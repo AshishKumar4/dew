@@ -287,7 +287,7 @@ def _saved_model(record: Mapping[str, object], dtype: str | None) -> ModelConfig
 
 def _saved_processor(record: Mapping[str, object]) -> Processor:
     """Build the run's tokenizer into a task's host processor."""
-    from dew.data import tokenizer_for
+    from dew.data.text import tokenizer_for
     from dew.inference.pipeline import RunProcessor
 
     return RunProcessor(tokenizer_for(named(record["tokenizer"], "tokenizer")))

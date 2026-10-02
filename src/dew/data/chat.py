@@ -8,8 +8,8 @@ only.
 
 Packing is the token pipeline's plan over the whole corpus
 (`PackedWindows`) with `text_roles` as one more per-token field. A window
-carries `text`, `text_roles`, `text_segment_ids`, `text_positions` and the
-identical `text_roles_segment_ids`, `text_roles_positions`, all aligned. The
+carries `text`, `text_roles`, `text_segment_ids` and `text_positions`, all
+aligned. The
 training stream's position is a global window count that resumes on any
 process count.
 

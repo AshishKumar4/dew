@@ -235,7 +235,13 @@ def test_scaled_native_gradients_preserve_update_and_restart(tmp_path, parameter
 
 @pytest.mark.parametrize("seq_aux", [False, True])
 def test_router_reductions_preserve_float64_scores(seq_aux):
-    from dew.nn.moe import deepseek_v2_aux_loss
+    from dew.nn.moe import global_router_loss, router_moments, sequence_router_losses
+
+    def balance_loss(scores, indices):
+        if seq_aux:
+            return jnp.mean(sequence_router_losses(scores, indices, .2))
+        return global_router_loss(router_moments(scores, indices), .2)
+
     with jax.enable_x64():
         values = np.array([[[.8 + 2.**-35, .2 - 2.**-35], [.65, .35], [.6, .4]],
                            [[.9, .1], [.15, .85], [.2, .8]]], np.float64)
@@ -248,8 +254,7 @@ def test_router_reductions_preserve_float64_scores(seq_aux):
         expected_gradient = np.broadcast_to(coefficients, values.shape)
         expected = np.sum(values * expected_gradient)
         loss, gradient = jax.value_and_grad(
-            lambda scores: deepseek_v2_aux_loss(scores, jnp.asarray(indices), 0.2, seq_aux)
-        )(jnp.asarray(values))
+            lambda scores: balance_loss(scores, jnp.asarray(indices)))(jnp.asarray(values))
         np.testing.assert_allclose(loss, expected, rtol=0, atol=1e-15)
         np.testing.assert_allclose(gradient, expected_gradient, rtol=0, atol=1e-15)
 

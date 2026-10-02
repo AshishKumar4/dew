@@ -332,7 +332,7 @@ def test_prediction_selection_seed_miss_hit_and_fixed_tail():
 
 
 def test_prediction_selection_empty_seed_inactive_rows_and_reordering():
-    from dew.nn.backbones.causal_transformer import gather_cache_rows
+    from dew.nn.kv_cache import gather_cache_rows
 
     block = module(index_kpool_always_select_tail=False)
     variables = translated(reference_block())

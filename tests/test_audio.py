@@ -18,7 +18,6 @@ import optax
 import pytest
 from safetensors.numpy import load_file
 
-from dew.data.audio import AudioProcessor
 from dew.nn.audio import Gemma3nAudio, audio_config, audio_weight_path, audio_weights
 from dew.nn.vision import (
     Gemma3nProjectorModule,
@@ -29,6 +28,22 @@ from dew.nn.vision import (
 from dew.registry import towers
 
 FIXTURES = Path(__file__).parent / "fixtures" / "audio"
+
+def gemma_features(model_type, config, waveforms):
+    """The float32 `input_features` and boolean `input_features_mask` the
+    checkpoint's own Transformers extractor makes of 16 kHz `waveforms`,
+    with the arguments `Processor` passes it: padded to the longest, 30 s
+    at most, frames a multiple of the encoder's 128."""
+    from transformers import Gemma3nAudioFeatureExtractor, Gemma4AudioFeatureExtractor
+
+    extractor = {"gemma3n_audio": Gemma3nAudioFeatureExtractor,
+                 "gemma4_audio": Gemma4AudioFeatureExtractor}[model_type].from_dict(dict(config))
+    features = extractor([np.asarray(waveform, np.float32) for waveform in waveforms],
+                         padding="longest", max_length=480000, truncation=True,
+                         pad_to_multiple_of=128, return_tensors="np", return_attention_mask=True)
+    return {"input_features": np.asarray(features["input_features"], np.float32),
+            "input_features_mask": np.asarray(features["input_features_mask"], np.bool_)}
+
 
 
 on_gpu = pytest.mark.skipif(jax.default_backend() != 'gpu',
@@ -65,9 +80,8 @@ def test_waveform_preprocessing_encoder_and_projection_match_reference(audio):
     data = np.load(path / "reference.npz")
     preprocessor = json.loads((path / "preprocessor_config.json").read_text())
     kind = "gemma3n_audio" if isinstance(config, Gemma3nAudio) else "gemma4_audio"
-    process = AudioProcessor(kind, preprocessor)
     waveforms = [np.load(path / f"waveform_{index}.npy") for index in range(2)]
-    features = process(waveforms, sampling_rate=16000)
+    features = gemma_features(kind, preprocessor, waveforms)
     np.testing.assert_array_equal(features["input_features_mask"], data["input_features_mask"])
     np.testing.assert_allclose(features["input_features"], data["input_features"], rtol=0, atol=1e-6)
     encoded = jax.jit(model.apply)(variables, **features)
@@ -185,14 +199,6 @@ def test_audio_weight_paths_round_trip_every_checkpoint_tensor(audio):
         if tensor.ndim > 1:
             restored = restored.transpose(restored.ndim - 1, restored.ndim - 2, *range(restored.ndim - 2))
         np.testing.assert_array_equal(restored, tensor)
-
-
-def test_processor_rejects_wrong_sampling_rate_without_resampling():
-    processor = AudioProcessor("gemma4_audio", {"feature_size": 16})
-    with pytest.raises(ValueError, match="sampling_rate"):
-        processor(np.ones(1000, np.float32), sampling_rate=8000)
-    with pytest.raises(ValueError, match="nonempty mono"):
-        processor([np.ones((100, 2), np.float32)], sampling_rate=16000)
 
 
 def test_released_geometries_emit_the_processor_token_counts():

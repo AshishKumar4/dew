@@ -273,15 +273,14 @@ class FlaxEncoder(nn.Module):
     """Encode images to latent moments with a conv stack that halves each axis.
 
     `block_out_channels` gives one level per entry, each `layers_per_block`
-    resnets; the last level does not downsample. `double_z` doubles the
-    output channels so the caller can split them into mean and log-variance.
+    resnets; the last level does not downsample. The output carries twice
+    `out_channels`, which the caller splits into mean and log-variance.
     """
 
     out_channels: int = 3
     block_out_channels: Sequence[int] = (64,)
     layers_per_block: int = 2
     norm_num_groups: int = 32
-    double_z: bool = False
     dtype: jnp.dtype = jnp.float32
 
     def setup(self):
@@ -312,10 +311,9 @@ class FlaxEncoder(nn.Module):
             dtype=self.dtype,
         )
 
-        conv_out_channels = 2 * self.out_channels if self.double_z else self.out_channels
         self.conv_norm_out = nn.GroupNorm(num_groups=self.norm_num_groups, epsilon=1e-6, dtype=self.dtype)
         self.conv_out = Conv(
-            conv_out_channels,
+            2 * self.out_channels,
             kernel_size=(3, 3),
             strides=(1, 1),
             padding=((1, 1), (1, 1)),

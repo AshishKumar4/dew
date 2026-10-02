@@ -14,7 +14,7 @@ from dew.config import OptimConfig, RunConfig
 from dew.objectives.base import EMASpec
 from dew.training import Layout, Trainer
 from dew.training.optim import PowerProfilesState, power_profiles
-from dew.training.posthoc import coefficients, exponent, power_decay, relative_std
+from dew.training.posthoc import coefficients, exponent, power_decay
 
 # Outputs of NVlabs/edm2 training/phema.py (std_to_exp, power_function_beta,
 # solve_posthoc_coefficients) on the same inputs, float64.
@@ -33,7 +33,6 @@ REFERENCE_ONE_PROFILE = [-5.4318017037919378e-25, -3.1130114879646682e-17, -4.16
 def test_the_solve_matches_the_reference_implementation():
     for std, gamma in REFERENCE_EXPONENTS.items():
         assert exponent(std) == pytest.approx(gamma, rel=1e-14)
-        assert relative_std(gamma) == pytest.approx(std, rel=1e-12)
     for std, beta in REFERENCE_BETA_AT_10.items():
         # After nine updates, the tenth keeps (1 - 1/10)^(γ + 1), in fp32.
         assert float(power_decay(std)(9)) == pytest.approx(beta, rel=1e-6)

@@ -102,12 +102,12 @@ def test_missing_and_undeclared_metrics_are_refused_before_training(tmp_path):
         trainer(tmp_path / 'b').fit(data(), steps=2, metrics=[metric], best=metric)
 
 
-def test_legacy_loss_and_periodic_retention(tmp_path):
+def test_ranked_loss_and_periodic_retention(tmp_path):
     run = trainer(tmp_path / 'run', keep=Keep(latest=1, every=2))
     state = run.fit(Data(train=data()._train), steps=1, log_every=1)
     checkpoints = run.checkpoints
     for step, loss in [(2, .1), (3, .9), (4, .7), (5, .8)]:
-        checkpoints.save(step, state.replace(step=jnp.int32(step)), None, metrics={'loss': loss})
+        checkpoints.save(step, state.replace(step=jnp.int32(step)), None, ranking=Ranking('train/loss', loss))
         checkpoints.wait()
     assert checkpoints.best == 2
     assert {entry.step for entry in checkpoints.kept()} == {2, 4, 5}

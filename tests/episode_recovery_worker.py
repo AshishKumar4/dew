@@ -10,8 +10,9 @@ import numpy as np
 from test_tool_episodes import build
 
 from dew.data import Dataset
-from dew.objectives.rl import EpisodeJournal, SandboxLimits, SubprocessEnvironment
+from dew.objectives.rl import EpisodeJournal
 from dew.objectives.rl.records import episode_record
+from dew.rl.sandbox import SandboxLimits, SubprocessEnvironment
 
 
 def main() -> None:

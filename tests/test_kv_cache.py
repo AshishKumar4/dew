@@ -268,7 +268,7 @@ def test_a_pool_split_into_groups_reads_what_each_row_wrote():
 
 
 def test_beam_search_refuses_a_paged_cache():
-    from dew.nn.backbones.causal_transformer import gather_cache_rows
+    from dew.nn.kv_cache import gather_cache_rows
 
     cache = Holder(KVCache(page_size=8)).init(jax.random.key(0), *(jnp.ones((2, 16, 1, 8)),) * 2)["cache"]
     with pytest.raises(ValueError, match="paged cache"):

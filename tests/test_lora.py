@@ -263,11 +263,14 @@ def test_a_source_fine_tunes_through_its_own_adapted_bundle(decoder, reference, 
     _, read = LoRA.load(source.model, source.variables, source.layouts, tmp_path / "adapter")
     for name, leaf in _flat(read).items():
         np.testing.assert_array_equal(np.asarray(leaf), np.asarray(_flat(trained)[name]), err_msg=name)
+    # The export is the merged weights in the source's layout, so the reload
+    # computes exactly what the source model computes on them; how close the
+    # merge is to the adapted forward is the PEFT parity test's to bound.
     tuned.save(tmp_path / "merged", variables=state.params)
     reloaded = load_pretrained(tmp_path / "merged", dtype="float32", attention_impl="reference")
     ids = jnp.asarray(tokens)
-    np.testing.assert_allclose(np.asarray(reloaded.model.apply(reloaded.variables, ids)),
-                               np.asarray(tuned.model.apply(trained, ids)), atol=1e-5, rtol=0)
+    np.testing.assert_array_equal(np.asarray(reloaded.model.apply(reloaded.variables, ids)),
+                                  np.asarray(source.model.apply(tuned.adapter.merge(state.params), ids)))
 
     # A source that ships a tokenizer hands its processor to the objective.
     processor = RunProcessor(ByteTokenizer())

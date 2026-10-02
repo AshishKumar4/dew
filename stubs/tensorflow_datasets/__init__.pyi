@@ -45,6 +45,8 @@ class _DatasetInfo(Protocol):
 class _PreparedBuilder(Protocol[Record]):
     @property
     def info(self) -> _DatasetInfo: ...
+    @property
+    def data_path(self) -> PathLike[str]: ...
 
     @overload
     def as_data_source(

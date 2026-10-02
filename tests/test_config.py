@@ -467,7 +467,7 @@ def test_a_saved_run_retains_vision_tower_and_projector_outputs(tmp_path):
         vision: dict[str, object] = dataclasses.field(default_factory=lambda: {
             "tower": SiglipVision(hidden_size=4, intermediate_size=8, num_layers=1,
                                    num_heads=1, image_size=2, patch_size=1),
-            "projector": GemmaProjector(vision_width=4, text_width=2,
+            "projector": GemmaProjector(text_width=2,
                                          patches_per_side=2, tokens_per_side=1),
         })
 

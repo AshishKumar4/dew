@@ -514,8 +514,9 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     CausalTransformer's mixture. Unset leaves the bias where it is.
 
     `aux_loss_alpha` scales DeepSeek V2's expert-level balance loss
-    (`dew.nn.moe.deepseek_v2_aux_loss`), summed over every sparse
-    layer, and `seq_aux` chooses its per-sequence form. The released V2
+    (`dew.nn.moe.global_router_loss`), summed over every sparse
+    layer, and `seq_aux` chooses its per-sequence form
+    (`dew.nn.moe.sequence_router_losses`). The released V2
     configs carry both under these names. Unset adds nothing.
 
     `loss_role` counts only the targets whose `text_roles` entry matches

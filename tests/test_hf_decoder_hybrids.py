@@ -263,11 +263,11 @@ def test_the_features_leave_a_plain_tree_unchanged(rng):
     assert "layers_0.self_attn.k_proj.kernel" in flat
 
 
-def test_new_leaves_are_declared_or_heuristic():
+def test_new_leaves_are_declared():
     """The coverage sweep builds default configs only, so the new leaves are
     asserted here: the packed table and the projections are declared, the
     scalar norms fall under rank one, and the values norm holds no weight."""
-    from dew.nn.sharding import declared_axes, is_heuristic
+    from dew.nn.sharding import declared_axes
 
     config = translate_config(gemma4_config("gemma4-kvshare"))
     model = models.build("causal_transformer", **with_precision(
@@ -279,7 +279,7 @@ def test_new_leaves_are_declared_or_heuristic():
     for path, leaf in jax.tree_util.tree_flatten_with_path(variables)[0]:
         if leaf.ndim < 2:
             continue
-        if declared_axes(path, leaf.ndim) is None and not is_heuristic(path):
+        if declared_axes(path, leaf.ndim) is None:
             uncovered.append(jax.tree_util.keystr(path))
     assert uncovered == []
 

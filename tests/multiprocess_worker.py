@@ -143,7 +143,7 @@ def jepa_objective():
     """The smallest real JEPA: an encoder, a predictor and one target block."""
     from dew.inputs import Field
     from dew.nn.backbones.jepa import JepaPredictor
-    from dew.objectives.jepa import JepaEncoder, JepaObjective, multi_block_mask
+    from dew.objectives.jepa import JepaEncoder, JepaObjective, MultiBlockMask
 
     patch = 2
     grid = (RES // patch, RES // patch)
@@ -151,7 +151,7 @@ def jepa_objective():
         JepaEncoder(patch_size=patch, emb_features=32, num_layers=1, num_heads=2, mlp_ratio=1),
         JepaPredictor(grid=grid, emb_features=32, predictor_features=16,
                       num_layers=1, num_heads=2, mlp_ratio=1),
-        multi_block_mask(grid, num_targets=1, scale=(0.2, 0.5)),
+        MultiBlockMask.for_grid(grid, num_targets=1, scale=(0.2, 0.5)),
         sample=Field("image", (RES, RES, 3)))
 
 

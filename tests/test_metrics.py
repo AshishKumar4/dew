@@ -712,6 +712,17 @@ def test_clip_metric_scores_the_reference_cosine():
     assert abs(score - expected) < CLIP_TOLERANCE, f"{score} against {expected}"
 
 
+def test_a_run_ranked_by_clip_distance_keeps_its_lowest():
+    """CLIP distance is 1 - cos, so the best checkpoint is the closest one:
+    the metric declares lower is better, and a selection by it minimizes."""
+    from dew.training.selection import Best
+    from dew.training.trainer import Trainer
+
+    metric = CLIPDistance(modelname="never/downloaded")
+    assert metric.shown.better == "lower"
+    assert Trainer._best_selection(Best(metric), [metric]).mode == "min"
+
+
 def test_clip_score_metric_clamps_the_reference_cosine():
     """CLIPScore is 100 * max(cos, 0) averaged; the fixture holds one negative
     cosine (-0.072) among three positive ones, so the clamp does work here.
@@ -815,7 +826,7 @@ def test_constructing_a_metric_opens_no_weights(monkeypatch):
     def refused(*args, **kwargs):
         raise AssertionError("constructing a metric loaded weights")
 
-    monkeypatch.setattr(fid_module, "_get_inception", refused)
+    monkeypatch.setattr(fid_module, "_extractor", refused)
     monkeypatch.setattr(images_module, "_get_clip", refused)
 
     FID()

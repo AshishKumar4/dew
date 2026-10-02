@@ -56,11 +56,8 @@ type PathFilter = Callable[[Path], bool]
 One filter type serves the EMA selection, `optax.multi_transform` labels and
 frozen subtrees."""
 type Initializer = Partial
-"""An objective's `init` as one value a JIT can take: a
-`jax.tree_util.Partial`, whose bound arguments are pytree children rather
-than closure cells, so a JIT that builds the initial state receives the held
-variables as arguments instead of compiling them in as constants. A plain
-function is not one of these; `jax.jit` cannot take it as an argument."""
+"""An objective's `init` with its held variables bound as `Partial` children,
+which a JIT takes as arguments (`Objective.initializer` says why)."""
 
 @struct.dataclass
 class Ratio:

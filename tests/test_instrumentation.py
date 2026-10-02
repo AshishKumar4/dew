@@ -570,7 +570,7 @@ def test_a_tracker_can_capture_after_each_training_update(tmp_path, monkeypatch)
         def log(self, scalars, step):
             super().log(scalars, step)
             if "train/loss" in scalars:
-                with dew.profile(tmp_path / f"step-{step}"):
+                with dew.Profiler(tmp_path / f"step-{step}"):
                     jnp.square(jnp.asarray(step)).block_until_ready()
                 captured.append(step)
 

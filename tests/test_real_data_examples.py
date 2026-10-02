@@ -66,7 +66,8 @@ def test_masked_lm_example_trains_real_byte_windows_and_writes_a_sample(tmp_path
     np.frombuffer((text * 64).encode(), np.uint8).tofile(corpus / "train.bin")
     np.frombuffer((text * 8).encode(), np.uint8).tofile(corpus / "val.bin")
     (corpus / "meta.json").write_text(json.dumps({"tokenizer": "byte", "vocab_size": 256,
-                                                "dtype": "uint8", "train_tokens": len(text) * 64}))
+                                                "dtype": "uint8", "train_tokens": len(text) * 64,
+                                                "val_tokens": len(text) * 8, "eos_id": None}))
     state = script.main(script.Config(tokens=corpus, sequence_length=16, batch_size=8,
                         features=32, layers=1, heads=4, steps=2, sample_tokens=8,
                         sample_steps=4, out=tmp_path / "run"))

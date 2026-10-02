@@ -59,16 +59,6 @@ def _extractor(weights: str | None):
             jax.tree.map(jnp.asarray, load(path)))
 
 
-@functools.cache
-def _get_inception(weights: str | None = None):
-    """Load the pool3 feature extractor and its variables, once per process
-    and per weights. The FID InceptionV3 is about 90 MB of weights,
-    and every metric built from this module shares the copy."""
-    _log.info("loading InceptionV3 FID weights from %s (cached for reuse)",
-              "the hub" if weights is None else weights)
-    return _extractor(weights)
-
-
 def _sqrtm(product):
     """Take `sqrtm` without its singularity warning. A singular product is the
     case the finiteness check in `frechet_distance` handles."""
@@ -158,10 +148,12 @@ class FIDStats:
 def _get_activations(weights: str | None = None):
     """Return the jitted pool3 feature extractor, built on first use.
 
-    Building it loads the ~90MB weights, so it happens here, on first use.
-    Constructing the metric opens nothing.
+    Building it loads the ~90 MB of InceptionV3 weights, once per process and
+    per weights, which every metric shares; constructing a metric opens nothing.
     """
-    model, variables = _get_inception(weights)
+    _log.info("loading InceptionV3 FID weights from %s (cached for reuse)",
+              "the hub" if weights is None else weights)
+    model, variables = _extractor(weights)
 
     @jax.jit
     def activations(images):
