@@ -175,10 +175,14 @@ class GatedMLP(nn.Module):
             nn.Dense, use_bias=self.use_bias, dtype=self.dtype, precision=self.precision,
             **normal_kernel(self.init_std))
         if self.activation not in ('gelu', 'gelu_exact', 'relu'):
-            self.gate_proj = dense(self.hidden_features, name='gate_proj')
+            if self.has_variable('params', 'gate_up_proj'):
+                self.gate_up_proj = dense(2 * self.hidden_features, name='gate_up_proj')
+            else:
+                self.gate_proj = dense(self.hidden_features, name='gate_proj')
         elif self.activation_sparsity or self.swiglu_limit is not None:
             raise ValueError('activation_sparsity and swiglu_limit require a gated MLP')
-        self.up_proj = dense(self.hidden_features, name='up_proj')
+        if not self.has_variable('params', 'gate_up_proj'):
+            self.up_proj = dense(self.hidden_features, name='up_proj')
         self.down_proj = dense(self.out_features, name='down_proj', **normal_kernel(
             self.init_std if self.output_init_std is None else self.output_init_std))
 
@@ -197,8 +201,12 @@ class GatedMLP(nn.Module):
             else:
                 hidden = nn.gelu(up)
             return checkpoint_name(self.down_proj(hidden), 'down_proj')
-        gate = checkpoint_name(constrain(self.gate_proj(x), MLP_HIDDEN), 'gate_proj')
-        up = checkpoint_name(constrain(self.up_proj(x), MLP_HIDDEN), 'up_proj')
+        if self.has_variable('params', 'gate_up_proj'):
+            gate, up = jnp.split(self.gate_up_proj(x), 2, axis=-1)
+        else:
+            gate, up = self.gate_proj(x), self.up_proj(x)
+        gate = checkpoint_name(constrain(gate, MLP_HIDDEN), 'gate_proj')
+        up = checkpoint_name(constrain(up, MLP_HIDDEN), 'up_proj')
         if self.swiglu_limit is not None:
             gate = jnp.minimum(gate, self.swiglu_limit)
             up = jnp.clip(up, -self.swiglu_limit, self.swiglu_limit)

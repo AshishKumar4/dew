@@ -48,9 +48,13 @@ def test_the_native_server_serves_loaded_weights_at_its_own_precision():
         server.close()
     assert (before.version, after.version) == (0, 7)
     assert before.behavior_log_probs != after.behavior_log_probs
-    for leaf, expected in zip(jax.tree.leaves(backend.variables), jax.tree.leaves(trained), strict=True):
-        assert leaf.dtype == jnp.bfloat16
-        np.testing.assert_array_equal(np.asarray(leaf), np.asarray(expected.astype(jnp.bfloat16)))
+    assert all(leaf.dtype == jnp.bfloat16 for leaf in jax.tree.leaves(backend.variables))
+    expected = TextGeneration(target.model, jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16), trained),
+                              None, sampling=SAMPLING)([[1, 2, 3]], BUDGET, key=5).host()
+    count = len(after.tokens)
+    assert after.tokens == tuple(int(token) for token in expected.tokens[0, 3:3 + count])
+    np.testing.assert_allclose(after.behavior_log_probs, expected.behavior_log_probs[0, :count],
+                               atol=2e-6, rtol=2e-6)
 
 
 def test_native_rollouts_preserve_a_split_jax_key():
