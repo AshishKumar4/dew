@@ -146,7 +146,7 @@ An image specification takes validation from `val_split`, a split of the dataset
 
 `Dataset.from_grain(train, *, batch, validation=None, records=None, loading=Loading())` builds a run over Grain pipelines a caller assembled: a `MapDataset` is repeated, cut into the reader's share and saved as one global record count; a pipeline read as it comes arrives as a function of the `DataPartition` that builds the `IterDataset` of that share, which is batched where it is and reports Grain's own iterator state.
 
-A token corpus is a `TokenSource`: `TokenBytes` over a `.bin` file, `TokenRecords` over ArrayRecord shards of token arrays, or `TokenColumn` over a parquet column of them. `TokenWindows` and `PackedTokens` read `path` as a directory of `train` and `val` files and take whichever store their suffix names, so the same corpus gives the same windows and the same packing plan in all three.
+A token corpus is a `TokenSource`: `TokenBytes` over a `.bin` file or `TokenRecords` over ArrayRecord shards of token arrays. `TokenWindows` and `PackedTokens` read `path` as a directory of `train` and `val` files and take whichever store their suffix names, so the same corpus gives the same windows and the same packing plan in both.
 
 
 ## Checkpoints
