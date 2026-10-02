@@ -76,6 +76,9 @@ class FitStarted:
     mesh: Mapping[str, int]
     seed: int | None = None
     """None: no integer seed recorded (a JAX key was supplied, or the record predates the field)."""
+    sharded: float | None = None
+    """The share of the parameters' bytes a parameter axis (fsdp, expert,
+    tensor) splits; None in a record that predates the field."""
 
 
 @dataclasses.dataclass(frozen=True)
