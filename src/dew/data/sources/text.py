@@ -1,9 +1,9 @@
 """Tokenized corpora as one stream of ids, and the two records cut out of it.
 
 A corpus is a stream of token ids, whatever holds it: the `.bin` files
-`TokenCorpus.write` (and `dew tokenize`) writes, ArrayRecord shards of token
-arrays, or a parquet column of them. `TokenSource` is that stream, read by slice, and the
-three readers below are the three stores it can live in. `token_corpus`
+`TokenCorpus.write` (and `dew tokenize`) writes, or ArrayRecord shards of
+token arrays. `TokenSource` is that stream, read by slice, and the two
+readers below are the two stores it can live in. `token_corpus`
 resolves a directory to the train and validation pair a run needs, by what
 the files in it are.
 
@@ -17,7 +17,7 @@ the shuffle lives in the sampler.
 previous eos id through its own. It exists for the packed pipeline, which
 cares where documents end and lets grain pack several of them into one
 window. Both read through `TokenSource` and nothing else, so the same corpus
-in any of the three stores gives the same windows and the same packing plan.
+in either store gives the same windows and the same packing plan.
 """
 
 from __future__ import annotations
@@ -374,52 +374,7 @@ class TokenRecords(_Reopened, _Sharded):
         return f"TokenRecords(paths={self.paths!r}, field={self.field!r})"
 
 
-class TokenColumn(_Sharded):
-    """Reads one column of token ids in parquet files as one stream.
-
-    The column holds a list of integers per row, which is what a tokenized
-    dataset written with `to_parquet` holds. The rows are the corpus in file
-    order. `column` names which column to read, and a file that holds one
-    column needs no name.
-    """
-
-    def __init__(self, paths: Sequence[str], *, column: str | None = None,
-                 dtype: np.dtype = _DEFAULT_DTYPE, eos_id: int | None = None):
-        import pyarrow.parquet as pq
-
-        if not paths:
-            raise ValueError("TokenColumn needs at least one parquet file")
-        self.paths = [str(path) for path in paths]
-        self.eos_id = None if eos_id is None else int(eos_id)
-        table = pq.read_table(self.paths)
-        self.column = _named_column(table.column_names, column, self.paths)
-        self._rows = [np.asarray(row, dtype) for row in
-                      table.column(self.column).to_pylist()]
-        super().__init__([len(row) for row in self._rows], np.dtype(dtype))
-
-    def piece(self, index: int) -> np.ndarray:
-        return self._rows[index]
-
-    def __repr__(self) -> str:
-        return f"TokenColumn(paths={self.paths!r}, column={self.column!r})"
-
-
-def _named_column(held: Sequence[str], named: str | None,
-                  paths: Sequence[str]) -> str:
-    """The column the ids are in: the one named, or the only one there is."""
-    if named is not None:
-        if named not in held:
-            raise ValueError(
-                f"{list(paths)} holds no column {named!r}; it holds {sorted(held)}")
-        return named
-    if len(held) != 1:
-        raise ValueError(
-            f"{list(paths)} holds {sorted(held)}, so which column holds the token "
-            f"ids has to be named")
-    return held[0]
-
-
-_STORES = (".bin", ".array_record", ".parquet")
+_STORES = (".bin", ".array_record")
 """What a tokenized corpus is held in, named by the suffix of its files."""
 
 
@@ -443,10 +398,10 @@ def token_corpus(path: str | None, name: str, *, field: str | None = None
     """The `(train, val)` corpora of a tokenized directory, both required.
 
     A split's files are the ones named for it, and their suffix says which
-    store they are in: `train.bin`, `train*.array_record*` shards, or
-    `train*.parquet`. Reading train in val's place would score the validation
-    pass on the windows the model trains on, so a directory holding one
-    without the other is refused rather than halved.
+    store they are in: `train.bin` or `train*.array_record*` shards. Reading
+    train in val's place would score the validation pass on the windows the
+    model trains on, so a directory holding one without the other is
+    refused rather than halved.
     """
     if not path:
         raise ValueError(
@@ -468,15 +423,13 @@ def _split(root: Path, split: str, name: str, field: str | None) -> TokenSource:
             f"store, so keep the one the run reads and move the rest")
     if not stores:
         raise ValueError(
-            f"{root} holds no {split} corpus: {name} reads {split}.bin, "
-            f"{split}*.array_record* shards or {split}*.parquet, and "
-            f"`dew tokenize --val-fraction` writes the held-out split")
+            f"{root} holds no {split} corpus: {name} reads {split}.bin or "
+            f"{split}*.array_record* shards, and `dew tokenize --val-fraction` "
+            f"writes the held-out split")
     files = found[stores[0]]
     if stores[0] == ".bin":
         return TokenBytes(files[0])
-    if stores[0] == ".array_record":
-        return TokenRecords(files, field=field, dtype=dtype, eos_id=eos_id)
-    return TokenColumn(files, column=field, dtype=dtype, eos_id=eos_id)
+    return TokenRecords(files, field=field, dtype=dtype, eos_id=eos_id)
 
 
 class TokenWindowSource:
