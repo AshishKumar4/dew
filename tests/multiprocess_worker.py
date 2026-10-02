@@ -600,10 +600,13 @@ def mode_fit(args) -> dict:
         val = data.val
         assert val is not None
         available = sum(1 for _ in val(data_partition(trainer.device_mesh)))
+    from dew.training import Best
+    counter = Batches()
     state = trainer.fit(Data(open_train, val=val, records=args.records),
                         steps=args.steps, log_every=1,
                         eval_every=args.steps if args.tokens else None,
-                        checkpoint_every=args.save_every, metrics=(Batches(),))
+                        checkpoint_every=args.save_every, metrics=(counter,),
+                        best=Best(counter, mode='max') if args.tokens else None)
     dump_params(args.out.with_suffix(".npz"), state.params)
     _, final_position = restored_state(trainer)
     return {

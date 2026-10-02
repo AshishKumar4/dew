@@ -35,7 +35,7 @@ if TYPE_CHECKING:
 
 def pipeline(source: str, *, mesh: MeshSpec | None = None, layout: Layout | None = None,
              dtype: str | None = None, param_dtype: str | None = None,
-             ema: bool | None = None, step: int | None = None,
+             ema: bool | None = None, step: int | str | None = None,
              revision: str | None = None) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration:
     """Load the inference task for `source`, its weights placed once.
 
@@ -99,7 +99,7 @@ about a run beyond the name its `run.json` records.
 
 def _from_run(root: epath.Path, *, mesh: MeshSpec | None, layout: Layout | None,
               dtype: str | None, param_dtype: str | None, ema: bool | None,
-              step: int | None) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration:
+              step: int | str | None) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration:
     record = json.loads((root / RUN_FILE).read_text())
     if not isinstance(record, dict) or not isinstance(record.get("objective"), str):
         raise ValueError("run.json must name its objective kind")

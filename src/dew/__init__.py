@@ -31,12 +31,15 @@ if TYPE_CHECKING:  # the surface above, with its types, for checkers and editors
     from dew.sampling import CFG, sample
     from dew.telemetry.profile import profile
     from dew.training import (
+        Best,
         Checkpoints,
         Evaluation,
+        Keep,
         Layout,
         LocalTracker,
         MeshSpec,
         MLflowTracker,
+        Plateau,
         ProfileWindow,
         TensorBoardTracker,
         Tracker,
@@ -60,6 +63,7 @@ _REGISTRIES = ("models", "presets", "samplers", "datasets", "encoders", "metrics
 
 _EXPORTS = {
     **dict.fromkeys(_REGISTRIES, "dew.registry"),
+    "Best": "dew.training", "Keep": "dew.training", "Plateau": "dew.training",
     "Trainer": "dew.training", "TrainState": "dew.training", "Step": "dew.training",
     "Aux": "dew.training", "EMASpec": "dew.training", "MeshSpec": "dew.training",
     "Layout": "dew.training", "Checkpoints": "dew.training", "Tracker": "dew.training",
@@ -101,6 +105,7 @@ def __dir__() -> list[str]:
 __all__ = [
     "CFG",
     "Aux",
+    "Best",
     "Checkpoints",
     "Condition",
     "Dataset",
@@ -109,12 +114,14 @@ __all__ = [
     "Field",
     "ImageGrid",
     "InputSpec",
+    "Keep",
     "Layout",
     "LocalTracker",
     "MLflowTracker",
     "Mean",
     "MeshSpec",
     "Objective",
+    "Plateau",
     "Process",
     "ProfileWindow",
     "Representations",

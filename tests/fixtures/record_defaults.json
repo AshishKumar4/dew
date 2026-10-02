@@ -1,4 +1,9 @@
 {
+ "dew.checkpoints.Keep": {
+  "every": null,
+  "interval": null,
+  "latest": 2
+ },
  "dew.nn.audio.Gemma3nAudio": {
   "conf_attention_chunk_size": 12,
   "conf_attention_context_left": 13,
@@ -217,6 +222,7 @@
   "accumulation": 1,
   "batch_ramp": null,
   "batch_size": 32,
+  "best": null,
   "checkpoint_dir": "./checkpoints",
   "checkpoint_every": "epoch",
   "compilation_cache_dir": {
@@ -1968,6 +1974,14 @@
   ],
   "tile_size": null,
   "weight_only": false
+ },
+ "dew.training.selection.Best": {
+  "metric": "required",
+  "mode": null,
+  "split": null,
+  "threshold": null,
+  "top": 1,
+  "weights_only": false
  },
  "dew.training.trainer.ProfileWindow": {
   "directory": "required",
