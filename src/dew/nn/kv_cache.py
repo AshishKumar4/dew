@@ -338,41 +338,107 @@ class KVStore:
 
     def _gathered(self, pool: jax.Array) -> jax.Array:
         """Every row's slots of `pool` `[heads, pages, page_size, ...]`, as `[rows, capacity, heads, ...]`."""
-        groups = self.layout.groups
-        rows = jax.vmap(lambda part, table: part[:, table], in_axes=(1, 0), out_axes=1)(
-            grouped(pool, 1, groups), grouped(self._get(TABLE), 0, groups))
-        # [heads, groups, rows / groups, per_row, page_size, ...] -> [rows, capacity, heads, ...]
-        return jnp.moveaxis(rows.reshape(self.kv_heads, self.rows, self.capacity, *pool.shape[3:]), 0, 2)
+        return _gather_pages(pool, self._get(TABLE), self.layout.groups)
 
     def kernel(self) -> bool:
-        """Whether decode runs the Pallas TPU paged kernel rather than the XLA gather.
+        """Whether decode can read a full-precision BF16 page pool natively.
 
         The kernel reads a bfloat16 pool: it casts any other page dtype to
         bfloat16 on the way in, and its int8 path broadcasts the scales to
         the pool's full width first, so a float32 or quantized pool takes
-        the gather. A GPU takes the gather too: jax deprecated its Triton
-        paged kernel (`jax.experimental.pallas.ops.gpu.paged_attention`),
-        which ran 2% faster than the gather on an A100. A pool split into
+        the gather. A GPU uses cuDNN's paged forward on supported heads and
+        pages of whole 16-token tiles. A pool split into
         groups takes the gather as well: the kernel indexes one pool with
         one table, and the grouped gather is what keeps each group's pages
         on the device that holds them.
         """
-        return (self.layout.page_size is not None and self.layout.quantized is None
-                and self.layout.groups == 1 and self.dtype == jnp.bfloat16 and jax.default_backend() == "tpu")
+        page_size = self.layout.page_size
+        if (page_size is None or self.layout.quantized is not None
+                or self.layout.groups != 1 or self.dtype != jnp.bfloat16):
+            return False
+        if jax.default_backend() == "tpu":
+            return True
+        if jax.default_backend() != "gpu":
+            return False
+        from dew.nn.attention import _FORWARD_MODE, cudnn_runs
+
+        query = jax.ShapeDtypeStruct((self.rows, 1, self.kv_heads, self.head_dim), self.dtype)
+        return (page_size % 16 == 0 and cudnn_runs(query)
+                and not _FORWARD_MODE.get())
 
     def decode(self, query: jax.Array, lengths: jax.Array, softcap: float | None) -> jax.Array:
         """One query per row `[rows, heads, head_dim]` against the first
-        `lengths` slots of each row, through the Pallas TPU paged kernel.
+        `lengths` slots of each row, through its device's paged kernel.
 
-        The kernel does not scale the logits, so the query carries
+        The TPU kernel does not scale the logits, so the query carries
         1/sqrt(head_dim) as every other attention path applies it.
         """
+        if jax.default_backend() == "gpu":
+            if softcap is not None:
+                raise ValueError("the cuDNN paged kernel does not apply a logit softcap")
+            # JAX 0.11.2's paged cuDNN backward returns [rows, page, heads, dim]
+            # for a [pool_pages, page, heads, dim] operand; the verifier rejects
+            # it. Keep the old gathered attention as the wrapper's VJP.
+            return _gpu_paged(query, self._get("cached_key"), self._get("cached_value"),
+                              self._get(TABLE), lengths)
         from jax.experimental.pallas.ops.tpu.paged_attention import paged_attention
 
         scaled = query * jnp.asarray(1.0 / math.sqrt(self.head_dim), query.dtype)
         table = self._get(TABLE)
         return paged_attention(scaled, self._get("cached_key"), self._get("cached_value"), lengths, table,
                                attn_logits_soft_cap=softcap, pages_per_compute_block=_pages_per_block(table.shape[1]))
+
+
+def _gather_pages(pool: jax.Array, table: jax.Array, groups: int) -> jax.Array:
+    """The existing grouped page read as `[rows, capacity, heads, ...]`."""
+    rows = jax.vmap(lambda part, index: part[:, index], in_axes=(1, 0), out_axes=1)(
+        grouped(pool, 1, groups), grouped(table, 0, groups))
+    return jnp.moveaxis(rows.reshape(pool.shape[0], table.shape[0],
+                                     table.shape[1] * pool.shape[2], *pool.shape[3:]), 0, 2)
+
+
+@jax.custom_vjp
+def _gpu_paged(query: jax.Array, key: jax.Array, value: jax.Array,
+               table: jax.Array, lengths: jax.Array) -> jax.Array:
+    # Private JAX API, pinned by jax<0.11.3. Moving it breaks
+    # test_native_gpu_paged_value_and_vjp_keep_the_gathered_attention.
+    from jax._src.cudnn.fused_attention_stablehlo import MaskType, paged_attention
+
+    rows = query.shape[0]
+    # The old gather pads q=1 to q=2 for cuDNN's odd-query backward restriction
+    # and passes query lengths of 2. Keep that forward tiling/rounding; discard
+    # the added query's output, rather than changing the accepted greedy tokens.
+    padded = jnp.pad(query[:, None], ((0, 0), (0, 1), (0, 0), (0, 0)))
+    pages = table[:, None, :, None]
+    # Inactive rows read one slot to keep the unused output finite; nobody reads it.
+    out = paged_attention(
+        padded, jnp.moveaxis(key, 0, 2), jnp.moveaxis(value, 0, 2),
+        jnp.full(rows, 2, jnp.int32), jnp.maximum(lengths, 1), pages, pages,
+        scale=query.shape[-1] ** -0.5, mask_type=MaskType.PADDING)
+    if not isinstance(out, jax.Array):
+        raise TypeError("cuDNN paged attention must return an array")
+    return out[:, 0]
+
+
+def _gpu_paged_fwd(query, key, value, table, lengths):
+    return _gpu_paged(query, key, value, table, lengths), (query, key, value, table, lengths)
+
+
+def _gpu_paged_bwd(saved, cotangent):
+    from dew.nn.attention import cudnn_attention
+
+    query, key, value, table, lengths = saved
+
+    def gathered(q, k, v):
+        return cudnn_attention(q[:, None], _gather_pages(k, table, 1), _gather_pages(v, table, 1),
+                                bias=None, mask=None, causal=False, sliding_window=None,
+                                key_value_seq_lengths=jnp.maximum(lengths, 1))[:, 0]
+
+    _, backward = jax.vjp(gathered, query, key, value)
+    return (*backward(cotangent), None, None)
+
+
+_gpu_paged.defvjp(_gpu_paged_fwd, _gpu_paged_bwd)
 
 
 def _pages_per_block(pages: int) -> int:
