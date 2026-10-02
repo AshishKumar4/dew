@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 
 import pytest
-from conftest import outside_any_cluster
+from lane_environment import outside_any_cluster
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 # The launches below stand in for Slurm, Open MPI or a plain host with

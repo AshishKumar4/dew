@@ -34,21 +34,19 @@ from steady_state import steady_state
 from dew import position
 from dew.artifacts import Representations
 from dew.checkpoints import STATE_LEAVES, Ranking
-from dew.config import TrainerConfig
 from dew.data import DataPartition
 from dew.objectives.base import Aux, EMASpec, Objective, merge, select, under
 from dew.training import (
     Checkpoints,
     Layout,
     MeshSpec,
-    ProfileWindow,
     Trainer,
     TrainState,
     display,
     ema_update,
     trainer as trainer_module,
-    write_back,
 )
+from dew.training.transaction import write_back
 
 BATCH = 8
 FEATURES = 3
@@ -353,27 +351,6 @@ def test_constructing_a_trainer_opens_nothing(tmp_path):
     assert not (tmp_path / "run").exists(), "the checkpoint directory was created"
 
 
-def test_from_config_is_the_construction_a_run_config_used_to_write(tmp_path):
-    """`from_config` against the constructor call `RunConfig.train` wrote by
-    hand, for a config whose every trainer-held field is off its default: one
-    mapping from the config's names to this constructor's, in one place."""
-    config = TrainerConfig(
-        batch_size=8, key=7, steps=3, accumulation=2, dynamic_scale=True,
-        mesh=MeshSpec(fsdp=2), layout=Layout(min_shard=1, tolerance=1.0),
-        profile=ProfileWindow(str(tmp_path / "trace"), steps=2, warmup=1))
-    objective, optimizer = Regression(), optax.sgd(0.1)
-    key = jax.random.key(config.key)
-    checkpoints, tracker = Checkpoints(str(tmp_path / "run")), RecordingTracker()
-
-    built = Trainer.from_config(config, objective, optimizer, key=key,
-                                checkpoints=checkpoints, tracker=tracker)
-
-    assert vars(built) == vars(Trainer(
-        objective, optimizer, key=key, mesh=config.mesh, layout=config.layout,
-        accumulation=config.accumulation, dynamic_scale=config.dynamic_scale,
-        checkpoints=checkpoints, tracker=tracker, profile=config.profile))
-
-
 class Keyed(Regression):
     """Loss scaled by the step key, so the key stream is observable in the parameters.
 
@@ -560,13 +537,21 @@ def test_overlapping_token_windows_resume_in_a_fresh_trainer_bit_exactly(tmp_pat
     assert jax.tree.structure(restored) == jax.tree.structure(prefix)
     for left, right in zip(jax.tree.leaves(restored), jax.tree.leaves(prefix), strict=True):
         actual, expected = np.asarray(raw_leaf(left)), np.asarray(raw_leaf(right))
-        assert (actual.dtype, actual.shape, actual.tobytes()) == (expected.dtype, expected.shape, expected.tobytes())
+        assert (actual.dtype, actual.shape, actual.tobytes()) == (
+            expected.dtype,
+            expected.shape,
+            expected.tobytes(),
+        )
     resumed = fresh.fit(dataset(resumed_seen), steps=4, checkpoint_every=1)
     assert resumed_seen[0].tobytes() == whole_seen[2].tobytes(), "the first batch after resume"
     assert jax.tree.structure(resumed) == jax.tree.structure(whole)
     for left, right in zip(jax.tree.leaves(resumed), jax.tree.leaves(whole), strict=True):
         actual, expected = np.asarray(raw_leaf(left)), np.asarray(raw_leaf(right))
-        assert (actual.dtype, actual.shape, actual.tobytes()) == (expected.dtype, expected.shape, expected.tobytes())
+        assert (actual.dtype, actual.shape, actual.tobytes()) == (
+            expected.dtype,
+            expected.shape,
+            expected.tobytes(),
+        )
     _, resumed_place = Checkpoints(str(tmp_path / "split/run")).restore(share=DataPartition())
     _, whole_place = Checkpoints(str(tmp_path / "whole/run")).restore(share=DataPartition())
     assert resumed_place == whole_place
@@ -701,7 +686,7 @@ from dew.training import Trainer
 
 model = SimpleDiT(patch_size=2, emb_features=64, num_layers=2, num_heads=2, mlp_ratio=2)
 objective = DiffusionObjective(model, presets.Flow()(), InputSpec(Field("image", (16, 16, 3))), guidance=None,
-                               sampler=Euler(), steps=2, ema_decay=None)
+                               solver=Euler(), steps=2, ema_decay=None)
 trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0))
 state = trainer.initial_state()
 batch = {"image": np.random.default_rng(0).integers(0, 256, (32, 16, 16, 3)).astype(np.uint8)}
@@ -709,7 +694,8 @@ step = trainer.compile(state, batch)
 for _ in range(2):
     state, *_ = step(state, batch)
 leaves = jax.tree.leaves(jax.tree.map(lambda leaf: jax.random.key_data(leaf)
-                                      if jax.dtypes.issubdtype(leaf.dtype, jax.dtypes.prng_key) else leaf, state))
+                                      if jax.dtypes.issubdtype(leaf.dtype, jax.dtypes.prng_key)
+                                      else leaf, state))
 np.savez(sys.argv[1], *[np.asarray(leaf) for leaf in leaves])
 """
 
@@ -720,7 +706,7 @@ def test_two_processes_train_a_conv_model_to_the_bit_under_the_repeatable_flags(
     a second process shows whether it agrees. Two fresh processes, without a
     compilation cache, train a DiT (a convolution embeds its patches) two
     Adam steps under the cuda lane's flags; every state leaf agrees."""
-    from conftest import REPEATABLE_GPU_FLAGS
+    from lane_environment import REPEATABLE_GPU_FLAGS
 
     root = Path(__file__).resolve().parents[1]
     flags = [flag for flag in os.environ.get("XLA_FLAGS", "").split()
@@ -796,7 +782,7 @@ def test_the_compiled_step_consumes_the_state_it_is_given():
     batch = next(Counting())
     step = trainer.compile(state, batch)
     stale = jax.tree.leaves(state.params)[0]
-    advanced, loss, _, finite, _ = step(state, batch)
+    advanced, _loss, _, finite, _ = step(state, batch)
     assert bool(finite) and int(advanced.step) == 1
     assert stale.is_deleted()
     again, _, _, _, _ = step(advanced, batch)
@@ -1409,7 +1395,7 @@ def test_a_failing_validation_loader_fails_the_pass():
         def __next__(self):
             raise OSError("val.bin: Input/output error")
 
-    with pytest.raises(OSError, match="val.bin"):
+    with pytest.raises(OSError, match=r"val.bin"):
         make_trainer(objective=Features()).fit(Data(val=UnreadableSplit), steps=1,
                                                log_every=1, eval_every=1, metrics=(Spread([]),))
 
@@ -1793,7 +1779,12 @@ def alternating(gen, disc):
                 return params, {**state.opt_state, "disc": disc_state}, loss
 
             params, opt_state, loss = jax.lax.cond(state.microstep % 2 == 0, generator, discriminator, None)
-            new_state = state.replace(microstep=state.microstep + 1, updates=state.updates + 1, opt_state=opt_state, params={**state.params, "params": params})
+            new_state = state.replace(
+                microstep=state.microstep + 1,
+                updates=state.updates + 1,
+                opt_state=opt_state,
+                params={**state.params, "params": params},
+            )
             return new_state, loss, Aux({"player": (state.microstep % 2).astype(jnp.float32)})
         return step
     return make_step
@@ -2028,7 +2019,9 @@ def test_sm89_step_matches_the_measured_head_without_a_latency_cliff(tmp_path, t
     samples = ([], [])
     for index, reference in enumerate((False, True, True, False)):
         objective = {"head_tile": [4096, 8192] if tokens == 16384 else "whole"} if reference else {}
-        options = f" --xla_gpu_enable_triton_gemm={'true' if tokens == 8192 else 'false'}" if reference else ""
+        options = (
+            f" --xla_gpu_enable_triton_gemm={'true' if tokens == 8192 else 'false'}" if reference else ""
+        )
         record = tmp_path / f"step-{index}.json"
         done = subprocess.run(
             [sys.executable, "tools/benchmark_step.py", "--cases",
@@ -2066,7 +2059,7 @@ def test_a_fresh_state_is_built_in_the_buffers_its_held_checkpoint_arrives_in(mo
         return out
 
     monkeypatch.setattr(jax, "device_put", recorded)
-    trainer, objective, weights = held_lm_trainer(mesh=MeshSpec(fsdp=jax.device_count()))
+    trainer, _objective, weights = held_lm_trainer(mesh=MeshSpec(fsdp=jax.device_count()))
     state, shardings, _ = trainer.place()
     params = dict(jax.tree_util.tree_leaves_with_path(shardings.params))
     sharded = 0
@@ -2109,6 +2102,30 @@ def test_a_step_compiles_from_its_arrays_shapes_before_they_are_placed():
     assert int(advanced.step) == 1 and bool(finite)
 
 
+@pytest.mark.parametrize("generation, flags, expected", [
+    ("sm89", "", {"xla_gpu_dot_merger_threshold_mb": 0, "xla_gpu_enable_triton_gemm": False}),
+    ("sm86", "", {"xla_gpu_dot_merger_threshold_mb": 0}),
+    ("sm89", "--xla_gpu_dot_merger_threshold_mb=64 --xla_gpu_enable_triton_gemm=true", None),
+    ("v6e", "", None),
+    ("cpu", "", None),
+])
+def test_a_gpu_training_step_compiles_its_dots_apart(monkeypatch, generation, flags, expected):
+    """A GPU training step runs dots that share an input apart, where XLA's
+    merger would concatenate their weights every step, and the Triton GEMM
+    fusions go off on the generations measured faster without them; a flag
+    the run named stands. The options are the step's own, so a process that
+    also serves keeps the merger there."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.lm import LMObjective
+    from dew.training import trainer as trainer_module
+
+    monkeypatch.setattr(trainer_module, 'device_generation', lambda: generation)
+    monkeypatch.setenv("XLA_FLAGS", flags)
+    model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=1,
+                              mlp_features=16, max_seq_len=8)
+    assert trainer_module.step_compiler_options(LMObjective(model, seq_len=4)) == expected
+
+
 def test_the_step_runs_the_program_it_compiled(monkeypatch, tmp_path):
     """The first execution requests no compilation after the public compile
     call, including a second program retrieved from the persistent cache.
@@ -2133,7 +2150,7 @@ def test_the_step_runs_the_program_it_compiled(monkeypatch, tmp_path):
     monitoring.register_event_listener(record)
     try:
         jax.config.update("jax_compilation_cache_dir", str(tmp_path))
-        jax.config.update("jax_enable_compilation_cache", True)
+        jax.config.update("jax_enable_compilation_cache", val=True)
         step = trainer.compile(state, batch)
         assert events, "the public compile must reach the compilation event listener"
         # Input placement is separate from executing the compiled transaction.

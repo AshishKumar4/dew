@@ -74,8 +74,8 @@ def test_an_interrupted_sweep_continues_at_the_trial_it_stopped_on(tmp_path):
             raise KeyboardInterrupt('the operator stopped the sweep')
         return float(len(trained))
 
-    arguments = dict(train=counted, trials=4, ledger=tmp_path / 'ledger.json',
-                     search=grid_search)
+    arguments = {'train': counted, 'trials': 4, 'ledger': tmp_path / 'ledger.json',
+                     'search': grid_search}
     with LocalTracker(tmp_path / 'sweep') as tracker:
         with pytest.raises(KeyboardInterrupt):
             config(tmp_path).sweep(SPACE, tracker=tracker, **arguments)
@@ -94,8 +94,8 @@ def test_an_interrupted_sweep_continues_at_the_trial_it_stopped_on(tmp_path):
 
 def test_a_ledger_of_another_space_is_refused(tmp_path):
     with LocalTracker(tmp_path / 'sweep') as tracker:
-        arguments = dict(train=lambda run: 1.0, trials=1, ledger=tmp_path / 'ledger.json',
-                         tracker=tracker)
+        arguments = {'train': lambda run: 1.0, 'trials': 1, 'ledger': tmp_path / 'ledger.json',
+                         'tracker': tracker}
         config(tmp_path).sweep(SPACE, **arguments)
         with pytest.raises(ValueError, match='not this space'):
             config(tmp_path).sweep({'optim.learning_rate': [0.5]}, **arguments)
@@ -137,9 +137,8 @@ def test_the_optuna_backend_asks_within_the_space_and_takes_the_ledgers_trials(t
 
 
 def test_a_sweep_without_a_run_name_is_refused(tmp_path):
-    with LocalTracker(tmp_path / 'sweep') as tracker:
-        with pytest.raises(ValueError, match='trainer.name'):
-            config(tmp_path, name=None).sweep(SPACE, train=lambda run: 1.0, trials=1,
-                                              ledger=tmp_path / 'ledger.json', tracker=tracker)
+    with LocalTracker(tmp_path / 'sweep') as tracker, pytest.raises(ValueError, match=r"trainer.name"):
+        config(tmp_path, name=None).sweep(SPACE, train=lambda run: 1.0, trials=1,
+                                          ledger=tmp_path / 'ledger.json', tracker=tracker)
 
 

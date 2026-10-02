@@ -17,7 +17,7 @@ from dew.diffusion.schedules import CosineNoiseScheduler
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.base import Step
 from dew.objectives.diffusion import MaskedDiffusionObjective
-from dew.registry import presets, samplers
+from dew.registry import presets, solvers
 from dew.sampling import sample
 from dew.training import Trainer
 
@@ -98,7 +98,8 @@ def test_unmask_reveals_the_schedules_share_with_the_models_token(rng):
     revealed = stepped != MASK
     share = (process.schedule.alpha(0.3) - process.schedule.alpha(0.8)) / (1 - process.schedule.alpha(0.8))
     assert abs(float(revealed.mean()) - float(share)) < 0.03
-    assert jnp.all(jnp.where(revealed, stepped == filled, True))
+    unobserved = True
+    assert jnp.all(jnp.where(revealed, stepped == filled, unobserved))
 
     same, _ = Unmask().step(x, t, t, filled, log_probs, (), rng, process, denoise)
     assert jnp.all(same == MASK)
@@ -189,7 +190,7 @@ def test_unmask_refuses_a_gaussian_process(rng):
 
 
 def test_the_mdlm_preset_is_registered_and_takes_no_conditions():
-    assert presets["mdlm"] is MDLM and samplers["unmask"] is Unmask
+    assert presets["mdlm"] is MDLM and solvers["unmask"] is Unmask
     process = presets.build("mdlm", mask_id=MASK, eps=1e-2)()
     assert process.mask_id == MASK and process.schedule == LogLinear(eps=1e-2)
     with pytest.raises(ValueError, match="no conditions"):
@@ -329,7 +330,9 @@ def test_masked_diffusion_lm_memorises_the_toy_corpus():
                         steps=1000, log_every=500)
     params = state.params
 
-    loss, aux = objective.scalar_loss(params, {"text": ROWS}, Step(state.microstep, jax.random.PRNGKey(1), None))
+    loss, aux = objective.scalar_loss(
+        params, {"text": ROWS}, Step(state.microstep, jax.random.PRNGKey(1), None)
+    )
     assert jnp.isfinite(loss)
     assert set(aux.metrics) == {"masked_accuracy", "masked_fraction"}
 

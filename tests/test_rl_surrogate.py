@@ -54,9 +54,9 @@ OLD_LOG_PROBS = jnp.asarray(REFERENCE["old_log_probs"])
 REF_LOG_PROBS = jnp.asarray(REFERENCE["ref_log_probs"])
 MASK = jnp.asarray(REFERENCE["response_mask"])
 ADVANTAGES = jnp.asarray(REFERENCE["advantages"])
-CLIP = dict(epsilon_low=float(REFERENCE["epsilon_low"]),
-            epsilon_high=float(REFERENCE["epsilon_high"]),
-            dual_clip=float(REFERENCE["dual_clip"]))
+CLIP = {"epsilon_low": float(REFERENCE["epsilon_low"]),
+            "epsilon_high": float(REFERENCE["epsilon_high"]),
+            "dual_clip": float(REFERENCE["dual_clip"])}
 
 
 def token_mean(x, mask):

@@ -553,11 +553,11 @@ class CausalTransformer(nn.Module):
     cache cursor.
 
     `layer_types` is the pattern, one kind per layer, and `kinds` says what
-    a kind does. KV sharing has two spellings that resolve to one plan:
-    `num_kv_shared_layers` trailing layers (Gemma 3n/4) or `kv_shared_layers`
-    by index (GLM's IndexShare). A sharing layer reads what the last earlier
-    non-sharing layer of its kind stashed: keys and values for attention,
-    the indexer's selection for MLA.
+    a kind does. `kv_shared_layers` names the layers that share by index (a
+    trailing run for Gemma 3n/4, one after every indexer layer for GLM's
+    IndexShare). A sharing layer reads what the last earlier non-sharing
+    layer of its kind stashed: keys and values for attention, the indexer's
+    selection for MLA.
 
     Active attention dropout runs the reference kernel, and an explicit
     fused kernel that cannot drop probabilities is refused.
@@ -673,8 +673,7 @@ class CausalTransformer(nn.Module):
     """Gemma 3n/4 per-layer inputs: an extra table read per layer and added
     to its input through its own gate."""
     per_layer_input_vocab: int | None = None  # None: vocab_size
-    num_kv_shared_layers: int = 0            # trailing layers reusing a provider's K/V; 0 disables
-    kv_shared_layers: tuple[int, ...] | None = None  # the sharing layers named one by one
+    kv_shared_layers: tuple[int, ...] | None = None  # layers reusing a provider's K/V; None disables
     mixer: MixerBase | None = None         # None: today's attention; a kind value or its record
     num_nextn_predict_layers: int = 0         # MTP depths; their input/residual policy is independent below
     index_share_for_mtp_iteration: bool = False
@@ -843,38 +842,20 @@ class CausalTransformer(nn.Module):
         mixture = self.mixture
         if mixture is None:
             return ()
-        if mixture.layers is not None:
-            return tuple(mixture.layers)
-        if mixture.every is not None:
-            return tuple(index for index in range(self.num_layers)
-                         if (index + 1) % mixture.every == 0)
-        return tuple(range(self.num_layers))
+        return tuple(range(self.num_layers)) if mixture.layers is None else mixture.layers
 
     @property
     def sharing_layers(self) -> tuple[int, ...]:
-        """The layers that read another layer's stash, in order: the trailing
-        num_kv_shared_layers or the ones kv_shared_layers names."""
-        if self.num_kv_shared_layers and self.kv_shared_layers is not None:
-            raise ValueError(
-                "num_kv_shared_layers and kv_shared_layers both name the sharing "
-                "layers; a model spells them one way")
-        if self.kv_shared_layers is not None:
-            outside = sorted(index for index in self.kv_shared_layers
-                             if not 0 <= index < self.num_layers)
-            if outside:
-                raise ValueError(
-                    f"kv_shared_layers {outside} name no layer of a "
-                    f"{self.num_layers}-layer model")
-            return tuple(sorted(set(self.kv_shared_layers)))
-        if not self.num_kv_shared_layers:
+        """The layers that read another layer's stash, in order."""
+        if self.kv_shared_layers is None:
             return ()
-        first = self.num_layers - self.num_kv_shared_layers
-        if first <= 0:
+        outside = sorted(index for index in self.kv_shared_layers
+                         if not 0 <= index < self.num_layers)
+        if outside:
             raise ValueError(
-                f"num_kv_shared_layers ({self.num_kv_shared_layers}) has to leave "
-                f"a provider: it must be between 1 and num_layers - 1 "
-                f"({self.num_layers - 1})")
-        return tuple(range(first, self.num_layers))
+                f"kv_shared_layers {outside} name no layer of a "
+                f"{self.num_layers}-layer model")
+        return tuple(sorted(set(self.kv_shared_layers)))
 
     @property
     def kv_sharing(self) -> dict:
@@ -906,51 +887,24 @@ class CausalTransformer(nn.Module):
                       kv_shared: bool) -> MixerContext:
         """One layer's mixer geometry: the kind's resolved values as a context.
 
-        `head_dim`, `rope_theta`, `window` and the two rotary ramps already
-        carry the layer kind's overrides; a windowed kind rotates every
-        dimension, so the partial rotary belongs to the kinds that attend the
-        whole sequence, where Gemma 4 puts it. A kind builds its
-        `DecoderBlock` factory from this and its own record; `setup` chooses
-        the mixer there and nowhere else.
+        `head_dim`, `rope_theta`, `window` and the two rotary ramps carry the
+        layer kind's overrides; a windowed kind rotates every dimension, so the
+        partial rotary belongs to the kinds that attend the whole sequence,
+        where Gemma 4 puts it. Every other field is the model's own of the same
+        name. A kind builds its `DecoderBlock` factory from this and its own
+        record; `setup` chooses the mixer there and nowhere else.
         """
-        return MixerContext(
-            emb_features=self.emb_features,
-            num_heads=self.num_heads,
-            num_kv_heads=kind.num_kv_heads,
-            head_dim=kind.head_dim,
-            max_seq_len=self.max_seq_len,
-            causal=self.causal,
-            rope_theta=kind.rope_theta,
-            rope_scaling=kind.rope_scaling,
-            qk_norm=self.qk_norm,
-            qk_norm_scope=self.qk_norm_scope,
-            v_norm=self.v_norm,
-            k_eq_v=self.attention_k_eq_v and kind.window is None,
-            norm_eps=self.norm_eps,
-            scale_offset=self.scale_offset,
-            scale_after_cast=self.scale_after_cast,
-            kv_shared=kv_shared,
-            kv_store_key=layer_type,
-            sliding_window=kind.window,
-            attention_chunk=kind.chunk,
-            attention_bias=self.attention_bias,
-            o_proj_bias=self.o_proj_bias,
-            attention_scale=self.attention_scale,
-            attention_dropout_rate=self.attention_dropout_rate,
-            attention_sinks=self.attention_sinks,
-            yarn=kind.yarn,
-            attn_logit_softcap=self.attn_logit_softcap,
-            output_gate=self.output_gate,
-            dtype=self.dtype,
-            precision=self.precision,
-            attention_impl=self.attention_impl,
-            force_fp32_for_softmax=self.force_fp32_for_softmax,
-            kv_cache=self.kv_cache,
-            partial_rotary_factor=(None if kind.window is not None
-                                   else self.partial_rotary_factor),
-            partial_rotary_type=self.partial_rotary_type,
-            init_std=self.init_stds[0],
-            output_init_std=self.init_stds[1])
+        resolved = {
+            "num_kv_heads": kind.num_kv_heads, "head_dim": kind.head_dim,
+            "rope_theta": kind.rope_theta, "rope_scaling": kind.rope_scaling, "yarn": kind.yarn,
+            "sliding_window": kind.window, "attention_chunk": kind.chunk,
+            "k_eq_v": self.attention_k_eq_v and kind.window is None,
+            "kv_shared": kv_shared, "kv_store_key": layer_type,
+            "partial_rotary_factor": None if kind.window is not None else self.partial_rotary_factor,
+            "init_std": self.init_stds[0], "output_init_std": self.init_stds[1]}
+        return MixerContext(**resolved, **{field.name: getattr(self, field.name)
+                                           for field in dataclasses.fields(MixerContext)
+                                           if field.name not in resolved})
 
     @property
     def bank_sites(self) -> tuple[DecoderBank, ...]:
@@ -1125,7 +1079,7 @@ class CausalTransformer(nn.Module):
         if self.use_double_wide_mlp and not sharing:
             raise ValueError(
                 "use_double_wide_mlp widens the MLP of the layers that share "
-                "their keys and values, so it needs num_kv_shared_layers set")
+                "their keys and values, so it needs kv_shared_layers set")
         ple = self.per_layer_input_dim
         if ple is not None and ple < 1:
             raise ValueError(
@@ -1572,13 +1526,12 @@ class CausalTransformer(nn.Module):
 
     def __call__(self, tokens, train: bool = False, decode: bool = False,
                  positions=None, segment_ids=None,
-                 input_embeddings=None, embedding_positions=None,
+                 input_embeddings=None,
                  attention_mask=None, image_groups=None, rotary_positions=None,
                  attention_pairwise_mask=None, attention_key_positions=None):
         x, prediction = self.hidden_and_mtp_inputs(
             tokens, train=train, decode=decode, positions=positions, segment_ids=segment_ids,
-            input_embeddings=input_embeddings, embedding_positions=embedding_positions,
-            attention_mask=attention_mask, image_groups=image_groups,
+            input_embeddings=input_embeddings, attention_mask=attention_mask, image_groups=image_groups,
             rotary_positions=rotary_positions, attention_pairwise_mask=attention_pairwise_mask,
             attention_key_positions=attention_key_positions)
         if self.is_initializing() and self.dspark is not None:
@@ -1590,7 +1543,7 @@ class CausalTransformer(nn.Module):
             # business: a plain init holds every depth.
             self.mtp_hidden_states(prediction, tokens, train=train, positions=positions,
                                    segment_ids=segment_ids, input_embeddings=input_embeddings,
-                                   embedding_positions=embedding_positions, attention_mask=attention_mask,
+                                   attention_mask=attention_mask,
                                    image_groups=image_groups, rotary_positions=rotary_positions)
         return self._logits(x)
 
@@ -1633,7 +1586,7 @@ class CausalTransformer(nn.Module):
 
     def mtp_hidden_states(self, hidden, tokens, train: bool = False,
                           positions=None, segment_ids=None, input_embeddings=None,
-                          embedding_positions=None, attention_mask=None,
+                          attention_mask=None,
                           image_groups=None, rotary_positions=None):
         """One final-normed state array per shifted prediction depth.
 
@@ -1644,8 +1597,7 @@ class CausalTransformer(nn.Module):
         """
         if self.mtp and tokens.shape[1] <= len(self.mtp):
             raise ValueError("prediction depths need a sequence longer than their depth count")
-        embeds = self._scatter_inputs(self.token_embeddings(tokens), tokens,
-                                      input_embeddings, embedding_positions)
+        embeds = self._prepared(self.token_embeddings(tokens), input_embeddings)
         # A depth restricts its keys only where the caller's validity or a
         # document boundary does. With neither, every shifted pair is real,
         # and no validity says that: an all-true array would make the depth
@@ -1673,13 +1625,13 @@ class CausalTransformer(nn.Module):
         return states
 
     def mtp_logits(self, hidden, tokens, train: bool = False, positions=None,
-                   segment_ids=None, input_embeddings=None, embedding_positions=None,
+                   segment_ids=None, input_embeddings=None,
                    attention_mask=None, image_groups=None, rotary_positions=None):
         """The shared language head over each prediction depth's hidden states."""
         return [self._logits(state) for state in self.mtp_hidden_states(
             hidden, tokens, train=train, positions=positions, segment_ids=segment_ids,
-            input_embeddings=input_embeddings, embedding_positions=embedding_positions,
-            attention_mask=attention_mask, image_groups=image_groups, rotary_positions=rotary_positions)]
+            input_embeddings=input_embeddings, attention_mask=attention_mask, image_groups=image_groups,
+            rotary_positions=rotary_positions)]
 
     def mtp_step(self, hidden, tokens, *, depth: int = 0, positions=None,
                  input_embeddings=None, attention_mask=None, rotary_positions=None,
@@ -1789,7 +1741,7 @@ class CausalTransformer(nn.Module):
 
     def hidden_and_mtp_inputs(self, tokens, train: bool = False, decode: bool = False,
                               positions=None, segment_ids=None,
-                              input_embeddings=None, embedding_positions=None,
+                              input_embeddings=None,
                               attention_mask=None, image_groups=None, rotary_positions=None,
                               attention_pairwise_mask=None, attention_key_positions=None,
                               routed_experts=None, routed=None, media_mask=None):
@@ -1800,8 +1752,9 @@ class CausalTransformer(nn.Module):
         final normalized states. Packed `positions` and `segment_ids` reach the
         layers.
 
-        `input_embeddings` with their `embedding_positions` (both or neither)
-        replace the scaled token embeddings, for a caller fusing another encoder.
+        `input_embeddings` `[B, S, D]` replace the scaled token embeddings, for
+        a caller fusing another encoder; the token ids still feed per-layer
+        inputs and routing.
         `attention_pairwise_mask` is an explicit [B, queries, keys] visibility mask
         for ordinary attention, with optional `attention_key_positions` [B, keys]
         for local windows; both are call-local cached-read metadata.
@@ -1817,8 +1770,8 @@ class CausalTransformer(nn.Module):
         # The stack's entry and exit sit where the batch does, so neither the
         # lookup nor the head is computed whole on the shards of an axis that
         # splits the rows or the positions.
-        x = constrain(self._scatter_inputs(self.scaled_embeddings(self.token_embeddings(tokens)), tokens,
-                                           input_embeddings, embedding_positions), RESIDUAL)
+        x = constrain(self._prepared(self.scaled_embeddings(self.token_embeddings(tokens)),
+                                     input_embeddings), RESIDUAL)
         if self.position_embedding == 'learned':
             places = positions
             if places is None:
@@ -1835,8 +1788,7 @@ class CausalTransformer(nn.Module):
         # replacements in place, which token ids cannot rebuild. Sowing costs
         # nothing unless a caller opens the collection; init leaves it out.
         if not self.is_initializing():
-            prepared = self._scatter_inputs(self.token_embeddings(tokens), tokens,
-                                            input_embeddings, embedding_positions)
+            prepared = self._prepared(self.token_embeddings(tokens), input_embeddings)
             self.sow("embeddings", "prepared", prepared,
                      reduce_fn=lambda _, value: value, init_fn=lambda: prepared)
         ple = self._layer_inputs(tokens, x, routed_experts, routed)
@@ -2252,37 +2204,16 @@ class CausalTransformer(nn.Module):
             context.reshape(*inputs_embeds.shape[:-1], self.num_layers, ple))
         return (context + table) * jnp.asarray(2.0 ** -0.5, context.dtype)
 
-    def _scatter_inputs(self, x, tokens, input_embeddings, embedding_positions):
-        """`x` with the fused encoder outputs written at their token positions.
-
-        Both arguments or neither; the shapes are `[B, N, D]` and `[B, N]`
-        against the `[B, S, D]` embeddings, the positions are integers within
-        the sequence, and the values are already in the decoder's scaled
-        space, so they land as they arrive, cast to the stream dtype.
-        """
-        if (input_embeddings is None) != (embedding_positions is None):
-            raise ValueError(
-                "input_embeddings and embedding_positions arrive together: one "
-                "without the other names no replacement")
+    @staticmethod
+    def _prepared(x, input_embeddings):
+        """`x`, or in its place a caller's prepared `[B, S, D]` embeddings
+        (another encoder's outputs fused in), cast to the stream dtype."""
         if input_embeddings is None:
             return x
-        replacements = jnp.asarray(input_embeddings)
-        where = jnp.asarray(embedding_positions)
-        batch, length = tokens.shape
-        if (replacements.ndim != 3 or where.ndim != 2
-                or replacements.shape[0] != batch
-                or where.shape != (batch, replacements.shape[1])
-                or replacements.shape[2] != self.emb_features):
-            raise ValueError(
-                f"input_embeddings is [B, N, D] and embedding_positions [B, N] "
-                f"for [{batch}, {length}, {self.emb_features}] embeddings, got "
-                f"{replacements.shape} and {where.shape}")
-        if not jnp.issubdtype(where.dtype, jnp.integer):
-            raise ValueError(
-                "embedding_positions holds token positions, so an integer "
-                f"dtype, got {where.dtype}")
-        rows = jnp.arange(batch)[:, None]
-        return x.at[rows, where].set(replacements.astype(x.dtype))
+        prepared = jnp.asarray(input_embeddings)
+        if prepared.shape != x.shape:
+            raise ValueError(f"input_embeddings are the whole {x.shape} sequence, got {prepared.shape}")
+        return prepared.astype(x.dtype)
 
     def head_weight(self, params):
         """The `[D, vocab]` head matrix in its stored dtype, as the forward

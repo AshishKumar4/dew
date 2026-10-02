@@ -168,7 +168,9 @@ def test_rewards_measure_reference_relative_improvement_on_unequal_pairs():
         selected = np.take_along_axis(np.asarray(log_probs), ids[:, 1:, None], axis=-1)[..., 0]
         return (selected * mask).sum(axis=-1)
     rewards_chosen = .5 * (score(params, chosen, chosen_mask) - score(reference, chosen, chosen_mask))
-    rewards_rejected = .5 * (score(params, rejected, rejected_mask) - score(reference, rejected, rejected_mask))
+    rewards_rejected = 0.5 * (
+        score(params, rejected, rejected_mask) - score(reference, rejected, rejected_mask)
+    )
     np.testing.assert_allclose(aux.metrics["rewards/chosen"], rewards_chosen.mean(), rtol=1e-5, atol=1e-6)
     np.testing.assert_allclose(aux.metrics["rewards/rejected"], rewards_rejected.mean(), rtol=1e-5, atol=1e-6)
     assert float(aux.metrics["accuracy"]) == float((rewards_chosen > rewards_rejected).mean())
@@ -209,9 +211,15 @@ def test_the_reference_comes_from_the_frozen_tree():
     moved = jax.tree.map(lambda leaf: leaf + 1.0, frozen)
     batch = pair_batch()
 
-    base, _ = objective.scalar_loss(params, batch, Step(step=jnp.asarray(0), key=jax.random.key(1), ema=frozen))
-    live_moved, _ = objective.scalar_loss(moved, batch, Step(step=jnp.asarray(0), key=jax.random.key(1), ema=frozen))
-    ref_moved, _ = objective.scalar_loss(params, batch, Step(step=jnp.asarray(0), key=jax.random.key(1), ema=moved))
+    base, _ = objective.scalar_loss(
+        params, batch, Step(step=jnp.asarray(0), key=jax.random.key(1), ema=frozen)
+    )
+    live_moved, _ = objective.scalar_loss(
+        moved, batch, Step(step=jnp.asarray(0), key=jax.random.key(1), ema=frozen)
+    )
+    ref_moved, _ = objective.scalar_loss(
+        params, batch, Step(step=jnp.asarray(0), key=jax.random.key(1), ema=moved)
+    )
 
     assert abs(float(live_moved) - float(base)) > 1e-3
     assert abs(float(ref_moved) - float(base)) > 1e-3
@@ -284,7 +292,7 @@ def test_a_misshapen_batch_is_refused():
         objective.scalar_loss(params, wide, step)
 
     no_ref = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=None)
-    with pytest.raises(ValueError, match="step.ema"):
+    with pytest.raises(ValueError, match=r"step.ema"):
         objective.scalar_loss(params, batch, no_ref)
 
 

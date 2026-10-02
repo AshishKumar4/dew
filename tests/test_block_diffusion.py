@@ -31,7 +31,9 @@ def system():
     config = json.loads((WORKFLOW / "config.json").read_text())
     model = adapter.build(config, dtype="float32", attention_impl="xla")
     variables = adapter.translate_weights(load_file(str(WORKFLOW / "model.safetensors")), config)
-    process = adapter.generation_process(config, json.loads((WORKFLOW / "generation_config.json").read_text()))
+    process = adapter.generation_process(
+        config, json.loads((WORKFLOW / "generation_config.json").read_text())
+    )
     with np.load(WORKFLOW / "reference.npz") as stored:
         reference = {name: stored[name] for name in stored.files}
     with np.load(WORKFLOW / "numerics.npz") as stored:
@@ -254,7 +256,10 @@ def test_the_released_layout_denoiser_matches_the_reference():
     cache = prefill(model, variables, np.load(directory / "prompt.npy"))
     canvas = np.load(directory / "canvas.npy")
     with np.load(directory / "numerics.npz") as exact:
-        for name, previous in (("ref_bare", None), ("ref_conditioned", np.load(directory / "prev_logits.npy"))):
+        for name, previous in (
+            ("ref_bare", None),
+            ("ref_conditioned", np.load(directory / "prev_logits.npy")),
+        ):
             logits = model.apply({**variables, "cache": cache}, canvas, self_conditioning_logits=previous)
             reference = np.load(directory / f"{name}.npy")
             assert_as_exact_as_the_reference(logits, reference, exact[f"{name}_f64"], name)

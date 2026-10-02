@@ -1,6 +1,6 @@
 """A load onto a mesh builds each leaf from the mapped checkpoint, one device shard at a time.
 
-`load_pretrained(..., mesh=...)` translates the checkpoint into `SourceLeaf`
+`Pretrained.load(..., mesh=...)` translates the checkpoint into `SourceLeaf`
 recipes and lands each straight on its sharding through
 `jax.make_array_from_callback`. What a consumer can observe is that the
 placed values are the host load's values under the layout's sharding, and
@@ -14,7 +14,7 @@ import jax
 import numpy as np
 import pytest
 
-from dew.interop import load_pretrained
+from dew.interop import Pretrained
 from dew.interop.streaming import SourceLeaf
 from dew.training import Layout, MeshSpec
 
@@ -34,7 +34,7 @@ def test_a_mesh_load_lands_the_host_values_and_reads_at_most_one_shard(fixture, 
     Qwen 3.5 wrapper streams its language model beside its host-built tower.
     Every placed leaf equals the host load's, carries the layout's sharding,
     and every read is one device's shard of it."""
-    host = load_pretrained(FIXTURES / fixture, dtype="float32", param_dtype=param_dtype, attention_impl="xla")
+    host = Pretrained.load(FIXTURES / fixture, dtype="float32", param_dtype=param_dtype, attention_impl="xla")
     reads: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
     read = SourceLeaf.read
 
@@ -44,7 +44,7 @@ def test_a_mesh_load_lands_the_host_values_and_reads_at_most_one_shard(fixture, 
         return value
 
     monkeypatch.setattr(SourceLeaf, "read", recorded)
-    placed = load_pretrained(FIXTURES / fixture, dtype="float32", param_dtype=param_dtype,
+    placed = Pretrained.load(FIXTURES / fixture, dtype="float32", param_dtype=param_dtype,
                              attention_impl="xla", mesh=MeshSpec(fsdp=jax.device_count()), layout=LAYOUT)
 
     placed_leaves = jax.tree_util.tree_leaves_with_path(placed.variables)

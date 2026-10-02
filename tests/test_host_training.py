@@ -15,7 +15,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import group_layers
 from dew.nn.inputs import ModelInputs
-from dew.objectives.base import FROZEN, Aux, EMASpec, Ratio, Objective, merge
+from dew.objectives.base import FROZEN, Aux, EMASpec, Objective, Ratio, merge
 from dew.objectives.lm import LMObjective
 from dew.training import Layout, Trainer
 from dew.training.host import companion_mesh, transfer
@@ -255,7 +255,7 @@ def test_composite_replay_does_not_apply_effects_twice():
         ema = Tiny.ema
 
         def __init__(self):
-            self.reference = Tiny(True)
+            self.reference = Tiny(composite=True)
 
         def init(self, key, variables=None):
             return self.reference.init(key, variables)
@@ -308,7 +308,7 @@ def test_companion_coordinates_preserve_shards_under_device_permutation():
 def test_missing_companion_devices_names_the_launch_fix():
     devices = jax.devices("cpu")
     mesh = Mesh(np.asarray(devices, dtype=object), ("fsdp",), axis_types=(AxisType.Auto,))
-    with pytest.raises(ValueError, match="JAX_NUM_CPU_DEVICES=.*restart"):
+    with pytest.raises(ValueError, match=r"JAX_NUM_CPU_DEVICES=.*restart"):
         companion_mesh(mesh, devices[:1])
 
 
@@ -355,8 +355,8 @@ def tokens(width=9):
 
 
 def decoder(**overrides):
-    fields = dict(vocab_size=16, emb_features=8, num_layers=2, num_heads=2,
-                  mlp_features=16, max_seq_len=8, scan_layers=True)
+    fields = {"vocab_size": 16, "emb_features": 8, "num_layers": 2, "num_heads": 2,
+                  "mlp_features": 16, "max_seq_len": 8, "scan_layers": True}
     return CausalTransformer(**{**fields, **overrides})
 
 
@@ -515,12 +515,12 @@ def test_a_shared_text_owner_sums_both_block_losses_through_one_bank(detached):
     """
     from pathlib import Path
 
-    from dew.interop import load_pretrained
+    from dew.interop import Pretrained
     from dew.nn.diffusion_gemma import DiffusionGemma
     from dew.objectives.diffusion.block import BlockDiffusionObjective
 
     fixture = Path(__file__).resolve().parent / "fixtures/hf/diffusion-gemma-sft"
-    loaded = load_pretrained(fixture, dtype="float32", attention_impl="xla", max_seq_len=32)
+    loaded = Pretrained.load(fixture, dtype="float32", attention_impl="xla", max_seq_len=32)
     source = loaded.model
     assert isinstance(source, DiffusionGemma)
     scanned = source.clone(text=source.text.clone(scan_layers=True))
@@ -571,7 +571,7 @@ def test_frozen_leaves_stay_resident_and_snapshots_alias_them():
 
     objective = LMObjective(decoder(scan_layers=True), 8, head_chunks=1, trainable=trainable)
     trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(5), layout=HOST)
-    state, placement, _ = trainer.place()
+    state, _placement, _ = trainer.place()
     frozen = state.params[FROZEN]
     for path, leaf in _named_leaves(frozen):
         assert leaf.sharding.mesh == trainer.device_mesh, path
@@ -580,14 +580,24 @@ def test_frozen_leaves_stay_resident_and_snapshots_alias_them():
     with jax.set_mesh(trainer.state_mesh):
         first, second = execution.snapshot(state.params), execution.snapshot(state.params)
     bank = next(name for name in first["params"] if name.startswith("layers_0_"))
-    assert first["params"][bank]["mlp"]["gate_proj"]["kernel"] is second["params"][bank]["mlp"]["gate_proj"]["kernel"]
-    assert first["params"][bank]["self_attn"]["q_proj"]["kernel"] is not second["params"][bank]["self_attn"]["q_proj"]["kernel"]
+    assert (
+        first["params"][bank]["mlp"]["gate_proj"]["kernel"]
+        is second["params"][bank]["mlp"]["gate_proj"]["kernel"]
+    )
+    assert (
+        first["params"][bank]["self_attn"]["q_proj"]["kernel"]
+        is not second["params"][bank]["self_attn"]["q_proj"]["kernel"]
+    )
     before = _pointers(frozen)
     step = trainer.compile(state, tokens())
     for _ in range(2):
         state, *_ = step(state, tokens())
     assert _pointers(state.params[FROZEN]) == before
-    assert _pointers(state.params["params"]) != _pointers(frozen) and set(state.params["params"]) == {"layers_0", "layers_1"}
+    assert _pointers(state.params["params"]) != _pointers(frozen) and set(state.params["params"]) == {
+        "layers_0",
+        "layers_1",
+    }
+
 
 def test_place_streams_the_held_tree_and_releases_each_source():
     """The objective's held leaves become the placed arrays as they land, so
@@ -606,13 +616,36 @@ def test_place_streams_the_held_tree_and_releases_each_source():
     bank = state.params[FROZEN]["layers_0_1"]["mlp"]["gate_proj"]["kernel"]
     assert held["params"]["layers_1"]["mlp"]["gate_proj"]["kernel"] is bank
     assert held["params"]["layers_0"]["mlp"]["gate_proj"]["kernel"] is bank
-    assert state.params["params"]["layers_0"]["self_attn"]["q_proj"]["kernel"] is held["params"]["layers_0"]["self_attn"]["q_proj"]["kernel"]
+    assert (
+        state.params["params"]["layers_0"]["self_attn"]["q_proj"]["kernel"]
+        is held["params"]["layers_0"]["self_attn"]["q_proj"]["kernel"]
+    )
     fresh = jax.tree.map(np.asarray, model.init(jax.random.key(1), jnp.zeros((1, 8), jnp.int32)))
-    resident = updated(LMObjective(model, 8, head_chunks=1, pretrained=fresh,
-                                   trainable=lambda path: path[-2:] == ("q_proj", "kernel")), tokens(), DEVICE)
-    close(updated(LMObjective(model, 8, head_chunks=1, pretrained=jax.tree.map(np.asarray, fresh),
-                              trainable=lambda path: path[-2:] == ("q_proj", "kernel")), tokens(), HOST).params,
-          resident.params)
+    resident = updated(
+        LMObjective(
+            model,
+            8,
+            head_chunks=1,
+            pretrained=fresh,
+            trainable=lambda path: path[-2:] == ("q_proj", "kernel"),
+        ),
+        tokens(),
+        DEVICE,
+    )
+    close(
+        updated(
+            LMObjective(
+                model,
+                8,
+                head_chunks=1,
+                pretrained=jax.tree.map(np.asarray, fresh),
+                trainable=lambda path: path[-2:] == ("q_proj", "kernel"),
+            ),
+            tokens(),
+            HOST,
+        ).params,
+        resident.params,
+    )
 
 
 def _resident_pages(view: np.ndarray) -> int:
@@ -675,7 +708,9 @@ def test_place_lets_a_mapped_checkpoint_page_go_once_the_leaf_has_landed(tmp_pat
     assert _resident_pages(banked_row) < pages // 10
     assert _resident_pages(single) < single.nbytes // 4096
     np.testing.assert_array_equal(
-        np.asarray(state.params[FROZEN]["layers_0_1"]["mlp"]["gate_proj"]["kernel"])[1], np.asarray(banked_row))
+        np.asarray(state.params[FROZEN]["layers_0_1"]["mlp"]["gate_proj"]["kernel"])[1],
+        np.asarray(banked_row),
+    )
 
 
 def test_stream_refuses_a_node_it_cannot_update_in_place_by_its_path():

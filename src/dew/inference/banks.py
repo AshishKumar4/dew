@@ -11,8 +11,9 @@ memory never exists per layer and banked at once.
 fetches a layer at a time (`run_stack`); everything else is placed as the
 trainer places a parameter. A `LayerBanks` source is a run directory
 (`CheckpointBanks`), a tree in memory (`HeldBanks`) or local HF safetensors
-(`SafetensorsBanks`). `host_banked` places whole banks; `stream_banked`
-leaves decoder weights on disk for the prefetch loop to read at execution.
+(`SafetensorsBanks`). A source's `place` puts whole banks on the mesh;
+`SafetensorsBanks.stream` leaves decoder weights on disk for the prefetch
+loop to read at execution.
 """
 
 from __future__ import annotations
@@ -49,7 +50,8 @@ class LayerBanks(Protocol):
 
     Paths are canonical below each collection, and a namespace selects a
     decoder inside a wrapper. What holding one bank costs is the source's
-    own business, and is what bounds a load.
+    own business, and is what bounds a load. A source subclasses this for
+    `place`, which builds a model's banked store from it.
     """
 
     def shapes(self) -> Variables:
@@ -67,6 +69,38 @@ class LayerBanks(Protocol):
         Formats carry a physical layout which the source must preserve.
         Returned collections are local to namespace."""
         ...
+
+    def place(self, model: BankedModel, *, mesh: MeshSpec | Mesh | None = None,
+              layout: Layout | None = None) -> Variables:
+        """Build the banked store `model`'s runs read from these weights.
+
+        Each bank's copies are waited for before the next bank is read, so a
+        load has one bank's transfers in flight, and costs the store plus what
+        this source holds. Nothing here donates or deletes a source's arrays.
+
+        `layout.host_parameters` may name only layers of the stack, which fetches
+        a layer as it reaches it; an embedding or head brought over whole would
+        cost the device memory it was meant to save. A run whose layers the
+        patterns place differently is refused too, since a bank is one array
+        with one sharding. Both are refused before anything is read.
+        """
+        sites, shapes, _device_mesh, placement, entries = _bank_plan(model, self, mesh, layout)
+
+        entry_values = jax.block_until_ready(self.entry(entries)) if entries else {}
+        bank_store: dict[str, dict] = {}
+        for site in sites:
+            for (first, count), name in zip(site.view.groups, site.view.bank_names(), strict=True):
+                bank = jax.block_until_ready(self.bank(
+                    range(first, first + count),
+                    _bank_placement(one_layer(placement, first, namespace=site.namespace),
+                                    one_layer(shapes, first, namespace=site.namespace), stacked=count > 1),
+                    namespace=site.namespace))
+                for collection, tree in bank.items():
+                    branch = bank_store.setdefault(collection, {})
+                    for component in site.namespace:
+                        branch = branch.setdefault(component, {})
+                    branch[name] = tree
+        return merge(entry_values, bank_store)
 
 
 def layer_index(name: str) -> int | None:
@@ -121,9 +155,8 @@ def at_namespace(subtrees: Variables, namespace: tuple[str, ...]) -> Variables:
     return collected
 
 
-
 @dataclasses.dataclass(frozen=True)
-class HeldBanks:
+class HeldBanks(LayerBanks):
     """Serve banks from a variables tree already held in memory.
 
     The tree is the one `model.init` or a loader produced, one subtree per
@@ -152,7 +185,7 @@ class HeldBanks:
 
 
 @dataclasses.dataclass(frozen=True)
-class CheckpointBanks:
+class CheckpointBanks(LayerBanks):
     """Serve banks by restoring a run's published weights one bank at a time.
 
     `ema` merges the averaged copy over the live weights, as
@@ -226,7 +259,7 @@ class DiskBankStats:
     wait_seconds: float
 
 
-class SafetensorsBanks:
+class SafetensorsBanks(LayerBanks):
     """Read a local HF decoder checkpoint without materializing its layer stack.
 
     Translation reuses the ordinary decoder's `SourceLeaf` recipes over
@@ -352,6 +385,56 @@ class SafetensorsBanks:
         rows = [self.read(index, namespace=namespace) for index in layers]
         bank = jax.tree.map(lambda *leaves: np.stack(leaves), *rows)
         return jax.device_put(bank, placement)
+
+    def stream(self, model: BankedModel, *, mesh: MeshSpec | Mesh | None = None,
+               layout: Layout | None = None) -> Variables:
+        """Bind disk rows to the ordinary banked inference loop on one device.
+
+        Only non-decoder leaves are loaded now. Each declared run receives a
+        static handle in the runtime-only `streaming` collection, which the
+        stack's two-row prefetch carry calls at execution.
+
+        Single-device inference only: a mesh above one, host placement or an
+        unscanned stack is refused before loading weights. The host callback
+        needs the CPU backend beside the accelerator (`JAX_PLATFORMS=cuda,cpu`
+        when platforms are explicit). Keep this source open until executions complete.
+        """
+        sites, _shapes, device_mesh, placement, entries = _bank_plan(model, self, mesh, layout)
+        if device_mesh.size != 1:
+            raise ValueError("disk streaming requires a single-device mesh")
+        if any(not site.scanned for site in sites):
+            raise ValueError("disk streaming requires scan_layers=True for bounded device prefetch")
+        if any(sharding.memory_kind != "device" for sharding in jax.tree.leaves(placement)):
+            raise ValueError(
+                "disk streaming uses its own bounded host cache; leave layout host placement empty")
+        try:
+            jax.devices("cpu")
+        except RuntimeError as error:
+            raise ValueError(
+                "disk streaming requires the CPU callback backend; configure "
+                "JAX_PLATFORMS=cuda,cpu (or your accelerator,cpu) before JAX initialization"
+            ) from error
+        device = SingleDeviceSharding(device_mesh.devices.flat[0])
+        handles: Variables = {}
+        for site in sites:
+            groups = site.view.groups
+            local = {
+                name: {
+                    "bank": StreamedBank(
+                        self,
+                        first,
+                        count,
+                        site.namespace,
+                        device,
+                        groups[index + 1][0] if index + 1 < len(groups) else groups[0][0],
+                    )
+                }
+                for index, ((first, count), name)
+                in enumerate(zip(groups, site.view.bank_names(), strict=True))
+            }
+            handles = merge(handles, at_namespace({"streaming": local}, site.namespace))
+        entries = jax.block_until_ready(self.entry(entries)) if entries else {}
+        return merge(entries, handles)
 
     def read(self, index: int, *, namespace: tuple[str, ...] = (),
              following: int | None = None) -> Variables:
@@ -513,7 +596,6 @@ def _bank_placement(placement: Placement, shapes: Variables, stacked: bool) -> P
     return jax.tree.map(place, placement, shapes)
 
 
-
 class BankedModel(Protocol):
     @property
     def bank_sites(self) -> tuple[DecoderBank, ...]: ...
@@ -618,88 +700,6 @@ def _bank_plan(model: BankedModel, source: LayerBanks, mesh: MeshSpec | Mesh | N
         _check_consumers(in_namespace(placement, site.namespace), site.view.groups)
 
     return sites, shapes, device_mesh, placement, entries
-
-
-def host_banked(model: BankedModel, source: LayerBanks, *,
-                mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None) -> Variables:
-    """Build the banked store `model`'s runs read from `source`'s weights.
-
-    Each bank's copies are waited for before the next bank is read, so a
-    load has one bank's transfers in flight, and costs the store plus what
-    its source holds. Nothing here donates or deletes a source's arrays.
-
-    `layout.host_parameters` may name only layers of the stack, which fetches
-    a layer as it reaches it; an embedding or head brought over whole would
-    cost the device memory it was meant to save. A run whose layers the
-    patterns place differently is refused too, since a bank is one array
-    with one sharding. Both are refused before anything is read.
-    """
-    sites, shapes, _device_mesh, placement, entries = _bank_plan(model, source, mesh, layout)
-
-    entry_values = jax.block_until_ready(source.entry(entries)) if entries else {}
-    bank_store: dict[str, dict] = {}
-    for site in sites:
-        for (first, count), name in zip(site.view.groups, site.view.bank_names(), strict=True):
-            bank = jax.block_until_ready(source.bank(
-                range(first, first + count),
-                _bank_placement(one_layer(placement, first, namespace=site.namespace),
-                                one_layer(shapes, first, namespace=site.namespace), stacked=count > 1),
-                namespace=site.namespace))
-            for collection, tree in bank.items():
-                branch = bank_store.setdefault(collection, {})
-                for component in site.namespace:
-                    branch = branch.setdefault(component, {})
-                branch[name] = tree
-    return merge(entry_values, bank_store)
-
-
-def stream_banked(model: BankedModel, source: SafetensorsBanks, *,
-                  mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None) -> Variables:
-    """Bind disk rows to the ordinary banked inference loop on one device.
-
-    Only non-decoder leaves are loaded now. Each declared run receives a
-    static handle in the runtime-only `streaming` collection, which the
-    stack's two-row prefetch carry calls at execution.
-
-    Single-device inference only: a mesh above one, host placement or an
-    unscanned stack is refused before loading weights. The host callback
-    needs the CPU backend beside the accelerator (`JAX_PLATFORMS=cuda,cpu`
-    when platforms are explicit). Keep `source` open until executions complete.
-    """
-    sites, _shapes, device_mesh, placement, entries = _bank_plan(model, source, mesh, layout)
-    if device_mesh.size != 1:
-        raise ValueError("disk streaming requires a single-device mesh")
-    if any(not site.scanned for site in sites):
-        raise ValueError("disk streaming requires scan_layers=True for bounded device prefetch")
-    if any(sharding.memory_kind != "device" for sharding in jax.tree.leaves(placement)):
-        raise ValueError("disk streaming uses its own bounded host cache; leave layout host placement empty")
-    try:
-        jax.devices("cpu")
-    except RuntimeError as error:
-        raise ValueError(
-            "disk streaming requires the CPU callback backend; configure "
-            "JAX_PLATFORMS=cuda,cpu (or your accelerator,cpu) before JAX initialization"
-        ) from error
-    device = SingleDeviceSharding(device_mesh.devices.flat[0])
-    handles: Variables = {}
-    for site in sites:
-        groups = site.view.groups
-        local = {
-            name: {
-                "bank": StreamedBank(
-                    source,
-                    first,
-                    count,
-                    site.namespace,
-                    device,
-                    groups[index + 1][0] if index + 1 < len(groups) else groups[0][0],
-                )
-            }
-            for index, ((first, count), name) in enumerate(zip(groups, site.view.bank_names(), strict=True))
-        }
-        handles = merge(handles, at_namespace({"streaming": local}, site.namespace))
-    entries = jax.block_until_ready(source.entry(entries)) if entries else {}
-    return merge(entries, handles)
 
 
 def _places(subtree) -> dict[str, tuple[str, str]]:

@@ -1,7 +1,7 @@
 """The reverse process for diffusion, and decoding for language models."""
 
 from .decoding import LogitsTransform, StepState, Stopping
-from .flow import FlowSDE, FlowTrajectory, GaussianTransition, flow_transition, sample_trajectory
+from .flow import FlowSDE, FlowTrajectory, GaussianTransition
 from .guidance import APG, CFG, Autoguidance, CFGPlusPlus, Guidance
 from .guided import Grammar
 from .pipelines import TextToImage
@@ -67,8 +67,6 @@ __all__ = [
     "Strategy",
     "TextToImage",
     "UniPC",
-    "flow_transition",
     "generate",
     "sample",
-    "sample_trajectory",
 ]

@@ -12,9 +12,7 @@ turns into a subcommand (`data:token-windows --data.path ...`).
 The resolved config is the run's spec. A recipe writes it to `run.json` next
 to the checkpoints with `save`, and `load` reads it back into the same class,
 so inference rebuilds a run from what training was built from. A field the
-file lacks takes its declared default, so a field added later must default to
-what runs recorded before it did; tests/fixtures/record_defaults.json holds
-every recorded field's default to that. A field the class does not have
+file lacks takes its declared default, and a field the class does not have
 raises.
 """
 
@@ -320,9 +318,9 @@ class TrainerConfig:
     name: str | None = None
     checkpoint_dir: str = "./checkpoints"
     keep: Annotated[int | Keep, _keep_argument()] = 2
+    """Latest checkpoints kept, besides the best one."""
     best: Annotated[str | Best | tuple[Best, ...] | None, _best_argument()] = None
     """Metric name and ranking policy; None selects validation loss or training loss."""
-    """Latest checkpoints kept, besides the best one."""
     batch_size: int = 32
     """Global batch, over every process."""
     key: int = 0
@@ -579,28 +577,12 @@ def _has_default(field: dataclasses.Field) -> bool:
     return field.default is not dataclasses.MISSING or field.default_factory is not dataclasses.MISSING
 
 
-_FIELD_RENAMES: Mapping[type, Mapping[str, str]] = {TrainerConfig: {"seed": "key"}}
-
-
 def _fields(cls: type, values: registry.Configured) -> dict[str, registry.Configured]:
     """The record's fields as `cls` declares them. A field the record lacks
-    takes its declared default, which says what runs recorded before the
-    field existed did (tests/fixtures/record_defaults.json holds every
-    default to that); a field `cls` does not declare, or a required one the
-    record lacks, raises.
-
-    A field whose default moved after runs were recorded without it says
-    what those runs meant as `metadata={"legacy": value}`, and a record
-    that lacks it reads as that value. Every record `to_dict` writes
-    carries the field, so code that builds the class takes the new default
-    and a recorded run keeps the old one."""
+    takes its declared default; a field `cls` does not declare, or a
+    required one the record lacks, raises."""
     if not isinstance(values, Mapping):
         raise ValueError(f"{cls.__name__} is built from a record of its fields, not {values!r}")
-    for old, new in _FIELD_RENAMES.get(cls, {}).items():
-        if old in values:
-            if new in values:
-                raise ValueError(f"{cls.__name__} record carries both {old} and {new}")
-            values = {new if key == old else key: value for key, value in values.items()}
     declared = [f for f in dataclasses.fields(cls) if _recorded(f)]
     unknown = sorted(set(values) - {f.name for f in declared})
     missing = [f.name for f in declared if f.name not in values and not _has_default(f)]
@@ -608,9 +590,8 @@ def _fields(cls: type, values: registry.Configured) -> dict[str, registry.Config
         raise ValueError(
             f"{cls.__name__} does not match the record: unknown fields {unknown}, "
             f"missing fields {missing}")
-    return {f.name: _rebuild(_declared_type(cls, f.name), registry.configured(
-                values[f.name] if f.name in values else f.metadata["legacy"]))
-            for f in declared if f.name in values or "legacy" in f.metadata}
+    return {f.name: _rebuild(_declared_type(cls, f.name), registry.configured(values[f.name]))
+            for f in declared if f.name in values}
 
 
 def _built[ValueT](cls: type[ValueT], values: Mapping[str, object]) -> ValueT:
@@ -683,8 +664,7 @@ class RunConfig:
     """Describes a whole run. Recipes add their objective's knobs by subclassing this."""
 
     model: ModelConfig = dataclasses.field(default_factory=ModelConfig)
-    data: DataSpec = dataclasses.field(
-        default_factory=lambda: datasets["oxford_flowers102"]())
+    data: DataSpec = dataclasses.field(default_factory=lambda: datasets["tfds_images"]())
     optim: OptimConfig = dataclasses.field(default_factory=OptimConfig)
     trainer: TrainerConfig = dataclasses.field(default_factory=TrainerConfig)
     objective: str | None = None
@@ -799,11 +779,14 @@ class RunConfig:
                         json_value(summary or {}), steps, packages_installed()), 0)
 
             agreed("run metadata", record_run)
-            state = Trainer.from_config(
-                trainer, objective, self.optim.build(steps),
-                key=trainer.key,
-                checkpoints=checkpoints,
-                tracker=tracker, rollout=rollout,
+            # The trainer holds mesh, layout, accumulation, dynamic_scale and
+            # profile; prepare_process read the process fields, and the rest
+            # are fit's arguments or built the checkpoints and the tracker.
+            state = Trainer(
+                objective, self.optim.build(steps), key=trainer.key,
+                mesh=trainer.mesh, layout=trainer.layout, accumulation=trainer.accumulation,
+                dynamic_scale=trainer.dynamic_scale, checkpoints=checkpoints, tracker=tracker,
+                rollout=rollout, profile=trainer.profile,
             ).fit(
                 dataset, steps=steps,
                 log_every=trainer.log_every,

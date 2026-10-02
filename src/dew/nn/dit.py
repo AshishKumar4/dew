@@ -237,19 +237,17 @@ class ConditioningEmbed(nn.Module):
     time_scale: float = 16
 
     def setup(self):
-        if self.interval:
-            self.duration_embed = nn.Sequential([
+        def time_embedding(name: str) -> nn.Sequential:
+            return nn.Sequential([
                 FourierEmbedding(features=self.emb_features, scale=self.time_scale, dtype=self.dtype),
                 TimeProjection(features=self.emb_features * self.mlp_ratio,
                                dtype=self.dtype, precision=self.precision),
                 nn.Dense(features=self.emb_features, dtype=self.dtype, precision=self.precision),
-            ], name="duration_embed")
-        self.time_embed = nn.Sequential([
-            FourierEmbedding(features=self.emb_features, scale=self.time_scale, dtype=self.dtype),
-            TimeProjection(features=self.emb_features * self.mlp_ratio,
-                           dtype=self.dtype, precision=self.precision),
-            nn.Dense(features=self.emb_features, dtype=self.dtype, precision=self.precision),
-        ], name="time_embed")
+            ], name=name)
+
+        if self.interval:
+            self.duration_embed = time_embedding("duration_embed")
+        self.time_embed = time_embedding("time_embed")
         self.text_proj = nn.Dense(
             features=self.emb_features, dtype=self.dtype,
             precision=self.precision, name="text_context_proj")

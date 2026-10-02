@@ -19,7 +19,7 @@ from safetensors.numpy import load_file
 
 from dew import Dataset, Trainer
 from dew.checkpoints import Checkpoints
-from dew.interop import load_pretrained
+from dew.interop import Pretrained
 from dew.interop.diffusion_gemma import translate_weights
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import FROZEN, Step
@@ -31,7 +31,7 @@ REFERENCES = FIXTURE / "reference"
 
 @pytest.fixture(scope="module")
 def source():
-    loaded = load_pretrained(FIXTURE, dtype="float32", attention_impl="xla", max_seq_len=32)
+    loaded = Pretrained.load(FIXTURE, dtype="float32", attention_impl="xla", max_seq_len=32)
     with np.load(FIXTURE / "reference.npz") as arrays:
         reference = {name: arrays[name] for name in arrays.files}
     batch = {"text": reference["tokens"], "canvas_mask": reference["canvas_mask"],
@@ -53,7 +53,7 @@ def reference_variables(loaded, name):
 
 def assert_tree_close(actual, expected, tolerance):
     assert jax.tree.structure(actual) == jax.tree.structure(expected)
-    for left, right in zip(jax.tree.leaves(actual), jax.tree.leaves(expected)):
+    for left, right in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
         np.testing.assert_allclose(left, right, atol=tolerance, rtol=0)
 
 
@@ -88,7 +88,13 @@ def test_disabling_encoder_gradient_matches_the_reference_control(source):
     expected = reference_variables(loaded, "detached_gradient.safetensors")
     assert_tree_close(gradient, expected, 1e-4)
     full = reference_variables(loaded, "gradient.safetensors")
-    assert max(float(jnp.max(jnp.abs(a - b))) for a, b in zip(jax.tree.leaves(gradient), jax.tree.leaves(full))) > 1e-3
+    assert (
+        max(
+            float(jnp.max(jnp.abs(a - b)))
+            for a, b in zip(jax.tree.leaves(gradient), jax.tree.leaves(full), strict=True)
+        )
+        > 1e-3
+    )
 
 
 @pytest.mark.parametrize("probability,reference_key", [(0., "sc_off_loss"), (1., "sc_on_loss")])
@@ -147,7 +153,7 @@ def test_real_trainer_update_and_checkpoint_resume(source, tmp_path):
     updated = trainer.fit(data, steps=1, checkpoint_every=1, log_every=1)
     assert_tree_close(updated.params, expected, 2e-6)
     replace(loaded, model=obj.model).save(tmp_path / "published", variables=updated.params)
-    readback = load_pretrained(tmp_path / "published", dtype="float32", attention_impl="xla", max_seq_len=32)
+    readback = Pretrained.load(tmp_path / "published", dtype="float32", attention_impl="xla", max_seq_len=32)
     assert_tree_close(objective(readback).init(jax.random.key(0)), updated.params, 0)
 
     resumed = Trainer(obj, optax.sgd(0.001), key=run_key,
@@ -160,7 +166,7 @@ def test_real_trainer_update_and_checkpoint_resume(source, tmp_path):
 
 def test_fresh_diffusion_gemma_sft_initializes_and_trains_its_vision_parameters():
     directory = FIXTURE.parent / "diffusion-gemma-workflow"
-    source = load_pretrained(directory, dtype="float32", attention_impl="xla", max_seq_len=32)
+    source = Pretrained.load(directory, dtype="float32", attention_impl="xla", max_seq_len=32)
     objective = BlockDiffusionObjective(source.model, prompt_length=8, pad_token_id=0)
     parameters = jax.jit(objective.init)(jax.random.key(0))
     with np.load(directory / "reference.npz") as reference:
@@ -181,7 +187,7 @@ def test_fresh_diffusion_gemma_sft_initializes_and_trains_its_vision_parameters(
 def image_source():
     """Native SFT behavior over the real loaded multimodal generation fixture."""
     directory = FIXTURE.parent / "diffusion-gemma-workflow"
-    loaded = load_pretrained(directory, dtype="float32", attention_impl="xla", max_seq_len=32)
+    loaded = Pretrained.load(directory, dtype="float32", attention_impl="xla", max_seq_len=32)
     with np.load(directory / "reference.npz") as reference:
         pixels = jnp.asarray(reference["pixels"])
     pixels = jnp.concatenate([pixels, pixels[..., ::-1]], axis=-1)
@@ -227,7 +233,9 @@ def test_image_sft_uses_media_validity_groups_and_positions(image_source):
     np.testing.assert_array_equal(media_gradient[0, 1], 0)
     assert any(float(jnp.linalg.norm(leaf)) > 0
                for leaf in jax.tree.leaves(gradient["params"]["conditioner"]))
-    changed = inputs.replace(conditioning={**inputs.conditioning, "pixel_values": -inputs.conditioning["pixel_values"]})
+    changed = inputs.replace(
+        conditioning={**inputs.conditioning, "pixel_values": -inputs.conditioning["pixel_values"]}
+    )
     changed_loss = evaluate(variables, changed)[0]
     assert abs(float(changed_loss - loss)) > 1e-5
     for name, replacement in (("attention_mask", inputs.tokens != 0),
@@ -261,7 +269,7 @@ def test_denoiser_image_gradient_obeys_encoder_detachment(image_source):
         obj = BlockDiffusionObjective(loaded.model, prompt_length=8, pretrained=loaded.variables,
                                       encoder_loss_weight=0,
                                       stop_gradient_from_denoiser_to_encoder=detach)
-        def loss(pixels):
+        def loss(pixels, *, obj=obj):
             conditioned = inputs.replace(conditioning={**inputs.conditioning, "pixel_values": pixels})
             return obj.scalar_loss(variables, {"text": conditioned}, step)[0]
         gradient = jax.jit(jax.grad(loss))(inputs.conditioning["pixel_values"])
@@ -289,7 +297,7 @@ def test_image_sft_trainer_resume_publish_and_generate(image_source, tmp_path):
     assert_tree_close(updated.params, expected, 2e-6)
     assert any(not np.array_equal(before, after) for before, after in zip(
         jax.tree.leaves(variables["params"]["conditioner"]),
-        jax.tree.leaves(updated.params["params"]["conditioner"])))
+        jax.tree.leaves(updated.params["params"]["conditioner"]), strict=True))
     resumed = Trainer(obj, optax.sgd(0.001), key=run_key,
                       checkpoints=Checkpoints(str(tmp_path / "run"))).fit(
                           data, steps=2, checkpoint_every=1, log_every=1)
@@ -299,7 +307,7 @@ def test_image_sft_trainer_resume_publish_and_generate(image_source, tmp_path):
     assert int(resumed.updates) == 2
 
     replace(loaded, model=obj.model).save(tmp_path / "published", variables=resumed.params)
-    readback = load_pretrained(tmp_path / "published", dtype="float32", attention_impl="xla", max_seq_len=32)
+    readback = Pretrained.load(tmp_path / "published", dtype="float32", attention_impl="xla", max_seq_len=32)
     restored = BlockDiffusionObjective(readback.model, prompt_length=8, pretrained=readback.variables)
     assert_tree_close(restored.init(jax.random.key(0)), resumed.params, 0)
     original_loss = obj.scalar_loss(resumed.params, {"text": inputs}, step)[0]

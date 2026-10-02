@@ -52,10 +52,10 @@ def decoder_norm(kind: Literal['rms', 'layer'], *, epsilon: float,
 class Mixture:
     """The experts some layers route to, and how the router chooses.
 
-    `layers` names the sparse layers by index, or `every` makes every nth layer
-    sparse counting from the end of the first group (Qwen3-MoE's
-    decoder_sparse_step); neither makes every layer sparse (Mixtral). The
-    routing fields pass straight through to `Router`, which documents them.
+    `layers` names the sparse layers by index (a source's cadence, such as
+    Qwen3-MoE's decoder_sparse_step, translates to them); None makes every
+    layer sparse (Mixtral). The routing fields pass straight through to
+    `Router`, which documents them.
     `parallel` is Gemma 4's placement (`enable_moe_block`): the experts run
     beside the dense feed-forward on the same residual, each normed and summed,
     under `Gemma4TextRouter`, which refuses the routing fields.
@@ -74,7 +74,6 @@ class Mixture:
     experts: int
     top_k: int = 2
     layers: tuple[int, ...] | None = None
-    every: int | None = None
     score_function: str = 'softmax'
     norm_topk_prob: bool = True
     scaling: float = 1.0
@@ -108,12 +107,6 @@ class Mixture:
             raise ValueError(
                 f"a mixture needs experts to route to, got {self.experts}; a "
                 "dense model has no mixture at all")
-        if self.layers is not None and self.every is not None:
-            raise ValueError(
-                f"layers ({self.layers}) and every ({self.every}) both choose the "
-                "sparse layers, so only one of them can be set")
-        if self.every is not None and self.every < 1:
-            raise ValueError(f"every must be positive, got {self.every}")
         if self.expert_features is not None and self.expert_features < 1:
             raise ValueError(
                 f"expert_features is the routed experts' width, got "

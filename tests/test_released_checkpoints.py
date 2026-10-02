@@ -55,7 +55,7 @@ import numpy as np
 import optax
 import pytest
 
-from dew.interop import load_pretrained
+from dew.interop import Pretrained
 from dew.objectives.base import Step
 from dew.sampling import Sampling
 
@@ -113,7 +113,7 @@ def bundle(checkpoint):
     repo, revision = CHECKPOINTS[checkpoint]
     if not available(repo, revision):
         pytest.skip(f"{repo} at {revision[:8]} is neither cached nor DEW_NETWORK_TESTS=1")
-    return load_pretrained(repo, dtype="float32", attention_impl="reference",
+    return Pretrained.load(repo, dtype="float32", attention_impl="reference",
                            max_seq_len=SEQ, revision=revision)
 
 
@@ -308,7 +308,7 @@ def test_one_trainer_step_moves_the_weights_by_the_objectives_gradient(scoring, 
 def test_the_trained_export_reloads_and_transformers_reads_it(
         bundle, batch, trained, checkpoint, tmp_path):
     """`Pretrained.save` writes the trained weights back into the released
-    layout: `load_pretrained` reads them back leaf for leaf, rebuilds the
+    layout: `Pretrained.load` reads them back leaf for leaf, rebuilds the
     same model and still carries a tokenizer, and transformers loads the
     same directory, consuming every tensor and wanting none, and computes
     the same logits."""
@@ -323,7 +323,7 @@ def test_the_trained_export_reloads_and_transformers_reads_it(
     bundle.save(export, variables=state.params)
     ours = np.asarray(bundle.model.apply(state.params, inputs.tokens, **inputs.kwargs()),
                       np.float32)
-    again = load_pretrained(export, dtype="float32", attention_impl="reference", max_seq_len=SEQ)
+    again = Pretrained.load(export, dtype="float32", attention_impl="reference", max_seq_len=SEQ)
 
     assert again.model == bundle.model, "the exported config rebuilds a different model"
     assert again.processor is not None, "the export carries no tokenizer"

@@ -6,7 +6,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.interop import load_pretrained
+from dew.interop import Pretrained
 
 DIRECTORY = Path(__file__).parent / 'fixtures' / 'hf' / 'gpt-neox-tiny'
 
@@ -14,7 +14,7 @@ DIRECTORY = Path(__file__).parent / 'fixtures' / 'hf' / 'gpt-neox-tiny'
 def test_gpt_neox_logits_and_cached_greedy_generation_match_transformers():
     from tools.classic_gpt_reference import greedy
 
-    loaded = load_pretrained(DIRECTORY, dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference')
     ids = np.load(DIRECTORY / 'input_ids.npy')
     expected = np.load(DIRECTORY / 'logits.npy')
     actual = np.asarray(loaded.model.apply(loaded.variables, jnp.asarray(ids)))
@@ -30,7 +30,7 @@ def test_gpt_neox_fused_qkv_is_grouped_by_head():
     from dew.interop.hf_decoders import translate_config, translate_weights
     from dew.interop.sources import load_shards
 
-    loaded = load_pretrained(DIRECTORY, dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference')
     tensors = dict(load_shards(DIRECTORY))
     for index in range(loaded.model.num_layers):
         for suffix in ('weight', 'bias'):
@@ -48,13 +48,13 @@ def test_gpt_neox_fused_qkv_is_grouped_by_head():
 def test_gpt_neox_export_preserves_fused_head_layout(tmp_path):
     from dew.interop.sources import load_shards
 
-    loaded = load_pretrained(DIRECTORY, dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference')
     loaded.save(tmp_path)
     exported, original = load_shards(tmp_path), load_shards(DIRECTORY)
     assert set(exported) == set(original)
     for name in original:
         np.testing.assert_array_equal(exported[name], original[name])
-    reloaded = load_pretrained(tmp_path, dtype='float32', attention_impl='reference')
+    reloaded = Pretrained.load(tmp_path, dtype='float32', attention_impl='reference')
     ids = jnp.asarray(np.load(DIRECTORY / 'input_ids.npy'))
     np.testing.assert_array_equal(reloaded.model.apply(reloaded.variables, ids),
                                   loaded.model.apply(loaded.variables, ids))
@@ -65,13 +65,15 @@ def test_legacy_neox_buffers_are_validated_in_their_stored_precision():
     from dew.interop.sources import load_shards
     from dew.nn.rope import inverse_frequencies
 
-    loaded = load_pretrained(DIRECTORY, dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference')
     config = translate_config(loaded.config)
     tensors = dict(load_shards(DIRECTORY))
     prefix = 'gpt_neox.layers.0.attention.'
     tensors[prefix + 'bias'] = np.tril(np.ones((1, 1, 64, 64), bool))
     tensors[prefix + 'masked_bias'] = np.asarray(-np.inf, np.float16)
-    tensors[prefix + 'rotary_emb.inv_freq'] = inverse_frequencies(10000., 4, dtype=np.float32).astype(np.float16)
+    tensors[prefix + "rotary_emb.inv_freq"] = inverse_frequencies(10000.0, 4, dtype=np.float32).astype(
+        np.float16
+    )
     actual = translate_weights(tensors, config, 'gpt_neox')
     ids = jnp.asarray(np.load(DIRECTORY / 'input_ids.npy'))
     np.testing.assert_array_equal(loaded.model.apply(actual, ids), loaded.model.apply(loaded.variables, ids))

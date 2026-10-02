@@ -27,8 +27,9 @@ import pytest
 
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.diffusion import component_tensors, flux2_fields, translate_flux2_weights
-from dew.nn.autoencoders.flux2 import load_flux2_vae, unfold
+from dew.nn.autoencoders.flux2 import load_flux2_vae
 from dew.nn.backbones.flux2 import Flux2Transformer
+from dew.nn.scan_orders import pixel_shuffle
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES = ("dev", "rect", "unguided", "narrow")
@@ -119,7 +120,9 @@ def test_a_guided_checkpoint_refuses_a_call_without_guidance(source, arrays, rec
         model.apply({"params": params}, latent, times, DenoisingCondition(condition.context))
 
 
-@pytest.mark.parametrize("change", [{"patch_size": 2}, {"axes_dims_rope": [8, 8]}, {"axes_dims_rope": [4, 4, 4, 3]}])
+@pytest.mark.parametrize(
+    "change", [{"patch_size": 2}, {"axes_dims_rope": [8, 8]}, {"axes_dims_rope": [4, 4, 4, 3]}]
+)
 def test_an_unsupported_config_is_refused(source, change):
     config = json.loads((source / "dev" / "transformer" / "config.json").read_text())
     flux2_fields(config)
@@ -135,7 +138,9 @@ def nhwc(array):
 def test_the_autoencoder_folds_and_normalizes_as_the_pipeline_does(source, arrays, name):
     autoencoder, params, layouts, _ = load_flux2_vae(source / name)
     tensors = component_tensors(source / name, "vae")
-    assert {layout.name for layout in layouts} == {f"vae/{key}" for key in tensors if not key.startswith("bn.")}
+    assert {layout.name for layout in layouts} == {
+        f"vae/{key}" for key in tensors if not key.startswith("bn.")
+    }
     image = nhwc(arrays[f"{name}.image"])
     latent = autoencoder.encode(params, image)
     assert latent.shape == (2, *autoencoder.latent_shape(image.shape[1:])) == (2, 4, 6, 16)
@@ -163,7 +168,9 @@ def test_the_published_autoencoder_matches_the_source():
     float32 distance from that result, or 1e-5."""
     import importlib.util
 
-    spec = importlib.util.spec_from_file_location("diffusers_flux2_reference", ROOT / "tools/diffusers_flux2_reference.py")
+    spec = importlib.util.spec_from_file_location(
+        "diffusers_flux2_reference", ROOT / "tools/diffusers_flux2_reference.py"
+    )
     tool = importlib.util.module_from_spec(spec)
     # Its dataclasses resolve their module through sys.modules.
     sys.modules[spec.name] = tool
@@ -183,9 +190,9 @@ def test_the_published_autoencoder_matches_the_source():
 
 @pytest.fixture(scope="module")
 def klein(source):
-    from dew.interop.pretrained import load_pretrained
+    from dew.interop.pretrained import Pretrained
 
-    return load_pretrained(str(source / "pipeline"), dtype="float32", attention_impl="xla")
+    return Pretrained.load(str(source / "pipeline"), dtype="float32", attention_impl="xla")
 
 
 def test_klein_prompt_encoding_matches_the_source_pipeline(klein, arrays, record):
@@ -205,7 +212,7 @@ def test_klein_prompt_encoding_matches_the_source_pipeline(klein, arrays, record
 
 
 def test_klein_pipeline_walk_matches_the_source(klein, arrays, record):
-    """`load_pretrained().text_to_image()` reproduces the source's own call:
+    """`Pretrained.load().text_to_image()` reproduces the source's own call:
     its defaults (50 steps, two branches guided at 4.0 against the empty
     prompt), and at the recorded step count the sigmas it lays out shifted
     by its empirical mu, the latent it ends on and the image it decodes."""
@@ -217,7 +224,7 @@ def test_klein_pipeline_walk_matches_the_source(klein, arrays, record):
                   key=jax.random.PRNGKey(0)).host()
     images = np.clip(np.asarray(walked.images) / 2 + 0.5, 0.0, 1.0)
     autoencoder = klein.autoencoder
-    raw = unfold(np.asarray(walked.latents) / autoencoder.latent_scale + autoencoder.latent_shift)
+    raw = pixel_shuffle(np.asarray(walked.latents) / autoencoder.latent_scale + autoencoder.latent_shift)
     for row in range(len(pipeline["prompts"])):
         assert relative_gap(raw[row], nhwc(arrays[f"pipeline.latents.{row}"])[0]) < FORWARD, row
         assert relative_gap(images[row], arrays[f"pipeline.images.{row}"][0]) < FORWARD, row

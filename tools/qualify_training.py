@@ -105,10 +105,10 @@ def _check_export(run: Path, source, params, probe) -> None:
     import jax.numpy as jnp
     import numpy as np
 
-    from dew.interop import load_pretrained
+    from dew.interop import Pretrained
 
     source.save(run / "export", variables=params)
-    reloaded = load_pretrained(
+    reloaded = Pretrained.load(
         run / "export", dtype="float32", attention_impl="reference"
     )
     ids = jnp.asarray(probe["text"][:, :-1])
@@ -131,7 +131,7 @@ def worker(directory: Path, mode: str, dtype: str) -> None:
     from dew.checkpoints import Checkpoints
     from dew.data import DataPartition, Loading, TokenWindows
     from dew.data.dataset import GlobalStream
-    from dew.interop import load_pretrained
+    from dew.interop import Pretrained
     from dew.objectives.base import Step
     from dew.objectives.lm import LMObjective
     from dew.training import Trainer
@@ -153,7 +153,7 @@ def worker(directory: Path, mode: str, dtype: str) -> None:
                 threading.Event().wait()
 
     configuration = json.loads((directory / "configuration.json").read_text())
-    source = load_pretrained(
+    source = Pretrained.load(
         directory / "source",
         dtype=dtype,
         attention_impl=configuration["attention_impl"],

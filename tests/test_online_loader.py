@@ -141,9 +141,8 @@ def test_a_malformed_sample_raises_instead_of_training_as_zeros(monkeypatch):
         sink.put(_sample(BATCH - 1, size=4))
         kwargs["stop"].wait()
 
-    with closing(_stream(monkeypatch, producer)) as stream:
-        with pytest.raises(ValueError):
-            next(stream)
+    with closing(_stream(monkeypatch, producer)) as stream, pytest.raises(ValueError):
+        next(stream)
 
 
 # ---------------------------------------------------------------------------------
@@ -204,7 +203,7 @@ def test_a_decompression_bomb_decodes_to_nothing():
     PIL raises its own DecompressionBombError, which is no OSError, so an
     uncaught one would kill the fetcher and the stream with it."""
     blob = _bomb_png(20000, 10000)
-    assert 20000 * 10000 > 2 * PIL.Image.MAX_IMAGE_PIXELS
+    assert 2 * PIL.Image.MAX_IMAGE_PIXELS < 20000 * 10000
 
     assert online_loader.decode_pixels(blob) is None
 

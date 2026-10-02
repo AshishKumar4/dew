@@ -713,45 +713,8 @@ class AttentionMixer(MixerBase):
                 raise ValueError("mrope_section must contain three nonnegative section widths")
 
     def build(self, ctx: MixerContext) -> Callable[..., nn.Module]:
-        return functools.partial(
-            CausalSelfAttention,
-            emb_features=ctx.emb_features,
-            num_heads=ctx.num_heads,
-            num_kv_heads=ctx.num_kv_heads,
-            head_dim=ctx.head_dim,
-            max_seq_len=ctx.max_seq_len,
-            causal=ctx.causal,
-            rope_theta=ctx.rope_theta,
-            rope_scaling=ctx.rope_scaling,
-            qk_norm=ctx.qk_norm,
-            qk_norm_scope=ctx.qk_norm_scope,
-            v_norm=ctx.v_norm,
-            k_eq_v=ctx.k_eq_v,
-            norm_eps=ctx.norm_eps,
-            scale_offset=ctx.scale_offset,
-            scale_after_cast=ctx.scale_after_cast,
-            kv_shared=ctx.kv_shared,
-            kv_store_key=ctx.kv_store_key,
-            sliding_window=ctx.sliding_window,
-            attention_chunk=ctx.attention_chunk,
-            attention_bias=ctx.attention_bias,
-            o_proj_bias=ctx.o_proj_bias,
-            attention_scale=ctx.attention_scale,
-            attention_dropout_rate=ctx.attention_dropout_rate,
-            attention_sinks=ctx.attention_sinks,
-            yarn=ctx.yarn,
-            attn_logit_softcap=ctx.attn_logit_softcap,
-            output_gate=ctx.output_gate,
-            dtype=ctx.dtype,
-            precision=ctx.precision,
-            attention_impl=ctx.attention_impl,
-            force_fp32_for_softmax=ctx.force_fp32_for_softmax,
-            partial_rotary_factor=ctx.partial_rotary_factor,
-            partial_rotary_type=ctx.partial_rotary_type,
-            kv_cache=ctx.kv_cache,
-            nope=self.nope,
-            exclusive_self_attention=self.exclusive_self_attention,
-            init_std=ctx.init_std,
-            output_init_std=ctx.output_init_std,
-            bidirectional_images=self.bidirectional_images, mrope_section=self.mrope_section)
+        # The context's fields and this kind's are CausalSelfAttention's, by name.
+        context = {field.name: getattr(ctx, field.name) for field in dataclasses.fields(ctx)}
+        kind = {field.name: getattr(self, field.name) for field in dataclasses.fields(self)}
+        return functools.partial(CausalSelfAttention, **context, **kind)
 
