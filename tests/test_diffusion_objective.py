@@ -433,8 +433,12 @@ def test_the_compiled_step_carries_no_autoencoder_constants():
     `params["autoencoder"]`, so the loss's jaxpr has no constant of the
     encoder kernel's shape. The mutation that reads them off the autoencoder
     object instead bakes them in, and this assertion catches that."""
-    from dew.nn.autoencoders import SimpleAutoEncoder
-    autoencoder = SimpleAutoEncoder(latent_channels=2, feature_depths=(8,))
+    from dew.nn.autoencoders import AutoencoderKL, StableDiffusionVAE
+    model = AutoencoderKL(channels=(8, 8), latent_channels=2, blocks_per_level=1, norm_groups=4,
+                          dtype=jnp.float32)
+    autoencoder = StableDiffusionVAE(
+        model=model, params=model.init(jax.random.PRNGKey(0), jnp.zeros((1, RES, RES, 3)))["params"],
+        dtype=jnp.float32, latent_shift=0.0, latent_scale=1.0)
     inputs = InputSpec(Field("image", (RES, RES, 3)))
     objective = DiffusionObjective(Zero(), presets.EDM(regime="pixel"), inputs,
                                    autoencoder=autoencoder)

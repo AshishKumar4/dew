@@ -16,7 +16,6 @@ from reference_error import assert_as_exact_as_the_reference
 
 from dew.diffusion.process import DenoisingCondition
 from dew.nn.attention import LayerNorm, Stage
-from dew.nn.autoencoders.simple import SimpleDecoder, SimpleEncoder
 from dew.nn.autoencoders.vae import FlaxDecoder, FlaxEncoder
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.backbones.mmdit import SimpleMMDiT
@@ -83,16 +82,6 @@ def _vae_decoder():
     model = FlaxDecoder(out_channels=3, block_out_channels=(32, 64), layers_per_block=1, norm_num_groups=8,
                         dtype=jnp.bfloat16)
     return model, (jnp.ones((2, 8, 8, 4), jnp.bfloat16),), {}
-
-
-def _simple_encoder():
-    model = SimpleEncoder(latent_channels=4, feature_depths=(16, 32), dtype=jnp.bfloat16)
-    return model, (jnp.ones((2, 16, 16, 3), jnp.bfloat16),), {}
-
-
-def _simple_decoder():
-    model = SimpleDecoder(out_channels=3, feature_depths=(16, 32), dtype=jnp.bfloat16)
-    return model, (jnp.ones((2, 4, 4, 4), jnp.bfloat16),), {}
 
 
 @pytest.mark.parametrize("batch", [1, 4])
@@ -225,9 +214,7 @@ def test_strided_convolutions_keep_nested_vmap_and_its_vjp():
 
 @pytest.mark.parametrize("build", [
     lambda: _unet(8), lambda: _unet(0), _unet_condition, _vae_encoder, _vae_decoder,
-    _simple_encoder, _simple_decoder,
-], ids=["unet_group_norm", "unet_rms_norm", "unet_condition", "vae_encoder", "vae_decoder",
-        "simple_encoder", "simple_decoder"])
+], ids=["unet_group_norm", "unet_rms_norm", "unet_condition", "vae_encoder", "vae_decoder"])
 def test_a_bf16_convolutional_model_keeps_its_activations_in_bf16(rng, build):
     """With fp32 parameters and a bf16 compute dtype, every image-shaped
     activation the convolutional models produce is bf16, the norms' outputs
