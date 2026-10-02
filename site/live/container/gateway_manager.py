@@ -37,7 +37,7 @@ class LimitedKernelManager(KernelGatewayIOLoopKernelManager):
             "--ro-bind", str(connection), "/kernel.json", "--chdir", "/work", "--cap-drop", "ALL",
             "/opt/venv/bin/python", "/opt/live/guest_entry.py", *arguments,
         ]
-        limited = ["capsh", "--drop=all", "--no-new-privs", f"--user=ctx{uid - 6100}",
+        limited = ["/usr/sbin/capsh", "--drop=all", "--no-new-privs", f"--user=ctx{uid - 6100}",
                    "--", "-c", "exec " + shlex.join(command)]
         env = {
             "PATH": "/opt/venv/bin:/usr/bin:/bin", "HOME": "/work", "TMPDIR": "/tmp",
