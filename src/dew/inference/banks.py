@@ -739,3 +739,14 @@ def _check_consumers(placement: Placement, groups: Sequence[tuple[int, int]]) ->
                         f"{reference.get(first_path)} in layer {held[0]} and "
                         f"{places.get(first_path)} in layer {index}. Select whole "
                         f"runs, or set bank_layers so the runs follow the selection")
+
+
+__all__ = [
+    "BankedModel",
+    "CheckpointBanks",
+    "DiskBankStats",
+    "HeldBanks",
+    "LayerBanks",
+    "SafetensorsBanks",
+    "StreamedBank",
+]

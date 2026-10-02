@@ -2246,3 +2246,6 @@ class CausalTransformer(nn.Module):
         the ones after it.
         """
         self(jnp.zeros((batch_size, 1), jnp.int32), decode=True)
+
+
+__all__ = ["CausalTransformer", "DecoderBank", "PipelineStage", "StackView"]

@@ -548,3 +548,6 @@ def declared_axes(path, ndim: int) -> LogicalAxes | None:
             f"{'/'.join(suffix)} is declared {axes}, which cannot name the "
             f"{ndim} dimensions of {'/'.join(parameter_path(path))}")
     return axes[len(axes) - ndim:]
+
+
+__all__ = ["RESIDUAL", "LayoutRefused", "Link", "Schedule", "logical_spec"]

@@ -851,3 +851,6 @@ class DevicePrefetchIterator:
             self.source_state = position
             return batch
         raise StopIteration
+
+
+__all__ = ["DevicePrefetchIterator", "Layout", "MeshSpec", "batch_shardings"]

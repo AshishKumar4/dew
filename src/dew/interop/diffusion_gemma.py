@@ -212,3 +212,6 @@ def export_weights(
         tensors["model.encoder.embed_vision.embedding_projection.weight"] = np.ascontiguousarray(
             np.asarray(params["conditioner"]["projector"]["projection"]["kernel"]).T)
     return tensors
+
+
+__all__ = ["build"]
