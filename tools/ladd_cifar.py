@@ -50,7 +50,8 @@ reference = images[np.random.default_rng(1).choice(len(images), 5000, replace=Fa
 
 
 def spec():
-    return InputSpec(Field("image", (32, 32, 3)), {"textcontext": Condition(CharTable.from_pretrained("char_table"))})
+    return InputSpec(Field("image", (32, 32, 3)),
+                     {"textcontext": Condition(CharTable.from_pretrained("char_table"))})
 
 
 def network():
@@ -78,7 +79,8 @@ def train(task, steps, lr, log_every=0, head_lr=None, seed=0, rows_per_step=128,
     store = None if checkpoints is None else Checkpoints(checkpoints)
     first = 0
     if store is not None and store.latest is not None:
-        template = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding),
+        template = jax.tree.map(
+            lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding),
                                 state)
         first = store.latest
         state, _ = store.restore(template, first)
@@ -89,7 +91,7 @@ def train(task, steps, lr, log_every=0, head_lr=None, seed=0, rows_per_step=128,
     def save(done):
         if store is None:
             return
-        store.save(done, state, None)
+        store.save(done, state, None, artifact=task.inference_record)
         store.wait()
         with open(f"{checkpoints}/sampler_{done}.json", "w") as handle:
             json.dump(rng.bit_generator.state, handle)
@@ -123,7 +125,7 @@ def score(task, params, steps, solver, guidance=None):
         prompts = text.tokenize([names[c] for c in labels[rows]])
         given, unconditional = task._conditions(params, {"text": prompts, "image": images[rows]},
                                                 jax.random.PRNGKey(0), dropout=False)
-        denoise = task.process.denoiser(task.model, task.trainable(params), given,
+        denoise = task.process.denoiser(task.model, task.model_variables(params), given,
                                         None if guidance is None else unconditional)
         x = sample(denoise, task.process.noise(jax.random.PRNGKey(start), (250, 32, 32, 3)), steps + 1,
                    solver=solver, guidance=guidance, key=jax.random.PRNGKey(1))
@@ -137,18 +139,20 @@ os.makedirs(OUTPUT, exist_ok=True)
 saved = f"{OUTPUT}/ladd_cifar_teacher.npz"
 if teacher_steps:
     started = time.time()
-    teacher = DiffusionObjective(network(), flow, spec(), guidance=None, sampler=Euler(), steps=2, ema_decay=None)
+    teacher = DiffusionObjective(network(), flow, spec(), guidance=None, solver=Euler(),
+                                 steps=2, ema_decay=None)
     state = train(teacher, teacher_steps, 2e-4)
-    teacher_model = teacher.trainable(state.params)
+    teacher_model = teacher.model_variables(state.params)
     leaves, _ = jax.tree.flatten(teacher_model)
     np.savez(saved, *[np.asarray(leaf) for leaf in leaves])
     print(json.dumps({"teacher": {f"euler_{n}_cfg1.5": score(teacher, state.params, n, Euler(), CFG(1.5))
                                   for n in (1, 4, 25)}, "seconds": round(time.time() - started)}), flush=True)
     sys.exit()
-template = DiffusionObjective(network(), flow, spec(), guidance=None, sampler=Euler(), steps=2, ema_decay=None)
-structure = jax.tree.structure(template.trainable(template.init(jax.random.PRNGKey(0))))
+template = DiffusionObjective(network(), flow, spec(), guidance=None, solver=Euler(), steps=2, ema_decay=None)
+structure = jax.tree.structure(template.model_variables(template.init(jax.random.PRNGKey(0))))
 stored = np.load(saved)
-teacher_model = jax.tree.unflatten(structure, [jnp.asarray(stored[f"arr_{i}"]) for i in range(len(stored.files))])
+teacher_model = jax.tree.unflatten(structure, [
+    jnp.asarray(stored[f"arr_{i}"]) for i in range(len(stored.files))])
 SYNTHETIC = f"{OUTPUT}/ladd_cifar_synthetic.npz"
 
 
@@ -159,7 +163,8 @@ def synthetic_data(count=20000):
     if os.path.exists(SYNTHETIC):
         stored = np.load(SYNTHETIC)
         return stored["images"], stored["labels"]
-    teacher = DiffusionObjective(network(), flow, spec(), guidance=None, sampler=Euler(), steps=2, ema_decay=None)
+    teacher = DiffusionObjective(network(), flow, spec(), guidance=None, solver=Euler(),
+                                 steps=2, ema_decay=None)
     params = {**teacher.init(jax.random.PRNGKey(0)), **teacher_model}
     text = CharTable.from_pretrained("char_table")
     classes = np.arange(count) % len(names)
@@ -169,8 +174,10 @@ def synthetic_data(count=20000):
         given, unconditional = teacher._conditions(
             params, {"text": text.tokenize([names[c] for c in chunk]), "image": images[:len(chunk)]},
             jax.random.PRNGKey(0), dropout=False)
-        denoise = teacher.process.denoiser(teacher.model, teacher.trainable(params), given, unconditional)
-        x = sample(denoise, teacher.process.noise(jax.random.PRNGKey(10_000 + start), (len(chunk), 32, 32, 3)), 26,
+        denoise = teacher.process.denoiser(
+            teacher.model, teacher.model_variables(params), given, unconditional)
+        x_T = teacher.process.noise(jax.random.PRNGKey(10_000 + start), (len(chunk), 32, 32, 3))
+        x = sample(denoise, x_T, 26,
                    solver=Euler(), guidance=CFG(1.5), key=jax.random.PRNGKey(2))
         generated.append(np.asarray(np.clip((np.asarray(x) + 1) * 127.5, 0, 255), np.uint8))
     pixels = np.concatenate(generated)
@@ -190,16 +197,18 @@ for overrides in variants:
     eval_every = fields.pop("eval_every", 0)
     stop = fields.pop("stop", None)
     evaluated = fields.pop("evaluate", True)
-    task = AdversarialDistillationObjective(network(), flow, spec(), teacher=jax.tree.map(jnp.copy, teacher_model),
+    task = AdversarialDistillationObjective(
+        network(), flow, spec(), teacher=jax.tree.map(jnp.copy, teacher_model),
                                             ema_decay=None, **fields)
 
     def evaluate(params, task=task):
         return {f"consistency_{n}": score(task, params, n, Consistency()) for n in (1, 4)}
 
-    distilled = train(task, ladd_steps, lr, log_every=500, head_lr=head_lr, seed=seed, rows_per_step=rows_per_step,
+    distilled = train(task, ladd_steps, lr, log_every=500, head_lr=head_lr, seed=seed,
+                      rows_per_step=rows_per_step,
                       accumulation=accumulation, data=data, evaluate=evaluate if evaluated else None,
                       eval_every=eval_every, checkpoints=f"{OUTPUT}/seed_{seed}", stop=stop)
     if stop is not None:
         continue
-    print(json.dumps({"ladd": overrides, **{f"consistency_{n}": score(task, distilled.params, n, Consistency())
-                                            for n in (1, 4)}, "seconds": round(time.time() - started)}), flush=True)
+    result = {f"consistency_{n}": score(task, distilled.params, n, Consistency()) for n in (1, 4)}
+    print(json.dumps({"ladd": overrides, **result, "seconds": round(time.time() - started)}), flush=True)

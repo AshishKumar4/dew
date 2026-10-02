@@ -99,7 +99,8 @@ def _without_loss_heads(variables: Variables) -> Variables:
     and a teacher."""
     return {name: ({key: value for key, value in tree.items() if key not in LOSS_HEADS}
                    if name in ("params", "constants") else tree)
-            for name, tree in variables.items() if name not in (REPRESENTATION, LATENT_STATS, TEACHER, SPECTRAL)}
+            for name, tree in variables.items()
+            if name not in (REPRESENTATION, LATENT_STATS, TEACHER, SPECTRAL)}
 
 
 def check_solver(process, solver, steps: int) -> None:

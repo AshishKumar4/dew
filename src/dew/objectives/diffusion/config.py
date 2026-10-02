@@ -503,7 +503,7 @@ class DiffusionRunConfig(RunConfig):
                   if getattr(self, name) is not None]
         if self.adversarial is not None and (extras or self.guidance_distill is not None
                                              or self.guidance is not None
-                                             or not isinstance(self.preset, presets.Flow)):
+                                             or not isinstance(self.preset, Flow)):
             raise ValueError("adversarial distillation trains on its own losses under the flow preset and "
                              "samples unguided: set guidance None, and leave the other training modes unset")
         if self.guidance_distill is not None and (extras or self.guidance is not None):

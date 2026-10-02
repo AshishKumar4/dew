@@ -31,7 +31,7 @@ from dew.diffusion.schedules import FlowMatchingScheduler
 from dew.diffusion.transforms import FlowMatchPredictionTransform, broadcast_rates
 from dew.inputs import InputSpec, unit_range
 from dew.nn.dit import TextContext, masked_mean
-from dew.objectives.base import Aux, Mean, Step, Variables
+from dew.objectives.base import Aux, Ratio, Step, Variables
 from dew.registry import objectives
 from dew.sampling.solvers import Consistency
 
@@ -63,7 +63,8 @@ class SpectralConv(nn.Module):
         fan_in = math.prod(shape[:-1])
         bound = 1 / math.sqrt(fan_in)
         kernel = self.param("kernel", lambda key: jax.random.uniform(key, shape, minval=-bound, maxval=bound))
-        bias = self.param("bias", lambda key: jax.random.uniform(key, (self.features,), minval=-bound, maxval=bound))
+        bias = self.param("bias", lambda key: jax.random.uniform(
+            key, (self.features,), minval=-bound, maxval=bound))
         u = self.variable(SPECTRAL, "u", lambda: _normalized(jax.random.normal(self.make_rng("params"),
                                                                                 (self.features,))))
         # torch's [out, in, kh, kw] flattened per output channel.
@@ -137,8 +138,10 @@ class Head(nn.Module):
         channels = x.shape[-1]
         h = Block(channels, (1, 1), name="block_0")(x, update)
         h = (Block(channels, self.kernel_size, name="block_1")(h, update) + h) / math.sqrt(2)
-        out = SpectralConv(self.cmap_dim, (1, 1), circular=False, name="cls")(h, update)
-        weight = self.param("cmapper_weight", nn.initializers.normal(1.0), (condition.shape[-1], self.cmap_dim))
+        out = SpectralConv(self.cmap_dim, (1, 1), circular=False, name="cls")(
+            h, update)
+        weight = self.param("cmapper_weight", nn.initializers.normal(1.0),
+                            (condition.shape[-1], self.cmap_dim))
         cmap_bias = self.param("cmapper_bias", nn.initializers.zeros, (self.cmap_dim,))
         cmap = condition @ (weight / math.sqrt(condition.shape[-1])) + cmap_bias
         return jnp.sum(out * cmap[:, None, None, :], axis=-1) / math.sqrt(self.cmap_dim)
@@ -180,7 +183,8 @@ def r1_penalty(score, features: Sequence[jax.Array]) -> jax.Array:
     def total(features):
         return sum(jnp.sum(jnp.mean(head.reshape(head.shape[0], -1), axis=-1)) for head in score(features))
     gradients = jax.grad(total)(list(features))
-    return jnp.sum(jnp.stack([jnp.sum(jnp.square(g).reshape(g.shape[0], -1), axis=-1) for g in gradients]), axis=0)
+    return jnp.sum(jnp.stack([
+        jnp.sum(jnp.square(g).reshape(g.shape[0], -1), axis=-1) for g in gradients]), axis=0)
 
 
 @objectives("ladd")
@@ -212,13 +216,14 @@ class AdversarialDistillationObjective(DiffusionObjective):
                 and isinstance(process.prediction, FlowMatchPredictionTransform)):
             raise ValueError("LADD distills a velocity model on the linear path; build the process with "
                              "presets.Flow()")
-        unused = sorted(key for key in ("uncertainty", "alignment", "end_to_end") if kwargs.get(key) is not None)
+        unused = sorted(key for key in ("uncertainty", "alignment", "end_to_end")
+                        if kwargs.get(key) is not None)
         if unused:
             raise ValueError(f"LADD trains on its own losses, which read none of {unused}")
         if not feature_layers:
             raise ValueError("the discriminator reads the teacher's tokens after at least one layer")
         kwargs.setdefault("guidance", None)
-        kwargs.setdefault("sampler", Consistency())
+        kwargs.setdefault("solver", Consistency())
         kwargs.setdefault("steps", 2)
         super().__init__(model, process, inputs, **kwargs)
         self.teacher = teacher
@@ -288,12 +293,14 @@ class AdversarialDistillationObjective(DiffusionObjective):
             samples = self.autoencoder.encode(params["autoencoder"], samples, encode_key)
         count = samples.shape[0]
         schedule = self.process.schedule
+        assert self.process.prediction is not None
         conditions, _ = self._conditions(params, batch, drop_key, dropout=True)
-        t = jnp.asarray(self.student_times)[jax.random.randint(time_key, (count,), 0, len(self.student_times))]
+        indices = jax.random.randint(time_key, (count,), 0, len(self.student_times))
+        t = jnp.asarray(self.student_times)[indices]
         noise = jax.random.normal(noise_key, samples.shape)
         noisy, _, _ = self.process.prediction.forward_diffusion(samples, noise,
                                                                  broadcast_rates(schedule, t, samples))
-        student = self.process.denoiser(self.model, self.trainable(params), conditions)
+        student = self.process.denoiser(self.model, self.model_variables(params), conditions)
         clean, _ = student(noisy, t)
 
         level_key, renoise_noise = jax.random.split(renoise_key)
@@ -313,7 +320,8 @@ class AdversarialDistillationObjective(DiffusionObjective):
         heads = params["params"][DISCRIMINATOR]
 
         def score(head_params, spectral, features, *, update=False):
-            scores, updated = self.heads.apply({"params": head_params, SPECTRAL: spectral}, features, condition,
+            scores, updated = self.heads.apply(
+                {"params": head_params, SPECTRAL: spectral}, features, condition,
                                                update=update, mutable=[SPECTRAL])
             return scores, updated[SPECTRAL]
 
@@ -330,14 +338,14 @@ class AdversarialDistillationObjective(DiffusionObjective):
             metrics["r1"] = jnp.mean(r1)
             total = total + self.r1_weight * r1
         if self.distillation_weight > 0:
-            target, _ = self.process.denoiser(self.model, self.trainable(teacher), conditions)(
+            target, _ = self.process.denoiser(self.model, self.model_variables(teacher), conditions)(
                 renoised(jax.lax.stop_gradient(clean)), level)
             distance = jnp.sum(jnp.square(clean - jax.lax.stop_gradient(target)),
                                axis=tuple(range(1, clean.ndim)))
             distillation = self.distillation_weight * schedule.rates(level)[0] * distance
             metrics["distillation"] = jnp.mean(distillation)
             total = total + distillation
-        return (Mean(jnp.sum(total), jnp.asarray(count, jnp.float32)),
+        return (Ratio(jnp.sum(total), jnp.asarray(count, jnp.float32)),
                 Aux(metrics=metrics, variables={SPECTRAL: jax.lax.stop_gradient(spectral)}))
 
 
