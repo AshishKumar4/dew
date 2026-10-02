@@ -269,7 +269,6 @@ class TokenBytes(_Reopened):
         self.path = str(path)
         meta = _meta(Path(self.path).parent)
         self.dtype = _dtype(meta)
-        self.vocab_size = _recorded(meta, "vocab_size")
         self.eos_id = eos_id if eos_id is not None else _recorded(meta, "eos_id")
         self._tokens = self.open_handle()
 
@@ -360,17 +359,12 @@ class TokenRecords(_Reopened, _Sharded):
         return self._ids(index, self.dtype)
 
     def open_handle(self):
-        return _array_records(self.paths)
+        from array_record.python.array_record_data_source import ArrayRecordDataSource
+
+        return ArrayRecordDataSource(list(self.paths))
 
     def __repr__(self) -> str:
         return f"TokenRecords(paths={self.paths!r}, field={self.field!r})"
-
-
-def _array_records(paths: Sequence[str]):
-    """The arrayrecord reader over `paths`, imported on use."""
-    from array_record.python.array_record_data_source import ArrayRecordDataSource
-
-    return ArrayRecordDataSource(list(paths))
 
 
 class TokenColumn(_Sharded):

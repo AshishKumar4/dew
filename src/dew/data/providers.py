@@ -36,8 +36,8 @@ from __future__ import annotations
 
 import copy
 import dataclasses
-from collections.abc import Callable, Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from collections.abc import Callable, Iterator, Mapping, Sequence, Sized
+from typing import TYPE_CHECKING
 
 import grain.python as pygrain
 import jax
@@ -74,13 +74,6 @@ PROVIDERS = ("tfds", "hf")
 
 Row = Mapping[str, object]
 Preprocess = Callable[[Row, np.random.Generator], Row]
-
-
-@runtime_checkable
-class Counted(Protocol):
-    """Reports how many records a source holds."""
-
-    def __len__(self) -> int: ...
 
 
 
@@ -263,7 +256,7 @@ def counted(source: object, given: int | None, name: str) -> int:
     number says, and a smaller one would report an epoch the run never
     trains.
     """
-    if not isinstance(source, Counted):
+    if not isinstance(source, Sized):
         if given is None:
             raise ValueError(
                 f"{name} reports no record count, so load() needs records= set "
