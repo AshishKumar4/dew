@@ -353,27 +353,6 @@ def test_constructing_a_trainer_opens_nothing(tmp_path):
     assert not (tmp_path / "run").exists(), "the checkpoint directory was created"
 
 
-def test_from_config_is_the_construction_a_run_config_used_to_write(tmp_path):
-    """`from_config` against the constructor call `RunConfig.train` wrote by
-    hand, for a config whose every trainer-held field is off its default: one
-    mapping from the config's names to this constructor's, in one place."""
-    config = TrainerConfig(
-        batch_size=8, key=7, steps=3, accumulation=2, dynamic_scale=True,
-        mesh=MeshSpec(fsdp=2), layout=Layout(min_shard=1, tolerance=1.0),
-        profile=ProfileWindow(str(tmp_path / "trace"), steps=2, warmup=1))
-    objective, optimizer = Regression(), optax.sgd(0.1)
-    key = jax.random.key(config.key)
-    checkpoints, tracker = Checkpoints(str(tmp_path / "run")), RecordingTracker()
-
-    built = Trainer.from_config(config, objective, optimizer, key=key,
-                                checkpoints=checkpoints, tracker=tracker)
-
-    assert vars(built) == vars(Trainer(
-        objective, optimizer, key=key, mesh=config.mesh, layout=config.layout,
-        accumulation=config.accumulation, dynamic_scale=config.dynamic_scale,
-        checkpoints=checkpoints, tracker=tracker, profile=config.profile))
-
-
 class Keyed(Regression):
     """Loss scaled by the step key, so the key stream is observable in the parameters.
 

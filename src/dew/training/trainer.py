@@ -23,7 +23,7 @@ import time
 import types
 import warnings
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, Generic, Literal, Protocol, TypeVar
+from typing import TYPE_CHECKING, Generic, Literal, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -104,7 +104,6 @@ from dew.training.transaction import Transaction, compact_qk, with_ema
 _log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from dew.config import TrainerConfig
     from dew.telemetry.profile import Profiler
 
 # Consecutive non-finite losses that stop a run.
@@ -123,14 +122,6 @@ microbatch was accepted."""
 
 Loss = DefaultTypeVar("Loss", default=Ratio | jax.Array | float)
 Effects = DefaultTypeVar("Effects", default=None)
-
-ObjectiveLoss = TypeVar("ObjectiveLoss")
-ObjectiveEffects = TypeVar("ObjectiveEffects")
-"""The two parameters of the objective `Trainer.from_config` is handed.
-
-A classmethod cannot solve the class's own `Loss` and `Effects` from an
-argument, since an unparameterized `Trainer.from_config` binds them to their
-defaults. So the factory carries its own pair and names the class it builds."""
 
 Shapes = tuple[tuple[int, ...], ...]
 """A batch's leaf shapes in tree order, the key a compiled step is held
@@ -778,51 +769,6 @@ class Trainer(Generic[Loss, Effects]):
         # if its first compile has to climb past it (`_climb_to`).
         self._xla_defaults = False
         self._resumed_rung: JSON = None
-
-    @classmethod
-    def from_config(
-        cls, config: TrainerConfig, objective: Objective[ObjectiveLoss, ObjectiveEffects],
-        optimizer: optax.GradientTransformation, *, key: int | jax.Array,
-        checkpoints: Checkpoints | None = None, tracker: Tracker | None = None,
-        step: Callable[[Objective[ObjectiveLoss, ObjectiveEffects],
-                        optax.GradientTransformation], StepFn] | None = None,
-        rollout: Rollout | None = None,
-    ) -> Trainer[ObjectiveLoss, ObjectiveEffects]:
-        """Build the trainer a `TrainerConfig` describes.
-
-        The mapping from the config's field names to this constructor's is
-        written once, here. `mesh`, `layout`, `accumulation`,
-        `dynamic_scale` and `profile` are the config fields a trainer holds.
-        `key` is the run key, which `RunConfig.train` draws from
-        `config.key`.
-
-        The rest of the config belongs to the capabilities and to the loop,
-        and reaches them from their own owners. `checkpoint_dir` and `keep`
-        build the `Checkpoints` passed in here, and `wandb` the tracker.
-        `xla_flags`, `multi_host` and `compilation_cache_dir` are read by
-        `prepare_process` before JAX opens a backend. `batch_ramp` wraps the
-        dataset with `dew.data.ramped`. `steps`, `epochs`, `log_every`,
-        `eval_every` and `checkpoint_every` are arguments of `fit`. `step`
-        and `rollout` are not configurable: they are code a caller hands
-        over.
-
-        It builds a `Trainer`, whatever it is called on. The objective's two
-        parameters are the factory's own, so a subclass that wants one of
-        itself constructs it.
-        """
-        return Trainer(
-            objective, optimizer,
-            key=key,
-            mesh=config.mesh,
-            layout=config.layout,
-            accumulation=config.accumulation,
-            dynamic_scale=config.dynamic_scale,
-            checkpoints=checkpoints,
-            tracker=tracker,
-            step=step,
-            rollout=rollout,
-            profile=config.profile,
-        )
 
     # ------------------------------------------------------------------
     # The state
