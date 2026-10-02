@@ -1118,7 +1118,7 @@ def _qwen35_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     tower = vision_nn.translate_qwen35_vision_config(hf_config)
     used.add("vision_config")
     projector = vision_nn.translate_qwen35_projector_config(
-        tower, records.integer(text.get("emb_features"), "emb_features"))
+        hf_config, records.integer(text.get("emb_features"), "emb_features"))
     image = _wrapper_token_id(hf_config, used, "image_token_id")
     _wrapper_tokens(used)
     # One resolution per call, so the soft-token count varies with the image

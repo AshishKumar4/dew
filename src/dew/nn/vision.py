@@ -1906,13 +1906,14 @@ def translate_qwen35_vision_config(hf_config: Mapping[str, object]) -> Mapping[s
     }
 
 
-def translate_qwen35_projector_config(vision: Mapping[str, object],
+def translate_qwen35_projector_config(hf_config: Mapping[str, object],
                                       text_width: int) -> Mapping[str, object]:
     """A Qwen 3.5 wrapper's projector fields: trunk width, merge, output.
 
     The merged features enter the text embeddings directly, so a merger width
     beside the decoder width refuses.
     """
+    vision = _vision_section(hf_config)
     merged = records.integer(vision["out_hidden_size"], "out_hidden_size")
     if merged != int(text_width):
         raise ValueError(
@@ -1921,7 +1922,7 @@ def translate_qwen35_projector_config(vision: Mapping[str, object],
     return {
         "kind": "qwen3_5",
         "vision_width": records.integer(vision["hidden_size"], "hidden_size"),
-        "merge_size": records.integer(vision["spatial_merge_size"], "spatial_merge_size"),
+        "merge_size": records.integer(vision.get("spatial_merge_size", 2), "spatial_merge_size"),
         "out_width": merged,
     }
 
