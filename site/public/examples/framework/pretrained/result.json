@@ -1,0 +1,8 @@
+{
+  "source": "Qwen/Qwen3-0.6B",
+  "text": [
+    " Paris. The capital of Italy is Rome. The capital of"
+  ],
+  "steps": 1,
+  "export": "export"
+}

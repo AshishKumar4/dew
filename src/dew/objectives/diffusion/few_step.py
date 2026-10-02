@@ -1,6 +1,6 @@
 """Few-step generators trained from scratch: MeanFlow and shortcut models.
 
-MeanFlow (Geng et al. 2025, "Mean Flows for One-step Generative Modeling")
+MeanFlow (Geng et al. 2025, "Ratio Flows for One-step Generative Modeling")
 trains a model of the average velocity u(z_t, r, t) over [r, t] through the
 MeanFlow identity u = v - (t - r) du/dt, the total derivative taken along
 the flow with one JVP. One step of the average velocity then crosses the
@@ -28,7 +28,7 @@ from dew.diffusion.process import Process, aligned_conditions
 from dew.diffusion.schedules import FlowMatchingScheduler, expand
 from dew.diffusion.transforms import FlowMatchPredictionTransform, broadcast_rates
 from dew.inputs import InputSpec, unit_range
-from dew.objectives.base import Aux, Mean, Step
+from dew.objectives.base import Aux, Ratio, Step
 from dew.registry import objectives
 from dew.sampling.solvers import Euler
 
@@ -190,7 +190,7 @@ class MeanFlowObjective(DiffusionObjective):
         guided = jnp.where(expand(dropped, v), v, guided)
         u, target = mean_flow_target(velocity(conditions, train=True), z, t, r, guided)
         losses = adaptive_loss(u, target, self.norm_p, self.norm_eps)
-        return Mean(jnp.sum(losses), jnp.asarray(count, jnp.float32)), Aux(metrics={})
+        return Ratio(jnp.sum(losses), jnp.asarray(count, jnp.float32)), Aux(metrics={})
 
 
 @objectives("shortcut")
@@ -273,7 +273,7 @@ class ShortcutObjective(DiffusionObjective):
         target = jnp.concatenate([bootstrapped, v[rows:]])
         u = velocity(self.trainable(params), conditions, train=True)(x, sigma, sigma - step_size)
         losses = optax.l2_loss(u, target)
-        return Mean(jnp.sum(losses), jnp.asarray(losses.size, jnp.float32)), Aux(metrics={})
+        return Ratio(jnp.sum(losses), jnp.asarray(losses.size, jnp.float32)), Aux(metrics={})
 
 
 __all__ = ["MeanFlowObjective", "ShortcutObjective", "adaptive_loss", "guided_velocity", "intervals",

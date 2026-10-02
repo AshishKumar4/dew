@@ -539,11 +539,9 @@ def _generate(model: nn.Module, params: Variables, inputs: ModelInputs, keys: ja
         drawn.behavior_log_probs, drawn.raw_log_probs)
 
 
-def _validated(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray],
-               conditioning: dict[str, jax.Array | np.ndarray], max_new_tokens: int, sampling: Sampling,
-               n: int) -> ModelInputs:
-    """Host checks shared by every caller; returns device inputs whose validity
-    field is present only where a prompt is actually padded."""
+def _check_inputs(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray],
+                  max_new_tokens: int, sampling: Sampling, n: int) -> np.ndarray:
+    """Shared host validation; return validity without placing unused device inputs."""
     if ids.ndim != 2 or min(ids.shape) < 1 or not np.issubdtype(ids.dtype, np.integer):
         raise ValueError("inputs must contain non-empty [B, P] integer token ids")
     if type(max_new_tokens) is not int or max_new_tokens < 0:
@@ -567,6 +565,15 @@ def _validated(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray],
     if vocab is not None and (sampling.pad_id >= vocab or
                              (sampling.eos_id is not None and np.any(np.asarray(sampling.eos_id) >= vocab))):
         raise ValueError("sampling token ids must be inside the vocabulary")
+    return valid
+
+
+def _validated(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray],
+               conditioning: dict[str, jax.Array | np.ndarray], max_new_tokens: int, sampling: Sampling,
+               n: int) -> ModelInputs:
+    """Host checks shared by every caller; returns device inputs whose validity
+    field is present only where a prompt is actually padded."""
+    valid = _check_inputs(model, ids, fields, max_new_tokens, sampling, n)
     token_fields = {name: jnp.asarray(value) for name, value in fields.items()
                     if name != "attention_mask"}
     if not valid.all():

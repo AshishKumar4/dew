@@ -11,7 +11,6 @@ from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple
 import jax
 import jax.numpy as jnp
 import numpy as np
-from transformers import CLIPTokenizer, PreTrainedTokenizerBase
 
 from dew.diffusion.process import DenoisingCondition
 from dew.inputs.encoders import ConditionEncoder
@@ -22,6 +21,8 @@ from dew.objectives.base import Variables
 from dew.registry import dtype_name, encoders
 
 if TYPE_CHECKING:
+    from transformers import CLIPTokenizer, PreTrainedTokenizerBase
+
     from dew.nn.backbones.causal_transformer import CausalTransformer
 
 

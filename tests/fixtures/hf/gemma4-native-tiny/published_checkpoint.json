@@ -1,0 +1,33 @@
+{
+  "checkpoint": "trl-internal-testing/tiny-Gemma4ForConditionalGeneration",
+  "revision": "0dc1746b7f9f623b748e735ed5a4302eb4baf346",
+  "dtype": "float32",
+  "precision": "highest",
+  "tf32": false,
+  "transformers": "5.16.1",
+  "torch": "2.14.0+cu130",
+  "jax": "0.11.2.post3",
+  "device": "NVIDIA GeForce RTX 4080",
+  "bound": "Dew verified-mapping rounding per transformer block; image logits traverse two vision blocks and two decoder blocks, text logits two decoder blocks.",
+  "observations": [
+    {
+      "modality": "text",
+      "sequence_length": 5,
+      "max_reference_logit": 0.40275341272354126,
+      "max_abs_error": 0.0000004470348358154297,
+      "bound": 0.0000012406287623889511,
+      "argmax_agreement": true,
+      "generation_agreement": true
+    },
+    {
+      "modality": "image",
+      "sequence_length": 71,
+      "max_reference_logit": 0.4208221733570099,
+      "max_abs_error": 0.0000019371509552001953,
+      "bound": 0.0000025925744466803735,
+      "argmax_agreement": true,
+      "generation_agreement": true
+    }
+  ],
+  "command": "PYTHONPATH=src python tools/wrapper_checkpoint_parity.py trl-internal-testing/tiny-Gemma4ForConditionalGeneration --revision 0dc1746b7f9f623b748e735ed5a4302eb4baf346 --output gemma4-parity.json"
+}

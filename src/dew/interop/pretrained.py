@@ -226,6 +226,7 @@ def _language_layout(name: str, text_name: str, tensor: np.ndarray,
     # (`_gemma4_prepare` swaps them into dew's `[E, in, out]`) writes them
     # back swapped.
     from dew.interop.families.gemma import _gemma4_prepare
+
     packed = family.prepare_weights is _gemma4_prepare
 
     def nested(path: tuple[str, ...]) -> tuple[str, ...]:

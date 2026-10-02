@@ -40,6 +40,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES, RematPolicy
 from dew.nn.kernels.generation import device_generation
 from dew.nn.sharding import (
+    BATCH_AXES,
     SEQUENCE_AXIS,
     STAGE_AXIS,
     TENSOR_AXIS,
@@ -54,9 +55,9 @@ from dew.objectives.base import (
     Aux,
     Batch,
     Initializer,
-    Mean,
     Metric,
     Objective,
+    Ratio,
     Shown,
     Step,
     Variables,
@@ -64,7 +65,7 @@ from dew.objectives.base import (
 )
 from dew.records import JSON, boolean, integers, json_value, record
 from dew.telemetry import profile as telemetry_profile
-from dew.telemetry.devices import TRITON_GEMM_OFF_GENERATIONS, xla_flag
+from dew.telemetry.devices import TRITON_GEMM_OFF_GENERATIONS, gpu_free_bytes, xla_flag
 from dew.telemetry.instrumentation import compiled_flops, model_flops_utilization, peak_flops
 from dew.telemetry.profile import region
 from dew.telemetry.records import (
@@ -117,7 +118,7 @@ CompiledStep = Callable[
 report (`Aux.metrics`), whether that loss was finite, and whether the
 microbatch was accepted."""
 
-Loss = DefaultTypeVar("Loss", default=Mean | jax.Array | float)
+Loss = DefaultTypeVar("Loss", default=Ratio | jax.Array | float)
 Effects = DefaultTypeVar("Effects", default=None)
 
 ObjectiveLoss = TypeVar("ObjectiveLoss")
@@ -370,24 +371,36 @@ def step_headroom(executable: jax.stages.Compiled, devices: Sequence, held: int 
     if stats is None or not all('bytes_limit' in m and 'bytes_in_use' in m for m in memory):
         return None
     beside = stats.output_size_in_bytes - stats.alias_size_in_bytes + held
-    return min(placeable(m) - beside - stats.temp_size_in_bytes * (2 if strands_temporaries(d.platform, m) else 1)
+    return min(placeable(m, unclaimed(d, m)) - beside
+               - stats.temp_size_in_bytes * (2 if strands_temporaries(d.platform, m) else 1)
                for d, m in zip(devices, memory, strict=True))
 
 
-def placeable(memory: Mapping[str, int]) -> int:
+def unclaimed(device, memory: Mapping[str, int]) -> int | None:
+    """The bytes free on a GPU whose pool grows (`gpu_free_bytes`), the
+    most a new region of it can take; None for any other device."""
+    if device.platform != 'gpu' or memory.get('pool_bytes', memory['bytes_limit']) >= memory['bytes_limit']:
+        return None
+    return gpu_free_bytes(device.local_hardware_id)
+
+
+def placeable(memory: Mapping[str, int], unclaimed: int | None = None) -> int:
     """The bytes one allocation can take from a device whose allocator
     reports `memory` (`Device.memory_stats`), the most a step's temporaries
     and every buffer beside them can need of one block.
 
     XLA's GPU pool, its BFC allocator, reports its size (pool_bytes) and its
     largest free block; a pool that grows (XLA_PYTHON_CLIENT_PREALLOCATE=false)
-    can also take a new block from the part of its limit it has not taken.
-    cuda_async and a TPU's allocator report no pool, and their free bytes are
-    all there is to read."""
+    can also take a new block from the part of its limit it has not taken,
+    as far as the GPU has `unclaimed` bytes free. cuda_async and a TPU's
+    allocator report no pool, and their free bytes are all there is to read."""
     free = memory['bytes_limit'] - memory['bytes_in_use']
     if 'pool_bytes' not in memory:
         return free
-    return min(free, max(memory['largest_free_block_bytes'], memory['bytes_limit'] - memory['pool_bytes']))
+    growth = memory['bytes_limit'] - memory['pool_bytes']
+    if unclaimed is not None:
+        growth = min(growth, unclaimed)
+    return min(free, max(memory['largest_free_block_bytes'], growth))
 
 
 def strands_temporaries(platform: str, memory: Mapping[str, int]) -> bool:
@@ -1083,7 +1096,7 @@ class Trainer(Generic[Loss, Effects]):
         if self.accumulation == 1 or self.step is not None or state.accumulation is not None:
             return state
         stats, aux = shapes
-        shared = isinstance(stats, (Mean, jax.ShapeDtypeStruct))
+        shared = isinstance(stats, (Ratio, jax.ShapeDtypeStruct))
         mean_dtype = jnp.result_type(jnp.float32, *(x.dtype for x in jax.tree.leaves(stats)))
         slots = self.accumulation - 1
         def shape(leaf: jax.Array) -> jax.ShapeDtypeStruct:
@@ -1311,7 +1324,11 @@ class Trainer(Generic[Loss, Effects]):
         # scopes share whichever profiler owns the capture.
         tracer = profiler if profiler is not None else telemetry_profile.active_profile()
         try:
-            self._check_pipelined_batch(dataset.batch, self.device_mesh)
+            if self.mesh.stage > 1:
+                # Before the state is placed; every other mesh's batch is
+                # checked with its stream (`_check_stream`), a ramp's at each
+                # of its stages.
+                self._check_batch(dataset.batch, self.device_mesh)
             plan = _FitPlan(dataset, steps, log_every, eval_every, checkpoint_every,
                             None if checkpoints is None else checkpoints.local_every, metrics, preview)
             state, shardings, position = self.place()
@@ -1449,7 +1466,7 @@ class Trainer(Generic[Loss, Effects]):
             return True
         if current < steps:
             run.source = plan.dataset.train(data_partition(mesh))
-            self._check_stream(run.source, mesh,
+            self._check_stream(run.source, mesh, plan.dataset.batch,
                                checkpointing=bool(plan.checkpoint_every or plan.local_every))
             run.train = DevicePrefetchIterator(run.source, mesh, source_state=position)
             run.source = None  # Lifetime transferred to the prefetch worker.
@@ -1586,14 +1603,15 @@ class Trainer(Generic[Loss, Effects]):
 
         return agreed("profiling window setup", own_window)
 
-    def _check_pipelined_batch(self, batch: int, mesh: Mesh) -> None:
-        """Refuse, before anything is placed, a global batch that a pipeline
-        cannot cut into its microbatches (`batch_divisor`): each device's
-        rows are cut into M microbatches, and a device that holds none of a
-        microbatch's rows computes another's again. The message names the
-        batches and the microbatch counts that fit. A rollout's rows are
-        its own, so a run with one is checked where its step traces."""
-        if self.mesh.stage == 1 or self.rollout is not None:
+    def _check_batch(self, batch: int, mesh: Mesh) -> None:
+        """Refuse, before anything is placed, a global batch the mesh cannot
+        split (`batch_divisor`): its rows shard over the batch axes as whole
+        rows, and a pipeline cuts each device's rows again into M
+        microbatches, where a device that holds none of a microbatch's rows
+        computes another's again. The message names the row shards, and the
+        batches and the microbatch counts that fit. A rollout's rows are its
+        own, so a run with one is checked where its step traces."""
+        if self.rollout is not None:
             return
         divisor = batch_divisor(mesh, self.mesh)
         if batch % divisor == 0:
@@ -1602,6 +1620,12 @@ class Trainer(Generic[Loss, Effects]):
         shards = divisor // count
         suggestions = [f"a batch that is a multiple of {divisor} rows, {-(-batch // divisor) * divisor} "
                        f"the nearest above {batch}"]
+        axes = " x ".join(f"{axis} {mesh.shape[axis]}" for axis in BATCH_AXES if mesh.shape[axis] > 1)
+        if count == 1:
+            raise LayoutRefused(
+                f"a global batch of {batch} rows over the {shards} row shards of {axes} leaves some "
+                f"device without whole rows; use {suggestions[0]}, or a mesh whose batch axes "
+                f"({' x '.join(BATCH_AXES)}) divide {batch}")
         if batch % shards == 0:
             fitting = [m for m in range(self.mesh.stage, batch // shards + 1, self.mesh.stage)
                        if (batch // shards) % m == 0]
@@ -1613,12 +1637,13 @@ class Trainer(Generic[Loss, Effects]):
             f"leaves some microbatch without rows on some device, which then computes another "
             f"microbatch's again; use {' or '.join(suggestions)}")
 
-    def _check_stream(self, source, mesh: Mesh, *, checkpointing: bool) -> None:
+    def _check_stream(self, source, mesh: Mesh, batch: int, *, checkpointing: bool) -> None:
         """Refuse a training stream this run cannot checkpoint or cannot shard.
 
         A checkpoint written without the data position would replay the data
-        on resume. A ramp stage whose batch the mesh cannot divide fails
-        where it is placed or traced, which for a later stage is an hour in.
+        on resume. A `batch` the mesh cannot divide fails where it is placed
+        or traced (`_check_batch`), and a ramp stage's, for a later stage,
+        an hour in.
         """
         if checkpointing and not isinstance(source, Checkpointable):
             raise ValueError(
@@ -1628,6 +1653,7 @@ class Trainer(Generic[Loss, Effects]):
                 f"resume. Train it with checkpoint_every=None "
                 f"(--trainer.checkpoint-every None)")
         if not isinstance(source, RampedStream):
+            self._check_batch(batch, mesh)
             return
         if self.accumulation > 1:
             raise ValueError(
