@@ -1090,8 +1090,8 @@ def stop_at_local_step(trainer, stop: int):
 
     save_local = trainer.checkpoints.save_local
 
-    def save_then_stop(step, state, position, *, share=None, rung=None):
-        save_local(step, state, position, share=share, rung=rung)
+    def save_then_stop(step, state, position, **options):
+        save_local(step, state, position, **options)
         trainer.checkpoints.wait()
         if step == stop:
             raise Stop()

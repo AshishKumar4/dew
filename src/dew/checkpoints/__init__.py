@@ -147,11 +147,10 @@ class Keep:
     def __post_init__(self):
         if self.latest < 0 or (self.every is not None and self.every < 1):
             raise ValueError("Keep needs latest >= 0 and every >= 1")
-        if isinstance(self.interval, str):
-            object.__setattr__(self, 'interval', duration(self.interval))
         interval = duration(self.interval) if isinstance(self.interval, str) else self.interval
         if interval is not None and interval.total_seconds() <= 0:
             raise ValueError("Keep.interval must be positive")
+        object.__setattr__(self, 'interval', interval)
 
 
 @dataclasses.dataclass(frozen=True)

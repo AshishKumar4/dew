@@ -291,10 +291,6 @@ class HostExecution:
         self.loss = jax.jit(objective.loss)
         self.unstack = jax.jit(functools.partial(_logical, sites=self.sites))
 
-    def resident(self, placement):
-        """Where the frozen collection lives for the run, given its layout specs."""
-        return resident(placement, self.sites, self.accelerator)
-
     def snapshot(self, variables):
         """The declared stacks as banks, everything else as it is stored.
 
