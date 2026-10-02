@@ -204,21 +204,11 @@ def _real(*dtypes: jax.typing.DTypeLike) -> bool:
 
 
 def _refuse_grouped_on_gpu() -> None:
-    """Refuse a grouped convolution with quantized activations on a GPU.
-
-    Measured with jax 0.11.2. In int8, with one or two input channels per
-    group and the int32 result scaled in float, plain JAX returns wrong
-    values without an error on the RTX 4080 (75% and 50% of the outputs),
-    and on the A100 quantizing the 176M text-to-image model's depthwise
-    convolutions dropped its CLIP score from 0.247 to 0.137. With four or
-    more per group, plain JAX computed it correctly on the RTX 4080, compiled
-    with its scaling; an int8 convolution run without its scaling fused in,
-    as it runs eagerly, fails to compile there at every group width. In fp8,
-    one or two input channels per group fail to compile on sm_89 (the RTX
-    4080), and four came out 3.5% from float; the A100, with no fp8 units,
-    computes it emulated, so nothing is gained there; sm_90 is untested. The
-    refusal covers every GPU, dtype and group width, and is revisited once an
-    H100 is measured."""
+    """Refuse a grouped convolution with quantized activations on a GPU,
+    where jax 0.11.2 computed it wrong or failed to compile it (the error
+    says where; in int8 on the A100 the 176M text-to-image model's CLIP score
+    fell from 0.247 to 0.137). The refusal covers every GPU, dtype and group
+    width until an H100 is measured."""
     if jax.default_backend() == "gpu":
         raise ValueError(
             "Dew refuses to quantize a grouped convolution's activations on a GPU. Measured with jax "
