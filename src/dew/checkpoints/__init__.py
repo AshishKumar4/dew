@@ -984,7 +984,7 @@ class Checkpoints:
         Sums every snapshot up to `step`, of every tracked profile, with the
         weights `coefficients` solves for, one snapshot read at a time and
         accumulated in fp32 or wider. The result goes where the run's params
-        go: `merge(params, {"variables": checkpoints.posthoc_ema(...)})`.
+        go: `merge(variables, {"params": checkpoints.posthoc_ema(...)})`.
         """
         from dew.training.posthoc import coefficients
 
