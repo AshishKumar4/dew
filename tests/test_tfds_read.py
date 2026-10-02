@@ -35,7 +35,12 @@ def test_prepared_records_carry_encoded_pixels_labels_and_caption_names():
         _, caption, label = spec.record(record, np.random.default_rng(0))
         assert ("red" if label == 0 else "blue") in caption.split()
     test_split = TFDSImages(path=str(FIXTURE), split="test").source()
-    assert [int(decode_image(test_split[i]["image"])[0, 0, 0]) for i in range(len(test_split))] == [26, 27, 28, 29]
+    assert [int(decode_image(test_split[i]["image"])[0, 0, 0]) for i in range(len(test_split))] == [
+        26,
+        27,
+        28,
+        29,
+    ]
 
 
 def test_a_prepared_source_describes_the_directory_and_split_it_reads():

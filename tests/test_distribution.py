@@ -24,7 +24,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from conftest import outside_any_cluster
+from lane_environment import outside_any_cluster
 
 from dew.nn.sharding import MESH_AXES
 from dew.training import MeshSpec
@@ -283,7 +283,9 @@ ONE_SLURM_TASK = {"SLURM_JOB_ID": "4242", "SLURM_NTASKS": "1", "SLURM_PROCID": "
 
 
 @pytest.mark.mesh(devices=0)
-@pytest.mark.parametrize("flags, kept", [("", "false"), ("--xla_gpu_enable_allocator_spatial_partitioning=true", "true")])
+@pytest.mark.parametrize(
+    "flags, kept", [("", "false"), ("--xla_gpu_enable_allocator_spatial_partitioning=true", "true")]
+)
 def test_a_gpu_process_keeps_its_temporaries_one_free_block(flags, kept):
     """A preallocated BFC pool is spatially partitioned by default: a free
     block below a buffer goes on serving the small allocations around a step,
@@ -546,10 +548,10 @@ def resumed_where_it_stopped(tmp_path: Path, run) -> None:
     exit code and output, SIGTERMed after the second step when `stop`."""
     steps, checkpoints = 8, tmp_path / "checkpoints"
     worker = ["--steps", str(steps), "--vary"]
-    code, output = run([*worker, "--out", str(tmp_path / "whole.json")], False)
+    code, output = run([*worker, "--out", str(tmp_path / "whole.json")], stop=False)
     assert code == 0, output
     code, output = run([*worker, "--out", str(tmp_path / "stopped.json"), "--checkpoints", str(checkpoints),
-                        "--step-seconds", "1"], True)
+                        "--step-seconds", "1"], stop=True)
     assert code == 128 + signal.SIGTERM, output
     assert "Terminating process" not in output and "Check failure" not in output, output
     stopped = re.search(r"Preempted at step (\d+)", output)
@@ -557,7 +559,7 @@ def resumed_where_it_stopped(tmp_path: Path, run) -> None:
     at = int(stopped[1])
     assert 2 <= at < steps, output
     code, output = run([*worker, "--out", str(tmp_path / "resumed.json"), "--checkpoints", str(checkpoints)],
-                       False)
+                       stop=False)
     assert code == 0, output
     whole, resumed = (json.loads((tmp_path / name).read_text()) for name in ("whole.json", "resumed.json"))
     # The state, the key and the data position all came back: every loss
@@ -736,47 +738,49 @@ def test_a_pool_gathers_a_tree_in_groups_to_every_host_or_to_process_zero():
     of its 6.8 s in them on 4x RTX 3090. With `held_by="first"`, process 0
     holds the tree and process 1, which took part in every agreement, holds
     none."""
-    program = ("import json\n"
-               "import dew.training.runtime as runtime\n"
-               "runtime.prepare_process()\n"
-               "import jax, jax.numpy as jnp, numpy as np\n"
-               "from jax.sharding import NamedSharding, PartitionSpec\n"
-               "from dew import artifacts\n"
-               "from dew.training import MeshSpec\n"
-               "mesh = MeshSpec(fsdp=jax.device_count()).build()\n"
-               "rows, rng = jax.device_count(), np.random.default_rng(0)\n"
-               "values = {'replicated': rng.standard_normal((3, 5)).astype(np.float32)}\n"
-               "for i in range(8):\n"
-               "    values[f'f32 {i}'] = rng.standard_normal((2 * rows, 3)).astype(np.float32)\n"
-               "    values[f'bf16 {i}'] = rng.standard_normal((4 * rows,)).astype(jnp.bfloat16)\n"
-               "    values[f'i32 {i}'] = rng.integers(0, 100, (rows, 2)).astype(np.int32)\n"
-               "def placed(name, value):\n"
-               "    spec = PartitionSpec() if name == 'replicated' else PartitionSpec('fsdp')\n"
-               "    return jax.make_array_from_callback(value.shape, NamedSharding(mesh, spec),"
-               " lambda index: value[index])\n"
-               "tree = {name: placed(name, value) for name, value in values.items()}\n"
-               "tree['host'] = np.arange(3)\n"
-               "agreements = []\n"
-               "agree = artifacts.agree_process_phase\n"
-               "def counted(error, *, phase, available=True):\n"
-               "    agreements.append(phase)\n"
-               "    return agree(error, phase=phase, available=available)\n"
-               "artifacts.agree_process_phase = counted\n"
-               "def same(got):\n"
-               "    return got is not None and np.array_equal(got['host'], np.arange(3)) and all(\n"
-               "        type(got[name]) is np.ndarray and got[name].dtype == value.dtype\n"
-               "        and np.array_equal(got[name], value) for name, value in values.items())\n"
-               "report = {}\n"
-               "for size in ('default', 'one leaf'):\n"
-               "    if size == 'one leaf':\n"
-               "        artifacts.GATHER_BYTES = 1\n"
-               "    agreements.clear()\n"
-               "    report[f'{size} every'] = [same(artifacts.collective_host(tree, phase='t')), len(agreements)]\n"
-               "    print('gathered', jax.process_index(), json.dumps(report), flush=True)\n"
-               "    agreements.clear()\n"
-               "    got = artifacts.collective_host(tree, phase='t', held_by='first')\n"
-               "    report[f'{size} first'] = [None if got is None else same(got), len(agreements)]\n"
-               "    print('gathered', jax.process_index(), json.dumps(report), flush=True)\n")
+    program = (
+        "import json\n"
+        "import dew.training.runtime as runtime\n"
+        "runtime.prepare_process()\n"
+        "import jax, jax.numpy as jnp, numpy as np\n"
+        "from jax.sharding import NamedSharding, PartitionSpec\n"
+        "from dew import artifacts\n"
+        "from dew.training import MeshSpec\n"
+        "mesh = MeshSpec(fsdp=jax.device_count()).build()\n"
+        "rows, rng = jax.device_count(), np.random.default_rng(0)\n"
+        "values = {'replicated': rng.standard_normal((3, 5)).astype(np.float32)}\n"
+        "for i in range(8):\n"
+        "    values[f'f32 {i}'] = rng.standard_normal((2 * rows, 3)).astype(np.float32)\n"
+        "    values[f'bf16 {i}'] = rng.standard_normal((4 * rows,)).astype(jnp.bfloat16)\n"
+        "    values[f'i32 {i}'] = rng.integers(0, 100, (rows, 2)).astype(np.int32)\n"
+        "def placed(name, value):\n"
+        "    spec = PartitionSpec() if name == 'replicated' else PartitionSpec('fsdp')\n"
+        "    return jax.make_array_from_callback(value.shape, NamedSharding(mesh, spec),"
+        " lambda index: value[index])\n"
+        "tree = {name: placed(name, value) for name, value in values.items()}\n"
+        "tree['host'] = np.arange(3)\n"
+        "agreements = []\n"
+        "agree = artifacts.agree_process_phase\n"
+        "def counted(error, *, phase, available=True):\n"
+        "    agreements.append(phase)\n"
+        "    return agree(error, phase=phase, available=available)\n"
+        "artifacts.agree_process_phase = counted\n"
+        "def same(got):\n"
+        "    return got is not None and np.array_equal(got['host'], np.arange(3)) and all(\n"
+        "        type(got[name]) is np.ndarray and got[name].dtype == value.dtype\n"
+        "        and np.array_equal(got[name], value) for name, value in values.items())\n"
+        "report = {}\n"
+        "for size in ('default', 'one leaf'):\n"
+        "    if size == 'one leaf':\n"
+        "        artifacts.GATHER_BYTES = 1\n"
+        "    agreements.clear()\n"
+        "    report[f'{size} every'] = [same(artifacts.collective_host(tree, phase='t')), len(agreements)]\n"
+        "    print('gathered', jax.process_index(), json.dumps(report), flush=True)\n"
+        "    agreements.clear()\n"
+        "    got = artifacts.collective_host(tree, phase='t', held_by='first')\n"
+        "    report[f'{size} first'] = [None if got is None else same(got), len(agreements)]\n"
+        "    print('gathered', jax.process_index(), json.dumps(report), flush=True)\n"
+    )
     done = launch("--processes-per-host", "2", "--", sys.executable, "-c", program, devices=1, timeout=300)
     assert done.returncode == 0, done.stdout + done.stderr
     # Each rank prints its report after every gather; the last line is the whole report.
@@ -885,23 +889,26 @@ def test_a_rank_that_holds_nothing_copies_none_of_the_tree_to_its_host():
 
     if jax.default_backend() != "gpu":
         pytest.skip("a CPU array reaches its host without a device-to-host transfer")
-    program = ("import dew.training.runtime as runtime\n"
-               "runtime.prepare_process()\n"
-               "import jax, jax.numpy as jnp, numpy as np\n"
-               "from jax.sharding import NamedSharding, PartitionSpec\n"
-               "from dew import artifacts\n"
-               "from dew.training import MeshSpec\n"
-               "mesh = MeshSpec(fsdp=jax.device_count()).build()\n"
-               "def placed(value, spec):\n"
-               "    return jax.make_array_from_callback(value.shape, NamedSharding(mesh, spec),"
-               " lambda index: value[index])\n"
-               "tree = {'sharded': [placed(np.full((2 * jax.device_count(), 37), i, np.float32),"
-               " PartitionSpec('fsdp')) for i in range(3)],\n"
-               "        'replicated': [placed(np.full((7, 37), i, np.float32), PartitionSpec()) for i in range(3)],\n"
-               "        'local': jnp.ones((5, 37))}\n"
-               "with jax.transfer_guard_device_to_host('log_explicit'):\n"
-               "    held = artifacts.collective_host(tree, phase='t', held_by='first')\n"
-               "print('held', jax.process_index(), held is not None, flush=True)\n")
+    program = (
+        "import dew.training.runtime as runtime\n"
+        "runtime.prepare_process()\n"
+        "import jax, jax.numpy as jnp, numpy as np\n"
+        "from jax.sharding import NamedSharding, PartitionSpec\n"
+        "from dew import artifacts\n"
+        "from dew.training import MeshSpec\n"
+        "mesh = MeshSpec(fsdp=jax.device_count()).build()\n"
+        "def placed(value, spec):\n"
+        "    return jax.make_array_from_callback(value.shape, NamedSharding(mesh, spec),"
+        " lambda index: value[index])\n"
+        "tree = {'sharded': [placed(np.full((2 * jax.device_count(), 37), i, np.float32),"
+        " PartitionSpec('fsdp')) for i in range(3)],\n"
+        "        'replicated': [placed(np.full((7, 37), i, np.float32), PartitionSpec()) "
+        "for i in range(3)],\n"
+        "        'local': jnp.ones((5, 37))}\n"
+        "with jax.transfer_guard_device_to_host('log_explicit'):\n"
+        "    held = artifacts.collective_host(tree, phase='t', held_by='first')\n"
+        "print('held', jax.process_index(), held is not None, flush=True)\n"
+    )
     done = launch("--processes-per-host", "2", "--", sys.executable, "-c", program, devices=1, timeout=300)
     assert done.returncode == 0, done.stdout + done.stderr
     assert "held 0 True" in done.stdout and "held 1 False" in done.stdout, done.stdout
@@ -954,42 +961,45 @@ def test_a_pools_second_run_loads_what_its_first_compiled(tmp_path):
     the run has; the jax constraints.txt names hashes the fingerprints of
     every process a computation spans."""
     cache, records = tmp_path / "cache", tmp_path / "records"
-    program = ("import json, sys\n"
-               "from pathlib import Path\n"
-               "import jax\n"
-               "from jax._src.lib import xla_client\n"
-               "topology_of = xla_client.get_topology_for_devices\n"
-               "class Apart:\n"
-               "    def __init__(self, topology):\n"
-               "        self.topology = topology\n"
-               "    def fingerprint(self):\n"
-               "        return self.topology.fingerprint() ^ (jax.process_index() + 1)\n"
-               "xla_client.get_topology_for_devices = lambda devices: Apart(topology_of(devices))\n"
-               "events = []\n"
-               "jax.monitoring.register_event_listener(lambda event, **_: events.append(event))\n"
-               "jax.config.update('jax_explain_cache_misses', True)\n"
-               "from dew.training.runtime import prepare_process\n"
-               "prepare_process(compilation_cache_dir=sys.argv[1])\n"
-               "import jax.numpy as jnp, numpy as np\n"
-               "from jax.sharding import NamedSharding, PartitionSpec\n"
-               "from dew.training import MeshSpec\n"
-               "mesh = MeshSpec(fsdp=jax.device_count()).build()\n"
-               "def placed(value, spec):\n"
-               "    return jax.make_array_from_callback(value.shape, NamedSharding(mesh, spec),"
-               " lambda index: value[index])\n"
-               "weights = [placed((np.random.default_rng(i).standard_normal((1024, 1024)) / 32)"
-               ".astype(jnp.bfloat16), PartitionSpec()) for i in range(4)]\n"
-               "x = placed(np.ones((jax.device_count() * 512, 1024), jnp.bfloat16), PartitionSpec('fsdp'))\n"
-               "def loss(x, weights):\n"
-               "    for weight in weights:\n"
-               "        x = jax.nn.gelu(x @ weight)\n"
-               "    return (x.astype(jnp.float32) ** 2).mean()\n"
-               "before = len(events)\n"
-               "float(jax.jit(lambda x, weights: jax.grad(loss)(x, weights).astype(jnp.float32).sum())(x, weights))\n"
-               "step = events[before:]\n"
-               "Path(sys.argv[2], f'{jax.process_index()}.json').write_text(json.dumps(\n"
-               "    [step.count('/jax/compilation_cache/compile_requests_use_cache'),\n"
-               "     step.count('/jax/compilation_cache/cache_hits')]))\n")
+    program = (
+        "import json, sys\n"
+        "from pathlib import Path\n"
+        "import jax\n"
+        "from jax._src.lib import xla_client\n"
+        "topology_of = xla_client.get_topology_for_devices\n"
+        "class Apart:\n"
+        "    def __init__(self, topology):\n"
+        "        self.topology = topology\n"
+        "    def fingerprint(self):\n"
+        "        return self.topology.fingerprint() ^ (jax.process_index() + 1)\n"
+        "xla_client.get_topology_for_devices = lambda devices: Apart(topology_of(devices))\n"
+        "events = []\n"
+        "jax.monitoring.register_event_listener(lambda event, **_: events.append(event))\n"
+        "jax.config.update('jax_explain_cache_misses', True)\n"
+        "from dew.training.runtime import prepare_process\n"
+        "prepare_process(compilation_cache_dir=sys.argv[1])\n"
+        "import jax.numpy as jnp, numpy as np\n"
+        "from jax.sharding import NamedSharding, PartitionSpec\n"
+        "from dew.training import MeshSpec\n"
+        "mesh = MeshSpec(fsdp=jax.device_count()).build()\n"
+        "def placed(value, spec):\n"
+        "    return jax.make_array_from_callback(value.shape, NamedSharding(mesh, spec),"
+        " lambda index: value[index])\n"
+        "weights = [placed((np.random.default_rng(i).standard_normal((1024, 1024)) / 32)"
+        ".astype(jnp.bfloat16), PartitionSpec()) for i in range(4)]\n"
+        "x = placed(np.ones((jax.device_count() * 512, 1024), jnp.bfloat16), PartitionSpec('fsdp'))\n"
+        "def loss(x, weights):\n"
+        "    for weight in weights:\n"
+        "        x = jax.nn.gelu(x @ weight)\n"
+        "    return (x.astype(jnp.float32) ** 2).mean()\n"
+        "before = len(events)\n"
+        "float(jax.jit(lambda x, weights: jax.grad(loss)(x, weights).astype(jnp.float32).sum())"
+        "(x, weights))\n"
+        "step = events[before:]\n"
+        "Path(sys.argv[2], f'{jax.process_index()}.json').write_text(json.dumps(\n"
+        "    [step.count('/jax/compilation_cache/compile_requests_use_cache'),\n"
+        "     step.count('/jax/compilation_cache/cache_hits')]))\n"
+    )
     runs, logged = [], []
     for run in range(2):
         out = records / str(run)

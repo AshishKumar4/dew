@@ -71,7 +71,9 @@ def test_legacy_neox_buffers_are_validated_in_their_stored_precision():
     prefix = 'gpt_neox.layers.0.attention.'
     tensors[prefix + 'bias'] = np.tril(np.ones((1, 1, 64, 64), bool))
     tensors[prefix + 'masked_bias'] = np.asarray(-np.inf, np.float16)
-    tensors[prefix + 'rotary_emb.inv_freq'] = inverse_frequencies(10000., 4, dtype=np.float32).astype(np.float16)
+    tensors[prefix + "rotary_emb.inv_freq"] = inverse_frequencies(10000.0, 4, dtype=np.float32).astype(
+        np.float16
+    )
     actual = translate_weights(tensors, config, 'gpt_neox')
     ids = jnp.asarray(np.load(DIRECTORY / 'input_ids.npy'))
     np.testing.assert_array_equal(loaded.model.apply(actual, ids), loaded.model.apply(loaded.variables, ids))

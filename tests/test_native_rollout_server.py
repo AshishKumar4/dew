@@ -37,7 +37,9 @@ def test_the_native_server_serves_loaded_weights_at_its_own_precision():
     target = objective()
     params = target.init(jax.random.key(0))
     served = jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16), params)
-    backend = Server.from_task(TextGeneration(target.model, served, None, sampling=SAMPLING), slots=2, capacity=64)
+    backend = Server.from_task(
+        TextGeneration(target.model, served, None, sampling=SAMPLING), slots=2, capacity=64
+    )
     server = NativeRolloutServer(backend)
     try:
         before = server.submit([1, 2, 3], BUDGET, key=5).result()
@@ -71,8 +73,9 @@ def test_native_rollouts_preserve_a_split_jax_key():
 def test_a_refused_request_raises_at_submit_and_the_native_server_keeps_serving():
     target = objective()
     params = target.init(jax.random.key(0))
-    server = NativeRolloutServer(Server.from_task(TextGeneration(target.model, params, None, sampling=SAMPLING),
-                                                  slots=2, capacity=64))
+    server = NativeRolloutServer(
+        Server.from_task(TextGeneration(target.model, params, None, sampling=SAMPLING), slots=2, capacity=64)
+    )
     try:
         running = server.submit([1, 2, 3], 40, key=1)
         with pytest.raises(ValueError, match="max_seq_len"):
@@ -102,6 +105,12 @@ def test_a_program_that_ends_with_draws_in_flight_exits_cleanly():
         "draws = [server.submit([1, 2, 3], 400, key=seed) for server in servers for seed in range(64)]\n"
         "draws[0].result()\n")
     root = Path(__file__).resolve().parents[1]
-    done = subprocess.run([sys.executable, "-c", program], cwd=root, capture_output=True, text=True, timeout=300,
-                          env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(root / "src")})
+    done = subprocess.run(
+        [sys.executable, "-c", program],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(root / "src")},
+    )
     assert done.returncode == 0, done.stdout + done.stderr

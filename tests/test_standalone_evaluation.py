@@ -68,7 +68,11 @@ class ScheduledScores(Objective):
         return params["params"]["offset"], Aux({})
 
     def evaluate(self, params, batch, step):
-        return TokenScores(jnp.ones_like(batch["x"]) * step.step, jnp.ones_like(batch["x"]), correct=jnp.zeros_like(jnp.ones_like(batch["x"]) * step.step, dtype=bool))
+        return TokenScores(
+            jnp.ones_like(batch["x"]) * step.step,
+            jnp.ones_like(batch["x"]),
+            correct=jnp.zeros_like(jnp.ones_like(batch["x"]) * step.step, dtype=bool),
+        )
 
 
 def test_integer_evaluation_key_matches_a_jax_key():
@@ -76,7 +80,9 @@ def test_integer_evaluation_key_matches_a_jax_key():
     params = objective.init(jax.random.key(0))
     batches = [{"x": np.ones((16, 1), np.float32), "score": np.arange(16, dtype=np.float32)},
                {"x": np.ones((8, 1), np.float32), "score": np.arange(16, 24, dtype=np.float32)}]
-    integer = Evaluation.run(objective, params, lambda partition: iter(batches), key=7, metrics=[Perplexity()])
+    integer = Evaluation.run(
+        objective, params, lambda partition: iter(batches), key=7, metrics=[Perplexity()]
+    )
     typed = Evaluation.run(objective, params, lambda partition: iter(batches), key=jax.random.key(7),
                            metrics=[Perplexity()])
     assert integer.scores == typed.scores == {"val/perplexity": 1.}

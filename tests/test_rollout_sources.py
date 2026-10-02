@@ -107,7 +107,11 @@ def test_a_multi_turn_session_keeps_each_calls_version_and_packs_into_one_chain(
     episodes.close()
     assert rollout.status == Status.COMPLETED and rollout.reward == 3.0
     assert [call.version for call in rollout.calls] == [0, 1, 2]
-    assert [call.prompt_ids for call in rollout.calls] == [(1, 2), (1, 2, 5, EOS, 4), (1, 2, 5, EOS, 4, 5, EOS, 4)]
+    assert [call.prompt_ids for call in rollout.calls] == [
+        (1, 2),
+        (1, 2, 5, EOS, 4),
+        (1, 2, 5, EOS, 4, 5, EOS, 4),
+    ]
     assert entered == exited and entered[0][0] == "3" and rollout.task == "3"
     batch = pack([rollout], 16)
     assert batch["input_ids"].shape == (1, 16) and set(batch["text_segment_ids"][0].tolist()) == {0, 1}
@@ -125,8 +129,13 @@ def test_every_call_of_a_multi_turn_session_carries_its_draws_engine_records():
         def submit(self, prompt, max_new_tokens, *, key):
             draw = super().submit(prompt, max_new_tokens, key=key).result()
             done = Future()
-            done.set_result(replace(draw, routed_experts=np.full((len(prompt) + 1, 2, 1), len(prompt), np.uint8),
-                                    support=((5, 6), (EOS,))))
+            done.set_result(
+                replace(
+                    draw,
+                    routed_experts=np.full((len(prompt) + 1, 2, 1), len(prompt), np.uint8),
+                    support=((5, 6), (EOS,)),
+                )
+            )
             return done
 
     episodes = source(Recording(), factory([], []))

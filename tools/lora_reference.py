@@ -15,6 +15,14 @@ environments, both sharing the baseline site-packages through a `.pth` file
         peft==0.20.0 accelerate psutil transformers==4.49.0 "tokenizers>=0.21,<0.22" "huggingface-hub>=0.26,<1"
     PYTHONPATH=src ~/.cache/dew/peft-diffusers-reference/bin/python tools/lora_reference.py pipeline
 
+The FLUX and SD3 round trip runs in two halves: Dew writes its adapter in
+Dew's own environment, whose transformers reads the fixtures' tokenizers,
+and Diffusers reads it in the pipeline reference environment:
+
+    PYTHONPATH=src .venv/bin/python tools/lora_reference.py pipeline-adapters
+    PYTHONPATH=src ~/.cache/dew/peft-diffusers-reference/bin/python \\
+        tools/lora_reference.py check-pipeline-adapters
+
 The decoder reference runs on transformers 5.16.1, the release every decoder
 fixture is calibrated against; the pipeline reference needs Diffusers 0.34.0's
 pipelines, which import only under transformers 4.49.0, the pair the native
@@ -37,6 +45,15 @@ What lands in tests/fixtures/lora:
   the UNet's prediction on them with the adapter on, off, and fused (the
   fused prediction equals the adapted one), and the fused UNet weights of
   every target.
+- flux-tiny and sd3-tiny: the round trip of an adapter Dew writes. Dew loads
+  the `pipeline` of tests/fixtures/{flux,sd3}_source.tar.xz, adapts its
+  transformer's to_q, to_k, to_v and to_out.0 at rank 4 through
+  `PretrainedPipeline.lora`, draws every B away from zero and writes the
+  Diffusers file with `adapter.save`. Diffusers then reads that file with
+  the pipeline's own `load_lora_weights`; reference.npz holds a latent, a
+  model time, a text context, a pooled row and FLUX's distilled guidance,
+  all in Dew's layout, with the transformer's prediction on them with the
+  adapter on and off, also in Dew's layout, and Dew's own prediction.
 
 `check DIRECTORY` loads a PEFT adapter dew exported next to a `logits.npy`
 into the reference decoder and compares; `check-pipeline DIRECTORY` loads a
@@ -243,13 +260,131 @@ def pipeline(out: Path) -> None:
     print(f"wrote {out}")
 
 
+ADAPTED = ("to_q", "to_k", "to_v", "to_out.0")
+FAMILIES = ("flux", "sd3")
+PIPELINES = {"flux": "FluxPipeline", "sd3": "StableDiffusion3Pipeline"}
+TEXT = {"flux": ("text_encoder", "text_encoder_2", "tokenizer", "tokenizer_2"),
+        "sd3": ("text_encoder", "text_encoder_2", "text_encoder_3",
+                "tokenizer", "tokenizer_2", "tokenizer_3")}
+
+
+@contextlib.contextmanager
+def _source_pipeline(family: str):
+    """The `pipeline` directory of the family's source fixture, for the duration of the block."""
+    with tempfile.TemporaryDirectory() as extracted:
+        with tarfile.open(ROOT / f"tests/fixtures/{family}_source.tar.xz") as archive:
+            archive.extractall(extracted, filter="data")
+        yield Path(extracted) / "pipeline"
+
+
+def dew_adapter(family: str, directory: Path) -> None:
+    """Dew's half of the round trip, in Dew's own environment: adapt the
+    family's tiny pipeline through `PretrainedPipeline.lora`, draw every B
+    away from zero, write the Diffusers file with `adapter.save`, and record
+    the inputs with Dew's prediction on them."""
+    import jax
+    import jax.numpy as jnp
+
+    from dew.diffusion.process import DenoisingCondition
+    from dew.interop.pretrained import Pretrained
+
+    directory.mkdir(parents=True, exist_ok=True)
+    with _source_pipeline(family) as root:
+        source = Pretrained.load(root, dtype="float32", attention_impl="xla")
+        config = json.loads((root / "transformer" / "config.json").read_text())
+    tuned = source.lora(rank=4, modules=ADAPTED, key=jax.random.key(0))
+    moved = iter(jax.random.split(jax.random.key(1), len(tuned.adapter.targets)))
+    variables = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: (0.2 * jax.random.normal(next(moved), leaf.shape, leaf.dtype)
+                            if path[-1].key == "lora_B" else leaf), tuned.variables)
+    tuned.adapter.save(variables, directory)
+    generator = np.random.default_rng(2)
+    channels = config["in_channels"] // (4 if family == "flux" else 1)
+    arrays = {
+        "latent": generator.standard_normal((1, 8, 8, channels), dtype=np.float32),
+        "context": generator.standard_normal((1, 8, config["joint_attention_dim"]), dtype=np.float32),
+        "pooled": generator.standard_normal((1, config["pooled_projection_dim"]), dtype=np.float32),
+        "guidance": (np.full((1,), 3.5, np.float32) if config.get("guidance_embeds")
+                     else np.zeros((0,), np.float32)),
+        "times": np.asarray([731.0], np.float32)}
+    own = {name: tree for name, tree in variables.items() if name not in ("encoders", "autoencoder")}
+    guidance = jnp.asarray(arrays["guidance"]) if arrays["guidance"].size else None
+    condition = DenoisingCondition(jnp.asarray(arrays["context"]), jnp.asarray(arrays["pooled"]),
+                                   guidance=guidance)
+    arrays["dew"] = np.asarray(tuned.model.apply(own, jnp.asarray(arrays["latent"]),
+                                                 jnp.asarray(arrays["times"]), condition))
+    np.savez_compressed(directory / "reference.npz", **arrays)
+    print(f"wrote {directory}")
+
+
+def _transformer_prediction(family: str, transformer, arrays) -> np.ndarray:
+    """The source transformer's call on the recorded inputs, read back into Dew's layout:
+    FLUX packs 2x2 latent patches into tokens and takes a timestep over the
+    training count, SD3 takes channels first."""
+    latent, times = arrays["latent"], torch.from_numpy(arrays["times"])
+    context, pooled = torch.from_numpy(arrays["context"]), torch.from_numpy(arrays["pooled"])
+    if family == "sd3":
+        output = transformer(hidden_states=torch.from_numpy(latent).permute(0, 3, 1, 2),
+                             encoder_hidden_states=context, pooled_projections=pooled, timestep=times,
+                             return_dict=False)[0]
+        return output.permute(0, 2, 3, 1).numpy()
+    channels = latent.shape[-1]
+    rows, columns = latent.shape[1] // 2, latent.shape[2] // 2
+    packed = latent.reshape(1, rows, 2, columns, 2, channels).transpose(0, 1, 3, 5, 2, 4)
+    ids = torch.zeros(rows, columns, 3)
+    ids[..., 1] += torch.arange(rows)[:, None]
+    ids[..., 2] += torch.arange(columns)[None, :]
+    output = transformer(
+        hidden_states=torch.from_numpy(np.ascontiguousarray(packed).reshape(1, rows * columns, -1)),
+        encoder_hidden_states=context, pooled_projections=pooled, timestep=times / 1000,
+        guidance=torch.from_numpy(arrays["guidance"]), txt_ids=torch.zeros(context.shape[1], 3),
+        img_ids=ids.reshape(rows * columns, 3), return_dict=False)[0].numpy()
+    return output.reshape(1, rows, columns, channels, 2, 2).transpose(0, 1, 4, 2, 5, 3).reshape(latent.shape)
+
+
+def diffusers_check(family: str, directory: Path) -> None:
+    """Diffusers' half, in the pipeline reference environment: the family's
+    pipeline reads the file Dew wrote with its own `load_lora_weights`, and
+    its transformer predicts on the recorded inputs with the adapter on and
+    off. Both land in reference.npz once the adapted one agrees with Dew's.
+    The text towers and their tokenizers are not loaded: the file adapts the
+    transformer alone."""
+    import diffusers
+    import transformers
+
+    arrays = dict(np.load(directory / "reference.npz"))
+    with _source_pipeline(family) as root:
+        pipe = getattr(diffusers, PIPELINES[family]).from_pretrained(
+            root, torch_dtype=torch.float32, **dict.fromkeys(TEXT[family]))
+    pipe.load_lora_weights(directory)
+    with torch.no_grad():
+        adapted = _transformer_prediction(family, pipe.transformer, arrays)
+        pipe.disable_lora()
+        base = _transformer_prediction(family, pipe.transformer, arrays)
+    gap = float(np.abs(arrays["dew"] - adapted).max() / np.abs(adapted).max())
+    moved_by = float(np.abs(adapted - base).max())
+    print(json.dumps({"family": family, "relative gap to Dew": gap, "max |adapted - base|": moved_by}))
+    if gap > 1e-5 or moved_by < 1e-2:
+        raise SystemExit(f"{family}: Diffusers does not predict what Dew does with Dew's adapter")
+    np.savez_compressed(directory / "reference.npz", **arrays, adapted=adapted, base=base)
+    versions = {"peft": _peft_version(), "transformers": transformers.__version__,
+                "diffusers": diffusers.__version__}
+    (directory / "meta.json").write_text(json.dumps(versions, indent=2) + "\n")
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("target", choices=["decoder", "pipeline", "check", "check-pipeline"])
+    parser.add_argument("target",
+                        choices=["decoder", "pipeline", "pipeline-adapters", "check", "check-pipeline",
+                                 "check-pipeline-adapters"])
     parser.add_argument("directory", nargs="?", type=Path)
     parser.add_argument("--out", type=Path, default=FIXTURES)
     arguments = parser.parse_args(argv)
-    if arguments.target.startswith("check"):
+    if arguments.target in ("pipeline-adapters", "check-pipeline-adapters"):
+        half = dew_adapter if arguments.target == "pipeline-adapters" else diffusers_check
+        for family in FAMILIES:
+            half(family, arguments.out / f"{family}-tiny")
+    elif arguments.target.startswith("check"):
         if arguments.directory is None:
             parser.error("check needs the exported adapter directory")
         (check if arguments.target == "check" else check_pipeline)(arguments.directory)

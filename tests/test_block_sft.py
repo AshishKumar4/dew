@@ -53,7 +53,7 @@ def reference_variables(loaded, name):
 
 def assert_tree_close(actual, expected, tolerance):
     assert jax.tree.structure(actual) == jax.tree.structure(expected)
-    for left, right in zip(jax.tree.leaves(actual), jax.tree.leaves(expected)):
+    for left, right in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
         np.testing.assert_allclose(left, right, atol=tolerance, rtol=0)
 
 
@@ -88,7 +88,13 @@ def test_disabling_encoder_gradient_matches_the_reference_control(source):
     expected = reference_variables(loaded, "detached_gradient.safetensors")
     assert_tree_close(gradient, expected, 1e-4)
     full = reference_variables(loaded, "gradient.safetensors")
-    assert max(float(jnp.max(jnp.abs(a - b))) for a, b in zip(jax.tree.leaves(gradient), jax.tree.leaves(full))) > 1e-3
+    assert (
+        max(
+            float(jnp.max(jnp.abs(a - b)))
+            for a, b in zip(jax.tree.leaves(gradient), jax.tree.leaves(full), strict=True)
+        )
+        > 1e-3
+    )
 
 
 @pytest.mark.parametrize("probability,reference_key", [(0., "sc_off_loss"), (1., "sc_on_loss")])
@@ -227,7 +233,9 @@ def test_image_sft_uses_media_validity_groups_and_positions(image_source):
     np.testing.assert_array_equal(media_gradient[0, 1], 0)
     assert any(float(jnp.linalg.norm(leaf)) > 0
                for leaf in jax.tree.leaves(gradient["params"]["conditioner"]))
-    changed = inputs.replace(conditioning={**inputs.conditioning, "pixel_values": -inputs.conditioning["pixel_values"]})
+    changed = inputs.replace(
+        conditioning={**inputs.conditioning, "pixel_values": -inputs.conditioning["pixel_values"]}
+    )
     changed_loss = evaluate(variables, changed)[0]
     assert abs(float(changed_loss - loss)) > 1e-5
     for name, replacement in (("attention_mask", inputs.tokens != 0),
@@ -261,7 +269,7 @@ def test_denoiser_image_gradient_obeys_encoder_detachment(image_source):
         obj = BlockDiffusionObjective(loaded.model, prompt_length=8, pretrained=loaded.variables,
                                       encoder_loss_weight=0,
                                       stop_gradient_from_denoiser_to_encoder=detach)
-        def loss(pixels):
+        def loss(pixels, *, obj=obj):
             conditioned = inputs.replace(conditioning={**inputs.conditioning, "pixel_values": pixels})
             return obj.scalar_loss(variables, {"text": conditioned}, step)[0]
         gradient = jax.jit(jax.grad(loss))(inputs.conditioning["pixel_values"])
@@ -289,7 +297,7 @@ def test_image_sft_trainer_resume_publish_and_generate(image_source, tmp_path):
     assert_tree_close(updated.params, expected, 2e-6)
     assert any(not np.array_equal(before, after) for before, after in zip(
         jax.tree.leaves(variables["params"]["conditioner"]),
-        jax.tree.leaves(updated.params["params"]["conditioner"])))
+        jax.tree.leaves(updated.params["params"]["conditioner"]), strict=True))
     resumed = Trainer(obj, optax.sgd(0.001), key=run_key,
                       checkpoints=Checkpoints(str(tmp_path / "run"))).fit(
                           data, steps=2, checkpoint_every=1, log_every=1)

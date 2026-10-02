@@ -43,7 +43,7 @@ from dew.data.sources.hf import HFDatasetSource
 from dew.position import ENVELOPE
 from dew.registry import datasets
 
-WORKERS = dict(loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
+WORKERS = {"loading": Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1)}
 
 
 # ---------------------------------------------------------------------------------
@@ -184,7 +184,7 @@ class Indexed(DatasetSpec):
     val_batches: int | None = None
     count: int | None = None
     seed: int = 0
-    loading: Loading = Loading(workers=0)
+    loading: Loading = dataclasses.field(default_factory=lambda: Loading(workers=0))
 
     def source(self):
         return _Indexed(self.length)
@@ -193,7 +193,7 @@ class Indexed(DatasetSpec):
         source = self.source()
         records = len(source) if self.count is None else self.count
         train, val = hold_out(source, records, (self.val_batches or 0) * batch, "Indexed")
-        knobs = dict(batch=batch, seed=self.seed, loading=self.loading)
+        knobs = {"batch": batch, "seed": self.seed, "loading": self.loading}
         return Dataset(train=train_stream(train, [], **knobs),
                        val=None if val is None else validation_pass(val, [], **knobs),
                        records=len(train), batch=batch)
@@ -605,7 +605,7 @@ def test_a_position_over_another_order_is_refused():
     refused instead of resumed at the same offset into different data."""
     _, saved = _steps(2, 3)
 
-    for other in (dict(length=64), dict(seed=1)):
+    for other in ({"length": 64}, {"seed": 1}):
         stream = Indexed(**other).load(batch=8).train(DataPartition())
         with pytest.raises(ValueError, match="records into"):
             stream.set_state(saved[0])
@@ -736,7 +736,9 @@ def test_local_videos_lists_every_file_under_the_directory(tmp_path):
 
     records = LocalVideos(path=str(tmp_path), caption="a clip").source()
 
-    assert [r["video_path"] for r in records] == sorted([str(c) for c in clips] + [str(tmp_path / "extra.webm")])
+    assert [r["video_path"] for r in records] == sorted(
+        [str(c) for c in clips] + [str(tmp_path / "extra.webm")]
+    )
     assert {r["caption"] for r in records} == {"a clip"}
     with pytest.raises(ValueError, match="path="):
         LocalVideos().source()
@@ -1063,7 +1065,10 @@ def test_an_interrupted_epoch_resumes_on_exactly_the_records_it_had_not_seen(
     assert sorted(index for index, _, _ in seen + rest[:4]) == list(range(8, 16))
 
 
-def _validated(length, val_batches, batch, partition=DataPartition(), **read):
+_DEFAULT_VALIDATED_PARTITION = DataPartition()
+
+
+def _validated(length, val_batches, batch, partition=_DEFAULT_VALIDATED_PARTITION, **read):
     """{record index: (pixels, caption)} for one share's validation pass."""
     data = Augmenting(length=length, image_size=8, seed=3, val_batches=val_batches,
                       loading=Loading(workers=0, worker_buffer=1, **read)).load(
@@ -1283,7 +1288,7 @@ def test_resizing_interpolates_up_and_averages_down():
     fine = np.zeros((900, 900, 3), np.uint8)
     fine[::2, ::2] = fine[1::2, 1::2] = 255
     down = images.resize_image(fine, 300)
-    assert 100 <= down.min() and down.max() <= 160, "area averages the squares it covers"
+    assert down.min() >= 100 and down.max() <= 160, "area averages the squares it covers"
 
 
 # ---------------------------------------------------------------------------------
