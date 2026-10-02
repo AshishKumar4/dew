@@ -4,6 +4,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import pytest
 
 from dew.checkpoints import Checkpoints
 from dew.config import ModelConfig
@@ -39,6 +40,11 @@ def test_python_lm_run_saves_its_inference_record_without_run_json(tmp_path):
     record = Checkpoints(str(tmp_path / 'run')).artifact(2)
     assert record['objective'] == 'lm'
     assert record['seq_len'] == 8
+    from dew.interop import Pretrained, PretrainedDecoder, PretrainedMaskedDecoder
+    bundle = Pretrained.from_run(tmp_path / 'run')
+    assert isinstance(bundle, PretrainedDecoder)
+    with pytest.raises(TypeError, match='PretrainedDecoder source, not a PretrainedMaskedDecoder'):
+        PretrainedMaskedDecoder.from_run(tmp_path / 'run')
     rebuilt = ModelConfig.from_dict(record['model']).build()
     assert rebuilt == objective.model.clone(dtype=jnp.float32)
     assert record['tokenizer'] is None
@@ -82,3 +88,21 @@ def test_builtin_autoencoder_record_uses_the_saved_parameters():
     latent = original.encode(original.params, image)
     np.testing.assert_array_equal(original.decode(original.params, latent),
                                   rebuilt.decode(rebuilt.params, latent))
+
+
+def test_masked_run_returns_its_own_bundle_kind(tmp_path):
+    from dew.diffusion.discrete import MDLM
+    from dew.interop import Pretrained, PretrainedMaskedDecoder
+    from dew.objectives.diffusion.masked import MaskedDiffusionObjective
+
+    masked = model().clone(causal=False, mask_token_id=0, qk_norm=False)
+    objective = MaskedDiffusionObjective(masked, MDLM(mask_id=0)(), 8,
+                                        head_chunks=1, ema_decay=None, steps=2)
+    source = grain.MapDataset.source([{'text': np.arange(1, 9, dtype=np.int32)}] * 8)
+    data = Dataset.from_grain(source, batch=8, loading=Loading(workers=0))
+    trainer = Trainer(objective, optax.sgd(.01), key=jax.random.key(0),
+                      checkpoints=Checkpoints(str(tmp_path / 'run')))
+    trainer.fit(data, steps=1, log_every=1, checkpoint_every=1)
+    bundle = Pretrained.from_run(tmp_path / 'run')
+    assert isinstance(bundle, PretrainedMaskedDecoder)
+    assert bundle.model.mask_token_id == 0

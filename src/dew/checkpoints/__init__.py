@@ -1093,7 +1093,7 @@ class Checkpoints:
         return json_value((checkpointer.metadata(step).custom_metadata or {}).get('rung'), 'rung')
 
     def variables(self, *, step: int | str | None = None, ema: bool | None = None,
-                  mesh=None, layout=None, param_dtype: str | None = None,
+                  mesh=None, layout=None, param_dtype: jax.typing.DTypeLike | None = None,
                   parameter_roots: tuple[tuple[str, ...], ...] = (("params",), ("frozen",))) -> Variables:
         """Read the selected step's live or averaged variables onto the requested layout.
 
