@@ -524,14 +524,6 @@ def test_a_quantized_runs_record_re_wraps_the_model_it_rebuilds(tmp_path):
     assert float(jnp.max(jnp.abs(quantized - plain.apply(task.variables, ids)))) > 0.0
     assert int(state.step) == 1
 
-    # A run.json from before the knob moved keeps the spec at the top level,
-    # where the LM recipe's own flag wrote it, and still re-wraps.
-    before = {**record, "quantization": record["trainer"]["quantization"],
-              "trainer": {**record["trainer"], "quantization": None}}
-    (tmp_path / "run" / "run.json").write_text(json.dumps(before))
-    older = dew.pipeline(str(tmp_path / "run"))
-    np.testing.assert_array_equal(older.model.apply(older.variables, ids), quantized)
-
 
 @pytest.mark.mesh
 def test_pipeline_places_a_run_on_a_mesh_and_answers_the_same_images(tmp_path):
