@@ -1423,7 +1423,7 @@ class Trainer(Generic[Loss, Effects]):
         run = _FitRun(time.perf_counter())
         # A display of this fit's own: one before it may have run other steps.
         self._display = TrainingDisplay()
-        profile, checkpoints = self.profile, self.checkpoints
+        checkpoints = self.checkpoints
         profiler = self._own_profile_window()
         # One boundary lookup at setup: the prefetch worker and the step
         # scopes share whichever profiler owns the capture.
@@ -1451,61 +1451,7 @@ class Trainer(Generic[Loss, Effects]):
                 run.stop_control = checkpoints.control(checkpoints.latest)
             if self._opened(plan, run, state, position):
                 return state
-            compiled: dict[Shapes, tuple[CompiledStep, float | None]] = {}
-            interval = _Interval(fresh_book(), time.time(), last_saved=(
-                run.current if checkpoints is not None and checkpoints.latest is not None else None))
-            seen = 0
-            run.notice = PreemptionNotice()
-            while run.current < steps:
-                # Read through `run` each time: a local alias would keep the
-                # closed iterator reachable from a failed run's traceback.
-                assert run.train is not None
-                # The window's capture opens before this iteration's first
-                # read, so the step row records the read it waits on rather
-                # than a compile that ran before capture began.
-                if (profiler is not None and profile is not None
-                        and not run.tracing and run.traced == 0
-                        and seen >= profile.warmup):
-                    self._start_window(profiler)
-                    run.tracing = True
-                capturing = tracer is not None and tracer.running
-                step_scope = (jax.profiler.StepTraceAnnotation("train", step_num=run.current)
-                              if capturing else contextlib.nullcontext())
-                with step_scope:
-                    with region("input.wait"):
-                        batch = next(run.train)
-                    if self.rollout is not None:
-                        batch, sampled = self._rolled_out(state, batch)
-                        interval.rollout_seconds += sampled
-                    first_compile = not compiled
-                    train_step, measured_flops = self._compiled_for(compiled, state, batch)
-                    if first_compile:
-                        # Rebound once the step is compiled, so the first tick
-                        # measures steps, not the compile.
-                        interval.last_log_time = time.time()
-                    with region("train.step"):
-                        state, loss, aux, finite, accepted = train_step(state, batch)
-                    run.loss = loss
-                    position = run.train.source_state
-                    run.current += 1
-                    self._display.step(run.current)
-                    seen += 1
-                    interval.count(batch, measured_flops, loss, finite)
-                    if run.first_step is None:
-                        loss.block_until_ready()
-                        run.first_step = time.perf_counter() - run.started
-                    if self._between_steps(plan, run, interval, state, shardings, position,
-                                           loss, aux, accepted):
-                        break
-                # The step row is complete once its scope exits; closing the
-                # window here keeps the last iteration inside the capture.
-                if run.tracing and profile is not None:
-                    run.traced += 1
-                    if run.traced == profile.steps:
-                        run.tracing = False
-                        assert profiler is not None
-                        self._stop_trace(run, profile, profiler)
-            self._wind_down(plan, run, interval, state, shardings, position, profiler)
+            state = self._training_loop(plan, run, state, shardings, position, profiler, tracer)
         finally:
             primary = sys.exception()
             error = self._closed(run, primary, profiler)
@@ -1520,6 +1466,67 @@ class Trainer(Generic[Loss, Effects]):
                 ),
                 step="best",
             )
+        return state
+
+    def _training_loop(self, plan: _FitPlan, run: _FitRun, state: TrainState,
+                       shardings, position, profiler: Profiler | None, tracer: Profiler | None) -> TrainState:
+        """Dispatch the numerical steps and finish their loop before resource cleanup."""
+        profile = self.profile
+        compiled: dict[Shapes, tuple[CompiledStep, float | None]] = {}
+        interval = _Interval(fresh_book(), time.time(), last_saved=(
+            run.current if checkpoints is not None and checkpoints.latest is not None else None))
+        seen = 0
+        run.notice = PreemptionNotice()
+        while run.current < plan.steps:
+            # Read through `run` each time: a local alias would keep the
+            # closed iterator reachable from a failed run's traceback.
+            assert run.train is not None
+            # The window's capture opens before this iteration's first
+            # read, so the step row records the read it waits on rather
+            # than a compile that ran before capture began.
+            if (profiler is not None and profile is not None
+                    and not run.tracing and run.traced == 0
+                    and seen >= profile.warmup):
+                self._start_window(profiler)
+                run.tracing = True
+            capturing = tracer is not None and tracer.running
+            step_scope = (jax.profiler.StepTraceAnnotation("train", step_num=run.current)
+                          if capturing else contextlib.nullcontext())
+            with step_scope:
+                with region("input.wait"):
+                    batch = next(run.train)
+                if self.rollout is not None:
+                    batch, sampled = self._rolled_out(state, batch)
+                    interval.rollout_seconds += sampled
+                first_compile = not compiled
+                train_step, measured_flops = self._compiled_for(compiled, state, batch)
+                if first_compile:
+                    # Rebound once the step is compiled, so the first tick
+                    # measures steps, not the compile.
+                    interval.last_log_time = time.time()
+                with region("train.step"):
+                    state, loss, aux, finite, accepted = train_step(state, batch)
+                run.loss = loss
+                position = run.train.source_state
+                run.current += 1
+                self._display.step(run.current)
+                seen += 1
+                interval.count(batch, measured_flops, loss, finite)
+                if run.first_step is None:
+                    loss.block_until_ready()
+                    run.first_step = time.perf_counter() - run.started
+                if self._between_steps(plan, run, interval, state, shardings, position,
+                                       loss, aux, accepted):
+                    break
+            # The step row is complete once its scope exits; closing the
+            # window here keeps the last iteration inside the capture.
+            if run.tracing and profile is not None:
+                run.traced += 1
+                if run.traced == profile.steps:
+                    run.tracing = False
+                    assert profiler is not None
+                    self._stop_trace(run, profile, profiler)
+        self._wind_down(plan, run, interval, state, shardings, position, profiler)
         return state
 
     def _closed(self, run: _FitRun, primary: BaseException | None,
