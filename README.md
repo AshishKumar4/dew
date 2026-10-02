@@ -753,8 +753,6 @@ combine one with `checkpoint_every`. `objective.pipeline` returns the
 An objective can train an ordinary Linen module. This example learns `y = 2x + 1` with a single dense layer.
 
 ```python
-import itertools
-
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
@@ -776,9 +774,7 @@ class Regression(Objective):
         return loss, Aux(metrics={"mse": loss})
 
 x = np.linspace(-1, 1, 32, dtype=np.float32).reshape(32, 1)
-batch = {"x": x, "y": 2 * x + 1}
-data = Dataset(train=lambda partition: itertools.repeat(batch),
-               val=None, records=32, batch=32)
+data = Dataset.from_records({"x": x, "y": 2 * x + 1}, batch=32)
 objective = Regression()
 state = Trainer(objective, optax.sgd(0.1), key=jax.random.key(0)).fit(
     data, steps=100, log_every=25)

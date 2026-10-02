@@ -30,8 +30,8 @@ from absl import flags
 if not flags.FLAGS.is_parsed():
     flags.FLAGS.mark_as_parsed()
 
-from dew.data import CC12M, DataPartition, Loading, OxfordFlowers, images
-from dew.data.images import ImageTransform
+from dew.data import DataPartition, Loading, OxfordFlowers, images
+from dew.data.images import CC12M, ImageTransform
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -114,7 +114,8 @@ def test_module_imports_and_constructs_without_torchvision(tmp_path):
         "sys.modules['transformers'] = None",
         "",
         "import numpy as np",
-        "from dew.data import CC12M, OxfordFlowers",
+        "from dew.data import OxfordFlowers",
+        "from dew.data.images import CC12M",
         "from dew.data.images import ImageTransform, augment_image, image_augmentations",
         "",
         "labels = sys.argv[1]",
