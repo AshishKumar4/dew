@@ -2,16 +2,18 @@
 
 import asyncio
 import json
+from importlib import import_module
 
 import pytest
 
-ollama = pytest.importorskip("ollama", reason="optional inference-clients extra")
-openai = pytest.importorskip("openai", reason="optional inference-clients extra")
-import httpx
-import httpx2
-
 from dew.inference import OllamaCompletion, OpenAICompletion, Usage
 from dew.sampling import Sampling
+
+ollama = pytest.importorskip("ollama", reason="optional inference-clients extra")
+openai = pytest.importorskip("openai", reason="optional inference-clients extra")
+httpx = import_module("httpx")
+httpx2 = import_module("httpx2")
+
 
 
 def response(choices, **fields):

@@ -43,12 +43,13 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-openai = pytest.importorskip("openai", reason="optional inference-clients extra")
-
 from dew.inference import OpenAICompletion
 from dew.interop import Pretrained, load_pretrained
 from dew.nn.inputs import ModelInputs
 from dew.sampling.text import Sampling, generate
+
+openai = pytest.importorskip("openai", reason="optional inference-clients extra")
+
 
 pytestmark = pytest.mark.network
 

@@ -13,24 +13,23 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-
-from dew.data import DataPartition, Loading
-from dew.objectives.base import scalar_loss
-
-# Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
-pytestmark = pytest.mark.mesh
 from flax import linen as nn
 from jax.sharding import PartitionSpec as P
 
 from dew.artifacts import Representations
+from dew.data import DataPartition, Loading
 from dew.inputs import unit_range
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.sharding import DECLARED, logical_axes
-from dew.objectives.base import Aux, EMASpec, Objective
+from dew.objectives.base import Aux, EMASpec, Objective, scalar_loss
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer, build_mesh
 from dew.training.distributed import DEFAULT_RULES, DevicePrefetchIterator, parameter_spec, shard_batch
 from dew.training.optim import OPTIMIZER_MAP
+
+# Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
+pytestmark = pytest.mark.mesh
+
 
 RES = 8
 BATCH = 8
