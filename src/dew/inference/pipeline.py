@@ -27,6 +27,7 @@ from dew.nn.inputs import Media, ModelInputs, pad_token_rows
 from dew.objectives.base import Variables
 from dew.registry import resolve_dtype
 from dew.sampling.pipelines import TextToImage
+from dew.telemetry.devices import keep_roundings
 from dew.telemetry.instrumentation import default_compilation_cache_dir, enable_compilation_cache
 
 if TYPE_CHECKING:
@@ -60,6 +61,7 @@ def pipeline(
     Loading a task also points XLA at the on-disk executable cache, so a
     restarted process reuses what it already compiled.
     """
+    keep_roundings()
     _persist_compilations()
     resolve_dtype(dtype)
     if param_dtype != "auto":
