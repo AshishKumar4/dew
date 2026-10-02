@@ -22,10 +22,11 @@ model with Flow-GRPO on that reward instead of the denoising loss.
 """
 
 import dataclasses
+import functools
 import hashlib
 import json
+import operator
 import re
-import typing
 from typing import Annotated
 
 import jax
@@ -33,7 +34,6 @@ import tyro
 
 from dew.data import ArrayRecordImages, DatasetSpec, OnlineImages, TFDSImages
 from dew.objectives.diffusion import DiffusionRunConfig
-from dew.objectives.diffusion.config import CaptionedSpec
 from dew.registry import datasets, presets
 from dew.training import TrainState, prepare_process, run_timestamp
 
@@ -75,8 +75,11 @@ CORPORA: dict[str, DatasetSpec] = {
         "playground-liked", "leonardo-liked-1.8m", "leonardo-liked-1.8m", "cc3m", "cc3m",
         "laion2B-en-aesthetic-4.2_37M"))),
 }
-Corpus = typing.Union[tuple(Annotated[type(spec), tyro.conf.subcommand(name, default=spec)]
-                            for name, spec in CORPORA.items())]
+Corpus = functools.reduce(operator.or_, (Annotated[type(spec), tyro.conf.subcommand(name, default=spec)]
+                                           for name, spec in CORPORA.items()))
+# Every registered spec stays its own subcommand beside the corpora, as in the
+# core config; the union holds what has registered by now.
+Registered = datasets.union
 
 
 def corpus_name(spec: DatasetSpec) -> str:
@@ -96,7 +99,7 @@ class DiffusionRecipeConfig(DiffusionRunConfig):
     """`DiffusionRunConfig` with this recipe's corpora on the command line,
     flowers by default."""
 
-    data: Corpus | CaptionedSpec = dataclasses.field(
+    data: Corpus | Registered = dataclasses.field(
         default_factory=lambda: CORPORA["oxford-flowers102"])
 
 
