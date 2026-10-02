@@ -88,7 +88,7 @@ def test_episode_gae_crosses_turns_without_discounting_observations_or_padding()
         for name in (OLD_VALUES_KEY, RETURNS_KEY, "advantages"):
             np.testing.assert_allclose(per_call(batch, name, episodes)[actions],
                                        reference[f"episode_{name}"][actions], atol=2e-6)
-    critic = state.params["params"]["critic"]
+    critic = state.variables["params"]["critic"]
     table = np.asarray(critic["backbone"]["scale"]) * np.asarray(critic["value"]["kernel"])[:, 0]
     previous = np.concatenate([np.zeros_like(batch["input_ids"][:, :1]), batch["input_ids"][:, :-1]], axis=1)
     expected = np.where(batch["response_mask"] != 0,
@@ -97,8 +97,8 @@ def test_episode_gae_crosses_turns_without_discounting_observations_or_padding()
     changed = {**batch, RETURNS_KEY: batch[RETURNS_KEY] + .25}
     info = Step(jnp.array(0), jax.random.key(1), None)
     no_kl = PPOObjective(ToolPolicy(), PROMPT + RESPONSE - 1, critic=ValueHead(TokenFeatures()))
-    before = scalar_loss(no_kl, state.params, batch, info)[0]
-    after = scalar_loss(no_kl, state.params, changed, info)[0]
+    before = scalar_loss(no_kl, state.variables, batch, info)[0]
+    after = scalar_loss(no_kl, state.variables, changed, info)[0]
     assert abs(float(before - after)) > .001
 
 
@@ -111,14 +111,14 @@ def test_ppo_trains_policy_and_critic_with_a_frozen_policy_reference():
     assert int(final.updates) == 2
     for part in ("policy", "critic"):
         differences = [np.max(np.abs(np.asarray(after) - np.asarray(before))) for before, after in
-                       zip(jax.tree.leaves(initial.params["params"][part]), jax.tree.leaves(final.params["params"][part]), strict=True)]
+                       zip(jax.tree.leaves(initial.variables["params"][part]), jax.tree.leaves(final.variables["params"][part]), strict=True)]
         assert max(differences) > 1e-5
     for before, after in zip(jax.tree.leaves(initial.ema), jax.tree.leaves(final.ema), strict=True):
         np.testing.assert_array_equal(before, after)
     fixed = rollout(initial, {"task_id": np.array([31], np.int32)}, jax.random.key(23))
     keep = fixed["response_mask"] != 0
-    old_error = np.mean((np.asarray(rollout.objective.values(initial.params, fixed))[keep] - fixed[RETURNS_KEY][keep]) ** 2)
-    new_error = np.mean((np.asarray(rollout.objective.values(final.params, fixed))[keep] - fixed[RETURNS_KEY][keep]) ** 2)
+    old_error = np.mean((np.asarray(rollout.objective.values(initial.variables, fixed))[keep] - fixed[RETURNS_KEY][keep]) ** 2)
+    new_error = np.mean((np.asarray(rollout.objective.values(final.variables, fixed))[keep] - fixed[RETURNS_KEY][keep]) ** 2)
     assert new_error < old_error
 
 
@@ -129,7 +129,7 @@ def test_ppo_refuses_missing_critic_targets(field):
     batch = rollout(state, {"task_id": np.array([31], np.int32)}, jax.random.key(23))
     batch.pop(field)
     with pytest.raises(ValueError, match=field):
-        rollout.objective.loss(state.params, batch, Step(jnp.array(0), jax.random.key(1), None))
+        rollout.objective.loss(state.variables, batch, Step(jnp.array(0), jax.random.key(1), None))
 
 
 def test_composite_objective_and_parameter_gradients_match_verl():
@@ -164,7 +164,7 @@ def test_an_all_truncated_cohort_is_a_zero_mass_batch_not_a_failure():
     assert batch["response_mask"].sum() == 0
     for name in (OLD_VALUES_KEY, RETURNS_KEY, "advantages"):
         assert batch[name].shape == batch["input_ids"].shape and not batch[name].any()
-    loss, _ = rollout.objective.loss(state.params, batch, Step(jnp.array(0), jax.random.key(1), state.averaged))
+    loss, _ = rollout.objective.loss(state.variables, batch, Step(jnp.array(0), jax.random.key(1), state.averaged))
     assert float(loss.mass) == 0
 
 

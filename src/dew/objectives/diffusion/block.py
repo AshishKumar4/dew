@@ -269,9 +269,9 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
             return values
         return self.model.init(key, jnp.zeros((1, self.canvas_size), jnp.int32))
 
-    def loss(self, params: Variables, batch: Batch, step: Step):
+    def loss(self, variables: Variables, batch: Batch, step: Step):
         canvas_losses, target_mask, encoder_losses, encoder_target_mask, _ = self._token_losses(
-            params, batch, step.key, train=True)
+            variables, batch, step.key, train=True)
         canvas_stats, encoder_stats = (
             _row_mean(canvas_losses, target_mask),
             _row_mean(encoder_losses, encoder_target_mask),

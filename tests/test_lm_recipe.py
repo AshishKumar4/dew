@@ -120,7 +120,7 @@ def test_the_recipe_trains_on_tokenized_files(tmp_path, packed):
     assert drawn.host().tokens.shape == (1, len("the ") + 4) and len(drawn.text[0]) > 0
     np.testing.assert_array_equal(
         drawn.host().tokens,
-        TextGeneration(task.model, state.params)([list(b"the ")], 4, key=1,
+        TextGeneration(task.model, state.variables)([list(b"the ")], 4, key=1,
                                                  sampling=Sampling(temperature=0)).host().tokens)
     objective = LMObjective(task.model, SEQ, samples=recipe.build_samples(config))
     trained = objective.pipeline(state, processor=task.processor)
@@ -184,7 +184,7 @@ def test_the_recipe_trains_muonclip_with_the_clip_firing(tmp_path):
 
     def q_kernel(state):
         return np.asarray(
-            state.params["params"]["layers_0"]["self_attn"]["q_proj"]["kernel"])
+            state.variables["params"]["layers_0"]["self_attn"]["q_proj"]["kernel"])
 
     assert int(clipped.step) == int(muon.step) > 0
     assert bool(jnp.all(jnp.isfinite(q_kernel(clipped))))
@@ -207,7 +207,7 @@ def test_the_recipe_trains_a_quantized_trunk(tmp_path):
     state = recipe.main(config)
     assert int(state.step) > 0
     assert all(bool(jnp.all(jnp.isfinite(leaf)))
-               for leaf in jax.tree.leaves(state.params["params"]))
+               for leaf in jax.tree.leaves(state.variables["params"]))
     recorded = recipe.LmRunConfig.load(str(tmp_path / "runs" / "quant"))
     assert recorded.model.config["vocab_size"] == 256
     assert dataclasses.replace(recorded, model=config.model) == config
@@ -267,7 +267,7 @@ def test_the_recipe_continues_a_pretrained_decoder(tmp_path):
     recorded = recipe.LmRunConfig.load(str(tmp_path / "runs" / "continued"))
     assert recorded.model.config["vocab_size"] == 256
     assert dataclasses.replace(recorded, model=config.model) == config
-    kernel = state.params["params"]["layers_0"]["self_attn"]["q_proj"]["kernel"]
+    kernel = state.variables["params"]["layers_0"]["self_attn"]["q_proj"]["kernel"]
     assert kernel.shape == (16, 16)
     assert np.all(np.isfinite(np.asarray(kernel)))
 
@@ -288,7 +288,7 @@ def test_a_pretrained_run_starts_from_the_checkpoints_weights(tmp_path):
     expected = load_pretrained(str(checkpoint), dtype="float32",
                                attention_impl="reference").variables
     for path, leaf in jax.tree_util.tree_flatten_with_path(expected["params"])[0]:
-        held = state.params["params"]
+        held = state.variables["params"]
         for entry in path:
             held = held[entry.key]
         np.testing.assert_array_equal(np.asarray(held), np.asarray(leaf))
@@ -385,7 +385,7 @@ def test_a_trained_export_round_trips_with_its_tokenizer(tmp_path):
 
     trained = tmp_path / "trained"
     load_pretrained(str(checkpoint), dtype="float32", attention_impl="reference").save(
-        trained, variables=state.params)
+        trained, variables=state.variables)
     again = load_pretrained(str(trained), dtype="float32", attention_impl="reference")
 
     assert again.processor is not None, "the saved export carries no tokenizer"
@@ -419,7 +419,7 @@ def test_the_recipe_balances_a_sparse_run(tmp_path):
                                            "--trainer.name", name, *extra,
                                            model_config=sparse))
         state = recipe.main(config)
-        return np.asarray(state.params["moe"]["layers_1"]["mlp"]["gate"]
+        return np.asarray(state.variables["moe"]["layers_1"]["mlp"]["gate"]
                           ["e_score_correction_bias"])
 
     balanced = run("balanced", "--balance-rate", "0.01")
@@ -446,7 +446,7 @@ def test_the_recipe_trains_the_prediction_depths_on_request(tmp_path):
                                            "--trainer.name", name, *extra,
                                            model_config=model_config))
         state = recipe.main(config)
-        return np.asarray(state.params["params"]["mtp_0"]["eh_proj"]["kernel"])
+        return np.asarray(state.variables["params"]["mtp_0"]["eh_proj"]["kernel"])
 
     assert np.any(run("mtp", "--mtp-weight", "0.3") != run("plain")), \
         "the term never reached the depth"
@@ -498,7 +498,7 @@ def test_masked_diffusion_trains_on_packed_documents(tmp_path):
     batch = next(iter(config.data.load(batch=8).val(DataPartition())))
     padding = np.asarray(batch["text_segment_ids"]) == 0
     assert padding.any() and not padding.all()
-    scored = objective.evaluate(state.params, batch, Step(jnp.asarray(0), jax.random.key(0), None))
+    scored = objective.evaluate(state.variables, batch, Step(jnp.asarray(0), jax.random.key(0), None))
     np.testing.assert_array_equal(np.asarray(scored.weights), ~padding)
 
 
@@ -578,7 +578,7 @@ def test_masked_diffusion_continues_a_pretrained_checkpoint(tmp_path):
     assert objective.seq_len == 12, "the objective has to take the window's whole width"
     held = jax.tree.leaves(original.variables)
     distance = max(float(jnp.max(jnp.abs(a - b)))
-                   for a, b in zip(jax.tree.leaves(state.params), held))
+                   for a, b in zip(jax.tree.leaves(state.variables), held))
     drawn = max(float(jnp.max(jnp.abs(a - b))) for a, b in zip(
         jax.tree.leaves(recipe.build_masked_objective(
             config, original.model, original.model_config, None).init(jax.random.key(0))), held))
@@ -612,10 +612,10 @@ def test_official_block_diffusion_is_a_complete_pretrained_recipe(tmp_path):
     original = load_pretrained(checkpoint, dtype="float32", attention_impl="xla")
     initial = recipe.build_block_objective(config, original.model, original.variables).init(jax.random.key(0))
     difference = max(float(jnp.max(jnp.abs(a - b)))
-                     for a, b in zip(jax.tree.leaves(state.params), jax.tree.leaves(initial)))
+                     for a, b in zip(jax.tree.leaves(state.variables), jax.tree.leaves(initial)))
     assert difference > 1e-5
     restored = recipe.main(config)
-    for wanted, actual in zip(jax.tree.leaves(state.params), jax.tree.leaves(restored.params),
+    for wanted, actual in zip(jax.tree.leaves(state.variables), jax.tree.leaves(restored.variables),
                               strict=True):
         np.testing.assert_array_equal(actual, wanted)
     task = dew.pipeline(str(tmp_path / "runs" / "block"), ema=False)
@@ -650,17 +650,17 @@ def test_a_trained_block_diffusion_tree_saves_back_over_its_source(tmp_path):
     data = Dataset(train=lambda partition: iter([batch, batch]), val=None, records=rows, batch=rows)
 
     state = Trainer(objective, optax.sgd(0.05), key=jax.random.key(0)).fit(data, steps=1, log_every=1)
-    source.save(tmp_path / "trained", variables=thaw(state.params))
+    source.save(tmp_path / "trained", variables=thaw(state.variables))
 
     read = load_pretrained(tmp_path / "trained", dtype="float32", attention_impl="xla", max_seq_len=32)
     restored = BlockDiffusionObjective(read.model, prompt_length=4, num_canvases=2,
                                        pretrained=read.variables)
     rebuilt = restored.init(jax.random.key(0))
-    for wanted, actual in zip(jax.tree.leaves(state.params), jax.tree.leaves(rebuilt), strict=True):
+    for wanted, actual in zip(jax.tree.leaves(state.variables), jax.tree.leaves(rebuilt), strict=True):
         np.testing.assert_array_equal(actual, wanted)
     step = Step(step=jnp.asarray(0, jnp.int32), key=jax.random.key(1), ema=None)
     np.testing.assert_array_equal(scalar_loss(restored, rebuilt, batch, step)[0],
-                                  scalar_loss(objective, state.params, batch, step)[0])
+                                  scalar_loss(objective, state.variables, batch, step)[0])
 
 
 def test_the_shipped_lm_run_config_round_trips_through_its_record():

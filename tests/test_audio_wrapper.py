@@ -147,8 +147,8 @@ def test_text_loss_reaches_audio_encoder_and_projector_parameters(wrapper):
     reference, tokens, valid, features, feature_mask = _inputs(wrapper)
     targets = jnp.asarray(reference["generated"][:, tokens.shape[1]])
 
-    def loss(params):
-        logits = wrapper.logits(params, tokens, valid, features, feature_mask)
+    def loss(variables):
+        logits = wrapper.logits(variables, tokens, valid, features, feature_mask)
         return -jnp.mean(jax.nn.log_softmax(logits[:, -1])[jnp.arange(tokens.shape[0]), targets])
 
     error, grads = jax.jit(checkify.checkify(jax.grad(loss)))(wrapper.variables())

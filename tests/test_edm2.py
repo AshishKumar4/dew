@@ -93,8 +93,8 @@ def test_forced_weight_normalization_keeps_every_kernel_at_unit_magnitude():
     x = jax.random.normal(jax.random.PRNGKey(0), (4, 5, 5, 3))
     params = {"layer": layer.init(jax.random.PRNGKey(1), x)["params"], "bias": jnp.ones((6,))}
 
-    def loss(params):
-        return jnp.sum((layer.apply({"params": params["layer"]}, x) + params["bias"]) ** 2)
+    def loss(variables):
+        return jnp.sum((layer.apply({"params": variables["layer"]}, x) + variables["bias"]) ** 2)
 
     free, forced = optax.adam(0.3), optax.chain(optax.adam(0.3), forced_weight_normalization())
     first, _ = free.update(jax.grad(loss)(params), free.init(params), params)

@@ -132,14 +132,14 @@ def test_images_as_pil_are_this_processs_real_rows_as_8_bit_pixels():
 def test_from_run_restores_the_averaged_weights_by_default(tmp_path):
     """The EMA copy is what a run publishes; `ema=False` reads the live ones."""
     objective, state = make_run(tmp_path)
-    averaged = merge(state.params, state.ema)
+    averaged = merge(state.variables, state.ema)
 
     pipe = TextToImage.from_run(str(tmp_path))
     for expected, loaded in zip(jax.tree.leaves(averaged["params"]),
                                 jax.tree.leaves(pipe.params["params"]), strict=True):
         np.testing.assert_allclose(np.asarray(loaded), np.asarray(expected))
     live = TextToImage.from_run(str(tmp_path), ema=False)
-    for expected, loaded in zip(jax.tree.leaves(state.params["params"]),
+    for expected, loaded in zip(jax.tree.leaves(state.variables["params"]),
                                 jax.tree.leaves(live.params["params"]), strict=True):
         np.testing.assert_allclose(np.asarray(loaded), np.asarray(expected))
     assert not all(np.allclose(np.asarray(a), np.asarray(b)) for a, b in zip(
@@ -237,10 +237,10 @@ def test_a_run_saved_before_the_fourier_table_was_stored_samples_and_resumes_as_
 
     _, resumed = make_run(old, steps=3)
     np.testing.assert_array_equal(
-        np.asarray(resumed.params["constants"]["conditioning"]["time_embed"]["layers_0"]["frequencies"]),
+        np.asarray(resumed.variables["constants"]["conditioning"]["time_embed"]["layers_0"]["frequencies"]),
         tables[0])
-    for expected, actual in zip(jax.tree.leaves(trained.params["params"]),
-                                jax.tree.leaves(resumed.params["params"]), strict=True):
+    for expected, actual in zip(jax.tree.leaves(trained.variables["params"]),
+                                jax.tree.leaves(resumed.variables["params"]), strict=True):
         np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
 
 
@@ -328,7 +328,7 @@ def test_an_unconditional_unet_takes_a_step():
         Dataset(train=lambda partition: batches(), val=None, records=None, batch=8), steps=1, log_every=100)
 
     assert int(state.step) == 1
-    leaves = jax.tree.leaves(state.params["params"])
+    leaves = jax.tree.leaves(state.variables["params"])
     assert leaves and all(np.all(np.isfinite(np.asarray(leaf))) for leaf in leaves)
 
 
@@ -459,7 +459,7 @@ def test_objective_pipeline_binds_the_trained_state_in_place(tmp_path):
     for expected, bound in zip(jax.tree.leaves(state.averaged), jax.tree.leaves(pipe.params), strict=True):
         assert bound is expected
     live = objective.pipeline(state, ema=False)
-    for expected, bound in zip(jax.tree.leaves(state.params), jax.tree.leaves(live.params), strict=True):
+    for expected, bound in zip(jax.tree.leaves(state.variables), jax.tree.leaves(live.params), strict=True):
         assert bound is expected
     drawn = pipe(["a", "b"], key=4).host().images
     assert drawn.shape == (2, RES, RES, 3)
@@ -526,7 +526,7 @@ def test_an_lm_run_without_an_average_publishes_and_exports_its_live_weights(tmp
     run.mkdir()
     objective, state = make_lm_run(run, ema_decay=None)
     published = objective.pipeline(state)
-    for expected, bound in zip(jax.tree.leaves(state.params), jax.tree.leaves(published.variables), strict=True):
+    for expected, bound in zip(jax.tree.leaves(state.variables), jax.tree.leaves(published.variables), strict=True):
         assert bound is expected
     export_run(str(run), tmp_path / "export")
     reloaded = load_pretrained(tmp_path / "export", dtype="float32", attention_impl="reference")
@@ -611,7 +611,7 @@ def test_pipeline_places_a_run_on_a_mesh_and_answers_the_same_images(tmp_path):
     make_run(tmp_path)
     plain = TextToImage.from_run(str(tmp_path))
     placed = dew.pipeline(str(tmp_path), mesh=MeshSpec(fsdp=2), layout=Layout(min_shard=2 ** 6))
-    specs = {leaf.sharding.spec for leaf in jax.tree.leaves(placed.params)}
+    specs = {leaf.sharding.spec for leaf in jax.tree.leaves(placed.variables)}
     assert any("fsdp" in str(spec) for spec in specs)
     result = placed(["a", "b", "c"], steps=3, key=7)
     assert result.images.sharding.spec == jax.sharding.PartitionSpec(BATCH_AXES)
@@ -630,7 +630,7 @@ def test_a_grid_prepares_the_process_and_times_and_final_denoise_ends_the_trajec
     prediction, and over a one-point grid hands the noise itself to the
     decode and clip that end every call."""
     objective, state = make_run(tmp_path)
-    plain = TextToImage.from_objective(objective, state.params)
+    plain = TextToImage.from_objective(objective, state.variables)
     same = dataclasses.replace(plain, grid=lambda steps: (plain.process, plain.process.times(steps)))
     key = jax.random.key(3)
     reference = plain(["a"], steps=4, sampler=Heun(), key=key).host().images
@@ -796,7 +796,7 @@ def test_saved_diffusion_precision_reconstructs_owners_without_source_weights(
         autoencoder=PretrainedAutoencoder(modelname=str(tmp_path / "source/sd/vae"), dtype="float32"))
     objective = config.build()
     initial = Trainer(objective, optax.sgd(0.01), key=jax.random.PRNGKey(3)).initial_state()
-    params = unfreeze(jax.tree.map(lambda leaf: (leaf + 0.015625).astype(jnp.bfloat16), initial.params))
+    params = unfreeze(jax.tree.map(lambda leaf: (leaf + 0.015625).astype(jnp.bfloat16), initial.variables))
     params = {**params, "constants": {**params["constants"], "scale": jnp.asarray([1.003], jnp.float32)}}
     params["params"]["packed"] = jnp.asarray([16777217], jnp.int32)
     params["encoders"]["textcontext"]["constants"] = {
@@ -805,7 +805,7 @@ def test_saved_diffusion_precision_reconstructs_owners_without_source_weights(
     averaged = {"params": {first: jax.tree.map(lambda leaf: leaf.astype(jnp.float32) + 0.03125,
                                              params["params"][first])},
                 "constants": {"scale": jnp.asarray([1.007], jnp.float32)}}
-    state = dataclasses.replace(initial, params=params, ema=averaged)
+    state = dataclasses.replace(initial, variables=params, ema=averaged)
     checkpoints = Checkpoints(str(directory))
     checkpoints.save(0, state, None)
     checkpoints.wait()
@@ -828,7 +828,7 @@ def test_saved_diffusion_precision_reconstructs_owners_without_source_weights(
         return leaf.astype(storage) if storage and parameter and jnp.issubdtype(leaf.dtype, jnp.floating) else leaf
 
     expected_params = jax.tree_util.tree_map_with_path(expected_leaf, merged)
-    for expected, actual in zip(jax.tree.leaves(expected_params), jax.tree.leaves(restored.params), strict=True):
+    for expected, actual in zip(jax.tree.leaves(expected_params), jax.tree.leaves(restored.variables), strict=True):
         assert actual.dtype == expected.dtype
         np.testing.assert_array_equal(actual, expected)
     # Equal storage is insufficient for bitwise comparison: the unplaced
@@ -863,12 +863,12 @@ def test_saved_diffusion_precision_reconstructs_owners_without_source_weights(
                                   reference(["a red bird"], steps=2, key=5).host().images)
     owned = restored.inputs.conditions["textcontext"].encoder.params
     for owner_leaf, bound_leaf in zip(jax.tree.leaves(owned),
-                                      jax.tree.leaves(restored.params["encoders"]["textcontext"]), strict=True):
+                                      jax.tree.leaves(restored.variables["encoders"]["textcontext"]), strict=True):
         assert owner_leaf.dtype == bound_leaf.dtype and owner_leaf.sharding == bound_leaf.sharding
         np.testing.assert_array_equal(owner_leaf, bound_leaf)
     assert isinstance(restored.autoencoder, StableDiffusionVAE)
     for owner_leaf, bound_leaf in zip(jax.tree.leaves(restored.autoencoder.params),
-                                      jax.tree.leaves(restored.params["autoencoder"]), strict=True):
+                                      jax.tree.leaves(restored.variables["autoencoder"]), strict=True):
         assert owner_leaf.dtype == bound_leaf.dtype and owner_leaf.sharding == bound_leaf.sharding
         np.testing.assert_array_equal(owner_leaf, bound_leaf)
 
@@ -883,7 +883,7 @@ def test_saved_decoder_compute_and_storage_overrides_generate_from_the_same_weig
     _, state = make_lm_run(tmp_path)
     baseline = dew.pipeline(str(tmp_path))
     assert isinstance(baseline, TextGeneration)
-    first = next(iter(state.params["params"]))
+    first = next(iter(state.variables["params"]))
 
     def move_to_frozen(variables):
         trainable = dict(variables["params"])
@@ -893,7 +893,7 @@ def test_saved_decoder_compute_and_storage_overrides_generate_from_the_same_weig
     assert state.ema is not None
     step = int(state.step) + 1
     frozen = dataclasses.replace(state, step=jnp.asarray(step, state.step.dtype),
-                                 params=move_to_frozen(state.params), ema=move_to_frozen(state.ema))
+                                 variables=move_to_frozen(state.variables), ema=move_to_frozen(state.ema))
     checkpoints = Checkpoints(str(tmp_path))
     checkpoints.save(step, frozen, None)
     checkpoints.wait()
@@ -923,9 +923,9 @@ def test_saved_bare_encoder_weights_follow_storage_without_changing_compute(tmp_
     assert isinstance(restored, TextToImage)
     encoder = restored.inputs.conditions["textcontext"].encoder
     assert isinstance(encoder, CharTable)
-    stored = merge(state.params, state.ema)
+    stored = merge(state.variables, state.ema)
     expected_vars = jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16), stored)
-    table = restored.params["encoders"]["textcontext"]["table"]
+    table = restored.variables["encoders"]["textcontext"]["table"]
     assert table.dtype == jnp.bfloat16
     assert encoder.params["table"].dtype == table.dtype
     np.testing.assert_array_equal(encoder.params["table"], table)

@@ -290,8 +290,8 @@ def family_loss(family: str, rng):
     variables = family_variables(family, model, args, kwargs, rng)
     held = {name: value for name, value in variables.items() if name != "params"}
 
-    def loss(params):
-        prediction = model.apply({**held, "params": params}, *args, **kwargs)
+    def loss(variables):
+        prediction = model.apply({**held, "params": variables}, *args, **kwargs)
         prediction = prediction.astype(jnp.float32)
         if family in LOGITS:
             targets = jnp.zeros(prediction.shape[:-1], jnp.int32)
@@ -350,8 +350,8 @@ def lm_loss_and_grad(rng):
     batch = {TEXT_KEY: jax.random.randint(rng, (2, 33), 0, 512)}
     step = Step(step=jnp.asarray(0), key=rng, ema=None)
 
-    def loss(params):
-        return scalar_loss(objective, params, batch, step)[0]
+    def loss(variables):
+        return scalar_loss(objective, variables, batch, step)[0]
 
     return jax.value_and_grad(loss), variables
 

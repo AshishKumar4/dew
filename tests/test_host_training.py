@@ -74,7 +74,7 @@ def close(left, right, bound=STREAMED_BOUND):
     if isinstance(left, dict) and FROZEN in left:
         left = {**left, FROZEN: unbanked(left[FROZEN])}
     elif FROZEN in getattr(left, "params", {}):
-        left = dataclasses.replace(left, params={**left.params, FROZEN: unbanked(left.params[FROZEN])})
+        left = dataclasses.replace(left, variables={**left.variables, FROZEN: unbanked(left.variables[FROZEN])})
     for path, a, b in _leaves(left, right):
         np.testing.assert_allclose(a, b, atol=bound, rtol=0, err_msg=path)
 
@@ -101,8 +101,8 @@ class Coupled(Objective):
     def init(self, key, variables=None):
         return {"params": {"first": jnp.array([1., 2.]), "second": jnp.array([3., 4., 5.])}}
 
-    def loss(self, params, batch, step):
-        p = params["params"]
+    def loss(self, variables, batch, step):
+        p = variables["params"]
         loss = jnp.sum(p["first"] * batch["small"]) + jnp.sum(p["second"] * batch["large"])
         return loss, Aux({})
 
@@ -146,15 +146,15 @@ def test_host_accumulation_replays_original_rng_and_mutable_snapshots(tmp_path, 
         step = trainer.compile(state, data[0])
         prefix, *_ = step(state, data[0])
         # the step consumes the state
-        prefix_params = jax.tree.map(np.asarray, prefix.params)
+        prefix_params = jax.tree.map(np.asarray, prefix.variables)
         prefix_accumulation = jax.tree.map(np.asarray, prefix.accumulation)
         rejected, _, _, _, accepted = step(prefix, data[1])
         assert not bool(accepted)
-        equal(prefix_params, rejected.params)
+        equal(prefix_params, rejected.variables)
         equal(prefix_accumulation, rejected.accumulation)
         state, *_ = step(rejected, data[2])
         assert int(state.updates) == 1
-        assert float(state.params["stats"]["seen"]) == 2
+        assert float(state.variables["stats"]["seen"]) == 2
         states.append(state)
     platforms_agree(*states, steps=1)
 
@@ -187,8 +187,8 @@ def test_decoder_scan_training_keeps_the_original_logical_state():
         state, _, _ = trainer.place()
         step = trainer.compile(state, data)
         state, *_ = step(state, data)
-        assert "layers_0" in state.params["params"] and "layers_1" in state.params["params"]
-        assert "layers_0_1" not in state.params["params"]
+        assert "layers_0" in state.variables["params"] and "layers_1" in state.variables["params"]
+        assert "layers_0_1" not in state.variables["params"]
         states.append(state)
     close(*states)
 
@@ -232,11 +232,11 @@ def test_nonfinite_optimizer_candidate_rolls_back_all_cpu_owned_fields():
         # the step consumes the state
         assert initial.scale is not None
         start_params, start_ema, start_opt = jax.tree.map(
-            np.asarray, (initial.params, initial.ema, initial.opt_state))
+            np.asarray, (initial.variables, initial.ema, initial.opt_state))
         start_scale, start_fin = float(initial.scale.scale), int(initial.scale.fin_steps)
         final, _, _, finite, accepted = trainer.compile(initial, data)(initial, data)
         assert bool(finite) and not bool(accepted)
-        equal(start_params, final.params)
+        equal(start_params, final.variables)
         equal(start_ema, final.ema)
         equal(start_opt, final.opt_state)
         assert int(final.microstep) == int(final.updates) == 0
@@ -260,8 +260,8 @@ def test_composite_replay_does_not_apply_effects_twice():
         def init(self, key, variables=None):
             return self.reference.init(key, variables)
 
-        def loss(self, params, batch, step):
-            stats, aux = self.reference.loss(params, batch, step)
+        def loss(self, variables, batch, step):
+            stats, aux = self.reference.loss(variables, batch, step)
             return stats, Aux(aux.metrics, variables=aux.variables, effects=jnp.asarray(1.))
 
         def reduce_loss(self, stats):
@@ -280,7 +280,7 @@ def test_composite_replay_does_not_apply_effects_twice():
         state, *_ = step(state, data)
         state, *_ = step(state, data)
         assert int(state.updates) == 1
-        assert float(state.params["stats"]["seen"]) == 4.
+        assert float(state.variables["stats"]["seen"]) == 4.
         results.append(state)
     equal(*results)
 
@@ -362,7 +362,7 @@ def decoder(**overrides):
 
 def frozen_leaves(state):
     return {jax.tree_util.keystr(path): np.asarray(leaf) for path, leaf
-            in jax.tree_util.tree_leaves_with_path(state.params[FROZEN])}
+            in jax.tree_util.tree_leaves_with_path(state.variables[FROZEN])}
 
 
 def _moments(opt_state) -> optax.ScaleByAdamState:
@@ -398,17 +398,17 @@ def test_streamed_banks_train_a_mixed_frozen_root_decoder_like_the_resident_stac
     assert initial and frozen_leaves(host).keys() == initial.keys()
     for name, value in frozen_leaves(host).items():
         np.testing.assert_array_equal(value, initial[name], err_msg=name)
-    assert sorted(host.params["params"]) == ["embed_tokens", "layers_0", "norm"]
+    assert sorted(host.variables["params"]) == ["embed_tokens", "layers_0", "norm"]
     # The leaf both rows froze is the run's bank; the leaves only layer 1
     # froze stay its own.
-    assert sorted(host.params[FROZEN]) == ["layers_0_1", "layers_1"]
-    assert host.params[FROZEN]["layers_0_1"]["mlp"]["gate_proj"]["kernel"].shape[0] == 2
-    assert jax.tree.structure(_moments(host.opt_state).mu) == jax.tree.structure(host.params["params"])
+    assert sorted(host.variables[FROZEN]) == ["layers_0_1", "layers_1"]
+    assert host.variables[FROZEN]["layers_0_1"]["mlp"]["gate_proj"]["kernel"].shape[0] == 2
+    assert jax.tree.structure(_moments(host.opt_state).mu) == jax.tree.structure(host.variables["params"])
 
     # The EMA tracks the moving collection only, and banked execution reads
     # that partial tree without extending it.
     assert host.ema is not None and FROZEN not in host.ema
-    assert jax.tree.structure(host.ema["params"]) == jax.tree.structure(host.params["params"])
+    assert jax.tree.structure(host.ema["params"]) == jax.tree.structure(host.variables["params"])
     checkpoints = Checkpoints(str(tmp_path / "mixed"))
     prefix = updated(objective(), batch, HOST, checkpoints=checkpoints)
     checkpoints.save(int(prefix.step), prefix, None)
@@ -474,9 +474,9 @@ def test_a_nested_decoder_bank_trains_beside_frozen_media_entries():
     resident = updated(objective(), batch, DEVICE)
     host = updated(objective(), batch, HOST)
     close(host, resident)
-    assert sorted(host.params["params"]) == ["language_model"]
-    assert sorted(host.params[FROZEN]) == ["language_model", "projector", "tower"]
-    assert sorted(host.params[FROZEN]["language_model"]) == ["layers_1"]
+    assert sorted(host.variables["params"]) == ["language_model"]
+    assert sorted(host.variables[FROZEN]) == ["language_model", "projector", "tower"]
+    assert sorted(host.variables[FROZEN]["language_model"]) == ["layers_1"]
     media = {name: value for name, value in frozen_leaves(host).items()
              if "tower" in name or "projector" in name}
     initial = frozen_leaves(Trainer(objective(), optax.adam(.01), key=jax.random.key(5),
@@ -541,8 +541,8 @@ def test_a_shared_text_owner_sums_both_block_losses_through_one_bank(detached):
     resident = updated(objective(), batch, DEVICE, optimizer=optax.sgd(.001))
     host = updated(objective(), batch, HOST, optimizer=optax.sgd(.001))
     close(host, resident, 1e-5)
-    assert "layers_0" in host.params["params"]["text"]
-    assert not any(name.startswith("layers_0_") for name in host.params["params"]["text"])
+    assert "layers_0" in host.variables["params"]["text"]
+    assert not any(name.startswith("layers_0_") for name in host.variables["params"]["text"])
 
 
 
@@ -572,13 +572,13 @@ def test_frozen_leaves_stay_resident_and_snapshots_alias_them():
     objective = LMObjective(decoder(scan_layers=True), 8, head_chunks=1, trainable=trainable)
     trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(5), layout=HOST)
     state, placement, _ = trainer.place()
-    frozen = state.params[FROZEN]
+    frozen = state.variables[FROZEN]
     for path, leaf in _named_leaves(frozen):
         assert leaf.sharding.mesh == trainer.device_mesh, path
         assert leaf.sharding.memory_kind == (BANK_MEMORY if "layers_" in path else "device"), path
     execution = HostExecution(objective, HOST, trainer.device_mesh, trainer.state_mesh)
     with jax.set_mesh(trainer.state_mesh):
-        first, second = execution.snapshot(state.params), execution.snapshot(state.params)
+        first, second = execution.snapshot(state.variables), execution.snapshot(state.variables)
     bank = next(name for name in first["params"] if name.startswith("layers_0_"))
     assert first["params"][bank]["mlp"]["gate_proj"]["kernel"] is second["params"][bank]["mlp"]["gate_proj"]["kernel"]
     assert first["params"][bank]["self_attn"]["q_proj"]["kernel"] is not second["params"][bank]["self_attn"]["q_proj"]["kernel"]
@@ -586,8 +586,8 @@ def test_frozen_leaves_stay_resident_and_snapshots_alias_them():
     step = trainer.compile(state, tokens())
     for _ in range(2):
         state, *_ = step(state, tokens())
-    assert _pointers(state.params[FROZEN]) == before
-    assert _pointers(state.params["params"]) != _pointers(frozen) and set(state.params["params"]) == {"layers_0", "layers_1"}
+    assert _pointers(state.variables[FROZEN]) == before
+    assert _pointers(state.variables["params"]) != _pointers(frozen) and set(state.variables["params"]) == {"layers_0", "layers_1"}
 
 def test_place_streams_the_held_tree_and_releases_each_source():
     """The objective's held leaves become the placed arrays as they land, so
@@ -603,16 +603,16 @@ def test_place_streams_the_held_tree_and_releases_each_source():
         assert isinstance(leaf, jax.Array), path
     # A leaf every row froze lives once, as the run's bank; the held tree
     # holds that bank where each row was, so no row copy stays beside it.
-    bank = state.params[FROZEN]["layers_0_1"]["mlp"]["gate_proj"]["kernel"]
+    bank = state.variables[FROZEN]["layers_0_1"]["mlp"]["gate_proj"]["kernel"]
     assert held["params"]["layers_1"]["mlp"]["gate_proj"]["kernel"] is bank
     assert held["params"]["layers_0"]["mlp"]["gate_proj"]["kernel"] is bank
-    assert state.params["params"]["layers_0"]["self_attn"]["q_proj"]["kernel"] is held["params"]["layers_0"]["self_attn"]["q_proj"]["kernel"]
+    assert state.variables["params"]["layers_0"]["self_attn"]["q_proj"]["kernel"] is held["params"]["layers_0"]["self_attn"]["q_proj"]["kernel"]
     fresh = jax.tree.map(np.asarray, model.init(jax.random.key(1), jnp.zeros((1, 8), jnp.int32)))
     resident = updated(LMObjective(model, 8, head_chunks=1, pretrained=fresh,
                                    trainable=lambda path: path[-2:] == ("q_proj", "kernel")), tokens(), DEVICE)
     close(updated(LMObjective(model, 8, head_chunks=1, pretrained=jax.tree.map(np.asarray, fresh),
                               trainable=lambda path: path[-2:] == ("q_proj", "kernel")), tokens(), HOST).params,
-          resident.params)
+          resident.variables)
 
 
 def _resident_pages(view: np.ndarray) -> int:
@@ -675,7 +675,7 @@ def test_place_lets_a_mapped_checkpoint_page_go_once_the_leaf_has_landed(tmp_pat
     assert _resident_pages(banked_row) < pages // 10
     assert _resident_pages(single) < single.nbytes // 4096
     np.testing.assert_array_equal(
-        np.asarray(state.params[FROZEN]["layers_0_1"]["mlp"]["gate_proj"]["kernel"])[1], np.asarray(banked_row))
+        np.asarray(state.variables[FROZEN]["layers_0_1"]["mlp"]["gate_proj"]["kernel"])[1], np.asarray(banked_row))
 
 
 def test_stream_refuses_a_node_it_cannot_update_in_place_by_its_path():

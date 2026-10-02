@@ -40,7 +40,7 @@ def test_metadata_inspection_and_restore_share_the_committed_snapshot(tmp_path, 
 
     def state(width, step):
         return TrainState(step=jnp.asarray(step), microstep=jnp.asarray(step), updates=jnp.asarray(step),
-                          params={"params": {"weight": jnp.arange(width, dtype=jnp.float32)}},
+                          variables={"params": {"weight": jnp.arange(width, dtype=jnp.float32)}},
                           opt_state=(), ema=None, key=jax.random.key(0), scale=None, window_size=jnp.asarray(1))
 
     checkpoints = Checkpoints(str(tmp_path))
@@ -59,14 +59,14 @@ def test_metadata_inspection_and_restore_share_the_committed_snapshot(tmp_path, 
         context.setattr(ocp.type_handlers.ArrayHandler, "metadata", repeated_metadata)
         restored, _ = checkpoints.restore(template)
         np.testing.assert_array_equal(restored["params"]["params"]["weight"],
-                                      first.params["params"]["weight"])
+                                      first.variables["params"]["weight"])
 
     second = state(5, 5)
     checkpoints.save(5, second, None)
     checkpoints.wait()
     assert checkpoints.stored()["params"]["params"]["weight"].shape == (5,)
     restored, _ = checkpoints.restore()
-    np.testing.assert_array_equal(restored["params"]["params"]["weight"], second.params["params"]["weight"])
+    np.testing.assert_array_equal(restored["params"]["params"]["weight"], second.variables["params"]["weight"])
     third = state(7, 7)
     checkpoints.save(7, third, None)
     checkpoints.wait()
@@ -106,9 +106,9 @@ def test_disabled_ema_trains_previews_and_resumes_without_a_copy(tmp_path, kind)
     # Each step consumes its state, so the two states share no buffer: the
     # frozen one is a copy with the average as its own copy of the parameters,
     # and the average's starting values are kept on the host to compare with.
-    reference = jax.tree.map(np.asarray, select(initial.params, frozen_objective.ema.select))
+    reference = jax.tree.map(np.asarray, select(initial.variables, frozen_objective.ema.select))
     frozen_state = jax.tree.map(jnp.copy, dataclasses.replace(
-        initial, ema=select(initial.params, frozen_objective.ema.select)))
+        initial, ema=select(initial.variables, frozen_objective.ema.select)))
     state = initial
     step = trainer.compile(initial, batch)
     frozen_step = frozen_trainer.compile(frozen_state, batch)
@@ -117,13 +117,13 @@ def test_disabled_ema_trains_previews_and_resumes_without_a_copy(tmp_path, kind)
         frozen_state, frozen_loss, *_ = frozen_step(frozen_state, batch)
         assert bool(accepted) and state.ema is None
         np.testing.assert_allclose(loss, frozen_loss, rtol=1e-6)
-        for got, want in zip(jax.tree.leaves(state.params), jax.tree.leaves(frozen_state.params), strict=True):
+        for got, want in zip(jax.tree.leaves(state.variables), jax.tree.leaves(frozen_state.variables), strict=True):
             np.testing.assert_array_equal(got, want)
     for got, want in zip(jax.tree.leaves(frozen_state.ema), jax.tree.leaves(reference), strict=True):
         np.testing.assert_array_equal(got, want)
     info = Step(state.microstep, jax.random.PRNGKey(13), None)
-    preview = objective.preview(state.params, batch, info)
-    expected_preview = frozen_objective.preview(state.params, batch, info)
+    preview = objective.preview(state.variables, batch, info)
+    expected_preview = frozen_objective.preview(state.variables, batch, info)
     for got, want in zip(jax.tree.leaves(preview), jax.tree.leaves(expected_preview), strict=True):
         np.testing.assert_array_equal(got, want)
     checkpoints.save(2, state, None, {"loss": float(loss)})
@@ -149,22 +149,22 @@ def test_zero_beta_grpo_has_no_reference_and_keeps_live_updates_and_preview():
     batch = {"input_ids": ids, "text_segment_ids": jnp.ones_like(ids),
              "text_positions": jnp.tile(jnp.arange(6, dtype=jnp.int32), (ids.shape[0], 1)),
              "response_mask": mask, "advantages": mask}
-    old = objective.packed_log_probs(initial.params, batch)
+    old = objective.packed_log_probs(initial.variables, batch)
     batch.update(old_log_probs=old, behavior_log_probs=old)
     def unregularized(params):
         current = objective.packed_log_probs({"params": params}, batch)
         return -jnp.sum(jnp.exp(current - old) * mask) / jnp.sum(mask)
-    expected_gradient = jax.grad(unregularized)(initial.params["params"])
-    updates, _ = optimizer.update(expected_gradient, initial.opt_state, initial.params["params"])
-    expected = optax.apply_updates(initial.params["params"], updates)
+    expected_gradient = jax.grad(unregularized)(initial.variables["params"])
+    updates, _ = optimizer.update(expected_gradient, initial.opt_state, initial.variables["params"])
+    expected = optax.apply_updates(initial.variables["params"], updates)
     state, loss, _, _, accepted = trainer.compile(initial, batch)(initial, batch)
     assert bool(accepted) and state.ema is None and int(state.updates) == 1
     assert float(loss) == pytest.approx(-1.)
-    for got, want in zip(jax.tree.leaves(state.params["params"]), jax.tree.leaves(expected), strict=True):
+    for got, want in zip(jax.tree.leaves(state.variables["params"]), jax.tree.leaves(expected), strict=True):
         np.testing.assert_allclose(got, want, rtol=1e-6, atol=1e-7)
     info = Step(state.microstep, jax.random.PRNGKey(7), None)
-    live = objective.preview(state.params, batch, info)
-    zeroed = jax.tree.map(jnp.zeros_like, state.params)
+    live = objective.preview(state.variables, batch, info)
+    zeroed = jax.tree.map(jnp.zeros_like, state.variables)
     moved = objective.preview(zeroed, batch, info)
     assert np.any(np.asarray(live.tokens) != np.asarray(moved.tokens))
     np.testing.assert_array_equal(moved.tokens[:, 2:], 0)

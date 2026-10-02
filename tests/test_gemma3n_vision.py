@@ -104,8 +104,8 @@ def test_encoder_backward_and_sgd_update_match_reference(bundle):
     meta = json.loads((FIXTURE / "meta.json").read_text())
     coefficients = jnp.linspace(-1, 1, 8192).reshape(1, 4, 2048)
 
-    def loss(params, inputs):
-        return jnp.mean(tower.apply({"params": params}, inputs) * coefficients)
+    def loss(variables, inputs):
+        return jnp.mean(tower.apply({"params": variables}, inputs) * coefficients)
 
     value, (grads, input_grad) = jax.jit(jax.value_and_grad(loss, argnums=(0, 1)))(
         variables["tower"]["params"], pixels)

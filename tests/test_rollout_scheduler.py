@@ -556,4 +556,4 @@ def test_a_trainer_run_trains_through_multi_turn_environments_on_the_native_serv
         assert len(rollout.calls) == 2
         assert pack([rollout], width)["input_ids"].shape[0] == 1
     assert server.version == 2
-    assert not all(jnp.array_equal(a, b) for a, b in zip(jax.tree.leaves(params), jax.tree.leaves(state.params), strict=True))
+    assert not all(jnp.array_equal(a, b) for a, b in zip(jax.tree.leaves(params), jax.tree.leaves(state.variables), strict=True))

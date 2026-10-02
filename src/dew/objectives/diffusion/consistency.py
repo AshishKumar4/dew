@@ -298,13 +298,13 @@ class ConsistencyDistillationObjective(DiffusionObjective):
         network = self._network(student_params, given)
         return backward_simulation(lambda x, t: trig_prediction(network, x, t)[0], x_T, times, noises, live)
 
-    def loss(self, params, batch, step: Step):
+    def loss(self, variables, batch, step: Step):
         samples = unit_range(batch[self.inputs.sample.key])
         encode_key, drop_key, time_key, noise_key, generate_key = jax.random.split(step.key, 5)
         if self.autoencoder is not None:
-            samples = self.autoencoder.encode(params["autoencoder"], samples, encode_key)
+            samples = self.autoencoder.encode(variables["autoencoder"], samples, encode_key)
         count = samples.shape[0]
-        given, unconditional = self._conditions(params, batch, drop_key, dropout=False)
+        given, unconditional = self._conditions(variables, batch, drop_key, dropout=False)
         blank = jax.tree.map(lambda value, null: jnp.broadcast_to(null, value.shape),
                              given, aligned_conditions(given, unconditional))
         iteration = step.step
@@ -314,27 +314,27 @@ class ConsistencyDistillationObjective(DiffusionObjective):
         effective = jnp.where(warm, iteration, self.tangent_warmup
                               + (iteration - self.tangent_warmup) // self.student_update_freq)
         def student_losses(params):
-            student_params = self.trainable(params)
+            student_params = self.trainable(variables)
             total = jnp.zeros((count,), jnp.float32)
             if self.consistency_weight > 0 and self.consistency == "discrete":
                 network = self._network(student_params, given)
                 u = jax.random.uniform(time_key, (count,)) * (1 - self.discrete_skip / self.discrete_steps)
                 total = total + discrete_consistency_loss(
                     lambda x, t: trig_prediction(network, x, t)[0],
-                    lambda x, t: self._teacher(params, given, blank, x, t)[1],
+                    lambda x, t: self._teacher(variables, given, blank, x, t)[1],
                     samples, jax.random.normal(noise_key, samples.shape), u, self.discrete_steps,
                     self.discrete_skip, self.discrete_shift, self.consistency_weight)
             elif self.consistency_weight > 0:
                 t = self._times(time_key, count, self.student_times)
                 noise = jax.random.normal(noise_key, samples.shape)
                 x = expand(jnp.cos(t), samples) * samples + expand(jnp.sin(t), samples) * noise
-                _, teacher_F = self._teacher(params, given, blank, x, t)
+                _, teacher_F = self._teacher(variables, given, blank, x, t)
                 ratio = 1.0 if self.tangent_warmup == 0 else jnp.minimum(1.0, iteration / self.tangent_warmup)
                 network = self._network(student_params, given)
                 total = total + consistency_loss(lambda x, t: trig_prediction(network, x, t)[1], x, t,
                                                  teacher_F, ratio, self.consistency_weight)
             if self.dmd_weight > 0:
-                distribution = self._distribution_matching(params, student_params, given, blank, generate_key,
+                distribution = self._distribution_matching(variables, student_params, given, blank, generate_key,
                                                            effective, count, samples.shape)
                 total = total + jnp.where(warm, 0.0, distribution)
             return total
@@ -343,14 +343,14 @@ class ConsistencyDistillationObjective(DiffusionObjective):
             generate, time_key, noise_key = jax.random.split(generate_key, 3)
             x_T = jax.random.normal(noise_key, samples.shape)
             generated = jax.lax.stop_gradient(self._generated(
-                self.trainable(params), given, x_T, generate, iteration - effective - 1))
+                self.trainable(variables), given, x_T, generate, iteration - effective - 1))
             t = self._times(time_key, count, self.critic_times)
             noise = jax.random.normal(jax.random.fold_in(noise_key, 1), samples.shape)
             x = expand(jnp.cos(t), generated) * generated + expand(jnp.sin(t), generated) * noise
-            fake, _ = trig_prediction(self._network(self._fake(params), given), x, t)
+            fake, _ = trig_prediction(self._network(self._fake(variables), given), x, t)
             return critic_loss(generated, fake, t)
 
-        losses = jax.lax.cond(student_phase, student_losses, critic_losses, params)
+        losses = jax.lax.cond(student_phase, student_losses, critic_losses, variables)
         return Ratio(jnp.sum(losses), jnp.asarray(count, jnp.float32)), Aux(metrics={})
 
     def _distribution_matching(self, params, student_params, given, blank, key, iteration, count, shape):

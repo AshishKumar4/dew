@@ -39,7 +39,7 @@ def test_journal_refuses_a_different_policy_at_identical_clocks(tmp_path):
     state = trainer.initial_state()
     complete = collect(rollout, state)
     assert collect(rollout, state) == complete
-    changed = replace(state, params=jax.tree.map(lambda value: value + .001, state.params))
+    changed = replace(state, variables=jax.tree.map(lambda value: value + .001, state.variables))
     with pytest.raises(ValueError, match="same policy"):
         collect(rollout, changed)
 

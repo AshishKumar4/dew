@@ -203,7 +203,7 @@ def test_multiturn_actions_keep_cached_likelihoods_and_observations_out_of_targe
 
     # Packed GRPO rescoring sees the exact contexts that produced the actions.
     assert isinstance(trainer.objective, GRPOObjective)
-    raw = np.asarray(trainer.objective.packed_log_probs(state.params, batch))
+    raw = np.asarray(trainer.objective.packed_log_probs(state.variables, batch))
     np.testing.assert_allclose(raw, batch["old_log_probs"], atol=2e-6)
 
 
@@ -224,7 +224,7 @@ def test_grpo_gradient_matches_action_only_categorical_reference():
         stats, _ = trainer.objective.loss({"params": {"table": table}}, batch, info)
         return trainer.objective.reduce_loss(stats)[0]
 
-    gradient = np.asarray(jax.grad(loss)(state.params["params"]["table"]))
+    gradient = np.asarray(jax.grad(loss)(state.variables["params"]["table"]))
     expected = np.zeros((VOCAB, VOCAB), np.float64)
     rewards = np.array([episode.reward for episode in episodes], np.float64)
     advantages = (rewards - rewards.mean()) / (rewards.std(ddof=1) + 1e-6)
@@ -368,7 +368,7 @@ def test_trainer_update_and_checkpoint_continue_without_replaying_committed_epis
     assert int(first.step) == 1 and int(first.updates) == 1 // accumulation
     second = run(tmp_path / "interrupted", 2, resumed, accumulation)
     assert int(second.step) == 2 and int(second.updates) == 2 // accumulation
-    logits = np.asarray(ToolPolicy().apply(second.params, jnp.array([[NINE], [SIXTEEN]])))[:, 0]
+    logits = np.asarray(ToolPolicy().apply(second.variables, jnp.array([[NINE], [SIXTEEN]])))[:, 0]
     probabilities = jax.nn.softmax(logits, axis=-1)
     initial = jax.nn.softmax(jnp.asarray(transition_logits()[[NINE, SIXTEEN]]), axis=-1)
     assert float(probabilities[0, ANSWER_NINE] + probabilities[1, ANSWER_SIXTEEN]) > float(
@@ -387,8 +387,8 @@ def test_trainer_update_and_checkpoint_continue_without_replaying_committed_epis
 def test_collection_does_not_follow_live_mapping_replacements():
     trainer, rollout = build()
     state = trainer.initial_state()
-    live = {"params": dict(state.params["params"])}
-    state = replace(state, params=live)
+    live = {"params": dict(state.variables["params"])}
+    state = replace(state, variables=live)
     original = np.asarray(live["params"]["table"]).copy()
 
     def changing_verifier(episode):
@@ -412,7 +412,7 @@ def test_collection_does_not_follow_live_mapping_replacements():
 def test_aborted_episode_leaves_the_previous_trainer_checkpoint_intact(tmp_path, failure):
     directory = tmp_path / "run"
     first = run(directory, 1, [])
-    expected = np.asarray(first.params["params"]["table"]).copy()
+    expected = np.asarray(first.variables["params"]["table"]).copy()
     records = []
     trainer, rollout = build(Harness(failure), record=records.append)
     trainer.rollout = rollout
@@ -425,7 +425,7 @@ def test_aborted_episode_leaves_the_previous_trainer_checkpoint_intact(tmp_path,
 
     restored, _, _ = trainer.place()
     assert int(restored.step) == int(restored.updates) == 1
-    np.testing.assert_array_equal(restored.params["params"]["table"], expected)
+    np.testing.assert_array_equal(restored.variables["params"]["table"], expected)
     assert len(records) == jax.device_count() * GROUPS
     assert all(episode.identity.attempt == 1 and episode.reward is None for episode in records)
 
@@ -481,8 +481,8 @@ def test_projection_rejects_distinct_weight_bindings_with_identical_clocks():
     """Update/attempt counters alone do not identify the generating weights."""
     trainer, rollout = build()
     first_state = trainer.initial_state()
-    second_state = replace(first_state, params={"params": {
-        "table": first_state.params["params"]["table"].at[START, CALL_THREE].add(.8)}})
+    second_state = replace(first_state, variables={"params": {
+        "table": first_state.variables["params"]["table"].at[START, CALL_THREE].add(.8)}})
     first = collect(rollout, first_state)
     second = collect(rollout, second_state)
     assert first[0].identity == second[0].identity

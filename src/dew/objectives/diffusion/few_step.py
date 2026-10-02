@@ -140,14 +140,14 @@ class MeanFlowObjective(DiffusionObjective):
         self.norm_p = norm_p
         self.norm_eps = norm_eps
 
-    def loss(self, params, batch, step: Step):
+    def loss(self, variables, batch, step: Step):
         samples = unit_range(batch[self.inputs.sample.key])
         encode_key, drop_key, time_key, noise_key, dropout_key = jax.random.split(step.key, 5)
         if self.autoencoder is not None:
-            samples = self.autoencoder.encode(params["autoencoder"], samples, encode_key)
+            samples = self.autoencoder.encode(variables["autoencoder"], samples, encode_key)
         count = samples.shape[0]
         schedule = self.process.schedule
-        given, unconditional = self._conditions(params, batch, drop_key, dropout=False)
+        given, unconditional = self._conditions(variables, batch, drop_key, dropout=False)
         blank = jax.tree.map(lambda value, null: jnp.broadcast_to(null, value.shape),
                              given, aligned_conditions(given, unconditional))
         later, earlier = jax.random.split(time_key)
@@ -157,7 +157,7 @@ class MeanFlowObjective(DiffusionObjective):
         z, _, v = self.process.prediction.forward_diffusion(
             samples, noise, broadcast_rates(schedule, t, samples)
         )
-        variables = self.trainable(params)
+        variables = self.trainable(variables)
 
         def velocity(conditions, *, train: bool) -> Velocity:
             def average(z, t, r) -> jax.Array:
@@ -225,15 +225,15 @@ class ShortcutObjective(DiffusionObjective):
         self.sections = sections
         self.bootstrap_every = bootstrap_every
 
-    def loss(self, params, batch, step: Step):
+    def loss(self, variables, batch, step: Step):
         samples = unit_range(batch[self.inputs.sample.key])
         encode_key, drop_key, time_key, noise_key, dropout_key = jax.random.split(step.key, 5)
         if self.autoencoder is not None:
-            samples = self.autoencoder.encode(params["autoencoder"], samples, encode_key)
+            samples = self.autoencoder.encode(variables["autoencoder"], samples, encode_key)
         count = samples.shape[0]
         rows = count // self.bootstrap_every
         schedule = self.process.schedule
-        given, unconditional = self._conditions(params, batch, drop_key, dropout=False)
+        given, unconditional = self._conditions(variables, batch, drop_key, dropout=False)
         blank = jax.tree.map(lambda value, null: jnp.broadcast_to(null, value.shape),
                              given, aligned_conditions(given, unconditional))
 
@@ -266,12 +266,12 @@ class ShortcutObjective(DiffusionObjective):
                 return output
             return over
 
-        teacher = self.trainable(jax.lax.stop_gradient(params if step.ema is None else step.ema))
+        teacher = self.trainable(jax.lax.stop_gradient(variables if step.ema is None else step.ema))
         leading = jax.tree.map(lambda value: value[:rows], given)
         bootstrapped = shortcut_target(velocity(teacher, leading, train=False), x[:rows], sigma[:rows],
                                        step_size[:rows])
         target = jnp.concatenate([bootstrapped, v[rows:]])
-        u = velocity(self.trainable(params), conditions, train=True)(x, sigma, sigma - step_size)
+        u = velocity(self.trainable(variables), conditions, train=True)(x, sigma, sigma - step_size)
         losses = optax.l2_loss(u, target)
         return Ratio(jnp.sum(losses), jnp.asarray(losses.size, jnp.float32)), Aux(metrics={})
 

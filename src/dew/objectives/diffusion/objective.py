@@ -370,28 +370,28 @@ class DiffusionObjective(Objective[Ratio]):
             fields.extend((self.inputs.sample.key, self.inputs.mask.key))
         return {name: batch[name] for name in fields}
 
-    def loss(self, params, batch, step: Step):
+    def loss(self, variables, batch, step: Step):
         images = unit_range(batch[self.inputs.sample.key])
         encode_key, drop_key, time_key, noise_key, dropout_key = jax.random.split(step.key, 5)
-        conditions, _ = self._conditions(params, batch, drop_key, dropout=True)
+        conditions, _ = self._conditions(variables, batch, drop_key, dropout=True)
         schedule = self.process.schedule
         count = images.shape[0]
         t = schedule.sample_t(time_key, count)
         end_to_end = None
         if self.end_to_end is not None:
-            end_to_end = self._end_to_end_latents(params, images, encode_key)
+            end_to_end = self._end_to_end_latents(variables, images, encode_key)
             samples = end_to_end.samples
         elif self.autoencoder is not None:
-            samples = self.autoencoder.encode(params["autoencoder"], images, encode_key)
+            samples = self.autoencoder.encode(variables["autoencoder"], images, encode_key)
         else:
             samples = images
         noise = jax.random.normal(noise_key, samples.shape, dtype=jnp.float32)
 
         call = {**conditions, "train": True, "rngs": {"dropout": dropout_key}}
-        losses, aligned = self._denoised(params, self.trainable(params), samples, t, noise, call, images)
+        losses, aligned = self._denoised(variables, self.trainable(variables), samples, t, noise, call, images)
         weighted = losses * expand(self.process.weight(t), losses)
         if self.uncertainty is not None:
-            head = {collection: params[collection][UNCERTAINTY] for collection in ("params", "constants")}
+            head = {collection: variables[collection][UNCERTAINTY] for collection in ("params", "constants")}
             logvar = expand(self.uncertainty.apply(head, schedule.model_time(t)), losses)
             weighted = weighted * jnp.exp(-logvar) + logvar / 2
         mass = jnp.asarray(losses.size, jnp.promote_types(losses.dtype, jnp.float32))
@@ -409,9 +409,9 @@ class DiffusionObjective(Objective[Ratio]):
         # mode (the batch norm on its running statistics, no condition
         # dropped), as REPA-E's `align_only` pass reads them, on the same
         # times and noise.
-        latents = self.end_to_end.normalized(end_to_end.raw, params[LATENT_STATS])
-        frozen = jax.lax.stop_gradient(params)
-        given, _ = self._conditions(params, batch, drop_key, dropout=False)
+        latents = self.end_to_end.normalized(end_to_end.raw, variables[LATENT_STATS])
+        frozen = jax.lax.stop_gradient(variables)
+        given, _ = self._conditions(variables, batch, drop_key, dropout=False)
         _, through = self._denoised(frozen, self.trainable(frozen), latents, t, noise,
                                     {**given, "train": False}, images)
         assert through is not None

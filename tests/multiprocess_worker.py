@@ -76,9 +76,9 @@ def make_objective():
         def init(self, key, variables=None):
             return self.model.init(key, jnp.ones((1, RES, RES, 3)), jnp.zeros((1,)))
 
-        def loss(self, params, batch, step):
+        def loss(self, variables, batch, step):
             data = unit_range(batch["image"])
-            preds = self.model.apply(params, data, jnp.zeros((data.shape[0],), jnp.float32))
+            preds = self.model.apply(variables, data, jnp.zeros((data.shape[0],), jnp.float32))
             return jnp.mean((preds - data) ** 2), Aux({})
 
         def evaluate(self, params, batch, step):
@@ -489,7 +489,7 @@ def mode_packed_fit(args) -> dict:
     state = trainer.fit(
         dataclasses.replace(data, train=lambda partition: Recording(data.train(partition), seen)),
         steps=args.steps, log_every=1, checkpoint_every=args.save_every)
-    dump_params(args.out.with_suffix(".npz"), state.params)
+    dump_params(args.out.with_suffix(".npz"), state.variables)
     _, final_position = restored_state(trainer)
     return {
         "process_index": jax.process_index(),
@@ -540,13 +540,13 @@ def mode_steps(args) -> dict:
     if args.save and args.steps:
         checkpoints.save(int(as_numpy(state.step)), state, None)
         checkpoints.wait()
-    dump_params(args.out.with_suffix(".npz"), state.params)
+    dump_params(args.out.with_suffix(".npz"), state.variables)
     return {
         "losses": losses,
         "step": int(as_numpy(state.step)),
         "restored_step": restored,
         "checkpoint_path": checkpoints.directory,
-        "sharding": sharding_facts(state.params),
+        "sharding": sharding_facts(state.variables),
         "mesh_shape": {axis: int(size) for axis, size in trainer.device_mesh.shape.items()},
     }
 
@@ -607,7 +607,7 @@ def mode_fit(args) -> dict:
                         eval_every=args.steps if args.tokens else None,
                         checkpoint_every=args.save_every, metrics=(counter,),
                         best=Best(counter, mode='max') if args.tokens else None)
-    dump_params(args.out.with_suffix(".npz"), state.params)
+    dump_params(args.out.with_suffix(".npz"), state.variables)
     _, final_position = restored_state(trainer)
     return {
         "step": int(as_numpy(state.step)),
@@ -842,11 +842,11 @@ def mode_pipeline(args) -> dict:
     mine = token_batch()[args.process_id * rows:(args.process_id + 1) * rows]
     trainer = pipeline_trainer(args.stage_size, args.microbatches, args.fsdp_size)
     losses, state = pipeline_losses(trainer, mine, args.steps)
-    dump_params(args.out.with_suffix(".npz"), state.params)
+    dump_params(args.out.with_suffix(".npz"), state.variables)
     return {
         "process_index": jax.process_index(),
         "losses": losses,
-        "sharding": sharding_facts(state.params),
+        "sharding": sharding_facts(state.variables),
         "mesh_shape": {axis: int(size) for axis, size in trainer.device_mesh.shape.items()},
     }
 
@@ -877,8 +877,8 @@ def _evaluation_parts(case: _EvaluationCase):
         def init(self, key, variables=None):
             return {"params": {"offset": jnp.zeros(())}}
 
-        def loss(self, params, batch, step):
-            return jnp.mean((batch["x"] + params["params"]["offset"]) ** 2), Aux({})
+        def loss(self, variables, batch, step):
+            return jnp.mean((batch["x"] + variables["params"]["offset"]) ** 2), Aux({})
 
         def evaluate(self, params, batch, step):
             case.events.append(["score", np.asarray(jax.random.key_data(step.key)).tolist()])
@@ -1000,7 +1000,7 @@ def mode_evaluation_contract(args) -> dict:
         if failure == "duplicates" and rank == 0:
             scoring = (metric, metric)
         try:
-            result = evaluate(objective, state.params, data.val, metrics=scoring, key=state.key,
+            result = evaluate(objective, state.variables, data.val, metrics=scoring, key=state.key,
                               step=state.step, schedule_step=state.microstep,
                               preview=trainer.tracker is not None, mesh=trainer.device_mesh)
             trainer._report_evaluation(result)
@@ -1025,8 +1025,8 @@ def mode_evaluation_replicas(args) -> dict:
         def init(self, key, variables=None):
             return {"params": {"offset": jnp.zeros(())}}
 
-        def loss(self, params, batch, step):
-            return params["params"]["offset"] ** 2, Aux({})
+        def loss(self, variables, batch, step):
+            return variables["params"]["offset"] ** 2, Aux({})
 
         def evaluate(self, params, batch, step):
             return Representations(features=batch["x"], labels=batch["x"][:, 0])
@@ -1050,9 +1050,9 @@ def mode_evaluation_replicas(args) -> dict:
     batch = {"a_metadata": np.asarray(7), "a_python": 9,
              "x": np.arange(3, dtype=np.float32)[:, None]}
     data = Dataset(train=lambda partition: iter([batch]), val=lambda partition: iter([batch]), records=3, batch=3)
-    measured = evaluate(trainer.objective, state.params, data.val, metrics=(Count(),),
+    measured = evaluate(trainer.objective, state.variables, data.val, metrics=(Count(),),
                         key=state.key, mesh=trainer.device_mesh).scalars
-    unconsumed = evaluate(trainer.objective, state.params, data.val, key=state.key,
+    unconsumed = evaluate(trainer.objective, state.variables, data.val, key=state.key,
                           mesh=trainer.device_mesh).scalars
     # Plain host stays usable on root alone for local arrays outside evaluation.
     local = None
@@ -1147,7 +1147,7 @@ def mode_builtin_preview_failures(args) -> dict:
                 else:
                     objective._sample = sample_failure
                 try:
-                    result = evaluate(objective, state.params, data.val, key=state.key,
+                    result = evaluate(objective, state.variables, data.val, key=state.key,
                                       preview=trainer.tracker is not None, mesh=trainer.device_mesh)
                     trainer._report_evaluation(result)
                 except (AttributeError, ValueError, RuntimeError) as error:
@@ -1170,7 +1170,7 @@ def mode_builtin_preview_failures(args) -> dict:
                         raise RuntimeError(f"{case}: peer never returned from evaluation")
                     time.sleep(.01)
         case = f"{kind}-healthy"
-        result = evaluate(objective, state.params, data.val, key=state.key,
+        result = evaluate(objective, state.variables, data.val, key=state.key,
                           preview=trainer.tracker is not None, mesh=trainer.device_mesh)
         trainer._report_evaluation(result)
         reports[case] = {"scores": result.scalars, "drawn": len(tracker.drawn)}
@@ -1277,7 +1277,7 @@ def _rejected_inputs(model, state, local, rollout, sampling, inputs_for, rank) -
         key = jax.random.split(jax.random.key(23), 2) if fault == "key" and rank == 1 else jax.random.key(23)
         try:
             if fault == "component":
-                generate(model, state.params, inputs_for(local), 4, key=key, sampling=sampling,
+                generate(model, state.variables, inputs_for(local), 4, key=key, sampling=sampling,
                          logits=(jax.tree_util.Partial(rewrite),))
             else:
                 rollout(state, broken, key)
@@ -1338,7 +1338,7 @@ def mode_rollout(args) -> dict:
                       mesh=MeshSpec(fsdp=args.fsdp_size), layout=Layout(min_shard=TINY),
                       rollout=rollout)
     state, _, _ = trainer.place()
-    facts = sharding_facts(state.params)
+    facts = sharding_facts(state.variables)
     began = time.monotonic()
     rolled = rollout(state, local, jax.random.key(9))
     sampled_seconds = time.monotonic() - began
@@ -1346,7 +1346,7 @@ def mode_rollout(args) -> dict:
     arrivals = multihost_utils.process_allgather(np.asarray(rank, np.int64))
     # Stochastic draws over the placed parameters: keys fold in the global
     # row index, so the pool draws what one process draws for the same rows.
-    drawn = generate(model, state.params, inputs_for(local), 4, key=jax.random.key(21),
+    drawn = generate(model, state.variables, inputs_for(local), 4, key=jax.random.key(21),
                      sampling=Sampling(temperature=0.8, top_k=5, eos_id=eos, pad_id=12)).host()
     # A resident global array reaches the task as it is: a process cannot
     # fetch the rows the other process's devices hold, so a host round trip
@@ -1356,8 +1356,8 @@ def mode_rollout(args) -> dict:
 
     resident = shard_batch(trainer.device_mesh, {"prompt": local["prompt"]})["prompt"]
     controls = Sampling(temperature=0.8, top_k=5, eos_id=eos, pad_id=12)
-    through_task = TextGeneration(model, state.params)(resident, 4, key=jax.random.key(27), sampling=controls).host()
-    direct = generate(model, state.params, local["prompt"], 4, key=jax.random.key(27), sampling=controls).host()
+    through_task = TextGeneration(model, state.variables)(resident, 4, key=jax.random.key(27), sampling=controls).host()
+    direct = generate(model, state.variables, local["prompt"], 4, key=jax.random.key(27), sampling=controls).host()
     invalid_errors = {}
     if processes > 1:
         invalid_errors = _rejected_inputs(model, state, local, rollout, sampling, inputs_for, rank)
@@ -1367,7 +1367,7 @@ def mode_rollout(args) -> dict:
     data = Dataset(train=lambda partition: iter([local]), val=None, records=rows * processes,
                    batch=rows * processes)
     final = trainer.fit(data, steps=1, log_every=1, checkpoint_every=None)
-    dump_params(args.out.with_suffix(".npz"), final.params["params"])
+    dump_params(args.out.with_suffix(".npz"), final.variables["params"])
     return {
         "process_count": processes,
         "arrivals": arrivals.tolist(),
@@ -1639,9 +1639,9 @@ def mixed_validity_step(trainer, batch: dict, out: Path | None = None) -> dict:
     state, _, _ = trainer.place()
     placed = shard_batch(trainer.device_mesh, batch)
     compiled = trainer.compile(state, placed)
-    before = params_dict(state.params)  # the step consumes `state`
+    before = params_dict(state.variables)  # the step consumes `state`
     updated, loss, _, _, _ = compiled(state, placed)
-    after = params_dict(updated.params)
+    after = params_dict(updated.variables)
     update = {name: after[name] - before[name] for name in after}
     if out is not None:
         np.savez(out.with_suffix(".npz"), **after)
@@ -1674,7 +1674,7 @@ def mode_mixed_validity(args) -> dict:
     trainer = mixed_validity_trainer(args.fsdp_size)
     state, _, _ = trainer.place()
     agreed = agreed_validity(local, processes, phase="mixed validity request")
-    drawn = generate(trainer.objective.model, state.params, local, MIXED_NEW, key=3,
+    drawn = generate(trainer.objective.model, state.variables, local, MIXED_NEW, key=3,
                      sampling=Sampling(temperature=0)).host()
     trained = mixed_validity_step(
         trainer, mixed_validity_batch(mine, explicit=args.explicit), args.out)
@@ -1874,8 +1874,8 @@ def mode_host_training(args) -> dict:
         def init(self, key, variables=None):
             return {"params": {"small": jnp.ones(8), "large": jnp.ones(16)}}
 
-        def loss(self, params, batch, step):
-            weights = params["params"]
+        def loss(self, variables, batch, step):
+            weights = variables["params"]
             x = batch["x"]
             return (jnp.sum(weights["small"]) * jnp.mean(x)
                     + jnp.sum(weights["large"]) * jnp.mean(x ** 2)), Aux({})
@@ -1907,7 +1907,7 @@ def mode_host_training(args) -> dict:
         state, _, _ = trainer.place()
         batch = shard_batch(trainer.device_mesh, {"x": local})
         state, loss, _, _, _ = trainer.compile(state, batch)(state, batch)
-        reports[name] = {"params": jax.tree.map(lambda x: x.tolist(), as_numpy(state.params)),
+        reports[name] = {"params": jax.tree.map(lambda x: x.tolist(), as_numpy(state.variables)),
                          "loss": float(loss), "step": int(state.step)}
     reports["compute_devices"] = [d.id for d in compute_devices]
     reports["transaction_devices"] = [d.id for d in transaction_devices]

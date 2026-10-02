@@ -180,11 +180,11 @@ def test_one_trainer_step_moves_the_adapter_and_nothing_else(decoder, loaded, re
 
     state = trainer.fit(data, steps=1, log_every=1)
 
-    for before, after in zip(jax.tree.leaves(initial.params[FROZEN]), jax.tree.leaves(state.params[FROZEN]), strict=True):
+    for before, after in zip(jax.tree.leaves(initial.variables[FROZEN]), jax.tree.leaves(state.variables[FROZEN]), strict=True):
         np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
     assert all(bool(jnp.any(before != after)) for before, after in
-               zip(jax.tree.leaves(initial.params["params"]), jax.tree.leaves(state.params["params"]), strict=True))
-    trained = thaw(state.params)
+               zip(jax.tree.leaves(initial.variables["params"]), jax.tree.leaves(state.variables["params"]), strict=True))
+    trained = thaw(state.variables)
     logits = adapter.adapt(decoder.model).apply(trained, jnp.asarray(tokens))
     np.testing.assert_allclose(np.asarray(logits), reference["updated_logits"], atol=1e-4, rtol=0)
     exported = _factors(adapter, trained, tmp_path / "adapter")
@@ -221,16 +221,16 @@ def test_a_source_fine_tunes_through_its_own_adapted_bundle(decoder, reference, 
     state = trainer.fit(Dataset(train=lambda partition: iter([batch, batch]), val=None, records=rows, batch=rows),
                         steps=2, log_every=2)
 
-    assert set(_flat(state.params["params"])) == {
+    assert set(_flat(state.variables["params"])) == {
         f"{'.'.join(target[1:])}.{factor}" for target in tuned.adapter.targets for factor in lora.FACTORS}
-    for before, after in zip(jax.tree.leaves(initial.params[FROZEN]), jax.tree.leaves(state.params[FROZEN]), strict=True):
+    for before, after in zip(jax.tree.leaves(initial.variables[FROZEN]), jax.tree.leaves(state.variables[FROZEN]), strict=True):
         np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
-    trained = thaw(state.params)
-    tuned.adapter.save(state.params, tmp_path / "adapter")
+    trained = thaw(state.variables)
+    tuned.adapter.save(state.variables, tmp_path / "adapter")
     _, read = LoRA.load(source.model, source.variables, source.layouts, tmp_path / "adapter")
     for name, leaf in _flat(read).items():
         np.testing.assert_array_equal(np.asarray(leaf), np.asarray(_flat(trained)[name]), err_msg=name)
-    tuned.save(tmp_path / "merged", variables=state.params)
+    tuned.save(tmp_path / "merged", variables=state.variables)
     reloaded = load_pretrained(tmp_path / "merged", dtype="float32", attention_impl="reference")
     ids = jnp.asarray(tokens)
     np.testing.assert_allclose(np.asarray(reloaded.model.apply(reloaded.variables, ids)),
@@ -637,13 +637,13 @@ def test_a_run_config_adapter_trains_its_factors_and_nothing_else(tmp_path):
     assert selects(("params", "layers_0", "self_attn", "q_proj", "lora_A"))
     assert not selects(("params", "layers_0", "self_attn", "q_proj", "kernel"))
     initial = Trainer(objective, optax.sgd(0.0), key=config.trainer.key).initial_state()
-    moved = _flat(state.params["params"])
+    moved = _flat(state.variables["params"])
     assert set(moved) == {f"{'.'.join(target[1:])}.{factor}"
                           for target in config.lora.targets for factor in lora.FACTORS}
     for name, leaf in moved.items():
-        assert bool(jnp.any(leaf != _flat(initial.params["params"])[name])), f"{name} did not move"
-    for before, after in zip(jax.tree.leaves(initial.params[FROZEN]),
-                             jax.tree.leaves(state.params[FROZEN]), strict=True):
+        assert bool(jnp.any(leaf != _flat(initial.variables["params"])[name])), f"{name} did not move"
+    for before, after in zip(jax.tree.leaves(initial.variables[FROZEN]),
+                             jax.tree.leaves(state.variables[FROZEN]), strict=True):
         np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
     record = json.loads((tmp_path / "run" / "run.json").read_text())
     assert record["lora"]["targets"]["params/layers_0/self_attn/q_proj"] == {"rank": 2, "alpha": 4.0}
@@ -686,8 +686,8 @@ def test_the_branch_reaches_every_layer_of_a_scanned_run(decoder, reference):
     plain = adapter.adapt(decoder.model).apply(variables, tokens)
     np.testing.assert_allclose(np.asarray(scanned.apply(variables, tokens)), np.asarray(plain), rtol=1e-5, atol=1e-5)
 
-    def loss(params):
-        return jnp.mean(scanned.apply({**variables, "params": params}, tokens) ** 2)
+    def loss(variables):
+        return jnp.mean(scanned.apply({**variables, "params": variables}, tokens) ** 2)
 
     grads = jax.grad(loss)(variables["params"])
     for layer in ("layers_0", "layers_1"):

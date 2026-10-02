@@ -51,9 +51,9 @@ def train_smoke(model, directory, starts, tokens):
                    val=None, records=3 * 64, batch=64)
     state = Trainer(objective, optimizer, key=jax.random.key(1337)).fit(data, steps=3)
     assert int(state.step) == 3
-    assert all(bool(jnp.all(jnp.isfinite(leaf))) for leaf in jax.tree.leaves(state.params))
+    assert all(bool(jnp.all(jnp.isfinite(leaf))) for leaf in jax.tree.leaves(state.variables))
     movement = max(float(jnp.max(jnp.abs(before - after))) for before, after in
-                   zip(jax.tree.leaves(weights), jax.tree.leaves(state.params), strict=True))
+                   zip(jax.tree.leaves(weights), jax.tree.leaves(state.variables), strict=True))
     assert movement > 0
     return {'steps': int(state.step), 'dropout': .2, 'bias': False, 'max_weight_movement': movement}
 

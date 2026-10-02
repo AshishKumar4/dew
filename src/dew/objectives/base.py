@@ -365,7 +365,7 @@ class Objective(ABC, Generic[Loss, Effects]):
         return TrainingScalar(self, name, self.shown.get(name, Shown(better='lower')))
 
     @abstractmethod
-    def loss(self, params: Variables, batch: Batch, step: Step) -> tuple[Loss, Aux[Effects]]:
+    def loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Loss, Aux[Effects]]:
         """Additive loss statistics and the reports from one realized batch.
 
         Ratio declares a shared normalization mass. A plain scalar is one
@@ -422,7 +422,7 @@ class Objective(ABC, Generic[Loss, Effects]):
 
     def _pipeline_weights(self, state: TrainState, ema: bool | None) -> Variables:
         if self._ema_is_reference or ema is False or (ema is None and state.ema is None):
-            return state.params
+            return state.variables
         return state.averaged
 
     def pipeline(self, state: TrainState, *, ema: bool | None = None) -> Task:

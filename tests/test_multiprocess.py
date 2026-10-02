@@ -429,7 +429,7 @@ def test_two_processes_train_the_step_one_process_trains(tmp_path):
     assert pool[0]["sharding"]["device_counts"] == [DEVICES]
 
     assert_same_parameters(dumped_params(tmp_path / "pool" / "process0.json"),
-                           worker.params_dict(state.params))
+                           worker.params_dict(state.variables))
 
 
 @pytest.mark.distributed
@@ -457,7 +457,7 @@ def test_two_processes_run_the_pipeline_one_process_runs(tmp_path):
     np.testing.assert_allclose(pool[0]["losses"], whole, rtol=PARITY["rtol"], atol=PARITY["atol"])
     assert pool[0]["sharding"]["fully_addressable"] == [False]
     assert_same_parameters(dumped_params(tmp_path / "pool" / "process0.json"),
-                           worker.params_dict(whole_state.params))
+                           worker.params_dict(whole_state.variables))
 
 
 # --------------------------------------------------------------------------

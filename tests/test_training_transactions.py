@@ -89,25 +89,25 @@ def test_boundary_rejection_preserves_accepted_prefix_and_mutable_reads(composit
     data = batches()
     run = train.compile(initial, data[0])
     # the step consumes the state
-    start, opt_state, key = (jax.tree.map(np.asarray, initial.params),
+    start, opt_state, key = (jax.tree.map(np.asarray, initial.variables),
                              jax.tree.map(np.asarray, initial.opt_state), np.asarray(jax.random.key_data(initial.key)))
     prefix, *_ = run(initial, data[0])
     # the step consumes the state
     prefix_scale = float(prefix.scale.scale)
-    prefix_params = jax.tree.map(np.asarray, prefix.params)
+    prefix_params = jax.tree.map(np.asarray, prefix.variables)
     prefix_accumulation = jax.tree.map(np.asarray, prefix.accumulation)
     rejected, _, _, finite, accepted = run(prefix, data[1])
     assert bool(finite) and not bool(accepted)
     assert int(rejected.step) == 2 and int(rejected.microstep) == 1
     assert float(rejected.scale.scale) == prefix_scale / 2
-    for before, after in zip(jax.tree.leaves(prefix_params), jax.tree.leaves(rejected.params), strict=True):
+    for before, after in zip(jax.tree.leaves(prefix_params), jax.tree.leaves(rejected.variables), strict=True):
         np.testing.assert_array_equal(before, after)
     for before, after in zip(jax.tree.leaves(prefix_accumulation),
                              jax.tree.leaves(rejected.accumulation), strict=True):
         np.testing.assert_array_equal(before, after)
     final, _, _, _, accepted = run(rejected, data[2])
     assert bool(accepted) and int(final.updates) == 1
-    assert float(final.params["stats"]["seen"]) == 2
+    assert float(final.variables["stats"]["seen"]) == 2
     assert float(start["stats"]["seen"]) == 0
 
     def combined(w):
@@ -123,7 +123,7 @@ def test_boundary_rejection_preserves_accepted_prefix_and_mutable_reads(composit
     gradient = jax.grad(combined)(start["params"]["w"])
     update, expected_opt = train.optimizer.update({"w": gradient}, opt_state, start["params"])
     expected = optax.apply_updates(start["params"], update)
-    np.testing.assert_allclose(final.params["params"]["w"], expected["w"], rtol=1e-6, atol=1e-7)
+    np.testing.assert_allclose(final.variables["params"]["w"], expected["w"], rtol=1e-6, atol=1e-7)
     for want, got in zip(jax.tree.leaves(expected_opt), jax.tree.leaves(final.opt_state), strict=True):
         np.testing.assert_allclose(got, want, rtol=1e-6, atol=1e-7)
 
@@ -178,13 +178,13 @@ def test_activity_uses_all_loss_terms(composite, aux_active, updates):
     data["active"] = jnp.asarray(aux_active)
     run = train.compile(initial, data)
     # the step consumes the state
-    start, opt_state = jax.tree.map(np.asarray, (initial.params, initial.opt_state))
+    start, opt_state = jax.tree.map(np.asarray, (initial.variables, initial.opt_state))
     state, *_ = run(initial, data)
     state, *_ = run(state, data)
     assert int(state.microstep) == 2
     assert int(state.updates) == updates
     if not updates:
-        np.testing.assert_array_equal(state.params["params"]["w"], start["params"]["w"])
+        np.testing.assert_array_equal(state.variables["params"]["w"], start["params"]["w"])
         for a, b in zip(jax.tree.leaves(opt_state), jax.tree.leaves(state.opt_state), strict=True):
             np.testing.assert_array_equal(a, b)
 
@@ -220,10 +220,10 @@ def test_real_lm_mtp_router_and_qk_update_matches_combined_batch(auxiliary):
                      "text_roles": jnp.asarray(roles)})
     run = train.compile(initial, data[0])
     # the step consumes the state
-    start, opt_state, key = (jax.tree.map(np.asarray, initial.params),
+    start, opt_state, key = (jax.tree.map(np.asarray, initial.variables),
                              jax.tree.map(np.asarray, initial.opt_state), np.asarray(jax.random.key_data(initial.key)))
     partial, *_ = run(initial, data[0])
-    for before, after in zip(jax.tree.leaves(start), jax.tree.leaves(partial.params), strict=True):
+    for before, after in zip(jax.tree.leaves(start), jax.tree.leaves(partial.variables), strict=True):
         np.testing.assert_array_equal(before, after)
     actual, actual_loss, _, _, accepted = run(partial, data[1])
     assert bool(accepted) and int(actual.updates) == 1
@@ -235,10 +235,10 @@ def test_real_lm_mtp_router_and_qk_update_matches_combined_batch(auxiliary):
     updates, _ = optimizer.update(gradient, opt_state, start["params"], qk_stats=aux.qk_stats)
     expected = optax.apply_updates(start["params"], updates)
     np.testing.assert_allclose(actual_loss, expected_loss, rtol=1e-6, atol=2e-6)
-    for want, got in zip(jax.tree.leaves(expected), jax.tree.leaves(actual.params["params"]), strict=True):
+    for want, got in zip(jax.tree.leaves(expected), jax.tree.leaves(actual.variables["params"]), strict=True):
         np.testing.assert_allclose(got, want, rtol=2e-5, atol=2e-6)
     expected_moe = objective.apply_effects(start, aux.effects)["moe"]
-    for want, got in zip(jax.tree.leaves(expected_moe), jax.tree.leaves(actual.params["moe"]), strict=True):
+    for want, got in zip(jax.tree.leaves(expected_moe), jax.tree.leaves(actual.variables["moe"]), strict=True):
         np.testing.assert_array_equal(raw_leaf(got), raw_leaf(want))
 
     # An independent role-mask equation catches a shared bug in both batching paths.
@@ -265,12 +265,12 @@ def test_replay_preserves_half_precision_cotangents_and_integer_support():
     data = batches()[0]
     step = train.compile(initial, data)
     # the step consumes the state
-    w = np.asarray(initial.params["params"]["w"])
+    w = np.asarray(initial.variables["params"]["w"])
     state, *_ = step(initial, data)
     state, *_ = step(state, data)
     expected = w - .1 * (2 * (w - 1) + .2 * (w + 3))
     # Original fp16 statistic pullbacks round their coefficients to fp16.
-    np.testing.assert_allclose(state.params["params"]["w"], expected, rtol=0, atol=5e-5)
+    np.testing.assert_allclose(state.variables["params"]["w"], expected, rtol=0, atol=5e-5)
 
 
 def test_local_partial_snapshot_survives_continued_training_and_weight_restore(tmp_path):
@@ -283,7 +283,7 @@ def test_local_partial_snapshot_survives_continued_training_and_weight_restore(t
     prefix, *_ = step(initial, data[0])
     checkpoints.save_local(1, prefix, b"1", share=DataPartition())
     # the step consumes the state
-    prefix_params = jax.tree.map(np.asarray, prefix.params)
+    prefix_params = jax.tree.map(np.asarray, prefix.variables)
     final, *_ = step(prefix, data[1])
     final, *_ = step(final, data[2])
     checkpoints.wait()
@@ -296,7 +296,7 @@ def test_local_partial_snapshot_survives_continued_training_and_weight_restore(t
     for want, got in zip(jax.tree.leaves(final), jax.tree.leaves(resumed), strict=True):
         np.testing.assert_array_equal(raw_leaf(got), raw_leaf(want))
     template = {"params": jax.tree.map(
-        lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=x.sharding), restored.params)}
+        lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=x.sharding), restored.variables)}
     selected, _ = checkpoints.restore(template, 1)
     for want, got in zip(jax.tree.leaves(prefix_params), jax.tree.leaves(selected["params"]), strict=True):
         np.testing.assert_array_equal(raw_leaf(got), raw_leaf(want))

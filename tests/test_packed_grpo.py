@@ -301,8 +301,8 @@ def test_the_loss_never_holds_the_logits_of_the_whole_batch():
         (OLD_LOG_PROBS_KEY, jnp.float32), (ADVANTAGES_KEY, jnp.float32))}
     step = Step(step=jnp.asarray(0), key=jax.random.key(0), ema=None)
 
-    def loss(params, batch):
-        return mean_loss(objective.loss(params, batch, step)[0])[0]
+    def loss(variables, batch):
+        return mean_loss(objective.loss(variables, batch, step)[0])[0]
 
     compiled = jax.jit(jax.value_and_grad(loss)).lower(params, batch).compile()
     logits = rows * width * vocab * 4

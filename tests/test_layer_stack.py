@@ -209,8 +209,8 @@ def test_runs_of_like_layers_scan_and_the_rest_unroll(shape):
     training = gemma3n_training_variables(variables) if shape == "gemma3n" else variables
 
     def measured(model, forward, trained):
-        def loss(params):
-            current = {**trained, "params": params}
+        def loss(variables):
+            current = {**trained, "params": variables}
             if shape == "gemma3n":
                 return next_token_loss(model, current, ids)
             return jnp.mean(model.apply(current, ids) ** 2)
@@ -356,8 +356,8 @@ def loss_and_grads(objective, spec, variables, batch, devices=None):
     batch = shard_batch(mesh, batch)
     step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(3), ema=None)
 
-    def loss(params):
-        return scalar_loss(objective, {**variables, "params": params}, batch, step)
+    def loss(variables):
+        return scalar_loss(objective, {**variables, "params": variables}, batch, step)
 
     with jax.set_mesh(mesh), pipeline_microbatches(spec.microbatches):
         (value, aux), grads = jax.jit(jax.value_and_grad(loss, has_aux=True))(placed["params"])

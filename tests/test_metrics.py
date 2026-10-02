@@ -97,7 +97,7 @@ def test_mean_lm_accuracy_matches_the_full_forward_after_a_real_fit(tmp_path):
     trainer = Trainer(objective, optax.adam(.05), key=jax.random.key(0),
                       checkpoints=Checkpoints(str(tmp_path / "lm")))
     final = trainer.fit(data, steps=4, log_every=1, eval_every=1, metrics=[metric], best=metric)
-    logits = model.apply(final.params, jnp.asarray(tokens[:, :-1]), train=False)
+    logits = model.apply(final.variables, jnp.asarray(tokens[:, :-1]), train=False)
     expected = float(jnp.mean(jnp.argmax(logits, axis=-1) == tokens[:, 1:]))
     assert trainer._display.evaluations["val"][-1].scores["val/accuracy"] == expected
     trainer.checkpoints.wait()
@@ -105,7 +105,7 @@ def test_mean_lm_accuracy_matches_the_full_forward_after_a_real_fit(tmp_path):
                    key=lambda event: (event.scores["val/accuracy"], -event.step))
     assert trainer.checkpoints.best == selected.step
     restored, _ = trainer.checkpoints.restore(final, step="best")
-    kept_logits = model.apply(restored.params, jnp.asarray(tokens[:, :-1]), train=False)
+    kept_logits = model.apply(restored.variables, jnp.asarray(tokens[:, :-1]), train=False)
     kept_accuracy = float(jnp.mean(jnp.argmax(kept_logits, axis=-1) == tokens[:, 1:]))
     assert kept_accuracy == selected.scores["val/accuracy"]
 
@@ -120,8 +120,8 @@ def test_mean_image_error_matches_each_real_row_after_a_fit(tmp_path):
         def init(self, key, variables=None):
             return {"params": {"value": jnp.asarray(0., jnp.float32)}}
 
-        def loss(self, params, batch, step):
-            return jnp.mean((params["params"]["value"] - batch["images"]) ** 2), Aux({})
+        def loss(self, variables, batch, step):
+            return jnp.mean((variables["params"]["value"] - batch["images"]) ** 2), Aux({})
 
         def evaluate(self, params, batch, step):
             return ImageGrid(jnp.broadcast_to(params["params"]["value"], batch["images"].shape))
@@ -134,7 +134,7 @@ def test_mean_image_error_matches_each_real_row_after_a_fit(tmp_path):
     trainer = Trainer(Pixels(), optax.sgd(.1), key=jax.random.key(0),
                       checkpoints=Checkpoints(str(tmp_path / "image")))
     final = trainer.fit(data, steps=4, log_every=1, eval_every=1, metrics=[metric], best=metric)
-    expected = float((final.params["params"]["value"] - .5) ** 2)
+    expected = float((final.variables["params"]["value"] - .5) ** 2)
     assert trainer._display.evaluations["val"][-1].scores["val/pixel_error"] == pytest.approx(expected)
     trainer.checkpoints.wait()
     assert trainer.checkpoints.best == 4
