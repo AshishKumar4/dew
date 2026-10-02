@@ -158,18 +158,6 @@ class Admission:
     history_valid: jax.Array
 
 
-@struct.dataclass
-class Draws:
-    """What one step drew, per slot: the token, whether the row drew at
-    all, whether a criterion stopped it, and both likelihoods."""
-
-    token: jax.Array
-    drawn: jax.Array
-    stopped: jax.Array
-    behavior: jax.Array
-    raw: jax.Array
-
-
 def _opened(model: nn.Module, params: Variables, pad_id: int, slots: int, capacity: int) -> Slots:
     """Every slot free: zeros in the shapes of a prefill over an all-invalid
     prompt, which leave the cursors at zero and the validity false."""
@@ -297,7 +285,7 @@ Placement = Dense | Paged
 
 def _advanced(model: nn.Module, params: Variables, pad_id: int, placement: Placement, state: Slots,
               admission: Admission | None, transforms: tuple[LogitsTransform, ...],
-              stopping: tuple[Stopping, ...], grammar: Grammar | None) -> tuple[Slots, Draws]:
+              stopping: tuple[Stopping, ...], grammar: Grammar | None) -> tuple[Slots, jax.Array]:
     """One iteration: admit, feed every drawing row its last draw, then every active row draws.
 
     This is `strategies._sample_rows`'s step over rows that carry their own
@@ -328,10 +316,15 @@ def _advanced(model: nn.Module, params: Variables, pad_id: int, placement: Place
     committed = view.commit(token, state.active)
     stopped = state.active & decoding.criterion(stopping)(committed, token)
     drawn = state.active
+    # One readout buffer avoids a separate CUDA copy/event for each result
+    # field. Bitcast the FP32 likelihoods so the host sees their exact bits.
+    readout = jnp.stack((token.astype(jnp.uint32), drawn.astype(jnp.uint32), stopped.astype(jnp.uint32),
+                         jax.lax.bitcast_convert_type(jnp.where(drawn, behavior, 0.0), jnp.uint32),
+                         jax.lax.bitcast_convert_type(jnp.where(drawn, raw, 0.0), jnp.uint32)), axis=-1)
     return (Slots(decoder, committed.tokens, committed.valid, committed.step, state.budget,
                   drawn & ~stopped & (committed.step < state.budget), state.keys,
                   state.automaton if grammar is None else grammar.advanced(state.automaton, token, drawn)),
-            Draws(token, drawn, stopped, jnp.where(drawn, behavior, 0.0), jnp.where(drawn, raw, 0.0)))
+            readout)
 
 
 def _split(state: Slots) -> tuple[Slots, Slots]:
@@ -361,24 +354,24 @@ def _stepped(model: nn.Module, params: Variables, pad_id: int, placement: Placem
              resident: Slots, carried: Slots,
              admission: Admission | None, transforms: tuple[LogitsTransform, ...],
              stopping: tuple[Stopping, ...], grammar: Grammar | None
-             ) -> tuple[checkify.Error, tuple[Slots, Slots, Draws]]:
+             ) -> tuple[checkify.Error, tuple[Slots, Slots, jax.Array]]:
     """Run `steps` iterations of `_advanced` over a split state, carrying their device checks as a value.
 
-    The first iteration takes the admission, the draws come back stacked
-    `[steps, slots]`, and the host throws the error when it reads them, one
-    call later. The state comes back split as it went in.
+    The first iteration takes the admission, the draws come back in one
+    `[steps, slots, fields]` buffer, and the host throws the error when it
+    reads them, one call later. The state comes back split as it went in.
     """
 
     def run(params, resident, carried, admission, transforms, stopping, grammar):
         state, draws = _advanced(model, params, pad_id, placement, _joined(resident, carried), admission,
                                  transforms, stopping, grammar)
-        draws = jax.tree.map(lambda leaf: leaf[None], draws)
+        draws = draws[None]
         if steps > 1:
-            def following(state: Slots, _: None) -> tuple[Slots, Draws]:
+            def following(state: Slots, _: None) -> tuple[Slots, jax.Array]:
                 return _advanced(model, params, pad_id, placement, state, None, transforms, stopping, grammar)
 
             state, more = jax.lax.scan(following, state, length=steps - 1)
-            draws = jax.tree.map(lambda first, rest: jnp.concatenate([first, rest]), draws, more)
+            draws = jnp.concatenate([draws, more])
         return *_split(state), draws
 
     return checkify.checkify(run, errors=checkify.user_checks)(
@@ -700,7 +693,7 @@ class Server:
         self.steps = 0
         self._queue: deque[_Row] = deque()
         self._rows: dict[int, _Row] = {}
-        self._pending: tuple[checkify.Error, Draws] | None = None
+        self._pending: tuple[checkify.Error, jax.Array] | None = None
         self._failed: BaseException | None = None
         self.rows = rows
         self.grammar = grammar
@@ -1040,7 +1033,7 @@ class Server:
         iteration; resolve the rows that ended."""
         if self._pending is None:
             return
-        error, draws = jax.device_get(self._pending)
+        error, readout = jax.device_get(self._pending)
         self._pending = None
         try:
             error.throw()
@@ -1048,19 +1041,24 @@ class Server:
             self._fail(failure)
             raise
         now = time.perf_counter()
-        for step in range(draws.drawn.shape[0]):
+        token = readout[..., 0].view(np.int32)
+        drawn = readout[..., 1] != 0
+        stopped = readout[..., 2] != 0
+        behavior = readout[..., 3].view(np.float32)
+        raw = readout[..., 4].view(np.float32)
+        for step in range(readout.shape[0]):
             for slot, row in list(self._rows.items()):
-                if not draws.drawn[step, slot]:
+                if not drawn[step, slot]:
                     continue
                 if not row.tokens:
                     row.ticket.first = now
-                row.tokens.append(int(draws.token[step, slot]))
-                row.behavior.append(float(draws.behavior[step, slot]))
-                row.raw.append(float(draws.raw[step, slot]))
-                if draws.stopped[step, slot] or len(row.tokens) == row.budget:
+                row.tokens.append(int(token[step, slot]))
+                row.behavior.append(float(behavior[step, slot]))
+                row.raw.append(float(raw[step, slot]))
+                if stopped[step, slot] or len(row.tokens) == row.budget:
                     del self._rows[slot]
                     self.rows.release(row)
-                    self._finish(row, terminated=bool(draws.stopped[step, slot]))
+                    self._finish(row, terminated=bool(stopped[step, slot]))
 
     def _fail(self, failure: BaseException) -> None:
         self._failed = failure
