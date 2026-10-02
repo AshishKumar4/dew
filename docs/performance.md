@@ -16,9 +16,135 @@ python tools/optimizer_curve.py --dataset <tokens> --optimizer <name> \
     --learning-rate <lr> --out <json>
 ```
 
-Measured on jax 0.11.1 / jaxlib 0.11.1 / jax_cuda12_plugin 0.11.1, driver
-595.84, RTX 4080 16 GiB, single device, bf16 compute, adam, 3 warmup and 10
-measured steps, one architecture per process. The card was idle before each
+## Training scoreboard, 2026-10-02
+
+Dew against `torch.compile` on the same models: the same batch, bf16
+compute over fp32 master weights, the same optimizer constants, the same
+step (forward, backward, update, and the EMA where both keep one), warm,
+one process per row. A ratio is Dew's throughput over the best reference
+row: above 1, Dew is faster. The torch rows come from
+`tools/reference_runs/torch_lm.py` (transformers models) and
+`tools/benchmark_torch.py` (line-by-line ports of Dew's modules), the Dew
+rows from `tools/reference_runs/dew_lm.py` and `tools/benchmark_step.py`;
+`tools/reference_runs/scoreboard.py` builds the reference-run rows into one
+table.
+
+RTX 4080 16 GiB, Dew at `42292e99` (jax 0.11.2.post3), torch 2.13.0+cu130,
+transformers 5.17.0, SDPA attention. Each Dew row is two processes, given
+as their range; each torch row is one process, or two where a range is
+given:
+
+| model | step | Dew | best torch.compile | Dew / torch |
+|---|---|---:|---:|---:|
+| Qwen3-0.6B, pretrained | 1 x 1024 tokens, AdamW | 100.4-101.9 ms, MFU 44.1-44.8% | 112.1-112.4 ms, 40.0% | 1.10-1.12 |
+| Qwen3-0.6B, pretrained | 2 x 1024 tokens, AdamW | 154.0-154.2 ms, MFU 58.3-58.4% | 168.6-169.1 ms, 53.3% | 1.09-1.10 |
+| 99M Qwen3-MoE shape, 8 experts, top 2 | 8 x 1024 tokens, AdamW | 79.2 ms | 112.5 ms | 1.42 |
+| decoder, GPT-2 small widths, 3 layers | 16 x 512, Adam, EMA | 52.2 ms | 49.4 ms (flash), 50.0 (cuDNN) | 0.95 |
+| SimpleDiT, width 384, 6 layers, 64 px | batch 16, Adam, EMA | 7.43-7.52 ms | 8.07 ms | 1.07-1.09 |
+| SimpleDiT, width 768, 12 layers, 64 px | batch 32, Adam, EMA | 76.4-76.5 ms, MFU 59.2-59.3% | 76.4 ms (flash) | 1.00 |
+| 176M hybrid DiT (published config) | batch 16, Adam, EMA | 69.7-72.7 ms, MFU 35.9-37.4% | no torch port | |
+| 176M hybrid DiT (published config) | batch 32 | 116.6-122.3 ms, MFU 42.6-44.8% | no torch port | |
+
+The Dew decoder and SimpleDiT rows take a fresh host batch every step, and
+match the fixed-batch rows ("Comparison with PyTorch" below has both ways
+for both frameworks, and the commands). On Qwen3-0.6B at 1 x 1024 torch
+waits 25.1 ms a step on its host, which its 2 x 1024 step hides; on the
+MoE it waits 20.9 ms, and on device time alone Dew is 1.24x faster (79.0
+against 98.3 ms busy).
+
+Since `42ddfc14`: the hybrid DiT's dilated depthwise convolutions run as
+undilated ones over their interleaved grids (75.4 to 70.2 ms at batch 16);
+the vocabulary head's logsumexp, maximum and argmax come from one pass, and
+its gradient products read one bf16 copy of the logits' gradient, so the
+MoE's whole logits fit (119.6 to 92.7 ms); pretrained weights are placed
+without the hole that made Qwen3-0.6B at 2 x 1024 recompute (185.7 to
+161.2 ms); and at the default precision the head rounds its logits and
+their gradient to bf16 once, as torch autocast and MaxText do ("The
+vocabulary head" below has the quality comparison): the 3-layer decoder
+59.9 to 52.2 ms, the MoE 92.7 to 79.2, Qwen3-0.6B at 2 x 1024 161.2 to
+154.0.
+
+Where Dew wins: the optimizer update. XLA fuses Adam (or AdamW), the EMA
+and the finiteness guard into one bandwidth-bound pass over the state,
+6.9 ms on the 768-wide SimpleDiT against torch's fused Adam and foreach EMA
+at 16.2, and 27.6 ms on Qwen3-0.6B against torch's fused AdamW and gradient
+clipping at 39.5. GEMMs run at par or better (44.5 against 47.2 ms on the
+768-wide SimpleDiT). Dew's host cost is at most 2.6 ms a step on these
+rows, where torch.compile's reaches 25 ms; it is 13.0 ms on Qwen3-0.6B at
+2 x 1024, hidden behind the device.
+
+Where Dew loses:
+
+- Attention: cuDNN's fused kernels take 7.1 ms forward and backward on the
+  768-wide SimpleDiT (head dimension 64, 256 tokens) against
+  FlashAttention-2's 4.4 in torch, and 8.7 against 7.2 on Qwen3-0.6B (head
+  dimension 128, causal, 1024 tokens). JAX's Pallas-Triton kernel is faster
+  than cuDNN but recovers only 1.2-1.7% of these steps, at larger gradient
+  errors ("Faster kernels not adopted" below).
+- Converts and reductions: 11.0 and 5.6 ms of Qwen3-0.6B's step at 1 x
+  1024, 15.9 and 9.8 of the MoE's, where torch.compile casts inside its
+  GEMMs and elementwise kernels. Not yet attributed by scope.
+- The 3-layer decoder, whose vocabulary head (50304 columns, 8192 tokens)
+  is most of the step: 2.8 ms behind, after the head's rounding took 7.7
+  ms off.
+
+A100 40 GB (Colab), the latest records:
+
+| model | step | Dew | reference | Dew / reference | Dew commit |
+|---|---|---:|---:|---:|---|
+| Qwen3-0.6B, pretrained | 4 x 1024 tokens, AdamW | 141.0 ms | torch.compile 138.3 ms | 0.98 | `8c391009` |
+| Qwen3-0.6B, pretrained | 4 x 1024 tokens | 161.9 ms | MaxText 0.2.4 GPU recipe 164.9 ms | 1.02 | `157bc21a` |
+| 99M Qwen3-MoE shape, 8 experts, top 2 | 8 x 1024 tokens | 74.4 ms | torch.compile 110.5 ms | 1.48 | `157bc21a` |
+| mamba2-130m | 4 x 1024 tokens | 127.9 ms | torch with mamba_ssm kernels, eager, 172.5 ms | 1.35 | `9490c9e6` |
+| SimpleDiT, width 384, 8 layers, 64 px | batch 64, EMA | 21.9 ms | flaxdiff 21.4 ms | 0.98 | `9490c9e6` |
+
+These rows predate every change listed above. On Qwen3-0.6B torch idles
+18.3 ms a step on the host, so its device does 120 ms of work against
+Dew's 138: Dew's attention is 21.4 against 16.6 ms (cuDNN's sm80 backward
+against FlashAttention-2), its converts 17.8 ms and its reductions 10.9
+against 4.2 (the norms and the fp32 head), while its GEMMs are 64.9 against
+70.9 and its update, inside 22.7 ms of copies, beats torch's 19.2 ms of
+copies plus 17.8 of optimizer. The MoE and Mamba-2 rows win only because
+torch idles on the host (77 to 177 ms a step); on device time Dew is 1.7
+and 2.0 times slower (its expert GEMMs and the XLA path of the SSD scan).
+The MaxText row ran on another VM, before the whole-logits head took Dew's
+step from 161.9 to 141 ms.
+
+## The hybrid DiT's SSM blocks, 2026-10-01
+
+The published 176M hybrid DiT (16 blocks, 12 of them S5 blocks with the
+2D fusion convolution, 32x32x4 latents, patch 2) at batch 16, bf16, RTX
+4080, `tools/benchmark_step.py` with `--cases` of its config. XProf with
+command buffers off names each kernel's HLO instruction, and the optimized
+HLO gives its JAX scope; per step, at `42ddfc14`:
+
+| scope | ms |
+|---|---:|
+| MLPs (GEMMs at about 88 TFLOP/s) | 21.0 |
+| S5 layers: complex projections, `associative_scan` | 15.9 |
+| optimizer update (Adam and the EMA, fp32 state) | 10.0 |
+| 2D fusion: dilated depthwise convolutions and the scan-order gather | 8.8 |
+| SSM output projections | 4.3 |
+| attention projections | 2.9 |
+| norms, modulation, attention kernels, embeddings, the S5 reversals | 6.4 |
+| unattributed (converts and reductions outside a scope) | 6.5 |
+
+Each dilated depthwise convolution (dilations 2 and 3) ran as nine shifted
+products in fp32, because cuDNN's dilated grouped kernels are slow; its
+weight gradient read the input and the output's cotangent once per tap. A
+pixel's dilation-d taps are its neighbours in the grid of pixels sharing
+its row and column residues mod d, so the convolution now runs as cuDNN's
+dilation-1 kernel over the d^2 interleaved grids: forward and VJP 0.097 ms
+(dilation 2) and 0.089 ms (dilation 3) against 0.31 and 0.33, and the step
+75.30 to 70.17 ms. In fp32, where cuDNN's depthwise kernels are slower,
+the step goes from 109.70 to 113.68 ms; the published config trains in
+bf16. At HIGHEST precision the fp32 output and input gradient equal lax's
+dilated convolution's exactly.
+
+Unless a section says otherwise, the sections below were measured on jax
+0.11.1 / jaxlib 0.11.1 / jax_cuda12_plugin 0.11.1, driver 595.84, RTX 4080
+16 GiB, single device, bf16 compute, adam, 3 warmup and 10 measured steps,
+one architecture per process. The card was idle before each
 measurement: `nvidia-smi --query-compute-apps=process_name` showed only
 gnome-remote-desktop-daemon, which is the desktop itself. The card ran at 210
 MHz and 30 W at rest and at 2760 MHz and 120-220 W under load. XLA reads a
@@ -100,6 +226,33 @@ ticks. The peak allocation does not grow with how far the loop runs ahead
 (0.823 GiB at 27 steps ahead, 0.819 in lockstep; 3.499 against 3.495 GiB for
 hierarchical_mmdit).
 
+Correction, 2026-10-01, at `42ddfc14` (jax 0.11.2.post3, same card). The
+three "loop" rows above time a dispatch loop that runs into the runtime's
+limit on executions in flight, so once the device is a few dozen steps
+behind each dispatch waits for a step to finish: they measure the device,
+not the host. Timed right after a synchronization, eight dispatches stay
+under that limit, and they cost 0.95 ms each on simple_dit with a fixed
+device batch, 1.38 ms when the main thread also places a fresh batch, and
+0.40 and 0.63 ms on the small decoder. With a fresh batch from
+`DevicePrefetchIterator`, as `Trainer.fit` reads it, the placement runs on
+the worker thread. Every loop then runs at the device's pace:
+
+| loop, 3 repeats of 100 steps (40 on the decoder) | simple_dit ms/step | decoder ms/step |
+|---|---:|---:|
+| one device batch reused | 7.41-7.46 | 63.54-63.64 |
+| a fresh placement each step, `DevicePrefetchIterator` | 7.43-7.50 | 63.55-63.64 |
+| `Trainer.fit` over the same host batch, logging every 100 (40) steps | 7.456-7.460 | 63.69-63.73 |
+
+The fit row includes its logging, which waits on the device once an
+interval. Where the host is the step, on the cpu-smoke decoder (0.3 ms of
+device work), `Trainer.fit` costs 0.51-0.62 ms a step against 0.31-0.37 for
+the bare loop and 0.32-0.44 with the prefetch iterator. Its pieces, timed one
+by one there: the compiled step's dispatch 234 us, the prefetch iterator's
+`next` 85 us, the jitted `bookkeep` 22 us, and the batch's shapes, its row
+count and the profiler regions under 1 us each. So `fit` adds about 0.2 ms
+of host work a step, which no step that keeps the device busy for longer
+than about 0.6 ms can see.
+
 ### Antipattern audit
 
 An audit of `src/dew` for nine classes of performance antipattern, measured on
@@ -156,6 +309,51 @@ between the fixed-batch row and this tool's loop at the same commit
 (`6b0f119` reruns at 83.26 here on the same day). The DiT gained, from 1.16x
 the week before to 1.19x. On the newer torch, torch's SDPA row is 0.4 ms
 slower than the week before.
+
+Correction, 2026-10-01. The 0.82x row set Dew's loop, which places a fresh
+batch every step, against torch's run without `--h2d`, which keeps one batch
+on the device, and the 7.6 ms was never shown to be loop overhead. At
+`42ddfc14` the two tools compare like with like: `tools/benchmark_step.py
+--fixed-batch` against `tools/benchmark_torch.py` without `--h2d`, and the
+default fresh-batch loop against `--h2d` (pinned host memory, copied every
+step). torch 2.13.0+cu130, transformers 5.17.0, `--mode compile --attention
+sdpa`, `--warmup 20 --steps 100`, one process per row:
+
+| case | Dew, fixed | Dew, fresh | torch.compile, fixed | torch.compile, `--h2d` | Dew against torch, fixed / fresh |
+|---|---:|---:|---:|---:|---:|
+| causal_transformer, small preset | 63.68 | 63.63 | 49.44 (flash), 50.00 (cudnn) | 49.99 (cudnn) | 0.78x / 0.79x |
+| simple_dit, small preset | 7.46 | 7.43 | 8.53 (cudnn) | 8.07 (cudnn) | 1.14x / 1.09x |
+| simple_dit, width 768, 12 layers, batch 32 (`--size large`) | 76.09 | 76.11 | 76.40 (flash), 78.18 (cudnn) | 76.51 (flash), 78.38 (cudnn) | 1.00x / 1.01x |
+
+The torch decoder takes its head's product in bf16 (`--head-dtype bfloat16`,
+now the twin's default), as Dew's LM objective does; with the fp32 head the
+twin carried before, torch ran 72.38 ms. A fresh batch costs Dew nothing
+measurable on these rows, and `Trainer.fit` costs nothing on top (the
+host-time correction above).
+
+At `42ddfc14` the decoder's 14 ms was its vocabulary head (8192 tokens,
+vocabulary 50304, three layers, so the head is most of the step). Dew kept
+the logits in fp32 and carried their fp32 cotangent into the state product
+as a bf16 high half and its rest, two products; torch rounds both to bf16.
+Three changes since took the decoder to 52.2 ms against torch's 49.4 (the
+scoreboard above): one pass for the log-sum-exp and argmax, one bf16 copy
+of the cotangent for both products, and torch's rounding of the logits and
+their cotangent at the default precision. XProf with
+command buffers off against torch.profiler, ms per step: the forward's
+log-sum-exp and argmax read the fp32 logits in two passes, 5.1, against
+torch's fused log-softmax at 1.3; the backward wrote the logits' cotangent
+three times in bf16 (the high half, the rest and the plain rounding for the
+head's own gradient), 6.7, against 2.7; and the state product ran twice,
+which was about 3 of Dew's 39.4 ms of GEMMs against torch's 33.9. Attention
+is 1.7 against 1.3.
+
+On the large DiT the two frameworks spend the step
+differently (XProf with command buffers off against torch.profiler, ms per
+step): GEMMs 44.5 against 47.2, the optimizer update 6.9 (XLA fuses Adam and
+the EMA into one pass over the state) against 16.2, attention 7.1 (cuDNN)
+against 4.4 (FlashAttention-2), and Dew's reductions and converts 16.5 (the
+bias gradients with the GELU backward 5.4, the norm statistics 1.9) against
+torch's elementwise and norm kernels 5.8 and copies 8.9.
 
 ## Attention kernels
 
@@ -375,7 +573,16 @@ in this change reaches them.
 ## XLA flags
 
 `TrainerConfig.xla_flags` appends to `XLA_FLAGS`. `prepare_process` applies
-it before JAX opens a backend. The default is None, and this sweep is the
+it before JAX opens a backend, and also sets `--xla_allow_excess_precision=false`
+unless the run named that flag (`dew.training.runtime.keep_roundings`): with
+XLA's default a fusion may skip a bf16 rounding the program states, and which
+it skips depends on the layout, so one device and four computed different
+bf16 forwards of one model. The recipes and the CLI call `prepare_process`;
+a script or notebook that builds a `Trainer` itself calls it first, or sets
+`XLA_FLAGS=--xla_allow_excess_precision=false` before importing jax. On the
+RTX 4080 the flag was faster: the 176M hybrid DiT at batch 16 69.60 to 66.62
+ms, SimpleDiT-B at batch 32 76.00 to 73.03, Qwen3-0.6B's widths at 1 x 1024
+110.52 to 109.62. The default `xla_flags` is None, and this sweep is the
 reason. It covers three architectures, with one fresh process per
 configuration. Each cell is the median of the runs, with the range and count
 where a configuration was repeated.
@@ -464,7 +671,7 @@ workstation CPU does nine of them in under an hour.
 ```
 curl -o data/shakespeare.txt --create-dirs \
     https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
-python tools/tokenize_text.py --input data/shakespeare.txt \
+dew tokenize --input data/shakespeare.txt \
     --out data/shakespeare-byte --tokenizer byte --val-fraction 0.02
 JAX_PLATFORMS=cpu taskset -c 0-5 python tools/optimizer_curve.py \
     --dataset data/shakespeare-byte --optimizer muon --learning-rate 3e-3 \
@@ -749,6 +956,7 @@ Kernel matrix, 2026-09-22, jax 0.11.2, forward plus backward medians, every cell
 | tokamax `triton` RMSNorm | sm80, sm89 | 1.07x (A100), 1.53x (L4), 1.57x (RTX 4080) over XLA | tokamax dependency. |
 | fused-weight SwiGLU (tokamax `xla` formulation, one contraction for gate and up) | every GPU | 1.47x (A100), 1.47x (L4), 1.55x (RTX 4080), 1.21x (T4) over two XLA matmuls; no gain on TPU | a change to the MLP's parameter layout. |
 | tokamax `xla` head plus cross entropy | sm89 speed | 73.0 ms (L4) and 36.8 ms (RTX 4080), 1.55x and 1.58x over Dew's chunked head | tokamax dependency, and it holds 1.6-3.2 GiB where the chunked head holds 131-355 MiB. |
+| JAX's Pallas-Triton `mha` (`jax.experimental.pallas.ops.gpu.attention`), 2026-10-01 | sm89, training attention | forward plus backward, bf16, against cuDNN: 0.38 against 0.64 ms (batch 32, 256 tokens, 12 heads of 64), 0.43 against 0.81 (causal, batch 16, 512 tokens), 1.12 against 1.36 (causal, batch 4, 1024 tokens, 16 heads of 128); in the step, routed where a call has no bias, mask, window or lengths: the 768-wide SimpleDiT 76.10 to 74.81 ms, the small decoder 63.61 to 62.86 | deprecated in JAX 0.11 for tokamax; against an fp32 reference its dq and dk errors reach 8.5e-3 of their maximum where cuDNN's reach 5.3e-3 (causal, 512 tokens); no grouped-query heads. |
 | JAX's Pallas GPU `paged_attention` | sm80 and later, decode | 1.75-1.84x (A100), 1.85-2.1x (L4), 2.1-2.8x (RTX 4080) over the XLA gather | a decode-path change; on TPU the XLA gather wins at batch 8 and up to 2k context. |
 
 ### The Mamba-2 SSD scan: `ssd_kernel_runs`

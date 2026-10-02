@@ -83,9 +83,19 @@ _AGENT_FAILURES = frozenset({"NonZeroAgentExitCodeError"})
 _HARNESS_LIMITS = frozenset({"LimitsExceeded", "TimeExceeded", "ContextWindowExceededError"})
 # Exit statuses naming a litellm or OpenAI client exception: the harness's model call failed after its
 # own retries. Harbor's error patterns do not match litellm's wording, so it reports only a nonzero exit.
-_CLIENT_FAILURES = frozenset({"APIConnectionError", "APIError", "APIResponseValidationError", "BadGatewayError",
-                              "InternalServerError", "RateLimitError", "ServiceUnavailableError", "Timeout",
-                              "APITimeoutError"})
+_CLIENT_FAILURES = frozenset(
+    {
+        "APIConnectionError",
+        "APIError",
+        "APIResponseValidationError",
+        "BadGatewayError",
+        "InternalServerError",
+        "RateLimitError",
+        "ServiceUnavailableError",
+        "Timeout",
+        "APITimeoutError",
+    }
+)
 _SESSION = re.compile(r"[A-Za-z0-9._:-]+")
 
 
@@ -180,8 +190,14 @@ class Gateway:
         """Make the gateway label the calls it records from now on with `version` (a `Publication` stamp)."""
         response = self._client.post(f"{self.url}/admin/weight_version", json={"weight_version": version})
         answer = response.json()
-        if response.status_code != 200 or not isinstance(answer, dict) or answer.get("weight_version") != version:
-            raise RuntimeError(f"the gateway refused version {version}: {response.status_code} {response.text}")
+        if (
+            response.status_code != 200
+            or not isinstance(answer, dict)
+            or answer.get("weight_version") != version
+        ):
+            raise RuntimeError(
+                f"the gateway refused version {version}: {response.status_code} {response.text}"
+            )
 
     def forget(self, session: str) -> None:
         self._client.delete(f"{self.url}/sessions/{session}").raise_for_status()
@@ -226,7 +242,9 @@ def _trace(trace: object, unstamped: int) -> _Trace:
     raw = trace.get("raw_response") or {}
     if not isinstance(raw, dict):
         raise ValueError(f"a trace's raw response is a JSON object, got {type(raw).__name__}")
-    arrival = _number("timestamp", trace.get("timestamp")) - _number("latency_ms", trace.get("latency_ms")) / 1000
+    arrival = (
+        _number("timestamp", trace.get("timestamp")) - _number("latency_ms", trace.get("latency_ms")) / 1000
+    )
     # vLLM answers {"error": {"message": ...}}; SGLang {"object": "error", "message": ...}.
     error = raw.get("error") or (raw.get("message") if raw.get("object") == "error" else None)
     if error:
@@ -239,7 +257,9 @@ def _trace(trace: object, unstamped: int) -> _Trace:
         sampled = (choice.get("response_token_ids") if isinstance(choice, dict) else None) or []
     prompt = trace.get("prompt_token_ids") or []
     if not prompt:
-        raise ValueError("a trace carries no prompt ids: the engine was not asked for them or cannot list them")
+        raise ValueError(
+            "a trace carries no prompt ids: the engine was not asked for them or cannot list them"
+        )
     version = trace.get("weight_version")
     if version is not None and type(version) is not int:
         raise ValueError(f"a trace's weight version is an integer, got {version!r}")
@@ -278,7 +298,8 @@ def calls(traces: Sequence[object], *, unstamped: int) -> Recorded:
 
 # How vLLM 0.30.0 ("This model's maximum context length is ...") and SGLang 0.5.20 ("The input (N
 # tokens) is longer than the model's context length (M tokens).") word a prompt past the context length;
-# vLLM's input processor, which token-id prompts reach, says "... is longer than the maximum model length of M".
+# vLLM's input processor, which token-id prompts reach, says
+# "... is longer than the maximum model length of M".
 _OVERFLOW = re.compile(r"maximum context length|longer than the model's context length"
                        r"|longer than the maximum model length", re.IGNORECASE)
 
@@ -337,7 +358,12 @@ def outcome(trial: JSON, records: tuple[Call, ...], *, errors: Sequence[str] = (
         return Status.INFRA_ERROR, reward, rewards, "the engine aborted a call"
     if (kind in _TRUNCATIONS or harness_exit in _HARNESS_LIMITS
             or (records and records[-1].finish_reason == "length")):
-        return Status.TRUNCATED, reward, rewards, detail or harness_exit or "the last call stopped at its length limit"
+        return (
+            Status.TRUNCATED,
+            reward,
+            rewards,
+            detail or harness_exit or "the last call stopped at its length limit",
+        )
     if not records:
         return Status.INFRA_ERROR, reward, rewards, detail or "no model call reached the gateway session"
     if harness_exit in _CLIENT_FAILURES:
@@ -383,10 +409,21 @@ class HarborSource:
     `grace`, the running ones.
     """
 
-    def __init__(self, gateway: Gateway, *, harbor: str | os.PathLike[str], model: str, trials: os.PathLike[str],
-                 agent: str = "mini-swe-agent", environment: Mapping[str, str] | None = None,
-                 arguments: Sequence[str] = (), workers: int = 8, grace: float = 60.0,
-                 ready_timeout: float = 900.0, ready_poll: float = 2.0):
+    def __init__(
+        self,
+        gateway: Gateway,
+        *,
+        harbor: str | os.PathLike[str],
+        model: str,
+        trials: os.PathLike[str],
+        agent: str = "mini-swe-agent",
+        environment: Mapping[str, str] | None = None,
+        arguments: Sequence[str] = (),
+        workers: int = 8,
+        grace: float = 60.0,
+        ready_timeout: float = 900.0,
+        ready_poll: float = 2.0,
+    ):
         if type(workers) is not int or workers < 1:
             raise ValueError("workers must be a positive number of concurrent trials")
         if not grace > 0:
@@ -505,13 +542,32 @@ class HarborSource:
         try:
             with self._lock:
                 record = self._records[future]
-                process = None if record.cancelled else subprocess.Popen(
-                    [*self._command, "-p", os.fspath(directory), "--trial-name", name,
-                     "--trials-dir", os.fspath(self._trials),
-                     *itertools.chain.from_iterable(("--ae", f"{key}={value}") for key, value in
-                                                    {**self._environment,
-                                                     "OPENAI_BASE_URL": self._gateway.session(session)}.items())],
-                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+                process = (
+                    None
+                    if record.cancelled
+                    else subprocess.Popen(
+                        [
+                            *self._command,
+                            "-p",
+                            os.fspath(directory),
+                            "--trial-name",
+                            name,
+                            "--trials-dir",
+                            os.fspath(self._trials),
+                            *itertools.chain.from_iterable(
+                                ("--ae", f"{key}={value}")
+                                for key, value in {
+                                    **self._environment,
+                                    "OPENAI_BASE_URL": self._gateway.session(session),
+                                }.items()
+                            ),
+                        ],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        start_new_session=True,
+                    )
+                )
                 record.process = process
             if process is None:
                 # Resolved outside the lock: the future's done-callback takes it.
@@ -527,7 +583,8 @@ class HarborSource:
                 future.set_result(self._verdict(ended, session, self._trials / name, log, process.returncode,
                                                 cancelled, version))
             finally:
-                # The session's traces leave the gateway on every exit path; the future already has its verdict.
+                # The session's traces leave the gateway on every exit path;
+                # the future already has its verdict.
                 try:
                     self._gateway.forget(session)
                 except Exception as error:
@@ -547,11 +604,17 @@ class HarborSource:
         if cancelled:
             return ended(Status.CANCELLED, records, detail=str(trial))
         if not (trial / "result.json").is_file():
-            return ended(Status.INFRA_ERROR, records, detail=f"harbor exited {returncode} with no result: {log[-2000:]}")
+            return ended(
+                Status.INFRA_ERROR,
+                records,
+                detail=f"harbor exited {returncode} with no result: {log[-2000:]}",
+            )
         try:
             harness_exit = _harness_exit(trial)
         except ValueError as error:
-            return ended(Status.INFRA_ERROR, records, detail=f"{trial}: unreadable harness trajectory: {error}")
+            return ended(
+                Status.INFRA_ERROR, records, detail=f"{trial}: unreadable harness trajectory: {error}"
+            )
         status, reward, components, detail = outcome(
             json.loads((trial / "result.json").read_text()), records, errors=recorded.errors,
             harness_exit=harness_exit)
@@ -582,7 +645,8 @@ def _signal(process: subprocess.Popen[str], sent: signal.Signals) -> None:
 
 
 def _stop_all(records: dict[Future[Session], _Trial], lock: threading.Lock, grace: float) -> None:
-    """At interpreter exit: cancel every trial, interrupt the live ones, and kill any still alive after `grace`."""
+    """At interpreter exit: cancel every trial, interrupt the live ones,
+    and kill any still alive after `grace`."""
     with lock:
         live = []
         for record in records.values():
@@ -600,7 +664,8 @@ def _stop_all(records: dict[Future[Session], _Trial], lock: threading.Lock, grac
 
 
 def _harness_exit(trial: Path) -> str | None:
-    """mini-swe-agent's own exit status for the trial, when its trajectory is there; ValueError when unreadable."""
+    """mini-swe-agent's own exit status for the trial, when its trajectory
+    is there; ValueError when unreadable."""
     path = trial / "agent" / "mini-swe-agent.trajectory.json"
     if not path.is_file():
         return None

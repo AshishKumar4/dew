@@ -26,7 +26,8 @@ it is batched with.
 from __future__ import annotations
 
 import functools
-from typing import TYPE_CHECKING, Sequence
+from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp

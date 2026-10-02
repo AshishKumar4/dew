@@ -2,7 +2,7 @@
 
 Prepare WikiText or TinyStories with the existing tokenizer tool:
 
-    python tools/tokenize_text.py --input data/wikitext.txt --out data/wikitext --tokenizer byte
+    dew tokenize --input data/wikitext.txt --out data/wikitext --tokenizer byte
     python examples/train_masked_lm.py --tokens data/wikitext --steps 2000
     python examples/train_masked_lm.py --tokens data/wikitext --smoke --out runs/mdlm-smoke
 

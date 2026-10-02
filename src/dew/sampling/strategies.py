@@ -26,6 +26,7 @@ from dew.nn.inputs import PredictionPhase, continuation_keys, prompt_major
 from dew.nn.scatter import DROPPED
 from dew.objectives.base import Variables
 from dew.objectives.likelihood import token_log_probs
+from dew.sampling import decoding
 from dew.sampling.decoding import StepState
 from dew.sampling.guided import Grammar
 
@@ -201,10 +202,17 @@ def draw(state: StepState, logits: jax.Array,
     raw = logits.astype(jnp.float32)
     checkify.check(jnp.all(wellformed(raw) | ~state.active),
                    "the model produced an active row without a distribution to score")
-    scores = transform(state, raw)
-    keys = jax.vmap(jax.random.fold_in)(state.keys, state.step)
-    token = select(keys, scores, state.active)
-    behavior = token_log_probs(scores, token)
+    if isinstance(transform, decoding.LogitsChain) and transform.greedy:
+        scores = decoding.chain(transform.transforms[:-1])(state, raw)
+        checkify.check(jnp.all(wellformed(scores) | ~state.active),
+                       "the transform chain left an active row without a distribution to draw from")
+        token = jnp.argmax(scores, axis=-1).astype(jnp.int32)
+        behavior = jnp.zeros(token.shape, jnp.float32)
+    else:
+        scores = transform(state, raw)
+        keys = jax.vmap(jax.random.fold_in)(state.keys, state.step)
+        token = select(keys, scores, state.active)
+        behavior = token_log_probs(scores, token)
     selected = token_log_probs(raw, token)
     return token, behavior, selected
 

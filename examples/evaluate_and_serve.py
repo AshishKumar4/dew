@@ -60,7 +60,7 @@ class Config:
     run: Path | None = None
     """The run directory, published checkpoint or Hub repo to score."""
     tokens: Path | None = None
-    """Token directory from tools/tokenize_text.py; its val split is the perplexity set."""
+    """Token directory from `dew tokenize`; its val split is the perplexity set."""
     out: Path = Path("reports/evaluation")
     sequence_length: int = 256
     batch_size: int = 8
@@ -137,7 +137,7 @@ def perplexity(task: TextGeneration, config: Config) -> dict[str, float]:
                         loading=Loading(workers=0)).load(batch=config.batch_size)
     if data.val is None:
         raise ValueError(f"{config.tokens} holds no val split to score")
-    scored = evaluate(LMObjective(task.model, config.sequence_length, ema_decay=None),
+    scored = evaluate(LMObjective(task.model, config.sequence_length),
                       task.variables, data.val, key=jax.random.key(0),
                       metrics=[metrics.perplexity()])
     return dict(scored.scores)

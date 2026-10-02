@@ -275,7 +275,11 @@ def _prepared(tokens: ModelInputs | jax.Array, segment_ids: jax.Array | None = N
     for name in columns:
         if name in prepared.token_fields:
             raise ValueError(f"{name} must come from either ModelInputs or the packing column")
-    return dataclasses.replace(prepared, token_fields={**prepared.token_fields, **columns}) if columns else prepared
+    return (
+        dataclasses.replace(prepared, token_fields={**prepared.token_fields, **columns})
+        if columns
+        else prepared
+    )
 
 
 def prompt_batch(prompt) -> jax.Array:
@@ -300,7 +304,7 @@ class Samples:
     """
     prompt: Sequence[int] | Sequence[Sequence[int]]
     max_new_tokens: int
-    sampling: Sampling = Sampling()
+    sampling: Sampling = dataclasses.field(default_factory=Sampling)
     decode: Callable[[list[int]], str] = lambda ids: str(ids)
 
 
@@ -466,6 +470,9 @@ def _trainable_with(model: nn.Module, indexer: IndexerTraining | None, trainable
     return _is_indexer if indexer.phase == "warmup" else None
 
 
+_DEFAULT_SAMPLING = Sampling()
+
+
 @objectives("lm")
 class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     """Train a next-token model: shifted cross entropy, teacher-forced scoring, optional previews.
@@ -491,6 +498,11 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     vocabulary 50,304 on one RTX 4080 (docs/benchmarks.md), and one is
     the full pass. It also slices the forward that an evaluation or a
     scoring pass runs.
+
+    `ema_decay` keeps an exponential moving average of the trained leaves
+    at that decay, and evaluation and previews then read the average. None,
+    the default, keeps none: no second copy of the weights, and validation
+    scores the weights that trained.
 
     `pretrained` is a variables dict to start from instead of a fresh
     init. A `dew.interop.load_pretrained(...)` bundle's `lm_objective`
@@ -557,10 +569,14 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
 
     `token_accuracy` reports the argmax accuracy; False skips the pass
     over every logit it costs (0.77 ms of the head's 8.0 on a TPU v6e).
+
+    `processor` is what `pipeline` turns text into ids with and decodes
+    through, unless it is handed another. A bundle's `lm_objective` passes
+    the source's own.
     """
 
     artifact = TokenScores
-    shown = {"ce": Shown(better="lower"), "perplexity": Shown(better="lower"),
+    shown: Mapping[str, Shown] = {"ce": Shown(better="lower"), "perplexity": Shown(better="lower"),
              "token_accuracy": Shown(better="higher", percent=True)}
 
     keeps_whole_logits: ClassVar[bool] = True
@@ -576,7 +592,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         model,
         seq_len: int,
         *,
-        ema_decay: float | None = 0.999,
+        ema_decay: float | None = None,
         pad_id: int | None = None,
         head_chunks: int = 4,
         head_tile: tuple[int, int] | Literal['whole', 'tiled'] | None = None,
@@ -593,6 +609,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         indexer: IndexerTraining | None = None,
         trainable: PathFilter | None = None,
         token_accuracy: bool = True,
+        processor: Processor | None = None,
     ):
         """Build the objective; the class docstring describes each argument."""
         decoder = _decoder(model)
@@ -605,6 +622,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         self.head_tile = _head_tile(head_tile, self.keeps_whole_logits)
         self.samples = samples
         self.pretrained = pretrained
+        self.processor = processor
         self.balance_rate = balance_rate
         _check_terms(decoder, aux_loss_alpha=aux_loss_alpha, mtp_weight=mtp_weight, z_loss=z_loss,
                      router_z_loss=router_z_loss)
@@ -682,7 +700,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         return merge(variables, pretrained)
 
 
-    def policy(self, params: Variables, sampling: Sampling = Sampling()) -> TextGeneration:
+    def policy(self, params: Variables, sampling: Sampling = _DEFAULT_SAMPLING) -> TextGeneration:
         """Expose the model over this training tree as a generation task.
 
         A rollout binds one snapshot of the policy and draws every completion
@@ -691,14 +709,17 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         """
         return TextGeneration(self.model, thaw(params), sampling=sampling)
 
-    def pipeline(self, state: TrainState, *, ema: bool = True, processor: Processor | None = None) -> TextGeneration:
+    def pipeline(self, state: TrainState, *, ema: bool | None = None,
+                 processor: Processor | None = None) -> TextGeneration:
         """Publish the decoder over the state's weights as a generation task.
 
         It samples and is budgeted the way this objective's previews are,
-        and `processor` decodes.
+        and `processor`, or the objective's own when it is None, encodes and
+        decodes.
         """
         samples = self.samples
-        return TextGeneration(self.model, thaw(self._pipeline_weights(state, ema)), processor,
+        return TextGeneration(self.model, thaw(self._pipeline_weights(state, ema)),
+                              self.processor if processor is None else processor,
                               sampling=Sampling() if samples is None else samples.sampling,
                               max_new_tokens=None if samples is None else samples.max_new_tokens)
 

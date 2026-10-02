@@ -628,7 +628,11 @@ def gated_product(activation: GatedActivation) -> Callable[[jax.Array, jax.Array
     was. A `Situ` computes its own product."""
     if isinstance(activation, Situ):
         return activation
-    gates = {'swiglu': nn.silu, 'geglu': functools.partial(nn.gelu, approximate=True), 'geglu_exact': exact_gelu}
+    gates = {
+        "swiglu": nn.silu,
+        "geglu": functools.partial(nn.gelu, approximate=True),
+        "geglu_exact": exact_gelu,
+    }
     if activation not in gates:
         raise ValueError(f"mlp must be 'swiglu', 'geglu', 'geglu_exact' or a Situ, got {activation!r}")
     activate = gates[activation]

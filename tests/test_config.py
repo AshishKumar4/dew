@@ -350,7 +350,7 @@ def test_an_interval_is_steps_a_pass_or_never():
     assert TrainerConfig(eval_every=None).eval_interval(data) is None
 
 
-def test_a_dataset_at_another_batch_than_the_run_is_refused(tmp_path):
+def test_a_dataset_at_another_batch_than_the_run_is_refused(tmp_path, capsys):
     """The batch is one number: the recipes load the data at
     `trainer.batch_size` and `train` refuses a dataset that reads another,
     naming both, instead of training at one batch and reporting the other."""
@@ -363,6 +363,9 @@ def test_a_dataset_at_another_batch_than_the_run_is_refused(tmp_path):
 
     state = run.train(Regression(), Dataset(lambda partition: batches(), None, None, 8), name="batch")
     assert int(state.step) == 1
+    output = capsys.readouterr().out
+    assert "Experiment_Name: batch" in output
+    assert f"Local tracking: {tmp_path / 'runs' / 'batch' / 'tracking'}" in output
 
 
 def test_a_pass_over_the_data_needs_a_record_count():

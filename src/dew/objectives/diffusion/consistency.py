@@ -70,8 +70,14 @@ def rows(value: jax.Array) -> jax.Array:
     return jnp.sum(value, axis=tuple(range(1, value.ndim)))
 
 
-def consistency_loss(student: Callable[[jax.Array, jax.Array], jax.Array], x, t, teacher_F, warmup: float | jax.Array,
-                     scale: float) -> jax.Array:
+def consistency_loss(
+    student: Callable[[jax.Array, jax.Array], jax.Array],
+    x,
+    t,
+    teacher_F,
+    warmup: float | jax.Array,
+    scale: float,
+) -> jax.Array:
     """sCM's per-row loss (`_student_scm_step`), scaled: the student's
     F-derivative along the teacher's ODE by one JVP, with tangents
     (cos t sin t F_teacher, cos t sin t), the tangent
@@ -183,18 +189,35 @@ class ConsistencyDistillationObjective(DiffusionObjective):
     sets for it, rather than the default 16.
     """
 
-    def __init__(self, model: nn.Module, process: Process, inputs: InputSpec, *, teacher: Variables,
-                 consistency_weight: float = 100.0, dmd_weight: float = 1.0, teacher_guidance: float = 1.0,
-                 tangent_warmup: int = 0, student_update_freq: int = 5, max_simulation_steps: int = 4,
-                 student_times: tuple[float, float] = (-0.8, 1.6), critic_times: tuple[float, float] = (0.0, 1.6),
-                 consistency: Literal["continuous", "discrete"] = "continuous", discrete_steps: int = 48,
-                 discrete_skip: int = 1, discrete_shift: float = 5.0, **kwargs):
+    def __init__(
+        self,
+        model: nn.Module,
+        process: Process,
+        inputs: InputSpec,
+        *,
+        teacher: Variables,
+        consistency_weight: float = 100.0,
+        dmd_weight: float = 1.0,
+        teacher_guidance: float = 1.0,
+        tangent_warmup: int = 0,
+        student_update_freq: int = 5,
+        max_simulation_steps: int = 4,
+        student_times: tuple[float, float] = (-0.8, 1.6),
+        critic_times: tuple[float, float] = (0.0, 1.6),
+        consistency: Literal["continuous", "discrete"] = "continuous",
+        discrete_steps: int = 48,
+        discrete_skip: int = 1,
+        discrete_shift: float = 5.0,
+        **kwargs,
+    ):
         schedule = process.schedule
         if not (isinstance(schedule, FlowMatchingScheduler) and schedule.shift == 1.0 and not process.interval
                 and isinstance(process.prediction, FlowMatchPredictionTransform)):
             raise ValueError("rCM distills a velocity model on the unshifted linear path; build the "
                              "process with presets.Flow()")
-        unused = sorted(key for key in ("uncertainty", "alignment", "end_to_end") if kwargs.get(key) is not None)
+        unused = sorted(
+            key for key in ("uncertainty", "alignment", "end_to_end") if kwargs.get(key) is not None
+        )
         if unused:
             raise ValueError(f"rCM trains on its own losses, which read none of {unused}")
         if consistency_weight <= 0 and dmd_weight <= 0:
@@ -342,5 +365,16 @@ class ConsistencyDistillationObjective(DiffusionObjective):
         return distribution_matching_loss(generated, jax.lax.stop_gradient(fake), teacher, self.dmd_weight)
 
 
-__all__ = ["FAKE_SCORE", "TEACHER", "ConsistencyDistillationObjective", "backward_simulation", "consistency_loss",
-           "critic_loss", "discrete_consistency_loss", "distribution_matching_loss", "guided", "trig_prediction", "trig_time"]
+__all__ = [
+    "FAKE_SCORE",
+    "TEACHER",
+    "ConsistencyDistillationObjective",
+    "backward_simulation",
+    "consistency_loss",
+    "critic_loss",
+    "discrete_consistency_loss",
+    "distribution_matching_loss",
+    "guided",
+    "trig_prediction",
+    "trig_time",
+]

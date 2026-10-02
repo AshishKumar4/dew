@@ -124,10 +124,16 @@ class DiscreteProcess:
         """
         return jnp.full(shape, self.mask_id, jnp.int32)
 
-    def denoiser(self, model: nn.Module, params: Variables,
-                 conditions: Mapping[str, Conditioning] | None = None,
-                 unconditional: Mapping[str, Conditioning] | None = None, *,
-                 inputs: ModelInputs | None = None, mutable_mask: jax.Array | None = None) -> DiscreteDenoiser:
+    def denoiser(
+        self,
+        model: nn.Module,
+        params: Variables,
+        conditions: Mapping[str, Conditioning] | None = None,
+        unconditional: Mapping[str, Conditioning] | None = None,
+        *,
+        inputs: ModelInputs | None = None,
+        mutable_mask: jax.Array | None = None,
+    ) -> DiscreteDenoiser:
         if conditions or unconditional is not None:
             raise ValueError("the masked diffusion LM takes no conditions")
         return DiscreteDenoiser(self, model, params, inputs, mutable_mask)
@@ -352,6 +358,10 @@ def _generate(model: nn.Module, variables: Variables, inputs: ModelInputs, keys:
 
 @functools.cache
 def _compiled(rows: jax.sharding.NamedSharding | None):
-    return jax.jit(_generate, static_argnames=("model", "process", "sampler", "budget", "steps", "n", "eos_ids", "pad_id"),
-                   in_shardings=(None, rows, rows), out_shardings=rows)
+    return jax.jit(
+        _generate,
+        static_argnames=("model", "process", "sampler", "budget", "steps", "n", "eos_ids", "pad_id"),
+        in_shardings=(None, rows, rows),
+        out_shardings=rows,
+    )
 

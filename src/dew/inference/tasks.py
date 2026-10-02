@@ -16,6 +16,7 @@ import dataclasses
 import functools
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
+from importlib import import_module
 from typing import TYPE_CHECKING, Protocol
 
 import jax
@@ -88,10 +89,14 @@ def _prepared(processor: Processor | None, request: Request, *, images: Media | 
         text = None
     if text is not None:
         if processor is None:
-            raise ValueError("text requests need a processor; pass ModelInputs or token rows")
+            raise ValueError("text requests need a processor: pass processor= where the task is built, "
+                             "as objective.pipeline(state, processor=source.processor) does, or request "
+                             "ModelInputs or token rows")
         return processor(text, images=images)
     if images is not None:
-        raise ValueError("images travel with text through the processor; prepared rows carry them in ModelInputs")
+        raise ValueError(
+            "images travel with text through the processor; prepared rows carry them in ModelInputs"
+        )
     if isinstance(request, ModelInputs):
         return ModelInputs.from_value(request)
     if isinstance(request, Sequence):
@@ -133,7 +138,9 @@ def _task_inputs(processor: Processor | None, request: Request, *, images: Media
     return held
 
 
-def _decoded(processor: Processor | None, tokens: ArrayLike, lengths: ArrayLike, width: int) -> tuple[str, ...]:
+def _decoded(
+    processor: Processor | None, tokens: ArrayLike, lengths: ArrayLike, width: int
+) -> tuple[str, ...]:
     if processor is None:
         return ()
     rows, counts = np.asarray(tokens), np.asarray(lengths)
@@ -385,7 +392,7 @@ class TextGeneration:
     model: nn.Module
     variables: Variables
     processor: Processor | None = None
-    sampling: Sampling = Sampling()
+    sampling: Sampling = dataclasses.field(default_factory=Sampling)
     max_new_tokens: int | None = None
     max_length: int | None = None
     n: int = 1
@@ -434,12 +441,12 @@ class TextGeneration:
         checkpoint stored. The run's preview budget and sampling policy
         become the task's defaults.
         """
-        import dew.objectives.lm  # registers the saved objective kinds
-        import dew.objectives.rl  # noqa: F401 registers the saved objective kinds
         from dew.objectives.base import thaw
         from dew.registry import objectives
         from dew.sampling.pipelines import restore_variables
 
+        import_module("dew.objectives.lm")  # registers the saved objective kinds
+        import_module("dew.objectives.rl")
         record, model_config, processor = _saved_run(directory, dtype)
         kind = named(record["objective"], "objective")
         budget = _saved_budget(record)
@@ -601,7 +608,7 @@ class MaskedGeneration:
     variables: Variables
     process: DiscreteProcess
     processor: Processor | None = None
-    sampler: Unmask = Unmask()
+    sampler: Unmask = dataclasses.field(default_factory=Unmask)
     steps: int = MDLM_STEPS
     eos_token_ids: tuple[int, ...] = ()
     pad_token_id: int = 0
@@ -634,7 +641,9 @@ class MaskedGeneration:
         budget = _saved_budget(record)
         model = model_config.build()
         if not isinstance(model, CausalTransformer) or model.causal or type(model.mask_token_id) is not int:
-            raise ValueError("a saved masked run requires a CausalTransformer with causal=False and a mask_token_id")
+            raise ValueError(
+                "a saved masked run requires a CausalTransformer with causal=False and a mask_token_id"
+            )
         mask_id = model.mask_token_id
         variables = restore_variables(directory, ema=ema, step=step, mesh=mesh, layout=layout,
                                       param_dtype=param_dtype)

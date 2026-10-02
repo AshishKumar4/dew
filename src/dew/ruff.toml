@@ -1,0 +1,6 @@
+# Library code renders terminal output through the display or emits a log
+# record. Scripts retain print() under the shared rules in pyproject.toml.
+extend = "../../pyproject.toml"
+
+[lint]
+extend-select = ["T20"]

@@ -1,3 +1,4 @@
+import logging
 import os
 import subprocess
 import sys
@@ -38,6 +39,10 @@ def configure_lane(environ: MutableMapping[str, str]) -> None:
     environ.setdefault("JAX_PLATFORMS", "cpu")
     platforms = environ["JAX_PLATFORMS"].split(",")
     flags = [environ.get("XLA_FLAGS", "")]
+    if "--xla_allow_excess_precision" not in flags[0]:
+        # Every rounding the program states, as a run keeps them
+        # (`dew.training.runtime.keep_roundings`).
+        flags.append("--xla_allow_excess_precision=false")
     local = {"cuda": _local_gpus, "tpu": _local_tpus}
     accelerator = next((name for name in platforms if name in local), None)
     if accelerator is None:
@@ -155,6 +160,17 @@ def without_deterministic_ops(monkeypatch):
     kept = [flag for flag in os.environ.get("XLA_FLAGS", "").split()
             if not flag.startswith("--xla_gpu_deterministic_ops")]
     monkeypatch.setenv("XLA_FLAGS", " ".join(kept))
+
+
+@pytest.fixture
+def caplog(caplog):
+    """Capture Dew's isolated logger as well as the application's root logger."""
+    logger = logging.getLogger("dew")
+    logger.addHandler(caplog.handler)
+    try:
+        yield caplog
+    finally:
+        logger.removeHandler(caplog.handler)
 
 
 @pytest.fixture

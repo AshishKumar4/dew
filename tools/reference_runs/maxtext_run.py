@@ -44,7 +44,8 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--schedule-steps", type=int, default=256)
     parser.add_argument("--timing-warmup", type=int, default=10)
     parser.add_argument("--profile-steps", type=int, default=5)
-    parser.add_argument("--attention", default="cudnn_flash_jax")
+    parser.add_argument("--attention", default=None,
+                        help="MaxText's kernel; cudnn_flash_jax on a GPU and its splash kernel, flash, on a TPU")
     parser.add_argument("--remat", default="full")
     parser.add_argument("--lr-peak", type=float, default=2e-5)
     parser.add_argument("--b1", type=float, default=0.9)
@@ -60,17 +61,18 @@ def maxtext_argv(args: argparse.Namespace, workdir: Path) -> list[str]:
     import maxtext
 
     devices = jax.device_count()
+    gpu = jax.default_backend() == "gpu"
     if args.batch % devices:
         raise ValueError(f"batch {args.batch} does not split over {devices} devices")
     base = Path(maxtext.__file__).parent / "configs" / "base.yml"
     settings = {
-        "model_name": args.model_name, "hardware": "gpu", "skip_jax_distributed_system": True,
+        "model_name": args.model_name, "hardware": "gpu" if gpu else "tpu", "skip_jax_distributed_system": True,
         "run_name": "reference", "base_output_directory": str(workdir),
         "metrics_file": str(workdir / "metrics.jsonl"), "enable_tensorboard": False,
         "enable_checkpointing": False, "dataset_type": "synthetic",
         "per_device_batch_size": args.batch // devices, "max_target_length": args.seq,
         "steps": args.steps, "learning_rate_schedule_steps": args.schedule_steps,
-        "attention": args.attention, "remat_policy": args.remat,
+        "attention": args.attention or ("cudnn_flash_jax" if gpu else "flash"), "remat_policy": args.remat,
         "dtype": "bfloat16", "weight_dtype": "float32",
         "ici_data_parallelism": devices if args.mesh == "data" else 1,
         "ici_fsdp_parallelism": devices if args.mesh == "fsdp" else 1,
