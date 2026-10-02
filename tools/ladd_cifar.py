@@ -91,7 +91,7 @@ def train(task, steps, lr, log_every=0, head_lr=None, seed=0, rows_per_step=128,
     def save(done):
         if store is None:
             return
-        store.save(done, state, None, artifact=task.inference_record)
+        store.save(done, state, None, artifact=task.inference_record())
         store.wait()
         with open(f"{checkpoints}/sampler_{done}.json", "w") as handle:
             json.dump(rng.bit_generator.state, handle)
