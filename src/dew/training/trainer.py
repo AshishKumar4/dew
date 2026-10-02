@@ -1361,8 +1361,7 @@ class Trainer(Generic[Loss, Effects]):
         receives them; scalar reporting never triggers preview work.
         """
         selection, stop = self._fit_policies(best, stop, metrics, validation, checkpoint_every, restore_best)
-        if stop is None or not isinstance(stop.metric, TrainingScalar):
-            self._check_validation_is_read(eval_every, metrics, preview=preview)
+        self._preflight(dataset, stop, eval_every, metrics, preview=preview)
         preview = preview and self.tracker is not None
         run = _FitRun(time.perf_counter())
         # A display of this fit's own: one before it may have run other steps.
@@ -1373,11 +1372,6 @@ class Trainer(Generic[Loss, Effects]):
         # scopes share whichever profiler owns the capture.
         tracer = profiler if profiler is not None else telemetry_profile.active_profile()
         try:
-            if self.mesh.stage > 1:
-                # Before the state is placed; every other mesh's batch is
-                # checked with its stream (`_check_stream`), a ramp's at each
-                # of its stages.
-                self._check_batch(dataset.batch, self.device_mesh)
             plan = _FitPlan(dataset, steps, log_every, eval_every, checkpoint_every,
                             None if checkpoints is None else checkpoints.local_every, metrics, preview,
                             best=selection, stop=stop, validation_splits=validation, restore_best=restore_best,
@@ -1786,6 +1780,18 @@ class Trainer(Generic[Loss, Effects]):
                                           loss=loss, reader=reader, split=split, training=reports))
         return dataclasses.replace(evaluations[0], scores={name: value for report in evaluations for name, value in report.scores.items()},
                                    elapsed_seconds=sum(report.elapsed_seconds for report in evaluations))
+
+    def _preflight(self, dataset: Dataset, stop, eval_every: int | None, metrics: Sequence[Metric], *,
+                   preview: bool) -> None:
+        """The refusals `fit` makes before it places anything: validation
+        nothing reads, and a pipeline's batch, whose placement could take
+        minutes or run out of memory before the error. Every other mesh's
+        batch is checked with its stream (`_check_stream`), a ramp's at each
+        of its stages."""
+        if stop is None or not isinstance(stop.metric, TrainingScalar):
+            self._check_validation_is_read(eval_every, metrics, preview=preview)
+        if self.mesh.stage > 1:
+            self._check_batch(dataset.batch, self.device_mesh)
 
     def _check_validation_is_read(self, eval_every: int | None,
                                   metrics: Sequence[Metric], *, preview: bool) -> None:
