@@ -924,10 +924,53 @@ def test_saved_bare_encoder_weights_follow_storage_without_changing_compute(tmp_
 
 
 
-def test_restored_bf16_clip_blank_and_samples_are_the_objectives_bits(tmp_path):
+@pytest.mark.parametrize("precision", ["highest", None])
+def test_restored_bf16_clip_blank_and_samples_are_the_objectives_bits(tmp_path, precision):
     """The checkpoint's task and the objective's pipeline encode the empty
     CLIP prompt with the same eager arithmetic, not a fused one-row JIT.
     Keep the denoiser float32 and CLIP bf16, as the published hybrid DiT is.
+    The construction precision travels with the artifact, not the caller's
+    context at restore.
+    """
+    from pathlib import Path
+
+    config = dataclasses.replace(
+        run_config(tmp_path, preset=Flow()),
+        text=TextCondition(encoder="clip_text", checkpoint=str(Path(__file__).parent / "fixtures/clip/tiny"),
+                           dtype="bfloat16"),
+        guidance=CFG(5.0), ema_decay=None)
+    with jax.default_matmul_precision(precision):
+        objective = config.build()
+    trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.key(0))
+    state = trainer.initial_state()
+    batch = {"image": np.full((jax.device_count(), RES, RES, 3), 180, np.uint8),
+             **objective.inputs.tokenize(["a bird"] * jax.device_count())}
+    state, *_ = trainer.compile(state, batch)(state, batch)
+    checkpoints = Checkpoints(str(tmp_path))
+    artifact = objective.inference_record()
+    assert artifact["condition_precision"] == precision
+    checkpoints.save(1, state, None, artifact=artifact)
+    checkpoints.wait()
+    original = objective.pipeline(state, ema=False)
+    with jax.default_matmul_precision("default" if precision == "highest" else "highest"):
+        restored = TextToImage.from_run(str(tmp_path), ema=False)
+
+    prepared = original.prepare(["a bird", "a cat"], key=0, steps=8)
+    assert restored.blank is not None
+    assert restored.blank.precision == precision
+    want = objective.blank_conditions(prepared.conditions)
+    got = restored.blank(prepared.conditions)
+    for actual, expected in zip(jax.tree.leaves(got), jax.tree.leaves(want), strict=True):
+        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+    np.testing.assert_array_equal(restored(["a bird", "a cat"], steps=8, key=0).host().images,
+                                  original(["a bird", "a cat"], steps=8, key=0).host().images)
+
+
+def test_binding_new_encoder_weights_recomputes_the_warmed_blank(tmp_path):
+    """A restored task warms both branches, then binds a new encoder tree.
+    Its conditional and unconditional features and samples match a fresh
+    task over those weights, not the old cached unconditional features.
+    Binding only a denoiser update preserves the cache.
     """
     from pathlib import Path
 
@@ -945,14 +988,29 @@ def test_restored_bf16_clip_blank_and_samples_are_the_objectives_bits(tmp_path):
     checkpoints = Checkpoints(str(tmp_path))
     checkpoints.save(1, state, None, artifact=objective.inference_record())
     checkpoints.wait()
-    original = objective.pipeline(state, ema=False)
     restored = TextToImage.from_run(str(tmp_path), ema=False)
-
-    prepared = original.prepare(["a bird", "a cat"], key=0, steps=8)
+    prompts = ["a bird", "a cat"]
+    old = restored.prepare(prompts, key=0, steps=8)
     assert restored.blank is not None
-    want = objective.blank_conditions(prepared.conditions)
-    got = restored.blank(prepared.conditions)
-    for actual, expected in zip(jax.tree.leaves(got), jax.tree.leaves(want), strict=True):
+    old_blank = restored.blank(old.conditions)
+
+    denoiser_update = {**restored.params, "params": jax.tree.map(lambda value: value + 0.03125,
+                                                               restored.params["params"])}
+    assert restored.bind(denoiser_update).blank is restored.blank
+    encoders = jax.tree.map(lambda value: value + 0.03125, restored.params["encoders"])
+    changed = {**restored.params, "encoders": encoders}
+    rebound = restored.bind(changed)
+    fresh_objective = config.build(variables=changed)
+    fresh = TextToImage.from_objective(fresh_objective, changed)
+    bound_inputs = rebound.prepare(prompts, key=0, steps=8)
+    fresh_inputs = fresh.prepare(prompts, key=0, steps=8)
+    assert rebound.blank is not None and fresh.blank is not None
+    new_blank = rebound.blank(bound_inputs.conditions)
+    expected_blank = fresh.blank(fresh_inputs.conditions)
+    assert any(not np.array_equal(np.asarray(left), np.asarray(right))
+               for left, right in zip(jax.tree.leaves(old_blank), jax.tree.leaves(new_blank), strict=True))
+    for actual, expected in zip(jax.tree.leaves((bound_inputs.conditions, new_blank)),
+                                jax.tree.leaves((fresh_inputs.conditions, expected_blank)), strict=True):
         np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
-    np.testing.assert_array_equal(restored(["a bird", "a cat"], steps=8, key=0).host().images,
-                                  original(["a bird", "a cat"], steps=8, key=0).host().images)
+    np.testing.assert_array_equal(rebound(prompts, steps=8, key=0).host().images,
+                                  fresh(prompts, steps=8, key=0).host().images)
