@@ -10,8 +10,9 @@ builds a model whose variables a forward pass takes straight away, and
 
 Each family is one `DecoderFamily` entry in `decoder_families.ENTRIES`, keyed by its
 model_type: the config translation, the tensor path rule and the export
-vocabulary. `family_entries()` loads that table on first use; read it for the
-covered families rather than a copy here.
+vocabulary. Its `Renames` and `Packed` entries are read one way on load and
+the other on export. `family_entries()` loads that table on first use; read
+it for the covered families rather than a copy here.
 
 A multimodal wrapper config raises a ValueError naming its model_type.
 DeepSeek's released checkpoints carry `num_nextn_predict_layers: 1` with no
@@ -1702,19 +1703,14 @@ def translate_weights(
 ) -> Variables:
     """Map HF tensors into a CausalTransformer tree. Parameters default to FP32.
 
-    Linear weights arrive as [out, in] and nn.Dense keeps [in, out], so every
-    `.kernel` is transposed; norm `.weight` becomes `.scale`; Gemma's
-    post_attention_layernorm and post_feedforward_layernorm land on the
-    sandwich norms, where Gemma applies them.
+    Each tensor goes through its family's `prepare_weights` and `weight_path`;
+    a 2-D kernel is transposed from torch's [out, in] to Dense's [in, out],
+    and per-expert tensors stack onto an expert axis.
 
     A tied checkpoint carries lm_head.weight as well, as a copy of the
     embedding (Qwen3-0.6B does). The copy is checked and dropped. The tree has
     one leaf for the two, and a checkpoint whose "tied" head is a different
     matrix would otherwise load as a model that computes something else.
-    DeepSeek's routed experts arrive one tensor per expert and stack onto
-    an expert dimension here; its dense shared experts, MLA projections
-    and indexer map by pattern like everything else, and its routers'
-    balancing bias lands in the `moe` collection beside `params`.
     param_dtype changes floating parameter storage, independently of compute
     dtype. Router and frozen state remain FP32; integer indices retain their
     native dtype. Conversion happens per leaf before its layout copy.
