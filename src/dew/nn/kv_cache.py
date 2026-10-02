@@ -400,11 +400,17 @@ def _gather_pages(pool: jax.Array, table: jax.Array, groups: int) -> jax.Array:
 @jax.custom_vjp
 def _gpu_paged(query: jax.Array, key: jax.Array, value: jax.Array,
                table: jax.Array, lengths: jax.Array) -> jax.Array:
+    # Private JAX API, pinned by jax<0.11.3. Moving it breaks
+    # test_native_gpu_paged_value_and_vjp_keep_the_gathered_attention.
     from jax._src.cudnn.fused_attention_stablehlo import MaskType, paged_attention
 
     rows = query.shape[0]
+    # The old gather pads q=1 to q=2 for cuDNN's odd-query backward restriction
+    # and passes query lengths of 2. Keep that forward tiling/rounding; discard
+    # the added query's output, rather than changing the accepted greedy tokens.
     padded = jnp.pad(query[:, None], ((0, 0), (0, 1), (0, 0), (0, 0)))
     pages = table[:, None, :, None]
+    # Inactive rows read one slot to keep the unused output finite; nobody reads it.
     out = paged_attention(
         padded, jnp.moveaxis(key, 0, 2), jnp.moveaxis(value, 0, 2),
         jnp.full(rows, 2, jnp.int32), jnp.maximum(lengths, 1), pages, pages,
