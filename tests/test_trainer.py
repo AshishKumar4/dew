@@ -2102,19 +2102,28 @@ def test_a_step_compiles_from_its_arrays_shapes_before_they_are_placed():
     assert int(advanced.step) == 1 and bool(finite)
 
 
-@pytest.mark.parametrize("generation, flags, expected", [
-    ("sm89", "", {"xla_gpu_dot_merger_threshold_mb": 0, "xla_gpu_enable_triton_gemm": False}),
-    ("sm86", "", {"xla_gpu_dot_merger_threshold_mb": 0}),
-    ("sm89", "--xla_gpu_dot_merger_threshold_mb=64 --xla_gpu_enable_triton_gemm=true", None),
-    ("v6e", "", None),
-    ("cpu", "", None),
+APART = {"xla_gpu_dot_merger_threshold_mb": 0}
+
+
+@pytest.mark.parametrize("generation, flags, rows, frozen, expected", [
+    ("sm89", "", 1, False, {**APART, "xla_gpu_enable_triton_gemm": False}),
+    ("sm86", "", 1, False, APART),
+    ("sm86", "", 32, True, None),
+    ("sm89", "", 32, True, {"xla_gpu_enable_triton_gemm": False}),
+    ("sm86", "", 33, True, APART),
+    ("sm86", "", 256, False, APART),
+    ("sm89", "--xla_gpu_dot_merger_threshold_mb=64 --xla_gpu_enable_triton_gemm=true", 1, False, None),
+    ("v6e", "", 1, False, None),
+    ("cpu", "", 1, True, None),
 ])
-def test_a_gpu_training_step_compiles_its_dots_apart(monkeypatch, generation, flags, expected):
+def test_a_gpu_training_step_compiles_its_dots_apart(monkeypatch, generation, flags, rows, frozen, expected):
     """A GPU training step runs dots that share an input apart, where XLA's
-    merger would concatenate their weights every step, and the Triton GEMM
-    fusions go off on the generations measured faster without them; a flag
-    the run named stands. The options are the step's own, so a process that
-    also serves keeps the merger there."""
+    merger would concatenate their weights every step, except a step beside
+    frozen weights on 128 tokens or fewer a device (here 32 rows of 4), which
+    keeps the merger as decoding does; the Triton GEMM fusions go off on the
+    generations measured faster without them; a flag the run named stands.
+    The options are the step's own, so a process that also serves keeps the
+    merger there."""
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import LMObjective
     from dew.training import trainer as trainer_module
@@ -2123,7 +2132,28 @@ def test_a_gpu_training_step_compiles_its_dots_apart(monkeypatch, generation, fl
     monkeypatch.setenv("XLA_FLAGS", flags)
     model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=1,
                               mlp_features=16, max_seq_len=8)
-    assert trainer_module.step_compiler_options(LMObjective(model, seq_len=4)) == expected
+    objective = LMObjective(model, seq_len=4)
+    assert trainer_module.step_compiler_options(objective, rows, frozen) == expected
+
+
+def test_a_frozen_step_tells_the_options_its_rows_and_split(monkeypatch):
+    """The trainer hands the options the rows one device steps and whether
+    the state holds frozen weights, as a LoRA objective's does."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.lm import LMObjective
+    from dew.training import trainer as trainer_module
+
+    seen = []
+    monkeypatch.setattr(trainer_module, 'step_compiler_options',
+                        lambda objective, rows, frozen: seen.append((rows, frozen)))
+    model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=1,
+                              mlp_features=16, max_seq_len=8)
+    for trainable, frozen in ((None, False), (lambda path: path[-2:] == ("q_proj", "kernel"), True)):
+        trainer = Trainer(LMObjective(model, seq_len=4, trainable=trainable), optax.sgd(1e-3),
+                          key=jax.random.key(0), checkpoints=None, tracker=None)
+        state, _, _ = trainer.place()
+        trainer.compile(state, {"text": jax.ShapeDtypeStruct((8, 5), jnp.int32)})
+        assert seen[-1] == (8 // len(jax.devices()), frozen)
 
 
 def test_the_step_runs_the_program_it_compiled(monkeypatch, tmp_path):
@@ -2135,7 +2165,7 @@ def test_the_step_runs_the_program_it_compiled(monkeypatch, tmp_path):
     from dew.training import trainer as trainer_module
 
     monkeypatch.setattr(trainer_module, 'step_compiler_options',
-                        lambda objective: {'xla_embed_ir_in_executable': False})
+                        lambda objective, rows, frozen: {'xla_embed_ir_in_executable': False})
     trainer, _, _ = held_lm_trainer()
     state, _, _ = trainer.place()
     batch = {"text": jnp.zeros((8, 5), jnp.int32)}
