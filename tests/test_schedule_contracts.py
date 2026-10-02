@@ -46,6 +46,20 @@ def test_generalized_weight_is_the_fp64_edm_lambda_with_two_fp32_roundings():
     np.testing.assert_allclose(schedule.weight(times), reference, rtol=2 * np.finfo(np.float32).eps, atol=0)
 
 
+def test_model_time_has_the_noise_schedulers_offset_and_log_scale():
+    schedule = LinearSigma(sigma_min=0, sigma_max=1)
+    times = np.float64([0., .5, 1.])
+    # The supplied times are dyadic and produce exact stored fp32 sigmas.
+    # The offset addition and logarithm round in the production fp32
+    # expression; division by four is exact binary scaling. The reference
+    # takes that first stored sum into fp64 before its logarithm.
+    sigma = np.float64([0., .5, 1.])
+    stored = np.asarray(sigma + 1e-10, np.float32).astype(np.float64)
+    expected = np.log(stored) / 4
+    np.testing.assert_allclose(schedule.model_time(times), expected,
+                               rtol=2 * np.finfo(np.float32).eps, atol=0)
+
+
 def test_generalized_training_times_are_the_unit_domains_exact_uniform_draws():
     with jax.enable_x64():
         key, count = jax.random.key(7), 8
