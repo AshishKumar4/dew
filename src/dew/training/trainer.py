@@ -191,13 +191,8 @@ def fresh_book(loss: jax.Array) -> Book:
 
 @jax.jit
 def bookkeep(book: Book, loss: jax.Array, finite: jax.Array) -> Book:
-    """Advance the loop's counters for one step, in one dispatch.
-
-    The same work as five eager ops, the cast, the add, the where, the add
-    and the maximum, each dispatching an executable of its own. Those cost
-    176 us a step on an i9-12900K against 37 us for this one call, measured
-    over 2000 steps on the CPU backend with the result blocked on at the end.
-    """
+    """Advance the loop's counters for one step, in one dispatch instead of
+    five eager ops' (176 against 37 us a step on a CPU)."""
     interval_loss, bad_run, worst_bad_run = book
     bad_run = jnp.where(finite, 0, bad_run + 1)
     dtype = jnp.promote_types(loss.dtype, jnp.float32)
@@ -266,12 +261,8 @@ def fitting_default(program: jax.stages.Lowered, executable: jax.stages.Compiled
     """Fall back to the step compiled under XLA's default options where it
     fits and the one compiled under `step_compiler_options` does not.
     Returns the step to run and whether it fits; `held` is `step_fits`'s.
-
-    The Triton GEMM fusions can hold fewer temporaries: on an RTX 4080
-    (sm89, jax 0.11.2), Qwen3-0.6B's widths at 2 layers and 8 x 1024 tokens
-    keep their whole logits in 13.1 GiB with them, inside the 13.24 GiB of an
-    0.85 pool, while without them the step does not fit and tiles its head.
-    So the fusions come back before the ladder's first rung."""
+    The Triton GEMM fusions can hold fewer temporaries, so they come back
+    before the ladder's first rung."""
     default = program.compile()
     if not step_fits(default, mesh, held):
         return executable, False
@@ -372,13 +363,9 @@ def _remat_of(model: nn.Module | None) -> RematPolicy | bool | str | None:
 
 
 # What a model recomputes in its backward pass when its step does not fit,
-# weakest first. Each rung is slower and holds less: on an NVIDIA L4 (24 GB,
-# jax 0.11.2, bf16) the 359.8M-parameter decoder at 4 x 1024 tokens took
-# 334.7, 356.4 and 401.3 ms at 9.93, 8.00 and 6.29 GiB, and at 16 x 1024
-# only 'full' fits; DiT-L/2 on 64x64 inputs at 16 fits only under 'full'
-# (docs/performance.md). A model's own remat is where it starts: the
-# trainer moves it up one rung at a time until the compiled step fits the
-# devices, and never past a policy the ladder does not name.
+# weakest first; each rung is slower and holds less (docs/performance.md).
+# A model's own remat is where it starts: the trainer moves it up one rung at
+# a time until the compiled step fits, never past a policy the ladder names.
 DECODER_REMAT = (None, REMAT_POLICIES['minimal'], REMAT_POLICIES['full'])
 DIFFUSION_REMAT = (False, 'dots', 'full')
 
@@ -392,11 +379,8 @@ def step_headroom(executable: jax.stages.Compiled, devices: Sequence, held: int 
     the outputs that alias them.
 
     XLA's GPU step takes all its temporaries in one allocation, so it needs
-    one free block that large, not that many free bytes: on an A100 the
-    'minimal' rung of a Qwen3-1.7B fine-tune ran out of memory placing its
-    11.68 GiB of temporaries with 16.3 GiB free, split 5.9 GiB below the
-    state and 10.4 GiB above it. `placeable` reads the block from the
-    allocator. Where it `strands_temporaries`, they need room twice."""
+    one free block that large, not that many free bytes (`placeable`). Where
+    the allocator `strands_temporaries`, they need room twice."""
     stats = executable.memory_analysis()
     memory = [device.memory_stats() or {} for device in devices]
     if stats is None or not all('bytes_limit' in m and 'bytes_in_use' in m for m in memory):
@@ -439,22 +423,13 @@ def strands_temporaries(platform: str, memory: Mapping[str, int]) -> bool:
     `memory`, can leave a step's temporaries no block to return to, so that
     the next step needs a second block as large.
 
-    XLA's spatially partitioned BFC pool can: a preallocated pool with
-    --xla_gpu_enable_allocator_spatial_partitioning left on, its default.
-    There a free block below a buffer serves every small allocation before
-    the open space past it. A batch prefetched while the temporaries are
-    placed lands past them; once they are freed the next step's outputs take
-    a few bytes of their block. On an RTX 4080 a step with 6.5 GiB of
-    temporaries and 3.9 GiB more of its pool to spare failed so in 5 of 16
-    runs. With the partitioning off, which `prepare_process` sets, the
-    smallest block that fits serves them instead: 4 of 4 runs placed a batch
-    past the temporaries 20 to 45 times each and finished.
-
-    cuda_async can too, and reports neither its blocks nor its pool: the
-    8192-token step there, 10.3 GiB of temporaries with 10.45 GiB free,
-    failed in 1 of 8 runs at a 0.85 pool, 1 of 8 at 0.87 and 1 of 16 at 0.91.
-    At the failure its pool held 14.2 GB with 3.0 GB in use, the device had
-    1.9 GB free, and neither gave the 11.1 GB the step asked for again."""
+    XLA's spatially partitioned BFC pool can (a preallocated pool with
+    --xla_gpu_enable_allocator_spatial_partitioning left on, its default):
+    a free block below a buffer serves every small allocation before the
+    open space past it, so a batch prefetched past the temporaries lets the
+    next step's outputs take a few bytes of their block. `prepare_process`
+    turns the partitioning off. cuda_async can too, inside a pool it does not
+    report."""
     if 'pool_bytes' not in memory:
         return platform == 'gpu'
     partitioning = xla_flag('xla_gpu_enable_allocator_spatial_partitioning') or 'true'
@@ -1022,10 +997,8 @@ class Trainer(Generic[Loss, Effects]):
         it is above where the objective stands, never below it.
 
         The fit check reads the free memory its own process finds, and one
-        that restores a state finds other memory than the one that built it:
-        on an A100 a Qwen3-1.7B run trained under remat 'full', and its
-        resumed process took 'minimal', ran another program and parted from
-        the uninterrupted run at step 70. So the resumed run compiles the
+        that restores a state can find more than the one that built it and
+        pick a lighter rung, another program. So the resumed run compiles the
         rung its checkpoint trained on, and climbs further only where that
         does not fit."""
         if rung is None:
@@ -1044,16 +1017,12 @@ class Trainer(Generic[Loss, Effects]):
         (`Objective.held_variables`), for the state's JIT to take over, the
         rest replicated.
 
-        Handed to the JIT as they are, a loaded checkpoint's arrays were placed
-        below the state it built and freed once it was: a hole as large as the
-        checkpoint under the state, 5.9 GiB on an A100 for Qwen3-1.7B, whose
-        'minimal' rung then found no free block for its temporaries
+        Handed to the JIT as they are, the arrays land below the state it
+        builds and leave a hole the checkpoint's size once freed, which splits
+        the free memory a step's temporaries need in one block
         (`step_headroom`). Placed where the state keeps them and donated, they
-        become the state's buffers, of the variable or of an optimizer moment
-        laid out like it. The copy leaves the objective's own arrays alone: a
-        checkpoint loaded to the host (`load_pretrained`) leaves no hole, while
-        arrays the objective already holds on the devices stay wherever they
-        were placed for as long as it holds them."""
+        become the state's buffers. The copy leaves the objective's own
+        arrays alone."""
         variables = {path: (sharding, leaf.shape) for (path, leaf), sharding in zip(
             jax.tree_util.tree_leaves_with_path(abstract.params), jax.tree.leaves(shardings.params),
             strict=True)}
