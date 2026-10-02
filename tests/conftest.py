@@ -1,6 +1,7 @@
 import logging
 import os
 
+import lane_environment as lane_environment  # configures the backend before JAX reads the environment
 import jax
 import jax.numpy as jnp
 import pytest
