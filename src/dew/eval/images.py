@@ -21,7 +21,7 @@ import numpy as np
 from jax.typing import ArrayLike
 
 from dew.artifacts import ImageGrid, uint8_pixels
-from dew.objectives.base import Batch, Shown
+from dew.objectives.base import Batch
 from dew.registry import metrics
 
 from .common import ImageMetric, metric_device
@@ -129,13 +129,12 @@ class CLIPDistance(ImageMetric):
         def measure(artifact, batch):
             return 1.0 - _artifact_cosine(artifact, batch, field, modelname)
 
-        super().__init__(name="clip_similarity", measure=measure)
+        super().__init__(name="clip_similarity", measure=measure, better="lower")
 
 
 @metrics("clip_score")
 class CLIPScore(ImageMetric):
     """Mean CLIPScore of the sampled images and the validation batch's prompts."""
-    shown = Shown(better='higher')
 
     def __init__(self, modelname: str = DEFAULT_MODEL, field: str = 'text'):
         def measure(artifact, batch):
