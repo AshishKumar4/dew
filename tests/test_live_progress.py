@@ -52,6 +52,23 @@ def test_reporting_samples_the_same_bits_and_reports_each_step(progress, pipe, m
     assert reports == [{"step": k, "steps": steps} for k in range(1, steps)] + [{"stage": "decode"}]
 
 
+def test_models_keep_different_revisions_and_reuse_each_snapshot(progress, monkeypatch):
+    reports = []
+    monkeypatch.setattr(progress, "_show", lambda report, png=None: reports.append(report))
+
+    def load(name, *, revision=None):
+        return np.array([1 if revision == "first" else 2], np.float32)
+
+    models = progress.ReportingModels(load, np.asarray)
+    first = models("image-model", revision="first")
+    second = models("image-model", revision="second")
+    assert first is models("image-model", revision="first")
+    assert second is models("image-model", revision="second")
+    np.testing.assert_array_equal(first, [1])
+    np.testing.assert_array_equal(second, [2])
+    assert reports == [{"stage": "load", "model": "image-model"}] * 2
+
+
 def test_a_text_model_reports_its_load_once_and_each_generation(progress, monkeypatch):
     """The page's text cell asks `text_model` for a model on every run; the
     kernel loads it once, and says so, and reports each generation, the first
