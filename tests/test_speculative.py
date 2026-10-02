@@ -8,6 +8,8 @@ emit exactly the greedy walk, which it can only do if the state it replays
 after a rejection is the state the accepted prefix would have left.
 """
 
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -267,7 +269,7 @@ def test_a_rejected_prefix_leaves_the_prediction_cache_teacher_forced():
                             method=model.mtp_step)[0]
 
     state, _ = _prefill(model, params, ModelInputs(prompt), ops)
-    state, _, _ = reseed(
+    state, _ = reseed(
         ops, state, (state.hidden,), ahead[:, prompt.shape[1]:width],
         model.apply(params, emitted, method=model.token_embeddings),
         jnp.ones((2, 2), bool),
@@ -289,6 +291,16 @@ def test_a_rejected_prefix_leaves_the_prediction_cache_teacher_forced():
 
 def params_of(model, prompt):
     return model.init(jax.random.key(0), prompt)
+
+
+def recording(ops, produced):
+    """`ops` whose prediction depths append each hidden state they produce to `produced`."""
+    def propose(*arguments):
+        state, logits, out = ops.propose(*arguments)
+        produced.append(out)
+        return state, logits, out
+
+    return dataclasses.replace(ops, propose=propose)
 
 
 def test_a_model_without_a_drafter_is_refused():
@@ -383,8 +395,9 @@ def test_a_second_prediction_depth_is_seeded_the_way_the_model_trains_it():
 
     ops = _operations(model, params, 0, 2)
     empty, _ = _prefill(model, params, ModelInputs(prompt[:, :1]), ops)
-    _, produced, _ = reseed(
-        ops, empty, (states[:, 0], None), states[:, 1:],
+    produced = []
+    reseed(
+        recording(ops, produced), empty, (states[:, 0], None), states[:, 1:],
         model.apply(params, prompt[:, 1:], method=model.token_embeddings),
         jnp.ones((2, width - 1), bool),
         jnp.broadcast_to(jnp.arange(1, width)[None, :], (2, width - 1)),
@@ -452,11 +465,11 @@ def test_a_draft_after_an_advance_is_proposed_at_the_advanced_coordinate():
     step = step.commit(grown[:, 3], jnp.ones(1, bool))
     base = _coordinates(advanced, step, jnp.arange(2)[None, :])
     # The block that emitted token four writes its own entry behind the draft.
-    advanced, _, _ = reseed(ops, advanced, (prompted.hidden,), states[:, 3:4],
-                            jnp.asarray(model.apply(params, grown[:, 3:4],
-                                                    method=model.token_embeddings)),
-                            jnp.ones((1, 1), bool), coordinates[:, 3:4], jnp.zeros(1, jnp.int32),
-                            prior_tokens=jnp.full(1, 3, jnp.int32))
+    advanced, _ = reseed(ops, advanced, (prompted.hidden,), states[:, 3:4],
+                         jnp.asarray(model.apply(params, grown[:, 3:4],
+                                                 method=model.token_embeddings)),
+                         jnp.ones((1, 1), bool), coordinates[:, 3:4], jnp.zeros(1, jnp.int32),
+                         prior_tokens=jnp.full(1, 3, jnp.int32))
     assert ops.propose is not None
     _, proposed, _ = ops.propose(advanced, states[:, 3:4], grown[:, 4:5], None,
                                  jnp.ones((1, 1), bool), base[:, :1], 0, "ordinary")
@@ -631,11 +644,11 @@ def test_a_cold_prompt_holds_its_second_depth_back_until_it_has_a_predecessor():
 
     ops = _operations(model, params, 0, 2)
     state, _ = _prefill(model, params, ModelInputs(cold), ops)
-    _, produced, _ = reseed(ops, state, (state.hidden,) + state.drafts,
-                            states[:, 1:], model.apply(params, emitted,
-                                                       method=model.token_embeddings),
-                            jnp.ones((1, 2), bool), jnp.asarray([[1, 2]], jnp.int32),
-                            jnp.ones(1, jnp.int32), prior_tokens=jnp.ones(1, jnp.int32))
+    produced = []
+    reseed(recording(ops, produced), state, (state.hidden,) + state.drafts,
+           states[:, 1:], model.apply(params, emitted, method=model.token_embeddings),
+           jnp.ones((1, 2), bool), jnp.asarray([[1, 2]], jnp.int32),
+           jnp.ones(1, jnp.int32), prior_tokens=jnp.ones(1, jnp.int32))
     # Depth two's only entry is at coordinate two, and it is the trained one.
     largest = float(np.max(np.abs(np.asarray(produced[1])[:, 1] - np.asarray(trained[1])[:, -1])))
     assert largest < 3e-5, f"largest difference {largest:g}"
@@ -665,7 +678,7 @@ def test_prediction_depths_resume_from_real_history_not_rotary_coordinates(prefi
     state, _ = _prefill(model, params,
                          ModelInputs(whole[:, :prefix], {"positions": positions[:, :prefix]}), ops)
     emitted = whole[:, prefix:-1]
-    state, _, carried = reseed(
+    state, carried = reseed(
         ops, state, (state.hidden,) + state.drafts, hidden[:, prefix:-1],
         ops.embed(emitted), jnp.ones(emitted.shape, bool), positions[:, prefix:-1],
         jnp.asarray([emitted.shape[1] - 1], jnp.int32),
@@ -709,7 +722,7 @@ def test_prediction_index_reuse_reseeds_each_rows_accepted_history():
     replayed, _, seen = ops.verify(replace(drafted, cache=saved), emitted, keep)
     assert seen is not None
     positions = jnp.asarray([[4, 5], [2, 3]])
-    corrected, _, _ = reseed(
+    corrected, _ = reseed(
         ops, replayed, (seeded.hidden,), seen, ops.embed(emitted), keep, positions,
         jnp.asarray([1, 0]), prior_tokens=jnp.asarray([4, 2]))
     whole = jnp.concatenate([prompt, emitted], axis=1)
