@@ -72,6 +72,7 @@ from jax.typing import ArrayLike
 from dew.inference.pages import Pages
 from dew.inference.tasks import Processor, TextGeneration, _bucket, _ceiling, _decoded, _prepared, _sized
 from dew.interop.streaming import SourceLeaf
+from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import GatedMLP
 from dew.nn.backbones.layer_plan import group_layers
 from dew.nn.inputs import ModelInputs, host_token_rows, mesh_of, request_key
@@ -194,7 +195,13 @@ def _pack_projections(
 
 
 def _inference_projections(model: nn.Module, variables: Variables) -> Variables:
-    """Pack constant projections; adapted models retain the paths their LoRA branches bind."""
+    """Pack an autoregressive decoder's constant projections during placement.
+
+    Other task kinds retain their own parameter layouts; adapted decoders
+    retain the original projection paths their LoRA branches bind.
+    """
+    if not isinstance(model, CausalTransformer) or not model.causal:
+        return variables
     return _pack_projections(variables, _projection_groups(model, variables))
 
 

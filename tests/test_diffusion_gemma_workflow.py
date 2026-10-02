@@ -50,6 +50,20 @@ def test_public_generation_override_keeps_canvas_semantics():
         np.testing.assert_array_equal(result.decoder_steps, reference["stopped_steps"])
 
 
+def test_public_pipeline_preserves_the_block_model_layout_and_generation():
+    import dew
+
+    bundle = Pretrained.load(str(FIXTURE), dtype="float32", param_dtype="bfloat16")
+    source = dew.pipeline(str(FIXTURE), dtype="float32", param_dtype="bfloat16")
+    for expected, actual in zip(jax.tree.leaves(bundle.variables), jax.tree.leaves(source.variables),
+                                strict=True):
+        np.testing.assert_array_equal(actual, expected)
+    expected = bundle.block_generation()([[1, 5, 7]], 3, key=4).host()
+    actual = source([[1, 5, 7]], 3, key=4).host()
+    np.testing.assert_array_equal(actual.tokens, expected.tokens)
+    np.testing.assert_array_equal(actual.decoder_steps, expected.decoder_steps)
+
+
 def test_public_pipeline_source_storage_and_saved_block_compute_are_independent(tmp_path):
     import json
 
