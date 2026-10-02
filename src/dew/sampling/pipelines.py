@@ -208,6 +208,11 @@ class TextToImage:
         policy. With `mesh` the weights restore straight onto that mesh under
         `layout`, the way the trainer places them; without one the default
         mesh uses the current pool.
+        The configured unconditional prompt uses the same eager encoding as
+        an objective's pipeline, at the matmul precision in force here. A
+        training objective captures that default at its construction; when
+        it was built under a different `jax.default_matmul_precision`
+        context, restore under the same context to preserve its blank's bits.
         dtype overrides computation in the model, encoders and VAE. param_dtype
         overrides parameter storage; None preserves checkpoint storage exactly.
         """
@@ -216,8 +221,9 @@ class TextToImage:
         from dew.diffusion.process import Process
         from dew.inference.tasks import run_record
         from dew.nn.autoencoders import AutoEncoder
+        from dew.objectives.diffusion.objective import FixedBlank, _without_loss_heads
         from dew.records import integer, record as fields, text
-        from dew.registry import objectives, samplers
+        from dew.registry import objectives, solvers
 
         record = run_record(directory, step)
         config = ModelConfig.from_dict(fields(record['model'], 'model'))
@@ -231,12 +237,15 @@ class TextToImage:
         autoencoder = None if record['autoencoder'] is None else AutoEncoder.from_json(
             fields(record['autoencoder'], 'autoencoder'), params=params['autoencoder'])
         solver_record = fields(record['solver'], 'solver')
-        solver = samplers.build(text(solver_record['name'], 'solver name'),
+        solver = solvers.build(text(solver_record['name'], 'solver name'),
                                 fields(solver_record['fields'], 'solver fields'))
         guidance = None if record['guidance'] is None else _built(CFG, fields(record['guidance'], 'guidance'))
         return cls(config.build(), Process.from_json(fields(record['process'], 'process')),
-                   inputs, params, autoencoder, steps=integer(record['sampling_steps'], 'sampling_steps'),
-                   guidance=guidance, sampler=solver)
+                   inputs, _without_loss_heads(params), autoencoder,
+                   steps=integer(record['sampling_steps'], 'sampling_steps'),
+                   guidance=guidance, solver=solver,
+                   blank=FixedBlank(inputs, params.get("encoders", {}),
+                                    jax.config.jax_default_matmul_precision))
 
     @classmethod
     def from_pretrained(cls, repo_id: str, *, ema: bool | None = None, mesh: MeshSpec | None = None,

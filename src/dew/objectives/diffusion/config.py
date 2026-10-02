@@ -239,11 +239,54 @@ class ShortcutTraining:
     bootstrap_every: int = 8
 
 
+def teacher_model(directory: str, variables: Variables | None) -> Variables:
+    """A distilled run's teacher model variables: a saved distilled tree's
+    own copy, else the teacher run's published ones."""
+    from dew.checkpoints import Checkpoints
+
+    from .objective import TEACHER, _without_loss_heads
+
+    if variables is not None:
+        return variables[TEACHER]
+    restored = Checkpoints(directory).variables(ema=None, step=None, mesh=None, layout=None, param_dtype=None)
+    return _without_loss_heads({name: tree for name, tree in restored.items()
+                                if name not in ("encoders", "autoencoder")})
+
+
 SMOOTH_TIME_SCALE = 0.002
 """The Fourier time scale a model trained through a derivative in time takes
 when its config names none. On a 2-D two-class toy (RTX 4080), one-step
 class accuracy at simple_dit's default 16 against 0.002 was MeanFlow 23%
 against 99%, an sCM student 11% against 98.6%."""
+
+
+@dataclasses.dataclass(frozen=True)
+class AdversarialDistillation:
+    """Distill a saved flow run into a few-step student adversarially, LADD
+    with ADD's R1 penalty and distillation term
+    (`AdversarialDistillationObjective`, which documents the fields).
+    `teacher` is the teacher run's directory; its model is this run's
+    `model`."""
+
+    teacher: str = ""
+    feature_layers: tuple[str, ...] = ()
+    student_times: tuple[float, ...] = (1.0, 0.75, 0.5, 0.25)
+    renoise_times: tuple[float, float] = (1.0, 1.0)
+    distillation_weight: float = 2.5
+    r1_weight: float = 1e-5
+    cmap_dim: int = 64
+    kernel_size: tuple[int, int] = (9, 9)
+
+    def __post_init__(self) -> None:
+        if not self.teacher or not self.feature_layers:
+            raise ValueError("adversarial distillation names a teacher run and the layers its "
+                             "discriminator reads")
+        object.__setattr__(self, "feature_layers", tuple(self.feature_layers))
+        object.__setattr__(self, "student_times", tuple(float(time) for time in self.student_times))
+        mean, std = (float(value) for value in self.renoise_times)
+        object.__setattr__(self, "renoise_times", (mean, std))
+        height, width = (int(size) for size in self.kernel_size)
+        object.__setattr__(self, "kernel_size", (height, width))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -300,19 +343,7 @@ class ConsistencyDistillation:
             )
 
     def teacher_variables(self, variables: Variables | None) -> Variables:
-        """The teacher model's variables: a saved distilled tree's own, else
-        the teacher run's published ones."""
-        from dew.checkpoints import Checkpoints
-
-        from .objective import TEACHER, _without_loss_heads
-
-        if variables is not None:
-            return variables[TEACHER]
-        restored = Checkpoints(self.teacher).variables(
-            ema=None, step=None, mesh=None, layout=None, param_dtype=None
-        )
-        return _without_loss_heads({name: tree for name, tree in restored.items()
-                                    if name not in ("encoders", "autoencoder")})
+        return teacher_model(self.teacher, variables)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -445,6 +476,9 @@ class DiffusionRunConfig(RunConfig):
     """Distill a saved flow run into a few-step student (rCM, sCM or DMD2)
     instead of the denoising loss; sampling is unguided."""
     guidance_distill: GuidanceDistillation | None = None
+    adversarial: AdversarialDistillation | None = None
+    """Distill a saved flow run adversarially (LADD, ADD); sampling is
+    unguided."""
     """Distill a saved run's classifier-free guidance into this model's
     guidance input; sampling reads the conditioner's guidance value and no
     second branch."""
@@ -462,9 +496,16 @@ class DiffusionRunConfig(RunConfig):
                            "mean_flow" if self.mean_flow is not None else
                            "shortcut" if self.shortcut is not None else
                            "rcm" if self.distill is not None else
-                           "guidance_distillation" if self.guidance_distill is not None else "diffusion")
+                           "guidance_distillation" if self.guidance_distill is not None else
+                           "ladd" if self.adversarial is not None else "diffusion")
+
         extras = [name for name in ("rl", "alignment", "mean_flow", "shortcut", "distill", "uncertainty")
                   if getattr(self, name) is not None]
+        if self.adversarial is not None and (extras or self.guidance_distill is not None
+                                             or self.guidance is not None
+                                             or not isinstance(self.preset, Flow)):
+            raise ValueError("adversarial distillation trains on its own losses under the flow preset and "
+                             "samples unguided: set guidance None, and leave the other training modes unset")
         if self.guidance_distill is not None and (extras or self.guidance is not None):
             raise ValueError("guidance distillation trains on its own loss and samples one branch: set "
                              f"guidance None, and leave {extras or 'the other training modes'} unset")
@@ -637,6 +678,15 @@ class DiffusionRunConfig(RunConfig):
                 model, process, inputs, **dataclasses.asdict(self.mean_flow),
                 autoencoder=autoencoder, pretrained=variables, unconditional_prob=self.unconditional_prob,
                 ema_decay=self.ema_decay, solver=self.solver, guidance=None, steps=self.sampling_steps)
+        if self.adversarial is not None:
+            from .adversarial import AdversarialDistillationObjective
+
+            fields = {field.name: getattr(self.adversarial, field.name)
+                      for field in dataclasses.fields(self.adversarial) if field.name != "teacher"}
+            return AdversarialDistillationObjective(
+                model, process, inputs, teacher=teacher_model(self.adversarial.teacher, variables), **fields,
+                autoencoder=autoencoder, pretrained=variables, unconditional_prob=self.unconditional_prob,
+                ema_decay=self.ema_decay, solver=self.solver, guidance=None, steps=self.sampling_steps)
         if self.guidance_distill is not None:
             from .guidance_distillation import GuidanceDistillationObjective
 
@@ -741,7 +791,7 @@ class DiffusionRunConfig(RunConfig):
         name, revision = split_revision(self.pretrained)
         height, width = self.sample_field().shape[-3:-1]
         return load_diffusion_source(
-            name, revision=revision, dtype=self.model.dtype,
+            name, revision=revision, dtype=self.model.dtype or "bfloat16",
             param_dtype=self.model.param_dtype or "float32",
             attention_impl=self.model.attention_impl, size=(height, width), variables=variables)
 

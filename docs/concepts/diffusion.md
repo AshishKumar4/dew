@@ -94,6 +94,33 @@ MeanFlow's and sCM's losses differentiate the model in time, so its time embeddi
 
 `GuidanceDistillationObjective` (`guidance_distill=GuidanceDistillation(teacher=<run directory>)` on the run config) distills a saved run's classifier-free guidance into a model that reads the scale as its conditioning's guidance input, as FLUX.1 [dev] does. This is stage one of Meng et al. (2023). Each row draws a scale w, and the student regresses its raw output onto the teacher's u + w (c - u) on the same noised sample. No training code is published for FLUX.1 [dev]'s guidance embedding, so the tests hold the loss to the paper's equation. A saved student samples one branch at its conditioner's guidance value.
 
+`AdversarialDistillationObjective` (`adversarial=AdversarialDistillation(teacher=<run directory>, feature_layers=...)`) trains a few-step student with LADD's projected discriminator (Sauer et al., 2024). Both clean predictions and reference samples are renoised; the frozen teacher's token grids feed StyleGAN-T heads with spectral normalization, local batch normalization and projection conditioning. The hinge losses train each side with the other stopped. ADD's R1 penalty regularizes the heads, and `distillation_weight` adds its alpha-weighted, summed squared distance toward the teacher's denoising (Sauer et al., 2023). LADD drops that term for synthetic data. ADD's DINOv2 discriminator is not implemented. Neither paper publishes training code; head parity uses StyleGAN-T's official code, and the losses are checked against their equations.
+
+The CIFAR-10 runs below use 32-pixel images, a flow `simple_dit` teacher (width 256, six blocks, 3,000 training steps), and FID-5k. Teacher columns give one-/four-/25-step Euler FID with CFG 1.5. Student columns use `Consistency`, without sampling-time CFG.
+
+| Setup | Student steps | Seeds | One-step FID | Four-step FID | Teacher FID (1 / 4 / 25 steps) |
+|---|---:|---|---:|---:|---|
+| RTX 4080, prototype MLP heads, real data, several learning rates and renoising levels | 1,500–3,000 | 0 | 319–365 | — | 316 / 103 / 90 |
+| RTX 4080, StyleGAN-T heads + R1, real data, lr 1e-5, batch 64, no distillation | 4,000 | 0 | 268 | 237 | 316 / 103 / 90 |
+| Same | 4,000 | 1 | 283 | 292 | 316 / 103 / 90 |
+| Same | 4,000 | 2 | 319 | 283 | 316 / 103 / 90 |
+| RTX 4080, StyleGAN-T heads + R1, ADD distillation weight 2.5 | 2,500–4,000 | 0 | 430–437 | — | 316 / 103 / 90 |
+| A100, StyleGAN-T heads + R1, synthetic teacher samples, lr 1e-5, batch 128, no distillation | 20,000 | 0 | 243.01 | 168.87 | 310.34 / 102.85 / 85.54 |
+| Same | 20,000 | 1 | 216.91 | 160.52 | 310.34 / 102.85 / 85.54 |
+| Same | 20,000 | 2 | 254.73 | 143.26 | 310.34 / 102.85 / 85.54 |
+
+Every A100 seed improved one-step FID by 18–30% over that run's teacher at one step. None reached the teacher's four-step FID. Those runs used the paper's high-noise renoising and resumed between 4,000-step segments. The ADD distance dominated the short real-data runs; dropping it follows LADD's synthetic-data recipe, not a change to ADD's equation.
+
+A separate two-class 2-D toy exposed the renoising sensitivity in the prototype heads (RTX 4080, one seed, 3,000 steps):
+
+| Setup | One-step class accuracy | Log-density | Mode coverage |
+|---|---:|---:|---|
+| Paper renoising mean 1, std 1 | 53% | — | Discriminator near chance |
+| Renoising mean -2, std 1, distillation weight 2.5, 256-wide prototype heads | 99.6% | 0.49 | All modes |
+| Same lower renoising, no distillation or 64-wide prototype heads | — | — | One mode per class |
+
+These are measured training smokes, not reproductions of the papers' image-quality results.
+
 ## Solvers
 
 `sample(denoise, x_T, steps, solver=..., key=...)` runs a solver from the highest time to zero. `denoise` is `process.denoiser(model, params, conditions)`, which calls the model and converts its output into estimates of $x_0$ and $\epsilon$. This samples from an untrained DiT with two solvers; only the shapes are meaningful:
