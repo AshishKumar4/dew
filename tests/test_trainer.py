@@ -7,6 +7,7 @@ count, what lands on disk and when, what a resume restores, what reaches the
 tracker, and what a failure does to the run.
 """
 
+import contextlib
 import dataclasses
 import gc
 import io
@@ -27,6 +28,7 @@ import pytest
 from flax import linen as nn
 from flax.errors import ScopeParamShapeError
 from rich.console import Console
+from steady_state import steady_state
 
 from dew import position
 from dew.artifacts import Representations
@@ -156,6 +158,37 @@ class RecordingTracker:
 def test_fit_trains_to_the_step_it_was_asked_for():
     state = make_trainer().fit(Data(endless), steps=4, log_every=2)
     assert int(state.step) == 4
+
+
+@pytest.mark.parametrize("variant", ["ema", "accumulation", "schedule", "dynamic_scale", "checkpoints"])
+def test_steps_after_the_first_logs_neither_compile_nor_move_data_unasked(variant, tmp_path):
+    """Past its first two logging intervals and checkpoints the loop reruns
+    the programs it compiled, and the only data that crosses is the batches
+    it places and what it reads, by name, at the logging and checkpoint
+    cadences (`steady_state`). A float() of the loss in the loop, a fresh
+    counter built on the host, or a counter on another device than the
+    loss's would each fail it."""
+    window = contextlib.ExitStack()
+
+    class Steady(RecordingTracker):
+        def log(self, scalars, step):
+            super().log(scalars, step)
+            if step == 8:
+                window.enter_context(steady_state())
+            elif step == 24:
+                window.close()
+
+    options = {"ema": {}, "accumulation": {"accumulation": 2}, "dynamic_scale": {"dynamic_scale": True},
+               "schedule": {"optimizer": optax.inject_hyperparams(optax.adam)(
+                   learning_rate=optax.cosine_decay_schedule(1e-2, 24))},
+               "checkpoints": {"tmp_path": tmp_path}}[variant]
+    tracker = Steady()
+    try:
+        make_trainer(tracker=tracker, **options).fit(
+            Data(), steps=24, log_every=4, checkpoint_every=4 if variant == "checkpoints" else None)
+    finally:
+        window.close()
+    assert [step for step, scalars in tracker.scalars if "train/loss" in scalars] == [4, 8, 12, 16, 20, 24]
 
 
 def test_integer_root_key_matches_a_typed_key_bit_exactly():

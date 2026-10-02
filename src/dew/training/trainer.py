@@ -177,9 +177,12 @@ Book = tuple[jax.Array, jax.Array, jax.Array]
 streak of non-finite losses, and the longest streak since the last check."""
 
 
-def fresh_book() -> Book:
-    """Return the counters a fresh logging interval starts from."""
-    return jnp.zeros((), jnp.float32), jnp.zeros((), jnp.int32), jnp.zeros((), jnp.int32)
+def fresh_book(loss: jax.Array) -> Book:
+    """Return the counters a fresh logging interval starts from, placed where
+    the step returns `loss`. Counters on any other device would move to the
+    step's devices at every count, and `bookkeep` would compile once more."""
+    dtype = jnp.promote_types(loss.dtype, jnp.float32)
+    return jax.device_put((np.zeros((), dtype), np.zeros((), np.int32), np.zeros((), np.int32)), loss.sharding)
 
 
 @jax.jit
@@ -197,17 +200,16 @@ def bookkeep(book: Book, loss: jax.Array, finite: jax.Array) -> Book:
     return interval_loss + loss.astype(dtype), bad_run, jnp.maximum(worst_bad_run, bad_run)
 
 
-def learning_rate(opt_state: optax.OptState) -> float | None:
+def learning_rate(opt_state: optax.OptState) -> jax.typing.ArrayLike | None:
     """The learning rate in `opt_state`, where the optimizer carries one:
     under `optax.inject_hyperparams`, the way optax exposes a schedule's
-    value. None for a rate the optimizer closes over, or for parameter
-    groups that carry several."""
+    value, as the state holds it, a scalar the caller reads. None for a rate
+    the optimizer closes over, or for parameter groups that carry several."""
     injected = (optax.InjectHyperparamsState, optax.InjectStatefulHyperparamsState)
     rates = [node.hyperparams["learning_rate"]
              for node in jax.tree.leaves(opt_state, is_leaf=lambda node: isinstance(node, injected))
              if isinstance(node, injected) and "learning_rate" in node.hyperparams]
-    # optax types a hyperparameter as any ArrayLike; a learning rate is a real scalar.
-    return float(jnp.asarray(rates[0])) if len(rates) == 1 else None
+    return rates[0] if len(rates) == 1 else None
 
 
 # How the display shows the metrics the trainer itself logs; an objective,
@@ -619,15 +621,18 @@ class _Interval:
     `book` is the loss summed since the last checkpoint and both bad-loss
     counters, on device, so the loop never blocks on a result, and they move
     together in one dispatch; the host reads them at the logging cadence.
+    The first step places them where its loss is, and `fresh` keeps them at
+    zero there, for a counter's restart to reuse rather than build again.
     `steps` counts since the last checkpoint, the rest since the last log.
     The records and FLOPs are summed per step rather than taken off the
     dataset's batch, so a ramped interval reports the records it read and
     their FLOPs. `rollout_seconds` is the time spent sampling, logged under
     train/rollout_seconds when a rollout is set."""
 
-    book: Book
     last_log_time: float
     last_saved: int | None
+    book: Book | None = None
+    fresh: Book | None = None
     steps: int = 0
     since_log: int = 0
     samples: int = 0
@@ -640,6 +645,8 @@ class _Interval:
         self.steps += 1
         self.samples += rows_of(batch)
         self.flops = None if self.flops is None or flops is None else self.flops + flops
+        if self.book is None:
+            self.book = self.fresh = fresh_book(loss)
         self.book = bookkeep(self.book, loss, finite)
 
     def check_finite(self, step: int, display: TrainingDisplay) -> None:
@@ -649,15 +656,17 @@ class _Interval:
         Deferred to the logging cadence so the step loop never synchronises;
         detection is late by at most that many steps, never missed.
         """
+        if self.book is None or self.fresh is None:
+            return
         loss, bad_run, worst_bad_run = self.book
-        streak = int(worst_bad_run)
+        streak = int(jax.device_get(worst_bad_run))
         if streak >= BAD_LOSS_STEPS:
             raise RuntimeError(
                 f"Loss has been non-finite for {streak} consecutive steps "
                 f"ending near step {step}, stopping")
         if streak:
             display.note(f"Non-finite loss for {streak} step(s) before {step}", style="red")
-        self.book = (loss, bad_run, jnp.zeros((), jnp.int32))
+        self.book = (loss, bad_run, self.fresh[2])
 
     def logged(self, now: float) -> None:
         """Start the next logging interval at `now`."""
@@ -666,9 +675,10 @@ class _Interval:
 
     def saved(self, step: int) -> None:
         """Start the next checkpoint interval after the one saved at `step`."""
-        loss, bad_run, worst_bad_run = self.book
         self.last_saved, self.steps = step, 0
-        self.book = (jnp.zeros_like(loss), bad_run, worst_bad_run)
+        if self.book is not None and self.fresh is not None:
+            _, bad_run, worst_bad_run = self.book
+            self.book = (self.fresh[0], bad_run, worst_bad_run)
 
 
 class Trainer(Generic[Loss, Effects]):
@@ -1389,7 +1399,7 @@ class Trainer(Generic[Loss, Effects]):
             if self._opened(plan, run, state, position):
                 return state
             compiled: dict[Shapes, tuple[CompiledStep, float | None]] = {}
-            interval = _Interval(fresh_book(), time.time(), last_saved=(
+            interval = _Interval(time.time(), last_saved=(
                 run.current if checkpoints is not None and checkpoints.latest is not None else None))
             seen = 0
             run.notice = PreemptionNotice()
@@ -1966,8 +1976,8 @@ class Trainer(Generic[Loss, Effects]):
         paused = time.perf_counter()
         self._display.status("writing a checkpoint")
         metadata = dict(scores or {})
-        if interval.steps:
-            metadata.setdefault('train/loss', float(interval.book[0] / interval.steps))
+        if interval.steps and interval.book is not None:
+            metadata.setdefault('train/loss', float(jax.device_get(interval.book[0]) / interval.steps))
             if not ranking and training_best:
                 ranking = (Ranking('train/loss', metadata['train/loss']),)
         checkpoints.save(step, state, position, metadata, share=data_partition(self.device_mesh),
@@ -2008,19 +2018,24 @@ class Trainer(Generic[Loss, Effects]):
             # where the loop waits on the device.
             loss.block_until_ready()
             now = time.time()
-            scalars = {"train/loss": float(loss),
-                       **{f"train/{k}": float(v) for k, v in aux.items()},
+            # One read for every number, since each float() of a device
+            # array is a copy of its own.
+            read = jax.device_get({
+                "loss": loss, "aux": aux, "accepted": accepted, "rate": learning_rate(state.opt_state),
+                "scale": None if state.scale is None else state.scale.scale,
+                "rollout": {} if self.rollout is None else dict(_rollout_metrics(self.rollout))})
+            scalars = {"train/loss": float(read["loss"]),
+                       **{f"train/{k}": float(v) for k, v in read["aux"].items()},
                        **self._throughput(now - interval.last_log_time, interval.since_log,
                                           interval.samples, interval.flops)}
-            scalars["train/accepted"] = float(accepted)
-            if (rate := learning_rate(state.opt_state)) is not None:
-                scalars["train/learning_rate"] = rate
-            if state.scale is not None:
-                scalars["train/loss_scale"] = float(state.scale.scale)
+            scalars["train/accepted"] = float(read["accepted"])
+            if read["rate"] is not None:
+                scalars["train/learning_rate"] = float(read["rate"])
+            if read["scale"] is not None:
+                scalars["train/loss_scale"] = float(read["scale"])
             if self.rollout is not None:
                 scalars["train/rollout_seconds"] = interval.rollout_seconds
-                scalars.update({f"rollout/{name}": float(value)
-                                for name, value in _rollout_metrics(self.rollout).items()})
+                scalars.update({f"rollout/{name}": float(value) for name, value in read["rollout"].items()})
             self._display.interval(step, scalars)
             if self.tracker is not None:
                 self.tracker.log(scalars, step)
@@ -2047,7 +2062,7 @@ class Trainer(Generic[Loss, Effects]):
                     wall = time.perf_counter() - run.started
                     scalars = goodput(wall, run.first_step, run.other)
                     self._display.summary(run.current, wall, scalars,
-                                          None if run.loss is None else float(run.loss))
+                                          None if run.loss is None else float(jax.device_get(run.loss)))
                     if self.tracker is not None:
                         self.tracker.log(scalars, run.current)
 
