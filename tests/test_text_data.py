@@ -21,7 +21,7 @@ import numpy as np
 import optax
 import pytest
 
-from dew.data import ByteTokenizer, DataPartition, Loading, PackedTokens, TokenWindows, write_tokens
+from dew.data import ByteTokenizer, DataPartition, Loading, PackedTokens, TokenCorpus, TokenWindows
 from dew.data.dataset import describe
 from dew.data.sources.text import (
     TokenBytes,
@@ -501,7 +501,7 @@ def test_a_token_spec_needs_a_directory_with_a_train_split(tmp_path, spec):
 
 
 # ---------------------------------------------------------------------------------
-# write_tokens and `dew tokenize`
+# TokenCorpus.write and `dew tokenize`
 # ---------------------------------------------------------------------------------
 
 def test_written_tokens_round_trip_through_the_source(tmp_path):
@@ -515,22 +515,22 @@ def test_written_tokens_round_trip_through_the_source(tmp_path):
     (raw / "nested" / "b.txt").write_text(corpus * 3, encoding="utf-8")
     out = tmp_path / "tokens"
 
-    written = write_tokens(raw, out, tokenizer="byte", val_fraction=0.1)
+    written = TokenCorpus.write(raw, out, tokenizer="byte", val_fraction=0.1)
 
-    meta = json.loads((out / "meta.json").read_text())
+    meta = TokenCorpus.read(out)
     assert meta == written
-    assert meta["tokenizer"] == "byte"
-    assert meta["vocab_size"] == 256
-    assert meta["dtype"] == "uint8"
-    assert meta["train_tokens"] + meta["val_tokens"] == len(
+    assert meta.tokenizer == "byte"
+    assert meta.vocab_size == 256
+    assert meta.dtype == "uint8"
+    assert meta.train_tokens + meta.val_tokens == len(
         (corpus * 8).encode("utf-8"))
 
     seq_len = 32
     train = TokenWindowSource(TokenBytes(str(out / "train.bin")), seq_len)
     val = TokenWindowSource(TokenBytes(str(out / "val.bin")), seq_len)
     assert train.tokens.dtype == np.dtype("uint8")
-    assert len(train) == (meta["train_tokens"] - 1) // seq_len
-    assert len(val) == (meta["val_tokens"] - 1) // seq_len
+    assert len(train) == (meta.train_tokens - 1) // seq_len
+    assert len(val) == (meta.val_tokens - 1) // seq_len
 
     tok = ByteTokenizer()
     whole = corpus * 8  # a.txt (5x) then nested/b.txt (3x), in path order
@@ -540,8 +540,8 @@ def test_written_tokens_round_trip_through_the_source(tmp_path):
     val_bytes = list((out / "val.bin").read_bytes())
     train_bytes = list((out / "train.bin").read_bytes())
     assert tok.decode(val_bytes + train_bytes) == whole
-    assert len(val_bytes) == meta["val_tokens"]
-    assert len(train_bytes) == meta["train_tokens"]
+    assert len(val_bytes) == meta.val_tokens
+    assert len(train_bytes) == meta.train_tokens
 
     # Windows tile each split at stride seq_len, so stitching them back
     # rebuilds the split up to the tokens past the last full window.
@@ -554,11 +554,11 @@ def test_written_tokens_round_trip_through_the_source(tmp_path):
         return ((n_tokens - 1) // seq_len) * seq_len + 1
 
     train_ids, val_ids = stitch(train), stitch(val)
-    assert len(val_ids) == covered(meta["val_tokens"])
-    assert len(train_ids) == covered(meta["train_tokens"])
+    assert len(val_ids) == covered(meta.val_tokens)
+    assert len(train_ids) == covered(meta.train_tokens)
     assert list(val_ids) == whole_ids[:len(val_ids)]
-    assert list(train_ids) == whole_ids[meta["val_tokens"]:
-                                        meta["val_tokens"] + len(train_ids)]
+    assert list(train_ids) == whole_ids[meta.val_tokens:
+                                        meta.val_tokens + len(train_ids)]
 
     # And what the windows carry decodes back to that text (a window boundary
     # can split a multi-byte character, which decode replaces on both sides).
@@ -570,24 +570,25 @@ def test_documents_in_memory_are_written_one_eos_terminated_document_each(tmp_pa
     """An iterable of strings is the route for text another library holds, a
     Hugging Face split's column included: each string is one document."""
     documents = ["alpha beta", "gamma", "", "delta epsilon zeta"]
-    meta = write_tokens(iter(documents), tmp_path, tokenizer="byte", val_fraction=0.0, pack=True)
+    meta = TokenCorpus.write(iter(documents), tmp_path, tokenizer="byte", val_fraction=0.0,
+                             pack=True)
 
     eos = ByteTokenizer().eos_id
     stream = list((tmp_path / "train.bin").read_bytes())
     expected = [byte for text in documents if text for byte in [*text.encode(), eos]]
     assert stream == expected, "an empty document writes nothing, not a lone eos"
-    assert meta["val_tokens"] == 0 and meta["eos_id"] == eos
+    assert meta.val_tokens == 0 and meta.eos_id == eos
     source = TokenDocumentSource(TokenBytes(str(tmp_path / "train.bin")))
     assert len(source) == 3
 
 
 def test_a_path_that_holds_no_text_is_refused(tmp_path):
     with pytest.raises(ValueError, match="holds no \\*.txt file"):
-        write_tokens(tmp_path, tmp_path / "out")
+        TokenCorpus.write(tmp_path, tmp_path / "out")
     with pytest.raises(FileNotFoundError, match="neither a text file nor a directory"):
-        write_tokens(tmp_path / "missing", tmp_path / "out")
+        TokenCorpus.write(tmp_path / "missing", tmp_path / "out")
     with pytest.raises(ValueError, match="val_fraction"):
-        write_tokens(["text"], tmp_path / "out", val_fraction=1.0)
+        TokenCorpus.write(["text"], tmp_path / "out", val_fraction=1.0)
 
 
 def test_the_tokenize_command_writes_what_the_library_writes(tmp_path, capsys):
@@ -598,11 +599,11 @@ def test_the_tokenize_command_writes_what_the_library_writes(tmp_path, capsys):
 
     assert main(["tokenize", "--input", str(raw), "--out", str(tmp_path / "cli"),
                  "--val-fraction", "0.2", "--pack"]) == 0
-    library = write_tokens(raw, tmp_path / "lib", val_fraction=0.2, pack=True)
+    library = TokenCorpus.write(raw, tmp_path / "lib", val_fraction=0.2, pack=True)
 
     for name in ("train.bin", "val.bin", "meta.json"):
         assert (tmp_path / "cli" / name).read_bytes() == (tmp_path / "lib" / name).read_bytes()
-    assert f"wrote {library['train_tokens']} tokens to" in capsys.readouterr().out
+    assert f"wrote {library.train_tokens} tokens to" in capsys.readouterr().out
 
 
 def _bos_tokenizer(directory):
@@ -634,17 +635,19 @@ def test_a_bos_adding_tokenizer_starts_each_document_once_however_it_is_chunked(
     (raw / "b.txt").write_text(lines[:90], encoding="utf-8")
     monkeypatch.setattr(token_files, "CHUNK_CHARS", 16)
 
-    meta = write_tokens(raw, tmp_path / "files", tokenizer=tokenizer, val_fraction=0.0, pack=True)
-    stream = np.fromfile(tmp_path / "files" / "train.bin", dtype=meta["dtype"])
+    meta = TokenCorpus.write(raw, tmp_path / "files", tokenizer=tokenizer, val_fraction=0.0,
+                             pack=True)
+    stream = np.fromfile(tmp_path / "files" / "train.bin", dtype=meta.dtype)
 
-    bos, eos = 0, meta["eos_id"]
+    bos, eos = 0, meta.eos_id
     starts = np.flatnonzero(stream == bos)
     ends = np.flatnonzero(stream == eos)
     assert len(starts) == 2 and len(ends) == 2, "one bos and one eos per document"
     assert starts[0] == 0 and starts[1] == ends[0] + 1, "each bos opens its document"
 
-    write_tokens(["w1 w2 w3", "w4"], tmp_path / "strings", tokenizer=tokenizer, val_fraction=0.0)
-    strings = np.fromfile(tmp_path / "strings" / "train.bin", dtype=meta["dtype"])
+    TokenCorpus.write(["w1 w2 w3", "w4"], tmp_path / "strings", tokenizer=tokenizer,
+                      val_fraction=0.0)
+    strings = np.fromfile(tmp_path / "strings" / "train.bin", dtype=meta.dtype)
     assert strings.tolist() == [bos, 4, 5, 6, bos, 7]
 
 
@@ -828,7 +831,7 @@ def test_a_single_file_corpus_packs_when_its_val_split_holds_no_eos(tmp_path):
                    encoding="utf-8")
     out = tmp_path / "tokens"
 
-    write_tokens(raw, out, tokenizer="byte", val_fraction=0.1, pack=True)
+    TokenCorpus.write(raw, out, tokenizer="byte", val_fraction=0.1, pack=True)
     val_tokens = list((out / "val.bin").read_bytes())
     assert ByteTokenizer().eos_id not in val_tokens, "the split kept a boundary"
 

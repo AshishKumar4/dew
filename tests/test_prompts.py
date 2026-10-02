@@ -101,7 +101,7 @@ def test_a_string_prompt_encodes_on_its_own():
 
 @pytest.mark.parametrize("prompt", ["dew", "caf\u00e9", "a longer prompt"])
 def test_byte_string_prompts_load_as_the_native_tokenizers_ids(prompt):
-    from dew.data import tokenizer_for
+    from dew.data.text import tokenizer_for
 
     data = Prompts(tokenizer="byte", records=records({"prompt": prompt}) * 8,
                    max_prompt_len=WINDOW, loading=Loading(workers=0)).load(batch=8)
