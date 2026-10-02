@@ -15,7 +15,6 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from functools import cached_property
 from typing import TYPE_CHECKING, Any, ClassVar, Generic, Literal, Protocol, runtime_checkable
 
 import jax
@@ -336,14 +335,22 @@ class Objective(ABC, Generic[Loss, Effects]):
         own `held_variables`. An objective that holds nothing ignores it.
         """
 
-    @cached_property
+    @property
     def _validation_loss(self):
-        """One reusable compiled loss, specialized by mesh and batch shape.
+        """Reuse the statistics program only while its model and head stay fixed.
 
-        Validation needs statistics, not the optimizer's gradient program.
-        Keep the bound callable alive so repeated passes reuse compilation.
+        Fit's ladder replaces the immutable Flax model and may change a
+        tiled head. Argument shapes alone cannot identify those programs.
+        Keep only the current specialization, not a history of old models.
         """
-        return jax.jit(lambda variables, batch, step: self.loss(variables, batch, step)[0])
+        held = vars(self)
+        model, head = held.get('model'), held.get('head_tile')
+        cached = held.get('_validation_loss_cache')
+        if cached is None or cached[0] is not model or cached[1] != head:
+            compiled = jax.jit(lambda variables, batch, step: self.loss(variables, batch, step)[0])
+            cached = (model, head, compiled)
+            self._validation_loss_cache = cached
+        return cached[2]
 
     @property
     def scalars(self) -> TrainingScalars[Loss, Effects]:

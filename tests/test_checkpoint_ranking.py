@@ -407,3 +407,35 @@ def test_validation_loss_reuses_compilation_without_retaining_dead_objectives():
     del objective
     gc.collect()
     assert owner() is None
+
+
+def test_tile_head_invalidates_validation_trace_for_the_same_batch_shape():
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.lm import LMObjective
+    from dew.training import evaluate
+
+    class TracedLM(LMObjective):
+        traces = 0
+        def loss(self, variables, batch, step):
+            self.traces += 1
+            return super().loss(variables, batch, step)
+    model = CausalTransformer(vocab_size=16, emb_features=16, num_layers=1, num_heads=2,
+                              mlp_features=32, max_seq_len=16, dtype='float32', attention_impl='xla')
+    objective = TracedLM(model, seq_len=8, ema_decay=None)
+    variables = objective.init(jax.random.key(0))
+    batch = {'text': np.tile(np.arange(9, dtype=np.int32), (8, 1))}
+    def reader(partition):
+        return iter([batch])
+    first = evaluate(objective, variables, reader, key=jax.random.key(0), loss=True)
+    old_program = objective._validation_loss
+    assert objective.traces == 1
+    assert objective.tile_head((4, 4)) is not None
+    second = evaluate(objective, variables, reader, key=jax.random.key(0), loss=True)
+    assert objective.traces == 2
+    assert objective._validation_loss is not old_program
+    assert np.isfinite(first.scores['val/loss']) and np.isfinite(second.scores['val/loss'])
+    # Replacing the immutable model (as the fit ladder does) also invalidates
+    # the program, even when every variable and input shape stays the same.
+    objective.model = objective.model.clone(remat=None)
+    evaluate(objective, variables, reader, key=jax.random.key(0), loss=True)
+    assert objective.traces == 3
