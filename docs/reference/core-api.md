@@ -428,6 +428,8 @@ PretrainedDecoder.lora(*, rank, modules, key, alpha=None, rslora=False, dropout=
 PretrainedMaskedDecoder.text_generation() -> MaskedGeneration
 PretrainedBlockDecoder.block_generation() -> BlockGeneration
 PretrainedPipeline.text_to_image() -> TextToImage
+PretrainedPipeline.diffusion_objective(**options) -> DiffusionObjective
+PretrainedPipeline.lora(*, rank, modules, key, alpha=None, rslora=False, dropout=0.0) -> PretrainedPipeline
 PretrainedFallback.lm_objective(seq_len, **options) -> LMObjective
 Pretrained.save(directory, *, variables=None, max_shard_size="5GB")
 Pretrained.push_to_hub(repo_id, *, variables=None, private=False, commit_message=..., max_shard_size="5GB")
@@ -500,7 +502,7 @@ A decoder trained through the LM recipe, exported with `PretrainedDecoder.from_m
 ```text
 DiffusionObjective(model, process, inputs, *, autoencoder=None,
                    unconditional_prob=0.12, ema_decay=0.999, solver=DDIM(),
-                   guidance=CFG(3.0), steps=200, pretrained=None)
+                   guidance=CFG(3.0), steps=200, pretrained=None, trainable=None)
 JepaObjective(encoder, predictor, mask, sample, momentum=(0.996, 1.0),
               momentum_steps=100000, label_key="label")
 ```
@@ -538,14 +540,10 @@ The tiny oracles in `tools/diffusers_source_reference.py` run actual Diffusers s
 <!-- not run: needs a local diffusion checkpoint directory -->
 ```python
 from dew.interop import PretrainedPipeline
-from dew.objectives.diffusion import DiffusionObjective
 
 source = PretrainedPipeline.load("./image-checkpoint", dtype="float32")
 images = source.text_to_image()(["a flower"], steps=20, key=0).host().images
-objective = DiffusionObjective(
-    source.model, source.process, source.inputs,
-    autoencoder=source.autoencoder, pretrained=source.variables,
-)
+objective = source.diffusion_objective()
 ```
 
 Training batches carry uint8 NHWC images and `source.inputs.tokenize(captions)`. A nine-channel inpainting source also specifies `inputs.mask`: binary NHWC masks with one channel, where white marks the region to repaint. Caption dropout preserves the mask and masked-image latents. This is neural conditioning, not a guarantee that decoded unmasked pixels equal the original image.
