@@ -60,8 +60,13 @@ def test_builtin_process_records_preserve_noise_prediction_and_weights():
         time = jnp.linspace(.01, .99, 16)
         np.testing.assert_array_equal(original.schedule.rates(time)[0], rebuilt.schedule.rates(time)[0])
         np.testing.assert_array_equal(original.schedule.rates(time)[1], rebuilt.schedule.rates(time)[1])
-        np.testing.assert_array_equal(original.loss_weight(time), rebuilt.loss_weight(time))
-        assert rebuilt.prediction == original.prediction
+        np.testing.assert_array_equal(original.weight(time), rebuilt.weight(time))
+        rates = original.schedule.rates(time)
+        clean, noise = jnp.ones((16, 1)), jnp.full((16, 1), .2)
+        np.testing.assert_array_equal(original.prediction.get_target(clean, noise, rates),
+                                      rebuilt.prediction.get_target(clean, noise, rates))
+        np.testing.assert_array_equal(original.prediction.get_input_scale(rates),
+                                      rebuilt.prediction.get_input_scale(rates))
 
 
 def test_builtin_autoencoder_record_uses_the_saved_parameters():
