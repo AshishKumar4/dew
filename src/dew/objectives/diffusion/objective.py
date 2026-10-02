@@ -114,6 +114,36 @@ def check_solver(process, solver, steps: int) -> None:
         x, key)
 
 
+class FixedBlank:
+    """A configured unconditional branch, lazily encoded in eager mode.
+
+    The objective and a restored task use the same operations, outside any
+    caller trace, at their construction-time matmul precision. Encoding a
+    single empty prompt through a JIT instead can change bf16 rounding.
+    The small host result is cached; a call casts it to the conditional
+    branch's dtypes without re-encoding.
+    """
+
+    def __init__(self, inputs: InputSpec, encoders: Variables, precision):
+        self.inputs = inputs
+        self.encoders = encoders
+        self.precision = precision
+
+    @cached_property
+    def values(self) -> dict:
+        # eval_context leaves the caller's trace without enabling eager
+        # constant folding of Flax's discarded parameter initializers.
+        with eval_context(), jax.default_matmul_precision(self.precision):
+            tokens = {keyword: condition.encoder.tokenize([condition.unconditional])
+                      for keyword, condition in self.inputs.conditions.items()}
+            encoded = {keyword: condition.encoder.encode(self.encoders[keyword], tokens[keyword])
+                       for keyword, condition in self.inputs.conditions.items()}
+            return jax.tree.map(np.asarray, encoded)
+
+    def __call__(self, like: dict) -> dict:
+        return jax.tree.map(lambda blank, value: jnp.asarray(blank, value.dtype), self.values, like)
+
+
 class TunedLatents(NamedTuple):
     """An end-to-end step's latents: the autoencoder's raw draw, the batch
     normalized samples the model trains on and the running statistics
@@ -259,29 +289,20 @@ class DiffusionObjective(Objective[Ratio]):
                 for keyword, condition in self.inputs.conditions.items()}
 
     @cached_property
-    def unconditional_conditions(self) -> dict:
-        """The fixed prompts encoded once, on first use, over the bound towers.
+    def _fixed_blank(self) -> FixedBlank:
+        return FixedBlank(self.inputs, self.encoder_params(), self._condition_precision)
 
+    @property
+    def unconditional_conditions(self) -> dict:
+        """The configured unconditional branch, lazily encoded over the bound
+        towers with the original eager operations and construction precision.
         Building or shape-checking a restored model does not run its towers.
-        The encode keeps the original eager operations and construction-time
-        matmul precision, so moving its first use does not fuse or change the
-        arithmetic. The small host result remains a constant in each training
-        step and sampling call.
         """
-        # Leave a caller's trace without enabling eager constant folding:
-        # Flax checks parameter shapes with eval_shape(initializer), and
-        # constant folding would compute those discarded random weights.
-        with eval_context(), jax.default_matmul_precision(self._condition_precision):
-            return jax.tree.map(np.asarray, self.encode(self.encoder_params()))
+        return self._fixed_blank.values
 
     def blank_conditions(self, like: dict) -> dict:
-        """Cast the stored unconditional conditions to the conditional branch's dtypes.
-
-        `like` is the conditional branch. The values themselves were
-        cached on first use, so subsequent calls only change dtype.
-        """
-        return jax.tree.map(lambda blank, value: jnp.asarray(blank, value.dtype),
-                            self.unconditional_conditions, like)
+        """Cast the cached unconditional branch to the conditional dtypes."""
+        return self._fixed_blank(like)
 
     def held_variables(self) -> Variables:
         """Every array `init` starts from rather than draws: a whole pretrained
