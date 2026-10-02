@@ -151,7 +151,9 @@ def test_the_block_matches_the_reference_and_is_sparse():
 
     ours = np.asarray(module().apply(variables, jnp.asarray(hidden), attention_metadata=metadata))
     assert scaled(ours[valid], wanted[valid]) < BOUND
-    dense = np.asarray(module(index_topk=64).apply(variables, jnp.asarray(hidden), attention_metadata=metadata))
+    dense = np.asarray(
+        module(index_topk=64).apply(variables, jnp.asarray(hidden), attention_metadata=metadata)
+    )
     assert scaled(dense[valid], wanted[valid]) > 1e-2
 
 
@@ -223,8 +225,13 @@ def decode_steps(block_module, variables, hidden, valid, prefill: int):
                                     attention_metadata=metadata(0, prefill), mutable=["cache"])
     steps = [out]
     for position in range(prefill, S):
-        out, state = block_module.apply({**variables, **state}, x[:, position:position + 1], decode=True,
-                                        attention_metadata=metadata(position, position + 1), mutable=["cache"])
+        out, state = block_module.apply(
+            {**variables, **state},
+            x[:, position : position + 1],
+            decode=True,
+            attention_metadata=metadata(position, position + 1),
+            mutable=["cache"],
+        )
         steps.append(out)
     return np.asarray(jnp.concatenate(steps, axis=1))
 
@@ -309,9 +316,13 @@ def test_prediction_selection_seed_miss_hit_and_fixed_tail():
     np.testing.assert_array_equal(drafted["cache"]["selection_position"], [4, 2])
     assert 2 in np.asarray(drafted["cache"]["selection_indices"])[1]
     _, next_draft = selection_step(block, variables, drafted["cache"], x[:, 6:7], active[:, 6:7], "draft")
-    np.testing.assert_array_equal(next_draft["cache"]["selection_indices"], drafted["cache"]["selection_indices"])
+    np.testing.assert_array_equal(
+        next_draft["cache"]["selection_indices"], drafted["cache"]["selection_indices"]
+    )
     assert 6 not in np.asarray(next_draft["cache"]["selection_indices"])[0]
-    ordinary, cleared = selection_step(block, variables, next_draft["cache"], x[:, 7:8], active[:, 7:8], "ordinary")
+    ordinary, cleared = selection_step(
+        block, variables, next_draft["cache"], x[:, 7:8], active[:, 7:8], "ordinary"
+    )
     canonical = {name: value for name, value in next_draft["cache"].items()
                  if name not in ("selection_indices", "selection_position")}
     expected, _ = selection_step(block, variables, canonical, x[:, 7:8], active[:, 7:8], "ordinary")

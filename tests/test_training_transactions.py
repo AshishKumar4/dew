@@ -89,8 +89,11 @@ def test_boundary_rejection_preserves_accepted_prefix_and_mutable_reads(composit
     data = batches()
     run = train.compile(initial, data[0])
     # the step consumes the state
-    start, opt_state, key = (jax.tree.map(np.asarray, initial.params),
-                             jax.tree.map(np.asarray, initial.opt_state), np.asarray(jax.random.key_data(initial.key)))
+    start, opt_state, key = (
+        jax.tree.map(np.asarray, initial.params),
+        jax.tree.map(np.asarray, initial.opt_state),
+        np.asarray(jax.random.key_data(initial.key)),
+    )
     prefix, *_ = run(initial, data[0])
     # the step consumes the state
     prefix_scale = float(prefix.scale.scale)
@@ -220,8 +223,11 @@ def test_real_lm_mtp_router_and_qk_update_matches_combined_batch(auxiliary):
                      "text_roles": jnp.asarray(roles)})
     run = train.compile(initial, data[0])
     # the step consumes the state
-    start, opt_state, key = (jax.tree.map(np.asarray, initial.params),
-                             jax.tree.map(np.asarray, initial.opt_state), np.asarray(jax.random.key_data(initial.key)))
+    start, opt_state, key = (
+        jax.tree.map(np.asarray, initial.params),
+        jax.tree.map(np.asarray, initial.opt_state),
+        np.asarray(jax.random.key_data(initial.key)),
+    )
     partial, *_ = run(initial, data[0])
     for before, after in zip(jax.tree.leaves(start), jax.tree.leaves(partial.params), strict=True):
         np.testing.assert_array_equal(before, after)

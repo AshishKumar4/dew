@@ -88,7 +88,9 @@ def site(spec, params, streams, output):
     if not isinstance(outputs, tuple) or len(outputs) != 3:
         raise TypeError("a hyper-connection site returns (post, comb, collapsed)")
     post, comb, collapsed = outputs
-    return collapsed, mix_streams(post, comb, jnp.asarray(output, jnp.float32), jnp.asarray(streams, jnp.float32))
+    return collapsed, mix_streams(
+        post, comb, jnp.asarray(output, jnp.float32), jnp.asarray(streams, jnp.float32)
+    )
 
 
 def test_the_site_mapping_and_mixing_match_the_oracle(case):
@@ -133,8 +135,9 @@ def test_the_gradients_match_central_differences_of_the_oracle(case):
         _, mixed = site(spec, params, streams, output)
         return jnp.sum(mixed * jnp.asarray(cotangent, jnp.float32))
 
-    grads = jax.grad(loss_module, argnums=(0, 1))(jnp.asarray(streams, jnp.float32),
-                                                   jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float32), params))
+    grads = jax.grad(loss_module, argnums=(0, 1))(
+        jnp.asarray(streams, jnp.float32), jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float32), params)
+    )
     ours = {"streams": grads[0], **grads[1]}
     arguments = {"streams": streams, **params}
     for name, value in arguments.items():

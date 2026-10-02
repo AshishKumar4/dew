@@ -155,8 +155,14 @@ def test_complete_groups_are_packed_and_the_next_batch_is_submitted_ahead():
     indices, weight = trained(batch)
     assert indices == [0, 1, 2, 3] and weight == pytest.approx(4.0)
     # Sample rewards 0 and 1 in each group, centred per group.
-    by_rollout = {int(i): float(a) for i, a in zip(batch["session_index"][batch["response_mask"] > 0],
-                                                   batch["advantages"][batch["response_mask"] > 0], strict=True)}
+    by_rollout = {
+        int(i): float(a)
+        for i, a in zip(
+            batch["session_index"][batch["response_mask"] > 0],
+            batch["advantages"][batch["response_mask"] > 0],
+            strict=True,
+        )
+    }
     assert by_rollout == pytest.approx({0: -.5, 1: .5, 2: -.5, 3: .5})
     np.testing.assert_allclose(batch["old_log_probs"], -0.75 * batch["response_mask"])
     record = records[-1]
@@ -207,7 +213,9 @@ def test_a_truncated_member_completes_its_group_but_carries_no_loss():
     rollout, data, records = scheduler(source, ahead=0, groups=3)
     batch = rollout(State(0), next(iter(data.train(DataPartition()))), None)
     metrics = records[-1].metrics
-    assert metrics["status/completed"] == pytest.approx(4 / 6) and metrics["status/truncated"] == pytest.approx(2 / 6)
+    assert metrics["status/completed"] == pytest.approx(4 / 6) and metrics[
+        "status/truncated"
+    ] == pytest.approx(2 / 6)
     assert source.submitted == [("1", 3, 0), ("2", 3, 0)]
     indices, _ = trained(batch)
     assert indices == [0, 2, 3, 5]
@@ -303,8 +311,11 @@ def test_a_spare_that_fails_after_its_group_filled_neither_abandons_nor_retries_
 
 
 def test_a_straggler_is_waited_for_and_admitted_when_it_finishes():
-    source = Scripted(lambda task, submission, sample, version: None if (task, sample) == ("2", 1) else finished(
-        float(sample), version))
+    source = Scripted(
+        lambda task, submission, sample, version: None
+        if (task, sample) == ("2", 1)
+        else finished(float(sample), version)
+    )
     rollout, data, records = scheduler(source, ahead=0)
     stream = iter(data.train(DataPartition()))
     late = threading.Timer(0.05, lambda: source.running[0].set_result(finished(3.0, 0)))
@@ -344,8 +355,11 @@ def bounded(rollout, state, batch, source, seconds=20.0):
 
 
 def test_a_rollout_past_its_deadline_is_cancelled_and_retried_and_counts_as_a_failed_attempt():
-    source = Scripted(lambda task, submission, sample, version: None if (task, submission, sample) == ("1", 0, 0)
-                      else finished(float(sample), version))
+    source = Scripted(
+        lambda task, submission, sample, version: None
+        if (task, submission, sample) == ("1", 0, 0)
+        else finished(float(sample), version)
+    )
     rollout, data, records = scheduler(source, ahead=0, timeout=0.05)
     batch = bounded(rollout, State(0), next(iter(data.train(DataPartition()))), source)
     assert records[-1].resubmitted == {"timeout": 1} and records[-1].cancelled == 1
@@ -469,7 +483,9 @@ def test_a_batch_that_did_not_come_through_the_stream_is_refused():
 ])
 def test_a_schedule_that_could_exceed_the_bound_is_refused(options, message):
     with pytest.raises(ValueError, match=message):
-        RolloutScheduler(Objective(), Scripted(lambda *_: None), Publisher(), width=WIDTH, rows=ROWS, **options)
+        RolloutScheduler(
+            Objective(), Scripted(lambda *_: None), Publisher(), width=WIDTH, rows=ROWS, **options
+        )
 
 
 VOCAB = 13
@@ -519,7 +535,9 @@ def test_a_trainer_run_trains_through_multi_turn_environments_on_the_native_serv
     def watched(task, samples, *, version):
         futures = submit(task, samples, version=version)
         for future in futures:
-            future.add_done_callback(lambda done: rollouts.append(done.result()) if not done.cancelled() else None)
+            future.add_done_callback(
+                lambda done: rollouts.append(done.result()) if not done.cancelled() else None
+            )
         return futures
 
     episodes.submit = watched
@@ -532,8 +550,16 @@ def test_a_trainer_run_trains_through_multi_turn_environments_on_the_native_serv
     records = []
     scheduler = RolloutScheduler(target, episodes, server, width=width, rows=2 * tasks, groups=2,
                                  max_lag=2, ahead=1, sync_every=2, log=records.append)
-    stream = scheduler.tasks(Dataset(train=lambda partition: ({"task_id": np.arange(tasks, dtype=np.int32) + step * tasks}
-                                                              for step in range(100)), val=None, records=None, batch=tasks))
+    stream = scheduler.tasks(
+        Dataset(
+            train=lambda partition: (
+                {"task_id": np.arange(tasks, dtype=np.int32) + step * tasks} for step in range(100)
+            ),
+            val=None,
+            records=None,
+            batch=tasks,
+        )
+    )
     try:
         trainer = Trainer(target, optax.adam(1e-2), key=jax.random.key(3), rollout=scheduler,
                           layout=Layout(min_shard=1, tolerance=1.0))
@@ -556,4 +582,7 @@ def test_a_trainer_run_trains_through_multi_turn_environments_on_the_native_serv
         assert len(rollout.calls) == 2
         assert pack([rollout], width)["input_ids"].shape[0] == 1
     assert server.version == 2
-    assert not all(jnp.array_equal(a, b) for a, b in zip(jax.tree.leaves(params), jax.tree.leaves(state.params), strict=True))
+    assert not all(
+        jnp.array_equal(a, b)
+        for a, b in zip(jax.tree.leaves(params), jax.tree.leaves(state.params), strict=True)
+    )

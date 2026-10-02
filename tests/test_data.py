@@ -718,7 +718,9 @@ def test_local_videos_lists_every_file_under_the_directory(tmp_path):
 
     records = LocalVideos(path=str(tmp_path), caption="a clip").source()
 
-    assert [r["video_path"] for r in records] == sorted([str(c) for c in clips] + [str(tmp_path / "extra.webm")])
+    assert [r["video_path"] for r in records] == sorted(
+        [str(c) for c in clips] + [str(tmp_path / "extra.webm")]
+    )
     assert {r["caption"] for r in records} == {"a clip"}
     with pytest.raises(ValueError, match="path="):
         LocalVideos().source()

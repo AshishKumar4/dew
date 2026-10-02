@@ -503,7 +503,14 @@ def test_a_checkpoint_written_by_one_process_restores_in_a_pool(tmp_path):
     expected = dumped_params(tmp_path / "single.json")
     for index, report in enumerate(pool):
         assert report["restored_step"] == 4
-        assert report["mesh_shape"] == {"data": 2, "expert": 1, "fsdp": 4, "tensor": 1, "sequence": 1, "stage": 1}
+        assert report["mesh_shape"] == {
+            "data": 2,
+            "expert": 1,
+            "fsdp": 4,
+            "tensor": 1,
+            "sequence": 1,
+            "stage": 1,
+        }
         assert report["sharding"]["fully_addressable"] == [False]
         assert largest_difference(
             dumped_params(tmp_path / "pool" / f"process{index}.json"), expected) == 0.0
@@ -1166,7 +1173,9 @@ def test_the_front_door_answers_the_same_rows_on_a_pool(tmp_path):
                                            "prepared", "prepared_rows", "request_kind", "budget"}
         assert any("fsdp" in spec for spec in report["parameter_specs"])
     assert single["image_rows"] == single["rows"] == 6
-    np.testing.assert_allclose(reports[0]["images"] + reports[1]["images"], single["images"], atol=2e-5, rtol=2e-5)
+    np.testing.assert_allclose(
+        reports[0]["images"] + reports[1]["images"], single["images"], atol=2e-5, rtol=2e-5
+    )
     assert reports[0]["tokens"] + reports[1]["tokens"] == single["tokens"]
     assert reports[0]["text"] + reports[1]["text"] == single["text"]
 

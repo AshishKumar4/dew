@@ -23,12 +23,25 @@ def edges(tmp_path_factory):
     return directory
 
 
-@pytest.mark.parametrize("case", ["ddim-linspace", "pndm-linspace", "ddim-clip", "euler-zero-snr", "dpm-karras", "norm", "odd"])
+@pytest.mark.parametrize(
+    "case", ["ddim-linspace", "pndm-linspace", "ddim-clip", "euler-zero-snr", "dpm-karras", "norm", "odd"]
+)
 def test_native_source_control_and_gradient_parity(edges, case):
-    result = subprocess.run([sys.executable, str(ROOT / "tools/check_native_diffusion_edges.py"), str(edges), case],
-        cwd=ROOT, capture_output=True, text=True, timeout=180,
-        env={**os.environ, "PYTHONPATH": str(ROOT / "src"), "JAX_PLATFORMS": "cpu", "USE_TF": "0",
-             "OMP_NUM_THREADS": "2", "OPENBLAS_NUM_THREADS": "1"})
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "tools/check_native_diffusion_edges.py"), str(edges), case],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=180,
+        env={
+            **os.environ,
+            "PYTHONPATH": str(ROOT / "src"),
+            "JAX_PLATFORMS": "cpu",
+            "USE_TF": "0",
+            "OMP_NUM_THREADS": "2",
+            "OPENBLAS_NUM_THREADS": "1",
+        },
+    )
     assert result.returncode == 0, result.stdout + result.stderr
 
 
@@ -82,8 +95,15 @@ def test_source_pndm_does_not_substitute_epsilon_history_for_velocity(edges):
         SourceSchedule.from_config({**config, "prediction_type": "v_prediction"})
 
 
-@pytest.mark.parametrize("control,value", [("center_input_sample", True), ("resnet_time_scale_shift", "scale_shift"),
-                                           ("act_fn", "mish"), ("conv_in_kernel", 1)])
+@pytest.mark.parametrize(
+    "control,value",
+    [
+        ("center_input_sample", True),
+        ("resnet_time_scale_shift", "scale_shift"),
+        ("act_fn", "mish"),
+        ("conv_in_kernel", 1),
+    ],
+)
 def test_unimplemented_unet_operations_are_explicit(edges, control, value):
     config = json.loads((edges / "unet/config.json").read_text())
     with pytest.raises(ValueError):

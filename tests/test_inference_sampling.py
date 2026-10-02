@@ -232,7 +232,10 @@ def test_unsupported_source_controls_report_their_reason(task):
         "cache": ({"use_cache": False}, "its own cache"),
         "quantized cache": ({"cache_config": {"backend": "quanto"}}, "quantized and offloaded"),
         "chunked prefill": ({"prefill_chunk_size": 8}, "one call"),
-        "continuous batching": ({"continuous_batching_config": {"max_batch_tokens": 8}}, "continuous batching"),
+        "continuous batching": (
+            {"continuous_batching_config": {"max_batch_tokens": 8}},
+            "continuous batching",
+        ),
         "scores": ({"output_scores": True}, "per-step distributions"),
         "hidden states": ({"output_hidden_states": True}, "hidden states"),
         "no compile": ({"disable_compile": True}, "always runs compiled"),

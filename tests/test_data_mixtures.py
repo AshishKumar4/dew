@@ -504,9 +504,13 @@ def test_a_run_of_one_mixture_resumes_into_phases_that_begin_with_it(tmp_path):
     for processes in (1, 2):
         assert pooled(open_stream, processes, 5, state, rows=windows_of) == whole[2:]
     with pytest.raises(ValueError, match="phase 0 reads something else"):
-        phased_packed(first, second, (both, 4), (first, None)).load(batch=4).train(DataPartition()).set_state(state)
+        phased_packed(first, second, (both, 4), (first, None)).load(batch=4).train(DataPartition()).set_state(
+            state
+        )
     with pytest.raises(ValueError, match="past this run's end of phase 0"):
-        phased_packed(first, second, (first, 1), (both, None)).load(batch=4).train(DataPartition()).set_state(state)
+        phased_packed(first, second, (first, 1), (both, None)).load(batch=4).train(DataPartition()).set_state(
+            state
+        )
 
 
 def test_a_phased_run_resumes_past_a_switch_and_refuses_a_changed_history(tmp_path):
@@ -540,7 +544,9 @@ def test_a_phased_run_resumes_past_a_switch_and_refuses_a_changed_history(tmp_pa
 def test_phases_are_a_list_of_ends_and_refuse_a_ramp(tmp_path):
     _, first, second = weighted_packed(tmp_path, (1.0, 1.0))
     with pytest.raises(ValueError, match="ends must increase"):
-        phased_packed(first, second, (first, 3), (second, 3), (first, None)).load(batch=4).train(DataPartition())
+        phased_packed(first, second, (first, 3), (second, 3), (first, None)).load(batch=4).train(
+            DataPartition()
+        )
     with pytest.raises(ValueError, match="the last runs on"):
         phased_packed(first, second, (first, 3), (second, 5)).load(batch=4).train(DataPartition())
     spec = phased_packed(first, second, (first, 3), (second, None))

@@ -67,7 +67,11 @@ def recorded_classes(annotation: registry.Annotation) -> list[type]:
     annotation = registry.resolve_alias(annotation)
     held = _registry_for(annotation)
     if held is not None:
-        return [member for member in held.values() if isinstance(member, type) and dataclasses.is_dataclass(member)]
+        return [
+            member
+            for member in held.values()
+            if isinstance(member, type) and dataclasses.is_dataclass(member)
+        ]
     if isinstance(annotation, type) and dataclasses.is_dataclass(annotation):
         return [annotation]
     return [cls for argument in typing.get_args(annotation) for cls in recorded_classes(argument)]
@@ -116,7 +120,11 @@ def snapshot_default(field: dataclasses.Field, annotation):
     if "legacy" in field.metadata:
         return described(field.metadata["legacy"], annotation)
     factory = field.default_factory
-    if factory is not dataclasses.MISSING and not isinstance(factory, type) and factory.__name__ != "<lambda>":
+    if (
+        factory is not dataclasses.MISSING
+        and not isinstance(factory, type)
+        and factory.__name__ != "<lambda>"
+    ):
         value = factory()
         if not dataclasses.is_dataclass(value):
             return {"factory": name_of(factory)}

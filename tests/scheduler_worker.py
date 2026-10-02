@@ -59,7 +59,9 @@ def main() -> None:
                 call = Call((1 + int(task.id) % 7, 2 + int(task.id) % 5), (3 + draw % 4, 4 + sample),
                             (-0.5 - 0.01 * sample, -0.25), "stop", version)
                 future = Future()
-                future.set_result(Session(str(task.id), "", 0, 0, (call,), Status.COMPLETED, float(sample), {}, ""))
+                future.set_result(
+                    Session(str(task.id), "", 0, 0, (call,), Status.COMPLETED, float(sample), {}, "")
+                )
                 futures.append(future)
             return futures
 
@@ -86,8 +88,14 @@ def main() -> None:
         return packed
 
     objective = GRPOObjective(model, seq_len=7, pretrained=params, behavior_importance=2.0)
-    trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(5), mesh=MeshSpec(**json.loads(args.mesh)),
-                      layout=Layout(min_shard=TINY_SHARD), rollout=rollout)
+    trainer = Trainer(
+        objective,
+        optax.sgd(0.1),
+        key=jax.random.key(5),
+        mesh=MeshSpec(**json.loads(args.mesh)),
+        layout=Layout(min_shard=TINY_SHARD),
+        rollout=rollout,
+    )
     partition = data_partition(trainer.device_mesh)
     # Two samples a task, two chains of four ids a row of eight.
     scheduler = RolloutScheduler(objective, Scripted(), Publisher(), width=8, rows=partition.rows(TASKS),

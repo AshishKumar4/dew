@@ -44,14 +44,20 @@ def test_greedy_generation_follows_the_full_sequence_argmax(rng):
     prompt = jax.random.randint(rng, (3, 5), 0, VOCAB)
     params = model.init(rng, prompt)
 
-    generated = generate(model, params, prompt, 6, key=jax.random.PRNGKey(1), sampling=Sampling(temperature=0)).tokens
+    generated = generate(
+        model, params, prompt, 6, key=jax.random.PRNGKey(1), sampling=Sampling(temperature=0)
+    ).tokens
     assert generated.shape == (3, 11)
     assert generated.dtype == jnp.int32
     assert jnp.array_equal(generated[:, :5], prompt)
     assert jnp.array_equal(generated, argmax_walk(model, params, prompt, 6))
     # greedy ignores the rng, so two calls cannot disagree
     assert jnp.array_equal(
-        generated, generate(model, params, prompt, 6, key=jax.random.PRNGKey(7), sampling=Sampling(temperature=0)).tokens)
+        generated,
+        generate(
+            model, params, prompt, 6, key=jax.random.PRNGKey(7), sampling=Sampling(temperature=0)
+        ).tokens,
+    )
 
 
 def test_a_pattern_and_its_kinds_from_json_can_generate(rng):
@@ -64,7 +70,9 @@ def test_a_pattern_and_its_kinds_from_json_can_generate(rng):
     prompt = jax.random.randint(rng, (2, 4), 0, VOCAB)
     params = model.init(rng, prompt)
 
-    generated = generate(model, params, prompt, 2, key=jax.random.PRNGKey(1), sampling=Sampling(temperature=0)).tokens
+    generated = generate(
+        model, params, prompt, 2, key=jax.random.PRNGKey(1), sampling=Sampling(temperature=0)
+    ).tokens
 
     assert jnp.array_equal(generated, argmax_walk(model, params, prompt, 2))
 
@@ -74,14 +82,20 @@ def test_sampling_stays_in_the_vocab_and_reacts_to_the_rng(rng):
     prompt = jax.random.randint(rng, (4, 4), 0, VOCAB)
     params = model.init(rng, prompt)
 
-    sampled = generate(model, params, prompt, 8, key=jax.random.PRNGKey(0), sampling=Sampling(temperature=1.0)).tokens
+    sampled = generate(
+        model, params, prompt, 8, key=jax.random.PRNGKey(0), sampling=Sampling(temperature=1.0)
+    ).tokens
     assert sampled.shape == (4, 12)
     assert jnp.all((sampled >= 0) & (sampled < VOCAB))
 
-    other = generate(model, params, prompt, 8, key=jax.random.PRNGKey(1), sampling=Sampling(temperature=1.0)).tokens
+    other = generate(
+        model, params, prompt, 8, key=jax.random.PRNGKey(1), sampling=Sampling(temperature=1.0)
+    ).tokens
     assert not jnp.array_equal(sampled, other)
 
-    warm = generate(model, params, prompt, 8, key=jax.random.PRNGKey(0), sampling=Sampling(temperature=1.0)).tokens
+    warm = generate(
+        model, params, prompt, 8, key=jax.random.PRNGKey(0), sampling=Sampling(temperature=1.0)
+    ).tokens
     assert jnp.array_equal(sampled, warm)
 
 
@@ -90,11 +104,19 @@ def test_top_k_restricts_the_choice_and_top_one_is_greedy(rng):
     prompt = jax.random.randint(rng, (2, 4), 0, VOCAB)
     params = model.init(rng, prompt)
 
-    greedy = generate(model, params, prompt, 5, key=jax.random.PRNGKey(2), sampling=Sampling(temperature=0)).tokens
+    greedy = generate(
+        model, params, prompt, 5, key=jax.random.PRNGKey(2), sampling=Sampling(temperature=0)
+    ).tokens
     assert jnp.array_equal(
-        greedy, generate(model, params, prompt, 5, key=jax.random.PRNGKey(3), sampling=Sampling(temperature=1.0, top_k=1)).tokens)
+        greedy,
+        generate(
+            model, params, prompt, 5, key=jax.random.PRNGKey(3), sampling=Sampling(temperature=1.0, top_k=1)
+        ).tokens,
+    )
 
-    sampled = generate(model, params, prompt, 5, key=jax.random.PRNGKey(4), sampling=Sampling(temperature=0.8, top_k=5)).tokens
+    sampled = generate(
+        model, params, prompt, 5, key=jax.random.PRNGKey(4), sampling=Sampling(temperature=0.8, top_k=5)
+    ).tokens
     assert jnp.all((sampled >= 0) & (sampled < VOCAB))
     # every sampled token has to be inside the top 5 of its own step
     for step in range(5):
@@ -112,7 +134,9 @@ def test_a_single_new_token_and_none_at_all(rng):
 
     assert jnp.array_equal(prompt, generate(model, params, prompt, 0,
                                             key=jax.random.PRNGKey(0)).tokens)
-    one = generate(model, params, prompt, 1, key=jax.random.PRNGKey(0), sampling=Sampling(temperature=0)).tokens
+    one = generate(
+        model, params, prompt, 1, key=jax.random.PRNGKey(0), sampling=Sampling(temperature=0)
+    ).tokens
     assert one.shape == (2, 5)
     assert jnp.array_equal(one, argmax_walk(model, params, prompt, 1))
 
@@ -171,8 +195,9 @@ def test_continuation_zero_is_the_single_draw_and_earlier_continuations_do_not_m
         np.testing.assert_array_equal(np.asarray(getattr(two, field))[::2], single)
         np.testing.assert_array_equal(np.asarray(getattr(three, field))[::3], single)
         grown = np.asarray(getattr(three, field)).reshape((2, 3, *single.shape[1:]))
-        np.testing.assert_array_equal(grown[:, 1],
-                                      np.asarray(getattr(two, field)).reshape((2, 2, *single.shape[1:]))[:, 1])
+        np.testing.assert_array_equal(
+            grown[:, 1], np.asarray(getattr(two, field)).reshape((2, 2, *single.shape[1:]))[:, 1]
+        )
     assert not np.array_equal(np.asarray(two.tokens)[0], np.asarray(two.tokens)[1])
     np.testing.assert_array_equal(np.asarray(draw(n=3).tokens), np.asarray(three.tokens))
 
@@ -266,7 +291,9 @@ def test_copy_task_trains_and_generate_reads_the_sequence_back():
     assert copy_region > 0.9
 
     prompt = held_out[:, :PAYLOAD + 1]
-    generated = generate(model, params, prompt, PAYLOAD, key=jax.random.PRNGKey(1), sampling=Sampling(temperature=0)).tokens
+    generated = generate(
+        model, params, prompt, PAYLOAD, key=jax.random.PRNGKey(1), sampling=Sampling(temperature=0)
+    ).tokens
     assert jnp.array_equal(generated[:, PAYLOAD + 1:], held_out[:, :PAYLOAD])
 
 
@@ -288,7 +315,9 @@ def test_the_sampled_rows_keep_their_sharding_and_host_reads_them_back(rng):
     prompt = jax.random.randint(rng, (8, 3), 0, VOCAB)
     sharded = jax.device_put(prompt, batch_shardings(mesh, prompt))
 
-    generated = generate(model, placed, sharded, 3, key=jax.random.PRNGKey(0), sampling=Sampling(temperature=0))
+    generated = generate(
+        model, placed, sharded, 3, key=jax.random.PRNGKey(0), sampling=Sampling(temperature=0)
+    )
     plain = generate(model, params, prompt, 3, key=jax.random.PRNGKey(0), sampling=Sampling(temperature=0))
 
     assert generated.tokens.sharding.mesh == mesh

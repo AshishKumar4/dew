@@ -62,7 +62,9 @@ def data():
 
 
 def trainer(path, keep=1):
-    return Trainer(Overfit(), optax.sgd(0.1), key=jax.random.key(0), checkpoints=Checkpoints(str(path), keep=keep))
+    return Trainer(
+        Overfit(), optax.sgd(0.1), key=jax.random.key(0), checkpoints=Checkpoints(str(path), keep=keep)
+    )
 
 
 def test_default_retains_the_weights_with_lowest_validation_loss(tmp_path):
@@ -172,9 +174,13 @@ def test_time_cadence_and_recorded_duration(tmp_path):
     from dew.config import TrainerConfig
     from dew.data import Dataset
 
-    assert TrainerConfig(checkpoint_every='30m').checkpoint_interval(Dataset(lambda p: iter(()), None, records=4, batch=2)) == datetime.timedelta(minutes=30)
+    assert TrainerConfig(checkpoint_every="30m").checkpoint_interval(
+        Dataset(lambda p: iter(()), None, records=4, batch=2)
+    ) == datetime.timedelta(minutes=30)
     with pytest.raises(ValueError, match='positive'):
-        TrainerConfig(checkpoint_every='0m').checkpoint_interval(Dataset(lambda p: iter(()), None, records=4, batch=2))
+        TrainerConfig(checkpoint_every="0m").checkpoint_interval(
+            Dataset(lambda p: iter(()), None, records=4, batch=2)
+        )
     with pytest.raises(TypeError, match='code-only'):
         TrainerConfig(best=Best(lambda m: 0))
     run = trainer(tmp_path / 'run', keep=Keep(latest=5))
@@ -285,7 +291,9 @@ def test_validation_loss_uses_exactly_the_ema_weights_of_the_evaluated_state():
     objective = Overfit()
     live = {'params': {'w': jnp.asarray(.9)}}
     averaged = {'params': {'w': jnp.asarray(.5)}}
-    result = evaluate(objective, live, data().val, key=jax.random.key(0), averaged=averaged, step=7, loss=True)
+    result = evaluate(
+        objective, live, data().val, key=jax.random.key(0), averaged=averaged, step=7, loss=True
+    )
     assert result.step == 7
     assert result.scores['val/loss'] == 0.
     direct = evaluate(objective, averaged, data().val, key=jax.random.key(0), step=7, loss=True)

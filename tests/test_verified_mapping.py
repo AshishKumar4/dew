@@ -50,20 +50,35 @@ CWM = ("hf-tiny-v2/tiny-random-CwmForCausalLM", "e0acc36e9533b85c5af948f7662edbd
 FP32, BF16 = 4.2e-7, 8.1e-3
 REFUSED = {
     # Every fourth layer without rotary positions.
-    "smollm3": ("HuggingFaceTB/SmolLM3-3B", "a07cc9a04f16550a088caea529712d1d335b0ac1",
-                r"SmolLM3ForCausalLM and the convention disagree .* \['no_rope_layer_interval', 'no_rope_layers'\]"),
+    "smollm3": (
+        "HuggingFaceTB/SmolLM3-3B",
+        "a07cc9a04f16550a088caea529712d1d335b0ac1",
+        r"SmolLM3ForCausalLM and the convention disagree .* \['no_rope_layer_interval', 'no_rope_layers'\]",
+    ),
     # Embedding, residual, attention and logit multipliers.
-    "granite": ("ibm-granite/granite-4.1-3b", "c0650403e44e78ec0262dab1c90914c65b196c4e",
-                r"GraniteForCausalLM and the convention disagree .* 'residual_multiplier'"),
+    "granite": (
+        "ibm-granite/granite-4.1-3b",
+        "c0650403e44e78ec0262dab1c90914c65b196c4e",
+        r"GraniteForCausalLM and the convention disagree .* 'residual_multiplier'",
+    ),
     # Llama's names and fields, a different rotary: the modeling alone differs.
-    "ernie4_5": ("baidu/ERNIE-4.5-0.3B-PT", "b565cf6caebdb7a1eadf00100857b1ed5e044f12",
-                 r"Ernie4_5ForCausalLM and the convention disagree"),
+    "ernie4_5": (
+        "baidu/ERNIE-4.5-0.3B-PT",
+        "b565cf6caebdb7a1eadf00100857b1ed5e044f12",
+        r"Ernie4_5ForCausalLM and the convention disagree",
+    ),
     # Phi-3's longrope and fused projections.
-    "phi3": ("microsoft/Phi-4-mini-instruct", "cfbefacb99257ffa30c83adab238a50856ac3083",
-             r"rope_type 'longrope'"),
+    "phi3": (
+        "microsoft/Phi-4-mini-instruct",
+        "cfbefacb99257ffa30c83adab238a50856ac3083",
+        r"rope_type 'longrope'",
+    ),
     # OLMo 2's q/k norms over the whole projection and its post-norms.
-    "olmo2": ("allenai/OLMo-2-0425-1B", "a1847dff35000b4271fa70afc5db10fd29fedbdf",
-              r"Olmo2ForCausalLM holds \d+ parameters at the probe's sizes"),
+    "olmo2": (
+        "allenai/OLMo-2-0425-1B",
+        "a1847dff35000b4271fa70afc5db10fd29fedbdf",
+        r"Olmo2ForCausalLM holds \d+ parameters at the probe's sizes",
+    ),
 }
 
 
@@ -103,7 +118,9 @@ def test_the_probe_holds_its_bound_at_a_gpus_default_tf32_precision(tmp_path):
               "load_pretrained(sys.argv[1], dtype='float32', attention_impl='reference')")
     env = {name: value for name, value in os.environ.items()
            if name not in ("JAX_DEFAULT_MATMUL_PRECISION", "XLA_FLAGS")}
-    run = subprocess.run([sys.executable, "-c", script, str(tmp_path)], capture_output=True, text=True, env=env)
+    run = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)], capture_output=True, text=True, env=env
+    )
     assert run.returncode == 0, run.stderr[-1500:]
     assert TIER2 in run.stderr
 

@@ -364,12 +364,16 @@ def test_a_server_on_an_expert_mesh_draws_what_one_device_draws(dispatch):
                                   mlp_features=32, max_seq_len=128, dtype="float32",
                                   mixture=Mixture(experts=4, top_k=2, dispatch=dispatch))
         params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)) if params is None else params
-        return TextGeneration(model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0, eos_id=EOS))
+        return TextGeneration(
+            model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0, eos_id=EOS)
+        )
 
     lone = generation("global", None)
     alone = [lone(prompt, budget, key=index)
              for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
-    served = generation(dispatch, place(lone.variables, MeshSpec(expert=4), Layout(min_shard=1, tolerance=1.0)))
+    served = generation(
+        dispatch, place(lone.variables, MeshSpec(expert=4), Layout(min_shard=1, tolerance=1.0))
+    )
     server, tickets = served_alongside(served, slots=8, admission=8, kv_cache=KVCache(page_size=16, pages=32))
     assert server.groups == jax.device_count()
     for ticket, row in zip(tickets, [*alone, alone[2]], strict=True):

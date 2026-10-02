@@ -1055,7 +1055,9 @@ def mode_evaluation_replicas(args) -> dict:
     state, _, _ = trainer.place()
     batch = {"a_metadata": np.asarray(7), "a_python": 9,
              "x": np.arange(3, dtype=np.float32)[:, None]}
-    data = Dataset(train=lambda partition: iter([batch]), val=lambda partition: iter([batch]), records=3, batch=3)
+    data = Dataset(
+        train=lambda partition: iter([batch]), val=lambda partition: iter([batch]), records=3, batch=3
+    )
     measured = evaluate(trainer.objective, state.params, data.val, metrics=(Count(),),
                         key=state.key, mesh=trainer.device_mesh).scalars
     unconsumed = evaluate(trainer.objective, state.params, data.val, key=state.key,
@@ -1341,7 +1343,10 @@ def mode_rollout(args) -> dict:
 
     def inputs_for(records):
         tokens = jnp.asarray(records["prompt"])
-        mask = jnp.arange(tokens.shape[1])[None, :] >= tokens.shape[1] - jnp.asarray(records["prompt_length"])[:, None]
+        mask = (
+            jnp.arange(tokens.shape[1])[None, :]
+            >= tokens.shape[1] - jnp.asarray(records["prompt_length"])[:, None]
+        )
         return ModelInputs(tokens, {"attention_mask": mask})
 
     greedy = generate(model, params, inputs_for(batch), 4, key=jax.random.key(1),
@@ -1373,8 +1378,12 @@ def mode_rollout(args) -> dict:
 
     resident = shard_batch(trainer.device_mesh, {"prompt": local["prompt"]})["prompt"]
     controls = Sampling(temperature=0.8, top_k=5, eos_id=eos, pad_id=12)
-    through_task = TextGeneration(model, state.params)(resident, 4, key=jax.random.key(27), sampling=controls).host()
-    direct = generate(model, state.params, local["prompt"], 4, key=jax.random.key(27), sampling=controls).host()
+    through_task = TextGeneration(model, state.params)(
+        resident, 4, key=jax.random.key(27), sampling=controls
+    ).host()
+    direct = generate(
+        model, state.params, local["prompt"], 4, key=jax.random.key(27), sampling=controls
+    ).host()
     invalid_errors = {}
     if processes > 1:
         invalid_errors = _rejected_inputs(model, state, local, rollout, sampling, inputs_for, rank)
@@ -1448,8 +1457,9 @@ def mode_inference_pipeline(args) -> dict:
             "guidance": lambda: images(prompts, steps=3, key=5, guidance="invalid" if rank == 1 else 3.0),
             "steps": lambda: images(prompts, steps=0 if rank == 1 else 3, key=5),
             "row_count": lambda: images.prepare(prompts[:1] if rank == 1 else prompts, steps=3, key=5),
-            "prepared": lambda: images(replace(prepared, noise=prepared.noise[:, :-1]) if rank == 1 else prepared,
-                                        steps=3, key=5),
+            "prepared": lambda: images(
+                replace(prepared, noise=prepared.noise[:, :-1]) if rank == 1 else prepared, steps=3, key=5
+            ),
             "prepared_rows": lambda: images(replace(padded_one, rows=rank + 1), steps=3, key=5),
             "request_kind": lambda: images(prepared if rank == 1 else prompts, steps=3, key=5),
             "budget": lambda: replace(text, max_new_tokens=None if rank == 1 else 4)(requests, key=5),
@@ -1761,13 +1771,27 @@ def mode_decoding_components(args) -> dict:
     refused = []
     if processes > 1:
         divergences = {
-            "criterion payload": (chain, (decoding.EndOfSequence(
-                jnp.asarray([3 if rank == 1 else 5], jnp.int32)),)),
+            "criterion payload": (
+                chain,
+                (decoding.EndOfSequence(jnp.asarray([3 if rank == 1 else 5], jnp.int32)),),
+            ),
             "transform identity": (
-                (*chain[:1], jax.tree_util.Partial((lambda state, scores: scores.at[:, 0].add(4.0)) if rank == 1 else raise_last), *chain[2:]), ()),
+                (
+                    *chain[:1],
+                    jax.tree_util.Partial(
+                        (lambda state, scores: scores.at[:, 0].add(4.0)) if rank == 1 else raise_last
+                    ),
+                    *chain[2:],
+                ),
+                (),
+            ),
             "transform payload": (
-                (decoding.RepetitionPenalty(1.3),
-                 decoding.SuppressTokens(jnp.asarray([2 if rank == 1 else 6], jnp.int32))), ()),
+                (
+                    decoding.RepetitionPenalty(1.3),
+                    decoding.SuppressTokens(jnp.asarray([2 if rank == 1 else 6], jnp.int32)),
+                ),
+                (),
+            ),
         }
         for name, (logits, stopping) in divergences.items():
             try:

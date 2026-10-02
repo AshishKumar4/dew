@@ -341,7 +341,24 @@ def stop_string_tokenizer(tmp_path):
     from tokenizers import Tokenizer, decoders, models
     from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
-    pieces = ["st", "op", "sto", "pper", "las", "topper", "s", "to", "pped", "stop", "at", "opera", "tion", "x", "yy", *list("abcdef")]
+    pieces = [
+        "st",
+        "op",
+        "sto",
+        "pper",
+        "las",
+        "topper",
+        "s",
+        "to",
+        "pped",
+        "stop",
+        "at",
+        "opera",
+        "tion",
+        "x",
+        "yy",
+        *list("abcdef"),
+    ]
     vocabulary = {"<unk>": 0}
     vocabulary.update({piece: index for index, piece in enumerate(pieces, start=1)})
     backend = Tokenizer(models.BPE(vocabulary, [], unk_token="<unk>"))

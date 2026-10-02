@@ -91,8 +91,13 @@ def test_disk_source_reads_shards_and_bounds_cache(tmp_path):
     with SafetensorsBanks(tmp_path, cache_bytes=1, param_dtype="float32") as source:
         row = source.read(0)
         expected = translate_weights(read_weights(FIXTURE), translate_config(source.config), "mixtral")
-        for actual, reference in zip(jax.tree.leaves(row), jax.tree.leaves(
-                {name: tree["layers_0"] for name, tree in expected.items() if "layers_0" in tree}), strict=True):
+        for actual, reference in zip(
+            jax.tree.leaves(row),
+            jax.tree.leaves(
+                {name: tree["layers_0"] for name, tree in expected.items() if "layers_0" in tree}
+            ),
+            strict=True,
+        ):
             np.testing.assert_array_equal(actual, reference)
             assert not actual.flags.writeable
         assert source.stats().cache_bytes <= 1
@@ -233,7 +238,9 @@ def test_runtime_scan_fetches_exactly_the_stored_expert_weights():
             def step(carry, index):
                 fetched = reader.fetch(index, carry)
                 expected = _fetched_layer(bank, index)
-                equals = jax.tree.map(lambda actual, reference: jnp.all(actual == reference), fetched, expected)
+                equals = jax.tree.map(
+                    lambda actual, reference: jnp.all(actual == reference), fetched, expected
+                )
                 return carry + 1, jnp.all(jnp.stack(jax.tree.leaves(equals)))
 
             return jax.lax.scan(step, jnp.zeros((1, 1, 1)), jnp.arange(model.num_layers))[1]

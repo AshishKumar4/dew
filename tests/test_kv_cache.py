@@ -171,8 +171,9 @@ def test_native_gpu_paged_value_and_vjp_keep_the_gathered_attention(without_dete
             value = reference(q, k, v)
             return jnp.sum(value ** 2), value
 
-        (_, truth), derivatives = jax.jit(jax.value_and_grad(reference_loss, argnums=(0, 1, 2), has_aux=True))(
-            q.astype(jnp.float64), k.astype(jnp.float64), v.astype(jnp.float64))
+        (_, truth), derivatives = jax.jit(
+            jax.value_and_grad(reference_loss, argnums=(0, 1, 2), has_aux=True)
+        )(q.astype(jnp.float64), k.astype(jnp.float64), v.astype(jnp.float64))
         for actual, expected in zip((out, *gradients), (truth, *derivatives), strict=True):
             expected = np.asarray(expected)
             assert np.abs(np.asarray(actual, np.float64) - expected).max() <= 2 ** -6 * np.abs(expected).max()

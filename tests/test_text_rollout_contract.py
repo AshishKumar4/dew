@@ -44,7 +44,9 @@ def prompts():
 
 def model_inputs(batch):
     tokens = jnp.asarray(batch["prompt"])
-    mask = jnp.arange(tokens.shape[1])[None, :] >= tokens.shape[1] - jnp.asarray(batch["prompt_length"])[:, None]
+    mask = (
+        jnp.arange(tokens.shape[1])[None, :] >= tokens.shape[1] - jnp.asarray(batch["prompt_length"])[:, None]
+    )
     return ModelInputs(tokens, {"attention_mask": mask})
 
 

@@ -66,7 +66,9 @@ def host_beam(model, params, prompt, budget, width, eos_ids, penalty, early=Fals
                 finished.append((entry[0], entry[1] / (position + 1) ** penalty,
                                  entry[2] in eos_ids, position + 1))
         finished = sorted(finished, key=lambda entry: -entry[1])[:width]
-        running = [(entry[0], entry[1]) for entry, hit in zip(candidates, hits, strict=True) if not hit][:width]
+        running = [(entry[0], entry[1]) for entry, hit in zip(candidates, hits, strict=True) if not hit][
+            :width
+        ]
         if not running:
             break
         reach = budget if (early == "never" and penalty > 0) else position + 1
@@ -196,7 +198,9 @@ def host_beam_shaped(model, params, prompt, budget, width, eos_ids, penalty, ear
                 finished.append((entry[0], entry[1] / (position + 1) ** penalty,
                                  entry[2] in eos_ids, position + 1))
         finished = sorted(finished, key=lambda entry: -entry[1])[:width]
-        running = [(entry[0], entry[1]) for entry, hit in zip(candidates, hits, strict=True) if not hit][:width]
+        running = [(entry[0], entry[1]) for entry, hit in zip(candidates, hits, strict=True) if not hit][
+            :width
+        ]
         if not running:
             break
         reach = budget if (early == "never" and penalty > 0) else position + 1

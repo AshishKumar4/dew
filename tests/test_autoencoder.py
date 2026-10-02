@@ -59,7 +59,9 @@ def test_video_frames_match_the_same_frames_encoded_as_images(autoencoder):
     video = frames.reshape(2, 3, IMAGE_SIZE, IMAGE_SIZE, 3)
     per_frame = autoencoder.encode(autoencoder.params, frames)
     assert jnp.allclose(
-        autoencoder.encode(autoencoder.params, video), per_frame.reshape(2, 3, *per_frame.shape[1:]), atol=1e-6
+        autoencoder.encode(autoencoder.params, video),
+        per_frame.reshape(2, 3, *per_frame.shape[1:]),
+        atol=1e-6,
     )
 
 
@@ -76,7 +78,11 @@ def test_latent_normalization_is_inverted_by_decode(autoencoder, image):
     raw_latent = autoencoder.encode(autoencoder.params, image)  # identity normalization by default
     latent = normalized.encode(normalized.params, image)
     assert jnp.allclose(latent, (raw_latent - 0.3) * 2.5, atol=1e-5)
-    assert jnp.allclose(normalized.decode(normalized.params, latent), autoencoder.decode(autoencoder.params, raw_latent), atol=1e-5)
+    assert jnp.allclose(
+        normalized.decode(normalized.params, latent),
+        autoencoder.decode(autoencoder.params, raw_latent),
+        atol=1e-5,
+    )
 
 
 def test_group_norm_survives_depths_not_divisible_by_norm_groups():
@@ -94,7 +100,9 @@ def test_params_can_be_reused_across_instances(autoencoder, image):
     reloaded = SimpleAutoEncoder(
         latent_channels=4, feature_depths=DEPTHS, params=autoencoder.params
     )
-    assert jnp.allclose(reloaded.encode(reloaded.params, image), autoencoder.encode(autoencoder.params, image), atol=1e-6)
+    assert jnp.allclose(
+        reloaded.encode(reloaded.params, image), autoencoder.encode(autoencoder.params, image), atol=1e-6
+    )
 
 
 def test_fresh_instances_get_different_random_weights(image):

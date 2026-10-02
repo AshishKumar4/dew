@@ -758,7 +758,9 @@ def test_the_forward_rounds_the_table_once_not_once_per_token_tile():
                      for sub in (param if isinstance(param, tuple) else (param,))
                      if isinstance(sub, jax.extend.core.ClosedJaxpr | jax.extend.core.Jaxpr)]
             for sub in inner:
-                found += converts(getattr(sub, "jaxpr", sub), looped or eqn.primitive.name in ("while", "scan"))
+                found += converts(
+                    getattr(sub, "jaxpr", sub), looped or eqn.primitive.name in ("while", "scan")
+                )
             if eqn.primitive.name == "convert_element_type" and eqn.outvars[0].aval.ndim == 2 \
                     and eqn.outvars[0].aval.shape[-1] == 16 and eqn.outvars[0].aval.dtype == jnp.bfloat16:
                 found.append((eqn.outvars[0].aval.shape, looped))
@@ -858,7 +860,10 @@ def test_the_whole_logits_head_computes_what_the_tiled_one_does(dtype, softcap):
         bound = 2 * (gamma(4 * RAGGED_VOCAB + 5) + gamma(2) * float(jnp.abs(tiled[2]).max()))
     else:
         bound = 2.0**-7
-    for have, want in [*zip(whole[::2], tiled[::2], strict=True), *zip(whole_grads, tiled_grads, strict=True)]:
+    for have, want in [
+        *zip(whole[::2], tiled[::2], strict=True),
+        *zip(whole_grads, tiled_grads, strict=True),
+    ]:
         have, want = jnp.asarray(have, jnp.float32), jnp.asarray(want, jnp.float32)
         assert jnp.abs(have - want).max() <= bound * jnp.abs(want).max() + 1e-7
 

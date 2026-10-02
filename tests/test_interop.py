@@ -342,7 +342,9 @@ def test_public_parameter_storage_is_independent_of_compute_and_roundtrips(tmp_p
     native.save(destination)
     restored = load_pretrained(destination, dtype="float32", param_dtype="bfloat16", attention_impl="xla")
     assert jax.tree.structure(native.variables) == jax.tree.structure(restored.variables)
-    for before, after in zip(jax.tree.leaves(native.variables), jax.tree.leaves(restored.variables), strict=True):
+    for before, after in zip(
+        jax.tree.leaves(native.variables), jax.tree.leaves(restored.variables), strict=True
+    ):
         assert np.asarray(before).dtype == np.asarray(after).dtype
         np.testing.assert_array_equal(before, after)
 

@@ -119,8 +119,12 @@ def write_index(directory, weight_map, stem="model"):
 
 def test_a_local_checkpoint_reads_the_indexed_shards_and_not_a_consolidated_copy(tmp_path):
     one, two = np.ones((2, 2), np.float32), np.zeros((2,), np.float32)
-    safetensors_numpy.save_file({"model.embed_tokens.weight": one}, str(tmp_path / "model-00001-of-00002.safetensors"))
-    safetensors_numpy.save_file({"model.norm.weight": two}, str(tmp_path / "model-00002-of-00002.safetensors"))
+    safetensors_numpy.save_file(
+        {"model.embed_tokens.weight": one}, str(tmp_path / "model-00001-of-00002.safetensors")
+    )
+    safetensors_numpy.save_file(
+        {"model.norm.weight": two}, str(tmp_path / "model-00002-of-00002.safetensors")
+    )
     safetensors_numpy.save_file({"tok_embeddings.weight": one}, str(tmp_path / "consolidated.safetensors"))
     write_index(tmp_path, {"model.embed_tokens.weight": "model-00001-of-00002.safetensors",
                            "model.norm.weight": "model-00002-of-00002.safetensors"})
@@ -131,11 +135,19 @@ def test_a_local_checkpoint_reads_the_indexed_shards_and_not_a_consolidated_copy
 
 
 def test_a_tensor_in_two_shards_is_refused_by_name(tmp_path):
-    safetensors_numpy.save_file({"model.norm.weight": np.ones(2, np.float32)}, str(tmp_path / "a.safetensors"))
-    safetensors_numpy.save_file({"model.norm.weight": np.zeros(2, np.float32)}, str(tmp_path / "b.safetensors"))
-    write_index(tmp_path, {"model.norm.weight": "a.safetensors", "model.embed_tokens.weight": "b.safetensors"})
+    safetensors_numpy.save_file(
+        {"model.norm.weight": np.ones(2, np.float32)}, str(tmp_path / "a.safetensors")
+    )
+    safetensors_numpy.save_file(
+        {"model.norm.weight": np.zeros(2, np.float32)}, str(tmp_path / "b.safetensors")
+    )
+    write_index(
+        tmp_path, {"model.norm.weight": "a.safetensors", "model.embed_tokens.weight": "b.safetensors"}
+    )
 
-    with pytest.raises(ValueError, match=r"'model\.norm\.weight' is stored in both a\.safetensors and b\.safetensors"):
+    with pytest.raises(
+        ValueError, match=r"'model\.norm\.weight' is stored in both a\.safetensors and b\.safetensors"
+    ):
         sources.load_shards(tmp_path)
 
 
@@ -145,7 +157,9 @@ def test_a_text_encoder_reads_its_weights_and_not_the_fp16_variant_beside_them(t
     from dew.nn import text_encoders
 
     weight = np.arange(4, dtype=np.float32)
-    safetensors_numpy.save_file({"text_model.final_layer_norm.weight": weight}, str(tmp_path / "model.safetensors"))
+    safetensors_numpy.save_file(
+        {"text_model.final_layer_norm.weight": weight}, str(tmp_path / "model.safetensors")
+    )
     safetensors_numpy.save_file({"text_model.final_layer_norm.weight": weight.astype(np.float16)},
                                 str(tmp_path / "model.fp16.safetensors"))
 
@@ -200,7 +214,9 @@ MAMBA2_130M_CONVERSION = "ea6060f68a4289e9c06f80effa896629ba519216"
 """The commit of SFconvertbot's refs/pr/1 on state-spaces/mamba2-130m."""
 
 
-def test_a_pickle_repo_loads_sfconvertbots_conversion_of_its_commit(hub, conversion, monkeypatch, tmp_path, caplog):
+def test_a_pickle_repo_loads_sfconvertbots_conversion_of_its_commit(
+    hub, conversion, monkeypatch, tmp_path, caplog
+):
     """state-spaces/mamba2-130m ships only pytorch_model.bin; refs/pr/1 on
     that commit adds model.safetensors, and only that file downloads."""
     import huggingface_hub
@@ -210,8 +226,13 @@ def test_a_pickle_repo_loads_sfconvertbots_conversion_of_its_commit(hub, convers
     pull = FakeHub(FIXTURES / "mamba2-130m-ssm", tmp_path / "pull")
     pull.commit, pull.files = MAMBA2_130M_CONVERSION, [*main.files, "model.safetensors"]
     pull.snapshot = tmp_path / "pull" / "snapshots" / MAMBA2_130M_CONVERSION
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda repo_id, *, revision=None, **kwargs: (
-        pull if revision in ("refs/pr/1", MAMBA2_130M_CONVERSION) else main)(repo_id, revision=revision, **kwargs))
+    monkeypatch.setattr(
+        huggingface_hub,
+        "snapshot_download",
+        lambda repo_id, *, revision=None, **kwargs: (
+            pull if revision in ("refs/pr/1", MAMBA2_130M_CONVERSION) else main
+        )(repo_id, revision=revision, **kwargs),
+    )
 
     with caplog.at_level("WARNING"):
         directory = sources.snapshot("state-spaces/mamba2-130m", None)
@@ -367,7 +388,10 @@ def test_the_r1_0528_qwen3_yarn_is_the_references_table():
 
     scaling = YarnScaling(**record["yarn"])
     assert record["yarn"]["factor"] == 4.0 and record["yarn"]["original_max_position_embeddings"] == 32768
-    assert np.max(np.abs(np.asarray(yarn_inv_freq(128, 1e6, scaling, dtype=np.float32)) - expected.numpy())) < 1e-7
+    assert (
+        np.max(np.abs(np.asarray(yarn_inv_freq(128, 1e6, scaling, dtype=np.float32)) - expected.numpy()))
+        < 1e-7
+    )
     assert yarn_attention_factor(scaling) == pytest.approx(attention_factor)
 
 

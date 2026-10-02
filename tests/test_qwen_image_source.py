@@ -209,7 +209,9 @@ def test_the_released_configs_and_weight_maps_translate():
             fields["axes_dims_rope"]) == (32, 32, 128, 4096, (16, 56, 56))
     names = read("transformer/diffusion_pytorch_model.safetensors.index.json")["weight_map"]
     assert len({_qwen_image_path(name) for name in names}) == len(names) == 297
-    text = _qwen_text_path(hf_decoders.translate_config(_qwen_vl_text_config(read("text_encoder/config.json"))))
+    text = _qwen_text_path(
+        hf_decoders.translate_config(_qwen_vl_text_config(read("text_encoder/config.json")))
+    )
     names = read("text_encoder/model.safetensors.index.json")["weight_map"]
     paths = [text(name) for name in names]
     assert None not in paths and len(set(paths)) == len(names) == 750

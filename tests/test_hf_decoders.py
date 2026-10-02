@@ -1034,16 +1034,27 @@ def test_a_biased_qwen3_export_carries_its_biases_into_transformers(tmp_path, rn
 MIXED = ("sliding_attention", "full_attention")
 
 
-@pytest.mark.parametrize("fixture, changes, model_type", [
-    # Llama's block with a window on some layers: LlamaConfig has no window,
-    # MinistralConfig names one per layer.
-    ("llama31-tiny", {"layer_types": MIXED, "kinds": {"sliding_attention": LayerKind(window=3)}}, "ministral"),
-    # Gemma3TextConfig rotates the sliding layers of a config that states only
-    # rope_theta at its own 10000, not at rope_theta.
-    ("gemma3-tiny", {"layer_types": MIXED, "kinds": {"sliding_attention": LayerKind(window=3)}}, "gemma3_text"),
-    # Olmo3Config moves a flat rope_theta onto the full layers alone.
-    ("olmo3-tiny", {"rope_theta": 500.0}, "olmo3"),
-])
+@pytest.mark.parametrize(
+    "fixture, changes, model_type",
+    [
+        # Llama's block with a window on some layers: LlamaConfig has no window,
+        # MinistralConfig names one per layer.
+        (
+            "llama31-tiny",
+            {"layer_types": MIXED, "kinds": {"sliding_attention": LayerKind(window=3)}},
+            "ministral",
+        ),
+        # Gemma3TextConfig rotates the sliding layers of a config that states only
+        # rope_theta at its own 10000, not at rope_theta.
+        (
+            "gemma3-tiny",
+            {"layer_types": MIXED, "kinds": {"sliding_attention": LayerKind(window=3)}},
+            "gemma3_text",
+        ),
+        # Olmo3Config moves a flat rope_theta onto the full layers alone.
+        ("olmo3-tiny", {"rope_theta": 500.0}, "olmo3"),
+    ],
+)
 def test_an_export_transformers_reads_computes_what_dew_computes(tmp_path, fixture, changes, model_type):
     model, variables = fp32_decoder(FIXTURES / fixture)
     model = model.clone(**changes)
@@ -1147,10 +1158,14 @@ def test_glm5_prediction_index_reuse_does_not_change_forward_or_sft(glm5_next_so
         predicted = model.apply(variables, hidden, ids, train=True, method="mtp_logits")[0]
         return jnp.mean(predicted ** 2)
 
-    expected, expected_grad = jax.jit(jax.value_and_grad(lambda p: loss(disabled, p)))(source.variables["params"])
+    expected, expected_grad = jax.jit(jax.value_and_grad(lambda p: loss(disabled, p)))(
+        source.variables["params"]
+    )
     actual, actual_grad = jax.jit(jax.value_and_grad(lambda p: loss(enabled, p)))(source.variables["params"])
     np.testing.assert_array_equal(actual, expected)
-    for actual_leaf, expected_leaf in zip(jax.tree.leaves(actual_grad), jax.tree.leaves(expected_grad), strict=True):
+    for actual_leaf, expected_leaf in zip(
+        jax.tree.leaves(actual_grad), jax.tree.leaves(expected_grad), strict=True
+    ):
         np.testing.assert_array_equal(actual_leaf, expected_leaf)
     np.testing.assert_array_equal(enabled.apply(source.variables, ids), disabled.apply(source.variables, ids))
 
@@ -1181,7 +1196,9 @@ def test_glm5_next_prefill_and_token_steps_match_parallel(glm5_next_source):
     out, state = model.apply({**variables, **state}, ids[:, :4], decode=True, mutable=['cache'])
     pieces = [np.asarray(out)]
     for index in range(4, ids.shape[1]):
-        out, state = model.apply({**variables, **state}, ids[:, index:index + 1], decode=True, mutable=['cache'])
+        out, state = model.apply(
+            {**variables, **state}, ids[:, index : index + 1], decode=True, mutable=["cache"]
+        )
         pieces.append(np.asarray(out))
     actual = np.concatenate(pieces, axis=1)
     assert scaled_difference(actual, full) < 1e-4
@@ -1257,7 +1274,9 @@ def test_glm5_mlp_schedule_and_router_normalization_follow_source_config():
     ("final_logit_softcap", 20.0), ("num_nextn_predict_layers", 2),
     ("hyper_connections", {"hc_mult": 4, "head": "weighted"}),
 ])
-def test_standalone_glm5_refuses_computation_without_a_source_inverse(field, value, glm5_next_source, tmp_path):
+def test_standalone_glm5_refuses_computation_without_a_source_inverse(
+    field, value, glm5_next_source, tmp_path
+):
     with pytest.raises(ValueError, match=field):
         save_pretrained_decoder(glm5_next_source.model.clone(**{field: value}),
                                 glm5_next_source.variables, tmp_path)
@@ -1294,7 +1313,9 @@ def test_scalar_mode_survives_scanning_and_rematerialized_backward(mode):
     def loss(model, params):
         return jnp.mean(model.apply({**variables, "params": params}, ids) ** 2)
 
-    expected, expected_grad = jax.jit(jax.value_and_grad(lambda params: loss(plain, params)))(variables["params"])
+    expected, expected_grad = jax.jit(jax.value_and_grad(lambda params: loss(plain, params)))(
+        variables["params"]
+    )
     value, gradient = jax.jit(jax.value_and_grad(lambda params: loss(scanned, params)))(variables["params"])
     np.testing.assert_allclose(value, expected, atol=1e-5, rtol=0)
     for actual, wanted in zip(jax.tree.leaves(gradient), jax.tree.leaves(expected_grad), strict=True):

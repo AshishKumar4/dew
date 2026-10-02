@@ -782,9 +782,15 @@ def test_a_sample_outside_the_pixel_range_is_clipped_not_wrapped():
     _, batch, _ = clip_fixture()
     white = jnp.ones((4, 16, 12, 3), jnp.float32)
 
-    assert metric.finalize(metric(ImageGrid(1.2 * white), batch)) == metric.finalize(metric(ImageGrid(white), batch))
-    assert metric.finalize(metric(ImageGrid(-1.2 * white), batch)) == metric.finalize(metric(ImageGrid(-white), batch))
-    assert metric.finalize(metric(ImageGrid(white), batch)) != metric.finalize(metric(ImageGrid(-white), batch))
+    assert metric.finalize(metric(ImageGrid(1.2 * white), batch)) == metric.finalize(
+        metric(ImageGrid(white), batch)
+    )
+    assert metric.finalize(metric(ImageGrid(-1.2 * white), batch)) == metric.finalize(
+        metric(ImageGrid(-white), batch)
+    )
+    assert metric.finalize(metric(ImageGrid(white), batch)) != metric.finalize(
+        metric(ImageGrid(-white), batch)
+    )
 
 
 @pytest.mark.parametrize("rows", [4, 12])

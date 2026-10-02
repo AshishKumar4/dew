@@ -118,7 +118,9 @@ def test_audio_input_gradients_and_sgd_step_match_reference(audio):
     def loss(params, inputs):
         return jnp.mean(forward(params, inputs) * data["coefficient"])
 
-    value, (grads, input_grad) = jax.jit(jax.value_and_grad(loss, argnums=(0, 1)))(state, data["input_features"])
+    value, (grads, input_grad) = jax.jit(jax.value_and_grad(loss, argnums=(0, 1)))(
+        state, data["input_features"]
+    )
     np.testing.assert_allclose(value, data["loss"], rtol=0, atol=1e-6)
     np.testing.assert_allclose(input_grad, data["input_gradient"], rtol=1e-4, atol=1e-7)
     optimizer = optax.sgd(json.loads((path / "meta.json").read_text())["learning_rate"])
@@ -142,7 +144,9 @@ def test_gemma4_checkpoint_clipping_bounds_change_the_computation():
 
 def test_audio_mask_and_feature_shape_are_part_of_the_contract(audio):
     _, config, variables, model, _, _, _ = audio
-    features = config.input_feat_size if isinstance(config, Gemma3nAudio) else config.subsampling_conv_channels[0]
+    features = (
+        config.input_feat_size if isinstance(config, Gemma3nAudio) else config.subsampling_conv_channels[0]
+    )
     with pytest.raises(ValueError, match="input_features_mask"):
         model.apply(variables, jnp.ones((1, 16, features)), jnp.ones((1, 16), jnp.int32))
     with pytest.raises(ValueError, match="input_features"):
@@ -198,7 +202,9 @@ def test_released_geometries_emit_the_processor_token_counts():
     audio_seq_length=188, Gemma4Processor audio_seq_length=750). Checked
     abstractly, without allocating the 681M and 305M encoder parameters.
     """
-    released = json.loads((FIXTURES.parent / "hf" / "gemma-3n-e2b" / "config.json").read_text())["audio_config"]
+    released = json.loads((FIXTURES.parent / "hf" / "gemma-3n-e2b" / "config.json").read_text())[
+        "audio_config"
+    ]
     for record, tokens in ((released, 188), ({"model_type": "gemma4_audio"}, 750)):
         encoder = audio_config(record).build()
         output, _ = jax.eval_shape(encoder.init_with_output, jax.random.key(0),

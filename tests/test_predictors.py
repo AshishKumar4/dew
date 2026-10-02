@@ -26,7 +26,11 @@ TRANSFORMS = [
 ]
 SCHEDULES = [
     ("cosine", CosineNoiseScheduler(1000), jnp.array([10, 300, 600, 900])),
-    ("karras_ve", KarrasVENoiseScheduler(sigma_max=80, rho=7, sigma_data=0.5), jnp.array([0.2, 0.4, 0.6, 0.8])),
+    (
+        "karras_ve",
+        KarrasVENoiseScheduler(sigma_max=80, rho=7, sigma_data=0.5),
+        jnp.array([0.2, 0.4, 0.6, 0.8]),
+    ),
 ]
 
 

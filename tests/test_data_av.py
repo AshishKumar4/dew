@@ -96,8 +96,12 @@ def test_an_audio_window_is_the_samples_between_its_times(clip):
     window = audio_window(clip, 3 / FPS, 2 / FPS, SAMPLE_RATE)
 
     assert window.shape == (2 * SAMPLES_PER_FRAME,) and window.dtype == np.float32
-    assert np.array_equal(window[:SAMPLES_PER_FRAME], np.full(SAMPLES_PER_FRAME, 3 * SAMPLE_STEP / 32768, np.float32))
-    assert np.array_equal(window[SAMPLES_PER_FRAME:], np.full(SAMPLES_PER_FRAME, 4 * SAMPLE_STEP / 32768, np.float32))
+    assert np.array_equal(
+        window[:SAMPLES_PER_FRAME], np.full(SAMPLES_PER_FRAME, 3 * SAMPLE_STEP / 32768, np.float32)
+    )
+    assert np.array_equal(
+        window[SAMPLES_PER_FRAME:], np.full(SAMPLES_PER_FRAME, 4 * SAMPLE_STEP / 32768, np.float32)
+    )
 
 
 def test_a_clip_longer_than_the_video_is_refused(clip):

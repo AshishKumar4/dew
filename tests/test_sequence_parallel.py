@@ -340,7 +340,10 @@ def test_cudnn_runs_inside_either_exchange(exchange, causal, without_determinist
 @pytest.mark.mesh
 def test_a_shape_the_exchange_cannot_split_is_refused_by_name():
     query, key, value = heads(jax.random.key(0), kv_heads=2)
-    with jax.set_mesh(build_mesh(MeshSpec(tensor=2, sequence=4))), pytest.raises(ValueError, match="gathered_keys_attention"):
+    with (
+        jax.set_mesh(build_mesh(MeshSpec(tensor=2, sequence=4))),
+        pytest.raises(ValueError, match="gathered_keys_attention"),
+    ):
         jax.jit(lambda q, k, v: through("all_to_all", q, k, v, causal=True))(
             query, key, value)
 

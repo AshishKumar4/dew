@@ -147,10 +147,16 @@ def test_the_quantizers_round_as_the_release_kernels():
     x = np.concatenate([*blocks, np.stack([ties, -ties])]).astype(np.float32)
     x[3, :32] = 0
     for jax_quant, torch_quant in (
-            (lambda v: fake_quant_fp8(v, 32), lambda v: kernels.act_quant(v, 32, "ue8m0", None, inplace=True)),
-            (lambda v: fake_quant_fp4(v, 16, e4m3_scale=True),
-             lambda v: kernels.fp4_act_quant(v, 16, inplace=True, scale_dtype=torch.float8_e4m3fn)),
-            (lambda v: fake_quant_fp4(v, 32, e4m3_scale=False), lambda v: kernels.fp4_act_quant(v, 32, inplace=True))):
+        (lambda v: fake_quant_fp8(v, 32), lambda v: kernels.act_quant(v, 32, "ue8m0", None, inplace=True)),
+        (
+            lambda v: fake_quant_fp4(v, 16, e4m3_scale=True),
+            lambda v: kernels.fp4_act_quant(v, 16, inplace=True, scale_dtype=torch.float8_e4m3fn),
+        ),
+        (
+            lambda v: fake_quant_fp4(v, 32, e4m3_scale=False),
+            lambda v: kernels.fp4_act_quant(v, 32, inplace=True),
+        ),
+    ):
         expected = torch_quant(torch.from_numpy(x.copy())).numpy()
         # under jit, where XLA GPU would delete a convert-pair rounding
         actual = np.asarray(jax.jit(jax_quant)(jnp.asarray(x)))
@@ -241,7 +247,9 @@ def released():
 
     config = json.loads((RELEASED / "config.json").read_text())
     record = translate_wrapper_config(config)
-    model = _wrapper_model(config, record, models.build("causal_transformer", record["text"]), dtype="float32")
+    model = _wrapper_model(
+        config, record, models.build("causal_transformer", record["text"]), dtype="float32"
+    )
     shapes = jax.eval_shape(lambda: model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32)))
     return config, record, model, shapes
 
@@ -358,7 +366,11 @@ def test_the_update_exports_and_decodes_as_the_reference(source, tmp_path):
         lambda model, variables: loss_and_gradient(model, variables, ids), plain, loaded.variables)
     loss_close(value, "")
     loss_close(twin_value, "")
-    indexer = [np.max(np.abs(leaf)) for path, leaf in flatten_dict(gradient, sep=".").items() if ".indexer." in f".{path}."]
+    indexer = [
+        np.max(np.abs(leaf))
+        for path, leaf in flatten_dict(gradient, sep=".").items()
+        if ".indexer." in f".{path}."
+    ]
     assert indexer and max(indexer) == 0
     variables = stepped(loaded.variables, gradient, reference["learning_rate"])
     loaded.save(tmp_path, variables=variables)
@@ -497,7 +509,9 @@ def test_consecutive_reindex_layers_publish_their_selections_under_scan_layers()
     unrolled, scanned = (models.build("causal_transformer", **{**fields, "scan_layers": scan})
                          for scan in (False, True))
     variables = unrolled.init(jax.random.key(0), ids)
-    assert distance(scanned.apply(variables, ids), unrolled.apply(variables, ids)) <= 2 * FACTOR * rounding("logits")
+    assert distance(scanned.apply(variables, ids), unrolled.apply(variables, ids)) <= 2 * FACTOR * rounding(
+        "logits"
+    )
 
 
 def test_a_config_without_swiglu_limit_clamps_nothing():

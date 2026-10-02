@@ -46,15 +46,20 @@ CONTINUOUS_STEPS = jnp.array([0.05, 0.3, 0.6, 0.95])
 # identity: 'vp' is variance preserving, 've' keeps alpha=1 and scales the
 # input, 'flow' is the rectified-flow linear path.
 SCHEDULES = [
-    (CosineNoiseScheduler, partial(CosineNoiseScheduler, 1000), DISCRETE_STEPS, 'vp'),
-    (LinearNoiseScheduler, partial(LinearNoiseScheduler, 1000), DISCRETE_STEPS, 'vp'),
-    (ExpNoiseScheduler, partial(ExpNoiseScheduler, 1000), DISCRETE_STEPS, 'vp'),
-    (CosineContinuousNoiseScheduler, CosineContinuousNoiseScheduler, CONTINUOUS_STEPS, 'vp'),
-    (SqrtContinuousNoiseScheduler, SqrtContinuousNoiseScheduler, CONTINUOUS_STEPS, 'vp'),
-    (CosineGeneralNoiseScheduler, CosineGeneralNoiseScheduler, CONTINUOUS_STEPS, 've'),
-    (KarrasVENoiseScheduler, partial(KarrasVENoiseScheduler, sigma_max=80, rho=7, sigma_data=0.5), CONTINUOUS_STEPS, 've'),
-    (EDMNoiseScheduler, partial(EDMNoiseScheduler, sigma_max=80, sigma_data=0.5), CONTINUOUS_STEPS, 've'),
-    (FlowMatchingScheduler, FlowMatchingScheduler, CONTINUOUS_STEPS, 'flow'),
+    (CosineNoiseScheduler, partial(CosineNoiseScheduler, 1000), DISCRETE_STEPS, "vp"),
+    (LinearNoiseScheduler, partial(LinearNoiseScheduler, 1000), DISCRETE_STEPS, "vp"),
+    (ExpNoiseScheduler, partial(ExpNoiseScheduler, 1000), DISCRETE_STEPS, "vp"),
+    (CosineContinuousNoiseScheduler, CosineContinuousNoiseScheduler, CONTINUOUS_STEPS, "vp"),
+    (SqrtContinuousNoiseScheduler, SqrtContinuousNoiseScheduler, CONTINUOUS_STEPS, "vp"),
+    (CosineGeneralNoiseScheduler, CosineGeneralNoiseScheduler, CONTINUOUS_STEPS, "ve"),
+    (
+        KarrasVENoiseScheduler,
+        partial(KarrasVENoiseScheduler, sigma_max=80, rho=7, sigma_data=0.5),
+        CONTINUOUS_STEPS,
+        "ve",
+    ),
+    (EDMNoiseScheduler, partial(EDMNoiseScheduler, sigma_max=80, sigma_data=0.5), CONTINUOUS_STEPS, "ve"),
+    (FlowMatchingScheduler, FlowMatchingScheduler, CONTINUOUS_STEPS, "flow"),
 ]
 
 ALL_CASES = SCHEDULES

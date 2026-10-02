@@ -81,7 +81,9 @@ def test_packed_documents_restart_their_windows_and_chunks(span):
     valid = np.ones((2, length), bool)
     valid[1, 3] = False
     rows = np.arange(length)
-    keep = (rows[None, :] <= rows[:, None]) & (segments[:, None] == segments[None, :]) & (segments[:, None] != 0)
+    keep = (
+        (rows[None, :] <= rows[:, None]) & (segments[:, None] == segments[None, :]) & (segments[:, None] != 0)
+    )
     if "window" in span:
         keep &= rows[:, None] - rows[None, :] < span["window"]
     else:

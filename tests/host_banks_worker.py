@@ -40,7 +40,11 @@ def layouts(tensor: int):
     from dew.training import Layout
     from dew.training.distributed import DEFAULT_RULES
 
-    rules = DEFAULT_RULES if tensor == 1 else (("mlp", "tensor"), *tuple(rule for rule in DEFAULT_RULES if rule[0] != "mlp"))
+    rules = (
+        DEFAULT_RULES
+        if tensor == 1
+        else (("mlp", "tensor"), *tuple(rule for rule in DEFAULT_RULES if rule[0] != "mlp"))
+    )
     return (Layout(rules=rules, min_shard=TINY_SHARD, tolerance=1.0),
             Layout(rules=rules, min_shard=TINY_SHARD, tolerance=1.0,
                    host_parameters=("params/layers_*",)))

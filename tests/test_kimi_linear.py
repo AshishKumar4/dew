@@ -41,7 +41,9 @@ TINY = ROOT / "kimi-linear-tiny"
 def source():
     loaded = load_pretrained(TINY, dtype="float32", attention_impl="reference")
     with np.load(TINY / "reference.npz") as stored, np.load(TINY / "numerics.npz") as exact:
-        reference = {name: stored[name] for name in stored.files} | {name: exact[name] for name in exact.files}
+        reference = {name: stored[name] for name in stored.files} | {
+            name: exact[name] for name in exact.files
+        }
     inputs = ModelInputs(jnp.asarray(reference["input_ids"], jnp.int32),
                          {"attention_mask": jnp.asarray(reference["attention_mask"], bool)})
     return loaded, inputs, reference
@@ -54,13 +56,19 @@ def released_config() -> dict:
 def test_released_config_builds_the_published_geometry():
     model = models.build("causal_transformer", translate_config(released_config()))
     assert model.num_layers == 27 and model.emb_features == 2304
-    assert model.per_layer_types.count("full_attention") == 7 and model.per_layer_types[-1] == "full_attention"
+    assert (
+        model.per_layer_types.count("full_attention") == 7 and model.per_layer_types[-1] == "full_attention"
+    )
     kda, mla = model.kinds["linear_attention"].mixer, model.kinds["full_attention"].mixer
     assert kda.linear_lower_bound is None and not kda.use_full_rank_gate
     assert mla.q_lora_rank is None and mla.mla_use_nope and not mla.mla_use_output_gate
     assert model.mixture.experts == 256 and model.mixture.top_k == 8 and model.mixture.bias
     assert model.sparse_layers == tuple(range(1, 27)) and model.mixture.groups == 1
-    assert (model.mixture.expert_features, model.mixture.shared_features, model.mixture.scaling) == (1024, 1024, 2.446)
+    assert (model.mixture.expert_features, model.mixture.shared_features, model.mixture.scaling) == (
+        1024,
+        1024,
+        2.446,
+    )
     assert model.mlp == "swiglu" and model.attention_residuals is None
 
 
@@ -129,18 +137,31 @@ def test_update_exports_the_trained_model_back_in_the_source_layout(source, tmp_
 
     value, gradient = jax.jit(jax.value_and_grad(loss))(loaded.variables["params"])
     np.testing.assert_allclose(value, reference["loss"], atol=1e-5, rtol=0)
-    variables = {**loaded.variables, "params": jax.tree.map(
-        lambda weight, grad: weight - reference["learning_rate"] * grad, loaded.variables["params"], gradient)}
+    variables = {
+        **loaded.variables,
+        "params": jax.tree.map(
+            lambda weight, grad: weight - reference["learning_rate"] * grad,
+            loaded.variables["params"],
+            gradient,
+        ),
+    }
     valid = reference["attention_mask"].astype(bool)
     updated = loaded.model.apply(variables, inputs.tokens, **inputs.kwargs())
     assert_as_exact_as_the_reference(np.asarray(updated)[valid], reference["updated_logits"][valid],
                                      reference["updated_logits_f64"][valid], "updated logits")
 
     loaded.save(tmp_path, variables=variables)
-    written, shipped = load_file(str(tmp_path / "model.safetensors")), load_file(str(TINY / "model.safetensors"))
-    assert {name: value.shape for name, value in written.items()} == {name: value.shape for name, value in shipped.items()}
+    written, shipped = (
+        load_file(str(tmp_path / "model.safetensors")),
+        load_file(str(TINY / "model.safetensors")),
+    )
+    assert {name: value.shape for name, value in written.items()} == {
+        name: value.shape for name, value in shipped.items()
+    }
     assert written["model.layers.0.self_attn.A_log"].shape == (1, 1, 2, 1)
-    assert json.loads((tmp_path / "config.json").read_text()) == json.loads((TINY / "config.json").read_text())
+    assert json.loads((tmp_path / "config.json").read_text()) == json.loads(
+        (TINY / "config.json").read_text()
+    )
     restored = load_pretrained(tmp_path, dtype="float32", attention_impl="reference")
     trained = flatten_dict(variables, sep=".")
     for name, after in flatten_dict(restored.variables, sep=".").items():
@@ -164,7 +185,9 @@ def test_greedy_generation_and_decode_steps_match_the_reference(source):
     np.testing.assert_array_equal(np.asarray(generated.tokens)[:, -4:], reference["generated"][:, -4:])
     exact = np.take_along_axis(log_softmax(reference["step_logits_f64"], -1),
                                reference["generated"][:, -4:, None], -1)[..., 0]
-    assert np.max(np.abs(np.asarray(generated.raw_log_probs, np.float64)[:, :4] - exact)) <= 2 * FACTOR * error
+    assert (
+        np.max(np.abs(np.asarray(generated.raw_log_probs, np.float64)[:, :4] - exact)) <= 2 * FACTOR * error
+    )
 
 
 def test_group_limited_routing_is_refused():

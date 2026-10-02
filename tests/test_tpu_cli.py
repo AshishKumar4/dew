@@ -362,7 +362,21 @@ def test_a_tpu_in_no_zone_is_an_error(fake):
 def test_ssh_forwards_ports_and_passes_extra_args(fake):
     fake.offer("slice", "us-central2-b")
     assert run("ssh", "slice", "-L", "8888", "-L", "6006", "--", "-vv") == 0
-    assert fake.gcloud_calls()[-1] == [*gcloud("compute", "tpus", "tpu-vm", "ssh", "you@slice", "--zone=us-central2-b", "--worker=0", "--ssh-flag=-L 8888:localhost:8888", "--ssh-flag=-L 6006:localhost:6006"), "--", "-vv"]
+    assert fake.gcloud_calls()[-1] == [
+        *gcloud(
+            "compute",
+            "tpus",
+            "tpu-vm",
+            "ssh",
+            "you@slice",
+            "--zone=us-central2-b",
+            "--worker=0",
+            "--ssh-flag=-L 8888:localhost:8888",
+            "--ssh-flag=-L 6006:localhost:6006",
+        ),
+        "--",
+        "-vv",
+    ]
 
 
 def test_ssh_config_names_every_worker_and_delete_removes_it(fake, capsys):

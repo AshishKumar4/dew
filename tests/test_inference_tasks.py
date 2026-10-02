@@ -42,8 +42,10 @@ def test_a_bound_task_draws_from_the_weights_it_was_bound_to():
                                        optax.sgd(0.5).init(params["params"]))
     moved = {"params": optax.apply_updates(params["params"], updates)}
     later = task.bind(moved)
-    assert_same_generation(later(rows, 5, key=jax.random.key(1)),
-                           generate(model, moved, jnp.asarray(rows), 5, key=jax.random.key(1), sampling=SAMPLING))
+    assert_same_generation(
+        later(rows, 5, key=jax.random.key(1)),
+        generate(model, moved, jnp.asarray(rows), 5, key=jax.random.key(1), sampling=SAMPLING),
+    )
     assert_same_generation(task(rows, 5, key=jax.random.key(1)), before)
     greedy = task(ModelInputs(jnp.asarray(rows)), 5, key=jax.random.key(2), sampling=Sampling(temperature=0))
     np.testing.assert_array_equal(greedy.behavior_log_probs, 0)
@@ -104,7 +106,9 @@ def test_a_pretrained_bundle_fine_tunes_identically_to_explicit_wiring():
     states = [Trainer(objective, optax.adamw(1e-3), key=key).fit(
         data, steps=1, log_every=100, checkpoint_every=None) for objective in (explicit, bundled)]
     assert int(states[1].updates) == 1
-    for actual, expected in zip(jax.tree.leaves(states[1].params), jax.tree.leaves(states[0].params), strict=True):
+    for actual, expected in zip(
+        jax.tree.leaves(states[1].params), jax.tree.leaves(states[0].params), strict=True
+    ):
         np.testing.assert_array_equal(actual, expected)
     assert any(not np.array_equal(actual, initial) for actual, initial in
                zip(jax.tree.leaves(states[1].params), jax.tree.leaves(source.variables), strict=True))
@@ -231,7 +235,9 @@ def test_text_decodes_lazily_through_the_bound_processor():
     bare = TextGeneration(model, params, sampling=Sampling(temperature=0))
     with pytest.raises(ValueError, match="no processor"):
         _ = bare([[1, 2]], 3, key=0).text
-    task = TextGeneration(model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0), max_new_tokens=3)
+    task = TextGeneration(
+        model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0), max_new_tokens=3
+    )
     result = task(["12", "5"], key=0)
     assert calls == []
     first = result.text
@@ -277,11 +283,17 @@ def test_a_task_moves_onto_a_mesh_with_the_variables_it_holds():
     from dew.training import Layout, MeshSpec
 
     model = decoder()
-    task = TextGeneration(model, model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)), sampling=SAMPLING)
+    task = TextGeneration(
+        model, model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)), sampling=SAMPLING
+    )
     placed = task.bind(place(task.variables, MeshSpec(), Layout(min_shard=1)))
-    assert {len(leaf.sharding.device_set) for leaf in jax.tree.leaves(placed.variables)} == {jax.device_count()}
+    assert {len(leaf.sharding.device_set) for leaf in jax.tree.leaves(placed.variables)} == {
+        jax.device_count()
+    }
     rows = [[1, 2, 3], [4, 5, 6]]
-    assert_same_generation(placed(rows, 5, key=jax.random.key(1)).host(), task(rows, 5, key=jax.random.key(1)).host())
+    assert_same_generation(
+        placed(rows, 5, key=jax.random.key(1)).host(), task(rows, 5, key=jax.random.key(1)).host()
+    )
 
 
 @pytest.mark.mesh
