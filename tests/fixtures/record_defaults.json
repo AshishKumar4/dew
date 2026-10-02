@@ -283,7 +283,7 @@
   "read_buffer": 128,
   "threads": 64,
   "worker_buffer": 2,
-  "workers": 32
+  "workers": 0
  },
  "dew.data.dataset.Ramp": {
   "increment": "required",

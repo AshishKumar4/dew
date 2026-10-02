@@ -34,15 +34,15 @@ assert int(state.step) == 10
 
 ```text
 Training CausalTransformer from step 0 to 10: 2,688 parameters, on 1 × cpu, batch 8, float32
-step  5/10  loss 0.6666  ce 0.6666  perplexity 1.948  token_accuracy 75.0%  step_time_ms 5.879  samples_per_sec 1,361  accepted 100.0%
-eval val at step 5: perplexity 5.283 (8 records in 0.18 s)
-step 10/10  loss 0.2373  ce 0.2373  perplexity 1.268  token_accuracy 87.5%  step_time_ms 37.04  samples_per_sec 216.0  accepted 100.0%
-eval val at step 10: perplexity 5.221 ↓ 1.2% (8 records in 0.00 s)
-Trained 10 steps in 0:00:01: first step after 0.82 s, then 736.2 step/s
-1.2% of the wall time in steps, final loss 0.2373
+step  5/10  loss 0.6666  ce 0.6666  perplexity 1.948  token_accuracy 75.0%  step_time_ms 6.443  samples_per_sec 1,242  accepted 100.0%
+eval val at step 5: perplexity 2.416 (8 records in 0.34 s)
+step 10/10  loss 0.2373  ce 0.2373  perplexity 1.268  token_accuracy 87.5%  step_time_ms 69.95  samples_per_sec 114.4  accepted 100.0%
+eval val at step 10: perplexity 2.500 ↑ 3.5% (8 records in 0.00 s)
+Trained 10 steps in 0:00:03: first step after 2.75 s, then 483.1 step/s
+0.6% of the wall time in steps, final loss 0.2373
 ```
 
-Each row has nine IDs: the model reads the first eight and predicts the last eight, so `seq_len=8`, and `vocab_size=4` makes the valid IDs zero to three. The run logs the training loss at steps five and ten and the validation perplexity at the same steps. Perplexity is the exponential of the cross entropy, weighted by the number of valid targets; lower is better when compared on the same validation data and tokenizer. Validation reads the EMA weights, which this short run has barely moved. This cyclic task does not measure general language ability.
+Each row has nine IDs: the model reads the first eight and predicts the last eight, so `seq_len=8`, and `vocab_size=4` makes the valid IDs zero to three. The run logs the training loss at steps five and ten and the validation perplexity at the same steps. Perplexity is the exponential of the cross entropy, weighted by the number of valid targets; lower is better when compared on the same validation data and tokenizer. Validation scores the weights the run trained; an objective that keeps an EMA (`LMObjective(..., ema_decay=0.999)`) is scored on the average instead, and the line then reads `eval val (ema)`. This cyclic task does not measure general language ability.
 
 ## Artifacts and metrics
 
