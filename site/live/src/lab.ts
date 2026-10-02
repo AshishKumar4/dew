@@ -92,9 +92,14 @@ export class SnapshotLab extends DurableObject<Env> {
 
 	async boundary(commit: string): Promise<unknown> {
 		if (!/^[0-9a-f]{40}$/.test(commit)) throw new Error('a full project commit is required');
-		const process = await this.container.exec(['sh', '-c',
-			'curl -fsSL "https://raw.githubusercontent.com/AshishKumar4/dew/$1/site/live/container/probe-kernel-boundary.sh" ' +
-			'-o /root/probe-kernel-boundary.sh; sh /root/probe-kernel-boundary.sh', 'probe', commit]);
+		for (const name of ['guest_limits.py', 'probe-kernel-boundary.sh']) {
+			const source = await fetch(`https://raw.githubusercontent.com/AshishKumar4/dew/${commit}/site/live/container/${name}`);
+			if (!source.ok || !source.body) throw new Error(`could not read ${name}`);
+			const destination = name === 'guest_limits.py' ? '/opt/live/guest_limits.py' : '/root/probe-kernel-boundary.sh';
+			const copy = await this.container.exec(['sh', '-c', 'cat > "$1"', 'copy', destination], { stdin: source.body });
+			if (await copy.exitCode !== 0) throw new Error(`could not install ${name}`);
+		}
+		const process = await this.container.exec(['sh', '/root/probe-kernel-boundary.sh']);
 		const result = await process.output();
 		return { exitCode: result.exitCode, stdout: new TextDecoder().decode(result.stdout),
 			stderr: new TextDecoder().decode(result.stderr) };
