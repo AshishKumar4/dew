@@ -28,8 +28,8 @@ SEQ = 12
 
 
 def tiny(**overrides):
-    config = dict(vocab_size=VOCAB, emb_features=32, num_layers=2, num_heads=4,
-                  mlp_features=64, max_seq_len=16)
+    config = {"vocab_size": VOCAB, "emb_features": 32, "num_layers": 2, "num_heads": 4,
+                  "mlp_features": 64, "max_seq_len": 16}
     return CausalTransformer(**{**config, **overrides})
 
 
@@ -86,8 +86,8 @@ def test_old_decoder_record_keeps_zero_dropout_and_bitwise_outputs():
 
     from dew.config import ModelConfig
 
-    config = dict(vocab_size=17, emb_features=8, num_layers=1, num_heads=2,
-                  mlp_features=16, max_seq_len=8)
+    config = {"vocab_size": 17, "emb_features": 8, "num_layers": 1, "num_heads": 2,
+                  "mlp_features": 16, "max_seq_len": 8}
     model = ModelConfig("causal_transformer", config=config, dtype="float32",
                         matmul_precision="highest", attention_impl="reference").build()
     assert model.embedding_dropout_rate == model.attention_dropout_rate == 0
@@ -689,8 +689,8 @@ def test_the_embedding_scale_is_not_rounded_to_the_activation_dtype(rng):
     gemma3-tiny is hidden 64, where the factor is 8.0 in either dtype.
     """
     features, ids = 1152, tokens(rng, length=4)
-    shared = dict(emb_features=features, num_heads=8, num_layers=1,
-                  tie_embeddings=False, dtype=jnp.bfloat16)
+    shared = {"emb_features": features, "num_heads": 8, "num_layers": 1,
+                  "tie_embeddings": False, "dtype": jnp.bfloat16}
     scaled = tiny(embedding_scale=True, **shared)
     params = scaled.init(rng, ids)
     assert params['params']['embed_tokens']['embedding'].dtype == jnp.float32
@@ -734,7 +734,7 @@ def test_the_attention_scale_is_not_rounded_to_the_activation_dtype(rng):
     whose ratio is exactly 0.871094, and scales every logit 0.2% low.
     """
     ids = tokens(rng)
-    shared = dict(head_dim=128, num_layers=1, dtype=jnp.bfloat16)
+    shared = {"head_dim": 128, "num_layers": 1, "dtype": jnp.bfloat16}
     exact = tiny(attention_scale=168 ** -0.5, **shared)
     params = exact.init(rng, ids)
     rounded = tiny(attention_scale=float(jnp.bfloat16(168 ** -0.5 * math.sqrt(128)))
@@ -1163,8 +1163,8 @@ def test_a_bf16_decoder_scores_the_same_on_one_device_and_split_over_four(mixtur
     2.6e-4. Every rounding kept, they are bitwise the same."""
     from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
-    config = dict(vocab_size=512, emb_features=64, num_layers=4, num_heads=8, num_kv_heads=4,
-                  head_dim=8, mlp_features=128, max_seq_len=33, dtype=jnp.bfloat16)
+    config = {"vocab_size": 512, "emb_features": 64, "num_layers": 4, "num_heads": 8, "num_kv_heads": 4,
+                  "head_dim": 8, "mlp_features": 128, "max_seq_len": 33, "dtype": jnp.bfloat16}
     if mixture is not None:
         config["mixture"] = {**mixture, "layers": (0, 1, 2, 3)}
     model = CausalTransformer(**config)

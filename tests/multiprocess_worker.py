@@ -1746,9 +1746,7 @@ def mode_decoding_components(args) -> dict:
             "criterion payload": (chain, (decoding.EndOfSequence(
                 jnp.asarray([3 if rank == 1 else 5], jnp.int32)),)),
             "transform identity": (
-                chain[:1] + (jax.tree_util.Partial(
-                    (lambda state, scores: scores.at[:, 0].add(4.0)) if rank == 1 else raise_last),)
-                + chain[2:], ()),
+                (*chain[:1], jax.tree_util.Partial((lambda state, scores: scores.at[:, 0].add(4.0)) if rank == 1 else raise_last), *chain[2:]), ()),
             "transform payload": (
                 (decoding.RepetitionPenalty(1.3),
                  decoding.SuppressTokens(jnp.asarray([2 if rank == 1 else 6], jnp.int32))), ()),

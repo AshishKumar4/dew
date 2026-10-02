@@ -23,8 +23,8 @@ VOCAB = 32
 SEQ_LEN = 8
 PROMPT = 5
 NEW_TOKENS = 3
-FIELDS = dict(vocab_size=VOCAB, emb_features=16, num_layers=4, num_heads=4,
-              num_kv_heads=2, mlp_features=32, max_seq_len=SEQ_LEN)
+FIELDS = {"vocab_size": VOCAB, "emb_features": 16, "num_layers": 4, "num_heads": 4,
+              "num_kv_heads": 2, "mlp_features": 32, "max_seq_len": SEQ_LEN}
 # Far below the production threshold, so a two-process mesh shards anything.
 TINY_SHARD = 4
 
@@ -40,8 +40,7 @@ def layouts(tensor: int):
     from dew.training import Layout
     from dew.training.distributed import DEFAULT_RULES
 
-    rules = DEFAULT_RULES if tensor == 1 else (
-        ("mlp", "tensor"),) + tuple(rule for rule in DEFAULT_RULES if rule[0] != "mlp")
+    rules = DEFAULT_RULES if tensor == 1 else (("mlp", "tensor"), *tuple(rule for rule in DEFAULT_RULES if rule[0] != "mlp"))
     return (Layout(rules=rules, min_shard=TINY_SHARD, tolerance=1.0),
             Layout(rules=rules, min_shard=TINY_SHARD, tolerance=1.0,
                    host_parameters=("params/layers_*",)))

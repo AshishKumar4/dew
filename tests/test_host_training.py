@@ -355,8 +355,8 @@ def tokens(width=9):
 
 
 def decoder(**overrides):
-    fields = dict(vocab_size=16, emb_features=8, num_layers=2, num_heads=2,
-                  mlp_features=16, max_seq_len=8, scan_layers=True)
+    fields = {"vocab_size": 16, "emb_features": 8, "num_layers": 2, "num_heads": 2,
+                  "mlp_features": 16, "max_seq_len": 8, "scan_layers": True}
     return CausalTransformer(**{**fields, **overrides})
 
 

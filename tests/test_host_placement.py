@@ -105,8 +105,8 @@ def test_a_layout_places_only_the_state_it_can_fetch():
 
 VOCAB = 32
 PROMPT = 5
-SHAPE = dict(vocab_size=VOCAB, emb_features=16, num_heads=4, num_kv_heads=2,
-             mlp_features=32, max_seq_len=16)
+SHAPE = {"vocab_size": VOCAB, "emb_features": 16, "num_heads": 4, "num_kv_heads": 2,
+             "mlp_features": 32, "max_seq_len": 16}
 
 # Every layer kind whose parameters a bank has to hold and a fetched run has
 # to read: the dense block, the routed one, the two mixers with a state of
@@ -115,26 +115,26 @@ SHAPE = dict(vocab_size=VOCAB, emb_features=16, num_heads=4, num_kv_heads=2,
 # stack of nothing but runs of one, and one run cut into banks by
 # bank_layers.
 SHAPES = {
-    "dense": dict(num_layers=4),
-    "narrow": dict(num_layers=8, emb_features=4, num_heads=1, num_kv_heads=1, mlp_features=8),
-    "moe": dict(num_layers=4, mixture={"experts": 4, "top_k": 2, "bias": True}),
-    "gated_delta_net": dict(num_layers=4, layer_types=("linear_attention",) * 4,
-                            kinds={"linear_attention": {"mixer": {"kind": "gated_delta_net"}}}),
-    "latent_attention": dict(num_layers=4, mixer={
+    "dense": {"num_layers": 4},
+    "narrow": {"num_layers": 8, "emb_features": 4, "num_heads": 1, "num_kv_heads": 1, "mlp_features": 8},
+    "moe": {"num_layers": 4, "mixture": {"experts": 4, "top_k": 2, "bias": True}},
+    "gated_delta_net": {"num_layers": 4, "layer_types": ("linear_attention",) * 4,
+                            "kinds": {"linear_attention": {"mixer": {"kind": "gated_delta_net"}}}},
+    "latent_attention": {"num_layers": 4, "mixer": {
         "kind": "mla", "kv_lora_rank": 16, "q_lora_rank": 16, "qk_rope_head_dim": 4,
-        "qk_nope_head_dim": 4, "v_head_dim": 8}),
-    "indexed_latent_attention": dict(num_layers=4, mixer={
+        "qk_nope_head_dim": 4, "v_head_dim": 8}},
+    "indexed_latent_attention": {"num_layers": 4, "mixer": {
         "kind": "mla", "kv_lora_rank": 16, "q_lora_rank": 16, "qk_rope_head_dim": 4,
         "qk_nope_head_dim": 4, "v_head_dim": 8, "index_n_heads": 2, "index_head_dim": 8,
-        "index_topk": 4}),
-    "untied_head": dict(num_layers=4, tie_embeddings=False),
-    "unequal_runs": dict(num_layers=5, layer_types=(
+        "index_topk": 4}},
+    "untied_head": {"num_layers": 4, "tie_embeddings": False},
+    "unequal_runs": {"num_layers": 5, "layer_types": (
         "full_attention", "sliding_attention", "sliding_attention", "sliding_attention",
-        "full_attention"), kinds={"sliding_attention": {"window": 8}}),
-    "runs_of_one": dict(num_layers=3, layer_types=(
+        "full_attention"), "kinds": {"sliding_attention": {"window": 8}}},
+    "runs_of_one": {"num_layers": 3, "layer_types": (
         "full_attention", "sliding_attention", "full_attention"),
-        kinds={"sliding_attention": {"window": 8}}),
-    "capped_banks": dict(num_layers=6, bank_layers=2),
+        "kinds": {"sliding_attention": {"window": 8}}},
+    "capped_banks": {"num_layers": 6, "bank_layers": 2},
 }
 
 # The scanned stack against the plain loop. Both are fp32 evaluations of the

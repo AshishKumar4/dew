@@ -205,12 +205,12 @@ def test_a_packed_batch_selects_inside_its_documents():
 
 
 def deepseek_stack(index_topk, **overrides) -> CausalTransformer:
-    return CausalTransformer(**{**dict(
-        vocab_size=VOCAB, emb_features=32, num_layers=2, num_heads=2,
-        head_dim=16, mlp_features=64, max_seq_len=SEQ,
-        mixer={"kind": "mla", "q_lora_rank": 8, "kv_lora_rank": 8,
+    return CausalTransformer(**{**{
+        "vocab_size": VOCAB, "emb_features": 32, "num_layers": 2, "num_heads": 2,
+        "head_dim": 16, "mlp_features": 64, "max_seq_len": SEQ,
+        "mixer": {"kind": "mla", "q_lora_rank": 8, "kv_lora_rank": 8,
                "qk_nope_head_dim": 8, "qk_rope_head_dim": 8, "v_head_dim": 8,
-               "index_topk": index_topk, "index_n_heads": 2, "index_head_dim": 16}),
+               "index_topk": index_topk, "index_n_heads": 2, "index_head_dim": 16}},
         **overrides})
 
 

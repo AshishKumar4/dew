@@ -77,7 +77,7 @@ def test_snr_decreases_along_the_trajectory(cls, make, steps, family):
 def test_rates_broadcast_against_the_sample(cls, make, steps, family, sample_shape):
     """broadcast_rates is how every caller shapes the rates: the result must
     broadcast against the batch it came from, for images and for video."""
-    x = jnp.zeros((len(steps),) + sample_shape)
+    x = jnp.zeros((len(steps), *sample_shape))
     alpha, sigma = broadcast_rates(make(), steps, x)
     assert alpha.shape == sigma.shape == (len(steps),) + (1,) * (x.ndim - 1)
     assert (alpha * x).shape == x.shape
@@ -91,7 +91,7 @@ def test_forward_diffusion_invertible(cls, make, steps, family, sample_shape, rn
     epsilon parameterization on every schedule."""
     schedule = make()
     key0, key1 = jax.random.split(rng)
-    full_shape = (len(steps),) + sample_shape
+    full_shape = (len(steps), *sample_shape)
     x0 = jax.random.normal(key0, full_shape)
     noise = jax.random.normal(key1, full_shape)
     rates = broadcast_rates(schedule, steps, x0)

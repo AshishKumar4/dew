@@ -44,7 +44,7 @@ from dew.data.sources.hf import HFDatasetSource
 from dew.position import ENVELOPE
 from dew.registry import datasets
 
-WORKERS = dict(loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
+WORKERS = {"loading": Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1)}
 
 
 # ---------------------------------------------------------------------------------
@@ -195,7 +195,7 @@ class Indexed(DatasetSpec):
         source = self.source()
         records = len(source) if self.count is None else self.count
         train, val = hold_out(source, records, (self.val_batches or 0) * batch, "Indexed")
-        knobs = dict(batch=batch, seed=self.seed, loading=self.loading)
+        knobs = {"batch": batch, "seed": self.seed, "loading": self.loading}
         return Dataset(train=train_stream(train, [], **knobs),
                        val=None if val is None else validation_pass(val, [], **knobs),
                        records=len(train), batch=batch)
@@ -607,7 +607,7 @@ def test_a_position_over_another_order_is_refused():
     refused instead of resumed at the same offset into different data."""
     _, saved = _steps(2, 3)
 
-    for other in (dict(length=64), dict(seed=1)):
+    for other in ({"length": 64}, {"seed": 1}):
         stream = Indexed(**other).load(batch=8).train(DataPartition())
         with pytest.raises(ValueError, match="records into"):
             stream.set_state(saved[0])

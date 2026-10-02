@@ -22,12 +22,13 @@ from dew.objectives.lm import LMObjective
 from dew.training.distributed import Layout, MeshSpec, build_mesh, shard_batch
 from dew.training.optim import build_optimizer
 from dew.training.quantization import Quantization, apply_quantization, quantize_for_serving
+import itertools
 
 VOCAB = 64
 SEQ_LEN = 8
 BATCH = 4
-TINY = dict(vocab_size=VOCAB, emb_features=32, num_layers=2, num_heads=4,
-            num_kv_heads=2, mlp_features=64, max_seq_len=16)
+TINY = {"vocab_size": VOCAB, "emb_features": 32, "num_layers": 2, "num_heads": 4,
+            "num_kv_heads": 2, "mlp_features": 64, "max_seq_len": 16}
 
 
 def tiny(**overrides):
@@ -141,7 +142,7 @@ def test_an_int8_trunk_trains_down():
         key, subkey = jax.random.split(key)
         params, opt_state, loss = train(params, opt_state, subkey)
         losses.append(float(loss))
-    assert all(later < earlier for earlier, later in zip(losses, losses[1:])), losses
+    assert all(later < earlier for earlier, later in itertools.pairwise(losses)), losses
 
 
 def int8_products(jaxpr) -> int:

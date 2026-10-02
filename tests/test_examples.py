@@ -120,7 +120,7 @@ def fake_dataset(batch, classes=None, size=RES):
 def test_train_diffusion_example_trains_samples_and_exports(tmp_path):
     example = load_example("train_diffusion")
     config = example.Config(image_size=RES, batch_size=8, steps=3, prompts=("a", "b"),
-                            model=dict(patch_size=4, emb_features=16, num_layers=1, num_heads=2),
+                            model={"patch_size": 4, "emb_features": 16, "num_layers": 1, "num_heads": 2},
                             out=tmp_path)
     inputs = InputSpec(Field("image", (RES, RES, 3)),
                        {"textcontext": Condition(StubText.from_pretrained("stub"))})
@@ -140,7 +140,7 @@ def test_train_jepa_example_trains_probes_and_saves_the_encoder(tmp_path):
     example = load_example("train_jepa")
     # An 8x8 patch grid, the smallest the default mask geometry fits on.
     config = example.Config(classes=5, image_size=32, patch_size=4, batch_size=8, steps=3,
-                            model=dict(emb_features=32, num_layers=2, num_heads=2), out=tmp_path)
+                            model={"emb_features": 32, "num_layers": 2, "num_heads": 2}, out=tmp_path)
 
     state = example.main(config, data=fake_dataset(8, classes=5, size=32))
 
@@ -166,7 +166,7 @@ def test_train_lm_example_samples_what_it_trained(tmp_path):
         {"tokenizer": "byte", "vocab_size": 256, "dtype": "uint8"}))
     example = load_example("train_lm")
     config = example.Config(tokens=tokens, sequence_length=32, batch_size=8, steps=60,
-                            learning_rate=1e-2, model=dict(emb_features=16, num_layers=1, num_heads=2),
+                            learning_rate=1e-2, model={"emb_features": 16, "num_layers": 1, "num_heads": 2},
                             prompt="ab", sample_tokens=8, out=tmp_path / "run")
 
     state = example.main(config)

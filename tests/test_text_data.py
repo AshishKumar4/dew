@@ -76,7 +76,7 @@ def _token_dir(tmp_path, train_tokens, val_tokens=None, dtype=np.uint16,
 
 def _document_dir(tmp_path, documents, eos_id=0, dtype=np.uint16):
     """A token directory whose stream is `documents`, each closed by eos_id."""
-    stream = np.concatenate([np.asarray(d + [eos_id], np.int64) for d in documents])
+    stream = np.concatenate([np.asarray([*d, eos_id], np.int64) for d in documents])
     _token_dir(tmp_path, train_tokens=0, body=stream, dtype=dtype, eos_id=eos_id)
     (tmp_path / "val.bin").write_bytes(stream.astype(dtype).tobytes())
     return tmp_path, stream
@@ -670,7 +670,7 @@ def test_document_source_reads_one_document_per_record(tmp_path):
     for index, document in enumerate(documents):
         # The eos closes the document, so it belongs to the record.
         np.testing.assert_array_equal(
-            source[index]["text"], np.asarray(document + [0], np.int32))
+            source[index]["text"], np.asarray([*document, 0], np.int32))
     assert list(source.lengths) == [4, 3, 5]
 
 
@@ -737,7 +737,7 @@ def test_packed_loader_cuts_documents_that_outgrow_the_window(tmp_path):
     positions = [batch["text_positions"][0] for batch in data.val(DataPartition())]
     assert len(rows) == 3  # ceil(10 / 4) pieces, one per window
     np.testing.assert_array_equal(np.concatenate(rows)[:10],
-                                  list(range(10, 19)) + [0])
+                                  [*list(range(10, 19)), 0])
     np.testing.assert_array_equal(positions[0], [0, 1, 2, 3])
 
 
@@ -966,7 +966,7 @@ PACK_EOS = 1
 
 def _packed(tmp_path, documents, seq_len, batch=1, bins=4):
     """One validation pass over `documents` packed into `seq_len + 1` windows."""
-    stream = np.concatenate([np.asarray(d + [PACK_EOS], np.int64) for d in documents])
+    stream = np.concatenate([np.asarray([*d, PACK_EOS], np.int64) for d in documents])
     _token_dir(tmp_path, train_tokens=0, body=stream, eos_id=PACK_EOS)
     (tmp_path / "val.bin").write_bytes(stream.astype(np.uint16).tobytes())
     return list(_packed_tokens(tmp_path, seq_len=seq_len, packing_bins=bins)
@@ -1146,7 +1146,7 @@ def test_a_document_longer_than_the_window_is_cut_into_separate_segments(
     assert len(batches) == 3
     np.testing.assert_array_equal(
         np.concatenate([b["text"][0] for b in batches])[:13],
-        list(range(2, 14)) + [PACK_EOS])
+        [*list(range(2, 14)), PACK_EOS])
     for batch in batches:
         np.testing.assert_array_equal(batch["text_positions"][0][:1], [0])
         _assert_mask_blocks_everything_it_should(batch, monkeypatch)
@@ -1282,7 +1282,7 @@ def test_an_interrupted_packed_epoch_resumes_through_mp_prefetch(tmp_path):
 def _chunks(tokens, sizes):
     """`tokens` cut into consecutive pieces of `sizes`, the last taking the rest."""
     edges = np.cumsum([0, *sizes])
-    pieces = [tokens[start:stop] for start, stop in zip(edges, edges[1:])]
+    pieces = [tokens[start:stop] for start, stop in itertools.pairwise(edges)]
     return [*pieces, tokens[edges[-1]:]]
 
 

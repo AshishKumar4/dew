@@ -74,8 +74,8 @@ def test_an_interrupted_sweep_continues_at_the_trial_it_stopped_on(tmp_path):
             raise KeyboardInterrupt('the operator stopped the sweep')
         return float(len(trained))
 
-    arguments = dict(train=counted, trials=4, ledger=tmp_path / 'ledger.json',
-                     search=grid_search)
+    arguments = {'train': counted, 'trials': 4, 'ledger': tmp_path / 'ledger.json',
+                     'search': grid_search}
     with LocalTracker(tmp_path / 'sweep') as tracker:
         with pytest.raises(KeyboardInterrupt):
             sweep(config(tmp_path), SPACE, tracker=tracker, **arguments)
@@ -94,8 +94,8 @@ def test_an_interrupted_sweep_continues_at_the_trial_it_stopped_on(tmp_path):
 
 def test_a_ledger_of_another_space_is_refused(tmp_path):
     with LocalTracker(tmp_path / 'sweep') as tracker:
-        arguments = dict(train=lambda run: 1.0, trials=1, ledger=tmp_path / 'ledger.json',
-                         tracker=tracker)
+        arguments = {'train': lambda run: 1.0, 'trials': 1, 'ledger': tmp_path / 'ledger.json',
+                         'tracker': tracker}
         sweep(config(tmp_path), SPACE, **arguments)
         with pytest.raises(ValueError, match='not this space'):
             sweep(config(tmp_path), {'optim.learning_rate': [0.5]}, **arguments)

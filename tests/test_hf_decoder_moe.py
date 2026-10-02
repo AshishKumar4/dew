@@ -1200,7 +1200,7 @@ def test_deepseek_v4_public_prediction_states_preserve_raw_streams():
     assert states.shape == (*ids.shape, 2, model.emb_features)
     normalized, expected = model.apply(variables, ids, method=model.hidden_and_mtp_inputs)
     np.testing.assert_array_equal(states, expected)
-    assert jnp.asarray(normalized).shape == ids.shape + (model.emb_features,)
+    assert jnp.asarray(normalized).shape == (*ids.shape, model.emb_features)
     doubled = {**variables, 'params': {**variables['params'], 'norm': {
         **variables['params']['norm'], 'scale': variables['params']['norm']['scale'] * 2}}}
     raw, louder = model.apply(doubled, ids, method=model.states_and_logits)
