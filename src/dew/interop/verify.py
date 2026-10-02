@@ -44,7 +44,7 @@ if TYPE_CHECKING:
 CONVENTION = "llama"
 """The registered family a verified unregistered type loads as."""
 
-_CONVENTION = replace(decoders._FAMILIES[CONVENTION], translate_config=decoders._base_config)
+_CONVENTION = replace(decoders.families()[CONVENTION], translate_config=decoders._base_config)
 """The convention reads every field `_base_config` shares, windows included,
 where the registered Llama family reads only what LlamaConfig declares; the
 probe, not the reference's declarations, is what admits a type's reading."""
