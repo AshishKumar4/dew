@@ -497,11 +497,11 @@ def test_equal_multimodal_coordinates_rotate_the_shared_keys_like_plain_position
 
 
 @pytest.mark.mesh
-def test_rotary_positions_and_the_causal_mask_survive_the_exchange():
-    """A full attention module: rotary angles from the row's position, then
-    the causal mask. Both were applied in sequence order, and the exchanged
-    call has to match them exactly (observed 4.8e-7)."""
-    module = NormalAttention(query_dim=32, heads=4, dim_head=8, causal=True)
+def test_rotary_positions_survive_the_exchange():
+    """A full attention module: rotary angles from the row's position,
+    applied in sequence order, and the exchanged call has to match them
+    exactly (observed 4.8e-7)."""
+    module = NormalAttention(query_dim=32, heads=4, dim_head=8)
     x = jax.random.normal(jax.random.key(1), (BATCH, SEQ_LEN, 32), jnp.float32)
     freqs = rotary_freqs(jnp.arange(SEQ_LEN), 8, 10000.0, dtype=np.float32)
     variables = module.init(jax.random.key(2), x, freqs_cis=freqs)

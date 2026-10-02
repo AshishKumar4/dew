@@ -259,7 +259,7 @@ def zoo() -> dict[str, Any]:
             "family": "gemma3", "image_token_id": 511, "images": 1, "pixels": [3, 16, 16],
             "tower": {"kind": "siglip", "hidden_size": 32, "intermediate_size": 64, "num_layers": 1,
                       "num_heads": 4, "image_size": 16, "patch_size": 8},
-            "projector": {"kind": "gemma", "vision_width": 32, "text_width": 64, "patches_per_side": 2,
+            "projector": {"kind": "gemma", "text_width": 64, "patches_per_side": 2,
                           "tokens_per_side": 2}}, **lm),
     }
 
