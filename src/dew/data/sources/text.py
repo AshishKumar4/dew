@@ -1,8 +1,8 @@
 """Tokenized corpora as one stream of ids, and the two records cut out of it.
 
 A corpus is a stream of token ids, whatever holds it: the `.bin` files
-`tools/tokenize_text.py` writes, ArrayRecord shards of token arrays, or a
-parquet column of them. `TokenSource` is that stream, read by slice, and the
+`write_tokens` (and `dew tokenize`) writes, ArrayRecord shards of token
+arrays, or a parquet column of them. `TokenSource` is that stream, read by slice, and the
 three readers below are the three stores it can live in. `token_corpus`
 resolves a directory to the train and validation pair a run needs, by what
 the files in it are.
@@ -23,9 +23,10 @@ in any of the three stores gives the same windows and the same packing plan.
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping, Sequence
+import os
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Protocol, TypedDict, runtime_checkable
 
 import numpy as np
 
@@ -100,6 +101,133 @@ class _Reopened:
     def __setstate__(self, state):
         self.__dict__.update(state)
         setattr(self, self.handle, self.open_handle())
+
+
+class TokenMeta(TypedDict):
+    """What `meta.json` records about a token directory `write_tokens` wrote."""
+
+    tokenizer: str
+    vocab_size: int
+    dtype: str
+    train_tokens: int
+    val_tokens: int
+    eos_id: int | None
+
+
+# Characters read per chunk of a text file; small enough that the encoded ids
+# of one chunk are a rounding error against memory, large enough to amortize
+# reads.
+CHUNK_CHARS = 1 << 20
+
+
+def write_tokens(documents: str | os.PathLike[str] | Iterable[str], out: str | os.PathLike[str], *,
+                 tokenizer: str = "byte", val_fraction: float = 0.01,
+                 pack: bool = False) -> TokenMeta:
+    """Tokenize a corpus into the directory `TokenWindows` and `PackedTokens` read.
+
+    `documents` is a text file, a directory read as every `*.txt` under it
+    in path order (each file one document), or any iterable of strings, one
+    document each, such as `(row["text"] for row in hf_split)`. A str is
+    always a path; pass text itself in a list. `tokenizer` is `"byte"` or a
+    Hugging Face tokenizer name, recorded in `meta.json` so a run can check
+    the ids against its model.
+
+    The ids go to `train.bin` and `val.bin` at the smallest unsigned width
+    the vocabulary fits, with `val_fraction` of the stream, from its head,
+    held out. `pack` ends every document with the tokenizer's eos id, which
+    `PackedTokens` cuts documents at. A file is read in line-bounded chunks
+    so a corpus larger than memory costs disk, and each chunk ends at a
+    newline, so a tokenizer that merges across its input sees whole lines.
+    Returns what `meta.json` records.
+    """
+    from dew.data.text import tokenizer_for
+
+    if not 0.0 <= val_fraction < 1.0:
+        raise ValueError(f"val_fraction is a fraction of the stream in [0, 1), got {val_fraction}")
+    encoder = tokenizer_for(tokenizer)
+    eos = encoder.eos_id if pack else None
+    if pack and eos is None:
+        raise ValueError(f"pack ends every document with an eos id, and tokenizer {tokenizer!r} has none")
+    root = Path(out)
+    root.mkdir(parents=True, exist_ok=True)
+    dtype = dtype_for(encoder.vocab_size)
+
+    # One encode pass writes the whole stream to a scratch file; the split
+    # point needs the total count, and slicing a memmap of it costs a linear
+    # copy, not a second tokenization.
+    scratch = root / "all.bin"
+    total = 0
+    try:
+        with open(scratch, "wb") as handle:
+            for document in _documents(documents):
+                written = 0
+                for chunk in document:
+                    ids = encoder.encode(chunk)
+                    handle.write(np.asarray(ids, dtype=dtype).tobytes())
+                    written += len(ids)
+                if written and eos is not None:
+                    # Every document is terminated, the last included, because
+                    # the packing source reads a record as the span up to an eos.
+                    handle.write(np.asarray([eos], dtype=dtype).tobytes())
+                    written += 1
+                total += written
+        if total < 2:
+            raise ValueError(f"the corpus tokenized to {total} tokens; a window needs at least 2")
+        held_out = min(round(total * val_fraction), total - 1)
+        stream = np.memmap(scratch, dtype=dtype, mode="r")
+        stream[:held_out].tofile(root / "val.bin")
+        stream[held_out:].tofile(root / "train.bin")
+    finally:
+        scratch.unlink(missing_ok=True)
+
+    meta = TokenMeta(tokenizer=tokenizer, vocab_size=encoder.vocab_size, dtype=dtype.name,
+                     train_tokens=total - held_out, val_tokens=held_out, eos_id=eos)
+    (root / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
+    return meta
+
+
+def dtype_for(vocab_size: int) -> np.dtype:
+    """The smallest unsigned dtype that holds every id a vocabulary emits."""
+    for dtype in (np.dtype("uint8"), np.dtype("uint16")):
+        if vocab_size <= np.iinfo(dtype).max + 1:
+            return dtype
+    return np.dtype("uint32")
+
+
+def _documents(documents: str | os.PathLike[str] | Iterable[str]) -> Iterator[Iterable[str]]:
+    """Each document of `documents` as the chunks of text it is encoded in."""
+    if not isinstance(documents, (str, os.PathLike)):
+        for document in documents:
+            yield (document,)
+        return
+    root = Path(documents)
+    if root.is_file():
+        paths = [root]
+    elif root.is_dir():
+        paths = sorted(path for path in root.rglob("*.txt") if path.is_file())
+        if not paths:
+            raise ValueError(f"{root} holds no *.txt file to tokenize")
+    else:
+        raise FileNotFoundError(f"{root} is neither a text file nor a directory of them")
+    for path in paths:
+        yield _chunks(path)
+
+
+def _chunks(path: Path) -> Iterator[str]:
+    """`path`'s text in chunks of about `CHUNK_CHARS`, each ending at a newline
+    except the file's last; a line longer than a chunk grows until it ends."""
+    with open(path, encoding="utf-8") as handle:
+        carry = ""
+        while chunk := handle.read(CHUNK_CHARS):
+            chunk = carry + chunk
+            split = chunk.rfind("\n")
+            if split < 0:
+                carry = chunk
+                continue
+            yield chunk[:split + 1]
+            carry = chunk[split + 1:]
+        if carry:
+            yield carry
 
 
 class TokenBytes(_Reopened):
@@ -296,7 +424,7 @@ def token_corpus(path: str | None, name: str, *, field: str | None = None
     """
     if not path:
         raise ValueError(
-            f"{name} needs path= set to the directory tools/tokenize_text.py wrote")
+            f"{name} needs path= set to the directory `dew tokenize` or write_tokens wrote")
     root = Path(path)
     return _split(root, "train", name, field), _split(root, "val", name, field)
 
@@ -316,7 +444,7 @@ def _split(root: Path, split: str, name: str, field: str | None) -> TokenSource:
         raise ValueError(
             f"{root} holds no {split} corpus: {name} reads {split}.bin, "
             f"{split}*.array_record* shards or {split}*.parquet, and "
-            f"tools/tokenize_text.py --val-fraction writes the held-out split")
+            f"`dew tokenize --val-fraction` writes the held-out split")
     files = found[stores[0]]
     if stores[0] == ".bin":
         return TokenBytes(files[0])
@@ -385,7 +513,7 @@ class TokenDocumentSource:
         if found is None:
             raise ValueError(
                 f"{tokens!r} records no eos_id: document boundaries are the "
-                "eos tokens tools/tokenize_text.py writes with --pack")
+                "eos tokens `dew tokenize` writes with --pack")
         self.eos_id = int(found)
 
         held = tokens[0:len(tokens)]

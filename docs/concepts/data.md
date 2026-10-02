@@ -103,7 +103,7 @@ print(windows["text"][0])
 
 The training stream is shuffled: the first window of the first batch is window 49 of the corpus. `records` is the number of windows, `(1000 - 1) // 8 = 124`.
 
-Each window starts `seq_len` ids after the previous one, so the last id of one window is the first of the next. `tools/tokenize_text.py` writes `train.bin`, `val.bin` and `meta.json` from raw text.
+Each window starts `seq_len` ids after the previous one, so the last id of one window is the first of the next. `dew tokenize` (or `dew.data.write_tokens` in Python) writes `train.bin`, `val.bin` and `meta.json` from raw text; see [Packing](#packing).
 
 Other specifications include `PackedTokens`, `OxfordFlowers`, `HFImages`, `ChatMessages` and the video and preference readers; the [API reference](../reference/core-api.md) lists them. Each has its own fields for paths, tokenization, transforms and splits, and two fields every specification shares:
 
@@ -123,7 +123,7 @@ Other specifications include `PackedTokens`, `OxfordFlowers`, `HFImages`, `ChatM
 
 The default reads in the training process, as Grain's own default does. Worker processes each import the program again, so they cost seconds and memory before the first batch, and pay off only when decoding or augmentation outruns the reading threads. Raise `workers` only after measuring the input pipeline on your data and hardware. A script that starts workers needs an `if __name__ == "__main__":` guard, because each worker imports the script.
 
-Image sources can need network access the first time. Token-window sources read files written by `tools/tokenize_text.py`. Streaming sources can depend on remote servers and may have no position to restore. [Recipes](../recipes.md) lists the command-line entry points and [Installation](../installation.md#optional-extras) the extras each source needs. `OnlineImages` and `OnlineVideos` (`data:online-videos` in a recipe) stream Hugging Face tables of urls and captions. `OnlineVideos` decodes each url's video the way `LocalVideos` reads a file: `frames` consecutive frames at 25 fps, resized to `image_size` squares, without audio.
+Image sources can need network access the first time. Token-window sources read files written by `dew tokenize`. Streaming sources can depend on remote servers and may have no position to restore. [Recipes](../recipes.md) lists the command-line entry points and [Installation](../installation.md#optional-extras) the extras each source needs. `OnlineImages` and `OnlineVideos` (`data:online-videos` in a recipe) stream Hugging Face tables of urls and captions. `OnlineVideos` decodes each url's video the way `LocalVideos` reads a file: `frames` consecutive frames at 25 fps, resized to `image_size` squares, without audio.
 
 ## Device image augmentation
 
@@ -260,7 +260,7 @@ qualify the released 26B DiffusionGemma; that requires a separate 80 GB GPU run.
 remains the text-chat LoRA example.
 
 [`train_masked_lm.py`](https://github.com/AshishKumar4/dew/blob/main/examples/train_masked_lm.py)
-reads real text prepared by `tools/tokenize_text.py --tokenizer byte`, trains
+reads real text prepared by `dew tokenize --tokenizer byte`, trains
 the MDLM negative ELBO and unmasks a text sample. The mask is an extra id, 256,
 outside the corpus's byte vocabulary. Use WikiText or TinyStories as input.
 Both new scripts accept `--smoke` to shrink the model and run while still
@@ -281,7 +281,7 @@ untrained-looking byte text after eight updates, and carry no quality claim.
 ```bash
 python examples/sft_diffusion_gemma_images.py \
     --flowers data/oxford_flowers102/2.1.1 --smoke --out runs/flowers-caption-smoke
-python tools/tokenize_text.py --input data/wikitext103-2m.txt \
+dew tokenize --input data/wikitext103-2m.txt \
     --out data/wikitext-bytes --tokenizer byte
 python examples/train_masked_lm.py \
     --tokens data/wikitext-bytes --smoke --out runs/masked-lm-smoke
@@ -343,6 +343,50 @@ A streamed split loaded by name without shuffling resumes at the record where it
 ## Packing
 
 Packing places tokens from several documents into rows of a fixed width. Segment ids (`text_segment_ids`) stop attention and target scoring from crossing document boundaries, and position ids (`text_positions`) restart at each document. Every per-token array must be sliced and packed the same way as the token ids.
+
+A batch stacks each field into one array, so token ids of varying length cannot reach it as they are: tokenizing in `preprocess` and batching the result raises an error that says so. There are two routes to fixed rows.
+
+Offline, `dew tokenize --pack` (or `dew.data.write_tokens(..., pack=True)` in Python) writes a token directory with an eos id after every document, and `PackedTokens` packs it. Its position is a global record count that resumes on any process count. `write_tokens` takes a text file, a directory of `.txt` files, or any iterable of strings, one document each, such as a Hugging Face split's text column.
+
+Online, Grain's packers build the rows as the documents are read, and `Dataset.from_grain` batches them. Each process builds the pipeline over its own share:
+
+<!-- not run: downloads wikitext and the SmolLM2 tokenizer on first use -->
+```python
+import datasets
+import grain
+import numpy as np
+
+from dew.data import DataPartition, Dataset, HFTokenizer
+
+tokenizer = HFTokenizer("HuggingFaceTB/SmolLM2-135M")
+split = datasets.load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="train[:2000]")
+seq_len = 128
+
+
+def tokenized(row):
+    return {"text": np.asarray(tokenizer.encode(row["text"]), np.int32)}
+
+
+def documents(partition):
+    rows = (grain.MapDataset.source(split).seed(0).shuffle().repeat(None)
+            .map(tokenized).filter(lambda row: len(row["text"]) > 0))
+    share = rows[partition.index::partition.count].to_iter_dataset()
+    return grain.experimental.ConcatThenSplitIterDataset(
+        share, length_struct={"text": seq_len + 1})
+
+
+data = Dataset.from_grain(documents, batch=8)
+batch = next(data.train(DataPartition()))
+print({name: (value.shape, value.dtype) for name, value in batch.items()})
+print([len(set(row)) for row in batch["text_segment_ids"]])
+```
+
+```text
+{'text': ((8, 129), dtype('int32')), 'text_positions': ((8, 129), dtype('int32')), 'text_segment_ids': ((8, 129), dtype('int32'))}
+[1, 1, 2, 2, 3, 2, 1, 2]
+```
+
+`ConcatThenSplitIterDataset` concatenates the documents and cuts the stream into rows of `seq_len + 1` ids, splitting a document that crosses a row's end, and writes `text_segment_ids` and `text_positions`, the field names `LMObjective` reads. The last line counts the documents in each row. `grain.experimental.FirstFitPackIterDataset` packs whole documents with padding instead, and refuses a document longer than the row, so cut long documents first. An online pipeline's position is Grain's own iterator state for one share, so it resumes only on the process count that wrote it (see [Resuming the data stream](#resuming-the-data-stream)).
 
 Padding and packing change the number of valid targets even when array shapes are equal. Gradient accumulation adds the loss totals and masses of its microbatches before dividing, so the accumulated gradient is that of one token mean over the whole window; check the normalization before calling two runs with different packing equivalent.
 

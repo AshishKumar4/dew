@@ -1554,6 +1554,17 @@ def test_held_out_records_too_few_for_one_batch_are_refused():
         Dataset.from_records(_columns(), batch=4, validation=_columns(3))
 
 
+def test_records_whose_field_lengths_differ_are_refused_with_the_remedy():
+    """Token ids of varying length are the usual cause, and grain's own
+    message names the batch structure rather than what to change."""
+    rows = [{"text": np.arange(length, dtype=np.int32)} for length in (3, 5, 4, 6)]
+    stream = Dataset.from_records(rows, batch=2).train(DataPartition())
+
+    with pytest.raises(ValueError, match="cut or pad a variable-length field") as refused:
+        next(stream)
+    assert "same structure" in str(refused.value.__cause__)
+
+
 def test_training_records_too_few_for_one_batch_are_refused():
     """An endless stream would fill a batch by repeating records inside it,
     and an epoch would be zero steps long."""

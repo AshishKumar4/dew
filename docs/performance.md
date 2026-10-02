@@ -662,7 +662,7 @@ workstation CPU does nine of them in under an hour.
 ```
 curl -o data/shakespeare.txt --create-dirs \
     https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
-python tools/tokenize_text.py --input data/shakespeare.txt \
+dew tokenize --input data/shakespeare.txt \
     --out data/shakespeare-byte --tokenizer byte --val-fraction 0.02
 JAX_PLATFORMS=cpu taskset -c 0-5 python tools/optimizer_curve.py \
     --dataset data/shakespeare-byte --optimizer muon --learning-rate 3e-3 \
