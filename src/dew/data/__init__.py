@@ -6,6 +6,11 @@ turns it into a `Dataset` of batch iterators:
     data = datasets.OxfordFlowers(image_size=128).load(batch=32)
     steps = epochs * data.steps_per_epoch
 
+The prepared web-scale image corpora (`CC3M`, `CC12M`, the LAION and
+DiffusionDB sets) are registered under their names in `dew.datasets` and
+importable from `dew.data.images`; this namespace holds what a run builds
+from.
+
 Importing this package registers every dataset and costs none of the heavy
 dependencies. cv2, tensorflow_datasets, HF `datasets`, the AV readers and
 `transformers` are imported by a spec on use, so a host that only needs the
@@ -28,24 +33,12 @@ from .dataset import (
                       mixture,
                       ramped,
 )
-from .images import (
-                      CC3M,
-                      CC12M,
-                      ArrayRecordImages,
-                      Combined30M,
-                      CombinedMsml612,
-                      DiffusionDB,
-                      HFImages,
-                      ImageDataset,
-                      Laion2bAesthetic,
-                      Laion12mCoco,
-                      OxfordFlowers,
-)
+from .images import ArrayRecordImages, HFImages, ImageDataset, OxfordFlowers
 from .preferences import IDS_KEY, MASK_KEY, PreferencePairs
 from .processors import AutoAudioProcessor, AutoTextTokenizer
 from .prompts import Prompts
 from .providers import HubDataset, PreparedTFDS, load
-from .sources.hf import HFDatasetSource, HFOptions
+from .sources.hf import HFOptions
 from .sources.text import (
     TokenBytes,
     TokenColumn,
@@ -60,13 +53,12 @@ from .text import ByteTokenizer, HFTokenizer, tokenizer_for
 from .tokens import PackedTokens, TokenWindows
 from .video import LocalVideos, VideoDataset, VoxCeleb2
 
-__all__ = ["CC3M", "CC12M", "IDS_KEY", "MASK_KEY", "ArrayRecordImages",
+__all__ = ["IDS_KEY", "MASK_KEY", "ArrayRecordImages",
            "AutoAudioProcessor", "AutoTextTokenizer",
-           "Batch", "ByteTokenizer", "ChatMessages", "Checkpointable", "Combined30M",
-           "CombinedMsml612", "CombinedOnline", "Corpus", "DataPartition", "DataPhase", "Dataset",
-           "DatasetSpec", "DiffusionDB",
-           "HFDatasetSource", "HFImages", "HFOptions", "HFTokenizer", "HubDataset", "ImageDataset",
-           "Laion2bAesthetic", "Laion12mCoco",
+           "Batch", "ByteTokenizer", "ChatMessages", "Checkpointable",
+           "CombinedOnline", "Corpus", "DataPartition", "DataPhase", "Dataset",
+           "DatasetSpec",
+           "HFImages", "HFOptions", "HFTokenizer", "HubDataset", "ImageDataset",
            "Loading", "LocalVideos", "OnlineImages", "OnlineVideos", "OxfordFlowers",
            "PackedTokens", "PreferencePairs", "PreparedTFDS", "Prompts", "Ramp", "Reader", "Role",
            "Stage",

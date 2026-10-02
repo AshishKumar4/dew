@@ -16,8 +16,6 @@ A Dew training run is built from four objects. Each owns one part of the work:
 This trains a small decoder on one repeated sentence and generates from it. It downloads nothing and runs on a CPU.
 
 ```python
-import itertools
-
 import jax
 import numpy as np
 import optax
@@ -29,9 +27,8 @@ from dew.sampling import Sampling, generate
 
 tokenizer = ByteTokenizer()
 text = tokenizer.encode("dew trains jax models. " * 3)
-batch = {"text": np.tile(np.asarray(text[:65], np.int32), (8, 1))}
-data = Dataset(train=lambda partition: itertools.repeat(batch),
-               val=None, records=8, batch=8)
+rows = np.tile(np.asarray(text[:65], np.int32), (8, 1))
+data = Dataset.from_records({"text": rows}, batch=8)
 
 model = models.build(
     "causal_transformer", vocab_size=tokenizer.vocab_size,
@@ -49,16 +46,16 @@ out = generate(model, state.params, prompt, max_new_tokens=40,
 print(tokenizer.decode(out.tokens[0]))
 ```
 
-Output on four cores of a workstation CPU:
+Output on two cores of a shared workstation CPU:
 
 ```text
 Training CausalTransformer from step 0 to 100: 147,840 parameters, on 1 × cpu, batch 8, float32
-step  25/100  loss 0.03061  ce 0.03061  perplexity 1.031  token_accuracy 100.0%  step_time_ms 10.88  samples_per_sec 735.3  accepted 100.0%
-step  50/100  loss 0.01018  ce 0.01018  perplexity 1.010  token_accuracy 100.0%  step_time_ms 8.713  samples_per_sec 918.2  accepted 100.0%  0:00:01 left
-step  75/100  loss 0.006710  ce 0.006710  perplexity 1.007  token_accuracy 100.0%  step_time_ms 8.472  samples_per_sec 944.3  accepted 100.0%  0:00:00 left
-step 100/100  loss 0.005113  ce 0.005113  perplexity 1.005  token_accuracy 100.0%  step_time_ms 9.332  samples_per_sec 857.3  accepted 100.0%
-Trained 100 steps in 0:00:02: first step after 0.94 s, then 115.5 step/s
-47.6% of the wall time in steps, final loss 0.005113
+step  25/100  loss 0.03061  ce 0.03061  perplexity 1.031  token_accuracy 100.0%  step_time_ms 23.68  samples_per_sec 337.9  accepted 100.0%  0:00:01 left
+step  50/100  loss 0.01018  ce 0.01018  perplexity 1.010  token_accuracy 100.0%  step_time_ms 24.52  samples_per_sec 326.2  accepted 100.0%  0:00:01 left
+step  75/100  loss 0.006710  ce 0.006710  perplexity 1.007  token_accuracy 100.0%  step_time_ms 24.68  samples_per_sec 324.1  accepted 100.0%  0:00:01 left
+step 100/100  loss 0.005113  ce 0.005113  perplexity 1.005  token_accuracy 100.0%  step_time_ms 22.84  samples_per_sec 350.2  accepted 100.0%
+Trained 100 steps in 0:00:04: first step after 2.06 s, then 42.6 step/s
+53.0% of the wall time in steps, final loss 0.005113
 dew trains jax models. dew trains jax model
 ```
 
@@ -83,7 +80,7 @@ Dew ships objectives for autoregressive language modeling (`LMObjective`), image
 
 ## Dataset
 
-`Dataset(train, val, records, batch)` holds two functions. `train(partition)` opens an endless stream of training batches; `val(partition)` opens one pass over the validation records. `partition` is a `DataPartition` that says which share of each global batch this process reads, which matters when several processes train together.
+`Dataset(train, val, records, batch)` holds two functions. `train(partition)` opens an endless stream of training batches; `val(partition)` opens one pass over the validation records. `partition` is a `DataPartition` that says which share of each global batch this process reads, which matters when several processes train together. `Dataset.from_records` builds one from records held in memory, as the example does: it reshuffles them every epoch, gives each process its share, and saves its position in checkpoints.
 
 The built-in readers, such as `TokenWindows` for tokenized text and `HFImages` for image datasets on the Hugging Face Hub, are specifications whose `.load(batch=...)` returns a `Dataset`. Images arrive as `uint8` arrays in `[0, 255]` and token windows as `int32` ids under the key `"text"`. Readers built on Grain record their position, so a checkpoint resumes the data stream where it stopped. [Training data](concepts/data.md) covers the details.
 

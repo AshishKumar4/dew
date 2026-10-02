@@ -25,9 +25,11 @@ Each provider's own options are one frozen value of its own type,
 argument `load` takes. An option of the other provider is then a type its
 spec has no field for rather than a name checked at run time.
 
-`preprocess(record, rng)` is where a record becomes batch fields. It has no
-default, because a provider's rows are its own shape and a loader that
-guessed would decode images meant to stay bytes or drop a column a run needs.
+`preprocess(record, rng)` is where a record becomes batch fields. Without
+one, a row's fields reach the batch as they are, only as arrays (`fields`):
+nothing is decoded, renamed or dropped, because a provider's rows are its
+own shape and a loader that guessed would decode images meant to stay bytes
+or drop a column a run needs.
 """
 
 from __future__ import annotations
@@ -166,6 +168,65 @@ def phased_dataset(phases: Sequence[tuple[Sequence[Corpus], int | None]],
                    batch=batch)
 
 
+NARROWED = {np.dtype(np.int64): np.dtype(np.int32), np.dtype(np.uint64): np.dtype(np.uint32),
+            np.dtype(np.float64): np.dtype(np.float32),
+            np.dtype(np.complex128): np.dtype(np.complex64)}
+"""The 64-bit types a row's Python numbers and `datasets`' columns arrive in,
+and the 32-bit ones a device holds by default, since JAX narrows them too."""
+
+
+def fields(record: Row, within: str = "") -> Batch:
+    """A provider row as batch fields: its values as arrays, 64-bit ones narrowed.
+
+    A list column becomes one array, so a batch holds it as `[batch, n]`
+    rather than as n separate `[batch]` fields, which is what grain makes of
+    a list. Strings and bytes stay as they are, and nested mappings keep
+    their structure; `within` is the path a nested mapping's fields are
+    named under in an error. An integer a 32-bit field cannot hold is
+    refused by name rather than wrapped round.
+    """
+    held: dict[str, object] = {}
+    for name, value in record.items():
+        where = f"{within}{name}"
+        if isinstance(value, Mapping):
+            held[name] = fields(value, f"{where}.")
+        elif value is None or isinstance(value, (str, bytes)):
+            held[name] = value
+        else:
+            held[name] = _narrowed(where, np.asarray(value))
+    return held
+
+
+def _narrowed(name: str, array: np.ndarray) -> np.ndarray:
+    """`array` in the 32-bit type of its kind, refused when its values do not fit."""
+    if array.dtype == object:
+        raise ValueError(
+            f"field {name!r} holds values of different shapes or types, which make no "
+            f"one array; pass preprocess= to say what the field becomes")
+    narrow = NARROWED.get(array.dtype)
+    if narrow is None:
+        return array
+    if narrow.kind in "iu" and array.size:
+        limits = np.iinfo(narrow)
+        outside = array[(array < limits.min) | (array > limits.max)]
+        if outside.size:
+            raise ValueError(
+                f"field {name!r} holds {outside.flat[0]}, outside the {narrow} range a "
+                f"device holds it in; pass preprocess= to keep it another way")
+    return array.astype(narrow)
+
+
+class Formatting(pygrain.MapTransform):
+    """`fields` as the transformation the workers run when there is no `preprocess`."""
+
+    def map(self, element: object) -> Batch:
+        if not isinstance(element, Mapping):
+            raise TypeError(
+                f"a provider record is a mapping of fields; this one is "
+                f"{type(element).__name__}")
+        return fields(element)
+
+
 class Preprocessing(pygrain.RandomMapTransform):
     """`preprocess` as the grain transformation that runs inside the workers."""
 
@@ -265,8 +326,8 @@ class ProviderDataset(DatasetSpec):
 
     @property
     def transforms(self) -> list[pygrain.Transformation]:
-        """`preprocess` as the transformation the workers run, or none."""
-        return [] if self.preprocess is None else [Preprocessing(self.preprocess)]
+        """`preprocess` as the transformation the workers run, or the row as arrays."""
+        return [Formatting() if self.preprocess is None else Preprocessing(self.preprocess)]
 
     def read(self, name: str, split: str) -> Records:
         """One split of one of this spec's datasets, read by index."""
@@ -496,9 +557,8 @@ def _stream(name: str, split: str, *, options: HFOptions,
                         world_size=partition.count,
                         shuffle_buffer=shuffle_buffer, epochs=epochs,
                         given=dataset is not None)
-        piped: pygrain.IterDataset = source
-        if preprocess is not None:
-            piped = piped.random_map(Preprocessing(preprocess), seed=seed)
+        piped: pygrain.IterDataset = (source.map(Formatting()) if preprocess is None
+                                      else source.random_map(Preprocessing(preprocess), seed=seed))
         batches = ThreadPrefetchIterDataset(
             piped.batch(partition.rows(batch), drop_remainder=True),
             prefetch_buffer_size=max(1, loading.worker_buffer))
