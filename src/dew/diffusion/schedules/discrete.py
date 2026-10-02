@@ -20,6 +20,9 @@ class DiscreteNoiseScheduler(NoiseScheduler):
 
     def __init__(self, betas: np.ndarray,
                  p2_loss_weight_k: float = 1, p2_loss_weight_gamma: float = 1):
+        self._record_fields = {'betas': np.asarray(betas, np.float64).tolist(),
+                               'p2_loss_weight_k': p2_loss_weight_k,
+                               'p2_loss_weight_gamma': p2_loss_weight_gamma}
         self.T = len(betas)
         # The table is fixed at construction. Device float32 prefix products
         # and roots introduce backend-dependent error into every later step.
