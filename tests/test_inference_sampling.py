@@ -190,10 +190,10 @@ def test_a_source_binds_a_chain_only_for_controls_its_policy_lacks(task):
     An explicit policy replaces both, while the row count stays the source's."""
     from pathlib import Path
 
-    from dew.interop.pretrained import Pretrained
+    from dew.interop.pretrained import PretrainedDecoder
     from dew.sampling import decoding
 
-    source = Pretrained(task.model, task.variables, None, {}, Path("."), {},
+    source = PretrainedDecoder(task.model, task.variables, None, {}, Path("."), {},
                         generation_config={"do_sample": True, "temperature": 0.7, "top_p": 0.4,
                                            "min_p": 0.1, "num_return_sequences": 2})
     altered = replace(source, generation_config={**source.generation_config,
@@ -246,10 +246,10 @@ def test_a_sources_generation_config_becomes_its_sampling_value(task):
     replacing it on that value while the others, EOS included, still apply."""
     from pathlib import Path
 
-    from dew.interop.pretrained import Pretrained
+    from dew.interop.pretrained import PretrainedDecoder
     from dew.sampling import decoding
 
-    source = Pretrained(task.model, task.variables, None, {}, Path("."), {}, generation_config={
+    source = PretrainedDecoder(task.model, task.variables, None, {}, Path("."), {}, generation_config={
         "do_sample": True, "temperature": 0.7, "top_k": 5, "eos_token_id": 5, "pad_token_id": 3,
         "repetition_penalty": 1.3, "no_repeat_ngram_size": 2, "min_new_tokens": 2, "typical_p": 0.9})
     bound = source.text_generation()
@@ -321,8 +321,8 @@ def test_unsupported_source_controls_report_their_reason(task):
     """An unsupported active source control names itself and the missing behavior."""
     from pathlib import Path
 
-    from dew.interop.pretrained import Pretrained
-    source = Pretrained(task.model, task.variables, None, {}, Path("."), {}, generation_config={})
+    from dew.interop.pretrained import PretrainedDecoder
+    source = PretrainedDecoder(task.model, task.variables, None, {}, Path("."), {}, generation_config={})
     refusals = {
         "stochastic beam": ({"num_beams": 2, "do_sample": True}, "marginal probability"),
         "beams below rows": ({"num_beams": 2, "num_return_sequences": 3}, "exceeds num_beams"),
@@ -362,9 +362,9 @@ def test_a_source_asking_for_several_sequences_binds_them_as_the_task_default(ta
     an explicit sampling policy leaves it alone."""
     from pathlib import Path
 
-    from dew.interop.pretrained import Pretrained
+    from dew.interop.pretrained import PretrainedDecoder
 
-    source = Pretrained(task.model, task.variables, None, {}, Path("."), {},
+    source = PretrainedDecoder(task.model, task.variables, None, {}, Path("."), {},
                         generation_config={"do_sample": True, "temperature": 0.9,
                                            "num_return_sequences": 3})
     policy = source.text_generation()
@@ -386,9 +386,9 @@ def test_a_source_asking_for_several_sequences_binds_them_as_the_task_default(ta
 def test_source_total_length_and_explicit_continuation_budget_have_defined_precedence(task):
     from pathlib import Path
 
-    from dew.interop.pretrained import Pretrained
+    from dew.interop.pretrained import PretrainedDecoder
 
-    source = Pretrained(task.model, task.variables, None, {}, Path("."), {},
+    source = PretrainedDecoder(task.model, task.variables, None, {}, Path("."), {},
                         generation_config={"do_sample": False, "max_length": 5})
     policy = source.text_generation()
     full = policy([[1, 2]], key=1).host()
@@ -405,9 +405,9 @@ def test_a_source_forced_eos_follows_the_budget_the_call_asks_for(task):
     the position to the source's own length would force at the wrong step."""
     from pathlib import Path
 
-    from dew.interop.pretrained import Pretrained
+    from dew.interop.pretrained import PretrainedDecoder
 
-    source = Pretrained(task.model, task.variables, None, {}, Path("."), {},
+    source = PretrainedDecoder(task.model, task.variables, None, {}, Path("."), {},
                         generation_config={"forced_eos_token_id": [2, 5],
                                            "max_new_tokens": 3, "max_length": 18,
                                            "pad_token_id": 0})
@@ -435,11 +435,11 @@ def test_an_explicit_policy_replaces_the_chain_the_source_could_not_build(task):
     would own it."""
     from pathlib import Path
 
-    from dew.interop.pretrained import Pretrained
+    from dew.interop.pretrained import PretrainedDecoder
 
     blocked = {"watermarking_config": {"greenlist_ratio": 0.5}, "guidance_scale": 2.0,
                "temperature": "warm", "num_return_sequences": 2}
-    source = Pretrained(task.model, task.variables, None, {}, Path("."), {},
+    source = PretrainedDecoder(task.model, task.variables, None, {}, Path("."), {},
                         generation_config=blocked)
     with pytest.raises(ValueError):
         source.text_generation()
@@ -465,10 +465,10 @@ def test_neutral_beam_controls_preserve_the_search(task):
     """Serialized beam defaults remain inert while beam search is active."""
     from pathlib import Path
 
-    from dew.interop.pretrained import Pretrained
+    from dew.interop.pretrained import PretrainedDecoder
 
     config = {"num_beams": 2, "num_return_sequences": 2, "eos_token_id": 5}
-    source = Pretrained(task.model, task.variables, None, {}, Path("."), {},
+    source = PretrainedDecoder(task.model, task.variables, None, {}, Path("."), {},
                         generation_config=config)
     expected = source.text_generation()([[1, 2]], 3, key=7)
     declared = replace(source, generation_config={
