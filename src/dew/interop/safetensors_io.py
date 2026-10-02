@@ -345,8 +345,8 @@ def save_sharded(
     `LazyTensors` table builds each shard's tensors as that shard is written
     and the host holds one shard of them at a time. A dense decoder export
     and a source-layout `Pretrained.export` are such tables. A quantized
-    source's requantization, `PretrainedDecoder.from_model` through the Gemma 4
-    and GLM-5-next exporters, and DiffusionGemma's export adapter build their
+    source's requantization, `PretrainedDecoder.from_model` through the
+    GLM-5-next exporter, and DiffusionGemma's export adapter build their
     whole table first, and this writer then holds what it is given.
 
     An export replaces the one `directory` held without a moment at which a

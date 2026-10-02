@@ -21,7 +21,7 @@ from dew.nn.text_encoders import ParamTree, checkpoint_array, insert
 from dew.registry import resolve_dtype
 
 if TYPE_CHECKING:
-    from dew.interop.pretrained import WeightLayout
+    from dew.interop.streaming import WeightLayout
 
 
 def _source_alias(tensors: Mapping[str, np.ndarray], owners: dict[tuple[str, ...], str],
@@ -264,7 +264,7 @@ def translate_unet_weights(tensors: Mapping[str, np.ndarray], model: UNet2DCondi
     are also reshaped to per-head axes, which is why this does not go through
     `record_layouts`.
     """
-    from dew.interop.pretrained import WeightLayout
+    from dew.interop.streaming import WeightLayout
     parameters: ParamTree = {}
     layouts = []
     owners: dict[tuple[str, ...], str] = {}
@@ -748,7 +748,7 @@ def translate_sd3_weights(tensors: Mapping[str, np.ndarray], *, param_dtype: str
     optimizer and an EMA see only `params`, and export writes the stored
     array back unchanged.
     """
-    from dew.interop.pretrained import WeightLayout
+    from dew.interop.streaming import WeightLayout
 
     parameters, layouts = record_layouts(
         "transformer", tensors, _sd3_path, ("params",), param_dtype=param_dtype)
@@ -885,7 +885,7 @@ def record_layouts(component: str, tensors: Mapping[str, np.ndarray],
     writes the tensor back unchanged. Each leaf is cast to `param_dtype` before
     the transpose; buffers and scoring state are the caller's to keep in FP32.
     """
-    from dew.interop.pretrained import WeightLayout
+    from dew.interop.streaming import WeightLayout
     parameters: ParamTree = {}
     layouts = []
     owners: dict[tuple[str, ...], str] = {}
