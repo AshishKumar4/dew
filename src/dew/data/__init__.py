@@ -30,8 +30,6 @@ from .dataset import (
                       Ramp,
                       Reader,
                       Stage,
-                      mixture,
-                      ramped,
 )
 from .images import ArrayRecordImages, HFImages, ImageDataset, OxfordFlowers
 from .preferences import IDS_KEY, MASK_KEY, PreferencePairs
@@ -42,15 +40,15 @@ from .sources.hf import HFOptions
 from .sources.text import (
     TokenBytes,
     TokenColumn,
+    TokenCorpus,
     TokenDocumentSource,
     TokenRecords,
     TokenSource,
     TokenWindowSource,
-    write_tokens,
 )
 from .sources.tfds import TFDSOptions
 from .streaming import CombinedOnline, OnlineImages, OnlineVideos
-from .text import ByteTokenizer, HFTokenizer, tokenizer_for
+from .text import ByteTokenizer, HFTokenizer
 from .tokens import PackedTokens, TokenWindows
 from .video import LocalVideos, VideoDataset, VoxCeleb2
 
@@ -63,7 +61,6 @@ __all__ = ["IDS_KEY", "MASK_KEY", "ArrayRecordImages",
            "Loading", "LocalVideos", "OnlineImages", "OnlineVideos", "OxfordFlowers",
            "PackedTokens", "PreferencePairs", "PreparedTFDS", "Prompts", "Ramp", "Reader", "Role",
            "Stage",
-           "TFDSOptions", "TokenBytes", "TokenColumn",
+           "TFDSOptions", "TokenBytes", "TokenColumn", "TokenCorpus",
            "TokenDocumentSource", "TokenRecords", "TokenSource", "TokenWindowSource",
-           "TokenWindows", "VideoDataset", "VoxCeleb2", "load", "mixture",
-           "ramped", "tokenizer_for", "write_tokens"]
+           "TokenWindows", "VideoDataset", "VoxCeleb2", "load"]

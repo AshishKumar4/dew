@@ -28,7 +28,7 @@ from dew.inference.serving import Server
 from dew.interop import load_pretrained
 from dew.nn.backbones import CausalTransformer, SimpleDiT
 from dew.objectives.diffusion import DiffusionObjective
-from dew.objectives.jepa import JepaEncoder, JepaObjective, JepaPredictor, multi_block_mask
+from dew.objectives.jepa import JepaEncoder, JepaObjective, JepaPredictor, MultiBlockMask
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl import GRPOObjective, SampledRollout
 from dew.sampling import Euler, Heun, Sampling
@@ -126,7 +126,7 @@ def jepa(out, smoke):
     predictor = JepaPredictor(grid=(8, 8), emb_features=32,
                               predictor_features=16, num_layers=1, num_heads=2)
     objective = JepaObjective(
-        encoder, predictor, mask=multi_block_mask((8, 8)),
+        encoder, predictor, mask=MultiBlockMask.for_grid((8, 8)),
         sample=Field("image", (32, 32, 3)), momentum_steps=3)
     trainer = Trainer(objective, optax.adamw(1e-3), key=jax.random.key(0))
     state = trainer.fit(data, steps=3)
