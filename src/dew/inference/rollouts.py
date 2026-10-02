@@ -306,6 +306,7 @@ class SafetensorsReload:
     def _replica(self, root: str, version: int) -> None:
         root = root.rstrip("/")
         # (path, JSON body, whether the answer must say {"success": true})
+        calls: tuple[tuple[str, JSON, bool], ...]
         if self.engine == "vllm":
             calls = (
                 ("/pause?mode=wait", None, False),
@@ -351,7 +352,7 @@ class Publication:
 
     `weights` is the push (`SafetensorsReload`, or any `WeightSync`) and
     `stamp`, when set, labels later calls with a version, as a recording
-    gateway does (`dew.objectives.rl.harbor.Gateway.stamp`). It runs only once
+    gateway does (`dew.interop.harbor.Gateway.stamp`). It runs only once
     every replica serves the new version: a gateway stamps a call when it
     arrives, so a stamp ahead of a replica would claim weights the call was
     not sampled from. A failed push or stamp raises and leaves `version` where
@@ -535,9 +536,9 @@ class VLLMGenerateServer(_RequestServer):
 
     def _draw(self, prompt: tuple[int, ...], budget: int, seed: int, version: int) -> Draw:
         sampling = self._sampling
-        parameters: dict[str, object] = {"temperature": sampling.temperature, "top_p": sampling.top_p,
-                                         "top_k": sampling.top_k, "min_p": sampling.min_p,
-                                         "max_tokens": budget, "seed": seed, "logprobs": 0}
+        parameters: dict[str, JSON] = {"temperature": sampling.temperature, "top_p": sampling.top_p,
+                                       "top_k": sampling.top_k, "min_p": sampling.min_p,
+                                       "max_tokens": budget, "seed": seed, "logprobs": 0}
         if sampling.eos_id is not None:
             parameters["stop_token_ids"] = list(sampling.stops)
         response = _post(self._root, "/inference/v1/generate",

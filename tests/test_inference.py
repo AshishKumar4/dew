@@ -654,7 +654,7 @@ def test_a_grid_prepares_the_process_and_times_and_final_denoise_ends_the_trajec
 def test_explicit_average_requests_do_not_substitute_live_weights(tmp_path):
     objective, state = make_lm_run(tmp_path, ema_decay=None)
     with pytest.raises(ValueError, match="no EMA"):
-        objective.pipeline(state)
+        objective.pipeline(state, ema=True)
     with pytest.raises(ValueError, match="no EMA"):
         dew.pipeline(str(tmp_path), ema=True)
     restored = dew.pipeline(str(tmp_path))

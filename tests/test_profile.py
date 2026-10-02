@@ -184,7 +184,7 @@ def test_a_capture_drains_past_an_array_a_donation_consumed(tmp_path, native_rep
     stepped = jax.jit(lambda value: value + 1, donate_argnums=0)(consumed)
     assert any(array is consumed for array in jax.live_arrays())
     assert consumed.addressable_shards[1].data.is_deleted()
-    with dew.profile(tmp_path):
+    with dew.Profiler(tmp_path):
         stepped = stepped + 1
     assert stepped.is_ready() and int(stepped) == 2
 

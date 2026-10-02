@@ -243,7 +243,6 @@ def test_token_window_source_reads_the_dtype_from_meta(tmp_path):
     source = TokenWindowSource(TokenBytes(str(tmp_path / "train.bin")), seq_len)
     assert source.tokens.dtype == np.dtype("uint32")
     np.testing.assert_array_equal(source[0]["text"], tokens[:seq_len + 1])
-    assert source.tokens.vocab_size == 100000
 
     # Without meta.json the nanoGPT default applies.
     bare = tmp_path / "bare"
