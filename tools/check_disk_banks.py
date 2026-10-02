@@ -28,8 +28,7 @@ from dew.inference.banks import SafetensorsBanks, host_banked, layer_index, stre
 from dew.interop.hf_decoders import translate_config
 from dew.objectives.base import merge
 from dew.registry import models, with_precision
-from dew.training import Layout
-from dew.training.distributed import build_mesh
+from dew.training import Layout, MeshSpec
 
 
 class PrefixBanks(SafetensorsBanks):
@@ -75,7 +74,7 @@ def check(config):
         loader = host_banked if config.mode == "host" else stream_banked
         layout = Layout(min_shard=1, tolerance=1.0,
                         host_parameters=("params/layers_*",) if config.mode == "host" else ())
-        variables = loader(model, source, mesh=build_mesh(devices=[jax.devices()[0]]), layout=layout)
+        variables = loader(model, source, mesh=MeshSpec().build([jax.devices()[0]]), layout=layout)
         loaded_seconds = time.perf_counter() - started
         print("weights loaded", loaded_seconds, "peak RSS",
               resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024, file=sys.stderr, flush=True)

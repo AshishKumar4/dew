@@ -17,7 +17,7 @@ from dew.inputs import Field, InputSpec
 from dew.nn.autoencoders.kl import AutoencoderKL
 from dew.nn.autoencoders.sd_vae import StableDiffusionVAE
 from dew.nn.backbones import SimpleDiT
-from dew.objectives.base import Step, scalar_loss
+from dew.objectives.base import Step
 from dew.objectives.diffusion import Alignment, DiffusionObjective
 from dew.objectives.diffusion.end_to_end import AUTOENCODER, LATENT_STATS, EndToEnd
 from dew.sampling import Euler, TextToImage
@@ -77,7 +77,7 @@ STEP = Step(step=jnp.asarray(0), key=jax.random.PRNGKey(2), ema=None)
 def gradients(end_to_end: EndToEnd):
     task = objective(end_to_end)
     params = task.init(jax.random.PRNGKey(0))
-    return params, jax.grad(lambda tree: scalar_loss(task, {**params, "params": tree}, BATCH, STEP)[0])(
+    return params, jax.grad(lambda tree: task.scalar_loss({**params, "params": tree}, BATCH, STEP)[0])(
         params["params"])
 
 

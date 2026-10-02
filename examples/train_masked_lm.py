@@ -24,7 +24,7 @@ from dew.data import ByteTokenizer, DataPartition, Loading, TokenWindows
 from dew.diffusion.discrete import DiscreteProcess, LogLinear
 from dew.inference import RunProcessor
 from dew.nn.backbones import CausalTransformer
-from dew.objectives.base import Step, scalar_loss
+from dew.objectives.base import Step
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.training import Checkpoints, Trainer
 
@@ -76,7 +76,7 @@ def main(config: Config):
         probe = next(stream)
     finally:
         stream.close()
-    score = jax.jit(lambda params: scalar_loss(objective, params, probe,
+    score = jax.jit(lambda params: objective.scalar_loss(params, probe,
                    Step(step=jnp.asarray(0), key=jax.random.key(7), ema=None))[0])
     initial_loss = float(score(trainer.initial_state().params))
     state = trainer.fit(data, steps=config.steps, log_every=1, checkpoint_every=config.steps)

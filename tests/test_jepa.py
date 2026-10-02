@@ -10,7 +10,7 @@ import pytest
 from dew.artifacts import Representations
 from dew.inputs import Field
 from dew.nn.backbones.jepa import JepaPredictor
-from dew.objectives.base import Step, merge, scalar_loss
+from dew.objectives.base import Step, merge
 from dew.objectives.jepa import (
     JepaEncoder,
     JepaObjective,
@@ -190,7 +190,7 @@ def test_fresh_loss_is_non_trivial_and_training_reduces_it(mask, rng):
     batch = {"image": images()}
 
     def loss_of(p):
-        return scalar_loss(objective, p, batch, step_with(params))[0]
+        return objective.scalar_loss(p, batch, step_with(params))[0]
 
     initial = float(loss_of(params))
     assert initial > 0.1, "a fresh model already predicts the targets"
@@ -215,7 +215,7 @@ def test_video_objective_trains(mask, rng):
     batch = {"video": videos()}
 
     def loss_of(p):
-        return scalar_loss(objective, p, batch, step_with(params))[0]
+        return objective.scalar_loss(p, batch, step_with(params))[0]
 
     initial = float(loss_of(params))
     optimizer = optax.adam(3e-3)
@@ -235,7 +235,7 @@ def test_bf16_models_keep_the_loss_in_fp32(mask, rng):
                               make_predictor(dtype=jnp.bfloat16), mask,
                               sample=Field("image", (RES, RES, 3)))
     params = objective.init(rng)
-    loss, aux = scalar_loss(objective, params, {"image": images()}, step_with(params))
+    loss, aux = objective.scalar_loss(params, {"image": images()}, step_with(params))
     assert loss.dtype == jnp.float32
     assert all(a.dtype == jnp.float32 for a in aux.metrics.values())
 
@@ -303,7 +303,7 @@ def test_no_gradient_reaches_the_target_branch(mask, rng):
     batch = {"image": images()}
 
     grads = jax.grad(
-        lambda ema: scalar_loss(objective, params, batch, step_with(ema))[0]
+        lambda ema: objective.scalar_loss(params, batch, step_with(ema))[0]
     )(params)
     assert all(float(jnp.max(jnp.abs(g))) == 0.0 for g in jax.tree.leaves(grads))
 
@@ -319,8 +319,8 @@ def test_the_targets_come_from_the_ema_encoder(mask, rng):
     moved = {"params": {"context_encoder": jax.tree.map(
         lambda p: p + 0.1, params["params"]["context_encoder"])}}
 
-    same = float(scalar_loss(objective, params, batch, step_with(params))[0])
-    other = float(scalar_loss(objective, params, batch, step_with(merge(params, moved)))[0])
+    same = float(objective.scalar_loss(params, batch, step_with(params))[0])
+    other = float(objective.scalar_loss(params, batch, step_with(merge(params, moved)))[0])
     assert abs(other - same) > 1e-2 * same
 
 
@@ -347,11 +347,11 @@ def test_collapse_telemetry_flows_through_a_degenerate_encoder(mask, rng):
                         mlp_ratio=2),
         make_predictor(), mask, sample=Field("image", (RES, RES, 3)))
     collapsed_params = collapsed.init(rng)
-    _, collapsed_aux = scalar_loss(collapsed, collapsed_params, batch, step_with(collapsed_params))
+    _, collapsed_aux = collapsed.scalar_loss(collapsed_params, batch, step_with(collapsed_params))
 
     healthy = make_objective(mask)
     healthy_params = healthy.init(rng)
-    _, healthy_aux = scalar_loss(healthy, healthy_params, batch, step_with(healthy_params))
+    _, healthy_aux = healthy.scalar_loss(healthy_params, batch, step_with(healthy_params))
 
     assert float(collapsed_aux.metrics["repr_std"]) < 1e-5
     assert float(healthy_aux.metrics["repr_std"]) > 1e-3

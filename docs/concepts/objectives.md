@@ -84,7 +84,7 @@ from flax import linen as nn
 
 from dew import Trainer
 from dew.data import Dataset
-from dew.objectives.base import Aux, Ratio, Objective, mean_loss
+from dew.objectives.base import Aux, Ratio, Objective
 
 
 class NormalizedRegressor(nn.Module):
@@ -107,7 +107,7 @@ class StatefulRegression(Objective):
         )
         errors = (prediction - batch["y"]) ** 2
         loss = Ratio(jnp.sum(errors), jnp.asarray(errors.size))
-        mse, _ = mean_loss(loss)
+        mse, _ = loss.mean()
         return loss, Aux(metrics={"mse": mse}, variables=updated)
 
 

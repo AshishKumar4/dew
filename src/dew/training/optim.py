@@ -492,25 +492,25 @@ class ParamGroup:
                 f"param group {self.name!r} scales the learning rate by a positive "
                 f"number, got {self.learning_rate_multiplier}")
 
+    @classmethod
+    def mup(cls, width_multiplier: float) -> tuple[ParamGroup, ...]:
+        """lm-engine's muP parameter groups (configs/param-groups/mup.yml at
+        45b6b57b), in its order: norms, biases and `dt_bias` without weight
+        decay at the base rate; the token embeddings at the base rate with decay;
+        everything else, the router, `A_log`, `D` and the conv taps included, at
+        the base rate divided by `width_multiplier` (lm-engine's m_width, the
+        model's `logits_scaling`)."""
+        return (
+            cls("no_weight_decay", NO_DECAY_PATTERNS, weight_decay=0.0),
+            cls("normal", ("*embed_tokens/*",)),
+            cls("mup", ("*",), learning_rate_multiplier=1 / width_multiplier),
+        )
+
 
 NO_DECAY_PATTERNS = ("*/bias", "*/scale", "*norm/weight", "*/dt_bias")
 """What lm-engine's `no_weight_decay` group holds (configs/param-groups/
 mup.yml at 45b6b57b): biases, every norm's weight (an RMSNorm keeps `scale`
 here, Mamba-2's gated norm `weight`) and Mamba-2's `dt_bias`."""
-
-
-def mup_param_groups(width_multiplier: float) -> tuple[ParamGroup, ...]:
-    """lm-engine's muP parameter groups (configs/param-groups/mup.yml at
-    45b6b57b), in its order: norms, biases and `dt_bias` without weight
-    decay at the base rate; the token embeddings at the base rate with decay;
-    everything else, the router, `A_log`, `D` and the conv taps included, at
-    the base rate divided by `width_multiplier` (lm-engine's m_width, the
-    model's `logits_scaling`)."""
-    return (
-        ParamGroup("no_weight_decay", NO_DECAY_PATTERNS, weight_decay=0.0),
-        ParamGroup("normal", ("*embed_tokens/*",)),
-        ParamGroup("mup", ("*",), learning_rate_multiplier=1 / width_multiplier),
-    )
 
 
 def param_labels(groups: Sequence[ParamGroup]):
@@ -574,15 +574,6 @@ def linear_schedule(peak: float, warmup_steps: int, decay_start: int | None,
         optax.constant_schedule(peak),
         optax.linear_schedule(peak, end_value, decay_end - start),
     ], [warmup_steps, start])
-
-
-def _scaled(learning_rate: float | optax.Schedule, multiplier: float) -> float | optax.Schedule:
-    if multiplier == 1.0:
-        return learning_rate
-    if callable(learning_rate):
-        schedule = learning_rate
-        return lambda count: multiplier * schedule(count)
-    return multiplier * learning_rate
 
 
 class ScheduleBase:
@@ -671,54 +662,3 @@ def learning_rate_schedule(config: OptimConfig, steps: int):
     """The rate `config` names: its schedule over a `steps`-update run, or
     the constant `learning_rate` when it names none."""
     return config.learning_rate if config.schedule is None else config.schedule.schedule(steps)
-
-
-def build_optimizer(config: OptimConfig, steps: int) -> optax.GradientTransformation:
-    """Build the solver a config describes, with its schedule, parameter
-    groups and clipping.
-
-    `steps` is the run's length, which a schedule decays over unless the
-    config names its own end. `param_groups` runs one solver per group under
-    `optax.multi_transform`, each on the schedule times its multiplier and
-    with its own weight decay; the global-norm clip still reads every
-    gradient together, before the groups split them."""
-    learning_rate = learning_rate_schedule(config, steps)
-    opts = dict(config.optimizer_opts)
-    if config.weight_decay is not None:
-        opts['weight_decay'] = config.weight_decay
-        if config.optimizer in ('muon', 'muonclip'):
-            # Muon's weight_decay does not cover the AdamW group's norm scales.
-            opts.setdefault('adam_weight_decay', config.weight_decay)
-    make = OPTIMIZER_MAP[config.optimizer]
-    if config.state_dtype == 'bfloat16':
-        if config.optimizer not in BF16_STATE_OPTIMIZERS:
-            raise ValueError(
-                f"state_dtype='bfloat16' stores Adam's moments in bf16, which "
-                f"{sorted(BF16_STATE_OPTIMIZERS)} have; {config.optimizer!r} does not")
-        make = BF16_STATE_OPTIMIZERS[config.optimizer]
-    if config.param_groups:
-        names = [group.name for group in config.param_groups]
-        if len(set(names)) != len(names):
-            raise ValueError(f"param group names repeat: {names}")
-        solvers = {}
-        for group in config.param_groups:
-            group_opts = dict(opts)
-            if group.weight_decay is not None:
-                group_opts['weight_decay'] = group.weight_decay
-                if config.optimizer in ('muon', 'muonclip'):
-                    group_opts['adam_weight_decay'] = group.weight_decay
-            solvers[group.name] = make(
-                _scaled(learning_rate, group.learning_rate_multiplier), **group_opts)
-        solver = optax.multi_transform(solvers, param_labels(config.param_groups))
-    else:
-        solver = make(learning_rate, **opts)
-
-    if config.clip_grads > 0:
-        solver = optax.chain(optax.clip_by_global_norm(config.clip_grads), solver)
-    if config.forced_weight_normalization:
-        from dew.nn.mp import forced_weight_normalization
-
-        solver = optax.chain(solver, forced_weight_normalization())
-    if config.ema_profiles:
-        solver = power_profiles(solver, config.ema_profiles)
-    return solver

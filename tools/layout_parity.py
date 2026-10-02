@@ -314,16 +314,16 @@ def _trainer(case, fields: dict[str, int], *, one_device: bool = False, accumula
     import jax
     import optax
 
-    from dew.training import Layout, MeshSpec, Trainer, build_mesh
+    from dew.training import Layout, MeshSpec, Trainer
 
     trainer = Trainer(bench.build_objective(case), optax.chain(stash(), optax.adam(1e-3)),
                       key=jax.random.key(0), mesh=bench.mesh_spec(fields),
                       layout=Layout(min_shard=case.fsdp_min_param_size, tolerance=1.0),
                       accumulation=accumulation, checkpoints=None, tracker=None)
     if one_device:
-        trainer.device_mesh = build_mesh(MeshSpec(), [jax.local_devices()[0]])
+        trainer.device_mesh = MeshSpec().build([jax.local_devices()[0]])
     elif devices is not None:
-        trainer.device_mesh = build_mesh(trainer.mesh, jax.devices()[:devices])
+        trainer.device_mesh = trainer.mesh.build(jax.devices()[:devices])
     return trainer
 
 
@@ -456,7 +456,7 @@ def anchor_step(case, batch) -> tuple[float, dict[str, NDArray]]:
     import jax.numpy as jnp
     import numpy as np
 
-    from dew.objectives.base import Step, scalar_loss
+    from dew.objectives.base import Step
     from dew.training.transaction import with_ema
 
     state = jax.jit(_trainer(case, {}, one_device=True).initial_state)()
@@ -474,7 +474,7 @@ def anchor_step(case, batch) -> tuple[float, dict[str, NDArray]]:
                 with_ema(wide, None if state.ema is None else widened(state.ema)))
 
     def loss(params, batch):
-        return scalar_loss(objective, {**wide, "params": params}, batch, step)[0]
+        return objective.scalar_loss({**wide, "params": params}, batch, step)[0]
 
     value, gradient = jax.jit(jax.value_and_grad(loss))(wide["params"], batch)
     return float(value), {jax.tree_util.keystr(path): np.asarray(leaf)

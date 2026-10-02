@@ -8,8 +8,8 @@ the shuffled training stream, the ordered validation pass, and the slice
 that keeps the two disjoint.
 
 Every stream is opened for a `DataPartition`, the share of each global batch
-its reader reads. The trainer asks the mesh for it
-(`dew.training.distributed.data_partition`), since the processes a pipeline
+its reader reads. The trainer asks the mesh for it (`DataPartition.of`),
+since the processes a pipeline
 or a split sequence spans between them hold the same rows and read the same
 share; a loader reads the share it is handed and nothing else.
 
@@ -41,9 +41,11 @@ import jax
 import numpy as np
 import tyro
 from absl import flags
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from numpy.typing import ArrayLike
 
 from dew import position
+from dew.nn.sharding import BATCH_AXES, LayoutRefused
 
 # `Batch` lives in dew.objectives.base. The data layer imports it from here
 # so a dataset module needs one import for the value and its shape.
@@ -74,10 +76,9 @@ class DataPartition:
     A loader cuts its record order `index :: count`, so the shares of global
     batch k together hold the same records at every count, and a record
     count is a place in the stream whatever the count. The trainer asks the
-    mesh which share a process reads (`dew.training.distributed.
-    data_partition`): processes whose devices hold the same rows read the
-    same share, since the axes between them split a sequence or hold a
-    pipeline's stages rather than rows. `DataPartition()` is one reader of
+    mesh which share a process reads (`DataPartition.of`): processes whose
+    devices hold the same rows read the same share, since the axes between
+    them split a sequence or hold a pipeline's stages rather than rows. `DataPartition()` is one reader of
     every row, what a single process reads.
     """
 
@@ -101,6 +102,25 @@ class DataPartition:
                 f"got index {self.index} of {self.count} read by {self.readers}, reader "
                 f"{self.reader}")
 
+    @classmethod
+    def of(cls, mesh: Mesh) -> DataPartition:
+        """The share of every global batch this process reads on `mesh`.
+
+        A batch's rows split over the batch axes and no others (`BATCH_SPEC`):
+        the sequence axis splits positions, the tensor axis widths, and the stage
+        axis holds a pipeline's stages. So the processes whose devices hold the
+        same row shards need the same rows, and the processes fall into groups by
+        the rows they hold.
+        Each group reads one share, numbered by the first row shard it holds,
+        and every process of the group reads it (`readers`); `reader` is this
+        process's place among them, in process order.
+
+        Groups whose rows overlap without being the same rows, which a device
+        order built by hand can produce, leave no share each could read whole,
+        so they are refused.
+        """
+        return _partition(mesh)
+
     def rows(self, batch: int) -> int:
         """The rows of a `batch`-row global batch one share holds.
 
@@ -112,6 +132,27 @@ class DataPartition:
                 f"batch {batch} does not split into {self.count} equal shares, "
                 f"one for each group of processes that reads its own rows")
         return batch // self.count
+
+
+@functools.cache
+def _partition(mesh: Mesh) -> DataPartition:
+    shards = math.prod(mesh.shape[axis] for axis in BATCH_AXES)
+    held: dict[int, set[int]] = {}
+    placement = NamedSharding(mesh, P(BATCH_AXES)).devices_indices_map((shards,))
+    for device, index in placement.items():
+        held.setdefault(device.process_index, set()).add(index[0].start or 0)
+    groups = sorted({frozenset(rows) for rows in held.values()}, key=min)
+    if (sum(len(group) for group in groups) != shards
+            or len({len(group) for group in groups}) != 1):
+        raise LayoutRefused(
+            f"the processes of this mesh hold the row shards "
+            f"{ {process: sorted(rows) for process, rows in sorted(held.items())} }, "
+            f"which overlap without being the same; each group of processes has to "
+            f"hold rows no other group holds, so it can read them as its own share")
+    mine = frozenset(held[jax.process_index()])
+    readers = sorted(process for process, rows in held.items() if frozenset(rows) == mine)
+    return DataPartition(index=groups.index(mine), count=len(groups), readers=len(readers),
+                         reader=readers.index(jax.process_index()))
 
 
 type Reader = Callable[[DataPartition], Iterator[Batch]]

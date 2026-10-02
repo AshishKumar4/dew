@@ -1,7 +1,7 @@
 """Draw the docs' figures, each in a light and a dark variant.
 
 The sharding and diffusion figures are computed by Dew itself: the mesh
-figure reads the placements `build_mesh`, `Layout` and `batch_shardings`
+figure reads the placements `MeshSpec.build`, `Layout` and `batch_shardings`
 give on eight simulated CPU devices, and the diffusion figure noises an
 image with the rates of the `Cosine` and `Flow` presets. The data and
 training-step figures draw the order of calls in `Trainer.fit`
@@ -28,7 +28,7 @@ from PIL import Image
 
 from dew.diffusion.presets import Cosine, Flow
 from dew.nn.backbones import CausalTransformer, Mixture
-from dew.training import Layout, MeshSpec, build_mesh
+from dew.training import Layout, MeshSpec
 from dew.training.distributed import batch_shardings
 
 HERE = Path(__file__).resolve().parent
@@ -103,7 +103,7 @@ def box(svg: Svg, x, y, w, h, title, lines=(), accent=False):
 
 def mesh_figure():
     """A (data=2, fsdp=2, tensor=2) mesh, a batch and an MLP kernel placed on it."""
-    mesh = build_mesh(MeshSpec(fsdp=2, tensor=2))
+    mesh = MeshSpec(fsdp=2, tensor=2).build()
     ids = np.vectorize(lambda d: d.id)(mesh.devices)  # (data, expert, fsdp, tensor, sequence, stage)
     coords = {int(ids[d, 0, f, k, 0, 0]): (d, f, k) for d in range(2) for f in range(2) for k in range(2)}
 
@@ -170,8 +170,8 @@ def mesh_figure():
         svg.text(476, 346, "columns (mlp) over tensor.", size=13, color=t["muted"])
         svg.text(476, 376, "Each block is held by one", size=13, color=t["muted"])
         svg.text(476, 396, "device of each data index.", size=13, color=t["muted"])
-        svg.text(24, 500, "Placements read from build_mesh, Layout().shardings and batch_shardings", size=13,
-                 color=t["muted"])
+        svg.text(24, 500, "Placements read from MeshSpec.build, Layout().shardings and batch_shardings",
+                 size=13, color=t["muted"])
         svg.text(24, 520, "(dew.training) on 8 simulated CPU devices.", size=13, color=t["muted"])
         svg.write("mesh", variant)
 
@@ -230,7 +230,7 @@ def data_figure():
         svg.arrow(304, 76, 454, 76)
         svg.arrow(456, 128, 306, 196)
         svg.arrow(304, 248, 454, 248)
-        svg.text(380, 66, "data_partition(mesh)", size=12, mono=True, color=t["muted"], anchor="middle")
+        svg.text(380, 66, "DataPartition.of(mesh)", size=12, mono=True, color=t["muted"], anchor="middle")
         svg.text(400, 170, "next(train(partition))", size=12, mono=True, color=t["muted"])
         svg.text(380, 238, "shard_batch", size=12, mono=True, color=t["muted"], anchor="middle")
         svg.text(24, 336, "One process: DataPartition() reads every row; the host batch is the global batch.",
