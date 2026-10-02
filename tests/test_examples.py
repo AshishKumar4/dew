@@ -44,11 +44,11 @@ def single_device(offline=True) -> dict[str, str]:
             "TOKENIZERS_PARALLELISM": "false"}
 
 
-def smoke(name, out, *arguments, offline=True):
+def smoke(name, out, *arguments, offline=True, script=None, smoke_args=True):
     """One example's `--smoke` run, in its own process, on one CPU device (`single_device`)."""
     finished = subprocess.run(
-        [sys.executable, str(REPO_ROOT / "examples" / f"{name}.py"), "--smoke",
-         "--out", str(out), *arguments],
+        [sys.executable, str(script or REPO_ROOT / "examples" / f"{name}.py"),
+         *(["--smoke", "--out", str(out)] if smoke_args else []), *arguments],
         cwd=REPO_ROOT, env=single_device(offline), capture_output=True, text=True, timeout=900)
     assert finished.returncode == 0, (
         f"{name} --smoke exited {finished.returncode}\n"
@@ -63,6 +63,37 @@ def load_example(name):
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.mark.parametrize("section", ["lm", "diffusion", "sample_public", "jepa", "grpo", "pretrained", "serving", "mesh", "reliability"])
+def test_landing_snippet_runs(section, tmp_path):
+    smoke("landing", tmp_path, "--section", section,
+          script=REPO_ROOT / "site/snippets/framework.py")
+    result = json.loads((tmp_path / "result.json").read_text())
+    assert result
+    if section == "reliability":
+        assert result["bit_exact"] and result["resumed_step"] == 3
+    elif section == "serving":
+        assert len(result["text"]) == 2
+    elif section == "pretrained":
+        assert (tmp_path / "export/config.json").is_file()
+
+
+def test_recorded_hero_runs_offline(tmp_path):
+    """The exact recorded script, with its normal 200 steps, over local byte fixtures."""
+    script = tmp_path / "hero.py"
+    shutil.copyfile(REPO_ROOT / "site/src/data/hero.py", script)
+    corpus = tmp_path / "tokens"
+    corpus.mkdir()
+    text = "ROMEO: I love the moon.\nJULIET: The moon shines tonight.\n" * 1000
+    tokens = np.asarray(list(text.encode()), np.uint16)
+    for split in ("train", "val"):
+        tokens.tofile(corpus / f"{split}.bin")
+    (corpus / "meta.json").write_text(json.dumps({
+        "tokenizer": "byte", "vocab_size": 256, "dtype": "uint16",
+        "train_tokens": len(tokens), "val_tokens": len(tokens), "eos_id": 255}))
+    finished = smoke("hero", tmp_path, script=script, smoke_args=False)
+    assert "ROMEO:" in finished.stdout and "JULIET:" in finished.stdout
 
 
 def _batches(batch, classes=None, size=RES):

@@ -90,3 +90,71 @@ test('Run sends the editor cell and shows the returned image', async () => {
 	assert.equal(await image.evaluate((element) => element.naturalWidth), 1);
 	assert.deepEqual(errors, []);
 });
+
+test('homepage text and diffusion cells share one kernel without overlapping', async () => {
+	const page = await browser.newPage({ viewport: { width: 390, height: 844 }, reducedMotion: 'reduce' });
+	await page.route('https://challenges.cloudflare.com/**', (route) => route.fulfill({
+		contentType: 'text/javascript',
+		body: 'window.turnstile = { render: (el, o) => { o.callback("token"); return "w"; }, remove() {} };',
+	}));
+	let requests = 0;
+	await page.route(`${live.endpoint}/v1/sessions`, (route) => {
+		requests++;
+		return route.fulfill({ json: { socket: SOCKET, warm: true } });
+	});
+	const sent = [];
+	await page.routeWebSocket(SOCKET, (socket) => {
+		socket.send(JSON.stringify({ type: 'ready', uptime: 1, setup: 1 }));
+		socket.onMessage((raw) => {
+			const message = JSON.parse(String(raw));
+			if (message.op !== 'execute') return;
+			sent.push(message.code);
+			const reply = (body) => socket.send(JSON.stringify({ id: message.id, ...body }));
+			if (message.code.includes('text_model')) {
+				reply({ type: 'display', text: JSON.stringify({ 'dew-progress': { stage: 'load', model: 'SmolLM2' } }) });
+				reply({ type: 'display', text: JSON.stringify({ 'dew-progress': { stage: 'generate', first: false } }) });
+				setTimeout(() => {
+					reply({ type: 'stream', name: 'stdout', text: 'Paris.\n' });
+					reply({ type: 'done', status: 'ok', count: 1 });
+				}, 800);
+			} else {
+				reply({ type: 'display', png: PNG });
+				reply({ type: 'done', status: 'ok', count: 2 });
+			}
+		});
+	});
+	await page.goto(`http://127.0.0.1:${server.address().port}/`);
+	const text = page.locator('[data-text-cell]');
+	const edited = `${await text.inputValue()}\n# edited`;
+	await text.fill(edited);
+	await page.locator('[data-text-run]').click();
+	await page.waitForFunction(() => document.querySelector('[data-text-status]').textContent.startsWith('Generating'));
+	// Use the event directly so scrolling to a second button cannot outlast the mock run.
+	await page.locator('[data-run]').dispatchEvent('click');
+	assert.match(await page.locator('[data-status]').textContent(), /Another cell is running/);
+	await page.waitForFunction(() => document.querySelector('[data-text-status]').textContent.startsWith('Generated in'));
+	assert.equal((await page.locator('[data-text-output]').textContent()).trim(), 'Paris.');
+	await page.locator('[data-run]').click();
+	await page.locator('[data-final]').waitFor({ state: 'visible' });
+	assert.equal(requests, 1);
+	assert.equal(sent.length, 2);
+	assert.equal(sent[0], edited);
+	await page.close();
+});
+
+test('Try it cards stay readable and the local sampler link opens at both widths', async () => {
+	for (const [width, scheme] of [[1440, 'dark'], [390, 'light']]) {
+		const page = await browser.newPage({ viewport: { width, height: 900 }, colorScheme: scheme, reducedMotion: 'reduce' });
+		await page.goto(`http://127.0.0.1:${server.address().port}/`);
+		const links = page.locator('.try-list a');
+		assert.equal(await links.count(), 3);
+		for (const link of await links.all()) {
+			const box = await link.boundingBox();
+			assert.ok(box.width > 200 && box.x >= 0 && box.x + box.width <= width + 1);
+		}
+		await page.locator('.try-list a[href="/sample/"]').click();
+		await page.locator('[data-live-sampler]').waitFor();
+		assert.match(await page.locator('h1').textContent(), /Sample/);
+		await page.close();
+	}
+});
