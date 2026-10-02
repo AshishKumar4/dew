@@ -1474,19 +1474,14 @@ class Trainer(Generic[Loss, Effects]):
                 validation=validation is not None
                 or (bool(eval_every or metrics) and dataset.val is not None),
             )
-            state, shardings, position = self.place()
-            run.last_checkpoint = time.perf_counter()
-            if checkpoints is not None and checkpoints.latest is not None:
-                run.stop_control = checkpoints.control(checkpoints.latest)
-            if self._opened(plan, run, state, position):
-                return state
-            state = self._training_loop(plan, run, state, shardings, position, profiler, tracer,
-                                        profile, checkpoints)
+            state, complete = self._training_loop(plan, run, profiler, tracer, profile, checkpoints)
         finally:
             primary = sys.exception()
             error = self._closed(run, primary, profiler)
             if primary is None and error is not None:
                 raise error
+        if complete:
+            return state
         if run.preempted is not None:
             raise Preempted(run.preempted)
         if restore_best and checkpoints is not None:
@@ -1498,10 +1493,22 @@ class Trainer(Generic[Loss, Effects]):
             )
         return state
 
-    def _training_loop(self, plan: _FitPlan, run: _FitRun, state: TrainState,
-                       shardings, position, profiler: Profiler | None, tracer: Profiler | None,
-                       profile: ProfileWindow | None, checkpoints: Checkpoints | None) -> TrainState:
-        """Dispatch the numerical steps and finish their loop before resource cleanup."""
+    def _training_loop(self, plan: _FitPlan, run: _FitRun, profiler: Profiler | None,
+                       tracer: Profiler | None, profile: ProfileWindow | None,
+                       checkpoints: Checkpoints | None) -> tuple[TrainState, bool]:
+        """Place the state, dispatch the numerical steps and finish their loop
+        before resource cleanup. Returns the final state and whether the run
+        was already complete, its last checkpoint written, so nothing ran.
+
+        The loop is the state's one holder: each step donates the state it is
+        handed, and a reference kept past that, as fit's own once was, holds
+        an array whose buffers the step consumed."""
+        state, shardings, position = self.place()
+        run.last_checkpoint = time.perf_counter()
+        if checkpoints is not None and checkpoints.latest is not None:
+            run.stop_control = checkpoints.control(checkpoints.latest)
+        if self._opened(plan, run, state, position):
+            return state, True
         compiled: dict[Shapes, tuple[CompiledStep, float | None]] = {}
         interval = _Interval(time.time(), last_saved=(
             run.current if checkpoints is not None and checkpoints.latest is not None else None))
@@ -1557,7 +1564,7 @@ class Trainer(Generic[Loss, Effects]):
                     assert profiler is not None
                     self._stop_trace(run, profile, profiler)
         self._wind_down(plan, run, interval, state, shardings, position, profiler)
-        return state
+        return state, False
 
     def _closed(self, run: _FitRun, primary: BaseException | None,
                 profiler: Profiler | None) -> BaseException | None:
