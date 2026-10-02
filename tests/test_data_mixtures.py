@@ -967,6 +967,23 @@ def test_a_batch_the_pipeline_cannot_cut_into_microbatches_is_refused_before_it_
     assert trainer.executable is None
 
 
+@pytest.mark.mesh
+def test_a_batch_the_row_shards_cannot_split_is_refused_before_it_is_placed():
+    """Six rows over data 8 leave two devices without a row. The run is
+    refused before a batch is placed or anything compiles, naming the row
+    shards and a batch that splits over them, where placing the batch raised
+    jax's own error about a sharding that does not divide a dimension."""
+    from dew.nn.sharding import LayoutRefused
+
+    trainer = Trainer(Regression(), optax.sgd(0.5), key=jax.random.key(0),
+                      layout=Layout(min_shard=1, tolerance=1.0))
+
+    with pytest.raises(LayoutRefused, match=r"6 rows over the 8 row shards of data 8.*multiple of 8 rows, "
+                                            r"8 the nearest above 6"):
+        trainer.fit(indexed_data(256, 6), steps=2, log_every=100)
+    assert trainer.executable is None
+
+
 def test_the_log_tick_reports_the_records_a_ramped_interval_read():
     """`samples_per_sec` is the records the interval read over its wall time,
     summed per step, so a ramped interval is not reported as if every step

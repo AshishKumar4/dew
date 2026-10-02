@@ -9,6 +9,7 @@ import sharp from 'sharp';
 import { repository } from '../src/manifest.mjs';
 import {
 	blobUrl,
+	checkOnly,
 	describe,
 	lastUpdated,
 	pageFile,
@@ -56,12 +57,14 @@ function terminal(text) {
 
 async function writeImage(buffer, stem, name) {
 	const dir = path.join(imageRoot, stem);
-	await mkdir(dir, { recursive: true });
 	const image = sharp(buffer);
 	const { width, height } = await image.metadata();
 	let webp = await image.clone().webp({ lossless: true, effort: 6 }).toBuffer();
 	if (webp.length > 150_000) webp = await image.clone().webp({ quality: 86, effort: 6 }).toBuffer();
-	await writeFile(path.join(dir, `${name}.webp`), webp);
+	if (!checkOnly) {
+		await mkdir(dir, { recursive: true });
+		await writeFile(path.join(dir, `${name}.webp`), webp);
+	}
 	return { src: `/tutorials/${stem}/${name}.webp`, width, height };
 }
 
@@ -136,11 +139,11 @@ function fence(code) {
 
 // `node scripts/render-notebooks.mjs 02 05` renders only the notebooks whose names
 // start with those prefixes, for working on the site while a notebook is re-executed.
-const only = process.argv.slice(2);
+const only = process.argv.slice(2).filter((arg) => arg !== '--check');
 const files = (await readdir(notebooksDir))
 	.filter((name) => name.endsWith('.ipynb') && (only.length === 0 || only.some((prefix) => name.startsWith(prefix))))
 	.sort();
-await rm(imageRoot, { recursive: true, force: true });
+if (!checkOnly) await rm(imageRoot, { recursive: true, force: true });
 
 const slugOf = (url) => url.replace('https://github.com/', '');
 const listing = [];
@@ -257,7 +260,9 @@ const cards = listing.map((entry) => {
 	].join('');
 });
 const overview = pageFile('tutorials');
-await writeFile(overview, `${(await readFile(overview, 'utf8')).trimEnd()}\n\n<div class="tutorial-grid not-content">${cards.join('')}</div>\n`);
+if (!checkOnly) {
+	await writeFile(overview, `${(await readFile(overview, 'utf8')).trimEnd()}\n\n<div class="tutorial-grid not-content">${cards.join('')}</div>\n`);
+}
 
 await writeGenerated('tutorials', listing.map(({ slug, label }) => ({ slug, label })));
 await writeGenerated('tutorial-cards', listing);

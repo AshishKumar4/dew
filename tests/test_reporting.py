@@ -62,7 +62,7 @@ def test_all_builtin_previews_have_local_representations(tmp_path):
         tracker.artifact(VideoGrid(np.zeros((1, 2, 8, 8, 3)), ('clip',)), 1)
         tracker.artifact(TextSamples(np.array([[1, 2]]), texts=('text',)), 1)
         tracker.artifact(Representations(np.ones((2, 3)), np.array([0, 1])), 1)
-        tracker.artifact(TokenScores(np.ones((2, 3)), np.ones((2, 3))), 1)
+        tracker.artifact(TokenScores(np.ones((2, 3)), np.ones((2, 3)), correct=np.zeros_like(np.ones((2, 3)), dtype=bool)), 1)
     entries = records(tmp_path)
     assert {e['type'] for e in entries} == {
         'ImageGrid', 'VideoGrid', 'TextSamples', 'Representations', 'TokenScores'}
@@ -332,7 +332,7 @@ def test_the_previews_tensorboard_can_show_render_and_the_rest_raises(tmp_path):
         tracker.artifact(VideoGrid(clip, ('a clip',)), 1)
         tracker.artifact(TextSamples(np.array([[1, 2]]), texts=('text',)), 1)
         with pytest.raises(TypeError, match='no renderer for TokenScores'):
-            tracker.artifact(TokenScores(np.zeros((1, 2)), np.ones((1, 2))), 1)
+            tracker.artifact(TokenScores(np.zeros((1, 2)), np.ones((1, 2)), correct=np.zeros_like(np.zeros((1, 2)), dtype=bool)), 1)
 
     reader = EventAccumulator(str(tmp_path / 'events'), size_guidance={IMAGES: 0, TENSORS: 0})
     reader.Reload()
