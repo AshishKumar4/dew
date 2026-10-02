@@ -55,7 +55,7 @@ import functools
 import math
 import time
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 
@@ -63,6 +63,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn, struct
+from flax.core import unfreeze
 from jax.experimental import checkify
 from jax.experimental.layout import Format, Layout
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
@@ -70,6 +71,8 @@ from jax.typing import ArrayLike
 
 from dew.inference.pages import Pages
 from dew.inference.tasks import Processor, TextGeneration, _bucket, _ceiling, _decoded, _prepared, _sized
+from dew.nn.backbones.decoder_block import GatedMLP
+from dew.nn.backbones.layer_plan import group_layers
 from dew.nn.inputs import ModelInputs, host_token_rows, mesh_of, request_key
 from dew.nn.kv_cache import (
     CURSOR,
@@ -83,6 +86,7 @@ from dew.nn.kv_cache import (
     is_paged,
     leaf_name,
 )
+from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.scatter import DROPPED
 from dew.nn.sharding import SEQUENCE_AXIS, STAGE_AXIS, batch_axes, logical_spec
 from dew.objectives.base import Variables
@@ -107,6 +111,24 @@ Prompt = str | Sequence[int] | ArrayLike | ModelInputs
 def _row_groups(mesh: Mesh | None) -> int:
     """How many groups of rows a server over `mesh` keeps, one per share of the slots."""
     return 1 if mesh is None else math.prod(mesh.shape[axis] for axis in batch_axes(mesh))
+
+
+def _pack_projections(
+    variables: Variables, groups: Mapping[tuple[str, ...], tuple[str, tuple[str, ...]]],
+) -> Variables:
+    """Move the concatenation of constant serving weights out of the decode step."""
+    if not groups:
+        return variables
+    packed = unfreeze(dict(variables))
+    for path, (name, projections) in groups.items():
+        node = packed["params"]
+        for part in path:
+            node = node[part]
+        node[name] = {field: jnp.concatenate([node[projection][field] for projection in projections], axis=-1)
+                      for field in node[projections[0]]}
+        for projection in projections:
+            del node[projection]
+    return packed
 
 
 @struct.dataclass
@@ -683,7 +705,9 @@ class Server:
             raise ValueError(f"slots ({slots}) and admission ({admission}) must divide by the "
                              f"{self.groups} groups the mesh splits rows into")
         self.model = model
-        self.variables = variables
+        self._source_shapes = [(path, jax.ShapeDtypeStruct(np.shape(leaf), jnp.result_type(leaf)))
+                               for path, leaf in jax.tree_util.tree_flatten_with_path(variables)[0]]
+        self._weight_groups: dict[tuple[str, ...], tuple[str, tuple[str, ...]]] = {}
         self.processor = processor
         if sampling.stop:
             raise ValueError("a server takes stop strings compiled into stopping; build it with "
@@ -709,19 +733,56 @@ class Server:
         self._admitted = (
             None if self.mesh is None else NamedSharding(self.mesh, P(batch_axes(self.mesh) or None))
         )
+
+        def projections(next_fun, args, kwargs, context):
+            module = context.module
+            group = None
+            if (self.mesh is None or self.mesh.size == 1) and context.method_name == "__call__":
+                if isinstance(module, CausalSelfAttention) and not (module.kv_shared or module.k_eq_v):
+                    group = ("qkv_proj", ("q_proj", "k_proj", "v_proj"))
+                elif isinstance(module, GatedMLP) and module.activation not in ('gelu', 'gelu_exact', 'relu'):
+                    group = ("gate_up_proj", ("gate_proj", "up_proj"))
+            if group is not None:
+                paths = [module.path]
+                # A scanned scope names a run, while the source keeps one
+                # subtree per layer. Use the stack's own name interpretation.
+                for depth, part in enumerate(module.path):
+                    layers = group_layers(part)
+                    if layers is not None and len(layers) > 1:
+                        paths = [(*path[:depth], f"layers_{index}", *path[depth + 1:])
+                                 for path in paths for index in layers]
+                for path in paths:
+                    node = variables.get("params", {})
+                    for part in path:
+                        node = node.get(part, {})
+                    held = [node.get(name, {}) for name in group[1]]
+                    fields = set(held[0])
+                    # Quantized, host-banked and unmerged LoRA projections
+                    # keep their own representations and their existing dots.
+                    if "kernel" in fields and fields <= {"kernel", "bias"} and all(
+                            set(projection) == fields for projection in held) and all(
+                            isinstance(projection[field], (jax.Array, np.ndarray))
+                            and projection[field].dtype == held[0][field].dtype
+                            and projection[field].shape[:-1] == held[0][field].shape[:-1]
+                            for projection in held for field in fields):
+                        self._weight_groups[path] = group
+            return next_fun(*args, **kwargs)
+
         with self._context():
-            shapes = jax.eval_shape(functools.partial(_opened, model, pad_id=self.pad_id, slots=slots,
-                                                      capacity=capacity), variables)
+            with nn.intercept_methods(projections):
+                shapes = jax.eval_shape(functools.partial(_opened, model, pad_id=self.pad_id, slots=slots,
+                                                          capacity=capacity), variables)
             rows.check(shapes.decoder.cache)
             if isinstance(rows, PagedRows) and prediction_depths(model):
                 raise ValueError("a paged server runs no prediction depths; their cache is seeded "
                                  "over the whole prompt at once")
-            formats = _resident_formats(model, variables, self.pad_id, rows.placement, decode_steps, shapes,
-                                        _state_shardings(self.mesh, shapes), self._admitted, transforms,
-                                        stopping, grammar)
+            self.variables = _pack_projections(variables, self._weight_groups)
+            formats = _resident_formats(
+                model, self.variables, self.pad_id, rows.placement, decode_steps, shapes,
+                _state_shardings(self.mesh, shapes), self._admitted, transforms, stopping, grammar)
             self._step = _program(formats, self._admitted)
             self._resident, self._carried = _split(
-                _opened_in(formats)(model, variables, self.pad_id, slots, capacity))
+                _opened_in(formats)(model, self.variables, self.pad_id, slots, capacity))
 
     def _context(self) -> contextlib.AbstractContextManager[None]:
         """The mesh the model traces under, so a layer that reads it, such as an expert exchange, finds it."""
@@ -862,17 +923,22 @@ class Server:
         # A frozen and a plain mapping flatten to different tree structures but
         # the same leaf paths, so the paths are what must match.
         incoming, _ = jax.tree_util.tree_flatten_with_path(variables)
-        served, structure = jax.tree_util.tree_flatten_with_path(self.variables)
-        if [path for path, _ in incoming] != [path for path, _ in served]:
+        source = self._source_shapes
+        if [path for path, _ in incoming] != [path for path, _ in source]:
             raise ValueError("reloaded variables must have the served tree structure")
-        leaves = []
-        for (_, new), (_, old) in zip(incoming, served, strict=True):
-            kind, served_kind = jnp.result_type(new), jnp.result_type(old)
+        for (_, new), (_, old) in zip(incoming, source, strict=True):
+            kind, served_kind = jnp.result_type(new), old.dtype
             if np.shape(new) != np.shape(old) or (kind != served_kind and not (
                     jnp.issubdtype(kind, jnp.floating) and jnp.issubdtype(served_kind, jnp.floating))):
                 raise ValueError(
                     f"a reloaded leaf is {kind}{list(np.shape(new))}, "
                     f"the served leaf {served_kind}{list(np.shape(old))}")
+        packed = _pack_projections(variables, self._weight_groups)
+        incoming, _ = jax.tree_util.tree_flatten_with_path(packed)
+        served, structure = jax.tree_util.tree_flatten_with_path(self.variables)
+        leaves = []
+        for (_, new), (_, old) in zip(incoming, served, strict=True):
+            served_kind = jnp.result_type(old)
             # A placement can alias a shard of the caller's array; the copy
             # owns its buffer whatever the caller donates next.
             placement = old.sharding if isinstance(old, jax.Array) else None
