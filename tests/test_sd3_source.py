@@ -196,7 +196,7 @@ def test_native_flow_schedule_matches_the_source_grids_and_trajectory(name, sour
                                     arrays[f"{tag}.times"]) < 1e-5
                 denoise = process.denoiser(model, params, {})
                 run = lambda value: sample(  # noqa: E731
-                    denoise, value, solver=schedule.solver(), key=jax.random.PRNGKey(0),
+                    denoise, value, solver=schedule.solver, key=jax.random.PRNGKey(0),
                     times=times, final_denoise=False)
                 x_T = jnp.asarray(arrays[f"{tag}.x_T"])
                 assert relative_gap(run(x_T), arrays[f"{tag}.latents"][-1]) < 1e-4

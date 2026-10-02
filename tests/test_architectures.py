@@ -359,7 +359,7 @@ def make_objective(case: Case, model, encoder):
                              MASK, sample=sample)
     inputs = InputSpec(sample, {"textcontext": Condition(encoder, field="text")})
     return DiffusionObjective(model, presets.EDM(regime="pixel"), inputs, steps=SAMPLER_STEPS,
-                              guidance=CFG(2.0), sampler=Euler())
+                              guidance=CFG(2.0), solver=Euler())
 
 
 def make_trainer(case: Case, tmp_path, fsdp, tracker=None):
@@ -532,7 +532,7 @@ def unet_run(fields):
     return DiffusionRunConfig(
         model=ModelConfig("unet", fields, dtype="float32", attention_impl="reference"),
         data=TFDSImages(image_size=8), text=None, guidance=None,
-        sampler=Euler(), sampling_steps=SAMPLER_STEPS)
+        solver=Euler(), sampling_steps=SAMPLER_STEPS)
 
 
 def test_a_unet_from_a_json_record_generates_what_its_value_twin_does():

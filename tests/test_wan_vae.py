@@ -263,7 +263,7 @@ def test_a_video_run_denoises_wan_latents_and_samples_whole_clips(source):
         model=ModelConfig("video_dit", dict(patch_size=1, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1),
                           dtype="float32", attention_impl="reference"),
         data=VideoDataset(frame_size=32, frames=9), trainer=TrainerConfig(batch_size=8, steps=1),
-        sampler=Euler(), sampling_steps=2, val_metrics=(),
+        solver=Euler(), sampling_steps=2, val_metrics=(),
         text=TextCondition(encoder="stub_text", checkpoint="stub-clip"),
         autoencoder=PretrainedAutoencoder(modelname=str(source), revision="main", dtype="float32"))
     objective = config.build()

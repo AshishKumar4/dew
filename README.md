@@ -961,7 +961,7 @@ A `Process` combines a noise schedule, a prediction transform, and loss weightin
 | Guidance | Classifier-free guidance with an optional interval and rescaling |
 | Conditions | `InputSpec`/`Condition`, CLIP, T5, labels or custom encoders |
 
-Training and inference can use different schedules, as in EDM's log-normal training distribution and Karras sampling grid. The sampler uses `jax.lax.scan`, so changing the solver reuses the same trained weights. `MultiStepDPM` integrates in sigma space and keeps the previous denoiser outputs to raise the order of each step.
+Training and inference can use different schedules, as in EDM's log-normal training distribution and Karras sampling grid. `sample` runs the solver under `jax.lax.scan`, so changing the solver reuses the same trained weights. `MultiStepDPM` integrates in sigma space and keeps the previous denoiser outputs to raise the order of each step.
 
 `TextToImage` combines text encoding, denoising, and optional latent decoding. See [diffusion](docs/guides/diffusion.md) for text conditioning, latent models, and sampling.
 
@@ -1064,7 +1064,7 @@ def main():
     print(sorted(path.name for path in run.iterdir()))
 
     task = TextToImage.from_run(str(run))
-    images = task(["a flower", "another flower"], steps=20, sampler=Heun(),
+    images = task(["a flower", "another flower"], steps=20, solver=Heun(),
                   key=jax.random.key(1))
     print(images.host().images.shape, int(state.updates))
 

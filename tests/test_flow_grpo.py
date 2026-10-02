@@ -528,7 +528,7 @@ def test_conditioned_prompt_only_evaluation_preview_and_trainer_consumers():
                                objective.encode(initial.params["encoders"]))
     noise_key, sample_key = jax.random.split(step.key)
     expected = sample(denoiser, process.noise(noise_key, (count, *objective.latent_shape)),
-                      objective.steps, solver=objective.sampler, guidance=objective.guidance, key=sample_key)
+                      objective.steps, solver=objective.solver, guidance=objective.guidance, key=sample_key)
     np.testing.assert_allclose(evaluated.images, np.clip(expected, -1, 1), atol=2e-6)
     assert previewed.images.shape == (min(4, count), 4, 4, 1)
     assert len(previewed.captions) == min(4, count)

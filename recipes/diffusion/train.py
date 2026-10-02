@@ -6,7 +6,7 @@
         --model.config '{"patch_size": 4, "emb_features": 512, "num_layers": 12, "num_heads": 8}'
 
 The dataset is a subcommand over the registry (`data:cc12m --data.path /mnt/gcs`),
-and so are the preset (`preset:flow --preset.shift 3.0`), the sampler, the text
+and so are the preset (`preset:flow --preset.shift 3.0`), the solver, the text
 condition (`text:None` for an unconditional run) and the autoencoder
 (`autoencoder:stable-diffusion-autoencoder`). The corpora this recipe names
 (`oxford-flowers102`, the default, `cc12m`, the LAION sets) are `CORPORA` below,
