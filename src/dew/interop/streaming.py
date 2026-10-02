@@ -34,6 +34,17 @@ class SourceLeaf:
     dtype: np.dtype
     transposed: bool = False
     stacked: bool = False
+    concatenated: bool = False
+
+    @staticmethod
+    def concatenate(leaves: Sequence[SourceLeaf]) -> SourceLeaf:
+        """Keep a projection group's columns mapped until its device shard is read."""
+        first = leaves[0]
+        if any(leaf.stacked or leaf.concatenated or leaf.shape[:-1] != first.shape[:-1]
+               or leaf.dtype != first.dtype or leaf.transposed != first.transposed for leaf in leaves):
+            raise ValueError("concatenated source leaves must agree on dtype, input axes and layout")
+        return SourceLeaf(tuple(leaf.members[0] for leaf in leaves), first.dtype,
+                          first.transposed, concatenated=True)
 
     @staticmethod
     def stack(leaves: Sequence[SourceLeaf], name: str) -> SourceLeaf:
@@ -41,7 +52,7 @@ class SourceLeaf:
         that disagree on shape, dtype or layout, as `np.stack` would."""
         first = leaves[0]
         disagree = sorted({(leaf.shape, str(leaf.dtype), leaf.transposed) for leaf in leaves})
-        if len(disagree) != 1 or any(leaf.stacked for leaf in leaves):
+        if len(disagree) != 1 or any(leaf.stacked or leaf.concatenated for leaf in leaves):
             raise ValueError(f"{name} members disagree: {disagree}")
         return SourceLeaf(tuple(leaf.members[0] for leaf in leaves), first.dtype,
                           first.transposed, stacked=True)
@@ -53,6 +64,8 @@ class SourceLeaf:
 
     @property
     def shape(self) -> tuple[int, ...]:
+        if self.concatenated:
+            return (*self._member_shape[:-1], sum(self._view(member).shape[-1] for member in self.members))
         return (len(self.members), *self._member_shape) if self.stacked else self._member_shape
 
     @property
@@ -70,6 +83,27 @@ class SourceLeaf:
         dtype borrows the mapped bytes rather than copying them.
         """
         index = () if index is None else index
+        if self.concatenated:
+            index = (*index, *(slice(None) for _ in range(self.ndim - len(index))))
+            shape = tuple(len(range(*part.indices(size)))
+                          for part, size in zip(index, self.shape, strict=True))
+            output = np.empty(shape, dtype=self.dtype)
+            columns = np.arange(*index[-1].indices(self.shape[-1]))
+            offset = 0
+            step = index[-1].step or 1
+            for member in self.members:
+                view = self._view(member)
+                positions = np.flatnonzero((columns >= offset) & (columns < offset + view.shape[-1]))
+                if len(positions):
+                    first, last = int(positions[0]), int(positions[-1])
+                    stop = int(columns[last]) - offset + step
+                    source = (*index[:-1], slice(int(columns[first]) - offset,
+                                                None if step < 0 and stop < 0 else stop, step))
+                    # Storage dtype is part of the recipe, as in the ordinary
+                    # read: copy directly into the shard, without a cast buffer.
+                    np.copyto(output[..., first:last + 1], view[source], casting="unsafe")
+                offset += view.shape[-1]
+            return output
         if not self.stacked:
             return np.asarray(self._view(self.members[0])[index], dtype=self.dtype, order="C")
         experts, rest = (index[0], index[1:]) if index else (slice(None), ())
