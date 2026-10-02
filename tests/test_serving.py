@@ -110,7 +110,8 @@ def test_prepacked_serving_keeps_the_source_and_reloads_its_original_tree():
 
     bound = task(Sampling(temperature=0, eos_id=None))
     source = jax.tree.map(np.asarray, bound.variables)
-    server = Server.from_task(bound, slots=2, capacity=128)
+    packed_task = TextGeneration(bound.model, source, bound.processor, sampling=bound.sampling)
+    server = Server.from_task(packed_task, slots=2, capacity=128)
     before = server(["12", "34"], 5, key=3)
     assert sum(leaf.nbytes for leaf in jax.tree.leaves(server.variables)) == sum(
         leaf.nbytes for leaf in jax.tree.leaves(bound.variables))
@@ -124,6 +125,12 @@ def test_prepacked_serving_keeps_the_source_and_reloads_its_original_tree():
     other = TextGeneration(bound.model, trained, bound.processor, sampling=bound.sampling)
     for prompt, actual in zip(("12", "34"), served, strict=True):
         assert_same_generation(actual, other(prompt, 5, key=3))
+    fresh = Server.from_task(other, slots=2, capacity=128)
+    for actual, expected in zip(served, fresh(["12", "34"], 5, key=3), strict=True):
+        assert_same_generation(actual, expected)
+    jax.jit(lambda weights: jax.tree.map(lambda leaf: leaf * 2, weights), donate_argnums=(0,))(trained)
+    for actual, expected in zip(server(["12", "34"], 5, key=3), served, strict=True):
+        assert_same_generation(actual, expected)
     for original, saved in zip(jax.tree.leaves(bound.variables), jax.tree.leaves(source), strict=True):
         np.testing.assert_array_equal(original, saved)
 

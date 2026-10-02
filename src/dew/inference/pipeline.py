@@ -123,6 +123,7 @@ def _from_run(root: epath.Path, *, mesh: MeshSpec | None, layout: Layout | None,
 def _from_source(source: str, *, mesh: MeshSpec | None, layout: Layout | None,
                  dtype: str | None, param_dtype: str | None,
                  revision: str | None) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration:
+    from dew.inference.serving import _inference_projections
     from dew.interop import (
         Pretrained,
         PretrainedBlockDecoder,
@@ -134,10 +135,14 @@ def _from_source(source: str, *, mesh: MeshSpec | None, layout: Layout | None,
 
     storage = "float32" if param_dtype is None else param_dtype
     placement = DefaultMesh() if mesh is None else mesh
-    loaded = (Pretrained.load(source, revision=revision, param_dtype=storage, mesh=placement, layout=layout)
+    def prepared(model, variables):
+        with jax.set_mesh(placement.build()):
+            return _inference_projections(model, variables)
+    loaded = (Pretrained._load(source, revision=revision, param_dtype=storage, mesh=placement, layout=layout,
+                              prepare=prepared)
               if dtype is None else
-              Pretrained.load(source, revision=revision, dtype=dtype, param_dtype=storage, mesh=placement,
-                              layout=layout))
+              Pretrained._load(source, revision=revision, dtype=dtype, param_dtype=storage, mesh=placement,
+                               layout=layout, prepare=prepared))
     match loaded:
         case PretrainedPipeline():
             return loaded.text_to_image()
