@@ -1,7 +1,7 @@
 """Generate the supported-models page from Dew's runtime registries.
 
 The families come from the code, not from a list kept by hand: the decoder
-table `_FAMILY_ENTRIES` and the wrapper table `_WRAPPERS` in
+table returned by `family_entries()` and the wrapper table `_WRAPPERS` in
 `dew/interop/hf_decoders.py`, the diffusers pipelines in
 `dew/interop/pretrained.py`, and the model registry.
 DECODERS, WRAPPERS and PIPELINES below only give each one a readable name and
@@ -104,11 +104,11 @@ FULL_SIZE = {
 
 
 def decoder_families() -> list[tuple[str, str, bool]]:
-    """(model_type, transformers architecture, has a multimodal wrapper) for every entry of `_FAMILY_ENTRIES`."""
-    from dew.interop.hf_decoders import _FAMILY_ENTRIES
+    """(model_type, transformers architecture, has a multimodal wrapper) for every decoder-family entry."""
+    from dew.interop.hf_decoders import family_entries
 
     return [(model_type, family.architecture, family.wrapper is not None)
-            for family in _FAMILY_ENTRIES for model_type in family.model_types]
+            for family in family_entries() for model_type in family.model_types]
 
 
 def wrappers() -> list[str]:
