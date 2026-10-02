@@ -277,7 +277,7 @@ class MambaRMSNormGated(nn.Module):
 @logical_axes({
     ("in_proj",): ("embed", "linear"),
     ("out_proj",): ("attention", "embed"),
-}, heuristic=(("conv1d",),))
+})
 class Mamba2(nn.Module):
     """The token mixer of a Mamba-2 layer, `Mamba2Mixer` (modeling_mamba2.py:360-588).
 

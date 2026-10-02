@@ -119,9 +119,7 @@ def test_llama4_projector_matches_the_reference_implementation():
     """fp32 parity on the tiny outer projector over the reference trunk
     output."""
     fixture = load_fixture("llama4-vision-tiny")
-    trunk = V.translate_llama4_vision_config(fixture["config"])
-    record = V.translate_llama4_projector_config(
-        trunk, fixture["projector"]["text_width"])
+    record = V.translate_llama4_projector_config(fixture["projector"]["text_width"])
     projector = projectors.from_record(record).build()
     variables = {"params": V.translate_llama4_projector_weights(
         fixture["projector_tensors"])}
@@ -263,9 +261,8 @@ def test_qwen35_projector_matches_the_reference_implementation():
     output, and the merger is live: with its first map zeroed the soft
     tokens leave the reference by more than 10.0."""
     fixture = load_fixture("qwen35-vision-tiny")
-    trunk = V.translate_qwen35_vision_config(fixture["config"])
     record = V.translate_qwen35_projector_config(
-        trunk, fixture["projector"]["text_width"])
+        fixture["config"], fixture["projector"]["text_width"])
     projector = projectors.from_record(record).build()
     variables = {"params": V.translate_qwen35_projector_weights(
         fixture["projector_tensors"])}
@@ -311,10 +308,9 @@ def test_a_qwen35_field_with_no_counterpart_is_refused(field, value, message):
 def test_a_qwen35_merger_beside_the_decoder_width_is_refused():
     """The merger output enters the text embeddings directly, so a width
     beside the decoder's refuses with both."""
-    trunk = V.translate_qwen35_vision_config(json.loads(
-        (FIXTURES / "qwen35-vision-tiny" / "config.json").read_text()))
+    config = json.loads((FIXTURES / "qwen35-vision-tiny" / "config.json").read_text())
     with pytest.raises(ValueError, match="out_hidden_size"):
-        V.translate_qwen35_projector_config(trunk, 32)
+        V.translate_qwen35_projector_config(config, 32)
 
 
 def test_gemma4_clipping_matches_reference_forward_and_backward():

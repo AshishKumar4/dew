@@ -18,7 +18,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from dew.objectives.rl.harbor import HARBOR_KEY, Gateway, HarborSource, calls, outcome
+from dew.interop.harbor import HARBOR_KEY, Gateway, HarborSource, calls, outcome
 from dew.objectives.rl.sessions import Call, Status, Task
 
 
@@ -417,7 +417,7 @@ import sys, time
 from pathlib import Path
 sys.path.insert(0, {src!r}); sys.path.insert(0, {tests!r})
 from test_harbor_source import fake_gateway
-from dew.objectives.rl.harbor import HARBOR_KEY, HarborSource
+from dew.interop.harbor import HARBOR_KEY, HarborSource
 from dew.objectives.rl.sessions import Task
 root = Path({root!r})
 source = HarborSource(fake_gateway()[0], harbor=root / "harbor", model="m/p", trials=root / "trials", workers=1,

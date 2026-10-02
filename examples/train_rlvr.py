@@ -48,6 +48,7 @@ import json
 import math
 import os
 import random
+import re
 import shutil
 import subprocess
 import time
@@ -77,22 +78,18 @@ from dew.interop import load_pretrained
 from dew.nn.backbones.decoder_block import remat_policy
 from dew.objectives.rl import (
     Action,
-    CodeReward,
-    ContainerRunner,
     EnvironmentSource,
     Episode,
     EpisodeStatus,
     GRPOObjective,
     Observation,
-    ProcessRunner,
     PromptSource,
     RolloutScheduler,
-    SandboxFleet,
-    SandboxLimits,
     SchedulerRecord,
     Task,
     prompt_tasks,
 )
+from dew.rl.sandbox import ContainerRunner, ProcessRunner, Program, SandboxFleet, SandboxLimits, outputs_match
 from dew.sampling import Sampling
 from dew.training import Trainer
 
@@ -100,6 +97,70 @@ FEEDBACK_TOKENS = 32
 """The longest test report a failed attempt gets back, in ids."""
 
 SMOKE_MODEL = Path(__file__).resolve().parents[1] / "tests/fixtures/hf/qwen2-tiny"
+
+
+# The reward is this recipe's: the program is the completion's last fenced
+# block, and the reward column holds `{"stdin", "stdout"}` test cases.
+_FENCE = re.compile(r"```([A-Za-z0-9_+-]*)[ \t]*\n(.*?)```", re.DOTALL)
+
+
+def code_block(completion: str, language: str = "python") -> str | None:
+    """The last fenced block tagged `language`, else the last untagged one, else None."""
+    blocks = [(tag.lower(), body) for tag, body in _FENCE.findall(completion)]
+    for wanted in (language, ""):
+        tagged = [body for tag, body in blocks if tag == wanted]
+        if tagged:
+            return tagged[-1]
+    return None
+
+
+def _cases(ground_truth: str) -> list[tuple[str, str]]:
+    """Read `[{"stdin": ..., "stdout": ...}, ...]` test cases from the reward column."""
+    cases = json.loads(ground_truth)
+    if not isinstance(cases, list) or not cases:
+        raise ValueError("a code reward's ground truth is a nonempty JSON list of test cases")
+    read: list[tuple[str, str]] = []
+    for case in cases:
+        if (not isinstance(case, dict) or not isinstance(case.get("stdout"), str)
+                or not isinstance(case.get("stdin", ""), str)):
+            raise ValueError("each test case holds string stdout and optional string stdin")
+        read.append((case.get("stdin", ""), case["stdout"]))
+    return read
+
+
+@dataclass(frozen=True)
+class CodeReward:
+    """Run the completion's program on every test case; reward the fraction that pass.
+
+    The ground truth is a JSON list of `{"stdin", "stdout"}` cases. A case
+    passes when the program completes and its stdout matches, line by line
+    up to trailing whitespace. A completion without a code block scores
+    zero, as do timeouts, crashes and oversized output. `all_or_nothing`
+    scores one only when every case passes. `interpreter` is the argv the
+    program file is appended to; None takes the fleet runner's `python`, so
+    a container runs the image's interpreter and a process runs this one.
+    """
+
+    fleet: SandboxFleet
+    interpreter: tuple[str, ...] | None = None
+    language: str = "python"
+    filename: str = "main.py"
+    all_or_nothing: bool = False
+
+    def __call__(self, data_source: str, completion: str, ground_truth: str, extra_info: str) -> float:
+        cases = _cases(ground_truth)
+        source = code_block(completion, self.language)
+        if source is None:
+            return 0.0
+        interpreter = self.fleet.runner.python if self.interpreter is None else self.interpreter
+        outcomes = self.fleet.run(Program({self.filename: source}, (*interpreter, self.filename), stdin)
+                                  for stdin, _ in cases)
+        passed = sum(
+            outputs_match(outcome, expected) for outcome, (_, expected) in zip(outcomes, cases, strict=True)
+        )
+        if self.all_or_nothing:
+            return float(passed == len(cases))
+        return passed / len(cases)
 
 
 def _uniform(low: int, high: int) -> Callable[[random.Random], tuple[int, int]]:

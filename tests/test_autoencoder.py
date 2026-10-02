@@ -1,40 +1,45 @@
-"""SimpleAutoEncoder tests.
+"""The AutoEncoder contract, over a tiny randomly initialized AutoencoderKL.
 
-The tutorial-grade AE has no pretrained weights, so nothing here asserts
-reconstruction quality: what matters is that it satisfies the AutoEncoder
-contract the samplers and input config depend on (the advertised latent
-geometry, video flattening, and the latent normalization seam).
+Nothing here asserts reconstruction quality: what matters is the contract the
+samplers and input config depend on (the advertised latent geometry, video
+flattening, and the latent normalization seam).
 """
 
 import jax
 import jax.numpy as jnp
 import pytest
 
-from dew.nn.autoencoders import SimpleAutoEncoder
+from dew.nn.autoencoders import AutoencoderKL, StableDiffusionVAE
 
-# Small enough to stay quick on CPU: 3 stages -> downscale factor 8
-DEPTHS = (8, 16, 32)
 IMAGE_SIZE = 8
+
+
+def tiny_vae(channels=(8, 16, 16), latent_shift=0.0, latent_scale=1.0, params=None):
+    model = AutoencoderKL(channels=channels, blocks_per_level=1, norm_groups=4, dtype=jnp.float32)
+    if params is None:
+        params = model.init(jax.random.PRNGKey(0), jnp.zeros((1, IMAGE_SIZE, IMAGE_SIZE, 3)))["params"]
+    return StableDiffusionVAE(model=model, params=params, dtype=jnp.float32,
+                              latent_shift=latent_shift, latent_scale=latent_scale)
 
 
 @pytest.fixture(scope="module")
 def autoencoder():
-    return SimpleAutoEncoder(latent_channels=4, feature_depths=DEPTHS)
+    return tiny_vae()
 
 
 @pytest.fixture(scope="module")
-def image(autoencoder):
+def image():
     return jax.random.uniform(
         jax.random.PRNGKey(1), (2, IMAGE_SIZE, IMAGE_SIZE, 3), minval=-1.0, maxval=1.0
     )
 
 
-@pytest.mark.parametrize("depths", [(8,), (8, 16), (8, 16, 32)])
-def test_the_advertised_geometry_is_the_encoders(depths):
+@pytest.mark.parametrize("channels", [(8,), (8, 16), (8, 16, 16)])
+def test_the_advertised_geometry_is_the_encoders(channels):
     """`downscale_factor` and `latent_channels` are what the samplers and the
     input config size latents by, so they must be what the encoder produces
     and the decoder takes back to the image."""
-    autoencoder = SimpleAutoEncoder(latent_channels=2, feature_depths=depths)
+    autoencoder = tiny_vae(channels)
     size = 2 * autoencoder.downscale_factor
     image = jnp.zeros((1, size, size, 3))
     latent = autoencoder.encode(autoencoder.params, image)
@@ -58,48 +63,16 @@ def test_video_frames_match_the_same_frames_encoded_as_images(autoencoder):
     )
     video = frames.reshape(2, 3, IMAGE_SIZE, IMAGE_SIZE, 3)
     per_frame = autoencoder.encode(autoencoder.params, frames)
-    assert jnp.allclose(
-        autoencoder.encode(autoencoder.params, video), per_frame.reshape(2, 3, *per_frame.shape[1:]), atol=1e-6
-    )
+    video_latent = autoencoder.encode(autoencoder.params, video)
+    assert jnp.allclose(video_latent, per_frame.reshape(2, 3, *per_frame.shape[1:]), atol=1e-6)
 
 
 def test_latent_normalization_is_inverted_by_decode(autoencoder, image):
     """encode applies (z - shift) * scale and decode must undo exactly it, so
     decode(encode(x)) is the raw decoder applied to the raw latent."""
-    normalized = SimpleAutoEncoder(
-        latent_channels=4,
-        feature_depths=DEPTHS,
-        latent_shift=0.3,
-        latent_scale=2.5,
-        params=autoencoder.params,
-    )
-    raw_latent = autoencoder.encode(autoencoder.params, image)  # identity normalization by default
+    normalized = tiny_vae(latent_shift=0.3, latent_scale=2.5, params=autoencoder.params)
+    raw_latent = autoencoder.encode(autoencoder.params, image)  # identity normalization
     latent = normalized.encode(normalized.params, image)
     assert jnp.allclose(latent, (raw_latent - 0.3) * 2.5, atol=1e-5)
-    assert jnp.allclose(normalized.decode(normalized.params, latent), autoencoder.decode(autoencoder.params, raw_latent), atol=1e-5)
-
-
-def test_group_norm_survives_depths_not_divisible_by_norm_groups():
-    """GroupNorm needs a divisor of the channel count; the AE picks one."""
-    autoencoder = SimpleAutoEncoder(latent_channels=2, feature_depths=(12,), norm_groups=8)
-    image = jnp.zeros((1, 2, 2, 3))
-    out = autoencoder(autoencoder.params, image)
-    assert out.shape == image.shape
-    assert jnp.all(jnp.isfinite(out))
-    assert not jnp.allclose(out, autoencoder(autoencoder.params, jnp.ones_like(image)), atol=1e-6)
-
-
-def test_params_can_be_reused_across_instances(autoencoder, image):
-    """Checkpointed weights load by construction, no re-init."""
-    reloaded = SimpleAutoEncoder(
-        latent_channels=4, feature_depths=DEPTHS, params=autoencoder.params
-    )
-    assert jnp.allclose(reloaded.encode(reloaded.params, image), autoencoder.encode(autoencoder.params, image), atol=1e-6)
-
-
-def test_fresh_instances_get_different_random_weights(image):
-    """No pretrained weights: two seeds must not agree."""
-    a = SimpleAutoEncoder(latent_channels=4, feature_depths=DEPTHS, key=jax.random.PRNGKey(0))
-    b = SimpleAutoEncoder(latent_channels=4, feature_depths=DEPTHS, key=jax.random.PRNGKey(1))
-    assert not jnp.allclose(a.encode(a.params, image), b.encode(b.params, image), atol=1e-4)
-
+    assert jnp.allclose(normalized.decode(normalized.params, latent),
+                        autoencoder.decode(autoencoder.params, raw_latent), atol=1e-5)

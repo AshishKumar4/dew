@@ -50,7 +50,6 @@ class AutoencoderKL(nn.Module):
             block_out_channels=self.channels,
             layers_per_block=self.blocks_per_level,
             norm_num_groups=self.norm_groups,
-            double_z=True,
             dtype=jnp.dtype(self.dtype),
         )
         self.decoder = FlaxDecoder(

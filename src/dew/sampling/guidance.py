@@ -191,9 +191,6 @@ class APG:
         parallel = jnp.sum(direction * unit, axis=axes, keepdims=True) * unit
         update = direction - parallel + self.eta * parallel
         scale = _scale(denoise, self.scale, self.interval, x, t)
-        # Where guidance is off, outside the interval or at scale 1, the
-        # reference returns the conditional output and leaves its momentum
-        # buffer as it was.
         off = scale == 1.0
         combined = jnp.where(off, output, unconditional + scale * update)
         running = jnp.where(off, average, output - unconditional + self.momentum * average)

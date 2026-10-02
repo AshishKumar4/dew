@@ -354,7 +354,7 @@ class TextToImage:
         if prepared is not None:
             prepared = self._checked_inputs(prepared, mesh, count)
         controls = (count, times, solver, chosen, self.final_denoise, decode,
-                    tuple(np.asarray(jax.random.key_data(request))), prepared is not None,
+                    tuple(jax.device_get(jax.random.key_data(request))), prepared is not None,
                     None if prepared is None else prepared.rows)
         arrays = None if prepared is None else (prepared.noise, prepared.conditions, prepared.unconditional)
         signature = generation_signature(arrays, controls)
@@ -419,7 +419,7 @@ class TextToImage:
         samples = self._supplied(len(rows), shape, image=image, image_latents=image_latents,
                                  mask=mask, noise=noise, initial=initial)
         controls = (plan.rows, count, selected, shape,
-                    tuple(np.asarray(jax.random.key_data(request))),
+                    tuple(jax.device_get(jax.random.key_data(request))),
                     None if posterior is None else tuple(np.asarray(jax.random.key_data(posterior))))
         signature = generation_signature((tokens, null_tokens, samples), controls)
         return _Resolved(plan, process, request, tokens, null_tokens, shape, count,

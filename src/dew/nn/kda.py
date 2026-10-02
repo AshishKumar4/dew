@@ -141,7 +141,7 @@ def chunk_kimi_delta_rule(query, key, value, g, beta, state=None, chunk_size: in
     ("g_a_proj",): ("embed", None),
     ("g_b_proj",): (None, "heads"),
     ("g_proj",): ("embed", "heads"),
-}, heuristic=(("q_conv1d",), ("k_conv1d",), ("v_conv1d",)))
+})
 class KimiDeltaAttention(nn.Module):
     """The token mixer of a GLM-5.3-Flash `linear_attention` layer.
 
