@@ -326,7 +326,10 @@ def test_an_image_batch_never_takes_the_sequence_axis():
 
 
 def test_build_mesh_rejects_sizes_the_devices_cannot_hold():
-    with pytest.raises(ValueError, match="sequence 3"):
+    """The refusal names the axes the spec splits and their product against
+    the devices, not the axes it leaves at one."""
+    with pytest.raises(ValueError, match=rf"^fsdp 4 x tensor 2 x sequence 3 is 24 devices a data "
+                                         rf"replica, which does not divide the {jax.device_count()} devices$"):
         build_mesh(MeshSpec(fsdp=4, tensor=2, sequence=3))
 
 
