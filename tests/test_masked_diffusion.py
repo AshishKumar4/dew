@@ -19,7 +19,6 @@ import numpy as np
 import optax
 import pytest
 
-import_module("dew.nn.backbones.causal_transformer")  # registers the backbone
 from dew.checkpoints import Checkpoints
 from dew.config import ModelConfig
 from dew.data import Dataset
@@ -34,6 +33,8 @@ from dew.registry import models, with_precision
 from dew.sampling import Sampling, sample
 from dew.training import Layout, MeshSpec, Trainer
 from dew.training.distributed import build_mesh
+
+import_module("dew.nn.backbones.causal_transformer")  # registers the backbone
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 
