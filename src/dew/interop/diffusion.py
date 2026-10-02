@@ -1052,8 +1052,10 @@ def save_source(source, values, destination: Path) -> None:
     config = dict(source.config)
     index = dict(config.pop("model_index"))
     if source.inputs is not None:
-        height, width = source.inputs.sample.shape[-3:-1]
-        index.update(dew_height=height, dew_width=width)
+        shape = source.inputs.sample.shape
+        index.update(dew_height=shape[-3], dew_width=shape[-2])
+        if len(shape) == 4:
+            index.update(dew_frames=shape[0])
     (destination / "model_index.json").write_text(json.dumps(index, indent=2))
     component_configs = {name: value for name, value in config.items() if isinstance(value, Mapping)}
     for name, component_config in component_configs.items():

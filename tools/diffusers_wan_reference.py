@@ -10,10 +10,20 @@ float32, the reference, and in float64 (`widened`), the truth
 tests/reference_error.py measures both runs from. The weights are rounded to
 bfloat16-representable values so the fixture compresses.
 
+The pipeline half saves one tiny `WanPipeline` over the published configs -
+a UMT5 text encoder saved as the release stores it, a character-level T5
+tokenizer, the Wan VAE, the transformer and the published UniPC scheduler
+config with its flow shift - and walks the unmodified call from fixed
+latents, recording the prompt states, the latent it ends on and the frames
+it decodes. Its prompts carry what `prompt_clean` repairs: curly quotes,
+HTML entities and runs of whitespace. Cleaning needs ftfy installed.
+
 Run with the Dew test environment's diffusers 0.34.0 and torch, on CPU:
 
     python tools/diffusers_wan_reference.py transformer OUTPUT_DIR
     python tools/diffusers_wan_reference.py bundle OUTPUT_DIR tests/fixtures/wan_transformer.tar.xz
+    python tools/diffusers_wan_reference.py pipeline OUTPUT_DIR
+    python tools/diffusers_wan_reference.py bundle OUTPUT_DIR tests/fixtures/wan_pipeline.tar.xz
 """
 
 from __future__ import annotations
@@ -26,6 +36,15 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import transformers.utils as transformers_utils
+
+# Diffusers 0.34.0's pipeline modules import two names Transformers dropped
+# after 4.x; the pipeline walk needs `WanPipeline` itself, so the names are
+# restored, as tools/diffusers_sd3_reference.py restores them.
+for _name, _value in (("FLAX_WEIGHTS_NAME", "flax_model.msgpack"),
+                      ("WEIGHTS_INDEX_NAME", "pytorch_model.bin.index.json")):
+    if not hasattr(transformers_utils, _name):
+        setattr(transformers_utils, _name, _value)
 
 DIFFUSERS = "0.34.0"
 SOURCE = Path(__file__).resolve().parents[1] / "tests/fixtures/hf/wan-source"
@@ -131,7 +150,7 @@ def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
     return arrays
 
 
-def transformer(destination: str) -> None:
+def output_root(destination: str) -> Path:
     import diffusers
 
     if diffusers.__version__ != DIFFUSERS:
@@ -139,6 +158,11 @@ def transformer(destination: str) -> None:
     torch.set_num_threads(2)
     root = Path(destination)
     root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def transformer(destination: str) -> None:
+    root = output_root(destination)
     arrays: dict[str, np.ndarray] = {}
     for name, case in CASES.items():
         arrays.update({f"{name}.{key}": value for key, value in build(name, case, root).items()})
@@ -152,12 +176,116 @@ def transformer(destination: str) -> None:
     print(f"{root}: {size / 1e6:.2f} MB, {len(CASES)} cases")
 
 
+PIPELINE = {**BASE, "text_dim": 16}
+PIPELINE_VAE = {"base_dim": 8, "z_dim": 4, "dim_mult": [1, 2, 2, 2], "num_res_blocks": 1}
+# ftfy unescapes the entities of text with no `<` itself; with one, only the
+# source's own two unescapes reach them.
+PROMPTS = ["a red cat on a mat", "  tiny \u201cboat\u201d <&amp;amp;>   sea\n"]
+FRAMES, HEIGHT, WIDTH, STEPS, GUIDANCE = 9, 32, 48, 4, 5.0
+
+
+def tokenizer():
+    """A T5 tokenizer over single characters: the release's umt5 vocabulary
+    is 256k pieces, and every character here is one."""
+    import string
+
+    from transformers import T5Tokenizer
+
+    pieces = ["<pad>", "</s>", "<unk>", "\u2581", *string.ascii_lowercase, *string.digits,
+              *string.punctuation]
+    return T5Tokenizer(vocab=[(piece, 0.0) for piece in pieces], extra_ids=0)
+
+
+def text_encoder(vocab: int):
+    """The published UMT5 config, narrowed and two layers deep, as
+    `UMT5EncoderModel`, which saves as the release is stored."""
+    from transformers import UMT5Config, UMT5EncoderModel
+
+    config = json.loads((SOURCE / "text_encoder" / "config.json").read_text())
+    for key in ("torch_dtype", "dtype", "_name_or_path", "architectures", "transformers_version"):
+        config.pop(key, None)
+    config.update(vocab_size=vocab, d_model=PIPELINE["text_dim"], d_kv=8, d_ff=32, num_layers=2,
+                  num_decoder_layers=2, num_heads=2, relative_attention_num_buckets=8,
+                  relative_attention_max_distance=32)
+    torch.manual_seed(SEED + 5)
+    model = UMT5EncoderModel(UMT5Config(**config)).eval()
+    generator = torch.Generator().manual_seed(SEED + 6)
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.add_(torch.randn(parameter.shape, generator=generator) * 0.05)
+    return model
+
+
+def build_pipeline(root: Path):
+    from diffusers import AutoencoderKLWan, UniPCMultistepScheduler, WanPipeline, WanTransformer3DModel
+
+    tok = tokenizer()
+    encoder = text_encoder(len(tok))
+    published = json.loads((SOURCE / "vae" / "config.json").read_text())
+    vae_config = {key: value for key, value in published.items() if not key.startswith("_")}
+    generator = torch.Generator().manual_seed(SEED + 7)
+    vae_config.update(PIPELINE_VAE, latents_mean=torch.randn(4, generator=generator).mul(0.5).tolist(),
+                      latents_std=torch.rand(4, generator=generator).add(0.5).tolist())
+    torch.manual_seed(SEED + 8)
+    vae = AutoencoderKLWan(**vae_config).eval()
+    transformer = WanTransformer3DModel(**PIPELINE).eval()
+    with torch.no_grad():
+        for module in (vae, transformer):
+            for name, parameter in module.named_parameters():
+                if module is transformer or name.endswith(("gamma", "bias")):
+                    parameter.add_(torch.randn(parameter.shape, generator=generator) * 0.05)
+    scheduler = json.loads((SOURCE / "scheduler" / "scheduler_config.json").read_text())
+    pipe = WanPipeline(tokenizer=tok, text_encoder=encoder, transformer=transformer, vae=vae,
+                       scheduler=UniPCMultistepScheduler.from_config(scheduler))
+    directory = root / "pipeline"
+    pipe.save_pretrained(directory, safe_serialization=True)
+    pipe.set_progress_bar_config(disable=True)
+    index = json.loads((directory / "model_index.json").read_text())
+    index.update(dew_frames=FRAMES, dew_height=HEIGHT, dew_width=WIDTH)
+    (directory / "model_index.json").write_text(json.dumps(index, indent=2))
+    return pipe
+
+
+def pipeline(destination: str) -> None:
+    """The prompt states each prompt (and the empty negative) encodes to, and
+    the unmodified call's walk from fixed latents at `STEPS` steps, guided at
+    its default scale: the latent it ends on and the frames it decodes."""
+    root = output_root(destination)
+    pipe = build_pipeline(root)
+    generator = torch.Generator().manual_seed(SEED + 9)
+    shape = (len(PROMPTS), PIPELINE_VAE["z_dim"], (FRAMES - 1) // 4 + 1, HEIGHT // 8, WIDTH // 8)
+    latents = torch.randn(shape, generator=generator)
+    arrays: dict[str, np.ndarray] = {"x_T": latents.numpy()}
+    for row, prompt in enumerate([*PROMPTS, ""]):
+        with torch.no_grad():
+            # `encode_prompt` defaults to 226 tokens; the call passes its own 512.
+            states, _ = pipe.encode_prompt(prompt, do_classifier_free_guidance=False, max_sequence_length=512,
+                                           device=torch.device("cpu"))
+        arrays[f"context.{row}"] = states[0].numpy()
+    for row, prompt in enumerate(PROMPTS):
+        call = {"prompt": prompt, "height": HEIGHT, "width": WIDTH, "num_frames": FRAMES,
+                "num_inference_steps": STEPS, "guidance_scale": GUIDANCE}
+        with torch.no_grad():
+            walked = pipe(**call, latents=latents[row:row + 1].clone(), output_type="latent").frames
+            frames = pipe(**call, latents=latents[row:row + 1].clone(), output_type="np").frames
+        arrays[f"latents.{row}"] = walked[0].numpy()
+        arrays[f"frames.{row}"] = frames[0]
+        print(f"pipeline {prompt!r}: latents {tuple(walked.shape)} frames {frames.shape}")
+    record = {"diffusers": DIFFUSERS, "torch": torch.__version__, "seed": SEED, "transformer": PIPELINE,
+              "vae": PIPELINE_VAE, "prompts": PROMPTS, "frames": FRAMES, "height": HEIGHT, "width": WIDTH,
+              "steps": STEPS, "guidance": GUIDANCE}
+    np.savez_compressed(root / "wan_pipeline.npz", **arrays)
+    (root / "wan_pipeline.json").write_text(json.dumps(record, indent=1) + "\n")
+    size = sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
+    print(f"{root}: {size / 1e6:.2f} MB")
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 3 and sys.argv[1] == "bundle":
         from diffusers_dc_ae_reference import bundle
 
         bundle(sys.argv[2], sys.argv[3])
-    elif len(sys.argv) == 3 and sys.argv[1] == "transformer":
-        transformer(sys.argv[2])
+    elif len(sys.argv) == 3 and sys.argv[1] in ("transformer", "pipeline"):
+        {"transformer": transformer, "pipeline": pipeline}[sys.argv[1]](sys.argv[2])
     else:
         raise SystemExit(__doc__)
