@@ -2360,7 +2360,10 @@ class Trainer(Generic[Loss, Effects]):
                 self.objective, params, dataset.val if reader is None else reader, metrics=metrics, key=key,
                 step=state.step, schedule_step=state.microstep,
                 averaged=averaged, preview=preview, mesh=mesh, loss=loss, split=split, training=training)
-        self._report_evaluation(evaluation)
+        # The training values ride along for ranking (`_ranking`); the log
+        # interval reports them, so the evaluation's own report leaves them out.
+        self._report_evaluation(dataclasses.replace(evaluation, scores={
+            name: value for name, value in evaluation.scores.items() if name not in (training or {})}))
         return dataclasses.replace(evaluation, elapsed_seconds=time.perf_counter() - paused)
 
     def _report_evaluation(self, advanced: Evaluation) -> None:
