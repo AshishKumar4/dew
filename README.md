@@ -461,7 +461,6 @@ sft_objective = LMObjective(
     seq_len=len(row) - 1,
     pretrained=lm_state.params,
     loss_role=Role.ASSISTANT,
-    ema_decay=None,
 )
 sft_state = Trainer(
     sft_objective,
@@ -729,13 +728,13 @@ row = np.resize(np.array([1, 2, 3, 4], np.int32), 17)
 batch = {"text": np.tile(row, (4, 1))}
 stream = grain.MapDataset.source([batch]).repeat().to_iter_dataset()
 data = Dataset(train=lambda partition: iter(stream), val=None, records=4, batch=4)
-objective = LMObjective(model, seq_len=16, ema_decay=None)
+objective = LMObjective(model, seq_len=16)
 checkpoints = Checkpoints("runs/custom-decoder")
 state = Trainer(objective, optax.adamw(0.003), key=jax.random.key(0),
                 checkpoints=checkpoints).fit(data, steps=40, log_every=20,
                                              checkpoint_every=40)
 checkpoints.wait()
-task = objective.pipeline(state, ema=False)
+task = objective.pipeline(state)
 result = task([[1, 2]], 8, key=jax.random.key(1), sampling=Sampling(temperature=0))
 print(np.asarray(result.tokens))
 ```
@@ -1137,7 +1136,7 @@ model = models.build("causal_transformer", vocab_size=meta["vocab_size"],
                      emb_features=128, num_layers=4, num_heads=4, num_kv_heads=2,
                      mlp_features=256, max_seq_len=128, dtype="float32",
                      qk_norm=False, tie_embeddings=False)
-state = Trainer(LMObjective(model, seq_len=128, ema_decay=None),
+state = Trainer(LMObjective(model, seq_len=128),
                 optax.adamw(3e-3), key=jax.random.key(0)).fit(
     data, steps=400, log_every=200)
 

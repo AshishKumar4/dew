@@ -446,7 +446,7 @@ def held_lm_trainer(**settings):
     model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=1,
                               mlp_features=16, max_seq_len=8)
     weights = jax.jit(LMObjective(model, seq_len=4).init)(jax.random.key(0))
-    objective = LMObjective(model, seq_len=4, pretrained=weights)
+    objective = LMObjective(model, seq_len=4, pretrained=weights, ema_decay=0.999)
     return Trainer(objective, optax.adam(1e-3), key=jax.random.key(0),
                    layout=Layout(min_shard=1, tolerance=1.0), **settings), objective, weights
 
@@ -1275,18 +1275,23 @@ def test_a_fit_on_a_terminal_of_any_width_shows_every_metric(width, monkeypatch)
         assert re.search(rf" {name} +\S", last), last
     assert "val" in last and "step 6" in last, last
     summary = output.rpartition("✓ ")[2]
-    assert "val at 6" in summary and "spread" in summary, summary
+    assert "val (ema)" in summary and "at 6" in summary and "spread" in summary, summary
     if width == 120:
         assert re.search(r"spread +\S+ +[▁▂▃▄▅▆▇█]{2}", last), last
         assert re.search(r"[▁▂▃▄▅▆▇█]{2}", summary), summary
 
 
-def test_off_a_terminal_evaluation_keeps_its_plain_line(capsys):
-    trainer = make_trainer(objective=Features())
+@pytest.mark.parametrize(("averaged", "label"), [(True, r"val \(ema\)"), (False, "val")])
+def test_off_a_terminal_evaluation_keeps_its_plain_line(averaged, label, capsys):
+    """An evaluation of the averaged weights says so beside its split."""
+    objective = Features()
+    if not averaged:
+        objective.ema = None
+    trainer = make_trainer(objective=objective)
     trainer.fit(Data(val=val_batches(3)), steps=6, log_every=2, eval_every=3, metrics=(Spread([]),))
     output = capsys.readouterr().out
-    assert re.search(r"eval val at step 3: spread \S+ \(24 records in \S+ s\)", output), output
-    assert re.search(r"eval val at step 6: spread \S+ .+ \(24 records in \S+ s\)", output), output
+    assert re.search(rf"eval {label} at step 3: spread \S+ \(24 records in \S+ s\)", output), output
+    assert re.search(rf"eval {label} at step 6: spread \S+ .+ \(24 records in \S+ s\)", output), output
 
 
 def test_a_failing_metric_fails_the_validation_pass():

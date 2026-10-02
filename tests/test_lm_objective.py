@@ -287,6 +287,13 @@ def test_init_builds_the_tree_from_int32_ids():
     assert params["params"]["lm_head"]["kernel"].shape == (16, VOCAB)
 
 
+def test_an_lm_keeps_no_average_unless_asked():
+    """Validation and previews read an average when one is kept, so an LM
+    keeps none by default: a short run then scores the weights it trained."""
+    assert make_objective().ema is None
+    assert make_objective(ema_decay=0.999).ema is not None
+
+
 def test_the_ema_tracks_the_whole_parameter_tree():
     ema = make_objective(ema_decay=0.995).ema
     assert ema.select(("params", "anything"))
@@ -473,10 +480,9 @@ def test_the_validation_pass_scores_perplexity_per_token_and_logs_it():
     batches = [token_batch(BATCH, seed=1), padded]
     tracker = RecordingTracker()
     trainer = make_trainer(pad_id=0, tracker=tracker)
-    trainer.fit(Data(cycle_batches, val=lambda: iter(batches)), steps=1, log_every=1,
-                eval_every=1, metrics=(metrics.perplexity(),))
+    state = trainer.fit(Data(cycle_batches, val=lambda: iter(batches)), steps=1, log_every=1,
+                        eval_every=1, metrics=(metrics.perplexity(),))
 
-    state = trainer.initial_state()
     total, count = 0.0, 0.0
     for batch in batches:
         scores = trainer.objective.evaluate(state.params, batch, step_at())
@@ -484,10 +490,9 @@ def test_the_validation_pass_scores_perplexity_per_token_and_logs_it():
         count += float(jnp.sum(scores.weights))
     logged = [s["val/perplexity"] for _, s in tracker.scalars if "val/perplexity" in s]
     assert len(logged) == 1
-    # The initial parameters moved one step before the pass, so the pass
-    # scores are close, not equal; what the assertion pins is the weighting.
+    # The pass scores the weights the step left, so it matches them.
     assert 0 < count < 2 * BATCH * SEQ
-    assert logged[0] == pytest.approx(np.exp(total / count), rel=5e-2)
+    assert logged[0] == pytest.approx(np.exp(total / count), rel=1e-6)
 
 
 # --- packed batches --------------------------------------------------------

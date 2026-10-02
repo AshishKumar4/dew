@@ -96,7 +96,8 @@ class MaskedDiffusionObjective(Objective[Mean]):
         self.ema = None if ema_decay is None else EMASpec(decay=optax.constant_schedule(ema_decay))
         self._sample = jax.jit(self._sample_impl, static_argnames=("count",))
 
-    def pipeline(self, state: TrainState, *, ema: bool = True, processor: Processor | None = None) -> MaskedGeneration:
+    def pipeline(self, state: TrainState, *, ema: bool | None = None,
+                 processor: Processor | None = None) -> MaskedGeneration:
         """Publish the state's weights as a native full-response MDLM task."""
         from dew.inference.tasks import MaskedGeneration
 

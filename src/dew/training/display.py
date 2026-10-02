@@ -202,6 +202,8 @@ class TrainingDisplay:
     groups: dict[str, dict[str, Row]] = dataclasses.field(default_factory=dict)
     # Each split's evaluations, in the order they completed.
     evaluations: dict[str, list[Evaluation]] = dataclasses.field(default_factory=dict)
+    # Whether evaluation scores the objective's EMA, which each split's label says.
+    averaged: bool = False
     phase: str = ""
     ended: bool = False
     # How the phase is drawn, not what the display holds: left out of equality.
@@ -213,14 +215,17 @@ class TrainingDisplay:
         return jax.process_index() == 0
 
     def start(self, started: FitStarted, *, model: str, batch: int, precision: str,
-              shown: Mapping[str, Shown]) -> None:
+              shown: Mapping[str, Shown], averaged: bool) -> None:
         """Open the display with the run's header: the model, its size, where
         it trains, the global batch and the precision. `shown` holds how
-        each metric is shown, by its name after its group's prefix."""
+        each metric is shown, by its name after its group's prefix, and
+        `averaged` says evaluation scores the EMA rather than the live
+        weights."""
         self.first = self.current = started.start_step
         self.total = started.target_steps
         self.started = time.perf_counter()
         self.shown = shown
+        self.averaged = averaged
         if not self.shown_here:
             return
         mesh = mesh_text(started.mesh)
@@ -285,7 +290,7 @@ class TrainingDisplay:
         counts = f"{evaluation.records} records in {evaluation.elapsed_seconds:.2f} s"
         if evaluation.uneven_shards:
             counts += ", uneven shards"
-        self.note(f"eval {evaluation.split} at step {evaluation.step}: "
+        self.note(f"eval {self.label(evaluation.split)} at step {evaluation.step}: "
                   f"{self.scores(evaluation).plain} ({counts})", style=LABEL)
 
     def note(self, text: str, *, style: Style | str | None = None) -> None:
@@ -339,7 +344,7 @@ class TrainingDisplay:
             rows.append(("final loss", Text(number(loss), "bold")))
         for split, history in self.evaluations.items():
             evaluation = history[-1]
-            rows.append((f"{split} at {evaluation.step}", self.scores(evaluation, history=True)))
+            rows.append((f"{self.label(split)} at {evaluation.step}", self.scores(evaluation, history=True)))
         table = Table.grid(padding=(0, 2))
         table.add_column(style=LABEL, justify="right")
         table.add_column()
@@ -352,6 +357,10 @@ class TrainingDisplay:
     # --------------------------------------------------------------
     # The panel
     # --------------------------------------------------------------
+
+    def label(self, split: str) -> str:
+        """The split's name, marked when its scores are of the averaged weights."""
+        return f"{split} (ema)" if self.averaged else split
 
     def rows(self) -> list[tuple[str, Row]]:
         """The metrics to show as (group, row) pairs, grouped in the order
@@ -383,7 +392,8 @@ class TrainingDisplay:
             for name in latest.scores:
                 bare = name.removeprefix(split + "/")
                 values = collections.deque(record.scores[name] for record in history if name in record.scores)
-                rows.append((f"{split} · step {latest.step}", Row(bare, self.shown.get(bare, PLAIN), values)))
+                rows.append((f"{self.label(split)} · step {latest.step}",
+                             Row(bare, self.shown.get(bare, PLAIN), values)))
         return rows
 
     def rate(self) -> float | None:

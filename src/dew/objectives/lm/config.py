@@ -42,8 +42,10 @@ class LMRunConfig(RunConfig):
             weight_decay=0.1, clip_grads=1.0))
     tokenizer: str = "byte"
     """What the ids were written with: 'byte', or an HF tokenizer name."""
-    ema_decay: float | None = 0.999
-    """None disables EMA; 1.0 retains a frozen copy."""
+    ema_decay: float | None = dataclasses.field(default=None, metadata={"legacy": 0.999})
+    """The decay of an EMA copy that validation and previews read; None
+    keeps none, and 1.0 retains a frozen copy. A record that lacks it was
+    written when LM runs kept 0.999."""
     sample_prompt: str = ""
     """Prompt the validation samples continue; empty continues a newline."""
     sample_tokens: int = 128
