@@ -412,3 +412,31 @@ class Append:
         """`query` `[..., head_dim]` in the basis the stored keys are in."""
         rotation = self.store.rotation
         return query if rotation is None else rotated(query, rotation)
+
+
+def gather_cache_rows(cache, rows):
+    """A decode cache reindexed on its batch axis, one gather per leaf.
+
+    Outside the layer stack a cache holds one subtree per layer, and every
+    leaf a decode step writes carries its batch on axis zero: dense keys and
+    values with their cached validity and cursor, a gated delta net's
+    convolution and recurrent state, latent attention's compressed cache,
+    cached image groups, and a multimodal model's next position. The scanned
+    stack's layer axis exists only inside `run_stack`; `StackView` removes it
+    before the cache crosses `apply`, so axis zero is the row here whatever
+    the stack did.
+
+    `rows` is any index array: repeats duplicate a row's whole decode state,
+    a permutation reparents rows, and a shorter or longer array changes the
+    row count. Beam branching and speculative rollback are both this
+    operation. Nothing else in the tree depends on the row order, so the
+    gathered cache decodes exactly as the rows it came from.
+
+    A paged cache (`dew.nn.kv_cache`) keeps its keys in a pool the rows
+    share through their page tables, so gathered rows would write into each
+    other's pages; it is refused.
+    """
+    if is_paged(cache):
+        raise ValueError("beam search and speculative decoding regroup cache rows, which a "
+                         "paged cache's shared pool cannot do; decode them with a dense cache")
+    return jax.tree.map(lambda leaf: jnp.take(leaf, rows, axis=0), cache)

@@ -947,7 +947,9 @@ class Server:
         if isinstance(prompt, (str, ModelInputs)):
             inputs = _prepared(self.processor, prompt, images=None)
             if set(inputs.token_fields) - {"attention_mask"} or inputs.conditioning:
-                raise ValueError("a served prompt carries tokens and validity only; media and positions do not slot")
+                raise ValueError(
+                    "a served prompt carries tokens and validity only; media and positions do not slot"
+                )
             ids = np.asarray(inputs.tokens)
             fields = {name: np.asarray(value) for name, value in inputs.token_fields.items()}
         else:
@@ -981,8 +983,13 @@ class Server:
             self.step()
         self._settle()
 
-    def __call__(self, prompts: str | Sequence[str] | Sequence[Sequence[int]] | ModelInputs,
-                 max_new_tokens: int | None = None, *, key: int | jax.Array | None = None) -> list[Generation]:
+    def __call__(
+        self,
+        prompts: str | Sequence[str] | Sequence[Sequence[int]] | ModelInputs,
+        max_new_tokens: int | None = None,
+        *,
+        key: int | jax.Array | None = None,
+    ) -> list[Generation]:
         """Submit a batch, run it through, and return its generations in order.
 
         Row `i` draws with the request key folded by `i`, as the same batch
@@ -1053,8 +1060,21 @@ class Server:
             history_valid[index, capacity - len(row.prompt):] = True
             if final[index]:
                 self.rows.prefilled(row)
-        placed = jax.device_put([tokens, valid, slots, budgets, _stacked_keys(tuple(keys)), tables, cursors, final, history,
-                                 history_valid], self._admitted)
+        placed = jax.device_put(
+            [
+                tokens,
+                valid,
+                slots,
+                budgets,
+                _stacked_keys(tuple(keys)),
+                tables,
+                cursors,
+                final,
+                history,
+                history_valid,
+            ],
+            self._admitted,
+        )
         return Admission(ModelInputs(placed[0], {"attention_mask": placed[1]}), *placed[2:])
 
     def _settle(self) -> None:

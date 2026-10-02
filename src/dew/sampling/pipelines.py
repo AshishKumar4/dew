@@ -7,6 +7,7 @@ import os
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
+from importlib import import_module
 from typing import TYPE_CHECKING, Generic
 
 import jax
@@ -175,7 +176,9 @@ class TextToImage:
         from dew.training.quantization import quantize_for_serving
 
         example = self.prepare("", key=0, steps=1)
-        denoiser = {name: value for name, value in self.params.items() if name not in ("encoders", "autoencoder")}
+        denoiser = {
+            name: value for name, value in self.params.items() if name not in ("encoders", "autoencoder")
+        }
         model, variables = quantize_for_serving(self.model, denoiser, spec, example.noise,
                                                 jnp.zeros(example.noise.shape[:1]), **example.conditions)
         return replace(self, model=model, params={**self.params, **variables})
@@ -270,13 +273,21 @@ class TextToImage:
         return _encode(None)(self._conditions, self.params, jax.tree.map(jnp.asarray, tokens))
 
 
-    def prepare(self, prompts: str | Sequence[str | Mapping[str, object]], *,
-                key: int | jax.Array | None = None, steps: int | None = None,
-                unconditional: str | Sequence[str | Mapping[str, object]] | None = None,
-                image: ArrayLike | None = None, image_latents: ArrayLike | None = None,
-                mask: ArrayLike | None = None, noise: ArrayLike | None = None, initial: ArrayLike | None = None,
-                times: ArrayLike | Sequence[float] | None = None,
-                encode_key: int | jax.Array | None = None) -> DenoisingInputs:
+    def prepare(
+        self,
+        prompts: str | Sequence[str | Mapping[str, object]],
+        *,
+        key: int | jax.Array | None = None,
+        steps: int | None = None,
+        unconditional: str | Sequence[str | Mapping[str, object]] | None = None,
+        image: ArrayLike | None = None,
+        image_latents: ArrayLike | None = None,
+        mask: ArrayLike | None = None,
+        noise: ArrayLike | None = None,
+        initial: ArrayLike | None = None,
+        times: ArrayLike | Sequence[float] | None = None,
+        encode_key: int | jax.Array | None = None,
+    ) -> DenoisingInputs:
         """Encode conditions and construct the initial state on a concrete grid.
 
         Images are uint8 or normalized floating NHWC pixels at the task's
@@ -491,9 +502,16 @@ class TextToImage:
         return given, null, initial_state
 
 
-    def __call__(self, prompts: str | Sequence[str | Mapping[str, object]] | DenoisingInputs, *,
-                 steps: int | None = None, guidance: Guidance | float | None | _Default = _Default.GUIDANCE,
-                 sampler: Solver | None = None, key: int | jax.Array | None = None, decode: bool = True) -> Images:
+    def __call__(
+        self,
+        prompts: str | Sequence[str | Mapping[str, object]] | DenoisingInputs,
+        *,
+        steps: int | None = None,
+        guidance: Guidance | float | None | _Default = _Default.GUIDANCE,
+        sampler: Solver | None = None,
+        key: int | jax.Array | None = None,
+        decode: bool = True,
+    ) -> Images:
         """Images in [-1, 1], `[rows, H, W, C]`. `guidance` is a classifier-free
         guidance scale, or a `CFG` with its interval, or None for the plain
         conditional prediction; omitted, it is the task's default."""

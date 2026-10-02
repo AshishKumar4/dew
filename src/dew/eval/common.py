@@ -31,7 +31,9 @@ class Mean[Scored: Artifact]:
         if self.better not in ("higher", "lower"):
             raise ValueError("better must be higher or lower")
         if "/" in self.name:
-            raise ValueError("name must be unprefixed, such as accuracy; evaluation adds val/ or the split name")
+            raise ValueError(
+                "name must be unprefixed, such as accuracy; evaluation adds val/ or the split name"
+            )
 
     @property
     def shown(self) -> Shown:
@@ -53,7 +55,9 @@ class Mean[Scored: Artifact]:
             raise ValueError(f"{self.name}: expected per-example values, not an already averaged scalar")
         return float(values.sum()), float(values.size)
 
-    def merge(self, accumulated: tuple[float, float], contribution: tuple[float, float]) -> tuple[float, float]:
+    def merge(
+        self, accumulated: tuple[float, float], contribution: tuple[float, float]
+    ) -> tuple[float, float]:
         return merge_totals(accumulated, contribution)
 
     def finalize(self, accumulated: tuple[float, float]) -> float:

@@ -1786,7 +1786,9 @@ def translate_gemma4_vision_config(hf_config: Mapping[str, object]) -> Mapping[s
         "intermediate_size": records.integer(vision["intermediate_size"], "intermediate_size"),
         "num_layers": records.integer(vision["num_hidden_layers"], "num_hidden_layers"),
         "num_heads": heads,
-        "num_key_value_heads": records.integer(vision.get("num_key_value_heads", heads), "num_key_value_heads"),
+        "num_key_value_heads": records.integer(
+            vision.get("num_key_value_heads", heads), "num_key_value_heads"
+        ),
         "head_dim": records.integer(head_dim, "head_dim"),
         "patch_size": records.integer(vision.get("patch_size", 16), "patch_size"),
         "pooling_kernel_size": records.integer(vision.get("pooling_kernel_size", 3), "pooling_kernel_size"),

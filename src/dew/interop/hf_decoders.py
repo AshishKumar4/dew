@@ -2031,14 +2031,15 @@ forward multiplies by them. `scale_after_cast` orders a norm's scale and its
 cast to the compute dtype, which are the same product in fp32."""
 
 _RESOLVED: Mapping[str, Callable[[CausalTransformer], object]] = {
-    'num_kv_heads': lambda model: model.kv_heads,
-    'head_dim': lambda model: model.features_per_head,
-    'layer_types': lambda model: model.per_layer_types,
-    'kinds': lambda model: tuple(model.kind_of(kind) for kind in sorted(set(model.per_layer_types))),
-    'partial_rotary_factor': lambda model: model.partial_rotary_factor or 1.0,
-    'per_layer_input_vocab': lambda model: model.per_layer_input_vocab or model.vocab_size,
-    'position_embedding_size': lambda model: (
-        model.position_embedding_size or model.max_seq_len if model.position_embedding == 'learned' else None),
+    "num_kv_heads": lambda model: model.kv_heads,
+    "head_dim": lambda model: model.features_per_head,
+    "layer_types": lambda model: model.per_layer_types,
+    "kinds": lambda model: tuple(model.kind_of(kind) for kind in sorted(set(model.per_layer_types))),
+    "partial_rotary_factor": lambda model: model.partial_rotary_factor or 1.0,
+    "per_layer_input_vocab": lambda model: model.per_layer_input_vocab or model.vocab_size,
+    "position_embedding_size": lambda model: (
+        model.position_embedding_size or model.max_seq_len if model.position_embedding == "learned" else None
+    ),
 }
 """Fields whose None stands for a value the forward derives, spelled out."""
 

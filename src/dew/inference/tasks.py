@@ -16,6 +16,7 @@ import dataclasses
 import functools
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
+from importlib import import_module
 from typing import TYPE_CHECKING, Protocol
 
 import jax

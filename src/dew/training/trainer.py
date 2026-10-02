@@ -321,8 +321,16 @@ def climb_to(objective, rung: Mapping[str, object]) -> None:
     ladder = (DECODER_REMAT if isinstance(model, CausalTransformer)
               else DIFFUSION_REMAT if isinstance(current, bool | str) else ())
     records = [remat_record(remat) for remat in ladder]
-    here, there = remat_record('dots' if current is True else current), json_value(rung.get('remat'), 'rung remat')
-    if model is not None and here in records and there in records and records.index(there) > records.index(here):
+    here, there = (
+        remat_record("dots" if current is True else current),
+        json_value(rung.get("remat"), "rung remat"),
+    )
+    if (
+        model is not None
+        and here in records
+        and there in records
+        and records.index(there) > records.index(here)
+    ):
         objective.model = model.clone(remat=ladder[records.index(there)])
 
 
@@ -918,7 +926,9 @@ class Trainer(Generic[Loss, Effects]):
             return
         fields = record(rung, 'rung')
         climb_to(self.objective, fields)
-        self._xla_defaults = self._xla_defaults or boolean(fields.get('xla_defaults', False), 'rung xla_defaults')
+        self._xla_defaults = self._xla_defaults or boolean(
+            fields.get("xla_defaults", False), "rung xla_defaults"
+        )
         self._resumed_rung = self._rung()
 
     def _placed_held(self, initializer: Initializer, abstract: TrainState,
@@ -1235,9 +1245,11 @@ class Trainer(Generic[Loss, Effects]):
                     self.executable, fits = fitting_default(self.program, self.executable, mesh, held)
                     self._xla_defaults = fits
                 if not fits and resumed is not None:
-                    print(colored(f"the step does not fit the devices at the rung its checkpoint trained on "
-                                  f"({resumed}); from here the resumed run computes otherwise than the "
-                                  f"run it continues", "yellow"), file=sys.stderr)
+                    _log.warning(
+                        "the step does not fit the devices at the rung its checkpoint trained on "
+                        "(%s); from here the resumed run computes otherwise than the run it continues",
+                        resumed,
+                    )
                     resumed = None
                 if fits or not recompute_more(self.objective):
                     break

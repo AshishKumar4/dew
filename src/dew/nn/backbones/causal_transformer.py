@@ -57,7 +57,7 @@ from ..hyper_connections import (
     first_stream,
 )
 from ..inputs import AttentionMetadata, LayerInputs, PredictionPhase
-from ..kv_cache import KVCache, is_paged
+from ..kv_cache import KVCache, gather_cache_rows as gather_cache_rows
 from ..mixers import AttentionMixer, MixerBase, MixerContext
 from ..mixers.mamba2 import Mamba2Mixer
 from ..mla import INDEXER_COLLECTION
@@ -680,11 +680,13 @@ class CausalTransformer(nn.Module):
     num_layers: int = 8
     num_heads: int = 8
     num_kv_heads: int | None = None       # None: as many as the query heads
-    head_dim: int | None = None           # None: emb_features // num_heads
-    mlp: GatedActivation = 'swiglu'          # 'swiglu' | 'geglu' | 'geglu_exact' | 'swigluoai', or Kimi K3's Situ
+    head_dim: int | None = None  # None: emb_features // num_heads
+    mlp: GatedActivation = "swiglu"  # 'swiglu' | 'geglu' | 'geglu_exact' | 'swigluoai', or Kimi K3's Situ
     mlp_bias: bool = False
     """Bias both feed-forward projections; gelu, gelu_exact and relu are ungated."""
-    mlp_features: int | tuple[int, ...] | None = None  # None: four times emb_features; a tuple: one width per layer (Gemma 3n); 0: no feed-forward (Mamba-2)
+    mlp_features: int | tuple[int, ...] | None = None
+    """None: four times emb_features; a tuple: one width per layer (Gemma 3n);
+    0: no feed-forward (Mamba-2)."""
     max_seq_len: int = 2048
     position_embedding: Literal['rotary', 'learned'] = 'rotary'
     position_embedding_size: int | None = None
@@ -1120,8 +1122,9 @@ class CausalTransformer(nn.Module):
             raise ValueError('scale_offset describes RMSNorm weights')
         if self.position_embedding not in ('rotary', 'learned'):
             raise ValueError('position_embedding must be rotary or learned')
-        if self.position_embedding == 'learned' and (
-                self.mixer is not None or any(kind.mixer is not None for kind in (self.kinds or {}).values())):
+        if self.position_embedding == "learned" and (
+            self.mixer is not None or any(kind.mixer is not None for kind in (self.kinds or {}).values())
+        ):
             raise ValueError('learned positions require the default unrotated attention mixer')
         if self.position_embedding_size is not None and (
                 self.position_embedding != 'learned' or self.position_embedding_size < self.max_seq_len):
@@ -1130,8 +1133,9 @@ class CausalTransformer(nn.Module):
                 self.position_embedding != 'learned' or self.position_embedding_size is None
                 or self.position_embedding_size < self.max_seq_len + self.position_embedding_offset)):
             raise ValueError('position_embedding_offset requires learned table rows past max_seq_len')
-        if self.position_embedding != 'rotary' and (
-                self.partial_rotary_factor is not None or self.rope_scaling is not None or self.yarn is not None):
+        if self.position_embedding != "rotary" and (
+            self.partial_rotary_factor is not None or self.rope_scaling is not None or self.yarn is not None
+        ):
             raise ValueError('rotary scaling requires rotary positions')
         if self.mixture is not None and (self.mlp_bias or self.mlp in ('gelu', 'gelu_exact', 'relu')):
             raise ValueError('the routed experts require a bias-free gated MLP')
@@ -2482,31 +2486,3 @@ class CausalTransformer(nn.Module):
         the ones after it.
         """
         self(jnp.zeros((batch_size, 1), jnp.int32), decode=True)
-
-
-def gather_cache_rows(cache, rows):
-    """A decode cache reindexed on its batch axis, one gather per leaf.
-
-    Outside the layer stack a cache holds one subtree per layer, and every
-    leaf a decode step writes carries its batch on axis zero: dense keys and
-    values with their cached validity and cursor, a gated delta net's
-    convolution and recurrent state, latent attention's compressed cache,
-    cached image groups, and a multimodal model's next position. The scanned
-    stack's layer axis exists only inside `run_stack`; `StackView` removes it
-    before the cache crosses `apply`, so axis zero is the row here whatever
-    the stack did.
-
-    `rows` is any index array: repeats duplicate a row's whole decode state,
-    a permutation reparents rows, and a shorter or longer array changes the
-    row count. Beam branching and speculative rollback are both this
-    operation. Nothing else in the tree depends on the row order, so the
-    gathered cache decodes exactly as the rows it came from.
-
-    A paged cache (`dew.nn.kv_cache`) keeps its keys in a pool the rows
-    share through their page tables, so gathered rows would write into each
-    other's pages; it is refused.
-    """
-    if is_paged(cache):
-        raise ValueError("beam search and speculative decoding regroup cache rows, which a "
-                         "paged cache's shared pool cannot do; decode them with a dense cache")
-    return jax.tree.map(lambda leaf: jnp.take(leaf, rows, axis=0), cache)

@@ -666,7 +666,9 @@ class DecoderBlock(nn.Module):
         state = self._enter(x, train, attention_metadata)
         state, read, site = self._read(state, "attention")
         normed = self.input_layernorm(read) if self.wiring.pre_norms else read
-        mixed = self._mix(normed, decode, positions, segment_ids, kv_store, attention_metadata, prediction_phase, train)
+        mixed = self._mix(
+            normed, decode, positions, segment_ids, kv_store, attention_metadata, prediction_phase, train
+        )
         if self.wiring.output_norms:
             mixed = self.attention_output_norm(mixed)
         attention_branch = self._branch(mixed, train)
@@ -816,12 +818,20 @@ class DecoderBlock(nn.Module):
         """The token mixer over `x`. The store, the metadata and a prediction
         phase other than ordinary reach it only when the call carries them,
         since a mixer with no use for one does not take it."""
-        return self.self_attn(x, decode=decode, positions=positions, segment_ids=segment_ids,
-                              **({"train": train} if isinstance(self.self_attn, CausalSelfAttention)
-                                 and self.self_attn.attention_dropout_rate else {}),
-                              **({} if kv_store is None else {"kv_store": kv_store}),
-                              **({} if attention_metadata is None else {"attention_metadata": attention_metadata}),
-                              **({} if prediction_phase == "ordinary" else {"prediction_phase": prediction_phase}))
+        return self.self_attn(
+            x,
+            decode=decode,
+            positions=positions,
+            segment_ids=segment_ids,
+            **(
+                {"train": train}
+                if isinstance(self.self_attn, CausalSelfAttention) and self.self_attn.attention_dropout_rate
+                else {}
+            ),
+            **({} if kv_store is None else {"kv_store": kv_store}),
+            **({} if attention_metadata is None else {"attention_metadata": attention_metadata}),
+            **({} if prediction_phase == "ordinary" else {"prediction_phase": prediction_phase}),
+        )
 
     def _feedforward_inputs(self, attention_metadata) -> dict:
         """The token ids for a hash-routed feed-forward, the media mask, when

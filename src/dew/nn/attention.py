@@ -888,7 +888,9 @@ def _dropout_attention(query, key, value, dtype, precision, force_fp32_for_softm
                        key_value_seq_lengths, dropout_rate, dropout_rng, shards):
     """Apply one reference probability draw, retaining visibility and projection precision."""
     if implementation not in ('auto', 'reference', 'xla'):
-        raise ValueError(f"{implementation} attention cannot apply probability dropout; use reference or auto")
+        raise ValueError(
+            f"{implementation} attention cannot apply probability dropout; use reference or auto"
+        )
     if shards > 1:
         raise ValueError("attention probability dropout requires sequence_shards=1")
     if sinks is not None or softcap is not None:
