@@ -58,7 +58,9 @@ def _parse(reader: GGUFReader, key: str) -> records.JSON:
     from transformers.integrations.ggml import _gguf_parse_value
 
     field = reader.fields[key]
-    values = [records.json_value(_gguf_parse_value(field.parts[index], field.types), key) for index in field.data]
+    values = [
+        records.json_value(_gguf_parse_value(field.parts[index], field.types), key) for index in field.data
+    ]
     return values[0] if len(values) == 1 else values
 
 
@@ -95,8 +97,9 @@ def _config(reader: GGUFReader) -> tuple[str, Mapping[str, object]]:
         fields["vocab_size"] = len(reader.fields["tokenizer.ggml.tokens"].data)
     config = AutoConfig.for_model(architecture, **fields).to_diff_dict()
     table = GGUF_TO_TRANSFORMERS_MAPPING["config"][architecture]
-    head_dim = config.get("head_dim") or records.integer(config["hidden_size"], "hidden_size") // records.integer(
-        config["num_attention_heads"], "num_attention_heads")
+    head_dim = config.get("head_dim") or records.integer(
+        config["hidden_size"], "hidden_size"
+    ) // records.integer(config["num_attention_heads"], "num_attention_heads")
     for key in reader.fields:
         name = key.removeprefix(f"{architecture}.")
         if name == key or (table.get(name, -1) is not None and name in table):
@@ -211,7 +214,9 @@ def read(path: str | os.PathLike[str]) -> tuple[Mapping[str, object], dict[str, 
         if architecture == "llama" and projection in heads:
             count = heads[projection]
             if not isinstance(count, int):
-                raise ValueError(f"{path} states no head counts, so its {projection} rows cannot be reordered")
+                raise ValueError(
+                    f"{path} states no head counts, so its {projection} rows cannot be reordered"
+                )
             values = unpermute(values, count)
         tensors[f"{stems[stem]}.{suffix}"] = values
     return config, tensors

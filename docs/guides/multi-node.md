@@ -26,10 +26,10 @@ Without `--hosts`, `--hostfile` or `--tpu`, `dew launch` asks JAX's own cluster 
 On one machine, `dew launch` runs the program after `--` once per GPU:
 
 ```bash
-dew launch -- python recipes/lm/train.py --trainer.multi-host True
+dew launch -- python recipes/lm/train.py
 ```
 
-On a four-GPU machine this starts four processes, each holding one GPU through `JAX_LOCAL_DEVICE_IDS`. The launcher prints one `pool:` line with the process count, the devices per process and the coordinator address, then one `[r] rank r of 4 on localhost, GPU r, pid ...` line per rank, and each process prints `Joined the JAX process pool: process r of 4` when it joins.
+On a four-GPU machine this starts four processes, each holding one GPU through `JAX_LOCAL_DEVICE_IDS`. The program needs no flag to join: `dew launch` leaves the pool's size and each rank in the environment, and `prepare_process` joins the pool it finds there. `--trainer.multi-host True` makes a run refuse to start alone, where no pool is configured; `False` never joins one. The launcher prints one `pool:` line with the process count, the devices per process and the coordinator address, then one `[r] rank r of 4 on localhost, GPU r, pid ...` line per rank, and each process prints `Joined the JAX process pool: process r of 4` when it joins.
 
 Every output line carries its rank. `--processes-per-host N` runs N processes a host and splits the GPUs evenly between them, so `--processes-per-host 1` runs one process that holds every GPU. `--devices-per-process N` gives each process N GPUs. A pool that would need more GPUs than the first host shows is refused before any rank starts, and the message names both counts. If the launcher cannot count a host's GPUs, because nvidia-smi is missing there or fails, it says so on stderr and starts the pool without the check. `JAX_PLATFORMS=cpu`, in the environment or through `--env`, stops the launcher from counting GPUs. The launcher counts NVIDIA GPUs, those in `CUDA_VISIBLE_DEVICES` when it is set; on other GPUs, set `--processes-per-host`.
 
@@ -54,7 +54,7 @@ A rank killed by a signal reads as `was killed by SIGKILL`, and the launch exits
 List the hosts, process 0's first, then the command after `--`:
 
 ```bash
-dew launch --hosts node0,node1 -- /opt/dew/.venv/bin/python recipes/lm/train.py --trainer.multi-host True
+dew launch --hosts node0,node1 -- /opt/dew/.venv/bin/python recipes/lm/train.py
 ```
 
 `--hostfile FILE` reads the hosts from a file instead, one per line. It takes the first word of each line, so an MPI hostfile with `slots=8` works as it is. The launcher counts the GPUs on the first host and runs as many processes on every host, so the hosts should match.
@@ -66,7 +66,7 @@ The launcher starts the command on each host over `ssh -o BatchMode=yes`, so pas
 Run `dew launch` inside the allocation. It starts `srun`, and JAX reads the rank from Slurm:
 
 ```bash
-sbatch --nodes=2 --gpus-per-node=8 --wrap "dew launch -- /opt/dew/.venv/bin/python recipes/lm/train.py --trainer.multi-host True"
+sbatch --nodes=2 --gpus-per-node=8 --wrap "dew launch -- /opt/dew/.venv/bin/python recipes/lm/train.py"
 ```
 
 This runs `srun --kill-on-bad-exit=1 --export=ALL --label --ntasks-per-node=8 ...`, with the `--env` variables in srun's environment. Each line carries its task number, and when a task fails srun names it and stops the others. JAX gives each Slurm task the one GPU at its `SLURM_LOCALID`, so a node runs one task per GPU: `--processes-per-host` when you give it, else the allocation's own `--ntasks-per-node`, else its `--gpus-per-node`, else the GPUs the node running `dew launch` sees. On a cluster whose login node has no GPUs, ask for `--gpus-per-node` rather than `--gpus`, or pass `--processes-per-host`. Every task needs a CPU of its own in the allocation, which `--ntasks-per-node` or `--cpus-per-gpu` in the sbatch request provides; with neither, srun refuses to start more tasks than the allocation has CPUs. One task per node would see a single GPU, so the launcher refuses `--devices-per-process` under Slurm. Fewer tasks a node than GPUs a node would leave the rest idle with nothing reporting it, so the launcher refuses such an allocation, or such a `--processes-per-host`, and names `--ntasks-per-node`. Inside a step of several tasks that `srun` already started, `dew launch` runs the program in place, and `prepare_process` refuses the same way a step with fewer tasks on a node than the GPUs its task sees. Inside a step of one task, such as a GPU wrapper script that runs its command under `srun`, it starts one process per GPU of the step, as on a plain machine, and each process takes its placement from the launcher, not from Slurm's variables. A program that such a step runs without `dew launch` runs as one process, unless it asks for a pool with `multi_host=True`.
@@ -87,7 +87,7 @@ Each rank takes the GPU at its local rank, as under Slurm.
 `--tpu NAME` runs the program on every worker of a TPU VM or pod slice, from any machine where gcloud reaches the TPU:
 
 ```bash
-dew launch --tpu dew-16 --cwd dew -- python recipes/lm/train.py --trainer.multi-host True
+dew launch --tpu dew-16 --cwd dew -- python recipes/lm/train.py
 ```
 
 The launcher finds the TPU's zone the way [`dew tpu`](../tpu.md) does, or takes `--zone`, and starts one `gcloud compute tpus tpu-vm ssh --worker=N` per worker. Each worker sources the environment `dew tpu setup` wrote, so `python` is the setup's virtualenv. A relative `--cwd` is under the worker's home directory, where `dew tpu sync` puts the working tree. JAX reads each worker's rank from the TPU metadata server. Closing the connections, which stopping the pool does, hangs up the programs on the workers.

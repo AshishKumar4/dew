@@ -30,7 +30,9 @@ def duration(value: str) -> datetime.timedelta:
         raise ValueError("duration must be positive, such as 30m (s, m and h are supported)")
     whole, _, fraction = match[1].partition('.')
     denominator = 10 ** len(fraction)
-    numerator = (int(whole) * denominator + int(fraction or '0')) * {'s': 1, 'm': 60, 'h': 3600}[match[2]] * 1_000_000
+    numerator = (
+        (int(whole) * denominator + int(fraction or "0")) * {"s": 1, "m": 60, "h": 3600}[match[2]] * 1_000_000
+    )
     micros, remainder = divmod(numerator, denominator)
     # timedelta's nearest-microsecond, ties-to-even rounding, without a
     # floating conversion or ambient decimal context.

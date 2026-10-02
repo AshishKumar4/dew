@@ -8,12 +8,98 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental import checkify
 from test_text_rollout_contract import decoder
 
 from dew.sampling import Sample, Sampling, decoding, generate
 from dew.sampling.decoding import StepState
+from dew.sampling.strategies import draw
 
 VOCAB = 13
+
+
+def test_terminal_greedy_matches_the_categorical_point_mass_and_float64_likelihood():
+    """The final processor selects a point mass, including first-index ties.
+
+    Compare the complete draw to the existing categorical path and score its
+    selected model logits with a float64 log partition. Earlier processors
+    affect the selection but not the model's raw likelihood.
+    """
+    values = np.asarray([[1.0, 1.0, -2.0, 0.5], [-5.0, 3.0, 2.0, 1.0], [0.0, -1.0, 2.0, 2.0]], np.float32)
+    bias = jnp.asarray([0.0, 0.0, 0.0, 1.5], jnp.float32)
+
+    def shifted(state, scores):
+        return scores + bias
+
+    chain = decoding.chain((shifted, decoding.Greedy()))
+    for seed in (0, 19):
+        state = StepState(jnp.zeros((3, 2), jnp.int32), jnp.zeros((3, 2), bool),
+                          jnp.asarray([0, 1, 7], jnp.int32), jnp.ones(3, bool),
+                          jax.random.split(jax.random.key(seed), 3), prompt_width=1)
+        checked = checkify.checkify(draw)
+        error, actual = jax.jit(lambda state, scores: checked(state, scores, chain))(state, jnp.asarray(values))
+        error.throw()
+        # A plain callable retains the categorical point-mass implementation.
+        error, categorical = jax.jit(lambda state, scores: checked(
+            state, scores, lambda step, logits: chain(step, logits)))(state, jnp.asarray(values))
+        error.throw()
+        for mine, reference in zip(actual, categorical, strict=True):
+            np.testing.assert_array_equal(mine, reference)
+        tokens, behavior, raw = map(np.asarray, actual)
+        np.testing.assert_array_equal(tokens, np.argmax(values + np.asarray(bias), axis=-1))
+        np.testing.assert_array_equal(behavior, 0.0)
+        wide = values.astype(np.float64)
+        maximum = wide.max(axis=-1)
+        partition = maximum + np.log(np.exp(wide - maximum[:, None]).sum(axis=-1))
+        expected = wide[np.arange(len(values)), tokens] - partition
+        np.testing.assert_allclose(raw, expected, atol=2e-6, rtol=2e-6)
+
+
+def test_a_transform_after_greedy_can_restore_a_sampled_distribution():
+    """Greedy is not a property of a chain with a later arbitrary rewrite."""
+    values = jnp.asarray([[1.0, 2.0, -3.0, 4.0]], jnp.float32)
+    state = StepState(jnp.zeros((1, 2), jnp.int32), jnp.zeros((1, 2), bool),
+                      jnp.zeros(1, jnp.int32), jnp.ones(1, bool),
+                      jax.random.split(jax.random.key(0), 1), prompt_width=1)
+
+    def uniform(step, scores):
+        return jnp.zeros_like(scores)
+
+    checked = checkify.checkify(draw)
+    error, (_, behavior, _) = jax.jit(lambda state: checked(
+        state, values, decoding.chain((decoding.Greedy(), uniform))))(state)
+    error.throw()
+    np.testing.assert_allclose(behavior, -np.log(4.0), atol=2e-6, rtol=2e-6)
+
+
+def test_an_array_backed_logits_chain_can_be_jitted_directly():
+    """A callable chain captures processor arrays as the old closure did."""
+    state = StepState(jnp.zeros((2, 2), jnp.int32), jnp.zeros((2, 2), bool),
+                      jnp.zeros(2, jnp.int32), jnp.ones(2, bool),
+                      jax.random.split(jax.random.key(0), 2), prompt_width=1)
+    scores = jnp.asarray([[1.0, 9.0, 5.0, 7.0], [8.0, 2.0, 4.0, 1.0]], jnp.float32)
+    chain = decoding.chain((decoding.SuppressTokens(jnp.asarray([1, 3], jnp.int32)), decoding.Greedy()))
+    actual = jax.jit(chain)(state, scores)
+    expected = np.full((2, 4), -np.inf, np.float32)
+    expected[np.arange(2), [2, 0]] = 0.0
+    np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.parametrize("invalid", [np.nan, np.inf, -np.inf])
+def test_terminal_greedy_still_refuses_an_undefined_processed_distribution(invalid):
+    state = StepState(jnp.zeros((1, 2), jnp.int32), jnp.zeros((1, 2), bool),
+                      jnp.zeros(1, jnp.int32), jnp.ones(1, bool),
+                      jax.random.split(jax.random.key(0), 1), prompt_width=1)
+
+    def undefined(step, scores):
+        return jnp.full_like(scores, invalid)
+
+    checked = checkify.checkify(draw)
+    error, _ = jax.jit(lambda state: checked(
+        state, jnp.asarray([[1.0, 2.0, 3.0]], jnp.float32),
+        decoding.chain((undefined, decoding.Greedy()))))(state)
+    with pytest.raises(Exception, match="without a distribution to draw from"):
+        error.throw()
 
 
 @pytest.fixture(scope="module")

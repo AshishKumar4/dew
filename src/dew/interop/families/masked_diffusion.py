@@ -96,26 +96,40 @@ def _llada_geometry(hf_config: Mapping[str, object]) -> Mapping[str, object]:
                 'mlp_hidden_size/intermediate_size and embedding_size/vocab_size are required')
     kv_heads = heads if kv_heads is None else kv_heads
     head_dim = hf_config.get('head_dim')
-    head_dim = records.integer(head_dim, 'head_dim') if head_dim is not None else records.integer(hidden, 'hidden_size/d_model') // records.integer(heads, 'num_attention_heads/n_heads')
+    head_dim = (
+        records.integer(head_dim, "head_dim")
+        if head_dim is not None
+        else records.integer(hidden, "hidden_size/d_model")
+        // records.integer(heads, "num_attention_heads/n_heads")
+    )
     max_pos = hf_config.get('max_position_embeddings',
                             hf_config.get('max_sequence_length', DEFAULT_MAX_SEQ_LEN))
     std: dict[str, object] = {
-        'hidden_size': records.integer(hidden, 'hidden_size/d_model'),
-        'num_attention_heads': records.integer(heads, 'num_attention_heads/n_heads'),
-        'num_key_value_heads': records.integer(kv_heads, 'num_key_value_heads/n_kv_heads'),
-        'head_dim': head_dim,
-        'intermediate_size': records.integer(intermediate, 'intermediate_size/mlp_hidden_size'),
-        'vocab_size': records.integer(vocab, 'vocab_size/embedding_size'),
-        'num_hidden_layers': records.integer(layers, 'num_hidden_layers/n_layers'),
-        'max_position_embeddings': min(records.integer(max_pos, 'max_position_embeddings/max_sequence_length'), DEFAULT_MAX_SEQ_LEN),
-        'rms_norm_eps': records.number(hf_config.get('rms_norm_eps', hf_config.get('norm_eps', 1e-6)), 'rms_norm_eps'),
-        'rope_theta': records.number(hf_config.get('rope_theta', 500000.0), 'rope_theta'),
-        'attention_bias': bool(hf_config.get('attention_bias', hf_config.get('include_bias',
-                              hf_config.get('include_qkv_bias', False)))),
-        'tie_word_embeddings': bool(hf_config.get('tie_word_embeddings',
-                                    hf_config.get('weight_tying', False))),
-        'hidden_act': hf_config.get('hidden_act', hf_config.get('hidden_activation',
-                      hf_config.get('activation_type', 'silu'))),
+        "hidden_size": records.integer(hidden, "hidden_size/d_model"),
+        "num_attention_heads": records.integer(heads, "num_attention_heads/n_heads"),
+        "num_key_value_heads": records.integer(kv_heads, "num_key_value_heads/n_kv_heads"),
+        "head_dim": head_dim,
+        "intermediate_size": records.integer(intermediate, "intermediate_size/mlp_hidden_size"),
+        "vocab_size": records.integer(vocab, "vocab_size/embedding_size"),
+        "num_hidden_layers": records.integer(layers, "num_hidden_layers/n_layers"),
+        "max_position_embeddings": min(
+            records.integer(max_pos, "max_position_embeddings/max_sequence_length"), DEFAULT_MAX_SEQ_LEN
+        ),
+        "rms_norm_eps": records.number(
+            hf_config.get("rms_norm_eps", hf_config.get("norm_eps", 1e-6)), "rms_norm_eps"
+        ),
+        "rope_theta": records.number(hf_config.get("rope_theta", 500000.0), "rope_theta"),
+        "attention_bias": bool(
+            hf_config.get(
+                "attention_bias", hf_config.get("include_bias", hf_config.get("include_qkv_bias", False))
+            )
+        ),
+        "tie_word_embeddings": bool(
+            hf_config.get("tie_word_embeddings", hf_config.get("weight_tying", False))
+        ),
+        "hidden_act": hf_config.get(
+            "hidden_act", hf_config.get("hidden_activation", hf_config.get("activation_type", "silu"))
+        ),
     }
     return std
 
@@ -190,7 +204,9 @@ def _llada_refusals(hf_config: Mapping[str, object], used: set[str],
                  'eos_token_id', 'pad_token_id'))
     embedding = hf_config.get('embedding_size')
     vocab = hf_config.get('vocab_size', embedding)
-    if embedding is not None and records.integer(embedding, 'embedding_size') != records.integer(vocab, 'vocab_size'):
+    if embedding is not None and records.integer(embedding, "embedding_size") != records.integer(
+        vocab, "vocab_size"
+    ):
         _refuse('embedding_size', f'it names {embedding} rows for a {vocab} vocabulary')
 
 
@@ -328,4 +344,6 @@ def _mask_token_export(model: CausalTransformer) -> Mapping[str, object]:
 
 
 def _diffusion_gemma_export(model: CausalTransformer) -> Mapping[str, object]:
-    raise ValueError('diffusion_gemma_text is a cache-reading view; export the complete native DiffusionGemma wrapper')
+    raise ValueError(
+        "diffusion_gemma_text is a cache-reading view; export the complete native DiffusionGemma wrapper"
+    )

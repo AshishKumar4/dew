@@ -6,7 +6,8 @@ qkv/mlp/modulation weights and mix through a single joint attention over the
 concatenated sequence.
 """
 
-from typing import Literal, Sequence
+from collections.abc import Sequence
+from typing import Literal
 
 import einops
 import jax.numpy as jnp
@@ -440,9 +441,13 @@ class HierarchicalMMDiT(nn.Module):
     def __call__(self, x, temb, textcontext, train: bool = False):
         _, H, W, _ = x.shape
         num_stages = len(self.emb_features)
-        assert H % (self.base_patch_size * (2**(num_stages - 1))) == 0 and \
-               W % (self.base_patch_size * (2**(num_stages - 1))) == 0, \
-            f"Image dimensions ({H},{W}) must be divisible by effective coarsest patch size {self.base_patch_size * (2**(num_stages - 1))}"
+        assert (
+            H % (self.base_patch_size * (2 ** (num_stages - 1))) == 0
+            and W % (self.base_patch_size * (2 ** (num_stages - 1))) == 0
+        ), (
+            f"Image dimensions ({H},{W}) must be divisible by effective coarsest patch size "
+            f"{self.base_patch_size * (2 ** (num_stages - 1))}"
+        )
 
         img, _ = self.embed(x)
         cond_base = self.conditioning(temb, textcontext)

@@ -101,7 +101,7 @@ def _refuse_to_fork(*args, **kwargs):
 # Slow fetching waits; it never invents data
 # ---------------------------------------------------------------------------------
 
-def test_slow_fetching_waits_instead_of_fabricating_samples(monkeypatch, capsys):
+def test_slow_fetching_waits_instead_of_fabricating_samples(monkeypatch, caplog):
     """A queue timeout waits; a batch of zeros captioned "Timeout occurred
     while waiting for sample" would train as data."""
     def slow(rows, sink, **kwargs):
@@ -115,7 +115,7 @@ def test_slow_fetching_waits_instead_of_fabricating_samples(monkeypatch, capsys)
 
     assert list(batch["caption"]) == [f"sample {i}" for i in range(BATCH)]
     assert [int(image.max()) for image in batch["image"]] == [1, 2, 3, 4]
-    assert "still fetching" in capsys.readouterr().out
+    assert "still fetching" in caplog.text
 
 
 def test_dropped_fetches_are_counted_and_never_yielded(monkeypatch):

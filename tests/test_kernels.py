@@ -131,6 +131,33 @@ def test_cudnn_takes_key_lengths_and_agrees_with_xla(q_len, kv_len, causal, as_m
         assert np.abs(got - want).max() <= 2 ** -6 * np.abs(want).max()
 
 
+@on_gpu
+def test_single_query_cudnn_decode_matches_float64_attention_and_gradients(without_deterministic_ops):
+    """One query, GQA and distinct key counts against the highest-precision path.
+
+    The single query is padded for the cuDNN backward even though the
+    forward accepts an odd length. The numerical bound is the existing
+    two-bf16-ulp bound, not a new tolerance.
+    """
+    query, _, _ = qkv((3, 1, 4, 64))
+    _, key, value = qkv((3, 17, 2, 64), seed=1)
+    lengths = jnp.asarray([17, 8, 1], jnp.int32)
+    actual = key_length_call("cudnn", query, key, value, lengths)
+    with jax.enable_x64():
+        def loss(q, k, v):
+            attended = scaled_dot_product_attention(
+                q, k, v, implementation="reference", key_value_seq_lengths=lengths,
+                force_fp32_for_softmax=False, precision=jax.lax.Precision.HIGHEST)
+            return jnp.sum(attended ** 2), attended
+
+        (_, expected), gradients = jax.jit(jax.value_and_grad(loss, argnums=(0, 1, 2), has_aux=True))(
+            query.astype(jnp.float64), key.astype(jnp.float64), value.astype(jnp.float64))
+        for got, want in zip(actual, (expected, *gradients), strict=True):
+            want = np.asarray(want)
+            assert got.shape == want.shape
+            assert np.abs(got - want).max() <= 2 ** -6 * np.abs(want).max()
+
+
 def test_flags_are_appended_to_what_the_environment_already_carries(monkeypatch):
     """The test suite itself sets a flag, and a run's own flags have to add to
     it, not replace it."""

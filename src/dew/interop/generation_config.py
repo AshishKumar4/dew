@@ -63,7 +63,9 @@ def pad_id(config: Mapping[str, object], generation_config: Mapping[str, object]
     return value
 
 
-def generation_limit(config: Mapping[str, object], generation_config: Mapping[str, object], name: str) -> int | None:
+def generation_limit(
+    config: Mapping[str, object], generation_config: Mapping[str, object], name: str
+) -> int | None:
     """Read a nonnegative source generation limit."""
     value = _generation_value(config, generation_config, name)
     if value is None:
@@ -110,33 +112,31 @@ _CONTROLS = {
     "assistant_confidence_threshold": _Control("strategy"),
     "assistant_early_exit": _Control("unsupported", refusal="early-exit proposal is not implemented"),
     "assistant_ensemble_weight": _Control(
-        "unsupported",
-        neutral=(1.0,),
-        refusal="ensemble verification below one accepts a biased distribution"),
+        "unsupported", neutral=(1.0,), refusal="ensemble verification below one accepts a biased distribution"
+    ),
     "assistant_lookbehind": _Control(
-        "unsupported",
-        refusal="translating between two tokenizers' token spaces is not implemented"),
+        "unsupported", refusal="translating between two tokenizers' token spaces is not implemented"
+    ),
     "bad_words_ids": _Control("transform"),
     "begin_suppress_tokens": _Control("transform"),
     "bos_token_id": _Control("inapplicable"),
     "cache_config": _Control("unsupported", refusal="quantized and offloaded caches are not implemented"),
     "cache_implementation": _Control(
         "unsupported",
-        neutral=('static',),
-        refusal="the native cache is the fixed-capacity static one", masked_neutral=()),
+        neutral=("static",),
+        refusal="the native cache is the fixed-capacity static one",
+        masked_neutral=(),
+    ),
     "compile_config": _Control("unsupported", refusal="the native decoder owns its compilation"),
     "constraints": _Control("unsupported", refusal="constrained beam search is not implemented"),
     "continuous_batching_config": _Control("unsupported", refusal="continuous batching is not implemented"),
     "decoder_start_token_id": _Control("inapplicable"),
     "disable_compile": _Control(
-        "unsupported",
-        neutral=(False,),
-        refusal="the native decoder always runs compiled"),
+        "unsupported", neutral=(False,), refusal="the native decoder always runs compiled"
+    ),
     "diversity_penalty": _Control(
-        "unsupported",
-        neutral=(0.0,),
-        mode="beam",
-        refusal="diverse group beam search is not implemented"),
+        "unsupported", neutral=(0.0,), mode="beam", refusal="diverse group beam search is not implemented"
+    ),
     "do_sample": _Control("policy", masked_neutral=(True,)),
     "dola_layers": _Control("unsupported", refusal="DoLa is a decoding strategy that is not implemented"),
     "early_stopping": _Control("strategy", neutral=(False,), mode="beam"),
@@ -152,16 +152,17 @@ _CONTROLS = {
     "guidance_scale": _Control(
         "transform",
         neutral=(1.0,),
-        refusal="classifier-free guidance evaluates the model a second time per step"),
+        refusal="classifier-free guidance evaluates the model a second time per step",
+    ),
     "is_assistant": _Control(
         "unsupported",
         neutral=(False,),
-        refusal="a source loads as a target model, not as another model's assistant"),
+        refusal="a source loads as a target model, not as another model's assistant",
+    ),
     "length_penalty": _Control("strategy", neutral=(1.0,), mode="beam"),
     "low_memory": _Control(
-        "unsupported",
-        neutral=(False,),
-        refusal="sequential beam evaluation is not implemented"),
+        "unsupported", neutral=(False,), refusal="sequential beam evaluation is not implemented"
+    ),
     "max_cache_len": _Control("capacity"),
     "max_length": _Control("task"),
     "max_matching_ngram_size": _Control("unsupported", refusal="prompt lookup proposal is not implemented"),
@@ -174,37 +175,35 @@ _CONTROLS = {
     "num_assistant_tokens": _Control("strategy"),
     "num_assistant_tokens_schedule": _Control(
         "unsupported",
-        neutral=('constant',),
-        refusal="only a constant proposal length fits a fixed device block"),
+        neutral=("constant",),
+        refusal="only a constant proposal length fits a fixed device block",
+    ),
     "num_beam_groups": _Control(
-        "unsupported",
-        neutral=(1,),
-        mode="beam",
-        refusal="diverse group beam search is not implemented"),
+        "unsupported", neutral=(1,), mode="beam", refusal="diverse group beam search is not implemented"
+    ),
     "num_beams": _Control("strategy", neutral=(1,)),
     "num_return_sequences": _Control("task"),
     "output_attentions": _Control(
-        "unsupported",
-        neutral=(False,),
-        refusal="generation does not return attentions"),
+        "unsupported", neutral=(False,), refusal="generation does not return attentions"
+    ),
     "output_hidden_states": _Control(
-        "unsupported",
-        neutral=(False,),
-        refusal="generation does not return hidden states"),
+        "unsupported", neutral=(False,), refusal="generation does not return hidden states"
+    ),
     "output_logits": _Control(
-        "unsupported",
-        neutral=(False,),
-        refusal="generation does not return per-step logits"),
+        "unsupported", neutral=(False,), refusal="generation does not return per-step logits"
+    ),
     "output_scores": _Control(
-        "unsupported",
-        neutral=(False,),
-        refusal="generation does not return per-step distributions"),
+        "unsupported", neutral=(False,), refusal="generation does not return per-step distributions"
+    ),
     "pad_token_id": _Control("task"),
     "penalty_alpha": _Control(
         "unsupported",
         neutral=(0.0,),
-        refusal="contrastive search is a decoding strategy that is not implemented"),
-    "prefill_chunk_size": _Control("unsupported", refusal="the native prefill evaluates a prompt in one call"),
+        refusal="contrastive search is a decoding strategy that is not implemented",
+    ),
+    "prefill_chunk_size": _Control(
+        "unsupported", refusal="the native prefill evaluates a prompt in one call"
+    ),
     "prompt_lookup_num_tokens": _Control("unsupported", refusal="prompt lookup proposal is not implemented"),
     "remove_invalid_values": _Control("transform", neutral=(False,)),
     "renormalize_logits": _Control("transform", neutral=(False,)),
@@ -215,13 +214,14 @@ _CONTROLS = {
     "stop_strings": _Control("criterion"),
     "suppress_tokens": _Control("transform"),
     "target_lookbehind": _Control(
-        "unsupported",
-        refusal="translating between two tokenizers' token spaces is not implemented"),
+        "unsupported", refusal="translating between two tokenizers' token spaces is not implemented"
+    ),
     "temperature": _Control("policy", masked_neutral=(1.0,)),
     "token_healing": _Control(
         "unsupported",
         neutral=(False,),
-        refusal="retokenizing the prompt is prompt construction, not decoding"),
+        refusal="retokenizing the prompt is prompt construction, not decoding",
+    ),
     "tokenizer_name": _Control("metadata"),
     "top_h": _Control("transform", mode="sampling"),
     "top_k": _Control("policy", masked_neutral=(0,)),
@@ -231,7 +231,9 @@ _CONTROLS = {
     "use_cache": _Control(
         "unsupported",
         neutral=(True,),
-        refusal="native decoding always runs through its own cache", masked_neutral=(False,)),
+        refusal="native decoding always runs through its own cache",
+        masked_neutral=(False,),
+    ),
     "use_mtp": _Control("strategy", neutral=(False,)),
     "watermarking_config": _Control("transform", refusal="no watermarking transform is implemented"),
 }
@@ -416,13 +418,17 @@ def _source_transforms(config: Mapping[str, object], generation_config: Mapping[
     if (value := read("sequence_bias")) is not None:
         transforms.append(decoding.sequence_bias(_as_bias(value)))
     if (value := read("encoder_repetition_penalty")) is not None:
-        transforms.append(decoding.PromptRepetitionPenalty(records.number(value, "encoder_repetition_penalty")))
+        transforms.append(
+            decoding.PromptRepetitionPenalty(records.number(value, "encoder_repetition_penalty"))
+        )
     if (value := read("repetition_penalty")) is not None:
         transforms.append(decoding.RepetitionPenalty(records.number(value, "repetition_penalty")))
     if (value := read("no_repeat_ngram_size")) is not None:
         transforms.append(decoding.NoRepeatNGram(records.integer(value, "no_repeat_ngram_size")))
     if (value := read("encoder_no_repeat_ngram_size")) is not None:
-        transforms.append(decoding.PromptNoRepeatNGram(records.integer(value, "encoder_no_repeat_ngram_size")))
+        transforms.append(
+            decoding.PromptNoRepeatNGram(records.integer(value, "encoder_no_repeat_ngram_size"))
+        )
     if (value := read("bad_words_ids")) is not None:
         transforms.append(decoding.bad_words(_as_words(value), sampling.eos_id))
     if (value := read("min_length")) is not None and eos.size:
@@ -455,24 +461,33 @@ def _source_transforms(config: Mapping[str, object], generation_config: Mapping[
     if not do_sample:
         transforms.append(decoding.Greedy())
     else:
-        if sampling.temperature != 1.0:
-            transforms.append(decoding.Temperature(sampling.temperature))
-        if (value := read("top_h")) is not None:
-            transforms.append(decoding.TopH(records.number(value, "top_h")))
-        if sampling.top_k is not None:
-            transforms.append(decoding.TopK(sampling.top_k))
-        if sampling.top_p < 1.0:
-            transforms.append(decoding.TopP(sampling.top_p))
-        if sampling.min_p > 0.0:
-            transforms.append(decoding.MinP(sampling.min_p))
-        if (value := read("typical_p")) is not None:
-            transforms.append(decoding.Typical(records.number(value, "typical_p")))
-        if (value := read("epsilon_cutoff")) is not None:
-            transforms.append(decoding.EpsilonCutoff(records.number(value, "epsilon_cutoff")))
-        if (value := read("eta_cutoff")) is not None:
-            transforms.append(decoding.EtaCutoff(records.number(value, "eta_cutoff")))
+        transforms.extend(_source_warpers(config, generation_config, sampling))
     if read("renormalize_logits") is not None:
         transforms.append(decoding.Renormalize())
+    return tuple(transforms)
+
+
+def _source_warpers(config: Mapping[str, object], generation_config: Mapping[str, object],
+                    sampling: Sampling) -> tuple[decoding.LogitsTransform, ...]:
+    """The sampling-only tail, in the reference's warper order."""
+    read = functools.partial(_active, config, generation_config)
+    transforms: list[decoding.LogitsTransform] = []
+    if sampling.temperature != 1.0:
+        transforms.append(decoding.Temperature(sampling.temperature))
+    if (value := read("top_h")) is not None:
+        transforms.append(decoding.TopH(records.number(value, "top_h")))
+    if sampling.top_k is not None:
+        transforms.append(decoding.TopK(sampling.top_k))
+    if sampling.top_p < 1.0:
+        transforms.append(decoding.TopP(sampling.top_p))
+    if sampling.min_p > 0.0:
+        transforms.append(decoding.MinP(sampling.min_p))
+    if (value := read("typical_p")) is not None:
+        transforms.append(decoding.Typical(records.number(value, "typical_p")))
+    if (value := read("epsilon_cutoff")) is not None:
+        transforms.append(decoding.EpsilonCutoff(records.number(value, "epsilon_cutoff")))
+    if (value := read("eta_cutoff")) is not None:
+        transforms.append(decoding.EtaCutoff(records.number(value, "eta_cutoff")))
     return tuple(transforms)
 
 
@@ -512,10 +527,14 @@ def _source_strategy(config: Mapping[str, object], generation_config: Mapping[st
             early = Beam.early_stopping
         if early not in (True, False, "never"):
             raise ValueError("early_stopping is True, False or 'never'")
-        return Beam(width=width,
-                    length_penalty=Beam.length_penalty if penalty is None else records.number(penalty, "length_penalty"),
-                    early_stopping=early is True if isinstance(early, bool) else "never",
-                    stop_ids=len(eos_ids(config, generation_config)))
+        return Beam(
+            width=width,
+            length_penalty=Beam.length_penalty
+            if penalty is None
+            else records.number(penalty, "length_penalty"),
+            early_stopping=early is True if isinstance(early, bool) else "never",
+            stop_ids=len(eos_ids(config, generation_config)),
+        )
     if not speculating:
         return None
     decoder = _decoder(model)
@@ -562,6 +581,9 @@ def source_decoding(config: Mapping[str, object], generation_config: Mapping[str
     criteria = _source_stopping(config, generation_config, processor,
                                 None if decoder is None else decoder.vocab_size)
     policy = override if override is not None else _source_sampling(config, generation_config, do_sample)
-    transforms = (None if override is not None else
-                  _source_transforms(config, generation_config, policy, do_sample, isinstance(strategy, Beam)))
+    transforms = (
+        None
+        if override is not None
+        else _source_transforms(config, generation_config, policy, do_sample, isinstance(strategy, Beam))
+    )
     return policy, transforms, criteria, strategy

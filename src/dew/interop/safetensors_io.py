@@ -15,9 +15,8 @@ import os
 import re
 import secrets
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Callable, Collection, Iterator, Mapping
 from pathlib import Path
-from typing import Callable, Collection, Mapping
 
 import jax
 import ml_dtypes
@@ -111,7 +110,9 @@ def _publish(
     try:
         os.close(descriptor)
         backend.save_file(
-            {name: _host_array(array) for name, array in tensors().items()}, temporary, metadata=None if metadata is None else dict(metadata)
+            {name: _host_array(array) for name, array in tensors().items()},
+            temporary,
+            metadata=None if metadata is None else dict(metadata),
         )
         os.replace(temporary, destination)
     finally:
@@ -244,7 +245,9 @@ def read_weights(folder) -> dict[str, np.ndarray]:
         values, _ = read_file(folder / shard)
         for name, value in values.items():
             if name in owner:
-                raise ValueError(f"tensor {name!r} is stored in both {owner[name]} and {shard} under {folder}")
+                raise ValueError(
+                    f"tensor {name!r} is stored in both {owner[name]} and {shard} under {folder}"
+                )
             owner[name] = shard
             tensors[name] = value
     return tensors
@@ -331,7 +334,9 @@ _OWN_SHARD = re.compile(r"model-[0-9a-f]{8}-\d{5}-of-\d{5}\.safetensors")
 """The shard names `save_sharded` writes."""
 
 
-def save_sharded(tensors: Mapping[str, np.ndarray], directory, max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
+def save_sharded(
+    tensors: Mapping[str, np.ndarray], directory, max_shard_size: int | str = MAX_SHARD_SIZE
+) -> None:
     """Write `tensors` as `model.safetensors`, or as numbered shards and their
     index when they exceed `max_shard_size`, reading one shard's tensors at a
     time.

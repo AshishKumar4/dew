@@ -394,7 +394,7 @@ This decoder trains on TinyStories, a corpus of short stories in simple English,
 ```bash
 hf download roneneldan/TinyStories TinyStoriesV2-GPT4-valid.txt \
     --repo-type dataset --local-dir data
-python tools/tokenize_text.py --input data/TinyStoriesV2-GPT4-valid.txt \
+dew tokenize --input data/TinyStoriesV2-GPT4-valid.txt \
     --out data/tinystories --tokenizer gpt2
 ```
 
@@ -431,7 +431,7 @@ On one Colab L4 GPU the run takes about three minutes. The training loss falls f
 
 `temperature=0` selects the highest-probability token. GPU reductions are not bitwise repeatable by default, so a second run can continue differently after the first sentence. Validation uses EMA weights, which lag the live parameters during a short run: at step 1,000 their perplexity is 29.3.
 
-`PackedTokens` packs whole documents into the windows instead, with segment IDs and positions; it splits the stream at the EOS ID that `tools/tokenize_text.py --pack` records. `ChatMessages` reads conversations from a parquet file, a JSONL file or a Hub dataset id, renders them with the tokenizer's chat template and tracks token roles. Set `LMObjective(loss_role=Role.ASSISTANT)` to train only on assistant targets. See [language models](docs/concepts/language_models.md) for checkpoint loading and text tokenization.
+`PackedTokens` packs whole documents into the windows instead, with segment IDs and positions; it splits the stream at the EOS ID that `dew tokenize --pack` records. `ChatMessages` reads conversations from a parquet file, a JSONL file or a Hub dataset id, renders them with the tokenizer's chat template and tracks token roles. Set `LMObjective(loss_role=Role.ASSISTANT)` to train only on assistant targets. See [language models](docs/concepts/language_models.md) for checkpoint loading and text tokenization.
 
 ### Supervised fine-tuning
 
@@ -1100,7 +1100,7 @@ byte-level BPE tokenizer committed for the tests, and the corpus is the
 TinyStories file that [Language modeling](#language-modeling) downloads:
 
 ```bash
-python tools/tokenize_text.py \
+dew tokenize \
     --input data/TinyStoriesV2-GPT4-valid.txt \
     --out runs/tokens \
     --tokenizer tests/fixtures/tokenizers/tiny-tools
@@ -1242,7 +1242,7 @@ Use the same script on each host. The example below uses two hosts with two visi
 Prepare byte-token data from your corpus and place it on shared storage:
 
 ```bash
-python tools/tokenize_text.py \
+dew tokenize \
     --input corpus.txt \
     --out /shared/tokens \
     --tokenizer byte \
