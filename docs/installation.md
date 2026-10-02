@@ -78,7 +78,6 @@ The plain install includes Transformers, the Hugging Face Hub client and the ima
 | `eval-harness` | lm-evaluation-harness tasks through `dew.eval.harness.DewLM` |
 | `profile` | The xprof profiler |
 | `quantization` | Qwix, for quantized training and serving (`dew.training.quantization`) |
-| `kernels` | tokamax, whose Pallas-Triton attention 'auto' runs on sm80 and later for heads up to 64 wide (`dew.nn.attention.triton_runs`); install it with `-c constraints.txt` |
 | `test` | The test suite's dependencies and pinned reference libraries |
 
 ```bash
@@ -94,7 +93,7 @@ uv pip install 'dewml[interop,vision] @ git+https://github.com/AshishKumar4/dew'
 
 The `profile` extra installs XProf 2.23.1 or a later release, never 2.23.2. XProf 2.23.2 declares `setuptools<70`, and PyTorch 2.13 and later declare `setuptools>=77.0.3`, so 2.23.2 can't be installed beside the `torch`, `vision`, `diffusers`, `torchax` or `test` extras. Don't upgrade XProf to 2.23.2 by hand in such an environment.
 
-The `kernels` extra needs `-c https://raw.githubusercontent.com/AshishKumar4/dew/main/constraints.txt`: tokamax 0.0.14, its latest release, pins `typeguard==2.13.3`, which tyro excludes, and the constraints name the tokamax commit that dropped it.
+tokamax is not a dependency. With it installed, 'auto' runs its Pallas-Triton attention on sm80 and later for heads up to 64 wide (`dew.nn.attention.triton_runs`). Install it as `uv pip install tokamax -c https://raw.githubusercontent.com/AshishKumar4/dew/main/constraints.txt`: tokamax 0.0.14, its latest release, pins `typeguard==2.13.3`, which tyro excludes, and the constraints name the tokamax commit that dropped it.
 
 ## Development install
 

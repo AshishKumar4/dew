@@ -56,7 +56,7 @@ field, a module's `attention_impl`, and `scaled_dot_product_attention`'s
 dtype, precision and force_fp32_for_softmax. 'xla' and 'cudnn' are
 `jax.nn.dot_product_attention`'s own two. 'triton' is tokamax's Pallas-Triton
 flash kernel (`triton_attention`), which needs tokamax installed
-(`dewml[kernels]`). 'tpu' is the pallas splash kernel, with the older pallas
+(docs/installation.md). 'tpu' is the pallas splash kernel, with the older pallas
 flash kernel behind it for the calls splash's mask descriptor cannot carry.
 'auto', every module's default, resolves per trace (`resolve_implementation`):
 triton where cudnn's kernel runs and `triton_runs`; cudnn where its kernel
@@ -784,13 +784,13 @@ def triton_attention(query, key, value, causal: bool):
     partitioning rule, so on a mesh it runs inside `manual_map` on each
     shard's rows and heads, with the key heads repeated until the tensor
     axes split them as they split the query's. tokamax is not a dependency
-    of Dew (`dewml[kernels]` installs it), so it is imported here.
+    of Dew (docs/installation.md says how to install it), so it is imported here.
     """
     try:
         tokamax = importlib.import_module('tokamax')
     except ImportError as e:
         raise ValueError("attention implementation 'triton' needs tokamax: "
-                         "pip install 'dewml[kernels]'") from e
+                         "uv pip install tokamax -c constraints.txt (docs/installation.md)") from e
 
     def local(query, key, value):
         return tokamax.dot_product_attention(query, key, value, is_causal=causal,

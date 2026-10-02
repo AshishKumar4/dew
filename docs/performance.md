@@ -79,7 +79,7 @@ Where Dew loses:
   768-wide SimpleDiT (head dimension 64, 256 tokens) against
   FlashAttention-2's 4.4 in torch, and 8.7 against 7.2 on Qwen3-0.6B (head
   dimension 128, causal, 1024 tokens). With tokamax installed
-  (`dewml[kernels]`), 'auto' runs its Pallas-Triton kernel for heads up to
+  (docs/installation.md), 'auto' runs its Pallas-Triton kernel for heads up to
   64 wide: 4.3 ms on the SimpleDiT, and its step 73.1 to 71.5 ms ("tokamax's
   attention" below).
 - Converts and reductions: 11.0 and 5.6 ms of Qwen3-0.6B's step at 1 x
