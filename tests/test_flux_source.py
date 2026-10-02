@@ -181,7 +181,8 @@ def test_the_guidance_input_follows_the_checkpoints_own_embedder(source):
 def test_the_rotary_table_is_the_sources_own_interleaved_pairs(source):
     """The table Flux rotates with: one angle per adjacent channel pair, laid
     out per axis, over the ids its pipeline writes."""
-    from dew.nn.backbones.flux import apply_rotary, flux_positions, rotary_table
+    from dew.nn.backbones.flux import flux_positions
+    from dew.nn.backbones.joint import apply_rotary, rotary_table
 
     positions = flux_positions(3, 2, 4)
     # The text sits at the origin and each patch carries its row and column.
