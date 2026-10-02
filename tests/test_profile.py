@@ -13,6 +13,7 @@ from threading import Event
 import jax
 import jax.numpy as jnp
 import pytest
+from steady_state import guarded
 
 import dew
 from dew.telemetry.profile import active_profile
@@ -153,7 +154,7 @@ def test_capture_drains_async_arrays_and_effects_without_host_copies(tmp_path, n
     value = jnp.ones((64, 64), jnp.float32)
     compute(value).block_until_ready()
     observed.clear()
-    with jax.transfer_guard_device_to_host("disallow"):
+    with guarded(allow=("host_to_device",)):
         with dew.Profiler(tmp_path):
             pending = compute(value)
     assert pending.is_ready()
@@ -184,7 +185,7 @@ def test_a_capture_drains_past_an_array_a_donation_consumed(tmp_path, native_rep
     stepped = jax.jit(lambda value: value + 1, donate_argnums=0)(consumed)
     assert any(array is consumed for array in jax.live_arrays())
     assert consumed.addressable_shards[1].data.is_deleted()
-    with dew.profile(tmp_path):
+    with dew.Profiler(tmp_path):
         stepped = stepped + 1
     assert stepped.is_ready() and int(stepped) == 2
 
