@@ -916,3 +916,37 @@ def test_saved_bare_encoder_weights_follow_storage_without_changing_compute(tmp_
 
 
 
+
+
+def test_restored_bf16_clip_blank_and_samples_are_the_objectives_bits(tmp_path):
+    """The checkpoint's task and the objective's pipeline encode the empty
+    CLIP prompt with the same eager arithmetic, not a fused one-row JIT.
+    Keep the denoiser float32 and CLIP bf16, as the published hybrid DiT is.
+    """
+    from pathlib import Path
+
+    config = dataclasses.replace(
+        run_config(tmp_path, preset=Flow()),
+        text=TextCondition(encoder="clip_text", checkpoint=str(Path(__file__).parent / "fixtures/clip/tiny"),
+                           dtype="bfloat16"),
+        guidance=CFG(5.0), ema_decay=None)
+    objective = config.build()
+    trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.key(0))
+    state = trainer.initial_state()
+    batch = {"image": np.full((jax.device_count(), RES, RES, 3), 180, np.uint8),
+             **objective.inputs.tokenize(["a bird"] * jax.device_count())}
+    state, *_ = trainer.compile(state, batch)(state, batch)
+    checkpoints = Checkpoints(str(tmp_path))
+    checkpoints.save(1, state, None, artifact=objective.inference_record())
+    checkpoints.wait()
+    original = objective.pipeline(state, ema=False)
+    restored = TextToImage.from_run(str(tmp_path), ema=False)
+
+    prepared = original.prepare(["a bird", "a cat"], key=0, steps=8)
+    assert restored.blank is not None
+    want = objective.blank_conditions(prepared.conditions)
+    got = restored.blank(prepared.conditions)
+    for actual, expected in zip(jax.tree.leaves(got), jax.tree.leaves(want), strict=True):
+        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+    np.testing.assert_array_equal(restored(["a bird", "a cat"], steps=8, key=0).host().images,
+                                  original(["a bird", "a cat"], steps=8, key=0).host().images)
