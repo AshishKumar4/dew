@@ -7,8 +7,8 @@ from dew.sampling import CFG, DPMSolverMultistep, EulerAncestral, Heun, Sampling
 
 
 @cache
-def from_pretrained(repo_id):
-    return TextToImage.from_pretrained(repo_id)
+def from_pretrained(repo_id, *, revision=None):
+    return TextToImage.from_pretrained(repo_id, revision=revision)
 
 
 @cache
