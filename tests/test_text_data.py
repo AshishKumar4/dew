@@ -1099,6 +1099,30 @@ def test_the_packing_bins_are_part_of_the_order_a_position_counts_into():
     assert describe(one) != describe(two)
 
 
+def test_a_window_of_a_long_document_reads_only_its_own_span(tmp_path, monkeypatch):
+    """Each chunk of a document longer than the window read the whole
+    document and kept a slice: a D-token document cost D tokens per chunk,
+    D * ceil(D / window) a pass."""
+    documents = [list(range(1, 40)), [2, 3], list(range(5, 30))]
+    stream = np.concatenate([np.asarray(d + [PACK_EOS], np.int64) for d in documents])
+    _token_dir(tmp_path, train_tokens=0, body=stream, eos_id=PACK_EOS)
+    (tmp_path / "val.bin").write_bytes(stream.astype(np.uint16).tobytes())
+    data = _packed_tokens(tmp_path, seq_len=7, packing_bins=2).load(batch=2)
+
+    spans = []
+    read = TokenBytes.__getitem__
+
+    def recording(self, span):
+        spans.append(span.stop - span.start)
+        return read(self, span)
+
+    monkeypatch.setattr(TokenBytes, "__getitem__", recording)
+    windows = list(itertools.islice(data.train(DataPartition()), 10))
+
+    assert spans and max(spans) <= 8
+    assert all(batch["text"].shape == (2, 8) for batch in windows)
+
+
 def _counted_cross_entropy(batch, seq_len):
     """The objective's ce, and the same number computed by hand.
 

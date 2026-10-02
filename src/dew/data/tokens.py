@@ -399,7 +399,9 @@ class PackedTokens(DatasetSpec):
         # reads the whole file, so rebuilding either per epoch would read a
         # multi-gigabyte train.bin again for a table the run already has.
         def packed(tokens) -> PackedWindows:
-            source = TokenDocumentSource(tokens)
+            # Cut where the packer would, so a chunk of a long document reads
+            # its own span instead of the whole document.
+            source = TokenDocumentSource(tokens, chunk_len=window)
             return PackedWindows(pygrain.MapDataset.source(source), source.lengths, window,
                                  self.packing_bins, describe(source))
 
