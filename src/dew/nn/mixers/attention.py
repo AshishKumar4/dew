@@ -621,8 +621,9 @@ class CausalSelfAttention(nn.Module):
         page_kernel_runs = self.attention_impl in ('auto', 'tpu')
         if jax.default_backend() == 'gpu':
             page_kernel_runs = (self.attention_impl in ('auto', 'cudnn')
-                          and cudnn_runs(query, self.attn_logit_softcap)
-                          and not reference_only(query, self.dtype, self.precision, self.force_fp32_for_softmax))
+                                and cudnn_runs(query, self.attn_logit_softcap)
+                                and not reference_only(query, self.dtype, self.precision,
+                                                       self.force_fp32_for_softmax))
         if append is not None and plain_step and page_kernel_runs and append.store.kernel():
             attention = self._paged(append, query)
         elif plain_step:
