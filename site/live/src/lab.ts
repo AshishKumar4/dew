@@ -104,6 +104,7 @@ export class SnapshotLab extends DurableObject<Env> {
 	async service(kind: string): Promise<unknown> {
 		if (kind !== 'text' && kind !== 'image') throw new Error('kind must be text or image');
 		const process = await this.container.exec(['sh', '-c',
+			'mkdir -p /run/dew; chown model:model /run/dew; chmod 0750 /run/dew; ' +
 			'nohup runuser -u model -- env HF_HOME=/opt/hf HF_HUB_OFFLINE=1 JAX_PLATFORMS=cpu ' +
 			'JAX_COMPILATION_CACHE_DIR=/opt/xla JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS=0 ' +
 			'JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES=-1 JAX_DEBUG_LOG_MODULES=jax._src.compiler ' +
@@ -115,9 +116,10 @@ export class SnapshotLab extends DurableObject<Env> {
 
 	async serviceStatus(): Promise<unknown> {
 		const process = await this.container.exec(['sh', '-c',
-			'tail -c 8000 /run/dew/service.log 2>/dev/null; echo; ps -eo user,pid,rss,args']);
+			'tail -c 8000 /run/dew/service.log 2>/dev/null; echo; ls -ld /run/dew; ' +
+			'ls -l /opt/live/demo.py; ps -eo user,pid,rss,args']);
 		const output = await process.output();
-		const log = new TextDecoder().decode(output.stdout);
+		const log = new TextDecoder().decode(output.stdout) + new TextDecoder().decode(output.stderr);
 		try {
 			const response = await this.container.getTcpPort(8888).fetch('http://container/health');
 			return { status: response.status, health: await response.json(), log };
