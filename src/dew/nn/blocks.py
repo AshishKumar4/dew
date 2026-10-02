@@ -1,7 +1,7 @@
 """The convolutional and embedding pieces the UNets and the DiT sandwich share."""
 
+from collections.abc import Callable
 from functools import partial
-from typing import Callable
 
 import jax
 import jax.numpy as jnp
@@ -169,7 +169,9 @@ def _torch_bicubic_weights(size_in: int, size_out: int, antialias: bool) -> np.n
             center = float(scale) * (i + 0.5)
             low, high = max(int(center - 2 * stretch + 0.5), 0), min(int(center + 2 * stretch + 0.5), size_in)
             x = np.abs((np.arange(low, high) - center + 0.5) / stretch)
-            weights = np.where(x < 1, (1.5 * x - 2.5) * x * x + 1, np.where(x < 2, ((-0.5 * x + 2.5) * x - 4) * x + 2, 0))
+            weights = np.where(
+                x < 1, (1.5 * x - 2.5) * x * x + 1, np.where(x < 2, ((-0.5 * x + 2.5) * x - 4) * x + 2, 0)
+            )
             matrix[i, low:high] = weights / weights.sum()
         return matrix.astype(np.float32)
     a, one = np.float32(-0.75), np.float32(1)
@@ -184,7 +186,9 @@ def _torch_bicubic_weights(size_in: int, size_out: int, antialias: bool) -> np.n
         source = scale * (np.float32(i) + np.float32(0.5)) - np.float32(0.5)
         index = int(np.floor(source))
         t = np.float32(source - np.float32(index))
-        for tap, weight in zip(range(index - 1, index + 3), (far(t + one), near(t), near(one - t), far(2 * one - t)), strict=True):
+        for tap, weight in zip(
+            range(index - 1, index + 3), (far(t + one), near(t), near(one - t), far(2 * one - t)), strict=True
+        ):
             matrix[i, min(max(tap, 0), size_in - 1)] += weight
     return matrix.astype(np.float32)
 

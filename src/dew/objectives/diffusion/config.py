@@ -11,12 +11,11 @@ from __future__ import annotations
 
 import dataclasses
 import os
+from importlib import import_module
 from typing import TYPE_CHECKING, ClassVar, Literal
 
 import numpy as np
 
-import dew.eval  # registers the image metrics
-import dew.nn.backbones  # noqa: F401  registers the models
 from dew.config import ModelConfig, RunConfig
 from dew.data import ImageDataset, OnlineImages, OnlineVideos, OxfordFlowers, VideoDataset
 from dew.diffusion.presets import build_process
@@ -31,6 +30,9 @@ from dew.sampling.guidance import CFG
 from .alignment import REPRESENTATION, Alignment
 from .end_to_end import AUTOENCODER, EndToEnd
 from .objective import DiffusionObjective
+
+import_module("dew.eval")  # registers the image metrics
+import_module("dew.nn.backbones")  # registers the models before the config's unions are built
 
 if TYPE_CHECKING:
     from dew.diffusion.presets import Preset
@@ -291,8 +293,10 @@ class ConsistencyDistillation:
         if scale != SMOOTH_TIME_SCALE:
             raise ValueError(
                 f"sCM differentiates the student in time, and the student starts from a teacher trained at "
-                f"time_scale={scale}, whose time embedding is too fast in it to learn from; train the teacher "
-                f"with time_scale={SMOOTH_TIME_SCALE}, or distill with dmd only (consistency_weight=0)")
+                f"time_scale={scale}, whose time embedding is too fast in it to learn from; "
+                "train the teacher "
+                f"with time_scale={SMOOTH_TIME_SCALE}, or distill with dmd only (consistency_weight=0)"
+            )
 
     def teacher_variables(self, variables: Variables | None) -> Variables:
         """The teacher model's variables: a saved distilled tree's own, else
@@ -303,7 +307,9 @@ class ConsistencyDistillation:
 
         if variables is not None:
             return variables[TEACHER]
-        restored = restore_variables(self.teacher, ema=None, step=None, mesh=None, layout=None, param_dtype=None)
+        restored = restore_variables(
+            self.teacher, ema=None, step=None, mesh=None, layout=None, param_dtype=None
+        )
         return _without_loss_heads({name: tree for name, tree in restored.items()
                                     if name not in ("encoders", "autoencoder")})
 
@@ -331,8 +337,13 @@ class GuidanceDistillation:
 
         from .objective import TEACHER
 
-        held = (variables[TEACHER] if variables is not None else
-                restore_variables(self.teacher, ema=None, step=None, mesh=None, layout=None, param_dtype=None))
+        held = (
+            variables[TEACHER]
+            if variables is not None
+            else restore_variables(
+                self.teacher, ema=None, step=None, mesh=None, layout=None, param_dtype=None
+            )
+        )
         return DiffusionRunConfig.load(self.teacher).build(variables=held), held
 
 
@@ -462,9 +473,11 @@ class DiffusionRunConfig(RunConfig):
                   if getattr(self, name) is not None]
         if self.distill is not None and (others or self.guidance is not None
                                          or not isinstance(self.preset, presets.Flow)):
-            raise ValueError("rCM distills on its own losses under the flow preset and samples unguided: "
-                             f"set guidance None, and leave {others or 'rl, alignment, mean_flow, shortcut, uncertainty'}"
-                             " unset")
+            raise ValueError(
+                "rCM distills on its own losses under the flow preset and samples unguided: "
+                f"set guidance None, and leave {others or 'rl, alignment, mean_flow, shortcut, uncertainty'}"
+                " unset"
+            )
         if (self.mean_flow is not None or self.shortcut is not None) and self.uncertainty is not None:
             raise ValueError("MeanFlow and shortcut models train on their own losses, which read no "
                              "learned uncertainty weighting; leave uncertainty unset")
@@ -638,8 +651,11 @@ class DiffusionRunConfig(RunConfig):
 
             self.distill.check_teacher(self.model.architecture)
 
-            fields = {field.name: getattr(self.distill, field.name) for field in dataclasses.fields(self.distill)
-                      if field.name != "teacher"}
+            fields = {
+                field.name: getattr(self.distill, field.name)
+                for field in dataclasses.fields(self.distill)
+                if field.name != "teacher"
+            }
             return ConsistencyDistillationObjective(
                 model, process, inputs, teacher=self.distill.teacher_variables(variables), **fields,
                 autoencoder=autoencoder, pretrained=variables, ema_decay=self.ema_decay, sampler=self.sampler,

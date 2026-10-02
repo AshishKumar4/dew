@@ -156,7 +156,9 @@ class _Configuration:
         return [self.validation, self.split, [list(entry) for entry in self.metrics]]
 
 
-def _agree_configuration(metrics: Sequence[Metric], batches, split: str, *, loss: bool = False, training: bool = False) -> None:
+def _agree_configuration(
+    metrics: Sequence[Metric], batches, split: str, *, loss: bool = False, training: bool = False
+) -> None:
     """Check this rank's evaluation settings, then agree they match root's.
 
     Ranks that disagree about the split, the metrics or whether there is a
@@ -191,7 +193,9 @@ def _event(key: jax.Array, step: int | jax.Array, schedule_step: int | jax.Array
     evaluation never draws what a training step at the same clock drew.
     """
     step_home, schedule_home, reports = collective_host(
-        (step, step if schedule_step is None else schedule_step, dict(training or {})), phase="evaluation clocks")
+        (step, step if schedule_step is None else schedule_step, dict(training or {})),
+        phase="evaluation clocks",
+    )
 
     def event() -> tuple[int, Step, jax.Array]:
         at = int(step_home)
@@ -256,9 +260,21 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
                     if loss:
                         assert batch is not None
                         loss_batch = batch
-                        loss_variables = context.ema if context.ema is not None and not objective._ema_is_reference else variables
-                        statistics = agreed(f"validation loss batch {scored}", lambda: objective._validation_loss(
-                            loss_variables, loss_batch, replace(context, key=jax.random.fold_in(score_key, scored))))
+                        loss_variables = (
+                            context.ema
+                            if context.ema is not None and not objective._ema_is_reference
+                            else variables
+                        )
+                        statistics = agreed(
+                            f"validation loss batch {scored}",
+                            lambda loss_variables=loss_variables, loss_batch=loss_batch, scored=scored: (
+                                objective._validation_loss(
+                                loss_variables,
+                                loss_batch,
+                                replace(context, key=jax.random.fold_in(score_key, scored)),
+                                )
+                            ),
+                        )
                         statistics = collective_host(statistics, phase=f"validation loss batch {scored}")
                         loss_stats = statistics if loss_stats is None else jax.tree.map(
                             lambda total, value: total + value, loss_stats, statistics)
@@ -331,7 +347,7 @@ def _scored_batch(objective: Objective[Loss, Effects], variables: Variables, bat
     produced, home = collective_host((produced, batch), phase=f"scoring batch {index}")
     artifacts = _artifacts(produced)
     for metric in metrics:
-        def merge() -> None:
+        def merge(metric=metric) -> None:
             if not root:
                 return
             summaries.add(metric, metric(_pick(artifacts, metric.reads), home))
@@ -363,7 +379,7 @@ def _finalized(metrics: Sequence[Metric], summaries: _Accumulators, *,
     """
     scores: dict[str, float] = {}
     for metric in metrics:
-        def finalize() -> None:
+        def finalize(metric=metric) -> None:
             if root:
                 scores[f"{split}/{metric.name}"] = summaries.finalize(metric)
 

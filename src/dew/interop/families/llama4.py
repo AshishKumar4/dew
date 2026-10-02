@@ -70,9 +70,11 @@ def _llama4_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     }
     chunk = hf_config.get('attention_chunk_size')
     kinds: dict[str, KindFields] = {
-        'full_attention': {'mixer': {**rule, 'use_rope': False}},
-        'chunked_attention': {'chunk': None if chunk is None else records.integer(chunk, 'attention_chunk_size'),
-                              'mixer': {**rule, 'use_rope': True}},
+        "full_attention": {"mixer": {**rule, "use_rope": False}},
+        "chunked_attention": {
+            "chunk": None if chunk is None else records.integer(chunk, "attention_chunk_size"),
+            "mixer": {**rule, "use_rope": True},
+        },
     }
     moe_layers = hf_config.get('moe_layers')
     step = records.integer(hf_config.get('interleave_moe_layer_step', 1), 'interleave_moe_layer_step')
@@ -139,13 +141,23 @@ def _llama4_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | N
     `.weight` suffix.
     """
     parts = name.split('.')
-    if len(parts) >= 5 and parts[:2] == ['model', 'layers'] and parts[2].isdigit() and parts[3] == 'feed_forward':
+    if (
+        len(parts) >= 5
+        and parts[:2] == ["model", "layers"]
+        and parts[2].isdigit()
+        and parts[3] == "feed_forward"
+    ):
         layer = ('params', f'layers_{parts[2]}', 'mlp')
         if parts[4:] == ['router', 'weight']:
             return (*layer, 'gate', 'kernel')
         if len(parts) == 6 and parts[4] == 'experts' and parts[5] in _MOE_SHARED:
             return (*layer, 'experts', parts[5], 'kernel')
-        if len(parts) == 7 and parts[4] == 'shared_expert' and parts[5] in _MOE_SHARED and parts[6] == 'weight':
+        if (
+            len(parts) == 7
+            and parts[4] == "shared_expert"
+            and parts[5] in _MOE_SHARED
+            and parts[6] == "weight"
+        ):
             return (*layer, 'shared_experts', parts[5], 'kernel')
         if len(parts) == 6 and parts[4] in _MOE_SHARED and parts[5] == 'weight':
             return (*layer, parts[4], 'kernel')

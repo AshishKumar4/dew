@@ -431,7 +431,9 @@ def _deepseek_v41_constants(directory, record: Mapping[str, object]) -> Mapping[
     if len(lookup) > vocab:
         _refuse('tokenizer', f"it has {len(lookup)} tokens for a vocabulary of {vocab}")
     pad = lookup[_record_int(engram, 'pad_token_id')]
-    return {'engram_hashes': {'token_map': np.concatenate([lookup, np.full(vocab - len(lookup), pad, np.int32)])}}
+    return {
+        "engram_hashes": {"token_map": np.concatenate([lookup, np.full(vocab - len(lookup), pad, np.int32)])}
+    }
 
 
 # V4.1 is V4's block under CSA2's compressor, which names the family; the

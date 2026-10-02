@@ -56,7 +56,9 @@ class VisionConditioner(nn.Module):
         elif positions is None:
             features = self.tower(flat)
         else:
-            features = self.tower(flat, pixel_position_ids=positions.reshape(batch * images, *positions.shape[2:]))
+            features = self.tower(
+                flat, pixel_position_ids=positions.reshape(batch * images, *positions.shape[2:])
+            )
         projected = self.projector(features)
         return projected.reshape(batch, images * projected.shape[1], projected.shape[-1])
 
@@ -120,13 +122,19 @@ class AudioConditioner(nn.Module):
         if self.soft_tokens is not None:
             if not isinstance(self.audio_projector, Gemma3nProjectorModule) or self.padding_id is None:
                 raise ValueError("fixed audio slots require the Gemma 3n embedder and its padding token")
-            padding = self.audio_projector.embed_hard(jnp.full((1, 1), self.padding_id, jnp.int32)).astype(projected.dtype)
+            padding = self.audio_projector.embed_hard(jnp.full((1, 1), self.padding_id, jnp.int32)).astype(
+                projected.dtype
+            )
             projected = jnp.where(encoding.mask[..., None], projected, padding)
             missing = self.soft_tokens - projected.shape[1]
             if missing < 0:
-                raise ValueError(f"{projected.shape[1]} encoded audio frames exceed the {self.soft_tokens} slots per clip")
+                raise ValueError(
+                    f"{projected.shape[1]} encoded audio frames exceed the {self.soft_tokens} slots per clip"
+                )
             projected = jnp.concatenate(
-                [projected, jnp.broadcast_to(padding, (projected.shape[0], missing, projected.shape[-1]))], axis=1)
+                [projected, jnp.broadcast_to(padding, (projected.shape[0], missing, projected.shape[-1]))],
+                axis=1,
+            )
         return projected.reshape(batch, clips * projected.shape[1], projected.shape[-1])
 
     def initialize_parameters(self) -> None:
@@ -234,7 +242,9 @@ class MultimodalTransformer(nn.Module):
             # Placeholder ids feed the per-layer inputs; the hard vocabulary
             # ranges above the per-layer table read the embedders instead, on
             # every call because sampling can emit them.
-            decoder_tokens = jnp.where((tokens >= 0) & (tokens < self.language_model.per_layer_vocab), tokens, 0)
+            decoder_tokens = jnp.where(
+                (tokens >= 0) & (tokens < self.language_model.per_layer_vocab), tokens, 0
+            )
         else:
             decoder_tokens = jnp.where(media, 0, tokens)
         embeddings = self.language_model.scaled_embeddings(
@@ -274,7 +284,9 @@ class MultimodalTransformer(nn.Module):
 
     def mtp_logits(self, hidden, tokens, **kwargs):
         """The shared language head over each media-aware prediction depth."""
-        return [self.language_model._logits(state) for state in self.mtp_hidden_states(hidden, tokens, **kwargs)]
+        return [
+            self.language_model._logits(state) for state in self.mtp_hidden_states(hidden, tokens, **kwargs)
+        ]
 
     def mtp_step(self, hidden, tokens, *, image_indices=None, conditioning=None,
                  input_embeddings=None, **kwargs):

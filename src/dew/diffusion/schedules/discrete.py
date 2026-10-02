@@ -30,7 +30,9 @@ class DiscreteNoiseScheduler(NoiseScheduler):
         self.sqrt_one_minus_alpha_cumprod = jnp.asarray(np.sqrt(1 - alpha_cumprod), jnp.float32)
         noise_variance = 1 - alpha_cumprod
         # This form of (k + SNR)^-gamma also preserves the zero-noise limit.
-        weights = (noise_variance / (p2_loss_weight_k * noise_variance + alpha_cumprod)) ** p2_loss_weight_gamma
+        weights = (
+            noise_variance / (p2_loss_weight_k * noise_variance + alpha_cumprod)
+        ) ** p2_loss_weight_gamma
         self.p2_loss_weights = jnp.asarray(weights, jnp.float32)
 
     def index(self, t) -> jax.Array:
