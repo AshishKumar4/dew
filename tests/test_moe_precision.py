@@ -477,7 +477,7 @@ def test_both_dispatches_carry_the_same_tangents(activation):
     for dispatch in ('global', 'exchange'):
         network = model.clone(dispatch=dispatch)
 
-        def run(parameters, x, weights, dp, dx, dw, choices):
+        def run(parameters, x, weights, dp, dx, dw, choices, *, network=network):
             return jax.jvp(lambda parameters, x, weights, network=network: jnp.asarray(
                 network.apply(parameters, x, weights, choices)), (parameters, x, weights), (dp, dx, dw))
 

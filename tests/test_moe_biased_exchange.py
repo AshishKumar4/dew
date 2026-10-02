@@ -327,7 +327,7 @@ def test_biased_router_and_bias_parameters_keep_forward_mode(dtype, skewed):
         for dispatch in ('global', 'exchange'):
             layer = model.clone(dispatch=dispatch)
 
-            def run(parameters, x, direction, input_direction):
+            def run(parameters, x, direction, input_direction, *, layer=layer):
                 def forward(parameters, x, *, layer=layer):
                     return jnp.asarray(layer.apply({'params': parameters}, x))
                 return jax.jvp(forward, (parameters, x), (direction, input_direction))

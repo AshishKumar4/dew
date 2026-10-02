@@ -301,7 +301,7 @@ def test_record_metrics_and_keep_predicate_accept_unhashable_metric_objects(tmp_
     for entry in retained:
         assert entry.metrics[metric] == entry.metrics['val/value']
     class WithCe(Overfit):
-        shown = {'ce': Shown(better='lower')}
+        shown: ClassVar = {'ce': Shown(better='lower')}
     objective = WithCe()
     assert 'ce' in dir(objective.scalars)
     assert objective.scalars.ce.owner is objective

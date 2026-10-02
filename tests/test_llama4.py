@@ -29,7 +29,7 @@ def fixture(name: str) -> dict:
         return {key: np.asarray(value) for key, value in data.items()}
 
 
-def attention(**overrides: Any) -> Llama4Attention:
+def attention(**overrides) -> Llama4Attention:
     settings: dict[str, Any] = {
         "emb_features": HIDDEN, "num_heads": HEADS, "num_kv_heads": KV_HEADS,
         "head_dim": HEAD_DIM, "max_seq_len": 32, "rope_theta": 500000.0,
