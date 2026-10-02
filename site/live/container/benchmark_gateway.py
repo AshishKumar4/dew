@@ -52,7 +52,7 @@ def main():
                 print('KERNEL_STATUS',request('/api/kernels/'+model['id']),flush=True)
                 for proc in pathlib.Path('/proc').glob('[0-9]*'):
                     try:
-                        text=(proc/'status').read_text()
+                        text=(proc/'status').read_text()+ '\ncmd='+ (proc/'cmdline').read_bytes().replace(b'\0',b' ').decode(errors='replace')
                         if '6100' in text or '6101' in text:
                             print('PROCESS_STATUS',text[:1600],flush=True)
                     except OSError:
