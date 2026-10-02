@@ -17,7 +17,7 @@ from dew.config import JsonDict, ModelConfig, OptimConfig, RunConfig
 from dew.data import ImageDataset, VideoDataset
 from dew.inputs import Field
 from dew.objectives.jepa import JepaObjective, KnnProbe, LinearProbe, MultiBlockMask
-from dew.registry import datasets, models
+from dew.registry import datasets
 from dew.training import TrainState, prepare_process, run_timestamp
 
 DEFAULT_ENCODER_CONFIG = {"precision": "default"}
@@ -75,8 +75,7 @@ def sample_field(config: JepaRunConfig) -> Field:
 
 def build_encoder(config: JepaRunConfig):
     """The encoder, and the fields the registry built it from."""
-    fields = config.model.fields()
-    return models.build(config.model.architecture, **fields), fields
+    return config.model.build(), config.model.fields()
 
 
 def build_predictor(config: JepaRunConfig, encoder_fields: Mapping[str, object], encoder, grid,
@@ -89,9 +88,9 @@ def build_predictor(config: JepaRunConfig, encoder_fields: Mapping[str, object],
         "factorized": is_video,
         "scan_order": encoder.scan_order,
     }
-    fields = ModelConfig('jepa_predictor', fields, dtype=config.model.dtype,
-                         attention_impl=config.model.attention_impl).fields()
-    return models.build('jepa_predictor', **fields), fields
+    record = ModelConfig('jepa_predictor', fields, dtype=config.model.dtype,
+                         attention_impl=config.model.attention_impl)
+    return record.build(), record.fields()
 
 
 def run_summary(config: JepaRunConfig, encoder_fields: Mapping[str, object]) -> dict:

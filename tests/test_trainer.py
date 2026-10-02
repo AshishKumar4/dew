@@ -47,8 +47,8 @@ from dew.training import (
     display,
     ema_update,
     trainer as trainer_module,
-    write_back,
 )
+from dew.training.transaction import write_back
 
 BATCH = 8
 FEATURES = 3
