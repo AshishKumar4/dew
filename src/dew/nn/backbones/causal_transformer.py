@@ -1572,13 +1572,12 @@ class CausalTransformer(nn.Module):
 
     def __call__(self, tokens, train: bool = False, decode: bool = False,
                  positions=None, segment_ids=None,
-                 input_embeddings=None, embedding_positions=None,
+                 input_embeddings=None,
                  attention_mask=None, image_groups=None, rotary_positions=None,
                  attention_pairwise_mask=None, attention_key_positions=None):
         x, prediction = self.hidden_and_mtp_inputs(
             tokens, train=train, decode=decode, positions=positions, segment_ids=segment_ids,
-            input_embeddings=input_embeddings, embedding_positions=embedding_positions,
-            attention_mask=attention_mask, image_groups=image_groups,
+            input_embeddings=input_embeddings, attention_mask=attention_mask, image_groups=image_groups,
             rotary_positions=rotary_positions, attention_pairwise_mask=attention_pairwise_mask,
             attention_key_positions=attention_key_positions)
         if self.is_initializing() and self.dspark is not None:
@@ -1590,7 +1589,7 @@ class CausalTransformer(nn.Module):
             # business: a plain init holds every depth.
             self.mtp_hidden_states(prediction, tokens, train=train, positions=positions,
                                    segment_ids=segment_ids, input_embeddings=input_embeddings,
-                                   embedding_positions=embedding_positions, attention_mask=attention_mask,
+                                   attention_mask=attention_mask,
                                    image_groups=image_groups, rotary_positions=rotary_positions)
         return self._logits(x)
 
@@ -1633,7 +1632,7 @@ class CausalTransformer(nn.Module):
 
     def mtp_hidden_states(self, hidden, tokens, train: bool = False,
                           positions=None, segment_ids=None, input_embeddings=None,
-                          embedding_positions=None, attention_mask=None,
+                          attention_mask=None,
                           image_groups=None, rotary_positions=None):
         """One final-normed state array per shifted prediction depth.
 
@@ -1644,8 +1643,7 @@ class CausalTransformer(nn.Module):
         """
         if self.mtp and tokens.shape[1] <= len(self.mtp):
             raise ValueError("prediction depths need a sequence longer than their depth count")
-        embeds = self._scatter_inputs(self.token_embeddings(tokens), tokens,
-                                      input_embeddings, embedding_positions)
+        embeds = self._prepared(self.token_embeddings(tokens), input_embeddings)
         # A depth restricts its keys only where the caller's validity or a
         # document boundary does. With neither, every shifted pair is real,
         # and no validity says that: an all-true array would make the depth
@@ -1673,13 +1671,13 @@ class CausalTransformer(nn.Module):
         return states
 
     def mtp_logits(self, hidden, tokens, train: bool = False, positions=None,
-                   segment_ids=None, input_embeddings=None, embedding_positions=None,
+                   segment_ids=None, input_embeddings=None,
                    attention_mask=None, image_groups=None, rotary_positions=None):
         """The shared language head over each prediction depth's hidden states."""
         return [self._logits(state) for state in self.mtp_hidden_states(
             hidden, tokens, train=train, positions=positions, segment_ids=segment_ids,
-            input_embeddings=input_embeddings, embedding_positions=embedding_positions,
-            attention_mask=attention_mask, image_groups=image_groups, rotary_positions=rotary_positions)]
+            input_embeddings=input_embeddings, attention_mask=attention_mask, image_groups=image_groups,
+            rotary_positions=rotary_positions)]
 
     def mtp_step(self, hidden, tokens, *, depth: int = 0, positions=None,
                  input_embeddings=None, attention_mask=None, rotary_positions=None,
@@ -1789,7 +1787,7 @@ class CausalTransformer(nn.Module):
 
     def hidden_and_mtp_inputs(self, tokens, train: bool = False, decode: bool = False,
                               positions=None, segment_ids=None,
-                              input_embeddings=None, embedding_positions=None,
+                              input_embeddings=None,
                               attention_mask=None, image_groups=None, rotary_positions=None,
                               attention_pairwise_mask=None, attention_key_positions=None,
                               routed_experts=None, routed=None, media_mask=None):
@@ -1800,8 +1798,9 @@ class CausalTransformer(nn.Module):
         final normalized states. Packed `positions` and `segment_ids` reach the
         layers.
 
-        `input_embeddings` with their `embedding_positions` (both or neither)
-        replace the scaled token embeddings, for a caller fusing another encoder.
+        `input_embeddings` `[B, S, D]` replace the scaled token embeddings, for
+        a caller fusing another encoder; the token ids still feed per-layer
+        inputs and routing.
         `attention_pairwise_mask` is an explicit [B, queries, keys] visibility mask
         for ordinary attention, with optional `attention_key_positions` [B, keys]
         for local windows; both are call-local cached-read metadata.
@@ -1817,8 +1816,8 @@ class CausalTransformer(nn.Module):
         # The stack's entry and exit sit where the batch does, so neither the
         # lookup nor the head is computed whole on the shards of an axis that
         # splits the rows or the positions.
-        x = constrain(self._scatter_inputs(self.scaled_embeddings(self.token_embeddings(tokens)), tokens,
-                                           input_embeddings, embedding_positions), RESIDUAL)
+        x = constrain(self._prepared(self.scaled_embeddings(self.token_embeddings(tokens)),
+                                     input_embeddings), RESIDUAL)
         if self.position_embedding == 'learned':
             places = positions
             if places is None:
@@ -1835,8 +1834,7 @@ class CausalTransformer(nn.Module):
         # replacements in place, which token ids cannot rebuild. Sowing costs
         # nothing unless a caller opens the collection; init leaves it out.
         if not self.is_initializing():
-            prepared = self._scatter_inputs(self.token_embeddings(tokens), tokens,
-                                            input_embeddings, embedding_positions)
+            prepared = self._prepared(self.token_embeddings(tokens), input_embeddings)
             self.sow("embeddings", "prepared", prepared,
                      reduce_fn=lambda _, value: value, init_fn=lambda: prepared)
         ple = self._layer_inputs(tokens, x, routed_experts, routed)
@@ -2252,37 +2250,16 @@ class CausalTransformer(nn.Module):
             context.reshape(*inputs_embeds.shape[:-1], self.num_layers, ple))
         return (context + table) * jnp.asarray(2.0 ** -0.5, context.dtype)
 
-    def _scatter_inputs(self, x, tokens, input_embeddings, embedding_positions):
-        """`x` with the fused encoder outputs written at their token positions.
-
-        Both arguments or neither; the shapes are `[B, N, D]` and `[B, N]`
-        against the `[B, S, D]` embeddings, the positions are integers within
-        the sequence, and the values are already in the decoder's scaled
-        space, so they land as they arrive, cast to the stream dtype.
-        """
-        if (input_embeddings is None) != (embedding_positions is None):
-            raise ValueError(
-                "input_embeddings and embedding_positions arrive together: one "
-                "without the other names no replacement")
+    @staticmethod
+    def _prepared(x, input_embeddings):
+        """`x`, or in its place a caller's prepared `[B, S, D]` embeddings
+        (another encoder's outputs fused in), cast to the stream dtype."""
         if input_embeddings is None:
             return x
-        replacements = jnp.asarray(input_embeddings)
-        where = jnp.asarray(embedding_positions)
-        batch, length = tokens.shape
-        if (replacements.ndim != 3 or where.ndim != 2
-                or replacements.shape[0] != batch
-                or where.shape != (batch, replacements.shape[1])
-                or replacements.shape[2] != self.emb_features):
-            raise ValueError(
-                f"input_embeddings is [B, N, D] and embedding_positions [B, N] "
-                f"for [{batch}, {length}, {self.emb_features}] embeddings, got "
-                f"{replacements.shape} and {where.shape}")
-        if not jnp.issubdtype(where.dtype, jnp.integer):
-            raise ValueError(
-                "embedding_positions holds token positions, so an integer "
-                f"dtype, got {where.dtype}")
-        rows = jnp.arange(batch)[:, None]
-        return x.at[rows, where].set(replacements.astype(x.dtype))
+        prepared = jnp.asarray(input_embeddings)
+        if prepared.shape != x.shape:
+            raise ValueError(f"input_embeddings are the whole {x.shape} sequence, got {prepared.shape}")
+        return prepared.astype(x.dtype)
 
     def head_weight(self, params):
         """The `[D, vocab]` head matrix in its stored dtype, as the forward
