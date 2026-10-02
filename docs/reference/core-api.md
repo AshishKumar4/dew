@@ -120,9 +120,13 @@ Import `Dataset`, `DataPartition` and `Loading` from `dew.data`.
 
 ```text
 Dataset(train, val, records, batch, ramp=None)
+Dataset.from_records(records, *, batch, seed=0, validation=None, loading=Loading())
+Dataset.from_grain(train, *, batch, validation=None, records=None, loading=Loading())
 DataPartition(index=0, count=1, readers=1, reader=0)
-Loading(workers=32, threads=64, read_buffer=128, worker_buffer=2)
+Loading(workers=0, threads=64, read_buffer=128, worker_buffer=2)
 ```
+
+`from_records` reads records held in memory: a mapping of equal-length columns, a sequence of per-record mappings, or a source with `__len__` and `__getitem__`. Its training stream reshuffles from `seed` every epoch and saves a global record position; `validation` is one ordered pass of whole batches, and fewer records than one batch are refused. `from_grain` reads a Grain pipeline the caller built, in the caller's order.
 
 `train(partition)` opens a training iterator, and `val(partition)` opens one finite validation pass, or `val` is `None`. Each reads the share of every global batch the `DataPartition` names: the `index`th of `count` disjoint shares, which `readers` processes read alike; `reader` is which of them this process is. `dew.training.data_partition(mesh)` is the share a process reads on a mesh, and `DataPartition()` is every row. `records` is the known training-record count or `None`; `batch` is global. `steps_per_epoch` is integer division of records by batch, or `None`. `epoch_steps(epochs=1)` requires a finite record count. `ramp` is set when the run grows its batch over its first records; `batch` is then the batch the ramp ends at.
 
@@ -134,7 +138,7 @@ The prefetch worker performs iteration, checkpoint operations, and final source 
 
 Grain limits how cleanly Dew can shut a loader down. The installed `DataLoaderIterator` exposes no public close, so Dew releases its owned references without reaching into private iterators or changing the sampling pipeline. Local-record probes release the source and child processes, but that is not a deterministic upstream shutdown contract. Grain also keeps a process-wide shared-memory deletion thread pool. Its `DatasetIterator.close()` is called on the iteration thread, but read-executor shutdown does not wait for already-running record reads. Arbitrary blocked upstream reads remain outside Dew's shutdown guarantee.
 
-`Loading` controls Grain concurrency and buffers for built-in specifications. Use zero worker processes for small local examples; the defaults may be excessive for a tiny dataset. See [data preparation](../concepts/data.md) for field layouts and process partitioning.
+`Loading` controls Grain concurrency and buffers for built-in specifications. The default starts no worker processes and reads with threads of the training process, Grain's own default; raise `workers` once a measured input pipeline is the bottleneck. See [data preparation](../concepts/data.md) for field layouts and process partitioning.
 
 Every dataset specification declares `seed` and `loading` as keyword-only fields of `DatasetSpec`, and `spec.load(batch=, tokenize=None)` is the call on all of them; a specification that writes no captions raises `TypeError` for a `tokenize` reader it cannot use.
 

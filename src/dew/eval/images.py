@@ -21,7 +21,7 @@ import numpy as np
 from jax.typing import ArrayLike
 
 from dew.artifacts import ImageGrid, uint8_pixels
-from dew.objectives.base import Batch
+from dew.objectives.base import Batch, Shown
 from dew.registry import metrics
 
 from .common import ImageMetric, metric_device
@@ -128,12 +128,19 @@ def clip(modelname: str = DEFAULT_MODEL, field: str = "text") -> ImageMetric:
 
 
 @metrics("clip_score")
+class CLIPScore(ImageMetric):
+    """Mean CLIPScore of the sampled images and the validation batch's prompts."""
+    shown = Shown(better='higher')
+
+    def __init__(self, modelname: str = DEFAULT_MODEL, field: str = 'text'):
+        def measure(artifact, batch):
+            return 100.0 * jnp.maximum(_artifact_cosine(artifact, batch, field, modelname), 0.0)
+        super().__init__(name='clip_score', measure=measure)
+
+
 def clip_score_metric(modelname: str = DEFAULT_MODEL, field: str = "text") -> ImageMetric:
     """Score standard CLIPScore over a validation pass, the same number `clip_score`
     reports for the images and prompts the pass consumed.
     """
 
-    def measure(artifact, batch):
-        return 100.0 * jnp.maximum(_artifact_cosine(artifact, batch, field, modelname), 0.0)
-
-    return ImageMetric(name="clip_score", measure=measure)
+    return CLIPScore(modelname, field)
