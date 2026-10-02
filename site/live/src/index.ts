@@ -57,7 +57,7 @@ async function labRequest(request: Request, env: Env, cors: HeadersInit): Promis
 	if (env.TURNSTILE_TEST_KEYS !== 'accept' || await verify(env.SESSION_SECRET, bearer, Date.now()) !== LAB_CAPABILITY) {
 		return reply({ error: 'forbidden' }, 403, cors);
 	}
-	const body = await request.json<{ operation?: string; commit?: string; kind?: string }>().catch(() => ({ operation: undefined, commit: undefined, kind: undefined }));
+	const body = await request.json<{ operation?: string; commit?: string; kind?: string; count?: number }>().catch(() => ({ operation: undefined, commit: undefined, kind: undefined, count: undefined }));
 	const lab = env.SNAPSHOT_LAB.get(env.SNAPSHOT_LAB.idFromName('snapshot-study'));
 	try {
 		switch (body.operation) {
@@ -66,6 +66,7 @@ async function labRequest(request: Request, env: Env, cors: HeadersInit): Promis
 			case 'boundary': return reply(await lab.boundary(body.commit ?? ''), 200, cors);
 			case 'service': return reply(await lab.service(body.kind ?? '', body.commit), 200, cors);
 			case 'service-status': return reply(await lab.serviceStatus(), 200, cors);
+			case 'measure': return reply(await lab.measure(body.count ?? 1), 200, cors);
 			case 'start': return reply(await lab.start(false), 200, cors);
 			case 'restore': return reply(await lab.start(true), 200, cors);
 			case 'prepare': return reply(await lab.prepare(body.commit ?? ''), 202, cors);

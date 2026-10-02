@@ -135,6 +135,20 @@ export class SnapshotLab extends DurableObject<Env> {
 		}
 	}
 
+	async measure(count: number): Promise<unknown> {
+		if (![1, 10, 50].includes(count)) throw new Error('count must be 1, 10 or 50');
+		const port = this.container.getTcpPort(8888);
+		const started = Date.now();
+		const rows = await Promise.all(Array.from({ length: count }, async () => {
+			const begin = Date.now();
+			const response = await port.fetch('http://container/generate', { method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ prompt: 'The capital of France is', key: 0, tokens: 24 }) });
+			return { status: response.status, seconds: (Date.now() - begin) / 1000, result: await response.json() };
+		}));
+		return { count, totalSeconds: (Date.now() - started) / 1000, rows };
+	}
+
 	async snapshot(): Promise<unknown> {
 		await this.status();
 		const state = await this.ctx.storage.get<{ stage?: string }>('state');
