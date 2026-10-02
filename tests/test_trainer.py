@@ -587,10 +587,13 @@ def test_a_resumed_run_that_cannot_fit_its_checkpoints_rung_climbs_and_says_so(t
 
 
 @pytest.mark.skipif(jax.default_backend() != "gpu", reason="CUDA embedding-gradient reductions")
-def test_a_cuda_lm_repeats_and_resumes_bit_exactly_with_deterministic_ops(tmp_path):
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+def test_a_cuda_lm_repeats_and_resumes_bit_exactly_with_deterministic_ops(tmp_path, dtype):
     """Repeated token IDs share embedding-gradient updates. CUDA's default
     scatter-add order is not repeatable; conftest enables deterministic ops
-    before the backend opens. Check every state leaf, not just parameters."""
+    before the backend opens. Check every state leaf, not just parameters.
+    bf16 at the default precision runs the head that rounds its logits and
+    their gradient to bf16, and resumes bit-exactly too."""
     from dew.data import Loading, TokenWindows
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import LMObjective
@@ -605,7 +608,7 @@ def test_a_cuda_lm_repeats_and_resumes_bit_exactly_with_deterministic_ops(tmp_pa
     data = TokenWindows(path=str(tmp_path), seq_len=16,
                         loading=Loading(workers=0)).load(batch=8)
     model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1,
-                              num_heads=2, mlp_features=32, max_seq_len=32)
+                              num_heads=2, mlp_features=32, max_seq_len=32, dtype=dtype)
     objective = LMObjective(model, seq_len=16, ema_decay=None)
 
     def trainer(checkpoints=None):
