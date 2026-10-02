@@ -1478,8 +1478,8 @@ def _pid_of(index):
 
 def test_a_default_loading_reads_in_the_training_process():
     """Grain's default is to read in the process that trains. A default that
-    starts worker processes made a sixteen-record pipeline take 7 GiB and
-    18 s to its first batch, and a script without a __main__ guard re-ran
+    started 32 worker processes took 17.8 s and 7.07 GiB to the first batch
+    of a 100-record pipeline, and a script without a __main__ guard re-ran
     itself in every worker."""
     data = Dataset.from_grain(pygrain.MapDataset.range(16).map(_pid_of), batch=4)
 
