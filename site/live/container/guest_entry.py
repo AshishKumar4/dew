@@ -5,11 +5,9 @@ import sys
 
 from guest_limits import install
 
-if os.environ.get("DEW_GUEST_TRACE") == "1":
-    print("GUEST_ENTRY started",flush=True)
+print("GUEST_ENTRY started",flush=True)
 install()
-if os.environ.get("DEW_GUEST_TRACE") == "1":
-    print("GUEST_ENTRY limits installed",flush=True)
+print("GUEST_ENTRY limits installed",flush=True)
 if os.environ.get("DEW_GUEST_TRACE") == "1":
     import faulthandler
     faulthandler.dump_traceback_later(2, repeat=True)
