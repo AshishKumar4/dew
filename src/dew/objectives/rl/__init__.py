@@ -5,8 +5,6 @@ tests/test_rl_imports.py keeps that arrow one way. `dew.rl` may read `dew`,
 and nothing under `dew` outside these two packages may read `dew.rl`.
 """
 
-from dew.data.preferences import IDS_KEY as PREFERENCE_IDS_KEY, MASK_KEY as PREFERENCE_MASK_KEY
-
 from .episodes import (
                        Action,
                        Environment,
@@ -53,8 +51,6 @@ __all__ = [
                        "ADVANTAGES_KEY",
                        "IDS_KEY",
                        "OLD_LOG_PROBS_KEY",
-                       "PREFERENCE_IDS_KEY",
-                       "PREFERENCE_MASK_KEY",
                        "RESPONSE_MASK_KEY",
                        "REWARDS_KEY",
                        "Action",

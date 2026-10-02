@@ -59,24 +59,12 @@ KL_CLAMP = 10.0
 when asked, so the two agree wherever the estimate stays under 10."""
 
 
-def token_mean(x: jax.Array, mask: jax.Array) -> jax.Array:
-    """Sum over the unmasked positions of `x`, divided by how many there are.
-
-    verl's `agg_loss(loss_agg_mode="token-mean")` and Tunix's
-    `aggregate_loss("token-mean")`. The denominator is the exact token count,
-    without `masked_mean`'s 1e-8. A loss that is 1e-8 off scales the gradient
-    by the same factor, so both references keep the two reductions separate.
-    A batch with no unmasked token divides by zero and surfaces as a nan.
-    """
-    weights = mask.astype(x.dtype)
-    return jnp.sum(jnp.where(weights != 0, x, 0) * weights) / jnp.sum(weights)
-
 
 def token_log_ratio(log_probs: jax.Array, old_log_probs: jax.Array) -> jax.Array:
     """Per-token `log pi(a) - log pi_old(a)`, clamped to +-20.
 
     verl calls this `negative_approx_kl` and negates it for its `ppo_kl`
-    metric, which is `-token_mean(token_log_ratio(...), mask)`. It is fp32,
+    metric, the token mean of its negation under the mask. It is fp32,
     or the log-probabilities' dtype where it is wider (`at_least_fp32`).
     """
     log_probs = jnp.asarray(log_probs)
@@ -226,14 +214,6 @@ def cispo_terms(log_probs: jax.Array, old_log_probs: jax.Array, advantages: jax.
     return terms, aux
 
 
-def clipped_surrogate(log_ratio: jax.Array, advantages: jax.Array, mask: jax.Array,
-                      epsilon_low: float = 0.2, epsilon_high: float = 0.2,
-                      dual_clip: float | None = 3.0) -> tuple[jax.Array, dict[str, jax.Array]]:
-    """Token-mean reduction of the dual-clipped policy terms."""
-    terms, aux = clipped_surrogate_terms(
-        log_ratio, advantages, mask, epsilon_low, epsilon_high, dual_clip)
-    return token_mean(terms, mask), aux
-
 
 def k3_kl(log_probs: jax.Array, ref_log_probs: jax.Array) -> jax.Array:
     """Schulman's k3 estimator of `KL(pi || pi_ref)`, per token.
@@ -245,8 +225,8 @@ def k3_kl(log_probs: jax.Array, ref_log_probs: jax.Array) -> jax.Array:
     second clamp one drifted token contributes `exp(20)` to the penalty and
     dominates the step.
 
-    Aggregate it the way the policy loss is aggregated, `token_mean(kl, mask)`,
-    and add `beta` times that.
+    Aggregate it the way the policy loss is aggregated, over the same token
+    mass, and add `beta` times that.
     """
     log_probs = jnp.asarray(log_probs)
     work = at_least_fp32(log_probs.dtype)
@@ -272,16 +252,6 @@ def preference_logsigmoid_terms(policy_chosen: jax.Array, policy_rejected: jax.A
     terms = -jax.nn.log_sigmoid(beta * (chosen - rejected))
     return terms, (beta * chosen, beta * rejected)
 
-
-def preference_logsigmoid(policy_chosen: jax.Array, policy_rejected: jax.Array,
-                          ref_chosen: jax.Array, ref_rejected: jax.Array,
-                          mask_chosen: jax.Array, mask_rejected: jax.Array,
-                          beta: float) -> jax.Array:
-    """Pair-mean reduction of the DPO sigmoid loss."""
-    terms, _ = preference_logsigmoid_terms(
-        policy_chosen, policy_rejected, ref_chosen, ref_rejected,
-        mask_chosen, mask_rejected, beta)
-    return jnp.mean(terms)
 
 
 def behavior_importance_weights(old_log_probs: jax.Array, behavior_log_probs: jax.Array,
