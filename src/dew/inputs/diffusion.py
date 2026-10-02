@@ -216,7 +216,7 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
             third.append(_prompt(record, "third", text))
             zero.append(bool(record.get("zero", False)))
             negative.append(bool(record.get("negative", False)))
-            guidance.append(self._guidance(record))
+            guidance.append(_row_guidance(record, self.guidance))
         ids = [tokenizer(second if index == 1 else rows, padding="max_length",
                          max_length=tokenizer.model_max_length, truncation=True,
                          return_tensors="np").input_ids
@@ -231,9 +231,6 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
                 max_length=self.t5.tokens, truncation=True, add_special_tokens=True,
                 return_tensors="np").input_ids
         return tokens
-
-    def _guidance(self, record: Mapping[str, object]) -> float:
-        return _row_guidance(record, self.guidance)
 
     def time_ids(self, count, dtype):
         """SDXL's micro-conditioning: the original size, no crop, then the
