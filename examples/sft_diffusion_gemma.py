@@ -1,6 +1,6 @@
 """LoRA SFT of DiffusionGemma on chat data, with the base weights host-streamed.
 
-The adapter is the only thing the optimizer moves, and `Layout(host=("params",))`
+The adapter is the only thing the optimizer moves, and `Layout(host=("variables",))`
 keeps the whole train state on the host between steps, with the scanned stack
 fetching one layer at a time. The 26B-A4B base has not been run through it:
 
@@ -117,7 +117,7 @@ def main(config: Config) -> Path:
     checkpoints = Checkpoints(str(config.out / "checkpoints"), keep=1)
     trainer = Trainer(objective, optax.adamw(config.learning_rate), key=jax.random.key(1),
                       mesh=MeshSpec(fsdp=jax.device_count()),
-                      layout=Layout(host=("params",)), checkpoints=checkpoints)
+                      layout=Layout(host=("variables",)), checkpoints=checkpoints)
     state = trainer.fit(data, steps=config.steps, log_every=1,
                         checkpoint_every=config.steps)
     checkpoints.wait()
