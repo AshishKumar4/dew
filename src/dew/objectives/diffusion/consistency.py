@@ -334,8 +334,8 @@ class ConsistencyDistillationObjective(DiffusionObjective):
                 total = total + consistency_loss(lambda x, t: trig_prediction(network, x, t)[1], x, t,
                                                  teacher_F, ratio, self.consistency_weight)
             if self.dmd_weight > 0:
-                distribution = self._distribution_matching(variables, student_params, given, blank, generate_key,
-                                                           effective, count, samples.shape)
+                distribution = self._distribution_matching(
+                    variables, student_params, given, blank, generate_key, effective, count, samples.shape)
                 total = total + jnp.where(warm, 0.0, distribution)
             return total
 
