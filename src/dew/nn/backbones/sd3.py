@@ -67,12 +67,13 @@ class _Modulation(nn.Module):
 
     features: int
     pieces: int
+    bias: bool = True
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     @nn.compact
     def __call__(self, conditioning):
-        projected = nn.Dense(self.pieces * self.features, dtype=self.dtype,
+        projected = nn.Dense(self.pieces * self.features, use_bias=self.bias, dtype=self.dtype,
                              precision=self.precision, name="linear")(nn.silu(conditioning))
         return jnp.split(projected, self.pieces, axis=-1)
 

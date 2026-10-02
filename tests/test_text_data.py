@@ -200,6 +200,46 @@ def test_token_window_source_length_and_window_contract(tmp_path):
         source[len(source)]
 
 
+@pytest.mark.parametrize("seq_len,stride,tokens", [
+    (4, 1, 5), (4, 1, 6), (4, 1, 13), (4, 2, 13),
+    (4, 3, 13), (4, 4, 13), (4, 6, 13), (8, 3, 22),
+])
+def test_token_window_stride_reads_every_complete_window(tmp_path, seq_len, stride, tokens):
+    body = np.arange(tokens, dtype=np.int32)
+    _token_dir(tmp_path, train_tokens=0, body=body)
+    source = TokenWindowSource(TokenBytes(str(tmp_path / "train.bin")), seq_len, stride=stride)
+    starts = list(range(0, tokens - seq_len, stride))
+    assert len(source) == len(starts)
+    for index, start in enumerate(starts):
+        expected = body[start:start + seq_len + 1]
+        assert source[index]["text"].tobytes() == expected.tobytes()
+        assert source[index]["text"].shape == (seq_len + 1,)
+    with pytest.raises(IndexError):
+        source[len(starts)]
+    with pytest.raises(IndexError):
+        source[-1]
+
+
+@pytest.mark.parametrize("seq_len,tokens", [(1, 7), (4, 13), (8, 37)])
+def test_token_window_default_stride_preserves_records_and_order(tmp_path, seq_len, tokens):
+    body = np.arange(tokens, dtype=np.int32)
+    _token_dir(tmp_path, train_tokens=0, body=body)
+    source = TokenWindowSource(TokenBytes(str(tmp_path / "train.bin")), seq_len)
+    explicit = TokenWindowSource(TokenBytes(str(tmp_path / "train.bin")), seq_len, stride=seq_len)
+    assert len(source) == len(explicit) == (tokens - 1) // seq_len
+    assert repr(source) == repr(explicit)
+    for index in range(len(source)):
+        expected = body[index * seq_len:index * seq_len + seq_len + 1].tobytes()
+        assert source[index]["text"].tobytes() == explicit[index]["text"].tobytes() == expected
+
+
+@pytest.mark.parametrize("stride", [0, -1])
+def test_token_window_stride_refuses_nonpositive_steps(tmp_path, stride):
+    _token_dir(tmp_path, train_tokens=16)
+    with pytest.raises(ValueError, match="stride"):
+        TokenWindowSource(TokenBytes(str(tmp_path / "train.bin")), 4, stride=stride)
+
+
 def test_token_window_source_reads_the_dtype_from_meta(tmp_path):
     seq_len = 4
     tokens = np.arange(1, 3 * seq_len + 1, dtype=np.uint32)
@@ -272,6 +312,79 @@ def test_token_loader_yields_int32_batches_with_one_overlap_token(tmp_path):
 
     val_rows = np.concatenate([b["text"] for b in data.val(DataPartition())])
     assert np.array_equal(val_rows[:-1, -1], val_rows[1:, 0]), "the pass is in order"
+
+
+def test_token_loader_stride_changes_training_windows_only(tmp_path):
+    seq_len, batch = 4, 4
+    _token_dir(tmp_path, train_tokens=17, val_tokens=17, body=np.arange(34))
+    default = _windows(tmp_path, seq_len=seq_len, seed=17).load(batch=batch)
+    positional = TokenWindows(str(tmp_path), seq_len, None, seed=17,
+                              loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1)).load(batch=batch)
+    explicit = _windows(tmp_path, seq_len=seq_len, stride=seq_len, seed=17).load(batch=batch)
+    overlap = _windows(tmp_path, seq_len=seq_len, stride=1, seed=17).load(batch=batch)
+    assert overlap.records == 13 and overlap.steps_per_epoch == 3
+    assert default.records == explicit.records == 4
+    assert default.steps_per_epoch == explicit.steps_per_epoch == 1
+    assert overlap.epoch_steps(3) == 9
+
+    def first_rows(data, steps):
+        stream = data.train(DataPartition())
+        try:
+            return np.concatenate([next(stream)["text"] for _ in range(steps)])
+        finally:
+            stream.close()
+
+    assert first_rows(default, 5).tobytes() == first_rows(explicit, 5).tobytes()
+    assert first_rows(default, 5).tobytes() == first_rows(positional, 5).tobytes()
+    rows = first_rows(overlap, overlap.steps_per_epoch + 1)
+    assert sorted(rows[:overlap.records, 0]) == list(range(17, 30)), "one overlapping epoch"
+    assert rows.tobytes() == first_rows(overlap, overlap.steps_per_epoch + 1).tobytes(), "same seed and order"
+    for data in (default, explicit, overlap):
+        validation = data.val(DataPartition())
+        try:
+            actual = np.concatenate([batch["text"] for batch in validation])
+        finally:
+            validation.close()
+        expected = np.stack([np.arange(start, start + seq_len + 1, dtype=np.int32)
+                             for start in range(0, 16, seq_len)])
+        assert actual.tobytes() == expected.tobytes()
+
+
+def test_token_window_stride_round_trips_and_old_records_keep_the_default(tmp_path):
+    from dew.config import RunConfig
+
+    _token_dir(tmp_path, train_tokens=17, val_tokens=17, body=np.arange(34))
+    recorded = RunConfig(data=_windows(tmp_path, seq_len=4, stride=1)).to_dict()
+    loaded = RunConfig.from_dict(recorded)
+    assert loaded.data.stride == 1
+    assert loaded.data.load(batch=4).records == 13
+    older = RunConfig(data=_windows(tmp_path, seq_len=4)).to_dict()
+    del older["data"]["fields"]["stride"]
+    restored = RunConfig.from_dict(older)
+    assert restored.data.stride is None
+    source = restored.data.load(batch=4)
+    explicit = _windows(tmp_path, seq_len=4, stride=4).load(batch=4)
+    actual, expected = source.train(DataPartition()), explicit.train(DataPartition())
+    try:
+        assert source.records == explicit.records == 4
+        for _ in range(3):
+            assert next(actual)["text"].tobytes() == next(expected)["text"].tobytes()
+    finally:
+        actual.close()
+        expected.close()
+
+
+def test_token_window_resume_refuses_a_changed_stride(tmp_path):
+    _token_dir(tmp_path, train_tokens=33, val_tokens=17, body=np.arange(50))
+    source = _windows(tmp_path, seq_len=4, stride=1).load(batch=4).train(DataPartition())
+    different = _windows(tmp_path, seq_len=4, stride=2).load(batch=4).train(DataPartition())
+    try:
+        next(source)
+        with pytest.raises(ValueError, match="resume the corpus"):
+            different.set_state(source.get_state())
+    finally:
+        source.close()
+        different.close()
 
 
 def test_token_loader_val_is_unshuffled_and_disjoint_from_train(tmp_path):

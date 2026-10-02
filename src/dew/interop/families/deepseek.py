@@ -908,7 +908,8 @@ def _deepseek_v4_path(name: str, config: Mapping[str, object]) -> tuple[str, ...
     return _dew_path(f"model.layers.{parts[2]}{tail}", config)
 
 
-def _deepseek_v4_prepare(tensors: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
+def _deepseek_v4_prepare(tensors: Mapping[str, np.ndarray],
+                          _config: Mapping[str, object] | None = None) -> dict[str, np.ndarray]:
     """Reshape the grouped output projection and the hash table as the tree holds them.
 
     `DeepseekV4GroupedLinear` stores one block per head group in a matrix of

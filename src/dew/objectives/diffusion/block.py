@@ -266,8 +266,6 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
             else:
                 del values["constants"]
             return values
-        if self.model.conditioner is not None:
-            raise ValueError("multimodal SFT initialization requires the complete pretrained variables")
         return self.model.init(key, jnp.zeros((1, self.canvas_size), jnp.int32))
 
     def loss(self, params: Variables, batch: Batch, step: Step):

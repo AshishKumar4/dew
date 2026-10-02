@@ -408,7 +408,11 @@ run that wants the unet flag can pass `--trainer.xla-flags`.
 Two flags stand out for other reasons:
 
 - `--xla_gpu_autotune_level=4` changes nothing on any architecture, because
-  it is already the default in this build.
+  it is already the default in this build. Level 0 turns autotuning off,
+  which removes XLA's compile-time kernel choice as a source of run-to-run
+  differences (see [checkpoints](guides/checkpoints.md)). On the 4080 it
+  slowed the 176M hybrid DiT's step from 139 to 151 ms and a 67M decoder's
+  from 79.8 to 81.5 ms, two fresh processes each.
 - `--xla_gpu_enable_command_buffer=` (command buffers off) is the only
   configuration that is reliably slower: 17.90 against 17.38 on the unet over
   four runs, and slower on the other two as well. Command buffers are on by
@@ -819,7 +823,7 @@ One bf16 `ExpertMLP` layer under `MeshSpec(fsdp=2)` on the NVLink pair (8192 tok
 
 ### Rematerialization: the trainer's ladder
 
-A model's `remat` is where its step starts, and the trainer moves it up one rung whenever the compiled step does not fit its devices' memory (`dew.training.trainer.step_fits`: the step's temporaries and the outputs that do not reuse the donated state, against each device's `bytes_limit` less what the resident state and batch already use; each process reads its own devices and the pool takes the tightest): a decoder from none to `'minimal'` (MaxText's name: every projection output kept) to `'full'`, a diffusion backbone from `False` to `'dots'` (matmul outputs and the attention forward kept) to `'full'`. Each rung is slower and smaller, so the first that fits is the fastest that runs. The rung a step compiled under is the `remat` of the run's `StepCompiled` record and of `tools/benchmark_step.py`'s rows. Forward plus backward plus AdamW, bf16 compute, 10 timed steps, `tools/benchmark_kernels.py step --remat`:
+A model's `remat` is where its step starts, and the trainer moves it up one rung whenever the compiled step does not fit its devices' memory (`dew.training.trainer.step_fits`: XLA places a GPU step's temporaries in one allocation, so they, the outputs that do not reuse the donated state and the batches `fit` prefetches beside the step's own have to fit one free block of each device, not just its free bytes; the block is the BFC pool's largest, or the part of its limit a growing pool has not taken yet, and an allocator that reports no pool, cuda_async or a TPU's, is read by its free bytes; each process reads its own devices and the pool takes the tightest. Where the allocator can leave the temporaries no block to return to once a batch is prefetched beside them, the check holds room for them twice (`strands_temporaries`): cuda_async, and XLA's spatially partitioned pool, which `prepare_process` turns off): a decoder from none to `'minimal'` (MaxText's name: every projection output kept) to `'full'`, a diffusion backbone from `False` to `'dots'` (matmul outputs and the attention forward kept) to `'full'`. Each rung is slower and smaller, so the first that fits is the fastest that runs. A checkpoint records the rung its state trained on, head tile, remat and XLA options, and a resumed run compiles that rung and climbs from it only where it does not fit, saying so: a process that restores a state finds other free memory than the one that built it, and a lighter rung would run another program. The rung a step compiled under is the `remat` of the run's `StepCompiled` record and of `tools/benchmark_step.py`'s rows. Forward plus backward plus AdamW, bf16 compute, 10 timed steps, `tools/benchmark_kernels.py step --remat`:
 
 | device | model, batch x tokens | none | minimal / dots | full |
 |---|---|---|---|---|

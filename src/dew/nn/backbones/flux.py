@@ -104,6 +104,9 @@ class _FluxAttention(nn.Module):
 
     heads: int
     head_dim: int
+    bias: bool = True
+    """Whether every projection carries a bias; FLUX.2's carry none."""
+    epsilon: float = 1e-6
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     attention_impl: str = "auto"  # an AttentionImpl
@@ -112,21 +115,21 @@ class _FluxAttention(nn.Module):
         return x.reshape(x.shape[0], x.shape[1], self.heads, self.head_dim)
 
     def _projection(self, name: str, x):
-        return self._heads(nn.Dense(self.heads * self.head_dim, dtype=self.dtype,
+        return self._heads(nn.Dense(self.heads * self.head_dim, use_bias=self.bias, dtype=self.dtype,
                                     precision=self.precision, name=name)(x))
 
     @nn.compact
     def __call__(self, image, context, cos, sin):
         inner = self.heads * self.head_dim
-        query = RMSNorm(epsilon=1e-6, dtype=self.dtype, name="norm_q")(
+        query = RMSNorm(epsilon=self.epsilon, dtype=self.dtype, name="norm_q")(
             self._projection("to_q", image))
-        key = RMSNorm(epsilon=1e-6, dtype=self.dtype, name="norm_k")(
+        key = RMSNorm(epsilon=self.epsilon, dtype=self.dtype, name="norm_k")(
             self._projection("to_k", image))
         value = self._projection("to_v", image)
         if context is not None:
-            text_query = RMSNorm(epsilon=1e-6, dtype=self.dtype, name="norm_added_q")(
+            text_query = RMSNorm(epsilon=self.epsilon, dtype=self.dtype, name="norm_added_q")(
                 self._projection("add_q_proj", context))
-            text_key = RMSNorm(epsilon=1e-6, dtype=self.dtype, name="norm_added_k")(
+            text_key = RMSNorm(epsilon=self.epsilon, dtype=self.dtype, name="norm_added_k")(
                 self._projection("add_k_proj", context))
             query = jnp.concatenate([text_query, query], axis=1)
             key = jnp.concatenate([text_key, key], axis=1)
@@ -139,9 +142,9 @@ class _FluxAttention(nn.Module):
         if context is None:
             return attended, None
         tokens = context.shape[1]
-        return (nn.Dense(inner, dtype=self.dtype, precision=self.precision,
+        return (nn.Dense(inner, use_bias=self.bias, dtype=self.dtype, precision=self.precision,
                          name="to_out_0")(attended[:, tokens:]),
-                nn.Dense(inner, dtype=self.dtype, precision=self.precision,
+                nn.Dense(inner, use_bias=self.bias, dtype=self.dtype, precision=self.precision,
                          name="to_add_out")(attended[:, :tokens]))
 
 
