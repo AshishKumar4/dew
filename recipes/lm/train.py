@@ -25,8 +25,7 @@ from typing import TYPE_CHECKING
 import tyro
 
 from dew.config import ModelConfig
-from dew.data import PackedTokens, TokenWindows
-from dew.data.text import tokenizer_for
+from dew.data import ByteTokenizer, HFTokenizer, PackedTokens, TokenWindows
 from dew.objectives.lm import LMObjective, LMRunConfig, Perplexity, Samples
 from dew.registry import datasets, models
 from dew.training import TrainState, prepare_process, run_timestamp
@@ -185,11 +184,17 @@ def checkpoint_tokenizer(directory: Path, name: str) -> str:
     return name
 
 
+def run_tokenizer(name: str) -> ByteTokenizer | HFTokenizer:
+    """The tokenizer `--tokenizer` names: "byte" for Dew's UTF-8 vocabulary,
+    any other name a Hugging Face tokenizer."""
+    return ByteTokenizer() if name == "byte" else HFTokenizer(name)
+
+
 def build_samples(config: LmRunConfig) -> Samples | None:
     """What the objective generates and decodes at every validation."""
     if config.sample_tokens <= 0:
         return None
-    tokenizer = tokenizer_for(config.tokenizer)
+    tokenizer = run_tokenizer(config.tokenizer)
     return Samples(
         prompt=tokenizer.encode(config.sample_prompt or "\n"),
         max_new_tokens=config.sample_tokens, sampling=config.sampling,
@@ -231,7 +236,7 @@ def build_masked_objective(config: LmRunConfig, model, fields, pretrained):
             "masked_diffusion trains a model with a mask token id: continue a "
             "--pretrained diffusion checkpoint, which carries one, or name "
             "mask_token_id in --model.config beside causal=False")
-    decode = None if config.sample_tokens <= 0 else tokenizer_for(config.tokenizer).decode
+    decode = None if config.sample_tokens <= 0 else run_tokenizer(config.tokenizer).decode
     return MaskedDiffusionObjective(
         model, MDLM(mask_id=int(mask))(), config.data.seq_len + 1,
         ema_decay=config.ema_decay, decode=decode, pretrained=pretrained)

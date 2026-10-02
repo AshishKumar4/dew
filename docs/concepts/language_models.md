@@ -177,7 +177,7 @@ Plain `torch.autocast` with FlashAttention 2 sits at +4.9e-4. Over 256 steps of 
 
 ### EMA weights
 
-`LMObjective` keeps no moving average unless `ema_decay` is set. Without one, `state.ema` is `None`, `state.averaged` raises `ValueError`, and previews and evaluation read the live variables. With `ema_decay=0.999`, `state.averaged` holds the EMA copy merged into the live variables, evaluation and previews read it, and the console labels the split `val (ema)`. The copy costs one more set of trained parameters. A checkpoint written with one setting does not restore into the other. An `LMRunConfig` record written before this default, which has no `ema_decay` field, reads back as 0.999, the average that run kept.
+`LMObjective` keeps no moving average unless `ema_decay` is set. Without one, `state.ema` is `None`, `state.averaged` raises `ValueError`, and previews and evaluation read the live variables. With `ema_decay=0.999`, `state.averaged` holds the EMA copy merged into the live variables, evaluation and previews read it, and the console labels the split `val (ema)`. The copy costs one more set of trained parameters. A checkpoint written with one setting does not restore into the other.
 
 To measure validation perplexity, give the dataset a validation split and set `eval_every`, as in the example ([Evaluation and tracking](../guides/evaluation.md)). With a tracker and `fit(preview=True)`, `Samples` adds one generated preview per evaluation event, separate from the teacher-forced scoring of the batch.
 
@@ -398,7 +398,7 @@ The default is 64 model evaluations, including the final clean prediction; a cal
 
 A source generation control that native MDLM cannot follow is rejected by name. Neutral values are accepted, as are the shared budget, continuation count, EOS and padding metadata. MDLM does not use a KV cache, so `use_cache=False` is accepted and asking for a cache is not.
 
-Saved masked-diffusion recipe runs keep their compute and storage precision, and `dew.pipeline`'s `ema` option picks live or EMA weights. The run record rebuilds native MDLM with its default `Unmask` sampler and 64 steps; it does not save custom objective steps or sampler choices set in code. Plain `Checkpoints` saves weights and training state, not these task settings, so a custom task configuration has to be applied again. The recipe does not save an EOS policy either. Source checkpoints follow their own EOS metadata. For a task built from an objective in code, set EOS with `dataclasses.replace(task, eos_token_ids=(...))`.
+Saved masked-diffusion recipe runs keep their compute and storage precision, and `dew.pipeline`'s `ema` option picks live or EMA weights. The run record rebuilds native MDLM with its default `Unmask` solver and 64 steps; it does not save custom objective steps or solver choices set in code. Plain `Checkpoints` saves weights and training state, not these task settings, so a custom task configuration has to be applied again. The recipe does not save an EOS policy either. Source checkpoints follow their own EOS metadata. For a task built from an objective in code, set EOS with `dataclasses.replace(task, eos_token_ids=(...))`.
 
 ## DiffusionGemma
 
