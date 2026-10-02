@@ -7,7 +7,6 @@ import os
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from importlib import import_module
 from typing import TYPE_CHECKING, Generic
 
 import jax
@@ -213,23 +212,28 @@ class TextToImage:
         overrides parameter storage; None preserves checkpoint storage exactly.
         """
         from dew.checkpoints import Checkpoints
-        from dew.objectives.diffusion import DiffusionRunConfig
-        from dew.registry import objectives
+        from dew.config import ModelConfig, _rebuild
+        from dew.diffusion.process import Process
+        from dew.inference.tasks import run_record
+        from dew.nn.autoencoders import AutoEncoder
+        from dew.registry import configured, objectives, samplers
 
-        import_module("dew.objectives.rl.flow")  # registers the flow_grpo a record names
-        config = DiffusionRunConfig.load(directory)
+        record = run_record(directory, step)
+        config = ModelConfig.from_dict(record['model'])
         compute = dtype_name(resolve_dtype(dtype))
         if compute is not None:
-            config = replace(config, model=replace(config.model, dtype=compute),
-                             text=None if config.text is None else replace(config.text, dtype=compute),
-                             audio=None if config.audio is None else replace(config.audio, dtype=compute),
-                             autoencoder=None if config.autoencoder is None else
-                             replace(config.autoencoder, dtype=compute))
-        averaged = False if objectives[config.objective]._ema_is_reference else ema
-        params = Checkpoints(directory).variables( ema=averaged, step=step, mesh=mesh, layout=layout,
-                                   param_dtype=param_dtype, parameter_roots=config.parameter_roots)
-        objective = config.build(variables=params)
-        return cls.from_objective(objective, _with_drawn_tables(objective, params))
+            config = replace(config, dtype=compute)
+        averaged = False if objectives[record['objective']]._ema_is_reference else ema
+        params = Checkpoints(directory).variables(ema=averaged, step=step, mesh=mesh, layout=layout,
+                                                 param_dtype=param_dtype)
+        inputs = InputSpec.from_json(record['inputs'], params=params.get('encoders', {}))
+        autoencoder = None if record['autoencoder'] is None else AutoEncoder.from_json(
+            record['autoencoder'], params=params['autoencoder'])
+        solver_record = record['solver']
+        solver = samplers.build(solver_record['name'], solver_record['fields'])
+        guidance = _rebuild(CFG | None, configured(record['guidance']))
+        return cls(config.build(), Process.from_json(record['process']), inputs, params, autoencoder,
+                   steps=record['sampling_steps'], guidance=guidance, sampler=solver)
 
     @classmethod
     def from_pretrained(cls, repo_id: str, *, ema: bool | None = None, mesh: MeshSpec | None = None,
@@ -601,49 +605,6 @@ def _image_start(rows: jax.sharding.NamedSharding | None):
 
 
 
-def _with_drawn_tables(objective: DiffusionObjective, variables: Variables) -> Variables:
-    """`variables` with every Fourier table the objective's model draws and
-    the checkpoint lacks (`is_fourier_table`).
-
-    A run written before the table became a variable trained against the
-    table its variable initializer draws. Apply the saved parameters with only
-    constants mutable: parameters are read, not drawn. Flax still checks their
-    shapes abstractly. The shape pass finds absent tables, and the compiled
-    pass computes only those leaves.
-    """
-    from flax.traverse_util import flatten_dict, unflatten_dict
-
-    from dew.checkpoints import absent
-    from dew.nn.blocks import is_fourier_table
-
-    def constants(params):
-        conditions = objective.encode(params.get("encoders", {}))
-        if objective.inputs.mask is not None:
-            conditions = {**conditions, "mask": jnp.zeros((1, *objective.latent_shape[:-1], 1)),
-                          "masked_image": jnp.zeros((1, *objective.latent_shape))}
-        _, tables = objective.model.apply(
-            objective.trainable(params), jnp.ones((1, *objective.latent_shape)), jnp.ones((1,)),
-            **conditions, mutable=["constants"])
-        return tables
-
-    drawn = [path for path in absent(jax.eval_shape(constants, variables), variables)
-             if is_fourier_table(path)]
-    if not drawn:
-        return variables
-
-    def leaf(tree, path):
-        for entry in path:
-            tree = tree[entry.key]
-        return tree
-
-    mesh = mesh_of(variables)
-    values = jax.jit(lambda params: [leaf(constants(params), path) for path in drawn],
-                     out_shardings=None if mesh is None else
-                     jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec()))(variables)
-    flat = flatten_dict(variables, keep_empty_nodes=True)
-    flat.update({tuple(entry.key for entry in path): value
-                 for path, value in zip(drawn, values, strict=True)})
-    return unflatten_dict(flat)
 
 
 @functools.cache

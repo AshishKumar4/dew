@@ -264,14 +264,14 @@ def _pulled(repo_id: str) -> str:
     return os.fspath(pull_from_hub(repo_id))
 
 
-def run_record(directory: str) -> Mapping[str, object]:
-    """Read the `run.json` a run directory publishes beside its checkpoints."""
-    import json
-
-    from etils import epath
-
-    from dew.checkpoints import RUN_FILE
-    return named_fields(json.loads((epath.Path(directory) / RUN_FILE).read_text()), RUN_FILE)
+def run_record(directory: str, step: int | str | None = None) -> Mapping[str, object]:
+    """The inference declaration of the selected checkpoint, not training configuration."""
+    from dew.checkpoints import Checkpoints
+    record = Checkpoints(directory).artifact(step)
+    if record is None:
+        raise ValueError("this checkpoint names no registered inference model; register it and declare "
+                         "Objective.inference_record, or call objective.pipeline(state)")
+    return named_fields(record, 'checkpoint artifact')
 
 
 def _saved_model(record: Mapping[str, object], dtype: str | None) -> ModelConfig:
@@ -284,12 +284,13 @@ def _saved_model(record: Mapping[str, object], dtype: str | None) -> ModelConfig
     return config if compute is None else replace(config, dtype=compute)
 
 
-def _saved_processor(record: Mapping[str, object]) -> Processor:
+def _saved_processor(record: Mapping[str, object]) -> Processor | None:
     """Build the run's tokenizer into a task's host processor."""
     from dew.data import tokenizer_for
     from dew.inference.pipeline import RunProcessor
 
-    return RunProcessor(tokenizer_for(named(record["tokenizer"], "tokenizer")))
+    tokenizer = record.get('tokenizer')
+    return None if tokenizer is None else RunProcessor(tokenizer_for(named(tokenizer, "tokenizer")))
 
 
 def _saved_budget(record: Mapping[str, object]) -> int | None:
@@ -302,9 +303,10 @@ def _saved_budget(record: Mapping[str, object]) -> int | None:
     return budget
 
 
-def _saved_run(directory: str, dtype: str | None) -> tuple[Mapping[str, object], ModelConfig, Processor]:
+def _saved_run(directory: str, dtype: str | None, step: int | str | None
+               ) -> tuple[Mapping[str, object], ModelConfig, Processor | None]:
     """Read a run's record, its model config at `dtype`, and its host processor."""
-    record = run_record(directory)
+    record = run_record(directory, step)
     return record, _saved_model(record, dtype), _saved_processor(record)
 
 
@@ -447,7 +449,7 @@ class TextGeneration:
 
         import_module("dew.objectives.lm")  # registers the saved objective kinds
         import_module("dew.objectives.rl")
-        record, model_config, processor = _saved_run(directory, dtype)
+        record, model_config, processor = _saved_run(directory, dtype, step)
         kind = named(record["objective"], "objective")
         budget = _saved_budget(record)
         objective_type = objectives[kind]
@@ -549,7 +551,7 @@ class BlockGeneration:
         from dew.checkpoints import Checkpoints
         from dew.interop import diffusion_gemma
 
-        record, model_config, processor = _saved_run(directory, dtype)
+        record, model_config, processor = _saved_run(directory, dtype, step)
         canvas = model_config.config["max_seq_len"]
         if not isinstance(canvas, int):
             raise ValueError(
@@ -637,7 +639,7 @@ class MaskedGeneration:
         from dew.checkpoints import Checkpoints
         from dew.diffusion.discrete import MDLM
 
-        record, model_config, processor = _saved_run(directory, dtype)
+        record, model_config, processor = _saved_run(directory, dtype, step)
         budget = _saved_budget(record)
         model = model_config.build()
         if not isinstance(model, CausalTransformer) or model.causal or type(model.mask_token_id) is not int:

@@ -16,7 +16,7 @@ DECODER_FAMILIES = "a decoder of a registered family (CausalTransformer) or a Di
 
 
 def export_run(run_dir: str, destination: str | Path, *, ema: bool | None = None,
-               step: int | None = None) -> None:
+               step: int | str | None = None) -> None:
     """Write the run in `run_dir` to `destination` in its family's layout.
 
     The run loads the way `dew.pipeline` loads it: `run.json` for the model
@@ -32,7 +32,7 @@ def export_run(run_dir: str, destination: str | Path, *, ema: bool | None = None
     from dew.inference.tasks import run_record
     from dew.sampling.pipelines import TextToImage
 
-    record = run_record(str(run_dir))
+    record = run_record(str(run_dir), step)
     task = pipeline(str(run_dir), ema=ema, step=step)
     # An image task keeps the objective's whole tree under `params`, which is
     # the same weights under the name that task gives them.
