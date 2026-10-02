@@ -48,6 +48,9 @@ dependencies = [
     "tyro",
     "typing_extensions>=4.14",
     "transformers>=5.16.1",
+    # A Wan pipeline's prompts are cleaned with it, as the source cleans them
+    # (dew.inputs.diffusion.wan_prompt); pure Python, with wcwidth its one dependency.
+    "ftfy",
     "jinja2",
     "filelock",
     "huggingface_hub",
@@ -92,8 +95,6 @@ test = [
     "wandb",
     # The committed VAE fixture was generated with this reference release.
     "diffusers==0.34.0",
-    # Wan's pipelines clean every prompt with ftfy, and so does WanConditioner.
-    "ftfy",
     # Every decoder and MoE parity number is calibrated against this exact
     # release: the fixtures record it (tests/fixtures/hf/*/meta.json), the
     # tests cite its line numbers, and a resolve that moved it would compare
