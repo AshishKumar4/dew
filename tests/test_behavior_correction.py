@@ -6,11 +6,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from test_rl_surrogate import token_mean
 from test_tool_episodes import PROMPT, RESPONSE, build, collect
 
 from dew.objectives.base import Step, scalar_loss
 from dew.objectives.rl import GRPOObjective
-from dew.rl import behavior_importance_weights, token_log_ratio, token_mean
+from dew.rl import behavior_importance_weights, token_log_ratio
 from dew.rl.surrogate import clipped_surrogate_terms
 
 FIXTURE = Path(__file__).parent / "fixtures/rl/behavior.npz"
