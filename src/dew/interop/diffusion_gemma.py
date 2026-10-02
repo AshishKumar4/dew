@@ -49,7 +49,7 @@ def text_config(config: Mapping[str, object]) -> Mapping[str, object]:
     return _section(config, "text_config")
 
 
-def build(config: Mapping[str, object], *, dtype: str = "bfloat16",
+def build(config: Mapping[str, object], *, dtype: str | None = "bfloat16",
           attention_impl: str = "auto", max_seq_len: int | None = None) -> DiffusionGemma:
     """Build native model values without allocating parameters."""
     fields = translate_config(text_config(config))
