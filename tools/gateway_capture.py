@@ -6,10 +6,10 @@ Needs one GPU and `uv`. Installs SGLang 0.5.20 (with ninja), vLLM 0.30.0 and rll
 3b40c37 in their own venvs under --venvs. For each engine, on 127.0.0.1: start the engine on
 Qwen/Qwen2.5-0.5B-Instruct and wait for /health; warm it with one chat request (SGLang compiles for
 minutes on its first one, stalling /health past the gateway's 5 s probe); start the gateway
-(sync_traces, health_check_interval 60) and wait until `dew.objectives.rl.harbor.Gateway.ready`
+(sync_traces, health_check_interval 60) and wait until `dew.interop.harbor.Gateway.ready`
 passes; run one three-turn tool-calling session and one prompt past the context length through
 /sessions/{sid}/v1; write the session's traces as `{engine}_session_traces.json` and the overflow's
-as `{engine}_overflow_trace.json`, keeping only the fields `dew.objectives.rl.harbor.calls` reads.
+as `{engine}_overflow_trace.json`, keeping only the fields `dew.interop.harbor.calls` reads.
 The fixtures committed were captured on a Colab L4 on 2026-09-23.
 """
 
@@ -23,7 +23,7 @@ from pathlib import Path
 
 import httpx
 
-from dew.objectives.rl.harbor import Gateway
+from dew.interop.harbor import Gateway
 
 MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 ENGINE, GATEWAY = "http://127.0.0.1:8011", "http://127.0.0.1:9090"

@@ -352,7 +352,7 @@ class Publication:
 
     `weights` is the push (`SafetensorsReload`, or any `WeightSync`) and
     `stamp`, when set, labels later calls with a version, as a recording
-    gateway does (`dew.objectives.rl.harbor.Gateway.stamp`). It runs only once
+    gateway does (`dew.interop.harbor.Gateway.stamp`). It runs only once
     every replica serves the new version: a gateway stamps a call when it
     arrives, so a stamp ahead of a replica would claim weights the call was
     not sampled from. A failed push or stamp raises and leaves `version` where
