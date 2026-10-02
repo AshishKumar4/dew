@@ -848,3 +848,6 @@ class MTPBlock(nn.Module):
             predicted = self.hc_head(predicted)
         normalized = self.final_norm(predicted)
         return normalized, normalized if self.hyper_connections is None else streams
+
+
+__all__ = ["BlockWiring", "DecoderBlock", "GatedMLP", "MTPBlock", "Mixture", "RematPolicy", "remat_policy"]

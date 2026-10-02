@@ -316,3 +316,6 @@ def region(name: str) -> AbstractContextManager[None]:
     """
     active = active_profile()
     return nullcontext() if active is None else active.region(name)
+
+
+__all__ = ["Profiler", "region"]

@@ -728,3 +728,6 @@ def _attach(objective: object, adapter: LoRA) -> None:
             f"freezes everything but its own factors; pass one filter, not both")
     objective.model = adapter.adapt(objective.model)
     objective.trainable = adapter.trainable
+
+
+__all__ = ["Adaptable", "LoRA", "PeftConfig", "Target"]
