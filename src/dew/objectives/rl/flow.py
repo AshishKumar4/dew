@@ -31,7 +31,7 @@ from dew.nn.autoencoders import AutoEncoder
 from dew.objectives.base import Aux, Batch, Ratio, Shown, Step, Variables
 from dew.objectives.diffusion.objective import VALIDATION_SAMPLES, DiffusionObjective
 from dew.registry import objectives
-from dew.sampling.flow import FlowSDE, FlowTrajectory, GaussianTransition, sample_trajectory
+from dew.sampling.flow import FlowSDE, FlowTrajectory, GaussianTransition
 from dew.sampling.guidance import CFG
 from dew.sampling.solvers import Euler, Solver
 
@@ -329,8 +329,8 @@ class FlowRollout:
         noise_key, sample_key = jax.random.split(key)
         count = _source(objective.inputs, batch).shape[0]
         initial = objective.process.noise(noise_key, (count, *objective.latent_shape))
-        trajectory = sample_trajectory(denoise, initial, self.steps, solver=objective.sde,
-                                       guidance=objective.guidance, key=sample_key)
+        trajectory = objective.sde.trajectory(denoise, initial, self.steps,
+                                              guidance=objective.guidance, key=sample_key)
         samples = trajectory.samples
         if objective.autoencoder is not None:
             samples = objective.autoencoder.decode(params["autoencoder"], samples)
