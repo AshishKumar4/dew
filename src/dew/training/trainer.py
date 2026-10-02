@@ -1423,7 +1423,7 @@ class Trainer(Generic[Loss, Effects]):
         run = _FitRun(time.perf_counter())
         # A display of this fit's own: one before it may have run other steps.
         self._display = TrainingDisplay()
-        checkpoints = self.checkpoints
+        profile, checkpoints = self.profile, self.checkpoints
         profiler = self._own_profile_window()
         # One boundary lookup at setup: the prefetch worker and the step
         # scopes share whichever profiler owns the capture.
@@ -1451,7 +1451,8 @@ class Trainer(Generic[Loss, Effects]):
                 run.stop_control = checkpoints.control(checkpoints.latest)
             if self._opened(plan, run, state, position):
                 return state
-            state = self._training_loop(plan, run, state, shardings, position, profiler, tracer)
+            state = self._training_loop(plan, run, state, shardings, position, profiler, tracer,
+                                        profile, checkpoints)
         finally:
             primary = sys.exception()
             error = self._closed(run, primary, profiler)
@@ -1469,9 +1470,9 @@ class Trainer(Generic[Loss, Effects]):
         return state
 
     def _training_loop(self, plan: _FitPlan, run: _FitRun, state: TrainState,
-                       shardings, position, profiler: Profiler | None, tracer: Profiler | None) -> TrainState:
+                       shardings, position, profiler: Profiler | None, tracer: Profiler | None,
+                       profile: ProfileWindow | None, checkpoints: Checkpoints | None) -> TrainState:
         """Dispatch the numerical steps and finish their loop before resource cleanup."""
-        profile = self.profile
         compiled: dict[Shapes, tuple[CompiledStep, float | None]] = {}
         interval = _Interval(fresh_book(), time.time(), last_saved=(
             run.current if checkpoints is not None and checkpoints.latest is not None else None))

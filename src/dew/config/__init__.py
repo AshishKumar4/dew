@@ -184,7 +184,11 @@ def _best_argument():
             return None
         if text.startswith(('{', '[')):
             policies = json.loads(text)
-            return tuple(Best(**policy) for policy in policies) if isinstance(policies, list) else Best(**policies)
+            return (
+                tuple(Best(**policy) for policy in policies)
+                if isinstance(policies, list)
+                else Best(**policies)
+            )
         return Best(text)
 
     def write(policy):
@@ -192,7 +196,13 @@ def _best_argument():
             return ['None']
         if isinstance(policy, str):
             return [policy]
-        return [json.dumps([_to_json(entry, Best) for entry in policy] if isinstance(policy, tuple) else _to_json(policy, Best))]
+        return [
+            json.dumps(
+                [_to_json(entry, Best) for entry in policy]
+                if isinstance(policy, tuple)
+                else _to_json(policy, Best)
+            )
+        ]
 
     return tyro.constructors.PrimitiveConstructorSpec(
         nargs=1, metavar='METRIC|JSON', instance_from_str=read,
@@ -202,10 +212,16 @@ def _best_argument():
 
 def _keep_argument():
     return tyro.constructors.PrimitiveConstructorSpec(
-        nargs=1, metavar='LATEST|JSON',
-        instance_from_str=lambda given: Keep(**json.loads(given[0])) if given[0].startswith('{') else int(given[0]),
+        nargs=1,
+        metavar="LATEST|JSON",
+        instance_from_str=lambda given: Keep(**json.loads(given[0]))
+        if given[0].startswith("{")
+        else int(given[0]),
         is_instance=lambda keep: isinstance(keep, (int, Keep)),
-        str_from_instance=lambda keep: [json.dumps(_to_json(keep, Keep)) if isinstance(keep, Keep) else str(keep)])
+        str_from_instance=lambda keep: [
+            json.dumps(_to_json(keep, Keep)) if isinstance(keep, Keep) else str(keep)
+        ],
+    )
 
 
 def _cadence_argument():
@@ -217,9 +233,14 @@ def _cadence_argument():
             return value
         return int(value) if value.isdecimal() else duration(value)
     return tyro.constructors.PrimitiveConstructorSpec(
-        nargs=1, metavar='STEPS|DURATION|epoch', instance_from_str=read,
+        nargs=1,
+        metavar="STEPS|DURATION|epoch",
+        instance_from_str=read,
         is_instance=lambda value: value is None or isinstance(value, (int, str, datetime.timedelta)),
-        str_from_instance=lambda value: [recorded_duration(value) if isinstance(value, datetime.timedelta) else str(value)])
+        str_from_instance=lambda value: [
+            recorded_duration(value) if isinstance(value, datetime.timedelta) else str(value)
+        ],
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -300,7 +321,9 @@ class TrainerConfig:
                 if not isinstance(choice, Best) or choice._source is not None:
                     raise TypeError("a recorded best selector names metrics; callable scores are code-only")
                 rebuilt.append(choice)
-            object.__setattr__(self, 'best', tuple(rebuilt) if isinstance(self.best, (tuple, list)) else rebuilt[0])
+            object.__setattr__(
+                self, "best", tuple(rebuilt) if isinstance(self.best, (tuple, list)) else rebuilt[0]
+            )
 
     def best_policies(self):
         if self.best is None:
