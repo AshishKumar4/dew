@@ -756,7 +756,7 @@ class Trainer(Generic[Loss, Effects]):
         """
         if accumulation < 1:
             raise ValueError(f"accumulation must be at least 1, got {accumulation}")
-        if step is not None and "params" in layout.host:
+        if step is not None and "variables" in layout.host:
             raise ValueError(
                 "Parameter-streamed training requires the trainer objective transaction; "
                 "custom steps own their execution"
@@ -894,7 +894,7 @@ class Trainer(Generic[Loss, Effects]):
 
     @property
     def host_master(self) -> bool:
-        return "params" in self.layout.host
+        return "variables" in self.layout.host
 
     @functools.cached_property
     def state_mesh(self) -> Mesh:
