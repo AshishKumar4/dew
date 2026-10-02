@@ -14,7 +14,8 @@ from test_diffusion_run_sources import batch_for
 
 from dew.checkpoints import Checkpoints
 from dew.config import ModelConfig, TrainerConfig
-from dew.data import OxfordFlowers
+from dew.data import TFDSImages
+from dew.diffusion.presets import Flow
 from dew.objectives.base import Step
 from dew.objectives.diffusion import (
     AdversarialDistillation,
@@ -24,8 +25,7 @@ from dew.objectives.diffusion import (
 )
 from dew.objectives.diffusion.adversarial import Head, hinge_discriminator, hinge_generator, r1_penalty
 from dew.objectives.diffusion.objective import DISCRIMINATOR, SPECTRAL, TEACHER
-from dew.registry import presets, samplers
-from dew.sampling import TextToImage
+from dew.sampling import Consistency, Euler, TextToImage
 from dew.training import Trainer
 
 HEAD = np.load(Path(__file__).resolve().parent / "fixtures" / "stylegan_t" / "head.npz")
@@ -36,7 +36,7 @@ def test_a_head_is_stylegan_ts_at_grid_height_one():
     on 16 sequences of 12 tokens: LADD's 2D head over a grid of height one,
     with a (1, 9) kernel, from the same weights and spectral-norm vectors.
     Both run in float64, so the gap is a few roundings of O(1) logits."""
-    with jax.enable_x64(True):
+    with jax.enable_x64(new_val=True):
         def conv(name):
             return {"kernel": jnp.asarray(HEAD[f"{name}.kernel"]), "bias": jnp.asarray(HEAD[f"{name}.bias"])}
 
@@ -53,7 +53,8 @@ def test_a_head_is_stylegan_ts_at_grid_height_one():
                     "block_1": {"conv": {"u": jnp.asarray(HEAD["main.1.fn.0.u"])}},
                     "cls": {"u": jnp.asarray(HEAD["cls.u"])}}
         logits, updated = Head(kernel_size=(1, 9)).apply(
-            {"params": params, SPECTRAL: spectral}, jnp.asarray(HEAD["x"]), jnp.asarray(HEAD["c"]), update=True,
+            {"params": params, SPECTRAL: spectral}, jnp.asarray(HEAD["x"]), jnp.asarray(HEAD["c"]),
+            update=True,
             mutable=[SPECTRAL])
         np.testing.assert_allclose(np.asarray(logits), HEAD["logits"], rtol=1e-10, atol=1e-12)
         assert not np.allclose(np.asarray(updated[SPECTRAL]["cls"]["u"]), HEAD["cls.u"])
@@ -86,9 +87,10 @@ def test_r1_is_the_squared_gradient_of_each_heads_mean_logit_at_its_input():
 def runs(tmp_path_factory):
     root = tmp_path_factory.mktemp("ladd")
     teacher = DiffusionRunConfig(
-        model=ModelConfig("simple_dit", {"patch_size": 2, "emb_features": 16, "num_layers": 2, "num_heads": 2},
+        model=ModelConfig("simple_dit",
+                          {"patch_size": 2, "emb_features": 16, "num_layers": 2, "num_heads": 2},
                           dtype="float32", attention_impl="xla"),
-        data=OxfordFlowers(image_size=4), preset=presets.Flow(), sampler=samplers.Euler(), guidance=None,
+        data=TFDSImages(image_size=4), preset=Flow(), solver=Euler(), guidance=None,
         sampling_steps=2, ema_decay=None, val_metrics=(), trainer=TrainerConfig(checkpoint_dir=str(root)),
         text=TextCondition(encoder="char_table", checkpoint="char_table"))
     objective = teacher.build()
@@ -97,10 +99,10 @@ def runs(tmp_path_factory):
     batch = batch_for(objective, 4)
     state, *_ = trainer.compile(state, batch)(state, batch)
     checkpoints = Checkpoints(str(root / "teacher"))
-    checkpoints.save(1, state, None)
+    checkpoints.save(1, state, None, artifact=objective.inference_record)
     checkpoints.wait()
     teacher.save(str(root / "teacher"))
-    student = dataclasses.replace(teacher, sampler=samplers.Consistency(), adversarial=AdversarialDistillation(
+    student = dataclasses.replace(teacher, solver=Consistency(), adversarial=AdversarialDistillation(
         teacher=str(root / "teacher"), feature_layers=("dit_block_0", "dit_block_1"), cmap_dim=8,
         kernel_size=(3, 3)))
     return student, batch
@@ -132,7 +134,8 @@ def test_each_side_trains_on_its_own_loss(runs):
         np.testing.assert_allclose(np.asarray(got), np.asarray(want), rtol=1e-5, atol=1e-7)
     for name in everything:
         if name != DISCRIMINATOR:
-            for got, want in zip(jax.tree.leaves(everything[name]), jax.tree.leaves(student[name]), strict=True):
+            for got, want in zip(jax.tree.leaves(everything[name]), jax.tree.leaves(student[name]),
+                                 strict=True):
                 np.testing.assert_allclose(np.asarray(got), np.asarray(want), rtol=1e-5, atol=1e-7)
     assert float(sum(jnp.abs(leaf).sum() for leaf in jax.tree.leaves(critic[DISCRIMINATOR]))) > 0
 
@@ -144,7 +147,7 @@ def test_a_saved_student_samples_in_one_step(runs, tmp_path):
     state = trainer.initial_state()
     state, *_ = trainer.compile(state, batch)(state, batch)
     checkpoints = Checkpoints(str(tmp_path / "student"))
-    checkpoints.save(1, state, None)
+    checkpoints.save(1, state, None, artifact=task.inference_record)
     checkpoints.wait()
     config.save(str(tmp_path / "student"))
     restored = TextToImage.from_run(str(tmp_path / "student"))
