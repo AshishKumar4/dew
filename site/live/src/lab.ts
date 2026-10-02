@@ -114,15 +114,15 @@ export class SnapshotLab extends DurableObject<Env> {
 	}
 
 	async serviceStatus(): Promise<unknown> {
+		const process = await this.container.exec(['sh', '-c',
+			'tail -c 8000 /run/dew/service.log 2>/dev/null; echo; ps -eo user,pid,rss,args']);
+		const output = await process.output();
+		const log = new TextDecoder().decode(output.stdout);
 		try {
 			const response = await this.container.getTcpPort(8888).fetch('http://container/health');
-			const process = await this.container.exec(['sh', '-c',
-				'tail -c 8000 /run/dew/service.log 2>/dev/null; echo; ps -eo user,pid,rss,args']);
-			const output = await process.output();
-			return { status: response.status, health: await response.json(),
-				log: new TextDecoder().decode(output.stdout) };
+			return { status: response.status, health: await response.json(), log };
 		} catch (error) {
-			return { error: error instanceof Error ? error.message : String(error) };
+			return { error: error instanceof Error ? error.message : String(error), log };
 		}
 	}
 

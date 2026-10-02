@@ -17,7 +17,8 @@ import threading
 import time
 from concurrent.futures import Future
 from dataclasses import dataclass
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
+from socketserver import ThreadingTCPServer
 
 TEXT_MODEL = "HuggingFaceTB/SmolLM2-135M-Instruct"
 IMAGE_MODEL = "dewml/hybrid-dit-176m"
@@ -214,7 +215,7 @@ def main():
             except Exception as error:
                 self.reply(503, {"error": str(error)})
 
-    ThreadingHTTPServer(("0.0.0.0", 8888), Handler).serve_forever()
+    ThreadingTCPServer(("0.0.0.0", 8888), Handler).serve_forever()
 
 
 if __name__ == "__main__":
