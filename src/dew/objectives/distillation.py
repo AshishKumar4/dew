@@ -133,7 +133,10 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
             return tree
         # A pair's widths decide whether it needs a projection, which only
         # a forward pass can say; the shapes come from an abstract one.
-        probe = {self.inputs.sample.key: jnp.zeros((1, *self.inputs.sample.shape), jnp.int32)}
+        inputs = self.inputs
+        if inputs is None:
+            raise ValueError("feature distillation requires the student's InputSpec")
+        probe = {inputs.sample.key: jnp.zeros((1, *inputs.sample.shape), jnp.int32)}
         _, _, student, teacher = jax.eval_shape(
             self._predictions, tree, probe, Step(jnp.zeros((), jnp.int32), key, None))
         projections = {}
