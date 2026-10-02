@@ -706,7 +706,8 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
                      segment_ids=None, positions=None, routing: bool = False,
                      depths: bool = False, roles=None, qk_stats: bool = False,
                      indexer: bool = False, layers: Sequence[int] = (),
-                     routes: tuple[jax.Array, jax.Array | None] | None = None):
+                     routes: tuple[jax.Array, jax.Array | None] | None = None,
+                     predict: bool | None = None):
         """Score per-token next-token cross entropy over a `[B, seq_len + 1]` batch.
 
         Returns `Scores`: the losses, the weight of each target, whether each
@@ -755,7 +756,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         losses, predicted, log_z = chunked_cross_entropy(
             hidden, head, targets, self.head_chunks, tile=self.head_tile,
             softcap=self.model.final_logit_softcap,
-            precision=self.model.precision, predict=self.token_accuracy)
+            precision=self.model.precision, predict=self.token_accuracy if predict is None else predict)
         weights = self._row_weights(prepared, targets, roles, losses.dtype)
         correct = None if predicted is None else (predicted == targets).astype(losses.dtype)
         depth_scores = []
@@ -1168,8 +1169,8 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     def evaluate(self, params, batch, step: Step):
         """Score the complete batch teacher-forced, using EMA when present."""
         params = params if step.ema is None else step.ema
-        losses, weights = self._scored(params, _batch_text(batch), self._batch_roles(batch))
-        return TokenScores(losses=losses, weights=weights)
+        losses, weights, correct = self._scored(params, _batch_text(batch), self._batch_roles(batch))
+        return TokenScores(losses=losses, weights=weights, correct=correct)
 
     def preview(self, params, batch, step: Step, *, scored=None):
         """Sample the configured prompt once, then decode only on process zero.
@@ -1207,8 +1208,9 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     def _scored(self):
         """Compile the teacher-forced scores once per objective."""
         def scored(params, prepared, roles):
-            scores = self.token_scores(params, prepared, roles=roles)
-            return scores.losses, scores.weights
+            scores = self.token_scores(params, prepared, roles=roles, predict=True)
+            assert scores.correct is not None
+            return scores.losses, scores.weights, scores.correct
 
         return jax.jit(scored)
 
