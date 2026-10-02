@@ -31,7 +31,8 @@ class Recording:
 def test_standalone_trained_variables_match_fit_and_return_hosted_previews():
     model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1, num_heads=2,
                               mlp_features=32, max_seq_len=16, dtype="float32", attention_impl="xla")
-    objective = LMObjective(model, seq_len=4, samples=Samples([1, 2], 2, sampling=Sampling(temperature=0)))
+    objective = LMObjective(model, seq_len=4, samples=Samples([1, 2], 2, sampling=Sampling(temperature=0)),
+                            ema_decay=0.999)
     batch = {"text": np.tile(np.array([1, 2, 3, 4, 1], np.int32), (8, 1))}
     data = Dataset(lambda partition: iter([batch] * 2), lambda partition: iter([batch]), records=8, batch=8)
     tracker = Recording()

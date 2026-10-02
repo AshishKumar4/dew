@@ -229,6 +229,29 @@ def test_a_run_with_a_regime_keeps_it_and_its_autoencoder():
     assert run.autoencoder == PretrainedAutoencoder(modelname="pcuenq/sd-vae-ft-mse-flax", revision="main")
 
 
+def test_an_lm_record_without_ema_decay_keeps_the_average_it_was_written_under():
+    """An LM run keeps no EMA unless it asks for one, and records that
+    choice; a record that lacks `ema_decay` was written when every LM run
+    kept a 0.999 average, and it reads back as one."""
+    for config in (LMRunConfig, recipe_config("lm", "LmRunConfig")):
+        assert config().ema_decay is None
+        written = json.loads(json.dumps(config().to_dict()))
+        assert written["ema_decay"] is None
+        assert config.from_dict(written).ema_decay is None
+        assert config.from_dict({**written, "ema_decay": 0.99}).ema_decay == 0.99
+        del written["ema_decay"]
+        assert config.from_dict(written).ema_decay == 0.999
+
+
+def test_a_changed_legacy_value_fails_the_snapshot(monkeypatch):
+    """A field whose default moved holds what older records meant as its
+    `legacy` value, and the snapshot reads that one."""
+    field = next(field for field in dataclasses.fields(LMRunConfig) if field.name == "ema_decay")
+    monkeypatch.setattr(field, "metadata", {"legacy": 0.99})
+    with pytest.raises(AssertionError, match=r"LMRunConfig.ema_decay: 0.999 -> 0.99"):
+        test_every_recorded_default_is_the_one_older_runs_were_recorded_under()
+
+
 def test_an_unknown_field_is_refused():
     published = record("hybrid-dit-176m-dfa94d6")
     with pytest.raises(ValueError, match=r"unknown fields \['epochs'\]"):

@@ -429,7 +429,7 @@ def test_the_sparse_phase_reads_the_warmup_tree():
 def test_evaluation_and_scoring_read_the_split_tree():
     """Teacher-forced scores under the warm-up split are the dense model's
     on the merged tree."""
-    objective = LMObjective(deepseek_stack(None), SEQ, indexer=IndexerTraining("warmup"))
+    objective = LMObjective(deepseek_stack(None), SEQ, indexer=IndexerTraining("warmup"), ema_decay=0.999)
     params = objective.init(jax.random.key(0))
     batch = token_batch()
     scored = objective.evaluate(params, batch, step_at())
