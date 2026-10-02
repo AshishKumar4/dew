@@ -243,8 +243,9 @@ def step_compiler_options(objective) -> jax.stages.CompilerOptions | None:
     concatenated afresh every step, 4.0 ms of Qwen3-0.6B's step at 1 x 1024,
     and an RTX 4080 trained Qwen3-0.6B's widths, a 3-layer decoder,
     SimpleDiT-B and the hybrid DiT 0.4-3.5% faster without it
-    (docs/performance.md). Decoding keeps the merger: its 32-token GEMMs
-    lost 5-15% apart. And Triton GEMM fusions go off where
+    (docs/performance.md), full steps from 32 tokens up. Decoding keeps the
+    merger: its 32-token GEMMs lost 5-15% apart, as a LoRA step of 128
+    tokens or fewer loses up to 3.6%. And Triton GEMM fusions go off where
     `TRITON_GEMM_OFF_GENERATIONS` measured a win and no mixer of the model
     keeps them."""
     generation = device_generation()
