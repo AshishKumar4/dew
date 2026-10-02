@@ -284,7 +284,7 @@ def test_the_sparse_phase_keeps_the_indexer_and_the_model_apart():
         seen[weight] = split_norms(grads)[0]
         assert seen[weight] > 0
         kl_grads = jax.jit(jax.grad(
-            lambda p: objective.loss(p, batch, step_at())[1].metrics["indexer_kl"]))(params)["params"]
+            lambda p, objective=objective: objective.loss(p, batch, step_at())[1].metrics["indexer_kl"]))(params)["params"]
         for path, leaf in jax.tree_util.tree_leaves_with_path(kl_grads):
             if not is_indexer(path):
                 assert bool(jnp.all(leaf == 0)), jax.tree_util.keystr(path)

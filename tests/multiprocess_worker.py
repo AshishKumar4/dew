@@ -1109,7 +1109,7 @@ def mode_builtin_preview_failures(args) -> dict:
         original_generate = TextGeneration.__call__
         closed = []
 
-        def validation():
+        def validation(*, batch=batch, case=case, closed=closed):
             try:
                 yield batch
             finally:
@@ -1121,7 +1121,7 @@ def mode_builtin_preview_failures(args) -> dict:
                 case = f"{kind}-{phase}-{source}"
                 fault = ValueError(f"{case}: local sampler failure before device work")
 
-                def sample_failure(*sample_args, **kwargs):
+                def sample_failure(*sample_args, fault=fault, kind=kind, phase=phase, source=source, **kwargs):
                     if phase == "generation" and rank == source:
                         raise fault
                     if kind == "diffusion":
