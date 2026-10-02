@@ -70,7 +70,8 @@ FIXTURES = Path(__file__).parent / "fixtures/gateway"
 @pytest.mark.parametrize("engine", ["sglang", "vllm"])
 def test_a_live_gateway_session_is_the_engine_ids_and_likelihoods(engine):
     # A three-turn tool session captured live by tools/gateway_capture.py (Colab L4, Qwen2.5-0.5B-Instruct).
-    # SGLang 0.5.20 lists the sampled ids as choices[0].response_token_ids, which the gateway does not extract.
+    # SGLang 0.5.20 lists the sampled ids as choices[0].response_token_ids,
+    # which the gateway does not extract.
     traces = json.loads((FIXTURES / f"{engine}_session_traces.json").read_text())
     session = calls(traces, unstamped=0)
     assert len(session.calls) == 3 and not session.errors
@@ -128,14 +129,16 @@ def refusal(message, code=400):
         # vLLM 0.30.0's input processor (_validate_prompt_len), reached by token-id prompts.
         (
             refusal(
-                "The decoder prompt (length 4200) is longer than the maximum model length of 4096. Make sure that "
+                "The decoder prompt (length 4200) is longer than the maximum model length of 4096. "
+                "Make sure that "
                 "`max_model_len` is no smaller than the number of text tokens."
             ),
             Status.TRUNCATED,
         ),
         (
             refusal(
-                "The decoder prompt (length 4096) plus the number of requested output tokens (at least 1) is longer "
+                "The decoder prompt (length 4096) plus the number of requested output tokens "
+                "(at least 1) is longer "
                 "than the maximum model length of 4096."
             ),
             Status.TRUNCATED,
@@ -481,7 +484,8 @@ from test_harbor_source import fake_gateway
 from dew.objectives.rl.harbor import HARBOR_KEY, HarborSource
 from dew.objectives.rl.sessions import Task
 root = Path({root!r})
-source = HarborSource(fake_gateway()[0], harbor=root / "harbor", model="m/p", trials=root / "trials", workers=1,
+source = HarborSource(fake_gateway()[0], harbor=root / "harbor", model="m/p",
+                      trials=root / "trials", workers=1,
                       grace=2.0)
 source.submit(Task("slow", {{HARBOR_KEY: str(root / "slow")}}), 2, version=0)
 while not list((root / "trials").glob("*/seen.json")):

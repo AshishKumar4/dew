@@ -54,7 +54,8 @@ def test_packed_scoring_computes_the_engines_filtered_likelihoods(objective):
     support vLLM kept at its temperature, Dew's fp32 likelihoods are as
     close to transformers' float64 ones as transformers' own fp32 run
     (`reference_error`), and vLLM's reported ones as transformers' bf16 run
-    on the record's routing: both tie the scored likelihood to the engine's. The tempered full-vocabulary likelihood misses by far more."""
+    on the record's routing: both tie the scored likelihood to the engine's.
+    The tempered full-vocabulary likelihood misses by far more."""
     grpo, variables = objective
     _, batch = engine_batch()
     sampled = batch["response_mask"] != 0

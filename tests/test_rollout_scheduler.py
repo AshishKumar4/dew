@@ -81,7 +81,8 @@ def finished(reward=1.0, *versions, status=Status.COMPLETED, components=None):
 
 
 class Scripted:
-    """A source whose `outcome(task, submission, sample, version)` returns a rollout or None to keep it running."""
+    """A source whose `outcome(task, submission, sample, version)` returns
+    a rollout or None to keep it running."""
 
     def __init__(self, outcome):
         self.outcome = outcome
