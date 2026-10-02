@@ -197,7 +197,21 @@ objective = bundle.lm_objective(seq_len=512)
 state = Trainer(objective, optax.adamw(1e-5), key=jax.random.key(0)).fit(data, steps=100)
 ```
 
-This downloads the Hub weights and needs memory for the model, gradients and optimizer. A bundle already supplies the initial variables, so passing `pretrained=` as well is refused. A separately built model can still start from an explicit variables tree, for example after adding an adapter.
+This downloads the Hub weights and needs memory for the model, gradients and optimizer. A bundle already supplies the initial variables, so passing `pretrained=` as well is refused. It also hands the objective its processor, so `objective.pipeline(state)` takes text prompts; `processor=` overrides it.
+
+`bundle.lora(rank=, modules=, key=)` returns the same kind of bundle with a fresh low-rank adapter (LoRA) on the projections `modules` names, PEFT's `target_modules`. Its `lm_objective` trains the adapter's factors and leaves every other weight frozen. `tuned.adapter.save` writes PEFT's adapter directory, and `tuned.save` writes the source's layout with the factors merged into the kernels. Both read the trainer's `state.params` as it comes back:
+
+```python
+key = jax.random.key(0)
+tuned = bundle.lora(rank=8, modules=("q_proj", "v_proj"), key=key)
+objective = tuned.lm_objective(seq_len=512)
+state = Trainer(objective, optax.adamw(1e-4), key=key).fit(data, steps=100)
+tuned.adapter.save(state.params, "qwen3-adapter")
+tuned.save("qwen3-merged", variables=state.params)
+print(objective.pipeline(state)("The capital of France is", 8, key=key).text[0])
+```
+
+`bundle` itself is unchanged; `lora` returns a new value. Calling `lora` on an adapted bundle is refused, as is `trainable=` beside an adapter. `dew.lora.LoRA.fresh` and `LoRA.load` build the same adapter over any model and variables, for a model built from the registry or a pipeline component.
 
 `save_pretrained_decoder` writes a trained `CausalTransformer` in the Hugging Face layout. This exports the decoder from the example and loads it back:
 

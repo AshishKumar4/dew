@@ -198,6 +198,73 @@ def test_one_trainer_step_moves_the_adapter_and_nothing_else(decoder, loaded, re
                                reference["updated_logits"], atol=1e-4, rtol=0)
 
 
+def test_a_source_fine_tunes_through_its_own_adapted_bundle(decoder, reference, tmp_path):
+    """`source.lora(...)` is the source with the adapted model, the factors
+    and the adapter beside them. Its objective trains the factors alone; the
+    adapter writes PEFT's files and `save` the merged weights straight from
+    the trainer's tree; and an objective a bundle builds decodes text
+    through the bundle's processor."""
+    from dew.data import ByteTokenizer
+    from dew.inference import RunProcessor
+    from dew.sampling import Sampling
+
+    source = decoder
+    tuned = source.lora(rank=2, modules=("q_proj", "v_proj"), key=jax.random.key(0))
+    assert source.adapter is None and tuned.adapter is not None
+    tokens = np.asarray(reference["input_ids"])
+    rows = 2 * jax.device_count()
+    batch = {"text": tokens[np.arange(rows) % 2]}
+    objective = tuned.lm_objective(tokens.shape[1] - 1)
+    trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(3), mesh=MeshSpec(),
+                      layout=Layout(min_shard=2**30))
+    initial = trainer.initial_state()
+    state = trainer.fit(Dataset(train=lambda partition: iter([batch, batch]), val=None, records=rows, batch=rows),
+                        steps=2, log_every=2)
+
+    assert set(_flat(state.params["params"])) == {
+        f"{'.'.join(target[1:])}.{factor}" for target in tuned.adapter.targets for factor in lora.FACTORS}
+    for before, after in zip(jax.tree.leaves(initial.params[FROZEN]), jax.tree.leaves(state.params[FROZEN]), strict=True):
+        np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
+    trained = thaw(state.params)
+    tuned.adapter.save(state.params, tmp_path / "adapter")
+    _, read = LoRA.load(source.model, source.variables, source.layouts, tmp_path / "adapter")
+    for name, leaf in _flat(read).items():
+        np.testing.assert_array_equal(np.asarray(leaf), np.asarray(_flat(trained)[name]), err_msg=name)
+    tuned.save(tmp_path / "merged", variables=state.params)
+    reloaded = load_pretrained(tmp_path / "merged", dtype="float32", attention_impl="reference")
+    ids = jnp.asarray(tokens)
+    np.testing.assert_allclose(np.asarray(reloaded.model.apply(reloaded.variables, ids)),
+                               np.asarray(tuned.model.apply(trained, ids)), atol=1e-5, rtol=0)
+
+    # A source that ships a tokenizer hands its processor to the objective.
+    processor = RunProcessor(ByteTokenizer())
+    tuned = dataclasses.replace(tuned, processor=processor)
+    task = tuned.lm_objective(tokens.shape[1] - 1).pipeline(state)
+    assert task.processor is processor
+    greedy = Sampling(temperature=0)
+    np.testing.assert_array_equal(task("hello", 3, key=1, sampling=greedy).host().tokens,
+                                  task([list(b"hello")], 3, key=1, sampling=greedy).host().tokens)
+    plain = dataclasses.replace(source, processor=processor)
+    assert plain.lm_objective(tokens.shape[1] - 1).pipeline(initial).processor is processor
+    other = RunProcessor(ByteTokenizer())
+    assert objective.pipeline(state, processor=other).processor is other
+
+
+def test_an_adapted_bundle_refuses_a_second_adapter_and_a_second_filter(decoder):
+    tuned = decoder.lora(rank=2, modules=("q_proj",), key=jax.random.key(0))
+    with pytest.raises(ValueError, match="already carries an adapter"):
+        tuned.lora(rank=2, modules=("v_proj",), key=jax.random.key(1))
+    with pytest.raises(ValueError, match="adapter already selects what trains"):
+        tuned.lm_objective(4, trainable=lambda path: True)
+
+
+def test_a_text_request_without_a_processor_names_the_argument(decoder):
+    from dew.inference import TextGeneration
+
+    with pytest.raises(ValueError, match="processor="):
+        TextGeneration(decoder.model, decoder.variables)("hello", 2, key=0)
+
+
 def test_export_writes_the_peft_file_back(decoder, loaded, tmp_path):
     """The factors land bitwise where PEFT wrote them, under its names, and
     the config resolves every module to the same rank and alpha on reload."""

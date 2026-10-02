@@ -44,7 +44,7 @@ from dew.artifacts import agree_process_phase, agreed
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep
 from dew.data import Dataset, DatasetSpec, Ramp, ramped
 from dew.data.dataset import json_list_argument
-from dew.lora import LoRA, attach
+from dew.lora import LoRA, _attach
 from dew.nn.attention import AttentionImpl
 from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.records import JSON, duration, recorded_duration
@@ -53,7 +53,7 @@ from dew.telemetry.instrumentation import default_compilation_cache_dir, dew_cac
 from dew.telemetry.records import RunRecord, json_value, packages_installed
 from dew.training.distributed import Layout, MeshSpec
 from dew.training.optim import ParamGroup, ScheduleBase, build_optimizer
-from dew.training.quantization import Quantization, quantize
+from dew.training.quantization import Quantization, _quantize
 from dew.training.selection import Best
 from dew.training.state import TrainState
 from dew.training.tracker import LocalTracker, Trackers, WandbTracker
@@ -674,9 +674,9 @@ class RunConfig:
                 f"reads {dataset.batch} records a step; load it with "
                 f"load(batch={self.trainer.batch_size})")
         if self.trainer.quantization is not None:
-            quantize(objective, self.trainer.quantization)
+            _quantize(objective, self.trainer.quantization)
         if self.lora is not None:
-            attach(objective, self.lora)
+            _attach(objective, self.lora)
         self = self._naming(objective)
         trainer = self.trainer
         # Before the run length, since a ramp reads fewer records a step early
