@@ -19,8 +19,6 @@ import numpy as np
 import optax
 import pytest
 
-import_module("test_diffusion_objective")  # registers "stub_text"
-
 import dew
 import dew.nn.backbones  # registers the models
 from dew.artifacts import VideoGrid
@@ -35,6 +33,8 @@ from dew.registry import presets, samplers
 from dew.sampling import CFG, Heun, TextToImage
 from dew.sampling.pipelines import Images, _with_drawn_tables
 from dew.training import Checkpoints, Trainer
+
+import_module("test_diffusion_objective")  # registers "stub_text"
 
 RES = 8
 MODEL = {"patch_size": 4, "emb_features": 16, "num_layers": 1, "num_heads": 2, "mlp_ratio": 1}
