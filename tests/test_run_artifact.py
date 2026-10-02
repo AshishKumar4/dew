@@ -61,6 +61,47 @@ def test_python_lm_run_saves_its_inference_record_without_run_json(tmp_path):
     np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
 
 
+@pytest.mark.parametrize("kind", ["text", "masked", "block"])
+def test_task_from_pretrained_selects_the_requested_snapshot(tmp_path, monkeypatch, kind):
+    from pathlib import Path
+
+    import dew.interop.hub as hub
+    from dew.diffusion.discrete import MDLM
+    from dew.inference import BlockGeneration, MaskedGeneration, TextGeneration
+    from dew.interop import Pretrained
+    from dew.objectives.diffusion import BlockDiffusionObjective, MaskedDiffusionObjective
+    from dew.training import TrainState
+
+    if kind == "text":
+        objective, task_type = LMObjective(model(), 8, ema_decay=None), TextGeneration
+    elif kind == "masked":
+        masked = model().clone(causal=False, mask_token_id=0, qk_norm=False)
+        objective, task_type = MaskedDiffusionObjective(masked, MDLM(mask_id=0)(), 8,
+                                                       ema_decay=None), MaskedGeneration
+    else:
+        fixture = Path(__file__).parent / "fixtures/hf/diffusion-gemma-workflow"
+        source = Pretrained.load(fixture, dtype="float32", max_seq_len=32)
+        objective = BlockDiffusionObjective(source.model, prompt_length=4, pretrained=source.variables)
+        task_type = BlockGeneration
+    original = objective.init(jax.random.key(0))
+    selected = jax.tree.map(lambda leaf: leaf + 2 if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf,
+                           original)
+    zero = jnp.asarray(0, jnp.int32)
+    for name, variables in (("main", original), ("pinned", selected)):
+        state = TrainState(step=zero, microstep=zero, updates=zero, variables=variables,
+                           opt_state=(), ema=None, key=jax.random.key(0), scale=None,
+                           window_size=jnp.asarray(1, jnp.int32))
+        checkpoints = Checkpoints(str(tmp_path / name))
+        checkpoints.save(0, state, None, artifact=objective.inference_record())
+        checkpoints.wait()
+    monkeypatch.setattr(hub, "snapshot_download", lambda repo_id, revision=None:
+                        tmp_path / ("main" if revision is None else {"pinned": "pinned"}[revision]))
+    task = task_type.from_pretrained("user/published-model", revision="pinned", ema=False)
+    assert jax.tree.structure(task.variables) == jax.tree.structure(selected)
+    for actual, expected in zip(jax.tree.leaves(task.variables), jax.tree.leaves(selected), strict=True):
+        np.testing.assert_array_equal(actual, expected)
+
+
 def test_builtin_process_records_preserve_noise_prediction_and_weights():
     from dew.diffusion.presets import EDM, Cosine, Flow
     for preset in (EDM(regime='pixel'), Flow(), Cosine()):
