@@ -334,7 +334,7 @@ def test_lm_head_variants_compute_the_same_loss_accuracy_and_gradients():
     for name in ("baseline", "stored", "remat"):
         head = tool.HEADS[name]
         (loss, accuracy), (d_states, d_table) = jax.value_and_grad(
-            lambda s, t: head(s, t, targets, variant), argnums=(0, 1), has_aux=True)(states, table)
+            lambda s, t, head=head: head(s, t, targets, variant), argnums=(0, 1), has_aux=True)(states, table)
         outputs[name] = (float(loss), float(accuracy), np.asarray(d_states), np.asarray(d_table))
 
     reference = outputs["baseline"]

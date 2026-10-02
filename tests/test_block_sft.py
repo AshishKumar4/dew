@@ -261,7 +261,7 @@ def test_denoiser_image_gradient_obeys_encoder_detachment(image_source):
         obj = BlockDiffusionObjective(loaded.model, prompt_length=8, pretrained=loaded.variables,
                                       encoder_loss_weight=0,
                                       stop_gradient_from_denoiser_to_encoder=detach)
-        def loss(pixels):
+        def loss(pixels, *, obj=obj):
             conditioned = inputs.replace(conditioning={**inputs.conditioning, "pixel_values": pixels})
             return scalar_loss(obj, variables, {"text": conditioned}, step)[0]
         gradient = jax.jit(jax.grad(loss))(inputs.conditioning["pixel_values"])

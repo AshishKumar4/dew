@@ -437,7 +437,7 @@ def test_both_dispatches_take_the_same_adam_steps_in_bf16(activation, skewed, sc
     for dispatch in ('global', 'exchange'):
         network = model.clone(dispatch=dispatch)
 
-        def objective(parameters, x, weights, choices):
+        def objective(parameters, x, weights, choices, *, network=network):
             y = jnp.asarray(network.apply(parameters, x, weights, choices))
             return jnp.mean(jnp.sin(y.astype(jnp.float32))), y
 
@@ -478,7 +478,7 @@ def test_both_dispatches_carry_the_same_tangents(activation):
         network = model.clone(dispatch=dispatch)
 
         def run(parameters, x, weights, dp, dx, dw, choices):
-            return jax.jvp(lambda parameters, x, weights: jnp.asarray(
+            return jax.jvp(lambda parameters, x, weights, network=network: jnp.asarray(
                 network.apply(parameters, x, weights, choices)), (parameters, x, weights), (dp, dx, dw))
 
         with jax.set_mesh(mesh):
@@ -603,7 +603,7 @@ def test_no_16_bit_operand_reaches_the_ragged_dot_at_the_highest_precision():
             program = jax.make_jaxpr(jax.grad(loss, argnums=(0, 1)))(x, kernel)
         refused = []
 
-        def walk(jaxpr):
+        def walk(jaxpr, *, refused=refused):
             for equation in jaxpr.eqns:
                 if equation.primitive.name.startswith("ragged_dot"):
                     kinds = {jnp.dtype(v.aval.dtype) for v in equation.invars[:2]}

@@ -187,7 +187,7 @@ def test_every_quantizer_and_top_k_input_is_as_exact_as_the_reference(source, fo
 def test_the_quantizers_pass_their_gradient_straight_through():
     x = jnp.linspace(-3.0, 3.0, 64).reshape(2, 32)
     for quant in (lambda v: fake_quant_fp8(v, 32), lambda v: fake_quant_fp4(v, 16, True)):
-        np.testing.assert_array_equal(jax.grad(lambda v: jnp.sum(quant(v) * v))(x),
+        np.testing.assert_array_equal(jax.grad(lambda v, quant=quant: jnp.sum(quant(v) * v))(x),
                                       quant(x) + x)
 
 

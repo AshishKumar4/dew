@@ -502,7 +502,7 @@ def integer_checkpoint(directory: Path, method: str) -> dict[str, np.ndarray]:
         stem = name.removesuffix(".weight")
         if method == "awq":
             order = list(codecs.AWQ_ORDER)
-            def pack(values):
+            def pack(values, *, order=order):
                 return codecs._words(values.reshape(values.shape[0], -1, 8)[..., order].reshape(values.shape), 4)
             stored |= {stem + ".qweight": pack(codes), stem + ".qzeros": pack(zeros), stem + ".scales": scales}
         else:
