@@ -343,7 +343,7 @@ class Objective(ABC, Generic[Loss, Effects]):
         Validation needs statistics, not the optimizer's gradient program.
         Keep the bound callable alive so repeated passes reuse compilation.
         """
-        return jax.jit(self.loss)
+        return jax.jit(lambda variables, batch, step: self.loss(variables, batch, step)[0])
 
     @property
     def scalars(self) -> TrainingScalars[Loss, Effects]:

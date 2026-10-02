@@ -384,3 +384,26 @@ def test_committed_metadata_is_cached_and_deleted_steps_leave_the_cache(tmp_path
     records = checkpoints.kept()
     records[0].rankings['value']['top'] = 99
     assert checkpoints.kept()[0].rankings['value']['top'] == 1
+
+
+def test_validation_loss_reuses_compilation_without_retaining_dead_objectives():
+    import gc
+    import weakref
+
+    from dew.training import evaluate
+
+    class Traced(Overfit):
+        traces = 0
+        def loss(self, params, batch, step):
+            self.traces += 1
+            return super().loss(params, batch, step)
+    objective = Traced()
+    variables = objective.init(jax.random.key(0))
+    for step in (1, 2):
+        report = evaluate(objective, variables, data().val, key=jax.random.key(0), step=step, loss=True)
+        assert report.scores['val/loss'] == .25
+    assert objective.traces == 1
+    owner = weakref.ref(objective)
+    del objective
+    gc.collect()
+    assert owner() is None
