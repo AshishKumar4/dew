@@ -2,11 +2,11 @@
 from __future__ import annotations
 
 import shutil
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple, Sequence
+from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -471,8 +471,10 @@ class HiddenStatesConditioner(ConditionEncoder[str | Mapping[str, object]]):
     keyword: ClassVar[str] = "conditioning"
 
     SYSTEM: ClassVar[str] = (
-        "You are an AI that reasons about image descriptions. You give structured responses focusing on object "
-        "relationships, object\nattribution and actions without speculation.")
+        "You are an AI that reasons about image descriptions. You give structured responses "
+        "focusing on object "
+        "relationships, object\nattribution and actions without speculation."
+    )
     """FLUX.2's `SYSTEM_MESSAGE`, from black-forest-labs/flux2 at 5a5d316b."""
 
     def _conversation(self, prompt: str) -> tuple[list[dict], dict]:
@@ -490,8 +492,15 @@ class HiddenStatesConditioner(ConditionEncoder[str | Mapping[str, object]]):
                         params: Variables | None = None):
         from dew.interop.pretrained import load_hidden_states_conditioner
 
-        return load_hidden_states_conditioner(checkpoint, dtype=dtype, param_dtype=param_dtype, revision=revision,
-                                              attention_impl=attention_impl, tokens=tokens, params=params)
+        return load_hidden_states_conditioner(
+            checkpoint,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            revision=revision,
+            attention_impl=attention_impl,
+            tokens=tokens,
+            params=params,
+        )
 
     def tokenize(self, texts: Sequence[str | Mapping[str, object]]):
         rows, guidance = [], []
@@ -554,7 +563,9 @@ def _cubic_weights(source: int, target: int) -> tuple[np.ndarray, np.ndarray]:
                           np.where(x < 2, ((-0.5 * x + 2.5) * x - 4) * x + 2, 0.0))
         normalized = kernel / kernel.sum() * (1 << 22)
         indices[row, :right - left] = np.arange(left, right)
-        weights[row, :right - left] = np.trunc(normalized + np.where(normalized >= 0, 0.5, -0.5)).astype(np.int32)
+        weights[row, : right - left] = np.trunc(normalized + np.where(normalized >= 0, 0.5, -0.5)).astype(
+            np.int32
+        )
     return indices, weights
 
 
@@ -588,10 +599,16 @@ class CLIPImageTransform:
             size = size["shortest_edge"] if "shortest_edge" in size else (size["height"], size["width"])
         crop = config.get("crop_size", {"height": 224, "width": 224})
         crop = (crop, crop) if isinstance(crop, int) else (crop["height"], crop["width"])
-        return cls(size, crop, tuple(config.get("image_mean", (0.48145466, 0.4578275, 0.40821073))),
-                   tuple(config.get("image_std", (0.26862954, 0.26130258, 0.27577711))),
-                   config.get("rescale_factor", 1 / 255) if config.get("do_rescale", True) else 1.0,
-                   config.get("do_resize", True), config.get("do_center_crop", True), config.get("do_normalize", True))
+        return cls(
+            size,
+            crop,
+            tuple(config.get("image_mean", (0.48145466, 0.4578275, 0.40821073))),
+            tuple(config.get("image_std", (0.26862954, 0.26130258, 0.27577711))),
+            config.get("rescale_factor", 1 / 255) if config.get("do_rescale", True) else 1.0,
+            config.get("do_resize", True),
+            config.get("do_center_crop", True),
+            config.get("do_normalize", True),
+        )
 
     def __call__(self, pixels):
         pixels = jnp.asarray(pixels, jnp.float32)
@@ -611,7 +628,9 @@ class CLIPImageTransform:
             # Each integer pass rounds and clamps before the next pass, as
             # Pillow does. Sparse taps avoid a dense HxW resampling matrix.
             pixels = pixels.astype(jnp.int32)
-            horizontal = jnp.sum(jnp.take(pixels, column_indices, axis=2) * columns[None, None, :, :, None], axis=3)
+            horizontal = jnp.sum(
+                jnp.take(pixels, column_indices, axis=2) * columns[None, None, :, :, None], axis=3
+            )
             pixels = jnp.clip((horizontal + (1 << 21)) >> 22, 0, 255)
             vertical = jnp.sum(jnp.take(pixels, row_indices, axis=1) * rows[None, :, :, None, None], axis=2)
             pixels = jnp.clip((vertical + (1 << 21)) >> 22, 0, 255).astype(jnp.float32)

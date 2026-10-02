@@ -136,15 +136,17 @@ class _Block:
 _ARCHITECTURE = (
     (_Block("edge", 128, stride=2, expansion=4, middle_kernel=3),)
     + (_Block("edge", 128, expansion=4, middle_kernel=3),) * 2,
-    (_Block("inverted", 256, stride=2, expansion=6, start_kernel=3, middle_kernel=5), *tuple(_Block("inverted", 256, expansion=4, start_kernel=k) for k in (5, 3, 5, 3))),
+    (
+        _Block("inverted", 256, stride=2, expansion=6, start_kernel=3, middle_kernel=5),
+        *tuple(_Block("inverted", 256, expansion=4, start_kernel=k) for k in (5, 3, 5, 3)),
+    ),
     (_Block("inverted", 640, stride=2, expansion=6, start_kernel=5, middle_kernel=5),)
     + (_Block("inverted", 640, expansion=4, start_kernel=5),) * 7
     + (_Block("inverted", 640),)
-    + (_Block("attention", 640, heads=12, head_dim=64, kv_stride=2),
-       _Block("inverted", 640, expansion=2)) * 14,
+    + (_Block("attention", 640, heads=12, head_dim=64, kv_stride=2), _Block("inverted", 640, expansion=2))
+    * 14,
     (_Block("inverted", 1280, stride=2, expansion=6, start_kernel=5, middle_kernel=5),)
-    + (_Block("attention", 1280, heads=16, head_dim=96),
-       _Block("inverted", 1280, expansion=2)) * 19,
+    + (_Block("attention", 1280, heads=16, head_dim=96), _Block("inverted", 1280, expansion=2)) * 19,
 )
 
 

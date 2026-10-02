@@ -113,7 +113,9 @@ def xla_ragged_dot(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     index_dtype = jnp.int32 if tokens.shape[0] <= np.iinfo(np.int32).max else jnp.int64
     if group_sizes.dtype == jnp.int64:
         group_sizes = group_sizes.astype(index_dtype)
-    grouped = jnp.arange(tokens.shape[0], dtype=index_dtype)[:, None] < jnp.sum(group_sizes, dtype=index_dtype)
+    grouped = jnp.arange(tokens.shape[0], dtype=index_dtype)[:, None] < jnp.sum(
+        group_sizes, dtype=index_dtype
+    )
     out = jax.lax.ragged_dot(
         jnp.where(grouped, tokens, 0), kernel, group_sizes, precision=precision,
         preferred_element_type=preferred_element_type)

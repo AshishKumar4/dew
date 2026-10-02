@@ -154,7 +154,9 @@ class MeanFlowObjective(DiffusionObjective):
         t, r = intervals(schedule.sample_t(later, count), schedule.sample_t(earlier, count),
                          self.instantaneous)
         noise = jax.random.normal(noise_key, samples.shape, dtype=jnp.float32)
-        z, _, v = self.process.prediction.forward_diffusion(samples, noise, broadcast_rates(schedule, t, samples))
+        z, _, v = self.process.prediction.forward_diffusion(
+            samples, noise, broadcast_rates(schedule, t, samples)
+        )
         variables = self.trainable(params)
 
         def velocity(conditions, *, train: bool) -> Velocity:
@@ -171,8 +173,15 @@ class MeanFlowObjective(DiffusionObjective):
             inside = (t >= start) & (t <= stop)
             omega = expand(jnp.where(inside, self.omega, 1.0), v)
             kappa = expand(jnp.where(inside, self.kappa, 0.0), v)
-            guided = jax.lax.stop_gradient(guided_velocity(
-                v, velocity(blank, train=False)(z, t, t), velocity(given, train=False)(z, t, t), omega, kappa))
+            guided = jax.lax.stop_gradient(
+                guided_velocity(
+                    v,
+                    velocity(blank, train=False)(z, t, t),
+                    velocity(given, train=False)(z, t, t),
+                    omega,
+                    kappa,
+                )
+            )
         else:
             guided = v
         dropped = jax.random.bernoulli(jax.random.fold_in(drop_key, 1), self.unconditional_prob, (count,))
@@ -234,7 +243,9 @@ class ShortcutObjective(DiffusionObjective):
         sigma = 1 - jax.random.randint(time_key, (count,), 0, grid.astype(jnp.int32)) / grid
         step_size = jnp.concatenate([2.0 ** -levels, jnp.full((count - rows,), 1 / self.sections)])
         noise = jax.random.normal(noise_key, samples.shape, dtype=jnp.float32)
-        x, _, v = self.process.prediction.forward_diffusion(samples, noise, broadcast_rates(schedule, sigma, samples))
+        x, _, v = self.process.prediction.forward_diffusion(
+            samples, noise, broadcast_rates(schedule, sigma, samples)
+        )
         dropped = jnp.arange(count) >= rows
         dropped &= jax.random.bernoulli(jax.random.fold_in(drop_key, 1), self.unconditional_prob, (count,))
         conditions = jax.tree.map(lambda value, null: jnp.where(expand(dropped, value), null, value),
@@ -242,9 +253,15 @@ class ShortcutObjective(DiffusionObjective):
 
         def velocity(variables, conditions, *, train: bool) -> Velocity:
             def over(x, sigma, following) -> jax.Array:
-                output = self.model.apply(variables, x, schedule.model_time(sigma), **conditions,
-                                          duration=schedule.model_time(sigma) - schedule.model_time(following),
-                                          train=train, rngs={"dropout": dropout_key})
+                output = self.model.apply(
+                    variables,
+                    x,
+                    schedule.model_time(sigma),
+                    **conditions,
+                    duration=schedule.model_time(sigma) - schedule.model_time(following),
+                    train=train,
+                    rngs={"dropout": dropout_key},
+                )
                 assert isinstance(output, jax.Array)
                 return output
             return over

@@ -8,8 +8,8 @@ The encoder is --model, the predictor takes the encoder's width and heads plus
 --predictor, and the probes score the frozen encoder at every validation.
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Mapping
 
 import tyro
 

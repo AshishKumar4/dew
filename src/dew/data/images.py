@@ -47,6 +47,10 @@ from .tokens import bounded
 
 Augmentation = Literal["none", "flip_only", "flip_jitter"]
 
+LABEL = "label"
+"""The batch field a record's class index travels in, and the column name a
+hub dataset keeps it under unless its spec names another."""
+
 
 def import_opencv() -> None:
     """Import OpenCV in the thread that opens a loader, before its readers start.
@@ -253,16 +257,14 @@ def class_names(path: str) -> tuple[str, ...]:
         return tuple(line.strip() for line in handle)
 
 
-def record_caption(element) -> str:
-    """The caption a record already carries, for datasets that ship their text.
-
-    Hub image datasets keep it in a 'caption' or a 'text' column.
-    """
-    for key in ("caption", "text"):
+def record_caption(element, columns: tuple[str, ...] = ("caption", "text")) -> str:
+    """The caption a record already carries, for datasets that ship their text:
+    the first of `columns` it holds."""
+    for key in columns:
         if key in element:
             return element[key]
     raise KeyError(
-        "an image record needs a 'caption' or a 'text' column, this one has "
+        f"an image record needs one of the columns {list(columns)}, this one has "
         f"{sorted(element)}")
 
 
@@ -321,7 +323,7 @@ class ImageTransform(pygrain.RandomMapTransform):
             record["image_augmentation_key"] = rng.integers(0, 2**32, size=2, dtype=np.uint32)
         if label is not None:
             # the class index, which the JEPA linear/kNN probes score against
-            record["label"] = np.int32(label)
+            record[LABEL] = np.int32(label)
         return record
 
 
@@ -346,17 +348,17 @@ class ImageDataset(DatasetSpec):
     augmentation_backend: Literal["host", "device"] = "host"
     """Host OpenCV/NumPy, or JAX augmentation of the decoded device batch."""
     crop_scale: tuple[float, float] = (1.0, 1.0)
-    """Uniform retained area fraction, resized bilinearly; (1, 1) keeps the full image.
-
-    Training and validation both use this crop and the augmentation mode.
-    Validation's per-record draws repeat each pass; augmentation="none"
-    keeps the full-image resize for evaluation.
-    """
+    """Uniform retained area fraction, resized bilinearly; (1, 1) keeps the full image."""
     augmentation_size: int | None = None
     """Square decoded staging size before random crop; None uses image_size."""
     val_batches: int | None = 4
     val_split: str | None = None
     count: int | None = None
+    augment_validation: bool = dataclasses.field(default=False, metadata={"legacy": True})
+    """Whether validation takes the training crop, flip and jitter. Off, it
+    reads the deterministic full-image resize a reference metric compares
+    against. On, each record's draws repeat every pass. A record that lacks
+    the field was written when validation was augmented, and reads as on."""
 
     def __post_init__(self):
         if self.augmentation_backend not in ("host", "device"):
@@ -444,8 +446,10 @@ class ImageDataset(DatasetSpec):
                                      type(self).__name__)
         if self.val_split:
             validation = self.source(self.val_split)
+        evaluated = self if self.augment_validation else dataclasses.replace(
+            self, augmentation="none", augmentation_backend="host", crop_scale=(1.0, 1.0))
         scored = None if validation is None else tokenized(
-            validation_pass(validation, [ImageTransform(self)], batch=batch,
+            validation_pass(validation, [ImageTransform(evaluated)], batch=batch,
                             seed=self.seed, loading=self.loading), tokenize)
         if self.val_split and scored is not None:
             scored = bounded(scored, self.val_batches)
@@ -453,9 +457,10 @@ class ImageDataset(DatasetSpec):
                                           seed=self.seed, loading=self.loading), tokenize)
         return Dataset(
             train=self.processed(training),
-            val=None if scored is None else self.processed(scored),
+            val=None if scored is None else evaluated.processed(scored),
             records=len(train),
             batch=batch,
+            held_out=0 if validation is None or self.val_split else held_out,
         )
 
 
@@ -508,13 +513,20 @@ class OxfordFlowers(ImageDataset):
 @datasets("hf_images")
 @dataclasses.dataclass(frozen=True)
 class HFImages(ImageDataset):
-    """Reads a Hugging Face hub dataset of images by index, captioned from its
-    'caption' or 'text' column.
+    """Reads a Hugging Face hub dataset of images by index.
 
     `name` is the repo id and `split` the split to read. `options` is
     everything else `datasets.load_dataset` takes, the same value the `hf`
     provider holds, so a dataset behind a config name, a revision, its own
     `data_files` or a token is read here too.
+
+    The columns say where a record keeps its fields. `image_column` holds the
+    image; the caption is the first of `caption_columns` a record has, and
+    an empty tuple reads an uncaptioned dataset, such as a class-labelled
+    one, for an unconditional or class-conditional run. `label_column` is
+    the class index a record carries as `label`: the default name is read
+    where the dataset has it, any other name is required, and None reads
+    none. A column the split does not hold is refused when the spec loads.
 
     Its images arrive decoded by `datasets` rather than by `decode_image`,
     so a JPEG's EXIF orientation is applied, where `decode_image` keeps the
@@ -523,19 +535,45 @@ class HFImages(ImageDataset):
 
     name: str = ""
     split: str = "train"
-    options: HubOptions = HFOptions()
+    options: HubOptions = dataclasses.field(default_factory=HFOptions)
+    image_column: str = "image"
+    caption_columns: tuple[str, ...] = ("caption", "text")
+    label_column: str | None = LABEL
+
+    def load(self, *, batch: int, tokenize: Tokenize | None = None) -> Dataset:
+        if not self.caption_columns and tokenize is not None:
+            raise TypeError(
+                "HFImages with caption_columns=() reads no captions, so tokenize= has "
+                "nothing to read; name the caption column, or train without conditions")
+        return super().load(batch=batch, tokenize=tokenize)
 
     def source(self, split: str | None = None):
         from .sources.hf import HFDatasetSource
         if not self.name:
             raise ValueError("HFImages needs name= set to a hub dataset repo id")
-        return HFDatasetSource(name=self.name, split=split or self.split,
-                               options=self.options)
+        source = HFDatasetSource(name=self.name, split=split or self.split,
+                                 options=self.options)
+        self._check_columns(source.columns, split or self.split)
+        return source
+
+    def _check_columns(self, columns: list[str], split: str) -> None:
+        """Refuse a column field the split does not hold, naming what it holds."""
+        held = f"{self.name!r} split {split!r} has the columns {sorted(columns)}"
+        if self.image_column not in columns:
+            raise ValueError(f"image_column={self.image_column!r}, and {held}; name its image column")
+        if self.caption_columns and not set(self.caption_columns) & set(columns):
+            raise ValueError(
+                f"caption_columns={self.caption_columns!r}, and {held}; name its caption "
+                f"column, or set caption_columns=() for a dataset without captions")
+        if self.label_column not in (None, LABEL, *columns):
+            raise ValueError(
+                f"label_column={self.label_column!r}, and {held}; name its class column, or None")
 
     def record(self, element: Batch | bytes, rng):
         element = _fields(element, "HFImages")
-        label = element.get("label")
-        return element["image"], record_caption(element), None if label is None else int(label)
+        caption = record_caption(element, self.caption_columns) if self.caption_columns else ""
+        label = None if self.label_column is None else element.get(self.label_column)
+        return element[self.image_column], caption, None if label is None else int(label)
 
 
 @datasets("array_record_images")

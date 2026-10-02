@@ -150,12 +150,7 @@ class S5Layer(nn.Module):
 
         y = y + D[None, None, :] * u_float  # [B, S, F]
 
-        if self.dtype is not None:
-            y = y.astype(self.dtype)
-        else:
-            y = y.astype(u.dtype)
-
-        return y
+        return y.astype(self.dtype) if self.dtype is not None else y.astype(u.dtype)
 
 
 @logical_axes({}, heuristic=(("s5_*",), ("out_proj",)))

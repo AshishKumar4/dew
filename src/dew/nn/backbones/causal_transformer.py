@@ -24,7 +24,8 @@ where a linear-attention mixer goes.
 import dataclasses
 import functools
 import math
-from typing import Callable, Literal, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from typing import Literal
 
 import flax.core
 import jax
@@ -56,7 +57,7 @@ from ..hyper_connections import (
     first_stream,
 )
 from ..inputs import AttentionMetadata, LayerInputs, PredictionPhase
-from ..kv_cache import KVCache, is_paged
+from ..kv_cache import KVCache, gather_cache_rows as gather_cache_rows
 from ..mixers import AttentionMixer, MixerBase, MixerContext
 from ..mixers.mamba2 import Mamba2Mixer
 from ..mla import INDEXER_COLLECTION
@@ -184,7 +185,7 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
         inputs = None if per_layer_input is None else per_layer_input.span(first, count)
         store = kv_store if count == 1 or specs[first].kv_shared else None
 
-        def step(layer, carry, per_layer_input):
+        def step(layer, carry, per_layer_input, *, store=store):
             return layer(carry, train=train, decode=decode, positions=positions,
                          segment_ids=segment_ids, kv_store=store,
                          per_layer_input=per_layer_input,
@@ -197,7 +198,7 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
             # host operand and refetches only this layer in backward
             # (MaxText layers/decoders.py:544-565).
             step = nn.remat(nn.map_variables(
-                step, True, trans_in_fn=_fetched, init=False, mutable=True))
+                step, mapped_collections=True, trans_in_fn=_fetched, init=False, mutable=True))
         if count == 1:
             x, _ = step(run, x, None if inputs is None else inputs.layer(0))
         else:
@@ -283,7 +284,7 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
         store = kv_store if count == 1 or specs[first].kv_shared else None
         mutable = [name for name in WRITTEN if run.is_mutable_collection(name)]
 
-        def layer(read, cache, hidden, per_layer_slice):
+        def layer(read, cache, hidden, per_layer_slice, *, run=run, mutable=mutable, store=store):
             variables = dict(read) if cache is None else {**read, 'cache': cache}
             hidden, changed = run.apply(
                 variables, hidden, mutable=mutable, train=train, decode=decode,
@@ -679,11 +680,13 @@ class CausalTransformer(nn.Module):
     num_layers: int = 8
     num_heads: int = 8
     num_kv_heads: int | None = None       # None: as many as the query heads
-    head_dim: int | None = None           # None: emb_features // num_heads
-    mlp: GatedActivation = 'swiglu'          # 'swiglu' | 'geglu' | 'geglu_exact' | 'swigluoai', or Kimi K3's Situ
+    head_dim: int | None = None  # None: emb_features // num_heads
+    mlp: GatedActivation = "swiglu"  # 'swiglu' | 'geglu' | 'geglu_exact' | 'swigluoai', or Kimi K3's Situ
     mlp_bias: bool = False
     """Bias both feed-forward projections; gelu, gelu_exact and relu are ungated."""
-    mlp_features: int | tuple[int, ...] | None = None  # None: four times emb_features; a tuple: one width per layer (Gemma 3n); 0: no feed-forward (Mamba-2)
+    mlp_features: int | tuple[int, ...] | None = None
+    """None: four times emb_features; a tuple: one width per layer (Gemma 3n);
+    0: no feed-forward (Mamba-2)."""
     max_seq_len: int = 2048
     position_embedding: Literal['rotary', 'learned'] = 'rotary'
     position_embedding_size: int | None = None
@@ -787,9 +790,12 @@ class CausalTransformer(nn.Module):
     decoder blocks attending with its `layer_type` kind's V4 attention as a
     `DSparkAttention`, and its target layers sow the stream means it reads
     (`draft_context`). None is a model without one."""
-    swiglu_limit: float | None = None      # GLM-5.3-Flash's clamp before every gated MLP's activation
-    activation_sparsity_pattern: tuple[float, ...] | None = None  # Gemma 3n's gaussian top-k, one fraction per layer
-    mask_token_id: int | None = None  # the vocabulary id a masked-diffusion objective corrupts to; None is plain training
+    swiglu_limit: float | None = None  # GLM-5.3-Flash's clamp before every gated MLP's activation
+    activation_sparsity_pattern: tuple[float, ...] | None = None
+    """Gemma 3n's gaussian top-k, one fraction per layer."""
+    mask_token_id: int | None = None
+    """The vocabulary id a masked-diffusion objective corrupts to;
+    None is plain training."""
     scan_layers: bool = False                 # runs of like layers under flax's scan
     bank_layers: int | None = None
     """The most layers one scanned run holds, which is how many its parameter
@@ -1056,7 +1062,9 @@ class CausalTransformer(nn.Module):
         if len(types) != self.num_layers:
             raise ValueError(
                 f"layer_types has {len(types)} entries for {self.num_layers} layers")
-        prediction_kinds = {self.mtp_layer_type} if self.num_nextn_predict_layers and self.mtp_layer_type else set()
+        prediction_kinds = (
+            {self.mtp_layer_type} if self.num_nextn_predict_layers and self.mtp_layer_type else set()
+        )
         if self.dspark is not None:
             prediction_kinds.add(self.dspark.layer_type)
         unnamed = sorted(set(self.kinds or {}) - set(types) - prediction_kinds)
@@ -1114,8 +1122,9 @@ class CausalTransformer(nn.Module):
             raise ValueError('scale_offset describes RMSNorm weights')
         if self.position_embedding not in ('rotary', 'learned'):
             raise ValueError('position_embedding must be rotary or learned')
-        if self.position_embedding == 'learned' and (
-                self.mixer is not None or any(kind.mixer is not None for kind in (self.kinds or {}).values())):
+        if self.position_embedding == "learned" and (
+            self.mixer is not None or any(kind.mixer is not None for kind in (self.kinds or {}).values())
+        ):
             raise ValueError('learned positions require the default unrotated attention mixer')
         if self.position_embedding_size is not None and (
                 self.position_embedding != 'learned' or self.position_embedding_size < self.max_seq_len):
@@ -1124,31 +1133,17 @@ class CausalTransformer(nn.Module):
                 self.position_embedding != 'learned' or self.position_embedding_size is None
                 or self.position_embedding_size < self.max_seq_len + self.position_embedding_offset)):
             raise ValueError('position_embedding_offset requires learned table rows past max_seq_len')
-        if self.position_embedding != 'rotary' and (
-                self.partial_rotary_factor is not None or self.rope_scaling is not None or self.yarn is not None):
+        if self.position_embedding != "rotary" and (
+            self.partial_rotary_factor is not None or self.rope_scaling is not None or self.yarn is not None
+        ):
             raise ValueError('rotary scaling requires rotary positions')
         if self.mixture is not None and (self.mlp_bias or self.mlp in ('gelu', 'gelu_exact', 'relu')):
             raise ValueError('the routed experts require a bias-free gated MLP')
         if self.num_nextn_predict_layers and (self.norm_type != 'rms' or self.position_embedding != 'rotary'):
             raise ValueError('prediction depths require RMSNorm and rotary positions')
 
-    def refuse_unbuildable_fields(self, kinds: Mapping[str, "ResolvedKind"]):
-        """Raise for a field, or a pair of fields, this model cannot build.
-
-        Each check names the field the caller set and what a model without
-        it looks like, so a translated config says which entry to fix.
-        """
-        self.refuse_unbuildable_mup(kinds)
-        self.refuse_unbuildable_dropout(kinds)
-        self.refuse_unbuildable_classic_fields()
-        mtp_hc = self.mtp_hyper_connections
-        if mtp_hc is not None:
-            if self.num_nextn_predict_layers != 1:
-                raise ValueError("mtp_hyper_connections requires a single prediction depth")
-            if mtp_hc.head != 'weighted':
-                raise ValueError("mtp_hyper_connections requires the V4 weighted stream-collapse head")
-            if self.hyper_connections is None or mtp_hc.hc_mult != self.hyper_connections.hc_mult:
-                raise ValueError("mtp_hyper_connections must match the trunk's residual stream count")
+    def refuse_unbuildable_kinds(self, kinds: Mapping[str, "ResolvedKind"]):
+        """Validate each kind's rotary, local-mask and grouped-head geometry."""
         for layer_type, kind in sorted(kinds.items()):
             if self.position_embedding == 'rotary' and kind.head_dim % 2:
                 raise ValueError(
@@ -1172,6 +1167,25 @@ class CausalTransformer(nn.Module):
                 raise ValueError(
                     f"num_heads ({self.num_heads}) must be a multiple of the key/value "
                     f"heads of {layer_type!r} ({kind.num_kv_heads})")
+
+    def refuse_unbuildable_fields(self, kinds: Mapping[str, "ResolvedKind"]):
+        """Raise for a field, or a pair of fields, this model cannot build.
+
+        Each check names the field the caller set and what a model without
+        it looks like, so a translated config says which entry to fix.
+        """
+        self.refuse_unbuildable_mup(kinds)
+        self.refuse_unbuildable_dropout(kinds)
+        self.refuse_unbuildable_classic_fields()
+        mtp_hc = self.mtp_hyper_connections
+        if mtp_hc is not None:
+            if self.num_nextn_predict_layers != 1:
+                raise ValueError("mtp_hyper_connections requires a single prediction depth")
+            if mtp_hc.head != 'weighted':
+                raise ValueError("mtp_hyper_connections requires the V4 weighted stream-collapse head")
+            if self.hyper_connections is None or mtp_hc.hc_mult != self.hyper_connections.hc_mult:
+                raise ValueError("mtp_hyper_connections must match the trunk's residual stream count")
+        self.refuse_unbuildable_kinds(kinds)
         if self.num_heads % self.kv_heads:
             raise ValueError(
                 f"num_heads ({self.num_heads}) must be a multiple of num_kv_heads "
@@ -1950,8 +1964,15 @@ class CausalTransformer(nn.Module):
             self.sow("embeddings", "prepared", prepared,
                      reduce_fn=lambda _, value: value, init_fn=lambda: prepared)
         ple = self._layer_inputs(tokens, x, routed_experts, routed)
-        residual = self.stack(self._expand(x), train=train, decode=decode, positions=positions,
-                              segment_ids=segment_ids, per_layer_input=ple, attention_metadata=attention_metadata)
+        residual = self.stack(
+            self._expand(x),
+            train=train,
+            decode=decode,
+            positions=positions,
+            segment_ids=segment_ids,
+            per_layer_input=ple,
+            attention_metadata=attention_metadata,
+        )
         streams, x = self._collapse(residual)
         hidden = constrain(self.norm(x), RESIDUAL)
         if self.logits_scaling != 1.0:
@@ -2017,7 +2038,7 @@ class CausalTransformer(nn.Module):
             groups = scan_groups(self.specs, self.bank_layers)
             if any(count > 1 for _, count in groups):
                 view = StackView(groups)
-                run = nn.map_variables(type(self)._stacked, True, trans_in_fn=view.stack,
+                run = nn.map_variables(type(self)._stacked, mapped_collections=True, trans_in_fn=view.stack,
                                        trans_out_fn=view.unstack, init=True, mutable=True)
                 return run(self, view, x, train, decode, positions, segment_ids,
                            per_layer_input, attention_metadata)
@@ -2084,7 +2105,7 @@ class CausalTransformer(nn.Module):
             per_layer_input=per_layer_input, attention_metadata=attention_metadata)
         # A carried collapse stays fp32, as the reference keeps it.
         x = x._replace(streams=x.streams.astype(dtype)) if isinstance(x, Carried) else x.astype(dtype)
-        run = nn.map_variables(type(self)._stacked, True, trans_in_fn=view.stack,
+        run = nn.map_variables(type(self)._stacked, mapped_collections=True, trans_in_fn=view.stack,
                                trans_out_fn=view.unstack, init=False, mutable=True)
         return run(self, view, x, train, decode, positions, segment_ids, per_layer_input, attention_metadata)
 
@@ -2245,8 +2266,15 @@ class CausalTransformer(nn.Module):
                 kv_store={} if self.sharing_layers else None,
                 per_layer_input=per_layer_input, attention_metadata=attention_metadata,
                 banked='params' in view.banked)
-        return self._pipeline(view, x, train=train, positions=positions,
-                              segment_ids=segment_ids, per_layer_input=per_layer_input, attention_metadata=attention_metadata)
+        return self._pipeline(
+            view,
+            x,
+            train=train,
+            positions=positions,
+            segment_ids=segment_ids,
+            per_layer_input=per_layer_input,
+            attention_metadata=attention_metadata,
+        )
 
     def _pipeline(self, view: StackView, x, *, train: bool, positions, segment_ids,
                   per_layer_input, attention_metadata=None):
@@ -2277,7 +2305,9 @@ class CausalTransformer(nn.Module):
         x = micro(x, batch_axis)
         per_row = [None if value is None else micro(jnp.asarray(value), 0)
                    for value in (positions, segment_ids)]
-        inputs = None if per_layer_input is None else jax.tree.map(lambda value: micro(value, 0), per_layer_input)
+        inputs = (
+            None if per_layer_input is None else jax.tree.map(lambda value: micro(value, 0), per_layer_input)
+        )
         metadata = jax.tree.map(lambda value: micro(value, 0), attention_metadata)
         slots = count // stages
         state_io = _on_stage_axis(x.reshape((stages, slots, *x.shape[1:])))
@@ -2456,31 +2486,3 @@ class CausalTransformer(nn.Module):
         the ones after it.
         """
         self(jnp.zeros((batch_size, 1), jnp.int32), decode=True)
-
-
-def gather_cache_rows(cache, rows):
-    """A decode cache reindexed on its batch axis, one gather per leaf.
-
-    Outside the layer stack a cache holds one subtree per layer, and every
-    leaf a decode step writes carries its batch on axis zero: dense keys and
-    values with their cached validity and cursor, a gated delta net's
-    convolution and recurrent state, latent attention's compressed cache,
-    cached image groups, and a multimodal model's next position. The scanned
-    stack's layer axis exists only inside `run_stack`; `StackView` removes it
-    before the cache crosses `apply`, so axis zero is the row here whatever
-    the stack did.
-
-    `rows` is any index array: repeats duplicate a row's whole decode state,
-    a permutation reparents rows, and a shorter or longer array changes the
-    row count. Beam branching and speculative rollback are both this
-    operation. Nothing else in the tree depends on the row order, so the
-    gathered cache decodes exactly as the rows it came from.
-
-    A paged cache (`dew.nn.kv_cache`) keeps its keys in a pool the rows
-    share through their page tables, so gathered rows would write into each
-    other's pages; it is refused.
-    """
-    if is_paged(cache):
-        raise ValueError("beam search and speculative decoding regroup cache rows, which a "
-                         "paged cache's shared pool cannot do; decode them with a dense cache")
-    return jax.tree.map(lambda leaf: jnp.take(leaf, rows, axis=0), cache)

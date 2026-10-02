@@ -159,7 +159,9 @@ def place_leaf(value, target: NamedSharding) -> jax.Array:
         # the host before any transfer.
         shards = []
         for device, index in target.addressable_devices_indices_map(value.shape).items():
-            shard = jax.device_put(value.read(index), SingleDeviceSharding(device, memory_kind=target.memory_kind))
+            shard = jax.device_put(
+                value.read(index), SingleDeviceSharding(device, memory_kind=target.memory_kind)
+            )
             shards.append(jax.block_until_ready(shard))
         value.release()
         return jax.make_array_from_single_device_arrays(value.shape, target, shards)
