@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from dew.config import RunConfig
+from dew.config import RunConfig, TrainerConfig
 from dew.objectives.diffusion import DiffusionRunConfig
 from dew.objectives.lm.config import LMRunConfig
 from dew.training.quantization import Quantization
@@ -39,10 +39,13 @@ def written(config) -> dict:
 
 @pytest.mark.parametrize("config", ["run", "diffusion", "lm", "recipe_lm", "recipe_jepa"])
 def test_a_run_config_reads_back_from_its_own_record(config):
-    cls = {"run": RunConfig, "diffusion": DiffusionRunConfig, "lm": LMRunConfig,
-           "recipe_lm": recipe_config("lm", "LmRunConfig"),
-           "recipe_jepa": recipe_config("jepa", "JepaRunConfig")}[config]
-    assert cls.from_dict(written(cls())) == cls()
+    if config == "recipe_jepa":
+        # A JEPA run validates through probes it has no classes for by default.
+        value = recipe_config("jepa", "JepaRunConfig")(trainer=TrainerConfig(eval_every=None))
+    else:
+        value = {"run": RunConfig, "diffusion": DiffusionRunConfig, "lm": LMRunConfig,
+                 "recipe_lm": recipe_config("lm", "LmRunConfig")}[config]()
+    assert type(value).from_dict(written(value)) == value
 
 
 def test_a_record_keeps_what_it_states_and_defaults_what_it_lacks():
