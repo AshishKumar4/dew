@@ -26,8 +26,8 @@ import jax.numpy as jnp
 import numpy as np
 from PIL import Image
 
-from dew import models
 from dew.diffusion.presets import Cosine, Flow
+from dew.nn.backbones import CausalTransformer, Mixture
 from dew.training import Layout, MeshSpec, build_mesh
 from dew.training.distributed import batch_shardings
 
@@ -107,8 +107,8 @@ def mesh_figure():
     ids = np.vectorize(lambda d: d.id)(mesh.devices)  # (data, expert, fsdp, tensor, sequence, stage)
     coords = {int(ids[d, 0, f, k, 0, 0]): (d, f, k) for d in range(2) for f in range(2) for k in range(2)}
 
-    model = models.build("causal_transformer", vocab_size=512, emb_features=256, num_layers=1,
-                         num_heads=4, mlp_features=1024, max_seq_len=64)
+    model = CausalTransformer(vocab_size=512, emb_features=256, num_layers=1,
+                              num_heads=4, mlp_features=1024, max_seq_len=64)
     shapes = jax.eval_shape(lambda: model.init(jax.random.key(0), jnp.zeros((1, 64), jnp.int32)))
     kernel_shape = shapes["params"]["layers_0"]["mlp"]["up_proj"]["kernel"].shape
     kernel = Layout().shardings(mesh, shapes)["params"]["layers_0"]["mlp"]["up_proj"]["kernel"]
@@ -289,9 +289,9 @@ def diffusion_figure():
 
 def moe_routing_figure():
     """The router's choices in a tiny mixture decoder, read from its sown `router` collection."""
-    model = models.build("causal_transformer", vocab_size=32, emb_features=16, num_layers=2, num_heads=2,
-                         mlp_features=32, max_seq_len=64, mixture={"experts": 4, "top_k": 2, "every": 1},
-                         dtype="float32", attention_impl="xla")
+    model = CausalTransformer(vocab_size=32, emb_features=16, num_layers=2, num_heads=2,
+                              mlp_features=32, max_seq_len=64, mixture=Mixture(experts=4, top_k=2, every=1),
+                              dtype=jnp.float32, attention_impl="xla")
     tokens = jax.random.randint(jax.random.key(1), (1, 64), 0, 32)
     variables = model.init(jax.random.key(0), tokens)
     _, sown = model.apply(variables, tokens, mutable=["router"])

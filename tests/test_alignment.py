@@ -12,10 +12,10 @@ from flax import linen as nn
 
 from dew.diffusion import presets
 from dew.inputs import Field, InputSpec
+from dew.nn.backbones import SimpleDiT
 from dew.objectives.base import Step, scalar_loss
 from dew.objectives.diffusion import Alignment, DiffusionObjective
 from dew.objectives.diffusion.alignment import ALIGNMENT, REPRESENTATION, spatial_zscore
-from dew.registry import models
 from dew.sampling import Euler, TextToImage
 
 CASES = np.load(Path(__file__).resolve().parent / "fixtures" / "repa" / "losses.npz")
@@ -63,7 +63,7 @@ class Patches(nn.Module):
 
 
 def aligned(kind: str = "mlp"):
-    model = models.SimpleDiT(patch_size=4, emb_features=16, num_layers=2, num_heads=2, mlp_ratio=1)
+    model = SimpleDiT(patch_size=4, emb_features=16, num_layers=2, num_heads=2, mlp_ratio=1)
     encoder = Patches()
     variables = encoder.init(jax.random.PRNGKey(9), jnp.zeros((1, 8, 8, 3)))
     alignment = Alignment(encoder, variables, "dit_block_0", weight=0.5, projector=kind, width=8,

@@ -691,11 +691,11 @@ import optax
 from dew.diffusion import presets
 from dew.inputs import Field, InputSpec
 from dew.objectives.diffusion import DiffusionObjective
-from dew.registry import models
+from dew.nn.backbones import SimpleDiT
 from dew.sampling import Euler
 from dew.training import Trainer
 
-model = models.SimpleDiT(patch_size=2, emb_features=64, num_layers=2, num_heads=2, mlp_ratio=2)
+model = SimpleDiT(patch_size=2, emb_features=64, num_layers=2, num_heads=2, mlp_ratio=2)
 objective = DiffusionObjective(model, presets.Flow()(), InputSpec(Field("image", (16, 16, 3))), guidance=None,
                                sampler=Euler(), steps=2, ema_decay=None)
 trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0))

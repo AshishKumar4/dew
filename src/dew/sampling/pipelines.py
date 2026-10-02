@@ -127,7 +127,7 @@ class Images(Generic[ArrayT]):
 
 @dataclass(frozen=True, eq=False)
 class TextToImage:
-    """`pipe(prompts, key=0)` or `pipe(prompts, steps=40, guidance=4.0, sampler=samplers.Heun(), key=key)`.
+    """`pipe(prompts, key=0)` or `pipe(prompts, steps=40, guidance=4.0, sampler=Heun(), key=key)`.
 
     `params` is the objective's whole tree, the EMA copy merged over the live
     weights when the run kept one, so a sample comes from the weights a run

@@ -4,7 +4,7 @@ A Dew training run is built from four objects. Each owns one part of the work:
 
 | Object | Owns | Written by you when |
 |---|---|---|
-| Model, a `flax.linen.Module` | The forward computation and the shapes of its variables | You need a new architecture. `models.build(name, ...)` builds a registered one. |
+| Model, a `flax.linen.Module` | The forward computation and the shapes of its variables | You need a new architecture. The built-in ones are classes in `dew.nn.backbones`. |
 | `Objective` | Initializing the variables, the loss, evaluation outputs, and which weights keep a moving average | You need a loss Dew does not have. |
 | `Dataset` | The iterators that yield training and validation batches | Your data does not fit a built-in reader. |
 | `Trainer` | The device mesh, the compiled step, the optimizer update, the moving average, checkpoints and logging | Never; it is configured, not subclassed. |
@@ -20,8 +20,9 @@ import jax
 import numpy as np
 import optax
 
-from dew import Dataset, Trainer, models
+from dew import Dataset, Trainer
 from dew.data import ByteTokenizer
+from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective
 from dew.sampling import Sampling, generate
 
@@ -30,8 +31,8 @@ text = tokenizer.encode("dew trains jax models. " * 3)
 rows = np.tile(np.asarray(text[:65], np.int32), (8, 1))
 data = Dataset.from_records({"text": rows}, batch=8)
 
-model = models.build(
-    "causal_transformer", vocab_size=tokenizer.vocab_size,
+model = CausalTransformer(
+    vocab_size=tokenizer.vocab_size,
     emb_features=64, num_layers=2, num_heads=4,
     mlp_features=256, max_seq_len=128)
 objective = LMObjective(model, seq_len=64)
@@ -63,7 +64,7 @@ This is the output with stdout piped to a file; on a terminal, `fit` draws the s
 
 ## Model
 
-A model is a `flax.linen.Module` with `init` and `apply`. Its variables are a nested dictionary of arrays, and it has no knowledge of training. `models.build("causal_transformer", ...)` looks the class up in a registry by name, which is how recipes and saved runs rebuild a model from a configuration file. Importing the class gives the same module: `from dew.nn.backbones import CausalTransformer`.
+A model is a `flax.linen.Module` with `init` and `apply`. Its variables are a nested dictionary of arrays, and it has no knowledge of training. Build one from its class, `from dew.nn.backbones import CausalTransformer`. Each class is also registered under a name (`causal_transformer`), which is how recipes and saved runs rebuild a model from a configuration file.
 
 Dew's modules name the logical axes of their parameters, such as `embed`, `heads` and `mlp`. The trainer maps those names onto the device mesh, so the model code does not change when the mesh does. [Distributed training](concepts/distributed.md) describes the mapping.
 

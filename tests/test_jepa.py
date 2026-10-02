@@ -15,13 +15,14 @@ from dew.objectives.jepa import (
     JepaEncoder,
     JepaObjective,
     JepaVideoEncoder,
+    KnnProbe,
+    LinearProbe,
     knn_probe_accuracy,
     linear_probe_accuracy,
     multi_block_mask,
     normalize_targets,
     representation_health,
 )
-from dew.registry import metrics
 from dew.training import Layout, MeshSpec, Trainer
 
 RES = 32
@@ -483,7 +484,7 @@ def test_probes_separate_clustered_embeddings():
 def test_probe_metrics_score_representations_and_average_over_the_pass():
     x, y = separable_embeddings()
     representations = Representations(features=x, labels=y)
-    linear, knn = metrics.linear_probe(4, steps=200), metrics.knn_probe(4, k=3)
+    linear, knn = LinearProbe(4, steps=200), KnnProbe(4, k=3)
     assert linear.reads is Representations and linear.name == "batch_linear_probe_accuracy"
     assert linear.finalize(linear.merge(linear(representations, None), (0.0, 1))) == pytest.approx(
         float(linear_probe_accuracy(x, y, 4, steps=200)) / 2)

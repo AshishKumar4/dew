@@ -25,12 +25,12 @@ from dew.artifacts import VideoGrid
 from dew.config import ModelConfig, RunConfig, TrainerConfig
 from dew.data import Dataset, OxfordFlowers, VideoDataset
 from dew.diffusion import FlowMatchPredictionTransform
+from dew.diffusion.presets import EDM, Flow
 from dew.diffusion.schedules import FlowMatchingScheduler
 from dew.inputs import Field, unit_range
 from dew.objectives.base import merge
 from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
-from dew.registry import presets, samplers
-from dew.sampling import CFG, Heun, TextToImage
+from dew.sampling import CFG, Euler, Heun, TextToImage
 from dew.sampling.pipelines import Images, _with_drawn_tables
 from dew.training import Checkpoints, Trainer
 
@@ -38,18 +38,18 @@ RES = 8
 MODEL = dict(patch_size=4, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1)
 
 
-def run_config(directory, preset=presets.EDM(), encoder="stub_text", checkpoint="stub-clip"):
+def run_config(directory, preset=EDM(), encoder="stub_text", checkpoint="stub-clip"):
     """The resolved config of a tiny conditional DiT run in `directory`; the
     text condition names the registered stub encoder by default."""
     return DiffusionRunConfig(
         model=ModelConfig("simple_dit", dict(MODEL), dtype="float32", attention_impl="reference"),
         data=OxfordFlowers(image_size=RES),
         trainer=TrainerConfig(checkpoint_dir=str(directory), batch_size=8, steps=2, keep=1),
-        preset=preset, sampler=samplers.Euler(), sampling_steps=3,
+        preset=preset, sampler=Euler(), sampling_steps=3,
         text=TextCondition(encoder=encoder, checkpoint=checkpoint))
 
 
-def make_run(directory, preset=presets.EDM(), encoder="stub_text", checkpoint="stub-clip", steps=2):
+def make_run(directory, preset=EDM(), encoder="stub_text", checkpoint="stub-clip", steps=2):
     """`steps` training steps of the tiny conditional DiT, its checkpoint and
     its `run.json` in `directory`, as the recipe leaves them: the objective is
     the config's own build. A directory that already holds the run resumes
@@ -171,7 +171,7 @@ def test_a_run_that_keeps_one_copy_of_its_weights_samples_it_by_default(tmp_path
 def test_from_run_rebuilds_the_training_process_exactly(tmp_path):
     """run.json holds the preset's fields, so inference samples with the
     shift the run trained with and not the preset default."""
-    make_run(tmp_path, preset=presets.Flow(shift=3.0, logit_mean=0.5))
+    make_run(tmp_path, preset=Flow(shift=3.0, logit_mean=0.5))
     pipe = TextToImage.from_run(str(tmp_path))
     assert isinstance(pipe.process.schedule, FlowMatchingScheduler)
     assert pipe.process.schedule.shift == 3.0 and pipe.process.schedule.logit_mean == 0.5

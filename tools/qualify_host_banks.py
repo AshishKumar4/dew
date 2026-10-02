@@ -41,9 +41,9 @@ import jax.numpy as jnp  # noqa: E402
 import numpy as np  # noqa: E402
 import tyro  # noqa: E402
 
-from dew import models  # noqa: E402  naming a registry fills it
+import dew.nn.backbones  # noqa: E402, F401  (registers the kind)
 from dew.inference.banks import HeldBanks, host_banked  # noqa: E402
-from dew.registry import with_precision  # noqa: E402
+from dew.registry import models, with_precision  # noqa: E402
 from dew.sampling.text import Sampling, generate  # noqa: E402
 from dew.training import Layout, MeshSpec  # noqa: E402
 from dew.training.distributed import build_mesh  # noqa: E402

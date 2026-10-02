@@ -8,11 +8,11 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew import models
+import dew.nn.backbones  # noqa: F401  (registers the kind)
 from dew.inference.banks import HeldBanks, host_banked
 from dew.interop.hf_decoders import translate_config, translate_weights
 from dew.interop.safetensors_io import read_weights, save_sharded
-from dew.registry import with_precision
+from dew.registry import models, with_precision
 from dew.sampling.text import Sampling, generate
 from dew.training import Layout
 from dew.training.distributed import build_mesh
