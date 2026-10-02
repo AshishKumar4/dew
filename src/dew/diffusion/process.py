@@ -124,24 +124,28 @@ class Process:
     def from_json(cls, record: Mapping) -> Process:
         """Rebuild only maintained built-in components; never import arbitrary record classes."""
         from dew.diffusion import schedules, transforms
-        def component(spec, module):
+        def component[Part](spec, module, expected: type[Part]) -> Part:
             name, fields = spec['name'], dict(spec['fields'])
             member = getattr(module, name, None)
-            expected = schedules.NoiseScheduler if module is schedules else transforms.PredictionTransform
-            if module is transforms and name in ('ScheduleWeighting', 'MinSNR', 'VelocityLoss'):
-                member = {'ScheduleWeighting': transforms.ScheduleWeighting,
-                          'MinSNR': transforms.MinSNR, 'VelocityLoss': transforms.VelocityLoss}[name]
-            elif not isinstance(member, type) or not issubclass(member, expected):
+            if not isinstance(member, type) or not issubclass(member, expected):
                 raise ValueError(f"{name!r} is not a built-in process component")
             if 'inner' in fields:
-                fields['inner'] = component(fields['inner'], transforms)
+                fields['inner'] = component(fields['inner'], transforms, transforms.PredictionTransform)
             return member(**fields)
-        return cls(component(record['schedule'], schedules), component(record['prediction'], transforms),
-                   component(record['weighting'], transforms),
-                   None if record['sampling'] is None else component(record['sampling'], schedules),
+        weights = {'ScheduleWeighting': transforms.ScheduleWeighting,
+                   'MinSNR': transforms.MinSNR, 'VelocityLoss': transforms.VelocityLoss}
+        weighting = record['weighting']
+        if weighting['name'] not in weights:
+            raise ValueError(f"{weighting['name']!r} is not a built-in loss weighting")
+        return cls(component(record['schedule'], schedules, schedules.NoiseScheduler),
+                   component(record['prediction'], transforms, transforms.PredictionTransform),
+                   weights[weighting['name']](**dict(weighting['fields'])),
+                   None if record['sampling'] is None else component(record['sampling'], schedules,
+                                                                     schedules.NoiseScheduler),
                    record['interval'])
 
     @property
+
     def sampler_schedule(self) -> NoiseScheduler:
         return self.schedule if self.sampling is None else self.sampling
 

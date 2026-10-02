@@ -165,6 +165,16 @@ class SimpleAutoEncoder(AutoEncoder):
         self.encode_single_frame = jax.jit(encode_single_frame)
         self.decode_single_frame = jax.jit(decode_single_frame)
 
+    def to_json(self) -> dict:
+        from dew.registry import dtype_name
+        if self.encoder.activation is not jax.nn.silu or self.encoder.precision is not None:
+            raise TypeError("custom autoencoder activation/precision needs an explicit record declaration")
+        return {'name': 'simple', 'fields': {
+            'latent_channels': self.latent_channels, 'feature_depths': list(self.feature_depths),
+            'out_channels': self.out_channels, 'norm_groups': self.encoder.norm_groups,
+            'dtype': dtype_name(self.dtype), 'latent_shift': float(self.latent_shift),
+            'latent_scale': float(self.latent_scale)}}
+
     def init_params(self, key: jax.Array) -> dict:
         """Freshly initialize encoder and decoder parameters.
 

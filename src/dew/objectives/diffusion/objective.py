@@ -159,7 +159,6 @@ class DiffusionObjective(Objective[Ratio]):
         """
         self.model = model
         self.process = build_process(process)
-        self._process_definition = process
         self.inputs = inputs
         self.autoencoder = autoencoder
         self.pretrained = pretrained
@@ -187,17 +186,15 @@ class DiffusionObjective(Objective[Ratio]):
     def inference_record(self):
         """Declare the model, input encoders and sampling convention of this step."""
         from dew.config import ModelConfig, _to_json
-        from dew.registry import models, objectives, presets
+        from dew.registry import models, objectives
         if (not any(member is type(self.model) for member in models.values())
-                or not any(member is type(self) for member in objectives.values())
-                or not any(member is type(self._process_definition) for member in presets.values())):
-            return None
-        if self.autoencoder is not None:
+                or not any(member is type(self) for member in objectives.values())):
             return None
         model = ModelConfig.from_model(self.model)
         return {'objective': objectives.name_of(type(self)), 'model': _to_json(model, ModelConfig),
-                'preset': _to_json(self._process_definition, type(self._process_definition)),
-                'inputs': self.inputs.to_json(), 'solver': _to_json(self.sampler, type(self.sampler)),
+                'process': self.process.to_json(), 'inputs': self.inputs.to_json(),
+                'autoencoder': None if self.autoencoder is None else self.autoencoder.to_json(),
+                'solver': _to_json(self.sampler, type(self.sampler)),
                 'guidance': _to_json(self.guidance, type(self.guidance)), 'sampling_steps': self.steps}
 
     def pipeline(self, state: TrainState, *, ema: bool | None = None) -> TextToImage:

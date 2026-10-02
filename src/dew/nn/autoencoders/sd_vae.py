@@ -42,6 +42,20 @@ class StableDiffusionVAE(ModuleAutoEncoder[AutoencoderKL]):
         self._downscale_factor = frame.shape[1] // latent.shape[1]
         self._latent_channels = latent.shape[-1]
 
+    def to_json(self) -> dict:
+        import dataclasses
+
+        import numpy as np
+
+        from dew.registry import dtype_name
+        model = {field.name: getattr(self.model, field.name) for field in dataclasses.fields(self.model)
+                 if field.init and field.name not in ('parent', 'name', 'dtype')}
+        model['dtype'] = dtype_name(self.model.dtype)
+        return {'name': 'sd_vae', 'fields': {
+            'model': model, 'dtype': dtype_name(self.dtype),
+            'latent_shift': np.asarray(self.latent_shift).tolist(),
+            'latent_scale': np.asarray(self.latent_scale).tolist()}}
+
     @property
     def downscale_factor(self) -> int:
         return self._downscale_factor
