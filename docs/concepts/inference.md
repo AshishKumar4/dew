@@ -130,7 +130,8 @@ import jax.numpy as jnp
 from dew.sampling import TextToImage
 from dew.training.quantization import Quantization
 
-pipe = TextToImage.from_pretrained("dewml/hybrid-dit-176m", dtype=jnp.bfloat16)
+pipe = TextToImage.from_pretrained("dewml/hybrid-dit-176m", dtype=jnp.bfloat16,
+                                   revision="434d7e8a940a906ef5d422b31d12b965944a5562")
 served = pipe.quantized(Quantization(dtype="int8", patterns=("^(?!.*spatial_fusion).*",)))
 images = served(["a red fox in a snowy forest"], steps=20, key=0).host().images
 ```

@@ -5,4 +5,4 @@ import progress
 
 from_pretrained = progress.ReportingModels(from_pretrained, progress.Reporting)  # noqa: F821 - the setup cell defines it
 text_model = progress.ReportingModels(text_model, progress.ReportingText)  # noqa: F821 - the setup cell defines it
-pipe = from_pretrained("dewml/hybrid-dit-176m")
+pipe = from_pretrained("dewml/hybrid-dit-176m", revision="434d7e8a940a906ef5d422b31d12b965944a5562")
