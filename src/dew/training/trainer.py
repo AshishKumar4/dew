@@ -527,7 +527,7 @@ class Trainer(Generic[Loss, Effects]):
         objective: Objective[Loss, Effects],
         optimizer: optax.GradientTransformation,
         *,
-        key: jax.Array,
+        key: int | jax.Array,
         mesh: MeshSpec = MeshSpec(),
         layout: Layout = Layout(),
         accumulation: int = 1,
@@ -556,7 +556,9 @@ class Trainer(Generic[Loss, Effects]):
             raise ValueError("Parameter-streamed training requires the trainer objective transaction; custom steps own their execution")
         self.objective = objective
         self.optimizer = optimizer
-        self.key = key
+        from dew.nn.inputs import request_key
+        self.seed = int(key) if isinstance(key, (int, np.integer)) and not isinstance(key, bool) else None
+        self.key = request_key(key)
         self.mesh = mesh
         self.layout = layout
         self.accumulation = accumulation
@@ -584,7 +586,7 @@ class Trainer(Generic[Loss, Effects]):
     @classmethod
     def from_config(
         cls, config: TrainerConfig, objective: Objective[ObjectiveLoss, ObjectiveEffects],
-        optimizer: optax.GradientTransformation, *, key: jax.Array,
+        optimizer: optax.GradientTransformation, *, key: int | jax.Array,
         checkpoints: Checkpoints | None = None, tracker: Tracker | None = None,
         step: Callable[[Objective[ObjectiveLoss, ObjectiveEffects],
                         optax.GradientTransformation], StepFn] | None = None,
@@ -596,7 +598,7 @@ class Trainer(Generic[Loss, Effects]):
         written once, here. `mesh`, `layout`, `accumulation`,
         `dynamic_scale` and `profile` are the config fields a trainer holds.
         `key` is the run key, which `RunConfig.train` draws from
-        `config.seed`.
+        `config.key`.
 
         The rest of the config belongs to the capabilities and to the loop,
         and reaches them from their own owners. `checkpoint_dir` and `keep`
@@ -631,7 +633,7 @@ class Trainer(Generic[Loss, Effects]):
     # ------------------------------------------------------------------
 
     def initial_state(self, initializer: Initializer | None = None,
-                      key: jax.Array | None = None) -> TrainState:
+                      key: int | jax.Array | None = None) -> TrainState:
         """Build the state a fresh run starts from.
 
         It is pure, so `fit` traces it once for its shapes and once, sharded,
@@ -646,7 +648,8 @@ class Trainer(Generic[Loss, Effects]):
         path sees the override.
         """
         initializer = self.objective.initializer if initializer is None else initializer
-        key = self.key if key is None else key
+        from dew.nn.inputs import request_key
+        key = self.key if key is None else request_key(key)
         init_key, run_key = jax.random.split(key)
         params = nn.unbox(initializer(init_key))
         if "params" not in params:
@@ -699,6 +702,8 @@ class Trainer(Generic[Loss, Effects]):
         params = dict(state.params)
         frozen = params.pop(FROZEN, None) if self.host_master else None
         placed = self.layout.shardings(mesh, dataclasses.replace(state, params=params, accumulation=None))
+        # A root key is one value; a legacy key's uint32 words are not parameter axes.
+        placed = dataclasses.replace(placed, key=NamedSharding(mesh, P()))
         placed = dataclasses.replace(placed, **{
             field: jax.tree.map(lambda s: s.with_memory_kind("pinned_host"), getattr(placed, field))
             for field in (() if self.host_master else self.layout.host)})
@@ -767,6 +772,8 @@ class Trainer(Generic[Loss, Effects]):
                                            initializer, key)
         state, position = checkpoints.restore(template, resume,
                                               share=data_partition(self.device_mesh))
+        from dew.nn.inputs import request_key
+        state = dataclasses.replace(state, key=jax.device_put(request_key(state.key), shardings.key))
         if int(state.window_size) != self.accumulation:
             raise ValueError("checkpoint accumulation window_size differs from this trainer")
         self._display.note(f"Resumed from step {resume} in {checkpoints.source(resume)}")
@@ -1251,7 +1258,7 @@ class Trainer(Generic[Loss, Effects]):
         started = FitStarted(current, steps,
             checkpoints.source(current) if checkpoints is not None and position is not None else None,
             sum(leaf.size for leaf in jax.tree.leaves(state.params["params"])), mesh.devices.size,
-            jax.devices()[0].device_kind, jax.process_count(), dict(mesh.shape))
+            jax.devices()[0].device_kind, jax.process_count(), dict(mesh.shape), seed=self.seed)
         self._report(started, current)
         if current > steps:
             raise ValueError(f"the run is at step {current}, past the {steps} asked for")

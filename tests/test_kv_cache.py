@@ -184,10 +184,10 @@ def test_a_pool_too_small_for_every_row_is_refused_where_no_server_assigns_pages
     prompts = np.array([[1, 2, 3, 4, 5, 6, 7], [7, 6, 5, 4, 3, 2, 1]])
     small = TextGeneration(model(KVCache(page_size=16, pages=10)), params, sampling=Sampling(temperature=0))
     with pytest.raises(ValueError, match="needs a server to assign its pages"):
-        small(prompts, 40, seed=0)
+        small(prompts, 40, key=0)
     whole = TextGeneration(model(KVCache(page_size=16)), params, sampling=Sampling(temperature=0))
     dense = TextGeneration(model(KVCache()), params, sampling=Sampling(temperature=0))
-    np.testing.assert_array_equal(whole(prompts, 40, seed=0).tokens, dense(prompts, 40, seed=0).tokens)
+    np.testing.assert_array_equal(whole(prompts, 40, key=0).tokens, dense(prompts, 40, key=0).tokens)
 
 
 def test_a_pool_split_into_groups_reads_what_each_row_wrote():
@@ -206,7 +206,7 @@ def test_a_pool_split_into_groups_reads_what_each_row_wrote():
     prompts = np.array([[1, 2, 3, 4, 5, 6, 7], [7, 6, 5, 4, 3, 2, 1]])
     grouped = TextGeneration(model(KVCache(page_size=16, groups=2)), params, sampling=Sampling(temperature=0))
     dense = TextGeneration(model(KVCache()), params, sampling=Sampling(temperature=0))
-    np.testing.assert_array_equal(grouped(prompts, 40, seed=0).tokens, dense(prompts, 40, seed=0).tokens)
+    np.testing.assert_array_equal(grouped(prompts, 40, key=0).tokens, dense(prompts, 40, key=0).tokens)
 
 
 def test_beam_search_refuses_a_paged_cache():

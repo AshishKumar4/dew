@@ -103,7 +103,7 @@ def draw(client: OllamaCompletion, prompt: str, count: int,
     request fields such as `raw` and `logprobs`; `options` is the lower-level
     escape hatch, and mixing a request field into it raises.
     """
-    return client(prompt, count, seed=0, raw=True, **fields)
+    return client(prompt, count, key=0, raw=True, **fields)
 
 
 def prompt_tokens(client: OllamaCompletion, prompt: str) -> int | None:
@@ -285,7 +285,7 @@ def test_the_client_completes_prompts_against_the_daemon(client):
     """`OllamaCompletion` over the imported model: one answer per prompt in
     prompt order, the token budget spent, the backend's own finish reason,
     and the SDK responses retained. Ollama reports no aggregate usage."""
-    answer = client(list(PROMPTS), DRAWN, seed=1234,
+    answer = client(list(PROMPTS), DRAWN, key=1234,
                     sampling=Sampling(temperature=0.8, top_k=40))
 
     assert len(answer.texts) == len(PROMPTS)
@@ -299,8 +299,8 @@ def test_the_client_completes_prompts_against_the_daemon(client):
 def test_zero_temperature_repeats_itself(client):
     """The seed rides on every call, so the same greedy request twice is the
     same text: a completion is reproducible against a fixed model."""
-    first = client(PROMPTS[0], DRAWN, seed=7, options={"temperature": 0.0})
-    again = client(PROMPTS[0], DRAWN, seed=7, options={"temperature": 0.0})
+    first = client(PROMPTS[0], DRAWN, key=7, options={"temperature": 0.0})
+    again = client(PROMPTS[0], DRAWN, key=7, options={"temperature": 0.0})
 
     assert first.texts == again.texts
 

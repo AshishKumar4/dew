@@ -219,7 +219,7 @@ class _SmokeRoutes(BaseHTTPRequestHandler):
         text = "".join(f"<{message['role']}>{message['content']}\n" for message in body["messages"])
         prompt = self.server.words.encode(text)
         began, version = time.time(), self.server.stamp
-        draw = self.server.policy.submit(prompt, body["max_tokens"], seed=hash(session) % 2 ** 31).result()
+        draw = self.server.policy.submit(prompt, body["max_tokens"], key=hash(session) % 2 ** 31).result()
         trace = {"prompt_token_ids": list(prompt), "completion_token_ids": list(draw.tokens),
                  "logprobs": list(draw.behavior_log_probs), "finish_reason": "stop" if draw.terminated else "length",
                  "weight_version": version, "timestamp": time.time(), "latency_ms": (time.time() - began) * 1000}

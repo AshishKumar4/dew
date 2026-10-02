@@ -1197,7 +1197,7 @@ from dew.inference import OllamaCompletion
 from dew.sampling import Sampling
 
 client = OllamaCompletion("dew-decoder", ollama.Client(host="http://127.0.0.1:11434"))
-served = client("The trainer", 12, sampling=Sampling(temperature=0.0), seed=0, raw=True)
+served = client("The trainer", 12, sampling=Sampling(temperature=0.0), key=0, raw=True)
 print(served.texts, served.finish_reasons)
 ```
 
@@ -1331,7 +1331,7 @@ result = chat(
     ["Explain gradient accumulation in one paragraph.",
      "Name three uses of a JEPA encoder."],
     128,
-    seed=0,
+    key=0,
 )
 for text in result.text:
     print(text)
@@ -1366,7 +1366,7 @@ def main():
             dtype="bfloat16",
         )
         rank = jax.process_index()
-        result = task([f"Process {rank}: write one sentence about tensors."], 64, seed=0)
+        result = task([f"Process {rank}: write one sentence about tensors."], 64, key=0)
         for text in result.host().text:
             print(rank, text)
     finally:
