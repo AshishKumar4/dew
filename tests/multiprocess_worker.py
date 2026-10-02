@@ -180,6 +180,11 @@ def as_numpy(tree):
     """
     import jax
 
+    import jax.numpy as jnp
+
+    tree = jax.tree.map(lambda leaf: jax.random.key_data(leaf)
+                        if isinstance(leaf, jax.Array) and jnp.issubdtype(leaf.dtype, jax.dtypes.prng_key)
+                        else leaf, tree)
     if jax.process_count() == 1:
         return jax.tree.map(np.asarray, tree)
     from jax.experimental import multihost_utils
@@ -1406,9 +1411,9 @@ def mode_inference_pipeline(args) -> dict:
         rows = len(prompts) // args.processes
         prompts = prompts[rank * rows:(rank + 1) * rows]
         requests = requests[rank * rows:(rank + 1) * rows]
-    drawn = images(prompts, steps=3, seed=5)
-    generated = text(requests, seed=5, sampling=Sampling(temperature=0, eos_id=255))
-    default_images = dew.pipeline(args.run_dir)(prompts, steps=3, seed=5).host().images
+    drawn = images(prompts, steps=3, key=5)
+    generated = text(requests, key=5, sampling=Sampling(temperature=0, eos_id=255))
+    default_images = dew.pipeline(args.run_dir)(prompts, steps=3, key=5).host().images
     np.testing.assert_allclose(default_images, drawn.host().images, atol=2e-5, rtol=2e-5)
     rejected = []
     if args.processes > 1:
@@ -1416,18 +1421,18 @@ def mode_inference_pipeline(args) -> dict:
 
         from jax.experimental import multihost_utils
 
-        prepared = images.prepare(prompts, steps=3, seed=5)
-        padded_one = images.prepare(prompts[:1], steps=3, seed=5)
+        prepared = images.prepare(prompts, steps=3, key=5)
+        padded_one = images.prepare(prompts[:1], steps=3, key=5)
         calls = {
-            "prompts": lambda: images.prepare([] if rank == 1 else prompts, steps=3, seed=5),
-            "guidance": lambda: images(prompts, steps=3, seed=5, guidance="invalid" if rank == 1 else 3.0),
-            "steps": lambda: images(prompts, steps=0 if rank == 1 else 3, seed=5),
-            "row_count": lambda: images.prepare(prompts[:1] if rank == 1 else prompts, steps=3, seed=5),
+            "prompts": lambda: images.prepare([] if rank == 1 else prompts, steps=3, key=5),
+            "guidance": lambda: images(prompts, steps=3, key=5, guidance="invalid" if rank == 1 else 3.0),
+            "steps": lambda: images(prompts, steps=0 if rank == 1 else 3, key=5),
+            "row_count": lambda: images.prepare(prompts[:1] if rank == 1 else prompts, steps=3, key=5),
             "prepared": lambda: images(replace(prepared, noise=prepared.noise[:, :-1]) if rank == 1 else prepared,
-                                        steps=3, seed=5),
-            "prepared_rows": lambda: images(replace(padded_one, rows=rank + 1), steps=3, seed=5),
-            "request_kind": lambda: images(prepared if rank == 1 else prompts, steps=3, seed=5),
-            "budget": lambda: replace(text, max_new_tokens=None if rank == 1 else 4)(requests, seed=5),
+                                        steps=3, key=5),
+            "prepared_rows": lambda: images(replace(padded_one, rows=rank + 1), steps=3, key=5),
+            "request_kind": lambda: images(prepared if rank == 1 else prompts, steps=3, key=5),
+            "budget": lambda: replace(text, max_new_tokens=None if rank == 1 else 4)(requests, key=5),
         }
         for name, call in calls.items():
             try:
@@ -1501,12 +1506,12 @@ def mode_continuations(args) -> dict:
     task = TextGeneration(model, placed, sampling=Sampling(temperature=0.9, top_k=5,
                                                            eos_id=11, pad_id=12), n=3)
     request = inputs_for(prompts[local], lengths[local])
-    result = task(request, 4, seed=7)
+    result = task(request, 4, key=7)
     host = result.host()
     rejected = []
     if processes > 1:
         try:
-            task(request, 4, seed=7, n=2 if rank == 1 else 3)
+            task(request, 4, key=7, n=2 if rank == 1 else 3)
         except (ValueError, RuntimeError, AssertionError) as failure:
             rejected.append(str(failure)[:160])
         else:
@@ -1523,12 +1528,12 @@ def mode_continuations(args) -> dict:
     canvas_prompts = ["<bos> t5 t7 t9 t11", "<bos> t6 t8 t10 t12"] * 2
     canvas_rows = len(canvas_prompts) // processes
     canvas_prompts = canvas_prompts[rank * canvas_rows:(rank + 1) * canvas_rows]
-    canvases = canvas(canvas_prompts, 7, n=2, seed=11)
+    canvases = canvas(canvas_prompts, 7, n=2, key=11)
     canvas_host = canvases.host()
     canvas_rejected = False
     if processes > 1:
         try:
-            canvas(canvas_prompts, 7, n=3 if rank == 1 else 2, seed=11)
+            canvas(canvas_prompts, 7, n=3 if rank == 1 else 2, key=11)
         except (ValueError, RuntimeError, AssertionError):
             canvas_rejected = True
         else:
@@ -1666,7 +1671,7 @@ def mode_mixed_validity(args) -> dict:
     trainer = mixed_validity_trainer(args.fsdp_size)
     state, _, _ = trainer.place()
     agreed = agreed_validity(local, processes, phase="mixed validity request")
-    drawn = generate(trainer.objective.model, state.params, local, MIXED_NEW, seed=3,
+    drawn = generate(trainer.objective.model, state.params, local, MIXED_NEW, key=3,
                      sampling=Sampling(temperature=0)).host()
     trained = mixed_validity_step(
         trainer, mixed_validity_batch(mine, explicit=args.explicit), args.out)
@@ -1724,10 +1729,10 @@ def mode_decoding_components(args) -> dict:
              decoding.Temperature(0.8), decoding.TopK(5))
     task = TextGeneration(model, placed, sampling=Sampling(temperature=0.8, top_k=5, pad_id=12),
                           logits=chain, stopping=(decoding.MaxNewTokens(3),))
-    result = task(request, 4, seed=7).host()
+    result = task(request, 4, key=7).host()
     # An explicit chain replaces these sampling filters. Their rank-local
     # values are not part of the executed policy or its agreement identity.
-    equivalent = task(request, 4, seed=7, logits=chain,
+    equivalent = task(request, 4, key=7, logits=chain,
                       sampling=Sampling(temperature=0.3 + rank, top_k=2 + rank, pad_id=12)).host()
     for name in ("tokens", "lengths", "terminated", "behavior_log_probs", "raw_log_probs"):
         if not np.array_equal(getattr(result, name), getattr(equivalent, name)):
@@ -1748,7 +1753,7 @@ def mode_decoding_components(args) -> dict:
         }
         for name, (logits, stopping) in divergences.items():
             try:
-                task(request, 4, seed=7, logits=logits, stopping=stopping)
+                task(request, 4, key=7, logits=logits, stopping=stopping)
             except (ValueError, RuntimeError, AssertionError) as failure:
                 refused.append(name)
                 del failure
@@ -1758,7 +1763,7 @@ def mode_decoding_components(args) -> dict:
             arrivals = multihost_utils.process_allgather(np.asarray(rank, np.int32))
             if arrivals.tolist() != list(range(processes)):
                 raise AssertionError("a rank did not return from the rejected request")
-        agreed = task(request, 4, seed=7, logits=chain,
+        agreed = task(request, 4, key=7, logits=chain,
                       stopping=(decoding.EndOfSequence(jnp.asarray([5], jnp.int32)),)).host()
         if int(agreed.lengths.sum()) < 1:
             raise AssertionError("the agreed request emitted nothing")
@@ -1774,12 +1779,12 @@ def mode_decoding_components(args) -> dict:
     early = (decoding.EndOfSequence(jnp.asarray([int(walked[0, -1])], jnp.int32)),)
     searched = TextGeneration(model, placed, sampling=Sampling(pad_id=12), stopping=early,
                               strategy=Beam(width=3, length_penalty=0.7), n=2)(
-                                  request, 4, seed=7).host()
+                                  request, 4, key=7).host()
     drafted = TextGeneration(model, placed, sampling=Sampling(temperature=0, pad_id=12),
                              stopping=early, strategy=Speculative(block=3))(
-                                 request, 5, seed=7).host()
+                                 request, 5, key=7).host()
     plain = TextGeneration(model, placed, sampling=Sampling(temperature=0, pad_id=12),
-                           stopping=early)(request, 5, seed=7).host()
+                           stopping=early)(request, 5, key=7).host()
     if not np.array_equal(drafted.tokens, plain.tokens):
         raise AssertionError("speculation and sampling disagreed on a greedy pool run")
     return {
@@ -1819,7 +1824,7 @@ def mode_masked_generation(args) -> dict:
     mine = slice(rank * rows, (rank + 1) * rows)
     fields = {} if valid[mine].all() else {"attention_mask": jnp.asarray(valid[mine])}
     request = ModelInputs(jnp.asarray(prompts[mine]), fields)
-    result = task(request, 8, steps=5, seed=7, n=2).host()
+    result = task(request, 8, steps=5, key=7, n=2).host()
     np.testing.assert_array_equal(result.tokens[:, :4], np.repeat(prompts[mine], 2, axis=0))
     assert np.all(result.tokens[:, 4:] != 120)
     refused = []
@@ -1833,7 +1838,7 @@ def mode_masked_generation(args) -> dict:
                 else:
                     steps = 0
             try:
-                task(invalid, 8, steps=steps, seed=7, n=2)
+                task(invalid, 8, steps=steps, key=7, n=2)
             except (ValueError, RuntimeError) as error:
                 diagnostic = " ".join([str(error), *getattr(error, "__notes__", ())])
                 assert label in diagnostic and "rank 1" in diagnostic, diagnostic
@@ -1842,7 +1847,7 @@ def mode_masked_generation(args) -> dict:
                 raise AssertionError(f"rank one's invalid {label} request was accepted")
             np.testing.assert_array_equal(multihost_utils.process_allgather(np.asarray(rank, np.int32)),
                                           np.arange(processes))
-        recovered = task(request, 8, steps=5, seed=7, n=2).host()
+        recovered = task(request, 8, steps=5, key=7, n=2).host()
         np.testing.assert_array_equal(recovered.tokens, result.tokens)
     return {"rows": result.rows, "tokens": result.tokens.tolist(), "lengths": result.lengths.tolist(),
             "terminated": result.terminated.tolist(), "decoder_steps": result.decoder_steps.tolist(),

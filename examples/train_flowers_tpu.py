@@ -192,7 +192,7 @@ def main(config: Config) -> Path:
     run_dir = Path(run.trainer.checkpoint_dir) / name
     pipe = dew.pipeline(str(run_dir))
     drawn = pipe(list(PROMPTS), steps=run.sampling_steps, guidance=config.guidance,
-                 sampler=Heun(), seed=1).host().images
+                 sampler=Heun(), key=1).host().images
     grid(drawn, config.out / "samples.png")
 
     generated = uint8_pixels(drawn)

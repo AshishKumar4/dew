@@ -489,7 +489,7 @@ def test_a_served_language_model_generates_with_its_quantized_kernels(weight_onl
     _, stepped = served.apply(served_variables, prompt, method="states_and_logits")
     np.testing.assert_array_equal(stepped, logits)
     assert float(jnp.max(jnp.abs(logits - model.apply(variables, prompt)))) > 1e-3
-    tokens = generate(served, served_variables, prompt, 3, seed=0, sampling=Sampling(temperature=0)).host().tokens
+    tokens = generate(served, served_variables, prompt, 3, key=0, sampling=Sampling(temperature=0)).host().tokens
     assert tokens.shape == (BATCH, 7)
 
 
@@ -529,13 +529,13 @@ def test_a_quantized_text_task_matches_qwix_direct_logits_and_generation(dtype, 
     assert float(jnp.max(jnp.abs(logits - model.apply(variables, prompt)))) > 1e-3
     assert jnp.dtype(qtype) in {leaf.dtype for leaf in jax.tree.leaves(served.variables)}
     assert jnp.dtype(qtype) not in {leaf.dtype for leaf in jax.tree.leaves(task.variables)}
-    actual = served(prompt, seed=7).host()
+    actual = served(prompt, key=7).host()
     expected = TextGeneration(reference, expected_variables, sampling=task.sampling,
-                              max_new_tokens=task.max_new_tokens)(prompt, seed=7).host()
+                              max_new_tokens=task.max_new_tokens)(prompt, key=7).host()
     for found, wanted in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
         np.testing.assert_array_equal(found, wanted)
     bf16 = TextGeneration(model.clone(dtype=jnp.bfloat16), variables,
-                           sampling=task.sampling, max_new_tokens=task.max_new_tokens)(prompt, seed=7).host()
+                           sampling=task.sampling, max_new_tokens=task.max_new_tokens)(prompt, key=7).host()
     matches = actual.tokens[:, -4:] == bf16.tokens[:, -4:]
     print(f"{jax.default_backend()} {dtype} weight_only={weight_only}: Qwix logit error=0; "
           f"bf16 greedy token agreement={int(matches.sum())}/{matches.size}; "
@@ -587,8 +587,8 @@ def test_quantizing_host_weights_keeps_numpy_storage_and_matches_qwix():
     expected = TextGeneration(reference, jax.device_get(reference_variables), sampling=task.sampling)
     np.testing.assert_array_equal(jax.jit(served.model.apply)(served.variables, prompt),
                                   jax.jit(expected.model.apply)(expected.variables, prompt))
-    np.testing.assert_array_equal(served(prompt, 3, seed=7).host().tokens,
-                                  expected(prompt, 3, seed=7).host().tokens)
+    np.testing.assert_array_equal(served(prompt, 3, key=7).host().tokens,
+                                  expected(prompt, 3, key=7).host().tokens)
 
 
 def test_a_quantized_text_task_without_qwix_names_the_install_extra(monkeypatch):
@@ -619,7 +619,7 @@ def test_a_quantized_multimodal_task_keeps_its_processor_and_media():
     model, variables = quantize_for_serving(task.model, task.variables, spec, inputs.tokens, **inputs.kwargs())
     np.testing.assert_array_equal(served.model.apply(served.variables, inputs.tokens, **inputs.kwargs()),
                                   model.apply(variables, inputs.tokens, **inputs.kwargs()))
-    generated = served(prompt, 3, seed=0, images=[image])
+    generated = served(prompt, 3, key=0, images=[image])
     assert generated.text == task.decode(generated)
     assert len(generated.text) == 1 and generated.text[0]
     assert served.processor is task.processor and served.sampling == task.sampling

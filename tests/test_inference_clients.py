@@ -92,12 +92,30 @@ def test_vllm_sampling_controls_are_explicit_and_generic_openai_is_not_guessed(c
     assert calls[1]["presence_penalty"] == 0.0 and calls[1]["guided_regex"] == "[a-z]+"
 
 
+@pytest.mark.parametrize("kind", ["ollama", "openai"])
+def test_integer_and_jax_keys_reach_the_same_native_wire_seed(clients, kind):
+    import jax
+
+    def network(http, request, body):
+        answer = {"response": "ok"} if kind == "ollama" else response([choice(0, "ok")])
+        return http.Response(200, json=answer)
+
+    task, calls = clients(kind, network)
+    task("prompt", 3, key=17)
+    task("prompt", 3, key=jax.random.key(17))
+    fields = [call["options"] if kind == "ollama" else call for call in calls]
+    assert fields[0]["seed"] == fields[1]["seed"] == 17
+    with pytest.raises(ValueError, match="key="):
+        task("prompt", 3, seed=17)
+    assert len(calls) == 2
+
+
 def test_ollama_retains_sdk_metadata_and_full_options(clients):
     def network(http, request, body):
         return http.Response(200, json={"response": body["prompt"].upper(), "done_reason": "length",
                                         "context": [4, 5], "logprobs": [{"token": "A", "logprob": -0.7}]})
     task, calls = clients("ollama", network)
-    result = task(["a", "b"], 7, seed=3,
+    result = task(["a", "b"], 7, key=3,
                   options={"top_p": 0.6, "min_p": 0.1, "repeat_penalty": 1.5},
                   raw=True, system="system", format={"type": "object"},
                   images=[b"image bytes"], logprobs=True, think=True)
@@ -137,7 +155,7 @@ def test_openai_keeps_aggregate_usage_separate_and_associates_choices(clients):
             choice(1, "second", "length", token_ids=[2]), choice(0, "first", "stop", token_ids=[1])],
             usage={"prompt_tokens": 3, "completion_tokens": 7, "total_tokens": 10}))
     task, calls = clients("openai", network)
-    result = task(["a", "b"], 8, seed=9, top_p=0.7, logprobs=2,
+    result = task(["a", "b"], 8, key=9, top_p=0.7, logprobs=2,
                   extra_body={"top_k": 3, "min_p": 0.1, "return_tokens_as_token_ids": True})
     assert result.texts == ("first", "second") and result.finish_reasons == ("stop", "length")
     assert result.token_counts == (None, None)
@@ -210,7 +228,7 @@ def test_native_streams_and_chat_keep_tools_structured_outputs_and_media(clients
         return http.Response(200, headers={"Content-Type": "text/event-stream"},
                              content="".join(f"data: {json.dumps(item)}\n\n" for item in records) + "data: [DONE]\n\n")
     task, calls = clients(kind, network)
-    streamed = list(task.stream("prompt", 5, seed=7))
+    streamed = list(task.stream("prompt", 5, key=7))
     if kind == "ollama":
         assert [chunk.response for chunk in streamed] == ["part", ""]
         options = {"format": {"type": "object"}}

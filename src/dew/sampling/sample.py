@@ -16,18 +16,18 @@ from dew.sampling.solvers import Solver
 
 @overload
 def sample[StateT](denoise: Denoiser | DiscreteDenoiser, x_T: jax.Array, steps: int, *, solver: Solver[StateT],
-                   guidance: Guidance | None = None, key: jax.Array, times: None = None,
+                   guidance: Guidance | None = None, key: int | jax.Array, times: None = None,
                    final_denoise: bool = True) -> jax.Array: ...
 
 
 @overload
 def sample[StateT](denoise: Denoiser | DiscreteDenoiser, x_T: jax.Array, steps: None = None, *, solver: Solver[StateT],
-                   guidance: Guidance | None = None, key: jax.Array, times: ArrayLike | Sequence[float],
+                   guidance: Guidance | None = None, key: int | jax.Array, times: ArrayLike | Sequence[float],
                    final_denoise: bool = True) -> jax.Array: ...
 
 
 def sample[StateT](denoise: Denoiser | DiscreteDenoiser, x_T: jax.Array, steps: int | None = None, *, solver: Solver[StateT],
-                   guidance: Guidance | None = None, key: jax.Array, times: ArrayLike | Sequence[float] | None = None,
+                   guidance: Guidance | None = None, key: int | jax.Array, times: ArrayLike | Sequence[float] | None = None,
                    final_denoise: bool = True) -> jax.Array:
     """`steps` points from T to 0: a solver step across each interval, then the
     model's clean prediction at the last point.
@@ -47,6 +47,8 @@ def sample[StateT](denoise: Denoiser | DiscreteDenoiser, x_T: jax.Array, steps: 
         raise ValueError("pass exactly one of steps and times")
     if steps is not None and (type(steps) is not int or steps < 1):
         raise ValueError("steps must be a positive integer")
+    from dew.nn.inputs import request_key
+    key = request_key(key)
     process = denoise.process
     if guidance is not None and not isinstance(denoise, Denoiser):
         raise TypeError("guidance needs a continuous Denoiser; the masked diffusion LM takes none")

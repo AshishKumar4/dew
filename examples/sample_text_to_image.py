@@ -106,8 +106,8 @@ def main(config: Config):
         columns = []
         for seed in config.seeds:
             started = time.perf_counter()
-            prepared = pipe.prepare(prompts, seed=seed, steps=steps, unconditional=config.negative)
-            images = pipe(prepared, seed=seed, steps=steps, sampler=solver, guidance=guidance).host().images
+            prepared = pipe.prepare(prompts, key=seed, steps=steps, unconditional=config.negative)
+            images = pipe(prepared, key=seed, steps=steps, sampler=solver, guidance=guidance).host().images
             seconds = time.perf_counter() - started
             print(f"{name}: seed {seed}, {len(prompts)} images in {seconds:.1f} s")
             pixels = uint8_pixels(np.asarray(images, np.float32))

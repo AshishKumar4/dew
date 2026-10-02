@@ -130,7 +130,7 @@ def main(config: Config) -> Path:
     base = dew.pipeline(config.model, dtype="float32")
     trained, weights = LoRA.load(base.model, base.variables, source.layouts, adapter_dir)
     task = base.bind(trained.merge(weights))
-    generated = task(PROMPTS, config.response_tokens, seed=3)
+    generated = task(PROMPTS, config.response_tokens, key=3)
     (config.out / "samples.txt").write_text("\n".join(task.decode(generated)) + "\n")
     print(f"adapter {adapter_dir}  samples {config.out / 'samples.txt'}")
     return adapter_dir
