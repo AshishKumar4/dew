@@ -72,6 +72,7 @@ jobs:
         node site/scripts/sync-docs.mjs --check
         node site/scripts/render-notebooks.mjs --check
         uv run --no-project --with griffe==2.3.0 python site/scripts/gen_api.py --check
+        uv run --no-project --with griffe==2.3.0 --with pytest python -m pytest -q --noconftest tests/test_gen_api.py
         JAX_PLATFORMS=cpu python site/scripts/gen_models.py --check
         python site/scripts/gen_examples.py --check
     - name: Type check
