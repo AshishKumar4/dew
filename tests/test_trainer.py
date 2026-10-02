@@ -749,7 +749,7 @@ def test_two_processes_train_a_conv_model_to_the_bit_under_the_repeatable_flags(
     a second process shows whether it agrees. Two fresh processes, without a
     compilation cache, train a DiT (a convolution embeds its patches) two
     Adam steps under the cuda lane's flags; every state leaf agrees."""
-    from conftest import REPEATABLE_GPU_FLAGS
+    from lane_environment import REPEATABLE_GPU_FLAGS
 
     root = Path(__file__).resolve().parents[1]
     flags = [flag for flag in os.environ.get("XLA_FLAGS", "").split()
