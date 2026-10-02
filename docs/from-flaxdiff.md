@@ -18,7 +18,7 @@ FlaxDiff was an earlier name for Dew, when it was built around diffusion. Dew se
 
 ## Loading an older text-to-image checkpoint
 
-`dew.interop.flaxdiff.load_flaxdiff` loads `simple_udit` and `hybrid_dit` latent text-to-image models from the older checkpoint format, trained on the Stable Diffusion VAE with a CLIP text encoder. It returns a `TextToImage`, the same task `dew.pipeline` returns for a Dew run.
+`TextToImage.from_flaxdiff` loads `simple_udit` and `hybrid_dit` latent text-to-image models from the older checkpoint format, trained on the Stable Diffusion VAE with a CLIP text encoder. It returns a `TextToImage`, the same task `dew.pipeline` returns for a Dew run.
 
 It takes three things from the old run:
 
@@ -32,11 +32,10 @@ It takes three things from the old run:
 ```python
 import json
 
-from dew.interop.flaxdiff import load_flaxdiff
-from dew.sampling import Heun
+from dew.sampling import Heun, TextToImage
 
 config = json.load(open("run_config.json"))  # the run's saved training config
-pipe = load_flaxdiff("checkpoints/350000", config, jax_version="0.5.3")
+pipe = TextToImage.from_flaxdiff("checkpoints/350000", config, jax_version="0.5.3")
 images = pipe(["a lighthouse on a rocky coast"], key=0, steps=25, solver=Heun()).host().images
 ```
 

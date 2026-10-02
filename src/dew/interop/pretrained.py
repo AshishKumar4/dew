@@ -590,6 +590,23 @@ class Pretrained:
                                     tokenizer=self.processor if self.tokenizer is None else self.tokenizer,
                                     generation_config=dict(self.generation_config))
 
+    def push_to_hub(self, repo_id: str, *, variables: Mapping[str, object] | None = None,
+                    private: bool = False, commit_message: str = "Upload dew export",
+                    max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
+        """Upload what `save` writes to the Hub repo `repo_id`, created when
+        it is missing: `save` into a staging directory, then
+        `huggingface_hub.HfApi`'s `create_repo` and `upload_folder`. Retries,
+        progress and authentication are the hub client's."""
+        import tempfile
+
+        from huggingface_hub import HfApi
+
+        with tempfile.TemporaryDirectory() as staged:
+            self.save(staged, variables=variables, max_shard_size=max_shard_size)
+            api = HfApi()
+            api.create_repo(repo_id, private=private, exist_ok=True)
+            api.upload_folder(repo_id=repo_id, folder_path=staged, commit_message=commit_message)
+
 
 @dataclass(frozen=True)
 class PretrainedDecoder(Pretrained):
