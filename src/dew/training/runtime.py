@@ -213,10 +213,11 @@ def keep_roundings() -> None:
     different bf16 forwards of the same model and batch; with every rounding
     kept they are bitwise the same (a 4-layer decoder and its 8-expert MoE
     twin on 8 simulated CPU devices: hidden states, log partitions, losses,
-    routes). It also costs nothing: on the RTX 4080 a Qwen3-0.6B-width
-    decoder step went from 110.5 to 109.6 ms, the 176M hybrid DiT from 69.6
-    to 66.6 ms and its peak from 5.79 to 5.44 GiB, SimpleDiT-B from 76.0 to
-    73.0 ms (jax 0.11.2)."""
+    routes). On the RTX 4080 it was faster: a Qwen3-0.6B-width decoder step
+    went from 110.5 to 109.6 ms, the 176M hybrid DiT from 69.6 to 66.6 ms and
+    its peak from 5.79 to 5.44 GiB, SimpleDiT-B from 76.0 to 73.0 ms (jax
+    0.11.2). A script that builds a Trainer without calling `prepare_process`
+    keeps XLA's default unless it sets the flag in XLA_FLAGS."""
     if xla_flag("xla_allow_excess_precision") is None:
         apply_xla_flags("--xla_allow_excess_precision=false")
 
