@@ -349,7 +349,7 @@ def test_published_pipeline_walk_matches_the_source(source, pipeline_record, cas
     loaded = load_pretrained(str(source / case), dtype="float32", attention_impl="xla")
     task = loaded.text_to_image()
     prepared = task.prepare(pipeline_record["prompts"], unconditional=pipeline_record["negatives"],
-                            initial=arrays[f"{case}.x_T"], steps=pipeline_record["steps"], seed=0)
+                            initial=arrays[f"{case}.x_T"], steps=pipeline_record["steps"], key=0)
     # The flow walk is an Euler integration with no noise draw; the key is
     # the call's contract, not a source of difference.
     walked = task(prepared, guidance=CFG(pipeline_record["guidance"]),
@@ -376,7 +376,7 @@ def test_omitted_call_policy_takes_the_published_pipelines_own(source, pipeline_
     assert task.steps == pipeline_record["default_steps"]
     assert task.guidance.scale == pipeline_record["default_guidance"]
     prepared = task.prepare(pipeline_record["prompts"], unconditional=pipeline_record["negatives"],
-                            initial=arrays[f"{case}.x_T"], seed=0)
+                            initial=arrays[f"{case}.x_T"], key=0)
     walked = task(prepared, key=jax.random.PRNGKey(0)).host()
     assert relative_gap(walked.latents, arrays[f"{case}.default_latents"]) < 2e-5
 
@@ -459,7 +459,8 @@ def test_a_trained_step_keeps_the_frozen_buffer_and_exports_for_the_source(sourc
     checkpoints.wait()
     restored, _, _ = trainer.place()
     for got, want in zip(jax.tree.leaves(restored), jax.tree.leaves(state), strict=True):
-        np.testing.assert_array_equal(got, want)
+        from test_trainer import raw_leaf
+        np.testing.assert_array_equal(raw_leaf(got), raw_leaf(want))
 
     export = tmp_path / "export"
     loaded.save(export, variables=state.params)

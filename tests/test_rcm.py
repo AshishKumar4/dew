@@ -221,8 +221,8 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     checkpoints.save(1, distilled, None)
     checkpoints.wait()
     config.save(str(tmp_path / "student"))
-    expected = task.pipeline(distilled, ema=False)(["a red bird"], seed=9).host().images
-    np.testing.assert_array_equal(TextToImage.from_run(str(tmp_path / "student"))(["a red bird"], seed=9)
+    expected = task.pipeline(distilled, ema=False)(["a red bird"], key=9).host().images
+    np.testing.assert_array_equal(TextToImage.from_run(str(tmp_path / "student"))(["a red bird"], key=9)
                                   .host().images, expected)
 
 

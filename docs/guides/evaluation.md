@@ -26,7 +26,7 @@ model = CausalTransformer(vocab_size=4, emb_features=16, num_layers=1,
                           num_heads=2, mlp_features=32, max_seq_len=16,
                           dtype="float32", attention_impl="xla")
 objective = LMObjective(model, seq_len=8)
-trainer = Trainer(objective, optax.adam(0.01), key=jax.random.key(0))
+trainer = Trainer(objective, optax.adam(0.01), key=0)
 state = trainer.fit(data, steps=10, log_every=5, eval_every=5,
                     metrics=(metrics.perplexity(),))
 assert int(state.step) == 10
@@ -66,6 +66,40 @@ The built-in metrics reduce their batches as follows:
 - JEPA's `linear_probe` and `knn_probe` fit on the first half of each batch and test on the second half. They log the mean of the batch accuracies as `val/batch_linear_probe_accuracy` and `val/batch_knn_probe_accuracy`. These numbers depend on how the batch is split and are not a probe over the full dataset.
 
 Training metrics are named under `train/`, and reduced validation metrics under `val/`. Metric names must be unique within a pass.
+
+`key=0` is the same root key as `key=jax.random.key(0)`. The fit record
+also keeps the supplied integer seed.
+
+`Mean` turns per-example values or a `(total, count)` pair into a metric.
+It sums counts across uneven batches, so a small last batch has its own
+weight. Choose `better` and `reads` explicitly: evaluation selects the exact
+artifact type. This LM metric ranks the logits' top-1 accuracy:
+
+```python
+from dew import Checkpoints, Mean
+from dew.artifacts import TokenScores
+
+accuracy = Mean(
+    lambda scores, batch: (np.sum(scores.correct * scores.weights), np.sum(scores.weights)),
+    reads=TokenScores, name="accuracy", better="higher",
+)
+language_model = LMObjective(model, seq_len=8, ema_decay=None)
+run = Trainer(language_model, optax.adam(0.01), key=jax.random.key(0),
+              checkpoints=Checkpoints("runs/lm-accuracy"))
+state = run.fit(
+    data, steps=10, eval_every=5, metrics=[accuracy], best=accuracy,
+)
+run.checkpoints.wait()
+assert run.checkpoints.best is not None
+```
+
+The helper starts a pass from its first contribution and finalizes on the
+host without collectives. A vector counts each example once; a pair can
+carry token counts or fractional weights. A scalar batch mean is refused.
+`TokenScores.correct` comes from the same chunked head as its losses; it
+does not retain a full logits tensor. The unprefixed name `accuracy` is
+reported as `val/accuracy`. Passing `name="val/accuracy"` gives a clear error
+instead of adding the prefix twice.
 
 ## Previews
 

@@ -55,6 +55,7 @@ from dew.artifacts import agreed, collective_host
 from dew.nn.inputs import mesh_of
 from dew.objectives.base import Variables
 from dew.records import JSON
+from dew.telemetry.devices import primary_context
 
 from .rollouts import _served, _succeeded
 
@@ -84,7 +85,6 @@ class _Library:
 
     def __init__(self, library: str, ordinal: int) -> None:
         self.nccl = ctypes.CDLL(library)
-        self.cuda = ctypes.CDLL("libcuda.so.1")
         self.nccl.ncclGetErrorString.restype = ctypes.c_char_p
         self.nccl.ncclCommInitRank.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_int, _UniqueId,
                                                ctypes.c_int]
@@ -93,11 +93,7 @@ class _Library:
         self.nccl.ncclAllReduce.argtypes = collective
         self.nccl.ncclBroadcast.argtypes = collective
         self.nccl.ncclCommAbort.argtypes = [ctypes.c_void_p]
-        device = ctypes.c_int()
-        self._driver(self.cuda.cuInit(0))
-        self._driver(self.cuda.cuDeviceGet(ctypes.byref(device), ordinal))
-        self.context = ctypes.c_void_p()
-        self._driver(self.cuda.cuDevicePrimaryCtxRetain(ctypes.byref(self.context), device))
+        self.cuda, self.context, _ = primary_context(ordinal)
 
     def _driver(self, status: int) -> None:
         if status != 0:

@@ -20,6 +20,7 @@ from dew.objectives.rl import GRPOObjective
 from dew.registry import presets
 from dew.sampling import Sampling
 from dew.training import Trainer
+from dew.training.state import TrainState
 
 
 class Denoiser(nn.Module):
@@ -31,6 +32,45 @@ class Denoiser(nn.Module):
 def decoder(causal=True):
     return CausalTransformer(vocab_size=8, emb_features=8, num_layers=1,
                              num_heads=2, mlp_features=16, max_seq_len=8, causal=causal)
+
+
+def test_metadata_inspection_and_restore_share_the_committed_snapshot(tmp_path, monkeypatch):
+    """A shape inspection opens arrays once; restore still reads every value."""
+    import orbax.checkpoint as ocp
+
+    def state(width, step):
+        return TrainState(step=jnp.asarray(step), microstep=jnp.asarray(step), updates=jnp.asarray(step),
+                          params={"params": {"weight": jnp.arange(width, dtype=jnp.float32)}},
+                          opt_state=(), ema=None, key=jax.random.key(0), scale=None, window_size=jnp.asarray(1))
+
+    checkpoints = Checkpoints(str(tmp_path))
+    first = state(3, 3)
+    checkpoints.save(3, first, None)
+    checkpoints.wait()
+    stored = checkpoints.stored()
+    placement = jax.sharding.SingleDeviceSharding(jax.devices()[0])
+    template = {"params": jax.tree.map(
+        lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=placement), stored["params"])}
+
+    def repeated_metadata(self, infos):
+        raise AssertionError("the inspected immutable checkpoint metadata was opened again")
+
+    with monkeypatch.context() as context:
+        context.setattr(ocp.type_handlers.ArrayHandler, "metadata", repeated_metadata)
+        restored, _ = checkpoints.restore(template)
+        np.testing.assert_array_equal(restored["params"]["params"]["weight"],
+                                      first.params["params"]["weight"])
+
+    second = state(5, 5)
+    checkpoints.save(5, second, None)
+    checkpoints.wait()
+    assert checkpoints.stored()["params"]["params"]["weight"].shape == (5,)
+    restored, _ = checkpoints.restore()
+    np.testing.assert_array_equal(restored["params"]["params"]["weight"], second.params["params"]["weight"])
+    third = state(7, 7)
+    checkpoints.save(7, third, None)
+    checkpoints.wait()
+    assert checkpoints.stored()["params"]["params"]["weight"].shape == (7,)
 
 
 def make_case(kind, decay):
@@ -91,7 +131,8 @@ def test_disabled_ema_trains_previews_and_resumes_without_a_copy(tmp_path, kind)
     restored, _, _ = trainer.place()
     assert restored.ema is None
     for got, want in zip(jax.tree.leaves(restored), jax.tree.leaves(state), strict=True):
-        np.testing.assert_array_equal(got, want)
+        from test_trainer import raw_leaf
+        np.testing.assert_array_equal(raw_leaf(got), raw_leaf(want))
     with pytest.raises(ValueError, match="EMA configuration"):
         Trainer(frozen_objective, optimizer, key=jax.random.PRNGKey(1), checkpoints=checkpoints).place()
 

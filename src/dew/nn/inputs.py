@@ -88,6 +88,16 @@ def pad_token_rows(rows: Sequence[Sequence[int]] | np.ndarray, *, pad_id: int = 
     return tokens, padded
 
 
+def host_token_rows(array: np.ndarray) -> np.ndarray:
+    """Integer `[B, S]` token ids normalized on the host without a device round-trip."""
+    if array.ndim != 2 or not np.issubdtype(array.dtype, np.integer):
+        raise ValueError("tokens must be an integer [B, S] array")
+    bounds = np.iinfo(np.int32)
+    if np.any(array < bounds.min) or np.any(array > bounds.max):
+        raise ValueError("token IDs must be representable as int32")
+    return array.astype(np.int32, copy=False)
+
+
 @struct.dataclass
 class ModelInputs:
     """Token rows with sequence-aligned fields and row-aligned conditioning.
@@ -119,13 +129,7 @@ class ModelInputs:
         elif isinstance(value, jax.Array):
             prepared = cls(value)
         else:
-            array = np.asarray(value)
-            if array.ndim != 2 or not np.issubdtype(array.dtype, np.integer):
-                raise ValueError("tokens must be an integer [B, S] array")
-            bounds = np.iinfo(np.int32)
-            if np.any(array < bounds.min) or np.any(array > bounds.max):
-                raise ValueError("token IDs must be representable as int32")
-            prepared = cls(jnp.asarray(array, jnp.int32))
+            prepared = cls(jnp.asarray(host_token_rows(np.asarray(value))))
         prepared.validate()
         return prepared
 
@@ -375,19 +379,29 @@ def local_rows(leaf: jax.typing.ArrayLike, *, host: bool = True) -> jax.Array | 
     return np.concatenate(blocks, axis=0)
 
 
-def request_key(key: jax.Array | None, seed: int | None) -> jax.Array:
-    """One typed PRNG key from either a key or an integer seed, never both."""
-    if (key is None) == (seed is None):
-        raise ValueError("pass exactly one of key and seed")
-    if seed is not None:
-        if isinstance(seed, bool) or not isinstance(seed, (int, np.integer)):
-            raise ValueError("seed must be an integer")
-        return jax.random.key(int(seed))
-    assert key is not None
+def request_key(key: int | jax.Array | None) -> jax.Array:
+    """Normalize an integer seed or a single JAX key to one typed PRNG key."""
+    if key is None or isinstance(key, bool):
+        raise ValueError("key must be an integer seed or a single JAX PRNG key")
+    if isinstance(key, (int, np.integer)):
+        return jax.random.key(int(key))
     typed = jax.random.wrap_key_data(jax.random.key_data(key), impl=jax.random.key_impl(key))
     if typed.shape != ():
         raise ValueError("key must be a single JAX PRNG key")
     return typed
+
+
+def key_seed(key: int | jax.Array | None) -> int | None:
+    """The normalized key as an integer for an external sampler's wire seed.
+
+    Threefry's key(n) stores [0, n], so summing the words preserves an
+    integer seed at the external server. Split keys can collide in 32 bits.
+    Native samplers keep the full key instead of this wire representation.
+    """
+    if key is None:
+        return None
+    words = np.asarray(jax.random.key_data(request_key(key))).reshape(-1)
+    return sum(int(word) for word in words) % (1 << 32)
 
 
 def continuation_keys(key: jax.Array, n: int) -> jax.Array:

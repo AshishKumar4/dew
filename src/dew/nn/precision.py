@@ -1,8 +1,9 @@
 """The precision a bf16 model's fp32 boundaries multiply at.
 
 A model's last matmul before a loss - the patch output head, the vocabulary
-head - keeps an fp32 result on purpose: the loss is computed in fp32, and a
-result rounded to bf16 would carry no more than bf16 tells. Asking for that
+head - keeps an fp32 result on purpose: the loss is computed in fp32. (The
+vocabulary head at the default precision rounds that result to bf16 values,
+as torch autocast's bf16 logits are; `head_product` says why.) Asking for that
 result with `preferred_element_type=jnp.float32` leaves the operands in the
 compute dtype, which is what a bf16 run wants, but it also makes the
 cotangent of that dot fp32, and the mixed f32 x bf16 products of the
@@ -184,8 +185,9 @@ def head_dot_general(dtype: Dtype | None, precision: PrecisionLike = None):
 
     `dtype` is the model's compute dtype, not the layer's: the layer
     promotes the states to at least fp32. Under bf16 compute at the default
-    precision both operands multiply as bf16 (`head_product`); otherwise the
-    product is the layer's own, in the operands' dtype.
+    precision both operands multiply as bf16 and the logits are bf16 values
+    (`head_product`); otherwise the product is the layer's own, in the
+    operands' dtype.
     """
     resolved = bf16_operand_precision(dtype, precision)
     rounds = rounds_to_bf16(dtype, precision)
@@ -195,8 +197,9 @@ def head_dot_general(dtype: Dtype | None, precision: PrecisionLike = None):
         del precision, preferred_element_type  # this head's policy, not the layer's
         if rounds:
             rhs = _algorithm_operand(rhs)
-        return jax.lax.dot_general(lhs, rhs, dimension_numbers, precision=resolved,
-                                   preferred_element_type=at_least_fp32(lhs.dtype))
+        logits = jax.lax.dot_general(lhs, rhs, dimension_numbers, precision=resolved,
+                                     preferred_element_type=at_least_fp32(lhs.dtype))
+        return rounded_to(logits, jnp.bfloat16) if rounds else logits
 
     return dot_general
 
@@ -207,14 +210,30 @@ def head_product(subscripts: str, hidden: jax.Array, head: jax.Array,
     it, with accumulation and a result at least fp32.
 
     The product follows the compute dtype, the states' dtype, as torch
-    autocast and MaxText (`logits_dot_in_fp32=False`) run it: bf16 states
-    at the default precision multiply the head as bf16, anything else
-    multiplies fp32 states by the head as stored. The softmax and the loss
-    read the fp32 result."""
+    autocast and MaxText (`logits_dot_in_fp32=False`) run it. bf16 states at
+    the default precision multiply the head as bf16, and the logits are
+    rounded to bf16, held in fp32 for the softmax and the loss; their
+    cotangent rounds to bf16 with them, so the backward's products read it
+    once rounded, as the gradient of torch's bf16 logits is. Anything else
+    multiplies fp32 states by the head as stored into fp32 logits.
+
+    The rounding is the reference frameworks' and costs nothing measurable
+    in training: 2000 steps on wikitext-103 against fp32 logits, the same
+    seed apart by at most 4.5e-4 in validation loss (a 3-layer decoder from
+    scratch) and 1.6e-3 (Qwen3-0.6B fine-tuned), where two seeds of either
+    rounding are 1.3e-2 and 2.9e-3 apart on average (RTX 4080). It is 13%
+    of the 3-layer decoder's step and 3% of Qwen3-0.6B's at 1 x 1024. With
+    the cotangent rounded once, a 4 x RTX 3090 bf16 run read 1.75 of its
+    layout parity bound at a dense model's final norm and 5758 of it at an
+    MoE's expert gate_proj, against 0.47 and 0.41 with it carried in fp32.
+    So a run that compares layouts in bf16, or resumes onto another mesh and
+    expects the same numbers, sets `matmul_precision` "highest", whose head
+    is fp32."""
     if rounds_to_bf16(hidden.dtype, precision):
-        return jnp.einsum(subscripts, hidden.astype(jnp.float32), _algorithm_operand(head),
-                          precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32,
-                          preferred_element_type=jnp.float32)
+        logits = jnp.einsum(subscripts, hidden.astype(jnp.float32), _algorithm_operand(head),
+                            precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32,
+                            preferred_element_type=jnp.float32)
+        return rounded_to(logits, jnp.bfloat16)
     wide = at_least_fp32(hidden.dtype)
     return jnp.einsum(subscripts, hidden.astype(wide), head,
                       precision=precision, preferred_element_type=wide)

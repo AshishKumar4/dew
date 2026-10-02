@@ -8,8 +8,20 @@ from flax import linen as nn, struct
 
 from dew.checkpoints import Checkpoints
 from dew.nn.blocks import TokenEmbedding
-from dew.objectives import Aux, EMASpec, Mean, Objective, mean_loss
+from dew.objectives import Aux, EMASpec, Ratio, Objective, mean_loss
 from dew.training import Trainer
+from test_trainer import raw_leaf
+
+
+def test_ratio_keeps_numerator_and_denominator_until_the_reduction():
+    import dew.objectives as objectives
+
+    first = objectives.Ratio(jnp.asarray(4.), jnp.asarray(2.))
+    last = objectives.Ratio(jnp.asarray(9.), jnp.asarray(1.))
+    whole = jax.tree.map(jnp.add, first, last)
+    value, supported = objectives.mean_loss(whole)
+    assert float(value) == pytest.approx(13 / 3) and bool(supported)
+    assert not hasattr(objectives, "Mean")
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])
@@ -50,7 +62,7 @@ def test_repeated_token_gradients_accumulate_in_master_precision(dtype):
 
 @struct.dataclass
 class Moments:
-    errors: Mean
+    errors: Ratio
     predictions: jax.Array
     rows: jax.Array
 
@@ -84,7 +96,7 @@ class DenseObjective(Objective):
         errors = (prediction - batch["y"]) ** 2
         if self.loss_kind == "scalar":
             return jnp.mean(errors), Aux({})
-        result = Mean(jnp.sum(errors), jnp.asarray(errors.size, jnp.int32))
+        result = Ratio(jnp.sum(errors), jnp.asarray(errors.size, jnp.int32))
         if self.loss_kind == "mean":
             return result, Aux({})
         return Moments(result, jnp.sum(prediction), jnp.asarray(prediction.size, jnp.int32)), Aux({})
@@ -98,6 +110,7 @@ class DenseObjective(Objective):
 
 def compare(actual, expected, *, exact=False, tolerance=2e-6, moment_rounding=False):
     for got, want in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
+        got, want = raw_leaf(got), raw_leaf(want)
         assert got.dtype == want.dtype
         if moment_rounding and not exact and got.dtype == jnp.bfloat16:
             # A materialized accumulation boundary can round the gradient before
@@ -205,7 +218,7 @@ def test_adam_native_parameter_dtypes_survive_updates_and_checkpoints(tmp_path, 
 def test_float64_statistics_and_updates_preserve_requested_precision(tmp_path, parameter_kind, loss_kind, k):
     with jax.enable_x64():
         total, mass = 1 + 2. ** -40, 3 + 2. ** -35
-        reduced, _ = mean_loss(Mean(jnp.array(total, jnp.float64), jnp.array(mass, jnp.float64)))
+        reduced, _ = mean_loss(Ratio(jnp.array(total, jnp.float64), jnp.array(mass, jnp.float64)))
         np.testing.assert_allclose(reduced, total / mass, rtol=0, atol=1e-15)
         exercise_updates_and_resume(tmp_path, parameter_kind, loss_kind, k)
 
@@ -247,8 +260,8 @@ def test_optimizer_dtype_overflow_backs_off_without_losing_the_prefix():
             first = batch["first"]
             left_mass = jnp.where(first, 100., 1.)
             right_mass = jnp.where(first, 1., 100.)
-            left = Mean(value * jnp.where(first, 60000., -50000.) * left_mass, left_mass)
-            right = Mean(value * jnp.where(first, -50000., 60000.) * right_mass, right_mass)
+            left = Ratio(value * jnp.where(first, 60000., -50000.) * left_mass, left_mass)
+            right = Ratio(value * jnp.where(first, -50000., 60000.) * right_mass, right_mass)
             return (left, right), Aux({})
         def reduce_loss(self, stats):
             left, active_left = mean_loss(stats[0])

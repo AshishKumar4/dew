@@ -1008,7 +1008,7 @@ def test_a_deepseek_v4_released_tensor_name_reaches_the_same_leaf(released, save
     nested head and `norm` (conversion_mapping.py:489-508 is ^-anchored on
     the first three, so the reverse leaves them). Both spellings are the
     same weights and land on the same leaf."""
-    from dew.interop.hf_decoders import _deepseek_v4_path
+    from dew.interop.families.deepseek import _deepseek_v4_path
 
     config = translate_config(fixture_config("deepseek-v4-tiny"))
     path = _deepseek_v4_path(released, config)
@@ -1153,8 +1153,8 @@ def test_deepseek_v4_public_speculation_preserves_padded_rows():
     tokens[~valid] = 0
     inputs = ModelInputs(jnp.asarray(tokens), {'attention_mask': jnp.asarray(valid)})
     task = source.text_generation(sampling=Sampling(temperature=0))
-    ordinary = task(inputs, max_new_tokens=7, seed=0).host()
-    speculative = task(inputs, max_new_tokens=7, seed=0, strategy=Speculative(block=3)).host()
+    ordinary = task(inputs, max_new_tokens=7, key=0).host()
+    speculative = task(inputs, max_new_tokens=7, key=0, strategy=Speculative(block=3)).host()
     # Three rows differ from the two residual streams: a row mask must not
     # accidentally broadcast along the stream axis during predictor reseeding.
     np.testing.assert_array_equal(speculative.tokens, ordinary.tokens)

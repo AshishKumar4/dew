@@ -226,6 +226,7 @@
   "epochs": null,
   "eval_every": "epoch",
   "keep": 2,
+  "key": 0,
   "layout": {
    "class": "dew.training.distributed.Layout",
    "sets": {}
@@ -239,7 +240,6 @@
   "name": null,
   "profile": null,
   "quantization": null,
-  "seed": 0,
   "steps": null,
   "wandb": null,
   "xla_flags": null
@@ -286,7 +286,13 @@
  },
  "dew.data.images.ArrayRecordImages": {
   "augmentation": "flip_jitter",
+  "augmentation_backend": "host",
+  "augmentation_size": null,
   "count": null,
+  "crop_scale": [
+   1.0,
+   1.0
+  ],
   "image_size": 128,
   "loading": {
    "class": "dew.data.dataset.Loading",
@@ -300,7 +306,13 @@
  },
  "dew.data.images.CC12M": {
   "augmentation": "flip_jitter",
+  "augmentation_backend": "host",
+  "augmentation_size": null,
   "count": null,
+  "crop_scale": [
+   1.0,
+   1.0
+  ],
   "image_size": 128,
   "loading": {
    "class": "dew.data.dataset.Loading",
@@ -316,7 +328,13 @@
  },
  "dew.data.images.CC3M": {
   "augmentation": "flip_jitter",
+  "augmentation_backend": "host",
+  "augmentation_size": null,
   "count": null,
+  "crop_scale": [
+   1.0,
+   1.0
+  ],
   "image_size": 128,
   "loading": {
    "class": "dew.data.dataset.Loading",
@@ -332,7 +350,13 @@
  },
  "dew.data.images.Combined30M": {
   "augmentation": "flip_jitter",
+  "augmentation_backend": "host",
+  "augmentation_size": null,
   "count": null,
+  "crop_scale": [
+   1.0,
+   1.0
+  ],
   "image_size": 128,
   "loading": {
    "class": "dew.data.dataset.Loading",
@@ -351,7 +375,13 @@
  },
  "dew.data.images.CombinedMsml612": {
   "augmentation": "flip_jitter",
+  "augmentation_backend": "host",
+  "augmentation_size": null,
   "count": null,
+  "crop_scale": [
+   1.0,
+   1.0
+  ],
   "image_size": 128,
   "loading": {
    "class": "dew.data.dataset.Loading",
@@ -370,7 +400,13 @@
  },
  "dew.data.images.DiffusionDB": {
   "augmentation": "flip_jitter",
+  "augmentation_backend": "host",
+  "augmentation_size": null,
   "count": null,
+  "crop_scale": [
+   1.0,
+   1.0
+  ],
   "image_size": 128,
   "loading": {
    "class": "dew.data.dataset.Loading",
@@ -386,7 +422,13 @@
  },
  "dew.data.images.HFImages": {
   "augmentation": "flip_jitter",
+  "augmentation_backend": "host",
+  "augmentation_size": null,
   "count": null,
+  "crop_scale": [
+   1.0,
+   1.0
+  ],
   "image_size": 128,
   "loading": {
    "class": "dew.data.dataset.Loading",
@@ -404,7 +446,13 @@
  },
  "dew.data.images.Laion12mCoco": {
   "augmentation": "flip_jitter",
+  "augmentation_backend": "host",
+  "augmentation_size": null,
   "count": null,
+  "crop_scale": [
+   1.0,
+   1.0
+  ],
   "image_size": 128,
   "loading": {
    "class": "dew.data.dataset.Loading",
@@ -420,7 +468,13 @@
  },
  "dew.data.images.Laion2bAesthetic": {
   "augmentation": "flip_jitter",
+  "augmentation_backend": "host",
+  "augmentation_size": null,
   "count": null,
+  "crop_scale": [
+   1.0,
+   1.0
+  ],
   "image_size": 128,
   "loading": {
    "class": "dew.data.dataset.Loading",
@@ -436,7 +490,13 @@
  },
  "dew.data.images.OxfordFlowers": {
   "augmentation": "flip_jitter",
+  "augmentation_backend": "host",
+  "augmentation_size": null,
   "count": null,
+  "crop_scale": [
+   1.0,
+   1.0
+  ],
   "image_size": 128,
   "labels": null,
   "loading": {
@@ -792,10 +852,13 @@
   "mixer": null,
   "mixture": null,
   "mlp": "swiglu",
+  "mlp_bias": false,
   "mlp_features": null,
   "mtp_hyper_connections": null,
   "mtp_layer_type": null,
   "norm_eps": 1e-05,
+  "norm_bias": false,
+  "norm_type": "rms",
   "num_heads": 8,
   "num_kv_heads": null,
   "num_kv_shared_layers": 0,
@@ -803,10 +866,14 @@
   "num_nextn_predict_layers": 0,
   "o_proj_bias": null,
   "output_gate": false,
+  "parallel_residual": false,
   "partial_rotary_factor": null,
   "partial_rotary_type": "proportional",
   "per_layer_input_dim": null,
   "per_layer_input_vocab": null,
+  "position_embedding": "rotary",
+  "position_embedding_offset": 0,
+  "position_embedding_size": null,
   "pre_norms": true,
   "precision": null,
   "qk_norm": true,

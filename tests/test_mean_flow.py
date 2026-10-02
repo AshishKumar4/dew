@@ -134,8 +134,8 @@ def test_a_run_config_trains_meanflow_and_its_saved_task_samples_in_one_step(tmp
     checkpoints.save(1, state, None)
     checkpoints.wait()
     config.save(str(run))
-    expected = task.pipeline(state, ema=False)(["a red bird"], seed=9).host().images
-    np.testing.assert_array_equal(TextToImage.from_run(str(run))(["a red bird"], seed=9).host().images, expected)
+    expected = task.pipeline(state, ema=False)(["a red bird"], key=9).host().images
+    np.testing.assert_array_equal(TextToImage.from_run(str(run))(["a red bird"], key=9).host().images, expected)
 
 
 def test_a_meanflow_run_samples_unguided():

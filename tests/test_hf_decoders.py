@@ -121,7 +121,7 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 TOKENIZER = Path(__file__).resolve().parent / "fixtures" / "tokenizers" / "tiny-tools"
 TINY = ("qwen3-tiny", "gemma3-tiny", "llama-tiny", "mistral-tiny", "qwen2-tiny",
         "gemma-tiny", "gemma2-tiny", "olmo3-tiny", "olmo3-yarn-tiny",
-        "llama31-tiny")
+        "llama31-tiny", "gpt2-tiny", "opt-tiny", "gpt-neox-tiny")
 DEEPSEEK = ("deepseek-v3-tiny", "deepseek-v32-tiny")
 ROUTED = DEEPSEEK + ("kimi-k2-tiny", "mixtral-tiny", "qwen3-moe-tiny")
 GEMMA4_MOE = FIXTURES / "gemma4-moe-tiny"
@@ -162,8 +162,8 @@ def test_registered_family_alias_preserves_its_source_when_exported(tmp_path, mo
     from dew.interop import hf_decoders
 
     alias = "dream_registered_alias"
-    family = hf_decoders._FAMILIES["dream"]
-    monkeypatch.setitem(hf_decoders._FAMILIES, alias,
+    family = hf_decoders.families()["dream"]
+    monkeypatch.setitem(hf_decoders.families(), alias,
                         dataclasses.replace(family, model_types=(*family.model_types, alias)))
     source = copytree(FIXTURES / "dream-tiny", tmp_path / "source")
     config = fixture_config("dream-tiny")
@@ -1165,8 +1165,8 @@ def test_glm5_prediction_index_reuse_preserves_public_padded_greedy_generation(g
     tokens[~valid] = 0
     inputs = ModelInputs(jnp.asarray(tokens), {"attention_mask": jnp.asarray(valid)})
     task = source.text_generation(sampling=Sampling(temperature=0))
-    ordinary = task(inputs, max_new_tokens=7, seed=0).host()
-    speculative = task(inputs, max_new_tokens=7, seed=0, strategy=Speculative(block=3)).host()
+    ordinary = task(inputs, max_new_tokens=7, key=0).host()
+    speculative = task(inputs, max_new_tokens=7, key=0, strategy=Speculative(block=3)).host()
     np.testing.assert_array_equal(speculative.tokens, ordinary.tokens)
     np.testing.assert_array_equal(speculative.lengths, ordinary.lengths)
     np.testing.assert_array_equal(speculative.terminated, ordinary.terminated)

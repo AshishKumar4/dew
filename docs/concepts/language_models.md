@@ -155,7 +155,9 @@ The step reports `ce`, `perplexity` and `token_accuracy`. `LMObjective` refuses 
 
 ### Loss and precision
 
-The vocabulary loss runs in float32. The head's product follows the compute dtype, as torch autocast and MaxText run it: under bf16 compute the hidden states and the head multiply as bf16 and sum in float32, backward included, which is 1.5x faster on an L4 and 1.6x faster on an RTX 4080 than fp32 operands. An fp32 model multiplies in fp32 ([Performance measurements](../performance.md)). `token_accuracy=False` (`--no-token-accuracy` on the recipe) skips the argmax over every logit, which costs 0.77 ms of the head's 8.0 ms on a TPU v6e. Chunking the head with `head_chunks` can lower peak memory but adds work, and the backend compiler may rewrite it; the saving depends on vocabulary size, sequence length, batch size and the compiled executable.
+The vocabulary loss runs in float32. The head's product follows the compute dtype, as torch autocast and MaxText run it: under bf16 compute the hidden states and the head multiply as bf16 and sum in float32, backward included, which is 1.5x faster on an L4 and 1.6x faster on an RTX 4080 than fp32 operands. At the default `matmul_precision` (unset or `"default"`) the logits are then rounded to bf16 and their gradient is rounded to bf16 once, as torch autocast's and MaxText's bf16 logits are; the softmax and the loss read them in float32. An fp32 model multiplies in fp32 ([Performance measurements](../performance.md)).
+
+That rounding costs nothing measurable in training. Over 2000 steps of wikitext-103 on an RTX 4080, against float32 logits and a float32 gradient at the same seed, validation loss moved by at most 4.5e-4 for a 3-layer decoder trained from scratch and 1.6e-3 for a Qwen3-0.6B fine-tune; two seeds of either rounding are 1.3e-2 and 2.9e-3 apart on average. It makes the 3-layer decoder's step 13% faster and Qwen3-0.6B's 3% faster at 1 x 1024 tokens. Layout parity is where it shows: with the logits' gradient rounded once, a bf16 run on 4 RTX 3090s read 1.75 times its layout-parity bound at a dense model's final norm and 5758 times it at an MoE's expert gate_proj, against 0.47 and 0.41 with the gradient carried in float32. A run that compares layouts in bf16, or resumes onto a different mesh and expects the same numbers, sets `matmul_precision="highest"`, which keeps the head in float32. `tools/layout_parity.py` sets it for bf16 decoders. An LM run recorded before this change resumes with the new rounding, which is within the rerun spread above but is not bitwise the same as before. `token_accuracy=False` (`--no-token-accuracy` on the recipe) skips the argmax over every logit, which costs 0.77 ms of the head's 8.0 ms on a TPU v6e. Chunking the head with `head_chunks` can lower peak memory but adds work, and the backend compiler may rewrite it; the saving depends on vocabulary size, sequence length, batch size and the compiled executable.
 
 With bf16 compute, Dew keeps the residual stream and every norm and sublayer output in bf16, each rounded where transformers rounds a bf16 tensor, as MaxText and Megatron (with `fp32_residual_connection=False`) do. `torch.autocast` instead keeps the residual stream and the norms in float32 and rounds at each matmul's input. The torch run with Dew's rounding points is autocast with the embedding output and every RMSNorm output cast to bf16 and the rotary table left in float32 (`tools/reference_runs/torch_lm.py --precision autocast-bf16-residual`). At those rounding points the first step's loss depends on the attention kernel as much as on the framework. On the first batch of a Qwen3-0.6B fine-tune (4 x 1024 tokens, one A100, `tools/reference_runs/step0_attention.py`):
 
@@ -206,7 +208,7 @@ save_pretrained_decoder(model, lm_state.params, "stories-decoder", tokenizer="by
                         generation_config={"do_sample": False, "max_new_tokens": 24})
 task = dew.pipeline("stories-decoder", dtype="float32")
 print(task.sampling)
-result = task([tokenizer.encode("At night")], seed=0).host()
+result = task([tokenizer.encode("At night")], key=0).host()
 print(tokenizer.decode(result.tokens[0]), result.lengths)
 ```
 
@@ -266,7 +268,7 @@ inputs = bundle.processor(["token7 <start_of_image> token9",
                           images=[[images[0]], [images[1], images[2]]])
 logits = bundle.model.apply(bundle.variables, inputs.tokens, **inputs.kwargs())
 task = bundle.text_generation(sampling=Sampling(temperature=0))
-for text in task(inputs, 3, seed=1).text:
+for text in task(inputs, 3, key=1).text:
     print(text)
 ```
 
@@ -363,7 +365,7 @@ LLaDA and Dream use this masked-token path from their released weights. They pre
 ```python
 llada = load_pretrained(fixtures / "llada-tiny", dtype="float32", attention_impl="xla")
 masked_task = llada.text_generation()
-result = masked_task([[1, 2, 3]], 8, seed=7, steps=16, n=2)
+result = masked_task([[1, 2, 3]], 8, key=7, steps=16, n=2)
 print(result.host().tokens)
 ```
 
