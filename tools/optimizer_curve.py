@@ -29,14 +29,13 @@ import jax
 import optax
 import tyro
 
-from dew.config import OptimConfig
-from dew.data import Loading, TokenWindows
-from dew.objectives.lm import LMObjective
 import dew.nn.backbones  # noqa: F401  (registers the kind)
+from dew.config import OptimConfig
+from dew.data import DataPartition, Loading, TokenWindows
+from dew.objectives.lm import LMObjective
 from dew.registry import models, with_precision
 from dew.training import MeshSpec, Trainer
-from dew.training.distributed import DevicePrefetchIterator, data_partition
-from dew.training.optim import build_optimizer
+from dew.training.distributed import DevicePrefetchIterator
 
 Solver = Literal["adam", "adamw", "lamb", "muon", "muon-unsplit"]
 """The OPTIMIZER_MAP names, plus the unsplit Muon arm."""
@@ -70,7 +69,7 @@ def build_solver(config: Comparison) -> optax.GradientTransformation:
                                   adam_weight_decay=config.weight_decay)
     optim = OptimConfig(optimizer=config.optimizer, learning_rate=config.learning_rate,
                         weight_decay=config.weight_decay)
-    return build_optimizer(optim, steps=config.steps)
+    return optim.build(config.steps)
 
 
 @dataclass(frozen=True)
@@ -118,7 +117,7 @@ def run(config: Comparison) -> Curve:
     state = jax.jit(trainer.initial_state, out_shardings=trainer.shardings(abstract))()
     parameters = sum(x.size for x in jax.tree.leaves(state.params))
 
-    with DevicePrefetchIterator(data.train(data_partition(trainer.device_mesh)),
+    with DevicePrefetchIterator(data.train(DataPartition.of(trainer.device_mesh)),
                                 trainer.device_mesh) as source:
         train_step = trainer.compile(state, next(source))
         

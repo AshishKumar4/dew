@@ -67,7 +67,6 @@ from dew.objectives.base import (
     Step,
     Variables,
     freeze,
-    mean_loss,
     merge,
     merge_totals,
     thaw,
@@ -1073,7 +1072,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         losses, weights, log_z, correct, _, _, routing, depths, qk, kls = scores
         mass = jax.lax.stop_gradient(jnp.sum(weights))
         prediction = Ratio(jnp.sum(losses * weights), mass)
-        ce, _ = mean_loss(prediction)
+        ce, _ = prediction.mean()
         reported = {"ce": ce, "perplexity": jnp.exp(ce)}
         if correct is not None:
             reported["token_accuracy"] = jnp.sum(correct * weights) / jnp.where(mass > 0, mass, 1)
@@ -1088,7 +1087,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             mtp_total = jnp.mean(jnp.stack([
                 jnp.sum(depth_losses * depth_weights)
                 for depth_losses, depth_weights in depths]))
-            reported["mtp_ce"], _ = mean_loss(Ratio(mtp_total, mass))
+            reported["mtp_ce"], _ = Ratio(mtp_total, mass).mean()
             prediction = Ratio(prediction.total + self.mtp_weight * mtp_total, mass)
         if self.indexer is not None:
             # The KL shares the cross entropy's denominator, as the depths
@@ -1109,7 +1108,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
                     "(dew.nn.moe.Router); this model's routers sow none")
             statistics = (LMStatistics(prediction, (), (), router_z) if isinstance(statistics, Ratio)
                           else dataclasses.replace(statistics, router_z=router_z))
-            reported["router_z_loss"] = jnp.sum(jnp.stack([mean_loss(term)[0] for term in router_z]))
+            reported["router_z_loss"] = jnp.sum(jnp.stack([term.mean()[0] for term in router_z]))
         effects = None
         if rate is not None:
             effects, load = self._router_load(params, routing)
@@ -1137,7 +1136,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         global_routers = () if self.seq_aux else tuple(router_moments(s, i) for s, i in routers)
         statistics = LMStatistics(prediction, sequence, global_routers)
         combined, _ = self.reduce_loss(statistics)
-        prediction_loss, _ = mean_loss(prediction)
+        prediction_loss, _ = prediction.mean()
         return statistics, combined - prediction_loss
 
     def _router_load(self, params: Variables, routing) -> tuple[Variables, dict[str, jax.Array]]:
@@ -1161,10 +1160,10 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
 
     def reduce_loss(self, stats: Ratio | LMStatistics) -> tuple[jax.Array, jax.Array]:
         if isinstance(stats, Ratio):
-            return mean_loss(stats)
-        value, active = mean_loss(stats.prediction)
+            return stats.mean()
+        value, active = stats.prediction.mean()
         for term in stats.sequence:
-            auxiliary, supported = mean_loss(term)
+            auxiliary, supported = term.mean()
             value, active = value + auxiliary, active | supported
         for term in stats.global_routers:
             if self.aux_loss_alpha is None:
@@ -1172,7 +1171,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             value = value + global_router_loss(term, self.aux_loss_alpha)
             active = active | (term.positions > 0)
         for term in stats.router_z:
-            auxiliary, supported = mean_loss(term)
+            auxiliary, supported = term.mean()
             value, active = value + auxiliary, active | supported
         return value, active
 

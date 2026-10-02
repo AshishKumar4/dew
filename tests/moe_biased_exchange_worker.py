@@ -12,7 +12,7 @@ import optax
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from dew.nn.gpt_oss import GptOssMLP
-from dew.training import MeshSpec, build_mesh
+from dew.training import MeshSpec
 
 
 def place(value: jax.Array, sharding: NamedSharding) -> jax.Array:
@@ -39,7 +39,7 @@ def main() -> None:
     from test_moe_biased_exchange import reference_case, training_shardings, training_step
 
     try:
-        mesh = build_mesh(MeshSpec(expert=2))
+        mesh = MeshSpec(expert=2).build()
         tokens, replicated = NamedSharding(mesh, P('expert')), NamedSharding(mesh, P())
         specs = training_shardings(mesh)
         errors: dict[str, list[float]] = {}

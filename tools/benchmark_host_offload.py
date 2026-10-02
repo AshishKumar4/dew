@@ -24,10 +24,10 @@ from __future__ import annotations
 
 import dataclasses
 import gc
-import zlib
 import json
 import math
 import time
+import zlib
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
@@ -40,10 +40,9 @@ import dew.nn.backbones  # noqa: F401  (registers the kind)
 from dew.inference.banks import at_namespace, host_banked, in_namespace, narrowed, one_layer
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import Variables
-from dew.training.distributed import Placement
 from dew.registry import models, with_precision
 from dew.training import Layout, MeshSpec
-from dew.training.distributed import build_mesh
+from dew.training.distributed import Placement
 
 WIDTHS = {
     "tiny": {"vocab_size": 256, "emb_features": 64, "num_heads": 4, "head_dim": 16,
@@ -239,7 +238,7 @@ def measure(config: OffloadConfig, depth: int, offload: bool) -> dict:
     """One case: the plan, and the run when the arguments fit."""
     model = build(config, depth)
     mesh = MeshSpec(fsdp=config.fsdp)
-    device_mesh = build_mesh(mesh)
+    device_mesh = mesh.build()
     tokens = jnp.zeros((config.batch, config.prompt), jnp.int32)
     layout = Layout(min_shard=1, tolerance=1.0,
                     host_parameters=("params/layers_*",) if offload else ())

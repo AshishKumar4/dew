@@ -82,7 +82,7 @@ JAX_PLATFORMS=cpu python examples/train_rlvr.py --smoke --turns 2 --out /tmp/rlv
 
 [`examples/evaluate_and_serve.py`](https://github.com/AshishKumar4/dew/blob/main/examples/evaluate_and_serve.py) loads a run with `dew.pipeline` and writes one JSON report. The report holds:
 
-- perplexity through [`evaluate`](evaluation.md), which is the trainer's validation call without the optimizer or the tracker;
+- perplexity through [`Evaluation.run`](evaluation.md), which is the trainer's validation call without the optimizer or the tracker;
 - an lm-evaluation-harness suite through `dew.eval.harness.DewLM`;
 - FID and CLIPScore of a diffusion run's samples against a directory of reference images;
 - a greedy continuation.

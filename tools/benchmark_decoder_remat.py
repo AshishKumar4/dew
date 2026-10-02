@@ -53,7 +53,6 @@ from jax.core import ShapedArray
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES, Mixture
-from dew.objectives import scalar_loss
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 
@@ -85,7 +84,7 @@ def main():
     optimizer = optax.adamw(1e-4)
 
     def loss(params, tokens):
-        return scalar_loss(objective, {"params": params}, tokens, info)[0]
+        return objective.scalar_loss({"params": params}, tokens, info)[0]
 
     residuals = saved_residuals(loss, shapes, jax.tree.map(
         lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), tokens))

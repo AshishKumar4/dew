@@ -155,7 +155,7 @@ def training_timing(config, backend):
     from dew.nn.backbones import SimpleDiT
     from dew.objectives.diffusion import DiffusionObjective
     from dew.training import Trainer
-    from dew.training.distributed import DevicePrefetchIterator, data_partition
+    from dew.training.distributed import DevicePrefetchIterator
 
     spec = OxfordFlowers(path=config.flowers, image_size=config.image_size,
                          augmentation_backend=backend, val_batches=0,
@@ -167,7 +167,7 @@ def training_timing(config, backend):
                                   ema_decay=None)
     trainer = Trainer(objective, optax.adamw(1e-3), key=jax.random.key(0))
     state, _, _ = trainer.place()
-    source = spec.load(batch=config.batch).train(data_partition(trainer.device_mesh))
+    source = spec.load(batch=config.batch).train(DataPartition.of(trainer.device_mesh))
     durations = []
     with DevicePrefetchIterator(source, trainer.device_mesh) as batches:
         step = trainer.compile(state, next(batches))

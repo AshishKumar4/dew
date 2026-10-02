@@ -13,8 +13,8 @@ from dew.checkpoints import Checkpoints
 from dew.config import OptimConfig, RunConfig
 from dew.objectives.base import EMASpec
 from dew.training import Layout, Trainer
-from dew.training.optim import PowerProfilesState, build_optimizer, power_profiles
-from dew.training.posthoc import coefficients, exponent, power_decay, reconstruct, relative_std
+from dew.training.optim import PowerProfilesState, power_profiles
+from dew.training.posthoc import coefficients, exponent, power_decay, relative_std
 
 # Outputs of NVlabs/edm2 training/phema.py (std_to_exp, power_function_beta,
 # solve_posthoc_coefficients) on the same inputs, float64.
@@ -68,7 +68,7 @@ def test_a_reconstructed_average_matches_one_tracked_directly(tmp_path):
     assert checkpoints.profile_steps() == list(range(4, 97, 4))
     assert checkpoints.profile_metadata(96) == (96, (float(np.float32(0.05)), float(np.float32(0.1))))
     direct = jax.tree.map(np.asarray, state.ema["params"])
-    rebuilt = reconstruct(str(tmp_path / "run"), 0.07)
+    rebuilt = Checkpoints(str(tmp_path / "run")).posthoc_ema(0.07)
     stored = checkpoints.restore_profiles(96)
 
     def distance(a, b):
@@ -109,7 +109,7 @@ def test_a_run_record_names_its_profiles_and_the_solver_keeps_them():
     assert loaded == config
 
     params = {"w": jnp.ones(3)}
-    solver = build_optimizer(loaded.optim, steps=10)
+    solver = loaded.optim.build(10)
     state = solver.init(params)
     assert isinstance(state, PowerProfilesState)
     np.testing.assert_array_equal(state.stds, np.float32([0.05, 0.10]))
@@ -210,7 +210,7 @@ def test_reconstruction_accumulates_bfloat16_weights_in_float32(tmp_path):
     checkpoints = Checkpoints(str(tmp_path / 'run'))
     checkpoints.save(2, state, None)
     checkpoints.wait()
-    rebuilt = reconstruct(str(tmp_path / 'run'), float(np.float32(0.05)))
+    rebuilt = Checkpoints(str(tmp_path / 'run')).posthoc_ema(float(np.float32(0.05)))
     for held, expected in zip(jax.tree.leaves(rebuilt), jax.tree.leaves(averages[0]), strict=True):
         assert held.dtype == np.asarray(expected).dtype
         np.testing.assert_array_equal(held.view(np.uint16), np.asarray(expected).view(np.uint16))

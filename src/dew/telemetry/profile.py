@@ -309,9 +309,3 @@ def region(name: str) -> AbstractContextManager[None]:
     """
     active = active_profile()
     return nullcontext() if active is None else active.region(name)
-
-
-def profile(directory: str | os.PathLike[str] | None = None, *,
-            options: jax.profiler.ProfileOptions | None = None) -> Profiler:
-    """Configure native profiling; capture starts only on enter or start()."""
-    return Profiler(directory, options=options)

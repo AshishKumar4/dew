@@ -4,7 +4,7 @@ This page describes the main interfaces and the contracts between them, grouped 
 
 ## Objective
 
-Import `Objective`, `Aux`, `Step`, `Ratio`, `mean_loss`, and `scalar_loss` from `dew.objectives`.
+Import `Objective`, `Aux`, `Step` and `Ratio` from `dew.objectives`. `Ratio.mean()` reduces a ratio statistic, and `objective.scalar_loss(variables, batch, step)` evaluates and reduces a loss for direct differentiation.
 
 | Member | Contract |
 |---|---|
@@ -19,7 +19,7 @@ Import `Objective`, `Aux`, `Step`, `Ratio`, `mean_loss`, and `scalar_loss` from 
 
 `Step.step` counts accepted microbatches. Its `key` derives from consumed attempts, including rejected ones. `ema` holds selected averaged leaves overlaid onto the complete variables mapping, or `None`.
 
-`Aux(metrics, variables=None, qk_stats=None, effects=None)` carries training measurements, sequential mutable replacements, QK maxima and additive deferred effects. The trainer applies effects once on a supported optimizer commit. `scalar_loss(objective, variables, batch, step)` returns a scalar and the same Aux for direct JAX differentiation.
+`Aux(metrics, variables=None, qk_stats=None, effects=None)` carries training measurements, sequential mutable replacements, QK maxima and additive deferred effects. The trainer applies effects once on a supported optimizer commit. `objective.scalar_loss(variables, batch, step)` returns a scalar and the same Aux for direct JAX differentiation.
 
 ### Collections and EMA selection
 
@@ -46,10 +46,10 @@ Import these from `dew.training`:
 ```text
 MeshSpec(fsdp=1, expert=1, tensor=1, sequence=1, stage=1, microbatches=None, replicas=1)
 Layout(rules=DEFAULT_RULES, min_shard=65536, tolerance=0.02, host=(), host_parameters=())
-build_mesh(spec, devices=None)
+MeshSpec(...).build(devices=None)
 ```
 
-`build_mesh` uses the supplied devices or JAX's visible devices; the specified factors must divide their count, and data parallelism fills the remaining factor. Explicit pipeline microbatches require `stage > 1` and a positive multiple of the stage count. `replicas` above 1 builds a hybrid mesh whose data axis spans that many groups of granules (TPU slices, GPU hosts or NVLink domains, or processes where every device shares one slice), with every other axis inside a group; see [training on several nodes](../guides/multi-node.md#mesh-layout-across-nodes). A sequence axis above 1 splits every attention call's positions, and each call picks the all-to-all or the gather exchange from its shape.
+`MeshSpec.build` uses the supplied devices or JAX's visible devices; the specified factors must divide their count, and data parallelism fills the remaining factor. Explicit pipeline microbatches require `stage > 1` and a positive multiple of the stage count. `replicas` above 1 builds a hybrid mesh whose data axis spans that many groups of granules (TPU slices, GPU hosts or NVLink domains, or processes where every device shares one slice), with every other axis inside a group; see [training on several nodes](../guides/multi-node.md#mesh-layout-across-nodes). A sequence axis above 1 splits every attention call's positions, and each call picks the all-to-all or the gather exchange from its shape.
 
 `Layout.rules` accepts an ordered logical-axis rule sequence or a mapping of overrides. Mapping entries update the default table. When dimensions compete for one mesh axis, rule order determines precedence; a non-divisible dimension cannot use that axis. Valid parameter mesh axes are `fsdp`, `expert`, and `tensor`. `min_shard` counts elements, not bytes. `tolerance` is the permitted fraction of shardable parameter elements left replicated. `host` names train-state fields out of `params`, `opt_state` and `ema`. The named `opt_state` and `ema` stay in pinned host memory between steps and the step fetches them to the device. Naming `params` instead makes the CPU own the whole `TrainState`, including optimizer, EMA and accumulation: the optimizer transaction runs on a CPU companion of the mesh, and the runtime CPU device count must match the accelerator count on every process before JAX initializes. `host_parameters` holds glob patterns over logical parameter paths (`params/layers_*`) that an inference placement keeps in pinned host memory; only the `offloaded` placement reads them, and `check` refuses a layout that names them for any other placement. `shardings(mesh, tree)` returns a matching tree of placements; `check(params, shardings, mesh)` validates excessive replication. See [distributed training](../concepts/distributed.md).
 
@@ -128,7 +128,7 @@ Loading(workers=0, threads=64, read_buffer=128, worker_buffer=2)
 
 `from_records` reads records held in memory: a mapping of equal-length columns, a sequence of per-record mappings, or a source with `__len__` and `__getitem__`. Its training stream reshuffles from `seed` every epoch and saves a global record position; `validation` is one ordered pass of whole batches, and fewer records than one batch are refused. `from_grain` reads a Grain pipeline the caller built, in the caller's order.
 
-`train(partition)` opens a training iterator, and `val(partition)` opens one finite validation pass, or `val` is `None`. Each reads the share of every global batch the `DataPartition` names: the `index`th of `count` disjoint shares, which `readers` processes read alike; `reader` is which of them this process is. `dew.training.data_partition(mesh)` is the share a process reads on a mesh, and `DataPartition()` is every row. `records` is the known training-record count or `None`; `batch` is global. `steps_per_epoch` is integer division of records by batch, or `None`. `epoch_steps(epochs=1)` requires a finite record count. `ramp` is set when the run grows its batch over its first records; `batch` is then the batch the ramp ends at.
+`train(partition)` opens a training iterator, and `val(partition)` opens one finite validation pass, or `val` is `None`. Each reads the share of every global batch the `DataPartition` names: the `index`th of `count` disjoint shares, which `readers` processes read alike; `reader` is which of them this process is. `DataPartition.of(mesh)` is the share a process reads on a mesh, and `DataPartition()` is every row. `records` is the known training-record count or `None`; `batch` is global. `steps_per_epoch` is integer division of records by batch, or `None`. `epoch_steps(epochs=1)` requires a finite record count. `ramp` is set when the run grows its batch over its first records; `batch` is then the batch the ramp ends at.
 
 Each factory call must return a fresh, exclusively owned iterator. Ordinary `close()` is finalization and must not race `next()` or checkpoint operations. A source that needs to interrupt blocking reads may additionally implement `request_stop()`: a thread-safe, nonblocking, idempotent signal, safe alongside both `next()` and `close()`. Tokenized wrappers forward these operations.
 

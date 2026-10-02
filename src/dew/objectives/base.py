@@ -66,7 +66,7 @@ function is not one of these; `jax.jit` cannot take it as an argument."""
 class Ratio:
     """Keep a numerator and its denominator apart until the reduction.
 
-    They sum across microbatches and devices before mean_loss divides.
+    They sum across microbatches and devices before `mean` divides.
 
     The denominator (mass) is nonnegative and does not depend on the parameters. Zero
     mass declares a zero numerator and no contribution.
@@ -74,14 +74,14 @@ class Ratio:
     total: jax.Array
     mass: jax.Array
 
-
-def mean_loss(stats: Ratio) -> tuple[jax.Array, jax.Array]:
-    """Reduce a shared-denominator estimator, including empty support."""
-    mass = jax.lax.stop_gradient(stats.mass)
-    active = mass > 0
-    dtype = jnp.result_type(stats.total.dtype, mass.dtype, jnp.float32)
-    value = stats.total.astype(dtype) / jnp.where(active, mass.astype(dtype), 1)
-    return jnp.where(active, value, 0), active
+    def mean(self) -> tuple[jax.Array, jax.Array]:
+        """Reduce a shared-denominator estimator, including empty support:
+        the mean, or zero where the mass is zero, and whether any mass was."""
+        mass = jax.lax.stop_gradient(self.mass)
+        active = mass > 0
+        dtype = jnp.result_type(self.total.dtype, mass.dtype, jnp.float32)
+        value = self.total.astype(dtype) / jnp.where(active, mass.astype(dtype), 1)
+        return jnp.where(active, value, 0), active
 
 
 Loss = TypeVar("Loss", default=Ratio | jax.Array | float)
@@ -382,7 +382,7 @@ class Objective(ABC, Generic[Loss, Effects]):
     def reduce_loss(self, stats: Loss) -> tuple[jax.Array, jax.Array]:
         """The objective value and whether its statistical support is active."""
         if isinstance(stats, Ratio):
-            return mean_loss(stats)
+            return stats.mean()
         if isinstance(stats, (jax.Array, float, int)):
             value = jnp.asarray(stats)
             value = value.astype(jnp.promote_types(value.dtype, jnp.float32))
@@ -390,6 +390,12 @@ class Objective(ABC, Generic[Loss, Effects]):
                 raise ValueError("a unit-mass loss must be scalar")
             return value, jnp.asarray(a=True)
         raise TypeError("custom loss statistics require Objective.reduce_loss")
+
+    def scalar_loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[jax.Array, Aux[Effects]]:
+        """Evaluate and reduce the canonical statistics, for direct JAX differentiation."""
+        stats, aux = self.loss(variables, batch, step)
+        value, _ = self.reduce_loss(stats)
+        return value, aux
 
     def tile_head(self, tile: tuple[int, int] | None = None) -> str | None:
         """Move a head that holds its whole logits for the backward to a
@@ -455,14 +461,6 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         return scored if scored is not None else self.evaluate(params, batch, step)
 
-
-
-def scalar_loss(objective: Objective[Loss, Effects], variables: Variables,
-                batch: Batch, step: Step) -> tuple[jax.Array, Aux[Effects]]:
-    """Evaluate and reduce canonical statistics for direct JAX differentiation."""
-    stats, aux = objective.loss(variables, batch, step)
-    value, _ = objective.reduce_loss(stats)
-    return value, aux
 
 
 S = TypeVar("S")
