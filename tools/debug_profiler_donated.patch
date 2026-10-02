@@ -1,0 +1,59 @@
+diff --git a/src/dew/training/trainer.py b/src/dew/training/trainer.py
+index 5863489b9..e185ba0d2 100644
+--- a/src/dew/training/trainer.py
++++ b/src/dew/training/trainer.py
+@@ -1463,19 +1463,15 @@ class Trainer(Generic[Loss, Effects]):
+                 validation=validation is not None
+                 or (bool(eval_every or metrics) and dataset.val is not None),
+             )
+-            state, shardings, position = self.place()
+-            run.last_checkpoint = time.perf_counter()
+-            if checkpoints is not None and checkpoints.latest is not None:
+-                run.stop_control = checkpoints.control(checkpoints.latest)
+-            if self._opened(plan, run, state, position):
+-                return state
+-            state = self._training_loop(plan, run, state, shardings, position, profiler, tracer,
+-                                        profile, checkpoints)
++            state, already_complete = self._training_loop(
++                plan, run, profiler, tracer, profile, checkpoints)
+         finally:
+             primary = sys.exception()
+             error = self._closed(run, primary, profiler)
+             if primary is None and error is not None:
+                 raise error
++        if already_complete:
++            return state
+         if run.preempted is not None:
+             raise Preempted(run.preempted)
+         if restore_best and checkpoints is not None:
+@@ -1487,10 +1483,17 @@ class Trainer(Generic[Loss, Effects]):
+             )
+         return state
+
+-    def _training_loop(self, plan: _FitPlan, run: _FitRun, state: TrainState,
+-                       shardings, position, profiler: Profiler | None, tracer: Profiler | None,
+-                       profile: ProfileWindow | None, checkpoints: Checkpoints | None) -> TrainState:
+-        """Dispatch the numerical steps and finish their loop before resource cleanup."""
++    def _training_loop(self, plan: _FitPlan, run: _FitRun,
++                       profiler: Profiler | None, tracer: Profiler | None,
++                       profile: ProfileWindow | None,
++                       checkpoints: Checkpoints | None) -> tuple[TrainState, bool]:
++        """Own the placed state through its updates and finish before resource cleanup."""
++        state, shardings, position = self.place()
++        run.last_checkpoint = time.perf_counter()
++        if checkpoints is not None and checkpoints.latest is not None:
++            run.stop_control = checkpoints.control(checkpoints.latest)
++        if self._opened(plan, run, state, position):
++            return state, True
+         compiled: dict[Shapes, tuple[CompiledStep, float | None]] = {}
+         interval = _Interval(fresh_book(), time.time(), last_saved=(
+             run.current if checkpoints is not None and checkpoints.latest is not None else None))
+@@ -1546,7 +1549,7 @@ class Trainer(Generic[Loss, Effects]):
+                     assert profiler is not None
+                     self._stop_trace(run, profile, profiler)
+         self._wind_down(plan, run, interval, state, shardings, position, profiler)
+-        return state
++        return state, False
+
+     def _closed(self, run: _FitRun, primary: BaseException | None,
+                 profiler: Profiler | None) -> BaseException | None:

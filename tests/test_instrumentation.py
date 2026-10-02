@@ -564,6 +564,7 @@ def test_a_tracker_can_capture_after_each_training_update(tmp_path, monkeypatch)
     the capture boundary to synchronize."""
     _capture_env(monkeypatch)
     captured = []
+    expected = make_trainer().fit(Data(batches), steps=2, log_every=1)
 
     class CapturingTracker(RecordingTracker):
         def log(self, scalars, step):
@@ -578,6 +579,9 @@ def test_a_tracker_can_capture_after_each_training_update(tmp_path, monkeypatch)
 
     assert int(state.step) == 2
     assert captured == [1, 2]
+    for actual, reference in zip(jax.tree.leaves(state.params),
+                                 jax.tree.leaves(expected.params), strict=True):
+        np.testing.assert_array_equal(actual, reference)
     assert all(list((tmp_path / f"step-{step}").glob("**/*.xplane.pb"))
                for step in captured), "a training tick left no native trace"
 
