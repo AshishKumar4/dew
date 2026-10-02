@@ -9,7 +9,7 @@ import pytest
 from flax import linen as nn
 from reference_error import assert_fp32_reduction_bound
 
-from dew.nn.conv import Conv, _polyphase_depthwise_3x3
+from dew.nn.conv import Conv, _conv_general_dilated, _polyphase_depthwise_3x3, _shifted_depthwise_3x3
 from dew.nn.ssm import SpatialFusionConv
 
 
@@ -20,8 +20,9 @@ def convolve(x, kernel, dilation):
         precision=jax.lax.Precision.HIGHEST)
 
 
+@pytest.mark.parametrize('operation', [_polyphase_depthwise_3x3, _shifted_depthwise_3x3])
 @pytest.mark.parametrize('dilation', [1, 2, 3])
-def test_depthwise_forward_and_gradients_keep_every_term_with_fp32_rounding(dilation):
+def test_depthwise_forward_and_gradients_keep_every_term_with_fp32_rounding(dilation, operation):
     """Two reductions differ by at most twice gamma_n times sum(abs(products)).
 
     Nine products contribute to each output and input gradient; B*H*W
@@ -34,7 +35,6 @@ def test_depthwise_forward_and_gradients_keep_every_term_with_fp32_rounding(dila
     highest precision, and dw was 0.0 of this bound; bf16 dw used 0.019 of
     it.
     """
-    operation = _polyphase_depthwise_3x3
     rng = np.random.default_rng(17)
     x = jnp.asarray(rng.normal(size=(2, 7, 8, 5)).astype(np.float32))
     kernel = jnp.asarray(rng.normal(size=(3, 3, 1, 5)).astype(np.float32))
@@ -61,10 +61,10 @@ def test_depthwise_forward_and_gradients_keep_every_term_with_fp32_rounding(dila
     assert_fp32_reduction_bound(actual_loss, expected_loss, loss_magnitude, terms)
 
 
+@pytest.mark.parametrize('operation', [_polyphase_depthwise_3x3, _shifted_depthwise_3x3])
 @pytest.mark.parametrize('dilation', [1, 2, 3])
-def test_bf16_depthwise_accumulates_before_rounding(dilation):
+def test_bf16_depthwise_accumulates_before_rounding(dilation, operation):
     """Rounding each add to bf16 loses eight half-ulp terms at an interior pixel."""
-    operation = _polyphase_depthwise_3x3
     side = 2 * dilation + 1
     x = jnp.ones((1, side, side, 2), jnp.bfloat16)
     kernel = jnp.full((3, 3, 1, 2), 1 / 256, jnp.bfloat16).at[1, 1].set(1)
@@ -79,6 +79,30 @@ def test_bf16_depthwise_accumulates_before_rounding(dilation):
         np.testing.assert_array_equal(lhs, rhs)
     assert float(actual[0][0, dilation, dilation, 0]) == 1.03125
     assert float(actual[1][0, dilation, dilation, 0]) == 1.03125
+
+
+@pytest.mark.skipif(jax.default_backend() != "cpu", reason="the shifted sum is the CPU's path")
+@pytest.mark.parametrize('dtype', [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize('dilation', [1, 2, 3])
+@pytest.mark.parametrize('shape', [(2, 16, 16, 768), (1, 7, 8, 17), (1, 7, 8, 16)])
+def test_cpu_depthwise_is_the_library_convolution_bit_for_bit(shape, dilation, dtype):
+    """On the CPU a depthwise convolution of more than 16 features runs as
+    nine shifted products summed in fp32, with no convolution op left, and
+    its bits are the library convolution's (YNNPACK under jax 0.11.2.post3),
+    so a sampled image does not change; 16 features or fewer, which the
+    library sums otherwise, keep the convolution. The hybrid DiT's 2 x 16 x
+    16 x 768 maps took 6.4 ms a call as a convolution and 1.4 ms shifted, on
+    one core of an i9-12900K."""
+    rng = np.random.default_rng(dilation)
+    x = jnp.asarray(rng.normal(size=shape), dtype)
+    kernel = jnp.asarray(rng.normal(size=(3, 3, 1, shape[-1])) * 0.2, dtype)
+    padding = 'SAME' if dilation != 2 else ((2, 2), (2, 2))
+    shared = jax.jit(lambda x, kernel: _conv_general_dilated(
+        x, kernel, (1, 1), padding, rhs_dilation=(dilation, dilation),
+        dimension_numbers=('NHWC', 'HWIO', 'NHWC'), feature_group_count=shape[-1]))
+    np.testing.assert_array_equal(np.asarray(shared(x, kernel)), np.asarray(jax.jit(partial(
+        convolve, dilation=dilation))(x, kernel)))
+    assert (' convolution(' in shared.lower(x, kernel).compile().as_text()) == (shape[-1] <= 16)
 
 
 @pytest.mark.parametrize('dilation', [1, 2, 3])
