@@ -52,7 +52,8 @@ def _gpt2_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     }
 
 
-def _gpt2_prepare(tensors: Mapping[str, np.ndarray]) -> Mapping[str, np.ndarray]:
+def _gpt2_prepare(tensors: Mapping[str, np.ndarray],
+                   _config: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
     """Split Conv1D qkv without copying the mapped checkpoint's bytes."""
     prepared = {}
     for name, tensor in tensors.items():

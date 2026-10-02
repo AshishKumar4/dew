@@ -367,7 +367,8 @@ def _kimi_k3_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | 
     return _decoder_path(name.removeprefix('language_model.model.'), config)
 
 
-def _kimi_linear_prepare(tensors: Mapping[str, np.ndarray]) -> Mapping[str, np.ndarray]:
+def _kimi_linear_prepare(tensors: Mapping[str, np.ndarray],
+                          _config: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
     """Read each KDA layer's `A_log` `[1, 1, heads, 1]` as the `[heads]` the
     layer holds (modeling_kimi.py:487-488)."""
     prepared = dict(tensors)
@@ -384,7 +385,8 @@ _KDA_ZERO_PADDED = ('.self_attn.A_log',)
 """The tensors K3's release stores past their heads as zeros (`DecoderFamily.zero_padded`)."""
 
 
-def _kimi_k3_prepare(tensors: Mapping[str, np.ndarray]) -> Mapping[str, np.ndarray]:
+def _kimi_k3_prepare(tensors: Mapping[str, np.ndarray],
+                      _config: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
     """Trim each KDA layer's zero-padded `A_log` to its heads.
 
     The release stores `A_log` `[128]` beside `dt_bias` `[96 * 128]`: 96
