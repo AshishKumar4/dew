@@ -250,11 +250,17 @@ def step_compiler_options(objective, rows: int, frozen: bool) -> jax.stages.Comp
         step                       tokens    merged   apart
         Qwen3-0.6B, LoRA r16       1 x 32     15.92   16.48
         Qwen3-0.6B, LoRA r16       4 x 32     18.64   18.99
+        Qwen3-0.6B, LoRA r16       2 x 64     18.59   18.89
+        Qwen3-0.6B, LoRA r16      1 x 128     20.79   19.18
         Qwen3-0.6B, LoRA r16       8 x 32     24.02   22.97
         Qwen3-0.6B, LoRA r16     1 x 1024     60.61   59.19
         Qwen3-0.6B widths, full    1 x 32     46.83   44.93
         Qwen3-0.6B widths, full  1 x 1024     97.7    94.1
         3-layer decoder, full      1 x 32      5.01    4.89
+
+    At 128 tokens the shapes disagree: 1 x 128 runs faster apart, 2 x 64
+    and 4 x 32 merged. The boundary includes 128, so no step runs slower
+    than XLA's default, and 1 x 128 gives up 1.6 ms to apart.
 
     Only an LM objective names the tokens in a row, its `seq_len`, so
     another objective's frozen step runs apart. And Triton GEMM fusions go
