@@ -227,7 +227,7 @@ CASES = [
                       "kind": "llama4", "use_rope": True, "floor_scale": 4.0}},
                   "full_attention": {"mixer": {"kind": "llama4", "use_rope": False,
                                                "floor_scale": 4.0}}},
-        "mixture": {"experts": 8, "top_k": 1, "every": 2, "score_function": "sigmoid",
+        "mixture": {"experts": 8, "top_k": 1, "layers": (1,), "score_function": "sigmoid",
                     "norm_topk_prob": False, "scale_inputs": True, "expert_features": 16,
                     "shared_features": 16},
     }, seq_len=SEQ_LEN, label="llama4"),

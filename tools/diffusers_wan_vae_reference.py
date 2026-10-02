@@ -22,6 +22,9 @@ compresses; they are still float32 tensors.
 
     python tools/diffusers_wan_vae_reference.py OUTPUT_DIR
     python tools/diffusers_wan_vae_reference.py bundle OUTPUT_DIR tests/fixtures/wan_vae.tar.xz
+
+`bfloat16 FIXTURE_DIR OUTPUT.npz` walks the saved fixture again in bfloat16
+(`bfloat16_walk`), for tests/fixtures/wan_vae_bf16.npz.
 """
 
 from __future__ import annotations
@@ -95,6 +98,37 @@ def build(root: Path) -> dict[str, np.ndarray]:
     return arrays
 
 
+def bfloat16_walk(fixture: Path) -> dict[str, np.ndarray]:
+    """The saved fixture VAE walked in bfloat16 as `WanPipeline` runs it under
+    `torch_dtype=torch.bfloat16`: one nine-frame video's posterior and the
+    decode of one latent, with the input gradients of both. Inputs and probes
+    are bfloat16 values; everything is recorded as float32."""
+    from diffusers import AutoencoderKLWan
+
+    model = AutoencoderKLWan.from_pretrained(fixture / "vae", torch_dtype=torch.bfloat16).eval()
+    generator = torch.Generator().manual_seed(SEED + 1)
+
+    def bfloat16(tensor):
+        return tensor.bfloat16().float()
+
+    video = torch.rand((1, 3, FRAMES, HEIGHT, WIDTH), generator=generator) * 2 - 1
+    video = video.bfloat16().requires_grad_()
+    posterior = model.encode(video).latent_dist
+    mean, std = posterior.mean, posterior.std
+    probe_mean = bfloat16(torch.randn(mean.shape, generator=generator))
+    probe_std = bfloat16(torch.randn(std.shape, generator=generator))
+    ((mean.float() * probe_mean).sum() + (std.float() * probe_std).sum()).backward()
+
+    latent = torch.randn(mean.shape, generator=generator).bfloat16().requires_grad_()
+    pixels = model.decode(latent).sample
+    probe = bfloat16(torch.randn(pixels.shape, generator=generator))
+    (pixels.float() * probe).sum().backward()
+    tensors = {"video": video, "mean": mean, "std": std, "probe_mean": probe_mean, "probe_std": probe_std,
+               "encode.grad_video": video.grad, "latent": latent, "pixels": pixels, "probe": probe,
+               "decode.grad_latent": latent.grad}
+    return {name: tensor.detach().float().numpy() for name, tensor in tensors.items()}
+
+
 def main(destination: str) -> None:
     import diffusers
 
@@ -116,5 +150,12 @@ if __name__ == "__main__":
         from diffusers_dc_ae_reference import bundle
 
         bundle(sys.argv[2], sys.argv[3])
+    elif len(sys.argv) > 3 and sys.argv[1] == "bfloat16":
+        import diffusers
+
+        if diffusers.__version__ != DIFFUSERS:
+            raise RuntimeError(f"recorded against diffusers {DIFFUSERS}, not {diffusers.__version__}")
+        torch.set_num_threads(2)
+        np.savez_compressed(sys.argv[3], **bfloat16_walk(Path(sys.argv[2])))
     else:
         main(sys.argv[1] if len(sys.argv) > 1 else "/tmp/dew-wan-vae-reference")

@@ -671,7 +671,7 @@ checkpoint = "Qwen/Qwen3-0.6B"
 tokenizer = AutoTokenizer.from_pretrained(checkpoint)
 pretrained = PretrainedDecoder.load(
     checkpoint,
-    dtype="bfloat16",
+    dtype=jnp.bfloat16,
     max_seq_len=512,
 )
 prompt = jnp.asarray(
@@ -1136,7 +1136,7 @@ state = Trainer(LMObjective(model, seq_len=128),
 PretrainedDecoder.from_model(model, state.params, tokenizer=tokenizer).save(export)
 print(sorted(path.name for path in export.iterdir()))
 
-task = PretrainedDecoder.load(str(export), dtype="float32").text_generation()
+task = PretrainedDecoder.load(str(export), dtype=jnp.float32).text_generation()
 drawn = task("The trainer", 12, key=jax.random.key(1),
              sampling=Sampling(temperature=0.0))
 print(task.decode(drawn))
@@ -1320,7 +1320,7 @@ dew launch --hosts 10.0.0.1,10.0.0.2 \
 ```python
 import dew
 
-chat = dew.pipeline("google/gemma-4-E2B-it", dtype="bfloat16")
+chat = dew.pipeline("google/gemma-4-E2B-it", dtype=jnp.bfloat16)
 result = chat(
     ["Explain gradient accumulation in one paragraph.",
      "Name three uses of a JEPA encoder."],
@@ -1357,7 +1357,7 @@ def main():
             os.environ.get("DEW_MODEL", "google/gemma-4-31B-it"),
             mesh=MeshSpec(fsdp=jax.device_count()),
             layout=Layout(min_shard=2**16),
-            dtype="bfloat16",
+            dtype=jnp.bfloat16,
         )
         rank = jax.process_index()
         result = task([f"Process {rank}: write one sentence about tensors."], 64, key=0)
