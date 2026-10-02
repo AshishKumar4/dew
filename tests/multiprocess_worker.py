@@ -909,7 +909,7 @@ def _evaluation_parts(case: _EvaluationCase):
                 raise ValueError("preview decoding failed")
             return preview
 
-    class Mean:
+    class Ratio:
         name, reads = "mean", Representations
 
         def __call__(self, artifact, batch):
@@ -962,7 +962,7 @@ def _evaluation_parts(case: _EvaluationCase):
             raise OSError("iterator construction failed")
         return batches()
 
-    return Numerical, Mean, Drawing, batches, validation
+    return Numerical, Ratio, Drawing, batches, validation
 
 
 def mode_evaluation_contract(args) -> dict:
@@ -976,7 +976,7 @@ def mode_evaluation_contract(args) -> dict:
     rank = jax.process_index()
     case = _EvaluationCase(rank)
     events, closed = case.events, case.closed
-    Numerical, Mean, Drawing, batches, validation = _evaluation_parts(case)
+    Numerical, Ratio, Drawing, batches, validation = _evaluation_parts(case)
 
     objective = Numerical()
     trainer = Trainer(objective, optax.sgd(.01), key=jax.random.key(37))
@@ -990,7 +990,7 @@ def mode_evaluation_contract(args) -> dict:
         case.failure = failure
         events.clear()
         trainer.tracker = Drawing() if rank == 0 and failure not in ("untracked", "no_consumer") else None
-        metric = Mean()
+        metric = Ratio()
         if failure == "mismatch" and rank == 1:
             metric.name = "another_metric"
         scoring = () if failure in ("preview_only", "no_consumer") else (metric,)

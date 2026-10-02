@@ -32,9 +32,9 @@ from dew.objectives.base import (
     Aux,
     Batch,
     EMASpec,
-    Mean,
     Objective,
     PathFilter,
+    Ratio,
     Step,
     Variables,
     freeze,
@@ -59,8 +59,8 @@ class BlockSFTStatistics:
     both, which is what says the step scored anything at all.
     """
 
-    canvas: Mean
-    encoder: Mean
+    canvas: Ratio
+    encoder: Ratio
     support: jax.Array
 
 
@@ -111,7 +111,7 @@ def _cache_geometry(valid: jax.Array, selected: jax.Array, prompt_length: int, c
     return positions, encoder_mask, packed_positions, decoder_mask, key_positions
 
 
-def _row_mean(losses: jax.Array, mask: jax.Array) -> Mean:
+def _row_mean(losses: jax.Array, mask: jax.Array) -> Ratio:
     """Average the masked losses within each row, then sum the rows.
 
     The mass is the row count, so accumulation weighs rows equally however
@@ -119,7 +119,7 @@ def _row_mean(losses: jax.Array, mask: jax.Array) -> Mean:
     """
     mass = mask.sum(axis=-1)
     row_losses = jnp.sum(jnp.where(mask != 0, losses, 0) * mask, axis=-1) / jnp.maximum(mass, 1)
-    return Mean(row_losses.sum(), jnp.asarray(losses.shape[0], jnp.int32))
+    return Ratio(row_losses.sum(), jnp.asarray(losses.shape[0], jnp.int32))
 
 
 @objectives("block_diffusion")
