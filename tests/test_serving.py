@@ -17,8 +17,9 @@ from dew.inference.pages import Pages
 from dew.inference.pipeline import place
 from dew.inference.serving import PagedRows, Server
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.backbones.decoder_block import Mixture
+from dew.nn.backbones.decoder_block import GatedMLP, Mixture
 from dew.nn.kv_cache import KVCache
+from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.sharding import BATCH_AXES
 from dew.sampling import Sampling
 from dew.training import Layout, MeshSpec
@@ -37,7 +38,10 @@ class Digits:
         return "".join(str(int(token)) for token in ids)
 
 
-def task(sampling=Sampling(temperature=0, eos_id=EOS), capacity=128):
+_DEFAULT_TASK_SAMPLING = Sampling(temperature=0, eos_id=EOS)
+
+
+def task(sampling=_DEFAULT_TASK_SAMPLING, capacity=128):
     model = CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=1, num_heads=2,
                               head_dim=8, mlp_features=32, max_seq_len=capacity, dtype="float32")
     params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
@@ -52,6 +56,108 @@ def assert_same_generation(served, alone):
     np.testing.assert_array_equal(served.terminated, alone.terminated)
     np.testing.assert_allclose(served.behavior_log_probs, alone.behavior_log_probs, atol=2e-6, rtol=2e-6)
     np.testing.assert_allclose(served.raw_log_probs, alone.raw_log_probs, atol=2e-6, rtol=2e-6)
+
+
+def test_prepacked_gate_and_up_draw_the_same_gated_projection():
+    """The serving layout is one dot, split before the trained activation."""
+    with jax.enable_x64():
+        model = GatedMLP(hidden_features=6, out_features=4, use_bias=True, dtype=jnp.float64)
+        x = jnp.arange(32, dtype=jnp.float64).reshape(2, 2, 8) / 16
+        kernel = jnp.arange(96, dtype=jnp.float64).reshape(8, 12) / 128
+        bias = jnp.arange(12, dtype=jnp.float64) / 32
+        down = jnp.arange(24, dtype=jnp.float64).reshape(6, 4) / 64
+        down_bias = jnp.arange(4, dtype=jnp.float64) / 16
+        variables = {"params": {"gate_up_proj": {"kernel": kernel, "bias": bias},
+                                "down_proj": {"kernel": down, "bias": down_bias}}}
+        gate, up = jnp.split(x @ kernel + bias, 2, axis=-1)
+        expected = (jax.nn.silu(gate) * up) @ down + down_bias
+        np.testing.assert_array_equal(jax.jit(model.apply)(variables, x), expected)
+
+
+def test_prepacked_queries_keys_and_values_preserve_attention_and_cache():
+    """Biases, head norms, RoPE and the cached append still read the same projections."""
+    with jax.enable_x64():
+        model = CausalSelfAttention(emb_features=8, num_heads=2, num_kv_heads=1,
+                                   head_dim=4, max_seq_len=64, attention_bias=True,
+                                   attention_impl="xla", dtype=jnp.float64)
+        x = jnp.arange(32, dtype=jnp.float64).reshape(1, 4, 8) / 32
+        variables = model.init(jax.random.key(0), x)
+        # Dyadic weights make the projection sums exact, so a different dot
+        # width cannot hide a wrong slice behind a floating-point bound.
+        for index, name in enumerate(("q_proj", "k_proj", "v_proj")):
+            projection = variables["params"][name]
+            projection["kernel"] = jnp.arange(projection["kernel"].size, dtype=jnp.float64).reshape(
+                projection["kernel"].shape) / (128 * 2 ** index)
+            projection["bias"] = jnp.arange(projection["bias"].size, dtype=jnp.float64) / 32
+        packed = {**variables, "params": dict(variables["params"])}
+        packed["params"]["qkv_proj"] = {
+            name: jnp.concatenate([variables["params"][projection][name]
+                                   for projection in ("q_proj", "k_proj", "v_proj")], axis=-1)
+            for name in ("kernel", "bias")}
+        for name in ("q_proj", "k_proj", "v_proj"):
+            del packed["params"][name]
+        applied = jax.jit(lambda weights: model.apply(weights, x, decode=True, mutable=["cache"]))
+        expected, cache = applied(variables)
+        actual, packed_cache = applied(packed)
+        np.testing.assert_array_equal(actual, expected)
+        for before, after in zip(jax.tree.leaves(cache), jax.tree.leaves(packed_cache), strict=True):
+            np.testing.assert_array_equal(after, before)
+
+
+def test_prepacked_serving_keeps_the_source_and_reloads_its_original_tree():
+    """Serving holds the same weight bytes; reloading casts and repacks the trained tree."""
+    from flax.core import freeze
+
+    bound = task(Sampling(temperature=0, eos_id=None))
+    source = jax.tree.map(np.asarray, bound.variables)
+    packed_task = TextGeneration(bound.model, source, bound.processor, sampling=bound.sampling)
+    server = Server.from_task(packed_task, slots=2, capacity=128)
+    before = server(["12", "34"], 5, key=3)
+    assert sum(leaf.nbytes for leaf in jax.tree.leaves(server.variables)) == sum(
+        leaf.nbytes for leaf in jax.tree.leaves(bound.variables))
+    for original, saved in zip(jax.tree.leaves(bound.variables), jax.tree.leaves(source), strict=True):
+        np.testing.assert_array_equal(original, saved)
+    trained = jax.tree.map(lambda leaf: leaf * 1.5, bound.variables)
+    server.reload(freeze(trained))
+    served = server(["12", "34"], 5, key=3)
+    assert any(not np.array_equal(old.host().raw_log_probs, new.host().raw_log_probs)
+               for old, new in zip(before, served, strict=True))
+    other = TextGeneration(bound.model, trained, bound.processor, sampling=bound.sampling)
+    for prompt, actual in zip(("12", "34"), served, strict=True):
+        assert_same_generation(actual, other(prompt, 5, key=3))
+    fresh = Server.from_task(other, slots=2, capacity=128)
+    for actual, expected in zip(served, fresh(["12", "34"], 5, key=3), strict=True):
+        assert_same_generation(actual, expected)
+    jax.jit(lambda weights: jax.tree.map(lambda leaf: leaf * 2, weights), donate_argnums=(0,))(trained)
+    for actual, expected in zip(server(["12", "34"], 5, key=3), served, strict=True):
+        assert_same_generation(actual, expected)
+    for original, saved in zip(jax.tree.leaves(bound.variables), jax.tree.leaves(source), strict=True):
+        np.testing.assert_array_equal(original, saved)
+
+
+@pytest.mark.parametrize("case", ["kv_shared", "k_eq_v", "output_gate"])
+def test_inference_projection_layout_preserves_special_attention_logits(case):
+    from dew.inference.serving import _inference_projections
+
+    with jax.enable_x64():
+        model = CausalTransformer(
+            vocab_size=VOCAB, emb_features=16, num_layers=2, num_heads=2, num_kv_heads=1,
+            head_dim=8, mlp_features=32, max_seq_len=64, dtype=jnp.float64,
+            precision=jax.lax.Precision.HIGHEST, attention_impl="reference",
+            kv_shared_layers=(1,) if case == "kv_shared" else None,
+            attention_k_eq_v=case == "k_eq_v", v_norm=case == "k_eq_v",
+            output_gate=case == "output_gate")
+        tokens = jnp.asarray([[1, 2, 3, 4]], jnp.int32)
+        variables = jax.tree.map(lambda leaf: np.asarray(leaf, np.float64),
+                                 model.init(jax.random.key(13), tokens))
+        packed = _inference_projections(model, variables)
+        expected = jax.jit(model.apply)(variables, tokens)
+        actual = jax.jit(model.apply)(packed, tokens)
+        # Both run in float64; 64 epsilon covers the tiny decoder's few
+        # reassociated dot sums, well inside the existing FP32 parity bound.
+        eps = 64 * np.finfo(np.float64).eps
+        np.testing.assert_allclose(actual, expected, atol=eps, rtol=eps)
+        np.testing.assert_array_equal(jnp.argmax(actual, axis=-1), jnp.argmax(expected, axis=-1))
 
 
 @pytest.mark.parametrize("decode_steps", [1, 4])
@@ -73,6 +179,44 @@ def test_mixed_lengths_and_budgets_submitted_together_draw_what_each_draws_alone
     for mine, theirs in zip(served, alone, strict=True):
         assert_same_generation(mine, theirs)
     assert all(ticket.admitted is not None and ticket.finished is not None for ticket in tickets)
+
+
+def test_host_task_and_server_preserve_nonzero_lora_branches():
+    from dew.lora import LoRA
+
+    bound = task(Sampling(temperature=0, eos_id=None))
+    adapter, fresh = LoRA.fresh(bound.model, bound.variables, {}, rank=2,
+                                modules=("q_proj", "gate_proj"), key=jax.random.key(17))
+    trained = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: leaf + jax.random.normal(jax.random.key(29), leaf.shape) * .25
+        if getattr(path[-1], "key", None) == "lora_B" else leaf, fresh)
+    model = adapter.adapt(bound.model)
+    unplaced = TextGeneration(model, jax.tree.map(np.asarray, trained), bound.processor,
+                             sampling=bound.sampling)
+    placed = TextGeneration(model, trained, bound.processor, sampling=bound.sampling)
+    expected = placed("12", 6, key=3)
+    assert not np.array_equal(expected.host().raw_log_probs, bound("12", 6, key=3).host().raw_log_probs)
+    assert_same_generation(unplaced("12", 6, key=3), expected)
+    served = Server.from_task(unplaced, slots=2, capacity=128)
+    assert_same_generation(served(["12"], 6, key=3)[0], expected)
+
+
+def test_reload_normalizes_source_precision_before_concatenating_projections():
+    """A float64 value just above an FP16 midpoint must not double-round through FP32."""
+    bound = task(Sampling(temperature=0, eos_id=None))
+    source = jax.tree.map(lambda leaf: np.asarray(leaf, dtype=np.float16), bound.variables)
+    host = TextGeneration(bound.model, source, bound.processor, sampling=bound.sampling)
+    server = Server.from_task(host, slots=2, capacity=128)
+    incoming = jax.tree.map(lambda leaf: np.asarray(leaf, np.float64), source)
+    kernel = incoming["params"]["layers_0"]["self_attn"]["q_proj"]["kernel"]
+    kernel[0, 0] = np.nextafter(1.00048828125, np.inf)
+    server.reload(incoming)
+    packed = server.variables["params"]["layers_0"]["self_attn"]["qkv_proj"]["kernel"]
+    assert float(np.asarray(packed)[0, 0]) == 1.0009765625
+    normalized = jax.tree.map(lambda leaf: np.asarray(leaf, dtype=np.float16), incoming)
+    other = TextGeneration(bound.model, jax.tree.map(jnp.asarray, normalized), bound.processor,
+                           sampling=bound.sampling)
+    assert_same_generation(server(["12"], 5, key=3)[0], other("12", 5, key=3))
 
 
 @pytest.mark.parametrize("dtype", ["int8", "fp8"])
@@ -398,12 +542,16 @@ def test_a_server_on_an_expert_mesh_draws_what_one_device_draws(dispatch):
                                   mlp_features=32, max_seq_len=128, dtype="float32",
                                   mixture=Mixture(experts=4, top_k=2, dispatch=dispatch))
         params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)) if params is None else params
-        return TextGeneration(model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0, eos_id=EOS))
+        return TextGeneration(
+            model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0, eos_id=EOS)
+        )
 
     lone = generation("global", None)
     alone = [lone(prompt, budget, key=index)
              for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
-    served = generation(dispatch, place(lone.variables, MeshSpec(expert=4), Layout(min_shard=1, tolerance=1.0)))
+    served = generation(
+        dispatch, place(lone.variables, MeshSpec(expert=4), Layout(min_shard=1, tolerance=1.0))
+    )
     server, tickets = served_alongside(served, slots=8, admission=8, kv_cache=KVCache(page_size=16, pages=32))
     assert server.groups == jax.device_count()
     for ticket, row in zip(tickets, [*alone, alone[2]], strict=True):

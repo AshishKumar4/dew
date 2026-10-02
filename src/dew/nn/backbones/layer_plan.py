@@ -173,3 +173,6 @@ def group_layers(name: str) -> range | None:
         return None
     first, last = int(parts[0]), int(parts[-1])
     return range(first, last + 1)
+
+
+__all__ = ["LayerKind", "LayerSpec", "ResolvedKind"]

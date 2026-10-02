@@ -24,7 +24,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 from flax.core import freeze
-from jax.typing import ArrayLike
+from jax.typing import ArrayLike, DTypeLike
 
 from dew.artifacts import agree_process_phase
 from dew.diffusion.block import BlockProcess, CanvasGeneration
@@ -271,7 +271,7 @@ def run_record(directory: str, step: int | str | None = None) -> Mapping[str, ob
     return named_fields(record, 'checkpoint artifact')
 
 
-def _saved_model(record: Mapping[str, object], dtype: str | None) -> ModelConfig:
+def _saved_model(record: Mapping[str, object], dtype: DTypeLike | None) -> ModelConfig:
     """Read the run's model record, with `dtype` overriding the computation it saved."""
     from dew.config import ModelConfig
     from dew.registry import dtype_name, resolve_dtype
@@ -300,7 +300,7 @@ def _saved_budget(record: Mapping[str, object]) -> int | None:
     return budget
 
 
-def _saved_run(directory: str, dtype: str | None, step: int | str | None
+def _saved_run(directory: str, dtype: DTypeLike | None, step: int | str | None
                ) -> tuple[Mapping[str, object], ModelConfig, Processor | None]:
     """Read a run's record, its model config at `dtype`, and its host processor."""
     record = run_record(directory, step)
@@ -401,7 +401,12 @@ class TextGeneration:
     _stops: tuple[Stopping, ...] = dataclasses.field(default=(), init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        _freeze_variables(self, self.variables)
+        variables = self.variables
+        if all(isinstance(leaf, np.ndarray) for leaf in jax.tree.leaves(variables)):
+            from dew.inference.serving import _inference_projections
+
+            variables = jax.device_put(_inference_projections(self.model, variables))
+        _freeze_variables(self, variables)
         object.__setattr__(self, "_stops", self._stop_criteria(self.sampling.stop))
 
     def _stop_criteria(self, strings: tuple[str, ...]) -> tuple[Stopping, ...]:
@@ -448,7 +453,7 @@ class TextGeneration:
     @classmethod
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
                  mesh: MeshSpec | None = None, layout: Layout | None = None,
-                 dtype: str | None = None, param_dtype: str | None = None) -> TextGeneration:
+                 dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None) -> TextGeneration:
         """Load the causal run in `directory`: the model its `run.json` records,
         rebuilt the way the recipe built it, over the weights of its latest
         checkpoint (or `step`), decoding through the run's own tokenizer.
@@ -486,7 +491,8 @@ class TextGeneration:
     @classmethod
     def from_pretrained(cls, repo_id: str, *, ema: bool | None = None, step: int | str | None = None,
                         mesh: MeshSpec | None = None, layout: Layout | None = None,
-                        dtype: str | None = None, param_dtype: str | None = None) -> TextGeneration:
+                        dtype: DTypeLike | None = None,
+                        param_dtype: DTypeLike | None = None) -> TextGeneration:
         """Load a run directory published to the Hugging Face Hub.
 
         `HfApi().upload_folder` of the run directory itself is what writes it.
@@ -553,7 +559,7 @@ class BlockGeneration:
     @classmethod
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
                  mesh: MeshSpec | None = None, layout: Layout | None = None,
-                 dtype: str | None = None, param_dtype: str | None = None) -> BlockGeneration:
+                 dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None) -> BlockGeneration:
         """Load the block-diffusion run in `directory`: the DiffusionGemma its
         `run.json` records over the weights of its latest checkpoint (or
         `step`), sampling over the canvas the model declares.
@@ -577,7 +583,8 @@ class BlockGeneration:
     @classmethod
     def from_pretrained(cls, repo_id: str, *, ema: bool | None = None, step: int | str | None = None,
                         mesh: MeshSpec | None = None, layout: Layout | None = None,
-                        dtype: str | None = None, param_dtype: str | None = None) -> BlockGeneration:
+                        dtype: DTypeLike | None = None,
+                        param_dtype: DTypeLike | None = None) -> BlockGeneration:
         """Load a run directory published to the Hugging Face Hub.
 
         `HfApi().upload_folder` of the run directory itself is what writes it.
@@ -636,7 +643,7 @@ class MaskedGeneration:
     @classmethod
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
                  mesh: MeshSpec | None = None, layout: Layout | None = None,
-                 dtype: str | None = None, param_dtype: str | None = None) -> MaskedGeneration:
+                 dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None) -> MaskedGeneration:
         """Load the masked-diffusion run in `directory`: the bidirectional model
         its `run.json` records over the weights of its latest checkpoint (or
         `step`), refined with MDLM over the run's own mask token.
@@ -672,7 +679,8 @@ class MaskedGeneration:
     @classmethod
     def from_pretrained(cls, repo_id: str, *, ema: bool | None = None, step: int | str | None = None,
                         mesh: MeshSpec | None = None, layout: Layout | None = None,
-                        dtype: str | None = None, param_dtype: str | None = None) -> MaskedGeneration:
+                        dtype: DTypeLike | None = None,
+                        param_dtype: DTypeLike | None = None) -> MaskedGeneration:
         """Load a run directory published to the Hugging Face Hub.
 
         `HfApi().upload_folder` of the run directory itself is what writes it.
@@ -700,3 +708,4 @@ class MaskedGeneration:
         return _canvas_text(self.processor, generation, "inference.masked.decode")
 
 
+__all__ = ["SHAPE_BUCKETS", "BlockGeneration", "MaskedGeneration", "Processor", "TextGeneration"]

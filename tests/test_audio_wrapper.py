@@ -40,8 +40,10 @@ class _Wrapper:
         text_config = translate_config(self.config["text_config"])
         text = {"model." + key: value for key, value in _component(tensors, "model.language_model.").items()}
         text["lm_head.weight"] = tensors["lm_head.weight"]
-        self.decoder = models.build("causal_transformer", **with_precision(
-            "causal_transformer", text_config, dtype="float32", attention_impl="reference")).clone(precision=HIGHEST)
+        self.decoder = models.build(
+            "causal_transformer",
+            **with_precision("causal_transformer", text_config, dtype="float32", attention_impl="reference"),
+        ).clone(precision=HIGHEST)
         self.text_variables = translate_weights(text, text_config)
         self.audio = audio_config(self.config["audio_config"])
         self.encoder = self.audio.build().clone(precision=HIGHEST)
@@ -67,30 +69,56 @@ class _Wrapper:
 
     def logits(self, params, tokens, valid, features, feature_mask):
         """Reference order: hard vocabularies, then soft audio, then the decoder."""
-        encoded = self.encoder.apply({**self.encoder_variables, "params": params["encoder"]}, features, feature_mask)
+        encoded = self.encoder.apply(
+            {**self.encoder_variables, "params": params["encoder"]}, features, feature_mask
+        )
         projector_variables = {"params": params["projector"]}
         audio_id = self.config["audio_token_id"]
         rows = jnp.arange(tokens.shape[0])[:, None]
         if isinstance(self.audio, Gemma3nAudio):
-            soft = jnp.asarray(self.projector.apply(projector_variables, encoded.features, method=self.projector.soft_embeddings))
+            soft = jnp.asarray(
+                self.projector.apply(
+                    projector_variables, encoded.features, method=self.projector.soft_embeddings
+                )
+            )
             padding = jnp.asarray(self.projector.apply(
                 projector_variables, jnp.array([[self.config["text_config"]["vocab_size"] - 1]], jnp.int32),
                 method=self.projector.embed_hard))
             count = self.config["audio_soft_tokens_per_image"]
             soft = jnp.where(encoded.mask[..., None], soft, padding)
-            soft = jnp.concatenate([soft, jnp.broadcast_to(padding, (soft.shape[0], count - soft.shape[1], soft.shape[2]))], 1)
+            soft = jnp.concatenate(
+                [soft, jnp.broadcast_to(padding, (soft.shape[0], count - soft.shape[1], soft.shape[2]))], 1
+            )
             safe = jnp.where((tokens >= 0) & (tokens < self.decoder.per_layer_input_vocab), tokens, 0)
-            embeddings = jnp.asarray(self.decoder.apply(self.text_variables, tokens, method=lambda m, t: m.embed_tokens(t)))
+            embeddings = jnp.asarray(
+                self.decoder.apply(self.text_variables, tokens, method=lambda m, t: m.embed_tokens(t))
+            )
             embeddings = embeddings * jnp.sqrt(jnp.float32(self.decoder.emb_features))
-            embeddings = jnp.asarray(self.vision.apply(self.vision_variables, embeddings, tokens, method=self.vision.merge_hard_embeddings))
-            embeddings = jnp.asarray(self.projector.apply(projector_variables, embeddings, tokens, method=self.projector.merge_hard_embeddings))
-            slots = jnp.argsort(jnp.where(tokens == audio_id, jnp.arange(tokens.shape[1]), tokens.shape[1]), axis=1)[:, :count]
+            embeddings = jnp.asarray(
+                self.vision.apply(
+                    self.vision_variables, embeddings, tokens, method=self.vision.merge_hard_embeddings
+                )
+            )
+            embeddings = jnp.asarray(
+                self.projector.apply(
+                    projector_variables, embeddings, tokens, method=self.projector.merge_hard_embeddings
+                )
+            )
+            slots = jnp.argsort(
+                jnp.where(tokens == audio_id, jnp.arange(tokens.shape[1]), tokens.shape[1]), axis=1
+            )[:, :count]
             embeddings = embeddings.at[rows, slots].set(soft)
         else:
             soft = jnp.asarray(self.projector.apply(projector_variables, encoded.features))
-            placeholders = (tokens == audio_id) | (tokens == self.config["image_token_id"]) | (tokens == self.config["video_token_id"])
+            placeholders = (
+                (tokens == audio_id)
+                | (tokens == self.config["image_token_id"])
+                | (tokens == self.config["video_token_id"])
+            )
             safe = jnp.where(placeholders, self.config["text_config"]["pad_token_id"], tokens)
-            embeddings = jnp.asarray(self.decoder.apply(self.text_variables, safe, method=lambda m, t: m.embed_tokens(t)))
+            embeddings = jnp.asarray(
+                self.decoder.apply(self.text_variables, safe, method=lambda m, t: m.embed_tokens(t))
+            )
             embeddings = embeddings * jnp.sqrt(jnp.float32(self.decoder.emb_features))
             # Valid frames form a prefix; each row's slots take its own features in order.
             order = jnp.cumsum(tokens == audio_id, axis=1) - 1
@@ -116,8 +144,13 @@ def _inputs(wrapper):
         [np.load(wrapper.path / f"waveform_{index}.npy") for index in range(2)])
     np.testing.assert_array_equal(features["input_features_mask"], reference["input_features_mask"])
     np.testing.assert_allclose(features["input_features"], reference["input_features"], rtol=0, atol=1e-6)
-    return reference, jnp.asarray(reference["input_ids"]), jnp.asarray(reference["attention_mask"].astype(bool)), \
-        jnp.asarray(features["input_features"]), jnp.asarray(features["input_features_mask"])
+    return (
+        reference,
+        jnp.asarray(reference["input_ids"]),
+        jnp.asarray(reference["attention_mask"].astype(bool)),
+        jnp.asarray(features["input_features"]),
+        jnp.asarray(features["input_features_mask"]),
+    )
 
 
 def test_waveforms_condition_text_logits_like_the_reference_model(wrapper):
@@ -133,7 +166,7 @@ def test_waveforms_condition_text_logits_like_the_reference_model(wrapper):
 def test_greedy_continuation_follows_the_reference(wrapper):
     reference, tokens, valid, features, feature_mask = _inputs(wrapper)
     generated = reference["generated"]
-    for step in range(generated.shape[1] - tokens.shape[1]):
+    for _step in range(generated.shape[1] - tokens.shape[1]):
         error, logits = jax.jit(checkify.checkify(wrapper.logits))(
             wrapper.variables(), tokens, valid, features, feature_mask)
         error.throw()

@@ -437,7 +437,7 @@ def test_both_dispatches_take_the_same_adam_steps_in_bf16(activation, skewed, sc
     for dispatch in ('global', 'exchange'):
         network = model.clone(dispatch=dispatch)
 
-        def objective(parameters, x, weights, choices):
+        def objective(parameters, x, weights, choices, *, network=network):
             y = jnp.asarray(network.apply(parameters, x, weights, choices))
             return jnp.mean(jnp.sin(y.astype(jnp.float32))), y
 
@@ -457,7 +457,9 @@ def test_both_dispatches_take_the_same_adam_steps_in_bf16(activation, skewed, sc
         trajectories.append(trajectory)
     for first, second in zip(*trajectories, strict=True):
         for a, b in zip(jax.tree.leaves(first), jax.tree.leaves(second), strict=True):
-            np.testing.assert_allclose(np.asarray(a, np.float64), np.asarray(b, np.float64), atol=TOLERANCE, rtol=TOLERANCE)
+            np.testing.assert_allclose(
+                np.asarray(a, np.float64), np.asarray(b, np.float64), atol=TOLERANCE, rtol=TOLERANCE
+            )
 
 
 @pytest.mark.mesh
@@ -467,7 +469,7 @@ def test_both_dispatches_carry_the_same_tangents(activation):
     weights all perturbed, agrees exactly between the dispatches."""
     mesh = MeshSpec(expert=4, fsdp=2).build()
     model, parameters, specs, tokens, x, weights, choices = placed_experts(
-        mesh, activation, False, False, None)
+        mesh, activation, skewed=False, scale_inputs=False, limit=None)
     rng = np.random.default_rng(523)
     dp = jax.device_put(jax.tree.map(
         lambda value: jnp.asarray(rng.normal(scale=.05, size=value.shape), value.dtype), parameters), specs)
@@ -477,8 +479,8 @@ def test_both_dispatches_carry_the_same_tangents(activation):
     for dispatch in ('global', 'exchange'):
         network = model.clone(dispatch=dispatch)
 
-        def run(parameters, x, weights, dp, dx, dw, choices):
-            return jax.jvp(lambda parameters, x, weights: jnp.asarray(
+        def run(parameters, x, weights, dp, dx, dw, choices, *, network=network):
+            return jax.jvp(lambda parameters, x, weights, network=network: jnp.asarray(
                 network.apply(parameters, x, weights, choices)), (parameters, x, weights), (dp, dx, dw))
 
         with jax.set_mesh(mesh):
@@ -572,7 +574,7 @@ def test_rows_past_the_groups_stay_zero_where_the_ragged_dot_writes_them(monkeyp
     def project(x, kernel):
         if implementation == 'xla':
             return jnp.asarray(expert_projection(x, kernel, sizes, jnp.bfloat16, 'xla', None))
-        return grouped_projection(x, kernel, sizes, jnp.bfloat16, False)
+        return grouped_projection(x, kernel, sizes, jnp.bfloat16, interpret_on_cpu=False)
 
     y, pullback = jax.vjp(project, x, kernel)
     dx, _ = pullback(jnp.ones_like(y))
@@ -593,8 +595,10 @@ def test_no_16_bit_operand_reaches_the_ragged_dot_at_the_highest_precision():
     kernel = jnp.ones((8, 16, 16), jnp.float32)
     sizes = jnp.asarray([0, 5, 0, 0, 12, 1, 0, 3], jnp.int32)
     projections = {
-        "xla": lambda x, kernel: expert_projection(x, kernel, sizes, jnp.bfloat16, 'xla', None),
-        "pallas-fallback": lambda x, kernel: grouped_projection(x, kernel, sizes, jnp.bfloat16, False),
+        "xla": lambda x, kernel: expert_projection(x, kernel, sizes, jnp.bfloat16, "xla", None),
+        "pallas-fallback": lambda x, kernel: grouped_projection(
+            x, kernel, sizes, jnp.bfloat16, interpret_on_cpu=False
+        ),
     }
     for name, project in projections.items():
         def loss(x, kernel, project=project):
@@ -603,7 +607,7 @@ def test_no_16_bit_operand_reaches_the_ragged_dot_at_the_highest_precision():
             program = jax.make_jaxpr(jax.grad(loss, argnums=(0, 1)))(x, kernel)
         refused = []
 
-        def walk(jaxpr):
+        def walk(jaxpr, *, refused=refused):
             for equation in jaxpr.eqns:
                 if equation.primitive.name.startswith("ragged_dot"):
                     kinds = {jnp.dtype(v.aval.dtype) for v in equation.invars[:2]}

@@ -55,8 +55,7 @@ from test_lm_recipe import load_recipe
 
 from dew.data import HFTokenizer
 from dew.inference import Completion, OllamaCompletion
-from dew.interop import Pretrained
-from dew.interop import PretrainedDecoder
+from dew.interop import Pretrained, PretrainedDecoder
 from dew.nn.inputs import ModelInputs
 from dew.registry import models, with_precision
 from dew.sampling.text import Sampling, generate
@@ -218,7 +217,7 @@ def test_the_converted_model_carries_the_exported_config(imported):
     """Ollama's converter reads the export's own config, so the GGUF it
     writes reports Dew's widths, its rope base and its parameter count.
     A field the export spelled wrong lands here as a different number."""
-    name, export, shown = imported
+    _name, export, shown = imported
     config = json.loads((export / "config.json").read_text())
     info = shown["model_info"]
 
@@ -365,7 +364,7 @@ def test_the_daemon_reports_dews_own_logprobs(imported, client):
 
         logits = np.asarray(loaded.model.apply(
             loaded.variables, jnp.asarray([head + theirs], jnp.int32)))[0]
-        for offset, (token, entry) in enumerate(zip(theirs, reported)):
+        for offset, (token, entry) in enumerate(zip(theirs, reported, strict=True)):
             row = logits[len(head) + offset - 1].astype(np.float64)
             ours = float(row[token] - (np.log(np.exp(row - row.max()).sum()) + row.max()))
             worst = max(worst, abs(ours - float(entry.logprob)))

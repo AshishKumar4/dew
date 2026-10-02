@@ -197,7 +197,7 @@ def test_a_conversation_starting_with_the_assistant_is_refused(tokenizer):
 
 
 def test_chat_messages_needs_a_parquet_path():
-    with pytest.raises(ValueError, match="--data.path"):
+    with pytest.raises(ValueError, match=r"--data.path"):
         ChatMessages(tokenizer=str(TOKENIZER)).load(batch=8)
 
 

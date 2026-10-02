@@ -7,7 +7,6 @@ in place of the Hub model and shortens training for CI, not for the recording.
 """
 
 # Command-line examples print results for capture_snippets.py.
-# ruff: noqa: T201
 
 import argparse
 import itertools
@@ -176,35 +175,37 @@ def pretrained(out, smoke):
     # End snippet: pretrained-source
     if smoke:
         source = str(ROOT / "tests/fixtures/hf/qwen3-tiny")
-    # Begin snippet: pretrained
-    bundle = PretrainedDecoder.load(source, dtype="bfloat16", max_seq_len=128)
+    # Begin snippet: finetune-load
+    bundle = PretrainedDecoder.load(source, dtype=jnp.bfloat16, max_seq_len=128)
+    # End snippet: finetune-load
     task = bundle.text_generation(sampling=Sampling(temperature=0))
-    # End snippet: pretrained
     if smoke:
         task = replace(task, processor=RunProcessor(ByteTokenizer()))
         prompt = np.load(ROOT / "tests/fixtures/hf/qwen3-tiny/input_ids.npy")[:1, :8]
         training_tokens = np.pad(prompt, ((0, 0), (0, 9 - prompt.shape[1])))
     else:
         prompt = "The capital of France is"
-        training_tokens = np.asarray(bundle.processor("The capital of France is Paris.").tokens[:, :9], np.int32)
-    data = Dataset(train=lambda partition: itertools.repeat({"text": training_tokens}), val=None, records=1, batch=1)
-    # Begin snippet: finetune
+        processed = bundle.processor("The capital of France is Paris.")
+        training_tokens = np.asarray(processed.tokens[:, :9], np.int32)
+    data = Dataset(train=lambda partition: itertools.repeat({"text": training_tokens}),
+                   val=None, records=1, batch=1)
     text = task(prompt, 12, key=0).text
+    # Begin snippet: finetune
     objective = bundle.lm_objective(seq_len=training_tokens.shape[1] - 1, ema_decay=None)
     trainer = Trainer(objective, optax.sgd(1e-5), key=jax.random.key(0))
     state = trainer.fit(data, steps=1)
     bundle.save(out / "export", variables=state.params, max_shard_size="128MB")
     # End snippet: finetune
     assert int(state.updates) == 1
-    assert any(not np.array_equal(np.asarray(before), np.asarray(after))
-               for before, after in zip(jax.tree.leaves(bundle.variables), jax.tree.leaves(state.params), strict=True))
+    pairs = zip(jax.tree.leaves(bundle.variables), jax.tree.leaves(state.params), strict=True)
+    assert any(not np.array_equal(np.asarray(before), np.asarray(after)) for before, after in pairs)
     assert (out / "export/config.json").is_file()
     return {"source": source, "text": list(text), "steps": int(state.step), "export": "export"}
 
 
 def serving(out, smoke):
     source = str(ROOT / "tests/fixtures/hf/qwen3-tiny") if smoke else "Qwen/Qwen3-0.6B"
-    bundle = PretrainedDecoder.load(source, dtype="bfloat16", param_dtype="bfloat16",
+    bundle = PretrainedDecoder.load(source, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16,
                                     max_seq_len=128, mesh=MeshSpec())
     if smoke:
         bundle = replace(bundle, processor=RunProcessor(ByteTokenizer()))
@@ -282,7 +283,8 @@ def reliability(out, smoke):
     return {"saved_step": int(state.step), "resumed_step": int(resumed.step), "bit_exact": exact}
 
 
-SECTIONS = {function.__name__: function for function in (lm, diffusion, sample_public, jepa, grpo, pretrained, serving, mesh, reliability)}
+SECTIONS = {function.__name__: function for function in
+            (lm, diffusion, sample_public, jepa, grpo, pretrained, serving, mesh, reliability)}
 
 
 def main():

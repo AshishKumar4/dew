@@ -13,18 +13,19 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from etils import epath
+from jax.typing import DTypeLike
 
 from dew.checkpoints import RUN_FILE
 from dew.inference.tasks import BlockGeneration, MaskedGeneration, TextGeneration
 from dew.nn.inputs import Media, ModelInputs, pad_token_rows
 from dew.objectives.base import Variables
-from dew.registry import resolve_dtype
+from dew.registry import dtype_name
 from dew.sampling.pipelines import TextToImage
 from dew.telemetry.instrumentation import default_compilation_cache_dir, enable_compilation_cache
 
@@ -37,8 +38,8 @@ def pipeline(
     *,
     mesh: MeshSpec | None = None,
     layout: Layout | None = None,
-    dtype: str | None = None,
-    param_dtype: str | None = None,
+    dtype: DTypeLike | None = None,
+    param_dtype: DTypeLike | Literal["auto"] | None = None,
     ema: bool | None = None,
     step: int | str | None = None,
     revision: str | None = None,
@@ -48,21 +49,21 @@ def pipeline(
     `source` is a run directory, or a source checkpoint directory or Hub
     repository. `mesh` places the weights on that mesh under `layout` (the
     trainer's default when None). Without `mesh`, data parallelism uses the
-    current pool's devices. dtype selects computation. param_dtype selects
-    parameter storage: None preserves a run's stored dtypes and uses FP32
-    masters for a source, and 'auto' stores the stored dtypes either way (a
-    source's config dtype or first floating tensor, as transformers'
-    dtype='auto' reads it). ema reads a run's averaged weights: None when the
-    run kept them and its live weights otherwise, True always; step selects
-    its checkpoint and revision pins a Hub source.
+    current pool's devices. dtype selects computation, a dtype (`jnp.bfloat16`)
+    or its name. param_dtype selects parameter storage: None preserves a
+    run's stored dtypes and uses FP32 masters for a source, and 'auto' stores
+    the stored dtypes either way (a source's config dtype or first floating
+    tensor, as transformers' dtype='auto' reads it). ema reads a run's
+    averaged weights: None when the run kept them and its live weights
+    otherwise, True always; step selects its checkpoint and revision pins a
+    Hub source.
 
     Loading a task also points XLA at the on-disk executable cache, so a
     restarted process reuses what it already compiled.
     """
     _persist_compilations()
-    resolve_dtype(dtype)
-    if param_dtype != "auto":
-        resolve_dtype(param_dtype)
+    dtype = dtype_name(dtype)
+    param_dtype = "auto" if param_dtype == "auto" else dtype_name(param_dtype)
     root = epath.Path(source)
     if root.is_dir() and (
             (root / RUN_FILE).is_file() or any(path.name.isdecimal() for path in root.iterdir())):
@@ -122,6 +123,7 @@ def _from_run(root: epath.Path, *, mesh: MeshSpec | None, layout: Layout | None,
 def _from_source(source: str, *, mesh: MeshSpec | None, layout: Layout | None,
                  dtype: str | None, param_dtype: str | None,
                  revision: str | None) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration:
+    from dew.inference.serving import _inference_projections
     from dew.interop import (
         Pretrained,
         PretrainedBlockDecoder,
@@ -133,10 +135,14 @@ def _from_source(source: str, *, mesh: MeshSpec | None, layout: Layout | None,
 
     storage = "float32" if param_dtype is None else param_dtype
     placement = DefaultMesh() if mesh is None else mesh
-    loaded = (Pretrained.load(source, revision=revision, param_dtype=storage, mesh=placement, layout=layout)
+    def prepared(model, variables):
+        with jax.set_mesh(placement.build()):
+            return _inference_projections(model, variables)
+    loaded = (Pretrained._load(source, revision=revision, param_dtype=storage, mesh=placement, layout=layout,
+                              prepare=prepared)
               if dtype is None else
-              Pretrained.load(source, revision=revision, dtype=dtype, param_dtype=storage, mesh=placement,
-                              layout=layout))
+              Pretrained._load(source, revision=revision, dtype=dtype, param_dtype=storage, mesh=placement,
+                               layout=layout, prepare=prepared))
     match loaded:
         case PretrainedPipeline():
             return loaded.text_to_image()

@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Literal, TypedDict
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.typing import DTypeLike
 
 from dew import records
 
@@ -208,7 +209,7 @@ def _condition(input_config: Mapping[str, object]) -> tuple[str, str, str]:
 
 
 def text_to_image(directory: str | os.PathLike, config: Mapping[str, object], *, jax_version: str,
-                  ema: bool = True, best: bool = False, dtype: str | None = None) -> TextToImage:
+                  ema: bool = True, best: bool = False, dtype: DTypeLike | None = None) -> TextToImage:
     """A FlaxDiff text-to-image run as a Dew `TextToImage` (`TextToImage.from_flaxdiff`).
 
     `directory` is one checkpoint step, `config` the run config FlaxDiff's

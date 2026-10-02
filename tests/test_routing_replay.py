@@ -27,11 +27,12 @@ from dew.training import Layout, MeshSpec
 VOCAB, SEQ_LEN, LAYERS, EXPERTS, TOP_K = 64, 16, 4, 8, 2
 
 
-def objective(scan: bool = False, dtype=None, every: int | None = None, **fields) -> LMObjective:
+def objective(scan: bool = False, dtype=None, layers: tuple[int, ...] | None = None,
+              **fields) -> LMObjective:
     model = CausalTransformer(
         vocab_size=VOCAB, emb_features=32, num_layers=LAYERS, num_heads=2, num_kv_heads=1,
         mlp_features=64, max_seq_len=SEQ_LEN, scan_layers=scan, dtype=dtype,
-        mixture=Mixture(experts=EXPERTS, top_k=TOP_K, every=every), **fields)
+        mixture=Mixture(experts=EXPERTS, top_k=TOP_K, layers=layers), **fields)
     return LMObjective(model, SEQ_LEN)
 
 
@@ -65,8 +66,9 @@ def test_replay_reproduces_the_rollout_routing_where_the_trainer_would_flip(scan
     replayed forward uses the rollout's experts on every token of every layer."""
     trainer, engine = objective(scan), objective(scan, dtype=jnp.bfloat16)
     params = trainer.init(jax.random.key(0))
-    stale = jax.tree.map(lambda leaf: leaf + 0.05 * jax.random.normal(jax.random.key(3), leaf.shape, leaf.dtype),
-                         params)
+    stale = jax.tree.map(
+        lambda leaf: leaf + 0.05 * jax.random.normal(jax.random.key(3), leaf.shape, leaf.dtype), params
+    )
     tokens = tokens_of(4)
     recorded = choices(engine, stale, tokens)
     native = choices(trainer, params, tokens)
@@ -89,7 +91,7 @@ def test_replaying_a_forwards_own_routing_changes_nothing():
 def test_the_gate_keeps_its_gradient_under_replay():
     """Only the selection is fixed: the replayed loss is smooth in the router
     kernel, and its gradient matches a central difference along a direction."""
-    obj = objective(every=2)
+    obj = objective(layers=(1, 3))
     params = obj.init(jax.random.key(0))
     tokens = tokens_of(2)
     routed = jax.random.randint(jax.random.key(2), (2, SEQ_LEN + 1, LAYERS, 1), 0, EXPERTS)
@@ -170,19 +172,23 @@ def test_under_replay_the_bias_counts_the_replayed_experts():
     tokens = tokens_of(2)
     routed = (engine_layout(choices(obj, params, tokens), 2) + 1) % EXPERTS
     sown = obj.token_scores(params, tokens, routing=True, routes=(routed, None)).routing
-    counts = router_counts({"layers_0": {"mlp": {"gate": {"e_score_correction_bias": jnp.zeros(EXPERTS)}}}}, sown)
+    counts = router_counts(
+        {"layers_0": {"mlp": {"gate": {"e_score_correction_bias": jnp.zeros(EXPERTS)}}}}, sown
+    )
     np.testing.assert_array_equal(counts["layers_0"]["mlp"]["gate"]["e_score_correction_bias"],
                                   np.bincount(routed[:, :-1, 0].ravel(), minlength=EXPERTS))
 
 
 def test_a_record_that_does_not_fit_the_model_is_refused():
-    obj = objective(every=2)
+    obj = objective(layers=(1, 3))
     params = obj.init(jax.random.key(0))
     tokens = jnp.zeros((1, SEQ_LEN + 1), jnp.int32)
     with pytest.raises(ValueError, match="layers, top_k"):
         obj.token_scores(params, tokens, routes=(jnp.zeros((1, SEQ_LEN + 1, 2, TOP_K), jnp.int32), None))
     with pytest.raises(ValueError, match="choosing"):
-        obj.token_scores(params, tokens, routes=(jnp.zeros((1, SEQ_LEN + 1, LAYERS, TOP_K + 1), jnp.int32), None))
+        obj.token_scores(
+            params, tokens, routes=(jnp.zeros((1, SEQ_LEN + 1, LAYERS, TOP_K + 1), jnp.int32), None)
+        )
 
 
 def test_pack_takes_each_ids_routing_from_the_latest_call_that_forwarded_it():
@@ -244,9 +250,13 @@ def test_a_multimodal_mixture_replays_through_its_language_model():
     text = CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=2, num_heads=2, num_kv_heads=2,
                              head_dim=8, mlp_features=32, max_seq_len=SEQ_LEN, dtype=jnp.float32,
                              attention_impl="reference", mixture=Mixture(experts=4, top_k=2))
-    vision = SiglipVision(hidden_size=16, intermediate_size=32, num_layers=1, num_heads=2, image_size=8, patch_size=4)
+    vision = SiglipVision(
+        hidden_size=16, intermediate_size=32, num_layers=1, num_heads=2, image_size=8, patch_size=4
+    )
     projection = GemmaProjector(text_width=16, patches_per_side=2, tokens_per_side=1)
-    model = MultimodalTransformer(text, vision, projection, family="gemma3", image_token_id=1, dtype=jnp.float32)
+    model = MultimodalTransformer(
+        text, vision, projection, family="gemma3", image_token_id=1, dtype=jnp.float32
+    )
     tokens = jnp.asarray([[2, 1, 3, 4, 5, 6]], jnp.int32)
     indices = jnp.asarray([[-1, 0, -1, -1, -1, -1]], jnp.int32)
     media = {"pixel_values": jnp.linspace(-0.5, 0.5, 3 * 8 * 8).reshape(1, 1, 3, 8, 8)}
@@ -257,7 +267,10 @@ def test_a_multimodal_mixture_replays_through_its_language_model():
     def run(**replay):
         _, sown = model.apply(variables, tokens, image_indices=indices, conditioning=media,
                               method=type(model).hidden_states, mutable=["router"], **replay)
-        return {name: np.asarray(tree["mlp"]["gate"]["indices"][0]) for name, tree in sown["router"]["language_model"].items()}
+        return {
+            name: np.asarray(tree["mlp"]["gate"]["indices"][0])
+            for name, tree in sown["router"]["language_model"].items()
+        }
 
     replayed = run(routed_experts=routed)
     for layer in range(2):

@@ -14,7 +14,8 @@ from typing import TypedDict
 
 import numpy as np
 
-from dew.interop.families.deepseek import _V4_SCORES, _deepseek_v4_prepare
+from dew import records
+from dew.interop.families.deepseek import _V4_LAYER_NAMES, _V4_SCORES, _deepseek_v4_prepare
 from dew.interop.hf_decoders import (
     _NO_AUDIO,
     DEFAULT_MAX_SEQ_LEN,
@@ -84,8 +85,8 @@ def _v41_modes(text: Mapping[str, object], layers: int) -> tuple[tuple[int, ...]
     if not isinstance(ratios, (list, tuple)) or len(ratios) < layers or any(
             type(rate) is not int or rate < 0 for rate in ratios):
         _refuse('compress_ratios', 'expected a non-negative compress ratio for every layer')
-    kv_sources = set(_int_list(text, 'kv_source_layer_ids'))
-    index_sources = set(_int_list(text, 'index_source_layer_ids'))
+    kv_sources = set(records.integers(text.get('kv_source_layer_ids', ()), 'kv_source_layer_ids'))
+    index_sources = set(records.integers(text.get('index_source_layer_ids', ()), 'index_source_layer_ids'))
     modes, latest_kv, latest_index = [], None, None
     for layer, rate in enumerate(ratios[:layers]):
         if rate == 0:
@@ -113,13 +114,6 @@ def _v41_modes(text: Mapping[str, object], layers: int) -> tuple[tuple[int, ...]
     if extra:
         _refuse(f"source layers {extra}", f"the model has {layers} layers")
     return tuple(ratios), tuple(modes)
-
-
-def _int_list(record: Mapping[str, object], field: str) -> tuple[int, ...]:
-    value = record.get(field, ())
-    if not isinstance(value, (list, tuple)) or any(type(entry) is not int for entry in value):
-        _refuse(field, 'expected a list of integers')
-    return tuple(value)
 
 
 def _deepseek_v41_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
@@ -307,7 +301,8 @@ def _v41_dspark(text: Mapping[str, object], layers: int, ratios, seen: set[str])
         _refuse('compress_ratios', "the DSpark stages are sliding layers, one trailing 0 each")
     return {'stages': stages, 'block_size': block,
             'noise_token_id': _record_int(text, 'dspark_noise_token_id'),
-            'target_layers': _int_list(text, 'dspark_target_layer_ids'),
+            'target_layers': records.integers(text.get('dspark_target_layer_ids', ()),
+                                              'dspark_target_layer_ids'),
             'markov_rank': _record_int(text, 'dspark_markov_rank'),
             'experts': _record_int(text, 'dspark_n_routed_experts',
                                    _record_int(text, 'n_routed_experts')),
@@ -322,10 +317,11 @@ def _v41_engram(text: Mapping[str, object], seen: set[str]) -> EngramFields | No
               'engram_vocab_size', 'engram_n_heads', 'engram_head_dim',
               'engram_compressed_vocab_size', 'engram_pad_token_id')
     seen.update(fields)
-    layers = _int_list(text, 'engram_layer_ids')
+    layers = records.integers(text.get('engram_layer_ids', ()), 'engram_layer_ids')
     if not layers:
         return None
-    return {'layer_ids': layers, 'num_embeddings': _int_list(text, 'engram_num_embeddings'),
+    embeddings = records.integers(text.get('engram_num_embeddings', ()), 'engram_num_embeddings')
+    return {'layer_ids': layers, 'num_embeddings': embeddings,
             'max_ngram_size': _record_int(text, 'engram_max_ngram_size'),
             'vocab_size': _record_int(text, 'engram_vocab_size'),
             'n_heads': _record_int(text, 'engram_n_heads'),
@@ -334,31 +330,16 @@ def _v41_engram(text: Mapping[str, object], seen: set[str]) -> EngramFields | No
             'pad_token_id': _record_int(text, 'engram_pad_token_id', 2)}
 
 
-# The release's names inside a layer onto the module names the tree keeps.
-# The indexer keeps V3.2's leaf names (wq_b, wk, k_norm, weights_proj),
-# which the shared reader already places under self_attn/indexer.
+# The release's own names inside a layer, before those V4 shares
+# (`_V4_LAYER_NAMES`). The indexer keeps V3.2's leaf names (wq_b, wk,
+# k_norm, weights_proj), which the shared reader already places under
+# self_attn/indexer.
 _DEEPSEEK_V41_NAMES = (
-    ('.attn_sink', '.sinks'),
     ('.compressor.norm.', '.compressor.kv_norm.'),
-    ('.q_norm.', '.q_a_norm.'),
-    ('.attn.wq_a.', '.attn.q_a_proj.'),
-    ('.attn.wq_b.', '.attn.q_b_proj.'),
-    ('.attn.wkv.', '.attn.kv_proj.'),
-    ('.compressor.wkv.', '.compressor.kv_proj.'),
-    ('.compressor.wgate.', '.compressor.gate_proj.'),
-    ('.wo_a.', '.o_a_proj.'),
-    ('.wo_b.', '.o_b_proj.'),
+    ('.attn.wq_a.', '.attn.q_a_proj.'), ('.attn.wq_b.', '.attn.q_b_proj.'), ('.attn.wkv.', '.attn.kv_proj.'),
+    ('.compressor.wkv.', '.compressor.kv_proj.'), ('.compressor.wgate.', '.compressor.gate_proj.'),
     ('.gate.bias_vl', '.gate.media_bias'),
-    ('.gate.bias', '.gate.e_score_correction_bias'),
-    ('.w1.', '.gate_proj.'),
-    ('.w2.', '.down_proj.'),
-    ('.w3.', '.up_proj.'),
-    ('.attn.', '.self_attn.'),
-    ('.ffn.', '.mlp.'),
-    ('.attn_norm.', '.input_layernorm.'),
-    ('.ffn_norm.', '.post_attention_layernorm.'),
-    ('.hc_attn_', '.attn_hc.'),
-    ('.hc_ffn_', '.ffn_hc.'),
+    *_V4_LAYER_NAMES,
 )
 _V41_TRUNK = {'embed.weight': 'model.embed_tokens.weight', 'norm.weight': 'model.norm.weight',
               'head.weight': 'lm_head.weight'}
@@ -443,7 +424,7 @@ DEEPSEEK_V41 = DecoderFamily(
     lambda fields: any(isinstance(mixer, DeepseekV4Mixer) and mixer.compressor == 'csa2'
                        for mixer in _kind_mixers(fields)),
     'deepseek_v41', 'DeepseekV41ForCausalLM', lambda model: {},
-    weight_path=_deepseek_v41_path, prepare_weights=_deepseek_v4_prepare,
+    weight_path=_deepseek_v41_path, prepare=_deepseek_v4_prepare,
     preserve_source_layout=True, tied_head_names=('head.weight', 'embed.weight'),
     constants=_deepseek_v41_constants, wrapper=_deepseek_v41_wrapper,
     # The image span's learned vectors sit at the top level, beside the

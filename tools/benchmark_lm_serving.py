@@ -105,6 +105,7 @@ def profile_decode(server, prompts: np.ndarray, output: int, steps: int, directo
     host_wall = time.perf_counter() - began
     stream = io.StringIO()
     pstats.Stats(profile, stream=stream).sort_stats("tottime").print_stats(30)
+    previous = set(directory.rglob("*.xplane.pb"))
     with dew.Profiler(directory) as capture:
         for _ in range(steps):
             with capture.region("serve.decode"):
@@ -114,7 +115,7 @@ def profile_decode(server, prompts: np.ndarray, output: int, steps: int, directo
     server.run()
     assert all(ticket.done() for ticket in tickets)
     devices = {}
-    trace = sorted(directory.rglob("*.xplane.pb"))[-1]
+    trace, = set(directory.rglob("*.xplane.pb")) - previous
     for plane in ProfileData.from_file(str(trace)).planes:
         if not plane.name.startswith("/device:GPU"):
             continue

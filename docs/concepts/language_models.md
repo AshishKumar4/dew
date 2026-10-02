@@ -187,7 +187,7 @@ With gradient accumulation, the cross-entropy and multi-token-prediction (MTP) l
 
 ## Pretrained checkpoints
 
-`Pretrained.load(name_or_dir)` reads a local Hugging Face directory or a Hub identifier into a `Pretrained` bundle: the native Flax model, its variables, the checkpoint's processor or tokenizer, the source config and the generation defaults. The bundle is the kind of source it read, each with the methods that work for it: `PretrainedDecoder` (text generation, `lm_objective`, `lora`), `PretrainedMaskedDecoder` (LLaDA, Dream), `PretrainedBlockDecoder` (DiffusionGemma), `PretrainedPipeline` (latent diffusion, `text_to_image`) and `PretrainedFallback` (`fallback="torchax"`, `lm_objective`). Calling `load` on a kind, as `PretrainedDecoder.load(...)`, refuses a source of another kind by name. `dew.pipeline(source)` wraps the same loader and returns a `TextGeneration` (a `BlockGeneration` for DiffusionGemma, a `MaskedGeneration` for LLaDA and Dream) with the weights placed on the current devices and the sampling policy and budget taken from the checkpoint.
+`Pretrained.load(name_or_dir)` reads a local Hugging Face directory or a Hub identifier into a `Pretrained` bundle: the native Flax model, its variables, the checkpoint's processor or tokenizer, the source config and the generation defaults. The bundle is the kind of source it read, each with the methods that work for it: `PretrainedDecoder` (text generation, `lm_objective`, `lora`), `PretrainedMaskedDecoder` (LLaDA, Dream), `PretrainedBlockDecoder` (DiffusionGemma), `PretrainedPipeline` (latent diffusion, `text_to_image`, `diffusion_objective`, `lora`) and `PretrainedFallback` (`fallback="torchax"`, `lm_objective`). Calling `load` on a kind, as `PretrainedDecoder.load(...)`, refuses a source of another kind by name. `dew.pipeline(source)` wraps the same loader and returns a `TextGeneration` (a `BlockGeneration` for DiffusionGemma, a `MaskedGeneration` for LLaDA and Dream) with the weights placed on the current devices and the sampling policy and budget taken from the checkpoint.
 
 A decoder's `bundle.lm_objective(seq_len, **options)` builds an `LMObjective` starting from its loaded weights. With token files prepared using the checkpoint's tokenizer (`dew tokenize --tokenizer Qwen/Qwen3-0.6B`), fine-tuning uses the same trainer as training from scratch:
 
@@ -219,13 +219,15 @@ print(objective.pipeline(state)("The capital of France is", 8, key=key).text[0])
 `PretrainedDecoder.from_model` makes a trained `CausalTransformer` a source bundle, and its `save` writes the Hugging Face layout. This exports the decoder from the example and loads it back:
 
 ```python
+import jax.numpy as jnp
+
 import dew
 from dew.interop import PretrainedDecoder
 
 trained = PretrainedDecoder.from_model(model, lm_state.params, tokenizer="byte",
                                        generation_config={"do_sample": False, "max_new_tokens": 24})
 trained.save("stories-decoder")
-task = dew.pipeline("stories-decoder", dtype="float32")
+task = dew.pipeline("stories-decoder", dtype=jnp.float32)
 print(task.sampling)
 result = task([tokenizer.encode("At night")], key=0).host()
 print(tokenizer.decode(result.tokens[0]), result.lengths)
@@ -275,12 +277,13 @@ The next examples read the tiny checkpoints under `tests/fixtures/hf` of a Dew r
 ```python
 from pathlib import Path
 
+import jax.numpy as jnp
 import numpy as np
 from dew.interop import PretrainedDecoder
 
 fixtures = Path(dew.__file__).parents[2] / "tests" / "fixtures" / "hf"
 source = fixtures / "gemma3-native-tiny"
-bundle = PretrainedDecoder.load(source, dtype="float32", max_seq_len=64)
+bundle = PretrainedDecoder.load(source, dtype=jnp.float32, max_seq_len=64)
 images = np.load(source / "raw_images.npy")          # uint8 [3, 32, 32, 3]
 inputs = bundle.processor(["token7 <start_of_image> token9",
                            "token5 <start_of_image> token8 <start_of_image> token6"],
@@ -384,7 +387,7 @@ LLaDA and Dream use this masked-token path from their released weights. They pre
 ```python
 from dew.interop import PretrainedMaskedDecoder
 
-llada = PretrainedMaskedDecoder.load(fixtures / "llada-tiny", dtype="float32", attention_impl="xla")
+llada = PretrainedMaskedDecoder.load(fixtures / "llada-tiny", dtype=jnp.float32, attention_impl="xla")
 masked_task = llada.text_generation()
 result = masked_task([[1, 2, 3]], 8, key=7, steps=16, n=2)
 print(result.host().tokens)
@@ -414,7 +417,7 @@ from tempfile import TemporaryDirectory
 
 from dew.interop import PretrainedBlockDecoder
 
-gemma = PretrainedBlockDecoder.load(fixtures / "diffusion-gemma-workflow", dtype="float32",
+gemma = PretrainedBlockDecoder.load(fixtures / "diffusion-gemma-workflow", dtype=jnp.float32,
                                     attention_impl="xla", max_seq_len=32)
 prompt = gemma.processor(["<bos> t5 t7 t9 t11"])
 block_task = gemma.block_generation()
@@ -422,7 +425,7 @@ generated = block_task(prompt, 7, key=jax.random.key(11))
 print(block_task.decode(generated))
 with TemporaryDirectory() as checkpoint:
     gemma.save(checkpoint)
-    restored = PretrainedBlockDecoder.load(checkpoint, dtype="float32", attention_impl="xla",
+    restored = PretrainedBlockDecoder.load(checkpoint, dtype=jnp.float32, attention_impl="xla",
                                            max_seq_len=32)
     replay = restored.block_generation()(prompt, 7, key=jax.random.key(11))
     np.testing.assert_array_equal(replay.tokens, generated.tokens)
@@ -446,7 +449,7 @@ from dataclasses import replace
 from dew.objectives.diffusion import BlockDiffusionObjective
 
 sft_source = fixtures / "diffusion-gemma-sft"
-sft_bundle = PretrainedBlockDecoder.load(sft_source, dtype="float32", attention_impl="xla", max_seq_len=32)
+sft_bundle = PretrainedBlockDecoder.load(sft_source, dtype=jnp.float32, attention_impl="xla", max_seq_len=32)
 with np.load(sft_source / "reference.npz") as reference:
     train_tokens = np.tile(reference["tokens"], (jax.device_count(), 1))
 block_data = Dataset(train=lambda partition: iter([{"text": train_tokens}]), val=None,
@@ -457,7 +460,7 @@ block_state = Trainer(block_objective, optax.sgd(0.001), key=jax.random.key(2)).
     block_data, steps=1, log_every=1)
 with TemporaryDirectory() as checkpoint:
     replace(sft_bundle, model=block_objective.model).save(checkpoint, variables=block_state.params)
-    trained_bundle = PretrainedBlockDecoder.load(checkpoint, dtype="float32", attention_impl="xla",
+    trained_bundle = PretrainedBlockDecoder.load(checkpoint, dtype=jnp.float32, attention_impl="xla",
                                                  max_seq_len=32)
 print("Optimizer updates:", int(block_state.updates))
 ```

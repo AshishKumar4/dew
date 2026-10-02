@@ -13,7 +13,7 @@ from dew.nn.backbones import CausalTransformer, Mixture
 model = CausalTransformer(
     vocab_size=32, emb_features=16,
     num_layers=2, num_heads=2, mlp_features=32, max_seq_len=8,
-    mixture=Mixture(experts=4, top_k=2, every=1),
+    mixture=Mixture(experts=4, top_k=2),
     dtype=jnp.float32, attention_impl="xla",
 )
 tokens = jnp.array([[1, 2, 3, 4]], dtype=jnp.int32)
@@ -29,7 +29,7 @@ logits: (1, 4, 32)
 experts per token, layer 0: [[1, 3], [3, 1], [1, 0], [3, 2]]
 ```
 
-Every layer here routes (`every=1`) to two of four experts. The logits keep the usual `(batch, sequence, vocabulary)` shape. Opening the `router` collection makes each router record its choices (`indices`, `[batch, sequence, top_k]`), its scores and its log partition; without it nothing is recorded. Flax keeps sown values in a tuple, hence the first `[0]`. The figure reads the same collection from this model over 64 random tokens:
+Every layer here routes to two of four experts. The logits keep the usual `(batch, sequence, vocabulary)` shape. Opening the `router` collection makes each router record its choices (`indices`, `[batch, sequence, top_k]`), its scores and its log partition; without it nothing is recorded. Flax keeps sown values in a tuple, hence the first `[0]`. The figure reads the same collection from this model over 64 random tokens:
 
 ![Router choices of a four-expert, top-2 mixture at layer 0 for 32 tokens, with each chosen expert's normalized weight, and the number of tokens each expert received in both layers.](../assets/moe-routing-light.svg)
 ![Router choices of a four-expert, top-2 mixture at layer 0 for 32 tokens, with each chosen expert's normalized weight, and the number of tokens each expert received in both layers.](../assets/moe-routing-dark.svg)
@@ -40,7 +40,7 @@ Every layer here routes (`every=1`) to two of four experts. The logits keep the 
 |---|---|---|
 | `experts` | required | Number of experts. |
 | `top_k` | `2` | Experts per token. |
-| `layers` / `every` | `None` | Sparse layers by index, or every nth layer counting from the end of the first group (Qwen3-MoE's `decoder_sparse_step`). With neither, every layer is sparse. Setting both is refused. |
+| `layers` | `None` | Sparse layers by index; `None` makes every layer sparse. A checkpoint's cadence (Qwen3-MoE's `decoder_sparse_step`, Llama 4's `interleave_moe_layer_step`) translates to these indices. |
 | `score_function` | `'softmax'` | How router logits become scores. |
 | `norm_topk_prob` | `True` | Divide a token's selected weights by their sum. |
 | `scaling` | `1.0` | Routed output scale. |

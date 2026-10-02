@@ -166,12 +166,17 @@ class CausalSelfAttention(nn.Module):
         # The gate doubles the query projection: the reference chunks its
         # output in half, one half the query and the other the gate the
         # branch multiplies by (modeling_qwen3_5.py:670-673, 701).
-        self.q_proj = dense(
-            self.num_heads * self.head_dim * (2 if self.output_gate else 1), name='q_proj')
+        query_width = self.num_heads * self.head_dim * (2 if self.output_gate else 1)
+        if self.has_variable('params', 'qkv_proj'):
+            # A Server packs its constant weights once, not on every decode
+            # step. The ordinary parameter tree remains the training layout.
+            self.qkv_proj = dense(query_width + 2 * self.num_kv_heads * self.head_dim, name='qkv_proj')
+        else:
+            self.q_proj = dense(query_width, name='q_proj')
         # A sharing layer reads another layer's keys and values, so it owns
         # no projections or key norm of its own, as the reference skips them
         # (modeling_gemma4.py, Gemma4TextAttention.__init__).
-        if not self.kv_shared:
+        if not self.kv_shared and not self.has_variable('params', 'qkv_proj'):
             self.k_proj = dense(self.num_kv_heads * self.head_dim, name='k_proj')
             if not self.k_eq_v:
                 self.v_proj = dense(self.num_kv_heads * self.head_dim, name='v_proj')
@@ -247,18 +252,24 @@ class CausalSelfAttention(nn.Module):
                 "its layer stack")
         return kv_store[self.kv_store_key]
 
-    def _projected_kv(self, x, whole: bool):
+    def _projected_kv(self, x, whole: bool, projected=None):
         """Project the keys and values, norm them, and split them into heads.
 
         `whole` norms the key projection before the head split, which is
         OLMo 3's scope. Otherwise the key norm runs per head, after it.
         """
         batch, length, _ = x.shape
-        key = checkpoint_name(self.k_proj(x), 'k_proj')
-        # attention_k_eq_v reads the values off the key projection before
-        # its norm (modeling_gemma4.py, Gemma4TextAttention.forward).
-        value = (key if self.k_eq_v else checkpoint_name(self.v_proj(x), 'v_proj')).reshape(
-            batch, length, self.num_kv_heads, self.head_dim)
+        if projected is None:
+            key = self.k_proj(x)
+            # Gemma 4's global layers use the raw key projection as the
+            # values before its norm (modeling_gemma4.py).
+            value = key if self.k_eq_v else self.v_proj(x)
+        else:
+            key, value = projected
+        key = checkpoint_name(key, 'k_proj')
+        if not self.k_eq_v:
+            value = checkpoint_name(value, 'v_proj')
+        value = value.reshape(batch, length, self.num_kv_heads, self.head_dim)
         if whole:
             key = self.k_norm(key)
         key = key.reshape(batch, length, self.num_kv_heads, self.head_dim)
@@ -348,7 +359,15 @@ class CausalSelfAttention(nn.Module):
         logical_positions = positions
         # The projections and the kernel's output carry the names a remat
         # policy saves or offloads (decoder_block.RESIDUALS).
-        projected = checkpoint_name(self.q_proj(x), 'q_proj')
+        projected_kv = None
+        if self.has_variable('params', 'qkv_proj'):
+            width = self.num_heads * self.head_dim * (2 if self.output_gate else 1)
+            projected, key, value = jnp.split(
+                self.qkv_proj(x), (width, width + self.num_kv_heads * self.head_dim), axis=-1)
+            projected_kv = (key, value)
+        else:
+            projected = self.q_proj(x)
+        projected = checkpoint_name(projected, 'q_proj')
         # OLMo 3 norms the whole projection, one scale of heads * head_dim,
         # before the head split (modeling_olmo3.py:162-163, :178-179); Qwen3
         # and the Gemmas norm each head after it, which the reference marks
@@ -368,7 +387,7 @@ class CausalSelfAttention(nn.Module):
         if self.kv_shared:
             key, value, positions = self._shared_kv(kv_store)
         else:
-            key, value = self._projected_kv(x, whole)
+            key, value = self._projected_kv(x, whole, projected_kv)
         if self.qk_norm and not whole:
             query = self.q_norm(query)
         # Column-parallel under a tensor axis, each shard a run of whole

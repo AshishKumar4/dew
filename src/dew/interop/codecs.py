@@ -294,20 +294,27 @@ PACKED_SUFFIXES = ('.weight_packed', '.weight_scale')
 """compressed-tensors' `mxfp4-pack-quantized` pair beside a Linear's module name."""
 
 
+def _config_groups(quantization: Mapping[str, object]) -> Mapping[str, object]:
+    """A compressed-tensors config's weight groups, refused unless its weights
+    are stored compressed and its KV cache is not quantized."""
+    if quantization.get('quantization_status', 'compressed') != 'compressed':
+        raise ValueError("compressed-tensors quantization_status must be 'compressed'")
+    if quantization.get('kv_cache_scheme') is not None:
+        raise ValueError("compressed-tensors kv_cache_scheme quantizes the cache, which this loader "
+                         "does not; load a checkpoint without a kv_cache_scheme")
+    groups = quantization.get('config_groups')
+    if not isinstance(groups, Mapping) or not groups:
+        raise ValueError("compressed-tensors config_groups must name the quantized weights")
+    return groups
+
+
 def packed_mxfp4_format(quantization: Mapping[str, object]) -> None:
     """Refuse a compressed-tensors config whose tensors are not MXFP4 packed weights.
 
     Weights alone are quantized, as groups of 32 inputs under one E8M0
     exponent; activations and the KV cache stay in the compute dtype.
     """
-    if quantization.get('quantization_status', 'compressed') != 'compressed':
-        raise ValueError("compressed-tensors quantization_status must be 'compressed'")
-    if quantization.get('kv_cache_scheme') is not None:
-        raise ValueError("compressed-tensors kv_cache_scheme quantizes the cache, which this loader does not")
-    groups = quantization.get('config_groups')
-    if not isinstance(groups, Mapping) or not groups:
-        raise ValueError("compressed-tensors config_groups must name the quantized weights")
-    for name, group in groups.items():
+    for name, group in _config_groups(quantization).items():
         group = records.record(group, f'config_groups.{name}')
         if group.get('format', 'mxfp4-pack-quantized') != 'mxfp4-pack-quantized':
             raise ValueError(f"config_groups.{name}.format must be mxfp4-pack-quantized")
@@ -971,18 +978,8 @@ def _weight_scheme(quantization: Mapping[str, object]) -> _WeightScheme:
     if form not in COMPRESSED_TENSORS_FORMATS:
         raise ValueError(f"compressed-tensors format {form!r}: this loader reads "
                          f"{', '.join(COMPRESSED_TENSORS_FORMATS)} and mxfp4-pack-quantized")
-    if quantization.get('quantization_status', 'compressed') != 'compressed':
-        raise ValueError("compressed-tensors quantization_status must be 'compressed'")
-    if quantization.get('kv_cache_scheme') is not None:
-        raise ValueError(
-            "compressed-tensors kv_cache_scheme quantizes the cache, which this loader does not; "
-            "load a checkpoint without a kv_cache_scheme"
-        )
-    groups = quantization.get('config_groups')
-    if not isinstance(groups, Mapping) or not groups:
-        raise ValueError("compressed-tensors config_groups must name the quantized weights")
     schemes = set()
-    for name, group in groups.items():
+    for name, group in _config_groups(quantization).items():
         group = records.record(group, f'config_groups.{name}')
         if group.get('output_activations') is not None:
             raise ValueError(

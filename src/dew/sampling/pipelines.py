@@ -15,7 +15,7 @@ import numpy as np
 from flax import linen as nn, struct
 from flax.core import freeze
 from jax.experimental import multihost_utils
-from jax.typing import ArrayLike
+from jax.typing import ArrayLike, DTypeLike
 from typing_extensions import TypeVar
 
 from dew.artifacts import agreed, uint8_pixels
@@ -197,7 +197,7 @@ class TextToImage:
     @classmethod
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
                  mesh: MeshSpec | None = None, layout: Layout | None = None,
-                 dtype: str | None = None, param_dtype: str | None = None) -> TextToImage:
+                 dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None) -> TextToImage:
         """The run in `directory`: its `run.json` built the way the recipe
         built it, and the weights of its latest checkpoint (or `step`).
 
@@ -240,8 +240,8 @@ class TextToImage:
 
     @classmethod
     def from_pretrained(cls, repo_id: str, *, ema: bool | None = None, mesh: MeshSpec | None = None,
-                        layout: Layout | None = None, dtype: str | None = None,
-                        param_dtype: str | None = None) -> TextToImage:
+                        layout: Layout | None = None, dtype: DTypeLike | None = None,
+                        param_dtype: DTypeLike | None = None) -> TextToImage:
         """A run directory published to the Hugging Face Hub, as
         `HfApi().upload_folder` of the run directory writes it."""
         from dew.interop.hub import pull_from_hub
@@ -251,7 +251,7 @@ class TextToImage:
 
     @classmethod
     def from_flaxdiff(cls, directory: str | os.PathLike, config: Mapping[str, object], *, jax_version: str,
-                      ema: bool = True, best: bool = False, dtype: str | None = None) -> TextToImage:
+                      ema: bool = True, best: bool = False, dtype: DTypeLike | None = None) -> TextToImage:
         """A FlaxDiff text-to-image run (`simple_udit` or `hybrid_dit` on the
         SD VAE) over Dew's own model.
 
@@ -607,6 +607,7 @@ def _image_start(rows: jax.sharding.NamedSharding | None):
         return value, spatial
     return jax.jit(prepare, static_argnums=(0, 1, 2),
                    in_shardings=(None, rows, rows, None, None), out_shardings=rows)
+
 
 
 

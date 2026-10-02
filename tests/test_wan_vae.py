@@ -16,8 +16,10 @@ same `WeightLayout`s an export uses. Every gap is scaled by max(1, |reference|).
 """
 
 import json
+import math
 import shutil
 import tarfile
+from importlib import import_module
 from pathlib import Path
 
 import jax
@@ -27,7 +29,7 @@ import pytest
 from safetensors.numpy import save_file
 
 from dew.interop.diffusion import component_tensors
-from dew.nn.autoencoders.wan import load_wan_vae, wan_vae_fields, wan_vae_path
+from dew.nn.autoencoders.wan import WanRMSNorm, load_wan_vae, wan_vae_fields, wan_vae_path
 
 ROOT = Path(__file__).resolve().parents[1]
 FORWARD = 1e-5
@@ -104,8 +106,9 @@ def test_an_image_is_the_one_frame_video(loaded, reference):
     assert scaled_gap(latent, channels_last(reference["image_mean"])) < FORWARD
     # The batch path runs the model jitted and the reference path op by op;
     # XLA fuses them differently, a float32 rounding apart.
-    np.testing.assert_allclose(np.asarray(autoencoder.encode_batch(params, first[:, 0])), np.asarray(latent[:, 0]),
-                               rtol=0, atol=1e-6)
+    np.testing.assert_allclose(
+        np.asarray(autoencoder.encode_batch(params, first[:, 0])), np.asarray(latent[:, 0]), rtol=0, atol=1e-6
+    )
 
 
 def test_the_decode_matches_the_source(loaded, reference):
@@ -188,6 +191,75 @@ def test_decoder_gradients_match_the_source(loaded, reference):
     assert gaps[worst] < GRADIENT, worst
 
 
+def test_a_bfloat16_walk_matches_the_sources_bfloat16_walk(source):
+    """The fixture VAE in bfloat16 against diffusers 0.34.0's own bfloat16
+    walk of it (`wan_vae_bf16.npz`, the reference tool's `bfloat16` mode):
+    the posterior and decode of one bfloat16 video and latent, and their
+    input gradients. Each differs from the source by less than one bfloat16
+    rounding of its scale on average, and by at most 2^-3 of it anywhere.
+
+    The norm computes `F.normalize` in float32 and rounds once. Against this
+    record its mean gaps are mean 1.87e-3, std 8.8e-4, pixels 3.28e-3, video
+    gradient 7.6e-5 and latent gradient 1.28e-2, where the earlier bfloat16
+    reduction gave 1.99e-3, 9.8e-4, 3.40e-3, 8.0e-5 and 1.73e-2. Averaged
+    over four more seeds it is closer to both 0.34.0 and 0.40.0 (which
+    normalizes in float32 too) on every output and on the encoder's
+    parameter gradients.
+    """
+    record = dict(np.load(ROOT / "tests/fixtures/wan_vae_bf16.npz"))
+    autoencoder, params, _, _ = load_wan_vae(source, jnp.bfloat16)
+    model = autoencoder.model
+
+    def walked(name):
+        return jnp.asarray(channels_last(record[name]), jnp.bfloat16)
+
+    def objective(video):
+        mean, std = posterior(model, params, video)
+        return (jnp.sum(mean.astype(jnp.float32) * channels_last(record["probe_mean"]))
+                + jnp.sum(std.astype(jnp.float32) * channels_last(record["probe_std"])))
+
+    def decoded(latent):
+        return model.apply({"params": params}, latent, method=model.decode)
+
+    def decode_objective(latent):
+        return jnp.sum(decoded(latent).astype(jnp.float32) * channels_last(record["probe"]))
+
+    mean, std = jax.jit(lambda video: posterior(model, params, video))(walked("video"))
+    ours = {"mean": mean, "std": std, "pixels": jax.jit(decoded)(walked("latent")),
+            "encode.grad_video": jax.jit(jax.grad(objective))(walked("video")),
+            "decode.grad_latent": jax.jit(jax.grad(decode_objective))(walked("latent"))}
+    for name, value in ours.items():
+        expected = channels_last(record[name]).astype(np.float64)
+        difference = np.abs(np.asarray(value, np.float64) - expected)
+        scale = max(1.0, float(np.abs(expected).max()))
+        print(f"{name}: mean gap {difference.mean():.3g}, scaled max {difference.max() / scale:.3g}")
+        # 2^-8 is bfloat16's unit roundoff: within one rounding of the
+        # output's scale on average. 2^-3 is twice the largest scaled gap any
+        # output reached over four other seeds (6.1e-2, the latent gradient),
+        # rounded up to a power of two. Normalizing over another axis, or
+        # dropping the sqrt(C) scale, fails the first at every output.
+        assert difference.mean() / scale < 2.0 ** -8, name
+        assert difference.max() / scale < 2.0 ** -3, name
+
+
+def test_a_zero_row_normalizes_to_zero_with_a_finite_gradient():
+    """`F.normalize` clamps the norm at 1e-12, so a zero row and one far
+    below the clamp both divide by 1e-12: the zero row stays zero, and either
+    row's gradient is the probe times sqrt(C) * gamma / 1e-12, finite, as
+    torch's is. Clamping the norm after its square root would leave sqrt's
+    derivative at zero, NaN through the clamp, in both."""
+    features = 16
+    rows = jnp.stack([jnp.zeros(features), jnp.full(features, 1e-20)])
+    gamma = jnp.linspace(0.5, 1.5, features)
+    probe = jnp.linspace(-1.0, 1.0, 2 * features).reshape(2, features)
+    output, pullback = jax.vjp(lambda x: WanRMSNorm(features, 1).apply({"params": {"gamma": gamma}}, x), rows)
+    (gradient,) = pullback(probe)
+    clamped = math.sqrt(features) * np.asarray(gamma) / 1e-12
+    np.testing.assert_array_equal(np.asarray(output[0]), 0.0)
+    np.testing.assert_allclose(np.asarray(output[1]), np.asarray(rows[1]) * clamped, rtol=1e-6)
+    np.testing.assert_allclose(np.asarray(gradient), np.asarray(probe) * clamped, rtol=1e-6)
+
+
 def test_the_autoencoder_normalizes_as_the_pipeline_does(loaded, reference):
     """`WanPipeline` stores `(z - latents_mean) * (1 / latents_std)` and
     decodes `z / (1 / latents_std) + latents_mean`, per channel, and a video
@@ -199,7 +271,9 @@ def test_the_autoencoder_normalizes_as_the_pipeline_does(loaded, reference):
     assert autoencoder.latent_shape(video.shape[1:]) == (3, 4, 6, 4)
     assert autoencoder.latent_shape(video.shape[2:]) == (4, 6, 4)
     raw = np.asarray(autoencoder.encode_video(params, video))
-    np.testing.assert_allclose(np.asarray(autoencoder.encode(params, video)), (raw - mean) * scale, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(
+        np.asarray(autoencoder.encode(params, video)), (raw - mean) * scale, rtol=1e-6, atol=1e-6
+    )
 
     latent = channels_last(reference["latent"])
     decoded = np.asarray(autoencoder.decode(params, latent))
@@ -251,7 +325,7 @@ def test_a_video_run_denoises_wan_latents_and_samples_whole_clips(source):
     """A `VideoDataset` run behind the Wan VAE denoises 1 + k latent frames
     for clips of 1 + 4k, trains, and samples clips of the length it read."""
     import optax
-    from test_diffusion_objective import StubText  # noqa: F401  registers "stub_text"
+    import_module("test_diffusion_objective")  # registers "stub_text"
 
     from dew.config import ModelConfig, TrainerConfig
     from dew.data import Dataset, VideoDataset
@@ -260,16 +334,27 @@ def test_a_video_run_denoises_wan_latents_and_samples_whole_clips(source):
     from dew.training import Trainer
 
     config = DiffusionRunConfig(
-        model=ModelConfig("video_dit", dict(patch_size=1, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1),
-                          dtype="float32", attention_impl="reference"),
-        data=VideoDataset(frame_size=32, frames=9), trainer=TrainerConfig(batch_size=8, steps=1),
-        solver=Euler(), sampling_steps=2, val_metrics=(),
+        model=ModelConfig(
+            "video_dit",
+            {"patch_size": 1, "emb_features": 16, "num_layers": 1, "num_heads": 2, "mlp_ratio": 1},
+            dtype="float32",
+            attention_impl="reference",
+        ),
+        data=VideoDataset(frame_size=32, frames=9),
+        trainer=TrainerConfig(batch_size=8, steps=1),
+        solver=Euler(),
+        sampling_steps=2,
+        val_metrics=(),
         text=TextCondition(encoder="stub_text", checkpoint="stub-clip"),
-        autoencoder=PretrainedAutoencoder(modelname=str(source), revision="main", dtype="float32"))
+        autoencoder=PretrainedAutoencoder(modelname=str(source), revision="main", dtype="float32"),
+    )
     objective = config.build()
     assert objective.latent_shape == (3, 4, 4, 4)
     clips = (np.random.default_rng(0).random((8, 9, 32, 32, 3)) * 255).astype(np.uint8)
-    batch = {"video": clips, "text": objective.inputs.conditions["textcontext"].encoder.tokenize(list("abcdefgh"))}
+    batch = {
+        "video": clips,
+        "text": objective.inputs.conditions["textcontext"].encoder.tokenize(list("abcdefgh")),
+    }
     state = Trainer(objective, optax.adam(1e-3), key=jax.random.PRNGKey(0)).fit(
         Dataset(train=lambda partition: iter(lambda: batch, None), val=None, records=None, batch=8),
         steps=1, log_every=100)
