@@ -65,7 +65,7 @@ class ScheduledScores(Objective):
         return params["params"]["offset"], Aux({})
 
     def evaluate(self, params, batch, step):
-        return TokenScores(jnp.ones_like(batch["x"]) * step.step, jnp.ones_like(batch["x"]))
+        return TokenScores(jnp.ones_like(batch["x"]) * step.step, jnp.ones_like(batch["x"]), correct=jnp.zeros_like(jnp.ones_like(batch["x"]) * step.step, dtype=bool))
 
 
 def test_integer_evaluation_key_matches_a_jax_key():
@@ -78,6 +78,19 @@ def test_integer_evaluation_key_matches_a_jax_key():
     assert integer.scores == typed.scores == {"val/perplexity": 1.}
     assert integer.event_key == typed.event_key
     assert integer.records == 24 and integer.coordinated_batches == 2
+
+
+def test_mean_metric_scores_uneven_validation_batches():
+    from dew import Mean
+
+    objective = ScheduledScores()
+    params = objective.init(jax.random.key(0))
+    batches = [{"x": np.ones((16, 1), np.float32), "score": np.arange(16, dtype=np.float32)},
+               {"x": np.ones((8, 1), np.float32), "score": np.arange(16, 24, dtype=np.float32)}]
+    metric = Mean(lambda artifact, batch: batch["score"], name="score", better="higher", reads=TokenScores)
+    result = evaluate(objective, params, lambda partition: iter(batches), key=jax.random.key(7), metrics=[metric])
+    assert result.scores == {"val/score": 11.5}
+    assert result.records == 24 and result.coordinated_batches == 2
 
 
 def test_event_step_and_objective_schedule_have_separate_meanings():

@@ -15,7 +15,7 @@ from jax.experimental import multihost_utils
 from dew.artifacts import agreed
 from dew.inference.tasks import Processor, TextGeneration
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of
-from dew.objectives.base import Aux, EMASpec, Mean, Objective, Shown, Step, Variables, mean_loss
+from dew.objectives.base import Aux, EMASpec, Objective, Ratio, Shown, Step, Variables, mean_loss
 from dew.registry import objectives
 from dew.rl import gae
 from dew.rl.advantage import MEAN_EPS, WHITEN_EPS
@@ -94,7 +94,7 @@ class _Policy:
 
 
 @objectives("ppo")
-class PPOObjective(Objective[Mean, Variables]):
+class PPOObjective(Objective[Ratio, Variables]):
     """Train a policy and a critic together on one token mass.
 
     The params collection holds policy and critic subtrees, both optimized by
@@ -169,7 +169,7 @@ class PPOObjective(Objective[Mean, Variables]):
         aligned = jnp.concatenate([jnp.zeros((ids.shape[0], 1), jnp.float32), values.astype(jnp.float32)], axis=1)
         return jnp.where(jnp.asarray(batch[RESPONSE_MASK_KEY]) != 0, aligned, 0.0)
 
-    def loss(self, params: Variables, batch, step: Step) -> tuple[Mean, Aux[Variables]]:
+    def loss(self, params: Variables, batch, step: Step) -> tuple[Ratio, Aux[Variables]]:
         """Add the actor's policy loss to the clipped value error on the same mass."""
         for field in (OLD_VALUES_KEY, RETURNS_KEY):
             if field not in batch or jnp.shape(batch[field]) != jnp.shape(batch[RESPONSE_MASK_KEY]):
@@ -179,9 +179,9 @@ class PPOObjective(Objective[Mean, Variables]):
         mask = jnp.asarray(batch[RESPONSE_MASK_KEY])
         terms = clipped_value_loss_terms(self.values(params, batch), jnp.asarray(batch[RETURNS_KEY]),
                                          jnp.asarray(batch[OLD_VALUES_KEY]), self.value_clip)
-        critic = Mean(jnp.sum(jnp.where(mask != 0, terms, 0) * mask), pg.mass)
+        critic = Ratio(jnp.sum(jnp.where(mask != 0, terms, 0) * mask), pg.mass)
         metrics = {**aux.metrics, "critic/loss": mean_loss(critic)[0]}
-        return Mean(pg.total + self.value_coefficient * critic.total, pg.mass), Aux(metrics)
+        return Ratio(pg.total + self.value_coefficient * critic.total, pg.mass), Aux(metrics)
 
     def evaluate(self, params: Variables, batch, step: Step):
         return self.actor.evaluate(_part(params, "policy"), batch, replace(step, ema=None))

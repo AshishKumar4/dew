@@ -97,7 +97,11 @@ class ModelConfig:
     """What every matmul of the model asks XLA for, where the model declares
     a `precision` field: `default` is the backend's fastest algorithm,
     `high` and `highest` trade throughput for mantissa bits (on Ampere and
-    later, tf32 and fp32 against bf16x3). Unset leaves the model's own."""
+    later, tf32 and fp32 against bf16x3). Unset leaves the model's own, the
+    default. Under bf16 compute a decoder's vocabulary head at the default
+    rounds its logits and their gradient to bf16, as torch autocast does;
+    `high` and `highest` keep that head fp32, the setting for comparing
+    parallel layouts in bf16 (`dew.nn.precision.head_product`)."""
     attention_impl: AttentionImpl = "auto"
     """Attention kernel; 'auto' is cudnn on a GPU for the shapes cudnn
     supports and xla for the rest, xla on any other backend."""

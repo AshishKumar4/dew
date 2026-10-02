@@ -160,12 +160,14 @@ with SafetensorsBanks("path/to/gpt-oss-20b-BF16",
     variables = stream_banked(model, source)
     generated = jax.block_until_ready(generate(
         model, variables, [[1, 2, 3, 4]], max_new_tokens=8,
-        seed=0, sampling=Sampling(temperature=0.0)))
+        key=0, sampling=Sampling(temperature=0.0)))
 ```
 
 Use a downloaded checkpoint snapshot's local directory for the path. This path accepts unquantized registered decoder families whose translation stays lazy; it refuses a quantized codec or family preparation that might materialize the model. It does not download a Hub repository, load a tokenizer or replace `dew.pipeline`'s resident loader. Tokenize inputs separately, or bind these variables to `TextGeneration` with the matching processor.
 
 `cache_bytes` bounds retained host layers, not the entire process. Complete layers are admitted in read order while they fit and kept until the source closes. A sequential decoder revisits every layer each token, so retaining this prefix avoids the cyclic eviction of a smaller LRU cache. Staging needs up to two host rows plus one leaf's conversion scratch beside that cache. Embeddings, the head, the KV cache and the runtime are separate. Read mapped pages are released; the kernel's shared filesystem cache is not controlled by this budget. Device storage must fit resident entries, two layer rows, activations and the KV cache. Expert tensors stream as part of a whole layer, not just the experts selected for one token. `read_ahead=False` disables the host read-ahead slot.
+
+For `host_banked` and any other pinned-host placement, budget for the allocator's reserve as well as live weights, staging and the runtime. XLA's pinned-host BFC allocator grows its regions in powers of two and retains freed chunks: the RTX 4080 measurement held about 1.55 GB of reserve above 3.29 GB of live pinned weights. Single-device-to-named assembly shared the same buffer, so this was allocator capacity, not another Dew copy. A cgroup or container limit can therefore be reached before the computed weight total; the observed reserve is not a fixed overhead to assume for other models.
 
 Streaming is single-device inference only. It requires `scan_layers=True` and a layout without host placement; training, multi-device meshes and pipeline stages are refused. Host callbacks need the CPU backend beside the accelerator: when setting platforms explicitly, use `JAX_PLATFORMS=cuda,cpu` (or `<accelerator>,cpu`) before initializing JAX. Keep the source open until all executions have finished and do not change its files in place. The runtime-only `streaming` collection holds live callback handles, not checkpoint weights: this path saves nothing through `Checkpoints`, and its variables tree is not a resident checkpoint to save or export. The original safetensors directory remains the checkpoint.
 
