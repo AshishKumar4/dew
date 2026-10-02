@@ -54,7 +54,7 @@ def test_python_lm_run_saves_its_inference_record_without_run_json(tmp_path):
 def test_builtin_process_records_preserve_noise_prediction_and_weights():
     from dew import presets
     from dew.diffusion.process import Process
-    for name in ('edm', 'flow_match', 'vp'):
+    for name in ('edm', 'flow', 'cosine'):
         original = presets[name](**({'regime': 'pixel'} if name == 'edm' else {}))()
         rebuilt = Process.from_json(original.to_json())
         time = jnp.linspace(.01, .99, 16)
