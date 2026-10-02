@@ -11,7 +11,7 @@ from flax import struct
 
 from dew.checkpoints import Checkpoints
 from dew.data import DataPartition
-from dew.objectives import Aux, EMASpec, Mean, Objective, mean_loss, scalar_loss
+from dew.objectives import Aux, EMASpec, Ratio, Objective, mean_loss, scalar_loss
 from dew.objectives.base import under
 from dew.training import Trainer
 from test_trainer import raw_leaf
@@ -19,14 +19,14 @@ from test_trainer import raw_leaf
 
 @struct.dataclass
 class Terms:
-    prediction: Mean
-    rows: Mean
+    prediction: Ratio
+    rows: Ratio
     scores: jax.Array
     counts: jax.Array
     positions: jax.Array
 
 
-class Tiny(Objective[Mean | Terms, None]):
+class Tiny(Objective[Ratio | Terms, None]):
     ema = EMASpec(optax.constant_schedule(.5), select=under("params"))
 
     def __init__(self, composite=False):
@@ -44,20 +44,20 @@ class Tiny(Objective[Mean | Terms, None]):
         bad = jax.lax.cond(batch["bad"],
                            lambda x: jnp.sqrt(x - jax.lax.stop_gradient(x)),
                            lambda x: x * 0, w)
-        main = Mean(jnp.sum(errors * batch["mask"]) + bad, jnp.sum(batch["mask"]))
+        main = Ratio(jnp.sum(errors * batch["mask"]) + bad, jnp.sum(batch["mask"]))
         aux = Aux({}, variables={"stats": {"seen": variables["stats"]["seen"] + 1}})
         if not self.composite:
             return main, aux
         logits = jnp.stack((prediction, -prediction, prediction * .3), axis=-1)
         scores = jax.nn.softmax(logits, axis=-1)
         counts = jnp.bincount(jnp.argmax(scores, axis=-1), length=3)
-        row = Mean(jnp.sum((prediction + batch["y"]) ** 2) * batch["active"],
+        row = Ratio(jnp.sum((prediction + batch["y"]) ** 2) * batch["active"],
                    jnp.asarray(batch["y"].size) * batch["active"])
         return Terms(main, row, jnp.sum(scores, axis=0) * batch["active"],
                      counts * batch["active"], jnp.asarray(scores.shape[0]) * batch["active"]), aux
 
     def reduce_loss(self, stats):
-        if isinstance(stats, Mean):
+        if isinstance(stats, Ratio):
             return mean_loss(stats)
         main, a = mean_loss(stats.prediction)
         row, b = mean_loss(stats.rows)
@@ -71,7 +71,7 @@ def batches():
                  bad=jnp.array(bad), active=jnp.array(1))
             for mask, bad in [([1., 0.], False), ([1., 1.], True), ([.5, 1.], False), ([1., 1.], False)]]
 
-class ShortScaleTrainer(Trainer[Mean | Terms, None]):
+class ShortScaleTrainer(Trainer[Ratio | Terms, None]):
     def initial_state(self, initializer=None, key=None):
         state = super().initial_state(initializer, key)
         return dataclasses.replace(state, scale=dataclasses.replace(state.scale, growth_interval=1))
@@ -256,8 +256,8 @@ def test_replay_preserves_half_precision_cotangents_and_integer_support():
         def loss(self, variables, batch, step):
             w = variables["params"]["w"]
             count = jnp.asarray(batch["y"].size)
-            prediction = Mean(((w - 1) ** 2 * count).astype(jnp.float16), count)
-            row = Mean(((w + 3) ** 2).astype(jnp.float16), jnp.asarray(1))
+            prediction = Ratio(((w - 1) ** 2 * count).astype(jnp.float16), count)
+            row = Ratio(((w + 3) ** 2).astype(jnp.float16), jnp.asarray(1))
             return Terms(prediction, row, jnp.zeros(3, jnp.float16),
                          jnp.zeros(3, jnp.int32), jnp.asarray(0)), Aux({})
     train = Trainer(Half(), optax.sgd(.1), key=jax.random.PRNGKey(1), accumulation=2)

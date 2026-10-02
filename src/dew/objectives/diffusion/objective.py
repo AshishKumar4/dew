@@ -34,7 +34,7 @@ from dew.nn.autoencoders import AutoEncoder
 from dew.nn.autoencoders.api import ModuleAutoEncoder
 from dew.nn.autoencoders.kl import AutoencoderKL, posterior_latent
 from dew.nn.mp import Uncertainty
-from dew.objectives.base import Aux, EMASpec, Mean, Objective, Step, Variables, under
+from dew.objectives.base import Aux, EMASpec, Objective, Ratio, Step, Variables, under
 from dew.objectives.diffusion.alignment import ALIGNMENT, REPRESENTATION, Alignment
 from dew.objectives.diffusion.end_to_end import AUTOENCODER, LATENT_STATS, EndToEnd
 from dew.registry import objectives
@@ -103,7 +103,7 @@ class TunedLatents(NamedTuple):
 
 
 @objectives("diffusion")
-class DiffusionObjective(Objective[Mean]):
+class DiffusionObjective(Objective[Ratio]):
     """Denoising diffusion: sample a noise level, corrupt, predict, weight."""
 
     def __init__(
@@ -378,7 +378,7 @@ class DiffusionObjective(Objective[Mean]):
             metrics["alignment"] = aligned
             total = total + self.alignment.weight / 2 * aligned * mass
         if self.end_to_end is None or end_to_end is None:
-            return Mean(total, mass), Aux(metrics=metrics)
+            return Ratio(total, mass), Aux(metrics=metrics)
         # The autoencoder's update: its regularizer and the alignment of its
         # latent, read through the frozen model and projector in evaluation
         # mode (the batch norm on its running statistics, no condition
@@ -392,7 +392,7 @@ class DiffusionObjective(Objective[Mean]):
         assert through is not None
         metrics.update(end_to_end.terms, autoencoder_alignment=through)
         total = total + (end_to_end.regularizer + self.end_to_end.align_weight * through) * mass
-        return Mean(total, mass), Aux(metrics=metrics, variables={LATENT_STATS: end_to_end.statistics})
+        return Ratio(total, mass), Aux(metrics=metrics, variables={LATENT_STATS: end_to_end.statistics})
 
     def _denoised(self, params, variables, samples, t, noise, call, images):
         """The per-element denoising loss at `(t, noise)` and, under

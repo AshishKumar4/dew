@@ -55,9 +55,9 @@ from dew.objectives.base import (
     Effects,
     Initializer,
     Loss,
-    Mean,
     Metric,
     Objective,
+    Ratio,
     Shown,
     Step,
     Variables,
@@ -1067,7 +1067,7 @@ class Trainer(Generic[Loss, Effects]):
         if self.accumulation == 1 or self.step is not None or state.accumulation is not None:
             return state
         stats, aux = shapes
-        shared = isinstance(stats, (Mean, jax.ShapeDtypeStruct))
+        shared = isinstance(stats, (Ratio, jax.ShapeDtypeStruct))
         mean_dtype = jnp.result_type(jnp.float32, *(x.dtype for x in jax.tree.leaves(stats)))
         slots = self.accumulation - 1
         def shape(leaf: jax.Array) -> jax.ShapeDtypeStruct:

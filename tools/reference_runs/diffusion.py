@@ -194,7 +194,7 @@ def dew_side(args, images, total, attention):
     from dew.diffusion.schedules import expand
     from dew.diffusion.transforms import broadcast_rates
     from dew.inputs import Field, InputSpec, unit_range
-    from dew.objectives.base import Aux, Mean
+    from dew.objectives.base import Aux, Ratio
     from dew.objectives.diffusion import DiffusionObjective
     from dew.registry import models
     from dew.training import MeshSpec, Trainer
@@ -214,7 +214,7 @@ def dew_side(args, images, total, attention):
             preds = self.process.prediction.pred_transform(noisy, preds, rates, t)
             losses = optax.l2_loss(preds, target)
             weights = expand(self.process.weight(t), losses)
-            return Mean(jnp.sum(losses * weights),
+            return Ratio(jnp.sum(losses * weights),
                         jnp.asarray(losses.size, jnp.promote_types(losses.dtype, jnp.float32))), Aux(metrics={})
 
     from dew.registry import with_precision
