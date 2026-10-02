@@ -15,7 +15,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.inference.banks import HeldBanks, host_banked
+from dew.inference.banks import HeldBanks
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.sharding import pipeline_microbatches
@@ -138,7 +138,7 @@ def test_replay_on_banked_weights_scores_as_on_the_plain_tree(layout):
     params = plain.init(jax.random.key(0))
     tokens = tokens_of(2)
     routed = (engine_layout(choices(plain, params, tokens), 2) + 1) % EXPERTS
-    store = host_banked(banked.model, HeldBanks(params), layout=layout)
+    store = HeldBanks(params).place(banked.model, layout=layout)
     expected = replayed_log_probs(plain, params, tokens, (routed, None))
     np.testing.assert_allclose(replayed_log_probs(banked, store, tokens, (routed, None)), expected, atol=1e-5)
     assert float(jnp.max(jnp.abs(expected - plain.per_token_log_probs(params, tokens)))) > 1e-3

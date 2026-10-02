@@ -26,7 +26,7 @@ import numpy as np
 import tyro
 
 import dew.nn.backbones  # noqa: F401  (registers the kind)
-from dew.inference.banks import SafetensorsBanks, stream_banked
+from dew.inference.banks import SafetensorsBanks
 from dew.interop.hf_decoders import translate_config
 from dew.objectives.base import merge
 from dew.registry import models, with_precision
@@ -97,7 +97,7 @@ def measure(config: DiskConfig):
         built = with_precision("causal_transformer", record, dtype=config.dtype, attention_impl="xla")
         model = models.build("causal_transformer", {**built, "scan_layers": True,
                                                    "bank_layers": config.bank_layers})
-        variables = stream_banked(model, source, mesh=MeshSpec().build([device]),
+        variables = source.stream(model, mesh=MeshSpec().build([device]),
                                    layout=Layout(min_shard=1, tolerance=1.0))
         print("non-decoder weights loaded", resident_status(), file=sys.stderr, flush=True)
         weight_bytes = sum(math.prod(leaf.shape) * np.dtype(leaf.dtype).itemsize
