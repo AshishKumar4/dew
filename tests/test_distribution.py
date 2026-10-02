@@ -309,6 +309,36 @@ def test_a_gpu_process_keeps_its_temporaries_one_free_block(flags, kept):
 
 
 @pytest.mark.mesh(devices=0)
+@pytest.mark.skipif(not hasattr(os, "sched_setaffinity"), reason="pins the child to four cores")
+def test_eight_cpu_devices_on_four_cores_run_collectives_ahead_of_the_host():
+    """A loop that dispatches collective steps faster than eight simulated
+    CPU devices run them fills each device's 32 computations in flight. XLA:CPU
+    then blocks the next launch's dispatch on the pool that runs the devices,
+    and with a thread per device, a 4-core runner's pool, the launch it waits
+    for never gets its eighth: the rendezvous aborted the process after 40 s,
+    as tests/test_discrete.py's toy run did on CI. The suite's environment
+    (`configure_lane`) gives that pool room for both."""
+    if os.environ["JAX_PLATFORMS"] != "cpu":
+        pytest.skip("the CPU lane's simulated devices")
+    cores = sorted(os.sched_getaffinity(0))[:4]
+    program = (f"import os\nos.sched_setaffinity(0, {cores})\n"
+               "import jax, jax.numpy as jnp\n"
+               "from jax.sharding import Mesh, NamedSharding, PartitionSpec as P\n"
+               "rows = NamedSharding(Mesh(jax.devices(), ('d',)), P('d'))\n"
+               "step = jax.jit(lambda x: x / jnp.sum(jnp.tanh(x @ x.T)), out_shardings=rows)\n"
+               "x = jax.device_put(jnp.ones((8 * 256, 256), jnp.float32), rows)\n"
+               "for _ in range(400):\n"
+               "    x = step(x)\n"
+               "x.block_until_ready()\n"
+               "print('devices', jax.device_count())\n")
+    done = subprocess.run([sys.executable, "-c", program], cwd=REPO_ROOT,
+                          env={**os.environ, "PYTHONPATH": str(REPO_ROOT / "src")},
+                          capture_output=True, text=True, timeout=120)
+    assert done.returncode == 0, done.stdout + done.stderr[-3000:]
+    assert "devices 8" in done.stdout, done.stdout
+
+
+@pytest.mark.mesh(devices=0)
 def test_one_slurm_task_joins_no_pool():
     """srun with one task sets SLURM_JOB_ID, and JAX's Slurm detection then
     starts a one-process pool whose coordinator is the node's name. A
