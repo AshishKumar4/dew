@@ -257,7 +257,7 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
                         assert batch is not None
                         loss_batch = batch
                         loss_variables = context.ema if context.ema is not None and not objective._ema_is_reference else variables
-                        statistics, _ = agreed(f"validation loss batch {scored}", lambda: objective._validation_loss(
+                        statistics = agreed(f"validation loss batch {scored}", lambda: objective._validation_loss(
                             loss_variables, loss_batch, replace(context, key=jax.random.fold_in(score_key, scored))))
                         statistics = collective_host(statistics, phase=f"validation loss batch {scored}")
                         loss_stats = statistics if loss_stats is None else jax.tree.map(
