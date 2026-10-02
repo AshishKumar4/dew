@@ -17,8 +17,26 @@ export class SnapshotLab extends DurableObject<Env> {
 	}
 
 	async status(): Promise<unknown> {
-		return { running: this.container.running, state: await this.ctx.storage.get('state'),
-			 snapshot: await this.ctx.storage.get('snapshot') };
+		let state = await this.ctx.storage.get<{ stage?: string; commit?: string }>('state');
+		if (state?.stage === 'preparing') {
+			if (!this.container.running) {
+				state = { ...state, stage: 'container-stopped' };
+				await this.ctx.storage.put('state', state);
+			} else {
+				const process = await this.container.exec(['sh', '-c',
+					'if test -f /root/setup.exit; then cat /root/setup.exit; else echo running; fi; ' +
+					'tail -c 8000 /root/setup.log 2>/dev/null || true']);
+				const output = await process.output();
+				const text = new TextDecoder().decode(output.stdout);
+				const end = text.indexOf('\n');
+				const code = text.slice(0, end);
+				const report = { ...state, stage: code === 'running' ? 'preparing' : code === '0' ? 'prepared' : 'failed',
+					exitCode: code === 'running' ? null : Number(code), log: text.slice(end + 1) };
+				await this.ctx.storage.put('state', report);
+				state = report;
+			}
+		}
+		return { running: this.container.running, state, snapshot: await this.ctx.storage.get('snapshot') };
 	}
 
 	/** The only boot target is Cloudflare's managed base, or this lab's own snapshot. */
@@ -38,7 +56,7 @@ export class SnapshotLab extends DurableObject<Env> {
 		const process = await this.container.exec(['sh', '-c', 'uname -m; node --version; cat /etc/os-release']);
 		const result = await process.output();
 		const state = { restore, startupSeconds: (Date.now() - started) / 1000,
-			exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr };
+			exitCode: result.exitCode, stdout: new TextDecoder().decode(result.stdout), stderr: new TextDecoder().decode(result.stderr) };
 		await this.ctx.storage.put('state', state);
 		return state;
 	}
@@ -47,27 +65,23 @@ export class SnapshotLab extends DurableObject<Env> {
 	async prepare(commit: string): Promise<unknown> {
 		if (!/^[0-9a-f]{40}$/.test(commit)) throw new Error('a full project commit is required');
 		if (!this.container.running) throw new Error('start the managed base first');
+		const state = await this.ctx.storage.get<{ stage?: string }>('state');
+		if (state?.stage === 'preparing') throw new Error('preparation is already running');
 		const process = await this.container.exec(['sh', '-c',
-			'set -eu; apt-get update; apt-get install -y --no-install-recommends ca-certificates curl; ' +
-			'curl -fsSL "https://raw.githubusercontent.com/AshishKumar4/dew/$1/site/live/container/setup-managed.sh" ' +
-			'-o /root/setup-managed.sh; sh /root/setup-managed.sh "$1"', 'setup', commit]);
+			'set -eu; rm -f /root/setup.exit; ' +
+			'nohup sh -c \'timeout 1200 sh -c "apt-get update && ' +
+			'apt-get install -y --no-install-recommends ca-certificates curl && ' +
+			'curl -fsSL https://raw.githubusercontent.com/AshishKumar4/dew/$1/site/live/container/setup-managed.sh ' +
+			'-o /root/setup-managed.sh && sh /root/setup-managed.sh $1"; ' +
+			'echo $? > /root/setup.exit\' setup "$1" > /root/setup.log 2>&1 </dev/null &', 'setup', commit],
+			{ stdout: 'ignore', stderr: 'ignore' });
+		if (await process.exitCode !== 0) throw new Error('could not launch preparation');
 		await this.ctx.storage.put('state', { stage: 'preparing', commit });
-		// Drain both pipes as they run; keep only bounded tails in Worker memory.
-		const read = async (stream: ReadableStream | null): Promise<string> => {
-			if (!stream) return '';
-			let tail = '';
-			for await (const chunk of stream.pipeThrough(new TextDecoderStream())) tail = (tail + chunk).slice(-8000);
-			return tail;
-		};
-		this.ctx.waitUntil((async () => {
-			const [stdout, stderr, exitCode] = await Promise.all([read(process.stdout), read(process.stderr), process.exitCode]);
-			await this.ctx.storage.put('state', { stage: exitCode === 0 ? 'prepared' : 'failed', commit,
-				exitCode, stdout, stderr });
-		})());
 		return { stage: 'preparing', commit };
 	}
 
 	async snapshot(): Promise<unknown> {
+		await this.status();
 		const state = await this.ctx.storage.get<{ stage?: string }>('state');
 		if (state?.stage !== 'prepared') throw new Error('setup must complete before snapshotting');
 		const started = Date.now();
