@@ -108,9 +108,13 @@ def described(value, annotation):
 
 
 def snapshot_default(field: dataclasses.Field, annotation):
-    """What a record lacking `field` reads as. A factory other than a class
-    or a lambda computes its default where it runs (the compilation cache is
-    under the user's home), so the snapshot names the factory."""
+    """What a record lacking `field` reads as: its `legacy` value when the
+    default moved after runs were recorded, else the default. A factory
+    other than a class or a lambda computes its default where it runs (the
+    compilation cache is under the user's home), so the snapshot names the
+    factory."""
+    if "legacy" in field.metadata:
+        return described(field.metadata["legacy"], annotation)
     factory = field.default_factory
     if factory is not dataclasses.MISSING and not isinstance(factory, type) and factory.__name__ != "<lambda>":
         value = factory()
@@ -122,15 +126,17 @@ def snapshot_default(field: dataclasses.Field, annotation):
 
 def recorded_defaults() -> dict[str, dict[str, object]]:
     """Every config class a run record reaches, from each run config Dew and
-    its recipes declare, and every registered model, whose fields a record
-    holds only where the run set them (`ModelConfig.config`), by module path:
+    its recipes declare, and every registered model, tower and projector,
+    whose fields a record holds only where the run set them, by module path:
     each recorded field's default as `snapshot_default` holds it. Flax's own
     `parent` and `name` are not a model's configuration."""
     import dew.nn.backbones  # noqa: F401  registers every model
 
     roots = [RunConfig, DiffusionRunConfig, LMRunConfig,
              recipe_config("lm", "LmRunConfig"), recipe_config("jepa", "JepaRunConfig"),
-             *(model for model in registry.models.values() if isinstance(model, type))]
+             *(model for model in registry.models.values() if isinstance(model, type)),
+             *(tower for tower in registry.towers.values() if isinstance(tower, type)),
+             *(projector for projector in registry.projectors.values() if isinstance(projector, type))]
     found: dict[str, dict[str, object]] = {}
     pending = list(roots)
     while pending:
@@ -190,6 +196,15 @@ def test_a_changed_model_default_fails_the_snapshot(monkeypatch):
         test_every_recorded_default_is_the_one_older_runs_were_recorded_under()
 
 
+def test_a_changed_tower_default_fails_the_snapshot(monkeypatch):
+    from dew.nn.vision import Gemma4Vision
+
+    field = next(field for field in dataclasses.fields(Gemma4Vision) if field.name == 'head_dim')
+    monkeypatch.setattr(field, 'default', 64)
+    with pytest.raises(AssertionError, match=r'Gemma4Vision.head_dim'):
+        test_every_recorded_default_is_the_one_older_runs_were_recorded_under()
+
+
 def contains(written, published) -> bool:
     """Whether every value `published` records is in `written` unchanged."""
     if isinstance(published, dict):
@@ -223,6 +238,29 @@ def test_a_run_with_a_regime_keeps_it_and_its_autoencoder():
     run = DiffusionRunConfig.load(str(RUNS / "hybrid-dit-176m-dfa94d6"))
     assert run.preset.regime == "latent" and run.preset.lognormal() == (-0.4, 1.0)
     assert run.autoencoder == PretrainedAutoencoder(modelname="pcuenq/sd-vae-ft-mse-flax", revision="main")
+
+
+def test_an_lm_record_without_ema_decay_keeps_the_average_it_was_written_under():
+    """An LM run keeps no EMA unless it asks for one, and records that
+    choice; a record that lacks `ema_decay` was written when every LM run
+    kept a 0.999 average, and it reads back as one."""
+    for config in (LMRunConfig, recipe_config("lm", "LmRunConfig")):
+        assert config().ema_decay is None
+        written = json.loads(json.dumps(config().to_dict()))
+        assert written["ema_decay"] is None
+        assert config.from_dict(written).ema_decay is None
+        assert config.from_dict({**written, "ema_decay": 0.99}).ema_decay == 0.99
+        del written["ema_decay"]
+        assert config.from_dict(written).ema_decay == 0.999
+
+
+def test_a_changed_legacy_value_fails_the_snapshot(monkeypatch):
+    """A field whose default moved holds what older records meant as its
+    `legacy` value, and the snapshot reads that one."""
+    field = next(field for field in dataclasses.fields(LMRunConfig) if field.name == "ema_decay")
+    monkeypatch.setattr(field, "metadata", {"legacy": 0.99})
+    with pytest.raises(AssertionError, match=r"LMRunConfig.ema_decay: 0.999 -> 0.99"):
+        test_every_recorded_default_is_the_one_older_runs_were_recorded_under()
 
 
 def test_an_unknown_field_is_refused():

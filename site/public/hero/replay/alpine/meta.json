@@ -1,0 +1,69 @@
+{
+ "prompt": "a turquoise alpine lake surrounded by pine trees and rugged mountains",
+ "seed": 3,
+ "sampler": "DPMSolverMultistep",
+ "steps": 40,
+ "cfg": 6.0,
+ "guidance_interval": [
+  0.15,
+  0.9
+ ],
+ "negative_prompt": "letterbox, white border, black border, border, frame, blurry, text, watermark, lowres, collage",
+ "batch_prompts": [
+  "a turquoise alpine lake surrounded by pine trees and rugged mountains",
+  "a bamboo forest with golden sunlight streaming between tall green stalks",
+  "an iceberg floating in a deep blue arctic sea beneath a pink sunset",
+  "a canyon with towering red rock cliffs and a winding river at sunset"
+ ],
+ "batch_row": 0,
+ "model": {
+  "model": "dewml/hybrid-dit-176m, loaded with dew.sampling.TextToImage.from_run",
+  "parameters": 175640848,
+  "dew_commit": "1bdb25dc88ab64df00ad41550d5a22a8e70edf52",
+  "device": "NVIDIA GeForce RTX 4080"
+ },
+ "frames": 32,
+ "kept_steps": [
+  0,
+  1,
+  3,
+  4,
+  5,
+  6,
+  8,
+  9,
+  10,
+  11,
+  13,
+  14,
+  15,
+  16,
+  18,
+  19,
+  20,
+  21,
+  23,
+  24,
+  25,
+  26,
+  28,
+  29,
+  30,
+  31,
+  33,
+  34,
+  35,
+  36,
+  38,
+  39
+ ],
+ "columns": 8,
+ "crop": [
+  0,
+  42,
+  256,
+  213
+ ],
+ "width": 256,
+ "height": 171
+}

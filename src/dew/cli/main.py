@@ -36,8 +36,9 @@ class Export:
     """The run directory: `run.json` beside its checkpoints."""
     destination: Positional[str]
     """Where the export lands; created if it is not there."""
-    ema: bool = True
-    """Read the run's averaged weights, where it kept them."""
+    ema: bool | None = None
+    """Read the run's averaged weights: unset where it kept them, True
+    always, False never."""
     step: int | None = None
     """Which checkpoint to read; unset takes the latest."""
 

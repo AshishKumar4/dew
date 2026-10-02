@@ -24,12 +24,15 @@ QWEN35_CALIBRATION_LENGTH = 12
 QWEN35_CALIBRATION_KEY_DIM = 12
 
 
-def rounding_bound(config, reference):
+def rounding_bound(config, reference, *, image=False):
     text = config.get_text_config()
     scale = float(np.max(np.abs(reference)))
     epsilon = np.finfo(np.float32).eps
+    # Image logits traverse the vision encoder's blocks before the decoder.
+    vision = config.vision_config.to_dict() if image else {}
+    layers = text.num_hidden_layers + int(vision.get('num_hidden_layers', vision.get('depth', 0)))
     if config.model_type not in ('qwen3_5', 'qwen3_5_moe'):
-        return float(2 * _ROUNDING * epsilon * text.num_hidden_layers * scale)
+        return float(2 * _ROUNDING * epsilon * layers * scale)
     def gamma(terms):
         unit_roundoff = epsilon / 2
         return terms * unit_roundoff / (1 - terms * unit_roundoff)
@@ -72,7 +75,7 @@ def check_checkpoint(checkpoint, output, revision=None):
         inputs = loaded.processor.from_hf({name: value.numpy() for name, value in batch.items()})
         actual = np.asarray(model.apply(loaded.variables, inputs.tokens, **inputs.kwargs()))
         error = float(np.max(np.abs(actual - expected[index])))
-        bound = rounding_bound(config, expected[index])
+        bound = rounding_bound(config, expected[index], image=index == 1)
         argmax = bool(np.array_equal(actual.argmax(-1), expected[index].argmax(-1)))
         generated = loaded.text_generation()(inputs, 3, key=jax.random.key(0), sampling=Sampling(temperature=0))
         agreement = bool(np.array_equal(np.asarray(generated.tokens)[:, -3:], continuations[index]))
@@ -87,7 +90,9 @@ def check_checkpoint(checkpoint, output, revision=None):
     revision = config._commit_hash or revision or (metadata.read_text().splitlines()[0] if metadata.is_file() else None)
     result = {'checkpoint': checkpoint, 'revision': revision,
               'dtype': 'float32', 'precision': 'highest', 'tf32': False,
-              'bound': 'Qwen3.5 fixture calibration, linear token count and gamma_key_dim scaling',
+              'bound': ('Qwen3.5 fixture calibration, linear token count and gamma_key_dim scaling'
+                        if config.model_type in ('qwen3_5', 'qwen3_5_moe') else
+                        'verified-mapping rounding per transformer block, including vision blocks for images'),
               'device': jax.devices()[0].device_kind, 'observations': observations}
     Path(output).write_text(json.dumps(result, indent=2) + '\n')
     print(json.dumps(result, indent=2), flush=True)

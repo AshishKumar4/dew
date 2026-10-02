@@ -196,7 +196,8 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         self.trainable = trainable
         self.head_chunks = head_chunks
 
-    def pipeline(self, state: TrainState, *, ema: bool = True, processor: Processor | None = None) -> BlockGeneration:
+    def pipeline(self, state: TrainState, *, ema: bool | None = None,
+                 processor: Processor | None = None) -> BlockGeneration:
         """Publish the state's weights as a `BlockGeneration` task.
 
         The sampler keeps the published defaults, and the tokenizer's EOS
