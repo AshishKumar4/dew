@@ -423,7 +423,7 @@ def cpu_smoke_cases() -> list[Case]:
                     "tower": {"kind": "siglip", "hidden_size": 32, "intermediate_size": 64,
                               "num_layers": 1, "num_heads": 2, "image_size": 16,
                               "patch_size": 8},
-                    "projector": {"kind": "gemma", "vision_width": 32, "text_width": 32,
+                    "projector": {"kind": "gemma", "text_width": 32,
                                   "patches_per_side": 2, "tokens_per_side": 2}},
              batch_size=8, seq_len=15, fsdp_min_param_size=256),
         Case("diffusion_gemma", {**tiny_decoder, "layer_scalar": "frozen"},
@@ -521,7 +521,7 @@ def small_cases(dtype: str) -> list[Case]:
                     "tower": {"kind": "siglip", "hidden_size": 1152,
                               "intermediate_size": 4304, "num_layers": 4,
                               "num_heads": 16, "image_size": 448, "patch_size": 14},
-                    "projector": {"kind": "gemma", "vision_width": 1152, "text_width": 768,
+                    "projector": {"kind": "gemma", "text_width": 768,
                                   "patches_per_side": 32, "tokens_per_side": 16}},
              batch_size=8, seq_len=512),
         # The same decoder read both ways by the official DiffusionGemma

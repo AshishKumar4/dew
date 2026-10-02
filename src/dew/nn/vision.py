@@ -245,10 +245,9 @@ class GemmaProjectorModule(nn.Module):
 @projectors("gemma")
 @dataclasses.dataclass(frozen=True)
 class GemmaProjector(ProjectorBase):
-    """Gemma's projector fields: the trunk width, the decoder width, and the
-    patch grid pooled into the soft-token grid."""
+    """Gemma's projector fields: the decoder width and the patch grid pooled
+    into the soft-token grid."""
 
-    vision_width: int
     text_width: int
     patches_per_side: int
     tokens_per_side: int
@@ -552,9 +551,8 @@ class Llama4ProjectorModule(nn.Module):
 @projectors("llama4")
 @dataclasses.dataclass(frozen=True)
 class Llama4Projector(ProjectorBase):
-    """Llama 4's projector fields: the tower output width and the text width."""
+    """Llama 4's projector fields: the text width."""
 
-    vision_width: int
     text_width: int
 
     def build(self) -> nn.Module:
@@ -934,9 +932,8 @@ class Gemma4ProjectorModule(nn.Module):
 @projectors("gemma4")
 @dataclasses.dataclass(frozen=True)
 class Gemma4Projector(ProjectorBase):
-    """Gemma 4's projector fields: the tower width, the decoder width."""
+    """Gemma 4's projector fields: the decoder width and the norm epsilon."""
 
-    vision_width: int
     text_width: int
     norm_eps: float = 1e-6
 
@@ -1159,7 +1156,6 @@ class Qwen35Vision(TowerBase):
     patch_size: int = 16
     spatial_merge_size: int = 2
     temporal_patch_size: int = 2
-    out_hidden_size: int = 3584
     num_position_embeddings: int = 2304
 
     def build(self) -> nn.Module:
@@ -1636,7 +1632,7 @@ def translate_llama4_vision_config(hf_config: Mapping[str, object]) -> Mapping[s
 
 def translate_gemma_projector_config(vision: Mapping[str, object], text_width: int,
                                      mm_tokens_per_image: object) -> Mapping[str, object]:
-    """A Gemma wrapper's projector fields: trunk width, decoder width, grids."""
+    """A Gemma wrapper's projector fields: decoder width, grids."""
     if isinstance(mm_tokens_per_image, bool) or not isinstance(mm_tokens_per_image, int):
         raise ValueError(
             f"mm_tokens_per_image is {mm_tokens_per_image!r}, the soft-token count "
@@ -1654,7 +1650,6 @@ def translate_gemma_projector_config(vision: Mapping[str, object], text_width: i
             f"{patches} patches per side do not split over {side} soft tokens per side")
     return {
         "kind": "gemma",
-        "vision_width": records.integer(vision["hidden_size"], "hidden_size"),
         "text_width": int(text_width),
         "patches_per_side": patches,
         "tokens_per_side": side,
@@ -1662,14 +1657,9 @@ def translate_gemma_projector_config(vision: Mapping[str, object], text_width: i
     }
 
 
-def translate_llama4_projector_config(vision: Mapping[str, object],
-                                      text_width: int) -> Mapping[str, object]:
-    """A Llama 4 wrapper's projector fields: tower output width, text width."""
-    return {
-        "kind": "llama4",
-        "vision_width": records.integer(vision["projector_output_dim"], "projector_output_dim"),
-        "text_width": int(text_width),
-    }
+def translate_llama4_projector_config(text_width: int) -> Mapping[str, object]:
+    """A Llama 4 wrapper's projector fields: the text width."""
+    return {"kind": "llama4", "text_width": int(text_width)}
 
 
 _GEMMA4_VISION_TENSORS = {
@@ -1805,10 +1795,9 @@ def translate_gemma4_vision_config(hf_config: Mapping[str, object]) -> Mapping[s
 
 def translate_gemma4_projector_config(vision: Mapping[str, object],
                                       text_width: int) -> Mapping[str, object]:
-    """A Gemma 4 wrapper's projector fields: tower width, decoder width."""
+    """A Gemma 4 wrapper's projector fields: decoder width, norm epsilon."""
     return {
         "kind": "gemma4",
-        "vision_width": records.integer(vision["hidden_size"], "hidden_size"),
         "text_width": int(text_width),
         "norm_eps": records.number(vision.get("rms_norm_eps", 1e-6), "rms_norm_eps"),
     }
@@ -1913,7 +1902,6 @@ def translate_qwen35_vision_config(hf_config: Mapping[str, object]) -> Mapping[s
         "patch_size": records.integer(vision["patch_size"], "patch_size"),
         "spatial_merge_size": records.integer(vision.get("spatial_merge_size", 2), "spatial_merge_size"),
         "temporal_patch_size": records.integer(vision["temporal_patch_size"], "temporal_patch_size"),
-        "out_hidden_size": records.integer(vision["out_hidden_size"], "out_hidden_size"),
         "num_position_embeddings": table,
     }
 

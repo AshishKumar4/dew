@@ -255,8 +255,7 @@ class SD3Block(nn.Module):
                ("timestep_embedder_linear_1",): (None, "embed"),
                ("timestep_embedder_linear_2",): (None, "embed"),
                ("text_embedder_linear_1",): (None, "embed"),
-               ("text_embedder_linear_2",): (None, "embed")},
-              heuristic=(("pos_embed_proj",),))
+               ("text_embedder_linear_2",): (None, "embed")})
 class SD3Transformer(nn.Module):
     """Diffusers 0.34.0's `SD3Transformer2DModel` over Dew's interface.
 

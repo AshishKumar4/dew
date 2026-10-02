@@ -1028,7 +1028,7 @@ def _llama4_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     tower = vision_nn.translate_llama4_vision_config(hf_config)
     used.add("vision_config")
     projector = vision_nn.translate_llama4_projector_config(
-        tower, records.integer(text.get("emb_features"), "emb_features"))
+        records.integer(text.get("emb_features"), "emb_features"))
     image = _wrapper_token_id(hf_config, used, "image_token_index", "image_token_id")
     _wrapper_tokens(used)
     grid = _record_int(tower, "image_size") // _record_int(tower, "patch_size")
@@ -1068,7 +1068,7 @@ def _wrapper_audio(hf_config: Mapping[str, object], used: set, text_width: int) 
     projector: Mapping[str, object]
     if isinstance(encoder, audio_nn.Gemma4Audio):
         projector = vision_nn.translate_gemma4_projector_config(
-            {"hidden_size": encoder.output_proj_dims, "rms_norm_eps": encoder.rms_norm_eps}, text_width)
+            {"rms_norm_eps": encoder.rms_norm_eps}, text_width)
     else:
         slots = records.integer(hf_config.get("audio_soft_tokens_per_image"), "audio_soft_tokens_per_image")
         if slots < 1:

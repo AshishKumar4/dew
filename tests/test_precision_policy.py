@@ -271,7 +271,7 @@ def build_model(architecture, dtype="bfloat16"):
     return MultimodalTransformer(
         text, SiglipVision(hidden_size=16, intermediate_size=32, num_layers=1, num_heads=2,
                            image_size=8, patch_size=4),
-        GemmaProjector(vision_width=16, text_width=TINY["emb_features"],
+        GemmaProjector(text_width=TINY["emb_features"],
                        patches_per_side=2, tokens_per_side=1),
         family="gemma3", image_token_id=1,
         dtype=jnp.float64 if dtype == "float64" else resolve_dtype(dtype))

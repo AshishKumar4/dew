@@ -119,9 +119,7 @@ def test_llama4_projector_matches_the_reference_implementation():
     """fp32 parity on the tiny outer projector over the reference trunk
     output."""
     fixture = load_fixture("llama4-vision-tiny")
-    trunk = V.translate_llama4_vision_config(fixture["config"])
-    record = V.translate_llama4_projector_config(
-        trunk, fixture["projector"]["text_width"])
+    record = V.translate_llama4_projector_config(fixture["projector"]["text_width"])
     projector = projectors.from_record(record).build()
     variables = {"params": V.translate_llama4_projector_weights(
         fixture["projector_tensors"])}

@@ -14,14 +14,9 @@ plain Flax modules whose init returns arrays. The optimizer's
 moments and the EMA copy have paths ending in their parameter's, so one
 declaration reaches them as well.
 
-`heuristic` lists what a class leaves to the shape heuristic on purpose (a
-convolution, a state matrix, a projection with no side worth naming): their
-parameters are placed on their largest divisible axis. Each entry is a run
-of `fnmatch` patterns matched against consecutive names of the parameter
-path, so `("time_embed",)` covers every parameter under that module and
-`("up_dense_*",)` a numbered family. The coverage test in
-tests/test_architectures.py reports a declared or heuristic name that no
-parameter carries any more, so a renamed submodule fails there.
+A parameter no declaration names (a convolution, a state matrix, a
+projection with no side worth naming) takes the shape heuristic, which
+places it on its largest divisible axis.
 
 The mesh axis names live here too, with the readers of the mesh in context:
 `pipeline_stages` for the decoder's stage count, `microbatches` for the
@@ -41,10 +36,9 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import dataclasses
-import fnmatch
 import math
 import types
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 
 import jax
 import jax.numpy as jnp
@@ -189,9 +183,6 @@ LOGITS: LogicalAxes = ("activation_batch", "activation_length", "activation_voca
 
 DECLARED: dict[Suffix, LogicalAxes] = {}
 """Every decorated module's declarations, merged."""
-
-HEURISTIC: set[Suffix] = set()
-"""Runs of name patterns whose parameters take the shape heuristic on purpose."""
 
 @dataclasses.dataclass
 class Schedule:
@@ -510,11 +501,9 @@ def constrain(x: jax.Array, axes: LogicalAxes) -> jax.Array:
     return jax.lax.with_sharding_constraint(x, logical_spec(axes, x.shape))
 
 
-def logical_axes(declared: Mapping[Suffix, LogicalAxes], *,
-                 heuristic: Iterable[Suffix] = ()):
+def logical_axes(declared: Mapping[Suffix, LogicalAxes]):
     """Declare the parameter axes of the modules `cls` creates."""
     declared = {tuple(suffix): tuple(axes) for suffix, axes in declared.items()}
-    heuristic = tuple(tuple(suffix) for suffix in heuristic)
     for suffix, axes in declared.items():
         names = [name for name in axes if name is not None]
         repeated = sorted({name for name in names if names.count(name) > 1})
@@ -533,9 +522,6 @@ def logical_axes(declared: Mapping[Suffix, LogicalAxes], *,
                     f"{'/'.join(suffix)} is declared {axes} by {cls.__name__} and "
                     f"{held} elsewhere; one module path has one set of axes")
             DECLARED[suffix] = axes
-        HEURISTIC.update(heuristic)
-        cls.__logical_axes__ = declared
-        cls.__heuristic_axes__ = heuristic
         return cls
 
     return decorate
@@ -579,14 +565,3 @@ def declared_axes(path, ndim: int) -> LogicalAxes | None:
             f"{'/'.join(suffix)} is declared {axes}, which cannot name the "
             f"{ndim} dimensions of {'/'.join(parameter_path(path))}")
     return axes[len(axes) - ndim:]
-
-
-def is_heuristic(path) -> bool:
-    """Whether the parameter at `path` is one a module left to the shape heuristic."""
-    names = parameter_path(path)
-    for pattern in HEURISTIC:
-        for start in range(len(names) - len(pattern) + 1):
-            if all(fnmatch.fnmatchcase(name, glob)
-                   for name, glob in zip(names[start:], pattern, strict=False)):
-                return True
-    return False
