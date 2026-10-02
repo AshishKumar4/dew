@@ -426,7 +426,7 @@ def test_a_streamed_split_reports_no_length(jsonl):
 
 def _drawn(stream, batches):
     return [(int(i), int(d)) for batch in itertools.islice(stream, batches)
-            for i, d in zip(batch["index"], batch["draw"])]
+            for i, d in zip(batch["index"], batch["draw"], strict=True)]
 
 
 def test_an_unshuffled_streamed_split_resumes_on_the_record_it_stopped_at(jsonl):
@@ -526,7 +526,7 @@ def test_a_streamed_row_is_transformed_by_its_own_rng(jsonl):
         stream = data.train(DataPartition())
         try:
             return [(int(i), int(d)) for batch in itertools.islice(stream, 3)
-                    for i, d in zip(batch["index"], batch["draw"])]
+                    for i, d in zip(batch["index"], batch["draw"], strict=True)]
         finally:
             stream.close()
 

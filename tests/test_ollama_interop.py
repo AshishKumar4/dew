@@ -365,7 +365,7 @@ def test_the_daemon_reports_dews_own_logprobs(imported, client):
 
         logits = np.asarray(loaded.model.apply(
             loaded.variables, jnp.asarray([head + theirs], jnp.int32)))[0]
-        for offset, (token, entry) in enumerate(zip(theirs, reported)):
+        for offset, (token, entry) in enumerate(zip(theirs, reported, strict=True)):
             row = logits[len(head) + offset - 1].astype(np.float64)
             ours = float(row[token] - (np.log(np.exp(row - row.max()).sum()) + row.max()))
             worst = max(worst, abs(ours - float(entry.logprob)))

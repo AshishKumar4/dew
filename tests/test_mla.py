@@ -243,7 +243,7 @@ def test_auto_and_the_reference_agree_on_the_mla_gradients(name):
         mla_module(settings, attention_impl="auto"), variables, hidden))
     largest = max(float(np.max(np.abs(np.asarray(leaf)))) for leaf in reference)
     difference = max(float(np.max(np.abs(np.asarray(a) - np.asarray(b))))
-                     for a, b in zip(reference, auto))
+                     for a, b in zip(reference, auto, strict=True))
     assert difference < 1e-6 * largest
 
 

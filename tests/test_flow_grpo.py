@@ -334,7 +334,7 @@ def test_multihost_flow_rollout_reassembles_owned_groups(tmp_path):
         text=True, start_new_session=True) for rank, output in enumerate(outputs)]
     try:
         reports = [report_of(process, output, timeout=120)
-                   for process, output in zip(running, outputs)]
+                   for process, output in zip(running, outputs, strict=True)]
     finally:
         for process in running:
             if process.poll() is None:
@@ -356,7 +356,7 @@ def test_multihost_flow_rollout_reassembles_owned_groups(tmp_path):
     assert reports[0]["metric_rows"] == 4 and reports[0]["preview_rows"] == 4
     assert reports[1]["metric_rows"] == 0 and reports[1]["preview_rows"] == 0
     assert reports[0]["validation_mean"] == pytest.approx(baseline["validation_mean"], abs=1e-6)
-    for report, output in zip(reports, outputs):
+    for report, output in zip(reports, outputs, strict=True):
         np.testing.assert_allclose(report["global_advantages"], expected_advantages, atol=2e-5)
         np.testing.assert_array_equal(report["global_rewards"], raw_callback.astype(np.float32))
         assert not report["x64_enabled"]

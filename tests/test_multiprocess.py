@@ -140,7 +140,7 @@ def run_pool(mode, directory: Path, processes: int, *, timeout=600, **flags) -> 
               **flags)
         for index, out in enumerate(outs)]
     try:
-        return [report_of(process, out, timeout=timeout) for process, out in zip(running, outs)]
+        return [report_of(process, out, timeout=timeout) for process, out in zip(running, outs, strict=True)]
     finally:
         for process in running:
             if process.poll() is None:
@@ -693,7 +693,7 @@ def test_a_packed_pool_reads_the_windows_one_process_reads(tmp_path, packed_chec
                     run_dir=tmp_path / "pool-run", **flags)
 
     for step in range(POOL_STEPS):
-        rows = [row for held in zip(*(report["windows"][step] for report in pool))
+        rows = [row for held in zip(*(report["windows"][step] for report in pool), strict=True)
                 for row in held]
         assert rows == single["windows"][step], f"step {step} read other windows"
 

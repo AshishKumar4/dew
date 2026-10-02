@@ -286,7 +286,7 @@ def test_native_sd3_agrees_across_a_sequence_sharded_mesh(source):
     whole, split = run(MeshSpec(fsdp=4)), run(MeshSpec(fsdp=2, sequence=2))
     assert relative_gap(split[0], whole[0]) < 1e-5
     gaps = [relative_gap(a, b) for a, b in zip(jax.tree.leaves(split[1]),
-                                               jax.tree.leaves(whole[1]))]
+                                               jax.tree.leaves(whole[1]), strict=True)]
     assert max(gaps) < 1e-5, max(gaps)
 
 

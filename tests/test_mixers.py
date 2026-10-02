@@ -62,7 +62,7 @@ def test_none_and_the_attention_value_build_the_same_tree():
     explicit = tiny(mixer=AttentionMixer()).init(jax.random.key(0), ids)
 
     assert jax.tree.structure(default) == jax.tree.structure(explicit)
-    for left, right in zip(jax.tree.leaves(default), jax.tree.leaves(explicit)):
+    for left, right in zip(jax.tree.leaves(default), jax.tree.leaves(explicit), strict=True):
         assert jnp.array_equal(left, right)
 
 

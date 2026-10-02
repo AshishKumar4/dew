@@ -99,7 +99,7 @@ def main() -> None:
     change = float(optax.tree.norm(jax.tree.map(
         lambda a, b: a - b, final.params["params"], initial.params["params"])))
     frozen = all(np.array_equal(np.asarray(a), np.asarray(b))
-                 for a, b in zip(jax.tree.leaves(final.ema), jax.tree.leaves(initial.ema)))
+                 for a, b in zip(jax.tree.leaves(final.ema), jax.tree.leaves(initial.ema), strict=True))
     params = collective_host(final.params["params"], phase="flow test parameters")
     np.savez(output.with_suffix(".npz"), **{
         jax.tree_util.keystr(path): np.asarray(value)

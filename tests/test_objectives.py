@@ -206,7 +206,7 @@ def test_the_initializer_and_init_return_the_same_tree():
         key = jax.random.key(4)
         direct, through = objective.init(key), objective.initializer(key)
         assert jax.tree.structure(direct) == jax.tree.structure(through)
-        for left, right in zip(jax.tree.leaves(direct), jax.tree.leaves(through)):
+        for left, right in zip(jax.tree.leaves(direct), jax.tree.leaves(through), strict=True):
             np.testing.assert_array_equal(left, right)
 
 

@@ -541,7 +541,7 @@ def test_fsdp_shards_parameters_and_optimizer_state():
         # Exactly the dimension the spec names is halved. Which dimension that
         # is belongs to the declarations, not to this test.
         split = [axis for axis, (whole, part) in enumerate(
-            zip(param.shape, local.shape)) if whole != part]
+            zip(param.shape, local.shape, strict=True)) if whole != part]
         assert len(split) == 1, f"{param.shape} -> {local.shape}"
         assert param.shape[split[0]] // 2 == local.shape[split[0]]
         assert param.sharding.spec[split[0]] == 'fsdp'
@@ -725,9 +725,9 @@ def test_accumulated_ema_matches_a_plain_run_at_equal_update_counts():
 
     # the comparison is only meaningful if the EMA left its starting point
     assert moved(snapshot(plain.params), snapshot(plain.ema))
-    for a, b in zip(jax.tree.leaves(plain.params), jax.tree.leaves(accumulated.params)):
+    for a, b in zip(jax.tree.leaves(plain.params), jax.tree.leaves(accumulated.params), strict=True):
         np.testing.assert_allclose(np.asarray(a), np.asarray(b), rtol=1e-6, atol=1e-7)
-    for a, b in zip(jax.tree.leaves(plain.ema), jax.tree.leaves(accumulated.ema)):
+    for a, b in zip(jax.tree.leaves(plain.ema), jax.tree.leaves(accumulated.ema), strict=True):
         np.testing.assert_allclose(np.asarray(a), np.asarray(b), rtol=1e-6, atol=1e-7)
 
 
