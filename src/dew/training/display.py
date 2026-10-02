@@ -40,6 +40,7 @@ from rich.table import Table
 from rich.text import Text
 
 from dew.logging import display_console
+from dew.nn.sharding import EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS
 from dew.objectives.base import Shown
 from dew.telemetry.records import FitStarted
 from dew.training.evaluation import Evaluation
@@ -235,6 +236,9 @@ class TrainingDisplay:
         self.title = model
         self.header = [("", f"{count(started.parameters)} parameters"), ("on", where)]
         if mesh:
+            splits = any(started.mesh.get(axis, 1) > 1 for axis in (EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS))
+            if splits:
+                mesh += f", {started.sharded:.0%} of the parameters' bytes split"
             self.header.append(("mesh", mesh))
         self.header += [("batch", str(batch)), ("", precision)]
         console = Console()

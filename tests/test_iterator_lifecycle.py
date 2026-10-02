@@ -21,7 +21,7 @@ from dew.artifacts import Representations
 from dew.data import DataPartition, Dataset
 from dew.data.dataset import tokenized
 from dew.data.tokens import bounded
-from dew.training import Checkpoints, ProfileWindow, Trainer, build_mesh
+from dew.training import Checkpoints, MeshSpec, ProfileWindow, Trainer
 from dew.training.distributed import DevicePrefetchIterator
 
 
@@ -71,7 +71,7 @@ class Source:
 def test_full_queue_close_preserves_consumed_position_and_releases_source():
     source = Source()
     ref = weakref.ref(source)
-    with DevicePrefetchIterator(source, build_mesh(), depth=1) as stream:
+    with DevicePrefetchIterator(source, MeshSpec().build(), depth=1) as stream:
         np.testing.assert_array_equal(np.asarray(next(stream)["x"]), 1)
         assert source.ahead.wait(5)
         stream.close()
@@ -89,7 +89,7 @@ def test_full_queue_close_preserves_consumed_position_and_releases_source():
 @pytest.mark.parametrize("failure", [None, ValueError("source failed")])
 def test_terminal_outcome_finalizes_with_a_full_data_queue(failure):
     source = Source(end=3, failure=failure)
-    with DevicePrefetchIterator(source, build_mesh(), depth=2) as stream:
+    with DevicePrefetchIterator(source, MeshSpec().build(), depth=2) as stream:
         assert int(np.asarray(next(stream)["x"])[0, 0]) == 1
         # Finalization must not depend on a consumer making room for EOF/error.
         assert source.closed.wait(5)
@@ -104,7 +104,7 @@ def test_terminal_outcome_finalizes_with_a_full_data_queue(failure):
 
 def test_early_close_discards_only_unconsumed_failure():
     source = Source(end=1, failure=ValueError("speculative read"))
-    with DevicePrefetchIterator(source, build_mesh(), depth=2) as stream:
+    with DevicePrefetchIterator(source, MeshSpec().build(), depth=2) as stream:
         next(stream)
         assert source.closed.wait(5)
     assert json.loads(stream.source_state) == {"position": 1}
@@ -112,7 +112,7 @@ def test_early_close_discards_only_unconsumed_failure():
 
 def test_restoration_and_position_capture_share_the_iteration_thread():
     source = Source(end=5)
-    with DevicePrefetchIterator(source, build_mesh(), source_state=b'{"position": 3}') as stream:
+    with DevicePrefetchIterator(source, MeshSpec().build(), source_state=b'{"position": 3}') as stream:
         assert int(np.asarray(next(stream)["x"])[0, 0]) == 4
         stream.close()
         assert json.loads(stream.source_state) == {"position": 4}
@@ -124,7 +124,7 @@ def test_unbounded_depth_is_rejected_without_taking_ownership():
     """depth 0 is the value queue.Queue reads as unbounded."""
     source = Source()
     with pytest.raises(ValueError, match="positive"):
-        DevicePrefetchIterator(source, build_mesh(), depth=0)
+        DevicePrefetchIterator(source, MeshSpec().build(), depth=0)
     assert not source.owners
     source.close()
 
@@ -140,7 +140,7 @@ def test_timeout_does_not_close_a_running_generator_and_can_be_rejoined():
         finally:
             closed.set()
 
-    stream = DevicePrefetchIterator(blocked(), build_mesh())
+    stream = DevicePrefetchIterator(blocked(), MeshSpec().build())
     consumer = threading.Thread(target=lambda: list(stream))
     consumer.start()
     try:
@@ -180,7 +180,7 @@ def test_tokenized_stop_interrupts_next_then_finalizes_on_its_owner():
             closed.set()
 
     wrapped = tokenized(lambda partition: Blocking(), None)(DataPartition())
-    with DevicePrefetchIterator(wrapped, build_mesh()) as stream:
+    with DevicePrefetchIterator(wrapped, MeshSpec().build()) as stream:
         consumer = threading.Thread(target=lambda: list(stream))
         consumer.start()
         try:
@@ -199,7 +199,7 @@ def test_source_close_failure_preserves_primary_and_is_reported_once(body_fails)
     primary = RuntimeError("body failed")
     source = Source(close_failure=cleanup)
     with pytest.raises((RuntimeError, OSError)) as raised:
-        with DevicePrefetchIterator(source, build_mesh()) as stream:
+        with DevicePrefetchIterator(source, MeshSpec().build()) as stream:
             next(stream)
             if body_fails:
                 raise primary
@@ -212,7 +212,7 @@ def test_source_close_failure_preserves_primary_and_is_reported_once(body_fails)
 def test_eof_reports_finalization_failure_instead_of_clean_exhaustion():
     cleanup = OSError("cannot finalize source")
     source = Source(end=0, close_failure=cleanup)
-    with DevicePrefetchIterator(source, build_mesh()) as stream:
+    with DevicePrefetchIterator(source, MeshSpec().build()) as stream:
         with pytest.raises(OSError) as raised:
             next(stream)
         assert raised.value is cleanup
@@ -360,7 +360,7 @@ def test_checkpointability_refusal_finalizes_the_untransferred_source(tmp_path):
 
 def test_constructor_starts_no_unowned_source_work():
     source = Source()
-    with DevicePrefetchIterator(source, build_mesh(), source_state=b'{"position": 2}'):
+    with DevicePrefetchIterator(source, MeshSpec().build(), source_state=b'{"position": 2}'):
         assert source.owners == []
     assert source.closed.is_set()
     assert source.position == 0
@@ -433,7 +433,7 @@ def test_wrapped_cancellation_reaches_source_during_finalization(limited):
         return Finalizing()
 
     wrapped = (bounded(opened, 1) if limited else tokenized(opened, None))(DataPartition())
-    stream = DevicePrefetchIterator(wrapped, build_mesh())
+    stream = DevicePrefetchIterator(wrapped, MeshSpec().build())
     consumer = threading.Thread(target=lambda: list(stream))
     consumer.start()
     try:
@@ -472,7 +472,7 @@ def test_failed_thread_creation_finalizes_the_unstarted_source(monkeypatch):
 
     monkeypatch.setattr(threading.Thread, "start", fail_start)
     with pytest.raises(RuntimeError) as caught:
-        with DevicePrefetchIterator(Source(), build_mesh()) as stream:
+        with DevicePrefetchIterator(Source(), MeshSpec().build()) as stream:
             next(stream)
     assert caught.value is failure
     assert owners == [threading.get_ident()]
@@ -505,13 +505,13 @@ def test_a_program_that_ends_without_closing_its_prefetcher_exits_cleanly():
     worker now stops at exit."""
     program = (
         "import numpy as np\n"
-        "from dew.training import MeshSpec, build_mesh\n"
+        "from dew.training import MeshSpec\n"
         "from dew.training.distributed import DevicePrefetchIterator\n"
         "batch = {'x': np.ones((2048, 4096), np.float32)}\n"
         "def endless():\n"
         "    while True:\n"
         "        yield batch\n"
-        "prefetch = DevicePrefetchIterator(endless(), build_mesh(MeshSpec()), depth=1)\n"
+        "prefetch = DevicePrefetchIterator(endless(), MeshSpec().build(), depth=1)\n"
         "for _ in range(20):\n"
         "    next(prefetch)\n")
     root = Path(__file__).resolve().parents[1]

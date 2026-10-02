@@ -10,3 +10,9 @@
 # package whose requirements name a URL. Return to the release once one ships
 # the fix.
 jax @ https://github.com/AshishKumar4/jax/archive/19a48d1decce77ee228334d56f7a9f78bf6f478b.tar.gz
+
+# tokamax main at 47d3d663 (2026-10-01), for `uv pip install tokamax -c
+# constraints.txt` (docs/installation.md). tokamax is not a dependency; its
+# latest release, 0.0.14, pins typeguard==2.13.3, which tyro's typeguard>=4
+# excludes. Return to a release once one ships without that pin.
+tokamax @ https://github.com/openxla/tokamax/archive/47d3d6632226298a4cf017c3a0bb997c27d1f2b5.tar.gz

@@ -6,7 +6,7 @@ FlaxDiff was an earlier name for Dew, when it was built around diffusion. Dew se
 
 | FlaxDiff area | Dew area | Change to account for |
 | --- | --- | --- |
-| `flaxdiff.models` | `dew.nn` and the `dew.models` registry | Build a registered model from its current fields; old constructor fields need review. |
+| `flaxdiff.models` | `dew.nn.backbones` | Build the model from its class with its current fields; old constructor fields need review. |
 | `flaxdiff.schedulers` and `flaxdiff.predictors` | `dew.diffusion.schedules` and `dew.diffusion.transforms` | A diffusion preset composes schedule, target, weighting, and preconditioning choices. A schedule alone does not describe the whole training convention. |
 | The diffusion trainer in `flaxdiff.trainer` | `dew.Trainer` plus `dew.objectives.diffusion.DiffusionObjective` | The objective owns diffusion-specific computation; the trainer owns updates, state placement, logging, and checkpoint orchestration. |
 | `flaxdiff.jepa` | `dew.objectives.jepa` and `dew.nn.backbones.jepa` | Encoder/predictor/target behavior belongs to the objective and its modules. |

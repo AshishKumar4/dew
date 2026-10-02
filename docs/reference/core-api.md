@@ -4,7 +4,7 @@ This page describes the main interfaces and the contracts between them, grouped 
 
 ## Objective
 
-Import `Objective`, `Aux`, `Step`, `Ratio`, `mean_loss`, and `scalar_loss` from `dew.objectives`.
+Import `Objective`, `Aux`, `Step` and `Ratio` from `dew.objectives`. `Ratio.mean()` reduces a ratio statistic, and `objective.scalar_loss(variables, batch, step)` evaluates and reduces a loss for direct differentiation.
 
 | Member | Contract |
 |---|---|
@@ -19,7 +19,7 @@ Import `Objective`, `Aux`, `Step`, `Ratio`, `mean_loss`, and `scalar_loss` from 
 
 `Step.step` counts accepted microbatches. Its `key` derives from consumed attempts, including rejected ones. `ema` holds selected averaged leaves overlaid onto the complete variables mapping, or `None`.
 
-`Aux(metrics, variables=None, qk_stats=None, effects=None)` carries training measurements, sequential mutable replacements, QK maxima and additive deferred effects. The trainer applies effects once on a supported optimizer commit. `scalar_loss(objective, variables, batch, step)` returns a scalar and the same Aux for direct JAX differentiation.
+`Aux(metrics, variables=None, qk_stats=None, effects=None)` carries training measurements, sequential mutable replacements, QK maxima and additive deferred effects. The trainer applies effects once on a supported optimizer commit. `objective.scalar_loss(variables, batch, step)` returns a scalar and the same Aux for direct JAX differentiation.
 
 ### Collections and EMA selection
 
@@ -46,10 +46,10 @@ Import these from `dew.training`:
 ```text
 MeshSpec(fsdp=1, expert=1, tensor=1, sequence=1, stage=1, microbatches=None, replicas=1)
 Layout(rules=DEFAULT_RULES, min_shard=65536, tolerance=0.02, host=(), host_parameters=())
-build_mesh(spec, devices=None)
+MeshSpec(...).build(devices=None)
 ```
 
-`build_mesh` uses the supplied devices or JAX's visible devices; the specified factors must divide their count, and data parallelism fills the remaining factor. Explicit pipeline microbatches require `stage > 1` and a positive multiple of the stage count. `replicas` above 1 builds a hybrid mesh whose data axis spans that many groups of granules (TPU slices, GPU hosts or NVLink domains, or processes where every device shares one slice), with every other axis inside a group; see [training on several nodes](../guides/multi-node.md#mesh-layout-across-nodes). A sequence axis above 1 splits every attention call's positions, and each call picks the all-to-all or the gather exchange from its shape.
+`MeshSpec.build` uses the supplied devices or JAX's visible devices; the specified factors must divide their count, and data parallelism fills the remaining factor. Explicit pipeline microbatches require `stage > 1` and a positive multiple of the stage count. `replicas` above 1 builds a hybrid mesh whose data axis spans that many groups of granules (TPU slices, GPU hosts or NVLink domains, or processes where every device shares one slice), with every other axis inside a group; see [training on several nodes](../guides/multi-node.md#mesh-layout-across-nodes). A sequence axis above 1 splits every attention call's positions, and each call picks the all-to-all or the gather exchange from its shape.
 
 `Layout.rules` accepts an ordered logical-axis rule sequence or a mapping of overrides. Mapping entries update the default table. When dimensions compete for one mesh axis, rule order determines precedence; a non-divisible dimension cannot use that axis. Valid parameter mesh axes are `fsdp`, `expert`, and `tensor`. `min_shard` counts elements, not bytes. `tolerance` is the permitted fraction of shardable parameter elements left replicated. `host` names train-state fields out of `params`, `opt_state` and `ema`. The named `opt_state` and `ema` stay in pinned host memory between steps and the step fetches them to the device. Naming `params` instead makes the CPU own the whole `TrainState`, including optimizer, EMA and accumulation: the optimizer transaction runs on a CPU companion of the mesh, and the runtime CPU device count must match the accelerator count on every process before JAX initializes. `host_parameters` holds glob patterns over logical parameter paths (`params/layers_*`) that an inference placement keeps in pinned host memory; only the `offloaded` placement reads them, and `check` refuses a layout that names them for any other placement. `shardings(mesh, tree)` returns a matching tree of placements; `check(params, shardings, mesh)` validates excessive replication. See [distributed training](../concepts/distributed.md).
 
@@ -128,7 +128,7 @@ Loading(workers=0, threads=64, read_buffer=128, worker_buffer=2)
 
 `from_records` reads records held in memory: a mapping of equal-length columns, a sequence of per-record mappings, or a source with `__len__` and `__getitem__`. Its training stream reshuffles from `seed` every epoch and saves a global record position; `validation` is one ordered pass of whole batches, and fewer records than one batch are refused. `from_grain` reads a Grain pipeline the caller built, in the caller's order.
 
-`train(partition)` opens a training iterator, and `val(partition)` opens one finite validation pass, or `val` is `None`. Each reads the share of every global batch the `DataPartition` names: the `index`th of `count` disjoint shares, which `readers` processes read alike; `reader` is which of them this process is. `dew.training.data_partition(mesh)` is the share a process reads on a mesh, and `DataPartition()` is every row. `records` is the known training-record count or `None`; `batch` is global. `steps_per_epoch` is integer division of records by batch, or `None`. `epoch_steps(epochs=1)` requires a finite record count. `ramp` is set when the run grows its batch over its first records; `batch` is then the batch the ramp ends at.
+`train(partition)` opens a training iterator, and `val(partition)` opens one finite validation pass, or `val` is `None`. Each reads the share of every global batch the `DataPartition` names: the `index`th of `count` disjoint shares, which `readers` processes read alike; `reader` is which of them this process is. `DataPartition.of(mesh)` is the share a process reads on a mesh, and `DataPartition()` is every row. `records` is the known training-record count or `None`; `batch` is global. `steps_per_epoch` is integer division of records by batch, or `None`. `epoch_steps(epochs=1)` requires a finite record count. `ramp` is set when the run grows its batch over its first records; `batch` is then the batch the ramp ends at.
 
 Each factory call must return a fresh, exclusively owned iterator. Ordinary `close()` is finalization and must not race `next()` or checkpoint operations. A source that needs to interrupt blocking reads may additionally implement `request_stop()`: a thread-safe, nonblocking, idempotent signal, safe alongside both `next()` and `close()`. Tokenized wrappers forward these operations.
 
@@ -183,7 +183,9 @@ Import `generate`, `Sampling` and `Generation` from `dew.sampling`:
 ```text
 generate(model, params, inputs, max_new_tokens, *, key=None,
          sampling=Sampling(), n=1, logits=None, stopping=None, strategy=None) -> Generation
-Sampling(temperature=1.0, top_k=None, eos_id=None, pad_id=0, top_p=1.0, min_p=0.0)
+Sampling(temperature=1.0, top_k=None, eos_id=None, pad_id=None, top_p=1.0, min_p=0.0,
+         repetition_penalty=1.0, presence_penalty=0.0, frequency_penalty=0.0,
+         no_repeat_ngram_size=0, min_new_tokens=0, typical_p=1.0, stop=())
 ```
 
 `params` is the complete variables tree. `inputs` is a `ModelInputs` from `dew.nn.inputs`, or an integer `(B, P)` array normalized to all-valid text. `ModelInputs.token_fields["attention_mask"]` identifies real token slots; there is no separate generation length argument. Every row needs a real token. Only real tokens count against `model.max_seq_len`. Conditioning arrays are batch-aligned and used during prefill; decode keeps the model's cached logical positions. `key` is an integer seed or a JAX key; `key=n` is `jax.random.key(n)`.
@@ -192,7 +194,7 @@ The compiled decoder uses one padded input shape with per-row cache cursors and 
 
 `n` is the number of continuations drawn per prompt and must be a positive integer. The continuations of a prompt share its prefill and then run one after another on the device, with the prompts of each continuation batched as before: decode time grows with `n`, one continuation's cache working memory is reused by the next, and only the output storage grows with `n`. A prompt's key is its global row key: continuation zero draws with that key, so `n=1` and continuation zero of a larger request are the same draw, and continuation `j` folds `j` into it, so raising `n` leaves the continuations already drawn unchanged. Row padding on a mesh pads prompts before the continuations exist, so a prompt's `n` rows stay together on the process that asked for them and `host()` drops only padded prompts' rows.
 
-`Sampling.eos_id` accepts an integer or a tuple of ids; any of them terminates a row. The value normalizes the ids into an immutable tuple. Stochastic selection applies temperature, top-k, nucleus top-p, then relative min-p filtering. At least one token survives. `top_p=1` and `min_p=0` disable their filters. Zero temperature selects argmax without filtering. A `Sampling` value is a convenience over the components below: it compiles to those four transforms, in that order, plus an EOS criterion, and `generate` appends them after whatever `logits` and `stopping` hold.
+`Sampling.eos_id` accepts an integer or a tuple of ids; any of them terminates a row. The value normalizes the ids into an immutable tuple. `Sampling` holds the common generation controls as one value, each at a default that changes nothing: the repetition penalty (Transformers' `RepetitionPenalty`, over the prompt and the draw), vLLM's presence and frequency penalties (over the drawn tokens), `no_repeat_ngram_size`, `min_new_tokens` (EOS held back, which needs an `eos_id`), and then temperature, top-k, nucleus top-p, relative min-p and typical-p filtering. `transforms()` compiles them in Transformers' `_get_logits_processor` order, which `dew.sampling.text.ordered_transforms` owns, with the penalties beside the repetition penalty where vLLM applies them; at least one token survives the filters. Zero temperature selects argmax and runs no filter. `stop` holds strings that end a row; they compile against a tokenizer's vocabulary, so `generate` refuses them and a `TextGeneration` compiles them through its processor. A `Sampling` value is a convenience over the components below: it compiles to those transforms plus the EOS criterion. `eos_id` and `pad_id` left `None` are a task's own when a task runs the policy; `generate` alone stops on no EOS unless one is named, and pads with 0.
 
 `Generation.tokens` includes the original prompt and has shape `(B * n, P + max_new_tokens)` with `B` the placed prompt rows, prompt zero's `n` continuations first and the prompts in request order. `lengths` counts response tokens including EOS. `terminated` marks EOS termination; false means the token budget. Slots after termination hold `Sampling.pad_id`. `behavior_log_probs` and `raw_log_probs` have shape `(B * n, max_new_tokens)`; the first describes the filtered distribution that drew each action and the second the unmodified policy. Each row carries its own length, termination and likelihoods. `rows` counts this process's real prompts times `n`; `host()` returns the record over host arrays of those rows; `text` decodes them through the processor a task bound, one string per row.
 
@@ -233,17 +235,15 @@ def favor_short(state, logits):
     return logits.at[:, 2].add(jnp.where(state.step >= 8, 3.0, 0.0))
 
 
-# The chain is complete, so the policy's own filters are written into it.
-drawn = generate(
-    model, variables, prompts, 32, key=0,
-    sampling=Sampling(eos_id=2, pad_id=0),
-    logits=(decoding.RepetitionPenalty(1.1),
-            decoding.NoRepeatNGram(3),
-            decoding.FrequencyPenalty(0.4),
-            favor_short,
-            decoding.Temperature(0.8),
-            decoding.TopP(0.9)),
-    stopping=(decoding.MaxNewTokens(24),))
+# The common controls are one value, compiled in Transformers' order.
+policy = Sampling(temperature=0.8, top_p=0.9, repetition_penalty=1.1, frequency_penalty=0.4,
+                  no_repeat_ngram_size=3, eos_id=2, pad_id=0)
+drawn = generate(model, variables, prompts, 32, key=0, sampling=policy,
+                 stopping=(decoding.MaxNewTokens(24),))
+
+# An explicit chain is complete: a transform of your own joins the policy's.
+nudged = generate(model, variables, prompts, 32, key=0, sampling=policy,
+                  logits=(favor_short, *policy.transforms()))
 
 # The same request as a deterministic search over four beams, returning two.
 searched = generate(model, variables, prompts, 32, key=0,
@@ -257,7 +257,7 @@ searched = generate(model, variables, prompts, 32, key=0,
 drafted = generate(model, variables, prompts, 32, key=0,
                    sampling=Sampling(temperature=0.8, top_p=0.9, eos_id=2),
                    strategy=Speculative(block=4))
-print(drawn.tokens.shape, searched.tokens.shape, drafted.tokens.shape)
+print(drawn.tokens.shape, nudged.tokens.shape, searched.tokens.shape, drafted.tokens.shape)
 ```
 
 The transforms port `transformers/generation/logits_process.py` from Transformers 5.16.1, with each row reading its own unpadded history instead of the batch's padded width.
@@ -341,32 +341,29 @@ Dew uses T5X as a reference and a test oracle, and adapts some of its state and 
 
 #### Source generation controls
 
-A loaded source's `generation_config.json` is data. Every control Transformers 5.16.1 writes there is classified: the native policy carries it, a transform, criterion or strategy carries it, the task owns it, it is provenance, or `Pretrained.text_generation()` refuses it and says why. The transforms a source binds are the complete chain, built in `_get_logits_processor`'s order, so the policy tail lands where the reference puts it; a source running beam search ends its chain after the processors, because the search picks its own continuations. An unset control, or one at the value where `generate()` adds no processor, criterion or search mode, is inert. Beam-only and sampling-only controls are judged only when beam search or sampling is active, as they are upstream.
+A loaded source's `generation_config.json` is data. Every control Transformers 5.16.1 writes there is classified: the native policy carries it, a transform, criterion or strategy carries it, the task owns it, it is provenance, or `Pretrained.text_generation()` refuses it and says why. The common controls become the task's `Sampling` value, `task.sampling`, so a caller changes one with `dataclasses.replace(task.sampling, ...)`. A source that also sets a control `Sampling` does not carry binds `task.logits`, the complete chain, which the same compiler (`ordered_transforms`) builds in `_get_logits_processor`'s order with the policy's transforms in it; a source running beam search always binds its chain and ends it after the processors, because the search picks its own continuations. An unset control, or one at the value where `generate()` adds no processor, criterion or search mode, is inert. Beam-only and sampling-only controls are judged only when beam search or sampling is active, as they are upstream.
 
 Each source control has one rule for its consumer, neutral value, mode and refusal. Source value precedence remains `generation_config.json`, wrapper config, then text config. The source resolver selects the actual policy once. `Sampling` supplies convenience defaults at the request boundary; only resolved transforms, criteria, strategy and padding reach the compiled decoder. An explicit chain therefore has no unused sampling settings in its compilation or process-agreement identity.
 
 | Control | Native mapping | Refused because |
 | --- | --- | --- |
-| `do_sample`, `temperature`, `top_k`, `top_p`, `min_p`, `eos_token_id`, `pad_token_id` | `Sampling` | |
+| `do_sample`, `temperature`, `top_k`, `top_p`, `min_p`, `typical_p`, `repetition_penalty`, `no_repeat_ngram_size`, `min_new_tokens`, `stop_strings`, `eos_token_id`, `pad_token_id` | `Sampling` (`stop_strings` as `stop`, compiled through the task's processor) | |
 | `max_length`, `max_new_tokens` | the task's token budget | |
 | `num_return_sequences` | the task's `n`, independent of any `sampling=` override | |
 | `bos_token_id`, `decoder_start_token_id` | inapplicable to supplied-input causal decoding; the tokenizer prepares special tokens | |
 | `max_cache_len` | capacity assertion only; it does not resize the cache or limit the request | a length above the model's `max_seq_len` |
-| `repetition_penalty` | `RepetitionPenalty` | |
 | `encoder_repetition_penalty` | `PromptRepetitionPenalty` | |
-| `no_repeat_ngram_size` | `NoRepeatNGram` | |
 | `encoder_no_repeat_ngram_size` | `PromptNoRepeatNGram` | |
 | `sequence_bias` | `sequence_bias` | |
 | `bad_words_ids` | `bad_words` | |
-| `min_length`, `min_new_tokens` | `MinLength`, `MinNewTokens` | |
+| `min_length` | `MinLength` | |
 | `forced_bos_token_id` | `ForcedBOS` | |
 | `forced_eos_token_id` | `ForcedEOS` at the request's own end, so a per-call budget moves it | |
 | `suppress_tokens`, `begin_suppress_tokens` | `SuppressTokens`, `BeginSuppressTokens` | |
 | `exponential_decay_length_penalty` | `ExponentialDecayLengthPenalty` | |
 | `remove_invalid_values` | `RemoveInvalidValues` | |
 | `renormalize_logits` | `Renormalize` | |
-| `typical_p`, `epsilon_cutoff`, `eta_cutoff`, `top_h` | `Typical`, `EpsilonCutoff`, `EtaCutoff`, `TopH` | |
-| `stop_strings` | `stop_strings` | without the source's processor or the model's `vocab_size` there is no vocabulary to compile |
+| `epsilon_cutoff`, `eta_cutoff`, `top_h` | `EpsilonCutoff`, `EtaCutoff`, `TopH` | |
 | `use_cache` | native decoding always runs through its own cache | `use_cache=False` |
 | `cache_implementation` | the fixed-capacity static cache | any other implementation |
 | `cache_config` | | quantized and offloaded caches are not implemented |
@@ -550,7 +547,7 @@ Prepared `DenoisingInputs` can supply encoded native conditions and initial late
 
 ## Configuration and registries
 
-A registry maps names to known classes or factories. For example, `models.build(name, **fields)` validates model fields and reconstructs supported configuration records. Ordinary Python constructors provide a clearer typed interface when the class is known. Dynamic lookup cannot provide the same static type information as a specific constructor.
+Code builds every model, preset, solver, dataset and metric from its class. `dew.registry` maps the names that configuration files, the command line and run records use to those classes and back; `RunConfig.from_dict` and `ModelConfig.build` read a record through it.
 
 `RunConfig.save` writes the run configuration. It is separate from the state checkpoint. [Recipes](../recipes.md) describes the configuration entry points and their side effects.
 

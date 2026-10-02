@@ -157,15 +157,9 @@ class DewLM(TemplateLM):
 
     @property
     def eot_token_id(self) -> int:
-        """Return the id a row with no context is conditioned on: the policy's EOS.
-
-        `Sampling` normalises its own field to a tuple, and declares the
-        form a caller may write, so both spellings are read here.
-        """
-        stops = self.task.sampling.eos_id
-        if stops is None:
-            return 0
-        return stops if isinstance(stops, int) else (stops[0] if stops else 0)
+        """Return the id a row with no context is conditioned on: the policy's first EOS, else 0."""
+        stops = self.task.sampling.stops
+        return stops[0] if stops else 0
 
     @property
     def prefix_token_id(self) -> int:

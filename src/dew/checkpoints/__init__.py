@@ -856,13 +856,13 @@ class Checkpoints:
         """Return the newest committed step a resume can read, local or persistent."""
         persistent = self._open().latest_step()
         if persistent is not None and (not self._complete(persistent) or
-                (self._open().metadata(persistent).custom_metadata or {}).get('weights_only', False)):
+                (self._step_metadata(persistent).custom_metadata or {}).get('weights_only', False)):
             persistent = max(
                 (
                     step
                     for step in self._open().all_steps()
                     if self._complete(step)
-                    and not (self._open().metadata(step).custom_metadata or {}).get("weights_only", False)
+                    and not (self._step_metadata(step).custom_metadata or {}).get("weights_only", False)
                 ),
                 default=None,
             )
@@ -994,6 +994,49 @@ class Checkpoints:
             item=wanted, partial_restore=True, restore_args=jax.tree.map(lambda _: host, wanted)))
         return tuple(_averages_of(_power_profiles(restored['opt_state'])))
 
+    def posthoc_ema(self, std: float, step: int | None = None) -> Variables:
+        """The post-hoc EMA of relative standard deviation `std` at checkpoint
+        `step` (default: the latest snapshot), as host arrays in the params'
+        structure and dtypes.
+
+        Sums every snapshot up to `step`, of every tracked profile, with the
+        weights `coefficients` solves for, one snapshot read at a time and
+        accumulated in fp32 or wider. The result goes where the run's params
+        go: `merge(params, {"params": checkpoints.posthoc_ema(...)})`.
+        """
+        from dew.training.posthoc import coefficients
+
+        steps = self.profile_steps()
+        if not steps:
+            raise FileNotFoundError(f"{self.directory} holds no EMA profile snapshots; train with "
+                                    f"OptimConfig.ema_profiles to keep them")
+        step = steps[-1] if step is None else step
+        if step not in steps:
+            raise ValueError(f"{self.directory} holds EMA profile snapshots at steps {steps}, not {step}")
+        held = [(each, *self.profile_metadata(each)) for each in steps if each <= step]
+        # A snapshot before the first update holds the initial weights, with no
+        # profile to fit.
+        held = [(each, updates, stds) for each, updates, stds in held if updates > 0]
+        if not held or held[-1][0] != step:
+            raise ValueError(f"the snapshot at step {step} was taken before the first update")
+        weights = iter(coefficients([(updates, deviation) for _, updates, stds in held for deviation in stds],
+                                    held[-1][1], std))
+        total, dtypes = None, None
+        for each, _, _ in held:
+            for average in self.restore_profiles(each):
+                weight = next(weights)
+                if total is None:
+                    dtypes = jax.tree.map(lambda leaf: leaf.dtype, average)
+                    total = jax.tree.map(
+                        lambda leaf, weight=weight: weight
+                        * leaf.astype(np.promote_types(leaf.dtype, np.float32)),
+                        average,
+                    )
+                else:
+                    total = jax.tree.map(lambda sum_, leaf, weight=weight: sum_ + weight * leaf,
+                                         total, average)
+        return jax.tree.map(lambda leaf, dtype: leaf.astype(dtype), total, dtypes)
+
     def save_local(
         self,
         step: int,
@@ -1049,7 +1092,7 @@ class Checkpoints:
     def rung(self, step: int) -> JSON:
         """The fit ladder's rung the state at `step` trained on, as `save`
         recorded it, from the directory `restore` reads the step from; None
-        for a checkpoint written without one."""
+        for a state saved outside `fit`, which trained on no ladder."""
         checkpointer = self._open_local() if step == self._local_latest() else self._open()
         return json_value((checkpointer.metadata(step).custom_metadata or {}).get('rung'), 'rung')
 

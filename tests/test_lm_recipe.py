@@ -635,7 +635,7 @@ def test_a_trained_block_diffusion_tree_saves_back_over_its_source(tmp_path):
 
     from dew import Dataset, Trainer
     from dew.interop import load_pretrained
-    from dew.objectives.base import Step, scalar_loss, thaw
+    from dew.objectives.base import Step, thaw
     from dew.objectives.diffusion.block import BlockDiffusionObjective
 
     checkpoint = REPO_ROOT / "tests/fixtures/hf/diffusion-gemma-sft"
@@ -659,8 +659,8 @@ def test_a_trained_block_diffusion_tree_saves_back_over_its_source(tmp_path):
     for wanted, actual in zip(jax.tree.leaves(state.params), jax.tree.leaves(rebuilt), strict=True):
         np.testing.assert_array_equal(actual, wanted)
     step = Step(step=jnp.asarray(0, jnp.int32), key=jax.random.key(1), ema=None)
-    np.testing.assert_array_equal(scalar_loss(restored, rebuilt, batch, step)[0],
-                                  scalar_loss(objective, state.params, batch, step)[0])
+    np.testing.assert_array_equal(restored.scalar_loss(rebuilt, batch, step)[0],
+                                  objective.scalar_loss(state.params, batch, step)[0])
 
 
 def test_the_shipped_lm_run_config_round_trips_through_its_record():

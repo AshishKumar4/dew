@@ -328,8 +328,6 @@ def test_an_uncaptioned_dataset_refuses_a_caption_reader(classes):
 @pytest.mark.parametrize("fields, message", [
     ({}, r"image_column='image'.*\['img', 'label'\]"),
     ({"image_column": "img"}, r"caption_columns=\('caption', 'text'\).*caption_columns=\(\)"),
-    ({"image_column": "img", "caption_columns": (), "label_column": "class"},
-     r"label_column='class'"),
 ])
 def test_a_column_the_dataset_does_not_have_is_refused_when_it_loads(classes, fields, message):
     """The refusal used to come from inside grain's reader on the first batch,

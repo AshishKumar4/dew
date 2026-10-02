@@ -126,7 +126,6 @@ class SampledRollout:
         and info strings the reward is called with, and the `ModelInputs`
         the policy is given.
         """
-        key = jax.random.wrap_key_data(jax.random.key_data(key), impl=jax.random.key_impl(key))
         if key.shape != ():
             raise ValueError("key must be a single JAX PRNG key")
         prompts, prompt_lengths, sources, truths, infos = prompt_rows(batch)

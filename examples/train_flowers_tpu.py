@@ -34,14 +34,14 @@ from PIL import Image
 import dew
 from dew.artifacts import uint8_pixels
 from dew.config import ModelConfig, OptimConfig, TrainerConfig
-from dew.data import ArrayRecordImages, Loading, OxfordFlowers
+from dew.data import ArrayRecordImages, DataPartition, Loading, OxfordFlowers
 from dew.data.images import pack_dict_of_byte_arrays
 from dew.diffusion.presets import EDM
 from dew.eval import clip_score, fid
 from dew.objectives.diffusion import DiffusionRunConfig, TextCondition
 from dew.sampling import CFG
 from dew.sampling.solvers import Heun
-from dew.training import MeshSpec, ProfileWindow, build_mesh, data_partition, prepare_process
+from dew.training import MeshSpec, ProfileWindow, prepare_process
 from dew.training.optim import Cosine
 
 PROMPTS = ("a water lily", "a sunflower", "a red rose", "a purple orchid")
@@ -160,7 +160,7 @@ def held_out(run: DiffusionRunConfig) -> np.ndarray:
     if data.val is None:
         raise ValueError("scoring FID needs a held-out split: set data.val_batches")
     # This process's share of the pass on the run's plain data-parallel mesh.
-    share = data_partition(build_mesh(run.trainer.mesh))
+    share = DataPartition.of(run.trainer.mesh.build())
     return np.concatenate([np.asarray(batch["image"], np.uint8) for batch in data.val(share)])
 
 

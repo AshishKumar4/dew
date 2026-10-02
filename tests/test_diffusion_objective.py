@@ -20,11 +20,12 @@ from flax import linen as nn
 from dew.artifacts import ImageGrid, VideoGrid
 from dew.data import Dataset
 from dew.diffusion import broadcast_rates, expand, presets
-from dew.inputs import CLIPText, CharTable, Condition, ConditionEncoder, Field, InputSpec, unit_range
+from dew.inputs import CharTable, CLIPText, Condition, ConditionEncoder, Field, InputSpec, unit_range
+from dew.nn.backbones import SimpleDiT, SimpleMMDiT
 from dew.nn.dit import TextContext
-from dew.objectives.base import Step, Variables, scalar_loss
+from dew.objectives.base import Step, Variables
 from dew.objectives.diffusion import VALIDATION_SAMPLES, DiffusionObjective
-from dew.registry import encoders, models
+from dew.registry import encoders
 from dew.sampling import CFG, Euler
 from dew.training import Trainer
 
@@ -74,7 +75,7 @@ class StubText(ConditionEncoder[str]):
 
 
 def make_objective(*, guidance: CFG | None = CFG(2.0)):
-    model = models.SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1)
+    model = SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1)
     inputs = InputSpec(Field("image", (RES, RES, 3)),
                        {"textcontext": Condition(StubText.from_pretrained("stub"))})
     # The sigmas GOLDEN was captured with (EDM2's), stated so the pin holds.
@@ -200,8 +201,8 @@ def test_a_preset_builds_the_same_loss_and_images_as_its_process():
     variables = objective.init(jax.random.key(0))
     batch = {"image": np.arange(8, dtype=np.uint8).reshape(2, 2, 2, 1)}
     step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=None)
-    np.testing.assert_array_equal(scalar_loss(objective, variables, batch, step)[0],
-                                  scalar_loss(explicit, variables, batch, step)[0])
+    np.testing.assert_array_equal(objective.scalar_loss(variables, batch, step)[0],
+                                  explicit.scalar_loss(variables, batch, step)[0])
     direct = TextToImage.from_objective(objective, variables)
     built = TextToImage.from_objective(explicit, variables)
     np.testing.assert_array_equal(direct(["", ""], key=2).host().images,
@@ -259,7 +260,7 @@ def test_loss_is_the_weighted_error_of_the_prediction():
     batch = make_batch()
     step = Step(step=jnp.asarray(3), key=jax.random.PRNGKey(7), ema=None)
 
-    loss, aux = scalar_loss(objective, params, batch, step)
+    loss, aux = objective.scalar_loss(params, batch, step)
 
     _, _, time_key, noise_key, _ = jax.random.split(step.key, 5)
     x0 = unit_range(batch["image"])
@@ -558,7 +559,7 @@ GOLDEN = {"params": 15.044008062570356, "ema": 15.049092350082788,
 def conditional_mmdit():
     encoder = CharTable.from_pretrained(tokens=3, features=6, vocab=16)
     inputs = InputSpec(Field("image", (4, 4, 1)), {"textcontext": Condition(encoder)})
-    model = models.SimpleMMDiT(output_channels=1, patch_size=2, emb_features=8,
+    model = SimpleMMDiT(output_channels=1, patch_size=2, emb_features=8,
                                num_layers=1, num_heads=2, mlp_ratio=2, attention_impl="xla")
     preset = presets.EDM(sigma_max=1.0, regime="pixel")
     objective = DiffusionObjective(model, preset, inputs, steps=3, sampler=Euler(), guidance=CFG(2.0))
@@ -591,9 +592,9 @@ def test_null_dropout_matches_explicit_tokens_under_current_encoder(conditional_
     explicit = {"image": batch["image"], "text": jax.tree.map(
         lambda blank, given: jnp.where(mask[:, None], blank, given), explicit["text"], batch["text"])}
     expected = jax.jit(jax.value_and_grad(
-        lambda values: scalar_loss(conditional, values, explicit, step)[0]))(variables)
+        lambda values: conditional.scalar_loss(values, explicit, step)[0]))(variables)
     actual = jax.jit(jax.value_and_grad(
-        lambda values: scalar_loss(dropped, values, batch, step)[0]))(variables)
+        lambda values: dropped.scalar_loss(values, batch, step)[0]))(variables)
     assert float(jnp.linalg.norm(expected[1]["encoders"]["textcontext"]["table"])) > 1e-6
     # The trained weights, on the loss the two routes agree on. The dropped
     # rows read a blank the objective encoded once, so the frozen tower is a
@@ -614,11 +615,11 @@ def test_a_dropped_row_is_conditioned_on_what_the_objective_holds(conditional_mm
                                  unconditional_prob=1.0, steps=3, sampler=Euler(),
                                  pretrained=variables)
     held = dropped.unconditional_conditions
-    before = float(scalar_loss(dropped, variables, batch, step)[0])
+    before = float(dropped.scalar_loss(variables, batch, step)[0])
     dropped.unconditional_conditions = jax.tree.map(
         lambda leaf: leaf + 1.0 if np.issubdtype(leaf.dtype, np.floating) else leaf, held)
 
-    assert float(scalar_loss(dropped, variables, batch, step)[0]) != pytest.approx(before)
+    assert float(dropped.scalar_loss(variables, batch, step)[0]) != pytest.approx(before)
 
 
 def test_guided_samples_use_bound_encoder_not_constructor_weights(conditional_mmdit):

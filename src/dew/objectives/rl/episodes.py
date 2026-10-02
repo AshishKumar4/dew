@@ -354,7 +354,7 @@ class EpisodeRollout:
         occupies its row: the shapes have to match across ranks, and its
         draw is discarded rather than skipped.
         """
-        tokens = np.full((len(slots), self.max_prompt_tokens), self.sampling.pad_id, np.int32)
+        tokens = np.full((len(slots), self.max_prompt_tokens), self.sampling.pad, np.int32)
         valid = np.zeros_like(tokens, bool)
         for row, slot in enumerate(slots):
             if (
@@ -499,7 +499,7 @@ class EpisodeRollout:
             np.asarray(generation.behavior_log_probs)[row],
         )
         width = self.max_prompt_tokens
-        expected = np.full(width, self.sampling.pad_id, np.int32)
+        expected = np.full(width, self.sampling.pad, np.int32)
         expected[-len(context):] = context
         if (tokens.shape != (width + self.max_new_tokens,)
                 or not np.issubdtype(tokens.dtype, np.integer)

@@ -14,9 +14,10 @@ from dew.data import Dataset
 from dew.diffusion import EpsilonPredictionTransform, Process
 from dew.diffusion.discrete import MDLM, DiscreteProcess, LogLinear, Unmask
 from dew.diffusion.schedules import CosineNoiseScheduler
-from dew.objectives.base import Step, scalar_loss
+from dew.nn.backbones import CausalTransformer
+from dew.objectives.base import Step
 from dew.objectives.diffusion import MaskedDiffusionObjective
-from dew.registry import models, presets, samplers
+from dew.registry import presets, samplers
 from dew.sampling import sample
 from dew.training import Trainer
 
@@ -45,8 +46,8 @@ def test_a_zero_time_row_contributes_nothing_to_the_loss(rng, monkeypatch):
     rows = jnp.array([[1, 2, 3, 4, 5, 1, 2, 3], [3, 2, 1, 0, 4, 5, 1, 2]])
     monkeypatch.setattr(DiscreteProcess, "sample_t",
                         lambda self, key, n: jnp.zeros((n,)))
-    full, _ = scalar_loss(objective, params, {"text": rows}, Step(jnp.asarray(0), rng, None))
-    rest, _ = scalar_loss(objective, params, {"text": rows[1:]}, Step(jnp.asarray(0), rng, None))
+    full, _ = objective.scalar_loss(params, {"text": rows}, Step(jnp.asarray(0), rng, None))
+    rest, _ = objective.scalar_loss(params, {"text": rows[1:]}, Step(jnp.asarray(0), rng, None))
     assert jnp.all(jnp.isfinite(full))
     assert float(full) == pytest.approx(0.0, abs=1e-12)
     assert float(full) == pytest.approx(float(rest), abs=1e-12)
@@ -200,7 +201,7 @@ def test_the_mdlm_preset_is_registered_and_takes_no_conditions():
 ############################################################################################################
 
 def transformer(causal):
-    return models.CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=1, num_heads=2,
+    return CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=1, num_heads=2,
                                     max_seq_len=8, causal=causal)
 
 
@@ -248,7 +249,7 @@ def test_the_loss_is_the_nelbo_of_the_row_the_model_saw(rng, monkeypatch):
         cross_entropy = -jnp.take_along_axis(log_probs, rows[..., None], axis=-1)[..., 0]
         return jnp.where(hidden, cross_entropy / times[:, None], 0.0)
 
-    loss, _ = scalar_loss(objective, params, {"text": rows}, Step(jnp.asarray(0), rng, None))
+    loss, _ = objective.scalar_loss(params, {"text": rows}, Step(jnp.asarray(0), rng, None))
     np.testing.assert_allclose(loss, terms(params).sum() / rows.size, rtol=1e-5)
 
     averaged = jax.tree.map(lambda leaf: 1.5 * leaf, params)
@@ -289,7 +290,7 @@ def test_a_packed_window_scores_as_its_documents_would_one_by_one(rng, monkeypat
     assert float(together.losses[0, 1]) > 0 and float(together.losses[0, 3]) > 0
     np.testing.assert_array_equal(together.losses[0, 5:], 0.0)
     np.testing.assert_array_equal(together.weights, [[1, 1, 1, 1, 1, 0, 0, 0]])
-    loss, _ = scalar_loss(objective, params, packed, step)
+    loss, _ = objective.scalar_loss(params, packed, step)
     np.testing.assert_allclose(loss, together.losses.sum() / 5, rtol=1e-5)
 
 
@@ -319,7 +320,7 @@ def test_masked_diffusion_lm_memorises_the_toy_corpus():
     tests/test_discrete.py at c0f4156). The loss reports the masked accuracy
     and the masked fraction beside the NELBO."""
     process = MDLM(mask_id=BYTE_MASK)()
-    model = models.CausalTransformer(vocab_size=257, emb_features=64, num_layers=2, num_heads=4,
+    model = CausalTransformer(vocab_size=257, emb_features=64, num_layers=2, num_heads=4,
                                      max_seq_len=ROW, causal=False)
     objective = MaskedDiffusionObjective(model, process, ROW, steps=48, samples=16)
 
@@ -328,7 +329,7 @@ def test_masked_diffusion_lm_memorises_the_toy_corpus():
                         steps=1000, log_every=500)
     params = state.params
 
-    loss, aux = scalar_loss(objective, params, {"text": ROWS}, Step(state.microstep, jax.random.PRNGKey(1), None))
+    loss, aux = objective.scalar_loss(params, {"text": ROWS}, Step(state.microstep, jax.random.PRNGKey(1), None))
     assert jnp.isfinite(loss)
     assert set(aux.metrics) == {"masked_accuracy", "masked_fraction"}
 

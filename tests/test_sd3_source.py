@@ -257,7 +257,7 @@ def test_native_sd3_agrees_across_a_sequence_sharded_mesh(source):
     shards, and the prediction and the parameter gradient are compared against
     the same walk on a mesh that keeps sequences whole.
     """
-    from dew.training import Layout, MeshSpec, build_mesh
+    from dew.training import Layout, MeshSpec
 
     with np.load(source / "sd3_transformer.npz") as arrays:
         config = json.loads(str(arrays["rect_cropped.config"]))
@@ -277,7 +277,7 @@ def test_native_sd3_agrees_across_a_sequence_sharded_mesh(source):
         return jnp.sum(output * probe)
 
     def run(spec):
-        mesh = build_mesh(spec)
+        mesh = spec.build()
         placement = Layout().shardings(mesh, {"params": params})["params"]
         with jax.set_mesh(mesh):
             placed = jax.device_put(params, placement)

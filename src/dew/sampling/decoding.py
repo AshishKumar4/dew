@@ -205,9 +205,10 @@ class Greedy:
 
     `Sampling(temperature=0)` compiles to this, so a zero-temperature draw
     stays the deterministic argmax and its behaviour log probability stays
-    exactly zero while running through the same categorical draw as any other
-    policy. Transforms placed before it still shape the argmax, which is what
-    greedy search does with a processor list.
+    exactly zero. A terminal Greedy lets the sampler select the argmax without
+    constructing or sampling the point mass. Transforms placed before it
+    still shape the argmax, which is what greedy search does with a processor
+    list.
 
     A row that arrives without a distribution leaves without one. A point
     mass over an all-removed row, or over a NaN or `+inf` the model or an
@@ -1090,15 +1091,31 @@ def components(values: LogitsTransform | Sequence[LogitsTransform]) -> tuple[Log
     return tuple(as_pytree(value) for value in values)
 
 
-def chain(transforms: Sequence[LogitsTransform]) -> Callable[[StepState, jax.Array], jax.Array]:
-    """The transforms as one callable, applied in order."""
+@dataclasses.dataclass(frozen=True, eq=False)
+class LogitsChain:
+    """The ordered transforms, retaining a terminal Greedy for the sampler.
 
-    def apply(state: StepState, logits: jax.Array) -> jax.Array:
-        for transform in transforms:
+    An arbitrary transform after Greedy may restore a nondegenerate
+    distribution, so only the final built-in Greedy proves an argmax draw.
+    Like a function closure, the callable is hashed by identity, not by its
+    captured processor arrays, when passed directly to `jax.jit`.
+    """
+
+    transforms: tuple[LogitsTransform, ...]
+
+    @property
+    def greedy(self) -> bool:
+        return bool(self.transforms) and type(self.transforms[-1]) is Greedy
+
+    def __call__(self, state: StepState, logits: jax.Array) -> jax.Array:
+        for transform in self.transforms:
             logits = transform(state, logits).astype(jnp.float32)
         return logits
 
-    return apply
+
+def chain(transforms: Sequence[LogitsTransform]) -> LogitsChain:
+    """The transforms as one callable, applied in order."""
+    return LogitsChain(tuple(transforms))
 
 
 def criterion(stopping: Sequence[Stopping]) -> Callable[[StepState, jax.Array], jax.Array]:

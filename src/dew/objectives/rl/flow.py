@@ -23,7 +23,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
-from dew.artifacts import agree_process_phase, broadcast_from_process_zero, collective_host
+from dew.artifacts import agreed, broadcast_from_process_zero, collective_host
 from dew.diffusion.presets import Preset
 from dew.diffusion.process import Process
 from dew.inputs import InputSpec
@@ -222,28 +222,17 @@ class FlowGRPOObjective(DiffusionObjective):
         `limit` caps the rows drawn, which is what a preview takes.
         Returns the samples and the condition tokens behind them.
         """
-        error = None
-        prepared = None
-        try:
+        def setup() -> tuple[int, Batch]:
             count = _source(self.inputs, batch).shape[0]
             sample_batch = self._sampling_batch(batch)
             if limit is not None:
                 count = min(limit, count)
                 sample_batch = jax.tree.map(lambda value: value[:count], sample_batch)
-            prepared = (count, sample_batch)
-        except BaseException as failure:
-            error = failure
-        agree_process_phase(error, phase="flow sample setup")
-        assert prepared is not None
-        count, sample_batch = prepared
-        error = None
-        samples = None
-        try:
-            samples = self._sample(params, sample_batch, key, count=count)
-        except BaseException as failure:
-            error = failure
-        agree_process_phase(error, phase="flow sample generation")
-        assert samples is not None
+            return count, sample_batch
+
+        count, sample_batch = agreed("flow sample setup", setup)
+        samples = agreed("flow sample generation",
+                         lambda: self._sample(params, sample_batch, key, count=count))
         return samples, {keyword: sample_batch[condition.field]
                          for keyword, condition in self.inputs.conditions.items()}
 
@@ -416,47 +405,23 @@ class FlowRollout:
         `train_steps` transitions. Every phase agrees across ranks before
         the next collective.
         """
-        error = None
-        expanded = None
-        owned = slice(None)
-        count = 0
-        try:
-            expanded, owned, count = self._expanded(batch)
-        except BaseException as failure:
-            error = failure
-        agree_process_phase(error, phase="flow rollout setup")
-        assert expanded is not None
-        error = None
-        generated = None
-        try:
-            generated = self._generate(state.params, expanded, key)
-        except BaseException as failure:
-            error = failure
-        agree_process_phase(error, phase="flow rollout generation")
-        assert generated is not None
+        expanded, owned, count = agreed("flow rollout setup", lambda: self._expanded(batch))
+        generated = agreed("flow rollout generation", lambda: self._generate(state.params, expanded, key))
         (trajectory, images), context = collective_host(
             (generated, expanded), phase="flow rollout")
-        error = None
-        rewards = None
-        if jax.process_index() == 0:
-            try:
-                rewards = np.asarray(self.reward(np.asarray(images), context), np.float64)
-                if rewards.shape != (count * self.groups,) or not np.isfinite(rewards).all():
-                    raise ValueError("a flow reward must return one finite scalar per generated sample")
-            except BaseException as failure:
-                error = failure
-        agree_process_phase(error, phase="flow rollout reward")
+
+        def score() -> np.ndarray | None:
+            if jax.process_index() != 0:
+                return None
+            rewards = np.asarray(self.reward(np.asarray(images), context), np.float64)
+            if rewards.shape != (count * self.groups,) or not np.isfinite(rewards).all():
+                raise ValueError("a flow reward must return one finite scalar per generated sample")
+            return rewards
+
+        rewards = agreed("flow rollout reward", score)
         rewards = np.asarray(broadcast_from_process_zero(
             None if rewards is None else rewards.tolist()), np.float64)
-        error = None
-        prepared = None
-        try:
-            prepared = self._transitions(trajectory, context, rewards, owned)
-        except BaseException as failure:
-            error = failure
-        agree_process_phase(error, phase="flow rollout batching")
-        assert prepared is not None
-        return prepared
+        return agreed("flow rollout batching", lambda: self._transitions(trajectory, context, rewards, owned))
 
 
 __all__ = ["FlowGRPOObjective", "FlowReward", "FlowRollout"]
