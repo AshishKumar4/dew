@@ -694,9 +694,10 @@ class Adaptable(Protocol):
     """Declares an objective an adapter attaches to.
 
     It trains one module, which is its `model`, and it takes the filter that
-    says which of that module's leaves the optimizer moves. `LMObjective`
-    and `BlockDiffusionObjective` are the two; an objective that keeps no
-    model or selects what trains some other way is refused by name.
+    says which of that module's leaves the optimizer moves. `LMObjective`,
+    `BlockDiffusionObjective` and the denoising `DiffusionObjective` are
+    the three; an objective that keeps no model or selects what trains some
+    other way is refused by name.
     """
 
     model: nn.Module
@@ -710,16 +711,17 @@ def _attach(objective: object, adapter: LoRA) -> None:
     its objective, and the run adapts it once, before anything initialises
     it, so the adapted module is what the run traces and the adapter's own
     leaves are the only ones the optimizer moves. Code that builds its own
-    run adapts a source with `PretrainedDecoder.lora` instead, which returns a
-    new bundle. The adapted module is a subclass of the same class with
-    the same fields, so what the objective read off the model at
-    construction still holds.
+    run adapts a source with `PretrainedDecoder.lora` or
+    `PretrainedPipeline.lora` instead, which returns a new bundle. The
+    adapted module is a subclass of the same class with the same fields, so
+    what the objective read off the model at construction still holds.
     """
     if not isinstance(objective, Adaptable):
         raise ValueError(
             f"--lora adapts the module an objective trains and freezes the rest, and "
             f"{type(objective).__name__} keeps no `model` it can select leaves of; train "
-            f"an LMObjective or a BlockDiffusionObjective, or leave the adapter unset")
+            f"an LMObjective, a BlockDiffusionObjective or a DiffusionObjective, or leave "
+            f"the adapter unset")
     if objective.trainable is not None:
         raise ValueError(
             f"{type(objective).__name__} already selects what trains, and an adapter "
