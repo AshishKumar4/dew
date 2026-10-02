@@ -404,17 +404,6 @@ _V4_SCORES = ('softmax', 'sigmoid', 'sqrtsoftplus')
 _V4_PARTIAL = 64 / 512
 
 
-def _string_sequence(value: object, field: str) -> tuple[str, ...]:
-    if not isinstance(value, (list, tuple)):
-        _refuse(field, 'expected one string entry per layer')
-    entries: list[str] = []
-    for entry in value:
-        if not isinstance(entry, str):
-            _refuse(field, f'expected a string, got {entry!r}')
-        entries.append(entry)
-    return tuple(entries)
-
-
 def _v4_layer_types(hf_config: Mapping[str, object], layers: int,
                     used: set[str]) -> tuple[str, ...]:
     """Return every layer's attention kind.
@@ -442,7 +431,7 @@ def _v4_layer_types(hf_config: Mapping[str, object], layers: int,
                  + ['compressed_sparse_attention' if index % 2
                     else 'heavily_compressed_attention'
                     for index in range(max(layers - 2, 0))])
-    resolved = _string_sequence(types, 'layer_types')[:layers]
+    resolved = records.strings(types, 'layer_types')[:layers]
     if len(resolved) != layers:
         _refuse(f"layer_types of {len(resolved)} entries",
                 f"the model has {layers} layers, one attention kind each")
@@ -467,7 +456,7 @@ def _v4_mlp_kinds(hf_config: Mapping[str, object], layers: int,
     if types is None:
         hashed = _record_int(hf_config, 'num_hash_layers', 3)
         types = ['hash_moe'] * min(layers, hashed) + ['moe'] * max(layers - hashed, 0)
-    resolved = _string_sequence(types, 'mlp_layer_types')[:layers]
+    resolved = records.strings(types, 'mlp_layer_types')[:layers]
     if len(resolved) != layers:
         _refuse(f"mlp_layer_types of {len(resolved)} entries",
                 f"the model has {layers} layers, one routing kind each")

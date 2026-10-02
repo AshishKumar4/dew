@@ -323,8 +323,6 @@ def sd3_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float
     meaning this model does not carry is refused rather than dropped, so a
     checkpoint that means something else cannot load as if it did not.
     """
-    from dew.interop.pretrained import resolve_dtype
-
     heads = records.integer(config["num_attention_heads"], "num_attention_heads")
     head_dim = records.integer(config["attention_head_dim"], "attention_head_dim")
     channels = records.integer(config["in_channels"], "in_channels")
@@ -457,8 +455,6 @@ def flux_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "floa
     embeds its distilled guidance, which changes what the model takes as an
     input rather than only which tensors it holds.
     """
-    from dew.interop.pretrained import resolve_dtype
-
     channels = records.integer(config["in_channels"], "in_channels")
     out_channels = config.get("out_channels")
     axes = config.get("axes_dims_rope", (16, 56, 56))
@@ -506,8 +502,6 @@ def flux2_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "flo
                  attention_impl="auto") -> Flux2Fields:
     """Read a published `Flux2Transformer2DModel` config into native model
     fields, refusing a patch size the pipeline does not use."""
-    from dew.interop.pretrained import resolve_dtype
-
     if records.integer(config.get("patch_size", 1), "patch_size") != 1:
         raise ValueError("FLUX.2's pipeline folds its latent 2x2 itself; the transformer's patch_size is 1")
     channels = records.integer(config.get("in_channels", 128), "in_channels")
@@ -604,8 +598,6 @@ def z_image_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "f
     fields, refusing what the port does not compute: another patch size,
     grouped keys and values, no query and key norms, or the Omni model's
     SigLIP stream."""
-    from dew.interop.pretrained import resolve_dtype
-
     if records.integers(config.get("all_patch_size", (2,)), "all_patch_size") != (2,) or records.integers(
             config.get("all_f_patch_size", (1,)), "all_f_patch_size") != (1,):
         raise ValueError("the port computes Z-Image's 2x2 patches of one frame")
@@ -788,8 +780,6 @@ def qwen_image_fields(config: Mapping[str, object], *, dtype: DTypeLike | None =
     over unpatched, so a patch size other than one is a checkpoint no
     published pipeline drives and is refused rather than folded.
     """
-    from dew.interop.pretrained import resolve_dtype
-
     if records.integer(config.get("patch_size", 1), "patch_size") != 1:
         raise ValueError("Qwen-Image 2.1's pipeline reads its latent unpatched; patch_size must be 1")
     channels = records.integer(config.get("in_channels", 64), "in_channels")
