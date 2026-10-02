@@ -112,6 +112,18 @@ def unpatchify(x: jnp.ndarray, patch_size: int, H: int, W: int, C: int) -> jnp.n
         x, 'b (h w) (p1 p2 c) -> b (h p1) (w p2) c', h=H_P, w=W_P, p1=patch_size, p2=patch_size, c=C)
 
 
+def pixel_unshuffle(x: jnp.ndarray) -> jnp.ndarray:
+    """torch's `pixel_unshuffle` by 2, channels last: `[B, H, W, C]` to
+    `[B, H/2, W/2, 4C]`, output channel `4c + 2 * row + column`. Channel-major,
+    where `patchify` is pixel-major."""
+    return einops.rearrange(x, 'b (h p1) (w p2) c -> b h w (c p1 p2)', p1=2, p2=2)
+
+
+def pixel_shuffle(x: jnp.ndarray) -> jnp.ndarray:
+    """torch's `pixel_shuffle` by 2, channels last, the inverse of `pixel_unshuffle`."""
+    return einops.rearrange(x, 'b h w (c p1 p2) -> b (h p1) (w p2) c', p1=2, p2=2)
+
+
 def _ordered_patchify(x: jnp.ndarray, patch_size: int, order: np.ndarray):
     return patchify(x, patch_size)[:, order, :], inverse_permutation(order)
 

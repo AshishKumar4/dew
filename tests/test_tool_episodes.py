@@ -73,7 +73,9 @@ class ToolPolicy(nn.Module):
     def init_cache(self, batch_size):
         self.variable("cache", "seen", lambda: jnp.zeros(batch_size, jnp.int32))
 
-    def __call__(self, tokens, train=False, decode=False, attention_mask=None, positions=None, segment_ids=None):
+    def __call__(
+        self, tokens, train=False, decode=False, attention_mask=None, positions=None, segment_ids=None
+    ):
         if decode:
             seen = self.get_variable("cache", "seen")
             valid = jnp.ones_like(tokens, bool) if attention_mask is None else attention_mask
@@ -110,7 +112,9 @@ class SquareSession:
             return Observation((*action.context, *action.tokens, observation),
                                detail=f"square({value}) = {self.answer}")
         answer = {ANSWER_NINE: 9, ANSWER_SIXTEEN: 16, WRONG: 8}[command[0]]
-        return Observation((), EpisodeStatus.COMPLETED, json.dumps({"answer": answer, "expected": self.answer}))
+        return Observation(
+            (), EpisodeStatus.COMPLETED, json.dumps({"answer": answer, "expected": self.answer})
+        )
 
 
 class Harness:
@@ -139,9 +143,17 @@ def build(harness=None, *, record=None, accumulation=1, **changes):
     model = ToolPolicy()
     objective = GRPOObjective(model, PROMPT + RESPONSE - 1, beta=.05)
     trainer = Trainer(objective, optax.sgd(.05), key=jax.random.key(19), accumulation=accumulation)
-    rollout = EpisodeRollout(TextGeneration(model, objective.init(jax.random.key(0))), harness or Harness(), verify,
-                             PROMPT, RESPONSE, TURNS, groups=GROUPS,
-                             sampling=SAMPLING, record=record)
+    rollout = EpisodeRollout(
+        TextGeneration(model, objective.init(jax.random.key(0))),
+        harness or Harness(),
+        verify,
+        PROMPT,
+        RESPONSE,
+        TURNS,
+        groups=GROUPS,
+        sampling=SAMPLING,
+        record=record,
+    )
     return trainer, replace(rollout, **changes)
 
 
@@ -199,7 +211,9 @@ def test_multiturn_actions_keep_cached_likelihoods_and_observations_out_of_targe
     assert np.max(np.abs(batch["old_log_probs"] - batch["behavior_log_probs"])) > .01
     targets = batch["input_ids"][batch["response_mask"].astype(bool)]
     assert NINE not in targets and SIXTEEN not in targets
-    assert batch["response_mask"].sum() == sum(len(turn.action.tokens) for e in episodes for turn in e.transitions)
+    assert batch["response_mask"].sum() == sum(
+        len(turn.action.tokens) for e in episodes for turn in e.transitions
+    )
 
     # Packed GRPO rescoring sees the exact contexts that produced the actions.
     assert isinstance(trainer.objective, GRPOObjective)

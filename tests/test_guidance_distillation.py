@@ -15,7 +15,7 @@ from test_diffusion_run_sources import batch_for
 
 from dew.checkpoints import Checkpoints
 from dew.config import ModelConfig, TrainerConfig
-from dew.data import OxfordFlowers
+from dew.data import TFDSImages
 from dew.diffusion import broadcast_rates
 from dew.diffusion.presets import Flow
 from dew.inputs import unit_range
@@ -32,8 +32,18 @@ from dew.sampling import Euler, TextToImage
 from dew.training import Trainer
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
-FLUX = {"in_channels": 12, "out_channels": 12, "num_layers": 1, "num_single_layers": 1, "heads": 2, "head_dim": 12,
-        "joint_attention_dim": 16, "pooled_projection_dim": 10, "guidance_embeds": True, "axes_dims_rope": [4, 4, 4]}
+FLUX = {
+    "in_channels": 12,
+    "out_channels": 12,
+    "num_layers": 1,
+    "num_single_layers": 1,
+    "heads": 2,
+    "head_dim": 12,
+    "joint_attention_dim": 16,
+    "pooled_projection_dim": 10,
+    "guidance_embeds": True,
+    "axes_dims_rope": [4, 4, 4],
+}
 
 
 @pytest.fixture(scope="module")
@@ -45,7 +55,7 @@ def runs(tmp_path_factory):
         archive.extractall(root / "flux", filter="data")
     teacher = DiffusionRunConfig(
         model=ModelConfig("flux_transformer", FLUX, dtype="float32", attention_impl="xla"),
-        data=OxfordFlowers(image_size=8), preset=Flow(), sampler=Euler(), guidance=None,
+        data=TFDSImages(image_size=8), preset=Flow(), solver=Euler(), guidance=None,
         sampling_steps=2, ema_decay=None, val_metrics=(), trainer=TrainerConfig(checkpoint_dir=str(root)),
         text=TextCondition(encoder="diffusion_text", checkpoint=str(root / "flux" / "pipeline")))
     objective = teacher.build()
@@ -57,8 +67,9 @@ def runs(tmp_path_factory):
     checkpoints.save(1, state, None)
     checkpoints.wait()
     teacher.save(str(root / "teacher"))
-    student = dataclasses.replace(teacher, guidance_distill=GuidanceDistillation(teacher=str(root / "teacher"),
-                                                                                 scales=(1.0, 6.0)))
+    student = dataclasses.replace(
+        teacher, guidance_distill=GuidanceDistillation(teacher=str(root / "teacher"), scales=(1.0, 6.0))
+    )
     return root, student, batch
 
 

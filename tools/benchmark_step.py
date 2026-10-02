@@ -477,12 +477,13 @@ def small_cases(dtype: str) -> list[Case]:
                                          "heads": 6, "head_dim": 64, "axes_dims_rope": (16, 24, 24)},
              batch_size=4, image_size=32, channels=16),
         # FLUX.2 reads three stacked encoder layers, so its context is three
-        # text widths wide.
+        # text widths wide. Each rotary splits the 64 head channels.
         Case("flux2_transformer", {"num_layers": 3, "num_single_layers": 3, "heads": 6, "head_dim": 64,
-                                    "joint_attention_dim": 3 * TEXT_FEATURES},
+                                    "joint_attention_dim": 3 * TEXT_FEATURES,
+                                    "axes_dims_rope": (16, 16, 16, 16)},
              batch_size=4, image_size=32, channels=128),
         Case("z_image_transformer", {"dim": 384, "n_layers": 3, "n_refiner_layers": 1, "n_heads": 6,
-                                      "cap_feat_dim": TEXT_FEATURES},
+                                      "cap_feat_dim": TEXT_FEATURES, "axes_dims": (16, 24, 24)},
              batch_size=4, image_size=32, channels=16),
         Case("uvit", {key: value for key, value in dit.items() if key != "mlp_ratio"},
              batch_size=16, image_size=64),
@@ -506,7 +507,7 @@ def small_cases(dtype: str) -> list[Case]:
         # The same decoder with an 8-expert, top-2 feed-forward on every second
         # layer, which is the sparse shape the 4.7 acceptance run trains
         Case("causal_transformer",
-             {**decoder, "mixture": {"experts": 8, "top_k": 2, "every": 2}},
+             {**decoder, "mixture": {"experts": 8, "top_k": 2, "layers": (1,)}},
              batch_size=16, seq_len=512),
         # The same decoder as a vision-conditioned one: SigLIP-so400m's widths
         # at four layers over a 448px crop, pooled to the 256 soft tokens

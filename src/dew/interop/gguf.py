@@ -2,7 +2,7 @@
 
 A GGUF file carries its own config (key/value metadata), its tokenizer and
 its tensors under llama.cpp's names, most of them quantized in blocks. This
-module turns one into what `load_pretrained` reads from a safetensors repo:
+module turns one into what `Pretrained.load` reads from a safetensors repo:
 the config.json dict, and tensors under the HF names in HF layout.
 Everything after that, family translation included, is the safetensors path;
 the tokenizer is transformers' own conversion of the one the file carries.

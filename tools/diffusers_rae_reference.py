@@ -232,17 +232,6 @@ def build_plain(root: Path) -> dict[str, np.ndarray]:
             "grad_pixels": grad.numpy()}
 
 
-def bundle(directory: str, destination: str) -> None:
-    """Pack the saved autoencoders and the recorded arrays for the suite."""
-    import tarfile
-
-    root = Path(directory)
-    with tarfile.open(destination, "w:xz") as archive:
-        for path in sorted(root.iterdir()):
-            archive.add(path, arcname=path.name)
-    print(f"{destination}: {Path(destination).stat().st_size / 1e6:.2f} MB")
-
-
 def main(destination: str) -> None:
     import diffusers
     import transformers
@@ -266,6 +255,8 @@ def main(destination: str) -> None:
 
 if __name__ == "__main__":
     if len(sys.argv) > 3 and sys.argv[1] == "bundle":
+        from diffusers_dc_ae_reference import bundle
+
         bundle(sys.argv[2], sys.argv[3])
     elif len(sys.argv) > 2 and sys.argv[1] == "published":
         published(sys.argv[2])

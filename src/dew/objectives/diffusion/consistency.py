@@ -182,7 +182,7 @@ class ConsistencyDistillationObjective(DiffusionObjective):
     it was, here the idle network's gradient is zero for that step: an
     optimizer whose update moves on a zero gradient, such as Adam's momentum,
     still moves it. Sampling walks the student's multistep consistency
-    sampler, `Consistency`.
+    solver, `Consistency`.
 
     sCM's loss differentiates the student in time, so its time embedding
     must be smooth in it: `simple_dit(time_scale=0.002)`, which a run config
@@ -219,7 +219,7 @@ class ConsistencyDistillationObjective(DiffusionObjective):
         if consistency_weight <= 0 and dmd_weight <= 0:
             raise ValueError("rCM needs a consistency or a distribution-matching loss")
         kwargs.setdefault("guidance", None)
-        kwargs.setdefault("sampler", Consistency())
+        kwargs.setdefault("solver", Consistency())
         kwargs.setdefault("steps", 3)
         super().__init__(model, process, inputs, **kwargs)
         self.teacher = teacher

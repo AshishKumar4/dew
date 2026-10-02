@@ -41,7 +41,7 @@ import numpy as np
 import optax
 
 from dew.config import ModelConfig, TrainerConfig
-from dew.data import Dataset, OxfordFlowers
+from dew.data import Dataset, TFDSImages
 from dew.diffusion.presets import Flow
 from dew.objectives.base import Step
 from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
@@ -62,12 +62,12 @@ PROMPTS = ["a red bird", "two cats", "a harbour at dawn", "x",
 def run_config(directory):
     """The SD3-shaped run: MMDiT, flow matching, T5 text, the 16-channel VAE."""
     return DiffusionRunConfig(
-        model=ModelConfig("simple_mmdit", dict(patch_size=2, emb_features=32, num_layers=1,
-                                               num_heads=2, mlp_ratio=1),
+        model=ModelConfig("simple_mmdit", {"patch_size": 2, "emb_features": 32, "num_layers": 1,
+                                               "num_heads": 2, "mlp_ratio": 1},
                           dtype="float32", attention_impl="reference"),
-        data=OxfordFlowers(image_size=RES),
+        data=TFDSImages(image_size=RES),
         trainer=TrainerConfig(checkpoint_dir=str(directory), batch_size=BATCH, steps=2),
-        preset=Flow(), sampler=Euler(), sampling_steps=3, guidance=None,
+        preset=Flow(), solver=Euler(), sampling_steps=3, guidance=None,
         text=TextCondition(encoder="t5", checkpoint=str(T5_TINY), max_length=8),
         autoencoder=PretrainedAutoencoder(modelname=str(VAE_TINY), dtype="float32"),
         val_metrics=())

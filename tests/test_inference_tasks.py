@@ -12,7 +12,7 @@ import pytest
 from test_text_rollout_contract import decoder
 
 from dew.inference import BlockGeneration, TextGeneration
-from dew.interop import load_pretrained
+from dew.interop import Pretrained
 from dew.nn.inputs import ModelInputs
 from dew.sampling import Sampling, generate
 
@@ -42,8 +42,10 @@ def test_a_bound_task_draws_from_the_weights_it_was_bound_to():
                                        optax.sgd(0.5).init(params["params"]))
     moved = {"params": optax.apply_updates(params["params"], updates)}
     later = task.bind(moved)
-    assert_same_generation(later(rows, 5, key=jax.random.key(1)),
-                           generate(model, moved, jnp.asarray(rows), 5, key=jax.random.key(1), sampling=SAMPLING))
+    assert_same_generation(
+        later(rows, 5, key=jax.random.key(1)),
+        generate(model, moved, jnp.asarray(rows), 5, key=jax.random.key(1), sampling=SAMPLING),
+    )
     assert_same_generation(task(rows, 5, key=jax.random.key(1)), before)
     greedy = task(ModelInputs(jnp.asarray(rows)), 5, key=jax.random.key(2), sampling=Sampling(temperature=0))
     np.testing.assert_array_equal(greedy.behavior_log_probs, 0)
@@ -65,7 +67,7 @@ def test_prepared_rows_and_text_requests_are_kept_apart():
 def test_a_loaded_source_generates_from_text_with_its_own_policy():
     """The Gemma3 source turns prompts and images into a conditioned greedy
     continuation and decodes it back through its own tokenizer."""
-    loaded = load_pretrained(FIXTURES / "gemma3-native-tiny", dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(FIXTURES / "gemma3-native-tiny", dtype="float32", attention_impl="reference")
     images = np.load(FIXTURES / "gemma3-native-tiny" / "raw_images.npy")
     prompts = json.loads((FIXTURES / "gemma3-native-tiny" / "prompts.json").read_text())
     task = loaded.text_generation()
@@ -75,8 +77,21 @@ def test_a_loaded_source_generates_from_text_with_its_own_policy():
                                   np.load(FIXTURES / "gemma3-native-tiny" / "continuation.npy"))
     assert loaded.processor is not None
     assert task.decode(generated) == tuple(loaded.processor.decode(generated.tokens[:, -3:]))
-    with pytest.raises(TypeError):
-        loaded.block_generation()
+    assert not hasattr(loaded, "block_generation")
+
+
+def test_a_source_loads_as_its_kind_and_a_kind_refuses_another():
+    """`Pretrained.load` returns the kind the source is, with the methods
+    that kind has; called on a kind, it refuses a source of another."""
+    from dew.interop import PretrainedBlockDecoder, PretrainedDecoder, PretrainedMaskedDecoder
+
+    assert type(Pretrained.load(FIXTURES / "llama-tiny", dtype="float32")) is PretrainedDecoder
+    assert type(Pretrained.load(FIXTURES / "llada-tiny", dtype="float32")) is PretrainedMaskedDecoder
+    gemma = PretrainedBlockDecoder.load(FIXTURES / "diffusion-gemma-workflow", dtype="float32",
+                                        max_seq_len=32)
+    assert type(gemma) is PretrainedBlockDecoder
+    with pytest.raises(TypeError, match="is a PretrainedMaskedDecoder source, not a PretrainedDecoder"):
+        PretrainedDecoder.load(FIXTURES / "llada-tiny", dtype="float32")
 
 
 def test_a_pretrained_bundle_fine_tunes_identically_to_explicit_wiring():
@@ -84,9 +99,9 @@ def test_a_pretrained_bundle_fine_tunes_identically_to_explicit_wiring():
     from dew.objectives.base import Step
     from dew.objectives.lm import LMObjective
 
-    source = load_pretrained(FIXTURES / "llama-tiny", dtype="float32", attention_impl="xla",
+    source = Pretrained.load(FIXTURES / "llama-tiny", dtype="float32", attention_impl="xla",
                              max_seq_len=8)
-    options = dict(ema_decay=None, head_chunks=1, pad_id=0, z_loss=1e-4)
+    options = {"ema_decay": None, "head_chunks": 1, "pad_id": 0, "z_loss": 1e-4}
     explicit = LMObjective(source.model, 4, pretrained=source.variables, **options)
     bundled = source.lm_objective(4, **options)
     key = jax.random.key(41)
@@ -96,20 +111,23 @@ def test_a_pretrained_bundle_fine_tunes_identically_to_explicit_wiring():
     batch = {"text": np.tile(np.asarray([[1, 3, 5, 7, 0], [2, 4, 6, 8, 9]], np.int32),
                               (count // 2, 1))}
     step = Step(step=jnp.asarray(0), key=jax.random.key(13), ema=None)
-    loss = lambda objective: jax.jit(objective.scalar_loss)(objective.init(key), batch, step)[0]
+    def loss(objective):
+        return jax.jit(objective.scalar_loss)(objective.init(key), batch, step)[0]
     np.testing.assert_array_equal(loss(bundled), loss(explicit))
     data = Dataset(train=lambda partition: iter([batch]), val=None, records=count, batch=count)
     states = [Trainer(objective, optax.adamw(1e-3), key=key).fit(
         data, steps=1, log_every=100, checkpoint_every=None) for objective in (explicit, bundled)]
     assert int(states[1].updates) == 1
-    for actual, expected in zip(jax.tree.leaves(states[1].params), jax.tree.leaves(states[0].params), strict=True):
+    for actual, expected in zip(
+        jax.tree.leaves(states[1].params), jax.tree.leaves(states[0].params), strict=True
+    ):
         np.testing.assert_array_equal(actual, expected)
     assert any(not np.array_equal(actual, initial) for actual, initial in
                zip(jax.tree.leaves(states[1].params), jax.tree.leaves(source.variables), strict=True))
 
 
 def test_a_pretrained_bundle_refuses_a_second_initial_tree():
-    source = load_pretrained(FIXTURES / "llama-tiny", dtype="float32", attention_impl="xla")
+    source = Pretrained.load(FIXTURES / "llama-tiny", dtype="float32", attention_impl="xla")
     with pytest.raises(ValueError, match="already supplies"):
         source.lm_objective(4, pretrained=source.variables)
 
@@ -119,7 +137,7 @@ def test_media_prompts_are_processed_once_and_keep_their_continuations():
     continuation count, and the continuations expand afterwards: each row
     carries the prompt, the image features and the conditioned continuation of
     the prompt it sits under."""
-    loaded = load_pretrained(FIXTURES / "gemma3-native-tiny", dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(FIXTURES / "gemma3-native-tiny", dtype="float32", attention_impl="reference")
     images = np.load(FIXTURES / "gemma3-native-tiny" / "raw_images.npy")
     prompts = json.loads((FIXTURES / "gemma3-native-tiny" / "prompts.json").read_text())
     expected = np.load(FIXTURES / "gemma3-native-tiny" / "continuation.npy")
@@ -156,7 +174,7 @@ def test_media_prompts_are_processed_once_and_keep_their_continuations():
 
 
 def test_a_diffusion_gemma_source_generates_canvases_without_likelihood_claims():
-    loaded = load_pretrained(FIXTURES / "diffusion-gemma-workflow", dtype="float32", attention_impl="xla",
+    loaded = Pretrained.load(FIXTURES / "diffusion-gemma-workflow", dtype="float32", attention_impl="xla",
                              max_seq_len=32)
     task = loaded.block_generation()
     assert isinstance(task, BlockGeneration)
@@ -228,8 +246,10 @@ def test_text_decodes_lazily_through_the_bound_processor():
     params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
     bare = TextGeneration(model, params, sampling=Sampling(temperature=0))
     with pytest.raises(ValueError, match="no processor"):
-        bare([[1, 2]], 3, key=0).text
-    task = TextGeneration(model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0), max_new_tokens=3)
+        _ = bare([[1, 2]], 3, key=0).text
+    task = TextGeneration(
+        model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0), max_new_tokens=3
+    )
     result = task(["12", "5"], key=0)
     assert calls == []
     first = result.text
@@ -239,7 +259,7 @@ def test_text_decodes_lazily_through_the_bound_processor():
     assert rows.tokens.shape == (2, 2 + 3) and rows.tokens[1, 0] == 0
     assert result.text == task.decode(result)
     assert result.text == tuple("".join(str(token) for token in row[2:2 + length])
-                                for row, length in zip(rows.tokens, rows.lengths))
+                                for row, length in zip(rows.tokens, rows.lengths, strict=True))
 
 
 def test_a_prompt_batch_carries_validity_only_where_it_padded():
@@ -275,11 +295,17 @@ def test_a_task_moves_onto_a_mesh_with_the_variables_it_holds():
     from dew.training import Layout, MeshSpec
 
     model = decoder()
-    task = TextGeneration(model, model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)), sampling=SAMPLING)
+    task = TextGeneration(
+        model, model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)), sampling=SAMPLING
+    )
     placed = task.bind(place(task.variables, MeshSpec(), Layout(min_shard=1)))
-    assert {len(leaf.sharding.device_set) for leaf in jax.tree.leaves(placed.variables)} == {jax.device_count()}
+    assert {len(leaf.sharding.device_set) for leaf in jax.tree.leaves(placed.variables)} == {
+        jax.device_count()
+    }
     rows = [[1, 2, 3], [4, 5, 6]]
-    assert_same_generation(placed(rows, 5, key=jax.random.key(1)).host(), task(rows, 5, key=jax.random.key(1)).host())
+    assert_same_generation(
+        placed(rows, 5, key=jax.random.key(1)).host(), task(rows, 5, key=jax.random.key(1)).host()
+    )
 
 
 @pytest.mark.mesh
@@ -292,7 +318,7 @@ def test_a_placed_diffusion_gemma_task_keeps_its_rows_sharded_and_draws_the_same
     from dew.nn.inputs import BATCH_AXES
     from dew.training import Layout, MeshSpec
 
-    loaded = load_pretrained(FIXTURES / "diffusion-gemma-workflow", dtype="float32", attention_impl="xla",
+    loaded = Pretrained.load(FIXTURES / "diffusion-gemma-workflow", dtype="float32", attention_impl="xla",
                              max_seq_len=32)
     plain = loaded.block_generation()
     placed = plain.bind(place(loaded.variables, MeshSpec(fsdp=2), Layout(min_shard=2 ** 6)))
@@ -361,8 +387,8 @@ def test_pipeline_publishes_the_updated_policy_not_the_frozen_reference(kind, tm
     checkpoints = Checkpoints(str(tmp_path))
     checkpoints.save(int(state.step), state, None)
     checkpoints.wait()
-    config = ModelConfig("causal_transformer", dict(vocab_size=8, emb_features=16, num_layers=1,
-        num_heads=2, mlp_features=32, max_seq_len=8), dtype="float32", attention_impl="xla")
+    config = ModelConfig("causal_transformer", {"vocab_size": 8, "emb_features": 16, "num_layers": 1,
+        "num_heads": 2, "mlp_features": 32, "max_seq_len": 8}, dtype="float32", attention_impl="xla")
     (tmp_path / "run.json").write_text(json.dumps({"objective": kind, "model": asdict(config),
         "tokenizer": "byte", "sample_tokens": 1, "sampling": asdict(sampling)}))
     restored = dew.pipeline(str(tmp_path))([[1, 2]], key=3).host()

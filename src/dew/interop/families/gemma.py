@@ -41,6 +41,16 @@ from dew.nn.gemma3n import AltUp
 from dew.nn.mixers import AttentionMixer
 
 
+def _trailing_sharers(hf_config: Mapping[str, object], layers: int, default: int) -> tuple[int, ...] | None:
+    """`num_kv_shared_layers` as the indices of the trailing layers that share
+    their providers' keys and values (`first_kv_shared_layer_idx`,
+    modeling_gemma3n.py:1178, modeling_gemma4.py:1068), None for none."""
+    count = records.integer(hf_config.get("num_kv_shared_layers", default), "num_kv_shared_layers")
+    if not 0 <= count < layers:
+        _refuse(f"num_kv_shared_layers {count}", f"it has to leave a provider among {layers} layers")
+    return tuple(range(layers - count, layers)) or None
+
+
 def _gemma_layer_types(hf_config: Mapping[str, object], used: set[str], *,
                        last_full: bool = False) -> tuple[str, ...]:
     if hf_config.get('layer_types') is not None:
@@ -248,9 +258,7 @@ def _gemma3n_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderF
         per_layer_input_vocab=records.integer(
             hf_config.get("vocab_size_per_layer_input", 262144), "vocab_size_per_layer_input"
         ),
-        num_kv_shared_layers=records.integer(
-            hf_config.get("num_kv_shared_layers", 15), "num_kv_shared_layers"
-        ),
+        kv_shared_layers=_trailing_sharers(hf_config, layers, 15),
         final_logit_softcap=records.number(
             hf_config.get("final_logit_softcapping", 30.0), "final_logit_softcapping"
         ),
@@ -339,6 +347,7 @@ def _gemma4_config(hf_config: Mapping[str, object], used: set[str], *,
     per_layer = records.integer(
         hf_config.get("hidden_size_per_layer_input", 0), "hidden_size_per_layer_input"
     )
+    sharing = _trailing_sharers(hf_config, len(layer_types), 0)
     config.update(
         sandwich_norms=True,
         embedding_scale=True,
@@ -356,13 +365,8 @@ def _gemma4_config(hf_config: Mapping[str, object], used: set[str], *,
         partial_rotary_factor=partial,
         # The reference widens only sharing layers. With none, this flag
         # changes neither the weights nor the forward operation.
-        use_double_wide_mlp=(
-            bool(hf_config.get("use_double_wide_mlp", False))
-            and records.integer(hf_config.get("num_kv_shared_layers", 0), "num_kv_shared_layers") > 0
-        ),
-        num_kv_shared_layers=records.integer(
-            hf_config.get("num_kv_shared_layers", 0), "num_kv_shared_layers"
-        ),
+        use_double_wide_mlp=bool(hf_config.get("use_double_wide_mlp", False)) and sharing is not None,
+        kv_shared_layers=sharing,
         per_layer_input_dim=per_layer or None,
         per_layer_input_vocab=records.integer(
             hf_config.get(
@@ -488,7 +492,7 @@ def _gemma4_export(model: CausalTransformer) -> Mapping[str, object]:
             _refuse('mixture', 'Gemma4 routes a parallel expert branch on every layer')
         defaults = Mixture(experts=mixture.experts, top_k=mixture.top_k,
                            expert_features=mixture.expert_features, parallel=True)
-        represented = {'experts', 'top_k', 'expert_features', 'parallel', 'layers', 'every',
+        represented = {'experts', 'top_k', 'expert_features', 'parallel', 'layers',
                        'implementation', 'dispatch'}
         _fixed_mixture(mixture, defaults, represented,
                        'Gemma4 has its fixed parallel router and expert computation')

@@ -9,6 +9,7 @@ source-format export of both families lives in test_masked_diffusion_export.py.
 
 import json
 from dataclasses import asdict, replace
+from importlib import import_module
 from pathlib import Path
 
 import grain.python as grain
@@ -18,13 +19,12 @@ import numpy as np
 import optax
 import pytest
 
-import dew.nn.backbones.causal_transformer  # noqa: F401, registers the backbone
 from dew.checkpoints import Checkpoints
 from dew.config import ModelConfig
 from dew.data import Dataset
 from dew.diffusion.discrete import MDLM, Unmask
 from dew.inference import pipeline
-from dew.interop import load_pretrained
+from dew.interop import Pretrained
 from dew.interop.hf_decoders import translate_config, translate_weights
 from dew.nn.inputs import BATCH_AXES, ModelInputs
 from dew.objectives.base import Step
@@ -32,6 +32,8 @@ from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.registry import models, with_precision
 from dew.sampling import Sampling, sample
 from dew.training import Layout, MeshSpec, Trainer
+
+import_module("dew.nn.backbones.causal_transformer")  # registers the backbone
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 
@@ -136,7 +138,7 @@ def test_the_trainer_builds_its_state_from_the_held_checkpoint():
 
 @pytest.fixture(scope="module", params=["llada-tiny", "dream-tiny"])
 def masked_source(request):
-    source = load_pretrained(FIXTURES / request.param, dtype="float32", attention_impl="xla")
+    source = Pretrained.load(FIXTURES / request.param, dtype="float32", attention_impl="xla")
     tokens = jnp.asarray([[0, 120, 5, 6], [1, 2, 3, 4], [0, 0, 7, 8]])
     fields = {"attention_mask": jnp.asarray([[0, 1, 1, 1], [1, 1, 1, 1], [0, 0, 1, 1]], bool),
               "positions": jnp.asarray([[0, 3, 4, 5], [0, 1, 2, 3], [0, 0, 4, 5]])}
@@ -152,10 +154,12 @@ def test_native_masked_task_matches_direct_mdlm_trajectory(masked_source):
     assert np.all(result.tokens[:, 4:] != 120)
     np.testing.assert_array_equal(result.lengths, 8)
     np.testing.assert_array_equal(result.decoder_steps, 5)
-    np.testing.assert_array_equal(result.terminated, False)
+    np.testing.assert_array_equal(result.terminated, desired=False)
     for row in range(3):
         tokens = jnp.concatenate([inputs.tokens[row:row + 1], jnp.full((1, 8), 120)], axis=1)
-        valid = jnp.concatenate([inputs.token_fields["attention_mask"][row:row + 1], jnp.ones((1, 8), bool)], axis=1)
+        valid = jnp.concatenate(
+            [inputs.token_fields["attention_mask"][row : row + 1], jnp.ones((1, 8), bool)], axis=1
+        )
         positions = inputs.token_fields["positions"][row:row + 1]
         positions = jnp.concatenate([positions, positions.max() + jnp.arange(1, 9)[None]], axis=1)
         prepared = ModelInputs(tokens, {"attention_mask": valid, "positions": positions})
@@ -236,7 +240,9 @@ def test_masked_training_resume_publish_and_run_pipeline(masked_source, tmp_path
     for left, right in zip(jax.tree.leaves(resumed.averaged), jax.tree.leaves(direct.averaged), strict=True):
         np.testing.assert_array_equal(left, right)
 
-    fields = {name: value for name, value in source.model_config.items() if name not in ("dtype", "attention_impl")}
+    fields = {
+        name: value for name, value in source.model_config.items() if name not in ("dtype", "attention_impl")
+    }
     config = ModelConfig("causal_transformer", fields, dtype="bfloat16", attention_impl="xla")
     (tmp_path / "run" / "run.json").write_text(json.dumps({
         "objective": "masked_diffusion", "model": asdict(config), "tokenizer": "byte", "sample_tokens": 8}))
@@ -260,7 +266,7 @@ def test_masked_training_resume_publish_and_run_pipeline(masked_source, tmp_path
     assert all(leaf.dtype == jnp.bfloat16 for leaf in jax.tree.leaves(converted.variables))
 
     source.save(tmp_path / "published", variables=resumed.params)
-    reloaded = load_pretrained(tmp_path / "published", dtype="bfloat16", attention_impl="xla")
+    reloaded = Pretrained.load(tmp_path / "published", dtype="bfloat16", attention_impl="xla")
     expected = live(prompt, 8, key=7).host().tokens
     np.testing.assert_array_equal(reloaded.text_generation()(prompt, 8, key=7).host().tokens, expected)
     np.testing.assert_array_equal(pipeline(str(tmp_path / "published"), dtype="bfloat16")(
@@ -276,10 +282,20 @@ def test_masked_continuation_uses_last_valid_packed_segment(masked_source):
         "attention_mask": jnp.asarray([[1, 1, 1, 0, 0]], bool),
         "positions": jnp.asarray([[0, 1, 2, 42, 42]]),
         "segment_ids": jnp.asarray([[2, 2, 2, 0, 0]])})
-    packed = ModelInputs(jnp.concatenate([jnp.arange(1, 17)[None], final.tokens], axis=1), {
-        "attention_mask": jnp.concatenate([jnp.ones((1, 16), bool), final.token_fields["attention_mask"]], axis=1),
-        "positions": jnp.concatenate([jnp.arange(100, 116)[None], final.token_fields["positions"]], axis=1),
-        "segment_ids": jnp.concatenate([jnp.ones((1, 16), jnp.int32), final.token_fields["segment_ids"]], axis=1)})
+    packed = ModelInputs(
+        jnp.concatenate([jnp.arange(1, 17)[None], final.tokens], axis=1),
+        {
+            "attention_mask": jnp.concatenate(
+                [jnp.ones((1, 16), bool), final.token_fields["attention_mask"]], axis=1
+            ),
+            "positions": jnp.concatenate(
+                [jnp.arange(100, 116)[None], final.token_fields["positions"]], axis=1
+            ),
+            "segment_ids": jnp.concatenate(
+                [jnp.ones((1, 16), jnp.int32), final.token_fields["segment_ids"]], axis=1
+            ),
+        },
+    )
     alone = task(final, 8, key=7, steps=1).host()
     together = task(packed, 8, key=7, steps=1).host()
     np.testing.assert_array_equal(together.tokens[:, :21], packed.tokens)
@@ -320,12 +336,16 @@ def test_masked_task_refuses_media_and_non_scalar_logical_positions(masked_sourc
         with pytest.raises(ValueError, match=name):
             task(replace(inputs, token_fields={**inputs.token_fields, name: jnp.full((3, 4), -1)}), 8, key=7)
     with pytest.raises(ValueError, match="positions"):
-        task(replace(inputs, token_fields={**inputs.token_fields, "positions": jnp.zeros((3, 4, 3))}), 8, key=7)
+        task(
+            replace(inputs, token_fields={**inputs.token_fields, "positions": jnp.zeros((3, 4, 3))}), 8, key=7
+        )
 
 
 def test_saved_masked_run_refuses_invalid_sample_budget(masked_source, tmp_path):
     source, _ = masked_source
-    fields = {name: value for name, value in source.model_config.items() if name not in ("dtype", "attention_impl")}
+    fields = {
+        name: value for name, value in source.model_config.items() if name not in ("dtype", "attention_impl")
+    }
     config = ModelConfig("causal_transformer", fields, dtype="float32", attention_impl="xla")
     for budget in (-1, True, "8"):
         (tmp_path / "run.json").write_text(json.dumps({"objective": "masked_diffusion",

@@ -299,8 +299,10 @@ def test_an_explicit_mask_is_anded_into_the_descriptor():
     """A dense mask does not replace the structural one; a causal call with a
     block-diagonal mask keeps both."""
     packed = np.asarray(document_mask(packed_ids((100, 84, 72))[:1]))[:, None]
-    descriptor = splash_mask_descriptor(256, 256, 2, True, None, packed)
-    expected = np.asarray(combined_attention_mask(256, 256, True, None, jnp.asarray(packed)))
+    descriptor = splash_mask_descriptor(256, 256, 2, causal=True, sliding_window=None, mask=packed)
+    expected = np.asarray(
+        combined_attention_mask(256, 256, causal=True, sliding_window=None, mask=jnp.asarray(packed))
+    )
     assert np.array_equal(dense(descriptor, 2, 256, 256),
                           np.broadcast_to(expected, (1, 2, 256, 256)))
 
@@ -326,7 +328,9 @@ def test_a_dense_mask_repeats_one_head_across_the_query_heads(leading):
 def test_a_mask_splash_cannot_carry_is_refused_at_the_descriptor(shape, q_len, kv_len, reason):
     mask = np.ones(shape, bool)
     assert splash_dense_mask(mask, q_len, kv_len, 4) is None, reason
-    assert splash_mask_descriptor(q_len, kv_len, 4, True, None, mask) is None, reason
+    assert splash_mask_descriptor(q_len, kv_len, 4, causal=True, sliding_window=None, mask=mask) is None, (
+        reason
+    )
 
 
 def test_a_traced_mask_is_refused_at_the_descriptor():
@@ -336,7 +340,7 @@ def test_a_traced_mask_is_refused_at_the_descriptor():
     seen = []
 
     def build(mask):
-        seen.append(splash_mask_descriptor(256, 256, 4, True, None, mask))
+        seen.append(splash_mask_descriptor(256, 256, 4, causal=True, sliding_window=None, mask=mask))
         return mask
 
     jax.jit(build)(jnp.ones((1, 1, 256, 256), bool))
@@ -390,9 +394,21 @@ def test_a_bf16_call_runs_the_kernels_at_the_default_precision_under_highest(bia
     additive = jnp.zeros((1, 2, 256, 256), jnp.float32) if bias else None
 
     def loss(query, key, value):
-        return jnp.sum(tpu_attention(query, key, value, additive, None, True, None, softcap=None,
-                                     sinks=None, segment_ids=None, interpret=False)
-                       .astype(jnp.float32))
+        return jnp.sum(
+            tpu_attention(
+                query,
+                key,
+                value,
+                additive,
+                None,
+                causal=True,
+                sliding_window=None,
+                softcap=None,
+                sinks=None,
+                segment_ids=None,
+                interpret=False,
+            ).astype(jnp.float32)
+        )
 
     with jax.default_matmul_precision("highest"):
         program = str(jax.make_jaxpr(jax.grad(loss, argnums=(0, 1, 2)))(query, query, query))

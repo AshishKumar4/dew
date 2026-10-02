@@ -486,7 +486,7 @@ def with_precision(name: str, config: Mapping[str, object], *,
 
 models: Registry[type[nn.Module], nn.Module] = Registry("model")
 presets: Registry[type[Preset], Preset] = Registry("preset")
-samplers: Registry[type[Solver[Any]], Solver[Any]] = Registry("sampler")
+solvers: Registry[type[Solver[Any]], Solver[Any]] = Registry("solver")
 datasets: Registry[type[DatasetSpec], DatasetSpec] = Registry("dataset")
 encoders: Registry[type[ConditionEncoder[Any]], ConditionEncoder[Any]] = Registry("encoder")
 metrics: Registry[Callable[..., Metric], Metric] = Registry("metric")
@@ -498,25 +498,22 @@ schedules: Registry[type[ScheduleBase], ScheduleBase] = Registry("schedule", rec
 
 # Core records nest their fields under a name; model component records inline
 # their fields beside the kind discriminator `Registry.from_record` reads.
-REGISTRIES = (models, presets, samplers, datasets, encoders, metrics, objectives,
+REGISTRIES = (models, presets, solvers, datasets, encoders, metrics, objectives,
               mixers, towers, projectors, schedules)
 
 __all__ = [
     "REGISTRIES",
     "Registry",
     "datasets",
-    "dtype_name",
     "encoders",
-    "float64_twin",
     "metrics",
     "mixers",
     "models",
     "objectives",
     "presets",
     "projectors",
-    "resolve_dtype",
-    "samplers",
     "schedules",
+    "solvers",
     "towers",
     "with_precision",
 ]

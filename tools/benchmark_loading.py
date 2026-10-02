@@ -51,7 +51,6 @@ def phases(args):
 
     pipelines.restore_variables = measured('read_s', pipelines.restore_variables)
     DiffusionRunConfig.build = measured('build_s', DiffusionRunConfig.build)
-    pipelines._with_drawn_tables = measured('build_s', pipelines._with_drawn_tables)
     load = time.perf_counter()
     with jax.default_matmul_precision('highest'):
         pipe = (TextToImage.from_run(args.source) if os.path.isdir(args.source) else
@@ -60,7 +59,7 @@ def phases(args):
         if args.sample:
             begin = time.perf_counter()
             result = pipe(['a red fox in a snowy forest'], seed=0, steps=args.steps,
-                          sampler=DPMSolverMultistep(), guidance=CFG(5.0)).host()
+                          solver=DPMSolverMultistep(), guidance=CFG(5.0)).host()
             timings['first_sample_s'] = time.perf_counter() - begin
             timings['from_pretrained_to_first_sample_s'] = time.perf_counter() - load
             timings['process_to_first_sample_s'] = time.perf_counter() - start

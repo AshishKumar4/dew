@@ -34,6 +34,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.scatter import DROPPED
 
+from .attention import unweighted_rmsnorm
 from .blocks import normal_kernel
 from .inputs import AttentionMetadata
 from .precision import at_least_fp32
@@ -574,9 +575,7 @@ class RMSNormGated(nn.Module):
     def __call__(self, x, gate):
         dtype = self.dtype if self.dtype is not None else x.dtype
         wide = at_least_fp32(x.dtype)
-        y = x.astype(wide)
-        y = y * jax.lax.rsqrt(
-            jnp.mean(jnp.square(y), axis=-1, keepdims=True) + self.epsilon)
+        y = unweighted_rmsnorm(x.astype(wide), self.epsilon)
         scale = self.param('weight', nn.initializers.ones,
                            (x.shape[-1],), jnp.float32)
         y = y * scale.astype(wide)

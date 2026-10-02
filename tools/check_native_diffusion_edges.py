@@ -51,7 +51,7 @@ def check(directory, case):
         np.testing.assert_allclose(model_times, expected_times, atol=1e-5, rtol=1e-5)
         initial = jnp.asarray([[10.0, -8.0, 0.3]]) * process.sampler_schedule.prior_scale()
         denoise = process.denoiser(Oracle(), {}, {})
-        result = sample(denoise, initial, solver=policy.solver(), times=times,
+        result = sample(denoise, initial, solver=policy.solver, times=times,
                         key=jax.random.PRNGKey(0), final_denoise=False)
         errors["trajectory"] = float(np.max(np.abs(result - ref[case + ".final"])))
         np.testing.assert_allclose(result, ref[case + ".final"], atol=1e-4, rtol=1e-4)

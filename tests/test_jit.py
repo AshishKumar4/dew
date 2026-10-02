@@ -35,7 +35,7 @@ def test_the_loss_is_the_references_velocity_error():
     Dew's L2 is half of that."""
     process = presets.JiT()()
     objective = DiffusionObjective(Clean(), process, InputSpec(Field("image", (4, 4, 3))), guidance=None,
-                                   sampler=Euler(), steps=2, ema_decay=None)
+                                   solver=Euler(), steps=2, ema_decay=None)
     params = objective.init(jax.random.PRNGKey(0))
     batch = {"image": np.asarray(jax.random.randint(jax.random.PRNGKey(1), (6, 4, 4, 3), 0, 256), np.uint8)}
     step = Step(step=jnp.asarray(0), key=jax.random.PRNGKey(2), ema=None)

@@ -57,7 +57,7 @@ def test_mixer_prefill_and_resume_follow_each_rows_real_tokens(kind):
                                head_k_dim=4, head_v_dim=4, conv_kernel=4,
                                dtype=jnp.float32)
     else:
-        sparse = dict(index_topk=3, index_n_heads=2, index_head_dim=8) if kind == "sparse" else {}
+        sparse = {"index_topk": 3, "index_n_heads": 2, "index_head_dim": 8} if kind == "sparse" else {}
         module = MultiHeadLatentAttention(
             emb_features=16, num_heads=2, max_seq_len=8, q_lora_rank=8,
             kv_lora_rank=8, qk_nope_head_dim=4, qk_rope_head_dim=4, v_head_dim=4,

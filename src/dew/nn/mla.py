@@ -125,6 +125,13 @@ def indexer_kl(scores, query, key, keep, scale: float):
     return jnp.sum(xlogy(target, target) - target * log_indexer, axis=-1)
 
 
+def _rotate(interleave: bool, part, freqs_cos, freqs_sin):
+    """Rotate a rope slice in interleaved pairs (DeepSeek's main head, GLM's
+    indexer) or half-split ones (V3.2's indexer)."""
+    rotate = apply_rotary_interleave if interleave else apply_rotary
+    return rotate(part, freqs_cos, freqs_sin)
+
+
 @logical_axes({
     ("wq_b",): ("qlora", "index"),
     ("wk",): ("embed", "index"),
@@ -172,11 +179,6 @@ class SparseIndexer(nn.Module):
         """The indexer's keys for these hidden states: `[B, S, head_dim]`."""
         return self.k_norm(self.wk(jax.lax.stop_gradient(hidden)))
 
-    def _rotate(self, part, freqs_cos, freqs_sin):
-        if self.rope_interleave:
-            return apply_rotary_interleave(part, freqs_cos, freqs_sin)
-        return apply_rotary(part, freqs_cos, freqs_sin)
-
     def rotated_keys(self, keys, freqs_cos, freqs_sin):
         """`keys` with their rope slice rotated at their own positions.
 
@@ -185,7 +187,7 @@ class SparseIndexer(nn.Module):
         what the reference's `update_indexer` ordering does.
         """
         k_rot, k_pass = jnp.split(keys, [self.rope_head_dim], axis=-1)
-        k_rot = self._rotate(k_rot[:, :, None, :], freqs_cos, freqs_sin)
+        k_rot = _rotate(self.rope_interleave, k_rot[:, :, None, :], freqs_cos, freqs_sin)
         return jnp.concatenate([k_rot[:, :, 0, :], k_pass], axis=-1)
 
     def scores(self, hidden, q_resid, keys, freqs_cos, freqs_sin):
@@ -203,7 +205,7 @@ class SparseIndexer(nn.Module):
             batch, length, self.n_heads, self.head_dim)
         q_rot, q_pass = jnp.split(query, [self.rope_head_dim], axis=-1)
         query = jnp.concatenate(
-            [self._rotate(q_rot, freqs_cos, freqs_sin), q_pass], axis=-1)
+            [_rotate(self.rope_interleave, q_rot, freqs_cos, freqs_sin), q_pass], axis=-1)
         wide = at_least_fp32(query.dtype)
         scores = jnp.matmul(
             query.astype(wide),
@@ -430,11 +432,6 @@ class MultiHeadLatentAttention(nn.Module):
         latent, rot = jnp.split(compressed, [self.kv_lora_rank], axis=-1)
         return constrain(self.kv_a_layernorm(latent), RESIDUAL), constrain(rot, RESIDUAL)
 
-    def _rotate(self, part, freqs_cos, freqs_sin):
-        if self.rope_interleave:
-            return apply_rotary_interleave(part, freqs_cos, freqs_sin)
-        return apply_rotary(part, freqs_cos, freqs_sin)
-
     def _rotated(self, q_rot, rot, positions):
         """Rotate the query's and the latent's rope heads at `positions`.
 
@@ -448,8 +445,8 @@ class MultiHeadLatentAttention(nn.Module):
         freqs_cos, freqs_sin = yarn_rope_freqs(
             positions, self.qk_rope_head_dim, self.rope_theta, self.yarn,
             dtype=at_least_fp32(q_rot.dtype))
-        return (self._rotate(q_rot, freqs_cos, freqs_sin),
-                self._rotate(rot[:, :, None, :], freqs_cos, freqs_sin)[:, :, 0, :],
+        return (_rotate(self.rope_interleave, q_rot, freqs_cos, freqs_sin),
+                _rotate(self.rope_interleave, rot[:, :, None, :], freqs_cos, freqs_sin)[:, :, 0, :],
                 freqs_cos, freqs_sin)
 
     def _expand(self, latent, rot):

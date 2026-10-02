@@ -64,7 +64,7 @@ def test_a_run_config_builds_the_unet_and_scores_a_batch():
     """The run's precision settings reach the model as every registered
     model takes them, attention kernel included."""
     from dew.config import ModelConfig
-    from dew.data import OxfordFlowers
+    from dew.data import TFDSImages
     from dew.diffusion.presets import EDM
     from dew.objectives import Step
     from dew.objectives.diffusion import DiffusionRunConfig, TextCondition
@@ -74,8 +74,8 @@ def test_a_run_config_builds_the_unet_and_scores_a_batch():
         model=ModelConfig("edm2_unet", {"model_channels": 8, "channel_mult": [1, 2], "num_blocks": 1,
                                         "attn_resolutions": [2], "channels_per_head": 8},
                           dtype="float32", attention_impl="xla"),
-        data=OxfordFlowers(image_size=4), preset=EDM(regime="pixel"),
-        sampler=Euler(), guidance=None, sampling_steps=2, ema_decay=None,
+        data=TFDSImages(image_size=4), preset=EDM(regime="pixel"),
+        solver=Euler(), guidance=None, sampling_steps=2, ema_decay=None,
         val_metrics=(), text=TextCondition(encoder="char_table", checkpoint="char_table"),
         uncertainty=8)
     objective = config.build()
@@ -141,7 +141,7 @@ def test_the_uncertainty_head_learns_each_levels_weighted_error():
     process = presets.EDM(regime="pixel")()
     objective = DiffusionObjective(Linear(), process, InputSpec(Field("image", (4, 4, 3))),
                                    uncertainty=32, ema_decay=None, guidance=None,
-                                   sampler=Euler(), steps=2)
+                                   solver=Euler(), steps=2)
     params = objective.init(jax.random.PRNGKey(0))
     batch = {"image": np.asarray(jax.random.randint(jax.random.PRNGKey(1), (64, 4, 4, 3), 0, 256),
                                  np.uint8)}

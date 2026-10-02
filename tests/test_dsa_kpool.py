@@ -40,10 +40,10 @@ B, S, E, H = 2, 11, 32, 4
 PADDED = 3
 """Leading slots of the second row the attention mask marks as padding."""
 
-SETTINGS = dict(
-    q_lora_rank=8, kv_lora_rank=8, qk_nope_head_dim=8, v_head_dim=8,
-    index_n_heads=2, index_head_dim=8, index_topk=4, index_kpool=2,
-    index_kpool_always_select_tail=True)
+SETTINGS = {
+    "q_lora_rank": 8, "kv_lora_rank": 8, "qk_nope_head_dim": 8, "v_head_dim": 8,
+    "index_n_heads": 2, "index_head_dim": 8, "index_topk": 4, "index_kpool": 2,
+    "index_kpool_always_select_tail": True}
 
 
 def reference_block(attention_bias: bool = False) -> Glm5NextTextAttention:
@@ -73,9 +73,9 @@ def dew_leaf(name: str) -> tuple[str, bool]:
     weights scales, biases and the compression tables stay as they are."""
     parts = name.split('.')
     if parts[-1] == 'weight' and parts[-2] in ('q_a_layernorm', 'kv_a_layernorm', 'k_norm'):
-        return '.'.join(parts[:-1] + ['scale']), False
+        return '.'.join([*parts[:-1], 'scale']), False
     if parts[-1] == 'weight':
-        return '.'.join(parts[:-1] + ['kernel']), True
+        return '.'.join([*parts[:-1], 'kernel']), True
     return name, False
 
 
@@ -151,7 +151,9 @@ def test_the_block_matches_the_reference_and_is_sparse():
 
     ours = np.asarray(module().apply(variables, jnp.asarray(hidden), attention_metadata=metadata))
     assert scaled(ours[valid], wanted[valid]) < BOUND
-    dense = np.asarray(module(index_topk=64).apply(variables, jnp.asarray(hidden), attention_metadata=metadata))
+    dense = np.asarray(
+        module(index_topk=64).apply(variables, jnp.asarray(hidden), attention_metadata=metadata)
+    )
     assert scaled(dense[valid], wanted[valid]) > 1e-2
 
 
@@ -179,7 +181,8 @@ def test_the_gradients_match_torch_autograd():
     block = reference_block()
     hidden, valid = inputs()
     cotangent = np.random.RandomState(1).randn(B, S, E).astype(np.float32) * valid[..., None]
-    x = torch.from_numpy(hidden).requires_grad_(True)
+    needs_grad = True
+    x = torch.from_numpy(hidden).requires_grad_(needs_grad)
     block(x, torch.from_numpy(valid))[0].mul(torch.from_numpy(cotangent)).sum().backward()
     theirs = {name: None if p.grad is None else p.grad.numpy() for name, p in block.named_parameters()}
     assert x.grad is not None
@@ -223,8 +226,13 @@ def decode_steps(block_module, variables, hidden, valid, prefill: int):
                                     attention_metadata=metadata(0, prefill), mutable=["cache"])
     steps = [out]
     for position in range(prefill, S):
-        out, state = block_module.apply({**variables, **state}, x[:, position:position + 1], decode=True,
-                                        attention_metadata=metadata(position, position + 1), mutable=["cache"])
+        out, state = block_module.apply(
+            {**variables, **state},
+            x[:, position : position + 1],
+            decode=True,
+            attention_metadata=metadata(position, position + 1),
+            mutable=["cache"],
+        )
         steps.append(out)
     return np.asarray(jnp.concatenate(steps, axis=1))
 
@@ -309,9 +317,13 @@ def test_prediction_selection_seed_miss_hit_and_fixed_tail():
     np.testing.assert_array_equal(drafted["cache"]["selection_position"], [4, 2])
     assert 2 in np.asarray(drafted["cache"]["selection_indices"])[1]
     _, next_draft = selection_step(block, variables, drafted["cache"], x[:, 6:7], active[:, 6:7], "draft")
-    np.testing.assert_array_equal(next_draft["cache"]["selection_indices"], drafted["cache"]["selection_indices"])
+    np.testing.assert_array_equal(
+        next_draft["cache"]["selection_indices"], drafted["cache"]["selection_indices"]
+    )
     assert 6 not in np.asarray(next_draft["cache"]["selection_indices"])[0]
-    ordinary, cleared = selection_step(block, variables, next_draft["cache"], x[:, 7:8], active[:, 7:8], "ordinary")
+    ordinary, cleared = selection_step(
+        block, variables, next_draft["cache"], x[:, 7:8], active[:, 7:8], "ordinary"
+    )
     canonical = {name: value for name, value in next_draft["cache"].items()
                  if name not in ("selection_indices", "selection_position")}
     expected, _ = selection_step(block, variables, canonical, x[:, 7:8], active[:, 7:8], "ordinary")

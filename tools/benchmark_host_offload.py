@@ -37,7 +37,7 @@ import numpy as np
 import tyro
 
 import dew.nn.backbones  # noqa: F401  (registers the kind)
-from dew.inference.banks import at_namespace, host_banked, in_namespace, narrowed, one_layer
+from dew.inference.banks import LayerBanks, at_namespace, in_namespace, narrowed, one_layer
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import Variables
 from dew.registry import models, with_precision
@@ -73,7 +73,7 @@ class OffloadConfig:
 
 
 @dataclasses.dataclass(frozen=True)
-class SyntheticBanks:
+class SyntheticBanks(LayerBanks):
     """Generated weights of a given shape, one bank at a time.
 
     Every leaf of every layer is filled independently: the index of the
@@ -276,7 +276,7 @@ def measure(config: OffloadConfig, depth: int, offload: bool) -> dict:
         return record
 
     started = time.perf_counter()
-    store = host_banked(model, SyntheticBanks(shapes), mesh=mesh, layout=layout)
+    store = SyntheticBanks(shapes).place(model, mesh=mesh, layout=layout)
     jax.block_until_ready(store)
     record["load_seconds"] = time.perf_counter() - started
     record["rss_loaded"] = status()

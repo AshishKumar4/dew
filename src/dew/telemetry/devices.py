@@ -8,8 +8,10 @@ reach the environment before the first JAX call of the process.
 import ctypes
 import logging
 import os
+import sys
 
 _log = logging.getLogger(__name__)
+_late_policy_warned = False
 
 
 def apply_xla_flags(flags: str | None) -> None:
@@ -40,6 +42,30 @@ def xla_flag(name: str) -> str | None:
         elif token.startswith(f"--{name}="):
             value = token.split('=', 1)[1]
     return value
+
+
+def keep_roundings() -> None:
+    """Keep declared narrow-dtype roundings unless the caller names XLA's policy.
+
+    Fusion must not normalize an unrounded FP32 value where the program
+    produces a BF16 sum. `import dew` applies it before the process's first
+    JAX computation: XLA reads these flags when its backend opens. In an
+    already-used notebook, restart with
+    `XLA_FLAGS=--xla_allow_excess_precision=false` set before importing JAX.
+    """
+    global _late_policy_warned
+    # Private JAX query pinned by jax<0.11.3; the fresh-process late-import
+    # test covers this path without opening a backend just to inspect it.
+    bridge = sys.modules.get("jax._src.xla_bridge")
+    if bridge is not None and bridge.backends_are_initialized():
+        if not _late_policy_warned:
+            _late_policy_warned = True
+            _log.warning(
+                "Dew was imported after the JAX backend opened; its numerical policy cannot take effect. "
+                "Restart with XLA_FLAGS=--xla_allow_excess_precision=false set before importing JAX.")
+        return
+    if xla_flag("xla_allow_excess_precision") is None:
+        apply_xla_flags("--xla_allow_excess_precision=false")
 
 
 def deterministic_ops_requested() -> bool:
