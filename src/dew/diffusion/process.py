@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 
@@ -9,9 +10,11 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn, struct
 
+from dew.diffusion import schedules, transforms
 from dew.diffusion.schedules import NoiseScheduler
 from dew.diffusion.transforms import PredictionTransform, ScheduleWeighting, Weighting, broadcast_rates
 from dew.objectives.base import Variables
+from dew.records import json_value
 
 
 @struct.dataclass
@@ -90,15 +93,12 @@ class Process:
 
     def to_json(self) -> dict:
         """The built-in schedule, prediction and weighting constructor records."""
-        from dew.diffusion import schedules, transforms
-        from dew.records import json_value
         def component(value, module):
             cls = type(value)
             if getattr(module, cls.__name__, None) is not cls:
                 raise TypeError(f"{cls.__name__} needs an explicit process record declaration")
             if isinstance(value, schedules.DiscreteNoiseScheduler):
                 return {'name': 'DiscreteNoiseScheduler', 'fields': value._record_fields}
-            import inspect
             fields = {}
             for name in inspect.signature(cls).parameters:
                 if name in ('args', 'kwargs'):
@@ -117,7 +117,6 @@ class Process:
     @classmethod
     def from_json(cls, record: Mapping) -> Process:
         """Rebuild only maintained built-in components; never import arbitrary record classes."""
-        from dew.diffusion import schedules, transforms
         def component[Part](spec, module, expected: type[Part]) -> Part:
             name, fields = spec['name'], dict(spec['fields'])
             member = getattr(module, name, None)

@@ -705,7 +705,8 @@ class Checkpoints:
         return retained
 
     def artifact(self, step: int | str | None = None) -> JSON:
-        """The inference declaration saved with the selected step, or None for old/custom steps."""
+        """The selected step's inference declaration, or None when its objective
+        declares no inference record."""
         step = self.resolve(step)
         step = self.latest if step is None else step
         if step is None:
