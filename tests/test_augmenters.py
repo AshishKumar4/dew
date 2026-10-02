@@ -113,24 +113,27 @@ def _record_rng(key):
 def test_module_imports_and_constructs_without_torchvision(tmp_path):
     """A base install without torchvision imports, constructs and augments."""
     labels_file = _write_labels(tmp_path)
-    script = "\n".join([
-        "import sys",
-        "sys.modules['torchvision'] = None",
-        "sys.modules['transformers'] = None",
-        "",
-        "import numpy as np",
-        "from dew.data import ArrayRecordImages, TFDSImages",
-        "from dew.data.images import ImageTransform, augment_image, image_augmentations",
-        "",
-        "labels = sys.argv[1]",
-        "image = np.zeros((9, 11, 3), dtype=np.uint8)",
-        "for mode in ('none', 'flip_only', 'flip_jitter'):",
-        "    for spec in (TFDSImages(labels=labels, augmentation=mode), ArrayRecordImages(augmentation=mode)):",
-        "        ImageTransform(spec)",
-        "    out = augment_image(image_augmentations(mode), image, np.random.default_rng(0))",
-        "    assert out.dtype == np.uint8 and out.shape == image.shape",
-        "print('ok')",
-    ])
+    script = "\n".join(
+        [
+            "import sys",
+            "sys.modules['torchvision'] = None",
+            "sys.modules['transformers'] = None",
+            "",
+            "import numpy as np",
+            "from dew.data import ArrayRecordImages, TFDSImages",
+            "from dew.data.images import ImageTransform, augment_image, image_augmentations",
+            "",
+            "labels = sys.argv[1]",
+            "image = np.zeros((9, 11, 3), dtype=np.uint8)",
+            "for mode in ('none', 'flip_only', 'flip_jitter'):",
+            "    for spec in (TFDSImages(labels=labels, augmentation=mode), "
+            "ArrayRecordImages(augmentation=mode)):",
+            "        ImageTransform(spec)",
+            "    out = augment_image(image_augmentations(mode), image, np.random.default_rng(0))",
+            "    assert out.dtype == np.uint8 and out.shape == image.shape",
+            "print('ok')",
+        ]
+    )
     env = dict(os.environ, PYTHONPATH=str(REPO_ROOT / "src"), JAX_PLATFORMS="cpu")
     result = subprocess.run(
         [sys.executable, "-c", script, str(labels_file)],
@@ -356,7 +359,9 @@ def test_a_record_caption_is_taken_as_it_is(column):
 
 
 def test_a_record_with_no_caption_column_says_what_it_has():
-    with pytest.raises(KeyError, match=r"one of the columns \['caption', 'text'\], this one has \['image', 'url'\]"):
+    with pytest.raises(
+        KeyError, match=r"one of the columns \['caption', 'text'\], this one has \['image', 'url'\]"
+    ):
         images.record_caption({"image": None, "url": "x"})
 
 

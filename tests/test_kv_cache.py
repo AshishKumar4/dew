@@ -152,7 +152,8 @@ def test_native_gpu_paged_value_and_vjp_keep_the_gathered_attention(without_dete
         out = function(q, k, v)
         return jnp.sum(out.astype(jnp.float32) ** 2), out
 
-    native = lambda q, k, v: _gpu_paged(q, k, v, table, lengths)  # noqa: E731
+    def native(q, k, v):
+        return _gpu_paged(q, k, v, table, lengths)
     (_, out), gradients = jax.jit(jax.value_and_grad(lambda q, k, v: loss(native, q, k, v),
                                                      argnums=(0, 1, 2), has_aux=True))(q, k, v)
     (_, prior), previous = jax.jit(jax.value_and_grad(lambda q, k, v: loss(old, q, k, v),
@@ -171,8 +172,9 @@ def test_native_gpu_paged_value_and_vjp_keep_the_gathered_attention(without_dete
             value = reference(q, k, v)
             return jnp.sum(value ** 2), value
 
-        (_, truth), derivatives = jax.jit(jax.value_and_grad(reference_loss, argnums=(0, 1, 2), has_aux=True))(
-            q.astype(jnp.float64), k.astype(jnp.float64), v.astype(jnp.float64))
+        (_, truth), derivatives = jax.jit(
+            jax.value_and_grad(reference_loss, argnums=(0, 1, 2), has_aux=True)
+        )(q.astype(jnp.float64), k.astype(jnp.float64), v.astype(jnp.float64))
         for actual, expected in zip((out, *gradients), (truth, *derivatives), strict=True):
             expected = np.asarray(expected)
             assert np.abs(np.asarray(actual, np.float64) - expected).max() <= 2 ** -6 * np.abs(expected).max()

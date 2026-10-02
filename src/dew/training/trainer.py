@@ -235,16 +235,27 @@ def goodput(wall: float, first_step: float | None, other: float) -> dict[str, fl
 
 
 def step_compiler_options(objective) -> jax.stages.CompilerOptions | None:
-    """XLA options for this objective's training step on this device: Triton
-    GEMM fusions off where `TRITON_GEMM_OFF_GENERATIONS` measured a win and
-    no mixer of the model keeps them, unless the run set the flag itself."""
-    if (device_generation() not in TRITON_GEMM_OFF_GENERATIONS
-            or xla_flag('xla_gpu_enable_triton_gemm') is not None):
-        return None
+    """XLA options for this objective's training step on this device, each
+    unless the run set its flag itself.
+
+    On a GPU, dots that share an input (q, k and v; gate and up) run apart:
+    XLA's dot merger would run them as one GEMM over their weights
+    concatenated afresh every step, 4.0 ms of Qwen3-0.6B's step at 1 x 1024,
+    and an RTX 4080 trained Qwen3-0.6B's widths, a 3-layer decoder,
+    SimpleDiT-B and the hybrid DiT 0.4-3.5% faster without it
+    (docs/performance.md). Decoding keeps the merger: its 32-token GEMMs
+    lost 5-15% apart. And Triton GEMM fusions go off where
+    `TRITON_GEMM_OFF_GENERATIONS` measured a win and no mixer of the model
+    keeps them."""
+    generation = device_generation()
+    options: dict[str, bool | int] = {}
+    if generation.startswith('sm') and xla_flag('xla_gpu_dot_merger_threshold_mb') is None:
+        options['xla_gpu_dot_merger_threshold_mb'] = 0
     model = _model_of(objective)
-    if model is None or _keeps_triton_gemm(model):
-        return None
-    return {'xla_gpu_enable_triton_gemm': False}
+    if (generation in TRITON_GEMM_OFF_GENERATIONS and xla_flag('xla_gpu_enable_triton_gemm') is None
+            and model is not None and not _keeps_triton_gemm(model)):
+        options['xla_gpu_enable_triton_gemm'] = False
+    return options or None
 
 
 def fitting_default(program: jax.stages.Lowered, executable: jax.stages.Compiled,
@@ -252,12 +263,13 @@ def fitting_default(program: jax.stages.Lowered, executable: jax.stages.Compiled
     """Fall back to the step compiled under XLA's default options where it
     fits and the one compiled under `step_compiler_options` does not.
     Returns the step to run and whether it fits; `held` is `step_fits`'s.
-    The Triton GEMM fusions can hold fewer temporaries, so they come back
-    before the ladder's first rung."""
+    The Triton GEMM fusions can hold fewer temporaries, so XLA's defaults
+    come back before the ladder's first rung."""
     default = program.compile()
     if not step_fits(default, mesh, held):
         return executable, False
-    _log.warning("the step fits the devices only with XLA's Triton GEMM fusions; compiling it with them")
+    _log.warning("the step fits the devices only with XLA's default options (Triton GEMM fusions, "
+                 "merged dots); compiling it with them")
     return default, True
 
 

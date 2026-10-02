@@ -116,7 +116,9 @@ def test_zero_altup_scale_still_learns_the_per_layer_residual():
         norm_eps=1e-6, per_layer_input_dim=per_layer_features,
         altup=AltUp(num_inputs=COPIES))
     stream = jnp.linspace(-1, 1, COPIES * features).reshape(COPIES, 1, 1, features)
-    per_layer = LayerInputs(embeddings=jnp.linspace(0.2, 1, per_layer_features).reshape(1, 1, per_layer_features))
+    per_layer = LayerInputs(
+        embeddings=jnp.linspace(0.2, 1, per_layer_features).reshape(1, 1, per_layer_features)
+    )
     variables = block.init(jax.random.key(0), stream, per_layer_input=per_layer)
     params = variables["params"]
     params["post_per_layer_input_norm"]["scale"] = jnp.linspace(0.7, 1.3, features)

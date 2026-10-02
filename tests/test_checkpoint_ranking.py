@@ -1,6 +1,7 @@
 """Evaluation ranks precisely the weights saved, with independent best trackers."""
 import dataclasses
 import datetime
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -62,7 +63,9 @@ def data():
 
 
 def trainer(path, keep=1):
-    return Trainer(Overfit(), optax.sgd(0.1), key=jax.random.key(0), checkpoints=Checkpoints(str(path), keep=keep))
+    return Trainer(
+        Overfit(), optax.sgd(0.1), key=jax.random.key(0), checkpoints=Checkpoints(str(path), keep=keep)
+    )
 
 
 def test_default_retains_the_weights_with_lowest_validation_loss(tmp_path):
@@ -172,9 +175,13 @@ def test_time_cadence_and_recorded_duration(tmp_path):
     from dew.config import TrainerConfig
     from dew.data import Dataset
 
-    assert TrainerConfig(checkpoint_every='30m').checkpoint_interval(Dataset(lambda p: iter(()), None, records=4, batch=2)) == datetime.timedelta(minutes=30)
+    assert TrainerConfig(checkpoint_every="30m").checkpoint_interval(
+        Dataset(lambda p: iter(()), None, records=4, batch=2)
+    ) == datetime.timedelta(minutes=30)
     with pytest.raises(ValueError, match='positive'):
-        TrainerConfig(checkpoint_every='0m').checkpoint_interval(Dataset(lambda p: iter(()), None, records=4, batch=2))
+        TrainerConfig(checkpoint_every="0m").checkpoint_interval(
+            Dataset(lambda p: iter(()), None, records=4, batch=2)
+        )
     with pytest.raises(TypeError, match='code-only'):
         TrainerConfig(best=Best(lambda m: 0))
     run = trainer(tmp_path / 'run', keep=Keep(latest=5))
@@ -235,7 +242,7 @@ def test_aggregate_never_reuses_missing_metrics_and_preserves_first_tracker(tmp_
     second = Value('second', Shown(better='higher'))
     run = trainer(tmp_path / 'run')
     from dew.training.trainer import _FitPlan
-    plan = _FitPlan(data(), 1, 1, 1, 1, None, [first, second], False,
+    plan = _FitPlan(data(), 1, 1, 1, 1, None, [first, second], preview=False,
                     best=(Best(lambda m: m[first] - m[second]), Best(second, mode='max', split='val')),
                     validation=True)
     ranks = run._ranking(plan, {'val/second': .5})
@@ -304,7 +311,7 @@ def test_record_metrics_and_keep_predicate_accept_unhashable_metric_objects(tmp_
     for entry in retained:
         assert entry.metrics[metric] == entry.metrics['val/value']
     class WithCe(Overfit):
-        shown = {'ce': Shown(better='lower')}
+        shown: ClassVar = {'ce': Shown(better='lower')}
     objective = WithCe()
     assert 'ce' in dir(objective.scalars)
     assert objective.scalars.ce.owner is objective

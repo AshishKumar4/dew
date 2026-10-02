@@ -47,7 +47,8 @@ GROUPS: list[tuple[str, list[str]]] = [
     ("Data", ["dew.data", "dew.data.chat", "dew.data.dataset", "dew.data.images"]),
     ("Models", ["dew.registry", "dew.nn.backbones", "dew.nn.backbones.causal_transformer",
                 "dew.nn.backbones.decoder_block", "dew.nn.backbones.layer_plan", "dew.nn.kv_cache",
-                "dew.nn.backbones.edm2", "dew.nn.backbones.flux", "dew.nn.backbones.flux2",
+                "dew.nn.backbones.edm2", "dew.nn.backbones.joint", "dew.nn.backbones.flux",
+                "dew.nn.backbones.flux2",
                 "dew.nn.backbones.qwen_image", "dew.nn.backbones.sd3", "dew.nn.backbones.z_image", "dew.nn.mp",
                 "dew.nn.diffusion_gemma", "dew.nn.gemma3n", "dew.nn.multimodal",
                 "dew.nn.autoencoders", "dew.nn.inputs", "dew.nn.kernels", "dew.nn.sharding", "dew.lora"]),
@@ -415,11 +416,13 @@ def usage_code(relative: str, path: Path) -> Iterator[tuple[str, set[int] | None
 
 
 def unresolved_uses(package: griffe.Module, home: dict[str, str], pages: dict[str, Page],
-                    code: str, shown: set[int] | None) -> Iterator[str]:
+                    code: str, shown: set[int] | None,
+                    bound: dict[str, griffe.Object]) -> Iterator[str]:
     """Each dotted use of a Dew name in `code` that does not reach the
     documented API: an attribute a module or class does not have, or a
     module member no page documents. Names come from `import dew...` and
-    `from dew... import ...`; a name the code also assigns is its own."""
+    `from dew... import ...`, in this unit or an earlier one of the same file
+    (`bound`, which this updates); a name the code assigns is its own."""
     try:
         tree = ast.parse(code)
     except SyntaxError:
@@ -429,7 +432,6 @@ def unresolved_uses(package: griffe.Module, home: dict[str, str], pages: dict[st
     assigned |= {node.name for node in ast.walk(tree)
                  if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)}
     assigned |= {node.arg for node in ast.walk(tree) if isinstance(node, ast.arg)}
-    bound: dict[str, griffe.Object] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -553,28 +555,42 @@ def load() -> griffe.Module:
     return package
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--check", action="store_true", help="Check public API coverage without writing generated files.")
-    args = parser.parse_args()
-    package = load()
+def module_of(package: griffe.Module, path: str) -> griffe.Module:
+    obj = package if path == "dew" else package[path.removeprefix("dew.")]
+    if not obj.is_module:
+        raise SystemExit(f"GROUPS lists {path}, which is not a module")
+    return obj
 
-    def module_of(path: str) -> griffe.Module:
-        obj = package if path == "dew" else package[path.removeprefix("dew.")]
-        if not obj.is_module:
-            raise SystemExit(f"GROUPS lists {path}, which is not a module")
-        return obj
 
-    pages = {path: Page(module_of(path), list(public_entries(module_of(path)))) for path in PAGES}
-
-    # Each object's home: the page with the longest module prefix of its path,
-    # else the first page that exports it.
+def documented(package: griffe.Module) -> tuple[dict[str, Page], dict[str, str]]:
+    """Each page, and each documented object's home: the page with the longest
+    module prefix of its path, else the first page that exports it."""
+    pages = {path: Page(module_of(package, path), list(public_entries(module_of(package, path))))
+             for path in PAGES}
     home: dict[str, str] = {}
     for path in PAGES:
         for entry in pages[path].entries:
             prefixes = [page for page in PAGES if entry.canonical.startswith(page + ".")
                         and any(e.canonical == entry.canonical for e in pages[page].entries)]
             home.setdefault(entry.canonical, max(prefixes, key=len) if prefixes else path)
+    return pages, home
+
+
+def unresolved_in(file: str, path: Path, package: griffe.Module, pages: dict[str, Page],
+                  home: dict[str, str]) -> list[str]:
+    """What `unresolved_uses` reports for each Python unit `path` shows, in
+    order, a unit seeing the names the units before it bound."""
+    bound: dict[str, griffe.Object] = {}
+    return [problem for code, shown in usage_code(file, path)
+            for problem in unresolved_uses(package, home, pages, code, shown, bound)]
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--check", action="store_true", help="Check public API coverage without writing generated files.")
+    args = parser.parse_args()
+    package = load()
+    pages, home = documented(package)
 
     linker = Linker()
     for path in PAGES:
@@ -607,7 +623,8 @@ def main() -> None:
                 problems.append(f"{module.path}.__all__ exports {entry.name} ({entry.canonical}), which no API page documents")
     for file, module_path, name in usage_imports():
         try:
-            module = module_of(module_path) if module_path == "dew" else package[module_path.removeprefix("dew.")]
+            module = (module_of(package, module_path) if module_path == "dew"
+                      else package[module_path.removeprefix("dew.")])
             member = module.members.get(name)
             if member is None:
                 problems.append(f"{file}: `from {module_path} import {name}`: {module_path} has no {name}")
@@ -624,9 +641,7 @@ def main() -> None:
         elif target.path not in home:
             problems.append(f"{file}: imports {module_path}.{name} ({target.path}), which no API page documents")
     for file, path in usage_files():
-        for code, shown in usage_code(file, path):
-            problems.extend(f"{file}: {problem}"
-                            for problem in unresolved_uses(package, home, pages, code, shown))
+        problems.extend(f"{file}: {problem}" for problem in unresolved_in(file, path, package, pages, home))
     if problems:
         print("gen_api: the API reference does not cover what is public:", file=sys.stderr)
         for problem in sorted(set(problems)):

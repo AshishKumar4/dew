@@ -66,7 +66,7 @@ def test_exchange_retains_outputs_and_all_differentiable_inputs(
 
 
 def test_exchange_preserves_placed_expert_and_width_gradients():
-    x, weights, indices = map(jnp.asarray, routing_case(24, 8, 2, False))
+    x, weights, indices = map(jnp.asarray, routing_case(24, 8, 2, skewed=False))
     model = ExpertMLP(8, 16, 8)
     parameters = model.init(jax.random.key(19), x, weights, indices)
     mesh = MeshSpec(expert=4, fsdp=2).build()
@@ -112,7 +112,7 @@ def test_decoder_exchange_retains_logits_and_expert_bias_observations(parallel):
 
 
 def test_exchange_requires_an_expert_axis_that_owns_whole_experts():
-    x, weights, indices = map(jnp.asarray, routing_case(8, 6, 2, False))
+    x, weights, indices = map(jnp.asarray, routing_case(8, 6, 2, skewed=False))
     module = ExpertMLP(6, 12, 8, dispatch='exchange')
     parameters = module.init(jax.random.key(0), x, weights, indices)
     for shards in (1, 4):
@@ -125,7 +125,7 @@ def test_exchange_requires_an_expert_axis_that_owns_whole_experts():
 def test_exchange_refuses_experts_the_rules_keep_off_the_expert_axis():
     """The exchange holds each device's own experts, so a rule table that
     leaves the expert dimension off the expert axis is refused, not run."""
-    x, weights, indices = map(jnp.asarray, routing_case(8, 8, 2, False))
+    x, weights, indices = map(jnp.asarray, routing_case(8, 8, 2, skewed=False))
     module = ExpertMLP(8, 12, 8, dispatch='exchange')
     parameters = module.init(jax.random.key(0), x, weights, indices)
     rules = tuple(rule for rule in DEFAULT_RULES if rule[0] != 'exp')

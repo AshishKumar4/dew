@@ -103,8 +103,16 @@ def byte_tokens() -> list[str]:
     return [bytes_to_unicode()[index] for index in range(VOCAB - 2)] + ["lo", "llo"]
 
 
-def write_gguf(path, architecture: str, qtype, tensors: dict[str, np.ndarray],
-               rng: np.random.Generator, *, extra: tuple[str, ...] = (), scaling: float | None = None) -> None:
+def write_gguf(
+    path,
+    architecture: str,
+    qtype,
+    tensors: dict[str, np.ndarray],
+    rng: np.random.Generator,
+    *,
+    extra: tuple[str, ...] = (),
+    scaling: float | None = None,
+) -> None:
     """Write `tensors` as llama.cpp would: metadata, a byte-level BPE vocabulary, and
     every matrix in `qtype` (norms and biases stay F32, as llama.cpp keeps them)."""
     writer = gguf.GGUFWriter(str(path), architecture)
@@ -236,7 +244,9 @@ def test_the_files_tokenizer_loads_without_torch(tmp_path):
     from transformers import AutoTokenizer
 
     rng = np.random.default_rng(0)
-    write_gguf(tmp_path / "model.gguf", "llama", gguf.GGMLQuantizationType.Q8_0, hf_tensors("llama", rng), rng)
+    write_gguf(
+        tmp_path / "model.gguf", "llama", gguf.GGMLQuantizationType.Q8_0, hf_tensors("llama", rng), rng
+    )
     expected = AutoTokenizer.from_pretrained(str(tmp_path), gguf_file="model.gguf")("Hello, GGUF").input_ids
     script = """
 import sys
