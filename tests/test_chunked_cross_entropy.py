@@ -29,7 +29,7 @@ import optax
 import pytest
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.precision import rounded_operand
+from dew.nn.precision import rounded_operand, rounded_to
 from dew.objectives.lm import chunked
 from dew.objectives.lm.chunked import chunked_cross_entropy, vocabulary_chunks
 
@@ -38,11 +38,15 @@ CHUNKS = [1, 2, 4, 8]
 
 def reference(hidden, head, targets, softcap=None):
     """The full-vocabulary path: one big logits tensor, optax's cross entropy.
-    bf16 states are bf16 compute, which multiplies the head rounded to bf16."""
-    if hidden.dtype == jnp.bfloat16:
+    bf16 states are bf16 compute, which multiplies the head rounded to bf16
+    and rounds the logits to bf16, as torch autocast does."""
+    bf16 = hidden.dtype == jnp.bfloat16
+    if bf16:
         head = head.astype(jnp.bfloat16).astype(jnp.float32)
     logits = jnp.einsum('...d,dv->...v', hidden.astype(jnp.float32), head,
                         precision=jax.lax.Precision.HIGHEST)
+    if bf16:
+        logits = rounded_to(logits, jnp.bfloat16)
     if softcap is not None:
         cap = jnp.asarray(softcap, jnp.float32)
         logits = cap * jnp.tanh(logits / cap)
@@ -57,10 +61,20 @@ def inputs(vocab=97, features=24, tokens=(4, 5), dtype=jnp.float32, seed=0):
             jax.random.randint(keys[2], tokens, 0, vocab))
 
 
+def eighths(*values):
+    """`values` rounded to multiples of 1/8. Every product of two is a
+    multiple of 1/64 and every sum of a few dozen is exact in fp32 in any
+    order, so two products of them give the same logits, and the same bf16
+    rounding of them, whatever order each sums in."""
+    return tuple((jnp.round(value.astype(jnp.float32) * 8) / 8).astype(value.dtype) for value in values)
+
+
 @pytest.mark.parametrize("chunks", CHUNKS)
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 def test_loss_and_prediction_match_the_full_vocabulary_pass(chunks, dtype):
     hidden, head, targets = inputs(dtype=dtype)
+    if dtype == jnp.bfloat16:
+        hidden, head = eighths(hidden, head)
     expected_losses, expected_top1 = reference(hidden, head, targets)
 
     losses, predicted, _ = chunked_cross_entropy(hidden, head, targets, chunks)
@@ -269,10 +283,9 @@ def test_the_gradient_reaches_the_backbone_through_the_states_and_the_head():
     the two paths is orders above it.
 
     The reference takes the logits from the operands the head multiplies,
-    rounded to bf16, at the highest precision, so its backward carries the
-    logits' cotangent in fp32 as the chunked head's state gradient does. The
-    model's own bf16 product rounds that cotangent, which moved the tied
-    embedding's gradient 1.7% of its largest entry on an A100.
+    rounded to bf16, at the highest precision, and rounds them to bf16 as the
+    chunked head does, so its backward rounds the logits' cotangent to bf16
+    once, as the chunked head's does.
     """
     model = small_model()
     rng = jax.random.PRNGKey(0)
@@ -287,7 +300,8 @@ def test_the_gradient_reaches_the_backbone_through_the_states_and_the_head():
                            method=CausalTransformer.head_weight)
         operands = (rounded_operand(value.astype(jnp.float32), jnp.bfloat16)
                     for value in (hidden, head))
-        logits = jnp.einsum('btd,dv->btv', *operands, precision=jax.lax.Precision.HIGHEST)
+        logits = rounded_to(jnp.einsum('btd,dv->btv', *operands, precision=jax.lax.Precision.HIGHEST),
+                            jnp.bfloat16)
         return jnp.mean(
             optax.softmax_cross_entropy_with_integer_labels(logits, targets))
 
@@ -754,24 +768,45 @@ def test_the_forward_rounds_the_table_once_not_once_per_token_tile():
     assert tables == [((64, 16), False)], tables
 
 
-def test_the_bf16_head_carries_its_logits_cotangent_in_fp32():
-    """The bf16 algorithm rounds each operand to bf16, and the logits'
-    cotangent was one of them: a 4-GPU run's gradients then moved past the
-    layout parity bound (1.75x on a dense model's final norm, 5758x on an
-    MoE's expert kernels). On operands already exact in bf16 the state
-    gradient matches the fp32 product's to far below a bf16 rounding."""
-    hidden, head, targets = inputs(vocab=RAGGED_VOCAB, features=64, tokens=(RAGGED_TOKENS,))
-    hidden = hidden.astype(jnp.bfloat16).astype(jnp.float32)
-    head = head.astype(jnp.bfloat16).astype(jnp.float32)
+@pytest.mark.parametrize("tile", [None, RAGGED])
+def test_the_bf16_head_rounds_its_logits_and_their_cotangent_once(tile):
+    """Under the bf16 algorithm the head takes torch autocast's rounding: the
+    logits are bf16 values, and their cotangent is rounded to bf16 once
+    before both products. The reference rounds the logits with
+    `rounded_to`, whose derivative rounds the cotangent where the value
+    rounds, and multiplies at the highest precision. On eighths both sides
+    form the same logits; the softmax's fp32 rounding can still move a
+    cotangent entry across a bf16 rounding boundary, one bf16 ulp, 2^-7 of
+    it at most, so each gradient entry is within 2^-7 of its terms'
+    magnitudes, plus fp32's rounding of them. Kept in fp32 (`highest`) the
+    cotangent misses that bound."""
+    hidden, head, targets = inputs(vocab=RAGGED_VOCAB, features=16, tokens=(RAGGED_TOKENS,))
+    hidden, head = eighths(hidden, head)
+    table = head.T
 
-    def loss(precision):
-        return jax.grad(lambda states, matrix: jnp.mean(chunked_cross_entropy(
-            states, matrix, targets, 4, tile=RAGGED, precision=precision)[0]),
-            argnums=(0, 1))(hidden, head)
+    def strict_or_rounded(round_logits):
+        def loss(states, matrix):
+            logits = jnp.einsum('td,vd->tv', states, matrix, precision=jax.lax.Precision.HIGHEST)
+            if round_logits:
+                logits = rounded_to(logits, jnp.bfloat16)
+            return jnp.mean(optax.softmax_cross_entropy_with_integer_labels(logits, targets))
+        return loss
 
-    # The state gradient; the head's own keeps its one bf16 product.
-    have, reference = loss(chunked.BF16)[0], loss(jax.lax.Precision.HIGHEST)[0]
-    assert jnp.abs(have - reference).max() <= 2 ** -14 * jnp.abs(reference).max()
+    rounded = strict_or_rounded(True)
+    want_states, want_table = jax.grad(rounded, argnums=(0, 1))(hidden, table)
+    have_states, have_table = jax.grad(lambda states, matrix: jnp.mean(chunked_cross_entropy(
+        states, matrix.T, targets, 4, tile=tile, precision=chunked.BF16)[0]), argnums=(0, 1))(hidden, table)
+    logits = jnp.einsum('td,vd->tv', hidden, table, precision=jax.lax.Precision.HIGHEST)
+    cotangent = jnp.abs(jax.grad(lambda z: jnp.mean(
+        optax.softmax_cross_entropy_with_integer_labels(z, targets)))(logits))
+    terms_states = jnp.einsum('tv,vd->td', cotangent, jnp.abs(table), precision=jax.lax.Precision.HIGHEST)
+    terms_table = jnp.einsum('tv,td->vd', cotangent, jnp.abs(hidden), precision=jax.lax.Precision.HIGHEST)
+    slack = (2 ** -7 + 64 * 2 ** -24)
+
+    assert jnp.all(jnp.abs(have_states - want_states) <= slack * terms_states)
+    assert jnp.all(jnp.abs(have_table - want_table) <= slack * terms_table)
+    strict_states, _ = jax.grad(strict_or_rounded(False), argnums=(0, 1))(hidden, table)
+    assert not jnp.all(jnp.abs(strict_states - have_states) <= 2 ** -20 * terms_states)
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
@@ -854,31 +889,13 @@ def test_a_pass_with_no_backward_never_holds_the_logits_whole():
     assert temporaries(None) < 4096 * 32768 * 4 // 4
 
 
-def test_the_split_cotangent_reaches_its_products_in_bf16():
-    """The bf16 head's backward splits the fp32 logits' cotangent into a bf16
-    high half and the rest, and both reach the products as bf16 arrays, the
-    rest rounded as a GPU's bf16 algorithm rounds an fp32 operand: split as
-    fp32 they wrote twice the bytes and the products read twice the bytes,
-    10 ms of a 168 ms step at Qwen3-0.6B's head on an RTX 4080."""
-    cotangent = jnp.ones((16, 64), jnp.float32)
-    operand = jnp.ones((64, 8), jnp.float32)
-    program = jax.make_jaxpr(lambda c, m: chunked._cotangent_product('tv,vd->td', c, m, chunked.BF16))(
-        cotangent, operand)
-    dots = [equation for equation in program.jaxpr.eqns if equation.primitive.name == "dot_general"]
-    assert len(dots) == 2
-    assert all(v.aval.dtype == jnp.bfloat16 for equation in dots for v in equation.invars), dots
-
-
 @pytest.mark.parametrize("tile", [None, RAGGED])
-def test_the_head_gradient_reads_the_cotangents_bf16_high_half(tile):
-    """Under the bf16 algorithm the head's own gradient multiplies the logits'
-    cotangent as bf16, the value the state product's high half holds, so the
-    backward hands both products one bf16 copy of it rather than a second
-    rounding: XLA wrote three bf16 copies of a 4096 x 151936 cotangent for
-    Qwen3-0.6B's head where two carry it. Every product into a gradient
-    (the ones whose result is feature-wide) multiplies bf16 operands; the
-    tiled backward's logits products read fp32-stored bf16 values under the
-    algorithm, as its forward does."""
+def test_both_gradient_products_read_one_bf16_cotangent(tile):
+    """Under the bf16 algorithm the backward hands the state product and the
+    head's own one bf16 copy of the logits' cotangent. Every product into a
+    gradient (the ones whose result is feature-wide) multiplies bf16
+    operands; the tiled backward's logits products read fp32-stored bf16
+    values under the algorithm, as its forward does."""
     hidden, head, targets = inputs(vocab=RAGGED_VOCAB, features=16, tokens=(RAGGED_TOKENS,))
     program = jax.make_jaxpr(jax.grad(lambda states, matrix: jnp.mean(chunked_cross_entropy(
         states, matrix, targets, 4, tile=tile, precision=chunked.BF16)[0]), argnums=(0, 1)))(hidden, head)
@@ -893,5 +910,5 @@ def test_the_head_gradient_reads_the_cotangents_bf16_high_half(tile):
                         yield from dots(getattr(sub, "jaxpr", sub))
 
     found = [equation for equation in dots(program.jaxpr) if equation.outvars[0].aval.shape[-1] == 16]
-    assert len(found) >= 3, found
+    assert len(found) >= 2, found
     assert all(v.aval.dtype == jnp.bfloat16 for equation in found for v in equation.invars), found

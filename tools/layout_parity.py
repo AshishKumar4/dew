@@ -667,6 +667,14 @@ def model_case(model: str, dtype: str, mixture: dict[str, Any], objective: dict[
     exchange needs an expert axis, so one device computes the same layer
     through the global dispatch."""
     case = dataclasses.replace(zoo()[model], dtype=dtype)
+    if dtype == "bfloat16" and case.architecture == "causal_transformer":
+        # At the default precision a bf16 vocabulary head rounds its logits
+        # and their cotangent to bf16 (`dew.nn.precision.head_product`). With
+        # the cotangent rounded once, 4 RTX 3090s read 1.75 of the bound at a
+        # dense model's final norm and 5758 of it at an MoE's expert
+        # gate_proj, against 0.47 and 0.41 with it carried in fp32. "highest"
+        # keeps the head fp32.
+        case = dataclasses.replace(case, matmul_precision="highest")
     if mixture:
         if "mixture" not in case.config:
             raise ValueError(f"{model} has no mixture for --mixture to change")

@@ -6,6 +6,8 @@ kernel as the gather reads it; and a pool nobody hands out refuses to alias
 rows.
 """
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -152,14 +154,20 @@ def test_the_tpu_paged_kernel_attends_what_the_stored_pool_holds(tokens, monkeyp
 
     monkeypatch.setattr(kernels, "paged_attention", recorded)
     rows, heads, width = 2, 2, 128
+    # The interpreter's callbacks dispatch computations to the device they run
+    # on, and each takes one of the device's 32 computations in flight. The
+    # computations queued behind the kernel hold those until it ends, so 31 of
+    # them hang the run for good (1 run in 12 on four cores, 2026-10-02): each
+    # interpreted call is waited on before anything more is dispatched.
     with jax.default_device(host), pltpu.force_tpu_interpret_mode():
         key, value = (jax.random.normal(jax.random.key(seed), (rows, tokens, heads, width),
                                         jnp.bfloat16) for seed in (0, 1))
         query = jax.random.normal(jax.random.key(2), (rows, 2 * heads, width), jnp.bfloat16)
         lengths = jnp.array([tokens, 19], jnp.int32)
         module = Decoder(KVCache(page_size=16))
-        variables = module.init(jax.random.key(0), key, value, query, lengths)
-        (attended, (keys, values)), _ = module.apply(variables, key, value, query, lengths, mutable=["cache"])
+        variables = jax.block_until_ready(jax.jit(module.init)(jax.random.key(0), key, value, query, lengths))
+        (attended, (keys, values)), _ = jax.block_until_ready(jax.jit(functools.partial(
+            module.apply, mutable=["cache"]))(variables, key, value, query, lengths))
     keys, values = (jnp.repeat(part.astype(jnp.float32), 2, axis=2) for part in (keys, values))
     scores = jnp.einsum("bhd,bkhd->bhk", query.astype(jnp.float32), keys) / np.sqrt(width)
     scores = jnp.where(jnp.arange(tokens)[None, None] < lengths[:, None, None], scores, -jnp.inf)
