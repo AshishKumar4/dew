@@ -1049,7 +1049,7 @@ class Checkpoints:
     def rung(self, step: int) -> JSON:
         """The fit ladder's rung the state at `step` trained on, as `save`
         recorded it, from the directory `restore` reads the step from; None
-        for a checkpoint written without one."""
+        for a state saved outside `fit`, which trained on no ladder."""
         checkpointer = self._open_local() if step == self._local_latest() else self._open()
         return json_value((checkpointer.metadata(step).custom_metadata or {}).get('rung'), 'rung')
 
