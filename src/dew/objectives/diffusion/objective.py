@@ -104,6 +104,10 @@ class TunedLatents(NamedTuple):
     terms: dict[str, jax.Array]
 
 
+_DEFAULT_SAMPLER = DDIM()
+_DEFAULT_GUIDANCE = CFG(3.0)
+
+
 @objectives("diffusion")
 class DiffusionObjective(Objective[Ratio]):
     """Denoising diffusion: sample a noise level, corrupt, predict, weight."""
@@ -117,8 +121,8 @@ class DiffusionObjective(Objective[Ratio]):
         autoencoder: AutoEncoder | None = None,
         unconditional_prob: float = 0.12,
         ema_decay: float | None = 0.999,
-        sampler: Solver = DDIM(),
-        guidance: Guidance | None = CFG(3.0),
+        sampler: Solver = _DEFAULT_SAMPLER,
+        guidance: Guidance | None = _DEFAULT_GUIDANCE,
         steps: int = 200,
         pretrained: Variables | None = None,
         uncertainty: int | None = None,
@@ -278,9 +282,13 @@ class DiffusionObjective(Objective[Ratio]):
                 state[collection] = {**state.get(collection, {}), UNCERTAINTY: value}
         if self.end_to_end is not None and AUTOENCODER not in state["params"]:
             assert self.autoencoder is not None
-            state["params"] = {**state["params"], AUTOENCODER: state.pop("autoencoder", self.autoencoder.params)}
+            state["params"] = {
+                **state["params"],
+                AUTOENCODER: state.pop("autoencoder", self.autoencoder.params),
+            }
             state[LATENT_STATS] = self.end_to_end.initial_statistics(
-                self.autoencoder.latent_shift, self.autoencoder.latent_scale, self.autoencoder.latent_channels)
+                self.autoencoder.latent_shift, self.autoencoder.latent_scale, self.autoencoder.latent_channels
+            )
         if self.alignment is not None and ALIGNMENT not in state["params"]:
             state["params"] = {**state["params"], ALIGNMENT: self._projector_init(
                 jax.random.fold_in(key, 2), state)}
@@ -346,8 +354,13 @@ class DiffusionObjective(Objective[Ratio]):
                 given, aligned_conditions(given, unconditional))
         if self.inputs.mask is not None:
             from dew.inputs.diffusion import latent_image_conditions
-            spatial = latent_image_conditions(self.autoencoder, params["autoencoder"],
-                unit_range(batch[self.inputs.sample.key]), batch[self.inputs.mask.key], jax.random.fold_in(key, 1))
+            spatial = latent_image_conditions(
+                self.autoencoder,
+                params["autoencoder"],
+                unit_range(batch[self.inputs.sample.key]),
+                batch[self.inputs.mask.key],
+                jax.random.fold_in(key, 1),
+            )
             return {**given, **spatial}, {**unconditional, **spatial}
         return given, unconditional
 

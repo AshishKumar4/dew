@@ -287,8 +287,12 @@ class EngramLayer(nn.Module):
         looked = table(hash_ids).astype(dtype).reshape(*hash_ids.shape[:2], -1)
         kv = nn.Dense(self.emb_features * (self.hc_mult + 1), use_bias=False, dtype=self.dtype,
                       precision=self.precision, name='wkv')(looked)
-        q_weight = self.param('q_weight', nn.initializers.ones, (self.hc_mult, self.emb_features), jnp.float32)
-        k_weight = self.param('k_weight', nn.initializers.ones, (self.hc_mult, self.emb_features), jnp.float32)
+        q_weight = self.param(
+            "q_weight", nn.initializers.ones, (self.hc_mult, self.emb_features), jnp.float32
+        )
+        k_weight = self.param(
+            "k_weight", nn.initializers.ones, (self.hc_mult, self.emb_features), jnp.float32
+        )
         wide = at_least_fp32(kv.dtype)
         key = kv[..., :self.hc_mult * self.emb_features].astype(wide).reshape(
             *kv.shape[:2], self.hc_mult, self.emb_features)

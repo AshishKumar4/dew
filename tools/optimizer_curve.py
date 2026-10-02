@@ -47,7 +47,7 @@ class Comparison:
     """One run of one solver."""
 
     dataset: str
-    """A directory written by tools/tokenize_text.py."""
+    """A directory written by `dew tokenize`."""
     out: str
     """Where the per-step losses are written, as JSON."""
     optimizer: Solver = "muon"

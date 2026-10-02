@@ -35,20 +35,18 @@ def test_caption_rows_keep_image_and_caption_targets_in_separate_spans():
 
 
 def test_caption_example_trains_and_executes_its_inference_call(tmp_path, monkeypatch):
-    from dew.data import Dataset
+    from dataclasses import replace
+    from dew.data import Dataset, Loading
 
     script = example("sft_diffusion_gemma_images")
     config = script.Config(flowers="unused", image_size=16, prompt_tokens=24,
-                           batch_size=8, steps=2, features=16, vision_features=16,
+                           canvas_length=32, batch_size=8, steps=2, features=16, vision_features=16,
                            out=tmp_path / "caption")
     pixels = np.arange(8 * 16 * 16 * 3, dtype=np.uint8).reshape(8, 16, 16, 3)
-    batch = script.caption_batch({"image": pixels, "label": np.arange(8) % 2}, config,
-                                 ["pink rose", "yellow tulip"])
-    def rows(partition):
-        yield from [batch] * config.steps
-
-    data = Dataset(train=rows, val=None,
-                   records=8 * config.steps, batch=8)
+    held = Dataset.from_records({"image": pixels, "label": np.arange(8) % 2}, batch=8,
+                                loading=Loading(workers=0, threads=1, read_buffer=1))
+    data = replace(held, train=script.mapped(held.train,
+                   lambda batch: script.caption_batch(batch, config, ["pink rose", "yellow tulip"])))
     monkeypatch.setattr(script, "flowers_data", lambda selected: data)
     state = script.main(config)
     assert int(state.step) == 2

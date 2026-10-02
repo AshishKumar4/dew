@@ -29,7 +29,6 @@ from dew.interop import load_pretrained
 from dew.interop.hf_decoders import families, translate_config
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import Step
-
 from dew.registry import models
 from dew.sampling import Sampling, generate
 

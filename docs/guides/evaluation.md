@@ -84,10 +84,12 @@ accuracy = Mean(
     reads=TokenScores, name="accuracy", better="higher",
 )
 language_model = LMObjective(model, seq_len=8, ema_decay=None)
+accuracy_data = Dataset.from_records({"text": train_tokens}, batch=8,
+                                    validation={"text": val_tokens})
 run = Trainer(language_model, optax.adam(0.01), key=jax.random.key(0),
               checkpoints=Checkpoints("runs/lm-accuracy"))
 state = run.fit(
-    data, steps=10, eval_every=5, metrics=[accuracy], best=accuracy,
+    accuracy_data, steps=10, eval_every=5, metrics=[accuracy], best=accuracy,
 )
 run.checkpoints.wait()
 assert run.checkpoints.best is not None
@@ -106,6 +108,13 @@ instead of adding the prefix twice.
 The trainer calls `Objective.preview` once per evaluation event, only when `fit(preview=True)` is passed, process zero has a tracker, and there is a coordinated batch. A tracker that only takes scalars does not turn previews on. LM previews use the objective's `Samples` configuration. Diffusion draws at most four display samples. Masked diffusion uses its configured preview count. DPO and GRPO preview the live policy, because their EMA holds a frozen reference. The base `preview` reuses the first scoring artifacts, so JEPA's representation histogram needs no second encoder pass. Preview samples never enter the scoring metrics. Without metrics, evaluation skips the scoring work; without a tracker, it skips the preview work.
 
 ## Trackers
+
+Diagnostic messages are separate from scalar and record trackers. Dew logs through Python's
+`"dew"` logger, at `WARNING` level by default, using Rich on stderr; redirected stderr is plain,
+and a live training panel shares its console with the log handler. Change verbosity with
+`logging.getLogger("dew").setLevel(logging.INFO)`. A handler configured on `"dew"` before importing
+Dew is left untouched. To use your application's root handlers instead, remove Dew's handlers
+and set `logging.getLogger("dew").propagate = True`.
 
 `Tracker` has three methods: `log(scalars, step)`, `artifact(value, step)` and `close()`. `Trainer.fit` borrows the tracker; whoever constructed it closes it. When a tracker used as a context manager fails to close while another exception is active, the original exception still surfaces. The trackers are importable from `dew.training`:
 
