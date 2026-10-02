@@ -86,7 +86,7 @@ def flux_walk(source, arrays, name: str, grid: tuple[int, int]):
     probe = jnp.asarray(unpacked(arrays[f"{name}.probe"], *grid))
     output = jax.jit(forward)(params, latent, context, pooled)
     gradients = jax.jit(jax.grad(
-        lambda p, l, c, q: jnp.sum(forward(p, l, c, q) * probe), argnums=(0, 1, 2, 3)))(
+        lambda p, noisy_latent, c, q: jnp.sum(forward(p, noisy_latent, c, q) * probe), argnums=(0, 1, 2, 3)))(
             params, latent, context, pooled)
     return output, gradients, {entry.name: entry for entry in layouts}
 
@@ -144,7 +144,7 @@ def test_every_declared_flux_tensor_is_mapped(source):
     this translation does not know raises with that name rather than loading a
     checkpoint that means something else."""
     tensors = component_tensors(source / "dev", "transformer")
-    params, layouts = translate_flux_weights(tensors)
+    _params, layouts = translate_flux_weights(tensors)
     assert len(layouts) == len(tensors)
     leaves = {"/".join(entry.paths[0]) for entry in layouts}
     assert len(leaves) == len(tensors)
@@ -181,7 +181,8 @@ def test_the_guidance_input_follows_the_checkpoints_own_embedder(source):
 def test_the_rotary_table_is_the_sources_own_interleaved_pairs(source):
     """The table Flux rotates with: one angle per adjacent channel pair, laid
     out per axis, over the ids its pipeline writes."""
-    from dew.nn.backbones.flux import apply_rotary, flux_positions, rotary_table
+    from dew.nn.backbones.flux import flux_positions
+    from dew.nn.backbones.joint import apply_rotary, rotary_table
 
     positions = flux_positions(3, 2, 4)
     # The text sits at the origin and each patch carries its row and column.
@@ -431,7 +432,7 @@ def test_the_tied_t5_embedding_maps_under_either_name(source):
                    ["shared.weight", "encoder.embed_tokens.weight"]):
         variant = {name: value for name, value in tensors.items()
                    if name not in ("shared.weight", "encoder.embed_tokens.weight")}
-        variant.update({name: embedding for name in stored})
+        variant.update(dict.fromkeys(stored, embedding))
         params, layouts = record_layouts("text_encoder_2", variant, _t5_path, ("encoders",))
         np.testing.assert_array_equal(params["embed_tokens"]["embedding"], embedding)
         bound = [entry.name for entry in layouts
@@ -460,5 +461,5 @@ def test_a_flux_directory_declaring_an_sd3_pipeline_is_refused(source, tmp_path)
     index = json.loads((directory / "model_index.json").read_text())
     index["_class_name"] = "StableDiffusion3Pipeline"
     (directory / "model_index.json").write_text(json.dumps(index))
-    with pytest.raises(ValueError, match="StableDiffusion3Pipeline.*FluxPipeline"):
+    with pytest.raises(ValueError, match=r"StableDiffusion3Pipeline.*FluxPipeline"):
         Pretrained.load(str(directory), dtype="float32", attention_impl="xla")

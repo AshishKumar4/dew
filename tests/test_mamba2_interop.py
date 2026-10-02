@@ -71,8 +71,20 @@ def test_every_fixture_tensor_has_a_place_and_an_unknown_one_none(hf_config, ten
     assert paths["backbone.norm_f.weight"] == ("params", "norm", "scale")
     assert paths["lm_head.weight"] == ("params", "lm_head", "kernel")
     assert paths["backbone.layers.1.norm.weight"] == ("params", "layers_1", "input_layernorm", "scale")
-    assert paths["backbone.layers.0.mixer.conv1d.bias"] == ("params", "layers_0", "self_attn", "conv1d", "bias")
-    assert paths["backbone.layers.0.mixer.in_proj.weight"] == ("params", "layers_0", "self_attn", "in_proj", "kernel")
+    assert paths["backbone.layers.0.mixer.conv1d.bias"] == (
+        "params",
+        "layers_0",
+        "self_attn",
+        "conv1d",
+        "bias",
+    )
+    assert paths["backbone.layers.0.mixer.in_proj.weight"] == (
+        "params",
+        "layers_0",
+        "self_attn",
+        "in_proj",
+        "kernel",
+    )
     assert weight_path("lm_head.weight", {"tie_embeddings": True}) is None
     with pytest.raises(ValueError, match="no place"):
         weight_path("backbone.layers.0.mlp.up_proj.weight", config)

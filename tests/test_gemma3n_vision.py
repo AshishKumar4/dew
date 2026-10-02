@@ -166,8 +166,9 @@ def test_the_layout_and_muon_read_the_towers_declared_axes():
 
     # Optax's spec is itself a pytree node, so its own fields would flatten
     # away; None is the AdamW group the norms and the biases belong to.
-    is_spec = lambda leaf: leaf is None or isinstance(
-        leaf, optax.contrib.MuonDimensionNumbers)
+    def is_spec(leaf):
+        return leaf is None or isinstance(
+            leaf, optax.contrib.MuonDimensionNumbers)
     numbers = muon_weight_dimension_numbers(tower)
     matrices = [(jax.tree_util.keystr(path), leaf) for path, leaf
                 in jax.tree_util.tree_flatten_with_path(numbers, is_leaf=is_spec)[0]
@@ -211,7 +212,9 @@ def test_image_only_wrapper_matches_conditional_reference_and_uses_hard_tokens(b
 def test_soft_initialization_also_creates_the_hard_vision_path():
     projector = V.Gemma3nProjectorModule(8, 4, vocab_size=3, vocab_offset=16)
     variables = projector.init(jax.random.key(51), jnp.arange(16, dtype=jnp.float32).reshape(1, 2, 8))
-    hard = jnp.asarray(projector.apply(variables, jnp.array([[16, 18]], jnp.int32), method=projector.embed_hard))
+    hard = jnp.asarray(
+        projector.apply(variables, jnp.array([[16, 18]], jnp.int32), method=projector.embed_hard)
+    )
     np.testing.assert_allclose(jnp.mean(jnp.square(hard), axis=-1), 1.0, atol=1e-4)
 
 

@@ -198,11 +198,13 @@ def test_source_close_failure_preserves_primary_and_is_reported_once(body_fails)
     cleanup = OSError("source close failed")
     primary = RuntimeError("body failed")
     source = Source(close_failure=cleanup)
-    with pytest.raises((RuntimeError, OSError)) as raised:
-        with DevicePrefetchIterator(source, MeshSpec().build()) as stream:
-            next(stream)
-            if body_fails:
-                raise primary
+    with (
+        pytest.raises((RuntimeError, OSError)) as raised,
+        DevicePrefetchIterator(source, MeshSpec().build()) as stream,
+    ):
+        next(stream)
+        if body_fails:
+            raise primary
     assert raised.value is (primary if body_fails else cleanup)
     if body_fails:
         assert any("source close failed" in note for note in primary.__notes__)
@@ -471,9 +473,11 @@ def test_failed_thread_creation_finalizes_the_unstarted_source(monkeypatch):
         raise failure
 
     monkeypatch.setattr(threading.Thread, "start", fail_start)
-    with pytest.raises(RuntimeError) as caught:
-        with DevicePrefetchIterator(Source(), MeshSpec().build()) as stream:
-            next(stream)
+    with (
+        pytest.raises(RuntimeError) as caught,
+        DevicePrefetchIterator(Source(), MeshSpec().build()) as stream,
+    ):
+        next(stream)
     assert caught.value is failure
     assert owners == [threading.get_ident()]
     stream.close()
@@ -515,6 +519,12 @@ def test_a_program_that_ends_without_closing_its_prefetcher_exits_cleanly():
         "for _ in range(20):\n"
         "    next(prefetch)\n")
     root = Path(__file__).resolve().parents[1]
-    done = subprocess.run([sys.executable, "-c", program], cwd=root, capture_output=True, text=True, timeout=300,
-                          env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(root / "src")})
+    done = subprocess.run(
+        [sys.executable, "-c", program],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(root / "src")},
+    )
     assert done.returncode == 0, done.stdout + done.stderr

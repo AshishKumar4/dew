@@ -76,7 +76,8 @@ def moment_owners(group_state, params):
     """
     wanted = leaf_paths(params)
     owned = set()
-    is_leaf = lambda leaf: isinstance(leaf, optax.MaskedNode)
+    def is_leaf(leaf):
+        return isinstance(leaf, optax.MaskedNode)
     for path, leaf in jax.tree_util.tree_flatten_with_path(
             group_state, is_leaf=is_leaf)[0]:
         if is_leaf(leaf):
@@ -141,7 +142,7 @@ def test_a_matrix_of_rank_above_two_with_undeclared_axes_is_rejected():
     # rank-2 axes would refuse this for another reason.
     params['params']['layers_0']['mixer'] = {'mixing': jnp.zeros((4, 8, 16))}
 
-    with pytest.raises(ValueError, match="mixer.*rank 3.*declared logical axes"):
+    with pytest.raises(ValueError, match=r"mixer.*rank 3.*declared logical axes"):
         muon_weight_dimension_numbers(params)
 
 
@@ -351,7 +352,7 @@ def qk_stats(layers=1, heads=4, rows=3, values=None, nope=None):
 
 def largest_update_difference(left, right) -> float:
     return max(float(jnp.max(jnp.abs(a - b)))
-               for a, b in zip(jax.tree.leaves(left), jax.tree.leaves(right)))
+               for a, b in zip(jax.tree.leaves(left), jax.tree.leaves(right), strict=True))
 
 
 def test_muonclip_without_stats_steps_like_muon():
@@ -498,9 +499,9 @@ def test_the_threshold_rides_optimizer_opts():
 
 
 def tiny_decoder(**overrides):
-    fields = dict(vocab_size=32, emb_features=16, num_layers=2, num_heads=4,
-                  num_kv_heads=2, mlp_features=32, max_seq_len=8,
-                  qk_norm=False)
+    fields = {'vocab_size': 32, 'emb_features': 16, 'num_layers': 2, 'num_heads': 4,
+                  'num_kv_heads': 2, 'mlp_features': 32, 'max_seq_len': 8,
+                  'qk_norm': False}
     fields.update(overrides)
     return CausalTransformer(**fields)
 

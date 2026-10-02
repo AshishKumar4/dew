@@ -86,7 +86,10 @@ def oracle_chunk(query, key, value, g, beta, state, chunk_size):
         attn_intra[..., mask] = 0
         v_new = v_i - k_cumdecay[:, :, i] @ s
         core[:, :, i] = attn_inter + attn_intra @ v_new
-        s = s * np.exp(g_i[:, :, -1])[..., None] + np.swapaxes(k_i * np.exp(g_i[:, :, -1:] - g_i), -1, -2) @ v_new
+        s = (
+            s * np.exp(g_i[:, :, -1])[..., None]
+            + np.swapaxes(k_i * np.exp(g_i[:, :, -1:] - g_i), -1, -2) @ v_new
+        )
     core = core.reshape(batch, heads, -1, dv)[:, :, :length]
     return np.swapaxes(core, 1, 2), s
 
@@ -166,7 +169,8 @@ def layer_and_params(lower_bound):
     module = KimiDeltaAttention(emb_features=E, num_heads=H, head_dim=D, conv_kernel=K,
                                 lower_bound=lower_bound, chunk_size=4, norm_eps=1e-5)
     rng = np.random.RandomState(3)
-    dense = lambda rows, cols: rng.randn(rows, cols) / np.sqrt(rows)
+    def dense(rows, cols):
+        return rng.randn(rows, cols) / np.sqrt(rows)
     params = {
         "q_proj": dense(E, H * D), "k_proj": dense(E, H * D), "v_proj": dense(E, H * D),
         **{name: rng.randn(H * D, 1, K) * 0.5 for name in ("q_conv1d", "k_conv1d", "v_conv1d")},
@@ -197,7 +201,10 @@ def test_the_layer_matches_the_oracle_in_both_forget_gate_forms(lower_bound):
     out = module.apply(variables, jnp.asarray(x, jnp.float32))
 
     assert scaled(out, wanted) < BOUND
-    assert module.init(jax.random.key(0), jnp.asarray(x, jnp.float32))["params"].keys() == variables["params"].keys()
+    assert (
+        module.init(jax.random.key(0), jnp.asarray(x, jnp.float32))["params"].keys()
+        == variables["params"].keys()
+    )
 
 
 def test_a_per_head_scalar_decay_is_a_different_layer():
@@ -258,7 +265,9 @@ def test_prefill_then_token_steps_reproduce_the_parallel_layer():
     out, state = module.apply({**variables, **allocated}, x[:, :3], decode=True, mutable=["cache"])
     steps = [out]
     for position in range(3, S):
-        out, state = module.apply({**variables, **state}, x[:, position:position + 1], decode=True, mutable=["cache"])
+        out, state = module.apply(
+            {**variables, **state}, x[:, position : position + 1], decode=True, mutable=["cache"]
+        )
         steps.append(out)
 
     assert scaled(jnp.concatenate(steps, axis=1), np.asarray(full)) < BOUND

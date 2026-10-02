@@ -66,7 +66,9 @@ def test_gpt2_public_generation_matches_the_reference_continuation():
     ids = np.load(FIXTURES / 'gpt2-tiny' / 'input_ids.npy')[:1, :4]
     task = TextGeneration(loaded.model, loaded.variables, sampling=Sampling(temperature=0))
     generated = task(ids, max_new_tokens=6, key=0)
-    np.testing.assert_array_equal(np.asarray(generated.tokens), np.load(FIXTURES / 'gpt2-tiny' / 'generated.npy'))
+    np.testing.assert_array_equal(
+        np.asarray(generated.tokens), np.load(FIXTURES / "gpt2-tiny" / "generated.npy")
+    )
 
 
 @pytest.mark.parametrize('term', ['norm_bias', 'mlp_bias', 'learned_positions'])
@@ -122,7 +124,9 @@ def test_original_bare_gpt2_weights_and_causal_buffers_preserve_logits():
     config = translate_config(loaded.config)
     variables = translate_weights(tensors, config, 'gpt2')
     ids = jnp.asarray(np.load(directory / 'input_ids.npy'))
-    np.testing.assert_array_equal(loaded.model.apply(variables, ids), loaded.model.apply(loaded.variables, ids))
+    np.testing.assert_array_equal(
+        loaded.model.apply(variables, ids), loaded.model.apply(loaded.variables, ids)
+    )
     tensors['h.0.attn.bias'][0, 0, 0, 1] = 1
     with pytest.raises(ValueError, match='causal mask'):
         translate_weights(tensors, config, 'gpt2')

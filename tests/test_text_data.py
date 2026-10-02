@@ -20,6 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from absl import flags
 
 from dew.data import ByteTokenizer, DataPartition, Loading, PackedTokens, TokenCorpus, TokenWindows
 from dew.data.dataset import describe
@@ -36,7 +37,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # grain's worker processes read absl flags; a test that never ran absl.app
 # would trip UnparsedFlagAccessError at any worker_count > 0.
-from absl import flags
 
 if not flags.FLAGS.is_parsed():
     flags.FLAGS.mark_as_parsed()
@@ -68,7 +68,7 @@ def _token_dir(tmp_path, train_tokens, val_tokens=None, dtype=np.uint16,
 
 def _document_dir(tmp_path, documents, eos_id=0, dtype=np.uint16):
     """A token directory whose stream is `documents`, each closed by eos_id."""
-    stream = np.concatenate([np.asarray(d + [eos_id], np.int64) for d in documents])
+    stream = np.concatenate([np.asarray([*d, eos_id], np.int64) for d in documents])
     _token_dir(tmp_path, train_tokens=0, body=stream, dtype=dtype, eos_id=eos_id)
     (tmp_path / "val.bin").write_bytes(stream.astype(dtype).tobytes())
     return tmp_path, stream
@@ -309,8 +309,13 @@ def test_token_loader_stride_changes_training_windows_only(tmp_path):
     seq_len, batch = 4, 4
     _token_dir(tmp_path, train_tokens=17, val_tokens=17, body=np.arange(34))
     default = _windows(tmp_path, seq_len=seq_len, seed=17).load(batch=batch)
-    positional = TokenWindows(str(tmp_path), seq_len, None, seed=17,
-                              loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1)).load(batch=batch)
+    positional = TokenWindows(
+        str(tmp_path),
+        seq_len,
+        None,
+        seed=17,
+        loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1),
+    ).load(batch=batch)
     explicit = _windows(tmp_path, seq_len=seq_len, stride=seq_len, seed=17).load(batch=batch)
     overlap = _windows(tmp_path, seq_len=seq_len, stride=1, seed=17).load(batch=batch)
     assert overlap.records == 13 and overlap.steps_per_epoch == 3
@@ -430,7 +435,9 @@ def test_token_loader_records_do_not_depend_on_worker_count(tmp_path):
     _token_dir(tmp_path, train_tokens=(records + 1) * seq_len, val_tokens=2 * seq_len)
 
     def by_record(worker_count):
-        data = _windows(tmp_path, seq_len=seq_len, seed=7, loading=Loading(workers=worker_count)).load(batch=4)
+        data = _windows(tmp_path, seq_len=seq_len, seed=7, loading=Loading(workers=worker_count)).load(
+            batch=4
+        )
         out = {}
         for b in itertools.islice(data.train(DataPartition()), data.steps_per_epoch):
             for row in b["text"]:
@@ -576,7 +583,7 @@ def test_documents_in_memory_are_written_one_eos_terminated_document_each(tmp_pa
 
 
 def test_a_path_that_holds_no_text_is_refused(tmp_path):
-    with pytest.raises(ValueError, match="holds no \\*.txt file"):
+    with pytest.raises(ValueError, match=r"holds no \*.txt file"):
         TokenCorpus.write(tmp_path, tmp_path / "out")
     with pytest.raises(FileNotFoundError, match="neither a text file nor a directory"):
         TokenCorpus.write(tmp_path / "missing", tmp_path / "out")
@@ -664,7 +671,7 @@ def test_document_source_reads_one_document_per_record(tmp_path):
     for index, document in enumerate(documents):
         # The eos closes the document, so it belongs to the record.
         np.testing.assert_array_equal(
-            source[index]["text"], np.asarray(document + [0], np.int32))
+            source[index]["text"], np.asarray([*document, 0], np.int32))
     assert list(source.lengths) == [4, 3, 5]
 
 
@@ -731,7 +738,7 @@ def test_packed_loader_cuts_documents_that_outgrow_the_window(tmp_path):
     positions = [batch["text_positions"][0] for batch in data.val(DataPartition())]
     assert len(rows) == 3  # ceil(10 / 4) pieces, one per window
     np.testing.assert_array_equal(np.concatenate(rows)[:10],
-                                  list(range(10, 19)) + [0])
+                                  [*list(range(10, 19)), 0])
     np.testing.assert_array_equal(positions[0], [0, 1, 2, 3])
 
 
@@ -759,7 +766,7 @@ def test_packed_loader_state_restores_the_next_unseen_batch(tmp_path):
 
     restored = data.val(DataPartition())
     restored.set_state(state)
-    for wanted, got in zip(expected, [next(restored)["text"] for _ in range(2)]):
+    for wanted, got in zip(expected, [next(restored)["text"] for _ in range(2)], strict=True):
         np.testing.assert_array_equal(wanted, got)
 
 
@@ -960,7 +967,7 @@ PACK_EOS = 1
 
 def _packed(tmp_path, documents, seq_len, batch=1, bins=4):
     """One validation pass over `documents` packed into `seq_len + 1` windows."""
-    stream = np.concatenate([np.asarray(d + [PACK_EOS], np.int64) for d in documents])
+    stream = np.concatenate([np.asarray([*d, PACK_EOS], np.int64) for d in documents])
     _token_dir(tmp_path, train_tokens=0, body=stream, eos_id=PACK_EOS)
     (tmp_path / "val.bin").write_bytes(stream.astype(np.uint16).tobytes())
     return list(_packed_tokens(tmp_path, seq_len=seq_len, packing_bins=bins)
@@ -1098,7 +1105,7 @@ def test_a_window_of_a_long_document_reads_only_its_own_span(tmp_path, monkeypat
     document and kept a slice: a D-token document cost D tokens per chunk,
     D * ceil(D / window) a pass."""
     documents = [list(range(1, 40)), [2, 3], list(range(5, 30))]
-    stream = np.concatenate([np.asarray(d + [PACK_EOS], np.int64) for d in documents])
+    stream = np.concatenate([np.asarray([*d, PACK_EOS], np.int64) for d in documents])
     _token_dir(tmp_path, train_tokens=0, body=stream, eos_id=PACK_EOS)
     (tmp_path / "val.bin").write_bytes(stream.astype(np.uint16).tobytes())
     data = _packed_tokens(tmp_path, seq_len=7, packing_bins=2).load(batch=2)
@@ -1178,7 +1185,7 @@ def test_a_document_longer_than_the_window_is_cut_into_separate_segments(
     assert len(batches) == 3
     np.testing.assert_array_equal(
         np.concatenate([b["text"][0] for b in batches])[:13],
-        list(range(2, 14)) + [PACK_EOS])
+        [*list(range(2, 14)), PACK_EOS])
     for batch in batches:
         np.testing.assert_array_equal(batch["text_positions"][0][:1], [0])
         _assert_mask_blocks_everything_it_should(batch, monkeypatch)
@@ -1314,7 +1321,7 @@ def test_an_interrupted_packed_epoch_resumes_through_mp_prefetch(tmp_path):
 def _chunks(tokens, sizes):
     """`tokens` cut into consecutive pieces of `sizes`, the last taking the rest."""
     edges = np.cumsum([0, *sizes])
-    pieces = [tokens[start:stop] for start, stop in zip(edges, edges[1:])]
+    pieces = [tokens[start:stop] for start, stop in itertools.pairwise(edges)]
     return [*pieces, tokens[edges[-1]:]]
 
 

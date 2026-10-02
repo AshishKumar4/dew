@@ -354,10 +354,10 @@ def test_an_unfamiliar_tensor_name_is_refused():
     weights. The text tower's loader skips the vision tower and the projection
     heads by their prefixes; the full model's loader maps them and skips only
     the buffers and the logit scale. Any other name raises ValueError."""
-    with pytest.raises(ValueError, match="text_model.encoder.layers.0.self_attn.qkv"):
+    with pytest.raises(ValueError, match=r"text_model.encoder.layers.0.self_attn.qkv"):
         translate_weights({"text_model.encoder.layers.0.self_attn.qkv.weight":
                            np.zeros((3, 2), np.float32)})
-    with pytest.raises(ValueError, match="vision_model.embeddings.patch_embedding.bias"):
+    with pytest.raises(ValueError, match=r"vision_model.embeddings.patch_embedding.bias"):
         translate_clip_weights({"vision_model.embeddings.patch_embedding.bias":
                                 np.zeros((2,), np.float32)})
     with pytest.raises(ValueError, match="logit_bias"):
@@ -426,7 +426,7 @@ def test_a_full_checkpoint_that_does_not_fit_its_config_is_refused(tmp_path):
     config["vision_config"]["num_hidden_layers"] = 2
     (tmp_path / "config.json").write_text(json.dumps(config))
 
-    with pytest.raises(ValueError, match="vision_model.layers_1"):
+    with pytest.raises(ValueError, match=r"vision_model.layers_1"):
         CLIPModel.from_pretrained(str(tmp_path))
 
 
@@ -505,7 +505,9 @@ def test_public_text_encoder_storage_is_separate_from_compute(kind):
         assert isinstance(native, (CLIPTextModel, T5EncoderModel))
         assert native.transformer.dtype == jnp.float32
     assert jax.tree.structure(masters.variables) == jax.tree.structure(native.variables)
-    for before, after in zip(jax.tree.leaves(masters.variables), jax.tree.leaves(native.variables), strict=True):
+    for before, after in zip(
+        jax.tree.leaves(masters.variables), jax.tree.leaves(native.variables), strict=True
+    ):
         assert np.asarray(before).dtype == np.float32
         assert after.dtype == jnp.bfloat16
         np.testing.assert_array_equal(after, np.asarray(before).astype(jnp.bfloat16))

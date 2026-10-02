@@ -126,7 +126,7 @@ def test_the_loader_hook_dequantizes_every_paired_weight_and_nothing_else():
 
 
 def test_a_scale_without_its_weight_is_refused():
-    with pytest.raises(ValueError, match="scales model.layers.0.mlp.up_proj.weight, which"):
+    with pytest.raises(ValueError, match=r"scales model.layers.0.mlp.up_proj.weight, which"):
         fp8_blocks(BLOCK).dequantize({"model.layers.0.mlp.up_proj.weight_scale_inv": np.ones((1, 1))})
 
 
@@ -406,7 +406,7 @@ def test_a_ue8m0_scale_rounds_as_the_references_float32_log2_does():
 
         codes, scale_inv = quantize_fp8_blocks(weight, 1, ue8m0=True)
 
-        reference_codes, reference_scales = torch_per_block_cast(weight, 1, True)
+        reference_codes, reference_scales = torch_per_block_cast(weight, 1, ue8m0=True)
         assert np.array_equal(scale_inv.view(np.uint32), reference_scales.view(np.uint32))
         assert np.array_equal(codes.view(np.uint8), reference_codes)
         assert np.all(scale_inv.view(np.uint32) & 0x7FFFFF == 0), "not powers of two"
@@ -470,7 +470,7 @@ def test_a_weight_that_is_not_finite_is_refused_rather_than_written(value):
     weight = np.ones((4, 4), np.float32)
     weight[2, 3] = value
 
-    with pytest.raises(ValueError, match="1 value.*not finite"):
+    with pytest.raises(ValueError, match=r"1 value.*not finite"):
         quantize_fp8_blocks(weight, block=2)
 
 
@@ -528,7 +528,7 @@ def test_the_packer_refuses_a_recorded_tensor_it_was_not_handed():
     """A source tensor that was quantized and is missing from the export
     would otherwise be written dense under a config that calls it
     quantized, which is the lie this whole path exists to avoid."""
-    with pytest.raises(KeyError, match="up_proj.weight"):
+    with pytest.raises(KeyError, match=r"up_proj.weight"):
         fp8_blocks(PACK_BLOCK).requantize({"a.weight": np.ones((16, 16), np.float32)},
                                           ("model.layers.0.mlp.up_proj.weight",))
 
@@ -537,7 +537,7 @@ def test_the_packer_refuses_to_overwrite_an_existing_scale_partner():
     tensors = {"a.weight": np.ones((16, 16), np.float32),
                "a.weight_scale_inv": np.ones((1, 1), np.float32)}
 
-    with pytest.raises(ValueError, match="a.weight_scale_inv is already"):
+    with pytest.raises(ValueError, match=r"a.weight_scale_inv is already"):
         fp8_blocks(PACK_BLOCK, ue8m0=False).requantize(tensors, ("a.weight",))
 
 
@@ -777,8 +777,10 @@ def test_deepseek_v3_kv_a_proj_dequantizes_like_the_reference():
 @pytest.mark.network
 @pytest.mark.parametrize("repo, scale_fmt", SOURCES,
                          ids=["deepseek-v3", "deepseek-v32-exp"])
-@pytest.mark.skipif(os.environ.get("DEW_NETWORK_TESTS") != "1",
-                    reason="reads two tensors of a DeepSeek checkpoint from the hub; DEW_NETWORK_TESTS=1 runs it")
+@pytest.mark.skipif(
+    os.environ.get("DEW_NETWORK_TESTS") != "1",
+    reason="reads two tensors of a DeepSeek checkpoint from the hub; DEW_NETWORK_TESTS=1 runs it",
+)
 def test_the_encoder_reproduces_the_bytes_deepseek_shipped(repo, scale_fmt):
     """The oracle no synthetic weight can stand in for. DeepSeek's own
     quantizer wrote the shipped pair, so dequantizing it and running this

@@ -125,7 +125,9 @@ def test_a_local_checkpoint_keeps_the_profiles_in_its_state(tmp_path):
     checkpoints = Checkpoints(str(tmp_path / 'run'), local_directory=str(tmp_path / 'local'), local_every=1)
     checkpoints.save_local(2, state, None)
     checkpoints.wait()
-    template = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding), state)
+    template = jax.tree.map(
+        lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding), state
+    )
     restored, _ = checkpoints.restore(template, 2)
     for held, expected in zip(jax.tree.leaves(restored.opt_state.averages),
                               jax.tree.leaves(state.opt_state.averages), strict=True):
@@ -163,7 +165,9 @@ def test_an_interrupted_snapshot_restores_the_previous_step_and_is_never_reconst
     fresh = Checkpoints(directory, keep=1)
     assert fresh.latest == fresh.best == 2
     assert fresh.profile_steps() == [2]
-    template = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding), state)
+    template = jax.tree.map(
+        lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding), state
+    )
     restored, _ = fresh.restore(template)
     def bits(leaf):
         if isinstance(leaf, jax.Array) and jax.dtypes.issubdtype(leaf.dtype, jax.dtypes.prng_key):

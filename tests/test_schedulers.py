@@ -43,12 +43,17 @@ CONTINUOUS_STEPS = jnp.array([0.05, 0.3, 0.6, 0.95])
 # identity: 'vp' is variance preserving, 've' keeps alpha=1 and scales the
 # input, 'flow' is the rectified-flow linear path.
 SCHEDULES = [
-    (CosineNoiseScheduler, partial(CosineNoiseScheduler, 1000), DISCRETE_STEPS, 'vp'),
-    (LinearNoiseScheduler, partial(LinearNoiseScheduler, 1000), DISCRETE_STEPS, 'vp'),
-    (SqrtContinuousNoiseScheduler, SqrtContinuousNoiseScheduler, CONTINUOUS_STEPS, 'vp'),
-    (KarrasVENoiseScheduler, partial(KarrasVENoiseScheduler, sigma_max=80, rho=7, sigma_data=0.5), CONTINUOUS_STEPS, 've'),
-    (EDMNoiseScheduler, partial(EDMNoiseScheduler, sigma_max=80, sigma_data=0.5), CONTINUOUS_STEPS, 've'),
-    (FlowMatchingScheduler, FlowMatchingScheduler, CONTINUOUS_STEPS, 'flow'),
+    (CosineNoiseScheduler, partial(CosineNoiseScheduler, 1000), DISCRETE_STEPS, "vp"),
+    (LinearNoiseScheduler, partial(LinearNoiseScheduler, 1000), DISCRETE_STEPS, "vp"),
+    (SqrtContinuousNoiseScheduler, SqrtContinuousNoiseScheduler, CONTINUOUS_STEPS, "vp"),
+    (
+        KarrasVENoiseScheduler,
+        partial(KarrasVENoiseScheduler, sigma_max=80, rho=7, sigma_data=0.5),
+        CONTINUOUS_STEPS,
+        "ve",
+    ),
+    (EDMNoiseScheduler, partial(EDMNoiseScheduler, sigma_max=80, sigma_data=0.5), CONTINUOUS_STEPS, "ve"),
+    (FlowMatchingScheduler, FlowMatchingScheduler, CONTINUOUS_STEPS, "flow"),
 ]
 
 ALL_CASES = SCHEDULES
@@ -71,7 +76,7 @@ def test_snr_decreases_along_the_trajectory(cls, make, steps, family):
 def test_rates_broadcast_against_the_sample(cls, make, steps, family, sample_shape):
     """broadcast_rates is how every caller shapes the rates: the result must
     broadcast against the batch it came from, for images and for video."""
-    x = jnp.zeros((len(steps),) + sample_shape)
+    x = jnp.zeros((len(steps), *sample_shape))
     alpha, sigma = broadcast_rates(make(), steps, x)
     assert alpha.shape == sigma.shape == (len(steps),) + (1,) * (x.ndim - 1)
     assert (alpha * x).shape == x.shape
@@ -85,7 +90,7 @@ def test_forward_diffusion_invertible(cls, make, steps, family, sample_shape, rn
     epsilon parameterization on every schedule."""
     schedule = make()
     key0, key1 = jax.random.split(rng)
-    full_shape = (len(steps),) + sample_shape
+    full_shape = (len(steps), *sample_shape)
     x0 = jax.random.normal(key0, full_shape)
     noise = jax.random.normal(key1, full_shape)
     rates = broadcast_rates(schedule, steps, x0)
@@ -212,7 +217,8 @@ def test_cosine_table_is_nichol_and_dhariwals_cumulative_alpha():
     T, s = 1000, 0.008
     schedule = CosineNoiseScheduler(T, beta_start=s)
     index = jnp.array([0, 10, 300, 600, 900])
-    f = lambda u: jnp.cos((u / T + s) / (1 + s) * jnp.pi / 2) ** 2
+    def f(u):
+        return jnp.cos((u / T + s) / (1 + s) * jnp.pi / 2) ** 2
     expected = f(index + 1.0) / f(0.0)
     assert jnp.allclose(schedule.rates(index)[0] ** 2, expected, rtol=1e-4)
 

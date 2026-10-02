@@ -11,6 +11,7 @@ network.
 
 import json
 import sys
+from importlib import import_module
 from pathlib import Path
 
 import jax
@@ -22,13 +23,13 @@ import pytest
 import dew
 from dew.interop import hub, load_params, save_hf_layout, save_params
 from dew.interop.hub import pull_from_hub
+from dew.interop.safetensors_io import read_file, write_file
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.dit import TextContext
 
 safetensors_numpy = pytest.importorskip("safetensors.numpy")
-import safetensors
+safetensors = import_module("safetensors")
 
-from dew.interop.safetensors_io import read_file, write_file
 
 
 @pytest.fixture
@@ -56,7 +57,7 @@ def test_round_trip_keeps_the_tree_and_the_values(params, tmp_path):
     loaded = load_params(path)
 
     assert jax.tree_util.tree_structure(loaded) == jax.tree_util.tree_structure(params)
-    for saved, restored in zip(jax.tree.leaves(params), jax.tree.leaves(loaded)):
+    for saved, restored in zip(jax.tree.leaves(params), jax.tree.leaves(loaded), strict=True):
         assert np.array_equal(np.asarray(saved), restored)
 
 
@@ -125,7 +126,7 @@ def test_every_stored_dtype_reads_back_exactly(tmp_path):
         "i64": np.asarray([7], np.int64),
         "bytes": np.asarray([0, 127, 128, 255], np.uint8),
         "empty": np.zeros((0, 4), np.uint8),
-        "flag": np.asarray(True, np.bool_),
+        "flag": np.ones((), dtype=np.bool_),
         "scalar": np.asarray(0.25, np.float32),
     }
     path = tmp_path / "model.safetensors"
@@ -197,7 +198,7 @@ def test_an_fp4_tensor_with_an_odd_last_axis_is_refused_by_name(tmp_path):
     path = tmp_path / "odd.safetensors"
     raw_safetensors(path, {"w": ("F4", (2, 3), bytes(3))})
 
-    with pytest.raises(ValueError, match="'w'.*F4 with shape \\(2, 3\\)"):
+    with pytest.raises(ValueError, match=r"'w'.*F4 with shape \(2, 3\)"):
         read_file(path)
 
 
@@ -342,7 +343,9 @@ def test_public_parameter_storage_is_independent_of_compute_and_roundtrips(tmp_p
     native.save(destination)
     restored = Pretrained.load(destination, dtype="float32", param_dtype="bfloat16", attention_impl="xla")
     assert jax.tree.structure(native.variables) == jax.tree.structure(restored.variables)
-    for before, after in zip(jax.tree.leaves(native.variables), jax.tree.leaves(restored.variables), strict=True):
+    for before, after in zip(
+        jax.tree.leaves(native.variables), jax.tree.leaves(restored.variables), strict=True
+    ):
         assert np.asarray(before).dtype == np.asarray(after).dtype
         np.testing.assert_array_equal(before, after)
 
