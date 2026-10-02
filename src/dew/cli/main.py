@@ -40,9 +40,9 @@ class Export:
     """Which checkpoint to read; unset takes the latest."""
 
     def run_command(self) -> int:
-        from dew.interop.export import export_run
+        from dew.interop import Pretrained
 
-        export_run(self.run, self.destination, ema=self.ema, step=self.step)
+        Pretrained.from_run(self.run, ema=self.ema, step=self.step).save(self.destination)
         emit(f"exported {self.run} to {self.destination}")
         return 0
 

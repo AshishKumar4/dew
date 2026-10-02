@@ -210,7 +210,7 @@ def test_sft_diffusion_gemma_smoke_writes_an_adapter_and_generates_from_it(tmp_p
 
 def test_sft_gemma4_smoke_trains_on_chat_rows_and_exports_the_decoder(tmp_path):
     """Full-weight SFT over packed conversations: the run record `dew.pipeline`
-    reads, and the Hugging Face directory `export_run` writes beside it."""
+    reads, and the Hugging Face directory `Pretrained.from_run(...).save(...)` writes beside it."""
     smoke("sft_gemma4", tmp_path)
 
     export = tmp_path / "export"

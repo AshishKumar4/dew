@@ -9,7 +9,6 @@ from importlib import import_module
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .export import export_run
     from .hf_decoders import translate_config, translate_weights
     from .pretrained import (
         Pretrained,
@@ -27,7 +26,6 @@ _EXPORTS = {
     **dict.fromkeys(("Pretrained", "PretrainedBlockDecoder", "PretrainedDecoder", "PretrainedFallback",
                      "PretrainedMaskedDecoder", "PretrainedPipeline", "Processor", "split_revision"),
                     "pretrained"),
-    "export_run": "export",
     "translate_config": "hf_decoders",
     "translate_weights": "hf_decoders",
     "load_params": "safetensors_io", "save_hf_layout": "safetensors_io", "save_params": "safetensors_io",
@@ -52,7 +50,6 @@ __all__ = [
     "PretrainedMaskedDecoder",
     "PretrainedPipeline",
     "Processor",
-    "export_run",
     "load_params",
     "save_hf_layout",
     "save_params",
