@@ -419,6 +419,43 @@ class Pretrained:
     for a bundle with no source processor to write (`from_model`)."""
 
     @classmethod
+    def from_run(cls, directory: str | Path, *, step: int | str | None = None,
+                 ema: bool | None = None) -> Pretrained:
+        """A trained run's selected checkpoint, rebuilt from its own inference record."""
+        from dew.checkpoints import Checkpoints
+        from dew.config import ModelConfig
+        from dew.inference.tasks import run_record
+        from dew.records import record, text
+        from dew.registry import objectives
+        declaration = run_record(str(directory), step)
+        model_config = ModelConfig.from_dict(record(declaration['model'], 'model'))
+        model = model_config.build()
+        kind = text(declaration['objective'], 'objective')
+        averaged = False if objectives[kind]._ema_is_reference else ema
+        variables = Checkpoints(str(directory)).variables(step=step, ema=averaged)
+        sampling = declaration.get('sampling')
+        generation = None if sampling is None else record(sampling, 'sampling')
+        tokenizer = declaration.get('tokenizer')
+        tokenizer = None if tokenizer is None else text(tokenizer, 'tokenizer')
+        if isinstance(model, CausalTransformer):
+            bundle = PretrainedDecoder.from_model(model, variables, tokenizer=tokenizer,
+                                                   generation_config=generation)
+        elif isinstance(model, DiffusionGemma):
+            from dew.interop import diffusion_gemma
+            settings = record(declaration['diffusion_gemma'], 'diffusion_gemma')
+            config = record(settings['config'], 'diffusion_gemma config')
+            generation = record(settings['generation_config'], 'generation_config')
+            bundle = PretrainedBlockDecoder(model, variables, None, config, None, model_config.fields(),
+                                             generation, export_adapter=diffusion_gemma.export_weights,
+                                             tokenizer=tokenizer)
+        else:
+            raise TypeError(f"{type(model).__name__} has no maintained exported bundle layout; "
+                            "load its task with from_run")
+        if cls is not Pretrained and not isinstance(bundle, cls):
+            raise ValueError(f"run builds {type(bundle).__name__}, not {cls.__name__}")
+        return bundle
+
+    @classmethod
     def load(cls, name_or_dir: str | Path, *, dtype: str = "bfloat16", param_dtype: str = "float32",
              attention_impl: str = "auto", max_seq_len: int | None = None,
              revision: str | None = None, gguf_file: str | None = None,
