@@ -29,7 +29,7 @@ from dew.registry import dtype_name, resolve_dtype
 from dew.sampling.guidance import CFG, Guidance
 from dew.sampling.sample import sample
 from dew.sampling.solvers import DDIM, Solver
-from dew.telemetry.profile import active_profile
+from dew.telemetry.profile import region
 
 ArrayT = TypeVar("ArrayT", bound=jax.Array | np.ndarray, default=jax.Array, covariant=True)
 
@@ -311,15 +311,8 @@ class TextToImage:
         if plan.processes > 1:
             multihost_utils.assert_equal(settled.signature,
                                          "image input shapes and sampling must agree across processes")
-        annotation = None
-        if active_profile() is not None:
-            annotation = jax.profiler.TraceAnnotation("inference.image.prepare")
-            annotation.__enter__()
-        try:
+        with region("inference.image.prepare"):
             given, null, initial_state = self._encoded(settled, configured=unconditional is None)
-        finally:
-            if annotation is not None:
-                annotation.__exit__(None, None, None)
         owns_grid = self.grid is not None or times is not None
         return DenoisingInputs(initial_state, given, null, rows=plan.rows,
                                grid_steps=count if owns_grid else None,
@@ -528,20 +521,13 @@ class TextToImage:
         if prepared is None:
             assert not isinstance(prompts, DenoisingInputs)
             prepared = self.prepare(prompts, key=request, steps=count)
-        annotation = None
-        if active_profile() is not None:
-            annotation = jax.profiler.TraceAnnotation("inference.image")
-            annotation.__enter__()
-        try:
+        with region("inference.image"):
             assert prepared.rows is not None
             plan = RowPlan.over(mesh, prepared.rows)
             generated = _run(plan.sharding)(self.model, process, self.autoencoder, self.finish, count,
                                          solver, chosen, self.final_denoise, times, decode, self.params,
                                          prepared.conditions, prepared.unconditional,
                                          prepared.noise, jax.random.fold_in(request, 1))
-        finally:
-            if annotation is not None:
-                annotation.__exit__(None, None, None)
         return replace(generated, rows=plan.rows)
 
 
