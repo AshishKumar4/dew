@@ -20,7 +20,7 @@ import jax.numpy as jnp
 import optax
 import tyro
 
-from dew.data import ByteTokenizer, DataPartition, Loading, TokenWindows
+from dew.data import ByteTokenizer, DataPartition, Loading, TokenCorpus, TokenWindows
 from dew.diffusion.discrete import DiscreteProcess, LogLinear
 from dew.inference import RunProcessor
 from dew.nn.backbones import CausalTransformer
@@ -50,8 +50,8 @@ def main(config: Config):
     if config.smoke:
         config = replace(config, sequence_length=64, batch_size=4, steps=8,
                          features=64, layers=2, heads=4, sample_tokens=32, sample_steps=8)
-    meta = json.loads((config.tokens / "meta.json").read_text())
-    if meta["tokenizer"] != "byte" or meta["vocab_size"] != 256:
+    corpus = TokenCorpus.read(config.tokens)
+    if corpus.tokenizer != "byte" or corpus.vocab_size != 256:
         raise ValueError("this example expects a corpus prepared with --tokenizer byte")
     tokenizer = ByteTokenizer()
     # TokenWindows ordinarily yields S+1 ids for next-token training. MDLM
@@ -85,7 +85,7 @@ def main(config: Config):
     task = objective.pipeline(state, ema=False, processor=RunProcessor(tokenizer))
     generated = task(config.prompt, config.sample_tokens, key=1).text[0]
     (config.out / "sample.txt").write_text(config.prompt + generated + "\n")
-    report = {"corpus": str(config.tokens), "train_tokens": meta["train_tokens"],
+    report = {"corpus": str(config.tokens), "train_tokens": corpus.train_tokens,
               "device": jax.devices()[0].device_kind, "steps": int(state.step),
               "updates": int(state.updates), "probe_nelbo_before": initial_loss,
               "probe_nelbo_after": final_loss, "sample": config.prompt + generated}

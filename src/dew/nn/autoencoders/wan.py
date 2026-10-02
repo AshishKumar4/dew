@@ -51,9 +51,6 @@ from .kl import posterior_latent
 if TYPE_CHECKING:
     from dew.interop.pretrained import WeightLayout
 
-TEMPORAL = 4
-"""Frames per latent frame after the first."""
-
 
 class _RMSNorm(nn.Module):
     """`WanRMS_norm`: the channel vector scaled to unit L2 norm, times sqrt(C)
@@ -107,7 +104,6 @@ class _Attention(nn.Module):
     """Single-head self-attention over each frame's pixels, the projections
     1x1 convolutions."""
 
-    features: int
     dtype: Dtype = jnp.float32
 
     @nn.compact
@@ -133,7 +129,7 @@ class _MidBlock(nn.Module):
     @nn.compact
     def __call__(self, x):
         x = _ResidualBlock(self.features, self.features, self.dtype, name="resnets_0")(x)
-        x = _Attention(self.features, self.dtype, name="attentions_0")(x)
+        x = _Attention(self.dtype, name="attentions_0")(x)
         return _ResidualBlock(self.features, self.features, self.dtype, name="resnets_1")(x)
 
 
@@ -229,7 +225,6 @@ class _UpBlock(nn.Module):
 
 class _Decoder(nn.Module):
     base: int
-    latent: int
     multipliers: tuple[int, ...]
     blocks: int
     temporal: tuple[bool, ...]
@@ -277,11 +272,11 @@ class WanVAE(nn.Module):
         return 2 ** sum(self.temporal)
 
     def setup(self):
-        fields = (self.base, self.latent, self.multipliers, self.blocks, self.temporal, self.dtype)
-        self.encoder = _Encoder(*fields)
+        self.encoder = _Encoder(self.base, self.latent, self.multipliers, self.blocks, self.temporal,
+                                self.dtype)
         self.quant_conv = _causal(2 * self.latent, 1, self.dtype, "quant_conv")
         self.post_quant_conv = _causal(self.latent, 1, self.dtype, "post_quant_conv")
-        self.decoder = _Decoder(*fields)
+        self.decoder = _Decoder(self.base, self.multipliers, self.blocks, self.temporal, self.dtype)
 
     def moments(self, video):
         """The posterior's mean and log-variance, stacked on the channel axis."""

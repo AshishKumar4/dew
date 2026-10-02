@@ -224,7 +224,6 @@ class _Down(nn.Module):
     convolution then a pixel unshuffle; the shortcut averages the unshuffled
     input's channel groups."""
 
-    in_features: int
     features: int
     unshuffle: bool
     shortcut: bool
@@ -278,8 +277,7 @@ class _Encoder(nn.Module):
         if layers[0] > 0:
             x = _conv(channels[0], 3, self.dtype, "conv_in")(image)
         else:
-            x = _Down(self.image_channels, channels[1], self.unshuffle, shortcut=False, dtype=self.dtype,
-                      name="conv_in")(image)
+            x = _Down(channels[1], self.unshuffle, shortcut=False, dtype=self.dtype, name="conv_in")(image)
         for level, (features, count) in enumerate(zip(channels, layers, strict=True)):
             for index in range(count):
                 x = _block(
@@ -293,7 +291,7 @@ class _Encoder(nn.Module):
                     f"down_blocks_{level}_{index}",
                 )(x)
             if level < len(channels) - 1 and count > 0:
-                x = _Down(features, channels[level + 1], self.unshuffle, shortcut=True, dtype=self.dtype,
+                x = _Down(channels[level + 1], self.unshuffle, shortcut=True, dtype=self.dtype,
                           name=f"down_blocks_{level}_{count}")(x)
         return _conv(self.latent_channels, 3, self.dtype, "conv_out")(x) + _group_mean(
             x, self.latent_channels

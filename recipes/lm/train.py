@@ -25,7 +25,8 @@ from typing import TYPE_CHECKING
 import tyro
 
 from dew.config import ModelConfig
-from dew.data import PackedTokens, TokenWindows, tokenizer_for
+from dew.data import PackedTokens, TokenWindows
+from dew.data.text import tokenizer_for
 from dew.objectives.lm import LMObjective, LMRunConfig, Perplexity, Samples
 from dew.registry import datasets, models
 from dew.training import TrainState, prepare_process, run_timestamp

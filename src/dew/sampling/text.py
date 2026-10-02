@@ -34,7 +34,6 @@ from jax.typing import ArrayLike
 from typing_extensions import TypeVar
 
 from dew.artifacts import agreed
-from dew.nn.backbones.causal_transformer import gather_cache_rows
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.dspark import DSpark
 from dew.nn.inputs import (
@@ -47,7 +46,7 @@ from dew.nn.inputs import (
     mesh_of,
     request_key,
 )
-from dew.nn.kv_cache import Layered, refuse_unassigned
+from dew.nn.kv_cache import Layered, gather_cache_rows, refuse_unassigned
 from dew.objectives.base import Variables
 from dew.sampling import decoding, strategies
 from dew.sampling.decoding import (
@@ -914,5 +913,6 @@ def generate(model: nn.Module, params: Variables,
     failure, output = _compiled(plan.sharding)(model, params, plan.place(padded),
                                                plan.keys(random_key), max_new_tokens, sampling.pad, n,
                                                *components)
-    failure.throw()
+    # The error's flags are the one read a request waits on.
+    jax.device_get(failure).throw()
     return replace(output, rows=plan.rows * n)

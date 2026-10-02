@@ -25,7 +25,6 @@ from jax.sharding import PartitionSpec as P
 from dew.telemetry.devices import deterministic_ops_requested
 
 from .attention_sinks import attention_with_sinks
-from .conv import Conv
 from .kernels.generation import bf16_dot_runs
 from .kv_cache import Append, KVCache, KVStore, filled_slots
 from .precision import at_default_precision, at_least_fp32, precision_names, rounded_to
@@ -1866,11 +1865,6 @@ def pallas_flash_attention(query, key, value, bias, mask, causal, sliding_window
 class NormalAttention(nn.Module):
     """Attend over a `[B, S, C]` or `[B, H, W, C]` input with multiple heads.
 
-    `causal` makes it a decoder attention, where query i sees keys 0..i.
-    `decode=True` on a call runs it against a fixed-size KV cache allocated
-    at max_seq_len instead: the first call writes the whole prompt, later
-    calls append one token each. Neither flag touches the param tree, so a
-    model trained without either reloads into a decoding one unchanged.
     `freqs_cis` rotates the queries and keys of a self-attention call;
     `rotary_freqs` gives the pair, and None leaves them unrotated.
     """
@@ -1883,8 +1877,6 @@ class NormalAttention(nn.Module):
     force_fp32_for_softmax: bool = True
     qk_norm: bool = False  # RMSNorm on q/k per head (SD3-style bf16 logit safety)
     attention_impl: str = "auto"  # an AttentionImpl
-    causal: bool = False
-    max_seq_len: int | None = None  # KV cache length, required to decode
 
     def setup(self):
         dense = functools.partial(
@@ -1913,7 +1905,7 @@ class NormalAttention(nn.Module):
         )
 
     @nn.compact
-    def __call__(self, x, context=None, decode: bool = False, freqs_cis=None):
+    def __call__(self, x, context=None, freqs_cis=None):
         orig_x_shape = x.shape
         if len(x.shape) == 4:
             x = x.reshape((x.shape[0], x.shape[1] * x.shape[2], x.shape[3]))
@@ -1936,19 +1928,10 @@ class NormalAttention(nn.Module):
             query = apply_rotary(query, freqs_cos, freqs_sin)
             key = apply_rotary(key, freqs_cos, freqs_sin)
 
-        causal, mask = self.causal, None
-        if decode:
-            # Position lives in the cache slot now, not in the row index, so
-            # causality travels as a mask over the slots.
-            positions, append = open_kv_cache(self, key, self.max_seq_len)
-            key, value = append(key, value)
-            mask = causal_attention_mask(positions, key.shape[-3])
-            causal = False
-
         hidden_states = scaled_dot_product_attention(
             query, key, value, dtype=self.dtype, precision=self.precision,
             force_fp32_for_softmax=self.force_fp32_for_softmax,
-            implementation=self.attention_impl, causal=causal, mask=mask,
+            implementation=self.attention_impl,
         )
         proj = self.proj_attn(constrain(hidden_states, HEADS))
         return proj.reshape(orig_x_shape)
@@ -2061,9 +2044,7 @@ class Stage:
     A stage with no attention is `None` instead. Every field is a
     `TransformerBlock` setting. The head width is the stage's channel count
     divided by `heads`, which the unet knows and a config does not, so there
-    is no `dim_head` field. `use_linear_attention` selects the projection
-    kind, a dense layer or a 1x1 convolution; it is not linear attention.
-    `dew.registry.from_record` builds one from a record at the build
+    is no `dim_head` field. `dew.registry.from_record` builds one from a record at the build
     boundary, so a stage arrives as `{"heads": 8}` from a command line and a
     misspelled field raises there.
 
@@ -2072,7 +2053,6 @@ class Stage:
     """
 
     heads: int
-    use_linear_attention: bool = True
     use_projection: bool = False
     use_self_and_cross: bool = True
     only_pure_attention: bool = True
@@ -2098,21 +2078,19 @@ def stage_attention(stage: Stage, channels: int, attention_impl: str,
         only_pure_attention=stage.only_pure_attention,
         force_fp32_for_softmax=stage.force_fp32_for_softmax,
         norm_inputs=stage.norm_inputs, explicitly_add_residual=stage.explicitly_add_residual,
-        use_linear_attention=stage.use_linear_attention, norm_epsilon=stage.norm_epsilon,
+        norm_epsilon=stage.norm_epsilon,
         name=name)
 
 
 class TransformerBlock(nn.Module):
     """Run a `BasicTransformerBlock`, optionally at its own head width.
 
-    `use_projection` puts a projection into and out of `heads * dim_head`
-    around the block; without it the block runs at the input width.
-    `use_linear_attention` picks what that projection is, a dense layer or
-    a 1x1 convolution. It does not select linear attention.
+    `use_projection` puts a dense projection into and out of
+    `heads * dim_head` around the block; without it the block runs at the
+    input width.
     """
     heads: int = 4
     dim_head: int = 32
-    use_linear_attention: bool = True
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     use_projection: bool = False
@@ -2131,12 +2109,8 @@ class TransformerBlock(nn.Module):
             x = RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)(x)
 
         def project(features: int, name: str):
-            if self.use_linear_attention:
-                return nn.Dense(features=features, use_bias=False, precision=self.precision,
-                                dtype=self.dtype, name=name)
-            return Conv(features=features, kernel_size=(1, 1), strides=(1, 1), padding='VALID',
-                        use_bias=False, dtype=self.dtype, precision=self.precision,
-                        name=f'{name}_conv')
+            return nn.Dense(features=features, use_bias=False, precision=self.precision,
+                            dtype=self.dtype, name=name)
 
         if self.use_projection:
             inner_dim = self.heads * self.dim_head

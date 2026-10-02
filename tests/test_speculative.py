@@ -510,7 +510,7 @@ def test_a_media_prompt_seeds_the_depths_with_its_prepared_embeddings():
     model = MultimodalTransformer(
         language, SiglipVision(hidden_size=16, intermediate_size=32, num_layers=1, num_heads=2,
                                image_size=8, patch_size=4),
-        GemmaProjector(vision_width=16, text_width=16, patches_per_side=2, tokens_per_side=1),
+        GemmaProjector(text_width=16, patches_per_side=2, tokens_per_side=1),
         family="gemma3", image_token_id=1)
     prompt = jnp.asarray([[2, 1, 3, 4]], jnp.int32)
     indices = jnp.asarray([[-1, 0, -1, -1]], jnp.int32)

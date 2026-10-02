@@ -58,7 +58,6 @@ from flax import linen as nn
 
 from .attention import unweighted_rmsnorm
 from .precision import at_least_fp32
-from .sharding import logical_axes
 
 HEADS = ('mean', 'weighted', 'carried')
 
@@ -134,7 +133,6 @@ def mix_streams(post, comb, output, streams):
     return post.astype(dtype)[..., None] * output[..., None, :] + mixed
 
 
-@logical_axes({}, heuristic=(("attn_hc",), ("ffn_hc",), ("hc_head",)))
 class HyperConnection(nn.Module):
     """Map the streams to one site's `(post, comb, collapsed)`.
 

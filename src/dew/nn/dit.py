@@ -156,8 +156,7 @@ class AdaLNParams(nn.Module):
         )(nn.silu(conditioning) if self.silu else conditioning)
 
 
-@logical_axes({("patch_embed", "Conv_0"): (None, None, None, "embed")},
-              heuristic=(("hilbert_projection",),))
+@logical_axes({("patch_embed", "Conv_0"): (None, None, None, "embed")})
 class PatchSequenceEmbed(nn.Module):
     """Patchify in raster/hilbert/zigzag order and add the 2D sincos signal.
 
@@ -215,8 +214,7 @@ class PatchSequenceEmbed(nn.Module):
         return tokens, inv_idx
 
 
-@logical_axes({("time_embed", "layers_2"): ("mlp", "embed")},
-              heuristic=(("time_embed", "layers_1"), ("text_context_proj",)))
+@logical_axes({("time_embed", "layers_2"): ("mlp", "embed")})
 class ConditioningEmbed(nn.Module):
     """Fourier time embedding + the text projection mean-pooled over the real
     tokens, summed into the single conditioning vector the adaLN modulation
@@ -385,8 +383,7 @@ def remat_block(block_cls, enabled: RematChoice, policy: str | None = 'dots'):
     )
 
 
-@logical_axes({("mlp", "layers_0"): ("embed", "mlp"), ("mlp", "layers_2"): ("mlp", "embed")},
-              heuristic=(("ssm",), ("spatial_fusion",)))
+@logical_axes({("mlp", "layers_0"): ("embed", "mlp"), ("mlp", "layers_2"): ("mlp", "embed")})
 class ModulatedBlock(nn.Module):
     """adaLN-Zero modulated residual block with a pluggable token mixer.
 
@@ -410,7 +407,6 @@ class ModulatedBlock(nn.Module):
     precision: PrecisionLike = None
     force_fp32_for_softmax: bool = True
     norm_epsilon: float = 1e-5
-    use_gating: bool = True
     adaln_silu: bool = True
     qk_norm: bool = False
     attention_impl: str = "auto"  # an AttentionImpl
@@ -518,18 +514,13 @@ class ModulatedBlock(nn.Module):
                 mixer_output = self._apply_2d_fusion(mixer_output)
         mixer_output = self.dropout(mixer_output, deterministic=not train)
 
-        if self.use_gating:
-            skip = constrain(skip + gate_attn * mixer_output, RESIDUAL)
-        else:
-            skip = constrain(skip + mixer_output, RESIDUAL)
+        skip = constrain(skip + gate_attn * mixer_output, RESIDUAL)
 
         x_mlp_modulated = self.norm2(skip) * (1 + scale_mlp) + shift_mlp
         mlp_output = self.mlp(x_mlp_modulated)
         mlp_output = self.dropout(mlp_output, deterministic=not train)
 
-        if self.use_gating:
-            return constrain(skip + gate_mlp * mlp_output, RESIDUAL)
-        return constrain(skip + mlp_output, RESIDUAL)
+        return constrain(skip + gate_mlp * mlp_output, RESIDUAL)
 
 
 def rope_for_scan(tokens: jax.Array, head_dim: int, scan_order: str):

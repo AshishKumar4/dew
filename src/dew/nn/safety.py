@@ -3,7 +3,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype
 
-from dew.nn.text_encoders import CLIPTowerOutput, CLIPVisionTransformer
+from dew.nn.text_encoders import CLIPVisionTransformer
 
 
 class CLIPSafetyHead(nn.Module):
@@ -39,9 +39,7 @@ class CLIPSafetyHead(nn.Module):
 
     def features(self, pixels):
         """Project the vision tower's pooled output into the concept space."""
-        output = self.vision_model(pixels)
-        assert isinstance(output, CLIPTowerOutput)
-        return self.visual_projection(output.pooler_output)
+        return self.visual_projection(self.vision_model(pixels).pooler_output)
 
     def __call__(self, pixels):
         images = self.features(pixels)
