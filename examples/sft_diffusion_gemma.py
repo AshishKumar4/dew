@@ -25,6 +25,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import optax
 import tyro
 
@@ -91,7 +92,7 @@ def main(config: Config) -> Path:
             raise ValueError("--chat names the conversations to fine-tune on: a hub "
                              "dataset id, a .jsonl file or a parquet file")
 
-    source = PretrainedBlockDecoder.load(config.model, dtype="bfloat16", param_dtype="float32")
+    source = PretrainedBlockDecoder.load(config.model, dtype=jnp.bfloat16, param_dtype=jnp.float32)
     sequence_length = config.prompt_tokens + config.canvases * source.model.canvas_length
     adapter, variables = LoRA.fresh(source.model, source.variables, source.layouts,
                                     rank=config.rank, alpha=config.alpha,
@@ -127,7 +128,7 @@ def main(config: Config) -> Path:
     # The other half of the workflow, from the files alone: the base weights
     # back through `dew.pipeline`, the adapter directory read onto them, and
     # the factors folded into the kernels so the task runs the base model.
-    base = dew.pipeline(config.model, dtype="float32")
+    base = dew.pipeline(config.model, dtype=jnp.float32)
     trained, weights = LoRA.load(base.model, base.variables, source.layouts, adapter_dir)
     task = base.bind(trained.merge(weights))
     generated = task(PROMPTS, config.response_tokens, key=3)

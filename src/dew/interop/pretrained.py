@@ -23,9 +23,11 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal, NamedTuple, Self
 
 import jax
+import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
 from flax import linen as nn
+from jax.typing import DTypeLike
 
 from dew import records
 from dew._model_types import _QWEN35_TEXT_TYPES, _QWEN35_TYPES
@@ -419,7 +421,8 @@ class Pretrained:
     for a bundle with no source processor to write (`from_model`)."""
 
     @classmethod
-    def load(cls, name_or_dir: str | Path, *, dtype: str = "bfloat16", param_dtype: str = "float32",
+    def load(cls, name_or_dir: str | Path, *, dtype: DTypeLike = jnp.bfloat16,
+             param_dtype: DTypeLike | Literal["auto"] = jnp.float32,
              attention_impl: str = "auto", max_seq_len: int | None = None,
              revision: str | None = None, gguf_file: str | None = None,
              single_file: str | None = None,
@@ -434,7 +437,8 @@ class Pretrained:
         artifacts are loaded only when the source contains them.
         dtype selects computation; param_dtype independently selects floating
         parameter storage and defaults to FP32 masters, or 'auto' stores the
-        checkpoint's own dtype (`_checkpoint_dtype`). Frozen component weights
+        checkpoint's own dtype (`_checkpoint_dtype`). Each is a dtype
+        (`jnp.bfloat16`) or its name, and the model's record keeps the name. Frozen component weights
         (text encoders and VAE) follow it too; router, clipping, positional and
         safety state retain their own FP32/integer contracts.
 
@@ -476,11 +480,8 @@ class Pretrained:
         def placed(variables: Variables) -> Variables:
             return place(variables, mesh, layout) if streaming else variables
 
-        if param_dtype != AUTO:
-            storage = dtype_name(resolve_dtype(param_dtype))
-            if storage is None:
-                raise ValueError("param_dtype must select floating parameter storage")
-            param_dtype = storage
+        dtype = dtype_name(dtype)
+        param_dtype = AUTO if param_dtype == AUTO else dtype_name(param_dtype)
         directory = sources.snapshot(str(name_or_dir), revision, weights=False)
         # A Hub snapshot directory is named by its commit.
         commit = None if os.path.isdir(name_or_dir) else directory.name
