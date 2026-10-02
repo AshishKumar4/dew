@@ -228,9 +228,11 @@ def _multimodal_logits(name, image_id, shift=0):
         fields["final_logit_softcap"] = None
     model = models.build("causal_transformer", **with_precision(
         "causal_transformer", fields, dtype="float32", attention_impl="reference"))
-    return (np.asarray(model.apply(variables["language_model"], ids,
-                                   input_embeddings=np.asarray(soft),
-                                   embedding_positions=positions)),
+    language = variables["language_model"]
+    embedded = model.apply(language, ids, method=lambda decoder, ids: decoder.scaled_embeddings(
+        decoder.token_embeddings(ids)))
+    embedded = embedded.at[np.arange(len(ids))[:, None], positions].set(soft.astype(embedded.dtype))
+    return (np.asarray(model.apply(language, ids, input_embeddings=embedded)),
             np.load(directory / "wrapper_ref.npy"), positions)
 
 

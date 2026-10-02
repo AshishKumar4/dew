@@ -274,16 +274,15 @@ class MultimodalTransformer(nn.Module):
                           segment_ids=None, image_indices=None, conditioning=None,
                           attention_mask=None, image_groups=None, rotary_positions=None):
         """Prediction layers over the same media embeddings as the main decoder."""
-        embeddings = slots = None
+        embeddings = None
         if conditioning is not None:
             fused = self._conditioned_embeddings(tokens, image_indices, conditioning, train=train)
             tokens, embeddings = fused.tokens, fused.embeddings
-            slots = jnp.broadcast_to(jnp.arange(tokens.shape[1]), tokens.shape)
         elif image_indices is not None:
             raise ValueError("image_indices require conditioning payloads")
         return self.language_model.mtp_hidden_states(
             hidden, tokens, train=train, positions=positions, segment_ids=segment_ids,
-            input_embeddings=embeddings, embedding_positions=slots, attention_mask=attention_mask,
+            input_embeddings=embeddings, attention_mask=attention_mask,
             image_groups=image_groups, rotary_positions=rotary_positions)
 
     def mtp_logits(self, hidden, tokens, **kwargs):
@@ -359,10 +358,9 @@ class MultimodalTransformer(nn.Module):
                 routed_experts=routed_experts, routed=routed)
         fused = self._conditioned_embeddings(tokens, image_indices, conditioning,
                                              train=train, audio_indices=audio_indices)
-        slots = jnp.broadcast_to(jnp.arange(tokens.shape[1]), tokens.shape)
         return self.language_model.hidden_states(
             fused.tokens, train=train, decode=decode, positions=positions, segment_ids=segment_ids,
-            input_embeddings=fused.embeddings, embedding_positions=slots, attention_mask=attention_mask,
+            input_embeddings=fused.embeddings, attention_mask=attention_mask,
             image_groups=image_groups, rotary_positions=rotary_positions, media_mask=fused.media,
             routed_experts=routed_experts, routed=routed)
 
