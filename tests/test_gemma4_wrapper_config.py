@@ -42,7 +42,24 @@ def test_gemma4_unshared_layers_ignore_the_double_width_flag(tmp_path):
 
 @pytest.mark.network
 def test_published_gemma4_tiny_logits_and_cached_generation(tmp_path):
-    from tools.wrapper_checkpoint_parity import check_checkpoint
+    import torch
+    from reference_error import assert_as_exact_as_the_reference
 
-    check_checkpoint('trl-internal-testing/tiny-Gemma4ForConditionalGeneration',
-                     tmp_path / 'measurement.json', revision='0dc1746b7f9f623b748e735ed5a4302eb4baf346')
+    from tools.gemma4_fp64_reference import CHECKPOINT, REVISION, reference_text
+    from tools.wrapper_checkpoint_parity import measure_checkpoint
+
+    # A CPU-only Torch build still supplies the reference when Dew runs on a GPU.
+    reference_device = None if torch.cuda.is_available() else 'cpu'
+    result, logits = measure_checkpoint(CHECKPOINT, tmp_path / 'measurement.json', revision=REVISION,
+                                        reference_device=reference_device)
+    assert all(row['argmax_agreement'] and row['generation_agreement']
+               for row in result['observations']), result
+    actual, reference, ids = logits[0]
+    truth, oracle_ids = reference_text()
+    np.testing.assert_array_equal(ids, oracle_ids)
+    assert truth.dtype == np.float64
+    # The CPU max delta is 2.50e-6, above the RTX 4080's 1.24e-6
+    # calibration. Both fp32 runs are 1.36e-7 RMS from the fp64 oracle.
+    assert_as_exact_as_the_reference(actual, reference, truth, 'published Gemma4 text')
+    image = result['observations'][1]
+    assert image['max_abs_error'] < image['bound'], image

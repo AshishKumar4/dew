@@ -982,6 +982,30 @@ On sm80 and sm89, the trainer compiles without XLA's Triton GEMM fusions unless 
 
 On every GPU the trainer also compiles its step without XLA's dot merger (`--xla_gpu_dot_merger_threshold_mb=0` in the step's own compiler options, `step_compiler_options`), unless the run sets that flag. The merger runs dots that share an input (q, k and v; gate and up) as one GEMM over their weights concatenated afresh every step, 4.0 ms of Qwen3-0.6B's step at 1 x 1024. On the RTX 4080 (benchmark_step, two rounds, one session) Qwen3-0.6B's widths at 1 x 1024 run 97.7-98.0 against 94.1-94.2 ms without it, the 3-layer decoder 50.8-50.9 against 49.1-49.2, SimpleDiT-B 73.1-73.2 against 72.8, and the 176M hybrid DiT 66.7-67.6 against 66.4-66.7, peaks unchanged. Over 2000 steps of wikitext-103, two seeds each, validation loss at the same seed moved by at most 1.5e-3 (a 3-layer decoder from scratch, seeds 1.2e-2 apart on average) and 2.2e-3 (Qwen3-0.6B fine-tuned, seeds 3.0e-3 apart). Serving keeps the merger: decoding Qwen3-0.6B at 32 slots ran 4.6-14.8% slower without it, its 32-token GEMMs losing more to separate launches than the concatenations cost.
 
+Small training steps, 2026-10-02 (RTX 4080, bf16, `Trainer.compile` with and without the option in one process, five alternating blocks of 20 steps, medians). A full step, every weight training, is faster apart from 32 tokens up, and a LoRA step (rank 16 on Qwen3-0.6B's seven projections, the base frozen) of 128 tokens or fewer is slower apart by up to 0.6 ms, 1 x 128 excepted (two sessions). The token count alone does not decide it, so the step keeps one rule, apart; the frozen-weight case, as in decoding, would gain from weights packed once rather than a merger that concatenates them every step.
+
+| model | tokens | merged ms | apart ms | change |
+|---|---|---|---|---|
+| Qwen3-0.6B widths, full | 1 x 32 | 46.83 | 44.93 | -4.1% |
+| Qwen3-0.6B widths, full | 1 x 64 | 47.81 | 45.89 | -4.0% |
+| Qwen3-0.6B widths, full | 1 x 128 | 49.86 | 47.98 | -3.8% |
+| Qwen3-0.6B widths, full | 1 x 512 | 67.33 | 64.78 | -3.8% |
+| 3-layer decoder, full | 1 x 32 | 5.01 | 4.89 | -2.4% |
+| 3-layer decoder, full | 1 x 64 | 5.12 | 5.01 | -2.1% |
+| 3-layer decoder, full | 1 x 128 | 5.37 | 5.27 | -1.9% |
+| 3-layer decoder, full | 4 x 256 | 10.06 | 10.06 | +0.0% |
+| Qwen3-0.6B, LoRA | 1 x 32 | 15.92 | 16.48 | +3.5% |
+| Qwen3-0.6B, LoRA | 2 x 32 | 16.50 | 17.09 | +3.6% |
+| Qwen3-0.6B, LoRA | 1 x 48 | 16.34 | 16.82 | +2.9% |
+| Qwen3-0.6B, LoRA | 1 x 64 | 16.61 | 17.15 | +3.3% |
+| Qwen3-0.6B, LoRA | 2 x 64 | 18.59 | 18.89 | +1.6% |
+| Qwen3-0.6B, LoRA | 4 x 32 | 18.64 | 18.99 | +1.9% |
+| Qwen3-0.6B, LoRA | 1 x 128 | 20.79 | 19.18 | -7.7% |
+| Qwen3-0.6B, LoRA | 8 x 32 | 24.02 | 22.97 | -4.4% |
+| Qwen3-0.6B, LoRA | 1 x 256 | 24.56 | 23.41 | -4.7% |
+| Qwen3-0.6B, LoRA | 1 x 512 | 36.30 | 34.99 | -3.6% |
+| Qwen3-0.6B, LoRA | 1 x 1024 | 60.61 | 59.19 | -2.3% |
+
 ### Generations below sm80
 
 A T4 (sm75) rejects the `BF16_BF16_F32` dot algorithm at run time ("UNIMPLEMENTED: Unsupported algorithm on the current device(s): ALG_DOT_BF16_BF16_F32"), cuDNN's fused attention refuses bf16 there ("SDPA FP16/BF16 requires SM80"), and Triton does not compile for it. `dew.nn.kernels.generation.bf16_dot_runs` is the one test: below sm80 bf16 attention takes the reference path for `auto` and `xla`, the bf16 operand precision keeps the caller's precision, and the grouped matmul runs XLA.
