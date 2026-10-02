@@ -1,8 +1,8 @@
 """The convolutional UNet, and the body it shares with the video UNet."""
 
 import dataclasses
+from collections.abc import Callable, Sequence
 from functools import partial
-from typing import Callable, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -14,7 +14,6 @@ from dew.registry import models
 from ..attention import RMSNorm, Stage, stage_attention
 from ..blocks import Downsample, FourierEmbedding, ResidualBlock, TimeProjection, Upsample
 from ..conv import Conv
-from ..sharding import logical_axes
 
 
 def unet_body(model: "Unet", x, temb, text, temporal=None):
@@ -98,7 +97,6 @@ def unet_body(model: "Unet", x, temb, text, temporal=None):
 
 
 @models("unet")
-@logical_axes({}, heuristic=(("Conv_*",),))
 class Unet(nn.Module):
     """A convolutional UNet with residual blocks and cross-attention stages.
 

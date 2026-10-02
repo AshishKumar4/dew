@@ -53,7 +53,7 @@ A `Process` is a frozen dataclass of four parts:
 | Weighting | How the loss weighs each time: the schedule's own weight, a P2-style weight, or Min-SNR |
 | Sampling schedule | The time grid inference walks, when it differs from training |
 
-Three methods serve sampling. `process.noise(key, shape)` draws the starting noise at the highest level. `process.times(steps)` is the descending grid a sampler walks. `process.denoiser(model, params, conditions)` wraps a model and its weights into the function a solver calls, which maps a noisy sample and its time to the model's estimates of the clean sample and of the noise.
+Four methods serve sampling. `process.noise(key, shape)` draws the starting noise at the highest level. `process.times(steps)` is the descending grid a solver walks, and `process.rates(t, like=x)` is that grid's `(alpha, sigma)` at `t`, shaped to broadcast against `x`. `process.denoiser(model, params, conditions)` wraps a model and its weights into the function a solver calls, which maps a noisy sample and its time to the model's estimates of the clean sample and of the noise.
 
 ## Presets
 
@@ -70,7 +70,7 @@ A preset is a frozen dataclass of the numbers that define a published convention
 | `Sqrt` | Diffusion-LM (Li et al., 2022): the square-root schedule with the plain $x_0$ loss |
 | `MDLM` | Masked diffusion over tokens (Sahoo et al., 2024) on the log-linear schedule, from `dew.diffusion.discrete`; it takes the vocabulary's `mask_id` |
 
-The presets are in `dew.diffusion.presets` and in the `dew.presets` registry. Training and inference can use different schedules: EDM trains on log-normal noise levels and samples on the Karras grid. `MinSNR(gamma)` in `dew.diffusion` replaces a process's weighting with min-SNR-$\gamma$ (Hang et al., 2023).
+The presets are classes in `dew.diffusion.presets`. Training and inference can use different schedules: EDM trains on log-normal noise levels and samples on the Karras grid. `MinSNR(gamma)` in `dew.diffusion` replaces a process's weighting with min-SNR-$\gamma$ (Hang et al., 2023).
 
 EDM2 (Karras et al., 2024) trains under the `EDM` preset with its latent regime. Its network is the `edm2_unet` backbone, built from the magnitude-preserving layers in `dew.nn.mp`; it matches NVlabs' `UNet` (`tools/edm2_reference.py`), with a text condition in place of the class label. `--optim.forced-weight-normalization` renormalizes those layers' weights after every update, as the paper's forced weight normalization does, and `uncertainty=128` on the run config learns the paper's loss weighting, a head u(sigma) trained beside the model with the loss w / e^u ||D - y||^2 + u, which a published task drops.
 

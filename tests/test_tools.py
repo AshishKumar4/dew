@@ -14,8 +14,10 @@ import ast
 import dataclasses
 import importlib.util
 import json
+import subprocess
 import sys
 from pathlib import Path
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -77,8 +79,13 @@ def assert_fixture_arrays(written: Path, committed: Path, numerical: dict[str, f
                 np.testing.assert_array_equal(actual, expected, err_msg=name)
 
 
+def assert_fixture_files(written: Path, committed: Path) -> None:
+    assert {p.name for p in written.iterdir() if p.is_file()} == {
+        p.name for p in committed.iterdir() if p.is_file()}
+
+
 def assert_fixture_json(written: Path, committed: Path) -> None:
-    assert {p.name for p in written.iterdir()} == {p.name for p in committed.iterdir()}
+    assert_fixture_files(written, committed)
     for path in committed.glob("*.json"):
         assert json.loads((written / path.name).read_text()) == json.loads(path.read_text()), path.name
 
@@ -177,35 +184,51 @@ def test_vae_tiny_fixture_is_what_the_generator_writes(tmp_path):
 # tools/flaxdiff_reference.py
 # ---------------------------------------------------------------------------
 
-# The modules FlaxDiff's SimpleUDiT and FourierEmbedding import, at the pin.
-FLAXDIFF_SOURCES = ("flaxdiff/__init__.py", "flaxdiff/models/__init__.py",
-                    "flaxdiff/models/attention.py", "flaxdiff/models/common.py",
-                    "flaxdiff/models/hilbert.py", "flaxdiff/models/simple_dit.py",
-                    "flaxdiff/models/simple_unet.py", "flaxdiff/models/simple_vit.py",
-                    "flaxdiff/models/vit_common.py")
+# The modules both pinned models import, including models/__init__.py's UNet.
+FLAXDIFF_COMMON_SOURCES = ("flaxdiff/__init__.py", "flaxdiff/models/__init__.py",
+                          "flaxdiff/models/attention.py", "flaxdiff/models/common.py",
+                          "flaxdiff/models/hilbert.py", "flaxdiff/models/simple_dit.py",
+                          "flaxdiff/models/simple_unet.py", "flaxdiff/models/vit_common.py")
+FLAXDIFF_SOURCES = {
+    "simple_udit": (*FLAXDIFF_COMMON_SOURCES, "flaxdiff/models/simple_vit.py"),
+    "hybrid_dit": (*FLAXDIFF_COMMON_SOURCES, "flaxdiff/models/ssm_dit.py"),
+}
 
 
 @pytest.mark.network
-def test_flaxdiff_fixture_is_what_the_generator_writes(tmp_path):
+@pytest.mark.parametrize("architecture, committed", [
+    ("simple_udit", FIXTURES / "flaxdiff"),
+    ("hybrid_dit", FIXTURES / "flaxdiff" / "hybrid_dit"),
+], ids=["simple_udit", "hybrid_dit"])
+def test_flaxdiff_fixture_is_what_the_generator_writes(tmp_path, architecture, committed):
     """FlaxDiff's own code at the pinned commit writes the committed fixture:
     exact config, weights and inputs, and the output at test_flaxdiff.py's bound."""
     pytest.importorskip("matplotlib")  # FlaxDiff's hilbert module imports it
     import urllib.request
 
     tool = load("flaxdiff_reference")
+    commit = {"simple_udit": tool.COMMIT, "hybrid_dit": tool.HYBRID_COMMIT}[architecture]
     source = tmp_path / "flaxdiff-src"
-    for name in FLAXDIFF_SOURCES:
+    for name in FLAXDIFF_SOURCES[architecture]:
         target = source / name
         target.parent.mkdir(parents=True, exist_ok=True)
-        url = f"https://raw.githubusercontent.com/AshishKumar4/FlaxDiff/{tool.COMMIT}/{name}"
+        url = f"https://raw.githubusercontent.com/AshishKumar4/FlaxDiff/{commit}/{name}"
         with urllib.request.urlopen(url, timeout=60) as response:
             target.write_bytes(response.read())
-    tool.main(["--flaxdiff-path", str(source), "--out", str(tmp_path / "out")])
+    written = tmp_path / "out"
+    # A fresh interpreter keeps one pin's imported modules out of the other pin.
+    subprocess.run([sys.executable, str(REPO_ROOT / "tools" / "flaxdiff_reference.py"),
+                    "--flaxdiff-path", str(source), "--architecture", architecture,
+                    "--out", str(written)], check=True)
 
-    committed = FIXTURES / "flaxdiff"
-    assert_fixture_json(tmp_path / "out", committed)
-    assert_fixture_arrays(tmp_path / "out" / "reference.npz", committed / "reference.npz",
-                          {"output": 1e-6})
+    assert_fixture_files(written, committed)
+    actual = json.loads((written / "config.json").read_text())
+    expected = json.loads((committed / "config.json").read_text())
+    # jax_version records the generating environment, not the fixture's recipe.
+    assert actual.pop("jax_version") == jax.__version__
+    expected.pop("jax_version", None)
+    assert actual == expected
+    assert_fixture_arrays(written / "reference.npz", committed / "reference.npz", {"output": 1e-6})
 
 
 # ---------------------------------------------------------------------------
@@ -213,14 +236,14 @@ def test_flaxdiff_fixture_is_what_the_generator_writes(tmp_path):
 # ---------------------------------------------------------------------------
 
 def token_directory(tmp_path: Path) -> Path:
-    """A byte-tokenized corpus, written by the tool the curve reads from."""
+    """A byte-tokenized corpus, in the directory the curve reads from."""
+    from dew.data import TokenCorpus
+
     corpus = tmp_path / "corpus.txt"
     corpus.write_text("".join(f"line {i}: the quick brown fox jumps over the lazy dog\n"
                               for i in range(60)))
-    tokenize = load("tokenize_text")
     out = tmp_path / "tokens"
-    tokenize.main(tokenize.TokenizeArgs(input=str(corpus), out=str(out),
-                                        tokenizer="byte", val_fraction=0.1))
+    TokenCorpus.write(corpus, out, tokenizer="byte", val_fraction=0.1)
     return out
 
 
@@ -259,8 +282,8 @@ def test_lm_step_parity_records_a_repeatable_fixed_batch_run():
     batch the loss also has to fall, which a loop feeding fresh random
     tokens each step would not show."""
     tool = load("lm_step_parity")
-    config = dict(vocab_size=64, emb_features=16, num_layers=1, num_heads=2,
-                  mlp_features=32, max_seq_len=8)
+    config = {"vocab_size": 64, "emb_features": 16, "num_layers": 1, "num_heads": 2,
+              "mlp_features": 32, "max_seq_len": 8}
 
     first = tool.run(config, batch=8, seq=8, steps=4)
     second = tool.run(config, batch=8, seq=8, steps=4)
@@ -275,6 +298,31 @@ def test_lm_step_parity_records_a_repeatable_fixed_batch_run():
 # ---------------------------------------------------------------------------
 # tools/benchmark_lm_head.py
 # ---------------------------------------------------------------------------
+
+def test_lm_serving_benchmark_draws_the_full_budget_without_stopping(monkeypatch, tmp_path):
+    import argparse
+
+    from test_serving import task
+
+    import dew
+    from dew.sampling import Sampling
+
+    tool = load("benchmark_lm_serving")
+    bound = task(Sampling(temperature=0, eos_id=None))
+    prompts = np.asarray([[1, 2], [3, 4]], np.int32)
+    monkeypatch.setattr(dew, "pipeline", lambda *args, **kwargs: bound)
+    monkeypatch.setattr(tool, "prompts_for", lambda *args, **kwargs: prompts)
+    args = argparse.Namespace(model="tiny", vocab_limit=13, prompt=2, output=4, slots=[2],
+                              requests=2, repeats=1, admission=2, decode_steps=1, kv="dense",
+                              profile=False, profile_steps=20, generations=True, out=tmp_path / "serve.json")
+    _, points = tool.dew_points(args)
+    assert points[0]["repeats"][0]["output_tokens"] == 8
+    saved = np.load(tmp_path / "serve-slots2.npz")
+    expected = [bound(prompt[None], 4, key=index).host() for index, prompt in enumerate(prompts)]
+    np.testing.assert_array_equal(saved["tokens"], np.concatenate([row.tokens[:, -4:] for row in expected]))
+    np.testing.assert_allclose(saved["raw"], np.concatenate([row.raw_log_probs for row in expected]),
+                               atol=2e-6, rtol=2e-6)
+
 
 def test_lm_head_variant_names_parse_as_documented():
     """A name is the head, an optional chunk count and optional suffixes:
@@ -312,7 +360,7 @@ def test_lm_head_variants_compute_the_same_loss_accuracy_and_gradients():
     for name in ("baseline", "stored", "remat"):
         head = tool.HEADS[name]
         (loss, accuracy), (d_states, d_table) = jax.value_and_grad(
-            lambda s, t: head(s, t, targets, variant), argnums=(0, 1), has_aux=True)(states, table)
+            lambda s, t, head=head: head(s, t, targets, variant), argnums=(0, 1), has_aux=True)(states, table)
         outputs[name] = (float(loss), float(accuracy), np.asarray(d_states), np.asarray(d_table))
 
     reference = outputs["baseline"]
@@ -371,7 +419,7 @@ def test_layout_parity_anchors_an_objective_that_draws_per_row_on_its_own_draws(
 
     case = dataclasses.replace(tool.zoo()[model], dtype="float32")
     # As the tool runs: the reference and the anchor both under x64.
-    with jax.enable_x64(True):
+    with jax.enable_x64(new_val=True):
         batch = benchmark_step.global_batch(case)
         reference = tool.computed_reference(case, batch, 1)
         loss, gradient = tool.anchor_step(case, batch)
@@ -380,6 +428,42 @@ def test_layout_parity_anchors_an_objective_that_draws_per_row_on_its_own_draws(
     errors = tool.leaf_errors(gradient, reference.gradient, "float32")
     assert max(errors.values()) <= tool.rounding_limit("float32"), max(
         errors.items(), key=lambda item: item[1])
+
+
+def test_layout_parity_reaches_every_leaf_of_a_model_that_initializes_its_output_to_zeros():
+    """A DiT zero-initializes its output projection and its modulations, so
+    its first step's gradient reached 2 of the zoo DiT's 70 leaves, and every
+    DiT, UNet and MMDiT layout was judged on its output layer alone. The
+    tool draws every all-zero leaf, so each one carries a gradient."""
+    tool = load("layout_parity")
+    import benchmark_step
+
+    case = dataclasses.replace(tool.zoo()["dit"], dtype="float32")
+    _, gradient, _ = tool.trained(case, {}, benchmark_step.global_batch(case), steps=1, one_device=True)
+
+    silent = [leaf for leaf, values in gradient.items() if not np.any(values)]
+    assert not silent, f"{len(silent)} of {len(gradient)} leaves get no gradient: {silent[:4]}"
+
+
+def test_layout_parity_bounds_a_split_losss_sum_by_its_contraction():
+    """A sequence or tensor axis over the output splits the loss's own sum
+    over a row's elements, which reordering the rows never moves: the MMDiT's
+    loss of 1.2114 landed 5 fp32 ulps (5.96e-7) from one device's on tensor4,
+    past the 5.78e-7 its reorderings allowed, every gradient leaf within 0.09
+    of its bound. The loss is also held to twice gamma_N of its magnitude,
+    the most two orders of a sum of N terms may differ."""
+    tool = load("layout_parity")
+    u = float(np.finfo(np.float32).eps) / 2
+
+    assert tool.contraction_floor(4, 1.0) == pytest.approx(2 * 4 * u / (1 - 4 * u))
+    assert tool.contracted_terms({"image": np.zeros((8, 32, 32, 4)), "label": np.zeros(8)}) == 32768
+    judged = tool.judged({"['w']": 1e-7}, {"['w']": 1e-6}, 5.96e-7, 1.4e-7, 1.2114, terms=32768)
+    assert judged["status"] == "works"
+    assert judged["loss_bound"] == pytest.approx(tool.contraction_floor(32768, 1.2114))
+    assert (
+        tool.judged({"['w']": 1e-7}, {"['w']": 1e-6}, 1e-2, 1.4e-7, 1.2114, terms=32768)["status"]
+        == "MISMATCH"
+    )
 
 
 def test_layout_parity_passes_a_layout_refused_by_design_and_fails_an_error(monkeypatch):
@@ -587,7 +671,7 @@ def test_step_benchmark_small_preset_exempts_only_the_jepa_predictor():
     through the registry inside their objective, so their rows are its rows.
     An architecture named as covered without a case measuring it would leave
     the difference here nonempty."""
-    from dew import models
+    from dew.registry import models
 
     tool = load("benchmark_step")
     cases = tool.small_cases("bfloat16")
@@ -792,7 +876,7 @@ def test_the_quantized_serving_benchmark_counts_nonfinite_values_before_it_clips
     class Pipe:
         """The part of TextToImage that sampling reads: latents, and an
         autoencoder that passes them through with one pixel infinite."""
-        params = {"autoencoder": {}}
+        params: ClassVar = {"autoencoder": {}}
         autoencoder = SimpleNamespace(decode=lambda params, z: z.at[0, 0, 0, 0].set(jnp.inf))
 
         def __call__(self, prompts, **controls):
@@ -800,7 +884,7 @@ def test_the_quantized_serving_benchmark_counts_nonfinite_values_before_it_clips
 
     # NumPy warns as it casts the NaN to a pixel; nothing else would.
     with pytest.warns(RuntimeWarning, match="invalid value encountered in cast"):
-        pixels, counts = bench.sample(Pipe(), seed=0, decode_batch=4)
+        pixels, counts = bench.sample(Pipe(), key=0, decode_batch=4)
     assert counts == {"latents": 1, "pixels": 2}
     assert pixels.dtype == np.uint8 and pixels.shape == latents.shape
 

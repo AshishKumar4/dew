@@ -1,20 +1,13 @@
 """The decoder block and what it is built from: the gated MLP, the mixture
 of experts, the block's wiring and remat policies, and the multi-token
-prediction depth.
-
-`CausalTransformer` (`dew.nn.backbones.causal_transformer`) stacks these.
-A block holds its token mixer in a slot: any module with the
-(x, decode=..., positions=..., segment_ids=...) -> x signature of
-CausalSelfAttention becomes self_attn without the block changing. Its
-residual runs in one of four forms (the plain stream, Gemma 3n's AltUp
-copies, mHC's streams, Kimi K3's depth state) through one forward
-(`DecoderBlock._forward`).
+prediction depth. `CausalTransformer` stacks these.
 """
 
 import dataclasses
 import functools
 import math
-from typing import Callable, Literal, Mapping, NamedTuple, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from typing import Literal, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -35,78 +28,52 @@ from ..hyper_connections import (
     mix_streams,
 )
 from ..inputs import LayerInputs, PredictionPhase
+from ..mixers.attention import CausalSelfAttention
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, GatedActivation, gated_product
-from ..precision import scaled
+from ..precision import at_least_fp32, scaled
 from ..sharding import MLP_HIDDEN, RESIDUAL, constrain, logical_axes
 
 STREAMS = ("activation_batch", "activation_length", None, "activation_embed")
 """Manifold-constrained hyper-connections' `[B, S, hc_mult, D]` residual streams."""
 
 
+def decoder_norm(kind: Literal['rms', 'layer'], *, epsilon: float,
+                 bias: bool, scale_offset: bool, scale_after_cast: bool,
+                 dtype: Dtype | None) -> Callable[..., nn.Module]:
+    """The decoder's norm factory, preserving each reference's variance formula."""
+    if kind == 'layer':
+        return functools.partial(nn.LayerNorm, epsilon=epsilon, use_bias=bias,
+                                 use_fast_variance=False, dtype=dtype)
+    return functools.partial(RMSNorm, epsilon=epsilon, scale_offset=scale_offset,
+                             scale_after_cast=scale_after_cast, dtype=dtype)
+
+
 @dataclasses.dataclass(frozen=True)
 class Mixture:
     """The experts some layers route to, and how the router chooses.
 
-    `experts` is what the rest depends on, so they live together: a top_k, a
-    cadence or a balancing bias says nothing about a model with no experts.
-    `layers` names the sparse layers by index, or `every` makes every nth
-    layer sparse counting from the end of the first group, the meaning of
-    Qwen3-MoE's decoder_sparse_step; neither makes every layer sparse, which
-    is Mixtral.
+    `layers` names the sparse layers by index (a source's cadence, such as
+    Qwen3-MoE's decoder_sparse_step, translates to them); None makes every
+    layer sparse (Mixtral). The routing fields pass straight through to
+    `Router`, which documents them.
+    `parallel` is Gemma 4's placement (`enable_moe_block`): the experts run
+    beside the dense feed-forward on the same residual, each normed and summed,
+    under `Gemma4TextRouter`, which refuses the routing fields.
 
-    The routing fields pass straight through to `Router`; that class
-    documents each one.
-
-    `parallel` is Gemma 4's placement (`enable_moe_block`). The experts run
-    beside the dense feed-forward on the same residual, and the two are
-    summed after a norm each, under `Gemma4TextRouter`. That router replaces
-    the routing fields above, which are refused with it.
-
-    `expert_features` is the routed experts' width, None for the model's
-    `mlp_features`; DeepSeek sizes its experts apart from its dense layers.
-    `shared_features` is the width of the one dense gated MLP every token
-    takes beside the routed experts, 0 for none. `DeepseekV3MoE` builds its
-    `n_shared_experts` as a single MLP of that many times its expert width,
-    so the product is the whole record of them. `shared_gate` multiplies
-    that branch's output by a learned scalar sigmoid per token, as Qwen3.5
-    MoE does.
-
-    `implementation` is the grouped matmul the experts run on, one of
-    `moe.grouped_matmul`'s, the way `attention_impl` names an attention
-    kernel. It changes which kernel computes the same contraction and
-    nothing about the routing.
-
-    `dispatch='exchange'` is expert parallelism: each device trades its
-    selected tokens with the expert shards that own them, in bounded
-    all-to-all rounds, on an expert mesh axis larger than one that divides
-    the expert count. The default `'global'` sorts and gathers where the
-    tokens are. Both share the projection precision and the differentiation
-    contract.
-
-    `capacity_factor` drops slots past each sequence's per-expert capacity,
-    GShard's and MaxText's token dropping (`moe.capacity_positions`); None,
-    the default, keeps every selected slot. Both dispatches drop the same
-    slots on any placement, and the exchange then runs one round.
-
-    `hash_layers` names the sparse layers that route by DeepSeek V4's fixed
-    token table instead of the scores (`DeepseekV4HashRouter`). Their router
-    holds `tid2eid` over the vocabulary in place of the balancing bias, and
-    the block hands it the token ids.
-
-    `latent_features` is Kimi K3's latent MoE: the routed experts run at that
-    width between a down and an up projection, with the model's RMSNorm on
-    their weighted sum when `latent_norm` is set (`SparseMLP`). None runs
-    them at the model width.
-
-    `media_bias` gives every router DeepSeek-V4.1's second balancing bias,
-    which selects for an image span's tokens (`Router`); the block hands it
-    the media mask.
+    `expert_features` is the experts' width, None for `mlp_features`.
+    `shared_features` is the one dense gated MLP every token takes, 0 for none
+    (`DeepseekV3MoE`'s `n_shared_experts` times its expert width), and
+    `shared_gate` its learned per-token sigmoid (Qwen3.5 MoE). `implementation`
+    names `moe.grouped_matmul`'s kernel. `dispatch` and `capacity_factor` are
+    `moe.expert_dispatch`'s: `'exchange'` is expert parallelism over an expert
+    mesh axis that divides the expert count. `hash_layers` route by DeepSeek
+    V4's token table, `latent_features` is Kimi K3's latent MoE and
+    `media_bias` DeepSeek-V4.1's image-span bias (`SparseMLP`, `Router`).
     """
 
     experts: int
     top_k: int = 2
     layers: tuple[int, ...] | None = None
-    every: int | None = None
     score_function: str = 'softmax'
     norm_topk_prob: bool = True
     scaling: float = 1.0
@@ -140,12 +107,6 @@ class Mixture:
             raise ValueError(
                 f"a mixture needs experts to route to, got {self.experts}; a "
                 "dense model has no mixture at all")
-        if self.layers is not None and self.every is not None:
-            raise ValueError(
-                f"layers ({self.layers}) and every ({self.every}) both choose the "
-                "sparse layers, so only one of them can be set")
-        if self.every is not None and self.every < 1:
-            raise ValueError(f"every must be positive, got {self.every}")
         if self.expert_features is not None and self.expert_features < 1:
             raise ValueError(
                 f"expert_features is the routed experts' width, got "
@@ -186,22 +147,22 @@ class Mixture:
 class GatedMLP(nn.Module):
     """down_proj(act(gate_proj(x)) * up_proj(x)): swiglu is silu, geglu is
     the tanh approximation of gelu (HF's gelu_pytorch_tanh) and geglu_exact
-    the erf form (HF's gelu, which Gemma's released config names). A `Situ`
-    in place of the name is Kimi K3's SiTU, which transforms both halves
-    (`dew.nn.moe.gated_product`).
+    the erf form (HF's gelu); a `Situ` is Kimi K3's SiTU, which transforms both
+    halves (`dew.nn.moe.gated_product`). `gelu`, `gelu_exact` and `relu` build
+    the ungated two-projection MLP; ungated `gelu_exact` follows Torch's
+    `1 + erf` arithmetic, which converted checkpoints trained with, where
+    `jax.nn.gelu(approximate=False)` goes through erfc and rounds the negative
+    tail differently.
 
-    Bias-free, like the gated MLP of every open decoder this loads.
-
-    activation_sparsity is Gemma 3n's gaussian top-k on the gate before its
-    nonlinearity (`dew.nn.gemma3n.gaussian_topk`); 0 leaves the gate alone.
-    swiglu_limit is the clamp GLM-5.3-Flash and DeepSeek V4 apply before the
-    activation (`Glm5NextTextMLP.forward`, modeling_glm5_next.py:98-104): the
-    gate capped at the limit from above and the up projection on both sides.
-    None is the plain gated MLP.
+    activation_sparsity is Gemma 3n's gaussian top-k on the gate
+    (`dew.nn.gemma3n.gaussian_topk`). swiglu_limit is GLM-5.3-Flash's and
+    DeepSeek V4's clamp before the activation (modeling_glm5_next.py:98-104):
+    the gate capped from above, the up projection on both sides.
     """
     hidden_features: int
     out_features: int
     activation: GatedActivation = 'swiglu'
+    use_bias: bool = False
     activation_sparsity: float = 0.0
     swiglu_limit: float | None = None
     init_std: float | None = None  # gate/up normal std; None: lecun normal
@@ -211,18 +172,41 @@ class GatedMLP(nn.Module):
 
     def setup(self):
         dense = functools.partial(
-            nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
+            nn.Dense, use_bias=self.use_bias, dtype=self.dtype, precision=self.precision,
             **normal_kernel(self.init_std))
-        self.gate_proj = dense(self.hidden_features, name='gate_proj')
-        self.up_proj = dense(self.hidden_features, name='up_proj')
+        if self.activation not in ('gelu', 'gelu_exact', 'relu'):
+            if self.has_variable('params', 'gate_up_proj'):
+                self.gate_up_proj = dense(2 * self.hidden_features, name='gate_up_proj')
+            else:
+                self.gate_proj = dense(self.hidden_features, name='gate_proj')
+        elif self.activation_sparsity or self.swiglu_limit is not None:
+            raise ValueError('activation_sparsity and swiglu_limit require a gated MLP')
+        if not self.has_variable('params', 'gate_up_proj'):
+            self.up_proj = dense(self.hidden_features, name='up_proj')
         self.down_proj = dense(self.out_features, name='down_proj', **normal_kernel(
             self.init_std if self.output_init_std is None else self.output_init_std))
 
     def __call__(self, x):
         # Column-parallel under a tensor axis: the hidden width splits and
         # down_proj's sum returns to the residual placement in the block.
-        gate = checkpoint_name(constrain(self.gate_proj(x), MLP_HIDDEN), 'gate_proj')
-        up = checkpoint_name(constrain(self.up_proj(x), MLP_HIDDEN), 'up_proj')
+        if self.activation in ('gelu', 'gelu_exact', 'relu'):
+            up = checkpoint_name(constrain(self.up_proj(x), MLP_HIDDEN), 'up_proj')
+            if self.activation == 'relu':
+                hidden = nn.relu(up)
+            elif self.activation == 'gelu_exact':
+                # Torch's GELU uses 1 + erf. Flax's erfc(-x) rounds its
+                # negative tail differently before this trained projection.
+                work = up.astype(at_least_fp32(up.dtype))
+                hidden = (.5 * work * (1 + jax.lax.erf(work * math.sqrt(.5)))).astype(up.dtype)
+            else:
+                hidden = nn.gelu(up)
+            return checkpoint_name(self.down_proj(hidden), 'down_proj')
+        if self.has_variable('params', 'gate_up_proj'):
+            gate, up = jnp.split(self.gate_up_proj(x), 2, axis=-1)
+        else:
+            gate, up = self.gate_proj(x), self.up_proj(x)
+        gate = checkpoint_name(constrain(gate, MLP_HIDDEN), 'gate_proj')
+        up = checkpoint_name(constrain(up, MLP_HIDDEN), 'up_proj')
         if self.swiglu_limit is not None:
             gate = jnp.minimum(gate, self.swiglu_limit)
             up = jnp.clip(up, -self.swiglu_limit, self.swiglu_limit)
@@ -235,20 +219,18 @@ class GatedMLP(nn.Module):
 class BlockWiring:
     """How a block norms its two residuals, and whether it scales its output.
 
-    `pre_norms` norms each sublayer's input and `output_norms` its output.
-    The input pair alone is the plain pre-norm block, both pairs Gemma's
-    sandwich block, and the output pair alone OLMo 3's post-norm block
-    (modeling_olmo3.py:249-266), where each sublayer reads the residual
-    stream as it is and its output is normed before it is added. The output
-    pair norms the sublayer outputs and not their inputs, so the input norms
-    keep their names and their places, and a checkpoint without the output
-    pair loads into the same tree minus two leaves per layer. `layer_scalar`
+    `pre_norms` norms each sublayer's input and `output_norms` its output: the
+    input pair alone is the plain pre-norm block, both Gemma's sandwich block,
+    the output pair alone OLMo 3's post-norm block (modeling_olmo3.py:249-266).
+    The output pair norms sublayer outputs, so the input norms keep their names
+    and a checkpoint without it loads minus two leaves per layer. `layer_scalar`
     selects the reference's frozen or trainable output scalar. One wiring serves
     every layer, so it stays off the per-layer specs the scan groups by.
     """
 
     pre_norms: bool = True
     output_norms: bool = False
+    parallel_residual: bool = False
     layer_scalar: Literal["frozen", "trainable"] | None = None
 
     def __post_init__(self):
@@ -271,18 +253,13 @@ name off the list is a typo that would otherwise recompute silently."""
 class RematPolicy:
     """What a recomputed block keeps for its backward pass, and where.
 
-    A block under remat saves its inputs and recomputes its forward when the
-    backward pass asks. `save` names the residuals (`RESIDUALS`) it keeps in
-    device memory instead, `offload` the ones it moves to pinned host memory
-    after the forward pass and fetches back for the backward; everything
-    else is recomputed. Both empty is MaxText's `full`, which recomputes the
-    whole block. `REMAT_POLICIES` holds MaxText's named recipes under this
-    decoder's names: MaxText's `query_proj`/`key_proj`/`value_proj`/
-    `out_proj` are `q_proj`/`k_proj`/`v_proj`/`o_proj` and its `mlpwi_0`/
-    `mlpwi_1`/`mlpwo` are `gate_proj`/`up_proj`/`down_proj`. Its fused
-    `qkv_proj`/`mlpwi` name projections this decoder does not fuse, and its
-    `quantization` names AQT intermediates Qwix does not produce. A config
-    gives a policy by name or as a record of the two lists.
+    A block under remat saves its inputs and recomputes its forward; `save`
+    names the residuals (`RESIDUALS`) kept in device memory and `offload` those
+    moved to pinned host memory, both empty being MaxText's `full`.
+    `REMAT_POLICIES` holds MaxText's recipes under this decoder's names
+    (`q_proj`... for its `query_proj`..., `gate_proj`/`up_proj`/`down_proj` for
+    `mlpwi_0`/`mlpwi_1`/`mlpwo`); its fused `qkv_proj`/`mlpwi` and AQT
+    `quantization` name nothing here. A config gives a name or the two lists.
     """
     save: tuple[str, ...] = ()
     offload: tuple[str, ...] = ()
@@ -391,72 +368,40 @@ _BlockState = _Plain | _Streams | _Depth
 class DecoderBlock(nn.Module):
     """Pre-norm decoder block: token mixer, then feed-forward, both residual.
 
-    `mixer` and `feedforward` are factories taking only a name. What `mixer`
-    builds lands in the tree as self_attn and has to accept (x, decode=...,
-    positions=..., segment_ids=...), the last two None outside a packed batch.
-    What `feedforward` builds lands there as mlp and takes the normalized
-    states alone, which is the one call `GatedMLP` and `moe.SparseMLP` share;
-    a `hash_routed` block hands it the token ids too, which the metadata
-    carries down the stack for DeepSeek V4's hash router. A `feedforward` of
-    None is a block of the mixer alone, norm, mixer, residual, which is
-    Mamba-2's (`Mamba2Block`, modeling_mamba2.py:608-632): no
-    post_attention_layernorm, no mlp, no output norm for either.
+    `mixer` and `feedforward` are factories taking only a name. The mixer lands
+    as self_attn and accepts (x, decode=..., positions=..., segment_ids=...);
+    the feed-forward lands as mlp and takes the normalized states (plus the
+    token ids on a `hash_routed` block). A `feedforward` of None is Mamba-2's
+    block of the mixer alone (modeling_mamba2.py:608-632). `wiring` places the
+    norms (`BlockWiring`).
 
-    `wiring` places the block's norms: the input pair alone is the plain
-    pre-norm block, both pairs Gemma's sandwich block, and the output pair
-    alone OLMo 3's post-norm block (modeling_olmo3.py:249-266), where each
-    sublayer reads the residual stream as it is and its output is normed
-    before it is added. The output pair norms the sublayer outputs and not
-    their inputs, so the input norms keep their names and their places, and
-    a checkpoint without the output pair loads into the same tree minus two
-    leaves per layer.
+    kv_store threads one dict down the stack for KV-sharing mixers.
+    per_layer_input is the layer's slice of `LayerInputs`: its per-layer
+    residual signal and, on a `routed` block, the replayed experts
+    (`dew.nn.moe.Routes`).
 
-    kv_store threads one dict down the layer stack so a KV-sharing mixer
-    reads its provider's keys and values; a mixer without a kv_store keyword
-    fails loudly when a run shares. per_layer_input is the layer's slice of
-    `LayerInputs`: its input signal for the per-layer residual, and on a
-    `routed` block the replayed experts its router uses (`dew.nn.moe.Routes`),
-    None when the model reads neither.
+    The residual takes one of four forms, all through `_forward`: the plain
+    stream; altup, Gemma 3n's `[num_inputs, B, S, D]` copies, predicted,
+    run on the active one and corrected, the per-layer residual added past the
+    first (Gemma3nTextDecoderLayer.forward); hyper_connections, mHC's
+    `[B, S, hc_mult, D]` streams with Sinkhorn-mixed residuals
+    (modeling_glm5_next.py:1293-1327), `Carried(streams, pre)` under
+    Single-Pass; and residual_site, Kimi K3's `[B, S, blocks + 1, D]` depth
+    state. laurel_rank adds LAuReL over the attention's normed input, averaged
+    with the attention residual over sqrt(2).
 
-    altup makes the block take and return Gemma 3n's stack of residual
-    copies, `[num_inputs, B, S, D]`: it predicts the copies, runs on the
-    active prediction, corrects every copy by what it computed, and adds the
-    per-layer residual to the copies past the first and not to its own
-    output (modeling_gemma3n.py, Gemma3nTextDecoderLayer.forward). laurel_rank
-    adds the LAuReL block over the attention's normed input, averaged with
-    the attention residual over sqrt(2).
-
-    hyper_connections makes the block take and return the mHC stack of
-    residual streams, `[B, S, hc_mult, D]`: each sublayer reads the collapse
-    its site's mapping chooses and writes back into every stream over the
-    Sinkhorn-mixed residual (`dew.nn.hyper_connections`), the plain pre-norm
-    block otherwise (modeling_glm5_next.py:1293-1327). Under the Single-Pass
-    schedule the block takes and returns `Carried(streams, pre)`, each
-    sublayer collapsing by the `pre` the site before it computed.
-
-    residual_site makes the block take and return Kimi K3's depth state,
-    `[B, S, blocks + 1, D]`: the finished blocks and the partial sum
-    (`dew.nn.attention_residuals`). Each sublayer reads the softmax mixture
-    of the finished blocks and the partial its site holds, as a plain
-    pre-norm block reads the residual, and adds its output to the partial.
-
-    Every form runs one forward (`_forward`): `_enter` turns the residual
-    the block receives into its state, each sublayer `_read`s its input
-    from that state and `_write`s its output back, and `_leave` hands the
-    next block its residual. The model's `_expand` and `_collapse` turn the
-    embeddings into the first block's residual and the last block's back.
-
-    engram writes the layer's n-gram lookup into the streams before anything
-    else reads them (V4.1 inference/model.py:1261-1263); `engram_index` is
-    which of the metadata's `engram_ids` it reads. A DSpark target layer
-    (`prediction_slot`) sows the mean of the streams its attention reads as
-    `prediction_inputs/draft_context` (:1264-1266).
+    engram writes the layer's n-gram lookup into the streams first (V4.1
+    inference/model.py:1261-1263), reading the metadata's `engram_ids` at
+    `engram_index`. A DSpark target layer (`prediction_slot`) sows the mean of
+    the streams its attention reads as `prediction_inputs/draft_context`.
     """
     mixer: Callable[..., nn.Module]
     feedforward: Callable[..., nn.Module] | None
     emb_features: int
     wiring: BlockWiring
     norm_eps: float = 1e-5
+    norm_type: Literal['rms', 'layer'] = 'rms'
+    norm_bias: bool = False
     scale_offset: bool = False
     scale_after_cast: bool = False
     per_layer_input_dim: int = 0
@@ -483,9 +428,16 @@ class DecoderBlock(nn.Module):
     precision: PrecisionLike = None
 
     def setup(self):
-        norm = functools.partial(
-            RMSNorm, epsilon=self.norm_eps, scale_offset=self.scale_offset,
-            scale_after_cast=self.scale_after_cast, dtype=self.dtype)
+        norm = decoder_norm(
+            self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
+            scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
+            dtype=self.dtype)
+        if self.wiring.parallel_residual and (
+                not self.wiring.pre_norms or self.wiring.output_norms
+                or self.feedforward is None or self.hyper_connections is not None
+                or self.altup is not None or self.residual_site is not None
+                or self.laurel_rank is not None or self.parallel is not None):
+            raise ValueError('parallel_residual requires a plain pre-norm attention and feed-forward block')
         if self.wiring.pre_norms:
             self.input_layernorm = norm(name='input_layernorm')
         self.self_attn = self.mixer(name='self_attn')
@@ -597,28 +549,42 @@ class DecoderBlock(nn.Module):
             kv_store.update(store)
         return out
 
-    def _forward(self, x, train: bool, decode: bool, positions, segment_ids,
-                 kv_store, per_layer_input, attention_metadata, prediction_phase: PredictionPhase = "ordinary"):
+    def _forward(
+        self,
+        x,
+        train: bool,
+        decode: bool,
+        positions,
+        segment_ids,
+        kv_store,
+        per_layer_input,
+        attention_metadata,
+        prediction_phase: PredictionPhase = "ordinary",
+    ):
         """The block's one forward over whichever residual form it runs.
 
-        The form (`_enter`, `_read`, `_write`, `_leave`) decides what the
-        residual is and how each sublayer reads it and writes back into it:
-        the plain `[B, S, D]` stream, Gemma 3n's AltUp copies, mHC's streams
-        with or without the Single-Pass schedule, or Kimi K3's depth state.
-        The sublayers themselves, their norms and their branches run the same
-        for every form.
+        `_enter` turns the received residual into the form's state, each sublayer
+        `_read`s its input and `_write`s its output back, and `_leave` hands the
+        next block its residual; the sublayers, norms and branches are the same for
+        every form.
         """
         state = self._enter(x, train, attention_metadata)
         state, read, site = self._read(state, "attention")
         normed = self.input_layernorm(read) if self.wiring.pre_norms else read
-        mixed = self._mix(normed, decode, positions, segment_ids, kv_store, attention_metadata, prediction_phase)
+        mixed = self._mix(
+            normed, decode, positions, segment_ids, kv_store, attention_metadata, prediction_phase, train
+        )
         if self.wiring.output_norms:
             mixed = self.attention_output_norm(mixed)
-        state = self._write(state, "attention", self._branch(mixed, train), site)
+        attention_branch = self._branch(mixed, train)
+        if not self.wiring.parallel_residual:
+            state = self._write(state, "attention", attention_branch, site)
         if self.laurel_rank is not None:
             # Only the plain form admits LAuReL (setup refuses the rest).
             assert isinstance(state, _Plain)
-            state = state._replace(x=(state.x + self.laurel(normed)) * jnp.asarray(1 / math.sqrt(2), state.x.dtype))
+            state = state._replace(
+                x=(state.x + self.laurel(normed)) * jnp.asarray(1 / math.sqrt(2), state.x.dtype)
+            )
         if self.feedforward is not None:
             routes = self._routes(per_layer_input)
             state, read, site = self._read(state, "mlp")
@@ -629,7 +595,12 @@ class DecoderBlock(nn.Module):
                 hidden = self.moe(read, hidden, **routes)
             if self.wiring.output_norms:
                 hidden = self.mlp_output_norm(hidden)
-            state = self._write(state, "mlp", self._branch(hidden, train), site)
+            mlp_branch = self._branch(hidden, train)
+            if self.wiring.parallel_residual:
+                # GPT-NeoX adds the two branches first, then the residual;
+                # both norms read the block's original stream.
+                mlp_branch = mlp_branch + attention_branch
+            state = self._write(state, "mlp", mlp_branch, site)
         return self._leave(state, train, per_layer_input)
 
     def _branch(self, output, train: bool):
@@ -748,14 +719,24 @@ class DecoderBlock(nn.Module):
         return x
 
     def _mix(self, x, decode: bool, positions, segment_ids, kv_store, attention_metadata,
-             prediction_phase: PredictionPhase):
+             prediction_phase: PredictionPhase, train: bool):
         """The token mixer over `x`. The store, the metadata and a prediction
         phase other than ordinary reach it only when the call carries them,
         since a mixer with no use for one does not take it."""
-        return self.self_attn(x, decode=decode, positions=positions, segment_ids=segment_ids,
-                              **({} if kv_store is None else {"kv_store": kv_store}),
-                              **({} if attention_metadata is None else {"attention_metadata": attention_metadata}),
-                              **({} if prediction_phase == "ordinary" else {"prediction_phase": prediction_phase}))
+        return self.self_attn(
+            x,
+            decode=decode,
+            positions=positions,
+            segment_ids=segment_ids,
+            **(
+                {"train": train}
+                if isinstance(self.self_attn, CausalSelfAttention) and self.self_attn.attention_dropout_rate
+                else {}
+            ),
+            **({} if kv_store is None else {"kv_store": kv_store}),
+            **({} if attention_metadata is None else {"attention_metadata": attention_metadata}),
+            **({} if prediction_phase == "ordinary" else {"prediction_phase": prediction_phase}),
+        )
 
     def _feedforward_inputs(self, attention_metadata) -> dict:
         """The token ids for a hash-routed feed-forward, the media mask, when
@@ -798,13 +779,11 @@ class DecoderBlock(nn.Module):
 class MTPBlock(nn.Module):
     """One multi-token-prediction depth: the next depth's hidden states.
 
-    The depth norms the token embeddings with `enorm` and the previous
-    hidden states with `hnorm`, projects the pair concatenated in that
-    order back to the model width, and runs one decoder block over it. That
-    composition is what the released MTP weights were trained for, which
-    the engines state (vLLM deepseek_mtp.py, glm4_moe_mtp.py and
-    qwen3_5_mtp.py). Training shifts complete sequences through this block;
-    prediction steps may use an independently allocated KV cache.
+    `enorm` norms the token embeddings and `hnorm` the previous hidden states;
+    the pair, concatenated in that order, projects back to the model width and
+    runs one decoder block, the composition the released MTP weights trained
+    for (vLLM deepseek_mtp.py, glm4_moe_mtp.py, qwen3_5_mtp.py). Prediction
+    steps may use an independently allocated KV cache.
     """
     mixer: Callable[..., nn.Module]
     feedforward: Callable[..., nn.Module] | None
@@ -877,3 +856,6 @@ class MTPBlock(nn.Module):
             predicted = self.hc_head(predicted)
         normalized = self.final_norm(predicted)
         return normalized, normalized if self.hyper_connections is None else streams
+
+
+__all__ = ["BlockWiring", "DecoderBlock", "GatedMLP", "MTPBlock", "Mixture", "RematPolicy", "remat_policy"]

@@ -6,13 +6,17 @@ kernel as the gather reads it; and a pool nobody hands out refuses to alias
 rows.
 """
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
 
-from dew.nn.kv_cache import KVCache, KVStore, hadamard, quantize, rotated
+from dew.nn.attention import cudnn_attention, cudnn_runs, scaled_dot_product_attention
+from dew.nn.kernels import bf16_dot_runs
+from dew.nn.kv_cache import KVCache, KVStore, _gather_pages, _gpu_paged, hadamard, quantize, rotated
 
 
 class Holder(nn.Module):
@@ -100,16 +104,17 @@ def test_an_int8_cache_refuses_a_head_width_no_hadamard_matrix_fits():
 
 
 @pytest.mark.parametrize("backend", ["tpu", "gpu"])
-def test_only_a_bfloat16_pool_on_a_tpu_takes_the_paged_kernel(monkeypatch, backend):
+def test_only_supported_bfloat16_pools_take_the_paged_kernel(monkeypatch, backend):
     """The TPU kernel casts every page to bfloat16 and broadcasts int8
     scales to the pool's width, so a float32 or quantized pool takes the
-    gather there; a GPU always takes the gather."""
+    gather there; a GPU additionally needs cuDNN's dtype/device support."""
     monkeypatch.setattr(jax, "default_backend", lambda: backend)
 
     def kernel(layout, dtype):
         return KVStore(nn.Module(), layout, 2, 32, 2, 64, jnp.dtype(dtype)).kernel()
 
-    assert kernel(KVCache(page_size=16), jnp.bfloat16) == (backend == "tpu")
+    query = jax.ShapeDtypeStruct((2, 1, 2, 64), jnp.bfloat16)
+    assert kernel(KVCache(page_size=16), jnp.bfloat16) == (backend == "tpu" or cudnn_runs(query))
     assert not kernel(KVCache(page_size=16), jnp.float32)
     assert not kernel(KVCache(quantized="int8", page_size=16), jnp.bfloat16)
     assert not kernel(KVCache(), jnp.bfloat16)
@@ -126,6 +131,53 @@ class Decoder(nn.Module):
         store = KVStore.open(self, self.layout, rows, tokens, heads, width, jnp.bfloat16)
         store.write(key, value, jnp.broadcast_to(jnp.arange(tokens), (rows, tokens)))
         return store.decode(query, lengths, None), store.read()
+
+
+@pytest.mark.skipif(jax.default_backend() != "gpu" or not bf16_dot_runs(),
+                    reason="native cuDNN paged BF16 forward needs CUDA sm80+")
+def test_native_gpu_paged_value_and_vjp_keep_the_gathered_attention(without_deterministic_ops):
+    """Reordered/shared pages, distinct key counts, gradients and float64 truth."""
+    q = jax.random.normal(jax.random.key(3), (2, 4, 64), jnp.bfloat16)
+    k = jax.random.normal(jax.random.key(4), (2, 4, 16, 64), jnp.bfloat16)
+    v = jax.random.normal(jax.random.key(5), k.shape, jnp.bfloat16)
+    table = jnp.asarray([[2, 0], [0, 3]], jnp.int32)
+    lengths = jnp.asarray([21, 32], jnp.int32)
+
+    def old(q, k, v):
+        return cudnn_attention(q[:, None], _gather_pages(k, table, 1), _gather_pages(v, table, 1),
+                                bias=None, mask=None, causal=False, sliding_window=None,
+                                key_value_seq_lengths=lengths)[:, 0]
+
+    def loss(function, q, k, v):
+        out = function(q, k, v)
+        return jnp.sum(out.astype(jnp.float32) ** 2), out
+
+    def native(q, k, v):
+        return _gpu_paged(q, k, v, table, lengths)
+    (_, out), gradients = jax.jit(jax.value_and_grad(lambda q, k, v: loss(native, q, k, v),
+                                                     argnums=(0, 1, 2), has_aux=True))(q, k, v)
+    (_, prior), previous = jax.jit(jax.value_and_grad(lambda q, k, v: loss(old, q, k, v),
+                                                     argnums=(0, 1, 2), has_aux=True))(q, k, v)
+    for actual, expected in zip((out, *gradients), (prior, *previous), strict=True):
+        np.testing.assert_array_equal(actual, expected)
+
+    with jax.enable_x64():
+        def reference(q, k, v):
+            return scaled_dot_product_attention(
+                q[:, None], _gather_pages(k, table, 1), _gather_pages(v, table, 1),
+                implementation="reference", key_value_seq_lengths=lengths,
+                precision=jax.lax.Precision.HIGHEST, force_fp32_for_softmax=False)[:, 0]
+
+        def reference_loss(q, k, v):
+            value = reference(q, k, v)
+            return jnp.sum(value ** 2), value
+
+        (_, truth), derivatives = jax.jit(
+            jax.value_and_grad(reference_loss, argnums=(0, 1, 2), has_aux=True)
+        )(q.astype(jnp.float64), k.astype(jnp.float64), v.astype(jnp.float64))
+        for actual, expected in zip((out, *gradients), (truth, *derivatives), strict=True):
+            expected = np.asarray(expected)
+            assert np.abs(np.asarray(actual, np.float64) - expected).max() <= 2 ** -6 * np.abs(expected).max()
 
 
 @pytest.mark.parametrize("tokens", [32, 48])
@@ -152,14 +204,20 @@ def test_the_tpu_paged_kernel_attends_what_the_stored_pool_holds(tokens, monkeyp
 
     monkeypatch.setattr(kernels, "paged_attention", recorded)
     rows, heads, width = 2, 2, 128
+    # The interpreter's callbacks dispatch computations to the device they run
+    # on, and each takes one of the device's 32 computations in flight. The
+    # computations queued behind the kernel hold those until it ends, so 31 of
+    # them hang the run for good (1 run in 12 on four cores, 2026-10-02): each
+    # interpreted call is waited on before anything more is dispatched.
     with jax.default_device(host), pltpu.force_tpu_interpret_mode():
         key, value = (jax.random.normal(jax.random.key(seed), (rows, tokens, heads, width),
                                         jnp.bfloat16) for seed in (0, 1))
         query = jax.random.normal(jax.random.key(2), (rows, 2 * heads, width), jnp.bfloat16)
         lengths = jnp.array([tokens, 19], jnp.int32)
         module = Decoder(KVCache(page_size=16))
-        variables = module.init(jax.random.key(0), key, value, query, lengths)
-        (attended, (keys, values)), _ = module.apply(variables, key, value, query, lengths, mutable=["cache"])
+        variables = jax.block_until_ready(jax.jit(module.init)(jax.random.key(0), key, value, query, lengths))
+        (attended, (keys, values)), _ = jax.block_until_ready(jax.jit(functools.partial(
+            module.apply, mutable=["cache"]))(variables, key, value, query, lengths))
     keys, values = (jnp.repeat(part.astype(jnp.float32), 2, axis=2) for part in (keys, values))
     scores = jnp.einsum("bhd,bkhd->bhk", query.astype(jnp.float32), keys) / np.sqrt(width)
     scores = jnp.where(jnp.arange(tokens)[None, None] < lengths[:, None, None], scores, -jnp.inf)
@@ -184,10 +242,10 @@ def test_a_pool_too_small_for_every_row_is_refused_where_no_server_assigns_pages
     prompts = np.array([[1, 2, 3, 4, 5, 6, 7], [7, 6, 5, 4, 3, 2, 1]])
     small = TextGeneration(model(KVCache(page_size=16, pages=10)), params, sampling=Sampling(temperature=0))
     with pytest.raises(ValueError, match="needs a server to assign its pages"):
-        small(prompts, 40, seed=0)
+        small(prompts, 40, key=0)
     whole = TextGeneration(model(KVCache(page_size=16)), params, sampling=Sampling(temperature=0))
     dense = TextGeneration(model(KVCache()), params, sampling=Sampling(temperature=0))
-    np.testing.assert_array_equal(whole(prompts, 40, seed=0).tokens, dense(prompts, 40, seed=0).tokens)
+    np.testing.assert_array_equal(whole(prompts, 40, key=0).tokens, dense(prompts, 40, key=0).tokens)
 
 
 def test_a_pool_split_into_groups_reads_what_each_row_wrote():
@@ -206,11 +264,11 @@ def test_a_pool_split_into_groups_reads_what_each_row_wrote():
     prompts = np.array([[1, 2, 3, 4, 5, 6, 7], [7, 6, 5, 4, 3, 2, 1]])
     grouped = TextGeneration(model(KVCache(page_size=16, groups=2)), params, sampling=Sampling(temperature=0))
     dense = TextGeneration(model(KVCache()), params, sampling=Sampling(temperature=0))
-    np.testing.assert_array_equal(grouped(prompts, 40, seed=0).tokens, dense(prompts, 40, seed=0).tokens)
+    np.testing.assert_array_equal(grouped(prompts, 40, key=0).tokens, dense(prompts, 40, key=0).tokens)
 
 
 def test_beam_search_refuses_a_paged_cache():
-    from dew.nn.backbones.causal_transformer import gather_cache_rows
+    from dew.nn.kv_cache import gather_cache_rows
 
     cache = Holder(KVCache(page_size=8)).init(jax.random.key(0), *(jnp.ones((2, 16, 1, 8)),) * 2)["cache"]
     with pytest.raises(ValueError, match="paged cache"):

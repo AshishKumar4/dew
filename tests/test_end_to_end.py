@@ -16,10 +16,10 @@ from dew.diffusion import presets
 from dew.inputs import Field, InputSpec
 from dew.nn.autoencoders.kl import AutoencoderKL
 from dew.nn.autoencoders.sd_vae import StableDiffusionVAE
-from dew.objectives.base import Step, scalar_loss
+from dew.nn.backbones import SimpleDiT
+from dew.objectives.base import Step
 from dew.objectives.diffusion import Alignment, DiffusionObjective
 from dew.objectives.diffusion.end_to_end import AUTOENCODER, LATENT_STATS, EndToEnd
-from dew.registry import models
 from dew.sampling import Euler, TextToImage
 from dew.training import Trainer
 
@@ -62,10 +62,10 @@ def objective(end_to_end: EndToEnd) -> DiffusionObjective:
     encoder = Patches()
     alignment = Alignment(encoder, encoder.init(jax.random.PRNGKey(9), jnp.zeros((1, 8, 8, 3))),
                           "dit_block_0", width=8)
-    model = models.SimpleDiT(patch_size=2, emb_features=16, num_layers=2, num_heads=2, mlp_ratio=1,
+    model = SimpleDiT(patch_size=2, emb_features=16, num_layers=2, num_heads=2, mlp_ratio=1,
                              output_channels=4)
     return DiffusionObjective(model, presets.Flow()(), InputSpec(Field("image", (8, 8, 3))), guidance=None,
-                              sampler=Euler(), steps=2, autoencoder=autoencoder, alignment=alignment,
+                              solver=Euler(), steps=2, autoencoder=autoencoder, alignment=alignment,
                               end_to_end=end_to_end, ema_decay=None)
 
 
@@ -77,7 +77,7 @@ STEP = Step(step=jnp.asarray(0), key=jax.random.PRNGKey(2), ema=None)
 def gradients(end_to_end: EndToEnd):
     task = objective(end_to_end)
     params = task.init(jax.random.PRNGKey(0))
-    return params, jax.grad(lambda tree: scalar_loss(task, {**params, "params": tree}, BATCH, STEP)[0])(
+    return params, jax.grad(lambda tree: task.scalar_loss({**params, "params": tree}, BATCH, STEP)[0])(
         params["params"])
 
 
@@ -96,7 +96,9 @@ def test_each_loss_trains_its_own_side():
     assert total(joint[AUTOENCODER]) > 0
     for name in joint:
         if name != AUTOENCODER:
-            for got, want in zip(jax.tree.leaves(joint[name]), jax.tree.leaves(model_only[name]), strict=True):
+            for got, want in zip(
+                jax.tree.leaves(joint[name]), jax.tree.leaves(model_only[name]), strict=True
+            ):
                 np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
     _, aligned_only = gradients(EndToEnd(reconstruction_weight=0.0, kl_weight=0.0))
     assert total(aligned_only[AUTOENCODER]) > 0
@@ -139,10 +141,9 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
 
     from dew.checkpoints import Checkpoints
     from dew.config import ModelConfig, TrainerConfig
-    from dew.data import OxfordFlowers
+    from dew.data import TFDSImages
     from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
     from dew.objectives.diffusion.config import RepresentationAlignment
-    from dew.registry import samplers
 
     fixtures = Path(__file__).resolve().parent / "fixtures"
     for name in ("tiny_diffusers", "rae"):
@@ -151,7 +152,7 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
     config = DiffusionRunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 1, "emb_features": 16, "num_layers": 2, "num_heads": 2,
                                          "mlp_ratio": 1}, dtype="float32", attention_impl="xla"),
-        data=OxfordFlowers(image_size=32), preset=presets.Flow(), sampler=samplers.Euler(), guidance=None,
+        data=TFDSImages(image_size=32), preset=presets.Flow(), solver=Euler(), guidance=None,
         sampling_steps=2, ema_decay=None, val_metrics=(), trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
         text=TextCondition(encoder="char_table", checkpoint="char_table"),
         autoencoder=PretrainedAutoencoder(modelname=str(tmp_path / "tiny_diffusers/sd/vae"), dtype="float32"),
@@ -176,5 +177,5 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
     for got, want in zip(jax.tree.leaves(restored.params["autoencoder"]),
                          jax.tree.leaves(state.params["params"][AUTOENCODER]), strict=True):
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
-    expected = task.pipeline(state, ema=False)(["a red bird"], seed=9).host().images
-    np.testing.assert_array_equal(restored(["a red bird"], seed=9).host().images, expected)
+    expected = task.pipeline(state, ema=False)(["a red bird"], key=9).host().images
+    np.testing.assert_array_equal(restored(["a red bird"], key=9).host().images, expected)

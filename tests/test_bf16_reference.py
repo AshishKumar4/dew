@@ -40,7 +40,7 @@ import pytest
 from reference_error import assert_as_exact_as_the_reference, assert_rounds_where_the_reference_does
 from safetensors.numpy import load_file
 
-from dew.interop import diffusion_gemma as adapter, load_pretrained
+from dew.interop import Pretrained, diffusion_gemma as adapter
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.inputs import ModelInputs
 
@@ -53,7 +53,7 @@ DECODERS = ("llama-tiny", "qwen3-tiny", "gemma3-tiny", "mixtral-tiny", "deepseek
 @pytest.mark.parametrize("name", DECODERS)
 def test_a_decoder_is_as_exact_as_its_reference(name, dtype):
     directory = FIXTURES / name
-    pretrained = load_pretrained(str(directory), dtype=dtype, attention_impl="reference")
+    pretrained = Pretrained.load(str(directory), dtype=dtype, attention_impl="reference")
     ids = jnp.asarray(np.load(directory / "input_ids.npy"), jnp.int32)
     logits = np.asarray(pretrained.model.apply(pretrained.variables, ids), np.float32)
     with np.load(directory / "numerics.npz") as exact:
@@ -108,7 +108,7 @@ def test_logits_coarser_than_the_reference_fail_the_rule():
     same logits rounded to three bits (e4m3) land at 1.73 times and pass,
     the scale below which this rule is blind (tests/reference_error.py)."""
     directory = FIXTURES / "llama-tiny"
-    pretrained = load_pretrained(str(directory), dtype="bfloat16", attention_impl="reference")
+    pretrained = Pretrained.load(str(directory), dtype="bfloat16", attention_impl="reference")
     ids = jnp.asarray(np.load(directory / "input_ids.npy"), jnp.int32)
     logits = jnp.asarray(pretrained.model.apply(pretrained.variables, ids), jnp.float32)
     coarse = jax.lax.reduce_precision(logits, exponent_bits=5, mantissa_bits=2)
@@ -181,7 +181,7 @@ def test_real_mamba2_weights_in_bf16_are_as_exact_as_the_reference():
         with torch.no_grad():
             runs[name] = reference(torch.from_numpy(ids)).logits.to(torch.float64).numpy()
     for dtype in ("float32", "bfloat16"):
-        pretrained = load_pretrained(MAMBA2_130M, revision=MAMBA2_REVISION, dtype=dtype,
+        pretrained = Pretrained.load(MAMBA2_130M, revision=MAMBA2_REVISION, dtype=dtype,
                                      param_dtype=dtype, attention_impl="xla")
         logits = pretrained.model.apply(pretrained.variables, jnp.asarray(ids, jnp.int32))
         assert_as_exact_as_the_reference(np.asarray(logits, np.float32), runs[dtype], runs["f64"],

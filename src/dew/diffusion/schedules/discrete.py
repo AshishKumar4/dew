@@ -20,17 +20,20 @@ class DiscreteNoiseScheduler(NoiseScheduler):
 
     def __init__(self, betas: np.ndarray,
                  p2_loss_weight_k: float = 1, p2_loss_weight_gamma: float = 1):
+        self._record_fields = {'betas': np.asarray(betas, np.float64).tolist(),
+                               'p2_loss_weight_k': p2_loss_weight_k,
+                               'p2_loss_weight_gamma': p2_loss_weight_gamma}
         self.T = len(betas)
         # The table is fixed at construction. Device float32 prefix products
         # and roots introduce backend-dependent error into every later step.
         alpha_cumprod = np.cumprod(1 - np.asarray(betas, np.float64), axis=0)
-
-        self.alpha_cumprod = jnp.asarray(alpha_cumprod, jnp.float32)
         self.sqrt_alpha_cumprod = jnp.asarray(np.sqrt(alpha_cumprod), jnp.float32)
         self.sqrt_one_minus_alpha_cumprod = jnp.asarray(np.sqrt(1 - alpha_cumprod), jnp.float32)
         noise_variance = 1 - alpha_cumprod
         # This form of (k + SNR)^-gamma also preserves the zero-noise limit.
-        weights = (noise_variance / (p2_loss_weight_k * noise_variance + alpha_cumprod)) ** p2_loss_weight_gamma
+        weights = (
+            noise_variance / (p2_loss_weight_k * noise_variance + alpha_cumprod)
+        ) ** p2_loss_weight_gamma
         self.p2_loss_weights = jnp.asarray(weights, jnp.float32)
 
     def index(self, t) -> jax.Array:

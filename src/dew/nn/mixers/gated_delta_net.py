@@ -5,7 +5,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 
-from dew.nn.mixers import MixerBase, MixerContext, mixers
+from dew.nn.mixer_base import MixerBase, MixerContext, mixers
 
 
 @mixers("gated_delta_net")
@@ -13,22 +13,13 @@ from dew.nn.mixers import MixerBase, MixerContext, mixers
 class GatedDeltaNetMixer(MixerBase):
     """The Qwen3.5 family's linear-attention layer, by the config's field names.
 
-    `linear_num_key_heads`/`linear_num_value_heads` with their head dims are
-    the mixer's own geometry: value heads may outnumber key heads, and one
-    key head serves `num_v // num_k` value heads, which is the reference's
-    `repeat_interleave`. `linear_conv_kernel_dim` is the depthwise short
-    conv's window. `output_gate_type` is the activation the gated norm
-    applies to its gate, silu in qwen3_5 (`Qwen3_5RMSNormGated.activation`,
-    modeling_qwen3_5.py:173) and `output_gate_type or hidden_act` in
-    qwen4_exp (modeling_qwen4_exp.py:438). `fused_in_proj` is Qwen3-Next's
-    parameterisation of the same layer: the four input projections stored as
-    the two leaves `in_proj_qkvz` and `in_proj_ba`, grouped by key head
-    (modeling_qwen3_next.py:540-586). The chunk size (64, the reference's
-    default) belongs to the implementation, so it is not a field here.
-
-    This kind ignores the context's attention geometry (num_kv_heads,
-    head_dim, the window, partial rotary, KV sharing, the output gate): a
-    linear-attention layer has no keys to cache, no rope and no window.
+    One key head serves `num_v // num_k` value heads (`repeat_interleave`).
+    `output_gate_type` is the gated norm's activation: silu in qwen3_5
+    (modeling_qwen3_5.py:173), `output_gate_type or hidden_act` in qwen4_exp
+    (modeling_qwen4_exp.py:438). `fused_in_proj` is Qwen3-Next's two fused
+    input leaves (modeling_qwen3_next.py:540-586). The chunk size, 64, belongs
+    to the implementation. The context's attention geometry is not read: the
+    layer has no keys to cache, no rope and no window.
     """
 
     linear_num_key_heads: int = 16

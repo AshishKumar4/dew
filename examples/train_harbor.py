@@ -1,4 +1,5 @@
-"""Agentic GRPO: a harness runs in Harbor sandboxes, a gateway records its model calls, and Dew trains on them.
+"""Agentic GRPO: a harness runs in Harbor sandboxes, a gateway records its
+model calls, and Dew trains on them.
 
     python examples/train_harbor.py --tasks path/to/harbor/task ... --gateway http://127.0.0.1:9090 \\
         --sandbox-gateway http://proxy:9091 --engines http://127.0.0.1:8011 --served runs/harbor/served
@@ -39,16 +40,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import optax
 import tyro
 
-from dew.data import tokenizer_for
+from dew.data import HFTokenizer
 from dew.data.dataset import Dataset
 from dew.inference import NativeRolloutServer, Publication, SafetensorsReload, Server, TextGeneration
-from dew.interop import load_pretrained
+from dew.interop import PretrainedDecoder
+from dew.interop.harbor import HARBOR_KEY, Gateway, HarborSource
 from dew.objectives.rl import GRPOObjective, RolloutScheduler, SchedulerRecord
-from dew.objectives.rl.harbor import HARBOR_KEY, Gateway, HarborSource
 from dew.objectives.rl.scheduler import task_ids
 from dew.objectives.rl.sessions import Task
 from dew.sampling import Sampling
@@ -94,8 +96,12 @@ def main(config: Config) -> dict:
         config = replace(config, model=str(FIXTURES / "qwen2-tiny"), steps=2, prompts=2, groups=2, width=128,
                          truncation="score", workers=4)
     config.out.mkdir(parents=True, exist_ok=True)
-    source = load_pretrained(config.model, dtype="float32" if config.smoke else "bfloat16", param_dtype="float32",
-                             max_seq_len=config.width)
+    source = PretrainedDecoder.load(
+        config.model,
+        dtype=jnp.float32 if config.smoke else jnp.bfloat16,
+        param_dtype=jnp.float32,
+        max_seq_len=config.width,
+    )
     objective = GRPOObjective(source.model, config.width - 1, pretrained=source.variables,
                               behavior_importance=2.0, epsilon_high=0.28)
     fake = None
@@ -141,8 +147,11 @@ def main(config: Config) -> dict:
         if fake is not None:
             fake.shutdown()
             fake.policy.close()
-    summary = {"updates": int(state.updates), "rewards": [record.metrics.get("reward/mean") for record in history],
-               "max_lag": max(record.lag for record in history)}
+    summary = {
+        "updates": int(state.updates),
+        "rewards": [record.metrics.get("reward/mean") for record in history],
+        "max_lag": max(record.lag for record in history),
+    }
     (config.out / "summary.json").write_text(json.dumps(summary, indent=1))
     return summary
 
@@ -201,7 +210,9 @@ class _SmokeRoutes(BaseHTTPRequestHandler):
             self.answer({"data": [{"id": "policy"}]})
         else:
             with self.server.lock:
-                self.answer(self.server.traces.get(self.path.removeprefix("/sessions/").removesuffix("/traces"), []))
+                self.answer(
+                    self.server.traces.get(self.path.removeprefix("/sessions/").removesuffix("/traces"), [])
+                )
 
     def do_DELETE(self) -> None:
         with self.server.lock:
@@ -219,14 +230,28 @@ class _SmokeRoutes(BaseHTTPRequestHandler):
         text = "".join(f"<{message['role']}>{message['content']}\n" for message in body["messages"])
         prompt = self.server.words.encode(text)
         began, version = time.time(), self.server.stamp
-        draw = self.server.policy.submit(prompt, body["max_tokens"], seed=hash(session) % 2 ** 31).result()
-        trace = {"prompt_token_ids": list(prompt), "completion_token_ids": list(draw.tokens),
-                 "logprobs": list(draw.behavior_log_probs), "finish_reason": "stop" if draw.terminated else "length",
-                 "weight_version": version, "timestamp": time.time(), "latency_ms": (time.time() - began) * 1000}
+        draw = self.server.policy.submit(prompt, body["max_tokens"], key=hash(session) % 2 ** 31).result()
+        trace = {
+            "prompt_token_ids": list(prompt),
+            "completion_token_ids": list(draw.tokens),
+            "logprobs": list(draw.behavior_log_probs),
+            "finish_reason": "stop" if draw.terminated else "length",
+            "weight_version": version,
+            "timestamp": time.time(),
+            "latency_ms": (time.time() - began) * 1000,
+        }
         with self.server.lock:
             self.server.traces.setdefault(session, []).append(trace)
-        self.answer({"choices": [{"message": {"role": "assistant", "content": self.server.words.decode(draw.tokens)},
-                                  "finish_reason": trace["finish_reason"]}]})
+        self.answer(
+            {
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": self.server.words.decode(draw.tokens)},
+                        "finish_reason": trace["finish_reason"],
+                    }
+                ]
+            }
+        )
 
     def log_message(self, *arguments) -> None:
         pass
@@ -242,9 +267,14 @@ def smoke_setup(config: Config, source) -> tuple[SmokeGateway, Path, tuple[Path,
         task.mkdir(parents=True, exist_ok=True)
     stock = source.text_generation().sampling
     sampling = Sampling(temperature=1.0, eos_id=stock.eos_id, pad_id=stock.pad_id)
-    engine = Server.from_task(TextGeneration(source.model, source.variables, source.processor, sampling=sampling),
-                              slots=config.prompts * config.groups, capacity=config.width)
-    fake = SmokeGateway(NativeRolloutServer(engine), tokenizer_for(str(FIXTURES / "diffusion-gemma-workflow")))
+    engine = Server.from_task(
+        TextGeneration(source.model, source.variables, source.processor, sampling=sampling),
+        slots=config.prompts * config.groups,
+        capacity=config.width,
+    )
+    fake = SmokeGateway(
+        NativeRolloutServer(engine), HFTokenizer(str(FIXTURES / "diffusion-gemma-workflow"))
+    )
     threading.Thread(target=fake.serve_forever, daemon=True).start()
     return fake, harbor, tasks
 

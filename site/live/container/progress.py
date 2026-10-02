@@ -1,7 +1,7 @@
 """Progress reports for the landing page's sampler, while a sampling cell runs.
 
-server.py wraps the setup cell's `pipe` in `Reporting` once the cell has run.
-The wrapper samples exactly as `pipe` does, with the solver it is handed
+preload.py wraps the pipelines the setup cell's `from_pretrained` returns in
+`Reporting`, which samples exactly as the pipeline does, with the solver it is handed
 wrapped so each step also sends its clean prediction to the host. While the
 compiled program runs, the kernel's main thread displays one output per solver
 step, whose text is {"dew-progress": {"step": k, "steps": n}} with n the
@@ -10,11 +10,11 @@ latents to a small RGB image, then {"dew-progress": {"stage": "decode"}} while
 the model's final clean prediction and the VAE decode run. The
 page shows these as the run's progress; any other display is the cell's own.
 
-`ReportingModels` wraps the setup cell's `text_model` the same way: it
-reports {"dew-progress": {"stage": "load", "model": name}} before a model this
-kernel has not loaded yet loads, and {"dew-progress": {"stage": "generate",
-"first": bool}} before each generation, `first` for that model's first one in
-this kernel, which compiles its program.
+`ReportingModels` wraps the setup cell's loaders, `from_pretrained` and
+`text_model`: it reports {"dew-progress": {"stage": "load", "model": name}}
+before a model this kernel has not loaded yet loads. A text task then reports
+{"dew-progress": {"stage": "generate", "first": bool}} before each generation,
+`first` for that model's first one in this kernel, which compiles its program.
 """
 
 from __future__ import annotations
@@ -90,19 +90,19 @@ class Reporting:
     def __getattr__(self, name: str) -> Any:
         return getattr(self.pipe, name)
 
-    def __call__(self, prompts, *, steps: int | None = None, sampler=None, decode: bool = True, **kw):
+    def __call__(self, prompts, *, steps: int | None = None, solver=None, decode: bool = True, **kw):
         count = self.pipe.steps if steps is None else steps
         # The solver steps between the grid's points; the model's last call, the
         # clean prediction at the final point, runs with the decode.
         process, times = self.pipe.prepared_process(count)
         walked = len(process.times(count) if times is None else times) - 1
-        solver = ReportingSolver(self.pipe.sampler if sampler is None else sampler)
+        reporting = ReportingSolver(self.pipe.solver if solver is None else solver)
         while not _steps.empty():
             _steps.get_nowait()
         # A call's first run of a program with host callbacks returns only when the
         # program has finished, so the call runs on its own thread and this one displays.
         with ThreadPoolExecutor(1) as pool:
-            call = pool.submit(self.pipe, prompts, steps=steps, sampler=solver, decode=decode, **kw)
+            call = pool.submit(self.pipe, prompts, steps=steps, solver=reporting, decode=decode, **kw)
             done = 0
             while done < walked:
                 try:
@@ -123,17 +123,19 @@ def _ready(result: Any) -> bool:
 
 
 class ReportingModels:
-    """`load`, the setup cell's `text_model`, reporting each model's load and generations."""
+    """`load`, one of the setup cell's loaders, reporting each model's load and
+    handing back what it loads wrapped in `wrap`, once per model."""
 
-    def __init__(self, load: Callable[[str], Any]) -> None:
+    def __init__(self, load: Callable[[str], Any], wrap: Callable[[Any], Any]) -> None:
         self.load = load
-        self.tasks: dict[str, ReportingText] = {}
+        self.wrap = wrap
+        self.loaded: dict[str, Any] = {}
 
-    def __call__(self, name: str) -> ReportingText:
-        if name not in self.tasks:
+    def __call__(self, name: str) -> Any:
+        if name not in self.loaded:
             _show({"stage": "load", "model": name})
-            self.tasks[name] = ReportingText(self.load(name))
-        return self.tasks[name]
+            self.loaded[name] = self.wrap(self.load(name))
+        return self.loaded[name]
 
 
 class ReportingText:

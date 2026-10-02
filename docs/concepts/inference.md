@@ -13,9 +13,10 @@ import jax
 import numpy as np
 import optax
 
-from dew import Dataset, Trainer, models
+from dew import Dataset, Trainer
 from dew.data import ByteTokenizer
 from dew.inference import RunProcessor
+from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective
 from dew.sampling import Sampling
 
@@ -25,15 +26,15 @@ ids = np.array(tokenizer.encode("One day, Lily saw a big dog in the park. "
 rows = np.stack([ids[i:i + 65] for i in range(0, 16 * 64, 64)])
 data = Dataset(train=lambda partition: iter([{"text": rows}] * 200), val=None,
                records=16, batch=16)
-model = models.build("causal_transformer", vocab_size=tokenizer.vocab_size,
-                     emb_features=64, num_layers=2, num_heads=2, mlp_features=256,
-                     max_seq_len=128)
-objective = LMObjective(model, seq_len=64, ema_decay=None)
+model = CausalTransformer(vocab_size=tokenizer.vocab_size,
+                          emb_features=64, num_layers=2, num_heads=2, mlp_features=256,
+                          max_seq_len=128)
+objective = LMObjective(model, seq_len=64)
 state = Trainer(objective, optax.adamw(3e-3), key=jax.random.key(0)).fit(
     data, steps=150, log_every=150)
 
-task = objective.pipeline(state, ema=False, processor=RunProcessor(tokenizer))
-result = task(["One day", "The dog"], 20, seed=0, n=2)
+task = objective.pipeline(state, processor=RunProcessor(tokenizer))
+result = task(["One day", "The dog"], 20, key=0, n=2)
 for text in result.text:
     print(repr(text))
 print(result.lengths, result.terminated)
@@ -72,44 +73,49 @@ pipeline(source, *, mesh=None, layout=None, dtype=None, param_dtype=None,
 
 A run's `run.json` must name its objective. Saved diffusion, LM, DPO, GRPO, PPO, block-diffusion and masked-diffusion runs have generation tasks. Other kinds, such as JEPA runs, have none and raise. Loading a task also points XLA at the on-disk compilation cache, so a restarted process reuses what it compiled.
 
-Checkpoints in a published layout load through `dew.interop.load_pretrained`, including native latent-diffusion checkpoints described by `model_index.json`. An original-format single-file checkpoint loads with `load_pretrained(repo_or_dir, single_file="name.safetensors")`. Stable Diffusion 1.x, SDXL and FLUX.1 files are checked against diffusers' own `from_single_file`: the released SD 1.5 file and tiny SD 1.x, SDXL and Flux files convert to the same tensors, and the released SDXL base, FLUX.1-dev and FLUX.1-schnell files convert to the names and shapes diffusers' models have. diffusers' key maps convert the file once into Dew's cache as the diffusers pipeline it describes. The configs are `repo_or_dir`'s own when it has a `model_index.json`, or else those of the diffusers repo diffusers infers from the file, pinned to the commit fetched. A component the file does not carry, such as a Flux file's text encoders and VAE, takes its weights from the same place; if there are none, the load names the component and stops. The cache entry is kept only after the pipeline loads, and a newer diffusers converts the file again. FLUX.1's config repos are gated on the Hub, so accept the license and log in, or load from a local directory that holds the configs. The conversion needs `pip install 'dewml[diffusers]'`; the loaded pipeline runs in JAX.
+Checkpoints in a published layout load through `dew.interop.Pretrained.load`, including native latent-diffusion checkpoints described by `model_index.json`. An original-format single-file checkpoint loads with `Pretrained.load(repo_or_dir, single_file="name.safetensors")`. Stable Diffusion 1.x, SDXL and FLUX.1 files are checked against diffusers' own `from_single_file`: the released SD 1.5 file and tiny SD 1.x, SDXL and Flux files convert to the same tensors, and the released SDXL base, FLUX.1-dev and FLUX.1-schnell files convert to the names and shapes diffusers' models have. diffusers' key maps convert the file once into Dew's cache as the diffusers pipeline it describes. The configs are `repo_or_dir`'s own when it has a `model_index.json`, or else those of the diffusers repo diffusers infers from the file, pinned to the commit fetched. A component the file does not carry, such as a Flux file's text encoders and VAE, takes its weights from the same place; if there are none, the load names the component and stops. The cache entry is kept only after the pipeline loads, and a newer diffusers converts the file again. FLUX.1's config repos are gated on the Hub, so accept the license and log in, or load from a local directory that holds the configs. The conversion needs `pip install 'dewml[diffusers]'`; the loaded pipeline runs in JAX.
 
 This exports the decoder from the example in the Hugging Face layout and loads it back:
 
 ```python
+import jax.numpy as jnp
+
 import dew
-from dew.interop import save_pretrained_decoder
+from dew.interop import PretrainedDecoder
 from dew.training import MeshSpec
 
-save_pretrained_decoder(model, state.params, "lily-decoder", tokenizer="byte")
-loaded = dew.pipeline("lily-decoder", mesh=MeshSpec(), dtype="float32")
+PretrainedDecoder.from_model(model, state.params, tokenizer="byte").save("lily-decoder")
+loaded = dew.pipeline("lily-decoder", mesh=MeshSpec(), dtype=jnp.float32)
 loaded = dataclasses.replace(loaded, processor=RunProcessor(tokenizer),
                              sampling=Sampling(temperature=0.0))
-print(loaded("One day", 20, seed=0).text)
+print(loaded("One day", 20, key=0).text)
 ```
 
 ```text
 (', Lily saw a big dog',)
 ```
 
-The byte vocabulary has no Hugging Face tokenizer files, so the loaded task has no processor, and the example attaches one. A checkpoint that ships a tokenizer loads with its processor, and its `generation_config.json` sets the sampling policy and budget. A Hub name such as `"Qwen/Qwen3-0.6B"` loads the same way and needs enough host and device memory for its weights and cache. `Pretrained.text_generation`, `block_generation` and `text_to_image` build the same task types from a bundle already loaded with `load_pretrained`.
+The byte vocabulary has no Hugging Face tokenizer files, so the loaded task has no processor, and the example attaches one. A checkpoint that ships a tokenizer loads with its processor, and its `generation_config.json` sets the sampling policy and budget. A Hub name such as `"Qwen/Qwen3-0.6B"` loads the same way and needs enough host and device memory for its weights and cache. `PretrainedDecoder.text_generation`, `PretrainedBlockDecoder.block_generation` and `PretrainedPipeline.text_to_image` build the same task types from a bundle already loaded with `Pretrained.load`.
 
 A run assembled by hand needs its configuration saved next to the checkpoints before `dew.pipeline(directory)` can rebuild the task. A recipe's `RunConfig.train` writes `run.json` there; otherwise save the matching configuration with `config.save(directory)`. The checkpoint arrays alone do not describe the model. The LM recipe records the resolved model, tokenizer, sampling value and `sample_tokens` budget, and reloading the run restores them.
 
 ## Weights
 
-For the plain LM, image-diffusion and block-diffusion objectives, `ema=True` asks for the moving-average weights and raises if the run or state has no EMA copy, and `ema=False` reads the live weights. `dew.pipeline` and the tasks' `from_run` and `from_pretrained` default to `ema=None`, which takes the EMA copy when the run stored one and the live weights otherwise; `objective.pipeline` defaults to `ema=True`. DPO, GRPO and PPO use the EMA slot for a frozen reference, so their pipelines always publish the trained policy, never the reference. PPO also leaves out the critic.
+For the plain LM, image-diffusion and block-diffusion objectives, `ema=True` asks for the moving-average weights and raises if the run or state has no EMA copy, and `ema=False` reads the live weights. `dew.pipeline`, the tasks' `from_run` and `from_pretrained`, `objective.pipeline` and `export_run` default to `ema=None`, which takes the EMA copy when the run or state has one and the live weights otherwise. DPO, GRPO and PPO use the EMA slot for a frozen reference, so their pipelines always publish the trained policy, never the reference. PPO also leaves out the critic.
 
 `objective.pipeline(state)` picks weights by the same rule and keeps the arrays the trainer has already placed. `LMObjective.policy(params, sampling)` returns a `TextGeneration` bound to the given tree, the task a GRPO rollout samples with. `task.bind(variables)` makes a task over another set of variables; it copies the mapping structure and shares the array buffers, so do not change or donate those arrays while a task uses them.
 
 `TextGeneration.quantized(Quantization(...))` returns a task with matched language-model weights stored as int8 or fp8 values with their scales. It uses the same Qwix serving path and `dewml[quantization]` extra as image tasks, and keeps the processor, sampling policy and token budget. Weight quantization is separate from `KVCache.quantized`, which changes cache storage. Both can be used by `Server.from_task`.
 
 ```python
+import jax.numpy as jnp
+
+import dew
 from dew.training.quantization import Quantization
 
-task = dew.pipeline("Qwen/Qwen3-0.6B", dtype="bfloat16")
+task = dew.pipeline("Qwen/Qwen3-0.6B", dtype=jnp.bfloat16)
 served = task.quantized(Quantization(dtype="int8", weight_only=True))
-print(served("The capital of France is", max_new_tokens=20, seed=0).text[0])
+print(served("The capital of France is", max_new_tokens=20, key=0).text[0])
 ```
 
 This example downloads a Hub checkpoint. `dtype="fp8"` selects e4m3 weights; hardware support determines whether quantized operations run natively. The default example used to trace a decoder is one numeric token. For a multimodal model, pass `example=inputs`, a `ModelInputs` prepared by its processor with the media fields its weights need.
@@ -119,12 +125,14 @@ Resident JAX weights retain their placement through Qwix. Unplaced NumPy weights
 `TextToImage.quantized(Quantization(...))` returns the task with its denoiser's kernels stored as int8 or fp8 values and their scales, through Qwix's post-training quantization (`pip install "dewml[quantization]"`). The encoders and the autoencoder keep their weights. `Quantization(dtype="int8")` quantizes weights and activations, so each matmul runs in int8; `weight_only=True` keeps activations in the compute dtype, which saves the weight memory without the speed. `patterns` chooses the modules by path. On the RTX 4080 the 176M text-to-image model then holds 183 MiB of denoiser weights in place of 670 MiB, and in bf16 with int8 weights and activations its denoiser forward takes 21% less time, with its CLIP score within 0.002 of fp32 ([measurements](../performance.md#quantized-serving-of-the-176m-text-to-image-model-2026-09-28)). The time it saves depends on the device: on an A100 the quantized forward is slower than the unquantized one, and on a TPU v6e int8 halves the fp32 forward's time and not the bf16 one's. On a GPU, Dew refuses to quantize the activations of a grouped convolution, which XLA:GPU computes wrongly or cannot compile, so there the model's depthwise convolutions stay out:
 
 ```python
+import jax.numpy as jnp
+
 from dew.sampling import TextToImage
 from dew.training.quantization import Quantization
 
-pipe = TextToImage.from_pretrained("dewml/hybrid-dit-176m", dtype="bfloat16")
+pipe = TextToImage.from_pretrained("dewml/hybrid-dit-176m", dtype=jnp.bfloat16)
 served = pipe.quantized(Quantization(dtype="int8", patterns=("^(?!.*spatial_fusion).*",)))
-images = served(["a red fox in a snowy forest"], steps=20, seed=0).host().images
+images = served(["a red fox in a snowy forest"], steps=20, key=0).host().images
 ```
 
 ## Placement
@@ -135,17 +143,78 @@ Every process supplies its own rows. All cooperating processes must supply the s
 
 Results hold global arrays sharded by row, including any filler rows added so the batch divides across devices. `result.host()` returns the same record with NumPy arrays for this process's real rows; it does not gather rows from other processes. Filler rows are added as prompts, before any continuation exists, so all continuations of a prompt stay on the process that asked for them. Token generation and image prior noise use keys per global row. Canvas refinement and an explicitly sampled VAE posterior use keys for the whole batch, so changing the placed batch shape can change their draws.
 
+### SSD-backed decoder banks
+
+`SafetensorsBanks` and its `stream` run a decoder whose layer weights do not fit in device memory or host RAM. The source reads a local Hugging Face safetensors checkpoint through read-only memory maps and the ordinary decoder translator. The existing banked inference loop fetches a layer at execution, with one host read-ahead slot for the following layer. No full decoder stack is loaded or captured as a compiled constant.
+
+```python
+import jax
+
+from dew.config import ModelConfig
+from dew.inference import SafetensorsBanks
+from dew.interop import translate_config
+from dew.sampling.text import Sampling, generate
+
+with SafetensorsBanks("path/to/gpt-oss-20b-BF16",
+                       cache_bytes=0, param_dtype="auto") as source:
+    record = {**translate_config(source.config), "max_seq_len": 128, "scan_layers": True}
+    model = ModelConfig("causal_transformer", record, dtype="bfloat16", attention_impl="xla").build()
+    variables = source.stream(model)
+    generated = jax.block_until_ready(generate(
+        model, variables, [[1, 2, 3, 4]], max_new_tokens=8,
+        key=0, sampling=Sampling(temperature=0.0)))
+```
+
+Use a downloaded checkpoint snapshot's local directory for the path. This path accepts unquantized registered decoder families whose translation stays lazy; it refuses a quantized codec or family preparation that might materialize the model. It does not download a Hub repository, load a tokenizer or replace `dew.pipeline`'s resident loader. Tokenize inputs separately, or bind these variables to `TextGeneration` with the matching processor.
+
+`cache_bytes` bounds retained host layers, not the entire process. Complete layers are admitted in read order while they fit and kept until the source closes. A sequential decoder revisits every layer each token, so retaining this prefix avoids the cyclic eviction of a smaller LRU cache. Staging needs up to two host rows plus one leaf's conversion scratch beside that cache. Embeddings, the head, the KV cache and the runtime are separate. Read mapped pages are released; the kernel's shared filesystem cache is not controlled by this budget. Device storage must fit resident entries, two layer rows, activations and the KV cache. Expert tensors stream as part of a whole layer, not just the experts selected for one token. `read_ahead=False` disables the host read-ahead slot.
+
+For a source's `place` and any other pinned-host placement, budget for the allocator's reserve as well as live weights, staging and the runtime. XLA's pinned-host BFC allocator grows its regions in powers of two and retains freed chunks. The GPT-OSS-20B BF16 two-layer prefix on the RTX 4080 (`place`, an eight-token context limit and `SafetensorsBanks(cache_bytes=0)`) held about 1.55 GB of reserve above 3.29 GB of live pinned weights. The sharded array Dew assembles from the per-device buffer shares that buffer, so the reserve is allocator capacity, not a second copy of the weights. A cgroup or container limit can therefore be reached before the computed weight total; the observed reserve is not a fixed overhead to assume for other models.
+
+Streaming is single-device inference only. It requires `scan_layers=True` and a layout without host placement; training, multi-device meshes and pipeline stages are refused. Host callbacks need the CPU backend beside the accelerator: when setting platforms explicitly, use `JAX_PLATFORMS=cuda,cpu` (or `<accelerator>,cpu`) before initializing JAX. Keep the source open until all executions have finished and do not change its files in place. The runtime-only `streaming` collection holds live callback handles, not checkpoint weights: this path saves nothing through `Checkpoints`, and its variables tree is not a resident checkpoint to save or export. The original safetensors directory remains the checkpoint.
+
+On CPU and an RTX 4080, the tiny Mixtral checkpoint's singleton banks and a genuine four-layer scan match the all-resident model bitwise, including the runtime-fetched expert weights. The two-layer GPU scan has a different legitimate RMSNorm fusion because an effectful one-trip loop cannot be peeled; its logit gap stays within the elementwise spread of the same resident weights' singleton and scanned fusions, with a measured maximum of 1.61e-6 at the highest matmul precision. Cached greedy tokens match.
+
+The real GPT-OSS BF16 weights were also compared on the RTX 4080 using the first two layers (both attention kinds), real embeddings, final norm and head: all prefill and decode logits and greedy tokens were bitwise equal to the existing host-banked path for three prompts and three decode steps, at the highest matmul precision. The resident host-bank reference peaked at 7.23 GB RSS and SSD streaming at 4.59 GB. A third host-resident layer exceeded the 8 GiB job budget; each layer is 1.646 GB, and pinned placement and allocator overhead are additional to that total. This was a prefix check, not a claimed full-depth reference comparison.
+
+`tools/benchmark_disk_banks.py` measures one cache budget per fresh process, including peak RSS, live device allocations, allocator pool size, physical storage reads and decode throughput. Its host read time includes I/O and layout conversion and can overlap compute, so it must not be added to elapsed time. An optional trace records the host reads, transfers and GPU kernels; the serial probe separately measures a row read and its host-to-device copy.
+
+The initial full-depth measurement used `unsloth/gpt-oss-20b-BF16` at revision `cc89b3e7fd423253264883a80a4fa5abc619649f`: 41.83 GB of weights, 24 layers of 1.646 GB each, on an RTX 4080 with 16 GB VRAM, from local NVMe under `/mnt/scratch`, with an 8 GiB host-memory cap. With no retained host cache and read-ahead enabled, two three-token decode intervals took 255.36 and 261.56 seconds: 0.0116 tokens/s, with 4.98 GB peak RSS, 5.80 GB peak live device allocations and an 8.59 GB peak allocator pool. This was a shared workstation, not a controlled bandwidth comparison; the two measured prefills took 64.15 and 101.45 seconds. Priority was changed during this initial run; subsequent large disk reads start under `ionice -c3 nice -n 19`.
+
+The cache-size curve below uses a separate fresh process per point, a four-token prompt, one measured greedy decode, BF16 storage and compute, and the highest matmul precision. `--no-warmup` compiles both programs without an extra weight sweep; cache initialization already reads the model once. Read-ahead is enabled. Peak live device storage stayed at 5.80 GB and the allocator pool at 8.59 GB for every point:
+
+| Host-cache budget (GiB) | Retained layers | Decode seconds/token | Tokens/s | Peak RSS (GB) | Physical reads for measured prefill + decode (GB) |
+|---|---|---|---|---|---|
+| 0 | 0 | 33.59 | 0.0298 | 4.75 | 77.45 |
+| 1.6 | 1 | 50.49 | 0.0198 | 6.53 | 75.79 |
+| 3.2 | 2 | 64.87 | 0.0154 | 8.10 | 69.77 |
+
+Retained layers occupy 1.646 GB each. These single-interval measurements do not show a throughput gain from enlarging the cache: physical reads fall and RSS rises, but the shared workstation and its memory-limited filesystem cache make this a capacity measurement, not a controlled cache speedup. All points drew the same first greedy token.
+
+A separate zero-cache, read-ahead-disabled trace covered one prefill and one decode in 183.10 seconds. Its non-overlapping intervals were 173.10 seconds reading and converting host rows, 9.65 seconds in GPU host-to-device copies, and 0.044 seconds in device compute and layout kernels. That interval's decode took 80.21 seconds (0.0125 tokens/s), with 4.33 GB peak RSS. Host reads dominate this protocol; the trace does not establish a read-ahead speedup.
+
 ## Calls and results
 
-A call takes exactly one of `seed` and `key`; `seed=n` means `jax.random.key(n)`.
+A call takes `key`, either an integer seed or a JAX key; `key=n` means `jax.random.key(n)`.
 
 | Control | Meaning |
 |---|---|
 | `max_new_tokens` | Continuation budget. A checkpoint can set a default in `generation_config.json`; if it declares only `max_length`, the budget is that total length minus the padded prompt width. A budget in the call wins. Without any, the call must pass one. |
 | `n` | Continuations per prompt, a positive integer. The checkpoint's `num_return_sequences` becomes the default, whatever sampling policy you pass; otherwise 1. `n` in the call wins in both directions. |
-| `sampling` | `Sampling`: temperature (default 1.0; 0 is argmax), top-k, top-p, min-p, EOS IDs and the output padding ID. |
+| `sampling` | `Sampling`: temperature (default 1.0; 0 is argmax), top-k, top-p, min-p, typical-p, the repetition, presence and frequency penalties, `no_repeat_ngram_size`, `min_new_tokens`, `stop` strings, EOS IDs and the output padding ID. |
 
-Building a task from source defaults raises if an unsupported control is active, such as a repetition penalty or wall-clock stopping. An LM run records its `sampling` value and `sample_tokens` budget, and reloading the run keeps that preview policy. `TextToImage` holds a default solver, guidance and step count; a call can override any of them, and `guidance=None` turns off classifier-free guidance.
+`task.sampling` holds the policy a loaded checkpoint's `generation_config.json` declares. To change one control, replace it on that value; the others, the source's EOS IDs included, still apply:
+
+```python
+from dataclasses import replace
+
+policy = replace(task.sampling, repetition_penalty=1.1, stop=("\n\n",))
+result = task("The capital of France is", 64, sampling=policy, key=0)
+```
+
+A fresh `Sampling(...)` in a call replaces the whole policy, except that the EOS and padding IDs it leaves `None` are the task's, because they belong to the model and its tokenizer. `stop` strings compile once against the task's processor, which a task needs for them. The controls run in Transformers' order whatever order you name them in. `logits=` stays the full override: `logits=policy.transforms() + (my_transform,)` adds a transform of your own to the chain the policy compiles to.
+
+Building a task from source defaults raises if an unsupported control is active, such as DoLa or wall-clock stopping. An LM run records its `sampling` value and `sample_tokens` budget, and reloading the run keeps that preview policy. `TextToImage` holds a default solver, guidance and step count; a call can override any of them, and `guidance=None` turns off classifier-free guidance.
 
 Every result array has `n` rows per prompt, in prompt order. `result.rows` is this process's real prompts times `n`. `Generation.text` returns one string per row in the same order, and each row has its own length, termination flag and likelihoods (`behavior_log_probs`, and `raw_log_probs` for the raw policy). `Generation.text` and `CanvasGeneration.text` decode the first time they are read and cache the strings; a result with no processor raises when asked for text. A tokenizer without a pad token needs no change: Dew tokenizes without padding, then pads the numeric rows and masks at the boundary `RunProcessor` uses.
 
@@ -161,7 +230,7 @@ Repeated calls with the same shapes and controls reuse the compiled executables.
 
 A pixel mask has shape `[B, H, W, 1]`. Its masked-image conditions go to both guidance branches. `encode_key=None` uses the VAE posterior mean; an explicit key samples from the posterior. Condition encoders accept native prompt records as well as strings. `unconditional=` supplies one row, or one row per prompt, in place of the configured unconditional input.
 
-`initial=` is a latent state that is already noisy, and Dew never adds noise to it again. Prepared inputs keep their process and concrete time grid. `task(prepared, seed=..., decode=False)` skips the VAE and the image checker and returns unclipped `result.latents`, with `result.images` set to `None`. For a base and refiner handoff, pass those latents as another task's `initial` with the matching partial grid. Normal calls return both the decoded images and the latents before decoding. Prepared inputs must belong to the task's mesh. A preparation on the source grid also records its step count; to change the count, prepare a new initial state.
+`initial=` is a latent state that is already noisy, and Dew never adds noise to it again. Prepared inputs keep their process and concrete time grid. `task(prepared, key=..., decode=False)` skips the VAE and the image checker and returns unclipped `result.latents`, with `result.images` set to `None`. For a base and refiner handoff, pass those latents as another task's `initial` with the matching partial grid. Normal calls return both the decoded images and the latents before decoding. Prepared inputs must belong to the task's mesh. A preparation on the source grid also records its step count; to change the count, prepare a new initial state.
 
 ## Serving
 
@@ -175,8 +244,8 @@ greedy = dataclasses.replace(task, sampling=Sampling(temperature=0.0))
 server = Server.from_task(greedy, slots=4, capacity=128,
                           kv_cache=KVCache(page_size=16, pages=32), prefix_cache=True)
 prompts = ["One day, Lily saw a big dog in", "One day, Lily saw a big dog in the park."]
-served = server(prompts[:1], 20, seed=0) + server(prompts[1:], 20, seed=0)
-alone = greedy(prompts, 20, seed=0)
+served = server(prompts[:1], 20, key=0) + server(prompts[1:], 20, key=0)
+alone = greedy(prompts, 20, key=0)
 print([generation.text[0] for generation in served])
 print("same as TextGeneration:", [g.text[0] for g in served] == list(alone.text))
 print("prompt tokens read from shared pages:", server.prefix_hits)
@@ -190,7 +259,7 @@ prompt tokens read from shared pages: 16
 
 The second call's prompt begins with the first call's, so its first full 16-token page comes from the prefix cache instead of a prefill.
 
-Calling the server with a batch submits every prompt, steps until they finish and returns one `Generation` per prompt. `server.submit(prompt, max_new_tokens, seed=...)` queues one request and returns a ticket that resolves to its `Generation`; `step()` runs one device call and `run()` steps until the queue and the rows are empty. The task's `n` must be one and its strategy the row-wise sampler, with or without a grammar. `capacity` rounds up to whole 64-slot tiles, and whole pages of a paged cache, and may not exceed the model's context.
+Calling the server with a batch submits every prompt, steps until they finish and returns one `Generation` per prompt. `server.submit(prompt, max_new_tokens, key=...)` queues one request and returns a ticket that resolves to its `Generation`; `step()` runs one device call and `run()` steps until the queue and the rows are empty. The task's `n` must be one and its strategy the row-wise sampler, with or without a grammar. `capacity` rounds up to whole 64-slot tiles, and whole pages of a paged cache, and may not exceed the model's context.
 
 | Option | Meaning |
 |---|---|
@@ -213,7 +282,21 @@ Calling the server with a batch submits every prompt, steps until they finish an
 
 With the default dense cache every served request draws the tokens it would draw alone. `prefix_cache` hashes each page together with everything before it, and `Server.reload(variables)` stops sharing the pages the old weights wrote. `Sample(guided.json_schema(tokenizer, schema, eos_id))` or `Sample(guided.regex(tokenizer, pattern, eos_id))` as the task's strategy keeps every draw inside the grammar, served or not. The automaton comes from `outlines-core` (`pip install dewml[guided]`), and a transform that forces a token the grammar forbids fails the request.
 
-On TPU, a paged bfloat16 cache decodes through the Pallas kernel `jax.experimental.pallas.ops.tpu.paged_attention`. It runs when the layer's `attention_impl` is `'auto'` or `'tpu'` and the decode mask is exactly the rows' filled slots, with no window, sinks, image groups, pairwise mask or QK-Clip sow. Every other paged decode gathers its pages and runs the ordinary attention kernels. GPUs always take the gather, because jax deprecated its Triton paged kernel (`ops.gpu.paged_attention`), which on an A100 ran at 5967 tokens/s against the gather's 5848.
+On TPU, a paged bfloat16 cache decodes through the Pallas kernel `jax.experimental.pallas.ops.tpu.paged_attention`. On supported CUDA devices, a full-precision BF16 pool with 16-token-aligned pages uses cuDNN's native paged forward. The GPU path requires `'auto'` or `'cudnn'`, cuDNN-compatible heads, no logit softcap and no reference-only precision request. Both paths require one query per row whose mask is exactly the filled slots, with no window, sinks, image groups, pairwise mask or QK-Clip sow. Grouped pools, quantized storage and other masks keep the existing gather and ordinary attention path. The GPU VJP also uses that gathered path; forward-mode attention uses the existing forward-mode context.
+
+Dense storage remains the default. Paging is opt-in for pooled storage and prefix sharing. On an RTX 4080, Qwen3-0.6B with BF16 storage and compute, 256-token prompts, 128 greedy output tokens with EOS ignored, capacity 384, 16-token pages, admission 8 and one decode iteration per call gave these warm output-token rates (medians of three runs):
+
+| Slots | Old paged gather (tokens/s) | Native GPU paged forward (tokens/s) |
+|---|---:|---:|
+| 32 | 3,242 | 4,719 |
+| 64 | 3,399 | 6,087 |
+| 128 | 3,498 | 7,150 |
+
+These numbers compare the old and new **paged** paths, not the default dense path. All 448 requests' 128 greedy tokens and both likelihood arrays were bit-identical before and after the kernel change. Reordered and shared page tests also preserve the old forward values and VJP exactly, within the existing BF16 bound against float64 truth.
+
+BF16 dense and paged prefill can round differently and change near-tie greedy continuations. Across the same 448 random-token prompts, 143 requests first diverged. Replaying each dense prefix gave a maximum logit difference of 0.732 and a maximum dense top-two gap of 0.223. Full-model float64 evaluations of those prefixes put the paged/dense RMS rounding-error ratio at median 0.996 and maximum 1.896, within the existing two-times-reference bound. The maximum-error ratio was at most 1.597. Triangle inequality therefore bounds the two executions' logit difference by three times dense's float64 maximum error; every first-divergence gap and logit difference was below that per-row envelope. This is BF16 precision sensitivity, not a detected page-table or cache-position error. It is also why paging does not replace the dense default.
+
+Verification records are in `/mnt/scratch/dew/runs/serving-attention`: `native-real.json`, `paged-old.json`, the generation archives, `paged-precision-envelope.json`, and the float64 truth chunks `fp64-chunk0.npz`, `fp64-chunk48.npz`, `fp64-chunk96.npz`. The throughput table predates the separate BF16 vocabulary-head output-rounding change; it holds that arithmetic fixed on both sides.
 
 ### Cache quality
 
@@ -263,4 +346,4 @@ Decode on a tensor axis is bound by the host on these cards. Each step runs 57 a
 
 ## Other runtimes
 
-To serve with vLLM or Ollama instead, export with `save_pretrained_decoder` or `Pretrained.save` and point the runtime at the directory. `OllamaCompletion` and `OpenAICompletion` (`dew.inference`) call those projects' official clients. Their results keep the backend's metadata and do not make up native raw-policy or behavior-policy likelihoods.
+To serve with vLLM or Ollama instead, export with `Pretrained.save` (a trained model through `PretrainedDecoder.from_model`) and point the runtime at the directory. `OllamaCompletion` and `OpenAICompletion` (`dew.inference`) call those projects' official clients. Their results keep the backend's metadata and do not make up native raw-policy or behavior-policy likelihoods.

@@ -1,20 +1,28 @@
 """Train an I-JEPA encoder on Oxford Flowers, probe it, save the encoder.
 
-    python examples/train_jepa.py --data-path /data/oxford_flowers102/2.1.1 --epochs 300
-    python examples/train_jepa.py --data-path /data/oxford_flowers102/2.1.1 --steps 20 --image-size 32 --patch-size 4
+python examples/train_jepa.py --data-path /data/oxford_flowers102/2.1.1 --epochs 300
+python examples/train_jepa.py --data-path /data/oxford_flowers102/2.1.1 \
+    --steps 20 --image-size 32 --patch-size 4
 """
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import optax
 import tyro
 
-from dew.data import OxfordFlowers
+from dew.data import TFDSImages
 from dew.inputs import Field
 from dew.interop import save_params
-from dew.objectives.jepa import JepaObjective, multi_block_mask
-from dew.registry import metrics, models
+from dew.objectives.jepa import (
+    JepaEncoder,
+    JepaObjective,
+    JepaPredictor,
+    KnnProbe,
+    LinearProbe,
+    MultiBlockMask,
+)
 from dew.training import Checkpoints, Trainer
 
 
@@ -35,26 +43,26 @@ class Config:
 
 
 def main(config: Config, data=None):
-    data = data or OxfordFlowers(
+    data = data or TFDSImages(
         path=None if config.data_path is None else str(config.data_path.expanduser()),
         image_size=config.image_size,
     ).load(batch=config.batch_size)
     steps = config.steps or data.epoch_steps(config.epochs)
     side = config.image_size // config.patch_size
     grid = (side, side)
-    encoder = models.build("jepa_encoder", **config.model, patch_size=config.patch_size, dtype="bfloat16")
-    predictor = models.build(
-        "jepa_predictor", grid=grid, emb_features=config.model["emb_features"],
+    encoder = JepaEncoder(**config.model, patch_size=config.patch_size, dtype=jnp.bfloat16)
+    predictor = JepaPredictor(
+        grid=grid, emb_features=config.model["emb_features"],
         num_heads=config.model["num_heads"], predictor_features=config.model["emb_features"] // 2,
-        num_layers=max(1, config.model["num_layers"] // 2), dtype="bfloat16")
-    objective = JepaObjective(encoder, predictor, mask=multi_block_mask(grid),
+        num_layers=max(1, config.model["num_layers"] // 2), dtype=jnp.bfloat16)
+    objective = JepaObjective(encoder, predictor, mask=MultiBlockMask.for_grid(grid),
                               sample=Field("image", (config.image_size, config.image_size, 3)),
                               momentum_steps=steps)
 
     trainer = Trainer(objective, optax.adamw(config.learning_rate), key=jax.random.key(0),
                       checkpoints=Checkpoints(str(config.out / "checkpoints")))
     state = trainer.fit(data, steps=steps, log_every=50, eval_every=steps,
-                        metrics=(metrics.linear_probe(config.classes), metrics.knn_probe(config.classes)))
+                        metrics=(LinearProbe(config.classes), KnnProbe(config.classes)))
 
     config.out.mkdir(parents=True, exist_ok=True)
     save_params(state.averaged["params"]["context_encoder"], config.out / "encoder.safetensors")

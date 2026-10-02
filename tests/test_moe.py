@@ -32,10 +32,10 @@ from jax.sharding import PartitionSpec as P
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import GatedMLP, Mixture
 from dew.nn.moe import ExpertMLP, Router, SparseMLP, load_balance_update
-from dew.objectives.base import Step, scalar_loss
+from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.registry import models
-from dew.training import Layout, MeshSpec, Trainer, build_mesh
+from dew.training import Layout, MeshSpec, Trainer
 from dew.training.distributed import shard_batch
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "moe"
@@ -102,12 +102,12 @@ def mixtral_router(**overrides) -> Router:
 
 def deepseek_router(**overrides) -> Router:
     config = CONFIG["deepseek"]
-    settings = dict(score_function='sigmoid',
-                    normalize_weights=config["norm_topk_prob"],
-                    routed_scaling_factor=config["routed_scaling_factor"],
-                    expert_groups=config["n_group"],
-                    groups_per_token=config["topk_group"],
-                    expert_bias=True)
+    settings = {"score_function": 'sigmoid',
+                    "normalize_weights": config["norm_topk_prob"],
+                    "routed_scaling_factor": config["routed_scaling_factor"],
+                    "expert_groups": config["n_group"],
+                    "groups_per_token": config["topk_group"],
+                    "expert_bias": True}
     settings.update(overrides)
     return Router(num_experts=config["n_routed_experts"],
                   in_features=config["hidden_size"],
@@ -184,9 +184,9 @@ def test_the_selection_bias_never_reaches_the_gate_values():
     hidden = jnp.asarray(tensors["hidden"])
     router = deepseek_router()
     variables = router_variables(tensors, bias=True)
-    weights, indices = router.apply(variables, hidden)
+    (weights, indices), sown = router.apply(variables, hidden, mutable=["router"])
 
-    scores = router.apply(variables, hidden, method=Router.scores)
+    scores = sown["router"]["scores"][0]
     biased = scores + jnp.asarray(tensors["mlp.gate.e_score_correction_bias"])
     scale = config["routed_scaling_factor"]
 
@@ -272,9 +272,9 @@ def test_deepseek_parity_needs_the_shared_branch():
 
 def v4_router(**overrides) -> Router:
     config = CONFIG["deepseek_v4"]
-    settings = dict(score_function='sqrtsoftplus',
-                    routed_scaling_factor=config["routed_scaling_factor"],
-                    expert_bias=True)
+    settings = {"score_function": 'sqrtsoftplus',
+                    "routed_scaling_factor": config["routed_scaling_factor"],
+                    "expert_bias": True}
     settings.update(overrides)
     return Router(num_experts=config["num_local_experts"],
                   in_features=config["hidden_size"],
@@ -527,7 +527,7 @@ def test_float32_expert_routing_with_x64_keeps_its_output_and_gradients():
     bincount defaults to int64 under x64; TPU ragged-dot cannot lower those
     group sizes. Exercise the routed experts, not just a hand-typed count.
     """
-    with jax.enable_x64(False):
+    with jax.enable_x64(new_val=False):
         experts, variables, x, weights, indices = routed_experts(top_k=2)
 
     def step(variables, x):
@@ -602,8 +602,8 @@ def test_routing_that_does_not_describe_the_tokens_is_rejected():
 # --------------------------------------------------------------------------
 
 def decoder_fields(**overrides) -> dict:
-    settings = dict(vocab_size=VOCAB, emb_features=32, num_layers=4, num_heads=2,
-                    num_kv_heads=1, mlp_features=64, max_seq_len=SEQ_LEN)
+    settings = {"vocab_size": VOCAB, "emb_features": 32, "num_layers": 4, "num_heads": 2,
+                    "num_kv_heads": 1, "mlp_features": 64, "max_seq_len": SEQ_LEN}
     settings.update(overrides)
     return settings
 
@@ -619,8 +619,6 @@ def leaf_names(variables):
 
 @pytest.mark.parametrize("settings,expected", [
     ({"mixture": {"experts": 4}}, (0, 1, 2, 3)),
-    ({"mixture": {"experts": 4, "every": 2}}, (1, 3)),
-    ({"mixture": {"experts": 4, "every": 4}}, (3,)),
     ({"mixture": {"experts": 4, "layers": (0, 2)}}, (0, 2)),
     ({}, ()),
 ])
@@ -680,8 +678,8 @@ def test_the_mixture_sizes_the_experts_and_the_shared_branch_apart():
 
 
 @pytest.mark.parametrize("mixture, message", [
-    (dict(experts=8, expert_features=0), "expert_features"),
-    (dict(experts=8, shared_features=-1), "shared_features"),
+    ({"experts": 8, "expert_features": 0}, "expert_features"),
+    ({"experts": 8, "shared_features": -1}, "shared_features"),
 ])
 def test_a_misconfigured_width_is_rejected(mixture, message):
     with pytest.raises(ValueError, match=message):
@@ -728,9 +726,7 @@ def test_the_router_runs_in_fp32_under_a_bfloat16_model():
 
 @pytest.mark.parametrize("mixture,message", [
     ({"experts": 0}, "dense model has no mixture"),
-    ({"experts": 4, "every": 2, "layers": (1,)}, "only"),
     ({"experts": 4, "layers": (4,)}, "outside"),
-    ({"experts": 4, "every": 0}, "positive"),
     ({"experts": 4, "top_k": 5}, "top_k"),
     ({"experts": 4, "implementation": "megablox"}, "implementation"),
 ])
@@ -748,11 +744,11 @@ def test_a_tokamax_mixture_computes_the_xla_mixtures_logits():
     same weights through either kernel give the same logits."""
     pytest.importorskip("tokamax")
     tokens = jax.random.randint(jax.random.key(0), (2, SEQ_LEN), 0, VOCAB)
-    reference = decoder(mixture=Mixture(experts=4, top_k=2, every=2))
+    reference = decoder(mixture=Mixture(experts=4, top_k=2, layers=(1, 3)))
     variables = reference.init(jax.random.key(1), tokens)
     expected = reference.apply(variables, tokens)
     logits = decoder(mixture=Mixture(
-        experts=4, top_k=2, every=2, implementation='tokamax')).apply(variables, tokens)
+        experts=4, top_k=2, layers=(1, 3), implementation='tokamax')).apply(variables, tokens)
 
     # Observed 0 on CPU, where tokamax lowers to the same ragged_dot.
     assert np.max(np.abs(np.asarray(logits) - np.asarray(expected))) < 1e-5
@@ -778,7 +774,7 @@ def expert_specs(expert_size, fsdp_size, num_experts=8, min_shard_size=TINY_SHAR
                       out_features=32)
     variables = jax.eval_shape(
         model.init, jax.random.key(0), jnp.ones((1, 4, 32)))
-    mesh = build_mesh(MeshSpec(fsdp=fsdp_size, expert=expert_size))
+    mesh = MeshSpec(fsdp=fsdp_size, expert=expert_size).build()
     shardings = Layout(min_shard=min_shard_size).shardings(mesh, variables)
     return mesh, jax.tree.map(lambda sharding: sharding.spec, shardings)["params"]
 
@@ -825,7 +821,7 @@ def test_every_expert_parallel_layout_stays_inside_the_sharding_tolerance(
     model = models.build("causal_transformer", **moe_config())
     variables = jax.eval_shape(
         model.init, jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
-    mesh = build_mesh(MeshSpec(fsdp=fsdp_size, expert=expert_size))
+    mesh = MeshSpec(fsdp=fsdp_size, expert=expert_size).build()
     layout = Layout(min_shard=TINY_SHARD)
     shardings = layout.shardings(mesh, variables)
 
@@ -851,7 +847,7 @@ def test_a_mostly_dense_model_on_expert_only_parallelism_is_rejected():
     model = models.build("causal_transformer", **moe_config())
     variables = jax.eval_shape(
         model.init, jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
-    mesh = build_mesh(MeshSpec(fsdp=1, expert=8))
+    mesh = MeshSpec(fsdp=1, expert=8).build()
     layout = Layout(min_shard=TINY_SHARD)
     shardings = layout.shardings(mesh, variables)
 
@@ -860,16 +856,16 @@ def test_a_mostly_dense_model_on_expert_only_parallelism_is_rejected():
 
 
 @pytest.mark.mesh
-def test_build_mesh_rejects_an_expert_size_the_devices_cannot_hold():
+def test_mesh_build_rejects_an_expert_size_the_devices_cannot_hold():
     with pytest.raises(ValueError, match="expert 4"):
-        build_mesh(MeshSpec(fsdp=4, expert=4))
+        MeshSpec(fsdp=4, expert=4).build()
 
 
 @pytest.mark.mesh
 def test_the_batch_is_split_over_the_expert_axis_too():
     """Expert parallelism must not cost data parallelism: every device holds a
     slice of the batch whichever axis it sits on."""
-    mesh = build_mesh(MeshSpec(fsdp=2, expert=4))
+    mesh = MeshSpec(fsdp=2, expert=4).build()
     batch = shard_batch(mesh, np.zeros((jax.device_count(), 4), np.float32))
 
     assert len(batch.addressable_shards) == jax.device_count()
@@ -1007,7 +1003,7 @@ def test_balancing_needs_a_router_with_a_bias():
     trainer.objective.balance_rate = 0.01
     params = trainer.initial_state().params
     with pytest.raises(ValueError, match="bias=True"):
-        scalar_loss(trainer.objective, params, next(token_batches()),
+        trainer.objective.scalar_loss(params, next(token_batches()),
                                Step(step=jnp.asarray(0), key=jax.random.key(0), ema=None))
 
 
@@ -1049,7 +1045,7 @@ def single_device_bias(steps):
     A fresh process is the only way to change the device count, so this
     subprocess runs the same trainer at one device and prints the bias.
     """
-    script = """
+    script = f"""
 import numpy as np, jax, optax
 from dew.registry import models
 import dew.nn.backbones
@@ -1057,16 +1053,16 @@ from dew.objectives.lm import LMObjective
 from dew.training import Trainer, MeshSpec, Layout
 import test_moe as suite
 
-model = models.build("causal_transformer", **{
+model = models.build("causal_transformer", **{{
     **suite.moe_config(),
-    "mixture": {**suite.moe_config()["mixture"], "bias": True}})
+    "mixture": {{**suite.moe_config()["mixture"], "bias": True}}}})
 trainer = Trainer(LMObjective(model, suite.SEQ_LEN, balance_rate=0.01),
                   optax.adam(1e-3), key=jax.random.key(0),
                   mesh=MeshSpec(), layout=Layout(min_shard=suite.TINY_SHARD))
-state = trainer.fit(suite.Data(suite.token_batches), steps=%d)
+state = trainer.fit(suite.Data(suite.token_batches), steps={steps})
 bias = state.params["moe"]["layers_1"]["mlp"]["gate"]["e_score_correction_bias"]
 print(",".join(repr(float(value)) for value in np.asarray(bias)))
-""" % steps
+"""
     environment = {**os.environ, "XLA_FLAGS": "--xla_force_host_platform_device_count=1",
                    "JAX_PLATFORMS": "cpu",
                    "PYTHONPATH": os.pathsep.join(
@@ -1125,7 +1121,7 @@ def test_a_forward_reads_the_expert_kernels_as_stored(experts, dispatch):
     x = jnp.zeros((4, 16, width), jnp.float32)
     shapes = jax.eval_shape(module.init, jax.random.key(0), x)
     variables = jax.tree.map(lambda leaf: jnp.zeros(leaf.shape, jnp.bfloat16), shapes)
-    with jax.set_mesh(build_mesh(MeshSpec(expert=4, fsdp=2))), nn.logical_axis_rules(()):
+    with jax.set_mesh(MeshSpec(expert=4, fsdp=2).build()), nn.logical_axis_rules(()):
         program = str(jax.make_jaxpr(module.apply)(variables, x))
     kernels = [f"{experts},{rows},{columns}" for experts in (8, 2)
                for rows, columns in ((width, hidden), (hidden, width),

@@ -24,13 +24,12 @@ from reference_error import FACTOR, assert_as_exact_as_the_reference
 from safetensors.numpy import load_file
 from scipy.special import log_softmax
 
-from dew.interop import load_pretrained
+from dew.interop import Pretrained
 from dew.interop.codecs import PACKED_MXFP4, decode_e2m1, quantize_packed_mxfp4
-from dew.interop.hf_decoders import _FAMILIES, translate_config
+from dew.interop.hf_decoders import families, translate_config
 from dew.nn.inputs import ModelInputs
 from dew.nn.moe import Situ
 from dew.objectives.base import Step
-
 from dew.registry import models
 from dew.sampling import Sampling, generate
 
@@ -41,9 +40,11 @@ TINY = ROOT / "kimi-k3-tiny"
 
 @pytest.fixture(scope="module")
 def source():
-    loaded = load_pretrained(TINY, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(TINY, dtype="float32", attention_impl="reference")
     with np.load(TINY / "reference.npz") as stored, np.load(TINY / "numerics.npz") as exact:
-        reference = {name: stored[name] for name in stored.files} | {name: exact[name] for name in exact.files}
+        reference = {name: stored[name] for name in stored.files} | {
+            name: exact[name] for name in exact.files
+        }
     inputs = ModelInputs(jnp.asarray(reference["input_ids"], jnp.int32),
                          {"attention_mask": jnp.asarray(reference["attention_mask"], bool)})
     return loaded, inputs, reference
@@ -77,7 +78,7 @@ def test_every_released_tensor_lands_on_one_leaf_of_the_released_tree():
     its zero-padded 128 to the 96 heads), and cover all 2,736 of its leaves,
     before 1.5 TB of weights would be read."""
     config = json.loads((SOURCE / "config.json").read_text())
-    fields, family = translate_config(config), _FAMILIES["kimi_k3"]
+    fields, family = translate_config(config), families()["kimi_k3"]
     model = models.build("causal_transformer", fields)
     shapes = jax.eval_shape(lambda: model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32)))
     tree = {path: leaf.shape for path, leaf in flatten_dict(dict(shapes)).items()}
@@ -85,12 +86,17 @@ def test_every_released_tensor_lands_on_one_leaf_of_the_released_tree():
     decoded = {}
     for name, (dtype, shape) in tensors.items():
         if name.endswith(".weight_packed"):
-            assert dtype == "U8" and tensors[name.removesuffix("packed") + "scale"] == ["U8", [shape[0], shape[1] // 16]]
+            assert dtype == "U8" and tensors[name.removesuffix("packed") + "scale"] == [
+                "U8",
+                [shape[0], shape[1] // 16],
+            ]
             decoded[name.removesuffix("_packed")] = (shape[0], 2 * shape[1])
         elif not name.endswith(".weight_scale"):
             decoded[name] = tuple(shape)
     assert set(PACKED_MXFP4.tensor_names(dict.fromkeys(tensors))) == set(decoded)
-    prepared = family.prepare_weights({name: np.broadcast_to(np.float32(0), shape) for name, shape in decoded.items()})
+    prepared = family.prepare_weights(
+        {name: np.broadcast_to(np.float32(0), shape) for name, shape in decoded.items()}
+    )
     placed, experts, towers = {}, {}, 0
     for name, value in prepared.items():
         path = family.weight_path(name, fields)
@@ -130,7 +136,9 @@ def test_forward_matches_the_reference_over_left_padding(source):
     0.87 on an RTX 4080, 0.89 on an RTX 3090)."""
     loaded, inputs, reference = source
     valid = reference["attention_mask"].astype(bool)
-    logits = jax.jit(lambda variables: loaded.model.apply(variables, inputs.tokens, **inputs.kwargs()))(loaded.variables)
+    logits = jax.jit(lambda variables: loaded.model.apply(variables, inputs.tokens, **inputs.kwargs()))(
+        loaded.variables
+    )
     assert_as_exact_as_the_reference(np.asarray(logits)[valid], reference["logits"][valid],
                                      reference["logits_f64"][valid], "logits")
     np.testing.assert_array_equal(np.asarray(logits)[valid].argmax(-1), reference["logits"][valid].argmax(-1))
@@ -158,24 +166,37 @@ def test_update_exports_the_trained_model_back_in_the_source_layout(source, tmp_
 
     value, gradient = jax.jit(jax.value_and_grad(loss))(loaded.variables["params"])
     np.testing.assert_allclose(value, reference["loss"], atol=1e-5, rtol=0)
-    variables = {**loaded.variables, "params": jax.tree.map(
-        lambda weight, grad: weight - reference["learning_rate"] * grad, loaded.variables["params"], gradient)}
+    variables = {
+        **loaded.variables,
+        "params": jax.tree.map(
+            lambda weight, grad: weight - reference["learning_rate"] * grad,
+            loaded.variables["params"],
+            gradient,
+        ),
+    }
     valid = reference["attention_mask"].astype(bool)
     updated = loaded.model.apply(variables, inputs.tokens, **inputs.kwargs())
     assert_as_exact_as_the_reference(np.asarray(updated)[valid], reference["updated_logits"][valid],
                                      reference["updated_logits_f64"][valid], "updated logits")
 
     loaded.save(tmp_path, variables=variables)
-    written, shipped = load_file(str(tmp_path / "model.safetensors")), load_file(str(TINY / "model.safetensors"))
+    written, shipped = (
+        load_file(str(tmp_path / "model.safetensors")),
+        load_file(str(TINY / "model.safetensors")),
+    )
     assert set(written) == set(shipped)
     for name in shipped:
         if name.startswith(("vision_tower.", "mm_projector.")):
             np.testing.assert_array_equal(written[name], shipped[name])
         if name.endswith("A_log"):
             assert written[name].shape == shipped[name].shape and not written[name][2:].any()
-    assert written["language_model.model.layers.1.block_sparse_moe.experts.0.w1.weight_packed"].dtype == np.uint8
-    assert json.loads((tmp_path / "config.json").read_text()) == json.loads((TINY / "config.json").read_text())
-    restored = load_pretrained(tmp_path, dtype="float32", attention_impl="reference")
+    assert (
+        written["language_model.model.layers.1.block_sparse_moe.experts.0.w1.weight_packed"].dtype == np.uint8
+    )
+    assert json.loads((tmp_path / "config.json").read_text()) == json.loads(
+        (TINY / "config.json").read_text()
+    )
+    restored = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
     trained = flatten_dict(variables, sep=".")
     for name, after in flatten_dict(dict(restored.variables), sep=".").items():
         before = np.asarray(trained[name])
@@ -202,7 +223,9 @@ def test_greedy_generation_and_decode_steps_match_the_reference(source):
     np.testing.assert_array_equal(np.asarray(generated.tokens)[:, -4:], reference["generated"][:, -4:])
     exact = np.take_along_axis(log_softmax(reference["step_logits_f64"], -1),
                                reference["generated"][:, -4:, None], -1)[..., 0]
-    assert np.max(np.abs(np.asarray(generated.raw_log_probs, np.float64)[:, :4] - exact)) <= 2 * FACTOR * error
+    assert (
+        np.max(np.abs(np.asarray(generated.raw_log_probs, np.float64)[:, :4] - exact)) <= 2 * FACTOR * error
+    )
 
 
 def test_cached_prefill_and_token_steps_are_as_exact_as_the_reference(source):
@@ -217,7 +240,9 @@ def test_cached_prefill_and_token_steps_are_as_exact_as_the_reference(source):
     out, state = model.apply({**variables, **state}, ids[:, :40], decode=True, mutable=["cache"])
     pieces = [np.asarray(out)]
     for index in range(40, ids.shape[1]):
-        out, state = model.apply({**variables, **state}, ids[:, index:index + 1], decode=True, mutable=["cache"])
+        out, state = model.apply(
+            {**variables, **state}, ids[:, index : index + 1], decode=True, mutable=["cache"]
+        )
         pieces.append(np.asarray(out))
     assert_as_exact_as_the_reference(np.concatenate(pieces, axis=1)[0], reference["logits"][0],
                                      reference["logits_f64"][0], "cached decode")
@@ -242,14 +267,17 @@ def test_a_quantization_scheme_other_than_mxfp4_is_refused(tmp_path):
     config["text_config"]["quantization_config"]["config_groups"]["group_0"]["weights"]["group_size"] = 16
     (directory / "config.json").write_text(json.dumps(config))
     with pytest.raises(ValueError, match="group_size"):
-        load_pretrained(directory, dtype="float32", attention_impl="reference")
+        Pretrained.load(directory, dtype="float32", attention_impl="reference")
 
 
 def test_a_nonzero_a_log_pad_is_refused():
-    family = _FAMILIES["kimi_k3"]
+    family = families()["kimi_k3"]
     stem = "language_model.model.layers.0.self_attn."
-    tensors = {stem + "A_log": np.array([0.5, 0.25, 0.0, 1.0], np.float32),
-               stem + "dt_bias": np.zeros(8, np.float32), stem + "f_a_proj.weight": np.zeros((4, 3), np.float32)}
+    tensors = {
+        stem + "A_log": np.array([0.5, 0.25, 0.0, 1.0], np.float32),
+        stem + "dt_bias": np.zeros(8, np.float32),
+        stem + "f_a_proj.weight": np.zeros((4, 3), np.float32),
+    }
     with pytest.raises(ValueError, match="nonzero"):
         family.prepare_weights(tensors)
     tensors[stem + "A_log"][3] = 0

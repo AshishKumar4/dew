@@ -3,7 +3,7 @@
 Network-marked, so an ordinary `-m "not network"` run deselects it, and it
 skips rather than fails without a server. Nothing downloads: the served
 model is a tiny Llama-layout export from a real Dew run, and the reference
-side reads those same files back through `load_pretrained`.
+side reads those same files back through `Pretrained.load`.
 
 What is held to account is `OpenAICompletion(provider="vllm")` against a
 real vLLM engine: asked for the model's own argmax, the server reproduces
@@ -43,12 +43,13 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-openai = pytest.importorskip("openai", reason="optional inference-clients extra")
-
 from dew.inference import OpenAICompletion
-from dew.interop import Pretrained, load_pretrained
+from dew.interop import Pretrained
 from dew.nn.inputs import ModelInputs
 from dew.sampling.text import Sampling, generate
+
+openai = pytest.importorskip("openai", reason="optional inference-clients extra")
+
 
 pytestmark = pytest.mark.network
 
@@ -91,7 +92,7 @@ def reference(client):
     from transformers import AutoTokenizer
 
     return (AutoTokenizer.from_pretrained(client.model, local_files_only=True),
-            load_pretrained(client.model, dtype="float32", attention_impl="xla"))
+            Pretrained.load(client.model, dtype="float32", attention_impl="xla"))
 
 
 @pytest.fixture(scope="module")
@@ -157,7 +158,7 @@ def test_top_k_top_p_and_min_p_reach_the_servers_sampler(client, continuation):
     of a model with nothing to choose.
     """
     def drawn(**controls: int | float) -> str:
-        return client(PROMPTS[0], DRAWN, seed=1234,
+        return client(PROMPTS[0], DRAWN, key=1234,
                       sampling=Sampling(temperature=1.0, **controls)).texts[0]
 
     assert drawn(top_k=1) == continuation
@@ -236,7 +237,7 @@ def test_streaming_replays_the_completion_it_would_have_returned(client, continu
 def test_chat_carries_the_template_the_export_does_not(client, continuation):
     """The gap between a served export and a chat endpoint.
 
-    `save_pretrained_decoder` writes no chat template, so vLLM has nothing
+    `PretrainedDecoder.from_model(...).save` writes no chat template, so vLLM has nothing
     to render a conversation with and refuses one. A request that carries
     its own template is answered, whole or streamed, and with a template
     that renders the turn as the bare prompt the answer is the completion's

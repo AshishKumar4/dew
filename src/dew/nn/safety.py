@@ -3,7 +3,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype
 
-from dew.nn.text_encoders import CLIPTowerOutput, CLIPVisionTransformer
+from dew.nn.text_encoders import CLIPVisionTransformer
 
 
 class CLIPSafetyHead(nn.Module):
@@ -24,16 +24,22 @@ class CLIPSafetyHead(nn.Module):
 
     def setup(self):
         self.visual_projection = nn.Dense(self.projection_dim, use_bias=False, dtype=self.dtype)
-        self.concept_embeds = self.param("concept_embeds", nn.initializers.ones, (self.concepts, self.projection_dim))
-        self.special_care_embeds = self.param("special_care_embeds", nn.initializers.ones, (self.special_concepts, self.projection_dim))
-        self.concept_embeds_weights = self.param("concept_embeds_weights", nn.initializers.ones, (self.concepts,))
-        self.special_care_embeds_weights = self.param("special_care_embeds_weights", nn.initializers.ones, (self.special_concepts,))
+        self.concept_embeds = self.param(
+            "concept_embeds", nn.initializers.ones, (self.concepts, self.projection_dim)
+        )
+        self.special_care_embeds = self.param(
+            "special_care_embeds", nn.initializers.ones, (self.special_concepts, self.projection_dim)
+        )
+        self.concept_embeds_weights = self.param(
+            "concept_embeds_weights", nn.initializers.ones, (self.concepts,)
+        )
+        self.special_care_embeds_weights = self.param(
+            "special_care_embeds_weights", nn.initializers.ones, (self.special_concepts,)
+        )
 
     def features(self, pixels):
         """Project the vision tower's pooled output into the concept space."""
-        output = self.vision_model(pixels)
-        assert isinstance(output, CLIPTowerOutput)
-        return self.visual_projection(output.pooler_output)
+        return self.visual_projection(self.vision_model(pixels).pooler_output)
 
     def __call__(self, pixels):
         images = self.features(pixels)

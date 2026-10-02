@@ -23,8 +23,8 @@ VOCAB = 32
 SEQ_LEN = 8
 PROMPT = 5
 NEW_TOKENS = 3
-FIELDS = dict(vocab_size=VOCAB, emb_features=16, num_layers=4, num_heads=4,
-              num_kv_heads=2, mlp_features=32, max_seq_len=SEQ_LEN)
+FIELDS = {"vocab_size": VOCAB, "emb_features": 16, "num_layers": 4, "num_heads": 4,
+              "num_kv_heads": 2, "mlp_features": 32, "max_seq_len": SEQ_LEN}
 # Far below the production threshold, so a two-process mesh shards anything.
 TINY_SHARD = 4
 
@@ -40,8 +40,11 @@ def layouts(tensor: int):
     from dew.training import Layout
     from dew.training.distributed import DEFAULT_RULES
 
-    rules = DEFAULT_RULES if tensor == 1 else (
-        ("mlp", "tensor"),) + tuple(rule for rule in DEFAULT_RULES if rule[0] != "mlp")
+    rules = (
+        DEFAULT_RULES
+        if tensor == 1
+        else (("mlp", "tensor"), *tuple(rule for rule in DEFAULT_RULES if rule[0] != "mlp"))
+    )
     return (Layout(rules=rules, min_shard=TINY_SHARD, tolerance=1.0),
             Layout(rules=rules, min_shard=TINY_SHARD, tolerance=1.0,
                    host_parameters=("params/layers_*",)))
@@ -78,7 +81,7 @@ def banked(args) -> dict:
     import jax.numpy as jnp
     import numpy as np
 
-    from dew.inference.banks import HeldBanks, host_banked
+    from dew.inference.banks import HeldBanks
     from dew.registry import models
     from dew.sampling.text import Sampling, generate
     from dew.training import MeshSpec
@@ -93,13 +96,13 @@ def banked(args) -> dict:
         jnp.int32)
     variables = plain.init(jax.random.key(0), tokens)
 
-    resident = host_banked(scanned, HeldBanks(variables), mesh=mesh, layout=resident_layout)
-    on_host = host_banked(scanned, HeldBanks(variables), mesh=mesh, layout=host_layout)
+    resident = HeldBanks(variables).place(scanned, mesh=mesh, layout=resident_layout)
+    on_host = HeldBanks(variables).place(scanned, mesh=mesh, layout=host_layout)
     resident_logits = local(scanned.apply(resident, tokens))
     host_logits = local(scanned.apply(on_host, tokens))
     sampling = Sampling(temperature=0.0)
-    resident_tokens = generate(scanned, resident, tokens, NEW_TOKENS, seed=0, sampling=sampling)
-    host_tokens = generate(scanned, on_host, tokens, NEW_TOKENS, seed=0, sampling=sampling)
+    resident_tokens = generate(scanned, resident, tokens, NEW_TOKENS, key=0, sampling=sampling)
+    host_tokens = generate(scanned, on_host, tokens, NEW_TOKENS, key=0, sampling=sampling)
 
     record = {
         "processes": jax.process_count(),
@@ -129,7 +132,7 @@ def _checkpointed(args, scanned, plain, tokens, mesh, resident_layout, host_layo
     import optax
 
     from dew.checkpoints import Checkpoints
-    from dew.inference.banks import CheckpointBanks, host_banked
+    from dew.inference.banks import CheckpointBanks
     from dew.objectives.lm import LMObjective
     from dew.training import Trainer
 
@@ -147,9 +150,8 @@ def _checkpointed(args, scanned, plain, tokens, mesh, resident_layout, host_layo
     checkpoints.save(int(state.step), state, None, metrics={"loss": 1.0})
     checkpoints.wait()
 
-    resident = host_banked(scanned, CheckpointBanks(directory), mesh=mesh,
-                           layout=resident_layout)
-    on_host = host_banked(scanned, CheckpointBanks(directory), mesh=mesh, layout=host_layout)
+    resident = CheckpointBanks(directory).place(scanned, mesh=mesh, layout=resident_layout)
+    on_host = CheckpointBanks(directory).place(scanned, mesh=mesh, layout=host_layout)
     from_resident = local(scanned.apply(resident, tokens))
     from_host = local(scanned.apply(on_host, tokens))
     return {

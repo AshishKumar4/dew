@@ -8,7 +8,7 @@ consecutive layers whose specs agree, which `nn.scan` stacks into one group.
 """
 
 import dataclasses
-from typing import Mapping, Sequence
+from collections.abc import Mapping, Sequence
 
 from dew.registry import mixers
 
@@ -75,10 +75,10 @@ class ResolvedKind:
     """One kind of layer with the model's defaults filled in.
 
     `LayerKind` is what a config states, so a field it leaves to the model is
-    None there. This is what the model resolved it to, so `rope_theta` and
-    `head_dim` are numbers; only the window stays optional, because attending
-    the whole sequence is what a kind without one does. `mixer` passes
-    through: it needs no resolution, only the model's default when unset.
+    None there. This is what the model resolved it to, so `num_kv_heads`,
+    `rope_theta` and `head_dim` are numbers; the window, the chunk and the
+    rotary ramps stay optional, as a kind may have none. `mixer` passes
+    through, the model's default applying when unset.
     """
 
     window: int | None
@@ -173,3 +173,6 @@ def group_layers(name: str) -> range | None:
         return None
     first, last = int(parts[0]), int(parts[-1])
     return range(first, last + 1)
+
+
+__all__ = ["LayerKind", "LayerSpec", "ResolvedKind"]

@@ -1,28 +1,27 @@
 """Engram: n-gram hash lookups written into the residual streams.
 
 DeepSeek-V4.1 (arXiv 2609.19969, section 2.4.2) adds Engram (Cheng et al.
-2026) at a few layers. The reference is the release's inference code,
-`engram.py` and `Engram` in `model.py` (DEEPSEEK_V41_REVISION in
-tools/deepseek_v41_reference.py). Per position:
+2026) at a few layers; the reference is the release's `engram.py` and
+`model.py` (DEEPSEEK_V41_REVISION in tools/deepseek_v41_reference.py). Per
+position:
 
-1. Every token id maps through a compressed vocabulary in which tokens that
-   normalize alike share an id (`compressed_token_map`, engram.py:17-55).
+1. Every token id maps through a compressed vocabulary of normalized ids
+   (`compressed_token_map`, engram.py:17-55).
 2. The position and the `max_ngram_size - 1` compressed ids before it make
-   one n-gram of each size from 2 up. Look-back stops at the sequence start
-   and at a dead token (an image span); the missing slots hold the pad id's
+   one n-gram of each size from 2 up; look-back stops at the sequence start
+   and at a dead token (an image span), and missing slots hold the pad id's
    compressed id (engram.py:155-170).
-3. Each engram layer multiplies the look-back ids by its own odd multipliers
-   and XORs them: after `i` steps the value hashes the `(i + 1)`-gram. Each
-   (n-gram size, head) pair reduces it modulo its own prime and offsets it
-   into its bucket range of the layer's table (engram.py:172-180).
-4. The layer looks the rows up, projects them into one key per residual
-   stream and a shared value, and gates the value into each stream by the
+3. Each layer multiplies the look-back ids by its own odd multipliers and
+   XORs them, so after `i` steps the value hashes the `(i + 1)`-gram; each
+   (n-gram size, head) reduces it modulo its prime and offsets it into its
+   bucket range (engram.py:172-180).
+4. The layer projects the looked-up rows into one key per residual stream
+   and a shared value, gated into each stream by a sigmoid of the
    sign-preserving square root of the stream's normalized dot product with
-   its key, through a sigmoid (model.py:328-365).
+   its key (model.py:328-365).
 
-The hashes are 64-bit integer arithmetic in the reference. Here they run on
-8-bit limbs in uint32 so they stay exact without x64: a compressed id and
-every prime stay under 2**24, which the spec checks.
+The reference hashes in 64-bit integers; here 8-bit limbs in uint32 stay
+exact without x64, since every compressed id and prime stays under 2**24.
 """
 
 from __future__ import annotations
@@ -93,11 +92,6 @@ class Engram:
                 f"engram_num_embeddings {self.num_embeddings} are not the tables the "
                 f"bucket primes lay out, {declared}")
 
-    @property
-    def columns(self) -> int:
-        """Hash ids per position and layer: one per (n-gram size, head)."""
-        return (self.max_ngram_size - 1) * self.n_heads
-
     @functools.cached_property
     def primes(self) -> tuple[tuple[tuple[int, ...], ...], ...]:
         """`[layer][n-gram size][head]` bucket moduli: the next unused prime
@@ -130,7 +124,8 @@ class Engram:
         return np.stack(rows)
 
     def hash_ids(self, compressed, blocked, pad):
-        """Every engram layer's bucket ids, `[B, S, layers, columns]` int32.
+        """Every engram layer's bucket ids, `[B, S, layers, columns]` int32,
+        a column per (n-gram size, head).
 
         `compressed` `[B, S, max_ngram_size]` holds each position's compressed
         id and its look-back, nearest first, with `blocked` marking the slots
@@ -213,15 +208,12 @@ class EngramHashes(nn.Module):
     """Every engram layer's bucket ids for a call's tokens,
     `[B, S, layers, columns]` (engram.py:153-180).
 
-    Tokens map through the compressed vocabulary, the `constants`
-    collection's `token_map`: a loaded checkpoint derives it from its
-    tokenizer (`compressed_token_map`), and a fresh model maps each id to
-    itself modulo the compressed vocabulary's size. Each position hashes
-    with the valid tokens before it: padding is skipped, and look-back stops
-    at a row's start, at a packed document's (`positions`), at a `media`
-    position (an image span, dead as in engram.py:164-166) and, while
-    decoding, where the cached history of the row's earlier calls runs out.
-    Padding positions get ids nothing reads.
+    Tokens map through the `constants` collection's `token_map`, which a loaded
+    checkpoint derives from its tokenizer and a fresh model fills with each id
+    modulo the compressed vocabulary. Each position hashes with the valid tokens
+    before it, skipping padding and stopping at a row's start, a packed
+    document's (`positions`), a `media` position (engram.py:164-166) and, while
+    decoding, where the cached history runs out.
     """
 
     spec: Engram
@@ -265,12 +257,11 @@ class EngramLayer(nn.Module):
     """One layer's lookup gated into the residual streams (model.py:328-365).
 
     `embed` `[rows, head_dim]` is the release's `engram.embed.weight`; `wkv`
-    projects the `columns` rows to `hc_mult` keys and one value; `q_weight`
+    projects a position's looked-up rows to `hc_mult` keys and one value; `q_weight`
     and `k_weight` `[hc_mult, D]` only ever act as their product.
     """
 
     rows: int
-    columns: int
     head_dim: int
     hc_mult: int
     emb_features: int
@@ -287,8 +278,12 @@ class EngramLayer(nn.Module):
         looked = table(hash_ids).astype(dtype).reshape(*hash_ids.shape[:2], -1)
         kv = nn.Dense(self.emb_features * (self.hc_mult + 1), use_bias=False, dtype=self.dtype,
                       precision=self.precision, name='wkv')(looked)
-        q_weight = self.param('q_weight', nn.initializers.ones, (self.hc_mult, self.emb_features), jnp.float32)
-        k_weight = self.param('k_weight', nn.initializers.ones, (self.hc_mult, self.emb_features), jnp.float32)
+        q_weight = self.param(
+            "q_weight", nn.initializers.ones, (self.hc_mult, self.emb_features), jnp.float32
+        )
+        k_weight = self.param(
+            "k_weight", nn.initializers.ones, (self.hc_mult, self.emb_features), jnp.float32
+        )
         wide = at_least_fp32(kv.dtype)
         key = kv[..., :self.hc_mult * self.emb_features].astype(wide).reshape(
             *kv.shape[:2], self.hc_mult, self.emb_features)

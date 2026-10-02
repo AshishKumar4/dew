@@ -60,8 +60,9 @@ import optax
 import tyro
 from jax.sharding import Mesh
 
-from dew import models  # naming a registry fills it
-from dew.data import preferences
+import dew.nn.backbones  # noqa: F401  (registers the kind)
+import dew.nn.backbones.jepa  # noqa: F401  (registers the kind)
+from dew.data import DataPartition, preferences
 from dew.data.chat import ROLES_KEY, Role
 from dew.diffusion import presets
 from dew.diffusion.discrete import MDLM
@@ -69,9 +70,11 @@ from dew.diffusion.process import DenoisingCondition
 from dew.inputs import CharTable, Condition, Field, InputSpec
 from dew.inputs.encoders import ConditionEncoder
 from dew.nn.backbones.flux import FluxTransformer
+from dew.nn.backbones.flux2 import Flux2Transformer
 from dew.nn.backbones.qwen_image import QwenImageTransformer
 from dew.nn.backbones.sd3 import SD3Transformer
 from dew.nn.backbones.unet_condition import UNet2DCondition
+from dew.nn.backbones.z_image import ZImageTransformer
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.inputs import ModelInputs
 from dew.nn.multimodal import MultimodalTransformer, VisionConditioner
@@ -79,14 +82,14 @@ from dew.nn.vision import ProjectorBase, TowerBase
 from dew.objectives.base import Objective, Variables
 from dew.objectives.diffusion import BlockDiffusionObjective, DiffusionObjective
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
-from dew.objectives.jepa import JepaObjective, multi_block_mask
+from dew.objectives.jepa import JepaObjective, MultiBlockMask
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl import DPOObjective, GRPOObjective, sessions
-from dew.registry import float64_twin, projectors, resolve_dtype, towers, with_precision
+from dew.registry import float64_twin, models, projectors, resolve_dtype, towers, with_precision
 from dew.telemetry.instrumentation import model_flops_utilization
 from dew.telemetry.profile import capture_options
-from dew.training import Layout, MeshSpec, Trainer, build_mesh
-from dew.training.distributed import DevicePrefetchIterator, data_partition
+from dew.training import Layout, MeshSpec, Trainer
+from dew.training.distributed import DevicePrefetchIterator
 from dew.training.runtime import prepare_process
 from dew.training.trainer import remat_record
 
@@ -107,34 +110,39 @@ class _DenoisingTextTable(ConditionEncoder[str]):
     """Synthetic token and pooled features for native diffusion models."""
 
     def __init__(self, table: CharTable, features: int, pooled_features: int | None,
-                 guidance: float | None):
+                 guidance: float | None, masked: bool = False):
         self.table = table
         self.params = table.params
         self.features = features
         self.pooled_features = pooled_features
         self.guidance = guidance
+        self.masked = masked
+        """Whether the condition marks the real tokens, as Z-Image reads them."""
 
     @classmethod
     def from_pretrained(cls, checkpoint: str = "char_table", *, tokens: int = TEXT_TOKENS,
                         features: int = TEXT_FEATURES, pooled_features: int | None = None,
-                        guidance: float | None = None, vocab: int = 130, seed: int = 0, dtype=None):
+                        guidance: float | None = None, masked: bool = False, vocab: int = 130, seed: int = 0,
+                        dtype=None):
         return cls(CharTable.from_pretrained(checkpoint, tokens=tokens,
                                             features=max(features, pooled_features or 0),
                                             vocab=vocab, seed=seed, dtype=dtype),
-                   features, pooled_features, guidance)
+                   features, pooled_features, guidance, masked)
 
     def tokenize(self, data: Sequence[str]) -> Mapping[str, np.ndarray]:
         return self.table.tokenize(data)
 
     def encode(self, params: Variables, tokens) -> DenoisingCondition:
-        hidden = self.table.encode(params, tokens).hidden
+        text = self.table.encode(params, tokens)
+        hidden = text.hidden
         pooled = None if self.pooled_features is None else hidden[:, 0, :self.pooled_features]
         guidance = None if self.guidance is None else jnp.full((hidden.shape[0],), self.guidance)
-        return DenoisingCondition(hidden[..., :self.features], pooled, guidance=guidance)
+        return DenoisingCondition(hidden[..., :self.features], pooled, guidance=guidance,
+                                  mask=jnp.asarray(text.mask, bool) if self.masked else None)
 
     def to_json(self) -> dict:
         return {**self.table.to_json(), "features": self.features, "pooled_features": self.pooled_features,
-                "guidance": self.guidance}
+                "guidance": self.guidance, "masked": self.masked}
 
 
 @dataclass(frozen=True)
@@ -146,6 +154,9 @@ class Case:
     dtype: str | None = None
     """Compute dtype, written into the model config by the precision policy;
     None takes the run's --dtype."""
+    matmul_precision: str | None = None
+    """What every matmul asks XLA for (`ModelConfig.matmul_precision`), written
+    into a model that declares `precision`; None keeps the model's own."""
     batch_size: int = 8
     accumulation: int = 1
     """Microbatches of `batch_size` rows the trainer pools into one optimizer
@@ -413,7 +424,7 @@ def cpu_smoke_cases() -> list[Case]:
                     "tower": {"kind": "siglip", "hidden_size": 32, "intermediate_size": 64,
                               "num_layers": 1, "num_heads": 2, "image_size": 16,
                               "patch_size": 8},
-                    "projector": {"kind": "gemma", "vision_width": 32, "text_width": 32,
+                    "projector": {"kind": "gemma", "text_width": 32,
                                   "patches_per_side": 2, "tokens_per_side": 2}},
              batch_size=8, seq_len=15, fsdp_min_param_size=256),
         Case("diffusion_gemma", {**tiny_decoder, "layer_scalar": "frozen"},
@@ -465,6 +476,15 @@ def small_cases(dtype: str) -> list[Case]:
         Case("qwen_image_transformer", {"in_channels": 16, "out_channels": 16, "num_layers": 3,
                                          "heads": 6, "head_dim": 64, "axes_dims_rope": (16, 24, 24)},
              batch_size=4, image_size=32, channels=16),
+        # FLUX.2 reads three stacked encoder layers, so its context is three
+        # text widths wide. Each rotary splits the 64 head channels.
+        Case("flux2_transformer", {"num_layers": 3, "num_single_layers": 3, "heads": 6, "head_dim": 64,
+                                    "joint_attention_dim": 3 * TEXT_FEATURES,
+                                    "axes_dims_rope": (16, 16, 16, 16)},
+             batch_size=4, image_size=32, channels=128),
+        Case("z_image_transformer", {"dim": 384, "n_layers": 3, "n_refiner_layers": 1, "n_heads": 6,
+                                      "cap_feat_dim": TEXT_FEATURES, "axes_dims": (16, 24, 24)},
+             batch_size=4, image_size=32, channels=16),
         Case("uvit", {key: value for key, value in dit.items() if key != "mlp_ratio"},
              batch_size=16, image_size=64),
         Case("simple_udit", {**dit, "num_layers": 6}, batch_size=16, image_size=64),
@@ -487,7 +507,7 @@ def small_cases(dtype: str) -> list[Case]:
         # The same decoder with an 8-expert, top-2 feed-forward on every second
         # layer, which is the sparse shape the 4.7 acceptance run trains
         Case("causal_transformer",
-             {**decoder, "mixture": {"experts": 8, "top_k": 2, "every": 2}},
+             {**decoder, "mixture": {"experts": 8, "top_k": 2, "layers": (1,)}},
              batch_size=16, seq_len=512),
         # The same decoder as a vision-conditioned one: SigLIP-so400m's widths
         # at four layers over a 448px crop, pooled to the 256 soft tokens
@@ -503,7 +523,7 @@ def small_cases(dtype: str) -> list[Case]:
                     "tower": {"kind": "siglip", "hidden_size": 1152,
                               "intermediate_size": 4304, "num_layers": 4,
                               "num_heads": 16, "image_size": 448, "patch_size": 14},
-                    "projector": {"kind": "gemma", "vision_width": 1152, "text_width": 768,
+                    "projector": {"kind": "gemma", "text_width": 768,
                                   "patches_per_side": 32, "tokens_per_side": 16}},
              batch_size=8, seq_len=512),
         # The same decoder read both ways by the official DiffusionGemma
@@ -548,6 +568,10 @@ class BenchmarkConfig:
     stay fp32 either way."""
     attention_impl: Literal['auto', 'reference', 'xla', 'cudnn', 'tpu'] = 'auto'
     """Attention kernel, through the same precision policy a recipe uses."""
+    fixed_batch: bool = False
+    """Reuse one placed batch in every step, as tools/benchmark_torch.py does
+    without --h2d. Unset, each step takes a fresh placement of the host batch
+    from DevicePrefetchIterator, as Trainer.fit does."""
     xla_flags: str | None = None
     """Appended to XLA_FLAGS before the first JAX call, as TrainerConfig.xla_flags
     is. A flag only takes effect in a process that has not opened a backend
@@ -653,7 +677,8 @@ def build_objective(case: Case, attention_impl: str = 'auto', *, widened: bool =
         dtype = case.dtype
 
     def built(architecture: str, config: Mapping[str, object]):
-        fields = with_precision(architecture, config, dtype=dtype, attention_impl=attention_impl)
+        fields = with_precision(architecture, config, dtype=dtype, attention_impl=attention_impl,
+                                matmul_precision=case.matmul_precision)
         return models.build(architecture, **(float64_twin(fields) if widened else fields))
 
     sample_key = "video" if case.frames else "image"
@@ -681,7 +706,7 @@ def build_objective(case: Case, attention_impl: str = 'auto', *, widened: bool =
         grid = (case.image_size // patch, case.image_size // patch)
         objective = JepaObjective(
             model, built("jepa_predictor", {**case.predictor, "grid": grid}),
-            multi_block_mask(grid, num_targets=2, scale=(0.2, 0.3)),
+            MultiBlockMask.for_grid(grid, num_targets=2, scale=(0.2, 0.3)),
             sample=Field(sample_key, case.sample_shape))
     else:
         model = built(case.architecture, case.config)
@@ -689,6 +714,15 @@ def build_objective(case: Case, attention_impl: str = 'auto', *, widened: bool =
         if isinstance(model, QwenImageTransformer):
             keyword = "conditioning"
             encoder = _DenoisingTextTable.from_pretrained()
+            preset = presets.Flow()
+        elif isinstance(model, ZImageTransformer):
+            keyword = "conditioning"
+            encoder = _DenoisingTextTable.from_pretrained(features=model.cap_feat_dim, masked=True)
+            preset = presets.Flow()
+        elif isinstance(model, Flux2Transformer):
+            keyword = "conditioning"
+            encoder = _DenoisingTextTable.from_pretrained(
+                features=model.joint_attention_dim, guidance=3.5 if model.guidance_embeds else None)
             preset = presets.Flow()
         elif isinstance(model, (SD3Transformer, FluxTransformer)):
             keyword = "conditioning"
@@ -718,7 +752,7 @@ def build_trainer(case: Case, attention_impl: str = 'auto',
         accumulation=case.accumulation, checkpoints=None, tracker=None)
     if case.device_order is not None:
         by_id = {device.id: device for device in jax.devices()}
-        trainer.device_mesh = build_mesh(trainer.mesh, [by_id[index] for index in case.device_order])
+        trainer.device_mesh = trainer.mesh.build([by_id[index] for index in case.device_order])
     return trainer
 
 
@@ -826,9 +860,9 @@ def global_batch(case: Case) -> Batch:
 def batches(case: Case, mesh: Mesh) -> Iterator[Batch]:
     """This process's share of one host batch, reused: the loader is
     benchmarked by benchmark_data.py. Every process draws the same global
-    batch and keeps the rows of the share `data_partition` names, as many
+    batch and keeps the rows of the share `DataPartition.of` names, as many
     as a loader would read."""
-    partition = data_partition(mesh)
+    partition = DataPartition.of(mesh)
     rows = partition.rows(case.batch_size)
     start = partition.index * rows
     mine = jax.tree.map(lambda leaf: leaf[start:start + rows], global_batch(case))
@@ -988,7 +1022,8 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
         compile_seconds = time.perf_counter() - compile_start
 
         def step(state):
-            state, loss, _, finite, _ = compiled(state, next(source))
+            batch = initial_batch if config.fixed_batch else next(source)
+            state, loss, _, finite, _ = compiled(state, batch)
             return state, loss, finite
 
         # At least one warm step, so the first dispatch of the executable is
@@ -1061,6 +1096,7 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
             "canvases_per_row": 0 if case.canvas is None else canvas_split(case)[2],
             "dtype": case.dtype,
             "attention_impl": config.attention_impl,
+            "fixed_batch": config.fixed_batch,
             "xla_flags": config.xla_flags,
             "devices": trainer.device_mesh.devices.size,
             "device_kind": jax.devices()[0].device_kind,

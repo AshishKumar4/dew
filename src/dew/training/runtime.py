@@ -9,6 +9,7 @@ main().
 from __future__ import annotations
 
 import importlib.util
+import logging
 import os
 import resource
 import signal
@@ -36,6 +37,8 @@ from dew.pool import (
 from dew.telemetry.devices import apply_xla_flags, xla_flag
 from dew.telemetry.instrumentation import enable_compilation_cache
 
+_log = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
     from dew.config import Wandb
     from dew.training.distributed import Layout
@@ -61,11 +64,61 @@ def prepare_process(wandb: Wandb | None = None,
                     xla_flags: str | None = None,
                     compilation_cache_dir: str | None = None,
                     *, layout: Layout | None = None) -> None:
-    """Raise the fd/core limits, set the env vars, join the JAX process pool.
+    """Set the env vars and XLA flags, raise the fd/core limits, join the JAX
+    process pool.
 
     `wandb` is the run's `dew.config.Wandb`, or None for a run without a
     tracker. Only its offline switch is read, and it has to be read before
-    wandb opens a run.
+    wandb opens a run. `multi_host` decides whether the process joins a pool
+    (`_join_process_pool`).
+
+    xla_flags reaches XLA through the environment, which XLA reads when it
+    opens a backend. So this call has to come before the first JAX call in
+    the process, which makes it a recipe's first line. A library user, who
+    never runs a recipe, sets XLA_FLAGS in the environment.
+
+    The same Layout passed to Trainer selects CPU transaction ownership when
+    host includes params. JAX_PLATFORMS must then permit CPU beside the
+    accelerator. JAX_NUM_CPU_DEVICES, or the existing XLA flags, must
+    establish one CPU device per local accelerator before this call.
+    Validation never changes backend configuration after initialization.
+    """
+    _set_environment(wandb, xla_flags, compilation_cache_dir)
+    _raise_limits()
+    _join_process_pool(multi_host)
+    if layout is not None and "params" in layout.host:
+        from dew.training.distributed import MeshSpec
+        from dew.training.host import companion_mesh
+        companion_mesh(MeshSpec().build())
+    _log.info("Number of devices: %s", jax.device_count())
+
+
+def _set_environment(wandb: Wandb | None, xla_flags: str | None,
+                     compilation_cache_dir: str | None) -> None:
+    """The env vars wandb and the tokenizers read, the run's XLA flags and
+    Dew's defaults beside them, and the compilation cache: everything read
+    before a backend opens."""
+    if wandb is not None and wandb.offline:
+        os.environ['WANDB_MODE'] = 'offline'
+    # HF tokenizers fork a thread pool; grain's workers fork the process.
+    os.environ['TOKENIZERS_PARALLELISM'] = "false"
+    apply_xla_flags(xla_flags)
+    unpartition_gpu_pool()
+    if compilation_cache_dir:
+        enable_compilation_cache(compilation_cache_dir)
+
+
+def _raise_limits() -> None:
+    """Unlimited core files, and room for the descriptors data loaders and
+    checkpoints open."""
+    resource.setrlimit(
+        resource.RLIMIT_CORE,
+        (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
+    resource.setrlimit(resource.RLIMIT_NOFILE, (65535, 65535))
+
+
+def _join_process_pool(multi_host: bool | None) -> None:
+    """Join the JAX process pool the environment describes, if any.
 
     jax.distributed.initialize() finds the coordinator from the environment on
     TPU pods and Slurm/GKE/Open MPI clusters. `dew launch` leaves the process
@@ -84,38 +137,7 @@ def prepare_process(wandb: Wandb | None = None,
     A Slurm step of several tasks with fewer on this node than the GPUs its
     task sees is refused: JAX gives each task the GPU at its SLURM_LOCALID,
     and the others would sit idle.
-
-    xla_flags reaches XLA through the environment, which XLA reads when it
-    opens a backend. So this call has to come before the first JAX call in
-    the process, which makes it a recipe's first line. A library user, who
-    never runs a recipe, sets XLA_FLAGS in the environment.
-
-    The same Layout passed to Trainer selects CPU transaction ownership when
-    host includes params. JAX_PLATFORMS must then permit CPU beside the
-    accelerator. JAX_NUM_CPU_DEVICES, or the existing XLA flags, must
-    establish one CPU device per local accelerator before this call.
-    Validation never changes backend configuration after initialization.
-
-    A GPU pool keeps the persistent compilation cache when its jax keys a
-    computation that spans processes alike on every one of them, as the jax
-    constraints.txt names does (`_pool_keys_alike`). With another jax, such
-    as the 0.11.2 release, it compiles without the cache and says so on every
-    process: some ranks would load a step that the others compile, and that
-    compile waits for every rank for ever.
     """
-    if wandb is not None and wandb.offline:
-        os.environ['WANDB_MODE'] = 'offline'
-    # HF tokenizers fork a thread pool; grain's workers fork the process.
-    os.environ['TOKENIZERS_PARALLELISM'] = "false"
-    apply_xla_flags(xla_flags)
-    if compilation_cache_dir:
-        enable_compilation_cache(compilation_cache_dir)
-
-    resource.setrlimit(
-        resource.RLIMIT_CORE,
-        (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
-    resource.setrlimit(resource.RLIMIT_NOFILE, (65535, 65535))
-
     # The cluster JAX's detection would take, in its own order: Open MPI's
     # ranks when mpirun started them, then Slurm's tasks.
     cluster = None if multi_host is False or PROCESS_COUNT in os.environ else detected_cluster()
@@ -127,53 +149,81 @@ def prepare_process(wandb: Wandb | None = None,
         # Before joining: a pool whose ranks see GPUs they will not use
         # trains on fewer than it was given, and nothing reports it.
         refuse_idle_gpus(tasks, local_gpu_count(), "this slurm step")
-    if multi_host is not False and not one_task:
-        try:
-            if PROCESS_COUNT in os.environ:
-                jax.distributed.initialize(num_processes=int(os.environ[PROCESS_COUNT]),
-                                           process_id=int(os.environ[PROCESS_ID]),
-                                           cluster_detection_method="deactivate")
-            else:
-                jax.distributed.initialize()
-        except ValueError as e:
-            if multi_host or "coordinator_address" not in str(e):
-                raise
+    if multi_host is False or one_task:
+        return
+    try:
+        if PROCESS_COUNT in os.environ:
+            jax.distributed.initialize(num_processes=int(os.environ[PROCESS_COUNT]),
+                                       process_id=int(os.environ[PROCESS_ID]),
+                                       cluster_detection_method="deactivate")
         else:
-            # Before the backend opens, which can fail on one process of a
-            # pool that has formed, a GPU with no memory left for one. The
-            # watch leaves through os._exit, past the atexit handlers, which
-            # only a peer waiting in a collective justifies; a pool of one
-            # process keeps Python's own exit. The count is the pool's as it
-            # formed: jax.process_count() would open the backend.
-            if global_state.num_processes > 1:
-                end_pool_on_failure()
-            # XLA reads its flags when the backend opens, which the first
-            # line below does. The watchdog is the CUDA plugin's, and a TPU
-            # host's libtpu need not know its flag.
-            if cuda_plugin() and xla_flag("xla_gpu_execution_terminate_timeout") is None:
-                apply_xla_flags(f"--xla_gpu_execution_terminate_timeout={EXECUTION_TIMEOUT}")
-            print(f"Joined the JAX process pool: process {jax.process_index()} "
-                  f"of {jax.process_count()}")
-            if jax.process_count() > 1 and jax.default_backend() == "gpu" and not _pool_keys_alike():
-                # Before the first compile, which fixes whether the cache is used.
-                jax.config.update("jax_enable_compilation_cache", val=False)
-                print("This jax keys a computation that spans processes apart on each of them "
-                      "(jax-ml/jax#40940), so the pool compiles without the persistent compilation "
-                      "cache; docs/installation.md names the jax that keeps it")
-            # One collective while the processes are still in lockstep;
-            # initialize() returns on every process once the last one has
-            # connected. On CPU, collectives rendezvous through the
-            # coordinator with a 30 second deadline. Without this the first
-            # collective would fall inside orbax's checkpoint-manager barrier
-            # in the trainer. By then the processes are as far apart as a
-            # wandb init and their model builds, and one that arrives late
-            # dies in gloo before the run can report it.
-            multihost_utils.sync_global_devices("dew process pool joined")
-    if layout is not None and "params" in layout.host:
-        from dew.training.distributed import build_mesh
-        from dew.training.host import companion_mesh
-        companion_mesh(build_mesh())
-    print(f"Number of devices: {jax.device_count()}")
+            jax.distributed.initialize()
+    except ValueError as e:
+        if multi_host or "coordinator_address" not in str(e):
+            raise
+    else:
+        _joined()
+
+
+def _joined() -> None:
+    """What a process does once it has joined the pool.
+
+    A GPU pool keeps the persistent compilation cache when its jax keys a
+    computation that spans processes alike on every one of them, as the jax
+    constraints.txt names does (`_pool_keys_alike`). With another jax, such
+    as the 0.11.2 release, it compiles without the cache and says so on every
+    process: some ranks would load a step that the others compile, and that
+    compile waits for every rank for ever.
+    """
+    # Before the backend opens, which can fail on one process of a
+    # pool that has formed, a GPU with no memory left for one. The
+    # watch leaves through os._exit, past the atexit handlers, which
+    # only a peer waiting in a collective justifies; a pool of one
+    # process keeps Python's own exit. The count is the pool's as it
+    # formed: jax.process_count() would open the backend.
+    if global_state.num_processes > 1:
+        end_pool_on_failure()
+    # XLA reads its flags when the backend opens, which the first
+    # line below does. The watchdog is the CUDA plugin's, and a TPU
+    # host's libtpu need not know its flag.
+    if cuda_plugin() and xla_flag("xla_gpu_execution_terminate_timeout") is None:
+        apply_xla_flags(f"--xla_gpu_execution_terminate_timeout={EXECUTION_TIMEOUT}")
+    _log.info(
+        "Joined the JAX process pool: process %s of %s", jax.process_index(), jax.process_count()
+    )
+    if jax.process_count() > 1 and jax.default_backend() == "gpu" and not _pool_keys_alike():
+        # Before the first compile, which fixes whether the cache is used.
+        jax.config.update("jax_enable_compilation_cache", val=False)
+        _log.warning("This jax keys a computation that spans processes apart on each of them "
+                     "(jax-ml/jax#40940), so the pool compiles without the persistent compilation "
+                     "cache; docs/installation.md names the jax that keeps it")
+    # One collective while the processes are still in lockstep;
+    # initialize() returns on every process once the last one has
+    # connected. On CPU, collectives rendezvous through the
+    # coordinator with a 30 second deadline. Without this the first
+    # collective would fall inside orbax's checkpoint-manager barrier
+    # in the trainer. By then the processes are as far apart as a
+    # wandb init and their model builds, and one that arrives late
+    # dies in gloo before the run can report it.
+    multihost_utils.sync_global_devices("dew process pool joined")
+
+
+def unpartition_gpu_pool() -> None:
+    """Turn off XLA's spatial partitioning of a preallocated GPU pool,
+    unless the run named it.
+
+    There a step's temporaries can lose their block between steps
+    (`dew.training.trainer.strands_temporaries`). The partitioning lets the
+    pool's upper end hold XLA's collective memory space
+    (xla/pjrt/gpu/se_gpu_pjrt_client.cc, `GetStreamExecutorGpuDeviceAllocator`
+    at openxla/xla 91888df, the commit jax 0.11.2 builds), which a buffer
+    takes only for NCCL user or symmetric buffers, a one-shot ragged
+    all-to-all or a Mosaic kernel's symmetric operand
+    (xla/service/gpu/gpu_memory_space_assignment.cc); Dew asks for none of
+    them. With it off XLA serves that space from an allocator of its own, and
+    steps ran as fast on an A100 (a DiT and a decoder within 0.5%)."""
+    if cuda_plugin() and xla_flag("xla_gpu_enable_allocator_spatial_partitioning") is None:
+        apply_xla_flags("--xla_gpu_enable_allocator_spatial_partitioning=false")
 
 
 def _pool_keys_alike() -> bool:
@@ -269,3 +319,6 @@ def run_timestamp() -> str:
     later would write into a different directory.
     """
     return broadcast_from_process_zero(datetime.now().strftime("%Y-%m-%d_%H:%M:%S"))
+
+
+__all__ = ["Preempted", "PreemptionNotice", "prepare_process", "run_timestamp"]

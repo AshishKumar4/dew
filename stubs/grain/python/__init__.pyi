@@ -40,9 +40,17 @@ class RandomMapTransform(abc.ABC):
         """Maps a single element: any record in, any record out."""
 
 
-Transformation: TypeAlias = RandomMapTransform
-"""What a data pipeline step is, of the kinds dew runs: a random map. Batching
-and sharding are the iterator's, not a transformation's."""
+class MapTransform(abc.ABC):
+    """One deterministic 1:1 record transformation (grain's `transforms.Map`)."""
+
+    @abc.abstractmethod
+    def map(self, element: Any) -> Any:
+        """Maps a single element: any record in, any record out."""
+
+
+Transformation: TypeAlias = RandomMapTransform | MapTransform
+"""What a data pipeline step is, of the kinds dew runs: a map, random or not.
+Batching and sharding are the iterator's, not a transformation's."""
 
 
 class MapDataset(Generic[T]):
@@ -66,11 +74,13 @@ class MapDataset(Generic[T]):
     def __getitem__(self, index: int) -> T | None: ...
     @property
     def _parent(self) -> MapDataset[T]: ...
+    @property
+    def parents(self) -> Sequence[MapDataset[Any]]: ...
     def seed(self, seed: int) -> MapDataset[T]: ...
     def apply(
         self, transformations: Transformation | Sequence[Transformation]
     ) -> MapDataset[Any]: ...
-    def map(self, transform: Callable[[T], S]) -> MapDataset[S]: ...
+    def map(self, transform: MapTransform | Callable[[T], S]) -> MapDataset[S]: ...
     def map_with_index(self, transform: Callable[[int, T], S]) -> MapDataset[S]: ...
     def slice(self, sl: builtins.slice) -> MapDataset[T]: ...
     def repeat(
@@ -107,6 +117,7 @@ class IterDataset(Generic[T]):
         | Sequence[MapDataset[Any] | IterDataset[Any]] = ()
     ) -> None: ...
     def __iter__(self) -> DatasetIterator[T]: ...
+    def map(self, transform: MapTransform | Callable[[T], S]) -> IterDataset[S]: ...
     def random_map(
         self,
         transform: RandomMapTransform | Callable[[T, np.random.Generator], S],

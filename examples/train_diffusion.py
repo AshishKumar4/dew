@@ -7,18 +7,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import optax
 import tyro
 from PIL import Image
 
 from dew.artifacts import uint8_pixels
-from dew.data import OxfordFlowers
+from dew.data import TFDSImages
 from dew.diffusion import presets
 from dew.inputs import CLIPText, Condition, Field, InputSpec
 from dew.interop import save_hf_layout
+from dew.nn.backbones import SimpleDiT
 from dew.objectives.diffusion import DiffusionObjective
-from dew.registry import models
 from dew.sampling import CFG, Heun
 from dew.training import Checkpoints, MeshSpec, Trainer
 
@@ -48,15 +49,14 @@ def text_conditioned_inputs(image_size: int) -> InputSpec:
 
 def main(config: Config, data=None, inputs=None):
     inputs = inputs or text_conditioned_inputs(config.image_size)
-    data = data or OxfordFlowers(
+    data = data or TFDSImages(
         path=None if config.data_path is None else str(config.data_path.expanduser()),
         image_size=config.image_size,
     ).load(batch=config.batch_size, tokenize=inputs.tokenize)
     steps = config.steps or data.epoch_steps(config.epochs)
-    fields = dict(config.model, output_channels=3, dtype="bfloat16")
-    model = models.build("simple_dit", **fields)
+    model = SimpleDiT(**config.model, output_channels=3, dtype=jnp.bfloat16)
     objective = DiffusionObjective(model, presets.EDM(regime="pixel"), inputs,
-                                   sampler=Heun(), guidance=CFG(3.0), steps=40)
+                                   solver=Heun(), guidance=CFG(3.0), steps=40)
 
     trainer = Trainer(objective, optax.adamw(config.learning_rate), key=jax.random.key(0),
                       mesh=MeshSpec(fsdp=config.fsdp),
@@ -66,13 +66,15 @@ def main(config: Config, data=None, inputs=None):
     # The averaged weights stay on
     # the trainer's mesh, prompts split over it, and host() reads the rows back.
     pipe = objective.pipeline(state)
-    images = pipe(list(config.prompts), steps=50, guidance=3.0, sampler=Heun(), seed=1).host().images
+    images = pipe(list(config.prompts), steps=50, guidance=3.0, solver=Heun(), key=1).host().images
     pixels = uint8_pixels(images)
     grid = np.concatenate(list(pixels), axis=1)
     config.out.mkdir(parents=True, exist_ok=True)
     Image.fromarray(grid).save(config.out / "samples.png")
 
-    save_hf_layout(state.averaged["params"], {"architecture": "simple_dit", **fields}, config.out / "export")
+    save_hf_layout(state.averaged["params"],
+                   {"architecture": "simple_dit", **config.model, "output_channels": 3, "dtype": "bfloat16"},
+                   config.out / "export")
     return state
 
 

@@ -11,21 +11,21 @@ from __future__ import annotations
 
 import functools
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from functools import partial
-from typing import Generic, overload
+from typing import Generic
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import struct
 from jax.experimental import multihost_utils
+from typing_extensions import TypeVar
 
 from dew.artifacts import agreed
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.inputs import (
-    ArrayT,
     ModelInputs,
     RowPlan,
     agreed_validity,
@@ -37,6 +37,8 @@ from dew.nn.inputs import (
     request_key,
 )
 from dew.objectives.base import Variables
+
+ArrayT = TypeVar("ArrayT", bound=jax.Array | np.ndarray, default=jax.Array, covariant=True)
 
 
 @struct.dataclass
@@ -62,8 +64,9 @@ class CanvasGeneration(Generic[ArrayT]):
     decoder_steps: ArrayT
     rows: int | None = struct.field(pytree_node=False, default=None)
     prompt_width: int | None = struct.field(pytree_node=False, default=None)
-    decoder: Callable[[jax.typing.ArrayLike, jax.typing.ArrayLike, int], tuple[str, ...]] | None = struct.field(
-        pytree_node=False, default=None)
+    decoder: Callable[[jax.typing.ArrayLike, jax.typing.ArrayLike, int], tuple[str, ...]] | None = (
+        struct.field(pytree_node=False, default=None)
+    )
 
     def host(self) -> CanvasGeneration[np.ndarray]:
         """This process's real rows as host arrays, without the padding a
@@ -139,6 +142,14 @@ class BlockProcess:
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be positive and finite")
 
+    def to_json(self) -> dict:
+        import dataclasses
+        return dataclasses.asdict(self)
+
+    @classmethod
+    def from_json(cls, record: Mapping) -> BlockProcess:
+        return cls(**record)
+
     def temperature(self, remaining: jax.typing.ArrayLike) -> jax.Array:
         return self.t_min + (self.t_max - self.t_min) * jnp.asarray(remaining) / self.max_steps
 
@@ -204,21 +215,10 @@ class BlockProcess:
 
         return jax.lax.fori_loop(0, self.max_steps, step, initial)
 
-    @overload
-    def generate(self, model: DiffusionGemma, variables: Variables,
-                 inputs: ModelInputs | jax.typing.ArrayLike | Sequence[Sequence[int]],
-                 max_new_tokens: int, *, key: jax.Array, seed: None = None, n: int = 1,
-                 eos_token_ids: tuple[int, ...] = (), pad_token_id: int = 0) -> CanvasGeneration: ...
-
-    @overload
-    def generate(self, model: DiffusionGemma, variables: Variables,
-                 inputs: ModelInputs | jax.typing.ArrayLike | Sequence[Sequence[int]],
-                 max_new_tokens: int, *, key: None = None, seed: int, n: int = 1,
-                 eos_token_ids: tuple[int, ...] = (), pad_token_id: int = 0) -> CanvasGeneration: ...
 
     def generate(self, model: DiffusionGemma, variables: Variables,
                  inputs: ModelInputs | jax.typing.ArrayLike | Sequence[Sequence[int]],
-                 max_new_tokens: int, *, key: jax.Array | None = None, seed: int | None = None,
+                 max_new_tokens: int, *, key: int | jax.Array | None = None,
                  n: int = 1, eos_token_ids: tuple[int, ...] = (), pad_token_id: int = 0) -> CanvasGeneration:
         """Runs prefill, refinement and clean-token commits as one device
         computation.
@@ -239,7 +239,7 @@ class BlockProcess:
         own key, so it is what a single continuation draws.
         """
         def resolve() -> tuple[jax.Array, ModelInputs]:
-            request = request_key(key, seed)
+            request = request_key(key)
             canonical = ModelInputs.from_value(inputs)
             prepared = jax.tree.map(lambda leaf: local_rows(leaf, host=False), canonical)
             _validated(model, self, prepared, max_new_tokens, eos_token_ids, pad_token_id, n)

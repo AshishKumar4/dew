@@ -1,0 +1,201 @@
+"""Python training saves the model/task declaration with its own checkpoint."""
+import inspect
+
+import grain.python as grain
+import jax
+import jax.numpy as jnp
+import numpy as np
+import optax
+import pytest
+
+from dew.checkpoints import Checkpoints
+from dew.config import ModelConfig
+from dew.data import Dataset, Loading
+from dew.diffusion import schedules, transforms
+from dew.diffusion.process import Process
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.objectives.lm import LMObjective
+from dew.training import Trainer
+
+
+def model():
+    return CausalTransformer(vocab_size=16, emb_features=16, num_layers=1, num_heads=2,
+                             mlp_features=32, max_seq_len=16, dtype='float32', attention_impl='xla')
+
+
+def test_live_model_record_rebuilds_exact_constructor_fields():
+    original = model()
+    rebuilt = ModelConfig.from_model(original).build()
+    assert rebuilt == original.clone(dtype=jnp.float32)
+    tokens = jnp.arange(1, 9)[None, :]
+    variables = original.init(jax.random.key(0), tokens)
+    np.testing.assert_array_equal(original.apply(variables, tokens), rebuilt.apply(variables, tokens))
+
+
+def test_python_lm_run_saves_its_inference_record_without_run_json(tmp_path):
+    objective = LMObjective(model(), seq_len=8, ema_decay=None)
+    rows = [{'text': np.arange(9, dtype=np.int32)} for _ in range(16)]
+    data = Dataset.from_grain(grain.MapDataset.source(rows), batch=8, loading=Loading(workers=0))
+    checkpoints = Checkpoints(str(tmp_path / 'run'))
+    trainer = Trainer(objective, optax.sgd(.01), key=0, checkpoints=checkpoints)
+    state = trainer.fit(data, steps=2, log_every=2, checkpoint_every=1)
+    checkpoints.wait()
+    assert not (tmp_path / 'run' / 'run.json').exists()
+    record = Checkpoints(str(tmp_path / 'run')).artifact(2)
+    assert record['objective'] == 'lm'
+    assert record['seq_len'] == 8
+    from dew.interop import Pretrained, PretrainedDecoder, PretrainedMaskedDecoder
+    bundle = Pretrained.from_run(tmp_path / 'run')
+    assert isinstance(bundle, PretrainedDecoder)
+    with pytest.raises(TypeError, match='PretrainedDecoder source, not a PretrainedMaskedDecoder'):
+        PretrainedMaskedDecoder.from_run(tmp_path / 'run')
+    rebuilt = ModelConfig.from_dict(record['model']).build()
+    assert rebuilt == objective.model.clone(dtype=jnp.float32)
+    assert record['tokenizer'] is None
+    from dew.inference import TextGeneration
+    task = TextGeneration.from_run(str(tmp_path / 'run'), ema=False)
+    assert task.processor is None
+    tokens = jnp.arange(1, 9)[None, :]
+    expected = objective.model.apply(state.params, tokens)
+    actual = task.model.apply(task.variables, tokens)
+    np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+
+
+def test_builtin_process_records_preserve_noise_prediction_and_weights():
+    from dew.diffusion.presets import EDM, Cosine, Flow
+    for preset in (EDM(regime='pixel'), Flow(), Cosine()):
+        original = preset()
+        rebuilt = Process.from_json(original.to_json())
+        time = jnp.linspace(.01, .99, 16)
+        np.testing.assert_array_equal(original.schedule.rates(time)[0], rebuilt.schedule.rates(time)[0])
+        np.testing.assert_array_equal(original.schedule.rates(time)[1], rebuilt.schedule.rates(time)[1])
+        np.testing.assert_array_equal(original.weight(time), rebuilt.weight(time))
+        rates = original.schedule.rates(time)
+        clean, noise = jnp.ones((16, 1)), jnp.full((16, 1), .2)
+        np.testing.assert_array_equal(original.prediction.get_target(clean, noise, rates),
+                                      rebuilt.prediction.get_target(clean, noise, rates))
+        np.testing.assert_array_equal(original.prediction.get_input_scale(rates),
+                                      rebuilt.prediction.get_input_scale(rates))
+
+
+def test_builtin_autoencoder_record_uses_the_saved_parameters():
+    from dew.nn.autoencoders import AutoEncoder, AutoencoderKL, StableDiffusionVAE
+    image = jnp.ones((1, 8, 8, 3))
+    module = AutoencoderKL(channels=(4,), latent_channels=2, blocks_per_level=1, norm_groups=1,
+                           dtype=jnp.float32)
+    variables = module.init(jax.random.key(0), image)
+    original = StableDiffusionVAE(model=module, params=variables['params'], dtype=jnp.float32)
+    rebuilt = AutoEncoder.from_json(original.to_json(), params=original.params)
+    np.testing.assert_array_equal(original.encode(original.params, image),
+                                  rebuilt.encode(rebuilt.params, image))
+    latent = original.encode(original.params, image)
+    np.testing.assert_array_equal(original.decode(original.params, latent),
+                                  rebuilt.decode(rebuilt.params, latent))
+
+
+def test_masked_run_returns_its_own_bundle_kind(tmp_path):
+    from dew.diffusion.discrete import MDLM
+    from dew.interop import Pretrained, PretrainedMaskedDecoder
+    from dew.objectives.diffusion.masked import MaskedDiffusionObjective
+
+    masked = model().clone(causal=False, mask_token_id=0, qk_norm=False)
+    objective = MaskedDiffusionObjective(masked, MDLM(mask_id=0)(), 8,
+                                        head_chunks=1, ema_decay=None, steps=2)
+    source = grain.MapDataset.source([{'text': np.arange(1, 9, dtype=np.int32)}] * 8)
+    data = Dataset.from_grain(source, batch=8, loading=Loading(workers=0))
+    trainer = Trainer(objective, optax.sgd(.01), key=jax.random.key(0),
+                      checkpoints=Checkpoints(str(tmp_path / 'run')))
+    trainer.fit(data, steps=1, log_every=1, checkpoint_every=1)
+    bundle = Pretrained.from_run(tmp_path / 'run')
+    assert isinstance(bundle, PretrainedMaskedDecoder)
+    assert bundle.model.mask_token_id == 0
+
+
+def process_components():
+
+    classes = [getattr(schedules, name) for name in schedules.__all__]
+    classes += [value for name, value in vars(transforms).items()
+                if not name.startswith('_') and inspect.isclass(value)
+                and value.__module__ == transforms.__name__]
+    return [cls for cls in classes if inspect.isclass(cls) and not inspect.isabstract(cls)
+            and cls.__name__ != 'Weighting']
+
+
+@pytest.mark.parametrize('component', process_components(), ids=lambda cls: cls.__name__)
+def test_every_builtin_process_component_round_trips_nondefaults(component):
+
+    arguments = {}
+    for name, parameter in inspect.signature(component).parameters.items():
+        default = parameter.default
+        if name == 'betas':
+            value = np.linspace(.003, .03, 37, dtype=np.float32)
+        elif name == 'inner':
+            value = transforms.DirectPredictionTransform(normalize_input=True)
+        elif name == 'timesteps':
+            value = 37
+        elif name == 'gamma':
+            value = 3.7
+        elif name == 'threshold':
+            value = (.7, 1.8)
+        elif name == 'density':
+            value = 'mode'
+        elif default is None:
+            value = 1.3
+        elif isinstance(default, bool):
+            value = not default
+        elif isinstance(default, (int, float)):
+            value = default * .8 if default else .2
+        else:
+            raise AssertionError(f'uncovered constructor parameter: {component.__name__}.{name}')
+        arguments[name] = value
+    value = component(**arguments)
+    schedule = schedules.FlowMatchingScheduler(shift=1.7)
+    prediction = transforms.DirectPredictionTransform()
+    if isinstance(value, schedules.NoiseScheduler):
+        schedule = value
+    elif isinstance(value, transforms.PredictionTransform):
+        prediction = value
+    weighting = value if isinstance(value, (transforms.ScheduleWeighting, transforms.MinSNR,
+                                            transforms.VelocityLoss)) else transforms.ScheduleWeighting()
+    original = Process(schedule=schedule, prediction=prediction, weighting=weighting)
+    rebuilt = Process.from_json(original.to_json())
+    time = jnp.linspace(.01, .99, 16)
+    for method in ('rates', 'weight', 'model_time'):
+        left, right = getattr(original.schedule, method)(time), getattr(rebuilt.schedule, method)(time)
+        jax.tree.map(np.testing.assert_array_equal, left, right)
+    key = jax.random.key(3)
+    np.testing.assert_array_equal(original.schedule.sample_t(key, 16), rebuilt.schedule.sample_t(key, 16))
+    rates = original.schedule.rates(time)
+    clean, noise = jnp.ones(16), jnp.full(16, .25)
+    jax.tree.map(np.testing.assert_array_equal,
+                 original.prediction.forward_diffusion(clean, noise, rates),
+                 rebuilt.prediction.forward_diffusion(clean, noise, rates))
+    np.testing.assert_array_equal(original.prediction.pred_transform(clean, noise, rates, time),
+                                  rebuilt.prediction.pred_transform(clean, noise, rates, time))
+    np.testing.assert_array_equal(original.weight(time), rebuilt.weight(time))
+    if type(original.prediction) is not transforms.PredictionTransform:
+        jax.tree.map(np.testing.assert_array_equal,
+                     original.prediction.backward_diffusion(clean, noise, rates),
+                     rebuilt.prediction.backward_diffusion(clean, noise, rates))
+
+
+def test_python_diffusion_checkpoint_preserves_its_solver(tmp_path):
+    from dew.diffusion.presets import Flow
+    from dew.inference import TextToImage
+    from dew.inputs import Field, InputSpec
+    from dew.nn.backbones.dit import SimpleDiT
+    from dew.objectives.diffusion import DiffusionObjective
+    from dew.sampling.solvers import Euler
+
+    model = SimpleDiT(patch_size=2, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1,
+                      output_channels=1, dtype=jnp.float32)
+    objective = DiffusionObjective(model, Flow(), InputSpec(Field('image', (4, 4, 1))),
+                                   solver=Euler(), steps=2, ema_decay=None)
+    source = grain.MapDataset.source([{'image': np.ones((4, 4, 1), np.float32)}] * 8)
+    data = Dataset.from_grain(source, batch=8, loading=Loading(workers=0))
+    trainer = Trainer(objective, optax.sgd(.01), key=0, checkpoints=Checkpoints(str(tmp_path / 'run')))
+    trainer.fit(data, steps=1, log_every=1, checkpoint_every=1)
+    trainer.checkpoints.wait()
+    loaded = TextToImage.from_run(str(tmp_path / 'run'))
+    assert isinstance(loaded.solver, Euler)
+    assert loaded.steps == 2

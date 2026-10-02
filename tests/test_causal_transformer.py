@@ -15,8 +15,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
 
-from dew.nn.attention import NormalAttention, scaled_dot_product_attention
+from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.mixers import AttentionMixer
 from dew.objectives.lm.chunked import head_logits
@@ -27,13 +28,175 @@ SEQ = 12
 
 
 def tiny(**overrides):
-    config = dict(vocab_size=VOCAB, emb_features=32, num_layers=2, num_heads=4,
-                  mlp_features=64, max_seq_len=16)
+    config = {"vocab_size": VOCAB, "emb_features": 32, "num_layers": 2, "num_heads": 4,
+                  "mlp_features": 64, "max_seq_len": 16}
     return CausalTransformer(**{**config, **overrides})
 
 
 def tokens(rng, batch=2, length=SEQ):
     return jax.random.randint(rng, (batch, length), 0, VOCAB)
+
+
+@pytest.mark.parametrize("fields,causal,message", [
+    ({"head_dim": 3}, True, "head dim"),
+    ({"window": 0}, True, "window"),
+    ({"chunk": 0}, True, "chunk"),
+    ({"window": 2, "chunk": 2}, True, "one or the other"),
+    ({"chunk": 2}, False, "not causal"),
+    ({"num_kv_heads": 3}, True, "multiple"),
+    ({"num_kv_heads": 0}, True, "multiple"),
+])
+def test_layer_kinds_refuse_invalid_rotary_mask_and_grouped_head_geometry(fields, causal, message):
+    with pytest.raises(ValueError, match=message):
+        model = tiny(num_layers=1, layer_types=("special",), kinds={"special": fields}, causal=causal)
+        model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+@pytest.mark.parametrize("field", ["embedding_dropout_rate", "attention_dropout_rate"])
+def test_decoder_dropout_is_training_only(rng, field):
+    base = tiny(dropout_rate=0, attention_impl="reference")
+    ids = tokens(rng, length=4)
+    params = base.init(rng, ids)
+    active = tiny(dropout_rate=0, attention_impl="reference", **{field: .5})
+    first = active.apply(params, ids, train=True, rngs={"dropout": jax.random.key(10)})
+    second = active.apply(params, ids, train=True, rngs={"dropout": jax.random.key(11)})
+    assert not np.array_equal(first, second)
+    expected = np.asarray(base.apply(params, ids, train=False))
+    for key in (10, 11):
+        evaluated = np.asarray(active.apply(params, ids, train=False, rngs={"dropout": jax.random.key(key)}))
+        assert evaluated.tobytes() == expected.tobytes()
+
+
+@pytest.mark.parametrize("geometry", [{"layer_types": ("local", "local"), "kinds": {"local": {"window": 2}}},
+                                     {"layer_types": ("local", "local"), "kinds": {"local": {"chunk": 2}}},
+                                     {"num_kv_heads": 2}])
+def test_attention_dropout_reaches_local_and_grouped_heads(rng, geometry):
+    model = tiny(attention_dropout_rate=.5, attention_impl="reference", **geometry)
+    ids = tokens(rng, length=4)
+    params = model.init(rng, ids)
+    one = model.apply(params, ids, train=True, rngs={"dropout": jax.random.key(1)})
+    two = model.apply(params, ids, train=True, rngs={"dropout": jax.random.key(2)})
+    assert not jnp.array_equal(one, two)
+    baseline = tiny(attention_impl="reference", **geometry).apply(params, ids)
+    evaluated = model.apply(params, ids)
+    assert np.asarray(evaluated).tobytes() == np.asarray(baseline).tobytes()
+
+
+def test_old_decoder_record_keeps_zero_dropout_and_bitwise_outputs():
+    from flax.traverse_util import unflatten_dict
+    from jax import export
+
+    from dew.config import ModelConfig
+
+    config = {"vocab_size": 17, "emb_features": 8, "num_layers": 1, "num_heads": 2,
+                  "mlp_features": 16, "max_seq_len": 8}
+    model = ModelConfig("causal_transformer", config=config, dtype="float32",
+                        matmul_precision="highest", attention_impl="reference").build()
+    assert model.embedding_dropout_rate == model.attention_dropout_rate == 0
+    directory = Path(__file__).with_name("fixtures")
+    held = np.load(directory / "decoder-default-dropout.npz")
+    try:
+        before = export.deserialize((directory / "decoder-default-dropout.jaxexport").read_bytes())
+    except Exception as error:
+        pytest.fail(f"cannot deserialize the pre-dropout forward/gradient export: {error}")
+    with jax.default_device(jax.devices("cpu")[0]):
+        ids = jnp.asarray(held["ids"])
+        params = unflatten_dict({tuple(name.split("/")[1:]): jnp.asarray(leaf)
+                                 for name, leaf in held.items() if name.startswith("params/")})
+
+        def forward_and_gradient(params, ids):
+            forward = model.apply(params, ids, train=True)
+            gradient = jax.grad(lambda p: jnp.sum(model.apply(p, ids, train=True)))(params)
+            return forward, gradient
+
+        expected = before.call(params, ids)
+        actual = jax.jit(forward_and_gradient)(params, ids)
+        assert jax.tree.structure(actual) == jax.tree.structure(expected)
+        for left, right in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
+            assert np.asarray(left).tobytes() == np.asarray(right).tobytes()
+
+
+def test_embedding_dropout_matches_flax_on_the_same_draw(rng):
+    class Reference(nn.Module):
+        @nn.compact
+        def __call__(self, x, train):
+            return nn.Dropout(.5, name="embedding_dropout")(x, deterministic=not train)
+
+    model = tiny(embedding_dropout_rate=.5)
+    ids = tokens(rng, length=4)
+    params = model.init(rng, ids)
+    embeddings = model.apply(params, ids, method=CausalTransformer.token_embeddings)
+    reference = Reference()
+    expected = reference.apply({}, embeddings, train=True, rngs={"dropout": rng})
+    actual = model.apply(params, embeddings, method=lambda module, values:
+                         module.embedding_dropout(values, deterministic=False), rngs={"dropout": rng})
+    assert np.asarray(actual).tobytes() == np.asarray(expected).tobytes()
+    evaluated = model.apply(params, embeddings, method=lambda module, values:
+                            module.embedding_dropout(values, deterministic=True))
+    assert np.asarray(evaluated).tobytes() == np.asarray(embeddings).tobytes()
+
+
+def test_attention_probability_dropout_matches_flax_on_the_same_draw(rng):
+    query = jnp.zeros((1, 4, 2, 4), jnp.float32)
+    value = jnp.broadcast_to(jnp.eye(4)[None, :, None, :], (1, 4, 2, 4))
+    mask = jnp.tril(jnp.ones((4, 4), bool))[None, None]
+    expected = nn.dot_product_attention(query, query, value, mask=mask, dropout_rate=.5,
+                                        dropout_rng=rng, broadcast_dropout=False, deterministic=False)
+    actual = scaled_dot_product_attention(query, query, value, causal=True, implementation="reference",
+                                          dropout_rate=.5, dropout_rng=rng, deterministic=False)
+    assert np.asarray(actual).tobytes() == np.asarray(expected).tobytes()
+    probabilities = np.asarray(actual)[0]
+    for row in range(4):
+        kept = np.float32((1 / (row + 1)) / (1 - .5))
+        visible = probabilities[row, :, :row + 1]
+        assert np.all((visible == 0) | (visible == kept))
+        assert not np.any(probabilities[row, :, row + 1:]), "future probabilities stay zero"
+        keep_counts = np.count_nonzero(visible, axis=-1)
+        np.testing.assert_array_equal(keep_counts, np.sum(visible == kept, axis=-1))
+    assert jnp.any(actual == 0)
+    different = scaled_dot_product_attention(query, query, value, causal=True, implementation="reference",
+        dropout_rate=.5, dropout_rng=jax.random.key(7), deterministic=False)
+    assert not jnp.array_equal(actual, different)
+    evaluated = scaled_dot_product_attention(query, query, value, causal=True, implementation="reference",
+                                              dropout_rate=.5, deterministic=True)
+    unchanged = scaled_dot_product_attention(query, query, value, causal=True, implementation="reference")
+    assert np.asarray(evaluated).tobytes() == np.asarray(unchanged).tobytes()
+    for implementation in ("auto", "xla"):
+        routed = scaled_dot_product_attention(query, query, value, causal=True, implementation=implementation,
+                                               dropout_rate=.5, dropout_rng=rng, deterministic=False)
+        assert np.asarray(routed).tobytes() == np.asarray(expected).tobytes()
+
+
+@pytest.mark.parametrize("implementation", ["cudnn", "tpu"])
+def test_attention_dropout_refuses_kernels_that_cannot_drop_probabilities(rng, implementation):
+    query = jnp.ones((1, 4, 2, 4), jnp.float32)
+    with pytest.raises(ValueError, match="dropout"):
+        scaled_dot_product_attention(query, query, query, implementation=implementation,
+                                      dropout_rate=.5, dropout_rng=rng, deterministic=False)
+
+
+def test_attention_dropout_preserves_visibility_masks(rng):
+    query = jnp.zeros((1, 4, 2, 4), jnp.float32)
+    value = jnp.broadcast_to(jnp.eye(4)[None, :, None, :], (1, 4, 2, 4))
+    documents = jnp.asarray([[1, 1, 2, 2]])
+    visible = (documents[:, :, None] == documents[:, None, :])[:, None]
+    visible = visible & jnp.tril(jnp.ones((4, 4), bool))[None, None]
+    expected = nn.dot_product_attention(query, query, value, mask=visible, dropout_rate=.5,
+                                        dropout_rng=rng, broadcast_dropout=False, deterministic=False)
+    actual = scaled_dot_product_attention(query, query, value, causal=True, segment_ids=documents,
+        implementation="auto", dropout_rate=.5, dropout_rng=rng, deterministic=False)
+    assert np.asarray(actual).tobytes() == np.asarray(expected).tobytes()
+    assert not np.any(np.asarray(actual)[0, 2:, :, :2]), "documents never see an earlier document"
+
+
+def test_attention_dropout_refuses_a_mixer_without_probabilities(rng):
+    with pytest.raises(ValueError, match="ordinary attention mixers"):
+        tiny(attention_dropout_rate=.5, mixer={"kind": "mamba2"}).init(rng, tokens(rng, length=4))
+
+
+@pytest.mark.parametrize("field", ["embedding_dropout_rate", "attention_dropout_rate"])
+@pytest.mark.parametrize("rate", [-.1, 1.1])
+def test_decoder_dropout_rates_must_be_probabilities(rng, field, rate):
+    with pytest.raises(ValueError, match=field):
+        tiny(**{field: rate}).init(rng, tokens(rng, length=4))
 
 
 def decode_logits(model, params, prompt, rest):
@@ -526,8 +689,8 @@ def test_the_embedding_scale_is_not_rounded_to_the_activation_dtype(rng):
     gemma3-tiny is hidden 64, where the factor is 8.0 in either dtype.
     """
     features, ids = 1152, tokens(rng, length=4)
-    shared = dict(emb_features=features, num_heads=8, num_layers=1,
-                  tie_embeddings=False, dtype=jnp.bfloat16)
+    shared = {"emb_features": features, "num_heads": 8, "num_layers": 1,
+                  "tie_embeddings": False, "dtype": jnp.bfloat16}
     scaled = tiny(embedding_scale=True, **shared)
     params = scaled.init(rng, ids)
     assert params['params']['embed_tokens']['embedding'].dtype == jnp.float32
@@ -571,7 +734,7 @@ def test_the_attention_scale_is_not_rounded_to_the_activation_dtype(rng):
     whose ratio is exactly 0.871094, and scales every logit 0.2% low.
     """
     ids = tokens(rng)
-    shared = dict(head_dim=128, num_layers=1, dtype=jnp.bfloat16)
+    shared = {"head_dim": 128, "num_layers": 1, "dtype": jnp.bfloat16}
     exact = tiny(attention_scale=168 ** -0.5, **shared)
     params = exact.init(rng, ids)
     rounded = tiny(attention_scale=float(jnp.bfloat16(168 ** -0.5 * math.sqrt(128)))
@@ -593,47 +756,6 @@ def test_dropout_trains_with_an_rng_and_is_off_by_default(rng):
     assert not jnp.allclose(quiet, noisy)
 
 
-def test_normal_attention_param_tree_survives_causal_and_decode(rng):
-    """The diffusion attention gains the flags without gaining parameters, so a
-    checkpoint moves between a bidirectional trainer and a decoding sampler."""
-    x = jax.random.normal(rng, (2, 6, 16))
-    plain = NormalAttention(query_dim=16, heads=2, dim_head=8)
-    causal = NormalAttention(query_dim=16, heads=2, dim_head=8, causal=True, max_seq_len=8)
-    shapes = jax.tree_util.tree_map(jnp.shape, plain.init(rng, x)['params'])
-    assert jax.tree_util.tree_map(jnp.shape, causal.init(rng, x)['params']) == shapes
-
-    decoding = causal.init(rng, x[:, :1], decode=True)
-    assert jax.tree_util.tree_map(jnp.shape, decoding['params']) == shapes
-
-    assert decoding['cache']['cached_key'].shape == (2, 8, 2, 8)
-
-
-def test_normal_attention_decode_matches_a_causal_forward(rng):
-    attention = NormalAttention(query_dim=16, heads=2, dim_head=8, causal=True,
-                                max_seq_len=8, use_bias=False)
-    x = jax.random.normal(rng, (2, 6, 16))
-    params = {'params': attention.init(rng, x)['params']}
-    full = attention.apply(params, x)
-
-    cache = attention.apply(params, x[:, :1], decode=True, mutable=['cache'])[1]['cache']
-    out, mutated = attention.apply({**params, 'cache': cache}, x[:, :3],
-                                   decode=True, mutable=['cache'])
-    assert jnp.allclose(out, full[:, :3], atol=1e-5)
-    cache = mutated['cache']
-    for position in range(3, 6):
-        out, mutated = attention.apply({**params, 'cache': cache},
-                                       x[:, position:position + 1],
-                                       decode=True, mutable=['cache'])
-        cache = mutated['cache']
-        assert jnp.allclose(out[:, 0], full[:, position], atol=1e-5)
-
-
-def test_decoding_without_a_cache_length_is_refused(rng):
-    attention = NormalAttention(query_dim=16, heads=2, dim_head=8, causal=True)
-    with pytest.raises(ValueError, match="max_seq_len"):
-        attention.init(rng, jax.random.normal(rng, (2, 4, 16)), decode=True)
-
-
 def test_a_prompt_longer_than_the_cache_is_refused(rng):
     model = tiny(max_seq_len=8)
     ids = tokens(rng, length=12)
@@ -651,9 +773,9 @@ def test_a_prompt_longer_than_the_cache_is_refused(rng):
     ({'kinds': {'linear_attention': {'window': 2}}}, "name no layer"),
     ({'kinds': {'full_attention': {'window': 0}}}, "window"),
     ({'kinds': {'full_attention': {'head_dim': 7}}}, "even"),
-    ({'use_double_wide_mlp': True}, "num_kv_shared_layers"),
+    ({'use_double_wide_mlp': True}, "kv_shared_layers"),
     ({'per_layer_input_dim': 0}, "None is a model without them"),
-    ({'mlp': 'relu'}, "swiglu"),
+    ({'mlp': 'unknown'}, "swiglu"),
 ])
 def test_rejected_configs(rng, config, message):
     with pytest.raises(ValueError, match=message):
@@ -790,7 +912,7 @@ def test_metadata_that_restricts_no_visibility_scores_like_no_metadata(rng):
     assert jnp.array_equal(model.apply(params, ids),
                            model.apply(params, ids, rotary_positions=rotary))
     plain, spelled = scored(), scored(rotary_positions=rotary)
-    for left, right in zip(jax.tree.leaves(plain), jax.tree.leaves(spelled)):
+    for left, right in zip(jax.tree.leaves(plain), jax.tree.leaves(spelled), strict=True):
         assert jnp.max(jnp.abs(left - right)) < 1e-4 * max(1.0, float(jnp.max(jnp.abs(left))))
 
 
@@ -874,11 +996,13 @@ def test_the_qk_norm_reads_the_model_norm_eps(rng):
     assert not jnp.allclose(q_small, q_large, rtol=1e-2)
 
 
-def test_the_tied_head_multiplies_bf16_into_fp32_under_bf16_compute(rng):
+def test_the_tied_head_rounds_its_bf16_product_to_bf16_logits_under_bf16_compute(rng):
     """Under bf16 compute the head multiplies the bf16 states by the table
-    rounded to bf16 and accumulates in fp32: the products are exact, so the
-    logits are the fp32 sum of the rounded operands, not the fp32 table's
-    product and not a product rounded to bf16 at the end."""
+    rounded to bf16, accumulates in fp32 and rounds the logits to bf16, as
+    torch autocast's bf16 logits are: each logit is a bf16 value within a
+    bf16 rounding (2^-8 relative) of the fp32 sum of the rounded operands,
+    plus that sum's own fp32 rounding. At "highest" the head multiplies the
+    fp32 table, and its logits are that fp32 product."""
     model = tiny(dtype=jnp.bfloat16)
     ids = tokens(rng)
     params = model.init(rng, ids)
@@ -888,12 +1012,18 @@ def test_the_tied_head_multiplies_bf16_into_fp32_under_bf16_compute(rng):
     exact = jnp.einsum("...d,vd->...v", hidden.astype(jnp.float32),
                        table.astype(jnp.bfloat16).astype(jnp.float32),
                        precision=jax.lax.Precision.HIGHEST)
+    np.testing.assert_array_equal(
+        np.asarray(logits), np.asarray(logits.astype(jnp.bfloat16).astype(jnp.float32))
+    )
+    assert np.all(np.abs(np.asarray(logits - exact)) <= 2 ** -8 * np.abs(np.asarray(exact)) + 1e-6)
+    assert not np.allclose(np.asarray(logits), np.asarray(exact), atol=1e-6)
+
+    strict = tiny(dtype=jnp.bfloat16, precision="highest")
+    logits = strict.apply(params, ids)
+    hidden = strict.apply(params, ids, method=CausalTransformer.hidden_states)
     fp32 = jnp.einsum("...d,vd->...v", hidden.astype(jnp.float32), table,
                       precision=jax.lax.Precision.HIGHEST)
-    rounded = exact.astype(jnp.bfloat16).astype(jnp.float32)
-    np.testing.assert_allclose(np.asarray(logits), np.asarray(exact), atol=1e-6)
-    assert not np.allclose(np.asarray(logits), np.asarray(fp32), atol=1e-6)
-    assert not np.allclose(np.asarray(logits), np.asarray(rounded), atol=1e-6)
+    np.testing.assert_allclose(np.asarray(logits), np.asarray(fp32), atol=1e-6)
 
 
 def test_the_rmsnorm_cast_order_is_a_field_that_bf16_tells_apart(rng):
@@ -920,8 +1050,14 @@ def test_the_rmsnorm_cast_order_is_a_field_that_bf16_tells_apart(rng):
             "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "hidden_act": "silu"}
     assert translate_config(base)["scale_after_cast"] is True
     assert translate_config({**base, "model_type": "qwen3", "head_dim": 8})["scale_after_cast"] is True
-    gemma_config = {**base, "model_type": "gemma3_text", "head_dim": 8, "hidden_activation": "gelu_pytorch_tanh",
-                    "query_pre_attn_scalar": 8, "sliding_window": 4}
+    gemma_config = {
+        **base,
+        "model_type": "gemma3_text",
+        "head_dim": 8,
+        "hidden_activation": "gelu_pytorch_tanh",
+        "query_pre_attn_scalar": 8,
+        "sliding_window": 4,
+    }
     assert translate_config(gemma_config)["scale_after_cast"] is False
 
 
@@ -956,6 +1092,60 @@ def test_a_cast_then_scale_norm_rounds_under_jit_and_keeps_an_fp32_weight_gradie
     np.testing.assert_array_equal(np.asarray(out), expected)
     grad = np.asarray(jax.jit(jax.grad(loss))(weight), np.float64)
     assert np.max(np.abs(grad - expected_grad)) <= 1e-5 * np.max(np.abs(expected_grad))
+
+
+@pytest.mark.parametrize("norm", ["rms", "rms_scaled_in_fp32", "layer"])
+def test_a_norm_under_jit_reads_the_bf16_sum_it_is_handed(norm):
+    """transformers stores a residual sum as a bf16 tensor and its norm reads
+    that. XLA's default lets a fusion skip a rounding
+    (`xla_allow_excess_precision`), and a bf16 add fused into the norm's
+    fp32 upcast was normalized unrounded: 23% of a bf16 RMSNorm's outputs,
+    30% of a LayerNorm's, differed from the norm of the stored sum, on CPU
+    and on an RTX 4080. Runs and this suite keep every rounding
+    (`dew.telemetry.devices.keep_roundings`). The oracle is the same norm
+    applied to the sum materialized by its own jit."""
+    from dew.nn.attention import LayerNorm, RMSNorm
+
+    a = jax.random.normal(jax.random.key(0), (512, 64), jnp.bfloat16)
+    b = (jax.random.normal(jax.random.key(1), (512, 64)) * 0.37).astype(jnp.bfloat16)
+    module = {"rms": RMSNorm(epsilon=1e-5, scale_after_cast=True, dtype=jnp.bfloat16),
+              "rms_scaled_in_fp32": RMSNorm(epsilon=1e-5, dtype=jnp.bfloat16),
+              "layer": LayerNorm(epsilon=1e-5, dtype=jnp.bfloat16)}[norm]
+    variables = module.init(jax.random.key(2), a)
+
+    stored = jax.jit(jnp.add)(a, b)
+    fused = jax.jit(lambda a, b: module.apply(variables, a + b))(a, b)
+
+    np.testing.assert_array_equal(np.asarray(fused), np.asarray(jax.jit(module.apply)(variables, stored)))
+
+
+@pytest.mark.mesh(devices=4)
+@pytest.mark.parametrize("mixture", [None, {"experts": 8, "top_k": 2, "expert_features": 32}])
+def test_a_bf16_decoder_scores_the_same_on_one_device_and_split_over_four(mixture):
+    """The rows are independent, so splitting the batch over devices changes
+    no token's arithmetic. With XLA free to skip roundings, what fused on one
+    device and on four differed: the hidden states of a 4-layer bf16 decoder
+    matched in 13% of entries, an 8-expert MoE's top-2 routes differed in
+    0.3% of layer 0's choices and 2.8% of layer 3's, and its loss moved
+    2.6e-4. Every rounding kept, they are bitwise the same."""
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
+    config = {"vocab_size": 512, "emb_features": 64, "num_layers": 4, "num_heads": 8, "num_kv_heads": 4,
+                  "head_dim": 8, "mlp_features": 128, "max_seq_len": 33, "dtype": jnp.bfloat16}
+    if mixture is not None:
+        config["mixture"] = {**mixture, "layers": (0, 1, 2, 3)}
+    model = CausalTransformer(**config)
+    ids = jax.random.randint(jax.random.key(0), (16, 32), 0, 512)
+    params = model.init(jax.random.key(1), ids)
+
+    def hidden(params, ids):
+        return model.apply(params, ids, method=CausalTransformer.hidden_states)
+
+    one = jax.jit(hidden)(params, ids)
+    mesh = Mesh(np.asarray(jax.devices()[:4]), ("data",))
+    split = jax.jit(hidden)(params, jax.device_put(ids, NamedSharding(mesh, PartitionSpec("data"))))
+
+    np.testing.assert_array_equal(np.asarray(one), np.asarray(split))
 
 
 @pytest.mark.parametrize("activation", ["swiglu", "geglu", "geglu_exact"])
@@ -1037,7 +1227,7 @@ def test_exclusive_self_attention_removes_the_own_value_direction_per_query_head
     from jax.test_util import check_grads
 
     from dew.nn.mixers.attention import exclusive_self_attention
-    with jax.enable_x64(True):
+    with jax.enable_x64(new_val=True):
         keys = jax.random.split(jax.random.key(0), 2)
         y = jax.random.normal(keys[0], (2, 5, 4, 8), jnp.float64)
         v = jax.random.normal(keys[1], (2, 5, 2, 8), jnp.float64).at[1, 3, 1].set(0.0)
@@ -1046,7 +1236,9 @@ def test_exclusive_self_attention_removes_the_own_value_direction_per_query_head
             v = np.repeat(np.asarray(v), 2, axis=-2)
             norm = np.sum(v * v, -1, keepdims=True)
             safe = np.where(norm > 0, norm, 1)
-            return np.asarray(y) - np.where(norm > 0, np.sum(np.asarray(y) * v, -1, keepdims=True) / safe, 0) * v
+            return (
+                np.asarray(y) - np.where(norm > 0, np.sum(np.asarray(y) * v, -1, keepdims=True) / safe, 0) * v
+            )
 
         out = exclusive_self_attention(y, v)
         np.testing.assert_allclose(out, oracle(y, v), rtol=1e-13, atol=1e-13)

@@ -219,12 +219,6 @@ def save(variables: Variables, path, divisor: int = 1) -> None:
                 "channel_divisor": str(divisor)})
 
 
-def load(path) -> Variables:
-    """Read a converted file back into the tree `InceptionV3.apply` takes."""
-    tensors, _ = read_file(path)
-    return _unflatten(tensors)
-
-
 def channel_divisor(path) -> int:
     """Return the `InceptionV3(channel_divisor=)` a file was written at.
 

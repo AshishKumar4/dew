@@ -18,21 +18,12 @@ it base64-encoded (`nccl_unique_id_b64`), and both sides enter
 The workers' communicator then runs a one-element all-reduce, which this side
 matches before its first broadcast.
 
-A push of version `v`, per replica: `POST /pause?mode=wait`, so in-flight draws
-finish on the old weights; `POST /start_weight_update`; `POST /update_weights`
-with the names, dtypes and shapes, which returns once every tensor has landed,
-while this side broadcasts them; `POST /finish_weight_update` with `v`; `POST
-/reset_prefix_cache`, which must answer success, so no cached prefix outlives
-the weights that computed it; `POST /resume`. A replica that fails after the
-pause stays paused, as under `SafetensorsReload`.
-
-Every process of a multi-process trainer calls the push. The pool gathers
-the served policy to process 0's host memory, as `SafetensorsReload` does
-(`collective_host` with `held_by="first"`), in groups of at most
-`dew.artifacts.GATHER_BYTES`, so a device holds one group of it at a time
-beside the trainer's state. Process 0 exports it and sends from its first
-device of the mesh, `chunk` bytes placed there at a time, and every process
-learns the outcome at an agreement point.
+A push pauses each replica with `mode=wait` and posts `/update_weights`, which
+returns once every tensor has landed, while this side broadcasts them; it then
+sets the version, resets the prefix cache and resumes, with the pause and
+failure rules of `SafetensorsReload`. Every process of a pool calls the push,
+and the policy is gathered to process 0 as `SafetensorsReload` gathers it, in
+groups of at most `dew.artifacts.GATHER_BYTES`.
 """
 
 from __future__ import annotations
@@ -44,7 +35,7 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -55,8 +46,9 @@ from dew.artifacts import agreed, collective_host
 from dew.nn.inputs import mesh_of
 from dew.objectives.base import Variables
 from dew.records import JSON
+from dew.telemetry.devices import primary_context
 
-from .rollouts import _served, _succeeded
+from .rollouts import _post, _served
 
 if TYPE_CHECKING:
     from dew.interop.pretrained import Pretrained
@@ -70,7 +62,7 @@ _SUM = 0
 
 
 class _UniqueId(ctypes.Structure):
-    _fields_ = [("internal", ctypes.c_byte * 128)]
+    _fields_: ClassVar = [("internal", ctypes.c_byte * 128)]
 
 
 class _Library:
@@ -84,7 +76,6 @@ class _Library:
 
     def __init__(self, library: str, ordinal: int) -> None:
         self.nccl = ctypes.CDLL(library)
-        self.cuda = ctypes.CDLL("libcuda.so.1")
         self.nccl.ncclGetErrorString.restype = ctypes.c_char_p
         self.nccl.ncclCommInitRank.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_int, _UniqueId,
                                                ctypes.c_int]
@@ -93,11 +84,7 @@ class _Library:
         self.nccl.ncclAllReduce.argtypes = collective
         self.nccl.ncclBroadcast.argtypes = collective
         self.nccl.ncclCommAbort.argtypes = [ctypes.c_void_p]
-        device = ctypes.c_int()
-        self._driver(self.cuda.cuInit(0))
-        self._driver(self.cuda.cuDeviceGet(ctypes.byref(device), ordinal))
-        self.context = ctypes.c_void_p()
-        self._driver(self.cuda.cuDevicePrimaryCtxRetain(ctypes.byref(self.context), device))
+        self.cuda, self.context, _ = primary_context(ordinal)
 
     def _driver(self, status: int) -> None:
         if status != 0:
@@ -137,14 +124,6 @@ class _Library:
     def abort(self, comm: ctypes.c_void_p) -> None:
         """Free `comm` without waiting for its peers or its operations."""
         self._checked(self.nccl.ncclCommAbort(comm))
-
-
-def _post(root: str, path: str, body: JSON, timeout: float, *, reports: bool = False) -> None:
-    import httpx
-
-    response = httpx.post(root + path, json=body, timeout=timeout)
-    if response.status_code != 200 or (reports and not _succeeded(response)):
-        raise RuntimeError(f"{path.split('?')[0]} answered {response.status_code}: {response.text}")
 
 
 def _world(root: str, timeout: float) -> int:
@@ -212,10 +191,8 @@ class NCCLPush:
 
         Every group is aborted, not destroyed: NCCL's destroy finalizes the
         group, which waits on the engine's side, and an engine keeps its side
-        open until it exits (the sender waited out jax.distributed's 300 s
-        shutdown barrier on 4x RTX 3090). A push that failed closes too: a
-        group whose broadcast failed, or whose replica did, cannot carry the
-        next version.
+        open until it exits. A push that failed closes too: a group whose
+        broadcast failed, or whose replica did, cannot carry the next version.
         """
         if self._library is not None:
             for comm in self._groups.values():
@@ -233,9 +210,13 @@ class NCCLPush:
         for root in self.engines:
             _post(root, "/pause?mode=wait", None, self.timeout)
             _post(root, "/start_weight_update", None, self.timeout)
-        listing: JSON = {"update_info": {"names": list(names),
-                                         "dtype_names": [str(tensor.dtype) for tensor in tensors],
-                                         "shapes": [[int(size) for size in tensor.shape] for tensor in tensors]}}
+        listing: JSON = {
+            "update_info": {
+                "names": list(names),
+                "dtype_names": [str(tensor.dtype) for tensor in tensors],
+                "shapes": [[int(size) for size in tensor.shape] for tensor in tensors],
+            }
+        }
         failures: list[BaseException] = []
 
         def receive(root: str) -> None:
@@ -278,7 +259,7 @@ class NCCLPush:
                                         "rank_offset": 1, "world_size": 1 + workers, "packed": False}}
             failures: list[BaseException] = []
 
-            def join(root: str = root, body: JSON = body) -> None:
+            def join(root: str = root, body: JSON = body, failures=failures) -> None:
                 try:
                     _post(root, "/init_weight_transfer_engine", body, self.timeout)
                 except BaseException as failure:
@@ -298,7 +279,9 @@ class NCCLPush:
             self._groups[root] = comm
         return library
 
-    def _broadcast(self, library: _Library, target: SingleDeviceSharding, tensors: Sequence[np.ndarray]) -> None:
+    def _broadcast(
+        self, library: _Library, target: SingleDeviceSharding, tensors: Sequence[np.ndarray]
+    ) -> None:
         """Broadcast `tensors` in order to every group, `chunk` bytes resident at a time.
 
         The next chunk's copies are issued before the current chunk broadcasts,

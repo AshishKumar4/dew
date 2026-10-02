@@ -21,10 +21,10 @@ from dew.diffusion.process import DenoisingCondition, Process
 from dew.diffusion.schedules import expand
 from dew.diffusion.transforms import broadcast_rates
 from dew.inputs import InputSpec, unit_range
-from dew.objectives.base import Aux, Mean, Step, Variables
+from dew.objectives.base import Aux, Ratio, Step, Variables
 from dew.registry import objectives
 
-from .objective import TEACHER, DiffusionObjective
+from .objective import TEACHER, DiffusionObjective, _own_loss
 
 
 def with_guidance(conditions: dict, scale: jax.Array) -> dict:
@@ -62,9 +62,7 @@ class GuidanceDistillationObjective(DiffusionObjective):
                 or type(teacher.process.prediction) is not type(process.prediction)):
             raise ValueError("guidance distillation regresses onto the teacher's raw output, so the "
                              "two share the process's schedule and prediction")
-        unused = sorted(key for key in ("uncertainty", "alignment", "end_to_end") if kwargs.get(key) is not None)
-        if unused:
-            raise ValueError(f"guidance distillation trains on its own loss, which reads none of {unused}")
+        _own_loss("guidance distillation", kwargs)
         kwargs.setdefault("guidance", None)
         super().__init__(model, process, inputs, **kwargs)
         if teacher.latent_shape != self.latent_shape:
@@ -99,7 +97,7 @@ class GuidanceDistillationObjective(DiffusionObjective):
         teacher = self.teacher
         frozen = jax.lax.stop_gradient(params[TEACHER])
         given, blank = teacher._conditions(frozen, batch, drop_key, dropout=False)
-        denoise = teacher.process.denoiser(teacher.model, teacher.trainable(frozen), given, blank)
+        denoise = teacher.process.denoiser(teacher.model, teacher.model_variables(frozen), given, blank)
         conditional, unconditional = denoise.raw_both(noisy, t)
         target = jax.lax.stop_gradient(guided_target(conditional, unconditional, scale))
 
@@ -107,13 +105,13 @@ class GuidanceDistillationObjective(DiffusionObjective):
         if not any(isinstance(value, DenoisingCondition) and value.guidance is not None
                    for value in conditions.values()):
             raise ValueError("the student's conditioning carries no guidance input to distill into")
-        output = self.model.apply(self.trainable(params), noisy * c_in, schedule.model_time(t),
+        output = self.model.apply(self.model_variables(params), noisy * c_in, schedule.model_time(t),
                                   **with_guidance(conditions, scale.astype(jnp.float32)), train=True,
                                   rngs={"dropout": jax.random.fold_in(step.key, 1)})
         assert isinstance(output, jax.Array)
         losses = optax.l2_loss(output, target)
         weighted = losses * expand(self.process.weight(t), losses)
-        return Mean(jnp.sum(weighted), jnp.asarray(losses.size, jnp.float32)), Aux(metrics={})
+        return Ratio(jnp.sum(weighted), jnp.asarray(losses.size, jnp.float32)), Aux(metrics={})
 
 
 __all__ = ["GuidanceDistillationObjective", "guided_target", "with_guidance"]

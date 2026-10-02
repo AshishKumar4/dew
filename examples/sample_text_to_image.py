@@ -79,8 +79,9 @@ def grid(title: str, prompts, seeds, images: np.ndarray) -> Image.Image:
     heading = title + "   seeds " + ", ".join(map(str, seeds))
     # As wide as the images, or as the longest caption where it is wider.
     widest = max(font.getlength(caption) for caption in (heading, *prompts)) + 8
-    sheet = Image.new("RGB", (max(columns * (width + gap) - gap, int(widest)), label + rows * (label + height)),
-                      "#b0b0b0")
+    sheet = Image.new(
+        "RGB", (max(columns * (width + gap) - gap, int(widest)), label + rows * (label + height)), "#b0b0b0"
+    )
     draw = ImageDraw.Draw(sheet)
     draw.text((4, 4), heading, fill="black", font=font)
     for row, prompt in enumerate(prompts):
@@ -106,8 +107,8 @@ def main(config: Config):
         columns = []
         for seed in config.seeds:
             started = time.perf_counter()
-            prepared = pipe.prepare(prompts, seed=seed, steps=steps, unconditional=config.negative)
-            images = pipe(prepared, seed=seed, steps=steps, sampler=solver, guidance=guidance).host().images
+            prepared = pipe.prepare(prompts, key=seed, steps=steps, unconditional=config.negative)
+            images = pipe(prepared, key=seed, steps=steps, solver=solver, guidance=guidance).host().images
             seconds = time.perf_counter() - started
             print(f"{name}: seed {seed}, {len(prompts)} images in {seconds:.1f} s")
             pixels = uint8_pixels(np.asarray(images, np.float32))

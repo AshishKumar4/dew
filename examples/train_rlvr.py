@@ -48,6 +48,7 @@ import json
 import math
 import os
 import random
+import re
 import shutil
 import subprocess
 import time
@@ -62,7 +63,7 @@ import jax.numpy as jnp
 import optax
 import tyro
 
-from dew.data import Loading, tokenizer_for
+from dew.data import HFTokenizer, Loading
 from dew.data.prompts import Prompts
 from dew.inference import (
     NativeRolloutServer,
@@ -73,26 +74,22 @@ from dew.inference import (
     TextGeneration,
 )
 from dew.inference.tasks import SHAPE_BUCKETS
-from dew.interop import load_pretrained
+from dew.interop import PretrainedDecoder
 from dew.nn.backbones.decoder_block import remat_policy
 from dew.objectives.rl import (
     Action,
-    CodeReward,
-    ContainerRunner,
     EnvironmentSource,
     Episode,
     EpisodeStatus,
     GRPOObjective,
     Observation,
-    ProcessRunner,
     PromptSource,
     RolloutScheduler,
-    SandboxFleet,
-    SandboxLimits,
     SchedulerRecord,
     Task,
     prompt_tasks,
 )
+from dew.rl.sandbox import ContainerRunner, ProcessRunner, Program, SandboxFleet, SandboxLimits, outputs_match
 from dew.sampling import Sampling
 from dew.training import Trainer
 
@@ -100,6 +97,70 @@ FEEDBACK_TOKENS = 32
 """The longest test report a failed attempt gets back, in ids."""
 
 SMOKE_MODEL = Path(__file__).resolve().parents[1] / "tests/fixtures/hf/qwen2-tiny"
+
+
+# The reward is this recipe's: the program is the completion's last fenced
+# block, and the reward column holds `{"stdin", "stdout"}` test cases.
+_FENCE = re.compile(r"```([A-Za-z0-9_+-]*)[ \t]*\n(.*?)```", re.DOTALL)
+
+
+def code_block(completion: str, language: str = "python") -> str | None:
+    """The last fenced block tagged `language`, else the last untagged one, else None."""
+    blocks = [(tag.lower(), body) for tag, body in _FENCE.findall(completion)]
+    for wanted in (language, ""):
+        tagged = [body for tag, body in blocks if tag == wanted]
+        if tagged:
+            return tagged[-1]
+    return None
+
+
+def _cases(ground_truth: str) -> list[tuple[str, str]]:
+    """Read `[{"stdin": ..., "stdout": ...}, ...]` test cases from the reward column."""
+    cases = json.loads(ground_truth)
+    if not isinstance(cases, list) or not cases:
+        raise ValueError("a code reward's ground truth is a nonempty JSON list of test cases")
+    read: list[tuple[str, str]] = []
+    for case in cases:
+        if (not isinstance(case, dict) or not isinstance(case.get("stdout"), str)
+                or not isinstance(case.get("stdin", ""), str)):
+            raise ValueError("each test case holds string stdout and optional string stdin")
+        read.append((case.get("stdin", ""), case["stdout"]))
+    return read
+
+
+@dataclass(frozen=True)
+class CodeReward:
+    """Run the completion's program on every test case; reward the fraction that pass.
+
+    The ground truth is a JSON list of `{"stdin", "stdout"}` cases. A case
+    passes when the program completes and its stdout matches, line by line
+    up to trailing whitespace. A completion without a code block scores
+    zero, as do timeouts, crashes and oversized output. `all_or_nothing`
+    scores one only when every case passes. `interpreter` is the argv the
+    program file is appended to; None takes the fleet runner's `python`, so
+    a container runs the image's interpreter and a process runs this one.
+    """
+
+    fleet: SandboxFleet
+    interpreter: tuple[str, ...] | None = None
+    language: str = "python"
+    filename: str = "main.py"
+    all_or_nothing: bool = False
+
+    def __call__(self, data_source: str, completion: str, ground_truth: str, extra_info: str) -> float:
+        cases = _cases(ground_truth)
+        source = code_block(completion, self.language)
+        if source is None:
+            return 0.0
+        interpreter = self.fleet.runner.python if self.interpreter is None else self.interpreter
+        outcomes = self.fleet.run(Program({self.filename: source}, (*interpreter, self.filename), stdin)
+                                  for stdin, _ in cases)
+        passed = sum(
+            outputs_match(outcome, expected) for outcome, (_, expected) in zip(outcomes, cases, strict=True)
+        )
+        if self.all_or_nothing:
+            return float(passed == len(cases))
+        return passed / len(cases)
 
 
 def _uniform(low: int, high: int) -> Callable[[random.Random], tuple[int, int]]:
@@ -154,22 +215,45 @@ def _index_and_modulus(draw: random.Random) -> tuple[int, int]:
 # program that ignores the task, a constant or a, b, min(a, b), max(a, b),
 # a + b, a * b or |a - b|, passes a tenth of its cases.
 TASKS = (
-    ("the sum of all integers from min(a, b) to max(a, b) inclusive",
-     lambda a, b: sum(range(min(a, b), max(a, b) + 1)), _uniform(-30, 30)),
-    ("the number of multiples of b between 1 and a inclusive (both are positive)",
-     lambda a, b: a // b, _divisor_at_most),
-    ("the sum of the decimal digits of the product a * b",
-     lambda a, b: sum(map(int, str(abs(a * b)))), _digits(6)),
+    (
+        "the sum of all integers from min(a, b) to max(a, b) inclusive",
+        lambda a, b: sum(range(min(a, b), max(a, b) + 1)),
+        _uniform(-30, 30),
+    ),
+    (
+        "the number of multiples of b between 1 and a inclusive (both are positive)",
+        lambda a, b: a // b,
+        _divisor_at_most,
+    ),
+    (
+        "the sum of the decimal digits of the product a * b",
+        lambda a, b: sum(map(int, str(abs(a * b)))),
+        _digits(6),
+    ),
     ("the greatest common divisor of a and b (both are positive)", math.gcd, _shared_factor),
-    ("the number of primes p with min(a, b) <= p <= max(a, b)",
-     lambda a, b: sum(all(p % d for d in range(2, int(p ** 0.5) + 1)) for p in range(max(2, min(a, b)), max(a, b) + 1)),
-     _uniform(1, 300)),
-    ("the a-th Fibonacci number modulo b, where the 0th is 0 and the 1st is 1 (b is never zero)",
-     lambda a, b: _fibonacci(a) % b, _index_and_modulus),
-    ("the number of 1 bits in the binary form of the product a * b (both are positive)",
-     lambda a, b: bin(a * b).count("1"), _digits(8)),
-    ("the integer whose decimal digits are those of the product a * b in reverse order, without leading zeros",
-     lambda a, b: int(str(a * b)[::-1]), _uniform(1, 99)),
+    (
+        "the number of primes p with min(a, b) <= p <= max(a, b)",
+        lambda a, b: sum(
+            all(p % d for d in range(2, int(p**0.5) + 1)) for p in range(max(2, min(a, b)), max(a, b) + 1)
+        ),
+        _uniform(1, 300),
+    ),
+    (
+        "the a-th Fibonacci number modulo b, where the 0th is 0 and the 1st is 1 (b is never zero)",
+        lambda a, b: _fibonacci(a) % b,
+        _index_and_modulus,
+    ),
+    (
+        "the number of 1 bits in the binary form of the product a * b (both are positive)",
+        lambda a, b: bin(a * b).count("1"),
+        _digits(8),
+    ),
+    (
+        "the integer whose decimal digits are those of the product a * b in reverse order, "
+        "without leading zeros",
+        lambda a, b: int(str(a * b)[::-1]),
+        _uniform(1, 99),
+    ),
 )
 
 
@@ -243,7 +327,9 @@ def rollout_width(config: Config) -> int:
     return config.prompt_tokens + config.turns * config.new_tokens + (config.turns - 1) * FEEDBACK_TOKENS
 
 
-def attempt_scorer(reward: CodeReward, decode: Callable[[Sequence[int]], str]) -> Callable[[str, Action], float]:
+def attempt_scorer(
+    reward: CodeReward, decode: Callable[[Sequence[int]], str]
+) -> Callable[[str, Action], float]:
     """The fraction of `cases` an attempt's program passes, its EOS excluded; each program runs once."""
     @functools.lru_cache(maxsize=4096)
     def passed(cases: str, program: tuple[int, ...]) -> float:
@@ -270,8 +356,10 @@ class Attempts:
         passed = self.score(self.cases, action)
         if passed == 1.0:
             return Observation((), EpisodeStatus.COMPLETED, "every test passes")
-        report = self.encode(f"\n\nThat program passed {round(3 * passed)} of 3 tests. Reply with one corrected "
-                             "```python code block.\n")[:FEEDBACK_TOKENS]
+        report = self.encode(
+            f"\n\nThat program passed {round(3 * passed)} of 3 tests. Reply with one corrected "
+            "```python code block.\n"
+        )[:FEEDBACK_TOKENS]
         return Observation(action.context + action.tokens + tuple(report))
 
 
@@ -285,9 +373,15 @@ def attempts_source(server, reward: CodeReward, decode: Callable[[Sequence[int]]
         return score(str(task.data["truth"]), episode.transitions[-1].action) if episode.transitions else 0.0
 
     return EnvironmentSource(
-        server, lambda task, identity: nullcontext(Attempts(task, score, encode)), verify,
-        max_prompt_tokens=rollout_width(config) - config.new_tokens, max_new_tokens=config.new_tokens,
-        max_turns=config.turns, workers=config.prompts * config.groups * (config.max_lag + 1), seed=config.seed)
+        server,
+        lambda task, identity: nullcontext(Attempts(task, score, encode)),
+        verify,
+        max_prompt_tokens=rollout_width(config) - config.new_tokens,
+        max_new_tokens=config.new_tokens,
+        max_turns=config.turns,
+        workers=config.prompts * config.groups * (config.max_lag + 1),
+        seed=config.seed,
+    )
 
 
 def engine_context(config: Config) -> int:
@@ -307,14 +401,50 @@ def engine_command(config: Config, directory: Path) -> tuple[list[str], dict[str
     """The command line and extra environment that serve `directory` on `config.backend`."""
     context = str(engine_context(config))
     if config.backend == "vllm":
-        return ([config.vllm, "serve", str(directory), "--served-model-name", "policy", "--port", str(config.port),
-                 "--gpu-memory-utilization", str(config.vllm_memory), "--dtype", "bfloat16",
-                 "--max-model-len", context, "--generation-config", "vllm",
-                 "--enable-prefix-caching", "--seed", str(config.seed)],
-                {"VLLM_SERVER_DEV_MODE": "1"})
-    return ([config.sglang, "serve", "--model-path", str(directory), "--served-model-name", "policy",
-             "--port", str(config.port), "--mem-fraction-static", str(config.sglang_memory), "--dtype", "bfloat16",
-             "--context-length", context, "--random-seed", str(config.seed)], {})
+        return (
+            [
+                config.vllm,
+                "serve",
+                str(directory),
+                "--served-model-name",
+                "policy",
+                "--port",
+                str(config.port),
+                "--gpu-memory-utilization",
+                str(config.vllm_memory),
+                "--dtype",
+                "bfloat16",
+                "--max-model-len",
+                context,
+                "--generation-config",
+                "vllm",
+                "--enable-prefix-caching",
+                "--seed",
+                str(config.seed),
+            ],
+            {"VLLM_SERVER_DEV_MODE": "1"},
+        )
+    return (
+        [
+            config.sglang,
+            "serve",
+            "--model-path",
+            str(directory),
+            "--served-model-name",
+            "policy",
+            "--port",
+            str(config.port),
+            "--mem-fraction-static",
+            str(config.sglang_memory),
+            "--dtype",
+            "bfloat16",
+            "--context-length",
+            context,
+            "--random-seed",
+            str(config.seed),
+        ],
+        {},
+    )
 
 
 def launch_engine(config: Config, directory: Path) -> subprocess.Popen:
@@ -351,38 +481,23 @@ def native_server(source, sampling: Sampling, *, slots: int, capacity: int) -> N
     reference kept past this call would keep a model's worth of device
     memory for the whole run.
     """
-    served = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.bfloat16) if jnp.issubdtype(leaf.dtype, jnp.floating)
-                          else jnp.asarray(leaf), source.variables)
-    return NativeRolloutServer(Server.from_task(TextGeneration(source.model, served, source.processor,
-                                                               sampling=sampling), slots=slots, capacity=capacity))
+    served = jax.tree.map(
+        lambda leaf: jnp.asarray(leaf, jnp.bfloat16)
+        if jnp.issubdtype(leaf.dtype, jnp.floating)
+        else jnp.asarray(leaf),
+        source.variables,
+    )
+    return NativeRolloutServer(
+        Server.from_task(
+            TextGeneration(source.model, served, source.processor, sampling=sampling),
+            slots=slots,
+            capacity=capacity,
+        )
+    )
 
 
-def main(config: Config) -> dict:
-    if config.smoke:
-        config = replace(config, model=str(SMOKE_MODEL), backend="native", steps=2, prompts=2, groups=2,
-                         prompt_tokens=56, new_tokens=8, tasks=8, window=1)
-    config.out.mkdir(parents=True, exist_ok=True)
-    tokenizer = str(SMOKE_MODEL.parents[0] / "diffusion-gemma-workflow") if config.smoke else config.model
-    width = rollout_width(config)
-    # The server rounds its cache up to whole 64-slot tiles, and an engine
-    # refuses a context past the export's; the next shape bucket covers both.
-    context = next(bucket for bucket in SHAPE_BUCKETS if bucket >= engine_context(config))
-    source = load_pretrained(config.model, dtype="float32" if config.smoke else "bfloat16",
-                             param_dtype="float32", max_seq_len=context)
-    stock = source.text_generation().sampling
-    words = tokenizer_for(tokenizer)
-    # An attempt ends on EOS; the committed tiny Qwen2 names none, its tokenizer does.
-    eos = stock.eos_id if stock.eos_id is not None else words.eos_id
-    # Temperature one without filters: the engine's reported likelihoods are
-    # then the behavior policy's, on either backend.
-    sampling = Sampling(temperature=1.0, eos_id=eos, pad_id=stock.pad_id)
-
-    # Recompute each block's forward in the backward: without it the saved
-    # activations of Qwen3-0.6B at 64 rows of 320 ids are 61.6 GiB, with it 3.4 GiB.
-    policy = source.model.clone(remat=remat_policy("full"))
-    objective = GRPOObjective(policy, width - 1, pretrained=source.variables,
-                              behavior_importance=2.0, epsilon_high=0.28)
-    pushes: list[float] = []
+def rollout_server(config: Config, source, sampling: Sampling, *, width: int, pushes: list[float]):
+    """Open the requested inference backend and the process it owns, if any."""
     if config.backend == "native":
         server = native_server(source, sampling, slots=config.prompts * config.groups, capacity=width)
         remote = None
@@ -402,11 +517,44 @@ def main(config: Config) -> dict:
 
         # A seeded request is safe to resend, so the SDK's retries cover a
         # keep-alive connection the server closed between requests.
-        completion = OpenAICompletion("policy", openai.OpenAI(base_url=f"{root}/v1", api_key="none", max_retries=3,
-                                                              timeout=600), provider=config.backend)
+        completion = OpenAICompletion(
+            "policy",
+            openai.OpenAI(base_url=f"{root}/v1", api_key="none", max_retries=3, timeout=600),
+            provider=config.backend,
+        )
         server = OpenAIRolloutServer(completion, sampling, push, workers=config.prompts * config.groups * 2)
     else:
         raise ValueError(f"backend is native, vllm or sglang, got {config.backend!r}")
+    return server, remote
+
+
+def main(config: Config) -> dict:
+    if config.smoke:
+        config = replace(config, model=str(SMOKE_MODEL), backend="native", steps=2, prompts=2, groups=2,
+                         prompt_tokens=56, new_tokens=8, tasks=8, window=1)
+    config.out.mkdir(parents=True, exist_ok=True)
+    tokenizer = str(SMOKE_MODEL.parents[0] / "diffusion-gemma-workflow") if config.smoke else config.model
+    width = rollout_width(config)
+    # The server rounds its cache up to whole 64-slot tiles, and an engine
+    # refuses a context past the export's; the next shape bucket covers both.
+    context = next(bucket for bucket in SHAPE_BUCKETS if bucket >= engine_context(config))
+    source = PretrainedDecoder.load(config.model, dtype=jnp.float32 if config.smoke else jnp.bfloat16,
+                             param_dtype=jnp.float32, max_seq_len=context)
+    stock = source.text_generation().sampling
+    words = HFTokenizer(tokenizer)
+    # An attempt ends on EOS; the committed tiny Qwen2 names none, its tokenizer does.
+    eos = stock.eos_id if stock.eos_id is not None else words.eos_id
+    # Temperature one without filters: the engine's reported likelihoods are
+    # then the behavior policy's, on either backend.
+    sampling = Sampling(temperature=1.0, eos_id=eos, pad_id=stock.pad_id)
+
+    # Recompute each block's forward in the backward: without it the saved
+    # activations of Qwen3-0.6B at 64 rows of 320 ids are 61.6 GiB, with it 3.4 GiB.
+    policy = source.model.clone(remat=remat_policy("full"))
+    objective = GRPOObjective(policy, width - 1, pretrained=source.variables,
+                              behavior_importance=2.0, epsilon_high=0.28)
+    pushes: list[float] = []
+    server, remote = rollout_server(config, source, sampling, width=width, pushes=pushes)
 
     # The trainer shows each call's rollout metrics as rollout/<name>; the
     # records are kept for the summary written below.
@@ -422,8 +570,13 @@ def main(config: Config) -> dict:
         sessions = PromptSource(server, reward, decode=words.decode, max_new_tokens=config.new_tokens,
                                 seed=config.seed)
     else:
-        sessions = attempts_source(server, reward, words.decode,
-                                   lambda text: words.tokenizer.encode(text, add_special_tokens=False), config)
+        sessions = attempts_source(
+            server,
+            reward,
+            words.decode,
+            lambda text: words.tokenizer.encode(text, add_special_tokens=False),
+            config,
+        )
     data = Prompts(tokenizer=tokenizer, records=records(config.tasks, config.seed),
                    thinking=config.thinking,
                    max_prompt_len=config.prompt_tokens, pad_id=sampling.pad_id, val_batches=None,
@@ -453,16 +606,28 @@ def main(config: Config) -> dict:
     rewards = [record.metrics.get("reward/mean", 0.0) for record in history]
     window = min(config.window, len(rewards) // 2 or 1)
     summary = {
-        "backend": config.backend, "model": config.model, "updates": int(state.updates),
-        "seconds": time.perf_counter() - began, "device": jax.devices()[0].device_kind,
-        "first_reward": sum(rewards[:window]) / window, "last_reward": sum(rewards[-window:]) / window,
+        "backend": config.backend,
+        "model": config.model,
+        "updates": int(state.updates),
+        "seconds": time.perf_counter() - began,
+        "device": jax.devices()[0].device_kind,
+        "first_reward": sum(rewards[:window]) / window,
+        "last_reward": sum(rewards[-window:]) / window,
         "max_lag": max(record.lag for record in history),
-        "resubmitted": sum(sum(record.resubmitted.values()) for record in history), "push_seconds": pushes, "history": [asdict(record) for record in history],
+        "resubmitted": sum(sum(record.resubmitted.values()) for record in history),
+        "push_seconds": pushes,
+        "history": [asdict(record) for record in history],
     }
     (config.out / "rewards.json").write_text(json.dumps(summary, indent=1))
-    print(f"{config.backend}: reward {summary['first_reward']:.3f} over the first {window} steps, "
-          f"{summary['last_reward']:.3f} over the last {window}; largest lag {summary['max_lag']}"
-          + (f"; median weight push {sorted(pushes)[len(pushes) // 2]:.2f}s over {len(pushes)}" if pushes else ""))
+    print(
+        f"{config.backend}: reward {summary['first_reward']:.3f} over the first {window} steps, "
+        f"{summary['last_reward']:.3f} over the last {window}; largest lag {summary['max_lag']}"
+        + (
+            f"; median weight push {sorted(pushes)[len(pushes) // 2]:.2f}s over {len(pushes)}"
+            if pushes
+            else ""
+        )
+    )
     return summary
 
 

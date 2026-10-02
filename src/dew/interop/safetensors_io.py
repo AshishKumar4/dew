@@ -15,9 +15,8 @@ import os
 import re
 import secrets
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Callable, Collection, Iterator, Mapping
 from pathlib import Path
-from typing import Callable, Collection, Mapping
 
 import jax
 import ml_dtypes
@@ -111,7 +110,9 @@ def _publish(
     try:
         os.close(descriptor)
         backend.save_file(
-            {name: _host_array(array) for name, array in tensors().items()}, temporary, metadata=None if metadata is None else dict(metadata)
+            {name: _host_array(array) for name, array in tensors().items()},
+            temporary,
+            metadata=None if metadata is None else dict(metadata),
         )
         os.replace(temporary, destination)
     finally:
@@ -244,7 +245,9 @@ def read_weights(folder) -> dict[str, np.ndarray]:
         values, _ = read_file(folder / shard)
         for name, value in values.items():
             if name in owner:
-                raise ValueError(f"tensor {name!r} is stored in both {owner[name]} and {shard} under {folder}")
+                raise ValueError(
+                    f"tensor {name!r} is stored in both {owner[name]} and {shard} under {folder}"
+                )
             owner[name] = shard
             tensors[name] = value
     return tensors
@@ -331,7 +334,9 @@ _OWN_SHARD = re.compile(r"model-[0-9a-f]{8}-\d{5}-of-\d{5}\.safetensors")
 """The shard names `save_sharded` writes."""
 
 
-def save_sharded(tensors: Mapping[str, np.ndarray], directory, max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
+def save_sharded(
+    tensors: Mapping[str, np.ndarray], directory, max_shard_size: int | str = MAX_SHARD_SIZE
+) -> None:
     """Write `tensors` as `model.safetensors`, or as numbered shards and their
     index when they exceed `max_shard_size`, reading one shard's tensors at a
     time.
@@ -340,8 +345,8 @@ def save_sharded(tensors: Mapping[str, np.ndarray], directory, max_shard_size: i
     `LazyTensors` table builds each shard's tensors as that shard is written
     and the host holds one shard of them at a time. A dense decoder export
     and a source-layout `Pretrained.export` are such tables. A quantized
-    source's requantization, `save_pretrained_decoder` through the Gemma 4
-    and GLM-5-next exporters, and DiffusionGemma's export adapter build their
+    source's requantization, `PretrainedDecoder.from_model` through the
+    GLM-5-next exporter, and DiffusionGemma's export adapter build their
     whole table first, and this writer then holds what it is given.
 
     An export replaces the one `directory` held without a moment at which a
@@ -407,8 +412,7 @@ def save_hf_layout(params, config: Mapping[str, object], directory,
     os.makedirs(directory, exist_ok=True)
     if not isinstance(params, LazyTensors):
         # Leaves stay where they are; `save_sharded` brings one shard at a time to the host.
-        leaves, _ = jax.tree_util.tree_flatten_with_path(params)
-        params = {_leaf_name(path): leaf for path, leaf in leaves}
+        params = _flatten(params)
     save_sharded(params, directory, max_shard_size)
     with open(os.path.join(directory, CONFIG_FILE), "w") as handle:
         json.dump(config, handle, indent=2)

@@ -60,7 +60,7 @@ def missing_weights(source: str, files: Collection[str]) -> str:
                 f"those, or convert the repo to safetensors at {pickles.CONVERT_SPACE}")
     if gguf:
         return (f"{source} ships GGUF files ({', '.join(gguf)}); load one with "
-                f"load_pretrained(..., gguf_file={gguf[0]!r})")
+                f"Pretrained.load(..., gguf_file={gguf[0]!r})")
     return f"{source} has no model.safetensors or model.safetensors.index.json"
 
 
@@ -105,7 +105,9 @@ def repo_file(name_or_dir: str | Path, directory: Path, filename: str) -> Path:
     if os.path.isdir(name_or_dir):
         path = directory / filename
         if not path.is_file():
-            present = sorted(entry.relative_to(directory).as_posix() for entry in directory.rglob(f"*{suffix}"))
+            present = sorted(
+                entry.relative_to(directory).as_posix() for entry in directory.rglob(f"*{suffix}")
+            )
             raise FileNotFoundError(f"{path} does not exist; the {suffix} files in {directory} are {present}")
         return path
     from huggingface_hub import hf_hub_download

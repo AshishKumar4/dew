@@ -16,8 +16,8 @@ import pytest
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
-from dew.nn.moe import Router, deepseek_v2_aux_loss
-from dew.objectives.base import Step, scalar_loss
+from dew.nn.moe import Router, global_router_loss, router_moments, sequence_router_losses
+from dew.objectives.base import Step
 from dew.objectives.lm import TEXT_KEY, LMObjective
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "moe"
@@ -86,11 +86,11 @@ def test_the_balance_loss_matches_the_released_gate_equations():
     first = np.array([2, 1, 0, 0]) / (3 / 4) * np.mean(np.asarray(scores[0]), axis=0)
     second = np.array([0, 0, 1, 2]) / (3 / 4) * np.mean(np.asarray(scores[1]), axis=0)
     expected = 0.5 * (first.sum() + second.sum()) * 0.01
-    assert float(deepseek_v2_aux_loss(scores, indices, 0.01, seq_aux=True)) == pytest.approx(expected)
+    assert float(jnp.mean(sequence_router_losses(scores, indices, 0.01))) == pytest.approx(expected)
     pooled = np.array([2, 1, 1, 2]) / 6 * 4 * np.mean(np.asarray(scores).reshape(-1, 4), axis=0)
-    assert float(deepseek_v2_aux_loss(scores, indices, 0.01, seq_aux=False)) == pytest.approx(
-        pooled.sum() * 0.01)
-    assert float(deepseek_v2_aux_loss(scores, indices, 0.01, seq_aux=False)) != pytest.approx(expected)
+    global_loss = float(global_router_loss(router_moments(scores, indices), 0.01))
+    assert global_loss == pytest.approx(pooled.sum() * 0.01)
+    assert global_loss != pytest.approx(expected)
 
 
 def test_the_objective_adds_every_sparse_layers_balance_loss():
@@ -106,16 +106,19 @@ def test_the_objective_adds_every_sparse_layers_balance_loss():
     balanced = LMObjective(model, 8, aux_loss_alpha=0.05, seq_aux=False)
     params = plain.init(jax.random.PRNGKey(0))
     step = Step(step=jnp.asarray(0), key=jax.random.PRNGKey(2), ema=None)
-    base, _ = scalar_loss(plain, params, {TEXT_KEY: tokens}, step)
-    loss, aux = scalar_loss(balanced, params, {TEXT_KEY: tokens}, step)
+    base, _ = plain.scalar_loss(params, {TEXT_KEY: tokens}, step)
+    loss, aux = balanced.scalar_loss(params, {TEXT_KEY: tokens}, step)
 
     _, sown = model.apply(params, tokens[:, :-1], mutable=["router"],
                           method=type(model).hidden_states)
     expected = sum(
-        deepseek_v2_aux_loss(sown["router"][layer]["mlp"]["gate"]["scores"][0],
-                             sown["router"][layer]["mlp"]["gate"]["indices"][0], 0.05, False)
+        global_router_loss(router_moments(sown["router"][layer]["mlp"]["gate"]["scores"][0],
+                                          sown["router"][layer]["mlp"]["gate"]["indices"][0]), 0.05)
         for layer in ("layers_0", "layers_1"))
     assert float(loss - base) == pytest.approx(float(expected), rel=1e-5)
     assert float(aux.metrics["aux_loss"]) == pytest.approx(float(expected), rel=1e-5)
-    grads = jax.grad(lambda p: scalar_loss(balanced, p, {TEXT_KEY: tokens}, step)[0] - scalar_loss(plain, p, {TEXT_KEY: tokens}, step)[0])(params)
+    grads = jax.grad(
+        lambda p: balanced.scalar_loss(p, {TEXT_KEY: tokens}, step)[0]
+        - plain.scalar_loss(p, {TEXT_KEY: tokens}, step)[0]
+    )(params)
     assert float(jnp.abs(grads["params"]["layers_0"]["mlp"]["gate"]["kernel"]).max()) > 0

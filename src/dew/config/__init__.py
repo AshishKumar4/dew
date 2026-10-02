@@ -12,13 +12,12 @@ turns into a subcommand (`data:token-windows --data.path ...`).
 The resolved config is the run's spec. A recipe writes it to `run.json` next
 to the checkpoints with `save`, and `load` reads it back into the same class,
 so inference rebuilds a run from what training was built from. A field the
-file lacks takes its declared default, so a field added later must default to
-what runs recorded before it did; tests/fixtures/record_defaults.json holds
-every recorded field's default to that. A field the class does not have
+file lacks takes its declared default, and a field the class does not have
 raises.
 """
 
 import dataclasses
+import datetime
 import functools
 import hashlib
 import json
@@ -28,33 +27,47 @@ import re
 import sys
 import types
 import typing
-from collections.abc import Callable, Mapping as MappingABC, MutableMapping, Sequence
-from typing import TYPE_CHECKING, Annotated, Literal, Mapping, Self
+from collections.abc import Callable, Mapping, Mapping as MappingABC, MutableMapping, Sequence
+from pathlib import Path
+from typing import TYPE_CHECKING, Annotated, Literal, Self
 
 import jax
+import optax
 import tyro
 from etils import epath
+from flax import linen as nn
 
 import dew.data  # registers the datasets a config names
 import dew.io
 import dew.nn.backbones  # registers the models a config names
 from dew import registry
 from dew.artifacts import agree_process_phase, agreed
-from dew.checkpoints import RUN_FILE, Checkpoints
-from dew.data import Dataset, DatasetSpec, Ramp, ramped
-from dew.data.dataset import json_list_argument
-from dew.lora import LoRA, attach
+from dew.checkpoints import RUN_FILE, Checkpoints, Keep
+from dew.config.sweep import Search, Space, _read, _write, override, random_search
+from dew.data import Dataset, DatasetSpec, Ramp
+from dew.data.dataset import json_list_argument, ramped
+from dew.lora import LoRA, _attach
 from dew.nn.attention import AttentionImpl
 from dew.objectives.base import Effects, Loss, Metric, Objective
-from dew.records import JSON
+from dew.records import JSON, duration, recorded_duration
 from dew.registry import REGISTRIES, _declared_type, datasets, models, schedules, with_precision
 from dew.telemetry.instrumentation import default_compilation_cache_dir, dew_cache_dir
-from dew.telemetry.records import RunRecord, json_value, packages_installed
+from dew.telemetry.records import RunRecord, TrialFinished, json_value, packages_installed
+from dew.training.display import TrainingDisplay
 from dew.training.distributed import Layout, MeshSpec
-from dew.training.optim import ParamGroup, ScheduleBase, build_optimizer
-from dew.training.quantization import Quantization, quantize
+from dew.training.optim import (
+    BF16_STATE_OPTIMIZERS,
+    OPTIMIZER_MAP,
+    ParamGroup,
+    ScheduleBase,
+    learning_rate_schedule,
+    param_labels,
+    power_profiles,
+)
+from dew.training.quantization import Quantization, _quantize
+from dew.training.selection import Best
 from dew.training.state import TrainState
-from dew.training.tracker import LocalTracker, Trackers, WandbTracker
+from dew.training.tracker import LocalTracker, Tracker, Trackers, WandbTracker
 from dew.training.trainer import ProfileWindow, Rollout, Trainer
 
 JsonDict = Annotated[
@@ -88,7 +101,7 @@ class ModelConfig:
 
     architecture: str = "simple_dit"
     config: JsonDict = dataclasses.field(default_factory=dict)
-    dtype: registry.DtypeName = "bfloat16"
+    dtype: registry.DtypeName | None = "bfloat16"
     """Compute dtype; parameter storage is independent."""
     param_dtype: registry.DtypeName | None = None
     """Parameter storage, where the model declares the field. Unset stores
@@ -97,7 +110,11 @@ class ModelConfig:
     """What every matmul of the model asks XLA for, where the model declares
     a `precision` field: `default` is the backend's fastest algorithm,
     `high` and `highest` trade throughput for mantissa bits (on Ampere and
-    later, tf32 and fp32 against bf16x3). Unset leaves the model's own."""
+    later, tf32 and fp32 against bf16x3). Unset leaves the model's own, the
+    default. Under bf16 compute a decoder's vocabulary head at the default
+    rounds its logits and their gradient to bf16, as torch autocast does;
+    `high` and `highest` keep that head fp32, the setting for comparing
+    parallel layouts in bf16 (`dew.nn.precision.head_product`)."""
     attention_impl: AttentionImpl = "auto"
     """Attention kernel; 'auto' is cudnn on a GPU for the shapes cudnn
     supports and xla for the rest, xla on any other backend."""
@@ -121,6 +138,41 @@ class ModelConfig:
         """Read back the record `RunConfig.to_dict` writes for this field."""
         return _built(cls, values)
 
+    @classmethod
+    def from_model(cls, model) -> Self:
+        """The registered module's constructor fields, with its actual compute settings."""
+        architecture = models.name_of(type(model))
+        fields = {}
+        compute, storage, attention = None, None, 'auto'
+        precision: Literal['default', 'high', 'highest'] | None = None
+        for field in dataclasses.fields(model):
+            if not field.init or field.name in ('parent', 'name'):
+                continue
+            value = getattr(model, field.name)
+            if field.name == 'dtype':
+                compute = registry.dtype_name(value)
+            elif field.name == 'param_dtype':
+                storage = registry.dtype_name(value)
+            elif field.name == 'precision':
+                if value is not None:
+                    setting = str(value).lower()
+                    if setting == 'default':
+                        precision = 'default'
+                    elif setting == 'high':
+                        precision = 'high'
+                    elif setting == 'highest':
+                        precision = 'highest'
+                    else:
+                        raise ValueError(f'model precision {value!r} has no recorded counterpart')
+            elif field.name == 'attention_impl':
+                attention = value
+            elif callable(value) and value is field.default:
+                continue
+            else:
+                fields[field.name] = _to_json(value, _declared_type(type(model), field.name))
+        return cls(architecture, fields, dtype=compute, param_dtype=storage,
+                   matmul_precision=precision, attention_impl=attention)
+
     def build(self):
         return models.build(self.architecture, self.fields())
 
@@ -140,8 +192,8 @@ class OptimConfig:
     weight_decay: float | None = None
     param_groups: Annotated[tuple[ParamGroup, ...], json_list_argument(ParamGroup)] = ()
     """Per-group learning-rate multipliers and weight decay, first match wins;
-    empty moves every parameter alike. `dew.training.optim.mup_param_groups`
-    is lm-engine's muP split."""
+    empty moves every parameter alike. `ParamGroup.mup` is lm-engine's muP
+    split."""
     clip_grads: float = 0.0
     state_dtype: Literal["float32", "bfloat16"] = "float32"
     """Adam's moments in memory. bfloat16 stores both stochastically rounded
@@ -151,6 +203,71 @@ class OptimConfig:
     """Renormalize every magnitude-preserving weight (`dew.nn.mp.MPConv`)
     after each update, EDM2's forced weight normalization, which its
     `edm2_unet` trains with (`dew.nn.mp.forced_weight_normalization`)."""
+    ema_profiles: tuple[float, ...] = ()
+    """Relative standard deviations of the power-function EMAs a run keeps
+    for post-hoc EMA (`dew.training.optim.power_profiles`), such as Karras
+    et al.'s (0.05, 0.10); every checkpoint save snapshots them, and
+    `Checkpoints.posthoc_ema` builds an average of any other
+    relative standard deviation from the snapshots. Empty keeps none."""
+
+    def build(self, steps: int) -> optax.GradientTransformation:
+        """Build the solver this config describes, with its schedule, parameter
+        groups and clipping.
+
+        `steps` is the run's length, which a schedule decays over unless the
+        config names its own end. `param_groups` runs one solver per group under
+        `optax.multi_transform`, each on the schedule times its multiplier and
+        with its own weight decay; the global-norm clip still reads every
+        gradient together, before the groups split them."""
+        learning_rate = learning_rate_schedule(self, steps)
+        opts = dict(self.optimizer_opts)
+        if self.weight_decay is not None:
+            opts['weight_decay'] = self.weight_decay
+            if self.optimizer in ('muon', 'muonclip'):
+                # Muon's weight_decay does not cover the AdamW group's norm scales.
+                opts.setdefault('adam_weight_decay', self.weight_decay)
+        make = OPTIMIZER_MAP[self.optimizer]
+        if self.state_dtype == 'bfloat16':
+            if self.optimizer not in BF16_STATE_OPTIMIZERS:
+                raise ValueError(
+                    f"state_dtype='bfloat16' stores Adam's moments in bf16, which "
+                    f"{sorted(BF16_STATE_OPTIMIZERS)} have; {self.optimizer!r} does not")
+            make = BF16_STATE_OPTIMIZERS[self.optimizer]
+        if self.param_groups:
+            names = [group.name for group in self.param_groups]
+            if len(set(names)) != len(names):
+                raise ValueError(f"param group names repeat: {names}")
+            solvers = {}
+            for group in self.param_groups:
+                group_opts = dict(opts)
+                if group.weight_decay is not None:
+                    group_opts['weight_decay'] = group.weight_decay
+                    if self.optimizer in ('muon', 'muonclip'):
+                        group_opts['adam_weight_decay'] = group.weight_decay
+                solvers[group.name] = make(
+                    _scaled(learning_rate, group.learning_rate_multiplier), **group_opts)
+            solver = optax.multi_transform(solvers, param_labels(self.param_groups))
+        else:
+            solver = make(learning_rate, **opts)
+
+        if self.clip_grads > 0:
+            solver = optax.chain(optax.clip_by_global_norm(self.clip_grads), solver)
+        if self.forced_weight_normalization:
+            from dew.nn.mp import forced_weight_normalization
+
+            solver = optax.chain(solver, forced_weight_normalization())
+        if self.ema_profiles:
+            solver = power_profiles(solver, self.ema_profiles)
+        return solver
+
+
+def _scaled(learning_rate: float | optax.Schedule, multiplier: float) -> float | optax.Schedule:
+    if multiplier == 1.0:
+        return learning_rate
+    if callable(learning_rate):
+        schedule = learning_rate
+        return lambda count: multiplier * schedule(count)
+    return multiplier * learning_rate
 
 
 @dataclasses.dataclass(frozen=True)
@@ -163,17 +280,86 @@ class Wandb:
     offline: bool = False
 
 
+def _best_argument():
+    """A metric name or JSON policies through one CLI argument."""
+    def read(given):
+        text = given[0]
+        if text == 'None':
+            return None
+        if text.startswith(('{', '[')):
+            policies = json.loads(text)
+            return (
+                tuple(Best(**policy) for policy in policies)
+                if isinstance(policies, list)
+                else Best(**policies)
+            )
+        return Best(text)
+
+    def write(policy):
+        if policy is None:
+            return ['None']
+        if isinstance(policy, str):
+            return [policy]
+        return [
+            json.dumps(
+                [_to_json(entry, Best) for entry in policy]
+                if isinstance(policy, tuple)
+                else _to_json(policy, Best)
+            )
+        ]
+
+    return tyro.constructors.PrimitiveConstructorSpec(
+        nargs=1, metavar='METRIC|JSON', instance_from_str=read,
+        is_instance=lambda policy: policy is None or isinstance(policy, (str, Best, tuple)),
+        str_from_instance=write)
+
+
+def _keep_argument():
+    return tyro.constructors.PrimitiveConstructorSpec(
+        nargs=1,
+        metavar="LATEST|JSON",
+        instance_from_str=lambda given: Keep(**json.loads(given[0]))
+        if given[0].startswith("{")
+        else int(given[0]),
+        is_instance=lambda keep: isinstance(keep, (int, Keep)),
+        str_from_instance=lambda keep: [
+            json.dumps(_to_json(keep, Keep)) if isinstance(keep, Keep) else str(keep)
+        ],
+    )
+
+
+def _cadence_argument():
+    def read(given):
+        value = given[0]
+        if value == 'None':
+            return None
+        if value == 'epoch':
+            return value
+        return int(value) if value.isdecimal() else duration(value)
+    return tyro.constructors.PrimitiveConstructorSpec(
+        nargs=1,
+        metavar="STEPS|DURATION|epoch",
+        instance_from_str=read,
+        is_instance=lambda value: value is None or isinstance(value, (int, str, datetime.timedelta)),
+        str_from_instance=lambda value: [
+            recorded_duration(value) if isinstance(value, datetime.timedelta) else str(value)
+        ],
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class TrainerConfig:
     """Holds the run length, checkpointing, sharding and run tracking."""
 
     name: str | None = None
     checkpoint_dir: str = "./checkpoints"
-    keep: int = 2
+    keep: Annotated[int | Keep, _keep_argument()] = 2
     """Latest checkpoints kept, besides the best one."""
+    best: Annotated[str | Best | tuple[Best, ...] | None, _best_argument()] = None
+    """Metric name and ranking policy; None selects validation loss or training loss."""
     batch_size: int = 32
     """Global batch, over every process."""
-    seed: int = 0
+    key: int = 0
     """Seed of the run key: parameter init and every per-step draw."""
     steps: int | None = None
     epochs: int | None = None
@@ -183,7 +369,7 @@ class TrainerConfig:
     """Steps between validation passes: a number of steps, "epoch" for one
     pass over the data, None to never validate. "epoch" over a stream that
     reports no record count raises a ValueError, since it has no pass."""
-    checkpoint_every: int | Literal["epoch"] | None = "epoch"
+    checkpoint_every: Annotated[int | str | datetime.timedelta | None, _cadence_argument()] = "epoch"
     """Steps between checkpoints, the same three answers. None is what a
     stream whose iterator cannot report a read position trains with; the
     trainer refuses any other answer for one."""
@@ -196,8 +382,8 @@ class TrainerConfig:
     One optimizer update a step either way, and the compiled step is traced
     once per stage."""
     dynamic_scale: bool = False
-    mesh: MeshSpec = MeshSpec()
-    layout: Layout = Layout()
+    mesh: MeshSpec = dataclasses.field(default_factory=MeshSpec)
+    layout: Layout = dataclasses.field(default_factory=Layout)
     profile: ProfileWindow | None = None
     """One profiler window: the steps to trace, the warmup before it and the
     directory it is written to. Unset traces nothing."""
@@ -208,7 +394,8 @@ class TrainerConfig:
     wandb: Wandb | None = None
     """Optional W&B sink in addition to the local tracking journal."""
     multi_host: bool | None = None
-    """Join the JAX process pool. None asks and continues alone only when no cluster is configured; True requires the pool; False never asks."""
+    """Join the JAX process pool. None asks and continues alone only when no
+    cluster is configured; True requires the pool; False never asks."""
     xla_flags: str | None = None
     """Extra XLA_FLAGS for this run, appended to the environment by
     `prepare_process` before JAX opens a backend. Library users set XLA_FLAGS
@@ -221,6 +408,32 @@ class TrainerConfig:
     def __post_init__(self):
         if self.steps is not None and self.epochs is not None:
             raise ValueError("steps and epochs both name the run length; set one")
+        if isinstance(self.checkpoint_every, str) and self.checkpoint_every != 'epoch':
+            object.__setattr__(self, 'checkpoint_every', duration(self.checkpoint_every))
+        if isinstance(self.keep, Mapping):
+            object.__setattr__(self, 'keep', _built(Keep, self.keep))
+        if isinstance(self.keep, Keep) and self.keep.where is not None:
+            raise TypeError("Keep.where is code-only; a recorded retention policy contains no callable")
+        if self.best is not None:
+            choices = self.best if isinstance(self.best, (tuple, list)) else (self.best,)
+            rebuilt = []
+            for choice in choices:
+                if isinstance(choice, str):
+                    choice = Best(choice)
+                elif isinstance(choice, Mapping):
+                    choice = _built(Best, choice)
+                if not isinstance(choice, Best) or choice._source is not None:
+                    raise TypeError("a recorded best selector names metrics; callable scores are code-only")
+                rebuilt.append(choice)
+            object.__setattr__(
+                self, "best", tuple(rebuilt) if isinstance(self.best, (tuple, list)) else rebuilt[0]
+            )
+
+    def best_policies(self):
+        if self.best is None:
+            return None
+        return (Best(self.best),) if isinstance(self.best, str) else (
+            self.best if isinstance(self.best, tuple) else (self.best,))
 
     def total_steps(self, dataset: Dataset) -> int:
         """Return the run's length in steps, from `steps` or from `epochs` over `data`."""
@@ -238,8 +451,15 @@ class TrainerConfig:
         """Return the steps between validation passes over `data`, or None for never."""
         return self._interval(self.eval_every, dataset, "eval-every")
 
-    def checkpoint_interval(self, dataset: Dataset) -> int | None:
-        """Return the steps between checkpoints over `data`, or None for never."""
+    def checkpoint_interval(self, dataset: Dataset) -> int | datetime.timedelta | None:
+        """Steps, or a recorded duration such as 30m, between checkpoints."""
+        value = self.checkpoint_every
+        if isinstance(value, datetime.timedelta):
+            if value.total_seconds() <= 0:
+                raise ValueError("checkpoint_every duration must be positive")
+            return value
+        if isinstance(value, str) and value != 'epoch':
+            return duration(value)
         return self._interval(self.checkpoint_every, dataset, "checkpoint-every")
 
     @staticmethod
@@ -310,6 +530,10 @@ def _to_json(value, annotation) -> JSON:
     """Return `value` as JSON: a dict, a list, or a scalar json.dump can write.
     `annotation` is the declared field type, so the write side names the same
     registry and member types the read side rebuilds from."""
+    if isinstance(value, datetime.timedelta):
+        return recorded_duration(value)
+    if isinstance(value, type) and value.__module__ in ('jax.numpy', 'numpy', 'ml_dtypes'):
+        return registry.dtype_name(value)
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         held = _registry_for(annotation)
         if held is not None and not any(type(value) is member
@@ -321,7 +545,8 @@ def _to_json(value, annotation) -> JSON:
         if held is None:
             held = _registry_for(type(value))
         fields = {f.name: _to_json(getattr(value, f.name), _declared_type(type(value), f.name))
-                  for f in dataclasses.fields(value) if _recorded(f)}
+                  for f in dataclasses.fields(value) if _recorded(f)
+                  and not (isinstance(value, nn.Module) and f.name in ('parent', 'name'))}
         if held is None:
             return fields
         name = held.name_of(type(value))
@@ -393,10 +618,8 @@ def _has_default(field: dataclasses.Field) -> bool:
 
 def _fields(cls: type, values: registry.Configured) -> dict[str, registry.Configured]:
     """The record's fields as `cls` declares them. A field the record lacks
-    takes its declared default, which says what runs recorded before the
-    field existed did (tests/fixtures/record_defaults.json holds every
-    default to that); a field `cls` does not declare, or a required one the
-    record lacks, raises."""
+    takes its declared default; a field `cls` does not declare, or a
+    required one the record lacks, raises."""
     if not isinstance(values, Mapping):
         raise ValueError(f"{cls.__name__} is built from a record of its fields, not {values!r}")
     declared = [f for f in dataclasses.fields(cls) if _recorded(f)]
@@ -480,8 +703,7 @@ class RunConfig:
     """Describes a whole run. Recipes add their objective's knobs by subclassing this."""
 
     model: ModelConfig = dataclasses.field(default_factory=ModelConfig)
-    data: DataSpec = dataclasses.field(
-        default_factory=lambda: datasets["oxford_flowers102"]())
+    data: DataSpec = dataclasses.field(default_factory=lambda: datasets["tfds_images"]())
     optim: OptimConfig = dataclasses.field(default_factory=OptimConfig)
     trainer: TrainerConfig = dataclasses.field(default_factory=TrainerConfig)
     objective: str | None = None
@@ -566,9 +788,9 @@ class RunConfig:
                 f"reads {dataset.batch} records a step; load it with "
                 f"load(batch={self.trainer.batch_size})")
         if self.trainer.quantization is not None:
-            quantize(objective, self.trainer.quantization)
+            _quantize(objective, self.trainer.quantization)
         if self.lora is not None:
-            attach(objective, self.lora)
+            _attach(objective, self.lora)
         self = self._naming(objective)
         trainer = self.trainer
         # Before the run length, since a ramp reads fewer records a step early
@@ -588,24 +810,29 @@ class RunConfig:
             def record_run() -> None:
                 """Write the run's record and name where it is tracked, on rank zero."""
                 if jax.process_index() == 0:
-                    print("Experiment_Name:", name)
-                    print(f"Local tracking: {local.directory}")
+                    display = TrainingDisplay()
+                    display.note(f"Experiment_Name: {name}")
+                    display.note(f"Local tracking: {local.directory}")
                     self.save(checkpoints.directory)
                     tracker.artifact(RunRecord(name, json_value(self.to_dict()),
                         json_value(summary or {}), steps, packages_installed()), 0)
 
             agreed("run metadata", record_run)
-            state = Trainer.from_config(
-                trainer, objective, build_optimizer(self.optim, steps),
-                key=jax.random.key(trainer.seed),
-                checkpoints=checkpoints,
-                tracker=tracker, rollout=rollout,
+            # The trainer holds mesh, layout, accumulation, dynamic_scale and
+            # profile; prepare_process read the process fields, and the rest
+            # are fit's arguments or built the checkpoints and the tracker.
+            state = Trainer(
+                objective, self.optim.build(steps), key=trainer.key,
+                mesh=trainer.mesh, layout=trainer.layout, accumulation=trainer.accumulation,
+                dynamic_scale=trainer.dynamic_scale, checkpoints=checkpoints, tracker=tracker,
+                rollout=rollout, profile=trainer.profile,
             ).fit(
                 dataset, steps=steps,
                 log_every=trainer.log_every,
                 eval_every=trainer.eval_interval(dataset),
                 checkpoint_every=trainer.checkpoint_interval(dataset),
                 metrics=metrics, preview=trainer.wandb is not None,
+                best=trainer.best_policies(),
             )
             def publish_checkpoint() -> None:
                 """Upload the checkpoint the run ended on, where a tracker takes one."""
@@ -619,3 +846,34 @@ class RunConfig:
 
         finally:
             _closed(tracker, sys.exception())
+
+    def sweep(self, space: Space, *, train: Callable[[Self], float], trials: int, ledger: str | Path,
+              tracker: Tracker, search: Search = random_search, seed: int = 0) -> list[TrialFinished]:
+        """Train `trials` trials of this config over `space` and return the ledger.
+
+        Each trial draws a point from `space`, trains under the run name
+        `<trainer.name>/trial-<index>` so trials keep their own checkpoints and
+        tracking, and records the score `train` returns for it. `tracker`
+        receives that score as `sweep/value` at the trial's number and the
+        trial's `TrialFinished` record. A trial reaches `ledger` before it is
+        reported, so rerunning the same call continues an interrupted sweep.
+        """
+        path = Path(ledger)
+        if self.trainer.name is None:
+            raise ValueError("a sweep needs trainer.name: every trial trains under "
+                             "<trainer.name>/trial-<index>, and trials sharing one name would "
+                             "resume from each other")
+        finished = _read(path, space)
+        for index in range(len(finished), trials):
+            point = search(space, finished, seed)
+            name = f"{self.trainer.name}/trial-{index}"
+            value = train(override(self, {**point, "trainer.name": name}))
+            trial = TrialFinished(index, name, point, value)
+            finished.append(trial)
+            _write(path, space, finished)
+            tracker.log({"sweep/value": value}, index)
+            tracker.artifact(trial, index)
+        return finished
+
+
+__all__ = ["JsonDict", "ModelConfig", "OptimConfig", "RunConfig", "TrainerConfig", "Wandb"]

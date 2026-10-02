@@ -158,7 +158,9 @@ def dequantize_mxfp4(blocks: ArrayLike, scales: ArrayLike) -> np.ndarray:
     high nibble, and every value is exact in the bf16 it decodes to.
     """
     blocks, scales = _mxfp4_arrays(blocks, scales)
-    return decode_e2m1(blocks.reshape(*scales.shape[:2], blocks.shape[2] * blocks.shape[3]), scales).swapaxes(1, 2)
+    return decode_e2m1(blocks.reshape(*scales.shape[:2], blocks.shape[2] * blocks.shape[3]), scales).swapaxes(
+        1, 2
+    )
 
 
 def quantize_mxfp4(weight: ArrayLike) -> tuple[np.ndarray, np.ndarray]:
@@ -259,7 +261,9 @@ def _paired(tensors: Mapping[str, np.ndarray], suffixes: tuple[str, ...], weight
     for stem in stems:
         for suffix in suffixes:
             if stem + suffix not in tensors:
-                raise ValueError(f"{stem}{weight} arrives quantized and the checkpoint holds no {stem}{suffix}")
+                raise ValueError(
+                    f"{stem}{weight} arrives quantized and the checkpoint holds no {stem}{suffix}"
+                )
     return tuple(stem + weight for stem in stems)
 
 
@@ -290,26 +294,35 @@ PACKED_SUFFIXES = ('.weight_packed', '.weight_scale')
 """compressed-tensors' `mxfp4-pack-quantized` pair beside a Linear's module name."""
 
 
+def _config_groups(quantization: Mapping[str, object]) -> Mapping[str, object]:
+    """A compressed-tensors config's weight groups, refused unless its weights
+    are stored compressed and its KV cache is not quantized."""
+    if quantization.get('quantization_status', 'compressed') != 'compressed':
+        raise ValueError("compressed-tensors quantization_status must be 'compressed'")
+    if quantization.get('kv_cache_scheme') is not None:
+        raise ValueError("compressed-tensors kv_cache_scheme quantizes the cache, which this loader "
+                         "does not; load a checkpoint without a kv_cache_scheme")
+    groups = quantization.get('config_groups')
+    if not isinstance(groups, Mapping) or not groups:
+        raise ValueError("compressed-tensors config_groups must name the quantized weights")
+    return groups
+
+
 def packed_mxfp4_format(quantization: Mapping[str, object]) -> None:
     """Refuse a compressed-tensors config whose tensors are not MXFP4 packed weights.
 
     Weights alone are quantized, as groups of 32 inputs under one E8M0
     exponent; activations and the KV cache stay in the compute dtype.
     """
-    if quantization.get('quantization_status', 'compressed') != 'compressed':
-        raise ValueError("compressed-tensors quantization_status must be 'compressed'")
-    if quantization.get('kv_cache_scheme') is not None:
-        raise ValueError("compressed-tensors kv_cache_scheme quantizes the cache, which this loader does not")
-    groups = quantization.get('config_groups')
-    if not isinstance(groups, Mapping) or not groups:
-        raise ValueError("compressed-tensors config_groups must name the quantized weights")
-    for name, group in groups.items():
+    for name, group in _config_groups(quantization).items():
         group = records.record(group, f'config_groups.{name}')
         if group.get('format', 'mxfp4-pack-quantized') != 'mxfp4-pack-quantized':
             raise ValueError(f"config_groups.{name}.format must be mxfp4-pack-quantized")
         for side in ('input_activations', 'output_activations'):
             if group.get(side) is not None:
-                raise ValueError(f"config_groups.{name}.{side} quantizes activations, which this loader does not")
+                raise ValueError(
+                    f"config_groups.{name}.{side} quantizes activations, which this loader does not"
+                )
         weights = records.record(group.get('weights'), f'config_groups.{name}.weights')
         wrong = sorted(key for key, value in PACKED_MXFP4_WEIGHTS.items() if weights.get(key, value) != value)
         if wrong:
@@ -639,8 +652,13 @@ def _decode_v4(tensors: Mapping[str, np.ndarray], name: str, *, block: int,
     partner, layout = _v4_partners(name)[0], deepseek_v4_layout(name, fp4_experts)
     scale = tensors[partner]
     if layout == 'fp4':
-        if (value.dtype not in _CODE_DTYPES or value.ndim != 2 or scale.dtype != ml_dtypes.float8_e8m0fnu
-                or scale.shape != (value.shape[0], 2 * value.shape[1] // GROUP) or 2 * value.shape[1] % GROUP):
+        if (
+            value.dtype not in _CODE_DTYPES
+            or value.ndim != 2
+            or scale.dtype != ml_dtypes.float8_e8m0fnu
+            or scale.shape != (value.shape[0], 2 * value.shape[1] // GROUP)
+            or 2 * value.shape[1] % GROUP
+        ):
             raise ValueError(
                 f"{name} is a routed expert, which expert_dtype 'fp4' ships as int8 [out, in / 2] E2M1 "
                 f"pairs beside a float8_e8m0fnu [out, in / {GROUP}] {partner}, got {value.dtype} "
@@ -774,10 +792,16 @@ def _scaled_product(codes: np.ndarray, zeros: np.ndarray | int, scales: np.ndarr
     most 8 bits and scales of at most float32 the float32 product is exact
     or rounds as theirs does, so one rounding to that dtype is theirs.
     """
-    return ((codes - zeros).astype(np.float32) * scales.astype(np.float32)).astype(scales.dtype).astype(np.float32)
+    return (
+        ((codes - zeros).astype(np.float32) * scales.astype(np.float32))
+        .astype(scales.dtype)
+        .astype(np.float32)
+    )
 
 
-def _encoded_codes(name: str, weight: np.ndarray, zeros: np.ndarray, scales: np.ndarray, bits: int) -> np.ndarray:
+def _encoded_codes(
+    name: str, weight: np.ndarray, zeros: np.ndarray, scales: np.ndarray, bits: int
+) -> np.ndarray:
     """`round((w + zero * scale) / scale)` for [in, out] `weight` against per-input
     zeros and scales, refusing codes the packing cannot hold."""
     w, s = weight.astype(np.float64), scales.astype(np.float64)
@@ -786,13 +810,17 @@ def _encoded_codes(name: str, weight: np.ndarray, zeros: np.ndarray, scales: np.
     if outside:
         raise ValueError(
             f"{name}: {outside} trained values fall outside the source's {bits}-bit grid, which the "
-            "libraries' packing would spill or clamp; save dense instead, with dataclasses.replace(pretrained, "
+            "libraries' packing would spill or clamp; save dense instead, with "
+            "dataclasses.replace(pretrained, "
             "config={k: v for k, v in pretrained.config.items() if k != 'quantization_config'}, "
-            "quantized_tensors=()).save(directory)")
+            "quantized_tensors=()).save(directory)"
+        )
     return codes.astype(np.int32)
 
 
-def _gridded(grid: Mapping[str, np.ndarray] | None, name: str, parts: tuple[str, ...]) -> tuple[np.ndarray, ...]:
+def _gridded(
+    grid: Mapping[str, np.ndarray] | None, name: str, parts: tuple[str, ...]
+) -> tuple[np.ndarray, ...]:
     if grid is None or any(part not in grid for part in parts):
         raise ValueError(f"{name} encodes against the scales and zeros it was loaded with, which this "
                          "codec was not given; save it through the Pretrained that loaded it")
@@ -950,52 +978,69 @@ def _weight_scheme(quantization: Mapping[str, object]) -> _WeightScheme:
     if form not in COMPRESSED_TENSORS_FORMATS:
         raise ValueError(f"compressed-tensors format {form!r}: this loader reads "
                          f"{', '.join(COMPRESSED_TENSORS_FORMATS)} and mxfp4-pack-quantized")
-    if quantization.get('quantization_status', 'compressed') != 'compressed':
-        raise ValueError("compressed-tensors quantization_status must be 'compressed'")
-    if quantization.get('kv_cache_scheme') is not None:
-        raise ValueError("compressed-tensors kv_cache_scheme quantizes the cache, which this loader does not; "
-                         "load a checkpoint without a kv_cache_scheme")
-    groups = quantization.get('config_groups')
-    if not isinstance(groups, Mapping) or not groups:
-        raise ValueError("compressed-tensors config_groups must name the quantized weights")
     schemes = set()
-    for name, group in groups.items():
+    for name, group in _config_groups(quantization).items():
         group = records.record(group, f'config_groups.{name}')
         if group.get('output_activations') is not None:
-            raise ValueError(f"config_groups.{name}.output_activations quantizes outputs, which this loader does not")
+            raise ValueError(
+                f"config_groups.{name}.output_activations quantizes outputs, which this loader does not"
+            )
         activations = group.get('input_activations')
-        dynamic = None if activations is None else records.record(activations, 'input_activations').get('dynamic')
+        dynamic = (
+            None if activations is None else records.record(activations, "input_activations").get("dynamic")
+        )
         if activations is not None and dynamic is not True:
-            raise ValueError(f"config_groups.{name}.input_activations have dynamic={dynamic!r}, with scales stored "
-                             "beside the weights that this loader would drop; load a weight-only checkpoint or one "
-                             "whose activations are quantized dynamically")
+            raise ValueError(
+                f"config_groups.{name}.input_activations have dynamic={dynamic!r}, with scales stored "
+                "beside the weights that this loader would drop; load a weight-only checkpoint or one "
+                "whose activations are quantized dynamically"
+            )
         weights = records.record(group.get('weights'), f'config_groups.{name}.weights')
         strategy, kind = weights.get('strategy'), weights.get('type')
-        if strategy not in ('tensor', 'channel', 'group', 'block', 'tensor_group') or kind not in ('int', 'float'):
-            raise ValueError(f"config_groups.{name}.weights: {kind!r} codes by {strategy!r}; this loader reads "
-                             "int or float codes by tensor, channel, group, block or tensor_group")
+        if strategy not in ("tensor", "channel", "group", "block", "tensor_group") or kind not in (
+            "int",
+            "float",
+        ):
+            raise ValueError(
+                f"config_groups.{name}.weights: {kind!r} codes by {strategy!r}; this loader reads "
+                "int or float codes by tensor, channel, group, block or tensor_group"
+            )
         if weights.get('dynamic', False):
             raise ValueError(f"config_groups.{name}.weights are dynamic, with no stored scales to read")
-        schemes.add(_WeightScheme(
-            str(form), records.integer(weights.get('num_bits'), 'num_bits'), kind,
-            bool(weights.get('symmetric', True)), strategy,
-            None if weights.get('group_size') is None else records.integer(weights['group_size'], 'group_size'),
-            _block_structure(weights)))
+        schemes.add(
+            _WeightScheme(
+                str(form),
+                records.integer(weights.get("num_bits"), "num_bits"),
+                kind,
+                bool(weights.get("symmetric", True)),
+                strategy,
+                None
+                if weights.get("group_size") is None
+                else records.integer(weights["group_size"], "group_size"),
+                _block_structure(weights),
+            )
+        )
     if len(schemes) != 1:
-        raise ValueError(f"compressed-tensors config_groups declare {len(schemes)} weight schemes; this loader "
-                         "reads one scheme for every quantized Linear")
+        raise ValueError(
+            f"compressed-tensors config_groups declare {len(schemes)} weight schemes; this loader "
+            "reads one scheme for every quantized Linear"
+        )
     scheme = schemes.pop()
-    fits = {'pack-quantized': scheme.kind == 'int' and 1 <= scheme.bits <= 8,
-            'float-quantized': scheme.kind == 'float' and scheme.bits == 8,
-            'int-quantized': scheme.kind == 'int' and scheme.bits == 8,
-            'naive-quantized': scheme.bits == 8,
-            'nvfp4-pack-quantized': (scheme.kind, scheme.bits, scheme.strategy, scheme.group, scheme.symmetric)
-            == ('float', 4, 'tensor_group', 16, True)}[scheme.format]
+    fits = {
+        "pack-quantized": scheme.kind == "int" and 1 <= scheme.bits <= 8,
+        "float-quantized": scheme.kind == "float" and scheme.bits == 8,
+        "int-quantized": scheme.kind == "int" and scheme.bits == 8,
+        "naive-quantized": scheme.bits == 8,
+        "nvfp4-pack-quantized": (scheme.kind, scheme.bits, scheme.strategy, scheme.group, scheme.symmetric)
+        == ("float", 4, "tensor_group", 16, True),
+    }[scheme.format]
     if not fits or (scheme.strategy in ('group', 'tensor_group')) != (scheme.group is not None) \
             or (scheme.strategy == 'block') != (scheme.block is not None):
-        raise ValueError(f"compressed-tensors {scheme.format} with {scheme.bits}-bit {scheme.kind} codes by "
-                         f"{scheme.strategy} (group {scheme.group}, block {scheme.block}) is not a layout the "
-                         "format writes")
+        raise ValueError(
+            f"compressed-tensors {scheme.format} with {scheme.bits}-bit {scheme.kind} codes by "
+            f"{scheme.strategy} (group {scheme.group}, block {scheme.block}) is not a layout the "
+            "format writes"
+        )
     return scheme
 
 
@@ -1107,8 +1152,12 @@ def _ct_decode(tensors: Mapping[str, np.ndarray], name: str, *, scheme: _WeightS
         parts = _ct_parts(scheme, name)
         packed = np.asarray(tensors[parts['packed']])
         values = _E2M1_BYTES[_bytes(packed, _CODE_DTYPES)].reshape(packed.shape[0], packed.shape[1] * 2)
-        scales = _nvfp4_scales(scheme, np.asarray(tensors[parts['scale']]), np.asarray(tensors[parts['global']]),
-                               (values.shape[0], values.shape[1]))
+        scales = _nvfp4_scales(
+            scheme,
+            np.asarray(tensors[parts["scale"]]),
+            np.asarray(tensors[parts["global"]]),
+            (values.shape[0], values.shape[1]),
+        )
         return (values * scales).astype(ml_dtypes.bfloat16).astype(np.float32)
     codes = _ct_codes(scheme, tensors, name)
     shape = (codes.shape[0], codes.shape[1])
@@ -1140,7 +1189,9 @@ def _ct_encode(name: str, weight: np.ndarray, *, scheme: _WeightScheme,
         # The library's compressor adds its zero point and would write 0
         # there; released checkpoints carry code 8 (Qwen3-0.6B-NVFP4A16: 3.5%
         # of codes), which only a sign-keeping encoding round-trips.
-        quotients = np.asarray(weight).astype(np.float32) / _nvfp4_scales(scheme, scales, stored['global'], shape)
+        quotients = np.asarray(weight).astype(np.float32) / _nvfp4_scales(
+            scheme, scales, stored["global"], shape
+        )
         out[parts['packed']] = encode_e2m1(np.clip(quotients, -6.0, 6.0), ties='even')
         return out
     held = np.asarray(weight)
@@ -1195,7 +1246,11 @@ def _refuse_mlx(config: Mapping[str, object]) -> None:
     """
     for key in ("quantization", "quantization_config"):
         entry = config.get(key)
-        if isinstance(entry, Mapping) and "quant_method" not in entry and {"bits", "group_size"} <= entry.keys():
+        if (
+            isinstance(entry, Mapping)
+            and "quant_method" not in entry
+            and {"bits", "group_size"} <= entry.keys()
+        ):
             raise ValueError(
                 f"{key} {dict(entry)!r} is MLX quantization ({entry['bits']}-bit weights in groups "
                 f"of {entry['group_size']}), which Dew does not dequantize; load the unquantized "

@@ -10,14 +10,13 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Mapping
 
-import numpy as np
-
 from dew import records
 from dew.interop.hf_decoders import (
     _MOE_SHARED,
     DecoderFields,
     KindFields,
     MixtureFields,
+    Packed,
     _base_config,
     _dew_path,
     _refuse,
@@ -70,9 +69,11 @@ def _llama4_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     }
     chunk = hf_config.get('attention_chunk_size')
     kinds: dict[str, KindFields] = {
-        'full_attention': {'mixer': {**rule, 'use_rope': False}},
-        'chunked_attention': {'chunk': None if chunk is None else records.integer(chunk, 'attention_chunk_size'),
-                              'mixer': {**rule, 'use_rope': True}},
+        "full_attention": {"mixer": {**rule, "use_rope": False}},
+        "chunked_attention": {
+            "chunk": None if chunk is None else records.integer(chunk, "attention_chunk_size"),
+            "mixer": {**rule, "use_rope": True},
+        },
     }
     moe_layers = hf_config.get('moe_layers')
     step = records.integer(hf_config.get('interleave_moe_layer_step', 1), 'interleave_moe_layer_step')
@@ -85,10 +86,12 @@ def _llama4_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
         'expert_features': records.integer(hf_config['intermediate_size'], 'intermediate_size'),
         'shared_features': records.integer(hf_config['intermediate_size'], 'intermediate_size'),
     }
-    if moe_layers is not None:
-        mixture['layers'] = records.integers(moe_layers, 'moe_layers')
-    else:
-        mixture['every'] = step
+    if moe_layers is None:
+        if step < 1:
+            _refuse(f"interleave_moe_layer_step {step}", "the routed layers are every step-th one")
+        # Llama4TextConfig's default (configuration_llama4.py:186-194).
+        moe_layers = list(range(step - 1, layers, step))
+    mixture['layers'] = records.integers(moe_layers, 'moe_layers')
     config.update(
         # The dense layers take intermediate_size_mlp; the experts and the
         # shared expert take intermediate_size.
@@ -111,23 +114,10 @@ def _llama4_export(model: CausalTransformer) -> Mapping[str, object]:
     return {'attention_chunk_size': chunks.pop() if chunks else None}
 
 
-def _llama4_prepare(tensors: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
-    """Split each fused `experts.gate_up_proj` into the two stacked kernels.
-
-    `Llama4TextExperts` holds `[E, hidden, 2 * expert]` with the gate in the
-    first half (`gate_up.chunk(2)`), already in the `[E, in, out]` layout dew's
-    stacked expert kernels keep.
-    """
-    prepared: dict[str, np.ndarray] = {}
-    for name, tensor in tensors.items():
-        if name.endswith('.feed_forward.experts.gate_up_proj'):
-            width = tensor.shape[-1] // 2
-            stem = name[:-len('gate_up_proj')]
-            prepared[stem + 'gate_proj'] = tensor[..., :width]
-            prepared[stem + 'up_proj'] = tensor[..., width:]
-        else:
-            prepared[name] = tensor
-    return prepared
+# `Llama4TextExperts` holds `[E, hidden, 2 * expert]` with the gate in the
+# first half (`gate_up.chunk(2)`), already the `[E, in, out]` dew stacks.
+_LLAMA4_PACKED = (Packed('.feed_forward.experts.gate_up_proj',
+                         ('.feed_forward.experts.gate_proj', '.feed_forward.experts.up_proj')),)
 
 
 def _llama4_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
@@ -138,13 +128,23 @@ def _llama4_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | N
     `.weight` suffix.
     """
     parts = name.split('.')
-    if len(parts) >= 5 and parts[:2] == ['model', 'layers'] and parts[2].isdigit() and parts[3] == 'feed_forward':
+    if (
+        len(parts) >= 5
+        and parts[:2] == ["model", "layers"]
+        and parts[2].isdigit()
+        and parts[3] == "feed_forward"
+    ):
         layer = ('params', f'layers_{parts[2]}', 'mlp')
         if parts[4:] == ['router', 'weight']:
             return (*layer, 'gate', 'kernel')
         if len(parts) == 6 and parts[4] == 'experts' and parts[5] in _MOE_SHARED:
             return (*layer, 'experts', parts[5], 'kernel')
-        if len(parts) == 7 and parts[4] == 'shared_expert' and parts[5] in _MOE_SHARED and parts[6] == 'weight':
+        if (
+            len(parts) == 7
+            and parts[4] == "shared_expert"
+            and parts[5] in _MOE_SHARED
+            and parts[6] == "weight"
+        ):
             return (*layer, 'shared_experts', parts[5], 'kernel')
         if len(parts) == 6 and parts[4] in _MOE_SHARED and parts[5] == 'weight':
             return (*layer, parts[4], 'kernel')

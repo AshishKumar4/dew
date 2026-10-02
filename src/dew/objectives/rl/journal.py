@@ -41,14 +41,21 @@ def _cohort(connection: sqlite3.Connection, cohort: str, signature: str, binding
     """
     connection.execute("PRAGMA journal_mode=WAL")
     connection.execute("PRAGMA synchronous=FULL")
-    connection.execute("CREATE TABLE IF NOT EXISTS cohorts (id TEXT PRIMARY KEY, signature TEXT, binding TEXT)")
-    connection.execute("CREATE TABLE IF NOT EXISTS turns (cohort TEXT, sample INTEGER, episode TEXT, pending TEXT, snapshot BLOB, PRIMARY KEY(cohort, sample))")
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS cohorts (id TEXT PRIMARY KEY, signature TEXT, binding TEXT)"
+    )
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS turns (cohort TEXT, sample INTEGER, episode TEXT, "
+        "pending TEXT, snapshot BLOB, PRIMARY KEY(cohort, sample))"
+    )
     with connection:
         row = connection.execute("SELECT signature, binding FROM cohorts WHERE id=?", (cohort,)).fetchone()
         if row is None:
             connection.execute("INSERT INTO cohorts VALUES (?, ?, ?)", (cohort, signature, binding))
         elif row[0] != signature:
-            raise ValueError("journal recovery requires the same policy, tasks, topology and sampling controls")
+            raise ValueError(
+                "journal recovery requires the same policy, tasks, topology and sampling controls"
+            )
         else:
             binding = row[1]
     return binding
@@ -90,14 +97,18 @@ class JournalRun:
 
     def load(self, identity: EpisodeId) -> SavedTurn | None:
         """Read one sample's saved turn, or None when it has none yet."""
-        row = self.connection.execute("SELECT episode, pending, snapshot FROM turns WHERE cohort=? AND sample=?",
-                                      (self.cohort, identity.sample)).fetchone()
+        row = self.connection.execute(
+            "SELECT episode, pending, snapshot FROM turns WHERE cohort=? AND sample=?",
+            (self.cohort, identity.sample),
+        ).fetchone()
         if row is None:
             return None
         episode = episode_from_record(json.loads(row[0]))
         if episode.identity != identity or episode._binding_id != self.binding:
             raise ValueError("journal episode identity or policy binding differs")
-        return SavedTurn(episode, None if row[1] is None else action_record(json.loads(row[1])), bytes(row[2]))
+        return SavedTurn(
+            episode, None if row[1] is None else action_record(json.loads(row[1])), bytes(row[2])
+        )
 
     def save(self, episode: Episode, pending: Action | None, snapshot: bytes) -> None:
         """Commit one sample's episode, its pending action and the environment snapshot."""

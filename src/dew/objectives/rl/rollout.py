@@ -106,7 +106,7 @@ class SampledRollout:
     max_new_tokens: int = 32
     estimator: str = "group"
     truncation: str = "score"
-    sampling: Sampling = Sampling()
+    sampling: Sampling = dataclasses.field(default_factory=Sampling)
     metrics: dict[str, float] = dataclasses.field(default_factory=dict, init=False, compare=False)
     shown: ClassVar[Mapping[str, Shown]] = {"reward/mean": Shown(better="higher"),
                                              "status/truncated": Shown(better="lower", percent=True)}
@@ -126,7 +126,6 @@ class SampledRollout:
         and info strings the reward is called with, and the `ModelInputs`
         the policy is given.
         """
-        key = jax.random.wrap_key_data(jax.random.key_data(key), impl=jax.random.key_impl(key))
         if key.shape != ():
             raise ValueError("key must be a single JAX PRNG key")
         prompts, prompt_lengths, sources, truths, infos = prompt_rows(batch)

@@ -1,59 +1,53 @@
+"""Train a byte decoder on Tiny Shakespeare, evaluate, and generate two samples."""
+import argparse
+import json
 import urllib.request
+from pathlib import Path
 
 import jax
 import numpy as np
 import optax
 
-from dew import Dataset, Layout, MeshSpec, Trainer, models
-from dew.data import ByteTokenizer
-from dew.inference import RunProcessor, TextGeneration
-from dew.inference.serving import Server
+from dew import Trainer
+from dew.nn.backbones import CausalTransformer
+from dew.data import ByteTokenizer, Loading, TokenWindows
 from dew.objectives.lm import LMObjective, Perplexity
-from dew.sampling import Sampling
+from dew.sampling import Sampling, generate
 
-# Eight CPU devices in one process, standing in for eight accelerators.
-jax.config.update("jax_platforms", "cpu")
-jax.config.update("jax_num_cpu_devices", 8)
+parser = argparse.ArgumentParser()
+parser.add_argument("--steps", type=int, default=1000)
+steps = parser.parse_args().steps
 
-url = ("https://raw.githubusercontent.com/karpathy/char-rnn/master/"
-       "data/tinyshakespeare/input.txt")
+# Prepare a byte corpus once; the final 50,000 tokens are held out.
+tokens = Path(__file__).with_name("tokens")
 tokenizer = ByteTokenizer()
-ids = np.asarray(tokenizer.encode(urllib.request.urlopen(url).read().decode()), np.int32)
-train, val = ids[:-50_000], ids[-50_000:]
+if not tokens.exists():
+    url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
+    text = urllib.request.urlopen(url).read().decode()
+    ids = np.asarray(tokenizer.encode(text), np.uint16)
+    tokens.mkdir()
+    ids[:-50_000].tofile(tokens / "train.bin")
+    ids[-50_000:].tofile(tokens / "val.bin")
+    (tokens / "meta.json").write_text(json.dumps({
+        "tokenizer": "byte", "vocab_size": tokenizer.vocab_size, "dtype": "uint16",
+        "train_tokens": len(ids) - 50_000, "val_tokens": 50_000, "eos_id": tokenizer.eos_id,
+    }))
 
+data = TokenWindows(path=str(tokens), seq_len=256, stride=1, val_batches=None,
+                    loading=Loading(workers=0, threads=1, read_buffer=2)).load(batch=64)
+model = CausalTransformer(vocab_size=tokenizer.vocab_size,
+                     emb_features=384, num_layers=6, num_heads=6, mlp_features=1024, max_seq_len=256,
+                     dropout_rate=0.2, embedding_dropout_rate=0.2, attention_dropout_rate=0.2,
+                     qk_norm=False, initializer_range=0.02, depth_scaled_init=True)
+objective = LMObjective(model, seq_len=256, ema_decay=None)
+optimizer = optax.chain(optax.clip_by_global_norm(1), optax.adamw(
+    optax.warmup_cosine_decay_schedule(0., 1e-3, min(100, steps - 1), steps, end_value=1e-4),
+    b2=0.99, weight_decay=0.1, mask=lambda params: jax.tree.map(lambda p: p.ndim >= 2, params)))
+trainer = Trainer(objective, optimizer, key=jax.random.key(0))
+state = trainer.fit(data, steps=steps, log_every=100, eval_every=500, metrics=(Perplexity(),))
 
-def windows(partition):
-    """Random 129-byte windows of the training text: 128 inputs and their next bytes."""
-    rng = np.random.default_rng(partition.index)
-    while True:
-        starts = rng.integers(0, len(train) - 129, partition.rows(32))
-        yield {"text": np.stack([train[s:s + 129] for s in starts])}
-
-
-def held_out(partition):
-    """The held-out text in order, 32 windows at a time."""
-    rows = np.lib.stride_tricks.sliding_window_view(val, 129)[::129][:256]
-    for batch in rows.reshape(-1, 32, 129):
-        yield {"text": batch[partition.index::partition.count]}
-
-
-data = Dataset(train=windows, val=held_out, records=len(train) // 129, batch=32)
-
-# Every layer routes each token to 2 of 8 experts. The mesh splits the batch,
-# the experts and the weights two ways each, and the tokens travel to their
-# experts' devices in an all-to-all.
-model = models.build("causal_transformer", vocab_size=tokenizer.vocab_size,
-                     emb_features=128, num_layers=4, num_heads=4, max_seq_len=256,
-                     mixture={"experts": 8, "top_k": 2, "dispatch": "exchange"})
-objective = LMObjective(model, seq_len=128, aux_loss_alpha=0.01, ema_decay=None)
-trainer = Trainer(objective, optax.adamw(3e-3), key=jax.random.key(0),
-                  mesh=MeshSpec(expert=2, fsdp=2), layout=Layout(min_shard=1))
-state = trainer.fit(data, steps=300, log_every=10, eval_every=100, metrics=[Perplexity()])
-
-# Serve the trained weights where they are, on the same mesh.
-task = TextGeneration(model, state.params, RunProcessor(tokenizer),
-                      sampling=Sampling(temperature=0.8, top_k=40))
-server = Server.from_task(task, slots=8, capacity=256)
-prompts = ["ROMEO:", "JULIET:"]
-for prompt, generation in zip(prompts, server(prompts, 160, seed=0)):
-    print(prompt + generation.host().text[0], end="\n\n")
+for index, prompt in enumerate(("ROMEO:", "JULIET:")):
+    result = generate(model, state.params, [tokenizer.encode(prompt)], max_new_tokens=200,
+                      key=jax.random.key(index), sampling=Sampling(
+                          temperature=0.5, top_k=40, eos_id=(46, 33, 63), pad_id=32))
+    print(tokenizer.decode(result.tokens[0]), end="\n\n")

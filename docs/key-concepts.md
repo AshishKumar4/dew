@@ -4,7 +4,7 @@ A Dew training run is built from four objects. Each owns one part of the work:
 
 | Object | Owns | Written by you when |
 |---|---|---|
-| Model, a `flax.linen.Module` | The forward computation and the shapes of its variables | You need a new architecture. `models.build(name, ...)` builds a registered one. |
+| Model, a `flax.linen.Module` | The forward computation and the shapes of its variables | You need a new architecture. The built-in ones are classes in `dew.nn.backbones`. |
 | `Objective` | Initializing the variables, the loss, evaluation outputs, and which weights keep a moving average | You need a loss Dew does not have. |
 | `Dataset` | The iterators that yield training and validation batches | Your data does not fit a built-in reader. |
 | `Trainer` | The device mesh, the compiled step, the optimizer update, the moving average, checkpoints and logging | Never; it is configured, not subclassed. |
@@ -16,25 +16,23 @@ A Dew training run is built from four objects. Each owns one part of the work:
 This trains a small decoder on one repeated sentence and generates from it. It downloads nothing and runs on a CPU.
 
 ```python
-import itertools
-
 import jax
 import numpy as np
 import optax
 
-from dew import Dataset, Trainer, models
+from dew import Dataset, Trainer
 from dew.data import ByteTokenizer
+from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective
 from dew.sampling import Sampling, generate
 
 tokenizer = ByteTokenizer()
 text = tokenizer.encode("dew trains jax models. " * 3)
-batch = {"text": np.tile(np.asarray(text[:65], np.int32), (8, 1))}
-data = Dataset(train=lambda partition: itertools.repeat(batch),
-               val=None, records=8, batch=8)
+rows = np.tile(np.asarray(text[:65], np.int32), (8, 1))
+data = Dataset.from_records({"text": rows}, batch=8)
 
-model = models.build(
-    "causal_transformer", vocab_size=tokenizer.vocab_size,
+model = CausalTransformer(
+    vocab_size=tokenizer.vocab_size,
     emb_features=64, num_layers=2, num_heads=4,
     mlp_features=256, max_seq_len=128)
 objective = LMObjective(model, seq_len=64)
@@ -49,16 +47,16 @@ out = generate(model, state.params, prompt, max_new_tokens=40,
 print(tokenizer.decode(out.tokens[0]))
 ```
 
-Output on four cores of a workstation CPU:
+Output on two cores of a shared workstation CPU:
 
 ```text
 Training CausalTransformer from step 0 to 100: 147,840 parameters, on 1 × cpu, batch 8, float32
-step  25/100  loss 0.03061  ce 0.03061  perplexity 1.031  token_accuracy 100.0%  step_time_ms 10.88  samples_per_sec 735.3  accepted 100.0%
-step  50/100  loss 0.01018  ce 0.01018  perplexity 1.010  token_accuracy 100.0%  step_time_ms 8.713  samples_per_sec 918.2  accepted 100.0%  0:00:01 left
-step  75/100  loss 0.006710  ce 0.006710  perplexity 1.007  token_accuracy 100.0%  step_time_ms 8.472  samples_per_sec 944.3  accepted 100.0%  0:00:00 left
-step 100/100  loss 0.005113  ce 0.005113  perplexity 1.005  token_accuracy 100.0%  step_time_ms 9.332  samples_per_sec 857.3  accepted 100.0%
-Trained 100 steps in 0:00:02: first step after 0.94 s, then 115.5 step/s
-47.6% of the wall time in steps, final loss 0.005113
+step  25/100  loss 0.03061  ce 0.03061  perplexity 1.031  token_accuracy 100.0%  step_time_ms 23.68  samples_per_sec 337.9  accepted 100.0%  0:00:01 left
+step  50/100  loss 0.01018  ce 0.01018  perplexity 1.010  token_accuracy 100.0%  step_time_ms 24.52  samples_per_sec 326.2  accepted 100.0%  0:00:01 left
+step  75/100  loss 0.006710  ce 0.006710  perplexity 1.007  token_accuracy 100.0%  step_time_ms 24.68  samples_per_sec 324.1  accepted 100.0%  0:00:01 left
+step 100/100  loss 0.005113  ce 0.005113  perplexity 1.005  token_accuracy 100.0%  step_time_ms 22.84  samples_per_sec 350.2  accepted 100.0%
+Trained 100 steps in 0:00:04: first step after 2.06 s, then 42.6 step/s
+53.0% of the wall time in steps, final loss 0.005113
 dew trains jax models. dew trains jax model
 ```
 
@@ -66,7 +64,7 @@ This is the output with stdout piped to a file; on a terminal, `fit` draws the s
 
 ## Model
 
-A model is a `flax.linen.Module` with `init` and `apply`. Its variables are a nested dictionary of arrays, and it has no knowledge of training. `models.build("causal_transformer", ...)` looks the class up in a registry by name, which is how recipes and saved runs rebuild a model from a configuration file. Importing the class gives the same module: `from dew.nn.backbones import CausalTransformer`.
+A model is a `flax.linen.Module` with `init` and `apply`. Its variables are a nested dictionary of arrays, and it has no knowledge of training. Build one from its class, `from dew.nn.backbones import CausalTransformer`. Each class is also registered under a name (`causal_transformer`), which is how recipes and saved runs rebuild a model from a configuration file.
 
 Dew's modules name the logical axes of their parameters, such as `embed`, `heads` and `mlp`. The trainer maps those names onto the device mesh, so the model code does not change when the mesh does. [Distributed training](concepts/distributed.md) describes the mapping.
 
@@ -75,7 +73,7 @@ Dew's modules name the logical axes of their parameters, such as `embed`, `heads
 An objective implements two methods:
 
 - `init(key, variables=None)` returns the model's variables.
-- `loss(variables, batch, step)` returns the loss as a `Mean(total, mass)` and an `Aux` with metrics to log.
+- `loss(variables, batch, step)` returns the loss as a `Ratio(total, mass)` and an `Aux` with metrics to log.
 
 It can also implement `evaluate` for validation and `preview` for samples, and it names the weights that keep an exponential moving average (EMA) in its `ema` attribute. Its `shown` attribute maps metric names to `Shown` values that tell the training display how to show them: `Shown(better="higher", percent=True)`, for an accuracy, colours a rise as progress and prints the value as a percentage.
 
@@ -83,7 +81,7 @@ Dew ships objectives for autoregressive language modeling (`LMObjective`), image
 
 ## Dataset
 
-`Dataset(train, val, records, batch)` holds two functions. `train(partition)` opens an endless stream of training batches; `val(partition)` opens one pass over the validation records. `partition` is a `DataPartition` that says which share of each global batch this process reads, which matters when several processes train together.
+`Dataset(train, val, records, batch)` holds two functions. `train(partition)` opens an endless stream of training batches; `val(partition)` opens one pass over the validation records. `partition` is a `DataPartition` that says which share of each global batch this process reads, which matters when several processes train together. `Dataset.from_records` builds one from records held in memory, as the example does: it reshuffles them every epoch, gives each process its share, and saves its position in checkpoints.
 
 The built-in readers, such as `TokenWindows` for tokenized text and `HFImages` for image datasets on the Hugging Face Hub, are specifications whose `.load(batch=...)` returns a `Dataset`. Images arrive as `uint8` arrays in `[0, 255]` and token windows as `int32` ids under the key `"text"`. Readers built on Grain record their position, so a checkpoint resumes the data stream where it stopped. [Training data](concepts/data.md) covers the details.
 

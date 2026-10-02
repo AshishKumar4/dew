@@ -1,7 +1,7 @@
 """Draw the docs' figures, each in a light and a dark variant.
 
 The sharding and diffusion figures are computed by Dew itself: the mesh
-figure reads the placements `build_mesh`, `Layout` and `batch_shardings`
+figure reads the placements `MeshSpec.build`, `Layout` and `batch_shardings`
 give on eight simulated CPU devices, and the diffusion figure noises an
 image with the rates of the `Cosine` and `Flow` presets. The data and
 training-step figures draw the order of calls in `Trainer.fit`
@@ -26,9 +26,9 @@ import jax.numpy as jnp
 import numpy as np
 from PIL import Image
 
-from dew import models
 from dew.diffusion.presets import Cosine, Flow
-from dew.training import Layout, MeshSpec, build_mesh
+from dew.nn.backbones import CausalTransformer, Mixture
+from dew.training import Layout, MeshSpec
 from dew.training.distributed import batch_shardings
 
 HERE = Path(__file__).resolve().parent
@@ -103,12 +103,12 @@ def box(svg: Svg, x, y, w, h, title, lines=(), accent=False):
 
 def mesh_figure():
     """A (data=2, fsdp=2, tensor=2) mesh, a batch and an MLP kernel placed on it."""
-    mesh = build_mesh(MeshSpec(fsdp=2, tensor=2))
+    mesh = MeshSpec(fsdp=2, tensor=2).build()
     ids = np.vectorize(lambda d: d.id)(mesh.devices)  # (data, expert, fsdp, tensor, sequence, stage)
     coords = {int(ids[d, 0, f, k, 0, 0]): (d, f, k) for d in range(2) for f in range(2) for k in range(2)}
 
-    model = models.build("causal_transformer", vocab_size=512, emb_features=256, num_layers=1,
-                         num_heads=4, mlp_features=1024, max_seq_len=64)
+    model = CausalTransformer(vocab_size=512, emb_features=256, num_layers=1,
+                              num_heads=4, mlp_features=1024, max_seq_len=64)
     shapes = jax.eval_shape(lambda: model.init(jax.random.key(0), jnp.zeros((1, 64), jnp.int32)))
     kernel_shape = shapes["params"]["layers_0"]["mlp"]["up_proj"]["kernel"].shape
     kernel = Layout().shardings(mesh, shapes)["params"]["layers_0"]["mlp"]["up_proj"]["kernel"]
@@ -170,8 +170,8 @@ def mesh_figure():
         svg.text(476, 346, "columns (mlp) over tensor.", size=13, color=t["muted"])
         svg.text(476, 376, "Each block is held by one", size=13, color=t["muted"])
         svg.text(476, 396, "device of each data index.", size=13, color=t["muted"])
-        svg.text(24, 500, "Placements read from build_mesh, Layout().shardings and batch_shardings", size=13,
-                 color=t["muted"])
+        svg.text(24, 500, "Placements read from MeshSpec.build, Layout().shardings and batch_shardings",
+                 size=13, color=t["muted"])
         svg.text(24, 520, "(dew.training) on 8 simulated CPU devices.", size=13, color=t["muted"])
         svg.write("mesh", variant)
 
@@ -191,7 +191,7 @@ def training_step_figure():
         svg.rect(272, 50, 464, 360, fill=t["raised"], stroke=t["accent"], rx=10)
         svg.text(288, 74, "compiled step (jax.jit), once per step", size=14, weight=600, color=t["accent"])
         box(svg, 288, 90, 432, 66, "objective.loss(variables, batch, step)",
-            ["→ Mean(total, mass), Aux(metrics)"], accent=True)
+            ["→ Ratio(total, mass), Aux(metrics)"], accent=True)
         box(svg, 288, 172, 432, 66, "gradient", ["of the mean over the accumulation window"])
         box(svg, 288, 254, 432, 66, "optimizer.update, optax.apply_updates",
             ["when the window closes"])
@@ -230,7 +230,7 @@ def data_figure():
         svg.arrow(304, 76, 454, 76)
         svg.arrow(456, 128, 306, 196)
         svg.arrow(304, 248, 454, 248)
-        svg.text(380, 66, "data_partition(mesh)", size=12, mono=True, color=t["muted"], anchor="middle")
+        svg.text(380, 66, "DataPartition.of(mesh)", size=12, mono=True, color=t["muted"], anchor="middle")
         svg.text(400, 170, "next(train(partition))", size=12, mono=True, color=t["muted"])
         svg.text(380, 238, "shard_batch", size=12, mono=True, color=t["muted"], anchor="middle")
         svg.text(24, 336, "One process: DataPartition() reads every row; the host batch is the global batch.",
@@ -289,9 +289,9 @@ def diffusion_figure():
 
 def moe_routing_figure():
     """The router's choices in a tiny mixture decoder, read from its sown `router` collection."""
-    model = models.build("causal_transformer", vocab_size=32, emb_features=16, num_layers=2, num_heads=2,
-                         mlp_features=32, max_seq_len=64, mixture={"experts": 4, "top_k": 2, "every": 1},
-                         dtype="float32", attention_impl="xla")
+    model = CausalTransformer(vocab_size=32, emb_features=16, num_layers=2, num_heads=2,
+                              mlp_features=32, max_seq_len=64, mixture=Mixture(experts=4, top_k=2),
+                              dtype=jnp.float32, attention_impl="xla")
     tokens = jax.random.randint(jax.random.key(1), (1, 64), 0, 32)
     variables = model.init(jax.random.key(0), tokens)
     _, sown = model.apply(variables, tokens, mutable=["router"])

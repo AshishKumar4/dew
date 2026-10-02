@@ -164,7 +164,7 @@ def test_an_audio_conditioned_video_run_learns_and_samples_from_audio(towers, tm
     assert after < 0.7 * before
 
     pipe = objective.pipeline(state, ema=False)
-    low, high = (pipe([{"audio": _tone(hertz, data.audio_seconds)}], seed=0).host().images
+    low, high = (pipe([{"audio": _tone(hertz, data.audio_seconds)}], key=0).host().images
                  for hertz in (220, 880))
     assert low.shape == (1, 2, 8, 8, 3)
     assert np.abs(low - high).max() > 1e-3
@@ -173,9 +173,9 @@ def test_an_audio_conditioned_video_run_learns_and_samples_from_audio(towers, tm
 def test_audio_conditioning_is_refused_beside_text_or_without_clip_audio():
     """The audio takes the models' one context keyword, so a run naming text
     too is refused, and so is a dataset whose samples carry no audio."""
-    from dew.data import OxfordFlowers
+    from dew.data import TFDSImages
 
     with pytest.raises(ValueError, match="set text to None"):
         DiffusionRunConfig(data=LocalVideos(path="clips"), audio=AudioCondition())
     with pytest.raises(ValueError, match="carries none"):
-        DiffusionRunConfig(data=OxfordFlowers(), text=None, audio=AudioCondition())
+        DiffusionRunConfig(data=TFDSImages(), text=None, audio=AudioCondition())

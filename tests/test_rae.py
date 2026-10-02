@@ -21,6 +21,7 @@ import importlib.util
 import json
 import shutil
 import tarfile
+from importlib import import_module
 from pathlib import Path
 
 import jax
@@ -119,7 +120,10 @@ def test_decoder_gradients_match_the_source(variant):
                                     reference[f"decode.grad.{layout.name.removeprefix('vae/')}"])
             for layout in layouts if layout.name.startswith("vae/decoder.")}
     worst = max(gaps, key=gaps.get)
-    print(f"{config['encoder_type']}: latent gradient gap {code_gap:.3g}; worst parameter {worst} {gaps[worst]:.3g}")
+    print(
+        f"{config['encoder_type']}: latent gradient gap {code_gap:.3g}; "
+        f"worst parameter {worst} {gaps[worst]:.3g}"
+    )
     assert code_gap < GRADIENT
     assert gaps[worst] < GRADIENT, worst
 
@@ -176,7 +180,9 @@ def test_the_published_rae_matches_the_source(name):
     twice the source's own float32 distance from that result: two float32
     walks rounding in different orders, and SigLIP's residual stream reaches
     several hundred."""
-    spec = importlib.util.spec_from_file_location("diffusers_rae_reference", ROOT / "tools/diffusers_rae_reference.py")
+    spec = importlib.util.spec_from_file_location(
+        "diffusers_rae_reference", ROOT / "tools/diffusers_rae_reference.py"
+    )
     tool = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(tool)
     repo, revision = tool.PUBLISHED[name]
@@ -184,8 +190,12 @@ def test_the_published_rae_matches_the_source(name):
     autoencoder, params, _, config = load_rae(repo, revision=revision)
     grid = config["encoder_input_size"] // config["encoder_patch_size"]
 
-    latent = autoencoder.encode(params, 2 * channels_last(tool.smooth_image()) - 1)[..., :tool.LATENT_CHANNELS]
-    decoded = autoencoder.decode(params, channels_last(tool.normal_latent(config["encoder_hidden_size"], grid)))
+    latent = autoencoder.encode(params, 2 * channels_last(tool.smooth_image()) - 1)[
+        ..., : tool.LATENT_CHANNELS
+    ]
+    decoded = autoencoder.decode(
+        params, channels_last(tool.normal_latent(config["encoder_hidden_size"], grid))
+    )
     gaps = {"latent": scaled_gap(latent, channels_last(reference[f"{name}.latent"])),
             "pixels": scaled_gap((decoded[:, :tool.CROP, :tool.CROP] + 1) / 2,
                                  channels_last(reference[f"{name}.pixels"]))}
@@ -202,7 +212,10 @@ def test_the_plain_dinov2_matches_transformers(source):
     module, params, layouts = load_dinov2(source / "dinov2_plain")
     reference = dict(np.load(source / "dinov2_plain" / "reference.npz"))
     assert {layout.name for layout in layouts} == {
-        f"dinov2/{name}" for name in component_tensors(source / "dinov2_plain", "") if name != "embeddings.mask_token"}
+        f"dinov2/{name}"
+        for name in component_tensors(source / "dinov2_plain", "")
+        if name != "embeddings.mask_token"
+    }
     module = module.clone(input_size=112)
     pixels = channels_last(reference["pixels"])
     tokens = module.apply({"params": params}, pixels)
@@ -219,7 +232,9 @@ def test_the_plain_dinov2_matches_transformers(source):
 def test_the_published_dinov2_matches_transformers():
     """`facebook/dinov2-base`, downloaded, on the smooth image at 224 pixels,
     against `Dinov2Model` in float64, as the published RAEs are held."""
-    spec = importlib.util.spec_from_file_location("diffusers_rae_reference", ROOT / "tools/diffusers_rae_reference.py")
+    spec = importlib.util.spec_from_file_location(
+        "diffusers_rae_reference", ROOT / "tools/diffusers_rae_reference.py"
+    )
     tool = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(tool)
     reference = np.load(ROOT / "tests/fixtures/rae_published.npz")
@@ -238,31 +253,47 @@ def test_a_latent_run_trains_behind_the_rae_and_samples_its_image_size(source):
     its per-position normalization, trains the model alone, and samples
     images of the size the decoder paints."""
     import optax
-    from test_diffusion_objective import StubText  # noqa: F401  registers "stub_text"
+    import_module("test_diffusion_objective")  # registers "stub_text"
 
     from dew.config import ModelConfig, TrainerConfig
-    from dew.data import Dataset, OxfordFlowers
+    from dew.data import Dataset, TFDSImages
     from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
-    from dew.registry import samplers
+    from dew.sampling import Euler
     from dew.training import Trainer
 
     config = DiffusionRunConfig(
-        model=ModelConfig("simple_dit", dict(patch_size=1, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1),
-                          dtype="float32", attention_impl="reference"),
-        data=OxfordFlowers(image_size=64), trainer=TrainerConfig(batch_size=8, steps=2),
-        sampler=samplers.Euler(), sampling_steps=2, text=TextCondition(encoder="stub_text", checkpoint="stub-clip"),
-        autoencoder=PretrainedAutoencoder(modelname=str(source / "siglip2"), revision="main", dtype="float32"))
+        model=ModelConfig(
+            "simple_dit",
+            {"patch_size": 1, "emb_features": 16, "num_layers": 1, "num_heads": 2, "mlp_ratio": 1},
+            dtype="float32",
+            attention_impl="reference",
+        ),
+        data=TFDSImages(image_size=64),
+        trainer=TrainerConfig(batch_size=8, steps=2),
+        solver=Euler(),
+        sampling_steps=2,
+        text=TextCondition(encoder="stub_text", checkpoint="stub-clip"),
+        autoencoder=PretrainedAutoencoder(
+            modelname=str(source / "siglip2"), revision="main", dtype="float32"
+        ),
+    )
     objective = config.build()
     assert objective.latent_shape == (8, 8, 64)
     images = (np.random.default_rng(0).random((8, 64, 64, 3)) * 255).astype(np.uint8)
-    batch = {"image": images, "text": objective.inputs.conditions["textcontext"].encoder.tokenize(list("abcdefgh"))}
+    batch = {
+        "image": images,
+        "text": objective.inputs.conditions["textcontext"].encoder.tokenize(list("abcdefgh")),
+    }
     trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.PRNGKey(0))
     initial = trainer.initial_state()
-    state = trainer.fit(Dataset(train=lambda partition: iter(lambda: batch, None), val=None, records=None, batch=8),
-                        steps=2, log_every=100)
+    state = trainer.fit(
+        Dataset(train=lambda partition: iter(lambda: batch, None), val=None, records=None, batch=8),
+        steps=2,
+        log_every=100,
+    )
 
     for before, after in zip(jax.tree.leaves(initial.params["autoencoder"]),
                              jax.tree.leaves(state.params["autoencoder"]), strict=True):
         np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
-    sampled = objective.pipeline(state)(["a", "b"], seed=0).host()
+    sampled = objective.pipeline(state)(["a", "b"], key=0).host()
     assert sampled.images.shape == (2, 64, 64, 3)

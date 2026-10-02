@@ -16,14 +16,15 @@ import dataclasses
 import functools
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Protocol, overload
+from importlib import import_module
+from typing import TYPE_CHECKING, Protocol
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 from flax.core import freeze
-from jax.typing import ArrayLike
+from jax.typing import ArrayLike, DTypeLike
 
 from dew.artifacts import agree_process_phase
 from dew.diffusion.block import BlockProcess, CanvasGeneration
@@ -33,9 +34,10 @@ from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.inputs import Media, ModelInputs, mesh_of, request_key
 from dew.objectives.base import Variables
 from dew.records import integer, record as named_fields, text as named
+from dew.sampling import decoding
 from dew.sampling.decoding import LogitsTransform, Stopping
 from dew.sampling.strategies import Strategy
-from dew.sampling.text import Bounded, Criteria, Generation, Sampling, Transforms, generate
+from dew.sampling.text import Bounded, Criteria, Generation, Sampling, Transforms, generate, with_ids_of
 from dew.telemetry.profile import region
 
 if TYPE_CHECKING:
@@ -49,17 +51,13 @@ Request = str | Sequence[str] | Rows
 SHAPE_BUCKETS = tuple(1 << exponent for exponent in range(21))
 """The shapes a text request is rounded up to: powers of two.
 
-Every distinct prompt width, batch, budget and continuation count is its
-own several-second XLA compile, and served requests are rarely the same
-length twice. So a prompt pads left to the smallest bucket of 64 or more,
-where the attention mask hides the filler as it already hides the padding
-a ragged batch needs; a budget rounds up to the next power of two, so a
-one-token request scans one trip and a scoring probe pays no decode it did
-not ask for, and the trips past the request come off the result; the cache for
-the call is the two together, rounded up again, in place of the model's
-whole `max_seq_len`. Rows are the caller's and are not bucketed. A request
-whose buckets would need more capacity than the model's `max_seq_len`
-keeps its own shapes, so the ceiling refuses what it refuses today.
+Every distinct prompt width, budget and continuation count is its own
+several-second XLA compile. So a prompt pads left to the smallest bucket of 64
+or more, behind the attention mask; a budget rounds up to the next power of
+two and the extra trips come off the result; and the call's cache is the two
+together, rounded up again, in place of the model's whole `max_seq_len`. Rows
+are not bucketed, and a request whose buckets would exceed `max_seq_len`
+keeps its own shapes, so the ceiling refuses what it would refuse anyway.
 """
 
 
@@ -88,10 +86,14 @@ def _prepared(processor: Processor | None, request: Request, *, images: Media | 
         text = None
     if text is not None:
         if processor is None:
-            raise ValueError("text requests need a processor; pass ModelInputs or token rows")
+            raise ValueError("text requests need a processor: pass processor= where the task is built, "
+                             "as objective.pipeline(state, processor=source.processor) does, or request "
+                             "ModelInputs or token rows")
         return processor(text, images=images)
     if images is not None:
-        raise ValueError("images travel with text through the processor; prepared rows carry them in ModelInputs")
+        raise ValueError(
+            "images travel with text through the processor; prepared rows carry them in ModelInputs"
+        )
     if isinstance(request, ModelInputs):
         return ModelInputs.from_value(request)
     if isinstance(request, Sequence):
@@ -111,10 +113,10 @@ def _prepared(processor: Processor | None, request: Request, *, images: Media | 
 
 def _task_inputs(processor: Processor | None, request: Request, *, images: Media | None,
                  collective: bool, max_new_tokens: int | None, default_tokens: int | None,
-                 max_length: int | None, key: jax.Array | None, seed: int | None) -> tuple[ModelInputs, int, jax.Array]:
+                 max_length: int | None, key: int | jax.Array | None) -> tuple[ModelInputs, int, jax.Array]:
     def prepared() -> tuple[ModelInputs, int, jax.Array]:
         """Tokenize the request, size its budget and draw its key."""
-        random_key = request_key(key, seed)
+        random_key = request_key(key)
         inputs = _prepared(processor, request, images=images)
         return inputs, _budget(max_new_tokens, default_tokens, max_length,
                                inputs.tokens.shape[1]), random_key
@@ -133,7 +135,9 @@ def _task_inputs(processor: Processor | None, request: Request, *, images: Media
     return held
 
 
-def _decoded(processor: Processor | None, tokens: ArrayLike, lengths: ArrayLike, width: int) -> tuple[str, ...]:
+def _decoded(
+    processor: Processor | None, tokens: ArrayLike, lengths: ArrayLike, width: int
+) -> tuple[str, ...]:
     if processor is None:
         return ()
     rows, counts = np.asarray(tokens), np.asarray(lengths)
@@ -257,17 +261,17 @@ def _pulled(repo_id: str) -> str:
     return os.fspath(pull_from_hub(repo_id))
 
 
-def run_record(directory: str) -> Mapping[str, object]:
-    """Read the `run.json` a run directory publishes beside its checkpoints."""
-    import json
+def run_record(directory: str, step: int | str | None = None) -> Mapping[str, object]:
+    """The inference declaration of the selected checkpoint, not training configuration."""
+    from dew.checkpoints import Checkpoints
+    record = Checkpoints(directory).artifact(step)
+    if record is None:
+        raise ValueError("this checkpoint names no registered inference model; register it and declare "
+                         "Objective.inference_record, or call objective.pipeline(state)")
+    return named_fields(record, 'checkpoint artifact')
 
-    from etils import epath
 
-    from dew.checkpoints import RUN_FILE
-    return named_fields(json.loads((epath.Path(directory) / RUN_FILE).read_text()), RUN_FILE)
-
-
-def _saved_model(record: Mapping[str, object], dtype: str | None) -> ModelConfig:
+def _saved_model(record: Mapping[str, object], dtype: DTypeLike | None) -> ModelConfig:
     """Read the run's model record, with `dtype` overriding the computation it saved."""
     from dew.config import ModelConfig
     from dew.registry import dtype_name, resolve_dtype
@@ -277,12 +281,13 @@ def _saved_model(record: Mapping[str, object], dtype: str | None) -> ModelConfig
     return config if compute is None else replace(config, dtype=compute)
 
 
-def _saved_processor(record: Mapping[str, object]) -> Processor:
+def _saved_processor(record: Mapping[str, object]) -> Processor | None:
     """Build the run's tokenizer into a task's host processor."""
-    from dew.data import tokenizer_for
+    from dew.data.text import tokenizer_for
     from dew.inference.pipeline import RunProcessor
 
-    return RunProcessor(tokenizer_for(named(record["tokenizer"], "tokenizer")))
+    tokenizer = record.get('tokenizer')
+    return None if tokenizer is None else RunProcessor(tokenizer_for(named(tokenizer, "tokenizer")))
 
 
 def _saved_budget(record: Mapping[str, object]) -> int | None:
@@ -295,9 +300,10 @@ def _saved_budget(record: Mapping[str, object]) -> int | None:
     return budget
 
 
-def _saved_run(directory: str, dtype: str | None) -> tuple[Mapping[str, object], ModelConfig, Processor]:
+def _saved_run(directory: str, dtype: DTypeLike | None, step: int | str | None
+               ) -> tuple[Mapping[str, object], ModelConfig, Processor | None]:
     """Read a run's record, its model config at `dtype`, and its host processor."""
-    record = run_record(directory)
+    record = run_record(directory, step)
     return record, _saved_model(record, dtype), _saved_processor(record)
 
 
@@ -338,20 +344,16 @@ def _saved_sampling(record: Mapping[str, object], budget: int | None) -> Samplin
 
 
 def _saved_quantization(record: Mapping[str, object]) -> Quantization | None:
-    """Read the run's quantization spec, wherever its `run.json` carries it.
+    """Read the run's quantization spec from its `run.json`'s `trainer.quantization`.
 
-    The spec is read from `trainer.quantization`, or from the top level, which
-    is where some run records carry it. It comes back through the config layer
-    that wrote it, the one place a saved dataclass record becomes its class
-    again.
+    It comes back through the config layer that wrote it, the one place a
+    saved dataclass record becomes its class again.
     """
     from dew.config import _built
     from dew.training.quantization import Quantization
 
     trainer = record.get("trainer")
     section = None if trainer is None else named_fields(trainer, "trainer").get("quantization")
-    if section is None:
-        section = record.get("quantization")
     return None if section is None else _built(Quantization, named_fields(section, "quantization"))
 
 
@@ -369,12 +371,16 @@ class TextGeneration:
     split over its batch axes and results keep that sharding.
 
     `logits` is the whole transform chain, `stopping` the criteria that run
-    beside the policy's EOS one, and `strategy` the device loop. `logits=None`
-    means the chain `sampling` compiles to. A call replaces each of them
-    whole, so a caller that wants to add to a bound chain writes
-    `logits=task.logits + (mine,)`, and an explicit `sampling=` on a call
-    replaces a bound chain with its own, because the policy it overrides is
-    what that chain was built from.
+    beside the policy's EOS and stop-string ones, and `strategy` the device
+    loop. `logits=None` means the chain `sampling` compiles to. A call
+    replaces each of them whole, so a caller that wants to add to a chain
+    writes `logits=task.sampling.transforms() + (mine,)`, and an explicit
+    `sampling=` on a call replaces a bound chain with its own, because the
+    policy it overrides is what that chain was built from. A call's policy
+    takes the task's EOS and pad ids where it leaves them None, so changing
+    one control is `sampling=replace(task.sampling, repetition_penalty=1.1)`
+    or a fresh `Sampling(...)`, and either still stops where the task does.
+    `sampling.stop` strings compile against `processor` once per policy.
 
     A call runs at `SHAPE_BUCKETS` shapes over a cache the bucket sizes,
     and hands back the shapes the request asked for, so two requests of
@@ -385,16 +391,43 @@ class TextGeneration:
     model: nn.Module
     variables: Variables
     processor: Processor | None = None
-    sampling: Sampling = Sampling()
+    sampling: Sampling = dataclasses.field(default_factory=Sampling)
     max_new_tokens: int | None = None
     max_length: int | None = None
     n: int = 1
     logits: tuple[LogitsTransform, ...] | None = None
     stopping: tuple[Stopping, ...] = ()
     strategy: Strategy | None = None
+    _stops: tuple[Stopping, ...] = dataclasses.field(default=(), init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        _freeze_variables(self, self.variables)
+        variables = self.variables
+        if all(isinstance(leaf, np.ndarray) for leaf in jax.tree.leaves(variables)):
+            from dew.inference.serving import _inference_projections
+
+            variables = jax.device_put(_inference_projections(self.model, variables))
+        _freeze_variables(self, variables)
+        object.__setattr__(self, "_stops", self._stop_criteria(self.sampling.stop))
+
+    def _stop_criteria(self, strings: tuple[str, ...]) -> tuple[Stopping, ...]:
+        """Compile stop strings against the processor's vocabulary, sized for the model's head."""
+        if not strings:
+            return ()
+        if not isinstance(self.processor, (decoding.Referencing, decoding.Tokenizing, decoding.Vocabulary)):
+            raise ValueError("stop strings compile against the task's processor, and this task has none "
+                             "that lists its vocabulary; pass processor=")
+        return (decoding.stop_strings(self.processor, strings,
+                                      self.model.vocab_size if isinstance(self.model, Bounded) else None),)
+
+    def _controls(self, sampling: Sampling | None, logits: Transforms | None, stopping: Criteria | None
+                  ) -> tuple[Sampling, Transforms | None, tuple[Stopping, ...]]:
+        """The policy, chain and criteria a call runs, the stop strings compiled
+        into criteria and the EOS and pad ids filled from the task's policy."""
+        policy = self.sampling if sampling is None else with_ids_of(sampling, self.sampling)
+        stops = self._stops if policy.stop == self.sampling.stop else self._stop_criteria(policy.stop)
+        chain = (self.logits if sampling is None else None) if logits is None else logits
+        criteria = decoding.components(self.stopping if stopping is None else stopping) + stops
+        return replace(policy, stop=(), pad_id=policy.pad), chain, criteria
 
     def bind(self, variables: Variables) -> TextGeneration:
         """Return the same task over other weights, such as a policy snapshot."""
@@ -418,33 +451,32 @@ class TextGeneration:
         return replace(self, model=model, variables=variables)
 
     @classmethod
-    def from_run(cls, directory: str, *, ema: bool | None = None, step: int | None = None,
+    def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
                  mesh: MeshSpec | None = None, layout: Layout | None = None,
-                 dtype: str | None = None, param_dtype: str | None = None) -> TextGeneration:
+                 dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None) -> TextGeneration:
         """Load the causal run in `directory`: the model its `run.json` records,
         rebuilt the way the recipe built it, over the weights of its latest
         checkpoint (or `step`), decoding through the run's own tokenizer.
 
         `ema` reads the averaged weights (None: when the run kept them), except
         under an objective whose average is a reference policy rather than the
-        trained one. With
-        `mesh` the weights restore straight onto that mesh under `layout`,
-        the way the trainer places them. dtype overrides computation;
+        trained one. With `mesh` the weights restore straight onto that mesh
+        under `layout`, the way the trainer places them. dtype overrides computation;
         param_dtype overrides parameter storage, and None preserves what the
         checkpoint stored. The run's preview budget and sampling policy
         become the task's defaults.
         """
-        import dew.objectives.lm  # registers the saved objective kinds
-        import dew.objectives.rl  # noqa: F401 registers the saved objective kinds
+        from dew.checkpoints import Checkpoints
         from dew.objectives.base import thaw
         from dew.registry import objectives
-        from dew.sampling.pipelines import restore_variables
 
-        record, model_config, processor = _saved_run(directory, dtype)
+        import_module("dew.objectives.lm")  # registers the saved objective kinds
+        import_module("dew.objectives.rl")
+        record, model_config, processor = _saved_run(directory, dtype, step)
         kind = named(record["objective"], "objective")
         budget = _saved_budget(record)
         objective_type = objectives[kind]
-        variables = restore_variables(directory, ema=False if objective_type._ema_is_reference else ema,
+        variables = Checkpoints(directory).variables( ema=False if objective_type._ema_is_reference else ema,
                                       step=step, mesh=mesh, layout=layout, param_dtype=param_dtype)
         if kind == "ppo":
             from dew.objectives.rl.ppo import _part
@@ -452,38 +484,25 @@ class TextGeneration:
         model = model_config.build()
         quantization = _saved_quantization(record)
         if quantization is not None:
-            from dew.training.quantization import apply_quantization
-            model = apply_quantization(model, quantization)
+            model = quantization.apply(model)
         return cls(model, thaw(variables), processor, sampling=_saved_sampling(record, budget),
                    max_new_tokens=budget if budget else None)
 
     @classmethod
-    def from_pretrained(cls, repo_id: str, *, ema: bool | None = None, step: int | None = None,
+    def from_pretrained(cls, repo_id: str, *, ema: bool | None = None, step: int | str | None = None,
                         mesh: MeshSpec | None = None, layout: Layout | None = None,
-                        dtype: str | None = None, param_dtype: str | None = None) -> TextGeneration:
+                        dtype: DTypeLike | None = None,
+                        param_dtype: DTypeLike | None = None) -> TextGeneration:
         """Load a run directory published to the Hugging Face Hub.
 
-        `dew.interop.hub.push_to_hub(..., raw=True)` is what writes it.
+        `HfApi().upload_folder` of the run directory itself is what writes it.
         """
         return cls.from_run(_pulled(repo_id), ema=ema, step=step, mesh=mesh, layout=layout,
                             dtype=dtype, param_dtype=param_dtype)
 
-    @overload
-    def __call__(self, request: Request, max_new_tokens: int | None = None, *, key: jax.Array,
-                 n: int | None = None, sampling: Sampling | None = None,
-                 images: Media | None = None, logits: Transforms | None = None,
-                 stopping: Criteria | None = None,
-                 strategy: Strategy | None = None) -> Generation: ...
-
-    @overload
-    def __call__(self, request: Request, max_new_tokens: int | None = None, *, seed: int,
-                 n: int | None = None, sampling: Sampling | None = None,
-                 images: Media | None = None, logits: Transforms | None = None,
-                 stopping: Criteria | None = None,
-                 strategy: Strategy | None = None) -> Generation: ...
 
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
-                 key: jax.Array | None = None, seed: int | None = None, n: int | None = None,
+                 key: int | jax.Array | None = None, n: int | None = None,
                  sampling: Sampling | None = None, images: Media | None = None,
                  logits: Transforms | None = None, stopping: Criteria | None = None,
                  strategy: Strategy | None = None) -> Generation:
@@ -491,14 +510,11 @@ class TextGeneration:
             inputs, budget, random_key = _task_inputs(self.processor, request, images=images,
                                           collective=mesh_of(self.variables) is not None,
                                           max_new_tokens=max_new_tokens, default_tokens=self.max_new_tokens,
-                                          max_length=self.max_length, key=key, seed=seed)
+                                          max_length=self.max_length, key=key)
             shaped, trips, capacity = _bucketed(inputs, budget, _ceiling(self.model))
-            chain = self.logits if sampling is None else None
+            policy, chain, criteria = self._controls(sampling, logits, stopping)
             generated = generate(_sized(self.model, capacity), self.variables, shaped, trips, key=random_key,
-                              sampling=self.sampling if sampling is None else sampling,
-                              n=self.n if n is None else n,
-                              logits=chain if logits is None else logits,
-                              stopping=self.stopping if stopping is None else stopping,
+                              sampling=policy, n=self.n if n is None else n, logits=chain, stopping=criteria,
                               strategy=self.strategy if strategy is None else strategy)
             decoder = None if self.processor is None else functools.partial(_decoded, self.processor)
             padding = shaped.tokens.shape[1] - inputs.tokens.shape[1]
@@ -509,7 +525,6 @@ class TextGeneration:
         with region("inference.text.decode"):
             rows = generation.host()
             return _decoded(self.processor, rows.tokens, rows.lengths, generation.prompt_width)
-
 
 
 @dataclass(frozen=True)
@@ -542,9 +557,9 @@ class BlockGeneration:
         return replace(self, variables=variables)
 
     @classmethod
-    def from_run(cls, directory: str, *, ema: bool | None = None, step: int | None = None,
+    def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
                  mesh: MeshSpec | None = None, layout: Layout | None = None,
-                 dtype: str | None = None, param_dtype: str | None = None) -> BlockGeneration:
+                 dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None) -> BlockGeneration:
         """Load the block-diffusion run in `directory`: the DiffusionGemma its
         `run.json` records over the weights of its latest checkpoint (or
         `step`), sampling over the canvas the model declares.
@@ -553,52 +568,38 @@ class BlockGeneration:
         selects the averaged weights, `mesh` and `layout` place them, and
         the two dtypes override computation and storage.
         """
-        from dew.interop import diffusion_gemma
-        from dew.sampling.pipelines import restore_variables
-
-        record, model_config, processor = _saved_run(directory, dtype)
-        canvas = model_config.config["max_seq_len"]
-        if not isinstance(canvas, int):
-            raise ValueError(
-                f"run.json records max_seq_len as {canvas!r}; the canvas a "
-                f"block-diffusion run decodes is a number of tokens")
-        model = diffusion_gemma.build(model_config.config, dtype=model_config.dtype,
-                                      attention_impl=model_config.attention_impl,
-                                      max_seq_len=canvas)
-        model = model.clone(text=model.text.clone(layer_scalar="trainable"))
-        variables = restore_variables(directory, ema=ema, step=step, mesh=mesh, layout=layout,
-                                      param_dtype=param_dtype)
-        return cls(model, variables, BlockProcess(model.canvas_length, model.vocab_size),
-                   processor, pad_token_id=integer(record.get("pad_token_id", 0), "pad_token_id"))
+        from dew.checkpoints import Checkpoints
+        from dew.diffusion.block import BlockProcess
+        record, model_config, processor = _saved_run(directory, dtype, step)
+        model = model_config.build()
+        if not isinstance(model, DiffusionGemma):
+            raise TypeError("block checkpoint must declare DiffusionGemma")
+        variables = Checkpoints(directory).variables(ema=ema, step=step, mesh=mesh, layout=layout,
+                                                      param_dtype=param_dtype)
+        return cls(model, variables, BlockProcess.from_json(named_fields(record['process'], 'process')),
+                   processor,
+                   max_new_tokens=_saved_budget(record) or None)
 
     @classmethod
-    def from_pretrained(cls, repo_id: str, *, ema: bool | None = None, step: int | None = None,
+    def from_pretrained(cls, repo_id: str, *, ema: bool | None = None, step: int | str | None = None,
                         mesh: MeshSpec | None = None, layout: Layout | None = None,
-                        dtype: str | None = None, param_dtype: str | None = None) -> BlockGeneration:
+                        dtype: DTypeLike | None = None,
+                        param_dtype: DTypeLike | None = None) -> BlockGeneration:
         """Load a run directory published to the Hugging Face Hub.
 
-        `dew.interop.hub.push_to_hub(..., raw=True)` is what writes it.
+        `HfApi().upload_folder` of the run directory itself is what writes it.
         """
         return cls.from_run(_pulled(repo_id), ema=ema, step=step, mesh=mesh, layout=layout,
                             dtype=dtype, param_dtype=param_dtype)
 
-    @overload
-    def __call__(self, request: Request, max_new_tokens: int | None = None, *, key: jax.Array,
-                 n: int | None = None, process: BlockProcess | None = None,
-                 images: Media | None = None) -> CanvasGeneration: ...
-
-    @overload
-    def __call__(self, request: Request, max_new_tokens: int | None = None, *, seed: int,
-                 n: int | None = None, process: BlockProcess | None = None,
-                 images: Media | None = None) -> CanvasGeneration: ...
 
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
-                 key: jax.Array | None = None, seed: int | None = None, n: int | None = None,
+                 key: int | jax.Array | None = None, n: int | None = None,
                  process: BlockProcess | None = None, images: Media | None = None) -> CanvasGeneration:
         with region("inference.block"):
             inputs, budget, random_key = _task_inputs(self.processor, request, images=images, collective=True,
                                           max_new_tokens=max_new_tokens, default_tokens=self.max_new_tokens,
-                                          max_length=self.max_length, key=key, seed=seed)
+                                          max_length=self.max_length, key=key)
             generated = (self.process if process is None else process).generate(
                 self.model, self.variables, inputs, budget, key=random_key,
                 n=self.n if n is None else n,
@@ -609,7 +610,6 @@ class BlockGeneration:
     def decode(self, generation: CanvasGeneration) -> tuple[str, ...]:
         """Return each row's valid continuation as text, empty without a processor."""
         return _canvas_text(self.processor, generation, "inference.block.decode")
-
 
 
 @dataclass(frozen=True)
@@ -625,7 +625,7 @@ class MaskedGeneration:
     variables: Variables
     process: DiscreteProcess
     processor: Processor | None = None
-    sampler: Unmask = Unmask()
+    solver: Unmask = dataclasses.field(default_factory=Unmask)
     steps: int = MDLM_STEPS
     eos_token_ids: tuple[int, ...] = ()
     pad_token_id: int = 0
@@ -641,9 +641,9 @@ class MaskedGeneration:
         return replace(self, variables=variables)
 
     @classmethod
-    def from_run(cls, directory: str, *, ema: bool | None = None, step: int | None = None,
+    def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
                  mesh: MeshSpec | None = None, layout: Layout | None = None,
-                 dtype: str | None = None, param_dtype: str | None = None) -> MaskedGeneration:
+                 dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None) -> MaskedGeneration:
         """Load the masked-diffusion run in `directory`: the bidirectional model
         its `run.json` records over the weights of its latest checkpoint (or
         `step`), refined with MDLM over the run's own mask token.
@@ -651,51 +651,54 @@ class MaskedGeneration:
         The arguments carry what `TextGeneration.from_run` carries, and the
         run's preview budget becomes the response length a call omits.
         """
-        from dew.diffusion.discrete import MDLM
-        from dew.sampling.pipelines import restore_variables
+        from dew.checkpoints import Checkpoints
+        from dew.diffusion.discrete import DiscreteProcess
+        from dew.registry import solvers
 
-        record, model_config, processor = _saved_run(directory, dtype)
+        record, model_config, processor = _saved_run(directory, dtype, step)
         budget = _saved_budget(record)
         model = model_config.build()
         if not isinstance(model, CausalTransformer) or model.causal or type(model.mask_token_id) is not int:
-            raise ValueError("a saved masked run requires a CausalTransformer with causal=False and a mask_token_id")
+            raise ValueError(
+                "a saved masked run requires a CausalTransformer with causal=False and a mask_token_id"
+            )
         mask_id = model.mask_token_id
-        variables = restore_variables(directory, ema=ema, step=step, mesh=mesh, layout=layout,
+        variables = Checkpoints(directory).variables( ema=ema, step=step, mesh=mesh, layout=layout,
                                       param_dtype=param_dtype)
-        return cls(model, variables, MDLM(mask_id=mask_id)(), processor,
+        process = DiscreteProcess.from_json(named_fields(record['process'], 'process'))
+        if process.mask_id != mask_id:
+            raise ValueError("model and process mask token disagree")
+        solver = named_fields(record['solver'], 'solver')
+        unmask = solvers.build(named(solver['name'], 'solver'), named_fields(solver['fields'], 'fields'))
+        if not isinstance(unmask, Unmask):
+            raise ValueError("a saved masked run requires an Unmask solver")
+        return cls(model, variables, process, processor, solver=unmask,
+                   steps=integer(record['sampling_steps'], 'sampling_steps'),
                    pad_token_id=integer(record.get("pad_token_id", 0), "pad_token_id"),
                    max_new_tokens=budget or None)
 
     @classmethod
-    def from_pretrained(cls, repo_id: str, *, ema: bool | None = None, step: int | None = None,
+    def from_pretrained(cls, repo_id: str, *, ema: bool | None = None, step: int | str | None = None,
                         mesh: MeshSpec | None = None, layout: Layout | None = None,
-                        dtype: str | None = None, param_dtype: str | None = None) -> MaskedGeneration:
+                        dtype: DTypeLike | None = None,
+                        param_dtype: DTypeLike | None = None) -> MaskedGeneration:
         """Load a run directory published to the Hugging Face Hub.
 
-        `dew.interop.hub.push_to_hub(..., raw=True)` is what writes it.
+        `HfApi().upload_folder` of the run directory itself is what writes it.
         """
         return cls.from_run(_pulled(repo_id), ema=ema, step=step, mesh=mesh, layout=layout,
                             dtype=dtype, param_dtype=param_dtype)
 
-    @overload
-    def __call__(self, request: Request, max_new_tokens: int | None = None, *, key: jax.Array,
-                 n: int | None = None, steps: int | None = None,
-                 images: Media | None = None) -> CanvasGeneration: ...
-
-    @overload
-    def __call__(self, request: Request, max_new_tokens: int | None = None, *, seed: int,
-                 n: int | None = None, steps: int | None = None,
-                 images: Media | None = None) -> CanvasGeneration: ...
 
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
-                 key: jax.Array | None = None, seed: int | None = None, n: int | None = None,
+                 key: int | jax.Array | None = None, n: int | None = None,
                  steps: int | None = None, images: Media | None = None) -> CanvasGeneration:
         with region("inference.masked"):
             inputs, budget, random_key = _task_inputs(self.processor, request, images=images, collective=True,
                 max_new_tokens=max_new_tokens, default_tokens=self.max_new_tokens,
-                max_length=self.max_length, key=key, seed=seed)
+                max_length=self.max_length, key=key)
             generated = self.process.generate(self.model, self.variables, inputs, budget, key=random_key,
-                sampler=self.sampler, steps=self.steps if steps is None else steps,
+                solver=self.solver, steps=self.steps if steps is None else steps,
                 n=self.n if n is None else n,
                 eos_token_ids=self.eos_token_ids, pad_token_id=self.pad_token_id)
             decoder = None if self.processor is None else functools.partial(_decoded, self.processor)
@@ -706,3 +709,4 @@ class MaskedGeneration:
         return _canvas_text(self.processor, generation, "inference.masked.decode")
 
 
+__all__ = ["SHAPE_BUCKETS", "BlockGeneration", "MaskedGeneration", "Processor", "TextGeneration"]

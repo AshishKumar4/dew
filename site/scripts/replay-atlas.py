@@ -111,6 +111,8 @@ def main() -> None:
         "cfg": trajectory.get("cfg", trajectory.get("cfg_scale")),
         "guidance_interval": trajectory.get("guidance_interval", "every step"),
         "negative_prompt": trajectory.get("negative_prompt"),
+        "batch_prompts": trajectory.get("batch_prompts"),
+        "batch_row": trajectory.get("batch_row"),
         "model": {key: provenance[key] for key in ("model", "parameters", "dew_commit", "device")},
         "frames": len(keep),
         "kept_steps": keep,

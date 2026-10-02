@@ -1,47 +1,30 @@
 """How a decode cache stores its keys and values: dense or paged, full or quantized.
 
 `dew.nn.attention.open_kv_cache` owns the cursor and the compact slot
-positions; this module owns the storage behind them. A `KVCache` value names
-the layout, and `KVStore` reads and writes it inside one attention module.
+positions; a `KVCache` value names the storage layout behind them and
+`KVStore` reads and writes it inside one attention module.
 
 Dense storage is one `[rows, capacity, kv_heads, head_dim]` block per row.
-Paged storage is one pool of fixed-size pages shared by every row,
-`[kv_heads, pages, page_size, head_dim]`, the layout the Pallas TPU paged
-attention kernel reads (`jax.experimental.pallas.ops.tpu.paged_attention`),
-and a
-`[rows, capacity // page_size]` page table maps a row's slot `s` to page
-`table[row, s // page_size]`, offset `s % page_size`. A row owns its pages
-only through the table, so a server can hand pages out on demand, share the
-pages of a common prompt prefix between rows, and hold more rows than
-`pages * page_size / capacity` whenever they are shorter than the capacity.
-
-A pool may be split into `groups`: the rows fall into that many equal
-groups in row order, the pool into as many equal parts, and a row's table
-names pages of its own group's part, counted from the start of that part.
-Reads and writes run mapped over the groups, so the group is a batch
-dimension of every gather and scatter into the pool. A server whose mesh
-splits its rows `n` ways splits the pool into `n` groups, and each device
-then reads and writes only the pages it holds. A pool indexed as one table
-into the whole of a split pool would be gathered onto every device first.
+Paged storage is one pool `[kv_heads, pages, page_size, head_dim]` shared by
+every row, the layout the Pallas TPU paged attention kernel reads, with a
+`[rows, capacity // page_size]` page table mapping slot `s` to page
+`table[row, s // page_size]`, offset `s % page_size`. A server can then hand
+pages out on demand, share a common prefix's pages, and hold more rows than
+`pages * page_size / capacity` while they are short. A pool split into
+`groups` gives each equal group of rows its own part, indexed from the
+part's start, so a server whose mesh splits rows `n` ways reads and writes
+only the pages each device holds instead of gathering the whole pool.
 
 A quantized cache stores int8 or float8 (e4m3) values with one float32
-scale per token and head, the absmax over the head's features divided by
-the format's largest value. Reads dequantize to the compute dtype.
-
-An int8 cache stores its keys rotated by the orthonormal Hadamard matrix
-over head_dim, as QuaRot (Ashkboos et al. 2024, arXiv:2404.00456) rotates
-its KV cache. A checkpoint whose keys carry a few outlier channels (Qwen3's
-do) otherwise spends the one per-token scale on those channels, and the rest
-round to a handful of levels; rotated, every channel carries an even share
-of the outlier. The keys stay rotated when read, and the query takes the
-same rotation (`Append.query`), which leaves every logit as it was, since
-`H Hᵀ = I`: one `[rows, heads, head_dim]` product per step, not one over the
-whole cache. Values are not rotated. Float8 keys are not rotated either:
-e4m3 rounds each element relative to itself, so an outlier costs the other
-channels nothing, and spreading it made things worse. On Qwen3-0.6B over
-wikitext-2, against the bf16 cache: int8 unrotated +0.66 perplexity,
-rotated +0.008; float8 unrotated -0.03, rotated +1.03. The full table is in
-docs/concepts/inference.md.
+scale per token and head (absmax over the head's features over the
+format's largest value), dequantized on read. int8 keys are stored rotated
+by the orthonormal Hadamard matrix over head_dim, as QuaRot (arXiv:2404.00456)
+rotates its cache, so a few outlier channels (Qwen3's keys) do not take the
+whole per-token scale; the query takes the same rotation (`Append.query`),
+leaving every logit unchanged since `H Hᵀ = I`. Values and float8 keys are
+not rotated (e4m3 rounds each element relative to itself). On Qwen3-0.6B
+over wikitext-2 against bf16: int8 +0.66 perplexity unrotated, +0.008
+rotated; float8 -0.03 unrotated, +1.03 rotated (docs/concepts/inference.md).
 """
 
 from __future__ import annotations
@@ -92,15 +75,12 @@ def is_paged(cache: Mapping[str, object]) -> bool:
 class KVCache:
     """The storage layout of a decode cache.
 
-    `quantized` stores keys and values in that format with per-token,
-    per-head scales; int8 keys are Hadamard-rotated, which needs a
-    power-of-two head_dim. None keeps the compute dtype. `page_size` pages the cache:
-    `capacity` has to be a multiple of it, and `pages` sizes the shared
-    pool, None allocating one page per slot of every row the cache is
-    opened for (as much memory as the dense layout). A smaller pool is a
-    server's to hand out (`dew.inference.serving.Server`). `groups` splits
-    a paged pool into that many parts, one per equal group of rows (see
-    the module docstring); the row count and `pages` have to divide by it.
+    `quantized` stores keys and values in that format with per-token, per-head
+    scales; int8 keys are Hadamard-rotated, which needs a power-of-two head_dim.
+    `page_size` pages the cache (`capacity` a multiple of it) and `pages` sizes
+    the pool, None giving one page per slot of every row; a smaller pool is a
+    server's to hand out (`dew.inference.serving.Server`). `groups` splits a
+    paged pool by equal groups of rows; the row count and `pages` divide by it.
     """
 
     quantized: KVDtype | None = None
@@ -200,12 +180,10 @@ class Layered(Protocol):
 def refuse_unassigned(layout: KVCache, rows: int, capacity: int) -> None:
     """Refuse a paged pool that cannot give each of `rows` rows its whole `capacity`.
 
-    A caller that writes through the default page tables, as generation
-    does, needs a private block of pages for every row. Jax's checkify
-    cannot carry a device check into a model layer's shard_map
-    (jax-ml/jax#40907), so the store checks no write, and the shapes decide
-    it here instead, before any write. A server hands a smaller pool out
-    itself (`dew.inference.serving.Server`).
+    Writing through the default page tables, as generation does, needs a private
+    block of pages per row. checkify cannot carry a device check into a layer's
+    shard_map (jax-ml/jax#40907), so the shapes decide it here, before any
+    write.
     """
     if layout.page_size is None or layout.pages is None:
         return
@@ -219,13 +197,11 @@ def refuse_unassigned(layout: KVCache, rows: int, capacity: int) -> None:
 def default_page_table(rows: int, per_row: int, pages: int, groups: int) -> jax.Array:
     """Each row owns a private contiguous block of `per_row` pages in its group's part.
 
-    Row `r` of a group holds pages `r * per_row` onward, counted from the
-    start of the part. That is what a cache opened outside a server reads,
-    over the default pool of one page per slot of every row. A smaller pool
-    cannot give every row a block: the pages past the end of a part read as
-    the part's size, an index no part holds, and a write through one is
-    dropped, so `refuse_unassigned` refuses such a pool before any write. A
-    server writes its rows' tables itself, so it never writes through them.
+    Row `r` of a group holds pages `r * per_row` onward, as a cache opened
+    outside a server reads. In a smaller pool the pages past a part's end read
+    as the part's size, an index no part holds, so a write through one drops;
+    `refuse_unassigned` refuses such a pool first. A server writes its own
+    tables.
     """
     part = pages // groups
     table = jnp.tile(jnp.arange(rows // groups * per_row, dtype=jnp.int32).reshape(rows // groups, per_row),
@@ -338,41 +314,111 @@ class KVStore:
 
     def _gathered(self, pool: jax.Array) -> jax.Array:
         """Every row's slots of `pool` `[heads, pages, page_size, ...]`, as `[rows, capacity, heads, ...]`."""
-        groups = self.layout.groups
-        rows = jax.vmap(lambda part, table: part[:, table], in_axes=(1, 0), out_axes=1)(
-            grouped(pool, 1, groups), grouped(self._get(TABLE), 0, groups))
-        # [heads, groups, rows / groups, per_row, page_size, ...] -> [rows, capacity, heads, ...]
-        return jnp.moveaxis(rows.reshape(self.kv_heads, self.rows, self.capacity, *pool.shape[3:]), 0, 2)
+        return _gather_pages(pool, self._get(TABLE), self.layout.groups)
 
     def kernel(self) -> bool:
-        """Whether decode runs the Pallas TPU paged kernel rather than the XLA gather.
+        """Whether decode can read a full-precision BF16 page pool natively.
 
-        The kernel reads a bfloat16 pool: it casts any other page dtype to
-        bfloat16 on the way in, and its int8 path broadcasts the scales to
-        the pool's full width first, so a float32 or quantized pool takes
-        the gather. A GPU takes the gather too: jax deprecated its Triton
-        paged kernel (`jax.experimental.pallas.ops.gpu.paged_attention`),
-        which ran 2% faster than the gather on an A100. A pool split into
-        groups takes the gather as well: the kernel indexes one pool with
-        one table, and the grouped gather is what keeps each group's pages
-        on the device that holds them.
+        The TPU kernel reads bfloat16 and casts other page dtypes (its int8 path
+        broadcasts the scales to full width first), so a float32 or quantized pool
+        takes the gather; a GPU uses cuDNN's paged forward on supported heads and
+        whole 16-token pages. A grouped pool takes the gather, which keeps each
+        group's pages where they are.
         """
-        return (self.layout.page_size is not None and self.layout.quantized is None
-                and self.layout.groups == 1 and self.dtype == jnp.bfloat16 and jax.default_backend() == "tpu")
+        page_size = self.layout.page_size
+        if (page_size is None or self.layout.quantized is not None
+                or self.layout.groups != 1 or self.dtype != jnp.bfloat16):
+            return False
+        if jax.default_backend() == "tpu":
+            return True
+        if jax.default_backend() != "gpu":
+            return False
+        from dew.nn.attention import _FORWARD_MODE, cudnn_runs
+
+        query = jax.ShapeDtypeStruct((self.rows, 1, self.kv_heads, self.head_dim), self.dtype)
+        return (page_size % 16 == 0 and cudnn_runs(query)
+                and not _FORWARD_MODE.get())
 
     def decode(self, query: jax.Array, lengths: jax.Array, softcap: float | None) -> jax.Array:
         """One query per row `[rows, heads, head_dim]` against the first
-        `lengths` slots of each row, through the Pallas TPU paged kernel.
+        `lengths` slots of each row, through its device's paged kernel.
 
-        The kernel does not scale the logits, so the query carries
+        The TPU kernel does not scale the logits, so the query carries
         1/sqrt(head_dim) as every other attention path applies it.
         """
+        if jax.default_backend() == "gpu":
+            if softcap is not None:
+                raise ValueError("the cuDNN paged kernel does not apply a logit softcap")
+            # JAX 0.11.2's paged cuDNN backward returns [rows, page, heads, dim]
+            # for a [pool_pages, page, heads, dim] operand; the verifier rejects
+            # it. Keep the old gathered attention as the wrapper's VJP.
+            return _gpu_paged(query, self._get("cached_key"), self._get("cached_value"),
+                              self._get(TABLE), lengths)
         from jax.experimental.pallas.ops.tpu.paged_attention import paged_attention
 
         scaled = query * jnp.asarray(1.0 / math.sqrt(self.head_dim), query.dtype)
         table = self._get(TABLE)
-        return paged_attention(scaled, self._get("cached_key"), self._get("cached_value"), lengths, table,
-                               attn_logits_soft_cap=softcap, pages_per_compute_block=_pages_per_block(table.shape[1]))
+        return paged_attention(
+            scaled,
+            self._get("cached_key"),
+            self._get("cached_value"),
+            lengths,
+            table,
+            attn_logits_soft_cap=softcap,
+            pages_per_compute_block=_pages_per_block(table.shape[1]),
+        )
+
+
+def _gather_pages(pool: jax.Array, table: jax.Array, groups: int) -> jax.Array:
+    """The existing grouped page read as `[rows, capacity, heads, ...]`."""
+    rows = jax.vmap(lambda part, index: part[:, index], in_axes=(1, 0), out_axes=1)(
+        grouped(pool, 1, groups), grouped(table, 0, groups))
+    return jnp.moveaxis(rows.reshape(pool.shape[0], table.shape[0],
+                                     table.shape[1] * pool.shape[2], *pool.shape[3:]), 0, 2)
+
+
+@jax.custom_vjp
+def _gpu_paged(query: jax.Array, key: jax.Array, value: jax.Array,
+               table: jax.Array, lengths: jax.Array) -> jax.Array:
+    # Private JAX API, pinned by jax<0.11.3. Moving it breaks
+    # test_native_gpu_paged_value_and_vjp_keep_the_gathered_attention.
+    from jax._src.cudnn.fused_attention_stablehlo import MaskType, paged_attention
+
+    rows = query.shape[0]
+    # The old gather pads q=1 to q=2 for cuDNN's odd-query backward restriction
+    # and passes query lengths of 2. Keep that forward tiling/rounding; discard
+    # the added query's output, rather than changing the accepted greedy tokens.
+    padded = jnp.pad(query[:, None], ((0, 0), (0, 1), (0, 0), (0, 0)))
+    pages = table[:, None, :, None]
+    # Inactive rows read one slot to keep the unused output finite; nobody reads it.
+    out = paged_attention(
+        padded, jnp.moveaxis(key, 0, 2), jnp.moveaxis(value, 0, 2),
+        jnp.full(rows, 2, jnp.int32), jnp.maximum(lengths, 1), pages, pages,
+        scale=query.shape[-1] ** -0.5, mask_type=MaskType.PADDING)
+    if not isinstance(out, jax.Array):
+        raise TypeError("cuDNN paged attention must return an array")
+    return out[:, 0]
+
+
+def _gpu_paged_fwd(query, key, value, table, lengths):
+    return _gpu_paged(query, key, value, table, lengths), (query, key, value, table, lengths)
+
+
+def _gpu_paged_bwd(saved, cotangent):
+    from dew.nn.attention import cudnn_attention
+
+    query, key, value, table, lengths = saved
+
+    def gathered(q, k, v):
+        return cudnn_attention(q[:, None], _gather_pages(k, table, 1), _gather_pages(v, table, 1),
+                                bias=None, mask=None, causal=False, sliding_window=None,
+                                key_value_seq_lengths=jnp.maximum(lengths, 1))[:, 0]
+
+    _, backward = jax.vjp(gathered, query, key, value)
+    return (*backward(cotangent), None, None)
+
+
+_gpu_paged.defvjp(_gpu_paged_fwd, _gpu_paged_bwd)
 
 
 def _pages_per_block(pages: int) -> int:
@@ -405,3 +451,24 @@ class Append:
         """`query` `[..., head_dim]` in the basis the stored keys are in."""
         rotation = self.store.rotation
         return query if rotation is None else rotated(query, rotation)
+
+
+def gather_cache_rows(cache, rows):
+    """A decode cache reindexed on its batch axis, one gather per leaf.
+
+    Every leaf a decode step writes carries its batch on axis zero outside the
+    stack (`StackView` removes a scanned layer axis before the cache crosses
+    `apply`): keys and values with validity and cursor, a delta net's states,
+    latent attention's cache, image groups, a multimodal model's next position.
+    `rows` is any index array: repeats duplicate a row's state, a permutation
+    reparents rows, a different length changes the row count; beam branching
+    and speculative rollback are both this. A paged cache is refused, since
+    gathered rows would write into each other's pages.
+    """
+    if is_paged(cache):
+        raise ValueError("beam search and speculative decoding regroup cache rows, which a "
+                         "paged cache's shared pool cannot do; decode them with a dense cache")
+    return jax.tree.map(lambda leaf: jnp.take(leaf, rows, axis=0), cache)
+
+
+__all__ = ["Append", "KVCache", "KVStore", "Layered"]

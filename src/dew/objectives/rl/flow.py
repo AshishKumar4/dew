@@ -14,7 +14,7 @@ unlike the released trainer's earlier float32 score conversion.
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -23,15 +23,15 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
-from dew.artifacts import agree_process_phase, broadcast_from_process_zero, collective_host
+from dew.artifacts import agreed, broadcast_from_process_zero, collective_host
 from dew.diffusion.presets import Preset
 from dew.diffusion.process import Process
 from dew.inputs import InputSpec
 from dew.nn.autoencoders import AutoEncoder
-from dew.objectives.base import Aux, Batch, Mean, Shown, Step, Variables
+from dew.objectives.base import Aux, Batch, Ratio, Shown, Step, Variables
 from dew.objectives.diffusion.objective import VALIDATION_SAMPLES, DiffusionObjective
 from dew.registry import objectives
-from dew.sampling.flow import FlowSDE, FlowTrajectory, GaussianTransition, sample_trajectory
+from dew.sampling.flow import FlowSDE, FlowTrajectory, GaussianTransition
 from dew.sampling.guidance import CFG
 from dew.sampling.solvers import Euler, Solver
 
@@ -58,6 +58,11 @@ def _source(inputs: InputSpec, batch: Batch) -> jax.Array:
 
 
 
+_DEFAULT_SDE = FlowSDE()
+_DEFAULT_GUIDANCE = CFG(3.0)
+_DEFAULT_SOLVER = Euler()
+
+
 @objectives("flow_grpo")
 class FlowGRPOObjective(DiffusionObjective):
     """Train a rectified-flow policy on clipped, coordinate-normalized gradients.
@@ -72,21 +77,21 @@ class FlowGRPOObjective(DiffusionObjective):
     beta > 0 freezes the initial denoiser in the existing EMA slot, which is
     then a reference rather than an average (`_ema_is_reference`): the
     task a run publishes and restores, its evaluation and its previews are
-    the live policy. sampler and steps configure evaluation; sde specifies
+    the live policy. solver and steps configure evaluation; sde specifies
     both rollout and rescoring. pretrained is the whole variables tree the
     policy starts from, as `DiffusionObjective` takes it: the model's
     collections, `encoders` and any `autoencoder`.
     """
 
     # The loss is a policy-gradient surrogate, shown without a direction.
-    shown = {"loss": Shown(), "reward": Shown(better="higher")}
+    shown: Mapping[str, Shown] = {"loss": Shown(), "reward": Shown(better="higher")}
     _ema_is_reference = True
 
     def __init__(self, model: nn.Module, process: Process | Preset, inputs: InputSpec, *,
-                 sde: FlowSDE = FlowSDE(), beta: float = 0.0,
+                 sde: FlowSDE = _DEFAULT_SDE, beta: float = 0.0,
                  clip_range: float = 1e-4, adv_clip_max: float = 5.0,
                  autoencoder: AutoEncoder | None = None,
-                 guidance: CFG | None = CFG(3.0), sampler: Solver = Euler(),
+                 guidance: CFG | None = _DEFAULT_GUIDANCE, solver: Solver = _DEFAULT_SOLVER,
                  steps: int = 41, pretrained: Variables | None = None):
         if not math.isfinite(beta) or beta < 0:
             raise ValueError("beta must be finite and non-negative")
@@ -99,7 +104,7 @@ class FlowGRPOObjective(DiffusionObjective):
         if pretrained is not None and "params" not in pretrained:
             raise ValueError("pretrained must be a variables tree with a params collection")
         super().__init__(model, process, inputs, autoencoder=autoencoder,
-                         unconditional_prob=0, ema_decay=1.0, sampler=sampler,
+                         unconditional_prob=0, ema_decay=1.0, solver=solver,
                          guidance=guidance, steps=steps, pretrained=pretrained)
         sde.validate(self.process)
         if beta == 0:
@@ -154,7 +159,7 @@ class FlowGRPOObjective(DiffusionObjective):
             jnp.swapaxes(value, 0, 1) for value in (latents, following, times, next_times)))
         return values.T
 
-    def loss(self, params: Variables, batch: Batch, step: Step) -> tuple[Mean, Aux]:
+    def loss(self, params: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
         """Score the clipped policy gradient over the recorded transitions.
 
         The scan carries nothing between transitions; each one contributes
@@ -208,7 +213,7 @@ class FlowGRPOObjective(DiffusionObjective):
             metrics["transition_kl"] = kl / denominator
         if REWARDS_KEY in batch:
             metrics["reward"] = jnp.asarray(batch[REWARDS_KEY], jnp.float32).mean()
-        return Mean(pg + self.beta * kl, mass), Aux(metrics)
+        return Ratio(pg + self.beta * kl, mass), Aux(metrics)
 
     def _draw(self, params: Variables, batch: Batch, key: jax.Array,
               limit: int | None = None) -> tuple[jax.Array, Batch]:
@@ -217,28 +222,17 @@ class FlowGRPOObjective(DiffusionObjective):
         `limit` caps the rows drawn, which is what a preview takes.
         Returns the samples and the condition tokens behind them.
         """
-        error = None
-        prepared = None
-        try:
+        def setup() -> tuple[int, Batch]:
             count = _source(self.inputs, batch).shape[0]
             sample_batch = self._sampling_batch(batch)
             if limit is not None:
                 count = min(limit, count)
                 sample_batch = jax.tree.map(lambda value: value[:count], sample_batch)
-            prepared = (count, sample_batch)
-        except BaseException as failure:
-            error = failure
-        agree_process_phase(error, phase="flow sample setup")
-        assert prepared is not None
-        count, sample_batch = prepared
-        error = None
-        samples = None
-        try:
-            samples = self._sample(params, sample_batch, key, count=count)
-        except BaseException as failure:
-            error = failure
-        agree_process_phase(error, phase="flow sample generation")
-        assert samples is not None
+            return count, sample_batch
+
+        count, sample_batch = agreed("flow sample setup", setup)
+        samples = agreed("flow sample generation",
+                         lambda: self._sample(params, sample_batch, key, count=count))
         return samples, {keyword: sample_batch[condition.field]
                          for keyword, condition in self.inputs.conditions.items()}
 
@@ -324,8 +318,8 @@ class FlowRollout:
         noise_key, sample_key = jax.random.split(key)
         count = _source(objective.inputs, batch).shape[0]
         initial = objective.process.noise(noise_key, (count, *objective.latent_shape))
-        trajectory = sample_trajectory(denoise, initial, self.steps, solver=objective.sde,
-                                       guidance=objective.guidance, key=sample_key)
+        trajectory = objective.sde.trajectory(denoise, initial, self.steps,
+                                              guidance=objective.guidance, key=sample_key)
         samples = trajectory.samples
         if objective.autoencoder is not None:
             samples = objective.autoencoder.decode(params["autoencoder"], samples)
@@ -411,47 +405,23 @@ class FlowRollout:
         `train_steps` transitions. Every phase agrees across ranks before
         the next collective.
         """
-        error = None
-        expanded = None
-        owned = slice(None)
-        count = 0
-        try:
-            expanded, owned, count = self._expanded(batch)
-        except BaseException as failure:
-            error = failure
-        agree_process_phase(error, phase="flow rollout setup")
-        assert expanded is not None
-        error = None
-        generated = None
-        try:
-            generated = self._generate(state.params, expanded, key)
-        except BaseException as failure:
-            error = failure
-        agree_process_phase(error, phase="flow rollout generation")
-        assert generated is not None
+        expanded, owned, count = agreed("flow rollout setup", lambda: self._expanded(batch))
+        generated = agreed("flow rollout generation", lambda: self._generate(state.params, expanded, key))
         (trajectory, images), context = collective_host(
             (generated, expanded), phase="flow rollout")
-        error = None
-        rewards = None
-        if jax.process_index() == 0:
-            try:
-                rewards = np.asarray(self.reward(np.asarray(images), context), np.float64)
-                if rewards.shape != (count * self.groups,) or not np.isfinite(rewards).all():
-                    raise ValueError("a flow reward must return one finite scalar per generated sample")
-            except BaseException as failure:
-                error = failure
-        agree_process_phase(error, phase="flow rollout reward")
+
+        def score() -> np.ndarray | None:
+            if jax.process_index() != 0:
+                return None
+            rewards = np.asarray(self.reward(np.asarray(images), context), np.float64)
+            if rewards.shape != (count * self.groups,) or not np.isfinite(rewards).all():
+                raise ValueError("a flow reward must return one finite scalar per generated sample")
+            return rewards
+
+        rewards = agreed("flow rollout reward", score)
         rewards = np.asarray(broadcast_from_process_zero(
             None if rewards is None else rewards.tolist()), np.float64)
-        error = None
-        prepared = None
-        try:
-            prepared = self._transitions(trajectory, context, rewards, owned)
-        except BaseException as failure:
-            error = failure
-        agree_process_phase(error, phase="flow rollout batching")
-        assert prepared is not None
-        return prepared
+        return agreed("flow rollout batching", lambda: self._transitions(trajectory, context, rewards, owned))
 
 
 __all__ = ["FlowGRPOObjective", "FlowReward", "FlowRollout"]

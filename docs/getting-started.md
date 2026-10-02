@@ -7,8 +7,6 @@ The blocks below form one script, `train.py`.
 ## Data
 
 ```python
-import itertools
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -17,27 +15,16 @@ from flax import linen as nn
 
 from dew import Trainer
 from dew.data import Dataset
-from dew.objectives.base import Aux, Mean, Objective, mean_loss
+from dew.objectives.base import Aux, Ratio, Objective
 
 x = np.linspace(-1, 1, 32, dtype=np.float32).reshape(32, 1)
 y = 2 * x + 1
-batch = {"x": x, "y": y}
-data = Dataset(train=lambda partition: itertools.repeat(batch), val=None,
-               records=32, batch=32)
+data = Dataset.from_records({"x": x, "y": y}, batch=32)
 ```
 
-A batch is a dictionary of arrays whose first dimension is the batch. Here `x` and `y` are float32 arrays of shape `(32, 1)`.
+`Dataset.from_records` takes the records as columns, here float32 arrays `x` and `y` of shape `(32, 1)` whose first axis is the record. A batch is a dictionary of the same fields whose first dimension is the batch. `batch=32` reads all 32 points every step.
 
-`Dataset` holds functions that open iterators, not the iterators themselves:
-
-| Argument | Meaning |
-|---|---|
-| `train` | `train(partition)` returns an iterator of training batches. This one repeats the same batch forever. |
-| `val` | The same for validation batches, or `None` for no validation. |
-| `records` | The number of training examples. |
-| `batch` | The global batch size. |
-
-Repeating one batch is enough to check that optimization works. A real run reads different batches and holds out validation records; [Training data](concepts/data.md) covers both.
+The training stream reshuffles the records every epoch, from `seed` (0 unless given), and a checkpoint saves its position, so a resumed run continues where it stopped. With several processes, each one reads its own share of every batch. `validation=` takes held-out records in the same form; this example has none. [Training data](concepts/data.md) covers the readers for files, Hugging Face and TFDS datasets, and the `Dataset` value they all return.
 
 ## Objective
 
@@ -55,8 +42,8 @@ class Regression(Objective):
     def loss(self, variables, batch, step):
         prediction = self.model.apply(variables, batch["x"])
         errors = (prediction - batch["y"]) ** 2
-        loss = Mean(jnp.sum(errors), jnp.asarray(errors.size))
-        mse, _ = mean_loss(loss)
+        loss = Ratio(jnp.sum(errors), jnp.asarray(errors.size))
+        mse, _ = loss.mean()
         return loss, Aux(metrics={"mse": mse})
 
 
@@ -68,8 +55,8 @@ objective = Regression(model)
 
 `loss(variables, batch, step)` returns two values:
 
-- `Mean(total, mass)`, a sum and the count it is averaged over. The trainer adds totals and masses over a gradient-accumulation window and divides once, so the gradient is the gradient of the mean over the whole window. Here the mass is the number of squared errors.
-- `Aux(metrics=...)`, scalars to log. `mean_loss` turns a `Mean` into its value.
+- `Ratio(total, mass)`, a sum and the count it is averaged over. The trainer adds totals and masses over a gradient-accumulation window and divides once, so the gradient is the gradient of the mean over the whole window. Here the mass is the number of squared errors.
+- `Aux(metrics=...)`, scalars to log. `Ratio.mean` turns a `Ratio` into its value.
 
 `step` is a `Step`: `step.step` counts accepted microbatches and `step.key` is a fresh random key for this attempt. This loss is deterministic and uses neither.
 
@@ -100,14 +87,14 @@ JAX_PLATFORMS=cpu python train.py
 
 ```text
 Training Dense from step 0 to 100: 2 parameters, on 1 × cpu, batch 32, float32
-step  50/100  loss 2.228e-04  mse 2.228e-04  step_time_ms 0.5490  samples_per_sec 58,283  accepted 100.0%
-step 100/100  loss 1.416e-07  mse 1.416e-07  step_time_ms 0.5323  samples_per_sec 60,117  accepted 100.0%
-Trained 100 steps in 0:00:00: first step after 0.20 s, then 2009.5 step/s
-20.0% of the wall time in steps, final loss 1.416e-07
+step  50/100  loss 2.228e-04  mse 2.228e-04  step_time_ms 10.31  samples_per_sec 3,105  accepted 100.0%  0:00:01 left
+step 100/100  loss 1.416e-07  mse 1.416e-07  step_time_ms 13.69  samples_per_sec 2,337  accepted 100.0%
+Trained 100 steps in 0:00:02: first step after 0.59 s, then 83.7 step/s
+66.6% of the wall time in steps, final loss 1.416e-07
 Final mean squared error: 0.000000
 ```
 
-The first line names the model, its parameter count, the devices, the global batch and the precision. Each `step` line reports the loss and the objective's metrics of that step, the step time and throughput averaged over the interval since the previous line, and whether the step was accepted (a step with non-finite values is rejected under dynamic loss scaling). The last two lines report when the first step finished, which includes compilation, and the share of wall time spent in steps. This is `fit`'s output when stdout is not a terminal, as in a pipe, a log file or CI; on a terminal it draws one live panel with the same numbers, a progress bar and a sparkline per metric. Only process 0 prints. Other backends and library versions print slightly different numbers.
+The first line names the model, its parameter count, the devices, the global batch and the precision. Each `step` line reports the loss and the objective's metrics of that step, the step time and throughput averaged over the interval since the previous line, and whether the step was accepted (a step with non-finite values is rejected under dynamic loss scaling). The last two lines report when the first step finished, which includes compilation, and the share of wall time spent in steps. This is `fit`'s output when stdout is not a terminal, as in a pipe, a log file or CI; on a terminal it draws one live panel with the same numbers, a progress bar and a sparkline per metric. Only process 0 prints. The output above came from two cores of a shared workstation CPU, where reading the batch through Grain's threads takes most of each 10 ms step; other machines, backends and library versions print different timings.
 
 `fit` returns a `TrainState`. `state.params` holds the trained variables, the tree `model.apply` takes. The state also holds the optimizer state, the root key and three counters: `step` counts attempts, `microstep` counts accepted microbatches, and `updates` counts optimizer updates. They differ when gradients are accumulated, or when dynamic loss scaling rejects a step with non-finite values. This objective keeps no moving average, so `state.averaged` raises an error.
 
@@ -115,6 +102,6 @@ The first line names the model, its parameter count, the devices, the global bat
 
 - More input features: give the batch shape `(batch_size, features)` and the `init` sample shape `(1, features)`.
 - A nonlinear model: replace `nn.Dense` with your own Linen module. The batch fields and the objective must still agree on names, shapes and dtypes.
-- Changing data: return an iterator over your batches instead of `itertools.repeat`. To resume from a checkpoint the iterator must save and restore its position; see [Training data](concepts/data.md) and [Checkpoints](guides/checkpoints.md).
+- Changing data: pass more records, a smaller `batch`, or `validation=` held-out records to `from_records`. Data that does not fit in memory comes from a dataset specification or `dew.data.load`; see [Training data](concepts/data.md) and [Checkpoints](guides/checkpoints.md).
 
 [Custom objectives](concepts/objectives.md) adds evaluation and state to an objective. [Language models](concepts/language_models.md) uses a built-in objective on tokenized text.

@@ -1,11 +1,10 @@
 """Manifold-constrained hyper-connections: the residual as `hc_mult` streams.
 
-GLM-5.3-Flash and DeepSeek V4 carry the residual through the decoder as a
-stack of `hc_mult` streams, `[B, S, H, D]`, instead of one vector. Each
-sublayer reads one collapse of the streams and writes back into every one
-of them through a mixing the streams themselves choose (mHC, Xie et al.
-2026, section 2.2 eq. 8). GLM-5.3-Flash and DeepSeek V4 compute this
-identically. The steps are:
+GLM-5.3-Flash and DeepSeek V4 carry the residual as `hc_mult` streams,
+`[B, S, H, D]`. Each sublayer reads one collapse of the streams and writes
+back into all of them through a mixing they choose (mHC, Xie et al. 2026,
+section 2.2 eq. 8; `Glm5NextTextHyperConnection`, modeling_glm5_next.py:219-295,
+and `DeepseekV4HyperConnection`, modeling_deepseek_v4.py:867-943):
 
     flat  = rmsnorm(streams.reshape(B, S, H*D))          # no weight, fp32
     mixes = flat @ fn^T                                  # [(2 + H) * H]
@@ -16,35 +15,22 @@ identically. The steps are:
     collapsed = sum_h pre[h] streams[h]                  # the sublayer's input
     streams'  = post[:, None] * sublayer(collapsed)[None, :] + comb^T @ streams
 
-References: `Glm5NextTextHyperConnection` (modeling_glm5_next.py:219-295)
-and `DeepseekV4HyperConnection` (modeling_deepseek_v4.py:867-943).
+Sinkhorn-Knopp normalises columns first, then `iters - 1` rounds of rows and
+columns, `eps` in each denominator, in fp32; the result is asymmetric, so it
+applies transposed, `streams'[k] = sum_j comb[j, k] streams[j]`. The final
+collapse is GLM's unweighted mean (modeling_glm5_next.py:298-302) or V4's
+learned collapse shaped like `pre` (modeling_deepseek_v4.py:946-962), the
+record's `head`.
 
-`comb` is projected toward the doubly stochastic matrices by Sinkhorn-Knopp:
-a column normalisation first, then `iters - 1` rounds of row and column
-normalisation, each with `eps` in the denominator, in fp32. It is applied
-transposed, `streams'[k] = sum_j comb[j, k] streams[j]`. Sinkhorn leaves the
-matrix asymmetric, so the direction is part of the math.
+DeepSeek-V4.1's Single-Pass mHC (arXiv 2609.19969, section 2.4.1, eq. 6)
+collapses each sublayer's input by the previous site's `pre`, the stack's
+first sublayer reading the first stream alone (V4.1 inference/model.py:968-994,
+:1159-1163); under `single_pass` the stack carries `Carried(streams, pre)`
+and the final norm reads the last site's collapse (:1268), head 'carried'.
 
-The two references differ only in how the streams collapse at the end:
-GLM takes their unweighted mean (`Glm5NextTextHyperHead`,
-modeling_glm5_next.py:298-302) and V4 a learned collapse of the same shape
-as `pre` (`DeepseekV4HyperHead`, modeling_deepseek_v4.py:946-962), which the
-record's `head` names.
-
-DeepSeek-V4.1 runs Single-Pass mHC (arXiv 2609.19969, section 2.4.1, eq. 6):
-a sublayer collapses the streams by the `pre` the previous site computed,
-not its own, so a block's attention reads the previous block's feed-forward
-`pre` and its feed-forward the attention's, and the stack's first sublayer
-reads the first stream alone (V4.1 inference/model.py:968-994, :1159-1163).
-The record's `single_pass` names that schedule, under which the stack
-carries `Carried(streams, pre)`; its final norm reads the collapse by the
-last site's `pre` (:1268), the head 'carried'.
-
-Parameter names are the checkpoints': `fn` `[(2 + H) H, H D]` in the
-torch Linear's `[out, in]` layout (the release stores it as a raw tensor,
-not a Linear), `base` `[(2 + H) H]` and `scale` `[3]` under the block's
-`attn_hc` and `ffn_hc`; the weighted head's `hc_fn`, `hc_base`, `hc_scale`
-under `hc_head`.
+Parameters are the checkpoints': `fn` `[(2 + H) H, H D]` in torch's `[out,
+in]` layout, `base` `[(2 + H) H]` and `scale` `[3]` under `attn_hc` and
+`ffn_hc`; the weighted head's `hc_fn`, `hc_base`, `hc_scale` under `hc_head`.
 """
 
 from __future__ import annotations
@@ -58,7 +44,6 @@ from flax import linen as nn
 
 from .attention import unweighted_rmsnorm
 from .precision import at_least_fp32
-from .sharding import logical_axes
 
 HEADS = ('mean', 'weighted', 'carried')
 
@@ -134,7 +119,6 @@ def mix_streams(post, comb, output, streams):
     return post.astype(dtype)[..., None] * output[..., None, :] + mixed
 
 
-@logical_axes({}, heuristic=(("attn_hc",), ("ffn_hc",), ("hc_head",)))
 class HyperConnection(nn.Module):
     """Map the streams to one site's `(post, comb, collapsed)`.
 
@@ -165,7 +149,9 @@ class HyperConnection(nn.Module):
         mixes = flat @ fn.T
         pre = nn.sigmoid(mixes[..., :hc] * scale[0] + base[:hc]) + self.spec.hc_eps
         post = 2 * nn.sigmoid(mixes[..., hc:2 * hc] * scale[1] + base[hc:2 * hc])
-        logits = mixes[..., 2 * hc:].reshape(*mixes.shape[:-1], hc, hc) * scale[2] + base[2 * hc:].reshape(hc, hc)
+        logits = mixes[..., 2 * hc :].reshape(*mixes.shape[:-1], hc, hc) * scale[2] + base[2 * hc :].reshape(
+            hc, hc
+        )
         comb = sinkhorn(jax.nn.softmax(logits, axis=-1) + self.spec.hc_eps,
                         self.spec.hc_sinkhorn_iters, self.spec.hc_eps)
         return pre, post, comb
@@ -173,7 +159,9 @@ class HyperConnection(nn.Module):
 
 def collapse_by(pre, streams):
     """`sum_h pre[h] streams[h]` in fp32 (`at_least_fp32`), back in the streams' dtype."""
-    return jnp.sum(pre[..., None] * streams.astype(at_least_fp32(streams.dtype)), axis=2).astype(streams.dtype)
+    return jnp.sum(pre[..., None] * streams.astype(at_least_fp32(streams.dtype)), axis=2).astype(
+        streams.dtype
+    )
 
 
 def first_stream(streams):

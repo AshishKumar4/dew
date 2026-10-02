@@ -1,8 +1,8 @@
 """Reads token datasets off a tokenized corpus directory.
 
 The corpus is the `train.bin`, `val.bin` and `meta.json` that
-`tools/tokenize_text.py` writes, or the same splits as ArrayRecord shards or
-parquet (`dew.data.sources.text`).
+`dew tokenize` writes, or the same splits as ArrayRecord shards
+(`dew.data.sources.text`).
 
 `TokenWindows` reads fixed `seq_len + 1` windows off the token stream.
 `PackedTokens` packs whole documents into windows of that size and carries
@@ -22,7 +22,8 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
-from typing import Annotated, Iterator, Mapping, overload
+from collections.abc import Iterator, Mapping
+from typing import Annotated, overload
 
 import grain.python as pygrain
 import numpy as np
@@ -110,8 +111,8 @@ class TokenWindows(DatasetSpec):
     stride: int | None = dataclasses.field(default=None, kw_only=True)
     val_batches: int | None = 4
     field: str | None = None
-    """Which arrayrecord field or parquet column the ids are in, for a corpus
-    held in one of those; a `.bin` corpus is the stream itself."""
+    """Which arrayrecord field the ids are in, for a corpus held in ArrayRecord
+    shards of dict records; a `.bin` corpus is the stream itself."""
 
     def load(self, *, batch: int, tokenize: Tokenize | None = None) -> Dataset:
         from .sources.text import TokenWindowSource, token_corpus
@@ -256,14 +257,15 @@ class PackedWindows(_WrappingDataset):
     """Packs documents into windows of `window` tokens, by one plan over the
     whole corpus.
 
-    Every window carries, beside each per-token field, `<field>_segment_ids`
-    (which chunk of the window each token came from, counted from 1, and 0
-    for the padding at the end) and `<field>_positions` (the token's place
-    inside its chunk). A block-diagonal mask and per-document RoPE read that
-    pair, which is what grain's packer writes per packed feature
-    (`grain/_src/python/dataset/transformations/packing_packed_batch.py:116-117`).
-    Chunks are cut the same way in every field, so one pair describes them
-    all and the arrays are shared rather than copied per field.
+    Every window carries its per-token fields and, named after the first of
+    them (the ids), `<field>_segment_ids` (which chunk of the window each
+    token came from, counted from 1, and 0 for the padding at the end) and
+    `<field>_positions` (the token's place inside its chunk). A block-diagonal
+    mask and per-document RoPE read that pair. grain's packer writes one
+    pair per packed feature
+    (`grain/_src/python/dataset/transformations/packing_packed_batch.py:116-117`);
+    chunks are cut the same way in every field here, so one pair describes
+    them all and nothing transfers a second copy to the device.
 
     A window is read by index. `first_fit` plans the packing from the
     document lengths alone, in file order, before any sharding. Window w
@@ -279,7 +281,7 @@ class PackedWindows(_WrappingDataset):
     def __init__(self, documents: pygrain.MapDataset[Batch], lengths, window: int,
                  bins: int, described: str):
         super().__init__(DocumentChunks(documents, lengths, window))
-        self._window = window
+        self._window, self._bins = window, bins
         self._described = described
         self._order, self._starts = first_fit(chunk_lengths(lengths, window), window, bins)
 
@@ -287,7 +289,7 @@ class PackedWindows(_WrappingDataset):
         # A saved position names the order it counts into (`dew.position`),
         # and which chunks share a window is part of that order.
         return (f"PackedWindows({self._described}, window={self._window}, "
-                f"windows={len(self)})")
+                f"bins={self._bins}, windows={len(self)})")
 
     def __len__(self) -> int:
         return len(self._starts) - 1
@@ -311,9 +313,8 @@ class PackedWindows(_WrappingDataset):
             segment_ids[filled:filled + length] = segment
             positions[filled:filled + length] = np.arange(length, dtype=np.int32)
             filled += length
-        return {**fields,
-                **{f"{key}_segment_ids": segment_ids for key in fields},
-                **{f"{key}_positions": positions for key in fields}}
+        ids = next(iter(fields))
+        return {**fields, f"{ids}_segment_ids": segment_ids, f"{ids}_positions": positions}
 
 
 @datasets("packed_tokens")
@@ -367,8 +368,8 @@ class PackedTokens(DatasetSpec):
     seq_len: int = 256
     val_batches: int | None = 4
     field: str | None = None
-    """Which arrayrecord field or parquet column the ids are in, for a
-    corpus held in one of those; a `.bin` corpus is the stream itself."""
+    """Which arrayrecord field the ids are in, for a corpus held in
+    ArrayRecord shards of dict records; a `.bin` corpus is the stream itself."""
     packing_bins: int = 8
     """Windows the plan keeps open at once. More of them leave less padding
     in a window and let documents further apart in the file share one."""
@@ -390,7 +391,7 @@ class PackedTokens(DatasetSpec):
         weighted = name_ordered(self.path)
         if not weighted and not self.phases:
             raise ValueError("PackedTokens needs path= set to the directory "
-                             "tools/tokenize_text.py wrote, or several with weights")
+                             "`dew tokenize` wrote, or several with weights")
         same_tokenizer(self.corpora)
         window = self.seq_len + 1
 
@@ -398,7 +399,9 @@ class PackedTokens(DatasetSpec):
         # reads the whole file, so rebuilding either per epoch would read a
         # multi-gigabyte train.bin again for a table the run already has.
         def packed(tokens) -> PackedWindows:
-            source = TokenDocumentSource(tokens)
+            # Cut where the packer would, so a chunk of a long document reads
+            # its own span instead of the whole document.
+            source = TokenDocumentSource(tokens, chunk_len=window)
             return PackedWindows(pygrain.MapDataset.source(source), source.lengths, window,
                                  self.packing_bins, describe(source))
 

@@ -1,46 +1,33 @@
 """Adapt a variables tree with low-rank deltas (LoRA, arXiv 2106.09685).
 
-An adapter is a set of rank-`r` deltas on the kernels of Dense modules.
 Beside a target kernel `W`, `[in..., out...]`, the tree holds `lora_A`,
 `[in..., r]`, and `lora_B`, `[r, out...]`, and the module computes
 `x W + scale * (x A) B` with `scale = alpha / r` (`alpha / sqrt(r)` for
-rsLoRA, arXiv 2312.03732). Merged, `scale * A B` is added into the kernel
-and the factors are gone. A target is the path of its module's leaves in
-the tree, `("params", "layers_0", "self_attn", "q_proj")`, so one
-description serves every model and every collection.
+rsLoRA, arXiv 2312.03732). Merged, `scale * A B` is added into the kernel and
+the factors are gone. A target is its module's path in the tree,
+`("params", "layers_0", "self_attn", "q_proj")`, so one description serves
+every model and every collection.
 
-One object carries all of it. `LoRA.fresh` draws an adapter on the
-projections a model binds, `LoRA.load` reads one off disk onto them, and the
-adapter that comes back adapts the model (`adapt`), says what trains
-(`trainable`), folds itself in (`merge`) and writes itself out (`save`),
-since it holds the bindings it was built over.
+`LoRA.fresh` draws an adapter on the projections a model binds and `LoRA.load`
+reads one off disk; the adapter adapts the model (`adapt`), names what trains
+(`trainable`), folds itself in (`merge`) and writes itself out (`save`).
+`adapt` wraps `apply` and `init` in a Flax method interceptor rather than
+swapping modules, and owns what PEFT's wrapper layers do: the factor shapes
+of a `DenseGeneral` with several contracted axes, the kernel path's compute
+dtype, dropout on the branch input, and the parameter names the merge, the
+export and the trainable filter agree on.
 
-`LoRA.adapt` makes a model compute the branch without a module of its own
-for every projection: it wraps `apply` and `init` in a Flax method
-interceptor that adds the branch to each target `Dense`'s output and reads
-or creates the factors as that module's own parameters. What it hides is
-the per-module bookkeeping PEFT does with wrapper layers: the factor shapes
-of a `DenseGeneral` with several contracted axes, the compute dtype the
-kernel path uses, dropout on the branch input, and the parameter naming
-the merge, the export and the trainable filter agree on.
-
-Two files are read and written, both what the references produce natively.
-PEFT's directory (`adapter_config.json`, `adapter_model.safetensors`, keys
-`base_model.model.<module>.lora_A.weight`) is what Transformers loads; the
-Diffusers file (`pytorch_lora_weights.safetensors`, keys
-`<component>.<module>.lora_A.weight`, the PEFT config per component in the
-header's `lora_adapter_metadata`) is what a pipeline's `load_lora_weights`
-reads. Kohya/sgm keys (`lora_unet_...`, `.alpha` tensors) are not accepted.
-Source module names resolve to tree paths through `Pretrained.layouts`, the
-bindings a source's export runs backwards, so an adapter is placed exactly
-where the base tensor it modifies went. An adapter attaches to a model and
-its variables, not to a loader: a model built from the registry passes no
-layouts and `bound_layouts` reads the names and shapes off its own kernels,
-so a run that never touched a published checkpoint adapts the same way.
-`RunConfig.lora` is that path from a config: the run adapts the module its
+The files are the references' own: PEFT's directory (`adapter_config.json`,
+`adapter_model.safetensors`, keys `base_model.model.<module>.lora_A.weight`),
+which Transformers loads, and the Diffusers file
+(`pytorch_lora_weights.safetensors`, keys `<component>.<module>.lora_A.weight`,
+each component's PEFT config in the header's `lora_adapter_metadata`), which a
+pipeline's `load_lora_weights` reads. Kohya/sgm keys are not accepted. Names
+resolve to tree paths through a loaded source's `Pretrained.layouts`; a model
+built from the registry passes none, and `bound_layouts` reads the names and
+shapes off its own kernels. `RunConfig.lora` adapts the module a run's
 objective trains and freezes everything but the factors.
 """
-
 from __future__ import annotations
 
 import dataclasses
@@ -59,10 +46,10 @@ from flax import linen as nn
 from flax.linen.dtypes import promote_dtype
 from flax.linen.module import Interceptor
 
-from dew.interop.pretrained import WeightLayout
 from dew.interop.safetensors_io import read_file, write_file
+from dew.interop.streaming import WeightLayout
 from dew.nn.backbones.layer_plan import group_layers
-from dew.objectives.base import Path, PathFilter, Variables, merge as overlay, select
+from dew.objectives.base import Path, PathFilter, Variables, merge as overlay, select, thaw
 
 PEFT_CONFIG = "adapter_config.json"
 PEFT_WEIGHTS = "adapter_model.safetensors"
@@ -211,9 +198,12 @@ class LoRA:
     def merge(self, variables: Variables) -> Variables:
         """Return `variables` with every delta added into its kernel and the factors removed.
 
-        The sum runs in at least fp32 at full precision and lands in the
-        kernel's dtype, PEFT's `merge_and_unload`.
+        `variables` is the adapted tree, or a trainer's split of it, the
+        factors under `params` and the base under `frozen`. The sum runs in
+        at least fp32 at full precision and lands in the kernel's dtype,
+        PEFT's `merge_and_unload`.
         """
+        variables = thaw(variables)
         merged: dict = {}
         for path, target in self.targets.items():
             node = _node(variables, path)
@@ -221,7 +211,11 @@ class LoRA:
             dtype = jnp.promote_types(kernel.dtype, jnp.float32)
             delta = jnp.tensordot(a.astype(dtype), b.astype(dtype), axes=1,
                                   precision=jax.lax.Precision.HIGHEST)
-            _insert(merged, (*path, "kernel"), (kernel.astype(dtype) + self.scale(target) * delta).astype(kernel.dtype))
+            _insert(
+                merged,
+                (*path, "kernel"),
+                (kernel.astype(dtype) + self.scale(target) * delta).astype(kernel.dtype),
+            )
         return select(overlay(variables, merged), lambda path: not self.trainable(path))
 
     @classmethod
@@ -281,7 +275,8 @@ class LoRA:
         """Write the adapter's factors from `variables` under its own module names.
 
         The names are the ones this adapter bound at construction, so a run
-        saves what it trained with the tree it trained it in. One unnamed
+        saves what it trained with the tree it trained it in, split or
+        whole (`merge` reads both). One unnamed
         component writes PEFT's directory, which is a decoder source and a
         registry-built model; a pipeline source, whose weights are named
         under several components, writes the Diffusers file with each
@@ -291,6 +286,7 @@ class LoRA:
             raise ValueError(
                 "this adapter binds no source names to write its factors under; "
                 "LoRA.fresh and LoRA.load bind them, a declared target set does not")
+        variables = thaw(variables)
         components = _components(self.layouts)
         names = {layout.paths[0][:-1]: name for name, layout in self.layouts.items()
                  if layout.paths[0][-1] == "kernel"}
@@ -605,7 +601,9 @@ def _place(layouts: Mapping[str, WeightLayout], variables: Variables,
     components = _components(layouts)
     settings = {(entry.config.rslora, entry.config.dropout) for entry in entries}
     if len(settings) != 1:
-        raise ValueError("the components disagree on use_rslora or lora_dropout, which one adapter carries once")
+        raise ValueError(
+            "the components disagree on use_rslora or lora_dropout, which one adapter carries once"
+        )
     (rslora, dropout), = settings
     targets: dict[Path, Target] = {}
     bound: dict[str, WeightLayout] = {}
@@ -647,7 +645,9 @@ def _diffusers_configs(tensors: Mapping[str, np.ndarray], metadata: str | None,
         for key, value in json.loads(metadata).items():
             component, _, field = key.partition(".")
             fields.setdefault(component, {})[field] = value
-        return {component: _Config.read(config, f"{where} ({component})") for component, config in fields.items()}
+        return {
+            component: _Config.read(config, f"{where} ({component})") for component, config in fields.items()
+        }
     ranks: dict[str, dict[str, int]] = {}
     for key, tensor in tensors.items():
         component, _, rest = key.partition(".")
@@ -694,33 +694,40 @@ class Adaptable(Protocol):
     """Declares an objective an adapter attaches to.
 
     It trains one module, which is its `model`, and it takes the filter that
-    says which of that module's leaves the optimizer moves. `LMObjective`
-    and `BlockDiffusionObjective` are the two; an objective that keeps no
-    model or selects what trains some other way is refused by name.
+    says which of that module's leaves the optimizer moves. `LMObjective`,
+    `BlockDiffusionObjective` and the denoising `DiffusionObjective` are
+    the three; an objective that keeps no model or selects what trains some
+    other way is refused by name.
     """
 
     model: nn.Module
     trainable: PathFilter | None
 
 
-def attach(objective: object, adapter: LoRA) -> None:
-    """Adapt the module `objective` trains and freeze all but the factors.
+def _attach(objective: object, adapter: LoRA) -> None:
+    """Adapt the module `objective` trains, in place, and freeze all but the factors.
 
-    `RunConfig.train` calls this once, after a recipe has built the
-    objective and before anything initialises it, so the adapted module is
-    what the run traces and the adapter's own leaves are the only ones the
-    optimizer moves. The adapted module is a subclass of the same class with
-    the same fields, so what the objective read off the model at
-    construction still holds.
+    This is `RunConfig.train`'s step, not a user's: the recipe hands the run
+    its objective, and the run adapts it once, before anything initialises
+    it, so the adapted module is what the run traces and the adapter's own
+    leaves are the only ones the optimizer moves. Code that builds its own
+    run adapts a source with `PretrainedDecoder.lora` or
+    `PretrainedPipeline.lora` instead, which returns a new bundle. The
+    adapted module is a subclass of the same class with the same fields, so
+    what the objective read off the model at construction still holds.
     """
     if not isinstance(objective, Adaptable):
         raise ValueError(
             f"--lora adapts the module an objective trains and freezes the rest, and "
             f"{type(objective).__name__} keeps no `model` it can select leaves of; train "
-            f"an LMObjective or a BlockDiffusionObjective, or leave the adapter unset")
+            f"an LMObjective, a BlockDiffusionObjective or a DiffusionObjective, or leave "
+            f"the adapter unset")
     if objective.trainable is not None:
         raise ValueError(
             f"{type(objective).__name__} already selects what trains, and an adapter "
             f"freezes everything but its own factors; pass one filter, not both")
     objective.model = adapter.adapt(objective.model)
     objective.trainable = adapter.trainable
+
+
+__all__ = ["Adaptable", "LoRA", "PeftConfig", "Target"]

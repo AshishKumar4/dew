@@ -105,7 +105,11 @@ class EnvironmentSource:
         if server.sampling.eos_id is None:
             raise ValueError("tool episodes need an EOS token to distinguish complete and truncated actions")
         self.server, self.environment, self.verifier = server, environment, verifier
-        self.max_prompt_tokens, self.max_new_tokens, self.max_turns = max_prompt_tokens, max_new_tokens, max_turns
+        self.max_prompt_tokens, self.max_new_tokens, self.max_turns = (
+            max_prompt_tokens,
+            max_new_tokens,
+            max_turns,
+        )
         self.seed = seed
         self._pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="dew-episode")
         self._lock = threading.Lock()
@@ -154,7 +158,7 @@ class EnvironmentSource:
         handle.wake.clear()
         if handle.cancelled:
             return None
-        pending = self.server.submit(context, self.max_new_tokens, seed=seed)
+        pending = self.server.submit(context, self.max_new_tokens, key=seed)
         pending.add_done_callback(lambda _: handle.wake.set())
         handle.wake.wait()
         if handle.cancelled and not pending.done():
@@ -170,7 +174,9 @@ class EnvironmentSource:
             raw = draw.behavior_log_probs
         if draw.prompt != context:
             raise _Refused("the server returned a draw for another context")
-        return Action(context, draw.tokens, raw, draw.behavior_log_probs, draw.terminated, draw.version, sampling)
+        return Action(
+            context, draw.tokens, raw, draw.behavior_log_probs, draw.terminated, draw.version, sampling
+        )
 
     def _run(self, task: Task, identity: EpisodeId, version: int, handle: _Handle) -> Session:
         initial: Observation | None = None
@@ -193,8 +199,9 @@ class EnvironmentSource:
                     if limit is not None:
                         status, detail = limit.status, limit.detail
                         break
-                    draw = self._draw(observation.context, _seed(self.seed, identity.task, identity.sample, turn),
-                                  handle)
+                    draw = self._draw(
+                        observation.context, _seed(self.seed, identity.task, identity.sample, turn), handle
+                    )
                     if draw is None:
                         status, detail = EpisodeStatus.CANCELLED, "cancelled by the scheduler"
                         break
@@ -236,7 +243,9 @@ def prompt_tasks(batch: Batch) -> list[Task]:
     for row in range(rows):
         ids = tuple(int(token) for token in prompts[row, width - int(lengths[row]):])
         name = hashlib.sha256(np.asarray(ids, np.int64).tobytes()).hexdigest()[:16]
-        tasks.append(Task(name, {"prompt": ids, "source": sources[row], "truth": truths[row], "info": infos[row]}))
+        tasks.append(
+            Task(name, {"prompt": ids, "source": sources[row], "truth": truths[row], "info": infos[row]})
+        )
     return tasks
 
 
@@ -251,7 +260,9 @@ class _Prompt:
 
     @classmethod
     def of(cls, task: Task) -> _Prompt:
-        ids, source, truth, extra_info = (task.data.get(name) for name in ("prompt", "source", "truth", "info"))
+        ids, source, truth, extra_info = (
+            task.data.get(name) for name in ("prompt", "source", "truth", "info")
+        )
         if not (isinstance(ids, tuple) and isinstance(source, str) and isinstance(truth, str)
                 and isinstance(extra_info, str)):
             raise TypeError(f"task {task.id!r} is not a prompt_tasks task: it needs prompt ids "
@@ -269,8 +280,16 @@ class PromptSource:
     future with the exception, so no future is left pending.
     """
 
-    def __init__(self, server: RolloutServer, reward: Reward, *,
-                 decode: Callable[[Sequence[int]], str], max_new_tokens: int, scorers: int = 16, seed: int = 0):
+    def __init__(
+        self,
+        server: RolloutServer,
+        reward: Reward,
+        *,
+        decode: Callable[[Sequence[int]], str],
+        max_new_tokens: int,
+        scorers: int = 16,
+        seed: int = 0,
+    ):
         if type(max_new_tokens) is not int or max_new_tokens < 1:
             raise ValueError("a rollout generates at least one token")
         self.server, self.reward, self.decode, self.max_new_tokens = server, reward, decode, max_new_tokens
@@ -286,7 +305,7 @@ class PromptSource:
             self._serial += 1
         prompt = _Prompt.of(task)
         return [self._scored(task, prompt, self.server.submit(prompt.ids, self.max_new_tokens,
-                                                              seed=_seed(self.seed, serial, k)))
+                                                              key=_seed(self.seed, serial, k)))
                 for k in range(samples)]
 
     def cancel(self, futures: Sequence[Future[Session]]) -> None:
@@ -303,14 +322,23 @@ class PromptSource:
             draw = drawn.result()
         except Exception as error:
             return Session(task.id, "", 0, 0, (), Status.INFRA_ERROR, None, {}, f"draw: {_failure(error)}")
-        call = Call(draw.prompt, draw.tokens, draw.behavior_log_probs, "stop" if draw.terminated else "length",
-                    draw.version, routed_experts=draw.routed_experts, support=draw.support)
+        call = Call(
+            draw.prompt,
+            draw.tokens,
+            draw.behavior_log_probs,
+            "stop" if draw.terminated else "length",
+            draw.version,
+            routed_experts=draw.routed_experts,
+            support=draw.support,
+        )
         status = Status.COMPLETED if draw.terminated else Status.TRUNCATED
         try:
             text = self.decode(draw.tokens[:len(draw.tokens) - int(draw.terminated)])
             score = _scored(self.reward(prompt.source, text, prompt.truth, prompt.info))
         except Exception as error:
-            return Session(task.id, "", 0, 0, (call,), Status.INFRA_ERROR, None, {}, f"reward: {_failure(error)}")
+            return Session(
+                task.id, "", 0, 0, (call,), Status.INFRA_ERROR, None, {}, f"reward: {_failure(error)}"
+            )
         return Session(task.id, "", 0, 0, (call,), status, score)
 
     def _scored(self, task: Task, prompt: _Prompt, drawn: Future[Draw]) -> Future[Session]:

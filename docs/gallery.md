@@ -4,28 +4,61 @@ Samples from models trained with Dew. [Diffusion training](guides/diffusion.md) 
 
 ## Text-to-image, 176M hybrid DiT
 
-A latent text-to-image model with a hybrid DiT denoiser (state-space and attention blocks), trained with Dew, sampled at step 1,350,000 from its EMA weights. It generates 256×256 images through the Stable Diffusion VAE, conditioned on a CLIP text encoder. The weights are public on the Hugging Face Hub as [`dewml/hybrid-dit-176m`](https://huggingface.co/dewml/hybrid-dit-176m).
+A 176M-parameter text-to-image model at 256×256, trained with Dew. Weights: [`dewml/hybrid-dit-176m`](https://huggingface.co/dewml/hybrid-dit-176m).
 
-| Component | Parameters |
-|---|---|
-| Denoiser (hybrid DiT) | 175,640,848 |
-| CLIP text encoder | 123,060,480 |
-| Stable Diffusion VAE | 83,653,863 |
+Each image is captioned with its prompt. The [manifest](../site/public/examples/curated/manifest.json) records the actual seed, solver, guidance and batch context for reproducing each draw; settings differ between images.
 
-Each grid has one row per prompt and one column per seed (0, 1, 2, 3), with classifier-free guidance 5.0 against the empty prompt. `examples/sample_text_to_image.py` loaded the model from that repository and drew them on an RTX 4080 with the denoiser computing in float32 and the CLIP encoder and VAE in bfloat16. After compilation, a batch of six images took 1.7-1.8 s with Heun over 40 steps and 0.5 s with `DPMSolverMultistep` over 20 steps. Some images carry flat white bands at their edges, which the model draws.
+<div class="curated-gallery">
 
-The prompts, in row order:
+<figure><img src="../site/public/examples/curated/p0_s5.webp" width="256" height="256" alt="green and purple northern lights reflected in a frozen lake, snowy mountains at night" loading="lazy" decoding="async" /><figcaption>green and purple northern lights reflected in a frozen lake, snowy mountains at night</figcaption></figure>
 
-1. a tropical beach with palm trees and turquoise water
-2. a colorful hot air balloon over a green valley
-3. a red fox in a snowy forest
-4. a stained glass window with geometric patterns
-5. a bowl of ramen with an egg and green onions
-6. the northern lights over a frozen lake at night
+<figure><img src="../site/public/examples/curated/p0_s14.webp" width="256" height="256" alt="green and purple northern lights reflected in a frozen lake, snowy mountains at night" loading="lazy" decoding="async" /><figcaption>green and purple northern lights reflected in a frozen lake, snowy mountains at night</figcaption></figure>
 
-![Six prompts by four seeds from the 176M hybrid DiT, Heun sampler, 40 steps, guidance 5.0](assets/gallery/hybrid-dit-heun40.webp)
+<figure><img src="../site/public/examples/curated/p0_s10.webp" width="256" height="256" alt="green and purple northern lights reflected in a frozen lake, snowy mountains at night" loading="lazy" decoding="async" /><figcaption>green and purple northern lights reflected in a frozen lake, snowy mountains at night</figcaption></figure>
 
-![The same prompts and seeds with DPMSolverMultistep, 20 steps, guidance 5.0](assets/gallery/hybrid-dit-dpm2m20.webp)
+<figure><img src="../site/public/examples/curated/p0_s3.webp" width="256" height="256" alt="green and purple northern lights reflected in a frozen lake, snowy mountains at night" loading="lazy" decoding="async" /><figcaption>green and purple northern lights reflected in a frozen lake, snowy mountains at night</figcaption></figure>
+
+<figure><img src="../site/public/examples/curated/p1_s3.webp" width="256" height="256" alt="rolling sand dunes in the desert at sunset, deep orange sand and purple sky" loading="lazy" decoding="async" /><figcaption>rolling sand dunes in the desert at sunset, deep orange sand and purple sky</figcaption></figure>
+
+<figure><img src="../site/public/examples/curated/p1_s10.webp" width="256" height="256" alt="rolling sand dunes in the desert at sunset, deep orange sand and purple sky" loading="lazy" decoding="async" /><figcaption>rolling sand dunes in the desert at sunset, deep orange sand and purple sky</figcaption></figure>
+
+<figure><img src="../site/public/examples/curated/p1_s5.webp" width="256" height="256" alt="rolling sand dunes in the desert at sunset, deep orange sand and purple sky" loading="lazy" decoding="async" /><figcaption>rolling sand dunes in the desert at sunset, deep orange sand and purple sky</figcaption></figure>
+
+<figure><img src="../site/public/examples/curated/p1_s1.webp" width="256" height="256" alt="rolling sand dunes in the desert at sunset, deep orange sand and purple sky" loading="lazy" decoding="async" /><figcaption>rolling sand dunes in the desert at sunset, deep orange sand and purple sky</figcaption></figure>
+
+<figure><img src="../site/public/examples/curated/p2_s2.webp" width="256" height="256" alt="the milky way above snowy mountains, a clear starry night sky" loading="lazy" decoding="async" /><figcaption>the milky way above snowy mountains, a clear starry night sky</figcaption></figure>
+
+<figure><img src="../site/public/examples/curated/p2_s12.webp" width="256" height="256" alt="the milky way above snowy mountains, a clear starry night sky" loading="lazy" decoding="async" /><figcaption>the milky way above snowy mountains, a clear starry night sky</figcaption></figure>
+
+<figure><img src="../site/public/examples/curated/p2_s13.webp" width="256" height="256" alt="the milky way above snowy mountains, a clear starry night sky" loading="lazy" decoding="async" /><figcaption>the milky way above snowy mountains, a clear starry night sky</figcaption></figure>
+
+<figure><img src="../site/public/examples/curated/p2_s1.webp" width="256" height="256" alt="the milky way above snowy mountains, a clear starry night sky" loading="lazy" decoding="async" /><figcaption>the milky way above snowy mountains, a clear starry night sky</figcaption></figure>
+
+<figure><img src="../site/public/examples/curated/p3_s2.webp" width="256" height="256" alt="a Gothic cathedral interior with glowing stained glass windows and stone arches" loading="lazy" decoding="async" /><figcaption>a Gothic cathedral interior with glowing stained glass windows and stone arches</figcaption></figure>
+
+<figure><img src="../site/public/examples/curated/p3_s13.webp" width="256" height="256" alt="a Gothic cathedral interior with glowing stained glass windows and stone arches" loading="lazy" decoding="async" /><figcaption>a Gothic cathedral interior with glowing stained glass windows and stone arches</figcaption></figure>
+
+<figure><img src="../site/public/examples/curated/p3_s1.webp" width="256" height="256" alt="a Gothic cathedral interior with glowing stained glass windows and stone arches" loading="lazy" decoding="async" /><figcaption>a Gothic cathedral interior with glowing stained glass windows and stone arches</figcaption></figure>
+
+<figure><img src="../site/public/examples/curated/p3_s12.webp" width="256" height="256" alt="a Gothic cathedral interior with glowing stained glass windows and stone arches" loading="lazy" decoding="async" /><figcaption>a Gothic cathedral interior with glowing stained glass windows and stone arches</figcaption></figure>
+
+<figure><img src="../site/public/examples/curated/p4_s1.webp" width="256" height="256" alt="a canyon with towering red rock cliffs and a winding river at sunset" loading="lazy" decoding="async" /><figcaption>a canyon with towering red rock cliffs and a winding river at sunset</figcaption></figure>
+
+<figure><img src="../site/public/examples/curated/p4_s13.webp" width="256" height="256" alt="a canyon with towering red rock cliffs and a winding river at sunset" loading="lazy" decoding="async" /><figcaption>a canyon with towering red rock cliffs and a winding river at sunset</figcaption></figure>
+
+<figure><img src="../site/public/examples/curated/p4_s2.webp" width="256" height="256" alt="a canyon with towering red rock cliffs and a winding river at sunset" loading="lazy" decoding="async" /><figcaption>a canyon with towering red rock cliffs and a winding river at sunset</figcaption></figure>
+
+<figure><img src="../site/public/examples/curated/p4_s12.webp" width="256" height="256" alt="a canyon with towering red rock cliffs and a winding river at sunset" loading="lazy" decoding="async" /><figcaption>a canyon with towering red rock cliffs and a winding river at sunset</figcaption></figure>
+
+<figure><img src="../site/public/examples/curated/p5_s8.webp" width="256" height="256" alt="a field of sunflowers in southern France, an oil painting by Vincent van Gogh" loading="lazy" decoding="async" /><figcaption>a field of sunflowers in southern France, an oil painting by Vincent van Gogh</figcaption></figure>
+
+<figure><img src="../site/public/examples/curated/p5_s12.webp" width="256" height="256" alt="a field of sunflowers in southern France, an oil painting by Vincent van Gogh" loading="lazy" decoding="async" /><figcaption>a field of sunflowers in southern France, an oil painting by Vincent van Gogh</figcaption></figure>
+
+<figure><img src="../site/public/examples/curated/p5_s1.webp" width="256" height="256" alt="a field of sunflowers in southern France, an oil painting by Vincent van Gogh" loading="lazy" decoding="async" /><figcaption>a field of sunflowers in southern France, an oil painting by Vincent van Gogh</figcaption></figure>
+
+<figure><img src="../site/public/examples/curated/p5_s13.webp" width="256" height="256" alt="a field of sunflowers in southern France, an oil painting by Vincent van Gogh" loading="lazy" decoding="async" /><figcaption>a field of sunflowers in southern France, an oil painting by Vincent van Gogh</figcaption></figure>
+
+</div>
 
 ## Unconditional models
 

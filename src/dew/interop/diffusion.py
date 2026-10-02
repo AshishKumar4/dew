@@ -21,7 +21,7 @@ from dew.nn.text_encoders import ParamTree, checkpoint_array, insert
 from dew.registry import resolve_dtype
 
 if TYPE_CHECKING:
-    from dew.interop.pretrained import WeightLayout
+    from dew.interop.streaming import WeightLayout
 
 
 def _source_alias(tensors: Mapping[str, np.ndarray], owners: dict[tuple[str, ...], str],
@@ -87,10 +87,21 @@ def unet_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "floa
         return values
     heads = tuple(records.integer(value, "attention heads") for value in per_stage(
         config.get("num_attention_heads") or config.get("attention_head_dim", 8), "attention heads"))
-    depths = tuple(records.integer(value, "transformer depth") for value in per_stage(config.get("transformer_layers_per_block", 1), "transformer depth"))
-    only_cross = tuple(records.boolean(value, "only_cross_attention") for value in per_stage(config.get("only_cross_attention", False), "only_cross_attention"))
+    depths = tuple(
+        records.integer(value, "transformer depth")
+        for value in per_stage(config.get("transformer_layers_per_block", 1), "transformer depth")
+    )
+    only_cross = tuple(
+        records.boolean(value, "only_cross_attention")
+        for value in per_stage(config.get("only_cross_attention", False), "only_cross_attention")
+    )
     down, up = config["down_block_types"], config["up_block_types"]
-    if not isinstance(down, (list, tuple)) or not isinstance(up, (list, tuple)) or len(down) != count or len(up) != count:
+    if (
+        not isinstance(down, (list, tuple))
+        or not isinstance(up, (list, tuple))
+        or len(down) != count
+        or len(up) != count
+    ):
         raise ValueError("UNet down/up blocks must have one entry per stage")
     if any(kind not in ("DownBlock2D", "CrossAttnDownBlock2D") for kind in down):
         raise ValueError("Unsupported conditional UNet downsampling stage")
@@ -119,7 +130,9 @@ def unet_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "floa
     }
     for name, expected in fixed.items():
         # A null flag is False to diffusers, the value the UNet computes.
-        value = flag(config, name, default=expected) if isinstance(expected, bool) else config.get(name, expected)
+        value = (
+            flag(config, name, default=expected) if isinstance(expected, bool) else config.get(name, expected)
+        )
         if value != expected:
             raise ValueError(f"Native UNet cannot honor active {name}={config[name]!r}")
     if config.get("time_embedding_dim") not in (None, widths[0] * 4):
@@ -127,8 +140,13 @@ def unet_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "floa
     groups = records.integer(config.get("norm_num_groups", 32), "norm_num_groups")
     epsilon = records.number(config.get("norm_eps", 1e-5), "norm_eps")
     if groups < 1 or epsilon <= 0 or any(width < 1 or width % groups for width in widths):
-        raise ValueError("UNet normalization requires positive epsilon and widths divisible by its group count")
-    if any(head < 1 or width % head or depth < 1 for width, head, depth in zip(widths, heads, depths, strict=True)):
+        raise ValueError(
+            "UNet normalization requires positive epsilon and widths divisible by its group count"
+        )
+    if any(
+        head < 1 or width % head or depth < 1
+        for width, head, depth in zip(widths, heads, depths, strict=True)
+    ):
         raise ValueError("UNet stage heads must divide their width and transformer depth must be positive")
     source_name = config.get("_class_name", "UNet2DConditionModel")
     if source_name not in ("UNet2DConditionModel", "FlaxUNet2DConditionModel"):
@@ -137,17 +155,30 @@ def unet_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "floa
     if flax_semantics and (groups != 32 or epsilon != 1e-5):
         raise ValueError("The published Flax UNet has fixed normalization groups and epsilon")
     return UNetFields(
-        stages=tuple(UNetStage(width, head, depth, attended, cross_only)
-                     for width, head, depth, attended, cross_only in zip(widths, heads, depths, cross, only_cross, strict=True)),
-        in_channels=records.integer(config["in_channels"], "in_channels"), out_channels=records.integer(config["out_channels"], "out_channels"),
+        stages=tuple(
+            UNetStage(width, head, depth, attended, cross_only)
+            for width, head, depth, attended, cross_only in zip(
+                widths, heads, depths, cross, only_cross, strict=True
+            )
+        ),
+        in_channels=records.integer(config["in_channels"], "in_channels"),
+        out_channels=records.integer(config["out_channels"], "out_channels"),
         blocks_per_level=records.integer(config.get("layers_per_block", 2), "layers_per_block"),
         linear_projection=flag(config, "use_linear_projection", default=False),
-        additional_time_features=records.integer(config["addition_time_embed_dim"], "addition_time_embed_dim") if addition else 0,
-        middle_attention=middle is not None, frequency_shift=records.number(config.get("freq_shift", 0), "freq_shift"),
+        additional_time_features=records.integer(config["addition_time_embed_dim"], "addition_time_embed_dim")
+        if addition
+        else 0,
+        middle_attention=middle is not None,
+        frequency_shift=records.number(config.get("freq_shift", 0), "freq_shift"),
         cosine_first=flag(config, "flip_sin_to_cos", default=True),
-        dropout=records.number(config.get("dropout", 0), "dropout"), norm_groups=groups, norm_epsilon=epsilon,
-        attention_norm_epsilon=1e-5 if flax_semantics else 1e-6, approximate_gelu=flax_semantics,
-        dtype=resolve_dtype(dtype), attention_impl=attention_impl)
+        dropout=records.number(config.get("dropout", 0), "dropout"),
+        norm_groups=groups,
+        norm_epsilon=epsilon,
+        attention_norm_epsilon=1e-5 if flax_semantics else 1e-6,
+        approximate_gelu=flax_semantics,
+        dtype=resolve_dtype(dtype),
+        attention_impl=attention_impl,
+    )
 
 
 def _unet_path(name: str, rank: int) -> tuple[str, ...]:
@@ -233,7 +264,7 @@ def translate_unet_weights(tensors: Mapping[str, np.ndarray], model: UNet2DCondi
     are also reshaped to per-head axes, which is why this does not go through
     `record_layouts`.
     """
-    from dew.interop.pretrained import WeightLayout
+    from dew.interop.streaming import WeightLayout
     parameters: ParamTree = {}
     layouts = []
     owners: dict[tuple[str, ...], str] = {}
@@ -247,8 +278,13 @@ def translate_unet_weights(tensors: Mapping[str, np.ndarray], model: UNet2DCondi
             transpose = (3, 2, 0, 1) if tensor.ndim == 4 else (1, 0)
             if "self_attention" in path or "cross_attention" in path:
                 root = path[0]
-                stage = (model.stages[int(root.removeprefix("down_"))] if root.startswith("down_") else
-                         model.stages[::-1][int(root.removeprefix("up_"))] if root.startswith("up_") else model.stages[-1])
+                stage = (
+                    model.stages[int(root.removeprefix("down_"))]
+                    if root.startswith("down_")
+                    else model.stages[::-1][int(root.removeprefix("up_"))]
+                    if root.startswith("up_")
+                    else model.stages[-1]
+                )
                 if path[-2] in ("q", "k", "v"):
                     value = value.reshape(value.shape[0], stage.heads, stage.features // stage.heads)
                     transpose = (1, 2, 0)
@@ -287,8 +323,6 @@ def sd3_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float
     meaning this model does not carry is refused rather than dropped, so a
     checkpoint that means something else cannot load as if it did not.
     """
-    from dew.interop.pretrained import resolve_dtype
-
     heads = records.integer(config["num_attention_heads"], "num_attention_heads")
     head_dim = records.integer(config["attention_head_dim"], "attention_head_dim")
     channels = records.integer(config["in_channels"], "in_channels")
@@ -421,8 +455,6 @@ def flux_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "floa
     embeds its distilled guidance, which changes what the model takes as an
     input rather than only which tensors it holds.
     """
-    from dew.interop.pretrained import resolve_dtype
-
     channels = records.integer(config["in_channels"], "in_channels")
     out_channels = config.get("out_channels")
     axes = config.get("axes_dims_rope", (16, 56, 56))
@@ -446,6 +478,204 @@ def flux_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "floa
         axes_dims_rope=tuple(axes), dtype=resolve_dtype(dtype),
         attention_impl=attention_impl)
 
+
+
+class Flux2Fields(TypedDict):
+    in_channels: int
+    out_channels: int
+    num_layers: int
+    num_single_layers: int
+    heads: int
+    head_dim: int
+    joint_attention_dim: int
+    timestep_guidance_channels: int
+    mlp_ratio: float
+    axes_dims_rope: tuple[int, ...]
+    rope_theta: float
+    eps: float
+    guidance_embeds: bool
+    dtype: object
+    attention_impl: str
+
+
+def flux2_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float32",
+                 attention_impl="auto") -> Flux2Fields:
+    """Read a published `Flux2Transformer2DModel` config into native model
+    fields, refusing a patch size the pipeline does not use."""
+    if records.integer(config.get("patch_size", 1), "patch_size") != 1:
+        raise ValueError("FLUX.2's pipeline folds its latent 2x2 itself; the transformer's patch_size is 1")
+    channels = records.integer(config.get("in_channels", 128), "in_channels")
+    out_channels = config.get("out_channels")
+    axes = config.get("axes_dims_rope", (32, 32, 32, 32))
+    heads = records.integer(config.get("num_attention_heads", 48), "num_attention_heads")
+    head_dim = records.integer(config.get("attention_head_dim", 128), "attention_head_dim")
+    if not isinstance(axes, (list, tuple)) or any(type(size) is not int or size % 2 for size in axes):
+        raise ValueError("axes_dims_rope must be a sequence of even channel counts")
+    if sum(axes) != head_dim or len(axes) != 4:
+        raise ValueError(f"axes_dims_rope {tuple(axes)} must split the {head_dim} head channels over the "
+                         f"four axes the pipeline's ids carry")
+    return Flux2Fields(
+        in_channels=channels,
+        out_channels=channels if out_channels is None else records.integer(out_channels, "out_channels"),
+        num_layers=records.integer(config.get("num_layers", 8), "num_layers"),
+        num_single_layers=records.integer(config.get("num_single_layers", 48), "num_single_layers"),
+        heads=heads, head_dim=head_dim,
+        joint_attention_dim=records.integer(config.get("joint_attention_dim", 15360), "joint_attention_dim"),
+        timestep_guidance_channels=records.integer(config.get("timestep_guidance_channels", 256),
+                                                   "timestep_guidance_channels"),
+        mlp_ratio=records.number(config.get("mlp_ratio", 3.0), "mlp_ratio"), axes_dims_rope=tuple(axes),
+        rope_theta=records.number(config.get("rope_theta", 2000), "rope_theta"),
+        eps=records.number(config.get("eps", 1e-6), "eps"),
+        guidance_embeds=records.boolean(config.get("guidance_embeds", True), "guidance_embeds"),
+        dtype=resolve_dtype(dtype), attention_impl=attention_impl)
+
+
+_FLUX2_EMBEDDERS = {
+    "x_embedder": ("x_embedder",),
+    "context_embedder": ("context_embedder",),
+    "proj_out": ("proj_out",),
+    "norm_out.linear": ("norm_out", "linear"),
+    "double_stream_modulation_img.linear": ("double_stream_modulation_img", "linear"),
+    "double_stream_modulation_txt.linear": ("double_stream_modulation_txt", "linear"),
+    "single_stream_modulation.linear": ("single_stream_modulation", "linear"),
+    "time_guidance_embed.timestep_embedder.linear_1": ("timestep_embedder_linear_1",),
+    "time_guidance_embed.timestep_embedder.linear_2": ("timestep_embedder_linear_2",),
+    "time_guidance_embed.guidance_embedder.linear_1": ("guidance_embedder_linear_1",),
+    "time_guidance_embed.guidance_embedder.linear_2": ("guidance_embedder_linear_2",),
+}
+
+
+def _flux2_path(name: str) -> tuple[str, ...]:
+    """Return the `Flux2Transformer` path for a published FLUX.2 tensor name."""
+    parts = name.split(".")
+    leaf, stem = parts[-1], ".".join(parts[:-1])
+    if stem in _FLUX2_EMBEDDERS:
+        return (*_FLUX2_EMBEDDERS[stem], _dit_leaf(leaf))
+    if len(parts) > 3 and parts[1].isdigit():
+        block, rest = (f"{parts[0]}_{parts[1]}",), parts[2:-1]
+        if parts[0] == "transformer_blocks":
+            if len(rest) == 2 and rest[0] in ("ff", "ff_context") and rest[1] in ("linear_in", "linear_out"):
+                return (*block, *rest, _dit_leaf(leaf))
+            if len(rest) > 1 and rest[0] == "attn":
+                return _dit_attention(block, "attn", rest[1:], leaf, name, joint=True)
+        # A single block's fused maps and head norms sit under `attn` in the
+        # source, whose parallel attention holds the feed-forward too; here
+        # they are the block's own, the output map named as Flux's is.
+        if parts[0] == "single_transformer_blocks" and rest[:1] == ["attn"] and len(rest) == 2:
+            if rest[1] in ("to_qkv_mlp_proj", "to_out"):
+                return (*block, "proj_fused" if rest[1] == "to_out" else rest[1], _dit_leaf(leaf))
+            if rest[1] in ("norm_q", "norm_k") and leaf == "weight":
+                return (*block, rest[1], "scale")
+    raise ValueError(f"unknown tensor name {name!r}")
+
+
+def translate_flux2_weights(tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
+                            ) -> tuple[ParamTree, tuple[WeightLayout, ...]]:
+    """Map FLUX.2 tensors into a parameter tree and the layouts that invert
+    it; its rotary tables are computed from ids, so it stores no buffer."""
+    return record_layouts("transformer", tensors, _flux2_path, ("params",), param_dtype=param_dtype)
+
+
+class ZImageFields(TypedDict):
+    in_channels: int
+    dim: int
+    n_layers: int
+    n_refiner_layers: int
+    n_heads: int
+    norm_eps: float
+    cap_feat_dim: int
+    rope_theta: float
+    t_scale: float
+    axes_dims: tuple[int, ...]
+    axes_lens: tuple[int, ...]
+    dtype: object
+    attention_impl: str
+
+
+def z_image_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float32",
+                   attention_impl="auto") -> ZImageFields:
+    """Read a published `ZImageTransformer2DModel` config into native model
+    fields, refusing what the port does not compute: another patch size,
+    grouped keys and values, no query and key norms, or the Omni model's
+    SigLIP stream."""
+    if records.integers(config.get("all_patch_size", (2,)), "all_patch_size") != (2,) or records.integers(
+            config.get("all_f_patch_size", (1,)), "all_f_patch_size") != (1,):
+        raise ValueError("the port computes Z-Image's 2x2 patches of one frame")
+    heads = records.integer(config.get("n_heads", 30), "n_heads")
+    if records.integer(config.get("n_kv_heads", heads), "n_kv_heads") != heads:
+        raise ValueError("the source's attention has as many key and value heads as query heads")
+    if not records.boolean(config.get("qk_norm", True), "qk_norm"):
+        raise ValueError("the port computes Z-Image with its query and key norms")
+    if config.get("siglip_feat_dim") is not None:
+        raise ValueError("the SigLIP stream belongs to Z-Image Omni, which the port does not compute")
+    dim = records.integer(config.get("dim", 3840), "dim")
+    axes = records.integers(config.get("axes_dims", (32, 48, 48)), "axes_dims")
+    lengths = records.integers(config.get("axes_lens", (1024, 512, 512)), "axes_lens")
+    if sum(axes) != dim // heads or len(axes) != 3 or len(lengths) != 3:
+        raise ValueError(f"axes_dims {axes} must split the {dim // heads} head channels over three axes")
+    return ZImageFields(
+        in_channels=records.integer(config.get("in_channels", 16), "in_channels"),
+        dim=dim,
+        n_layers=records.integer(config.get("n_layers", 30), "n_layers"),
+        n_refiner_layers=records.integer(config.get("n_refiner_layers", 2), "n_refiner_layers"),
+        n_heads=heads,
+        norm_eps=records.number(config.get("norm_eps", 1e-5), "norm_eps"),
+        cap_feat_dim=records.integer(config.get("cap_feat_dim", 2560), "cap_feat_dim"),
+        rope_theta=records.number(config.get("rope_theta", 256.0), "rope_theta"),
+        t_scale=records.number(config.get("t_scale", 1000.0), "t_scale"),
+        axes_dims=axes,
+        axes_lens=lengths,
+        dtype=resolve_dtype(dtype),
+        attention_impl=attention_impl,
+    )
+
+
+_Z_IMAGE_MODULES = {
+    "all_x_embedder.2-1": ("x_embedder",), "all_final_layer.2-1.linear": ("final_linear",),
+    "all_final_layer.2-1.adaLN_modulation.1": ("final_modulation",), "t_embedder.mlp.0": ("t_embedder_1",),
+    "t_embedder.mlp.2": ("t_embedder_2",), "cap_embedder.1": ("cap_embedder",),
+}
+_Z_IMAGE_BLOCK = {
+    "attention.to_q": ("attention", "to_q"), "attention.to_k": ("attention", "to_k"),
+    "attention.to_v": ("attention", "to_v"), "attention.to_out.0": ("attention", "to_out_0"),
+    "attention.norm_q": ("attention", "norm_q"), "attention.norm_k": ("attention", "norm_k"),
+    "feed_forward.w1": ("feed_forward", "w1"), "feed_forward.w2": ("feed_forward", "w2"),
+    "feed_forward.w3": ("feed_forward", "w3"), "adaLN_modulation.0": ("modulation",),
+    **{norm: (norm,) for norm in ("attention_norm1", "attention_norm2", "ffn_norm1", "ffn_norm2")},
+}
+
+
+def _z_image_path(name: str, ndim: int) -> tuple[str, ...]:
+    """Return the `ZImageTransformer` path for a published Z-Image tensor
+    name; a one-axis weight is a norm's scale."""
+    if name in ("x_pad_token", "cap_pad_token"):
+        return (name,)
+    if name == "cap_embedder.0.weight":
+        return ("cap_norm", "scale")
+    stem, _, leaf = name.rpartition(".")
+    if leaf == "weight":
+        leaf = "kernel" if ndim == 2 else "scale"
+    elif leaf != "bias":
+        raise ValueError(f"unknown tensor name {name!r}")
+    if stem in _Z_IMAGE_MODULES:
+        return (*_Z_IMAGE_MODULES[stem], leaf)
+    stack, _, rest = stem.partition(".")
+    index, _, inner = rest.partition(".")
+    if (
+        stack in ("noise_refiner", "context_refiner", "layers")
+        and index.isdigit()
+        and inner in _Z_IMAGE_BLOCK
+    ):
+        return (f"{stack}_{index}", *_Z_IMAGE_BLOCK[inner], leaf)
+    raise ValueError(f"unknown tensor name {name!r}")
+
+
+def translate_z_image_weights(tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
+                              ) -> tuple[ParamTree, tuple[WeightLayout, ...]]:
+    """Map Z-Image tensors into a parameter tree and the layouts that invert
+    it; its rotary table is computed, so it stores no buffer."""
+    return record_layouts("transformer", tensors, lambda name: _z_image_path(name, np.ndim(tensors[name])),
+                          ("params",), param_dtype=param_dtype)
 
 _FLUX_EMBEDDERS = {
     "x_embedder": ("x_embedder",),
@@ -510,7 +740,7 @@ def translate_sd3_weights(tensors: Mapping[str, np.ndarray], *, param_dtype: str
     optimizer and an EMA see only `params`, and export writes the stored
     array back unchanged.
     """
-    from dew.interop.pretrained import WeightLayout
+    from dew.interop.streaming import WeightLayout
 
     parameters, layouts = record_layouts(
         "transformer", tensors, _sd3_path, ("params",), param_dtype=param_dtype)
@@ -550,8 +780,6 @@ def qwen_image_fields(config: Mapping[str, object], *, dtype: DTypeLike | None =
     over unpatched, so a patch size other than one is a checkpoint no
     published pipeline drives and is refused rather than folded.
     """
-    from dew.interop.pretrained import resolve_dtype
-
     if records.integer(config.get("patch_size", 1), "patch_size") != 1:
         raise ValueError("Qwen-Image 2.1's pipeline reads its latent unpatched; patch_size must be 1")
     channels = records.integer(config.get("in_channels", 64), "in_channels")
@@ -647,7 +875,7 @@ def record_layouts(component: str, tensors: Mapping[str, np.ndarray],
     writes the tensor back unchanged. Each leaf is cast to `param_dtype` before
     the transpose; buffers and scoring state are the caller's to keep in FP32.
     """
-    from dew.interop.pretrained import WeightLayout
+    from dew.interop.streaming import WeightLayout
     parameters: ParamTree = {}
     layouts = []
     owners: dict[tuple[str, ...], str] = {}
@@ -683,8 +911,15 @@ def flax_component_parameters(component: str, tensors: Mapping[str, np.ndarray])
         else:
             if leaf in ("weight", "bias"):
                 parts.pop()
-                leaf = ("bias" if leaf == "bias" else "embedding" if parts[-1] in ("token_embedding", "position_embedding")
-                        else "scale" if array.ndim == 1 else "kernel")
+                leaf = (
+                    "bias"
+                    if leaf == "bias"
+                    else "embedding"
+                    if parts[-1] in ("token_embedding", "position_embedding")
+                    else "scale"
+                    if array.ndim == 1
+                    else "kernel"
+                )
             else:
                 parts.pop()
             if component == "unet":
@@ -730,7 +965,9 @@ def save_source(source, values, destination: Path) -> None:
     for name, component_config in component_configs.items():
         folder = destination / name
         folder.mkdir(exist_ok=True)
-        file = {"scheduler": "scheduler_config.json", "feature_extractor": "preprocessor_config.json"}.get(name, "config.json")
+        file = {"scheduler": "scheduler_config.json", "feature_extractor": "preprocessor_config.json"}.get(
+            name, "config.json"
+        )
         (folder / file).write_text(json.dumps(component_config, indent=2))
     grouped: dict[str, dict[str, np.ndarray]] = {}
     for layout in source.weight_layouts:
@@ -740,6 +977,11 @@ def save_source(source, values, destination: Path) -> None:
         weights = "diffusion_pytorch_model" if component in ("unet", "vae", "transformer") else "model"
         write_file(tensors, destination / component / f"{weights}.safetensors", metadata={"format": "pt"})
         declared = index.get(component)
-        if isinstance(declared, (list, tuple)) and len(declared) == 2 and isinstance(declared[1], str) and declared[1].startswith("Flax"):
+        if (
+            isinstance(declared, (list, tuple))
+            and len(declared) == 2
+            and isinstance(declared[1], str)
+            and declared[1].startswith("Flax")
+        ):
             write_flax_component(destination, component, tensors)
     source.inputs.conditions["conditioning"].encoder.save_assets(destination)

@@ -86,7 +86,7 @@ def flux_walk(source, arrays, name: str, grid: tuple[int, int]):
     probe = jnp.asarray(unpacked(arrays[f"{name}.probe"], *grid))
     output = jax.jit(forward)(params, latent, context, pooled)
     gradients = jax.jit(jax.grad(
-        lambda p, l, c, q: jnp.sum(forward(p, l, c, q) * probe), argnums=(0, 1, 2, 3)))(
+        lambda p, noisy_latent, c, q: jnp.sum(forward(p, noisy_latent, c, q) * probe), argnums=(0, 1, 2, 3)))(
             params, latent, context, pooled)
     return output, gradients, {entry.name: entry for entry in layouts}
 
@@ -144,7 +144,7 @@ def test_every_declared_flux_tensor_is_mapped(source):
     this translation does not know raises with that name rather than loading a
     checkpoint that means something else."""
     tensors = component_tensors(source / "dev", "transformer")
-    params, layouts = translate_flux_weights(tensors)
+    _params, layouts = translate_flux_weights(tensors)
     assert len(layouts) == len(tensors)
     leaves = {"/".join(entry.paths[0]) for entry in layouts}
     assert len(leaves) == len(tensors)
@@ -181,7 +181,8 @@ def test_the_guidance_input_follows_the_checkpoints_own_embedder(source):
 def test_the_rotary_table_is_the_sources_own_interleaved_pairs(source):
     """The table Flux rotates with: one angle per adjacent channel pair, laid
     out per axis, over the ids its pipeline writes."""
-    from dew.nn.backbones.flux import apply_rotary, flux_positions, rotary_table
+    from dew.nn.backbones.flux import flux_positions
+    from dew.nn.backbones.joint import apply_rotary, rotary_table
 
     positions = flux_positions(3, 2, 4)
     # The text sits at the origin and each patch carries its row and column.
@@ -215,10 +216,10 @@ def test_published_flux_prompt_encoding_matches_the_source_pipeline(source, pipe
     `prompt_2` to T5. The two slots carry different words, so a native
     encoder that crossed them or projected the pooled row would not land here.
     """
-    from dew.interop.pretrained import load_pretrained
+    from dew.interop.pretrained import Pretrained
 
     with np.load(source / "flux_transformer.npz") as arrays:
-        loaded = load_pretrained(str(source / "pipeline"), dtype="float32",
+        loaded = Pretrained.load(str(source / "pipeline"), dtype="float32",
                                  attention_impl="xla")
         encoder = loaded.inputs.conditions["conditioning"].encoder
         params = loaded.variables["encoders"]["conditioning"]
@@ -237,23 +238,23 @@ def test_published_flux_prompt_encoding_matches_the_source_pipeline(source, pipe
 
 
 def test_published_flux_pipeline_walk_matches_the_source(source, pipeline_record):
-    """`load_pretrained().text_to_image()` reproduces the source's own call.
+    """`Pretrained.load().text_to_image()` reproduces the source's own call.
 
     Nothing is passed in: the directory's declared pipeline carries the step
     count, the guidance the transformer embeds and the sigma seed its call
     lays out, and its own mu for this latent's packed token count.
     """
-    from dew.interop.pretrained import load_pretrained
+    from dew.interop.pretrained import Pretrained
 
     with np.load(source / "flux_transformer.npz") as arrays:
-        loaded = load_pretrained(str(source / "pipeline"), dtype="float32",
+        loaded = Pretrained.load(str(source / "pipeline"), dtype="float32",
                                  attention_impl="xla")
         task = loaded.text_to_image()
         assert task.steps == pipeline_record["default_steps"]
         assert task.guidance is None and pipeline_record["true_cfg"] == 1.0
         rows = pipeline_record["size"] // 4
         initial = unpacked(arrays["pipeline.x_T"], rows, rows)
-        prepared = task.prepare(pipeline_record["prompts"], initial=initial, seed=0)
+        prepared = task.prepare(pipeline_record["prompts"], initial=initial, key=0)
         walked = task(prepared, key=jax.random.PRNGKey(0)).host()
         assert relative_gap(packed(np.asarray(walked.latents)), arrays["pipeline.latents"]) < 2e-5
         images = np.clip(np.asarray(walked.images) / 2 + 0.5, 0.0, 1.0)
@@ -273,12 +274,12 @@ def test_a_trained_flux_step_exports_and_reloads(source, pipeline_record, tmp_pa
     import optax
 
     from dew.checkpoints import Checkpoints
-    from dew.interop.pretrained import load_pretrained
+    from dew.interop.pretrained import Pretrained
     from dew.objectives import Step
     from dew.objectives.diffusion import DiffusionObjective
     from dew.training import Trainer
 
-    loaded = load_pretrained(str(source / "pipeline"), dtype="float32", attention_impl="xla")
+    loaded = Pretrained.load(str(source / "pipeline"), dtype="float32", attention_impl="xla")
     height, width = loaded.inputs.sample.shape[:2]
     objective = DiffusionObjective(loaded.model, loaded.process, loaded.inputs,
                                    autoencoder=loaded.autoencoder, pretrained=loaded.variables,
@@ -316,11 +317,12 @@ def test_a_trained_flux_step_exports_and_reloads(source, pipeline_record, tmp_pa
     checkpoints.wait()
     restored, _, _ = trainer.place()
     for got, want in zip(jax.tree.leaves(restored), jax.tree.leaves(state), strict=True):
-        np.testing.assert_array_equal(got, want)
+        from test_trainer import raw_leaf
+        np.testing.assert_array_equal(raw_leaf(got), raw_leaf(want))
 
     export = tmp_path / "export"
     loaded.save(export, variables=state.params)
-    again = load_pretrained(str(export), dtype="float32", attention_impl="xla")
+    again = Pretrained.load(str(export), dtype="float32", attention_impl="xla")
     with np.load(source / "flux_transformer.npz") as arrays:
         grid = pipeline_record["size"] // 4
         latent = jnp.asarray(unpacked(arrays["pipeline.x_T"], grid, grid))
@@ -343,11 +345,11 @@ def test_each_records_guidance_reaches_the_model_and_survives_the_shared_seams(
     a caption changes what the model reads about the text and not the scale
     the checkpoint was distilled to walk at.
     """
-    from dew.interop.pretrained import load_pretrained
+    from dew.interop.pretrained import Pretrained
     from dew.objectives import Step
     from dew.objectives.diffusion import DiffusionObjective
 
-    loaded = load_pretrained(str(source / "pipeline"), dtype="float32", attention_impl="xla")
+    loaded = Pretrained.load(str(source / "pipeline"), dtype="float32", attention_impl="xla")
     encoder = loaded.inputs.conditions["conditioning"].encoder
     params = loaded.variables["encoders"]["conditioning"]
     rows = [dict(pipeline_record["prompts"][0], guidance=2.0),
@@ -430,7 +432,7 @@ def test_the_tied_t5_embedding_maps_under_either_name(source):
                    ["shared.weight", "encoder.embed_tokens.weight"]):
         variant = {name: value for name, value in tensors.items()
                    if name not in ("shared.weight", "encoder.embed_tokens.weight")}
-        variant.update({name: embedding for name in stored})
+        variant.update(dict.fromkeys(stored, embedding))
         params, layouts = record_layouts("text_encoder_2", variant, _t5_path, ("encoders",))
         np.testing.assert_array_equal(params["embed_tokens"]["embedding"], embedding)
         bound = [entry.name for entry in layouts
@@ -452,12 +454,12 @@ def test_a_flux_directory_declaring_an_sd3_pipeline_is_refused(source, tmp_path)
     """A declared class another family's denoiser drives is refused: the
     shared unet/transformer check cannot tell SD3's transformer from Flux's,
     so the gate reads the pipeline family."""
-    from dew.interop.pretrained import load_pretrained
+    from dew.interop.pretrained import Pretrained
 
     directory = tmp_path / "pipeline"
     shutil.copytree(source / "pipeline", directory)
     index = json.loads((directory / "model_index.json").read_text())
     index["_class_name"] = "StableDiffusion3Pipeline"
     (directory / "model_index.json").write_text(json.dumps(index))
-    with pytest.raises(ValueError, match="StableDiffusion3Pipeline.*FluxPipeline"):
-        load_pretrained(str(directory), dtype="float32", attention_impl="xla")
+    with pytest.raises(ValueError, match=r"StableDiffusion3Pipeline.*FluxPipeline"):
+        Pretrained.load(str(directory), dtype="float32", attention_impl="xla")

@@ -87,12 +87,12 @@ def test_padless_tokenizer_batches_match_unpadded_rows_without_changing_exports(
     policy = replace(task, processor=processor, sampling=Sampling(temperature=0))
     prompts = ["one", "one two three"]
     inputs = processor(prompts)
-    generated = policy(inputs, 2, seed=0).host()
+    generated = policy(inputs, 2, key=0).host()
     for row, prompt in enumerate(prompts):
         valid = np.asarray(inputs.token_fields["attention_mask"])[row]
         ids = np.asarray(inputs.tokens)[row, valid]
         np.testing.assert_array_equal(ids, tokenizer.encode(prompt))
-        alone = policy(prompt, 2, seed=0).host()
+        alone = policy(prompt, 2, key=0).host()
         np.testing.assert_array_equal(generated.tokens[row, -2:], alone.tokens[0, -2:])
         np.testing.assert_allclose(generated.raw_log_probs[row], alone.raw_log_probs[0], atol=2e-6, rtol=2e-6)
     assert tokenizer.pad_token_id is None and tokenizer.padding_side == padding_side
@@ -183,34 +183,146 @@ def test_invalid_probability_controls_are_refused():
             Sampling(min_p=value)
 
 
-def test_a_source_binds_its_whole_chain_and_an_override_clears_it(task):
-    """A source builds the complete chain in the reference's order, keeping
-    its basic policy visible as a `Sampling` value. An explicit policy
-    replaces that policy and clears the chain it was built around, while the
-    row count stays the source's."""
+def test_a_source_binds_a_chain_only_for_controls_its_policy_lacks(task):
+    """A source's common controls are its `Sampling` value. A control the
+    policy does not carry (epsilon sampling) binds the complete chain,
+    built in the reference's order with the policy's own transforms in it.
+    An explicit policy replaces both, while the row count stays the source's."""
     from pathlib import Path
 
-    from dew.interop.pretrained import Pretrained
+    from dew.interop.pretrained import PretrainedDecoder
+    from dew.sampling import decoding
 
-    source = Pretrained(task.model, task.variables, None, {}, Path("."), {},
+    source = PretrainedDecoder(task.model, task.variables, None, {}, Path("."), {},
                         generation_config={"do_sample": True, "temperature": 0.7, "top_p": 0.4,
                                            "min_p": 0.1, "num_return_sequences": 2})
     altered = replace(source, generation_config={**source.generation_config,
                                                  "repetition_penalty": 2.0, "typical_p": 0.9})
-    override = altered.text_generation(sampling=Sampling(temperature=0))
+    bound = altered.text_generation()
+    assert bound.logits is None and bound.n == 2
+    assert (bound.sampling.repetition_penalty, bound.sampling.typical_p) == (2.0, 0.9)
+    rare = replace(altered, generation_config={**altered.generation_config, "epsilon_cutoff": 0.01})
+    assert [type(transform) for transform in rare.text_generation().logits] == [
+        decoding.RepetitionPenalty, decoding.Temperature, decoding.TopP, decoding.MinP, decoding.Typical,
+        decoding.EpsilonCutoff]
+    override = rare.text_generation(sampling=Sampling(temperature=0))
+    assert override.logits is None and override.sampling.repetition_penalty == 1.0 and override.n == 2
     plain = override([[1, 2]], 6, key=jax.random.key(1), n=1)
     np.testing.assert_array_equal(plain.behavior_log_probs, 0)
-    penalized = replace(override, logits=altered.text_generation().logits)
-    assert not np.array_equal(np.asarray(plain.tokens),
-                              np.asarray(penalized([[1, 2]], 6, key=jax.random.key(1), n=1).tokens))
+    penalized = override([[1, 2]], 6, key=jax.random.key(1), n=1,
+                         sampling=Sampling(temperature=0, repetition_penalty=2.0))
+    assert not np.array_equal(np.asarray(plain.tokens), np.asarray(penalized.tokens))
+
+
+def test_one_policy_holds_the_common_controls_in_the_reference_order():
+    """Penalties, n-gram bans and the EOS floor run before the warpers, and
+    typical filtering after min-p, which is `_get_logits_processor`'s order;
+    presence and frequency sit beside the repetition penalty, as vLLM applies
+    its penalties together. Every control at its neutral value adds nothing."""
+    from dew.sampling import decoding
+
+    policy = Sampling(temperature=0.7, top_k=5, top_p=0.9, min_p=0.05, eos_id=5,
+                      repetition_penalty=1.1, presence_penalty=0.5, frequency_penalty=0.25,
+                      no_repeat_ngram_size=3, min_new_tokens=2, typical_p=0.8)
+    assert [type(transform) for transform in policy.transforms()] == [
+        decoding.RepetitionPenalty, decoding.PresencePenalty, decoding.FrequencyPenalty,
+        decoding.NoRepeatNGram, decoding.MinNewTokens, decoding.Temperature, decoding.TopK,
+        decoding.TopP, decoding.MinP, decoding.Typical]
+    assert [type(transform) for transform in replace(policy, temperature=0).transforms()] == [
+        decoding.RepetitionPenalty, decoding.PresencePenalty, decoding.FrequencyPenalty,
+        decoding.NoRepeatNGram, decoding.MinNewTokens, decoding.Greedy]
+    assert Sampling(temperature=0.7).transforms() == (decoding.Temperature(0.7),)
+    with pytest.raises(ValueError, match="eos_id"):
+        Sampling(min_new_tokens=2).transforms()
+    for bad in ({"repetition_penalty": 0.0}, {"no_repeat_ngram_size": -1}, {"min_new_tokens": -1},
+                {"typical_p": 1.5}, {"stop": ("",)}, {"stop": "\n\n"}, {"presence_penalty": float("nan")}):
+        with pytest.raises(ValueError):
+            Sampling(**bad)
+
+
+def test_a_sources_generation_config_becomes_its_sampling_value(task):
+    """The common controls a source declares land in `task.sampling`, so the
+    task binds no chain of its own, and a caller changes one control by
+    replacing it on that value while the others, EOS included, still apply."""
+    from pathlib import Path
+
+    from dew.interop.pretrained import PretrainedDecoder
+    from dew.sampling import decoding
+
+    source = PretrainedDecoder(task.model, task.variables, None, {}, Path("."), {}, generation_config={
+        "do_sample": True, "temperature": 0.7, "top_k": 5, "eos_token_id": 5, "pad_token_id": 3,
+        "repetition_penalty": 1.3, "no_repeat_ngram_size": 2, "min_new_tokens": 2, "typical_p": 0.9})
+    bound = source.text_generation()
+    assert bound.logits is None
+    assert bound.sampling == Sampling(temperature=0.7, top_k=5, eos_id=5, pad_id=3, repetition_penalty=1.3,
+                                      no_repeat_ngram_size=2, min_new_tokens=2, typical_p=0.9)
+    greedy = bound([[1, 2]], 6, key=1, n=1, sampling=replace(bound.sampling, temperature=0))
+    explicit = bound([[1, 2]], 6, key=1, n=1, logits=(
+        decoding.RepetitionPenalty(1.3), decoding.NoRepeatNGram(2),
+        decoding.MinNewTokens(2, jnp.asarray([5], jnp.int32)), decoding.Greedy()))
+    for name in ("tokens", "lengths", "terminated", "behavior_log_probs"):
+        np.testing.assert_array_equal(getattr(greedy, name), getattr(explicit, name))
+
+
+def test_a_call_policy_takes_the_tasks_eos_and_pad_ids(task):
+    """EOS and padding are the model's and the tokenizer's, so a call-level
+    policy that names neither stops and pads where the task does."""
+    first = task([[1, 2]], 4, key=1, sampling=Sampling(temperature=0))
+    eos = int(first.tokens[0, 3])
+    bound = replace(task, sampling=Sampling(temperature=0, eos_id=eos, pad_id=11))
+
+    drawn = bound([[1, 2]], 4, key=1, sampling=Sampling(temperature=0))
+
+    assert drawn.lengths.tolist() == [2] and drawn.terminated.tolist() == [True]
+    np.testing.assert_array_equal(drawn.tokens[0, 4:], 11)
+    named = bound([[1, 2]], 4, key=1, sampling=Sampling(temperature=0, eos_id=12, pad_id=0))
+    assert named.lengths.tolist() == [4] and not named.terminated.any()
+
+
+def test_stop_strings_in_the_policy_end_a_row_as_the_compiled_criterion_does(task, tmp_path):
+    """`stop=` compiles against the task's processor, once for the bound
+    policy and on the call for a call's own; plain `generate` has no
+    vocabulary to compile them against and says so."""
+    from tokenizers import Tokenizer, decoders, models
+    from transformers import PreTrainedTokenizerFast
+
+    from dew.data import HFTokenizer
+    from dew.inference import RunProcessor
+    from dew.sampling import decoding
+
+    pieces = ["st", "op", "sto", "pper", "x", "yy", "a", "b", "c", "d", "e", "f"]
+    vocabulary = {"<unk>": 0, **{piece: index for index, piece in enumerate(pieces, start=1)}}
+    backend = Tokenizer(models.BPE(vocabulary, [], unk_token="<unk>"))
+    backend.decoder = decoders.Fuse()
+    PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="<unk>").save_pretrained(tmp_path)
+    tokenizer = HFTokenizer(str(tmp_path))
+    order = jnp.asarray([vocabulary["st"], vocabulary["op"], vocabulary["yy"]], jnp.int32)
+
+    def scripted(state, logits):
+        pick = jnp.take(order, jnp.clip(state.step, 0, len(order) - 1))
+        return jnp.where(jnp.arange(logits.shape[-1])[None, :] == pick[:, None], 0.0, -jnp.inf)
+
+    processed = replace(task, processor=RunProcessor(tokenizer))
+    expected = processed([[1, 2]], 4, key=0, logits=(scripted,),
+                         stopping=(decoding.stop_strings(tokenizer.tokenizer, "stop", 13),))
+    called = processed([[1, 2]], 4, key=0, logits=(scripted,), sampling=Sampling(stop=("stop",)))
+    bound = replace(processed, sampling=Sampling(stop=("stop",)))([[1, 2]], 4, key=0, logits=(scripted,))
+    assert expected.lengths.tolist() == [2] and expected.terminated.tolist() == [True]
+    for drawn in (called, bound):
+        np.testing.assert_array_equal(drawn.tokens, expected.tokens)
+        assert drawn.lengths.tolist() == [2] and drawn.terminated.tolist() == [True]
+    with pytest.raises(ValueError, match="processor"):
+        replace(task, sampling=Sampling(stop=("stop",)))
+    with pytest.raises(ValueError, match="stop"):
+        generate(task.model, task.variables, [[1, 2]], 2, sampling=Sampling(stop=("stop",)))
 
 
 def test_unsupported_source_controls_report_their_reason(task):
     """An unsupported active source control names itself and the missing behavior."""
     from pathlib import Path
 
-    from dew.interop.pretrained import Pretrained
-    source = Pretrained(task.model, task.variables, None, {}, Path("."), {}, generation_config={})
+    from dew.interop.pretrained import PretrainedDecoder
+    source = PretrainedDecoder(task.model, task.variables, None, {}, Path("."), {}, generation_config={})
     refusals = {
         "stochastic beam": ({"num_beams": 2, "do_sample": True}, "marginal probability"),
         "beams below rows": ({"num_beams": 2, "num_return_sequences": 3}, "exceeds num_beams"),
@@ -232,13 +344,16 @@ def test_unsupported_source_controls_report_their_reason(task):
         "cache": ({"use_cache": False}, "its own cache"),
         "quantized cache": ({"cache_config": {"backend": "quanto"}}, "quantized and offloaded"),
         "chunked prefill": ({"prefill_chunk_size": 8}, "one call"),
-        "continuous batching": ({"continuous_batching_config": {"max_batch_tokens": 8}}, "continuous batching"),
+        "continuous batching": (
+            {"continuous_batching_config": {"max_batch_tokens": 8}},
+            "continuous batching",
+        ),
         "scores": ({"output_scores": True}, "per-step distributions"),
         "hidden states": ({"output_hidden_states": True}, "hidden states"),
         "no compile": ({"disable_compile": True}, "always runs compiled"),
         "capacity": ({"max_cache_len": 4096}, "max_seq_len"),
     }
-    for name, (active, reason) in refusals.items():
+    for (active, reason) in refusals.values():
         with pytest.raises(ValueError, match=reason):
             replace(source, generation_config=active).text_generation()
 
@@ -250,21 +365,21 @@ def test_a_source_asking_for_several_sequences_binds_them_as_the_task_default(ta
     an explicit sampling policy leaves it alone."""
     from pathlib import Path
 
-    from dew.interop.pretrained import Pretrained
+    from dew.interop.pretrained import PretrainedDecoder
 
-    source = Pretrained(task.model, task.variables, None, {}, Path("."), {},
+    source = PretrainedDecoder(task.model, task.variables, None, {}, Path("."), {},
                         generation_config={"do_sample": True, "temperature": 0.9,
                                            "num_return_sequences": 3})
     policy = source.text_generation()
-    rows = policy([[1, 2], [3, 4]], 4, seed=5).host()
+    rows = policy([[1, 2], [3, 4]], 4, key=5).host()
     assert rows.tokens.shape == (6, 6) and rows.lengths.shape == (6,)
     np.testing.assert_array_equal(rows.tokens[:, :2], np.repeat([[1, 2], [3, 4]], 3, axis=0))
-    assert policy([[1, 2], [3, 4]], 4, n=1, seed=5).host().tokens.shape == (2, 6)
+    assert policy([[1, 2], [3, 4]], 4, n=1, key=5).host().tokens.shape == (2, 6)
     overridden = source.text_generation(sampling=Sampling(temperature=0))
-    assert overridden([[1, 2], [3, 4]], 1, seed=5).lengths.shape == (6,)
+    assert overridden([[1, 2], [3, 4]], 1, key=5).lengths.shape == (6,)
     searched = replace(source, generation_config={"num_return_sequences": 3, "num_beams": 4})
     beamed = searched.text_generation()
-    found = beamed([[1, 2], [3, 4]], 4, seed=5).host()
+    found = beamed([[1, 2], [3, 4]], 4, key=5).host()
     assert found.tokens.shape == (6, 6)
     np.testing.assert_array_equal(found.tokens[:, :2], np.repeat([[1, 2], [3, 4]], 3, axis=0))
     with pytest.raises(ValueError, match="num_return_sequences"):
@@ -274,17 +389,17 @@ def test_a_source_asking_for_several_sequences_binds_them_as_the_task_default(ta
 def test_source_total_length_and_explicit_continuation_budget_have_defined_precedence(task):
     from pathlib import Path
 
-    from dew.interop.pretrained import Pretrained
+    from dew.interop.pretrained import PretrainedDecoder
 
-    source = Pretrained(task.model, task.variables, None, {}, Path("."), {},
+    source = PretrainedDecoder(task.model, task.variables, None, {}, Path("."), {},
                         generation_config={"do_sample": False, "max_length": 5})
     policy = source.text_generation()
-    full = policy([[1, 2]], seed=1).host()
+    full = policy([[1, 2]], key=1).host()
     assert full.tokens.shape == (1, 5) and full.lengths.tolist() == [3]
-    overridden = policy([[1, 2]], 1, seed=1).host()
+    overridden = policy([[1, 2]], 1, key=1).host()
     np.testing.assert_array_equal(overridden.tokens, full.tokens[:, :3])
     with pytest.raises(ValueError, match="prompt width"):
-        policy([[1, 2, 3, 4, 5, 6]], seed=1)
+        policy([[1, 2, 3, 4, 5, 6]], key=1)
 
 
 def test_a_source_forced_eos_follows_the_budget_the_call_asks_for(task):
@@ -293,9 +408,9 @@ def test_a_source_forced_eos_follows_the_budget_the_call_asks_for(task):
     the position to the source's own length would force at the wrong step."""
     from pathlib import Path
 
-    from dew.interop.pretrained import Pretrained
+    from dew.interop.pretrained import PretrainedDecoder
 
-    source = Pretrained(task.model, task.variables, None, {}, Path("."), {},
+    source = PretrainedDecoder(task.model, task.variables, None, {}, Path("."), {},
                         generation_config={"forced_eos_token_id": [2, 5],
                                            "max_new_tokens": 3, "max_length": 18,
                                            "pad_token_id": 0})
@@ -304,15 +419,15 @@ def test_a_source_forced_eos_follows_the_budget_the_call_asks_for(task):
     plain = replace(policy, logits=(decoding.Greedy(),))
     moved = False
     for budget in (3, 5):
-        drawn = policy([[1, 2]], budget, seed=0).host()
+        drawn = policy([[1, 2]], budget, key=0).host()
         assert drawn.tokens.shape == (1, 2 + budget)
         # The last step allows either id and nothing else.
         assert int(drawn.tokens[0, 2 + budget - 1]) in (2, 5)
-        free = plain([[1, 2]], budget, seed=0).host()
+        free = plain([[1, 2]], budget, key=0).host()
         moved = moved or int(free.tokens[0, -1]) != int(drawn.tokens[0, -1])
     assert moved, "the control changed nothing, so the position it fires at is untested"
     # Without an explicit budget the source's own max_new_tokens decides.
-    assert policy([[1, 2]], seed=0).host().tokens.shape == (1, 5)
+    assert policy([[1, 2]], key=0).host().tokens.shape == (1, 5)
 
 
 def test_an_explicit_policy_replaces_the_chain_the_source_could_not_build(task):
@@ -323,11 +438,11 @@ def test_an_explicit_policy_replaces_the_chain_the_source_could_not_build(task):
     would own it."""
     from pathlib import Path
 
-    from dew.interop.pretrained import Pretrained
+    from dew.interop.pretrained import PretrainedDecoder
 
     blocked = {"watermarking_config": {"greenlist_ratio": 0.5}, "guidance_scale": 2.0,
                "temperature": "warm", "num_return_sequences": 2}
-    source = Pretrained(task.model, task.variables, None, {}, Path("."), {},
+    source = PretrainedDecoder(task.model, task.variables, None, {}, Path("."), {},
                         generation_config=blocked)
     with pytest.raises(ValueError):
         source.text_generation()
@@ -353,16 +468,16 @@ def test_neutral_beam_controls_preserve_the_search(task):
     """Serialized beam defaults remain inert while beam search is active."""
     from pathlib import Path
 
-    from dew.interop.pretrained import Pretrained
+    from dew.interop.pretrained import PretrainedDecoder
 
     config = {"num_beams": 2, "num_return_sequences": 2, "eos_token_id": 5}
-    source = Pretrained(task.model, task.variables, None, {}, Path("."), {},
+    source = PretrainedDecoder(task.model, task.variables, None, {}, Path("."), {},
                         generation_config=config)
-    expected = source.text_generation()([[1, 2]], 3, seed=7)
+    expected = source.text_generation()([[1, 2]], 3, key=7)
     declared = replace(source, generation_config={
         **config, "num_beam_groups": 1, "diversity_penalty": 0.0,
         "early_stopping": False, "length_penalty": 1.0})
-    actual = declared.text_generation()([[1, 2]], 3, seed=7)
+    actual = declared.text_generation()([[1, 2]], 3, key=7)
     for name in ("tokens", "lengths", "terminated", "raw_log_probs", "behavior_log_probs"):
         np.testing.assert_array_equal(getattr(actual, name), getattr(expected, name))
 
@@ -381,12 +496,12 @@ def test_prompts_inside_one_bucket_trace_once_and_draw_what_their_own_width_draw
     attend to, the bug the masking prevents, moves the same log
     probabilities by 0.07 or more, four orders above the bound.
     """
-    exact = {width: generate(roomy.model, roomy.variables, ramp(width), 8, seed=0,
+    exact = {width: generate(roomy.model, roomy.variables, ramp(width), 8, key=0,
                              sampling=roomy.sampling) for width in (100, 120)}
     compiled = text._compiled(None)
     traced = compiled._cache_size()
     for width, reference in exact.items():
-        drawn = roomy(ramp(width), 8, seed=0)
+        drawn = roomy(ramp(width), 8, key=0)
         assert drawn.tokens.shape == (1, width + 8)
         np.testing.assert_array_equal(drawn.tokens, reference.tokens)
         tokens = np.asarray(reference.tokens)
@@ -423,8 +538,8 @@ def test_a_processor_prompt_is_bucketed_like_bare_ids(roomy):
     compiled = text._compiled(None)
     traced = compiled._cache_size()
     for width in (100, 120):
-        reference = generate(roomy.model, roomy.variables, ramp(width), 8, seed=0, sampling=roomy.sampling)
-        drawn = roomy(processor_rows(width), 8, seed=0)
+        reference = generate(roomy.model, roomy.variables, ramp(width), 8, key=0, sampling=roomy.sampling)
+        drawn = roomy(processor_rows(width), 8, key=0)
         assert drawn.tokens.shape == (1, width + 8)
         np.testing.assert_array_equal(drawn.tokens, reference.tokens)
         logits = roomy.model.apply(roomy.variables, jnp.asarray(reference.tokens))
@@ -447,7 +562,7 @@ def test_the_cache_a_call_builds_holds_the_request_not_the_model_context(roomy, 
         return unwrapped(model, *args, **kwargs)
 
     monkeypatch.setattr(tasks, "generate", record)
-    roomy(ramp(200), 100, seed=0)
+    roomy(ramp(200), 100, key=0)
     cache = seen["model"].apply(roomy.variables, 1, method="init_cache", mutable=["cache"])[1]["cache"]
     slots = {path[-1].key: leaf.shape[1]
              for path, leaf in jax.tree_util.tree_flatten_with_path(cache)[0] if leaf.ndim > 1}
@@ -458,7 +573,7 @@ def test_a_request_the_ceiling_refuses_keeps_refusing_at_its_own_shapes(roomy):
     """A prompt and budget over `max_seq_len` cannot be bucketed into one that
     fits, so the request keeps its own shapes and meets the cache ceiling."""
     with pytest.raises(ValueError, match="exceeds max_seq_len"):
-        roomy(ramp(1000), 100, seed=0)
+        roomy(ramp(1000), 100, key=0)
 
 
 def test_a_one_token_request_scans_one_trip(roomy):
@@ -478,17 +593,17 @@ def test_a_budget_inside_a_bucket_returns_the_budget_and_what_the_budget_draws(r
                                               roomy.model.max_seq_len)
     assert (shaped.tokens.shape[1], trips, capacity) == (64, 128, 256)
     exact = generate(tasks._sized(roomy.model, capacity), roomy.variables, shaped, budget,
-                     seed=3, sampling=roomy.sampling)
+                     key=3, sampling=roomy.sampling)
     compiled = text._compiled(None)
     traced = compiled._cache_size()
-    drawn = roomy(prompt, budget, seed=3)
+    drawn = roomy(prompt, budget, key=3)
     assert drawn.tokens.shape == (1, 40 + budget) and drawn.behavior_log_probs.shape == (1, budget)
     np.testing.assert_array_equal(drawn.tokens[:, -budget:], exact.tokens[:, -budget:])
     np.testing.assert_array_equal(drawn.lengths, exact.lengths)
     np.testing.assert_array_equal(drawn.terminated, exact.terminated)
     np.testing.assert_array_equal(drawn.raw_log_probs, exact.raw_log_probs)
     assert compiled._cache_size() - traced == 1
-    roomy(prompt, 128, seed=3)
+    roomy(prompt, 128, key=3)
     assert compiled._cache_size() - traced == 1
 
 
@@ -501,7 +616,7 @@ def test_a_criterion_the_budget_never_reaches_leaves_the_row_unterminated(roomy)
     """The 128-trip bucket runs 28 trips past a 100-token budget. A row that
     stops in one of them stopped outside the request: it comes back at the
     budget's length, unterminated, as it does without the bucket."""
-    drawn = roomy(ramp(40), 100, seed=3, stopping=stop_at_110)
+    drawn = roomy(ramp(40), 100, key=3, stopping=stop_at_110)
     np.testing.assert_array_equal(drawn.lengths, [100])
     np.testing.assert_array_equal(drawn.terminated, [False])
 
@@ -520,10 +635,10 @@ def test_prefill_scores_the_sampled_position_and_no_other(roomy, monkeypatch):
     assert picked.shape == (2, roomy.model.vocab_size) and every.shape[:2] == prompt.shape
     np.testing.assert_array_equal(picked, every[jnp.arange(2), slots])
     np.testing.assert_array_equal(states, whole_states)
-    gathered = roomy(prompt, 8, seed=0)
+    gathered = roomy(prompt, 8, key=0)
     # Nothing satisfies this stand-in, so the prefill takes the path that
     # scores every prompt position.
     monkeypatch.setattr(text, "Selective", type("NotSelective", (), {}))
-    scored_everywhere = roomy(prompt, 8, seed=0)
+    scored_everywhere = roomy(prompt, 8, key=0)
     np.testing.assert_array_equal(gathered.tokens, scored_everywhere.tokens)
     np.testing.assert_array_equal(gathered.raw_log_probs, scored_everywhere.raw_log_probs)

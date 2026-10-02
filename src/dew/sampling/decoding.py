@@ -90,11 +90,6 @@ class StepState:
         width = self.prompt_width
         return _compact(self.tokens[:, :width], self.valid[:, :width])
 
-    def generated(self) -> tuple[jax.Array, jax.Array]:
-        """The drawn region's real tokens left aligned, and how many."""
-        width = self.prompt_width
-        return _compact(self.tokens[:, width:], self.valid[:, width:])
-
     def commit(self, tokens: jax.Array, drawn: jax.Array) -> StepState:
         """The state after `drawn` rows appended `tokens` at their next slot."""
         rows = jnp.arange(self.rows)
@@ -158,13 +153,23 @@ def _ids(name: str, value: int | Sequence[int]) -> tuple[int, ...]:
 
 
 def _positive(name: str, value: float | int | str | bool | None) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value <= 0
+    ):
         raise ValueError(f"{name} must be a finite positive number")
     return float(value)
 
 
 def _unit(name: str, value: float | int | str | bool | None) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= 1:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or not 0 <= value <= 1
+    ):
         raise ValueError(f"{name} must be finite and between zero and one")
     return float(value)
 
@@ -193,16 +198,13 @@ class Stopping(Protocol):
 class Greedy:
     """The argmax as a distribution: zero on the best token, `-inf` elsewhere.
 
-    `Sampling(temperature=0)` compiles to this, so a zero-temperature draw
-    stays the deterministic argmax and its behaviour log probability stays
-    exactly zero while running through the same categorical draw as any other
-    policy. Transforms placed before it still shape the argmax, which is what
-    greedy search does with a processor list.
-
-    A row that arrives without a distribution leaves without one. A point
-    mass over an all-removed row, or over a NaN or `+inf` the model or an
-    earlier transform produced, would turn an undefined draw into a confident
-    token, so those rows pass through and the draw refuses them.
+    `Sampling(temperature=0)` compiles to this, so the draw stays the
+    deterministic argmax with a behaviour log probability of exactly zero; a
+    terminal Greedy lets the sampler take the argmax without building the
+    point mass. Transforms before it still shape the argmax, as in greedy
+    search. A row without a distribution (all removed, or NaN or `+inf`)
+    passes through for the draw to refuse, rather than becoming a confident
+    token.
     """
 
     def __call__(self, state: StepState, logits: jax.Array) -> jax.Array:
@@ -213,10 +215,8 @@ class Greedy:
                          point, logits)
 
 
-# `as_pytree` binds each of these to its scalar and hands the result over as a
-# `LogitsTransform`, which is called `(state, logits)`. None of the three reads
-# the step state; they take it because the chain calls every transform the same
-# way.
+# `as_pytree` binds each of these to its scalar as a `LogitsTransform`; none
+# reads the step state, which the chain hands every transform.
 def _temperature(value: float, state: StepState, logits: jax.Array) -> jax.Array:
     return logits / value
 
@@ -360,7 +360,7 @@ class TopH:
 
     Tokens enter in probability order while the cumulative entropy of the
     truncated head stays within `fraction` of its total entropy, and the best
-    token always enters. `candidates` is the head the reference fixes at 100.
+    token always enters, out of the reference's fixed head of 100.
 
     The two entropies are computed the way the reference computes them, and
     they are not the same expression. The budget is
@@ -373,15 +373,13 @@ class TopH:
     """
 
     fraction: float = struct.field(pytree_node=False, default=1.0)
-    candidates: int = struct.field(pytree_node=False, default=100)
 
     def __post_init__(self) -> None:
         if _unit("top_h", self.fraction) <= 0:
             raise ValueError("top_h must be finite and above zero up to one")
-        _size("top_h candidates", self.candidates)
 
     def __call__(self, state: StepState, logits: jax.Array) -> jax.Array:
-        head, index = lax.top_k(logits, min(self.candidates, logits.shape[-1]))
+        head, index = lax.top_k(logits, min(100, logits.shape[-1]))
         normalized = head - jax.scipy.special.logsumexp(head, axis=-1, keepdims=True)
         probabilities = jax.nn.softmax(normalized)
         budget = -jnp.sum(jnp.maximum(normalized, jnp.finfo(head.dtype).min) * probabilities,
@@ -410,10 +408,7 @@ class RemoveInvalidValues:
     """
 
     def __call__(self, state: StepState, logits: jax.Array) -> jax.Array:
-        limits = jnp.finfo(logits.dtype)
-        cleaned = jnp.where(jnp.isnan(logits), 0.0, logits)
-        cleaned = jnp.where(logits == jnp.inf, limits.max, cleaned)
-        return jnp.where(logits == -jnp.inf, limits.min, cleaned)
+        return jnp.nan_to_num(logits, nan=0.0)
 
 
 @struct.dataclass
@@ -814,27 +809,6 @@ class Vocabulary(Protocol):
     def __call__(self, text: str, *, add_special_tokens: bool) -> Mapping[str, list[int]]: ...
 
 
-PRINTABLE = (list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1))
-             + list(range(ord("®"), ord("ÿ") + 1)))
-"""The bytes GPT-2's byte-level alphabet maps to themselves."""
-
-
-def byte_alphabet() -> dict[str, int]:
-    """GPT-2's byte-to-unicode table, inverted.
-
-    A byte-level tokenizer stores each byte of a piece as one of these
-    characters, so reading a piece back byte by byte is the only way to keep
-    a code point that two tokens split between them.
-    """
-    used, mapped, spare = list(PRINTABLE), list(PRINTABLE), 0
-    for byte in range(256):
-        if byte not in PRINTABLE:
-            used.append(byte)
-            mapped.append(256 + spare)
-            spare += 1
-    return {chr(code): byte for byte, code in zip(used, mapped, strict=True)}
-
-
 def _decoder_has(config: JSON, name: str) -> bool:
     match config:
         case dict():
@@ -930,7 +904,14 @@ def vocabulary_pieces(tokenizer: Vocabulary, mode: str | None,
     adds or removes a leading space depending on what came before. The prefix
     is tokenized once and its text is cut off the front of every piece.
     """
-    alphabet = byte_alphabet() if mode == "byte_level" else None
+    alphabet = None
+    if mode == "byte_level":
+        # A byte-level piece spells each byte as a character of GPT-2's
+        # alphabet; reading it back byte by byte keeps a code point two
+        # tokens split.
+        from transformers.convert_slow_tokenizer import bytes_to_unicode
+
+        alphabet = {char: byte for byte, char in bytes_to_unicode().items()}
     base = [tokenizer._convert_id_to_token(token)
             for token in tokenizer(prefix, add_special_tokens=False)["input_ids"]]
     pieces: list[str | bytes] = []
@@ -962,24 +943,9 @@ def _piece_bytes(token: str, mode: str | None, alphabet: dict[str, int] | None) 
     return None
 
 
-def stop_strings(tokenizer: Vocabulary | Referencing | Tokenizing, strings: str | Sequence[str],
-                 vocab_size: int | None = None) -> StopStrings:
-    """Compile a tokenizer's vocabulary against `strings` into a `StopStrings`.
-
-    The tables record, for every token, where its piece can sit inside a stop
-    string and how many of the string's trailing units its start can cover.
-    This runs once on the host; the criterion never decodes.
-
-    A byte-level or byte-fallback vocabulary matches over UTF-8 bytes, so a
-    stop string whose code point two tokens split still ends a row.
-    `vocab_size` sizes the table for the model rather than the tokenizer when
-    a checkpoint pads its head.
-    """
-    wanted = (strings,) if isinstance(strings, str) else tuple(strings)
-    if not wanted or any(not isinstance(value, str) or not value for value in wanted):
-        raise ValueError("stop_strings needs non-empty strings")
-    # A tokenizer is read as it stands; dew's own processor holds the source
-    # processor as `reference`, and that processor holds the tokenizer.
+def vocabulary_of(tokenizer: Vocabulary | Referencing | Tokenizing, reader: str) -> Vocabulary:
+    """The tokenizer as it stands, or beneath a processor: dew's own processor
+    holds the source processor as `reference`, and that holds the tokenizer."""
     source = tokenizer
     for _ in range(3):
         if isinstance(source, Vocabulary):
@@ -991,21 +957,29 @@ def stop_strings(tokenizer: Vocabulary | Referencing | Tokenizing, strings: str 
         else:
             break
     if not isinstance(source, Vocabulary):
-        raise TypeError("stop_strings needs a tokenizer that can list its vocabulary")
+        raise TypeError(f"{reader} needs a tokenizer that can list its vocabulary")
+    return source
+
+
+def stop_strings(tokenizer: Vocabulary | Referencing | Tokenizing, strings: str | Sequence[str],
+                 vocab_size: int | None = None) -> StopStrings:
+    """Compile a tokenizer's vocabulary against `strings` into a `StopStrings`.
+
+    The tables record, once on the host, where each token's piece can sit
+    inside a stop string and how many of its trailing units the piece's start
+    covers, so the criterion never decodes. A byte-level or byte-fallback
+    vocabulary matches over UTF-8 bytes, so a code point two tokens split
+    still ends a row. `vocab_size` sizes the table for a model's padded head.
+    """
+    wanted = (strings,) if isinstance(strings, str) else tuple(strings)
+    if not wanted or any(not isinstance(value, str) or not value for value in wanted):
+        raise ValueError("stop_strings needs non-empty strings")
+    source = vocabulary_of(tokenizer, "stop_strings")
     mode = matching_mode(source)
     pieces, ids = vocabulary_pieces(source, mode)
     targets = [value.encode("utf-8") if mode is not None else value for value in wanted]
     width = max(len(ids) + 1, 1 if vocab_size is None else vocab_size + 1)
     return _stop_string_tables(pieces, ids, targets, width)
-
-
-def _overlap(part: str | bytes, target: str | bytes, position: int) -> bool:
-    """Whether `part` starts the slice of `target` at `position`."""
-    if isinstance(part, bytes) and isinstance(target, bytes):
-        return part.startswith(target[position:position + len(part)])
-    if isinstance(part, str) and isinstance(target, str):
-        return part.startswith(target[position:position + len(part)])
-    raise TypeError("a stop string and the vocabulary pieces have to be read the same way")
 
 
 def _stop_string_tables(pieces: Sequence[str | bytes], ids: Sequence[int],
@@ -1024,7 +998,9 @@ def _stop_string_tables(pieces: Sequence[str | bytes], ids: Sequence[int],
                     part, position = reversed_piece[-start:], 0
                 else:
                     part, position = reversed_piece, start
-                if _overlap(part, backwards, position):
+                # Pieces and targets are both bytes or both text (`stop_strings`).
+                window = backwards[position:position + len(part)]
+                if part[:len(window)] == window:
                     if position == 0:
                         ending.setdefault(index, []).append(min(len(part), len(target)))
                     else:
@@ -1080,15 +1056,31 @@ def components(values: LogitsTransform | Sequence[LogitsTransform]) -> tuple[Log
     return tuple(as_pytree(value) for value in values)
 
 
-def chain(transforms: Sequence[LogitsTransform]) -> Callable[[StepState, jax.Array], jax.Array]:
-    """The transforms as one callable, applied in order."""
+@dataclasses.dataclass(frozen=True, eq=False)
+class LogitsChain:
+    """The ordered transforms, retaining a terminal Greedy for the sampler.
 
-    def apply(state: StepState, logits: jax.Array) -> jax.Array:
-        for transform in transforms:
+    An arbitrary transform after Greedy may restore a nondegenerate
+    distribution, so only the final built-in Greedy proves an argmax draw.
+    Like a function closure, the callable is hashed by identity, not by its
+    captured processor arrays, when passed directly to `jax.jit`.
+    """
+
+    transforms: tuple[LogitsTransform, ...]
+
+    @property
+    def greedy(self) -> bool:
+        return bool(self.transforms) and type(self.transforms[-1]) is Greedy
+
+    def __call__(self, state: StepState, logits: jax.Array) -> jax.Array:
+        for transform in self.transforms:
             logits = transform(state, logits).astype(jnp.float32)
         return logits
 
-    return apply
+
+def chain(transforms: Sequence[LogitsTransform]) -> LogitsChain:
+    """The transforms as one callable, applied in order."""
+    return LogitsChain(tuple(transforms))
 
 
 def criterion(stopping: Sequence[Stopping]) -> Callable[[StepState, jax.Array], jax.Array]:
@@ -1101,3 +1093,46 @@ def criterion(stopping: Sequence[Stopping]) -> Callable[[StepState, jax.Array], 
         return done
 
     return finished
+
+
+__all__ = [
+    "Backend",
+    "BeginSuppressTokens",
+    "EndOfSequence",
+    "EpsilonCutoff",
+    "EtaCutoff",
+    "ExponentialDecayLengthPenalty",
+    "Fast",
+    "ForcedBOS",
+    "ForcedEOS",
+    "FrequencyPenalty",
+    "Greedy",
+    "LogitsChain",
+    "LogitsTransform",
+    "MaxLength",
+    "MaxNewTokens",
+    "MinLength",
+    "MinNewTokens",
+    "MinP",
+    "NoRepeatNGram",
+    "PieceDecoder",
+    "PresencePenalty",
+    "PromptNoRepeatNGram",
+    "PromptRepetitionPenalty",
+    "Referencing",
+    "RemoveInvalidValues",
+    "Renormalize",
+    "RepetitionPenalty",
+    "SequenceBias",
+    "StepState",
+    "StopStrings",
+    "Stopping",
+    "SuppressTokens",
+    "Temperature",
+    "Tokenizing",
+    "TopH",
+    "TopK",
+    "TopP",
+    "Typical",
+    "Vocabulary",
+]
