@@ -236,7 +236,8 @@ class TextToImage:
                                 fields(solver_record['fields'], 'solver fields'))
         guidance = None if record['guidance'] is None else _built(CFG, fields(record['guidance'], 'guidance'))
         return cls(config.build(), Process.from_json(fields(record['process'], 'process')),
-                   inputs, _without_loss_heads(params), autoencoder, steps=integer(record['sampling_steps'], 'sampling_steps'),
+                   inputs, _without_loss_heads(params), autoencoder,
+                   steps=integer(record['sampling_steps'], 'sampling_steps'),
                    guidance=guidance, solver=solver)
 
     @classmethod
