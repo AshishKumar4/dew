@@ -19,7 +19,7 @@ from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple, Self
+from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple, Self, cast
 
 import jax
 import jax.numpy as jnp
@@ -311,7 +311,7 @@ class Pretrained:
 
     @classmethod
     def from_run(cls, directory: str | Path, *, step: int | str | None = None,
-                 ema: bool | None = None) -> Pretrained:
+                 ema: bool | None = None) -> Self:
         """A trained run's selected checkpoint, rebuilt from its own inference record."""
         from dew.checkpoints import Checkpoints
         from dew.config import ModelConfig
@@ -331,6 +331,11 @@ class Pretrained:
         if isinstance(model, CausalTransformer):
             bundle = PretrainedDecoder.from_model(model, variables, tokenizer=tokenizer,
                                                    generation_config=generation)
+            if kind == 'masked_diffusion':
+                bundle = PretrainedMaskedDecoder(
+                    model, bundle.variables, bundle.processor, bundle.config, bundle.source,
+                    bundle.model_config, bundle.generation_config,
+                    export_adapter=bundle.export_adapter, tokenizer=bundle.tokenizer)
         elif isinstance(model, DiffusionGemma):
             from dew.interop import diffusion_gemma
             settings = record(declaration['diffusion_gemma'], 'diffusion_gemma')
@@ -341,10 +346,11 @@ class Pretrained:
                                              tokenizer=tokenizer)
         else:
             raise TypeError(f"{type(model).__name__} has no maintained exported bundle layout; "
-                            "load its task with from_run")
+                            "load diffusion runs with TextToImage.from_run")
         if cls is not Pretrained and not isinstance(bundle, cls):
-            raise ValueError(f"run builds {type(bundle).__name__}, not {cls.__name__}")
-        return bundle
+            raise TypeError(f"{directory} is a {type(bundle).__name__} source, not a {cls.__name__}; "
+                            f"load it with {type(bundle).__name__}.from_run or Pretrained.from_run")
+        return cast(Self, bundle)
 
     @classmethod
     def load(cls, name_or_dir: str | Path, *, dtype: DTypeLike = jnp.bfloat16,

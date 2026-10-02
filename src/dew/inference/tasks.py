@@ -669,9 +669,10 @@ class MaskedGeneration:
         if process.mask_id != mask_id:
             raise ValueError("model and process mask token disagree")
         solver = named_fields(record['solver'], 'solver')
-        return cls(model, variables, process, processor,
-                   solver=solvers.build(named(solver['name'], 'solver'),
-                                        named_fields(solver['fields'], 'fields')),
+        unmask = solvers.build(named(solver['name'], 'solver'), named_fields(solver['fields'], 'fields'))
+        if not isinstance(unmask, Unmask):
+            raise ValueError("a saved masked run requires an Unmask solver")
+        return cls(model, variables, process, processor, solver=unmask,
                    steps=integer(record['sampling_steps'], 'sampling_steps'),
                    pad_token_id=integer(record.get("pad_token_id", 0), "pad_token_id"),
                    max_new_tokens=budget or None)
