@@ -25,15 +25,14 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.attention import RMSNorm, scaled_dot_product_attention
+from dew.nn.attention import RMSNorm
 from dew.nn.backbones.unet_condition import sinusoidal_time
 from dew.nn.precision import at_least_fp32
 from dew.nn.scan_orders import patchify, unpatchify
 from dew.nn.sharding import logical_axes
 from dew.registry import models
 
-from .flux import apply_rotary
-from .sd3 import _layer_norm
+from .joint import JointAttention, layer_norm
 
 if TYPE_CHECKING:
     from dew.diffusion.process import DenoisingCondition
@@ -58,50 +57,14 @@ def rotary_table(dim: int, length: int, theta: float) -> tuple[np.ndarray, np.nd
 def _rotation(positions, axes: Sequence[int], lengths: Sequence[int], theta: float, dtype):
     """The rotary cosines and sines for integer `positions` `[B, S, 3]` in
     `dtype`, each channel pair's value repeated for both channels,
-    `[B, S, sum(axes)]`."""
+    `[B, S, 1, sum(axes)]`."""
     cosines, sines = [], []
     for index, (dim, length) in enumerate(zip(axes, lengths, strict=True)):
         cos_table, sin_table = rotary_table(dim, length, theta)
         cosines.append(jnp.asarray(cos_table, dtype)[positions[..., index]])
         sines.append(jnp.asarray(sin_table, dtype)[positions[..., index]])
-    return (jnp.repeat(jnp.concatenate(cosines, axis=-1), 2, axis=-1),
-            jnp.repeat(jnp.concatenate(sines, axis=-1), 2, axis=-1))
-
-
-class _Attention(nn.Module):
-    """`Attention` under `ZSingleStreamAttnProcessor`: bias-free projections,
-    per-head RMS norms on the queries and keys, the rotation, and the keys
-    past each row's length masked."""
-
-    heads: int
-    head_dim: int
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-    attention_impl: str = "auto"  # an AttentionImpl
-
-    @nn.compact
-    def __call__(self, x, cos, sin, lengths):
-        inner = self.heads * self.head_dim
-        split = (x.shape[0], x.shape[1], self.heads, self.head_dim)
-
-        def projection(name):
-            return nn.Dense(inner, use_bias=False, dtype=self.dtype, precision=self.precision, name=name)(
-                x
-            ).reshape(split)
-
-        query = RMSNorm(epsilon=1e-5, dtype=self.dtype, name="norm_q")(projection("to_q"))
-        key = RMSNorm(epsilon=1e-5, dtype=self.dtype, name="norm_k")(projection("to_k"))
-        rotation = (cos[:, :, None, :], sin[:, :, None, :])
-        attended = scaled_dot_product_attention(
-            apply_rotary(query, *rotation), apply_rotary(key, *rotation), projection("to_v"),
-            implementation=self.attention_impl, precision=self.precision, key_value_seq_lengths=lengths)
-        return nn.Dense(
-            self.heads * self.head_dim,
-            use_bias=False,
-            dtype=self.dtype,
-            precision=self.precision,
-            name="to_out_0",
-        )(attended.reshape(x.shape[0], x.shape[1], inner))
+    return (jnp.repeat(jnp.concatenate(cosines, axis=-1), 2, axis=-1)[:, :, None],
+            jnp.repeat(jnp.concatenate(sines, axis=-1), 2, axis=-1)[:, :, None])
 
 
 @logical_axes({("w1",): ("embed", "mlp"), ("w3",): ("embed", "mlp"), ("w2",): ("mlp", "embed")})
@@ -136,27 +99,28 @@ class ZImageBlock(nn.Module):
     attention_impl: str = "auto"  # an AttentionImpl
 
     @nn.compact
-    def __call__(self, x, cos, sin, lengths, embedded=None):
+    def __call__(self, x, rotation, lengths, embedded=None):
         def norm(name):
             return RMSNorm(epsilon=self.epsilon, dtype=self.dtype, name=name)
 
-        attention = _Attention(
-            self.heads,
-            self.features // self.heads,
-            dtype=self.dtype,
-            precision=self.precision,
-            attention_impl=self.attention_impl,
-            name="attention",
-        )
+        # `ZSingleStreamAttnProcessor`: bias-free, its query and key norms at
+        # 1e-5 whatever `norm_eps`.
+        joint = JointAttention(self.heads, self.features // self.heads, bias=False, epsilon=1e-5,
+                               dtype=self.dtype, precision=self.precision, attention_impl=self.attention_impl,
+                               name="attention")
+
+        def attention(x):
+            return joint(x, rotation=rotation, lengths=lengths)[0]
+
         feed_forward = _FeedForward(self.features, int(self.features / 3 * 8), dtype=self.dtype,
                                     precision=self.precision, name="feed_forward")
         if not self.modulation:
-            x = x + norm("attention_norm2")(attention(norm("attention_norm1")(x), cos, sin, lengths))
+            x = x + norm("attention_norm2")(attention(norm("attention_norm1")(x)))
             return x + norm("ffn_norm2")(feed_forward(norm("ffn_norm1")(x)))
         modulated = nn.Dense(4 * self.features, dtype=self.dtype, precision=self.precision,
                              name="modulation")(embedded)[:, None]
         scale, gate, scale_mlp, gate_mlp = jnp.split(modulated, 4, axis=-1)
-        attended = attention(norm("attention_norm1")(x) * (1 + scale), cos, sin, lengths)
+        attended = attention(norm("attention_norm1")(x) * (1 + scale))
         x = x + jnp.tanh(gate) * norm("attention_norm2")(attended)
         return x + jnp.tanh(gate_mlp) * norm("ffn_norm2")(
             feed_forward(norm("ffn_norm1")(x) * (1 + scale_mlp))
@@ -244,31 +208,31 @@ class ZImageTransformer(nn.Module):
         # Slots past a row's padded prompt are masked; they sit at the origin.
         leading = jnp.where(slots[None] < spans[:, None], slots[None] + 1, 0)
         caption_positions = jnp.stack([leading, jnp.zeros_like(leading), jnp.zeros_like(leading)], axis=-1)
-        rotation = (self.axes_dims, self.axes_lens, self.rope_theta)
-        image_cos, image_sin = _rotation(image_positions, *rotation, image.dtype)
-        caption_cos, caption_sin = _rotation(caption_positions, *rotation, image.dtype)
+        table = (self.axes_dims, self.axes_lens, self.rope_theta)
+        image_rotation = _rotation(image_positions, *table, image.dtype)
+        caption_rotation = _rotation(caption_positions, *table, image.dtype)
         whole_image = jnp.full((batch,), image_span, jnp.int32)
         block = {"epsilon": self.norm_eps, "dtype": self.dtype, "precision": self.precision,
                  "attention_impl": self.attention_impl}
 
         for index in range(self.n_refiner_layers):
             image = ZImageBlock(self.dim, self.n_heads, name=f"noise_refiner_{index}", **block)(
-                image, image_cos, image_sin, whole_image, embedded)
+                image, image_rotation, whole_image, embedded)
         for index in range(self.n_refiner_layers):
             caption = ZImageBlock(
                 self.dim, self.n_heads, modulation=False, name=f"context_refiner_{index}", **block
-            )(caption, caption_cos, caption_sin, spans)
+            )(caption, caption_rotation, spans)
         joined = jnp.concatenate([image, caption], axis=1)
-        cos = jnp.concatenate([image_cos, caption_cos], axis=1)
-        sin = jnp.concatenate([image_sin, caption_sin], axis=1)
+        rotation = tuple(jnp.concatenate(pair, axis=1)
+                         for pair in zip(image_rotation, caption_rotation, strict=True))
         for index in range(self.n_layers):
             joined = ZImageBlock(self.dim, self.n_heads, name=f"layers_{index}", **block)(
-                joined, cos, sin, image_span + spans, embedded)
+                joined, rotation, image_span + spans, embedded)
 
         scale = 1 + nn.Dense(self.dim, dtype=self.dtype, precision=self.precision,
                              name="final_modulation")(nn.silu(embedded))[:, None]
         out = nn.Dense(4 * channels, dtype=self.dtype, precision=self.precision, name="final_linear")(
-            _layer_norm(self.dtype)(joined[:, :count]) * scale)
+            layer_norm(self.dtype)(joined[:, :count]) * scale)
         return -unpatchify(out, 2, *x.shape[1:])
 
 
