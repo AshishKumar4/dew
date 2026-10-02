@@ -171,6 +171,16 @@ _DEFAULT_GUIDANCE = CFG(3.0)
 class DiffusionObjective(Objective[Ratio]):
     """Denoising diffusion: sample a noise level, corrupt, predict, weight."""
 
+    @property
+    def inputs(self) -> InputSpec:
+        if self._inputs is None:
+            raise ValueError("a diffusion objective requires an InputSpec")
+        return self._inputs
+
+    @inputs.setter
+    def inputs(self, inputs: InputSpec | None) -> None:
+        self._inputs = inputs
+
     def __init__(
         self,
         model: nn.Module,
