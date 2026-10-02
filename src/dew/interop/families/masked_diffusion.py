@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 from dew import records
-from dew.interop.families.gemma import _gemma4_config
+from dew.interop.families.gemma import _gemma4_config, _parallel_experts
 from dew.interop.families.qwen import _qwen2_config
 from dew.interop.hf_decoders import (
     DEFAULT_MAX_SEQ_LEN,
@@ -53,12 +53,9 @@ def _llada_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFie
     """
     std = _llada_geometry(hf_config)
     layers = records.integer(std['num_hidden_layers'], 'num_hidden_layers/n_layers')
-    inner: set[str] = set()
-    config = _base_config(std, inner, layer_types=('full_attention',) * layers,
+    config = _base_config(std, set(), layer_types=('full_attention',) * layers,
                           rope=_Ropes(records.number(std['rope_theta'], 'rope_theta')))
-    for key in _LLADA_READ:
-        if key in hf_config:
-            used.add(key)
+    used.update(key for key in _LLADA_READ if key in hf_config)
     mask = _mask_token(hf_config, used)
     _llada_refusals(hf_config, used, std)
     config.update(causal=False, mask_token_id=mask)
@@ -261,12 +258,7 @@ def _diffusion_gemma_text_config(hf_config: Mapping[str, object], used: set[str]
         # DiffusionGemma names no enable_moe_block flag; a config carrying the
         # three routed widths routes every layer beside its dense MLP, which
         # is what its encoder and decoder layers both build.
-        config["mixture"] = {
-            "experts": records.integer(hf_config["num_experts"], 'num_experts'),
-            "top_k": records.integer(hf_config["top_k_experts"], 'top_k_experts'),
-            "expert_features": records.integer(hf_config["moe_intermediate_size"], 'moe_intermediate_size'),
-            "parallel": True,
-        }
+        config["mixture"] = _parallel_experts(hf_config)
     # final_logit_softcapping is a class attribute of the reference text
     # config, not an instance field a config.json carries; the head always
     # divides by 30 under tanh.

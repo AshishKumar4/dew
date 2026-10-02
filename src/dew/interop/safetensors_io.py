@@ -412,8 +412,7 @@ def save_hf_layout(params, config: Mapping[str, object], directory,
     os.makedirs(directory, exist_ok=True)
     if not isinstance(params, LazyTensors):
         # Leaves stay where they are; `save_sharded` brings one shard at a time to the host.
-        leaves, _ = jax.tree_util.tree_flatten_with_path(params)
-        params = {_leaf_name(path): leaf for path, leaf in leaves}
+        params = _flatten(params)
     save_sharded(params, directory, max_shard_size)
     with open(os.path.join(directory, CONFIG_FILE), "w") as handle:
         json.dump(config, handle, indent=2)

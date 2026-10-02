@@ -20,6 +20,7 @@ from dew.interop.hf_decoders import (
     _MOE_SHARED,
     AltUpFields,
     DecoderFields,
+    MixtureFields,
     _base_config,
     _decoder_tensors,
     _dew_path,
@@ -81,36 +82,34 @@ def _gemma4_rope(entries: Mapping[str, object]) -> tuple[float, float | None, fl
     """
     full = records.record(entries.get('full_attention') or {}, 'rope_parameters.full_attention')
     sliding = records.record(entries.get('sliding_attention') or {}, 'rope_parameters.sliding_attention')
-    for kind, entry in (('sliding_attention', sliding),):
-        factor = entry.get('partial_rotary_factor')
-        if factor not in (None, 1, 1.0):
-            _refuse(f"rope_parameters.{kind} partial_rotary_factor {factor}",
-                    "partial rotary applies to the full layers only")
-        _rope_theta({**entry, 'rope_type': entry.get('rope_type', entry.get('type', 'default'))},
-                    f"rope_parameters.{kind}")
+    factor = sliding.get('partial_rotary_factor')
+    if factor not in (None, 1, 1.0):
+        _refuse(f"rope_parameters.sliding_attention partial_rotary_factor {factor}",
+                "partial rotary applies to the full layers only")
+    _rope_theta({**sliding, 'rope_type': sliding.get('rope_type', sliding.get('type', 'default'))},
+                "rope_parameters.sliding_attention")
     local = sliding.get('rope_theta', 10000.0)
-    kind, entry = 'full_attention', full
-    rope_type = entry.get('rope_type', entry.get('type', 'default'))
-    factor = entry.get('partial_rotary_factor')
+    rope_type = full.get('rope_type', full.get('type', 'default'))
+    factor = full.get('partial_rotary_factor')
     if rope_type == 'proportional':
         if factor is None:
             _refuse("rope_parameters.full_attention",
                     "proportional rope needs its partial_rotary_factor")
-        extra = sorted(set(entry) - {'rope_type', 'type', 'rope_theta',
-                                     'partial_rotary_factor', 'factor'})
-        if extra or entry.get('factor', 1.0) not in (1, 1.0):
+        extra = sorted(set(full) - {'rope_type', 'type', 'rope_theta',
+                                    'partial_rotary_factor', 'factor'})
+        if extra or full.get('factor', 1.0) not in (1, 1.0):
             _refuse("rope_parameters.full_attention scaling",
                     "the backbone applies plain rotary positions at rope_theta")
         partial = records.number(factor, 'rope_parameters.full_attention partial_rotary_factor')
         theta = records.number(
-            entry.get("rope_theta", 1000000.0), "rope_parameters.full_attention rope_theta"
+            full.get("rope_theta", 1000000.0), "rope_parameters.full_attention rope_theta"
         )
     elif rope_type in ('default', 'none'):
         if factor not in (None, 1, 1.0):
             _refuse("rope_parameters.full_attention partial_rotary_factor",
                     "partial rotary comes spelled proportional")
         partial = None
-        theta = _rope_theta(entry, 'rope_parameters.full_attention') or 10000.0
+        theta = _rope_theta(full, 'rope_parameters.full_attention') or 10000.0
     else:
         _refuse(f"rope_parameters.full_attention (rope_type {rope_type!r})",
                 "the backbone applies plain rotary positions at rope_theta")
@@ -399,14 +398,17 @@ def _gemma4_config(hf_config: Mapping[str, object], used: set[str], *,
         for field in ('num_experts', 'top_k_experts', 'moe_intermediate_size'):
             if hf_config.get(field) is None:
                 _refuse("enable_moe_block=True", f"the routed branch needs {field}")
-        config['mixture'] = {
-            'experts': records.integer(hf_config['num_experts'], 'num_experts'),
-            'top_k': records.integer(hf_config['top_k_experts'], 'top_k_experts'),
-            'expert_features': records.integer(hf_config['moe_intermediate_size'], 'moe_intermediate_size'),
-            'parallel': True,
-        }
+        config['mixture'] = _parallel_experts(hf_config)
 
     return config
+
+
+def _parallel_experts(hf_config: Mapping[str, object]) -> MixtureFields:
+    """The routed branch a Gemma 4 layer runs beside its dense MLP."""
+    return {'experts': records.integer(hf_config['num_experts'], 'num_experts'),
+            'top_k': records.integer(hf_config['top_k_experts'], 'top_k_experts'),
+            'expert_features': records.integer(hf_config['moe_intermediate_size'], 'moe_intermediate_size'),
+            'parallel': True}
 
 
 def _gemma3_export(model: CausalTransformer) -> Mapping[str, object]:
