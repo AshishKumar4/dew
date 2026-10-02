@@ -38,28 +38,17 @@ def scatter_tokens(held: jax.Array, kept: jax.Array, tokens: jax.Array) -> jax.A
 class SimpleDiT(nn.Module):
     """Standard DiT: a plain stack of adaLN-Zero attention blocks.
 
-    `adaln_silu=False` and `text_pooling="all"` use FlaxDiff 0.2's
-    conditioning, as in `SimpleUDiT`.
-
-    `routes` is TREAD's token routing (Krause et al. 2025, "TREAD: Token
-    Routing for Efficient Architecture-agnostic Diffusion Training"), in
-    training only: each `(ratio, start, end)` draws `int(tokens * ratio)`
-    tokens uniformly per example that skip blocks `start` to `end`
-    inclusive, which the rest pass through, and rejoin after block `end`
-    holding the values they entered block `start` with, as CompVis/tread's
-    `Router` gathers and scatters them. The kept tokens stay in sequence
-    order and rotate at their own positions. The draw reads the `dropout`
-    stream. Sampling runs every token through every block.
-
-    `patch_bottleneck` is JiT's bottleneck patch embedding (Li & He 2025,
-    "Back to Basics: Let Denoising Generative Models Denoise"), for large
-    pixel patches: 128 in its models.
-
-    `interval` makes it an interval model (`Process.interval`), reading the
-    `duration` of the interval it predicts over beside the time: MeanFlow's
-    and shortcut models' network. `time_scale` scales the time embedding's
-    Fourier frequencies (`ConditioningEmbed`); a model trained through a JVP
-    in time, MeanFlow's or an sCM student, takes a small one.
+    `adaln_silu=False` and `text_pooling="all"` are FlaxDiff 0.2's conditioning,
+    as in `SimpleUDiT`. `routes` is TREAD's token routing (Krause et al. 2025)
+    in training: each `(ratio, start, end)` draws `int(tokens * ratio)` tokens
+    per example, from the `dropout` stream, that skip blocks `start` to `end`
+    and rejoin after `end` with the values they entered with, as CompVis/tread's
+    `Router` does; kept tokens stay in order at their own positions. Sampling
+    runs every token through every block. `patch_bottleneck` is JiT's bottleneck
+    patch embedding (Li & He 2025), 128 in its models. `interval` reads the
+    `duration` of the predicted interval beside the time (MeanFlow, shortcut
+    models; `Process.interval`), and `time_scale` scales the Fourier
+    frequencies, small for a model trained through a JVP in time.
     """
     output_channels: int = 3
     patch_size: int = 16

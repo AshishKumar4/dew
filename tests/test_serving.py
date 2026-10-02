@@ -10,6 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from steady_state import guarded, steady_state
 
 from dew.inference import RunProcessor, TextGeneration
 from dew.inference.pages import Pages
@@ -112,9 +113,8 @@ def test_a_sampled_request_keeps_its_own_draws():
         np.testing.assert_array_equal(mine.lengths[0], rows.lengths[index])
 
 
-@pytest.mark.skipif(jax.default_backend() != "gpu", reason="guards a CUDA device-to-host key transfer")
 def test_submission_keeps_device_keys_on_device_until_admission():
-    """A request can queue its key without waiting for a CUDA copy to the host.
+    """A request can queue its key without waiting for a copy to the host.
 
     The request still draws the same sampled tokens and likelihoods once it
     is admitted; only the host-side preparation's synchronization changes.
@@ -123,10 +123,47 @@ def test_submission_keeps_device_keys_on_device_until_admission():
     key = jax.random.key(7)
     prompt = np.asarray([1, 2, 3], np.int32)
     server = Server.from_task(bound, slots=2, capacity=128, admission=2)
-    with jax.transfer_guard_device_to_host("disallow"):
+    with guarded(allow=("host_to_device",)):
         ticket = server.submit(prompt, 5, key=key)
     server.run()
     assert_same_generation(ticket.result(), bound(prompt[None], 5, key=key))
+
+
+def test_repeated_requests_reuse_their_programs_and_read_back_only_results():
+    """Text requests of one bucket after the first run the program it
+    compiled, and the host waits on nothing but what a request asks for:
+    the device check it raises from and the result. A request's own inputs
+    reach the device as it arrives, so only reads are held (`steady_state`).
+    A prompt that went to the device and came back for validation, or a
+    recompile per request, fails it."""
+    bound = task()
+    keys = [jax.random.key(index) for index in range(4)]
+    bound("12", 6, key=keys[0])
+    with steady_state(allow=("host_to_device",)):
+        drawn = [bound(prompt, 6, key=key) for prompt, key in zip(["34", "56", "78"], keys[1:], strict=True)]
+    assert [generation.tokens.shape for generation in drawn] == [(1, 8)] * 3
+
+
+def test_a_server_round_after_the_first_reuses_its_programs_and_reads_once_a_step():
+    """A second round of the same requests runs the programs the first
+    compiled, and each step's one read is the explicit copy of the drawn
+    tokens the admission works from (`steady_state`). Token rows, which the
+    server keeps on the host until it admits them."""
+    server = Server.from_task(task(), slots=4, capacity=128, admission=2, decode_steps=4)
+    rounds = [[jax.random.key(10 * round + index) for index in range(len(PROMPTS))] for round in range(2)]
+    rows = [np.asarray(Digits().encode(prompt), np.int32) for prompt in PROMPTS]
+
+    def served(keys):
+        tickets = [server.submit(prompt, budget, key=key)
+                   for prompt, budget, key in zip(rows, BUDGETS, keys, strict=True)]
+        server.run()
+        return [ticket.result() for ticket in tickets]
+
+    first = served(rounds[0])
+    with steady_state(allow=("host_to_device",)):
+        second = served(rounds[1])
+    for mine, theirs in zip(second, first, strict=True):
+        np.testing.assert_array_equal(mine.host().tokens, theirs.host().tokens)
 
 
 @pytest.mark.parametrize("ids", [np.asarray([1.5, 2.0]), np.asarray([True, False]),

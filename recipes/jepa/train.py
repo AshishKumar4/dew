@@ -16,7 +16,7 @@ import tyro
 from dew.config import JsonDict, ModelConfig, OptimConfig, RunConfig
 from dew.data import ImageDataset, VideoDataset
 from dew.inputs import Field
-from dew.objectives.jepa import JepaObjective, KnnProbe, LinearProbe, multi_block_mask
+from dew.objectives.jepa import JepaObjective, KnnProbe, LinearProbe, MultiBlockMask
 from dew.registry import datasets, models
 from dew.training import TrainState, prepare_process, run_timestamp
 
@@ -125,7 +125,7 @@ def main(config: JepaRunConfig) -> TrainState:
     predictor, predictor_fields = build_predictor(
         config, encoder_fields, encoder, grid, is_video)
 
-    mask = multi_block_mask(
+    mask = MultiBlockMask.for_grid(
         grid,
         num_targets=config.num_target_blocks,
         scale=config.target_scale,

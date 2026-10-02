@@ -4,11 +4,11 @@ Preparation downloads, generates and writes the shards, and needs
 TensorFlow. Reading them needs neither: TFDS's read-only builder opens what
 preparation left behind, and nothing here prepares or generates.
 
-`prepared` resolves the version directory: the directory itself when it
-holds the metadata, otherwise `<data_dir>/<builder>/<config>/<version>` from
-the names a caller gave, taking the newest version when none is named.
-`read_only_builder` compares the builder, config and version asked for with
-what the metadata reports and refuses a file format other than ArrayRecord.
+`read_only_builder` resolves the version directory, the directory itself
+when it holds the metadata and otherwise through TFDS's own
+`builder_from_files` from the names a caller gave, then compares the builder,
+config and version asked for with what the metadata reports and refuses a
+file format other than ArrayRecord.
 `prepared_source` is the builder's own data source behind those checks and a
 check that every shard of the split is present.
 """
@@ -35,76 +35,18 @@ PREPARE = ("Prepare it in a separate environment with "
            "builder.data_dir it wrote. Training never prepares its own data.")
 
 
-def _version(name: str) -> tuple[int, ...]:
-    """`name` as the tuple that orders TFDS versions, or () when it is not one."""
-    parts = name.split(".")
-    return tuple(int(part) for part in parts) if all(part.isdigit() for part in parts) else ()
-
-
-def _newest(directory: epath.Path, what: str) -> epath.Path:
-    """The highest-numbered version directory under `directory`."""
-    versions = sorted((_version(child.name), child) for child in directory.iterdir()
-                      if child.is_dir() and _version(child.name))
-    if not versions:
-        raise FileNotFoundError(
-            f"{directory} holds no prepared version of {what}. " + PREPARE)
-    return versions[-1][1]
-
-
-def prepared(path: str, *, builder: str | None = None, config: str | None = None,
-             version: str | None = None) -> epath.Path:
-    """The version directory holding `builder`'s prepared shards.
-
-    `path` is either that directory, when it holds the metadata, or the
-    `data_dir` a preparation run wrote under. In the second case the builder,
-    the config and the version name the directory inside it the way TFDS lays
-    it out. An unset version takes the newest prepared one, so a caller who
-    prepared once does not have to repeat its number. Without a builder name
-    only the first form resolves, since a data_dir holds one directory per
-    builder and nothing says which of them was wanted.
-    """
-    root = epath.Path(os.path.expanduser(path))
-    if not root.is_dir():
-        raise FileNotFoundError(f"No prepared TFDS data at {path!r}. " + PREPARE)
-    if all((root / name).is_file() for name in METADATA):
-        # A resolved directory needs no names to find it. A caller who gives
-        # them anyway is constraining what it must hold, and the metadata
-        # checks in `read_only_builder` are where that is answered.
-        return root
-    if builder is None:
-        raise FileNotFoundError(
-            f"No prepared TFDS metadata at {path!r}. " + PREPARE)
-    directory = root / builder
-    if not directory.is_dir():
-        raise FileNotFoundError(
-            f"{path!r} holds no prepared {builder!r} and is not a prepared "
-            f"version directory itself. " + PREPARE)
-    if config is not None:
-        directory = directory / config
-        if not directory.is_dir():
-            raise FileNotFoundError(
-                f"{path!r} holds no {config!r} config of {builder!r}. " + PREPARE)
-    if version is not None:
-        directory = directory / version
-        if not directory.is_dir():
-            raise FileNotFoundError(
-                f"{path!r} holds no version {version!r} of {builder!r}. " + PREPARE)
-    else:
-        directory = _newest(directory, builder)
-        if not all((directory / name).is_file() for name in METADATA):
-            # A configured builder keeps its versions one level further down.
-            directory = _newest(directory, builder)
-    for name in METADATA:
-        if not (directory / name).is_file():
-            raise FileNotFoundError(
-                f"{directory} has no {name}, so nothing there is a prepared "
-                f"TFDS dataset. " + PREPARE)
-    return directory
-
-
-def read_only_builder(directory: epath.Path, *, builder: str | None,
+def read_only_builder(path: str, *, builder: str | None,
                       config: str | None, version: str | None):
-    """The read-only builder over `directory`, checked against what was asked for.
+    """The read-only builder over the prepared data at `path`, checked against
+    what was asked for.
+
+    `path` is either a version directory, when it holds the metadata, or the
+    `data_dir` a preparation run wrote under, where TFDS's own
+    `builder_from_files` finds the builder's directory from the names given
+    (the newest prepared version when none is named, the default config when
+    none is). Without a builder name only the first form resolves, since a
+    data_dir holds one directory per builder and nothing says which of them
+    was wanted.
 
     The import is here rather than at module level so `import dew.data` costs
     no TFDS, and so a missing extra names the extra. TFDS reads prepared
@@ -124,7 +66,28 @@ def read_only_builder(directory: epath.Path, *, builder: str | None,
         raise ImportError(
             "reading prepared TFDS data needs the tfds extra: "
             "pip install 'dewml[tfds]'") from missing
-    reader = tfds.builder_from_directory(directory)
+    root = epath.Path(os.path.expanduser(path))
+    if not root.is_dir():
+        raise FileNotFoundError(f"No prepared TFDS data at {path!r}. " + PREPARE)
+    if all((root / name).is_file() for name in METADATA):
+        # A resolved directory needs no names to find it. A caller who gives
+        # them anyway is constraining what it must hold, which the metadata
+        # answers below.
+        reader = tfds.builder_from_directory(root)
+    elif builder is None:
+        raise FileNotFoundError(f"No prepared TFDS metadata at {path!r}. " + PREPARE)
+    else:
+        from tensorflow_datasets.core.read_only_builder import builder_from_files
+
+        asked = "".join(f" {what} {value!r}" for what, value in (("config", config),
+                                                                 ("version", version)) if value)
+        try:
+            reader = builder_from_files(builder, data_dir=os.fspath(root), config=config,
+                                        version=version)
+        except tfds.core.DatasetNotFoundError as missing:
+            raise FileNotFoundError(
+                f"{path!r} holds no prepared {builder!r}{asked}. " + PREPARE) from missing
+    directory = reader.data_path
     dataset_info = reader.info
     if dataset_info.file_format != tfds.core.FileFormat.ARRAY_RECORD:
         raise ValueError(
@@ -184,11 +147,10 @@ def prepared_source(path: str, split: str, *, builder: str | None = None,
     bare array for a single feature. The run's own `preprocess` is where it
     becomes batch fields.
     """
-    directory = prepared(path, builder=builder, config=config, version=version)
-    reader = read_only_builder(directory, builder=builder, config=config, version=version)
-    check_shards(reader, split, directory)
+    reader = read_only_builder(path, builder=builder, config=config, version=version)
+    check_shards(reader, split, epath.Path(reader.data_path))
     return Prepared(reader.as_data_source(split, decoders=decoders),
-                    str(directory), split)
+                    str(reader.data_path), split)
 
 
 class Prepared:

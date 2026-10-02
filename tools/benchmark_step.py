@@ -82,7 +82,7 @@ from dew.nn.vision import ProjectorBase, TowerBase
 from dew.objectives.base import Objective, Variables
 from dew.objectives.diffusion import BlockDiffusionObjective, DiffusionObjective
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
-from dew.objectives.jepa import JepaObjective, multi_block_mask
+from dew.objectives.jepa import JepaObjective, MultiBlockMask
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl import DPOObjective, GRPOObjective, sessions
 from dew.registry import float64_twin, models, projectors, resolve_dtype, towers, with_precision
@@ -424,7 +424,7 @@ def cpu_smoke_cases() -> list[Case]:
                     "tower": {"kind": "siglip", "hidden_size": 32, "intermediate_size": 64,
                               "num_layers": 1, "num_heads": 2, "image_size": 16,
                               "patch_size": 8},
-                    "projector": {"kind": "gemma", "vision_width": 32, "text_width": 32,
+                    "projector": {"kind": "gemma", "text_width": 32,
                                   "patches_per_side": 2, "tokens_per_side": 2}},
              batch_size=8, seq_len=15, fsdp_min_param_size=256),
         Case("diffusion_gemma", {**tiny_decoder, "layer_scalar": "frozen"},
@@ -522,7 +522,7 @@ def small_cases(dtype: str) -> list[Case]:
                     "tower": {"kind": "siglip", "hidden_size": 1152,
                               "intermediate_size": 4304, "num_layers": 4,
                               "num_heads": 16, "image_size": 448, "patch_size": 14},
-                    "projector": {"kind": "gemma", "vision_width": 1152, "text_width": 768,
+                    "projector": {"kind": "gemma", "text_width": 768,
                                   "patches_per_side": 32, "tokens_per_side": 16}},
              batch_size=8, seq_len=512),
         # The same decoder read both ways by the official DiffusionGemma
@@ -705,7 +705,7 @@ def build_objective(case: Case, attention_impl: str = 'auto', *, widened: bool =
         grid = (case.image_size // patch, case.image_size // patch)
         objective = JepaObjective(
             model, built("jepa_predictor", {**case.predictor, "grid": grid}),
-            multi_block_mask(grid, num_targets=2, scale=(0.2, 0.3)),
+            MultiBlockMask.for_grid(grid, num_targets=2, scale=(0.2, 0.3)),
             sample=Field(sample_key, case.sample_shape))
     else:
         model = built(case.architecture, case.config)

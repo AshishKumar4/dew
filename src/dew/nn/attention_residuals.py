@@ -1,34 +1,26 @@
 """Block attention residuals: Kimi K3's residual as a softmax over depth.
 
-Kimi K3 (arXiv 2607.24653) replaces the running residual sum with Attention
-Residuals. The layers are cut into blocks of `block_size`. Each block's
-output sum is kept, and a sublayer does not read the running sum: it reads
-a softmax-weighted mixture of every finished block and the partial sum of
-the current one. The weights come from one learned pseudo-query per site
-(`KimiDecoderLayer._forward_attn_residual` and `_apply_attn_res`,
-modeling_kimi_linear.py:973-1088 of moonshotai/Kimi-K3 at f831ab6):
+Kimi K3 (arXiv 2607.24653) cuts the layers into blocks of `block_size`, keeps
+each block's output sum, and has every sublayer read a softmax mixture of the
+finished blocks and the current partial sum, weighted by one learned
+pseudo-query per site (`KimiDecoderLayer._forward_attn_residual`,
+`_apply_attn_res`, modeling_kimi_linear.py:973-1088 of moonshotai/Kimi-K3 at
+f831ab6):
 
     v      = [block_0, ..., block_{n-1}, partial]          # [B, S, n + 1, D]
     k      = v / sqrt(mean(v^2) + eps)                     # fp32, per source
     scores = k @ (norm.weight * proj.weight)               # [B, S, n + 1]
     h      = softmax(scores) @ v                           # fp32, then v's dtype
 
-Layer `i` opens a block when `i % block_size == 0`: after its attention
-input is read, the partial sum it received becomes a finished block and the
+Layer `i` opens a block when `i % block_size == 0`: after reading its
+attention input, the partial it received becomes a finished block and the
 partial restarts from the attention output. Layer 0 reads the embeddings as
-they are and makes them block 0. Every other sublayer input is a mixture,
-and after the last layer a model-level site mixes all blocks with the final
-partial before the final norm (`_apply_output_attn_res`, :1226-1233).
-
-The residual state between layers is one array `[B, S, blocks + 1, D]`:
-the finished blocks in order, unfilled slots zero, and the partial last.
-Which slots a layer reads is fixed by its index, so a layer's slice is
-static and the state keeps one shape through a scan or a pipeline.
-
-Each site holds the checkpoint's two tensors folded as the reference folds
-them: `scale` `[D]` is the norm's weight (`*_res_norm.weight`) and `kernel`
-`[D, 1]` the projection's (`*_res_proj.weight`, `[1, D]` in the torch
-layout). A zero kernel scores every source alike, so a fresh site averages.
+block 0, and after the last layer a model-level site mixes all blocks with
+the final partial before the final norm (`_apply_output_attn_res`,
+:1226-1233). The state is one `[B, S, blocks + 1, D]` array, unfilled slots
+zero and the partial last, so each layer's slice is static through a scan or
+pipeline. A site's `scale` `[D]` is `*_res_norm.weight` and `kernel` `[D, 1]`
+`*_res_proj.weight`; a zero kernel averages.
 """
 
 from __future__ import annotations
@@ -40,7 +32,6 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from .precision import at_least_fp32
-from .sharding import logical_axes
 
 
 @dataclasses.dataclass(frozen=True)
@@ -76,7 +67,6 @@ def sources(state, finished: int, partial):
     return jnp.concatenate([state[:, :, :finished], partial[:, :, None, :]], axis=2)
 
 
-@logical_axes({}, heuristic=(("attention_res",), ("mlp_res",), ("output_res",)))
 class DepthAttention(nn.Module):
     """Mix `[B, S, n, D]` sources into `[B, S, D]` by one learned pseudo-query.
 

@@ -15,17 +15,12 @@ import sys
 import time
 
 import pytest
+from test_examples import load_example
 
-from dew.objectives.rl import (
-    CodeReward,
-    ContainerRunner,
-    MathReward,
-    Program,
-    SandboxFleet,
-    SandboxLimits,
-    Verdict,
-    code_block,
-)
+from dew.rl.sandbox import ContainerRunner, MathReward, Program, SandboxFleet, SandboxLimits, Verdict
+
+RLVR = load_example("train_rlvr")
+CodeReward, code_block = RLVR.CodeReward, RLVR.code_block
 
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="the fleet's limits are Linux process limits")
 

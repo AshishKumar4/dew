@@ -1,49 +1,38 @@
 """DeepSeek V4's attention: shared-KV MQA over a sliding window, extended by
 a compressor.
 
-The reference is transformers 5.16.1
-`models/deepseek_v4/modeling_deepseek_v4.py`, read as the specification.
-Every layer is one attention (`DeepseekV4Attention`, :746-864). The query is
-low-rank and normed per head without a weight. One key/value head is shared
-by every query head. Rotary positions turn the trailing `rope_head_dim` of
-each head in interleaved pairs. A learned sink sits beside the logits. The
-values are the rotated keys, so the output is de-rotated at the query's
-position after the softmax. The output projection is grouped and low-rank.
+The reference is transformers 5.16.1 `models/deepseek_v4/modeling_deepseek_v4.py`
+(`DeepseekV4Attention`, :746-864). The query is low-rank and normed per head
+without a weight, one key/value head serves every query head, rotary turns
+the trailing `rope_head_dim` of each head in interleaved pairs, a learned
+sink sits beside the logits, the values are the rotated keys (so the output
+is de-rotated at the query's position), and the output projection is grouped
+and low-rank.
 
-A sliding layer attends the last `sliding_window` positions,
-its own included (masking_utils sliding_window_overlay). A compressed layer
-concatenates onto those keys the entries its compressor emits, one per
-window of `compress_rate` tokens (:353-435 the heavily compressed HCA
-branch, :580-693 the compressed sparse CSA branch with its lightning
-indexer, :437-578), and a per-query bias says which entries a query may
-attend: HCA every entry whose window closed before the query, CSA the
-indexer's top-k of those.
+A sliding layer attends the last `sliding_window` positions, its own
+included. A compressed layer adds the entries its compressor emits, one per
+window of `compress_rate` tokens (HCA :353-435, CSA :580-693 with its
+indexer :437-578), with a per-query bias: HCA attends every entry whose
+window closed before the query, CSA the indexer's top-k of those. A trailing
+partial window emits nothing outside a cache (:398, :630) and is buffered
+inside one; cached calls never reproject old hidden states (:209-291).
 
-The compressors emit no entry for a trailing partial window: the reference
-drops it outside a cache (:398, :630) and buffers it inside one. Cached
-calls keep projected incomplete windows, CSA's preceding Ca window and
-completed rotated entries (:209-291); no old hidden state is reprojected.
-
-DeepSeek-V4.1-Flash replaces CSA and HCA with CSA2 (arXiv 2609.19969,
-section 2.3; the release's inference/model.py at the revision
+DeepSeek-V4.1-Flash replaces CSA and HCA with CSA2 (arXiv 2609.19969, section
+2.3; the release's inference/model.py at the revision
 tools/deepseek_v41_reference.py pins, cited as v41:line). Its compressor
-pools non-overlapping windows with no position bias, in fp32, and at rate 1
-is the normed projection alone (v41:429-485). Its indexer projects its keys
-from the compressor's normed latent before RoPE rather than compressing its
-own (v41:488-580). The main KV and the index keys are shared across layers,
-and so are the selections (section 2.3.1): a Full layer computes both and
-its selection, a Reindex layer rescores the latest keys with its own
-queries, and a Reuse layer attends the latest selection over the latest
-entries (v41:613-763). What a layer publishes goes into the kv_store the
-block threads down the stack, under the `_CSA2_*` names. The first Full layer
-of the decoder also builds a candidate pool of the best-scoring blocks,
-within which the later Reindex layers search (section 2.3.2, v41:583-610).
-The query is not normed per head (v41:770-772), and quantization-aware
-training rounds the cache as the release stores it (section 2.4.4): the
-window keys through FP8 E4M3 per 32 channels under power-of-two scales, the
-compressed entries through FP4 E2M1 per 16 under E4M3 scales, and the index
-queries and keys through FP4 per 32 under power-of-two scales, each after
-its RoPE and each passing its gradient straight through (v41:545-552,
+pools non-overlapping windows without position bias in fp32, and at rate 1
+is the normed projection alone (v41:429-485). Its indexer projects keys from
+the compressor's latent before RoPE (v41:488-580). KV, index keys and
+selections are shared across layers through the kv_store (`_CSA2_*`): a Full
+layer computes all three, a Reindex layer rescores the latest keys, a Reuse
+layer attends the latest selection (v41:613-763), and the first Full layer
+builds the candidate pool later Reindex layers search (section 2.3.2,
+v41:583-610). The query is not normed per head (v41:770-772), and
+quantization-aware training rounds the cache as the release stores it
+(section 2.4.4), each rounding after its RoPE with a straight-through
+gradient: window keys through FP8 E4M3 per 32 channels with power-of-two
+scales, compressed entries through FP4 E2M1 per 16 with E4M3 scales, index
+queries and keys through FP4 per 32 with power-of-two scales (v41:545-552,
 :705-707, :759-760; kernel.py:40-204).
 """
 
@@ -245,22 +234,16 @@ class GroupedLinear(nn.Module):
 
 class CompressedEntries(nn.Module):
     """The projections behind a compressor's entries: `kv_proj` and
-    `gate_proj` into the entry width (twice it for the two-series CSA
-    layout), the position bias, and the entry norm; `entries` pools the
-    windows and rotates each entry at its window's first position, `w *
-    rate` (modeling_deepseek_v4.py:375-413, :603-671).
+    `gate_proj` into the entry width (twice it for the two-series CSA layout),
+    the position bias and the entry norm; `entries` pools the windows and
+    rotates each entry at its window's first position, `w * rate`
+    (modeling_deepseek_v4.py:375-413, :603-671). The indexer's compressor sits
+    under `compressor/indexer`, as the checkpoint nests it
+    (conversion_mapping.py:487).
 
-    Both the layer's compressor and the indexer's own compressor are one of
-    these under their checkpoint names; the indexer's sits under
-    `compressor/indexer` with its scoring leaves beside them, the nesting
-    the checkpoint keeps (conversion_mapping.py:487).
-
-    V4.1's compressor (v41:429-485) differs in two facts: it has no position
-    bias (`position_bias` False), and it pools in fp32 (`pool_dtype`), back
-    in the model's dtype before the norm. A window of one token pools
-    nothing, so at rate 1 there is no gate and the normed projection is the
-    entry; V4's rates are 4 and 128. `quantized` rounds the rotated entries
-    through FP4 as V4.1's cache stores them (v41:759-760).
+    V4.1's compressor (v41:429-485) has no position bias and pools in fp32
+    (`pool_dtype`); at rate 1 there is no gate and the normed projection is the
+    entry. `quantized` rounds the rotated entries through FP4 (v41:759-760).
     """
 
     width: int
@@ -379,7 +362,6 @@ class IndexScorer(nn.Module):
     modeling_deepseek_v4.py:437-450)."""
 
     n_heads: int
-    head_dim: int
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
@@ -405,12 +387,9 @@ def _index_scores(query, keys, weights, precision=None):
 
 class LightningIndexer(CompressedEntries):
     """CSA's lightning indexer: its own compressor at `head_dim` over the same
-    windows (the inherited projections), queries from the query residual,
-    and the V3.2 score (modeling_deepseek_v4.py:453-578).
-
-    The indexer reads its inputs detached, as V3.2's does: the top-k is a
-    selection the main loss cannot reach, and no indexer loss is trained
-    here (the reference trains none either).
+    windows, queries from the query residual, and the V3.2 score
+    (modeling_deepseek_v4.py:453-578). It reads its inputs detached and trains
+    no loss, as the reference's.
     """
 
     n_heads: int = 1
@@ -424,8 +403,8 @@ class LightningIndexer(CompressedEntries):
         super().setup()
         self.q_b_proj = nn.Dense(self.n_heads * self.width, use_bias=False,
                                  dtype=self.dtype, precision=self.precision, name='q_b_proj')
-        self.scorer = IndexScorer(n_heads=self.n_heads, head_dim=self.width,
-                                  dtype=self.dtype, precision=self.precision, name='scorer')
+        self.scorer = IndexScorer(n_heads=self.n_heads, dtype=self.dtype, precision=self.precision,
+                                  name='scorer')
 
     def select(self, x, q_resid, positions, cos, sin, cache=None):
         """The entries each query attends: `[B, S, T]`, bool.
@@ -475,12 +454,9 @@ class Compressor(CompressedEntries):
 
 class Csa2Indexer(nn.Module):
     """CSA2's indexer (v41:488-580): queries from the query residual, scored
-    against index keys a Full layer projects from its compressor's latent
-    (`wk`, `k_norm`), which the other layers read from the store. The leaves
-    keep the release's names, which are V3.2's indexer's.
-
-    Like V4's it reads its inputs detached: the selection is out of the
-    main loss's reach, and the reference trains no indexer loss here.
+    against index keys a Full layer projects from its compressor's latent (`wk`,
+    `k_norm`) and the other layers read from the store, under V3.2's leaf names.
+    It reads its inputs detached and trains no loss, as the reference's.
     """
 
     n_heads: int
@@ -554,22 +530,14 @@ def _published(kv_store, name: str, layer: str):
 class DeepseekV4Attention(nn.Module):
     """One V4 attention layer, sliding or compressed (see the module doc).
 
-    `compressor` is None for a sliding layer, 'hca' or 'csa' otherwise, with
-    `compress_rate` its window; a CSA layer needs the indexer's
-    `index_n_heads`, `index_head_dim` and `index_topk`. `rope_theta` and
-    `yarn` are the layer's rope (the main one on a sliding layer, the
-    compress one otherwise), which the compressor and indexer share.
-    Compressed windows follow the physical row, not document boundaries.
-    Packed documents are refused rather than allowing a pooled entry to
-    carry information across segments.
-
-    'csa2' is V4.1's (see the module doc): `kv_shared` makes it a Reuse
-    layer, `reindex` a Reindex one, and otherwise it is a Full layer.
-    `candidates` 'source' makes a Full layer build the candidate pool of
-    `candidate_blocks` blocks of `candidate_block_size` entries, and
-    'restrict' makes a Reindex layer search within it. `query_norm` is V4's
-    per-head query norm, which V4.1 drops, and `kv_qat` V4.1's rounding of
-    the cache and the indexer through FP8 and FP4.
+    `compressor` is None, 'hca', 'csa' or V4.1's 'csa2', with `compress_rate`
+    its window; CSA needs `index_n_heads`, `index_head_dim` and `index_topk`.
+    `rope_theta` and `yarn` are the layer's rope, shared by its compressor and
+    indexer. Compressed windows follow the physical row, so packed documents
+    are refused. For 'csa2', `kv_shared` makes a Reuse layer and `reindex` a
+    Reindex one, else a Full layer; `candidates` 'source' builds the candidate
+    pool and 'restrict' searches it. `query_norm` is V4's per-head query norm,
+    and `kv_qat` V4.1's FP8/FP4 rounding.
     """
 
     emb_features: int
@@ -851,17 +819,13 @@ class DSparkAttention(DeepseekV4Attention):
     a sliding V4 layer whose keys are the target's context and the draft
     block's own.
 
-    `kv_store[DRAFT_CONTEXT]` `[B, M, D]` is the target model's context for
-    the positions up to the one the block drafts after, and
-    `kv_store[DRAFT_VALID]` `[B, M]`, when present, which of them are real;
-    this layer projects the context's keys with its own `kv_proj` into a
-    sliding window. `x` `[B, K, D]` is the draft block at the `K` positions
-    after the context's last, whose queries attend that window and every
-    key of the block, the block's own included in both directions. Cached,
-    each call appends the real context positions to the window cache, and
-    a block of no tokens only does that (the release's prefill); a call
-    without context drafts after what the cache holds. Uncached, the
-    context is whole and the block follows its last position.
+    `kv_store[DRAFT_CONTEXT]` `[B, M, D]` is the target's context up to the
+    drafting position and `kv_store[DRAFT_VALID]` `[B, M]` which of it is real;
+    its keys come through this layer's `kv_proj` into a sliding window. The
+    block `x` `[B, K, D]` attends that window and all of itself, both
+    directions. Cached, each call appends the real context to the window cache
+    (an empty block only does that, the release's prefill), and a call without
+    context drafts after the cache; uncached, the context is whole.
     """
 
     @nn.compact
@@ -919,23 +883,14 @@ class DSparkAttention(DeepseekV4Attention):
 class DeepseekV4Mixer(MixerBase):
     """The `deepseek_v4` kind, by the config's field names.
 
-    The model names the sliding layer (`compressor` None); the two
-    compressed kinds name their `compressor` ('csa' or 'hca') and its
-    `compress_rate` on their `LayerKind.mixer`, with the indexer's three
-    fields on the csa kind. The window is the context's `sliding_window`
-    (every V4 layer has one), the rope base and YaRN ramp the context's
-    kind-resolved ones, and `rope_head_dim` the rotated slice
-    (`head_dim * partial_rotary_factor`). The context's `num_kv_heads`,
-    `qk_norm`, `v_norm`, `k_eq_v`, `kv_shared`, `attention_scale`,
-    `partial_rotary_factor`, `output_gate` and `attention_sinks` are the
-    standard attention's dials and are not read: V4's single KV head,
-    unweighted query norm, sinks and de-rotated values are the layer's own.
-
-    V4.1's kinds name `compressor` 'csa2'. A Reuse layer is one the model
-    lists in `kv_shared_layers` (the context's `kv_shared`), in the kind of
-    the Full layer before it; `reindex` names the Reindex kind, and
-    `candidates` the candidate pool's role. `query_norm` False and `kv_qat`
-    True are V4.1's query and quantization-aware cache.
+    The compressed kinds name `compressor` ('csa', 'hca' or V4.1's 'csa2') and
+    `compress_rate` on their `LayerKind.mixer`, the csa kind the indexer's three
+    fields. The window, rope base and YaRN ramp are the context's, and
+    `rope_head_dim` the rotated slice. The context's standard attention dials
+    (`num_kv_heads`, the norms, `kv_shared` outside CSA2, sinks and scales) are
+    not read. A V4.1 Reuse layer is one listed in `kv_shared_layers`, in the
+    kind of the Full layer before it; `reindex` names the Reindex kind and
+    `candidates` the pool's role.
     """
 
     q_lora_rank: int = 1024

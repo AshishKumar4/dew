@@ -189,8 +189,8 @@ def test_a_version_named_beside_a_resolved_path_is_an_identity_constraint():
 
 
 def test_a_builder_config_or_version_the_prepared_data_does_not_hold_is_refused():
-    for options, message in (({"config": "nope"}, "no 'nope' config"),
-                             ({"version": "9.9.9"}, "no version '9.9.9'")):
+    for options, message in (({"config": "nope"}, "no prepared 'dew_images' config 'nope'"),
+                             ({"version": "9.9.9"}, "no prepared 'dew_images' version '9.9.9'")):
         with pytest.raises(FileNotFoundError, match=message):
             dew.data.load("tfds/dew_images", batch=4,
                           options=TFDSOptions(path=str(FIXTURES), **options))

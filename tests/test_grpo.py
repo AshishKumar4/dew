@@ -19,6 +19,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
+from steady_state import steady_state
 from test_rl_surrogate import clipped_surrogate, token_mean
 
 from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY
@@ -312,3 +313,29 @@ def test_the_rollout_batch_feeds_the_objective():
     assert np.isfinite(float(loss))
     assert rolled[IDS_KEY].shape == (4, width + RESPONSE_WIDTH)
     assert set(aux.metrics) >= {"pg", "kl"}
+
+
+def test_a_rollout_after_the_first_reuses_its_programs_and_reads_only_what_it_scores():
+    """Sampling a group of the same prompt width again runs the programs the
+    first rollout compiled, and the host reads the drawn rows and the group
+    advantages by name and nothing else (`steady_state`). The prompts reach
+    the device as each batch arrives, so only reads are held."""
+    objective = GRPOObjective(TinyHead(vocab_size=VOCAB), PROMPT_WIDTH + RESPONSE_WIDTH - 1, beta=0.01)
+    state = SimpleNamespace(params=objective.init(jax.random.key(0)), updates=0)
+    rollout = SampledRollout(objective, lambda *args: float(len(args[0]) % 3), groups=2,
+                             max_new_tokens=RESPONSE_WIDTH, sampling=Sampling(temperature=1.0))
+    info = len("other")
+    pad = lambda text: np.pad(np.frombuffer(text.encode(), np.uint8).astype(np.int32), (0, info - len(text)))
+
+    def batch(offset):
+        rows = np.arange(PROMPT_WIDTH, dtype=np.int32)[None] + np.arange(2)[:, None] + offset
+        prompts = rows % (VOCAB - 1) + 1
+        return {PROMPT_KEY: prompts, LENGTH_KEY: np.full(2, PROMPT_WIDTH, np.int32),
+                SOURCE_KEY: np.stack([pad("rule"), pad("other")]), TRUTH_KEY: np.stack([pad("1"), pad("2")]),
+                INFO_KEY: np.stack([pad(""), pad("")])}
+
+    keys = [jax.random.key(index) for index in range(3)]
+    rollout(state, batch(0), keys[0])
+    with steady_state(allow=("host_to_device",)):
+        rolled = [rollout(state, batch(offset), key) for offset, key in zip((1, 2), keys[1:], strict=True)]
+    assert all(rows[IDS_KEY].shape == (4, PROMPT_WIDTH + RESPONSE_WIDTH) for rows in rolled)
