@@ -19,7 +19,7 @@ from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple, Self, cast
+from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple, Self
 
 import jax
 import jax.numpy as jnp
@@ -347,10 +347,10 @@ class Pretrained:
         else:
             raise TypeError(f"{type(model).__name__} has no maintained exported bundle layout; "
                             "load diffusion runs with TextToImage.from_run")
-        if cls is not Pretrained and not isinstance(bundle, cls):
+        if not isinstance(bundle, cls):
             raise TypeError(f"{directory} is a {type(bundle).__name__} source, not a {cls.__name__}; "
                             f"load it with {type(bundle).__name__}.from_run or Pretrained.from_run")
-        return cast(Self, bundle)
+        return bundle
 
     @classmethod
     def load(cls, name_or_dir: str | Path, *, dtype: DTypeLike = jnp.bfloat16,
