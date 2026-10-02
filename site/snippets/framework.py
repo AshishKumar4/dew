@@ -111,7 +111,7 @@ def sample_public(out, smoke):
     from dew.sampling import CFG, DPMSolverMultistep, TextToImage
     pipe = TextToImage.from_pretrained("dewml/hybrid-dit-176m")
     result = pipe(["green and purple northern lights over a frozen lake"],
-                  seed=5, steps=20, sampler=DPMSolverMultistep(), guidance=CFG(5))
+                  key=5, steps=20, sampler=DPMSolverMultistep(), guidance=CFG(5))
     result.pil()[0].save(out / "sample.png")
     # End snippet: sample-public
     assert (out / "sample.png").is_file()
@@ -188,7 +188,7 @@ def pretrained(out, smoke):
         prompt = "The capital of France is"
         training_tokens = np.asarray(bundle.processor("The capital of France is Paris.").tokens[:, :9], np.int32)
     data = Dataset(train=lambda partition: itertools.repeat({"text": training_tokens}), val=None, records=1, batch=1)
-    text = task(prompt, 12, seed=0).text
+    text = task(prompt, 12, key=0).text
     # Begin snippet: finetune
     objective = bundle.lm_objective(seq_len=training_tokens.shape[1] - 1, ema_decay=None)
     trainer = Trainer(objective, optax.sgd(1e-5), key=jax.random.key(0))
@@ -214,7 +214,7 @@ def serving(out, smoke):
     # Begin snippet: serving
     task = bundle.text_generation(sampling=Sampling(temperature=0))
     server = Server.from_task(task, slots=4, capacity=128)
-    results = server(prompts, 24, seed=0)
+    results = server(prompts, 24, key=0)
     print([result.text[0] for result in results])
     # End snippet: serving
     # Begin snippet: int8
@@ -226,7 +226,7 @@ def serving(out, smoke):
     # End snippet: fp8
     for variant in (int8, fp8):
         quantized = Server.from_task(variant, slots=4, capacity=128)
-        assert len(quantized(["dew"], 2, seed=0)) == 1
+        assert len(quantized(["dew"], 2, key=0)) == 1
     return {"source": source, "prompts": prompts, "text": [result.text[0] for result in results],
             "weight_formats": ["int8", "fp8"]}
 
