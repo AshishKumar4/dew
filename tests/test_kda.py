@@ -166,7 +166,8 @@ def layer_and_params(lower_bound):
     module = KimiDeltaAttention(emb_features=E, num_heads=H, head_dim=D, conv_kernel=K,
                                 lower_bound=lower_bound, chunk_size=4, norm_eps=1e-5)
     rng = np.random.RandomState(3)
-    dense = lambda rows, cols: rng.randn(rows, cols) / np.sqrt(rows)
+    def dense(rows, cols):
+        return rng.randn(rows, cols) / np.sqrt(rows)
     params = {
         "q_proj": dense(E, H * D), "k_proj": dense(E, H * D), "v_proj": dense(E, H * D),
         **{name: rng.randn(H * D, 1, K) * 0.5 for name in ("q_conv1d", "k_conv1d", "v_conv1d")},

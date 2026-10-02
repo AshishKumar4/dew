@@ -281,7 +281,8 @@ def model_variables(case: Case):
     """The case's variables as shapes."""
     model = models.build(case.architecture, **case.config)
     rng = jax.random.key(0)
-    init = lambda *args: jax.eval_shape(model.init, *args)
+    def init(*args):
+        return jax.eval_shape(model.init, *args)
     if case.is_lm:
         return init(rng, jnp.ones((1, case.seq_len), jnp.int32))
     sample = jnp.ones((1, *case.sample_shape), jnp.float32)

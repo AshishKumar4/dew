@@ -386,10 +386,8 @@ def test_a_packed_pass_covers_every_document_once_at_every_process_count(tmp_pat
     whole = [row for batch in pass_over(DataPartition()) for row in windows_of([batch])[0]]
 
     for processes in (2, 4):
-        shards = []
-        for index in range(processes):
-            shards.append([row for batch in pass_over(DataPartition(index, processes))
-                           for row in windows_of([batch])[0]])
+        shards = [[row for batch in pass_over(DataPartition(index, processes))
+                   for row in windows_of([batch])[0]] for index in range(processes)]
         assert sum(len(shard) for shard in shards) == len(whole)
         assert sorted(row for shard in shards for row in shard) == sorted(whole)
 
@@ -493,7 +491,7 @@ def test_a_run_of_one_mixture_resumes_into_phases_that_begin_with_it(tmp_path):
     """Resuming onto a changed mixture is refused, but resuming onto a phase
     list whose first phase is the run's mixture, with a boundary it has not
     passed, is the same run with a switch ahead of it, at any process count."""
-    spec, first, second = weighted_packed(tmp_path, (1.0, 1.0))
+    _spec, first, second = weighted_packed(tmp_path, (1.0, 1.0))
     both = {first: 1.0, second: 1.0}
     plain = PackedTokens(path=first, seq_len=8, val_batches=None, packing_bins=2, loading=READ)
     stopped = plain.load(batch=4).train(DataPartition())

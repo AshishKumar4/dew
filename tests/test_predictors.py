@@ -39,7 +39,7 @@ def test_forward_backward_roundtrip(tname, transform, sname, schedule, steps, rn
     noise = jax.random.normal(key1, (4, 8, 8, 3))
     rates = broadcast_rates(schedule, steps, x0)
 
-    xt, c_in, target = transform.forward_diffusion(x0, noise, rates)
+    xt, _c_in, target = transform.forward_diffusion(x0, noise, rates)
     # A model that outputs the exact target must recover x0 and noise
     recovered_x0, recovered_noise = transform.backward_diffusion(xt, target, rates)
 

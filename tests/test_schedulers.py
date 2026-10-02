@@ -218,7 +218,8 @@ def test_cosine_table_is_nichol_and_dhariwals_cumulative_alpha():
     T, s = 1000, 0.008
     schedule = CosineNoiseScheduler(T, beta_start=s)
     index = jnp.array([0, 10, 300, 600, 900])
-    f = lambda u: jnp.cos((u / T + s) / (1 + s) * jnp.pi / 2) ** 2
+    def f(u):
+        return jnp.cos((u / T + s) / (1 + s) * jnp.pi / 2) ** 2
     expected = f(index + 1.0) / f(0.0)
     assert jnp.allclose(schedule.rates(index)[0] ** 2, expected, rtol=1e-4)
 

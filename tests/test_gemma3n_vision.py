@@ -166,8 +166,9 @@ def test_the_layout_and_muon_read_the_towers_declared_axes():
 
     # Optax's spec is itself a pytree node, so its own fields would flatten
     # away; None is the AdamW group the norms and the biases belong to.
-    is_spec = lambda leaf: leaf is None or isinstance(
-        leaf, optax.contrib.MuonDimensionNumbers)
+    def is_spec(leaf):
+        return leaf is None or isinstance(
+            leaf, optax.contrib.MuonDimensionNumbers)
     numbers = muon_weight_dimension_numbers(tower)
     matrices = [(jax.tree_util.keystr(path), leaf) for path, leaf
                 in jax.tree_util.tree_flatten_with_path(numbers, is_leaf=is_spec)[0]

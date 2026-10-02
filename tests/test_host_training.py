@@ -571,7 +571,7 @@ def test_frozen_leaves_stay_resident_and_snapshots_alias_them():
 
     objective = LMObjective(decoder(scan_layers=True), 8, head_chunks=1, trainable=trainable)
     trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(5), layout=HOST)
-    state, placement, _ = trainer.place()
+    state, _placement, _ = trainer.place()
     frozen = state.params[FROZEN]
     for path, leaf in _named_leaves(frozen):
         assert leaf.sharding.mesh == trainer.device_mesh, path

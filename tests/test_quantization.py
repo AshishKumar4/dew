@@ -798,7 +798,7 @@ def test_a_quantized_pipeline_has_finite_loss_and_gradients():
                 jax.value_and_grad(loss, has_aux=True))(placed["params"])
         return float(value), jax.tree.map(np.asarray, grads)
 
-    loss, grads = run(MeshSpec(fsdp=8))
+    loss, _grads = run(MeshSpec(fsdp=8))
     piped, piped_grads = run(MeshSpec(fsdp=4, stage=2, microbatches=2))
     assert np.isfinite(loss) and np.isfinite(piped)
     assert all(np.isfinite(leaf).all() for leaf in jax.tree.leaves(piped_grads))

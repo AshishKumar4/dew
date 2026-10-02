@@ -78,7 +78,8 @@ def moment_owners(group_state, params):
     """
     wanted = leaf_paths(params)
     owned = set()
-    is_leaf = lambda leaf: isinstance(leaf, optax.MaskedNode)
+    def is_leaf(leaf):
+        return isinstance(leaf, optax.MaskedNode)
     for path, leaf in jax.tree_util.tree_flatten_with_path(
             group_state, is_leaf=is_leaf)[0]:
         if is_leaf(leaf):

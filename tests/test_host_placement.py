@@ -230,7 +230,7 @@ def test_a_bank_holds_the_layers_a_checkpoint_stores(tmp_path):
 def test_a_layout_offloads_only_the_layers_it_names():
     """Banks the patterns do not name stay on the device, and a stack split
     between the two places computes what the resident one computes."""
-    plain, scanned, variables, tokens = pair(num_layers=4, bank_layers=2)
+    _plain, scanned, variables, tokens = pair(num_layers=4, bank_layers=2)
     selected = Layout(min_shard=1, tolerance=1.0,
                       host_parameters=("params/layers_0", "params/layers_1"))
     resident = host_banked(scanned, HeldBanks(variables), layout=DEVICE)
@@ -482,8 +482,7 @@ def run_pool(directory: Path, processes: int, devices: int, **flags) -> list[dic
             stderr=subprocess.STDOUT, text=True, start_new_session=True))
     logs = []
     try:
-        for process in running:
-            logs.append(process.communicate(timeout=600)[0])
+        logs.extend(process.communicate(timeout=600)[0] for process in running)
     finally:
         for process in running:
             if process.poll() is None:

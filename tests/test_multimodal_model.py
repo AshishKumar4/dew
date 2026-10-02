@@ -111,7 +111,7 @@ def test_trainer_update_exports_and_reloads_the_complete_model(source, tmp_path)
 
 
 def test_model_inputs_alignment_preserves_media_identity(source):
-    loaded, inputs = source
+    _loaded, inputs = source
     padding = (~inputs.token_fields["attention_mask"]).sum(axis=1)
     aligned = jax.jit(lambda value: value.align_left(padding).take_rows(jnp.array([1, 0])))(inputs)
     np.testing.assert_array_equal(aligned.conditioning["pixel_values"], inputs.conditioning["pixel_values"][jnp.array([1, 0])])

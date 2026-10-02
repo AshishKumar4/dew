@@ -582,7 +582,8 @@ def mode_fit(args) -> dict:
         loader = indexed_loader(args.records, rows)
         if args.block_after:
             loader = BlockUntilKilled(loader, args.block_after, Path(args.marker))
-        open_train = lambda partition: iter(loader)
+        def open_train(partition):
+            return iter(loader)
     val, available = None, None
     scored = []
     evaluate = trainer.objective.evaluate
@@ -1264,7 +1265,7 @@ def _rejected_inputs(model, state, local, rollout, sampling, inputs_for, rank) -
     captured = None if rank == 0 else object()
 
     def rewrite(state, logits):
-        return logits if captured is None else logits
+        return jax.lax.select(captured is None, logits, logits)
 
     for fault in ("token", "length", "key", "component"):
         broken = {name: np.array(value, copy=True) for name, value in local.items()}

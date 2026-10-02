@@ -107,7 +107,7 @@ def test_an_mxfp4_gpt_oss_checkpoint_loads_through_the_dequantization(tmp_path):
     tensors = load_file(str(GPT_OSS / "model.safetensors"))
     packed = {}
     for name, tensor in tensors.items():
-        if not (name.endswith("gate_up_proj") or name.endswith("down_proj")):
+        if not (name.endswith(("gate_up_proj", "down_proj"))):
             packed[name] = tensor
             continue
         blocks, scales = (np.asarray(part) for part in quantize_mxfp4(jnp.asarray(tensor)))

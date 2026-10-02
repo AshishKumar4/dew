@@ -133,7 +133,7 @@ def test_waveforms_condition_text_logits_like_the_reference_model(wrapper):
 def test_greedy_continuation_follows_the_reference(wrapper):
     reference, tokens, valid, features, feature_mask = _inputs(wrapper)
     generated = reference["generated"]
-    for step in range(generated.shape[1] - tokens.shape[1]):
+    for _step in range(generated.shape[1] - tokens.shape[1]):
         error, logits = jax.jit(checkify.checkify(wrapper.logits))(
             wrapper.variables(), tokens, valid, features, feature_mask)
         error.throw()
