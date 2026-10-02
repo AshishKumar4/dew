@@ -6,9 +6,10 @@ Each model here is a line-by-line port of the Dew module it is compared with
 (src/dew/nn/backbones/{causal_transformer,dit,unet}.py and the objectives),
 including every dtype cast Dew makes: fp32 master parameters cast to bf16 at
 each use, RMSNorm/LayerNorm statistics in fp32, RoPE in fp32, softmax in fp32,
-the fp32 (TF32) output head, the fp32 loss, Adam with Optax's constants, an
-EMA copy of every parameter updated each step, and the finiteness check on the
-loss. Diffusion cases use fixed NumPy image, CFG-mask, timestep, and noise
+the output head's product in the compute dtype with fp32 logits
+(`--head-dtype float32` is the TF32 head Dew ran before), the fp32 loss,
+Adam with Optax's constants, an EMA copy of every parameter updated each
+step, and the finiteness check on the loss. Diffusion cases use fixed NumPy image, CFG-mask, timestep, and noise
 tensors. The paired JAX benchmark uses the same byte values, so the
 comparison is between frameworks, not between JAX threefry and PyTorch
 Philox. The measured step is otherwise the whole of the Trainer's train
@@ -270,9 +271,10 @@ class DecoderBlock(nn.Module):
 
 
 class CausalTransformer(nn.Module):
-    """Tied embeddings, swiglu, qk RMSNorm, rotary positions, fp32 head."""
+    """Tied embeddings, swiglu, qk RMSNorm, rotary positions, the head in
+    the compute dtype with fp32 logits."""
 
-    def __init__(self, cfg, attention, head_dtype=F32):
+    def __init__(self, cfg, attention, head_dtype=BF16):
         super().__init__()
         d, L, H = cfg['emb_features'], cfg['num_layers'], cfg['num_heads']
         head_dim = d // H
@@ -293,7 +295,8 @@ class CausalTransformer(nn.Module):
         for layer in self.layers:
             x = layer(x, cos, sin)
         x = self.norm(x)
-        # fp32 head over the tied fp32 table (TF32 on this card, as XLA's default)
+        # The head's product in head_dtype over the tied fp32 table, as Dew's
+        # LM objective forms it under bf16 compute; the softmax and loss stay fp32.
         return torch.matmul(x.to(self.head_dtype), self.embed_tokens.to(self.head_dtype).t()).float()
 
 
@@ -816,8 +819,8 @@ def _arguments() -> argparse.Namespace:
                     choices=['eager', 'compile', 'max-autotune', 'max-autotune-no-graphs'])
     ap.add_argument('--attention', default='reference', choices=['reference', 'sdpa'])
     ap.add_argument('--sdpa-backend', default='flash', choices=['flash', 'cudnn', 'efficient', 'math'])
-    ap.add_argument('--head-dtype', default='float32', choices=['float32', 'bfloat16'],
-                    help='causal_transformer output head dtype (Dew: float32)')
+    ap.add_argument('--head-dtype', default='bfloat16', choices=['float32', 'bfloat16'],
+                    help="causal_transformer output head's product dtype (Dew: the compute dtype)")
     ap.add_argument('--no-ema', action='store_true', help='skip the EMA update Dew makes every step')
     ap.add_argument('--no-metrics', action='store_true', help='skip perplexity/token accuracy (LM aux)')
     ap.add_argument('--no-optimizer', action='store_true', help='forward+backward only')
