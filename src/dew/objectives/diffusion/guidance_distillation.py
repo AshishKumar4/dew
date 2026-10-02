@@ -24,7 +24,7 @@ from dew.inputs import InputSpec, unit_range
 from dew.objectives.base import Aux, Ratio, Step, Variables
 from dew.registry import objectives
 
-from .objective import TEACHER, DiffusionObjective
+from .objective import TEACHER, DiffusionObjective, _own_loss
 
 
 def with_guidance(conditions: dict, scale: jax.Array) -> dict:
@@ -62,11 +62,7 @@ class GuidanceDistillationObjective(DiffusionObjective):
                 or type(teacher.process.prediction) is not type(process.prediction)):
             raise ValueError("guidance distillation regresses onto the teacher's raw output, so the "
                              "two share the process's schedule and prediction")
-        unused = sorted(
-            key for key in ("uncertainty", "alignment", "end_to_end") if kwargs.get(key) is not None
-        )
-        if unused:
-            raise ValueError(f"guidance distillation trains on its own loss, which reads none of {unused}")
+        _own_loss("guidance distillation", kwargs)
         kwargs.setdefault("guidance", None)
         super().__init__(model, process, inputs, **kwargs)
         if teacher.latent_shape != self.latent_shape:

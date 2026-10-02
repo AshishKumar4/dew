@@ -54,14 +54,14 @@ FSDP_AXIS = 'fsdp'
 TENSOR_AXIS = 'tensor'
 SEQUENCE_AXIS = 'sequence'
 STAGE_AXIS = 'stage'
-"""The axes of a mesh `dew.training.build_mesh` builds, plus the stage axis a
+"""The axes of a mesh `MeshSpec.build` builds, plus the stage axis a
 pipeline mesh adds. They are named here because the attention seam and the
 decoder read them off the mesh in context: the sequence axis attention splits
 its queries over, and the tensor and stage axes, which hold a width and a
 pipeline stage and never a row."""
 
 MESH_AXES = (DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS, SEQUENCE_AXIS, STAGE_AXIS)
-"""Every mesh's axes, in the order `dew.training.build_mesh` lays them out."""
+"""Every mesh's axes, in the order `MeshSpec.build` lays them out."""
 
 BATCH_AXES = (DATA_AXIS, EXPERT_AXIS, FSDP_AXIS)
 """The mesh axes a batch's rows split over, in mesh order. Sequence holds a

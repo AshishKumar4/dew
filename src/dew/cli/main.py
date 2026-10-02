@@ -21,10 +21,7 @@ from dew.cli import tpu
 from dew.cli.gcloud import emit
 from dew.cli.launch import Launch
 
-CONFIG = (
-    tyro.conf.FlagCreatePairsOff,
-    tyro.conf.PositionalMetavarFromFieldName,
-)
+CONFIG = tpu.CONFIG
 Positional = tyro.conf.Positional
 
 

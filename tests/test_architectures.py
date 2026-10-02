@@ -39,7 +39,7 @@ from dew.objectives.jepa import JepaObjective, multi_block_mask
 from dew.objectives.lm import LMObjective
 from dew.registry import metrics, models
 from dew.sampling import CFG, Euler
-from dew.training import Checkpoints, Layout, MeshSpec, Trainer, build_mesh
+from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 
 RES = 16
 FRAMES = 2
@@ -466,7 +466,7 @@ def test_every_architecture_shards_within_the_tolerance_at_every_width(case, fsd
     run is quietly training a replicated model on every device.
     """
     variables = model_variables(case)
-    mesh = build_mesh(MeshSpec(fsdp=fsdp_size))
+    mesh = MeshSpec(fsdp=fsdp_size).build()
     layout = Layout(min_shard=TINY_SHARD)
     shardings = layout.shardings(mesh, variables)
     specs = jax.tree.map(lambda sharding: sharding.spec, shardings)

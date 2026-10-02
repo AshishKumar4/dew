@@ -30,7 +30,7 @@ from absl import flags  # noqa: E402
 flags.FLAGS.mark_as_parsed()
 
 from dew.data import DatasetSpec, OxfordFlowers  # noqa: E402
-from dew import datasets  # noqa: E402  naming a registry fills it
+from dew.registry import datasets  # noqa: E402
 
 if TYPE_CHECKING:
     # tyro reads the runtime annotation, a Union of the registered specs, and
@@ -85,10 +85,11 @@ def main(config: Benchmark) -> None:
     dataset = config.data.load(batch=config.batch)
     print(f"{datasets.name_of(type(config.data))}: {dataset.records} records, "
           f"batch {dataset.batch} across every process")
-    from dew.training import build_mesh, data_partition
+    from dew.data import DataPartition
+    from dew.training import MeshSpec
 
     # The share this process reads on the plain data-parallel mesh.
-    source = dataset.train(data_partition(build_mesh()))
+    source = dataset.train(DataPartition.of(MeshSpec().build()))
     try:
         report(measure(source, config.steps, config.warmup), dataset.batch)
     finally:

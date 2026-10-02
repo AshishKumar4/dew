@@ -13,9 +13,10 @@ import jax
 import numpy as np
 import optax
 
-from dew import Dataset, Trainer, models
+from dew import Dataset, Trainer
 from dew.data import ByteTokenizer
 from dew.inference import RunProcessor
+from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective
 from dew.sampling import Sampling
 
@@ -25,9 +26,9 @@ ids = np.array(tokenizer.encode("One day, Lily saw a big dog in the park. "
 rows = np.stack([ids[i:i + 65] for i in range(0, 16 * 64, 64)])
 data = Dataset(train=lambda partition: iter([{"text": rows}] * 200), val=None,
                records=16, batch=16)
-model = models.build("causal_transformer", vocab_size=tokenizer.vocab_size,
-                     emb_features=64, num_layers=2, num_heads=2, mlp_features=256,
-                     max_seq_len=128)
+model = CausalTransformer(vocab_size=tokenizer.vocab_size,
+                          emb_features=64, num_layers=2, num_heads=2, mlp_features=256,
+                          max_seq_len=128)
 objective = LMObjective(model, seq_len=64)
 state = Trainer(objective, optax.adamw(3e-3), key=jax.random.key(0)).fit(
     data, steps=150, log_every=150)
@@ -142,10 +143,9 @@ Results hold global arrays sharded by row, including any filler rows added so th
 ```python
 import jax
 
-from dew import models
 from dew.inference import SafetensorsBanks, stream_banked
 from dew.interop.hf_decoders import translate_config
-from dew.registry import with_precision
+from dew.registry import models, with_precision
 from dew.sampling.text import Sampling, generate
 
 with SafetensorsBanks("path/to/gpt-oss-20b-BF16",

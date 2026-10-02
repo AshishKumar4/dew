@@ -269,7 +269,6 @@ class TokenBytes(_Reopened):
         self.path = str(path)
         meta = _meta(Path(self.path).parent)
         self.dtype = _dtype(meta)
-        self.vocab_size = _recorded(meta, "vocab_size")
         self.eos_id = eos_id if eos_id is not None else _recorded(meta, "eos_id")
         self._tokens = self.open_handle()
 
@@ -360,17 +359,12 @@ class TokenRecords(_Reopened, _Sharded):
         return self._ids(index, self.dtype)
 
     def open_handle(self):
-        return _array_records(self.paths)
+        from array_record.python.array_record_data_source import ArrayRecordDataSource
+
+        return ArrayRecordDataSource(list(self.paths))
 
     def __repr__(self) -> str:
         return f"TokenRecords(paths={self.paths!r}, field={self.field!r})"
-
-
-def _array_records(paths: Sequence[str]):
-    """The arrayrecord reader over `paths`, imported on use."""
-    from array_record.python.array_record_data_source import ArrayRecordDataSource
-
-    return ArrayRecordDataSource(list(paths))
 
 
 class TokenColumn(_Sharded):
@@ -530,9 +524,15 @@ class TokenDocumentSource:
     `eos_id` is the corpus's own unless one is given; without it the stream
     has no boundaries to find. Finding them reads the corpus once at
     construction, after which a worker touches only the span it is asked for.
+
+    `chunk_len` cuts every document into consecutive records of at most that
+    many tokens, as the packer would (`dew.data.tokens.DocumentChunks`), so a
+    record of a document longer than a window reads its own span rather than
+    the whole document.
     """
 
-    def __init__(self, tokens: TokenSource, eos_id: int | None = None):
+    def __init__(self, tokens: TokenSource, eos_id: int | None = None, *,
+                 chunk_len: int | None = None):
         self.tokens = tokens
         found = tokens.eos_id if eos_id is None else eos_id
         if found is None:
@@ -545,15 +545,24 @@ class TokenDocumentSource:
         ends = (np.flatnonzero(held == self.eos_id) + 1).astype(np.int64)
         if len(ends) == 0 or ends[-1] < len(held):
             ends = np.append(ends, len(held))
+        starts = np.concatenate([[0], ends[:-1]])
+        self.chunk_len = chunk_len
+        if chunk_len is not None:
+            counts = -(-(ends - starts) // chunk_len)
+            first = np.repeat(starts, counts)
+            within = np.arange(len(first), dtype=np.int64) - np.repeat(np.cumsum(counts) - counts, counts)
+            starts = first + within * chunk_len
+            ends = np.minimum(starts + chunk_len, np.repeat(ends, counts))
         # Exclusive span ends; record i is tokens[starts[i] : ends[i]].
         self._ends = ends
-        self._starts = np.concatenate([[0], ends[:-1]])
+        self._starts = starts
         self.lengths = self._ends - self._starts
 
     def __repr__(self) -> str:
         # The description a saved position compares against (`describe`); the
         # packed loader plans its order over these documents.
-        return f"TokenDocumentSource(tokens={self.tokens!r}, eos_id={self.eos_id})"
+        return (f"TokenDocumentSource(tokens={self.tokens!r}, eos_id={self.eos_id}, "
+                f"chunk_len={self.chunk_len})")
 
     def __len__(self) -> int:
         return len(self._ends)

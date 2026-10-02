@@ -244,6 +244,17 @@ def test_the_registry_answers_dew_with_this_adapter_built_from_a_run(run):
         get_model("dew").create_from_arg_string("batch_size=2")
 
 
+def test_the_registry_builds_a_run_that_kept_no_average(tmp_path):
+    """A run trained without an EMA loads its live weights through the
+    registry, as `dew.pipeline` loads it; asking for the average still refuses."""
+    from lm_eval.api.registry import get_model
+
+    make_lm_run(tmp_path, ema_decay=None)
+    assert isinstance(get_model("dew").create_from_arg_string(f"run={tmp_path}"), DewLM)
+    with pytest.raises(ValueError, match="keeps no EMA"):
+        DewLM.from_run(str(tmp_path), ema=True)
+
+
 @pytest.mark.network
 def test_a_real_task_suite_runs_against_a_run(tmp_path):
     """One tiny suite end to end, over a run whose 512-id window holds

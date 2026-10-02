@@ -60,6 +60,6 @@
 <text x="476" y="346" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#4d6763" text-anchor="start">columns (mlp) over tensor.</text>
 <text x="476" y="376" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#4d6763" text-anchor="start">Each block is held by one</text>
 <text x="476" y="396" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#4d6763" text-anchor="start">device of each data index.</text>
-<text x="24" y="500" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#4d6763" text-anchor="start">Placements read from build_mesh, Layout().shardings and batch_shardings</text>
+<text x="24" y="500" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#4d6763" text-anchor="start">Placements read from MeshSpec.build, Layout().shardings and batch_shardings</text>
 <text x="24" y="520" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#4d6763" text-anchor="start">(dew.training) on 8 simulated CPU devices.</text>
 </svg>

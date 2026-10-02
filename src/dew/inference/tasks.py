@@ -486,8 +486,7 @@ class TextGeneration:
         model = model_config.build()
         quantization = _saved_quantization(record)
         if quantization is not None:
-            from dew.training.quantization import apply_quantization
-            model = apply_quantization(model, quantization)
+            model = quantization.apply(model)
         return cls(model, thaw(variables), processor, sampling=_saved_sampling(record, budget),
                    max_new_tokens=budget if budget else None)
 

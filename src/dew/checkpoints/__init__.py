@@ -147,11 +147,10 @@ class Keep:
     def __post_init__(self):
         if self.latest < 0 or (self.every is not None and self.every < 1):
             raise ValueError("Keep needs latest >= 0 and every >= 1")
-        if isinstance(self.interval, str):
-            object.__setattr__(self, 'interval', duration(self.interval))
         interval = duration(self.interval) if isinstance(self.interval, str) else self.interval
         if interval is not None and interval.total_seconds() <= 0:
             raise ValueError("Keep.interval must be positive")
+        object.__setattr__(self, 'interval', interval)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -993,6 +992,49 @@ class Checkpoints:
         restored = persistent.restore(step, args=ocp.args.PyTreeRestore(
             item=wanted, partial_restore=True, restore_args=jax.tree.map(lambda _: host, wanted)))
         return tuple(_averages_of(_power_profiles(restored['opt_state'])))
+
+    def posthoc_ema(self, std: float, step: int | None = None) -> Variables:
+        """The post-hoc EMA of relative standard deviation `std` at checkpoint
+        `step` (default: the latest snapshot), as host arrays in the params'
+        structure and dtypes.
+
+        Sums every snapshot up to `step`, of every tracked profile, with the
+        weights `coefficients` solves for, one snapshot read at a time and
+        accumulated in fp32 or wider. The result goes where the run's params
+        go: `merge(params, {"params": checkpoints.posthoc_ema(...)})`.
+        """
+        from dew.training.posthoc import coefficients
+
+        steps = self.profile_steps()
+        if not steps:
+            raise FileNotFoundError(f"{self.directory} holds no EMA profile snapshots; train with "
+                                    f"OptimConfig.ema_profiles to keep them")
+        step = steps[-1] if step is None else step
+        if step not in steps:
+            raise ValueError(f"{self.directory} holds EMA profile snapshots at steps {steps}, not {step}")
+        held = [(each, *self.profile_metadata(each)) for each in steps if each <= step]
+        # A snapshot before the first update holds the initial weights, with no
+        # profile to fit.
+        held = [(each, updates, stds) for each, updates, stds in held if updates > 0]
+        if not held or held[-1][0] != step:
+            raise ValueError(f"the snapshot at step {step} was taken before the first update")
+        weights = iter(coefficients([(updates, deviation) for _, updates, stds in held for deviation in stds],
+                                    held[-1][1], std))
+        total, dtypes = None, None
+        for each, _, _ in held:
+            for average in self.restore_profiles(each):
+                weight = next(weights)
+                if total is None:
+                    dtypes = jax.tree.map(lambda leaf: leaf.dtype, average)
+                    total = jax.tree.map(
+                        lambda leaf, weight=weight: weight
+                        * leaf.astype(np.promote_types(leaf.dtype, np.float32)),
+                        average,
+                    )
+                else:
+                    total = jax.tree.map(lambda sum_, leaf, weight=weight: sum_ + weight * leaf,
+                                         total, average)
+        return jax.tree.map(lambda leaf, dtype: leaf.astype(dtype), total, dtypes)
 
     def save_local(
         self,

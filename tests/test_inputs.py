@@ -22,11 +22,10 @@ def test_row_plan_preserves_resident_rows_padding_and_random_keys():
 
     from dew.nn.inputs import RowPlan, local_rows
     from dew.training import MeshSpec
-    from dew.training.distributed import build_mesh
 
     pixels = jnp.arange(18, dtype=jnp.float32).reshape(3, 2, 3)
     host_pixels = np.asarray(pixels)
-    plan = RowPlan(build_mesh(MeshSpec()), 3, 8, 0, 1)
+    plan = RowPlan(MeshSpec().build(), 3, 8, 0, 1)
     key = jax.random.key(11)
     with jax.transfer_guard_device_to_host("disallow"):
         local = local_rows(pixels, host=False)
@@ -52,9 +51,8 @@ def test_row_plan_folds_a_mesh_replicated_request_key_on_device():
 
     from dew.nn.inputs import BATCH_AXES, RowPlan
     from dew.training import MeshSpec
-    from dew.training.distributed import build_mesh
 
-    mesh = build_mesh(MeshSpec())
+    mesh = MeshSpec().build()
     plan = RowPlan(mesh, 3, 8, 0, 1)
     key = jax.device_put(jax.random.key(11), NamedSharding(mesh, P()))
     with jax.transfer_guard_device_to_host("disallow"):
@@ -72,9 +70,9 @@ def test_shard_batch_preserves_resident_nested_inputs_without_host_transfer():
     from jax.sharding import NamedSharding, PartitionSpec as P
 
     from dew.nn.inputs import ModelInputs
-    from dew.training.distributed import build_mesh, shard_batch
+    from dew.training.distributed import MeshSpec, shard_batch
 
-    mesh = build_mesh()
+    mesh = MeshSpec().build()
     rows = 2 * jax.device_count()
     tokens = jnp.arange(rows * 4, dtype=jnp.int32).reshape(rows, 4)
     pixels = jnp.arange(rows * 12, dtype=jnp.float32).reshape(rows, 2, 2, 3) / 16
