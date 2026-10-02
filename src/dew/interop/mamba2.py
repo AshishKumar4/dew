@@ -5,9 +5,8 @@ into the backbone's: the SSD geometry onto the `mamba2` mixer value, the
 block without a feed-forward as `mlp_features=0`, the final norm's epsilon
 and the head's tying. `weight_path` maps the checkpoint's tensor names
 (`backbone.layers.N.mixer.*`, `backbone.norm_f`, `lm_head`) onto the
-variables tree, and `translate` walks a whole state dict through it,
-transposing the linear kernels as `dew.interop.hf_decoders.translate_weights`
-does.
+variables tree for `dew.interop.hf_decoders.translate_weights`, and
+`export_path` maps them back.
 
 mamba_ssm's own checkpoints (state-spaces/mamba2-*) read through the same
 path: `config_from_mamba_ssm` writes their config as the `Mamba2Config` dict
@@ -28,16 +27,25 @@ import numpy as np
 
 from dew import records
 from dew.nn.mixers.mamba2 import Mamba2Mixer
-from dew.nn.text_encoders import ParamTree, checkpoint_array, insert
-from dew.objectives.base import Variables
 
 if TYPE_CHECKING:
     from dew.interop.hf_decoders import DecoderFields
 
 MODEL_TYPE = "mamba2"
 
-_MIXER_LEAVES = ("A_log", "dt_bias", "D")
-_MIXER_LINEARS = ("in_proj", "out_proj")
+# The checkpoint's names onto the tree's, read one way on load and the other
+# on export. Linear weights are kernels; the conv taps keep `[D, 1, K]`.
+_TRUNK = {"backbone.embeddings.weight": ("embed_tokens", "embedding"),
+          "backbone.norm_f.weight": ("norm", "scale")}
+_TRUNK_NAMES = {path: name for name, path in _TRUNK.items()}
+_LAYER = {
+    "norm.weight": ("input_layernorm", "scale"), "mixer.norm.weight": ("self_attn", "norm", "weight"),
+    **{f"mixer.{leaf}": ("self_attn", leaf) for leaf in ("A_log", "dt_bias", "D")},
+    **{f"mixer.{linear}.{kind}": ("self_attn", linear, "kernel" if kind == "weight" else "bias")
+       for linear in ("in_proj", "out_proj") for kind in ("weight", "bias")},
+    **{f"mixer.conv1d.{kind}": ("self_attn", "conv1d", kind) for kind in ("weight", "bias")},
+}
+_LAYER_NAMES = {path: name for name, path in _LAYER.items()}
 
 
 def config_from_hf(hf_config: Mapping[str, object], used: set[str] | None = None) -> DecoderFields:
@@ -118,27 +126,14 @@ def weight_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | No
     The tied head's copy comes back as None. An unknown name raises.
     """
     parts = name.split(".")
-    if parts == ["backbone", "embeddings", "weight"]:
-        return ("params", "embed_tokens", "embedding")
-    if parts == ["backbone", "norm_f", "weight"]:
-        return ("params", "norm", "scale")
-    if parts == ["lm_head", "weight"]:
+    if name in _TRUNK:
+        return ("params", *_TRUNK[name])
+    if name == "lm_head.weight":
         return None if config.get("tie_embeddings") else ("params", "lm_head", "kernel")
-    if len(parts) >= 5 and parts[:2] == ["backbone", "layers"] and parts[2].isdigit():
-        layer = f"layers_{parts[2]}"
-        tail = parts[3:]
-        if tail == ["norm", "weight"]:
-            return ("params", layer, "input_layernorm", "scale")
-        if tail[0] == "mixer":
-            leaf = tail[1:]
-            if len(leaf) == 1 and leaf[0] in _MIXER_LEAVES:
-                return ("params", layer, "self_attn", leaf[0])
-            if len(leaf) == 2 and leaf[0] in _MIXER_LINEARS and leaf[1] in ("weight", "bias"):
-                return ("params", layer, "self_attn", leaf[0], "kernel" if leaf[1] == "weight" else "bias")
-            if len(leaf) == 2 and leaf[0] == "conv1d" and leaf[1] in ("weight", "bias"):
-                return ("params", layer, "self_attn", "conv1d", leaf[1])
-            if leaf == ["norm", "weight"]:
-                return ("params", layer, "self_attn", "norm", "weight")
+    if len(parts) >= 4 and parts[:2] == ["backbone", "layers"] and parts[2].isdigit():
+        tail = _LAYER.get(".".join(parts[3:]))
+        if tail is not None:
+            return ("params", f"layers_{parts[2]}", *tail)
     raise ValueError(f"{name!r} has no place in a Mamba-2 CausalTransformer")
 
 
@@ -148,27 +143,13 @@ def export_path(dew_name: str, config: Mapping[str, object]) -> str | None:
     The inverse of `weight_path`. The tied head comes back as None, since its
     embedding copy is written instead.
     """
-    parts = dew_name.split(".")
-    if parts == ["embed_tokens", "embedding"]:
-        return "backbone.embeddings.weight"
-    if parts == ["norm", "scale"]:
-        return "backbone.norm_f.weight"
-    if parts == ["lm_head", "kernel"]:
+    parts = tuple(dew_name.split("."))
+    if parts in _TRUNK_NAMES:
+        return _TRUNK_NAMES[parts]
+    if parts == ("lm_head", "kernel"):
         return None if config.get("tie_embeddings") else "lm_head.weight"
-    if len(parts) >= 3 and parts[0].startswith("layers_"):
-        prefix = f"backbone.layers.{parts[0].removeprefix('layers_')}"
-        if parts[1:] == ["input_layernorm", "scale"]:
-            return f"{prefix}.norm.weight"
-        if parts[1] == "self_attn":
-            leaf = parts[2:]
-            if len(leaf) == 1 and leaf[0] in _MIXER_LEAVES:
-                return f"{prefix}.mixer.{leaf[0]}"
-            if len(leaf) == 2 and leaf[0] in _MIXER_LINEARS and leaf[1] in ("kernel", "bias"):
-                return f"{prefix}.mixer.{leaf[0]}.{'weight' if leaf[1] == 'kernel' else 'bias'}"
-            if len(leaf) == 2 and leaf[0] == "conv1d" and leaf[1] in ("weight", "bias"):
-                return f"{prefix}.mixer.conv1d.{leaf[1]}"
-            if leaf == ["norm", "weight"]:
-                return f"{prefix}.mixer.norm.weight"
+    if parts[0].startswith("layers_") and parts[1:] in _LAYER_NAMES:
+        return f"backbone.layers.{parts[0].removeprefix('layers_')}.{_LAYER_NAMES[parts[1:]]}"
     raise ValueError(f"{dew_name!r} is not a Mamba-2 CausalTransformer parameter")
 
 
@@ -254,28 +235,3 @@ def tensors_from_mamba_ssm(tensors: Mapping[str, np.ndarray]) -> dict[str, np.nd
     `embedding.` becomes `embeddings.` wherever a name holds it.
     """
     return {name.replace("embedding.", "embeddings."): tensor for name, tensor in tensors.items()}
-
-
-def translate(state_dict: Mapping[str, np.ndarray], config: Mapping[str, object], *,
-              param_dtype: str = "float32") -> Variables:
-    """Map a `Mamba2ForCausalLM` state dict into a `CausalTransformer`'s variables.
-
-    `config` is the dict `config_from_hf` returns, which decides the model the
-    variables belong to. Linear weights arrive `[out, in]` and `nn.Dense` keeps
-    `[in, out]`, so every kernel is transposed; the conv taps keep the
-    checkpoint's `[D, 1, K]`. A tied checkpoint's `lm_head.weight` is checked
-    against the embedding and dropped.
-    """
-    variables: ParamTree = {}
-    for name, tensor in state_dict.items():
-        path = weight_path(name, config)
-        if path is None:
-            embedding = np.asarray(state_dict["backbone.embeddings.weight"])
-            if not np.array_equal(np.asarray(tensor), embedding):
-                raise ValueError("lm_head.weight differs from the embedding it is declared tied to")
-            continue
-        leaf = checkpoint_array(tensor, param_dtype)
-        if path[-1] == "kernel":
-            leaf = np.ascontiguousarray(leaf.T)
-        insert(variables, path, leaf, name)
-    return variables

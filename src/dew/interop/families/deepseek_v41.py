@@ -14,7 +14,7 @@ from typing import TypedDict
 
 import numpy as np
 
-from dew.interop.families.deepseek import _V4_SCORES, _deepseek_v4_prepare
+from dew.interop.families.deepseek import _V4_LAYER_NAMES, _V4_SCORES, _deepseek_v4_prepare
 from dew.interop.hf_decoders import (
     _NO_AUDIO,
     DEFAULT_MAX_SEQ_LEN,
@@ -334,31 +334,16 @@ def _v41_engram(text: Mapping[str, object], seen: set[str]) -> EngramFields | No
             'pad_token_id': _record_int(text, 'engram_pad_token_id', 2)}
 
 
-# The release's names inside a layer onto the module names the tree keeps.
-# The indexer keeps V3.2's leaf names (wq_b, wk, k_norm, weights_proj),
-# which the shared reader already places under self_attn/indexer.
+# The release's own names inside a layer, before those V4 shares
+# (`_V4_LAYER_NAMES`). The indexer keeps V3.2's leaf names (wq_b, wk,
+# k_norm, weights_proj), which the shared reader already places under
+# self_attn/indexer.
 _DEEPSEEK_V41_NAMES = (
-    ('.attn_sink', '.sinks'),
     ('.compressor.norm.', '.compressor.kv_norm.'),
-    ('.q_norm.', '.q_a_norm.'),
-    ('.attn.wq_a.', '.attn.q_a_proj.'),
-    ('.attn.wq_b.', '.attn.q_b_proj.'),
-    ('.attn.wkv.', '.attn.kv_proj.'),
-    ('.compressor.wkv.', '.compressor.kv_proj.'),
-    ('.compressor.wgate.', '.compressor.gate_proj.'),
-    ('.wo_a.', '.o_a_proj.'),
-    ('.wo_b.', '.o_b_proj.'),
+    ('.attn.wq_a.', '.attn.q_a_proj.'), ('.attn.wq_b.', '.attn.q_b_proj.'), ('.attn.wkv.', '.attn.kv_proj.'),
+    ('.compressor.wkv.', '.compressor.kv_proj.'), ('.compressor.wgate.', '.compressor.gate_proj.'),
     ('.gate.bias_vl', '.gate.media_bias'),
-    ('.gate.bias', '.gate.e_score_correction_bias'),
-    ('.w1.', '.gate_proj.'),
-    ('.w2.', '.down_proj.'),
-    ('.w3.', '.up_proj.'),
-    ('.attn.', '.self_attn.'),
-    ('.ffn.', '.mlp.'),
-    ('.attn_norm.', '.input_layernorm.'),
-    ('.ffn_norm.', '.post_attention_layernorm.'),
-    ('.hc_attn_', '.attn_hc.'),
-    ('.hc_ffn_', '.ffn_hc.'),
+    *_V4_LAYER_NAMES,
 )
 _V41_TRUNK = {'embed.weight': 'model.embed_tokens.weight', 'norm.weight': 'model.norm.weight',
               'head.weight': 'lm_head.weight'}

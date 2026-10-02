@@ -814,35 +814,27 @@ def _v4_streams(hf_config: Mapping[str, object]) -> HyperConnectionsFields:
         'head': 'weighted'}
 
 
-# A DeepSeek V4 checkpoint's own names onto the module names transformers
-# renames them to (conversion_mapping.py:483-534), which is the layout
-# `_param_path` reads. The indexer's leaves move before the `attn` and `ffn`
-# prefixes they sit under, and the per-expert and shared `w1`/`w2`/`w3` are
-# the gate, down and up projections of one gated MLP.
+# The layer names V4 and V4.1 releases share, onto the module names
+# transformers renames them to (conversion_mapping.py:483-534), which is the
+# layout `_param_path` reads: the per-expert and shared `w1`/`w2`/`w3` are the
+# gate, down and up projections of one gated MLP. Each release's own renames
+# run first.
+_V4_LAYER_NAMES = (
+    ('.attn_sink', '.sinks'), ('.q_norm.', '.q_a_norm.'), ('.wo_a.', '.o_a_proj.'), ('.wo_b.', '.o_b_proj.'),
+    ('.gate.bias', '.gate.e_score_correction_bias'),
+    ('.w1.', '.gate_proj.'), ('.w2.', '.down_proj.'), ('.w3.', '.up_proj.'),
+    ('.attn.', '.self_attn.'), ('.ffn.', '.mlp.'),
+    ('.attn_norm.', '.input_layernorm.'), ('.ffn_norm.', '.post_attention_layernorm.'),
+    ('.hc_attn_', '.attn_hc.'), ('.hc_ffn_', '.ffn_hc.'),
+)
+# V4's indexer leaves move before the `attn` and `ffn` prefixes they sit under.
 _DEEPSEEK_V4_NAMES = (
     ('.indexer.compressor.', '.compressor.indexer.'),
     ('.indexer.wq_b.', '.compressor.indexer.q_b_proj.'),
     ('.indexer.weights_proj.', '.compressor.indexer.scorer.weights_proj.'),
-    ('.attn_sink', '.sinks'),
-    ('.norm.', '.kv_norm.'),
-    ('.q_norm.', '.q_a_norm.'),
-    ('.ape', '.position_bias'),
-    ('.wq_a.', '.q_a_proj.'),
-    ('.wq_b.', '.q_b_proj.'),
-    ('.wkv.', '.kv_proj.'),
-    ('.wgate.', '.gate_proj.'),
-    ('.wo_a.', '.o_a_proj.'),
-    ('.wo_b.', '.o_b_proj.'),
-    ('.gate.bias', '.gate.e_score_correction_bias'),
-    ('.w1.', '.gate_proj.'),
-    ('.w2.', '.down_proj.'),
-    ('.w3.', '.up_proj.'),
-    ('.attn.', '.self_attn.'),
-    ('.ffn.', '.mlp.'),
-    ('.attn_norm.', '.input_layernorm.'),
-    ('.ffn_norm.', '.post_attention_layernorm.'),
-    ('.hc_attn_', '.attn_hc.'),
-    ('.hc_ffn_', '.ffn_hc.'),
+    ('.norm.', '.kv_norm.'), ('.ape', '.position_bias'),
+    ('.wq_a.', '.q_a_proj.'), ('.wq_b.', '.q_b_proj.'), ('.wkv.', '.kv_proj.'), ('.wgate.', '.gate_proj.'),
+    *_V4_LAYER_NAMES,
 )
 
 
