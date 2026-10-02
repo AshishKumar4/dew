@@ -1085,6 +1085,20 @@ def test_documents_packed_online_by_grain_keep_attention_inside_each_document(mo
                     f"row {row} position {query} attending to {key}")
 
 
+def test_the_packing_bins_are_part_of_the_order_a_position_counts_into():
+    """Which chunks share a window depends on how many bins the plan keeps
+    open. Two plans with as many windows were described alike, so a run
+    resumed under another bin count read other windows at the same count."""
+    lengths = np.asarray([3, 2, 1, 1])
+    documents = pygrain.MapDataset.source(
+        [{"text": np.full(length, index + 1, np.int32)} for index, length in enumerate(lengths)])
+    one, two = (PackedWindows(documents, lengths, 4, bins, "corpus") for bins in (1, 2))
+
+    assert len(one) == len(two) == 2
+    assert not np.array_equal(one[0]["text"], two[0]["text"]), "the plans differ"
+    assert describe(one) != describe(two)
+
+
 def _counted_cross_entropy(batch, seq_len):
     """The objective's ce, and the same number computed by hand.
 
