@@ -23,14 +23,7 @@ import pytest
 
 from dew.data import ByteTokenizer, DataPartition, Loading, PackedTokens, TokenCorpus, TokenWindows
 from dew.data.dataset import describe
-from dew.data.sources.text import (
-    TokenBytes,
-    TokenColumn,
-    TokenDocumentSource,
-    TokenRecords,
-    TokenWindowSource,
-    dtype_for,
-)
+from dew.data.sources.text import TokenBytes, TokenDocumentSource, TokenRecords, TokenWindowSource, dtype_for
 from dew.data.tokens import PackedWindows
 from dew.nn import attention
 from dew.nn.backbones import causal_transformer as backbone
@@ -1342,24 +1335,13 @@ def _as_records(directory, split, tokens, sizes, field=None):
     return paths
 
 
-def _as_parquet(directory, split, tokens, sizes, column="input_ids"):
-    """`tokens` as one parquet file whose rows are pieces of `sizes`."""
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-
-    path = directory / f"{split}.parquet"
-    rows = [piece.astype(np.int64).tolist() for piece in _chunks(tokens, sizes)]
-    pq.write_table(pa.table({column: rows}), path)
-    return [str(path)]
-
-
 CORPUS = np.concatenate([np.asarray([*document, PACK_EOS], np.int64) for document in
                          ([10, 11, 12], [20, 21], [30, 31, 32, 33, 34], [40], [50, 51])])
 
 
 @pytest.fixture
 def stores(tmp_path):
-    """The same corpus in all three stores, cut differently in each.
+    """The same corpus in every store, cut differently in each.
 
     The pieces are deliberately unequal, so a window that crosses a record
     boundary has to be joined out of two of them; identical windows then say
@@ -1373,8 +1355,6 @@ def stores(tmp_path):
         "packed_records": TokenRecords(
             _as_records(tmp_path, "packed", CORPUS, [2, 9], field="ids"),
             field="ids", eos_id=PACK_EOS),
-        "parquet": TokenColumn(_as_parquet(tmp_path, "train", CORPUS, [5, 1, 6]),
-                               eos_id=PACK_EOS),
     }
 
 
