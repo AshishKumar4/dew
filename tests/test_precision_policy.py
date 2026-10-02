@@ -490,6 +490,23 @@ def test_a_rounded_operand_rounds_between_formats_of_one_width(source, target):
     assert not jnp.array_equal(rounded, x)
 
 
+@pytest.mark.parametrize("helper", ["rounded_operand", "rounded_to"])
+def test_a_rounding_survives_the_reduction_it_feeds(helper):
+    """XLA:CPU's YNNPACK reduce fusion sums the unrounded values of a bare
+    `astype` round trip, even with excess precision off (openxla/xla#49978);
+    the helpers' optimization barrier keeps the rounding a sum and a mean
+    of squares read, as a norm's statistics do."""
+    from dew.nn import precision
+    x = np.random.default_rng(0).normal(size=(8, 4096)).astype(np.float32) * 3
+    rounded = x.astype(jnp.bfloat16).astype(np.float64)
+    held = jax.jit(lambda v: getattr(precision, helper)(v, jnp.bfloat16).astype(jnp.float32))
+    sums = np.asarray(jax.jit(lambda v: jnp.sum(held(v), axis=-1))(x), np.float64)
+    squares = np.asarray(jax.jit(lambda v: jnp.mean(jnp.square(held(v)), axis=-1))(x), np.float64)
+    np.testing.assert_allclose(sums, rounded.sum(-1), rtol=0, atol=1e-3)
+    assert np.min(np.abs(sums - x.astype(np.float64).sum(-1))) > 1e-2
+    np.testing.assert_allclose(squares, np.mean(rounded ** 2, -1), rtol=1e-6)
+
+
 def test_a_value_already_in_the_dtype_keeps_its_rounding_under_jit():
     """A bf16 value computed in fp32 and cast down is held as bf16 where it is
     already the operand dtype: without the barrier, XLA's GPU excess precision
