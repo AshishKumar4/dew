@@ -127,7 +127,7 @@ Image sources can need network access the first time. Token-window sources read 
 
 ## Image datasets on the Hugging Face Hub
 
-`HFImages` reads a Hub image dataset by index through the image pipeline: decode, resize to `image_size`, augmentation, and captions for text conditioning. Its column fields say where a record keeps its fields. `image_column` holds the image, the caption is the first of `caption_columns` a record has, and `label_column` is the class index a record carries as `label`. CIFAR-10 keeps its image under `img`, a class under `label` and no caption:
+`HFImages` reads a Hub image dataset by index through the image pipeline: decode, resize to `image_size`, augmentation, and captions for text conditioning. Its column fields say where a record keeps its fields. `image_column` holds the image, the caption is the first of `caption_columns` a record has, and a `label` column, where the dataset has one, is the class index a record carries. CIFAR-10 keeps its image under `img`, a class under `label` and no caption:
 
 <!-- not run: downloads CIFAR-10 on first use -->
 ```python

@@ -47,10 +47,6 @@ from .tokens import bounded
 
 Augmentation = Literal["none", "flip_only", "flip_jitter"]
 
-LABEL = "label"
-"""The batch field a record's class index travels in, and the column name a
-hub dataset keeps it under unless its spec names another."""
-
 
 def import_opencv() -> None:
     """Import OpenCV in the thread that opens a loader, before its readers start.
@@ -323,7 +319,7 @@ class ImageTransform(pygrain.RandomMapTransform):
             record["image_augmentation_key"] = rng.integers(0, 2**32, size=2, dtype=np.uint32)
         if label is not None:
             # the class index, which the JEPA linear/kNN probes score against
-            record[LABEL] = np.int32(label)
+            record["label"] = np.int32(label)
         return record
 
 
@@ -523,10 +519,9 @@ class HFImages(ImageDataset):
     The columns say where a record keeps its fields. `image_column` holds the
     image; the caption is the first of `caption_columns` a record has, and
     an empty tuple reads an uncaptioned dataset, such as a class-labelled
-    one, for an unconditional or class-conditional run. `label_column` is
-    the class index a record carries as `label`: the default name is read
-    where the dataset has it, any other name is required, and None reads
-    none. A column the split does not hold is refused when the spec loads.
+    one, for an unconditional or class-conditional run. A `label` column,
+    where the dataset has one, is the class index a record carries. A column
+    the split does not hold is refused when the spec loads.
 
     Its images arrive decoded by `datasets` rather than by `decode_image`,
     so a JPEG's EXIF orientation is applied, where `decode_image` keeps the
@@ -538,7 +533,6 @@ class HFImages(ImageDataset):
     options: HubOptions = dataclasses.field(default_factory=HFOptions)
     image_column: str = "image"
     caption_columns: tuple[str, ...] = ("caption", "text")
-    label_column: str | None = LABEL
 
     def load(self, *, batch: int, tokenize: Tokenize | None = None) -> Dataset:
         if not self.caption_columns and tokenize is not None:
@@ -565,14 +559,11 @@ class HFImages(ImageDataset):
             raise ValueError(
                 f"caption_columns={self.caption_columns!r}, and {held}; name its caption "
                 f"column, or set caption_columns=() for a dataset without captions")
-        if self.label_column not in (None, LABEL, *columns):
-            raise ValueError(
-                f"label_column={self.label_column!r}, and {held}; name its class column, or None")
 
     def record(self, element: Batch | bytes, rng):
         element = _fields(element, "HFImages")
         caption = record_caption(element, self.caption_columns) if self.caption_columns else ""
-        label = None if self.label_column is None else element.get(self.label_column)
+        label = element.get("label")
         return element[self.image_column], caption, None if label is None else int(label)
 
 
