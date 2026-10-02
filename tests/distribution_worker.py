@@ -11,6 +11,7 @@ the reference the pool is compared with.
 """
 
 import argparse
+import hashlib
 import json
 import time
 from pathlib import Path
@@ -140,8 +141,16 @@ def main() -> None:
                       mesh=MeshSpec(**json.loads(args.mesh)), layout=Layout(min_shard=TINY_SHARD),
                       checkpoints=None if args.checkpoints is None else Checkpoints(str(args.checkpoints)),
                       tracker=losses)
-    trainer.fit(Dataset(train=Stream if args.vary else share, val=None, records=None, batch=BATCH),
-                steps=args.steps, log_every=1)
+    state = trainer.fit(Dataset(train=Stream if args.vary else share, val=None, records=None, batch=BATCH),
+                        steps=args.steps, log_every=1)
+    # Every leaf of the trained state whole, in a fixed order, so two runs'
+    # states compare by one hash.
+    digest = hashlib.sha256()
+    for path, leaf in jax.tree_util.tree_leaves_with_path(state):
+        whole = np.asarray(multihost_utils.process_allgather(
+            jax.random.key_data(leaf) if jax.dtypes.issubdtype(leaf.dtype, jax.dtypes.prng_key) else leaf,
+            tiled=True))
+        digest.update(jax.tree_util.keystr(path).encode() + whole.tobytes())
 
     # A leaf whose second dimension the sequence axis splits, placed from the
     # share and gathered back whole.
@@ -161,6 +170,7 @@ def main() -> None:
             "placed_whole": bool(np.array_equal(np.asarray(gathered), wide)),
             "losses": losses.losses,
             "loss_steps": losses.steps,
+            "state_digest": digest.hexdigest(),
         }))
 
 

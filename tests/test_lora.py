@@ -569,7 +569,7 @@ def test_a_run_config_adapter_trains_its_factors_and_nothing_else(tmp_path):
     assert selects is not None
     assert selects(("params", "layers_0", "self_attn", "q_proj", "lora_A"))
     assert not selects(("params", "layers_0", "self_attn", "q_proj", "kernel"))
-    initial = Trainer(objective, optax.sgd(0.0), key=jax.random.key(config.trainer.seed)).initial_state()
+    initial = Trainer(objective, optax.sgd(0.0), key=config.trainer.key).initial_state()
     moved = _flat(state.params["params"])
     assert set(moved) == {f"{'.'.join(target[1:])}.{factor}"
                           for target in config.lora.targets for factor in lora.FACTORS}

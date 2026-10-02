@@ -21,7 +21,7 @@ import math
 import types
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Generic, Protocol, overload, runtime_checkable
+from typing import Generic, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -531,11 +531,9 @@ def _generate(model: nn.Module, params: Variables, inputs: ModelInputs, keys: ja
         drawn.behavior_log_probs, drawn.raw_log_probs)
 
 
-def _validated(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray],
-               conditioning: dict[str, jax.Array | np.ndarray], max_new_tokens: int, sampling: Sampling,
-               n: int) -> ModelInputs:
-    """Host checks shared by every caller; returns device inputs whose validity
-    field is present only where a prompt is actually padded."""
+def _check_inputs(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray],
+                  max_new_tokens: int, sampling: Sampling, n: int) -> np.ndarray:
+    """Shared host validation; return validity without placing unused device inputs."""
     if ids.ndim != 2 or min(ids.shape) < 1 or not np.issubdtype(ids.dtype, np.integer):
         raise ValueError("inputs must contain non-empty [B, P] integer token ids")
     if type(max_new_tokens) is not int or max_new_tokens < 0:
@@ -559,6 +557,15 @@ def _validated(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray],
     if vocab is not None and (sampling.pad_id >= vocab or
                              (sampling.eos_id is not None and np.any(np.asarray(sampling.eos_id) >= vocab))):
         raise ValueError("sampling token ids must be inside the vocabulary")
+    return valid
+
+
+def _validated(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray],
+               conditioning: dict[str, jax.Array | np.ndarray], max_new_tokens: int, sampling: Sampling,
+               n: int) -> ModelInputs:
+    """Host checks shared by every caller; returns device inputs whose validity
+    field is present only where a prompt is actually padded."""
+    valid = _check_inputs(model, ids, fields, max_new_tokens, sampling, n)
     token_fields = {name: jnp.asarray(value) for name, value in fields.items()
                     if name != "attention_mask"}
     if not valid.all():
@@ -676,7 +683,7 @@ def _digest(components: Components) -> tuple[Identity, str]:
 
 def _request(model: nn.Module, params: Variables,
              inputs: ModelInputs | ArrayLike | Sequence[Sequence[int]], max_new_tokens: int,
-             key: jax.Array | None, seed: int | None, sampling: Sampling, n: int,
+             key: int | jax.Array | None, sampling: Sampling, n: int,
              logits: Transforms | None, stopping: Criteria | None, strategy: Strategy | None,
              *, pooled: bool) -> tuple[ModelInputs, jax.Array, Components, tuple[Identity, ...]]:
     """This process's validated request and the controls a pool compares.
@@ -686,7 +693,7 @@ def _request(model: nn.Module, params: Variables,
     rank enters a collective. A single process never digests: refusing a
     component only a pool could disagree about would cost it nothing.
     """
-    random_key = request_key(key, seed)
+    random_key = request_key(key)
     canonical = ModelInputs.from_value(inputs)
     ids = local_rows(canonical.tokens)
     fields = {name: local_rows(value) for name, value in canonical.token_fields.items()}
@@ -759,25 +766,9 @@ def _padded(plan: RowPlan, prepared: ModelInputs) -> ModelInputs:
                                          "attention_mask": valid & ~plan.padding[:, None]})
 
 
-@overload
 def generate(model: nn.Module, params: Variables,
              inputs: ModelInputs | ArrayLike | Sequence[Sequence[int]], max_new_tokens: int,
-             *, key: jax.Array, sampling: Sampling = Sampling(), n: int = 1,
-             logits: Transforms | None = None, stopping: Criteria | None = None,
-             strategy: Strategy | None = None) -> Generation: ...
-
-
-@overload
-def generate(model: nn.Module, params: Variables,
-             inputs: ModelInputs | ArrayLike | Sequence[Sequence[int]], max_new_tokens: int,
-             *, seed: int, sampling: Sampling = Sampling(), n: int = 1,
-             logits: Transforms | None = None, stopping: Criteria | None = None,
-             strategy: Strategy | None = None) -> Generation: ...
-
-
-def generate(model: nn.Module, params: Variables,
-             inputs: ModelInputs | ArrayLike | Sequence[Sequence[int]], max_new_tokens: int,
-             *, key: jax.Array | None = None, seed: int | None = None,
+             *, key: int | jax.Array | None = None,
              sampling: Sampling = Sampling(), n: int = 1, logits: Transforms | None = None,
              stopping: Criteria | None = None, strategy: Strategy | None = None) -> Generation:
     """Generate from numeric model inputs, with an array shorthand for text.
@@ -810,7 +801,7 @@ def generate(model: nn.Module, params: Variables,
     processes = jax.process_count() if mesh is not None else 1
 
     def resolve():
-        return _request(model, params, inputs, max_new_tokens, key, seed, sampling, n,
+        return _request(model, params, inputs, max_new_tokens, key, sampling, n,
                         logits, stopping, strategy, pooled=processes > 1)
 
     request = (agreed("generation input validation", resolve) if processes > 1 else resolve())

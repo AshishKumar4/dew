@@ -191,7 +191,7 @@ def training_step_figure():
         svg.rect(272, 50, 464, 360, fill=t["raised"], stroke=t["accent"], rx=10)
         svg.text(288, 74, "compiled step (jax.jit), once per step", size=14, weight=600, color=t["accent"])
         box(svg, 288, 90, 432, 66, "objective.loss(variables, batch, step)",
-            ["→ Mean(total, mass), Aux(metrics)"], accent=True)
+            ["→ Ratio(total, mass), Aux(metrics)"], accent=True)
         box(svg, 288, 172, 432, 66, "gradient", ["of the mean over the accumulation window"])
         box(svg, 288, 254, 432, 66, "optimizer.update, optax.apply_updates",
             ["when the window closes"])

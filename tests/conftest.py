@@ -9,6 +9,16 @@ from collections.abc import Mapping, MutableMapping
 MESH_DEVICES = 8
 
 
+REPEATABLE_GPU_FLAGS = ("--xla_gpu_deterministic_ops=true", "--xla_gpu_autotune_level=0")
+"""The cuda lane's flags for steps repeatable across processes. Deterministic
+ops order the reductions. Autotuning off is a precaution: XLA picks GEMM and
+convolution kernels at compile time by live timing, which can differ between
+compilations (openxla.org/xla/determinism). Two LADD runs on an RTX 4080
+diverged under deterministic ops alone, but 20 fresh DiT processes did not,
+so that cause is unconfirmed. The precaution costs a test lane nothing that
+matters; in training it cost 8% on a 176M DiT step (docs/guides/checkpoints.md)."""
+
+
 def configure_lane(environ: MutableMapping[str, str]) -> None:
     """Set the environment a lane runs the suite under, before jax opens a backend.
 
@@ -20,8 +30,9 @@ def configure_lane(environ: MutableMapping[str, str]) -> None:
     there, since a TPU has no float64, and a host layout pairs every
     accelerator device with a CPU device of its process
     (`dew.training.host.companion_mesh`), so that backend holds one device
-    per local accelerator device. A cuda lane's reductions are made
-    repeatable, since exact state and gradient checks require it.
+    per local accelerator device. A cuda lane's steps are made repeatable
+    across processes (`REPEATABLE_GPU_FLAGS`), since exact state and
+    gradient checks require it.
     jax.devices() is still the accelerator's.
     """
     environ.setdefault("JAX_PLATFORMS", "cpu")
@@ -30,14 +41,24 @@ def configure_lane(environ: MutableMapping[str, str]) -> None:
     local = {"cuda": _local_gpus, "tpu": _local_tpus}
     accelerator = next((name for name in platforms if name in local), None)
     if accelerator is None:
-        flags.append(f"--xla_force_host_platform_device_count={MESH_DEVICES}")
+        cpu_devices = MESH_DEVICES
     else:
         if accelerator == "cuda":
-            flags.append("--xla_gpu_deterministic_ops=true")
+            flags.extend(REPEATABLE_GPU_FLAGS)
         if "cpu" not in platforms:
             environ["JAX_PLATFORMS"] = ",".join([*platforms, "cpu"])
-        flags.append(f"--xla_force_host_platform_device_count={local[accelerator](environ)}")
+        cpu_devices = local[accelerator](environ)
+    flags.append(f"--xla_force_host_platform_device_count={cpu_devices}")
     environ["XLA_FLAGS"] = " ".join(flags).strip()
+    # XLA:CPU runs every device of a launch on one pool of max(cores,
+    # devices) threads (PJRT_NPROC overrides the cores), each held until the
+    # launch's collectives meet, and dispatches the next launch on the same
+    # pool, where a device with 32 computations in flight blocks its thread.
+    # With a thread per device, a 4-core runner's 8, a loop that ran ahead
+    # left the launch it waited on one device short, and the rendezvous
+    # aborted the process (tests/test_discrete.py's toy run on CI, three
+    # times). Two threads per device hold both launches.
+    environ.setdefault("PJRT_NPROC", str(max(len(os.sched_getaffinity(0)), 2 * cpu_devices)))
 
 
 def _local_gpus(environ: MutableMapping[str, str]) -> int:

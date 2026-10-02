@@ -153,6 +153,9 @@ class Case:
     dtype: str | None = None
     """Compute dtype, written into the model config by the precision policy;
     None takes the run's --dtype."""
+    matmul_precision: str | None = None
+    """What every matmul asks XLA for (`ModelConfig.matmul_precision`), written
+    into a model that declares `precision`; None keeps the model's own."""
     batch_size: int = 8
     accumulation: int = 1
     """Microbatches of `batch_size` rows the trainer pools into one optimizer
@@ -668,7 +671,8 @@ def build_objective(case: Case, attention_impl: str = 'auto', *, widened: bool =
         dtype = case.dtype
 
     def built(architecture: str, config: Mapping[str, object]):
-        fields = with_precision(architecture, config, dtype=dtype, attention_impl=attention_impl)
+        fields = with_precision(architecture, config, dtype=dtype, attention_impl=attention_impl,
+                                matmul_precision=case.matmul_precision)
         return models.build(architecture, **(float64_twin(fields) if widened else fields))
 
     sample_key = "video" if case.frames else "image"

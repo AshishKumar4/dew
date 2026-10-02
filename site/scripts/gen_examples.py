@@ -7,6 +7,7 @@ GROUPS names a script that is gone.
 
 from __future__ import annotations
 
+import argparse
 import ast
 import re
 import sys
@@ -17,9 +18,10 @@ PAGE = REPO / "site/src/content/docs/examples.md"
 SOURCE = "https://github.com/AshishKumar4/dew/blob/main/"
 
 GROUPS = [
-    ("Train one model", ["readme_demo", "train_lm", "train_flowers", "train_diffusion", "train_jepa"]),
-    ("Run a whole job", ["train_flowers_tpu", "sft_gemma4", "sft_diffusion_gemma", "train_rlvr",
-                         "train_harbor", "evaluate_and_serve"]),
+    ("Train one model", ["readme_demo", "train_lm", "train_masked_lm", "train_flowers",
+                         "train_diffusion", "train_jepa"]),
+    ("Run a whole job", ["train_flowers_tpu", "sft_gemma4", "sft_diffusion_gemma", "sft_diffusion_gemma_images",
+                         "train_rlvr", "train_harbor", "evaluate_and_serve"]),
     ("Sample and inspect", ["sample_text_to_image", "moe_mesh"]),
 ]
 
@@ -45,6 +47,9 @@ def markdown(docstring: str) -> str:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--check", action="store_true", help="Check examples without writing generated files.")
+    args = parser.parse_args()
     scripts = {path.stem: path for path in sorted((REPO / "examples").glob("*.py"))}
     listed = [name for _, names in GROUPS for name in names]
     problems = [f"examples/{name}.py is not in scripts/gen_examples.py" for name in scripts if name not in listed]
@@ -54,8 +59,6 @@ def main() -> None:
         for problem in problems:
             print(f"  {problem}", file=sys.stderr)
         raise SystemExit(1)
-    if not PAGE.exists():
-        raise SystemExit("gen_examples: run sync-docs first; it writes the page these sections extend")
 
     sections = []
     for label, names in GROUPS:
@@ -69,7 +72,10 @@ def main() -> None:
             if rest.strip():
                 sections += [markdown(rest), ""]
             sections += [f"[Source on GitHub]({SOURCE}examples/{name}.py)", ""]
-    PAGE.write_text(PAGE.read_text().rstrip() + "\n\n" + "\n".join(sections).rstrip() + "\n")
+    if not args.check:
+        if not PAGE.exists():
+            raise SystemExit("gen_examples: run sync-docs first; it writes the page these sections extend")
+        PAGE.write_text(PAGE.read_text().rstrip() + "\n\n" + "\n".join(sections).rstrip() + "\n")
     print(f"gen_examples: {len(scripts)} scripts")
 
 

@@ -4,12 +4,12 @@ This page describes the main interfaces and the contracts between them, grouped 
 
 ## Objective
 
-Import `Objective`, `Aux`, `Step`, `Mean`, `mean_loss`, and `scalar_loss` from `dew.objectives`.
+Import `Objective`, `Aux`, `Step`, `Ratio`, `mean_loss`, and `scalar_loss` from `dew.objectives`.
 
 | Member | Contract |
 |---|---|
 | `init(key, variables=None)` | Return a Flax variables mapping with a `params` collection. Pure; the trainer traces it once for shapes and once for values. `variables` is a held tree the caller supplies, which is how the trainer passes it as data; with `None` the objective uses its own (`DiffusionObjective.held_variables`, for example). An objective that holds nothing ignores it. |
-| `loss(variables, batch, step)` | Return additive statistics and `Aux`. Use `Mean(total, mass)` for a shared denominator; a scalar denotes a unit-mass term. |
+| `loss(variables, batch, step)` | Return additive statistics and `Aux`. Use `Ratio(total, mass)` for a shared denominator; a scalar denotes a unit-mass term. |
 | `reduce_loss(statistics)` | Return `(value, has_data)`. Override for an objective-owned composite Flax PyTree. |
 | `apply_effects(variables, effects)` | Return nonparameter replacements from additive accepted-window observations. Required when the objective emits effects. |
 | `evaluate(variables, batch, step)` | Return an artifact, a tuple of artifacts, or `None`. The base method returns `None`. |
@@ -176,12 +176,12 @@ IndexerTraining(phase, weight=1.0)
 Import `generate`, `Sampling` and `Generation` from `dew.sampling`:
 
 ```text
-generate(model, params, inputs, max_new_tokens, *, key=None, seed=None,
+generate(model, params, inputs, max_new_tokens, *, key=None,
          sampling=Sampling(), n=1, logits=None, stopping=None, strategy=None) -> Generation
 Sampling(temperature=1.0, top_k=None, eos_id=None, pad_id=0, top_p=1.0, min_p=0.0)
 ```
 
-`params` is the complete variables tree. `inputs` is a `ModelInputs` from `dew.nn.inputs`, or an integer `(B, P)` array normalized to all-valid text. `ModelInputs.token_fields["attention_mask"]` identifies real token slots; there is no separate generation length argument. Every row needs a real token. Only real tokens count against `model.max_seq_len`. Conditioning arrays are batch-aligned and used during prefill; decode keeps the model's cached logical positions. Exactly one of `key` and `seed` is given; `seed=n` is `jax.random.key(n)`.
+`params` is the complete variables tree. `inputs` is a `ModelInputs` from `dew.nn.inputs`, or an integer `(B, P)` array normalized to all-valid text. `ModelInputs.token_fields["attention_mask"]` identifies real token slots; there is no separate generation length argument. Every row needs a real token. Only real tokens count against `model.max_seq_len`. Conditioning arrays are batch-aligned and used during prefill; decode keeps the model's cached logical positions. `key` is an integer seed or a JAX key; `key=n` is `jax.random.key(n)`.
 
 The compiled decoder uses one padded input shape with per-row cache cursors and a fixed trip count. Finished rows preserve their cached state. On a mesh, rows split over the batch axes and the result keeps that sharding; each process hands in its own rows, at the same count and padded width on every process, and reads them back with `Generation.host()`. Keys fold in the global row index, so a pool draws what one process draws for the same rows. The cooperating processes also pass the same `n`. Invalid input on one rank raises on all ranks before device execution.
 
@@ -230,7 +230,7 @@ def favor_short(state, logits):
 
 # The chain is complete, so the policy's own filters are written into it.
 drawn = generate(
-    model, variables, prompts, 32, seed=0,
+    model, variables, prompts, 32, key=0,
     sampling=Sampling(eos_id=2, pad_id=0),
     logits=(decoding.RepetitionPenalty(1.1),
             decoding.NoRepeatNGram(3),
@@ -241,7 +241,7 @@ drawn = generate(
     stopping=(decoding.MaxNewTokens(24),))
 
 # The same request as a deterministic search over four beams, returning two.
-searched = generate(model, variables, prompts, 32, seed=0,
+searched = generate(model, variables, prompts, 32, key=0,
                     sampling=Sampling(eos_id=2, pad_id=0),
                     logits=(decoding.NoRepeatNGram(3),),
                     strategy=Beam(width=4, length_penalty=1.0), n=2)
@@ -249,7 +249,7 @@ searched = generate(model, variables, prompts, 32, seed=0,
 # Drafted by the model's own prediction depths and verified by the model:
 # tokens are distributed exactly as ordinary sampling under this call's
 # policy; accepted drafts save target forwards, which untrained depths rarely give.
-drafted = generate(model, variables, prompts, 32, seed=0,
+drafted = generate(model, variables, prompts, 32, key=0,
                    sampling=Sampling(temperature=0.8, top_p=0.9, eos_id=2),
                    strategy=Speculative(block=4))
 print(drawn.tokens.shape, searched.tokens.shape, drafted.tokens.shape)
@@ -405,7 +405,7 @@ Objective.pipeline(state, *, ema=True) -> the objective's task over state.averag
 LMObjective.pipeline(state, *, ema=True, processor=None) -> TextGeneration
 TextGeneration(model, variables, processor=None, sampling=Sampling(), max_new_tokens=None,
                max_length=None, n=1, logits=None, stopping=(), strategy=None)
-task(request, max_new_tokens=None, *, key=None, seed=None, n=None, sampling=None,
+task(request, max_new_tokens=None, *, key=None, n=None, sampling=None,
      images=None, logits=None, stopping=None, strategy=None) -> Generation
 task.bind(variables) -> TextGeneration      task.decode(generation) -> tuple[str, ...]
 task.quantized(spec, example=((0,),)) -> TextGeneration
@@ -415,7 +415,7 @@ TextGeneration.from_pretrained / BlockGeneration.from_pretrained / MaskedGenerat
     (repo_id, *, ema=None, step=None, mesh=None, layout=None, dtype=None, param_dtype=None)
 BlockGeneration(model, variables, process, processor=None, eos_token_ids=(), pad_token_id=0,
                 max_new_tokens=None, max_length=None, n=1)
-task(request, max_new_tokens=None, *, key=None, seed=None, n=None, process=None,
+task(request, max_new_tokens=None, *, key=None, n=None, process=None,
      images=None) -> CanvasGeneration
 Pretrained.text_generation(*, sampling=None) -> TextGeneration | MaskedGeneration
 Pretrained.lm_objective(seq_len, **options) -> LMObjective
@@ -432,11 +432,10 @@ TextToImage.from_pretrained(repo_id, *, ema=None, mesh=None, layout=None, dtype=
 LMObjective.policy(params, sampling=Sampling()) -> TextGeneration
 image_task.bind(variables) -> TextToImage
 image_task.quantized(spec) -> TextToImage
-image_task.prepare(prompts, *, key=None, seed=None, steps=None, unconditional=None,
+image_task.prepare(prompts, *, key=None, steps=None, unconditional=None,
                    image=None, image_latents=None, mask=None, noise=None, initial=None,
                    times=None, encode_key=None) -> DenoisingInputs
-image_task(prompts_or_prepared, *, steps=None, guidance=<default>, sampler=None, key=None,
-           seed=None, decode=True) -> Images
+image_task(prompts_or_prepared, *, steps=None, guidance=<default>, sampler=None, key=None, decode=True) -> Images
 RunProcessor(tokenizer)   # a run's ByteTokenizer or HFTokenizer as a task processor
 Server.from_task(task, *, slots, capacity, admission=None, kv_cache=None, chunk=None,
                  prefix_cache=False, decode_steps=1) -> Server
@@ -466,7 +465,7 @@ from dew.inference import OllamaCompletion, OpenAICompletion
 
 with ollama.Client(host="http://127.0.0.1:11434") as client:
     task = OllamaCompletion("my-exported-model", client)
-    answer = task("Explain this result.", 64, seed=7,
+    answer = task("Explain this result.", 64, key=7,
                   options={"temperature": 0.8, "top_p": 0.9, "num_gpu": 0})
     print(answer.texts)
 
@@ -532,7 +531,7 @@ from dew.interop import load_pretrained
 from dew.objectives.diffusion import DiffusionObjective
 
 source = load_pretrained("./image-checkpoint", dtype="float32")
-images = source.text_to_image()(["a flower"], steps=20, seed=0).host().images
+images = source.text_to_image()(["a flower"], steps=20, key=0).host().images
 objective = DiffusionObjective(
     source.model, source.process, source.inputs,
     autoencoder=source.autoencoder, pretrained=source.variables,

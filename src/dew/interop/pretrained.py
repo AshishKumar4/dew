@@ -763,11 +763,13 @@ def _language_layout(name: str, text_name: str, tensor: np.ndarray,
                      config, model_type: str, variables: Mapping[str, object],
                      component: str | None = None) -> WeightLayout | None:
     """Return the text family's leaf map plus its inverse storage operations."""
-    family = decoders._FAMILIES[model_type]
+    family = decoders.families()[model_type]
     # A family whose checkpoint packs its experts as `[E, out, in]`
     # (`_gemma4_prepare` swaps them into dew's `[E, in, out]`) writes them
     # back swapped.
-    packed = family.prepare_weights is decoders._gemma4_prepare
+    from dew.interop.families.gemma import _gemma4_prepare
+
+    packed = family.prepare_weights is _gemma4_prepare
 
     def nested(path: tuple[str, ...]) -> tuple[str, ...]:
         return path if component is None else (path[0], component, *path[1:])
@@ -1041,7 +1043,7 @@ class Pretrained:
         if self.export_adapter is not None:
             tensors = self.export_adapter(self.model, values, self.config)
         elif (isinstance(self.model, CausalTransformer) and isinstance(family, str)
-              and not decoders._FAMILIES.get(family, decoders._FAMILIES[verify.CONVENTION]).preserve_source_layout
+              and not decoders.families().get(family, decoders.families()[verify.CONVENTION]).preserve_source_layout
               and quantization is None):
             # The decoder export's own encoder, so this and `save_pretrained_decoder`
             # leave the same weights. A quantized source keeps its packed format
@@ -1759,7 +1761,7 @@ def _qwen_text_path(record: decoders.DecoderFields):
     """Map a Qwen3-VL checkpoint's tensors: its language model as the Qwen3
     decoder's, its head too, and its vision tower held as stored, which the
     text-to-image prompt never reads and an export writes back."""
-    family = decoders._FAMILIES["qwen3"]
+    family = decoders.families()["qwen3"]
 
     def path(name: str) -> tuple[str, ...] | None:
         if name.startswith("model.language_model."):
@@ -1844,7 +1846,7 @@ def _hidden_states_path(record: decoders.DecoderFields, family: str, multimodal:
     language model `language_model.model.` and its head
     `language_model.lm_head` (transformers 4.50 and 5 write these), or
     `model.language_model.` and `lm_head` (4.52 to 4.57)."""
-    decoder = decoders._FAMILIES[family]
+    decoder = decoders.families()[family]
 
     def path(name: str) -> tuple[str, ...] | None:
         if not multimodal or name == "lm_head.weight":
@@ -2310,9 +2312,9 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
     # preserve_source_layout and quantization, not by whether bindings exist.
     # A family whose tensors are rewritten before the path map reads them
     # (Gemma 4's prepare) has no raw-name bindings.
-    entry = decoders._FAMILIES[family]
+    entry = decoders.families()[family]
     layouts, retained = ((), {})
-    if entry.preserve_source_layout or entry.prepare_weights is dict:
+    if entry.preserve_source_layout or entry.prepare_weights is decoders.DecoderFamily.prepare_weights:
         layouts, retained = _decoder_layouts(tensors, record, family, variables)
     return _Built(model, variables, record, built, layouts, retained)
 
@@ -2398,7 +2400,7 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
     source_quantization(config)
     # An unregistered decoder is checked against transformers on the config
     # alone, before its weights download (tier 2, dew.interop.verify).
-    verified = (verify.verify_mapping(config) if isinstance(family, str) and family not in decoders._FAMILIES
+    verified = (verify.verify_mapping(config) if isinstance(family, str) and family not in decoders.families()
                 and family != "diffusion_gemma" and "text_config" not in config else None)
     if tensors is None:
         directory = sources.snapshot(str(name_or_dir), directory.name)
@@ -2416,7 +2418,7 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
         record, layouts, retained = config, (), {}
         built: Mapping[str, object] = {**config, "dtype": dtype, "attention_impl": attention_impl}
         export_adapter = diffusion_gemma.export_weights
-    elif "text_config" in config and (family not in decoders._FAMILIES or decoders._bundles(config)):
+    elif "text_config" in config and (family not in decoders.families() or decoders._bundles(config)):
         # A wrapper repo carries its decoder under text_config. Where its
         # model_type is a registered decoder family, its towers have no
         # counterpart and the text half, read from the nested config, is the

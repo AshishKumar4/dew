@@ -74,6 +74,8 @@ class FitStarted:
     device_kind: str
     processes: int
     mesh: Mapping[str, int]
+    seed: int | None = None
+    """None: no integer seed recorded (a JAX key was supplied, or the record predates the field)."""
 
 
 @dataclasses.dataclass(frozen=True)

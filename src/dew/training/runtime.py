@@ -108,6 +108,7 @@ def prepare_process(wandb: Wandb | None = None,
     # HF tokenizers fork a thread pool; grain's workers fork the process.
     os.environ['TOKENIZERS_PARALLELISM'] = "false"
     apply_xla_flags(xla_flags)
+    unpartition_gpu_pool()
     if compilation_cache_dir:
         enable_compilation_cache(compilation_cache_dir)
 
@@ -174,6 +175,23 @@ def prepare_process(wandb: Wandb | None = None,
         from dew.training.host import companion_mesh
         companion_mesh(build_mesh())
     print(f"Number of devices: {jax.device_count()}")
+
+
+def unpartition_gpu_pool() -> None:
+    """Turn off XLA's spatial partitioning of a preallocated GPU pool,
+    unless the run named it.
+
+    There a step's temporaries can lose their block between steps
+    (`dew.training.trainer.strands_temporaries`). The partitioning lets the
+    pool's upper end hold XLA's collective memory space
+    (xla/pjrt/gpu/se_gpu_pjrt_client.cc, `GetStreamExecutorGpuDeviceAllocator`
+    at openxla/xla 91888df, the commit jax 0.11.2 builds), which a buffer
+    takes only for NCCL user or symmetric buffers, a one-shot ragged
+    all-to-all or a Mosaic kernel's symmetric operand
+    (xla/service/gpu/gpu_memory_space_assignment.cc); Dew asks for none of
+    them. With it off XLA serves that space from an allocator of its own."""
+    if cuda_plugin() and xla_flag("xla_gpu_enable_allocator_spatial_partitioning") is None:
+        apply_xla_flags("--xla_gpu_enable_allocator_spatial_partitioning=false")
 
 
 def _pool_keys_alike() -> bool:

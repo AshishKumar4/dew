@@ -97,7 +97,11 @@ class ModelConfig:
     """What every matmul of the model asks XLA for, where the model declares
     a `precision` field: `default` is the backend's fastest algorithm,
     `high` and `highest` trade throughput for mantissa bits (on Ampere and
-    later, tf32 and fp32 against bf16x3). Unset leaves the model's own."""
+    later, tf32 and fp32 against bf16x3). Unset leaves the model's own, the
+    default. Under bf16 compute a decoder's vocabulary head at the default
+    rounds its logits and their gradient to bf16, as torch autocast does;
+    `high` and `highest` keep that head fp32, the setting for comparing
+    parallel layouts in bf16 (`dew.nn.precision.head_product`)."""
     attention_impl: AttentionImpl = "auto"
     """Attention kernel; 'auto' is cudnn on a GPU for the shapes cudnn
     supports and xla for the rest, xla on any other backend."""
@@ -179,7 +183,7 @@ class TrainerConfig:
     """Latest checkpoints kept, besides the best one."""
     batch_size: int = 32
     """Global batch, over every process."""
-    seed: int = 0
+    key: int = 0
     """Seed of the run key: parameter init and every per-step draw."""
     steps: int | None = None
     epochs: int | None = None
@@ -397,6 +401,9 @@ def _has_default(field: dataclasses.Field) -> bool:
     return field.default is not dataclasses.MISSING or field.default_factory is not dataclasses.MISSING
 
 
+_FIELD_RENAMES: Mapping[type, Mapping[str, str]] = {TrainerConfig: {"seed": "key"}}
+
+
 def _fields(cls: type, values: registry.Configured) -> dict[str, registry.Configured]:
     """The record's fields as `cls` declares them. A field the record lacks
     takes its declared default, which says what runs recorded before the
@@ -405,6 +412,11 @@ def _fields(cls: type, values: registry.Configured) -> dict[str, registry.Config
     record lacks, raises."""
     if not isinstance(values, Mapping):
         raise ValueError(f"{cls.__name__} is built from a record of its fields, not {values!r}")
+    for old, new in _FIELD_RENAMES.get(cls, {}).items():
+        if old in values:
+            if new in values:
+                raise ValueError(f"{cls.__name__} record carries both {old} and {new}")
+            values = {new if key == old else key: value for key, value in values.items()}
     declared = [f for f in dataclasses.fields(cls) if _recorded(f)]
     unknown = sorted(set(values) - {f.name for f in declared})
     missing = [f.name for f in declared if f.name not in values and not _has_default(f)]
@@ -603,7 +615,7 @@ class RunConfig:
             agreed("run metadata", record_run)
             state = Trainer.from_config(
                 trainer, objective, build_optimizer(self.optim, steps),
-                key=jax.random.key(trainer.seed),
+                key=trainer.key,
                 checkpoints=checkpoints,
                 tracker=tracker, rollout=rollout,
             ).fit(
