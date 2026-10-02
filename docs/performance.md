@@ -215,6 +215,26 @@ the step goes from 109.70 to 113.68 ms; the published config trains in
 bf16. At HIGHEST precision the fp32 output and input gradient equal lax's
 dilated convolution's exactly.
 
+The S5 layer ran its recurrence as `associative_scan` over complex
+states, whose backward spent 4.5 ms of the 4080's step in complex
+arithmetic alone. It now runs in real arithmetic, in chunks: inside a
+chunk the states are one fp32 product of the pole's powers with the
+chunk's inputs, and `associative_scan` carries only the chunks' last
+states (`dew.nn.ssm.diagonal_recurrence`, within the fp32 bound of the
+old scan). `tools/benchmark_step.py`, one batch on the device, ms per step
+(the asynchronous throughput a run sees), old against new, 2026-10-02:
+
+| device | batch 16 | batch 32 |
+|---|---:|---:|
+| RTX 4080, traced with command buffers off | 68.29 to 62.42 | |
+| A100 40 GB (Colab, `db1761fd`) | 42.38 to 40.89 | 65.67 to 62.39 |
+| TPU v6e (Colab, `db1761fd`) | 21.12 to 20.91 | 36.41 to 36.61 |
+
+One process a side on Colab. On the v6e a step waited on alone takes
+longer (p50 21.20 to 23.93 ms at batch 16), with the throughput above
+unchanged: the extra 2.7 ms is latency that a training loop's queued
+steps and a sampler's scanned steps never wait on.
+
 Unless a section says otherwise, the sections below were measured on jax
 0.11.1 / jaxlib 0.11.1 / jax_cuda12_plugin 0.11.1, driver 595.84, RTX 4080
 16 GiB, single device, bf16 compute, adam, 3 warmup and 10 measured steps,
