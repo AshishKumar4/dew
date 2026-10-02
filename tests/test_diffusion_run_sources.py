@@ -77,16 +77,16 @@ def test_a_run_fine_tunes_a_published_pipeline_and_rebinds_it_without_weights(
     batch = batch_for(objective, size)
     trainer = Trainer(objective, optax.sgd(1e-2), key=jax.random.PRNGKey(3))
     initial = trainer.initial_state()
-    before = value(objective, initial.params, batch)
+    before = value(objective, initial.variables, batch)
     state, _, _, _, accepted = trainer.compile(initial, batch)(initial, batch)
     assert bool(accepted)
-    trained = value(objective, state.params, batch)
+    trained = value(objective, state.variables, batch)
     assert trained < before
 
     metadata = tmp_path / "metadata"
     shutil.copytree(directory, metadata, ignore=shutil.ignore_patterns("*.safetensors"))
-    rebuilt = dataclasses.replace(config, pretrained=str(metadata)).build(variables=state.params)
-    assert value(rebuilt, state.params, batch) == trained
+    rebuilt = dataclasses.replace(config, pretrained=str(metadata)).build(variables=state.variables)
+    assert value(rebuilt, state.variables, batch) == trained
 
 
 def test_a_pretrained_run_refuses_a_preset_of_another_kind(pipelines):
@@ -159,10 +159,10 @@ def test_a_published_family_trains_from_scratch_on_its_pipelines_text_towers(pip
     batch = batch_for(objective, 8)
     trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.PRNGKey(0))
     initial = trainer.initial_state()
-    before = value(objective, initial.params, batch)
+    before = value(objective, initial.variables, batch)
     state, _, _, _, accepted = trainer.compile(initial, batch)(initial, batch)
     assert bool(accepted)
-    assert value(objective, state.params, batch) < before
+    assert value(objective, state.variables, batch) < before
 
 
 def grpo_run(beta: float = 0.0, directory: str = "./checkpoints") -> DiffusionRunConfig:
@@ -182,7 +182,7 @@ def grpo_step(objective, rollout, **trainer):
                       **trainer)
     initial = trainer.initial_state()
     prepared = rollout(initial, batch_for(objective, 4), jax.random.PRNGKey(2))
-    started = [np.asarray(leaf) for leaf in jax.tree.leaves(initial.params["params"])]
+    started = [np.asarray(leaf) for leaf in jax.tree.leaves(initial.variables["params"])]
     state, _, _, _, accepted = trainer.compile(initial, prepared)(initial, prepared)
     assert bool(accepted)
     return prepared, started, state
@@ -199,7 +199,7 @@ def test_flow_grpo_trains_from_the_run_config_on_a_registered_reward():
     assert prepared["latents"].shape[:2] == (jax.device_count() * 2, 2)
     assert np.all(np.isfinite(prepared["rewards"]))
     assert any(not np.array_equal(after, before) for after, before in zip(
-        jax.tree.leaves(state.params["params"]), started, strict=True))
+        jax.tree.leaves(state.variables["params"]), started, strict=True))
 
 
 def test_a_saved_flow_grpo_run_restores_its_policy_and_not_its_kl_reference(tmp_path):

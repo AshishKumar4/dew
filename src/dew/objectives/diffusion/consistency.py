@@ -294,13 +294,13 @@ class ConsistencyDistillationObjective(DiffusionObjective):
         network = self._network(student_params, given)
         return backward_simulation(lambda x, t: trig_prediction(network, x, t)[0], x_T, times, noises, live)
 
-    def loss(self, params, batch, step: Step):
+    def loss(self, variables, batch, step: Step):
         samples = unit_range(batch[self.inputs.sample.key])
         encode_key, drop_key, time_key, noise_key, generate_key = jax.random.split(step.key, 5)
         if self.autoencoder is not None:
-            samples = self.autoencoder.encode(params["autoencoder"], samples, encode_key)
+            samples = self.autoencoder.encode(variables["autoencoder"], samples, encode_key)
         count = samples.shape[0]
-        given, blank = self._conditions(params, batch, drop_key, dropout=False)
+        given, blank = self._conditions(variables, batch, drop_key, dropout=False)
         iteration = step.step
         warm = iteration < self.tangent_warmup
         student_phase = (self.dmd_weight <= 0) | warm | (
@@ -344,7 +344,7 @@ class ConsistencyDistillationObjective(DiffusionObjective):
             fake, _ = trig_prediction(self._network(self._fake(params), given), x, t)
             return critic_loss(generated, fake, t)
 
-        losses = jax.lax.cond(student_phase, student_losses, critic_losses, params)
+        losses = jax.lax.cond(student_phase, student_losses, critic_losses, variables)
         return Ratio(jnp.sum(losses), jnp.asarray(count, jnp.float32)), Aux(metrics={})
 
     def _distribution_matching(self, params, student_params, given, blank, key, iteration, count, shape):

@@ -202,16 +202,17 @@ def test_one_trainer_step_moves_the_adapter_and_nothing_else(decoder, loaded, re
     state = trainer.fit(data, steps=1, log_every=1)
 
     for before, after in zip(
-        jax.tree.leaves(initial.params[FROZEN]), jax.tree.leaves(state.params[FROZEN]), strict=True
+        jax.tree.leaves(initial.variables[FROZEN]), jax.tree.leaves(state.variables[FROZEN]), strict=True
     ):
         np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
     assert all(
         bool(jnp.any(before != after))
         for before, after in zip(
-            jax.tree.leaves(initial.params["params"]), jax.tree.leaves(state.params["params"]), strict=True
+            jax.tree.leaves(initial.variables["params"]),
+            jax.tree.leaves(state.variables["params"]), strict=True
         )
     )
-    trained = thaw(state.params)
+    trained = thaw(state.variables)
     logits = adapter.adapt(decoder.model).apply(trained, jnp.asarray(tokens))
     np.testing.assert_allclose(np.asarray(logits), reference["updated_logits"], atol=1e-4, rtol=0)
     exported = _factors(adapter, trained, tmp_path / "adapter")
@@ -253,25 +254,25 @@ def test_a_source_fine_tunes_through_its_own_adapted_bundle(decoder, reference, 
         log_every=2,
     )
 
-    assert set(_flat(state.params["params"])) == {
+    assert set(_flat(state.variables["params"])) == {
         f"{'.'.join(target[1:])}.{factor}" for target in tuned.adapter.targets for factor in lora.FACTORS}
     for before, after in zip(
-        jax.tree.leaves(initial.params[FROZEN]), jax.tree.leaves(state.params[FROZEN]), strict=True
+        jax.tree.leaves(initial.variables[FROZEN]), jax.tree.leaves(state.variables[FROZEN]), strict=True
     ):
         np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
-    trained = thaw(state.params)
-    tuned.adapter.save(state.params, tmp_path / "adapter")
+    trained = thaw(state.variables)
+    tuned.adapter.save(state.variables, tmp_path / "adapter")
     _, read = LoRA.load(source.model, source.variables, source.layouts, tmp_path / "adapter")
     for name, leaf in _flat(read).items():
         np.testing.assert_array_equal(np.asarray(leaf), np.asarray(_flat(trained)[name]), err_msg=name)
     # The export is the merged weights in the source's layout, so the reload
     # computes exactly what the source model computes on them; how close the
     # merge is to the adapted forward is the PEFT parity test's to bound.
-    tuned.save(tmp_path / "merged", variables=state.params)
+    tuned.save(tmp_path / "merged", variables=state.variables)
     reloaded = Pretrained.load(tmp_path / "merged", dtype="float32", attention_impl="reference")
     ids = jnp.asarray(tokens)
     np.testing.assert_array_equal(np.asarray(reloaded.model.apply(reloaded.variables, ids)),
-                                  np.asarray(source.model.apply(tuned.adapter.merge(state.params), ids)))
+                                  np.asarray(source.model.apply(tuned.adapter.merge(state.variables), ids)))
 
     # A source that ships a tokenizer hands its processor to the objective.
     processor = RunProcessor(ByteTokenizer())
@@ -712,13 +713,13 @@ def test_a_run_config_adapter_trains_its_factors_and_nothing_else(tmp_path):
     assert selects(("params", "layers_0", "self_attn", "q_proj", "lora_A"))
     assert not selects(("params", "layers_0", "self_attn", "q_proj", "kernel"))
     initial = Trainer(objective, optax.sgd(0.0), key=config.trainer.key).initial_state()
-    moved = _flat(state.params["params"])
+    moved = _flat(state.variables["params"])
     assert set(moved) == {f"{'.'.join(target[1:])}.{factor}"
                           for target in config.lora.targets for factor in lora.FACTORS}
     for name, leaf in moved.items():
-        assert bool(jnp.any(leaf != _flat(initial.params["params"])[name])), f"{name} did not move"
-    for before, after in zip(jax.tree.leaves(initial.params[FROZEN]),
-                             jax.tree.leaves(state.params[FROZEN]), strict=True):
+        assert bool(jnp.any(leaf != _flat(initial.variables["params"])[name])), f"{name} did not move"
+    for before, after in zip(jax.tree.leaves(initial.variables[FROZEN]),
+                             jax.tree.leaves(state.variables[FROZEN]), strict=True):
         np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
     record = json.loads((tmp_path / "run" / "run.json").read_text())
     assert record["lora"]["targets"]["params/layers_0/self_attn/q_proj"] == {"rank": 2, "alpha": 4.0}
@@ -763,8 +764,8 @@ def test_the_branch_reaches_every_layer_of_a_scanned_run(decoder, reference):
         np.asarray(scanned.apply(variables, tokens)), np.asarray(plain), rtol=1e-5, atol=1e-5
     )
 
-    def loss(params):
-        return jnp.mean(scanned.apply({**variables, "params": params}, tokens) ** 2)
+    def loss(variables):
+        return jnp.mean(scanned.apply({**variables, "params": variables}, tokens) ** 2)
 
     grads = jax.grad(loss)(variables["params"])
     for layer in ("layers_0", "layers_1"):
@@ -881,13 +882,13 @@ def test_a_pipeline_lora_run_moves_its_factors_and_nothing_else(family, pipeline
     data = Dataset(train=lambda partition: iter([batch] * 3), val=None, records=rows, batch=rows)
     state = trainer.fit(data, steps=3, log_every=3)
 
-    assert set(_flat(state.params["params"])) == {
+    assert set(_flat(state.variables["params"])) == {
         f"{'.'.join(path[1:])}.{factor}" for path in tuned.adapter.targets for factor in lora.FACTORS}
     for collection in (FROZEN, "encoders", "autoencoder"):
-        for before, after in zip(jax.tree.leaves(initial.params[collection]),
-                                 jax.tree.leaves(state.params[collection]), strict=True):
+        for before, after in zip(jax.tree.leaves(initial.variables[collection]),
+                                 jax.tree.leaves(state.variables[collection]), strict=True):
             np.testing.assert_array_equal(np.asarray(before), np.asarray(after), err_msg=collection)
-    assert all(bool(jnp.any(leaf)) for name, leaf in _flat(state.params["params"]).items()
+    assert all(bool(jnp.any(leaf)) for name, leaf in _flat(state.variables["params"]).items()
                if name.endswith("lora_B"))
     assert np.isfinite(_sampled(objective.pipeline(state))).all()
     with pytest.raises(ValueError, match="already selects what trains"):
@@ -995,12 +996,12 @@ def test_a_run_config_adapter_trains_a_diffusion_models_factors_and_nothing_else
 
     assert objective.trainable is not None
     initial = Trainer(objective, optax.sgd(0.0), key=config.trainer.key).initial_state()
-    moved = _flat(state.params["params"])
+    moved = _flat(state.variables["params"])
     assert set(moved) == {f"{'.'.join(target[1:])}.{factor}"
                           for target in adapter.targets for factor in lora.FACTORS}
     for name, leaf in moved.items():
-        assert bool(jnp.any(leaf != _flat(initial.params["params"])[name])), f"{name} did not move"
+        assert bool(jnp.any(leaf != _flat(initial.variables["params"])[name])), f"{name} did not move"
     for collection in (FROZEN, "encoders"):
-        for before, after in zip(jax.tree.leaves(initial.params[collection]),
-                                 jax.tree.leaves(state.params[collection]), strict=True):
+        for before, after in zip(jax.tree.leaves(initial.variables[collection]),
+                                 jax.tree.leaves(state.variables[collection]), strict=True):
             np.testing.assert_array_equal(np.asarray(before), np.asarray(after), err_msg=collection)

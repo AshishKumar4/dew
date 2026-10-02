@@ -78,15 +78,15 @@ class DPOObjective(LMObjective):
         # pairs into the halves and compare across them.
         return (ids[:, 0], ids[:, 1], mask[:, 0, 1:], mask[:, 1, 1:])
 
-    def loss(self, params, batch, step):
+    def loss(self, variables, batch, step):
         """Score the preference term over each pair's completion tokens."""
         if step.ema is None:
             raise ValueError(
                 "the DPO reference reads step.ema, but the objective keeps no EMA; "
                 "a DPO run always freezes one")
         chosen_ids, rejected_ids, chosen_mask, rejected_mask = self._halves(batch)
-        policy_chosen = self.per_token_log_probs(params, chosen_ids)
-        policy_rejected = self.per_token_log_probs(params, rejected_ids)
+        policy_chosen = self.per_token_log_probs(variables, chosen_ids)
+        policy_rejected = self.per_token_log_probs(variables, rejected_ids)
         ref_chosen = self.per_token_log_probs(step.ema, chosen_ids)
         ref_rejected = self.per_token_log_probs(step.ema, rejected_ids)
         terms, (pair_chosen, pair_rejected) = preference_logsigmoid_terms(

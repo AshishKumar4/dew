@@ -84,7 +84,7 @@ import dew
 from dew.interop import PretrainedDecoder
 from dew.training import MeshSpec
 
-PretrainedDecoder.from_model(model, state.params, tokenizer="byte").save("lily-decoder")
+PretrainedDecoder.from_model(model, state.variables, tokenizer="byte").save("lily-decoder")
 loaded = dew.pipeline("lily-decoder", mesh=MeshSpec(), dtype=jnp.float32)
 loaded = dataclasses.replace(loaded, processor=RunProcessor(tokenizer),
                              sampling=Sampling(temperature=0.0))
@@ -130,7 +130,8 @@ import jax.numpy as jnp
 from dew.sampling import TextToImage
 from dew.training.quantization import Quantization
 
-pipe = TextToImage.from_pretrained("dewml/hybrid-dit-176m", dtype=jnp.bfloat16)
+pipe = TextToImage.from_pretrained("dewml/hybrid-dit-176m", dtype=jnp.bfloat16,
+                                   revision="0964f57387afc938927b1047f19ed32b63fe0619")
 served = pipe.quantized(Quantization(dtype="int8", patterns=("^(?!.*spatial_fusion).*",)))
 images = served(["a red fox in a snowy forest"], steps=20, key=0).host().images
 ```

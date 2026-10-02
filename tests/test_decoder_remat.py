@@ -100,7 +100,7 @@ def training_step(model):
 def train_state(step, variables, opt_state, key):
     """A single-microbatch state after `step` committed updates."""
     count = jnp.asarray(step, jnp.int32)
-    return TrainState(step=count, microstep=count, updates=count, params=variables,
+    return TrainState(step=count, microstep=count, updates=count, variables=variables,
                       opt_state=opt_state, ema=None, key=key, scale=None,
                       window_size=jnp.asarray(1, jnp.int32))
 
@@ -218,9 +218,9 @@ def test_checkpoint_resumes_with_remat_switched(tmp_path, saved_remat):
     restored, position = checkpoints.restore(template)
     assert position is None
     assert int(restored.step) == 1 and int(restored.updates) == 1
-    expected = run(state.params, state.opt_state, batch(), state.key)
+    expected = run(state.variables, state.opt_state, batch(), state.key)
     resume, _ = training_step(resumed_model)
-    actual = resume(restored.params, restored.opt_state, batch(), restored.key)
+    actual = resume(restored.variables, restored.opt_state, batch(), restored.key)
     assert abs(float(actual[2] - expected[2])) < 2e-5
     assert difference(actual[0], expected[0]) < 2e-5
 
@@ -231,9 +231,9 @@ NAMED = [name for name in REMAT_POLICIES if name != 'full']
 def gradient_step(model, variables, key):
     objective = objective_for(model)
 
-    def loss(params):
+    def loss(variables):
         info = Step(jnp.zeros((), jnp.int32), key, None)
-        return objective.scalar_loss({**variables, "params": params}, batch(), info)
+        return objective.scalar_loss({**variables, "params": variables}, batch(), info)
 
     return jax.jit(jax.value_and_grad(loss, has_aux=True))(variables["params"])
 
@@ -265,9 +265,9 @@ def residuals(model, variables, capsys):
     `jax.ad_checkpoint.print_saved_residuals` reports it."""
     objective = objective_for(model)
 
-    def loss(params):
+    def loss(variables):
         info = Step(jnp.zeros((), jnp.int32), jax.random.key(1), None)
-        return objective.scalar_loss({**variables, "params": params}, batch(), info)[0]
+        return objective.scalar_loss({**variables, "params": variables}, batch(), info)[0]
 
     capsys.readouterr()
     jax.ad_checkpoint.print_saved_residuals(loss, variables["params"])

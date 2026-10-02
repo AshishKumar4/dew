@@ -47,7 +47,7 @@ trainer = Trainer(objective, optimizer, key=jax.random.key(0))
 state = trainer.fit(data, steps=steps, log_every=100, eval_every=500, metrics=(Perplexity(),))
 
 for index, prompt in enumerate(("ROMEO:", "JULIET:")):
-    result = generate(model, state.params, [tokenizer.encode(prompt)], max_new_tokens=200,
+    result = generate(model, state.variables, [tokenizer.encode(prompt)], max_new_tokens=200,
                       key=jax.random.key(index), sampling=Sampling(
                           temperature=0.5, top_k=40, eos_id=(46, 33, 63), pad_id=32))
     print(tokenizer.decode(result.tokens[0]), end="\n\n")

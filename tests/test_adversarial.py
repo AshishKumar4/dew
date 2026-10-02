@@ -151,6 +151,6 @@ def test_a_saved_student_samples_in_one_step(runs, tmp_path):
     checkpoints.wait()
     config.save(str(tmp_path / "student"))
     restored = TextToImage.from_run(str(tmp_path / "student"))
-    assert TEACHER not in restored.params and DISCRIMINATOR not in restored.params["params"]
+    assert TEACHER not in restored.variables and DISCRIMINATOR not in restored.variables["params"]
     expected = task.pipeline(state, ema=False)(["a red bird"], key=9).host().images
     np.testing.assert_array_equal(restored(["a red bird"], key=9).host().images, expected)

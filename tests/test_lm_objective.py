@@ -344,12 +344,12 @@ def test_the_objective_trains_through_the_trainer(tmp_path, fsdp):
     trainer = make_trainer(tmp_path, fsdp=fsdp)
     batch = next(cycle_batches(seed=7))
     scored = jax.jit(lambda params: trainer.objective.scalar_loss(params, batch, step_at())[0])
-    before = float(scored(trainer.initial_state().params))
+    before = float(scored(trainer.initial_state().variables))
 
     state = trainer.fit(Data(cycle_batches), steps=STEPS, log_every=50)
-    after = float(scored(state.params))
+    after = float(scored(state.variables))
 
-    specs = [p.sharding.spec for p in jax.tree.leaves(state.params)]
+    specs = [p.sharding.spec for p in jax.tree.leaves(state.variables)]
     if fsdp > 1:
         assert any('fsdp' in str(spec) for spec in specs), "no parameter was sharded"
     assert before > 1.5, "the untrained model already knew the task"
@@ -532,7 +532,7 @@ def test_the_validation_pass_scores_perplexity_per_token_and_logs_it():
 
     total, count = 0.0, 0.0
     for batch in batches:
-        scores = trainer.objective.evaluate(state.params, batch, step_at())
+        scores = trainer.objective.evaluate(state.variables, batch, step_at())
         total += float(jnp.sum(scores.losses * scores.weights))
         count += float(jnp.sum(scores.weights))
     logged = [s["val/perplexity"] for _, s in tracker.scalars if "val/perplexity" in s]

@@ -118,8 +118,8 @@ def worst(ours, theirs) -> float:
 def objective(model, tokens):
     """lm-engine's training loss: the mean next-token cross entropy plus the
     coefficient times the summed Switch loss and 0.1 of the router z-loss."""
-    def loss(params):
-        logits, sown = model.apply({"params": params}, tokens, mutable=["router"])
+    def loss(variables):
+        logits, sown = model.apply({"params": variables}, tokens, mutable=["router"])
         logp = jax.nn.log_softmax(logits[:, :-1], axis=-1)
         lm = -jnp.mean(jnp.take_along_axis(logp, tokens[:, 1:, None], axis=-1))
         routing = sown["router"]

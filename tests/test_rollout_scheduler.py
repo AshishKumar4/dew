@@ -585,5 +585,5 @@ def test_a_trainer_run_trains_through_multi_turn_environments_on_the_native_serv
     assert server.version == 2
     assert not all(
         jnp.array_equal(a, b)
-        for a, b in zip(jax.tree.leaves(params), jax.tree.leaves(state.params), strict=True)
+        for a, b in zip(jax.tree.leaves(params), jax.tree.leaves(state.variables), strict=True)
     )

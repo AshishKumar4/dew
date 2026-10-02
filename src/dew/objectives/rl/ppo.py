@@ -152,7 +152,7 @@ class PPOObjective(Objective[Ratio, Variables]):
     def pipeline(self, state: TrainState, *, ema: bool | None = None,
                  processor: Processor | None = None) -> TextGeneration:
         """Publish the trained actor, without the critic or the frozen KL reference."""
-        actor_state = replace(state, params=_part(state.params, "policy"))
+        actor_state = replace(state, variables=_part(state.variables, "policy"))
         return self.actor.pipeline(actor_state, ema=ema, processor=processor)
 
     def values(self, variables: Variables, batch: Mapping[str, object]) -> jax.Array:
@@ -173,15 +173,15 @@ class PPOObjective(Objective[Ratio, Variables]):
         )
         return jnp.where(jnp.asarray(batch[RESPONSE_MASK_KEY]) != 0, aligned, 0.0)
 
-    def loss(self, params: Variables, batch, step: Step) -> tuple[Ratio, Aux[Variables]]:
+    def loss(self, variables: Variables, batch, step: Step) -> tuple[Ratio, Aux[Variables]]:
         """Add the actor's policy loss to the clipped value error on the same mass."""
         for field in (OLD_VALUES_KEY, RETURNS_KEY):
             if field not in batch or jnp.shape(batch[field]) != jnp.shape(batch[RESPONSE_MASK_KEY]):
                 raise ValueError(f"PPO requires response-aligned {field} from the rollout")
         policy_step = replace(step, ema=None if step.ema is None else _part(step.ema, "policy"))
-        pg, aux = self.actor.loss(_part(params, "policy"), batch, policy_step)
+        pg, aux = self.actor.loss(_part(variables, "policy"), batch, policy_step)
         mask = jnp.asarray(batch[RESPONSE_MASK_KEY])
-        terms = clipped_value_loss_terms(self.values(params, batch), jnp.asarray(batch[RETURNS_KEY]),
+        terms = clipped_value_loss_terms(self.values(variables, batch), jnp.asarray(batch[RETURNS_KEY]),
                                          jnp.asarray(batch[OLD_VALUES_KEY]), self.value_clip)
         critic = Ratio(jnp.sum(jnp.where(mask != 0, terms, 0) * mask), pg.mass)
         metrics = {**aux.metrics, "critic/loss": critic.mean()[0]}
@@ -290,11 +290,12 @@ class PPORollout:
             return {**projected, OLD_VALUES_KEY: zeros, ADVANTAGES_KEY: zeros, RETURNS_KEY: zeros}
         if int(count) < 2:
             raise ValueError("PPO GAE whitening requires at least two action tokens globally")
-        mesh = mesh_of(state.params)
+        mesh = mesh_of(state.variables)
         device = agreed(
             "PPO critic inputs", lambda: projected if mesh is None else shard_batch(mesh, projected)
         )
-        values = agreed("PPO critic values", lambda: local_rows(self._compiled_values(state.params, device)))
+        values = agreed(
+            "PPO critic values", lambda: local_rows(self._compiled_values(state.variables, device)))
         rewards = np.asarray(
             [0.0 if episode.reward is None else episode.reward for episode in episodes], np.float32
         )

@@ -292,23 +292,24 @@ def test_the_teacher_never_moves_and_the_student_learns(tmp_path):
     batch = {TEXT_KEY: jnp.tile(fixture_batch(arrays)[TEXT_KEY], (4, 1))}
     trainer = make_trainer(arrays)
     initial = trainer.initial_state()
-    before = float(trainer.objective.scalar_loss(initial.params, batch, step_at())[0])
+    before = float(trainer.objective.scalar_loss(initial.variables, batch, step_at())[0])
 
     state = trainer.fit(Data(batch), steps=5, log_every=1)
 
-    for path, leaf in jax.tree_util.tree_leaves_with_path(state.params[TEACHER]):
+    for path, leaf in jax.tree_util.tree_leaves_with_path(state.variables[TEACHER]):
         assert np.array_equal(np.asarray(leaf), np.asarray(dict(
-            jax.tree_util.tree_leaves_with_path(initial.params[TEACHER]))[path])), path
-    for name, kernel in state.params["params"][PROJECTIONS].items():
+            jax.tree_util.tree_leaves_with_path(initial.variables[TEACHER]))[path])), path
+    for name, kernel in state.variables["params"][PROJECTIONS].items():
         assert not np.array_equal(
-            np.asarray(kernel), np.asarray(initial.params["params"][PROJECTIONS][name])
+            np.asarray(kernel), np.asarray(initial.variables["params"][PROJECTIONS][name])
         ), name
-    after = float(trainer.objective.scalar_loss(state.params, batch, step_at())[0])
+    after = float(trainer.objective.scalar_loss(state.variables, batch, step_at())[0])
     assert after < before, (before, after)
 
     make_trainer(arrays, tmp_path).fit(Data(batch), steps=3, log_every=1)
     resumed = make_trainer(arrays, tmp_path).fit(Data(batch), steps=5, log_every=1)
-    for straight, again in zip(jax.tree.leaves(state.params), jax.tree.leaves(resumed.params), strict=True):
+    for straight, again in zip(jax.tree.leaves(state.variables),
+                               jax.tree.leaves(resumed.variables), strict=True):
         np.testing.assert_array_equal(np.asarray(straight), np.asarray(again))
     assert Checkpoints(str(tmp_path / "distill")).latest == 5
 

@@ -281,7 +281,7 @@ def test_mlflow_marks_the_run_of_a_failed_fit_failed(tmp_path, monkeypatch):
     from dew.training import MLflowTracker
 
     class Broken(Regression):
-        def loss(self, params, batch, step):
+        def loss(self, variables, batch, step):
             raise ValueError('objective broke')
 
     with MLflowTracker('dew-reporting', 'failed-fit', uri=store) as tracker:

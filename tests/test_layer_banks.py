@@ -185,7 +185,7 @@ def test_nested_checkpoint_banks_restore_only_selected_leaves_and_partial_ema(tm
         "embed_tokens": first_leaf(local["embed_tokens"]),
     }}, site.namespace)
     zero = jnp.asarray(0, jnp.int32)
-    state = TrainState(step=zero, microstep=zero, updates=zero, params=variables,
+    state = TrainState(step=zero, microstep=zero, updates=zero, variables=variables,
                        opt_state=(), ema=averaged, key=jax.random.PRNGKey(0),
                        scale=None, window_size=jnp.asarray(1, jnp.int32))
     checkpoints = Checkpoints(str(tmp_path))
@@ -209,7 +209,7 @@ def test_a_checkpoint_written_again_at_a_path_is_read_as_it_now_is(tmp_path):
     zero = jnp.asarray(0, jnp.int32)
     for kind in ("multimodal", "shared-diffusion"):
         _, variables, _, _, _ = fixture(kind)
-        state = TrainState(step=zero, microstep=zero, updates=zero, params=variables,
+        state = TrainState(step=zero, microstep=zero, updates=zero, variables=variables,
                            opt_state=(), ema=None, key=jax.random.PRNGKey(0),
                            scale=None, window_size=jnp.asarray(1, jnp.int32))
         if run.exists():

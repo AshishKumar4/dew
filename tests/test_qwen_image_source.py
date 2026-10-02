@@ -342,15 +342,15 @@ def test_a_trained_qwen_image_step_exports_and_reloads(source, loaded, arrays, r
         loss, _ = objective.loss(params, batch, fixed)
         return float(loss.total / loss.mass)
 
-    before = value(initial.params)
+    before = value(initial.variables)
     state, _, _, _, accepted = trainer.compile(initial, batch)(initial, batch)
     assert bool(accepted)
-    assert value(state.params) < before
-    assert not np.allclose(state.params["params"]["proj_out"]["kernel"],
-                           initial.params["params"]["proj_out"]["kernel"])
+    assert value(state.variables) < before
+    assert not np.allclose(state.variables["params"]["proj_out"]["kernel"],
+                           initial.variables["params"]["proj_out"]["kernel"])
     for held in ("encoders", "autoencoder"):
-        for got, want in zip(jax.tree.leaves(state.params[held]),
-                             jax.tree.leaves(initial.params[held]), strict=True):
+        for got, want in zip(jax.tree.leaves(state.variables[held]),
+                             jax.tree.leaves(initial.variables[held]), strict=True):
             np.testing.assert_array_equal(got, want)
 
     checkpoints.save(1, state, None, {})
@@ -361,7 +361,7 @@ def test_a_trained_qwen_image_step_exports_and_reloads(source, loaded, arrays, r
         np.testing.assert_array_equal(raw_leaf(got), raw_leaf(want))
 
     export = tmp_path / "export"
-    loaded.save(export, variables=state.params)
+    loaded.save(export, variables=state.variables)
     for component in ("text_encoder", "vae"):
         published, written = (component_tensors(source / "pipeline", component),
                               component_tensors(export, component))
@@ -379,6 +379,6 @@ def test_a_trained_qwen_image_step_exports_and_reloads(source, loaded, arrays, r
     grid = (record["pipeline"]["height"] // 16, record["pipeline"]["width"] // 16)
     latent = jnp.asarray(nhwc(arrays["pipeline.x_T"], *grid))
     times = jnp.asarray([500.0, 100.0])
-    trained = loaded.model.apply({"params": state.params["params"]}, latent, times, condition)
+    trained = loaded.model.apply({"params": state.variables["params"]}, latent, times, condition)
     reloaded = again.model.apply({"params": again.variables["params"]}, latent, times, condition)
     np.testing.assert_array_equal(reloaded, trained)

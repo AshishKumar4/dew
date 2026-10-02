@@ -577,11 +577,11 @@ def parameter_movement(tool, case, steps: int = 2):
     trainer = tool.build_trainer(case, "reference")
     source = tool.batches(case, trainer.device_mesh)
     state = jax.jit(trainer.initial_state)()
-    before = jax.tree.map(np.asarray, named(state.params))  # the step consumes the state
+    before = jax.tree.map(np.asarray, named(state.variables))  # the step consumes the state
     compiled = trainer.compile(state, next(source))
     for _ in range(steps):
         state, loss, _, finite, _ = compiled(state, next(source))
-    after = named(state.params)
+    after = named(state.variables)
     assert bool(finite) and np.isfinite(float(loss))
     moved = {name: float(jnp.max(jnp.abs(value - before[name])))
              for name, value in after.items()}

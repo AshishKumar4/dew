@@ -1151,8 +1151,8 @@ def test_glm5_prediction_index_reuse_does_not_change_forward_or_sft(glm5_next_so
     enabled = source.model
     disabled = enabled.clone(index_share_for_mtp_iteration=False)
 
-    def loss(model, params):
-        variables = {**source.variables, "params": params}
+    def loss(model, variables):
+        variables = {**source.variables, "params": variables}
         hidden = model.apply(variables, ids, method="hidden_states")
         predicted = model.apply(variables, hidden, ids, train=True, method="mtp_logits")[0]
         return jnp.mean(predicted ** 2)
@@ -1309,8 +1309,8 @@ def test_scalar_mode_survives_scanning_and_rematerialized_backward(mode):
     scanned = plain.clone(scan_layers=True, remat="full")
     ids = jnp.asarray(np.load(GEMMA4_MOE / "input_ids.npy"), jnp.int32)
 
-    def loss(model, params):
-        return jnp.mean(model.apply({**variables, "params": params}, ids) ** 2)
+    def loss(model, variables):
+        return jnp.mean(model.apply({**variables, "params": variables}, ids) ** 2)
 
     expected, expected_grad = jax.jit(jax.value_and_grad(lambda params: loss(plain, params)))(
         variables["params"]
