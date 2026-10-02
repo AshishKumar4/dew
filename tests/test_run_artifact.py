@@ -177,3 +177,25 @@ def test_every_builtin_process_component_round_trips_nondefaults(component):
         jax.tree.map(np.testing.assert_array_equal,
                      original.prediction.backward_diffusion(clean, noise, rates),
                      rebuilt.prediction.backward_diffusion(clean, noise, rates))
+
+
+def test_python_diffusion_checkpoint_preserves_its_solver(tmp_path):
+    from dew.diffusion.presets import Flow
+    from dew.inference import TextToImage
+    from dew.inputs import Field, InputSpec
+    from dew.nn.backbones.dit import SimpleDiT
+    from dew.objectives.diffusion import DiffusionObjective
+    from dew.sampling.solvers import Euler
+
+    model = SimpleDiT(patch_size=2, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1,
+                      output_channels=1, dtype=jnp.float32)
+    objective = DiffusionObjective(model, Flow(), InputSpec(Field('image', (4, 4, 1))),
+                                   solver=Euler(), steps=2, ema_decay=None)
+    source = grain.MapDataset.source([{'image': np.ones((4, 4, 1), np.float32)}] * 8)
+    data = Dataset.from_grain(source, batch=8, loading=Loading(workers=0))
+    trainer = Trainer(objective, optax.sgd(.01), key=0, checkpoints=Checkpoints(str(tmp_path / 'run')))
+    trainer.fit(data, steps=1, log_every=1, checkpoint_every=1)
+    trainer.checkpoints.wait()
+    loaded = TextToImage.from_run(str(tmp_path / 'run'))
+    assert isinstance(loaded.solver, Euler)
+    assert loaded.steps == 2
