@@ -38,7 +38,7 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from reference_error import FACTOR, assert_as_exact_as_the_reference, distance
 
 from dew.interop import load_pretrained
-from dew.interop.hf_decoders import families, _wrapper_sources, translate_config, translate_wrapper_config
+from dew.interop.hf_decoders import _wrapper_sources, families, translate_config, translate_wrapper_config
 from dew.nn.engram import Engram
 from dew.nn.fake_quant import fake_quant_fp4, fake_quant_fp8
 from dew.nn.inputs import ModelInputs

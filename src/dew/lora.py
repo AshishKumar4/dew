@@ -224,7 +224,11 @@ class LoRA:
             dtype = jnp.promote_types(kernel.dtype, jnp.float32)
             delta = jnp.tensordot(a.astype(dtype), b.astype(dtype), axes=1,
                                   precision=jax.lax.Precision.HIGHEST)
-            _insert(merged, (*path, "kernel"), (kernel.astype(dtype) + self.scale(target) * delta).astype(kernel.dtype))
+            _insert(
+                merged,
+                (*path, "kernel"),
+                (kernel.astype(dtype) + self.scale(target) * delta).astype(kernel.dtype),
+            )
         return select(overlay(variables, merged), lambda path: not self.trainable(path))
 
     @classmethod
@@ -610,7 +614,9 @@ def _place(layouts: Mapping[str, WeightLayout], variables: Variables,
     components = _components(layouts)
     settings = {(entry.config.rslora, entry.config.dropout) for entry in entries}
     if len(settings) != 1:
-        raise ValueError("the components disagree on use_rslora or lora_dropout, which one adapter carries once")
+        raise ValueError(
+            "the components disagree on use_rslora or lora_dropout, which one adapter carries once"
+        )
     (rslora, dropout), = settings
     targets: dict[Path, Target] = {}
     bound: dict[str, WeightLayout] = {}
@@ -652,7 +658,9 @@ def _diffusers_configs(tensors: Mapping[str, np.ndarray], metadata: str | None,
         for key, value in json.loads(metadata).items():
             component, _, field = key.partition(".")
             fields.setdefault(component, {})[field] = value
-        return {component: _Config.read(config, f"{where} ({component})") for component, config in fields.items()}
+        return {
+            component: _Config.read(config, f"{where} ({component})") for component, config in fields.items()
+        }
     ranks: dict[str, dict[str, int]] = {}
     for key, tensor in tensors.items():
         component, _, rest = key.partition(".")

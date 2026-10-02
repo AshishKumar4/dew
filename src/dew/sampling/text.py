@@ -30,13 +30,13 @@ from flax import linen as nn, struct
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax.experimental import checkify, multihost_utils
 from jax.typing import ArrayLike
+from typing_extensions import TypeVar
 
 from dew.artifacts import agreed
 from dew.nn.backbones.causal_transformer import gather_cache_rows
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.dspark import DSpark
 from dew.nn.inputs import (
-    ArrayT,
     ModelInputs,
     PredictionPhase,
     RowPlan,
@@ -61,6 +61,8 @@ from dew.sampling.decoding import (
     TopP,
 )
 from dew.sampling.strategies import DecodeOps, DecoderState, Draws, Sample, Strategy
+
+ArrayT = TypeVar("ArrayT", bound=jax.Array | np.ndarray, default=jax.Array, covariant=True)
 
 Transforms = LogitsTransform | Sequence[LogitsTransform]
 Criteria = Stopping | Sequence[Stopping]
@@ -295,11 +297,15 @@ def _prefill(model: nn.Module, params: Variables, inputs: ModelInputs, ops: Deco
     rows, slot = jnp.arange(batch), jnp.maximum(last, 0)
     scored = (inputs.tokens, slot) if selective else (inputs.tokens,)
     answer, updated = model.apply(
-        {**params, "cache": held}, *scored, decode=True,
-        mutable=["cache", "embeddings", *(["prediction_inputs"] if ops.record is not None else [])], rngs=None,
-        method=("states_and_logits_at" if selective else
-                "states_and_logits" if exposed else None), capture_intermediates=False,
-        **inputs.kwargs())
+        {**params, "cache": held},
+        *scored,
+        decode=True,
+        mutable=["cache", "embeddings", *(["prediction_inputs"] if ops.record is not None else [])],
+        rngs=None,
+        method=("states_and_logits_at" if selective else "states_and_logits" if exposed else None),
+        capture_intermediates=False,
+        **inputs.kwargs(),
+    )
     states, logits = answer if exposed or selective else (None, answer)
     if ops.record is not None:
         states = _context(model, params, updated)
@@ -333,7 +339,9 @@ def _empty_cache(model: nn.Module, params: Variables, batch: int, ops: DecodeOps
     """A zeroed decode cache for `batch` rows, with the drafter's own beside it."""
     cache = flatten_dict(dict(model.apply(params, batch, method="init_cache", mutable=["cache"])[1]["cache"]))
     for method in ("init_mtp_cache",) * bool(ops.depths) + ("init_draft_cache",) * (ops.record is not None):
-        cache.update(flatten_dict(dict(model.apply(params, batch, method=method, mutable=["cache"])[1]["cache"])))
+        cache.update(
+            flatten_dict(dict(model.apply(params, batch, method=method, mutable=["cache"])[1]["cache"]))
+        )
     return unflatten_dict(cache)
 
 
@@ -766,10 +774,13 @@ def _padded(plan: RowPlan, prepared: ModelInputs) -> ModelInputs:
                                          "attention_mask": valid & ~plan.padding[:, None]})
 
 
+_DEFAULT_SAMPLING = Sampling()
+
+
 def generate(model: nn.Module, params: Variables,
              inputs: ModelInputs | ArrayLike | Sequence[Sequence[int]], max_new_tokens: int,
              *, key: int | jax.Array | None = None,
-             sampling: Sampling = Sampling(), n: int = 1, logits: Transforms | None = None,
+             sampling: Sampling = _DEFAULT_SAMPLING, n: int = 1, logits: Transforms | None = None,
              stopping: Criteria | None = None, strategy: Strategy | None = None) -> Generation:
     """Generate from numeric model inputs, with an array shorthand for text.
 

@@ -14,7 +14,7 @@ path: `config_from_mamba_ssm` writes their config as the `Mamba2Config` dict
 transformers' conversion script does, and `tensors_from_mamba_ssm` renames
 their tensors as the reference's load hook does.
 
-`hf_decoders._FAMILY_ENTRIES` registers this module as the `mamba2` family.
+`decoder_families.ENTRIES` registers this module as the `mamba2` family.
 The entry lives there rather than here so that one table names every family.
 """
 

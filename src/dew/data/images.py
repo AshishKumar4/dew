@@ -523,7 +523,7 @@ class HFImages(ImageDataset):
 
     name: str = ""
     split: str = "train"
-    options: HubOptions = HFOptions()
+    options: HubOptions = dataclasses.field(default_factory=HFOptions)
 
     def source(self, split: str | None = None):
         from .sources.hf import HFDatasetSource

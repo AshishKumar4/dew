@@ -132,9 +132,20 @@ class VideoDataset(DatasetSpec):
                    else checked_count(self.count, len(source), name))
         train, validation = hold_out(source, records, (self.val_batches or 0) * batch, name)
         return Dataset(
-            train=tokenized(train_stream(train, [AudioVideoTransform(self)], batch=batch, seed=self.seed, loading=self.loading), tokenize),
-            val=None if validation is None else tokenized(
-                validation_pass(validation, [AudioVideoTransform(self)], batch=batch, seed=self.seed, loading=self.loading), tokenize),
+            train=tokenized(
+                train_stream(
+                    train, [AudioVideoTransform(self)], batch=batch, seed=self.seed, loading=self.loading
+                ),
+                tokenize,
+            ),
+            val=None
+            if validation is None
+            else tokenized(
+                validation_pass(
+                    validation, [AudioVideoTransform(self)], batch=batch, seed=self.seed, loading=self.loading
+                ),
+                tokenize,
+            ),
             records=len(train),
             batch=batch,
         )

@@ -863,8 +863,12 @@ class DPMSolverSinglestep:
                 if bool(jnp.all(last_sigma == 0)):
                     orders[-1] = 1
         if self.algorithm == "dpmsolver" and len(orders) > 1 and orders[1] > 1:
-            _check_endpoint_domain(process, times, source=True,
-                                   reason="noise-prediction singlestep differences diverge at an alpha=0 anchor")
+            _check_endpoint_domain(
+                process,
+                times,
+                source=True,
+                reason="noise-prediction singlestep differences diverge at an alpha=0 anchor",
+            )
         if (self.algorithm == "sde-dpmsolver++" and self.solver_type == "heun"
                 and 3 in orders[:3]):
             _check_endpoint_domain(process, times, source=True,
@@ -1158,7 +1162,9 @@ class UniPC:
             else:
                 base = alpha_here / alpha_s0 * state.last_x - sigma_here * jnp.expm1(hh) * m0
                 scale = sigma_here
-            residual = sum((rho * d1 for rho, d1 in zip(rhos[:-1], d1s, strict=True)), rhos[-1] * (m_here - m0))
+            residual = sum(
+                (rho * d1 for rho, d1 in zip(rhos[:-1], d1s, strict=True)), rhos[-1] * (m_here - m0)
+            )
             return base - scale * B_h * residual
 
         disabled = reduce(jnp.logical_or, [taken - 1 == index for index in self.disable_corrector],
@@ -1184,7 +1190,9 @@ class UniPC:
             base = sigma_t / sigma_here * x - alpha_t * jnp.expm1(hh) * m_here
             scale = alpha_t
         else:
-            base = alpha_t / jnp.where(alpha_here == 0, 1.0, alpha_here) * x - sigma_t * jnp.expm1(hh) * m_here
+            base = (
+                alpha_t / jnp.where(alpha_here == 0, 1.0, alpha_here) * x - sigma_t * jnp.expm1(hh) * m_here
+            )
             scale = sigma_t
         base = jnp.where(alpha_here == 0, alpha_t * denoised + sigma_t * eps, base)
 
@@ -1201,9 +1209,15 @@ class UniPC:
         this_order = jnp.minimum(this_order, taken + 1)
         stepped = lax.switch(this_order - 1, [
             (lambda p: lambda _: predicted(p))(p) for p in range(1, self.order + 1)], None)
-        target_limit = (alpha_t * denoised if self.predict_x0
-                        else jnp.where(alpha_here == 0, alpha_t * denoised,
-                                       alpha_t / jnp.where(alpha_here == 0, 1.0, alpha_here) * (x - sigma_here * eps)))
+        target_limit = (
+            alpha_t * denoised
+            if self.predict_x0
+            else jnp.where(
+                alpha_here == 0,
+                alpha_t * denoised,
+                alpha_t / jnp.where(alpha_here == 0, 1.0, alpha_here) * (x - sigma_here * eps),
+            )
+        )
         next_x = jnp.where(terminal, target_limit, stepped)
         return next_x, UniPCState(history.advance(), x, this_order)
 

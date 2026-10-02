@@ -15,7 +15,8 @@ the layer norm the MM-DiT family uses; what differs is here.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Sequence
+from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp

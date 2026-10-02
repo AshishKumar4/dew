@@ -60,7 +60,7 @@ from dew.nn.blocks import normal_kernel
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.kernels.ssd import ssd_chunk_scan, ssd_kernel_platform
 from dew.nn.linear import DepthwiseConv1d, _masked_conv1d, causal_conv1d, document_conv1d, document_starts
-from dew.nn.mixers import MixerBase, MixerContext, mixers
+from dew.nn.mixer_base import MixerBase, MixerContext, mixers
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import (
     SEQUENCE_AXIS,
@@ -350,9 +350,14 @@ class Mamba2(nn.Module):
                 f"the causal conv needs a history, so a kernel of at least 2, got {self.conv_kernel}")
         if self.chunk_size < 1:
             raise ValueError(f"chunk_size counts tokens per chunk, got {self.chunk_size}")
-        dense = functools.partial(nn.Dense, use_bias=self.use_bias, dtype=self.dtype, precision=self.precision)
-        self.in_proj = dense(2 * self.intermediate_size + 2 * self.n_groups * self.state_size + self.num_heads,
-                             name='in_proj', **normal_kernel(self.init_std))
+        dense = functools.partial(
+            nn.Dense, use_bias=self.use_bias, dtype=self.dtype, precision=self.precision
+        )
+        self.in_proj = dense(
+            2 * self.intermediate_size + 2 * self.n_groups * self.state_size + self.num_heads,
+            name="in_proj",
+            **normal_kernel(self.init_std),
+        )
         self.conv1d = DepthwiseConv1d(features=self.conv_features, kernel=self.conv_kernel,
                                       use_bias=self.use_conv_bias, init_std=self.init_std, name='conv1d')
         # The reference's init: A_log = log(1..H), dt_bias the inverse

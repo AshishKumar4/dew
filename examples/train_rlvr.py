@@ -154,22 +154,45 @@ def _index_and_modulus(draw: random.Random) -> tuple[int, int]:
 # program that ignores the task, a constant or a, b, min(a, b), max(a, b),
 # a + b, a * b or |a - b|, passes a tenth of its cases.
 TASKS = (
-    ("the sum of all integers from min(a, b) to max(a, b) inclusive",
-     lambda a, b: sum(range(min(a, b), max(a, b) + 1)), _uniform(-30, 30)),
-    ("the number of multiples of b between 1 and a inclusive (both are positive)",
-     lambda a, b: a // b, _divisor_at_most),
-    ("the sum of the decimal digits of the product a * b",
-     lambda a, b: sum(map(int, str(abs(a * b)))), _digits(6)),
+    (
+        "the sum of all integers from min(a, b) to max(a, b) inclusive",
+        lambda a, b: sum(range(min(a, b), max(a, b) + 1)),
+        _uniform(-30, 30),
+    ),
+    (
+        "the number of multiples of b between 1 and a inclusive (both are positive)",
+        lambda a, b: a // b,
+        _divisor_at_most,
+    ),
+    (
+        "the sum of the decimal digits of the product a * b",
+        lambda a, b: sum(map(int, str(abs(a * b)))),
+        _digits(6),
+    ),
     ("the greatest common divisor of a and b (both are positive)", math.gcd, _shared_factor),
-    ("the number of primes p with min(a, b) <= p <= max(a, b)",
-     lambda a, b: sum(all(p % d for d in range(2, int(p ** 0.5) + 1)) for p in range(max(2, min(a, b)), max(a, b) + 1)),
-     _uniform(1, 300)),
-    ("the a-th Fibonacci number modulo b, where the 0th is 0 and the 1st is 1 (b is never zero)",
-     lambda a, b: _fibonacci(a) % b, _index_and_modulus),
-    ("the number of 1 bits in the binary form of the product a * b (both are positive)",
-     lambda a, b: bin(a * b).count("1"), _digits(8)),
-    ("the integer whose decimal digits are those of the product a * b in reverse order, without leading zeros",
-     lambda a, b: int(str(a * b)[::-1]), _uniform(1, 99)),
+    (
+        "the number of primes p with min(a, b) <= p <= max(a, b)",
+        lambda a, b: sum(
+            all(p % d for d in range(2, int(p**0.5) + 1)) for p in range(max(2, min(a, b)), max(a, b) + 1)
+        ),
+        _uniform(1, 300),
+    ),
+    (
+        "the a-th Fibonacci number modulo b, where the 0th is 0 and the 1st is 1 (b is never zero)",
+        lambda a, b: _fibonacci(a) % b,
+        _index_and_modulus,
+    ),
+    (
+        "the number of 1 bits in the binary form of the product a * b (both are positive)",
+        lambda a, b: bin(a * b).count("1"),
+        _digits(8),
+    ),
+    (
+        "the integer whose decimal digits are those of the product a * b in reverse order, "
+        "without leading zeros",
+        lambda a, b: int(str(a * b)[::-1]),
+        _uniform(1, 99),
+    ),
 )
 
 
@@ -243,7 +266,9 @@ def rollout_width(config: Config) -> int:
     return config.prompt_tokens + config.turns * config.new_tokens + (config.turns - 1) * FEEDBACK_TOKENS
 
 
-def attempt_scorer(reward: CodeReward, decode: Callable[[Sequence[int]], str]) -> Callable[[str, Action], float]:
+def attempt_scorer(
+    reward: CodeReward, decode: Callable[[Sequence[int]], str]
+) -> Callable[[str, Action], float]:
     """The fraction of `cases` an attempt's program passes, its EOS excluded; each program runs once."""
     @functools.lru_cache(maxsize=4096)
     def passed(cases: str, program: tuple[int, ...]) -> float:
@@ -270,8 +295,10 @@ class Attempts:
         passed = self.score(self.cases, action)
         if passed == 1.0:
             return Observation((), EpisodeStatus.COMPLETED, "every test passes")
-        report = self.encode(f"\n\nThat program passed {round(3 * passed)} of 3 tests. Reply with one corrected "
-                             "```python code block.\n")[:FEEDBACK_TOKENS]
+        report = self.encode(
+            f"\n\nThat program passed {round(3 * passed)} of 3 tests. Reply with one corrected "
+            "```python code block.\n"
+        )[:FEEDBACK_TOKENS]
         return Observation(action.context + action.tokens + tuple(report))
 
 
@@ -285,9 +312,15 @@ def attempts_source(server, reward: CodeReward, decode: Callable[[Sequence[int]]
         return score(str(task.data["truth"]), episode.transitions[-1].action) if episode.transitions else 0.0
 
     return EnvironmentSource(
-        server, lambda task, identity: nullcontext(Attempts(task, score, encode)), verify,
-        max_prompt_tokens=rollout_width(config) - config.new_tokens, max_new_tokens=config.new_tokens,
-        max_turns=config.turns, workers=config.prompts * config.groups * (config.max_lag + 1), seed=config.seed)
+        server,
+        lambda task, identity: nullcontext(Attempts(task, score, encode)),
+        verify,
+        max_prompt_tokens=rollout_width(config) - config.new_tokens,
+        max_new_tokens=config.new_tokens,
+        max_turns=config.turns,
+        workers=config.prompts * config.groups * (config.max_lag + 1),
+        seed=config.seed,
+    )
 
 
 def engine_context(config: Config) -> int:
@@ -307,14 +340,50 @@ def engine_command(config: Config, directory: Path) -> tuple[list[str], dict[str
     """The command line and extra environment that serve `directory` on `config.backend`."""
     context = str(engine_context(config))
     if config.backend == "vllm":
-        return ([config.vllm, "serve", str(directory), "--served-model-name", "policy", "--port", str(config.port),
-                 "--gpu-memory-utilization", str(config.vllm_memory), "--dtype", "bfloat16",
-                 "--max-model-len", context, "--generation-config", "vllm",
-                 "--enable-prefix-caching", "--seed", str(config.seed)],
-                {"VLLM_SERVER_DEV_MODE": "1"})
-    return ([config.sglang, "serve", "--model-path", str(directory), "--served-model-name", "policy",
-             "--port", str(config.port), "--mem-fraction-static", str(config.sglang_memory), "--dtype", "bfloat16",
-             "--context-length", context, "--random-seed", str(config.seed)], {})
+        return (
+            [
+                config.vllm,
+                "serve",
+                str(directory),
+                "--served-model-name",
+                "policy",
+                "--port",
+                str(config.port),
+                "--gpu-memory-utilization",
+                str(config.vllm_memory),
+                "--dtype",
+                "bfloat16",
+                "--max-model-len",
+                context,
+                "--generation-config",
+                "vllm",
+                "--enable-prefix-caching",
+                "--seed",
+                str(config.seed),
+            ],
+            {"VLLM_SERVER_DEV_MODE": "1"},
+        )
+    return (
+        [
+            config.sglang,
+            "serve",
+            "--model-path",
+            str(directory),
+            "--served-model-name",
+            "policy",
+            "--port",
+            str(config.port),
+            "--mem-fraction-static",
+            str(config.sglang_memory),
+            "--dtype",
+            "bfloat16",
+            "--context-length",
+            context,
+            "--random-seed",
+            str(config.seed),
+        ],
+        {},
+    )
 
 
 def launch_engine(config: Config, directory: Path) -> subprocess.Popen:
@@ -351,10 +420,51 @@ def native_server(source, sampling: Sampling, *, slots: int, capacity: int) -> N
     reference kept past this call would keep a model's worth of device
     memory for the whole run.
     """
-    served = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.bfloat16) if jnp.issubdtype(leaf.dtype, jnp.floating)
-                          else jnp.asarray(leaf), source.variables)
-    return NativeRolloutServer(Server.from_task(TextGeneration(source.model, served, source.processor,
-                                                               sampling=sampling), slots=slots, capacity=capacity))
+    served = jax.tree.map(
+        lambda leaf: jnp.asarray(leaf, jnp.bfloat16)
+        if jnp.issubdtype(leaf.dtype, jnp.floating)
+        else jnp.asarray(leaf),
+        source.variables,
+    )
+    return NativeRolloutServer(
+        Server.from_task(
+            TextGeneration(source.model, served, source.processor, sampling=sampling),
+            slots=slots,
+            capacity=capacity,
+        )
+    )
+
+
+def rollout_server(config: Config, source, sampling: Sampling, *, width: int, pushes: list[float]):
+    """Open the requested inference backend and the process it owns, if any."""
+    if config.backend == "native":
+        server = native_server(source, sampling, slots=config.prompts * config.groups, capacity=width)
+        remote = None
+    elif config.backend in ("vllm", "sglang"):
+        import openai
+
+        directory = config.out / "served"
+        root = f"http://127.0.0.1:{config.port}"
+        reload = SafetensorsReload(source, directory, (root,), config.backend)
+        reload.write(source.variables)
+        remote = launch_engine(config, directory)
+
+        def push(variables, version: int) -> None:
+            began = time.perf_counter()
+            reload(variables, version)
+            pushes.append(time.perf_counter() - began)
+
+        # A seeded request is safe to resend, so the SDK's retries cover a
+        # keep-alive connection the server closed between requests.
+        completion = OpenAICompletion(
+            "policy",
+            openai.OpenAI(base_url=f"{root}/v1", api_key="none", max_retries=3, timeout=600),
+            provider=config.backend,
+        )
+        server = OpenAIRolloutServer(completion, sampling, push, workers=config.prompts * config.groups * 2)
+    else:
+        raise ValueError(f"backend is native, vllm or sglang, got {config.backend!r}")
+    return server, remote
 
 
 def main(config: Config) -> dict:
@@ -383,30 +493,7 @@ def main(config: Config) -> dict:
     objective = GRPOObjective(policy, width - 1, pretrained=source.variables,
                               behavior_importance=2.0, epsilon_high=0.28)
     pushes: list[float] = []
-    if config.backend == "native":
-        server = native_server(source, sampling, slots=config.prompts * config.groups, capacity=width)
-        remote = None
-    elif config.backend in ("vllm", "sglang"):
-        import openai
-
-        directory = config.out / "served"
-        root = f"http://127.0.0.1:{config.port}"
-        reload = SafetensorsReload(source, directory, (root,), config.backend)
-        reload.write(source.variables)
-        remote = launch_engine(config, directory)
-
-        def push(variables, version: int) -> None:
-            began = time.perf_counter()
-            reload(variables, version)
-            pushes.append(time.perf_counter() - began)
-
-        # A seeded request is safe to resend, so the SDK's retries cover a
-        # keep-alive connection the server closed between requests.
-        completion = OpenAICompletion("policy", openai.OpenAI(base_url=f"{root}/v1", api_key="none", max_retries=3,
-                                                              timeout=600), provider=config.backend)
-        server = OpenAIRolloutServer(completion, sampling, push, workers=config.prompts * config.groups * 2)
-    else:
-        raise ValueError(f"backend is native, vllm or sglang, got {config.backend!r}")
+    server, remote = rollout_server(config, source, sampling, width=width, pushes=pushes)
 
     # The trainer shows each call's rollout metrics as rollout/<name>; the
     # records are kept for the summary written below.
@@ -422,8 +509,13 @@ def main(config: Config) -> dict:
         sessions = PromptSource(server, reward, decode=words.decode, max_new_tokens=config.new_tokens,
                                 seed=config.seed)
     else:
-        sessions = attempts_source(server, reward, words.decode,
-                                   lambda text: words.tokenizer.encode(text, add_special_tokens=False), config)
+        sessions = attempts_source(
+            server,
+            reward,
+            words.decode,
+            lambda text: words.tokenizer.encode(text, add_special_tokens=False),
+            config,
+        )
     data = Prompts(tokenizer=tokenizer, records=records(config.tasks, config.seed),
                    thinking=config.thinking,
                    max_prompt_len=config.prompt_tokens, pad_id=sampling.pad_id, val_batches=None,
@@ -453,16 +545,28 @@ def main(config: Config) -> dict:
     rewards = [record.metrics.get("reward/mean", 0.0) for record in history]
     window = min(config.window, len(rewards) // 2 or 1)
     summary = {
-        "backend": config.backend, "model": config.model, "updates": int(state.updates),
-        "seconds": time.perf_counter() - began, "device": jax.devices()[0].device_kind,
-        "first_reward": sum(rewards[:window]) / window, "last_reward": sum(rewards[-window:]) / window,
+        "backend": config.backend,
+        "model": config.model,
+        "updates": int(state.updates),
+        "seconds": time.perf_counter() - began,
+        "device": jax.devices()[0].device_kind,
+        "first_reward": sum(rewards[:window]) / window,
+        "last_reward": sum(rewards[-window:]) / window,
         "max_lag": max(record.lag for record in history),
-        "resubmitted": sum(sum(record.resubmitted.values()) for record in history), "push_seconds": pushes, "history": [asdict(record) for record in history],
+        "resubmitted": sum(sum(record.resubmitted.values()) for record in history),
+        "push_seconds": pushes,
+        "history": [asdict(record) for record in history],
     }
     (config.out / "rewards.json").write_text(json.dumps(summary, indent=1))
-    print(f"{config.backend}: reward {summary['first_reward']:.3f} over the first {window} steps, "
-          f"{summary['last_reward']:.3f} over the last {window}; largest lag {summary['max_lag']}"
-          + (f"; median weight push {sorted(pushes)[len(pushes) // 2]:.2f}s over {len(pushes)}" if pushes else ""))
+    print(
+        f"{config.backend}: reward {summary['first_reward']:.3f} over the first {window} steps, "
+        f"{summary['last_reward']:.3f} over the last {window}; largest lag {summary['max_lag']}"
+        + (
+            f"; median weight push {sorted(pushes)[len(pushes) // 2]:.2f}s over {len(pushes)}"
+            if pushes
+            else ""
+        )
+    )
     return summary
 
 

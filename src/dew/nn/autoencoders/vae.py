@@ -8,9 +8,9 @@ configuration and checkpoint files; no external model implementation runs.
 import json
 import math
 import os
+from collections.abc import Sequence
 from functools import partial
 from pathlib import Path
-from typing import Sequence
 
 import flax.linen as nn
 import jax
@@ -475,8 +475,10 @@ def _candidates(revision: str) -> list[Candidate]:
     """
     torch = ([(revision, "vae"), (revision, None)] if revision not in FLAX_REVISIONS
              else [(None, "vae"), (None, None)])
-    return ([(FLAX_WEIGHTS, *place) for place in [(revision, "vae"), ("flax", "vae"), (revision, None), (None, None)]]
-            + [(TORCH_WEIGHTS, *place) for place in torch])
+    return [
+        (FLAX_WEIGHTS, *place)
+        for place in [(revision, "vae"), ("flax", "vae"), (revision, None), (None, None)]
+    ] + [(TORCH_WEIGHTS, *place) for place in torch]
 
 
 def _check_weights(modelname: str, candidates: list[Candidate], index: int) -> None:
@@ -502,8 +504,11 @@ def _check_weights(modelname: str, candidates: list[Candidate], index: int) -> N
     def cached(name: str, place: Candidate):
         """The cached path (str), the Hub's cached miss (another object) or unknown (None)."""
         _, place_revision, place_subfolder = place
-        return try_to_load_from_cache(modelname, name if place_subfolder is None else f"{place_subfolder}/{name}",
-                                      revision=place_revision)
+        return try_to_load_from_cache(
+            modelname,
+            name if place_subfolder is None else f"{place_subfolder}/{name}",
+            revision=place_revision,
+        )
 
     def recorded_missing(place: Candidate) -> bool:
         found = cached(place[0], place)
