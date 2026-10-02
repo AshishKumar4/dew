@@ -54,7 +54,7 @@ from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 import jax
 import jax.numpy as jnp
 import numpy as np
-from flax import linen as nn
+from flax import core, linen as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
 
 if TYPE_CHECKING:
@@ -563,7 +563,16 @@ def quantize_for_serving(model: nn.Module, variables: Variables, spec: Quantizat
     qwix = _qwix()
     methods = tuple(method for method in METHODS if hasattr(model, method))
     served = qwix.quantize_model(model, _providers()[1](rules), methods=methods)
-    abstract = jax.eval_shape(functools.partial(served.init, jax.random.key(0), *args, **kwargs))
+    def initialized(scope: core.Scope, supplied: Variables):
+        # Initialization lets Qwix annotate each weight with its quantization
+        # recipe. Seed the scope first so data-dependent module layouts, such
+        # as packed inference projections, trace the weights they will read.
+        for collection, values in core.unfreeze(dict(supplied)).items():
+            for name, value in values.items():
+                scope.put_variable(collection, name, value)
+        return served.clone(parent=scope)(*args, **kwargs)
+
+    _, abstract = jax.eval_shape(core.init(initialized), jax.random.key(0), variables)
     parameters = _serving_parameters(variables["params"], abstract["params"])
     return served, {**variables, "params": parameters}
 

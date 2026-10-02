@@ -401,12 +401,7 @@ class TextGeneration:
     _stops: tuple[Stopping, ...] = dataclasses.field(default=(), init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        variables = self.variables
-        if all(isinstance(leaf, np.ndarray) for leaf in jax.tree.leaves(variables)):
-            from dew.inference.serving import _inference_projections
-
-            variables = jax.device_put(_inference_projections(self.model, variables))
-        _freeze_variables(self, variables)
+        _freeze_variables(self, self.variables)
         object.__setattr__(self, "_stops", self._stop_criteria(self.sampling.stop))
 
     def _stop_criteria(self, strings: tuple[str, ...]) -> tuple[Stopping, ...]:

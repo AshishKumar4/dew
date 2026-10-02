@@ -108,9 +108,12 @@ def test_prepacked_serving_keeps_the_source_and_reloads_its_original_tree():
     """Serving holds the same weight bytes; reloading casts and repacks the trained tree."""
     from flax.core import freeze
 
+    from dew.inference.serving import _inference_projections
+
     bound = task(Sampling(temperature=0, eos_id=None))
     source = jax.tree.map(np.asarray, bound.variables)
-    packed_task = TextGeneration(bound.model, source, bound.processor, sampling=bound.sampling)
+    packed_task = TextGeneration(bound.model, jax.device_put(_inference_projections(bound.model, source)),
+                                 bound.processor, sampling=bound.sampling)
     server = Server.from_task(packed_task, slots=2, capacity=128)
     before = server(["12", "34"], 5, key=3)
     assert sum(leaf.nbytes for leaf in jax.tree.leaves(server.variables)) == sum(
@@ -203,9 +206,12 @@ def test_host_task_and_server_preserve_nonzero_lora_branches():
 
 def test_reload_normalizes_source_precision_before_concatenating_projections():
     """A float64 value just above an FP16 midpoint must not double-round through FP32."""
+    from dew.inference.serving import _inference_projections
+
     bound = task(Sampling(temperature=0, eos_id=None))
     source = jax.tree.map(lambda leaf: np.asarray(leaf, dtype=np.float16), bound.variables)
-    host = TextGeneration(bound.model, source, bound.processor, sampling=bound.sampling)
+    host = TextGeneration(bound.model, jax.device_put(_inference_projections(bound.model, source)),
+                          bound.processor, sampling=bound.sampling)
     server = Server.from_task(host, slots=2, capacity=128)
     incoming = jax.tree.map(lambda leaf: np.asarray(leaf, np.float64), source)
     kernel = incoming["params"]["layers_0"]["self_attn"]["q_proj"]["kernel"]
