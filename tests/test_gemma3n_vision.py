@@ -22,7 +22,7 @@ from dew.nn import vision as V
 from dew.nn.inputs import ModelInputs
 from dew.nn.mobilenet import MobileConvNormAct
 from dew.registry import models, projectors, towers, with_precision
-from dew.training import Layout, MeshSpec, build_mesh
+from dew.training import Layout, MeshSpec
 from dew.training.optim import muon_weight_dimension_numbers
 
 FIXTURE = Path(__file__).parent / "fixtures" / "hf" / "gemma3n-vision-tiny"
@@ -152,7 +152,7 @@ def test_the_layout_and_muon_read_the_towers_declared_axes():
     them, which is what the unnamed leading dimensions say.
     """
     loaded = load_pretrained(FIXTURE, dtype="float32", attention_impl="reference")
-    mesh = build_mesh(MeshSpec(fsdp=4))
+    mesh = MeshSpec(fsdp=4).build()
     layout = Layout(min_shard=64)
     shardings = layout.shardings(mesh, loaded.variables)
     layout.check(loaded.variables["params"], shardings["params"], mesh)

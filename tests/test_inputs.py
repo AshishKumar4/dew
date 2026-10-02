@@ -6,14 +6,7 @@ copying resident inputs through the host.
 """
 
 import numpy as np
-
-from dew.inputs import Field, pixel_field
-from dew.nn.vision import PIXEL_VALUES_KEY
-
-
-def test_pixel_field_names_the_batch_key_and_shape():
-    assert pixel_field(28, 28) == Field(PIXEL_VALUES_KEY, (3, 28, 28))
-    assert pixel_field(16, 16, 1).shape == (1, 16, 16)
+from steady_state import guarded
 
 
 def test_row_plan_preserves_resident_rows_padding_and_random_keys():
@@ -22,13 +15,12 @@ def test_row_plan_preserves_resident_rows_padding_and_random_keys():
 
     from dew.nn.inputs import RowPlan, local_rows
     from dew.training import MeshSpec
-    from dew.training.distributed import build_mesh
 
     pixels = jnp.arange(18, dtype=jnp.float32).reshape(3, 2, 3)
     host_pixels = np.asarray(pixels)
-    plan = RowPlan(build_mesh(MeshSpec()), 3, 8, 0, 1)
+    plan = RowPlan(MeshSpec().build(), 3, 8, 0, 1)
     key = jax.random.key(11)
-    with jax.transfer_guard_device_to_host("disallow"):
+    with guarded(allow=("host_to_device",)):
         local = local_rows(pixels, host=False)
         placed = plan.place(plan.pad({"pixels": local, "labels": np.arange(3)}))
         keys = plan.keys(key)
@@ -52,12 +44,11 @@ def test_row_plan_folds_a_mesh_replicated_request_key_on_device():
 
     from dew.nn.inputs import BATCH_AXES, RowPlan
     from dew.training import MeshSpec
-    from dew.training.distributed import build_mesh
 
-    mesh = build_mesh(MeshSpec())
+    mesh = MeshSpec().build()
     plan = RowPlan(mesh, 3, 8, 0, 1)
     key = jax.device_put(jax.random.key(11), NamedSharding(mesh, P()))
-    with jax.transfer_guard_device_to_host("disallow"):
+    with guarded(allow=("host_to_device",)):
         keys = plan.keys(key)
         jax.block_until_ready(keys)
     expected = jax.vmap(lambda row: jax.random.fold_in(jax.random.key(11), row))(jnp.arange(8))
@@ -72,9 +63,9 @@ def test_shard_batch_preserves_resident_nested_inputs_without_host_transfer():
     from jax.sharding import NamedSharding, PartitionSpec as P
 
     from dew.nn.inputs import ModelInputs
-    from dew.training.distributed import build_mesh, shard_batch
+    from dew.training.distributed import MeshSpec, shard_batch
 
-    mesh = build_mesh()
+    mesh = MeshSpec().build()
     rows = 2 * jax.device_count()
     tokens = jnp.arange(rows * 4, dtype=jnp.int32).reshape(rows, 4)
     pixels = jnp.arange(rows * 12, dtype=jnp.float32).reshape(rows, 2, 2, 3) / 16
@@ -82,7 +73,7 @@ def test_shard_batch_preserves_resident_nested_inputs_without_host_transfer():
     batch = {"text": ModelInputs(tokens, conditioning={"pixel_values": pixels}),
              "labels": labels, "weight": np.float32(0.5)}
     jax.block_until_ready(batch)
-    with jax.transfer_guard_device_to_host("disallow"):
+    with guarded(allow=("host_to_device",)):
         placed = shard_batch(mesh, batch)
         jax.block_until_ready(placed)
     np.testing.assert_array_equal(placed["text"].tokens, np.arange(rows * 4).reshape(rows, 4))

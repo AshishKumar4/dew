@@ -3,13 +3,13 @@
 A dataset is a frozen dataclass behind `@datasets(name)`, and `load(batch=)`
 turns it into a `Dataset` of batch iterators:
 
-    data = datasets.OxfordFlowers(image_size=128).load(batch=32)
+    data = OxfordFlowers(image_size=128).load(batch=32)
     steps = epochs * data.steps_per_epoch
 
 The prepared web-scale image corpora (`CC3M`, `CC12M`, the LAION and
-DiffusionDB sets) are registered under their names in `dew.datasets` and
-importable from `dew.data.images`; this namespace holds what a run builds
-from.
+DiffusionDB sets) are importable from `dew.data.images` and registered under
+their names in `dew.registry.datasets`; this namespace holds what a run
+builds from.
 
 Importing this package registers every dataset and costs none of the heavy
 dependencies. cv2, tensorflow_datasets, HF `datasets`, the AV readers and
@@ -30,8 +30,6 @@ from .dataset import (
                       Ramp,
                       Reader,
                       Stage,
-                      mixture,
-                      ramped,
 )
 from .images import ArrayRecordImages, HFImages, ImageDataset, OxfordFlowers
 from .preferences import IDS_KEY, MASK_KEY, PreferencePairs
@@ -41,16 +39,15 @@ from .providers import HubDataset, PreparedTFDS, load
 from .sources.hf import HFOptions
 from .sources.text import (
     TokenBytes,
-    TokenColumn,
+    TokenCorpus,
     TokenDocumentSource,
     TokenRecords,
     TokenSource,
     TokenWindowSource,
-    write_tokens,
 )
 from .sources.tfds import TFDSOptions
 from .streaming import CombinedOnline, OnlineImages, OnlineVideos
-from .text import ByteTokenizer, HFTokenizer, tokenizer_for
+from .text import ByteTokenizer, HFTokenizer
 from .tokens import PackedTokens, TokenWindows
 from .video import LocalVideos, VideoDataset, VoxCeleb2
 
@@ -63,7 +60,6 @@ __all__ = ["IDS_KEY", "MASK_KEY", "ArrayRecordImages",
            "Loading", "LocalVideos", "OnlineImages", "OnlineVideos", "OxfordFlowers",
            "PackedTokens", "PreferencePairs", "PreparedTFDS", "Prompts", "Ramp", "Reader", "Role",
            "Stage",
-           "TFDSOptions", "TokenBytes", "TokenColumn",
+           "TFDSOptions", "TokenBytes", "TokenCorpus",
            "TokenDocumentSource", "TokenRecords", "TokenSource", "TokenWindowSource",
-           "TokenWindows", "VideoDataset", "VoxCeleb2", "load", "mixture",
-           "ramped", "tokenizer_for", "write_tokens"]
+           "TokenWindows", "VideoDataset", "VoxCeleb2", "load"]

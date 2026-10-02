@@ -1,57 +1,32 @@
 """The convolution Dew's models build on: `flax.linen.Conv` with its input,
 output and kernel placed so that XLA partitions it correctly.
 
-XLA's SPMD partitioner (jax 0.11.2) scales a convolution's kernel gradient
-by a power of two in some layouts where a mesh axis holds the convolution's
-input or output replicated. In the case we traced, it split the kernel
-gradient's computation over one axis and all-reduced the partial kernels
-over every device, so the devices along the replicated axis added the same
-partial sum again. An input batch split over data with the output's image
-rows split over sequence doubles it, and so does a grouped convolution's
-batch split over one axis beside another. In our checks the gradient came
-out right whenever the input and the output were split over every mesh axis
-or over none, and a 1x1 convolution and every dot_general came out right in
-every layout we tried. The input and bias gradients were right throughout.
+XLA's SPMD partitioner (jax 0.11.2) scales a convolution's kernel gradient by
+a power of two where a mesh axis holds the input or output replicated: it
+splits the gradient over one axis and all-reduces over every device, so the
+replicas add the same partial again (a batch over data with output rows over
+sequence doubles it). The gradient is right when input and output are split
+over every mesh axis or none; 1x1 convolutions, dot_generals and the input
+and bias gradients are right throughout. The same partitioner computes the
+output wrong where one axis splits the image rows or columns (a halo) and
+another the kernel's input features (23.9 off on an 8x8 3x3 over a 2x2 CPU
+mesh), so a kernel is used whole, as FSDP gathers a layer's weights. Both
+are https://github.com/openxla/xla/issues/49382 and
+https://github.com/AshishKumar4/dew/issues/4.
 
-The same partitioner computes a convolution's output wrong where a mesh
-axis splits its image rows or columns, so that each shard needs a halo of
-its neighbours', and another axis splits the kernel's input features: a
-3x3 convolution of an 8x8 image, its rows over one axis of a 2x2 mesh and
-the kernel's input features over the other, came out 23.9 off one
-device's (jax 0.11.2, CPU). A 1x1 kernel, a kernel whole or split on its
-output features, or whole image rows came out right. A layout that splits a kernel over fsdp stores it on
-whichever width its heuristic picks, so the kernel is used whole, as fully
-sharded data parallelism gathers a layer's weights before it computes.
-
-On TPU, XLA's space-to-batch rewrite also corrupts a convolution feeding
-a strided 2D convolution at small batches (Dew issue #5). A barrier at the
-strided convolution's input fixes both the forward and the VJP. It applies
-regardless of the global batch: partitioning may make a shard's batch small.
-CPU and GPU lower the input unchanged. The barrier's derivative and batching
-rules are identities; JAX's primitive defines neither.
-
-The partitioner bugs are reported at
-https://github.com/openxla/xla/issues/49382 and drafted in
-Dew issue #4 (https://github.com/AshishKumar4/dew/issues/4).
+On TPU, XLA's space-to-batch rewrite corrupts a convolution feeding a strided
+2D convolution at small batches (Dew issue #5), so a barrier sits at the
+strided convolution's input, whatever the global batch, since a shard's may
+be small; its derivative and batching rules are identities.
 
 A dilated 3x3 depthwise convolution runs on CUDA as an undilated one over
-its interleaved grids (`_polyphase_depthwise_3x3`): cuDNN's dilated grouped
-forward and weight-gradient kernels are slow, its dilation-one depthwise
-kernels are not. On the RTX 4080 at 16x16x768 and batch 16 the bf16
-forward and VJP take 0.097 ms at dilation 2 and 0.089 at dilation 3,
-against 1.6 ms through the dilated convolution and 0.31-0.33 through the
-fp32 shifted products this replaced; the 176M hybrid DiT's bf16 step at
-that batch runs 70.2 ms against 75.3. cuDNN's fp32 depthwise kernels are
-slower, and the same step in fp32 runs 113.7 ms against 109.7 with the
-shifted products. The accumulation stays fp32,
-including for bf16 inputs; ordinary JAX differentiation keeps forward-mode
-and higher-order derivatives. Other backends retain lax.
-`tools/benchmark_depthwise.py` measures each path's forward and backward
-separately, as well as the hybrid DiT training step.
-Under Qwix quantization (`dew.training.quantization`) a convolution that a
-rule quantizes goes through Qwix's provider, which computes it with lax, and
-so does not get this depthwise speedup; one that no rule quantizes, such as
-an excluded or weight-only one, computes here as unwrapped.
+its interleaved grids (`_polyphase_depthwise_3x3`), since cuDNN's dilated
+grouped kernels are slow: on the RTX 4080 at 16x16x768, batch 16, bf16
+forward and VJP take 0.097 ms (dilation 2) against 1.6 ms dilated, and the
+176M hybrid DiT's bf16 step runs 70.2 ms against 75.3
+(`tools/benchmark_depthwise.py`). Accumulation stays fp32 and ordinary JAX
+differentiation keeps higher-order derivatives; other backends use lax, as
+does a convolution a Qwix rule quantizes (`dew.training.quantization`).
 """
 
 import math
@@ -107,19 +82,12 @@ def _promoted_whole(*arrays: jax.Array | None, dtype: DTypeLike | None = None,
 
 def _unreplicated(x: jax.Array, spatial: int) -> jax.Array:
     """`x` `[*batch, *spatial, features]` constrained so that every mesh
-    axis above size one splits it.
-
-    The first batch dimension splits as `activation_batch` splits rows
-    (`logical_spec`). Every other automatic mesh axis above size one then
-    splits the first dimension after it that it divides evenly, the features
-    last. The sequence axis goes first, since a sequence of positions lays
-    its rows out along the first spatial dimension, so a patch embedding's
-    output already sits where its tokens go. If an axis divides no dimension,
-    `x` is replicated over the whole mesh. The stage axis is left out:
-    inside a pipeline the stage vmap holds it, and the trainer refuses a
-    stage axis for a model without one. With no automatic axis above size
-    one (no mesh, one device, or inside a `shard_map` that holds them all)
-    `x` is left as it is."""
+    axis above size one splits it: the first batch dimension as
+    `activation_batch` splits rows, then every other automatic axis the first
+    later dimension it divides, the sequence axis first (a patch embedding's
+    rows already sit where its tokens go) and the features last; an axis that
+    divides nothing replicates. The stage axis is left to the pipeline's vmap,
+    and with no automatic axis above one `x` is left as it is."""
     mesh = jax.sharding.get_abstract_mesh()
     automatic = _automatic_axes(mesh)
     if not automatic:

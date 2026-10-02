@@ -4,8 +4,8 @@ Qwix (google/qwix, Apache 2.0) expresses quantization as rules over module
 paths and applies them without editing the model. One call wraps the module,
 and the matmuls in the wrapped methods' extent run quantized.
 
-Dew's version of that call is `apply_quantization`. A caller builds its model
-from the registry as always, then wraps it before the objective ever sees it.
+Dew's version of that call is `Quantization.apply`. A caller builds its model
+as always, then wraps it before the objective ever sees it.
 A run that names `--trainer.quantization` instead hands `RunConfig.train` the
 objective, and `_quantize` wraps the model it holds before anything
 initialises it.
@@ -144,6 +144,19 @@ class Quantization:
                 "bwd_stochastic_rounding is 'uniform', 'low_bit_uniform' or "
                 f"unset, got {self.bwd_stochastic_rounding!r}")
 
+    def apply(self, model: nn.Module) -> nn.Module:
+        """Wrap `model` so its trunk matmuls train in this spec's dtype.
+
+        The returned module is a copy of the same class with the entry methods
+        it defines of `METHODS` wrapped, so everything the registry, the
+        objective and the checkpoint code read off the model still answers.
+        Construction already refused what the value cannot ask for; without the
+        package the call raises naming it.
+        """
+        rules = _rules(self, training=True)
+        methods = tuple(method for method in METHODS if hasattr(model, method))
+        return _qwix().quantize_model(model, _providers()[0](rules), methods=methods)
+
 
 def _qwix(module: str = "qwix") -> ModuleType:
     """Qwix's `module`, imported when a call needs it; without Qwix, an error
@@ -191,21 +204,11 @@ def _real(*dtypes: jax.typing.DTypeLike) -> bool:
 
 
 def _refuse_grouped_on_gpu() -> None:
-    """Refuse a grouped convolution with quantized activations on a GPU.
-
-    Measured with jax 0.11.2. In int8, with one or two input channels per
-    group and the int32 result scaled in float, plain JAX returns wrong
-    values without an error on the RTX 4080 (75% and 50% of the outputs),
-    and on the A100 quantizing the 176M text-to-image model's depthwise
-    convolutions dropped its CLIP score from 0.247 to 0.137. With four or
-    more per group, plain JAX computed it correctly on the RTX 4080, compiled
-    with its scaling; an int8 convolution run without its scaling fused in,
-    as it runs eagerly, fails to compile there at every group width. In fp8,
-    one or two input channels per group fail to compile on sm_89 (the RTX
-    4080), and four came out 3.5% from float; the A100, with no fp8 units,
-    computes it emulated, so nothing is gained there; sm_90 is untested. The
-    refusal covers every GPU, dtype and group width, and is revisited once an
-    H100 is measured."""
+    """Refuse a grouped convolution with quantized activations on a GPU,
+    where jax 0.11.2 computed it wrong or failed to compile it (the error
+    says where; in int8 on the A100 the 176M text-to-image model's CLIP score
+    fell from 0.247 to 0.137). The refusal covers every GPU, dtype and group
+    width until an H100 is measured."""
     if jax.default_backend() == "gpu":
         raise ValueError(
             "Dew refuses to quantize a grouped convolution's activations on a GPU. Measured with jax "
@@ -516,20 +519,6 @@ def _rules(spec: Quantization, training: bool) -> list:
             for pattern in spec.patterns]
 
 
-def apply_quantization(model: nn.Module, spec: Quantization) -> nn.Module:
-    """Wrap `model` so its trunk matmuls train in `spec`'s dtype.
-
-    The returned module is a copy of the same class with the entry methods
-    it defines of `METHODS` wrapped, so everything the registry, the
-    objective and the checkpoint code read off the model still answers.
-    Construction already refused what the value cannot ask for; without the
-    package the call raises naming it.
-    """
-    rules = _rules(spec, training=True)
-    methods = tuple(method for method in METHODS if hasattr(model, method))
-    return _qwix().quantize_model(model, _providers()[0](rules), methods=methods)
-
-
 def _serving_parameters(parameters: Variables, abstract: Variables) -> Variables:
     """Quantize one kernel at a time, retaining its host or device placement."""
     qwix = _qwix()
@@ -555,7 +544,7 @@ def quantize_for_serving(model: nn.Module, variables: Variables, spec: Quantizat
     the float kernel, so the weights take about a quarter of fp32's memory, and the
     returned module computes with them. Unless `spec.weight_only`, its
     activations quantize at each matmul from their own range, as training
-    under `apply_quantization` does, and a matmul of two quantized operands
+    under `Quantization.apply` does, and a matmul of two quantized operands
     runs in the quantized dtype. `args` and `kwargs` are one example call of
     the model, which Qwix traces abstractly to find the kernels its
     matmuls read. `spec`'s backward fields have nothing to do here.
@@ -592,7 +581,7 @@ class ModelObjective(Protocol):
 def _quantize(objective: object, spec: Quantization) -> None:
     """Quantize the trunk matmuls of the module `objective` trains, in place.
 
-    This is `RunConfig.train`'s step, not a user's. `apply_quantization`
+    This is `RunConfig.train`'s step, not a user's. `Quantization.apply`
     wraps a module before an objective is built, which is what a recipe or
     a script that builds its own model does. A run that names
     `--trainer.quantization` has handed `RunConfig.train` the objective
@@ -609,4 +598,4 @@ def _quantize(objective: object, spec: Quantization) -> None:
             f"--trainer.quantization quantizes the module an objective trains, and "
             f"{type(objective).__name__} keeps no `model`; train an objective that "
             f"holds one, or leave the quantization unset")
-    objective.model = apply_quantization(objective.model, spec)
+    objective.model = spec.apply(objective.model)

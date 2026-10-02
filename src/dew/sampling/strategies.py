@@ -5,9 +5,9 @@ typed operations that move the model forward and reparent its cache rows, the
 composed transform chain and stopping criterion, the token budget and the
 number of continuations. It returns one `Draws` record per output row.
 
-`Sample` draws each row independently. `Beam` and `Speculative` in this module
-use the same operations, so a user strategy is a callable with this signature
-and nothing else: no registry, no server object, no model access.
+`Sample`, `Beam` and `Speculative` use only those operations, so a user
+strategy is a callable with the same signature: no registry, no server object,
+no model access.
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ from dew.nn.inputs import PredictionPhase, continuation_keys, prompt_major
 from dew.nn.scatter import DROPPED
 from dew.objectives.base import Variables
 from dew.objectives.likelihood import token_log_probs
+from dew.sampling import decoding
 from dew.sampling.decoding import StepState
 from dew.sampling.guided import Grammar
 
@@ -84,20 +85,16 @@ class DecodeOps:
     """What a strategy may do to the model, and nothing more.
 
     `advance` feeds one token per row and returns the state scoring the next
-    position; inactive rows leave their cache untouched. `reindex` gathers
-    cache rows, so a strategy can duplicate, reorder or drop a row's whole
-    decode state. `verify` feeds a whole block of tokens per row behind a
-    validity mask and returns every position's logits and hidden states.
-    `propose` runs one prediction depth over a candidate token at an explicit
-    target position, returning its logits and its own hidden state; both are
-    None on a model without prediction depths, and `depths` counts them. Its
-    prediction_phase distinguishes ordinary recomputation, accepted-history
-    extend, and single-chain draft operations; the model owns any reuse policy.
-    `record` and `draft` are a block drafter's instead: `record` appends the
-    context of a stretch's real positions, the states `verify` returns, to
-    the drafter's windows, and `draft` drafts the block after them from each
-    row's first token, handing each position's logits to a `choose` that
-    draws the token there.
+    position, leaving inactive rows' caches untouched. `reindex` gathers
+    cache rows, so a strategy can duplicate, reorder or drop a row's decode
+    state. `verify` feeds a block of tokens per row behind a validity mask and
+    returns every position's logits and hidden states. `propose` runs one of
+    the model's `depths` prediction depths over a candidate token at an
+    explicit target position, in the given prediction phase, and returns its
+    logits and hidden state. `record` and `draft` are a block drafter's:
+    `record` appends the states `verify` returned for a stretch's real
+    positions to the drafter's windows, and `draft` drafts the next block from
+    each row's first token, handing each position's logits to a `choose`.
     """
 
     advance: Advance
@@ -122,30 +119,26 @@ class Strategy(Protocol):
 def reseed(ops: DecodeOps, state: DecoderState, carry: Sequence[jax.Array | None],
            states: jax.Array, embeds: jax.Array, valid: jax.Array, positions: jax.Array,
            last: jax.Array, *, prior_tokens: jax.Array
-           ) -> tuple[DecoderState, list[jax.Array], tuple[jax.Array, ...]]:
-    """Write the prediction cache a stretch of history leaves behind.
+           ) -> tuple[DecoderState, tuple[jax.Array, ...]]:
+    """Write the prediction cache a stretch of history leaves behind, and
+    return each depth's predecessor at `last`, the target's first.
 
-    One invariant covers every depth: the entry for token `t` at depth `d`
-    consumes depth `d - 1`'s hidden state at `t - 1` together with `t`'s own
-    embedding, at `t`'s own target coordinate, and depth zero's predecessor is
-    the target model. That is what `mtp_hidden_states` does when it trains the
-    depths, what `MTPCandidateGenerator` corrects its cache with, and what
-    `Qwen3_5MultiTokenPredictor.forward` takes.
+    The entry for token `t` at depth `d` consumes depth `d - 1`'s hidden
+    state at `t - 1` with `t`'s own embedding, at `t`'s target coordinate,
+    and depth zero's predecessor is the target model, as `mtp_hidden_states`
+    trains the depths and `Qwen3_5MultiTokenPredictor.forward` reads them.
 
-    `carry` holds each depth's predecessor state at the position before this
-    stretch, so a block continues where the last one stopped instead of losing
-    the entry on the boundary. `prior_tokens` counts the real tokens before
-    this stretch. Depth `d` needs `d + 1` predecessors; rotary coordinates
-    cannot determine that count. A newly available predecessor is retained
-    even when its next depth cannot write an entry yet. `embeds` are the
-    prepared embeddings, including media replacements from the first prefill.
-    `last` is each row's final written slot, and a row that wrote nothing
-    keeps its carry.
+    `carry` holds each depth's predecessor at the position before this
+    stretch, so a block continues across the boundary. `prior_tokens` counts
+    the real tokens before it: depth `d` needs `d + 1` predecessors, which
+    rotary coordinates cannot count, and a newly available predecessor is
+    kept even before its next depth can write. `embeds` are the prepared
+    embeddings, media included. `last` is each row's final written slot; a
+    row that wrote nothing keeps its carry.
     """
     propose = ops.propose
-    produced: list[jax.Array] = []
     if propose is None:
-        return state, produced, tuple(entry for entry in carry if entry is not None)
+        return state, tuple(entry for entry in carry if entry is not None)
     ordinal = prior_tokens[:, None] + jnp.cumsum(valid, axis=1, dtype=jnp.int32) - 1
     upstream, tails = states, []
     for depth in range(ops.depths):
@@ -155,14 +148,13 @@ def reseed(ops: DecodeOps, state: DecoderState, carry: Sequence[jax.Array | None
              upstream[:, :-1]], axis=1)
         ready = valid & (ordinal > depth)
         state, _, out = propose(state, before, None, embeds, ready, positions, depth, "extend")
-        produced.append(out)
         held = jnp.zeros_like(upstream[:, 0]) if head is None else head
         predecessor_ready = jnp.any(valid & (ordinal >= depth), axis=1)
         tail = upstream[jnp.arange(upstream.shape[0]), last]
         mask = predecessor_ready.reshape((predecessor_ready.shape[0],) + (1,) * (tail.ndim - 1))
         tails.append(jnp.where(mask, tail, held))
         upstream = out
-    return state, produced, tuple(tails)
+    return state, tuple(tails)
 
 
 def as_pytree(value: Strategy) -> Strategy:
@@ -201,10 +193,17 @@ def draw(state: StepState, logits: jax.Array,
     raw = logits.astype(jnp.float32)
     checkify.check(jnp.all(wellformed(raw) | ~state.active),
                    "the model produced an active row without a distribution to score")
-    scores = transform(state, raw)
-    keys = jax.vmap(jax.random.fold_in)(state.keys, state.step)
-    token = select(keys, scores, state.active)
-    behavior = token_log_probs(scores, token)
+    if isinstance(transform, decoding.LogitsChain) and transform.greedy:
+        scores = decoding.chain(transform.transforms[:-1])(state, raw)
+        checkify.check(jnp.all(wellformed(scores) | ~state.active),
+                       "the transform chain left an active row without a distribution to draw from")
+        token = jnp.argmax(scores, axis=-1).astype(jnp.int32)
+        behavior = jnp.zeros(token.shape, jnp.float32)
+    else:
+        scores = transform(state, raw)
+        keys = jax.vmap(jax.random.fold_in)(state.keys, state.step)
+        token = select(keys, scores, state.active)
+        behavior = token_log_probs(scores, token)
     selected = token_log_probs(raw, token)
     return token, behavior, selected
 
@@ -242,16 +241,14 @@ class _Emitted(NamedTuple):
 class Sample:
     """Draw every row independently, one token per step.
 
-    This is the loop `generate` runs when a request names no strategy.
-    Continuations of a prompt share its prefill and run one after another, so
-    decode memory does not grow with `n` and a routed-expert forward sees the
-    same batch as a single continuation.
+    This is the loop `generate` runs when a request names no strategy, and
+    a prompt's continuations share its prefill (`continuations`).
 
     `grammar` holds every draw to a regex or JSON schema
-    (`dew.sampling.guided`). Each row carries its automaton state through
-    the loop; before a draw the tokens the state forbids score -inf, ahead
-    of the transform chain, so the chain filters and samples inside the
-    language, and the raw likelihood stays the model's own.
+    (`dew.sampling.guided`): each row carries its automaton state, and the
+    tokens it forbids score -inf ahead of the transform chain, so the chain
+    filters and samples inside the language and the raw likelihood stays
+    the model's own.
     """
 
     grammar: Grammar | None = None
@@ -371,12 +368,8 @@ def _beam_rows(parent, prompts: int, width: int):
 
 def _beam_continue(state: DecoderState, beams: StepState, ops: DecodeOps, parent, token,
                    forward, real, prompts: int, width: int):
-    """The `width` beams the step carries on with, reparented onto their rows.
-
-    A branched beam decodes exactly like a separately selected prefix, so
-    the whole decode state of each parent is gathered onto the row its child
-    continues from before the child's token is committed.
-    """
+    """The `width` beams the step carries on with, each parent's decode state
+    gathered onto its child's row before the child's token is committed."""
     parents = _pick(parent, forward)
     selected = _pick(token, forward).reshape(-1)
     state = ops.reindex(state, _beam_rows(parents, prompts, width))
@@ -422,10 +415,7 @@ def _beam_search(state: DecoderState, start: StepState, ops: DecodeOps,
 
     The carry is the model state, the beams' `StepState`, each beam's running
     score, the tokens and raw log probabilities drawn so far, whether the
-    prompt is still worth extending, and the completed set. A step scores
-    every live beam's continuations, keeps the best `Beam.keep`, moves the
-    ended ones into the completed set at their length-penalized score, and
-    reparents the cache rows of the ones it continues with.
+    prompt is still worth extending, and the completed set.
     """
     prompts, width, keep = start.rows, search.width, search.keep
     penalty, never = search.length_penalty, search.early_stopping == "never"
@@ -523,12 +513,7 @@ def _beam_start(state: DecoderState, start: StepState, ops: DecodeOps, prompts: 
 
 
 def _beam_draws(done: Completed, start: StepState, prompts: int, n: int, budget: int) -> Draws:
-    """The best `n` completed hypotheses per prompt, as output rows.
-
-    A selected path is a search result rather than a draw, so its behaviour
-    log probability is zero; the raw log probabilities stay the model's own
-    for the tokens on the path.
-    """
+    """The best `n` completed hypotheses per prompt, as output rows."""
     lengths = jnp.where(start.active[:, None], done.length, 0)[:, :n]
     valid = jnp.arange(budget)[None, None, :] < lengths[:, :, None]
     return Draws(done.tokens[:, :n].reshape(prompts * n, budget),
@@ -628,16 +613,9 @@ class _Drafted(NamedTuple):
 def _drafted(plan: Speculative, ops: DecodeOps, state: DecoderState, step: StepState,
              keys: jax.Array, base: jax.Array, active: jax.Array, budget: int,
              transform, stopping) -> _Drafted:
-    """One block's candidates: an ordinary target draw, then the draft.
-
-    The first candidate comes from the target's own logits, so it is always
-    accepted. Every later one chains through a prediction depth from the
-    previous candidate's hidden state and the coordinate it sits at, or is
-    drawn from a block drafter's logits for its position as its one pass
-    reaches it. `plan.confidence` stops offering candidates after the first
-    the draft is less sure of than that; they are still computed, at the
-    same shapes, and simply cannot be accepted.
-    """
+    """One block's candidates: an ordinary target draw, then the draft's,
+    chained through the prediction depths or drawn as a block drafter's pass
+    reaches each position."""
     block_size, rows = plan.block, step.rows
 
     def asked(at):
@@ -703,16 +681,12 @@ def _accepted(block_size: int, keys: jax.Array, targets: list[jax.Array], drafte
               step: StepState, active: jax.Array, budget: int) -> tuple[jax.Array, jax.Array]:
     """How many candidates the block keeps, and the token it ends on.
 
-    A proposed `x` is accepted with probability `min(1, p(x) / q(x))` for the
-    target's post-transform `p` and the draft's own `q`, compared as a log
-    ratio. A candidate the draft never offered was not rejected, so the block
-    ends on an ordinary target draw; only a rejected offer draws from the
-    normalized positive part of `p - q`, which is the distinction algorithm 1
-    rests on.
+    A candidate the draft never offered was not rejected, so the block ends
+    on an ordinary target draw there; only a rejected offer draws from the
+    positive part of `p - q`, the distinction algorithm 1 rests on.
     """
     candidates, drafts, offered, ending = (drafted.candidates, drafted.scores,
                                            drafted.offered, drafted.ending)
-    rows = active.shape[0]
     accepted = []
     for at in range(1, block_size):
         ratio = (token_log_probs(targets[at], candidates[at])
@@ -720,8 +694,7 @@ def _accepted(block_size: int, keys: jax.Array, targets: list[jax.Array], drafte
         uniform = jax.vmap(jax.random.uniform)(keys[:, block_size + at])
         accepted.append((jnp.log(uniform) <= ratio) & offered[at])
     available = 1 + sum(offered_flag.astype(jnp.int32) for offered_flag in offered[1:])
-    matched = (1 + jnp.sum(jnp.cumprod(jnp.stack(accepted, axis=1), axis=1), axis=1)
-               if accepted else jnp.ones(rows, jnp.int32)).astype(jnp.int32)
+    matched = (1 + jnp.sum(jnp.cumprod(jnp.stack(accepted, axis=1), axis=1), axis=1)).astype(jnp.int32)
     turned_down = matched < available
     target = jnp.take_along_axis(jnp.stack(targets, axis=1), matched[:, None, None], axis=1)[:, 0]
     draft = jnp.take_along_axis(jnp.stack(drafts, axis=1),
@@ -739,13 +712,8 @@ def _accepted(block_size: int, keys: jax.Array, targets: list[jax.Array], drafte
 def _emission(block_size: int, slots: jax.Array, matched: jax.Array, replacement: jax.Array,
               proposed: jax.Array, targets: list[jax.Array], raw: list[jax.Array],
               rows: int) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """The block's tokens and the two log probabilities recorded for each.
-
-    Every emitted action, a replacement or a bonus included, records the
-    target's post-transform log probability as its behaviour and the model's
-    own as its raw value. The draft's `q` is never recorded: it is not the
-    distribution the action came from.
-    """
+    """The block's tokens and the two log probabilities recorded for each,
+    the target's post-transform and the model's own (`Speculative`)."""
     emitted = jnp.where(slots < matched[:, None],
                         jnp.concatenate([proposed, jnp.zeros((rows, 1), jnp.int32)], axis=1),
                         replacement[:, None])
@@ -803,12 +771,8 @@ def _recorded(block_size: int, step: StepState, emitted: jax.Array, behavior: ja
 def _block(carry, plan: Speculative, ops: DecodeOps, transform, stopping, budget: int,
            slots: jax.Array, index: jax.Array):
     """One speculative block: draft `plan.block` candidates, verify them,
-    accept the longest prefix the test allows, and emit what follows it.
-
-    The target cache is saved before the block and the accepted prefix is
-    replayed into it, because a recurrent mixer's state is a running summary
-    no cursor can rewind, and the prediction cache is rebuilt the same way.
-    """
+    accept the longest prefix the test allows, and emit what follows it,
+    replaying the accepted prefix into the cache saved before the block."""
     verify, block_size = ops.verify, plan.block
     assert verify is not None
     state, step, terminated, out = carry
@@ -851,7 +815,7 @@ def _block(carry, plan: Speculative, ops: DecodeOps, transform, stopping, budget
         # The tails reseed hands back are every depth's predecessor at the
         # last emitted slot, the target's own state first; a row that
         # emitted nothing keeps what it had.
-        following, _, carried = reseed(
+        following, carried = reseed(
             ops, following, (state.hidden, *state.drafts), seen, ops.embed(emitted),
             keep, base, last, prior_tokens=step.total())
         following = dataclasses.replace(following, hidden=carried[0], drafts=carried[1:])
@@ -866,15 +830,9 @@ def _speculate(state: DecoderState, start: StepState, ops: DecodeOps,
                transform: Callable[[StepState, jax.Array], jax.Array],
                stopping: Callable[[StepState, jax.Array], jax.Array],
                budget: int, plan: Speculative) -> Draws:
-    """`Speculative`'s loop: propose `plan.block` tokens, then verify them.
-
-    The carry is the draft and target model states, the `StepState` the
-    accepted tokens leave behind, the tokens and their two log probabilities,
-    and the rows still running. One block drafts `block_size` candidates, scores them
-    and the one after them in a single target call, accepts the longest
-    prefix the acceptance test allows, and emits the bonus or corrected token
-    after it.
-    """
+    """`Speculative`'s loop of `_block`s. The carry is the model state, the
+    `StepState` the accepted tokens leave behind, which rows ended, and the
+    rows emitted so far."""
     block_size, rows = plan.block, start.rows
     slots = jnp.arange(block_size + 1)[None, :]
     index = jnp.arange(rows)[:, None]

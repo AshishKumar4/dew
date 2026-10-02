@@ -23,11 +23,11 @@ import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from dew.nn.moe import ExpertMLP
-from dew.training import MeshSpec, build_mesh
+from dew.training import MeshSpec
 
 
 def measure_exchange() -> None:
-    mesh = build_mesh(MeshSpec(expert=4, fsdp=2))
+    mesh = MeshSpec(expert=4, fsdp=2).build()
     model = ExpertMLP(8, 128, 64)
     x = jax.random.normal(jax.random.key(1), (256, 64))
     ids = jax.lax.top_k(jax.random.normal(jax.random.key(2), (256, 8)), 2)[1]

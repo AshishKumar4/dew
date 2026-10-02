@@ -73,9 +73,7 @@ class EDM:
     pixels in [-1, 1], and `regime="latent"` EDM2's exp(N(-0.4, 1.0^2))
     (Karras et al. 2024) for an autoencoder's latents. `P_mean` and `P_std`
     set explicitly override the regime's, and a record that stores them
-    rebuilds without one. A preset with neither builds no process: a single
-    default silently trained pixel models on latent sigmas (Oxford Flowers
-    at 64px, 6k steps, flip-only both sides: FID 160 on EDM2's values against 133 on 2022's).
+    rebuilds without one. A preset with neither builds no process, and
     `DiffusionRunConfig` fills the regime from whether it has an autoencoder.
     """
 

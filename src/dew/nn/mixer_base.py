@@ -1,19 +1,13 @@
 """Token mixers: what a decoder layer mixes across the sequence, by kind.
 
-A mixer is the per-layer token interaction a `DecoderBlock` holds as
-`self_attn`: any module with the `(x, decode=..., positions=...,
-segment_ids=...) -> x` signature. Grouped-query causal attention is the
-`attention` kind; MLA, the gated delta rule and the other mixers register
-beside it, each as a frozen dataclass value carrying the reference's field
-names.
-
-The backbone names one value on its `mixer` field, None for attention, and
-a kind builds its own `DecoderBlock` factory from a `MixerContext`: the
-layer geometry the backbone owns (heads, head dims, the kind-resolved rotary
-base, the window, the KV-sharing slot) plus the run's dtype and kernel
-choices. Geometry is stated once, here, so a new kind reads what it needs
-without the backbone growing a branch per kind. The backbone builds every
-mixer through `mixer.build(ctx)`.
+A mixer is the module a `DecoderBlock` holds as `self_attn`, with the `(x,
+decode=..., positions=..., segment_ids=...) -> x` signature. Grouped-query
+causal attention is the `attention` kind; MLA, the gated delta rule and the
+rest register beside it as frozen dataclass values under the reference's
+field names. A kind builds its `DecoderBlock` factory with `mixer.build(ctx)`
+from a `MixerContext`, the layer geometry the backbone owns (heads, head
+dims, the kind-resolved rotary base, the window, the KV-sharing slot) plus
+the run's dtype and kernel choices, so a new kind needs no backbone branch.
 """
 
 from __future__ import annotations
@@ -103,17 +97,12 @@ class MixerContext:
 class MixerBase:
     """One mixer kind's value: its fields, and how it builds its mixer.
 
-    Each kind is a frozen dataclass of the reference's field names, registered
-    under its name (`@mixers("mla")`), and a `{"kind": ...}` record builds it
-    through `mixers.from_record`: an unknown kind or field raises there.
-    `build` turns the value and the layer's context into the `DecoderBlock`
-    factory, the `Callable[..., nn.Module]` the block calls with
-    `name='self_attn'`.
-
-    The backbone types its `mixer` field as this base, not the registry
-    union, because a union of members that register over time cannot be
-    spelled before they exist. `mixers.union` is the live union for config
-    introspection and a tyro subcommand per kind.
+    Registered under its name (`@mixers("mla")`); a `{"kind": ...}` record
+    builds it through `mixers.from_record`, which refuses unknown kinds and
+    fields. `build` returns the `DecoderBlock` factory called with
+    `name='self_attn'`. The backbone types its field as this base because a
+    union of members that register over time cannot be spelled before they
+    exist; `mixers.union` is the live union for introspection and tyro.
     """
 
     keeps_triton_gemm = False

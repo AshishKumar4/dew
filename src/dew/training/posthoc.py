@@ -14,19 +14,16 @@ snapshot of them (`Checkpoints.profile_steps`). Each snapshot is a linear
 image of the weight trajectory with a known profile, so the average of
 any σ_rel at any snapshot's step is, to a least-squares fit of profiles,
 a weighted sum of snapshots: `coefficients` solves for the weights
-(Algorithm 3) and `reconstruct` sums the snapshots.
+(Algorithm 3) and `Checkpoints.posthoc_ema` sums the snapshots.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-
-from dew.objectives.base import Variables
 
 
 def exponent(std: float) -> float:
@@ -37,11 +34,6 @@ def exponent(std: float) -> float:
         raise ValueError(f"a relative standard deviation lies in (0, {12 ** -0.5:.4f}); got {std}")
     tail = std ** -2
     return float(np.roots([1, 7, 16 - tail, 12 - tail]).real.max())
-
-
-def relative_std(gamma: float) -> float:
-    """The relative standard deviation of the profile of exponent `gamma` (Eq. 123)."""
-    return float(np.sqrt((gamma + 1) / (gamma + 2) ** 2 / (gamma + 3)))
 
 
 def power_decay(std: float) -> optax.Schedule:
@@ -83,47 +75,3 @@ def coefficients(snapshots: Sequence[tuple[int, float]], updates: int, std: floa
     target = _correlation(times, gammas, np.float64(updates), exponent(std))
     weights = np.linalg.solve(gram, target)
     return weights / weights.sum()
-
-
-def reconstruct(directory: str, std: float, step: int | None = None) -> Variables:
-    """The average of relative standard deviation `std` at checkpoint `step`
-    (default: the latest snapshot) of the run in `directory`, as host arrays
-    in the params' structure and dtypes.
-
-    Sums every snapshot up to `step`, of every tracked profile, with the
-    weights `coefficients` solves for, one snapshot read at a time and
-    accumulated in fp32 or wider. The result goes where the run's params
-    go: `merge(params, {"params": reconstruct(...)})`.
-    """
-    from dew.checkpoints import Checkpoints
-
-    checkpoints = Checkpoints(directory)
-    steps = checkpoints.profile_steps()
-    if not steps:
-        raise FileNotFoundError(f"{directory} holds no EMA profile snapshots; train with "
-                                f"OptimConfig.ema_profiles to keep them")
-    step = steps[-1] if step is None else step
-    if step not in steps:
-        raise ValueError(f"{directory} holds EMA profile snapshots at steps {steps}, not {step}")
-    held = [(each, *checkpoints.profile_metadata(each)) for each in steps if each <= step]
-    # A snapshot before the first update holds the initial weights, with no
-    # profile to fit.
-    held = [(each, updates, stds) for each, updates, stds in held if updates > 0]
-    if not held or held[-1][0] != step:
-        raise ValueError(f"the snapshot at step {step} was taken before the first update")
-    weights = iter(coefficients([(updates, deviation) for _, updates, stds in held for deviation in stds],
-                                held[-1][1], std))
-    total, dtypes = None, None
-    for each, _, _ in held:
-        for average in checkpoints.restore_profiles(each):
-            weight = next(weights)
-            if total is None:
-                dtypes = jax.tree.map(lambda leaf: leaf.dtype, average)
-                total = jax.tree.map(
-                    lambda leaf, weight=weight: weight
-                    * leaf.astype(np.promote_types(leaf.dtype, np.float32)),
-                    average,
-                )
-            else:
-                total = jax.tree.map(lambda sum_, leaf, weight=weight: sum_ + weight * leaf, total, average)
-    return jax.tree.map(lambda leaf, dtype: leaf.astype(dtype), total, dtypes)

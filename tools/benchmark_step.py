@@ -60,8 +60,9 @@ import optax
 import tyro
 from jax.sharding import Mesh
 
-from dew import models  # naming a registry fills it
-from dew.data import preferences
+import dew.nn.backbones  # noqa: F401  (registers the kind)
+import dew.nn.backbones.jepa  # noqa: F401  (registers the kind)
+from dew.data import DataPartition, preferences
 from dew.data.chat import ROLES_KEY, Role
 from dew.diffusion import presets
 from dew.diffusion.discrete import MDLM
@@ -81,14 +82,14 @@ from dew.nn.vision import ProjectorBase, TowerBase
 from dew.objectives.base import Objective, Variables
 from dew.objectives.diffusion import BlockDiffusionObjective, DiffusionObjective
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
-from dew.objectives.jepa import JepaObjective, multi_block_mask
+from dew.objectives.jepa import JepaObjective, MultiBlockMask
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl import DPOObjective, GRPOObjective, sessions
-from dew.registry import float64_twin, projectors, resolve_dtype, towers, with_precision
+from dew.registry import float64_twin, models, projectors, resolve_dtype, towers, with_precision
 from dew.telemetry.instrumentation import model_flops_utilization
 from dew.telemetry.profile import capture_options
-from dew.training import Layout, MeshSpec, Trainer, build_mesh
-from dew.training.distributed import DevicePrefetchIterator, data_partition
+from dew.training import Layout, MeshSpec, Trainer
+from dew.training.distributed import DevicePrefetchIterator
 from dew.training.runtime import prepare_process
 from dew.training.trainer import remat_record
 
@@ -423,7 +424,7 @@ def cpu_smoke_cases() -> list[Case]:
                     "tower": {"kind": "siglip", "hidden_size": 32, "intermediate_size": 64,
                               "num_layers": 1, "num_heads": 2, "image_size": 16,
                               "patch_size": 8},
-                    "projector": {"kind": "gemma", "vision_width": 32, "text_width": 32,
+                    "projector": {"kind": "gemma", "text_width": 32,
                                   "patches_per_side": 2, "tokens_per_side": 2}},
              batch_size=8, seq_len=15, fsdp_min_param_size=256),
         Case("diffusion_gemma", {**tiny_decoder, "layer_scalar": "frozen"},
@@ -521,7 +522,7 @@ def small_cases(dtype: str) -> list[Case]:
                     "tower": {"kind": "siglip", "hidden_size": 1152,
                               "intermediate_size": 4304, "num_layers": 4,
                               "num_heads": 16, "image_size": 448, "patch_size": 14},
-                    "projector": {"kind": "gemma", "vision_width": 1152, "text_width": 768,
+                    "projector": {"kind": "gemma", "text_width": 768,
                                   "patches_per_side": 32, "tokens_per_side": 16}},
              batch_size=8, seq_len=512),
         # The same decoder read both ways by the official DiffusionGemma
@@ -704,7 +705,7 @@ def build_objective(case: Case, attention_impl: str = 'auto', *, widened: bool =
         grid = (case.image_size // patch, case.image_size // patch)
         objective = JepaObjective(
             model, built("jepa_predictor", {**case.predictor, "grid": grid}),
-            multi_block_mask(grid, num_targets=2, scale=(0.2, 0.3)),
+            MultiBlockMask.for_grid(grid, num_targets=2, scale=(0.2, 0.3)),
             sample=Field(sample_key, case.sample_shape))
     else:
         model = built(case.architecture, case.config)
@@ -750,7 +751,7 @@ def build_trainer(case: Case, attention_impl: str = 'auto',
         accumulation=case.accumulation, checkpoints=None, tracker=None)
     if case.device_order is not None:
         by_id = {device.id: device for device in jax.devices()}
-        trainer.device_mesh = build_mesh(trainer.mesh, [by_id[index] for index in case.device_order])
+        trainer.device_mesh = trainer.mesh.build([by_id[index] for index in case.device_order])
     return trainer
 
 
@@ -858,9 +859,9 @@ def global_batch(case: Case) -> Batch:
 def batches(case: Case, mesh: Mesh) -> Iterator[Batch]:
     """This process's share of one host batch, reused: the loader is
     benchmarked by benchmark_data.py. Every process draws the same global
-    batch and keeps the rows of the share `data_partition` names, as many
+    batch and keeps the rows of the share `DataPartition.of` names, as many
     as a loader would read."""
-    partition = data_partition(mesh)
+    partition = DataPartition.of(mesh)
     rows = partition.rows(case.batch_size)
     start = partition.index * rows
     mine = jax.tree.map(lambda leaf: leaf[start:start + rows], global_batch(case))

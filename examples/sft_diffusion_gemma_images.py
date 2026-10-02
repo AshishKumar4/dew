@@ -30,7 +30,7 @@ from dew.data.dataset import mapped, tokenized, train_stream
 from dew.data.images import ImageTransform, class_names
 from dew.interop.diffusion_gemma import build
 from dew.nn.inputs import ModelInputs
-from dew.objectives.base import Step, scalar_loss
+from dew.objectives.base import Step
 from dew.objectives.diffusion.block import BlockDiffusionObjective
 from dew.training import Checkpoints, Trainer
 
@@ -137,7 +137,7 @@ def main(config: Config):
         stream.close()
     initial = trainer.initial_state()
     vision_before = jax.tree.map(np.asarray, initial.params["params"]["conditioner"])
-    score = jax.jit(lambda params, inputs: scalar_loss(objective, params, {"text": inputs},
+    score = jax.jit(lambda params, inputs: objective.scalar_loss(params, {"text": inputs},
                    Step(step=jnp.asarray(0), key=jax.random.key(7), ema=None))[0])
     before = float(score(initial.params, probe["text"]))
     del initial

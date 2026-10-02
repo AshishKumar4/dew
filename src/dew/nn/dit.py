@@ -156,8 +156,7 @@ class AdaLNParams(nn.Module):
         )(nn.silu(conditioning) if self.silu else conditioning)
 
 
-@logical_axes({("patch_embed", "Conv_0"): (None, None, None, "embed")},
-              heuristic=(("hilbert_projection",),))
+@logical_axes({("patch_embed", "Conv_0"): (None, None, None, "embed")})
 class PatchSequenceEmbed(nn.Module):
     """Patchify in raster/hilbert/zigzag order and add the 2D sincos signal.
 
@@ -215,25 +214,19 @@ class PatchSequenceEmbed(nn.Module):
         return tokens, inv_idx
 
 
-@logical_axes({("time_embed", "layers_2"): ("mlp", "embed")},
-              heuristic=(("time_embed", "layers_1"), ("text_context_proj",)))
+@logical_axes({("time_embed", "layers_2"): ("mlp", "embed")})
 class ConditioningEmbed(nn.Module):
     """Fourier time embedding + the text projection mean-pooled over the real
     tokens, summed into the single conditioning vector the adaLN modulation
     consumes.
 
-    The projection is affine and the pooling a weighted mean, so the mean of
-    the projected tokens is the projection of the mean, computed for a row
-    rather than for each of its tokens. A row with no real tokens gets no
-    text, its bias included, as it would from a mean over no tokens.
-
-    `text_pooling` "all" averages every position the text tower returns, the
-    padding rows included, the pooling FlaxDiff 0.2's DiTs trained with, so
-    their checkpoints load. `interval` adds a second time embedding, of an
-    interval's `duration`. `time_scale` is the Fourier frequencies' scale:
-    the default 16 makes the embedding of a flow's model time (sigma times
-    1000) vary fast in time, which only its values need, while a loss that
-    differentiates in time (MeanFlow's, sCM's) needs it smooth.
+    The projection is affine and the pooling a weighted mean, so the row's mean
+    is projected once; a row with no real tokens gets no text, bias included.
+    `text_pooling` "all" averages every position, padding included, as FlaxDiff
+    0.2's DiTs trained. `interval` adds a second time embedding of the
+    interval's `duration`. `time_scale` is the Fourier frequencies' scale: the
+    default 16 varies fast in a flow's model time (sigma times 1000), while a
+    loss that differentiates in time (MeanFlow's, sCM's) needs it smooth.
     """
     emb_features: int
     mlp_ratio: int = 4
@@ -338,16 +331,11 @@ _DOTS_AND_ATTENTION_OUTPUT = jax.checkpoint_policies.save_from_both_policies(
 
 
 def saved_through_remat(prim, *args, **params) -> bool:
-    """The values a rematerialized block keeps instead of recomputing.
-
-    Three kinds. Unbatched matmul outputs, which keeps the recompute cheap
-    while leaving the reference path's [B, H, Q, K] scores, a batched dot, out
-    of the residuals. Whatever `scaled_dot_product_attention` returns, which
-    it labels 'attention_output'. And the whole fused attention forward: a
-    name can only mark that primitive's output, and its backward pass also
-    needs the softmax statistics, so a policy that saves the output alone
-    still replays the entire flash forward. Saving the primitive keeps both,
-    which is what takes a step's fused forward calls from two per layer back
+    """The values a rematerialized block keeps instead of recomputing:
+    unbatched matmul outputs (leaving the reference path's [B, H, Q, K] scores
+    out), the 'attention_output' `scaled_dot_product_attention` labels, and the
+    fused attention primitive itself, whose backward also needs the softmax
+    statistics, so saving it takes a step from two fused forward calls per layer
     to one.
     """
     return (str(prim) in FUSED_ATTENTION_FORWARD
@@ -361,17 +349,12 @@ forward, 'full' recomputes the whole block from its inputs."""
 
 
 def remat_block(block_cls, enabled: RematChoice, policy: str | None = 'dots'):
-    """Optionally rematerialize a block class.
+    """Optionally rematerialize a block class under `saved_through_remat`.
 
-    Recomputing a block during the backward pass trades extra compute for a
-    large drop in activation memory, which caps trainable model size. The
-    default policy is `saved_through_remat`, which keeps the block's cheap
-    matmul outputs and its attention forward. Blocks carrying complex
-    intermediates (the S5 mixer) must pass policy=None: saving a residual
-    goes through jax.lax.reduce_precision, which only accepts floating dtypes.
-
-    `train` selects a Python branch, so it has to stay static; that also means
-    callers must pass it positionally for jax to see it as such.
+    Blocks with complex intermediates (the S5 mixer) pass policy=None, since a
+    saved residual goes through jax.lax.reduce_precision, which accepts only
+    floating dtypes. `train` selects a Python branch, so callers pass it
+    positionally for jax to treat it as static.
     """
     if not enabled:
         return block_cls
@@ -385,19 +368,14 @@ def remat_block(block_cls, enabled: RematChoice, policy: str | None = 'dots'):
     )
 
 
-@logical_axes({("mlp", "layers_0"): ("embed", "mlp"), ("mlp", "layers_2"): ("mlp", "embed")},
-              heuristic=(("ssm",), ("spatial_fusion",)))
+@logical_axes({("mlp", "layers_0"): ("embed", "mlp"), ("mlp", "layers_2"): ("mlp", "embed")})
 class ModulatedBlock(nn.Module):
     """adaLN-Zero modulated residual block with a pluggable token mixer.
 
-    mixer='attention' gives the standard DiT block, rotated by the `freqs_cis`
-    a call passes (None leaves the tokens unrotated); mixer='ssm' replaces
-    attention with a bidirectional S5 scan, optionally followed by
-    Spatial-Mamba style 2D state fusion, and ignores freqs_cis.
-
-    modulated=False drops the adaLN-Zero conditioning path entirely, leaving a
-    plain pre-norm residual block with learned affine norms, the ViT block a
-    JEPA encoder needs, where there is no timestep to condition on.
+    mixer='attention' is the standard DiT block, rotated by `freqs_cis` (None
+    leaves it unrotated); mixer='ssm' is a bidirectional S5 scan, optionally
+    with Spatial-Mamba 2D state fusion, and ignores freqs_cis. modulated=False
+    is the plain pre-norm block with affine norms a JEPA encoder needs.
     `adaln_silu` is `AdaLNParams.silu`.
     """
     features: int
@@ -410,7 +388,6 @@ class ModulatedBlock(nn.Module):
     precision: PrecisionLike = None
     force_fp32_for_softmax: bool = True
     norm_epsilon: float = 1e-5
-    use_gating: bool = True
     adaln_silu: bool = True
     qk_norm: bool = False
     attention_impl: str = "auto"  # an AttentionImpl
@@ -518,18 +495,13 @@ class ModulatedBlock(nn.Module):
                 mixer_output = self._apply_2d_fusion(mixer_output)
         mixer_output = self.dropout(mixer_output, deterministic=not train)
 
-        if self.use_gating:
-            skip = constrain(skip + gate_attn * mixer_output, RESIDUAL)
-        else:
-            skip = constrain(skip + mixer_output, RESIDUAL)
+        skip = constrain(skip + gate_attn * mixer_output, RESIDUAL)
 
         x_mlp_modulated = self.norm2(skip) * (1 + scale_mlp) + shift_mlp
         mlp_output = self.mlp(x_mlp_modulated)
         mlp_output = self.dropout(mlp_output, deterministic=not train)
 
-        if self.use_gating:
-            return constrain(skip + gate_mlp * mlp_output, RESIDUAL)
-        return constrain(skip + mlp_output, RESIDUAL)
+        return constrain(skip + gate_mlp * mlp_output, RESIDUAL)
 
 
 def rope_for_scan(tokens: jax.Array, head_dim: int, scan_order: str):

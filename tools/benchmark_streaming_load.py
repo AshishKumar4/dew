@@ -56,7 +56,6 @@ def measure(mode: str, param_dtype: str) -> dict[str, object]:
 
     from dew.interop import load_pretrained
     from dew.training import Layout, MeshSpec
-    from dew.training.distributed import build_mesh
 
     repo, revision = QWEN3
     mesh, layout = MeshSpec(fsdp=jax.device_count()), Layout()
@@ -64,7 +63,7 @@ def measure(mode: str, param_dtype: str) -> dict[str, object]:
     start = time.perf_counter()
     if mode == "host":
         loaded = load_pretrained(repo, revision=revision, param_dtype=param_dtype)
-        variables = jax.device_put(loaded.variables, layout.shardings(build_mesh(mesh), loaded.variables))
+        variables = jax.device_put(loaded.variables, layout.shardings(mesh.build(), loaded.variables))
     else:
         variables = load_pretrained(repo, revision=revision, param_dtype=param_dtype,
                                     mesh=mesh, layout=layout).variables
@@ -92,7 +91,6 @@ def abstract() -> dict[str, object]:
     from dew.interop import pretrained, sources
     from dew.interop.streaming import SourceLeaf
     from dew.training import Layout, MeshSpec
-    from dew.training.distributed import build_mesh
 
     repo, revision = QWEN38
     stored = {"BF16": ml_dtypes.bfloat16, "F32": np.float32, "F16": np.float16}
@@ -106,7 +104,7 @@ def abstract() -> dict[str, object]:
     sources.snapshot = lambda name, revision, weights=True: snapshot(name, revision, weights=False)
 
     def placement(variables, mesh, layout):
-        device_mesh = build_mesh(mesh)
+        device_mesh = mesh.build()
         shardings = layout.shardings(device_mesh, variables)
         layout.check(variables, shardings, device_mesh)
         leaves = jax.tree.leaves(variables)

@@ -21,10 +21,7 @@ from dew.cli import tpu
 from dew.cli.gcloud import emit
 from dew.cli.launch import Launch
 
-CONFIG = (
-    tyro.conf.FlagCreatePairsOff,
-    tyro.conf.PositionalMetavarFromFieldName,
-)
+CONFIG = tpu.CONFIG
 Positional = tyro.conf.Positional
 
 
@@ -67,7 +64,7 @@ class Tokenize:
     PackedTokens can cut the stream back into documents."""
 
     def run_command(self) -> int:
-        from dew.data import write_tokens
+        from dew.data import TokenCorpus
 
         if self.tokenizer != "byte":
             # Every chunk is longer than the model's context, which is the
@@ -75,12 +72,12 @@ class Tokenize:
             from transformers.utils import logging as hf_logging
 
             hf_logging.set_verbosity_error()
-        meta = write_tokens(self.input, self.out, tokenizer=self.tokenizer,
-                            val_fraction=self.val_fraction, pack=self.pack)
+        corpus = TokenCorpus.write(self.input, self.out, tokenizer=self.tokenizer,
+                                   val_fraction=self.val_fraction, pack=self.pack)
         out = Path(self.out)
-        emit(f"wrote {meta['train_tokens']} tokens to {out / 'train.bin'} and "
-             f"{meta['val_tokens']} to {out / 'val.bin'}")
-        emit(f"{out / 'meta.json'}: {json.dumps(meta)}")
+        emit(f"wrote {corpus.train_tokens} tokens to {out / 'train.bin'} and "
+             f"{corpus.val_tokens} to {out / 'val.bin'}")
+        emit(f"{out / 'meta.json'}: {json.dumps(dataclasses.asdict(corpus))}")
         return 0
 
 

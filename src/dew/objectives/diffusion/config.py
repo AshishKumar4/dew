@@ -18,7 +18,7 @@ import numpy as np
 
 from dew.config import ModelConfig, RunConfig
 from dew.data import ImageDataset, OnlineImages, OnlineVideos, OxfordFlowers, VideoDataset
-from dew.diffusion.presets import build_process
+from dew.diffusion.presets import EDM, Flow, MeanFlow, Shortcut, build_process
 from dew.diffusion.process import Process
 from dew.inputs import Condition, Field, InputSpec, rebuild
 from dew.nn.autoencoders import AutoEncoder
@@ -26,6 +26,7 @@ from dew.nn.text_encoders import DEFAULT_MODEL
 from dew.objectives.base import FROZEN, Variables
 from dew.registry import DtypeName, datasets, encoders, metrics, models, presets, samplers
 from dew.sampling.guidance import CFG
+from dew.sampling.solvers import EulerAncestral
 
 from .alignment import REPRESENTATION, Alignment
 from .end_to_end import AUTOENCODER, EndToEnd
@@ -203,7 +204,7 @@ class FlowGRPO:
                              "scores each sample with an image metric's per-sample measure")
 
         def reward(images, batch):
-            return np.asarray(metric.measure(ImageGrid(images), batch))
+            return np.asarray(metric.fn(ImageGrid(images), batch))
 
         return FlowRollout(objective, reward, groups=self.groups, steps=self.rollout_steps,
                            train_steps=self.train_steps)
@@ -397,10 +398,10 @@ class DiffusionRunConfig(RunConfig):
     model: ModelConfig = dataclasses.field(
         default_factory=lambda: ModelConfig("unet", dict(DEFAULT_MODEL_CONFIG)))
     data: CaptionedSpec = dataclasses.field(default_factory=OxfordFlowers)
-    preset: PresetSpec | None = dataclasses.field(default_factory=presets.EDM)
+    preset: PresetSpec | None = dataclasses.field(default_factory=EDM)
     """The convention the model is trained and sampled with. None is the one
     the `pretrained` pipeline's scheduler reads, which a preset may restate."""
-    sampler: SamplerSpec = dataclasses.field(default_factory=samplers.EulerAncestral)
+    sampler: SamplerSpec = dataclasses.field(default_factory=EulerAncestral)
     """The solver validation samples with."""
     guidance: CFG | None = dataclasses.field(default_factory=lambda: CFG(3.0))
     """How validation samples are guided, scale and interval; None samples
@@ -431,22 +432,22 @@ class DiffusionRunConfig(RunConfig):
     (`DiffusionObjective(uncertainty=...)`; EDM2 uses 128); None keeps the
     preset's fixed weighting."""
     alignment: RepresentationAlignment | None = None
+    """Align the model's hidden tokens with a frozen DINOv2's, REPA or
+    iREPA, and with `end_to_end` tune the autoencoder through it (REPA-E)."""
     mean_flow: MeanFlowTraining | None = None
+    """Train with MeanFlow's loss instead of the denoising loss; the preset
+    is `mean_flow` and sampling is unguided, since the guidance is trained
+    in."""
     shortcut: ShortcutTraining | None = None
+    """Train a shortcut model instead of the denoising loss; the preset is
+    `shortcut`, and sampling is unguided."""
     distill: ConsistencyDistillation | None = None
+    """Distill a saved flow run into a few-step student (rCM, sCM or DMD2)
+    instead of the denoising loss; sampling is unguided."""
     guidance_distill: GuidanceDistillation | None = None
     """Distill a saved run's classifier-free guidance into this model's
     guidance input; sampling reads the conditioner's guidance value and no
     second branch."""
-    """Distill a saved flow run into a few-step student (rCM, sCM or DMD2)
-    instead of the denoising loss; sampling is unguided."""
-    """Train a shortcut model instead of the denoising loss; the preset is
-    `shortcut`, and sampling is unguided."""
-    """Train with MeanFlow's loss instead of the denoising loss; the preset
-    is `mean_flow` and sampling is unguided, since the guidance is trained
-    in."""
-    """Align the model's hidden tokens with a frozen DINOv2's, REPA or
-    iREPA, and with `end_to_end` tune the autoencoder through it (REPA-E)."""
     val_metrics: tuple[str, ...] = ("clip",)
     """Names in the metrics registry, scored on every validation pass. The
     registry is the list of what a run can name, so a metric registered
@@ -462,8 +463,6 @@ class DiffusionRunConfig(RunConfig):
                            "shortcut" if self.shortcut is not None else
                            "rcm" if self.distill is not None else
                            "guidance_distillation" if self.guidance_distill is not None else "diffusion")
-        from dew.diffusion.presets import EDM, Flow
-
         extras = [name for name in ("rl", "alignment", "mean_flow", "shortcut", "distill", "uncertainty")
                   if getattr(self, name) is not None]
         if self.guidance_distill is not None and (extras or self.guidance is not None):
@@ -472,7 +471,7 @@ class DiffusionRunConfig(RunConfig):
         others = [name for name in ("rl", "alignment", "mean_flow", "shortcut", "uncertainty")
                   if getattr(self, name) is not None]
         if self.distill is not None and (others or self.guidance is not None
-                                         or not isinstance(self.preset, presets.Flow)):
+                                         or not isinstance(self.preset, Flow)):
             raise ValueError(
                 "rCM distills on its own losses under the flow preset and samples unguided: "
                 f"set guidance None, and leave {others or 'rl, alignment, mean_flow, shortcut, uncertainty'}"
@@ -483,12 +482,12 @@ class DiffusionRunConfig(RunConfig):
                              "learned uncertainty weighting; leave uncertainty unset")
         if self.mean_flow is not None and (self.rl is not None or self.alignment is not None
                                            or self.guidance is not None
-                                           or not isinstance(self.preset, presets.MeanFlow)):
+                                           or not isinstance(self.preset, MeanFlow)):
             raise ValueError("MeanFlow trains on its own loss under the mean_flow preset, guided in "
                              "training (omega, kappa): set guidance None, and neither rl nor alignment")
         if self.shortcut is not None and (self.rl is not None or self.alignment is not None
                                           or self.mean_flow is not None or self.guidance is not None
-                                          or not isinstance(self.preset, presets.Shortcut)):
+                                          or not isinstance(self.preset, Shortcut)):
             raise ValueError("a shortcut model trains on its own loss under the shortcut preset and "
                              "samples unguided: set guidance None, and none of rl, alignment, mean_flow")
         if self.alignment is not None and (self.rl is not None or self.pretrained is not None):

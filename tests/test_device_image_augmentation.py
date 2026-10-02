@@ -7,6 +7,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from steady_state import guarded, steady_state
 
 from dew.data import DataPartition, Loading
 from dew.data.images import ImageDataset
@@ -131,13 +132,13 @@ def test_device_none_keeps_the_old_resize_bit_identical():
 
 
 def test_device_pixels_are_not_fetched_back_when_the_trainer_places_them():
-    from dew.training.distributed import build_mesh, shard_batch
+    from dew.training.distributed import MeshSpec, shard_batch
 
     stream = spec(augmentation_backend="device").load(batch=4).train(DataPartition())
     try:
         batch = next(stream)
-        mesh = build_mesh(devices=[jax.devices()[0]])
-        with jax.transfer_guard_device_to_host("disallow"):
+        mesh = MeshSpec().build([jax.devices()[0]])
+        with guarded(allow=("host_to_device",)):
             placed = shard_batch(mesh, batch)
             jax.block_until_ready(placed)
         np.testing.assert_array_equal(placed["image"], batch["image"])
@@ -187,3 +188,22 @@ def test_grain_workers_only_decode_and_keep_the_parent_device_draws():
 def test_invalid_augmentation_configuration_is_rejected(options):
     with pytest.raises(ValueError):
         spec(**options)
+
+
+def test_a_device_augmented_stream_steadies_into_compiled_reads_the_loop_waits_on_alone():
+    """Once a few batches have been augmented and placed, the stream the
+    trainer reads compiles nothing more for records of other sizes and
+    crops, and handing the loop a placed batch moves nothing it did not ask
+    for (`steady_state`): the augmentation and the placement stay on the
+    devices and on the prefetch worker."""
+    from dew.training.distributed import DevicePrefetchIterator, MeshSpec
+
+    mesh = MeshSpec().build([jax.devices()[0]])
+    stream = spec(augmentation_backend="device", crop_scale=(0.5, 0.9)).load(batch=4).train(DataPartition())
+    with DevicePrefetchIterator(stream, mesh) as prefetch:
+        for _ in range(3):
+            jax.block_until_ready(next(prefetch))
+        with steady_state():
+            batches = [next(prefetch) for _ in range(3)]
+            jax.block_until_ready(batches)
+    assert all(batch["image"].shape == (4, 12, 12, 3) for batch in batches)

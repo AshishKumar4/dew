@@ -28,7 +28,8 @@ class Overfit(Objective):
 
     def evaluate(self, params, batch, step):
         weight = params['params']['w']
-        return TokenScores(jnp.broadcast_to(weight, (4, 1)), jnp.ones((4, 1)))
+        return TokenScores(jnp.broadcast_to(weight, (4, 1)), jnp.ones((4, 1)),
+                           correct=jnp.zeros((4, 1), dtype=bool))
 
 
 @dataclasses.dataclass
@@ -98,12 +99,12 @@ def test_missing_and_undeclared_metrics_are_refused_before_training(tmp_path):
         trainer(tmp_path / 'b').fit(data(), steps=2, metrics=[metric], best=metric)
 
 
-def test_legacy_loss_and_periodic_retention(tmp_path):
+def test_ranked_loss_and_periodic_retention(tmp_path):
     run = trainer(tmp_path / 'run', keep=Keep(latest=1, every=2))
     state = run.fit(Data(train=data()._train), steps=1, log_every=1)
     checkpoints = run.checkpoints
     for step, loss in [(2, .1), (3, .9), (4, .7), (5, .8)]:
-        checkpoints.save(step, state.replace(step=jnp.int32(step)), None, metrics={'loss': loss})
+        checkpoints.save(step, state.replace(step=jnp.int32(step)), None, ranking=Ranking('train/loss', loss))
         checkpoints.wait()
     assert checkpoints.best == 2
     assert {entry.step for entry in checkpoints.kept()} == {2, 4, 5}
@@ -265,7 +266,7 @@ def test_aggregate_does_not_accept_strings_for_object_owned_metrics(tmp_path):
 
 def test_validation_loss_reduces_additive_statistics_over_uneven_batches():
     from dew.objectives.base import Ratio
-    from dew.training import evaluate
+    from dew.training import Evaluation
 
     class Weighted(Overfit):
         def loss(self, params, batch, step):
@@ -275,19 +276,21 @@ def test_validation_loss_reduces_additive_statistics_over_uneven_batches():
     objective = Weighted()
     variables = objective.init(jax.random.key(0))
     batches = [{'target': np.zeros(16, np.float32)}, {'target': np.ones(8, np.float32)}]
-    result = evaluate(objective, variables, lambda partition: iter(batches), key=jax.random.key(0), loss=True)
+    result = Evaluation.run(objective, variables, lambda partition: iter(batches), key=jax.random.key(0),
+                            loss=True)
     assert result.scores['val/loss'] == pytest.approx(1 / 3)
 
 
 def test_validation_loss_uses_exactly_the_ema_weights_of_the_evaluated_state():
-    from dew.training import evaluate
+    from dew.training import Evaluation
     objective = Overfit()
     live = {'params': {'w': jnp.asarray(.9)}}
     averaged = {'params': {'w': jnp.asarray(.5)}}
-    result = evaluate(objective, live, data().val, key=jax.random.key(0), averaged=averaged, step=7, loss=True)
+    result = Evaluation.run(objective, live, data().val, key=jax.random.key(0), averaged=averaged, step=7,
+                            loss=True)
     assert result.step == 7
     assert result.scores['val/loss'] == 0.
-    direct = evaluate(objective, averaged, data().val, key=jax.random.key(0), step=7, loss=True)
+    direct = Evaluation.run(objective, averaged, data().val, key=jax.random.key(0), step=7, loss=True)
     assert direct.scores == result.scores
 
 
@@ -390,7 +393,7 @@ def test_validation_loss_reuses_compilation_without_retaining_dead_objectives():
     import gc
     import weakref
 
-    from dew.training import evaluate
+    from dew.training import Evaluation
 
     class Traced(Overfit):
         traces = 0
@@ -400,7 +403,7 @@ def test_validation_loss_reuses_compilation_without_retaining_dead_objectives():
     objective = Traced()
     variables = objective.init(jax.random.key(0))
     for step in (1, 2):
-        report = evaluate(objective, variables, data().val, key=jax.random.key(0), step=step, loss=True)
+        report = Evaluation.run(objective, variables, data().val, key=jax.random.key(0), step=step, loss=True)
         assert report.scores['val/loss'] == .25
     assert objective.traces == 1
     owner = weakref.ref(objective)
@@ -412,7 +415,7 @@ def test_validation_loss_reuses_compilation_without_retaining_dead_objectives():
 def test_tile_head_invalidates_validation_trace_for_the_same_batch_shape():
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import LMObjective
-    from dew.training import evaluate
+    from dew.training import Evaluation
 
     class TracedLM(LMObjective):
         traces = 0
@@ -426,16 +429,16 @@ def test_tile_head_invalidates_validation_trace_for_the_same_batch_shape():
     batch = {'text': np.tile(np.arange(9, dtype=np.int32), (8, 1))}
     def reader(partition):
         return iter([batch])
-    first = evaluate(objective, variables, reader, key=jax.random.key(0), loss=True)
+    first = Evaluation.run(objective, variables, reader, key=jax.random.key(0), loss=True)
     old_program = objective._validation_loss
     assert objective.traces == 1
     assert objective.tile_head((4, 4)) is not None
-    second = evaluate(objective, variables, reader, key=jax.random.key(0), loss=True)
+    second = Evaluation.run(objective, variables, reader, key=jax.random.key(0), loss=True)
     assert objective.traces == 2
     assert objective._validation_loss is not old_program
     assert np.isfinite(first.scores['val/loss']) and np.isfinite(second.scores['val/loss'])
     # Replacing the immutable model (as the fit ladder does) also invalidates
     # the program, even when every variable and input shape stays the same.
     objective.model = objective.model.clone(remat=None)
-    evaluate(objective, variables, reader, key=jax.random.key(0), loss=True)
+    Evaluation.run(objective, variables, reader, key=jax.random.key(0), loss=True)
     assert objective.traces == 3

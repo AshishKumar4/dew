@@ -126,10 +126,10 @@ class HFDatasetSource:
     """Reads a Hugging Face `datasets.Dataset` by index.
 
     Either hand over a loaded dataset or name a hub dataset and split;
-    `load_dataset` resolves the name on the first record. The table never
-    travels in the source's pickle. A named dataset reloads from its name
-    inside the worker. A dataset handed over in memory is written out once
-    and reopened from there, the way `TokenBytes` reopens its memmap.
+    `load_dataset` resolves the name on the first record. The rows never
+    travel in the source's pickle: `datasets` pickles a table read from files
+    as their paths, which a worker maps again, and a dataset handed over in
+    memory is written out once and mapped from there.
     """
 
     def __init__(self, name: str | None = None, split: str = "train", dataset=None,
@@ -145,9 +145,6 @@ class HFDatasetSource:
         # compares two descriptions of the same rows.
         self.options = options or HFOptions()
         self._dataset = dataset
-        # Set when a dataset that arrived in memory is written out for the
-        # workers; from then on it is what reloads the table.
-        self._cache_path: str | None = None
         self._lock = threading.Lock()
 
     def __repr__(self) -> str:
@@ -155,7 +152,7 @@ class HFDatasetSource:
         # It names the dataset rather than an address, without touching the
         # table.
         return (f"HFDatasetSource(name={self.name!r}, split={self.split!r}, "
-                f"options={self.options!r}, cache={self._cache_path!r})")
+                f"options={self.options!r})")
 
     def _table(self) -> ArrowDataset:
         """The one Arrow-backed split, loaded once on first access.
@@ -177,24 +174,16 @@ class HFDatasetSource:
         return held
 
     def _loaded(self) -> ArrowDataset:
-        """One table, from the cache path or from the dataset's name."""
+        """One table, from the dataset's name."""
+        if self.name is None:
+            raise ValueError("an HF source needs a dataset name or a loaded dataset")
         datasets = _hf_datasets()
-        if self._cache_path is not None:
-            # A directory of splits comes back as a DatasetDict; a row source
-            # is one split's table.
-            held = datasets.load_from_disk(self._cache_path)
-            table = held[self.split] if isinstance(held, datasets.DatasetDict) else held
-            where = f"the saved dataset at {self._cache_path!r}"
-        elif self.name is None:
-            raise ValueError("an HF source needs a dataset name or a cache path")
-        else:
-            table = self.options.load(self.name, self.split, streaming=False)
-            where = f"{self.name!r} split {self.split!r}"
+        table = self.options.load(self.name, self.split, streaming=False)
         if not isinstance(table, datasets.Dataset):
             raise TypeError(
-                f"{where} loaded as {type(table).__name__}; a random-access source "
-                f"is one Arrow-backed split, so name one split, or read it with "
-                f"streaming=True")
+                f"{self.name!r} split {self.split!r} loaded as {type(table).__name__}; a "
+                f"random-access source is one Arrow-backed split, so name one split, or "
+                f"read it with streaming=True")
         return table
 
     def __len__(self) -> int:
@@ -216,17 +205,16 @@ class HFDatasetSource:
 
 
     def __getstate__(self) -> Held:
-        # grain pickles the source into every worker process, so the table
-        # must not be part of it. That would be a copy per worker of a dataset
-        # that is already on disk. A named dataset reloads from the hub cache
-        # on the other side; a dataset that only exists in memory has nowhere
-        # to reload from yet, so it is written out here, once.
+        # grain pickles the source into every worker process. A table read
+        # from files pickles as their paths and the worker maps them, with no
+        # second trip through load_dataset; a table that exists only in memory
+        # would travel whole, so it is written out here, once, and mapped.
         held = self._dataset
-        if held is not None and self.name is None and self._cache_path is None:
-            self._cache_path = tempfile.mkdtemp(prefix="dew-hf-dataset-")
-            held.save_to_disk(self._cache_path)
+        if held is not None and not held.cache_files:
+            directory = tempfile.mkdtemp(prefix="dew-hf-dataset-")
+            held.save_to_disk(directory)
+            self._dataset = _hf_datasets().Dataset.load_from_disk(directory)
         state = dict(self.__dict__)
-        state["_dataset"] = None
         state["_lock"] = None  # a lock does not pickle; the worker gets its own
         return state
 

@@ -129,12 +129,12 @@ def worker(directory: Path, mode: str, dtype: str) -> None:
     import optax
 
     from dew.checkpoints import Checkpoints
-    from dew.data import Loading, TokenWindows
+    from dew.data import DataPartition, Loading, TokenWindows
     from dew.data.dataset import GlobalStream
     from dew.interop import load_pretrained
     from dew.objectives.base import Step
     from dew.objectives.lm import LMObjective
-    from dew.training import Trainer, data_partition
+    from dew.training import Trainer
     from dew.training.tracker import LocalTracker
 
     run = directory / ("baseline" if mode == "baseline" else "restarted")
@@ -185,7 +185,7 @@ def worker(directory: Path, mode: str, dtype: str) -> None:
     before, _, before_position = trainer.place()
     if mode == "resumed" and not _mid_accumulation(before):
         raise RuntimeError("Resume lost the partially accumulated gradient")
-    stream = data.train(data_partition(trainer.device_mesh))
+    stream = data.train(DataPartition.of(trainer.device_mesh))
     if not isinstance(stream, GlobalStream):
         raise TypeError(
             "Qualification requires the token loader's global-position stream"
@@ -244,14 +244,15 @@ def prepare(
     directory: Path, corpus: Path, family: str, dtype: str, attention_impl: str
 ) -> None:
     import torch
-    from dew.data import write_tokens
     from transformers import AutoTokenizer, LlamaConfig, LlamaForCausalLM, MixtralConfig, MixtralForCausalLM
+
+    from dew.data import TokenCorpus
 
     directory.mkdir(parents=True, exist_ok=False)
     text = corpus.read_bytes()
     (directory / "corpus.txt").write_bytes(text)
-    write_tokens(directory / "corpus.txt", directory / "tokens", tokenizer=str(TOKENIZER),
-                 val_fraction=0.1)
+    TokenCorpus.write(directory / "corpus.txt", directory / "tokens", tokenizer=str(TOKENIZER),
+                      val_fraction=0.1)
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER, local_files_only=True)
     fields = dict(
         vocab_size=len(tokenizer),

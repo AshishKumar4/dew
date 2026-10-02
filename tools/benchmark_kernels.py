@@ -34,7 +34,6 @@ import optax
 from dew.config import OptimConfig
 from dew.nn.moe import expert_projection
 from dew.telemetry.profile import capture_options
-from dew.training.optim import build_optimizer
 
 VOCAB = 50304
 SEQUENCE = 1024
@@ -119,8 +118,8 @@ def adam(args: argparse.Namespace) -> dict[str, object]:
     keys = jax.random.split(jax.random.key(1), len(params))
     grads = {name: jax.random.normal(key, leaf.shape, jnp.float32) * 1e-3
              for key, (name, leaf) in zip(keys, params.items(), strict=True)}
-    solver = build_optimizer(OptimConfig(optimizer="adamw", learning_rate=1e-4, weight_decay=0.1,
-                                         state_dtype=args.state_dtype), 1000)
+    solver = OptimConfig(optimizer="adamw", learning_rate=1e-4, weight_decay=0.1,
+                                         state_dtype=args.state_dtype).build(1000)
 
     def update(params, state, grads):
         updates, state = solver.update(grads, state, params)
@@ -174,8 +173,8 @@ def step(args: argparse.Namespace) -> dict[str, object]:
         import dew.nn.backbones.dit as dit
         dit.remat_block = functools.partial(dit.remat_block, policy=None)
     case = case_for(args.path, args.batch, args)
-    trainer = benchmark_step.build_trainer(case, optimizer=build_optimizer(
-        OptimConfig(optimizer="adam", learning_rate=1e-4, state_dtype=args.state_dtype), 1000))
+    trainer = benchmark_step.build_trainer(case, optimizer=OptimConfig(
+        optimizer="adam", learning_rate=1e-4, state_dtype=args.state_dtype).build(1000))
     source = benchmark_step.DevicePrefetchIterator(
         benchmark_step.batches(case, trainer.device_mesh), trainer.device_mesh)
     with source:

@@ -1,11 +1,11 @@
 # Distributed training
 
-Dew places a run on several devices with two objects. A `MeshSpec` says how many devices each of six named mesh axes takes, and `build_mesh` arranges the devices into a `jax.sharding.Mesh` with those axes. A `Layout` maps the logical axis names that Dew's modules give their parameters, such as `embed` and `mlp`, to mesh axes. `Trainer` uses both to initialize, place and update the state, and XLA compiles the collectives the placement needs. The model, the objective and the data do not change with the mesh.
+Dew places a run on several devices with two objects. A `MeshSpec` says how many devices each of six named mesh axes takes, and `MeshSpec.build` arranges the devices into a `jax.sharding.Mesh` with those axes. A `Layout` maps the logical axis names that Dew's modules give their parameters, such as `embed` and `mlp`, to mesh axes. `Trainer` uses both to initialize, place and update the state, and XLA compiles the collectives the placement needs. The model, the objective and the data do not change with the mesh.
 
 ![A mesh of 8 devices with fsdp=2 and tensor=2, so data=2. The batch's 16 rows split into 4 blocks over data and fsdp, each held by a tensor pair. An MLP kernel of shape (256, 1024) splits its rows over fsdp and its columns over tensor, and each block is held by one device of each data index.](../assets/mesh-light.svg)
 ![A mesh of 8 devices with fsdp=2 and tensor=2, so data=2. The batch's 16 rows split into 4 blocks over data and fsdp, each held by a tensor pair. An MLP kernel of shape (256, 1024) splits its rows over fsdp and its columns over tensor, and each block is held by one device of each data index.](../assets/mesh-dark.svg)
 
-The figure is computed by `docs/assets/figures.py` from the placements `build_mesh`, `Layout().shardings` and `batch_shardings` return.
+The figure is computed by `docs/assets/figures.py` from the placements `MeshSpec.build`, `Layout().shardings` and `batch_shardings` return.
 
 ## Example
 
@@ -21,12 +21,13 @@ import jax
 import numpy as np
 import optax
 
-from dew import Dataset, Trainer, models
+from dew import Dataset, Trainer
+from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective
 from dew.training import MeshSpec
 
-model = models.build("causal_transformer", vocab_size=512, emb_features=256, num_layers=2,
-                     num_heads=4, mlp_features=1024, max_seq_len=64)
+model = CausalTransformer(vocab_size=512, emb_features=256, num_layers=2,
+                          num_heads=4, mlp_features=1024, max_seq_len=64)
 rows = np.random.default_rng(0).integers(0, 512, (16, 65), dtype=np.int32)
 data = Dataset(train=lambda partition: itertools.repeat({"text": rows}), val=None,
                records=16, batch=16)
@@ -53,7 +54,7 @@ Each device holds a `(128, 512)` block of the `(256, 1024)` kernel: the rows spl
 
 ## Mesh
 
-`MeshSpec` fields name the devices each axis takes; `data` takes the rest. The product of the fields must divide the device count, or `build_mesh` raises `LayoutRefused`.
+`MeshSpec` fields name the devices each axis takes; `data` takes the rest. The product of the fields must divide the device count, or `MeshSpec.build` raises `LayoutRefused`.
 
 | Axis | `MeshSpec` field | Splits |
 |---|---|---|
@@ -65,11 +66,11 @@ Each device holds a `(128, 512)` block of the `(256, 1024)` kernel: the rows spl
 | `stage` | `stage` | The decoder's layer stack, into pipeline stages |
 
 ```python
-from dew.training import build_mesh
+from dew.training import MeshSpec
 
-print(dict(build_mesh(MeshSpec(fsdp=4)).shape))
-print(dict(build_mesh(MeshSpec(fsdp=2, expert=4)).shape))
-print(dict(build_mesh(MeshSpec(fsdp=4, sequence=2)).shape))
+print(dict(MeshSpec(fsdp=4).build().shape))
+print(dict(MeshSpec(fsdp=2, expert=4).build().shape))
+print(dict(MeshSpec(fsdp=4, sequence=2).build().shape))
 ```
 
 ```text
@@ -139,7 +140,7 @@ An earlier synthetic BF16 bank load of 18.00 GiB (144 layers, width 2048, `bank_
 
 ## Batches
 
-`Dataset.batch` is the global batch. `Dataset.train(partition)` and `Dataset.val(partition)` read one share of every global batch, and `dew.training.data_partition(mesh)` returns the `DataPartition(index, count, readers, reader)` of this process. Processes whose devices hold the same rows read the same share: under `stage` or `sequence` axes that span processes, several processes hold one row shard and count as `readers` of one share. A loader cuts its records `index::count`, so global batch *k* holds the same records at every process count. `shard_batch` assembles the shares into global arrays of whole rows.
+`Dataset.batch` is the global batch. `Dataset.train(partition)` and `Dataset.val(partition)` read one share of every global batch, and `DataPartition.of(mesh)` returns the `DataPartition(index, count, readers, reader)` of this process. Processes whose devices hold the same rows read the same share: under `stage` or `sequence` axes that span processes, several processes hold one row shard and count as `readers` of one share. A loader cuts its records `index::count`, so global batch *k* holds the same records at every process count. `shard_batch` assembles the shares into global arrays of whole rows.
 
 For custom data, take the partition you are handed and read that share alone. Two readers of one share must read the same records in the same order. A source that returns rows in whatever order its fetches finish, such as `UrlStream`, refuses a partition with more than one reader. If each process repeats the full dataset on its own, the run trains on a different distribution.
 
