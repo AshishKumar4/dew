@@ -19,12 +19,22 @@ CPU array reaches numpy as a view, without a copy for the guard to refuse.
 `float(x)` under `jax.transfer_guard("disallow")` passes on CPU and raises
 on a GPU (measured on jax 0.11.2: float, int, np.asarray and item all pass
 on CPU). So for the block's duration `guarded` holds CPU arrays to the same
-rule, at the one place every implicit read goes through, `jax.Array`'s host
-value, reading the guard level the calling thread set. A test that passes
-on CPU then also passes the native guard on a GPU.
+rule, reading the guard level the calling thread set, at the two places an
+implicit read goes through: `jax.Array`'s host value, which float(), int(),
+item() and `__array__` read, and its buffer, which np.asarray takes first
+and, refused, falls back from to `__array__`. A test that passes on CPU
+then also passes the native guard on a GPU.
+
+The one read let through is a checkpoint's. Orbax moves a GPU array to
+pinned host memory with an explicit `jax.device_put` and reads that with
+np.asarray, which the native guard allows (a save under
+`jax.transfer_guard_device_to_host("disallow")` passes on an RTX 4080); a
+CPU device has no pinned memory, and the same np.asarray reads the array
+itself (`transfer_arrays_to_host` in orbax's replica_slices.py).
 """
 
 import contextlib
+import sys
 import traceback
 from collections.abc import Iterator
 
@@ -34,22 +44,44 @@ from jax._src.lib import guard_lib
 
 _COMPILE_EVENTS = {dispatch.JAXPR_TRACE_EVENT: "traced", dispatch.BACKEND_COMPILE_EVENT: "compiled"}
 _REFUSED = {guard_lib.TransferGuardLevel.DISALLOW, guard_lib.TransferGuardLevel.DISALLOW_EXPLICIT}
+_CHECKPOINT_COPY = "orbax/checkpoint/_src/serialization/replica_slices.py"
 _host_value = jax_array.ArrayImpl._value
+_buffer = jax_array.ArrayImpl.__buffer__
 _guarding = 0
 
 
-def _guarded_value(array):
-    """`jax.Array._value`, refusing an implicit read where the calling
-    thread's device-to-host guard refuses one, as a GPU's would."""
+def _refused(array) -> bool:
+    """Whether the calling thread's device-to-host guard refuses reading
+    `array` here, as a GPU's would."""
     state = guard_lib.thread_local_state()
     level = state.device_to_host or guard_lib.global_state().device_to_host
     explicit = state.explicit_device_get
-    if (array._npy_value is None and level in _REFUSED
-            and (not explicit or level == guard_lib.TransferGuardLevel.DISALLOW_EXPLICIT)):
+    return (array._npy_value is None and level in _REFUSED
+            and (not explicit or level == guard_lib.TransferGuardLevel.DISALLOW_EXPLICIT)
+            and not _checkpoint_copy())
+
+
+def _checkpoint_copy() -> bool:
+    frame = sys._getframe(1)
+    while frame is not None:
+        if frame.f_code.co_filename.endswith(_CHECKPOINT_COPY):
+            return True
+        frame = frame.f_back
+    return False
+
+
+def _guarded_value(array):
+    if _refused(array):
         raise AssertionError(
             f"Disallowed device-to-host transfer: aval={array.aval}; read it with "
             f"jax.device_get at the cadence that needs it")
     return _host_value.fget(array)
+
+
+def _guarded_buffer(array, flags):
+    if _refused(array):
+        raise BufferError("a guarded read goes through jax.Array._value")
+    return _buffer(array, flags)
 
 
 @contextlib.contextmanager
@@ -60,6 +92,7 @@ def guarded() -> Iterator[None]:
     global _guarding
     if _guarding == 0:
         jax_array.ArrayImpl._value = property(_guarded_value)
+        jax_array.ArrayImpl.__buffer__ = _guarded_buffer
     _guarding += 1
     try:
         with jax.transfer_guard("disallow"):
@@ -68,6 +101,7 @@ def guarded() -> Iterator[None]:
         _guarding -= 1
         if _guarding == 0:
             jax_array.ArrayImpl._value = _host_value
+            jax_array.ArrayImpl.__buffer__ = _buffer
 
 
 @contextlib.contextmanager

@@ -12,6 +12,7 @@ additive loss statistics with Aux reports. These values are JAX PyTrees.
 
 from __future__ import annotations
 
+import functools
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -353,6 +354,11 @@ class Objective(ABC, Generic[Loss, Effects]):
             cached = (model, head, compiled)
             self._validation_loss_cache = cached
         return cached[2]
+
+    @functools.cached_property
+    def _validation_reduction(self):
+        """`reduce_loss` compiled once, for the statistics a validation pass sums."""
+        return jax.jit(self.reduce_loss)
 
     @property
     def scalars(self) -> TrainingScalars[Loss, Effects]:

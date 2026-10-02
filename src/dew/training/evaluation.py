@@ -10,7 +10,6 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh
 
@@ -108,8 +107,8 @@ def evaluate(objective: Objective[Loss, Effects], variables: Variables,
     _agree_configuration(metrics, batches, split, loss=loss, training=training is not None)
     preview_enabled = bool(broadcast_from_process_zero(root and preview))
     event_step, context, event_words, training_scores = _event(key, step, schedule_step, averaged, training)
-    score_key = jax.random.fold_in(context.key, 0x53434F52)
-    preview_key = jax.random.fold_in(context.key, 0x50524556)
+    score_key = _folded(context.key, 0x53434F52)
+    preview_key = _folded(context.key, 0x50524556)
     scores: dict[str, float] = {}
     previews: tuple[Artifact, ...] = ()
     scored = records = 0
@@ -195,14 +194,21 @@ def _event(key: jax.Array, step: int | jax.Array, schedule_step: int | jax.Array
 
     def event() -> tuple[int, Step, jax.Array]:
         at = int(step_home)
-        event_key = jax.random.fold_in(jax.random.fold_in(key, 0x4556414C), at)
-        return (at, Step(step=jnp.asarray(schedule_home), key=event_key, ema=averaged),
+        event_key = _folded(_folded(key, 0x4556414C), at)
+        return (at, Step(step=jax.device_put(schedule_home), key=event_key, ema=averaged),
                 jax.random.key_data(event_key))
 
     event_step, context, event_data = agreed("evaluation context", event)
     event_words = tuple(int(word) for word in np.asarray(collective_host(
         event_data, phase="event identity")))
     return event_step, context, event_words, {name: float(value) for name, value in reports.items()}
+
+
+def _folded(key: jax.Array, word: int) -> jax.Array:
+    """`jax.random.fold_in(key, word)`, the host integer placed beside the
+    key by name rather than moved there implicitly by the fold: on the key's
+    devices, or uncommitted with an uncommitted key."""
+    return jax.random.fold_in(key, jax.device_put(np.uint32(word), key.sharding if key.committed else None))
 
 
 def _score_split(objective: Objective[Loss, Effects], variables: Variables, batches,
@@ -258,7 +264,7 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
                         loss_batch = batch
                         loss_variables = context.ema if context.ema is not None and not objective._ema_is_reference else variables
                         statistics = agreed(f"validation loss batch {scored}", lambda: objective._validation_loss(
-                            loss_variables, loss_batch, replace(context, key=jax.random.fold_in(score_key, scored))))
+                            loss_variables, loss_batch, replace(context, key=_folded(score_key, scored))))
                         statistics = collective_host(statistics, phase=f"validation loss batch {scored}")
                         loss_stats = statistics if loss_stats is None else jax.tree.map(
                             lambda total, value: total + value, loss_stats, statistics)
@@ -276,7 +282,7 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
         if scored:
             scores = _finalized(metrics, summaries, split=split, root=root)
             if loss_stats is not None and f'{split}/loss' not in scores:
-                value, valid = objective.reduce_loss(jax.tree.map(jnp.asarray, loss_stats))
+                value, valid = jax.device_get(objective._validation_reduction(jax.device_put(loss_stats)))
                 if not bool(valid) or not np.isfinite(float(value)):
                     raise ValueError("validation loss has no finite statistical support")
                 scores[f'{split}/loss'] = float(value)
@@ -327,7 +333,7 @@ def _scored_batch(objective: Objective[Loss, Effects], variables: Variables, bat
     whether or not it holds an accumulator.
     """
     produced = agreed(f"scoring batch {index}", lambda: objective.evaluate(
-        variables, batch, replace(context, key=jax.random.fold_in(score_key, index))))
+        variables, batch, replace(context, key=_folded(score_key, index))))
     produced, home = collective_host((produced, batch), phase=f"scoring batch {index}")
     artifacts = _artifacts(produced)
     for metric in metrics:
