@@ -3,7 +3,7 @@
 set -eu
 id -u visitor_probe >/dev/null 2>&1 || useradd --uid 6000 --create-home --shell /bin/sh visitor_probe
 id -u other_probe >/dev/null 2>&1 || useradd --uid 6001 --create-home --shell /bin/sh other_probe
-mkdir -p /sessions/probe /sessions/other
+mkdir -p /work /sessions/probe /sessions/other
 chmod 0711 /sessions
 chown visitor_probe:visitor_probe /sessions/probe
 chmod 0700 /sessions/probe /sessions/other
