@@ -14,7 +14,7 @@ from dew import Dataset, Trainer, evaluate
 from dew.artifacts import TextSamples, TokenScores
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import Aux, Objective
-from dew.objectives.lm import LMObjective, Samples, perplexity
+from dew.objectives.lm import LMObjective, Perplexity, Samples
 from dew.sampling import Sampling
 from dew.training import build_mesh
 
@@ -40,10 +40,10 @@ def test_standalone_trained_variables_match_fit_and_return_hosted_previews():
     data = Dataset(lambda partition: iter([batch] * 2), lambda partition: iter([batch]), records=8, batch=8)
     tracker = Recording()
     trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(1), tracker=tracker)
-    state = trainer.fit(data, steps=2, eval_every=2, log_every=2, metrics=(perplexity(),), preview=True)
+    state = trainer.fit(data, steps=2, eval_every=2, log_every=2, metrics=(Perplexity(),), preview=True)
     result = evaluate(objective, state.params, data.val, key=state.key, step=state.step,
                       schedule_step=state.microstep, averaged=state.averaged,
-                      metrics=(perplexity(),), preview=True, mesh=trainer.device_mesh)
+                      metrics=(Perplexity(),), preview=True, mesh=trainer.device_mesh)
     logged = next(item for item in tracker.scalars if "val/perplexity" in item)
     assert result.scalars == logged
     previews = [artifact for artifact in tracker.artifacts if isinstance(artifact, TextSamples)]
@@ -55,7 +55,7 @@ def test_standalone_trained_variables_match_fit_and_return_hosted_previews():
     assert restored.scores == result.scores and restored.event_key == result.event_key
     np.testing.assert_array_equal(restored.previews[0].tokens, result.previews[0].tokens)
     test = evaluate(objective, state.averaged, data.val, key=state.key, step=state.step,
-                    metrics=(perplexity(),), split="test")
+                    metrics=(Perplexity(),), split="test")
     assert test.scores == {"test/perplexity": result.scores["val/perplexity"]}
     assert test.previews == ()
 
@@ -76,8 +76,8 @@ def test_integer_evaluation_key_matches_a_jax_key():
     params = objective.init(jax.random.key(0))
     batches = [{"x": np.ones((16, 1), np.float32), "score": np.arange(16, dtype=np.float32)},
                {"x": np.ones((8, 1), np.float32), "score": np.arange(16, 24, dtype=np.float32)}]
-    integer = evaluate(objective, params, lambda partition: iter(batches), key=7, metrics=[perplexity()])
-    typed = evaluate(objective, params, lambda partition: iter(batches), key=jax.random.key(7), metrics=[perplexity()])
+    integer = evaluate(objective, params, lambda partition: iter(batches), key=7, metrics=[Perplexity()])
+    typed = evaluate(objective, params, lambda partition: iter(batches), key=jax.random.key(7), metrics=[Perplexity()])
     assert integer.scores == typed.scores == {"val/perplexity": 1.}
     assert integer.event_key == typed.event_key
     assert integer.records == 24 and integer.coordinated_batches == 2
@@ -100,7 +100,7 @@ def test_event_step_and_objective_schedule_have_separate_meanings():
     objective = ScheduledScores()
     batch = {"x": np.ones((8, 1), np.float32)}
     result = evaluate(objective, objective.init(jax.random.key(0)), lambda partition: iter([batch]),
-                      key=jax.random.key(9), step=7, schedule_step=2, metrics=(perplexity(),))
+                      key=jax.random.key(9), step=7, schedule_step=2, metrics=(Perplexity(),))
     assert result.step == 7
     assert result.scores["val/perplexity"] == pytest.approx(np.exp(2))
     event = jax.random.fold_in(jax.random.fold_in(jax.random.key(9), 0x4556414C), 7)
@@ -145,9 +145,9 @@ def test_a_second_pass_over_a_split_neither_compiles_nor_moves_data_unasked():
 
     key = jax.device_put(jax.random.key(1), NamedSharding(mesh, P()))
     first = evaluate(objective, params, split(0), key=key, step=2,
-                     metrics=(perplexity(),), loss=True, mesh=mesh)
+                     metrics=(Perplexity(),), loss=True, mesh=mesh)
     with steady_state():
         second = evaluate(objective, params, split(3), key=key, step=3,
-                          metrics=(perplexity(),), loss=True, mesh=mesh)
+                          metrics=(Perplexity(),), loss=True, mesh=mesh)
     assert second.coordinated_batches == first.coordinated_batches == 3
     assert second.scores["val/perplexity"] != first.scores["val/perplexity"]

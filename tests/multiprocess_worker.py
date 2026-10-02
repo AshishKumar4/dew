@@ -179,7 +179,6 @@ def as_numpy(tree):
     process takes the other branch.
     """
     import jax
-
     import jax.numpy as jnp
 
     tree = jax.tree.map(lambda leaf: jax.random.key_data(leaf)
@@ -712,7 +711,7 @@ def mode_validate(args) -> dict:
 
     from dew.data import Dataset
     from dew.diffusion import presets
-    from dew.eval import clip
+    from dew.eval import CLIPDistance
     from dew.inputs import Condition, Field, InputSpec
     from dew.inputs.encoders import CLIPText
     from dew.nn.backbones.dit import SimpleDiT
@@ -737,7 +736,7 @@ def mode_validate(args) -> dict:
     data = Dataset(train=lambda partition: iter([batch] * args.steps), val=lambda partition: iter([batch]),
                    records=BATCH * args.steps, batch=BATCH)
     state = trainer.fit(data, steps=args.steps, log_every=1, eval_every=args.steps,
-                        metrics=(clip(modelname=tiny), GlobalMean()), preview=True)
+                        metrics=(CLIPDistance(modelname=tiny), GlobalMean()), preview=True)
     return {
         "process_index": jax.process_index(),
         "process_count": jax.process_count(),

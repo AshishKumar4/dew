@@ -28,8 +28,7 @@ from flax import linen as nn
 from dew.artifacts import TokenScores
 from dew.data.chat import ROLES_KEY, Role
 from dew.objectives.base import Step
-from dew.objectives.lm import TEXT_KEY, LMObjective, Samples
-from dew.registry import metrics
+from dew.objectives.lm import TEXT_KEY, LMObjective, Perplexity, Samples
 from dew.sampling import Sampling
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 
@@ -359,9 +358,9 @@ def test_the_objective_trains_through_the_trainer(tmp_path, fsdp):
 # --- evaluation ------------------------------------------------------------
 
 def test_evaluation_correctness_is_the_same_full_forward_argmax():
-    from dew import models
+    from dew.nn.backbones import CausalTransformer
 
-    model = models.build("causal_transformer", vocab_size=8, emb_features=16, num_layers=1, num_heads=2,
+    model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1, num_heads=2,
                               mlp_features=32, max_seq_len=8, attention_impl="reference")
     objective = LMObjective(model, seq_len=4, ema_decay=None, token_accuracy=False)
     tokens = jnp.asarray([[1, 2, 3, 4, 1], [4, 3, 2, 1, 4]], jnp.int32)
@@ -445,7 +444,7 @@ def test_perplexity_weighs_every_batch_by_its_counted_targets():
     """exp(sum(loss * weight) / sum(weight)) over the pass: a batch with more
     counted targets moves the score more, which the mean of per-batch means
     gets wrong the moment counts differ."""
-    metric = metrics.perplexity()
+    metric = Perplexity()
     assert metric.reads is TokenScores
     heavy = TokenScores(losses=jnp.full((1, 4), 1.0), weights=jnp.ones((1, 4)), correct=jnp.zeros_like(jnp.full((1, 4), 1.0), dtype=bool))
     light = TokenScores(losses=jnp.full((1, 4), 3.0), weights=jnp.array([[1.0, 0, 0, 0]]), correct=jnp.zeros_like(jnp.full((1, 4), 3.0), dtype=bool))
@@ -457,7 +456,7 @@ def test_perplexity_weighs_every_batch_by_its_counted_targets():
 
 
 def test_a_batch_with_no_counted_target_weighs_nothing():
-    metric = metrics.perplexity()
+    metric = Perplexity()
     scored = TokenScores(losses=jnp.full((1, 4), 2.0), weights=jnp.ones((1, 4)), correct=jnp.zeros_like(jnp.full((1, 4), 2.0), dtype=bool))
     empty = TokenScores(losses=jnp.zeros((1, 4)), weights=jnp.zeros((1, 4)), correct=jnp.zeros_like(jnp.zeros((1, 4)), dtype=bool))
 
@@ -467,7 +466,7 @@ def test_a_batch_with_no_counted_target_weighs_nothing():
 
 
 def test_perplexity_is_exp_of_the_mean_cross_entropy_not_the_mean_of_exps():
-    metric = metrics.perplexity()
+    metric = Perplexity()
     values = [metric(TokenScores(losses=jnp.full((1, 2), ce), weights=jnp.ones((1, 2)), correct=jnp.zeros_like(jnp.full((1, 2), ce), dtype=bool)), None)
               for ce in (0.0, 2.0)]
     expected = np.exp(np.mean([0.0, 2.0]))
@@ -496,7 +495,7 @@ def test_the_validation_pass_scores_perplexity_per_token_and_logs_it():
     tracker = RecordingTracker()
     trainer = make_trainer(pad_id=0, tracker=tracker)
     state = trainer.fit(Data(cycle_batches, val=lambda: iter(batches)), steps=1, log_every=1,
-                        eval_every=1, metrics=(metrics.perplexity(),))
+                        eval_every=1, metrics=(Perplexity(),))
 
     total, count = 0.0, 0.0
     for batch in batches:

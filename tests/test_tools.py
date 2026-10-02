@@ -642,7 +642,11 @@ def test_step_benchmark_small_preset_exempts_only_the_jepa_predictor():
     through the registry inside their objective, so their rows are its rows.
     An architecture named as covered without a case measuring it would leave
     the difference here nonempty."""
-    from dew import models
+    import dew.nn.backbones  # noqa: F401  (registers the kind)
+    import dew.nn.backbones.jepa  # noqa: F401  (registers the kind)
+    import dew.nn.diffusion_gemma  # noqa: F401  (registers the kind)
+    import dew.nn.multimodal  # noqa: F401  (registers the kind)
+    from dew.registry import models
 
     tool = load("benchmark_step")
     cases = tool.small_cases("bfloat16")

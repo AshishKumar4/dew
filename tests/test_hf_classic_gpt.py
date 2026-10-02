@@ -8,10 +8,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew import models
 from dew.interop import load_pretrained
 from dew.interop.hf_decoders import translate_config
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.registry import models
 
 FIXTURES = Path(__file__).parent / 'fixtures' / 'hf'
 
@@ -92,8 +92,8 @@ def test_gpt2_reference_detects_a_dropped_classic_term(term):
 
 
 def test_gpt2_export_is_read_by_transformers(tmp_path):
-    from transformers import AutoModelForCausalLM
     import torch
+    from transformers import AutoModelForCausalLM
 
     loaded = load_pretrained(FIXTURES / 'gpt2-tiny', dtype='float32', attention_impl='reference')
     loaded.save(tmp_path)

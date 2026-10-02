@@ -122,14 +122,15 @@ Hybrid sharding keeps fsdp inside a node and replicates across nodes, so only on
 ```python
 import jax
 import optax
-from dew import Trainer, models
+from dew import Trainer
+from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective
 from dew.training import MeshSpec
 from dew.training.runtime import prepare_process
 
 prepare_process()
-model = models.build("causal_transformer", vocab_size=256, emb_features=512,
-                     num_layers=8, num_heads=8, max_seq_len=1024)
+model = CausalTransformer(vocab_size=256, emb_features=512,
+                          num_layers=8, num_heads=8, max_seq_len=1024)
 # fsdp over the eight GPUs of each node, and the data axis of 2 across the nodes.
 mesh = MeshSpec(fsdp=8, replicas=2)
 trainer = Trainer(LMObjective(model, seq_len=1024), optax.adamw(3e-4),

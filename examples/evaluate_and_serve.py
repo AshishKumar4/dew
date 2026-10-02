@@ -43,8 +43,7 @@ from dew.config import ModelConfig, OptimConfig, TrainerConfig
 from dew.data import Loading, TokenWindows
 from dew.eval import clip_score, fid
 from dew.inference import TextGeneration, TextToImage
-from dew.objectives.lm import LMObjective, LMRunConfig
-from dew.registry import metrics
+from dew.objectives.lm import LMObjective, LMRunConfig, Perplexity
 from dew.sampling import Sampling
 from dew.training import evaluate
 
@@ -139,7 +138,7 @@ def perplexity(task: TextGeneration, config: Config) -> dict[str, float]:
         raise ValueError(f"{config.tokens} holds no val split to score")
     scored = evaluate(LMObjective(task.model, config.sequence_length),
                       task.variables, data.val, key=jax.random.key(0),
-                      metrics=[metrics.perplexity()])
+                      metrics=[Perplexity()])
     return dict(scored.scores)
 
 

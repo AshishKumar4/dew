@@ -34,15 +34,17 @@ from pathlib import Path
 
 import flax.linen as nn
 import jax
+import jax.numpy as jnp
 import numpy as np
 import optax
 import tyro
 from jax.sharding import NamedSharding
 
-from dew import Layout, MeshSpec, Trainer, models
+from dew import Layout, MeshSpec, Trainer
 from dew.data import ByteTokenizer, Loading, TokenWindows
 from dew.inference import RunProcessor, TextGeneration
 from dew.inference.serving import Server
+from dew.nn.backbones import CausalTransformer, Mixture
 from dew.nn.sharding import RESIDUAL, logical_spec
 from dew.objectives.lm import LMObjective
 from dew.sampling import Sampling
@@ -216,10 +218,10 @@ def main(config: Config) -> None:
     write_tokens(config.out / "tokens", config.seed)
     data = TokenWindows(path=str(config.out / "tokens"), seq_len=config.sequence_length, val_batches=1,
                         loading=Loading(workers=0, threads=1, read_buffer=2)).load(batch=config.batch_size)
-    model = models.build(
-        "causal_transformer", vocab_size=256, emb_features=64, num_layers=2, num_heads=4,
-        mlp_features=128, max_seq_len=64, dtype="float32", attention_impl="xla",
-        mixture={"experts": config.experts, "top_k": config.top_k, "every": 1, "dispatch": config.dispatch})
+    model = CausalTransformer(
+        vocab_size=256, emb_features=64, num_layers=2, num_heads=4,
+        mlp_features=128, max_seq_len=64, dtype=jnp.float32, attention_impl="xla",
+        mixture=Mixture(experts=config.experts, top_k=config.top_k, every=1, dispatch=config.dispatch))
     objective = LMObjective(model, config.sequence_length, aux_loss_alpha=0.01)
     trainer = Trainer(objective, optax.adam(config.learning_rate), key=jax.random.key(config.seed),
                       mesh=MeshSpec(fsdp=config.fsdp, expert=config.expert), layout=Layout(min_shard=1))

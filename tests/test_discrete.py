@@ -14,9 +14,10 @@ from dew.data import Dataset
 from dew.diffusion import EpsilonPredictionTransform, Process
 from dew.diffusion.discrete import MDLM, DiscreteProcess, LogLinear, Unmask
 from dew.diffusion.schedules import CosineNoiseScheduler
+from dew.nn.backbones import CausalTransformer
 from dew.objectives.base import Step, scalar_loss
 from dew.objectives.diffusion import MaskedDiffusionObjective
-from dew.registry import models, presets, samplers
+from dew.registry import presets, samplers
 from dew.sampling import sample
 from dew.training import Trainer
 
@@ -200,7 +201,7 @@ def test_the_mdlm_preset_is_registered_and_takes_no_conditions():
 ############################################################################################################
 
 def transformer(causal):
-    return models.CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=1, num_heads=2,
+    return CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=1, num_heads=2,
                                     max_seq_len=8, causal=causal)
 
 
@@ -319,7 +320,7 @@ def test_masked_diffusion_lm_memorises_the_toy_corpus():
     tests/test_discrete.py at c0f4156). The loss reports the masked accuracy
     and the masked fraction beside the NELBO."""
     process = MDLM(mask_id=BYTE_MASK)()
-    model = models.CausalTransformer(vocab_size=257, emb_features=64, num_layers=2, num_heads=4,
+    model = CausalTransformer(vocab_size=257, emb_features=64, num_layers=2, num_heads=4,
                                      max_seq_len=ROW, causal=False)
     objective = MaskedDiffusionObjective(model, process, ROW, steps=48, samples=16)
 
