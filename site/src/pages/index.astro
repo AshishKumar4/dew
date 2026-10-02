@@ -40,7 +40,7 @@ if (JSON.stringify(expanded.slice(-terminalReplay.source_rows)) !== JSON.stringi
 	throw new Error('Training replay changes the recorded final viewport');
 }
 const shortHero = heroCode.slice(heroCode.indexOf('model ='));
-const replays = ['aurora', 'alpine', 'painted-mountains'].map((name) => {
+const replays = ['aurora', 'lighthouse-sunset', 'roerich'].map((name) => {
 	const meta = JSON.parse(readPublic('hero', 'replay', name, 'meta.json'));
 	if (Math.round(meta.model.parameters / 1e6) !== 176 || !/^[0-9a-f]{40}$/.test(meta.model.dew_commit)) {
 		throw new Error(`replay ${name}: missing model provenance`);
@@ -50,6 +50,7 @@ const replays = ['aurora', 'alpine', 'painted-mountains'].map((name) => {
 const modelSize = Math.round(replays[0].model.parameters / 1e6);
 const resolution = records.sample_public.result.shape.slice(1, 3).join('×');
 const mesh = records.mesh.result;
+const gallery = JSON.parse(readPublic('gallery', 'dew-176m', 'manifest.json'));
 const tries = [
 	...(live.endpoint && live.turnstileSitekey ? [{ name: 'Live sampler', what: 'Edit the cell and run it on a CPU kernel.', href: '/sample/' }] : []),
 	{ name: 'Colab notebook', what: 'Load the model and sample it on a GPU.', href: 'https://colab.research.google.com/github/AshishKumar4/dew/blob/main/site/notebooks/sample-text-to-image.ipynb' },
@@ -68,6 +69,14 @@ const tutorialNames: Record<string, string> = {
 
 <StarlightPage frontmatter={{ title: 'Dew', description: 'A JAX/Flax framework for training, generation and serving.', template: 'splash', hero: { title: 'Train models with JAX and Flax.' }, pagefind: false }} hasSidebar={false}>
 	<div class="landing not-content">
+		<section class="band landing-visuals" data-reveal>
+			<h2 class="band-title">Trained with Dew</h2>
+			<p class="framework-note"><a href="https://huggingface.co/dewml/hybrid-dit-176m">176M hybrid DiT</a> · <a href="/gallery/dew-176m/manifest.json">Prompts and settings</a></p>
+			<div class="landing-image-grid">{gallery.images.map((image: { file: string; prompt: string }) => <figure>
+				<img src={`/gallery/dew-176m/${image.file}`} width="256" height="256" alt={image.prompt} loading="lazy" decoding="async" />
+				<figcaption>{image.prompt}</figcaption>
+			</figure>)}</div>
+		</section>
 		<section class="band run" data-reveal>
 			<h2 class="band-title">Train, evaluate, sample</h2>
 			<p class="band-lede">A decoder learns Tiny Shakespeare on {capture.meta.where}, then generates ROMEO and JULIET samples.</p>

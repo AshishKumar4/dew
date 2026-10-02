@@ -1,6 +1,6 @@
 {
- "prompt": "the northern lights over a frozen lake at night",
- "seed": 50,
+ "prompt": "a red and gold mountain landscape, a painting in the style of Nicholas Roerich, vivid colors, dramatic lighting, highly detailed",
+ "seed": 32,
  "sampler": "UniPC",
  "steps": 30,
  "cfg": 6.0,
@@ -53,9 +53,9 @@
  "columns": 8,
  "crop": [
   0,
-  36,
+  42,
   256,
-  207
+  213
  ],
  "width": 256,
  "height": 171

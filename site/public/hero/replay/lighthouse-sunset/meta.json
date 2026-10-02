@@ -1,6 +1,6 @@
 {
- "prompt": "the northern lights over a frozen lake at night",
- "seed": 50,
+ "prompt": "a lighthouse on a rocky coast at sunset, dramatic waves and golden light, vivid colors, dramatic lighting, highly detailed",
+ "seed": 3,
  "sampler": "UniPC",
  "steps": 30,
  "cfg": 6.0,
@@ -53,9 +53,9 @@
  "columns": 8,
  "crop": [
   0,
-  36,
+  42,
   256,
-  207
+  213
  ],
  "width": 256,
  "height": 171
