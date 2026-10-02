@@ -354,10 +354,11 @@ def _gemma4_config(hf_config: Mapping[str, object], used: set[str], *,
             None if full_dim == sliding_dim else full_dim,
         ),
         partial_rotary_factor=partial,
-        use_double_wide_mlp=bool(hf_config.get("use_double_wide_mlp", False)),
-        num_kv_shared_layers=records.integer(
-            hf_config.get("num_kv_shared_layers", 0), "num_kv_shared_layers"
-        ),
+        # The reference widens only sharing layers. With none, this flag
+        # changes neither the weights nor the forward operation.
+        use_double_wide_mlp=(bool(hf_config.get('use_double_wide_mlp', False))
+                            and records.integer(hf_config.get('num_kv_shared_layers', 0), 'num_kv_shared_layers') > 0),
+        num_kv_shared_layers=records.integer(hf_config.get('num_kv_shared_layers', 0), 'num_kv_shared_layers'),
         per_layer_input_dim=per_layer or None,
         per_layer_input_vocab=records.integer(
             hf_config.get(

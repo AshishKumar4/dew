@@ -57,6 +57,23 @@ jobs:
       with:
         name: complexity
         path: complexity.json
+    - uses: pnpm/action-setup@v4
+      with:
+        package_json_file: site/package.json
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 22
+        cache: pnpm
+        cache-dependency-path: site/pnpm-lock.yaml
+    - name: Install site dependencies
+      run: pnpm --dir site install --frozen-lockfile
+    - name: Check site content
+      run: |
+        node site/scripts/sync-docs.mjs --check
+        node site/scripts/render-notebooks.mjs --check
+        uv run --no-project --with griffe==2.3.0 python site/scripts/gen_api.py --check
+        JAX_PLATFORMS=cpu python site/scripts/gen_models.py --check
+        python site/scripts/gen_examples.py --check
     - name: Type check
       run: uvx pyright@1.1.406 --pythonpath "$(which python)" src/dew
 

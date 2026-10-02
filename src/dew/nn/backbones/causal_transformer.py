@@ -1708,10 +1708,11 @@ class CausalTransformer(nn.Module):
 
     def _logits(self, x):
         """The shared fp32 head over `x`: what `__call__` and every MTP depth score with."""
-        # The logits are fp32 and the loss is computed in fp32. The product
-        # follows the compute dtype, as torch autocast and MaxText's
-        # `logits_dot_in_fp32=False` do: bf16 states multiply the head as
-        # bf16 with fp32 accumulation, fp32 states the head as stored
+        # The logits are held in fp32 and the loss is computed in fp32. The
+        # product follows the compute dtype, as torch autocast and MaxText's
+        # `logits_dot_in_fp32=False` do: at the default precision bf16
+        # states multiply the head as bf16 with fp32 accumulation into bf16
+        # logits, fp32 states the head as stored
         # (`dew.nn.precision.head_product`, the chunked loss's arithmetic).
         if self.tie_embeddings:
             logits = head_product('...d,vd->...v', x, self.embed_tokens.embedding,

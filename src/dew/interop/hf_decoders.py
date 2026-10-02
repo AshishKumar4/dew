@@ -8,10 +8,10 @@ defaults to FP32, independently of compute dtype, so dew.interop.load_pretrained
 builds a model whose variables a forward pass takes straight away, and
 save_pretrained_decoder writes one back out in the HF layout.
 
-Each family is one `DecoderFamily` entry in `family_entries()`, keyed by its
+Each family is one `DecoderFamily` entry in `decoder_families.ENTRIES`, keyed by its
 model_type: the config translation, the tensor path rule and the export
-vocabulary. `family_entries()` at the bottom of this file is the list of
-covered families; read it rather than a copy of it here.
+vocabulary. `family_entries()` loads that table on first use; read it for the
+covered families rather than a copy here.
 
 A multimodal wrapper config raises a ValueError naming its model_type.
 DeepSeek's released checkpoints carry `num_nextn_predict_layers: 1` with no
@@ -38,7 +38,6 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew import records
 from dew._model_types import _QWEN35_TEXT_TYPES, _QWEN35_TYPES
-from dew.interop import mamba2
 from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors
 
 if TYPE_CHECKING:
@@ -943,13 +942,18 @@ def _translated(hf_config: Mapping[str, object], family: "DecoderFamily") -> tup
     return config, unknown
 
 
-def _wrapper_text(hf_config: Mapping[str, object], used: set) -> DecoderFields:
+def _wrapper_text(hf_config: Mapping[str, object], used: set, *,
+                  declared_type: str | None = None) -> DecoderFields:
     """Translate the wrapper's text_config as the decoder it is."""
     text = hf_config.get("text_config")
     if not isinstance(text, Mapping):
         _refuse("text_config",
                 f"a wrapper carries its decoder under text_config, got {text!r}")
     used.add("text_config")
+    if declared_type is not None and 'model_type' not in text:
+        # The wrapper config class supplies its declared nested class when
+        # reading a raw dict. Checkpoint copies need not repeat that tag.
+        text = {**text, 'model_type': declared_type}
     if hf_config.get("model_type") != "llama4":
         # These conditional models own their lm_head at wrapper scope; the
         # nested text model has no head. Llama4 nests a complete causal LM.
@@ -1081,7 +1085,7 @@ def _wrapper_audio(hf_config: Mapping[str, object], used: set, text_width: int) 
 
 def _gemma4_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields:
     """Read a Gemma 4 wrapper: 2D-table tower, position pooler, embedder, decoder."""
-    text = _wrapper_text(hf_config, used)
+    text = _wrapper_text(hf_config, used, declared_type='gemma4_text')
     tower = vision_nn.translate_gemma4_vision_config(hf_config)
     used.add("vision_config")
     projector = vision_nn.translate_gemma4_projector_config(

@@ -431,7 +431,7 @@ A `Program` is files written into a fresh temporary directory, an argv run there
 | `policy_loss="ppo"` | Dual-clipped token surrogate | `compute_policy_loss_vanilla` |
 | `policy_loss="gspo"` | Clipped sequence ratio, pooled per chain, no dual clip | `compute_policy_loss_gspo` |
 | `policy_loss="cispo"` | `-sg(clip(r)) * A * log pi` | `compute_policy_loss_cispo` |
-| `aggregation="session-mean"` | Mean over sessions of each session's token mean | `seq-mean-token-mean`; Agent Lightning `per_rollout_mean` |
+| `aggregation="session-mean"` | Ratio over sessions of each session's token mean | `seq-mean-token-mean`; Agent Lightning `per_rollout_mean` |
 | `behavior_importance=c` | Token TIS weight `min(pi_old / mu, c)` | `compute_rollout_correction_weights` |
 | `behavior_importance=(lo, hi)` | IcePop: token weight zero outside the band | same, `"lo_hi"` threshold |
 | `sequence_mask=(lo, hi)` | Reject a chain whose summed k1 leaves `[log lo, log hi]` | `compute_rollout_rejection_mask`, `seq_sum_k1` |

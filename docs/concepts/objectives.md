@@ -5,7 +5,7 @@ An `Objective` defines what a run learns: how to initialize the variables, how t
 | Method or attribute | Required | Returns |
 |---|---|---|
 | `init(key, variables=None)` | Yes | The complete Flax variables tree, with a `params` collection |
-| `loss(variables, batch, step)` | Yes | `(statistics, Aux)`; statistics is usually `Mean(total, mass)` |
+| `loss(variables, batch, step)` | Yes | `(statistics, Aux)`; statistics is usually `Ratio(total, mass)` |
 | `held_variables()` | No | Arrays the objective starts from, or `None` |
 | `reduce_loss(statistics)` | For composite statistics | `(value, has_data)` |
 | `evaluate(variables, batch, step)` | No | Scoring artifacts for a validation batch |
@@ -50,7 +50,7 @@ class Continued(Objective):
 
 ## loss
 
-`loss(variables, batch, step)` returns `(statistics, aux)`. `Mean(total, mass)` holds additive terms that share one denominator; the mass is nonnegative and does not depend on the parameters. The trainer adds totals and masses over an accumulation window and then divides, treating zero mass as no data. A plain scalar is one term with unit mass; Dew does not infer token or row weights from a scalar.
+`loss(variables, batch, step)` returns `(statistics, aux)`. `Ratio(total, mass)` holds additive terms that share one denominator; the mass is nonnegative and does not depend on the parameters. The trainer adds totals and masses over an accumulation window and then divides, treating zero mass as no data. A plain scalar is one term with unit mass; Dew does not infer token or row weights from a scalar.
 
 For a composite loss, return a pytree whose leaves are additive sufficient statistics and implement `reduce_loss(statistics) -> (value, has_data)`, keeping independent denominators separate. `scalar_loss(objective, variables, batch, step)` computes `(value, aux)` from the same statistics for direct differentiation. A loss that is not additive over the batch needs its own decomposition into additive statistics; a per-microbatch mean is not a substitute.
 
@@ -84,7 +84,7 @@ from flax import linen as nn
 
 from dew import Trainer
 from dew.data import Dataset
-from dew.objectives.base import Aux, Mean, Objective, mean_loss
+from dew.objectives.base import Aux, Ratio, Objective, mean_loss
 
 
 class NormalizedRegressor(nn.Module):
@@ -106,7 +106,7 @@ class StatefulRegression(Objective):
             variables, batch["x"], train=True, mutable=["batch_stats"],
         )
         errors = (prediction - batch["y"]) ** 2
-        loss = Mean(jnp.sum(errors), jnp.asarray(errors.size))
+        loss = Ratio(jnp.sum(errors), jnp.asarray(errors.size))
         mse, _ = mean_loss(loss)
         return loss, Aux(metrics={"mse": mse}, variables=updated)
 
@@ -138,7 +138,7 @@ The base `Objective` has `ema=None`. An `EMASpec` turns on an exponential moving
 
 The trainer stores the selected copy in `TrainState.ema`. `state.averaged` lays it over the live variables and raises when no EMA is configured. EMA arithmetic runs in at least fp32 (fp64 when the leaves are fp64) and stores each result in the leaf's initialized dtype, so there is no wider persistent copy. A decay of one keeps the reference exact. The copy counts toward memory.
 
-The EMA is updated only when the optimizer commits an update. `Mean` accumulation keeps one gradient tree, at least fp32, and a mass; float64 inputs keep their precision when JAX x64 is on. The finished gradient is cast to each parameter's dtype before Optax sees it, so the optimizer state keeps its dtypes.
+The EMA is updated only when the optimizer commits an update. `Ratio` accumulation keeps one gradient tree, at least fp32, and a mass; float64 inputs keep their precision when JAX x64 is on. The finished gradient is cast to each parameter's dtype before Optax sees it, so the optimizer state keeps its dtypes.
 
 Composite accumulation keeps each microbatch's inputs and snapshots of the mutable state it read, then replays the pullbacks with the final normalization coefficients. The loss must therefore be pure; collect rollouts and external rewards before the compiled step. Replays do not apply mutable writes twice. BatchNorm over separate microbatches keeps its sequential behavior and differs from one BatchNorm pass over the full batch.
 
