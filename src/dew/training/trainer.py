@@ -1972,7 +1972,7 @@ class Trainer(Generic[Loss, Effects]):
             if not ranking and training_best:
                 ranking = (Ranking('train/loss', metadata['train/loss']),)
         checkpoints.save(step, state, position, metadata, share=data_partition(self.device_mesh),
-                         ranking=ranking, control=control, weights_only=weights_only, rung=self._rung())
+                         ranking=ranking, control=control, weights_only=weights_only, rung=self._rung(), artifact=self.objective.inference_record())
         self._report(CheckpointRequested(checkpoints.directory), step)
         interval.saved(step)
         self._display.status("")
@@ -1987,9 +1987,9 @@ class Trainer(Generic[Loss, Effects]):
         paused = time.perf_counter()
         self._display.status("writing a local checkpoint")
         if control:
-            checkpoints.save_local(step, state, position, share=data_partition(self.device_mesh), control=control, rung=self._rung())
+            checkpoints.save_local(step, state, position, share=data_partition(self.device_mesh), control=control, rung=self._rung(), artifact=self.objective.inference_record())
         else:
-            checkpoints.save_local(step, state, position, share=data_partition(self.device_mesh), rung=self._rung())
+            checkpoints.save_local(step, state, position, share=data_partition(self.device_mesh), rung=self._rung(), artifact=self.objective.inference_record())
         self._report(CheckpointRequested(str(checkpoints.local_directory), local=True), step)
         self._display.status("")
         return time.perf_counter() - paused

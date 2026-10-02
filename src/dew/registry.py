@@ -402,7 +402,7 @@ class PrecisionFields(TypedDict, total=False):
     model config carries and what `build` narrows against the field.
     """
 
-    dtype: str
+    dtype: str | None
     attention_impl: str
     param_dtype: str
     precision: str
@@ -410,7 +410,7 @@ class PrecisionFields(TypedDict, total=False):
 
 
 def precision_fields(name: str, config: Mapping[str, object], *,
-                     dtype: str, attention_impl: str, param_dtype: str | None = None,
+                     dtype: str | None, attention_impl: str, param_dtype: str | None = None,
                      matmul_precision: str | None = None) -> PrecisionFields:
     """Return the run's compute dtype and attention kernel as the fields a model takes.
 
@@ -494,7 +494,7 @@ def float64_twin(config: Mapping[str, object]) -> Mapping[str, object]:
 
 
 def with_precision(name: str, config: Mapping[str, object], *,
-                   dtype: str, attention_impl: str, param_dtype: str | None = None,
+                   dtype: str | None, attention_impl: str, param_dtype: str | None = None,
                    matmul_precision: str | None = None) -> Mapping[str, object]:
     """Return a model config with the run's compute dtype and attention kernel in it."""
     return {**config, **precision_fields(

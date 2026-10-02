@@ -702,6 +702,25 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         """
         return TextGeneration(self.model, thaw(params), sampling=sampling)
 
+    def inference_record(self):
+        """Describe this decoder without a training RunConfig or parameter copies."""
+        from dew.config import ModelConfig, _to_json
+        from dew.registry import objectives
+        try:
+            model = ModelConfig.from_model(self.model)
+            kind = objectives.name_of(type(self))
+        except KeyError:
+            return None
+        samples = self.samples
+        return {
+            'objective': kind,
+            'model': _to_json(model, ModelConfig),
+            'seq_len': self.seq_len,
+            'sample_tokens': 0 if samples is None else samples.max_new_tokens,
+            'sampling': _to_json(Sampling() if samples is None else samples.sampling, Sampling),
+            'tokenizer': None,
+        }
+
     def pipeline(self, state: TrainState, *, ema: bool | None = None,
                  processor: Processor | None = None) -> TextGeneration:
         """Publish the decoder over the state's weights as a generation task.

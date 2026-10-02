@@ -90,7 +90,7 @@ class ModelConfig:
 
     architecture: str = "simple_dit"
     config: JsonDict = dataclasses.field(default_factory=dict)
-    dtype: registry.DtypeName = "bfloat16"
+    dtype: registry.DtypeName | None = "bfloat16"
     """Compute dtype; parameter storage is independent."""
     param_dtype: registry.DtypeName | None = None
     """Parameter storage, where the model declares the field. Unset stores
@@ -132,7 +132,8 @@ class ModelConfig:
         """The registered module's constructor fields, with its actual compute settings."""
         architecture = models.name_of(type(model))
         fields = {}
-        compute, storage, precision, attention = None, None, None, 'auto'
+        compute, storage, attention = None, None, 'auto'
+        precision: Literal['default', 'high', 'highest'] | None = None
         for field in dataclasses.fields(model):
             if not field.init or field.name in ('parent', 'name'):
                 continue
@@ -142,7 +143,16 @@ class ModelConfig:
             elif field.name == 'param_dtype':
                 storage = registry.dtype_name(value)
             elif field.name == 'precision':
-                precision = None if value is None else str(value).lower()
+                if value is not None:
+                    setting = str(value).lower()
+                    if setting == 'default':
+                        precision = 'default'
+                    elif setting == 'high':
+                        precision = 'high'
+                    elif setting == 'highest':
+                        precision = 'highest'
+                    else:
+                        raise ValueError(f'model precision {value!r} has no recorded counterpart')
             elif field.name == 'attention_impl':
                 attention = value
             elif callable(value) and value is field.default:

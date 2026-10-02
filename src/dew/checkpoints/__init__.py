@@ -702,6 +702,15 @@ class Checkpoints:
             retained.append(dataclasses.replace(checkpoint, rankings=copy.deepcopy(checkpoint.rankings)))
         return retained
 
+    def artifact(self, step: int | str | None = None) -> JSON:
+        """The inference declaration saved with the selected step, or None for old/custom steps."""
+        step = self.resolve(step)
+        step = self.latest if step is None else step
+        if step is None:
+            raise FileNotFoundError(f"{self.directory} holds no checkpoint")
+        local = step == self._local_latest()
+        return json_value((self._step_metadata(step, local=local).custom_metadata or {}).get('artifact'), 'artifact')
+
     def control(self, step: int) -> dict:
         if step == self._local_latest():
             custom = self._open_local().metadata(step).custom_metadata or {}
@@ -862,7 +871,7 @@ class Checkpoints:
     def save(self, step: int, state: TrainState, saved: bytes | None,
              metrics: Mapping[str, float] | None = None, *,
              share: DataPartition | None = None, ranking: Ranking | Sequence[Ranking] | None = None, control: dict | None = None,
-             weights_only: bool = False, primary: str | None = None, rung: JSON = None) -> None:
+             weights_only: bool = False, primary: str | None = None, rung: JSON = None, artifact: JSON = None) -> None:
         """Write `state` under `step`, asynchronously.
 
         Sharded arrays go straight to orbax: gathering them onto the host
@@ -912,7 +921,7 @@ class Checkpoints:
             persistent.save(step, args=ocp.args.PyTreeSave(state_tree), metrics=scores, force=True,
                             custom_metadata={'ema_deltas': deltas, 'profiles': profile_metadata,
                                              'rankings': rules, 'primary': primary or (rankings[0].metric if rankings else None),
-                                             'control': copy.deepcopy(control or {}), 'weights_only': weights_only, 'rung': rung})
+                                             'control': copy.deepcopy(control or {}), 'weights_only': weights_only, 'rung': rung, 'artifact': artifact})
         self._pending = (step, scores)
         if _written_in_place(state_tree):
             with region("checkpoint.write_in_place"):
@@ -949,7 +958,7 @@ class Checkpoints:
         return tuple(_averages_of(_power_profiles(restored['opt_state'])))
 
     def save_local(self, step: int, state: TrainState, saved: bytes | None, *,
-                   share: DataPartition | None = None, control: dict | None = None, rung: JSON = None) -> None:
+                   share: DataPartition | None = None, control: dict | None = None, rung: JSON = None, artifact: JSON = None) -> None:
         """Write `state` under `step` to this process's local directory,
         asynchronously, in place of the local step before it, and as `save`
         does, a state with arrays in pinned host memory before it returns.
@@ -966,7 +975,7 @@ class Checkpoints:
         with region("checkpoint.submit_local"):
             local.save(step, args=ocp.args.PyTreeSave(state_tree), force=True,
                        custom_metadata={'processes': jax.process_count(), 'placement': written,
-                                        'ema_deltas': deltas, 'control': copy.deepcopy(control or {}), 'rung': rung})
+                                        'ema_deltas': deltas, 'control': copy.deepcopy(control or {}), 'rung': rung, 'artifact': artifact})
         if _written_in_place(state_tree):
             with region("checkpoint.write_in_place"):
                 local.wait_until_finished()
