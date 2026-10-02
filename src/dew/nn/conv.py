@@ -144,7 +144,9 @@ def _shifted_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -> jax
     arithmetic (YNNPACK, jax 0.11.2), bit for bit in fp32 and bf16, which on
     the hybrid DiT's 2 x 16 x 16 x 768 maps takes 6.4 ms a call against 1.4
     here; it sums 16 features or fewer otherwise, so those keep the
-    convolution."""
+    convolution. If a jax or YNNPACK release changes that summation,
+    tests/test_depthwise_conv.py's
+    test_cpu_depthwise_is_the_library_convolution_bit_for_bit fails."""
     height, width = lhs.shape[1:3]
     padded = jnp.pad(lhs, ((0, 0), (dilation, dilation), (dilation, dilation), (0, 0))).astype(jnp.float32)
     kernel = rhs.astype(jnp.float32)
