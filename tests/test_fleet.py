@@ -135,6 +135,9 @@ def test_code_block_prefers_the_last_tagged_block():
     assert code_block("no code") is None
 
 
+IMAGE = "python:3.12-slim"
+
+
 def _image_present() -> bool:
     if shutil.which("docker") is None:
         return False
