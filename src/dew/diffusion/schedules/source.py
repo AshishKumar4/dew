@@ -85,12 +85,6 @@ from dew.sampling.solvers import (
     UniPC,
 )
 
-Kind = Literal[
-    "DDIM", "PNDM", "DDPM", "LMSDiscrete", "EulerDiscrete", "EulerAncestralDiscrete",
-    "HeunDiscrete", "KDPM2Discrete", "KDPM2AncestralDiscrete", "DPMSolverMultistep",
-    "DPMSolverSinglestep", "DPMSolverSDE", "DEISMultistep", "UniPCMultistep",
-    "EDMDPMSolverMultistep", "LCM", "TCD", "FlowMatchEulerDiscrete",
-]
 Family = Literal["tabulated", "lambda", "sigma", "stage", "edm", "flow"]
 Origin = Literal["scheduler", "linspace", "empirical"]
 Spacing = Literal["leading", "linspace", "trailing"]
@@ -544,10 +538,6 @@ class SourceSchedule:
         policy, sampler = _resolve(kind, source, value, betas)
         return cls(MappingProxyType(dict(config)), betas,
                    _prediction_transform(policy, prediction), policy, sampler)
-
-    @property
-    def kind(self) -> str:
-        return self.policy.kind
 
     @property
     def train_steps(self) -> int:
