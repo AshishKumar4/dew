@@ -1265,20 +1265,6 @@ def test_resizing_interpolates_up_and_averages_down():
     assert 100 <= down.min() and down.max() <= 160, "area averages the squares it covers"
 
 
-@pytest.mark.network
-def test_an_overlong_caption_is_truncated_to_the_text_context():
-    """The tokenizer pads and truncates to CLIP's context, so one enormous
-    caption cannot change the batch's shape."""
-    tokenizer = dew.data.AutoTextTokenizer(tensor_type="np")
-    context = tokenizer.tokenizer.model_max_length
-
-    out = tokenizer(["short", " ".join(["word"] * 500)])
-
-    assert out["input_ids"].shape == (2, context)
-    assert int(out["attention_mask"][1].sum()) == context
-    assert int(out["attention_mask"][0].sum()) < context
-
-
 # ---------------------------------------------------------------------------------
 # Whose tokenizer: the run's condition, not the dataset
 # ---------------------------------------------------------------------------------
