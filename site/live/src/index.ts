@@ -13,6 +13,7 @@ import { visitorKey } from './visitor';
 
 export { Coordinator } from './coordinator';
 export { LiveKernel } from './kernel';
+export { SnapshotLab } from './lab';
 
 const REFUSALS: Record<Refusal, string> = {
 	busy: 'Every live kernel is in use right now. Try again in a minute, or open the notebook in Colab.',
@@ -45,6 +46,32 @@ async function passesTurnstile(env: Env, token: string, ip: string): Promise<boo
 	// Cloudflare's test secret passes every token and names no real hostname or action.
 	if (outcome.metadata?.result_with_testing_key) return env.TURNSTILE_TEST_KEYS === 'accept';
 	return listed(env.TURNSTILE_HOSTNAMES).includes(outcome.hostname ?? '') && outcome.action === 'live-session';
+}
+
+// A fixed, non-session capability: only the operator can sign it. It is never
+// issued by createSession, and lab operations are unavailable in production.
+const LAB_CAPABILITY = '00000000-0000-0000-0000-000000000001';
+
+async function labRequest(request: Request, env: Env, cors: HeadersInit): Promise<Response> {
+	const bearer = request.headers.get('Authorization')?.replace(/^Bearer /, '') ?? '';
+	if (env.TURNSTILE_TEST_KEYS !== 'accept' || await verify(env.SESSION_SECRET, bearer, Date.now()) !== LAB_CAPABILITY) {
+		return reply({ error: 'forbidden' }, 403, cors);
+	}
+	const body = await request.json<{ operation?: string; commit?: string }>().catch(() => ({ operation: undefined, commit: undefined }));
+	const lab = env.SNAPSHOT_LAB.get(env.SNAPSHOT_LAB.idFromName('snapshot-study'));
+	try {
+		switch (body.operation) {
+			case 'status': return reply(await lab.status(), 200, cors);
+			case 'start': return reply(await lab.start(false), 200, cors);
+			case 'restore': return reply(await lab.start(true), 200, cors);
+			case 'prepare': return reply(await lab.prepare(body.commit ?? ''), 202, cors);
+			case 'snapshot': return reply(await lab.snapshot(), 200, cors);
+			case 'stop': await lab.stop(); return reply({ stopped: true }, 200, cors);
+			default: return reply({ error: 'unknown lab operation' }, 400, cors);
+		}
+	} catch (error) {
+		return reply({ error: error instanceof Error ? error.message : String(error) }, 503, cors);
+	}
 }
 
 async function createSession(request: Request, env: Env, ctx: ExecutionContext, ip: string, cors: HeadersInit): Promise<Response> {
@@ -105,6 +132,7 @@ export default {
 		const { success } = await env.REQUESTS.limit({ key: visitorKey(ip) });
 		if (!success) return reply({ error: 'rate', message: 'Too many requests. Wait a minute.' }, 429, cors, { 'Retry-After': '60' });
 
+		if (url.pathname === '/v1/lab' && request.method === 'POST') return labRequest(request, env, cors);
 		if (url.pathname === '/v1/sessions' && request.method === 'POST') return createSession(request, env, ctx, ip, cors);
 		if (url.pathname === '/v1/status' && request.method === 'GET') return reply(await coordinatorOf(env).status(Date.now()), 200, cors);
 		const socket = /^\/v1\/sessions\/([0-9a-f-]{36})\/ws$/.exec(url.pathname);

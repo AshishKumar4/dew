@@ -17,12 +17,14 @@
 			"class_name": "LiveKernel",
 			"scheduling_policy": "durable_object",
 			"images": { "kernel": { "dockerfile": "./container/Dockerfile" } }
-		}
+		},
+		{ "class_name": "SnapshotLab", "scheduling_policy": "durable_object" }
 	],
 	"durable_objects": {
 		"bindings": [
 			{ "name": "KERNEL", "class_name": "LiveKernel" },
-			{ "name": "COORDINATOR", "class_name": "Coordinator" }
+			{ "name": "COORDINATOR", "class_name": "Coordinator" },
+			{ "name": "SNAPSHOT_LAB", "class_name": "SnapshotLab" }
 		]
 	},
 	// v2 moves the containers to the durable_object scheduling policy, which needs a new
@@ -32,7 +34,8 @@
 	"migrations": [
 		{ "tag": "v1", "new_sqlite_classes": ["Kernel", "Coordinator"] },
 		{ "tag": "v2", "new_sqlite_classes": ["LiveKernel"] },
-		{ "tag": "v3", "deleted_classes": ["Kernel"] }
+		{ "tag": "v3", "deleted_classes": ["Kernel"] },
+		{ "tag": "v4", "new_sqlite_classes": ["SnapshotLab"] }
 	],
 	// Requests to the API per visitor IP; sessions have their own limits below.
 	"ratelimits": [{ "name": "REQUESTS", "namespace_id": "7401", "simple": { "limit": 30, "period": 60 } }],
@@ -69,12 +72,14 @@
 					"class_name": "LiveKernel",
 					"scheduling_policy": "durable_object",
 					"images": { "kernel": { "dockerfile": "./container/Dockerfile" } }
-				}
+				},
+				{ "class_name": "SnapshotLab", "scheduling_policy": "durable_object" }
 			],
 			"durable_objects": {
 				"bindings": [
 					{ "name": "KERNEL", "class_name": "LiveKernel" },
-					{ "name": "COORDINATOR", "class_name": "Coordinator" }
+					{ "name": "COORDINATOR", "class_name": "Coordinator" },
+			{ "name": "SNAPSHOT_LAB", "class_name": "SnapshotLab" }
 				]
 			},
 			"ratelimits": [{ "name": "REQUESTS", "namespace_id": "7402", "simple": { "limit": 30, "period": 60 } }],
