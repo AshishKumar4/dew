@@ -36,11 +36,6 @@ def exponent(std: float) -> float:
     return float(np.roots([1, 7, 16 - tail, 12 - tail]).real.max())
 
 
-def relative_std(gamma: float) -> float:
-    """The relative standard deviation of the profile of exponent `gamma` (Eq. 123)."""
-    return float(np.sqrt((gamma + 1) / (gamma + 2) ** 2 / (gamma + 3)))
-
-
 def power_decay(std: float) -> optax.Schedule:
     """The decay of the power-function EMA of relative standard deviation
     `std`, as an `EMASpec` reads it: after `count` completed updates, the

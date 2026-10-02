@@ -14,22 +14,9 @@ import math
 import os
 import re
 import sys
-from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
 
 import jax
-import numpy as np
-
-if TYPE_CHECKING:
-    from _typeshed import DataclassInstance
-
-# One argument a compiled function is called with: an array, a Python scalar
-# a trace reads as one, or the trees of either that a train state and a batch
-# already are. `jax.stages.Wrapped.lower` takes these and nothing else, since
-# anything it cannot flatten it cannot trace.
-type Traced = (jax.Array | np.ndarray | np.generic | bool | int | float | complex | None
-               | DataclassInstance | Sequence[Traced] | Mapping[str, Traced])
 
 # Dense bf16 peak of one JAX device, keyed by the start of the string
 # `jax.devices()[0].device_kind` reports, and read by `peak_flops` with the

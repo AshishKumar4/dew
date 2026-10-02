@@ -145,7 +145,7 @@ Reporting has no background queue and never drops a report, so the I/O costs tim
 | `FitStarted` | The fit began. |
 | `StepCompiled` | A training step compiled for a new batch shape, with the seconds it took, the remat it compiled under, and the per-axis link bandwidths and projection-spreading choices. |
 | `CheckpointRequested` | A checkpoint save was submitted asynchronously; it does not mean the checkpoint is durable. |
-| `ProfileWindow` | The directory a `Trainer` profile window wrote and the number of steps it traced, reported once the trace stopped. It copies no per-step layer tensors. A standalone `dew.profile` capture reports no record. |
+| `ProfileWindow` | The directory a `Trainer` profile window wrote and the number of steps it traced, reported once the trace stopped. It copies no per-step layer tensors. A standalone `dew.Profiler` capture reports no record. |
 | `FitEnded` | The fit ended, with its status. |
 | `TrialFinished` | One sweep trial. |
 
