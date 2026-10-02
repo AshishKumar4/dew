@@ -234,10 +234,11 @@ def goodput(wall: float, first_step: float | None, other: float) -> dict[str, fl
     return numbers
 
 
-def step_compiler_options(objective, rows: int, frozen: bool) -> jax.stages.CompilerOptions | None:
+def step_compiler_options(objective, tokens: float, frozen: bool) -> jax.stages.CompilerOptions | None:
     """XLA options for this objective's training step on this device, each
-    unless the run set its flag itself. `rows` is the batch rows one device
-    steps, and `frozen` says whether the step trains beside frozen weights.
+    unless the run set its flag itself. `tokens` is what one device steps
+    (`_device_tokens`), and `frozen` says whether the step trains beside
+    frozen weights.
 
     On a GPU, dots that share an input (q, k and v; gate and up) run apart:
     XLA's dot merger would run them as one GEMM over their weights
@@ -268,7 +269,7 @@ def step_compiler_options(objective, rows: int, frozen: bool) -> jax.stages.Comp
     the model keeps them."""
     generation = device_generation()
     options: dict[str, bool | int] = {}
-    small = rows * _row_tokens(objective) <= 128
+    small = tokens <= 128
     if (generation.startswith('sm') and xla_flag('xla_gpu_dot_merger_threshold_mb') is None
             and not (frozen and small)):
         options['xla_gpu_dot_merger_threshold_mb'] = 0
@@ -319,11 +320,14 @@ def _model_of(objective: Objective[Loss, Effects]) -> nn.Module | None:
     return getattr(objective, 'model', None)
 
 
-def _row_tokens(objective: Objective[Loss, Effects]) -> float:
-    """The tokens one row of an objective's batch carries, or infinity. An
-    `Objective` declares none, since images and pairs have no context, so the
-    trainer reads it at this boundary: LM objectives name theirs `seq_len`."""
-    return getattr(objective, 'seq_len', math.inf)
+def _device_tokens(objective: Objective[Loss, Effects], batch: Batch, shards: int) -> float:
+    """The tokens one device steps of `batch`, split over `shards` row shards,
+    or infinity. An `Objective` declares no tokens in a row, since images and
+    pairs have no context, so the trainer reads it at this boundary: LM
+    objectives name theirs `seq_len`. Rows are counted only then, so another
+    objective's batch, one that holds no rows among them, is never asked."""
+    per_row = getattr(objective, 'seq_len', None)
+    return math.inf if per_row is None else rows_of(batch) // shards * per_row
 
 
 def _rollout_metrics(rollout: Rollout) -> Mapping[str, float]:
@@ -1259,9 +1263,10 @@ class Trainer(Generic[Loss, Effects]):
                                                 replicated),
                                  donate_argnums=0)
                 self.program = jitted.lower(prepared, batch)
-                rows = rows_of(batch) // math.prod(mesh.shape[axis] for axis in BATCH_AXES)
+                shards = math.prod(mesh.shape[axis] for axis in BATCH_AXES)
                 options = None if self._xla_defaults else step_compiler_options(
-                    self.objective, rows, FROZEN in prepared.params)
+                    self.objective, _device_tokens(self.objective, batch, shards),
+                    FROZEN in prepared.params)
                 self.executable = self.program.compile(options)
                 fits = step_fits(self.executable, mesh, held)
                 if not fits and options is not None:
