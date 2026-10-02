@@ -171,7 +171,7 @@ def flaxdiff_side(args, images, total, attention):
     initial = load_tree(init)
     params = jax.device_put(initial, trainer.state_sharding.params)
     state = state.replace(
-        params=params, ema_params=jax.device_put(initial, trainer.state_sharding.ema_params),
+        variables=params, ema_params=jax.device_put(initial, trainer.state_sharding.ema_params),
         opt_state=jax.jit(optimizer.init, out_shardings=trainer.state_sharding.opt_state)(params))
     step_fn = trainer._define_train_step(args.batch)
     rng_state = trainer.rngstate
