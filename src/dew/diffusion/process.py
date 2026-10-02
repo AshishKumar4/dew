@@ -94,6 +94,53 @@ class Process:
     sampling: NoiseScheduler | None = None
     interval: bool = False
 
+    def to_json(self) -> dict:
+        """The built-in schedule, prediction and weighting constructor records."""
+        from dew.diffusion import schedules, transforms
+        from dew.records import json_value
+        def component(value, module):
+            cls = type(value)
+            if getattr(module, cls.__name__, None) is not cls:
+                raise TypeError(f"{cls.__name__} needs an explicit process record declaration")
+            if isinstance(value, schedules.DiscreteNoiseScheduler):
+                return {'name': 'DiscreteNoiseScheduler', 'fields': value._record_fields}
+            import inspect
+            fields = {}
+            for name in inspect.signature(cls).parameters:
+                if name in ('args', 'kwargs'):
+                    continue
+                if name == 'inner':
+                    fields[name] = component(value.inner, transforms)
+                else:
+                    fields[name] = json_value(getattr(value, name), name)
+            return {'name': cls.__name__, 'fields': fields}
+        return {'schedule': component(self.schedule, schedules),
+                'prediction': component(self.prediction, transforms),
+                'weighting': component(self.weighting, transforms),
+                'sampling': None if self.sampling is None else component(self.sampling, schedules),
+                'interval': self.interval}
+
+    @classmethod
+    def from_json(cls, record: Mapping) -> Process:
+        """Rebuild only maintained built-in components; never import arbitrary record classes."""
+        from dew.diffusion import schedules, transforms
+        def component(spec, module):
+            name, fields = spec['name'], dict(spec['fields'])
+            member = getattr(module, name, None)
+            expected = schedules.NoiseScheduler if module is schedules else transforms.PredictionTransform
+            if module is transforms and name in ('ScheduleWeighting', 'MinSNR', 'VelocityLoss'):
+                member = {'ScheduleWeighting': transforms.ScheduleWeighting,
+                          'MinSNR': transforms.MinSNR, 'VelocityLoss': transforms.VelocityLoss}[name]
+            elif not isinstance(member, type) or not issubclass(member, expected):
+                raise ValueError(f"{name!r} is not a built-in process component")
+            if 'inner' in fields:
+                fields['inner'] = component(fields['inner'], transforms)
+            return member(**fields)
+        return cls(component(record['schedule'], schedules), component(record['prediction'], transforms),
+                   component(record['weighting'], transforms),
+                   None if record['sampling'] is None else component(record['sampling'], schedules),
+                   record['interval'])
+
     @property
     def sampler_schedule(self) -> NoiseScheduler:
         return self.schedule if self.sampling is None else self.sampling
