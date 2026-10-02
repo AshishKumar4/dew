@@ -946,5 +946,6 @@ def generate(model: nn.Module, params: Variables,
     failure, output = _compiled(plan.sharding)(model, params, plan.place(padded),
                                                plan.keys(random_key), max_new_tokens, sampling.pad, n,
                                                *components)
-    failure.throw()
+    # The error's flags are the one read a request waits on.
+    jax.device_get(failure).throw()
     return replace(output, rows=plan.rows * n)
