@@ -426,9 +426,9 @@ def _fields(cls: type, values: registry.Configured) -> dict[str, registry.Config
         raise ValueError(
             f"{cls.__name__} does not match the record: unknown fields {unknown}, "
             f"missing fields {missing}")
-    values = {**{f.name: f.metadata["legacy"] for f in declared if "legacy" in f.metadata}, **values}
-    return {f.name: _rebuild(_declared_type(cls, f.name), registry.configured(values[f.name]))
-            for f in declared if f.name in values}
+    return {f.name: _rebuild(_declared_type(cls, f.name), registry.configured(
+                values[f.name] if f.name in values else f.metadata["legacy"]))
+            for f in declared if f.name in values or "legacy" in f.metadata}
 
 
 def _built[ValueT](cls: type[ValueT], values: Mapping[str, object]) -> ValueT:
