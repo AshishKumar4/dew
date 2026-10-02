@@ -264,8 +264,15 @@ class OllamaCompletion:
         body = self._request(parameters, {"prompt": prompt, "stream": True}, seed, max_new_tokens)
         return _invoke(self._sync().generate, body)
 
-    def chat(self, messages: Sequence[ChatMessage], max_new_tokens: int, *, key: int | jax.Array | None = None,
-             stream: bool = False, **parameters: RequestField) -> OllamaChat | Iterator[OllamaChat]:
+    def chat(
+        self,
+        messages: Sequence[ChatMessage],
+        max_new_tokens: int,
+        *,
+        key: int | jax.Array | None = None,
+        stream: bool = False,
+        **parameters: RequestField,
+    ) -> OllamaChat | Iterator[OllamaChat]:
         seed = key_seed(key)
         _prompts("", max_new_tokens, seed)
         body = self._request(parameters, {"messages": messages, "stream": stream}, seed, max_new_tokens)
@@ -290,8 +297,15 @@ class OllamaCompletion:
         body = self._request(parameters, {"prompt": prompt, "stream": True}, seed, max_new_tokens)
         return await _ainvoke(self._async().generate, body)
 
-    async def achat(self, messages: Sequence[ChatMessage], max_new_tokens: int, *, key: int | jax.Array | None = None,
-                    stream: bool = False, **parameters: RequestField) -> OllamaChat | AsyncIterator[OllamaChat]:
+    async def achat(
+        self,
+        messages: Sequence[ChatMessage],
+        max_new_tokens: int,
+        *,
+        key: int | jax.Array | None = None,
+        stream: bool = False,
+        **parameters: RequestField,
+    ) -> OllamaChat | AsyncIterator[OllamaChat]:
         seed = key_seed(key)
         _prompts("", max_new_tokens, seed)
         body = self._request(parameters, {"messages": messages, "stream": stream}, seed, max_new_tokens)
@@ -502,13 +516,21 @@ class OpenAICompletion:
     def __call__(self, prompts: str | Sequence[str] | TokenRows, max_new_tokens: int, *,
                  key: int | jax.Array | None = None, **parameters: RequestField) -> Completion:
         seed = key_seed(key)
-        fields, expected = _openai_fields(self.model, prompts, max_new_tokens, seed, self._parameters(parameters))
+        fields, expected = _openai_fields(
+            self.model, prompts, max_new_tokens, seed, self._parameters(parameters)
+        )
         create: Callable[..., _RawResponse[object]] = self._sync().completions.with_raw_response.create
         raw = _invoke(create, fields)
         return _openai_result(raw.http_response.json(), raw.parse(), expected)
 
-    def stream(self, prompts: str | Sequence[str] | TokenRows, max_new_tokens: int, *, key: int | jax.Array | None = None,
-               **parameters: RequestField) -> Stream[OpenAIResponse]:
+    def stream(
+        self,
+        prompts: str | Sequence[str] | TokenRows,
+        max_new_tokens: int,
+        *,
+        key: int | jax.Array | None = None,
+        **parameters: RequestField,
+    ) -> Stream[OpenAIResponse]:
         seed = key_seed(key)
         fields, _ = _openai_fields(self.model, prompts, max_new_tokens, seed,
                                    self._parameters(parameters), stream=True)
@@ -535,8 +557,15 @@ class OpenAICompletion:
         )
         return fields if seed is None else _bound(fields, {"seed": seed})
 
-    def chat(self, messages: Sequence[ChatMessage], max_new_tokens: int, *, key: int | jax.Array | None = None,
-             stream: bool = False, **parameters: RequestField) -> ChatCompletion | Stream[ChatCompletionChunk]:
+    def chat(
+        self,
+        messages: Sequence[ChatMessage],
+        max_new_tokens: int,
+        *,
+        key: int | jax.Array | None = None,
+        stream: bool = False,
+        **parameters: RequestField,
+    ) -> ChatCompletion | Stream[ChatCompletionChunk]:
         seed = key_seed(key)
         fields = self._chat_body(messages, max_new_tokens, seed, stream, parameters)
         create: Callable[..., ChatCompletion | Stream[ChatCompletionChunk]] = (
@@ -547,19 +576,34 @@ class OpenAICompletion:
     async def acall(self, prompts: str | Sequence[str] | TokenRows, max_new_tokens: int, *,
                     key: int | jax.Array | None = None, **parameters: RequestField) -> Completion:
         seed = key_seed(key)
-        fields, expected = _openai_fields(self.model, prompts, max_new_tokens, seed, self._parameters(parameters))
+        fields, expected = _openai_fields(
+            self.model, prompts, max_new_tokens, seed, self._parameters(parameters)
+        )
         raw = await _ainvoke(self._async().completions.with_raw_response.create, fields)
         return _openai_result(raw.http_response.json(), raw.parse(), expected)
 
-    async def astream(self, prompts: str | Sequence[str] | TokenRows, max_new_tokens: int, *, key: int | jax.Array | None = None,
-                      **parameters: RequestField) -> AsyncStream[OpenAIResponse]:
+    async def astream(
+        self,
+        prompts: str | Sequence[str] | TokenRows,
+        max_new_tokens: int,
+        *,
+        key: int | jax.Array | None = None,
+        **parameters: RequestField,
+    ) -> AsyncStream[OpenAIResponse]:
         seed = key_seed(key)
         fields, _ = _openai_fields(self.model, prompts, max_new_tokens, seed,
                                    self._parameters(parameters), stream=True)
         return await _ainvoke(self._async().completions.create, fields)
 
-    async def achat(self, messages: Sequence[ChatMessage], max_new_tokens: int, *, key: int | jax.Array | None = None,
-                    stream: bool = False, **parameters: RequestField) -> ChatCompletion | AsyncStream[ChatCompletionChunk]:
+    async def achat(
+        self,
+        messages: Sequence[ChatMessage],
+        max_new_tokens: int,
+        *,
+        key: int | jax.Array | None = None,
+        stream: bool = False,
+        **parameters: RequestField,
+    ) -> ChatCompletion | AsyncStream[ChatCompletionChunk]:
         seed = key_seed(key)
         fields = self._chat_body(messages, max_new_tokens, seed, stream, parameters)
         return await _ainvoke(self._async().chat.completions.create, fields)

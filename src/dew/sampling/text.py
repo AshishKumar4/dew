@@ -774,6 +774,9 @@ def _padded(plan: RowPlan, prepared: ModelInputs) -> ModelInputs:
                                          "attention_mask": valid & ~plan.padding[:, None]})
 
 
+_DEFAULT_SAMPLING = Sampling()
+
+
 def generate(model: nn.Module, params: Variables,
              inputs: ModelInputs | ArrayLike | Sequence[Sequence[int]], max_new_tokens: int,
              *, key: int | jax.Array | None = None,

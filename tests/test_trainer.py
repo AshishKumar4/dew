@@ -572,19 +572,19 @@ def test_a_resumed_run_compiles_the_rung_its_checkpoint_trained_on(tmp_path, mon
         assert np.asarray(raw_leaf(left)).tobytes() == np.asarray(raw_leaf(right)).tobytes()
 
 
-def test_a_resumed_run_that_cannot_fit_its_checkpoints_rung_climbs_and_says_so(tmp_path, monkeypatch, capsys):
+def test_a_resumed_run_that_cannot_fit_its_checkpoints_rung_climbs_and_says_so(tmp_path, monkeypatch, caplog):
     """A process that cannot fit the rung its checkpoint trained on moves up
     the ladder, never down, and says the run now computes otherwise."""
     split, _, headroom = ladder_lm_trainer(tmp_path / "split", lambda rung: rung[0])
     monkeypatch.setattr(trainer_module, 'step_headroom', headroom)
     split.fit(lm_windows(tmp_path), steps=2, checkpoint_every=2)
-    capsys.readouterr()
+    caplog.clear()
 
     resumed, objective, headroom = ladder_lm_trainer(tmp_path / "split", lambda rung: rung == (True, 'full'))
     monkeypatch.setattr(trainer_module, 'step_headroom', headroom)
     resumed.fit(lm_windows(tmp_path), steps=3, checkpoint_every=2)
     assert trainer_module.remat_record(objective.model.remat) == 'full'
-    assert "the rung its checkpoint trained on" in capsys.readouterr().err
+    assert "the rung its checkpoint trained on" in caplog.text
 
 
 @pytest.mark.skipif(jax.default_backend() != "gpu", reason="CUDA embedding-gradient reductions")

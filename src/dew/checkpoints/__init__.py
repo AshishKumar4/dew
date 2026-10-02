@@ -685,8 +685,13 @@ class Checkpoints:
         if profiles is not None:
             self._profile_snapshots.add(step)
         with region("checkpoint.submit"):
-            persistent.save(step, args=ocp.args.PyTreeSave(state_tree), metrics=metrics, force=True,
-                            custom_metadata={'ema_deltas': deltas, 'profiles': profile_metadata, 'rung': rung})
+            persistent.save(
+                step,
+                args=ocp.args.PyTreeSave(state_tree),
+                metrics=metrics,
+                force=True,
+                custom_metadata={"ema_deltas": deltas, "profiles": profile_metadata, "rung": rung},
+            )
         if _written_in_place(state_tree):
             with region("checkpoint.write_in_place"):
                 persistent.wait_until_finished()

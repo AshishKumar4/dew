@@ -521,8 +521,14 @@ class OpenAIRolloutServer(_RequestServer):
 
     def _draw(self, prompt: tuple[int, ...], budget: int, seed: int, version: int) -> Draw:
         # The pad id shapes Dew's packed rows; it is not a request field.
-        completion = self._completion([list(prompt)], budget, key=seed, sampling=replace(self._sampling, pad_id=0),
-                                      logprobs=0, extra_body=self._return_ids)
+        completion = self._completion(
+            [list(prompt)],
+            budget,
+            key=seed,
+            sampling=replace(self._sampling, pad_id=0),
+            logprobs=0,
+            extra_body=self._return_ids,
+        )
         tokens, probabilities = completion.tokens[0], completion.log_probs[0]
         if tokens is None or probabilities is None:
             raise ValueError(f"the engine reported no sampled token ids; is it {self._completion.provider}?")
