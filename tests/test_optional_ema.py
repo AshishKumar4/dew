@@ -50,7 +50,7 @@ def test_metadata_inspection_and_restore_share_the_committed_snapshot(tmp_path, 
     stored = checkpoints.stored()
     placement = jax.sharding.SingleDeviceSharding(jax.devices()[0])
     template = {"params": jax.tree.map(
-        lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=placement), stored["params"])}
+        lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=placement), stored["variables"])}
 
     def repeated_metadata(self, infos):
         raise AssertionError("the inspected immutable checkpoint metadata was opened again")
@@ -58,7 +58,7 @@ def test_metadata_inspection_and_restore_share_the_committed_snapshot(tmp_path, 
     with monkeypatch.context() as context:
         context.setattr(ocp.type_handlers.ArrayHandler, "metadata", repeated_metadata)
         restored, _ = checkpoints.restore(template)
-        np.testing.assert_array_equal(restored["params"]["params"]["weight"],
+        np.testing.assert_array_equal(restored["variables"]["params"]["weight"],
                                       first.variables["params"]["weight"])
 
     second = state(5, 5)
@@ -66,7 +66,7 @@ def test_metadata_inspection_and_restore_share_the_committed_snapshot(tmp_path, 
     checkpoints.wait()
     assert checkpoints.stored()["params"]["params"]["weight"].shape == (5,)
     restored, _ = checkpoints.restore()
-    np.testing.assert_array_equal(restored["params"]["params"]["weight"], second.variables["params"]["weight"])
+    np.testing.assert_array_equal(restored["variables"]["params"]["weight"], second.variables["params"]["weight"])
     third = state(7, 7)
     checkpoints.save(7, third, None)
     checkpoints.wait()

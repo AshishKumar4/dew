@@ -811,7 +811,7 @@ def test_restore_preserves_the_optimizer_state_the_ema_and_the_key(tmp_path):
     state, _, position = resumed.place()
 
     assert int(state.step) == 3, "the step counter was reset"
-    for field in ("params", "opt_state", "ema"):
+    for field in ("variables", "opt_state", "ema"):
         for before, after in zip(jax.tree.leaves(getattr(trained, field)),
                                  jax.tree.leaves(getattr(state, field)), strict=True):
             np.testing.assert_array_equal(np.asarray(before), np.asarray(after), err_msg=field)
@@ -873,7 +873,7 @@ def test_the_ema_comes_back_bit_for_bit_however_it_is_read(tmp_path):
 
     whole, _ = checkpoints.restore()
     ema_alone, _ = checkpoints.restore({"ema": typed(state.ema)})
-    pinned, _ = checkpoints.restore({"params": typed(state.variables),
+    pinned, _ = checkpoints.restore({"variables": typed(state.variables),
                                      "ema": typed(state.ema, "pinned_host")})
     resumed, _ = checkpoints.restore(held_state(typed(state.variables), typed(state.ema)))
     for restored in (whole["ema"], ema_alone["ema"], pinned["ema"], resumed.ema):
@@ -904,7 +904,7 @@ def test_an_ema_held_in_lists_comes_back_bit_for_bit(tmp_path):
 
     whole, _ = checkpoints.restore()
     alone, _ = checkpoints.restore({"ema": typed(ema)})
-    beside, _ = checkpoints.restore({"params": typed(params, jnp.bfloat16), "ema": typed(ema)})
+    beside, _ = checkpoints.restore({"variables": typed(params, jnp.bfloat16), "ema": typed(ema)})
     for restored in (whole["ema"], alone["ema"], beside["ema"]):
         assert jax.tree.all(jax.tree.map(same_bits, ema, restored))
 
@@ -1615,7 +1615,7 @@ def test_aux_variables_are_written_back_into_the_state_and_checkpointed(tmp_path
     assert float(state.variables["stats"]["seen"]) == 3.0
 
     restored, _ = trainer.checkpoints.restore()
-    assert float(restored["params"]["stats"]["seen"]) == 3.0
+    assert float(restored["variables"]["stats"]["seen"]) == 3.0
 
 
 def test_the_optimizer_never_touches_a_non_parameter_collection():
