@@ -376,6 +376,86 @@ def test_a_step_that_does_not_fit_compiles_again_one_rung_up(monkeypatch, option
     assert trainer.objective.model.remat == REMAT_POLICIES['minimal']
 
 
+def refusing_trainer(monkeypatch, refused, error="RESOURCE_EXHAUSTED: Ran out of memory on HBM, the total "
+                     "memory required for HLO temporaries (38.47G) exceeds available HBM (31.24G)."):
+    """A decoder trainer whose compiles XLA refuses with `error` at every rung
+    `refused` names: (whether the head is tiled, the remat's record), as
+    XLA:TPU refuses a program whose temporaries exceed HBM. A program it
+    compiles fits. Returns the trainer and the rungs compiled, in order."""
+    import optax
+
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.lm import LMObjective
+    from dew.training import Trainer, trainer as trainer_module
+
+    attempts = []
+    compile_lowered = jax.stages.Lowered.compile
+
+    def compile(self, compiler_options=None):
+        rung = (trainer.objective.head_tile is not None,
+                trainer_module.remat_record(trainer.objective.model.remat))
+        attempts.append(rung)
+        if rung in refused:
+            raise jax.errors.JaxRuntimeError(error)
+        return compile_lowered(self, compiler_options)
+
+    monkeypatch.setattr(jax.stages.Lowered, 'compile', compile)
+    monkeypatch.setattr(trainer_module, 'step_headroom', lambda executable, devices, held=0: 0)
+    monkeypatch.setattr(trainer_module, 'step_compiler_options', lambda objective, rows, frozen: None)
+    model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=1,
+                              mlp_features=16, max_seq_len=8)
+    trainer = Trainer(LMObjective(model, seq_len=4), optax.sgd(1e-3), key=jax.random.key(0))
+    return trainer, attempts
+
+
+def test_a_step_xla_refuses_for_memory_compiles_again_one_rung_up(monkeypatch):
+    """XLA:TPU checks a program's temporaries against HBM as it compiles and
+    refuses one that does not fit, so there is no executable to measure: on
+    a v6e Qwen3-0.6B at 16 x 1024 tokens died at the bottom rung, 38.47G of
+    temporaries for 31.24G of HBM. The refusal is the step not fitting, and
+    the ladder climbs: the head tiles, then the remat."""
+    import numpy as np
+
+    from dew.nn.backbones.decoder_block import REMAT_POLICIES
+
+    trainer, attempts = refusing_trainer(monkeypatch, {(False, None), (True, None)})
+    state, _, _ = trainer.place()
+    batch = {'text': jnp.zeros((8, 5), jnp.int32)}
+    executable = trainer.compile(state, batch)
+
+    assert attempts == [(False, None), (True, None), (True, 'minimal')]
+    assert trainer.objective.model.remat == REMAT_POLICIES['minimal']
+    state, loss, *_ = executable(state, batch)
+    assert np.isfinite(float(loss))
+    assert trainer._rung() == {'head_tile': list(trainer.objective.head_tile), 'remat': 'minimal',
+                               'xla_defaults': False}
+
+
+def test_a_step_xla_refuses_at_every_rung_raises_its_refusal(monkeypatch):
+    """Where XLA refuses the last rung too, the run stops with XLA's own
+    refusal."""
+    rungs = {(tiled, remat) for tiled in (False, True) for remat in (None, 'minimal', 'full')}
+    trainer, attempts = refusing_trainer(monkeypatch, rungs)
+    state, _, _ = trainer.place()
+
+    with pytest.raises(jax.errors.JaxRuntimeError, match="RESOURCE_EXHAUSTED: Ran out of memory on HBM"):
+        trainer.compile(state, {'text': jnp.zeros((8, 5), jnp.int32)})
+    assert attempts[:3] == [(False, None), (True, None), (True, 'minimal')]
+
+
+def test_a_compile_error_that_is_not_about_memory_is_not_a_rung(monkeypatch):
+    """Only XLA's out-of-memory refusal means the step does not fit; any
+    other compile error is raised as it is, at the rung it happened on."""
+    trainer, attempts = refusing_trainer(monkeypatch, {(False, None)},
+                                         error="INVALID_ARGUMENT: an unsupported custom call")
+    state, _, _ = trainer.place()
+
+    with pytest.raises(jax.errors.JaxRuntimeError, match="INVALID_ARGUMENT"):
+        trainer.compile(state, {'text': jnp.zeros((8, 5), jnp.int32)})
+    assert attempts == [(False, None)]
+    assert trainer.objective.head_tile is None
+
+
 @pytest.mark.parametrize('activation', ['swiglu', 'geglu', 'geglu_exact'])
 def test_a_gated_product_keeps_only_its_16_bit_inputs_for_the_backward(activation):
     """The product runs in fp32. Differentiated as written it kept five fp32
