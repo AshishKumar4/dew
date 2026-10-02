@@ -9,6 +9,16 @@ from collections.abc import Mapping, MutableMapping
 MESH_DEVICES = 8
 
 
+REPEATABLE_GPU_FLAGS = ("--xla_gpu_deterministic_ops=true", "--xla_gpu_autotune_level=0")
+"""The cuda lane's flags for steps repeatable across processes. Deterministic
+ops order the reductions. Autotuning off is a precaution: XLA picks GEMM and
+convolution kernels at compile time by live timing, which can differ between
+compilations (openxla.org/xla/determinism). Two LADD runs on an RTX 4080
+diverged under deterministic ops alone, but 20 fresh DiT processes did not,
+so that cause is unconfirmed. The precaution costs a test lane nothing that
+matters; in training it cost 8% on a 176M DiT step (docs/guides/checkpoints.md)."""
+
+
 def configure_lane(environ: MutableMapping[str, str]) -> None:
     """Set the environment a lane runs the suite under, before jax opens a backend.
 
@@ -20,8 +30,9 @@ def configure_lane(environ: MutableMapping[str, str]) -> None:
     there, since a TPU has no float64, and a host layout pairs every
     accelerator device with a CPU device of its process
     (`dew.training.host.companion_mesh`), so that backend holds one device
-    per local accelerator device. A cuda lane's reductions are made
-    repeatable, since exact state and gradient checks require it.
+    per local accelerator device. A cuda lane's steps are made repeatable
+    across processes (`REPEATABLE_GPU_FLAGS`), since exact state and
+    gradient checks require it.
     jax.devices() is still the accelerator's.
     """
     environ.setdefault("JAX_PLATFORMS", "cpu")
@@ -33,7 +44,7 @@ def configure_lane(environ: MutableMapping[str, str]) -> None:
         flags.append(f"--xla_force_host_platform_device_count={MESH_DEVICES}")
     else:
         if accelerator == "cuda":
-            flags.append("--xla_gpu_deterministic_ops=true")
+            flags.extend(REPEATABLE_GPU_FLAGS)
         if "cpu" not in platforms:
             environ["JAX_PLATFORMS"] = ",".join([*platforms, "cpu"])
         flags.append(f"--xla_force_host_platform_device_count={local[accelerator](environ)}")

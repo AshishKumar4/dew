@@ -27,6 +27,7 @@ import numpy as np
 from flax import linen as nn
 
 from dew import records
+from dew._model_types import _QWEN35_TEXT_TYPES, _QWEN35_TYPES
 from dew.artifacts import agreed
 from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import Origin, SourceSchedule
@@ -304,11 +305,12 @@ class Processor:
             raise ValueError("video_position_ids require the Gemma4 visual tower")
         conditioning: dict[str, jax.Array] = {}
         if "pixel_values" in values or "pixel_values_videos" in values:
-            if "pixel_values_videos" in values and self.config.get("model_type") not in ("qwen3_5", "gemma4"):
+            if ("pixel_values_videos" in values
+                    and self.config.get("model_type") not in (*_QWEN35_TYPES, "gemma4")):
                 raise ValueError("video patch inputs require a Qwen3.5 or Gemma4 visual tower")
             image_fields, conditioning = self._images(values, tokens)
             token_fields.update(image_fields)
-            if self.config.get("model_type") == "qwen3_5":
+            if self.config.get("model_type") in _QWEN35_TYPES:
                 token_fields["rotary_positions"] = self._image_rotary_positions(
                     tokens, valid, image_fields["image_groups"], conditioning["image_grid_thw"])
         if ("input_features" in values) != ("input_features_mask" in values):
@@ -340,7 +342,7 @@ class Processor:
         image_id = self.record.get("image_token_id", self.config.get("image_token_id"))
         if type(image_id) is not int:
             raise ValueError("image_token_id must be an integer")
-        qwen = self.config.get("model_type") == "qwen3_5"
+        qwen = self.config.get("model_type") in _QWEN35_TYPES
         gemma = self.config.get("model_type") == "gemma4"
         video_id = (self.config.get("video_token_id", 258884) if gemma else
                     self.config.get("video_token_id") if qwen else None)
@@ -2012,7 +2014,7 @@ def _wrapper_text_fields(config: Mapping[str, object], record: decoders.WrapperF
             "mixer": {"kind": "attention", "bidirectional_images": True}}
         kinds["sliding_attention"] = sliding
         text_fields["kinds"] = kinds
-    if family == "qwen3_5":
+    if family in _QWEN35_TYPES:
         rope = records.record(text_config.get("rope_parameters") or {}, "rope_parameters")
         sections = rope.get("mrope_section", [11, 11, 10])
         if (not isinstance(sections, (list, tuple)) or len(sections) != 3
@@ -2265,6 +2267,13 @@ def _wrapper_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
     """A multimodal wrapper: the decoder under its text_config and the towers beside it."""
     record = decoders.translate_wrapper_config(config)
     text_fields = _wrapper_text_fields(config, record, max_seq_len)
+    # The Transformers conditional classes ignore auxiliary prediction
+    # layers. A released config advertises a depth even when its checkpoint
+    # contains only the trunk; a source with mtp.* retains its actual depth.
+    if (record['text_model_type'] in _QWEN35_TEXT_TYPES
+            and not any(name.startswith(('mtp.', 'model.mtp.')) for name in tensors)):
+        text_fields['num_nextn_predict_layers'] = 0
+        record['text']['num_nextn_predict_layers'] = 0
     text: decoders.DecoderFields = {**text_fields, **precision_fields(
         "causal_transformer", text_fields, dtype=dtype, attention_impl=attention_impl)}
     wrapper: decoders.WrapperFields = {**record, "text": text}
@@ -2305,7 +2314,7 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
     # (Gemma 4's prepare) has no raw-name bindings.
     entry = decoders.families()[family]
     layouts, retained = ((), {})
-    if entry.preserve_source_layout or entry.prepare_weights is dict:
+    if entry.preserve_source_layout or entry.prepare_weights is decoders.DecoderFamily.prepare_weights:
         layouts, retained = _decoder_layouts(tensors, record, family, variables)
     return _Built(model, variables, record, built, layouts, retained)
 

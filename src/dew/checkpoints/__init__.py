@@ -48,6 +48,7 @@ from orbax.checkpoint.checkpoint_managers import preservation_policy as preserva
 
 from dew import position
 from dew.objectives.base import Variables
+from dew.records import JSON, json_value
 from dew.telemetry.profile import region
 
 if TYPE_CHECKING:
@@ -647,8 +648,9 @@ class Checkpoints:
 
     def save(self, step: int, state: TrainState, saved: bytes | None,
              metrics: Mapping[str, float] | None = None, *,
-             share: DataPartition | None = None) -> None:
-        """Write `state` under `step`, asynchronously.
+             share: DataPartition | None = None, rung: JSON = None) -> None:
+        """Write `state` under `step`, asynchronously, and `rung`, the fit
+        ladder's rung the state trained on, for a resume to compile (`rung`).
 
         Sharded arrays go straight to orbax: gathering them onto the host
         first would serialise the whole state through one process and undo
@@ -679,7 +681,7 @@ class Checkpoints:
             self._profile_snapshots.add(step)
         with region("checkpoint.submit"):
             persistent.save(step, args=ocp.args.PyTreeSave(state_tree), metrics=metrics, force=True,
-                            custom_metadata={'ema_deltas': deltas, 'profiles': profile_metadata})
+                            custom_metadata={'ema_deltas': deltas, 'profiles': profile_metadata, 'rung': rung})
         if _written_in_place(state_tree):
             with region("checkpoint.write_in_place"):
                 persistent.wait_until_finished()
@@ -714,7 +716,7 @@ class Checkpoints:
         return tuple(_averages_of(_power_profiles(restored['opt_state'])))
 
     def save_local(self, step: int, state: TrainState, saved: bytes | None, *,
-                   share: DataPartition | None = None) -> None:
+                   share: DataPartition | None = None, rung: JSON = None) -> None:
         """Write `state` under `step` to this process's local directory,
         asynchronously, in place of the local step before it, and as `save`
         does, a state with arrays in pinned host memory before it returns.
@@ -731,7 +733,7 @@ class Checkpoints:
         with region("checkpoint.submit_local"):
             local.save(step, args=ocp.args.PyTreeSave(state_tree), force=True,
                        custom_metadata={'processes': jax.process_count(), 'placement': written,
-                                        'ema_deltas': deltas})
+                                        'ema_deltas': deltas, 'rung': rung})
         if _written_in_place(state_tree):
             with region("checkpoint.write_in_place"):
                 local.wait_until_finished()
@@ -747,6 +749,13 @@ class Checkpoints:
                     "with the share its stream read (share=DataPartition(...))")
             state_tree['position'] = gather_positions(saved, share)
         return state_tree
+
+    def rung(self, step: int) -> JSON:
+        """The fit ladder's rung the state at `step` trained on, as `save`
+        recorded it, from the directory `restore` reads the step from; None
+        for a checkpoint written without one."""
+        checkpointer = self._open_local() if step == self._local_latest() else self._open()
+        return json_value((checkpointer.metadata(step).custom_metadata or {}).get('rung'), 'rung')
 
     def stored(self, step: int | None = None) -> Variables:
         """Return what the checkpoint at `step` holds, without reading its values.

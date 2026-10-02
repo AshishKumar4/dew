@@ -13,7 +13,9 @@ conversations, which is what `dew.data.ChatMessages` reads and renders with
 the checkpoint's own chat template. The run writes the PEFT adapter directory
 `LoRA.save` produces, which transformers loads, then loads the base again
 through `dew.pipeline`, merges the adapter into it and writes the decoded
-canvases to `samples.txt`.
+canvases to `samples.txt`. Image-conditioned training on real Oxford Flowers
+is `examples/sft_diffusion_gemma_images.py`; it uses a fresh small model,
+not the released 26B model's qualification.
 
     JAX_PLATFORMS=cpu python examples/sft_diffusion_gemma.py --smoke --out /tmp/dg-smoke
 """
