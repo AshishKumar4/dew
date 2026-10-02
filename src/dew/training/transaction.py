@@ -167,7 +167,8 @@ class Transaction:
     once here. `step` composes them for a resident run or for a host-master
     run; only where each phase executes differs.
     """
-    def __init__(self, objective, optimizer, accumulation: int, shapes):
+    def __init__(self, objective, optimizer, accumulation: int, shapes, *,
+                 report_norm: bool = False):
         """Hold the objective, the optimizer and the shapes a step traces for.
 
         `shapes` is the traced result of the objective's loss, statistics and
@@ -177,6 +178,7 @@ class Transaction:
         self.objective = objective
         self.optimizer = optimizer
         self.size = accumulation
+        self.report_norm = report_norm
         stats_shape, self.aux_shape = shapes
         self.shared = isinstance(stats_shape, (Ratio, jax.ShapeDtypeStruct))
         self.stats_tree = jax.tree.structure(stats_shape)
@@ -401,7 +403,8 @@ class Transaction:
         advanced = chosen(accepted, numerical, state)
         if scale is not None:
             advanced = dataclasses.replace(advanced, scale=_advance_scale(scale, finite))
-        aux = dataclasses.replace(aux, metrics={**aux.metrics, "grad_norm": optax.tree.norm(gradient)})
+        if self.report_norm:
+            aux = dataclasses.replace(aux, metrics={**aux.metrics, "grad_norm": optax.tree.norm(gradient)})
         return advanced, loss, aux
 
     def step(self, *, realize=None, host=False):

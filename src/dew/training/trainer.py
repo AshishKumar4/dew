@@ -808,6 +808,7 @@ class Trainer(Generic[Loss, Effects]):
         self.links: dict[str, Link] = {}
         self._bandwidths: dict[tuple[Mesh, str], float | None] = {}
         self._display = TrainingDisplay()
+        self._report_norm = False
         # The fit ladder's rung beyond the objective's own head and remat: a
         # step that fit only under XLA's default options keeps them for later
         # compiles. A resumed run starts at its checkpoint's rung, and says so
@@ -1250,7 +1251,8 @@ class Trainer(Generic[Loss, Effects]):
                 lambda x, s: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=s), prepared, shardings)
             while True:
                 body = (self.step(self.objective, self.optimizer) if self.step is not None else
-                        Transaction(self.objective, self.optimizer, self.accumulation, shapes).step())
+                        Transaction(self.objective, self.optimizer, self.accumulation, shapes,
+                                    report_norm=self._report_norm).step())
 
                 def step(current, batch, body=body):
                     # The body sees every field on the device; the out shardings
@@ -1307,7 +1309,8 @@ class Trainer(Generic[Loss, Effects]):
             shapes = self._loss_shape(state, cpu_batch)
             prepared = self._initialize_accumulation(state, cpu_batch, shapes, shape_only=True)
             placement = self.shardings(prepared)
-            transaction = Transaction(self.objective, self.optimizer, self.accumulation, shapes)
+            transaction = Transaction(self.objective, self.optimizer, self.accumulation, shapes,
+                                    report_norm=self._report_norm)
             body = transaction.step(realize=execution.realize, host=True)
 
         def run(current, batch):
@@ -1400,6 +1403,7 @@ class Trainer(Generic[Loss, Effects]):
         finally:
             primary = sys.exception()
             error = self._closed(run, primary, profiler)
+            self._report_norm = False
             if primary is None and error is not None:
                 raise error
         if complete:
@@ -1438,7 +1442,7 @@ class Trainer(Generic[Loss, Effects]):
             run.stop_control = checkpoints.control(checkpoints.latest)
         if self._opened(plan, run, state, position):
             return state, True
-        compiled: dict[Shapes, tuple[CompiledStep, float | None]] = {}
+        compiled: dict[tuple[Shapes, bool], tuple[CompiledStep, float | None]] = {}
         interval = _Interval(time.time(), last_saved=(
             run.current if checkpoints is not None and checkpoints.latest is not None else None))
         seen = 0
@@ -1467,7 +1471,8 @@ class Trainer(Generic[Loss, Effects]):
                 if not compiled:
                     agreed("training input declaration", functools.partial(self._check_inputs, batch))
                 first_compile = not compiled
-                train_step, measured_flops = self._compiled_for(compiled, state, batch)
+                report_norm = (run.current + 1) % plan.log_every == 0
+                train_step, measured_flops = self._compiled_for(compiled, state, batch, report_norm)
                 if first_compile:
                     # Rebound once the step is compiled, so the first tick
                     # measures steps, not the compile.
@@ -2095,24 +2100,29 @@ class Trainer(Generic[Loss, Effects]):
         batch = shard_batch(self.device_mesh, self.rollout(state, batch, key))
         return batch, time.perf_counter() - began
 
-    def _compiled_for(self, compiled: dict[Shapes, tuple[CompiledStep, float | None]],
-                      state: TrainState, batch: Batch) -> tuple[CompiledStep, float | None]:
-        """Return the step compiled for this batch's shapes, compiling on first sight.
+    def _compiled_for(self, compiled: dict[tuple[Shapes, bool], tuple[CompiledStep, float | None]],
+                      state: TrainState, batch: Batch, report_norm: bool = False
+                      ) -> tuple[CompiledStep, float | None]:
+        """Keep a default and a reporting step per batch shape.
 
-        A ramped run reads a new shape at every stage, so `compiled` keeps
-        one step per stage with the FLOPs measured for it.
+        Reporting has its own static program, so a normal step neither reads
+        the gradient norm nor materializes gradients for a conditional branch.
         """
-        shapes = batch_shapes(batch)
-        if shapes not in compiled:
+        key = (batch_shapes(batch), report_norm)
+        if key not in compiled:
             began = time.perf_counter()
-            with region("compile"):
-                compiled[shapes] = (self.compile(state, batch), self.flops_per_step)
+            self._report_norm = report_norm
+            try:
+                with region("compile"):
+                    compiled[key] = (self.compile(state, batch), self.flops_per_step)
+            finally:
+                self._report_norm = False
             seconds = time.perf_counter() - began
             remat = _remat_of(_model_of(self.objective))
             links = {axis: AxisLink(link.bytes_per_second, link.spread)
                      for axis, link in self.links.items()}
             self._report(StepCompiled(seconds, remat_record(remat), links), int(state.step))
-        return compiled[shapes]
+        return compiled[key]
 
     def _saved_checkpoint(
         self,
