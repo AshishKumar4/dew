@@ -94,6 +94,7 @@ from dew.training.distributed import (
     data_partition,
     link_bandwidth,
     shard_batch,
+    sharded_share,
 )
 from dew.training.evaluation import Evaluation, evaluate
 from dew.training.runtime import Preempted, PreemptionNotice
@@ -1504,7 +1505,8 @@ class Trainer(Generic[Loss, Effects]):
         started = FitStarted(current, steps,
             checkpoints.source(current) if checkpoints is not None and position is not None else None,
             sum(leaf.size for leaf in jax.tree.leaves(state.params["params"])), mesh.devices.size,
-            jax.devices()[0].device_kind, jax.process_count(), dict(mesh.shape), seed=self.seed)
+            jax.devices()[0].device_kind, jax.process_count(), dict(mesh.shape), seed=self.seed,
+            sharded=sharded_share(state.params["params"]))
         self._report(started, current)
         if current > steps:
             raise ValueError(f"the run is at step {current}, past the {steps} asked for")

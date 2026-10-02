@@ -656,6 +656,22 @@ def first_reader_batch(mesh: Mesh, batch: Mapping[str, np.ndarray]) -> dict[str,
     return {name: np.asarray(gathered[name][source]) for name in layout}
 
 
+def sharded_share(params: Variables) -> float:
+    """The share of the bytes of `params`, placed arrays, that a parameter
+    axis splits (`PARAMETER_AXES`): a mesh can name fsdp or tensor and still
+    split nothing of a model whose parameters all sit below `Layout`'s
+    `min_shard`, and the run's banner says how much it does."""
+    total = split = 0
+    for leaf in jax.tree.leaves(params):
+        total += leaf.nbytes
+        sharding = leaf.sharding
+        if isinstance(sharding, NamedSharding) and any(
+                sharding.mesh.shape[axis] > 1 for assignment in sharding.spec
+                for axis in mesh_axes(assignment) if axis in PARAMETER_AXES):
+            split += leaf.nbytes
+    return split / total if total else 0.0
+
+
 # The batches a `DevicePrefetchIterator` queues ahead of the step by default.
 PREFETCH_DEPTH = 2
 
