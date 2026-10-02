@@ -1478,7 +1478,7 @@ _TRUNK: Mapping[str, tuple[str, ...]] = {
     'model.per_layer_model_projection.weight': ('per_layer_model_projection', 'kernel'),
     'model.per_layer_projection_norm.weight': ('per_layer_projection_norm', 'scale'),
 }
-_TRUNK_NAMES = {path: name for name, path in _TRUNK.items()}
+_TRUNK_NAMES: Mapping[tuple[str, ...], str] = {path: name for name, path in _TRUNK.items()}
 # Gemma 4's per-layer residual. Gate and projection are kernels, the post
 # norm is a scale. The values norm carries no weight, so it maps nothing.
 _PER_LAYER_INPUTS = {'per_layer_input_gate': 'kernel', 'per_layer_projection': 'kernel',
@@ -1928,12 +1928,12 @@ def _packed_layouts(layouts: Mapping[str, WeightLayout],
                     packed: Sequence["Packed"]) -> dict[str, WeightLayout]:
     """`layouts` with each `packed` source tensor built from its parts' layouts,
     in the place of its first part."""
-    result: dict[str, WeightLayout] = {}
+    source: dict[str, WeightLayout] = {}
     for name, layout in layouts.items():
         found = next(((packing, part) for packing in packed for part in packing.parts
                       if name.endswith(part)), None)
         if found is None:
-            result[name] = layout
+            source[name] = layout
             continue
         packing, part = found
         stem = name.removesuffix(part)
@@ -1941,9 +1941,9 @@ def _packed_layouts(layouts: Mapping[str, WeightLayout],
         if missing:
             raise ValueError(f'{stem}{packing.name} packs {name} with {missing}, which nothing writes')
         if part == packing.parts[0]:
-            result[stem + packing.name] = packing.layout(
+            source[stem + packing.name] = packing.layout(
                 stem + packing.name, [layouts[stem + other] for other in packing.parts])
-    return result
+    return source
 
 
 def _layout_tensors(layouts: Mapping[str, WeightLayout], variables: Mapping[str, object],
