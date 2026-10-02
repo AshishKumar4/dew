@@ -14,7 +14,8 @@ which is the timestep the source's pipeline passes, and returns the flow the
 source returns. Dew in float32 is held to tests/reference_error.py's rule,
 within twice the reference's own RMS distance from float64. Observed on CPU
 (Dew's RMS error over the reference's): published forward 1.01, gradients
-1.01; variant forward 0.96, gradients 0.99. The truth is float64 throughout:
+1.01; variant forward 0.96, gradients 0.99; in bfloat16, 1.26 and 0.99
+against the source's own bfloat16 run. The truth is float64 throughout:
 Dew run in float64 with a float64 rotary table lands 3e-16 (RMS) from it.
 
 The pipeline walk composes the UMT5 encoder, the transformer, UniPC and the
@@ -110,6 +111,22 @@ def test_the_flow_and_its_gradients_are_as_exact_as_the_source(source, arrays, n
     native_order = np.concatenate([np.ravel(leaf) for leaf in native])
     assert_as_exact_as_the_reference(native_order, source_order("fp32"), source_order("fp64"),
                                      f"{name} gradients")
+
+
+@pytest.mark.parametrize("name", CASES)
+def test_a_bfloat16_flow_is_as_exact_as_the_bfloat16_source(source, arrays, name):
+    """In bfloat16, Dew's flow is no further from float64 than the source's
+    own bfloat16 run, whose time embedder stays in float32: sinusoids taken
+    in bfloat16 land ten to twenty times further."""
+    config = json.loads((source / name / "transformer" / "config.json").read_text())
+    model = WanTransformer(**wan_fields(config, dtype="bfloat16", attention_impl="xla"))
+    params, _ = translate_wan_weights(component_tensors(source / name, "transformer"))
+    latents = jnp.asarray(channels_last(arrays[f"{name}.latents"]), jnp.bfloat16)
+    context = DenoisingCondition(jnp.asarray(arrays[f"{name}.context"], jnp.bfloat16))
+    flow = model.apply({"params": params}, latents, jnp.asarray(arrays[f"{name}.times"]), context)
+    assert_as_exact_as_the_reference(np.moveaxis(np.asarray(flow, np.float32), -1, 1),
+                                     arrays[f"{name}.bf16.output"], arrays[f"{name}.fp64.output"],
+                                     f"{name} bfloat16 flow")
 
 
 @pytest.mark.parametrize("change", [

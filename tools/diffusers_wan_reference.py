@@ -7,8 +7,10 @@ every parameter moved off its initialization, saves each with
 cotangent it records the gradients of the latents, the prompt states and
 every parameter. Each call runs twice over the same float32 weights: in
 float32, the reference, and in float64 (`widened`), the truth
-tests/reference_error.py measures both runs from. The weights are rounded to
-bfloat16-representable values so the fixture compresses.
+tests/reference_error.py measures both runs from; and once more forward in
+bfloat16 as `from_pretrained(torch_dtype=torch.bfloat16)` loads it, its
+`_keep_in_fp32_modules` in float32, on bfloat16 inputs. The weights are
+rounded to bfloat16-representable values so the fixture compresses.
 
 The pipeline half saves one tiny `WanPipeline` over the published configs -
 a UMT5 text encoder saved as the release stores it, a character-level T5
@@ -144,6 +146,11 @@ def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
     with widened():
         widest = walk(model, inputs, probe, torch.float64)
         arrays.update({f"fp64.{key}": value for key, value in widest.items()})
+    half = WanTransformer3DModel.from_pretrained(root / name / "transformer", torch_dtype=torch.bfloat16)
+    with torch.no_grad():
+        output = half.eval()(inputs["latents"].bfloat16(), inputs["times"], inputs["context"].bfloat16(),
+                             return_dict=False)[0]
+    arrays["bf16.output"] = output.float().numpy()
     gap = np.abs(arrays["fp32.output"] - arrays["fp64.output"]).max()
     print(f"{name}: latent {case.size} prompt {case.length} "
           f"|output| <= {np.abs(arrays['fp64.output']).max():.4g}, fp32 off float64 by {gap:.3g}")
