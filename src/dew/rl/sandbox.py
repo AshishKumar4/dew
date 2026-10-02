@@ -25,6 +25,10 @@ hostile code.
 A program that fails returns an `Outcome`, and the reward decides what a
 timeout or a crash is worth. A runner raises only when it cannot start a
 program at all.
+
+`MathReward` is the verifiable reward that needs no program: it reads the
+completion's final answer and compares it with the reference as an exact
+rational number.
 """
 
 from __future__ import annotations
@@ -34,6 +38,7 @@ import contextlib
 import json
 import math
 import os
+import re
 import selectors
 import signal
 import subprocess
@@ -46,6 +51,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from enum import Enum
+from fractions import Fraction
 from pathlib import Path
 from types import MappingProxyType
 from typing import Protocol
@@ -560,3 +566,68 @@ def outputs_match(outcome: Outcome, expected: str) -> bool:
         return [line.rstrip() for line in text.strip().splitlines()]
 
     return outcome.verdict is Verdict.COMPLETED and lines(outcome.stdout) == lines(expected)
+
+
+_BOXED = re.compile(r"\\boxed\{")
+_GROUPED = r"-?\d{1,3}(?:,\d{3})+(?:\.\d+)?"
+"""A number written with thousands-group commas, the only commas read as part of one."""
+_NUMBER = re.compile(rf"{_GROUPED}|-?\d+(?:\.\d+)?(?:/\d+)?|-?\.\d+")
+
+
+def _boxed(text: str) -> str | None:
+    """The contents of the last `\\boxed{...}`, braces balanced."""
+    starts = [match.end() for match in _BOXED.finditer(text)]
+    if not starts:
+        return None
+    depth, start = 1, starts[-1]
+    for index in range(start, len(text)):
+        depth += {"{": 1, "}": -1}.get(text[index], 0)
+        if depth == 0:
+            return text[start:index]
+    return None
+
+
+def _rational(text: str) -> Fraction | None:
+    """Read a decimal, integer or `a/b` answer, allowing thousands separators and `\\frac{a}{b}`.
+
+    Any other comma or inner space leaves the text unreadable as one number,
+    so a list such as `1,2` or `2 3` never collapses into `12` or `23`.
+    """
+    cleaned = text.replace("$", "").strip()
+    if re.fullmatch(_GROUPED, cleaned):
+        cleaned = cleaned.replace(",", "")
+    fraction = re.fullmatch(r"-?\\[dt]?frac\{(-?\d+)\}\{(-?\d+)\}", cleaned)
+    if fraction is not None:
+        numerator, denominator = int(fraction[1]), int(fraction[2])
+        sign = -1 if cleaned.startswith("-") else 1
+        return None if denominator == 0 else sign * Fraction(numerator, denominator)
+    number = re.fullmatch(r"-?(?:\d+(?:\.\d*)?|\.\d+)(?:/(\d+))?", cleaned)
+    if number is None or (number[1] is not None and int(number[1]) == 0):
+        return None
+    return Fraction(cleaned)
+
+
+@dataclass(frozen=True)
+class MathReward:
+    """Score one when the final answer equals the reference as a rational number.
+
+    The answer is the last `\\boxed{}` in the completion; with
+    `require_boxed=False` a completion without one falls back to its last
+    number. Integers, decimals, `a/b` and `\\frac{a}{b}` compare exactly, so
+    `0.5`, `1/2` and `\\frac{1}{2}` agree. A reference that is not a number
+    compares as trimmed text.
+    """
+
+    require_boxed: bool = True
+
+    def __call__(self, data_source: str, completion: str, ground_truth: str, extra_info: str) -> float:
+        answer = _boxed(completion)
+        if answer is None and not self.require_boxed:
+            numbers = _NUMBER.findall(completion)
+            answer = numbers[-1] if numbers else None
+        if answer is None:
+            return 0.0
+        expected = _rational(ground_truth)
+        if expected is None:
+            return float(answer.strip() == ground_truth.strip())
+        return float(_rational(answer) == expected)
