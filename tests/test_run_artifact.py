@@ -63,12 +63,12 @@ def test_python_lm_run_saves_its_inference_record_without_run_json(tmp_path):
 
 @pytest.mark.parametrize("kind", ["text", "masked", "block"])
 def test_task_from_pretrained_selects_the_requested_snapshot(tmp_path, monkeypatch, kind):
-    from pathlib import Path
+    from flax.core import freeze
 
     import dew.interop.hub as hub
     from dew.diffusion.discrete import MDLM
     from dew.inference import BlockGeneration, MaskedGeneration, TextGeneration
-    from dew.interop import Pretrained
+    from dew.nn.diffusion_gemma import DiffusionGemma
     from dew.objectives.diffusion import BlockDiffusionObjective, MaskedDiffusionObjective
     from dew.training import TrainState
 
@@ -79,9 +79,8 @@ def test_task_from_pretrained_selects_the_requested_snapshot(tmp_path, monkeypat
         objective, task_type = MaskedDiffusionObjective(masked, MDLM(mask_id=0)(), 8,
                                                        ema_decay=None), MaskedGeneration
     else:
-        fixture = Path(__file__).parent / "fixtures/hf/diffusion-gemma-workflow"
-        source = Pretrained.load(fixture, dtype="float32", max_seq_len=32)
-        objective = BlockDiffusionObjective(source.model, prompt_length=4, pretrained=source.variables)
+        block = DiffusionGemma(model().clone(layer_scalar="frozen"), canvas_length=4)
+        objective = BlockDiffusionObjective(block, prompt_length=4)
         task_type = BlockGeneration
     original = objective.init(jax.random.key(0))
     selected = jax.tree.map(lambda leaf: leaf + 2 if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf,
@@ -97,7 +96,7 @@ def test_task_from_pretrained_selects_the_requested_snapshot(tmp_path, monkeypat
     monkeypatch.setattr(hub, "snapshot_download", lambda repo_id, revision=None:
                         tmp_path / ("main" if revision is None else {"pinned": "pinned"}[revision]))
     task = task_type.from_pretrained("user/published-model", revision="pinned", ema=False)
-    assert jax.tree.structure(task.variables) == jax.tree.structure(selected)
+    assert jax.tree.structure(task.variables) == jax.tree.structure(freeze(selected))
     for actual, expected in zip(jax.tree.leaves(task.variables), jax.tree.leaves(selected), strict=True):
         np.testing.assert_array_equal(actual, expected)
 
