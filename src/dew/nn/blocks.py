@@ -12,7 +12,7 @@ from flax.typing import Dtype, PrecisionLike
 from .attention import RMSNorm
 from .conv import Conv
 from .precision import at_least_fp32
-from .sharding import constrain, logical_axes
+from .sharding import constrain
 
 
 def normal_kernel(std: float | None, default: Callable | None = None) -> dict:
@@ -124,7 +124,6 @@ def is_fourier_table(path: jax.tree_util.KeyPath) -> bool:
     return len(names) > 1 and names[0] == "constants" and names[-1] == "frequencies"
 
 
-@logical_axes({}, heuristic=(("DenseGeneral_*",),))
 class TimeProjection(nn.Module):
     """Two dense layers with the activation after each."""
     features: int
@@ -206,7 +205,6 @@ def torch_bicubic_resize(x, height: int, width: int, *, antialias: bool = False)
     return jnp.einsum("oh,bhwc,pw->bopc", rows, x, columns, precision=jax.lax.Precision.HIGHEST)
 
 
-@logical_axes({}, heuristic=(("Conv_*",),))
 class Upsample(nn.Module):
     """Nearest-neighbour upsampling by `scale`, then a 3x3 convolution to `features`."""
     features: int
@@ -234,7 +232,6 @@ class Downsample(nn.Module):
                     dtype=self.dtype, precision=self.precision)(x)
 
 
-@logical_axes({}, heuristic=(("conv1",), ("conv2",), ("residual_conv",), ("temb_projection",)))
 class ResidualBlock(nn.Module):
     """Norm, activation, convolution, the projected time embedding added,
     norm, activation, convolution, plus the input (through a 1x1 convolution

@@ -14,15 +14,11 @@ import jax.numpy as jnp
 import numpy as np
 from flax import struct
 from jax.core import Tracer
-from typing_extensions import TypeVar
 
 from dew.nn.sharding import DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS
 
 if TYPE_CHECKING:
     from PIL.Image import Image
-
-ArrayT = TypeVar("ArrayT", bound=jax.Array | np.ndarray, default=jax.Array, covariant=True)
-TreeT = TypeVar("TreeT")
 
 # What a caller hands a host processor as one media argument: pixels or audio
 # samples in an array, a PIL image, or one entry per row of either. The source's

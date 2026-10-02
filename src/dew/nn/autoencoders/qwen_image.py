@@ -102,7 +102,6 @@ class _ResidualBlock(nn.Module):
 class _Attention(nn.Module):
     """Single-head self-attention over the pixels, the projections 1x1 convs."""
 
-    features: int
     dtype: Dtype = jnp.float32
 
     @nn.compact
@@ -122,7 +121,7 @@ class _MidBlock(nn.Module):
     @nn.compact
     def __call__(self, x):
         x = _ResidualBlock(self.features, self.features, self.dtype, name="resnets_0")(x)
-        x = _Attention(self.features, self.dtype, name="attentions_0")(x)
+        x = _Attention(self.dtype, name="attentions_0")(x)
         return _ResidualBlock(self.features, self.features, self.dtype, name="resnets_1")(x)
 
 

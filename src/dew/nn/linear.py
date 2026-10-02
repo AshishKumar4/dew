@@ -378,7 +378,7 @@ def recurrent_gated_delta_rule(query, key, value, g, beta, state=None):
     ("in_proj_b",): ("embed", "kv"),
     ("in_proj_a",): ("embed", "kv"),
     ("out_proj",): ("attention", "embed"),
-}, heuristic=(("conv1d",),))
+})
 class GatedDeltaNet(nn.Module):
     """The token mixer of a linear_attention layer.
 

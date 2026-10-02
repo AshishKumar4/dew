@@ -379,7 +379,6 @@ class IndexScorer(nn.Module):
     modeling_deepseek_v4.py:437-450)."""
 
     n_heads: int
-    head_dim: int
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
@@ -424,8 +423,8 @@ class LightningIndexer(CompressedEntries):
         super().setup()
         self.q_b_proj = nn.Dense(self.n_heads * self.width, use_bias=False,
                                  dtype=self.dtype, precision=self.precision, name='q_b_proj')
-        self.scorer = IndexScorer(n_heads=self.n_heads, head_dim=self.width,
-                                  dtype=self.dtype, precision=self.precision, name='scorer')
+        self.scorer = IndexScorer(n_heads=self.n_heads, dtype=self.dtype, precision=self.precision,
+                                  name='scorer')
 
     def select(self, x, q_resid, positions, cos, sin, cache=None):
         """The entries each query attends: `[B, S, T]`, bool.

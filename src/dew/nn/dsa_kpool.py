@@ -56,7 +56,7 @@ from .kv_cache import KVCache
 from .mixer_base import MixerBase, MixerContext, mixers
 from .mla import INDEXER, open_mla_cache
 from .precision import at_least_fp32
-from .sharding import RESIDUAL, constrain, down_projection, logical_axes
+from .sharding import RESIDUAL, constrain, down_projection
 from .sparse_selection import selection_mask
 
 
@@ -69,7 +69,6 @@ def _first_valid(valid, total: int):
 # wq_b, wk, k_norm and weights_proj carry the V3.2 indexer's declarations
 # under the same names; the pool compression's two tables have no side worth
 # naming and take the shape heuristic.
-@logical_axes({}, heuristic=(("index_kpool_compress_*",),))
 class KPoolIndexer(nn.Module):
     """The k-pool indexer: which keys each query attends, by pools
     (`Glm5NextTextIndexer`, modeling_glm5_next.py:736-1024).
