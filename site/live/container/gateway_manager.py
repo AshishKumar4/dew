@@ -44,6 +44,7 @@ class LimitedKernelManager(KernelGatewayIOLoopKernelManager):
             "LANG": "C.UTF-8", "IPYTHONDIR": "/work/ipython", "JUPYTER_RUNTIME_DIR": "/work/jupyter",
             "HF_HOME": "/opt/hf", "HF_HUB_OFFLINE": "1", "JAX_PLATFORMS": "cpu",
             "JAX_COMPILATION_CACHE_DIR": "/work/xla", "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1",
+            "MALLOC_ARENA_MAX": "2",
         }
         await super()._async_launch_kernel(limited, **{**kwargs, "env": env, "cwd": "/"})
 
