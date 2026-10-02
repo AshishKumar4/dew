@@ -33,6 +33,12 @@ const names = ['lm', 'diffusion', 'sample_public', 'jepa', 'grpo', 'pretrained',
 const records = Object.fromEntries(names.map((name) => [name, recorded(name)]));
 const fullScript = 'https://github.com/AshishKumar4/dew/blob/main/site/snippets/framework.py';
 const hero = capture.hero;
+const terminalReplay = JSON.parse(readPublic('hero', 'train.json'));
+const expanded = [...terminalReplay.frames.at(-1).screen];
+while (expanded.length <= terminalReplay.final_cursor_row) expanded.push([]);
+if (JSON.stringify(expanded.slice(-terminalReplay.source_rows)) !== JSON.stringify(terminalReplay.source_final_screen)) {
+	throw new Error('Training replay changes the recorded final viewport');
+}
 const shortHero = heroCode.slice(heroCode.indexOf('model ='));
 const replays = ['aurora', 'alpine', 'painted-mountains'].map((name) => {
 	const meta = JSON.parse(readPublic('hero', 'replay', name, 'meta.json'));
@@ -67,7 +73,7 @@ const tutorialNames: Record<string, string> = {
 			<p class="band-lede">A decoder learns Tiny Shakespeare on {capture.meta.where}, then generates ROMEO and JULIET samples.</p>
 			<div class="run-grid">
 				<Code code={shortHero.trimEnd()} lang="python" title="train.py" />
-				<HeroOutput screen={hero.screen} meta={capture.meta} seconds={hero.seconds} replay={hero.replay} rows={hero.rows} />
+				<HeroOutput screen={hero.screen} meta={capture.meta} seconds={hero.seconds} replay={hero.replay} rows={hero.rows} columns={hero.columns} source_rows={hero.source_rows} />
 			</div>
 			<p class="framework-note"><a href="https://github.com/AshishKumar4/dew/blob/main/site/src/data/hero.py">Full script</a></p>
 		</section>

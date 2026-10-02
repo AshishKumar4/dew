@@ -45,6 +45,7 @@ GROUPS: list[tuple[str, list[str]]] = [
     ("Models", ["dew.registry", "dew.nn.backbones", "dew.nn.backbones.causal_transformer",
                 "dew.nn.backbones.decoder_block", "dew.nn.backbones.layer_plan", "dew.nn.kv_cache",
                 "dew.nn.backbones.flux", "dew.nn.backbones.qwen_image", "dew.nn.backbones.sd3",
+                "dew.nn.backbones.flux2", "dew.nn.backbones.z_image",
                 "dew.nn.backbones.edm2", "dew.nn.mp",
                 "dew.nn.diffusion_gemma", "dew.nn.gemma3n", "dew.nn.multimodal",
                 "dew.nn.autoencoders", "dew.nn.kernels", "dew.nn.sharding", "dew.lora"]),
