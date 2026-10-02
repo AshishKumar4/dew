@@ -60,7 +60,6 @@ def prepare(spec, out: str, shards: int | None, *, source: dict) -> dict:
     from array_record.python.array_record_module import ArrayRecordWriter
 
     writer = None
-    written = 0
     shard_sizes = []
     for index in range(records):
         if index % per_shard == 0:
@@ -86,11 +85,10 @@ def prepare(spec, out: str, shards: int | None, *, source: dict) -> dict:
         assert writer is not None
         writer.write(record)
         shard_sizes[-1] += len(record)
-        written += 1
     if writer is not None:
         writer.close()
 
-    manifest = {"records": written, "image_size": spec.image_size,
+    manifest = {"records": records, "image_size": spec.image_size,
                 "source": source, "shard_sizes": shard_sizes}
     with open(os.path.join(out, "manifest.json"), "w") as handle:
         json.dump(manifest, handle, indent=2)
