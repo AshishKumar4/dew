@@ -412,10 +412,11 @@ def _real_pixels(inputs: ModelInputs, gradient: jax.Array) -> jax.Array:
                             for row, count in enumerate(lengths) for image in range(int(count))])
 
 
-@pytest.fixture(scope="module", params=sorted(FAMILIES))
-def family_source(request):
+def _family(family: str):
+    """A family's loaded checkpoint, its actual processor's inputs and its
+    references' directory."""
     pytest.importorskip("torchvision", reason="the vision extra supplies the actual processors")
-    references, checkpoint, *_ = FAMILIES[request.param]
+    references, checkpoint, *_ = FAMILIES[family]
     directory = FIXTURE.parent / references
     source = FIXTURE.parent / checkpoint
     loaded = load_pretrained(source, dtype="float32", attention_impl="reference")
@@ -425,7 +426,34 @@ def family_source(request):
     inputs = loaded.processor(json.loads((directory / "prompts.json").read_text()),
                               images=[[images[0]], [images[1], images[2]]],
                               audio=[np.load(path) for path in waveforms] if waveforms else None)
-    return request.param, loaded, inputs, directory
+    return loaded, inputs, directory
+
+
+@pytest.fixture(scope="module", params=sorted(FAMILIES))
+def family_source(request):
+    return request.param, *_family(request.param)
+
+
+def test_training_reaches_the_gemma3n_vision_drop_path():
+    """`train` reaches Gemma 3n's MobileNet through the wrapper: with a
+    drop-path rate the training forward depends on the dropout key, without
+    one nothing else in the model draws, and evaluation still reads the
+    reference logits."""
+    loaded, inputs, directory = _family("gemma3n")
+    dropping = loaded.model.clone(vision=dataclasses.replace(loaded.model.vision, drop_path_rate=0.4))
+
+    def forward(model, train, seed):
+        return np.asarray(jax.jit(lambda variables: model.apply(
+            variables, inputs.tokens, **inputs.kwargs(), train=train,
+            rngs={"dropout": jax.random.key(seed)}))(loaded.variables))
+
+    valid = np.asarray(inputs.token_fields["attention_mask"])
+    np.testing.assert_array_equal(forward(loaded.model, True, 1), forward(loaded.model, True, 2))
+    first = forward(dropping, True, 1)
+    np.testing.assert_array_equal(first, forward(dropping, True, 1))
+    assert np.max(np.abs(first - forward(dropping, True, 2))[valid]) > 1e-3
+    expected = np.load(directory / "logits.npy")
+    np.testing.assert_allclose(forward(dropping, False, 1)[valid], expected[valid], atol=1e-4, rtol=0)
 
 
 @pytest.fixture(scope="module", params=["gemma-3n-audio-tiny", "gemma-4-audio-tiny"])

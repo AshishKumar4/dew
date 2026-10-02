@@ -24,6 +24,7 @@ from dew.nn.attention import LayerNorm, RMSNorm, scaled_dot_product_attention
 from dew.nn.backbones.unet_condition import sinusoidal_time
 from dew.nn.conv import Conv
 from dew.nn.precision import at_least_fp32
+from dew.nn.scan_orders import unpatchify
 from dew.nn.sharding import logical_axes
 from dew.registry import models
 
@@ -335,9 +336,7 @@ class SD3Transformer(nn.Module):
         image = _modulate(_layer_norm(self.dtype)(image), shift, scale)
         image = nn.Dense(patch * patch * self.out_channels, dtype=self.dtype,
                          precision=self.precision, name="proj_out")(image)
-        image = image.reshape(image.shape[0], rows, columns, patch, patch, self.out_channels)
-        image = image.transpose(0, 1, 3, 2, 4, 5)
-        return image.reshape(image.shape[0], rows * patch, columns * patch, self.out_channels)
+        return unpatchify(image, patch, rows * patch, columns * patch, self.out_channels)
 
 
 __all__ = ["SD3Block", "SD3Transformer", "sincos_position"]
