@@ -51,12 +51,13 @@ def pipeline(
     repository. `mesh` places the weights on that mesh under `layout` (the
     trainer's default when None). Without `mesh`, data parallelism uses the
     current pool's devices. dtype selects computation, a dtype (`jnp.bfloat16`)
-    or its name. param_dtype selects parameter storage: None preserves a run's stored dtypes and uses FP32
-    masters for a source, and 'auto' stores the stored dtypes either way (a
-    source's config dtype or first floating tensor, as transformers'
-    dtype='auto' reads it). ema reads a run's averaged weights: None when the
-    run kept them and its live weights otherwise, True always; step selects
-    its checkpoint and revision pins a Hub source.
+    or its name. param_dtype selects parameter storage: None preserves a
+    run's stored dtypes and uses FP32 masters for a source, and 'auto' stores
+    the stored dtypes either way (a source's config dtype or first floating
+    tensor, as transformers' dtype='auto' reads it). ema reads a run's
+    averaged weights: None when the run kept them and its live weights
+    otherwise, True always; step selects its checkpoint and revision pins a
+    Hub source.
 
     Loading a task also points XLA at the on-disk executable cache, so a
     restarted process reuses what it already compiled.
