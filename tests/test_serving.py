@@ -112,6 +112,33 @@ def test_a_sampled_request_keeps_its_own_draws():
         np.testing.assert_array_equal(mine.lengths[0], rows.lengths[index])
 
 
+@pytest.mark.skipif(jax.default_backend() != "gpu", reason="guards a CUDA device-to-host key transfer")
+def test_submission_keeps_device_keys_on_device_until_admission():
+    """A request can queue its key without waiting for a CUDA copy to the host.
+
+    The request still draws the same sampled tokens and likelihoods once it
+    is admitted; only the host-side preparation's synchronization changes.
+    """
+    bound = task(Sampling(temperature=1.0, top_k=5, eos_id=None))
+    key = jax.random.key(7)
+    prompt = np.asarray([1, 2, 3], np.int32)
+    server = Server.from_task(bound, slots=2, capacity=128, admission=2)
+    with jax.transfer_guard_device_to_host("disallow"):
+        ticket = server.submit(prompt, 5, key=key)
+    server.run()
+    assert_same_generation(ticket.result(), bound(prompt[None], 5, key=key))
+
+
+@pytest.mark.parametrize("ids", [np.asarray([1.5, 2.0]), np.asarray([True, False]),
+                                  np.asarray([2**32], np.int64), np.asarray([-1, 2], np.int32),
+                                  np.asarray([VOCAB], np.int32), np.asarray([], np.int32)])
+def test_host_numeric_submission_still_refuses_invalid_token_rows(ids):
+    server = Server.from_task(task(), slots=1, capacity=128)
+    with pytest.raises(ValueError):
+        server.submit(ids, 2, key=jax.random.key(1))
+    assert server.queued == 0 and server.occupancy == 0
+
+
 def test_a_request_admitted_mid_flight_draws_what_it_draws_alone():
     bound = task()
     server = Server.from_task(bound, slots=4, capacity=128, admission=2)

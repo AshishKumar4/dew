@@ -67,7 +67,9 @@ class _RMSNorm(nn.Module):
     def __call__(self, x):
         gamma = self.param("gamma", nn.initializers.ones, (self.features, *(1,) * (self.rank - 1)))
         norm = jnp.sqrt(jnp.sum(jnp.square(x), axis=-1, keepdims=True))
-        return (x / jnp.maximum(norm, 1e-12) * math.sqrt(self.features) * gamma.reshape(-1)).astype(self.dtype)
+        return (x / jnp.maximum(norm, 1e-12) * math.sqrt(self.features) * gamma.reshape(-1)).astype(
+            self.dtype
+        )
 
 
 def _causal(features: int, kernel: int, dtype: Dtype, name: str) -> nn.Module:
@@ -114,8 +116,12 @@ class _Attention(nn.Module):
         normalized = _RMSNorm(channels, 3, self.dtype, name="norm")(x)
         qkv = Conv(3 * channels, (1, 1), dtype=self.dtype, name="to_qkv")(
             normalized.reshape(batch * frames, height, width, channels))
-        query, key, value = jnp.split(qkv.reshape(batch * frames, height * width, 1, 3 * channels), 3, axis=-1)
-        attended = jax.nn.dot_product_attention(query, key, value).reshape(batch * frames, height, width, channels)
+        query, key, value = jnp.split(
+            qkv.reshape(batch * frames, height * width, 1, 3 * channels), 3, axis=-1
+        )
+        attended = jax.nn.dot_product_attention(query, key, value).reshape(
+            batch * frames, height, width, channels
+        )
         out = Conv(channels, (1, 1), dtype=self.dtype, name="attention_out")(attended)
         return out.reshape(x.shape) + x
 
@@ -141,7 +147,9 @@ class _Downsample(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        conv = Conv(self.features, (3, 3), strides=2, padding=((0, 1), (0, 1)), dtype=self.dtype, name="resample_1")
+        conv = Conv(
+            self.features, (3, 3), strides=2, padding=((0, 1), (0, 1)), dtype=self.dtype, name="resample_1"
+        )
         x = _frames(conv, x)
         if not self.temporal:
             return x
@@ -166,7 +174,9 @@ class _Upsample(nn.Module):
             if x.shape[1] > 1:
                 batch, frames, height, width, channels = x.shape
                 later = time_conv(x[:, 1:]).reshape(batch, frames - 1, height, width, 2, channels)
-                later = later.transpose(0, 1, 4, 2, 3, 5).reshape(batch, 2 * (frames - 1), height, width, channels)
+                later = later.transpose(0, 1, 4, 2, 3, 5).reshape(
+                    batch, 2 * (frames - 1), height, width, channels
+                )
                 x = jnp.concatenate([x[:, :1], later], axis=1)
         x = jnp.repeat(jnp.repeat(x, 2, axis=2), 2, axis=3)
         conv = Conv(self.features // 2, (3, 3), padding=((1, 1), (1, 1)), dtype=self.dtype, name="resample_1")
@@ -300,7 +310,9 @@ def wan_vae_fields(config: Mapping[str, object]) -> WanVAEFields:
     if len(temporal) != len(multipliers) - 1:
         raise ValueError(f"temperal_downsample has {len(temporal)} entries for {len(multipliers)} levels")
     if config.get("attn_scales"):
-        raise ValueError("attention inside the levels (attn_scales) is not ported; the published VAEs have none")
+        raise ValueError(
+            "attention inside the levels (attn_scales) is not ported; the published VAEs have none"
+        )
     if config.get("dropout", 0.0):
         raise ValueError("a frozen autoencoder runs without dropout")
     for name in ("is_residual", "patch_size"):
@@ -351,8 +363,10 @@ class WanAutoencoder(AutoEncoder):
         self.latent_scale = 1.0 / np.asarray(latents_std, np.float32)
         expected = (model.latent,)
         if self.latent_shift.shape != expected or self.latent_scale.shape != expected:
-            raise ValueError(f"latents_mean {self.latent_shift.shape} and latents_std {self.latent_scale.shape} "
-                             f"must both hold one value per latent channel {expected}")
+            raise ValueError(
+                f"latents_mean {self.latent_shift.shape} and latents_std {self.latent_scale.shape} "
+                f"must both hold one value per latent channel {expected}"
+            )
         self._encode = jax.jit(lambda params, video, key=None: model.apply(
             {"params": params}, video, key, method=model.encode))
         self._decode = jax.jit(lambda params, latents: model.apply(
@@ -397,10 +411,14 @@ def load_wan_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str 
     source layouts are returned."""
     from dew.interop import diffusion, sources
 
-    directory = sources.snapshot(str(name_or_dir), revision, weights=(subfolder,) if params is None else False)
+    directory = sources.snapshot(
+        str(name_or_dir), revision, weights=(subfolder,) if params is None else False
+    )
     config = json.loads((directory / subfolder / "config.json").read_text())
     if config.get("_class_name") != "AutoencoderKLWan":
-        raise ValueError(f"{directory / subfolder} holds a {config.get('_class_name')}, not an AutoencoderKLWan")
+        raise ValueError(
+            f"{directory / subfolder} holds a {config.get('_class_name')}, not an AutoencoderKLWan"
+        )
     model = WanVAE(**wan_vae_fields(config), dtype=compute)
     layouts: tuple[WeightLayout, ...] = ()
     if params is None:
@@ -408,8 +426,9 @@ def load_wan_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str 
         params, layouts = diffusion.record_layouts(
             "vae", tensors, lambda name: wan_vae_path(name, np.ndim(tensors[name])), ("autoencoder",),
             param_dtype=param_dtype)
-    video = jax.ShapeDtypeStruct((1, 1 + model.temporal_factor, model.downscale_factor, model.downscale_factor, 3),
-                                 jnp.float32)
+    video = jax.ShapeDtypeStruct(
+        (1, 1 + model.temporal_factor, model.downscale_factor, model.downscale_factor, 3), jnp.float32
+    )
     check_tree({"params": params}, model, video)
     autoencoder = WanAutoencoder(model=model, params=params, latents_mean=config["latents_mean"],
                                  latents_std=config["latents_std"])

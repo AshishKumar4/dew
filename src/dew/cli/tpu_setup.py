@@ -49,7 +49,8 @@ step() { echo "== $*"; }
 step "apt packages"
 if ! command -v gcsfuse >/dev/null || ! command -v rsync >/dev/null; then
   repo="gcsfuse-$(lsb_release -c -s)"
-  echo "deb [signed-by=/usr/share/keyrings/cloud.google.asc] https://packages.cloud.google.com/apt $repo main" \\
+  echo "deb [signed-by=/usr/share/keyrings/cloud.google.asc]" \\
+    "https://packages.cloud.google.com/apt $repo main" \\
     | sudo -n tee /etc/apt/sources.list.d/gcsfuse.list >/dev/null
   curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \\
     | sudo -n tee /usr/share/keyrings/cloud.google.asc >/dev/null

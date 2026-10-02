@@ -30,13 +30,13 @@ from flax import linen as nn, struct
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax.experimental import checkify, multihost_utils
 from jax.typing import ArrayLike
+from typing_extensions import TypeVar
 
 from dew.artifacts import agreed
 from dew.nn.backbones.causal_transformer import gather_cache_rows
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.dspark import DSpark
 from dew.nn.inputs import (
-    ArrayT,
     ModelInputs,
     PredictionPhase,
     RowPlan,
@@ -61,6 +61,8 @@ from dew.sampling.decoding import (
     TopP,
 )
 from dew.sampling.strategies import DecodeOps, DecoderState, Draws, Sample, Strategy
+
+ArrayT = TypeVar("ArrayT", bound=jax.Array | np.ndarray, default=jax.Array, covariant=True)
 
 Transforms = LogitsTransform | Sequence[LogitsTransform]
 Criteria = Stopping | Sequence[Stopping]
@@ -295,11 +297,15 @@ def _prefill(model: nn.Module, params: Variables, inputs: ModelInputs, ops: Deco
     rows, slot = jnp.arange(batch), jnp.maximum(last, 0)
     scored = (inputs.tokens, slot) if selective else (inputs.tokens,)
     answer, updated = model.apply(
-        {**params, "cache": held}, *scored, decode=True,
-        mutable=["cache", "embeddings", *(["prediction_inputs"] if ops.record is not None else [])], rngs=None,
-        method=("states_and_logits_at" if selective else
-                "states_and_logits" if exposed else None), capture_intermediates=False,
-        **inputs.kwargs())
+        {**params, "cache": held},
+        *scored,
+        decode=True,
+        mutable=["cache", "embeddings", *(["prediction_inputs"] if ops.record is not None else [])],
+        rngs=None,
+        method=("states_and_logits_at" if selective else "states_and_logits" if exposed else None),
+        capture_intermediates=False,
+        **inputs.kwargs(),
+    )
     states, logits = answer if exposed or selective else (None, answer)
     if ops.record is not None:
         states = _context(model, params, updated)
@@ -333,7 +339,9 @@ def _empty_cache(model: nn.Module, params: Variables, batch: int, ops: DecodeOps
     """A zeroed decode cache for `batch` rows, with the drafter's own beside it."""
     cache = flatten_dict(dict(model.apply(params, batch, method="init_cache", mutable=["cache"])[1]["cache"]))
     for method in ("init_mtp_cache",) * bool(ops.depths) + ("init_draft_cache",) * (ops.record is not None):
-        cache.update(flatten_dict(dict(model.apply(params, batch, method=method, mutable=["cache"])[1]["cache"])))
+        cache.update(
+            flatten_dict(dict(model.apply(params, batch, method=method, mutable=["cache"])[1]["cache"]))
+        )
     return unflatten_dict(cache)
 
 
@@ -531,11 +539,9 @@ def _generate(model: nn.Module, params: Variables, inputs: ModelInputs, keys: ja
         drawn.behavior_log_probs, drawn.raw_log_probs)
 
 
-def _validated(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray],
-               conditioning: dict[str, jax.Array | np.ndarray], max_new_tokens: int, sampling: Sampling,
-               n: int) -> ModelInputs:
-    """Host checks shared by every caller; returns device inputs whose validity
-    field is present only where a prompt is actually padded."""
+def _check_inputs(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray],
+                  max_new_tokens: int, sampling: Sampling, n: int) -> np.ndarray:
+    """Shared host validation; return validity without placing unused device inputs."""
     if ids.ndim != 2 or min(ids.shape) < 1 or not np.issubdtype(ids.dtype, np.integer):
         raise ValueError("inputs must contain non-empty [B, P] integer token ids")
     if type(max_new_tokens) is not int or max_new_tokens < 0:
@@ -559,6 +565,15 @@ def _validated(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray],
     if vocab is not None and (sampling.pad_id >= vocab or
                              (sampling.eos_id is not None and np.any(np.asarray(sampling.eos_id) >= vocab))):
         raise ValueError("sampling token ids must be inside the vocabulary")
+    return valid
+
+
+def _validated(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray],
+               conditioning: dict[str, jax.Array | np.ndarray], max_new_tokens: int, sampling: Sampling,
+               n: int) -> ModelInputs:
+    """Host checks shared by every caller; returns device inputs whose validity
+    field is present only where a prompt is actually padded."""
+    valid = _check_inputs(model, ids, fields, max_new_tokens, sampling, n)
     token_fields = {name: jnp.asarray(value) for name, value in fields.items()
                     if name != "attention_mask"}
     if not valid.all():
@@ -759,10 +774,13 @@ def _padded(plan: RowPlan, prepared: ModelInputs) -> ModelInputs:
                                          "attention_mask": valid & ~plan.padding[:, None]})
 
 
+_DEFAULT_SAMPLING = Sampling()
+
+
 def generate(model: nn.Module, params: Variables,
              inputs: ModelInputs | ArrayLike | Sequence[Sequence[int]], max_new_tokens: int,
              *, key: int | jax.Array | None = None,
-             sampling: Sampling = Sampling(), n: int = 1, logits: Transforms | None = None,
+             sampling: Sampling = _DEFAULT_SAMPLING, n: int = 1, logits: Transforms | None = None,
              stopping: Criteria | None = None, strategy: Strategy | None = None) -> Generation:
     """Generate from numeric model inputs, with an array shorthand for text.
 

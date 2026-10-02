@@ -101,7 +101,7 @@ def _refuse_to_fork(*args, **kwargs):
 # Slow fetching waits; it never invents data
 # ---------------------------------------------------------------------------------
 
-def test_slow_fetching_waits_instead_of_fabricating_samples(monkeypatch, capsys):
+def test_slow_fetching_waits_instead_of_fabricating_samples(monkeypatch, caplog):
     """A queue timeout waits; a batch of zeros captioned "Timeout occurred
     while waiting for sample" would train as data."""
     def slow(rows, sink, **kwargs):
@@ -115,7 +115,7 @@ def test_slow_fetching_waits_instead_of_fabricating_samples(monkeypatch, capsys)
 
     assert list(batch["caption"]) == [f"sample {i}" for i in range(BATCH)]
     assert [int(image.max()) for image in batch["image"]] == [1, 2, 3, 4]
-    assert "still fetching" in capsys.readouterr().out
+    assert "still fetching" in caplog.text
 
 
 def test_dropped_fetches_are_counted_and_never_yielded(monkeypatch):
@@ -499,7 +499,7 @@ def test_the_streaming_spec_stops_when_its_fetcher_is_gone(monkeypatch):
             next(loader)
 
 
-class Mean(Objective):
+class Ratio(Objective):
     """One scalar fitted to the batch mean: the smallest objective that reads a
     batch, so what is under test is the streaming data path alone."""
 
@@ -514,7 +514,7 @@ class Mean(Objective):
 
 
 def _run(data, *, steps, checkpoints=None, checkpoint_every=None):
-    trainer = Trainer(Mean(), optax.sgd(0.1), key=jax.random.key(0),
+    trainer = Trainer(Ratio(), optax.sgd(0.1), key=jax.random.key(0),
                       mesh=MeshSpec(), layout=Layout(), checkpoints=checkpoints)
     return trainer.fit(data, steps=steps, log_every=steps, eval_every=None,
                        checkpoint_every=checkpoint_every)

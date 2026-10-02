@@ -15,7 +15,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import group_layers
 from dew.nn.inputs import ModelInputs
-from dew.objectives.base import FROZEN, Aux, EMASpec, Mean, Objective, merge
+from dew.objectives.base import FROZEN, Aux, EMASpec, Ratio, Objective, merge
 from dew.objectives.lm import LMObjective
 from dew.training import Layout, Trainer
 from dew.training.host import companion_mesh, transfer
@@ -251,7 +251,7 @@ def test_nonfinite_optimizer_candidate_rolls_back_all_cpu_owned_fields():
 
 
 def test_composite_replay_does_not_apply_effects_twice():
-    class Effects(Objective[Mean | Terms, jax.Array]):
+    class Effects(Objective[Ratio | Terms, jax.Array]):
         ema = Tiny.ema
 
         def __init__(self):
@@ -387,7 +387,7 @@ def test_streamed_banks_train_a_mixed_frozen_root_decoder_like_the_resident_stac
         return "layers_1" not in path and path[-2:] != ("gate_proj", "kernel")
 
     def objective():
-        return LMObjective(decoder(), 8, head_chunks=1, trainable=trainable)
+        return LMObjective(decoder(), 8, head_chunks=1, trainable=trainable, ema_decay=0.999)
 
     batch = tokens()
     resident = updated(objective(), batch, DEVICE)

@@ -288,3 +288,73 @@ def test_a_hub_dataset_holds_its_validation_batches_out_of_training(hub):
     assert batch["image"].shape == (4, SCALE, SCALE, 3)
     # The held-out records, in table order.
     assert list(map(str, batch["caption"])) == _captions(0, 1, 2, 3)
+
+
+# ---------------------------------------------------------------------------------
+# Columns, uncaptioned sets and validation augmentation
+# ---------------------------------------------------------------------------------
+
+def _classes(records=RECORDS, size=IMAGE_SIZE):
+    """A class-labelled image table without captions, laid out as CIFAR-10 is:
+    the image under "img", the class under "label"."""
+    from PIL import Image
+
+    return datasets.Dataset.from_dict({
+        "img": [Image.fromarray(np.random.RandomState(i).randint(0, 256, (size, size, 3), np.uint8))
+                for i in range(records)],
+        "label": [i % 10 for i in range(records)],
+    })
+
+
+@pytest.fixture
+def classes(monkeypatch):
+    monkeypatch.setattr(datasets, "load_dataset", lambda path, split=None, **kwargs: _classes())
+
+
+def test_columns_name_where_an_uncaptioned_class_dataset_keeps_its_fields(classes):
+    data = _hub_images(image_column="img", caption_columns=(), val_batches=1).load(batch=4)
+
+    batch = next(data.val(DataPartition()))
+    assert batch["image"].shape == (4, SCALE, SCALE, 3) and batch["image"].dtype == np.uint8
+    np.testing.assert_array_equal(batch["label"], [0, 1, 2, 3])
+    assert "caption" not in batch
+
+
+def test_an_uncaptioned_dataset_refuses_a_caption_reader(classes):
+    with pytest.raises(TypeError, match="reads no captions"):
+        _hub_images(image_column="img", caption_columns=()).load(batch=4, tokenize=keep_captions)
+
+
+@pytest.mark.parametrize("fields, message", [
+    ({}, r"image_column='image'.*\['img', 'label'\]"),
+    ({"image_column": "img"}, r"caption_columns=\('caption', 'text'\).*caption_columns=\(\)"),
+    ({"image_column": "img", "caption_columns": (), "label_column": "class"},
+     r"label_column='class'"),
+])
+def test_a_column_the_dataset_does_not_have_is_refused_when_it_loads(classes, fields, message):
+    """The refusal used to come from inside grain's reader on the first batch,
+    as a KeyError naming no field of the spec."""
+    with pytest.raises(ValueError, match=message):
+        _hub_images(**fields).load(batch=4)
+
+
+def test_validation_is_scored_on_unaugmented_images_unless_asked(hub):
+    """Training augments; a validation pass that crops, flips and jitters
+    scores different images from the ones a reference metric reads."""
+    def first_validation(**fields):
+        data = HFImages(name="acme/pets", image_size=SCALE, val_batches=1,
+                        loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1),
+                        **fields).load(batch=4, tokenize=keep_captions)
+        return next(data.val(DataPartition()))["image"]
+
+    plain = first_validation(augmentation="none")
+    np.testing.assert_array_equal(first_validation(augmentation="flip_jitter"), plain)
+    assert not np.array_equal(first_validation(augmentation="flip_jitter", augment_validation=True), plain)
+
+
+def test_a_spec_that_holds_validation_out_of_training_says_how_many(hub):
+    """With no val_split the head of the training split is scored; the run
+    says so rather than training on fewer records than the split holds."""
+    assert _hub_images(val_batches=2).load(batch=4).held_out == 8
+    assert _hub_images(val_split="validation", val_batches=2).load(batch=4).held_out == 0
+    assert _hub_images(val_batches=None).load(batch=4).held_out == 0

@@ -34,15 +34,15 @@ assert int(state.step) == 10
 
 ```text
 Training CausalTransformer from step 0 to 10: 2,688 parameters, on 1 × cpu, batch 8, float32
-step  5/10  loss 0.6666  ce 0.6666  perplexity 1.948  token_accuracy 75.0%  step_time_ms 5.879  samples_per_sec 1,361  accepted 100.0%
-eval val at step 5: perplexity 5.283 (8 records in 0.18 s)
-step 10/10  loss 0.2373  ce 0.2373  perplexity 1.268  token_accuracy 87.5%  step_time_ms 37.04  samples_per_sec 216.0  accepted 100.0%
-eval val at step 10: perplexity 5.221 ↓ 1.2% (8 records in 0.00 s)
-Trained 10 steps in 0:00:01: first step after 0.82 s, then 736.2 step/s
-1.2% of the wall time in steps, final loss 0.2373
+step  5/10  loss 0.6666  ce 0.6666  perplexity 1.948  token_accuracy 75.0%  step_time_ms 6.443  samples_per_sec 1,242  accepted 100.0%
+eval val at step 5: perplexity 2.416 (8 records in 0.34 s)
+step 10/10  loss 0.2373  ce 0.2373  perplexity 1.268  token_accuracy 87.5%  step_time_ms 69.95  samples_per_sec 114.4  accepted 100.0%
+eval val at step 10: perplexity 2.500 ↑ 3.5% (8 records in 0.00 s)
+Trained 10 steps in 0:00:03: first step after 2.75 s, then 483.1 step/s
+0.6% of the wall time in steps, final loss 0.2373
 ```
 
-Each row has nine IDs: the model reads the first eight and predicts the last eight, so `seq_len=8`, and `vocab_size=4` makes the valid IDs zero to three. The run logs the training loss at steps five and ten and the validation perplexity at the same steps. Perplexity is the exponential of the cross entropy, weighted by the number of valid targets; lower is better when compared on the same validation data and tokenizer. Validation reads the EMA weights, which this short run has barely moved. This cyclic task does not measure general language ability.
+Each row has nine IDs: the model reads the first eight and predicts the last eight, so `seq_len=8`, and `vocab_size=4` makes the valid IDs zero to three. The run logs the training loss at steps five and ten and the validation perplexity at the same steps. Perplexity is the exponential of the cross entropy, weighted by the number of valid targets; lower is better when compared on the same validation data and tokenizer. Validation scores the weights the run trained; an objective that keeps an EMA (`LMObjective(..., ema_decay=0.999)`) is scored on the average instead, and the line then reads `eval val (ema)`. This cyclic task does not measure general language ability.
 
 ## Artifacts and metrics
 
@@ -70,11 +70,49 @@ Training metrics are named under `train/`, and reduced validation metrics under 
 `key=0` is the same root key as `key=jax.random.key(0)`. The fit record
 also keeps the supplied integer seed.
 
+`Mean` turns per-example values or a `(total, count)` pair into a metric.
+It sums counts across uneven batches, so a small last batch has its own
+weight. Choose `better` and `reads` explicitly: evaluation selects the exact
+artifact type. This LM metric ranks the logits' top-1 accuracy:
+
+```python
+from dew import Checkpoints, Mean
+from dew.artifacts import TokenScores
+
+accuracy = Mean(
+    lambda scores, batch: (np.sum(scores.correct * scores.weights), np.sum(scores.weights)),
+    reads=TokenScores, name="accuracy", better="higher",
+)
+language_model = LMObjective(model, seq_len=8, ema_decay=None)
+run = Trainer(language_model, optax.adam(0.01), key=jax.random.key(0),
+              checkpoints=Checkpoints("runs/lm-accuracy"))
+state = run.fit(
+    data, steps=10, eval_every=5, metrics=[accuracy], best=accuracy,
+)
+run.checkpoints.wait()
+assert run.checkpoints.best is not None
+```
+
+The helper starts a pass from its first contribution and finalizes on the
+host without collectives. A vector counts each example once; a pair can
+carry token counts or fractional weights. A scalar batch mean is refused.
+`TokenScores.correct` comes from the same chunked head as its losses; it
+does not retain a full logits tensor. The unprefixed name `accuracy` is
+reported as `val/accuracy`. Passing `name="val/accuracy"` gives a clear error
+instead of adding the prefix twice.
+
 ## Previews
 
 The trainer calls `Objective.preview` once per evaluation event, only when `fit(preview=True)` is passed, process zero has a tracker, and there is a coordinated batch. A tracker that only takes scalars does not turn previews on. LM previews use the objective's `Samples` configuration. Diffusion draws at most four display samples. Masked diffusion uses its configured preview count. DPO and GRPO preview the live policy, because their EMA holds a frozen reference. The base `preview` reuses the first scoring artifacts, so JEPA's representation histogram needs no second encoder pass. Preview samples never enter the scoring metrics. Without metrics, evaluation skips the scoring work; without a tracker, it skips the preview work.
 
 ## Trackers
+
+Diagnostic messages are separate from scalar and record trackers. Dew logs through Python's
+`"dew"` logger, at `WARNING` level by default, using Rich on stderr; redirected stderr is plain,
+and a live training panel shares its console with the log handler. Change verbosity with
+`logging.getLogger("dew").setLevel(logging.INFO)`. A handler configured on `"dew"` before importing
+Dew is left untouched. To use your application's root handlers instead, remove Dew's handlers
+and set `logging.getLogger("dew").propagate = True`.
 
 `Tracker` has three methods: `log(scalars, step)`, `artifact(value, step)` and `close()`. `Trainer.fit` borrows the tracker; whoever constructed it closes it. When a tracker used as a context manager fails to close while another exception is active, the original exception still surfaces. The trackers are importable from `dew.training`:
 

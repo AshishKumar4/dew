@@ -29,8 +29,9 @@ its PIL image processor.
 import functools
 import json
 import math
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Mapping, NamedTuple, TypedDict
+from typing import NamedTuple, TypedDict
 
 import jax
 import jax.numpy as jnp
@@ -64,7 +65,14 @@ def quick_gelu(x):
     return x * jax.nn.sigmoid(1.702 * x)
 
 
-@logical_axes({("q_proj",): ("embed", "heads"), ("k_proj",): ("embed", "kv"), ("v_proj",): ("embed", "kv"), ("out_proj",): ("attention", "embed")})
+@logical_axes(
+    {
+        ("q_proj",): ("embed", "heads"),
+        ("k_proj",): ("embed", "kv"),
+        ("v_proj",): ("embed", "kv"),
+        ("out_proj",): ("attention", "embed"),
+    }
+)
 class CLIPAttention(nn.Module):
     """Self-attention with a bias on all four projections.
 
@@ -396,7 +404,9 @@ def translate_config(hf_config: Mapping[str, object]) -> TextFields:
         "intermediate_size": records.integer(text["intermediate_size"], "intermediate_size"),
         "num_layers": records.integer(text["num_hidden_layers"], "num_hidden_layers"),
         "num_heads": records.integer(text["num_attention_heads"], "num_attention_heads"),
-        "max_position_embeddings": records.integer(text["max_position_embeddings"], "max_position_embeddings"),
+        "max_position_embeddings": records.integer(
+            text["max_position_embeddings"], "max_position_embeddings"
+        ),
         "layer_norm_eps": records.number(text.get("layer_norm_eps", 1e-5), "layer_norm_eps"),
         "eos_token_id": eos_token_id,
         "activation": activation,
@@ -798,7 +808,15 @@ def _t5_relative_position_bucket(relative_position, bidirectional, num_buckets, 
     return relative_buckets + jnp.where(is_small, relative_position, large)
 
 
-@logical_axes({("q_proj",): ("embed", "heads"), ("k_proj",): ("embed", "kv"), ("v_proj",): ("embed", "kv"), ("out_proj",): ("attention", "embed"), ("rel_bias",): (None, "heads")})
+@logical_axes(
+    {
+        ("q_proj",): ("embed", "heads"),
+        ("k_proj",): ("embed", "kv"),
+        ("v_proj",): ("embed", "kv"),
+        ("out_proj",): ("attention", "embed"),
+        ("rel_bias",): (None, "heads"),
+    }
+)
 class T5SelfAttention(nn.Module):
     """Multi-head self-attention with the relative position bias, no causal
     mask and no 1/sqrt(d) scale, modeling_t5.py `T5Attention` as the encoder

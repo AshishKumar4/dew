@@ -15,10 +15,46 @@ JSON. The `JSON` alias both directions speak is declared here, once.
 
 from __future__ import annotations
 
+import datetime
 import math
+import re
 from collections.abc import Mapping
 
 type JSON = None | bool | int | float | str | list['JSON'] | dict[str, 'JSON']
+
+
+def duration(value: str) -> datetime.timedelta:
+    """A positive recorded duration, in seconds, minutes or hours."""
+    match = re.fullmatch(r'(\d+(?:\.\d+)?)(s|m|h)', value)
+    if match is None:
+        raise ValueError("duration must be positive, such as 30m (s, m and h are supported)")
+    whole, _, fraction = match[1].partition('.')
+    denominator = 10 ** len(fraction)
+    numerator = (
+        (int(whole) * denominator + int(fraction or "0")) * {"s": 1, "m": 60, "h": 3600}[match[2]] * 1_000_000
+    )
+    micros, remainder = divmod(numerator, denominator)
+    # timedelta's nearest-microsecond, ties-to-even rounding, without a
+    # floating conversion or ambient decimal context.
+    if remainder * 2 > denominator or (remainder * 2 == denominator and micros % 2):
+        micros += 1
+    if micros <= 0:
+        raise ValueError("duration must be positive and representable in microseconds")
+    return datetime.timedelta(microseconds=micros)
+
+
+def recorded_duration(value: datetime.timedelta) -> str:
+    """One canonical spelling, preserving timedelta's microsecond precision."""
+    micros = (value.days * 86400 + value.seconds) * 1_000_000 + value.microseconds
+    if micros <= 0:
+        raise ValueError("duration must be positive")
+    if micros % 3_600_000_000 == 0:
+        return f'{micros // 3_600_000_000}h'
+    if micros % 60_000_000 == 0:
+        return f'{micros // 60_000_000}m'
+    seconds, fraction = divmod(micros, 1_000_000)
+    tail = f'.{fraction:06d}'.rstrip('0') if fraction else ''
+    return f'{seconds}{tail}s'
 
 
 def integer(value: object, key: str) -> int:

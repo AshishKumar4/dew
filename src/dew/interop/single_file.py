@@ -104,9 +104,13 @@ def _text_encoder(name: str, class_name: str, checkpoint: Mapping[str, torch.Ten
     if utils.is_open_clip_model(checkpoint):
         return utils.convert_open_clip_checkpoint(stand_in, checkpoint, prefix="cond_stage_model.model.")
     if fits("open_clip_sdxl"):
-        return utils.convert_open_clip_checkpoint(stand_in, checkpoint, prefix="conditioner.embedders.1.model.")
+        return utils.convert_open_clip_checkpoint(
+            stand_in, checkpoint, prefix="conditioner.embedders.1.model."
+        )
     if utils.is_open_clip_sdxl_refiner_model(checkpoint):
-        return utils.convert_open_clip_checkpoint(stand_in, checkpoint, prefix="conditioner.embedders.0.model.")
+        return utils.convert_open_clip_checkpoint(
+            stand_in, checkpoint, prefix="conditioner.embedders.0.model."
+        )
     return None
 
 
@@ -135,7 +139,10 @@ def pipeline_index(configs: Path) -> Mapping[str, object]:
     from diffusers.loaders.single_file import SINGLE_FILE_OPTIONAL_COMPONENTS
 
     index = json.loads((configs / "model_index.json").read_text())
-    return {name: [None, None] if name in SINGLE_FILE_OPTIONAL_COMPONENTS else spec for name, spec in index.items()}
+    return {
+        name: [None, None] if name in SINGLE_FILE_OPTIONAL_COMPONENTS else spec
+        for name, spec in index.items()
+    }
 
 
 def converted(checkpoint: Mapping[str, torch.Tensor], configs: Path,
@@ -162,9 +169,11 @@ def _configs(repo: str) -> Path:
     except GatedRepoError as error:
         raise PermissionError(
             f"this checkpoint's configs come from {repo}, which is gated on the Hub: accept its license at "
-            f"https://huggingface.co/{repo} and log in (`hf auth login`), or put the file in a local diffusers "
+            f"https://huggingface.co/{repo} and log in (`hf auth login`), "
+            "or put the file in a local diffusers "
             "directory holding model_index.json and its component configs and load that directory with "
-            "single_file=") from error
+            "single_file="
+        ) from error
 
 
 def _metadata(configs: Path) -> list[Path]:
@@ -223,10 +232,14 @@ def unpacked(path: str | os.PathLike[str], configs: Path | None = None,
     when the caller's block exits without an error, so an interrupted or
     failed load leaves nothing cached.
     """
-    missing = [name for name in ("diffusers", "huggingface_hub", "torch") if importlib.util.find_spec(name) is None]
+    missing = [
+        name for name in ("diffusers", "huggingface_hub", "torch") if importlib.util.find_spec(name) is None
+    ]
     if missing:
-        raise ImportError(f"a single-file checkpoint converts through diffusers' key maps, which run in torch, "
-                          f"and {missing} are not installed; {INSTALL}")
+        raise ImportError(
+            f"a single-file checkpoint converts through diffusers' key maps, which run in torch, "
+            f"and {missing} are not installed; {INSTALL}"
+        )
 
     source = Path(path)
     checkpoint: dict[str, torch.Tensor] = {}
@@ -273,8 +286,11 @@ def unpacked(path: str | os.PathLike[str], configs: Path | None = None,
                 missing.append(name)
                 continue
             weights = "diffusion_pytorch_model.safetensors" if library == "diffusers" else "model.safetensors"
-            write_file({key: host_view(value.contiguous(), f"{name}'s {key}") for key, value in tensors.items()},
-                       staging / name / weights, {"format": "pt"})
+            write_file(
+                {key: host_view(value.contiguous(), f"{name}'s {key}") for key, value in tensors.items()},
+                staging / name / weights,
+                {"format": "pt"},
+            )
         if missing:
             # The Hub snapshot and the local directory are both read by
             # `weight_files`' rule, so a precision variant or non-EMA copy

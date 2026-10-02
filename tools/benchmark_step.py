@@ -153,6 +153,9 @@ class Case:
     dtype: str | None = None
     """Compute dtype, written into the model config by the precision policy;
     None takes the run's --dtype."""
+    matmul_precision: str | None = None
+    """What every matmul asks XLA for (`ModelConfig.matmul_precision`), written
+    into a model that declares `precision`; None keeps the model's own."""
     batch_size: int = 8
     accumulation: int = 1
     """Microbatches of `batch_size` rows the trainer pools into one optimizer
@@ -563,6 +566,10 @@ class BenchmarkConfig:
     stay fp32 either way."""
     attention_impl: Literal['auto', 'reference', 'xla', 'cudnn', 'tpu'] = 'auto'
     """Attention kernel, through the same precision policy a recipe uses."""
+    fixed_batch: bool = False
+    """Reuse one placed batch in every step, as tools/benchmark_torch.py does
+    without --h2d. Unset, each step takes a fresh placement of the host batch
+    from DevicePrefetchIterator, as Trainer.fit does."""
     xla_flags: str | None = None
     """Appended to XLA_FLAGS before the first JAX call, as TrainerConfig.xla_flags
     is. A flag only takes effect in a process that has not opened a backend
@@ -668,7 +675,8 @@ def build_objective(case: Case, attention_impl: str = 'auto', *, widened: bool =
         dtype = case.dtype
 
     def built(architecture: str, config: Mapping[str, object]):
-        fields = with_precision(architecture, config, dtype=dtype, attention_impl=attention_impl)
+        fields = with_precision(architecture, config, dtype=dtype, attention_impl=attention_impl,
+                                matmul_precision=case.matmul_precision)
         return models.build(architecture, **(float64_twin(fields) if widened else fields))
 
     sample_key = "video" if case.frames else "image"
@@ -1012,7 +1020,8 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
         compile_seconds = time.perf_counter() - compile_start
 
         def step(state):
-            state, loss, _, finite, _ = compiled(state, next(source))
+            batch = initial_batch if config.fixed_batch else next(source)
+            state, loss, _, finite, _ = compiled(state, batch)
             return state, loss, finite
 
         # At least one warm step, so the first dispatch of the executable is
@@ -1085,6 +1094,7 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
             "canvases_per_row": 0 if case.canvas is None else canvas_split(case)[2],
             "dtype": case.dtype,
             "attention_impl": config.attention_impl,
+            "fixed_batch": config.fixed_batch,
             "xla_flags": config.xla_flags,
             "devices": trainer.device_mesh.devices.size,
             "device_kind": jax.devices()[0].device_kind,

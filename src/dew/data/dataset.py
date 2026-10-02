@@ -28,23 +28,28 @@ import dataclasses
 import functools
 import itertools
 import json
+import logging
 import math
 import sys
 import threading
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Callable, Iterator, Mapping, Protocol, Sequence, overload, runtime_checkable
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from typing import TYPE_CHECKING, Protocol, overload, runtime_checkable
 
 import grain.python as pygrain
 import jax
 import numpy as np
 import tyro
 from absl import flags
+from numpy.typing import ArrayLike
 
 from dew import position
 
 # `Batch` lives in dew.objectives.base. The data layer imports it from here
 # so a dataset module needs one import for the value and its shape.
 from dew.objectives.base import Batch
+
+_log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
@@ -145,6 +150,52 @@ type Indexed = Records | Sequence[Batch]
 """Records read by index: a source that answers grain's two methods, or a
 plain sequence of them. A spec that lists its records in memory hands over
 the sequence, the way the video specs list their clips."""
+
+type InMemory = Mapping[str, ArrayLike] | Indexed
+"""Records a caller holds, for `Dataset.from_records`: columns whose first
+axis is the record, or anything `Indexed`."""
+
+
+class Columns:
+    """Reads records out of equal-length columns, one row of each per record.
+
+    The description a saved position compares against names the fields, their
+    per-record shapes and dtypes and the record count; it cannot tell apart
+    two tables of the same layout, as no source description can without
+    reading its data.
+    """
+
+    def __init__(self, columns: Mapping[str, ArrayLike]):
+        held = {name: np.asarray(column) for name, column in columns.items()}
+        if not held:
+            raise ValueError("in-memory records need at least one column")
+        first, *_ = held
+        for name, column in held.items():
+            if column.ndim == 0:
+                raise ValueError(
+                    f"column {name!r} is a single value; a column holds one value per "
+                    f"record along its first axis")
+            if len(column) != len(held[first]):
+                raise ValueError(
+                    f"a column holds one row per record, and {name!r} holds "
+                    f"{len(column)} records and {first!r} holds {len(held[first])}")
+        self._columns = held
+
+    def __len__(self) -> int:
+        return len(next(iter(self._columns.values())))
+
+    def __getitem__(self, index: int) -> Batch:
+        return {name: column[index] for name, column in self._columns.items()}
+
+    def __repr__(self) -> str:
+        fields = ", ".join(f"{name} {column.dtype}{list(column.shape[1:])}"
+                           for name, column in self._columns.items())
+        return f"Columns({fields}; {len(self)} records)"
+
+
+def in_memory(records: InMemory) -> Indexed:
+    """`records` as a source read by index: columns wrapped, the rest as given."""
+    return Columns(records) if isinstance(records, Mapping) else records
 
 
 def json_argument[Options: DataclassInstance](
@@ -290,9 +341,17 @@ class Loading:
     records one worker reads ahead. `worker_buffer` alone counts batches, the
     batches one worker holds ready for the process that trains, because a
     worker stacks the records it read and hands whole batches back.
+
+    No workers is grain's own default: records are read by threads of the
+    process that trains. Worker processes each import the program again, so
+    they cost seconds and a process's memory apiece before the first batch,
+    and pay off only once decoding or augmentation outruns the threads. On
+    two cores of a shared workstation, the first batch of a 100-record
+    pipeline took 17.8 s and 7.07 GiB resident across 33 processes with 32
+    workers, against under 0.1 s and 0.23 GiB with none.
     """
 
-    workers: int = 32
+    workers: int = 0
     threads: int = 64
     read_buffer: int = 128
     worker_buffer: int = 2
@@ -333,16 +392,17 @@ class Loading:
             return None
         line = (f"waiting for {self.workers} grain workers to stop, "
                 f"up to {self.workers * _grain_kill_seconds()} s")
-        timer = threading.Timer(_QUIET_STOP_SECONDS, print, (line,),
-                                {"file": sys.stderr, "flush": True})
+        timer = threading.Timer(_QUIET_STOP_SECONDS, _log.warning, (line,))
         timer.daemon = True
         try:
             timer.start()
         except RuntimeError as refused:
-            print(f"stopping {self.workers} grain workers without a progress line: {refused}",
-                  file=sys.stderr, flush=True)
+            _log.warning("stopping %s grain workers without a progress line: %s", self.workers, refused)
             return None
         return timer
+
+
+_DEFAULT_LOADING = Loading()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -436,7 +496,9 @@ class Dataset:
     global batch and `records` the training records behind it, so
     `steps_per_epoch` is one pass over them. `ramped` sets `ramp` when the
     run grows its batch over its first records, and `batch` is then the batch
-    the ramp ends at.
+    the ramp ends at. `held_out` is how many records of the training split
+    a spec kept back as the validation pass, which `fit` reports when the run
+    starts; 0 when validation is a split of its own or there is none.
 
     Each factory call returns a fresh iterator owned by its caller. Close it
     after use when it exposes close; never close the shared dataset or
@@ -463,12 +525,13 @@ class Dataset:
     records: int | None
     batch: int
     ramp: Ramp | None = None
+    held_out: int = 0
 
     @classmethod
     def from_grain(cls, train: GrainPipeline, *, batch: int,
                    validation: GrainPipeline | None = None,
                    records: int | None = None,
-                   loading: Loading = Loading()) -> Dataset:
+                   loading: Loading = _DEFAULT_LOADING) -> Dataset:
         """Builds a run over grain pipelines a caller built themselves.
 
         The order, the shuffle and what a record becomes are the caller's.
@@ -517,6 +580,38 @@ class Dataset:
             train=training,
             val=None if validation is None else validating,
             records=len(mapped) if records is None and mapped is not None else records,
+            batch=batch,
+        )
+
+    @classmethod
+    def from_records(cls, records: InMemory, *, batch: int, seed: int = 0,
+                     validation: InMemory | None = None,
+                     loading: Loading = _DEFAULT_LOADING) -> Dataset:
+        """Builds a run over records the caller holds: columns, rows or a source.
+
+        `records` is a mapping of columns whose first axis is the record,
+        `{"x": x, "y": y}`, a sequence of per-record mappings, or any source
+        read by index. Training reshuffles them from `seed` every epoch, the
+        stream every spec reads (`train_stream`), so the position a
+        checkpoint saves is a global record count and each process reads its
+        own share of every batch. `validation` is read once, in order, in
+        whole batches.
+        """
+        held = None if validation is None else in_memory(validation)
+        if held is not None and len(held) < batch:
+            raise ValueError(
+                f"{len(held)} validation records, fewer than one batch of {batch}: a "
+                f"pass is whole batches, so it would score nothing")
+        source = in_memory(records)
+        if len(source) < batch:
+            raise ValueError(
+                f"{len(source)} training records, fewer than one batch of {batch}: a "
+                f"batch would hold a record twice and an epoch would take no steps")
+        return cls(
+            train=train_stream(source, [], batch=batch, seed=seed, loading=loading),
+            val=None if held is None else validation_pass(held, [], batch=batch, seed=seed,
+                                                          loading=loading),
+            records=len(source),
             batch=batch,
         )
 
@@ -996,6 +1091,31 @@ def rows_of(batch: Mapping[str, object]) -> int:
     raise ValueError("a batch of scalars holds no records")
 
 
+_UNSTACKED = "Expected all input elements to have the same structure"
+"""How grain's batching starts the error it raises when records' fields do
+not stack. A grain that words it otherwise raises its own error unchanged."""
+
+
+def stacked(reads: Iterator[Batch]) -> Batch:
+    """The next batch of `reads`, with grain's failure to stack its records
+    said in terms of what to change.
+
+    The usual cause is a field of varying length, as token ids are before
+    anything cuts or packs them, and grain's message names the batch's
+    structure rather than the field or the remedy.
+    """
+    try:
+        return next(reads)
+    except ValueError as failed:
+        if not str(failed).startswith(_UNSTACKED):
+            raise
+        raise ValueError(
+            "the records of one batch hold a field in different shapes, and a batch "
+            "stacks each field into one array: cut or pad a variable-length field, such "
+            "as token ids, to one length, or pack documents into fixed windows (Training "
+            "data, Packing). Grain's report of the shapes is the cause below") from failed
+
+
 class GlobalStream:
     """Reads a training stream whose saved position is one global record count.
 
@@ -1034,7 +1154,7 @@ class GlobalStream:
     def __next__(self) -> Batch:
         if self._reads is None:
             self._reads = self._open(self._records)
-        batch = next(self._reads)
+        batch = stacked(self._reads)
         # Counted after the batch: a step the stream did not deliver is not
         # a step a resume may skip.
         self._records += self._batch

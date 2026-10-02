@@ -14,6 +14,7 @@ import ast
 import dataclasses
 import importlib.util
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -77,8 +78,13 @@ def assert_fixture_arrays(written: Path, committed: Path, numerical: dict[str, f
                 np.testing.assert_array_equal(actual, expected, err_msg=name)
 
 
+def assert_fixture_files(written: Path, committed: Path) -> None:
+    assert {p.name for p in written.iterdir() if p.is_file()} == {
+        p.name for p in committed.iterdir() if p.is_file()}
+
+
 def assert_fixture_json(written: Path, committed: Path) -> None:
-    assert {p.name for p in written.iterdir()} == {p.name for p in committed.iterdir()}
+    assert_fixture_files(written, committed)
     for path in committed.glob("*.json"):
         assert json.loads((written / path.name).read_text()) == json.loads(path.read_text()), path.name
 
@@ -177,35 +183,51 @@ def test_vae_tiny_fixture_is_what_the_generator_writes(tmp_path):
 # tools/flaxdiff_reference.py
 # ---------------------------------------------------------------------------
 
-# The modules FlaxDiff's SimpleUDiT and FourierEmbedding import, at the pin.
-FLAXDIFF_SOURCES = ("flaxdiff/__init__.py", "flaxdiff/models/__init__.py",
-                    "flaxdiff/models/attention.py", "flaxdiff/models/common.py",
-                    "flaxdiff/models/hilbert.py", "flaxdiff/models/simple_dit.py",
-                    "flaxdiff/models/simple_unet.py", "flaxdiff/models/simple_vit.py",
-                    "flaxdiff/models/vit_common.py")
+# The modules both pinned models import, including models/__init__.py's UNet.
+FLAXDIFF_COMMON_SOURCES = ("flaxdiff/__init__.py", "flaxdiff/models/__init__.py",
+                          "flaxdiff/models/attention.py", "flaxdiff/models/common.py",
+                          "flaxdiff/models/hilbert.py", "flaxdiff/models/simple_dit.py",
+                          "flaxdiff/models/simple_unet.py", "flaxdiff/models/vit_common.py")
+FLAXDIFF_SOURCES = {
+    "simple_udit": (*FLAXDIFF_COMMON_SOURCES, "flaxdiff/models/simple_vit.py"),
+    "hybrid_dit": (*FLAXDIFF_COMMON_SOURCES, "flaxdiff/models/ssm_dit.py"),
+}
 
 
 @pytest.mark.network
-def test_flaxdiff_fixture_is_what_the_generator_writes(tmp_path):
+@pytest.mark.parametrize("architecture, committed", [
+    ("simple_udit", FIXTURES / "flaxdiff"),
+    ("hybrid_dit", FIXTURES / "flaxdiff" / "hybrid_dit"),
+], ids=["simple_udit", "hybrid_dit"])
+def test_flaxdiff_fixture_is_what_the_generator_writes(tmp_path, architecture, committed):
     """FlaxDiff's own code at the pinned commit writes the committed fixture:
     exact config, weights and inputs, and the output at test_flaxdiff.py's bound."""
     pytest.importorskip("matplotlib")  # FlaxDiff's hilbert module imports it
     import urllib.request
 
     tool = load("flaxdiff_reference")
+    commit = {"simple_udit": tool.COMMIT, "hybrid_dit": tool.HYBRID_COMMIT}[architecture]
     source = tmp_path / "flaxdiff-src"
-    for name in FLAXDIFF_SOURCES:
+    for name in FLAXDIFF_SOURCES[architecture]:
         target = source / name
         target.parent.mkdir(parents=True, exist_ok=True)
-        url = f"https://raw.githubusercontent.com/AshishKumar4/FlaxDiff/{tool.COMMIT}/{name}"
+        url = f"https://raw.githubusercontent.com/AshishKumar4/FlaxDiff/{commit}/{name}"
         with urllib.request.urlopen(url, timeout=60) as response:
             target.write_bytes(response.read())
-    tool.main(["--flaxdiff-path", str(source), "--out", str(tmp_path / "out")])
+    written = tmp_path / "out"
+    # A fresh interpreter keeps one pin's imported modules out of the other pin.
+    subprocess.run([sys.executable, str(REPO_ROOT / "tools" / "flaxdiff_reference.py"),
+                    "--flaxdiff-path", str(source), "--architecture", architecture,
+                    "--out", str(written)], check=True)
 
-    committed = FIXTURES / "flaxdiff"
-    assert_fixture_json(tmp_path / "out", committed)
-    assert_fixture_arrays(tmp_path / "out" / "reference.npz", committed / "reference.npz",
-                          {"output": 1e-6})
+    assert_fixture_files(written, committed)
+    actual = json.loads((written / "config.json").read_text())
+    expected = json.loads((committed / "config.json").read_text())
+    # jax_version records the generating environment, not the fixture's recipe.
+    assert actual.pop("jax_version") == jax.__version__
+    expected.pop("jax_version", None)
+    assert actual == expected
+    assert_fixture_arrays(written / "reference.npz", committed / "reference.npz", {"output": 1e-6})
 
 
 # ---------------------------------------------------------------------------
@@ -213,14 +235,14 @@ def test_flaxdiff_fixture_is_what_the_generator_writes(tmp_path):
 # ---------------------------------------------------------------------------
 
 def token_directory(tmp_path: Path) -> Path:
-    """A byte-tokenized corpus, written by the tool the curve reads from."""
+    """A byte-tokenized corpus, in the directory the curve reads from."""
+    from dew.data import write_tokens
+
     corpus = tmp_path / "corpus.txt"
     corpus.write_text("".join(f"line {i}: the quick brown fox jumps over the lazy dog\n"
                               for i in range(60)))
-    tokenize = load("tokenize_text")
     out = tmp_path / "tokens"
-    tokenize.main(tokenize.TokenizeArgs(input=str(corpus), out=str(out),
-                                        tokenizer="byte", val_fraction=0.1))
+    write_tokens(corpus, out, tokenizer="byte", val_fraction=0.1)
     return out
 
 
@@ -259,8 +281,8 @@ def test_lm_step_parity_records_a_repeatable_fixed_batch_run():
     batch the loss also has to fall, which a loop feeding fresh random
     tokens each step would not show."""
     tool = load("lm_step_parity")
-    config = dict(vocab_size=64, emb_features=16, num_layers=1, num_heads=2,
-                  mlp_features=32, max_seq_len=8)
+    config = {"vocab_size": 64, "emb_features": 16, "num_layers": 1, "num_heads": 2,
+              "mlp_features": 32, "max_seq_len": 8}
 
     first = tool.run(config, batch=8, seq=8, steps=4)
     second = tool.run(config, batch=8, seq=8, steps=4)

@@ -244,20 +244,14 @@ def prepare(
     directory: Path, corpus: Path, family: str, dtype: str, attention_impl: str
 ) -> None:
     import torch
-    from tokenize_text import TokenizeArgs, main as tokenize
+    from dew.data import write_tokens
     from transformers import AutoTokenizer, LlamaConfig, LlamaForCausalLM, MixtralConfig, MixtralForCausalLM
 
     directory.mkdir(parents=True, exist_ok=False)
     text = corpus.read_bytes()
     (directory / "corpus.txt").write_bytes(text)
-    tokenize(
-        TokenizeArgs(
-            input=str(directory / "corpus.txt"),
-            out=str(directory / "tokens"),
-            tokenizer=str(TOKENIZER),
-            val_fraction=0.1,
-        )
-    )
+    write_tokens(directory / "corpus.txt", directory / "tokens", tokenizer=str(TOKENIZER),
+                 val_fraction=0.1)
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER, local_files_only=True)
     fields = dict(
         vocab_size=len(tokenizer),

@@ -14,7 +14,7 @@ unlike the released trainer's earlier float32 score conversion.
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -28,7 +28,7 @@ from dew.diffusion.presets import Preset
 from dew.diffusion.process import Process
 from dew.inputs import InputSpec
 from dew.nn.autoencoders import AutoEncoder
-from dew.objectives.base import Aux, Batch, Mean, Shown, Step, Variables
+from dew.objectives.base import Aux, Batch, Ratio, Shown, Step, Variables
 from dew.objectives.diffusion.objective import VALIDATION_SAMPLES, DiffusionObjective
 from dew.registry import objectives
 from dew.sampling.flow import FlowSDE, FlowTrajectory, GaussianTransition, sample_trajectory
@@ -58,6 +58,11 @@ def _source(inputs: InputSpec, batch: Batch) -> jax.Array:
 
 
 
+_DEFAULT_SDE = FlowSDE()
+_DEFAULT_GUIDANCE = CFG(3.0)
+_DEFAULT_SAMPLER = Euler()
+
+
 @objectives("flow_grpo")
 class FlowGRPOObjective(DiffusionObjective):
     """Train a rectified-flow policy on clipped, coordinate-normalized gradients.
@@ -79,14 +84,14 @@ class FlowGRPOObjective(DiffusionObjective):
     """
 
     # The loss is a policy-gradient surrogate, shown without a direction.
-    shown = {"loss": Shown(), "reward": Shown(better="higher")}
+    shown: Mapping[str, Shown] = {"loss": Shown(), "reward": Shown(better="higher")}
     _ema_is_reference = True
 
     def __init__(self, model: nn.Module, process: Process | Preset, inputs: InputSpec, *,
-                 sde: FlowSDE = FlowSDE(), beta: float = 0.0,
+                 sde: FlowSDE = _DEFAULT_SDE, beta: float = 0.0,
                  clip_range: float = 1e-4, adv_clip_max: float = 5.0,
                  autoencoder: AutoEncoder | None = None,
-                 guidance: CFG | None = CFG(3.0), sampler: Solver = Euler(),
+                 guidance: CFG | None = _DEFAULT_GUIDANCE, sampler: Solver = _DEFAULT_SAMPLER,
                  steps: int = 41, pretrained: Variables | None = None):
         if not math.isfinite(beta) or beta < 0:
             raise ValueError("beta must be finite and non-negative")
@@ -154,7 +159,7 @@ class FlowGRPOObjective(DiffusionObjective):
             jnp.swapaxes(value, 0, 1) for value in (latents, following, times, next_times)))
         return values.T
 
-    def loss(self, params: Variables, batch: Batch, step: Step) -> tuple[Mean, Aux]:
+    def loss(self, params: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
         """Score the clipped policy gradient over the recorded transitions.
 
         The scan carries nothing between transitions; each one contributes
@@ -208,7 +213,7 @@ class FlowGRPOObjective(DiffusionObjective):
             metrics["transition_kl"] = kl / denominator
         if REWARDS_KEY in batch:
             metrics["reward"] = jnp.asarray(batch[REWARDS_KEY], jnp.float32).mean()
-        return Mean(pg + self.beta * kl, mass), Aux(metrics)
+        return Ratio(pg + self.beta * kl, mass), Aux(metrics)
 
     def _draw(self, params: Variables, batch: Batch, key: jax.Array,
               limit: int | None = None) -> tuple[jax.Array, Batch]:

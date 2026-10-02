@@ -60,21 +60,27 @@ def pad_token_rows(rows: Sequence[Sequence[int]] | np.ndarray, *, pad_id: int = 
     if type(pad_id) is not int or not 0 <= pad_id <= limits.max:
         raise ValueError("pad_id must be a nonnegative int32 token id")
     arrays = [np.asarray(row) for row in rows]
-    if not arrays or any(row.ndim != 1 or row.size == 0 or not np.issubdtype(row.dtype, np.integer) for row in arrays):
+    if not arrays or any(
+        row.ndim != 1 or row.size == 0 or not np.issubdtype(row.dtype, np.integer) for row in arrays
+    ):
         raise ValueError("each prompt must contain a nonempty integer token row")
     if any(np.any((row < 0) | (row > limits.max)) for row in arrays):
         raise ValueError("token IDs must be nonnegative int32 values")
     width = max(row.size for row in arrays)
     tokens = np.full((len(arrays), width), pad_id, np.int32)
     valid = np.zeros(tokens.shape, bool)
-    slots = [slice(width - row.size, width) if padding_side == "left" else slice(0, row.size) for row in arrays]
+    slots = [
+        slice(width - row.size, width) if padding_side == "left" else slice(0, row.size) for row in arrays
+    ]
     for index, (row, slot) in enumerate(zip(arrays, slots, strict=True)):
         tokens[index, slot] = row
         valid[index, slot] = True
     padded = {"attention_mask": valid}
     for name, values in (fields or {}).items():
         aligned = [np.asarray(row) for row in values]
-        if len(aligned) != len(arrays) or any(value.shape != row.shape for value, row in zip(aligned, arrays, strict=True)):
+        if len(aligned) != len(arrays) or any(
+            value.shape != row.shape for value, row in zip(aligned, arrays, strict=True)
+        ):
             raise ValueError(f"token field {name!r} must align with the token rows")
         if name == "attention_mask" and any(np.any((row != 0) & (row != 1)) for row in aligned):
             raise ValueError("attention_mask must contain only zero or one")
@@ -86,6 +92,16 @@ def pad_token_rows(rows: Sequence[Sequence[int]] | np.ndarray, *, pad_id: int = 
     if padded["attention_mask"].all():
         del padded["attention_mask"]
     return tokens, padded
+
+
+def host_token_rows(array: np.ndarray) -> np.ndarray:
+    """Integer `[B, S]` token ids normalized on the host without a device round-trip."""
+    if array.ndim != 2 or not np.issubdtype(array.dtype, np.integer):
+        raise ValueError("tokens must be an integer [B, S] array")
+    bounds = np.iinfo(np.int32)
+    if np.any(array < bounds.min) or np.any(array > bounds.max):
+        raise ValueError("token IDs must be representable as int32")
+    return array.astype(np.int32, copy=False)
 
 
 @struct.dataclass
@@ -119,13 +135,7 @@ class ModelInputs:
         elif isinstance(value, jax.Array):
             prepared = cls(value)
         else:
-            array = np.asarray(value)
-            if array.ndim != 2 or not np.issubdtype(array.dtype, np.integer):
-                raise ValueError("tokens must be an integer [B, S] array")
-            bounds = np.iinfo(np.int32)
-            if np.any(array < bounds.min) or np.any(array > bounds.max):
-                raise ValueError("token IDs must be representable as int32")
-            prepared = cls(jnp.asarray(array, jnp.int32))
+            prepared = cls(jnp.asarray(host_token_rows(np.asarray(value))))
         prepared.validate()
         return prepared
 
@@ -138,10 +148,14 @@ class ModelInputs:
                     "mutable", "capture_intermediates", "attention_pairwise_mask",
                     "attention_key_positions"}
         if reserved.intersection(self.token_fields):
-            raise ValueError(f"token_fields cannot contain {sorted(reserved.intersection(self.token_fields))}")
+            raise ValueError(
+                f"token_fields cannot contain {sorted(reserved.intersection(self.token_fields))}"
+            )
         for name, value in self.token_fields.items():
             if value.ndim < 2 or value.shape[:2] != self.tokens.shape:
-                raise ValueError(f"token field {name!r} must start with {self.tokens.shape}, got {value.shape}")
+                raise ValueError(
+                    f"token field {name!r} must start with {self.tokens.shape}, got {value.shape}"
+                )
         for name, value in self.conditioning.items():
             if value.ndim < 1 or value.shape[0] != self.tokens.shape[0]:
                 raise ValueError(f"conditioning {name!r} must have batch size {self.tokens.shape[0]}")

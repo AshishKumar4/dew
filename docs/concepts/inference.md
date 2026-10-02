@@ -28,11 +28,11 @@ data = Dataset(train=lambda partition: iter([{"text": rows}] * 200), val=None,
 model = models.build("causal_transformer", vocab_size=tokenizer.vocab_size,
                      emb_features=64, num_layers=2, num_heads=2, mlp_features=256,
                      max_seq_len=128)
-objective = LMObjective(model, seq_len=64, ema_decay=None)
+objective = LMObjective(model, seq_len=64)
 state = Trainer(objective, optax.adamw(3e-3), key=jax.random.key(0)).fit(
     data, steps=150, log_every=150)
 
-task = objective.pipeline(state, ema=False, processor=RunProcessor(tokenizer))
+task = objective.pipeline(state, processor=RunProcessor(tokenizer))
 result = task(["One day", "The dog"], 20, key=0, n=2)
 for text in result.text:
     print(repr(text))
@@ -98,7 +98,7 @@ A run assembled by hand needs its configuration saved next to the checkpoints be
 
 ## Weights
 
-For the plain LM, image-diffusion and block-diffusion objectives, `ema=True` asks for the moving-average weights and raises if the run or state has no EMA copy, and `ema=False` reads the live weights. `dew.pipeline` and the tasks' `from_run` and `from_pretrained` default to `ema=None`, which takes the EMA copy when the run stored one and the live weights otherwise; `objective.pipeline` defaults to `ema=True`. DPO, GRPO and PPO use the EMA slot for a frozen reference, so their pipelines always publish the trained policy, never the reference. PPO also leaves out the critic.
+For the plain LM, image-diffusion and block-diffusion objectives, `ema=True` asks for the moving-average weights and raises if the run or state has no EMA copy, and `ema=False` reads the live weights. `dew.pipeline`, the tasks' `from_run` and `from_pretrained`, `objective.pipeline` and `export_run` default to `ema=None`, which takes the EMA copy when the run or state has one and the live weights otherwise. DPO, GRPO and PPO use the EMA slot for a frozen reference, so their pipelines always publish the trained policy, never the reference. PPO also leaves out the critic.
 
 `objective.pipeline(state)` picks weights by the same rule and keeps the arrays the trainer has already placed. `LMObjective.policy(params, sampling)` returns a `TextGeneration` bound to the given tree, the task a GRPO rollout samples with. `task.bind(variables)` makes a task over another set of variables; it copies the mapping structure and shares the array buffers, so do not change or donate those arrays while a task uses them.
 
@@ -160,12 +160,14 @@ with SafetensorsBanks("path/to/gpt-oss-20b-BF16",
     variables = stream_banked(model, source)
     generated = jax.block_until_ready(generate(
         model, variables, [[1, 2, 3, 4]], max_new_tokens=8,
-        seed=0, sampling=Sampling(temperature=0.0)))
+        key=0, sampling=Sampling(temperature=0.0)))
 ```
 
 Use a downloaded checkpoint snapshot's local directory for the path. This path accepts unquantized registered decoder families whose translation stays lazy; it refuses a quantized codec or family preparation that might materialize the model. It does not download a Hub repository, load a tokenizer or replace `dew.pipeline`'s resident loader. Tokenize inputs separately, or bind these variables to `TextGeneration` with the matching processor.
 
 `cache_bytes` bounds retained host layers, not the entire process. Complete layers are admitted in read order while they fit and kept until the source closes. A sequential decoder revisits every layer each token, so retaining this prefix avoids the cyclic eviction of a smaller LRU cache. Staging needs up to two host rows plus one leaf's conversion scratch beside that cache. Embeddings, the head, the KV cache and the runtime are separate. Read mapped pages are released; the kernel's shared filesystem cache is not controlled by this budget. Device storage must fit resident entries, two layer rows, activations and the KV cache. Expert tensors stream as part of a whole layer, not just the experts selected for one token. `read_ahead=False` disables the host read-ahead slot.
+
+For `host_banked` and any other pinned-host placement, budget for the allocator's reserve as well as live weights, staging and the runtime. XLA's pinned-host BFC allocator grows its regions in powers of two and retains freed chunks. The GPT-OSS-20B BF16 two-layer prefix on the RTX 4080 (`host_banked`, an eight-token context limit and `SafetensorsBanks(cache_bytes=0)`) held about 1.55 GB of reserve above 3.29 GB of live pinned weights. The sharded array Dew assembles from the per-device buffer shares that buffer, so the reserve is allocator capacity, not a second copy of the weights. A cgroup or container limit can therefore be reached before the computed weight total; the observed reserve is not a fixed overhead to assume for other models.
 
 Streaming is single-device inference only. It requires `scan_layers=True` and a layout without host placement; training, multi-device meshes and pipeline stages are refused. Host callbacks need the CPU backend beside the accelerator: when setting platforms explicitly, use `JAX_PLATFORMS=cuda,cpu` (or `<accelerator>,cpu`) before initializing JAX. Keep the source open until all executions have finished and do not change its files in place. The runtime-only `streaming` collection holds live callback handles, not checkpoint weights: this path saves nothing through `Checkpoints`, and its variables tree is not a resident checkpoint to save or export. The original safetensors directory remains the checkpoint.
 
@@ -267,7 +269,21 @@ Calling the server with a batch submits every prompt, steps until they finish an
 
 With the default dense cache every served request draws the tokens it would draw alone. `prefix_cache` hashes each page together with everything before it, and `Server.reload(variables)` stops sharing the pages the old weights wrote. `Sample(guided.json_schema(tokenizer, schema, eos_id))` or `Sample(guided.regex(tokenizer, pattern, eos_id))` as the task's strategy keeps every draw inside the grammar, served or not. The automaton comes from `outlines-core` (`pip install dewml[guided]`), and a transform that forces a token the grammar forbids fails the request.
 
-On TPU, a paged bfloat16 cache decodes through the Pallas kernel `jax.experimental.pallas.ops.tpu.paged_attention`. It runs when the layer's `attention_impl` is `'auto'` or `'tpu'` and the decode mask is exactly the rows' filled slots, with no window, sinks, image groups, pairwise mask or QK-Clip sow. Every other paged decode gathers its pages and runs the ordinary attention kernels. GPUs always take the gather, because jax deprecated its Triton paged kernel (`ops.gpu.paged_attention`), which on an A100 ran at 5967 tokens/s against the gather's 5848.
+On TPU, a paged bfloat16 cache decodes through the Pallas kernel `jax.experimental.pallas.ops.tpu.paged_attention`. On supported CUDA devices, a full-precision BF16 pool with 16-token-aligned pages uses cuDNN's native paged forward. The GPU path requires `'auto'` or `'cudnn'`, cuDNN-compatible heads, no logit softcap and no reference-only precision request. Both paths require one query per row whose mask is exactly the filled slots, with no window, sinks, image groups, pairwise mask or QK-Clip sow. Grouped pools, quantized storage and other masks keep the existing gather and ordinary attention path. The GPU VJP also uses that gathered path; forward-mode attention uses the existing forward-mode context.
+
+Dense storage remains the default. Paging is opt-in for pooled storage and prefix sharing. On an RTX 4080, Qwen3-0.6B with BF16 storage and compute, 256-token prompts, 128 greedy output tokens with EOS ignored, capacity 384, 16-token pages, admission 8 and one decode iteration per call gave these warm output-token rates (medians of three runs):
+
+| Slots | Old paged gather (tokens/s) | Native GPU paged forward (tokens/s) |
+|---|---:|---:|
+| 32 | 3,242 | 4,719 |
+| 64 | 3,399 | 6,087 |
+| 128 | 3,498 | 7,150 |
+
+These numbers compare the old and new **paged** paths, not the default dense path. All 448 requests' 128 greedy tokens and both likelihood arrays were bit-identical before and after the kernel change. Reordered and shared page tests also preserve the old forward values and VJP exactly, within the existing BF16 bound against float64 truth.
+
+BF16 dense and paged prefill can round differently and change near-tie greedy continuations. Across the same 448 random-token prompts, 143 requests first diverged. Replaying each dense prefix gave a maximum logit difference of 0.732 and a maximum dense top-two gap of 0.223. Full-model float64 evaluations of those prefixes put the paged/dense RMS rounding-error ratio at median 0.996 and maximum 1.896, within the existing two-times-reference bound. The maximum-error ratio was at most 1.597. Triangle inequality therefore bounds the two executions' logit difference by three times dense's float64 maximum error; every first-divergence gap and logit difference was below that per-row envelope. This is BF16 precision sensitivity, not a detected page-table or cache-position error. It is also why paging does not replace the dense default.
+
+Verification records are in `/mnt/scratch/dew/runs/serving-attention`: `native-real.json`, `paged-old.json`, the generation archives, `paged-precision-envelope.json`, and the float64 truth chunks `fp64-chunk0.npz`, `fp64-chunk48.npz`, `fp64-chunk96.npz`. The throughput table predates the separate BF16 vocabulary-head output-rounding change; it holds that arithmetic fixed on both sides.
 
 ### Cache quality
 

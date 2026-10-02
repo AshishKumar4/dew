@@ -394,7 +394,7 @@ This decoder trains on TinyStories, a corpus of short stories in simple English,
 ```bash
 hf download roneneldan/TinyStories TinyStoriesV2-GPT4-valid.txt \
     --repo-type dataset --local-dir data
-python tools/tokenize_text.py --input data/TinyStoriesV2-GPT4-valid.txt \
+dew tokenize --input data/TinyStoriesV2-GPT4-valid.txt \
     --out data/tinystories --tokenizer gpt2
 ```
 
@@ -431,7 +431,7 @@ On one Colab L4 GPU the run takes about three minutes. The training loss falls f
 
 `temperature=0` selects the highest-probability token. GPU reductions are not bitwise repeatable by default, so a second run can continue differently after the first sentence. Validation uses EMA weights, which lag the live parameters during a short run: at step 1,000 their perplexity is 29.3.
 
-`PackedTokens` packs whole documents into the windows instead, with segment IDs and positions; it splits the stream at the EOS ID that `tools/tokenize_text.py --pack` records. `ChatMessages` reads conversations from a parquet file, a JSONL file or a Hub dataset id, renders them with the tokenizer's chat template and tracks token roles. Set `LMObjective(loss_role=Role.ASSISTANT)` to train only on assistant targets. See [language models](docs/concepts/language_models.md) for checkpoint loading and text tokenization.
+`PackedTokens` packs whole documents into the windows instead, with segment IDs and positions; it splits the stream at the EOS ID that `dew tokenize --pack` records. `ChatMessages` reads conversations from a parquet file, a JSONL file or a Hub dataset id, renders them with the tokenizer's chat template and tracks token roles. Set `LMObjective(loss_role=Role.ASSISTANT)` to train only on assistant targets. See [language models](docs/concepts/language_models.md) for checkpoint loading and text tokenization.
 
 ### Supervised fine-tuning
 
@@ -461,7 +461,6 @@ sft_objective = LMObjective(
     seq_len=len(row) - 1,
     pretrained=lm_state.params,
     loss_role=Role.ASSISTANT,
-    ema_decay=None,
 )
 sft_state = Trainer(
     sft_objective,
@@ -729,13 +728,13 @@ row = np.resize(np.array([1, 2, 3, 4], np.int32), 17)
 batch = {"text": np.tile(row, (4, 1))}
 stream = grain.MapDataset.source([batch]).repeat().to_iter_dataset()
 data = Dataset(train=lambda partition: iter(stream), val=None, records=4, batch=4)
-objective = LMObjective(model, seq_len=16, ema_decay=None)
+objective = LMObjective(model, seq_len=16)
 checkpoints = Checkpoints("runs/custom-decoder")
 state = Trainer(objective, optax.adamw(0.003), key=jax.random.key(0),
                 checkpoints=checkpoints).fit(data, steps=40, log_every=20,
                                              checkpoint_every=40)
 checkpoints.wait()
-task = objective.pipeline(state, ema=False)
+task = objective.pipeline(state)
 result = task([[1, 2]], 8, key=jax.random.key(1), sampling=Sampling(temperature=0))
 print(np.asarray(result.tokens))
 ```
@@ -753,8 +752,6 @@ combine one with `checkpoint_every`. `objective.pipeline` returns the
 An objective can train an ordinary Linen module. This example learns `y = 2x + 1` with a single dense layer.
 
 ```python
-import itertools
-
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
@@ -776,9 +773,7 @@ class Regression(Objective):
         return loss, Aux(metrics={"mse": loss})
 
 x = np.linspace(-1, 1, 32, dtype=np.float32).reshape(32, 1)
-batch = {"x": x, "y": 2 * x + 1}
-data = Dataset(train=lambda partition: itertools.repeat(batch),
-               val=None, records=32, batch=32)
+data = Dataset.from_records({"x": x, "y": 2 * x + 1}, batch=32)
 objective = Regression()
 state = Trainer(objective, optax.sgd(0.1), key=jax.random.key(0)).fit(
     data, steps=100, log_every=25)
@@ -1105,7 +1100,7 @@ byte-level BPE tokenizer committed for the tests, and the corpus is the
 TinyStories file that [Language modeling](#language-modeling) downloads:
 
 ```bash
-python tools/tokenize_text.py \
+dew tokenize \
     --input data/TinyStoriesV2-GPT4-valid.txt \
     --out runs/tokens \
     --tokenizer tests/fixtures/tokenizers/tiny-tools
@@ -1137,7 +1132,7 @@ model = models.build("causal_transformer", vocab_size=meta["vocab_size"],
                      emb_features=128, num_layers=4, num_heads=4, num_kv_heads=2,
                      mlp_features=256, max_seq_len=128, dtype="float32",
                      qk_norm=False, tie_embeddings=False)
-state = Trainer(LMObjective(model, seq_len=128, ema_decay=None),
+state = Trainer(LMObjective(model, seq_len=128),
                 optax.adamw(3e-3), key=jax.random.key(0)).fit(
     data, steps=400, log_every=200)
 
@@ -1247,7 +1242,7 @@ Use the same script on each host. The example below uses two hosts with two visi
 Prepare byte-token data from your corpus and place it on shared storage:
 
 ```bash
-python tools/tokenize_text.py \
+dew tokenize \
     --input corpus.txt \
     --out /shared/tokens \
     --tokenizer byte \

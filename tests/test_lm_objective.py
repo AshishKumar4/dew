@@ -287,6 +287,13 @@ def test_init_builds_the_tree_from_int32_ids():
     assert params["params"]["lm_head"]["kernel"].shape == (16, VOCAB)
 
 
+def test_an_lm_keeps_no_average_unless_asked():
+    """Validation and previews read an average when one is kept, so an LM
+    keeps none by default: a short run then scores the weights it trained."""
+    assert make_objective().ema is None
+    assert make_objective(ema_decay=0.999).ema is not None
+
+
 def test_the_ema_tracks_the_whole_parameter_tree():
     ema = make_objective(ema_decay=0.995).ema
     assert ema.select(("params", "anything"))
@@ -350,6 +357,21 @@ def test_the_objective_trains_through_the_trainer(tmp_path, fsdp):
 
 
 # --- evaluation ------------------------------------------------------------
+
+def test_evaluation_correctness_is_the_same_full_forward_argmax():
+    from dew import models
+
+    model = models.build("causal_transformer", vocab_size=8, emb_features=16, num_layers=1, num_heads=2,
+                              mlp_features=32, max_seq_len=8, attention_impl="reference")
+    objective = LMObjective(model, seq_len=4, ema_decay=None, token_accuracy=False)
+    tokens = jnp.asarray([[1, 2, 3, 4, 1], [4, 3, 2, 1, 4]], jnp.int32)
+    params = objective.init(jax.random.key(0))
+    scores = objective.evaluate(params, {"text": tokens}, Step(jnp.asarray(0), jax.random.key(1), None))
+    logits = model.apply(params, tokens[:, :-1], train=False)
+    expected = jnp.argmax(logits, axis=-1) == tokens[:, 1:]
+    np.testing.assert_array_equal(np.asarray(scores.correct), np.asarray(expected))
+    assert scores.correct.shape == scores.losses.shape == scores.weights.shape
+
 
 def test_evaluation_scores_every_target_of_the_batch():
     objective = make_objective()
@@ -425,8 +447,8 @@ def test_perplexity_weighs_every_batch_by_its_counted_targets():
     gets wrong the moment counts differ."""
     metric = metrics.perplexity()
     assert metric.reads is TokenScores
-    heavy = TokenScores(losses=jnp.full((1, 4), 1.0), weights=jnp.ones((1, 4)))
-    light = TokenScores(losses=jnp.full((1, 4), 3.0), weights=jnp.array([[1.0, 0, 0, 0]]))
+    heavy = TokenScores(losses=jnp.full((1, 4), 1.0), weights=jnp.ones((1, 4)), correct=jnp.zeros_like(jnp.full((1, 4), 1.0), dtype=bool))
+    light = TokenScores(losses=jnp.full((1, 4), 3.0), weights=jnp.array([[1.0, 0, 0, 0]]), correct=jnp.zeros_like(jnp.full((1, 4), 3.0), dtype=bool))
 
     score = metric.finalize(metric.merge(metric(heavy, None), metric(light, None)))
 
@@ -436,8 +458,8 @@ def test_perplexity_weighs_every_batch_by_its_counted_targets():
 
 def test_a_batch_with_no_counted_target_weighs_nothing():
     metric = metrics.perplexity()
-    scored = TokenScores(losses=jnp.full((1, 4), 2.0), weights=jnp.ones((1, 4)))
-    empty = TokenScores(losses=jnp.zeros((1, 4)), weights=jnp.zeros((1, 4)))
+    scored = TokenScores(losses=jnp.full((1, 4), 2.0), weights=jnp.ones((1, 4)), correct=jnp.zeros_like(jnp.full((1, 4), 2.0), dtype=bool))
+    empty = TokenScores(losses=jnp.zeros((1, 4)), weights=jnp.zeros((1, 4)), correct=jnp.zeros_like(jnp.zeros((1, 4)), dtype=bool))
 
     assert metric.finalize(metric.merge(metric(scored, None), metric(empty, None))) == pytest.approx(np.exp(2.0))
     with pytest.raises(ValueError, match="no counted target"):
@@ -446,7 +468,7 @@ def test_a_batch_with_no_counted_target_weighs_nothing():
 
 def test_perplexity_is_exp_of_the_mean_cross_entropy_not_the_mean_of_exps():
     metric = metrics.perplexity()
-    values = [metric(TokenScores(losses=jnp.full((1, 2), ce), weights=jnp.ones((1, 2))), None)
+    values = [metric(TokenScores(losses=jnp.full((1, 2), ce), weights=jnp.ones((1, 2)), correct=jnp.zeros_like(jnp.full((1, 2), ce), dtype=bool)), None)
               for ce in (0.0, 2.0)]
     expected = np.exp(np.mean([0.0, 2.0]))
     wrong = np.mean(np.exp([0.0, 2.0]))
@@ -473,10 +495,9 @@ def test_the_validation_pass_scores_perplexity_per_token_and_logs_it():
     batches = [token_batch(BATCH, seed=1), padded]
     tracker = RecordingTracker()
     trainer = make_trainer(pad_id=0, tracker=tracker)
-    trainer.fit(Data(cycle_batches, val=lambda: iter(batches)), steps=1, log_every=1,
-                eval_every=1, metrics=(metrics.perplexity(),))
+    state = trainer.fit(Data(cycle_batches, val=lambda: iter(batches)), steps=1, log_every=1,
+                        eval_every=1, metrics=(metrics.perplexity(),))
 
-    state = trainer.initial_state()
     total, count = 0.0, 0.0
     for batch in batches:
         scores = trainer.objective.evaluate(state.params, batch, step_at())
@@ -484,10 +505,9 @@ def test_the_validation_pass_scores_perplexity_per_token_and_logs_it():
         count += float(jnp.sum(scores.weights))
     logged = [s["val/perplexity"] for _, s in tracker.scalars if "val/perplexity" in s]
     assert len(logged) == 1
-    # The initial parameters moved one step before the pass, so the pass
-    # scores are close, not equal; what the assertion pins is the weighting.
+    # The pass scores the weights the step left, so it matches them.
     assert 0 < count < 2 * BATCH * SEQ
-    assert logged[0] == pytest.approx(np.exp(total / count), rel=5e-2)
+    assert logged[0] == pytest.approx(np.exp(total / count), rel=1e-6)
 
 
 # --- packed batches --------------------------------------------------------

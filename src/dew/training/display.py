@@ -26,6 +26,7 @@ import math
 import sys
 import time
 from collections.abc import Mapping, Sequence
+from contextlib import AbstractContextManager
 
 import jax
 from rich import box
@@ -38,6 +39,7 @@ from rich.style import Style
 from rich.table import Table
 from rich.text import Text
 
+from dew.logging import display_console
 from dew.objectives.base import Shown
 from dew.telemetry.records import FitStarted
 from dew.training.evaluation import Evaluation
@@ -146,10 +148,7 @@ def change(first: float, last: float, shown: Shown = PLAIN) -> Text:
         size = ""
     else:
         size = f" {relative:.1%}" if relative < 0.1 else f" {relative:.0%}"
-    if shown.better is None:
-        style = LABEL
-    else:
-        style = BETTER if rising == (shown.better == "higher") else WORSE
+    style = LABEL if shown.better is None else BETTER if rising == (shown.better == "higher") else WORSE
     return Text(arrow + size, style)
 
 
@@ -202,25 +201,31 @@ class TrainingDisplay:
     groups: dict[str, dict[str, Row]] = dataclasses.field(default_factory=dict)
     # Each split's evaluations, in the order they completed.
     evaluations: dict[str, list[Evaluation]] = dataclasses.field(default_factory=dict)
+    # Whether evaluation scores the objective's EMA, which each split's label says.
+    averaged: bool = False
     phase: str = ""
     ended: bool = False
     # How the phase is drawn, not what the display holds: left out of equality.
     spinner: Spinner = dataclasses.field(default_factory=lambda: Spinner("dots", style=ACCENT), compare=False)
     live: Live | None = None
+    _logs: AbstractContextManager[None] | None = dataclasses.field(default=None, compare=False)
 
     @property
     def shown_here(self) -> bool:
         return jax.process_index() == 0
 
     def start(self, started: FitStarted, *, model: str, batch: int, precision: str,
-              shown: Mapping[str, Shown]) -> None:
+              shown: Mapping[str, Shown], averaged: bool) -> None:
         """Open the display with the run's header: the model, its size, where
         it trains, the global batch and the precision. `shown` holds how
-        each metric is shown, by its name after its group's prefix."""
+        each metric is shown, by its name after its group's prefix, and
+        `averaged` says evaluation scores the EMA rather than the live
+        weights."""
         self.first = self.current = started.start_step
         self.total = started.target_steps
         self.started = time.perf_counter()
         self.shown = shown
+        self.averaged = averaged
         if not self.shown_here:
             return
         mesh = mesh_text(started.mesh)
@@ -240,6 +245,8 @@ class TrainingDisplay:
         self.phase = "compiling"
         self.live = Live(self, console=console, refresh_per_second=8, vertical_overflow="visible")
         self.live.start()
+        self._logs = display_console(console)
+        self._logs.__enter__()
 
     # --------------------------------------------------------------
     # What the trainer tells it
@@ -275,7 +282,7 @@ class TrainingDisplay:
                 f"{row.name} {number(row.values[-1], row.shown)}" for _, row in self.rows())
             if (rate := self.rate()) and step < self.total:
                 line += f"  {duration((self.total - step) / rate)} left"
-            print(line, flush=True)
+            self.note(line)
 
     def evaluation(self, evaluation: Evaluation) -> None:
         self.phase = ""
@@ -285,7 +292,7 @@ class TrainingDisplay:
         counts = f"{evaluation.records} records in {evaluation.elapsed_seconds:.2f} s"
         if evaluation.uneven_shards:
             counts += ", uneven shards"
-        self.note(f"eval {evaluation.split} at step {evaluation.step}: "
+        self.note(f"eval {self.label(evaluation.split)} at step {evaluation.step}: "
                   f"{self.scores(evaluation).plain} ({counts})", style=LABEL)
 
     def note(self, text: str, *, style: Style | str | None = None) -> None:
@@ -295,14 +302,19 @@ class TrainingDisplay:
         if self.live is not None:
             self.live.console.print(Text(text, style=style or ""))
         else:
-            print(text, flush=True)
+            Console().print(Text(text), soft_wrap=True)
 
     def close(self) -> None:
         """Stop the live panel, leaving its last frame on the screen."""
-        if self.live is not None:
-            self.ended = True
-            self.live.stop()
-        self.live = None
+        try:
+            if self.live is not None:
+                self.ended = True
+                self.live.stop()
+        finally:
+            self.live = None
+            if self._logs is not None:
+                self._logs.__exit__(None, None, None)
+                self._logs = None
 
     def summary(self, step: int, seconds: float, goodput: Mapping[str, float],
                 loss: float | None) -> None:
@@ -339,7 +351,7 @@ class TrainingDisplay:
             rows.append(("final loss", Text(number(loss), "bold")))
         for split, history in self.evaluations.items():
             evaluation = history[-1]
-            rows.append((f"{split} at {evaluation.step}", self.scores(evaluation, history=True)))
+            rows.append((f"{self.label(split)} at {evaluation.step}", self.scores(evaluation, history=True)))
         table = Table.grid(padding=(0, 2))
         table.add_column(style=LABEL, justify="right")
         table.add_column()
@@ -352,6 +364,10 @@ class TrainingDisplay:
     # --------------------------------------------------------------
     # The panel
     # --------------------------------------------------------------
+
+    def label(self, split: str) -> str:
+        """The split's name, marked when its scores are of the averaged weights."""
+        return f"{split} (ema)" if self.averaged else split
 
     def rows(self) -> list[tuple[str, Row]]:
         """The metrics to show as (group, row) pairs, grouped in the order
@@ -383,7 +399,8 @@ class TrainingDisplay:
             for name in latest.scores:
                 bare = name.removeprefix(split + "/")
                 values = collections.deque(record.scores[name] for record in history if name in record.scores)
-                rows.append((f"{split} · step {latest.step}", Row(bare, self.shown.get(bare, PLAIN), values)))
+                rows.append((f"{self.label(split)} · step {latest.step}",
+                             Row(bare, self.shown.get(bare, PLAIN), values)))
         return rows
 
     def rate(self) -> float | None:
@@ -437,7 +454,9 @@ class TrainingDisplay:
 
         if evaluations := self.evaluation_rows():
             parts.append(Text())
-            used = len(console.render_lines(Group(*parts), options.update(width=inner, height=None), pad=False))
+            used = len(
+                console.render_lines(Group(*parts), options.update(width=inner, height=None), pad=False)
+            )
             parts.append(self.metrics(evaluations, inner, options.size.height - used - 4, evaluation=True))
 
         title = Text.assemble(" ", ("dew", Style(color=Color.from_triplet(END), bold=True)),
@@ -456,7 +475,9 @@ class TrainingDisplay:
         assert isinstance(frame, Text)
         return Text.assemble(" ", frame, " ", (self.phase or "training", LABEL), " ")
 
-    def metrics(self, rows: list[tuple[str, Row]], inner: int, lines: int, *, evaluation: bool = False) -> Table:
+    def metrics(
+        self, rows: list[tuple[str, Row]], inner: int, lines: int, *, evaluation: bool = False
+    ) -> Table:
         """The metrics under their groups' headings, each as its name, its
         value, a sparkline and its change across the sparkline; those that
         have held one value share a line per group. Groups stay whole, and

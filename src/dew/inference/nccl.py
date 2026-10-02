@@ -44,7 +44,7 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -55,6 +55,7 @@ from dew.artifacts import agreed, collective_host
 from dew.nn.inputs import mesh_of
 from dew.objectives.base import Variables
 from dew.records import JSON
+from dew.telemetry.devices import primary_context
 
 from .rollouts import _served, _succeeded
 
@@ -70,7 +71,7 @@ _SUM = 0
 
 
 class _UniqueId(ctypes.Structure):
-    _fields_ = [("internal", ctypes.c_byte * 128)]
+    _fields_: ClassVar = [("internal", ctypes.c_byte * 128)]
 
 
 class _Library:
@@ -84,7 +85,6 @@ class _Library:
 
     def __init__(self, library: str, ordinal: int) -> None:
         self.nccl = ctypes.CDLL(library)
-        self.cuda = ctypes.CDLL("libcuda.so.1")
         self.nccl.ncclGetErrorString.restype = ctypes.c_char_p
         self.nccl.ncclCommInitRank.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_int, _UniqueId,
                                                ctypes.c_int]
@@ -93,11 +93,7 @@ class _Library:
         self.nccl.ncclAllReduce.argtypes = collective
         self.nccl.ncclBroadcast.argtypes = collective
         self.nccl.ncclCommAbort.argtypes = [ctypes.c_void_p]
-        device = ctypes.c_int()
-        self._driver(self.cuda.cuInit(0))
-        self._driver(self.cuda.cuDeviceGet(ctypes.byref(device), ordinal))
-        self.context = ctypes.c_void_p()
-        self._driver(self.cuda.cuDevicePrimaryCtxRetain(ctypes.byref(self.context), device))
+        self.cuda, self.context, _ = primary_context(ordinal)
 
     def _driver(self, status: int) -> None:
         if status != 0:
@@ -233,9 +229,13 @@ class NCCLPush:
         for root in self.engines:
             _post(root, "/pause?mode=wait", None, self.timeout)
             _post(root, "/start_weight_update", None, self.timeout)
-        listing: JSON = {"update_info": {"names": list(names),
-                                         "dtype_names": [str(tensor.dtype) for tensor in tensors],
-                                         "shapes": [[int(size) for size in tensor.shape] for tensor in tensors]}}
+        listing: JSON = {
+            "update_info": {
+                "names": list(names),
+                "dtype_names": [str(tensor.dtype) for tensor in tensors],
+                "shapes": [[int(size) for size in tensor.shape] for tensor in tensors],
+            }
+        }
         failures: list[BaseException] = []
 
         def receive(root: str) -> None:
@@ -278,7 +278,7 @@ class NCCLPush:
                                         "rank_offset": 1, "world_size": 1 + workers, "packed": False}}
             failures: list[BaseException] = []
 
-            def join(root: str = root, body: JSON = body) -> None:
+            def join(root: str = root, body: JSON = body, failures=failures) -> None:
                 try:
                     _post(root, "/init_weight_transfer_engine", body, self.timeout)
                 except BaseException as failure:
@@ -298,7 +298,9 @@ class NCCLPush:
             self._groups[root] = comm
         return library
 
-    def _broadcast(self, library: _Library, target: SingleDeviceSharding, tensors: Sequence[np.ndarray]) -> None:
+    def _broadcast(
+        self, library: _Library, target: SingleDeviceSharding, tensors: Sequence[np.ndarray]
+    ) -> None:
         """Broadcast `tensors` in order to every group, `chunk` bytes resident at a time.
 
         The next chunk's copies are issued before the current chunk broadcasts,

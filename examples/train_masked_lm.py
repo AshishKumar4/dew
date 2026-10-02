@@ -2,7 +2,7 @@
 
 Prepare WikiText or TinyStories with the existing tokenizer tool:
 
-    python tools/tokenize_text.py --input data/wikitext.txt --out data/wikitext --tokenizer byte
+    dew tokenize --input data/wikitext.txt --out data/wikitext --tokenizer byte
     python examples/train_masked_lm.py --tokens data/wikitext --steps 2000
     python examples/train_masked_lm.py --tokens data/wikitext --smoke --out runs/mdlm-smoke
 
@@ -83,7 +83,7 @@ def main(config: Config):
     checkpoints.wait()
     final_loss = float(score(state.params))
     task = objective.pipeline(state, ema=False, processor=RunProcessor(tokenizer))
-    generated = task(config.prompt, config.sample_tokens, seed=1).text[0]
+    generated = task(config.prompt, config.sample_tokens, key=1).text[0]
     (config.out / "sample.txt").write_text(config.prompt + generated + "\n")
     report = {"corpus": str(config.tokens), "train_tokens": meta["train_tokens"],
               "device": jax.devices()[0].device_kind, "steps": int(state.step),

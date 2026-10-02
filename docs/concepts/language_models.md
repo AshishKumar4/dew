@@ -37,7 +37,7 @@ print(len(ids) - held_out, "training tokens,", held_out, "validation tokens")
 48830 training tokens, 2569 validation tokens
 ```
 
-This is the layout `tools/tokenize_text.py` writes: `train.bin` and `val.bin` hold the token IDs back to back, and `meta.json` records the tokenizer, vocabulary size, dtype and counts. The validation split is the head of the stream.
+This is the layout `dew tokenize` writes: `train.bin` and `val.bin` hold the token IDs back to back, and `meta.json` records the tokenizer, vocabulary size, dtype and counts. The validation split is the head of the stream.
 
 ```python
 import jax
@@ -64,18 +64,18 @@ print(tokenizer.decode(continuation.tokens[0]))
 
 ```text
 Training CausalTransformer from step 0 to 300: 147,904 parameters, on 1 × cpu, batch 16, float32
-step 100/300  loss 0.09353  ce 0.09353  perplexity 1.098  token_accuracy 97.2%  step_time_ms 62.10  samples_per_sec 257.6  accepted 100.0%  0:00:11 left
-step 200/300  loss 0.06881  ce 0.06881  perplexity 1.071  token_accuracy 97.7%  step_time_ms 52.80  samples_per_sec 303.0  accepted 100.0%  0:00:06 left
-step 300/300  loss 0.06941  ce 0.06941  perplexity 1.072  token_accuracy 97.8%  step_time_ms 49.44  samples_per_sec 323.6  accepted 100.0%
-eval val at step 300: perplexity 16.68 (32 records in 0.68 s)
-Trained 300 steps in 0:00:19: first step after 2.14 s, then 18.4 step/s
-85.2% of the wall time in steps, final loss 0.06941
+step 100/300  loss 0.09353  ce 0.09353  perplexity 1.098  token_accuracy 97.2%  step_time_ms 29.97  samples_per_sec 533.9  accepted 100.0%  0:00:05 left
+step 200/300  loss 0.06881  ce 0.06881  perplexity 1.071  token_accuracy 97.7%  step_time_ms 34.53  samples_per_sec 463.4  accepted 100.0%  0:00:03 left
+step 300/300  loss 0.06941  ce 0.06941  perplexity 1.072  token_accuracy 97.8%  step_time_ms 36.10  samples_per_sec 443.3  accepted 100.0%
+eval val at step 300: perplexity 1.065 (32 records in 0.93 s)
+Trained 300 steps in 0:00:14: first step after 2.76 s, then 30.0 step/s
+72.9% of the wall time in steps, final loss 0.06941
 One day, Lily saw a big dog in the park. The dog want
 ```
 
 `TokenWindows(seq_len=64)` yields rows of 65 IDs under the key `text`. `LMObjective(model, seq_len=64)` feeds the first 64 to the model and scores the predictions against the next 64. Token IDs must be integers inside the model's vocabulary. `temperature=0.0` picks the most likely token at every step, and the returned row holds the prompt followed by the continuation.
 
-The training loss is near zero because four sentences repeat. Validation reads the EMA copy of the weights (decay 0.999 by default), which after 300 steps still lags the live parameters, so its perplexity is much higher than the training loss. Generation above reads the live `lm_state.params`.
+The training loss is near zero because four sentences repeat, and the held-out head of the same stream scores as low. Validation and the generation above both read the trained `lm_state.params`, since the objective keeps no moving average unless `ema_decay` is set.
 
 ## TinyStories
 
@@ -84,7 +84,7 @@ The same code trains a decoder on TinyStories, a corpus of short stories in simp
 ```bash
 hf download roneneldan/TinyStories TinyStoriesV2-GPT4-valid.txt \
     --repo-type dataset --local-dir data
-python tools/tokenize_text.py --input data/TinyStoriesV2-GPT4-valid.txt \
+dew tokenize --input data/TinyStoriesV2-GPT4-valid.txt \
     --out data/tinystories --tokenizer gpt2
 ```
 
@@ -96,6 +96,7 @@ The measured run changes these settings from the example:
 | Data | `TokenWindows(path="data/tinystories", seq_len=256).load(batch=32)` |
 | Model | `emb_features=256, num_layers=4, num_heads=4, max_seq_len=256, dtype=jnp.bfloat16` |
 | Optimizer | `optax.adamw(1e-3)` |
+| Objective | `LMObjective(model, seq_len=256, ema_decay=0.999)` |
 | Run | `steps=2000, log_every=500, eval_every=1000` |
 | Prompt | `"Once upon a time"`, 40 new tokens, `temperature=0.0` |
 
@@ -109,10 +110,12 @@ GPU reductions are not bitwise repeatable by default, so a second run can contin
 
 Use one tokenizer everywhere: data preparation, model construction, decoding and checkpoint export. `ByteTokenizer` has a vocabulary of 256 and uses ID 255 as its EOS. `HFTokenizer(name)` wraps a Hugging Face tokenizer with that model's vocabulary and chat template, and downloads its files on first use.
 
-`tools/tokenize_text.py` (in a repository checkout) tokenizes a file, or every `.txt` file under a directory, into `train.bin`, `val.bin` and `meta.json`:
+`ByteTokenizer` and `HFTokenizer` have `encode` and `decode`, and `tokenizer_for(name)` returns the first for `"byte"` and the second for any other name. A source loaded with `load_pretrained` carries the checkpoint's own processor instead, which has no `encode`. Call it on text: `bundle.processor(["The capital of France is", "Hello"])` returns `ModelInputs`, whose `tokens` are the id rows padded the way the tokenizer pads and whose `kwargs()` hold the attention mask and positions. `bundle.processor.decode(rows)` turns ids back into strings, and `bundle.processor.chat(messages)` runs the checkpoint's chat template when it has one. `RunProcessor(tokenizer)` in `dew.inference` wraps an `encode`/`decode` tokenizer into the same callable, which is what a task takes as `processor=`. A text-to-image run's captions are tokenized by its condition encoder, for example `CLIPText.tokenize` in `dew.inputs`.
+
+`dew tokenize`, or `dew.data.write_tokens` in Python, tokenizes a file, or every `.txt` file under a directory, into `train.bin`, `val.bin` and `meta.json`:
 
 ```bash
-python tools/tokenize_text.py --input data/corpus.txt --out data/corpus-byte \
+dew tokenize --input data/corpus.txt --out data/corpus-byte \
     --tokenizer byte --val-fraction 0.1
 ```
 
@@ -135,7 +138,7 @@ The binary files use the smallest unsigned dtype that holds the vocabulary. Two 
 
 | Argument | Default | Meaning |
 |---|---|---|
-| `ema_decay` | `0.999` | Decay of the EMA copy. `None` keeps no copy. |
+| `ema_decay` | `None` | Decay of an EMA copy, which evaluation and previews then read. `None` keeps no copy. |
 | `pad_id` | `None` | Token ID whose targets carry no loss. |
 | `head_chunks` | `4` | Vocabulary slices the tiled head scores in. `1` is the full pass. |
 | `head_tile` | `None` | Backward tile of the head, or `'whole'` / `'tiled'`. `None` keeps the whole logits where they fit. |
@@ -155,7 +158,9 @@ The step reports `ce`, `perplexity` and `token_accuracy`. `LMObjective` refuses 
 
 ### Loss and precision
 
-The vocabulary loss runs in float32. The head's product follows the compute dtype, as torch autocast and MaxText run it: under bf16 compute the hidden states and the head multiply as bf16 and sum in float32, backward included, which is 1.5x faster on an L4 and 1.6x faster on an RTX 4080 than fp32 operands. An fp32 model multiplies in fp32 ([Performance measurements](../performance.md)). `token_accuracy=False` (`--no-token-accuracy` on the recipe) skips the argmax over every logit, which costs 0.77 ms of the head's 8.0 ms on a TPU v6e. Chunking the head with `head_chunks` can lower peak memory but adds work, and the backend compiler may rewrite it; the saving depends on vocabulary size, sequence length, batch size and the compiled executable.
+The vocabulary loss runs in float32. The head's product follows the compute dtype, as torch autocast and MaxText run it: under bf16 compute the hidden states and the head multiply as bf16 and sum in float32, backward included, which is 1.5x faster on an L4 and 1.6x faster on an RTX 4080 than fp32 operands. At the default `matmul_precision` (unset or `"default"`) the logits are then rounded to bf16 and their gradient is rounded to bf16 once, as torch autocast's and MaxText's bf16 logits are; the softmax and the loss read them in float32. An fp32 model multiplies in fp32 ([Performance measurements](../performance.md)).
+
+That rounding costs nothing measurable in training. Over 2000 steps of wikitext-103 on an RTX 4080, against float32 logits and a float32 gradient at the same seed, validation loss moved by at most 4.5e-4 for a 3-layer decoder trained from scratch and 1.6e-3 for a Qwen3-0.6B fine-tune; two seeds of either rounding are 1.3e-2 and 2.9e-3 apart on average. It makes the 3-layer decoder's step 13% faster and Qwen3-0.6B's 3% faster at 1 x 1024 tokens. Layout parity is where it shows: with the logits' gradient rounded once, a bf16 run on 4 RTX 3090s read 1.75 times its layout-parity bound at a dense model's final norm and 5758 times it at an MoE's expert gate_proj, against 0.47 and 0.41 with the gradient carried in float32. A run that compares layouts in bf16, or resumes onto a different mesh and expects the same numbers, sets `matmul_precision="highest"`, which keeps the head in float32. `tools/layout_parity.py` sets it for bf16 decoders. An LM run recorded before this change resumes with the new rounding, which is within the rerun spread above but is not bitwise the same as before. `token_accuracy=False` (`--no-token-accuracy` on the recipe) skips the argmax over every logit, which costs 0.77 ms of the head's 8.0 ms on a TPU v6e. Chunking the head with `head_chunks` can lower peak memory but adds work, and the backend compiler may rewrite it; the saving depends on vocabulary size, sequence length, batch size and the compiled executable.
 
 With bf16 compute, Dew keeps the residual stream and every norm and sublayer output in bf16, each rounded where transformers rounds a bf16 tensor, as MaxText and Megatron (with `fp32_residual_connection=False`) do. `torch.autocast` instead keeps the residual stream and the norms in float32 and rounds at each matmul's input. The torch run with Dew's rounding points is autocast with the embedding output and every RMSNorm output cast to bf16 and the rotary table left in float32 (`tools/reference_runs/torch_lm.py --precision autocast-bf16-residual`). At those rounding points the first step's loss depends on the attention kernel as much as on the framework. On the first batch of a Qwen3-0.6B fine-tune (4 x 1024 tokens, one A100, `tools/reference_runs/step0_attention.py`):
 
@@ -171,7 +176,7 @@ Plain `torch.autocast` with FlashAttention 2 sits at +4.9e-4. Over 256 steps of 
 
 ### EMA weights
 
-`state.params` holds the live variables and `state.averaged` the EMA copy merged into them. Evaluation reads the averaged variables when the objective keeps them. With `ema_decay=None`, `state.ema` is `None`, `state.averaged` raises `ValueError`, and previews and evaluation read the live variables. A checkpoint written with one setting does not restore into the other.
+`LMObjective` keeps no moving average unless `ema_decay` is set. Without one, `state.ema` is `None`, `state.averaged` raises `ValueError`, and previews and evaluation read the live variables. With `ema_decay=0.999`, `state.averaged` holds the EMA copy merged into the live variables, evaluation and previews read it, and the console labels the split `val (ema)`. The copy costs one more set of trained parameters. A checkpoint written with one setting does not restore into the other. An `LMRunConfig` record written before this default, which has no `ema_decay` field, reads back as 0.999, the average that run kept.
 
 To measure validation perplexity, give the dataset a validation split and set `eval_every`, as in the example ([Evaluation and tracking](../guides/evaluation.md)). With a tracker and `fit(preview=True)`, `Samples` adds one generated preview per evaluation event, separate from the teacher-forced scoring of the batch.
 
@@ -183,18 +188,32 @@ With gradient accumulation, the cross-entropy and multi-token-prediction (MTP) l
 
 `load_pretrained(name_or_dir)` reads a local Hugging Face directory or a Hub identifier into a `Pretrained` bundle: the native Flax model, its variables, the checkpoint's processor or tokenizer, the source config and the generation defaults. `dew.pipeline(source)` wraps the same loader and returns a `TextGeneration` (a `BlockGeneration` for DiffusionGemma, a `MaskedGeneration` for LLaDA and Dream) with the weights placed on the current devices and the sampling policy and budget taken from the checkpoint.
 
-`bundle.lm_objective(seq_len, **options)` builds an `LMObjective` starting from its loaded weights. With token files prepared using the checkpoint's tokenizer (`tools/tokenize_text.py --tokenizer Qwen/Qwen3-0.6B`), fine-tuning uses the same trainer as training from scratch:
+`bundle.lm_objective(seq_len, **options)` builds an `LMObjective` starting from its loaded weights. With token files prepared using the checkpoint's tokenizer (`dew tokenize --tokenizer Qwen/Qwen3-0.6B`), fine-tuning uses the same trainer as training from scratch:
 
 ```python
 from dew.interop import load_pretrained
 
 data = TokenWindows(path="data/qwen3-tokens", seq_len=512).load(batch=4)
 bundle = load_pretrained("Qwen/Qwen3-0.6B", max_seq_len=512)
-objective = bundle.lm_objective(seq_len=512, ema_decay=None)
+objective = bundle.lm_objective(seq_len=512)
 state = Trainer(objective, optax.adamw(1e-5), key=jax.random.key(0)).fit(data, steps=100)
 ```
 
-This downloads the Hub weights and needs memory for the model, gradients and optimizer. A bundle already supplies the initial variables, so passing `pretrained=` as well is refused. A separately built model can still start from an explicit variables tree, for example after adding an adapter.
+This downloads the Hub weights and needs memory for the model, gradients and optimizer. A bundle already supplies the initial variables, so passing `pretrained=` as well is refused. It also hands the objective its processor, so `objective.pipeline(state)` takes text prompts; `processor=` overrides it.
+
+`bundle.lora(rank=, modules=, key=)` returns the same kind of bundle with a fresh low-rank adapter (LoRA) on the projections `modules` names, PEFT's `target_modules`. Its `lm_objective` trains the adapter's factors and leaves every other weight frozen. `tuned.adapter.save` writes PEFT's adapter directory, and `tuned.save` writes the source's layout with the factors merged into the kernels. Both read the trainer's `state.params` as it comes back:
+
+```python
+key = jax.random.key(0)
+tuned = bundle.lora(rank=8, modules=("q_proj", "v_proj"), key=key)
+objective = tuned.lm_objective(seq_len=512)
+state = Trainer(objective, optax.adamw(1e-4), key=key).fit(data, steps=100)
+tuned.adapter.save(state.params, "qwen3-adapter")
+tuned.save("qwen3-merged", variables=state.params)
+print(objective.pipeline(state)("The capital of France is", 8, key=key).text[0])
+```
+
+`bundle` itself is unchanged; `lora` returns a new value. Calling `lora` on an adapted bundle is refused, as is `trainable=` beside an adapter. `dew.lora.LoRA.fresh` and `LoRA.load` build the same adapter over any model and variables, for a model built from the registry or a pipeline component.
 
 `save_pretrained_decoder` writes a trained `CausalTransformer` in the Hugging Face layout. This exports the decoder from the example and loads it back:
 
@@ -296,7 +315,7 @@ import optax
 from dew.data.dataset import Dataset
 from dew.training import Layout, MeshSpec
 
-mm_objective = bundle.lm_objective(inputs.tokens.shape[1] - 1, ema_decay=None, pad_id=0)
+mm_objective = bundle.lm_objective(inputs.tokens.shape[1] - 1, pad_id=0)
 rows = 2 * jax.device_count()
 batch = inputs.take_rows(jax.numpy.arange(rows) % 2)
 mm_data = Dataset(train=lambda partition: iter([{"text": batch}]), val=None,

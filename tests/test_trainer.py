@@ -11,6 +11,7 @@ import dataclasses
 import gc
 import io
 import json
+import logging
 import os
 import re
 import subprocess
@@ -382,14 +383,14 @@ def test_checkpoint_every_saves_on_its_own_cadence(tmp_path):
     saved = []
     real_save = trainer.checkpoints.save
 
-    def spy(step, state, position, metrics=None, *, share=None, rung=None):
+    def spy(step, state, position, metrics=None, *, share=None, **metadata):
         saved.append((step, None if metrics is None else sorted(metrics)))
-        return real_save(step, state, position, metrics, share=share, rung=rung)
+        return real_save(step, state, position, metrics, share=share, **metadata)
 
     trainer.checkpoints.save = spy
     trainer.fit(Data(), steps=6, log_every=4, checkpoint_every=2)
 
-    assert saved == [(2, ["loss"]), (4, ["loss"]), (6, ["loss"])]
+    assert saved == [(2, ["train/loss"]), (4, ["train/loss"]), (6, ["train/loss"])]
     assert set(trainer.checkpoints._open().all_steps()) == {2, 4, 6}
 
 
@@ -446,7 +447,7 @@ def held_lm_trainer(**settings):
     model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=1,
                               mlp_features=16, max_seq_len=8)
     weights = jax.jit(LMObjective(model, seq_len=4).init)(jax.random.key(0))
-    objective = LMObjective(model, seq_len=4, pretrained=weights)
+    objective = LMObjective(model, seq_len=4, pretrained=weights, ema_decay=0.999)
     return Trainer(objective, optax.adam(1e-3), key=jax.random.key(0),
                    layout=Layout(min_shard=1, tolerance=1.0), **settings), objective, weights
 
@@ -571,26 +572,29 @@ def test_a_resumed_run_compiles_the_rung_its_checkpoint_trained_on(tmp_path, mon
         assert np.asarray(raw_leaf(left)).tobytes() == np.asarray(raw_leaf(right)).tobytes()
 
 
-def test_a_resumed_run_that_cannot_fit_its_checkpoints_rung_climbs_and_says_so(tmp_path, monkeypatch, capsys):
+def test_a_resumed_run_that_cannot_fit_its_checkpoints_rung_climbs_and_says_so(tmp_path, monkeypatch, caplog):
     """A process that cannot fit the rung its checkpoint trained on moves up
     the ladder, never down, and says the run now computes otherwise."""
     split, _, headroom = ladder_lm_trainer(tmp_path / "split", lambda rung: rung[0])
     monkeypatch.setattr(trainer_module, 'step_headroom', headroom)
     split.fit(lm_windows(tmp_path), steps=2, checkpoint_every=2)
-    capsys.readouterr()
+    caplog.clear()
 
     resumed, objective, headroom = ladder_lm_trainer(tmp_path / "split", lambda rung: rung == (True, 'full'))
     monkeypatch.setattr(trainer_module, 'step_headroom', headroom)
     resumed.fit(lm_windows(tmp_path), steps=3, checkpoint_every=2)
     assert trainer_module.remat_record(objective.model.remat) == 'full'
-    assert "the rung its checkpoint trained on" in capsys.readouterr().err
+    assert "the rung its checkpoint trained on" in caplog.text
 
 
 @pytest.mark.skipif(jax.default_backend() != "gpu", reason="CUDA embedding-gradient reductions")
-def test_a_cuda_lm_repeats_and_resumes_bit_exactly_with_deterministic_ops(tmp_path):
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+def test_a_cuda_lm_repeats_and_resumes_bit_exactly_with_deterministic_ops(tmp_path, dtype):
     """Repeated token IDs share embedding-gradient updates. CUDA's default
     scatter-add order is not repeatable; conftest enables deterministic ops
-    before the backend opens. Check every state leaf, not just parameters."""
+    before the backend opens. Check every state leaf, not just parameters.
+    bf16 at the default precision runs the head that rounds its logits and
+    their gradient to bf16, and resumes bit-exactly too."""
     from dew.data import Loading, TokenWindows
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import LMObjective
@@ -605,7 +609,7 @@ def test_a_cuda_lm_repeats_and_resumes_bit_exactly_with_deterministic_ops(tmp_pa
     data = TokenWindows(path=str(tmp_path), seq_len=16,
                         loading=Loading(workers=0)).load(batch=8)
     model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1,
-                              num_heads=2, mlp_features=32, max_seq_len=32)
+                              num_heads=2, mlp_features=32, max_seq_len=32, dtype=dtype)
     objective = LMObjective(model, seq_len=16, ema_decay=None)
 
     def trainer(checkpoints=None):
@@ -1254,13 +1258,20 @@ def test_a_fit_on_a_terminal_of_any_width_shows_every_metric(width, monkeypatch)
     screen = io.StringIO()
     evaluation_budgets = []
     render_metrics = display.TrainingDisplay.metrics
+    advance_step = display.TrainingDisplay.step
 
     def metrics(panel, rows, inner, lines, *, evaluation=False):
         if evaluation:
             evaluation_budgets.append(lines)
         return render_metrics(panel, rows, inner, lines, evaluation=evaluation)
 
+    def step(panel, number):
+        advance_step(panel, number)
+        if number == 2:
+            logging.getLogger("dew.training.test").warning("diagnostic above the live panel")
+
     monkeypatch.setattr(display.TrainingDisplay, "metrics", metrics)
+    monkeypatch.setattr(display.TrainingDisplay, "step", step)
     monkeypatch.setattr(display, "terminal", lambda console: True)
     monkeypatch.setattr(display, "Console", lambda: Console(file=screen, width=width, height=40,
                                                             force_terminal=True, color_system=None))
@@ -1268,6 +1279,7 @@ def test_a_fit_on_a_terminal_of_any_width_shows_every_metric(width, monkeypatch)
                                            metrics=(Spread([]),))
 
     output = screen.getvalue()
+    assert "diagnostic above the live panel" in output
     assert "eval val at step" not in output
     assert evaluation_budgets and max(evaluation_budgets) < 40
     last = output.rpartition("dew · ")[2]
@@ -1275,18 +1287,23 @@ def test_a_fit_on_a_terminal_of_any_width_shows_every_metric(width, monkeypatch)
         assert re.search(rf" {name} +\S", last), last
     assert "val" in last and "step 6" in last, last
     summary = output.rpartition("✓ ")[2]
-    assert "val at 6" in summary and "spread" in summary, summary
+    assert "val (ema)" in summary and "at 6" in summary and "spread" in summary, summary
     if width == 120:
         assert re.search(r"spread +\S+ +[▁▂▃▄▅▆▇█]{2}", last), last
         assert re.search(r"[▁▂▃▄▅▆▇█]{2}", summary), summary
 
 
-def test_off_a_terminal_evaluation_keeps_its_plain_line(capsys):
-    trainer = make_trainer(objective=Features())
+@pytest.mark.parametrize(("averaged", "label"), [(True, r"val \(ema\)"), (False, "val")])
+def test_off_a_terminal_evaluation_keeps_its_plain_line(averaged, label, capsys):
+    """An evaluation of the averaged weights says so beside its split."""
+    objective = Features()
+    if not averaged:
+        objective.ema = None
+    trainer = make_trainer(objective=objective)
     trainer.fit(Data(val=val_batches(3)), steps=6, log_every=2, eval_every=3, metrics=(Spread([]),))
     output = capsys.readouterr().out
-    assert re.search(r"eval val at step 3: spread \S+ \(24 records in \S+ s\)", output), output
-    assert re.search(r"eval val at step 6: spread \S+ .+ \(24 records in \S+ s\)", output), output
+    assert re.search(rf"eval {label} at step 3: spread \S+ \(24 records in \S+ s\)", output), output
+    assert re.search(rf"eval {label} at step 6: spread \S+ .+ \(24 records in \S+ s\)", output), output
 
 
 def test_a_failing_metric_fails_the_validation_pass():
@@ -1759,7 +1776,7 @@ def device_memory(limit, in_use, largest=0, pool=None, platform="gpu"):
     stats = {"bytes_limit": int(limit), "bytes_in_use": int(in_use), "largest_free_block_bytes": int(largest)}
     if pool is not None:
         stats["pool_bytes"] = int(pool)
-    return SimpleNamespace(platform=platform, memory_stats=lambda: stats)
+    return SimpleNamespace(platform=platform, local_hardware_id=0, memory_stats=lambda: stats)
 
 
 def test_a_step_fits_where_one_free_block_holds_its_temporaries(monkeypatch):
@@ -1789,7 +1806,10 @@ def test_a_partitioned_pool_needs_room_for_the_temporaries_twice(monkeypatch):
     block to return to, and the next step needs a second block as large: the
     RTX 4080's 4096-token step, 6.5 GiB of temporaries with 10.45 GiB free in
     one block, failed so in 5 of 16 runs. With the partitioning off it fits."""
+    from dew.training import trainer as module
     from dew.training.trainer import step_headroom
+
+    monkeypatch.setattr(module, "gpu_free_bytes", lambda ordinal: None)
 
     limit = 13.24 * GiB
     pool = device_memory(limit, 2.79 * GiB, largest=10.45 * GiB, pool=limit)
@@ -1806,12 +1826,31 @@ def test_a_partitioned_pool_needs_room_for_the_temporaries_twice(monkeypatch):
 def test_a_growing_pool_places_temporaries_in_a_region_it_has_yet_to_take(monkeypatch):
     """A pool that grows (XLA_PYTHON_CLIENT_PREALLOCATE=false) takes a new
     region for an allocation its free blocks cannot hold, up to its limit."""
+    from dew.training import trainer as module
     from dew.training.trainer import step_headroom
+
+    monkeypatch.setattr(module, "gpu_free_bytes", lambda ordinal: None)
 
     monkeypatch.setenv("XLA_FLAGS", "")
     growing = device_memory(16 * GiB, 3 * GiB, largest=GiB, pool=4 * GiB)
     assert step_headroom(planned_step(10 * GiB), [growing]) > 0
     assert step_headroom(planned_step(13.5 * GiB), [growing]) < 0
+
+
+def test_a_growing_pool_takes_no_more_of_its_limit_than_the_gpu_has_free(monkeypatch):
+    """A pool that grows takes a new region from the GPU, which another
+    process may already hold: past what the driver reports free, its limit
+    is a number, not memory."""
+    from dew.training import trainer as module
+    from dew.training.trainer import step_headroom
+
+    monkeypatch.setenv("XLA_FLAGS", "")
+    growing = device_memory(16 * GiB, 3 * GiB, largest=GiB, pool=4 * GiB)
+    monkeypatch.setattr(module, "gpu_free_bytes", lambda ordinal: 6 * GiB)
+    assert step_headroom(planned_step(5 * GiB), [growing]) > 0
+    assert step_headroom(planned_step(10 * GiB), [growing]) < 0
+    monkeypatch.setattr(module, "gpu_free_bytes", lambda ordinal: None)
+    assert step_headroom(planned_step(10 * GiB), [growing]) > 0
 
 
 def test_an_allocator_without_a_pool_is_read_by_its_free_bytes(monkeypatch):

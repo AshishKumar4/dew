@@ -46,11 +46,17 @@ def _gemma_layer_types(hf_config: Mapping[str, object], used: set[str], *,
     if hf_config.get('layer_types') is not None:
         types = _specified_layer_types(hf_config, used)
     else:
-        pattern = 6 if last_full else records.integer(hf_config.get('sliding_window_pattern', 6), 'sliding_window_pattern')
+        pattern = (
+            6
+            if last_full
+            else records.integer(hf_config.get("sliding_window_pattern", 6), "sliding_window_pattern")
+        )
         if not last_full:
             used.add('sliding_window_pattern')
-        types = tuple('sliding_attention' if (index + 1) % pattern else 'full_attention'
-                      for index in range(records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')))
+        types = tuple(
+            "sliding_attention" if (index + 1) % pattern else "full_attention"
+            for index in range(records.integer(hf_config["num_hidden_layers"], "num_hidden_layers"))
+        )
     # Gemma4TextConfig rewrites the final layer before building the model.
     return (*types[:-1], 'full_attention') if last_full and types else types
 
@@ -85,7 +91,9 @@ def _gemma4_rope(entries: Mapping[str, object]) -> tuple[float, float | None, fl
             _refuse("rope_parameters.full_attention scaling",
                     "the backbone applies plain rotary positions at rope_theta")
         partial = records.number(factor, 'rope_parameters.full_attention partial_rotary_factor')
-        theta = records.number(entry.get('rope_theta', 1000000.0), 'rope_parameters.full_attention rope_theta')
+        theta = records.number(
+            entry.get("rope_theta", 1000000.0), "rope_parameters.full_attention rope_theta"
+        )
     elif rope_type in ('default', 'none'):
         if factor not in (None, 1, 1.0):
             _refuse("rope_parameters.full_attention partial_rotary_factor",
@@ -179,8 +187,10 @@ def _gemma3n_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderF
         layer_types = _specified_layer_types(hf_config, used)
     else:
         # Gemma3nTextConfig fills every fifth layer full.
-        layer_types = tuple('full_attention' if (index + 1) % 5 == 0 else 'sliding_attention'
-                            for index in range(records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')))
+        layer_types = tuple(
+            "full_attention" if (index + 1) % 5 == 0 else "sliding_attention"
+            for index in range(records.integer(hf_config["num_hidden_layers"], "num_hidden_layers"))
+        )
     # Gemma3nTextConfig folds a flat rope_scaling into the full layers'
     # entry (convert_rope_params_to_dict) and defaults the bases to 1e6 for
     # the full layers and 1e4 for the sliding ones, spelled rope_theta and
@@ -225,14 +235,25 @@ def _gemma3n_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderF
                   coef_clip=None if clip is None else records.number(clip, 'altup_coef_clip'),
                   correct_scale=bool(hf_config.get('altup_correct_scale', True)))
     config.update(
-        sandwich_norms=True, embedding_scale=True, attention_scale=1.0, v_norm=True,
+        sandwich_norms=True,
+        embedding_scale=True,
+        attention_scale=1.0,
+        v_norm=True,
         activation_sparsity_pattern=tuple(float(fraction) for fraction in sparsity),
-        laurel_rank=records.integer(hf_config.get('laurel_rank', 64), 'laurel_rank'),
+        laurel_rank=records.integer(hf_config.get("laurel_rank", 64), "laurel_rank"),
         altup=AltUpFields(**dataclasses.asdict(altup)),
-        per_layer_input_dim=records.integer(hf_config.get('hidden_size_per_layer_input', 256), 'hidden_size_per_layer_input'),
-        per_layer_input_vocab=records.integer(hf_config.get('vocab_size_per_layer_input', 262144), 'vocab_size_per_layer_input'),
-        num_kv_shared_layers=records.integer(hf_config.get('num_kv_shared_layers', 15), 'num_kv_shared_layers'),
-        final_logit_softcap=records.number(hf_config.get('final_logit_softcapping', 30.0), 'final_logit_softcapping'),
+        per_layer_input_dim=records.integer(
+            hf_config.get("hidden_size_per_layer_input", 256), "hidden_size_per_layer_input"
+        ),
+        per_layer_input_vocab=records.integer(
+            hf_config.get("vocab_size_per_layer_input", 262144), "vocab_size_per_layer_input"
+        ),
+        num_kv_shared_layers=records.integer(
+            hf_config.get("num_kv_shared_layers", 15), "num_kv_shared_layers"
+        ),
+        final_logit_softcap=records.number(
+            hf_config.get("final_logit_softcapping", 30.0), "final_logit_softcapping"
+        ),
     )
     return config
 
@@ -315,22 +336,40 @@ def _gemma4_config(hf_config: Mapping[str, object], used: set[str], *,
     entries = records.record(hf_config.get('rope_parameters') or {}, 'rope_parameters')
     rope_theta, rope_local_theta, partial = _gemma4_rope(entries)
     used.update(('rope_parameters', 'rope_theta'))
-    per_layer = records.integer(hf_config.get('hidden_size_per_layer_input', 0), 'hidden_size_per_layer_input')
+    per_layer = records.integer(
+        hf_config.get("hidden_size_per_layer_input", 0), "hidden_size_per_layer_input"
+    )
     config.update(
-        sandwich_norms=True, embedding_scale=True, attention_scale=1.0,
+        sandwich_norms=True,
+        embedding_scale=True,
+        attention_scale=1.0,
         v_norm=True,
         head_dim=sliding_dim,
         rope_theta=rope_theta,
-        kinds=_kinds(layer_types, _kinds_of(config).get(
-            'sliding_attention', {}).get('window'), rope_local_theta, None,
-            None if full_dim == sliding_dim else full_dim),
+        kinds=_kinds(
+            layer_types,
+            _kinds_of(config).get("sliding_attention", {}).get("window"),
+            rope_local_theta,
+            None,
+            None if full_dim == sliding_dim else full_dim,
+        ),
         partial_rotary_factor=partial,
-        use_double_wide_mlp=bool(hf_config.get('use_double_wide_mlp', False)),
-        num_kv_shared_layers=records.integer(hf_config.get('num_kv_shared_layers', 0), 'num_kv_shared_layers'),
+        # The reference widens only sharing layers. With none, this flag
+        # changes neither the weights nor the forward operation.
+        use_double_wide_mlp=(
+            bool(hf_config.get("use_double_wide_mlp", False))
+            and records.integer(hf_config.get("num_kv_shared_layers", 0), "num_kv_shared_layers") > 0
+        ),
+        num_kv_shared_layers=records.integer(
+            hf_config.get("num_kv_shared_layers", 0), "num_kv_shared_layers"
+        ),
         per_layer_input_dim=per_layer or None,
-        per_layer_input_vocab=records.integer(hf_config.get(
-            'vocab_size_per_layer_input',
-            records.integer(hf_config['vocab_size'], 'vocab_size')), 'vocab_size_per_layer_input'),
+        per_layer_input_vocab=records.integer(
+            hf_config.get(
+                "vocab_size_per_layer_input", records.integer(hf_config["vocab_size"], "vocab_size")
+            ),
+            "vocab_size_per_layer_input",
+        ),
     )
     used.update(('use_double_wide_mlp', 'num_kv_shared_layers',
                  'hidden_size_per_layer_input', 'vocab_size_per_layer_input',
@@ -406,7 +445,9 @@ def _gemma4_export(model: CausalTransformer) -> Mapping[str, object]:
         mixer = kind.mixer or model.mixer
         if mixer is not None and not isinstance(mixer, AttentionMixer):
             _refuse(f'kinds.{name}.mixer', 'Gemma4 uses ordinary attention')
-        if isinstance(mixer, AttentionMixer) and (mixer.bidirectional_images or mixer.mrope_section is not None):
+        if isinstance(mixer, AttentionMixer) and (
+            mixer.bidirectional_images or mixer.mrope_section is not None
+        ):
             _refuse(f'kinds.{name}.mixer', 'multimodal attention metadata needs its source wrapper')
         if kind.rope_scaling is not None or kind.yarn is not None:
             _refuse(f'kinds.{name}.rope', 'Gemma4 uses plain local and proportional global rotary')

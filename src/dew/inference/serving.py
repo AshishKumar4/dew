@@ -84,17 +84,8 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.typing import ArrayLike
 
 from dew.inference.pages import Pages
-from dew.inference.tasks import (
-    Processor,
-    Request,
-    TextGeneration,
-    _bucket,
-    _ceiling,
-    _decoded,
-    _prepared,
-    _sized,
-)
-from dew.nn.inputs import ModelInputs, mesh_of, request_key
+from dew.inference.tasks import Processor, TextGeneration, _bucket, _ceiling, _decoded, _prepared, _sized
+from dew.nn.inputs import ModelInputs, host_token_rows, mesh_of, request_key
 from dew.nn.kv_cache import (
     CURSOR,
     POOLED,
@@ -117,9 +108,9 @@ from dew.sampling.strategies import DecoderState, Sample, draw
 from dew.sampling.text import (
     Generation,
     Sampling,
+    _check_inputs,
     _operations,
     _prefill,
-    _validated,
     prediction_depths,
     resolve,
 )
@@ -450,7 +441,9 @@ def _state_shardings(mesh: Mesh | None, state: Slots) -> Slots:
         axes = (*names, *(None,) * (leaf.ndim - len(names)))
         return NamedSharding(mesh, logical_spec(axes, leaf.shape, mesh=mesh))
 
-    def cached(path: tuple[jax.tree_util.KeyEntry, ...], leaf: jax.ShapeDtypeStruct | jax.Array) -> NamedSharding:
+    def cached(
+        path: tuple[jax.tree_util.KeyEntry, ...], leaf: jax.ShapeDtypeStruct | jax.Array
+    ) -> NamedSharding:
         if leaf_name(path) not in POOLED:
             return placed(leaf, "activation_batch")
         if paged:
@@ -540,13 +533,19 @@ class Ticket(Future):
         self.finished: float | None = None
 
 
+@jax.jit
+def _stacked_keys(keys: tuple[jax.Array | np.ndarray, ...]) -> jax.Array:
+    """Assemble one fixed-width admission's key data without a device-to-host read."""
+    return jnp.stack(keys)
+
+
 @dataclass
 class _Row:
     """One request on the host: its prompt, budget and key, and what it drew."""
 
     prompt: np.ndarray
     budget: int
-    keys: np.ndarray
+    keys: jax.Array
     ticket: Ticket
     tokens: list[int] = field(default_factory=list)
     behavior: list[float] = field(default_factory=list)
@@ -741,7 +740,9 @@ class Server:
         self.grammar = grammar
         self.prefix_hits = 0
         """Prompt tokens served from shared prefix pages instead of prefilled."""
-        self._admitted = None if self.mesh is None else NamedSharding(self.mesh, P(batch_axes(self.mesh) or None))
+        self._admitted = (
+            None if self.mesh is None else NamedSharding(self.mesh, P(batch_axes(self.mesh) or None))
+        )
         with self._context():
             shapes = jax.eval_shape(functools.partial(_opened, model, pad_id=self.pad_id, slots=slots,
                                                       capacity=capacity), variables)
@@ -800,10 +801,12 @@ class Server:
         mesh = mesh_of(task.variables)
         if mesh is not None:
             if mesh.shape[STAGE_AXIS] > 1:
-                raise ValueError("a server decodes through the whole layer stack every step; the stage axis "
-                                 "runs the stack as the training pipeline, which the decoder refuses to decode "
-                                 "through (one token a step leaves no microbatches to pipeline). Serve on a "
-                                 "mesh with stage=1")
+                raise ValueError(
+                    "a server decodes through the whole layer stack every step; the stage axis "
+                    "runs the stack as the training pipeline, which the decoder refuses to decode "
+                    "through (one token a step leaves no microbatches to pipeline). Serve on a "
+                    "mesh with stage=1"
+                )
             if mesh.shape[SEQUENCE_AXIS] > 1:
                 raise ValueError("a server keeps each row's cached keys whole on the devices of its group, "
                                  "and a decoder refuses to decode under a sequence axis, which splits a "
@@ -835,7 +838,9 @@ class Server:
         unit = math.lcm(64, layout.page_size or 64)
         rounded = -(-capacity // unit) * unit
         if rounded > ceiling:
-            raise ValueError(f"a capacity of {capacity} rounds to {rounded}, over the model's max_seq_len of {ceiling}")
+            raise ValueError(
+                f"a capacity of {capacity} rounds to {rounded}, over the model's max_seq_len of {ceiling}"
+            )
         model = _sized(model, rounded)
         groups = _row_groups(mesh)
         rows: Rows
@@ -849,12 +854,25 @@ class Server:
             model = model.clone(kv_cache=dataclasses.replace(layout, pages=count, groups=groups))
             rows = PagedRows([Pages(count // groups, layout.page_size, prefix_cache=prefix_cache)
                               for _ in range(groups)], chunk, rounded // layout.page_size)
-        return cls(model, task.variables, task.processor, sampling=task.sampling,
-                   transforms=transforms, stopping=stopping, grammar=strategy.grammar, rows=rows,
-                   slots=slots, capacity=rounded,
-                   admission=(max(groups, min(slots, 8 * decode_steps) // groups * groups) if admission is None
-                              else admission),
-                   default_budget=task.max_new_tokens, decode_steps=decode_steps)
+        return cls(
+            model,
+            task.variables,
+            task.processor,
+            sampling=task.sampling,
+            transforms=transforms,
+            stopping=stopping,
+            grammar=strategy.grammar,
+            rows=rows,
+            slots=slots,
+            capacity=rounded,
+            admission=(
+                max(groups, min(slots, 8 * decode_steps) // groups * groups)
+                if admission is None
+                else admission
+            ),
+            default_budget=task.max_new_tokens,
+            decode_steps=decode_steps,
+        )
 
     @property
     def cache(self) -> Variables:
@@ -926,21 +944,25 @@ class Server:
         return row.ticket
 
     def _prepared(self, prompt: Prompt, max_new_tokens: int | None, key: jax.Array) -> _Row:
-        request: Request = prompt if isinstance(prompt, (str, ModelInputs)) else np.atleast_2d(np.asarray(prompt))
-        inputs = _prepared(self.processor, request, images=None)
-        if inputs.tokens.shape[0] != 1:
+        if isinstance(prompt, (str, ModelInputs)):
+            inputs = _prepared(self.processor, prompt, images=None)
+            if set(inputs.token_fields) - {"attention_mask"} or inputs.conditioning:
+                raise ValueError(
+                    "a served prompt carries tokens and validity only; media and positions do not slot"
+                )
+            ids = np.asarray(inputs.tokens)
+            fields = {name: np.asarray(value) for name, value in inputs.token_fields.items()}
+        else:
+            ids = host_token_rows(np.atleast_2d(np.asarray(prompt)))
+            fields = {}
+        if ids.shape[0] != 1:
             raise ValueError("submit takes one prompt; call the server with a batch")
-        if set(inputs.token_fields) - {"attention_mask"} or inputs.conditioning:
-            raise ValueError("a served prompt carries tokens and validity only; media and positions do not slot")
         budget = self.default_budget if max_new_tokens is None else max_new_tokens
         if budget is None:
             raise ValueError("max_new_tokens is required; the source declares no default budget")
-        ids = np.asarray(inputs.tokens)
-        fields = {name: np.asarray(value) for name, value in inputs.token_fields.items()}
-        _validated(self.model, ids, fields, {}, budget, self.sampling, 1)
-        valid = fields.get("attention_mask", np.ones(ids.shape, bool)).astype(bool)
+        valid = _check_inputs(self.model, ids, fields, budget, self.sampling, 1).astype(bool)
         self.rows.refuse(int(valid[0].sum()), budget)
-        return _Row(ids[0][valid[0]].astype(np.int32), budget, np.asarray(jax.random.key_data(key)), Ticket())
+        return _Row(ids[0][valid[0]].astype(np.int32), budget, jax.random.key_data(key), Ticket())
 
     def step(self) -> None:
         """One device call: admit what fits, run `decode_steps` iterations, read the last call's."""
@@ -961,8 +983,13 @@ class Server:
             self.step()
         self._settle()
 
-    def __call__(self, prompts: str | Sequence[str] | Sequence[Sequence[int]] | ModelInputs,
-                 max_new_tokens: int | None = None, *, key: int | jax.Array | None = None) -> list[Generation]:
+    def __call__(
+        self,
+        prompts: str | Sequence[str] | Sequence[Sequence[int]] | ModelInputs,
+        max_new_tokens: int | None = None,
+        *,
+        key: int | jax.Array | None = None,
+    ) -> list[Generation]:
         """Submit a batch, run it through, and return its generations in order.
 
         Row `i` draws with the request key folded by `i`, as the same batch
@@ -1012,7 +1039,8 @@ class Server:
         valid = np.zeros((count, width), bool)
         slots = np.full((count,), size, np.int32)
         budgets = np.zeros((count,), np.int32)
-        keys = np.zeros((count, *chosen[0][2].keys.shape), chosen[0][2].keys.dtype)
+        empty_key = np.zeros(chosen[0][2].keys.shape, chosen[0][2].keys.dtype)
+        keys: list[jax.Array | np.ndarray] = [empty_key] * count
         tables = np.zeros((count, self.rows.width), np.int32)
         cursors = np.zeros((count,), np.int32)
         final = np.zeros((count,), bool)
@@ -1032,12 +1060,26 @@ class Server:
             history_valid[index, capacity - len(row.prompt):] = True
             if final[index]:
                 self.rows.prefilled(row)
-        placed = jax.device_put([tokens, valid, slots, budgets, keys, tables, cursors, final, history,
-                                 history_valid], self._admitted)
+        placed = jax.device_put(
+            [
+                tokens,
+                valid,
+                slots,
+                budgets,
+                _stacked_keys(tuple(keys)),
+                tables,
+                cursors,
+                final,
+                history,
+                history_valid,
+            ],
+            self._admitted,
+        )
         return Admission(ModelInputs(placed[0], {"attention_mask": placed[1]}), *placed[2:])
 
     def _settle(self) -> None:
-        """Read the previous call's draws into their rows, iteration by iteration; resolve the rows that ended."""
+        """Read the previous call's draws into their rows, iteration by
+        iteration; resolve the rows that ended."""
         if self._pending is None:
             return
         error, draws = jax.device_get(self._pending)

@@ -265,7 +265,13 @@ class SafetensorsBanks:
 
     def __init__(self, directory: str | Path, *, cache_bytes: int = 0,
                  param_dtype: str = "auto", read_ahead: bool = True):
-        from dew.interop.hf_decoders import _FAMILIES, _check_tree, translate_config, translate_weights
+        from dew.interop.hf_decoders import (
+            DecoderFamily,
+            _check_tree,
+            families,
+            translate_config,
+            translate_weights,
+        )
         from dew.interop.safetensors_io import read_weights
         from dew.registry import models, with_precision
 
@@ -278,7 +284,7 @@ class SafetensorsBanks:
             raise ValueError("disk banks require unquantized safetensors; a whole-model codec is not bounded")
         record = translate_config(self.config)
         family = records.text(self.config.get("model_type"), "model_type")
-        if _FAMILIES[family].prepare_weights is not dict:
+        if families()[family].prepare_weights is not DecoderFamily.prepare_weights:
             raise ValueError("disk banks require a family with lazy tensor translation; "
                              "this family's preparation can materialize checkpoint weights")
         tensors = read_weights(folder)
@@ -287,7 +293,9 @@ class SafetensorsBanks:
             param_dtype = _checkpoint_dtype(self.config, tensors)
         self._variables: Variables = translate_weights(
             tensors, record, family, param_dtype=param_dtype, lazy=True)
-        self._shapes = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), self._variables)
+        self._shapes = jax.tree.map(
+            lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), self._variables
+        )
         _check_tree(self._shapes, models.build("causal_transformer", with_precision(
             "causal_transformer", record, dtype="float32", attention_impl="reference")))
         self.cache_limit = cache_bytes
@@ -695,16 +703,27 @@ def stream_banked(model: BankedModel, source: SafetensorsBanks, *,
     try:
         jax.devices("cpu")
     except RuntimeError as error:
-        raise ValueError("disk streaming requires the CPU callback backend; configure "
-                         "JAX_PLATFORMS=cuda,cpu (or your accelerator,cpu) before JAX initialization") from error
+        raise ValueError(
+            "disk streaming requires the CPU callback backend; configure "
+            "JAX_PLATFORMS=cuda,cpu (or your accelerator,cpu) before JAX initialization"
+        ) from error
     device = SingleDeviceSharding(device_mesh.devices.flat[0])
     handles: Variables = {}
     for site in sites:
         groups = site.view.groups
-        local = {name: {"bank": StreamedBank(source, first, count, site.namespace, device,
-                                             groups[index + 1][0] if index + 1 < len(groups) else groups[0][0])}
-                 for index, ((first, count), name) in enumerate(zip(
-                     groups, site.view.bank_names(), strict=True))}
+        local = {
+            name: {
+                "bank": StreamedBank(
+                    source,
+                    first,
+                    count,
+                    site.namespace,
+                    device,
+                    groups[index + 1][0] if index + 1 < len(groups) else groups[0][0],
+                )
+            }
+            for index, ((first, count), name) in enumerate(zip(groups, site.view.bank_names(), strict=True))
+        }
         handles = merge(handles, at_namespace({"streaming": local}, site.namespace))
     entries = jax.block_until_ready(source.entry(entries)) if entries else {}
     return merge(entries, handles)

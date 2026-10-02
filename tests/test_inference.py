@@ -31,7 +31,7 @@ from dew.objectives.base import merge
 from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
 from dew.registry import presets, samplers
 from dew.sampling import CFG, Heun, TextToImage
-from dew.sampling.pipelines import Images
+from dew.sampling.pipelines import Images, _with_drawn_tables
 from dew.training import Checkpoints, Trainer
 
 RES = 8
@@ -177,6 +177,32 @@ def test_from_run_rebuilds_the_training_process_exactly(tmp_path):
     assert pipe.process.schedule.shift == 3.0 and pipe.process.schedule.logit_mean == 0.5
     assert type(pipe.process.prediction) is FlowMatchPredictionTransform
     assert pipe.process.sampling is None
+
+
+def test_legacy_fourier_restore_applies_saved_weights_without_initializing_them(monkeypatch):
+    """Only the missing deterministic table is drawn; saved weights are authoritative."""
+    config = run_config("unused")
+    objective = config.build()
+    original = objective.init(jax.random.key(0))
+    stored = {name: tree for name, tree in original.items() if name != "constants"}
+
+    def forbidden_init(*args, **kwargs):
+        raise AssertionError("a restored model must not initialize a second set of weights")
+
+    monkeypatch.setattr(type(objective.model), "init", forbidden_init)
+    restored = _with_drawn_tables(objective, stored)
+    for got, want in zip(jax.tree.leaves(restored["constants"]),
+                         jax.tree.leaves(original["constants"]), strict=True):
+        np.testing.assert_array_equal(np.ascontiguousarray(got).view(np.uint8),
+                                      np.ascontiguousarray(want).view(np.uint8))
+    assert all(got is want for got, want in zip(jax.tree.leaves(restored["params"]),
+                                               jax.tree.leaves(stored["params"]), strict=True))
+    given = objective.encode(stored["encoders"])
+    x, t = jnp.ones((1, *objective.latent_shape)), jnp.ones((1,))
+    with jax.default_matmul_precision("highest"):
+        expected = jax.jit(objective.model.apply)(original, x, t, **given)
+        actual = jax.jit(objective.model.apply)(restored, x, t, **given)
+    np.testing.assert_array_equal(actual, expected)
 
 
 def test_a_run_saved_before_the_fourier_table_was_stored_samples_and_resumes_as_it_did(
@@ -488,6 +514,25 @@ def test_pipeline_answers_an_lm_run_with_its_tokenizer_and_budget(tmp_path):
         task("the ", seed=2)
     with pytest.raises(ValueError, match="max_new_tokens is required"):
         dataclasses.replace(task, max_new_tokens=None)("the ", key=2)
+
+
+def test_an_lm_run_without_an_average_publishes_and_exports_its_live_weights(tmp_path):
+    """An LM keeps no EMA unless asked, so each reader's default takes the
+    live weights of such a run: the objective's pipeline, `dew.pipeline`
+    and `export_run`."""
+    from dew.interop import export_run, load_pretrained
+
+    run = tmp_path / "run"
+    run.mkdir()
+    objective, state = make_lm_run(run, ema_decay=None)
+    published = objective.pipeline(state)
+    for expected, bound in zip(jax.tree.leaves(state.params), jax.tree.leaves(published.variables), strict=True):
+        assert bound is expected
+    export_run(str(run), tmp_path / "export")
+    reloaded = load_pretrained(tmp_path / "export", dtype="float32", attention_impl="reference")
+    ids = jnp.asarray([[3, 4, 5, 6]], jnp.int32)
+    np.testing.assert_array_equal(np.asarray(reloaded.model.apply(reloaded.variables, ids)),
+                                  np.asarray(published.model.apply(published.variables, ids)))
 
 
 def test_a_quantized_runs_record_re_wraps_the_model_it_rebuilds(tmp_path):
