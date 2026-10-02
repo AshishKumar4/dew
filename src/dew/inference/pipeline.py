@@ -59,8 +59,6 @@ def pipeline(
 
     Loading a task also points XLA at the on-disk executable cache, so a
     restarted process reuses what it already compiled.
-
-
     """
     _persist_compilations()
     resolve_dtype(dtype)
