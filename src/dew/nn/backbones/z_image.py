@@ -28,6 +28,7 @@ from flax.typing import Dtype, PrecisionLike
 from dew.nn.attention import RMSNorm, scaled_dot_product_attention
 from dew.nn.backbones.unet_condition import sinusoidal_time
 from dew.nn.precision import at_least_fp32
+from dew.nn.scan_orders import patchify, unpatchify
 from dew.nn.sharding import logical_axes
 from dew.registry import models
 
@@ -225,9 +226,8 @@ class ZImageTransformer(nn.Module):
         embedded = self._embedded_time(time, x.dtype)
         pad_image = self.param("x_pad_token", nn.initializers.zeros, (1, self.dim))
         pad_caption = self.param("cap_pad_token", nn.initializers.zeros, (1, self.dim))
-        patches = x.reshape(batch, rows, 2, columns, 2, channels).transpose(0, 1, 3, 2, 4, 5).reshape(
-            batch, count, 4 * channels)
-        image = nn.Dense(self.dim, dtype=self.dtype, precision=self.precision, name="x_embedder")(patches)
+        image = nn.Dense(self.dim, dtype=self.dtype, precision=self.precision, name="x_embedder")(
+            patchify(x, 2))
         image = jnp.concatenate(
             [image, jnp.broadcast_to(pad_image.astype(image.dtype), (batch, image_span - count, self.dim))],
             axis=1,
@@ -269,8 +269,7 @@ class ZImageTransformer(nn.Module):
                              name="final_modulation")(nn.silu(embedded))[:, None]
         out = nn.Dense(4 * channels, dtype=self.dtype, precision=self.precision, name="final_linear")(
             _layer_norm(self.dtype)(joined[:, :count]) * scale)
-        out = out.reshape(batch, rows, columns, 2, 2, channels).transpose(0, 1, 3, 2, 4, 5).reshape(x.shape)
-        return -out
+        return -unpatchify(out, 2, *x.shape[1:])
 
 
 __all__ = ["ZImageBlock", "ZImageTransformer", "rotary_table"]

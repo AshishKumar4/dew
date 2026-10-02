@@ -120,11 +120,7 @@ def rotary_freqs(positions, head_dim: int, theta: float, rot_dim: int | None = N
     if rot_dim is not None and partial_rotary_type == 'proportional':
         padding = head_dim // 2 - pairs
         inv_freq = np.concatenate([inv_freq, np.zeros((padding,), inv_freq.dtype)])
-    positions = jnp.asarray(positions, inv_freq.dtype)
-    if positions.ndim == 1:
-        angles = positions[:, None] * inv_freq[None, :]
-    else:
-        angles = positions[:, :, None] * inv_freq[None, None, :]
+    angles = jnp.asarray(positions, inv_freq.dtype)[..., None] * inv_freq
     return jnp.cos(angles), jnp.sin(angles)
 
 
@@ -261,11 +257,7 @@ def yarn_rope_freqs(positions, head_dim: int, theta: float,
     if yarn is None:
         return rotary_freqs(positions, head_dim, theta, dtype=dtype)
     inv_freq = yarn_inv_freq(head_dim, theta, yarn, dtype=dtype)
-    positions = jnp.asarray(positions, inv_freq.dtype)
-    if positions.ndim == 1:
-        angles = positions[:, None] * inv_freq[None, :]
-    else:
-        angles = positions[:, :, None] * inv_freq[None, None, :]
+    angles = jnp.asarray(positions, inv_freq.dtype)[..., None] * inv_freq
     factor = yarn_attention_factor(yarn)
     return jnp.cos(angles) * factor, jnp.sin(angles) * factor
 
