@@ -45,12 +45,12 @@ def _gpt_oss_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderF
 
 # The layer's own tensors beside the shared map's, read one way on load and
 # the other on export.
-_GPT_OSS_LEAVES = {
+_GPT_OSS_LEAVES: Mapping[str, tuple[str, ...]] = {
     'self_attn.sinks': ('self_attn', 'sinks'),
     'mlp.router.weight': ('mlp', 'router', 'kernel'), 'mlp.router.bias': ('mlp', 'router', 'bias'),
     **{f'mlp.experts.{leaf}': ('mlp', 'experts', leaf)
        for leaf in ('gate_up_proj', 'gate_up_proj_bias', 'down_proj', 'down_proj_bias')}}
-_GPT_OSS_NAMES = {path: name for name, path in _GPT_OSS_LEAVES.items()}
+_GPT_OSS_NAMES: Mapping[tuple[str, ...], str] = {path: name for name, path in _GPT_OSS_LEAVES.items()}
 
 
 def _gpt_oss_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:

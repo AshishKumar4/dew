@@ -35,17 +35,17 @@ MODEL_TYPE = "mamba2"
 
 # The checkpoint's names onto the tree's, read one way on load and the other
 # on export. Linear weights are kernels; the conv taps keep `[D, 1, K]`.
-_TRUNK = {"backbone.embeddings.weight": ("embed_tokens", "embedding"),
-          "backbone.norm_f.weight": ("norm", "scale")}
-_TRUNK_NAMES = {path: name for name, path in _TRUNK.items()}
-_LAYER = {
+_TRUNK: Mapping[str, tuple[str, ...]] = {"backbone.embeddings.weight": ("embed_tokens", "embedding"),
+                                         "backbone.norm_f.weight": ("norm", "scale")}
+_TRUNK_NAMES: Mapping[tuple[str, ...], str] = {path: name for name, path in _TRUNK.items()}
+_LAYER: Mapping[str, tuple[str, ...]] = {
     "norm.weight": ("input_layernorm", "scale"), "mixer.norm.weight": ("self_attn", "norm", "weight"),
     **{f"mixer.{leaf}": ("self_attn", leaf) for leaf in ("A_log", "dt_bias", "D")},
     **{f"mixer.{linear}.{kind}": ("self_attn", linear, "kernel" if kind == "weight" else "bias")
        for linear in ("in_proj", "out_proj") for kind in ("weight", "bias")},
     **{f"mixer.conv1d.{kind}": ("self_attn", "conv1d", kind) for kind in ("weight", "bias")},
 }
-_LAYER_NAMES = {path: name for name, path in _LAYER.items()}
+_LAYER_NAMES: Mapping[tuple[str, ...], str] = {path: name for name, path in _LAYER.items()}
 
 
 def config_from_hf(hf_config: Mapping[str, object], used: set[str] | None = None) -> DecoderFields:
