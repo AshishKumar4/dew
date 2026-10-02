@@ -20,7 +20,6 @@ from dew.inference import RunProcessor, TextGeneration
 from dew.inference.serving import Server
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.sampling import Sample, Sampling, decoding, guided
-from dew.sampling.decoding import byte_alphabet
 
 pytest.importorskip("outlines_core")
 
@@ -32,8 +31,9 @@ def tokenizer(tmp_path_factory):
     """A byte-level BPE over all 256 bytes, so any text has a spelling."""
     from tokenizers import Tokenizer, decoders, models, pre_tokenizers
     from transformers import AutoTokenizer, PreTrainedTokenizerFast
+    from transformers.convert_slow_tokenizer import bytes_to_unicode
 
-    alphabet = {byte: char for char, byte in byte_alphabet().items()}
+    alphabet = bytes_to_unicode()
     backend = Tokenizer(models.BPE({alphabet[byte]: byte for byte in range(256)}, [], unk_token=None))
     backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
     backend.decoder = decoders.ByteLevel()
