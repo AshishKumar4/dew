@@ -29,7 +29,7 @@ from jax.sharding import PartitionSpec as P
 
 from dew.artifacts import ImageGrid, Representations, TokenScores, VideoGrid
 from dew.config import ModelConfig
-from dew.data import OxfordFlowers
+from dew.data import TFDSImages
 from dew.diffusion import presets
 from dew.inputs import Condition, ConditionEncoder, Field, InputSpec
 from dew.nn.attention import Stage
@@ -531,7 +531,7 @@ JSON_UNET = {"emb_features": 32, "feature_depths": [8, 16], "norm_groups": 4,
 def unet_run(fields):
     return DiffusionRunConfig(
         model=ModelConfig("unet", fields, dtype="float32", attention_impl="reference"),
-        data=OxfordFlowers(image_size=8), text=None, guidance=None,
+        data=TFDSImages(image_size=8), text=None, guidance=None,
         sampler=Euler(), sampling_steps=SAMPLER_STEPS)
 
 

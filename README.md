@@ -79,7 +79,7 @@ import jax.numpy as jnp
 import optax
 
 from dew import Checkpoints, Field, InputSpec, Trainer
-from dew.data import Loading, OxfordFlowers
+from dew.data import Loading, TFDSImages
 from dew.diffusion.presets import EDM
 from dew.objectives.diffusion import DiffusionObjective
 from dew.nn.backbones import SimpleDiT
@@ -87,7 +87,7 @@ from dew.nn.backbones import SimpleDiT
 
 def train():
     data_path = Path.home() / ".cache/dew/datasets/oxford_flowers102/2.1.1"
-    data = OxfordFlowers(
+    data = TFDSImages(
         path=str(data_path),
         split="train",
         image_size=64,
@@ -604,12 +604,12 @@ import jax
 import optax
 
 from dew import Field, Trainer
-from dew.data import Loading, OxfordFlowers
+from dew.data import Loading, TFDSImages
 from dew.objectives.jepa import JepaEncoder, JepaObjective, JepaPredictor, KnnProbe, MultiBlockMask
 
 
 def train_jepa():
-    data = OxfordFlowers(
+    data = TFDSImages(
         path=str(Path.home() / ".cache/dew/datasets/oxford_flowers102/2.1.1"),
         split="train",
         image_size=64,
@@ -1030,7 +1030,7 @@ import optax
 
 from dew import Checkpoints, Trainer
 from dew.config import ModelConfig, TrainerConfig
-from dew.data import Loading, OxfordFlowers
+from dew.data import Loading, TFDSImages
 from dew.diffusion import presets
 from dew.inference import TextToImage
 from dew.objectives.diffusion import DiffusionRunConfig
@@ -1040,7 +1040,7 @@ run = Path("runs/flowers-run")
 config = DiffusionRunConfig(
     model=ModelConfig("simple_dit", {"patch_size": 4, "emb_features": 128,
                                      "num_layers": 4, "num_heads": 4}),
-    data=OxfordFlowers(
+    data=TFDSImages(
         path=str(Path.home() / ".cache/dew/datasets/oxford_flowers102/2.1.1"),
         image_size=64,
         val_batches=0,

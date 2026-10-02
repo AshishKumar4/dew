@@ -105,7 +105,7 @@ The training stream is shuffled: the first window of the first batch is window 4
 
 Each window starts `seq_len` ids after the previous one, so the last id of one window is the first of the next. `dew tokenize` (or `TokenCorpus.write` in Python) writes `train.bin`, `val.bin` and `meta.json` from raw text; see [Packing](#packing). Token ids already stored in parquet are read through `dew.data.load("hf/parquet", options=HFOptions(data_files=...))` or a Grain pipeline given to `Dataset.from_grain`.
 
-Other specifications include `PackedTokens`, `OxfordFlowers`, `HFImages`, `ChatMessages` and the video and preference readers; the [API reference](../reference/core-api.md) lists them. Each has its own fields for paths, tokenization, transforms and splits, and two fields every specification shares:
+Other specifications include `PackedTokens`, `TFDSImages` (a prepared TFDS image dataset, captioned from its class names), `HFImages`, `ChatMessages` and the video and preference readers; the [API reference](../reference/core-api.md) lists them. Each has its own fields for paths, tokenization, transforms and splits, and two fields every specification shares:
 
 | Field | Meaning |
 |---|---|
@@ -152,7 +152,7 @@ Validation reads each image through the deterministic resize, without the crop, 
 
 ## Device image augmentation
 
-`OxfordFlowers`, `HFImages` and the prepared `ArrayRecordImages` readers share
+`TFDSImages`, `HFImages` and the prepared `ArrayRecordImages` readers share
 `ImageDataset`'s transforms. Set `augmentation_backend="device"` to apply
 random crop/resize, horizontal flip and colour jitter to each decoded batch
 with JAX. The default remains `"host"`, preserving existing runs' OpenCV/NumPy
@@ -161,9 +161,9 @@ keeps the deterministic resize, without random cropping.
 
 <!-- not run: needs a prepared Oxford Flowers version directory -->
 ```python
-from dew.data import Loading, OxfordFlowers
+from dew.data import Loading, TFDSImages
 
-data = OxfordFlowers(
+data = TFDSImages(
     path="data/oxford_flowers102/2.1.1",
     image_size=128,
     augmentation_backend="device",

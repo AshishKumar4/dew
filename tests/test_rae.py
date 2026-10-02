@@ -241,7 +241,7 @@ def test_a_latent_run_trains_behind_the_rae_and_samples_its_image_size(source):
     from test_diffusion_objective import StubText  # noqa: F401  registers "stub_text"
 
     from dew.config import ModelConfig, TrainerConfig
-    from dew.data import Dataset, OxfordFlowers
+    from dew.data import Dataset, TFDSImages
     from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
     from dew.sampling import Euler
     from dew.training import Trainer
@@ -249,7 +249,7 @@ def test_a_latent_run_trains_behind_the_rae_and_samples_its_image_size(source):
     config = DiffusionRunConfig(
         model=ModelConfig("simple_dit", dict(patch_size=1, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1),
                           dtype="float32", attention_impl="reference"),
-        data=OxfordFlowers(image_size=64), trainer=TrainerConfig(batch_size=8, steps=2),
+        data=TFDSImages(image_size=64), trainer=TrainerConfig(batch_size=8, steps=2),
         sampler=Euler(), sampling_steps=2, text=TextCondition(encoder="stub_text", checkpoint="stub-clip"),
         autoencoder=PretrainedAutoencoder(modelname=str(source / "siglip2"), revision="main", dtype="float32"))
     objective = config.build()

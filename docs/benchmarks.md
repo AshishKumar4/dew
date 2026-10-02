@@ -106,7 +106,7 @@ python tools/benchmark_data.py data:oxford-flowers --batch 8 \
     --data.path <prepared version directory>
 ```
 
-The dataset was Oxford Flowers 102 from local TFDS ArrayRecord files: 8189 records, resized to 64px, with flip and jitter augmentation and CLIP tokenization per record. `OxfordFlowers` reads only prepared ArrayRecords and raises a `ValueError` without `--data.path`, so the command passes it.
+The dataset was Oxford Flowers 102 from local TFDS ArrayRecord files: 8189 records, resized to 64px, with flip and jitter augmentation and CLIP tokenization per record. `TFDSImages` reads only prepared ArrayRecords and raises a `ValueError` without `--data.path`, so the command passes it.
 
 | grain workers | samples/s | p50 step | p95 step |
 |---------------|-----------|----------|----------|

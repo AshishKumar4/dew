@@ -24,7 +24,7 @@ import dew
 import dew.nn.backbones  # registers the models
 from dew.artifacts import VideoGrid
 from dew.config import ModelConfig, RunConfig, TrainerConfig
-from dew.data import Dataset, OxfordFlowers, VideoDataset
+from dew.data import Dataset, TFDSImages, VideoDataset
 from dew.diffusion import FlowMatchPredictionTransform
 from dew.diffusion.presets import EDM, Flow
 from dew.diffusion.schedules import FlowMatchingScheduler
@@ -44,7 +44,7 @@ def run_config(directory, preset=EDM(), encoder="stub_text", checkpoint="stub-cl
     text condition names the registered stub encoder by default."""
     return DiffusionRunConfig(
         model=ModelConfig("simple_dit", dict(MODEL), dtype="float32", attention_impl="reference"),
-        data=OxfordFlowers(image_size=RES),
+        data=TFDSImages(image_size=RES),
         trainer=TrainerConfig(checkpoint_dir=str(directory), batch_size=8, steps=2, keep=1),
         preset=preset, sampler=Euler(), sampling_steps=3,
         text=TextCondition(encoder=encoder, checkpoint=checkpoint))
@@ -335,7 +335,7 @@ def test_an_unconditional_unet_takes_a_step():
             "norm_groups": 4, "attention_configs": [None, {"heads": 2}]}
     config = DiffusionRunConfig(
         model=ModelConfig("unet", unet, dtype="float32", attention_impl="reference"),
-        data=OxfordFlowers(image_size=16), text=None)
+        data=TFDSImages(image_size=16), text=None)
     objective = config.build()
     images = np.zeros((8, 16, 16, 3), np.uint8)
 
