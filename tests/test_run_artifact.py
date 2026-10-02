@@ -52,10 +52,10 @@ def test_python_lm_run_saves_its_inference_record_without_run_json(tmp_path):
 
 
 def test_builtin_process_records_preserve_noise_prediction_and_weights():
-    from dew import presets
+    from dew.diffusion.presets import EDM, Cosine, Flow
     from dew.diffusion.process import Process
-    for name in ('edm', 'flow', 'cosine'):
-        original = presets[name](**({'regime': 'pixel'} if name == 'edm' else {}))()
+    for preset in (EDM(regime='pixel'), Flow(), Cosine()):
+        original = preset()
         rebuilt = Process.from_json(original.to_json())
         time = jnp.linspace(.01, .99, 16)
         np.testing.assert_array_equal(original.schedule.rates(time)[0], rebuilt.schedule.rates(time)[0])
@@ -72,11 +72,13 @@ def test_builtin_process_records_preserve_noise_prediction_and_weights():
 def test_builtin_autoencoder_record_uses_the_saved_parameters():
     from dew.nn.autoencoders import AutoEncoder, AutoencoderKL, StableDiffusionVAE
     image = jnp.ones((1, 8, 8, 3))
-    module = AutoencoderKL(channels=(4,), latent_channels=2, layers_per_block=1, norm_groups=1,
+    module = AutoencoderKL(channels=(4,), latent_channels=2, blocks_per_level=1, norm_groups=1,
                            dtype=jnp.float32)
     variables = module.init(jax.random.key(0), image)
     original = StableDiffusionVAE(model=module, params=variables['params'], dtype=jnp.float32)
     rebuilt = AutoEncoder.from_json(original.to_json(), params=original.params)
-    np.testing.assert_array_equal(original.encode(image), rebuilt.encode(image))
-    latent = original.encode(image)
-    np.testing.assert_array_equal(original.decode(latent), rebuilt.decode(latent))
+    np.testing.assert_array_equal(original.encode(original.params, image),
+                                  rebuilt.encode(rebuilt.params, image))
+    latent = original.encode(original.params, image)
+    np.testing.assert_array_equal(original.decode(original.params, latent),
+                                  rebuilt.decode(rebuilt.params, latent))
