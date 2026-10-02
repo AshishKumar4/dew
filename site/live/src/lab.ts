@@ -80,6 +80,16 @@ export class SnapshotLab extends DurableObject<Env> {
 		return { stage: 'preparing', commit };
 	}
 
+	/** Fixed diagnostics; no arbitrary command execution API is exposed. */
+	async diagnostics(): Promise<unknown> {
+		const process = await this.container.exec(['sh', '-c',
+			'cat /opt/live/prepared.json 2>/dev/null; echo; cat /opt/live/namespace-probe.txt 2>/dev/null; ' +
+			'grep -m1 "model name" /proc/cpuinfo; cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null || true']);
+		const result = await process.output();
+		return { exitCode: result.exitCode, stdout: new TextDecoder().decode(result.stdout),
+			stderr: new TextDecoder().decode(result.stderr) };
+	}
+
 	async snapshot(): Promise<unknown> {
 		await this.status();
 		const state = await this.ctx.storage.get<{ stage?: string }>('state');
