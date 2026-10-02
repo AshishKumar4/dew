@@ -15,6 +15,7 @@ so a new public module has to be placed in GROUPS below before it ships.
 
 from __future__ import annotations
 
+import argparse
 import ast
 import json
 import re
@@ -33,27 +34,28 @@ SOURCE = "https://github.com/AshishKumar4/dew/blob/main/"
 
 GROUPS: list[tuple[str, list[str]]] = [
     ("Top level", ["dew"]),
-    ("Training", ["dew.training", "dew.training.state", "dew.training.optim", "dew.training.quantization", "dew.training.posthoc",
-                  "dew.training.runtime", "dew.training.distributed"]),
+    ("Training", ["dew.training", "dew.training.state", "dew.training.optim", "dew.training.quantization",
+                  "dew.training.runtime", "dew.training.distributed", "dew.training.posthoc"]),
     ("Objectives", ["dew.objectives", "dew.objectives.base", "dew.objectives.lm", "dew.objectives.diffusion",
                     "dew.objectives.diffusion.alignment", "dew.objectives.diffusion.consistency",
                     "dew.objectives.diffusion.end_to_end", "dew.objectives.diffusion.few_step",
                     "dew.objectives.diffusion.guidance_distillation",
                     "dew.objectives.jepa", "dew.objectives.rl", "dew.objectives.rl.flow",
                     "dew.objectives.rl.harbor", "dew.objectives.rl.scheduler"]),
-    ("Data", ["dew.data", "dew.data.chat", "dew.data.images"]),
+    ("Data", ["dew.data", "dew.data.chat", "dew.data.dataset", "dew.data.images"]),
     ("Models", ["dew.registry", "dew.nn.backbones", "dew.nn.backbones.causal_transformer",
                 "dew.nn.backbones.decoder_block", "dew.nn.backbones.layer_plan", "dew.nn.kv_cache",
-                "dew.nn.backbones.flux", "dew.nn.backbones.qwen_image", "dew.nn.backbones.sd3",
-                "dew.nn.backbones.flux2", "dew.nn.backbones.z_image",
-                "dew.nn.backbones.edm2", "dew.nn.mp",
+                "dew.nn.backbones.edm2", "dew.nn.backbones.flux", "dew.nn.backbones.flux2",
+                "dew.nn.backbones.qwen_image", "dew.nn.backbones.sd3", "dew.nn.backbones.z_image", "dew.nn.mp",
                 "dew.nn.diffusion_gemma", "dew.nn.gemma3n", "dew.nn.multimodal",
-                "dew.nn.autoencoders", "dew.nn.kernels", "dew.nn.sharding", "dew.lora"]),
+                "dew.nn.autoencoders", "dew.nn.inputs", "dew.nn.kernels", "dew.nn.sharding", "dew.lora"]),
     ("Diffusion and sampling", ["dew.diffusion", "dew.diffusion.process", "dew.diffusion.schedules",
                                 "dew.diffusion.schedules.source", "dew.diffusion.schedules.source_grids",
                                 "dew.diffusion.presets", "dew.diffusion.discrete", "dew.sampling",
-                                "dew.sampling.solvers", "dew.sampling.flow", "dew.sampling.guidance", "dew.sampling.decoding"]),
-    ("Inference and interop", ["dew.inference", "dew.inference.tasks", "dew.interop", "dew.interop.flaxdiff"]),
+                                "dew.sampling.solvers", "dew.sampling.flow", "dew.sampling.guidance",
+                                "dew.sampling.decoding"]),
+    ("Inference and interop", ["dew.inference", "dew.inference.banks", "dew.inference.tasks",
+                              "dew.interop", "dew.interop.diffusion_gemma", "dew.interop.flaxdiff"]),
     ("Conditions and evaluation", ["dew.inputs", "dew.inputs.encoders", "dew.eval", "dew.eval.harness"]),
     ("Configuration", ["dew.config", "dew.config.sweep"]),
     ("Utilities", ["dew.rl", "dew.artifacts", "dew.telemetry.profile"]),
@@ -404,8 +406,10 @@ def load() -> griffe.Module:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--check", action="store_true", help="Check public API coverage without writing generated files.")
+    args = parser.parse_args()
     package = load()
-    registered = registrations()
 
     def module_of(path: str) -> griffe.Module:
         obj = package if path == "dew" else package[path.removeprefix("dew.")]
@@ -477,6 +481,11 @@ def main() -> None:
             print(f"  {problem}", file=sys.stderr)
         raise SystemExit(1)
 
+    if args.check:
+        print(f"gen_api: {len(PAGES)} pages cover the public API")
+        return
+
+    registered = registrations()
     CONTENT.mkdir(parents=True, exist_ok=True)
     for path in PAGES:
         page = pages[path]

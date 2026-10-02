@@ -1,9 +1,9 @@
-"""Generate the supported-models page from the registries in Dew's source.
+"""Generate the supported-models page from Dew's runtime registries.
 
 The families come from the code, not from a list kept by hand: the decoder
 table `_FAMILY_ENTRIES` and the wrapper table `_WRAPPERS` in
 `dew/interop/hf_decoders.py`, the diffusers pipelines in
-`dew/interop/pretrained.py`, and the classes registered with `@models(...)`.
+`dew/interop/pretrained.py`, and the model registry.
 DECODERS, WRAPPERS and PIPELINES below only give each one a readable name and
 a group. The build fails when the code registers a family those tables do not
 name, or when they name one the code no longer has.
@@ -11,7 +11,7 @@ name, or when they name one the code no longer has.
 
 from __future__ import annotations
 
-import ast
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -19,9 +19,13 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 SITE = REPO / "site"
 SOURCE = "https://github.com/AshishKumar4/dew/blob/main/"
+sys.path.insert(0, str(REPO / "src"))
 
 # model_type -> (name, group). Groups print in the order they first appear.
 DECODERS = {
+    "gpt2": ("GPT-2", "Dense decoders"),
+    "gpt_neox": ("GPT-NeoX", "Dense decoders"),
+    "opt": ("OPT", "Dense decoders"),
     "llama": ("Llama", "Dense decoders"),
     "mistral": ("Mistral", "Dense decoders"),
     "ministral": ("Ministral", "Dense decoders"),
@@ -63,6 +67,7 @@ WRAPPERS = {
     "gemma3n": ("Gemma 3n", "Images, audio"),
     "gemma4": ("Gemma 4", "Images, video, audio"),
     "qwen3_5": ("Qwen 3.5", "Images, video"),
+    "qwen3_5_moe": ("Qwen 3.5 MoE", "Images, video"),
     "llama4": ("Llama 4", "Images"),
     "deepseek_v41": ("DeepSeek V4.1", "Images"),
 }
@@ -75,8 +80,8 @@ PIPELINES = {
     "StableDiffusionXLInpaintPipeline": ("Stable Diffusion XL", "Inpainting"),
     "StableDiffusion3Pipeline": ("Stable Diffusion 3", "Text to image"),
     "FluxPipeline": ("Flux", "Text to image"),
-    "Flux2Pipeline": ("Flux 2", "Text to image"),
-    "Flux2KleinPipeline": ("Flux 2 Klein", "Text to image"),
+    "Flux2Pipeline": ("FLUX.2 [dev]", "Text to image"),
+    "Flux2KleinPipeline": ("FLUX.2 [klein]", "Text to image"),
     "ZImagePipeline": ("Z-Image", "Text to image"),
     "QwenImage21Pipeline": ("Qwen-Image 2.1", "Text to image"),
     "FlaxStableDiffusionPipeline": ("Stable Diffusion, Flax weights", "Text to image"),
@@ -98,89 +103,35 @@ FULL_SIZE = {
 }
 
 
-def module_tree(relative: str) -> ast.Module:
-    return ast.parse((REPO / relative).read_text())
-
-
-def constants(tree: ast.Module) -> dict[str, str]:
-    found = {}
-    for node in tree.body:
-        if (isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
-                and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)):
-            found[node.targets[0].id] = node.value.value
-    return found
-
-
-def assigned(tree: ast.Module, name: str) -> ast.expr:
-    for node in tree.body:
-        target = node.targets[0] if isinstance(node, ast.Assign) else getattr(node, "target", None)
-        if isinstance(target, ast.Name) and target.id == name:
-            return node.value
-    raise SystemExit(f"gen_models: {name} is gone from the source; update scripts/gen_models.py")
-
-
-def family_call(tree: ast.Module, element: ast.expr) -> tuple[ast.Call, dict[str, str]]:
-    """The `DecoderFamily(...)` call an entry of `_FAMILY_ENTRIES` stands for, and its module's string constants.
-
-    An entry is either the call itself or a name bound to one, in this module or
-    imported from another module of the package.
-    """
-    if isinstance(element, ast.Call):
-        return element, constants(tree)
-    if not isinstance(element, ast.Name):
-        raise SystemExit(f"gen_models: cannot read _FAMILY_ENTRIES element {ast.dump(element)[:80]}")
-    for node in tree.body:
-        if isinstance(node, ast.Assign) and any(getattr(t, "id", None) == element.id for t in node.targets):
-            return node.value, constants(tree)
-        if isinstance(node, ast.ImportFrom) and node.module and any(
-                (alias.asname or alias.name) == element.id for alias in node.names):
-            other = module_tree("src/" + node.module.replace(".", "/") + ".py")
-            name = next(alias.name for alias in node.names if (alias.asname or alias.name) == element.id)
-            return family_call(other, ast.Name(id=name))
-    raise SystemExit(f"gen_models: cannot find the definition of {element.id}")
-
-
 def decoder_families() -> list[tuple[str, str, bool]]:
     """(model_type, transformers architecture, has a multimodal wrapper) for every entry of `_FAMILY_ENTRIES`."""
-    tree = module_tree("src/dew/interop/hf_decoders.py")
-    families = []
-    for element in assigned(tree, "_FAMILY_ENTRIES").elts:
-        call, names = family_call(tree, element)
-        types = [e.value if isinstance(e, ast.Constant) else names[e.id] for e in call.args[0].elts]
-        architecture = next(arg.value for arg in call.args[1:] if isinstance(arg, ast.Constant)
-                            and isinstance(arg.value, str) and arg.value[0].isupper())
-        wrapped = any(keyword.arg == "wrapper" for keyword in call.keywords)
-        families += [(model_type, architecture, wrapped) for model_type in types]
-    return families
+    from dew.interop.hf_decoders import _FAMILY_ENTRIES
+
+    return [(model_type, family.architecture, family.wrapper is not None)
+            for family in _FAMILY_ENTRIES for model_type in family.model_types]
 
 
 def wrappers() -> list[str]:
     """The multimodal model_types that load, in source order: the keys of
     `_WRAPPERS`, then the decoder families that register a `wrapper`."""
-    value = assigned(module_tree("src/dew/interop/hf_decoders.py"), "_WRAPPERS")
-    explicit = [key.value for key in value.keys]
+    from dew.interop.hf_decoders import _WRAPPERS
+
+    explicit = list(_WRAPPERS)
     bundled = [model_type for model_type, _, wrapped in decoder_families() if wrapped and model_type not in explicit]
     return explicit + bundled
 
 
 def pipelines() -> list[str]:
-    value = assigned(module_tree("src/dew/interop/pretrained.py"), "_PIPELINE_POLICY")
-    mapping = value.args[0] if isinstance(value, ast.Call) else value
-    return [key.value for key in mapping.keys]
+    from dew.interop.pretrained import _PIPELINE_POLICY
+
+    return list(_PIPELINE_POLICY)
 
 
 def native_models() -> list[tuple[str, str, str]]:
-    """(registered name, class, module path) for every `@models("...")` class."""
-    found = []
-    for path in sorted((REPO / "src/dew").rglob("*.py")):
-        for node in ast.walk(ast.parse(path.read_text())):
-            if isinstance(node, ast.ClassDef):
-                for decorator in node.decorator_list:
-                    if (isinstance(decorator, ast.Call) and isinstance(decorator.func, ast.Name)
-                            and decorator.func.id == "models" and isinstance(decorator.args[0], ast.Constant)):
-                        module = ".".join(path.relative_to(REPO / "src").with_suffix("").parts).removesuffix(".__init__")
-                        found.append((decorator.args[0].value, node.name, module))
-    return sorted(found)
+    """(registered name, class, module path) for every model available through Dew."""
+    from dew import models
+
+    return sorted((name, cls.__name__, cls.__module__) for name, cls in models.items())
 
 
 def check(kind: str, registered: list[str], labelled: dict) -> list[str]:
@@ -198,6 +149,9 @@ def table(header: list[str], rows: list[list[str]]) -> str:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--check", action="store_true", help="Check model coverage without writing generated files.")
+    args = parser.parse_args()
     decoders = decoder_families()
     wrapped = wrappers()
     pipes = pipelines()
@@ -213,6 +167,10 @@ def main() -> None:
         for problem in problems:
             print(f"  {problem}", file=sys.stderr)
         raise SystemExit(1)
+
+    if args.check:
+        print(f"gen_models: {len(decoders)} decoder types, {len(wrapped)} multimodal, {len(pipes)} pipelines, {len(native)} native")
+        return
 
     architecture = {model_type: arch for model_type, arch, _ in decoders}
     groups: dict[str, list[str]] = {}

@@ -167,6 +167,8 @@ class DiffusionGemma(nn.Module):
         """The canvas logits, or with `states` the final normalized states
         before the head (`encode` says why)."""
         tokens = jnp.asarray(tokens, jnp.int32)
+        if self.is_initializing() and self.conditioner is not None:
+            self.conditioner.initialize_parameters()
         embedded = self.decoder.embed_tokens(tokens)
         table = self.decoder.embed_tokens.embedding
         scaled = (embedded * jnp.asarray(math.sqrt(self.text.emb_features), table.dtype)).astype(embedded.dtype)
