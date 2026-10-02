@@ -23,7 +23,7 @@ import jax.numpy as jnp
 import optax
 from flax import struct
 from jax.tree_util import Partial
-from typing_extensions import TypeVar
+from typing_extensions import TypeIs, TypeVar
 
 from dew.artifacts import Artifact, Artifacts
 from dew.records import JSON
@@ -124,6 +124,10 @@ class Aux(Generic[Effects]):
     collection, in which case the clip steps aside."""
     effects: Effects | None = None
     """Additive observations applied once on a supported optimizer commit."""
+
+
+def _has_aux(loss: Loss | tuple[Loss, Aux[Effects]]) -> TypeIs[tuple[Loss, Aux[Effects]]]:
+    return isinstance(loss, tuple) and len(loss) == 2 and isinstance(loss[1], Aux)
 
 
 @dataclass(frozen=True)
@@ -276,8 +280,20 @@ class EMASpec:
 class Objective(ABC, Generic[Loss, Effects]):
     """Define what is being learned: the parameters, the loss, what evaluation produces."""
 
-    inputs: InputSpec
-    """Per-example shapes and dtypes the parameter tree is initialised from."""
+    _inputs: InputSpec | None = None
+
+    @property
+    def inputs(self) -> InputSpec | None:
+        """Declared input shapes, or None for a custom initializer without an InputSpec.
+
+        A property lets built-in objectives narrow this optional research contract.
+        """
+        return self._inputs
+
+    @inputs.setter
+    def inputs(self, inputs: InputSpec | None) -> None:
+        self._inputs = inputs
+
     ema: EMASpec | None = None
     _ema_is_reference: ClassVar[bool] = False
     artifact: type | None = None
@@ -348,7 +364,7 @@ class Objective(ABC, Generic[Loss, Effects]):
         model, head = held.get('model'), held.get('head_tile')
         cached = held.get('_validation_loss_cache')
         if cached is None or cached[0] is not model or cached[1] != head:
-            compiled = jax.jit(lambda variables, batch, step: self.loss(variables, batch, step)[0])
+            compiled = jax.jit(lambda variables, batch, step: self._loss(variables, batch, step)[0])
             cached = (model, head, compiled)
             self._validation_loss_cache = cached
         return cached[2]
@@ -369,13 +385,19 @@ class Objective(ABC, Generic[Loss, Effects]):
         return TrainingScalar(self, name, self.shown.get(name, Shown(better='lower')))
 
     @abstractmethod
-    def loss(self, params: Variables, batch: Batch, step: Step) -> tuple[Loss, Aux[Effects]]:
-        """Additive loss statistics and the reports from one realized batch.
+    def loss(self, params: Variables, batch: Batch, step: Step) -> Loss | tuple[Loss, Aux[Effects]]:
+        """Additive loss statistics, optionally paired with auxiliary reports.
 
         Ratio declares a shared normalization mass. A plain scalar is one
         unit-mass term. Composite statistics are objective-owned Flax PyTrees;
         their leaves add across records before reduce_loss is evaluated.
         """
+
+    def _loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Loss, Aux[Effects]]:
+        loss = self.loss(variables, batch, step)
+        if _has_aux(loss):
+            return loss
+        return loss, Aux(metrics={})
 
     def reduce_loss(self, stats: Loss) -> tuple[jax.Array, jax.Array]:
         """The objective value and whether its statistical support is active."""
@@ -391,7 +413,7 @@ class Objective(ABC, Generic[Loss, Effects]):
 
     def scalar_loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[jax.Array, Aux[Effects]]:
         """Evaluate and reduce the canonical statistics, for direct JAX differentiation."""
-        stats, aux = self.loss(variables, batch, step)
+        stats, aux = self._loss(variables, batch, step)
         value, _ = self.reduce_loss(stats)
         return value, aux
 
