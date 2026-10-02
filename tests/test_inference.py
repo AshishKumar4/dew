@@ -45,7 +45,7 @@ def run_config(directory, preset=EDM(), encoder="stub_text", checkpoint="stub-cl
         model=ModelConfig("simple_dit", dict(MODEL), dtype="float32", attention_impl="reference"),
         data=OxfordFlowers(image_size=RES),
         trainer=TrainerConfig(checkpoint_dir=str(directory), batch_size=8, steps=2, keep=1),
-        preset=preset, sampler=Euler(), sampling_steps=3,
+        preset=preset, solver=Euler(), sampling_steps=3,
         text=TextCondition(encoder=encoder, checkpoint=checkpoint))
 
 
@@ -260,13 +260,13 @@ def test_sampler_and_guidance_are_call_arguments(tmp_path):
     loaded = TextToImage.from_run(str(tmp_path))
     pipe = dataclasses.replace(loaded, params=jax.tree.map(lambda leaf: leaf + 0.05, loaded.params))
     key = jax.random.PRNGKey(1)
-    plain = pipe(["x"], steps=8, guidance=None, sampler=Heun(), key=key).host().images
-    guided = pipe(["x"], steps=8, guidance=CFG(4.0, interval=(0.2, 0.8)), sampler=Heun(), key=key).host().images
+    plain = pipe(["x"], steps=8, guidance=None, solver=Heun(), key=key).host().images
+    guided = pipe(["x"], steps=8, guidance=CFG(4.0, interval=(0.2, 0.8)), solver=Heun(), key=key).host().images
     assert plain.shape == guided.shape == (1, RES, RES, 3)
     assert not np.allclose(plain, guided)
-    assert np.array_equal(pipe(["x"], steps=8, guidance=None, sampler=Heun(), key=key).host().images, plain)
-    assert np.array_equal(pipe(["x"], steps=8, guidance=4.0, sampler=Heun(), key=key).host().images,
-                          pipe(["x"], steps=8, guidance=CFG(4.0), sampler=Heun(), key=key).host().images)
+    assert np.array_equal(pipe(["x"], steps=8, guidance=None, solver=Heun(), key=key).host().images, plain)
+    assert np.array_equal(pipe(["x"], steps=8, guidance=4.0, solver=Heun(), key=key).host().images,
+                          pipe(["x"], steps=8, guidance=CFG(4.0), solver=Heun(), key=key).host().images)
 
 
 def test_the_run_record_refuses_a_field_it_does_not_know(tmp_path):
@@ -455,7 +455,7 @@ def test_objective_pipeline_binds_the_trained_state_in_place(tmp_path):
     objective, state = make_run(tmp_path)
     pipe = objective.pipeline(state)
     assert isinstance(pipe, TextToImage)
-    assert (pipe.steps, pipe.guidance, pipe.sampler) == (objective.steps, objective.guidance, objective.sampler)
+    assert (pipe.steps, pipe.guidance, pipe.solver) == (objective.steps, objective.guidance, objective.solver)
     for expected, bound in zip(jax.tree.leaves(state.averaged), jax.tree.leaves(pipe.params), strict=True):
         assert bound is expected
     live = objective.pipeline(state, ema=False)
@@ -633,19 +633,19 @@ def test_a_grid_prepares_the_process_and_times_and_final_denoise_ends_the_trajec
     plain = TextToImage.from_objective(objective, state.params)
     same = dataclasses.replace(plain, grid=lambda steps: (plain.process, plain.process.times(steps)))
     key = jax.random.key(3)
-    reference = plain(["a"], steps=4, sampler=Heun(), key=key).host().images
-    np.testing.assert_array_equal(same(["a"], steps=4, sampler=Heun(), key=key).host().images, reference)
+    reference = plain(["a"], steps=4, solver=Heun(), key=key).host().images
+    np.testing.assert_array_equal(same(["a"], steps=4, solver=Heun(), key=key).host().images, reference)
     warped = dataclasses.replace(plain, grid=lambda steps: (plain.process, plain.process.times(steps) ** 2))
-    assert not np.allclose(warped(["a"], steps=4, sampler=Heun(), key=key).host().images, reference)
+    assert not np.allclose(warped(["a"], steps=4, solver=Heun(), key=key).host().images, reference)
     open_ended = dataclasses.replace(plain, final_denoise=False)
-    assert not np.allclose(open_ended(["a"], steps=4, sampler=Heun(), key=key).host().images, reference)
+    assert not np.allclose(open_ended(["a"], steps=4, solver=Heun(), key=key).host().images, reference)
     longer = dataclasses.replace(plain, grid=lambda steps: (plain.process, plain.process.times(steps + 1)))
-    np.testing.assert_array_equal(longer(["a"], steps=3, sampler=Heun(), key=key).host().images,
-                                  plain(["a"], steps=4, sampler=Heun(), key=key).host().images)
+    np.testing.assert_array_equal(longer(["a"], steps=3, solver=Heun(), key=key).host().images,
+                                  plain(["a"], steps=4, solver=Heun(), key=key).host().images)
     start = dataclasses.replace(plain, grid=lambda steps: (plain.process, plain.process.times(steps)[:1]),
                                 final_denoise=False)
     prepared = start.prepare(["a"], key=key, steps=4)
-    np.testing.assert_array_equal(start(prepared, steps=4, sampler=Heun(), key=key).images,
+    np.testing.assert_array_equal(start(prepared, steps=4, solver=Heun(), key=key).images,
                                   np.clip(np.asarray(prepared.noise), -1.0, 1.0))
     with pytest.raises(ValueError, match="different source grid"):
         start(prepared, steps=3, key=3)

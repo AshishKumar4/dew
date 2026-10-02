@@ -36,8 +36,7 @@ from typing_extensions import TypeVar
 
 from dew.diffusion.process import Process
 from dew.diffusion.schedules import GeneralizedNoiseScheduler, expand
-from dew.diffusion.transforms import broadcast_rates
-from dew.registry import samplers
+from dew.registry import solvers
 
 # A solver whose state nobody names is a solver over any state: `StateT` is
 # covariant, so `Solver` written bare is the type every concrete solver
@@ -46,7 +45,7 @@ StateT = TypeVar("StateT", covariant=True, default=object)
 
 
 class Solver(Protocol[StateT]):
-    """A step of a sampler, and whatever it carries between steps.
+    """One step of a diffusion solver, and whatever it carries between steps.
 
     `StateT` is that carried value: nothing for a one-step solver, the
     previous model outputs for a multi-step one. It is a type parameter, so a
@@ -98,11 +97,6 @@ def _check_endpoint_domain(process: Process, times: jax.Array, *,
             raise ValueError("sigma=0 target has no finite update: " + reason)
 
 
-def _rates(process: Process, t, t_next, x):
-    schedule = process.sampler_schedule
-    return broadcast_rates(schedule, t, x), broadcast_rates(schedule, t_next, x)
-
-
 def _sigma_integrator(name: str, process: Process) -> GeneralizedNoiseScheduler:
     schedule = process.sampler_schedule
     if not isinstance(schedule, GeneralizedNoiseScheduler):
@@ -135,7 +129,7 @@ def _ancestral(sigma_t, sigma_s):
     return (sigma_s ** 2 - sigma_up ** 2) ** 0.5, sigma_up
 
 
-@samplers("ddpm")
+@solvers("ddpm")
 @dataclass(frozen=True)
 class DDPM:
     """Exact ancestral sampler for the reverse diffusion SDE.
@@ -177,7 +171,8 @@ class DDPM:
         return ()
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
-        (alpha_t, sigma_t), (alpha_s, sigma_s) = _rates(process, t, t_next, x)
+        alpha_t, sigma_t = process.rates(t, like=x)
+        alpha_s, sigma_s = process.rates(t_next, like=x)
         noise = jax.random.normal(key, x.shape, dtype=jnp.float32)
         eps_coeff = (sigma_s ** 2 * alpha_t) / (sigma_t * alpha_s)
         if self.variance == "large":
@@ -189,7 +184,7 @@ class DDPM:
         return alpha_s * denoised + eps_coeff * eps + noise * gamma, state
 
 
-@samplers("ddim")
+@solvers("ddim")
 @dataclass(frozen=True)
 class DDIM:
     """DDIM (Song et al. 2021); `eta` is the stochasticity, 0 deterministic and
@@ -209,7 +204,8 @@ class DDIM:
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
         schedule = process.sampler_schedule
         target = t - schedule.step_interval(t, t_next)
-        (alpha_t, sigma_t), (alpha_s, sigma_s) = _rates(process, t, target, x)
+        alpha_t, sigma_t = process.rates(t, like=x)
+        alpha_s, sigma_s = process.rates(target, like=x)
         if self.eta > 0:
             # DDIM paper eq. 16: eta=0 is deterministic DDIM, eta=1.0 approaches DDPM.
             # The direction term must shrink to keep the marginal variance right.
@@ -221,7 +217,7 @@ class DDIM:
         return alpha_s * denoised + sigma_s * eps, state
 
 
-@samplers("euler")
+@solvers("euler")
 @dataclass(frozen=True)
 class Euler:
     """The DDIM update written as an Euler step of the probability flow ODE.
@@ -231,11 +227,11 @@ class Euler:
         return ()
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
-        stepped, _, _, _ = _euler_step(x, denoised, *_rates(process, t, t_next, x))
+        stepped, _, _, _ = _euler_step(x, denoised, process.rates(t, like=x), process.rates(t_next, like=x))
         return stepped, state
 
 
-@samplers("euler_ancestral")
+@solvers("euler_ancestral")
 @dataclass(frozen=True)
 class EulerAncestral:
     """Euler with the ancestral noise injection of k-diffusion
@@ -248,14 +244,15 @@ class EulerAncestral:
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
         _sigma_integrator("EulerAncestral", process)
-        (_, sigma_t), (_, sigma_s) = _rates(process, t, t_next, x)
+        _, sigma_t = process.rates(t, like=x)
+        _, sigma_s = process.rates(t_next, like=x)
         sigma_down, sigma_up = _ancestral(sigma_t, sigma_s)
         dx = (x - denoised) / sigma_t
         dW = jax.random.normal(key, x.shape) * sigma_up
         return x + dx * (sigma_down - sigma_t) + dW, state
 
 
-@samplers("heun")
+@solvers("heun")
 @dataclass(frozen=True)
 class Heun:
     """Heun's second order method (Karras et al. 2022, Algorithm 2): an Euler
@@ -311,7 +308,8 @@ class Heun:
             x = x + expand(spread, x) * noise
             t = schedule.t_of_sigma(raised)
             denoised, _ = denoise(x, t)
-        source, target = _rates(process, t, t_next, x)
+        source = process.rates(t, like=x)
+        target = process.rates(t_next, like=x)
         sigma_s = target[1]
         x_euler, dx_0, x_0_coeff, dt = _euler_step(x, denoised, source, target)
 
@@ -323,7 +321,7 @@ class Heun:
         return jnp.where(sigma_s > 0, x + 0.5 * (dx_0 + dx_1) * dt, x_euler), state
 
 
-@samplers("rk4")
+@solvers("rk4")
 @dataclass(frozen=True)
 class RK4:
     """Classical Runge-Kutta over dx/dsigma = eps, on a variance exploding
@@ -335,7 +333,8 @@ class RK4:
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
         schedule = _sigma_integrator("RK4", process)
-        (_, sigma_t), (_, sigma_s) = _rates(process, t, t_next, x)
+        _, sigma_t = process.rates(t, like=x)
+        _, sigma_s = process.rates(t_next, like=x)
         dt = sigma_s - sigma_t
 
         def derivative(x_at, sigma):
@@ -348,7 +347,7 @@ class RK4:
         return x + (k1 + 2 * k2 + 2 * k3 + k4) * dt / 6, state
 
 
-@samplers("kdpm2")
+@solvers("kdpm2")
 @dataclass(frozen=True)
 class KDPM2:
     """k-diffusion's DPM-Solver-2 (`sample_dpm_2`), the update of Diffusers
@@ -370,7 +369,8 @@ class KDPM2:
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
         schedule = _sigma_integrator("KDPM2", process)
-        (_, sigma_t), (_, sigma_s) = _rates(process, t, t_next, x)
+        _, sigma_t = process.rates(t, like=x)
+        _, sigma_s = process.rates(t_next, like=x)
 
         def midpoint(_):
             # The final Euler step has no midpoint evaluation at sigma zero.
@@ -472,7 +472,7 @@ def _sde_step(x, denoised, sigma, target):
     return (target / sigma) * x - jnp.expm1(jnp.log(target) - jnp.log(sigma)) * denoised
 
 
-@samplers("dpmsolver_sde")
+@solvers("dpmsolver_sde")
 @dataclass(frozen=True)
 class DPMSolverSDE:
     """Diffusers 0.34.0's `DPMSolverSDEScheduler`, k-diffusion's
@@ -546,7 +546,8 @@ class DPMSolverSDE:
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
         schedule = _sigma_integrator("DPMSolverSDE", process)
-        (_, sigma_t), (_, sigma_s) = _rates(process, t, t_next, x)
+        _, sigma_t = process.rates(t, like=x)
+        _, sigma_s = process.rates(t_next, like=x)
 
         def ancestral(target):
             """The source's `sigma_up`, capped at the target level, and the
@@ -568,7 +569,7 @@ class DPMSolverSDE:
         return jnp.where(sigma_s > 0, stepped, denoised), state
 
 
-@samplers("multistep_dpm")
+@solvers("multistep_dpm")
 @dataclass(frozen=True)
 class MultiStepDPM:
     """A third order multistep integrator of dx/dsigma = eps on a variance
@@ -581,7 +582,8 @@ class MultiStepDPM:
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
         _sigma_integrator("MultiStepDPM", process)
-        (_, sigma_t), (_, sigma_s) = _rates(process, t, t_next, x)
+        _, sigma_t = process.rates(t, like=x)
+        _, sigma_s = process.rates(t_next, like=x)
         dt = sigma_s - sigma_t
         last_eps, last_sigma, older_eps, older_sigma, count = state
 
@@ -705,7 +707,7 @@ def _dpm_terms(algorithm: str, alpha_s, sigma_s, alpha_t, sigma_t, h):
             -2.0 * sigma_t * (psi / h - 1.0), None, sigma_t * jnp.sqrt(jnp.exp(2 * h) - 1.0))
 
 
-@samplers("dpmsolver_multistep")
+@solvers("dpmsolver_multistep")
 @dataclass(frozen=True)
 class DPMSolverMultistep:
     """DPM-Solver (Lu et al. 2022, arXiv 2206.00927) and DPM-Solver++
@@ -760,7 +762,8 @@ class DPMSolverMultistep:
         return _multistep(x, times, self.order)
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
-        (alpha_s0, sigma_s0), (alpha_t, sigma_t) = _rates(process, t, t_next, x)
+        alpha_s0, sigma_s0 = process.rates(t, like=x)
+        alpha_t, sigma_t = process.rates(t_next, like=x)
         history = state.push(denoised if self.algorithm.endswith("++") else eps, alpha_s0, sigma_s0)
         terminal, h = _lambda_step(alpha_s0, sigma_s0, alpha_t, sigma_t)
         a, b, c_midpoint, c_heun, c_2, n = _dpm_terms(
@@ -810,7 +813,7 @@ class Singlestep(NamedTuple):
     orders: jax.Array
 
 
-@samplers("dpmsolver_singlestep")
+@solvers("dpmsolver_singlestep")
 @dataclass(frozen=True)
 class DPMSolverSinglestep:
     """Diffusers 0.34.0's grouped DPM-Solver updates from each group's anchor.
@@ -876,7 +879,8 @@ class DPMSolverSinglestep:
         return Singlestep(_multistep(x, times, self.order), x, jnp.asarray(orders, jnp.int32))
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
-        (alpha_s0, sigma_s0), (alpha_t, sigma_t) = _rates(process, t, t_next, x)
+        alpha_s0, sigma_s0 = process.rates(t, like=x)
+        alpha_t, sigma_t = process.rates(t_next, like=x)
         history = state.history.push(
             denoised if self.algorithm.endswith("++") else eps, alpha_s0, sigma_s0)
         order = jnp.where(jnp.all(sigma_t == 0), 1, state.orders[history.taken])
@@ -988,7 +992,7 @@ def _deis_third(t, b, c, d):
     return jnp.where(infinite_b, 0.0, integral)
 
 
-@samplers("deis")
+@solvers("deis")
 @dataclass(frozen=True)
 class DEIS:
     """DEIS (Zhang and Chen 2023, arXiv 2204.13902) in its log-rho multistep
@@ -1013,7 +1017,8 @@ class DEIS:
         return _multistep(x, times, self.order)
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
-        (alpha_s0, sigma_s0), (alpha_t, sigma_t) = _rates(process, t, t_next, x)
+        alpha_s0, sigma_s0 = process.rates(t, like=x)
+        alpha_t, sigma_t = process.rates(t_next, like=x)
         history = state.push(eps, alpha_s0, sigma_s0)
         terminal, h = _lambda_step(alpha_s0, sigma_s0, alpha_t, sigma_t)
         rho_t = sigma_t / alpha_t
@@ -1092,7 +1097,7 @@ def _unipc_weights(rks, hh, B_h, order: int, predictor: bool):
             for k in range(columns)]
 
 
-@samplers("unipc")
+@solvers("unipc")
 @dataclass(frozen=True)
 class UniPC:
     """UniPC (Zhao et al. 2023, arXiv 2302.04867), Diffusers 0.34.0's
@@ -1174,7 +1179,8 @@ class UniPC:
             (lambda p: lambda _: corrected(p))(p) for p in range(1, self.order + 1)], None)
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
-        (alpha_here, sigma_here), (alpha_t, sigma_t) = _rates(process, t, t_next, x)
+        alpha_here, sigma_here = process.rates(t, like=x)
+        alpha_t, sigma_t = process.rates(t_next, like=x)
         history = state.history
         m_here = denoised if self.predict_x0 else eps
         taken, steps = history.taken, history.steps
@@ -1230,7 +1236,7 @@ def _pndm_step(x, eps, rates_t, rates_s):
     return (alpha_s / alpha_t) * x - (alpha_s ** 2 - alpha_t ** 2) * eps / denominator
 
 
-@samplers("pndm")
+@solvers("pndm")
 @dataclass(frozen=True)
 class PNDM:
     """PNDM (Liu et al. 2022, arXiv 2202.09778), Diffusers 0.34.0's
@@ -1255,9 +1261,10 @@ class PNDM:
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
         schedule = process.sampler_schedule
-        rates_t, rates_s = _rates(process, t, t_next, x)
+        rates_t = process.rates(t, like=x)
+        rates_s = process.rates(t_next, like=x)
         interval = schedule.step_interval(t, t_next)
-        rates_step = broadcast_rates(schedule, t - interval, x)
+        rates_step = process.rates(t - interval, like=x)
         outputs, count = state
         outputs = _push(outputs, eps)
         e0, e1, e2, e3 = outputs[-1], outputs[-2], outputs[-3], outputs[-4]
@@ -1268,8 +1275,8 @@ class PNDM:
             # schedule rounds its interval (Diffusers' integer stride // 2).
             half = schedule.half_interval(t, t_next)
             t_low, t_eval = t - half, t_next + half
-            rates_low = broadcast_rates(schedule, t_low, x)
-            rates_eval = broadcast_rates(schedule, t_eval, x)
+            rates_low = process.rates(t_low, like=x)
+            rates_eval = process.rates(t_eval, like=x)
             k2 = denoise(_pndm_step(x, eps, rates_t, rates_low), t_eval)[1]
             k3 = denoise(_pndm_step(x, k2, rates_t, rates_eval), t_eval)[1]
             k4 = denoise(_pndm_step(x, k3, rates_t, rates_s), t_next)[1]
@@ -1277,7 +1284,7 @@ class PNDM:
 
         def predictor_corrector(_):
             eps_next = denoise(_pndm_step(x, eps, rates_t, rates_step), t_next)[1]
-            correction_source = broadcast_rates(schedule, t_next + interval, x)
+            correction_source = process.rates(t_next + interval, like=x)
             return _pndm_step(x, (eps_next + eps) / 2, correction_source, rates_s)
 
         def adams(k: int):
@@ -1315,7 +1322,7 @@ def _lagrange_integral(nodes: list, j: int, a, b):
     return integral / scale
 
 
-@samplers("lms")
+@solvers("lms")
 @dataclass(frozen=True)
 class LMS:
     """Linear multistep over dx/dsigma = (x - x_0) / sigma, k-diffusion's
@@ -1338,7 +1345,8 @@ class LMS:
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
         _sigma_integrator("LMS", process)
-        (_, sigma_t), (_, sigma_s) = _rates(process, t, t_next, x)
+        _, sigma_t = process.rates(t, like=x)
+        _, sigma_s = process.rates(t_next, like=x)
         derivatives, sigmas, count = state
         derivatives = _push(derivatives, (x - denoised) / sigma_t)
         sigmas = _push(sigmas, sigma_t)
@@ -1353,7 +1361,7 @@ class LMS:
         return stepped, (derivatives, sigmas, count + 1)
 
 
-@samplers("consistency")
+@solvers("consistency")
 @dataclass(frozen=True)
 class Consistency:
     """Multistep consistency sampling (Song et al. 2023, Algorithm 1), the
@@ -1368,14 +1376,14 @@ class Consistency:
         return jnp.zeros((), jnp.int32), jnp.asarray(times.shape[0] - 1, jnp.int32)
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
-        _, (alpha_s, sigma_s) = _rates(process, t, t_next, x)
+        alpha_s, sigma_s = process.rates(t_next, like=x)
         count, steps = state
         noise = jax.random.normal(key, x.shape, dtype=jnp.float32)
         stepped = jnp.where(count == steps - 1, denoised, alpha_s * denoised + sigma_s * noise)
         return stepped, (count + 1, steps)
 
 
-@samplers("tcd")
+@solvers("tcd")
 @dataclass(frozen=True)
 class TCD:
     """Trajectory consistency sampling (Zheng et al. 2024, arXiv 2402.19159),
@@ -1398,8 +1406,8 @@ class TCD:
         return ()
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
-        _, (alpha_s, _) = _rates(process, t, t_next, x)
-        alpha_mid, sigma_mid = broadcast_rates(process.sampler_schedule, (1 - self.eta) * t_next, x)
+        alpha_s, _ = process.rates(t_next, like=x)
+        alpha_mid, sigma_mid = process.rates((1 - self.eta) * t_next, like=x)
         noised = alpha_mid * denoised + sigma_mid * eps
         if self.eta == 0:
             return noised, state

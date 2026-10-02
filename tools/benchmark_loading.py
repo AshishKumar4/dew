@@ -60,7 +60,7 @@ def phases(args):
         if args.sample:
             begin = time.perf_counter()
             result = pipe(['a red fox in a snowy forest'], seed=0, steps=args.steps,
-                          sampler=DPMSolverMultistep(), guidance=CFG(5.0)).host()
+                          solver=DPMSolverMultistep(), guidance=CFG(5.0)).host()
             timings['first_sample_s'] = time.perf_counter() - begin
             timings['from_pretrained_to_first_sample_s'] = time.perf_counter() - load
             timings['process_to_first_sample_s'] = time.perf_counter() - start

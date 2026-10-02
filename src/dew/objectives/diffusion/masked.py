@@ -46,7 +46,7 @@ if TYPE_CHECKING:
 TEXT_KEY = "text"
 
 
-_DEFAULT_SAMPLER = Unmask()
+_DEFAULT_SOLVER = Unmask()
 
 
 @objectives("masked_diffusion")
@@ -69,7 +69,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         *,
         head_chunks: int = 4,
         ema_decay: float | None = 0.999,
-        sampler: Unmask = _DEFAULT_SAMPLER,
+        solver: Unmask = _DEFAULT_SOLVER,
         steps: int = MDLM_STEPS,
         samples: int = 4,
         decode: Callable[[Sequence[int]], str] | None = None,
@@ -77,7 +77,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
     ):
         """Build an MDLM objective over `model` for `seq_len`-token rows.
 
-        `sampler`, `steps` and `samples` are how evaluation unmasks.
+        `solver`, `steps` and `samples` are how evaluation unmasks.
         `decode` turns a row of ids into the text the artifact shows, and
         None shows the ids alone.
 
@@ -92,7 +92,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         self.process = process
         self.seq_len = seq_len
         self.head_chunks = head_chunks
-        self.sampler = sampler
+        self.solver = solver
         self.steps = steps
         self.samples = samples
         self.decode = decode
@@ -107,7 +107,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         from dew.inference.tasks import MaskedGeneration
 
         return MaskedGeneration(self.model, self._pipeline_weights(state, ema), self.process,
-                                processor, sampler=self.sampler, steps=self.steps)
+                                processor, solver=self.solver, steps=self.steps)
 
     def held_variables(self) -> Variables | None:
         """Return the checkpoint this run continues from, or None for a fresh init."""
@@ -208,7 +208,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
     def _sample_impl(self, params, key, *, count: int):
         denoise = self.process.denoiser(self.model, params)
         x_T = self.process.noise(key, (count, self.seq_len))
-        return sample(denoise, x_T, self.steps, solver=self.sampler, key=key)
+        return sample(denoise, x_T, self.steps, solver=self.solver, key=key)
 
     def preview(self, params, batch, step: Step, *, scored=None):
         """Generate the configured display count, then decode on process zero."""

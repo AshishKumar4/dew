@@ -75,7 +75,7 @@ def test_a_run_config_builds_the_unet_and_scores_a_batch():
                                         "attn_resolutions": [2], "channels_per_head": 8},
                           dtype="float32", attention_impl="xla"),
         data=OxfordFlowers(image_size=4), preset=EDM(regime="pixel"),
-        sampler=Euler(), guidance=None, sampling_steps=2, ema_decay=None,
+        solver=Euler(), guidance=None, sampling_steps=2, ema_decay=None,
         val_metrics=(), text=TextCondition(encoder="char_table", checkpoint="char_table"),
         uncertainty=8)
     objective = config.build()
@@ -141,7 +141,7 @@ def test_the_uncertainty_head_learns_each_levels_weighted_error():
     process = presets.EDM(regime="pixel")()
     objective = DiffusionObjective(Linear(), process, InputSpec(Field("image", (4, 4, 3))),
                                    uncertainty=32, ema_decay=None, guidance=None,
-                                   sampler=Euler(), steps=2)
+                                   solver=Euler(), steps=2)
     params = objective.init(jax.random.PRNGKey(0))
     batch = {"image": np.asarray(jax.random.randint(jax.random.PRNGKey(1), (64, 4, 4, 3), 0, 256),
                                  np.uint8)}

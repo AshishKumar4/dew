@@ -67,7 +67,7 @@ def run_config(directory):
                           dtype="float32", attention_impl="reference"),
         data=OxfordFlowers(image_size=RES),
         trainer=TrainerConfig(checkpoint_dir=str(directory), batch_size=BATCH, steps=2),
-        preset=Flow(), sampler=Euler(), sampling_steps=3, guidance=None,
+        preset=Flow(), solver=Euler(), sampling_steps=3, guidance=None,
         text=TextCondition(encoder="t5", checkpoint=str(T5_TINY), max_length=8),
         autoencoder=PretrainedAutoencoder(modelname=str(VAE_TINY), dtype="float32"),
         val_metrics=())

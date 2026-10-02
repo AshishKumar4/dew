@@ -43,7 +43,7 @@ from dew.nn.inputs import (
 )
 from dew.nn.multimodal import MultimodalTransformer
 from dew.objectives.base import Variables
-from dew.registry import presets, samplers
+from dew.registry import presets, solvers
 
 MDLM_STEPS = 64
 """Reverse steps `generate` takes by default, the count MDLM samples with."""
@@ -140,7 +140,7 @@ class DiscreteProcess:
 
     def generate(self, model: nn.Module, variables: Variables, inputs: ModelInputs | jax.typing.ArrayLike,
                  max_new_tokens: int, *, key: int | jax.Array | None = None,
-                 n: int = 1, steps: int = MDLM_STEPS, sampler: Unmask | None = None,
+                 n: int = 1, steps: int = MDLM_STEPS, solver: Unmask | None = None,
                  eos_token_ids: tuple[int, ...] = (), pad_token_id: int = 0) -> CanvasGeneration:
         """Runs native MDLM over one full response span.
 
@@ -148,7 +148,7 @@ class DiscreteProcess:
         the completed response and does not stop bidirectional refinement
         early.
         """
-        solver = Unmask() if sampler is None else sampler
+        solver = Unmask() if solver is None else solver
 
         def resolve() -> tuple[jax.Array, ModelInputs]:
             request = request_key(key)
@@ -214,7 +214,7 @@ class DiscreteDenoiser:
         return filled, log_probs
 
 
-@samplers("unmask")
+@solvers("unmask")
 @dataclass(frozen=True)
 class Unmask:
     """Integrates a `DiscreteProcess` with MDLM's reverse step from t to s < t.
@@ -321,7 +321,7 @@ def _response_inputs(inputs: ModelInputs, width: int, mask_id: int) -> tuple[Mod
 
 
 def _generate(model: nn.Module, variables: Variables, inputs: ModelInputs, keys: jax.Array,
-              process: DiscreteProcess, sampler: Unmask, budget: int, steps: int, n: int,
+              process: DiscreteProcess, solver: Unmask, budget: int, steps: int, n: int,
               eos_ids: tuple[int, ...], pad_id: int) -> CanvasGeneration:
     """The compiled body: one masked walk per row, `n` continuations each.
 
@@ -341,7 +341,7 @@ def _generate(model: nn.Module, variables: Variables, inputs: ModelInputs, keys:
         prepared = jax.tree.map(lambda leaf: leaf[None], prepared)
         denoise = process.denoiser(model, variables, inputs=prepared, mutable_mask=changeable[None])
         def continued(draw_key):
-            tokens = sample(denoise, prepared.tokens, steps, solver=sampler, key=draw_key)[0]
+            tokens = sample(denoise, prepared.tokens, steps, solver=solver, key=draw_key)[0]
             response = tokens[prompt:]
             is_eos = jnp.isin(response, jnp.asarray(eos_ids, jnp.int32))
             first = jnp.min(jnp.where(is_eos, jnp.arange(budget), budget))
@@ -360,7 +360,7 @@ def _generate(model: nn.Module, variables: Variables, inputs: ModelInputs, keys:
 def _compiled(rows: jax.sharding.NamedSharding | None):
     return jax.jit(
         _generate,
-        static_argnames=("model", "process", "sampler", "budget", "steps", "n", "eos_ids", "pad_id"),
+        static_argnames=("model", "process", "solver", "budget", "steps", "n", "eos_ids", "pad_id"),
         in_shardings=(None, rows, rows),
         out_shardings=rows,
     )

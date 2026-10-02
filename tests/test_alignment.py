@@ -69,7 +69,7 @@ def aligned(kind: str = "mlp"):
     alignment = Alignment(encoder, variables, "dit_block_0", weight=0.5, projector=kind, width=8,
                           spatial_norm=0.6 if kind == "conv" else None)
     return DiffusionObjective(model, presets.Flow()(), InputSpec(Field("image", (8, 8, 3))),
-                              guidance=None, sampler=Euler(), steps=2, alignment=alignment)
+                              guidance=None, solver=Euler(), steps=2, alignment=alignment)
 
 
 @pytest.mark.parametrize("kind", ["mlp", "conv"])
@@ -85,7 +85,7 @@ def test_the_objective_adds_the_weighted_alignment_to_the_denoising_mean(kind):
     loss, aux = objective.scalar_loss(params, batch, step)
 
     plain = DiffusionObjective(objective.model, objective.process, objective.inputs, guidance=None,
-                               sampler=Euler(), steps=2)
+                               solver=Euler(), steps=2)
     denoising, _ = plain.scalar_loss({**objective.trainable(params), "encoders": params["encoders"]},
                                batch, step)
     # REPA's total is mse + proj_coeff * alignment; Dew's L2 halves the
@@ -109,4 +109,4 @@ def test_a_layer_the_model_lacks_is_refused():
     alignment = Alignment(objective.alignment.encoder, objective.alignment.variables, "dit_block_9")
     with pytest.raises(ValueError, match="no submodule 'dit_block_9'"):
         DiffusionObjective(objective.model, objective.process, objective.inputs, guidance=None,
-                           sampler=Euler(), steps=2, alignment=alignment).init(jax.random.PRNGKey(0))
+                           solver=Euler(), steps=2, alignment=alignment).init(jax.random.PRNGKey(0))

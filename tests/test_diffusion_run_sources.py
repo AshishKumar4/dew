@@ -69,7 +69,7 @@ def test_a_run_fine_tunes_a_published_pipeline_and_rebinds_it_without_weights(
     directory = pipelines / family / "pipeline"
     size = 16 if family != "qwen_image" else 32
     config = DiffusionRunConfig(pretrained=str(directory), preset=None, model=precision(),
-                                data=OxfordFlowers(image_size=size), sampler=Euler(),
+                                data=OxfordFlowers(image_size=size), solver=Euler(),
                                 guidance=None, sampling_steps=2, unconditional_prob=0.0,
                                 ema_decay=None, val_metrics=())
     objective = config.build()
@@ -93,7 +93,7 @@ def test_a_pretrained_run_refuses_a_preset_of_another_kind(pipelines):
     """Flux was trained as a velocity flow; the default EDM preset is not
     that convention, and a flow preset is."""
     common = dict(pretrained=str(pipelines / "flux" / "pipeline"), model=precision(),
-                  data=OxfordFlowers(image_size=16), sampler=Euler(), guidance=None,
+                  data=OxfordFlowers(image_size=16), solver=Euler(), guidance=None,
                   sampling_steps=2, val_metrics=())
     with pytest.raises(ValueError, match="name a preset of its kind"):
         DiffusionRunConfig(**common).build()
@@ -103,7 +103,7 @@ def test_a_pretrained_run_refuses_a_preset_of_another_kind(pipelines):
 def flow_run(family: str, size: int, pipelines) -> DiffusionRunConfig:
     return DiffusionRunConfig(pretrained=str(pipelines / family / "pipeline"), preset=None,
                               model=precision(), data=OxfordFlowers(image_size=size),
-                              sampler=Euler(), guidance=None, sampling_steps=2,
+                              solver=Euler(), guidance=None, sampling_steps=2,
                               val_metrics=())
 
 
@@ -151,7 +151,7 @@ def test_a_published_family_trains_from_scratch_on_its_pipelines_text_towers(pip
             "heads": 2, "head_dim": 12, "joint_attention_dim": 16, "pooled_projection_dim": 10,
             "guidance_embeds": True, "axes_dims_rope": [4, 4, 4]},
             dtype="float32", attention_impl="xla"),
-        data=OxfordFlowers(image_size=8), preset=Flow(), sampler=Euler(),
+        data=OxfordFlowers(image_size=8), preset=Flow(), solver=Euler(),
         guidance=None, sampling_steps=2, ema_decay=None, val_metrics=(),
         text=TextCondition(encoder="diffusion_text", checkpoint=str(directory)))
     objective = config.build()
@@ -169,7 +169,7 @@ def grpo_run(beta: float = 0.0, directory: str = "./checkpoints") -> DiffusionRu
     return DiffusionRunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 2, "emb_features": 16, "num_layers": 1,
                                          "num_heads": 2}, dtype="float32", attention_impl="xla"),
-        data=OxfordFlowers(image_size=4), preset=Flow(), sampler=Euler(),
+        data=OxfordFlowers(image_size=4), preset=Flow(), solver=Euler(),
         guidance=None, sampling_steps=2, val_metrics=(),
         trainer=TrainerConfig(checkpoint_dir=directory),
         text=TextCondition(encoder="char_table", checkpoint="char_table"),

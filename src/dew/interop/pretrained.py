@@ -540,7 +540,7 @@ class Pretrained:
         if self.task is None:
             raise TypeError("text_to_image needs the source's own call policy")
         return TextToImage(self.model, self.process, self.inputs, self.variables, self.autoencoder,
-                           grid=self.task.grid, final_denoise=False, sampler=self.schedule.solver(),
+                           grid=self.task.grid, final_denoise=False, solver=self.schedule.solver,
                            steps=self.task.steps, guidance=self.task.guidance, finish=self.finish)
 
     def export(self, variables: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:

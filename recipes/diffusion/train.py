@@ -6,7 +6,7 @@
         --model.config '{"patch_size": 4, "emb_features": 512, "num_layers": 12, "num_heads": 8}'
 
 The dataset is a subcommand over the registry (`data:cc12m --data.path /mnt/gcs`),
-and so are the preset (`preset:flow --preset.shift 3.0`), the sampler, the text
+and so are the preset (`preset:flow --preset.shift 3.0`), the solver, the text
 condition (`text:None` for an unconditional run) and the autoencoder
 (`autoencoder:stable-diffusion-autoencoder`). Architecture kwargs go through
 --model.config as one JSON object, straight to the registry. The run spec is

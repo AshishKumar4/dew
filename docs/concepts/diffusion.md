@@ -53,7 +53,7 @@ A `Process` is a frozen dataclass of four parts:
 | Weighting | How the loss weighs each time: the schedule's own weight, a P2-style weight, or Min-SNR |
 | Sampling schedule | The time grid inference walks, when it differs from training |
 
-Three methods serve sampling. `process.noise(key, shape)` draws the starting noise at the highest level. `process.times(steps)` is the descending grid a sampler walks. `process.denoiser(model, params, conditions)` wraps a model and its weights into the function a solver calls, which maps a noisy sample and its time to the model's estimates of the clean sample and of the noise.
+Four methods serve sampling. `process.noise(key, shape)` draws the starting noise at the highest level. `process.times(steps)` is the descending grid a solver walks, and `process.rates(t, like=x)` is that grid's `(alpha, sigma)` at `t`, shaped to broadcast against `x`. `process.denoiser(model, params, conditions)` wraps a model and its weights into the function a solver calls, which maps a noisy sample and its time to the model's estimates of the clean sample and of the noise.
 
 ## Presets
 

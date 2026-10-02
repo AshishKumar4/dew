@@ -127,15 +127,15 @@ class Images(Generic[ArrayT]):
 
 @dataclass(frozen=True, eq=False)
 class TextToImage:
-    """`pipe(prompts, key=0)` or `pipe(prompts, steps=40, guidance=4.0, sampler=Heun(), key=key)`.
+    """`pipe(prompts, key=0)` or `pipe(prompts, steps=40, guidance=4.0, solver=Heun(), key=key)`.
 
     `params` is the objective's whole tree, the EMA copy merged over the live
     weights when the run kept one, so a sample comes from the weights a run
-    publishes. `steps`, `guidance` and `sampler` are the defaults a call
+    publishes. `steps`, `guidance` and `solver` are the defaults a call
     omits; an objective or a loaded source sets them. `grid` prepares the
     process and its explicit time grid for a step count, for a source whose
-    sampler pairs its own sigma and model-time tables; `final_denoise`
-    False ends a trajectory the way those samplers do. `finish` runs on the
+    solver pairs its own sigma and model-time tables; `final_denoise`
+    False ends a trajectory the way those solvers do. `finish` runs on the
     decoded images under the same placement, for a source that ships a
     checker or an output transform.
 
@@ -152,7 +152,7 @@ class TextToImage:
     autoencoder: AutoEncoder | None = None
     steps: int = 50
     guidance: Guidance | None = None
-    sampler: Solver[object] = field(default_factory=DDIM)
+    solver: Solver[object] = field(default_factory=DDIM)
     grid: Callable[[int], tuple[Process, jax.Array]] | None = None
     final_denoise: bool = True
     finish: Callable[[Variables, jax.Array], jax.Array] | None = None
@@ -192,7 +192,7 @@ class TextToImage:
         autoencoder, variables = objective.published_autoencoder(variables)
         return cls(objective.model, objective.process, objective.inputs,
                    _without_loss_heads(variables), autoencoder,
-                   steps=objective.steps, guidance=objective.guidance, sampler=objective.sampler,
+                   steps=objective.steps, guidance=objective.guidance, solver=objective.solver,
                    blank=objective.blank_conditions)
 
     @classmethod
@@ -325,7 +325,7 @@ class TextToImage:
                                grid_steps=count if owns_grid else None,
                                process=process if owns_grid else None, times=selected)
 
-    def _settings(self, mesh, prompts, *, steps, guidance, sampler, key, decode):
+    def _settings(self, mesh, prompts, *, steps, guidance, solver, key, decode):
         """Everything one call settles on the host before it runs the model.
 
         A caller who hands over `DenoisingInputs` gets them checked against
@@ -350,7 +350,7 @@ class TextToImage:
             process, times = self.prepared_process(count)
         if type(decode) is not bool:
             raise ValueError("decode must be a boolean")
-        solver = self.sampler if sampler is None else sampler
+        solver = self.solver if solver is None else solver
         if prepared is not None:
             prepared = self._checked_inputs(prepared, mesh, count)
         controls = (count, times, solver, chosen, self.final_denoise, decode,
@@ -508,7 +508,7 @@ class TextToImage:
         *,
         steps: int | None = None,
         guidance: Guidance | float | None | _Default = _Default.GUIDANCE,
-        sampler: Solver | None = None,
+        solver: Solver | None = None,
         key: int | jax.Array | None = None,
         decode: bool = True,
     ) -> Images:
@@ -519,7 +519,7 @@ class TextToImage:
 
         def resolve():
             return self._settings(mesh, prompts, steps=steps, guidance=guidance,
-                                  sampler=sampler, key=key, decode=decode)
+                                  solver=solver, key=key, decode=decode)
 
         settings = (agreed("image sampling setup", resolve) if mesh is not None else resolve())
         prepared, request, count, process, times, solver, chosen, signature = settings
@@ -708,17 +708,17 @@ def _noise(rows: jax.sharding.NamedSharding | None):
 @functools.cache
 def _run(rows: jax.sharding.NamedSharding | None):
     # Rebinding weights must not change the static compilation identity.
-    def run(model, process, autoencoder, finish, steps, sampler, guidance, final_denoise, times, decode,
+    def run(model, process, autoencoder, finish, steps, solver, guidance, final_denoise, times, decode,
             params, given, null, x_T, key):
         variables = {name: value for name, value in params.items() if name not in ("encoders", "autoencoder")}
         denoise = process.denoiser(model, variables, given, None if guidance is None else null)
         with jax.ensure_compile_time_eval():
             grid = None if times is None else jnp.asarray(times, jnp.float32)
         if grid is None:
-            latents = sample(denoise, x_T, steps, solver=sampler, guidance=guidance,
+            latents = sample(denoise, x_T, steps, solver=solver, guidance=guidance,
                              key=key, final_denoise=final_denoise)
         else:
-            latents = sample(denoise, x_T, solver=sampler, guidance=guidance,
+            latents = sample(denoise, x_T, solver=solver, guidance=guidance,
                              key=key, times=grid, final_denoise=final_denoise)
         if not decode:
             return Images(None, latents=latents)
