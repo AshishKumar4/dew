@@ -10,6 +10,7 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
+from test_rl_surrogate import clipped_surrogate, token_mean
 from test_tool_episodes import (
     EOS,
     GROUPS,
@@ -28,7 +29,7 @@ from dew.data import Dataset
 from dew.objectives.base import Step
 from dew.objectives.rl import EpisodeRollout, PPOObjective, PPORollout, ValueHead
 from dew.objectives.rl.ppo import OLD_VALUES_KEY, RETURNS_KEY
-from dew.rl import clipped_surrogate, clipped_value_loss_terms, gae, token_log_ratio, token_mean
+from dew.rl import clipped_value_loss_terms, gae, token_log_ratio
 from dew.training import Trainer
 
 FIXTURE = Path(__file__).parent / "fixtures/rl/ppo.npz"
