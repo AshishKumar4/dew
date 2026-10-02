@@ -60,7 +60,7 @@ class Config:
     run: Path | None = None
     """The run directory, published checkpoint or Hub repo to score."""
     tokens: Path | None = None
-    """Token directory from tools/tokenize_text.py; its val split is the perplexity set."""
+    """Token directory from `dew tokenize`; its val split is the perplexity set."""
     out: Path = Path("reports/evaluation")
     sequence_length: int = 256
     batch_size: int = 8

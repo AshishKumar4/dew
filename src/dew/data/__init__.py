@@ -46,6 +46,7 @@ from .sources.text import (
     TokenRecords,
     TokenSource,
     TokenWindowSource,
+    write_tokens,
 )
 from .sources.tfds import TFDSOptions
 from .streaming import CombinedOnline, OnlineImages, OnlineVideos
@@ -65,4 +66,4 @@ __all__ = ["IDS_KEY", "MASK_KEY", "ArrayRecordImages",
            "TFDSOptions", "TokenBytes", "TokenColumn",
            "TokenDocumentSource", "TokenRecords", "TokenSource", "TokenWindowSource",
            "TokenWindows", "VideoDataset", "VoxCeleb2", "load", "mixture",
-           "ramped", "tokenizer_for"]
+           "ramped", "tokenizer_for", "write_tokens"]

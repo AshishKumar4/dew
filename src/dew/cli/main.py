@@ -1,4 +1,4 @@
-"""dew: run programs on accelerator clusters and act on run directories.
+"""dew: run programs on accelerator clusters, prepare data and act on run directories.
 
 dew tpu creates, sets up and reaches Cloud TPUs; `dew tpu --help` lists its commands.
 """
@@ -10,8 +10,10 @@ dew tpu creates, sets up and reaches Cloud TPUs; `dew tpu --help` lists its comm
 from __future__ import annotations
 
 import dataclasses
+import json
 import sys
 from collections.abc import Sequence
+from pathlib import Path
 
 import tyro
 
@@ -47,7 +49,41 @@ class Export:
         return 0
 
 
-COMMANDS = {"export": Export, "launch": Launch}
+@dataclasses.dataclass(frozen=True)
+class Tokenize:
+    """Tokenize a text corpus into the train.bin, val.bin and meta.json a token dataset reads."""
+
+    input: str
+    """A text file, or a directory read as every *.txt inside it (recursive)."""
+    out: str
+    """The directory the token files are written into; created if it is not there."""
+    tokenizer: str = "byte"
+    """'byte' for utf-8 bytes, else a Hugging Face tokenizer name."""
+    val_fraction: float = 0.01
+    """The fraction of the token stream held out, from its head, as validation."""
+    pack: bool = False
+    """End every document (input file) with the tokenizer's eos id, so
+    PackedTokens can cut the stream back into documents."""
+
+    def run_command(self) -> int:
+        from dew.data import write_tokens
+
+        if self.tokenizer != "byte":
+            # Every chunk is longer than the model's context, which is the
+            # point of a corpus; without this the tokenizer warns about it.
+            from transformers.utils import logging as hf_logging
+
+            hf_logging.set_verbosity_error()
+        meta = write_tokens(self.input, self.out, tokenizer=self.tokenizer,
+                            val_fraction=self.val_fraction, pack=self.pack)
+        out = Path(self.out)
+        emit(f"wrote {meta['train_tokens']} tokens to {out / 'train.bin'} and "
+             f"{meta['val_tokens']} to {out / 'val.bin'}")
+        emit(f"{out / 'meta.json'}: {json.dumps(meta)}")
+        return 0
+
+
+COMMANDS = {"export": Export, "launch": Launch, "tokenize": Tokenize}
 
 
 def main(argv: Sequence[str] | None = None) -> int:
