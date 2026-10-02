@@ -1075,10 +1075,9 @@ def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dty
     `size` is the (height, width) in pixels the pipeline runs at instead of
     its own, or a video pipeline's (frames, height, width): the geometry its
     conditioning, its training shift and its sampling grid are bound to.
-    Supplied `variables` are a saved tree of the
-    same pipeline, as a run that fine-tuned it wrote them: the modules are
-    built from the directory's metadata and bind those variables, and no
-    weight downloads.
+    Supplied `variables` are a saved tree of the same pipeline, as a run
+    that fine-tuned it wrote them: the modules are built from the
+    directory's metadata and bind those variables, and no weight downloads.
     """
     directory = sources.snapshot(checkpoint, revision, weights=False)
     if not (directory / "model_index.json").is_file():
