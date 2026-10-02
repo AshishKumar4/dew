@@ -300,14 +300,18 @@ def test_every_released_tensor_lands_on_one_leaf_of_the_released_tree(released):
 def test_every_matrix_of_the_released_decoder_shards_by_a_declared_rule(released):
     """No decoder weight of two or more axes is left to the shape heuristic
     unasked: the engram tables alone hold 384M rows a layer, which shard as
-    a vocabulary's do. The ViT's, like every tower's, are the heuristic's."""
-    from dew.nn.sharding import declared_axes, is_heuristic
+    a vocabulary's do. The hyper-connection mixes and DSpark's Markov tables
+    have no side worth naming, and the ViT's, like every tower's, are the
+    heuristic's."""
+    from dew.nn.sharding import declared_axes, parameter_path
 
+    heuristic = {"attn_hc", "ffn_hc", "markov_embed", "markov_head"}
     *_, shapes = released
     leaves = [(jax.tree_util.keystr(path), path, leaf)
               for path, leaf in jax.tree_util.tree_flatten_with_path(shapes)[0]]
     uncovered = [name for name, path, leaf in leaves if "['language_model']" in name and leaf.ndim >= 2
-                 and declared_axes(path, leaf.ndim) is None and not is_heuristic(path)]
+                 and declared_axes(path, leaf.ndim) is None
+                 and not heuristic.intersection(parameter_path(path))]
     assert uncovered == []
     engram = [declared_axes(path, leaf.ndim) for name, path, leaf in leaves
               if name.endswith("['engram']['embed']['embedding']")]

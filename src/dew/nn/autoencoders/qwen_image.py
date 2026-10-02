@@ -1,22 +1,15 @@
 """Qwen-Image 2.1's autoencoder, `AutoencoderKLQwenImage21`, on one frame.
 
 An independent linen port of diffusers 6256aa76
-src/diffusers/models/autoencoders/autoencoder_kl_qwenimage21.py (Apache-2.0),
-which is Wan's causal video VAE specialized to images: every "3D"
-convolution squeezes its frame axis and is a 2D convolution. A single frame
-takes the first-chunk path through the whole stack, which is what this module
-computes, NHWC. The temporal machinery reduces to three facts on that path:
-
-- a temporally downsampling block's average shortcut (`AvgDown3D`) pads one
-  zero frame in front of the frame before it averages, so its channel groups
-  average that zero frame with the image;
-- a temporally upsampling block's duplicate shortcut (`DupUp3D` with
-  `first_chunk`) keeps the second of the two frames it duplicates;
-- `time_conv` runs only from a second frame on. Its weights are held so an
-  export writes them back unchanged; the image path gives them zero gradient.
-
-The decoder clamps its pixels to [-1, 1], as the source's `_decode` does.
-The RMS gammas keep the source's stored `[C, 1, 1(, 1)]` shape.
+autoencoder_kl_qwenimage21.py (Apache-2.0): Wan's causal video VAE for
+images, every 3D convolution squeezed to 2D, NHWC, on the first-chunk path a
+single frame takes. The temporal machinery leaves three facts: the
+downsampling `AvgDown3D` shortcut pads one zero frame in front before
+averaging; the upsampling `DupUp3D` shortcut keeps the second duplicated
+frame; and `time_conv` runs only from a second frame on, its weights held
+so an export writes them back unchanged (zero gradient here). The decoder
+clamps pixels to [-1, 1], and RMS gammas keep the stored `[C, 1, 1(, 1)]`
+shape.
 """
 from __future__ import annotations
 
@@ -102,7 +95,6 @@ class _ResidualBlock(nn.Module):
 class _Attention(nn.Module):
     """Single-head self-attention over the pixels, the projections 1x1 convs."""
 
-    features: int
     dtype: Dtype = jnp.float32
 
     @nn.compact
@@ -122,7 +114,7 @@ class _MidBlock(nn.Module):
     @nn.compact
     def __call__(self, x):
         x = _ResidualBlock(self.features, self.features, self.dtype, name="resnets_0")(x)
-        x = _Attention(self.features, self.dtype, name="attentions_0")(x)
+        x = _Attention(self.dtype, name="attentions_0")(x)
         return _ResidualBlock(self.features, self.features, self.dtype, name="resnets_1")(x)
 
 

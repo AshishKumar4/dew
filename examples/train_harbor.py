@@ -44,12 +44,12 @@ import numpy as np
 import optax
 import tyro
 
-from dew.data import tokenizer_for
+from dew.data import HFTokenizer
 from dew.data.dataset import Dataset
 from dew.inference import NativeRolloutServer, Publication, SafetensorsReload, Server, TextGeneration
 from dew.interop import load_pretrained
+from dew.interop.harbor import HARBOR_KEY, Gateway, HarborSource
 from dew.objectives.rl import GRPOObjective, RolloutScheduler, SchedulerRecord
-from dew.objectives.rl.harbor import HARBOR_KEY, Gateway, HarborSource
 from dew.objectives.rl.scheduler import task_ids
 from dew.objectives.rl.sessions import Task
 from dew.sampling import Sampling
@@ -272,7 +272,7 @@ def smoke_setup(config: Config, source) -> tuple[SmokeGateway, Path, tuple[Path,
         capacity=config.width,
     )
     fake = SmokeGateway(
-        NativeRolloutServer(engine), tokenizer_for(str(FIXTURES / "diffusion-gemma-workflow"))
+        NativeRolloutServer(engine), HFTokenizer(str(FIXTURES / "diffusion-gemma-workflow"))
     )
     threading.Thread(target=fake.serve_forever, daemon=True).start()
     return fake, harbor, tasks

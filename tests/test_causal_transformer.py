@@ -17,7 +17,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 
-from dew.nn.attention import NormalAttention, scaled_dot_product_attention
+from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.mixers import AttentionMixer
 from dew.objectives.lm.chunked import head_logits
@@ -754,47 +754,6 @@ def test_dropout_trains_with_an_rng_and_is_off_by_default(rng):
     assert jnp.array_equal(quiet, model.apply(params, ids))
     noisy = model.apply(params, ids, train=True, rngs={'dropout': jax.random.PRNGKey(1)})
     assert not jnp.allclose(quiet, noisy)
-
-
-def test_normal_attention_param_tree_survives_causal_and_decode(rng):
-    """The diffusion attention gains the flags without gaining parameters, so a
-    checkpoint moves between a bidirectional trainer and a decoding sampler."""
-    x = jax.random.normal(rng, (2, 6, 16))
-    plain = NormalAttention(query_dim=16, heads=2, dim_head=8)
-    causal = NormalAttention(query_dim=16, heads=2, dim_head=8, causal=True, max_seq_len=8)
-    shapes = jax.tree_util.tree_map(jnp.shape, plain.init(rng, x)['params'])
-    assert jax.tree_util.tree_map(jnp.shape, causal.init(rng, x)['params']) == shapes
-
-    decoding = causal.init(rng, x[:, :1], decode=True)
-    assert jax.tree_util.tree_map(jnp.shape, decoding['params']) == shapes
-
-    assert decoding['cache']['cached_key'].shape == (2, 8, 2, 8)
-
-
-def test_normal_attention_decode_matches_a_causal_forward(rng):
-    attention = NormalAttention(query_dim=16, heads=2, dim_head=8, causal=True,
-                                max_seq_len=8, use_bias=False)
-    x = jax.random.normal(rng, (2, 6, 16))
-    params = {'params': attention.init(rng, x)['params']}
-    full = attention.apply(params, x)
-
-    cache = attention.apply(params, x[:, :1], decode=True, mutable=['cache'])[1]['cache']
-    out, mutated = attention.apply({**params, 'cache': cache}, x[:, :3],
-                                   decode=True, mutable=['cache'])
-    assert jnp.allclose(out, full[:, :3], atol=1e-5)
-    cache = mutated['cache']
-    for position in range(3, 6):
-        out, mutated = attention.apply({**params, 'cache': cache},
-                                       x[:, position:position + 1],
-                                       decode=True, mutable=['cache'])
-        cache = mutated['cache']
-        assert jnp.allclose(out[:, 0], full[:, position], atol=1e-5)
-
-
-def test_decoding_without_a_cache_length_is_refused(rng):
-    attention = NormalAttention(query_dim=16, heads=2, dim_head=8, causal=True)
-    with pytest.raises(ValueError, match="max_seq_len"):
-        attention.init(rng, jax.random.normal(rng, (2, 4, 16)), decode=True)
 
 
 def test_a_prompt_longer_than_the_cache_is_refused(rng):

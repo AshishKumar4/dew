@@ -27,7 +27,7 @@ import jax
 import tyro
 
 from dew.config import ModelConfig, OptimConfig, TrainerConfig
-from dew.data import ChatMessages, Loading, tokenizer_for
+from dew.data import ChatMessages, HFTokenizer, Loading
 from dew.data.chat import Role
 from dew.interop import export_run, load_pretrained
 from dew.objectives.lm import LMRunConfig, Perplexity, Samples
@@ -121,7 +121,7 @@ def main(config: Config) -> Path:
     source = load_pretrained(config.model, dtype=run.model.dtype,
                              attention_impl=run.model.attention_impl,
                              max_seq_len=config.sequence_length + run.sample_tokens)
-    words = tokenizer_for(tokenizer)
+    words = HFTokenizer(tokenizer)
     objective = source.lm_objective(
         config.sequence_length,
         loss_role=Role.ASSISTANT,

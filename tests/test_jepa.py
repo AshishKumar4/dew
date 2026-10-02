@@ -17,9 +17,9 @@ from dew.objectives.jepa import (
     JepaVideoEncoder,
     KnnProbe,
     LinearProbe,
+    MultiBlockMask,
     knn_probe_accuracy,
     linear_probe_accuracy,
-    multi_block_mask,
     normalize_targets,
     representation_health,
 )
@@ -33,7 +33,7 @@ FRAMES = 3
 
 @pytest.fixture
 def mask():
-    return multi_block_mask(GRID, num_targets=4, scale=(0.15, 0.2))
+    return MultiBlockMask.for_grid(GRID, num_targets=4, scale=(0.15, 0.2))
 
 
 def make_encoder(**kwargs):
@@ -89,7 +89,7 @@ def test_context_and_targets_are_disjoint(mask):
 
 def test_target_coverage_sits_inside_the_configured_scale():
     scale = (0.15, 0.2)
-    mask = multi_block_mask(GRID, num_targets=4, scale=scale)
+    mask = MultiBlockMask.for_grid(GRID, num_targets=4, scale=scale)
     coverage = mask.block_area / mask.num_patches
     assert scale[0] <= coverage <= scale[1]
     for h, w in mask.block_shapes:
@@ -115,9 +115,9 @@ def test_block_shapes_and_positions_actually_vary(mask):
 
 def test_geometry_that_cannot_exist_is_rejected():
     with pytest.raises(ValueError, match="aspect ratio"):
-        multi_block_mask((4, 4), num_targets=2, scale=(0.18, 0.19))
+        MultiBlockMask.for_grid((4, 4), num_targets=2, scale=(0.18, 0.19))
     with pytest.raises(ValueError, match="no context"):
-        multi_block_mask(GRID, num_targets=6, scale=(0.15, 0.2))
+        MultiBlockMask.for_grid(GRID, num_targets=6, scale=(0.15, 0.2))
 
 
 # --- the encoders and the predictor ----------------------------------------

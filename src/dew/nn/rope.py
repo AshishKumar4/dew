@@ -2,20 +2,13 @@
 decoders use and DeepSeek's interleaved-pair one, Llama 3.1's frequency
 ramp, and YaRN's frequency ramp and attention factor.
 
-YaRN scaling, which both released DeepSeek configs ask for, reshapes the
-inverse frequencies and multiplies the attention scale; the frequency ramp
-is the reference's `_compute_yarn_parameters` and the scale multiplier its
-`yarn_apply_mscale` (transformers 5.16.1, models/deepseek_v3), both with
-`dim` at the rope width, where DeepSeek points `config.head_dim`.
-
-The inverse-frequency tables are static configuration, so they are built on
-the host in NumPy, as transformers builds them in torch on the CPU, and are
-the same on every backend. Each function takes the dtype its tables and
-angles are computed in, `dew.nn.precision.at_least_fp32` of the activations'
-it rotates: float32 below float64, as transformers computes them, and
-float64 for a float64 model. The one transcendental, `theta ** x`, is
-rounded once from float64 (`_base_powers`); transformers' float32 `pow`
-agrees with that to within one ulp.
+YaRN's ramp is transformers 5.16.1's `_compute_yarn_parameters` and its
+scale `yarn_apply_mscale` (models/deepseek_v3), with `dim` at the rope
+width. The inverse-frequency tables are static, built on the host in NumPy
+as transformers builds them on the CPU, in the dtype the angles are computed
+in (`at_least_fp32` of the rotated activations'). The one transcendental,
+`theta ** x`, rounds once from float64 (`_base_powers`), within one ulp of
+transformers' float32 `pow`.
 """
 
 import dataclasses
@@ -47,16 +40,13 @@ def _base_powers(theta: float, exponents: np.ndarray) -> np.ndarray:
 class RopeScaling:
     """Scales rotary frequencies by Llama 3.1's ramp, under the reference's names.
 
-    `_compute_llama3_parameters` (transformers modeling_rope_utils.py:580)
-    divides a frequency by `factor` when its wavelength exceeds
-    original_max_position_embeddings / low_freq_factor, and leaves it alone
-    below original_max_position_embeddings / high_freq_factor. In between it
-    interpolates linearly on
-    (original_max_position_embeddings / wavelength - low_freq_factor)
-    / (high_freq_factor - low_freq_factor).
-
-    `rope_type` is the record's discriminator and only 'llama3' is this
-    ramp; YaRN is a mixer kind's own value.
+    `_compute_llama3_parameters` (modeling_rope_utils.py:580) divides a
+    frequency by `factor` when its wavelength exceeds
+    original_max_position_embeddings / low_freq_factor, keeps it below
+    original_max_position_embeddings / high_freq_factor, and interpolates
+    linearly on (original_max_position_embeddings / wavelength -
+    low_freq_factor) / (high_freq_factor - low_freq_factor) between. Only
+    `rope_type` 'llama3' is this ramp.
     """
 
     factor: float
@@ -100,31 +90,23 @@ def rotary_freqs(positions, head_dim: int, theta: float, rot_dim: int | None = N
                  rope_scaling: RopeScaling | None = None, *, dtype: DTypeLike):
     """Return cos and sin of the rotary angles at absolute `positions`: [P, pairs].
 
-    `positions` may be [P] for one sequence, or [B, P] for a packed batch
-    whose documents each restart at 0; the angle axes line up with the
-    trailing [B, S] either way. The angles are computed in `dtype`, at least
-    fp32 (`at_least_fp32` of the rotated activations'), so a token rotates
-    the same in a prefill and in a single decode step.
+    `positions` is [P], or [B, P] for a packed batch whose documents restart at
+    0. The angles are computed in `dtype` (at least fp32), so a token rotates
+    the same in prefill and decode.
 
-    `rot_dim` narrows the rotation to the first rot_dim dimensions.
-    `partial_rotary_type` names which published convention that is, because
-    the two rotate different angles:
+    `rot_dim` narrows the rotation to the first rot_dim dimensions, under one
+    of two published conventions that rotate different angles:
 
-    - 'proportional' (Gemma 4, modeling_rope_utils.py
-      `_compute_proportional_rope_parameters`): the exponents run over the
-      full head_dim, `theta ** (2i / head_dim)` for the rot_dim // 2 rotated
-      pairs. The rest keep frequency zero, where the rotation is the
-      identity. The output is head_dim // 2 wide.
-    - 'default' (Qwen3.5, modeling_qwen3_5.py:117-124
-      `Qwen3_5TextRotaryEmbedding.compute_default_rope_parameters`): the rope
-      is rot_dim-dimensional, `theta ** (2i / rot_dim)`, and the output is
-      rot_dim // 2 wide. `apply_rotary` passes the trailing dimensions
-      through, the reference's `q_rot, q_pass` split.
+    - 'proportional' (Gemma 4, `_compute_proportional_rope_parameters`):
+      `theta ** (2i / head_dim)` for the rot_dim // 2 rotated pairs, the rest at
+      frequency zero; head_dim // 2 wide.
+    - 'default' (Qwen3.5, modeling_qwen3_5.py:117-124): a rot_dim-wide rope,
+      `theta ** (2i / rot_dim)`, rot_dim // 2 wide; `apply_rotary` passes the
+      rest through, the reference's `q_rot, q_pass` split.
 
-    With rot_dim None both are the full rotation and the type is moot.
-    `rope_scaling` is Llama 3.1's ramp over the base frequencies. It applies
-    before a proportional rope pads its zero-frequency tail, as the
-    reference's `dim = head_dim * partial_rotary_factor` does.
+    `rope_scaling` (Llama 3.1's ramp) applies before a proportional rope pads
+    its zero-frequency tail, as the reference's `dim = head_dim *
+    partial_rotary_factor` does.
     """
     if partial_rotary_type not in ('proportional', 'default'):
         raise ValueError(

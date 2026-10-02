@@ -425,8 +425,9 @@ def byte_level_tokenizer(tmp_path):
     """A byte-level BPE over all 256 bytes, so a code point splits in two."""
     from tokenizers import Tokenizer, decoders, models, pre_tokenizers
     from transformers import AutoTokenizer, PreTrainedTokenizerFast
+    from transformers.convert_slow_tokenizer import bytes_to_unicode
 
-    alphabet = {byte: char for char, byte in decoding.byte_alphabet().items()}
+    alphabet = bytes_to_unicode()
     backend = Tokenizer(models.BPE({alphabet[byte]: byte for byte in range(256)}, [],
                                    unk_token=None))
     backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)

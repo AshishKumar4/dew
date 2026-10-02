@@ -66,6 +66,10 @@ def sample[StateT](
     of `steps` and `times` is passed. `final_denoise=False` returns the last
     point's state without the closing clean prediction, the way those
     samplers end.
+
+    The trajectory is one `lax.scan`, traced at each call: under a caller's
+    `jax.jit` it compiles once, as the pipelines and objectives call it,
+    and called eagerly it traces and compiles the scan again every time.
     """
     if (steps is None) == (times is None):
         raise ValueError("pass exactly one of steps and times")
