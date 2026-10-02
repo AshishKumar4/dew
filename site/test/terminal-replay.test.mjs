@@ -95,6 +95,11 @@ test('prepared frames preserve the final recorded screen and cast provenance', a
 	assert.deepEqual(replay.frames.at(-1).screen, capture.hero.screen);
 	assert.equal(replay.frames.at(-1).time, replay.seconds);
 	assert.equal(replay.columns, capture.hero.columns);
+	const expanded = [...replay.frames.at(-1).screen];
+	while (expanded.length <= replay.final_cursor_row) expanded.push([]);
+	assert.deepEqual(expanded.slice(-replay.source_rows), replay.source_final_screen);
+	assert.equal(replay.source_rows, 30);
+	assert.equal(replay.viewer_rows, 200);
 	assert.ok(replay.frames.some((frame) => JSON.stringify(frame.screen) !== JSON.stringify(capture.hero.screen)));
 	const { createHash } = await import('node:crypto');
 	assert.equal(createHash('sha256').update(await readFile(path.join(dist, 'hero/train.cast'))).digest('hex'), replay.sha256);
