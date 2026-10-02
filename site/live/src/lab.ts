@@ -100,6 +100,32 @@ export class SnapshotLab extends DurableObject<Env> {
 			stderr: new TextDecoder().decode(result.stderr) };
 	}
 
+	/** Start the prompt-only prototype; no visitor code runs in this process. */
+	async service(kind: string): Promise<unknown> {
+		if (kind !== 'text' && kind !== 'image') throw new Error('kind must be text or image');
+		const process = await this.container.exec(['sh', '-c',
+			'nohup runuser -u model -- env HF_HOME=/opt/hf HF_HUB_OFFLINE=1 JAX_PLATFORMS=cpu ' +
+			'JAX_COMPILATION_CACHE_DIR=/opt/xla JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS=0 ' +
+			'JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES=-1 JAX_DEBUG_LOG_MODULES=jax._src.compiler ' +
+			'XLA_FLAGS=--xla_cpu_max_isa=AVX2 DEW_DEMO_KIND="$1" ' +
+			'/opt/venv/bin/python /opt/live/demo.py > /run/dew/service.log 2>&1 </dev/null &', 'service', kind],
+			{ stdout: 'ignore', stderr: 'ignore' });
+		return { launched: await process.exitCode === 0, kind };
+	}
+
+	async serviceStatus(): Promise<unknown> {
+		try {
+			const response = await this.container.getTcpPort(8888).fetch('http://container/health');
+			const process = await this.container.exec(['sh', '-c',
+				'tail -c 8000 /run/dew/service.log 2>/dev/null; echo; ps -eo user,pid,rss,args']);
+			const output = await process.output();
+			return { status: response.status, health: await response.json(),
+				log: new TextDecoder().decode(output.stdout) };
+		} catch (error) {
+			return { error: error instanceof Error ? error.message : String(error) };
+		}
+	}
+
 	async snapshot(): Promise<unknown> {
 		await this.status();
 		const state = await this.ctx.storage.get<{ stage?: string }>('state');
