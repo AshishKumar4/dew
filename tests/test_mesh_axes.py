@@ -744,8 +744,9 @@ def test_a_convolutions_kernel_gradient_under_a_partly_replicated_layout(name):
     alone = jax.grad(loss)(params, x, cotangent, constrained=False)
     mesh = spec.build(jax.devices()[:4])
     with jax.set_mesh(mesh):
+        constrained = True
         split = jax.jit(jax.grad(loss), static_argnums=3)(
-            params, jax.device_put(x, NamedSharding(mesh, rows)), cotangent, constrained=True)
+            params, jax.device_put(x, NamedSharding(mesh, rows)), cotangent, constrained)
 
     # Each kernel entry's and bias entry's gradient sums one product per row
     # and output position, bounded as the taps' above.
