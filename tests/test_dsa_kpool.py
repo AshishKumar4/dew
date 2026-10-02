@@ -40,10 +40,10 @@ B, S, E, H = 2, 11, 32, 4
 PADDED = 3
 """Leading slots of the second row the attention mask marks as padding."""
 
-SETTINGS = dict(
-    q_lora_rank=8, kv_lora_rank=8, qk_nope_head_dim=8, v_head_dim=8,
-    index_n_heads=2, index_head_dim=8, index_topk=4, index_kpool=2,
-    index_kpool_always_select_tail=True)
+SETTINGS = {
+    "q_lora_rank": 8, "kv_lora_rank": 8, "qk_nope_head_dim": 8, "v_head_dim": 8,
+    "index_n_heads": 2, "index_head_dim": 8, "index_topk": 4, "index_kpool": 2,
+    "index_kpool_always_select_tail": True}
 
 
 def reference_block(attention_bias: bool = False) -> Glm5NextTextAttention:
@@ -73,9 +73,9 @@ def dew_leaf(name: str) -> tuple[str, bool]:
     weights scales, biases and the compression tables stay as they are."""
     parts = name.split('.')
     if parts[-1] == 'weight' and parts[-2] in ('q_a_layernorm', 'kv_a_layernorm', 'k_norm'):
-        return '.'.join(parts[:-1] + ['scale']), False
+        return '.'.join([*parts[:-1], 'scale']), False
     if parts[-1] == 'weight':
-        return '.'.join(parts[:-1] + ['kernel']), True
+        return '.'.join([*parts[:-1], 'kernel']), True
     return name, False
 
 

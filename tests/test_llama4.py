@@ -30,10 +30,10 @@ def fixture(name: str) -> dict:
 
 
 def attention(**overrides: Any) -> Llama4Attention:
-    settings: dict[str, Any] = dict(
-        emb_features=HIDDEN, num_heads=HEADS, num_kv_heads=KV_HEADS,
-        head_dim=HEAD_DIM, max_seq_len=32, rope_theta=500000.0,
-        floor_scale=4.0, attn_scale=0.1)
+    settings: dict[str, Any] = {
+        "emb_features": HIDDEN, "num_heads": HEADS, "num_kv_heads": KV_HEADS,
+        "head_dim": HEAD_DIM, "max_seq_len": 32, "rope_theta": 500000.0,
+        "floor_scale": 4.0, "attn_scale": 0.1}
     settings.update(overrides)
     return Llama4Attention(**settings)
 
@@ -63,9 +63,9 @@ def test_a_global_layer_matches_the_reference():
 
 
 @pytest.mark.parametrize("mutation, against", [
-    (dict(use_rope=True, attention_chunk_size=None), "local_output"),
-    (dict(use_rope=True, attention_chunk_size=4, use_qk_norm=False), "local_output"),
-    (dict(use_rope=False, attn_temperature_tuning=False), "global_output"),
+    ({"use_rope": True, "attention_chunk_size": None}, "local_output"),
+    ({"use_rope": True, "attention_chunk_size": 4, "use_qk_norm": False}, "local_output"),
+    ({"use_rope": False, "attn_temperature_tuning": False}, "global_output"),
 ])
 def test_each_rule_is_what_the_parity_tests(mutation, against):
     """Without the chunk, without the norm, or without the temperature, the
@@ -91,7 +91,7 @@ def test_decode_matches_prefill_on_both_rules():
     Tolerance 1e-5; observed 2.4e-07 and 3.6e-07."""
     tensors = fixture("attention")
     hidden = jnp.asarray(tensors["hidden"])
-    for settings in (dict(use_rope=True, attention_chunk_size=4), dict(use_rope=False)):
+    for settings in ({"use_rope": True, "attention_chunk_size": 4}, {"use_rope": False}):
         module = attention(**settings)
         variables = attention_variables(tensors)
         whole = jnp.asarray(module.apply(variables, hidden))

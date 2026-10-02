@@ -419,8 +419,8 @@ def _adapted(model, tree, *, contracted=1, rank=2, alpha=4.0, seed=0):
     adapter = LoRA({("params", "proj"): lora.Target(rank, alpha)})
     keys = iter(jax.random.split(jax.random.key(seed), 2))
     shape = tree["params"]["proj"]["kernel"].shape
-    factors = {"lora_A": jnp.asarray(jax.random.normal(next(keys), shape[:contracted] + (rank,))),
-               "lora_B": jnp.asarray(jax.random.normal(next(keys), (rank,) + shape[contracted:]))}
+    factors = {"lora_A": jnp.asarray(jax.random.normal(next(keys), (*shape[:contracted], rank))),
+               "lora_B": jnp.asarray(jax.random.normal(next(keys), (rank, *shape[contracted:])))}
     adapted_tree = merge(tree, {"params": {"proj": factors}})
     return adapter, adapter.adapt(model), adapted_tree, adapter.merge(adapted_tree)
 

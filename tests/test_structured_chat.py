@@ -328,8 +328,8 @@ def test_text_parts_reach_string_templates_as_text(body):
         {"role": "assistant", "content": [{"type": "text", "text": "Four"},
                                            {"type": "text", "text": "."}]},
     ]
-    desired = [dict(role="user", content="Two plus two?"),
-               dict(role="assistant", content="Four.")]
+    desired = [{"role": "user", "content": "Two plus two?"},
+               {"role": "assistant", "content": "Four."}]
     expected_text = ("<|im_start|>user\nTwo plus two?<|im_end|>\n"
                      "<|im_start|>assistant\nFour.<|im_end|>\n")
 
@@ -536,7 +536,7 @@ def test_a_role_the_template_does_not_read_is_refused(tools_tokenizer):
     nothing; that is refused, not silently trained around. Without tools,
     since a tools block renders before any message and would count as the
     first message's tokens whatever its role."""
-    with_developer = [{"role": "developer", "content": "Answer in French."}] + CONVERSATION
+    with_developer = [{"role": "developer", "content": "Answer in French."}, *CONVERSATION]
     with pytest.raises(ValueError, match=r"message 0 \(developer\) to no tokens"):
         render(tools_tokenizer, with_developer)
 

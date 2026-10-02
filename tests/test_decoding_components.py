@@ -341,8 +341,7 @@ def stop_string_tokenizer(tmp_path):
     from tokenizers import Tokenizer, decoders, models
     from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
-    pieces = ["st", "op", "sto", "pper", "las", "topper", "s", "to", "pped", "stop",
-              "at", "opera", "tion", "x", "yy"] + list("abcdef")
+    pieces = ["st", "op", "sto", "pper", "las", "topper", "s", "to", "pped", "stop", "at", "opera", "tion", "x", "yy", *list("abcdef")]
     vocabulary = {"<unk>": 0}
     vocabulary.update({piece: index for index, piece in enumerate(pieces, start=1)})
     backend = Tokenizer(models.BPE(vocabulary, [], unk_token="<unk>"))
@@ -434,7 +433,7 @@ def test_a_stop_string_split_across_byte_tokens_still_ends_the_row(tmp_path):
     native = decoding.stop_strings(tokenizer, ["é", "stop"], 256)
     oracle = StopStringCriteria(tokenizer, ["é", "stop"])
     checked = jax.jit(decoding.criterion((native,)))
-    rows = [pair, [ord("a")] + pair, [pair[0]], [pair[1]], tokenizer.encode("stop"),
+    rows = [pair, [ord("a"), *pair], [pair[0]], [pair[1]], tokenizer.encode("stop"),
             tokenizer.encode("laststop"), tokenizer.encode("stopat"), tokenizer.encode("héllo")]
     for row in rows:
         width = len(row)

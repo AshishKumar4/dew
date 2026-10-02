@@ -294,14 +294,14 @@ def mla_record(settings: dict) -> dict:
 
 def mla_model(settings: dict, **overrides) -> CausalTransformer:
     """A one-layer decoder whose mixer is the fixture's block."""
-    fields = dict(
-        vocab_size=37, emb_features=settings["hidden_size"], num_layers=1,
-        num_heads=settings["num_attention_heads"],
-        head_dim=settings["qk_nope_head_dim"] + settings["qk_rope_head_dim"],
-        mlp_features=48, max_seq_len=64, rope_theta=float(settings["rope_theta"]),
-        norm_eps=float(settings["rms_norm_eps"]), qk_norm=False,
-        attention_bias=bool(settings["attention_bias"]),
-        mixer=mla_record(settings), attention_impl="reference")
+    fields = {
+        "vocab_size": 37, "emb_features": settings["hidden_size"], "num_layers": 1,
+        "num_heads": settings["num_attention_heads"],
+        "head_dim": settings["qk_nope_head_dim"] + settings["qk_rope_head_dim"],
+        "mlp_features": 48, "max_seq_len": 64, "rope_theta": float(settings["rope_theta"]),
+        "norm_eps": float(settings["rms_norm_eps"]), "qk_norm": False,
+        "attention_bias": bool(settings["attention_bias"]),
+        "mixer": mla_record(settings), "attention_impl": "reference"}
     return CausalTransformer(**{**fields, **overrides})
 
 

@@ -29,15 +29,15 @@ SEQ = 8
 
 
 def tiny(**overrides):
-    config = dict(vocab_size=VOCAB, emb_features=32, num_layers=2, num_heads=4,
-                  mlp_features=64, max_seq_len=16)
+    config = {"vocab_size": VOCAB, "emb_features": 32, "num_layers": 2, "num_heads": 4,
+                  "mlp_features": 64, "max_seq_len": 16}
     return CausalTransformer(**{**config, **overrides})
 
 
 def test_no_depths_leaves_the_tree_unchanged():
     params = tiny().init(jax.random.key(0), jnp.ones((1, 8), jnp.int32))
 
-    assert [key for key in params["params"]] == [
+    assert list(params["params"]) == [
         "embed_tokens", "layers_0", "layers_1", "norm"]
 
 
@@ -61,7 +61,7 @@ def test_mean_stream_trunk_exposes_normalized_states_to_plain_prediction():
     hidden = jnp.asarray(model.apply(variables, ids, method=CausalTransformer.hidden_states))
     state, _ = model.apply(variables, ids, method=CausalTransformer.states_and_logits)
     state = jnp.asarray(state)
-    assert state.shape == ids.shape + (model.emb_features,)
+    assert state.shape == (*ids.shape, model.emb_features)
     np.testing.assert_array_equal(state, hidden)
     doubled = {**variables, 'params': {**variables['params'], 'norm': {
         **variables['params']['norm'], 'scale': variables['params']['norm']['scale'] * 2}}}

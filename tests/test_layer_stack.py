@@ -286,8 +286,8 @@ def test_a_scanned_moe_stack_sows_and_balances_like_the_plain_loop():
         lambda a, b: float(jnp.max(jnp.abs(a - b))), moe, scanned_moe))) < 1e-6
 
 
-TINY = dict(vocab_size=VOCAB, emb_features=32, num_layers=4, num_heads=4,
-            num_kv_heads=2, mlp_features=64, max_seq_len=SEQ_LEN)
+TINY = {"vocab_size": VOCAB, "emb_features": 32, "num_layers": 4, "num_heads": 4,
+            "num_kv_heads": 2, "mlp_features": 64, "max_seq_len": SEQ_LEN}
 
 
 def tiny(**overrides):

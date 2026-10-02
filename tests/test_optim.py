@@ -503,9 +503,9 @@ def test_the_threshold_rides_optimizer_opts():
 
 
 def tiny_decoder(**overrides):
-    fields = dict(vocab_size=32, emb_features=16, num_layers=2, num_heads=4,
-                  num_kv_heads=2, mlp_features=32, max_seq_len=8,
-                  qk_norm=False)
+    fields = {'vocab_size': 32, 'emb_features': 16, 'num_layers': 2, 'num_heads': 4,
+                  'num_kv_heads': 2, 'mlp_features': 32, 'max_seq_len': 8,
+                  'qk_norm': False}
     fields.update(overrides)
     return CausalTransformer(**fields)
 

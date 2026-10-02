@@ -24,8 +24,8 @@ from dew.nn.mixers import AttentionMixer, MixerBase, MixerContext, mixers
 from dew.registry import models
 
 VOCAB = 37
-TINY = dict(vocab_size=VOCAB, emb_features=32, num_layers=2, num_heads=4,
-            mlp_features=64, max_seq_len=16)
+TINY = {"vocab_size": VOCAB, "emb_features": 32, "num_layers": 2, "num_heads": 4,
+            "mlp_features": 64, "max_seq_len": 16}
 
 
 def tiny(**overrides):

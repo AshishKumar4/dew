@@ -40,7 +40,7 @@ def every_sequence(model, params, prompt, budget, eos_ids=()):
         following = []
         for index, (seq, total) in enumerate(live):
             for token in range(VOCAB):
-                grown, score = seq + [token], float(total + scores[index, token])
+                grown, score = [*seq, token], float(total + scores[index, token])
                 if token in eos_ids or position + 1 == budget:
                     done.append((grown, score, token in eos_ids))
                 else:
@@ -56,7 +56,7 @@ def host_beam(model, params, prompt, budget, width, eos_ids, penalty, early=Fals
     for position in range(budget):
         scores = next_log_probs(model, params, [list(prompt) + seq for seq, _ in running])
         candidates = sorted(
-            ((seq + [token], float(total + scores[index, token]), token)
+            (([*seq, token], float(total + scores[index, token]), token)
              for index, (seq, total) in enumerate(running) for token in range(VOCAB)),
             key=lambda entry: -entry[1])[:keep]
         hits = [entry[2] in eos_ids or position + 1 == budget for entry in candidates]
@@ -186,7 +186,7 @@ def host_beam_shaped(model, params, prompt, budget, width, eos_ids, penalty, ear
         rows = [list(prompt) + seq for seq, _ in running]
         scores = shaped(model, params, rows, entries, renormalize)
         candidates = sorted(
-            ((seq + [token], float(total + scores[index, token]), token)
+            (([*seq, token], float(total + scores[index, token]), token)
              for index, (seq, total) in enumerate(running) for token in range(VOCAB)),
             key=lambda entry: -entry[1])[:keep]
         hits = [entry[2] in eos_ids or position + 1 == budget for entry in candidates]

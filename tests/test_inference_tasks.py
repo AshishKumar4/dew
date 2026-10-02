@@ -86,7 +86,7 @@ def test_a_pretrained_bundle_fine_tunes_identically_to_explicit_wiring():
 
     source = load_pretrained(FIXTURES / "llama-tiny", dtype="float32", attention_impl="xla",
                              max_seq_len=8)
-    options = dict(ema_decay=None, head_chunks=1, pad_id=0, z_loss=1e-4)
+    options = {"ema_decay": None, "head_chunks": 1, "pad_id": 0, "z_loss": 1e-4}
     explicit = LMObjective(source.model, 4, pretrained=source.variables, **options)
     bundled = source.lm_objective(4, **options)
     key = jax.random.key(41)
@@ -362,8 +362,8 @@ def test_pipeline_publishes_the_updated_policy_not_the_frozen_reference(kind, tm
     checkpoints = Checkpoints(str(tmp_path))
     checkpoints.save(int(state.step), state, None)
     checkpoints.wait()
-    config = ModelConfig("causal_transformer", dict(vocab_size=8, emb_features=16, num_layers=1,
-        num_heads=2, mlp_features=32, max_seq_len=8), dtype="float32", attention_impl="xla")
+    config = ModelConfig("causal_transformer", {"vocab_size": 8, "emb_features": 16, "num_layers": 1,
+        "num_heads": 2, "mlp_features": 32, "max_seq_len": 8}, dtype="float32", attention_impl="xla")
     (tmp_path / "run.json").write_text(json.dumps({"objective": kind, "model": asdict(config),
         "tokenizer": "byte", "sample_tokens": 1, "sampling": asdict(sampling)}))
     restored = dew.pipeline(str(tmp_path))([[1, 2]], key=3).host()

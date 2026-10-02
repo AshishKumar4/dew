@@ -315,7 +315,7 @@ def test_a_mixture_computes_its_own_pass_and_takes_no_record_count(two_splits):
 def document_dir(root: Path, documents, eos: int = 0) -> str:
     """A token directory whose stream is `documents`, each closed by eos."""
     root.mkdir(parents=True, exist_ok=True)
-    stream = np.concatenate([np.asarray(list(document) + [eos], np.uint16)
+    stream = np.concatenate([np.asarray([*list(document), eos], np.uint16)
                              for document in documents])
     (root / "train.bin").write_bytes(stream.tobytes())
     (root / "val.bin").write_bytes(stream.tobytes())

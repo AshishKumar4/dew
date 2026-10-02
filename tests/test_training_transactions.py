@@ -66,9 +66,9 @@ class Tiny(Objective[Ratio | Terms, None]):
         return main + .1 * row + auxiliary, a | b | (stats.positions > 0)
 
 def batches():
-    return [dict(y=jnp.tile(jnp.array([1., 2.]), jax.device_count()),
-                 mask=jnp.tile(jnp.array(mask), jax.device_count()),
-                 bad=jnp.array(bad), active=jnp.array(1))
+    return [{"y": jnp.tile(jnp.array([1., 2.]), jax.device_count()),
+                 "mask": jnp.tile(jnp.array(mask), jax.device_count()),
+                 "bad": jnp.array(bad), "active": jnp.array(1)}
             for mask, bad in [([1., 0.], False), ([1., 1.], True), ([.5, 1.], False), ([1., 1.], False)]]
 
 class ShortScaleTrainer(Trainer[Ratio | Terms, None]):

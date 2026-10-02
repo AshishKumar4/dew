@@ -31,7 +31,7 @@ from dew.data import Checkpointable, DataPartition, HFOptions, Loading, TFDSOpti
 
 FIXTURES = Path(__file__).parent / "fixtures" / "tfds"
 PREPARED = FIXTURES / "dew_images" / "1.0.0"
-READ = dict(loading=Loading(workers=0, threads=1, read_buffer=4, worker_buffer=2))
+READ = {"loading": Loading(workers=0, threads=1, read_buffer=4, worker_buffer=2)}
 ROWS = 24
 
 

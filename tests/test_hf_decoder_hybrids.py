@@ -186,7 +186,7 @@ def test_a_per_layer_count_equal_to_the_models_still_translates():
     assert translate_config(config)["kinds"]["full_attention"] == {"head_dim": 32}
 
 
-@pytest.mark.parametrize("name", GEMMA4 + ("gemma4-e2b",))
+@pytest.mark.parametrize("name", (*GEMMA4, "gemma4-e2b"))
 def test_gemma4_checkpoints_load_through_the_translator(name):
     """The full load path on a gemma4 checkpoint: translate, weights, build,
     shape check. Sharing layers own no K/V leaves and the per-layer table
@@ -204,7 +204,7 @@ def test_gemma4_checkpoints_load_through_the_translator(name):
         assert "embed_tokens_per_layer.embedding" in leaves
 
 
-@pytest.mark.parametrize("name", GEMMA4 + ("gemma4-e2b",))
+@pytest.mark.parametrize("name", (*GEMMA4, "gemma4-e2b"))
 def test_gemma4_logits_match_the_reference_implementation(name):
     """Full-model parity, fully live on both branches. Largest observed max
     |logit difference| on CPU: gemma4-ple 4.9e-07, gemma4-kvshare 8.6e-07,

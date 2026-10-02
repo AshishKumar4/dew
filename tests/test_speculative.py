@@ -631,7 +631,7 @@ def test_a_cold_prompt_holds_its_second_depth_back_until_it_has_a_predecessor():
 
     ops = _operations(model, params, 0, 2)
     state, _ = _prefill(model, params, ModelInputs(cold), ops)
-    _, produced, _ = reseed(ops, state, (state.hidden,) + state.drafts,
+    _, produced, _ = reseed(ops, state, (state.hidden, *state.drafts),
                             states[:, 1:], model.apply(params, emitted,
                                                        method=model.token_embeddings),
                             jnp.ones((1, 2), bool), jnp.asarray([[1, 2]], jnp.int32),
@@ -666,7 +666,7 @@ def test_prediction_depths_resume_from_real_history_not_rotary_coordinates(prefi
                          ModelInputs(whole[:, :prefix], {"positions": positions[:, :prefix]}), ops)
     emitted = whole[:, prefix:-1]
     state, _, carried = reseed(
-        ops, state, (state.hidden,) + state.drafts, hidden[:, prefix:-1],
+        ops, state, (state.hidden, *state.drafts), hidden[:, prefix:-1],
         ops.embed(emitted), jnp.ones(emitted.shape, bool), positions[:, prefix:-1],
         jnp.asarray([emitted.shape[1] - 1], jnp.int32),
         prior_tokens=jnp.asarray([prefix], jnp.int32))

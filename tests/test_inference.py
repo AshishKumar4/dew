@@ -35,7 +35,7 @@ from dew.sampling.pipelines import Images, _with_drawn_tables
 from dew.training import Checkpoints, Trainer
 
 RES = 8
-MODEL = dict(patch_size=4, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1)
+MODEL = {"patch_size": 4, "emb_features": 16, "num_layers": 1, "num_heads": 2, "mlp_ratio": 1}
 
 
 def run_config(directory, preset=presets.EDM(), encoder="stub_text", checkpoint="stub-clip"):
@@ -410,8 +410,8 @@ def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16):
     from dew.sampling import Sampling
     from dew.training import MeshSpec
 
-    fields = dict(vocab_size=256, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
-                  mlp_features=32, max_seq_len=max_seq_len)
+    fields = {"vocab_size": 256, "emb_features": 16, "num_layers": 1, "num_heads": 2, "head_dim": 8,
+                  "mlp_features": 32, "max_seq_len": max_seq_len}
     model_config = ModelConfig("causal_transformer", fields, dtype="float32", attention_impl="reference")
     objective = LMObjective(model_config.build(), 8, ema_decay=ema_decay,
                             samples=Samples([1, 2, 3], 4, sampling=Sampling(temperature=0, eos_id=255)))
@@ -546,8 +546,8 @@ def test_a_quantized_runs_record_re_wraps_the_model_it_rebuilds(tmp_path):
     from dew.training.quantization import Quantization
 
     batch, seq = 8, 8
-    fields = dict(vocab_size=256, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
-                  mlp_features=32, max_seq_len=16)
+    fields = {"vocab_size": 256, "emb_features": 16, "num_layers": 1, "num_heads": 2, "head_dim": 8,
+                  "mlp_features": 32, "max_seq_len": 16}
 
     @dataclasses.dataclass(frozen=True)
     class LmRun(RunConfig):

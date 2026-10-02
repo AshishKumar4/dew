@@ -437,14 +437,14 @@ def test_unet3d_inflation_reproduces_2d_unet(rng):
     The checkpoint's Fourier table comes along with its weights."""
     from dew.nn.backbones.unet3d import UNet3D, inflate_unet_variables
 
-    config = dict(
-        emb_features=64,
-        feature_depths=[16, 32],
-        attention_configs=[None, Stage(heads=2, dtype=jnp.float32,
+    config = {
+        "emb_features": 64,
+        "feature_depths": [16, 32],
+        "attention_configs": [None, Stage(heads=2, dtype=jnp.float32,
                                        use_projection=False, use_self_and_cross=False)],
-        num_res_blocks=1,
-        num_middle_res_blocks=1,
-    )
+        "num_res_blocks": 1,
+        "num_middle_res_blocks": 1,
+    }
     model_2d = Unet(**config)
     model_3d = UNet3D(**config, temporal_heads=2)
 
@@ -493,14 +493,14 @@ def test_non_symmetric_attention_configs_place_attention_on_that_stage_alone(rng
     are not, in either the image or the video stack."""
     from dew.nn.backbones.unet3d import UNet3D
 
-    config = dict(
-        emb_features=64,
-        feature_depths=[16, 32],
-        attention_configs=[Stage(heads=2, dtype=jnp.float32,
+    config = {
+        "emb_features": 64,
+        "feature_depths": [16, 32],
+        "attention_configs": [Stage(heads=2, dtype=jnp.float32,
                                  use_projection=False, use_self_and_cross=False), None],
-        num_res_blocks=1,
-        num_middle_res_blocks=1,
-    )
+        "num_res_blocks": 1,
+        "num_middle_res_blocks": 1,
+    }
     temb = jnp.ones((2,))
     textcontext = text()
 
@@ -525,9 +525,9 @@ def test_stages_that_do_not_match_the_feature_depths_are_refused(rng):
     """
     from dew.nn.backbones.unet3d import UNet3D
 
-    config = dict(emb_features=64, feature_depths=[16, 32], num_res_blocks=1,
-                  num_middle_res_blocks=1,
-                  attention_configs=[None, Stage(heads=2), Stage(heads=2)])
+    config = {"emb_features": 64, "feature_depths": [16, 32], "num_res_blocks": 1,
+                  "num_middle_res_blocks": 1,
+                  "attention_configs": [None, Stage(heads=2), Stage(heads=2)]}
     temb, textcontext = jnp.ones((2,)), text()
     with pytest.raises(ValueError, match="3 stages for 2 depths"):
         Unet(**config).init(rng, jax.random.normal(rng, (2, 16, 16, 3)), temb, textcontext)
@@ -666,7 +666,7 @@ def test_a_block_pattern_and_a_ratio_together_are_refused():
                                   block_pattern=("ssm", "attn"), ssm_attention_ratio="1:1")
     with pytest.raises(ValueError, match="ssm_attention_ratio"):
         model.init(jax.random.PRNGKey(0), jnp.zeros((1, 8, 8, 3)), jnp.ones((1,)))
-    for alone in (dict(block_pattern=("ssm", "attn")), dict(ssm_attention_ratio="1:1")):
+    for alone in ({"block_pattern": ("ssm", "attn")}, {"ssm_attention_ratio": "1:1"}):
         HybridSSMAttentionDiT(patch_size=4, emb_features=32, num_layers=2, num_heads=2,
                               **alone).init(jax.random.PRNGKey(0), jnp.zeros((1, 8, 8, 3)),
                                             jnp.ones((1,)))
@@ -703,7 +703,7 @@ def test_layer_norm_matches_flax_bit_for_bit(rng, use_scale, use_bias, dtype):
     checkpoint's outputs, and this is where that shows."""
     x = jax.random.normal(rng, (2, 6, 16), jnp.float32)
     x = x.astype(jnp.bfloat16) if dtype is jnp.bfloat16 else x
-    fields = dict(epsilon=1e-5, use_scale=use_scale, use_bias=use_bias, dtype=dtype)
+    fields = {"epsilon": 1e-5, "use_scale": use_scale, "use_bias": use_bias, "dtype": dtype}
     ours, reference = LayerNorm(**fields), nn.LayerNorm(**fields)
     params, flax_params = ours.init(rng, x), reference.init(rng, x)
 

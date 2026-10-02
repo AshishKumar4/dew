@@ -125,10 +125,10 @@ def test_every_declared_sd3_tensor_is_mapped_or_a_named_buffer(source):
 def test_unsupported_sd3_controls_are_refused():
     """A geometry control whose active meaning this model does not carry fails
     at load rather than being dropped."""
-    config = dict(sample_size=16, patch_size=2, in_channels=4, num_layers=2,
-                  attention_head_dim=8, num_attention_heads=2, joint_attention_dim=12,
-                  caption_projection_dim=16, pooled_projection_dim=10, out_channels=4,
-                  pos_embed_max_size=8)
+    config = {"sample_size": 16, "patch_size": 2, "in_channels": 4, "num_layers": 2,
+                  "attention_head_dim": 8, "num_attention_heads": 2, "joint_attention_dim": 12,
+                  "caption_projection_dim": 16, "pooled_projection_dim": 10, "out_channels": 4,
+                  "pos_embed_max_size": 8}
     assert sd3_fields(config)["qk_norm"] is None
     with pytest.raises(ValueError, match="qk_norm"):
         sd3_fields({**config, "qk_norm": "layer_norm"})

@@ -129,7 +129,7 @@ def test_a_tie_goes_to_the_lowest_column_across_chunk_boundaries():
     _, expected_top1 = reference(hidden, head, targets)
     assert int(expected_top1[0, 0]) == 5, "the reference argmax did not tie-break low"
 
-    for chunks in CHUNKS + [6]:
+    for chunks in [*CHUNKS, 6]:
         _, predicted, _ = chunked_cross_entropy(hidden, head, targets, chunks)
         assert jnp.array_equal(predicted, expected_top1), chunks
 
@@ -242,8 +242,8 @@ def test_dropping_one_chunk_fails_the_parity_check(monkeypatch, dropped):
 # --- against the real backbone ---------------------------------------------
 
 def small_model(**overrides):
-    config = dict(vocab_size=97, emb_features=32, num_layers=2, num_heads=4,
-                  mlp_features=64, max_seq_len=16, dtype=jnp.bfloat16)
+    config = {'vocab_size': 97, 'emb_features': 32, 'num_layers': 2, 'num_heads': 4,
+                  'mlp_features': 64, 'max_seq_len': 16, 'dtype': jnp.bfloat16}
     return CausalTransformer(**{**config, **overrides})
 
 

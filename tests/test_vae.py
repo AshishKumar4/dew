@@ -44,9 +44,9 @@ def test_vae_reconstructs_metadata_without_reloading_supplied_weights(tmp_path, 
     import dew.nn.autoencoders.vae as loader
     from dew.nn.autoencoders import AutoencoderKL, StableDiffusionVAE
 
-    config = dict(block_out_channels=[8, 16], latent_channels=4, in_channels=3,
-                  layers_per_block=1, norm_num_groups=4, use_quant_conv=False,
-                  use_post_quant_conv=False, shift_factor=0.25, scaling_factor=0.5)
+    config = {"block_out_channels": [8, 16], "latent_channels": 4, "in_channels": 3,
+                  "layers_per_block": 1, "norm_num_groups": 4, "use_quant_conv": False,
+                  "use_post_quant_conv": False, "shift_factor": 0.25, "scaling_factor": 0.5}
     (tmp_path / "config.json").write_text(json.dumps(config))
     name = str(tmp_path)
     if remote:
@@ -118,9 +118,9 @@ def test_supplied_vae_params_load_offline_with_the_config_an_online_load_chose(t
     import dew.nn.autoencoders.vae as loader
     from dew.nn.autoencoders import AutoencoderKL, StableDiffusionVAE
 
-    config = dict(block_out_channels=[8, 16], latent_channels=4, in_channels=3,
-                  layers_per_block=1, norm_num_groups=4, use_quant_conv=False,
-                  use_post_quant_conv=False, shift_factor=0.25, scaling_factor=0.5)
+    config = {"block_out_channels": [8, 16], "latent_channels": 4, "in_channels": 3,
+                  "layers_per_block": 1, "norm_num_groups": 4, "use_quant_conv": False,
+                  "use_post_quant_conv": False, "shift_factor": 0.25, "scaling_factor": 0.5}
     revision, entries = OFFLINE_CACHES[case]
     repo = tmp_path / "models--fixture--vae"
     (repo / "refs").mkdir(parents=True)

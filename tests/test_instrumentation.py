@@ -615,7 +615,7 @@ def test_the_profiler_runs_once_per_fit(tmp_path, monkeypatch):
     make_trainer(profile=ProfileWindow(str(tmp_path), steps=1, warmup=0)).fit(
         Data(batches), steps=6, log_every=1)
 
-    captures = [path for path in (tmp_path).glob("capture-*")]
+    captures = list((tmp_path).glob("capture-*"))
     assert len(captures) == 1
     assert list(captures[0].glob("**/*.xplane.pb")), "no trace to read"
 

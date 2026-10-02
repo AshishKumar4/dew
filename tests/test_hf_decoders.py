@@ -123,7 +123,7 @@ TINY = ("qwen3-tiny", "gemma3-tiny", "llama-tiny", "mistral-tiny", "qwen2-tiny",
         "gemma-tiny", "gemma2-tiny", "olmo3-tiny", "olmo3-yarn-tiny",
         "llama31-tiny", "gpt2-tiny", "opt-tiny", "gpt-neox-tiny")
 DEEPSEEK = ("deepseek-v3-tiny", "deepseek-v32-tiny")
-ROUTED = DEEPSEEK + ("kimi-k2-tiny", "mixtral-tiny", "qwen3-moe-tiny")
+ROUTED = (*DEEPSEEK, "kimi-k2-tiny", "mixtral-tiny", "qwen3-moe-tiny")
 GEMMA4_MOE = FIXTURES / "gemma4-moe-tiny"
 REAL = FIXTURES / "qwen3-0.6b"
 
@@ -664,10 +664,10 @@ def test_the_llama3_ramp_matches_the_reference_frequencies(head_dim, theta, ramp
 
     from dew.nn.rope import RopeScaling
 
-    config = LlamaConfig.from_dict(dict(
-        hidden_size=head_dim * 4, num_attention_heads=4, head_dim=head_dim,
-        rope_theta=theta, rope_scaling={'rope_type': 'llama3', **ramp},
-        max_position_embeddings=8 * ramp['original_max_position_embeddings']))
+    config = LlamaConfig.from_dict({
+        "hidden_size": head_dim * 4, "num_attention_heads": 4, "head_dim": head_dim,
+        "rope_theta": theta, "rope_scaling": {'rope_type': 'llama3', **ramp},
+        "max_position_embeddings": 8 * ramp['original_max_position_embeddings']})
     reference, attention_factor = ROPE_INIT_FUNCTIONS['llama3'](config, 'cpu')
     assert attention_factor == 1.0
     plain = 1.0 / (theta ** (np.arange(0, head_dim, 2, dtype=np.float32) / head_dim))

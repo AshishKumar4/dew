@@ -247,7 +247,7 @@ def test_a_latent_run_trains_behind_the_rae_and_samples_its_image_size(source):
     from dew.training import Trainer
 
     config = DiffusionRunConfig(
-        model=ModelConfig("simple_dit", dict(patch_size=1, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1),
+        model=ModelConfig("simple_dit", {"patch_size": 1, "emb_features": 16, "num_layers": 1, "num_heads": 2, "mlp_ratio": 1},
                           dtype="float32", attention_impl="reference"),
         data=OxfordFlowers(image_size=64), trainer=TrainerConfig(batch_size=8, steps=2),
         sampler=samplers.Euler(), sampling_steps=2, text=TextCondition(encoder="stub_text", checkpoint="stub-clip"),
