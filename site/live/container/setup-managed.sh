@@ -12,7 +12,7 @@ python3 -m venv /opt/venv
   "dewml @ https://github.com/AshishKumar4/dew/archive/$commit.tar.gz" \
   -c "https://raw.githubusercontent.com/AshishKumar4/dew/$commit/constraints.txt" \
   ipykernel jupyter-kernel-gateway pillow
-useradd --uid 5000 --create-home --shell /usr/sbin/nologin model
+id -u model >/dev/null 2>&1 || useradd --uid 5000 --create-home --shell /usr/sbin/nologin model
 mkdir -p /opt/live /opt/models /opt/hf /opt/xla /run/dew /sessions
 chown model:model /opt/models /opt/hf /opt/xla /run/dew
 chmod 0755 /opt/models /opt/hf /opt/xla
