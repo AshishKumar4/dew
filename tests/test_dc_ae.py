@@ -17,6 +17,7 @@ gradients are written back into the source layout through the same
 import json
 import shutil
 import tarfile
+from importlib import import_module
 from pathlib import Path
 
 import jax
@@ -223,7 +224,7 @@ def test_a_latent_run_trains_behind_the_dc_ae_and_leaves_it_frozen(source):
     name, and a DC-AE module named like another's declaration of fewer axes
     (a bare `proj_out`) left the run unable to place its variables."""
     import optax
-    from test_diffusion_objective import StubText  # noqa: F401  registers "stub_text"
+    import_module("test_diffusion_objective")  # registers "stub_text"
 
     from dew.config import ModelConfig, TrainerConfig
     from dew.data import Dataset, OxfordFlowers

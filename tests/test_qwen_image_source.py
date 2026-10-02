@@ -119,8 +119,9 @@ def test_a_padded_row_is_its_own_prompt_alone(source, arrays, record):
     context, mask = arrays["padded.context"], arrays["padded.mask"]
     times = jnp.asarray(arrays["padded.times"])
     filled = np.where(mask[..., None], context, 7.0)
-    run = lambda values: model.apply({"params": params}, latent, times,  # noqa: E731
-                                     DenoisingCondition(jnp.asarray(values), mask=jnp.asarray(mask)))
+    def run(values):
+        return model.apply({"params": params}, latent, times,
+                                         DenoisingCondition(jnp.asarray(values), mask=jnp.asarray(mask)))
     np.testing.assert_allclose(run(filled), run(context), atol=1e-6)
     # Without the mask the short row reads its padding as prompt.
     unmasked = model.apply({"params": params}, latent, times, DenoisingCondition(jnp.asarray(context)))

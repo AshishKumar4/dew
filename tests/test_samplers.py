@@ -897,8 +897,9 @@ class RecordedPath(DPMSolverSDE):
     def _noise(self, state, first, second, shape):
         starts = jnp.asarray([pair[0] for pair in self.intervals], jnp.float32)
         ends = jnp.asarray([pair[1] for pair in self.intervals], jnp.float32)
-        close = lambda asked, recorded: jnp.abs(asked - recorded) <= 1e-4 * jnp.maximum(  # noqa: E731
-            jnp.abs(recorded), 1e-3)
+        def close(asked, recorded):
+            return jnp.abs(asked - recorded) <= 1e-4 * jnp.maximum(
+                    jnp.abs(recorded), 1e-3)
         weights = (close(first, starts) & close(second, ends)).astype(jnp.float32)
         return jnp.sum(jnp.reshape(weights, (-1,) + (1,) * len(shape)) * self.draws, axis=0)
 
@@ -966,11 +967,13 @@ def test_source_config_rebuilds_its_scheduler_trajectory_and_gradient(name):
         params = model.init(jax.random.PRNGKey(1), jnp.ones((1, *x_T.shape[1:])), jnp.ones((1,)))
         denoise = process.denoiser(model, params, {})
         solver = source_solver(name, schedule)
-        run = lambda value: walk(solver, process, model, value, times)  # noqa: E731
+        def run(value):
+            return walk(solver, process, model, value, times)
         latents = run(x_T)
         assert latents.shape == expected.shape
         assert relative_gap(latents, expected) < 1e-4
-        final = lambda value: run(value)[-1]  # noqa: E731
+        def final(value):
+            return run(value)[-1]
     else:
         model = ConditionalSourceOracle()
         rows = x_T.shape[0]

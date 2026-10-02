@@ -21,6 +21,7 @@ import importlib.util
 import json
 import shutil
 import tarfile
+from importlib import import_module
 from pathlib import Path
 
 import jax
@@ -252,7 +253,7 @@ def test_a_latent_run_trains_behind_the_rae_and_samples_its_image_size(source):
     its per-position normalization, trains the model alone, and samples
     images of the size the decoder paints."""
     import optax
-    from test_diffusion_objective import StubText  # noqa: F401  registers "stub_text"
+    import_module("test_diffusion_objective")  # registers "stub_text"
 
     from dew.config import ModelConfig, TrainerConfig
     from dew.data import Dataset, OxfordFlowers
