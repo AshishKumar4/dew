@@ -83,21 +83,21 @@ def test_partial_image_trajectory_and_refiner_handoff_preserve_latents(tmp_path)
     pixels = np.zeros(shape, np.float32)
     noise = np.full(shape, 0.25, np.float32)
     times = np.asarray(task.process.times(5))
-    prepared = task.prepare(["flower"], image=pixels, noise=noise, times=times, steps=5, seed=3)
+    prepared = task.prepare(["flower"], image=pixels, noise=noise, times=times, steps=5, key=3)
     _, sigma = task.process.sampler_schedule.rates(times[0])
     np.testing.assert_allclose(np.asarray(prepared.noise)[:1], float(sigma) * noise, atol=1e-6, rtol=1e-6)
-    full = task(prepared, seed=3, decode=False).host()
+    full = task(prepared, key=3, decode=False).host()
     assert full.images is None
     # The handoff carries the state at this grid point, not pixels or a newly noised image.
-    prefix = task(replace(prepared, times=tuple(times[:3])), seed=3, decode=False).host()
-    resumed = task.prepare(["flower"], initial=prefix.latents, times=times[2:], steps=5, seed=3)
+    prefix = task(replace(prepared, times=tuple(times[:3])), key=3, decode=False).host()
+    resumed = task.prepare(["flower"], initial=prefix.latents, times=times[2:], steps=5, key=3)
     np.testing.assert_array_equal(np.asarray(resumed.noise)[:1], prefix.latents)
-    tail = task(resumed, seed=3, decode=False).host()
+    tail = task(resumed, key=3, decode=False).host()
     np.testing.assert_allclose(tail.latents, full.latents, atol=1e-6, rtol=1e-6)
-    decoded = task(resumed, seed=3).host()
+    decoded = task(resumed, key=3).host()
     np.testing.assert_array_equal(decoded.images, np.clip(tail.latents, -1, 1))
     with pytest.raises(ValueError, match="already noisy"):
-        task.prepare(["flower"], initial=prefix.latents, noise=noise, seed=3)
+        task.prepare(["flower"], initial=prefix.latents, noise=noise, key=3)
 
 
 

@@ -17,9 +17,10 @@ PAGE = REPO / "site/src/content/docs/examples.md"
 SOURCE = "https://github.com/AshishKumar4/dew/blob/main/"
 
 GROUPS = [
-    ("Train one model", ["readme_demo", "train_lm", "train_flowers", "train_diffusion", "train_jepa"]),
-    ("Run a whole job", ["train_flowers_tpu", "sft_gemma4", "sft_diffusion_gemma", "train_rlvr",
-                         "train_harbor", "evaluate_and_serve"]),
+    ("Train one model", ["readme_demo", "train_lm", "train_masked_lm", "train_flowers",
+                         "train_diffusion", "train_jepa"]),
+    ("Run a whole job", ["train_flowers_tpu", "sft_gemma4", "sft_diffusion_gemma", "sft_diffusion_gemma_images",
+                         "train_rlvr", "train_harbor", "evaluate_and_serve"]),
     ("Sample and inspect", ["sample_text_to_image", "moe_mesh"]),
 ]
 

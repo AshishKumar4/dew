@@ -15,26 +15,36 @@ same mesh under the same rules.
 
 A source is a `LayerBanks`: the shapes it can produce, the variables outside
 the layer stack, and one bank of consecutive layers. A run directory
-(`CheckpointBanks`) and a tree already in memory (`HeldBanks`) are the two
-that ship, and `host_banked` loads either the same way. `CheckpointBanks`
-reads Dew's own run checkpoints; a source that streams a published
-checkpoint too large to hold is not implemented here.
+(`CheckpointBanks`), a tree already in memory (`HeldBanks`), and local HF
+safetensors shards (`SafetensorsBanks`) all answer the same bank interface.
+`host_banked` places whole banks. `stream_banked` instead leaves the decoder
+weights on disk: the existing layer prefetch loop reads one row at execution,
+with one host read-ahead slot and a byte-bounded cache of retained layers.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import itertools
+import json
+import math
+import threading
+import time
 from collections.abc import Mapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
+from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Protocol
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.experimental.layout import Format, Layout as DeviceLayout
-from jax.sharding import NamedSharding, PartitionSpec as P
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P, SingleDeviceSharding
 
+from dew import records
 from dew.nn.backbones.causal_transformer import DecoderBank
+from dew.nn.hyper_connections import Carried
 from dew.objectives.base import Variables, merge
 
 if TYPE_CHECKING:
@@ -216,6 +226,249 @@ class CheckpointBanks:
         return merge(values["params"], values["ema"]) if "ema" in template else values["params"]
 
 
+@dataclasses.dataclass(frozen=True)
+class DiskBankStats:
+    """Cumulative host reads; read time includes layout conversion and can overlap compute."""
+
+    cache_bytes: int
+    hits: int
+    misses: int
+    bytes_read: int
+    read_seconds: float
+    wait_seconds: float
+
+
+class SafetensorsBanks:
+    """Read a local HF decoder checkpoint without materializing its layer stack.
+
+    Translation reuses the ordinary decoder's `SourceLeaf` recipes over
+    read-only memory maps, including expert stacking, transposition and dtype
+    binding. Quantized sources are refused: their codec may dequantize the
+    entire checkpoint before translation, which would violate this bound.
+
+    The cache admits complete layers in read order until `cache_bytes` is
+    full and retains them until `close`. A sequential decoder visits every
+    layer each token; LRU would evict all of them whenever the model exceeds
+    the cache. Retaining a prefix makes a partial cache useful instead.
+    A single read-ahead slot holds the next layer, even with a zero cache.
+    Host weight storage is bounded by cache bytes plus two rows and one
+    leaf's conversion scratch. Embeddings, heads and the KV cache remain
+    resident and are separate from that bound. Mapped pages are released
+    after each read; the kernel's shared filesystem page cache is not a
+    private copy and is not controlled by this cache budget.
+
+    Keep the source open until all executions finish. The files must not be
+    modified in place during its lifetime. `close` drains read-ahead, clears
+    retained rows and releases the maps; a compiled callback cannot read a
+    closed source.
+    """
+
+    def __init__(self, directory: str | Path, *, cache_bytes: int = 0,
+                 param_dtype: str = "auto", read_ahead: bool = True):
+        from dew.interop.hf_decoders import _FAMILIES, _check_tree, translate_config, translate_weights
+        from dew.interop.safetensors_io import read_weights
+        from dew.registry import models, with_precision
+
+        if cache_bytes < 0:
+            raise ValueError("cache_bytes must be nonnegative")
+        folder = Path(directory)
+        config = records.record(json.loads((folder / "config.json").read_text()), "config.json")
+        self.config: Mapping[str, object] = MappingProxyType(config)
+        if self.config.get("quantization_config") or self.config.get("expert_dtype"):
+            raise ValueError("disk banks require unquantized safetensors; a whole-model codec is not bounded")
+        record = translate_config(self.config)
+        family = records.text(self.config.get("model_type"), "model_type")
+        if _FAMILIES[family].prepare_weights is not dict:
+            raise ValueError("disk banks require a family with lazy tensor translation; "
+                             "this family's preparation can materialize checkpoint weights")
+        tensors = read_weights(folder)
+        if param_dtype == "auto":
+            from dew.interop.pretrained import _checkpoint_dtype
+            param_dtype = _checkpoint_dtype(self.config, tensors)
+        self._variables: Variables = translate_weights(
+            tensors, record, family, param_dtype=param_dtype, lazy=True)
+        self._shapes = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), self._variables)
+        _check_tree(self._shapes, models.build("causal_transformer", with_precision(
+            "causal_transformer", record, dtype="float32", attention_impl="reference")))
+        self.cache_limit = cache_bytes
+        self.read_ahead = read_ahead
+        self._cache: dict[tuple[tuple[str, ...], int], Variables] = {}
+        self._cache_bytes = self._hits = self._misses = self._bytes_read = 0
+        self._read_seconds = self._wait_seconds = 0.0
+        self._lock = threading.Lock()
+        self._requests = threading.Lock()
+        self._reader = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dew-disk-bank")
+        self._pending: tuple[tuple[tuple[str, ...], int], Future[Variables]] | None = None
+        self._closed = False
+
+    def __enter__(self) -> SafetensorsBanks:
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.close()
+
+    def close(self) -> None:
+        with self._requests:
+            if self._closed:
+                return
+            self._closed = True
+            self._reader.shutdown(wait=True)
+            self._pending = None
+            with self._lock:
+                self._cache.clear()
+                self._cache_bytes = 0
+            self._variables = {}
+
+    def stats(self) -> DiskBankStats:
+        with self._lock:
+            return DiskBankStats(self._cache_bytes, self._hits, self._misses, self._bytes_read,
+                                 self._read_seconds, self._wait_seconds)
+
+    def shapes(self) -> Variables:
+        return self._shapes
+
+    def layer_bytes(self, index: int, *, namespace: tuple[str, ...] = ()) -> int:
+        return sum(math.prod(leaf.shape) * np.dtype(leaf.dtype).itemsize
+                   for leaf in jax.tree.leaves(one_layer(self._shapes, index, namespace=namespace)))
+
+    def entry(self, placement: Placement) -> Variables:
+        with self._requests:
+            self._check_open()
+            return self._placed(narrowed(self._variables, placement), placement)
+
+    @staticmethod
+    def _placed(variables: Variables, placement: Placement) -> Variables:
+        from dew.training.host import place_leaf
+
+        def place(leaf, target):
+            if not isinstance(target, Format):
+                return place_leaf(leaf, target)
+            try:
+                return jax.block_until_ready(jax.device_put(leaf.read(), target))
+            finally:
+                leaf.release()
+
+        return jax.tree.map(place, variables, placement)
+
+    def bank(self, layers: Sequence[int], placement: Placement, *,
+             namespace: tuple[str, ...] = ()) -> Variables:
+        if len(layers) == 1:
+            with self._requests:
+                self._check_open()
+                row = narrowed(one_layer(self._variables, layers[0], namespace=namespace), placement)
+                return self._placed(row, placement)
+        rows = [self.read(index, namespace=namespace) for index in layers]
+        bank = jax.tree.map(lambda *leaves: np.stack(leaves), *rows)
+        return jax.device_put(bank, placement)
+
+    def read(self, index: int, *, namespace: tuple[str, ...] = (),
+             following: int | None = None) -> Variables:
+        """Read one row and start at most one following row before returning.
+
+        Reads serialize across executions sharing this source. Read-ahead
+        is joined before a different request, so concurrent calls cannot
+        accumulate an unbounded queue of rows.
+        """
+        key = (namespace, index)
+        with self._requests:
+            self._check_open()
+            started = time.perf_counter()
+            pending, self._pending = self._pending, None
+            if pending is not None:
+                row = pending[1].result()
+                if pending[0] != key:
+                    del row
+                    row = self._read(key)
+            else:
+                row = self._read(key)
+            with self._lock:
+                self._wait_seconds += time.perf_counter() - started
+            if self.read_ahead and following is not None:
+                next_key = (namespace, following)
+                self._pending = (next_key, self._reader.submit(self._read, next_key))
+            return row
+
+    def _check_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("the safetensors bank source is closed")
+
+    def _read(self, key: tuple[tuple[str, ...], int]) -> Variables:
+        from dew.interop.streaming import SourceLeaf
+        from dew.training.host import evict
+
+        with self._lock:
+            if key in self._cache:
+                self._hits += 1
+                return self._cache[key]
+        started = time.perf_counter()
+        namespace, index = key
+        stored = one_layer(self._variables, index, namespace=namespace)
+        if not stored:
+            raise ValueError(f"no layer {index} at namespace {namespace}")
+
+        def read_leaf(leaf):
+            try:
+                values = leaf.read() if isinstance(leaf, SourceLeaf) else np.asarray(leaf)
+                # A transposed, cast or stacked SourceLeaf already owns its
+                # C-ordered allocation. Only a borrowed mapped view needs a
+                # private copy before its file pages are released.
+                if not values.flags.owndata or not values.flags.c_contiguous:
+                    values = np.array(values, copy=True, order="C")
+                values.setflags(write=False)
+                return values
+            finally:
+                leaf.release() if isinstance(leaf, SourceLeaf) else evict(leaf)
+
+        with jax.profiler.TraceAnnotation("SSD bank read", layer=index):
+            row = jax.tree.map(read_leaf, stored)
+        size = sum(leaf.nbytes for leaf in jax.tree.leaves(row))
+        with self._lock:
+            self._misses += 1
+            self._bytes_read += size
+            self._read_seconds += time.perf_counter() - started
+            if self._cache_bytes + size <= self.cache_limit:
+                self._cache[key] = row
+                self._cache_bytes += size
+        return row
+
+
+@jax.tree_util.register_static
+@dataclasses.dataclass(frozen=True, eq=False)
+class StreamedBank:
+    """A runtime-only bank handle: no parameter buffer or serialized model field.
+
+    Its identity is static in the variables pytree; changing the source
+    retraces, changing tokens does not. The callback is effectful, so it is
+    neither folded at trace time nor elided when an executable is reused.
+    """
+
+    source: SafetensorsBanks
+    first: int
+    count: int
+    namespace: tuple[str, ...]
+    device: SingleDeviceSharding
+    following: int | None
+
+    def shapes(self) -> Variables:
+        return one_layer(self.source.shapes(), self.first, namespace=self.namespace)
+
+    def fetch(self, index, dependency) -> Variables:
+        from jax.experimental import io_callback
+
+        def read(offset, _dependency):
+            position = self.first + int(offset)
+            following = position + 1 if int(offset) + 1 < self.count else self.following
+            return self.source.read(position, namespace=self.namespace, following=following)
+
+        # Only a scalar is copied to the host. Its data dependence orders a
+        # fetch after the preceding layer, while allowing this layer's
+        # compute to overlap the next host read and device transfer.
+        hidden = dependency.streams if isinstance(dependency, Carried) else dependency
+        with jax.named_scope("ssd_bank_fetch"):
+            return io_callback(read, self.shapes(), index, hidden.reshape(-1)[0],
+                               sharding=self.device, ordered=True)
+
+
 def narrowed(tree: Mapping, selection: Mapping) -> dict:
     """Return the leaf-level intersection of `tree` and `selection`, paths kept."""
     collected = {}
@@ -350,8 +603,33 @@ def _check_shapes(shapes: Variables, site: DecoderBank) -> None:
                 raise ValueError(f"namespace {site.namespace} layers {first} and {index} "
                                  "must have identical leaf paths, shapes and dtypes within one bank")
 
+def _bank_plan(model: BankedModel, source: LayerBanks, mesh: MeshSpec | Mesh | None,
+               layout: Layout | None):
+    """Validate canonical ownership and placement before either loader reads a value."""
+    from dew.training.distributed import Layout as DefaultLayout, MeshSpec as DefaultMesh, build_mesh
+
+    sites = bank_sites(model)
+    shapes = source.shapes()
+    for site in sites:
+        _check_shapes(shapes, site)
+    device_mesh = mesh if isinstance(mesh, Mesh) else build_mesh(DefaultMesh() if mesh is None else mesh)
+    chosen = DefaultLayout() if layout is None else layout
+    placement = chosen.offloaded(device_mesh, shapes)
+    chosen.check(shapes["params"], placement["params"], device_mesh)
+    entries = entry_tree(placement, sites)
+    outside = [jax.tree_util.keystr(path) for path, sharding in
+               jax.tree_util.tree_flatten_with_path(entries)[0] if sharding.memory_kind == "pinned_host"]
+    if outside:
+        raise ValueError(f"host_parameters selected {outside}, which the layer stack does not fetch; "
+                         "select declared decoder layers and keep embeddings, heads and media resident")
+    for site in sites:
+        _check_consumers(in_namespace(placement, site.namespace), site.view.groups)
+
+    return sites, shapes, device_mesh, placement, entries
+
+
 def host_banked(model: BankedModel, source: LayerBanks, *,
-                mesh: MeshSpec | None = None, layout: Layout | None = None) -> Variables:
+                mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None) -> Variables:
     """Build the banked store `model`'s runs read from `source`'s weights.
 
     Each run's bank is read, stacked and placed on its own, and the copies of
@@ -372,24 +650,7 @@ def host_banked(model: BankedModel, source: LayerBanks, *,
     the patterns place differently, leaf for leaf, is refused for the same
     reason: a bank is one array with one sharding.
     """
-    from dew.training.distributed import Layout as DefaultLayout, MeshSpec as DefaultMesh, build_mesh
-
-    sites = bank_sites(model)
-    shapes = source.shapes()
-    for site in sites:
-        _check_shapes(shapes, site)
-    device_mesh = build_mesh(DefaultMesh() if mesh is None else mesh)
-    chosen = DefaultLayout() if layout is None else layout
-    placement = chosen.offloaded(device_mesh, shapes)
-    chosen.check(shapes["params"], placement["params"], device_mesh)
-    entries = entry_tree(placement, sites)
-    outside = [jax.tree_util.keystr(path) for path, sharding in
-               jax.tree_util.tree_flatten_with_path(entries)[0] if sharding.memory_kind == "pinned_host"]
-    if outside:
-        raise ValueError(f"host_parameters selected {outside}, which the layer stack does not fetch; "
-                         "select declared decoder layers and keep embeddings, heads and media resident")
-    for site in sites:
-        _check_consumers(in_namespace(placement, site.namespace), site.view.groups)
+    sites, shapes, _device_mesh, placement, entries = _bank_plan(model, source, mesh, layout)
 
     entry_values = jax.block_until_ready(source.entry(entries)) if entries else {}
     bank_store: dict[str, dict] = {}
@@ -406,6 +667,47 @@ def host_banked(model: BankedModel, source: LayerBanks, *,
                     branch = branch.setdefault(component, {})
                 branch[name] = tree
     return merge(entry_values, bank_store)
+
+
+def stream_banked(model: BankedModel, source: SafetensorsBanks, *,
+                  mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None) -> Variables:
+    """Bind disk rows to the ordinary banked inference loop on one device.
+
+    Only non-decoder leaves are loaded now. Each declared run receives a
+    static handle in the runtime-only `streaming` collection, which calls
+    the source at execution and is not a checkpoint or a recorded field.
+    The stack uses its existing two-row prefetch carry and writes its usual
+    KV caches. No model wrapper or generation implementation is needed.
+
+    This first disk path is single-device inference: layouts with a mesh
+    above one, host placement or an unscanned/pipelined stack are refused,
+    before loading weights. A host callback needs the CPU backend beside
+    the accelerator (`JAX_PLATFORMS=cuda,cpu` when platforms are explicit).
+    Keep `source` open until executions complete.
+    """
+    sites, _shapes, device_mesh, placement, entries = _bank_plan(model, source, mesh, layout)
+    if device_mesh.size != 1:
+        raise ValueError("disk streaming requires a single-device mesh")
+    if any(not site.scanned for site in sites):
+        raise ValueError("disk streaming requires scan_layers=True for bounded device prefetch")
+    if any(sharding.memory_kind != "device" for sharding in jax.tree.leaves(placement)):
+        raise ValueError("disk streaming uses its own bounded host cache; leave layout host placement empty")
+    try:
+        jax.devices("cpu")
+    except RuntimeError as error:
+        raise ValueError("disk streaming requires the CPU callback backend; configure "
+                         "JAX_PLATFORMS=cuda,cpu (or your accelerator,cpu) before JAX initialization") from error
+    device = SingleDeviceSharding(device_mesh.devices.flat[0])
+    handles: Variables = {}
+    for site in sites:
+        groups = site.view.groups
+        local = {name: {"bank": StreamedBank(source, first, count, site.namespace, device,
+                                             groups[index + 1][0] if index + 1 < len(groups) else groups[0][0])}
+                 for index, ((first, count), name) in enumerate(zip(
+                     groups, site.view.bank_names(), strict=True))}
+        handles = merge(handles, at_namespace({"streaming": local}, site.namespace))
+    entries = jax.block_until_ready(source.entry(entries)) if entries else {}
+    return merge(entries, handles)
 
 
 def _places(subtree) -> dict[str, tuple[str, str]]:

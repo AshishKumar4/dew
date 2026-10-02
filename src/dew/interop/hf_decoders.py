@@ -47,6 +47,7 @@ from flax.traverse_util import flatten_dict
 from flax.typing import Dtype, PrecisionLike
 
 from dew import records
+from dew._model_types import _QWEN35_TEXT_TYPES, _QWEN35_TYPES
 from dew.interop import mamba2
 from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors
 
@@ -384,6 +385,7 @@ class DecoderFields(TypedDict, total=False):
     scale_after_cast: bool
     sandwich_norms: bool
     pre_norms: bool
+    parallel_residual: bool
     qk_norm: bool
     qk_norm_scope: str
     v_norm: bool
@@ -946,7 +948,7 @@ def _wrapper_text(hf_config: Mapping[str, object], used: set) -> DecoderFields:
     if hf_config.get("model_type") != "llama4":
         # These conditional models own their lm_head at wrapper scope; the
         # nested text model has no head. Llama4 nests a complete causal LM.
-        default_tied = hf_config.get("model_type") != "qwen3_5"
+        default_tied = hf_config.get("model_type") not in _QWEN35_TYPES
         tied = hf_config.get("tie_word_embeddings", default_tied)
         if tied is not None and not isinstance(tied, bool):
             _refuse("tie_word_embeddings", "the wrapper head takes a boolean tying policy")
@@ -1114,8 +1116,8 @@ def _qwen35_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     # and the record leaves it open the way the Gemma 4 wrapper does.
     used.update(("video_token_id", "vision_start_token_id", "vision_end_token_id"))
     return {
-        "model_type": "qwen3_5",
-        "text_model_type": "qwen3_5_text",
+        "model_type": records.text(hf_config['model_type'], 'model_type'),
+        "text_model_type": f"{hf_config['model_type']}_text",
         "text": text,
         "tower": tower,
         "projector": projector,
@@ -1145,14 +1147,14 @@ def _gemma3n_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wrapper
 
 _WRAPPERS: Mapping[str, Callable[[Mapping[str, object], set[str]], WrapperFields]] = {
     "gemma3": _gemma3_wrapper, "llama4": _llama4_wrapper, "gemma4": _gemma4_wrapper,
-    "qwen3_5": _qwen35_wrapper, "gemma3n": _gemma3n_wrapper}
+    **dict.fromkeys(_QWEN35_TYPES, _qwen35_wrapper), "gemma3n": _gemma3n_wrapper}
 
 
 def translate_wrapper_config(hf_config: Mapping[str, object]) -> WrapperFields:
     """Translate a multimodal wrapper into its decoder, tower and projector records.
 
-    gemma3, llama4, gemma4, qwen3_5, gemma3n and decoder-family bundles translate. Records
-    retain the decoder, tower, projector, image token ID and token count, and
+    gemma3, llama4, gemma4, qwen3_5, qwen3_5_moe, gemma3n and decoder-family
+    bundles translate. Records retain the decoder, tower, projector, image token ID and token count, and
     for Gemma 3n and Gemma 4 the optional audio tower, its embedder, the
     audio placeholder ID and Gemma 3n's fixed slots per clip. Gemma 3n's
     embedders also embed their hard vocabulary ranges.
@@ -1202,7 +1204,8 @@ def _wrapper_route(name: str, record: WrapperFields) -> tuple[str, str]:
         return "audio_projector", bare[len("embed_audio."):]
     if audio and bare.startswith("audio_tower."):
         return "audio_tower", bare[len("audio_tower."):]
-    if (bare.startswith("mtp.") and record["text_model_type"] == _QWEN35) or bare == "lm_head.weight":
+    if ((bare.startswith("mtp.") and record["text_model_type"] in _QWEN35_TEXT_TYPES)
+            or bare == "lm_head.weight"):
         return "language_model", bare
     if bundled is not None:
         return ("projector" if bare in bundled.wrapper_projector_names else "language_model"), bare
@@ -1674,7 +1677,7 @@ def translate_weights(
     # whose every tensor maps to nothing is an empty tree.
     params: LazyTree = {}
     variables: LazyTree = {'params': params}
-    for name, tensor in family.prepare_weights(hf_tensors).items():
+    for name, tensor in family.prepare_weights(hf_tensors, config).items():
         path = family.weight_path(name, config)
         if path is None or name in copies:
             continue
@@ -2075,6 +2078,13 @@ def _hf_name(dew_name: str, config: Mapping[str, object]) -> str | None:
     raise ValueError(f"unknown parameter path {dew_name!r}")
 
 
+class WeightPreparer(Protocol):
+    """Checkpoint storage transforms, with translated geometry where layout needs it."""
+
+    def __call__(self, tensors: Mapping[str, np.ndarray],
+                 config: Mapping[str, object] | None = None, /) -> Mapping[str, np.ndarray]: ...
+
+
 @dataclass(frozen=True)
 class DecoderFamily:
     """Holds one family's config, tensor paths and export vocabulary.
@@ -2101,7 +2111,7 @@ class DecoderFamily:
                              Mapping[str, np.ndarray]] = _dense_decoder_weights
     """Whole-variable encoder; dense families retain their export_path loop."""
     sandwich_norms: bool = False
-    prepare_weights: Callable[[Mapping[str, np.ndarray]], Mapping[str, np.ndarray]] = dict
+    prepare_weights: WeightPreparer = field(default=lambda tensors, _config=None: dict(tensors))
     """The checkpoint's tensors as the path map reads them: Llama 4 and Gemma 4
     split their fused expert kernels. A quantized format is undone before this,
     by `load_pretrained`, which records what it undid for the export."""
@@ -2211,6 +2221,13 @@ from dew.interop.families.gpt2 import (
     _gpt2_path,
     _gpt2_prepare,
 )
+from dew.interop.families.gpt_neox import (
+    _gpt_neox_config,
+    _gpt_neox_export,
+    _gpt_neox_export_weights,
+    _gpt_neox_path,
+    _gpt_neox_prepare,
+)
 from dew.interop.families.gpt_oss import _gpt_oss_config, _gpt_oss_export, _gpt_oss_export_path, _gpt_oss_path
 from dew.interop.families.kimi import (
     _KDA_ZERO_PADDED,
@@ -2253,6 +2270,13 @@ from dew.interop.families.qwen import (
 )
 
 _FAMILY_ENTRIES = (
+    DecoderFamily(('gpt_neox',), _gpt_neox_config,
+                  lambda fields: bool(fields.get('norm_type') == 'layer' and fields.get('norm_bias')
+                                      and fields.get('mlp_bias') and fields.get('position_embedding') == 'rotary'),
+                  'gpt_neox', 'GPTNeoXForCausalLM', _gpt_neox_export,
+                  weight_path=_gpt_neox_path, prepare_weights=_gpt_neox_prepare,
+                  export_weights=_gpt_neox_export_weights, preserve_source_layout=False,
+                  tied_head_names=('embed_out.weight', 'gpt_neox.embed_in.weight')),
     DecoderFamily(('opt',), _opt_config,
                   lambda fields: fields.get('position_embedding_offset') == 2,
                   'opt', 'OPTForCausalLM', _opt_export,

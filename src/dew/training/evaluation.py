@@ -75,7 +75,7 @@ def _artifacts(value: Artifacts | None) -> tuple[Artifact, ...]:
 
 def evaluate(objective: Objective[Loss, Effects], variables: Variables,
              batches: Reader | None, *,
-             key: jax.Array, metrics: Sequence[Metric] = (),
+             key: int | jax.Array, metrics: Sequence[Metric] = (),
              step: int | jax.Array = 0, averaged: Variables | None = None,
              preview: bool = False, mesh: Mesh | None = None, split: str = "val",
              schedule_step: int | jax.Array | None = None, loss: bool = False,
@@ -101,6 +101,8 @@ def evaluate(objective: Objective[Loss, Effects], variables: Variables,
     before entering their next collective. In-flight device failures still
     require distributed runtime termination.
     """
+    from dew.nn.inputs import request_key
+    key = request_key(key)
     started = time.perf_counter()
     root = jax.process_index() == 0
     _agree_configuration(metrics, batches, split, loss=loss, training=training is not None)
