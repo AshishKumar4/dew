@@ -42,6 +42,19 @@ def xla_flag(name: str) -> str | None:
     return value
 
 
+def keep_roundings() -> None:
+    """Keep declared narrow-dtype roundings unless the caller names XLA's policy.
+
+    Fusion must not normalize an unrounded FP32 value where the program
+    produces a BF16 sum. It takes effect only before the process's first
+    JAX computation: XLA reads these flags when its backend opens. In an
+    already-used notebook, restart with
+    `XLA_FLAGS=--xla_allow_excess_precision=false` set before importing JAX.
+    """
+    if xla_flag("xla_allow_excess_precision") is None:
+        apply_xla_flags("--xla_allow_excess_precision=false")
+
+
 def deterministic_ops_requested() -> bool:
     """Whether the run asked XLA for deterministic ops.
 

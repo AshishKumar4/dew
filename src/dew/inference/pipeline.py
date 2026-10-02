@@ -27,6 +27,7 @@ from dew.nn.inputs import Media, ModelInputs, pad_token_rows
 from dew.objectives.base import Variables
 from dew.registry import resolve_dtype
 from dew.sampling.pipelines import TextToImage
+from dew.telemetry.devices import keep_roundings
 from dew.telemetry.instrumentation import default_compilation_cache_dir, enable_compilation_cache
 
 if TYPE_CHECKING:
@@ -59,7 +60,13 @@ def pipeline(
 
     Loading a task also points XLA at the on-disk executable cache, so a
     restarted process reuses what it already compiled.
+
+    The narrow-rounding policy applies only when this loads before the
+    process's first JAX computation. If a notebook already used JAX,
+    restart with `XLA_FLAGS=--xla_allow_excess_precision=false` set before
+    importing it; changing the environment cannot reopen a live backend.
     """
+    keep_roundings()
     _persist_compilations()
     resolve_dtype(dtype)
     if param_dtype != "auto":
