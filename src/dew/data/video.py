@@ -130,7 +130,8 @@ class VideoDataset(DatasetSpec):
         name = type(self).__name__
         records = (len(source) if self.count is None
                    else checked_count(self.count, len(source), name))
-        train, validation = hold_out(source, records, (self.val_batches or 0) * batch, name)
+        held_out = (self.val_batches or 0) * batch
+        train, validation = hold_out(source, records, held_out, name)
         return Dataset(
             train=tokenized(
                 train_stream(
@@ -148,6 +149,7 @@ class VideoDataset(DatasetSpec):
             ),
             records=len(train),
             batch=batch,
+            held_out=held_out,
         )
 
 

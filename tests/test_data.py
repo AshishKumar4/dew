@@ -1609,3 +1609,32 @@ def test_a_run_over_records_in_memory_checkpoints_and_resumes_where_it_stopped(t
     for expected, actual in zip(jax.tree.leaves(whole.params),
                                 jax.tree.leaves(resumed.params), strict=True):
         np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), rtol=1e-6)
+
+
+def test_a_fit_over_a_dataset_that_held_validation_out_says_so_once(capsys):
+    import optax
+    from flax import linen as nn
+
+    from dew.objectives.base import Aux, Objective
+    from dew.training import Layout, Trainer
+
+    class Regression(Objective):
+        def __init__(self):
+            self.model = nn.Dense(1)
+
+        def init(self, key, variables=None):
+            return self.model.init(key, jnp.zeros((1, 2)))
+
+        def loss(self, params, batch, step):
+            return jnp.mean(self.model.apply(params, batch["x"]) ** 2), Aux({})
+
+    trainer = Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0),
+                      layout=Layout(min_shard=1, tolerance=1.0))
+    data = Dataset.from_records(_columns(16), batch=8)
+
+    trainer.fit(dataclasses.replace(data, held_out=24), steps=2, log_every=1)
+    noted = capsys.readouterr().out
+    trainer.fit(data, steps=2, log_every=1)
+
+    assert noted.count("validation: 24 records held out of train") == 1
+    assert "held out" not in capsys.readouterr().out

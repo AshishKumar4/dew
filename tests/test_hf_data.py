@@ -350,3 +350,11 @@ def test_validation_is_scored_on_unaugmented_images_unless_asked(hub):
     plain = first_validation(augmentation="none")
     np.testing.assert_array_equal(first_validation(augmentation="flip_jitter"), plain)
     assert not np.array_equal(first_validation(augmentation="flip_jitter", augment_validation=True), plain)
+
+
+def test_a_spec_that_holds_validation_out_of_training_says_how_many(hub):
+    """With no val_split the head of the training split is scored; the run
+    says so rather than training on fewer records than the split holds."""
+    assert _hub_images(val_batches=2).load(batch=4).held_out == 8
+    assert _hub_images(val_split="validation", val_batches=2).load(batch=4).held_out == 0
+    assert _hub_images(val_batches=None).load(batch=4).held_out == 0
