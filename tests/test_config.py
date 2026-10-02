@@ -369,6 +369,30 @@ def test_a_dataset_at_another_batch_than_the_run_is_refused(tmp_path, capsys):
     assert f"Local tracking: {tmp_path / 'runs' / 'batch' / 'tracking'}" in output
 
 
+@pytest.mark.mesh(devices=2)
+def test_train_runs_the_trainer_its_config_describes(tmp_path):
+    """Every field a trainer holds, off its default, shows in the run `train`
+    makes of it: the parameters split over fsdp, a dynamic loss scale, an
+    accumulator for two microbatches and the profiler window's trace."""
+    import jax
+
+    from dew.training import ProfileWindow
+
+    trace = tmp_path / "trace"
+    config = TrainerConfig(
+        name="built", checkpoint_dir=str(tmp_path / "runs"), steps=3, batch_size=8, accumulation=2,
+        dynamic_scale=True, mesh=MeshSpec(fsdp=2), layout=Layout(min_shard=1, tolerance=1.0),
+        profile=ProfileWindow(str(trace), steps=1, warmup=1), eval_every=None, checkpoint_every=None)
+
+    state = RunConfig(trainer=config).train(Regression(), Dataset(lambda partition: batches(), None, None, 8),
+                                            name="built")
+
+    assert any(not leaf.sharding.is_fully_replicated for leaf in jax.tree.leaves(state.params))
+    assert state.scale is not None
+    assert state.accumulation is not None
+    assert any(path.is_file() for path in trace.rglob("*"))
+
+
 def test_a_pass_over_the_data_needs_a_record_count():
     """A stream with no record count has no epoch, so "epoch" raises a
     ValueError that names the field."""
