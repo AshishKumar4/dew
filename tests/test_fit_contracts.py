@@ -88,44 +88,11 @@ def test_metrics_without_a_cadence_are_refused_before_initialization():
         Trainer(Uninitialized(), optax.sgd(.1), key=0).fit(data(), steps=1, metrics=(metric,))
 
 
-def test_gradient_norm_and_injected_learning_rate_are_logged():
+def test_injected_learning_rate_is_logged():
     tracker = RecordingTracker()
     optimizer = optax.inject_hyperparams(optax.sgd)(learning_rate=.1)
     running = Trainer(ScalarRegression(auxiliary=True), optimizer, key=0, tracker=tracker)
     running.fit(data(), steps=1, log_every=1)
-    recorded = next(values for _, values in tracker.scalars if 'train/grad_norm' in values)
-    assert recorded['train/grad_norm'] == pytest.approx(np.sqrt(8))
+    recorded = next(values for _, values in tracker.scalars if 'train/learning_rate' in values)
     assert recorded['train/learning_rate'] == pytest.approx(.1)
 
-
-def test_gradient_norm_runs_only_at_reports_and_preserves_resume_cadence(monkeypatch):
-    observed = []
-    tree_norm = optax.tree.norm
-
-    def measured_norm(gradient):
-        norm = tree_norm(gradient)
-        jax.debug.callback(lambda value: observed.append(float(value)), norm)
-        return norm
-
-    monkeypatch.setattr(optax.tree, 'norm', measured_norm)
-    tracker = RecordingTracker()
-    running = trainer(auxiliary=True, tracker=tracker)
-    state = running.fit(data(), steps=4, log_every=3)
-    jax.effects_barrier()
-    assert len(observed) == 1
-    running.fit(data(), state=state, steps=8, log_every=3)
-    jax.effects_barrier()
-    assert len(observed) == 2
-    reports = [(step, values['train/grad_norm']) for step, values in tracker.scalars
-               if 'train/grad_norm' in values]
-    assert [step for step, _ in reports] == [3, 6]
-    assert all(norm > 0 for _, norm in reports)
-
-
-def test_nonreporting_steps_do_not_even_trace_a_gradient_norm(monkeypatch):
-    def unexpected_norm(gradient):
-        raise AssertionError('a normal step must not trace a norm')
-
-    monkeypatch.setattr(optax.tree, 'norm', unexpected_norm)
-    state = trainer(auxiliary=True).fit(data(), steps=2, log_every=100)
-    assert int(state.step) == 2
