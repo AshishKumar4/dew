@@ -674,3 +674,6 @@ def _harness_exit(trial: Path) -> str | None:
     if status is not None and not isinstance(status, str):
         raise ValueError(f"mini-swe-agent's exit status is not a name: {status!r}")
     return status
+
+
+__all__ = ["HARBOR_KEY", "Gateway", "HarborSource", "Recorded"]

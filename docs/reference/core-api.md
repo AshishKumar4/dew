@@ -172,7 +172,7 @@ LMObjective(model, seq_len, *, ema_decay=None, pad_id=None, head_chunks=4, head_
 IndexerTraining(phase, weight=1.0)
 ```
 
-`load_pretrained` returns a bundle whose `lm_objective(seq_len, **options)` builds this objective with its model, initial variables and processor, which `pipeline` then decodes with. It refuses `pretrained=` because the bundle supplies those weights. `bundle.lora(...)` returns a bundle with a fresh adapter whose `lm_objective` trains the factors alone, and whose `save` and `export` merge them. The model must implement Linen `hidden_states(tokens, train=..., positions=..., segment_ids=...)`, returning `(B, S, D)`, and `head_weight(params)`, returning the `(D, vocab)` vocabulary matrix. The objective also reads `final_logit_softcap` and `precision`. Prediction-depth training needs `mtp_hidden_states` and compatible prediction-depth configuration. Mutable router, QK and indexer collections are required when their options are enabled.
+`Pretrained.load` returns a bundle whose `lm_objective(seq_len, **options)` builds this objective with its model, initial variables and processor, which `pipeline` then decodes with. It refuses `pretrained=` because the bundle supplies those weights. `bundle.lora(...)` returns a bundle with a fresh adapter whose `lm_objective` trains the factors alone, and whose `save` and `export` merge them. The model must implement Linen `hidden_states(tokens, train=..., positions=..., segment_ids=...)`, returning `(B, S, D)`, and `head_weight(params)`, returning the `(D, vocab)` vocabulary matrix. The objective also reads `final_logit_softcap` and `precision`. Prediction-depth training needs `mtp_hidden_states` and compatible prediction-depth configuration. Mutable router, QK and indexer collections are required when their options are enabled.
 
 `pretrained` supplies the complete variables tree; `loss_role` requires aligned `text_roles`. `pad_id` masks matching targets. `head_chunks` controls vocabulary tiling, and `head_tile` the head's backward tile (`'whole'`, `'tiled'` or a tile shape; `None` picks one for the objective); `samples` configures text previews. `ema_decay` defaults to `None`, which trains without an averaged copy; a decay such as `0.999` keeps one that evaluation and previews read, and `1.0` retains a frozen one. Routing balance, auxiliary loss, prediction-depth weight, and QK statistics require matching model computation. These interfaces make `LMObjective` specific to compatible decoders. `z_loss` adds PaLM's auxiliary term, the coefficient times the squared log partition of every counted prediction; zero adds nothing. `router_z_loss` is the routers' own z-loss (ST-MoE), and zero adds nothing. `token_accuracy=False` drops the `token_accuracy` metric and the pass over every logit it costs. `trainable` is a path filter over the parameter leaves the optimizer moves; the rest of the tree is kept under `frozen`. An adapter's filter, `dew.lora.LoRA.trainable`, goes here. `None` trains every leaf, and `trainable` cannot be combined with `indexer`.
 
@@ -341,7 +341,7 @@ Dew uses T5X as a reference and a test oracle, and adapts some of its state and 
 
 #### Source generation controls
 
-A loaded source's `generation_config.json` is data. Every control Transformers 5.16.1 writes there is classified: the native policy carries it, a transform, criterion or strategy carries it, the task owns it, it is provenance, or `Pretrained.text_generation()` refuses it and says why. The common controls become the task's `Sampling` value, `task.sampling`, so a caller changes one with `dataclasses.replace(task.sampling, ...)`. A source that also sets a control `Sampling` does not carry binds `task.logits`, the complete chain, which the same compiler (`ordered_transforms`) builds in `_get_logits_processor`'s order with the policy's transforms in it; a source running beam search always binds its chain and ends it after the processors, because the search picks its own continuations. An unset control, or one at the value where `generate()` adds no processor, criterion or search mode, is inert. Beam-only and sampling-only controls are judged only when beam search or sampling is active, as they are upstream.
+A loaded source's `generation_config.json` is data. Every control Transformers 5.16.1 writes there is classified: the native policy carries it, a transform, criterion or strategy carries it, the task owns it, it is provenance, or `PretrainedDecoder.text_generation()` refuses it and says why. The common controls become the task's `Sampling` value, `task.sampling`, so a caller changes one with `dataclasses.replace(task.sampling, ...)`. A source that also sets a control `Sampling` does not carry binds `task.logits`, the complete chain, which the same compiler (`ordered_transforms`) builds in `_get_logits_processor`'s order with the policy's transforms in it; a source running beam search always binds its chain and ends it after the processors, because the search picks its own continuations. An unset control, or one at the value where `generate()` adds no processor, criterion or search mode, is inert. Beam-only and sampling-only controls are judged only when beam search or sampling is active, as they are upstream.
 
 Each source control has one rule for its consumer, neutral value, mode and refusal. Source value precedence remains `generation_config.json`, wrapper config, then text config. The source resolver selects the actual policy once. `Sampling` supplies convenience defaults at the request boundary; only resolved transforms, criteria, strategy and padding reach the compiled decoder. An explicit chain therefore has no unused sampling settings in its compilation or process-agreement identity.
 
@@ -419,11 +419,20 @@ BlockGeneration(model, variables, process, processor=None, eos_token_ids=(), pad
                 max_new_tokens=None, max_length=None, n=1)
 task(request, max_new_tokens=None, *, key=None, n=None, process=None,
      images=None) -> CanvasGeneration
-Pretrained.text_generation(*, sampling=None) -> TextGeneration | MaskedGeneration
-Pretrained.lm_objective(seq_len, **options) -> LMObjective
-Pretrained.lora(*, rank, modules, key, alpha=None, rslora=False, dropout=0.0) -> Pretrained
-Pretrained.block_generation() -> BlockGeneration
-Pretrained.text_to_image() -> TextToImage
+Pretrained.load(name_or_dir, *, dtype=jnp.bfloat16, param_dtype=jnp.float32, attention_impl="auto",
+                max_seq_len=None, revision=None, gguf_file=None, single_file=None, mesh=None,
+                layout=None, fallback=None) -> the kind it is called on, or the kind the source is
+PretrainedDecoder.text_generation(*, sampling=None) -> TextGeneration
+PretrainedDecoder.lm_objective(seq_len, **options) -> LMObjective
+PretrainedDecoder.lora(*, rank, modules, key, alpha=None, rslora=False, dropout=0.0) -> PretrainedDecoder
+PretrainedMaskedDecoder.text_generation() -> MaskedGeneration
+PretrainedBlockDecoder.block_generation() -> BlockGeneration
+PretrainedPipeline.text_to_image() -> TextToImage
+PretrainedPipeline.diffusion_objective(**options) -> DiffusionObjective
+PretrainedPipeline.lora(*, rank, modules, key, alpha=None, rslora=False, dropout=0.0) -> PretrainedPipeline
+PretrainedFallback.lm_objective(seq_len, **options) -> LMObjective
+Pretrained.save(directory, *, variables=None, max_shard_size="5GB")
+Pretrained.push_to_hub(repo_id, *, variables=None, private=False, commit_message=..., max_shard_size="5GB")
 PPOObjective.pipeline(state, *, ema=None, processor=None) -> TextGeneration
 TextToImage(model, process, inputs, params, autoencoder=None, steps=50, guidance=None,
             solver=DDIM(), grid=None, final_denoise=True, finish=None, blank=None)
@@ -484,16 +493,16 @@ An explicit `sampling=Sampling(...)` sets the native policy controls supported b
 
 `stream` returns native SDK response chunks. `chat(messages, max_new_tokens, stream=..., **parameters)` preserves SDK tools, tool-result messages, structured-output controls and media fields. Inject an `AsyncClient`/`AsyncOpenAI` and use `acall`, `astream` or `achat` for asynchronous execution. Ollama requests go through the SDK's public `generate` and `chat` methods, which own request conversion, HTTP behavior, error handling and line-stream framing; the adapter rejects request fields the installed SDK does not accept and negative token counts, and the SDK's own parsing rejects unparsable values. OpenAI completions use the SDK's public `with_raw_response` hook, so choice and usage fields are checked on the wire before parsing. OpenAI request parameters go to its completion/chat resources. vLLM-only parameters belong explicitly in `extra_body`. The task's model, prompt, token budget, requested choice count and an explicit `Sampling` policy cannot be overridden through provider extensions; the SDK writes `extra_body` over the named parameters, so a policy field there must equal the policy or the request is refused before any network call.
 
-`export_run(run_dir, destination, *, ema=None, step=None)` writes a saved run into that same layout: it loads the run the way `dew.pipeline` does and hands the rebuilt model to its family's writer, refusing a model with no published layout by name. `dew export <run> <dest>` is the command over it, and `push_to_hub` exports a run directory before uploading unless `raw=True`, which uploads the run itself for `from_pretrained` to pull back.
+`export_run(run_dir, destination, *, ema=None, step=None)` writes a saved run into that same layout: it loads the run the way `dew.pipeline` does and hands the rebuilt model to its family's writer, refusing a model with no published layout by name. `dew export <run> <dest>` is the command over it. A bundle publishes what `save` writes with `bundle.push_to_hub(repo_id, private=, commit_message=)`; uploading the run directory itself with `huggingface_hub.HfApi().upload_folder` is the form `from_pretrained` pulls back.
 
-A decoder trained through the LM recipe, exported with `save_pretrained_decoder` and converted by `ollama create` answers a greedy request with Dew's own greedy continuation, token for token, over the live daemon. `Pretrained.save` and `save_pretrained_decoder` leave the same files, so either export converts.
+A decoder trained through the LM recipe, exported with `PretrainedDecoder.from_model(...).save` and converted by `ollama create` answers a greedy request with Dew's own greedy continuation, token for token, over the live daemon. A loaded source's `save` and a `from_model` bundle's leave the same files, so either export converts.
 
 ## Diffusion and JEPA objectives
 
 ```text
 DiffusionObjective(model, process, inputs, *, autoencoder=None,
                    unconditional_prob=0.12, ema_decay=0.999, solver=DDIM(),
-                   guidance=CFG(3.0), steps=200, pretrained=None)
+                   guidance=CFG(3.0), steps=200, pretrained=None, trainable=None)
 JepaObjective(encoder, predictor, mask, sample, momentum=(0.996, 1.0),
               momentum_steps=100000, label_key="label")
 ```
@@ -504,7 +513,7 @@ Import `JepaObjective` from `dew.objectives.jepa`. The encoder receives normaliz
 
 ### Pretrained latent diffusion
 
-The same `dew.interop.load_pretrained` entry reads a diffusion checkpoint directory with `model_index.json`, component configurations, safetensors and tokenizer files. Six denoisers load: a `UNet2DCondition` reading one or two CLIP towers through cross attention, an `SD3Transformer` reading both jointly beside a T5 tower, a `FluxTransformer` reading a T5 sequence with a pooled CLIP vector, Qwen-Image 2.1's `QwenImageTransformer` reading its Qwen3-VL encoder's prompt states, FLUX.2's `Flux2Transformer` reading stacked hidden states of a Mistral-3 ([dev]) or Qwen3 ([klein]) encoder, and Z-Image's `ZImageTransformer` reading its Qwen3 encoder's second-to-last layer, the last five on flow-matching schedules. The denoiser component the directory holds selects the family, and the class it declares selects the model. The returned `Pretrained` holds the native model, its autoencoder behind the existing autoencoder seam (an `AutoencoderKL`, or Qwen-Image 2.1's one-frame `QwenImageVAE`), native text conditioning, a `Process`, the native solver policy and the published pipeline's own call policy. Model and scheduler implementations from other libraries run only in the reference tools.
+The same `dew.interop.Pretrained.load` entry reads a diffusion checkpoint directory with `model_index.json`, component configurations, safetensors and tokenizer files. Six denoisers load: a `UNet2DCondition` reading one or two CLIP towers through cross attention, an `SD3Transformer` reading both jointly beside a T5 tower, a `FluxTransformer` reading a T5 sequence with a pooled CLIP vector, Qwen-Image 2.1's `QwenImageTransformer` reading its Qwen3-VL encoder's prompt states, FLUX.2's `Flux2Transformer` reading stacked hidden states of a Mistral-3 ([dev]) or Qwen3 ([klein]) encoder, and Z-Image's `ZImageTransformer` reading its Qwen3 encoder's second-to-last layer, the last five on flow-matching schedules. The denoiser component the directory holds selects the family, and the class it declares selects the model. The returned `Pretrained` holds the native model, its autoencoder behind the existing autoencoder seam (an `AutoencoderKL`, or Qwen-Image 2.1's one-frame `QwenImageVAE`), native text conditioning, a `Process`, the native solver policy and the published pipeline's own call policy. Model and scheduler implementations from other libraries run only in the reference tools.
 
 `source.text_to_image()` builds the native image task. `source.save(directory, variables=updated)` writes the updated component weights back to their published layouts, retaining tokenizer files, image geometry and any safety-head parameters. Flax-declared components retain their source class and receive Flax msgpack files alongside the safetensors used by Dew; export does not relabel them as PyTorch models.
 
@@ -530,15 +539,11 @@ The tiny oracles in `tools/diffusers_source_reference.py` run actual Diffusers s
 
 <!-- not run: needs a local diffusion checkpoint directory -->
 ```python
-from dew.interop import load_pretrained
-from dew.objectives.diffusion import DiffusionObjective
+from dew.interop import PretrainedPipeline
 
-source = load_pretrained("./image-checkpoint", dtype="float32")
+source = PretrainedPipeline.load("./image-checkpoint", dtype=jnp.float32)
 images = source.text_to_image()(["a flower"], steps=20, key=0).host().images
-objective = DiffusionObjective(
-    source.model, source.process, source.inputs,
-    autoencoder=source.autoencoder, pretrained=source.variables,
-)
+objective = source.diffusion_objective()
 ```
 
 Training batches carry uint8 NHWC images and `source.inputs.tokenize(captions)`. A nine-channel inpainting source also specifies `inputs.mask`: binary NHWC masks with one channel, where white marks the region to repaint. Caption dropout preserves the mask and masked-image latents. This is neural conditioning, not a guarantee that decoded unmasked pixels equal the original image.

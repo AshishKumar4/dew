@@ -118,8 +118,8 @@ def model_fields(config: LmRunConfig, vocab_size: int, max_seq_len: int) -> dict
     return {**config.model.fields(), "max_seq_len": max_seq_len, "vocab_size": vocab_size}
 
 
-def load_pretrained(pretrained: str, model_config: ModelConfig, vocab_size: int,
-                    max_seq_len: int, meta: dict):
+def pretrained_source(pretrained: str, model_config: ModelConfig, vocab_size: int,
+                      max_seq_len: int, meta: dict):
     """The bundle a --pretrained run continues and the reference it was read at.
 
     `pretrained` is a local directory, a Hub repo or `repo@revision`; the
@@ -134,7 +134,7 @@ def load_pretrained(pretrained: str, model_config: ModelConfig, vocab_size: int,
     trained with: continuing pretraining on ids from another vocabulary trains
     the embedding table against noise.
     """
-    from dew.interop import load_pretrained as load_checkpoint, split_revision
+    from dew.interop import Pretrained, split_revision
 
     overridden = sorted(set(model_config.config) - {"max_seq_len"})
     if overridden:
@@ -148,7 +148,7 @@ def load_pretrained(pretrained: str, model_config: ModelConfig, vocab_size: int,
             f"--model.config max_seq_len is {context!r}; the context a checkpoint "
             f"is reloaded at is a number of tokens")
     name, revision = split_revision(pretrained)
-    loaded = load_checkpoint(
+    loaded = Pretrained.load(
         name, dtype=model_config.dtype, attention_impl=model_config.attention_impl,
         max_seq_len=context, revision=revision)
     expected = checkpoint_tokenizer(loaded.source, name)
@@ -172,9 +172,9 @@ def checkpoint_tokenizer(directory: Path, name: str) -> str:
     """The tokenizer name the checkpoint in `directory`, read as `name`,
     expects its ids to come from.
 
-    A checkpoint written by save_pretrained_decoder records the name it was
-    exported with, since the path or repo it happens to sit at says nothing;
-    any other hub repo is its own tokenizer's name.
+    A checkpoint written by `PretrainedDecoder.from_model(...).save` records
+    the name it was exported with, since the path or repo it happens to sit at
+    says nothing; any other hub repo is its own tokenizer's name.
     """
     generation_config = directory / "generation_config.json"
     if generation_config.is_file():
@@ -287,7 +287,7 @@ def main(config: LmRunConfig) -> TrainState:
         fields = model_fields(config, vocab_size, context)
         model = models.build(config.model.architecture, **fields)
     else:
-        source, reference = load_pretrained(
+        source, reference = pretrained_source(
             config.pretrained, config.model, vocab_size, context, meta)
         model, fields = source.model, source.model_config
         # run.json names the commit the weights were read at.

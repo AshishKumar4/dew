@@ -1,12 +1,12 @@
 """Trained source-format exports of the masked-diffusion decoder families.
 
-`load_pretrained` binds every tensor of a LLaDA or Dream checkpoint to the
+`Pretrained.load` binds every tensor of a LLaDA or Dream checkpoint to the
 leaf it loaded into, so a trained model writes back into the source's own
 tensor names beside the config it came with rather than a config derived
 from the built model. These cases run that path end to end on the committed
 tiny checkpoints: one real `Trainer` step of plain SGD under
 `MaskedDiffusionObjective` started from the loaded weights,
-`Pretrained.save`, then the export read back by `load_pretrained` and by
+`Pretrained.save`, then the export read back by `Pretrained.load` and by
 transformers 5.16.1 on the same ids.
 
 tools/masked_diffusion_export_reference.py owns the pipeline and prints the
@@ -36,10 +36,9 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-
-from dew.interop import load_pretrained
-from dew.interop.hf_decoders import save_pretrained_decoder
 from test_masked_diffusion import flat
+
+from dew.interop import Pretrained, PretrainedDecoder
 from tools import masked_diffusion_export_reference as tool
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -99,7 +98,7 @@ def test_the_export_carries_the_trained_weights_not_the_loaded_ones(trip):
 
 
 def test_the_trained_export_reloads_leaf_for_leaf_and_recomputes_the_logits(trip):
-    """`load_pretrained` reads the export back into the same model with the
+    """`Pretrained.load` reads the export back into the same model with the
     trained values bit for bit, so it computes the same logits."""
     assert trip.reloaded.model == trip.source.model, "the export rebuilds a different model"
 
@@ -146,17 +145,17 @@ def test_the_bidirectional_reading_is_what_the_reference_agrees_with(trip):
 
 @pytest.mark.parametrize("fixture", ["llada-tiny", "dream-tiny"])
 def test_the_derived_config_writer_round_trips_each_family(fixture, tmp_path):
-    """The other writer: `save_pretrained_decoder` derives the config from a
+    """The other writer: `PretrainedDecoder.from_model` derives the config from a
     built model, for a masked-diffusion model that came from no checkpoint.
     It has to write names its own family reads back, so LLaDA's leaves go
     out under the release's OLMo-style spellings and Dream's config carries
     the split o_proj bias its reference builds."""
-    source = load_pretrained(str(FIXTURES / fixture), dtype="float32",
+    source = Pretrained.load(str(FIXTURES / fixture), dtype="float32",
                              attention_impl="reference")
 
-    save_pretrained_decoder(source.model, source.variables, tmp_path)
+    PretrainedDecoder.from_model(source.model, source.variables).save(tmp_path)
     written = json.loads((tmp_path / "config.json").read_text())
-    reloaded = load_pretrained(str(tmp_path), dtype="float32", attention_impl="reference")
+    reloaded = Pretrained.load(str(tmp_path), dtype="float32", attention_impl="reference")
 
     assert written["mask_token_id"] == source.model.mask_token_id
     assert reloaded.model == source.model, "the derived config rebuilds a different model"

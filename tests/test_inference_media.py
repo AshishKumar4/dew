@@ -12,7 +12,7 @@ from steady_state import guarded
 from test_inference import make_run
 
 from dew.inference import DenoisingInputs, TextToImage
-from dew.interop import load_pretrained
+from dew.interop import Pretrained
 from dew.nn.inputs import ModelInputs
 from dew.sampling import CFG, Heun
 
@@ -29,22 +29,32 @@ def test_trained_image_task_accepts_raw_and_prepared_inputs_and_immutable_rebind
     again = task(prepared, steps=3, solver=Heun(), guidance=CFG(2.0), key=key).host().images
     np.testing.assert_array_equal(again, raw)
     loaded = TextToImage.from_run(str(tmp_path), ema=False)
-    np.testing.assert_allclose(loaded(["flower", "tree"], steps=3, solver=Heun(), guidance=CFG(2.0), key=key).host().images,
-                               raw, atol=2e-6, rtol=2e-6)
+    np.testing.assert_allclose(
+        loaded(["flower", "tree"], steps=3, solver=Heun(), guidance=CFG(2.0), key=key).host().images,
+        raw,
+        atol=2e-6,
+        rtol=2e-6,
+    )
     mutable = jax.tree.map(lambda leaf: leaf, task.params.unfreeze())
     bound = task.bind(mutable)
     mutable["params"] = jax.tree.map(lambda leaf: leaf + 0.05, mutable["params"])
-    np.testing.assert_array_equal(bound(prepared, steps=3, solver=Heun(), guidance=CFG(2.0), key=key).host().images, raw)
+    np.testing.assert_array_equal(
+        bound(prepared, steps=3, solver=Heun(), guidance=CFG(2.0), key=key).host().images, raw
+    )
     changed = task.bind(mutable)(prepared, steps=3, solver=Heun(), guidance=CFG(2.0), key=key).host().images
     assert np.max(np.abs(changed - raw)) > 1e-4
-    np.testing.assert_allclose(task("flower", steps=3, solver=Heun(), key=key).host().images,
-                               task(["flower"], steps=3, solver=Heun(), key=key).host().images, atol=0, rtol=0)
+    np.testing.assert_allclose(
+        task("flower", steps=3, solver=Heun(), key=key).host().images,
+        task(["flower"], steps=3, solver=Heun(), key=key).host().images,
+        atol=0,
+        rtol=0,
+    )
     with pytest.raises(ValueError, match="initial noise"):
         task(replace(prepared, noise=prepared.noise[:, :-1]), steps=3, key=key)
 
 
 def test_canvas_raw_media_processing_reaches_the_real_conditioner():
-    source = load_pretrained(FIXTURE, dtype="float32", attention_impl="xla", max_seq_len=32)
+    source = Pretrained.load(FIXTURE, dtype="float32", attention_impl="xla", max_seq_len=32)
     with np.load(FIXTURE / "reference.npz") as reference:
         prompt = np.asarray(reference["image_prompt"])
         pixels = np.asarray(reference["pixels"])
@@ -107,7 +117,7 @@ def test_host_and_resident_media_generate_equivalent_public_results(family):
     from dew.training import Layout, MeshSpec
 
     directory = FIXTURE.parent / family
-    loaded = load_pretrained(directory, dtype="float32", attention_impl="xla", max_seq_len=64)
+    loaded = Pretrained.load(directory, dtype="float32", attention_impl="xla", max_seq_len=64)
     if family == "diffusion-gemma-workflow":
         with np.load(directory / "reference.npz") as reference:
             tokens = reference["image_prompt"]

@@ -1,6 +1,6 @@
 # Language models
 
-`LMObjective` trains a decoder on next-token prediction: it reads rows of token IDs, feeds all but the last token to the model and scores its predictions against the following tokens with cross entropy. The decoder is usually `CausalTransformer` from `dew.nn.backbones`, and `dew.sampling.generate` draws text from the trained weights. The same page covers loading published checkpoints with `load_pretrained`, and the two non-autoregressive language objectives, `MaskedDiffusionObjective` and `BlockDiffusionObjective`.
+`LMObjective` trains a decoder on next-token prediction: it reads rows of token IDs, feeds all but the last token to the model and scores its predictions against the following tokens with cross entropy. The decoder is usually `CausalTransformer` from `dew.nn.backbones`, and `dew.sampling.generate` draws text from the trained weights. The same page covers loading published checkpoints with `Pretrained.load`, and the two non-autoregressive language objectives, `MaskedDiffusionObjective` and `BlockDiffusionObjective`.
 
 ## Example
 
@@ -111,7 +111,7 @@ GPU reductions are not bitwise repeatable by default, so a second run can contin
 
 Use one tokenizer everywhere: data preparation, model construction, decoding and checkpoint export. `ByteTokenizer` has a vocabulary of 256 and uses ID 255 as its EOS. `HFTokenizer(name)` wraps a Hugging Face tokenizer with that model's vocabulary and chat template, and downloads its files on first use.
 
-`ByteTokenizer` and `HFTokenizer` have `encode` and `decode`. A source loaded with `load_pretrained` carries the checkpoint's own processor instead, which has no `encode`. Call it on text: `bundle.processor(["The capital of France is", "Hello"])` returns `ModelInputs`, whose `tokens` are the id rows padded the way the tokenizer pads and whose `kwargs()` hold the attention mask and positions. `bundle.processor.decode(rows)` turns ids back into strings, and `bundle.processor.chat(messages)` runs the checkpoint's chat template when it has one. `RunProcessor(tokenizer)` in `dew.inference` wraps an `encode`/`decode` tokenizer into the same callable, which is what a task takes as `processor=`. A text-to-image run's captions are tokenized by its condition encoder, for example `CLIPText.tokenize` in `dew.inputs`.
+`ByteTokenizer` and `HFTokenizer` have `encode` and `decode`. A source loaded with `Pretrained.load` carries the checkpoint's own processor instead, which has no `encode`. Call it on text: `bundle.processor(["The capital of France is", "Hello"])` returns `ModelInputs`, whose `tokens` are the id rows padded the way the tokenizer pads and whose `kwargs()` hold the attention mask and positions. `bundle.processor.decode(rows)` turns ids back into strings, and `bundle.processor.chat(messages)` runs the checkpoint's chat template when it has one. `RunProcessor(tokenizer)` in `dew.inference` wraps an `encode`/`decode` tokenizer into the same callable, which is what a task takes as `processor=`. A text-to-image run's captions are tokenized by its condition encoder, for example `CLIPText.tokenize` in `dew.inputs`.
 
 `dew tokenize`, or `TokenCorpus.write` from `dew.data` in Python, tokenizes a file, or every `.txt` file under a directory, into `train.bin`, `val.bin` and `meta.json`:
 
@@ -187,15 +187,15 @@ With gradient accumulation, the cross-entropy and multi-token-prediction (MTP) l
 
 ## Pretrained checkpoints
 
-`load_pretrained(name_or_dir)` reads a local Hugging Face directory or a Hub identifier into a `Pretrained` bundle: the native Flax model, its variables, the checkpoint's processor or tokenizer, the source config and the generation defaults. `dew.pipeline(source)` wraps the same loader and returns a `TextGeneration` (a `BlockGeneration` for DiffusionGemma, a `MaskedGeneration` for LLaDA and Dream) with the weights placed on the current devices and the sampling policy and budget taken from the checkpoint.
+`Pretrained.load(name_or_dir)` reads a local Hugging Face directory or a Hub identifier into a `Pretrained` bundle: the native Flax model, its variables, the checkpoint's processor or tokenizer, the source config and the generation defaults. The bundle is the kind of source it read, each with the methods that work for it: `PretrainedDecoder` (text generation, `lm_objective`, `lora`), `PretrainedMaskedDecoder` (LLaDA, Dream), `PretrainedBlockDecoder` (DiffusionGemma), `PretrainedPipeline` (latent diffusion, `text_to_image`, `diffusion_objective`, `lora`) and `PretrainedFallback` (`fallback="torchax"`, `lm_objective`). Calling `load` on a kind, as `PretrainedDecoder.load(...)`, refuses a source of another kind by name. `dew.pipeline(source)` wraps the same loader and returns a `TextGeneration` (a `BlockGeneration` for DiffusionGemma, a `MaskedGeneration` for LLaDA and Dream) with the weights placed on the current devices and the sampling policy and budget taken from the checkpoint.
 
-`bundle.lm_objective(seq_len, **options)` builds an `LMObjective` starting from its loaded weights. With token files prepared using the checkpoint's tokenizer (`dew tokenize --tokenizer Qwen/Qwen3-0.6B`), fine-tuning uses the same trainer as training from scratch:
+A decoder's `bundle.lm_objective(seq_len, **options)` builds an `LMObjective` starting from its loaded weights. With token files prepared using the checkpoint's tokenizer (`dew tokenize --tokenizer Qwen/Qwen3-0.6B`), fine-tuning uses the same trainer as training from scratch:
 
 ```python
-from dew.interop import load_pretrained
+from dew.interop import PretrainedDecoder
 
 data = TokenWindows(path="data/qwen3-tokens", seq_len=512).load(batch=4)
-bundle = load_pretrained("Qwen/Qwen3-0.6B", max_seq_len=512)
+bundle = PretrainedDecoder.load("Qwen/Qwen3-0.6B", max_seq_len=512)
 objective = bundle.lm_objective(seq_len=512)
 state = Trainer(objective, optax.adamw(1e-5), key=jax.random.key(0)).fit(data, steps=100)
 ```
@@ -216,15 +216,18 @@ print(objective.pipeline(state)("The capital of France is", 8, key=key).text[0])
 
 `bundle` itself is unchanged; `lora` returns a new value. Calling `lora` on an adapted bundle is refused, as is `trainable=` beside an adapter. `dew.lora.LoRA.fresh` and `LoRA.load` build the same adapter over any model and variables, for a model built from the registry or a pipeline component.
 
-`save_pretrained_decoder` writes a trained `CausalTransformer` in the Hugging Face layout. This exports the decoder from the example and loads it back:
+`PretrainedDecoder.from_model` makes a trained `CausalTransformer` a source bundle, and its `save` writes the Hugging Face layout. This exports the decoder from the example and loads it back:
 
 ```python
-import dew
-from dew.interop import save_pretrained_decoder
+import jax.numpy as jnp
 
-save_pretrained_decoder(model, lm_state.params, "stories-decoder", tokenizer="byte",
-                        generation_config={"do_sample": False, "max_new_tokens": 24})
-task = dew.pipeline("stories-decoder", dtype="float32")
+import dew
+from dew.interop import PretrainedDecoder
+
+trained = PretrainedDecoder.from_model(model, lm_state.params, tokenizer="byte",
+                                       generation_config={"do_sample": False, "max_new_tokens": 24})
+trained.save("stories-decoder")
+task = dew.pipeline("stories-decoder", dtype=jnp.float32)
 print(task.sampling)
 result = task([tokenizer.encode("At night")], key=0).host()
 print(tokenizer.decode(result.tokens[0]), result.lengths)
@@ -235,7 +238,7 @@ Sampling(temperature=0.0, top_k=None, eos_id=None, pad_id=0, top_p=1.0, min_p=0.
 At night, Lily went home. She wa [24]
 ```
 
-The directory holds `config.json`, `generation_config.json` and `model.safetensors`. `generation_config.json` sets the task's defaults: `do_sample: false` becomes `temperature=0.0`, and `max_new_tokens` the budget, so the call passes neither. The byte vocabulary has no Hugging Face tokenizer files, so the export records only `tokenizer_name: "byte"` and the loaded task takes token rows. An export with an `HFTokenizer` carries the tokenizer's files and its task accepts strings and returns `result.text`. `save_pretrained_decoder` refuses a model whose computation the exported config would not reproduce, and names the field.
+The directory holds `config.json`, `generation_config.json` and `model.safetensors`. `generation_config.json` sets the task's defaults: `do_sample: false` becomes `temperature=0.0`, and `max_new_tokens` the budget, so the call passes neither. The byte vocabulary has no Hugging Face tokenizer files, so the export records only `tokenizer_name: "byte"` and the loaded task takes token rows. An export with an `HFTokenizer` carries the tokenizer's files and its task accepts strings and returns `result.text`. `from_model` refuses a model whose computation the exported config would not reproduce, and names the field.
 
 A Hub name such as `"Qwen/Qwen3-0.6B"` loads the same way; the published checkpoint needs enough host and device memory for its weights and cache. `LMObjective.policy(params)` returns the same kind of task bound to a training tree, and `SampledRollout` samples with it. To serve the weights with Ollama or vLLM, export them and point the runtime at the directory; the [README](https://github.com/AshishKumar4/dew/blob/main/README.md#exporting-a-decoder-and-serving-it) walks through it.
 
@@ -243,7 +246,7 @@ A Hub name such as `"Qwen/Qwen3-0.6B"` loads the same way; the published checkpo
 
 From the Hub, the loader fetches the configs and indexes first, then only the weight files the index's `weight_map` names, or `model.safetensors` when there is no index. Other copies in the repo stay on the Hub: Mistral's `consolidated.safetensors`, a pipeline's fp16 variants, and root single-file checkpoints. A tensor stored in two shards is refused. `Pretrained.revision` records the commit the Hub resolved, so a branch that moves later does not change what you loaded; it is `None` for a local directory.
 
-`param_dtype` defaults to float32 master weights; `param_dtype="auto"` stores parameters in the checkpoint's own dtype: `dtype` in `config.json`, or else the first floating tensor's, as transformers' `dtype="auto"` reads it. `load_pretrained(..., mesh=MeshSpec(...), layout=Layout(...))`, which `dew.pipeline` calls, places each weight on its devices directly from the memory-mapped checkpoint, one device shard at a time, so the host never holds the whole translated model ([Distributed training](distributed.md) has the measurements).
+`param_dtype` defaults to float32 master weights; `param_dtype="auto"` stores parameters in the checkpoint's own dtype: `dtype` in `config.json`, or else the first floating tensor's, as transformers' `dtype="auto"` reads it. `Pretrained.load(..., mesh=MeshSpec(...), layout=Layout(...))`, which `dew.pipeline` calls, places each weight on its devices directly from the memory-mapped checkpoint, one device shard at a time, so the host never holds the whole translated model ([Distributed training](distributed.md) has the measurements).
 
 A config field Dew cannot express is refused by name. The exceptions are the fields in `_INERT_FIELDS` (`dew/interop/hf_decoders.py`), which transformers 5.16.1 neither declares nor reads, such as SmolLM2's `transformers.js_config`, Qwen2.5's `use_mrope: false` and the Mamba2 ports' `rms_norm`. A family reads only the fields its transformers config class declares. A Llama config that names a sliding window is refused, because transformers' Llama attends to every key; the window is read only for a model type that applies it, such as Mistral or Ministral. MLX quantization is refused by name.
 
@@ -253,7 +256,7 @@ The base checkpoints used below are not instruction-tuned chat models. With an i
 
 ### Other weight formats
 
-- **GGUF.** `load_pretrained(repo, gguf_file="Model-Q4_K_M.gguf")` reads one llama.cpp file (`pip install 'dewml[gguf]'`). The file's metadata becomes the config, and every tensor is dequantized to float32 on the host. The model then trains and generates like a safetensors load, and `param_dtype` sets how it is stored. The tokenizer comes from the file when the repo has none. The llama, qwen2 and qwen3 architectures load; anything else is refused. A repo that ships only GGUF files, loaded without `gguf_file`, lists its files and names the argument that loads one.
+- **GGUF.** `Pretrained.load(repo, gguf_file="Model-Q4_K_M.gguf")` reads one llama.cpp file (`pip install 'dewml[gguf]'`). The file's metadata becomes the config, and every tensor is dequantized to float32 on the host. The model then trains and generates like a safetensors load, and `param_dtype` sets how it is stored. The tokenizer comes from the file when the repo has none. The llama, qwen2 and qwen3 architectures load; anything else is refused. A repo that ships only GGUF files, loaded without `gguf_file`, lists its files and names the argument that loads one.
 - **PyTorch pickles.** A repo with only `pytorch_model.bin` (or its index) also loads. If SFconvertbot has opened a safetensors pull request for that commit, Dew loads that `refs/pr/N` revision, logs which one, and records its commit in `Pretrained.revision`. Otherwise, with torch installed (`pip install 'dewml[torch]'`), Dew unpickles the files once with `torch.load(weights_only=True)`, which runs no code from the file. It saves them as safetensors under `~/.cache/dew/converted/` (`$XDG_CACHE_HOME/dew/converted/` when that is set), and later loads read that copy without importing torch. Without torch and without a pull request, the load is refused with the extra to install and the https://huggingface.co/spaces/safetensors/convert space. Local directories work the same way.
 - **mamba_ssm checkpoints.** `state-spaces/mamba2-*` and other checkpoints in mamba_ssm's own format have a config.json with `d_model`, `n_layer` and `ssm_cfg` but no `model_type`. They load as the transformers Mamba2 port that transformers' conversion script would produce, and `save` writes that port.
 
@@ -262,8 +265,8 @@ The base checkpoints used below are not instruction-tuned chat models. With an i
 Loading works in three tiers.
 
 1. **Native family.** The model type is registered, and a test pins its numbers against transformers. It gets Dew's attention kernels, sharding rules, cached generation and export.
-2. **Verified mapping.** Some unregistered model types compute the Llama block, for example CWM. Before downloading the weights, `load_pretrained` builds transformers' own class for that type from the same config at a much smaller size, with random weights, loads it through Dew's Llama mapping and compares the logits in float32. If they match, the real load goes ahead as a native Dew model and emits one `VerifiedMappingWarning` that names tier 2, the transformers version and the measured error. The check needs torch (`pip install 'dewml[torch]'`); without torch the load is refused and the refusal names that extra. A type that computes something else is refused with the measured difference, for example SmolLM3 (layers without rotary positions), Granite (multipliers) or Phi-3 (fused projections).
-3. **Generic, opt-in.** `load_pretrained(repo, fallback="torchax")` builds transformers' PyTorch model on the host and runs its forward through torchax. It compiles, differentiates and trains through `Trainer` and `LMObjective`. The variables keep the source's torch names and are split into `params`, which the optimizer updates, and `buffers`, which it never touches. `TorchLayout` places them on a mesh by name. This tier has no Dew kernels and no cached generation (`text_generation` refuses), and reads float weights only. It pins the torch version (`pip install 'dewml[torchax]'`), and the load keeps the torch model in host memory too, so plan for at least twice the checkpoint size. The load warns and names the tier.
+2. **Verified mapping.** Some unregistered model types compute the Llama block, for example CWM. Before downloading the weights, `Pretrained.load` builds transformers' own class for that type from the same config at a much smaller size, with random weights, loads it through Dew's Llama mapping and compares the logits in float32. If they match, the real load goes ahead as a native Dew model and emits one `VerifiedMappingWarning` that names tier 2, the transformers version and the measured error. The check needs torch (`pip install 'dewml[torch]'`); without torch the load is refused and the refusal names that extra. A type that computes something else is refused with the measured difference, for example SmolLM3 (layers without rotary positions), Granite (multipliers) or Phi-3 (fused projections).
+3. **Generic, opt-in.** `Pretrained.load(repo, fallback="torchax")` builds transformers' PyTorch model on the host and runs its forward through torchax. It compiles, differentiates and trains through `Trainer` and `LMObjective`. The variables keep the source's torch names and are split into `params`, which the optimizer updates, and `buffers`, which it never touches. `TorchLayout` places them on a mesh by name. This tier has no Dew kernels and no cached generation (`text_generation` refuses), and reads float weights only. It pins the torch version (`pip install 'dewml[torchax]'`), and the load keeps the torch model in host memory too, so plan for at least twice the checkpoint size. The load warns and names the tier.
 
 ### Multimodal checkpoints
 
@@ -274,12 +277,13 @@ The next examples read the tiny checkpoints under `tests/fixtures/hf` of a Dew r
 ```python
 from pathlib import Path
 
+import jax.numpy as jnp
 import numpy as np
-from dew.interop import load_pretrained
+from dew.interop import PretrainedDecoder
 
 fixtures = Path(dew.__file__).parents[2] / "tests" / "fixtures" / "hf"
 source = fixtures / "gemma3-native-tiny"
-bundle = load_pretrained(source, dtype="float32", max_seq_len=64)
+bundle = PretrainedDecoder.load(source, dtype=jnp.float32, max_seq_len=64)
 images = np.load(source / "raw_images.npy")          # uint8 [3, 32, 32, 3]
 inputs = bundle.processor(["token7 <start_of_image> token9",
                            "token5 <start_of_image> token8 <start_of_image> token6"],
@@ -327,7 +331,7 @@ mm_state = mm_trainer.fit(mm_data, steps=1, log_every=1)
 bundle.save("gemma3-tiny-step1", variables=mm_state.params)
 ```
 
-`bundle.save(directory, variables=...)` writes the trained weights back under the source tensor names, together with the processor, so the directory loads again both in Dew and in Transformers. This includes Gemma 4's frozen standardization and clipping buffers, which live in the `constants` collection and stay bit-for-bit unchanged through training. Past `max_shard_size` (default `"5GB"`) the weights go out as numbered shards with their index. A dense decoder or a source-layout checkpoint builds each tensor on the host only when its shard is written; a quantized source, `save_pretrained_decoder` of a Gemma 4 or GLM-5-next model, and a DiffusionGemma export build the whole export first. Saving over an earlier export replaces it in one step: the new shards take fresh names and the index is written last, so a save that stops partway leaves the previous export whole, and files the export did not write, such as `model.fp16.safetensors`, are left alone.
+`bundle.save(directory, variables=...)` writes the trained weights back under the source tensor names, together with the processor, so the directory loads again both in Dew and in Transformers. This includes Gemma 4's frozen standardization and clipping buffers, which live in the `constants` collection and stay bit-for-bit unchanged through training. Past `max_shard_size` (default `"5GB"`) the weights go out as numbered shards with their index. A dense decoder or a source-layout checkpoint builds each tensor on the host only when its shard is written; a quantized source, a `from_model` export of a Gemma 4 or GLM-5-next model, and a DiffusionGemma export build the whole export first. Saving over an earlier export replaces it in one step: the new shards take fresh names and the index is written last, so a save that stops partway leaves the previous export whole, and files the export did not write, such as `model.fp16.safetensors`, are left alone.
 
 Each family's processor emits what its reference implementation expects:
 
@@ -340,7 +344,7 @@ Each family's processor emits what its reference implementation expects:
 
 Audio clips carry a mask that is True for valid frames. Gemma 4 inserts one placeholder per encoded frame. Gemma 3n inserts a fixed `audio_soft_tokens_per_image` per clip and fills the remaining slots with the embedder's padding token.
 
-The Gemma 3n and Gemma 4 audio encoders are `dew.nn.audio.Gemma3nAudio` and `Gemma4Audio`, registered as the towers `gemma3n_audio` and `gemma4_audio`. `audio_config` reads the checkpoint's `audio_config` record and rejects unknown computational fields. `audio_weights` converts the tower's own tensors and keeps Gemma 4's checkpointed clipping bounds in a frozen `constants` collection. An encoder takes `input_features` shaped `[B, T, F]` and a boolean `input_features_mask` that is True for valid frames, and returns `AudioEncoding(features, mask)`, with the mask subsampled to the encoder's frame rate. A loaded source's processor (`load_pretrained(...).processor`) runs the checkpoint's own Transformers feature extractor, which turns 16 kHz mono waveforms into those two arrays; nothing resamples. Gemma 3n projects audio through `Gemma3nProjectorModule.soft_embeddings`, without the scaling used for vision. Gemma 4 reuses `Gemma4ProjectorModule`, with its input width taken from `output_proj_dims`.
+The Gemma 3n and Gemma 4 audio encoders are `dew.nn.audio.Gemma3nAudio` and `Gemma4Audio`, registered as the towers `gemma3n_audio` and `gemma4_audio`. `audio_config` reads the checkpoint's `audio_config` record and rejects unknown computational fields. `audio_weights` converts the tower's own tensors and keeps Gemma 4's checkpointed clipping bounds in a frozen `constants` collection. An encoder takes `input_features` shaped `[B, T, F]` and a boolean `input_features_mask` that is True for valid frames, and returns `AudioEncoding(features, mask)`, with the mask subsampled to the encoder's frame rate. A loaded source's processor (`Pretrained.load(...).processor`) runs the checkpoint's own Transformers feature extractor, which turns 16 kHz mono waveforms into those two arrays; nothing resamples. Gemma 3n projects audio through `Gemma3nProjectorModule.soft_embeddings`, without the scaling used for vision. Gemma 4 reuses `Gemma4ProjectorModule`, with its input width taken from `output_proj_dims`.
 
 ## Masked diffusion language models
 
@@ -378,10 +382,12 @@ The loss is MDLM's negative ELBO per token. `process.generate` unmasks the 24 to
 
 > Once upon a time, in a small town, there lived a little girl named Lily. Mia loved whistle. She had an key telling to try to sleep. One day, she always to see her favorite mom, dad unate to have lots of.
 
-LLaDA and Dream use this masked-token path from their released weights. They predict masked tokens with bidirectional attention and need a mask token ID and a masked-diffusion objective; swapping out the autoregressive loss is not enough, because the attention and the corruption process change too. For these models, `load_pretrained(...).text_generation()`, `dew.pipeline(source_or_run)` and `MaskedDiffusionObjective.pipeline(state)` return `MaskedGeneration`. It runs Dew's native MDLM algorithm (`DiscreteProcess` with `Unmask`), not the source-specific remasking and block-generation recipes of LLaDA or Dream.
+LLaDA and Dream use this masked-token path from their released weights. They predict masked tokens with bidirectional attention and need a mask token ID and a masked-diffusion objective; swapping out the autoregressive loss is not enough, because the attention and the corruption process change too. For these models, `PretrainedMaskedDecoder.load(...).text_generation()`, `dew.pipeline(source_or_run)` and `MaskedDiffusionObjective.pipeline(state)` return `MaskedGeneration`. It runs Dew's native MDLM algorithm (`DiscreteProcess` with `Unmask`), not the source-specific remasking and block-generation recipes of LLaDA or Dream.
 
 ```python
-llada = load_pretrained(fixtures / "llada-tiny", dtype="float32", attention_impl="xla")
+from dew.interop import PretrainedMaskedDecoder
+
+llada = PretrainedMaskedDecoder.load(fixtures / "llada-tiny", dtype=jnp.float32, attention_impl="xla")
 masked_task = llada.text_generation()
 result = masked_task([[1, 2, 3]], 8, key=7, steps=16, n=2)
 print(result.host().tokens)
@@ -402,22 +408,25 @@ Saved masked-diffusion recipe runs keep their compute and storage precision, and
 
 ## DiffusionGemma
 
-DiffusionGemma uses uniform-vocabulary corruption, a causal prompt encoder, a bidirectional canvas and self-conditioning. `load_pretrained` loads the complete model. Its `BlockProcess` generation policy refines whole canvases and commits clean tokens to the shared text cache. It returns `CanvasGeneration` with response lengths (including EOS), termination flags and per-row refinement counts, and no autoregressive likelihood fields.
+DiffusionGemma uses uniform-vocabulary corruption, a causal prompt encoder, a bidirectional canvas and self-conditioning. `Pretrained.load` loads the complete model. Its `BlockProcess` generation policy refines whole canvases and commits clean tokens to the shared text cache. It returns `CanvasGeneration` with response lengths (including EOS), termination flags and per-row refinement counts, and no autoregressive likelihood fields.
 
 The next example loads the tiny reference checkpoint, then tokenizes, generates, decodes, saves and reloads it. Its synthetic vocabulary has 64 tokens. The released model ID is `google/diffusiongemma-26B-A4B-it`, which downloads large weights and needs matching host and device memory.
 
 ```python
 from tempfile import TemporaryDirectory
 
-gemma = load_pretrained(fixtures / "diffusion-gemma-workflow", dtype="float32",
-                        attention_impl="xla", max_seq_len=32)
+from dew.interop import PretrainedBlockDecoder
+
+gemma = PretrainedBlockDecoder.load(fixtures / "diffusion-gemma-workflow", dtype=jnp.float32,
+                                    attention_impl="xla", max_seq_len=32)
 prompt = gemma.processor(["<bos> t5 t7 t9 t11"])
 block_task = gemma.block_generation()
 generated = block_task(prompt, 7, key=jax.random.key(11))
 print(block_task.decode(generated))
 with TemporaryDirectory() as checkpoint:
     gemma.save(checkpoint)
-    restored = load_pretrained(checkpoint, dtype="float32", attention_impl="xla", max_seq_len=32)
+    restored = PretrainedBlockDecoder.load(checkpoint, dtype=jnp.float32, attention_impl="xla",
+                                           max_seq_len=32)
     replay = restored.block_generation()(prompt, 7, key=jax.random.key(11))
     np.testing.assert_array_equal(replay.tokens, generated.tokens)
 ```
@@ -440,7 +449,7 @@ from dataclasses import replace
 from dew.objectives.diffusion import BlockDiffusionObjective
 
 sft_source = fixtures / "diffusion-gemma-sft"
-sft_bundle = load_pretrained(sft_source, dtype="float32", attention_impl="xla", max_seq_len=32)
+sft_bundle = PretrainedBlockDecoder.load(sft_source, dtype=jnp.float32, attention_impl="xla", max_seq_len=32)
 with np.load(sft_source / "reference.npz") as reference:
     train_tokens = np.tile(reference["tokens"], (jax.device_count(), 1))
 block_data = Dataset(train=lambda partition: iter([{"text": train_tokens}]), val=None,
@@ -451,8 +460,8 @@ block_state = Trainer(block_objective, optax.sgd(0.001), key=jax.random.key(2)).
     block_data, steps=1, log_every=1)
 with TemporaryDirectory() as checkpoint:
     replace(sft_bundle, model=block_objective.model).save(checkpoint, variables=block_state.params)
-    trained_bundle = load_pretrained(checkpoint, dtype="float32", attention_impl="xla",
-                                     max_seq_len=32)
+    trained_bundle = PretrainedBlockDecoder.load(checkpoint, dtype=jnp.float32, attention_impl="xla",
+                                                 max_seq_len=32)
 print("Optimizer updates:", int(block_state.updates))
 ```
 

@@ -1,6 +1,6 @@
 """Tier 3: a transformers PyTorch causal LM, lowered to JAX by torchax.
 
-`load_pretrained(source, fallback="torchax")` builds the model with
+`Pretrained.load(source, fallback="torchax")` builds the model with
 transformers on the host and hands its forward to torchax, which runs every
 torch op as a JAX op, so the model jits, differentiates and shards like any
 other JAX function. Dew knows nothing about the architecture: no Dew
@@ -40,7 +40,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from dew.interop import sources
 from dew.interop.pickles import host_view
-from dew.interop.pretrained import AUTO, Pretrained, _source_processor
+from dew.interop.pretrained import AUTO, PretrainedFallback, _source_processor
 from dew.nn.sharding import LogicalAxes, logical_spec, parameter_path
 from dew.registry import resolve_dtype
 from dew.training.distributed import PARAMETER_AXES, Layout, Placement
@@ -163,7 +163,7 @@ class TorchGraph:
         buffers = variables.get("buffers", {})
         if not isinstance(params, Mapping) or not isinstance(buffers, Mapping):
             raise TypeError("a torchax model's variables are {'params': ..., 'buffers': ...} "
-                            "keyed by torch names, as load_pretrained returns them")
+                            "keyed by torch names, as Pretrained.load returns them")
         tensors = {name: np.asarray(leaf) for name, leaf in params.items()}
         tensors.update({name: np.asarray(buffers[name]) for name in self.persistent})
         return tensors
@@ -237,7 +237,7 @@ class TorchCausalLM(nn.Module):
         if self.is_initializing():
             raise ValueError(
                 "a torchax model has no initializer; apply it to the variables "
-                "load_pretrained returned, or pass them to LMObjective as pretrained=")
+                "Pretrained.load returned, or pass them to LMObjective as pretrained=")
         held = self.variables
         params = {name: self._compute(leaf) for name, leaf in held["params"].items()}
         buffers = {name: jnp.asarray(leaf) for name, leaf in held.get("buffers", {}).items()}
@@ -251,10 +251,10 @@ class TorchCausalLM(nn.Module):
 
 
 def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtype: str,
-         param_dtype: str, attention_impl: str, max_seq_len: int | None) -> Pretrained:
+         param_dtype: str, attention_impl: str, max_seq_len: int | None) -> PretrainedFallback:
     """Load `directory`'s causal LM through transformers and torchax.
 
-    `directory` is the metadata snapshot `load_pretrained` resolved and
+    `directory` is the metadata snapshot `Pretrained.load` resolved and
     `revision` its commit (None for a local directory); the weights come
     from the same commit through `sources.snapshot`, so the file
     selection is the native loader's.
@@ -322,8 +322,8 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
         f"or KV-cache generation; the load holds the torch model on the host, at least 2x "
         f"the checkpoint", stacklevel=3)
     built = {**config, "dtype": dtype, "fallback": "torchax", **versions}
-    return Pretrained(module, {"params": params, "buffers": buffers}, processor, config, directory,
-                      built, generation_config, export_adapter=graph.export, revision=revision)
+    return PretrainedFallback(module, {"params": params, "buffers": buffers}, processor, config, directory,
+                              built, generation_config, export_adapter=graph.export, revision=revision)
 
 
 def _plain_head(model: PreTrainedModel, weight: torch.Tensor) -> bool:

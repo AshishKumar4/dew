@@ -280,3 +280,6 @@ class DewLM(TemplateLM):
             stops = handle_stop_sequences(controls.get("until"), eos=eos)
             answers.append(postprocess_generated_text(self.task.decode(drawn)[0], stops, None))
         return answers
+
+
+__all__ = ["DewLM"]

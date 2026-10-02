@@ -89,21 +89,6 @@ def uint8_pixels(images: ArrayLike) -> NDArray[np.uint8]:
     return np.clip(levels, 0, 255).astype(np.uint8)
 
 
-def _addressable(leaf: jax.Array | np.ndarray) -> np.ndarray:
-    """`leaf` as numpy, gathering it across the pool when it is a global
-    array this process holds only a shard of."""
-    if isinstance(leaf, jax.Array) and not leaf.is_fully_addressable:
-        return np.asarray(multihost_utils.process_allgather(leaf, tiled=True))
-    return np.asarray(leaf)
-
-
-def host[T](value: T) -> T:
-    """An artifact whose arrays are host-local numpy. On a pool the gather that
-    completes a global array is a collective every process has to call;
-    `collective_host` adds the failure agreement the trainer uses."""
-    return jax.tree.map(_addressable, value)
-
-
 GATHER_BYTES = 256 * 2 ** 20
 """The bytes of global leaves `collective_host` gathers in one computation.
 
@@ -448,3 +433,14 @@ def end_pool_on_failure(grace: float = FAILURE_GRACE_SECONDS) -> None:
     # The bound only keeps an exit from waiting on a service that stopped
     # answering.
     stop_at_exit(watcher, stop.set, timeout=5.0)
+
+
+__all__ = [
+    "ImageGrid",
+    "PeerFailure",
+    "Representations",
+    "TextSamples",
+    "TokenScores",
+    "VideoGrid",
+    "uint8_pixels",
+]

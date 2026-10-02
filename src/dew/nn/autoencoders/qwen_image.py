@@ -3,18 +3,17 @@
 An independent linen port of diffusers 6256aa76
 autoencoder_kl_qwenimage21.py (Apache-2.0): Wan's causal video VAE for
 images, every 3D convolution squeezed to 2D, NHWC, on the first-chunk path a
-single frame takes. The temporal machinery leaves three facts: the
-downsampling `AvgDown3D` shortcut pads one zero frame in front before
-averaging; the upsampling `DupUp3D` shortcut keeps the second duplicated
-frame; and `time_conv` runs only from a second frame on, its weights held
-so an export writes them back unchanged (zero gradient here). The decoder
-clamps pixels to [-1, 1], and RMS gammas keep the stored `[C, 1, 1(, 1)]`
-shape.
+single frame takes; its norm, residual, attention and mid blocks are Wan's
+own on a frame. The temporal machinery leaves three facts: the downsampling
+`AvgDown3D` shortcut pads one zero frame in front before averaging; the
+upsampling `DupUp3D` shortcut keeps the second duplicated frame; and
+`time_conv` runs only from a second frame on, its weights held so an export
+writes them back unchanged (zero gradient here). The decoder clamps pixels
+to [-1, 1], and RMS gammas keep the stored `[C, 1, 1(, 1)]` shape.
 """
 from __future__ import annotations
 
 import json
-import math
 import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -30,37 +29,18 @@ from dew import records
 from dew.nn.text_encoders import check_tree
 from dew.objectives.base import Variables
 
-from ..conv import Conv
 from .api import ModuleAutoEncoder
 from .kl import posterior_latent
 from .vae import FlaxDownsample2D, FlaxUpsample2D
+from .wan import WanMidBlock, WanResidualBlock, WanRMSNorm, causal_conv
 
 if TYPE_CHECKING:
-    from dew.interop.pretrained import WeightLayout
+    from dew.interop.streaming import WeightLayout
 
 
-class _RMSNorm(nn.Module):
-    """`QwenImage21RMS_norm`: the channel vector scaled to unit L2 norm, times
-    sqrt(C) and a gamma stored `[C]` followed by `rank - 1` unit axes."""
-
-    features: int
-    rank: int
-    dtype: Dtype = jnp.float32
-
-    @nn.compact
-    def __call__(self, x):
-        gamma = self.param("gamma", nn.initializers.ones, (self.features, *(1,) * (self.rank - 1)))
-        # F.normalize widens half precision to float32 and casts back.
-        wide = x.astype(jnp.promote_types(x.dtype, jnp.float32))
-        norm = jnp.sqrt(jnp.sum(jnp.square(wide), axis=-1, keepdims=True))
-        normalized = (wide / jnp.maximum(norm, 1e-12)).astype(x.dtype)
-        return normalized * math.sqrt(self.features) * gamma.reshape(-1).astype(self.dtype)
-
-
-def _conv(features: int, kernel: int, dtype: Dtype, name: str | None) -> Conv:
+def _conv(features: int, kernel: int, dtype: Dtype, name: str | None) -> nn.Module:
     """The source's padded "causal" convolution, which is a 2D one on a frame."""
-    pad = kernel // 2
-    return Conv(features, (kernel, kernel), padding=((pad, pad), (pad, pad)), dtype=dtype, name=name)
+    return causal_conv(features, kernel, 2, dtype, name)
 
 
 class _TimeConv(nn.Module):
@@ -74,48 +54,6 @@ class _TimeConv(nn.Module):
     def __call__(self) -> None:
         self.param("kernel", nn.initializers.lecun_normal(), (1, 1, self.in_features, self.features))
         self.param("bias", nn.initializers.zeros, (self.features,))
-
-
-class _ResidualBlock(nn.Module):
-    in_features: int
-    features: int
-    dtype: Dtype = jnp.float32
-
-    @nn.compact
-    def __call__(self, x):
-        shortcut = x
-        if self.in_features != self.features:
-            shortcut = _conv(self.features, 1, self.dtype, "conv_shortcut")(x)
-        x = nn.silu(_RMSNorm(self.in_features, 4, self.dtype, name="norm1")(x))
-        x = _conv(self.features, 3, self.dtype, "conv1")(x)
-        x = nn.silu(_RMSNorm(self.features, 4, self.dtype, name="norm2")(x))
-        return _conv(self.features, 3, self.dtype, "conv2")(x) + shortcut
-
-
-class _Attention(nn.Module):
-    """Single-head self-attention over the pixels, the projections 1x1 convs."""
-
-    dtype: Dtype = jnp.float32
-
-    @nn.compact
-    def __call__(self, x):
-        batch, height, width, channels = x.shape
-        normalized = _RMSNorm(channels, 3, self.dtype, name="norm")(x)
-        qkv = _conv(3 * channels, 1, self.dtype, "to_qkv")(normalized)
-        query, key, value = jnp.split(qkv.reshape(batch, height * width, 1, 3 * channels), 3, axis=-1)
-        attended = jax.nn.dot_product_attention(query, key, value).reshape(batch, height, width, channels)
-        return _conv(channels, 1, self.dtype, "attention_out")(attended) + x
-
-
-class _MidBlock(nn.Module):
-    features: int
-    dtype: Dtype = jnp.float32
-
-    @nn.compact
-    def __call__(self, x):
-        x = _ResidualBlock(self.features, self.features, self.dtype, name="resnets_0")(x)
-        x = _Attention(self.dtype, name="attentions_0")(x)
-        return _ResidualBlock(self.features, self.features, self.dtype, name="resnets_1")(x)
 
 
 class _Downsampler(nn.Module):
@@ -176,7 +114,7 @@ class _DownBlock(nn.Module):
     def __call__(self, x):
         shortcut = _average_down(x, self.features, self.temporal, 2 if self.down else 1)
         for index in range(self.num_res_blocks):
-            x = _ResidualBlock(self.in_features if index == 0 else self.features, self.features,
+            x = WanResidualBlock(self.in_features if index == 0 else self.features, self.features,
                                self.dtype, name=f"resnets_{index}")(x)
         if self.down:
             x = _Downsampler(self.features, self.temporal, self.dtype, name="downsampler")(x)
@@ -195,7 +133,7 @@ class _UpBlock(nn.Module):
     def __call__(self, x):
         source = x
         for index in range(self.num_res_blocks + 1):
-            x = _ResidualBlock(self.in_features if index == 0 else self.features, self.features,
+            x = WanResidualBlock(self.in_features if index == 0 else self.features, self.features,
                                self.dtype, name=f"resnets_{index}")(x)
         if not self.up:
             return x
@@ -220,8 +158,8 @@ class _Encoder(nn.Module):
             x = _DownBlock(widths[index], widths[index + 1], self.num_res_blocks,
                            index != last and self.temporal_downsample[index], index != last,
                            self.dtype, name=f"down_blocks_{index}")(x)
-        x = _MidBlock(widths[-1], self.dtype, name="mid_block")(x)
-        x = nn.silu(_RMSNorm(widths[-1], 4, self.dtype, name="norm_out")(x))
+        x = WanMidBlock(widths[-1], self.dtype, name="mid_block")(x)
+        x = nn.silu(WanRMSNorm(widths[-1], 4, self.dtype, name="norm_out")(x))
         return _conv(self.moments, 3, self.dtype, "conv_out")(x)
 
 
@@ -237,13 +175,13 @@ class _Decoder(nn.Module):
     def __call__(self, z):
         widths = [self.base_dim * multiple for multiple in (self.dim_mult[-1], *self.dim_mult[::-1])]
         x = _conv(widths[0], 3, self.dtype, "conv_in")(z)
-        x = _MidBlock(widths[0], self.dtype, name="mid_block")(x)
+        x = WanMidBlock(widths[0], self.dtype, name="mid_block")(x)
         last = len(self.dim_mult) - 1
         for index in range(len(self.dim_mult)):
             x = _UpBlock(widths[index], widths[index + 1], self.num_res_blocks,
                          index != last and self.temporal_upsample[index], index != last,
                          self.dtype, name=f"up_blocks_{index}")(x)
-        x = nn.silu(_RMSNorm(widths[-1], 4, self.dtype, name="norm_out")(x))
+        x = nn.silu(WanRMSNorm(widths[-1], 4, self.dtype, name="norm_out")(x))
         return _conv(self.image_channels, 3, self.dtype, "conv_out")(x)
 
 

@@ -587,7 +587,7 @@ def test_video_scores_equal_the_flattened_frame_batch(rng, metric_fn):
 @pytest.mark.parametrize("shape", [(2, 32, 32, 3), (2, 3, 32, 32, 3), (2, 32, 32, 1)])
 def test_per_example_scores_have_one_entry_per_frame(rng, metric_fn, shape):
     key_x, key_noise = jax.random.split(rng)
-    x = _ramp_image((int(np.prod(shape[:-3])),) + shape[-3:], key_x).reshape(shape)
+    x = _ramp_image((int(np.prod(shape[:-3])), *shape[-3:]), key_x).reshape(shape)
     y = x + 0.1 * jax.random.normal(key_noise, x.shape)
     scores = metric_fn(x, y, data_range=2.0, per_example=True)
     assert scores.shape == (int(np.prod(shape[:-3])),)
@@ -792,9 +792,15 @@ def test_a_sample_outside_the_pixel_range_is_clipped_not_wrapped():
     _, batch, _ = clip_fixture()
     white = jnp.ones((4, 16, 12, 3), jnp.float32)
 
-    assert metric.finalize(metric(ImageGrid(1.2 * white), batch)) == metric.finalize(metric(ImageGrid(white), batch))
-    assert metric.finalize(metric(ImageGrid(-1.2 * white), batch)) == metric.finalize(metric(ImageGrid(-white), batch))
-    assert metric.finalize(metric(ImageGrid(white), batch)) != metric.finalize(metric(ImageGrid(-white), batch))
+    assert metric.finalize(metric(ImageGrid(1.2 * white), batch)) == metric.finalize(
+        metric(ImageGrid(white), batch)
+    )
+    assert metric.finalize(metric(ImageGrid(-1.2 * white), batch)) == metric.finalize(
+        metric(ImageGrid(-white), batch)
+    )
+    assert metric.finalize(metric(ImageGrid(white), batch)) != metric.finalize(
+        metric(ImageGrid(-white), batch)
+    )
 
 
 @pytest.mark.parametrize("rows", [4, 12])
@@ -852,7 +858,7 @@ def test_the_weights_loader_reads_arrays_and_refuses_the_rest(tmp_path):
 
     hostile = tmp_path / "hostile.pickle"
     hostile.write_bytes(pickle.dumps(print))
-    with pytest.raises(pickle.UnpicklingError, match="builtins.print"):
+    with pytest.raises(pickle.UnpicklingError, match=r"builtins.print"):
         load_arrays(hostile)
 
 

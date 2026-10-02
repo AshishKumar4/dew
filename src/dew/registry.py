@@ -21,7 +21,7 @@ import types
 import typing
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Literal, Protocol, TypedDict, TypeVar, Union
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypedDict, TypeVar, Union, overload
 
 import jax
 import jax.numpy as jnp
@@ -357,8 +357,14 @@ def resolve_dtype(value: object) -> DTypeLike | None:
         f"dtype {value!r} is not a dtype, nor one of {sorted(_DTYPES)}")
 
 
+@overload
+def dtype_name(value: DTypeLike) -> DtypeName: ...
+@overload
+def dtype_name(value: None) -> None: ...
 def dtype_name(value: DTypeLike | None) -> DtypeName | None:
-    """Return the name `resolve_dtype` accepts for a dtype, for a logged config."""
+    """Return the name `resolve_dtype` accepts for a dtype, for a logged config.
+
+    A loader takes a dtype, `jnp.bfloat16`, or its name, and records the name."""
     if value is None:
         return None
     for name, dtype in _DTYPES.items():
@@ -505,16 +511,13 @@ __all__ = [
     "REGISTRIES",
     "Registry",
     "datasets",
-    "dtype_name",
     "encoders",
-    "float64_twin",
     "metrics",
     "mixers",
     "models",
     "objectives",
     "presets",
     "projectors",
-    "resolve_dtype",
     "schedules",
     "solvers",
     "towers",

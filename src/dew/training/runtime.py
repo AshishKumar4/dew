@@ -34,7 +34,7 @@ from dew.pool import (
     runs_on_gpu,
     slurm_tasks_here,
 )
-from dew.telemetry.devices import apply_xla_flags, keep_roundings, xla_flag
+from dew.telemetry.devices import apply_xla_flags, xla_flag
 from dew.telemetry.instrumentation import enable_compilation_cache
 
 _log = logging.getLogger(__name__)
@@ -104,7 +104,6 @@ def _set_environment(wandb: Wandb | None, xla_flags: str | None,
     os.environ['TOKENIZERS_PARALLELISM'] = "false"
     apply_xla_flags(xla_flags)
     unpartition_gpu_pool()
-    keep_roundings()
     if compilation_cache_dir:
         enable_compilation_cache(compilation_cache_dir)
 
@@ -320,3 +319,6 @@ def run_timestamp() -> str:
     later would write into a different directory.
     """
     return broadcast_from_process_zero(datetime.now().strftime("%Y-%m-%d_%H:%M:%S"))
+
+
+__all__ = ["Preempted", "PreemptionNotice", "prepare_process", "run_timestamp"]

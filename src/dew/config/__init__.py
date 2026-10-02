@@ -318,9 +318,9 @@ class TrainerConfig:
     name: str | None = None
     checkpoint_dir: str = "./checkpoints"
     keep: Annotated[int | Keep, _keep_argument()] = 2
+    """Latest checkpoints kept, besides the best one."""
     best: Annotated[str | Best | tuple[Best, ...] | None, _best_argument()] = None
     """Metric name and ranking policy; None selects validation loss or training loss."""
-    """Latest checkpoints kept, besides the best one."""
     batch_size: int = 32
     """Global batch, over every process."""
     key: int = 0
@@ -779,11 +779,14 @@ class RunConfig:
                         json_value(summary or {}), steps, packages_installed()), 0)
 
             agreed("run metadata", record_run)
-            state = Trainer.from_config(
-                trainer, objective, self.optim.build(steps),
-                key=trainer.key,
-                checkpoints=checkpoints,
-                tracker=tracker, rollout=rollout,
+            # The trainer holds mesh, layout, accumulation, dynamic_scale and
+            # profile; prepare_process read the process fields, and the rest
+            # are fit's arguments or built the checkpoints and the tracker.
+            state = Trainer(
+                objective, self.optim.build(steps), key=trainer.key,
+                mesh=trainer.mesh, layout=trainer.layout, accumulation=trainer.accumulation,
+                dynamic_scale=trainer.dynamic_scale, checkpoints=checkpoints, tracker=tracker,
+                rollout=rollout, profile=trainer.profile,
             ).fit(
                 dataset, steps=steps,
                 log_every=trainer.log_every,
@@ -832,3 +835,6 @@ class RunConfig:
             tracker.log({"sweep/value": value}, index)
             tracker.artifact(trial, index)
         return finished
+
+
+__all__ = ["JsonDict", "ModelConfig", "OptimConfig", "RunConfig", "TrainerConfig", "Wandb"]

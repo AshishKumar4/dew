@@ -1,10 +1,10 @@
 """One trained source-format export per routed decoder family, measured.
 
 The reproduction command behind the numbers in tests/test_decoder_export.py.
-Each case loads a committed tiny checkpoint through `load_pretrained`, runs
+Each case loads a committed tiny checkpoint through `Pretrained.load`, runs
 one real `Trainer` step of plain SGD under `LMObjective`, writes the trained
 weights back into the source's own tensor names with `Pretrained.save`, and
-reads the export back twice: with `load_pretrained` for the parameter tree
+reads the export back twice: with `Pretrained.load` for the parameter tree
 and the logits, and with transformers 5.16.1 for the reference logits on the
 same ids. It prints what moved, what the export holds and where the two
 implementations disagree.
@@ -33,7 +33,6 @@ import optax
 import torch
 from torch.overrides import TorchFunctionMode
 
-from dew.interop import load_pretrained
 from dew.interop.pretrained import Pretrained
 from dew.objectives.base import Variables
 
@@ -368,11 +367,11 @@ def round_trip(case: Case, workspace: Path) -> RoundTrip:
     """`case` loaded, trained for one step, exported and read back."""
     directory = FIXTURES / case.fixture
     ids = np.load(directory / "input_ids.npy")
-    source = load_pretrained(str(directory), dtype="float32", attention_impl="reference")
+    source = Pretrained.load(str(directory), dtype="float32", attention_impl="reference")
     state = train(case, source, ids)
     export = workspace / case.name
     source.save(export, variables=state.params)
-    reloaded = load_pretrained(str(export), dtype="float32", attention_impl="reference")
+    reloaded = Pretrained.load(str(export), dtype="float32", attention_impl="reference")
     return RoundTrip(case, source, state.params, export, ids,
                      logits(source, state.params, ids), reloaded,
                      reference_logits(case, export, ids),

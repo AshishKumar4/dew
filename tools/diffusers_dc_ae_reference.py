@@ -126,7 +126,9 @@ def build(config: dict, root: Path) -> dict[str, np.ndarray]:
 
 
 def bundle(directory: str, destination: str) -> None:
-    """Pack the saved autoencoders and the recorded arrays for the suite."""
+    """Pack every entry of `directory`, the saved models and the recorded
+    arrays, into the xz tarball `destination` for the suite. The diffusers
+    reference tools that bundle a whole directory share it."""
     import tarfile
 
     root = Path(directory)

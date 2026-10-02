@@ -74,7 +74,7 @@ from dew.inference import (
     TextGeneration,
 )
 from dew.inference.tasks import SHAPE_BUCKETS
-from dew.interop import load_pretrained
+from dew.interop import PretrainedDecoder
 from dew.nn.backbones.decoder_block import remat_policy
 from dew.objectives.rl import (
     Action,
@@ -538,8 +538,8 @@ def main(config: Config) -> dict:
     # The server rounds its cache up to whole 64-slot tiles, and an engine
     # refuses a context past the export's; the next shape bucket covers both.
     context = next(bucket for bucket in SHAPE_BUCKETS if bucket >= engine_context(config))
-    source = load_pretrained(config.model, dtype="float32" if config.smoke else "bfloat16",
-                             param_dtype="float32", max_seq_len=context)
+    source = PretrainedDecoder.load(config.model, dtype=jnp.float32 if config.smoke else jnp.bfloat16,
+                             param_dtype=jnp.float32, max_seq_len=context)
     stock = source.text_generation().sampling
     words = HFTokenizer(tokenizer)
     # An attempt ends on EOS; the committed tiny Qwen2 names none, its tokenizer does.

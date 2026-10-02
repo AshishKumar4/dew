@@ -141,23 +141,23 @@ def packed_mask(segments):
 
 
 CALLS = {
-    "causal": dict(causal=True),
-    "window": dict(causal=True, sliding_window=5),
-    "packed": dict(mask=packed_mask(jnp.asarray(packed_batch()["text_segment_ids"][:, :-1]))),
+    "causal": {"causal": True},
+    "window": {"causal": True, "sliding_window": 5},
+    "packed": {"mask": packed_mask(jnp.asarray(packed_batch()["text_segment_ids"][:, :-1]))},
     # Query-broadcast rows must survive the reorder without being expanded.
-    "broadcast_mask": dict(
-        causal=True, mask=(jnp.arange(SEQ_LEN) < SEQ_LEN // 2)[None, None, None, :]),
-    "broadcast_bias": dict(
-        causal=True, bias=jnp.linspace(-4.0, 4.0, SEQ_LEN)[None, None, None, :]),
-    "bias": dict(causal=True,
-                 bias=jax.random.normal(jax.random.key(3), (1, 4, SEQ_LEN, SEQ_LEN))),
-    "full": dict(),
+    "broadcast_mask": {
+        "causal": True, "mask": (jnp.arange(SEQ_LEN) < SEQ_LEN // 2)[None, None, None, :]},
+    "broadcast_bias": {
+        "causal": True, "bias": jnp.linspace(-4.0, 4.0, SEQ_LEN)[None, None, None, :]},
+    "bias": {"causal": True,
+                 "bias": jax.random.normal(jax.random.key(3), (1, 4, SEQ_LEN, SEQ_LEN))},
+    "full": {},
     # One learned logit per query head, split with the heads by the exchange.
-    "sinks": dict(causal=True, sinks=jax.random.normal(jax.random.key(4), (4,))),
+    "sinks": {"causal": True, "sinks": jax.random.normal(jax.random.key(4), (4,))},
     # Each row's keys end at its own length; the rows split with the batch.
-    "key_lengths": dict(key_value_seq_lengths=jnp.asarray([16, 9, 3, 1, 12, 16, 5, 7], jnp.int32)),
-    "causal_key_lengths": dict(causal=True, key_value_seq_lengths=jnp.asarray(
-        [16, 9, 3, 1, 12, 16, 5, 7], jnp.int32)),
+    "key_lengths": {"key_value_seq_lengths": jnp.asarray([16, 9, 3, 1, 12, 16, 5, 7], jnp.int32)},
+    "causal_key_lengths": {"causal": True, "key_value_seq_lengths": jnp.asarray(
+        [16, 9, 3, 1, 12, 16, 5, 7], jnp.int32)},
 }
 
 
@@ -255,16 +255,16 @@ def test_the_byte_count_picks_the_exchange_for_a_call_with_no_mask():
 
 @pytest.mark.mesh
 @pytest.mark.parametrize("case, spec, shape, call, exchanged", [
-    ("causal", SPLIT, (BATCH, SEQ_LEN, 4, 2), dict(causal=True), True),
+    ("causal", SPLIT, (BATCH, SEQ_LEN, 4, 2), {"causal": True}, True),
     # H=4, K=1, n=4: 2(4 + 4)/4 = 4 units against the gather's 2 + 2 * 4/4 = 4.
     # A masked call takes the all-to-all even at a tie in bytes, whose kernel
     # skips the masked blocks.
     ("causal_one_key_head", MeshSpec(fsdp=2, sequence=4), (BATCH, SEQ_LEN, 4, 1),
-     dict(causal=True), True),
-    ("unmasked_grouped", SPLIT, (BATCH, SEQ_LEN, 8, 1), dict(), False),
+     {"causal": True}, True),
+    ("unmasked_grouped", SPLIT, (BATCH, SEQ_LEN, 8, 1), {}, False),
     ("heads_the_split_cannot_divide", MeshSpec(tensor=2, sequence=4),
-     (BATCH, SEQ_LEN, 4, 2), dict(causal=True), False),
-    ("odd_joint_length", SPLIT, (BATCH, 15, 4, 4), dict(), False),
+     (BATCH, SEQ_LEN, 4, 2), {"causal": True}, False),
+    ("odd_joint_length", SPLIT, (BATCH, 15, 4, 4), {}, False),
 ], ids=lambda value: value if isinstance(value, str) else "")
 def test_every_call_takes_the_exchange_its_shape_admits(case, spec, shape, call, exchanged):
     """The choice is per call and falls to the gather for any shape the
@@ -340,10 +340,12 @@ def test_cudnn_runs_inside_either_exchange(exchange, causal, without_determinist
 @pytest.mark.mesh
 def test_a_shape_the_exchange_cannot_split_is_refused_by_name():
     query, key, value = heads(jax.random.key(0), kv_heads=2)
-    with jax.set_mesh(MeshSpec(tensor=2, sequence=4).build()):
-        with pytest.raises(ValueError, match="gathered_keys_attention"):
-            jax.jit(lambda q, k, v: through("all_to_all", q, k, v, causal=True))(
-                query, key, value)
+    with (
+        jax.set_mesh(MeshSpec(tensor=2, sequence=4).build()),
+        pytest.raises(ValueError, match="gathered_keys_attention"),
+    ):
+        jax.jit(lambda q, k, v: through("all_to_all", q, k, v, causal=True))(
+            query, key, value)
 
 
 LOCAL_LENGTH = 32
@@ -364,13 +366,13 @@ def local_inputs():
 
 
 LOCAL_CALLS = {
-    "window": dict(window=5),
-    "window_packed": dict(window=5, packed=True),
-    "window_valid_sinks": dict(window=5, valid=True, sinks=True),
+    "window": {"window": 5},
+    "window_packed": {"window": 5, "packed": True},
+    "window_valid_sinks": {"window": 5, "valid": True, "sinks": True},
     # Chunks of 4 start at every shard's first row; chunks of 6 straddle them.
-    "chunk_aligned": dict(chunk=4),
-    "chunk_straddling": dict(chunk=6),
-    "chunk_positions": dict(chunk=6, positions=True, packed=True),
+    "chunk_aligned": {"chunk": 4},
+    "chunk_straddling": {"chunk": 6},
+    "chunk_positions": {"chunk": 6, "positions": True, "packed": True},
 }
 
 
@@ -447,7 +449,7 @@ def test_local_attention_splits_over_the_sequence_with_one_halo(name, spec):
 def test_a_window_wider_than_a_shard_takes_the_exchange():
     """Eight shards of 4 rows cannot hold a window of 5 in one neighbour, so
     the call runs whole through the sequence exchange, and still matches."""
-    call = dict(window=5, packed=True)
+    call = {"window": 5, "packed": True}
     whole, _ = local_outputs(call, 8, 8)
     split, text = local_outputs(call, 8, 8, MeshSpec(sequence=8).build())
     assert "all-to-all" in text
@@ -516,10 +518,9 @@ def test_decoding_is_refused_under_a_sequence_axis():
     model = tiny()
     tokens = jnp.ones((1, SEQ_LEN), jnp.int32)
     variables = model.init(jax.random.key(0), tokens)
-    with jax.set_mesh(SPLIT.build()):
-        with pytest.raises(ValueError, match="sequence axis of 2"):
-            jax.jit(lambda v, t: model.apply(v, t, decode=True, mutable=["cache"]))(
-                variables, tokens)
+    with jax.set_mesh(SPLIT.build()), pytest.raises(ValueError, match="sequence axis of 2"):
+        jax.jit(lambda v, t: model.apply(v, t, decode=True, mutable=["cache"]))(
+            variables, tokens)
 
 
 # --------------------------------------------------------------------------

@@ -92,9 +92,9 @@ def test_a_run_fine_tunes_a_published_pipeline_and_rebinds_it_without_weights(
 def test_a_pretrained_run_refuses_a_preset_of_another_kind(pipelines):
     """Flux was trained as a velocity flow; the default EDM preset is not
     that convention, and a flow preset is."""
-    common = dict(pretrained=str(pipelines / "flux" / "pipeline"), model=precision(),
-                  data=TFDSImages(image_size=16), solver=Euler(), guidance=None,
-                  sampling_steps=2, val_metrics=())
+    common = {"pretrained": str(pipelines / "flux" / "pipeline"), "model": precision(),
+                  "data": TFDSImages(image_size=16), "solver": Euler(), "guidance": None,
+                  "sampling_steps": 2, "val_metrics": ()}
     with pytest.raises(ValueError, match="name a preset of its kind"):
         DiffusionRunConfig(**common).build()
     assert DiffusionRunConfig(**common, preset=Flow(shift=3.0)).build() is not None
@@ -135,7 +135,7 @@ def test_a_scratch_flow_run_shifts_by_the_datas_resolution(size):
 
 
 def test_a_pretrained_run_refuses_a_model_of_its_own():
-    with pytest.raises(ValueError, match="leave model.architecture, model.config, text unset"):
+    with pytest.raises(ValueError, match=r"leave model.architecture, model.config, text unset"):
         DiffusionRunConfig(pretrained="some/pipeline", model=ModelConfig("simple_dit"),
                            text=TextCondition(encoder="t5"))
 

@@ -142,10 +142,9 @@ class DiffusionGemma(nn.Module):
         embedded = (embedded * jnp.asarray(math.sqrt(self.text.emb_features),
                      self.text.embed_tokens.embedding.dtype)).astype(embedded.dtype)
         fused = self.conditioner.fuse(safe, embedded, image_indices, conditioning, train=train)
-        slots = jnp.broadcast_to(jnp.arange(tokens.shape[1]), tokens.shape)
         return read(fused.tokens, decode=True, train=train, positions=positions,
                     segment_ids=segment_ids, input_embeddings=fused.embeddings,
-                    embedding_positions=slots, attention_mask=attention_mask,
+                    attention_mask=attention_mask,
                     image_groups=image_groups, rotary_positions=rotary_positions,
                     attention_pairwise_mask=attention_pairwise_mask,
                     attention_key_positions=attention_key_positions)
@@ -182,12 +181,11 @@ class DiffusionGemma(nn.Module):
             if self_conditioning_mask is not None:
                 signal = jnp.where(jnp.asarray(self_conditioning_mask)[:, None, None], signal, 0)
         conditioned = self.self_conditioning(scaled, signal)
-        indices = jnp.broadcast_to(jnp.arange(tokens.shape[1]), tokens.shape)
         # Parameter initialization needs no prefix. Loaded inference always
         # takes the frozen-cache branch, which refuses an absent prefill.
         read = self.decoder.hidden_states if states else self.decoder
         return read(tokens, train=train, decode=not self.is_initializing(),
-                    input_embeddings=conditioned, embedding_positions=indices,
+                    input_embeddings=conditioned,
                     positions=positions, attention_pairwise_mask=attention_pairwise_mask,
                     attention_key_positions=attention_key_positions)
 
@@ -216,3 +214,6 @@ def translate_weights(
     if missing:
         raise ValueError(f"missing self-conditioning tensors for {sorted(missing)}")
     return params
+
+
+__all__ = ["DiffusionGemma", "SelfConditioning"]

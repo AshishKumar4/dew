@@ -5,7 +5,9 @@ everywhere, since construction never imports it.
 """
 
 import dataclasses
+import itertools
 import json
+from importlib import import_module
 
 import jax
 import jax.numpy as jnp
@@ -14,7 +16,6 @@ import optax
 import pytest
 from reference_error import assert_fp32_reduction_bound
 
-import dew.nn.backbones  # noqa: F401  (registers the kind)
 from dew.config import OptimConfig, _rebuild
 from dew.nn.sharding import pipeline_microbatches
 from dew.objectives.base import Step
@@ -23,11 +24,14 @@ from dew.registry import models
 from dew.training.distributed import Layout, MeshSpec, shard_batch
 from dew.training.quantization import Quantization, quantize_for_serving
 
+import_module("dew.nn.backbones")  # registers the fixture kind
+
+
 VOCAB = 64
 SEQ_LEN = 8
 BATCH = 4
-TINY = dict(vocab_size=VOCAB, emb_features=32, num_layers=2, num_heads=4,
-            num_kv_heads=2, mlp_features=64, max_seq_len=16)
+TINY = {"vocab_size": VOCAB, "emb_features": 32, "num_layers": 2, "num_heads": 4,
+            "num_kv_heads": 2, "mlp_features": 64, "max_seq_len": 16}
 
 
 def tiny(**overrides):
@@ -141,7 +145,7 @@ def test_an_int8_trunk_trains_down():
         key, subkey = jax.random.split(key)
         params, opt_state, loss = train(params, opt_state, subkey)
         losses.append(float(loss))
-    assert all(later < earlier for earlier, later in zip(losses, losses[1:])), losses
+    assert all(later < earlier for earlier, later in itertools.pairwise(losses)), losses
 
 
 def int8_products(jaxpr) -> int:
@@ -205,7 +209,9 @@ def test_a_grouped_convolution_quantizes_each_group_on_its_own_range(group_width
                 feature_group_count=features // group_width, use_bias=False, dtype=dtype)
     ranges = jnp.logspace(-3, 0, features)
     x = (jax.random.normal(jax.random.key(0), (2, 8, 8, features)) * ranges).astype(dtype)
-    variables = jax.tree.map(lambda leaf: leaf.astype(dtype).astype(jnp.float32), conv.init(jax.random.key(1), x))
+    variables = jax.tree.map(
+        lambda leaf: leaf.astype(dtype).astype(jnp.float32), conv.init(jax.random.key(1), x)
+    )
     with jax.default_matmul_precision("highest"):
         plain = conv.clone(dtype=jnp.float32).apply(variables, x.astype(jnp.float32))
     quantized = Quantization().apply(conv).apply(variables, x)
@@ -241,7 +247,6 @@ def test_a_quantized_grouped_convolution_differentiates_as_qwix_does_ungrouped(g
     convolutions)."""
     qwix = pytest.importorskip("qwix")
     from qwix._src.core import conv_general, qarray
-    from reference_error import assert_fp32_reduction_bound
 
     from dew.nn.conv import Conv
 
@@ -283,14 +288,25 @@ def test_a_quantized_grouped_convolution_differentiates_as_qwix_does_ungrouped(g
         return qarray.dequantize(qarray.quantize(array, how))
 
     def convolve(x, kernel):
-        return jax.lax.conv_general_dilated(x, kernel, (1, 1), "SAME", rhs_dilation=(dilation, dilation),
-                                            dimension_numbers=("NHWC", "HWIO", "NHWC"), feature_group_count=groups)
+        return jax.lax.conv_general_dilated(
+            x,
+            kernel,
+            (1, 1),
+            "SAME",
+            rhs_dilation=(dilation, dilation),
+            dimension_numbers=("NHWC", "HWIO", "NHWC"),
+            feature_group_count=groups,
+        )
 
     with jax.default_matmul_precision("highest"):
         got, want, float_ = (value_and_gradients(function) for function in (dew, reference, plain))
         # The absolute products each gradient sums: the dequantized operands
         # the backward reads, and the cotangent scaled by the peaks.
-        _, transpose = jax.vjp(convolve, jnp.abs(dequantized(x / peaks, True)), jnp.abs(dequantized(kernel, False)))
+        _, transpose = jax.vjp(
+            convolve,
+            jnp.abs(dequantized(x / peaks, for_lhs=True)),
+            jnp.abs(dequantized(kernel, for_lhs=False)),
+        )
         x_magnitude, kernel_magnitude = transpose(jnp.abs(cotangent * peaks))
     np.testing.assert_array_equal(got[0], want[0])
     assert_fp32_reduction_bound(got[1], want[1], kernel_magnitude, int(np.prod(x.shape[:-1])))
@@ -313,7 +329,13 @@ def test_a_bf16_quantized_convolution_trains_as_qwix_does_in_float32(dtype):
 
     # Without the bias, which the quantization leaves alone and a bf16
     # module adds, and differentiates, in bf16.
-    settings = {"features": 128, "kernel_size": (2, 2), "strides": (2, 2), "padding": "VALID", "use_bias": False}
+    settings = {
+        "features": 128,
+        "kernel_size": (2, 2),
+        "strides": (2, 2),
+        "padding": "VALID",
+        "use_bias": False,
+    }
     conv = Conv(**settings, dtype=jnp.bfloat16)
     x = jax.random.normal(jax.random.key(0), (8, 16, 16, 4), jnp.bfloat16)
     variables = jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16), conv.init(jax.random.key(1), x))
@@ -404,7 +426,9 @@ def test_a_gpu_refuses_grouped_quantized_convolutions(group_width, dtype, dilati
         Quantization(dtype=dtype).apply(conv).apply(variables, x)
     with pytest.raises(ValueError, match="spatial_fusion"):
         quantize_for_serving(conv, variables, Quantization(dtype=dtype), x)
-    served, served_variables = quantize_for_serving(conv, variables, Quantization(dtype=dtype, weight_only=True), x)
+    served, served_variables = quantize_for_serving(
+        conv, variables, Quantization(dtype=dtype, weight_only=True), x
+    )
     np.testing.assert_array_equal(served.apply(served_variables, x), conv.apply(variables, x))
 
 
@@ -434,7 +458,9 @@ def test_a_convolution_no_rule_quantizes_computes_as_unwrapped_and_as_qwix_does(
     x = jax.random.normal(jax.random.key(0), (2, 8, 8, 64))
     variables = block.init(jax.random.key(1), x)
     if kernels == "trained":
-        variables = jax.tree.map(lambda leaf: 0.1 * jax.random.normal(jax.random.key(2), leaf.shape), variables)
+        variables = jax.tree.map(
+            lambda leaf: 0.1 * jax.random.normal(jax.random.key(2), leaf.shape), variables
+        )
     cotangent = jax.random.normal(jax.random.key(3), x.shape)
     pattern = "^(?!.*spatial_fusion).*"
     spec = Quantization(patterns=(pattern,))
@@ -484,12 +510,16 @@ def test_a_served_language_model_generates_with_its_quantized_kernels(weight_onl
     model = tiny()
     prompt = token_batch()["text"][:, :4]
     variables = model.init(jax.random.key(0), prompt)
-    served, served_variables = quantize_for_serving(model, variables, Quantization(weight_only=weight_only), prompt)
+    served, served_variables = quantize_for_serving(
+        model, variables, Quantization(weight_only=weight_only), prompt
+    )
     logits = served.apply(served_variables, prompt)
     _, stepped = served.apply(served_variables, prompt, method="states_and_logits")
     np.testing.assert_array_equal(stepped, logits)
     assert float(jnp.max(jnp.abs(logits - model.apply(variables, prompt)))) > 1e-3
-    tokens = generate(served, served_variables, prompt, 3, key=0, sampling=Sampling(temperature=0)).host().tokens
+    tokens = (
+        generate(served, served_variables, prompt, 3, key=0, sampling=Sampling(temperature=0)).host().tokens
+    )
     assert tokens.shape == (BATCH, 7)
 
 
@@ -522,7 +552,10 @@ def test_a_quantized_text_task_matches_qwix_direct_logits_and_generation(dtype, 
                                     methods=tuple(method for method in METHODS if hasattr(model, method)))
     abstract = jax.eval_shape(functools.partial(reference.init, jax.random.key(0),
                                                jnp.zeros((1, 1), jnp.int32)))
-    expected_variables = {**variables, "params": qwix.quantize_params(variables["params"], abstract["params"])}
+    expected_variables = {
+        **variables,
+        "params": qwix.quantize_params(variables["params"], abstract["params"]),
+    }
     expected_logits = jax.jit(reference.apply)(expected_variables, prompt)
     logits = jax.jit(served.model.apply)(served.variables, prompt)
     np.testing.assert_array_equal(logits, expected_logits)
@@ -604,19 +637,21 @@ def test_a_quantized_text_task_without_qwix_names_the_install_extra(monkeypatch)
 def test_a_quantized_multimodal_task_keeps_its_processor_and_media():
     from pathlib import Path
 
-    from dew.interop import load_pretrained
+    from dew.interop import Pretrained
     from dew.sampling import Sampling
 
     pytest.importorskip("qwix")
     directory = Path(__file__).parent / "fixtures/hf/gemma3-native-tiny"
-    source = load_pretrained(directory, dtype="float32", attention_impl="reference", max_seq_len=64)
+    source = Pretrained.load(directory, dtype="float32", attention_impl="reference", max_seq_len=64)
     task = source.text_generation(sampling=Sampling(temperature=0))
     image = np.load(directory / "raw_images.npy")[0]
     prompt = "token7 <start_of_image> token9"
     inputs = source.processor(prompt, images=[image])
     spec = Quantization(weight_only=True, patterns=(".*_proj",))
     served = task.quantized(spec, example=inputs)
-    model, variables = quantize_for_serving(task.model, task.variables, spec, inputs.tokens, **inputs.kwargs())
+    model, variables = quantize_for_serving(
+        task.model, task.variables, spec, inputs.tokens, **inputs.kwargs()
+    )
     np.testing.assert_array_equal(served.model.apply(served.variables, inputs.tokens, **inputs.kwargs()),
                                   model.apply(variables, inputs.tokens, **inputs.kwargs()))
     generated = served(prompt, 3, key=0, images=[image])
@@ -636,7 +671,9 @@ def test_a_served_bf16_module_computes_in_bf16(weight_only):
     dense = nn.Dense(16, dtype=jnp.bfloat16)
     x = jax.random.normal(jax.random.key(0), (4, 32), jnp.bfloat16)
     variables = dense.init(jax.random.key(1), x)
-    served, served_variables = quantize_for_serving(dense, variables, Quantization(weight_only=weight_only), x)
+    served, served_variables = quantize_for_serving(
+        dense, variables, Quantization(weight_only=weight_only), x
+    )
     assert served.apply(served_variables, x).dtype == jnp.bfloat16
 
 
@@ -739,7 +776,9 @@ def test_quantized_training_differentiates_through_complex_matmuls_in_float():
     want = value_and_gradients(reference)
     jax.tree.map(np.testing.assert_array_equal, got, want)
     _, (kernel_gradient, _) = value_and_gradients(model)
-    error = jnp.linalg.norm(got[1][0]["params"]["proj"]["kernel"] - kernel_gradient["params"]["proj"]["kernel"])
+    error = jnp.linalg.norm(
+        got[1][0]["params"]["proj"]["kernel"] - kernel_gradient["params"]["proj"]["kernel"]
+    )
     assert 0.0 < float(error / jnp.linalg.norm(kernel_gradient["params"]["proj"]["kernel"])) < 0.05
 
 
@@ -798,7 +837,7 @@ def test_a_quantized_pipeline_has_finite_loss_and_gradients():
                 jax.value_and_grad(loss, has_aux=True))(placed["params"])
         return float(value), jax.tree.map(np.asarray, grads)
 
-    loss, grads = run(MeshSpec(fsdp=8))
+    loss, _grads = run(MeshSpec(fsdp=8))
     piped, piped_grads = run(MeshSpec(fsdp=4, stage=2, microbatches=2))
     assert np.isfinite(loss) and np.isfinite(piped)
     assert all(np.isfinite(leaf).all() for leaf in jax.tree.leaves(piped_grads))
@@ -909,6 +948,9 @@ def test_an_objective_that_trains_no_single_model_is_refused(tmp_path):
 
     config = diffusion_run(tmp_path, quantization=Quantization())
     with pytest.raises(ValueError, match="Modelless keeps no `model`"):
-        config.train(Modelless(), Dataset(lambda partition: image_batches(RUN_BATCH)(), None, None, RUN_BATCH),
-                     name="quantized")
+        config.train(
+            Modelless(),
+            Dataset(lambda partition: image_batches(RUN_BATCH)(), None, None, RUN_BATCH),
+            name="quantized",
+        )
     assert not (tmp_path / "quantized").exists()

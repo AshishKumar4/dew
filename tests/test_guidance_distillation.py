@@ -32,8 +32,18 @@ from dew.sampling import Euler, TextToImage
 from dew.training import Trainer
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
-FLUX = {"in_channels": 12, "out_channels": 12, "num_layers": 1, "num_single_layers": 1, "heads": 2, "head_dim": 12,
-        "joint_attention_dim": 16, "pooled_projection_dim": 10, "guidance_embeds": True, "axes_dims_rope": [4, 4, 4]}
+FLUX = {
+    "in_channels": 12,
+    "out_channels": 12,
+    "num_layers": 1,
+    "num_single_layers": 1,
+    "heads": 2,
+    "head_dim": 12,
+    "joint_attention_dim": 16,
+    "pooled_projection_dim": 10,
+    "guidance_embeds": True,
+    "axes_dims_rope": [4, 4, 4],
+}
 
 
 @pytest.fixture(scope="module")
@@ -57,8 +67,9 @@ def runs(tmp_path_factory):
     checkpoints.save(1, state, None)
     checkpoints.wait()
     teacher.save(str(root / "teacher"))
-    student = dataclasses.replace(teacher, guidance_distill=GuidanceDistillation(teacher=str(root / "teacher"),
-                                                                                 scales=(1.0, 6.0)))
+    student = dataclasses.replace(
+        teacher, guidance_distill=GuidanceDistillation(teacher=str(root / "teacher"), scales=(1.0, 6.0))
+    )
     return root, student, batch
 
 
@@ -85,12 +96,12 @@ def test_the_loss_is_the_papers_equation(runs):
     x = alpha * samples + sigma * noise
     teacher = task.teacher
     given, blank = teacher._conditions(params[TEACHER], batch, drop_key, dropout=False)
-    variables = teacher.trainable(params[TEACHER])
+    variables = teacher.model_variables(params[TEACHER])
     conditional = teacher.model.apply(variables, x, schedule.model_time(t), **given)
     unconditional = teacher.process.denoiser(teacher.model, variables, given, blank).raw_both(x, t)[1]
     target = unconditional + scale.reshape(-1, 1, 1, 1) * (conditional - unconditional)
     student_given, _ = task._conditions(params, batch, drop_key, dropout=False)
-    output = task.model.apply(task.trainable(params), x, schedule.model_time(t),
+    output = task.model.apply(task.model_variables(params), x, schedule.model_time(t),
                               **with_guidance(student_given, scale))
     expected = jnp.mean(0.5 * jnp.square(output - target))
     assert float(loss.total / loss.mass) == pytest.approx(float(expected), rel=1e-5)

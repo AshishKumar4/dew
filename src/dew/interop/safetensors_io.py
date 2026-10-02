@@ -345,8 +345,8 @@ def save_sharded(
     `LazyTensors` table builds each shard's tensors as that shard is written
     and the host holds one shard of them at a time. A dense decoder export
     and a source-layout `Pretrained.export` are such tables. A quantized
-    source's requantization, `save_pretrained_decoder` through the Gemma 4
-    and GLM-5-next exporters, and DiffusionGemma's export adapter build their
+    source's requantization, `PretrainedDecoder.from_model` through the
+    GLM-5-next exporter, and DiffusionGemma's export adapter build their
     whole table first, and this writer then holds what it is given.
 
     An export replaces the one `directory` held without a moment at which a
@@ -412,8 +412,7 @@ def save_hf_layout(params, config: Mapping[str, object], directory,
     os.makedirs(directory, exist_ok=True)
     if not isinstance(params, LazyTensors):
         # Leaves stay where they are; `save_sharded` brings one shard at a time to the host.
-        leaves, _ = jax.tree_util.tree_flatten_with_path(params)
-        params = {_leaf_name(path): leaf for path, leaf in leaves}
+        params = _flatten(params)
     save_sharded(params, directory, max_shard_size)
     with open(os.path.join(directory, CONFIG_FILE), "w") as handle:
         json.dump(config, handle, indent=2)

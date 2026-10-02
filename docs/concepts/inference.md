@@ -73,17 +73,19 @@ pipeline(source, *, mesh=None, layout=None, dtype=None, param_dtype=None,
 
 A run's `run.json` must name its objective. Saved diffusion, LM, DPO, GRPO, PPO, block-diffusion and masked-diffusion runs have generation tasks. Other kinds, such as JEPA runs, have none and raise. Loading a task also points XLA at the on-disk compilation cache, so a restarted process reuses what it compiled.
 
-Checkpoints in a published layout load through `dew.interop.load_pretrained`, including native latent-diffusion checkpoints described by `model_index.json`. An original-format single-file checkpoint loads with `load_pretrained(repo_or_dir, single_file="name.safetensors")`. Stable Diffusion 1.x, SDXL and FLUX.1 files are checked against diffusers' own `from_single_file`: the released SD 1.5 file and tiny SD 1.x, SDXL and Flux files convert to the same tensors, and the released SDXL base, FLUX.1-dev and FLUX.1-schnell files convert to the names and shapes diffusers' models have. diffusers' key maps convert the file once into Dew's cache as the diffusers pipeline it describes. The configs are `repo_or_dir`'s own when it has a `model_index.json`, or else those of the diffusers repo diffusers infers from the file, pinned to the commit fetched. A component the file does not carry, such as a Flux file's text encoders and VAE, takes its weights from the same place; if there are none, the load names the component and stops. The cache entry is kept only after the pipeline loads, and a newer diffusers converts the file again. FLUX.1's config repos are gated on the Hub, so accept the license and log in, or load from a local directory that holds the configs. The conversion needs `pip install 'dewml[diffusers]'`; the loaded pipeline runs in JAX.
+Checkpoints in a published layout load through `dew.interop.Pretrained.load`, including native latent-diffusion checkpoints described by `model_index.json`. An original-format single-file checkpoint loads with `Pretrained.load(repo_or_dir, single_file="name.safetensors")`. Stable Diffusion 1.x, SDXL and FLUX.1 files are checked against diffusers' own `from_single_file`: the released SD 1.5 file and tiny SD 1.x, SDXL and Flux files convert to the same tensors, and the released SDXL base, FLUX.1-dev and FLUX.1-schnell files convert to the names and shapes diffusers' models have. diffusers' key maps convert the file once into Dew's cache as the diffusers pipeline it describes. The configs are `repo_or_dir`'s own when it has a `model_index.json`, or else those of the diffusers repo diffusers infers from the file, pinned to the commit fetched. A component the file does not carry, such as a Flux file's text encoders and VAE, takes its weights from the same place; if there are none, the load names the component and stops. The cache entry is kept only after the pipeline loads, and a newer diffusers converts the file again. FLUX.1's config repos are gated on the Hub, so accept the license and log in, or load from a local directory that holds the configs. The conversion needs `pip install 'dewml[diffusers]'`; the loaded pipeline runs in JAX.
 
 This exports the decoder from the example in the Hugging Face layout and loads it back:
 
 ```python
+import jax.numpy as jnp
+
 import dew
-from dew.interop import save_pretrained_decoder
+from dew.interop import PretrainedDecoder
 from dew.training import MeshSpec
 
-save_pretrained_decoder(model, state.params, "lily-decoder", tokenizer="byte")
-loaded = dew.pipeline("lily-decoder", mesh=MeshSpec(), dtype="float32")
+PretrainedDecoder.from_model(model, state.params, tokenizer="byte").save("lily-decoder")
+loaded = dew.pipeline("lily-decoder", mesh=MeshSpec(), dtype=jnp.float32)
 loaded = dataclasses.replace(loaded, processor=RunProcessor(tokenizer),
                              sampling=Sampling(temperature=0.0))
 print(loaded("One day", 20, key=0).text)
@@ -93,7 +95,7 @@ print(loaded("One day", 20, key=0).text)
 (', Lily saw a big dog',)
 ```
 
-The byte vocabulary has no Hugging Face tokenizer files, so the loaded task has no processor, and the example attaches one. A checkpoint that ships a tokenizer loads with its processor, and its `generation_config.json` sets the sampling policy and budget. A Hub name such as `"Qwen/Qwen3-0.6B"` loads the same way and needs enough host and device memory for its weights and cache. `Pretrained.text_generation`, `block_generation` and `text_to_image` build the same task types from a bundle already loaded with `load_pretrained`.
+The byte vocabulary has no Hugging Face tokenizer files, so the loaded task has no processor, and the example attaches one. A checkpoint that ships a tokenizer loads with its processor, and its `generation_config.json` sets the sampling policy and budget. A Hub name such as `"Qwen/Qwen3-0.6B"` loads the same way and needs enough host and device memory for its weights and cache. `PretrainedDecoder.text_generation`, `PretrainedBlockDecoder.block_generation` and `PretrainedPipeline.text_to_image` build the same task types from a bundle already loaded with `Pretrained.load`.
 
 A run assembled by hand needs its configuration saved next to the checkpoints before `dew.pipeline(directory)` can rebuild the task. A recipe's `RunConfig.train` writes `run.json` there; otherwise save the matching configuration with `config.save(directory)`. The checkpoint arrays alone do not describe the model. The LM recipe records the resolved model, tokenizer, sampling value and `sample_tokens` budget, and reloading the run restores them.
 
@@ -106,9 +108,12 @@ For the plain LM, image-diffusion and block-diffusion objectives, `ema=True` ask
 `TextGeneration.quantized(Quantization(...))` returns a task with matched language-model weights stored as int8 or fp8 values with their scales. It uses the same Qwix serving path and `dewml[quantization]` extra as image tasks, and keeps the processor, sampling policy and token budget. Weight quantization is separate from `KVCache.quantized`, which changes cache storage. Both can be used by `Server.from_task`.
 
 ```python
+import jax.numpy as jnp
+
+import dew
 from dew.training.quantization import Quantization
 
-task = dew.pipeline("Qwen/Qwen3-0.6B", dtype="bfloat16")
+task = dew.pipeline("Qwen/Qwen3-0.6B", dtype=jnp.bfloat16)
 served = task.quantized(Quantization(dtype="int8", weight_only=True))
 print(served("The capital of France is", max_new_tokens=20, key=0).text[0])
 ```
@@ -120,10 +125,12 @@ Resident JAX weights retain their placement through Qwix. Unplaced NumPy weights
 `TextToImage.quantized(Quantization(...))` returns the task with its denoiser's kernels stored as int8 or fp8 values and their scales, through Qwix's post-training quantization (`pip install "dewml[quantization]"`). The encoders and the autoencoder keep their weights. `Quantization(dtype="int8")` quantizes weights and activations, so each matmul runs in int8; `weight_only=True` keeps activations in the compute dtype, which saves the weight memory without the speed. `patterns` chooses the modules by path. On the RTX 4080 the 176M text-to-image model then holds 183 MiB of denoiser weights in place of 670 MiB, and in bf16 with int8 weights and activations its denoiser forward takes 21% less time, with its CLIP score within 0.002 of fp32 ([measurements](../performance.md#quantized-serving-of-the-176m-text-to-image-model-2026-09-28)). The time it saves depends on the device: on an A100 the quantized forward is slower than the unquantized one, and on a TPU v6e int8 halves the fp32 forward's time and not the bf16 one's. On a GPU, Dew refuses to quantize the activations of a grouped convolution, which XLA:GPU computes wrongly or cannot compile, so there the model's depthwise convolutions stay out:
 
 ```python
+import jax.numpy as jnp
+
 from dew.sampling import TextToImage
 from dew.training.quantization import Quantization
 
-pipe = TextToImage.from_pretrained("dewml/hybrid-dit-176m", dtype="bfloat16")
+pipe = TextToImage.from_pretrained("dewml/hybrid-dit-176m", dtype=jnp.bfloat16)
 served = pipe.quantized(Quantization(dtype="int8", patterns=("^(?!.*spatial_fusion).*",)))
 images = served(["a red fox in a snowy forest"], steps=20, key=0).host().images
 ```
@@ -138,26 +145,21 @@ Results hold global arrays sharded by row, including any filler rows added so th
 
 ### SSD-backed decoder banks
 
-`SafetensorsBanks` and `stream_banked` run a decoder whose layer weights do not fit in device memory or host RAM. The source reads a local Hugging Face safetensors checkpoint through read-only memory maps and the ordinary decoder translator. The existing banked inference loop fetches a layer at execution, with one host read-ahead slot for the following layer. No full decoder stack is loaded or captured as a compiled constant.
+`SafetensorsBanks` and its `stream` run a decoder whose layer weights do not fit in device memory or host RAM. The source reads a local Hugging Face safetensors checkpoint through read-only memory maps and the ordinary decoder translator. The existing banked inference loop fetches a layer at execution, with one host read-ahead slot for the following layer. No full decoder stack is loaded or captured as a compiled constant.
 
 ```python
 import jax
 
-from dew.inference import SafetensorsBanks, stream_banked
-from dew.interop.hf_decoders import translate_config
-from dew.registry import models, with_precision
+from dew.config import ModelConfig
+from dew.inference import SafetensorsBanks
+from dew.interop import translate_config
 from dew.sampling.text import Sampling, generate
 
 with SafetensorsBanks("path/to/gpt-oss-20b-BF16",
                        cache_bytes=0, param_dtype="auto") as source:
-    record = translate_config(source.config)
-    record["max_seq_len"] = 128
-    model = models.build("causal_transformer", {
-        **with_precision("causal_transformer", record,
-                         dtype="bfloat16", attention_impl="xla"),
-        "scan_layers": True,
-    })
-    variables = stream_banked(model, source)
+    record = {**translate_config(source.config), "max_seq_len": 128, "scan_layers": True}
+    model = ModelConfig("causal_transformer", record, dtype="bfloat16", attention_impl="xla").build()
+    variables = source.stream(model)
     generated = jax.block_until_ready(generate(
         model, variables, [[1, 2, 3, 4]], max_new_tokens=8,
         key=0, sampling=Sampling(temperature=0.0)))
@@ -167,7 +169,7 @@ Use a downloaded checkpoint snapshot's local directory for the path. This path a
 
 `cache_bytes` bounds retained host layers, not the entire process. Complete layers are admitted in read order while they fit and kept until the source closes. A sequential decoder revisits every layer each token, so retaining this prefix avoids the cyclic eviction of a smaller LRU cache. Staging needs up to two host rows plus one leaf's conversion scratch beside that cache. Embeddings, the head, the KV cache and the runtime are separate. Read mapped pages are released; the kernel's shared filesystem cache is not controlled by this budget. Device storage must fit resident entries, two layer rows, activations and the KV cache. Expert tensors stream as part of a whole layer, not just the experts selected for one token. `read_ahead=False` disables the host read-ahead slot.
 
-For `host_banked` and any other pinned-host placement, budget for the allocator's reserve as well as live weights, staging and the runtime. XLA's pinned-host BFC allocator grows its regions in powers of two and retains freed chunks. The GPT-OSS-20B BF16 two-layer prefix on the RTX 4080 (`host_banked`, an eight-token context limit and `SafetensorsBanks(cache_bytes=0)`) held about 1.55 GB of reserve above 3.29 GB of live pinned weights. The sharded array Dew assembles from the per-device buffer shares that buffer, so the reserve is allocator capacity, not a second copy of the weights. A cgroup or container limit can therefore be reached before the computed weight total; the observed reserve is not a fixed overhead to assume for other models.
+For a source's `place` and any other pinned-host placement, budget for the allocator's reserve as well as live weights, staging and the runtime. XLA's pinned-host BFC allocator grows its regions in powers of two and retains freed chunks. The GPT-OSS-20B BF16 two-layer prefix on the RTX 4080 (`place`, an eight-token context limit and `SafetensorsBanks(cache_bytes=0)`) held about 1.55 GB of reserve above 3.29 GB of live pinned weights. The sharded array Dew assembles from the per-device buffer shares that buffer, so the reserve is allocator capacity, not a second copy of the weights. A cgroup or container limit can therefore be reached before the computed weight total; the observed reserve is not a fixed overhead to assume for other models.
 
 Streaming is single-device inference only. It requires `scan_layers=True` and a layout without host placement; training, multi-device meshes and pipeline stages are refused. Host callbacks need the CPU backend beside the accelerator: when setting platforms explicitly, use `JAX_PLATFORMS=cuda,cpu` (or `<accelerator>,cpu`) before initializing JAX. Keep the source open until all executions have finished and do not change its files in place. The runtime-only `streaming` collection holds live callback handles, not checkpoint weights: this path saves nothing through `Checkpoints`, and its variables tree is not a resident checkpoint to save or export. The original safetensors directory remains the checkpoint.
 
@@ -344,4 +346,4 @@ Decode on a tensor axis is bound by the host on these cards. Each step runs 57 a
 
 ## Other runtimes
 
-To serve with vLLM or Ollama instead, export with `save_pretrained_decoder` or `Pretrained.save` and point the runtime at the directory. `OllamaCompletion` and `OpenAICompletion` (`dew.inference`) call those projects' official clients. Their results keep the backend's metadata and do not make up native raw-policy or behavior-policy likelihoods.
+To serve with vLLM or Ollama instead, export with `Pretrained.save` (a trained model through `PretrainedDecoder.from_model`) and point the runtime at the directory. `OllamaCompletion` and `OpenAICompletion` (`dew.inference`) call those projects' official clients. Their results keep the backend's metadata and do not make up native raw-policy or behavior-policy likelihoods.

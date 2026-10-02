@@ -23,7 +23,7 @@ import time
 import types
 import warnings
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, Generic, Literal, Protocol, TypeVar
+from typing import TYPE_CHECKING, Generic, Literal, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -104,7 +104,6 @@ from dew.training.transaction import Transaction, compact_qk, with_ema
 _log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from dew.config import TrainerConfig
     from dew.telemetry.profile import Profiler
 
 # Consecutive non-finite losses that stop a run.
@@ -123,14 +122,6 @@ microbatch was accepted."""
 
 Loss = DefaultTypeVar("Loss", default=Ratio | jax.Array | float)
 Effects = DefaultTypeVar("Effects", default=None)
-
-ObjectiveLoss = TypeVar("ObjectiveLoss")
-ObjectiveEffects = TypeVar("ObjectiveEffects")
-"""The two parameters of the objective `Trainer.from_config` is handed.
-
-A classmethod cannot solve the class's own `Loss` and `Effects` from an
-argument, since an unparameterized `Trainer.from_config` binds them to their
-defaults. So the factory carries its own pair and names the class it builds."""
 
 Shapes = tuple[tuple[int, ...], ...]
 """A batch's leaf shapes in tree order, the key a compiled step is held
@@ -243,17 +234,50 @@ def goodput(wall: float, first_step: float | None, other: float) -> dict[str, fl
     return numbers
 
 
-def step_compiler_options(objective) -> jax.stages.CompilerOptions | None:
-    """XLA options for this objective's training step on this device: Triton
-    GEMM fusions off where `TRITON_GEMM_OFF_GENERATIONS` measured a win and
-    no mixer of the model keeps them, unless the run set the flag itself."""
-    if (device_generation() not in TRITON_GEMM_OFF_GENERATIONS
-            or xla_flag('xla_gpu_enable_triton_gemm') is not None):
-        return None
+def step_compiler_options(objective, tokens: float, frozen: bool) -> jax.stages.CompilerOptions | None:
+    """XLA options for this objective's training step on this device, each
+    unless the run set its flag itself. `tokens` is what one device steps
+    (`_device_tokens`), and `frozen` says whether the step trains beside
+    frozen weights.
+
+    On a GPU, dots that share an input (q, k and v; gate and up) run apart:
+    XLA's dot merger would run them as one GEMM over their weights
+    concatenated afresh every step, 4.0 ms of Qwen3-0.6B's step at 1 x 1024.
+    A step beside frozen weights (a LoRA adapter's) on 128 tokens or fewer a
+    device keeps the merger, as decoding does, whose 32-token GEMMs ran 5-15%
+    faster merged. On an RTX 4080, bf16, ms a step (docs/performance.md has
+    every row):
+
+        step                       tokens    merged   apart
+        Qwen3-0.6B, LoRA r16       1 x 32     15.92   16.48
+        Qwen3-0.6B, LoRA r16       4 x 32     18.64   18.99
+        Qwen3-0.6B, LoRA r16       2 x 64     18.59   18.89
+        Qwen3-0.6B, LoRA r16      1 x 128     20.79   19.18
+        Qwen3-0.6B, LoRA r16       8 x 32     24.02   22.97
+        Qwen3-0.6B, LoRA r16     1 x 1024     60.61   59.19
+        Qwen3-0.6B widths, full    1 x 32     46.83   44.93
+        Qwen3-0.6B widths, full  1 x 1024     97.7    94.1
+        3-layer decoder, full      1 x 32      5.01    4.89
+
+    At 128 tokens the shapes disagree: 1 x 128 runs faster apart, 2 x 64
+    and 4 x 32 merged. The boundary includes 128, so no step runs slower
+    than XLA's default, and 1 x 128 gives up 1.6 ms to apart.
+
+    Only an LM objective names the tokens in a row, its `seq_len`, so
+    another objective's frozen step runs apart. And Triton GEMM fusions go
+    off where `TRITON_GEMM_OFF_GENERATIONS` measured a win and no mixer of
+    the model keeps them."""
+    generation = device_generation()
+    options: dict[str, bool | int] = {}
+    small = tokens <= 128
+    if (generation.startswith('sm') and xla_flag('xla_gpu_dot_merger_threshold_mb') is None
+            and not (frozen and small)):
+        options['xla_gpu_dot_merger_threshold_mb'] = 0
     model = _model_of(objective)
-    if model is None or _keeps_triton_gemm(model):
-        return None
-    return {'xla_gpu_enable_triton_gemm': False}
+    if (generation in TRITON_GEMM_OFF_GENERATIONS and xla_flag('xla_gpu_enable_triton_gemm') is None
+            and model is not None and not _keeps_triton_gemm(model)):
+        options['xla_gpu_enable_triton_gemm'] = False
+    return options or None
 
 
 def fitting_default(program: jax.stages.Lowered, executable: jax.stages.Compiled,
@@ -261,12 +285,13 @@ def fitting_default(program: jax.stages.Lowered, executable: jax.stages.Compiled
     """Fall back to the step compiled under XLA's default options where it
     fits and the one compiled under `step_compiler_options` does not.
     Returns the step to run and whether it fits; `held` is `step_fits`'s.
-    The Triton GEMM fusions can hold fewer temporaries, so they come back
-    before the ladder's first rung."""
+    The Triton GEMM fusions can hold fewer temporaries, so XLA's defaults
+    come back before the ladder's first rung."""
     default = program.compile()
     if not step_fits(default, mesh, held):
         return executable, False
-    _log.warning("the step fits the devices only with XLA's Triton GEMM fusions; compiling it with them")
+    _log.warning("the step fits the devices only with XLA's default options (Triton GEMM fusions, "
+                 "merged dots); compiling it with them")
     return default, True
 
 
@@ -293,6 +318,16 @@ def _model_of(objective: Objective[Loss, Effects]) -> nn.Module | None:
     the trainer reads it at this boundary: LM, diffusion and masked
     objectives name theirs `model`."""
     return getattr(objective, 'model', None)
+
+
+def _device_tokens(objective: Objective[Loss, Effects], batch: Batch, shards: int) -> float:
+    """The tokens one device steps of `batch`, split over `shards` row shards,
+    or infinity. An `Objective` declares no tokens in a row, since images and
+    pairs have no context, so the trainer reads it at this boundary: LM
+    objectives name theirs `seq_len`. Rows are counted only then, so another
+    objective's batch, one that holds no rows among them, is never asked."""
+    per_row = getattr(objective, 'seq_len', None)
+    return math.inf if per_row is None else rows_of(batch) // shards * per_row
 
 
 def _rollout_metrics(rollout: Rollout) -> Mapping[str, float]:
@@ -779,51 +814,6 @@ class Trainer(Generic[Loss, Effects]):
         self._xla_defaults = False
         self._resumed_rung: JSON = None
 
-    @classmethod
-    def from_config(
-        cls, config: TrainerConfig, objective: Objective[ObjectiveLoss, ObjectiveEffects],
-        optimizer: optax.GradientTransformation, *, key: int | jax.Array,
-        checkpoints: Checkpoints | None = None, tracker: Tracker | None = None,
-        step: Callable[[Objective[ObjectiveLoss, ObjectiveEffects],
-                        optax.GradientTransformation], StepFn] | None = None,
-        rollout: Rollout | None = None,
-    ) -> Trainer[ObjectiveLoss, ObjectiveEffects]:
-        """Build the trainer a `TrainerConfig` describes.
-
-        The mapping from the config's field names to this constructor's is
-        written once, here. `mesh`, `layout`, `accumulation`,
-        `dynamic_scale` and `profile` are the config fields a trainer holds.
-        `key` is the run key, which `RunConfig.train` draws from
-        `config.key`.
-
-        The rest of the config belongs to the capabilities and to the loop,
-        and reaches them from their own owners. `checkpoint_dir` and `keep`
-        build the `Checkpoints` passed in here, and `wandb` the tracker.
-        `xla_flags`, `multi_host` and `compilation_cache_dir` are read by
-        `prepare_process` before JAX opens a backend. `batch_ramp` wraps the
-        dataset with `dew.data.ramped`. `steps`, `epochs`, `log_every`,
-        `eval_every` and `checkpoint_every` are arguments of `fit`. `step`
-        and `rollout` are not configurable: they are code a caller hands
-        over.
-
-        It builds a `Trainer`, whatever it is called on. The objective's two
-        parameters are the factory's own, so a subclass that wants one of
-        itself constructs it.
-        """
-        return Trainer(
-            objective, optimizer,
-            key=key,
-            mesh=config.mesh,
-            layout=config.layout,
-            accumulation=config.accumulation,
-            dynamic_scale=config.dynamic_scale,
-            checkpoints=checkpoints,
-            tracker=tracker,
-            step=step,
-            rollout=rollout,
-            profile=config.profile,
-        )
-
     # ------------------------------------------------------------------
     # The state
     # ------------------------------------------------------------------
@@ -1273,7 +1263,10 @@ class Trainer(Generic[Loss, Effects]):
                                                 replicated),
                                  donate_argnums=0)
                 self.program = jitted.lower(prepared, batch)
-                options = None if self._xla_defaults else step_compiler_options(self.objective)
+                shards = math.prod(mesh.shape[axis] for axis in BATCH_AXES)
+                options = None if self._xla_defaults else step_compiler_options(
+                    self.objective, _device_tokens(self.objective, batch, shards),
+                    FROZEN in prepared.params)
                 self.executable = self.program.compile(options)
                 fits = step_fits(self.executable, mesh, held)
                 if not fits and options is not None:

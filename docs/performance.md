@@ -29,28 +29,29 @@ rows from `tools/reference_runs/dew_lm.py` and `tools/benchmark_step.py`;
 `tools/reference_runs/scoreboard.py` builds the reference-run rows into one
 table.
 
-RTX 4080 16 GiB, Dew at `42292e99` (jax 0.11.2.post3), torch 2.13.0+cu130,
+RTX 4080 16 GiB, Dew at `4d392f0a` (jax 0.11.2.post3), torch 2.13.0+cu130,
 transformers 5.17.0, SDPA attention. Each Dew row is two processes, given
 as their range; each torch row is one process, or two where a range is
-given:
+given. Dew as installed, cuDNN attention; with tokamax installed
+(docs/installation.md) where the row says so:
 
 | model | step | Dew | best torch.compile | Dew / torch |
 |---|---|---:|---:|---:|
-| Qwen3-0.6B, pretrained | 1 x 1024 tokens, AdamW | 100.4-101.9 ms, MFU 44.1-44.8% | 112.1-112.4 ms, 40.0% | 1.10-1.12 |
-| Qwen3-0.6B, pretrained | 2 x 1024 tokens, AdamW | 154.0-154.2 ms, MFU 58.3-58.4% | 168.6-169.1 ms, 53.3% | 1.09-1.10 |
-| 99M Qwen3-MoE shape, 8 experts, top 2 | 8 x 1024 tokens, AdamW | 79.2 ms | 112.5 ms | 1.42 |
-| decoder, GPT-2 small widths, 3 layers | 16 x 512, Adam, EMA | 52.2 ms | 49.4 ms (flash), 50.0 (cuDNN) | 0.95 |
-| SimpleDiT, width 384, 6 layers, 64 px | batch 16, Adam, EMA | 7.43-7.52 ms | 8.07 ms | 1.07-1.09 |
-| SimpleDiT, width 768, 12 layers, 64 px | batch 32, Adam, EMA | 76.4-76.5 ms, MFU 59.2-59.3% | 76.4 ms (flash) | 1.00 |
-| 176M hybrid DiT (published config) | batch 16, Adam, EMA | 69.7-72.7 ms, MFU 35.9-37.4% | no torch port | |
-| 176M hybrid DiT (published config) | batch 32 | 116.6-122.3 ms, MFU 42.6-44.8% | no torch port | |
+| Qwen3-0.6B, pretrained | 1 x 1024 tokens, AdamW | 96.2 ms, MFU 46.7-46.8% | 112.1-112.4 ms, 40.0% | 1.17 |
+| Qwen3-0.6B, pretrained | 2 x 1024 tokens, AdamW | 148.1 ms, MFU 60.7% | 168.6-169.1 ms, 53.3% | 1.14 |
+| 99M Qwen3-MoE shape, 8 experts, top 2 | 8 x 1024 tokens, AdamW | 78.1 ms | 112.5 ms | 1.44 |
+| decoder, GPT-2 small widths, 3 layers | 16 x 512, Adam, EMA | 49.1 ms; tokamax 48.4-48.5 | 49.4 ms (flash), 50.0 (cuDNN) | 1.01; 1.02 |
+| SimpleDiT, width 384, 6 layers, 64 px | batch 16, Adam, EMA | 7.41-7.46 ms | 8.07 ms | 1.08-1.09 |
+| SimpleDiT, width 768, 12 layers, 64 px | batch 32, Adam, EMA | 72.6-72.7 ms, MFU 62.3-62.4%; tokamax 71.1 | 76.4 ms (flash) | 1.05; 1.07 |
+| 176M hybrid DiT (published config) | batch 16, Adam, EMA | 66.5-66.6 ms, MFU 39.2%; tokamax 66.3-66.4 | no torch port | |
+| 176M hybrid DiT (published config) | batch 32 | 110.2-110.3 ms, MFU 47.3%; tokamax 109.6 | no torch port | |
 
 The Dew decoder and SimpleDiT rows take a fresh host batch every step, and
 match the fixed-batch rows ("Comparison with PyTorch" below has both ways
-for both frameworks, and the commands). On Qwen3-0.6B at 1 x 1024 torch
-waits 25.1 ms a step on its host, which its 2 x 1024 step hides; on the
-MoE it waits 20.9 ms, and on device time alone Dew is 1.24x faster (79.0
-against 98.3 ms busy).
+for both frameworks, and the commands). Qwen3-0.6B at 1 x 1024 keeps both
+devices busy (torch 110.3 ms of its 112.1 ms step in the second process,
+Dew 96.0 of 96.2); on the MoE torch idles 20.9 ms a step on its host, and
+on device time alone Dew is 1.26x faster (78.1 against 98.3 ms busy).
 
 Since `42ddfc14`: the hybrid DiT's dilated depthwise convolutions run as
 undilated ones over their interleaved grids (75.4 to 70.2 ms at batch 16);
@@ -62,7 +63,23 @@ without the hole that made Qwen3-0.6B at 2 x 1024 recompute (185.7 to
 their gradient to bf16 once, as torch autocast and MaxText do ("The
 vocabulary head" below has the quality comparison): the 3-layer decoder
 59.9 to 52.2 ms, the MoE 92.7 to 79.2, Qwen3-0.6B at 2 x 1024 161.2 to
-154.0.
+154.0. From `42292e99` to `4d392f0a` (92 merges from every lane) Qwen3-0.6B
+at 1 x 1024 went from 100.4-101.9 to 96.2 ms, at 2 x 1024 from 154.0 to
+148.1, the decoder from 52.2 to 49.1 and the hybrid DiT at batch 32 from
+116.6-122.3 to 110.2-110.3. Two of those changes are the training step's:
+every bf16 rounding of a program is kept
+(`--xla_allow_excess_precision=false`), and the step compiles without XLA's
+dot merger, which took Qwen3-0.6B at 1 x 1024 from 97.7-98.0 to 94.1-94.2
+ms in its own A/B ("XLA flags" below has both).
+
+Where the time goes, Qwen3-0.6B at 1 x 1024 (device kernels per step, XProf
+for Dew, the torch profiler for torch): GEMMs 42.2 ms against 42.3, and
+attention 8.7 against 7.2. The rest, the update, the casts, the norms and
+the loss, is 45.0 ms in Dew (copies 28.0, with the fused update; converts
+10.7; reductions 5.7; elementwise 0.6) against torch's 60.8 (optimizer
+39.5, copies 13.8, elementwise 6.0, loss 1.0, reductions 0.5). Both cast
+the fp32 master weights to bf16 every step and the gradients back; torch's
+casts are its `_to_copy` kernels.
 
 Where Dew wins: the optimizer update. XLA fuses Adam (or AdamW), the EMA
 and the finiteness guard into one bandwidth-bound pass over the state,
@@ -73,21 +90,17 @@ clipping at 39.5. GEMMs run at par or better (44.5 against 47.2 ms on the
 rows, where torch.compile's reaches 25 ms; it is 13.0 ms on Qwen3-0.6B at
 2 x 1024, hidden behind the device.
 
-Where Dew loses:
-
-- Attention: cuDNN's fused kernels take 5.6 ms forward and backward on the
-  768-wide SimpleDiT (head dimension 64, 256 tokens) against
-  FlashAttention-2's 4.4 in torch, and 8.7 against 7.2 on Qwen3-0.6B (head
-  dimension 128, causal, 1024 tokens). With tokamax installed
-  (docs/installation.md), 'auto' runs its Pallas-Triton kernel for heads up to
-  64 wide: 4.3 ms on the SimpleDiT, and its step 73.1 to 71.5 ms ("tokamax's
-  attention" below).
-- Converts and reductions: 11.0 and 5.6 ms of Qwen3-0.6B's step at 1 x
-  1024, 15.9 and 9.8 of the MoE's, where torch.compile casts inside its
-  GEMMs and elementwise kernels. Not yet attributed by scope.
-- The 3-layer decoder, whose vocabulary head (50304 columns, 8192 tokens)
-  is most of the step: 2.8 ms behind, after the head's rounding took 7.7
-  ms off.
+Where Dew loses: attention. cuDNN's fused kernels take 5.6 ms forward and
+backward on the 768-wide SimpleDiT (head dimension 64, 256 tokens) against
+FlashAttention-2's 4.4 in torch, and 8.7 against 7.2 on Qwen3-0.6B (head
+dimension 128, causal, 1024 tokens). With tokamax installed, 'auto' runs
+its Pallas-Triton kernel for heads up to 64 wide: 4.3 ms on the SimpleDiT
+("tokamax's attention" below); at 128 wide cuDNN stays faster (Qwen3-0.6B's
+widths at 2 x 1024, 148.8-149.0 against 151.1 ms a step). Kernel by kernel
+on Qwen3-0.6B at 1 x 1024, the gap is cuDNN's 2.56 ms forward and 5.25
+backward (with its grouped-query head reduction) against FlashAttention-2's
+2.05 and 4.56 kernels; no alternative on this stack closes it ("At 128-wide heads"
+below).
 
 A100 40 GB (Colab), the latest records:
 
@@ -375,7 +388,8 @@ rounds of 10 calls, each checked against fp32 XLA at HIGHEST
 | 4 x 1024 causal, 16 over 8, of 128 (Qwen3-0.6B) | 1.541 | 1.288 | 1.242 | 1.260 |
 | 4 x 1024 causal, window of 256 | 0.579 | 0.587 | 0.535 | no window |
 
-tokamax's errors are cuDNN's at every shape (dq and dk 4.8e-3 to 6.6e-3);
+tokamax's errors are cuDNN's at the 64-wide shapes (dq and dk 4.8e-3 to
+6.6e-3), and not at 128 (below);
 JAX's `mha` reaches 8.5e-3 because its backward forms `rowsum(o * do)` as a
 bf16 product, and an fp32 one gives cuDNN's errors at the same speed. In the
 training step the gain holds at 64-wide heads and not at 128: SimpleDiT-B
@@ -384,6 +398,28 @@ at batch 32, attention 5.62 to 4.33 ms and the step 73.1 to 71.5; the
 1 x 1024, 9.13 to 9.24 ms and 97.6 to 98.4. So with tokamax installed
 'auto' takes it for heads up to 64 wide and calls with no window, mask or
 bias (`dew.nn.attention.triton_runs`), at tokamax's heuristic config.
+
+At 128-wide heads, 2026-10-02 (Qwen3-0.6B's: 16 query heads over 8, causal,
+1024 tokens; RTX 4080, bf16; Dew at `14087252`), nothing on this stack beats
+cuDNN with gradients as accurate:
+
+- In the training step at 1 x 1024 (XProf, command buffers on, kernels per
+  step), tokamax's forward is faster and its backward slower: 2.16 ms
+  forward against cuDNN's 2.56, and 7.14 backward plus 0.27 for
+  `rowsum(o * do)` against cuDNN's 5.07 plus 0.18 for its head reduction;
+  the step 95.96 against 94.07 ms. torch's FlashAttention-2 kernels take 2.05 and
+  4.56.
+- tokamax's gradients are less accurate there: dk and dv reach 5.2e-3 and
+  4.6e-3 of their maximum at batch 1 against cuDNN's 4.9e-3 and 2.8e-3, and
+  6.7e-3 and 4.8e-3 at batch 2 against 4.7e-3 and 3.5e-3. Its best grid
+  config (blocks of 32, keeping openxla/tokamax#1494's constraint) has the
+  same errors.
+- cuDNN with BNTH inputs runs as BTNH does (0.385 against 0.381 ms a call
+  at batch 1, 0.721 against 0.716 at batch 2), and cuDNN 9.27.0 as 9.25.1
+  (Qwen3-0.6B's widths at 1 x 1024 94.20 and 94.08 against 94.23 and 94.19
+  ms, attention 9.09 against 9.11; SimpleDiT-B and the decoder alike).
+  `uv pip install` resolves the newest cuDNN under 10, so a fresh install
+  gets 9.27.
 
 tokamax trails JAX's `mha` by 10-18% at 64-wide heads in its backward
 (0.35 against 0.29 ms of the SimpleDiT-B call; the forwards are 0.093 and
@@ -979,6 +1015,55 @@ On an A100, the reference runs measured the fp32 head at 38 ms a step, 21% of a 
 The logits' rounding, 2026-10-01. The bf16 product above still kept fp32 logits, and carried their fp32 gradient into the state product as two bf16 products, a high half and the rest (`347238c7`), where torch autocast and MaxText round both to bf16. At the default `matmul_precision` Dew now rounds as they do: the logits to bf16 values and their gradient to bf16 once, read by both backward products. On the RTX 4080 (`tools/benchmark_step.py --fixed-batch`, one session against `66784383`) the 3-layer decoder (GPT-2 small widths, vocabulary 50304, 16 x 512 tokens) runs 52.17 ms against 59.95, with a planned peak of 4.53 GB against 5.36, where torch.compile runs it in 49.4-50.0; Qwen3-0.6B's widths at 1 x 1024 run 106.62 ms against 110.04. Training quality, 2000 steps of wikitext-103 Qwen3 tokens on the same card, with validation over 64 fixed windows scored with fp32 logits for both: the 3-layer decoder at vocabulary 151936 from scratch ends at 5.0604 and 5.0491 (fp32 logits, seeds 0 and 1) against 5.0604 and 5.0493, and Qwen3-0.6B fine-tuned ends at 2.71965 and 2.71996 against 2.71983 and 2.71981. At the same seed the two roundings are at most 4.5e-4 and 1.6e-3 apart at any checkpoint, where the two seeds of either rounding are 1.3e-2 and 2.9e-3 apart on average. The high half existed for layout parity: with the gradient rounded once, a 4 x RTX 3090 bf16 run read 1.75 times its bound at a dense model's final norm and 5758 times it at an MoE's expert gate_proj, against 0.47 and 0.41; why the MoE's gap is that large is not yet established. A run that compares layouts in bf16 sets `matmul_precision="highest"`, which keeps the head fp32; `tools/layout_parity.py` does so for bf16 decoders.
 
 On sm80 and sm89, the trainer compiles without XLA's Triton GEMM fusions unless the run explicitly sets that flag or the model has an SSD mixer (`TRITON_GEMM_OFF_GENERATIONS`). On an A100 (jax 0.11.2, bf16), through the trainer, Qwen3-0.6B at 4 x 512 tokens compiled in 27.1 s instead of 47.5 s, with no Triton GEMM autotuning, and stepped in 161.4 ms against 161.5; standalone, Qwen3-0.6B at 4 x 1024 tokens went from 162.1 to 153.1 ms, a 99M MoE from 74.6 to 69.4 ms and a DiT 5.8% faster, while a Mamba-2 step lost 7.7% (127.9 to 138.6 ms), since its SSD scan's small batched dots gain from the fusions. On the RTX 4080, at 2048, 4080 and 16384 tokens the two-layer steps run 56.7 to 53.5, 103.8 to 94.0 and 420.5 to 406.3 ms, and tiled heads 3-6% faster. At Qwen3-0.6B's widths with two layers, bf16, vocabulary 151936, and a 0.9 allocator fraction on an RTX 4080 (JAX 0.11.2), this removes a 4096-token cliff: 286.0 ms per training step with the fusions, 93.4 ms without. At other shapes, the unfused step can use more temporary memory. Before tiling the head or recomputing blocks, a step that does not fit is tried with XLA's default options; at 8192 tokens only that whole-logits step fits (178.7 ms, versus 211.2 ms after tiling). When tiling is needed, sm89 uses the measured 4096-by-8192 tile. These are two-layer measurements, not full-model times.
+
+On every GPU the trainer also compiles its step without XLA's dot merger (`--xla_gpu_dot_merger_threshold_mb=0` in the step's own compiler options, `step_compiler_options`), unless the run sets that flag or the step trains beside frozen weights on 128 tokens or fewer a device (below). The merger runs dots that share an input (q, k and v; gate and up) as one GEMM over their weights concatenated afresh every step, 4.0 ms of Qwen3-0.6B's step at 1 x 1024. On the RTX 4080 (benchmark_step, two rounds, one session) Qwen3-0.6B's widths at 1 x 1024 run 97.7-98.0 against 94.1-94.2 ms without it, the 3-layer decoder 50.8-50.9 against 49.1-49.2, SimpleDiT-B 73.1-73.2 against 72.8, and the 176M hybrid DiT 66.7-67.6 against 66.4-66.7, peaks unchanged. Over 2000 steps of wikitext-103, two seeds each, validation loss at the same seed moved by at most 1.5e-3 (a 3-layer decoder from scratch, seeds 1.2e-2 apart on average) and 2.2e-3 (Qwen3-0.6B fine-tuned, seeds 3.0e-3 apart). Serving keeps the merger: decoding Qwen3-0.6B at 32 slots ran 4.6-14.8% slower without it, its 32-token GEMMs losing more to separate launches than the concatenations cost.
+
+Small training steps, 2026-10-02 (RTX 4080, bf16, `Trainer.compile` with and without the option in one process, five alternating blocks of 20 steps, medians). A full step, every weight training, is faster apart from 32 tokens up, and a LoRA step (rank 16 on Qwen3-0.6B's seven projections, the base frozen) of 128 tokens or fewer is slower apart by up to 0.6 ms, 1 x 128 excepted (two sessions). The token count alone does not decide it, so the rule has two conditions: a step beside frozen weights (an objective's `trainable` split, as LoRA's) on 128 tokens or fewer a device keeps XLA's merger, and every other step runs apart. Only an LM objective names the tokens in its rows, so another objective's frozen step runs apart, unmeasured.
+
+| model | tokens | merged ms | apart ms | change |
+|---|---|---|---|---|
+| Qwen3-0.6B widths, full | 1 x 32 | 46.83 | 44.93 | -4.1% |
+| Qwen3-0.6B widths, full | 1 x 64 | 47.81 | 45.89 | -4.0% |
+| Qwen3-0.6B widths, full | 1 x 128 | 49.86 | 47.98 | -3.8% |
+| Qwen3-0.6B widths, full | 1 x 512 | 67.33 | 64.78 | -3.8% |
+| 3-layer decoder, full | 1 x 32 | 5.01 | 4.89 | -2.4% |
+| 3-layer decoder, full | 1 x 64 | 5.12 | 5.01 | -2.1% |
+| 3-layer decoder, full | 1 x 128 | 5.37 | 5.27 | -1.9% |
+| 3-layer decoder, full | 4 x 256 | 10.06 | 10.06 | +0.0% |
+| Qwen3-0.6B, LoRA | 1 x 32 | 15.92 | 16.48 | +3.5% |
+| Qwen3-0.6B, LoRA | 2 x 32 | 16.50 | 17.09 | +3.6% |
+| Qwen3-0.6B, LoRA | 1 x 48 | 16.34 | 16.82 | +2.9% |
+| Qwen3-0.6B, LoRA | 1 x 64 | 16.61 | 17.15 | +3.3% |
+| Qwen3-0.6B, LoRA | 2 x 64 | 18.59 | 18.89 | +1.6% |
+| Qwen3-0.6B, LoRA | 4 x 32 | 18.64 | 18.99 | +1.9% |
+| Qwen3-0.6B, LoRA | 1 x 128 | 20.79 | 19.18 | -7.7% |
+| Qwen3-0.6B, LoRA | 8 x 32 | 24.02 | 22.97 | -4.4% |
+| Qwen3-0.6B, LoRA | 1 x 256 | 24.56 | 23.41 | -4.7% |
+| Qwen3-0.6B, LoRA | 1 x 512 | 36.30 | 34.99 | -3.6% |
+| Qwen3-0.6B, LoRA | 1 x 1024 | 60.61 | 59.19 | -2.3% |
+
+With the rule, the same steps against XLA's default (the merger on), measured the same way in a second session at `perf/merger-frozen` (load average 15-27 from other work on the host): no row is slower. The LoRA steps of 128 tokens or fewer compile the same program both ways, so their spread, -0.3% to +0.3%, is the measurement's.
+
+| model | tokens | XLA's default ms | as shipped ms | change |
+|---|---|---|---|---|
+| Qwen3-0.6B, LoRA | 1 x 32 | 16.08 | 16.04 | -0.3% |
+| Qwen3-0.6B, LoRA | 2 x 32 | 16.66 | 16.62 | -0.2% |
+| Qwen3-0.6B, LoRA | 1 x 64 | 16.49 | 16.50 | +0.1% |
+| Qwen3-0.6B, LoRA | 2 x 64 | 18.57 | 18.63 | +0.3% |
+| Qwen3-0.6B, LoRA | 4 x 32 | 18.56 | 18.56 | +0.0% |
+| Qwen3-0.6B, LoRA | 1 x 128 | 20.81 | 20.82 | +0.1% |
+| Qwen3-0.6B, LoRA | 8 x 32 | 24.25 | 23.31 | -3.9% |
+| Qwen3-0.6B, LoRA | 1 x 256 | 24.62 | 23.45 | -4.7% |
+| Qwen3-0.6B, LoRA | 1 x 1024 | 60.62 | 59.38 | -2.0% |
+| Qwen3-0.6B widths, full | 1 x 32 | 46.88 | 44.94 | -4.1% |
+| Qwen3-0.6B widths, full | 1 x 128 | 49.83 | 47.97 | -3.7% |
+| Qwen3-0.6B widths, full | 1 x 512 | 67.38 | 64.80 | -3.8% |
+| 3-layer decoder, full | 1 x 32 | 5.04 | 4.91 | -2.6% |
+| 3-layer decoder, full | 1 x 64 | 5.14 | 5.02 | -2.3% |
+| 3-layer decoder, full | 1 x 128 | 5.33 | 5.23 | -1.8% |
+| 3-layer decoder, full | 4 x 256 | 10.02 | 10.00 | -0.3% |
+
+At 128 tokens the shapes disagree, in two more sessions of merged against apart: 1 x 128 runs 20.65 and 20.65 ms merged against 18.98 and 19.11 apart, where 2 x 64 runs 18.72 and 18.63 against 18.96 and 19.03, and 4 x 32 18.56 and 18.50 against 18.91 and 18.81 (1 x 96: 18.22 and 18.22 against 18.41 and 18.43; 1 x 160: 22.33 and 21.95 against 20.57 and 20.37). A boundary below 128 would run 2 x 64 and 4 x 32 1.3-2.1% slower than XLA's default, so it includes 128, and 1 x 128 runs at XLA's default, 1.6 ms behind apart.
 
 ### Generations below sm80
 

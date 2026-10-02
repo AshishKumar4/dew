@@ -1,6 +1,8 @@
 from functools import cache
 
-from dew.interop import load_pretrained
+import jax.numpy as jnp
+
+from dew.interop import PretrainedDecoder
 from dew.sampling import CFG, DPMSolverMultistep, EulerAncestral, Heun, Sampling, TextToImage
 
 
@@ -11,7 +13,7 @@ def from_pretrained(repo_id):
 
 @cache
 def text_model(name):
-    model = load_pretrained(f"/opt/models/{name}", dtype="float32", max_seq_len=256)
+    model = PretrainedDecoder.load(f"/opt/models/{name}", dtype=jnp.float32, max_seq_len=256)
     return model.text_generation(sampling=Sampling(temperature=0))
 
 

@@ -98,15 +98,20 @@ def test_rollouts_round_trip_through_verl_rows_losslessly():
     status, finish reasons, versions and the sampling support, across a
     rollout whose history broke the strict chain (two rows)."""
     routed = np.arange(4 * 2 * 2).reshape(4, 2, 2) % 5
-    calls = (Call((1, 2), (3, 4), (-0.5, -0.25), "tool_calls", 3, routed_experts=routed[:3],
-                  support=((3, 9), (4,))),
-             Call((1, 2, 3, 4, 7), (8,), (-1.0,), "length", 4, routed_experts=routed[:, :, :].repeat(2, 0)[:5]),
-             Call((5, 6), (2,), (-0.125,), "stop", 4))
+    calls = (
+        Call(
+            (1, 2), (3, 4), (-0.5, -0.25), "tool_calls", 3, routed_experts=routed[:3], support=((3, 9), (4,))
+        ),
+        Call((1, 2, 3, 4, 7), (8,), (-1.0,), "length", 4, routed_experts=routed[:, :, :].repeat(2, 0)[:5]),
+        Call((5, 6), (2,), (-0.125,), "stop", 4),
+    )
     rollout = Session("task", "g", 1, 2, calls, Status.COMPLETED, 0.5, {"tests": 0.5}, "log://1")
     failed = Session("task", "g", 2, 0, (Call((1,), (2,), (-3.0,), "abort", 4),), Status.INFRA_ERROR, None)
     rows = json.loads(json.dumps(to_verl([rollout, failed])))
     assert len(rows) == 3
-    assert rows[0]["extra_fields"]["min_global_steps"] == 3 and rows[0]["extra_fields"]["max_global_steps"] == 4
+    assert (
+        rows[0]["extra_fields"]["min_global_steps"] == 3 and rows[0]["extra_fields"]["max_global_steps"] == 4
+    )
     restored = [trajectory.session for trajectory in from_verl(rows)]
     assert restored == [rollout, failed]
     for key, value in pack([rollout], 16, support_capacity=4).items():
@@ -124,8 +129,19 @@ def test_import_refuses_rows_that_lost_what_training_needs(corruption):
     elif corruption == "reward":
         rows[0]["reward_score"] = None
     elif corruption == "chain":
-        rows = to_verl([Session("t", "g", 0, 0, (Call((1,), (2,), (-1.0,), "stop", 0),
-                                                 Call((5,), (6,), (-1.0,), "stop", 0)), Status.COMPLETED, 1.0)])
+        rows = to_verl(
+            [
+                Session(
+                    "t",
+                    "g",
+                    0,
+                    0,
+                    (Call((1,), (2,), (-1.0,), "stop", 0), Call((5,), (6,), (-1.0,), "stop", 0)),
+                    Status.COMPLETED,
+                    1.0,
+                )
+            ]
+        )
         rows.pop(0)
     else:
         rows[0]["teacher_ids"] = []
@@ -138,7 +154,12 @@ def test_import_refuses_rows_that_lost_what_training_needs(corruption):
 def test_native_rows_group_as_verl_interleaves_its_samples():
     rows = native_rows() * 2
     rollouts = [trajectory.session for trajectory in from_verl(rows, samples=2, media=True)]
-    assert [(rollout.task, rollout.sample) for rollout in rollouts] == [("0", 0), ("0", 1), ("1", 0), ("1", 1)]
+    assert [(rollout.task, rollout.sample) for rollout in rollouts] == [
+        ("0", 0),
+        ("0", 1),
+        ("1", 0),
+        ("1", 1),
+    ]
 
 
 def test_the_verl_rl_parquet_reads_its_nested_ground_truth():
@@ -172,8 +193,13 @@ def test_a_native_rows_step_stamps_survive_two_round_trips():
     once = json.loads(json.dumps(to_verl(from_verl([row]))))
     twice = json.loads(json.dumps(to_verl(from_verl(once))))
     for exported in (once, twice):
-        assert (exported[0]["extra_fields"]["min_global_steps"], exported[0]["extra_fields"]["max_global_steps"]) == (7, 9)
-    written = to_verl([Session("t", "g", 0, 0, (Call((1,), (2,), (-1.0,), "stop", 4),), Status.COMPLETED, 1.0)])
+        assert (
+            exported[0]["extra_fields"]["min_global_steps"],
+            exported[0]["extra_fields"]["max_global_steps"],
+        ) == (7, 9)
+    written = to_verl(
+        [Session("t", "g", 0, 0, (Call((1,), (2,), (-1.0,), "stop", 4),), Status.COMPLETED, 1.0)]
+    )
     assert "extra_fields" not in from_verl(json.loads(json.dumps(written)))[0].extras
 
 
