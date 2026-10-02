@@ -37,7 +37,6 @@ from dew.interop import load_pretrained
 from dew.interop.pretrained import Pretrained
 from dew.objectives.base import Variables
 
-
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
 RATE = 5e-2
 SEED = 3
@@ -591,7 +590,7 @@ def v4_training_gradient_parity(trip: RoundTrip) -> dict[str, float]:
     import torch
     from transformers.core_model_loading import revert_weight_conversion
 
-    from dew.objectives.base import Step, scalar_loss
+    from dew.objectives.base import Step
     from tools.deepseek_v4_reference import deepseek_v4_source_name, load_mtp_reference
 
     source, case = trip.source, trip.case
@@ -604,7 +603,7 @@ def v4_training_gradient_parity(trip: RoundTrip) -> dict[str, float]:
     batch = {'text': jnp.asarray(trip.ids, jnp.int32)}
 
     def loss(params):
-        return scalar_loss(objective, {**source.variables, 'params': params}, batch, step)[0]
+        return objective.scalar_loss({**source.variables, 'params': params}, batch, step)[0]
 
     our_loss, gradients = jax.value_and_grad(loss)(source.variables['params'])
     model, _ = reference_model(case, FIXTURES / case.fixture)

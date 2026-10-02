@@ -1,24 +1,16 @@
 """Multi-head latent attention: DeepSeek-V3 MLA and the V3.2 sparse indexer.
 
-The reference is transformers 5.16.1
-(models/deepseek_v3/modeling_deepseek_v3.py and
-models/deepseek_v32/modeling_deepseek_v32.py), read as the specification;
-models/glm_moe_dsa/modeling_glm_moe_dsa.py is the same block with the
-indexer rotating interleaved pairs and IndexShare layers attending the
-previous full layer's selection.
-MLA compresses keys and values into one low-rank latent per token plus a
-small decoupled rotary head: `kv_a_proj_with_mqa` maps the hidden states to
+The reference is transformers 5.16.1 (deepseek_v3, deepseek_v32, and
+glm_moe_dsa, the same block with the indexer rotating interleaved pairs and
+IndexShare layers attending the previous full layer's selection). MLA
+compresses keys and values into one low-rank latent per token plus a small
+decoupled rotary head: `kv_a_proj_with_mqa` maps the hidden states to
 `[kv_lora_rank + qk_rope_head_dim]`, the latent is normed, and `kv_b_proj`
-expands it back out to every head's nope keys and values. Queries are
-low-rank the same way when `q_lora_rank` is set (a plain `q_proj` when it is
-None, which no released checkpoint uses). Decode caches the compressed
-latents, as the V3 reference does; the V3.2 reference caches the expanded
-keys and values instead, so the sparse variant does that too.
-
-The rotary head rotates interleaved pairs (even/odd slices, one frequency
-each), not the rotate-half pairs `apply_rotary` rotates, at the plain or
-YaRN-scaled frequencies both released DeepSeek configs ask for
-(`dew.nn.rope`).
+expands it to every head's nope keys and values. Queries are low-rank the
+same way when `q_lora_rank` is set. Decode caches the compressed latents as
+V3 does, and the sparse variant the expanded keys and values as V3.2 does.
+The rotary head rotates interleaved pairs, at the plain or YaRN-scaled
+frequencies (`dew.nn.rope`).
 """
 
 import dataclasses
@@ -104,17 +96,13 @@ def indexer_kl(scores, query, key, keep, scale: float):
     """Per query, KL of the indexer's softmax from the attention: `[B, S]`, fp32.
 
     The indexer's objective (arXiv 2512.02556, eq. 3 and 4; MaxText
-    `attention_mla.py` `calculate_indexer_loss`): the target is the main
-    attention's distribution summed over its heads and L1-normalised, the
-    indexer's distribution the softmax of its `[B, S, T]` `scores`, both
-    over the keys `keep` allows, so the dense warm-up passes the causal
-    (and packed) mask and sparse training the top-k selection. `query` and
-    `key` are the main heads, `[B, S, H, D]` and `[B, T, H, D]`, `scale`
-    the logit scale the kernel applies on top of them. The target is a
-    constant of the loss, both projections detached as the reference
-    detaches them, so the gradient reaches the indexer alone. The heads are
-    summed one at a time, which keeps the footprint at `[B, S, T]` rather
-    than the `[B, H, S, T]` logits.
+    `calculate_indexer_loss`): the target is the main attention's distribution
+    summed over heads and L1-normalised, the indexer's the softmax of its
+    `[B, S, T]` `scores`, both over the keys `keep` allows (the causal mask in
+    the dense warm-up, the top-k selection in sparse training). `query` and
+    `key` are the main heads, `scale` the kernel's logit scale. The target is
+    detached as the reference detaches it, and heads are summed one at a time
+    to keep the footprint at `[B, S, T]`.
     """
     masked = jnp.finfo(jnp.float32).min
     batch, length, total = scores.shape
@@ -148,24 +136,12 @@ def indexer_kl(scores, query, key, keep, scale: float):
 class SparseIndexer(nn.Module):
     """DeepSeek sparse attention's lightning indexer: a score per query and key.
 
-    A lightweight scorer beside the main MLA projections
-    (`modeling_deepseek_v32.DeepseekV32Indexer`): `wq_b` reads the query
-    residual, `wk` reads the hidden states into keys the cache holds, and
-    `weights_proj` weights the heads into one score per key. `select`
-    keeps the top-k keys of each query. A whole-sequence pass attends only
-    those, in the latent space (`sparse_latent_attention`); the cache path
-    folds them into the attention mask the way the reference's eager path
-    does.
-
-    The indexer reads its inputs detached. The reference trains it apart
-    from the main model: the top-k is a selection, so the main loss reaches
-    the indexer's weights nowhere, and the indexer's own loss (`indexer_kl`)
-    reaches the main model nowhere.
-
-    The indexer rotates its rope slice in its family's convention: V3.2's
-    rotates half-split pairs (`modeling_deepseek_v32.py` calls
-    `apply_rotary_pos_emb` in the indexer beside the main head's interleaved
-    rotation) and GLM's rotates interleaved pairs like its main head
+    `modeling_deepseek_v32.DeepseekV32Indexer`: `wq_b` reads the query residual,
+    `wk` the hidden states into cached keys, and `weights_proj` weights the
+    heads into one score per key; `select` keeps each query's top-k. The
+    indexer reads its inputs detached, so the main loss and the indexer's own
+    (`indexer_kl`) each train only their side. V3.2 rotates the indexer's rope
+    slice as half-split pairs and GLM as interleaved ones
     (modeling_glm_moe_dsa.py:231-232), which `rope_interleave` selects.
     """
 
@@ -259,50 +235,24 @@ class SparseIndexer(nn.Module):
 class MultiHeadLatentAttention(nn.Module):
     """DeepSeek's multi-head latent attention, dense or sparse.
 
-    decode=True runs against the cache, like the standard mixer: the first
-    call writes the whole prompt and each later call appends one token. The
-    dense variant caches the compressed latent and the rotated rope head;
-    the sparse (V3.2 indexer) variant caches the expanded keys and values
-    with the indexer's keys, as each reference does. `positions`
-    and `segment_ids` behave as on the standard mixer: absolute positions
-    for the cache slots, per-document positions and a block-diagonal mask
-    for a packed batch.
-    `yarn` replaces the plain rope base with the YaRN ramp; when it is set
-    the mixer's `rope_theta` has to equal the record's, so the scaling is
-    configured once, and the mscale reaches the logits as a query
-    pre-scale. causal=False is full attention with no cache, the mode a
-    non-causal reader would take; decode=True raises there. The two latent
-    norms are the model's RMSNorm under the model's `scale_offset` and
-    `scale_after_cast`, since the reference builds them from the same class
-    as every other norm of the layer.
+    decode=True runs against the cache like the standard mixer; `positions` and
+    `segment_ids` behave as there. `yarn` replaces the rope base with the YaRN
+    ramp (the mixer's `rope_theta` must equal the record's) and its mscale
+    pre-scales the query. The two latent norms are the model's RMSNorm, as the
+    reference builds them from the layer's one norm class.
 
-    `index_n_heads` and `index_head_dim` together put the indexer beside
-    the attention; `index_topk` makes it select, which is the released
-    V3.2 layer. Without a top-k the attention stays dense and the indexer
-    only scores, the state of V3.2's dense warm-up (arXiv 2512.02556,
-    section 2.1.1), where a fresh indexer learns the dense attention of a
-    frozen model. Whenever the indexer is present and the `indexer`
-    collection is open, a training pass sows the per-query `indexer_kl`
-    under `kl`, over the keys the attention itself used.
-    `index_rope_interleave` is the indexer's own rotation convention.
+    `index_n_heads` and `index_head_dim` put the indexer beside the attention
+    and `index_topk` makes it select, the released V3.2 layer; without a top-k
+    the indexer only scores, V3.2's dense warm-up (arXiv 2512.02556, section
+    2.1.1). With the `indexer` collection open, training sows `indexer_kl`
+    under `kl` over the keys the attention used. `index_shared` is GLM's
+    IndexShare layer (modeling_glm_moe_dsa.py:313-318, 432-446): no indexer of
+    its own, it attends the selection its provider stashed in `kv_store`.
 
-    `index_shared` is GLM's IndexShare layer (modeling_glm_moe_dsa.py:313-318,
-    432-446): it owns no indexer and attends the keys the last earlier
-    selecting layer chose, which that layer stashes under `kv_store_key` in
-    the `kv_store` the block threads down the stack, as a KV-sharing
-    attention layer reads its provider's keys and values. It caches the
-    expanded keys and values like any sparse layer, without indexer keys.
-
-    `attention_impl` reaches the shared kernel path, which pads these
-    values to the query's width for a fused kernel and hands back their own
-    columns (`widen_value_heads`), so `auto` picks cudnn or xla off the
-    query width like any other layer's: `qk_nope_head_dim +
-    qk_rope_head_dim`, 192 in the released V3 configs, which is past the
-    width cudnn tiles, so those run on xla. A mask this layer materializes
-    outside decode (packed documents, row validity, the indexer's
-    selection) takes 'auto' and 'cudnn' to xla, since cudnn reads a bool
-    mask as an additive bias and refuses one at an odd length while
-    training.
+    The query width `qk_nope_head_dim + qk_rope_head_dim` (192 in the released
+    V3 configs, past cudnn's tiles) decides the kernel, values padded to it
+    (`widen_value_heads`). A mask materialized outside decode (packed
+    documents, row validity, the selection) takes 'auto' and 'cudnn' to xla.
     """
 
     emb_features: int
@@ -667,16 +617,11 @@ class MultiHeadLatentAttention(nn.Module):
         return not self.is_initializing() and self.is_mutable_collection("qk")
 
     def _attends_sparsely(self, selection, total: int) -> bool:
-        """Whether a whole-sequence pass runs `sparse_latent_attention`.
-
-        It does when the selection is narrower than the keys, so the dense
-        kernel would read keys the selection drops. A selection as wide as
-        the sequence is every allowed key, which the dense kernel under the
-        allowed mask computes. An open `qk` collection reads the dense
-        logits for its maxima, so it keeps the masked kernel, and so does a
-        call whose `kv_b_proj` input is drawn on (`stochastic_input`): the
-        absorbed path feeds kv_b_proj the identity, where a dropout draw
-        would be one mask for every token rather than one per token.
+        """Whether a whole-sequence pass runs `sparse_latent_attention`: when the
+        selection is narrower than the keys. An open `qk` collection keeps the
+        masked kernel for its dense maxima, and so does a drawn `kv_b_proj` input
+        (`stochastic_input`), since the absorbed path would draw one mask for every
+        token.
         """
         return (selection.shape[-1] < total and not self._qk_open()
                 and not self.stochastic_input("kv_b_proj"))
@@ -746,29 +691,13 @@ class MultiHeadLatentAttention(nn.Module):
 class MLAMixer(MixerBase):
     """The `mla` kind: DeepSeek's latent attention under the reference's names.
 
-    A config names it as `mixer={"kind": "mla", ...}` with the fields of a
-    DeepSeek config.json, so translation renames nothing; `yarn` is the
-    rope-scaling record (or None for plain rope). `index_n_heads` and
-    `index_head_dim` put the V3.2 indexer beside the attention and
-    `index_topk` makes it select, the released sparse layer; the heads
-    without a top-k is dense attention with an indexer scoring beside it,
-    the state the dense warm-up trains (all None is dense MLA). The rope
-    base is the model's `rope_theta`, transformed by the yarn ramp rather
-    than replaced, so scaling is configured once, and the mscale is applied
-    in the attention as a query pre-scale.
-
-    `index_rope_interleave` is the indexer's rotation convention: V3.2
-    rotates half-split pairs, GLM interleaved ones.
-
-    The context's grouped-query geometry (`num_kv_heads`, `head_dim`) has
-    no meaning here and is not read, as the backbone documents; `qk_norm` is
-    not read either, since the latent norms are the design's own and always
-    present. A layer the backbone marks `kv_shared` is GLM's IndexShare
-    layer (modeling_glm_moe_dsa.py:313-318): what an MLA layer shares is
-    its indexer's selection, so the layer builds no indexer and attends the
-    keys its provider chose, which needs the kind to select. The dials a
-    standard attention honours and this cannot (a values norm, a window, an
-    attention scale, a partial rotary) are refused.
+    `mixer={"kind": "mla", ...}` takes a DeepSeek config.json's fields, so
+    translation renames nothing; `yarn` is the rope-scaling record. The rope base
+    is the model's `rope_theta`, transformed by the ramp. The context's GQA
+    geometry and `qk_norm` are not read (the latent norms are always present).
+    A `kv_shared` layer is GLM's IndexShare layer, which shares its provider's
+    selection and so needs the kind to select. Dials this cannot honour (a
+    values norm, a window, an attention scale, a partial rotary) are refused.
     """
 
     q_lora_rank: int | None = None

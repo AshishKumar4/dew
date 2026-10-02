@@ -9,7 +9,8 @@ def test_the_cpu_lane_simulates_the_mesh_devices():
     environ = {}
     configure_lane(environ)
     assert environ["JAX_PLATFORMS"] == "cpu"
-    assert environ["XLA_FLAGS"].split() == [f"--xla_force_host_platform_device_count={MESH_DEVICES}"]
+    assert environ["XLA_FLAGS"].split() == [
+        "--xla_allow_excess_precision=false", f"--xla_force_host_platform_device_count={MESH_DEVICES}"]
 
 
 @pytest.mark.parametrize("platforms, devices", [("cpu", MESH_DEVICES), ("cuda", 2)])
@@ -36,8 +37,8 @@ def test_a_cuda_lane_repeats_its_reductions_and_pairs_a_cpu_device_with_each_gpu
     configure_lane(environ)
     assert environ["JAX_PLATFORMS"] == "cuda,cpu"
     assert environ["XLA_FLAGS"].split() == [
-        "--xla_dump_to=/tmp/dump", "--xla_gpu_deterministic_ops=true", "--xla_gpu_autotune_level=0",
-        "--xla_force_host_platform_device_count=2"]
+        "--xla_dump_to=/tmp/dump", "--xla_allow_excess_precision=false", "--xla_gpu_deterministic_ops=true",
+        "--xla_gpu_autotune_level=0", "--xla_force_host_platform_device_count=2"]
 
 
 @pytest.mark.parametrize("platforms", ["tpu", "tpu,cpu"])
@@ -51,4 +52,5 @@ def test_a_tpu_lane_keeps_a_cpu_device_beside_each_tpu_device(platforms):
     configure_lane(environ)
     assert environ["JAX_PLATFORMS"] == "tpu,cpu"
     assert environ["XLA_FLAGS"].split() == [
-        "--xla_dump_to=/tmp/dump", "--xla_force_host_platform_device_count=4"]
+        "--xla_dump_to=/tmp/dump", "--xla_allow_excess_precision=false",
+        "--xla_force_host_platform_device_count=4"]

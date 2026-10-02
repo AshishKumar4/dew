@@ -36,7 +36,7 @@ import tyro
 
 from dew.config import ModelConfig, OptimConfig, TrainerConfig
 from dew.data import DataPhase, PackedTokens
-from dew.training.optim import Power, PowerTail, mup_param_groups
+from dew.training.optim import ParamGroup, Power, PowerTail
 
 LAYERS = 40
 VOCAB = 100_352
@@ -90,7 +90,7 @@ def optim_config(width: int, steps: int, batch: int, seq_len: int) -> OptimConfi
         schedule=Power(peak=0.01, warmup_steps=max(round(5_000 * scale), 1),
                        a=4.0 * batch, b=-0.51, c=float(batch * seq_len),
                        tail=PowerTail(start=round(DECAY_START * scale))),
-        weight_decay=0.1, clip_grads=1.0, param_groups=mup_param_groups(width / 128))
+        weight_decay=0.1, clip_grads=1.0, param_groups=ParamGroup.mup(width / 128))
 
 
 def phases(corpora: Mapping[str, str], steps: int) -> tuple[DataPhase, ...]:

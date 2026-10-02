@@ -1,12 +1,12 @@
 """Model backbones.
 
-Each class registers itself with `dew.registry.models` where it is defined,
-so `models["simple_dit"]`, `models.SimpleDiT` and the class are one object and
-training and inference build the same model from a logged name and fields.
-The classes are exported for direct use in notebooks and tests.
+Code builds a model by its class: `SimpleDiT(patch_size=4, ...)`. Each class
+also registers itself with `dew.registry.models` where it is defined, so a
+run record that names `simple_dit` and its fields rebuilds the same model.
 """
 
 from .causal_transformer import CausalTransformer
+from .decoder_block import Mixture
 from .dit import SimpleDiT
 from .edm2 import EDM2UNet
 from .flux import FluxTransformer
@@ -23,6 +23,6 @@ from .video_dit import VideoDiT
 from .z_image import ZImageTransformer
 
 __all__ = ["CausalTransformer", "EDM2UNet", "Flux2Transformer", "FluxTransformer", "HierarchicalMMDiT",
-           "HybridSSMAttentionDiT", "QwenImageTransformer", "SD3Transformer", "SimpleDiT", "SimpleMMDiT",
-           "SimpleUDiT", "UNet2DCondition", "UNet3D", "UNetStage", "UViT", "Unet", "VideoDiT",
+           "HybridSSMAttentionDiT", "Mixture", "QwenImageTransformer", "SD3Transformer", "SimpleDiT",
+           "SimpleMMDiT", "SimpleUDiT", "UNet2DCondition", "UNet3D", "UNetStage", "UViT", "Unet", "VideoDiT",
            "ZImageTransformer"]

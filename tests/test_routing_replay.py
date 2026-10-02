@@ -22,7 +22,7 @@ from dew.nn.sharding import pipeline_microbatches
 from dew.objectives.lm import LMObjective
 from dew.objectives.lm.objective import router_counts
 from dew.objectives.rl.sessions import ROUTED_EXPERTS_KEY, ROUTED_KEY, Call, Session, Status, pack
-from dew.training import Layout, MeshSpec, build_mesh
+from dew.training import Layout, MeshSpec
 
 VOCAB, SEQ_LEN, LAYERS, EXPERTS, TOP_K = 64, 16, 4, 8, 2
 
@@ -154,7 +154,7 @@ def test_replay_under_a_pipeline_scores_as_on_one_stage():
     routed = (engine_layout(choices(obj, params, tokens), 8) + 1) % EXPERTS
 
     def scored(spec):
-        mesh = build_mesh(spec)
+        mesh = spec.build()
         with jax.set_mesh(mesh), pipeline_microbatches(spec.microbatches):
             return np.asarray(jax.jit(lambda p: replayed_log_probs(obj, p, tokens, (routed, None)))(params))
 
@@ -245,7 +245,7 @@ def test_a_multimodal_mixture_replays_through_its_language_model():
                              head_dim=8, mlp_features=32, max_seq_len=SEQ_LEN, dtype=jnp.float32,
                              attention_impl="reference", mixture=Mixture(experts=4, top_k=2))
     vision = SiglipVision(hidden_size=16, intermediate_size=32, num_layers=1, num_heads=2, image_size=8, patch_size=4)
-    projection = GemmaProjector(vision_width=16, text_width=16, patches_per_side=2, tokens_per_side=1)
+    projection = GemmaProjector(text_width=16, patches_per_side=2, tokens_per_side=1)
     model = MultimodalTransformer(text, vision, projection, family="gemma3", image_token_id=1, dtype=jnp.float32)
     tokens = jnp.asarray([[2, 1, 3, 4, 5, 6]], jnp.int32)
     indices = jnp.asarray([[-1, 0, -1, -1, -1, -1]], jnp.int32)

@@ -1,26 +1,18 @@
 """Qwen-Image 2.1's transformer, as Diffusers' `QwenImage21Transformer2DModel`
 runs it at commit 6256aa76.
 
-One residual stream carries the image and the text together, image first.
-The text is the vision-language encoder's hidden states, projected through a
-zero-centred RMS norm and a GELU MLP; the image is the latent, one token per
-latent position, projected by one linear. Every block modulates both with
-scales and tanh gates read from one projection of the time embedding that
-all blocks share, attends, and runs a SwiGLU feed-forward.
-
-Two things set it apart from the MM-DiT families. Attention is block-causal:
-the text attends causally and the image attends to all of the text and to
-itself. And under `causal_condition` the text is modulated from time zero
-rather than from the sampled time, so its activations do not change across a
-walk. The rotary table spans three axes: a text token advances one shared
-position on all three, and the image sits at the frame position after the
-text on a height and width grid centred on zero.
-
-The source takes the text padded to the longest prompt of the call and
-starts the image's frame position after that padding. Here each row starts it
-after its own text, which is the source's value for a prompt alone and for a
-batch of prompts of one length, and keeps a row's output independent of what
-it is batched with.
+One residual stream carries the image then the text: the text is the
+vision-language encoder's states through a zero-centred RMS norm and a GELU
+MLP, the image one linear per latent position. Every block modulates both by
+scales and tanh gates from one shared projection of the time embedding,
+attends, and runs a SwiGLU. Attention is block-causal (text causal, image
+over all text and itself), and under `causal_condition` the text is
+modulated from time zero, so its activations do not change across a walk.
+The rotary table's three axes advance a text token on all three and place
+the image at the frame after the text on a zero-centred height and width
+grid. The source starts the frame after the call's longest prompt; here
+each row starts after its own text, which matches a prompt alone or a batch
+of one length and keeps rows independent of their batch.
 """
 
 from __future__ import annotations
@@ -107,17 +99,12 @@ def _scaled(x, scale):
               | {("attn", "to_out_0"): (None, "embed")})
 class _Attention(nn.Module):
     """`QwenImage21Attention` under the source's exact multi-pass prefill:
-    the image queries attend over everything and the text queries causally
-    over the text, a padded text key excluded from both. Queries and keys
-    are RMS normalized per head, then rotated.
-
-    The sequence runs image first, so the keys a row's image queries read
-    are a prefix of it and its text queries' keys a prefix of the text. Both
-    calls pass those prefix lengths, which cuDNN applies as its padding mask
-    and skips the padded keys by, where a mask would reach it as a dense
-    additive bias read once per head. Attention does not depend on the order
-    of its keys and every token carries its own rotary position, so this is
-    the source's arithmetic, summed in another order.
+    image queries attend everything and text queries the text causally, padded
+    text keys excluded; queries and keys are RMS normalized per head, then
+    rotated. With the image first, each query's keys are a prefix, passed as
+    lengths that cuDNN skips rather than as a dense mask; attention does not
+    depend on key order, so this is the source's arithmetic summed in another
+    order.
     """
 
     heads: int

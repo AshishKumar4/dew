@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from steady_state import guarded
 from test_inference import make_run
 
 from dew.inference import DenoisingInputs, TextToImage
@@ -104,7 +105,6 @@ def test_partial_image_trajectory_and_refiner_handoff_preserve_latents(tmp_path)
 @pytest.mark.parametrize("family", ["diffusion-gemma-workflow", "gemma3-native-tiny"])
 def test_host_and_resident_media_generate_equivalent_public_results(family):
     from dew.training import Layout, MeshSpec
-    from dew.training.distributed import build_mesh
 
     directory = FIXTURE.parent / family
     loaded = load_pretrained(directory, dtype="float32", attention_impl="xla", max_seq_len=64)
@@ -121,20 +121,15 @@ def test_host_and_resident_media_generate_equivalent_public_results(family):
         task = loaded.text_generation()
     host_inputs = jax.tree.map(np.asarray, inputs)
     resident = replace(host_inputs, conditioning=jax.tree.map(jnp.asarray, host_inputs.conditioning))
-    mesh = build_mesh(MeshSpec())
+    mesh = MeshSpec().build()
     variables = jax.device_put(loaded.variables, Layout().shardings(mesh, loaded.variables))
     task = task.bind(variables)
     key = jax.random.key(7)
     expected = task(host_inputs, 4, key=key).host()
     jax.block_until_ready(resident.conditioning)
-    if family == "diffusion-gemma-workflow":
-        with jax.transfer_guard_device_to_host("disallow"):
-            generated = task(resident, 4, key=key)
-            jax.block_until_ready(generated.tokens)
-    else:
-        # Autoregressive checkify reports scalar error status on the host;
-        # public result equivalence does not forbid that control-plane transfer.
+    with guarded(allow=("host_to_device", "device_to_device")):
         generated = task(resident, 4, key=key)
+        jax.block_until_ready(generated.tokens)
     actual = generated.host()
     for left, right in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
         np.testing.assert_array_equal(left, right)

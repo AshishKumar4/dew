@@ -18,7 +18,10 @@ import pytest
 from jax._src import source_info_util
 from test_architectures import CASES as ARCHITECTURE_CASES
 
-from dew import models
+import dew.nn.backbones  # noqa: F401  (registers the kind)
+import dew.nn.backbones.jepa  # noqa: F401  (registers the kind)
+import dew.nn.diffusion_gemma  # noqa: F401  (registers the kind)
+import dew.nn.multimodal  # noqa: F401  (registers the kind)
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.hf_decoders import translate_config
 from dew.nn.attention import local_attention, scaled_dot_product_attention
@@ -31,7 +34,7 @@ from dew.nn.llama4 import Llama4Attention
 from dew.nn.mla import MultiHeadLatentAttention
 from dew.nn.multimodal import MultimodalTransformer
 from dew.nn.vision import GemmaProjector, SiglipVision
-from dew.registry import dtype_name, float64_twin, resolve_dtype, with_precision
+from dew.registry import dtype_name, float64_twin, models, resolve_dtype, with_precision
 
 BF16_QKV = (1, 4, 2, 8)  # [B, S, H, D]
 
@@ -271,7 +274,7 @@ def build_model(architecture, dtype="bfloat16"):
     return MultimodalTransformer(
         text, SiglipVision(hidden_size=16, intermediate_size=32, num_layers=1, num_heads=2,
                            image_size=8, patch_size=4),
-        GemmaProjector(vision_width=16, text_width=TINY["emb_features"],
+        GemmaProjector(text_width=TINY["emb_features"],
                        patches_per_side=2, tokens_per_side=1),
         family="gemma3", image_token_id=1,
         dtype=jnp.float64 if dtype == "float64" else resolve_dtype(dtype))

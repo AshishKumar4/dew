@@ -17,6 +17,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from steady_state import steady_state
 from test_diffusion_objective import StubText  # noqa: F401  registers "stub_text"
 
 import dew
@@ -25,12 +26,12 @@ from dew.artifacts import VideoGrid
 from dew.config import ModelConfig, RunConfig, TrainerConfig
 from dew.data import Dataset, OxfordFlowers, VideoDataset
 from dew.diffusion import FlowMatchPredictionTransform
+from dew.diffusion.presets import EDM, Flow
 from dew.diffusion.schedules import FlowMatchingScheduler
 from dew.inputs import Field, unit_range
 from dew.objectives.base import merge
 from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
-from dew.registry import presets, samplers
-from dew.sampling import CFG, Heun, TextToImage
+from dew.sampling import CFG, Euler, Heun, TextToImage
 from dew.sampling.pipelines import Images, _with_drawn_tables
 from dew.training import Checkpoints, Trainer
 
@@ -38,18 +39,18 @@ RES = 8
 MODEL = dict(patch_size=4, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1)
 
 
-def run_config(directory, preset=presets.EDM(), encoder="stub_text", checkpoint="stub-clip"):
+def run_config(directory, preset=EDM(), encoder="stub_text", checkpoint="stub-clip"):
     """The resolved config of a tiny conditional DiT run in `directory`; the
     text condition names the registered stub encoder by default."""
     return DiffusionRunConfig(
         model=ModelConfig("simple_dit", dict(MODEL), dtype="float32", attention_impl="reference"),
         data=OxfordFlowers(image_size=RES),
         trainer=TrainerConfig(checkpoint_dir=str(directory), batch_size=8, steps=2, keep=1),
-        preset=preset, sampler=samplers.Euler(), sampling_steps=3,
+        preset=preset, sampler=Euler(), sampling_steps=3,
         text=TextCondition(encoder=encoder, checkpoint=checkpoint))
 
 
-def make_run(directory, preset=presets.EDM(), encoder="stub_text", checkpoint="stub-clip", steps=2):
+def make_run(directory, preset=EDM(), encoder="stub_text", checkpoint="stub-clip", steps=2):
     """`steps` training steps of the tiny conditional DiT, its checkpoint and
     its `run.json` in `directory`, as the recipe leaves them: the objective is
     the config's own build. A directory that already holds the run resumes
@@ -112,6 +113,25 @@ def test_pipeline_generates_from_a_run_directory(tmp_path):
         pipe(["a water lily", "a sunflower"], steps=3, guidance=2.0, key=0).host().images)
 
 
+def test_repeated_image_requests_reuse_their_programs_and_read_back_only_results(tmp_path):
+    """Prompts of the same count and sampling settings after the first run
+    the programs it compiled, and nothing comes back to the host but the
+    images (`steady_state`). A request's prompts and key reach the device
+    as it arrives, so only reads are held. Unguided: the task's cached
+    blank conditions sit on one device and move to the mesh at every
+    guided request."""
+    make_run(tmp_path)
+    pipe = TextToImage.from_run(str(tmp_path))
+    keys = [jax.random.key(index) for index in range(3)]
+    pipe(["a water lily", "a sunflower"], steps=3, guidance=None, key=keys[0])
+    with steady_state(allow=("host_to_device",)):
+        prompts = [["a rose", "a tulip"], ["a daisy", "an iris"]]
+        results = [pipe(rows, steps=3, guidance=None, key=key)
+                   for rows, key in zip(prompts, keys[1:], strict=True)]
+        jax.block_until_ready([result.images for result in results])
+    assert [result.host().images.shape for result in results] == [(2, RES, RES, 3)] * 2
+
+
 def test_images_as_pil_are_this_processs_real_rows_as_8_bit_pixels():
     """`pil()` drops the rows a row plan padded, maps [-1, 1] to [0, 255],
     and refuses a result that kept only latents or holds video."""
@@ -171,7 +191,7 @@ def test_a_run_that_keeps_one_copy_of_its_weights_samples_it_by_default(tmp_path
 def test_from_run_rebuilds_the_training_process_exactly(tmp_path):
     """run.json holds the preset's fields, so inference samples with the
     shift the run trained with and not the preset default."""
-    make_run(tmp_path, preset=presets.Flow(shift=3.0, logit_mean=0.5))
+    make_run(tmp_path, preset=Flow(shift=3.0, logit_mean=0.5))
     pipe = TextToImage.from_run(str(tmp_path))
     assert isinstance(pipe.process.schedule, FlowMatchingScheduler)
     assert pipe.process.schedule.shift == 3.0 and pipe.process.schedule.logit_mean == 0.5
@@ -646,7 +666,7 @@ def test_a_grid_prepares_the_process_and_times_and_final_denoise_ends_the_trajec
 def test_explicit_average_requests_do_not_substitute_live_weights(tmp_path):
     objective, state = make_lm_run(tmp_path, ema_decay=None)
     with pytest.raises(ValueError, match="no EMA"):
-        objective.pipeline(state)
+        objective.pipeline(state, ema=True)
     with pytest.raises(ValueError, match="no EMA"):
         dew.pipeline(str(tmp_path), ema=True)
     restored = dew.pipeline(str(tmp_path))

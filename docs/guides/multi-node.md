@@ -122,25 +122,26 @@ Hybrid sharding keeps fsdp inside a node and replicates across nodes, so only on
 ```python
 import jax
 import optax
-from dew import Trainer, models
+from dew import Trainer
+from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective
 from dew.training import MeshSpec
 from dew.training.runtime import prepare_process
 
 prepare_process()
-model = models.build("causal_transformer", vocab_size=256, emb_features=512,
-                     num_layers=8, num_heads=8, max_seq_len=1024)
+model = CausalTransformer(vocab_size=256, emb_features=512,
+                          num_layers=8, num_heads=8, max_seq_len=1024)
 # fsdp over the eight GPUs of each node, and the data axis of 2 across the nodes.
 mesh = MeshSpec(fsdp=8, replicas=2)
 trainer = Trainer(LMObjective(model, seq_len=1024), optax.adamw(3e-4),
                   key=jax.random.key(0), mesh=mesh)
 ```
 
-`replicas` counts groups of granules. A granule is whatever the devices' `slice_index` groups: a TPU slice on a multislice run, and on several GPU hosts a host or an NVLink domain, however many processes each host runs, because XLA numbers GPU slices per host boot or NVLink fabric. Where every device shares one slice, as in a CPU pool or on the hosts of one TPU slice, the process is the granule. `build_mesh` then builds the mesh with JAX's `mesh_utils.create_hybrid_device_mesh`, the same call MaxText uses for multislice runs. The data axis spans the groups. The expert, tensor, sequence and stage axes stay inside one granule. When a group holds more than one granule, fsdp is the only axis that crosses between them. `replicas` must divide both the granule count and the data axis, and fsdp must divide over the granules of one group. `build_mesh` raises with the numbers when they do not fit.
+`replicas` counts groups of granules. A granule is whatever the devices' `slice_index` groups: a TPU slice on a multislice run, and on several GPU hosts a host or an NVLink domain, however many processes each host runs, because XLA numbers GPU slices per host boot or NVLink fabric. Where every device shares one slice, as in a CPU pool or on the hosts of one TPU slice, the process is the granule. `MeshSpec.build` then builds the mesh with JAX's `mesh_utils.create_hybrid_device_mesh`, the same call MaxText uses for multislice runs. The data axis spans the groups. The expert, tensor, sequence and stage axes stay inside one granule. When a group holds more than one granule, fsdp is the only axis that crosses between them. `replicas` must divide both the granule count and the data axis, and fsdp must divide over the granules of one group. `MeshSpec.build` raises with the numbers when they do not fit.
 
 On GPU hosts whose device ids run host by host, `jax.make_mesh` already puts the data axis outermost, so for one granule per replica `replicas` states the layout rather than changing it. It changes the mesh when a replica spans several granules, when the slices do not follow the device order, and on a multislice TPU run.
 
-With `replicas=1`, `jax.make_mesh` places the devices, which is what a single node or a single TPU slice wants. To choose which devices share an axis, pass them to `build_mesh(spec, devices)`: it fills the mesh with the list in the order you give, row-major over `MESH_AXES`, so the last axes get neighbouring entries. On a machine whose NVLink pairs are GPUs 0-1 and 2-3, `[0, 2, 1, 3]` puts a two-way tensor axis across the pairs instead of inside them. `jax.make_mesh` would sort GPU devices by id and discard that order.
+With `replicas=1`, `jax.make_mesh` places the devices, which is what a single node or a single TPU slice wants. To choose which devices share an axis, pass them to `spec.build(devices)`: it fills the mesh with the list in the order you give, row-major over `MESH_AXES`, so the last axes get neighbouring entries. On a machine whose NVLink pairs are GPUs 0-1 and 2-3, `[0, 2, 1, 3]` puts a two-way tensor axis across the pairs instead of inside them. `jax.make_mesh` would sort GPU devices by id and discard that order.
 
 Hybrid sharding keeps a full copy of the parameters and optimizer state on every replica group. Plain fsdp across all nodes divides them by the total device count instead. Choose hybrid sharding when one node's memory holds the sharded state, and plain fsdp when it does not.
 
@@ -175,7 +176,7 @@ Two other designs were timed against the all-to-all on the same pairs, and Dew s
 
 With Rigel's attention the ring took 1.02 to 1.79 times as long and two head groups 0.91 to 1.10 times; four head groups did no better than two. The ring lost at every length. The head groups gained up to 16%, on the PCIe pair at lengths one GPU trains, and came within 3% faster to 9% slower at 32,768 and 65,536 tokens.
 
-Keep the sequence axis on the fastest links. Both exchanges run once per attention layer in the forward and the backward pass, and again when the layer is recomputed. On the 3090s the all-to-all moved 19.5 GB/s per device over the NVLink pair and 6.3 GB/s across the sockets, 64 MiB a device, and NCCL runs the PCIe pair through host memory as it runs the sockets. On the PCIe pair a 32,768-token Qwen3-0.6B-shaped training step split two ways took 7.6 s, 1.25 s of it an all-to-all that no computation overlapped. `build_mesh` puts the `sequence` axis last, on neighbouring devices, and `replicas` keeps it inside a granule.
+Keep the sequence axis on the fastest links. Both exchanges run once per attention layer in the forward and the backward pass, and again when the layer is recomputed. On the 3090s the all-to-all moved 19.5 GB/s per device over the NVLink pair and 6.3 GB/s across the sockets, 64 MiB a device, and NCCL runs the PCIe pair through host memory as it runs the sockets. On the PCIe pair a 32,768-token Qwen3-0.6B-shaped training step split two ways took 7.6 s, 1.25 s of it an all-to-all that no computation overlapped. `MeshSpec.build` puts the `sequence` axis last, on neighbouring devices, and `replicas` keeps it inside a granule.
 
 ## Single-machine rehearsal
 

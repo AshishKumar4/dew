@@ -212,8 +212,7 @@ class RolloutScheduler:
 
     `tasks` turns one registered batch into its tasks (`task_ids` for
     integer `task_id` rows). `timeout` is each rollout's deadline in seconds
-    from its submission; a rollout past it is cancelled and resubmitted as a
-    failed attempt. `width` and `rows` fix the packed batch shape, `rows`
+    from its submission. `width` and `rows` fix the packed batch shape, `rows`
     for this process's share of a multi-process trainer's batch;
     `estimator` and `truncation` are `pack`'s advantage family and
     truncation policy, and `support_capacity` its per-row support length,

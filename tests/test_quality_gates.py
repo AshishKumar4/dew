@@ -25,7 +25,8 @@ def lint(source: str, *, library: bool = True):
     ('value = 1\nimport math\nassert math.pi > value\n', "E402"),
     ('class Options:\n    pass\n\n\ndef read(options=Options()):\n    return options\n', "B008"),
     ('class Options:\n    rows = []\n', "RUF012"),
-    ('from dataclasses import dataclass\n\n\n@dataclass\nclass Row:\n    name: str = str()\n', "RUF009"),
+    ('from dataclasses import dataclass\n\n\nclass Value:\n    pass\n\n\n'
+     '@dataclass\nclass Row:\n    value: Value = Value()\n', "RUF009"),
     ('def read(x):\n    if x:\n        return 1\n    else:\n        return 2\n', "RET505"),
     ('def read(x):\n    if x:\n        y = 1\n    else:\n        y = 2\n    return y\n', "SIM108"),
     ('functions = []\nfor row in range(3):\n    functions.append(lambda: row)\n', "B023"),
