@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING, overload
+from typing import TYPE_CHECKING, Protocol, overload, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -48,6 +48,7 @@ from orbax.checkpoint.checkpoint_managers import preservation_policy as preserva
 
 from dew import position
 from dew.objectives.base import Variables
+from dew.records import JSON, json_value
 from dew.telemetry.profile import region
 
 if TYPE_CHECKING:
@@ -350,16 +351,15 @@ def _with_ema_deltas(state_tree: dict[str, StateLeaf]) -> tuple[dict[str, StateL
             [jax.tree_util.keystr(paths_leaves[index][0]) for index in chosen])
 
 
-def _ema_deltas(checkpointer: ocp.CheckpointManager, step: int,
-                metadata) -> dict[jax.tree_util.KeyPath, jax.ShapeDtypeStruct]:
+def _ema_deltas(metadata: ocp.metadata.StepMetadata) -> dict[jax.tree_util.KeyPath, jax.ShapeDtypeStruct]:
     """The EMA leaves the checkpoint at `step` stores as byte planes, by path,
     each with the shape and dtype of the weight it is the difference from,
     which are its own. The step's custom metadata records those paths; a
     checkpoint written before the EMA was stored so records none."""
-    stored = dict(metadata)
+    stored = dict(_item_metadata(metadata))
     if stored.get('ema') is None:
         return {}
-    custom = checkpointer.metadata(step).custom_metadata or {}
+    custom = metadata.custom_metadata or {}
     recorded = set(custom.get('ema_deltas', ()))
     if not recorded:
         return {}
@@ -369,6 +369,24 @@ def _ema_deltas(checkpointer: ocp.CheckpointManager, step: int,
             live = lives[path]
             deltas[path] = jax.ShapeDtypeStruct(tuple(live.shape), live.dtype)
     return deltas
+
+
+@runtime_checkable
+class _MetadataTree(Protocol):
+    """The state tree exposed by Orbax's PyTree metadata wrapper."""
+
+    @property
+    def tree(self) -> Variables: ...
+
+
+def _item_metadata(metadata: ocp.metadata.StepMetadata) -> Variables:
+    """The named state tree, a dict or Orbax's newer metadata wrapper's `tree`."""
+    tree = metadata.item_metadata
+    if isinstance(tree, _MetadataTree):
+        tree = tree.tree
+    if not isinstance(tree, Mapping) or any(not isinstance(key, str) for key in tree):
+        raise ValueError("the checkpoint holds no named state metadata")
+    return dict(tree)
 
 
 def _plane_template(ema, deltas):
@@ -502,6 +520,7 @@ class Checkpoints:
         self._manager = None
         self._local_manager = None
         self._profile_snapshots: set[int] = set()
+        self._metadata: tuple[bool, int, ocp.metadata.StepMetadata] | None = None
 
     def _open(self) -> ocp.CheckpointManager:
         if self._manager is None:
@@ -520,10 +539,26 @@ class Checkpoints:
                 self.directory, options=options,
                 item_handlers=ocp.PyTreeCheckpointHandler())
             for step in self._manager.all_steps():
-                custom = self._manager.metadata(step).custom_metadata or {}
+                custom = self._step_metadata(step).custom_metadata or {}
                 if custom.get('profiles') is not None:
                     self._profile_snapshots.add(step)
         return self._manager
+
+    def _step_metadata(self, step: int, *, local: bool = False) -> ocp.metadata.StepMetadata:
+        """The most recently inspected committed step, shared by shape and value reads.
+
+        Orbax's metadata opens every array's TensorStore. A restore following
+        `stored` needs that same immutable metadata, not a second opening of
+        all those arrays. A save invalidates it so a later inspection observes
+        the newly committed step. Only one step's metadata is retained.
+        """
+        held = self._metadata
+        if held is not None and held[:2] == (local, step):
+            return held[2]
+        checkpointer = self._open_local() if local else self._open()
+        metadata = checkpointer.metadata(step)
+        self._metadata = local, step, metadata
+        return metadata
 
     @property
     def local_path(self) -> str:
@@ -613,8 +648,9 @@ class Checkpoints:
 
     def save(self, step: int, state: TrainState, saved: bytes | None,
              metrics: Mapping[str, float] | None = None, *,
-             share: DataPartition | None = None) -> None:
-        """Write `state` under `step`, asynchronously.
+             share: DataPartition | None = None, rung: JSON = None) -> None:
+        """Write `state` under `step`, asynchronously, and `rung`, the fit
+        ladder's rung the state trained on, for a resume to compile (`rung`).
 
         Sharded arrays go straight to orbax: gathering them onto the host
         first would serialise the whole state through one process and undo
@@ -640,11 +676,12 @@ class Checkpoints:
             'updates': int(profiles.updates), 'stds': [float(std) for std in np.asarray(profiles.stds)]}
         state_tree, deltas = _with_ema_deltas(self._item(state, saved, share))
         persistent = self._open()
+        self._metadata = None
         if profiles is not None:
             self._profile_snapshots.add(step)
         with region("checkpoint.submit"):
             persistent.save(step, args=ocp.args.PyTreeSave(state_tree), metrics=metrics, force=True,
-                            custom_metadata={'ema_deltas': deltas, 'profiles': profile_metadata})
+                            custom_metadata={'ema_deltas': deltas, 'profiles': profile_metadata, 'rung': rung})
         if _written_in_place(state_tree):
             with region("checkpoint.write_in_place"):
                 persistent.wait_until_finished()
@@ -679,7 +716,7 @@ class Checkpoints:
         return tuple(_averages_of(_power_profiles(restored['opt_state'])))
 
     def save_local(self, step: int, state: TrainState, saved: bytes | None, *,
-                   share: DataPartition | None = None) -> None:
+                   share: DataPartition | None = None, rung: JSON = None) -> None:
         """Write `state` under `step` to this process's local directory,
         asynchronously, in place of the local step before it, and as `save`
         does, a state with arrays in pinned host memory before it returns.
@@ -692,10 +729,11 @@ class Checkpoints:
             state_tree['position'] = jax.tree.map(
                 lambda leaf: jax.device_put(leaf, state.step.sharding), state_tree['position'])
         local = self._open_local()
+        self._metadata = None
         with region("checkpoint.submit_local"):
             local.save(step, args=ocp.args.PyTreeSave(state_tree), force=True,
                        custom_metadata={'processes': jax.process_count(), 'placement': written,
-                                        'ema_deltas': deltas})
+                                        'ema_deltas': deltas, 'rung': rung})
         if _written_in_place(state_tree):
             with region("checkpoint.write_in_place"):
                 local.wait_until_finished()
@@ -712,6 +750,13 @@ class Checkpoints:
             state_tree['position'] = gather_positions(saved, share)
         return state_tree
 
+    def rung(self, step: int) -> JSON:
+        """The fit ladder's rung the state at `step` trained on, as `save`
+        recorded it, from the directory `restore` reads the step from; None
+        for a checkpoint written without one."""
+        checkpointer = self._open_local() if step == self._local_latest() else self._open()
+        return json_value((checkpointer.metadata(step).custom_metadata or {}).get('rung'), 'rung')
+
     def stored(self, step: int | None = None) -> Variables:
         """Return what the checkpoint at `step` holds, without reading its values.
 
@@ -722,12 +767,12 @@ class Checkpoints:
             step = self.latest
             if step is None:
                 raise FileNotFoundError(f"{self.directory} holds no checkpoint")
-        checkpointer = self._open_local() if step == self._local_latest() else self._open()
-        metadata = checkpointer.item_metadata(step)
+        snapshot = self._step_metadata(step, local=step == self._local_latest())
+        metadata = _item_metadata(snapshot)
         stored = {name: None if value is None else
                   jax.tree.map(lambda meta: jax.ShapeDtypeStruct(meta.shape, meta.dtype), value)
                   for name, value in dict(metadata).items()}
-        deltas = _ema_deltas(checkpointer, step, metadata)
+        deltas = _ema_deltas(snapshot)
         if deltas:
             stored['ema'] = jax.tree_util.tree_map_with_path(
                 lambda path, leaf: deltas.get(path, leaf), stored['ema'])
@@ -736,8 +781,7 @@ class Checkpoints:
     def accumulation_template(self, step: int):
         """Return the persisted pending-array shapes, without reading their values."""
         from dew.training.state import Accumulation
-        checkpointer = self._open_local() if step == self._local_latest() else self._open()
-        metadata = checkpointer.item_metadata(step)
+        metadata = _item_metadata(self._step_metadata(step, local=step == self._local_latest()))
         missing = set(STATE_LEAVES).difference(metadata.keys())
         if missing:
             raise ValueError(f"training checkpoint lacks required state fields {sorted(missing)}")
@@ -790,7 +834,8 @@ class Checkpoints:
                 f"so a pool cannot read step {step} as host arrays; restore it with "
                 f"the template of a run placed as it was written, or read the "
                 f"persistent checkpoint at {self.path(step)}")
-        metadata = checkpointer.item_metadata(step)
+        snapshot = self._step_metadata(step, local=from_local)
+        metadata = _item_metadata(snapshot)
         stored = metadata.keys()
         _check_template(template, metadata, stored)
         if template is None:
@@ -804,7 +849,7 @@ class Checkpoints:
                 restore_args=jax.tree.map(lambda _: untyped, dict(metadata))))
             if from_local:
                 restored = jax.tree.map(np.asarray, restored)
-            deltas = _ema_deltas(checkpointer, step, metadata)
+            deltas = _ema_deltas(snapshot)
             if deltas:
                 restored = dict(restored)
                 weights = _by_path(restored['params'])
@@ -818,7 +863,7 @@ class Checkpoints:
                 self._check_placement(step, state_tree)
             targets, deltas = {}, {}
             if state_tree.get('ema') is not None:
-                deltas = _ema_deltas(checkpointer, step, metadata)
+                deltas = _ema_deltas(snapshot)
                 state_tree['ema'], targets = _plane_template(state_tree['ema'], deltas)
             restore_args = jax.tree.map(
                 lambda leaf: ocp.ArrayRestoreArgs(

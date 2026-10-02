@@ -499,7 +499,7 @@ def test_the_streaming_spec_stops_when_its_fetcher_is_gone(monkeypatch):
             next(loader)
 
 
-class Mean(Objective):
+class Ratio(Objective):
     """One scalar fitted to the batch mean: the smallest objective that reads a
     batch, so what is under test is the streaming data path alone."""
 
@@ -514,7 +514,7 @@ class Mean(Objective):
 
 
 def _run(data, *, steps, checkpoints=None, checkpoint_every=None):
-    trainer = Trainer(Mean(), optax.sgd(0.1), key=jax.random.key(0),
+    trainer = Trainer(Ratio(), optax.sgd(0.1), key=jax.random.key(0),
                       mesh=MeshSpec(), layout=Layout(), checkpoints=checkpoints)
     return trainer.fit(data, steps=steps, log_every=steps, eval_every=None,
                        checkpoint_every=checkpoint_every)

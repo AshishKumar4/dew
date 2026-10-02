@@ -158,6 +158,25 @@ def test_real_trainer_update_and_checkpoint_resume(source, tmp_path):
     assert int(resumed.updates) == 2
 
 
+def test_fresh_diffusion_gemma_sft_initializes_and_trains_its_vision_parameters():
+    directory = FIXTURE.parent / "diffusion-gemma-workflow"
+    source = load_pretrained(directory, dtype="float32", attention_impl="xla", max_seq_len=32)
+    objective = BlockDiffusionObjective(source.model, prompt_length=8, pad_token_id=0)
+    parameters = jax.jit(objective.init)(jax.random.key(0))
+    with np.load(directory / "reference.npz") as reference:
+        pixels = reference["pixels"]
+    tokens = jnp.asarray([[2, 60, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]] * 2)
+    inputs = ModelInputs(tokens, {"image_indices": jnp.where(tokens == 60, 0, -1)},
+                         {"pixel_values": jnp.asarray(pixels)})
+    step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=None)
+    loss, gradient = jax.jit(jax.value_and_grad(lambda params: scalar_loss(
+        objective, params, {"text": inputs}, step)[0]))(parameters)
+    assert np.isfinite(loss)
+    assert all(np.isfinite(value).all() for value in jax.tree.leaves(gradient))
+    assert max(float(jnp.linalg.norm(leaf)) for leaf in jax.tree.leaves(
+        gradient["params"]["conditioner"])) > 1e-6
+
+
 @pytest.fixture(scope="module")
 def image_source():
     """Native SFT behavior over the real loaded multimodal generation fixture."""

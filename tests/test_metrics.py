@@ -44,6 +44,90 @@ INCEPTION_TINY = (Path(__file__).resolve().parent / "fixtures" / "inception" / "
                   / "inception_v3_fid.safetensors")
 
 
+def test_mean_metric_counts_uneven_batches_and_weighted_totals():
+    from dew.eval import Mean
+
+    artifact = ImageGrid(np.zeros((1, 1, 1, 1), np.float32))
+    metric = Mean(lambda artifact, batch: batch["values"], name="score", better="higher", reads=ImageGrid)
+    first = metric(artifact, {"values": np.asarray([1., 3.])})
+    last = metric(artifact, {"values": np.asarray([8.])})
+    assert metric.finalize(metric.merge(first, last)) == 4.
+    assert metric.shown.better == "higher" and metric.reads is ImageGrid
+    weighted = Mean(lambda artifact, batch: batch["totals"], name="weighted", better="lower", reads=ImageGrid)
+    assert weighted.finalize(weighted.merge(weighted(artifact, {"totals": (12., 3.)}),
+                                             weighted(artifact, {"totals": (8., 1.)}))) == 5.
+    with pytest.raises(ValueError, match="count"):
+        weighted.finalize((0., 0.))
+    with pytest.raises(ValueError, match="per-example"):
+        metric(artifact, {"values": np.asarray(4.)})
+
+
+def test_mean_metric_requires_a_direction_and_keeps_no_pass_state():
+    from dew import Mean
+
+    artifact = ImageGrid(np.zeros((1, 1, 1, 1), np.float32))
+    with pytest.raises(TypeError, match="better"):
+        Mean(lambda artifact, batch: batch["values"], name="accuracy", reads=ImageGrid)
+    with pytest.raises(TypeError, match="reads"):
+        Mean(lambda artifact, batch: batch["values"], name="accuracy", better="higher")
+    with pytest.raises(ValueError, match="unprefixed"):
+        Mean(lambda artifact, batch: batch["values"], name="val/accuracy", better="higher", reads=ImageGrid)
+    metric = Mean(lambda artifact, batch: batch["values"], name="score", better="higher", reads=ImageGrid)
+    assert metric.finalize(metric(artifact, {"values": [1., 3.]})) == 2.
+    assert metric.finalize(metric(artifact, {"values": [10.]})) == 10.
+    with pytest.raises(TypeError, match="reads ImageGrid"):
+        metric(None, {"values": [10.]})
+
+
+def test_mean_lm_accuracy_matches_the_full_forward_after_a_real_fit():
+    from dew import Mean, Trainer, models
+    from dew.artifacts import TokenScores
+    from dew.data import Dataset
+    from dew.objectives.lm import LMObjective
+    import optax
+
+    tokens = np.tile(np.asarray([[0, 1, 2, 3, 0]], np.int32), (8, 1))
+    data = Dataset(train=lambda partition: iter([{"text": tokens}] * 4),
+                   val=lambda partition: iter([{"text": tokens}]), records=32, batch=8)
+    model = models.build("causal_transformer", vocab_size=4, emb_features=8, num_layers=1,
+                         num_heads=2, mlp_features=16, max_seq_len=4, attention_impl="reference")
+    objective = LMObjective(model, seq_len=4, ema_decay=None)
+    metric = Mean(lambda scores, batch: (np.sum(scores.correct * scores.weights), np.sum(scores.weights)),
+                  reads=TokenScores, name="accuracy", better="higher")
+    trainer = Trainer(objective, optax.adam(.05), key=jax.random.key(0))
+    final = trainer.fit(data, steps=4, log_every=1, eval_every=1, metrics=[metric])
+    logits = model.apply(final.params, jnp.asarray(tokens[:, :-1]), train=False)
+    expected = float(jnp.mean(jnp.argmax(logits, axis=-1) == tokens[:, 1:]))
+    assert trainer._display.evaluations["val"][-1].scores["val/accuracy"] == expected
+
+
+def test_mean_image_error_matches_each_real_row_after_a_fit():
+    from dew import Mean, Trainer
+    from dew.data import Dataset
+    from dew.objectives.base import Aux, Objective
+    import optax
+
+    class Pixels(Objective):
+        def init(self, key, variables=None):
+            return {"params": {"value": jnp.asarray(0., jnp.float32)}}
+
+        def loss(self, params, batch, step):
+            return jnp.mean((params["params"]["value"] - batch["images"]) ** 2), Aux({})
+
+        def evaluate(self, params, batch, step):
+            return ImageGrid(jnp.broadcast_to(params["params"]["value"], batch["images"].shape))
+
+    images = np.full((8, 2, 2, 1), .5, np.float32)
+    data = Dataset(train=lambda partition: iter([{"images": images}] * 4),
+                   val=lambda partition: iter([{"images": images}]), records=32, batch=8)
+    metric = Mean(lambda grid, batch: np.square(grid.images - batch["images"]).mean(axis=(1, 2, 3)),
+                  reads=ImageGrid, name="pixel_error", better="lower")
+    trainer = Trainer(Pixels(), optax.sgd(.1), key=jax.random.key(0))
+    final = trainer.fit(data, steps=4, log_every=1, eval_every=1, metrics=[metric])
+    expected = float((final.params["params"]["value"] - .5) ** 2)
+    assert trainer._display.evaluations["val"][-1].scores["val/pixel_error"] == pytest.approx(expected)
+
+
 def test_frechet_distance_of_a_distribution_with_itself_is_zero(rng):
     features = np.asarray(jax.random.normal(rng, (256, 16)))
     mu, sigma = features.mean(axis=0), np.cov(features, rowvar=False)

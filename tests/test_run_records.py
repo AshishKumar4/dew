@@ -22,7 +22,7 @@ import pytest
 from flax import linen as nn
 
 from dew import registry
-from dew.config import RunConfig, _recorded, _registry_for, _to_json
+from dew.config import RunConfig, TrainerConfig, _FIELD_RENAMES, _recorded, _registry_for, _to_json
 from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder
 from dew.objectives.lm.config import LMRunConfig
 from dew.training.quantization import Quantization
@@ -33,7 +33,20 @@ DEFAULTS = ROOT / "tests" / "fixtures" / "record_defaults.json"
 
 
 def record(name: str) -> dict:
-    return json.loads((RUNS / name / "run.json").read_text())
+    held = json.loads((RUNS / name / "run.json").read_text())
+    for old, new in _FIELD_RENAMES.get(TrainerConfig, {}).items():
+        if old in held.get("trainer", {}):
+            held["trainer"][new] = held["trainer"].pop(old)
+    return held
+
+
+def test_old_seed_record_reads_as_the_same_integer_root_key():
+    loaded = RunConfig.from_dict({"trainer": {"seed": 23}})
+    assert loaded.trainer.key == 23
+    assert loaded.to_dict()["trainer"]["key"] == 23
+    assert "seed" not in loaded.to_dict()["trainer"]
+    with pytest.raises(ValueError, match="both seed and key"):
+        RunConfig.from_dict({"trainer": {"seed": 23, "key": 23}})
 
 
 def recipe_config(name: str, cls: str) -> type:
@@ -109,15 +122,17 @@ def snapshot_default(field: dataclasses.Field, annotation):
 
 def recorded_defaults() -> dict[str, dict[str, object]]:
     """Every config class a run record reaches, from each run config Dew and
-    its recipes declare, and every registered model, whose fields a record
-    holds only where the run set them (`ModelConfig.config`), by module path:
+    its recipes declare, and every registered model, tower and projector,
+    whose fields a record holds only where the run set them, by module path:
     each recorded field's default as `snapshot_default` holds it. Flax's own
     `parent` and `name` are not a model's configuration."""
     import dew.nn.backbones  # noqa: F401  registers every model
 
     roots = [RunConfig, DiffusionRunConfig, LMRunConfig,
              recipe_config("lm", "LmRunConfig"), recipe_config("jepa", "JepaRunConfig"),
-             *(model for model in registry.models.values() if isinstance(model, type))]
+             *(model for model in registry.models.values() if isinstance(model, type)),
+             *(tower for tower in registry.towers.values() if isinstance(tower, type)),
+             *(projector for projector in registry.projectors.values() if isinstance(projector, type))]
     found: dict[str, dict[str, object]] = {}
     pending = list(roots)
     while pending:
@@ -174,6 +189,15 @@ def test_a_changed_model_default_fails_the_snapshot(monkeypatch):
     field = next(field for field in dataclasses.fields(SimpleDiT) if field.name == "mlp_ratio")
     monkeypatch.setattr(field, "default", field.default + 1)
     with pytest.raises(AssertionError, match=r"SimpleDiT.mlp_ratio"):
+        test_every_recorded_default_is_the_one_older_runs_were_recorded_under()
+
+
+def test_a_changed_tower_default_fails_the_snapshot(monkeypatch):
+    from dew.nn.vision import Gemma4Vision
+
+    field = next(field for field in dataclasses.fields(Gemma4Vision) if field.name == 'head_dim')
+    monkeypatch.setattr(field, 'default', 64)
+    with pytest.raises(AssertionError, match=r'Gemma4Vision.head_dim'):
         test_every_recorded_default_is_the_one_older_runs_were_recorded_under()
 
 

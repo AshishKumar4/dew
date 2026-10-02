@@ -27,6 +27,7 @@ import numpy as np
 from flax import linen as nn
 
 from dew import records
+from dew._model_types import _QWEN35_TEXT_TYPES, _QWEN35_TYPES
 from dew.artifacts import agreed
 from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import Origin, SourceSchedule
@@ -304,11 +305,12 @@ class Processor:
             raise ValueError("video_position_ids require the Gemma4 visual tower")
         conditioning: dict[str, jax.Array] = {}
         if "pixel_values" in values or "pixel_values_videos" in values:
-            if "pixel_values_videos" in values and self.config.get("model_type") not in ("qwen3_5", "gemma4"):
+            if ("pixel_values_videos" in values
+                    and self.config.get("model_type") not in (*_QWEN35_TYPES, "gemma4")):
                 raise ValueError("video patch inputs require a Qwen3.5 or Gemma4 visual tower")
             image_fields, conditioning = self._images(values, tokens)
             token_fields.update(image_fields)
-            if self.config.get("model_type") == "qwen3_5":
+            if self.config.get("model_type") in _QWEN35_TYPES:
                 token_fields["rotary_positions"] = self._image_rotary_positions(
                     tokens, valid, image_fields["image_groups"], conditioning["image_grid_thw"])
         if ("input_features" in values) != ("input_features_mask" in values):
@@ -340,7 +342,7 @@ class Processor:
         image_id = self.record.get("image_token_id", self.config.get("image_token_id"))
         if type(image_id) is not int:
             raise ValueError("image_token_id must be an integer")
-        qwen = self.config.get("model_type") == "qwen3_5"
+        qwen = self.config.get("model_type") in _QWEN35_TYPES
         gemma = self.config.get("model_type") == "gemma4"
         video_id = (self.config.get("video_token_id", 258884) if gemma else
                     self.config.get("video_token_id") if qwen else None)
@@ -761,11 +763,13 @@ def _language_layout(name: str, text_name: str, tensor: np.ndarray,
                      config, model_type: str, variables: Mapping[str, object],
                      component: str | None = None) -> WeightLayout | None:
     """Return the text family's leaf map plus its inverse storage operations."""
-    family = decoders._FAMILIES[model_type]
+    family = decoders.families()[model_type]
     # A family whose checkpoint packs its experts as `[E, out, in]`
     # (`_gemma4_prepare` swaps them into dew's `[E, in, out]`) writes them
     # back swapped.
-    packed = family.prepare_weights is decoders._gemma4_prepare
+    from dew.interop.families.gemma import _gemma4_prepare
+
+    packed = family.prepare_weights is _gemma4_prepare
 
     def nested(path: tuple[str, ...]) -> tuple[str, ...]:
         return path if component is None else (path[0], component, *path[1:])
@@ -1039,7 +1043,7 @@ class Pretrained:
         if self.export_adapter is not None:
             tensors = self.export_adapter(self.model, values, self.config)
         elif (isinstance(self.model, CausalTransformer) and isinstance(family, str)
-              and not decoders._FAMILIES.get(family, decoders._FAMILIES[verify.CONVENTION]).preserve_source_layout
+              and not decoders.families().get(family, decoders.families()[verify.CONVENTION]).preserve_source_layout
               and quantization is None):
             # The decoder export's own encoder, so this and `save_pretrained_decoder`
             # leave the same weights. A quantized source keeps its packed format
@@ -1757,7 +1761,7 @@ def _qwen_text_path(record: decoders.DecoderFields):
     """Map a Qwen3-VL checkpoint's tensors: its language model as the Qwen3
     decoder's, its head too, and its vision tower held as stored, which the
     text-to-image prompt never reads and an export writes back."""
-    family = decoders._FAMILIES["qwen3"]
+    family = decoders.families()["qwen3"]
 
     def path(name: str) -> tuple[str, ...] | None:
         if name.startswith("model.language_model."):
@@ -1842,7 +1846,7 @@ def _hidden_states_path(record: decoders.DecoderFields, family: str, multimodal:
     language model `language_model.model.` and its head
     `language_model.lm_head` (transformers 4.50 and 5 write these), or
     `model.language_model.` and `lm_head` (4.52 to 4.57)."""
-    decoder = decoders._FAMILIES[family]
+    decoder = decoders.families()[family]
 
     def path(name: str) -> tuple[str, ...] | None:
         if not multimodal or name == "lm_head.weight":
@@ -2010,7 +2014,7 @@ def _wrapper_text_fields(config: Mapping[str, object], record: decoders.WrapperF
             "mixer": {"kind": "attention", "bidirectional_images": True}}
         kinds["sliding_attention"] = sliding
         text_fields["kinds"] = kinds
-    if family == "qwen3_5":
+    if family in _QWEN35_TYPES:
         rope = records.record(text_config.get("rope_parameters") or {}, "rope_parameters")
         sections = rope.get("mrope_section", [11, 11, 10])
         if (not isinstance(sections, (list, tuple)) or len(sections) != 3
@@ -2263,6 +2267,13 @@ def _wrapper_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
     """A multimodal wrapper: the decoder under its text_config and the towers beside it."""
     record = decoders.translate_wrapper_config(config)
     text_fields = _wrapper_text_fields(config, record, max_seq_len)
+    # The Transformers conditional classes ignore auxiliary prediction
+    # layers. A released config advertises a depth even when its checkpoint
+    # contains only the trunk; a source with mtp.* retains its actual depth.
+    if (record['text_model_type'] in _QWEN35_TEXT_TYPES
+            and not any(name.startswith(('mtp.', 'model.mtp.')) for name in tensors)):
+        text_fields['num_nextn_predict_layers'] = 0
+        record['text']['num_nextn_predict_layers'] = 0
     text: decoders.DecoderFields = {**text_fields, **precision_fields(
         "causal_transformer", text_fields, dtype=dtype, attention_impl=attention_impl)}
     wrapper: decoders.WrapperFields = {**record, "text": text}
@@ -2301,7 +2312,7 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
     # preserve_source_layout and quantization, not by whether bindings exist.
     # A family whose tensors are rewritten before the path map reads them
     # (Gemma 4's prepare) has no raw-name bindings.
-    entry = decoders._FAMILIES[family]
+    entry = decoders.families()[family]
     layouts, retained = ((), {})
     if entry.preserve_source_layout or entry.prepare_weights is decoders.DecoderFamily.prepare_weights:
         layouts, retained = _decoder_layouts(tensors, record, family, variables)
@@ -2389,7 +2400,7 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
     source_quantization(config)
     # An unregistered decoder is checked against transformers on the config
     # alone, before its weights download (tier 2, dew.interop.verify).
-    verified = (verify.verify_mapping(config) if isinstance(family, str) and family not in decoders._FAMILIES
+    verified = (verify.verify_mapping(config) if isinstance(family, str) and family not in decoders.families()
                 and family != "diffusion_gemma" and "text_config" not in config else None)
     if tensors is None:
         directory = sources.snapshot(str(name_or_dir), directory.name)
@@ -2407,7 +2418,7 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
         record, layouts, retained = config, (), {}
         built: Mapping[str, object] = {**config, "dtype": dtype, "attention_impl": attention_impl}
         export_adapter = diffusion_gemma.export_weights
-    elif "text_config" in config and (family not in decoders._FAMILIES or decoders._bundles(config)):
+    elif "text_config" in config and (family not in decoders.families() or decoders._bundles(config)):
         # A wrapper repo carries its decoder under text_config. Where its
         # model_type is a registered decoder family, its towers have no
         # counterpart and the text half, read from the nested config, is the

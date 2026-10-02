@@ -45,6 +45,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.typing import DTypeLike
 
 from dew import records
+from dew._model_types import _QWEN35_VISION_TYPES
 from dew.nn.attention import LayerNorm, RMSNorm, scaled_dot_product_attention
 from dew.nn.conv import Conv
 from dew.nn.precision import at_least_fp32
@@ -636,15 +637,21 @@ class Gemma4VisionAttention(nn.Module):
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     use_clipped_linears: bool = False
+    head_dim: int | None = None
+
+    @property
+    def features_per_head(self) -> int:
+        return self.hidden_size // self.num_heads if self.head_dim is None else self.head_dim
 
     def setup(self):
         dense = functools.partial(Gemma4ClippableLinear, use_bias=False,
                                   use_clipped_linears=self.use_clipped_linears,
                                   dtype=self.dtype, precision=self.precision)
-        self.q_proj = dense(self.hidden_size, name="q_proj")
-        self.k_proj = dense(self.num_key_value_heads * (self.hidden_size // self.num_heads),
+        head_dim = self.features_per_head
+        self.q_proj = dense(self.num_heads * head_dim, name="q_proj")
+        self.k_proj = dense(self.num_key_value_heads * head_dim,
                             name="k_proj")
-        self.v_proj = dense(self.num_key_value_heads * (self.hidden_size // self.num_heads),
+        self.v_proj = dense(self.num_key_value_heads * head_dim,
                             name="v_proj")
         self.o_proj = dense(self.hidden_size, name="o_proj")
         self.q_norm = RMSNorm(epsilon=self.rms_norm_eps, dtype=self.dtype, name="q_norm")
@@ -654,7 +661,7 @@ class Gemma4VisionAttention(nn.Module):
 
     def __call__(self, hidden_states, cos, sin, valid=None) -> jax.Array:
         batch, length, _ = hidden_states.shape
-        head_dim = self.hidden_size // self.num_heads
+        head_dim = self.features_per_head
         # The norms read the heads (modeling_gemma4.py,
         # Gemma4VisionAttention.forward): project, split, then normalize.
         query = self.q_norm(self.q_proj(hidden_states).reshape(batch, length, -1, head_dim))
@@ -670,7 +677,7 @@ class Gemma4VisionAttention(nn.Module):
             scores = jnp.where(valid[:, None, None, :], scores, jnp.finfo(scores.dtype).min)
         probs = jax.nn.softmax(scores.astype(jnp.float32), axis=-1).astype(query.dtype)
         attended = jnp.einsum("bhqk,bkhd->bqhd", probs, value, precision=self.precision)
-        return self.o_proj(attended.reshape(batch, length, self.hidden_size))
+        return self.o_proj(attended.reshape(batch, length, self.num_heads * head_dim))
 
 
 class Gemma4VisionMLP(nn.Module):
@@ -724,12 +731,14 @@ class Gemma4VisionEncoderLayer(nn.Module):
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     use_clipped_linears: bool = False
+    head_dim: int | None = None
 
     def setup(self):
         norm = functools.partial(RMSNorm, epsilon=self.rms_norm_eps, dtype=self.dtype)
         self.input_layernorm = norm(name="input_layernorm")
         self.self_attn = Gemma4VisionAttention(
             self.hidden_size, self.num_heads, self.num_key_value_heads,
+            head_dim=self.head_dim,
             rms_norm_eps=self.rms_norm_eps,
             dtype=self.dtype, precision=self.precision,
             use_clipped_linears=self.use_clipped_linears, name="self_attn")
@@ -774,15 +783,17 @@ class Gemma4VisionTransformer(nn.Module):
     precision: PrecisionLike = None
     standardize: bool = False
     use_clipped_linears: bool = False
+    head_dim: int | None = None
 
     def setup(self):
-        if self.hidden_size % self.num_heads:
+        if self.head_dim is None and self.hidden_size % self.num_heads:
             raise ValueError(
                 f"hidden_size ({self.hidden_size}) must split over num_heads "
                 f"({self.num_heads})")
-        if self.hidden_size // self.num_heads % 4:
+        head_dim = self.hidden_size // self.num_heads if self.head_dim is None else self.head_dim
+        if head_dim <= 0 or head_dim % 4:
             raise ValueError(
-                f"the head width ({self.hidden_size // self.num_heads}) must split "
+                f"the head width ({head_dim}) must split "
                 "over the two rotary dims and their halves")
         if self.num_heads % self.num_key_value_heads:
             raise ValueError(
@@ -798,6 +809,7 @@ class Gemma4VisionTransformer(nn.Module):
             Gemma4VisionEncoderLayer(
                 self.hidden_size, self.intermediate_size, self.num_heads,
                 self.num_key_value_heads, self.hidden_act,
+                head_dim=self.head_dim,
                 rms_norm_eps=self.rms_norm_eps,
                 dtype=self.dtype, precision=self.precision,
                 use_clipped_linears=self.use_clipped_linears, name=f"layers_{index}")
@@ -836,7 +848,8 @@ class Gemma4VisionTransformer(nn.Module):
         table = jnp.asarray(self.position_table, hidden_states.dtype)
         positional = table[0, safe[..., 0]] + table[1, safe[..., 1]]
         hidden_states = hidden_states + jnp.where(valid[..., None], positional, 0)
-        cos, sin = _gemma4_rope_tables(pixel_position_ids, self.hidden_size // self.num_heads, self.rope_theta,
+        head_dim = self.head_dim or self.hidden_size // self.num_heads
+        cos, sin = _gemma4_rope_tables(pixel_position_ids, head_dim, self.rope_theta,
                                        dtype=at_least_fp32(hidden_states.dtype))
         for layer in self.layers:
             hidden_states = layer(hidden_states, cos, sin, valid)
@@ -871,6 +884,8 @@ class Gemma4Vision(TowerBase):
     rope_theta: float = 100.0
     standardize: bool = False
     use_clipped_linears: bool = False
+    head_dim: int | None = None
+    """None retains hidden_size // num_heads; checkpoints may project a wider head."""
 
     def build(self) -> nn.Module:
         return Gemma4VisionTransformer(
@@ -881,7 +896,7 @@ class Gemma4Vision(TowerBase):
             position_embedding_size=self.position_embedding_size,
             hidden_act=self.hidden_act, rms_norm_eps=self.rms_norm_eps,
             rope_theta=self.rope_theta, standardize=self.standardize,
-            use_clipped_linears=self.use_clipped_linears)
+            use_clipped_linears=self.use_clipped_linears, head_dim=self.head_dim)
 
     def geometry(self) -> TowerGeometry:
         return TowerGeometry(patch_size=self.patch_size, block_size=self.pooling_kernel_size)
@@ -1707,18 +1722,17 @@ def translate_gemma4_vision_config(hf_config: Mapping[str, object]) -> Mapping[s
     """A Gemma4VisionConfig into a Gemma4Vision value's fields.
 
     Reads the vision_config of a wrapper or a bare vision config. The head
-    width derives from the hidden size and the head count; a config carrying
-    any other width refuses. Standardization and activation clipping retain
+    width comes from head_dim or the hidden size divided by the head count.
+    Standardization and activation clipping retain
     their reference buffers outside the trainable parameter collection.
     """
     vision = _vision_section(hf_config)
     hidden = records.integer(vision["hidden_size"], "hidden_size")
     heads = records.integer(vision["num_attention_heads"], "num_attention_heads")
     head_dim = vision.get("head_dim", hidden // heads)
-    if records.integer(head_dim, "head_dim") != hidden // heads or hidden % heads:
+    if records.integer(head_dim, "head_dim") <= 0 or records.integer(head_dim, "head_dim") % 4:
         raise ValueError(
-            f"head_dim ({head_dim}) is not hidden_size ({hidden}) over "
-            f"num_attention_heads ({heads}), the width this trunk derives")
+            f"head_dim ({head_dim}) must split into the two rotary dimensions and their halves")
     activation = str(vision.get("hidden_activation", vision.get("hidden_act",
                                                                 "gelu_pytorch_tanh")))
     if activation not in ("gelu_pytorch_tanh", "gelu"):
@@ -1745,6 +1759,7 @@ def translate_gemma4_vision_config(hf_config: Mapping[str, object]) -> Mapping[s
         "num_layers": records.integer(vision["num_hidden_layers"], "num_hidden_layers"),
         "num_heads": heads,
         "num_key_value_heads": records.integer(vision.get("num_key_value_heads", heads), "num_key_value_heads"),
+        "head_dim": records.integer(head_dim, "head_dim"),
         "patch_size": records.integer(vision.get("patch_size", 16), "patch_size"),
         "pooling_kernel_size": records.integer(vision.get("pooling_kernel_size", 3), "pooling_kernel_size"),
         "position_embedding_size": records.integer(vision.get("position_embedding_size", 10240), "position_embedding_size"),
@@ -1837,7 +1852,7 @@ def translate_qwen35_vision_config(hf_config: Mapping[str, object]) -> Mapping[s
     must be square, and the activation one the shared MLP runs.
     """
     vision = _vision_section(hf_config)
-    if vision.get("model_type", "qwen3_5_vision") not in ("qwen3_5_vision", "qwen3_5"):
+    if vision.get("model_type", "qwen3_5_vision") not in _QWEN35_VISION_TYPES:
         raise ValueError(
             f"vision model_type {vision.get('model_type')!r} is not the Qwen 3.5 tower")
     table = records.integer(vision["num_position_embeddings"], "num_position_embeddings")

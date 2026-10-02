@@ -1,0 +1,18 @@
+{
+  "axes": {
+    "data": 1,
+    "expert": 1,
+    "fsdp": 2,
+    "tensor": 2,
+    "sequence": 1,
+    "stage": 1
+  },
+  "devices": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "backend": "cpu",
+  "training": false
+}

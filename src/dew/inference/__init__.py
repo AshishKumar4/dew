@@ -2,7 +2,7 @@
 
 from dew.sampling.pipelines import DenoisingInputs, Images, TextToImage
 
-from .banks import CheckpointBanks, HeldBanks, LayerBanks, host_banked
+from .banks import CheckpointBanks, HeldBanks, LayerBanks, SafetensorsBanks, host_banked, stream_banked
 from .clients import Completion, OllamaCompletion, OpenAICompletion, Usage
 from .nccl import NCCLPush
 from .pipeline import RunProcessor, pipeline
@@ -21,5 +21,5 @@ from .tasks import BlockGeneration, MaskedGeneration, Processor, TextGeneration
 __all__ = ["BlockGeneration", "CheckpointBanks", "Completion", "DenoisingInputs", "Draw", "HeldBanks",
            "Images", "LayerBanks", "MaskedGeneration", "NCCLPush", "NativeRolloutServer", "OllamaCompletion",
            "OpenAICompletion", "OpenAIRolloutServer", "Processor", "Publication", "RolloutServer", "RunProcessor",
-           "SafetensorsReload", "Server", "TextGeneration", "TextToImage", "Usage", "VLLMGenerateServer", "host_banked",
-           "pipeline"]
+           "SafetensorsBanks", "SafetensorsReload", "Server", "TextGeneration", "TextToImage", "Usage",
+           "VLLMGenerateServer", "host_banked", "pipeline", "stream_banked"]

@@ -62,17 +62,19 @@ variables as arguments instead of compiling them in as constants. A plain
 function is not one of these; `jax.jit` cannot take it as an argument."""
 
 @struct.dataclass
-class Mean:
-    """Carry a scalar sum together with the mass it is averaged over.
+class Ratio:
+    """Keep a numerator and its denominator apart until the reduction.
 
-    The mass is nonnegative and does not depend on the parameters. Zero
+    They sum across microbatches and devices before mean_loss divides.
+
+    The denominator (mass) is nonnegative and does not depend on the parameters. Zero
     mass declares a zero numerator and no contribution.
     """
     total: jax.Array
     mass: jax.Array
 
 
-def mean_loss(stats: Mean) -> tuple[jax.Array, jax.Array]:
+def mean_loss(stats: Ratio) -> tuple[jax.Array, jax.Array]:
     """Reduce a shared-denominator estimator, including empty support."""
     mass = jax.lax.stop_gradient(stats.mass)
     active = mass > 0
@@ -81,7 +83,7 @@ def mean_loss(stats: Mean) -> tuple[jax.Array, jax.Array]:
     return jnp.where(active, value, 0), active
 
 
-Loss = TypeVar("Loss", default=Mean | jax.Array | float)
+Loss = TypeVar("Loss", default=Ratio | jax.Array | float)
 Effects = TypeVar("Effects", default=None)
 
 
@@ -307,14 +309,14 @@ class Objective(ABC, Generic[Loss, Effects]):
     def loss(self, params: Variables, batch: Batch, step: Step) -> tuple[Loss, Aux[Effects]]:
         """Additive loss statistics and the reports from one realized batch.
 
-        Mean declares a shared normalization mass. A plain scalar is one
+        Ratio declares a shared normalization mass. A plain scalar is one
         unit-mass term. Composite statistics are objective-owned Flax PyTrees;
         their leaves add across records before reduce_loss is evaluated.
         """
 
     def reduce_loss(self, stats: Loss) -> tuple[jax.Array, jax.Array]:
         """The objective value and whether its statistical support is active."""
-        if isinstance(stats, Mean):
+        if isinstance(stats, Ratio):
             return mean_loss(stats)
         if isinstance(stats, (jax.Array, float, int)):
             value = jnp.asarray(stats)
@@ -324,12 +326,13 @@ class Objective(ABC, Generic[Loss, Effects]):
             return value, jnp.asarray(True)
         raise TypeError("custom loss statistics require Objective.reduce_loss")
 
-    def tile_head(self) -> str | None:
+    def tile_head(self, tile: tuple[int, int] | None = None) -> str | None:
         """Move a head that holds its whole logits for the backward to a
-        bounded tile and say what it moved to, or None when there was nothing
-        to move: the fit ladder's first rung
-        (`dew.training.trainer.recompute_more`), which logs it. An objective
-        with no such head has nothing to move."""
+        bounded tile, `tile` or the objective's own, and say what it moved
+        to, or None when there was nothing to move: the fit ladder's first
+        rung (`dew.training.trainer.recompute_more`), which logs it, and the
+        rung a resumed run takes back. An objective with no such head has
+        nothing to move."""
         return None
 
     def apply_effects(self, variables: Variables, effects: Effects) -> Variables:
@@ -337,12 +340,12 @@ class Objective(ABC, Generic[Loss, Effects]):
         raise TypeError("deferred effects require Objective.apply_effects")
 
     def predict(self, params: Variables, batch: Batch, step: Step, *, train: bool,
-                layers: Sequence[int] = ()) -> tuple[Mean, Aux[Effects], Prediction]:
+                layers: Sequence[int] = ()) -> tuple[Ratio, Aux[Effects], Prediction]:
         """The loss over `batch` as `loss` computes it, with the prediction
         behind it: the statistics, the reports, and the token logits with the
         weight of every position and the hidden states of `layers`.
 
-        The statistics are one `Mean` over the positions the weights count,
+        The statistics are one `Ratio` over the positions the weights count,
         so a distillation can mix in terms over the same mass. `train` gates
         dropout the way `loss` has it on; a frozen teacher scores with it
         off. Objectives that score no token logits raise.

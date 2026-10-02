@@ -8,10 +8,10 @@ defaults to FP32, independently of compute dtype, so dew.interop.load_pretrained
 builds a model whose variables a forward pass takes straight away, and
 save_pretrained_decoder writes one back out in the HF layout.
 
-Each family is one `DecoderFamily` entry in `_FAMILY_ENTRIES`, keyed by its
+Each family is one `DecoderFamily` entry in `decoder_families.ENTRIES`, keyed by its
 model_type: the config translation, the tensor path rule and the export
-vocabulary. `_FAMILY_ENTRIES` at the bottom of this file is the list of
-covered families; read it rather than a copy of it here.
+vocabulary. `family_entries()` loads that table on first use; read it for the
+covered families rather than a copy here.
 
 A multimodal wrapper config raises a ValueError naming its model_type.
 DeepSeek's released checkpoints carry `num_nextn_predict_layers: 1` with no
@@ -21,11 +21,11 @@ raises a ValueError naming it.
 """
 
 import dataclasses
+import functools
 import json
 import operator
 import os
 from dataclasses import asdict, dataclass, field
-from functools import partial
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -47,7 +47,7 @@ from flax.traverse_util import flatten_dict
 from flax.typing import Dtype, PrecisionLike
 
 from dew import records
-from dew.interop import mamba2
+from dew._model_types import _QWEN35_TEXT_TYPES, _QWEN35_TYPES
 from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors
 
 if TYPE_CHECKING:
@@ -57,15 +57,8 @@ from dew.nn import audio as audio_nn, vision as vision_nn
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture, RematPolicy
 from dew.nn.backbones.layer_plan import LayerKind
-from dew.nn.deepseek_v4 import DeepseekV4Mixer
-from dew.nn.dsa_kpool import KPoolSparseAttentionMixer
-from dew.nn.kda import KimiDeltaAttentionMixer
 from dew.nn.kv_cache import KVCache
-from dew.nn.llama4 import Llama4Mixer
 from dew.nn.mixers import AttentionMixer, MixerBase
-from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
-from dew.nn.mixers.mamba2 import Mamba2Mixer
-from dew.nn.mla import MLAMixer
 from dew.nn.moe import GatedActivation, Situ
 from dew.nn.text_encoders import check_tree, checkpoint_dtype, insert
 from dew.objectives.base import Variables
@@ -895,7 +888,7 @@ def translate_config(hf_config: Mapping[str, object]) -> DecoderFields:
     # whole model and whose text_config holds the decoder;
     # translate_wrapper_config reads the wrappers that load. A wrapper whose
     # own model_type is a registered family (kimi_k25) is read here instead.
-    if model_type not in _FAMILIES and 'text_config' in hf_config:
+    if model_type not in families() and 'text_config' in hf_config:
         # google/gemma-4-E2B is one of these. The decoder is real and its
         # text_config translates, but the repo is a multimodal model whose
         # weights sit under model.language_model.* beside vision and audio
@@ -907,10 +900,10 @@ def translate_config(hf_config: Mapping[str, object]) -> DecoderFields:
                 "no counterpart here; its decoder is the text_config, which "
                 "translates on its own, and its weights are the "
                 "model.language_model.* half of the checkpoint")
-    if model_type not in _FAMILIES:
+    if model_type not in families():
         _refuse(f"model_type {model_type!r}",
-                f"expected one of {', '.join(repr(name) for name in _FAMILIES)}")
-    config, unknown = _translated(hf_config, _FAMILIES[records.text(model_type, 'model_type')])
+                f"expected one of {', '.join(repr(name) for name in families())}")
+    config, unknown = _translated(hf_config, families()[records.text(model_type, 'model_type')])
     if unknown:
         _refuse(f"config fields {sorted(unknown)}",
                 "CausalTransformer has no counterpart, so translating them "
@@ -943,17 +936,22 @@ def _translated(hf_config: Mapping[str, object], family: "DecoderFamily") -> tup
     return config, unknown
 
 
-def _wrapper_text(hf_config: Mapping[str, object], used: set) -> DecoderFields:
+def _wrapper_text(hf_config: Mapping[str, object], used: set, *,
+                  declared_type: str | None = None) -> DecoderFields:
     """Translate the wrapper's text_config as the decoder it is."""
     text = hf_config.get("text_config")
     if not isinstance(text, Mapping):
         _refuse("text_config",
                 f"a wrapper carries its decoder under text_config, got {text!r}")
     used.add("text_config")
+    if declared_type is not None and 'model_type' not in text:
+        # The wrapper config class supplies its declared nested class when
+        # reading a raw dict. Checkpoint copies need not repeat that tag.
+        text = {**text, 'model_type': declared_type}
     if hf_config.get("model_type") != "llama4":
         # These conditional models own their lm_head at wrapper scope; the
         # nested text model has no head. Llama4 nests a complete causal LM.
-        default_tied = hf_config.get("model_type") != "qwen3_5"
+        default_tied = hf_config.get("model_type") not in _QWEN35_TYPES
         tied = hf_config.get("tie_word_embeddings", default_tied)
         if tied is not None and not isinstance(tied, bool):
             _refuse("tie_word_embeddings", "the wrapper head takes a boolean tying policy")
@@ -1081,7 +1079,7 @@ def _wrapper_audio(hf_config: Mapping[str, object], used: set, text_width: int) 
 
 def _gemma4_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields:
     """Read a Gemma 4 wrapper: 2D-table tower, position pooler, embedder, decoder."""
-    text = _wrapper_text(hf_config, used)
+    text = _wrapper_text(hf_config, used, declared_type='gemma4_text')
     tower = vision_nn.translate_gemma4_vision_config(hf_config)
     used.add("vision_config")
     projector = vision_nn.translate_gemma4_projector_config(
@@ -1121,8 +1119,8 @@ def _qwen35_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     # and the record leaves it open the way the Gemma 4 wrapper does.
     used.update(("video_token_id", "vision_start_token_id", "vision_end_token_id"))
     return {
-        "model_type": "qwen3_5",
-        "text_model_type": "qwen3_5_text",
+        "model_type": records.text(hf_config['model_type'], 'model_type'),
+        "text_model_type": f"{hf_config['model_type']}_text",
         "text": text,
         "tower": tower,
         "projector": projector,
@@ -1152,14 +1150,14 @@ def _gemma3n_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wrapper
 
 _WRAPPERS: Mapping[str, Callable[[Mapping[str, object], set[str]], WrapperFields]] = {
     "gemma3": _gemma3_wrapper, "llama4": _llama4_wrapper, "gemma4": _gemma4_wrapper,
-    "qwen3_5": _qwen35_wrapper, "gemma3n": _gemma3n_wrapper}
+    **dict.fromkeys(_QWEN35_TYPES, _qwen35_wrapper), "gemma3n": _gemma3n_wrapper}
 
 
 def translate_wrapper_config(hf_config: Mapping[str, object]) -> WrapperFields:
     """Translate a multimodal wrapper into its decoder, tower and projector records.
 
-    gemma3, llama4, gemma4, qwen3_5, gemma3n and decoder-family bundles translate. Records
-    retain the decoder, tower, projector, image token ID and token count, and
+    gemma3, llama4, gemma4, qwen3_5, qwen3_5_moe, gemma3n and decoder-family
+    bundles translate. Records retain the decoder, tower, projector, image token ID and token count, and
     for Gemma 3n and Gemma 4 the optional audio tower, its embedder, the
     audio placeholder ID and Gemma 3n's fixed slots per clip. Gemma 3n's
     embedders also embed their hard vocabulary ranges.
@@ -1209,7 +1207,8 @@ def _wrapper_route(name: str, record: WrapperFields) -> tuple[str, str]:
         return "audio_projector", bare[len("embed_audio."):]
     if audio and bare.startswith("audio_tower."):
         return "audio_tower", bare[len("audio_tower."):]
-    if (bare.startswith("mtp.") and record["text_model_type"] == _QWEN35) or bare == "lm_head.weight":
+    if ((bare.startswith("mtp.") and record["text_model_type"] in _QWEN35_TEXT_TYPES)
+            or bare == "lm_head.weight"):
         return "language_model", bare
     if bundled is not None:
         return ("projector" if bare in bundled.wrapper_projector_names else "language_model"), bare
@@ -1670,7 +1669,7 @@ def translate_weights(
     `language_model.`.
     """
     family = (_family_for_config(config) if model_type is None
-              else _FAMILIES[model_type])
+              else families()[model_type])
     # A tied head and a depth's embedding and head are checked copies of
     # tensors the tree already takes, so they are dropped here; any other
     # second tensor for a filled leaf is refused where it is placed.
@@ -1830,9 +1829,9 @@ def export_decoder_weights(model: CausalTransformer, variables: Mapping[str, obj
     if not isinstance(model, CausalTransformer):
         raise TypeError('decoder weight export requires a CausalTransformer')
     model_type = config.get('model_type')
-    if not isinstance(model_type, str) or model_type not in _FAMILIES:
+    if not isinstance(model_type, str) or model_type not in families():
         raise ValueError(f'no decoder tensor encoder for model_type {model_type!r}')
-    family = _FAMILIES[model_type]
+    family = families()[model_type]
     tied = (bool(config['tie_word_embeddings']) if 'tie_word_embeddings' in config
             else records.boolean(family.translate_config(config, set()).get('tie_embeddings'),
                        'tie_embeddings'))
@@ -1854,7 +1853,7 @@ def _dense_decoder_weights(model: CausalTransformer, variables: Mapping[str, obj
         raise ValueError(
             'the attention output gate, a partial rotary and a mixer other than attention '
             'have no counterpart in this dense tensor encoder')
-    family = _FAMILIES[records.text(config['model_type'], 'model_type')]
+    family = families()[records.text(config['model_type'], 'model_type')]
     if model.mixture is not None and family.export_path is _hf_name:
         raise ValueError('a model with a mixture has no routed tensor writer in this family')
     params = variables.get('params', variables)
@@ -2075,7 +2074,7 @@ def _hf_name(dew_name: str, config: Mapping[str, object]) -> str | None:
             if module == 'self_attn' and parts[2] in _HEAD_NORMS and leaf == 'scale':
                 return f'model.layers.{index}.self_attn.{parts[2]}.weight'
         theirs = {ours: hf for hf, ours in
-                  _norm_names(_FAMILIES[records.text(config['model_type'],
+                  _norm_names(families()[records.text(config['model_type'],
                                              'model_type')].sandwich_norms).items()}
         if len(parts) == 3 and module in theirs and leaf in ('scale', 'bias'):
             return f'model.layers.{index}.{theirs[module]}.' + ('weight' if leaf == 'scale' else 'bias')
@@ -2137,7 +2136,7 @@ class DecoderFamily:
 
 def _bundled(model_type: str) -> DecoderFamily | None:
     """The family that reads the media bundle released under `model_type`, or None."""
-    family = _FAMILIES.get(model_type)
+    family = families().get(model_type)
     return family if family is not None and family.wrapper is not None else None
 
 
@@ -2183,289 +2182,18 @@ def _check_tree(variables: Mapping[str, object], model) -> None:
     check_tree(variables, model, np.zeros((1, 2), np.int32))
 
 
-# The family modules stand below the shared readers they call, so reaching one
-# of them first leaves the hub complete before its body runs. Their names are
-# bound here alone: the table below is the one place a family is registered.
-from dew.interop.families.bloom import (
-    _bloom_config,
-    _bloom_export,
-    _bloom_export_weights,
-    _bloom_path,
-    _bloom_prepare,
-)
-from dew.interop.families.deepseek import (
-    _deepseek_config,
-    _deepseek_v2_mixture,
-    _deepseek_v4_config,
-    _deepseek_v4_path,
-    _deepseek_v4_prepare,
-    _kimi_k25_config,
-    _kimi_k25_path,
-)
-from dew.interop.families.deepseek_v41 import DEEPSEEK_V41
-from dew.interop.families.gemma import (
-    _gemma2_config,
-    _gemma2_export,
-    _gemma3_config,
-    _gemma3_export,
-    _gemma3n_config,
-    _gemma3n_path,
-    _gemma4_config,
-    _gemma4_export,
-    _gemma4_export_weights,
-    _gemma4_path,
-    _gemma4_prepare,
-    _gemma_config,
-)
-from dew.interop.families.glm import (
-    _glm4_moe_config,
-    _glm4_moe_path,
-    _glm5_next_config,
-    _glm5_next_export,
-    _glm5_next_export_weights,
-    _glm_moe_dsa_config,
-)
-from dew.interop.families.gpt2 import (
-    _gpt2_config,
-    _gpt2_export,
-    _gpt2_export_weights,
-    _gpt2_path,
-    _gpt2_prepare,
-)
-from dew.interop.families.gpt_neox import (
-    _gpt_neox_config,
-    _gpt_neox_export,
-    _gpt_neox_export_weights,
-    _gpt_neox_path,
-    _gpt_neox_prepare,
-)
-from dew.interop.families.gpt_oss import _gpt_oss_config, _gpt_oss_export, _gpt_oss_export_path, _gpt_oss_path
-from dew.interop.families.kimi import (
-    _KDA_ZERO_PADDED,
-    _kimi_k3_config,
-    _kimi_k3_path,
-    _kimi_k3_prepare,
-    _kimi_linear_config,
-    _kimi_linear_path,
-    _kimi_linear_prepare,
-)
-from dew.interop.families.llama import (
-    _llama_config,
-    _ministral_config,
-    _mistral_config,
-    _mixtral_config,
-    _mixtral_path,
-)
-from dew.interop.families.llama4 import _llama4_config, _llama4_export, _llama4_path, _llama4_prepare
-from dew.interop.families.masked_diffusion import (
-    _diffusion_gemma_export,
-    _diffusion_gemma_text_config,
-    _dream_config,
-    _llada_config,
-    _llada_export_path,
-    _llada_path,
-    _mask_token_export,
-)
-from dew.interop.families.olmo import _olmo3_config
-from dew.interop.families.opt import _opt_config, _opt_export, _opt_export_path, _opt_path
-from dew.interop.families.qwen import (
-    _qwen2_config,
-    _qwen3_config,
-    _qwen3_export,
-    _qwen3_moe_config,
-    _qwen3_next_config,
-    _qwen35_config,
-    _qwen35_moe_config,
-    _qwen35_moe_path,
-    _qwen35_path,
-)
+@functools.cache
+def family_entries() -> tuple[DecoderFamily, ...]:
+    """The registered layouts, loaded after their shared readers are defined."""
+    from dew.interop.decoder_families import ENTRIES
+    return ENTRIES
 
-_FAMILY_ENTRIES = (
-    DecoderFamily(('bloom',), _bloom_config,
-                  lambda fields: bool(fields.get('embedding_norm')),
-                  'bloom', 'BloomForCausalLM', _bloom_export,
-                  weight_path=_bloom_path, prepare_weights=_bloom_prepare,
-                  export_weights=_bloom_export_weights, preserve_source_layout=False,
-                  tied_head_names=('lm_head.weight', 'transformer.word_embeddings.weight')),
-    DecoderFamily(('gpt_neox',), _gpt_neox_config,
-                  lambda fields: bool(fields.get('norm_type') == 'layer' and fields.get('norm_bias')
-                                      and fields.get('mlp_bias') and fields.get('position_embedding') == 'rotary'),
-                  'gpt_neox', 'GPTNeoXForCausalLM', _gpt_neox_export,
-                  weight_path=_gpt_neox_path, prepare_weights=_gpt_neox_prepare,
-                  export_weights=_gpt_neox_export_weights, preserve_source_layout=False,
-                  tied_head_names=('embed_out.weight', 'gpt_neox.embed_in.weight')),
-    DecoderFamily(('opt',), _opt_config,
-                  lambda fields: fields.get('position_embedding_offset') == 2,
-                  'opt', 'OPTForCausalLM', _opt_export,
-                  weight_path=_opt_path, export_path=_opt_export_path,
-                  preserve_source_layout=False,
-                  tied_head_names=('lm_head.weight', 'model.decoder.embed_tokens.weight')),
-    DecoderFamily(('gpt2',), _gpt2_config,
-                  lambda fields: fields.get('position_embedding') == 'learned',
-                  'gpt2', 'GPT2LMHeadModel', _gpt2_export,
-                  weight_path=_gpt2_path, prepare_weights=_gpt2_prepare,
-                  export_weights=_gpt2_export_weights, preserve_source_layout=False,
-                  tied_head_names=('lm_head.weight', 'transformer.wte.weight')),
-    DecoderFamily(('glm5_next_text',), _glm5_next_config,
-                  lambda fields: any(isinstance(mixer, (KimiDeltaAttentionMixer, KPoolSparseAttentionMixer))
-                                     for mixer in _kind_mixers(fields)),
-                  'glm5_next_text', 'Glm5NextTextForCausalLM', _glm5_next_export,
-                  weight_path=_glm4_moe_path, export_weights=_glm5_next_export_weights, preserve_source_layout=True),
-    DecoderFamily(('diffusion_gemma_text',), _diffusion_gemma_text_config,
-                  lambda fields: bool(fields.get('causal') is False
-                                      and (fields.get('v_norm')
-                                           or fields.get('per_layer_input_dim')
-                                           or fields.get('num_kv_shared_layers'))),
-                  'diffusion_gemma_text', 'DiffusionGemmaForBlockDiffusion',
-                  _diffusion_gemma_export, sandwich_norms=True,
-                  weight_path=_gemma4_path, prepare_weights=_gemma4_prepare,
-                  export_weights=_gemma4_export_weights, preserve_source_layout=False),
-    DecoderFamily(('dream', 'Dream'), _dream_config,
-                  lambda fields: bool(fields.get('causal') is False
-                                      and fields.get('attention_bias')
-                                      and fields.get('o_proj_bias') is False),
-                  'dream', 'DreamModel', _mask_token_export, preserve_source_layout=True),
-    DecoderFamily(('llada',), _llada_config,
-                  lambda fields: bool(fields.get('causal') is False
-                                      and not fields.get('attention_bias')
-                                      and fields.get('mixture') is None
-                                      and not (fields.get('v_norm')
-                                               or fields.get('per_layer_input_dim')
-                                               or fields.get('num_kv_shared_layers'))
-                                      and not fields.get('output_gate')
-                                      and not fields.get('qk_norm')),
-                  'llada', 'LLaDAModelLM', _mask_token_export,
-                  weight_path=_llada_path, export_path=_llada_export_path, preserve_source_layout=True),
-    DecoderFamily(('gpt_oss',), _gpt_oss_config,
-                  lambda fields: fields.get('mlp') == 'swigluoai',
-                  'gpt_oss', 'GptOssForCausalLM', _gpt_oss_export,
-                  weight_path=_gpt_oss_path, export_path=_gpt_oss_export_path,
-                  preserve_source_layout=False),
-    DecoderFamily(('llama4_text',), _llama4_config,
-                  lambda fields: any(isinstance(mixer, Llama4Mixer) for mixer in _kind_mixers(fields)),
-                  'llama4_text', 'Llama4ForCausalLM', _llama4_export,
-                  weight_path=_llama4_path, prepare_weights=_llama4_prepare, preserve_source_layout=True),
-    DecoderFamily(('glm4_moe',), _glm4_moe_config,
-                  lambda fields: (fields.get('partial_rotary_type') == 'default'
-                                  and (mixture := _mixture_value(fields)) is not None
-                                  and mixture.bias),
-                  'glm4_moe', 'Glm4MoeForCausalLM', lambda model: {},
-                  weight_path=_glm4_moe_path, preserve_source_layout=True),
-    # GLM's sparse block is V3.2's with the indexer rotating interleaved
-    # pairs, which no DeepSeek release does, so that field names the family.
-    DecoderFamily(('glm_moe_dsa',), _glm_moe_dsa_config,
-                  lambda fields: (isinstance(mixer := _mixer_value(fields), MLAMixer)
-                                  and mixer.index_topk is not None
-                                  and mixer.index_rope_interleave),
-                  'glm_moe_dsa', 'GlmMoeDsaForCausalLM', lambda model: {},
-                  weight_path=_glm4_moe_path, preserve_source_layout=True),
-    DEEPSEEK_V41,
-    # V4's block is nothing another family builds: the mixer kind names its
-    # window, its compressor and its grouped output projection at once.
-    DecoderFamily(('deepseek_v4',), _deepseek_v4_config,
-                  lambda fields: isinstance(_mixer_value(fields), DeepseekV4Mixer),
-                  'deepseek_v4', 'DeepseekV4ForCausalLM', lambda model: {},
-                  weight_path=_deepseek_v4_path, prepare_weights=_deepseek_v4_prepare,
-                  preserve_source_layout=True,
-                  tied_head_names=('head.weight', 'embed.weight')),
-    DecoderFamily(('deepseek_v32',), partial(_deepseek_config, sparse=True),
-                  lambda fields: (isinstance(mixer := _mixer_value(fields), MLAMixer)
-                                  and mixer.index_topk is not None),
-                  'deepseek_v32', 'DeepseekV32ForCausalLM', lambda model: {}, preserve_source_layout=True),
-    DecoderFamily(('deepseek_v2',), partial(_deepseek_config, mixture=_deepseek_v2_mixture),
-                  lambda fields: (isinstance(_mixer_value(fields), MLAMixer)
-                                  and (mixture := _mixture_value(fields)) is not None
-                                  and not mixture.bias),
-                  'deepseek_v2', 'DeepseekV2ForCausalLM', lambda model: {}, preserve_source_layout=True),
-    # Kimi and DeepSeek V3 share a computation; only source provenance names Kimi.
-    # Derived-model export therefore never selects Kimi via `matches`.
-    DecoderFamily(('kimi_k2',), _deepseek_config, lambda fields: False,
-                  'deepseek_v3', 'DeepseekV3ForCausalLM', lambda model: {}, preserve_source_layout=True),
-    # Kimi K2.5 wraps that same computation in a vision repo, so it is
-    # provenance-only too, and its own tensor names are the wrapper's.
-    DecoderFamily(('kimi_k25',), _kimi_k25_config, lambda fields: False,
-                  'kimi_k25', 'Kimi_K25ForConditionalGeneration', lambda model: {},
-                  weight_path=_kimi_k25_path, preserve_source_layout=True,
-                  tied_head_names=('language_model.lm_head.weight',
-                                   'language_model.model.embed_tokens.weight')),
-    # Kimi Linear's released remote code; provenance-only, like K2.5.
-    DecoderFamily(('kimi_linear',), _kimi_linear_config, lambda fields: False,
-                  'kimi_linear', 'KimiLinearForCausalLM', lambda model: {},
-                  weight_path=_kimi_linear_path, prepare_weights=_kimi_linear_prepare,
-                  preserve_source_layout=True),
-    # Kimi K3's text decoder under its vision wrapper; provenance-only, like K2.5.
-    DecoderFamily(('kimi_k3',), _kimi_k3_config, lambda fields: False,
-                  'kimi_k3', 'KimiK3ForConditionalGeneration', lambda model: {},
-                  weight_path=_kimi_k3_path, prepare_weights=_kimi_k3_prepare, zero_padded=_KDA_ZERO_PADDED,
-                  preserve_source_layout=True,
-                  tied_head_names=('language_model.lm_head.weight',
-                                   'language_model.model.embed_tokens.weight')),
-    DecoderFamily(('deepseek_v3',), _deepseek_config,
-                  lambda fields: isinstance(_mixer_value(fields), MLAMixer),
-                  'deepseek_v3', 'DeepseekV3ForCausalLM', lambda model: {}, preserve_source_layout=True),
-    DecoderFamily(('qwen3_next',), _qwen3_next_config,
-                  lambda fields: any(isinstance(mixer, GatedDeltaNetMixer) and mixer.fused_in_proj
-                                     for mixer in _kind_mixers(fields)),
-                  'qwen3_next', 'Qwen3NextForCausalLM', lambda model: {},
-                  weight_path=_qwen35_moe_path, prepare_weights=_gemma4_prepare, preserve_source_layout=True),
-    DecoderFamily(('qwen3_5_moe_text',), _qwen35_moe_config,
-                  lambda fields: bool(fields.get('output_gate') and _mixture_value(fields) is not None),
-                  'qwen3_5_moe_text', 'Qwen3_5MoeForCausalLM', lambda model: {},
-                  weight_path=_qwen35_moe_path, prepare_weights=_gemma4_prepare, preserve_source_layout=True),
-    DecoderFamily((_QWEN35,), _qwen35_config,
-                  lambda fields: bool(fields.get('output_gate')
-                                      or 'linear_attention' in (fields.get('layer_types') or ())),
-                  _QWEN35, 'Qwen3_5ForCausalLM', lambda model: {}, weight_path=_qwen35_path, preserve_source_layout=True),
-    DecoderFamily(('olmo3',), _olmo3_config,
-                  lambda fields: not fields.get('pre_norms'),
-                  'olmo3', 'Olmo3ForCausalLM', lambda model: {}, sandwich_norms=True, preserve_source_layout=True),
-    DecoderFamily(('gemma3n_text',), _gemma3n_config,
-                  lambda fields: fields.get('altup') is not None,
-                  'gemma3n_text', 'Gemma3nForCausalLM', _gemma3_export, sandwich_norms=True,
-                  weight_path=_gemma3n_path, preserve_source_layout=True),
-    DecoderFamily(('gemma4_text',), _gemma4_config,
-                  lambda fields: bool(fields.get('v_norm') or fields.get('per_layer_input_dim')
-                                      or fields.get('num_kv_shared_layers')),
-                  'gemma4_text', 'Gemma4ForCausalLM', _gemma4_export, sandwich_norms=True,
-                  weight_path=_gemma4_path, prepare_weights=_gemma4_prepare,
-                  export_weights=_gemma4_export_weights, preserve_source_layout=True),
-    DecoderFamily((_GEMMA,), _gemma3_config,
-                  lambda fields: bool(fields.get('sandwich_norms') and fields.get('qk_norm')),
-                  _GEMMA, 'Gemma3ForCausalLM', _gemma3_export, sandwich_norms=True, preserve_source_layout=False),
-    DecoderFamily(('gemma2',), _gemma2_config,
-                  lambda fields: bool(fields.get('sandwich_norms')),
-                  'gemma2', 'Gemma2ForCausalLM', _gemma2_export, sandwich_norms=True, preserve_source_layout=False),
-    DecoderFamily(('gemma',), _gemma_config,
-                  lambda fields: bool(fields.get('embedding_scale')),
-                  'gemma', 'GemmaForCausalLM', lambda model: {}, preserve_source_layout=False),
-    DecoderFamily(('qwen3_moe',), _qwen3_moe_config,
-                  lambda fields: bool(fields.get('qk_norm') and fields.get('mixture') is not None),
-                  'qwen3_moe', 'Qwen3MoeForCausalLM', _qwen3_export, preserve_source_layout=True),
-    DecoderFamily(('qwen3',), _qwen3_config, lambda fields: bool(fields.get('qk_norm')),
-                  'qwen3', 'Qwen3ForCausalLM', _qwen3_export, preserve_source_layout=False),
-    DecoderFamily(('qwen2',), _qwen2_config,
-                  lambda fields: bool(fields.get('attention_bias') and fields.get('o_proj_bias') is False),
-                  'qwen2', 'Qwen2ForCausalLM', _qwen3_export, preserve_source_layout=False),
-    DecoderFamily(('mixtral',), _mixtral_config, lambda fields: fields.get('mixture') is not None,
-                  'mixtral', 'MixtralForCausalLM', lambda model: {},
-                  weight_path=_mixtral_path, preserve_source_layout=True),
-    # MistralConfig has no layer_types: its window is on every layer.
-    DecoderFamily(('mistral',), _mistral_config, _every_layer_windowed,
-                  'mistral', 'MistralForCausalLM', lambda model: {'layer_types': None},
-                  preserve_source_layout=False),
-    DecoderFamily(('mamba2',), mamba2.config_from_hf,
-                  lambda fields: isinstance(_mixer_value(fields), Mamba2Mixer),
-                  'mamba2', 'Mamba2ForCausalLM', lambda model: {},
-                  weight_path=mamba2.weight_path, export_path=mamba2.export_path,
-                  preserve_source_layout=True,
-                  tied_head_names=('lm_head.weight', 'backbone.embeddings.weight')),
-    DecoderFamily(('ministral',), _ministral_config,
-                  lambda fields: 'sliding_attention' in (fields.get('layer_types') or ()),
-                  'ministral', 'MinistralForCausalLM', lambda model: {}, preserve_source_layout=False),
-    DecoderFamily(('llama',), _llama_config, lambda fields: True,
-                  'llama', 'LlamaForCausalLM', lambda model: {}, preserve_source_layout=False),
-)
-_FAMILIES = {name: family for family in _FAMILY_ENTRIES for name in family.model_types}
+
+@functools.cache
+def families() -> dict[str, DecoderFamily]:
+    """The single mutable name table, also used for registered source aliases."""
+    return {name: family for family in family_entries() for name in family.model_types}
+
 
 def _backbone_defaults() -> DecoderFields:
     """Return what the backbone takes for a field a config leaves unset, so a partial
@@ -2484,7 +2212,7 @@ _BACKBONE_DEFAULTS = _backbone_defaults()
 
 
 def _family_of(fields: DecoderFields) -> DecoderFamily:
-    return next(family for family in _FAMILY_ENTRIES if family.matches(fields))
+    return next(family for family in family_entries() if family.matches(fields))
 
 
 def _family_for_config(config: DecoderFields) -> DecoderFamily:

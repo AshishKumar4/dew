@@ -84,17 +84,8 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.typing import ArrayLike
 
 from dew.inference.pages import Pages
-from dew.inference.tasks import (
-    Processor,
-    Request,
-    TextGeneration,
-    _bucket,
-    _ceiling,
-    _decoded,
-    _prepared,
-    _sized,
-)
-from dew.nn.inputs import ModelInputs, mesh_of, request_key
+from dew.inference.tasks import Processor, TextGeneration, _bucket, _ceiling, _decoded, _prepared, _sized
+from dew.nn.inputs import ModelInputs, host_token_rows, mesh_of, request_key
 from dew.nn.kv_cache import (
     CURSOR,
     POOLED,
@@ -117,9 +108,9 @@ from dew.sampling.strategies import DecoderState, Sample, draw
 from dew.sampling.text import (
     Generation,
     Sampling,
+    _check_inputs,
     _operations,
     _prefill,
-    _validated,
     prediction_depths,
     resolve,
 )
@@ -540,13 +531,19 @@ class Ticket(Future):
         self.finished: float | None = None
 
 
+@jax.jit
+def _stacked_keys(keys: tuple[jax.Array | np.ndarray, ...]) -> jax.Array:
+    """Assemble one fixed-width admission's key data without a device-to-host read."""
+    return jnp.stack(keys)
+
+
 @dataclass
 class _Row:
     """One request on the host: its prompt, budget and key, and what it drew."""
 
     prompt: np.ndarray
     budget: int
-    keys: np.ndarray
+    keys: jax.Array
     ticket: Ticket
     tokens: list[int] = field(default_factory=list)
     behavior: list[float] = field(default_factory=list)
@@ -905,7 +902,7 @@ class Server:
         self.rows.reloaded()
 
     def submit(self, prompt: Prompt, max_new_tokens: int | None = None, *,
-               key: jax.Array | None = None, seed: int | None = None) -> Ticket:
+               key: int | jax.Array | None = None) -> Ticket:
         """Queue one request; the ticket resolves to its `Generation`.
 
         The prompt is validated as `TextGeneration` validates it, against
@@ -913,7 +910,7 @@ class Server:
         resolves at once with the prompt alone.
         """
         # One row's key, folded the way `RowPlan.keys` folds row zero.
-        return self._enqueued(prompt, max_new_tokens, jax.random.fold_in(request_key(key, seed), 0))
+        return self._enqueued(prompt, max_new_tokens, jax.random.fold_in(request_key(key), 0))
 
     def _enqueued(self, prompt: Prompt, max_new_tokens: int | None, key: jax.Array) -> Ticket:
         if self._failed is not None:
@@ -926,21 +923,23 @@ class Server:
         return row.ticket
 
     def _prepared(self, prompt: Prompt, max_new_tokens: int | None, key: jax.Array) -> _Row:
-        request: Request = prompt if isinstance(prompt, (str, ModelInputs)) else np.atleast_2d(np.asarray(prompt))
-        inputs = _prepared(self.processor, request, images=None)
-        if inputs.tokens.shape[0] != 1:
+        if isinstance(prompt, (str, ModelInputs)):
+            inputs = _prepared(self.processor, prompt, images=None)
+            if set(inputs.token_fields) - {"attention_mask"} or inputs.conditioning:
+                raise ValueError("a served prompt carries tokens and validity only; media and positions do not slot")
+            ids = np.asarray(inputs.tokens)
+            fields = {name: np.asarray(value) for name, value in inputs.token_fields.items()}
+        else:
+            ids = host_token_rows(np.atleast_2d(np.asarray(prompt)))
+            fields = {}
+        if ids.shape[0] != 1:
             raise ValueError("submit takes one prompt; call the server with a batch")
-        if set(inputs.token_fields) - {"attention_mask"} or inputs.conditioning:
-            raise ValueError("a served prompt carries tokens and validity only; media and positions do not slot")
         budget = self.default_budget if max_new_tokens is None else max_new_tokens
         if budget is None:
             raise ValueError("max_new_tokens is required; the source declares no default budget")
-        ids = np.asarray(inputs.tokens)
-        fields = {name: np.asarray(value) for name, value in inputs.token_fields.items()}
-        _validated(self.model, ids, fields, {}, budget, self.sampling, 1)
-        valid = fields.get("attention_mask", np.ones(ids.shape, bool)).astype(bool)
+        valid = _check_inputs(self.model, ids, fields, budget, self.sampling, 1).astype(bool)
         self.rows.refuse(int(valid[0].sum()), budget)
-        return _Row(ids[0][valid[0]].astype(np.int32), budget, np.asarray(jax.random.key_data(key)), Ticket())
+        return _Row(ids[0][valid[0]].astype(np.int32), budget, jax.random.key_data(key), Ticket())
 
     def step(self) -> None:
         """One device call: admit what fits, run `decode_steps` iterations, read the last call's."""
@@ -962,14 +961,13 @@ class Server:
         self._settle()
 
     def __call__(self, prompts: str | Sequence[str] | Sequence[Sequence[int]] | ModelInputs,
-                 max_new_tokens: int | None = None, *, key: jax.Array | None = None,
-                 seed: int | None = None) -> list[Generation]:
+                 max_new_tokens: int | None = None, *, key: int | jax.Array | None = None) -> list[Generation]:
         """Submit a batch, run it through, and return its generations in order.
 
         Row `i` draws with the request key folded by `i`, as the same batch
         through `TextGeneration` would.
         """
-        base = request_key(key, seed)
+        base = request_key(key)
         inputs = _prepared(self.processor, prompts, images=None)
         valid = inputs.token_fields.get("attention_mask")
         rows = np.asarray(inputs.tokens)
@@ -1013,7 +1011,8 @@ class Server:
         valid = np.zeros((count, width), bool)
         slots = np.full((count,), size, np.int32)
         budgets = np.zeros((count,), np.int32)
-        keys = np.zeros((count, *chosen[0][2].keys.shape), chosen[0][2].keys.dtype)
+        empty_key = np.zeros(chosen[0][2].keys.shape, chosen[0][2].keys.dtype)
+        keys: list[jax.Array | np.ndarray] = [empty_key] * count
         tables = np.zeros((count, self.rows.width), np.int32)
         cursors = np.zeros((count,), np.int32)
         final = np.zeros((count,), bool)
@@ -1033,7 +1032,7 @@ class Server:
             history_valid[index, capacity - len(row.prompt):] = True
             if final[index]:
                 self.rows.prefilled(row)
-        placed = jax.device_put([tokens, valid, slots, budgets, keys, tables, cursors, final, history,
+        placed = jax.device_put([tokens, valid, slots, budgets, _stacked_keys(tuple(keys)), tables, cursors, final, history,
                                  history_valid], self._admitted)
         return Admission(ModelInputs(placed[0], {"attention_mask": placed[1]}), *placed[2:])
 

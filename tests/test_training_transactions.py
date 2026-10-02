@@ -11,21 +11,22 @@ from flax import struct
 
 from dew.checkpoints import Checkpoints
 from dew.data import DataPartition
-from dew.objectives import Aux, EMASpec, Mean, Objective, mean_loss, scalar_loss
+from dew.objectives import Aux, EMASpec, Ratio, Objective, mean_loss, scalar_loss
 from dew.objectives.base import under
 from dew.training import Trainer
+from test_trainer import raw_leaf
 
 
 @struct.dataclass
 class Terms:
-    prediction: Mean
-    rows: Mean
+    prediction: Ratio
+    rows: Ratio
     scores: jax.Array
     counts: jax.Array
     positions: jax.Array
 
 
-class Tiny(Objective[Mean | Terms, None]):
+class Tiny(Objective[Ratio | Terms, None]):
     ema = EMASpec(optax.constant_schedule(.5), select=under("params"))
 
     def __init__(self, composite=False):
@@ -43,20 +44,20 @@ class Tiny(Objective[Mean | Terms, None]):
         bad = jax.lax.cond(batch["bad"],
                            lambda x: jnp.sqrt(x - jax.lax.stop_gradient(x)),
                            lambda x: x * 0, w)
-        main = Mean(jnp.sum(errors * batch["mask"]) + bad, jnp.sum(batch["mask"]))
+        main = Ratio(jnp.sum(errors * batch["mask"]) + bad, jnp.sum(batch["mask"]))
         aux = Aux({}, variables={"stats": {"seen": variables["stats"]["seen"] + 1}})
         if not self.composite:
             return main, aux
         logits = jnp.stack((prediction, -prediction, prediction * .3), axis=-1)
         scores = jax.nn.softmax(logits, axis=-1)
         counts = jnp.bincount(jnp.argmax(scores, axis=-1), length=3)
-        row = Mean(jnp.sum((prediction + batch["y"]) ** 2) * batch["active"],
+        row = Ratio(jnp.sum((prediction + batch["y"]) ** 2) * batch["active"],
                    jnp.asarray(batch["y"].size) * batch["active"])
         return Terms(main, row, jnp.sum(scores, axis=0) * batch["active"],
                      counts * batch["active"], jnp.asarray(scores.shape[0]) * batch["active"]), aux
 
     def reduce_loss(self, stats):
-        if isinstance(stats, Mean):
+        if isinstance(stats, Ratio):
             return mean_loss(stats)
         main, a = mean_loss(stats.prediction)
         row, b = mean_loss(stats.rows)
@@ -70,7 +71,7 @@ def batches():
                  bad=jnp.array(bad), active=jnp.array(1))
             for mask, bad in [([1., 0.], False), ([1., 1.], True), ([.5, 1.], False), ([1., 1.], False)]]
 
-class ShortScaleTrainer(Trainer[Mean | Terms, None]):
+class ShortScaleTrainer(Trainer[Ratio | Terms, None]):
     def initial_state(self, initializer=None, key=None):
         state = super().initial_state(initializer, key)
         return dataclasses.replace(state, scale=dataclasses.replace(state.scale, growth_interval=1))
@@ -89,7 +90,7 @@ def test_boundary_rejection_preserves_accepted_prefix_and_mutable_reads(composit
     run = train.compile(initial, data[0])
     # the step consumes the state
     start, opt_state, key = (jax.tree.map(np.asarray, initial.params),
-                             jax.tree.map(np.asarray, initial.opt_state), np.asarray(initial.key))
+                             jax.tree.map(np.asarray, initial.opt_state), np.asarray(jax.random.key_data(initial.key)))
     prefix, *_ = run(initial, data[0])
     # the step consumes the state
     prefix_scale = float(prefix.scale.scale)
@@ -158,7 +159,7 @@ def test_partial_checkpoint_replays_exact_realized_records(tmp_path, composite, 
     assert int(resumed.scale.fin_steps) == 0
     uninterrupted = trainer(composite).fit(Data(), steps=4)
     for want, got in zip(jax.tree.leaves(uninterrupted), jax.tree.leaves(resumed), strict=True):
-        np.testing.assert_array_equal(got, want)
+        np.testing.assert_array_equal(raw_leaf(got), raw_leaf(want))
     class Unused(Data):
         def train(self, partition):
             raise AssertionError("same-target resume opened the data stream")
@@ -220,7 +221,7 @@ def test_real_lm_mtp_router_and_qk_update_matches_combined_batch(auxiliary):
     run = train.compile(initial, data[0])
     # the step consumes the state
     start, opt_state, key = (jax.tree.map(np.asarray, initial.params),
-                             jax.tree.map(np.asarray, initial.opt_state), np.asarray(initial.key))
+                             jax.tree.map(np.asarray, initial.opt_state), np.asarray(jax.random.key_data(initial.key)))
     partial, *_ = run(initial, data[0])
     for before, after in zip(jax.tree.leaves(start), jax.tree.leaves(partial.params), strict=True):
         np.testing.assert_array_equal(before, after)
@@ -238,7 +239,7 @@ def test_real_lm_mtp_router_and_qk_update_matches_combined_batch(auxiliary):
         np.testing.assert_allclose(got, want, rtol=2e-5, atol=2e-6)
     expected_moe = objective.apply_effects(start, aux.effects)["moe"]
     for want, got in zip(jax.tree.leaves(expected_moe), jax.tree.leaves(actual.params["moe"]), strict=True):
-        np.testing.assert_array_equal(got, want)
+        np.testing.assert_array_equal(raw_leaf(got), raw_leaf(want))
 
     # An independent role-mask equation catches a shared bug in both batching paths.
     if auxiliary is None:
@@ -255,8 +256,8 @@ def test_replay_preserves_half_precision_cotangents_and_integer_support():
         def loss(self, variables, batch, step):
             w = variables["params"]["w"]
             count = jnp.asarray(batch["y"].size)
-            prediction = Mean(((w - 1) ** 2 * count).astype(jnp.float16), count)
-            row = Mean(((w + 3) ** 2).astype(jnp.float16), jnp.asarray(1))
+            prediction = Ratio(((w - 1) ** 2 * count).astype(jnp.float16), count)
+            row = Ratio(((w + 3) ** 2).astype(jnp.float16), jnp.asarray(1))
             return Terms(prediction, row, jnp.zeros(3, jnp.float16),
                          jnp.zeros(3, jnp.int32), jnp.asarray(0)), Aux({})
     train = Trainer(Half(), optax.sgd(.1), key=jax.random.PRNGKey(1), accumulation=2)
@@ -293,10 +294,10 @@ def test_local_partial_snapshot_survives_continued_training_and_weight_restore(t
     resumed, *_ = step(restored, data[1])
     resumed, *_ = step(resumed, data[2])
     for want, got in zip(jax.tree.leaves(final), jax.tree.leaves(resumed), strict=True):
-        np.testing.assert_array_equal(got, want)
+        np.testing.assert_array_equal(raw_leaf(got), raw_leaf(want))
     template = {"params": jax.tree.map(
         lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=x.sharding), restored.params)}
     selected, _ = checkpoints.restore(template, 1)
     for want, got in zip(jax.tree.leaves(prefix_params), jax.tree.leaves(selected["params"]), strict=True):
-        np.testing.assert_array_equal(got, want)
+        np.testing.assert_array_equal(raw_leaf(got), raw_leaf(want))
 
