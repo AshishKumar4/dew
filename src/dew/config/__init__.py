@@ -35,6 +35,7 @@ import jax
 import optax
 import tyro
 from etils import epath
+from flax import linen as nn
 
 import dew.data  # registers the datasets a config names
 import dew.io
@@ -531,6 +532,8 @@ def _to_json(value, annotation) -> JSON:
     registry and member types the read side rebuilds from."""
     if isinstance(value, datetime.timedelta):
         return recorded_duration(value)
+    if isinstance(value, type) and value.__module__ in ('jax.numpy', 'numpy', 'ml_dtypes'):
+        return registry.dtype_name(value)
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         held = _registry_for(annotation)
         if held is not None and not any(type(value) is member
@@ -542,7 +545,8 @@ def _to_json(value, annotation) -> JSON:
         if held is None:
             held = _registry_for(type(value))
         fields = {f.name: _to_json(getattr(value, f.name), _declared_type(type(value), f.name))
-                  for f in dataclasses.fields(value) if _recorded(f)}
+                  for f in dataclasses.fields(value) if _recorded(f)
+                  and not (isinstance(value, nn.Module) and f.name in ('parent', 'name'))}
         if held is None:
             return fields
         name = held.name_of(type(value))
