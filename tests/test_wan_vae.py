@@ -190,6 +190,52 @@ def test_decoder_gradients_match_the_source(loaded, reference):
     assert gaps[worst] < GRADIENT, worst
 
 
+def test_a_bfloat16_walk_matches_the_sources_bfloat16_walk(source):
+    """The fixture VAE in bfloat16 against diffusers 0.34.0's own bfloat16
+    walk of it (`wan_vae_bf16.npz`, the reference tool's `bfloat16` mode):
+    the posterior and decode of one bfloat16 video and latent, and their
+    input gradients. Each differs from the source by less than one bfloat16
+    rounding of its scale on average, and by at most 2^-3 of it anywhere.
+
+    The norm computes `F.normalize` in float32 and rounds once. Against this
+    record its mean gaps are mean 1.87e-3, std 8.8e-4, pixels 3.28e-3, video
+    gradient 7.6e-5 and latent gradient 1.28e-2, where the earlier bfloat16
+    reduction gave 1.99e-3, 9.8e-4, 3.40e-3, 8.0e-5 and 1.73e-2. Averaged
+    over four more seeds it is closer to both 0.34.0 and 0.40.0 (which
+    normalizes in float32 too) on every output and on the encoder's
+    parameter gradients.
+    """
+    record = dict(np.load(ROOT / "tests/fixtures/wan_vae_bf16.npz"))
+    autoencoder, params, _, _ = load_wan_vae(source, jnp.bfloat16)
+    model = autoencoder.model
+
+    def walked(name):
+        return jnp.asarray(channels_last(record[name]), jnp.bfloat16)
+
+    def objective(video):
+        mean, std = posterior(model, params, video)
+        return (jnp.sum(mean.astype(jnp.float32) * channels_last(record["probe_mean"]))
+                + jnp.sum(std.astype(jnp.float32) * channels_last(record["probe_std"])))
+
+    def decoded(latent):
+        return model.apply({"params": params}, latent, method=model.decode)
+
+    def decode_objective(latent):
+        return jnp.sum(decoded(latent).astype(jnp.float32) * channels_last(record["probe"]))
+
+    mean, std = jax.jit(lambda video: posterior(model, params, video))(walked("video"))
+    ours = {"mean": mean, "std": std, "pixels": jax.jit(decoded)(walked("latent")),
+            "encode.grad_video": jax.jit(jax.grad(objective))(walked("video")),
+            "decode.grad_latent": jax.jit(jax.grad(decode_objective))(walked("latent"))}
+    for name, value in ours.items():
+        expected = channels_last(record[name]).astype(np.float64)
+        difference = np.abs(np.asarray(value, np.float64) - expected)
+        scale = max(1.0, float(np.abs(expected).max()))
+        print(f"{name}: mean gap {difference.mean():.3g}, scaled max {difference.max() / scale:.3g}")
+        assert difference.mean() / scale < 2.0 ** -8, name
+        assert difference.max() / scale < 2.0 ** -3, name
+
+
 def test_the_autoencoder_normalizes_as_the_pipeline_does(loaded, reference):
     """`WanPipeline` stores `(z - latents_mean) * (1 / latents_std)` and
     decodes `z / (1 / latents_std) + latents_mean`, per channel, and a video
