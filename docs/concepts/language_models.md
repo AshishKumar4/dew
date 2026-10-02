@@ -206,7 +206,7 @@ save_pretrained_decoder(model, lm_state.params, "stories-decoder", tokenizer="by
                         generation_config={"do_sample": False, "max_new_tokens": 24})
 task = dew.pipeline("stories-decoder", dtype="float32")
 print(task.sampling)
-result = task([tokenizer.encode("At night")], seed=0).host()
+result = task([tokenizer.encode("At night")], key=0).host()
 print(tokenizer.decode(result.tokens[0]), result.lengths)
 ```
 
@@ -266,7 +266,7 @@ inputs = bundle.processor(["token7 <start_of_image> token9",
                           images=[[images[0]], [images[1], images[2]]])
 logits = bundle.model.apply(bundle.variables, inputs.tokens, **inputs.kwargs())
 task = bundle.text_generation(sampling=Sampling(temperature=0))
-for text in task(inputs, 3, seed=1).text:
+for text in task(inputs, 3, key=1).text:
     print(text)
 ```
 
@@ -363,7 +363,7 @@ LLaDA and Dream use this masked-token path from their released weights. They pre
 ```python
 llada = load_pretrained(fixtures / "llada-tiny", dtype="float32", attention_impl="xla")
 masked_task = llada.text_generation()
-result = masked_task([[1, 2, 3]], 8, seed=7, steps=16, n=2)
+result = masked_task([[1, 2, 3]], 8, key=7, steps=16, n=2)
 print(result.host().tokens)
 ```
 

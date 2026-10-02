@@ -67,6 +67,18 @@ class ScheduledScores(Objective):
         return TokenScores(jnp.ones_like(batch["x"]) * step.step, jnp.ones_like(batch["x"]))
 
 
+def test_integer_evaluation_key_matches_a_jax_key():
+    objective = ScheduledScores()
+    params = objective.init(jax.random.key(0))
+    batches = [{"x": np.ones((16, 1), np.float32), "score": np.arange(16, dtype=np.float32)},
+               {"x": np.ones((8, 1), np.float32), "score": np.arange(16, 24, dtype=np.float32)}]
+    integer = evaluate(objective, params, lambda partition: iter(batches), key=7, metrics=[perplexity()])
+    typed = evaluate(objective, params, lambda partition: iter(batches), key=jax.random.key(7), metrics=[perplexity()])
+    assert integer.scores == typed.scores == {"val/perplexity": 1.}
+    assert integer.event_key == typed.event_key
+    assert integer.records == 24 and integer.coordinated_batches == 2
+
+
 def test_event_step_and_objective_schedule_have_separate_meanings():
     objective = ScheduledScores()
     batch = {"x": np.ones((8, 1), np.float32)}

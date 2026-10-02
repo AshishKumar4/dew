@@ -169,15 +169,15 @@ def test_native_masked_task_matches_direct_mdlm_trajectory(masked_source):
 def test_masked_continuations_seed_eos_and_zero_budget(masked_source):
     source, inputs = masked_source
     task = source.text_generation()
-    single = task(inputs, 8, seed=7, steps=5).host()
-    many = task(inputs, 8, seed=7, steps=5, n=3).host()
+    single = task(inputs, 8, key=7, steps=5).host()
+    many = task(inputs, 8, key=7, steps=5, n=3).host()
     np.testing.assert_array_equal(many.tokens.reshape(3, 3, 12)[:, 0], single.tokens)
     pair = task(inputs, 8, key=jax.random.key(7), steps=5, n=2).host()
     np.testing.assert_array_equal(many.tokens.reshape(3, 3, 12)[:, :2], pair.tokens.reshape(3, 2, 12))
-    assert not np.array_equal(task(inputs, 8, seed=8, steps=5).host().tokens, single.tokens)
+    assert not np.array_equal(task(inputs, 8, key=8, steps=5).host().tokens, single.tokens)
     np.testing.assert_array_equal(many.tokens[:, :4], np.repeat(np.asarray(inputs.tokens), 3, axis=0))
     eos = int(single.tokens[0, 5])
-    stopped = replace(task, eos_token_ids=(eos,))(inputs, 8, seed=7, steps=5).host()
+    stopped = replace(task, eos_token_ids=(eos,))(inputs, 8, key=7, steps=5).host()
     for row, response in enumerate(single.tokens[:, 4:]):
         hits = np.flatnonzero(response == eos)
         length = int(hits[0]) + 1 if hits.size else 8
@@ -186,7 +186,7 @@ def test_masked_continuations_seed_eos_and_zero_budget(masked_source):
         np.testing.assert_array_equal(stopped.tokens[row, 4:4 + length], response[:length])
         np.testing.assert_array_equal(stopped.tokens[row, 4 + length:], task.pad_token_id)
     np.testing.assert_array_equal(stopped.decoder_steps, single.decoder_steps)
-    empty = task(inputs, 0, seed=7, n=2).host()
+    empty = task(inputs, 0, key=7, n=2).host()
     np.testing.assert_array_equal(empty.tokens, np.repeat(np.asarray(inputs.tokens), 2, axis=0))
     np.testing.assert_array_equal(empty.lengths, 0)
     np.testing.assert_array_equal(empty.decoder_steps, 0)
@@ -196,7 +196,7 @@ def test_masked_continuations_seed_eos_and_zero_budget(masked_source):
         replace(source, generation_config={"num_beams": 2}).text_generation()
     for controls in ({"sampling": Sampling()}, {"logits": ()}, {"num_beams": 2}):
         with pytest.raises(TypeError):
-            task(inputs, 8, seed=7, **controls)
+            task(inputs, 8, key=7, **controls)
 
 
 @pytest.mark.mesh
@@ -205,8 +205,8 @@ def test_masked_rows_and_continuations_keep_the_mesh_contract(masked_source):
     task = source.text_generation()
     mesh = build_mesh(MeshSpec())
     variables = jax.device_put(source.variables, Layout().shardings(mesh, source.variables))
-    expected = task(inputs, 8, seed=7, steps=5, n=2).host()
-    placed = task.bind(variables)(inputs, 8, seed=7, steps=5, n=2)
+    expected = task(inputs, 8, key=7, steps=5, n=2).host()
+    placed = task.bind(variables)(inputs, 8, key=7, steps=5, n=2)
     actual = placed.host()
     assert placed.tokens.sharding.spec == jax.sharding.PartitionSpec(BATCH_AXES)
     assert placed.tokens.shape[0] == jax.device_count() * 2
@@ -246,8 +246,8 @@ def test_masked_training_resume_publish_and_run_pipeline(masked_source, tmp_path
     restored = pipeline(str(tmp_path / "run"), ema=False)
     restored_ema = pipeline(str(tmp_path / "run"))
     for expected, actual in ((live, restored), (averaged, restored_ema)):
-        np.testing.assert_array_equal(actual(prompt, seed=7).host().tokens,
-                                      expected(prompt, 8, seed=7).host().tokens)
+        np.testing.assert_array_equal(actual(prompt, key=7).host().tokens,
+                                      expected(prompt, 8, key=7).host().tokens)
     masked = jnp.full((1, 8), 120, jnp.int32)
     assert not np.array_equal(model.apply(live.variables, masked), model.apply(averaged.variables, masked))
     assert restored.model.dtype == jnp.bfloat16
@@ -255,18 +255,18 @@ def test_masked_training_resume_publish_and_run_pipeline(masked_source, tmp_path
     converted = pipeline(str(tmp_path / "run"), ema=False, dtype="float32", param_dtype="bfloat16")
     reference = replace(live, model=model.clone(dtype=jnp.float32),
                         variables=jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16), live.variables))
-    np.testing.assert_array_equal(converted(prompt, seed=7).host().tokens,
-                                  reference(prompt, 8, seed=7).host().tokens)
+    np.testing.assert_array_equal(converted(prompt, key=7).host().tokens,
+                                  reference(prompt, 8, key=7).host().tokens)
     assert converted.model.dtype == jnp.float32
     assert all(leaf.dtype == jnp.bfloat16 for leaf in jax.tree.leaves(converted.variables))
 
     source.save(tmp_path / "published", variables=resumed.params)
     reloaded = load_pretrained(tmp_path / "published", dtype="bfloat16", attention_impl="xla")
-    expected = live(prompt, 8, seed=7).host().tokens
-    np.testing.assert_array_equal(reloaded.text_generation()(prompt, 8, seed=7).host().tokens, expected)
+    expected = live(prompt, 8, key=7).host().tokens
+    np.testing.assert_array_equal(reloaded.text_generation()(prompt, 8, key=7).host().tokens, expected)
     np.testing.assert_array_equal(pipeline(str(tmp_path / "published"), dtype="bfloat16")(
-        prompt, 8, seed=7).host().tokens, expected)
-    raw = restored(["a", "bc"], 3, seed=7, steps=3)
+        prompt, 8, key=7).host().tokens, expected)
+    raw = restored(["a", "bc"], 3, key=7, steps=3)
     assert raw.text == restored.decode(raw)
 
 
@@ -281,8 +281,8 @@ def test_masked_continuation_uses_last_valid_packed_segment(masked_source):
         "attention_mask": jnp.concatenate([jnp.ones((1, 16), bool), final.token_fields["attention_mask"]], axis=1),
         "positions": jnp.concatenate([jnp.arange(100, 116)[None], final.token_fields["positions"]], axis=1),
         "segment_ids": jnp.concatenate([jnp.ones((1, 16), jnp.int32), final.token_fields["segment_ids"]], axis=1)})
-    alone = task(final, 8, seed=7, steps=1).host()
-    together = task(packed, 8, seed=7, steps=1).host()
+    alone = task(final, 8, key=7, steps=1).host()
+    together = task(packed, 8, key=7, steps=1).host()
     np.testing.assert_array_equal(together.tokens[:, :21], packed.tokens)
     np.testing.assert_array_equal(together.tokens[:, -8:], alone.tokens[:, -8:])
 
@@ -306,8 +306,8 @@ def test_masked_source_accepts_neutral_controls_and_honors_task_metadata(masked_
                 "num_return_sequences": 2, "eos_token_id": [1], "pad_token_id": 0}
     configured = replace(source, generation_config=controls).text_generation()
     expected = replace(source.text_generation(), max_new_tokens=8, n=2, eos_token_ids=(1,), pad_token_id=0)
-    actual = configured(inputs, seed=7, steps=5).host()
-    wanted = expected(inputs, seed=7, steps=5).host()
+    actual = configured(inputs, key=7, steps=5).host()
+    wanted = expected(inputs, key=7, steps=5).host()
     for left, right in zip(jax.tree.leaves(actual), jax.tree.leaves(wanted), strict=True):
         np.testing.assert_array_equal(left, right)
 
@@ -316,12 +316,12 @@ def test_masked_task_refuses_media_and_non_scalar_logical_positions(masked_sourc
     source, inputs = masked_source
     task = source.text_generation()
     with pytest.raises(ValueError, match="conditioning"):
-        task(replace(inputs, conditioning={"pixel_values": jnp.zeros((3, 1, 3, 4, 4))}), 8, seed=7)
+        task(replace(inputs, conditioning={"pixel_values": jnp.zeros((3, 1, 3, 4, 4))}), 8, key=7)
     for name in ("image_indices", "image_groups", "audio_indices"):
         with pytest.raises(ValueError, match=name):
-            task(replace(inputs, token_fields={**inputs.token_fields, name: jnp.full((3, 4), -1)}), 8, seed=7)
+            task(replace(inputs, token_fields={**inputs.token_fields, name: jnp.full((3, 4), -1)}), 8, key=7)
     with pytest.raises(ValueError, match="positions"):
-        task(replace(inputs, token_fields={**inputs.token_fields, "positions": jnp.zeros((3, 4, 3))}), 8, seed=7)
+        task(replace(inputs, token_fields={**inputs.token_fields, "positions": jnp.zeros((3, 4, 3))}), 8, key=7)
 
 
 def test_saved_masked_run_refuses_invalid_sample_budget(masked_source, tmp_path):

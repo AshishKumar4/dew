@@ -55,5 +55,5 @@ task = TextGeneration(model, state.params, RunProcessor(tokenizer),
                       sampling=Sampling(temperature=0.8, top_k=40))
 server = Server.from_task(task, slots=8, capacity=256)
 prompts = ["ROMEO:", "JULIET:"]
-for prompt, generation in zip(prompts, server(prompts, 160, seed=0)):
+for prompt, generation in zip(prompts, server(prompts, 160, key=0)):
     print(prompt + generation.host().text[0], end="\n\n")

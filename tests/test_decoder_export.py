@@ -970,7 +970,7 @@ def test_standalone_glm5_export_preserves_native_and_source_computation(variant,
         ordinary = generate(model, variables, jnp.asarray(ids[:, :5]), 4, key=jax.random.key(0),
                             sampling=Sampling(temperature=0)).host()
         speculative = restored.text_generation(sampling=Sampling(temperature=0))(
-            ids[:, :5], max_new_tokens=4, seed=0, strategy=Speculative(block=3)).host()
+            ids[:, :5], max_new_tokens=4, key=0, strategy=Speculative(block=3)).host()
         np.testing.assert_array_equal(speculative.tokens, ordinary.tokens)
         np.testing.assert_array_equal(speculative.lengths, ordinary.lengths)
     for collection in ("params", "moe"):

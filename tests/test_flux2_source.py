@@ -213,7 +213,7 @@ def test_klein_pipeline_walk_matches_the_source(klein, arrays, record):
     task = klein.text_to_image()
     assert task.steps == 50 and task.guidance is not None and task.guidance.scale == 4.0
     initial = arrays["pipeline.x_T"].transpose(0, 2, 3, 1)
-    walked = task(task.prepare(pipeline["prompts"], initial=initial, seed=0, steps=pipeline["steps"]),
+    walked = task(task.prepare(pipeline["prompts"], initial=initial, key=0, steps=pipeline["steps"]),
                   key=jax.random.PRNGKey(0)).host()
     images = np.clip(np.asarray(walked.images) / 2 + 0.5, 0.0, 1.0)
     autoencoder = klein.autoencoder
