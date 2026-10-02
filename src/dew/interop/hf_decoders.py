@@ -4,7 +4,7 @@ translate_config and translate_weights are the map: a decoder config dict into
 CausalTransformer kwargs, and HF-named tensors into a dew params tree. The
 helpers around them fetch a repo (or read a local directory) and read the
 safetensors shards in their stored dtype without torch. Parameter binding
-defaults to FP32, independently of compute dtype, so dew.interop.load_pretrained
+defaults to FP32, independently of compute dtype, so dew.interop.Pretrained.load
 builds a model whose variables a forward pass takes straight away, and
 save_pretrained_decoder writes one back out in the HF layout.
 
@@ -1822,7 +1822,7 @@ def save_pretrained_decoder(model, variables, directory, *,
 
     `tokenizer` is the vocabulary the weights were trained against, by object
     or by name; `save_export_assets` writes its files beside them, so one call
-    leaves a directory `load_pretrained` reads back with its processor.
+    leaves a directory `Pretrained.load` reads back with its processor.
     `Pretrained.save` writes a decoder's weights through the same encoder
     (`Pretrained.export`), so the two leave the same weights behind.
     """
@@ -2146,7 +2146,7 @@ class DecoderFamily:
     prepare_weights: WeightPreparer = field(default=lambda tensors, _config=None: dict(tensors))
     """The checkpoint's tensors as the path map reads them: Llama 4 and Gemma 4
     split their fused expert kernels. A quantized format is undone before this,
-    by `load_pretrained`, which records what it undid for the export."""
+    by `Pretrained.load`, which records what it undid for the export."""
     tied_head_names: tuple[str, str] = ('lm_head.weight', 'model.embed_tokens.weight')
     """The head and the embedding a tied checkpoint stores two copies of, in
     the source's own names. A wrapper nests both under its language model."""

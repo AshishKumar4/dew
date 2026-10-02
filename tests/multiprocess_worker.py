@@ -1521,8 +1521,8 @@ def mode_continuations(args) -> dict:
         arrivals = multihost_utils.process_allgather(np.asarray(rank, np.int32))
         if arrivals.tolist() != list(range(processes)):
             raise AssertionError("a rank did not return from the rejected request")
-    from dew.interop import load_pretrained
-    source = load_pretrained(Path(__file__).parent / "fixtures/hf/diffusion-gemma-workflow",
+    from dew.interop import Pretrained
+    source = Pretrained.load(Path(__file__).parent / "fixtures/hf/diffusion-gemma-workflow",
                              dtype="float32", attention_impl="xla", max_seq_len=32)
     canvas = source.block_generation().bind(place(source.variables, MeshSpec(fsdp=args.fsdp_size),
                                                   Layout(min_shard=TINY)))
@@ -1809,12 +1809,12 @@ def mode_masked_generation(args) -> dict:
     from jax.experimental import multihost_utils
 
     from dew.inference.pipeline import place
-    from dew.interop import load_pretrained
+    from dew.interop import Pretrained
     from dew.nn.inputs import ModelInputs
     from dew.training import Layout, MeshSpec
 
     rank, processes = jax.process_index(), jax.process_count()
-    source = load_pretrained(Path(__file__).parent / "fixtures/hf/llada-tiny",
+    source = Pretrained.load(Path(__file__).parent / "fixtures/hf/llada-tiny",
                              dtype="float32", attention_impl="xla")
     task = source.text_generation().bind(place(source.variables, MeshSpec(fsdp=args.fsdp_size),
                                               Layout(min_shard=TINY)))

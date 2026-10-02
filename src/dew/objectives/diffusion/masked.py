@@ -83,7 +83,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         None shows the ids alone.
 
         `pretrained` is a released masked-diffusion checkpoint's variables as
-        `load_pretrained` returns them, so a run continues from LLaDA's or
+        `Pretrained.load` returns them, so a run continues from LLaDA's or
         Dream's weights instead of a fresh init; None draws the init."""
         if model.causal:
             raise ValueError(
@@ -121,7 +121,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         if "params" not in pretrained:
             raise ValueError(
                 "pretrained is the variables dict ({'params': ...}) that "
-                "load_pretrained and model.init return")
+                "Pretrained.load and model.init return")
         return pretrained
 
     def loss(self, params, batch, step: Step):

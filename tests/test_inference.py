@@ -473,7 +473,7 @@ def test_an_lm_run_without_an_average_publishes_and_exports_its_live_weights(tmp
     """An LM keeps no EMA unless asked, so each reader's default takes the
     live weights of such a run: the objective's pipeline, `dew.pipeline`
     and `export_run`."""
-    from dew.interop import export_run, load_pretrained
+    from dew.interop import Pretrained, export_run
 
     run = tmp_path / "run"
     run.mkdir()
@@ -482,7 +482,7 @@ def test_an_lm_run_without_an_average_publishes_and_exports_its_live_weights(tmp
     for expected, bound in zip(jax.tree.leaves(state.params), jax.tree.leaves(published.variables), strict=True):
         assert bound is expected
     export_run(str(run), tmp_path / "export")
-    reloaded = load_pretrained(tmp_path / "export", dtype="float32", attention_impl="reference")
+    reloaded = Pretrained.load(tmp_path / "export", dtype="float32", attention_impl="reference")
     ids = jnp.asarray([[3, 4, 5, 6]], jnp.int32)
     np.testing.assert_array_equal(np.asarray(reloaded.model.apply(reloaded.variables, ids)),
                                   np.asarray(published.model.apply(published.variables, ids)))
@@ -613,11 +613,11 @@ def make_block_run(directory):
     weights under a checkpoint, and the `run.json` a block run writes."""
     from pathlib import Path
 
-    from dew.interop import load_pretrained
+    from dew.interop import Pretrained
     from dew.objectives.diffusion.block import BlockDiffusionObjective
 
     fixture = Path(__file__).resolve().parent / "fixtures/hf/diffusion-gemma-workflow"
-    bundle = load_pretrained(str(fixture), dtype="float32", attention_impl="xla", max_seq_len=32)
+    bundle = Pretrained.load(str(fixture), dtype="float32", attention_impl="xla", max_seq_len=32)
     objective = BlockDiffusionObjective(bundle.model, prompt_length=3, pretrained=bundle.variables)
     state = Trainer(objective, optax.sgd(0.01), key=jax.random.PRNGKey(2)).initial_state()
     checkpoints = Checkpoints(str(directory))
@@ -637,11 +637,11 @@ def make_masked_run(directory):
     from pathlib import Path
 
     from dew.diffusion.discrete import MDLM
-    from dew.interop import load_pretrained
+    from dew.interop import Pretrained
     from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 
     fixture = Path(__file__).resolve().parent / "fixtures/hf/llada-tiny"
-    source = load_pretrained(fixture, dtype="float32", attention_impl="xla")
+    source = Pretrained.load(fixture, dtype="float32", attention_impl="xla")
     objective = MaskedDiffusionObjective(source.model, MDLM(mask_id=120)(), 8,
                                          pretrained=source.variables, ema_decay=None)
     state = Trainer(objective, optax.sgd(0.05), key=jax.random.PRNGKey(19)).initial_state()

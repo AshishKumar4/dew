@@ -17,7 +17,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.interop import load_pretrained
+from dew.interop import Pretrained
 from dew.interop.hf_decoders import translate_config
 from dew.nn.sharding import pipeline_microbatches
 from dew.objectives.base import Step
@@ -38,7 +38,7 @@ FIXTURE_NAMES = ("qwen3-tiny", "deepseek-v3-tiny", "gemma4-e2b", "gemma3n-tiny")
 def fixture_pair(name, **overrides):
     """The fixture's model and its scanned twin, with the fixture's weights."""
     directory = FIXTURES / name
-    pretrained = load_pretrained(
+    pretrained = Pretrained.load(
         str(directory), dtype="float32", attention_impl="reference", **overrides)
     scanned = models.build("causal_transformer",
                            **{**pretrained.model_config, "scan_layers": True})
@@ -606,7 +606,7 @@ def test_a_scanned_glm5_next_computes_its_unrolled_forward():
     8.7, 10.1 or NaN depending on the process, exact without jit and on a
     GPU: the compiled program is identical across processes, so the bad
     values came from its run (`chunk_kimi_delta_rule`'s workaround)."""
-    loaded = load_pretrained(FIXTURES / "glm5-next-tiny", dtype="float32", param_dtype="float32")
+    loaded = Pretrained.load(FIXTURES / "glm5-next-tiny", dtype="float32", param_dtype="float32")
     tokens = (jnp.arange(24, dtype=jnp.int32).reshape(2, 12) * 7) % 31 + 1
     unrolled = np.asarray(jax.jit(loaded.model.apply)(loaded.variables, tokens), np.float64)
     scanned = dataclasses.replace(loaded.model, scan_layers=True)

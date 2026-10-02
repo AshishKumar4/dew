@@ -184,9 +184,9 @@ def test_the_published_autoencoder_matches_the_source():
 
 @pytest.fixture(scope="module")
 def klein(source):
-    from dew.interop.pretrained import load_pretrained
+    from dew.interop.pretrained import Pretrained
 
-    return load_pretrained(str(source / "pipeline"), dtype="float32", attention_impl="xla")
+    return Pretrained.load(str(source / "pipeline"), dtype="float32", attention_impl="xla")
 
 
 def test_klein_prompt_encoding_matches_the_source_pipeline(klein, arrays, record):
@@ -206,7 +206,7 @@ def test_klein_prompt_encoding_matches_the_source_pipeline(klein, arrays, record
 
 
 def test_klein_pipeline_walk_matches_the_source(klein, arrays, record):
-    """`load_pretrained().text_to_image()` reproduces the source's own call:
+    """`Pretrained.load().text_to_image()` reproduces the source's own call:
     its defaults (50 steps, two branches guided at 4.0 against the empty
     prompt), and at the recorded step count the sigmas it lays out shifted
     by its empirical mu, the latent it ends on and the image it decodes."""

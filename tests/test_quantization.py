@@ -604,12 +604,12 @@ def test_a_quantized_text_task_without_qwix_names_the_install_extra(monkeypatch)
 def test_a_quantized_multimodal_task_keeps_its_processor_and_media():
     from pathlib import Path
 
-    from dew.interop import load_pretrained
+    from dew.interop import Pretrained
     from dew.sampling import Sampling
 
     pytest.importorskip("qwix")
     directory = Path(__file__).parent / "fixtures/hf/gemma3-native-tiny"
-    source = load_pretrained(directory, dtype="float32", attention_impl="reference", max_seq_len=64)
+    source = Pretrained.load(directory, dtype="float32", attention_impl="reference", max_seq_len=64)
     task = source.text_generation(sampling=Sampling(temperature=0))
     image = np.load(directory / "raw_images.npy")[0]
     prompt = "token7 <start_of_image> token9"

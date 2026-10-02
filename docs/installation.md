@@ -62,9 +62,9 @@ The plain install includes Transformers, the Hugging Face Hub client and the ima
 |---|---|
 | `interop` | safetensors reading and writing |
 | `torch` | PyTorch on the host, to read `pytorch_model.bin` files and to check unregistered decoders against Transformers |
-| `diffusers` | Loading original-format single-file diffusion checkpoints (`load_pretrained(..., single_file=)`) |
-| `gguf` | Loading GGUF files (`load_pretrained(..., gguf_file=)`) |
-| `torchax` | `load_pretrained(fallback="torchax")`, which runs a Transformers PyTorch model lowered to JAX |
+| `diffusers` | Loading original-format single-file diffusion checkpoints (`Pretrained.load(..., single_file=)`) |
+| `gguf` | Loading GGUF files (`Pretrained.load(..., gguf_file=)`) |
+| `torchax` | `Pretrained.load(fallback="torchax")`, which runs a Transformers PyTorch model lowered to JAX |
 | `guided` | Regex and JSON-schema guided decoding (`dew.sampling.guided`) |
 | `streaming` | Hugging Face `datasets` and online sources |
 | `tfds` | Reading prepared TFDS ArrayRecords without TensorFlow |

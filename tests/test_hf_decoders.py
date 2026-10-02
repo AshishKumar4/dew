@@ -105,7 +105,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.interop import hf_decoders, load_pretrained
+from dew.interop import Pretrained, hf_decoders
 from dew.interop.hf_decoders import save_pretrained_decoder, translate_config, translate_weights
 from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -169,11 +169,11 @@ def test_registered_family_alias_preserves_its_source_when_exported(tmp_path, mo
     config = fixture_config("dream-tiny")
     config["model_type"] = alias
     (source / "config.json").write_text(json.dumps(config))
-    loaded = load_pretrained(source, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(source, dtype="float32", attention_impl="reference")
     destination = tmp_path / "export"
     loaded.save(destination)
     assert json.loads((destination / "config.json").read_text()) == config
-    restored = load_pretrained(destination, dtype="float32", attention_impl="reference")
+    restored = Pretrained.load(destination, dtype="float32", attention_impl="reference")
     ids = np.load(source / "input_ids.npy")
     np.testing.assert_array_equal(loaded.model.apply(loaded.variables, ids),
                                   restored.model.apply(restored.variables, ids))
@@ -181,7 +181,7 @@ def test_registered_family_alias_preserves_its_source_when_exported(tmp_path, mo
 
 def fp32_decoder(directory, **kwargs):
     """The fixture as a model plus variables, in fp32 on the reference kernel."""
-    pretrained = load_pretrained(str(directory), dtype='float32',
+    pretrained = Pretrained.load(str(directory), dtype='float32',
                                  attention_impl='reference', **kwargs)
     return pretrained.model, pretrained.variables
 
@@ -199,7 +199,7 @@ def test_llama_checkpoint_with_training_metadata_keeps_reference_logits(tmp_path
     config = fixture_config("llama-tiny")
     config.update(is_llama_config=True, rope_interleaved=False)
     (directory / "config.json").write_text(json.dumps(config))
-    loaded = load_pretrained(directory, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
     ids = np.load(original / "input_ids.npy")
     actual = np.asarray(loaded.model.apply(loaded.variables, ids))
     expected = np.load(original / "logits.npy")
@@ -776,7 +776,7 @@ def test_the_bf16_gemma_forward_still_tracks_the_reference():
     the fp32 reference logits the observed difference is 5.7e-02 on the
     reference kernel, tolerance 1e-01; dropping the scale moves them by 1.06."""
     directory = FIXTURES / "gemma3-tiny"
-    pretrained = load_pretrained(str(directory), dtype='bfloat16',
+    pretrained = Pretrained.load(str(directory), dtype='bfloat16',
                                  attention_impl='reference')
     model, variables = pretrained.model, pretrained.variables
     reference = np.load(directory / "logits.npy")
@@ -970,7 +970,7 @@ def test_qwen3_0_6b_matches_the_reference_on_the_real_weights():
     reference = np.load(REAL / "reference.npz")
     ids = np.asarray(prompt['input_ids'], np.int32)[None]
 
-    pretrained = load_pretrained(prompt['repo'], dtype='float32',
+    pretrained = Pretrained.load(prompt['repo'], dtype='float32',
                                  attention_impl='reference',
                                  max_seq_len=int(ids.shape[1]))
     model, variables = pretrained.model, pretrained.variables
@@ -1105,7 +1105,7 @@ def test_llada_logits_match_the_reference_implementation():
 
 @pytest.fixture(scope='module')
 def glm5_next_source():
-    return load_pretrained(FIXTURES / 'glm5-next-tiny', dtype='float32', attention_impl='reference')
+    return Pretrained.load(FIXTURES / 'glm5-next-tiny', dtype='float32', attention_impl='reference')
 
 
 def test_glm5_next_translates_the_released_text_config_and_refuses_the_wrapper():

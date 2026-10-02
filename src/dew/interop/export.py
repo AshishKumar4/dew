@@ -25,7 +25,7 @@ def export_run(run_dir: str, destination: str | Path, *, ema: bool | None = None
     takes the live weights). The model that comes back decides
     the layout, and a model with no published layout is refused by name.
 
-    The result is a Hugging Face directory: `load_pretrained` reads it back,
+    The result is a Hugging Face directory: `Pretrained.load` reads it back,
     and so does transformers for a family it knows.
     """
     from dew.inference.pipeline import pipeline

@@ -515,12 +515,12 @@ def test_a_shared_text_owner_sums_both_block_losses_through_one_bank(detached):
     """
     from pathlib import Path
 
-    from dew.interop import load_pretrained
+    from dew.interop import Pretrained
     from dew.nn.diffusion_gemma import DiffusionGemma
     from dew.objectives.diffusion.block import BlockDiffusionObjective
 
     fixture = Path(__file__).resolve().parent / "fixtures/hf/diffusion-gemma-sft"
-    loaded = load_pretrained(fixture, dtype="float32", attention_impl="xla", max_seq_len=32)
+    loaded = Pretrained.load(fixture, dtype="float32", attention_impl="xla", max_seq_len=32)
     source = loaded.model
     assert isinstance(source, DiffusionGemma)
     scanned = source.clone(text=source.text.clone(scan_layers=True))

@@ -6,7 +6,7 @@
 The run packs whole conversations into windows, counts the loss on assistant
 targets alone, shards the weights over the visible devices and accumulates
 micro-batches into one update. It ends by exporting the trained weights to
-the Hugging Face layout, so transformers and `load_pretrained` both read
+the Hugging Face layout, so transformers and `Pretrained.load` both read
 them, and the run directory itself scores through the harness:
 
     python -m dew.eval --model dew --model_args run=runs/gemma4-sft/checkpoints/gemma4-sft \\
@@ -29,7 +29,7 @@ import tyro
 from dew.config import ModelConfig, OptimConfig, TrainerConfig
 from dew.data import ChatMessages, HFTokenizer, Loading
 from dew.data.chat import Role
-from dew.interop import export_run, load_pretrained
+from dew.interop import PretrainedDecoder, export_run
 from dew.objectives.lm import LMRunConfig, Perplexity, Samples
 from dew.training import MeshSpec, TrainState, prepare_process
 
@@ -118,7 +118,7 @@ def main(config: Config) -> Path:
     # the pool forms, and a pool's count is every process's devices.
     run = replace(run, trainer=replace(run.trainer, mesh=MeshSpec(fsdp=jax.device_count())))
 
-    source = load_pretrained(config.model, dtype=run.model.dtype,
+    source = PretrainedDecoder.load(config.model, dtype=run.model.dtype,
                              attention_impl=run.model.attention_impl,
                              max_seq_len=config.sequence_length + run.sample_tokens)
     words = HFTokenizer(tokenizer)

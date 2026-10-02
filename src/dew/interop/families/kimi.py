@@ -46,7 +46,7 @@ their bytes back. K3's decoder adds to Kimi Linear's:
 - Attention Residuals over blocks of `attn_res_block_size` layers.
 
 K3's routed experts ship as compressed-tensors MXFP4
-(`text_config.quantization_config`), which `load_pretrained` decodes before
+(`text_config.quantization_config`), which `Pretrained.load` decodes before
 this map runs. Each KDA layer's `A_log` ships padded from its heads to a
 longer zero tail (128 for 96 heads), which `_kimi_k3_prepare` checks and
 trims.

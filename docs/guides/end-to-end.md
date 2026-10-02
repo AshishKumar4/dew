@@ -25,7 +25,7 @@ The smoke run writes synthetic captioned records, conditions on the tiny CLIP fi
 
 [`examples/sft_diffusion_gemma.py`](https://github.com/AshishKumar4/dew/blob/main/examples/sft_diffusion_gemma.py) fine-tunes a DiffusionGemma checkpoint on chat data with a low-rank adapter. The script works in these steps:
 
-1. `load_pretrained` loads the base weights and their layouts.
+1. `Pretrained.load` loads the base weights and their layouts.
 2. `LoRA.fresh` adds low-rank factors to the projections that `--modules` names.
 3. `BlockDiffusionObjective` trains the adapted module, with the adapter's own filter as `trainable`.
 4. `Layout(host=("params",))` keeps the train state in host memory between steps, so only the factors move to the device. For this the decoder is cloned with `scan_layers=True`: a host layout streams one layer per scan iteration, while a plain Python loop would have all its fetches hoisted onto the device together.
@@ -46,7 +46,7 @@ JAX_PLATFORMS=cpu python examples/sft_diffusion_gemma.py --smoke --out /tmp/dg-s
 
 ## Full-weight SFT of a Gemma 4 decoder
 
-[`examples/sft_gemma4.py`](https://github.com/AshishKumar4/dew/blob/main/examples/sft_gemma4.py) trains every weight of a Gemma 4 text decoder on a Hub chat dataset. It packs conversations into windows, and `LMObjective(loss_role=Role.ASSISTANT)` counts the loss only on assistant targets. The trainer shards over the visible devices and accumulates micro-batches into one update. The run writes `run.json` next to its checkpoints, so `dew.interop.export_run` can write a Hugging Face directory that both transformers and `load_pretrained` read. The run directory is `<--out>/checkpoints/<name of --out>`, which is the path the `dew.eval` command below reads.
+[`examples/sft_gemma4.py`](https://github.com/AshishKumar4/dew/blob/main/examples/sft_gemma4.py) trains every weight of a Gemma 4 text decoder on a Hub chat dataset. It packs conversations into windows, and `LMObjective(loss_role=Role.ASSISTANT)` counts the loss only on assistant targets. The trainer shards over the visible devices and accumulates micro-batches into one update. The run writes `run.json` next to its checkpoints, so `dew.interop.export_run` can write a Hugging Face directory that both transformers and `Pretrained.load` read. The run directory is `<--out>/checkpoints/<name of --out>`, which is the path the `dew.eval` command below reads.
 
 ```bash
 python examples/sft_gemma4.py --model google/gemma-4-E2B \

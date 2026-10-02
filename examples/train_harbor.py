@@ -47,7 +47,7 @@ import tyro
 from dew.data import HFTokenizer
 from dew.data.dataset import Dataset
 from dew.inference import NativeRolloutServer, Publication, SafetensorsReload, Server, TextGeneration
-from dew.interop import load_pretrained
+from dew.interop import PretrainedDecoder
 from dew.interop.harbor import HARBOR_KEY, Gateway, HarborSource
 from dew.objectives.rl import GRPOObjective, RolloutScheduler, SchedulerRecord
 from dew.objectives.rl.scheduler import task_ids
@@ -95,7 +95,7 @@ def main(config: Config) -> dict:
         config = replace(config, model=str(FIXTURES / "qwen2-tiny"), steps=2, prompts=2, groups=2, width=128,
                          truncation="score", workers=4)
     config.out.mkdir(parents=True, exist_ok=True)
-    source = load_pretrained(
+    source = PretrainedDecoder.load(
         config.model,
         dtype="float32" if config.smoke else "bfloat16",
         param_dtype="float32",
