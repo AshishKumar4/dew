@@ -16,7 +16,7 @@ with os.fdopen(fd,'w') as f:f.write(secrets.token_urlsafe(32))
 PY
 KG_AUTH_TOKEN=$(cat /run/dew/gateway-token)
 export KG_AUTH_TOKEN
-nohup env PYTHONPATH=/opt/live /opt/venv/bin/jupyter-kernel-gateway \
+nohup env PYTHONPATH=/opt/live /opt/venv/bin/jupyter-kernelgateway \
   --KernelGatewayApp.kernel_manager_class=gateway_manager.LimitedMappingKernelManager \
   --KernelGatewayApp.ip=127.0.0.1 --KernelGatewayApp.port=8890 \
   --KernelGatewayApp.max_kernels=8 --KernelGatewayApp.runtime_dir=/run/dew/gateway \
