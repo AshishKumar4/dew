@@ -6,10 +6,9 @@ the trainer or a batch dict, so an objective composes them and this package
 is testable on fixed tensors.
 
 The import arrow points one way. `dew.rl` may read `dew`; nothing under `dew`
-outside `dew.rl` and `dew.objectives.rl` may read `dew.rl`. That one-way arrow
-keeps the split into a separate distribution a directory move
-(`docs/design/plan.md`, section 5.1). tests/test_rl_imports.py walks the tree
-and fails when either half of that stops being true.
+outside `dew.rl` and `dew.objectives.rl` may read `dew.rl`, which keeps the
+split into a separate distribution a directory move (`docs/design/plan.md`,
+section 5.1).
 
 `sandbox` runs untrusted programs and tool sessions in bounded subprocesses
 or containers, which a verifiable reward scores completions with. It reads
