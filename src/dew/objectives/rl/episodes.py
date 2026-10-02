@@ -237,7 +237,9 @@ class _Session:
                        self.status, self.detail, self.reward, _binding_id=binding_id)
 
 
-def turn_limit(observation: Observation, turn: int, *, max_turns: int, max_prompt_tokens: int) -> Observation | None:
+def turn_limit(
+    observation: Observation, turn: int, *, max_turns: int, max_prompt_tokens: int
+) -> Observation | None:
     """The truncation that ends a running episode before its call `turn`, or None to draw it.
 
     Every episode driver applies these limits: `turn` counts calls already
@@ -251,7 +253,8 @@ def turn_limit(observation: Observation, turn: int, *, max_turns: int, max_promp
 
 
 def step_action(environment: Environment, action: Action) -> Observation:
-    """Step the environment with an action that ended on EOS; one that hit its token limit truncates instead."""
+    """Step the environment with an action that ended on EOS; one that
+    hit its token limit truncates instead."""
     if action.terminated:
         return environment.step(action)
     return Observation((), EpisodeStatus.TRUNCATED, "model turn reached its token limit")
@@ -323,7 +326,9 @@ class EpisodeRollout:
         of resetting, so a resumed cohort never repeats a completed call.
         """
         for slot in slots:
-            slot.environment = slot.invoke(lambda: stack.enter_context(self.environment(slot.identity)))
+            slot.environment = slot.invoke(
+                lambda slot=slot: stack.enter_context(self.environment(slot.identity))
+            )
             saved = None if run is None else slot.invoke(run.load, slot.identity)
             if saved is None:
                 observation = slot.invoke(slot.environment.reset)
@@ -337,7 +342,9 @@ class EpisodeRollout:
                 episode = saved.episode
                 slot.initial, slot.transitions = episode.initial, list(episode.transitions)
                 slot.pending, slot.reward = saved.pending, episode.reward
-                slot.observation = episode.transitions[-1].observation if episode.transitions else episode.initial
+                slot.observation = (
+                    episode.transitions[-1].observation if episode.transitions else episode.initial
+                )
                 slot.status, slot.detail = episode.status, episode.detail
 
     def _inputs(self, slots: list[_Session], turn: int) -> ModelInputs:
@@ -350,7 +357,11 @@ class EpisodeRollout:
         tokens = np.full((len(slots), self.max_prompt_tokens), self.sampling.pad_id, np.int32)
         valid = np.zeros_like(tokens, bool)
         for row, slot in enumerate(slots):
-            if slot.status == EpisodeStatus.RUNNING and len(slot.transitions) == turn and slot.pending is None:
+            if (
+                slot.status == EpisodeStatus.RUNNING
+                and len(slot.transitions) == turn
+                and slot.pending is None
+            ):
                 observation = slot.observation
                 assert observation is not None
                 length = len(observation.context)
@@ -385,10 +396,16 @@ class EpisodeRollout:
         # Record every actual draw before invoking any tool. A tool failure
         # must not erase the other requests already sampled in this cohort.
         for row, slot in enumerate(slots):
-            if slot.status == EpisodeStatus.RUNNING and len(slot.transitions) == turn and slot.pending is None:
+            if (
+                slot.status == EpisodeStatus.RUNNING
+                and len(slot.transitions) == turn
+                and slot.pending is None
+            ):
                 observation = slot.observation
                 assert observation is not None
-                slot.pending = slot.invoke(self._action, rows, row, observation.context, policy_step, binding_id)
+                slot.pending = slot.invoke(
+                    self._action, rows, row, observation.context, policy_step, binding_id
+                )
                 self._persist(slot, run, policy_step, binding_id)
         for slot in slots:
             action = slot.pending
@@ -404,7 +421,9 @@ class EpisodeRollout:
             slot.invoke(slot.observe, observation)
             self._persist(slot, run, policy_step, binding_id)
 
-    def _verify(self, slots: list[_Session], policy_step: int, binding_id: str, run: JournalRun | None) -> None:
+    def _verify(
+        self, slots: list[_Session], policy_step: int, binding_id: str, run: JournalRun | None
+    ) -> None:
         """Score every unscored slot with the verifier and persist the reward.
 
         A slot still running when the turn budget ran out is truncated
@@ -415,7 +434,7 @@ class EpisodeRollout:
                 continue
             if slot.status == EpisodeStatus.RUNNING:
                 slot.status, slot.detail = EpisodeStatus.TRUNCATED, "episode turn limit reached"
-            def score() -> float:
+            def score(slot=slot) -> float:
                 reward = float(self.verifier(slot.episode(policy_step, binding_id)))
                 if not math.isfinite(reward):
                     raise ValueError("episode verifier returned a non-finite reward")
@@ -440,7 +459,9 @@ class EpisodeRollout:
         if explicit:
             cancelled = primary.status == EpisodeStatus.CANCELLED
         for slot in started:
-            slot.status = (EpisodeStatus.ERROR if slot is primary and not cancelled else EpisodeStatus.CANCELLED)
+            slot.status = (
+                EpisodeStatus.ERROR if slot is primary and not cancelled else EpisodeStatus.CANCELLED
+            )
             slot.detail = str(error) if explicit else f"{type(error).__name__}: {error}"
             slot.reward = None
             if slot.pending is not None:
@@ -458,8 +479,14 @@ class EpisodeRollout:
             raise failure from None
         raise failure from error
 
-    def _action(self, generation: Generation[np.ndarray], row: int, context: tuple[int, ...], policy_step: int,
-                binding_id: str) -> Action:
+    def _action(
+        self,
+        generation: Generation[np.ndarray],
+        row: int,
+        context: tuple[int, ...],
+        policy_step: int,
+        binding_id: str,
+    ) -> Action:
         """Read one cohort row as an `Action`, validating its provenance first.
 
         The environment acts on this record, so the row has to carry back
@@ -467,7 +494,10 @@ class EpisodeRollout:
         """
         tokens = np.asarray(generation.tokens)[row]
         lengths, ended = np.asarray(generation.lengths), np.asarray(generation.terminated)
-        raw, behavior = np.asarray(generation.raw_log_probs)[row], np.asarray(generation.behavior_log_probs)[row]
+        raw, behavior = (
+            np.asarray(generation.raw_log_probs)[row],
+            np.asarray(generation.behavior_log_probs)[row],
+        )
         width = self.max_prompt_tokens
         expected = np.full(width, self.sampling.pad_id, np.int32)
         expected[-len(context):] = context
@@ -542,13 +572,15 @@ class EpisodeRollout:
         with ExitStack() as stack:
             agreed("episode reset", lambda: self._open(slots, stack, run, policy_step, binding_id))
             for turn in range(self.max_turns):
-                inputs = agreed("episode context preparation", lambda: self._inputs(slots, turn))
+                inputs = agreed("episode context preparation", lambda turn=turn: self._inputs(slots, turn))
                 active = any(slot.status == EpisodeStatus.RUNNING for slot in slots)
                 if not agree_process_phase(None, phase="episode availability", available=active):
                     break
-                generation = agreed("episode generation", lambda: policy(inputs, self.max_new_tokens,
+                generation = agreed("episode generation", lambda inputs=inputs, turn=turn: policy(
+                    inputs, self.max_new_tokens,
                     key=jax.random.fold_in(key, turn), sampling=self.sampling))
-                agreed("episode tool step", lambda: self._advance(slots, generation, policy_step, binding_id, turn, run))
+                agreed("episode tool step", lambda generation=generation, turn=turn: self._advance(
+                    slots, generation, policy_step, binding_id, turn, run))
             agreed("episode verification", lambda: self._verify(slots, policy_step, binding_id, run))
 
     def collect(self, state: TrainState, batch: Batch, key: jax.Array) -> tuple[Episode, ...]:
@@ -567,7 +599,9 @@ class EpisodeRollout:
         tasks, policy, signature = agreed("episode preparation", prepare)
         processes, rank = jax.process_count(), jax.process_index()
         if processes > 1:
-            multihost_utils.assert_equal(signature, "episode task counts, budgets, sampling and clocks must agree")
+            multihost_utils.assert_equal(
+                signature, "episode task counts, budgets, sampling and clocks must agree"
+            )
         origin = np.frombuffer(uuid4().bytes, np.uint8) if rank == 0 else np.zeros(16, np.uint8)
         if processes > 1:
             origin = multihost_utils.broadcast_one_to_all(origin)
@@ -629,7 +663,10 @@ class EpisodeRollout:
                     or episode.identity.attempt != episodes[0].identity.attempt
                     or any(turn.action.policy_step != policy_step for turn in episode.transitions)):
                 raise ValueError("an episode batch must share one policy snapshot and attempt")
-            if episode.status not in (EpisodeStatus.COMPLETED, EpisodeStatus.TRUNCATED) or episode.reward is None:
+            if (
+                episode.status not in (EpisodeStatus.COMPLETED, EpisodeStatus.TRUNCATED)
+                or episode.reward is None
+            ):
                 raise ValueError("only verified completed or truncated episodes may train")
             if len(episode.transitions) > self.max_turns:
                 raise ValueError("episode exceeds max_turns")
@@ -653,8 +690,12 @@ def session_of(episode: Episode, *, group: str) -> Session:
     ended on EOS and `length` otherwise. An environment-reported error is an
     infrastructure failure; how well the agent did is the verifier's reward.
     """
-    status = {EpisodeStatus.COMPLETED: Status.COMPLETED, EpisodeStatus.TRUNCATED: Status.TRUNCATED,
-              EpisodeStatus.ERROR: Status.INFRA_ERROR, EpisodeStatus.CANCELLED: Status.CANCELLED}[episode.status]
+    status = {
+        EpisodeStatus.COMPLETED: Status.COMPLETED,
+        EpisodeStatus.TRUNCATED: Status.TRUNCATED,
+        EpisodeStatus.ERROR: Status.INFRA_ERROR,
+        EpisodeStatus.CANCELLED: Status.CANCELLED,
+    }[episode.status]
     calls = tuple(Call(turn.action.context, turn.action.tokens, turn.action.behavior_log_probs,
                        "stop" if turn.action.terminated else "length", turn.action.policy_step)
                   for turn in episode.transitions)

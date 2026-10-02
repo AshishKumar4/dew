@@ -19,6 +19,7 @@ raises.
 """
 
 import dataclasses
+import datetime
 import functools
 import hashlib
 import json
@@ -28,8 +29,8 @@ import re
 import sys
 import types
 import typing
-from collections.abc import Callable, Mapping as MappingABC, MutableMapping, Sequence
-from typing import TYPE_CHECKING, Annotated, Literal, Mapping, Self
+from collections.abc import Callable, Mapping, Mapping as MappingABC, MutableMapping, Sequence
+from typing import TYPE_CHECKING, Annotated, Literal, Self
 
 import jax
 import tyro
@@ -40,19 +41,21 @@ import dew.io
 import dew.nn.backbones  # registers the models a config names
 from dew import registry
 from dew.artifacts import agree_process_phase, agreed
-from dew.checkpoints import RUN_FILE, Checkpoints
+from dew.checkpoints import RUN_FILE, Checkpoints, Keep
 from dew.data import Dataset, DatasetSpec, Ramp, ramped
 from dew.data.dataset import json_list_argument
-from dew.lora import LoRA, attach
+from dew.lora import LoRA, _attach
 from dew.nn.attention import AttentionImpl
 from dew.objectives.base import Effects, Loss, Metric, Objective
-from dew.records import JSON
+from dew.records import JSON, duration, recorded_duration
 from dew.registry import REGISTRIES, _declared_type, datasets, models, schedules, with_precision
 from dew.telemetry.instrumentation import default_compilation_cache_dir, dew_cache_dir
 from dew.telemetry.records import RunRecord, json_value, packages_installed
+from dew.training.display import TrainingDisplay
 from dew.training.distributed import Layout, MeshSpec
 from dew.training.optim import ParamGroup, ScheduleBase, build_optimizer
-from dew.training.quantization import Quantization, quantize
+from dew.training.quantization import Quantization, _quantize
+from dew.training.selection import Best
 from dew.training.state import TrainState
 from dew.training.tracker import LocalTracker, Trackers, WandbTracker
 from dew.training.trainer import ProfileWindow, Rollout, Trainer
@@ -97,7 +100,11 @@ class ModelConfig:
     """What every matmul of the model asks XLA for, where the model declares
     a `precision` field: `default` is the backend's fastest algorithm,
     `high` and `highest` trade throughput for mantissa bits (on Ampere and
-    later, tf32 and fp32 against bf16x3). Unset leaves the model's own."""
+    later, tf32 and fp32 against bf16x3). Unset leaves the model's own, the
+    default. Under bf16 compute a decoder's vocabulary head at the default
+    rounds its logits and their gradient to bf16, as torch autocast does;
+    `high` and `highest` keep that head fp32, the setting for comparing
+    parallel layouts in bf16 (`dew.nn.precision.head_product`)."""
     attention_impl: AttentionImpl = "auto"
     """Attention kernel; 'auto' is cudnn on a GPU for the shapes cudnn
     supports and xla for the rest, xla on any other backend."""
@@ -169,13 +176,82 @@ class Wandb:
     offline: bool = False
 
 
+def _best_argument():
+    """A metric name or JSON policies through one CLI argument."""
+    def read(given):
+        text = given[0]
+        if text == 'None':
+            return None
+        if text.startswith(('{', '[')):
+            policies = json.loads(text)
+            return (
+                tuple(Best(**policy) for policy in policies)
+                if isinstance(policies, list)
+                else Best(**policies)
+            )
+        return Best(text)
+
+    def write(policy):
+        if policy is None:
+            return ['None']
+        if isinstance(policy, str):
+            return [policy]
+        return [
+            json.dumps(
+                [_to_json(entry, Best) for entry in policy]
+                if isinstance(policy, tuple)
+                else _to_json(policy, Best)
+            )
+        ]
+
+    return tyro.constructors.PrimitiveConstructorSpec(
+        nargs=1, metavar='METRIC|JSON', instance_from_str=read,
+        is_instance=lambda policy: policy is None or isinstance(policy, (str, Best, tuple)),
+        str_from_instance=write)
+
+
+def _keep_argument():
+    return tyro.constructors.PrimitiveConstructorSpec(
+        nargs=1,
+        metavar="LATEST|JSON",
+        instance_from_str=lambda given: Keep(**json.loads(given[0]))
+        if given[0].startswith("{")
+        else int(given[0]),
+        is_instance=lambda keep: isinstance(keep, (int, Keep)),
+        str_from_instance=lambda keep: [
+            json.dumps(_to_json(keep, Keep)) if isinstance(keep, Keep) else str(keep)
+        ],
+    )
+
+
+def _cadence_argument():
+    def read(given):
+        value = given[0]
+        if value == 'None':
+            return None
+        if value == 'epoch':
+            return value
+        return int(value) if value.isdecimal() else duration(value)
+    return tyro.constructors.PrimitiveConstructorSpec(
+        nargs=1,
+        metavar="STEPS|DURATION|epoch",
+        instance_from_str=read,
+        is_instance=lambda value: value is None or isinstance(value, (int, str, datetime.timedelta)),
+        str_from_instance=lambda value: [
+            recorded_duration(value) if isinstance(value, datetime.timedelta) else str(value)
+        ],
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class TrainerConfig:
     """Holds the run length, checkpointing, sharding and run tracking."""
 
     name: str | None = None
     checkpoint_dir: str = "./checkpoints"
-    keep: int = 2
+    keep: Annotated[int | Keep, _keep_argument()] = 2
+    best: Annotated[str | Best | tuple[Best, ...] | None, _best_argument()] = None
+    """Metric name and ranking policy; None selects validation loss or training loss."""
     """Latest checkpoints kept, besides the best one."""
     batch_size: int = 32
     """Global batch, over every process."""
@@ -189,7 +265,7 @@ class TrainerConfig:
     """Steps between validation passes: a number of steps, "epoch" for one
     pass over the data, None to never validate. "epoch" over a stream that
     reports no record count raises a ValueError, since it has no pass."""
-    checkpoint_every: int | Literal["epoch"] | None = "epoch"
+    checkpoint_every: Annotated[int | str | datetime.timedelta | None, _cadence_argument()] = "epoch"
     """Steps between checkpoints, the same three answers. None is what a
     stream whose iterator cannot report a read position trains with; the
     trainer refuses any other answer for one."""
@@ -202,8 +278,8 @@ class TrainerConfig:
     One optimizer update a step either way, and the compiled step is traced
     once per stage."""
     dynamic_scale: bool = False
-    mesh: MeshSpec = MeshSpec()
-    layout: Layout = Layout()
+    mesh: MeshSpec = dataclasses.field(default_factory=MeshSpec)
+    layout: Layout = dataclasses.field(default_factory=Layout)
     profile: ProfileWindow | None = None
     """One profiler window: the steps to trace, the warmup before it and the
     directory it is written to. Unset traces nothing."""
@@ -214,7 +290,8 @@ class TrainerConfig:
     wandb: Wandb | None = None
     """Optional W&B sink in addition to the local tracking journal."""
     multi_host: bool | None = None
-    """Join the JAX process pool. None asks and continues alone only when no cluster is configured; True requires the pool; False never asks."""
+    """Join the JAX process pool. None asks and continues alone only when no
+    cluster is configured; True requires the pool; False never asks."""
     xla_flags: str | None = None
     """Extra XLA_FLAGS for this run, appended to the environment by
     `prepare_process` before JAX opens a backend. Library users set XLA_FLAGS
@@ -227,6 +304,32 @@ class TrainerConfig:
     def __post_init__(self):
         if self.steps is not None and self.epochs is not None:
             raise ValueError("steps and epochs both name the run length; set one")
+        if isinstance(self.checkpoint_every, str) and self.checkpoint_every != 'epoch':
+            object.__setattr__(self, 'checkpoint_every', duration(self.checkpoint_every))
+        if isinstance(self.keep, Mapping):
+            object.__setattr__(self, 'keep', _built(Keep, self.keep))
+        if isinstance(self.keep, Keep) and self.keep.where is not None:
+            raise TypeError("Keep.where is code-only; a recorded retention policy contains no callable")
+        if self.best is not None:
+            choices = self.best if isinstance(self.best, (tuple, list)) else (self.best,)
+            rebuilt = []
+            for choice in choices:
+                if isinstance(choice, str):
+                    choice = Best(choice)
+                elif isinstance(choice, Mapping):
+                    choice = _built(Best, choice)
+                if not isinstance(choice, Best) or choice._source is not None:
+                    raise TypeError("a recorded best selector names metrics; callable scores are code-only")
+                rebuilt.append(choice)
+            object.__setattr__(
+                self, "best", tuple(rebuilt) if isinstance(self.best, (tuple, list)) else rebuilt[0]
+            )
+
+    def best_policies(self):
+        if self.best is None:
+            return None
+        return (Best(self.best),) if isinstance(self.best, str) else (
+            self.best if isinstance(self.best, tuple) else (self.best,))
 
     def total_steps(self, dataset: Dataset) -> int:
         """Return the run's length in steps, from `steps` or from `epochs` over `data`."""
@@ -244,8 +347,15 @@ class TrainerConfig:
         """Return the steps between validation passes over `data`, or None for never."""
         return self._interval(self.eval_every, dataset, "eval-every")
 
-    def checkpoint_interval(self, dataset: Dataset) -> int | None:
-        """Return the steps between checkpoints over `data`, or None for never."""
+    def checkpoint_interval(self, dataset: Dataset) -> int | datetime.timedelta | None:
+        """Steps, or a recorded duration such as 30m, between checkpoints."""
+        value = self.checkpoint_every
+        if isinstance(value, datetime.timedelta):
+            if value.total_seconds() <= 0:
+                raise ValueError("checkpoint_every duration must be positive")
+            return value
+        if isinstance(value, str) and value != 'epoch':
+            return duration(value)
         return self._interval(self.checkpoint_every, dataset, "checkpoint-every")
 
     @staticmethod
@@ -316,6 +426,8 @@ def _to_json(value, annotation) -> JSON:
     """Return `value` as JSON: a dict, a list, or a scalar json.dump can write.
     `annotation` is the declared field type, so the write side names the same
     registry and member types the read side rebuilds from."""
+    if isinstance(value, datetime.timedelta):
+        return recorded_duration(value)
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         held = _registry_for(annotation)
         if held is not None and not any(type(value) is member
@@ -405,7 +517,13 @@ def _fields(cls: type, values: registry.Configured) -> dict[str, registry.Config
     takes its declared default, which says what runs recorded before the
     field existed did (tests/fixtures/record_defaults.json holds every
     default to that); a field `cls` does not declare, or a required one the
-    record lacks, raises."""
+    record lacks, raises.
+
+    A field whose default moved after runs were recorded without it says
+    what those runs meant as `metadata={"legacy": value}`, and a record
+    that lacks it reads as that value. Every record `to_dict` writes
+    carries the field, so code that builds the class takes the new default
+    and a recorded run keeps the old one."""
     if not isinstance(values, Mapping):
         raise ValueError(f"{cls.__name__} is built from a record of its fields, not {values!r}")
     for old, new in _FIELD_RENAMES.get(cls, {}).items():
@@ -420,8 +538,9 @@ def _fields(cls: type, values: registry.Configured) -> dict[str, registry.Config
         raise ValueError(
             f"{cls.__name__} does not match the record: unknown fields {unknown}, "
             f"missing fields {missing}")
-    return {f.name: _rebuild(_declared_type(cls, f.name), registry.configured(values[f.name]))
-            for f in declared if f.name in values}
+    return {f.name: _rebuild(_declared_type(cls, f.name), registry.configured(
+                values[f.name] if f.name in values else f.metadata["legacy"]))
+            for f in declared if f.name in values or "legacy" in f.metadata}
 
 
 def _built[ValueT](cls: type[ValueT], values: Mapping[str, object]) -> ValueT:
@@ -580,9 +699,9 @@ class RunConfig:
                 f"reads {dataset.batch} records a step; load it with "
                 f"load(batch={self.trainer.batch_size})")
         if self.trainer.quantization is not None:
-            quantize(objective, self.trainer.quantization)
+            _quantize(objective, self.trainer.quantization)
         if self.lora is not None:
-            attach(objective, self.lora)
+            _attach(objective, self.lora)
         self = self._naming(objective)
         trainer = self.trainer
         # Before the run length, since a ramp reads fewer records a step early
@@ -602,8 +721,9 @@ class RunConfig:
             def record_run() -> None:
                 """Write the run's record and name where it is tracked, on rank zero."""
                 if jax.process_index() == 0:
-                    print("Experiment_Name:", name)
-                    print(f"Local tracking: {local.directory}")
+                    display = TrainingDisplay()
+                    display.note(f"Experiment_Name: {name}")
+                    display.note(f"Local tracking: {local.directory}")
                     self.save(checkpoints.directory)
                     tracker.artifact(RunRecord(name, json_value(self.to_dict()),
                         json_value(summary or {}), steps, packages_installed()), 0)
@@ -620,6 +740,7 @@ class RunConfig:
                 eval_every=trainer.eval_interval(dataset),
                 checkpoint_every=trainer.checkpoint_interval(dataset),
                 metrics=metrics, preview=trainer.wandb is not None,
+                best=trainer.best_policies(),
             )
             def publish_checkpoint() -> None:
                 """Upload the checkpoint the run ended on, where a tracker takes one."""

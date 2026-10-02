@@ -36,21 +36,14 @@ import jax
 import jax.numpy as jnp
 import optax
 from flax import linen as nn
+from typing_extensions import TypeVar
 
 from dew.artifacts import Artifacts
-from dew.objectives.base import (
-    Aux,
-    Batch,
-    Effects,
-    EMASpec,
-    Loss,
-    Mean,
-    Objective,
-    Prediction,
-    Step,
-    Variables,
-)
+from dew.objectives.base import Aux, Batch, EMASpec, Objective, Prediction, Ratio, Step, Variables
 from dew.registry import objectives
+
+Loss = TypeVar("Loss", default=Ratio | jax.Array | float)
+Effects = TypeVar("Effects", default=None)
 
 if TYPE_CHECKING:
     from dew.training.state import TrainState
@@ -70,7 +63,7 @@ def _schedule(value: Weight) -> optax.Schedule:
 
 
 @objectives("distillation")
-class DistillationObjective(Objective[Mean, Effects], Generic[Loss, Effects]):
+class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
     """Mix the student's own loss with a frozen teacher's soft targets."""
 
     def __init__(
@@ -168,7 +161,7 @@ class DistillationObjective(Objective[Mean, Effects], Generic[Loss, Effects]):
         return replace(step, ema=None if step.ema is None else self.student_variables(step.ema))
 
     def _predictions(self, params: Variables, batch: Batch, step: Step
-                     ) -> tuple[Mean, Aux[Effects], Prediction, Prediction]:
+                     ) -> tuple[Ratio, Aux[Effects], Prediction, Prediction]:
         """Score both sides over the batch: the student training, the teacher not."""
         statistics, aux, student = self.student.predict(
             self.student_variables(params), batch, self._student_step(step), train=True,
@@ -191,7 +184,7 @@ class DistillationObjective(Objective[Mean, Effects], Generic[Loss, Effects]):
             return optax.cosine_distance(student, teacher, epsilon=1e-6)
         return jnp.mean(jnp.square(student - teacher), axis=-1)
 
-    def loss(self, params: Variables, batch: Batch, step: Step) -> tuple[Mean, Aux[Effects]]:
+    def loss(self, params: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux[Effects]]:
         statistics, aux, student, teacher = self._predictions(params, batch, step)
         alpha, temperature, beta = (jnp.asarray(schedule(step.step), jnp.float32) for schedule in
                                     (self.alpha, self.temperature, self.beta))
@@ -217,7 +210,7 @@ class DistillationObjective(Objective[Mean, Effects], Generic[Loss, Effects]):
             feature = jnp.sum(jnp.stack(distances) * weights) / len(self.features)
             total = total + beta * feature
             reported.update({"distill/beta": beta, "distill/feature": feature / counted})
-        return Mean(total, mass), replace(aux, metrics=reported)
+        return Ratio(total, mass), replace(aux, metrics=reported)
 
     def apply_effects(self, variables: Variables, effects: Effects) -> Variables:
         return self.student.apply_effects(self.student_variables(variables), effects)
@@ -230,7 +223,7 @@ class DistillationObjective(Objective[Mean, Effects], Generic[Loss, Effects]):
         return self.student.preview(self.student_variables(params), batch, self._student_step(step),
                                     scored=scored)
 
-    def pipeline(self, state: TrainState, *, ema: bool = True):
+    def pipeline(self, state: TrainState, *, ema: bool | None = None):
         """The student as its inference task; the teacher stays behind."""
         return self.student.pipeline(
             replace(state, params=self.student_variables(state.params),

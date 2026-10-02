@@ -181,6 +181,15 @@ def assert_same_parameters(left: dict, right: dict) -> None:
         np.testing.assert_allclose(left[name], right[name], err_msg=name, **PARITY)
 
 
+def assert_identical_parameters(left: dict, right: dict) -> None:
+    """Two runs of one program over the same processes and mesh: a resume
+    restores the state, the key and the data position, so it reduces in the
+    order the run it continues did, and lands on its parameters bit for bit."""
+    assert set(left) == set(right), "the two runs do not even hold the same parameters"
+    for name in left:
+        np.testing.assert_array_equal(left[name], right[name], err_msg=name)
+
+
 def token_corpus(directory: Path, records: int, seq_len: int) -> Path:
     """A tokenized corpus whose windows say which record they are.
 
@@ -549,8 +558,8 @@ def test_a_pool_resumes_every_process_at_its_own_position(tmp_path, pool_checkpo
         assert shard_of(report["restored_dataset_state"]) == index
         assert report["step"] == 2 * POOL_STEPS
         assert report["dataset_state"] == whole[index]["dataset_state"]
-        assert_same_parameters(dumped_params(tmp_path / "resumed" / f"process{index}.json"),
-                               dumped_params(tmp_path / "whole" / f"process{index}.json"))
+        assert_identical_parameters(dumped_params(tmp_path / "resumed" / f"process{index}.json"),
+                                    dumped_params(tmp_path / "whole" / f"process{index}.json"))
 
 
 @pytest.mark.distributed
@@ -752,8 +761,7 @@ def test_a_killed_run_resumes_on_the_batch_after_its_checkpoint(tmp_path, whole_
     The killed process trained five steps and had committed three, so the
     resume has to open on the fourth batch, not on the sixth (the two steps
     whose work was never saved) and not on the first. It then has to land on
-    the parameters of the run nobody killed, to rtol 2e-4 and atol 2e-5, with
-    0.0 the largest difference observed on CPU.
+    the parameters of the run nobody killed, bit for bit.
     """
     run_dir = tmp_path / "run"
     checkpoints = worker.checkpoint_dir(run_dir, "preempt")
@@ -779,7 +787,7 @@ def test_a_killed_run_resumes_on_the_batch_after_its_checkpoint(tmp_path, whole_
     # Same final position means the same batches were consumed overall, in the
     # same order, with the two uncommitted ones redone, not skipped.
     assert resumed["dataset_state"] == whole_run["dataset_state"]
-    assert_same_parameters(dumped_params(tmp_path / "resumed.json"), whole_run["params"])
+    assert_identical_parameters(dumped_params(tmp_path / "resumed.json"), whole_run["params"])
 
 
 @pytest.mark.slow
@@ -810,7 +818,7 @@ def test_two_preemptions_in_one_epoch_still_land_where_the_whole_run_did(tmp_pat
     third = run_worker("fit", tmp_path / "third.json", **fit_flags(run_dir))
     assert third["step"] == STEPS
     assert third["dataset_state"] == whole_run["dataset_state"]
-    assert_same_parameters(dumped_params(tmp_path / "third.json"), whole_run["params"])
+    assert_identical_parameters(dumped_params(tmp_path / "third.json"), whole_run["params"])
 
 
 # --------------------------------------------------------------------------
@@ -937,8 +945,8 @@ def test_a_killed_pool_resumes_from_the_newer_local_checkpoint(tmp_path, killed_
             "0": (LOCAL_KILL_AFTER * worker.BATCH // 2 - 1) * 2 + index}
         assert report["step"] == STEPS
         assert report["dataset_state"] == whole[index]["dataset_state"]
-        assert_same_parameters(dumped_params(tmp_path / "resumed" / f"process{index}.json"),
-                               dumped_params(tmp_path / "whole" / f"process{index}.json"))
+        assert_identical_parameters(dumped_params(tmp_path / "resumed" / f"process{index}.json"),
+                                    dumped_params(tmp_path / "whole" / f"process{index}.json"))
     # The resume added its final step and touched nothing that was there.
     after = persistent_bytes(persistent)
     assert committed_steps(persistent) == [SAVE_EVERY, 2 * SAVE_EVERY, STEPS]

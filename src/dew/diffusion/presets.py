@@ -241,7 +241,7 @@ class Flow:
 class MeanFlow:
     """Rectified flow on the linear path whose model predicts the average
     velocity over an interval (`Process.interval`), MeanFlow's convention
-    (Geng et al. 2025, "Mean Flows for One-step Generative Modeling"). Its
+    (Geng et al. 2025, "Ratio Flows for One-step Generative Modeling"). Its
     training times are Gsunshine/meanflow's logit-normal at P_mean -0.4 and
     P_std 1.0, in the same noise-at-one time as Dew's. It trains under
     `MeanFlowObjective`, and one Euler step over the whole grid samples it.

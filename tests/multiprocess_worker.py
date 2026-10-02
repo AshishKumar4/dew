@@ -600,10 +600,13 @@ def mode_fit(args) -> dict:
         val = data.val
         assert val is not None
         available = sum(1 for _ in val(data_partition(trainer.device_mesh)))
+    from dew.training import Best
+    counter = Batches()
     state = trainer.fit(Data(open_train, val=val, records=args.records),
                         steps=args.steps, log_every=1,
                         eval_every=args.steps if args.tokens else None,
-                        checkpoint_every=args.save_every, metrics=(Batches(),))
+                        checkpoint_every=args.save_every, metrics=(counter,),
+                        best=Best(counter, mode='max') if args.tokens else None)
     dump_params(args.out.with_suffix(".npz"), state.params)
     _, final_position = restored_state(trainer)
     return {
@@ -909,7 +912,7 @@ def _evaluation_parts(case: _EvaluationCase):
                 raise ValueError("preview decoding failed")
             return preview
 
-    class Mean:
+    class Ratio:
         name, reads = "mean", Representations
 
         def __call__(self, artifact, batch):
@@ -962,7 +965,7 @@ def _evaluation_parts(case: _EvaluationCase):
             raise OSError("iterator construction failed")
         return batches()
 
-    return Numerical, Mean, Drawing, batches, validation
+    return Numerical, Ratio, Drawing, batches, validation
 
 
 def mode_evaluation_contract(args) -> dict:
@@ -976,7 +979,7 @@ def mode_evaluation_contract(args) -> dict:
     rank = jax.process_index()
     case = _EvaluationCase(rank)
     events, closed = case.events, case.closed
-    Numerical, Mean, Drawing, batches, validation = _evaluation_parts(case)
+    Numerical, Ratio, Drawing, batches, validation = _evaluation_parts(case)
 
     objective = Numerical()
     trainer = Trainer(objective, optax.sgd(.01), key=jax.random.key(37))
@@ -990,7 +993,7 @@ def mode_evaluation_contract(args) -> dict:
         case.failure = failure
         events.clear()
         trainer.tracker = Drawing() if rank == 0 and failure not in ("untracked", "no_consumer") else None
-        metric = Mean()
+        metric = Ratio()
         if failure == "mismatch" and rank == 1:
             metric.name = "another_metric"
         scoring = () if failure in ("preview_only", "no_consumer") else (metric,)

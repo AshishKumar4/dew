@@ -104,9 +104,15 @@ def to_verl(trajectories: Sequence[Session | VerlTrajectory]) -> list[VerlRow]:
             calls: list[_DewCall] = []
             for index, first, count in chain.members:
                 call = session.calls[index]
-                calls.append({"start": first, "count": count, "finish_reason": call.finish_reason,
-                              "version": call.version,
-                              "support": None if call.support is None else [list(kept) for kept in call.support]})
+                calls.append(
+                    {
+                        "start": first,
+                        "count": count,
+                        "finish_reason": call.finish_reason,
+                        "version": call.version,
+                        "support": None if call.support is None else [list(kept) for kept in call.support],
+                    }
+                )
             versions = [session.calls[index].version for index, _, _ in chain.members]
             gaps = sum(1 for position in range(start + 1, len(chain.tokens))
                        if not sampled[position] and sampled[position - 1])
@@ -118,11 +124,21 @@ def to_verl(trajectories: Sequence[Session | VerlTrajectory]) -> list[VerlRow]:
             stamped = "min_global_steps" not in extra
             if stamped:
                 extra.update(min_global_steps=min(versions), max_global_steps=max(versions))
-            extra["dew"] = {"session": {
-                "task": session.task, "group": session.group, "sample": session.sample,
-                "attempt": session.attempt, "status": session.status.value,
-                "components": dict(session.components), "detail": session.detail}, "chain": number, "chains": len(built),
-                            "calls": calls, "stamped": stamped}
+            extra["dew"] = {
+                "session": {
+                    "task": session.task,
+                    "group": session.group,
+                    "sample": session.sample,
+                    "attempt": session.attempt,
+                    "status": session.status.value,
+                    "components": dict(session.components),
+                    "detail": session.detail,
+                },
+                "chain": number,
+                "chains": len(built),
+                "calls": calls,
+                "stamped": stamped,
+            }
             routing = chain.routing
             rows.append({
                 "prompt_ids": chain.tokens[:start],
@@ -189,16 +205,24 @@ def _calls(row: Mapping[str, object], version: int | None,
             raise ValueError(f"verl call {number} samples ids {begin}..{begin + length} of a "
                              f"{len(full)}-id row after a nonempty prompt")
         if record is not None and len(record) < forwarded:
-            raise ValueError(f"verl routed_experts covers {len(record)} ids; call {number} forwarded {forwarded}")
+            raise ValueError(
+                f"verl routed_experts covers {len(record)} ids; call {number} forwarded {forwarded}"
+            )
         support = meta.get("support")
         offset = begin - len(prompt)
-        calls.append(Call(
-            prompt_ids=tuple(full[:begin]), sampled_ids=tuple(full[begin:begin + length]),
-            behavior_log_probs=tuple(logprobs[offset:offset + length]),
-            finish_reason=text(meta.get("finish_reason", "stop" if number == len(runs) - 1 else "tool_calls")),
-            version=integer(stated),
-            routed_experts=None if record is None else record[:forwarded],
-            support=None if support is None else sequence(support, lambda kept: sequence(kept, integer))))
+        calls.append(
+            Call(
+                prompt_ids=tuple(full[:begin]),
+                sampled_ids=tuple(full[begin : begin + length]),
+                behavior_log_probs=tuple(logprobs[offset : offset + length]),
+                finish_reason=text(
+                    meta.get("finish_reason", "stop" if number == len(runs) - 1 else "tool_calls")
+                ),
+                version=integer(stated),
+                routed_experts=None if record is None else record[:forwarded],
+                support=None if support is None else sequence(support, lambda kept: sequence(kept, integer)),
+            )
+        )
     return tuple(calls)
 
 
@@ -256,8 +280,11 @@ def from_verl(rows: Sequence[Mapping[str, object]], *, samples: int = 1,
             dew = _dew(row)
             count = integer(dew["chains"])
             group = rows[cursor:cursor + count]
-            if len(group) != count or [integer(_dew(member)["chain"]) for member in group] != list(range(count)) \
-                    or any(_dew(member)["session"] != dew["session"] for member in group):
+            if (
+                len(group) != count
+                or [integer(_dew(member)["chain"]) for member in group] != list(range(count))
+                or any(_dew(member)["session"] != dew["session"] for member in group)
+            ):
                 raise ValueError(f"verl rows from {cursor} do not hold the {count} chains of one session")
             calls = tuple(call for member in group
                           for call in _calls(member, None, sequence(_dew(member)["calls"], object_record)))

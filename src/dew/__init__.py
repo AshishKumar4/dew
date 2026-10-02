@@ -18,10 +18,15 @@ from collections.abc import Callable, Mapping
 from importlib import import_module
 from typing import TYPE_CHECKING
 
+from dew.logging import configure as _configure_logging
+
+_configure_logging()
+
 if TYPE_CHECKING:  # the surface above, with its types, for checkers and editors
     from dew.artifacts import ImageGrid, Representations, TextSamples, TokenScores, VideoGrid
     from dew.data import Dataset
     from dew.diffusion import Process
+    from dew.eval import Mean
     from dew.inference import pipeline
     from dew.inputs import Condition, Field, InputSpec
     from dew.objectives import Objective
@@ -30,12 +35,15 @@ if TYPE_CHECKING:  # the surface above, with its types, for checkers and editors
     from dew.sampling import CFG, sample
     from dew.telemetry.profile import profile
     from dew.training import (
+        Best,
         Checkpoints,
         Evaluation,
+        Keep,
         Layout,
         LocalTracker,
         MeshSpec,
         MLflowTracker,
+        Plateau,
         ProfileWindow,
         TensorBoardTracker,
         Tracker,
@@ -59,6 +67,7 @@ _REGISTRIES = ("models", "presets", "samplers", "datasets", "encoders", "metrics
 
 _EXPORTS = {
     **dict.fromkeys(_REGISTRIES, "dew.registry"),
+    "Best": "dew.training", "Keep": "dew.training", "Plateau": "dew.training",
     "Trainer": "dew.training", "TrainState": "dew.training", "Step": "dew.training",
     "Aux": "dew.training", "EMASpec": "dew.training", "MeshSpec": "dew.training",
     "Layout": "dew.training", "Checkpoints": "dew.training", "Tracker": "dew.training",
@@ -69,6 +78,7 @@ _EXPORTS = {
     "Objective": "dew.objectives",
     "Dataset": "dew.data",
     "Process": "dew.diffusion",
+    "Mean": "dew.eval",
     "InputSpec": "dew.inputs", "Field": "dew.inputs", "Condition": "dew.inputs",
     "sample": "dew.sampling", "CFG": "dew.sampling",
     "pipeline": "dew.inference",
@@ -99,6 +109,7 @@ def __dir__() -> list[str]:
 __all__ = [
     "CFG",
     "Aux",
+    "Best",
     "Checkpoints",
     "Condition",
     "Dataset",
@@ -107,11 +118,14 @@ __all__ = [
     "Field",
     "ImageGrid",
     "InputSpec",
+    "Keep",
     "Layout",
     "LocalTracker",
     "MLflowTracker",
+    "Mean",
     "MeshSpec",
     "Objective",
+    "Plateau",
     "Process",
     "ProfileWindow",
     "Representations",

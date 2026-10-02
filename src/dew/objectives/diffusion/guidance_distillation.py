@@ -21,7 +21,7 @@ from dew.diffusion.process import DenoisingCondition, Process
 from dew.diffusion.schedules import expand
 from dew.diffusion.transforms import broadcast_rates
 from dew.inputs import InputSpec, unit_range
-from dew.objectives.base import Aux, Mean, Step, Variables
+from dew.objectives.base import Aux, Ratio, Step, Variables
 from dew.registry import objectives
 
 from .objective import TEACHER, DiffusionObjective
@@ -62,7 +62,9 @@ class GuidanceDistillationObjective(DiffusionObjective):
                 or type(teacher.process.prediction) is not type(process.prediction)):
             raise ValueError("guidance distillation regresses onto the teacher's raw output, so the "
                              "two share the process's schedule and prediction")
-        unused = sorted(key for key in ("uncertainty", "alignment", "end_to_end") if kwargs.get(key) is not None)
+        unused = sorted(
+            key for key in ("uncertainty", "alignment", "end_to_end") if kwargs.get(key) is not None
+        )
         if unused:
             raise ValueError(f"guidance distillation trains on its own loss, which reads none of {unused}")
         kwargs.setdefault("guidance", None)
@@ -113,7 +115,7 @@ class GuidanceDistillationObjective(DiffusionObjective):
         assert isinstance(output, jax.Array)
         losses = optax.l2_loss(output, target)
         weighted = losses * expand(self.process.weight(t), losses)
-        return Mean(jnp.sum(weighted), jnp.asarray(losses.size, jnp.float32)), Aux(metrics={})
+        return Ratio(jnp.sum(weighted), jnp.asarray(losses.size, jnp.float32)), Aux(metrics={})
 
 
 __all__ = ["GuidanceDistillationObjective", "guided_target", "with_guidance"]

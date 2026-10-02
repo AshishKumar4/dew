@@ -880,7 +880,11 @@ def _deepseek_v4_path(name: str, config: Mapping[str, object]) -> tuple[str, ...
     """
     if name.startswith('mtp.'):
         parts = name.split('.')
-        if len(parts) < 3 or not parts[1].isdigit() or int(parts[1]) >= _record_int(config, 'num_nextn_predict_layers', 0):
+        if (
+            len(parts) < 3
+            or not parts[1].isdigit()
+            or int(parts[1]) >= _record_int(config, "num_nextn_predict_layers", 0)
+        ):
             raise ValueError(f"{name} names an undeclared prediction depth")
         depth = f'mtp_{parts[1]}'
         tail = '.'.join(parts[2:])

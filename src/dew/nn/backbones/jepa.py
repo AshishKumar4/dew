@@ -13,7 +13,8 @@ position is carried entirely by the 2D sincos embedding that travels with
 each token.
 """
 
-from typing import ClassVar, Literal, Sequence
+from collections.abc import Sequence
+from typing import ClassVar, Literal
 
 import jax
 import jax.numpy as jnp

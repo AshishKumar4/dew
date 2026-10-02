@@ -79,8 +79,9 @@ def grid(title: str, prompts, seeds, images: np.ndarray) -> Image.Image:
     heading = title + "   seeds " + ", ".join(map(str, seeds))
     # As wide as the images, or as the longest caption where it is wider.
     widest = max(font.getlength(caption) for caption in (heading, *prompts)) + 8
-    sheet = Image.new("RGB", (max(columns * (width + gap) - gap, int(widest)), label + rows * (label + height)),
-                      "#b0b0b0")
+    sheet = Image.new(
+        "RGB", (max(columns * (width + gap) - gap, int(widest)), label + rows * (label + height)), "#b0b0b0"
+    )
     draw = ImageDraw.Draw(sheet)
     draw.text((4, 4), heading, fill="black", font=font)
     for row, prompt in enumerate(prompts):

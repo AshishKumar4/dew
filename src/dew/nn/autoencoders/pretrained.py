@@ -67,15 +67,21 @@ def load_autoencoder(modelname: str, *, revision: str = "bf16", dtype: DTypeLike
     if class_name == "AutoencoderDC":
         from .dc_ae import load_dc_ae
 
-        autoencoder, *_ = load_dc_ae(modelname, dtype, revision=revision, subfolder=subfolder or "", params=params)
+        autoencoder, *_ = load_dc_ae(
+            modelname, dtype, revision=revision, subfolder=subfolder or "", params=params
+        )
     elif class_name == "AutoencoderKLWan":
         from .wan import load_wan_vae
 
-        autoencoder, *_ = load_wan_vae(modelname, dtype, revision=revision, subfolder=subfolder or "", params=params)
+        autoencoder, *_ = load_wan_vae(
+            modelname, dtype, revision=revision, subfolder=subfolder or "", params=params
+        )
     elif class_name == "AutoencoderRAE":
         from .rae import load_rae
 
-        autoencoder, *_ = load_rae(modelname, dtype, revision=revision, subfolder=subfolder or "", params=params)
+        autoencoder, *_ = load_rae(
+            modelname, dtype, revision=revision, subfolder=subfolder or "", params=params
+        )
     else:
         from .sd_vae import StableDiffusionVAE
 

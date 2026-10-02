@@ -26,11 +26,10 @@ from scipy.special import log_softmax
 
 from dew.interop import load_pretrained
 from dew.interop.codecs import PACKED_MXFP4, decode_e2m1, quantize_packed_mxfp4
-from dew.interop.hf_decoders import _FAMILIES, translate_config
+from dew.interop.hf_decoders import families, translate_config
 from dew.nn.inputs import ModelInputs
 from dew.nn.moe import Situ
 from dew.objectives.base import Step
-
 from dew.registry import models
 from dew.sampling import Sampling, generate
 
@@ -77,7 +76,7 @@ def test_every_released_tensor_lands_on_one_leaf_of_the_released_tree():
     its zero-padded 128 to the 96 heads), and cover all 2,736 of its leaves,
     before 1.5 TB of weights would be read."""
     config = json.loads((SOURCE / "config.json").read_text())
-    fields, family = translate_config(config), _FAMILIES["kimi_k3"]
+    fields, family = translate_config(config), families()["kimi_k3"]
     model = models.build("causal_transformer", fields)
     shapes = jax.eval_shape(lambda: model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32)))
     tree = {path: leaf.shape for path, leaf in flatten_dict(dict(shapes)).items()}
@@ -246,7 +245,7 @@ def test_a_quantization_scheme_other_than_mxfp4_is_refused(tmp_path):
 
 
 def test_a_nonzero_a_log_pad_is_refused():
-    family = _FAMILIES["kimi_k3"]
+    family = families()["kimi_k3"]
     stem = "language_model.model.layers.0.self_attn."
     tensors = {stem + "A_log": np.array([0.5, 0.25, 0.0, 1.0], np.float32),
                stem + "dt_bias": np.zeros(8, np.float32), stem + "f_a_proj.weight": np.zeros((4, 3), np.float32)}

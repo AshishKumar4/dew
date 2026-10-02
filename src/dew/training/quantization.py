@@ -7,7 +7,7 @@ and the matmuls in the wrapped methods' extent run quantized.
 Dew's version of that call is `apply_quantization`. A caller builds its model
 from the registry as always, then wraps it before the objective ever sees it.
 A run that names `--trainer.quantization` instead hands `RunConfig.train` the
-objective, and `quantize` wraps the model it holds before anything
+objective, and `_quantize` wraps the model it holds before anything
 initialises it.
 
 What trains is fake-quantized. The parameter tree keeps fp32 master weights
@@ -153,8 +153,9 @@ def _qwix(module: str = "qwix") -> ModuleType:
     except ModuleNotFoundError as error:
         if error.name != "qwix":
             raise
-        raise ModuleNotFoundError('quantization runs on Qwix; install it with pip install "dewml[quantization]"',
-                                  name="qwix") from error
+        raise ModuleNotFoundError(
+            'quantization runs on Qwix; install it with pip install "dewml[quantization]"', name="qwix"
+        ) from error
 
 
 def _qtype(dtype: QuantizedDtype) -> jax.typing.DTypeLike:
@@ -243,8 +244,11 @@ def _scaled_in_float32[**P](op: Callable[P, jax.Array]) -> Callable[P, jax.Array
         if len(operands) < 2:
             return op(*args, **kwargs)
         _, dtype = qarray.get_accumulator_and_result_type(*operands, preferred_element_type=None)
-        rescaled = jax.tree.map(lambda arg: arg.astype(jnp.float32) if isinstance(arg, qarray.QArray) else arg,
-                                args, is_leaf=lambda arg: isinstance(arg, qarray.QArray))
+        rescaled = jax.tree.map(
+            lambda arg: arg.astype(jnp.float32) if isinstance(arg, qarray.QArray) else arg,
+            args,
+            is_leaf=lambda arg: isinstance(arg, qarray.QArray),
+        )
         return op(*rescaled, **kwargs).astype(dtype)
 
     return scaled
@@ -314,7 +318,11 @@ def _grouped_convolution_gradient() -> type:
                                  preferred_element_type: jax.typing.DTypeLike | None = None,
                                  out_sharding: jax.sharding.NamedSharding | None = None) -> jax.Array:
             rule, _ = self._get_current_rule_and_op_id("conv_general_dilated", only_rule=True)
-            if rule is None or rule.weight_qtype is None or (feature_group_count == 1 and rule.act_qtype is None):
+            if (
+                rule is None
+                or rule.weight_qtype is None
+                or (feature_group_count == 1 and rule.act_qtype is None)
+            ):
                 return super().conv_general_dilated(
                     lhs, rhs, window_strides, padding, lhs_dilation, rhs_dilation, dimension_numbers,
                     feature_group_count, batch_group_count, precision, preferred_element_type, out_sharding)
@@ -417,7 +425,9 @@ def _group_scaled_convolution() -> type:
             out = convolve(lhs=lhs.astype(jnp.float32)
                            / _per_feature(scales, lhs.ndim, batch, feature, lhs.shape[feature]))
             batch, feature = numbers.out_spec[:2]
-            return (out * _per_feature(scales, out.ndim, batch, feature, out.shape[feature])).astype(lhs.dtype)
+            return (out * _per_feature(scales, out.ndim, batch, feature, out.shape[feature])).astype(
+                lhs.dtype
+            )
 
     return GroupScaledConvolution
 
@@ -579,11 +589,12 @@ class ModelObjective(Protocol):
     model: nn.Module
 
 
-def quantize(objective: object, spec: Quantization) -> None:
-    """Quantize the trunk matmuls of the module `objective` trains.
+def _quantize(objective: object, spec: Quantization) -> None:
+    """Quantize the trunk matmuls of the module `objective` trains, in place.
 
-    `apply_quantization` wraps a module before an objective is built, which
-    is what a recipe that builds its own model does. A run that names
+    This is `RunConfig.train`'s step, not a user's. `apply_quantization`
+    wraps a module before an objective is built, which is what a recipe or
+    a script that builds its own model does. A run that names
     `--trainer.quantization` has handed `RunConfig.train` the objective
     already, so the wrap lands on the objective's own model instead, before
     anything has initialised or traced it; the wrapped module is a copy of

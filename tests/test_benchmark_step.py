@@ -29,18 +29,20 @@ def _benchmark_step():
     return module
 
 
-def test_cpu_smoke_case_measures_a_finite_step_through_the_trainer():
+@pytest.mark.parametrize("fixed_batch", [False, True])
+def test_cpu_smoke_case_measures_a_finite_step_through_the_trainer(fixed_batch):
     """The tool's row is the trainer's own compiled step run for real: a
-    finite loss out of it, timed over the steps asked for."""
+    finite loss out of it, timed over the steps asked for, whether each step
+    reads a fresh placement or reuses one."""
     tool = _benchmark_step()
     config = tool.BenchmarkConfig(preset='cpu-smoke', architectures=['causal_transformer'],
-                                  warmup=1, steps=2, dtype='float32')
+                                  warmup=1, steps=2, dtype='float32', fixed_batch=fixed_batch)
     (case,) = tool.build_cases(config)
 
     row = tool.measure(case, config)
 
     assert row["finite"] and np.isfinite(row["loss"])
-    assert row["measured_steps"] == 2
+    assert row["measured_steps"] == 2 and row["fixed_batch"] is fixed_batch
     assert row["ms_per_step"] > 0 and row["p50_ms"] > 0
 
 

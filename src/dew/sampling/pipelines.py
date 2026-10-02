@@ -5,8 +5,9 @@ from __future__ import annotations
 import functools
 import os
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
+from importlib import import_module
 from typing import TYPE_CHECKING, Generic
 
 import jax
@@ -16,18 +17,21 @@ from flax import linen as nn, struct
 from flax.core import freeze
 from jax.experimental import multihost_utils
 from jax.typing import ArrayLike
+from typing_extensions import TypeVar
 
 from dew.artifacts import agreed, uint8_pixels
 from dew.diffusion.process import Conditioning, Process
 from dew.inputs import InputSpec, unit_range
 from dew.nn.autoencoders import AutoEncoder
-from dew.nn.inputs import ArrayT, RowPlan, generation_signature, local_rows, mesh_of, request_key
+from dew.nn.inputs import RowPlan, generation_signature, local_rows, mesh_of, request_key
 from dew.objectives.base import FROZEN, Variables
 from dew.registry import dtype_name, resolve_dtype
 from dew.sampling.guidance import CFG, Guidance
 from dew.sampling.sample import sample
 from dew.sampling.solvers import DDIM, Solver
 from dew.telemetry.profile import active_profile
+
+ArrayT = TypeVar("ArrayT", bound=jax.Array | np.ndarray, default=jax.Array, covariant=True)
 
 if TYPE_CHECKING:
     from PIL.Image import Image as PILImage
@@ -148,7 +152,7 @@ class TextToImage:
     autoencoder: AutoEncoder | None = None
     steps: int = 50
     guidance: Guidance | None = None
-    sampler: Solver[object] = DDIM()
+    sampler: Solver[object] = field(default_factory=DDIM)
     grid: Callable[[int], tuple[Process, jax.Array]] | None = None
     final_denoise: bool = True
     finish: Callable[[Variables, jax.Array], jax.Array] | None = None
@@ -172,7 +176,9 @@ class TextToImage:
         from dew.training.quantization import quantize_for_serving
 
         example = self.prepare("", key=0, steps=1)
-        denoiser = {name: value for name, value in self.params.items() if name not in ("encoders", "autoencoder")}
+        denoiser = {
+            name: value for name, value in self.params.items() if name not in ("encoders", "autoencoder")
+        }
         model, variables = quantize_for_serving(self.model, denoiser, spec, example.noise,
                                                 jnp.zeros(example.noise.shape[:1]), **example.conditions)
         return replace(self, model=model, params={**self.params, **variables})
@@ -190,7 +196,7 @@ class TextToImage:
                    blank=objective.blank_conditions)
 
     @classmethod
-    def from_run(cls, directory: str, *, ema: bool | None = None, step: int | None = None,
+    def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
                  mesh: MeshSpec | None = None, layout: Layout | None = None,
                  dtype: str | None = None, param_dtype: str | None = None) -> TextToImage:
         """The run in `directory`: its `run.json` built the way the recipe
@@ -206,10 +212,10 @@ class TextToImage:
         dtype overrides computation in the model, encoders and VAE. param_dtype
         overrides parameter storage; None preserves checkpoint storage exactly.
         """
-        import dew.objectives.rl.flow  # noqa: F401 registers the flow_grpo a record names
         from dew.objectives.diffusion import DiffusionRunConfig
         from dew.registry import objectives
 
+        import_module("dew.objectives.rl.flow")  # registers the flow_grpo a record names
         config = DiffusionRunConfig.load(directory)
         compute = dtype_name(resolve_dtype(dtype))
         if compute is not None:
@@ -267,13 +273,21 @@ class TextToImage:
         return _encode(None)(self._conditions, self.params, jax.tree.map(jnp.asarray, tokens))
 
 
-    def prepare(self, prompts: str | Sequence[str | Mapping[str, object]], *,
-                key: int | jax.Array | None = None, steps: int | None = None,
-                unconditional: str | Sequence[str | Mapping[str, object]] | None = None,
-                image: ArrayLike | None = None, image_latents: ArrayLike | None = None,
-                mask: ArrayLike | None = None, noise: ArrayLike | None = None, initial: ArrayLike | None = None,
-                times: ArrayLike | Sequence[float] | None = None,
-                encode_key: int | jax.Array | None = None) -> DenoisingInputs:
+    def prepare(
+        self,
+        prompts: str | Sequence[str | Mapping[str, object]],
+        *,
+        key: int | jax.Array | None = None,
+        steps: int | None = None,
+        unconditional: str | Sequence[str | Mapping[str, object]] | None = None,
+        image: ArrayLike | None = None,
+        image_latents: ArrayLike | None = None,
+        mask: ArrayLike | None = None,
+        noise: ArrayLike | None = None,
+        initial: ArrayLike | None = None,
+        times: ArrayLike | Sequence[float] | None = None,
+        encode_key: int | jax.Array | None = None,
+    ) -> DenoisingInputs:
         """Encode conditions and construct the initial state on a concrete grid.
 
         Images are uint8 or normalized floating NHWC pixels at the task's
@@ -488,9 +502,16 @@ class TextToImage:
         return given, null, initial_state
 
 
-    def __call__(self, prompts: str | Sequence[str | Mapping[str, object]] | DenoisingInputs, *,
-                 steps: int | None = None, guidance: Guidance | float | None | _Default = _Default.GUIDANCE,
-                 sampler: Solver | None = None, key: int | jax.Array | None = None, decode: bool = True) -> Images:
+    def __call__(
+        self,
+        prompts: str | Sequence[str | Mapping[str, object]] | DenoisingInputs,
+        *,
+        steps: int | None = None,
+        guidance: Guidance | float | None | _Default = _Default.GUIDANCE,
+        sampler: Solver | None = None,
+        key: int | jax.Array | None = None,
+        decode: bool = True,
+    ) -> Images:
         """Images in [-1, 1], `[rows, H, W, C]`. `guidance` is a classifier-free
         guidance scale, or a `CFG` with its interval, or None for the plain
         conditional prediction; omitted, it is the task's default."""
@@ -542,7 +563,9 @@ def _image_rows(value, rows: int, shape: tuple[int, ...], name: str) -> np.ndarr
     if not np.isfinite(array).all():
         raise ValueError(f"{name} must contain finite values")
     if name == "image" and array.dtype != np.uint8 and np.any((array < -1) | (array > 1)):
-        raise ValueError("floating image pixels must be normalized to [-1, 1]; uint8 pixels are also accepted")
+        raise ValueError(
+            "floating image pixels must be normalized to [-1, 1]; uint8 pixels are also accepted"
+        )
     return np.broadcast_to(array, (rows, *shape))
 
 
@@ -567,13 +590,16 @@ def _image_start(rows: jax.sharding.NamedSharding | None):
             value = alpha * clean + sigma * noise
         if "mask" in samples:
             from dew.inputs.diffusion import latent_image_conditions
-            spatial = latent_image_conditions(autoencoder, params["autoencoder"], pixels, samples["mask"], encode_key)
+
+            spatial = latent_image_conditions(
+                autoencoder, params["autoencoder"], pixels, samples["mask"], encode_key
+            )
         return value, spatial
     return jax.jit(prepare, static_argnums=(0, 1, 2),
                    in_shardings=(None, rows, rows, None, None), out_shardings=rows)
 
 
-def restore_variables(directory: str, *, ema: bool | None, step: int | None, mesh: MeshSpec | None,
+def restore_variables(directory: str, *, ema: bool | None, step: int | str | None, mesh: MeshSpec | None,
                       layout: Layout | None, param_dtype: str | None,
                       parameter_roots: tuple[tuple[str, ...], ...] = (("params",), (FROZEN,))) -> Variables:
     """A run's published variables, restored onto the current mesh under a layout.
@@ -621,21 +647,30 @@ def restore_variables(directory: str, *, ema: bool | None, step: int | None, mes
 
 def _with_drawn_tables(objective: DiffusionObjective, variables: Variables) -> Variables:
     """`variables` with every Fourier table the objective's model draws and
-    the checkpoint lacks, drawn by the model's init (`is_fourier_table`).
+    the checkpoint lacks (`is_fourier_table`).
 
     A run written before the table became a variable trained against the
-    table init draws. Only those leaves are computed: the rest of the init
-    is dead code to the compiler.
+    table its variable initializer draws. Apply the saved parameters with only
+    constants mutable: parameters are read, not drawn. Flax still checks their
+    shapes abstractly. The shape pass finds absent tables, and the compiled
+    pass computes only those leaves.
     """
     from flax.traverse_util import flatten_dict, unflatten_dict
 
     from dew.checkpoints import absent
     from dew.nn.blocks import is_fourier_table
 
-    towers = {name: variables[name] for name in ("encoders", "autoencoder") if name in variables}
-    towers.setdefault("encoders", {})
-    key = jax.random.key(0)
-    drawn = [path for path in absent(jax.eval_shape(objective.init, key, towers), variables)
+    def constants(params):
+        conditions = objective.encode(params.get("encoders", {}))
+        if objective.inputs.mask is not None:
+            conditions = {**conditions, "mask": jnp.zeros((1, *objective.latent_shape[:-1], 1)),
+                          "masked_image": jnp.zeros((1, *objective.latent_shape))}
+        _, tables = objective.model.apply(
+            objective.trainable(params), jnp.ones((1, *objective.latent_shape)), jnp.ones((1,)),
+            **conditions, mutable=["constants"])
+        return tables
+
+    drawn = [path for path in absent(jax.eval_shape(constants, variables), variables)
              if is_fourier_table(path)]
     if not drawn:
         return variables
@@ -646,9 +681,9 @@ def _with_drawn_tables(objective: DiffusionObjective, variables: Variables) -> V
         return tree
 
     mesh = mesh_of(variables)
-    values = jax.jit(lambda key, towers: [leaf(objective.init(key, towers), path) for path in drawn],
+    values = jax.jit(lambda params: [leaf(constants(params), path) for path in drawn],
                      out_shardings=None if mesh is None else
-                     jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec()))(key, towers)
+                     jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec()))(variables)
     flat = flatten_dict(variables, keep_empty_nodes=True)
     flat.update({tuple(entry.key for entry in path): value
                  for path, value in zip(drawn, values, strict=True)})

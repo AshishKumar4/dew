@@ -165,7 +165,9 @@ class HyperConnection(nn.Module):
         mixes = flat @ fn.T
         pre = nn.sigmoid(mixes[..., :hc] * scale[0] + base[:hc]) + self.spec.hc_eps
         post = 2 * nn.sigmoid(mixes[..., hc:2 * hc] * scale[1] + base[hc:2 * hc])
-        logits = mixes[..., 2 * hc:].reshape(*mixes.shape[:-1], hc, hc) * scale[2] + base[2 * hc:].reshape(hc, hc)
+        logits = mixes[..., 2 * hc :].reshape(*mixes.shape[:-1], hc, hc) * scale[2] + base[2 * hc :].reshape(
+            hc, hc
+        )
         comb = sinkhorn(jax.nn.softmax(logits, axis=-1) + self.spec.hc_eps,
                         self.spec.hc_sinkhorn_iters, self.spec.hc_eps)
         return pre, post, comb
@@ -173,7 +175,9 @@ class HyperConnection(nn.Module):
 
 def collapse_by(pre, streams):
     """`sum_h pre[h] streams[h]` in fp32 (`at_least_fp32`), back in the streams' dtype."""
-    return jnp.sum(pre[..., None] * streams.astype(at_least_fp32(streams.dtype)), axis=2).astype(streams.dtype)
+    return jnp.sum(pre[..., None] * streams.astype(at_least_fp32(streams.dtype)), axis=2).astype(
+        streams.dtype
+    )
 
 
 def first_stream(streams):
