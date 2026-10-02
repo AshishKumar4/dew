@@ -131,12 +131,12 @@ def test_device_none_keeps_the_old_resize_bit_identical():
 
 
 def test_device_pixels_are_not_fetched_back_when_the_trainer_places_them():
-    from dew.training.distributed import build_mesh, shard_batch
+    from dew.training.distributed import MeshSpec, shard_batch
 
     stream = spec(augmentation_backend="device").load(batch=4).train(DataPartition())
     try:
         batch = next(stream)
-        mesh = build_mesh(devices=[jax.devices()[0]])
+        mesh = MeshSpec().build([jax.devices()[0]])
         with jax.transfer_guard_device_to_host("disallow"):
             placed = shard_batch(mesh, batch)
             jax.block_until_ready(placed)

@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 from test_tool_episodes import PROMPT, RESPONSE, build, collect
 
-from dew.objectives.base import Step, scalar_loss
+from dew.objectives.base import Step
 from dew.objectives.rl import GRPOObjective
 from dew.rl import behavior_importance_weights, token_log_ratio, token_mean
 from dew.rl.surrogate import clipped_surrogate_terms
@@ -47,8 +47,8 @@ def test_correction_is_explicit_and_uses_actual_recorded_behavior():
                               beta=.05, behavior_importance=2.)
     info = Step(state.microstep, jax.random.key(4), state.ema)
 
-    ordinary_loss, _ = scalar_loss(trainer.objective, state.params, batch, info)
-    corrected_loss, _ = scalar_loss(corrected, state.params, batch, info)
+    ordinary_loss, _ = trainer.objective.scalar_loss(state.params, batch, info)
+    corrected_loss, _ = corrected.scalar_loss(state.params, batch, info)
 
     mask = batch["response_mask"]
     weights = np.minimum(np.exp(np.clip(batch["old_log_probs"] - batch["behavior_log_probs"], -20, 20)), 2.)

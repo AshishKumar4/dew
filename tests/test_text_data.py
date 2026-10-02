@@ -35,7 +35,6 @@ from dew.data.tokens import PackedWindows
 from dew.nn import attention
 from dew.nn.backbones import causal_transformer as backbone
 from dew.nn.mixers import attention as attention_kind
-from dew.objectives.base import scalar_loss
 from dew.objectives.lm import LMObjective
 from dew.position import ENVELOPE
 from dew.training import Step
@@ -1112,7 +1111,7 @@ def _counted_cross_entropy(batch, seq_len):
     segment_ids = jnp.asarray(batch["text_segment_ids"], jnp.int32)
     positions = jnp.asarray(batch["text_positions"], jnp.int32)
 
-    ce, _ = scalar_loss(objective, params, batch, Step(step=jnp.zeros((), jnp.int32),
+    ce, _ = objective.scalar_loss(params, batch, Step(step=jnp.zeros((), jnp.int32),
                                                 key=jax.random.key(1), ema=None))
 
     logits = model.apply(params, tokens[:, :-1], positions=positions[:, :-1],

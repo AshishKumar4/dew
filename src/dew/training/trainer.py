@@ -37,7 +37,7 @@ from typing_extensions import TypeVar as DefaultTypeVar
 
 from dew.artifacts import agree_process_phase, agreed
 from dew.checkpoints import Checkpoints, Ranking
-from dew.data.dataset import Checkpointable, Closeable, Dataset, RampedStream, Reader, rows_of
+from dew.data.dataset import Checkpointable, Closeable, DataPartition, Dataset, RampedStream, Reader, rows_of
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES, RematPolicy
 from dew.nn.kernels.generation import device_generation
@@ -91,12 +91,10 @@ from dew.training.distributed import (
     Placement,
     batch_divisor,
     batch_shardings,
-    build_mesh,
-    data_partition,
     link_bandwidth,
     shard_batch,
 )
-from dew.training.evaluation import Evaluation, evaluate
+from dew.training.evaluation import Evaluation
 from dew.training.runtime import Preempted, PreemptionNotice
 from dew.training.selection import Best
 from dew.training.state import Accumulation, TrainState
@@ -168,7 +166,7 @@ class ProfileWindow:
     `directory` after `warmup` steps have run, so the trace holds the loop
     and not the compile.
 
-    `dew.profile` is the other way to capture one, a context manager around
+    `dew.Profiler` is the other way to capture one, a context manager around
     any code at all; a fit refuses to schedule a window inside one. The
     window the loop wrote is reported as the `ProfileWindow` record of
     `dew.telemetry.records`."""
@@ -901,7 +899,7 @@ class Trainer(Generic[Loss, Effects]):
     def device_mesh(self) -> Mesh:
         """Build the mesh `MeshSpec` describes over this process pool's devices,
         on first use."""
-        return build_mesh(self.mesh)
+        return self.mesh.build()
 
     @property
     def host_master(self) -> bool:
@@ -1001,7 +999,7 @@ class Trainer(Generic[Loss, Effects]):
         template = self._with_drawn_tables(template, shardings, checkpoints.stored(resume),
                                            initializer, key)
         state, position = checkpoints.restore(template, resume,
-                                              share=data_partition(self.device_mesh))
+                                              share=DataPartition.of(self.device_mesh))
         self._climb_to(checkpoints.rung(resume))
         from dew.nn.inputs import request_key
         state = dataclasses.replace(state, key=jax.device_put(request_key(state.key), shardings.key))
@@ -1638,7 +1636,7 @@ class Trainer(Generic[Loss, Effects]):
         if current == steps and checkpoints is not None and checkpoints.latest is not None:
             return True
         if current < steps:
-            run.source = plan.dataset.train(data_partition(mesh))
+            run.source = plan.dataset.train(DataPartition.of(mesh))
             self._check_stream(run.source, mesh, plan.dataset.batch,
                                checkpointing=bool(plan.checkpoint_every or plan.local_every or (
                                    checkpoints is not None and plan.eval_every and plan.best and
@@ -2032,10 +2030,10 @@ class Trainer(Generic[Loss, Effects]):
             if telemetry_profile.active_profile() is not None:
                 raise ValueError(
                     "Trainer.profile cannot schedule a window while an explicit "
-                    "dew.profile capture is active; drop one or stop the outer "
+                    "dew.Profiler capture is active; drop one or stop the outer "
                     "profiler before fitting")
             telemetry_profile.require_profile_support()
-            return telemetry_profile.profile(profile.directory)
+            return telemetry_profile.Profiler(profile.directory)
 
         return agreed("profiling window setup", own_window)
 
@@ -2189,7 +2187,7 @@ class Trainer(Generic[Loss, Effects]):
             metadata.setdefault('train/loss', float(jax.device_get(interval.book[0]) / interval.steps))
             if not ranking and training_best:
                 ranking = (Ranking('train/loss', metadata['train/loss']),)
-        checkpoints.save(step, state, position, metadata, share=data_partition(self.device_mesh),
+        checkpoints.save(step, state, position, metadata, share=DataPartition.of(self.device_mesh),
                          ranking=ranking, control=control, weights_only=weights_only, rung=self._rung())
         self._report(CheckpointRequested(checkpoints.directory), step)
         interval.saved(step)
@@ -2216,13 +2214,13 @@ class Trainer(Generic[Loss, Effects]):
                 step,
                 state,
                 position,
-                share=data_partition(self.device_mesh),
+                share=DataPartition.of(self.device_mesh),
                 control=control,
                 rung=self._rung(),
             )
         else:
             checkpoints.save_local(
-                step, state, position, share=data_partition(self.device_mesh), rung=self._rung()
+                step, state, position, share=DataPartition.of(self.device_mesh), rung=self._rung()
             )
         self._report(CheckpointRequested(str(checkpoints.local_directory), local=True), step)
         self._display.status("")
@@ -2354,11 +2352,11 @@ class Trainer(Generic[Loss, Effects]):
                 params, averaged = execution.snapshot(params), execution.snapshot(averaged)
             key = execution.on_accelerator(key)
         assert params is not None, "evaluation always has model variables"
-        # The rules and the microbatch count; `evaluate` scores under the
+        # The rules and the microbatch count; `Evaluation.run` scores under the
         # mesh itself, and previews decode outside it.
         with (pipeline_microbatches(self.mesh.microbatches),
               nn.logical_axis_rules(self.layout.axis_rules), measured_links(self._links(mesh))):
-            evaluation = evaluate(
+            evaluation = Evaluation.run(
                 self.objective, params, dataset.val if reader is None else reader, metrics=metrics, key=key,
                 step=state.step, schedule_step=state.microstep,
                 averaged=averaged, preview=preview, mesh=mesh, loss=loss, split=split, training=training)

@@ -32,7 +32,6 @@ from dew.objectives.jepa import JepaEncoder, JepaObjective, JepaPredictor, multi
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl import GRPOObjective, SampledRollout
 from dew.sampling import Euler, Heun, Sampling
-from dew.training.distributed import build_mesh
 
 ROOT = Path(__file__).resolve().parents[2]
 PROFILE = True
@@ -242,7 +241,7 @@ def mesh(out, smoke):
     state = trainer.fit(data, steps=3)
     # End snippet: mesh
     assert int(state.step) == 3 and int(state.updates) == 3
-    return {"devices": jax.device_count(), "axes": dict(build_mesh(trainer.mesh).shape), "steps": int(state.step)}
+    return {"devices": jax.device_count(), "axes": dict(trainer.mesh.build().shape), "steps": int(state.step)}
 
 
 def reliability(out, smoke):
@@ -276,7 +275,7 @@ def reliability(out, smoke):
     if PROFILE:
         # Begin snippet: profile
         import dew
-        with dew.profile(out / "profile"):
+        with dew.Profiler(out / "profile"):
             logits = objective.model.apply(resumed.params, jnp.zeros((1, 8), jnp.int32))
             logits.block_until_ready()
         # End snippet: profile
@@ -305,7 +304,7 @@ def main():
     if options.section == "mesh":
         jax.config.update("jax_num_cpu_devices", 4)
     if options.topology_only:
-        mesh = build_mesh(MeshSpec(fsdp=2, tensor=2))
+        mesh = MeshSpec(fsdp=2, tensor=2).build()
         result = {"axes": dict(mesh.shape), "devices": [device.id for device in mesh.devices.flat],
                   "backend": jax.default_backend(), "training": False}
     else:

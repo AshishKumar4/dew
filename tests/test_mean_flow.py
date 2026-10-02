@@ -13,7 +13,7 @@ import pytest
 from dew.diffusion import presets
 from dew.inputs import CharTable, Condition, Field, InputSpec
 from dew.nn.backbones import SimpleDiT
-from dew.objectives.base import Step, scalar_loss
+from dew.objectives.base import Step
 from dew.objectives.diffusion.few_step import (
     MeanFlowObjective,
     adaptive_loss,
@@ -85,7 +85,7 @@ def test_the_objective_trains_the_duration_and_one_step_samples_the_interval():
     batch = {"image": np.asarray(jax.random.randint(jax.random.PRNGKey(1), (4, 4, 4, 3), 0, 256), np.uint8),
              **task.inputs.tokenize(["a", "b", "c", "d"])}
     step = Step(step=jnp.asarray(0), key=jax.random.PRNGKey(2), ema=None)
-    grads = jax.grad(lambda tree: scalar_loss(task, {**params, "params": tree}, batch, step)[0])(params["params"])
+    grads = jax.grad(lambda tree: task.scalar_loss({**params, "params": tree}, batch, step)[0])(params["params"])
     duration = grads["conditioning"]["duration_embed"]
     assert float(sum(jnp.abs(leaf).sum() for leaf in jax.tree.leaves(duration))) > 0
 

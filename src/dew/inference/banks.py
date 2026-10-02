@@ -614,13 +614,13 @@ def _check_shapes(shapes: Variables, site: DecoderBank) -> None:
 def _bank_plan(model: BankedModel, source: LayerBanks, mesh: MeshSpec | Mesh | None,
                layout: Layout | None):
     """Validate canonical ownership and placement before either loader reads a value."""
-    from dew.training.distributed import Layout as DefaultLayout, MeshSpec as DefaultMesh, build_mesh
+    from dew.training.distributed import Layout as DefaultLayout, MeshSpec as DefaultMesh
 
     sites = bank_sites(model)
     shapes = source.shapes()
     for site in sites:
         _check_shapes(shapes, site)
-    device_mesh = mesh if isinstance(mesh, Mesh) else build_mesh(DefaultMesh() if mesh is None else mesh)
+    device_mesh = mesh if isinstance(mesh, Mesh) else (DefaultMesh() if mesh is None else mesh).build()
     chosen = DefaultLayout() if layout is None else layout
     placement = chosen.offloaded(device_mesh, shapes)
     chosen.check(shapes["params"], placement["params"], device_mesh)

@@ -4,7 +4,7 @@ tests/test_distribution.py starts it through the launcher, so the process
 joins exactly as a multi-node run does: `prepare_process` reads the
 coordinator, count and rank `dew launch` left in the environment. The pool
 trains a few steps through `Trainer.fit` on one packed global batch, each
-process reading the share of it the mesh gives it (`data_partition`), and
+process reading the share of it the mesh gives it (`DataPartition.of`), and
 process 0 writes the losses, the partition and, for every fsdp group of the
 mesh, the processes its devices sit on. The same script on one process is
 the reference the pool is compared with.
@@ -89,10 +89,10 @@ def main() -> None:
     from jax.experimental import multihost_utils
 
     from dew.checkpoints import Checkpoints
-    from dew.data import Dataset
+    from dew.data import DataPartition, Dataset
     from dew.objectives.lm import LMObjective
     from dew.registry import models
-    from dew.training import Layout, MeshSpec, Trainer, data_partition
+    from dew.training import Layout, MeshSpec, Trainer
     from dew.training.distributed import shard_batch
 
     def share(partition):
@@ -155,7 +155,7 @@ def main() -> None:
     # A leaf whose second dimension the sequence axis splits, placed from the
     # share and gathered back whole.
     mesh = trainer.device_mesh
-    partition = data_partition(mesh)
+    partition = DataPartition.of(mesh)
     wide = np.arange(BATCH * SEQ_LEN, dtype=np.float32).reshape(BATCH, SEQ_LEN)
     rows = partition.rows(BATCH)
     placed = shard_batch(mesh, {"wide": wide[partition.index * rows:(partition.index + 1) * rows]})

@@ -40,15 +40,14 @@ import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
 import numpy as np  # noqa: E402
 import tyro  # noqa: E402
+from benchmark_host_offload import bytes_of, entry_spaces, plan  # noqa: E402
+from probe_pinned_charge import preflight  # noqa: E402
 
 import dew.nn.backbones  # noqa: E402, F401  (registers the kind)
 from dew.inference.banks import HeldBanks, host_banked  # noqa: E402
 from dew.registry import models, with_precision  # noqa: E402
 from dew.sampling.text import Sampling, generate  # noqa: E402
 from dew.training import Layout, MeshSpec  # noqa: E402
-from dew.training.distributed import build_mesh  # noqa: E402
-from benchmark_host_offload import bytes_of, entry_spaces, plan  # noqa: E402
-from probe_pinned_charge import preflight  # noqa: E402
 
 # About 200 MiB of bf16 weights: small enough for a four-gigabyte cap to hold
 # the source and the store at once, deep enough to bank four times.
@@ -172,7 +171,7 @@ def _offload_accounting(plain, case: Case) -> dict:
         jax.eval_shape(lambda key: plain.init(
             key, jax.ShapeDtypeStruct((case.batch, case.prompt), jnp.int32)),
             jax.random.key(case.seed)))
-    return stored_bytes(abstract, offloaded.offloaded(build_mesh(MeshSpec()), abstract))
+    return stored_bytes(abstract, offloaded.offloaded(MeshSpec().build(), abstract))
 
 
 def _record_decode(record: dict, model, store, cache, logits, case: Case) -> None:

@@ -612,7 +612,7 @@ def restore_variables(directory: str, *, ema: bool | None, step: int | str | Non
     """
     from dew.checkpoints import Checkpoints
     from dew.objectives.base import merge
-    from dew.training.distributed import Layout as DefaultLayout, MeshSpec as DefaultMesh, build_mesh
+    from dew.training.distributed import Layout as DefaultLayout, MeshSpec as DefaultMesh
 
     target = resolve_dtype(param_dtype)
     checkpoints = Checkpoints(directory)
@@ -623,7 +623,7 @@ def restore_variables(directory: str, *, ema: bool | None, step: int | str | Non
     averaged = stored.get("ema") is not None if ema is None else ema
     if averaged:
         template["ema"] = stored["ema"]
-    device_mesh = build_mesh(DefaultMesh() if mesh is None else mesh)
+    device_mesh = (DefaultMesh() if mesh is None else mesh).build()
     chosen_layout = DefaultLayout() if layout is None else layout
     placement = chosen_layout.shardings(device_mesh, template)
     chosen_layout.check(template["params"], placement["params"], device_mesh)

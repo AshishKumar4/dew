@@ -156,13 +156,13 @@ def test_supports_need_a_fixed_capacity_so_every_batch_has_one_shape():
 def test_supports_shard_with_their_rows():
     """The trainer splits axis 0 of every batch leaf over the data axes, so the
     supports have to lead with rows, as every other packed array does."""
-    from dew.training import MeshSpec, build_mesh
+    from dew.training import MeshSpec
     from dew.training.distributed import shard_batch
 
     sessions = [Session("t", "g", index, 0, (Call((1, 2), (3,), (-0.5,), "stop", 0, support=((3, 5, 7),)),),
                         Status.COMPLETED, float(index)) for index in range(7)]
     batch = pack(sessions, 3, rows=8, support_capacity=3)
-    placed = shard_batch(build_mesh(MeshSpec(fsdp=4)), batch)
+    placed = shard_batch(MeshSpec(fsdp=4).build(), batch)
     assert placed[SUPPORT_KEY].shape == (8, 3)
 
 

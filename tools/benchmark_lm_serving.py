@@ -105,7 +105,7 @@ def profile_decode(server, prompts: np.ndarray, output: int, steps: int, directo
     host_wall = time.perf_counter() - began
     stream = io.StringIO()
     pstats.Stats(profile, stream=stream).sort_stats("tottime").print_stats(30)
-    with dew.profile(directory) as capture:
+    with dew.Profiler(directory) as capture:
         for _ in range(steps):
             with capture.region("serve.decode"):
                 server.step()
