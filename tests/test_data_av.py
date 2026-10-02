@@ -51,11 +51,11 @@ def clip(tmp_path_factory):
 
 
 def _frame_indices(frames):
-    return [int(round(int(frame[16, 16, 0]) / GREY_STEP)) for frame in frames]
+    return [round(int(frame[16, 16, 0]) / GREY_STEP) for frame in frames]
 
 
 def _audio_indices(audio):
-    return [int(round(float(np.median(row)) * 32768 / SAMPLE_STEP)) for row in audio]
+    return [round(float(np.median(row)) * 32768 / SAMPLE_STEP) for row in audio]
 
 
 @pytest.mark.parametrize("seed", [0, 3, 7])

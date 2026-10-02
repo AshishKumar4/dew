@@ -470,7 +470,7 @@ def test_the_compiled_kernel_is_as_exact_as_the_xla_scan(shape, chunk_size):
     that the two make. The largest difference between the two is recorded
     in the assertion message rather than bounded: at TF32 it scales with the
     operands, not with fp32's epsilon."""
-    batch, _, heads, head_dim, state_size, _ = shape
+    _batch, _, _heads, head_dim, state_size, _ = shape
     assert ssd_kernel_runs(chunk_size, head_dim, state_size, jax.default_backend(), dtype=jnp.float32)
     platform = jax.default_backend()
     x, dt, A, B, C, _, state = mixer_operands(shape)

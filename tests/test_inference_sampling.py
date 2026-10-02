@@ -238,7 +238,7 @@ def test_unsupported_source_controls_report_their_reason(task):
         "no compile": ({"disable_compile": True}, "always runs compiled"),
         "capacity": ({"max_cache_len": 4096}, "max_seq_len"),
     }
-    for name, (active, reason) in refusals.items():
+    for (active, reason) in refusals.values():
         with pytest.raises(ValueError, match=reason):
             replace(source, generation_config=active).text_generation()
 

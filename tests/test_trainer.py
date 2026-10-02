@@ -759,7 +759,7 @@ def test_the_compiled_step_consumes_the_state_it_is_given():
     batch = next(Counting())
     step = trainer.compile(state, batch)
     stale = jax.tree.leaves(state.params)[0]
-    advanced, loss, _, finite, _ = step(state, batch)
+    advanced, _loss, _, finite, _ = step(state, batch)
     assert bool(finite) and int(advanced.step) == 1
     assert stale.is_deleted()
     again, _, _, _, _ = step(advanced, batch)
@@ -2017,7 +2017,7 @@ def test_a_fresh_state_is_built_in_the_buffers_its_held_checkpoint_arrives_in(mo
         return out
 
     monkeypatch.setattr(jax, "device_put", recorded)
-    trainer, objective, weights = held_lm_trainer(mesh=MeshSpec(fsdp=jax.device_count()))
+    trainer, _objective, weights = held_lm_trainer(mesh=MeshSpec(fsdp=jax.device_count()))
     state, shardings, _ = trainer.place()
     params = dict(jax.tree_util.tree_leaves_with_path(shardings.params))
     sharded = 0

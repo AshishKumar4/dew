@@ -91,11 +91,11 @@ def test_parent_death_kills_the_worker(tmp_path):
     script = tmp_path / "parent.py"
     script.write_text(
         "import json, os, sys, time\n"
-        "sys.path.insert(0, %r)\n"
+        "sys.path.insert(0, {!r})\n"
         "from test_sandbox import environment, IDENTITY\n"
         "with environment()(IDENTITY) as session:\n"
         "    print(json.loads(session.reset().detail)[0], flush=True)\n"
-        "    time.sleep(3600)\n" % str(Path(__file__).parent))
+        "    time.sleep(3600)\n".format(str(Path(__file__).parent)))
     root = Path(__file__).resolve().parents[1]
     parent = subprocess.Popen([sys.executable, str(script)], stdout=subprocess.PIPE, text=True,
                               env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(root / "src")})

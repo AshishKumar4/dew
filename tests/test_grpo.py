@@ -50,7 +50,8 @@ def reference():
 
 def terms(fixture):
     """The fixture rollout as float32 arrays with the KL strength."""
-    get = lambda key: np.asarray(fixture[key], np.float32)
+    def get(key):
+        return np.asarray(fixture[key], np.float32)
     return (get("old_log_probs"), get("current_log_probs"), get("ref_log_probs"),
             get("advantages"), get("response_mask"), float(fixture["beta"]))
 
@@ -122,7 +123,7 @@ def test_a_flat_mean_moves_the_loss(reference):
     dilutes the short tails: observed move 0.082."""
     old, current, ref, advantages, mask, beta = terms(reference)
     ratio = token_log_ratio(jnp.asarray(current), jnp.asarray(old))
-    pg, _ = clipped_surrogate(ratio, jnp.asarray(advantages), jnp.asarray(mask))
+    _pg, _ = clipped_surrogate(ratio, jnp.asarray(advantages), jnp.asarray(mask))
     kl = token_mean(k3_kl(jnp.asarray(current), jnp.asarray(ref)), jnp.asarray(mask))
     flat = jnp.mean(jnp.asarray(mask) * -jnp.asarray(advantages) * jnp.exp(ratio))
 
@@ -291,8 +292,9 @@ def test_the_rollout_batch_feeds_the_objective():
     width = PROMPT_WIDTH
     prompts = np.tile(np.arange(1, width + 1, dtype=np.int32), (2, 1))
     info = max(len("rule"), len("other"))
-    pad = lambda text: np.pad(
-        np.frombuffer(text.encode(), np.uint8).astype(np.int32), (0, info - len(text)))
+    def pad(text):
+        return np.pad(
+            np.frombuffer(text.encode(), np.uint8).astype(np.int32), (0, info - len(text)))
     batch = {
         PROMPT_KEY: prompts,
         LENGTH_KEY: np.full(2, width, np.int32),

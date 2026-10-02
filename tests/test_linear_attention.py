@@ -202,7 +202,8 @@ def test_the_conv_reads_no_future_column(reference):
 def layer_params(reference):
     """The reference layer's state_dict under dew's names: Linear weights
     transposed to [in, out], everything else as it stands."""
-    leaf = lambda name: jnp.asarray(reference[f"layer.{name}"])
+    def leaf(name):
+        return jnp.asarray(reference[f"layer.{name}"])
     return {"params": {
         "in_proj_qkv": {"kernel": leaf("in_proj_qkv.weight").T},
         "in_proj_z": {"kernel": leaf("in_proj_z.weight").T},
@@ -354,7 +355,7 @@ def test_the_masked_conv_reads_across_a_gap():
     trailing padding and moves the slots after an interior gap by 5.0 here.
     """
     rows, width = MASKED_ROWS["interior holes"]
-    x, kernel, state, valid, _ = masked_operands(rows, width, history=False, seed=3)
+    x, kernel, _state, valid, _ = masked_operands(rows, width, history=False, seed=3)
     out, _ = _masked_conv1d(x, kernel, valid)
 
     for row in range(x.shape[0]):

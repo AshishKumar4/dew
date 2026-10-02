@@ -218,7 +218,7 @@ def test_the_converted_model_carries_the_exported_config(imported):
     """Ollama's converter reads the export's own config, so the GGUF it
     writes reports Dew's widths, its rope base and its parameter count.
     A field the export spelled wrong lands here as a different number."""
-    name, export, shown = imported
+    _name, export, shown = imported
     config = json.loads((export / "config.json").read_text())
     info = shown["model_info"]
 

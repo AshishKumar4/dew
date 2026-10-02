@@ -86,7 +86,7 @@ def test_native_sd3_matches_the_source_forward_and_every_gradient(name, source):
         # sin/cos initializer, so a model that rebuilt it would not match.
         assert relative_gap(buffers["pos_embed"], arrays[f"{name}.position_buffer"]) == 0.0
         gradients = jax.jit(jax.grad(
-            lambda p, l, c, q: jnp.sum(forward(p, l, c, q) * probe), argnums=(0, 1, 2, 3)))(
+            lambda p, noisy_latent, c, q: jnp.sum(forward(p, noisy_latent, c, q) * probe), argnums=(0, 1, 2, 3)))(
                 params, latent, condition.context, condition.pooled)
         assert relative_gap(gradients[1].transpose(0, 3, 1, 2), arrays[f"{name}.grad_latent"]) < 1e-5
         assert relative_gap(gradients[2], arrays[f"{name}.grad_context"]) < 1e-5

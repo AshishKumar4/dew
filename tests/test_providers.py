@@ -313,7 +313,7 @@ def test_an_arrow_split_reads_by_index_and_carries_its_position(jsonl):
 
     assert indices(resumed, 2) == rest
     assert sorted(i for batch in seen for i in batch) == sorted(
-        set(i for batch in seen for i in batch)), "no record twice inside a pass"
+        {i for batch in seen for i in batch}), "no record twice inside a pass"
 
 
 def test_an_arrow_split_holds_a_named_validation_split(jsonl):

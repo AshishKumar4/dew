@@ -791,12 +791,13 @@ def test_a_resumed_run_reads_the_batch_after_its_checkpoint(tmp_path):
 
     mesh = build_mesh()
     with DevicePrefetchIterator(grain_image_loader(), mesh,
-                                source_state=position) as resumed:
-        with DevicePrefetchIterator(grain_image_loader(), mesh) as fresh:
-            for _ in range(3):
-                next(fresh)
-            np.testing.assert_array_equal(np.asarray(next(resumed)["image"]),
-                                          np.asarray(next(fresh)["image"]))
+                                source_state=position) as resumed, (
+            DevicePrefetchIterator(grain_image_loader(), mesh)
+    ) as fresh:
+        for _ in range(3):
+            next(fresh)
+        np.testing.assert_array_equal(np.asarray(next(resumed)["image"]),
+                                      np.asarray(next(fresh)["image"]))
 
 
 def test_fit_resumes_the_unfinished_part_of_a_run(tmp_path):

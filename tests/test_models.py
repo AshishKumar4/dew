@@ -166,7 +166,8 @@ def test_strided_convolution_linearizations_keep_host_precision(transform):
                              (variables, image, direction, cotangent))
 
         def run(params, x, tangent, cot):
-            forward = lambda value: model.apply(params, value)
+            def forward(value):
+                return model.apply(params, value)
             if transform == "jvp":
                 return jax.jvp(forward, (x,), (tangent,))[1]
             if transform == "transpose":
