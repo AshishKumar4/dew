@@ -40,7 +40,7 @@ def every_sequence(model, params, prompt, budget, eos_ids=()):
         following = []
         for index, (seq, total) in enumerate(live):
             for token in range(VOCAB):
-                grown, score = seq + [token], float(total + scores[index, token])
+                grown, score = [*seq, token], float(total + scores[index, token])
                 if token in eos_ids or position + 1 == budget:
                     done.append((grown, score, token in eos_ids))
                 else:
@@ -56,17 +56,19 @@ def host_beam(model, params, prompt, budget, width, eos_ids, penalty, early=Fals
     for position in range(budget):
         scores = next_log_probs(model, params, [list(prompt) + seq for seq, _ in running])
         candidates = sorted(
-            ((seq + [token], float(total + scores[index, token]), token)
+            (([*seq, token], float(total + scores[index, token]), token)
              for index, (seq, total) in enumerate(running) for token in range(VOCAB)),
             key=lambda entry: -entry[1])[:keep]
         hits = [entry[2] in eos_ids or position + 1 == budget for entry in candidates]
         recording = open_ and not (early is True and len(finished) >= width)
-        for slot, (entry, hit) in enumerate(zip(candidates, hits)):
+        for slot, (entry, hit) in enumerate(zip(candidates, hits, strict=True)):
             if recording and slot < width and hit:
                 finished.append((entry[0], entry[1] / (position + 1) ** penalty,
                                  entry[2] in eos_ids, position + 1))
         finished = sorted(finished, key=lambda entry: -entry[1])[:width]
-        running = [(entry[0], entry[1]) for entry, hit in zip(candidates, hits) if not hit][:width]
+        running = [(entry[0], entry[1]) for entry, hit in zip(candidates, hits, strict=True) if not hit][
+            :width
+        ]
         if not running:
             break
         reach = budget if (early == "never" and penalty > 0) else position + 1
@@ -186,17 +188,19 @@ def host_beam_shaped(model, params, prompt, budget, width, eos_ids, penalty, ear
         rows = [list(prompt) + seq for seq, _ in running]
         scores = shaped(model, params, rows, entries, renormalize)
         candidates = sorted(
-            ((seq + [token], float(total + scores[index, token]), token)
+            (([*seq, token], float(total + scores[index, token]), token)
              for index, (seq, total) in enumerate(running) for token in range(VOCAB)),
             key=lambda entry: -entry[1])[:keep]
         hits = [entry[2] in eos_ids or position + 1 == budget for entry in candidates]
         recording = open_ and not (early is True and len(finished) >= width)
-        for slot, (entry, hit) in enumerate(zip(candidates, hits)):
+        for slot, (entry, hit) in enumerate(zip(candidates, hits, strict=True)):
             if recording and slot < width and hit:
                 finished.append((entry[0], entry[1] / (position + 1) ** penalty,
                                  entry[2] in eos_ids, position + 1))
         finished = sorted(finished, key=lambda entry: -entry[1])[:width]
-        running = [(entry[0], entry[1]) for entry, hit in zip(candidates, hits) if not hit][:width]
+        running = [(entry[0], entry[1]) for entry, hit in zip(candidates, hits, strict=True) if not hit][
+            :width
+        ]
         if not running:
             break
         reach = budget if (early == "never" and penalty > 0) else position + 1
@@ -221,7 +225,7 @@ def test_a_renormalized_biased_search_matches_the_host_search(model):
                      strategy=Beam(width=3, length_penalty=penalty, early_stopping="never",
                                    stop_ids=1))
     expected = host_beam_shaped(module, params, PROMPT, 4, 3, (eos,), penalty, "never",
-                                entries, True)
+                                entries, renormalize=True)
     for row, (tokens, _, terminated, length) in enumerate(expected[:2]):
         assert int(found.lengths[row]) == length, (row, np.asarray(found.tokens)[row])
         np.testing.assert_array_equal(np.asarray(found.tokens)[row, 3:3 + length], tokens)

@@ -22,7 +22,7 @@ from jax.typing import ArrayLike
 from dew.diffusion.process import Denoiser, Process
 from dew.diffusion.schedules import FlowMatchingScheduler, expand
 from dew.diffusion.transforms import FlowMatchPredictionTransform
-from dew.registry import samplers
+from dew.registry import solvers
 
 from .guidance import Guidance
 
@@ -117,8 +117,7 @@ def flow_transition(x: ArrayLike, velocity: ArrayLike, sigma: ArrayLike,
                               jnp.where(valid, variance, jnp.nan))
 
 
-
-@samplers("flow_sde")
+@solvers("flow_sde")
 @dataclass(frozen=True)
 class FlowSDE:
     """Flow-GRPO's Euler-Maruyama solver on a rectified-flow Process.
@@ -154,6 +153,39 @@ class FlowSDE:
              /) -> tuple[jax.Array, tuple[()]]:
         return self.transition(x, t, t_next, denoised, eps, process).sample(key), state
 
+    def trajectory(self, denoise: Denoiser, x_T: jax.Array, steps: int, *,
+                   guidance: Guidance | None = None, key: int | jax.Array) -> FlowTrajectory:
+        """Record this solver's transitions over the same time grid and keys as sample.
+
+        steps counts grid points, including both endpoints. A ten-transition
+        rollout therefore uses steps=11. Guidance is applied identically before
+        constructing each Gaussian, and must be stateless, as the rescoring of
+        each transition reads it alone. Rectified flow's clean prediction at t=0
+        is its state, so the last transition already produces the final sample.
+        """
+        if steps < 2:
+            raise ValueError("a trajectory needs at least two time points")
+        from dew.nn.inputs import request_key
+        key = request_key(key)
+        process = denoise.process
+        predict = denoise if guidance is None else guidance(denoise)
+        times = process.times(steps)
+        x_T = jnp.asarray(x_T, jnp.float32)
+        batch = x_T.shape[0]
+
+        def body(x, inputs):
+            t, t_next, index = inputs
+            t, t_next = jnp.full((batch,), t), jnp.full((batch,), t_next)
+            denoised, eps = predict(x, t)
+            transition = self.transition(x, t, t_next, denoised, eps, process)
+            following = transition.sample(jax.random.fold_in(key, index))
+            return following, (following, transition.log_prob(following), transition.stochastic)
+
+        _, (states, log_probs, stochastic) = jax.lax.scan(
+            body, x_T, (times[:-1], times[1:], jnp.arange(steps - 1)))
+        states = jnp.concatenate((x_T[:, None], jnp.swapaxes(states, 0, 1)), axis=1)
+        return FlowTrajectory(states, times, log_probs.T, stochastic.T)
+
 
 @struct.dataclass
 class FlowTrajectory:
@@ -174,43 +206,5 @@ class FlowTrajectory:
         return self.states[:, -1]
 
 
-_DEFAULT_SOLVER = FlowSDE()
-
-
-def sample_trajectory(denoise: Denoiser, x_T: jax.Array, steps: int, *,
-                      solver: FlowSDE = _DEFAULT_SOLVER, guidance: Guidance | None = None,
-                      key: int | jax.Array) -> FlowTrajectory:
-    """Record FlowSDE transitions over the same time grid and keys as sample.
-
-    steps counts grid points, including both endpoints. A ten-transition
-    rollout therefore uses steps=11. Guidance is applied identically before
-    constructing each Gaussian, and must be stateless, as the rescoring of
-    each transition reads it alone. Rectified flow's clean prediction at t=0
-    is its state, so the last transition already produces the final sample.
-    """
-    if steps < 2:
-        raise ValueError("a trajectory needs at least two time points")
-    from dew.nn.inputs import request_key
-    key = request_key(key)
-    process = denoise.process
-    predict = denoise if guidance is None else guidance(denoise)
-    times = process.times(steps)
-    x_T = jnp.asarray(x_T, jnp.float32)
-    batch = x_T.shape[0]
-
-    def body(x, inputs):
-        t, t_next, index = inputs
-        t, t_next = jnp.full((batch,), t), jnp.full((batch,), t_next)
-        denoised, eps = predict(x, t)
-        transition = solver.transition(x, t, t_next, denoised, eps, process)
-        following = transition.sample(jax.random.fold_in(key, index))
-        return following, (following, transition.log_prob(following), transition.stochastic)
-
-    _, (states, log_probs, stochastic) = jax.lax.scan(
-        body, x_T, (times[:-1], times[1:], jnp.arange(steps - 1)))
-    states = jnp.concatenate((x_T[:, None], jnp.swapaxes(states, 0, 1)), axis=1)
-    return FlowTrajectory(states, times, log_probs.T, stochastic.T)
-
-
-__all__ = ["FlowSDE", "FlowTrajectory", "GaussianTransition", "flow_transition", "sample_trajectory"]
+__all__ = ["FlowSDE", "FlowTrajectory", "GaussianTransition"]
 

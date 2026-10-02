@@ -12,10 +12,10 @@ from flax import linen as nn
 
 from dew.diffusion import presets
 from dew.inputs import Field, InputSpec
-from dew.objectives.base import Step, scalar_loss
+from dew.nn.backbones import SimpleDiT
+from dew.objectives.base import Step
 from dew.objectives.diffusion import Alignment, DiffusionObjective
 from dew.objectives.diffusion.alignment import ALIGNMENT, REPRESENTATION, spatial_zscore
-from dew.registry import models
 from dew.sampling import Euler, TextToImage
 
 CASES = np.load(Path(__file__).resolve().parent / "fixtures" / "repa" / "losses.npz")
@@ -63,13 +63,13 @@ class Patches(nn.Module):
 
 
 def aligned(kind: str = "mlp"):
-    model = models.SimpleDiT(patch_size=4, emb_features=16, num_layers=2, num_heads=2, mlp_ratio=1)
+    model = SimpleDiT(patch_size=4, emb_features=16, num_layers=2, num_heads=2, mlp_ratio=1)
     encoder = Patches()
     variables = encoder.init(jax.random.PRNGKey(9), jnp.zeros((1, 8, 8, 3)))
     alignment = Alignment(encoder, variables, "dit_block_0", weight=0.5, projector=kind, width=8,
                           spatial_norm=0.6 if kind == "conv" else None)
     return DiffusionObjective(model, presets.Flow()(), InputSpec(Field("image", (8, 8, 3))),
-                              guidance=None, sampler=Euler(), steps=2, alignment=alignment)
+                              guidance=None, solver=Euler(), steps=2, alignment=alignment)
 
 
 @pytest.mark.parametrize("kind", ["mlp", "conv"])
@@ -82,11 +82,11 @@ def test_the_objective_adds_the_weighted_alignment_to_the_denoising_mean(kind):
     params = objective.init(jax.random.PRNGKey(0))
     batch = {"image": np.asarray(jax.random.randint(jax.random.PRNGKey(1), (4, 8, 8, 3), 0, 256), np.uint8)}
     step = Step(step=jnp.asarray(0), key=jax.random.PRNGKey(2), ema=None)
-    loss, aux = scalar_loss(objective, params, batch, step)
+    loss, aux = objective.scalar_loss(params, batch, step)
 
     plain = DiffusionObjective(objective.model, objective.process, objective.inputs, guidance=None,
-                               sampler=Euler(), steps=2)
-    denoising, _ = scalar_loss(plain, {**objective.trainable(params), "encoders": params["encoders"]},
+                               solver=Euler(), steps=2)
+    denoising, _ = plain.scalar_loss({**objective.trainable(params), "encoders": params["encoders"]},
                                batch, step)
     # REPA's total is mse + proj_coeff * alignment; Dew's L2 halves the
     # first, so the second is halved with it: 0.5 / 2.
@@ -94,7 +94,7 @@ def test_the_objective_adds_the_weighted_alignment_to_the_denoising_mean(kind):
     assert -1.0 <= float(aux.metrics["alignment"]) <= 1.0
 
     def alignment_only(tree):
-        return scalar_loss(objective, {**params, "params": tree}, batch, step)[1].metrics["alignment"]
+        return objective.scalar_loss({**params, "params": tree}, batch, step)[1].metrics["alignment"]
 
     grads = jax.grad(alignment_only)(params["params"])
     assert float(jnp.abs(jax.tree.leaves(grads[ALIGNMENT])[0]).sum()) > 0
@@ -109,4 +109,4 @@ def test_a_layer_the_model_lacks_is_refused():
     alignment = Alignment(objective.alignment.encoder, objective.alignment.variables, "dit_block_9")
     with pytest.raises(ValueError, match="no submodule 'dit_block_9'"):
         DiffusionObjective(objective.model, objective.process, objective.inputs, guidance=None,
-                           sampler=Euler(), steps=2, alignment=alignment).init(jax.random.PRNGKey(0))
+                           solver=Euler(), steps=2, alignment=alignment).init(jax.random.PRNGKey(0))

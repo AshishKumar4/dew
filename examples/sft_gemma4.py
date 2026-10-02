@@ -6,7 +6,7 @@
 The run packs whole conversations into windows, counts the loss on assistant
 targets alone, shards the weights over the visible devices and accumulates
 micro-batches into one update. It ends by exporting the trained weights to
-the Hugging Face layout, so transformers and `load_pretrained` both read
+the Hugging Face layout, so transformers and `Pretrained.load` both read
 them, and the run directory itself scores through the harness:
 
     python -m dew.eval --model dew --model_args run=runs/gemma4-sft/checkpoints/gemma4-sft \\
@@ -27,11 +27,10 @@ import jax
 import tyro
 
 from dew.config import ModelConfig, OptimConfig, TrainerConfig
-from dew.data import ChatMessages, Loading, tokenizer_for
+from dew.data import ChatMessages, HFTokenizer, Loading
 from dew.data.chat import Role
-from dew.interop import export_run, load_pretrained
-from dew.objectives.lm import LMRunConfig, Samples
-from dew.registry import metrics
+from dew.interop import PretrainedDecoder, export_run
+from dew.objectives.lm import LMRunConfig, Perplexity, Samples
 from dew.training import MeshSpec, TrainState, prepare_process
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests/fixtures"
@@ -119,10 +118,10 @@ def main(config: Config) -> Path:
     # the pool forms, and a pool's count is every process's devices.
     run = replace(run, trainer=replace(run.trainer, mesh=MeshSpec(fsdp=jax.device_count())))
 
-    source = load_pretrained(config.model, dtype=run.model.dtype,
+    source = PretrainedDecoder.load(config.model, dtype=run.model.dtype,
                              attention_impl=run.model.attention_impl,
                              max_seq_len=config.sequence_length + run.sample_tokens)
-    words = tokenizer_for(tokenizer)
+    words = HFTokenizer(tokenizer)
     objective = source.lm_objective(
         config.sequence_length,
         loss_role=Role.ASSISTANT,
@@ -138,7 +137,7 @@ def main(config: Config) -> Path:
     data = run.data.load(batch=run.trainer.batch_size)
     name = config.out.name
     state: TrainState = run.train(objective, data, name=name,
-                                  metrics=(metrics.perplexity(),),
+                                  metrics=(Perplexity(),),
                                   summary={"model": dict(source.model_config)})
 
     run_dir = Path(run.trainer.checkpoint_dir) / name

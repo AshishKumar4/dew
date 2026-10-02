@@ -58,6 +58,7 @@ whose dtypes are worth counting.
 import math
 import re
 from dataclasses import dataclass
+from importlib import import_module
 
 import jax
 import jax.numpy as jnp
@@ -65,12 +66,12 @@ import optax
 import pytest
 from test_precision_policy import build_model, tiny_inputs
 
-from dew import models  # the attribute import is what registers every family
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.kernels import bf16_dot_runs
-from dew.objectives.base import Step, scalar_loss
+from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.objectives.lm.objective import TEXT_KEY
+from dew.registry import models
 from dew.telemetry.instrumentation import (
     _COMPUTATION,
     _INSTRUCTION,
@@ -82,6 +83,9 @@ from dew.telemetry.instrumentation import (
     _weights,
     hlo_flops,
 )
+
+import_module("dew.nn.multimodal")  # registers the fixture kind
+
 
 # The element type of an HLO shape: `f32[4,8]{1,0}` and `bf16[]` both start
 # with it, and a tuple shape starts with its first member's.
@@ -351,7 +355,7 @@ def lm_loss_and_grad(rng):
     step = Step(step=jnp.asarray(0), key=rng, ema=None)
 
     def loss(variables):
-        return scalar_loss(objective, variables, batch, step)[0]
+        return objective.scalar_loss(variables, batch, step)[0]
 
     return jax.value_and_grad(loss), variables
 

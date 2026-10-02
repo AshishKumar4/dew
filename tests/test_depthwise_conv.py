@@ -125,7 +125,9 @@ def test_spatial_fusion_keeps_its_checkpoint_and_residual_add_order():
     magnitude = jnp.abs(x)
     for dilation in (1, 2, 3):
         expected = expected + convolve(x, kernels[f'dwconv_dil{dilation}']['kernel'], dilation)
-        magnitude = magnitude + convolve(jnp.abs(x), jnp.abs(kernels[f'dwconv_dil{dilation}']['kernel']), dilation)
+        magnitude = magnitude + convolve(
+            jnp.abs(x), jnp.abs(kernels[f"dwconv_dil{dilation}"]["kernel"]), dilation
+        )
     actual = jax.jit(SpatialFusionConv(4).apply)({'params': kernels}, x)
     assert_fp32_reduction_bound(actual, expected, magnitude, 28)
 
@@ -149,13 +151,15 @@ def test_depthwise_boundaries_preserve_forward_and_higher_order_derivatives():
         np.testing.assert_allclose(lhs, rhs, rtol=4e-6, atol=2e-5)
 
 
-@pytest.mark.skipif(jax.default_backend() == 'gpu',
-                    reason='Grouped int8/fp8 convolution is refused on GPU; test_quantization covers the refusal')
+@pytest.mark.skipif(
+    jax.default_backend() == "gpu",
+    reason="Grouped int8/fp8 convolution is refused on GPU; test_quantization covers the refusal",
+)
 @pytest.mark.parametrize('training', [True, False])
 def test_depthwise_quantization_keeps_the_original_provider_output(training):
     """QT and PTQ still reach the provider, with identical scales and output."""
     pytest.importorskip('qwix')
-    from dew.training.quantization import Quantization, apply_quantization, quantize_for_serving
+    from dew.training.quantization import Quantization, quantize_for_serving
 
     fields = {'features': 8, 'kernel_size': (3, 3), 'feature_group_count': 8,
               'use_bias': False, 'dtype': jnp.bfloat16}
@@ -164,8 +168,8 @@ def test_depthwise_quantization_keeps_the_original_provider_output(training):
     x = jax.random.normal(jax.random.key(2), (2, 7, 8, 8), jnp.bfloat16)
     variables = original.init(jax.random.key(1), x)
     if training:
-        before = apply_quantization(original, Quantization()).apply(variables, x)
-        after = apply_quantization(optimized, Quantization()).apply(variables, x)
+        before = Quantization().apply(original).apply(variables, x)
+        after = Quantization().apply(optimized).apply(variables, x)
     else:
         old, old_variables = quantize_for_serving(original, variables, Quantization(), x)
         new, new_variables = quantize_for_serving(optimized, variables, Quantization(), x)

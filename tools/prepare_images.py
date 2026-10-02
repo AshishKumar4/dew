@@ -1,6 +1,6 @@
 """Prepare an image dataset at training resolution as ArrayRecord shards.
 
-    python tools/prepare_images.py --dataset oxford_flowers102 \
+    python tools/prepare_images.py --dataset tfds_images \
         --data-path ~/.cache/dew/datasets/oxford_flowers102/2.1.1 \
         --split all --image-size 64 --out prepared/64
 
@@ -20,16 +20,21 @@ import time
 
 import numpy as np
 
-from dew.data.images import (ArrayRecordImages, HFImages, OxfordFlowers,
-                             decode_image, pack_dict_of_byte_arrays,
-                             resize_image)
+from dew.data.images import (
+    ArrayRecordImages,
+    HFImages,
+    TFDSImages,
+    decode_image,
+    pack_dict_of_byte_arrays,
+    resize_image,
+)
 
 
 def build_spec(args):
     """The dataset spec the recipe would build, minus the runtime knobs."""
     common: dict = {"augmentation": "none", "val_batches": None}
-    if args.dataset == "oxford_flowers102":
-        return OxfordFlowers(path=args.data_path, split=args.split,
+    if args.dataset == "tfds_images":
+        return TFDSImages(path=args.data_path, split=args.split,
                              image_size=args.image_size, **common)
     if args.dataset == "hf_images":
         if not args.name:
@@ -40,7 +45,7 @@ def build_spec(args):
         shards = tuple(args.source_shard or [])
         return ArrayRecordImages(path=args.data_path, shards=shards,
                                  image_size=args.image_size, **common)
-    raise ValueError(f"--dataset must be oxford_flowers102, hf_images or "
+    raise ValueError(f"--dataset must be tfds_images, hf_images or "
                      f"array_record_images, got {args.dataset!r}")
 
 def prepare(spec, out: str, shards: int | None, *, source: dict) -> dict:
@@ -55,7 +60,6 @@ def prepare(spec, out: str, shards: int | None, *, source: dict) -> dict:
     from array_record.python.array_record_module import ArrayRecordWriter
 
     writer = None
-    written = 0
     shard_sizes = []
     for index in range(records):
         if index % per_shard == 0:
@@ -81,11 +85,10 @@ def prepare(spec, out: str, shards: int | None, *, source: dict) -> dict:
         assert writer is not None
         writer.write(record)
         shard_sizes[-1] += len(record)
-        written += 1
     if writer is not None:
         writer.close()
 
-    manifest = {"records": written, "image_size": spec.image_size,
+    manifest = {"records": records, "image_size": spec.image_size,
                 "source": source, "shard_sizes": shard_sizes}
     with open(os.path.join(out, "manifest.json"), "w") as handle:
         json.dump(manifest, handle, indent=2)
@@ -94,7 +97,7 @@ def prepare(spec, out: str, shards: int | None, *, source: dict) -> dict:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dataset", default="oxford_flowers102")
+    parser.add_argument("--dataset", default="tfds_images")
     parser.add_argument("--data-path", required=True,
                         help="the spec's path= (prepared TFDS dir or shard root)")
     parser.add_argument("--name", default=None, help="hub repo id for hf_images")

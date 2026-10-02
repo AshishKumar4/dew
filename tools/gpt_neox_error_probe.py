@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from dew.interop import load_pretrained
+from dew.interop import Pretrained
 from dew.nn.backbones.causal_transformer import layer_output, layer_outputs
 
 
@@ -23,7 +23,7 @@ def main():
     ids = AutoTokenizer.from_pretrained(args.checkpoint)('The capital of France is', return_tensors='np')['input_ids']
     with torch.no_grad():
         expected = reference(torch.tensor(ids, device='cuda'), use_cache=False, output_hidden_states=True)
-    loaded = load_pretrained(args.checkpoint, dtype='float32', attention_impl='reference', max_seq_len=64)
+    loaded = Pretrained.load(args.checkpoint, dtype='float32', attention_impl='reference', max_seq_len=64)
     model = loaded.model.clone(precision=jax.lax.Precision.HIGHEST)
     actual, intermediates = model.apply(loaded.variables, jnp.asarray(ids),
                                         capture_intermediates=layer_outputs, mutable=['intermediates'])

@@ -7,6 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from test_rl_surrogate import clipped_surrogate
 
 from dew.data import Dataset
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -16,7 +17,6 @@ from dew.nn.mla import MLAMixer
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl import GRPOObjective, SampledRollout
-from dew.rl import clipped_surrogate
 from dew.sampling import Sampling, generate
 from dew.training import Trainer
 
@@ -44,7 +44,9 @@ def prompts():
 
 def model_inputs(batch):
     tokens = jnp.asarray(batch["prompt"])
-    mask = jnp.arange(tokens.shape[1])[None, :] >= tokens.shape[1] - jnp.asarray(batch["prompt_length"])[:, None]
+    mask = (
+        jnp.arange(tokens.shape[1])[None, :] >= tokens.shape[1] - jnp.asarray(batch["prompt_length"])[:, None]
+    )
     return ModelInputs(tokens, {"attention_mask": mask})
 
 
@@ -106,7 +108,7 @@ def test_padding_repro_greedy_and_seeded_reproducibility():
         np.testing.assert_array_equal(padded.tokens[:, 4:], plain.tokens[:, 2:])
         np.testing.assert_allclose(padded.behavior_log_probs, plain.behavior_log_probs, atol=1e-6)
         repeated = generate(model, params, inputs, 3, key=key, sampling=sampling)
-        for first, second in zip(jax.tree.leaves(padded), jax.tree.leaves(repeated)):
+        for first, second in zip(jax.tree.leaves(padded), jax.tree.leaves(repeated), strict=True):
             np.testing.assert_array_equal(first, second)
 
 
@@ -195,7 +197,7 @@ def test_real_trainer_update_matches_raw_policy_ratio_with_behavior_recorded():
     assert int(state.step) == 1
     movement = 0.0
     for old, actual, reference in zip(jax.tree.leaves(params), jax.tree.leaves(state.variables),
-                                     jax.tree.leaves(expected)):
+                                     jax.tree.leaves(expected), strict=True):
         np.testing.assert_allclose(actual, reference, atol=2e-6, rtol=2e-6)
         movement += float(jnp.sum(jnp.abs(actual - old)))
     assert movement > 0.001

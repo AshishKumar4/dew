@@ -6,7 +6,7 @@ read is a memcpy rather than a JPEG decode:
     python -c "import tensorflow_datasets as tfds; tfds.builder('oxford_flowers102', \\
         data_dir='~/.cache/dew/datasets').download_and_prepare(\\
         file_format='array_record')"
-    python tools/prepare_images.py --dataset oxford_flowers102 \\
+    python tools/prepare_images.py --dataset tfds_images \\
         --data-path ~/.cache/dew/datasets/oxford_flowers102/2.1.1 \\
         --split all --image-size 256 --out prepared/flowers-256
 
@@ -15,7 +15,7 @@ Then launch the same file on every worker of the slice:
     python examples/train_flowers_tpu.py --data prepared/flowers-256 --steps 200000
 
 `--data` reads whichever of the two layouts it is given: the TFDS version
-directory loads as `oxford_flowers102`, the `prepare_images.py` output as
+directory loads as `tfds_images`, the `prepare_images.py` output as
 `array_record_images`. The smoke run writes a handful of synthetic records in
 that second layout and trains on them on one CPU device:
 
@@ -34,14 +34,14 @@ from PIL import Image
 import dew
 from dew.artifacts import uint8_pixels
 from dew.config import ModelConfig, OptimConfig, TrainerConfig
-from dew.data import ArrayRecordImages, Loading, OxfordFlowers
+from dew.data import ArrayRecordImages, DataPartition, Loading, TFDSImages
 from dew.data.images import pack_dict_of_byte_arrays
 from dew.diffusion.presets import EDM
-from dew.eval import clip_score, fid
+from dew.eval import FID, CLIPScore
 from dew.objectives.diffusion import DiffusionRunConfig, TextCondition
 from dew.sampling import CFG
 from dew.sampling.solvers import Heun
-from dew.training import MeshSpec, ProfileWindow, build_mesh, data_partition, prepare_process
+from dew.training import MeshSpec, ProfileWindow, prepare_process
 from dew.training.optim import Cosine
 
 PROMPTS = ("a water lily", "a sunflower", "a red rose", "a purple orchid")
@@ -69,7 +69,7 @@ class Config:
     guidance: float = 3.0
     clip_model: str = "openai/clip-vit-large-patch14"
     """The checkpoint CLIPScore is read from, for conditioning and for scoring."""
-    inception_weights: Path | None = None
+    inception_weights: str | None = None
     """The FID extractor's parameters as a file; unset downloads the published
     checkpoint. --smoke reads the committed tiny one instead."""
     model: dict = field(default_factory=lambda: {
@@ -110,7 +110,7 @@ def smoke_config(config: Config, out: Path) -> DiffusionRunConfig:
                                val_batches=1, loading=Loading(workers=0, threads=1,
                                                               read_buffer=2, worker_buffer=1)),
         preset=EDM(regime="pixel"),
-        sampler=Heun(),
+        solver=Heun(),
         guidance=CFG(2.0),
         sampling_steps=2,
         ema_decay=0.9,
@@ -132,12 +132,12 @@ def slice_config(config: Config) -> DiffusionRunConfig:
         raise ValueError("--data is the prepared record directory; --smoke writes its own")
     path = str(config.data.expanduser())
     prepared = (ArrayRecordImages(path=path) if (config.data / "manifest.json").is_file()
-                else OxfordFlowers(path=path))
+                else TFDSImages(path=path))
     return DiffusionRunConfig(
         model=ModelConfig("simple_dit", dict(config.model), dtype="bfloat16"),
         data=replace(prepared, image_size=config.image_size, val_batches=4),
         preset=EDM(regime="pixel"),
-        sampler=Heun(),
+        solver=Heun(),
         guidance=CFG(config.guidance),
         sampling_steps=config.sampling_steps,
         ema_decay=0.9999,
@@ -160,7 +160,7 @@ def held_out(run: DiffusionRunConfig) -> np.ndarray:
     if data.val is None:
         raise ValueError("scoring FID needs a held-out split: set data.val_batches")
     # This process's share of the pass on the run's plain data-parallel mesh.
-    share = data_partition(build_mesh(run.trainer.mesh))
+    share = DataPartition.of(run.trainer.mesh.build())
     return np.concatenate([np.asarray(batch["image"], np.uint8) for batch in data.val(share)])
 
 
@@ -173,7 +173,7 @@ def grid(images: np.ndarray, path: Path) -> None:
 
 def main(config: Config) -> Path:
     if config.smoke:
-        config = replace(config, clip_model=str(SMOKE_CLIP), inception_weights=SMOKE_INCEPTION)
+        config = replace(config, clip_model=str(SMOKE_CLIP), inception_weights=str(SMOKE_INCEPTION))
     run = smoke_config(config, config.out) if config.smoke else slice_config(config)
     prepare_process(run.trainer.wandb, run.trainer.multi_host, run.trainer.xla_flags,
                     run.trainer.compilation_cache_dir, layout=run.trainer.layout)
@@ -192,12 +192,12 @@ def main(config: Config) -> Path:
     run_dir = Path(run.trainer.checkpoint_dir) / name
     pipe = dew.pipeline(str(run_dir))
     drawn = pipe(list(PROMPTS), steps=run.sampling_steps, guidance=config.guidance,
-                 sampler=Heun(), key=1).host().images
+                 solver=Heun(), key=1).host().images
     grid(drawn, config.out / "samples.png")
 
     generated = uint8_pixels(drawn)
-    report = {"clip_score": clip_score(generated, list(PROMPTS), modelname=config.clip_model),
-              "fid": fid(generated, held_out(run), weights=config.inception_weights)}
+    report = {"clip_score": CLIPScore(config.clip_model).score(generated, list(PROMPTS)),
+              "fid": FID(weights=config.inception_weights).score(generated, held_out(run))}
     (config.out / "eval.json").write_text(json.dumps(report, indent=2))
     print(f"samples {config.out / 'samples.png'}  {report}")
     return run_dir

@@ -32,9 +32,9 @@ def publish(args) -> dict:
     from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
     from dew.inference import NCCLPush, SafetensorsReload
-    from dew.interop import load_pretrained
+    from dew.interop import Pretrained
 
-    source = load_pretrained(FIXTURE, dtype="float32")
+    source = Pretrained.load(FIXTURE, dtype="float32")
     mesh = Mesh(np.asarray(jax.devices()), ("pool",))
 
     def sharded(leaf):

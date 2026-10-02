@@ -25,9 +25,9 @@ from typing import TYPE_CHECKING
 import tyro
 
 from dew.config import ModelConfig
-from dew.data import PackedTokens, TokenWindows, tokenizer_for
-from dew.objectives.lm import LMObjective, LMRunConfig, Samples
-from dew.registry import datasets, metrics, models
+from dew.data import ByteTokenizer, HFTokenizer, PackedTokens, TokenWindows
+from dew.objectives.lm import LMObjective, LMRunConfig, Perplexity, Samples
+from dew.registry import datasets, models
 from dew.training import TrainState, prepare_process, run_timestamp
 
 if TYPE_CHECKING:
@@ -118,8 +118,8 @@ def model_fields(config: LmRunConfig, vocab_size: int, max_seq_len: int) -> dict
     return {**config.model.fields(), "max_seq_len": max_seq_len, "vocab_size": vocab_size}
 
 
-def load_pretrained(pretrained: str, model_config: ModelConfig, vocab_size: int,
-                    max_seq_len: int, meta: dict):
+def pretrained_source(pretrained: str, model_config: ModelConfig, vocab_size: int,
+                      max_seq_len: int, meta: dict):
     """The bundle a --pretrained run continues and the reference it was read at.
 
     `pretrained` is a local directory, a Hub repo or `repo@revision`; the
@@ -134,7 +134,7 @@ def load_pretrained(pretrained: str, model_config: ModelConfig, vocab_size: int,
     trained with: continuing pretraining on ids from another vocabulary trains
     the embedding table against noise.
     """
-    from dew.interop import load_pretrained as load_checkpoint, split_revision
+    from dew.interop import Pretrained, split_revision
 
     overridden = sorted(set(model_config.config) - {"max_seq_len"})
     if overridden:
@@ -148,7 +148,7 @@ def load_pretrained(pretrained: str, model_config: ModelConfig, vocab_size: int,
             f"--model.config max_seq_len is {context!r}; the context a checkpoint "
             f"is reloaded at is a number of tokens")
     name, revision = split_revision(pretrained)
-    loaded = load_checkpoint(
+    loaded = Pretrained.load(
         name, dtype=model_config.dtype, attention_impl=model_config.attention_impl,
         max_seq_len=context, revision=revision)
     expected = checkpoint_tokenizer(loaded.source, name)
@@ -172,9 +172,9 @@ def checkpoint_tokenizer(directory: Path, name: str) -> str:
     """The tokenizer name the checkpoint in `directory`, read as `name`,
     expects its ids to come from.
 
-    A checkpoint written by save_pretrained_decoder records the name it was
-    exported with, since the path or repo it happens to sit at says nothing;
-    any other hub repo is its own tokenizer's name.
+    A checkpoint written by `PretrainedDecoder.from_model(...).save` records
+    the name it was exported with, since the path or repo it happens to sit at
+    says nothing; any other hub repo is its own tokenizer's name.
     """
     generation_config = directory / "generation_config.json"
     if generation_config.is_file():
@@ -184,11 +184,17 @@ def checkpoint_tokenizer(directory: Path, name: str) -> str:
     return name
 
 
+def run_tokenizer(name: str) -> ByteTokenizer | HFTokenizer:
+    """The tokenizer `--tokenizer` names: "byte" for Dew's UTF-8 vocabulary,
+    any other name a Hugging Face tokenizer."""
+    return ByteTokenizer() if name == "byte" else HFTokenizer(name)
+
+
 def build_samples(config: LmRunConfig) -> Samples | None:
     """What the objective generates and decodes at every validation."""
     if config.sample_tokens <= 0:
         return None
-    tokenizer = tokenizer_for(config.tokenizer)
+    tokenizer = run_tokenizer(config.tokenizer)
     return Samples(
         prompt=tokenizer.encode(config.sample_prompt or "\n"),
         max_new_tokens=config.sample_tokens, sampling=config.sampling,
@@ -230,7 +236,7 @@ def build_masked_objective(config: LmRunConfig, model, fields, pretrained):
             "masked_diffusion trains a model with a mask token id: continue a "
             "--pretrained diffusion checkpoint, which carries one, or name "
             "mask_token_id in --model.config beside causal=False")
-    decode = None if config.sample_tokens <= 0 else tokenizer_for(config.tokenizer).decode
+    decode = None if config.sample_tokens <= 0 else run_tokenizer(config.tokenizer).decode
     return MaskedDiffusionObjective(
         model, MDLM(mask_id=int(mask))(), config.data.seq_len + 1,
         ema_decay=config.ema_decay, decode=decode, pretrained=pretrained)
@@ -281,7 +287,7 @@ def main(config: LmRunConfig) -> TrainState:
         fields = model_fields(config, vocab_size, context)
         model = models.build(config.model.architecture, **fields)
     else:
-        source, reference = load_pretrained(
+        source, reference = pretrained_source(
             config.pretrained, config.model, vocab_size, context, meta)
         model, fields = source.model, source.model_config
         # run.json names the commit the weights were read at.
@@ -301,7 +307,7 @@ def main(config: LmRunConfig) -> TrainState:
     summary = {"model": fields, "arguments": run_summary(config, fields),
                "dataset": {"path": read_corpora(config.data), "records": data.records,
                            "tokens": meta.get("train_tokens")}}
-    validation = (metrics.perplexity(),)
+    validation = (Perplexity(),)
     pretrained = None if source is None else source.variables
     if config.objective == "masked_diffusion":
         return config.train(build_masked_objective(config, model, fields, pretrained), data,

@@ -22,7 +22,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import ModelInputs
 from dew.nn.mla import INDEXER, indexer_kl
 from dew.nn.sparse_selection import top_k_keys
-from dew.objectives.base import FROZEN, Step, scalar_loss
+from dew.objectives.base import FROZEN, Step
 from dew.objectives.lm import IndexerTraining, LMObjective
 from dew.training import Layout, MeshSpec, Trainer
 
@@ -205,12 +205,12 @@ def test_a_packed_batch_selects_inside_its_documents():
 
 
 def deepseek_stack(index_topk, **overrides) -> CausalTransformer:
-    return CausalTransformer(**{**dict(
-        vocab_size=VOCAB, emb_features=32, num_layers=2, num_heads=2,
-        head_dim=16, mlp_features=64, max_seq_len=SEQ,
-        mixer={"kind": "mla", "q_lora_rank": 8, "kv_lora_rank": 8,
+    return CausalTransformer(**{
+        "vocab_size": VOCAB, "emb_features": 32, "num_layers": 2, "num_heads": 2,
+        "head_dim": 16, "mlp_features": 64, "max_seq_len": SEQ,
+        "mixer": {"kind": "mla", "q_lora_rank": 8, "kv_lora_rank": 8,
                "qk_nope_head_dim": 8, "qk_rope_head_dim": 8, "v_head_dim": 8,
-               "index_topk": index_topk, "index_n_heads": 2, "index_head_dim": 16}),
+               "index_topk": index_topk, "index_n_heads": 2, "index_head_dim": 16},
         **overrides})
 
 
@@ -246,7 +246,7 @@ def test_the_warmup_trains_the_indexer_and_nothing_else():
     assert all(is_indexer(path) for path, _ in jax.tree_util.tree_leaves_with_path(params["params"]))
     assert not any(is_indexer(path) for path, _ in jax.tree_util.tree_leaves_with_path(params[FROZEN]))
     loss = jax.jit(jax.value_and_grad(
-        lambda p: scalar_loss(objective, p, batch, step_at()), has_aux=True))
+        lambda p: objective.scalar_loss(p, batch, step_at()), has_aux=True))
     (before, aux), grads = loss(params)
     assert set(aux.metrics) == {"indexer_kl"}
     assert float(before) == pytest.approx(float(aux.metrics["indexer_kl"]))
@@ -271,7 +271,7 @@ def test_the_sparse_phase_keeps_the_indexer_and_the_model_apart():
 
     def gradient(objective):
         (_, aux), grads = jax.value_and_grad(
-            lambda p: scalar_loss(objective, p, batch, step_at()), has_aux=True)(params)
+            lambda p: objective.scalar_loss(p, batch, step_at()), has_aux=True)(params)
         return aux, grads["params"]
 
     _, plain_grads = gradient(plain)
@@ -283,8 +283,11 @@ def test_the_sparse_phase_keeps_the_indexer_and_the_model_apart():
         aux, grads = gradient(objective)
         seen[weight] = split_norms(grads)[0]
         assert seen[weight] > 0
-        kl_grads = jax.jit(jax.grad(
-            lambda p: objective.loss(p, batch, step_at())[1].metrics["indexer_kl"]))(params)["params"]
+        kl_grads = jax.jit(
+            jax.grad(
+                lambda p, objective=objective: objective.loss(p, batch, step_at())[1].metrics["indexer_kl"]
+            )
+        )(params)["params"]
         for path, leaf in jax.tree_util.tree_leaves_with_path(kl_grads):
             if not is_indexer(path):
                 assert bool(jnp.all(leaf == 0)), jax.tree_util.keystr(path)
@@ -298,9 +301,9 @@ def test_the_loss_is_the_cross_entropy_plus_the_weighted_kl():
     batch = token_batch()
     plain = LMObjective(deepseek_stack(4), SEQ)
     params = plain.init(jax.random.key(0))
-    ce, _ = scalar_loss(plain, params, batch, step_at())
+    ce, _ = plain.scalar_loss(params, batch, step_at())
     sparse = LMObjective(deepseek_stack(4), SEQ, indexer=IndexerTraining("sparse", weight=0.25))
-    value, aux = scalar_loss(sparse, params, batch, step_at())
+    value, aux = sparse.scalar_loss(params, batch, step_at())
     assert float(aux.metrics["ce"]) == pytest.approx(float(ce), rel=1e-6)
     assert float(value) == pytest.approx(float(ce) + 0.25 * float(aux.metrics["indexer_kl"]), rel=1e-5)
 
@@ -337,8 +340,8 @@ def test_a_packed_batch_scores_the_kl_of_its_documents_alone():
     for phase, topk in (("warmup", None), ("sparse", 4)):
         objective = LMObjective(deepseek_stack(topk), SEQ, indexer=IndexerTraining(phase))
         params = objective.init(jax.random.key(0))
-        _, packed = scalar_loss(objective, params, packed_batch([together]), step_at())
-        _, alone = scalar_loss(objective, params, packed_batch(apart), step_at())
+        _, packed = objective.scalar_loss(params, packed_batch([together]), step_at())
+        _, alone = objective.scalar_loss(params, packed_batch(apart), step_at())
         assert np.isfinite(float(packed.metrics["indexer_kl"]))
         assert float(packed.metrics["indexer_kl"]) == pytest.approx(
             float(alone.metrics["indexer_kl"]), rel=1e-5), phase
@@ -356,8 +359,8 @@ def test_packing_carried_by_the_model_inputs_scores_the_same_kl(phase, topk):
     objective = LMObjective(deepseek_stack(topk), SEQ, indexer=IndexerTraining(phase))
     params = objective.init(jax.random.key(0))
 
-    _, by_columns = scalar_loss(objective, params, columns, step_at())
-    _, by_inputs = scalar_loss(objective, params, carried, step_at())
+    _, by_columns = objective.scalar_loss(params, columns, step_at())
+    _, by_inputs = objective.scalar_loss(params, carried, step_at())
 
     assert float(by_inputs.metrics["indexer_kl"]) == float(by_columns.metrics["indexer_kl"])
 
@@ -376,8 +379,8 @@ def test_padding_the_model_inputs_mask_leaves_out_counts_no_query(phase, topk):
     objective = LMObjective(deepseek_stack(topk), SEQ, indexer=IndexerTraining(phase))
     params = objective.init(jax.random.key(0))
 
-    _, masked_by_segments = scalar_loss(objective, params, by_segments, step_at())
-    _, masked_by_inputs = scalar_loss(objective, params, by_mask, step_at())
+    _, masked_by_segments = objective.scalar_loss(params, by_segments, step_at())
+    _, masked_by_inputs = objective.scalar_loss(params, by_mask, step_at())
 
     assert (float(masked_by_inputs.metrics["indexer_kl"])
             == float(masked_by_segments.metrics["indexer_kl"]))

@@ -17,8 +17,9 @@ import numpy as np
 import pytest
 from test_text_rollout_contract import decoder
 
-from dew.nn.backbones.causal_transformer import CausalTransformer, gather_cache_rows
+from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import ModelInputs
+from dew.nn.kv_cache import gather_cache_rows
 from dew.sampling import Sampling, generate
 from dew.sampling.text import _operations, _prefill
 
@@ -33,7 +34,7 @@ def multimodal():
     return MultimodalTransformer(
         decoder(), SiglipVision(hidden_size=16, intermediate_size=32, num_layers=1, num_heads=2,
                                 image_size=8, patch_size=4),
-        GemmaProjector(vision_width=16, text_width=16, patches_per_side=2, tokens_per_side=1),
+        GemmaProjector(text_width=16, patches_per_side=2, tokens_per_side=1),
         family="gemma3", image_token_id=1)
 
 
@@ -125,7 +126,7 @@ def test_every_cache_leaf_moves_with_its_row(kind):
     leaves = jax.tree.leaves(state.cache)
     assert leaves, "the cache has to hold something for this to prove anything"
     for before, after, moved in zip(leaves, jax.tree.leaves(restored),
-                                    jax.tree.leaves(rotated)):
+                                    jax.tree.leaves(rotated), strict=True):
         np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
         assert moved.shape == before.shape
 

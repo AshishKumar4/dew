@@ -29,9 +29,9 @@ import optax
 import tyro
 
 from benchmark_step import Case, batches, parameter_count
-from dew import models  # naming a registry fills it
+import dew.nn.backbones  # noqa: F401  (registers the kind)
 from dew.objectives.lm import LMObjective
-from dew.registry import with_precision
+from dew.registry import models, with_precision
 from dew.training import Layout, MeshSpec, Trainer
 from dew.training.distributed import DevicePrefetchIterator
 

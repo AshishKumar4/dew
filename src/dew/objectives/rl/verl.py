@@ -29,7 +29,9 @@ from typing import TypedDict
 
 import numpy as np
 
-from .records import integer, object_record, real, sequence, text
+from dew.records import integer, integers, record as section, text
+
+from .records import real, reals, sequence
 from .sessions import Call, Session, Status, _chains
 
 MEDIA = ("multi_modal_data", "mm_processor_kwargs", "mm_processor_output")
@@ -117,7 +119,7 @@ def to_verl(trajectories: Sequence[Session | VerlTrajectory]) -> list[VerlRow]:
             gaps = sum(1 for position in range(start + 1, len(chain.tokens))
                        if not sampled[position] and sampled[position - 1])
             given_extra = trajectory.extras.get("extra_fields")
-            extra: dict[str, object] = dict(object_record(given_extra)) if given_extra else {}
+            extra: dict[str, object] = dict(section(given_extra, "extra_fields")) if given_extra else {}
             # A native row's own stamps are kept, its maximum naming the
             # newest weights; Dew's are written, and later dropped, only
             # where the row had none.
@@ -160,7 +162,7 @@ def to_verl(trajectories: Sequence[Session | VerlTrajectory]) -> list[VerlRow]:
 
 def _ids(row: Mapping[str, object], name: str) -> list[int]:
     try:
-        return list(sequence(row.get(name), integer))
+        return list(integers(row.get(name), name))
     except ValueError:
         raise ValueError(f"verl {name} is a list of integers, got {row.get(name)!r}") from None
 
@@ -184,13 +186,13 @@ def _calls(row: Mapping[str, object], version: int | None,
     if len(mask) != len(response) or set(mask) - {0, 1}:
         raise ValueError("verl response_mask holds one 0 or 1 per response id")
     given = row.get("response_logprobs")
-    if 1 in mask and (given is None or len(sequence(given, real)) != len(response)):
+    if 1 in mask and (given is None or len(reals(given, "response_logprobs")) != len(response)):
         raise ValueError("a verl row with sampled ids needs one response_logprob per response id; "
                          "behavior likelihoods are never estimated")
-    logprobs = () if given is None else sequence(given, real)
+    logprobs = () if given is None else reals(given, "response_logprobs")
     full = prompt + response
     runs = (_runs(mask, len(prompt)) if described is None
-            else [(integer(call["start"]), integer(call["count"])) for call in described])
+            else [(integer(call["start"], "start"), integer(call["count"], "count")) for call in described])
     routed = row.get("routed_experts")
     record = None if routed is None else np.asarray(routed)
     calls = []
@@ -216,18 +218,20 @@ def _calls(row: Mapping[str, object], version: int | None,
                 sampled_ids=tuple(full[begin : begin + length]),
                 behavior_log_probs=tuple(logprobs[offset : offset + length]),
                 finish_reason=text(
-                    meta.get("finish_reason", "stop" if number == len(runs) - 1 else "tool_calls")
+                    meta.get("finish_reason", "stop" if number == len(runs) - 1 else "tool_calls"),
+                    "finish_reason",
                 ),
-                version=integer(stated),
+                version=integer(stated, "version"),
                 routed_experts=None if record is None else record[:forwarded],
-                support=None if support is None else sequence(support, lambda kept: sequence(kept, integer)),
+                support=None if support is None else sequence(
+                    support, lambda kept: integers(kept, "support"), "support"),
             )
         )
     return tuple(calls)
 
 
 def _dew(row: Mapping[str, object]) -> Mapping[str, object]:
-    return object_record(object_record(row["extra_fields"])["dew"])
+    return section(section(row["extra_fields"], "extra_fields")["dew"], "dew")
 
 
 def from_verl(rows: Sequence[Mapping[str, object]], *, samples: int = 1,
@@ -259,7 +263,7 @@ def from_verl(rows: Sequence[Mapping[str, object]], *, samples: int = 1,
         unknown = sorted(set(row) - set(FIELDS))
         if unknown:
             raise ValueError(f"verl row {cursor} has fields {unknown} outside AgentLoopOutput")
-        extra = dict(object_record(row.get("extra_fields") or {}))
+        extra = dict(section(row.get("extra_fields") or {}, "extra_fields"))
         extras = {name: row[name] for name in EXTRAS if row.get(name) is not None}
         # verl's loops write empty dicts on text-only rows; only content is media.
         carried = sorted(name for name in MEDIA if row.get(name))
@@ -273,27 +277,31 @@ def from_verl(rows: Sequence[Mapping[str, object]], *, samples: int = 1,
                 raise ValueError(f"verl row {cursor} has no reward_score; score it before training on it")
             steps = extra.get("min_global_steps")
             session = Session(str(cursor // samples), "0", cursor % samples, 0,
-                              _calls(row, version if steps is None else integer(steps), None),
-                              Status.COMPLETED, real(reward))
+                              _calls(row, version if steps is None else integer(steps, "min_global_steps"),
+                                     None),
+                              Status.COMPLETED, real(reward, "reward_score"))
             used = 1
         else:
             dew = _dew(row)
-            count = integer(dew["chains"])
+            count = integer(dew["chains"], "chains")
             group = rows[cursor:cursor + count]
             if (
                 len(group) != count
-                or [integer(_dew(member)["chain"]) for member in group] != list(range(count))
+                or [integer(_dew(member)["chain"], "chain") for member in group] != list(range(count))
                 or any(_dew(member)["session"] != dew["session"] for member in group)
             ):
                 raise ValueError(f"verl rows from {cursor} do not hold the {count} chains of one session")
             calls = tuple(call for member in group
-                          for call in _calls(member, None, sequence(_dew(member)["calls"], object_record)))
-            record = object_record(dew["session"])
-            components = {key: real(value) for key, value in object_record(record["components"]).items()}
-            session = Session(text(record["task"]), text(record["group"]), integer(record["sample"]),
-                              integer(record["attempt"]), calls, Status(text(record["status"])),
-                              None if reward is None else real(reward), MappingProxyType(components),
-                              text(record["detail"]))
+                          for call in _calls(member, None, sequence(
+                              _dew(member)["calls"], lambda call: section(call, "call"), "calls")))
+            record = section(dew["session"], "session")
+            components = {key: real(value, key)
+                          for key, value in section(record["components"], "components").items()}
+            session = Session(text(record["task"], "task"), text(record["group"], "group"),
+                              integer(record["sample"], "sample"), integer(record["attempt"], "attempt"),
+                              calls, Status(text(record["status"], "status")),
+                              None if reward is None else real(reward, "reward_score"),
+                              MappingProxyType(components), text(record["detail"], "detail"))
             if dew.get("stamped", False):
                 for key in ("min_global_steps", "max_global_steps"):
                     extra.pop(key, None)

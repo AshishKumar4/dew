@@ -6,6 +6,7 @@ fixed inputs and original outputs, with a text mask for Dew's caller.
 """
 
 import json
+from importlib import import_module
 from pathlib import Path
 
 import jax
@@ -15,7 +16,6 @@ import orbax.checkpoint as ocp
 import pytest
 from flax.traverse_util import unflatten_dict
 
-from dew import models
 from dew.interop.flaxdiff import (
     fourier_table,
     hybrid_dit_fields,
@@ -25,6 +25,10 @@ from dew.interop.flaxdiff import (
     simple_udit_variables,
 )
 from dew.nn.dit import TextContext
+from dew.registry import models
+
+import_module("dew.nn.backbones")  # registers the fixture kind
+
 
 FIXTURE = Path(__file__).parent / "fixtures" / "flaxdiff"
 
@@ -100,7 +104,7 @@ def test_the_fourier_table_follows_the_jax_the_run_trained_under(reference):
             draw = jax.random.normal(jax.random.PRNGKey(42), (features // 2,), dtype=jnp.float32)
         return np.asarray(draw * 16)
 
-    streams = {False: drawn(False), True: drawn(True)}
+    streams = {False: drawn(partitionable=False), True: drawn(partitionable=True)}
     for version, partitionable in (("0.4.31", False), ("0.5.0", True), ("0.5.3", True), ("0.10.1", True)):
         np.testing.assert_array_equal(fourier_table(features, version), streams[partitionable])
     with jax.default_device(jax.devices("cpu")[0]):

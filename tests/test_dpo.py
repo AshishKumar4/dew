@@ -1,6 +1,7 @@
 """DPO: the preference loss against TRL, and the objective around it.
 
-`preference_logsigmoid` must match TRL 1.12's DPO path with the defaults
+`preference_logsigmoid_terms`, averaged over pairs as `DPOObjective` does,
+must match TRL 1.12's DPO path with the defaults
 (`sigmoid` loss, `reverse_kl`): the same per-token terms summed under the
 shifted completion mask, the `[chosen, rejected]` chunking, and
 `mean(-logsigmoid(beta * delta))`. The reference is
@@ -21,11 +22,17 @@ from flax import linen as nn
 
 from dew.data import DataPartition, Loading, PreferencePairs
 from dew.data.preferences import IDS_KEY, MASK_KEY, PreferenceSource
-from dew.objectives.base import Step, scalar_loss
+from dew.objectives.base import Step
 from dew.objectives.rl import DPOObjective
-from dew.rl import preference_logsigmoid
+from dew.rl import preference_logsigmoid_terms
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "rl" / "dpo.npz"
+
+
+def preference_logsigmoid(*halves_and_beta):
+    """The pair mean of the DPO sigmoid terms, the loss `DPOObjective` reduces to."""
+    terms, _ = preference_logsigmoid_terms(*halves_and_beta)
+    return jnp.mean(terms)
 VOCAB = 8
 PAIRS = 2
 WIDTH = 6
@@ -140,7 +147,7 @@ def flat(batch):
 def test_identical_reference_has_zero_rewards_and_tied_accuracy():
     objective = DPOObjective(TinyHead(vocab_size=VOCAB), WIDTH - 1, beta=.5)
     params = objective.init(jax.random.key(0))
-    loss, aux = scalar_loss(objective, params, pair_batch(), Step(jnp.array(0), jax.random.key(1), params))
+    loss, aux = objective.scalar_loss(params, pair_batch(), Step(jnp.array(0), jax.random.key(1), params))
     assert float(loss) == pytest.approx(np.log(2), rel=1e-6)
     assert float(aux.metrics["rewards/chosen"]) == 0.
     assert float(aux.metrics["rewards/rejected"]) == 0.
@@ -153,7 +160,7 @@ def test_rewards_measure_reference_relative_improvement_on_unequal_pairs():
     reference = objective.init(jax.random.key(0))
     params = jax.tree.map(lambda x: x + .1, reference)
     batch = pair_batch()
-    loss, aux = scalar_loss(objective, params, batch, Step(jnp.array(0), jax.random.key(1), reference))
+    loss, aux = objective.scalar_loss(params, batch, Step(jnp.array(0), jax.random.key(1), reference))
     chosen, rejected, chosen_mask, rejected_mask = flat(batch)
     def score(variables, ids, mask):
         logits = model.apply(variables, jnp.asarray(ids[:, :-1]))
@@ -161,7 +168,9 @@ def test_rewards_measure_reference_relative_improvement_on_unequal_pairs():
         selected = np.take_along_axis(np.asarray(log_probs), ids[:, 1:, None], axis=-1)[..., 0]
         return (selected * mask).sum(axis=-1)
     rewards_chosen = .5 * (score(params, chosen, chosen_mask) - score(reference, chosen, chosen_mask))
-    rewards_rejected = .5 * (score(params, rejected, rejected_mask) - score(reference, rejected, rejected_mask))
+    rewards_rejected = 0.5 * (
+        score(params, rejected, rejected_mask) - score(reference, rejected, rejected_mask)
+    )
     np.testing.assert_allclose(aux.metrics["rewards/chosen"], rewards_chosen.mean(), rtol=1e-5, atol=1e-6)
     np.testing.assert_allclose(aux.metrics["rewards/rejected"], rewards_rejected.mean(), rtol=1e-5, atol=1e-6)
     assert float(aux.metrics["accuracy"]) == float((rewards_chosen > rewards_rejected).mean())
@@ -178,7 +187,7 @@ def test_the_loss_composes_the_term_over_head_log_probs():
     batch = pair_batch()
     step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=frozen)
 
-    loss, aux = scalar_loss(objective, params, batch, step)
+    loss, aux = objective.scalar_loss(params, batch, step)
 
     chosen_ids, rejected_ids, chosen_mask, rejected_mask = flat(batch)
     stack = np.concatenate([chosen_ids, rejected_ids])
@@ -202,9 +211,15 @@ def test_the_reference_comes_from_the_frozen_tree():
     moved = jax.tree.map(lambda leaf: leaf + 1.0, frozen)
     batch = pair_batch()
 
-    base, _ = scalar_loss(objective, params, batch, Step(step=jnp.asarray(0), key=jax.random.key(1), ema=frozen))
-    live_moved, _ = scalar_loss(objective, moved, batch, Step(step=jnp.asarray(0), key=jax.random.key(1), ema=frozen))
-    ref_moved, _ = scalar_loss(objective, params, batch, Step(step=jnp.asarray(0), key=jax.random.key(1), ema=moved))
+    base, _ = objective.scalar_loss(
+        params, batch, Step(step=jnp.asarray(0), key=jax.random.key(1), ema=frozen)
+    )
+    live_moved, _ = objective.scalar_loss(
+        moved, batch, Step(step=jnp.asarray(0), key=jax.random.key(1), ema=frozen)
+    )
+    ref_moved, _ = objective.scalar_loss(
+        params, batch, Step(step=jnp.asarray(0), key=jax.random.key(1), ema=moved)
+    )
 
     assert abs(float(live_moved) - float(base)) > 1e-3
     assert abs(float(ref_moved) - float(base)) > 1e-3
@@ -221,10 +236,10 @@ def test_swapped_halves_change_the_loss():
     batch = pair_batch()
     step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=frozen)
 
-    loss, _ = scalar_loss(objective, moved, batch, step)
+    loss, _ = objective.scalar_loss(moved, batch, step)
     swapped = {IDS_KEY: batch[IDS_KEY][:, ::-1, :],
                MASK_KEY: batch[MASK_KEY][:, ::-1, :]}
-    flipped, _ = scalar_loss(objective, moved, swapped, step)
+    flipped, _ = objective.scalar_loss(moved, swapped, step)
 
     assert abs(float(flipped) - float(loss)) > 1e-4
 
@@ -266,19 +281,19 @@ def test_a_misshapen_batch_is_refused():
     flat_batch = {IDS_KEY: batch[IDS_KEY].reshape(-1, WIDTH),
                   MASK_KEY: batch[MASK_KEY].reshape(-1, WIDTH)}
     with pytest.raises(ValueError, match="holds pairs"):
-        scalar_loss(objective, params, flat_batch, step)
+        objective.scalar_loss(params, flat_batch, step)
 
     short = {IDS_KEY: batch[IDS_KEY][:, :, :4], MASK_KEY: batch[MASK_KEY][:, :, :4]}
     with pytest.raises(ValueError, match="6 ids per row"):
-        scalar_loss(objective, params, short, step)
+        objective.scalar_loss(params, short, step)
 
     wide = {IDS_KEY: batch[IDS_KEY], MASK_KEY: batch[MASK_KEY][:, :, :4]}
     with pytest.raises(ValueError, match="one mark per token"):
-        scalar_loss(objective, params, wide, step)
+        objective.scalar_loss(params, wide, step)
 
     no_ref = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=None)
-    with pytest.raises(ValueError, match="step.ema"):
-        scalar_loss(objective, params, batch, no_ref)
+    with pytest.raises(ValueError, match=r"step.ema"):
+        objective.scalar_loss(params, batch, no_ref)
 
 
 # --- the source ------------------------------------------------------------------

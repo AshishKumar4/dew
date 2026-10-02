@@ -24,7 +24,7 @@ import numpy as np
 import optax
 from flax import linen as nn
 
-from dew.diffusion.process import Process, aligned_conditions
+from dew.diffusion.process import Process
 from dew.diffusion.schedules import FlowMatchingScheduler, expand
 from dew.diffusion.transforms import FlowMatchPredictionTransform, broadcast_rates
 from dew.inputs import InputSpec, unit_range
@@ -32,15 +32,7 @@ from dew.objectives.base import Aux, Ratio, Step
 from dew.registry import objectives
 from dew.sampling.solvers import Euler
 
-from .objective import DiffusionObjective
-
-
-def _own_loss(name: str, kwargs: dict) -> None:
-    """Refuse the denoising loss's extras, which an objective with its own
-    loss would leave unused."""
-    unused = sorted(key for key in ("uncertainty", "alignment", "end_to_end") if kwargs.get(key) is not None)
-    if unused:
-        raise ValueError(f"{name} trains on its own loss, which reads none of {unused}")
+from .objective import DiffusionObjective, _own_loss
 
 Velocity = Callable[[jax.Array, jax.Array, jax.Array], jax.Array]
 """An average velocity u(z, t, r) over [r, t]."""
@@ -130,7 +122,7 @@ class MeanFlowObjective(DiffusionObjective):
                              "path; build the process with presets.MeanFlow")
         _own_loss("MeanFlow", kwargs)
         kwargs.setdefault("guidance", None)
-        kwargs.setdefault("sampler", Euler())
+        kwargs.setdefault("solver", Euler())
         kwargs.setdefault("steps", 2)
         super().__init__(model, process, inputs, **kwargs)
         self.instantaneous = instantaneous
@@ -147,9 +139,7 @@ class MeanFlowObjective(DiffusionObjective):
             samples = self.autoencoder.encode(variables["autoencoder"], samples, encode_key)
         count = samples.shape[0]
         schedule = self.process.schedule
-        given, unconditional = self._conditions(variables, batch, drop_key, dropout=False)
-        blank = jax.tree.map(lambda value, null: jnp.broadcast_to(null, value.shape),
-                             given, aligned_conditions(given, unconditional))
+        given, blank = self._conditions(variables, batch, drop_key, dropout=False)
         later, earlier = jax.random.split(time_key)
         t, r = intervals(schedule.sample_t(later, count), schedule.sample_t(earlier, count),
                          self.instantaneous)
@@ -219,7 +209,7 @@ class ShortcutObjective(DiffusionObjective):
         if sections < 2 or sections & (sections - 1):
             raise ValueError(f"sections is a power of two, not {sections}")
         kwargs.setdefault("guidance", None)
-        kwargs.setdefault("sampler", Euler())
+        kwargs.setdefault("solver", Euler())
         kwargs.setdefault("steps", 2)
         super().__init__(model, process, inputs, **kwargs)
         self.sections = sections
@@ -233,9 +223,7 @@ class ShortcutObjective(DiffusionObjective):
         count = samples.shape[0]
         rows = count // self.bootstrap_every
         schedule = self.process.schedule
-        given, unconditional = self._conditions(variables, batch, drop_key, dropout=False)
-        blank = jax.tree.map(lambda value, null: jnp.broadcast_to(null, value.shape),
-                             given, aligned_conditions(given, unconditional))
+        given, blank = self._conditions(variables, batch, drop_key, dropout=False)
 
         levels = shortcut_levels(rows, self.sections)
         grid = jnp.concatenate([2.0 ** levels, jnp.full((count - rows,), float(self.sections))])

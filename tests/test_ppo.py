@@ -10,6 +10,7 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
+from test_rl_surrogate import clipped_surrogate, token_mean
 from test_tool_episodes import (
     EOS,
     GROUPS,
@@ -25,10 +26,10 @@ from test_tool_episodes import (
 )
 
 from dew.data import Dataset
-from dew.objectives.base import Step, scalar_loss
+from dew.objectives.base import Step
 from dew.objectives.rl import EpisodeRollout, PPOObjective, PPORollout, ValueHead
 from dew.objectives.rl.ppo import OLD_VALUES_KEY, RETURNS_KEY
-from dew.rl import clipped_surrogate, clipped_value_loss_terms, gae, token_log_ratio, token_mean
+from dew.rl import clipped_value_loss_terms, gae, token_log_ratio
 from dew.training import Trainer
 
 FIXTURE = Path(__file__).parent / "fixtures/rl/ppo.npz"
@@ -59,12 +60,16 @@ def test_ppo_losses_gradients_and_gae_match_pinned_verl():
     """
     with np.load(FIXTURE) as reference:
         f = {name: jnp.asarray(reference[name]) for name in reference.files if name != "revision"}
-        advantages, returns = gae(f["rewards"], f["old_values"], f["mask"], float(f["gamma"]), float(f["lam"]))
+        advantages, returns = gae(
+            f["rewards"], f["old_values"], f["mask"], float(f["gamma"]), float(f["lam"])
+        )
         np.testing.assert_allclose(advantages, f["advantages"], atol=2e-6)
         np.testing.assert_allclose(returns, f["returns"], atol=2e-6)
         def loss(current, predicted):
             actor, _ = clipped_surrogate(token_log_ratio(current, f["old"]), advantages, f["mask"])
-            critic = token_mean(clipped_value_loss_terms(predicted, returns, f["old_values"], float(f["clip"])), f["mask"])
+            critic = token_mean(
+                clipped_value_loss_terms(predicted, returns, f["old_values"], float(f["clip"])), f["mask"]
+            )
             return actor + f["coefficient"] * critic
         actual, gradients = jax.value_and_grad(loss, argnums=(0, 1))(f["current"], f["predicted"])
         assert float(actual) == pytest.approx(float(f["loss"]), abs=2e-6)
@@ -97,28 +102,42 @@ def test_episode_gae_crosses_turns_without_discounting_observations_or_padding()
     changed = {**batch, RETURNS_KEY: batch[RETURNS_KEY] + .25}
     info = Step(jnp.array(0), jax.random.key(1), None)
     no_kl = PPOObjective(ToolPolicy(), PROMPT + RESPONSE - 1, critic=ValueHead(TokenFeatures()))
-    before = scalar_loss(no_kl, state.variables, batch, info)[0]
-    after = scalar_loss(no_kl, state.variables, changed, info)[0]
+    before = no_kl.scalar_loss(state.variables, batch, info)[0]
+    after = no_kl.scalar_loss(state.variables, changed, info)[0]
     assert abs(float(before - after)) > .001
 
 
 def test_ppo_trains_policy_and_critic_with_a_frozen_policy_reference():
     trainer, rollout = build_ppo()
     initial = trainer.initial_state()
-    data = Dataset(train=lambda partition: itertools.repeat({"task_id": np.arange(jax.device_count(), dtype=np.int32)}),
-                   val=None, records=None, batch=jax.device_count())
+    data = Dataset(
+        train=lambda partition: itertools.repeat({"task_id": np.arange(jax.device_count(), dtype=np.int32)}),
+        val=None,
+        records=None,
+        batch=jax.device_count(),
+    )
     final = trainer.fit(data, steps=2, log_every=1)
     assert int(final.updates) == 2
     for part in ("policy", "critic"):
-        differences = [np.max(np.abs(np.asarray(after) - np.asarray(before))) for before, after in
-                       zip(jax.tree.leaves(initial.variables["params"][part]), jax.tree.leaves(final.variables["params"][part]), strict=True)]
+        differences = [
+            np.max(np.abs(np.asarray(after) - np.asarray(before)))
+            for before, after in zip(
+                jax.tree.leaves(initial.variables["params"][part]),
+                jax.tree.leaves(final.variables["params"][part]),
+                strict=True,
+            )
+        ]
         assert max(differences) > 1e-5
     for before, after in zip(jax.tree.leaves(initial.ema), jax.tree.leaves(final.ema), strict=True):
         np.testing.assert_array_equal(before, after)
     fixed = rollout(initial, {"task_id": np.array([31], np.int32)}, jax.random.key(23))
     keep = fixed["response_mask"] != 0
-    old_error = np.mean((np.asarray(rollout.objective.values(initial.variables, fixed))[keep] - fixed[RETURNS_KEY][keep]) ** 2)
-    new_error = np.mean((np.asarray(rollout.objective.values(final.variables, fixed))[keep] - fixed[RETURNS_KEY][keep]) ** 2)
+    old_error = np.mean(
+        (np.asarray(rollout.objective.values(initial.variables, fixed))[keep] - fixed[RETURNS_KEY][keep]) ** 2
+    )
+    new_error = np.mean(
+        (np.asarray(rollout.objective.values(final.variables, fixed))[keep] - fixed[RETURNS_KEY][keep]) ** 2
+    )
     assert new_error < old_error
 
 
@@ -144,11 +163,15 @@ def test_composite_objective_and_parameter_gradients_match_verl():
                                        "bias": jnp.asarray(reference["objective_bias"])}}}
         info = Step(jnp.array(0), jax.random.key(1), state.averaged)
         def loss(parameters):
-            return scalar_loss(rollout.objective, {"params": parameters}, batch, info)[0]
+            return rollout.objective.scalar_loss({"params": parameters}, batch, info)[0]
         actual, gradient = jax.value_and_grad(loss)(params)
         assert float(actual) == pytest.approx(float(reference["objective_loss"]), abs=2e-6)
-        observed = {"policy": gradient["policy"]["table"], "kernel": gradient["critic"]["value"]["kernel"],
-                    "bias": gradient["critic"]["value"]["bias"], "scale": gradient["critic"]["backbone"]["scale"]}
+        observed = {
+            "policy": gradient["policy"]["table"],
+            "kernel": gradient["critic"]["value"]["kernel"],
+            "bias": gradient["critic"]["value"]["bias"],
+            "scale": gradient["critic"]["backbone"]["scale"],
+        }
         for name, value in observed.items():
             difference = np.max(np.abs(np.asarray(value) - reference[f"objective_{name}_gradient"]))
             assert difference < 2e-6, f"verl {name} gradient maximum difference {difference}"
@@ -164,7 +187,9 @@ def test_an_all_truncated_cohort_is_a_zero_mass_batch_not_a_failure():
     assert batch["response_mask"].sum() == 0
     for name in (OLD_VALUES_KEY, RETURNS_KEY, "advantages"):
         assert batch[name].shape == batch["input_ids"].shape and not batch[name].any()
-    loss, _ = rollout.objective.loss(state.variables, batch, Step(jnp.array(0), jax.random.key(1), state.averaged))
+    loss, _ = rollout.objective.loss(
+        state.variables, batch, Step(jnp.array(0), jax.random.key(1), state.averaged)
+    )
     assert float(loss.mass) == 0
 
 
@@ -191,6 +216,8 @@ def test_ppo_refuses_undefined_gae_whitening():
         yield Terminal(identity.sample)
 
     trainer, rollout = build_ppo()
-    rollout = replace(rollout, episodes=replace(rollout.episodes, environment=environment, verifier=lambda episode: 1.))
+    rollout = replace(
+        rollout, episodes=replace(rollout.episodes, environment=environment, verifier=lambda episode: 1.0)
+    )
     with pytest.raises(ValueError, match="at least two action tokens"):
         rollout(trainer.initial_state(), {"task_id": np.array([31], np.int32)}, jax.random.key(23))

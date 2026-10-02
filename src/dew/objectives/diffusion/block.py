@@ -38,7 +38,6 @@ from dew.objectives.base import (
     Step,
     Variables,
     freeze,
-    mean_loss,
     thaw,
 )
 from dew.objectives.lm.chunked import chunked_cross_entropy, head_logits
@@ -281,8 +280,8 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
             + self.encoder_loss_weight * encoder_target_mask.sum()
         )
         stats = BlockSFTStatistics(canvas_stats, encoder_stats, support)
-        return stats, Aux(metrics={"canvas_ce": mean_loss(canvas_stats)[0],
-                                  "encoder_ce": mean_loss(encoder_stats)[0]})
+        return stats, Aux(metrics={"canvas_ce": canvas_stats.mean()[0],
+                                  "encoder_ce": encoder_stats.mean()[0]})
 
     def evaluate(self, params: Variables, batch: Batch, step: Step) -> TokenScores:
         """Score the denoiser's cross entropy on every canvas target of the batch.
@@ -454,6 +453,6 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         return canvas_losses, target_mask, encoder_losses, encoder_target_mask, correct
 
     def reduce_loss(self, stats: BlockSFTStatistics):
-        canvas, _ = mean_loss(stats.canvas)
-        encoder, _ = mean_loss(stats.encoder)
+        canvas, _ = stats.canvas.mean()
+        encoder, _ = stats.encoder.mean()
         return self.decoder_loss_weight * canvas + self.encoder_loss_weight * encoder, stats.support > 0

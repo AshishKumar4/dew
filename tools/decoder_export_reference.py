@@ -1,10 +1,10 @@
 """One trained source-format export per routed decoder family, measured.
 
 The reproduction command behind the numbers in tests/test_decoder_export.py.
-Each case loads a committed tiny checkpoint through `load_pretrained`, runs
+Each case loads a committed tiny checkpoint through `Pretrained.load`, runs
 one real `Trainer` step of plain SGD under `LMObjective`, writes the trained
 weights back into the source's own tensor names with `Pretrained.save`, and
-reads the export back twice: with `load_pretrained` for the parameter tree
+reads the export back twice: with `Pretrained.load` for the parameter tree
 and the logits, and with transformers 5.16.1 for the reference logits on the
 same ids. It prints what moved, what the export holds and where the two
 implementations disagree.
@@ -33,10 +33,8 @@ import optax
 import torch
 from torch.overrides import TorchFunctionMode
 
-from dew.interop import load_pretrained
 from dew.interop.pretrained import Pretrained
 from dew.objectives.base import Variables
-
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
 RATE = 5e-2
@@ -369,11 +367,11 @@ def round_trip(case: Case, workspace: Path) -> RoundTrip:
     """`case` loaded, trained for one step, exported and read back."""
     directory = FIXTURES / case.fixture
     ids = np.load(directory / "input_ids.npy")
-    source = load_pretrained(str(directory), dtype="float32", attention_impl="reference")
+    source = Pretrained.load(str(directory), dtype="float32", attention_impl="reference")
     state = train(case, source, ids)
     export = workspace / case.name
     source.save(export, variables=state.variables)
-    reloaded = load_pretrained(str(export), dtype="float32", attention_impl="reference")
+    reloaded = Pretrained.load(str(export), dtype="float32", attention_impl="reference")
     return RoundTrip(case, source, state.variables, export, ids,
                      logits(source, state.variables, ids), reloaded,
                      reference_logits(case, export, ids),
@@ -591,7 +589,7 @@ def v4_training_gradient_parity(trip: RoundTrip) -> dict[str, float]:
     import torch
     from transformers.core_model_loading import revert_weight_conversion
 
-    from dew.objectives.base import Step, scalar_loss
+    from dew.objectives.base import Step
     from tools.deepseek_v4_reference import deepseek_v4_source_name, load_mtp_reference
 
     source, case = trip.source, trip.case
@@ -604,7 +602,7 @@ def v4_training_gradient_parity(trip: RoundTrip) -> dict[str, float]:
     batch = {'text': jnp.asarray(trip.ids, jnp.int32)}
 
     def loss(variables):
-        return scalar_loss(objective, {**source.variables, 'params': variables}, batch, step)[0]
+        return objective.scalar_loss({**source.variables, 'params': variables}, batch, step)[0]
 
     our_loss, gradients = jax.value_and_grad(loss)(source.variables['params'])
     model, _ = reference_model(case, FIXTURES / case.fixture)

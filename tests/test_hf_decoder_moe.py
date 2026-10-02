@@ -14,9 +14,9 @@ import numpy as np
 import pytest
 from test_hf_decoders import GEMMA4_MOE, fixture_config, flat_tree, fp32_decoder
 
-from dew.interop import load_pretrained
+from dew.interop import Pretrained, PretrainedDecoder
 from dew.interop.codecs import dequantize_mxfp4, quantize_mxfp4
-from dew.interop.hf_decoders import save_pretrained_decoder, translate_config, translate_weights
+from dew.interop.hf_decoders import translate_config, translate_weights
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.registry import models, with_precision
 
@@ -70,7 +70,7 @@ def test_a_gpt_oss_field_with_no_counterpart_is_refused(field, value, message):
 def test_gpt_oss_logits_match_the_reference_implementation():
     """fp32 parity through xla sink attention: tolerance 1e-4, observed
     max |logit difference| 2.5e-06 with identical argmax."""
-    pretrained = load_pretrained(str(GPT_OSS), dtype="float32", attention_impl="xla")
+    pretrained = Pretrained.load(str(GPT_OSS), dtype="float32", attention_impl="xla")
     model, variables = pretrained.model, pretrained.variables
     ids = np.load(GPT_OSS / "input_ids.npy")
     reference = np.load(GPT_OSS / "logits.npy")
@@ -86,11 +86,11 @@ def test_gpt_oss_logits_match_the_reference_implementation():
 
 
 def test_gpt_oss_export_round_trips_sinks_and_fused_experts(tmp_path):
-    pretrained = load_pretrained(str(GPT_OSS), dtype="float32", attention_impl="xla")
+    pretrained = Pretrained.load(str(GPT_OSS), dtype="float32", attention_impl="xla")
     model, variables = pretrained.model, pretrained.variables
     export = tmp_path / "gpt-oss"
-    save_pretrained_decoder(model, variables, export)
-    round_trip = load_pretrained(str(export), dtype="float32", attention_impl="xla")
+    PretrainedDecoder.from_model(model, variables).save(export)
+    round_trip = Pretrained.load(str(export), dtype="float32", attention_impl="xla")
     again, reloaded = round_trip.model, round_trip.variables
     assert again == model
     for path, leaf in flat_tree(reloaded["params"]).items():
@@ -107,7 +107,7 @@ def test_an_mxfp4_gpt_oss_checkpoint_loads_through_the_dequantization(tmp_path):
     tensors = load_file(str(GPT_OSS / "model.safetensors"))
     packed = {}
     for name, tensor in tensors.items():
-        if not (name.endswith("gate_up_proj") or name.endswith("down_proj")):
+        if not (name.endswith(("gate_up_proj", "down_proj"))):
             packed[name] = tensor
             continue
         blocks, scales = (np.asarray(part) for part in quantize_mxfp4(jnp.asarray(tensor)))
@@ -120,8 +120,8 @@ def test_an_mxfp4_gpt_oss_checkpoint_loads_through_the_dequantization(tmp_path):
     (directory / "config.json").write_text(json.dumps(
         {**fixture_config("gpt-oss-tiny"), "quantization_config": {"quant_method": "mxfp4"}}))
 
-    pretrained = load_pretrained(str(directory), dtype="float32", attention_impl="xla")
-    model, variables = pretrained.model, pretrained.variables
+    pretrained = Pretrained.load(str(directory), dtype="float32", attention_impl="xla")
+    _model, variables = pretrained.model, pretrained.variables
     expected = translate_weights(tensors, translate_config(fixture_config("gpt-oss-tiny")))
     for path, leaf in flat_tree(variables["params"]).items():
         assert np.array_equal(np.asarray(leaf), flat_tree(expected["params"])[path]), path
@@ -142,7 +142,7 @@ def test_gpt_oss_20b_matches_transformers_on_the_real_weights():
     prompt = "The Cascade Range runs from northern California through Oregon"
     ids = AutoTokenizer.from_pretrained("openai/gpt-oss-20b")(
         prompt, return_tensors="np")["input_ids"].astype(np.int32)
-    pretrained = load_pretrained("openai/gpt-oss-20b", dtype="bfloat16",
+    pretrained = Pretrained.load("openai/gpt-oss-20b", dtype="bfloat16",
                                  attention_impl="xla",
                                  max_seq_len=int(ids.shape[1]))
     model, variables = pretrained.model, pretrained.variables
@@ -442,7 +442,7 @@ def test_a_kimi_k25_load_binds_the_decoder_and_retains_the_vision_halves():
     a `vision_tower.*` and a `mm_projector.*` this has no counterpart for.
     Every decoder tensor binds to a leaf, every vision tensor is retained
     by name, and the retained bytes reach the export untouched."""
-    loaded = load_pretrained(str(KIMI_K25), dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(str(KIMI_K25), dtype="float32", attention_impl="reference")
     from dew.interop.sources import load_shards
 
     tensors = load_shards(KIMI_K25)
@@ -463,7 +463,7 @@ def test_a_kimi_k25_export_writes_the_source_names_and_the_vision_bytes(tmp_path
     """The whole checkpoint comes back out: the decoder from the parameter
     tree under the release's names, the tower and the projector from the
     bytes they were retained as, and the source's own config beside them."""
-    loaded = load_pretrained(str(KIMI_K25), dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(str(KIMI_K25), dtype="float32", attention_impl="reference")
     from dew.interop.sources import load_shards
 
     destination = tmp_path / "export"
@@ -476,7 +476,7 @@ def test_a_kimi_k25_export_writes_the_source_names_and_the_vision_bytes(tmp_path
         np.testing.assert_array_equal(exported[name], tensor, err_msg=name)
     assert (json.loads((destination / "config.json").read_text())
             == fixture_config("kimi-k25-tiny"))
-    again = load_pretrained(str(destination), dtype="float32", attention_impl="reference")
+    again = Pretrained.load(str(destination), dtype="float32", attention_impl="reference")
     ids = jnp.asarray(np.load(KIMI_K25 / "input_ids.npy"), jnp.int32)
     np.testing.assert_array_equal(np.asarray(again.model.apply(again.variables, ids)),
                                   np.asarray(loaded.model.apply(loaded.variables, ids)))
@@ -503,7 +503,7 @@ def test_a_kimi_k25_tied_head_binds_to_the_nested_embedding(tmp_path):
     write_file({**tensors, "language_model.lm_head.weight": embedding},
                source / "model.safetensors", {"format": "pt"})
 
-    loaded = load_pretrained(str(source), dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(str(source), dtype="float32", attention_impl="reference")
     assert "lm_head" not in loaded.variables["params"]
     head = next(layout for layout in loaded.weight_layouts
                 if layout.name == "language_model.lm_head.weight")
@@ -512,8 +512,8 @@ def test_a_kimi_k25_tied_head_binds_to_the_nested_embedding(tmp_path):
     write_file({**tensors, "language_model.lm_head.weight": embedding + 1.0},
                source / "model.safetensors", {"format": "pt"})
     with pytest.raises(ValueError,
-                       match="language_model.lm_head.weight is not the embedding"):
-        load_pretrained(str(source), dtype="float32", attention_impl="reference")
+                       match=r"language_model.lm_head.weight is not the embedding"):
+        Pretrained.load(str(source), dtype="float32", attention_impl="reference")
 
 
 # --------------------------------------------------------------------------
@@ -617,7 +617,7 @@ def test_a_glm4_moe_depth_with_its_own_head_is_refused(tmp_path):
     directory.mkdir()
     save_file(tensors, str(directory / "model.safetensors"))
     (directory / "config.json").write_text(json.dumps(fixture_config("glm4-moe-tiny")))
-    with pytest.raises(ValueError, match="shared_head.head.weight differs from lm_head.weight"):
+    with pytest.raises(ValueError, match=r"shared_head.head.weight differs from lm_head.weight"):
         fp32_decoder(directory)
 
 
@@ -636,7 +636,7 @@ def test_kimi_k25_text_only_placeholders_match_reference():
     from tools.decoder_export_reference import Case, reference_model
 
     directory = FIXTURES / "kimi-k25-tiny"
-    source = load_pretrained(directory, dtype="float32", attention_impl="reference")
+    source = Pretrained.load(directory, dtype="float32", attention_impl="reference")
     ids = np.load(directory / "input_ids.npy").copy()
     config = fixture_config("kimi-k25-tiny")
     ids[0, 0] = config["image_token_id"]
@@ -658,7 +658,7 @@ def test_kimi_k25_nested_quantization_is_refused_before_loading_shards(tmp_path)
     config["text_config"]["quantization_config"] = {"quant_method": "compressed-tensors"}
     (tmp_path / "config.json").write_text(json.dumps(config))
     with pytest.raises(ValueError, match=r"text_config\.quantization_config"):
-        load_pretrained(tmp_path, dtype="float32", attention_impl="reference")
+        Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
 
 
 def test_glm_moe_dsa_config_translates_field_by_field():
@@ -1024,7 +1024,7 @@ def test_both_spellings_of_one_deepseek_v4_tensor_are_refused():
     tensors = dict(load_shards(DEEPSEEK_V4))
     tensors["model.embed_tokens.weight"] = tensors["embed.weight"] + 1
 
-    with pytest.raises(ValueError, match="model.embed_tokens.weight lands on params/embed_tokens"):
+    with pytest.raises(ValueError, match=r"model.embed_tokens.weight lands on params/embed_tokens"):
         translate_weights(tensors, config)
 
 
@@ -1075,8 +1075,11 @@ def test_the_deepseek_v4_hash_layers_route_by_their_token_table():
     ids = jnp.asarray(np.load(DEEPSEEK_V4 / "input_ids.npy"), jnp.int32)
     reference = np.load(DEEPSEEK_V4 / "logits.npy")
     moe = variables["moe"]
-    assert [layer for layer in sorted(moe)
-            if layer.startswith('layers_') and "tid2eid" in moe[layer]["mlp"]["gate"]] == ["layers_0", "layers_1", "layers_2"]
+    assert [
+        layer
+        for layer in sorted(moe)
+        if layer.startswith("layers_") and "tid2eid" in moe[layer]["mlp"]["gate"]
+    ] == ["layers_0", "layers_1", "layers_2"]
 
     rolled = jax.tree.map(lambda value: value, moe)
     for layer in ("layers_0", "layers_1", "layers_2"):
@@ -1113,20 +1116,20 @@ def test_deepseek_v4_tied_source_names_roundtrip(tmp_path, saved_spelling):
     config['tie_word_embeddings'] = True
     directory = tmp_path / 'source'
     save_hf_layout(tensors, config, directory)
-    source = load_pretrained(directory, dtype='float32', attention_impl='reference')
+    source = Pretrained.load(directory, dtype='float32', attention_impl='reference')
     export = tmp_path / 'export'
     source.save(export)
     emitted = load_shards(export)
     assert set(emitted) == set(tensors)
     for name, tensor in tensors.items():
         np.testing.assert_array_equal(emitted[name], tensor, err_msg=name)
-    reloaded = load_pretrained(export, dtype='float32', attention_impl='reference')
+    reloaded = Pretrained.load(export, dtype='float32', attention_impl='reference')
     ids = np.load(DEEPSEEK_V4 / 'input_ids.npy')
     np.testing.assert_array_equal(source.model.apply(source.variables, ids),
                                   reloaded.model.apply(reloaded.variables, ids))
     save_hf_layout({**tensors, 'head.weight': tensors['head.weight'] + 1}, config, directory)
     with pytest.raises(ValueError, match=r'head\.weight is not the embedding'):
-        load_pretrained(directory, dtype='float32', attention_impl='reference')
+        Pretrained.load(directory, dtype='float32', attention_impl='reference')
 
 
 @pytest.mark.parametrize('invalid', [2**32, 8])
@@ -1140,14 +1143,14 @@ def test_deepseek_v4_hash_table_refuses_invalid_expert_indices(tmp_path, invalid
     tensors[name][0, 0] = invalid
     save_hf_layout(tensors, fixture_config('deepseek-v4-tiny'), tmp_path)
     with pytest.raises(ValueError, match=r'tid2eid.*(int32 range|outside its 8 experts)'):
-        load_pretrained(tmp_path, dtype='float32', attention_impl='reference')
+        Pretrained.load(tmp_path, dtype='float32', attention_impl='reference')
 
 
 def test_deepseek_v4_public_speculation_preserves_padded_rows():
     from dew.nn.inputs import ModelInputs
     from dew.sampling import Sampling, Speculative
 
-    source = load_pretrained(DEEPSEEK_V4, dtype='float32', attention_impl='reference')
+    source = Pretrained.load(DEEPSEEK_V4, dtype='float32', attention_impl='reference')
     tokens = np.load(DEEPSEEK_V4 / 'input_ids.npy')[[0, 1, 0], :5].copy()
     valid = np.arange(5)[None, :] >= np.asarray([0, 2, 4])[:, None]
     tokens[~valid] = 0
@@ -1167,7 +1170,7 @@ def test_deepseek_v4_cached_chunks_match_transformers():
 
     from tools.decoder_export_reference import Case, reference_model
 
-    source = load_pretrained(DEEPSEEK_V4, dtype='float32', attention_impl='reference')
+    source = Pretrained.load(DEEPSEEK_V4, dtype='float32', attention_impl='reference')
     ids = np.load(DEEPSEEK_V4 / 'input_ids.npy')
     cache = source.model.apply(source.variables, ids.shape[0], method=source.model.init_cache,
                                mutable=['cache'])[1]['cache']
@@ -1192,7 +1195,7 @@ def test_deepseek_v4_cached_chunks_match_transformers():
 
 
 def test_deepseek_v4_public_prediction_states_preserve_raw_streams():
-    source = load_pretrained(DEEPSEEK_V4, dtype='float32', attention_impl='reference')
+    source = Pretrained.load(DEEPSEEK_V4, dtype='float32', attention_impl='reference')
     ids = np.load(DEEPSEEK_V4 / 'input_ids.npy')
     model, variables = source.model, source.variables
     states, logits = model.apply(variables, ids, method=model.states_and_logits)
@@ -1200,7 +1203,7 @@ def test_deepseek_v4_public_prediction_states_preserve_raw_streams():
     assert states.shape == (*ids.shape, 2, model.emb_features)
     normalized, expected = model.apply(variables, ids, method=model.hidden_and_mtp_inputs)
     np.testing.assert_array_equal(states, expected)
-    assert jnp.asarray(normalized).shape == ids.shape + (model.emb_features,)
+    assert jnp.asarray(normalized).shape == (*ids.shape, model.emb_features)
     doubled = {**variables, 'params': {**variables['params'], 'norm': {
         **variables['params']['norm'], 'scale': variables['params']['norm']['scale'] * 2}}}
     raw, louder = model.apply(doubled, ids, method=model.states_and_logits)
@@ -1209,7 +1212,7 @@ def test_deepseek_v4_public_prediction_states_preserve_raw_streams():
 
 
 def test_deepseek_v4_mtp_matches_released_raw_stream_composition():
-    source = load_pretrained(DEEPSEEK_V4, dtype='float32', attention_impl='reference')
+    source = Pretrained.load(DEEPSEEK_V4, dtype='float32', attention_impl='reference')
     ids = np.load(DEEPSEEK_V4 / 'input_ids.npy')
     hidden, streams = source.model.apply(source.variables, ids, method=source.model.hidden_and_mtp_inputs)
     streams = jnp.asarray(streams)
@@ -1291,7 +1294,8 @@ def test_the_real_llama_4_scout_text_config_translates():
     assert (config["num_heads"], config["num_kv_heads"], config["head_dim"]) == (40, 8, 128)
     assert config["mixture"] == {
         "experts": 16, "top_k": 1, "score_function": "sigmoid", "norm_topk_prob": False,
-        "scale_inputs": True, "expert_features": 8192, "shared_features": 8192, "every": 1}
+        "scale_inputs": True, "expert_features": 8192, "shared_features": 8192,
+        "layers": tuple(range(48))}
     assert config["mlp_features"] == 16384 and config["vocab_size"] == 202048
     local = config["kinds"]["chunked_attention"]
     assert local["chunk"] == 8192 and local["mixer"]["floor_scale"] == 8192.0
@@ -1341,7 +1345,7 @@ def test_llama4_logits_match_the_reference_implementation():
 def test_llama4_export_is_refused_by_name(tmp_path):
     model, variables = fp32_decoder(LLAMA4)
     with pytest.raises(ValueError, match="lacks 'num_local_experts'"):
-        save_pretrained_decoder(model, variables, str(tmp_path))
+        PretrainedDecoder.from_model(model, variables).save(str(tmp_path))
 
 
 def test_a_chunked_kind_no_config_carries_is_refused_on_export(tmp_path):
@@ -1353,7 +1357,7 @@ def test_a_chunked_kind_no_config_carries_is_refused_on_export(tmp_path):
         kinds={"chunked_attention": {"chunk": 4}})
     variables = model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))
     with pytest.raises(ValueError, match="chunk"):
-        save_pretrained_decoder(model, variables, str(tmp_path))
+        PretrainedDecoder.from_model(model, variables).save(str(tmp_path))
 
 
 
@@ -1404,7 +1408,7 @@ def test_the_real_gemma_4_26b_a4b_text_config_translates():
     assert config["rope_theta"] == 1000000.0
     assert config["final_logit_softcap"] == 30.0
     assert config["v_norm"] and not config["use_double_wide_mlp"]
-    assert config["per_layer_input_dim"] is None and config["num_kv_shared_layers"] == 0
+    assert config["per_layer_input_dim"] is None and config["kv_shared_layers"] is None
 
 
 def test_the_released_diffusiongemma_26b_text_config_derives_what_it_does_not_name():
@@ -1503,7 +1507,7 @@ def test_the_released_e2b_config_translates_and_shares_the_layers_it_names():
     assert config["num_kv_heads"] == 1
     assert config["kinds"]["full_attention"] == {"head_dim": 512}
     assert config["kinds"]["sliding_attention"] == {"window": 512, "rope_theta": 10000.0}
-    assert config["num_kv_shared_layers"] == 20
+    assert config["kv_shared_layers"] == tuple(range(config["num_layers"] - 20, config["num_layers"]))
     assert config["per_layer_input_dim"] == 256
     assert config["use_double_wide_mlp"]
     assert config["attention_scale"] == 1.0
@@ -1517,7 +1521,7 @@ def test_the_released_e2b_config_translates_and_shares_the_layers_it_names():
     shared = [index for index in range(config["num_layers"])
               if set(params[f"layers_{index}"]["self_attn"]) == {"q_proj", "o_proj", "q_norm"}]
     assert shared == sorted(model.kv_sharing)
-    assert len(shared) == config["num_kv_shared_layers"]
+    assert tuple(shared) == config["kv_shared_layers"]
 
 
 @pytest.mark.network
@@ -1584,7 +1588,7 @@ def test_a_global_layer_without_k_eq_v_needs_its_v_proj(tmp_path):
     (directory / "model.safetensors").symlink_to(GEMMA4_MOE / "model.safetensors")
     (directory / "config.json").write_text(json.dumps(
         {**fixture_config("gemma4-moe-tiny"), "attention_k_eq_v": False}))
-    with pytest.raises(ValueError, match="layers_2.self_attn.v_proj.kernel"):
+    with pytest.raises(ValueError, match=r"layers_2.self_attn.v_proj.kernel"):
         fp32_decoder(directory)
 
 
@@ -1611,5 +1615,5 @@ def test_a_gemma4_wrapper_around_the_routed_text_config_is_refused_by_name():
 def test_standalone_gemma4_refuses_unrepresentable_native_computation(changes, field, tmp_path):
     model, variables = fp32_decoder(GEMMA4_MOE)
     with pytest.raises(ValueError, match=field):
-        save_pretrained_decoder(model.clone(**changes), variables, str(tmp_path))
+        PretrainedDecoder.from_model(model.clone(**changes), variables).save(str(tmp_path))
     assert not (tmp_path / "config.json").exists()

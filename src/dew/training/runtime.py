@@ -87,9 +87,9 @@ def prepare_process(wandb: Wandb | None = None,
     _raise_limits()
     _join_process_pool(multi_host)
     if layout is not None and "params" in layout.host:
-        from dew.training.distributed import build_mesh
+        from dew.training.distributed import MeshSpec
         from dew.training.host import companion_mesh
-        companion_mesh(build_mesh())
+        companion_mesh(MeshSpec().build())
     _log.info("Number of devices: %s", jax.device_count())
 
 
@@ -104,7 +104,6 @@ def _set_environment(wandb: Wandb | None, xla_flags: str | None,
     os.environ['TOKENIZERS_PARALLELISM'] = "false"
     apply_xla_flags(xla_flags)
     unpartition_gpu_pool()
-    keep_roundings()
     if compilation_cache_dir:
         enable_compilation_cache(compilation_cache_dir)
 
@@ -221,36 +220,10 @@ def unpartition_gpu_pool() -> None:
     takes only for NCCL user or symmetric buffers, a one-shot ragged
     all-to-all or a Mosaic kernel's symmetric operand
     (xla/service/gpu/gpu_memory_space_assignment.cc); Dew asks for none of
-    them. With it off XLA serves that space from an allocator of its own.
-
-    Steps run as fast either way. On an A100 (jax 0.11.2, bf16, 20 steps,
-    on then off then off then on): the 176M hybrid DiT at batch 32 took a
-    median of 79.6 and 80.2 ms with it on and 80.0 and 80.7 ms with it off,
-    and a 2-layer decoder at Qwen3-0.6B's widths over 8 x 1024 tokens with a
-    tiled head 95.5 and 95.6 ms on, 95.5 and 95.5 ms off."""
+    them. With it off XLA serves that space from an allocator of its own, and
+    steps ran as fast on an A100 (a DiT and a decoder within 0.5%)."""
     if cuda_plugin() and xla_flag("xla_gpu_enable_allocator_spatial_partitioning") is None:
         apply_xla_flags("--xla_gpu_enable_allocator_spatial_partitioning=false")
-
-
-def keep_roundings() -> None:
-    """Keep every rounding to a narrow dtype the program states, unless the
-    run named `--xla_allow_excess_precision`.
-
-    XLA's default lets a fusion carry an op's result wider than its dtype,
-    skipping the rounding: a bf16 residual sum fused into the RMSNorm that
-    reads it was normalized unrounded, and 23% of that norm's bf16 outputs
-    differed from the norm of the stored sum, on CPU and on an RTX 4080.
-    What fuses depends on the layout, so one device and four computed
-    different bf16 forwards of the same model and batch; with every rounding
-    kept they are bitwise the same (a 4-layer decoder and its 8-expert MoE
-    twin on 8 simulated CPU devices: hidden states, log partitions, losses,
-    routes). On the RTX 4080 it was faster: a Qwen3-0.6B-width decoder step
-    went from 110.5 to 109.6 ms, the 176M hybrid DiT from 69.6 to 66.6 ms and
-    its peak from 5.79 to 5.44 GiB, SimpleDiT-B from 76.0 to 73.0 ms (jax
-    0.11.2). A script that builds a Trainer without calling `prepare_process`
-    keeps XLA's default unless it sets the flag in XLA_FLAGS."""
-    if xla_flag("xla_allow_excess_precision") is None:
-        apply_xla_flags("--xla_allow_excess_precision=false")
 
 
 def _pool_keys_alike() -> bool:

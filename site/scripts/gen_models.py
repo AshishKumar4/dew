@@ -129,8 +129,13 @@ def pipelines() -> list[str]:
 
 def native_models() -> list[tuple[str, str, str]]:
     """(registered name, class, module path) for every model available through Dew."""
-    from dew import models
+    from importlib import import_module
 
+    from dew.registry import models
+
+    # The modules that define, and so register, every model class.
+    for module in ("dew.nn.backbones", "dew.nn.backbones.jepa", "dew.nn.diffusion_gemma", "dew.nn.multimodal"):
+        import_module(module)
     return sorted((name, cls.__name__, cls.__module__) for name, cls in models.items())
 
 
@@ -200,13 +205,13 @@ def main() -> None:
     for pipe in pipes:
         by_family.setdefault(PIPELINES[pipe][0], []).append((pipe, PIPELINES[pipe][1]))
     sections += ["## Diffusion pipelines", "",
-                 "`load_pretrained` and `dew.pipeline` read a diffusers pipeline directory by the class it names "
+                 "`Pretrained.load` and `dew.pipeline` read a diffusers pipeline directory by the class it names "
                  "in `model_index.json`.", "",
                  table(["Family", "Pipeline class", "Task"],
                        [[family, f"`{pipe}`", task] for family, entries in by_family.items() for pipe, task in entries]), ""]
     sections += ["## Architectures you can train from scratch", "",
-                 "`models.build(name, ...)` builds these by their registered name. A class the API reference "
-                 "documents links to its entry.", "",
+                 "Code builds each one from its class; a run record names it by its registered name. A class the API "
+                 "reference documents links to its entry.", "",
                  table(["Registered name", "Class"],
                        [[f"`{name}`", api_link(module, cls)] for name, cls, module in native]), ""]
 

@@ -31,7 +31,7 @@ from dew.data import Checkpointable, DataPartition, HFOptions, Loading, TFDSOpti
 
 FIXTURES = Path(__file__).parent / "fixtures" / "tfds"
 PREPARED = FIXTURES / "dew_images" / "1.0.0"
-READ = dict(loading=Loading(workers=0, threads=1, read_buffer=4, worker_buffer=2))
+READ = {"loading": Loading(workers=0, threads=1, read_buffer=4, worker_buffer=2)}
 ROWS = 24
 
 
@@ -182,15 +182,15 @@ def test_a_version_named_beside_a_resolved_path_is_an_identity_constraint():
                          preprocess=image_and_label, **READ)
     assert data.records == 16
 
-    with pytest.raises(ValueError, match="holds version '1.0.0'"):
+    with pytest.raises(ValueError, match=r"holds version '1.0.0'"):
         dew.data.load("tfds/dew_images", batch=4,
                       options=TFDSOptions(path=str(PREPARED), version="2.0.0"),
                       preprocess=image_and_label, **READ)
 
 
 def test_a_builder_config_or_version_the_prepared_data_does_not_hold_is_refused():
-    for options, message in (({"config": "nope"}, "no 'nope' config"),
-                             ({"version": "9.9.9"}, "no version '9.9.9'")):
+    for options, message in (({"config": "nope"}, "no prepared 'dew_images' config 'nope'"),
+                             ({"version": "9.9.9"}, "no prepared 'dew_images' version '9.9.9'")):
         with pytest.raises(FileNotFoundError, match=message):
             dew.data.load("tfds/dew_images", batch=4,
                           options=TFDSOptions(path=str(FIXTURES), **options))
@@ -313,7 +313,7 @@ def test_an_arrow_split_reads_by_index_and_carries_its_position(jsonl):
 
     assert indices(resumed, 2) == rest
     assert sorted(i for batch in seen for i in batch) == sorted(
-        set(i for batch in seen for i in batch)), "no record twice inside a pass"
+        {i for batch in seen for i in batch}), "no record twice inside a pass"
 
 
 def test_an_arrow_split_holds_a_named_validation_split(jsonl):
@@ -385,7 +385,7 @@ def test_rows_keep_64_bit_fields_in_a_process_that_enables_x64():
     from dew.data.providers import fields
 
     row = {"x": [0.1, 0.2], "id": 2**40, "nested": {"n": 3}}
-    with jax.enable_x64(True):
+    with jax.enable_x64(new_val=True):
         wide = fields(row)
     narrow = fields({name: value for name, value in row.items() if name != "id"})
 
@@ -426,7 +426,7 @@ def test_a_streamed_split_reports_no_length(jsonl):
 
 def _drawn(stream, batches):
     return [(int(i), int(d)) for batch in itertools.islice(stream, batches)
-            for i, d in zip(batch["index"], batch["draw"])]
+            for i, d in zip(batch["index"], batch["draw"], strict=True)]
 
 
 def test_an_unshuffled_streamed_split_resumes_on_the_record_it_stopped_at(jsonl):
@@ -526,7 +526,7 @@ def test_a_streamed_row_is_transformed_by_its_own_rng(jsonl):
         stream = data.train(DataPartition())
         try:
             return [(int(i), int(d)) for batch in itertools.islice(stream, 3)
-                    for i, d in zip(batch["index"], batch["draw"])]
+                    for i, d in zip(batch["index"], batch["draw"], strict=True)]
         finally:
             stream.close()
 

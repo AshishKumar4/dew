@@ -10,6 +10,7 @@ from flax import linen as nn
 
 from dew.checkpoints import Checkpoints
 from dew.diffusion.discrete import MDLM
+from dew.diffusion.presets import EDM
 from dew.inputs import Field, InputSpec
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives import Step
@@ -17,7 +18,6 @@ from dew.objectives.base import select
 from dew.objectives.diffusion import DiffusionObjective, MaskedDiffusionObjective
 from dew.objectives.lm import LMObjective, Samples
 from dew.objectives.rl import GRPOObjective
-from dew.registry import presets
 from dew.sampling import Sampling
 from dew.training import Trainer
 from dew.training.state import TrainState
@@ -39,9 +39,17 @@ def test_metadata_inspection_and_restore_share_the_committed_snapshot(tmp_path, 
     import orbax.checkpoint as ocp
 
     def state(width, step):
-        return TrainState(step=jnp.asarray(step), microstep=jnp.asarray(step), updates=jnp.asarray(step),
-                          variables={"params": {"weight": jnp.arange(width, dtype=jnp.float32)}},
-                          opt_state=(), ema=None, key=jax.random.key(0), scale=None, window_size=jnp.asarray(1))
+        return TrainState(
+            step=jnp.asarray(step),
+            microstep=jnp.asarray(step),
+            updates=jnp.asarray(step),
+            variables={"params": {"weight": jnp.arange(width, dtype=jnp.float32)}},
+            opt_state=(),
+            ema=None,
+            key=jax.random.key(0),
+            scale=None,
+            window_size=jnp.asarray(1),
+        )
 
     checkpoints = Checkpoints(str(tmp_path))
     first = state(3, 3)
@@ -84,7 +92,7 @@ def make_case(kind, decay):
                                              ema_decay=decay, head_chunks=1, steps=2)
         batch = {"text": jnp.tile(jnp.array([[1, 2, 3, 4]], jnp.int32), (rows, 1))}
     else:
-        objective = DiffusionObjective(Denoiser(), presets.EDM(regime="pixel"),
+        objective = DiffusionObjective(Denoiser(), EDM(regime="pixel"),
                                        InputSpec(Field("image", (2, 2, 3))),
                                        ema_decay=decay, guidance=None, steps=2)
         batch = {"image": jnp.arange(rows * 12, dtype=jnp.uint8).reshape(rows, 2, 2, 3)}
@@ -117,7 +125,9 @@ def test_disabled_ema_trains_previews_and_resumes_without_a_copy(tmp_path, kind)
         frozen_state, frozen_loss, *_ = frozen_step(frozen_state, batch)
         assert bool(accepted) and state.ema is None
         np.testing.assert_allclose(loss, frozen_loss, rtol=1e-6)
-        for got, want in zip(jax.tree.leaves(state.variables), jax.tree.leaves(frozen_state.variables), strict=True):
+        for got, want in zip(
+            jax.tree.leaves(state.variables), jax.tree.leaves(frozen_state.variables), strict=True
+        ):
             np.testing.assert_array_equal(got, want)
     for got, want in zip(jax.tree.leaves(frozen_state.ema), jax.tree.leaves(reference), strict=True):
         np.testing.assert_array_equal(got, want)

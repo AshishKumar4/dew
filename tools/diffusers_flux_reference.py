@@ -36,7 +36,7 @@ import numpy as np
 import torch
 
 # The SD3 tool restores the transformers names diffusers 0.34.0 imports.
-from diffusers_sd3_reference import clip_tokenizers, t5_tokenizer
+from diffusers_sd3_reference import bundle, clip_tokenizers, t5_tokenizer
 
 BASE = dict(patch_size=1, in_channels=16, num_layers=2, num_single_layers=2,
             attention_head_dim=12, num_attention_heads=2, joint_attention_dim=16,
@@ -208,18 +208,6 @@ def reload(directory: str, recorded: str) -> None:
     if not (gap < 1e-5 and trained == 0.0):
         raise SystemExit("the source did not read the native update")
     print("the source reads the native update")
-
-
-def bundle(directory: str, destination: str) -> None:
-    """Pack the saved transformers and the recorded arrays for the suite."""
-    import tarfile
-
-    root = Path(directory)
-    with tarfile.open(destination, "w:xz") as archive:
-        for path in sorted(root.iterdir()):
-            if path.name.endswith((".npz", ".json")) or path.is_dir():
-                archive.add(path, arcname=path.name)
-    print(f"{destination}: {Path(destination).stat().st_size / 1e6:.2f} MB")
 
 
 def main(destination: str) -> None:

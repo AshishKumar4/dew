@@ -27,8 +27,17 @@ import pytest
 from flax import linen as nn
 
 import dew.data
-from dew.data import Corpus, DataPartition, DataPhase, Loading, PackedTokens, Ramp, ramped
-from dew.data.dataset import CAPTION, Dataset, mixed_records, mixed_stream, mixture, tokenized, train_stream
+from dew.data import Corpus, DataPartition, DataPhase, Loading, PackedTokens, Ramp
+from dew.data.dataset import (
+    CAPTION,
+    Dataset,
+    mixed_records,
+    mixed_stream,
+    mixture,
+    ramped,
+    tokenized,
+    train_stream,
+)
 from dew.objectives.base import Aux, Objective
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 
@@ -74,7 +83,7 @@ def pooled(build, processes: int, batches: int, state: bytes | None = None,
         if state is not None:
             stream.set_state(state)
         shards.append(rows(itertools.islice(stream, batches)))
-    return [[row for held in zip(*step) for row in held] for step in zip(*shards)]
+    return [[row for held in zip(*step, strict=True) for row in held] for step in zip(*shards, strict=True)]
 
 
 # --------------------------------------------------------------------------
@@ -315,7 +324,7 @@ def test_a_mixture_computes_its_own_pass_and_takes_no_record_count(two_splits):
 def document_dir(root: Path, documents, eos: int = 0) -> str:
     """A token directory whose stream is `documents`, each closed by eos."""
     root.mkdir(parents=True, exist_ok=True)
-    stream = np.concatenate([np.asarray(list(document) + [eos], np.uint16)
+    stream = np.concatenate([np.asarray([*list(document), eos], np.uint16)
                              for document in documents])
     (root / "train.bin").write_bytes(stream.tobytes())
     (root / "val.bin").write_bytes(stream.tobytes())
@@ -386,10 +395,8 @@ def test_a_packed_pass_covers_every_document_once_at_every_process_count(tmp_pat
     whole = [row for batch in pass_over(DataPartition()) for row in windows_of([batch])[0]]
 
     for processes in (2, 4):
-        shards = []
-        for index in range(processes):
-            shards.append([row for batch in pass_over(DataPartition(index, processes))
-                           for row in windows_of([batch])[0]])
+        shards = [[row for batch in pass_over(DataPartition(index, processes))
+                   for row in windows_of([batch])[0]] for index in range(processes)]
         assert sum(len(shard) for shard in shards) == len(whole)
         assert sorted(row for shard in shards for row in shard) == sorted(whole)
 
@@ -493,7 +500,7 @@ def test_a_run_of_one_mixture_resumes_into_phases_that_begin_with_it(tmp_path):
     """Resuming onto a changed mixture is refused, but resuming onto a phase
     list whose first phase is the run's mixture, with a boundary it has not
     passed, is the same run with a switch ahead of it, at any process count."""
-    spec, first, second = weighted_packed(tmp_path, (1.0, 1.0))
+    _spec, first, second = weighted_packed(tmp_path, (1.0, 1.0))
     both = {first: 1.0, second: 1.0}
     plain = PackedTokens(path=first, seq_len=8, val_batches=None, packing_bins=2, loading=READ)
     stopped = plain.load(batch=4).train(DataPartition())
@@ -506,9 +513,13 @@ def test_a_run_of_one_mixture_resumes_into_phases_that_begin_with_it(tmp_path):
     for processes in (1, 2):
         assert pooled(open_stream, processes, 5, state, rows=windows_of) == whole[2:]
     with pytest.raises(ValueError, match="phase 0 reads something else"):
-        phased_packed(first, second, (both, 4), (first, None)).load(batch=4).train(DataPartition()).set_state(state)
+        phased_packed(first, second, (both, 4), (first, None)).load(batch=4).train(DataPartition()).set_state(
+            state
+        )
     with pytest.raises(ValueError, match="past this run's end of phase 0"):
-        phased_packed(first, second, (first, 1), (both, None)).load(batch=4).train(DataPartition()).set_state(state)
+        phased_packed(first, second, (first, 1), (both, None)).load(batch=4).train(DataPartition()).set_state(
+            state
+        )
 
 
 def test_a_phased_run_resumes_past_a_switch_and_refuses_a_changed_history(tmp_path):
@@ -542,7 +553,9 @@ def test_a_phased_run_resumes_past_a_switch_and_refuses_a_changed_history(tmp_pa
 def test_phases_are_a_list_of_ends_and_refuse_a_ramp(tmp_path):
     _, first, second = weighted_packed(tmp_path, (1.0, 1.0))
     with pytest.raises(ValueError, match="ends must increase"):
-        phased_packed(first, second, (first, 3), (second, 3), (first, None)).load(batch=4).train(DataPartition())
+        phased_packed(first, second, (first, 3), (second, 3), (first, None)).load(batch=4).train(
+            DataPartition()
+        )
     with pytest.raises(ValueError, match="the last runs on"):
         phased_packed(first, second, (first, 3), (second, 5)).load(batch=4).train(DataPartition())
     spec = phased_packed(first, second, (first, 3), (second, None))

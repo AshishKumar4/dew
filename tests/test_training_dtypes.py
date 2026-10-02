@@ -5,12 +5,12 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn, struct
+from test_trainer import raw_leaf
 
 from dew.checkpoints import Checkpoints
 from dew.nn.blocks import TokenEmbedding
-from dew.objectives import Aux, EMASpec, Ratio, Objective, mean_loss
+from dew.objectives import Aux, EMASpec, Objective, Ratio
 from dew.training import Trainer
-from test_trainer import raw_leaf
 
 
 def test_ratio_keeps_numerator_and_denominator_until_the_reduction():
@@ -19,7 +19,7 @@ def test_ratio_keeps_numerator_and_denominator_until_the_reduction():
     first = objectives.Ratio(jnp.asarray(4.), jnp.asarray(2.))
     last = objectives.Ratio(jnp.asarray(9.), jnp.asarray(1.))
     whole = jax.tree.map(jnp.add, first, last)
-    value, supported = objectives.mean_loss(whole)
+    value, supported = whole.mean()
     assert float(value) == pytest.approx(13 / 3) and bool(supported)
     assert not hasattr(objectives, "Mean")
 
@@ -103,7 +103,7 @@ class DenseObjective(Objective):
 
     def reduce_loss(self, stats):
         if isinstance(stats, Moments):
-            value, active = mean_loss(stats.errors)
+            value, active = stats.errors.mean()
             return value + .125 * (stats.predictions / stats.rows) ** 2, active
         return super().reduce_loss(stats)
 
@@ -134,7 +134,9 @@ def compare(actual, expected, *, exact=False, tolerance=2e-6, moment_rounding=Fa
 ON_TPU = jax.default_backend() == "tpu"
 
 
-def exercise_updates_and_resume(tmp_path, parameter_kind, loss_kind, k, *, dynamic_scale=False, ema_decay=None):
+def exercise_updates_and_resume(
+    tmp_path, parameter_kind, loss_kind, k, *, dynamic_scale=False, ema_decay=None
+):
     objective = DenseObjective(parameter_kind, loss_kind)
     if ON_TPU and "64" in parameter_kind:
         with pytest.raises(ValueError, match="a TPU has no float64"):
@@ -171,7 +173,9 @@ def exercise_updates_and_resume(tmp_path, parameter_kind, loss_kind, k, *, dynam
             def average(old, new):
                 work = np.float64 if old.dtype == jnp.float64 or new.dtype == jnp.float64 else np.float32
                 weight = np.asarray(ema_decay, work)
-                value = weight * np.asarray(old, work) + (np.asarray(1, work) - weight) * np.asarray(new, work)
+                value = weight * np.asarray(old, work) + (np.asarray(1, work) - weight) * np.asarray(
+                    new, work
+                )
                 return value.astype(old.dtype)
             expected_ema = jax.tree.map(average, expected_ema, {"params": expected_params})
         for micro in range(k):
@@ -218,7 +222,7 @@ def test_adam_native_parameter_dtypes_survive_updates_and_checkpoints(tmp_path, 
 def test_float64_statistics_and_updates_preserve_requested_precision(tmp_path, parameter_kind, loss_kind, k):
     with jax.enable_x64():
         total, mass = 1 + 2. ** -40, 3 + 2. ** -35
-        reduced, _ = mean_loss(Ratio(jnp.array(total, jnp.float64), jnp.array(mass, jnp.float64)))
+        reduced, _ = Ratio(jnp.array(total, jnp.float64), jnp.array(mass, jnp.float64)).mean()
         np.testing.assert_allclose(reduced, total / mass, rtol=0, atol=1e-15)
         exercise_updates_and_resume(tmp_path, parameter_kind, loss_kind, k)
 
@@ -231,7 +235,13 @@ def test_scaled_native_gradients_preserve_update_and_restart(tmp_path, parameter
 
 @pytest.mark.parametrize("seq_aux", [False, True])
 def test_router_reductions_preserve_float64_scores(seq_aux):
-    from dew.nn.moe import deepseek_v2_aux_loss
+    from dew.nn.moe import global_router_loss, router_moments, sequence_router_losses
+
+    def balance_loss(scores, indices):
+        if seq_aux:
+            return jnp.mean(sequence_router_losses(scores, indices, .2))
+        return global_router_loss(router_moments(scores, indices), .2)
+
     with jax.enable_x64():
         values = np.array([[[.8 + 2.**-35, .2 - 2.**-35], [.65, .35], [.6, .4]],
                            [[.9, .1], [.15, .85], [.2, .8]]], np.float64)
@@ -244,7 +254,7 @@ def test_router_reductions_preserve_float64_scores(seq_aux):
         expected_gradient = np.broadcast_to(coefficients, values.shape)
         expected = np.sum(values * expected_gradient)
         loss, gradient = jax.value_and_grad(
-            lambda scores: deepseek_v2_aux_loss(scores, jnp.asarray(indices), .2, seq_aux))(jnp.asarray(values))
+            lambda scores: balance_loss(scores, jnp.asarray(indices)))(jnp.asarray(values))
         np.testing.assert_allclose(loss, expected, rtol=0, atol=1e-15)
         np.testing.assert_allclose(gradient, expected_gradient, rtol=0, atol=1e-15)
 
@@ -264,15 +274,15 @@ def test_optimizer_dtype_overflow_backs_off_without_losing_the_prefix():
             right = Ratio(value * jnp.where(first, -50000., 60000.) * right_mass, right_mass)
             return (left, right), Aux({})
         def reduce_loss(self, stats):
-            left, active_left = mean_loss(stats[0])
-            right, active_right = mean_loss(stats[1])
+            left, active_left = stats[0].mean()
+            right, active_right = stats[1].mean()
             return left + right, active_left | active_right
 
     trainer = Trainer(Cancellation(), optax.sgd(.01), key=jax.random.PRNGKey(2),
                       accumulation=2, dynamic_scale=True)
     initial = trainer.initial_state()
     initial = dataclasses.replace(initial, scale=dataclasses.replace(initial.scale, scale=jnp.array(1.)))
-    batch = {"first": jnp.array(True)}
+    batch = {"first": jnp.ones((), dtype=bool)}
     step = trainer.compile(initial, batch)
     prefix, _, _, _, accepted = step(initial, batch)
     assert bool(accepted)
@@ -280,7 +290,7 @@ def test_optimizer_dtype_overflow_backs_off_without_losing_the_prefix():
     prefix_accumulation = jax.tree.map(np.asarray, prefix.accumulation)
     prefix_params = jax.tree.map(np.asarray, prefix.variables)
     # Each finalized contribution fits fp16; their fp32 sum does not.
-    rejected, loss, _, finite, accepted = step(prefix, {"first": jnp.array(False)})
+    rejected, loss, _, finite, accepted = step(prefix, {"first": jnp.zeros((), dtype=bool)})
     assert bool(finite) and float(loss) == 0 and not bool(accepted)
     assert int(rejected.step) == 2 and int(rejected.microstep) == 1 and int(rejected.updates) == 0
     assert float(rejected.scale.scale) == .5

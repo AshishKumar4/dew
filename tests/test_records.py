@@ -10,14 +10,14 @@ from dew import records
 def test_integer_reads_a_width_and_refuses_the_flag_python_calls_an_int():
     assert records.integer(4096, 'hidden_size') == 4096
     with pytest.raises(ValueError, match=r"tie_word_embeddings=True: this field is an integer"):
-        records.integer(True, 'tie_word_embeddings')
+        records.integer(value=True, key='tie_word_embeddings')
 
 
 def test_number_reads_an_integer_as_a_real_and_refuses_a_flag():
     assert records.number(1, 'rope_theta') == 1.0
     assert records.number(1e-5, 'norm_eps') == pytest.approx(1e-5)
     with pytest.raises(ValueError, match=r"norm_eps=False: this field is a finite number"):
-        records.number(False, 'norm_eps')
+        records.number(value=False, key='norm_eps')
 
 
 def test_number_reads_the_float_record_transformers_writes_a_non_finite_bound_as():
@@ -29,7 +29,7 @@ def test_number_reads_the_float_record_transformers_writes_a_non_finite_bound_as
 
 
 def test_boolean_and_text_take_only_their_own_type():
-    assert records.boolean(False, 'use_cache') is False
+    assert records.boolean(value=False, key='use_cache') is False
     assert records.text('silu', 'hidden_act') == 'silu'
     with pytest.raises(ValueError, match=r"use_cache=1: this field is a boolean"):
         records.boolean(1, 'use_cache')

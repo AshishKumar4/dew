@@ -111,7 +111,10 @@ def test_strict_merge_follows_append_only_history_and_splits_on_any_rewrite(seed
             np.testing.assert_array_equal(batch[IDS_KEY][row, sampled], expected_ids)
             np.testing.assert_array_equal(
                 batch[BEHAVIOR_LOG_PROBS_KEY][row, sampled],
-                np.asarray([p for number in calls for p in rollout.calls[number].behavior_log_probs], np.float32))
+                np.asarray(
+                    [p for number in calls for p in rollout.calls[number].behavior_log_probs], np.float32
+                ),
+            )
             np.testing.assert_array_equal(
                 batch[VERSIONS_KEY][row, sampled],
                 [number for number in calls for _ in rollout.calls[number].sampled_ids])

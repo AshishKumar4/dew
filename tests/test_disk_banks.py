@@ -1,6 +1,7 @@
 """Disk-backed MoE banks read at execution, not once at trace or load time."""
 
 import json
+from importlib import import_module
 from pathlib import Path
 
 import jax
@@ -8,21 +9,22 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew import models
-from dew.inference.banks import HeldBanks, host_banked
+from dew.inference.banks import HeldBanks
 from dew.interop.hf_decoders import translate_config, translate_weights
 from dew.interop.safetensors_io import read_weights, save_sharded
-from dew.registry import with_precision
+from dew.registry import models, with_precision
 from dew.sampling.text import Sampling, generate
-from dew.training import Layout
-from dew.training.distributed import build_mesh
+from dew.training import Layout, MeshSpec
+
+import_module("dew.nn.backbones")  # registers the fixture kind
+
 
 FIXTURE = Path(__file__).parent / "fixtures" / "hf" / "mixtral-tiny"
 DEVICE = Layout(min_shard=1, tolerance=1.0)
 
 
 def single_mesh():
-    return build_mesh(devices=[jax.devices()[0]])
+    return MeshSpec().build([jax.devices()[0]])
 
 
 def decoder(config, bank_layers):
@@ -35,18 +37,18 @@ def decoder(config, bank_layers):
 @pytest.mark.parametrize("bank_layers", [None, 1])
 @pytest.mark.parametrize("read_ahead", [True, False])
 def test_disk_moe_logits_and_cached_decode_equal_resident(bank_layers, read_ahead):
-    from dew.inference.banks import SafetensorsBanks, stream_banked
+    from dew.inference.banks import SafetensorsBanks
 
     with SafetensorsBanks(FIXTURE, cache_bytes=0, param_dtype="float32", read_ahead=read_ahead) as source:
         model = decoder(source.config, bank_layers)
-        resident = host_banked(model, HeldBanks(translate_weights(
-            read_weights(FIXTURE), translate_config(source.config), "mixtral")),
-            mesh=single_mesh(), layout=DEVICE)
+        resident = HeldBanks(translate_weights(
+            read_weights(FIXTURE), translate_config(source.config), "mixtral"
+        )).place(model, mesh=single_mesh(), layout=DEVICE)
         singleton = decoder(source.config, 1)
-        singleton_store = host_banked(singleton, HeldBanks(translate_weights(
-            read_weights(FIXTURE), translate_config(source.config), "mixtral")),
-            mesh=single_mesh(), layout=DEVICE)
-        streamed = stream_banked(model, source, mesh=single_mesh(), layout=DEVICE)
+        singleton_store = HeldBanks(translate_weights(
+            read_weights(FIXTURE), translate_config(source.config), "mixtral"
+        )).place(singleton, mesh=single_mesh(), layout=DEVICE)
+        streamed = source.stream(model, mesh=single_mesh(), layout=DEVICE)
         assert source.stats().misses == 0  # No decoder weight is read by loading or tracing.
         tokens = jax.device_put(np.load(FIXTURE / "input_ids.npy"), jax.devices()[0])
         score = jax.jit(model.apply)
@@ -91,8 +93,13 @@ def test_disk_source_reads_shards_and_bounds_cache(tmp_path):
     with SafetensorsBanks(tmp_path, cache_bytes=1, param_dtype="float32") as source:
         row = source.read(0)
         expected = translate_weights(read_weights(FIXTURE), translate_config(source.config), "mixtral")
-        for actual, reference in zip(jax.tree.leaves(row), jax.tree.leaves(
-                {name: tree["layers_0"] for name, tree in expected.items() if "layers_0" in tree}), strict=True):
+        for actual, reference in zip(
+            jax.tree.leaves(row),
+            jax.tree.leaves(
+                {name: tree["layers_0"] for name, tree in expected.items() if "layers_0" in tree}
+            ),
+            strict=True,
+        ):
             np.testing.assert_array_equal(actual, reference)
             assert not actual.flags.writeable
         assert source.stats().cache_bytes <= 1
@@ -105,10 +112,10 @@ def test_disk_source_also_builds_ordinary_resident_banks(bank_layers):
 
     with SafetensorsBanks(FIXTURE, cache_bytes=0) as source:
         model = decoder(source.config, bank_layers)
-        actual = host_banked(model, source, mesh=single_mesh(), layout=DEVICE)
-        expected = host_banked(model, HeldBanks(translate_weights(
-            read_weights(FIXTURE), translate_config(source.config), "mixtral")),
-            mesh=single_mesh(), layout=DEVICE)
+        actual = source.place(model, mesh=single_mesh(), layout=DEVICE)
+        expected = HeldBanks(translate_weights(
+            read_weights(FIXTURE), translate_config(source.config), "mixtral"
+        )).place(model, mesh=single_mesh(), layout=DEVICE)
         for leaf, reference in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
             np.testing.assert_array_equal(leaf, reference)
 
@@ -147,11 +154,11 @@ def test_cache_retains_a_prefix_without_cyclic_scan_thrash():
 
 
 def test_streaming_refuses_training_and_closed_sources():
-    from dew.inference.banks import SafetensorsBanks, stream_banked
+    from dew.inference.banks import SafetensorsBanks
 
     with SafetensorsBanks(FIXTURE, cache_bytes=0) as source:
         model = decoder(source.config, None)
-        variables = stream_banked(model, source, mesh=single_mesh(), layout=DEVICE)
+        variables = source.stream(model, mesh=single_mesh(), layout=DEVICE)
         tokens = jnp.ones((1, 2), jnp.int32)
         with pytest.raises(ValueError, match="inference"):
             model.apply(variables, tokens, train=True)
@@ -187,27 +194,27 @@ def test_an_incomplete_disk_checkpoint_is_refused_before_inference(tmp_path):
 
 
 def test_disk_loading_rejects_unbounded_layouts_before_reading_rows():
-    from dew.inference.banks import SafetensorsBanks, stream_banked
+    from dew.inference.banks import SafetensorsBanks
 
     with SafetensorsBanks(FIXTURE, cache_bytes=0) as source:
         model = decoder(source.config, None)
         with pytest.raises(ValueError, match="scan_layers=True"):
-            stream_banked(model.clone(scan_layers=False), source, mesh=single_mesh(), layout=DEVICE)
+            source.stream(model.clone(scan_layers=False), mesh=single_mesh(), layout=DEVICE)
         with pytest.raises(ValueError, match="bounded host cache"):
-            stream_banked(model, source, mesh=single_mesh(), layout=Layout(
+            source.stream(model, mesh=single_mesh(), layout=Layout(
                 min_shard=1, tolerance=1.0, host_parameters=("params/layers_*",)))
         assert source.stats().misses == 0
 
 
 def test_disk_bank_memory_plan_has_no_decoder_weight_arguments():
-    from dew.inference.banks import SafetensorsBanks, stream_banked
+    from dew.inference.banks import SafetensorsBanks
 
     with SafetensorsBanks(FIXTURE, cache_bytes=0) as source:
         model = decoder(source.config, None)
-        streamed = stream_banked(model, source, mesh=single_mesh(), layout=DEVICE)
-        resident = host_banked(model, HeldBanks(translate_weights(
-            read_weights(FIXTURE), translate_config(source.config), "mixtral")),
-            mesh=single_mesh(), layout=DEVICE)
+        streamed = source.stream(model, mesh=single_mesh(), layout=DEVICE)
+        resident = HeldBanks(translate_weights(
+            read_weights(FIXTURE), translate_config(source.config), "mixtral"
+        )).place(model, mesh=single_mesh(), layout=DEVICE)
         tokens = jnp.ones((1, 2), jnp.int32)
         resident_plan = jax.jit(model.apply).lower(resident, tokens).compile().memory_analysis()
         disk_plan = jax.jit(model.apply).lower(streamed, tokens).compile().memory_analysis()
@@ -217,15 +224,15 @@ def test_disk_bank_memory_plan_has_no_decoder_weight_arguments():
 
 
 def test_runtime_scan_fetches_exactly_the_stored_expert_weights():
-    from dew.inference.banks import SafetensorsBanks, stream_banked
+    from dew.inference.banks import SafetensorsBanks
     from dew.nn.backbones.causal_transformer import _fetched_layer
 
     with SafetensorsBanks(FIXTURE, cache_bytes=0) as source:
         model = decoder(source.config, None)
-        streamed = stream_banked(model, source, mesh=single_mesh(), layout=DEVICE)
-        resident = host_banked(model, HeldBanks(translate_weights(
-            read_weights(FIXTURE), translate_config(source.config), "mixtral")),
-            mesh=single_mesh(), layout=DEVICE)
+        streamed = source.stream(model, mesh=single_mesh(), layout=DEVICE)
+        resident = HeldBanks(translate_weights(
+            read_weights(FIXTURE), translate_config(source.config), "mixtral"
+        )).place(model, mesh=single_mesh(), layout=DEVICE)
         reader = streamed["streaming"]["layers_0_1"]["bank"]
         bank = {name: tree["layers_0_1"] for name, tree in resident.items() if "layers_0_1" in tree}
 
@@ -233,7 +240,9 @@ def test_runtime_scan_fetches_exactly_the_stored_expert_weights():
             def step(carry, index):
                 fetched = reader.fetch(index, carry)
                 expected = _fetched_layer(bank, index)
-                equals = jax.tree.map(lambda actual, reference: jnp.all(actual == reference), fetched, expected)
+                equals = jax.tree.map(
+                    lambda actual, reference: jnp.all(actual == reference), fetched, expected
+                )
                 return carry + 1, jnp.all(jnp.stack(jax.tree.leaves(equals)))
 
             return jax.lax.scan(step, jnp.zeros((1, 1, 1)), jnp.arange(model.num_layers))[1]
@@ -242,7 +251,7 @@ def test_runtime_scan_fetches_exactly_the_stored_expert_weights():
 
 
 def test_a_long_disk_scan_is_the_resident_moe(tmp_path):
-    from dew.inference.banks import SafetensorsBanks, stream_banked
+    from dew.inference.banks import SafetensorsBanks
 
     config = json.loads((FIXTURE / "config.json").read_text())
     config["num_hidden_layers"] = 4
@@ -255,9 +264,10 @@ def test_a_long_disk_scan_is_the_resident_moe(tmp_path):
     save_sharded(tensors, tmp_path, max_shard_size=24_000)
     with SafetensorsBanks(tmp_path, cache_bytes=0, param_dtype="float32") as source:
         model = decoder(source.config, None)
-        resident = host_banked(model, HeldBanks(translate_weights(
-            tensors, translate_config(source.config), "mixtral")), mesh=single_mesh(), layout=DEVICE)
-        streamed = stream_banked(model, source, mesh=single_mesh(), layout=DEVICE)
+        resident = HeldBanks(translate_weights(
+            tensors, translate_config(source.config), "mixtral"
+        )).place(model, mesh=single_mesh(), layout=DEVICE)
+        streamed = source.stream(model, mesh=single_mesh(), layout=DEVICE)
         tokens = jnp.asarray(np.load(FIXTURE / "input_ids.npy"))
         score = jax.jit(model.apply)
         np.testing.assert_array_equal(score(streamed, tokens), score(resident, tokens))

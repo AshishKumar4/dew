@@ -41,7 +41,9 @@ def drawn(network, x, t):
     variables = network.init(jax.random.PRNGKey(1), x, t)
     leaves, tree = jax.tree.flatten(variables)
     keys = jax.random.split(jax.random.PRNGKey(4), len(leaves))
-    return jax.tree.unflatten(tree, [0.3 * jax.random.normal(key, leaf.shape) for key, leaf in zip(keys, leaves, strict=True)])
+    return jax.tree.unflatten(
+        tree, [0.3 * jax.random.normal(key, leaf.shape) for key, leaf in zip(keys, leaves, strict=True)]
+    )
 
 
 def inputs():
@@ -67,7 +69,7 @@ def test_a_routed_forward_skips_each_span_on_the_drawn_tokens():
             assert kept.shape[1] == 16 - int(16 * {1: 0.5, 3: 0.25}[index])
             held, tokens = tokens, gather_tokens(tokens, kept)
             rotation = rotary_freqs(kept, 8, ROPE_THETA, dtype=jnp.float32)
-        tokens = block(tokens, condition, rotation, True)
+        tokens = block(tokens, condition, rotation, train=True)
         if index in (2, 3):
             tokens, rotation = scatter_tokens(held, kept, tokens), full
     np.testing.assert_array_equal(np.asarray(output), np.asarray(bound.output(tokens, order, 8, 8)))
@@ -85,14 +87,20 @@ def test_routing_changes_the_training_forward():
     variables = drawn(model(), x, t)
     rngs = {"dropout": jax.random.PRNGKey(2)}
     routed = model().apply(variables, x, t, train=True, rngs=rngs)
-    assert not np.allclose(np.asarray(routed), np.asarray(model(()).apply(variables, x, t, train=True, rngs=rngs)))
+    assert not np.allclose(
+        np.asarray(routed), np.asarray(model(()).apply(variables, x, t, train=True, rngs=rngs))
+    )
 
 
-@pytest.mark.parametrize("routes", [((1.0, 1, 2),), ((0.5, 2, 1),), ((0.5, 1, 3), (0.5, 3, 4)), ((0.5, 1, 5),)])
+@pytest.mark.parametrize(
+    "routes", [((1.0, 1, 2),), ((0.5, 2, 1),), ((0.5, 1, 3), (0.5, 3, 4)), ((0.5, 1, 5),)]
+)
 def test_a_route_outside_the_stack_or_overlapping_another_is_refused(routes):
     x, t = inputs()
     with pytest.raises(ValueError, match="ordered, disjoint"):
-        model(routes).init({"params": jax.random.PRNGKey(1), "dropout": jax.random.PRNGKey(2)}, x, t, train=True)
+        model(routes).init(
+            {"params": jax.random.PRNGKey(1), "dropout": jax.random.PRNGKey(2)}, x, t, train=True
+        )
 
 
 def test_the_hybrid_refuses_routes_under_2d_fusion():

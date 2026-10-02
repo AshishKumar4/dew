@@ -13,15 +13,6 @@ from flax.typing import Dtype, PrecisionLike
 
 from .conv import Conv
 from .precision import at_least_fp32
-from .sharding import logical_axes
-
-
-def hippo_log_a_real_init(key, shape, dtype=jnp.float32):
-    """S4D-Lin real part: A_real_n = -1/2 for every state, stored as the log
-    of its negative (Gu, Gupta, Goel and Re, "On the Parameterization and
-    Initialization of Diagonal State Space Models", 2022, section 4; S5's
-    HiPPO-N poles share the same real part, Smith et al. 2023, section 4.1)."""
-    return jnp.full(shape, jnp.log(0.5), dtype)
 
 
 def hippo_a_imag_init(key, shape, dtype=jnp.float32):
@@ -44,8 +35,6 @@ class S5Layer(nn.Module):
     """
     features: int
     state_dim: int = 64
-    dt_min: float = 0.001
-    dt_max: float = 0.1
     dtype: Dtype | None = None
 
     @nn.compact
@@ -62,10 +51,12 @@ class S5Layer(nn.Module):
         assert self.features == F, f"S5Layer built for {self.features} features, got {F}"
 
         # A: diagonal complex state matrix, S4D-Lin init, parameterized as
-        # log of the negative real part for stability
+        # log of the negative real part for stability: A_real_n = -1/2 for
+        # every state (Gu, Gupta, Goel and Re 2022, section 4; S5's HiPPO-N
+        # poles share it, Smith et al. 2023, section 4.1)
         log_A_real = self.param(
             'log_A_real',
-            hippo_log_a_real_init,
+            nn.initializers.constant(jnp.log(0.5), jnp.float32),
             (self.state_dim,)
         )
         A_imag = self.param(
@@ -102,13 +93,13 @@ class S5Layer(nn.Module):
         D = self.param('D', nn.initializers.normal(stddev=1.0), (F,))
 
         # dt: discretization timestep, learned per state dim so each state
-        # channel can model its own time scale
+        # channel can model its own time scale, drawn log-uniform in [0.001, 0.1]
         log_dt = self.param(
             'log_dt',
             lambda key, shape: jax.random.uniform(
                 key, shape,
-                minval=jnp.log(self.dt_min),
-                maxval=jnp.log(self.dt_max)
+                minval=jnp.log(0.001),
+                maxval=jnp.log(0.1)
             ),
             (self.state_dim,)
         )
@@ -153,15 +144,12 @@ class S5Layer(nn.Module):
         return y.astype(self.dtype) if self.dtype is not None else y.astype(u.dtype)
 
 
-@logical_axes({}, heuristic=(("s5_*",), ("out_proj",)))
 class BidirectionalS5Layer(nn.Module):
     """Runs forward and backward S5 scans, concats and projects back to features.
     Patches have no inherent direction, so scan both ways.
     """
     features: int
     state_dim: int = 64
-    dt_min: float = 0.001
-    dt_max: float = 0.1
     dtype: Dtype | None = None
 
     @nn.compact
@@ -170,8 +158,6 @@ class BidirectionalS5Layer(nn.Module):
         y_fwd = S5Layer(
             features=self.features,
             state_dim=self.state_dim,
-            dt_min=self.dt_min,
-            dt_max=self.dt_max,
             dtype=self.dtype,
             name="s5_forward"
         )(u)
@@ -180,8 +166,6 @@ class BidirectionalS5Layer(nn.Module):
         y_bwd_rev = S5Layer(
             features=self.features,
             state_dim=self.state_dim,
-            dt_min=self.dt_min,
-            dt_max=self.dt_max,
             dtype=self.dtype,
             name="s5_backward"
         )(u_rev)

@@ -17,6 +17,7 @@ gradients are written back into the source layout through the same
 import json
 import shutil
 import tarfile
+from importlib import import_module
 from pathlib import Path
 
 import jax
@@ -161,7 +162,9 @@ def test_the_autoencoder_scales_as_the_pipeline_does(variant):
     video = np.asarray(autoencoder.encode(params, image[None]))
     np.testing.assert_array_equal(video[0], normalized)
     decoded = np.asarray(autoencoder.decode(params, normalized))
-    np.testing.assert_allclose(decoded, np.asarray(autoencoder.decode_batch(params, raw)), rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(
+        decoded, np.asarray(autoencoder.decode_batch(params, raw)), rtol=1e-5, atol=1e-5
+    )
 
 
 def test_a_missing_tensor_is_refused(source, tmp_path):
@@ -170,7 +173,7 @@ def test_a_missing_tensor_is_refused(source, tmp_path):
     tensors = load_file(weights)
     del tensors["encoder.down_blocks.2.1.attn.to_qkv_multiscale.0.proj_out.weight"]
     save_file(tensors, weights)
-    with pytest.raises(ValueError, match="down_blocks_2_1.attn.to_qkv_multiscale_0.per_head"):
+    with pytest.raises(ValueError, match=r"down_blocks_2_1.attn.to_qkv_multiscale_0.per_head"):
         load_dc_ae(tmp_path / "vae")
 
 
@@ -221,31 +224,49 @@ def test_a_latent_run_trains_behind_the_dc_ae_and_leaves_it_frozen(source):
     name, and a DC-AE module named like another's declaration of fewer axes
     (a bare `proj_out`) left the run unable to place its variables."""
     import optax
-    from test_diffusion_objective import StubText  # noqa: F401  registers "stub_text"
+    import_module("test_diffusion_objective")  # registers "stub_text"
 
     from dew.config import ModelConfig, TrainerConfig
-    from dew.data import Dataset, OxfordFlowers
+    from dew.data import Dataset, TFDSImages
     from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
-    from dew.registry import samplers
+    from dew.sampling import Euler
     from dew.training import Trainer
 
     config = DiffusionRunConfig(
-        model=ModelConfig("simple_dit", dict(patch_size=1, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1),
-                          dtype="float32", attention_impl="reference"),
-        data=OxfordFlowers(image_size=16), trainer=TrainerConfig(batch_size=8, steps=2),
-        sampler=samplers.Euler(), sampling_steps=2, text=TextCondition(encoder="stub_text", checkpoint="stub-clip"),
-        autoencoder=PretrainedAutoencoder(modelname=str(source / "conv"), dtype="float32"))
+        model=ModelConfig(
+            "simple_dit",
+            {"patch_size": 1, "emb_features": 16, "num_layers": 1, "num_heads": 2, "mlp_ratio": 1},
+            dtype="float32",
+            attention_impl="reference",
+        ),
+        data=TFDSImages(image_size=16),
+        trainer=TrainerConfig(batch_size=8, steps=2),
+        solver=Euler(),
+        sampling_steps=2,
+        text=TextCondition(encoder="stub_text", checkpoint="stub-clip"),
+        autoencoder=PretrainedAutoencoder(modelname=str(source / "conv"), dtype="float32"),
+    )
     objective = config.build()
     images = (np.random.default_rng(0).random((8, 16, 16, 3)) * 255).astype(np.uint8)
-    batch = {"image": images, "text": objective.inputs.conditions["textcontext"].encoder.tokenize(list("abcdefgh"))}
+    batch = {
+        "image": images,
+        "text": objective.inputs.conditions["textcontext"].encoder.tokenize(list("abcdefgh")),
+    }
     trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.PRNGKey(0))
     initial = trainer.initial_state()
-    state = trainer.fit(Dataset(train=lambda partition: iter(lambda: batch, None), val=None, records=None, batch=8),
-                        steps=2, log_every=100)
+    state = trainer.fit(
+        Dataset(train=lambda partition: iter(lambda: batch, None), val=None, records=None, batch=8),
+        steps=2,
+        log_every=100,
+    )
 
     for before, after in zip(jax.tree.leaves(initial.variables["autoencoder"]),
                              jax.tree.leaves(state.variables["autoencoder"]), strict=True):
         np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
-    moved = [not np.array_equal(np.asarray(before), np.asarray(after)) for before, after in
-             zip(jax.tree.leaves(initial.variables["params"]), jax.tree.leaves(state.variables["params"]), strict=True)]
+    moved = [
+        not np.array_equal(np.asarray(before), np.asarray(after))
+        for before, after in zip(
+            jax.tree.leaves(initial.variables["params"]), jax.tree.leaves(state.variables["params"]), strict=True
+        )
+    ]
     assert any(moved)

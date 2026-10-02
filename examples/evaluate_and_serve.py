@@ -41,12 +41,11 @@ import dew
 from dew.artifacts import uint8_pixels
 from dew.config import ModelConfig, OptimConfig, TrainerConfig
 from dew.data import Loading, TokenWindows
-from dew.eval import clip_score, fid
+from dew.eval import FID, CLIPScore
 from dew.inference import TextGeneration, TextToImage
-from dew.objectives.lm import LMObjective, LMRunConfig
-from dew.registry import metrics
+from dew.objectives.lm import LMObjective, LMRunConfig, Perplexity
 from dew.sampling import Sampling
-from dew.training import evaluate
+from dew.training import Evaluation
 
 GREEDY = Sampling(temperature=0.0)
 FIXTURES = Path(__file__).resolve().parents[1] / "tests/fixtures"
@@ -74,7 +73,7 @@ class Config:
     """A diffusion run to sample and score; unset skips the image metrics."""
     reference_images: Path | None = None
     """Directory of PNGs FID is measured against; --smoke draws its own."""
-    inception_weights: Path | None = None
+    inception_weights: str | None = None
     """The FID extractor's parameters as a file; unset downloads the
     published checkpoint. --smoke reads the committed tiny one."""
     image_prompts: tuple[str, ...] = ("a water lily", "a sunflower", "a red rose", "a purple orchid")
@@ -127,7 +126,7 @@ def smoke_run(out: Path) -> tuple[Path, Path]:
 def perplexity(task: TextGeneration, config: Config) -> dict[str, float]:
     """The run's loss over a held-out split, through the evaluation contract.
 
-    `evaluate` is what the trainer calls at a validation step, minus the
+    `Evaluation.run` is what the trainer calls at a validation step, minus the
     optimizer and the tracker: the same objective, the same metric, one
     finite pass, and scalars every rank agrees on.
     """
@@ -137,9 +136,9 @@ def perplexity(task: TextGeneration, config: Config) -> dict[str, float]:
                         loading=Loading(workers=0)).load(batch=config.batch_size)
     if data.val is None:
         raise ValueError(f"{config.tokens} holds no val split to score")
-    scored = evaluate(LMObjective(task.model, config.sequence_length),
+    scored = Evaluation.run(LMObjective(task.model, config.sequence_length),
                       task.variables, data.val, key=jax.random.key(0),
-                      metrics=[metrics.perplexity()])
+                      metrics=[Perplexity()])
     return dict(scored.scores)
 
 
@@ -176,8 +175,7 @@ def image_metrics(config: Config) -> dict[str, float]:
     if not isinstance(pipe, TextToImage):
         raise TypeError(f"--image-run holds a {type(pipe).__name__}, not a diffusion run")
     generated = draw(pipe, config, key=0)
-    scores = {"clip_score": clip_score(generated, list(config.image_prompts),
-                                       modelname=config.clip_model)}
+    scores = {"clip_score": CLIPScore(config.clip_model).score(generated, list(config.image_prompts))}
     if config.reference_images is not None:
         from PIL import Image
 
@@ -190,7 +188,7 @@ def image_metrics(config: Config) -> dict[str, float]:
         reference = draw(pipe, config, key=1)
     else:
         return scores
-    scores["fid"] = fid(generated, reference, weights=config.inception_weights)
+    scores["fid"] = FID(weights=config.inception_weights).score(generated, reference)
     return scores
 
 
@@ -245,7 +243,7 @@ def main(config: Config) -> Path:
         run, tokens = smoke_run(config.out)
         config = replace(config, run=run, tokens=tokens, sequence_length=32, batch_size=2,
                          prompt="to be", max_new_tokens=8, image_steps=2,
-                         inception_weights=SMOKE_INCEPTION)
+                         inception_weights=str(SMOKE_INCEPTION))
     if config.run is None:
         raise ValueError("--run names the run directory, checkpoint or Hub repo to score")
 

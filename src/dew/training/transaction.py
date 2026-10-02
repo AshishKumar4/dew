@@ -24,7 +24,7 @@ from flax import struct
 from flax.training import dynamic_scale as dynamic_scale_lib
 from typing_extensions import TypeVar
 
-from dew.objectives.base import FROZEN, Aux, Batch, Ratio, Step, Variables, mean_loss, merge
+from dew.objectives.base import FROZEN, Aux, Batch, Ratio, Step, Variables, merge
 from dew.training.state import Accumulation
 
 Loss = TypeVar("Loss", default=Ratio | jax.Array | float)
@@ -244,7 +244,7 @@ class Transaction:
                     + new * jnp.asarray(mass / denominator, new.dtype), prior_gradient, gradient)
                 numerator = previous.statistics[0] + total
                 pooled = Ratio(numerator, total_mass)
-                value, active = mean_loss(pooled)
+                value, active = pooled.mean()
                 candidate = dataclasses.replace(previous, gradient=gradient, mass=total_mass,
                                                 statistics=(numerator,), effects=effects, qk_stats=qk)
             else:

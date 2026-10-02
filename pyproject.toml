@@ -151,10 +151,10 @@ interop = ["safetensors"]
 # once into Dew's cache (dew.interop.pickles), and the tier-2 check that runs
 # transformers' own model for an unregistered decoder (dew.interop.verify).
 torch = ["torch"]
-# Original-format single-file diffusion checkpoints (load_pretrained(..., single_file=)):
+# Original-format single-file diffusion checkpoints (Pretrained.load(..., single_file=)):
 # diffusers' own key maps, which are written in torch, convert them once.
 diffusers = ["diffusers>=0.34.0", "torch"]
-# GGUF files (load_pretrained(..., gguf_file=)): llama.cpp's reader and block dequantizers.
+# GGUF files (Pretrained.load(..., gguf_file=)): llama.cpp's reader and block dequantizers.
 gguf = ["gguf==0.19.0"]
 # Official client transports and native request/result schemas; no model runtime.
 inference-clients = ["ollama>=0.6.2,<0.7", "openai>=3.8,<4"]
@@ -162,7 +162,7 @@ inference-clients = ["ollama>=0.6.2,<0.7", "openai>=3.8,<4"]
 guided = ["outlines-core>=0.2.14"]
 # HF image processors use torchvision on the host; model computation stays JAX.
 vision = ["torchvision>=0.29"]
-# load_pretrained(fallback="torchax"): transformers' PyTorch forward lowered to
+# Pretrained.load(fallback="torchax"): transformers' PyTorch forward lowered to
 # JAX. torchax 0.0.13 fails to import on torch 2.14; this nightly is the build
 # the fallback's tests ran against.
 torchax = ["torch>=2.14,<2.15", "torchax==0.0.14.dev20260922"]
@@ -193,6 +193,8 @@ max-statements = 75
 
 [tool.ruff.lint.isort]
 known-first-party = ["dew"]
+# The lane bootstrap must execute before JAX reads backend configuration.
+force-to-top = ["lane_environment"]
 # `from x import A as B, C` is one line in this tree; splitting it per alias
 # turns three-name imports into three lines and hides the shared origin.
 combine-as-imports = true

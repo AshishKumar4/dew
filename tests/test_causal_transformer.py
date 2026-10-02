@@ -15,9 +15,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
-from dew.nn.attention import NormalAttention, scaled_dot_product_attention
 from flax import linen as nn
+
+from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.mixers import AttentionMixer
 from dew.objectives.lm.chunked import head_logits
@@ -28,8 +28,8 @@ SEQ = 12
 
 
 def tiny(**overrides):
-    config = dict(vocab_size=VOCAB, emb_features=32, num_layers=2, num_heads=4,
-                  mlp_features=64, max_seq_len=16)
+    config = {"vocab_size": VOCAB, "emb_features": 32, "num_layers": 2, "num_heads": 4,
+                  "mlp_features": 64, "max_seq_len": 16}
     return CausalTransformer(**{**config, **overrides})
 
 
@@ -81,12 +81,13 @@ def test_attention_dropout_reaches_local_and_grouped_heads(rng, geometry):
 
 
 def test_old_decoder_record_keeps_zero_dropout_and_bitwise_outputs():
-    from dew.config import ModelConfig
     from flax.traverse_util import unflatten_dict
     from jax import export
 
-    config = dict(vocab_size=17, emb_features=8, num_layers=1, num_heads=2,
-                  mlp_features=16, max_seq_len=8)
+    from dew.config import ModelConfig
+
+    config = {"vocab_size": 17, "emb_features": 8, "num_layers": 1, "num_heads": 2,
+                  "mlp_features": 16, "max_seq_len": 8}
     model = ModelConfig("causal_transformer", config=config, dtype="float32",
                         matmul_precision="highest", attention_impl="reference").build()
     assert model.embedding_dropout_rate == model.attention_dropout_rate == 0
@@ -688,8 +689,8 @@ def test_the_embedding_scale_is_not_rounded_to_the_activation_dtype(rng):
     gemma3-tiny is hidden 64, where the factor is 8.0 in either dtype.
     """
     features, ids = 1152, tokens(rng, length=4)
-    shared = dict(emb_features=features, num_heads=8, num_layers=1,
-                  tie_embeddings=False, dtype=jnp.bfloat16)
+    shared = {"emb_features": features, "num_heads": 8, "num_layers": 1,
+                  "tie_embeddings": False, "dtype": jnp.bfloat16}
     scaled = tiny(embedding_scale=True, **shared)
     params = scaled.init(rng, ids)
     assert params['params']['embed_tokens']['embedding'].dtype == jnp.float32
@@ -733,7 +734,7 @@ def test_the_attention_scale_is_not_rounded_to_the_activation_dtype(rng):
     whose ratio is exactly 0.871094, and scales every logit 0.2% low.
     """
     ids = tokens(rng)
-    shared = dict(head_dim=128, num_layers=1, dtype=jnp.bfloat16)
+    shared = {"head_dim": 128, "num_layers": 1, "dtype": jnp.bfloat16}
     exact = tiny(attention_scale=168 ** -0.5, **shared)
     params = exact.init(rng, ids)
     rounded = tiny(attention_scale=float(jnp.bfloat16(168 ** -0.5 * math.sqrt(128)))
@@ -755,47 +756,6 @@ def test_dropout_trains_with_an_rng_and_is_off_by_default(rng):
     assert not jnp.allclose(quiet, noisy)
 
 
-def test_normal_attention_param_tree_survives_causal_and_decode(rng):
-    """The diffusion attention gains the flags without gaining parameters, so a
-    checkpoint moves between a bidirectional trainer and a decoding sampler."""
-    x = jax.random.normal(rng, (2, 6, 16))
-    plain = NormalAttention(query_dim=16, heads=2, dim_head=8)
-    causal = NormalAttention(query_dim=16, heads=2, dim_head=8, causal=True, max_seq_len=8)
-    shapes = jax.tree_util.tree_map(jnp.shape, plain.init(rng, x)['params'])
-    assert jax.tree_util.tree_map(jnp.shape, causal.init(rng, x)['params']) == shapes
-
-    decoding = causal.init(rng, x[:, :1], decode=True)
-    assert jax.tree_util.tree_map(jnp.shape, decoding['params']) == shapes
-
-    assert decoding['cache']['cached_key'].shape == (2, 8, 2, 8)
-
-
-def test_normal_attention_decode_matches_a_causal_forward(rng):
-    attention = NormalAttention(query_dim=16, heads=2, dim_head=8, causal=True,
-                                max_seq_len=8, use_bias=False)
-    x = jax.random.normal(rng, (2, 6, 16))
-    params = {'params': attention.init(rng, x)['params']}
-    full = attention.apply(params, x)
-
-    cache = attention.apply(params, x[:, :1], decode=True, mutable=['cache'])[1]['cache']
-    out, mutated = attention.apply({**params, 'cache': cache}, x[:, :3],
-                                   decode=True, mutable=['cache'])
-    assert jnp.allclose(out, full[:, :3], atol=1e-5)
-    cache = mutated['cache']
-    for position in range(3, 6):
-        out, mutated = attention.apply({**params, 'cache': cache},
-                                       x[:, position:position + 1],
-                                       decode=True, mutable=['cache'])
-        cache = mutated['cache']
-        assert jnp.allclose(out[:, 0], full[:, position], atol=1e-5)
-
-
-def test_decoding_without_a_cache_length_is_refused(rng):
-    attention = NormalAttention(query_dim=16, heads=2, dim_head=8, causal=True)
-    with pytest.raises(ValueError, match="max_seq_len"):
-        attention.init(rng, jax.random.normal(rng, (2, 4, 16)), decode=True)
-
-
 def test_a_prompt_longer_than_the_cache_is_refused(rng):
     model = tiny(max_seq_len=8)
     ids = tokens(rng, length=12)
@@ -813,7 +773,7 @@ def test_a_prompt_longer_than_the_cache_is_refused(rng):
     ({'kinds': {'linear_attention': {'window': 2}}}, "name no layer"),
     ({'kinds': {'full_attention': {'window': 0}}}, "window"),
     ({'kinds': {'full_attention': {'head_dim': 7}}}, "even"),
-    ({'use_double_wide_mlp': True}, "num_kv_shared_layers"),
+    ({'use_double_wide_mlp': True}, "kv_shared_layers"),
     ({'per_layer_input_dim': 0}, "None is a model without them"),
     ({'mlp': 'unknown'}, "swiglu"),
 ])
@@ -952,7 +912,7 @@ def test_metadata_that_restricts_no_visibility_scores_like_no_metadata(rng):
     assert jnp.array_equal(model.apply(params, ids),
                            model.apply(params, ids, rotary_positions=rotary))
     plain, spelled = scored(), scored(rotary_positions=rotary)
-    for left, right in zip(jax.tree.leaves(plain), jax.tree.leaves(spelled)):
+    for left, right in zip(jax.tree.leaves(plain), jax.tree.leaves(spelled), strict=True):
         assert jnp.max(jnp.abs(left - right)) < 1e-4 * max(1.0, float(jnp.max(jnp.abs(left))))
 
 
@@ -1052,7 +1012,9 @@ def test_the_tied_head_rounds_its_bf16_product_to_bf16_logits_under_bf16_compute
     exact = jnp.einsum("...d,vd->...v", hidden.astype(jnp.float32),
                        table.astype(jnp.bfloat16).astype(jnp.float32),
                        precision=jax.lax.Precision.HIGHEST)
-    np.testing.assert_array_equal(np.asarray(logits), np.asarray(logits.astype(jnp.bfloat16).astype(jnp.float32)))
+    np.testing.assert_array_equal(
+        np.asarray(logits), np.asarray(logits.astype(jnp.bfloat16).astype(jnp.float32))
+    )
     assert np.all(np.abs(np.asarray(logits - exact)) <= 2 ** -8 * np.abs(np.asarray(exact)) + 1e-6)
     assert not np.allclose(np.asarray(logits), np.asarray(exact), atol=1e-6)
 
@@ -1088,8 +1050,14 @@ def test_the_rmsnorm_cast_order_is_a_field_that_bf16_tells_apart(rng):
             "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "hidden_act": "silu"}
     assert translate_config(base)["scale_after_cast"] is True
     assert translate_config({**base, "model_type": "qwen3", "head_dim": 8})["scale_after_cast"] is True
-    gemma_config = {**base, "model_type": "gemma3_text", "head_dim": 8, "hidden_activation": "gelu_pytorch_tanh",
-                    "query_pre_attn_scalar": 8, "sliding_window": 4}
+    gemma_config = {
+        **base,
+        "model_type": "gemma3_text",
+        "head_dim": 8,
+        "hidden_activation": "gelu_pytorch_tanh",
+        "query_pre_attn_scalar": 8,
+        "sliding_window": 4,
+    }
     assert translate_config(gemma_config)["scale_after_cast"] is False
 
 
@@ -1134,7 +1102,7 @@ def test_a_norm_under_jit_reads_the_bf16_sum_it_is_handed(norm):
     fp32 upcast was normalized unrounded: 23% of a bf16 RMSNorm's outputs,
     30% of a LayerNorm's, differed from the norm of the stored sum, on CPU
     and on an RTX 4080. Runs and this suite keep every rounding
-    (`dew.training.runtime.keep_roundings`). The oracle is the same norm
+    (`dew.telemetry.devices.keep_roundings`). The oracle is the same norm
     applied to the sum materialized by its own jit."""
     from dew.nn.attention import LayerNorm, RMSNorm
 
@@ -1162,8 +1130,8 @@ def test_a_bf16_decoder_scores_the_same_on_one_device_and_split_over_four(mixtur
     2.6e-4. Every rounding kept, they are bitwise the same."""
     from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
-    config = dict(vocab_size=512, emb_features=64, num_layers=4, num_heads=8, num_kv_heads=4,
-                  head_dim=8, mlp_features=128, max_seq_len=33, dtype=jnp.bfloat16)
+    config = {"vocab_size": 512, "emb_features": 64, "num_layers": 4, "num_heads": 8, "num_kv_heads": 4,
+                  "head_dim": 8, "mlp_features": 128, "max_seq_len": 33, "dtype": jnp.bfloat16}
     if mixture is not None:
         config["mixture"] = {**mixture, "layers": (0, 1, 2, 3)}
     model = CausalTransformer(**config)
@@ -1259,7 +1227,7 @@ def test_exclusive_self_attention_removes_the_own_value_direction_per_query_head
     from jax.test_util import check_grads
 
     from dew.nn.mixers.attention import exclusive_self_attention
-    with jax.enable_x64(True):
+    with jax.enable_x64(new_val=True):
         keys = jax.random.split(jax.random.key(0), 2)
         y = jax.random.normal(keys[0], (2, 5, 4, 8), jnp.float64)
         v = jax.random.normal(keys[1], (2, 5, 2, 8), jnp.float64).at[1, 3, 1].set(0.0)
@@ -1268,7 +1236,9 @@ def test_exclusive_self_attention_removes_the_own_value_direction_per_query_head
             v = np.repeat(np.asarray(v), 2, axis=-2)
             norm = np.sum(v * v, -1, keepdims=True)
             safe = np.where(norm > 0, norm, 1)
-            return np.asarray(y) - np.where(norm > 0, np.sum(np.asarray(y) * v, -1, keepdims=True) / safe, 0) * v
+            return (
+                np.asarray(y) - np.where(norm > 0, np.sum(np.asarray(y) * v, -1, keepdims=True) / safe, 0) * v
+            )
 
         out = exclusive_self_attention(y, v)
         np.testing.assert_allclose(out, oracle(y, v), rtol=1e-13, atol=1e-13)

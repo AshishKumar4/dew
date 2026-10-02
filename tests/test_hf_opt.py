@@ -6,7 +6,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.interop import load_pretrained
+from dew.interop import Pretrained
 from dew.interop.hf_decoders import translate_config
 
 DIRECTORY = Path(__file__).parent / 'fixtures' / 'hf' / 'opt-tiny'
@@ -23,7 +23,7 @@ def test_opt_config_holds_reserved_position_rows():
 def test_opt_same_weight_logits_and_cached_greedy_generation():
     from tools.classic_gpt_reference import greedy
 
-    loaded = load_pretrained(DIRECTORY, dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference')
     ids = np.load(DIRECTORY / 'input_ids.npy')
     actual = np.asarray(loaded.model.apply(loaded.variables, jnp.asarray(ids)))
     expected = np.load(DIRECTORY / 'logits.npy')
@@ -37,14 +37,14 @@ def test_opt_same_weight_logits_and_cached_greedy_generation():
 def test_opt_export_uses_the_reference_checkpoint_names(tmp_path):
     from dew.interop.sources import load_shards
 
-    loaded = load_pretrained(DIRECTORY, dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference')
     loaded.save(tmp_path)
     actual = load_shards(tmp_path)
     expected = load_shards(DIRECTORY)
     assert set(actual) == set(expected)
     for name in actual:
         np.testing.assert_array_equal(actual[name], expected[name])
-    reloaded = load_pretrained(tmp_path, dtype='float32', attention_impl='reference')
+    reloaded = Pretrained.load(tmp_path, dtype='float32', attention_impl='reference')
     ids = jnp.asarray(np.load(DIRECTORY / 'input_ids.npy'))
     np.testing.assert_array_equal(reloaded.model.apply(reloaded.variables, ids),
                                   loaded.model.apply(loaded.variables, ids))

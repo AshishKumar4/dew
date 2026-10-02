@@ -31,10 +31,9 @@ from dew.checkpoints import Checkpoints
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES, RematPolicy
 from dew.nn.sharding import pipeline_microbatches
-from dew.objectives import scalar_loss
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
-from dew.training.distributed import Layout, MeshSpec, build_mesh, shard_batch
+from dew.training.distributed import Layout, MeshSpec, shard_batch
 from dew.training.state import TrainState
 from dew.training.transaction import write_back
 
@@ -42,9 +41,9 @@ SHAPES = {
     "dense": {"num_nextn_predict_layers": 1},
     "sparse": {"mixture": {"experts": 4, "top_k": 2, "bias": True},
                "num_nextn_predict_layers": 1},
-    "shared": {"num_kv_shared_layers": 2, "per_layer_input_dim": 8,
+    "shared": {"kv_shared_layers": (2, 3), "per_layer_input_dim": 8,
                "use_double_wide_mlp": True, "sandwich_norms": True},
-    "altup": {"altup": {"num_inputs": 2}, "num_kv_shared_layers": 2,
+    "altup": {"altup": {"num_inputs": 2}, "kv_shared_layers": (2, 3),
               "per_layer_input_dim": 8, "laurel_rank": 4},
     "mla": {"mixer": {"kind": "mla", "q_lora_rank": 8, "kv_lora_rank": 8,
                       "qk_nope_head_dim": 4, "qk_rope_head_dim": 4, "v_head_dim": 4}},
@@ -85,7 +84,7 @@ def training_step(model):
     def step(variables, state, tokens, key):
         info = Step(jnp.zeros((), jnp.int32), key, None)
         (loss, aux), grads = jax.value_and_grad(
-            lambda params: scalar_loss(objective, {**variables, "params": params},
+            lambda params: objective.scalar_loss({**variables, "params": params},
                                        tokens, info),
             has_aux=True)(variables["params"])
         updates, state = optimizer.update(grads, state, variables["params"])
@@ -182,7 +181,7 @@ def test_recomputed_pipeline_preserves_updates_and_sown_values(shape, scan):
     # Eight rows split four ways over data x fsdp hold two a device, which
     # two microbatches divide.
     mesh_spec = MeshSpec(fsdp=2, stage=2, microbatches=2)
-    mesh = build_mesh(mesh_spec)
+    mesh = mesh_spec.build()
     tokens = shard_batch(mesh, batch())
     variables = plain.init(jax.random.key(0), batch()["text"][:, :-1])
     variables = jax.device_put(variables, Layout(min_shard=16).shardings(mesh, variables))
@@ -234,7 +233,7 @@ def gradient_step(model, variables, key):
 
     def loss(variables):
         info = Step(jnp.zeros((), jnp.int32), key, None)
-        return scalar_loss(objective, {**variables, "params": variables}, batch(), info)
+        return objective.scalar_loss({**variables, "params": variables}, batch(), info)
 
     return jax.jit(jax.value_and_grad(loss, has_aux=True))(variables["params"])
 
@@ -268,7 +267,7 @@ def residuals(model, variables, capsys):
 
     def loss(variables):
         info = Step(jnp.zeros((), jnp.int32), jax.random.key(1), None)
-        return scalar_loss(objective, {**variables, "params": variables}, batch(), info)[0]
+        return objective.scalar_loss({**variables, "params": variables}, batch(), info)[0]
 
     capsys.readouterr()
     jax.ad_checkpoint.print_saved_residuals(loss, variables["params"])
@@ -304,8 +303,7 @@ KEPT = {
 def test_a_policy_keeps_the_residuals_it_names_in_every_layer(policy, capsys):
     model = model_for("dense", dropout_rate=0.0, num_nextn_predict_layers=0, remat=policy)
     variables = model.init(jax.random.key(0), batch()["text"][:, :-1])
-    assert named(residuals(model, variables, capsys)) == {
-        name: model.num_layers for name in KEPT[policy]}
+    assert named(residuals(model, variables, capsys)) == dict.fromkeys(KEPT[policy], model.num_layers)
 
 
 @pytest.mark.parametrize("policy, kept", [

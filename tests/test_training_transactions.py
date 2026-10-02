@@ -8,13 +8,13 @@ import numpy as np
 import optax
 import pytest
 from flax import struct
+from test_trainer import raw_leaf
 
 from dew.checkpoints import Checkpoints
 from dew.data import DataPartition
-from dew.objectives import Aux, EMASpec, Ratio, Objective, mean_loss, scalar_loss
+from dew.objectives import Aux, EMASpec, Objective, Ratio
 from dew.objectives.base import under
 from dew.training import Trainer
-from test_trainer import raw_leaf
 
 
 @struct.dataclass
@@ -58,17 +58,17 @@ class Tiny(Objective[Ratio | Terms, None]):
 
     def reduce_loss(self, stats):
         if isinstance(stats, Ratio):
-            return mean_loss(stats)
-        main, a = mean_loss(stats.prediction)
-        row, b = mean_loss(stats.rows)
+            return stats.mean()
+        main, a = stats.prediction.mean()
+        row, b = stats.rows.mean()
         positions = jnp.where(stats.positions > 0, stats.positions, 1)
         auxiliary = .2 * 3 * jnp.vdot(jax.lax.stop_gradient(stats.counts), stats.scores) / positions ** 2
         return main + .1 * row + auxiliary, a | b | (stats.positions > 0)
 
 def batches():
-    return [dict(y=jnp.tile(jnp.array([1., 2.]), jax.device_count()),
-                 mask=jnp.tile(jnp.array(mask), jax.device_count()),
-                 bad=jnp.array(bad), active=jnp.array(1))
+    return [{"y": jnp.tile(jnp.array([1., 2.]), jax.device_count()),
+                 "mask": jnp.tile(jnp.array(mask), jax.device_count()),
+                 "bad": jnp.array(bad), "active": jnp.array(1)}
             for mask, bad in [([1., 0.], False), ([1., 1.], True), ([.5, 1.], False), ([1., 1.], False)]]
 
 class ShortScaleTrainer(Trainer[Ratio | Terms, None]):
@@ -89,8 +89,11 @@ def test_boundary_rejection_preserves_accepted_prefix_and_mutable_reads(composit
     data = batches()
     run = train.compile(initial, data[0])
     # the step consumes the state
-    start, opt_state, key = (jax.tree.map(np.asarray, initial.variables),
-                             jax.tree.map(np.asarray, initial.opt_state), np.asarray(jax.random.key_data(initial.key)))
+    start, opt_state, key = (
+        jax.tree.map(np.asarray, initial.variables),
+        jax.tree.map(np.asarray, initial.opt_state),
+        np.asarray(jax.random.key_data(initial.key)),
+    )
     prefix, *_ = run(initial, data[0])
     # the step consumes the state
     prefix_scale = float(prefix.scale.scale)
@@ -220,8 +223,11 @@ def test_real_lm_mtp_router_and_qk_update_matches_combined_batch(auxiliary):
                      "text_roles": jnp.asarray(roles)})
     run = train.compile(initial, data[0])
     # the step consumes the state
-    start, opt_state, key = (jax.tree.map(np.asarray, initial.variables),
-                             jax.tree.map(np.asarray, initial.opt_state), np.asarray(jax.random.key_data(initial.key)))
+    start, opt_state, key = (
+        jax.tree.map(np.asarray, initial.variables),
+        jax.tree.map(np.asarray, initial.opt_state),
+        np.asarray(jax.random.key_data(initial.key)),
+    )
     partial, *_ = run(initial, data[0])
     for before, after in zip(jax.tree.leaves(start), jax.tree.leaves(partial.variables), strict=True):
         np.testing.assert_array_equal(before, after)
@@ -230,7 +236,7 @@ def test_real_lm_mtp_router_and_qk_update_matches_combined_batch(auxiliary):
     combined = jax.tree.map(lambda a, b: jnp.concatenate((a, b)), *data)
     info = Step(jnp.array(0), jax.random.fold_in(key, 0), start)
     (expected_loss, aux), gradient = jax.value_and_grad(
-        lambda p: scalar_loss(objective, {**start, "params": p}, combined, info),
+        lambda p: objective.scalar_loss({**start, "params": p}, combined, info),
         has_aux=True)(start["params"])
     updates, _ = optimizer.update(gradient, opt_state, start["params"], qk_stats=aux.qk_stats)
     expected = optax.apply_updates(start["params"], updates)
@@ -276,7 +282,7 @@ def test_replay_preserves_half_precision_cotangents_and_integer_support():
 def test_local_partial_snapshot_survives_continued_training_and_weight_restore(tmp_path):
     checkpoints = Checkpoints(str(tmp_path / "persistent"),
                               local_directory=str(tmp_path / "local"), local_every=1)
-    train = trainer(True, checkpoints=checkpoints)
+    train = trainer(composite=True, checkpoints=checkpoints)
     initial = train.initial_state()
     data = batches()
     step = train.compile(initial, data[0])
@@ -287,7 +293,7 @@ def test_local_partial_snapshot_survives_continued_training_and_weight_restore(t
     final, *_ = step(prefix, data[1])
     final, *_ = step(final, data[2])
     checkpoints.wait()
-    resumed_trainer = trainer(True, checkpoints=checkpoints)
+    resumed_trainer = trainer(composite=True, checkpoints=checkpoints)
     restored, _, position = resumed_trainer.place()
     assert position == b"1"
     step = resumed_trainer.compile(restored, data[1])

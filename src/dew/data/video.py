@@ -153,42 +153,6 @@ class VideoDataset(DatasetSpec):
         )
 
 
-@datasets("voxceleb2")
-@dataclasses.dataclass(frozen=True)
-class VoxCeleb2(VideoDataset):
-    """Reads a VoxCeleb2 tree, `<path>/<split>/<identity>/<clip>/<utterance>.mp4`.
-
-    The scan is recursive, so extra nesting is tolerated. The caption is
-    `prompt_template` with `{identity}` replaced by the speaker directory.
-    """
-
-    path: str | None = None
-    split: str = "train"
-    extensions: tuple[str, ...] = (".mp4", ".avi")
-    prompt_template: str = "a video of a person speaking"
-
-    def source(self):
-        if not self.path:
-            raise ValueError("VoxCeleb2 needs path= set to the dataset root, the "
-                             "directory holding the split directories")
-        split_root = os.path.join(self.path, self.split)
-        if not os.path.isdir(split_root):
-            raise ValueError(
-                f"VoxCeleb2 split {self.split!r} not found: {split_root!r} is not a "
-                "directory. Expected <root>/<split>/<identity>/<clip>/<utterance>.mp4.")
-        records = []
-        for video_path in video_paths(split_root, self.extensions):
-            identity = os.path.relpath(video_path, split_root).split(os.sep)[0]
-            try:
-                caption = self.prompt_template.format(identity=identity)
-            except (KeyError, IndexError, ValueError):
-                raise ValueError(
-                    f"prompt_template {self.prompt_template!r} may use {{identity}} "
-                    "and no other placeholder") from None
-            records.append({"video_path": video_path, "caption": caption})
-        return records
-
-
 @datasets("local_videos")
 @dataclasses.dataclass(frozen=True)
 class LocalVideos(VideoDataset):
