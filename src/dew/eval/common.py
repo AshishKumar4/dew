@@ -94,29 +94,15 @@ def paired(artifact: ImageGrid | VideoGrid, batch: Batch, field: str):
     return samples, unit_range(targets)
 
 
-@dataclass(frozen=True, eq=False)
-class ImageMetric:
-    """Averages one image metric per image, or per frame for video, over a pass."""
+class ImageMetric(Mean[ImageGrid | VideoGrid]):
+    """A `Mean` of one measurement per image, or per frame for video, taken on
+    one local device. Flow-GRPO reads `fn` as a per-sample reward."""
 
-    name: str
-    measure: Callable[[ImageGrid | VideoGrid, Batch], ArrayLike]
-    """One measurement per image or frame, never an already averaged scalar."""
-    reads: type = ImageGrid
-    shown = Shown(better='higher')
+    def __init__(self, name: str, measure: Callable[[ImageGrid | VideoGrid, Batch], ArrayLike], *,
+                 better: Literal["higher", "lower"] = "higher",
+                 reads: type[ImageGrid | VideoGrid] = ImageGrid):
+        super().__init__(measure, name, better, reads)
 
-    def __call__(self, artifact, batch) -> tuple[float, int]:
+    def __call__(self, artifact: Artifact, batch: Batch) -> tuple[float, float]:
         with metric_device():
-            values = np.asarray(self.measure(artifact, batch), dtype=np.float64)
-        if values.ndim != 1:
-            raise ValueError(f"{self.name} must measure one value per image or frame")
-        return float(values.sum()), values.size
-
-    def merge(self, accumulated: tuple[float, int],
-              contribution: tuple[float, int]) -> tuple[float, int]:
-        return accumulated[0] + contribution[0], accumulated[1] + contribution[1]
-
-    def finalize(self, accumulated: tuple[float, int]) -> float:
-        total, count = accumulated
-        if count == 0:
-            raise ValueError(f"{self.name}: no images or frames in the validation pass")
-        return total / count
+            return super().__call__(artifact, batch)
