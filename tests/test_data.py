@@ -625,6 +625,69 @@ def test_a_shard_offset_cannot_resume_a_global_stream():
     stream.close()
 
 
+class _Corpus:
+    """Records of one named corpus, described by that name as a source with
+    an identity is (`describe`)."""
+
+    def __init__(self, name, length=16):
+        self.name, self.length = name, length
+
+    def __repr__(self):
+        return f"_Corpus({self.name!r})"
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, index):
+        return {"index": np.int32(index)}
+
+
+def test_a_held_out_slice_keeps_the_identity_of_the_corpus_it_cuts():
+    """Two corpora of one type and length, each with a slice held out, were
+    described the same, so a position saved over one resumed the other."""
+    def stream(name):
+        train, _ = hold_out(_Corpus(name), 16, 4, "corpus")
+        return train_stream(train, [], batch=4, seed=0, loading=Loading(threads=1, read_buffer=1))(
+            DataPartition())
+
+    saved = stream("flowers")
+    next(saved)
+    state = saved.get_state()
+    saved.close()
+
+    other = stream("faces")
+    with pytest.raises(ValueError, match="_Corpus\\('flowers'\\)"):
+        other.set_state(state)
+    resumed = stream("flowers")
+    resumed.set_state(state)
+    resumed.close()
+
+
+def test_records_listed_in_memory_are_described_by_their_count_not_their_contents():
+    """A list has a repr, and it is every record: a saved position held it all."""
+    rows = [{"x": np.full(64, index, np.float32)} for index in range(512)]
+    stream = Dataset.from_records(rows, batch=8).train(DataPartition())
+    next(stream)
+
+    assert len(stream.get_state()) < 512
+    stream.close()
+
+
+def test_a_filtering_grain_dataset_is_refused_for_a_global_position():
+    """A filter yields fewer records than the indices it reads, so a record
+    count no longer says where a resumed run starts: one resumed on records
+    it had already read. Grain's own ElasticIterator refuses it the same way."""
+    filtered = pygrain.MapDataset.source(_Points(16)).filter(lambda point: point["index"] % 3)
+
+    shuffled = filtered.seed(0).shuffle()
+    mixed = pygrain.MapDataset.mix([_grain_points(), filtered.repeat(2)])
+    for pipeline in (filtered, shuffled, mixed):
+        with pytest.raises(ValueError, match="filter"):
+            Dataset.from_grain(pipeline, batch=4, **WORKERS)
+    with pytest.raises(ValueError, match="filter"):
+        Dataset.from_grain(_grain_points(), validation=filtered, batch=4, **WORKERS)
+
+
 # ---------------------------------------------------------------------------------
 # Clip sampling uses a local RNG
 # ---------------------------------------------------------------------------------

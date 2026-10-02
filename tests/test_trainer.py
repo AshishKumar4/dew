@@ -156,6 +156,30 @@ class RecordingTracker:
 # The loop
 # --------------------------------------------------------------------------
 
+def test_fit_lets_go_of_each_state_its_step_consumed():
+    """A step donates the state it is handed, so once the next state exists
+    nothing in fit may still hold the old one: its arrays have lost their
+    buffers, and a drain of every live array (`dew.profile`) waits on them."""
+    trainer = make_trainer()
+    placed, held, alive = trainer.place, [], []
+
+    def place():
+        state, shardings, position = placed()
+        held.append(weakref.ref(state))
+        return state, shardings, position
+
+    class Watching(RecordingTracker):
+        def log(self, scalars, step):
+            if "train/loss" in scalars:
+                gc.collect()
+                alive.append(held[0]() is not None)
+
+    trainer.place = place
+    trainer.tracker = Watching()
+    trainer.fit(Data(), steps=2, log_every=1)
+    assert alive == [False, False]
+
+
 def test_fit_trains_to_the_step_it_was_asked_for():
     state = make_trainer().fit(Data(endless), steps=4, log_every=2)
     assert int(state.step) == 4
