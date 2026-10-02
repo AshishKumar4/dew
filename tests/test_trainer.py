@@ -995,7 +995,7 @@ def test_a_checkpoint_without_a_leaf_the_model_now_has_is_refused_by_name(tmp_pa
     make_trainer(tmp_path).fit(Data(), steps=2, log_every=1)
     grown = Regression()
     grown.model = AffineWithOffset()
-    with pytest.raises(ValueError, match=r"holds no .*\['params'\]\['constants'\]\['offset'\]"):
+    with pytest.raises(ValueError, match=r"holds no .*\['variables'\]\['constants'\]\['offset'\]"):
         make_trainer(tmp_path, objective=grown).place()
 
 
