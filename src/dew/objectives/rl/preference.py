@@ -15,7 +15,7 @@ import jax.numpy as jnp
 
 from dew.artifacts import TokenScores
 from dew.data.preferences import IDS_KEY, MASK_KEY
-from dew.objectives.base import Aux, Mean, Variables
+from dew.objectives.base import Aux, Ratio, Variables
 from dew.registry import objectives
 from dew.rl.surrogate import preference_logsigmoid_terms
 
@@ -93,7 +93,7 @@ class DPOObjective(LMObjective):
             policy_chosen, policy_rejected, ref_chosen, ref_rejected,
             chosen_mask, rejected_mask, self.beta)
         accuracy = (pair_chosen > pair_rejected).astype(jnp.float32).mean()
-        return Mean(jnp.sum(terms), jnp.asarray(terms.size, terms.dtype)), Aux[Variables]({
+        return Ratio(jnp.sum(terms), jnp.asarray(terms.size, terms.dtype)), Aux[Variables]({
             "rewards/chosen": pair_chosen.mean(),
             "rewards/rejected": pair_rejected.mean(),
             "accuracy": accuracy,

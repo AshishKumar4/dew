@@ -31,7 +31,7 @@ import optax
 from dew.artifacts import TextSamples, TokenScores, agreed, collective_host
 from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask
 from dew.inputs import Field, InputSpec
-from dew.objectives.base import Aux, EMASpec, Mean, Objective, Shown, Step, Variables
+from dew.objectives.base import Aux, EMASpec, Objective, Ratio, Shown, Step, Variables
 from dew.objectives.lm.chunked import chunked_cross_entropy
 from dew.objectives.lm.objective import _batch_text
 from dew.registry import objectives
@@ -46,7 +46,7 @@ TEXT_KEY = "text"
 
 
 @objectives("masked_diffusion")
-class MaskedDiffusionObjective(Objective[Mean]):
+class MaskedDiffusionObjective(Objective[Ratio]):
     """Train a masked diffusion model on the MDLM negative ELBO.
 
     The rows are `[B, seq_len]` token ids under `batch["text"]`; packed
@@ -120,7 +120,7 @@ class MaskedDiffusionObjective(Objective[Mean]):
     def loss(self, params, batch, step: Step):
         tokens, losses, weights, counted, predicted, real = self._token_losses(
             params, batch, step.key, train=True)
-        nelbo = Mean(jnp.sum(losses * weights), jnp.sum(real, dtype=jnp.float32))
+        nelbo = Ratio(jnp.sum(losses * weights), jnp.sum(real, dtype=jnp.float32))
         correct = (predicted == tokens).astype(losses.dtype)
         return nelbo, Aux(metrics={
             "masked_accuracy": jnp.sum(correct * counted) / jnp.maximum(jnp.sum(counted), 1.0),

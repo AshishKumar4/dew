@@ -23,7 +23,7 @@ import optax
 from flax import struct
 from flax.training import dynamic_scale as dynamic_scale_lib
 
-from dew.objectives.base import FROZEN, Aux, Batch, Effects, Loss, Mean, Step, Variables, mean_loss, merge
+from dew.objectives.base import FROZEN, Aux, Batch, Effects, Loss, Ratio, Step, Variables, mean_loss, merge
 from dew.training.state import Accumulation
 
 
@@ -164,14 +164,14 @@ class Transaction:
         """Hold the objective, the optimizer and the shapes a step traces for.
 
         `shapes` is the traced result of the objective's loss, statistics and
-        `Aux`. Statistics that are a `Mean` or a bare scalar pool into one
+        `Aux`. Statistics that are a `Ratio` or a bare scalar pool into one
         shared mean, which the window can sum and never has to replay.
         """
         self.objective = objective
         self.optimizer = optimizer
         self.size = accumulation
         stats_shape, self.aux_shape = shapes
-        self.shared = isinstance(stats_shape, (Mean, jax.ShapeDtypeStruct))
+        self.shared = isinstance(stats_shape, (Ratio, jax.ShapeDtypeStruct))
         self.stats_tree = jax.tree.structure(stats_shape)
         self.effects_tree = jax.tree.structure(self.aux_shape.effects)
 
@@ -223,12 +223,12 @@ class Transaction:
                 prior_mass, prior_gradient = previous.mass, previous.gradient
                 if prior_mass is None or prior_gradient is None:
                     raise ValueError("checkpoint accumulator does not match shared-mean statistics")
-                if isinstance(stats, Mean):
+                if isinstance(stats, Ratio):
                     mass, total = stats.mass, stats.total
                 elif isinstance(stats, (jax.Array, float, int)):
                     mass, total = jnp.asarray(1.), jnp.asarray(stats)
                 else:
-                    raise TypeError("shared accumulation requires Mean or a scalar")
+                    raise TypeError("shared accumulation requires Ratio or a scalar")
                 mass = jax.lax.stop_gradient(mass)
                 total_mass = prior_mass + mass
                 denominator = jnp.where(total_mass > 0, total_mass, 1)
@@ -236,7 +236,7 @@ class Transaction:
                     lambda old, new: old * jnp.asarray(prior_mass / denominator, old.dtype)
                     + new * jnp.asarray(mass / denominator, new.dtype), prior_gradient, gradient)
                 numerator = previous.statistics[0] + total
-                pooled = Mean(numerator, total_mass)
+                pooled = Ratio(numerator, total_mass)
                 value, active = mean_loss(pooled)
                 candidate = dataclasses.replace(previous, gradient=gradient, mass=total_mass,
                                                 statistics=(numerator,), effects=effects, qk_stats=qk)

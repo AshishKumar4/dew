@@ -41,7 +41,7 @@ SEQUENCE = 1024
 
 
 def timed(function, arguments, repeats: int) -> dict[str, float]:
-    """Mean, minimum and median wall time of `function`, each call synced."""
+    """Ratio, minimum and median wall time of `function`, each call synced."""
     for _ in range(5):
         jax.block_until_ready(function(*arguments))
     samples = []
