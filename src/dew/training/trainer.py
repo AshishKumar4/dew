@@ -634,7 +634,6 @@ class _FitPlan:
     best: tuple[Best, ...] = ()
     stop: Plateau | None = None
     validation_splits: Mapping[str, Reader] | None = None
-    restore_best: bool = False
     validation: bool = False
 
 
@@ -1468,7 +1467,6 @@ class Trainer(Generic[Loss, Effects]):
                 best=selection,
                 stop=stop,
                 validation_splits=validation,
-                restore_best=restore_best,
                 validation=validation is not None
                 or (bool(eval_every or metrics) and dataset.val is not None),
             )
@@ -2209,19 +2207,8 @@ class Trainer(Generic[Loss, Effects]):
         is the one a restarted node reads back, not the run's record."""
         paused = time.perf_counter()
         self._display.status("writing a local checkpoint")
-        if control:
-            checkpoints.save_local(
-                step,
-                state,
-                position,
-                share=DataPartition.of(self.device_mesh),
-                control=control,
-                rung=self._rung(),
-            )
-        else:
-            checkpoints.save_local(
-                step, state, position, share=DataPartition.of(self.device_mesh), rung=self._rung()
-            )
+        checkpoints.save_local(step, state, position, share=DataPartition.of(self.device_mesh),
+                               control=control, rung=self._rung())
         self._report(CheckpointRequested(str(checkpoints.local_directory), local=True), step)
         self._display.status("")
         return time.perf_counter() - paused
