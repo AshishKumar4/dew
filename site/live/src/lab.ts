@@ -90,6 +90,16 @@ export class SnapshotLab extends DurableObject<Env> {
 			stderr: new TextDecoder().decode(result.stderr) };
 	}
 
+	async boundary(commit: string): Promise<unknown> {
+		if (!/^[0-9a-f]{40}$/.test(commit)) throw new Error('a full project commit is required');
+		const process = await this.container.exec(['sh', '-c',
+			'curl -fsSL "https://raw.githubusercontent.com/AshishKumar4/dew/$1/site/live/container/probe-kernel-boundary.sh" ' +
+			'-o /root/probe-kernel-boundary.sh; sh /root/probe-kernel-boundary.sh', 'probe', commit]);
+		const result = await process.output();
+		return { exitCode: result.exitCode, stdout: new TextDecoder().decode(result.stdout),
+			stderr: new TextDecoder().decode(result.stderr) };
+	}
+
 	async snapshot(): Promise<unknown> {
 		await this.status();
 		const state = await this.ctx.storage.get<{ stage?: string }>('state');

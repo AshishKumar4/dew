@@ -63,6 +63,7 @@ async function labRequest(request: Request, env: Env, cors: HeadersInit): Promis
 		switch (body.operation) {
 			case 'status': return reply(await lab.status(), 200, cors);
 			case 'diagnostics': return reply(await lab.diagnostics(), 200, cors);
+			case 'boundary': return reply(await lab.boundary(body.commit ?? ''), 200, cors);
 			case 'start': return reply(await lab.start(false), 200, cors);
 			case 'restore': return reply(await lab.start(true), 200, cors);
 			case 'prepare': return reply(await lab.prepare(body.commit ?? ''), 202, cors);
