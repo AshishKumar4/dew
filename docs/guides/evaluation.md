@@ -153,9 +153,9 @@ Dew does not hash data contents or source revisions. Put their identities in the
 
 ## Hyperparameter sweeps
 
-`dew.config.sweep.sweep(config, space, *, train, trials, ledger, tracker, search=random_search, seed=0)` trains one trial per point of a search space through the entry point `train`, which trains a config and returns its score. Each trial is an ordinary run with its own record, checkpoints and tracking directory under `<trainer.name>/trial-<index>`. It uses the normal training loop and has no scheduler.
+`config.sweep(space, *, train, trials, ledger, tracker, search=random_search, seed=0)` on a `RunConfig` trains one trial per point of a search space through the entry point `train`, which trains a config and returns its score. Each trial is an ordinary run with its own record, checkpoints and tracking directory under `<trainer.name>/trial-<index>`. It uses the normal training loop and has no scheduler.
 
-A space maps dotted paths into the run record to the values a trial can take. `override` applies a point through `to_dict` and `from_dict`, so a path the config class does not declare raises instead of silently training the unchanged config.
+A space maps dotted paths into the run record to the values a trial can take. A point is applied through `to_dict` and `from_dict`, so a path the config class does not declare raises instead of silently training the unchanged config.
 
 | Search | Behavior |
 |---|---|
@@ -170,7 +170,7 @@ The example continues the previous one and reuses `objective`, `data`, `Perplexi
 ```python
 from dew import Evaluation, LocalTracker
 from dew.config import ModelConfig, OptimConfig, RunConfig, TrainerConfig
-from dew.config.sweep import grid_search, sweep
+from dew.config.sweep import grid_search
 from dew.data import TokenWindows
 
 config = RunConfig(
@@ -193,8 +193,8 @@ def trial(run: RunConfig) -> float:
 
 
 with LocalTracker("runs/sweep/tracking") as tracker:
-    trials = sweep(config, {"optim.learning_rate": [0.01, 0.003]}, train=trial, trials=2,
-                   ledger="runs/sweep/ledger.json", tracker=tracker, search=grid_search)
+    trials = config.sweep({"optim.learning_rate": [0.01, 0.003]}, train=trial, trials=2,
+                          ledger="runs/sweep/ledger.json", tracker=tracker, search=grid_search)
 print(min(trials, key=lambda trial: trial.value).overrides)
 ```
 

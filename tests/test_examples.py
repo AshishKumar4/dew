@@ -163,7 +163,8 @@ def test_train_lm_example_samples_what_it_trained(tmp_path):
     (tokens / "train.bin").write_bytes(text[:3600])
     (tokens / "val.bin").write_bytes(text[3600:])
     (tokens / "meta.json").write_text(json.dumps(
-        {"tokenizer": "byte", "vocab_size": 256, "dtype": "uint8"}))
+        {"tokenizer": "byte", "vocab_size": 256, "dtype": "uint8", "train_tokens": 3600,
+         "val_tokens": 400, "eos_id": None}))
     example = load_example("train_lm")
     config = example.Config(tokens=tokens, sequence_length=32, batch_size=8, steps=60,
                             learning_rate=1e-2, model=dict(emb_features=16, num_layers=1, num_heads=2),

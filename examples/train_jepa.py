@@ -21,7 +21,7 @@ from dew.objectives.jepa import (
     JepaPredictor,
     KnnProbe,
     LinearProbe,
-    multi_block_mask,
+    MultiBlockMask,
 )
 from dew.training import Checkpoints, Trainer
 
@@ -55,7 +55,7 @@ def main(config: Config, data=None):
         grid=grid, emb_features=config.model["emb_features"],
         num_heads=config.model["num_heads"], predictor_features=config.model["emb_features"] // 2,
         num_layers=max(1, config.model["num_layers"] // 2), dtype=jnp.bfloat16)
-    objective = JepaObjective(encoder, predictor, mask=multi_block_mask(grid),
+    objective = JepaObjective(encoder, predictor, mask=MultiBlockMask.for_grid(grid),
                               sample=Field("image", (config.image_size, config.image_size, 3)),
                               momentum_steps=steps)
 

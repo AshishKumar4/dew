@@ -19,11 +19,9 @@ from ..attention import NormalAttention, RMSNorm
 from ..dit import ROPE_THETA
 from ..precision import at_least_fp32
 from ..rope import rotary_freqs
-from ..sharding import logical_axes
 from .unet import Unet, unet_body
 
 
-@logical_axes({}, heuristic=(("temporal_out",),))
 class TemporalBlock(nn.Module):
     """Temporal self-attention over the frame axis at every spatial position.
 

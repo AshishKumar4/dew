@@ -245,7 +245,7 @@ def test_a_multimodal_mixture_replays_through_its_language_model():
                              head_dim=8, mlp_features=32, max_seq_len=SEQ_LEN, dtype=jnp.float32,
                              attention_impl="reference", mixture=Mixture(experts=4, top_k=2))
     vision = SiglipVision(hidden_size=16, intermediate_size=32, num_layers=1, num_heads=2, image_size=8, patch_size=4)
-    projection = GemmaProjector(vision_width=16, text_width=16, patches_per_side=2, tokens_per_side=1)
+    projection = GemmaProjector(text_width=16, patches_per_side=2, tokens_per_side=1)
     model = MultimodalTransformer(text, vision, projection, family="gemma3", image_token_id=1, dtype=jnp.float32)
     tokens = jnp.asarray([[2, 1, 3, 4, 5, 6]], jnp.int32)
     indices = jnp.asarray([[-1, 0, -1, -1, -1, -1]], jnp.int32)

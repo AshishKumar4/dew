@@ -155,7 +155,6 @@ class MMDiTBlock(nn.Module):
 
 
 @models("simple_mmdit")
-@logical_axes({}, heuristic=(("txt_embed",),))
 class SimpleMMDiT(nn.Module):
     """SD3-style MM-DiT: a plain stack of dual-stream blocks."""
     output_channels: int = 3
@@ -231,13 +230,11 @@ class SimpleMMDiT(nn.Module):
         return self.output(img, inv_idx, H, W, conditioning=cond_emb)
 
 
-@logical_axes({}, heuristic=(("projection",),))
 class PatchMerging(nn.Module):
     """Merges each 2x2 group of patches into one token of `out_features`,
     halving the grid on the way down: a Swin-style layer norm over the
     concatenated group, then a projection."""
     out_features: int
-    merge_size: int = 2
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     norm_epsilon: float = 1e-5
@@ -250,7 +247,7 @@ class PatchMerging(nn.Module):
         merged = einops.rearrange(
             x,
             'b (h p1) (w p2) c -> b h w (p1 p2 c)',
-            p1=self.merge_size, p2=self.merge_size
+            p1=2, p2=2
         )
         merged = LayerNorm(epsilon=self.norm_epsilon, dtype=self.dtype, name="norm")(merged)
         merged = nn.Dense(
@@ -260,19 +257,17 @@ class PatchMerging(nn.Module):
             name="projection"
         )(merged)
 
-        new_H = H_patches // self.merge_size
-        new_W = W_patches // self.merge_size
+        new_H = H_patches // 2
+        new_W = W_patches // 2
         merged = merged.reshape(B, new_H * new_W, self.out_features)
 
         return merged, new_H, new_W
 
-@logical_axes({}, heuristic=(("projection",),))
 class PatchExpanding(nn.Module):
     """Expands each token into a 2x2 group of `out_features` tokens, doubling
     the grid on the way up: a projection to the group's width, a layer norm,
     then the rearrangement."""
     out_features: int
-    expand_size: int = 2
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     norm_epsilon: float = 1e-5
@@ -281,7 +276,7 @@ class PatchExpanding(nn.Module):
     def __call__(self, x, H_patches, W_patches):
         B = x.shape[0]
 
-        expanded_features = self.expand_size * self.expand_size * self.out_features
+        expanded_features = 4 * self.out_features
         x = nn.Dense(
             features=expanded_features,
             dtype=self.dtype,
@@ -294,18 +289,17 @@ class PatchExpanding(nn.Module):
         expanded = einops.rearrange(
             x,
             'b h w (p1 p2 c) -> b (h p1) (w p2) c',
-            p1=self.expand_size, p2=self.expand_size, c=self.out_features
+            p1=2, p2=2, c=self.out_features
         )
 
-        new_H = H_patches * self.expand_size
-        new_W = W_patches * self.expand_size
+        new_H = H_patches * 2
+        new_W = W_patches * 2
         expanded = expanded.reshape(B, new_H * new_W, self.out_features)
 
         return expanded, new_H, new_W
 
 
 @models("hierarchical_mmdit")
-@logical_axes({}, heuristic=(("cond_proj_stage*",), ("txt_embed_stage*",), ("fusion_*",)))
 class HierarchicalMMDiT(nn.Module):
     """U-shaped MM-DiT: dual-stream blocks per stage with patch merging on the
     way down and expansion + skip fusion on the way up.

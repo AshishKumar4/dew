@@ -103,7 +103,7 @@ print(windows["text"][0])
 
 The training stream is shuffled: the first window of the first batch is window 49 of the corpus. `records` is the number of windows, `(1000 - 1) // 8 = 124`.
 
-Each window starts `seq_len` ids after the previous one, so the last id of one window is the first of the next. `dew tokenize` (or `dew.data.write_tokens` in Python) writes `train.bin`, `val.bin` and `meta.json` from raw text; see [Packing](#packing). Token ids already stored in parquet are read through `dew.data.load("hf/parquet", options=HFOptions(data_files=...))` or a Grain pipeline given to `Dataset.from_grain`.
+Each window starts `seq_len` ids after the previous one, so the last id of one window is the first of the next. `dew tokenize` (or `TokenCorpus.write` in Python) writes `train.bin`, `val.bin` and `meta.json` from raw text; see [Packing](#packing). Token ids already stored in parquet are read through `dew.data.load("hf/parquet", options=HFOptions(data_files=...))` or a Grain pipeline given to `Dataset.from_grain`.
 
 Other specifications include `PackedTokens`, `OxfordFlowers`, `HFImages`, `ChatMessages` and the video and preference readers; the [API reference](../reference/core-api.md) lists them. Each has its own fields for paths, tokenization, transforms and splits, and two fields every specification shares:
 
@@ -370,7 +370,7 @@ Packing places tokens from several documents into rows of a fixed width. Segment
 
 A batch stacks each field into one array, so token ids of varying length cannot reach it as they are: tokenizing in `preprocess` and batching the result raises an error that says so. There are two routes to fixed rows.
 
-Offline, `dew tokenize --pack` (or `dew.data.write_tokens(..., pack=True)` in Python) writes a token directory with an eos id after every document, and `PackedTokens` packs it. Its position is a global record count that resumes on any process count. `write_tokens` takes a text file, a directory of `.txt` files, or any iterable of strings, one document each, such as a Hugging Face split's text column.
+Offline, `dew tokenize --pack` (or `TokenCorpus.write(..., pack=True)` in Python) writes a token directory with an eos id after every document, and `PackedTokens` packs it. Its position is a global record count that resumes on any process count. `TokenCorpus.write` takes a text file, a directory of `.txt` files, or any iterable of strings, one document each, such as a Hugging Face split's text column.
 
 Online, Grain's packers build the rows as the documents are read, and `Dataset.from_grain` batches them. Each process builds the pipeline over its own share:
 

@@ -257,14 +257,15 @@ class PackedWindows(_WrappingDataset):
     """Packs documents into windows of `window` tokens, by one plan over the
     whole corpus.
 
-    Every window carries, beside each per-token field, `<field>_segment_ids`
-    (which chunk of the window each token came from, counted from 1, and 0
-    for the padding at the end) and `<field>_positions` (the token's place
-    inside its chunk). A block-diagonal mask and per-document RoPE read that
-    pair, which is what grain's packer writes per packed feature
-    (`grain/_src/python/dataset/transformations/packing_packed_batch.py:116-117`).
-    Chunks are cut the same way in every field, so one pair describes them
-    all and the arrays are shared rather than copied per field.
+    Every window carries its per-token fields and, named after the first of
+    them (the ids), `<field>_segment_ids` (which chunk of the window each
+    token came from, counted from 1, and 0 for the padding at the end) and
+    `<field>_positions` (the token's place inside its chunk). A block-diagonal
+    mask and per-document RoPE read that pair. grain's packer writes one
+    pair per packed feature
+    (`grain/_src/python/dataset/transformations/packing_packed_batch.py:116-117`);
+    chunks are cut the same way in every field here, so one pair describes
+    them all and nothing transfers a second copy to the device.
 
     A window is read by index. `first_fit` plans the packing from the
     document lengths alone, in file order, before any sharding. Window w
@@ -312,9 +313,8 @@ class PackedWindows(_WrappingDataset):
             segment_ids[filled:filled + length] = segment
             positions[filled:filled + length] = np.arange(length, dtype=np.int32)
             filled += length
-        return {**fields,
-                **{f"{key}_segment_ids": segment_ids for key in fields},
-                **{f"{key}_positions": positions for key in fields}}
+        ids = next(iter(fields))
+        return {**fields, f"{ids}_segment_ids": segment_ids, f"{ids}_positions": positions}
 
 
 @datasets("packed_tokens")
