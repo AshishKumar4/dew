@@ -45,6 +45,7 @@ from numbers import Real
 from types import MappingProxyType
 from typing import Protocol
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -383,7 +384,7 @@ def advantages(sessions: Sequence[Session], estimator: str = "group", *,
             values = rloo_advantage(rewards, size)
         else:
             values = group_advantage(rewards, size, normalise_by_std=estimator == "group")
-        per_session[order] = np.asarray(values, np.float32)
+        per_session[order] = np.asarray(jax.device_get(values), np.float32)
     return per_session
 
 

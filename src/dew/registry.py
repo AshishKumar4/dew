@@ -92,7 +92,7 @@ class Registry[T: Callable[..., Any], Built](Mapping[str, T]):
             held = self._members.get(name)
             if held is not None and held is not member:
                 raise ValueError(
-                    f"{self.kind} {name!r} is already {_describe(held)}; "
+                    f"{self.kind} {name!r} is already {held.__name__}; "
                     f"a name maps to one {self.kind}")
             self._members[name] = member
             return member
@@ -122,7 +122,7 @@ class Registry[T: Callable[..., Any], Built](Mapping[str, T]):
         for name, held in self._members.items():
             if held is member:
                 return name
-        raise KeyError(f"{_describe(member)} is not a registered {self.kind}")
+        raise KeyError(f"{member.__name__} is not a registered {self.kind}")
 
     def build(self, name: str, record: Mapping[str, object] = NO_RECORD, /,
               **fields: Configured) -> Built:
@@ -167,7 +167,7 @@ class Registry[T: Callable[..., Any], Built](Mapping[str, T]):
         unknown = sorted(set(fields) - declared)
         if unknown:
             raise ValueError(
-                f"{self.kind} {name!r} ({_describe(member)}) has no field for "
+                f"{self.kind} {name!r} ({member.__name__}) has no field for "
                 f"{unknown}; its fields are {sorted(declared)}")
         return {key: resolve_dtype(value) if key == "dtype"
                 else _rebuilt(_declared_type(member, key), value)
@@ -190,10 +190,6 @@ class Named(Protocol):
 
     @property
     def __name__(self) -> str: ...
-
-
-def _describe(member: Named) -> str:
-    return member.__name__
 
 
 def _declared_type(member: type, field: str) -> Annotation:
@@ -274,8 +270,8 @@ def from_record[ValueT](annotation: type[ValueT], value: Configured) -> ValueT:
     """
     built = _rebuilt(annotation, value)
     if not isinstance(built, annotation):
-        raise ValueError(f"{value!r} builds {_describe(type(built))}, "
-                         f"not the {_describe(annotation)} the field declares")
+        raise ValueError(f"{value!r} builds {type(built).__name__}, "
+                         f"not the {annotation.__name__} the field declares")
     return built
 
 
@@ -307,7 +303,7 @@ def _rebuilt(annotation: Annotation, value: object) -> Configured:
         declared = sorted(f.name for f in dataclasses.fields(held) if f.init)
         unknown = sorted(set(value) - set(declared))
         if unknown:
-            raise ValueError(f"{_describe(held)} has no field for {unknown}; its "
+            raise ValueError(f"{held.__name__} has no field for {unknown}; its "
                              f"fields are {declared}")
         return held(**{key: resolve_dtype(record) if key == "dtype"
                        else _rebuilt(_declared_type(held, key), record)

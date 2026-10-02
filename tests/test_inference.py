@@ -17,6 +17,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from steady_state import steady_state
 from test_diffusion_objective import StubText  # noqa: F401  registers "stub_text"
 
 import dew
@@ -110,6 +111,25 @@ def test_pipeline_generates_from_a_run_directory(tmp_path):
     np.testing.assert_array_equal(
         front(["a water lily", "a sunflower"], steps=3, guidance=2.0, key=0).host().images,
         pipe(["a water lily", "a sunflower"], steps=3, guidance=2.0, key=0).host().images)
+
+
+def test_repeated_image_requests_reuse_their_programs_and_read_back_only_results(tmp_path):
+    """Prompts of the same count and sampling settings after the first run
+    the programs it compiled, and nothing comes back to the host but the
+    images (`steady_state`). A request's prompts and key reach the device
+    as it arrives, so only reads are held. Unguided: the task's cached
+    blank conditions sit on one device and move to the mesh at every
+    guided request."""
+    make_run(tmp_path)
+    pipe = TextToImage.from_run(str(tmp_path))
+    keys = [jax.random.key(index) for index in range(3)]
+    pipe(["a water lily", "a sunflower"], steps=3, guidance=None, key=keys[0])
+    with steady_state(allow=("host_to_device",)):
+        prompts = [["a rose", "a tulip"], ["a daisy", "an iris"]]
+        results = [pipe(rows, steps=3, guidance=None, key=key)
+                   for rows, key in zip(prompts, keys[1:], strict=True)]
+        jax.block_until_ready([result.images for result in results])
+    assert [result.host().images.shape for result in results] == [(2, RES, RES, 3)] * 2
 
 
 def test_images_as_pil_are_this_processs_real_rows_as_8_bit_pixels():
@@ -654,7 +674,7 @@ def test_a_grid_prepares_the_process_and_times_and_final_denoise_ends_the_trajec
 def test_explicit_average_requests_do_not_substitute_live_weights(tmp_path):
     objective, state = make_lm_run(tmp_path, ema_decay=None)
     with pytest.raises(ValueError, match="no EMA"):
-        objective.pipeline(state)
+        objective.pipeline(state, ema=True)
     with pytest.raises(ValueError, match="no EMA"):
         dew.pipeline(str(tmp_path), ema=True)
     restored = dew.pipeline(str(tmp_path))

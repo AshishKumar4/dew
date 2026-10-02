@@ -14,15 +14,11 @@ import jax.numpy as jnp
 import numpy as np
 from flax import struct
 from jax.core import Tracer
-from typing_extensions import TypeVar
 
 from dew.nn.sharding import DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS
 
 if TYPE_CHECKING:
     from PIL.Image import Image
-
-ArrayT = TypeVar("ArrayT", bound=jax.Array | np.ndarray, default=jax.Array, covariant=True)
-TreeT = TypeVar("TreeT")
 
 # What a caller hands a host processor as one media argument: pixels or audio
 # samples in an array, a PIL image, or one entry per row of either. The source's
@@ -375,12 +371,13 @@ def local_rows(leaf: jax.typing.ArrayLike, *, host: bool = True) -> jax.Array | 
     if isinstance(leaf, jax.Array) and leaf.is_fully_addressable and not host:
         return leaf
     if not isinstance(leaf, jax.Array) or leaf.is_fully_addressable:
-        return np.asarray(leaf)
+        return np.asarray(jax.device_get(leaf))
     if leaf.ndim == 0:
-        return np.asarray(leaf.addressable_shards[0].data)
+        return np.asarray(jax.device_get(leaf.addressable_shards[0].data))
     pieces: dict[tuple[int, ...], np.ndarray] = {}
     for shard in leaf.addressable_shards:
-        pieces.setdefault(tuple(part.start or 0 for part in shard.index), np.asarray(shard.data))
+        pieces.setdefault(tuple(part.start or 0 for part in shard.index),
+                          np.asarray(jax.device_get(shard.data)))
     blocks = []
     for start in sorted({key[0] for key in pieces}):
         columns = sorted(key for key in pieces if key[0] == start)
@@ -508,7 +505,7 @@ class RowPlan:
         """Place padded host or device rows, row-sharded on a mesh."""
         sharding = self.sharding
         if sharding is None:
-            return jax.tree.map(jnp.asarray, tree)
+            return jax.device_put(tree)
 
         def put(leaf):
             rows = leaf if isinstance(leaf, jax.Array) else np.asarray(leaf)
@@ -525,14 +522,17 @@ class RowPlan:
         A request key replicated over a multi-process mesh is not
         addressable, and folding it would hand
         `make_array_from_process_local_data` rows this process cannot place.
-        Every replica holds the same key data, so the rows fold from this
-        process's own replica and stay device-resident throughout.
+        Every replica holds the same key data, so on a mesh the rows fold
+        from this process's first replica, on its one device, and are sliced
+        from there to their devices. Folded on every device of a replicated
+        key, they went through the host to be split: jax reshards a
+        multi-device array whose shards hold no target slice by reading it.
         """
-        local = key if key.is_fully_addressable else key.addressable_data(0)
-        indices = jnp.arange(self.count, dtype=jnp.uint32,
-                             device=local.sharding) + self.process * self.rows
-        row_keys = jax.vmap(lambda row: jax.random.fold_in(local, row))(indices)
         sharding = self.sharding
+        local = key if sharding is None else key.addressable_data(0)
+        start = self.process * self.rows
+        indices = jax.device_put(np.arange(start, start + self.count, dtype=np.uint32), local.sharding)
+        row_keys = jax.vmap(lambda row: jax.random.fold_in(local, row))(indices)
         if sharding is None:
             return row_keys
         sharded = jax.make_array_from_process_local_data(sharding, jax.random.key_data(row_keys))

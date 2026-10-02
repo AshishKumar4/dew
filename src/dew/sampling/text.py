@@ -34,7 +34,6 @@ from jax.typing import ArrayLike
 from typing_extensions import TypeVar
 
 from dew.artifacts import agreed
-from dew.nn.backbones.causal_transformer import gather_cache_rows
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.dspark import DSpark
 from dew.nn.inputs import (
@@ -47,7 +46,7 @@ from dew.nn.inputs import (
     mesh_of,
     request_key,
 )
-from dew.nn.kv_cache import Layered, refuse_unassigned
+from dew.nn.kv_cache import Layered, gather_cache_rows, refuse_unassigned
 from dew.objectives.base import Variables
 from dew.sampling import decoding, strategies
 from dew.sampling.decoding import (
@@ -89,14 +88,9 @@ SELF_NAMING = (type, types.FunctionType, types.MethodType, types.BuiltinFunction
 
 @runtime_checkable
 class Bounded(Protocol):
-    """A model that declares its vocabulary and the capacity of its cache.
-
-    `nn.Module` declares neither; a decoder (`CausalTransformer`, the
-    multimodal wrapper, a test policy) declares both, and the host checks
-    read them to refuse an id outside the vocabulary or a request that
-    would overflow the cache. A model that declares neither is checked
-    for neither.
-    """
+    """A model that declares its vocabulary and cache capacity, which the host
+    checks read to refuse an id outside the vocabulary or a request that would
+    overflow the cache; a model that declares neither is checked for neither."""
 
     @property
     def vocab_size(self) -> int: ...
@@ -107,11 +101,8 @@ class Bounded(Protocol):
 
 @runtime_checkable
 class Exposing(Protocol):
-    """A decoder that hands back its hidden states beside its logits.
-
-    A strategy that drafts seeds its draft from them. A model without the
-    method still decodes; it only cannot draft.
-    """
+    """A decoder that hands back its hidden states beside its logits, which a
+    drafting strategy seeds from; without them a model decodes but cannot draft."""
 
     def states_and_logits(self, tokens: jax.Array, **kwargs: jax.Array | bool | None
                           ) -> tuple[jax.Array, jax.Array]: ...
@@ -119,12 +110,8 @@ class Exposing(Protocol):
 
 @runtime_checkable
 class Selective(Protocol):
-    """A decoder that scores one position per row instead of them all.
-
-    Its prefill runs the head on the slot the first draw reads and nothing
-    else; a model without the method scores every prompt position and pays
-    for the ones it discards.
-    """
+    """A decoder that scores one position per row instead of them all, so its
+    prefill runs the head only on the slot the first draw reads."""
 
     def states_and_logits_at(self, tokens: jax.Array, slots: jax.Array, **kwargs: jax.Array | bool | None
                              ) -> tuple[jax.Array, jax.Array]: ...
@@ -384,21 +371,12 @@ def _prefill(model: nn.Module, params: Variables, inputs: ModelInputs, ops: Deco
              cache: Variables | None = None) -> tuple[DecoderState, jax.Array]:
     """The state after the prompt, and which rows hold a real token.
 
-    A decoder that scores one position per row runs its head on the slot the
-    first draw reads and nothing else: the head over a whole prompt is the
-    largest array a prefill allocates, [rows, width, vocab], and the loop
-    keeps one row of it. A decoder without that method scores every position
-    and pays for the ones it discards.
-
-    A model with prediction depths also gets their independent cache, seeded
-    over the prompt: each depth reads the target's hidden state at one
-    position with the token at the next, at that token's own position, which
-    is the history a checkpoint's predictor was trained behind. A depth left
-    empty would draft the first block from nothing. A block drafter's
-    windows take the context of every real prompt position.
-
-    `cache` continues a cache the caller already holds, whose cursors say
-    where each row's prompt resumes; None allocates an empty one.
+    A `Selective` decoder skips the prompt-wide head, the largest array a
+    prefill allocates, `[rows, width, vocab]`. Prediction depths get their
+    cache seeded over the prompt (`_seeded_depths`), so the first block does
+    not draft from nothing, and a block drafter's windows take every real
+    prompt position's context. `cache` continues a cache the caller holds,
+    whose cursors say where each prompt resumes; None allocates an empty one.
     """
     batch, width = inputs.tokens.shape
     held = _empty_cache(model, params, batch, ops) if cache is None else cache
@@ -488,7 +466,7 @@ def _seeded_depths(ops: DecodeOps, state: DecoderState, states: jax.Array,
                    if logical is None
                    else jnp.take_along_axis(logical.astype(jnp.int32), order[..., 0], axis=1))
     compact = states[jnp.arange(batch)[:, None], order[..., 0]]
-    state, _, carried = strategies.reseed(
+    state, carried = strategies.reseed(
         ops, state, (compact[:, 0],) + (None,) * (ops.depths - 1), compact[:, 1:],
         jnp.take_along_axis(embeddings, order, axis=1)[:, 1:],
         jnp.arange(width - 1)[None, :] < (lengths - 1)[:, None],
@@ -572,12 +550,7 @@ def _operations(model: nn.Module, params: Variables, pad_id: int, depths: int) -
 
 
 def _drafting(model: nn.Module, params: Variables, pad_id: int):
-    """The `(propose, embed)` pair a drafting strategy runs the depths with.
-
-    `propose` runs one prediction depth over a candidate token at an explicit
-    target position; `embed` prepares the token embeddings a replayed block
-    hands back to the depths.
-    """
+    """`DecodeOps.propose` and `DecodeOps.embed` over the model's prediction depths."""
     def propose(state: DecoderState, hidden: jax.Array, tokens: jax.Array | None,
                 embeds: jax.Array | None, valid: jax.Array, positions: jax.Array,
                 depth: int, prediction_phase: PredictionPhase) -> tuple[DecoderState, jax.Array, jax.Array]:
@@ -602,13 +575,7 @@ def _drafting(model: nn.Module, params: Variables, pad_id: int):
 
 
 def _block_drafting(model: nn.Module, params: Variables):
-    """The `(record, draft)` pair a block drafter runs with.
-
-    `record` appends the context of a stretch's real positions to the
-    drafter's windows; `draft` drafts the block after what they hold from
-    each row's drawn token, handing each position's logits to `choose`,
-    which draws the next token.
-    """
+    """`DecodeOps.record` and `DecodeOps.draft` over the model's block drafter."""
     def record(state: DecoderState, context: jax.Array, valid: jax.Array) -> DecoderState:
         _, updated = model.apply({**params, "cache": state.cache}, context, None, valid=valid,
                                  method="draft", mutable=["cache"])
@@ -946,5 +913,6 @@ def generate(model: nn.Module, params: Variables,
     failure, output = _compiled(plan.sharding)(model, params, plan.place(padded),
                                                plan.keys(random_key), max_new_tokens, sampling.pad, n,
                                                *components)
-    failure.throw()
+    # The error's flags are the one read a request waits on.
+    jax.device_get(failure).throw()
     return replace(output, rows=plan.rows * n)

@@ -40,7 +40,6 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from .precision import at_least_fp32
-from .sharding import logical_axes
 
 
 @dataclasses.dataclass(frozen=True)
@@ -76,7 +75,6 @@ def sources(state, finished: int, partial):
     return jnp.concatenate([state[:, :, :finished], partial[:, :, None, :]], axis=2)
 
 
-@logical_axes({}, heuristic=(("attention_res",), ("mlp_res",), ("output_res",)))
 class DepthAttention(nn.Module):
     """Mix `[B, S, n, D]` sources into `[B, S, D]` by one learned pseudo-query.
 

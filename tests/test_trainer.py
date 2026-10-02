@@ -33,7 +33,7 @@ from steady_state import steady_state
 
 from dew import position
 from dew.artifacts import Representations
-from dew.checkpoints import STATE_LEAVES
+from dew.checkpoints import STATE_LEAVES, Ranking
 from dew.config import TrainerConfig
 from dew.data import DataPartition
 from dew.objectives.base import Aux, EMASpec, Objective, merge, select, under
@@ -159,7 +159,7 @@ class RecordingTracker:
 def test_fit_lets_go_of_each_state_its_step_consumed():
     """A step donates the state it is handed, so once the next state exists
     nothing in fit may still hold the old one: its arrays have lost their
-    buffers, and a drain of every live array (`dew.profile`) waits on them."""
+    buffers, and a drain of every live array (`dew.Profiler`) waits on them."""
     trainer = make_trainer()
     placed, held, alive = trainer.place, [], []
 
@@ -271,32 +271,12 @@ def test_typed_root_key_round_trips_and_resumes_bit_exactly(tmp_path):
         np.testing.assert_array_equal(np.asarray(raw_leaf(left)), np.asarray(raw_leaf(right)))
 
 
-def test_legacy_key_checkpoint_restores_as_a_typed_key(tmp_path):
-    reference = Trainer(Regression(), optax.adam(1e-3), key=jax.random.key(0))
-    baseline = reference.fit(Data(), steps=4, log_every=1)
-    prefix = Trainer(Regression(), optax.adam(1e-3), key=0).fit(Data(), steps=2, log_every=1)
-    legacy = dataclasses.replace(prefix, key=jax.random.key_data(prefix.key))
-    checkpoints = Checkpoints(str(tmp_path / "legacy"))
-    checkpoints.save(2, legacy, json.dumps({"index": 2}).encode(), share=DataPartition())
-    checkpoints.wait()
-    fresh = Trainer(Regression(), optax.adam(1e-3), key=0,
-                    checkpoints=Checkpoints(str(tmp_path / "legacy")))
-    restored, _, _ = fresh.place()
-    assert jnp.issubdtype(restored.key.dtype, jax.dtypes.prng_key)
-    np.testing.assert_array_equal(jax.random.key_data(restored.key), legacy.key)
-    resumed = fresh.fit(Data(), steps=4, log_every=1)
-    for left, right in zip(jax.tree.leaves(resumed), jax.tree.leaves(baseline), strict=True):
-        np.testing.assert_array_equal(np.asarray(raw_leaf(left)), np.asarray(raw_leaf(right)))
-
-
 @pytest.mark.mesh(devices=2)
 def test_root_key_stays_replicated_on_a_multi_device_mesh():
     trainer = Trainer(Regression(), optax.sgd(.1), key=0, mesh=MeshSpec(fsdp=2),
                       layout=Layout(min_shard=1, tolerance=1.0))
     state, shardings, _ = trainer.place()
-    legacy = dataclasses.replace(state, key=jax.random.key_data(state.key))
-    legacy_shardings = trainer.shardings(legacy)
-    assert shardings.key.spec == legacy_shardings.key.spec == jax.sharding.PartitionSpec()
+    assert shardings.key.spec == jax.sharding.PartitionSpec()
     assert state.key.sharding.mesh == shardings.key.mesh
     for shard in state.key.addressable_shards:
         np.testing.assert_array_equal(jax.random.key_data(shard.data), jax.random.key_data(state.key))
@@ -1049,7 +1029,8 @@ def test_the_best_step_is_the_lowest_loss(tmp_path):
     checkpoints = Checkpoints(str(tmp_path / "best"), keep=1)
     state = make_trainer().initial_state()
     for step, loss in ((1, 0.9), (2, 0.3), (3, 0.7)):
-        checkpoints.save(step, state.replace(step=jnp.asarray(step)), None, {"loss": loss})
+        checkpoints.save(step, state.replace(step=jnp.asarray(step)), None,
+                         ranking=Ranking("train/loss", loss))
     checkpoints.wait()
 
     assert checkpoints.best == 2
@@ -1090,8 +1071,8 @@ def stop_at_local_step(trainer, stop: int):
 
     save_local = trainer.checkpoints.save_local
 
-    def save_then_stop(step, state, position, *, share=None, rung=None):
-        save_local(step, state, position, share=share, rung=rung)
+    def save_then_stop(step, state, position, **options):
+        save_local(step, state, position, **options)
         trainer.checkpoints.wait()
         if step == stop:
             raise Stop()
@@ -1256,6 +1237,17 @@ def test_a_global_position_is_read_by_any_process_count(tmp_path):
     _rewrite_position(trainer, 2, [global_position, global_position], shares=[[0, 2], [1, 2]])
 
     assert Checkpoints(str(tmp_path / "run")).restore(step=2, share=DataPartition())[1] == global_position
+
+
+def test_a_global_position_round_trips_and_a_partial_one_is_refused():
+    """Dew writes every field of its global position, the phases a run
+    completed among them, and reads back only a position with all of them:
+    one without its completed phases is damaged, not a shorter format."""
+    for place in (position.Global(records=16, order="Counting"),
+                  position.Global(records=20, order="B", completed=(("A", 12),))):
+        assert position.decode(position.encode(place)) == place
+    with pytest.raises(ValueError, match=r"missing \['completed'\]"):
+        position.decode(json.dumps({position.ENVELOPE: {"records": 16, "order": "Counting"}}).encode())
 
 
 def test_global_positions_that_disagree_between_processes_are_refused(tmp_path):
@@ -1519,7 +1511,7 @@ def test_goodput_counts_evaluations_and_checkpoints_as_time_outside_steps(monkey
     monkeypatch.setattr(trainer_module, "time", clock)
     tracker = RecordingTracker()
     trainer = make_trainer(tmp_path, objective=Features(), tracker=tracker)
-    compile_step, evaluate, save = trainer.compile, trainer_module.evaluate, trainer.checkpoints.save
+    compile_step, evaluate, save = trainer.compile, trainer_module.Evaluation.run, trainer.checkpoints.save
 
     def compile_then_time_each_step(*args):
         executable = compile_step(*args)
@@ -1540,7 +1532,7 @@ def test_goodput_counts_evaluations_and_checkpoints_as_time_outside_steps(monkey
         return save(*args, **keywords)
 
     monkeypatch.setattr(trainer, "compile", compile_then_time_each_step)
-    monkeypatch.setattr(trainer_module, "evaluate", slow_evaluate)
+    monkeypatch.setattr(trainer_module.Evaluation, "run", slow_evaluate)
     monkeypatch.setattr(trainer.checkpoints, "save", slow_save)
     trainer.fit(Data(val=val_batches()), steps=4, log_every=1, eval_every=2, checkpoint_every=2,
                 metrics=(Spread([]),))

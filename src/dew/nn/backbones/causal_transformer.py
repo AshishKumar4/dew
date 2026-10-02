@@ -57,7 +57,7 @@ from ..hyper_connections import (
     first_stream,
 )
 from ..inputs import AttentionMetadata, LayerInputs, PredictionPhase
-from ..kv_cache import KVCache, gather_cache_rows as gather_cache_rows
+from ..kv_cache import KVCache
 from ..mixers import AttentionMixer, MixerBase, MixerContext
 from ..mixers.mamba2 import Mamba2Mixer
 from ..mla import INDEXER_COLLECTION
@@ -573,7 +573,7 @@ def _whole(value, axis: int):
     # per copy past the first, named by their index like the layers; a
     # square kernel takes the shape heuristic the way the other indexed
     # projections do.
-}, heuristic=(("altup_projections_*",), ("altup_unembed_projections_*",)))
+})
 class CausalTransformer(nn.Module):
     """Decoder-only transformer over token ids: [B, S] int32 -> [B, S, vocab] fp32.
 
@@ -1523,8 +1523,7 @@ class CausalTransformer(nn.Module):
             media_routed=(spec.routed and not spec.hash_routed
                           and self.mixture is not None and self.mixture.media_bias),
             engram=None if spec.engram is None or self.engram is None else functools.partial(
-                EngramLayer, rows=self.engram.num_embeddings[spec.engram],
-                columns=self.engram.columns, head_dim=self.engram.head_dim,
+                EngramLayer, rows=self.engram.num_embeddings[spec.engram], head_dim=self.engram.head_dim,
                 hc_mult=self.hyper_connections.hc_mult if self.hyper_connections else 1,
                 emb_features=self.emb_features, norm_eps=self.norm_eps,
                 dtype=self.dtype, precision=self.precision),
@@ -1612,8 +1611,8 @@ class CausalTransformer(nn.Module):
                     scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
                     wiring=wiring, hyper_connections=self.hyper_connections,
                     dtype=self.dtype, precision=self.precision),
-                emb_features=self.emb_features, targets=len(self.dspark.target_layers),
-                vocab_size=self.vocab_size, markov_rank=self.dspark.markov_rank,
+                emb_features=self.emb_features, vocab_size=self.vocab_size,
+                markov_rank=self.dspark.markov_rank,
                 first=stage == 0, last=stage == stages - 1, norm_eps=self.norm_eps,
                 dtype=self.dtype, precision=self.precision, name=f'dspark_{stage}')
             for stage in range(stages)]

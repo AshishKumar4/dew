@@ -93,11 +93,6 @@ class Engram:
                 f"engram_num_embeddings {self.num_embeddings} are not the tables the "
                 f"bucket primes lay out, {declared}")
 
-    @property
-    def columns(self) -> int:
-        """Hash ids per position and layer: one per (n-gram size, head)."""
-        return (self.max_ngram_size - 1) * self.n_heads
-
     @functools.cached_property
     def primes(self) -> tuple[tuple[tuple[int, ...], ...], ...]:
         """`[layer][n-gram size][head]` bucket moduli: the next unused prime
@@ -130,7 +125,8 @@ class Engram:
         return np.stack(rows)
 
     def hash_ids(self, compressed, blocked, pad):
-        """Every engram layer's bucket ids, `[B, S, layers, columns]` int32.
+        """Every engram layer's bucket ids, `[B, S, layers, columns]` int32,
+        a column per (n-gram size, head).
 
         `compressed` `[B, S, max_ngram_size]` holds each position's compressed
         id and its look-back, nearest first, with `blocked` marking the slots
@@ -265,12 +261,11 @@ class EngramLayer(nn.Module):
     """One layer's lookup gated into the residual streams (model.py:328-365).
 
     `embed` `[rows, head_dim]` is the release's `engram.embed.weight`; `wkv`
-    projects the `columns` rows to `hc_mult` keys and one value; `q_weight`
+    projects a position's looked-up rows to `hc_mult` keys and one value; `q_weight`
     and `k_weight` `[hc_mult, D]` only ever act as their product.
     """
 
     rows: int
-    columns: int
     head_dim: int
     hc_mult: int
     emb_features: int
