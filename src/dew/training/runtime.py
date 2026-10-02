@@ -34,7 +34,7 @@ from dew.pool import (
     runs_on_gpu,
     slurm_tasks_here,
 )
-from dew.telemetry.devices import apply_xla_flags, xla_flag
+from dew.telemetry.devices import apply_xla_flags, keep_roundings, xla_flag
 from dew.telemetry.instrumentation import enable_compilation_cache
 
 _log = logging.getLogger(__name__)
@@ -225,21 +225,6 @@ def unpartition_gpu_pool() -> None:
     steps ran as fast on an A100 (a DiT and a decoder within 0.5%)."""
     if cuda_plugin() and xla_flag("xla_gpu_enable_allocator_spatial_partitioning") is None:
         apply_xla_flags("--xla_gpu_enable_allocator_spatial_partitioning=false")
-
-
-def keep_roundings() -> None:
-    """Keep every rounding to a narrow dtype the program states, unless the
-    run named `--xla_allow_excess_precision`.
-
-    XLA's default lets a fusion carry an op's result wider than its dtype,
-    skipping the rounding, and what fuses depends on the layout: one device
-    and four computed different bf16 forwards of the same model and batch,
-    and with every rounding kept they are bitwise the same. It was no slower
-    on an RTX 4080 (decoder and DiT steps 1-4% faster). A script that builds
-    a Trainer without calling `prepare_process` keeps XLA's default unless it
-    sets the flag in XLA_FLAGS."""
-    if xla_flag("xla_allow_excess_precision") is None:
-        apply_xla_flags("--xla_allow_excess_precision=false")
 
 
 def _pool_keys_alike() -> bool:

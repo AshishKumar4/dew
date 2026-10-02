@@ -412,6 +412,36 @@ def test_the_pipeline_places_a_source_in_its_own_dtype(tmp_path):
     assert leaf_dtypes(task.variables) == {np.dtype(ml_dtypes.bfloat16)}
 
 
+def test_pipeline_preserves_a_bf16_residual_before_its_norm(tmp_path):
+    """A fresh inference process observes the same stored BF16 sum as training."""
+    import subprocess
+    import sys
+
+    source = bf16_source(tmp_path)
+    script = """
+import sys
+import dew
+task = dew.pipeline(sys.argv[1], dtype="bfloat16", param_dtype="auto")
+import jax
+import jax.numpy as jnp
+import numpy as np
+from dew.nn.attention import RMSNorm
+a = jax.random.normal(jax.random.key(0), (512, 64), jnp.bfloat16)
+b = (jax.random.normal(jax.random.key(1), (512, 64)) * 0.37).astype(jnp.bfloat16)
+norm = RMSNorm(epsilon=1e-5, scale_after_cast=True, dtype=jnp.bfloat16)
+variables = norm.init(jax.random.key(2), a)
+stored = jax.jit(jnp.add)(a, b)
+expected = jax.jit(norm.apply)(variables, stored)
+actual = jax.jit(lambda a, b: norm.apply(variables, a + b))(a, b)
+np.testing.assert_array_equal(actual, expected)
+"""
+    flags = " ".join(flag for flag in os.environ.get("XLA_FLAGS", "").split()
+                     if not flag.startswith("--xla_allow_excess_precision"))
+    result = subprocess.run([sys.executable, "-c", script, str(source)], capture_output=True, text=True,
+                            env={**os.environ, "XLA_FLAGS": flags, "JAX_PLATFORMS": "cpu"}, timeout=90)
+    assert result.returncode == 0, result.stderr[-4000:]
+
+
 @pytest.mark.parametrize("name", ["qwen3-tiny", "llama-tiny", "mistral-tiny", "gemma3-tiny",
                                   "olmo3-yarn-tiny", "mixtral-tiny", "deepseek-v3-tiny"])
 def test_a_saved_source_writes_its_config_back_unchanged(tmp_path, name):
