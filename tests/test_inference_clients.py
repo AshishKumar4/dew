@@ -169,7 +169,7 @@ def test_openai_keeps_aggregate_usage_separate_and_associates_choices(clients):
 
 @pytest.mark.parametrize("choices", [
     [choice(0, "a"), choice(0, "b")], [choice(0.9, "a"), choice(0.1, "b")],
-    [choice(True, "a"), choice(0, "b")], [choice(2, "a"), choice(0, "b")],
+    [choice(index=True, text="a"), choice(0, "b")], [choice(2, "a"), choice(0, "b")],
     [{"text": "a"}, choice(1, "b")], [choice(0, None), choice(1, "b")], [{}, {}],
 ])
 def test_openai_refuses_ambiguous_or_malformed_prompt_associations(clients, choices):

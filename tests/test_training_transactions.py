@@ -276,7 +276,7 @@ def test_replay_preserves_half_precision_cotangents_and_integer_support():
 def test_local_partial_snapshot_survives_continued_training_and_weight_restore(tmp_path):
     checkpoints = Checkpoints(str(tmp_path / "persistent"),
                               local_directory=str(tmp_path / "local"), local_every=1)
-    train = trainer(True, checkpoints=checkpoints)
+    train = trainer(composite=True, checkpoints=checkpoints)
     initial = train.initial_state()
     data = batches()
     step = train.compile(initial, data[0])
@@ -287,7 +287,7 @@ def test_local_partial_snapshot_survives_continued_training_and_weight_restore(t
     final, *_ = step(prefix, data[1])
     final, *_ = step(final, data[2])
     checkpoints.wait()
-    resumed_trainer = trainer(True, checkpoints=checkpoints)
+    resumed_trainer = trainer(composite=True, checkpoints=checkpoints)
     restored, _, position = resumed_trainer.place()
     assert position == b"1"
     step = resumed_trainer.compile(restored, data[1])

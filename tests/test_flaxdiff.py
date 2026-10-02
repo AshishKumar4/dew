@@ -100,7 +100,7 @@ def test_the_fourier_table_follows_the_jax_the_run_trained_under(reference):
             draw = jax.random.normal(jax.random.PRNGKey(42), (features // 2,), dtype=jnp.float32)
         return np.asarray(draw * 16)
 
-    streams = {False: drawn(False), True: drawn(True)}
+    streams = {False: drawn(partitionable=False), True: drawn(partitionable=True)}
     for version, partitionable in (("0.4.31", False), ("0.5.0", True), ("0.5.3", True), ("0.10.1", True)):
         np.testing.assert_array_equal(fourier_table(features, version), streams[partitionable])
     with jax.default_device(jax.devices("cpu")[0]):

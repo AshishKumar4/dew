@@ -290,7 +290,7 @@ def test_a_quantized_grouped_convolution_differentiates_as_qwix_does_ungrouped(g
         got, want, float_ = (value_and_gradients(function) for function in (dew, reference, plain))
         # The absolute products each gradient sums: the dequantized operands
         # the backward reads, and the cotangent scaled by the peaks.
-        _, transpose = jax.vjp(convolve, jnp.abs(dequantized(x / peaks, True)), jnp.abs(dequantized(kernel, False)))
+        _, transpose = jax.vjp(convolve, jnp.abs(dequantized(x / peaks, for_lhs=True)), jnp.abs(dequantized(kernel, for_lhs=False)))
         x_magnitude, kernel_magnitude = transpose(jnp.abs(cotangent * peaks))
     np.testing.assert_array_equal(got[0], want[0])
     assert_fp32_reduction_bound(got[1], want[1], kernel_magnitude, int(np.prod(x.shape[:-1])))

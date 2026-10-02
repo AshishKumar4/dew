@@ -255,7 +255,7 @@ def test_composite_replay_does_not_apply_effects_twice():
         ema = Tiny.ema
 
         def __init__(self):
-            self.reference = Tiny(True)
+            self.reference = Tiny(composite=True)
 
         def init(self, key, variables=None):
             return self.reference.init(key, variables)

@@ -385,7 +385,7 @@ def test_rows_keep_64_bit_fields_in_a_process_that_enables_x64():
     from dew.data.providers import fields
 
     row = {"x": [0.1, 0.2], "id": 2**40, "nested": {"n": 3}}
-    with jax.enable_x64(True):
+    with jax.enable_x64(new_val=True):
         wide = fields(row)
     narrow = fields({name: value for name, value in row.items() if name != "id"})
 

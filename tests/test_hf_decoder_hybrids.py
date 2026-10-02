@@ -816,7 +816,7 @@ def test_the_fused_delta_net_projection_is_read_by_key_head_group():
         return GatedDeltaNet(emb_features=16, num_k_heads=2, num_v_heads=4, head_k_dim=4,
                              head_v_dim=6, fused_in_proj=fused)
 
-    fused, split = net(True), net(False)
+    fused, split = net(fused=True), net(fused=False)
     x = jax.random.normal(jax.random.key(0), (1, 5, 16))
     variables = fused.init(jax.random.key(1), x)
     params = dict(variables["params"])

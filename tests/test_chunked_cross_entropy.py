@@ -149,7 +149,7 @@ def test_the_prediction_is_the_int32_column_under_x64():
     """jax_enable_x64 widens argmax to int64, while the tile loop carries its
     best column as int32; the prediction is still the reference's argmax,
     as int32 columns."""
-    with jax.enable_x64(True):
+    with jax.enable_x64(new_val=True):
         hidden, head, targets = inputs()
         _, predicted, _ = chunked_cross_entropy(hidden, head, targets.astype(jnp.int32), 4)
         assert predicted.dtype == jnp.int32
@@ -172,7 +172,7 @@ def test_float64_states_and_head_compute_nothing_in_float32(tile):
     float32, the reference shared the float32 run's roundings of the head,
     so the run's distance from it understated the run's own rounding. It
     traces on the CPU backend, since a TPU has no float64."""
-    with jax.enable_x64(True), jax.default_device(jax.devices("cpu")[0]):
+    with jax.enable_x64(new_val=True), jax.default_device(jax.devices("cpu")[0]):
         hidden, head, targets = jax.tree.map(
             lambda leaf: leaf.astype(jnp.float64) if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf,
             inputs())
@@ -764,7 +764,7 @@ def test_the_forward_rounds_the_table_once_not_once_per_token_tile():
                 found.append((eqn.outvars[0].aval.shape, looped))
         return found
 
-    tables = converts(program.jaxpr, False)
+    tables = converts(program.jaxpr, looped=False)
     assert tables == [((64, 16), False)], tables
 
 
@@ -792,7 +792,7 @@ def test_the_bf16_head_rounds_its_logits_and_their_cotangent_once(tile):
             return jnp.mean(optax.softmax_cross_entropy_with_integer_labels(logits, targets))
         return loss
 
-    rounded = strict_or_rounded(True)
+    rounded = strict_or_rounded(round_logits=True)
     want_states, want_table = jax.grad(rounded, argnums=(0, 1))(hidden, table)
     have_states, have_table = jax.grad(lambda states, matrix: jnp.mean(chunked_cross_entropy(
         states, matrix.T, targets, 4, tile=tile, precision=chunked.BF16)[0]), argnums=(0, 1))(hidden, table)
@@ -805,7 +805,7 @@ def test_the_bf16_head_rounds_its_logits_and_their_cotangent_once(tile):
 
     assert jnp.all(jnp.abs(have_states - want_states) <= slack * terms_states)
     assert jnp.all(jnp.abs(have_table - want_table) <= slack * terms_table)
-    strict_states, _ = jax.grad(strict_or_rounded(False), argnums=(0, 1))(hidden, table)
+    strict_states, _ = jax.grad(strict_or_rounded(round_logits=False), argnums=(0, 1))(hidden, table)
     assert not jnp.all(jnp.abs(strict_states - have_states) <= 2 ** -20 * terms_states)
 
 

@@ -329,7 +329,7 @@ def test_train_rlvr_turns_feed_a_failed_attempt_back_and_run_each_program_once()
         def submit(self, prompt, max_new_tokens, *, key):
             program = failing if not runs else passing
             future = Future()
-            future.set_result(Draw(tuple(prompt), (*program, eos), (-.5,) * 3, None, True, 0))
+            future.set_result(Draw(tuple(prompt), (*program, eos), (-.5,) * 3, None, terminated=True, version=0))
             return future
 
     def reward(source, completion, cases, info):
@@ -364,7 +364,7 @@ def test_train_rlvr_scorer_forgets_old_programs_in_a_long_run():
 
     score = example.attempt_scorer(reward, lambda ids: " ".join(map(str, ids)))
     sampling = Sampling(temperature=1.0, eos_id=0)
-    programs = [Action((1,), (token,), (-.5,), (-.5,), False, 0, sampling) for token in range(1, 65_538)]
+    programs = [Action((1,), (token,), (-.5,), (-.5,), terminated=False, policy_step=0, sampling=sampling) for token in range(1, 65_538)]
     for action in (*programs, programs[0]):
         score("cases", action)
     assert runs.count("1") == 2

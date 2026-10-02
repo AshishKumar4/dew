@@ -394,7 +394,7 @@ def test_layout_parity_anchors_an_objective_that_draws_per_row_on_its_own_draws(
 
     case = dataclasses.replace(tool.zoo()[model], dtype="float32")
     # As the tool runs: the reference and the anchor both under x64.
-    with jax.enable_x64(True):
+    with jax.enable_x64(new_val=True):
         batch = benchmark_step.global_batch(case)
         reference = tool.computed_reference(case, batch, 1)
         loss, gradient = tool.anchor_step(case, batch)

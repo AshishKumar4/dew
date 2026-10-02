@@ -125,7 +125,7 @@ def test_every_stored_dtype_reads_back_exactly(tmp_path):
         "i64": np.asarray([7], np.int64),
         "bytes": np.asarray([0, 127, 128, 255], np.uint8),
         "empty": np.zeros((0, 4), np.uint8),
-        "flag": np.asarray(True, np.bool_),
+        "flag": np.ones((), dtype=np.bool_),
         "scalar": np.asarray(0.25, np.float32),
     }
     path = tmp_path / "model.safetensors"

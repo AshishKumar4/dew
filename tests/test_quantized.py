@@ -406,7 +406,7 @@ def test_a_ue8m0_scale_rounds_as_the_references_float32_log2_does():
 
         codes, scale_inv = quantize_fp8_blocks(weight, 1, ue8m0=True)
 
-        reference_codes, reference_scales = torch_per_block_cast(weight, 1, True)
+        reference_codes, reference_scales = torch_per_block_cast(weight, 1, ue8m0=True)
         assert np.array_equal(scale_inv.view(np.uint32), reference_scales.view(np.uint32))
         assert np.array_equal(codes.view(np.uint8), reference_codes)
         assert np.all(scale_inv.view(np.uint32) & 0x7FFFFF == 0), "not powers of two"

@@ -272,7 +272,7 @@ def test_optimizer_dtype_overflow_backs_off_without_losing_the_prefix():
                       accumulation=2, dynamic_scale=True)
     initial = trainer.initial_state()
     initial = dataclasses.replace(initial, scale=dataclasses.replace(initial.scale, scale=jnp.array(1.)))
-    batch = {"first": jnp.array(True)}
+    batch = {"first": jnp.ones((), dtype=bool)}
     step = trainer.compile(initial, batch)
     prefix, _, _, _, accepted = step(initial, batch)
     assert bool(accepted)
@@ -280,7 +280,7 @@ def test_optimizer_dtype_overflow_backs_off_without_losing_the_prefix():
     prefix_accumulation = jax.tree.map(np.asarray, prefix.accumulation)
     prefix_params = jax.tree.map(np.asarray, prefix.params)
     # Each finalized contribution fits fp16; their fp32 sum does not.
-    rejected, loss, _, finite, accepted = step(prefix, {"first": jnp.array(False)})
+    rejected, loss, _, finite, accepted = step(prefix, {"first": jnp.zeros((), dtype=bool)})
     assert bool(finite) and float(loss) == 0 and not bool(accepted)
     assert int(rejected.step) == 2 and int(rejected.microstep) == 1 and int(rejected.updates) == 0
     assert float(rejected.scale.scale) == .5

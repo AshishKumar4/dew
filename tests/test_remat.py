@@ -71,7 +71,7 @@ def compare_forward_and_backward(plain, remat, params, *inputs):
 @pytest.mark.parametrize('arch', sorted(BUILDERS))
 def test_remat_keeps_parameter_tree_identical(rng, arch, choice):
     x, temb, ctx = image_inputs(rng)
-    plain = BUILDERS[arch](False).init(rng, x, temb, ctx)
+    plain = BUILDERS[arch](remat=False).init(rng, x, temb, ctx)
     remat = BUILDERS[arch](choice).init(rng, x, temb, ctx)
 
     def paths(tree):
@@ -84,7 +84,7 @@ def test_remat_keeps_parameter_tree_identical(rng, arch, choice):
 @pytest.mark.parametrize('arch', sorted(BUILDERS))
 def test_remat_preserves_outputs_and_gradients(rng, arch, choice):
     x, temb, ctx = image_inputs(rng)
-    plain, remat = BUILDERS[arch](False), BUILDERS[arch](choice)
+    plain, remat = BUILDERS[arch](remat=False), BUILDERS[arch](choice)
     compare_forward_and_backward(plain, remat, plain.init(rng, x, temb, ctx), x, temb, ctx)
 
 
@@ -95,7 +95,7 @@ def test_remat_recompute_is_bit_exact(rng):
     on CPU fp32 nothing is merely close: a single differing bit would mean
     the policy dropped something the backward pass then rebuilt differently."""
     x, temb, ctx = image_inputs(rng)
-    plain, remat = BUILDERS['simple_dit'](False), BUILDERS['simple_dit'](True)
+    plain, remat = BUILDERS['simple_dit'](remat=False), BUILDERS['simple_dit'](remat=True)
     params = plain.init(rng, x, temb, ctx)
 
     def loss(model, p):
@@ -161,7 +161,7 @@ def test_remat_policy_saves_what_the_attention_name_marks(rng, named):
     fused kernel either, so whether this value survives the backward pass is
     decided by the name alone."""
     x = jax.random.normal(rng, (2, 2, 8, 4))
-    block = remat_block(BatchedDotBlock, True)(named=named)
+    block = remat_block(BatchedDotBlock, enabled=True)(named=named)
     params = block.init(rng, x)
     lines = saved_residuals(lambda arr: jnp.sum(block.apply(params, arr) ** 2), x)
 
@@ -252,7 +252,7 @@ def test_a_step_that_does_not_fit_recomputes_one_rung_more_until_the_ladder_ends
         climbed.append(decoder.model.remat)
     assert climbed == [REMAT_POLICIES['minimal'], REMAT_POLICIES['full']]
 
-    diffusion = SimpleNamespace(tile_head=lambda: None, model=BUILDERS['simple_dit'](True))
+    diffusion = SimpleNamespace(tile_head=lambda: None, model=BUILDERS['simple_dit'](remat=True))
     assert recompute_more(diffusion) and diffusion.model.remat == 'full'
     assert not recompute_more(diffusion)
 

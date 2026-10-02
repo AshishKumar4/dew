@@ -132,9 +132,9 @@ def test_the_input_scaled_experts_match_the_reference_block():
     }}
     hidden = jnp.asarray(tensors["hidden"])
     reference = tensors["output"].reshape(hidden.shape)
-    output = block(True).apply(variables, hidden)
+    output = block(scale_inputs=True).apply(variables, hidden)
     assert float(np.max(np.abs(np.asarray(output) - reference))) < 1e-5
-    other = block(False).apply(variables, hidden)
+    other = block(scale_inputs=False).apply(variables, hidden)
     assert float(np.max(np.abs(np.asarray(other) - reference))) > 1e-3
 
 

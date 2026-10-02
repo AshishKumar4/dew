@@ -160,7 +160,7 @@ def test_a_criterion_inside_a_block_truncates_it():
     assert int(np.asarray(drawn.valid).sum(axis=1)[0]) == 8
     stopped = run(point(5), [point(5)] * 3, 2, 8, 4, stopping=(stop,))
     np.testing.assert_array_equal(np.asarray(stopped.valid).sum(axis=1), 2)
-    np.testing.assert_array_equal(np.asarray(stopped.terminated), True)
+    np.testing.assert_array_equal(np.asarray(stopped.terminated), desired=True)
 
 
 def test_a_stop_on_the_last_candidate_of_a_whole_block_draws_no_bonus():
@@ -174,7 +174,7 @@ def test_a_stop_on_the_last_candidate_of_a_whole_block_draws_no_bonus():
         lambda state, logits: jnp.where((state.step < 2)[:, None], logits, -jnp.inf))
     drawn = run(point(1), [point(1)] * 3, 2, 4, 2, stopping=(stop,), transforms=(nothing_after,))
     np.testing.assert_array_equal(np.asarray(drawn.valid).sum(axis=1), 2)
-    np.testing.assert_array_equal(np.asarray(drawn.terminated), True)
+    np.testing.assert_array_equal(np.asarray(drawn.terminated), desired=True)
     np.testing.assert_array_equal(np.asarray(drawn.tokens)[:, :2], 1)
 
 
@@ -184,7 +184,7 @@ def test_the_budget_bounds_the_last_block():
     for budget in (3, 5, 7):
         drawn = run(point(5), [point(5)] * 3, 2, budget, 4)
         np.testing.assert_array_equal(np.asarray(drawn.valid).sum(axis=1), budget)
-        np.testing.assert_array_equal(np.asarray(drawn.valid)[:, :budget], True)
+        np.testing.assert_array_equal(np.asarray(drawn.valid)[:, :budget], desired=True)
 
 
 @pytest.mark.parametrize("kind", ["attention", "mla", "recurrent"])
