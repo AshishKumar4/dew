@@ -978,7 +978,8 @@ class Server:
                     f"a reloaded leaf is {kind}{list(np.shape(new))}, "
                     f"the served leaf {served_kind}{list(np.shape(old))}")
         normalized = jax.tree.unflatten(
-            incoming_structure, [jnp.asarray(new, dtype=old.dtype)
+            incoming_structure, [jnp.asarray(np.asarray(new, dtype=old.dtype)
+                                             if isinstance(new, np.ndarray) else new, dtype=old.dtype)
                                  for (_, new), (_, old) in zip(incoming, source, strict=True)])
         packed = _pack_projections(normalized, self._weight_groups)
         incoming, _ = jax.tree_util.tree_flatten_with_path(packed)

@@ -176,6 +176,24 @@ def test_host_task_and_server_preserve_nonzero_lora_branches():
     assert_same_generation(served(["12"], 6, key=3)[0], expected)
 
 
+def test_reload_normalizes_source_precision_before_concatenating_projections():
+    """A float64 value just above an FP16 midpoint must not double-round through FP32."""
+    bound = task(Sampling(temperature=0, eos_id=None))
+    source = jax.tree.map(lambda leaf: np.asarray(leaf, dtype=np.float16), bound.variables)
+    host = TextGeneration(bound.model, source, bound.processor, sampling=bound.sampling)
+    server = Server.from_task(host, slots=2, capacity=128)
+    incoming = jax.tree.map(lambda leaf: np.asarray(leaf, np.float64), source)
+    kernel = incoming["params"]["layers_0"]["self_attn"]["q_proj"]["kernel"]
+    kernel[0, 0] = np.nextafter(1.00048828125, np.inf)
+    server.reload(incoming)
+    packed = server.variables["params"]["layers_0"]["self_attn"]["qkv_proj"]["kernel"]
+    assert float(np.asarray(packed)[0, 0]) == 1.0009765625
+    normalized = jax.tree.map(lambda leaf: np.asarray(leaf, dtype=np.float16), incoming)
+    other = TextGeneration(bound.model, jax.tree.map(jnp.asarray, normalized), bound.processor,
+                           sampling=bound.sampling)
+    assert_same_generation(server(["12"], 5, key=3)[0], other("12", 5, key=3))
+
+
 @pytest.mark.parametrize("dtype", ["int8", "fp8"])
 def test_quantized_weights_serve_the_same_greedy_text_as_the_task(dtype):
     from dew.training.quantization import Quantization
