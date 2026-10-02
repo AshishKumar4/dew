@@ -33,9 +33,6 @@ from dew.sampling import CFG, Euler, Heun, TextToImage
 from dew.sampling.pipelines import Images
 from dew.training import Checkpoints, Trainer
 
-import_module("test_diffusion_objective")  # registers the fixture kind
-
-
 import_module("test_diffusion_objective")  # registers "stub_text"
 
 RES = 8
