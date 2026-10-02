@@ -103,7 +103,8 @@ def test_boundary_rejection_preserves_accepted_prefix_and_mutable_reads(composit
     assert bool(finite) and not bool(accepted)
     assert int(rejected.step) == 2 and int(rejected.microstep) == 1
     assert float(rejected.scale.scale) == prefix_scale / 2
-    for before, after in zip(jax.tree.leaves(prefix_params), jax.tree.leaves(rejected.variables), strict=True):
+    for before, after in zip(jax.tree.leaves(prefix_params),
+                             jax.tree.leaves(rejected.variables), strict=True):
         np.testing.assert_array_equal(before, after)
     for before, after in zip(jax.tree.leaves(prefix_accumulation),
                              jax.tree.leaves(rejected.accumulation), strict=True):
@@ -244,7 +245,8 @@ def test_real_lm_mtp_router_and_qk_update_matches_combined_batch(auxiliary):
     for want, got in zip(jax.tree.leaves(expected), jax.tree.leaves(actual.variables["params"]), strict=True):
         np.testing.assert_allclose(got, want, rtol=2e-5, atol=2e-6)
     expected_moe = objective.apply_effects(start, aux.effects)["moe"]
-    for want, got in zip(jax.tree.leaves(expected_moe), jax.tree.leaves(actual.variables["moe"]), strict=True):
+    for want, got in zip(jax.tree.leaves(expected_moe),
+                         jax.tree.leaves(actual.variables["moe"]), strict=True):
         np.testing.assert_array_equal(raw_leaf(got), raw_leaf(want))
 
     # An independent role-mask equation catches a shared bug in both batching paths.

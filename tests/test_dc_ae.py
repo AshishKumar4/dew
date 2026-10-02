@@ -266,7 +266,8 @@ def test_a_latent_run_trains_behind_the_dc_ae_and_leaves_it_frozen(source):
     moved = [
         not np.array_equal(np.asarray(before), np.asarray(after))
         for before, after in zip(
-            jax.tree.leaves(initial.variables["params"]), jax.tree.leaves(state.variables["params"]), strict=True
+            jax.tree.leaves(initial.variables["params"]),
+            jax.tree.leaves(state.variables["params"]), strict=True
         )
     ]
     assert any(moved)

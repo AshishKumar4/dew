@@ -72,13 +72,14 @@ def test_metadata_inspection_and_restore_share_the_committed_snapshot(tmp_path, 
     second = state(5, 5)
     checkpoints.save(5, second, None)
     checkpoints.wait()
-    assert checkpoints.stored()["params"]["params"]["weight"].shape == (5,)
+    assert checkpoints.stored()["variables"]["params"]["weight"].shape == (5,)
     restored, _ = checkpoints.restore()
-    np.testing.assert_array_equal(restored["variables"]["params"]["weight"], second.variables["params"]["weight"])
+    np.testing.assert_array_equal(restored["variables"]["params"]["weight"],
+                                  second.variables["params"]["weight"])
     third = state(7, 7)
     checkpoints.save(7, third, None)
     checkpoints.wait()
-    assert checkpoints.stored()["params"]["params"]["weight"].shape == (7,)
+    assert checkpoints.stored()["variables"]["params"]["weight"].shape == (7,)
 
 
 def make_case(kind, decay):
