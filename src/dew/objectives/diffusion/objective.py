@@ -16,7 +16,6 @@ uses; the preview hook limits itself to the display count.
 
 from __future__ import annotations
 
-import copy
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -288,7 +287,9 @@ class DiffusionObjective(Objective[Ratio]):
                 'autoencoder': None if self.autoencoder is None else self.autoencoder.to_json(),
                 'solver': _to_json(self.solver, type(self.solver)),
                 'guidance': _to_json(self.guidance, type(self.guidance)), 'sampling_steps': self.steps,
-                'condition_precision': self._condition_precision}
+                'condition_precision': self._condition_precision,
+                # A tuned autoencoder's weights and statistics sit in the run's own tree.
+                'end_to_end': None if self.end_to_end is None else _to_json(self.end_to_end, EndToEnd)}
 
     def pipeline(self, state: TrainState, *, ema: bool | None = None) -> TextToImage:
         """The model over the state's published weights as a `TextToImage`
@@ -568,12 +569,7 @@ class DiffusionObjective(Objective[Ratio]):
         the tuned one, its latents normalized by the running statistics."""
         if self.end_to_end is None or self.autoencoder is None:
             return self.autoencoder, variables
-        tuned = copy.copy(self.autoencoder)
-        statistics = variables[LATENT_STATS]
-        tuned.latent_shift = statistics["mean"]
-        tuned.latent_scale = 1.0 / jnp.sqrt(statistics["var"] + self.end_to_end.epsilon)
-        tuned.params = variables["params"][AUTOENCODER]
-        return tuned, {**variables, "autoencoder": tuned.params}
+        return self.end_to_end.tuned(self.autoencoder, variables)
 
     def _sample_impl(self, params, batch, key, *, count: int):
         given, unconditional = self._conditions(params, batch, key, dropout=False)

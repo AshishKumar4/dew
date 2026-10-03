@@ -251,8 +251,15 @@ class TextToImage:
             ema=averaged, step=step, mesh=mesh, layout=layout, param_dtype=param_dtype,
             parameter_roots=_parameter_roots(inputs_record, autoencoder_record))
         inputs = InputSpec.from_json(inputs_record, params=params.get('encoders', {}))
-        autoencoder = None if autoencoder_record is None else AutoEncoder.from_json(
-            autoencoder_record, params=params['autoencoder'])
+        end_to_end = record.get('end_to_end')
+        autoencoder = None
+        if autoencoder_record is not None and end_to_end is not None:
+            from dew.objectives.diffusion.end_to_end import AUTOENCODER, EndToEnd
+            tuning = _built(EndToEnd, fields(end_to_end, 'end_to_end'))
+            frozen = AutoEncoder.from_json(autoencoder_record, params=params['params'][AUTOENCODER])
+            autoencoder, params = tuning.tuned(frozen, params)
+        elif autoencoder_record is not None:
+            autoencoder = AutoEncoder.from_json(autoencoder_record, params=params['autoencoder'])
         solver_record = fields(record['solver'], 'solver')
         solver = solvers.build(text(solver_record['name'], 'solver name'),
                                 fields(solver_record['fields'], 'solver fields'))
