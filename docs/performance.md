@@ -16,7 +16,7 @@ python tools/optimizer_curve.py --dataset <tokens> --optimizer <name> \
     --learning-rate <lr> --out <json>
 ```
 
-## Training scoreboard, 2026-10-02
+## Training scoreboard, 2026-10-03
 
 Dew against `torch.compile` on the same models: the same batch, bf16
 compute over fp32 master weights, the same optimizer constants, the same
@@ -29,7 +29,7 @@ rows from `tools/reference_runs/dew_lm.py` and `tools/benchmark_step.py`;
 `tools/reference_runs/scoreboard.py` builds the reference-run rows into one
 table.
 
-RTX 4080 16 GiB, Dew at `4d392f0a` (jax 0.11.2.post3), torch 2.13.0+cu130,
+RTX 4080 16 GiB, Dew at `f6047cf9` (jax 0.11.2.post3), torch 2.13.0+cu130,
 transformers 5.17.0, SDPA attention. Each Dew row is two processes, given
 as their range; each torch row is one process, or two where a range is
 given. Dew as installed, cuDNN attention; with tokamax installed
@@ -37,14 +37,14 @@ given. Dew as installed, cuDNN attention; with tokamax installed
 
 | model | step | Dew | best torch.compile | Dew / torch |
 |---|---|---:|---:|---:|
-| Qwen3-0.6B, pretrained | 1 x 1024 tokens, AdamW | 96.2 ms, MFU 46.7-46.8% | 112.1-112.4 ms, 40.0% | 1.17 |
-| Qwen3-0.6B, pretrained | 2 x 1024 tokens, AdamW | 148.1 ms, MFU 60.7% | 168.6-169.1 ms, 53.3% | 1.14 |
-| 99M Qwen3-MoE shape, 8 experts, top 2 | 8 x 1024 tokens, AdamW | 78.1 ms | 112.5 ms | 1.44 |
-| decoder, GPT-2 small widths, 3 layers | 16 x 512, Adam, EMA | 49.1 ms; tokamax 48.4-48.5 | 49.4 ms (flash), 50.0 (cuDNN) | 1.01; 1.02 |
-| SimpleDiT, width 384, 6 layers, 64 px | batch 16, Adam, EMA | 7.41-7.46 ms | 8.07 ms | 1.08-1.09 |
-| SimpleDiT, width 768, 12 layers, 64 px | batch 32, Adam, EMA | 72.6-72.7 ms, MFU 62.3-62.4%; tokamax 71.1 | 76.4 ms (flash) | 1.05; 1.07 |
-| 176M hybrid DiT (published config) | batch 16, Adam, EMA | 66.5-66.6 ms, MFU 39.2%; tokamax 66.3-66.4 | no torch port | |
-| 176M hybrid DiT (published config) | batch 32 | 110.2-110.3 ms, MFU 47.3%; tokamax 109.6 | no torch port | |
+| Qwen3-0.6B, pretrained | 1 x 1024 tokens, AdamW | 96.0-96.1 ms, MFU 46.8% | 112.1-112.4 ms, 40.0% | 1.17 |
+| Qwen3-0.6B, pretrained | 2 x 1024 tokens, AdamW | 148.0-148.3 ms, MFU 60.6-60.8% | 168.6-169.1 ms, 53.3% | 1.14 |
+| 99M Qwen3-MoE shape, 8 experts, top 2 | 8 x 1024 tokens, AdamW | 78.1-78.2 ms | 112.5 ms | 1.44 |
+| decoder, GPT-2 small widths, 3 layers | 16 x 512, Adam, EMA | 49.0-49.3 ms; tokamax 48.5 | 49.4 ms (flash), 50.0 (cuDNN) | 1.00-1.01; 1.02 |
+| SimpleDiT, width 384, 6 layers, 64 px | batch 16, Adam, EMA | 7.41-7.42 ms | 8.07 ms | 1.09 |
+| SimpleDiT, width 768, 12 layers, 64 px | batch 32, Adam, EMA | 72.6-72.7 ms, MFU 62.4%; tokamax 70.9-71.0 | 76.4 ms (flash) | 1.05; 1.08 |
+| 176M hybrid DiT (published config) | batch 16, Adam, EMA | 60.1 ms, MFU 44.4%; tokamax 60.0-60.2 | no torch port | |
+| 176M hybrid DiT (published config) | batch 32 | 100.6 ms, MFU 53.1%; tokamax 100.0-100.1 | no torch port | |
 
 The Dew decoder and SimpleDiT rows take a fresh host batch every step, and
 match the fixed-batch rows ("Comparison with PyTorch" below has both ways
@@ -52,6 +52,12 @@ for both frameworks, and the commands). Qwen3-0.6B at 1 x 1024 keeps both
 devices busy (torch 110.3 ms of its 112.1 ms step in the second process,
 Dew 96.0 of 96.2); on the MoE torch idles 20.9 ms a step on its host, and
 on device time alone Dew is 1.26x faster (78.1 against 98.3 ms busy).
+
+From `4d392f0a` to `f6047cf9` the hybrid DiT went from 66.5 to 60.1 ms at
+batch 16 and from 110.2 to 100.6 at 32, over the merges in between (among
+them the S5 recurrence in real arithmetic, "The hybrid DiT's SSM blocks"
+below, and gradient norms compiled only at the log cadence); the other
+rows stayed within their spread.
 
 Since `42ddfc14`: the hybrid DiT's dilated depthwise convolutions run as
 undilated ones over their interleaved grids (75.4 to 70.2 ms at batch 16);
