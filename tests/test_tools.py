@@ -859,6 +859,26 @@ def test_a_scoreboard_row_waits_for_every_reference_record(monkeypatch):
         "Dew (dew) LOSES to torch, bf16 experts: 0.880x")
 
 
+def test_maxtext_names_its_profiler_only_for_profiled_steps(monkeypatch, tmp_path):
+    """MaxText reads an empty `profiler=` as None, which its config refuses,
+    so a run that profiles no steps leaves the profiler's settings out; one
+    that profiles the last five names the profiler and where it starts."""
+    from types import SimpleNamespace
+
+    monkeypatch.syspath_prepend(str(REPO_ROOT / "tools" / "reference_runs"))
+    package = SimpleNamespace(__file__=str(tmp_path / "maxtext" / "__init__.py"))
+    monkeypatch.setitem(sys.modules, "maxtext", package)
+    runner = load("reference_runs/maxtext_run")
+    args = SimpleNamespace(
+        model_name="qwen3-0.6b", batch=8, seq=1024, steps=90, schedule_steps=256, attention=None,
+        remat="minimal", mesh="fsdp", lr_peak=2e-5, b1=0.9, b2=0.95, eps=1e-8, weight_decay=0.1, clip=1.0,
+        profile_steps=0, overrides=[])
+    unprofiled = runner.maxtext_argv(args, tmp_path)
+    assert not [setting for setting in unprofiled if setting.startswith("profiler")]
+    profiled = runner.maxtext_argv(SimpleNamespace(**{**vars(args), "profile_steps": 5}), tmp_path)
+    assert {"profiler=xplane", "profiler_steps=5", "skip_first_n_steps_for_profiler=85"} <= set(profiled)
+
+
 # ---------------------------------------------------------------------------
 # tools/benchmark_quantized_serving.py
 # ---------------------------------------------------------------------------
