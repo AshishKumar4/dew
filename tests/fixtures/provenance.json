@@ -118,6 +118,17 @@
   ],
   "note": "Documented generation environment also uses Torch 2.8.0."
  },
+ "codecs/deepgemm_fp8.npz": {
+  "tool": "tools/deepgemm_fp8_reference.py",
+  "sources": [
+   {
+    "repo": "deepseek-ai/DeepGEMM",
+    "version": "057ca5964aae0879ff2e0eb71ee05a3cb0ba3df7",
+    "runs": "fetched"
+   }
+  ],
+  "note": "per_block_cast_to_fp8 of deep_gemm/utils/math.py, checked by SHA-256; operands stored beside the outputs. Torch 2.14.0+cpu."
+ },
  "dc_ae.tar.xz": {
   "tool": "tools/diffusers_dc_ae_reference.py",
   "sources": [
