@@ -2,10 +2,11 @@
 """Measure 3x3 depthwise forward/VJP and the published 176M DiT's step.
 
 RTX 4080: ~/.cache/dew/dew-gpu-run env PYTHONPATH=src python tools/benchmark_depthwise.py kernels
-Run `step --implementation lax` and `step --implementation polyphase` in
+Run `step --implementation lax` and `step --implementation production` in
 separate processes. The diagnostic lax choice substitutes the dilated
-convolution for the polyphase one only inside this benchmark; production
-dispatch has no performance flag.
+convolution for production's dilated forms (polyphase in bf16, the
+materialized shifted products in fp32) only inside this benchmark;
+production dispatch has no performance flag.
 """
 
 import argparse
@@ -69,7 +70,8 @@ def kernels(args):
                 for name, operation in (
                         ('lax-NHWC', partial(reference, dilation=dilation)),
                         ('lax-NCHW', partial(reference, dilation=dilation, layout='NCHW')),
-                        ('polyphase', partial(conv._polyphase_depthwise_3x3, dilation=dilation))):
+                        ('polyphase', partial(conv._polyphase_depthwise_3x3, dilation=dilation)),
+                        ('materialized', partial(conv._materialized_depthwise_3x3, dilation=dilation))):
                     actual = jax.jit(partial(vjp, operation))(x, kernel, cotangent)
                     errors = [float(np.max(np.abs(np.asarray(a, np.float64) - np.asarray(b, np.float64))))
                               for a, b in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True)]
@@ -101,7 +103,7 @@ def step(args):
     import benchmark_step
 
     if args.implementation == 'lax':
-        conv._polyphase_depthwise_3x3 = partial(reference, precision=None)
+        conv._polyphase_depthwise_3x3 = conv._materialized_depthwise_3x3 = partial(reference, precision=None)
     config = {'emb_features': 768, 'mlp_ratio': 4, 'norm_epsilon': 1e-5,
               'num_heads': 12, 'num_layers': 16, 'patch_size': 2, 'scan_order': 'zigzag',
               'ssm_attention_ratio': '3:1', 'ssm_state_dim': 64, 'text_pooling': 'all',
@@ -145,46 +147,60 @@ def checkpoint(args):
 
     pipeline = TextToImage.from_pretrained('dewml/hybrid-dit-176m',
                                            revision='32d59de89683d59824361144b87bdcaf3e742598')
-    original = conv._polyphase_depthwise_3x3
+    original = conv._polyphase_depthwise_3x3, conv._materialized_depthwise_3x3
     prompt = 'a watercolor painting of a mountain lake at sunrise'
-    with jax.default_matmul_precision('highest'):
+
+    def sample(dilated=None):
         try:
-            conv._polyphase_depthwise_3x3 = partial(reference, precision=None)
+            if dilated is not None:
+                conv._polyphase_depthwise_3x3 = conv._materialized_depthwise_3x3 = dilated
             jax.clear_caches()
-            before = pipeline(prompt, key=17, steps=20)
-            jax.block_until_ready(before)
+            return jax.block_until_ready(pipeline(prompt, key=17, steps=20))
         finally:
-            conv._polyphase_depthwise_3x3 = original
-        jax.clear_caches()
-        after = pipeline(prompt, key=17, steps=20)
-        jax.block_until_ready(after)
-        vae = pipeline.autoencoder
+            conv._polyphase_depthwise_3x3, conv._materialized_depthwise_3x3 = original
+
+    with jax.default_matmul_precision('highest'):
+        before = sample(partial(reference, precision=None))
+        after = sample()
+        rounded = sample(one_rounding)
+        vae, params = pipeline.autoencoder, pipeline.variables['autoencoder']
         float_vae = StableDiffusionVAE(
-            model=vae.model.clone(dtype=jnp.float32), params=pipeline.variables['autoencoder'],
+            model=vae.model.clone(dtype=jnp.float32), params=params,
             dtype=jnp.float32, latent_shift=vae.latent_shift, latent_scale=vae.latent_scale)
         decode = jax.jit(lambda params, z: jnp.clip(float_vae.decode(params, z), -1, 1))
-        before_fp32 = decode(pipeline.variables['autoencoder'], before.latents)
-        after_fp32 = decode(pipeline.variables['autoencoder'], after.latents)
-        jax.block_until_ready((before_fp32, after_fp32))
+        before_fp32, after_fp32, rounded_fp32 = (
+            decode(params, z) for z in (before.latents, after.latents, rounded.latents))
+        jax.block_until_ready((before_fp32, after_fp32, rounded_fp32))
         delta = np.asarray(after.latents, np.float64) - np.asarray(before.latents, np.float64)
         noise = np.random.default_rng(29).normal(size=delta.shape).astype(np.float32)
         noise *= np.sqrt(np.mean(delta ** 2)) / np.sqrt(np.mean(noise ** 2))
         noise.flat[0] = np.max(np.abs(delta))
         perturbed = before.latents + jnp.asarray(noise)
         decode_bf16 = jax.jit(lambda params, z: jnp.clip(vae.decode(params, z), -1, 1))
-        noisy_images = decode_bf16(pipeline.variables['autoencoder'], perturbed)
-        original_images = decode_bf16(pipeline.variables['autoencoder'], before.latents)
+        noisy_images = decode_bf16(params, perturbed)
+        original_images = decode_bf16(params, before.latents)
         jax.block_until_ready((noisy_images, original_images))
     report = {'latents': errors(before.latents, after.latents),
               'fp32_images': errors(before_fp32, after_fp32),
+              'one_rounding_latents': errors(before.latents, rounded.latents),
+              'one_rounding_fp32_images': errors(before_fp32, rounded_fp32),
               'bf16_images': errors(before.images, after.images),
               'independent_latent_noise': errors(before.latents, perturbed),
               'bf16_decoder_noise_sensitivity': errors(original_images, noisy_images)}
     print(json.dumps(report), flush=True)
     args.output.write_text(json.dumps(report, indent=2))
-    np.testing.assert_allclose(before.latents, after.latents, rtol=0, atol=3e-5)
-    np.testing.assert_allclose(before_fp32, after_fp32, rtol=0, atol=5e-5)
+    for name in ('latents', 'fp32_images'):
+        for statistic in ('max_abs_error', 'rms_error'):
+            assert report[name][statistic] <= 2 * report[f'one_rounding_{name}'][statistic], (name, report)
     return report
+
+
+def one_rounding(x, kernel, dilation):
+    """lax's dilated convolution with every other output feature moved up
+    one ulp: one rounding's worth of difference in half the outputs."""
+    out = reference(x, kernel, dilation, precision=None)
+    moved = jnp.nextafter(out, jnp.asarray(jnp.inf, out.dtype))
+    return jnp.where(jax.lax.broadcasted_iota(jnp.int32, out.shape, out.ndim - 1) % 2 == 0, moved, out)
 
 
 def errors(lhs, rhs):
@@ -196,7 +212,7 @@ def errors(lhs, rhs):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('mode', choices=('kernels', 'step', 'checkpoint'))
-    parser.add_argument('--implementation', choices=('lax', 'polyphase'), default='polyphase')
+    parser.add_argument('--implementation', choices=('lax', 'production'), default='production')
     parser.add_argument('--dtype', choices=('float32', 'bfloat16'), default='bfloat16',
                         help='Training step compute dtype; checkpoint keeps the published dtypes.')
     parser.add_argument('--batch-size', type=int, choices=(16, 32), help='One step case in a fresh process.')

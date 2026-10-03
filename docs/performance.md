@@ -233,7 +233,14 @@ fp32 is 4.0% faster at batch 16 and 4.1% at 32; bf16 is the same program,
 with the same losses to the bit. The fp32 losses move in the 8th digit
 (0.56920904 to 0.56920898 at batch 16), within the forms' fp32 bound
 (tests/test_depthwise_conv.py). In bf16 the shifted form would cost 65.4
-and 107.0 ms. The A100 has no fp32 row for either form.
+and 107.0 ms. The published model samples in fp32, and the live sampler's
+call (15 DPM-Solver++ steps under CFG, `0964f573`, median of five, two
+rounds each) is faster too: batch 1 101.0-102.0 to 97.5-98.1 ms, batch 4
+268.2-269.3 to 257.4-259.0, the denoising scan alone 93.0-93.2 to 90.1-90.5
+and 236.8-237.6 to 226.8-227.7, peak memory within the rounds' spread. Its
+latents and fp32 images move within twice what one rounding of the
+convolutions moves them (the published-sample test). The A100 has no fp32
+row for either form.
 
 The S5 layer ran its recurrence as `associative_scan` over complex
 states, whose backward spent 4.5 ms of the 4080's step in complex
