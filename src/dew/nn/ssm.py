@@ -1,7 +1,8 @@
 """Mix tokens with S5 state-space layers and a 2D state fusion convolution.
 
 The S5 layer is a diagonal SSM from the S4D-Lin poles, run in chunks of
-pole-power products (`diagonal_recurrence`). The fusion convolution is
+pole-power products on a GPU and as one complex scan on a TPU
+(`diagonal_recurrence`). The fusion convolution is
 Spatial-Mamba's, and the two together are the SSM mixer of `ModulatedBlock`.
 """
 
@@ -72,14 +73,36 @@ def diagonal_recurrence(pole: jax.Array, inputs: jax.Array, chunk: int = SCAN_CH
 
     `pole` is `[N]` complex. `inputs` is `v` `[B, S, 2N]` in real form, its
     real parts and then its imaginary parts on the last axis, and the states
-    come back the same way, computed in real arithmetic. Positions run in
-    chunks of `chunk`: inside a chunk the states are one product of the
-    powers `pole^(k - j)` with the chunk's inputs, at fp32's full precision,
-    and across chunks `associative_scan` carries each chunk's last state
-    forward by `pole^chunk`. The powers come by doubling (`_powers`), and
-    the states stay within the fp32 running-error bound of the scan the
-    layer ran before (tests/test_ssm.py).
+    come back the same way. On a GPU and the CPU they run in chunks of
+    pole-power products (`_chunked_recurrence`); on a TPU as one
+    `associative_scan` over complex states (`_scanned_recurrence`), the form
+    a v6e ran faster at 16 images a step and when sampling 4 at a time,
+    where the chunks were faster at 32 and when sampling 1
+    (docs/performance.md). Both stay within the fp32 running-error bound of
+    the recurrence (tests/test_ssm.py).
     """
+    return jax.lax.platform_dependent(
+        pole, inputs, tpu=_scanned_recurrence,
+        default=lambda pole, inputs: _chunked_recurrence(pole, inputs, chunk))
+
+
+def _scanned_recurrence(pole: jax.Array, inputs: jax.Array) -> jax.Array:
+    """`diagonal_recurrence` as one `associative_scan` over complex states,
+    `(a1, b1) * (a2, b2) = (a1 a2, a2 b1 + b2)`."""
+    states = inputs.shape[-1] // 2
+    values = jax.lax.complex(inputs[..., :states], inputs[..., states:])
+    poles = jnp.broadcast_to(pole, values.shape)
+    _, x = jax.lax.associative_scan(lambda e1, e2: (e1[0] * e2[0], e2[0] * e1[1] + e2[1]),
+                                    (poles, values), axis=1)
+    return jnp.concatenate([x.real, x.imag], axis=-1)
+
+
+def _chunked_recurrence(pole: jax.Array, inputs: jax.Array, chunk: int) -> jax.Array:
+    """`diagonal_recurrence` in real arithmetic, in chunks of `chunk`
+    positions: inside a chunk the states are one product of the powers
+    `pole^(k - j)` with the chunk's inputs, at fp32's full precision, and
+    across chunks `associative_scan` carries each chunk's last state forward
+    by `pole^chunk`. The powers come by doubling (`_powers`)."""
     batch, steps, width = inputs.shape
     states = width // 2
     length = min(chunk, steps)

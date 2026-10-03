@@ -43,7 +43,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.nn.ssm import S5Layer, diagonal_recurrence
+from dew.nn.ssm import S5Layer, _chunked_recurrence, _scanned_recurrence, diagonal_recurrence
 
 U = 2.0 ** -24
 BATCH, FEATURES, STATE = 2, 4, 8
@@ -279,9 +279,21 @@ def test_the_recurrence_holds_for_poles_all_around_the_circle():
     expected = run(pole.astype(np.complex128), v.astype(np.complex128))
     magnitude = run(np.abs(pole).astype(np.float64), np.abs(v).astype(np.float64))
     inputs = np.concatenate([v.real, v.imag], axis=-1)
-    actual = np.asarray(jax.jit(diagonal_recurrence)(jnp.asarray(pole), jnp.asarray(inputs)), np.float64)
-    actual = actual[..., :states] + 1j * actual[..., states:]
-    assert np.all(np.abs(actual - expected) <= forward_chain(steps, 1, states) * U * magnitude)
+    for form in (lambda pole, v: _chunked_recurrence(pole, v, 16), _scanned_recurrence):
+        actual = np.asarray(jax.jit(form)(jnp.asarray(pole), jnp.asarray(inputs)), np.float64)
+        actual = actual[..., :states] + 1j * actual[..., states:]
+        assert np.all(np.abs(actual - expected) <= forward_chain(steps, 1, states) * U * magnitude)
+
+
+@pytest.mark.parametrize("platform, scanned", [("tpu", True), ("cuda", False), ("cpu", False)])
+def test_a_tpu_runs_the_recurrence_as_one_scan(platform, scanned):
+    """The TPU lowering takes the complex scan and the others the chunked
+    pole-power products, whose Toeplitz product names its einsum."""
+    pole = jnp.full((4,), 0.9 + 0.1j, jnp.complex64)
+    inputs = jnp.zeros((1, 40, 8), jnp.float32)
+    text = jax.jit(diagonal_recurrence).trace(pole, inputs).lower(lowering_platforms=(platform,)).as_text(
+        debug_info=True)
+    assert ("kjn,bcjn->bckn" not in text) == scanned
 
 
 def test_the_forward_bound_rejects_an_euler_step(case):

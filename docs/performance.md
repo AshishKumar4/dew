@@ -217,38 +217,35 @@ dilated convolution's exactly.
 
 The S5 layer ran its recurrence as `associative_scan` over complex
 states, whose backward spent 4.5 ms of the 4080's step in complex
-arithmetic alone. It now runs in real arithmetic, in chunks: inside a
-chunk the states are one fp32 product of the pole's powers with the
-chunk's inputs, and `associative_scan` carries only the chunks' last
-states (`dew.nn.ssm.diagonal_recurrence`, within the fp32 bound of the
-old scan). `tools/benchmark_step.py`, one batch on the device, ms per step
-(the asynchronous throughput a run sees), old against new, 2026-10-02:
+arithmetic alone. On a GPU (and the CPU) it now runs in real arithmetic,
+in chunks: inside a chunk the states are one fp32 product of the pole's
+powers with the chunk's inputs, and `associative_scan` carries only the
+chunks' last states. The powers come by doubling, the powers so far times
+the next squared power, so each rounds at most 2 log2(t) times, and the
+`[L, L]` Toeplitz block is a one-hot product of them, exact at full
+precision, whose transpose is a product too. A TPU keeps the complex scan
+(`dew.nn.ssm.diagonal_recurrence`): on a v6e the chunks were faster at
+some shapes and slower at others. `tools/benchmark_step.py`, ms per step
+(the asynchronous throughput a run sees), and the live sampler's call
+(`dit_sample_time.py`: 15 DPM-Solver++ steps under CFG 5.0, the denoising
+scan alone), scan against chunks, 2026-10-02:
 
-| device | batch 16 | batch 32 |
-|---|---:|---:|
-| RTX 4080 (integration `527a32e9`, two rounds) | 66.64/66.37 to 59.42/59.47 | 110.31/110.05 to 100.12/100.08 |
-| A100 40 GB (Colab, `db1761fd`, the first form) | 42.38 to 40.89 | 65.67 to 62.39 |
-| TPU v6e (Colab, `8e92a4a6`, the first form, three rounds) | 18.25-18.28 to 20.88-20.91 | 36.43-36.45 to 36.60-36.64 |
+| device | step, batch 16 | step, batch 32 | sampler, 1 image | sampler, 4 images |
+|---|---:|---:|---:|---:|
+| RTX 4080 (integration `527a32e9`, two rounds) | 66.64/66.37 to 60.21/60.80 | 110.31/110.05 to 100.73/100.83 | | |
+| A100 40 GB (Colab, `db1761fd`, a first form) | 42.38 to 40.89 | 65.67 to 62.39 | | |
+| TPU v6e (Colab, `527a32e9`, three rounds) | 17.25-17.25 to 18.03-18.05 | 34.39 to 32.17-32.20 | 22.0 to 18.8 ms | 63.6 to 65.2 ms |
 
-The first form built the powers as a running product (`cumprod`) and the
-`[L, L]` Toeplitz block from shifted copies of them. On the v6e those
-small serial pieces cost more than the products saved: compiled for a v6e
-chip, the S5 mixer's forward and backward at batch 16 is estimated at
-1.52 million cycles against the old scan's 1.08 million, 0.58 million of
-them in the running product, the copies and their transposes. The powers
-now come by doubling (the powers so far times the next squared power, so
-each rounds at most 2 log2(t) times) and the block is a one-hot product of
-them, exact at full precision, whose transpose is a product too: 1.01
-million cycles. `exp(t log(pole))` would be cheaper still (0.93 million,
-and 0.6-1.3% faster on the RTX 4080) but rounds the phase of a large-angle
-pole t times over: on poles all around the unit circle its states' RMS
-error against complex128 is 1.05e-5, against 1.57e-6 by doubling and
-8.5e-7 by the running product. On the RTX 4080 the doubled form runs the
-hybrid DiT at batch 16 in 60.21/60.80 ms against integration's
-66.64/66.37, and at 32 in 100.73/100.83 against 110.31/110.05; over 4096
-positions its forward RMS error against the oracle is 1.144e-6, the
-running product's 1.156e-6. The v6e step with this form is measured in
-the next TPU session.
+The v6e row is why a TPU keeps the scan: the chunks lost 4.5% at batch
+16 and 2.5% sampling 4 images (with 0.11 GB more at peak) while winning at
+batch 32 and for 1 image, and no form we tried won at every shape. A first
+chunked form built the powers as a running product (`cumprod`) and the
+Toeplitz block from shifted copies; `exp(t log(pole))` was cheaper but
+rounds the phase of a large-angle pole t times over (RMS 1.05e-5 against
+complex128 on poles all around the unit circle, against 1.57e-6 by
+doubling and 8.5e-7 by the running product). Over 4096 positions the
+doubled chunks' forward RMS error against the complex128 oracle is
+1.144e-6, the old scan's 1.156e-6.
 
 Unless a section says otherwise, the sections below were measured on jax
 0.11.1 / jaxlib 0.11.1 / jax_cuda12_plugin 0.11.1, driver 595.84, RTX 4080
