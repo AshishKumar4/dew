@@ -16,8 +16,11 @@ import tarfile
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
+from reference_error import assert_as_exact_as_the_reference
 
 from dew.interop.diffusion import component_tensors, translate_wan_weights
 from dew.interop.pretrained import Pretrained, load_diffusion_source
@@ -126,11 +129,23 @@ ENCODED = {"z_image": "HiddenStatesConditioner", "wan": "WanConditioner"}
 PROMPTS = ["a red bird", "two cats on a mat"]
 
 
-def encoded(directory: Path, conditioner: str, rows: list, placement: dict) -> dict:
-    """`rows` encoded with the pipeline's conditioner loaded alone."""
+def encoded(directory: Path, conditioner: str, rows: list, placement: dict, *, widened: bool = False) -> dict:
+    """`rows` encoded with the pipeline's conditioner loaded alone; `widened`
+    runs its tower in float64 over float64 parameters (under x64), the truth
+    tests/reference_error.py measures from, since a compute dtype is at most
+    float32."""
+    import dataclasses
+
     import dew.inputs.diffusion as conditioners
 
     encoder = getattr(conditioners, conditioner).from_pretrained(str(directory), dtype="float32", **placement)
+    if widened:
+        modules = [field.name for field in dataclasses.fields(encoder)
+                   if isinstance(getattr(encoder, field.name), nn.Module)]
+        towers = {name: getattr(encoder, name).clone(dtype=jnp.float64) for name in modules}
+        params = jax.tree.map(lambda leaf: np.asarray(leaf, np.float64)
+                              if np.issubdtype(leaf.dtype, np.floating) else np.asarray(leaf), encoder.params)
+        encoder = dataclasses.replace(encoder, **towers, params=params)
     return {"conditioning": jax.jit(encoder.encode)(encoder.params, encoder.tokenize(rows))}
 
 
@@ -162,8 +177,11 @@ def test_on_a_mesh_an_encoded_call_is_the_prompted_call(extracted, family):
     encodings the prompted call made it walks to its images bit for bit.
     The conditioner alone encodes two rows where the task encodes them
     padded and sharded, so XLA sums its contractions in another order: those
-    encodings sit within float32 rounding of the task's (1e-5 of their
-    largest value; 9e-7 observed), not on them."""
+    encodings are held to tests/reference_error.py's rule against the same
+    conditioner's float64 encoding, no further from it than twice the
+    task's own, and their masks equal. Observed (RMS distance from float64,
+    the conditioner alone's over the task's): Wan 1.008, Z-Image 1.053; the
+    two float32 encodings lie at most 8.9e-7 apart."""
     directory = extracted[family]
     placement = {"mesh": MeshSpec(fsdp=jax.device_count()), "layout": LAYOUT}
     whole = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla", **placement)
@@ -179,13 +197,17 @@ def test_on_a_mesh_an_encoded_call_is_the_prompted_call(extracted, family):
     walked = lean_task(own, key=3).host().images
     assert np.asarray(walked).tobytes() == np.asarray(task(prompted, key=3).host().images).tobytes()
     alone = encoded(directory, ENCODED[family], PROMPTS, placement)["conditioning"]
-    for got, want in zip(jax.tree.leaves(alone), jax.tree.leaves(prompted.conditions["conditioning"]),
-                         strict=True):
-        got, want = np.asarray(got), np.asarray(want)[:rows]
+    with jax.enable_x64(new_val=True):
+        truth = encoded(directory, ENCODED[family], PROMPTS, {}, widened=True)["conditioning"]
+        truth = [np.asarray(leaf) for leaf in jax.tree.leaves(truth)]
+    task_own = [np.asarray(leaf)[:rows] for leaf in jax.tree.leaves(prompted.conditions["conditioning"])]
+    for got, want, wide in zip(jax.tree.leaves(alone), task_own, truth, strict=True):
         if want.dtype == bool:
-            np.testing.assert_array_equal(got, want)
+            np.testing.assert_array_equal(np.asarray(got), want)
+            np.testing.assert_array_equal(wide, want)
         else:
-            assert np.abs(got - want).max() <= 1e-5 * max(1.0, np.abs(want).max())
+            assert wide.dtype == np.float64
+            assert_as_exact_as_the_reference(np.asarray(got), want, wide, f"{family} conditioner alone")
 
 
 def test_a_pipeline_without_its_text_encoder_reads_none_of_its_weights(extracted, tmp_path):

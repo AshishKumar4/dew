@@ -464,20 +464,22 @@ class TextToImage:
         earn is raised here, and the signature at the end is what the ranks
         compare before any of them touches a device.
         """
-        if (prompts is None) == (conditions is None):
-            raise ValueError("pass the prompts or their encoded conditions, one of the two")
-        rows = None
-        if conditions is None:
-            rows = [prompts] if isinstance(prompts, str) else list(prompts)
-            if not rows or not all(isinstance(prompt, (str, Mapping)) for prompt in rows):
+        given: list | Mapping[str, Conditioning]
+        if prompts is not None and conditions is None:
+            given = [prompts] if isinstance(prompts, str) else list(prompts)
+            if not given or not all(isinstance(prompt, (str, Mapping)) for prompt in given):
                 raise ValueError("prompts must be a non-empty sequence of strings or conditioning records")
-        samples_count = len(rows) if rows is not None else _encoded_rows(conditions)
+            samples_count = len(given)
+        elif conditions is not None and prompts is None:
+            given, samples_count = conditions, _encoded_rows(conditions)
+        else:
+            raise ValueError("pass the prompts or their encoded conditions, one of the two")
         request = request_key(key)
         count = self.steps if steps is None else steps
         process, source_times = self.prepared_process(count)
         selected = _time_grid(times) if times is not None else source_times
         plan = RowPlan.over(mesh, samples_count)
-        tokens, null_tokens, encoded = self._branches(rows, conditions, unconditional, samples_count)
+        tokens, null_tokens, encoded = self._branches(given, unconditional, samples_count)
         shape = self.latent_shape
         if image is not None and image_latents is not None:
             raise ValueError("pass image or image_latents, not both")
@@ -499,11 +501,12 @@ class TextToImage:
         return _Resolved(plan, process, request, tokens, null_tokens, shape, count,
                          selected, samples, posterior, signature, encoded)
 
-    def _branches(self, rows: list | None, conditions: Mapping[str, Conditioning] | None, unconditional,
+    def _branches(self, given: list | Mapping[str, Conditioning], unconditional,
                   count: int) -> tuple[dict, dict | None, frozenset[str]]:
         """The conditional and unconditional branches, one row per sample, as
         tokens the text encoder encodes or as the encodings a caller passed,
-        which the returned set names ("given", "null").
+        which the returned set names ("given", "null"). `given` is the prompt
+        rows, or the encodings `{keyword: condition}`.
 
         Negatives are one row or one per sample. `unconditional` None is the
         task's own blank prompt, encoded where the text encoder is loaded; an
@@ -511,21 +514,20 @@ class TextToImage:
         branch (None), which only an unguided call takes.
         """
         encoded = set()
-        if conditions is None:
-            assert rows is not None
+        if isinstance(given, Mapping):
+            tokens = self._encodings(given, (count,), "conditions")
+            encoded.add("given")
+        else:
             self._text_encoder("a prompt is encoded with it")
-            tokens = {keyword: condition.encoder.tokenize(rows)
+            tokens = {keyword: condition.encoder.tokenize(given)
                       for keyword, condition in self.inputs.conditions.items()}
             for leaf in jax.tree.leaves(tokens):
                 if leaf.ndim < 1 or leaf.shape[0] != count:
                     raise ValueError("tokenized conditions must have one row per prompt")
-        else:
-            tokens = self._encodings(conditions, (count,), "conditions")
-            encoded.add("given")
         if isinstance(unconditional, Mapping):
             null = self._encodings(unconditional, (1, count), "unconditional")
             return tokens, null, frozenset({*encoded, "null"})
-        if unconditional is None and conditions is not None and not self._text_held():
+        if unconditional is None and isinstance(given, Mapping) and not self._text_held():
             return tokens, None, frozenset(encoded)
         self._text_encoder("an unconditional prompt is encoded with it")
         negatives = None
