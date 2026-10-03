@@ -1363,6 +1363,52 @@ With the rule, the same steps against XLA's default (the merger on), measured th
 
 At 128 tokens the shapes disagree, in two more sessions of merged against apart: 1 x 128 runs 20.65 and 20.65 ms merged against 18.98 and 19.11 apart, where 2 x 64 runs 18.72 and 18.63 against 18.96 and 19.03, and 4 x 32 18.56 and 18.50 against 18.91 and 18.81 (1 x 96: 18.22 and 18.22 against 18.41 and 18.43; 1 x 160: 22.33 and 21.95 against 20.57 and 20.37). A boundary below 128 would run 2 x 64 and 4 x 32 1.3-2.1% slower than XLA's default, so it includes 128, and 1 x 128 runs at XLA's default, 1.6 ms behind apart.
 
+### The forward's bf16 weights: `NARROW_COPY_GENERATIONS`, 2026-10-03
+
+A bf16 model over fp32 parameters cast each weight to bf16 in the forward,
+a CUDA kernel per weight every step (on Qwen3-0.6B at 1 x 1024 on the RTX
+4080, 5.7 ms of casts), and widened each weight's bf16 gradient back to
+fp32 in the backward (1.8 ms). On `sm89` the update now writes the bf16
+copy of each such weight (`TrainState.compute`) from the new fp32 value,
+the forward reads the copy, and the gradient reaches the update in bf16,
+widened as the update reads it (`dew.training.narrow`). Only a weight whose
+one use in the loss is that cast is copied: a tied embedding's table (two
+uses, so its cotangents sum in fp32), the norms' scales (not read through
+a lone cast) and a weight a custom VJP reads keep their fp32 read. RTX 4080, the step against
+its parent, two alternating rounds, ms:
+
+| row | before | copies | peak GiB |
+|---|---:|---:|---:|
+| Qwen3-0.6B, 1 x 1024, AdamW (dew_lm) | 96.03 / 96.09 | 90.88 / 90.71 | 9.87 -> 9.86 |
+| Qwen3-0.6B, 2 x 1024 | 147.94 / 148.25 | 142.44 / 142.32 | 11.94 -> 11.94 |
+| 176M hybrid DiT, batch 16 | 60.11 / 60.13 | 57.86 / 57.74 | 5.02 -> 5.03 |
+| 176M hybrid DiT, batch 32 | 100.81 / 100.72 | 99.43 / 99.22 | 6.94 -> 6.96 |
+| SimpleDiT 768, batch 32 | 72.68 / 72.69 | 71.46 / 71.56 | 4.99 -> 5.01 |
+| SimpleDiT 384, batch 16 | 7.38 / 7.41 | 7.21 / 7.27 | 0.67 -> 0.67 |
+| decoder, 3 layers, 16 x 512 | 49.08 / 49.12 | 48.79 / 48.80 | 3.97 -> 3.98 |
+| 99M MoE, 8 x 1024 | 78.13 / 78.09 | 78.06 / 78.03 | 9.56 -> 9.56 |
+
+No row moved to another rung of the fit ladder. The MoE's experts run
+through the grouped matmul, which reads them otherwise, so it gains
+nothing.
+
+The forward and the gradients are the cast's to the bit: under plain SGD
+every parameter is bitwise the same after three steps
+(tests/test_narrow.py). The update's arithmetic rounds otherwise, its fp32
+multiply-adds contracted differently with the widening inside it (Adam's
+second moment within 1 ulp after two steps); every accumulation is still
+fp32. A deterministic Qwen3-0.6B run (dew_lm, AdamW and its clip) is
+bitwise for 13 steps and within 2.7e-3 of the loss at 40, where two default
+runs of the parent differ by 3.9e-3. `tools/lm_step_parity.py`'s decoder
+(100 steps) and the hybrid DiT on one batch (300 steps), twice each way:
+the DiT's four runs are bitwise equal at every step, and the decoder's two
+runs with copies equal one of the parent's two at every step, the parent's
+pair 6.9e-4 apart at most.
+
+A TPU fuses the cast into the matmul, so there the copies would only add
+writes (Qwen3-0.6B's widths at 8 x 1024 compiled for a v6e: 85.8 GiB
+written a step against 79.8, and 2.1 GiB more temporaries).
+
 ### Generations below sm80
 
 A T4 (sm75) rejects the `BF16_BF16_F32` dot algorithm at run time ("UNIMPLEMENTED: Unsupported algorithm on the current device(s): ALG_DOT_BF16_BF16_F32"), cuDNN's fused attention refuses bf16 there ("SDPA FP16/BF16 requires SM80"), and Triton does not compile for it. `dew.nn.kernels.generation.bf16_dot_runs` is the one test: below sm80 bf16 attention takes the reference path for `auto` and `xla`, the bf16 operand precision keeps the caller's precision, and the grouped matmul runs XLA.
