@@ -285,14 +285,18 @@ class MinSNR:
     """Weights the loss with min-SNR-gamma (Hang et al. 2023).
 
     min(SNR, gamma) on the x_0 loss, converted into the space the model
-    trains in. It replaces the schedule's own weight.
+    trains in. It replaces the schedule's own weight. At zero SNR (a table
+    whose last step keeps no signal) the weight is one, as the authors'
+    code sets it: the epsilon conversion is 0 / 0 there.
     """
 
     gamma: float
 
     def __call__(self, schedule, prediction, t):
         snr = schedule.snr(t)
-        return jnp.minimum(snr, self.gamma) / prediction.target_error_scale(snr)
+        scale = prediction.target_error_scale(snr)
+        weight = jnp.minimum(snr, self.gamma) / jnp.where(snr == 0, 1.0, scale)
+        return jnp.where(snr == 0, 1.0, weight)
 
 
 @dataclass(frozen=True)

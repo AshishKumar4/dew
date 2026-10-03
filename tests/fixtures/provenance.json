@@ -2491,6 +2491,27 @@
    ],
    "note": "Loads the saved Wan VAE fixture in bfloat16 and records posterior/decode and input gradients."
   },
+  "weighting/weights.npz": {
+   "tool": "tools/weighting_reference.py",
+   "sources": [
+    {
+     "repo": "jychoi118/P2-weighting",
+     "version": "3da0947ac350072e457c211401218175bc94e137",
+     "runs": "fetched"
+    },
+    {
+     "repo": "TiankaiHang/Min-SNR-Diffusion-Training",
+     "version": "5189997d6bbde5a1301bcf31a54d2b3589f7309c",
+     "runs": "fetched"
+    },
+    {
+     "repo": "pytorch/pytorch",
+     "version": "2.14.0",
+     "runs": "torch"
+    }
+   ],
+   "note": "Each repo's own GaussianDiffusion.training_losses at every step; the beta tables in it are inputs."
+  },
   "z_image_source.tar.xz": {
    "tool": "tools/diffusers_z_image_reference.py",
    "sources": [
