@@ -332,18 +332,36 @@ def _trainer(case, fields: dict[str, int], *, one_device: bool = False, accumula
     """The trainer of `case` on the layout `fields` names over the first
     `devices` devices (every device by default), or on this process's first
     device, stashing each gradient the optimizer is handed. Its initial
-    parameters have no all-zero leaf (`_drawn`)."""
+    parameters have no all-zero leaf (`_drawn`). In a one-process run it
+    places the case's initial state from one device (`_initial`) once that
+    has been computed, rather than computing its own: the same state, without
+    a compile of the model's initialization on every layout."""
     import benchmark_step as bench
     import jax
     import optax
 
     from dew.training import Layout, MeshSpec, Trainer
+    from dew.training.trainer import refuse_wide_floats
 
     class Drawn(Trainer):
         def initial_state(self, initializer=None, key=None):
             state = super().initial_state(initializer, key)
             params = {**state.variables, "params": _drawn(state.variables["params"], jax.random.key(7))}
             return dataclasses.replace(state, variables=params, opt_state=self.optimizer.init(params["params"]))
+
+        def place(self):
+            held = _initial.get((repr(case), accumulation)) if jax.process_count() == 1 else None
+            # Copies every time, in and out: the step donates the state it is handed.
+            if held is None:
+                state, shardings, position = super().place()
+                if one_device:
+                    _initial[(repr(case), accumulation)] = jax.tree.map(lambda leaf: leaf.copy(), state)
+                return state, shardings, position
+            abstract = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), held)
+            refuse_wide_floats(abstract, self.device_mesh)
+            shardings = self.shardings(abstract)
+            self.layout.check(abstract.variables, shardings.variables, self.device_mesh)
+            return jax.device_put(jax.tree.map(lambda leaf: leaf.copy(), held), shardings), shardings, None
 
     trainer = Drawn(bench.build_objective(case), optax.chain(stash(), optax.adam(1e-3)),
                       key=jax.random.key(0), mesh=bench.mesh_spec(fields),
@@ -354,6 +372,13 @@ def _trainer(case, fields: dict[str, int], *, one_device: bool = False, accumula
     elif devices is not None:
         trainer.device_mesh = trainer.mesh.build(jax.devices()[:devices])
     return trainer
+
+
+_initial: dict[tuple[str, int], Any] = {}
+"""Each case's initial state by its accumulation window, as the first
+one-device trainer placed it on this process's first device: every layout's
+trainer draws the same state from the same key, so later trainers copy it
+onto their mesh."""
 
 
 def _gradient(state) -> dict[str, NDArray]:
@@ -488,7 +513,7 @@ def anchor_step(case, batch) -> tuple[float, dict[str, NDArray]]:
     from dew.objectives.base import Step
     from dew.training.transaction import with_ema
 
-    state = jax.jit(_trainer(case, {}, one_device=True).initial_state)()
+    state, _, _ = _trainer(case, {}, one_device=True).place()
 
     def widened(tree):
         return jax.tree.map(lambda leaf: leaf.astype(jnp.float64)
