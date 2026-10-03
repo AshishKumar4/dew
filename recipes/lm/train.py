@@ -26,6 +26,7 @@ import tyro
 
 from dew.config import ModelConfig
 from dew.data import ByteTokenizer, HFTokenizer, PackedTokens, TokenWindows
+from dew.inference import RunProcessor
 from dew.objectives.lm import LMObjective, LMRunConfig, Perplexity, Samples
 from dew.registry import datasets, models
 from dew.training import TrainState, prepare_process, run_timestamp
@@ -318,6 +319,8 @@ def main(config: LmRunConfig) -> TrainState:
     options = {
         "ema_decay": config.ema_decay,
         "samples": samples,
+        # The run's tokenizer, which its checkpoints record for every loader.
+        "processor": RunProcessor(run_tokenizer(config.tokenizer)),
         "balance_rate": config.balance_rate,
         "aux_loss_alpha": config.aux_loss_alpha,
         "seq_aux": config.seq_aux,

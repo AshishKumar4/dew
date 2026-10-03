@@ -82,8 +82,8 @@ def loss_and_gradient(model, variables, ids):
     objective = LMObjective(model, ids.shape[1] - 1, pretrained=variables, ema_decay=None)
     step = Step(step=jnp.int32(0), key=jax.random.key(0), ema=None)
 
-    def loss(variables):
-        statistics, _ = objective.loss({**variables, "params": variables}, {"text": ModelInputs(ids)}, step)
+    def loss(params):
+        statistics, _ = objective.loss({**variables, "params": params}, {"text": ModelInputs(ids)}, step)
         return objective.reduce_loss(statistics)[0]
 
     return jax.jit(jax.value_and_grad(loss))(variables["params"])
