@@ -78,30 +78,30 @@ const tutorialNames: Record<string, string> = {
 			</figure>)}</div>
 		</section>
 		<section class="band run" data-reveal>
-			<h2 class="band-title">Train, evaluate, sample</h2>
+			<h2 class="band-title">Training</h2>
 			<p class="band-lede">A decoder learns Tiny Shakespeare on {capture.meta.where}, then generates ROMEO and JULIET samples.</p>
 			<div class="run-grid">
 				<Code code={shortHero.trimEnd()} lang="python" title="train.py" />
-				<HeroOutput screen={hero.screen} meta={capture.meta} seconds={hero.seconds} replay={hero.replay} rows={hero.rows} columns={hero.columns} source_rows={hero.source_rows} />
+				<HeroOutput screen={hero.screen} meta={capture.meta} seconds={hero.seconds} replay={hero.replay} rows={hero.rows} columns={hero.columns} source_rows={hero.source_rows} playbackSeconds={terminalReplay.duration} />
 			</div>
 			<p class="framework-note"><a href="https://github.com/AshishKumar4/dew/blob/main/site/src/data/hero.py">Full script</a></p>
 		</section>
 
 		<section class="band" data-reveal>
-			<h2 class="band-title">One trainer for every objective</h2>
+			<h2 class="band-title">Language modeling</h2>
 			<p class="band-lede">The objective defines the loss, initialization and evaluation. The same <code>Trainer.fit</code> owns optimization, reporting and checkpoints.</p>
 			<Code code={snippet('lm')} lang="python" title="framework.py" />
 			<p class="framework-note"><a href={fullScript}>Full script</a></p>
 		</section>
 
 		<section class="band" data-reveal>
-			<h2 class="band-title">Predict representations</h2>
+			<h2 class="band-title">Representation learning</h2>
 			<p class="band-lede">A JEPA encoder learns by predicting masked patch representations from the visible context.</p>
 			<Code code={snippet('jepa')} lang="python" title="framework.py" />
 		</section>
 
 		<section class="band" data-reveal>
-			<h2 class="band-title">Pretrained models</h2>
+			<h2 class="band-title">Fine-tuning</h2>
 			<p class="band-lede">Load a Hub checkpoint into a native Flax model, generate, fine-tune with the same trainer, and export under its source tensor names.</p>
 			{live.endpoint && live.turnstileSitekey && <LiveText cell={textCell} recorded={textRecording.text} models={[{ id: 'HuggingFaceTB/SmolLM2-135M-Instruct', label: 'SmolLM2 135M Instruct' }]} />}
 			<Code code={snippet('pretrained-source', 'finetune-load', 'finetune')} lang="python" title="framework.py — Qwen3-0.6B" />
@@ -124,17 +124,17 @@ const tutorialNames: Record<string, string> = {
 		</section>
 
 		<section class="band" data-reveal>
-			<h2 class="band-title">Generation and serving</h2>
+			<h2 class="band-title">Serving</h2>
 			<p class="band-lede">A <code>TextGeneration</code> task binds the model, weights and decoding policy. The server batches requests over the same task, keeping each request's seed and cache.</p>
 			<Code code={snippet('serving')} lang="python" title="framework.py — batched decoding" />
 			<pre class="shown-output">{records.serving.result.text.join('\n')}</pre>
 			<p class="framework-note">Store weights in int8 or fp8:</p>
 			<Code code={snippet('int8', 'fp8')} lang="python" title="framework.py — weight-only int8 and fp8" />
-			<p class="framework-note"><a href="/guides/inference/">Generation and serving</a> covers paging, prefix sharing, constrained decoding and the measured quantization errors.</p>
+			<p class="framework-note"><a href="/guides/inference/">Serving</a> covers paging, prefix sharing, constrained decoding and the measured quantization errors.</p>
 		</section>
 
 		<section class="band" data-reveal>
-			<h2 class="band-title">Scale out</h2>
+			<h2 class="band-title">Distributed</h2>
 			<p class="band-lede">Change the mesh, not the training loop. FSDP shards parameter storage, tensor parallelism splits model widths, and an expert axis shards an MoE's experts; the data axis fills the remaining devices.</p>
 			<Code code={snippet('mesh')} lang="python" title="framework.py — the same objective and data" />
 			<figure class="mesh-overview">
@@ -145,7 +145,7 @@ const tutorialNames: Record<string, string> = {
 		</section>
 
 		<section class="band" data-reveal>
-			<h2 class="band-title">Post-training and RL</h2>
+			<h2 class="band-title">Post-training</h2>
 			<p class="band-lede">GRPO scores groups of completions with a reward function. Here the reward is the fraction of adjacent tokens counting up by one, modulo 13.</p>
 			<Code code={snippet('grpo')} lang="python" title="framework.py — rollout and reward" />
 			<figure class="reward-figure">
