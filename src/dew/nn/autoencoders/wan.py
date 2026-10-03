@@ -8,13 +8,17 @@ frames make 1 + k latent frames and an image is the one-frame video.
 
 The source walks a video in chunks and carries each convolution's last two
 input frames across them, which is the causal convolution over the whole
-video this computes in one pass. The resampling blocks keep the first frame
-out of their temporal convolution, as the source's first chunk does: a
-downsampling block convolves with stride 2 and no padding, so output frame
-j > 0 reads frames 2j - 2 to 2j; an upsampling block turns every later frame
-into two by a causal convolution that doubles the channels. The decoder
-clamps pixels to [-1, 1] (`_decode`), and RMS gammas keep the stored
-`[C, 1, 1(, 1)]` shape.
+video. `WanVAE.encode` and `WanVAE.decode` compute it in one pass;
+`chunked_moments` and `chunked_decode` walk it as the source does, the first
+frame alone and then four frames to one latent frame at a time, with each
+convolution's frames carried in the "cache" collection, so the activations
+held are one chunk's, not the clip's. `WanAutoencoder` encodes and decodes
+in chunks. The resampling blocks keep the first frame out of their temporal
+convolution, as the source's first chunk does: a downsampling block
+convolves with stride 2 and no padding, so output frame j > 0 reads frames
+2j - 2 to 2j; an upsampling block turns every later frame into two by a
+causal convolution that doubles the channels. The decoder clamps pixels to
+[-1, 1] (`_decode`), and RMS gammas keep the stored `[C, 1, 1(, 1)]` shape.
 """
 from __future__ import annotations
 
@@ -77,6 +81,30 @@ def causal_conv(features: int, kernel: int, spatial: int, dtype: Dtype, name: st
                 name=name)
 
 
+def _chunked_call(module: nn.Module) -> bool:
+    """Whether `module` runs one chunk of a longer video: it may write the
+    "cache" collection, outside `init`, where every collection is writable."""
+    return module.is_mutable_collection("cache") and not module.is_initializing()
+
+
+def _causal(parent: nn.Module, features: int, kernel: int, spatial: int, name: str, x):
+    """`causal_conv` as `parent`'s child `name`, applied to `x`.
+
+    Where `x` is one chunk of a longer video (`_chunked_call`), the last
+    `kernel - 1` input frames of the chunks before stand in for the
+    convolution's zero frames, zeros before the first chunk, and the chunk's
+    own last frames replace them."""
+    if spatial != 3 or kernel == 1 or not _chunked_call(parent):
+        return causal_conv(features, kernel, spatial, parent.dtype, name)(x)
+    held = parent.variable("cache", f"{name}_frames", jnp.zeros, (x.shape[0], kernel - 1, *x.shape[2:]),
+                           x.dtype)
+    x = jnp.concatenate([held.value, x], axis=1)
+    held.value = x[:, 1 - kernel:]
+    pad = kernel // 2
+    return Conv(features, (kernel,) * 3, padding=((0, 0), (pad, pad), (pad, pad)), dtype=parent.dtype,
+                name=name)(x)
+
+
 def _frames(module: nn.Module, x):
     """Apply a 2-D module to every frame of `[B, T, H, W, C]`."""
     batch, frames = x.shape[:2]
@@ -100,9 +128,9 @@ class WanResidualBlock(nn.Module):
         if self.in_features != self.features:
             shortcut = causal_conv(self.features, 1, spatial, self.dtype, "conv_shortcut")(x)
         x = nn.silu(WanRMSNorm(self.in_features, 4, self.dtype, name="norm1")(x))
-        x = causal_conv(self.features, 3, spatial, self.dtype, "conv1")(x)
+        x = _causal(self, self.features, 3, spatial, "conv1", x)
         x = nn.silu(WanRMSNorm(self.features, 4, self.dtype, name="norm2")(x))
-        return causal_conv(self.features, 3, spatial, self.dtype, "conv2")(x) + shortcut
+        return _causal(self, self.features, 3, spatial, "conv2", x) + shortcut
 
 
 class WanAttention(nn.Module):
@@ -135,7 +163,9 @@ class WanMidBlock(nn.Module):
 
 class _Downsample(nn.Module):
     """`WanResample` down: halve each frame, padded one pixel at the bottom
-    and right; with `temporal`, halve time after the first frame."""
+    and right; with `temporal`, halve time after the first frame. Chunked,
+    a later chunk's time convolution reads the last frame before it first,
+    as the source's does."""
 
     features: int
     temporal: bool
@@ -149,14 +179,22 @@ class _Downsample(nn.Module):
         x = _frames(conv, x)
         if not self.temporal:
             return x
-        later = Conv(self.features, (3, 1, 1), strides=(2, 1, 1), padding="VALID", dtype=self.dtype,
-                     name="time_conv")(x)
-        return jnp.concatenate([x[:, :1], later], axis=1)
+        time_conv = Conv(self.features, (3, 1, 1), strides=(2, 1, 1), padding="VALID", dtype=self.dtype,
+                         name="time_conv")
+        if _chunked_call(self):
+            # No frame held yet: this chunk opens the video.
+            started = self.has_variable("cache", "time_frames")
+            held = self.variable("cache", "time_frames", jnp.zeros, (x.shape[0], 1, *x.shape[2:]), x.dtype)
+            previous, held.value = held.value, x[:, -1:]
+            if started:
+                return time_conv(jnp.concatenate([previous, x], axis=1))
+        return jnp.concatenate([x[:, :1], time_conv(x)], axis=1)
 
 
 class _Upsample(nn.Module):
     """`WanResample` up: with `temporal`, every frame after the first becomes
-    two; then each frame doubles in size and halves its channels."""
+    two; then each frame doubles in size and halves its channels. Chunked,
+    the time convolution carries the last two frames after the first."""
 
     features: int
     temporal: bool
@@ -165,15 +203,25 @@ class _Upsample(nn.Module):
     @nn.compact
     def __call__(self, x):
         if self.temporal:
-            time_conv = Conv(2 * self.features, (3, 1, 1), padding=((2, 0), (0, 0), (0, 0)), dtype=self.dtype,
-                             name="time_conv")
-            if x.shape[1] > 1:
-                batch, frames, height, width, channels = x.shape
-                later = time_conv(x[:, 1:]).reshape(batch, frames - 1, height, width, 2, channels)
-                later = later.transpose(0, 1, 4, 2, 3, 5).reshape(
-                    batch, 2 * (frames - 1), height, width, channels
-                )
-                x = jnp.concatenate([x[:, :1], later], axis=1)
+            cached = _chunked_call(self)
+            time_conv = Conv(2 * self.features, (3, 1, 1), padding=((0 if cached else 2, 0), (0, 0), (0, 0)),
+                             dtype=self.dtype, name="time_conv")
+            # The first frame passes through, so the time convolution reads
+            # the frames after it; chunked, every frame of a later chunk.
+            started = cached and self.has_variable("cache", "time_frames")
+            first, later = (x[:, :0], x) if started else (x[:, :1], x[:, 1:])
+            if cached:
+                held = self.variable("cache", "time_frames", jnp.zeros, (x.shape[0], 2, *x.shape[2:]),
+                                     x.dtype)
+                later = jnp.concatenate([held.value, later], axis=1)
+                held.value = later[:, -2:]
+            if later.shape[1] > (2 if cached else 0):
+                batch, _, height, width, channels = later.shape
+                later = time_conv(later)
+                frames = later.shape[1]
+                later = later.reshape(batch, frames, height, width, 2, channels)
+                later = later.transpose(0, 1, 4, 2, 3, 5).reshape(batch, 2 * frames, height, width, channels)
+                x = jnp.concatenate([first, later], axis=1)
         x = jnp.repeat(jnp.repeat(x, 2, axis=2), 2, axis=3)
         conv = Conv(self.features // 2, (3, 3), padding=((1, 1), (1, 1)), dtype=self.dtype, name="resample_1")
         return _frames(conv, x)
@@ -190,7 +238,7 @@ class _Encoder(nn.Module):
     @nn.compact
     def __call__(self, x):
         dims = [self.base * m for m in (1, *self.multipliers)]
-        x = causal_conv(dims[0], 3, 3, self.dtype, "conv_in")(x)
+        x = _causal(self, dims[0], 3, 3, "conv_in", x)
         index = 0
         for level, (in_features, features) in enumerate(pairwise(dims)):
             for _ in range(self.blocks):
@@ -201,7 +249,7 @@ class _Encoder(nn.Module):
                 index += 1
         x = WanMidBlock(dims[-1], self.dtype, name="mid_block")(x)
         x = nn.silu(WanRMSNorm(dims[-1], 4, self.dtype, name="norm_out")(x))
-        return causal_conv(2 * self.latent, 3, 3, self.dtype, "conv_out")(x)
+        return _causal(self, 2 * self.latent, 3, 3, "conv_out", x)
 
 
 class _UpBlock(nn.Module):
@@ -233,7 +281,7 @@ class _Decoder(nn.Module):
     @nn.compact
     def __call__(self, z):
         dims = [self.base * m for m in (self.multipliers[-1], *self.multipliers[::-1])]
-        x = causal_conv(dims[0], 3, 3, self.dtype, "conv_in")(z)
+        x = _causal(self, dims[0], 3, 3, "conv_in", z)
         x = WanMidBlock(dims[0], self.dtype, name="mid_block")(x)
         upsampling = self.temporal[::-1]
         for level, (in_features, features) in enumerate(pairwise(dims)):
@@ -241,7 +289,7 @@ class _Decoder(nn.Module):
             x = _UpBlock(in_features // 2 if level > 0 else in_features, features, self.blocks, upsample,
                          upsample and upsampling[level], self.dtype, name=f"up_blocks_{level}")(x)
         x = nn.silu(WanRMSNorm(dims[-1], 4, self.dtype, name="norm_out")(x))
-        return causal_conv(3, 3, 3, self.dtype, "conv_out")(x)
+        return _causal(self, 3, 3, 3, "conv_out", x)
 
 
 class WanVAEFields(TypedDict):
@@ -279,8 +327,9 @@ class WanVAE(nn.Module):
         self.decoder = _Decoder(self.base, self.multipliers, self.blocks, self.temporal, self.dtype)
 
     def moments(self, video):
-        """The posterior's mean and log-variance, stacked on the channel axis."""
-        if (video.shape[1] - 1) % self.temporal_factor:
+        """The posterior's mean and log-variance, stacked on the channel axis.
+        A chunk (`chunked_moments`) is any run of frames after the first."""
+        if (video.shape[1] - 1) % self.temporal_factor and not _chunked_call(self):
             raise ValueError(f"a Wan VAE encodes 1 + {self.temporal_factor}k frames, not {video.shape[1]}")
         return self.quant_conv(self.encoder(video))
 
@@ -292,6 +341,41 @@ class WanVAE(nn.Module):
 
     def __call__(self, video):
         return self.decode(self.encode(video))
+
+
+def _chunked(model: WanVAE, variables: Variables, sequence, step: int, method):
+    """`method` over `sequence` `[B, T, ...]` as the source walks it: the
+    first frame alone, then `step` frames at a time in one `lax.scan`, each
+    convolution's last frames carried between chunks in the "cache"
+    collection, the outputs joined in time."""
+    head, cache = model.apply(variables, sequence[:, :1], method=method, mutable=["cache"])
+    if sequence.shape[1] == 1:
+        return head
+    batch, frames = sequence.shape[:2]
+    chunks = sequence[:, 1:].reshape(batch, (frames - 1) // step, step, *sequence.shape[2:])
+    chunks = jnp.moveaxis(chunks, 1, 0)
+
+    def walk(cache, chunk):
+        out, cache = model.apply({**variables, **cache}, chunk, method=method, mutable=["cache"])
+        return cache, out
+
+    _, tail = jax.lax.scan(walk, cache, chunks)
+    tail = jnp.moveaxis(tail, 0, 1)
+    return jnp.concatenate([head, tail.reshape(batch, -1, *tail.shape[3:])], axis=1)
+
+
+def chunked_moments(model: WanVAE, variables: Variables, video):
+    """`WanVAE.moments` as the source encodes: the first frame, then four
+    frames to a latent frame at a time, holding one chunk's activations."""
+    if (video.shape[1] - 1) % model.temporal_factor:
+        raise ValueError(f"a Wan VAE encodes 1 + {model.temporal_factor}k frames, not {video.shape[1]}")
+    return _chunked(model, variables, video, model.temporal_factor, WanVAE.moments)
+
+
+def chunked_decode(model: WanVAE, variables: Variables, latents):
+    """`WanVAE.decode` as the source decodes: one latent frame at a time,
+    holding one chunk's activations rather than the clip's."""
+    return _chunked(model, variables, latents, 1, WanVAE.decode)
 
 
 def wan_vae_fields(config: Mapping[str, object]) -> WanVAEFields:
@@ -348,7 +432,8 @@ class WanAutoencoder(AutoEncoder):
 
     A video `[B, T, H, W, C]` is encoded as one causal sequence, 1 + 4k
     frames to 1 + k latent frames, and an image `[B, H, W, C]` as a
-    one-frame video.
+    one-frame video, both in the source's chunks (`chunked_moments`,
+    `chunked_decode`), so a clip's length does not set the memory they hold.
     """
 
     def __init__(self, *, model: WanVAE, params: Variables, latents_mean, latents_std):
@@ -362,10 +447,9 @@ class WanAutoencoder(AutoEncoder):
                 f"latents_mean {self.latent_shift.shape} and latents_std {self.latent_scale.shape} "
                 f"must both hold one value per latent channel {expected}"
             )
-        self._encode = jax.jit(lambda params, video, key=None: model.apply(
-            {"params": params}, video, key, method=model.encode))
-        self._decode = jax.jit(lambda params, latents: model.apply(
-            {"params": params}, latents, method=model.decode))
+        self._encode = jax.jit(lambda params, video, key=None: posterior_latent(
+            chunked_moments(model, {"params": params}, video), key))
+        self._decode = jax.jit(lambda params, latents: chunked_decode(model, {"params": params}, latents))
 
     @property
     def downscale_factor(self) -> int:
