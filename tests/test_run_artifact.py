@@ -44,6 +44,46 @@ def test_a_composite_model_record_nests_its_part_and_rebuilds_it():
     assert record.build() == original.clone(text=original.text.clone(dtype=jnp.float32))
 
 
+def documented_block(page, after):
+    """The first Python block of `page` that follows the sentence `after`."""
+    from pathlib import Path
+
+    text = (Path(__file__).resolve().parents[1] / page).read_text()
+    start = text.index("```python\n", text.index(after)) + len("```python\n")
+    return text[start:text.index("```", start)]
+
+
+def test_the_documented_registration_line_records_the_model_and_its_run_loads_back(tmp_path, monkeypatch):
+    """docs/key-concepts.md's registration example, run as written: the
+    decorator is the whole of it, the constructor fields are the record, and
+    a run of the model loads back by that record."""
+    from dew import Field, InputSpec
+    from dew.diffusion.presets import Flow
+    from dew.objectives.diffusion import DiffusionObjective
+    from dew.registry import models
+    from dew.sampling import TextToImage
+
+    monkeypatch.setattr(models, "_members", dict(models._members))
+    scope: dict = {}
+    exec(documented_block("docs/key-concepts.md", "Your own model registers with one line"), scope)
+    model = scope["ResidualMLP"](features=16)
+    objective = DiffusionObjective(model, Flow(), InputSpec(Field("image", (4, 4, 3))),
+                                   guidance=None, steps=2)
+    rows = [{"image": np.full((4, 4, 3), 128, np.uint8)} for _ in range(8)]
+    data = Dataset.from_grain(grain.MapDataset.source(rows), batch=8, loading=Loading(workers=0))
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+    state = Trainer(objective, optax.sgd(.01), key=0, checkpoints=checkpoints).fit(
+        data, steps=1, checkpoint_every=1)
+    checkpoints.wait()
+
+    recorded = checkpoints.artifact()["model"]
+    assert (recorded["architecture"], recorded["config"]) == ("residual_mlp", {"features": 16})
+    restored = TextToImage.from_run(str(tmp_path / "run"))
+    assert type(restored.model) is scope["ResidualMLP"] and restored.model.features == 16
+    np.testing.assert_array_equal(restored([""], key=3).host().images,
+                                  objective.pipeline(state)([""], key=3).host().images)
+
+
 def test_an_unregistered_model_trains_and_saves_and_loads_once_registered(tmp_path, monkeypatch, caplog):
     """A class no registry names trains and checkpoints as any other; loading
     the run by its record names the line that registers it, and after that

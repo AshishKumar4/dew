@@ -921,10 +921,9 @@ from dew.config.sweep import grid_search
 from dew.data import TokenWindows
 
 config = RunConfig(
-    model=ModelConfig("causal_transformer", {"vocab_size": 8, "emb_features": 32,
-                                             "num_layers": 1, "num_heads": 2,
-                                             "mlp_features": 64, "max_seq_len": 32}),
-    # The synthetic batches above stand in for the dataset this names.
+    # The run records the model it trains, and the batches above stand in
+    # for the dataset this names.
+    model=ModelConfig.from_model(objective.model),
     data=TokenWindows(seq_len=16),
     optim=OptimConfig(optimizer="adam"),
     trainer=TrainerConfig(name="lm-rate", checkpoint_dir="runs/sweep", steps=40, batch_size=8,
@@ -1026,6 +1025,7 @@ configuration at generation time.
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import optax
 
 from dew import Checkpoints, Trainer
@@ -1033,13 +1033,14 @@ from dew.config import ModelConfig, TrainerConfig
 from dew.data import Loading, TFDSImages
 from dew.diffusion import presets
 from dew.inference import TextToImage
+from dew.nn.backbones import SimpleDiT
 from dew.objectives.diffusion import DiffusionRunConfig
 from dew.sampling import Heun
 
 run = Path("runs/flowers-run")
 config = DiffusionRunConfig(
-    model=ModelConfig("simple_dit", {"patch_size": 4, "emb_features": 128,
-                                     "num_layers": 4, "num_heads": 4}),
+    model=ModelConfig.from_model(SimpleDiT(patch_size=4, emb_features=128, num_layers=4,
+                                           num_heads=4, dtype=jnp.bfloat16)),
     data=TFDSImages(
         path=str(Path.home() / ".cache/dew/datasets/oxford_flowers102/2.1.1"),
         image_size=64,
