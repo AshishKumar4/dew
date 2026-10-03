@@ -222,6 +222,9 @@ PER_ARCH = {
                           "timestep_guidance_channels": 32, "axes_dims_rope": (4, 4, 4, 4)},
     "z_image_transformer": {"in_channels": 4, "dim": 32, "n_layers": 1, "n_refiner_layers": 1, "n_heads": 2,
                             "cap_feat_dim": 16, "axes_dims": (4, 6, 6), "axes_lens": (64, 16, 16)},
+    "wan_transformer": {"num_attention_heads": 2, "attention_head_dim": 12, "in_channels": 4,
+                        "out_channels": 4, "text_dim": 16, "freq_dim": 16, "ffn_dim": 32,
+                        "num_layers": 1, "rope_max_seq_len": 16},
 }
 COMPOSITES = ("diffusion_gemma", "multimodal_transformer")
 RES, FRAMES = 16, 2
@@ -272,6 +275,7 @@ def build_model(architecture, dtype="bfloat16"):
             "edm2_unet",
             "flux2_transformer",
             "z_image_transformer",
+            "wan_transformer",
         )
         fields = PER_ARCH[architecture] if architecture in own else {**TINY, **PER_ARCH[architecture]}
         return models.build(architecture, **resolved(architecture, fields))
@@ -314,6 +318,11 @@ def tiny_inputs(architecture, rng):
         latents = jax.random.normal(rng, (1, 4, 4, 4))
         return (latents, jnp.ones((1,))), {"conditioning": DenoisingCondition(
             text.hidden[:, :, :16], mask=text.mask)}
+    if architecture == "wan_transformer":
+        # 32 patch tokens: the source's time embedder is fp32 on purpose, and
+        # fewer tokens would leave it a toy-sized share of the matmuls.
+        latents = jax.random.normal(rng, (1, FRAMES, 8, 8, 4))
+        return (latents, jnp.ones((1,))), {"conditioning": DenoisingCondition(text.hidden[:, :, :16])}
     if architecture == "qwen_image_transformer":
         latents = jax.random.normal(rng, (1, 4, 4, 4))
         return (latents, jnp.ones((1,))), {"conditioning": DenoisingCondition(
