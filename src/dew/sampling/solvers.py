@@ -18,11 +18,11 @@ substitute an update.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import reduce
 from typing import Literal, NamedTuple, Protocol
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import lax
 from typing_extensions import TypeVar
 
@@ -1022,49 +1022,128 @@ class DEIS:
 
 
 class UniPCState(NamedTuple):
-    """`UniPC`'s state: the output history, the sample its last predictor
-    left from, and that predictor's order, which its corrector takes: 0
-    before the first predictor, when there is nothing to correct."""
+    """`UniPC`'s state: the last `order` model outputs, most recent last; the
+    sample its last predictor left from; that predictor's order, which its
+    corrector takes (0 before the first predictor, when there is nothing to
+    correct); the steps taken and the walk's count; and the walk's grid with
+    every interval's coefficients (`_unipc_tables`)."""
 
-    history: Multistep
+    outputs: jax.Array
     last_x: jax.Array
     last_order: jax.Array
+    taken: jax.Array
+    steps: jax.Array
+    grid: jax.Array
+    corrector: jax.Array
+    predictor: jax.Array
 
 
-def _unipc_weights(rks, hh, B_h, order: int, predictor: bool):
+def _unipc_weights(rks: list[np.float64], hh: np.float64, B_h: np.float64, order: int,
+                   predictor: bool) -> list[np.float64]:
     """UniPC's B(h) weights at `order`: the solution of R rho = b built from
     the relative positions `rks` of the history points (the current point's
     own 1 last). The predictor has no difference at the point it steps to,
     so it drops the last row and column; Diffusers takes 0.5 outright for
     the second-order predictor and the first-order corrector."""
     if order == (2 if predictor else 1):
-        return [0.5]
-    shape = hh.shape
-    batch = shape[0]
-    def flat(coefficient: jax.Array) -> jax.Array:
-        return jnp.reshape(coefficient, (batch,))
-
-    rks = [flat(rk) for rk in rks[:-1]] + [jnp.ones((batch,), hh.dtype)]
-    hh, B_h = flat(hh), flat(B_h)
+        return [np.float64(0.5)]
     columns = order - 1 if predictor else order
-    nodes = rks[:columns]
+    nodes = [*rks[:-1], np.float64(1.0)][:columns]
     # Scale the infinite node's Vandermonde column by r**(columns-1).
     # Its lower entries and recovered weight vanish; the leading entry
     # stays finite. This is the limit of the same system, not a lower-order solver.
-    inverse = [jnp.where(jnp.isinf(rk), 0.0, 1.0) for rk in nodes]
-    normalized = [jnp.where(jnp.isinf(rk), jnp.sign(rk), rk) for rk in nodes]
+    inverse = [np.float64(0.0 if np.isinf(rk) else 1.0) for rk in nodes]
+    normalized = [np.sign(rk) if np.isinf(rk) else rk for rk in nodes]
     rows, b = [], []
-    h_phi_k = jnp.expm1(hh) / hh - 1
+    h_phi_k = np.expm1(hh) / hh - 1
     factorial = 1
     for i in range(1, columns + 1):
-        rows.append(jnp.stack([rk ** (i - 1) * inv ** (columns - i)
-                               for rk, inv in zip(normalized, inverse, strict=True)], axis=-1))
+        rows.append([rk ** (i - 1) * inv ** (columns - i)
+                     for rk, inv in zip(normalized, inverse, strict=True)])
         b.append(h_phi_k * factorial / B_h)
         factorial *= i + 1
         h_phi_k = h_phi_k / hh - 1 / factorial
-    solution = jnp.linalg.solve(jnp.stack(rows, axis=-2), jnp.stack(b, axis=-1)[..., None])[..., 0]
-    return [jnp.reshape(solution[:, k] * inverse[k] ** (columns - 1), shape)
-            for k in range(columns)]
+    solution = np.linalg.solve(np.asarray(rows, np.float64), np.asarray(b, np.float64))
+    return [solution[k] * inverse[k] ** (columns - 1) for k in range(columns)]
+
+
+def _unipc_tables(alpha: np.ndarray, sigma: np.ndarray, solver: UniPC) -> tuple[np.ndarray, np.ndarray]:
+    """Every interval's UniPC update as coefficients, in float64 on the host.
+
+    Each depends only on the grid's rates and the order it is taken at, so
+    lambda, h, e^h - 1 and the weight systems are solved once here rather
+    than in float32 inside the walk, where Diffusers' scheduler also solves
+    them. `corrector[j, p]` corrects the sample at grid point j with order
+    p: weights on the sample, the last predictor's sample, m_{j-1}, the
+    difference m_j - m_{j-1} and the history's differences
+    m_{j-1-k} - m_{j-1}; p = 0 keeps the sample. `predictor[j, q-1]` steps
+    from point j to j+1 with order q: weights on the corrected sample, the
+    clean prediction, eps and the differences m_{j-k} - m_j. The
+    differences stay in the walk, taken before any weight, as the source
+    takes them.
+
+    Only the pairs a walk can take are solved: the order a step reaches
+    (`reach`, the history and `lower_order_final`'s cap) and below, as a
+    walk restarted on the grid takes them, and no correction where
+    `disable_corrector` names the step before. Every other pair holds
+    zeros, or keeps the sample for a correction.
+    """
+    order, predict_x0 = solver.order, solver.predict_x0
+    # An endpoint's lambda is infinite: log(0) at sigma 0 or alpha 0.
+    with np.errstate(divide="ignore"):
+        lambdas = np.log(alpha) - np.log(sigma)
+    intervals = alpha.shape[0] - 1
+    corrector = np.zeros((max(intervals, 0), order + 1, order + 3))
+    predictor = np.zeros((max(intervals, 0), order, order + 2))
+    corrector[:, :, 0] = 1.0
+    here = 1 if predict_x0 else 2
+
+    def reach(j: int) -> int:
+        return min(order, j + 1, intervals - j if solver.lower_order_final else order)
+
+    def b_h(hh):
+        return hh if solver.solver_type == "bh1" else np.expm1(hh)
+
+    for j in range(intervals):
+        for p in range(1, reach(j - 1) + 1 if j > 0 and j - 1 not in solver.disable_corrector else 1):
+            row = corrector[j, p]
+            row[0] = 0.0
+            h = lambdas[j] - lambdas[j - 1]
+            hh = -h if predict_x0 else h
+            rks = [(lambdas[j - 1 - k] - lambdas[j - 1]) / h for k in range(1, p)] + [np.float64(1.0)]
+            B_h = b_h(hh)
+            rhos = _unipc_weights(rks, hh, B_h, p, predictor=False)
+            head = alpha[j] if predict_x0 else sigma[j]
+            row[1] = sigma[j] / sigma[j - 1] if predict_x0 else alpha[j] / alpha[j - 1]
+            row[2] = -head * np.expm1(hh)
+            row[3] = -head * B_h * rhos[-1]
+            for k in range(1, p):
+                row[3 + k] = -head * B_h * rhos[k - 1] / rks[k - 1]
+        for q in range(1, reach(j) + 1):
+            row = predictor[j, q - 1]
+            terminal = sigma[j + 1] <= 0
+            if terminal:
+                # The h -> infinity limit, which each prediction proves apart.
+                if predict_x0 or alpha[j] == 0:
+                    row[1] = alpha[j + 1]
+                else:
+                    row[0], row[2] = alpha[j + 1] / alpha[j], -alpha[j + 1] * sigma[j] / alpha[j]
+                continue
+            h = np.float64(1.0) if alpha[j] == 0 else lambdas[j + 1] - lambdas[j]
+            hh = -h if predict_x0 else h
+            B_h = b_h(hh)
+            head = alpha[j + 1] if predict_x0 else sigma[j + 1]
+            if alpha[j] == 0:
+                row[1], row[2] = alpha[j + 1], sigma[j + 1]
+            else:
+                row[0] = sigma[j + 1] / sigma[j] if predict_x0 else alpha[j + 1] / alpha[j]
+                row[here] = -head * np.expm1(hh)
+            if q > 1:
+                rks = [(lambdas[j - k] - lambdas[j]) / h for k in range(1, q)] + [np.float64(1.0)]
+                rhos = _unipc_weights(rks, hh, B_h, q, predictor=True)
+                for k in range(1, q):
+                    row[2 + k] = -head * B_h * rhos[k - 1] / rks[k - 1]
+    return corrector, predictor
 
 
 @solvers("unipc")
@@ -1086,6 +1165,11 @@ class UniPC:
     At an alpha=0 source, bh1 and epsilon correctors diverge unless the
     first correction is disabled. The finite infinite-node weights use the
     same Vandermonde system with column scaling.
+
+    Every coefficient depends on the grid alone, so `init` solves them in
+    float64 for each interval and order (`_unipc_tables`), and a step reads
+    its interval's row by where `t` sits on that grid and its order from
+    the state. A step's `t` is a point of the grid `init` was given.
     """
 
     order: int = 2
@@ -1105,93 +1189,36 @@ class UniPC:
             source=corrects_source and (not self.predict_x0 or self.solver_type == "bh1"),
             target=not self.lower_order_final and self.order > 1 and times.shape[0] > 2,
             reason="UniPC corrector/predictor requires finite log-SNR at this endpoint")
-        return UniPCState(_multistep(x, times, self.order), x, jnp.zeros((), jnp.int32))
-
-    def _b_h(self, hh):
-        return hh if self.solver_type == "bh1" else jnp.expm1(hh)
-
-    def _corrected(self, x, state: UniPCState, m_here, alpha_here, sigma_here, lambda_here):
-        """`x` corrected with the UniC of the last predictor's own order (none
-        before the first predictor or at a `disable_corrector` index), reading
-        the history before this point's output is pushed."""
-        history = state.history
-        taken, lambdas = history.taken, history.lambdas
-
-        def corrected(p: int):
-            """x at this point, corrected with the p-th order UniC from the
-            sample the last predictor left."""
-            alpha_s0, sigma_s0, m0 = history.alphas[-1], history.sigmas[-1], history.outputs[-1]
-            h = lambda_here - lambdas[-1]
-            hh = -h if self.predict_x0 else h
-            rks = [(lambdas[-(i + 1)] - lambdas[-1]) / h for i in range(1, p)] + [1.0]
-            d1s = [(history.outputs[-(i + 1)] - m0) / rks[i - 1] for i in range(1, p)]
-            B_h = self._b_h(hh)
-            rhos = _unipc_weights(rks, hh, B_h, p, predictor=False)
-            if self.predict_x0:
-                base = sigma_here / sigma_s0 * state.last_x - alpha_here * jnp.expm1(hh) * m0
-                scale = alpha_here
-            else:
-                base = alpha_here / alpha_s0 * state.last_x - sigma_here * jnp.expm1(hh) * m0
-                scale = sigma_here
-            residual = sum(
-                (rho * d1 for rho, d1 in zip(rhos[:-1], d1s, strict=True)), rhos[-1] * (m_here - m0)
-            )
-            return base - scale * B_h * residual
-
-        disabled = reduce(jnp.logical_or, [taken - 1 == index for index in self.disable_corrector],
-                          jnp.zeros((), bool))
-        branch = jnp.where(disabled, 0, state.last_order)
-        return lax.switch(branch, [lambda _: x] + [
-            (lambda p: lambda _: corrected(p))(p) for p in range(1, self.order + 1)], None)
+        with jax.ensure_compile_time_eval():
+            alpha, sigma = process.sampler_schedule.rates(jnp.asarray(times))
+            corrector, predictor = _unipc_tables(np.asarray(alpha, np.float64), np.asarray(sigma, np.float64),
+                                                 self)
+        return UniPCState(jnp.zeros((self.order, *x.shape), x.dtype), x, jnp.zeros((), jnp.int32),
+                          jnp.zeros((), jnp.int32), jnp.asarray(times.shape[0] - 1, jnp.int32),
+                          jnp.asarray(times, jnp.float32), jnp.asarray(corrector, jnp.float32),
+                          jnp.asarray(predictor, jnp.float32))
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
-        alpha_here, sigma_here = process.rates(t, like=x)
-        alpha_t, sigma_t = process.rates(t_next, like=x)
-        history = state.history
-        m_here = denoised if self.predict_x0 else eps
-        taken, steps = history.taken, history.steps
-        lambda_here = _half_log_snr(alpha_here, sigma_here)
-        x = self._corrected(x, state, m_here, alpha_here, sigma_here, lambda_here)
+        def weighted(row: jax.Array, terms: list[jax.Array]) -> jax.Array:
+            total = row[0] * terms[0]
+            for index in range(1, len(terms)):
+                total = total + row[index] * terms[index]
+            return total
 
-        history = history.push(m_here, alpha_here, sigma_here)
-        lambdas, outputs = history.lambdas, history.outputs
-        terminal, h = _lambda_step(alpha_here, sigma_here, alpha_t, sigma_t)
-        hh = -h if self.predict_x0 else h
-        B_h = self._b_h(hh)
-        if self.predict_x0:
-            base = sigma_t / sigma_here * x - alpha_t * jnp.expm1(hh) * m_here
-            scale = alpha_t
-        else:
-            base = (
-                alpha_t / jnp.where(alpha_here == 0, 1.0, alpha_here) * x - sigma_t * jnp.expm1(hh) * m_here
-            )
-            scale = sigma_t
-        base = jnp.where(alpha_here == 0, alpha_t * denoised + sigma_t * eps, base)
-
-        def predicted(p: int):
-            """The p-th order UniP step to t_next from the corrected x."""
-            if p == 1:
-                return base
-            rks = [(lambdas[-(i + 1)] - lambdas[-1]) / h for i in range(1, p)] + [1.0]
-            d1s = [(outputs[-(i + 1)] - m_here) / rks[i - 1] for i in range(1, p)]
-            rhos = _unipc_weights(rks, hh, B_h, p, predictor=True)
-            return base - scale * B_h * sum(rho * d1 for rho, d1 in zip(rhos, d1s, strict=True))
-
-        this_order = jnp.minimum(self.order, steps - taken) if self.lower_order_final else self.order
-        this_order = jnp.minimum(this_order, taken + 1)
-        stepped = lax.switch(this_order - 1, [
-            (lambda p: lambda _: predicted(p))(p) for p in range(1, self.order + 1)], None)
-        target_limit = (
-            alpha_t * denoised
-            if self.predict_x0
-            else jnp.where(
-                alpha_here == 0,
-                alpha_t * denoised,
-                alpha_t / jnp.where(alpha_here == 0, 1.0, alpha_here) * (x - sigma_here * eps),
-            )
-        )
-        next_x = jnp.where(terminal, target_limit, stepped)
-        return next_x, UniPCState(history.advance(), x, this_order)
+        interval = jnp.argmin(jnp.abs(state.grid - t.reshape(-1)[0]))
+        here = denoised if self.predict_x0 else eps
+        history = [state.outputs[-k] for k in range(1, self.order + 1)]
+        row = state.corrector[interval, state.last_order]
+        previous = history[0]
+        x = weighted(row, [x, state.last_x, previous, here - previous,
+                           *(older - previous for older in history[1:])])
+        this_order = (jnp.minimum(self.order, state.steps - state.taken) if self.lower_order_final
+                      else self.order)
+        this_order = jnp.minimum(this_order, state.taken + 1)
+        row = state.predictor[interval, this_order - 1]
+        next_x = weighted(row, [x, denoised, eps, *(older - here for older in history[:self.order - 1])])
+        return next_x, state._replace(outputs=_push(state.outputs, here), last_x=x, last_order=this_order,
+                                      taken=state.taken + 1)
 
 
 def _pndm_step(x, eps, rates_t, rates_s):

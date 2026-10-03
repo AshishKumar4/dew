@@ -78,13 +78,13 @@ def layer_norm(dtype, epsilon: float = 1e-6):
 
 
 def embedding(x, features: int, name: str, *, bias: bool = True, dtype: Dtype | None = None,
-              precision: PrecisionLike = None):
-    """`TimestepEmbedding` and `PixArtAlphaTextProjection`: a linear, SiLU and
-    a linear, stored flat as `{name}_linear_1` and `{name}_linear_2` in the
-    calling module."""
+              precision: PrecisionLike = None, activation: Callable[[jax.Array], jax.Array] = nn.silu):
+    """`TimestepEmbedding` and `PixArtAlphaTextProjection`: a linear, the
+    activation (SiLU, or Wan's tanh GELU) and a linear, stored flat as
+    `{name}_linear_1` and `{name}_linear_2` in the calling module."""
     hidden = nn.Dense(features, use_bias=bias, dtype=dtype, precision=precision, name=f"{name}_linear_1")(x)
     return nn.Dense(features, use_bias=bias, dtype=dtype, precision=precision,
-                    name=f"{name}_linear_2")(nn.silu(hidden))
+                    name=f"{name}_linear_2")(activation(hidden))
 
 
 def guided_time(embed: Callable[[jax.Array, str], jax.Array], time, guidance, *, guidance_embeds: bool):
@@ -187,16 +187,18 @@ class JointAttention(nn.Module):
 @logical_axes({("net_0_proj",): ("embed", "mlp"), ("net_2",): ("mlp", "embed")})
 class FeedForward(nn.Module):
     """The source's `FeedForward(activation_fn="gelu-approximate")`: one
-    projection to four times the width into the tanh GELU, then one back,
+    projection to `hidden` (four times the width unless a config names its
+    `inner_dim`, as Wan's `ffn_dim` does) into the tanh GELU, then one back,
     stored as `net.0.proj` and `net.2`."""
 
     features: int
+    hidden: int | None = None
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     @nn.compact
     def __call__(self, x):
-        hidden = nn.Dense(4 * self.features, dtype=self.dtype,
+        hidden = nn.Dense(self.hidden or 4 * self.features, dtype=self.dtype,
                           precision=self.precision, name="net_0_proj")(x)
         hidden = nn.gelu(hidden, approximate=True)
         return nn.Dense(self.features, dtype=self.dtype, precision=self.precision,

@@ -1,6 +1,8 @@
 """Native CLIP conditioning and image preprocessing for latent diffusion."""
 from __future__ import annotations
 
+import html
+import re
 import shutil
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -535,6 +537,86 @@ class HiddenStatesConditioner(ConditionEncoder[str | Mapping[str, object]]):
     def save_assets(self, destination: Path) -> None:
         """Copy the tokenizer's files as they came: they are read, never trained."""
         shutil.copytree(Path(self.checkpoint) / "tokenizer", destination / "tokenizer", dirs_exist_ok=True)
+
+def wan_prompt(text: str) -> str:
+    """`prompt_clean` of Diffusers' Wan pipelines: ftfy's repairs, HTML
+    entities unescaped twice, then every run of whitespace one space.
+
+    The source collapses with the `regex` module's `\\s`, Unicode's
+    White_Space; the standard library's also takes U+001C to U+001F, which
+    ftfy has already removed as control characters, so the two agree here.
+    """
+    try:
+        import ftfy
+    except ImportError as missing:  # the wan extra's one package
+        raise ValueError("Wan's pipelines clean each prompt with ftfy; install it with "
+                         "`pip install 'dewml[wan]'`") from missing
+    text = html.unescape(html.unescape(ftfy.fix_text(text))).strip()
+    return re.sub(r"\s+", " ", text).strip()
+
+
+@encoders("wan_text")
+@dataclass(eq=False)
+class WanConditioner(ConditionEncoder[str | Mapping[str, object]]):
+    """The text conditioning of a Wan 2.1 checkpoint: its UMT5 encoder's last
+    hidden states.
+
+    `WanPipeline._get_t5_prompt_embeds` cleans each prompt (`wan_prompt`),
+    tokenizes it with its end-of-sequence token, padded and cut to `tokens`,
+    runs the encoder under the padding mask, keeps each row's states up to
+    its own token count and fills the rest of the row with zeros. Its
+    transformer reads every position, the zeros included, so the condition
+    carries no mask.
+    """
+
+    tower: T5EncoderTransformer
+    tokenizer: PreTrainedTokenizerBase
+    params: Variables
+    checkpoint: str
+    tokens: int = 512
+    param_dtype: str = "float32"
+    keyword: ClassVar[str] = "conditioning"
+
+    @classmethod
+    def from_pretrained(cls, checkpoint: str, *, dtype: str | None = "bfloat16",
+                        param_dtype: str = "float32", revision: str | None = None,
+                        attention_impl: str = "auto", tokens: int = 512,
+                        params: Variables | None = None):
+        from dew.interop.pretrained import load_diffusion_conditioner
+
+        return load_diffusion_conditioner(checkpoint, cls, dtype=dtype, param_dtype=param_dtype,
+                                          revision=revision, attention_impl=attention_impl,
+                                          tokens=tokens, params=params)
+
+    def tokenize(self, texts: Sequence[str | Mapping[str, object]]):
+        rows = []
+        for prompt in texts:
+            record: Mapping[str, object] = {"text": prompt} if isinstance(prompt, str) else prompt
+            rows.append(wan_prompt(_prompt(record, "text", "")))
+        encoded = self.tokenizer(rows, padding="max_length", max_length=self.tokens, truncation=True,
+                                 add_special_tokens=True, return_tensors="np")
+        return {"input_ids": np.asarray(encoded.input_ids, np.int32),
+                "attention_mask": np.asarray(encoded.attention_mask, np.int32)}
+
+    def encode(self, params, tokens) -> DenoisingCondition:
+        mask = jnp.asarray(tokens["attention_mask"])
+        states = jnp.asarray(self.tower.apply({"params": params["text_encoder"]},
+                                              jnp.asarray(tokens["input_ids"]), mask))
+        lengths = jnp.sum(mask != 0, axis=1)
+        kept = jnp.arange(states.shape[1])[None, :, None] < lengths[:, None, None]
+        return DenoisingCondition(jnp.where(kept, states, 0))
+
+    def captions(self, tokens):
+        return tuple(self.tokenizer.batch_decode(np.asarray(tokens["input_ids"]), skip_special_tokens=True))
+
+    def to_json(self):
+        return {"checkpoint": self.checkpoint, "dtype": dtype_name(self.tower.dtype),
+                "param_dtype": self.param_dtype, "tokens": self.tokens}
+
+    def save_assets(self, destination: Path) -> None:
+        """Copy the tokenizer's files as they came: they are read, never trained."""
+        shutil.copytree(Path(self.checkpoint) / "tokenizer", destination / "tokenizer", dirs_exist_ok=True)
+
 
 @lru_cache(maxsize=32)
 def _cubic_weights(source: int, target: int) -> tuple[np.ndarray, np.ndarray]:

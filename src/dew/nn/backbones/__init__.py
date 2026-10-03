@@ -20,9 +20,10 @@ from .unet3d import UNet3D
 from .unet_condition import UNet2DCondition, UNetStage
 from .uvit import SimpleUDiT, UViT
 from .video_dit import VideoDiT
+from .wan import WanTransformer
 from .z_image import ZImageTransformer
 
 __all__ = ["CausalTransformer", "EDM2UNet", "Flux2Transformer", "FluxTransformer", "HierarchicalMMDiT",
            "HybridSSMAttentionDiT", "Mixture", "QwenImageTransformer", "SD3Transformer", "SimpleDiT",
            "SimpleMMDiT", "SimpleUDiT", "UNet2DCondition", "UNet3D", "UNetStage", "UViT", "Unet", "VideoDiT",
-           "ZImageTransformer"]
+           "WanTransformer", "ZImageTransformer"]

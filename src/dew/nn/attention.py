@@ -1439,11 +1439,14 @@ def _local_blocks(kernel, query, key, value, *, window, chunk, positions, segmen
     return out.reshape(batch, blocks * span, *out.shape[2:])[:, :length]
 
 
-# Splash's tile size. At 512 the forward kernel holds 1 MiB of fp32 logits
-# plus its operands, which fits VMEM at decoder head widths. jax's default
-# of 128 gives the MXU a sixteenth of that per pass. `splash_block_sizes`
-# narrows this to a divisor of each sequence, as the mask blocking needs.
-SPLASH_BLOCK = 512
+# Splash's tile size. At 1024 the forward kernel holds 4 MiB of fp32 logits
+# plus its operands. On a TPU v6e, Qwen3-0.6B's attention (8 x 1024 tokens,
+# 16 query heads over 8, 128 wide, causal) took 1.28 ms forward and backward
+# at 1024 with the fused backward, against 1.81 at 512 with separate dq and
+# dkv kernels and 1.42 at 512 fused, with the same errors against fp32
+# (docs/performance.md). `splash_block_sizes` narrows this to a divisor of
+# each sequence, as the mask blocking needs.
+SPLASH_BLOCK = 1024
 # The kernel tiles the key axis by lanes: the compute block must be a whole
 # number of them (`{bkv_compute=} must be a multiple of {NUM_LANES=}`,
 # splash_attention_kernel.py:970-971) and the mask blocking must divide both
@@ -1587,8 +1590,10 @@ def splash_block_sizes(q_len: int, kv_len: int):
 
     The greatest common divisor divides its sequence, as the mask blocking
     requires, and stays a multiple of `SPLASH_LANES`, as the key compute block
-    requires. The backward blocks are set because a kernel built without them
-    raises "Need to specify backward blocks." at its first gradient.
+    requires. The backward runs as one kernel for dq, dk and dv, which reads
+    each logits block once where separate dq and dkv kernels read it twice;
+    its blocks are set because a kernel built without them raises "Need to
+    specify backward blocks." at its first gradient.
     """
     from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel
 
@@ -1596,7 +1601,7 @@ def splash_block_sizes(q_len: int, kv_len: int):
     return splash_attention_kernel.BlockSizes(
         block_q=block_q, block_kv=block_kv, block_kv_compute=block_kv,
         block_q_dkv=block_q, block_kv_dkv=block_kv, block_kv_dkv_compute=block_kv,
-        block_q_dq=block_q, block_kv_dq=block_kv)
+        use_fused_bwd_kernel=True)
 
 
 def splash_mask_descriptor(q_len: int, kv_len: int, heads: int, causal: bool,
