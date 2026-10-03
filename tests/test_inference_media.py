@@ -35,7 +35,7 @@ def test_trained_image_task_accepts_raw_and_prepared_inputs_and_immutable_rebind
         atol=2e-6,
         rtol=2e-6,
     )
-    mutable = jax.tree.map(lambda leaf: leaf, task.params.unfreeze())
+    mutable = jax.tree.map(lambda leaf: leaf, task.variables.unfreeze())
     bound = task.bind(mutable)
     mutable["params"] = jax.tree.map(lambda leaf: leaf + 0.05, mutable["params"])
     np.testing.assert_array_equal(

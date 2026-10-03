@@ -101,7 +101,7 @@ A run assembled by hand needs its configuration saved next to the checkpoints be
 
 ## Weights
 
-For the plain LM, image-diffusion and block-diffusion objectives, `ema=True` asks for the moving-average weights and raises if the run or state has no EMA copy, and `ema=False` reads the live weights. `dew.pipeline`, the tasks' `from_run` and `from_pretrained`, `objective.pipeline` and `export_run` default to `ema=None`, which takes the EMA copy when the run or state has one and the live weights otherwise. DPO, GRPO and PPO use the EMA slot for a frozen reference, so their pipelines always publish the trained policy, never the reference. PPO also leaves out the critic.
+For the plain LM, image-diffusion and block-diffusion objectives, `ema=True` asks for the moving-average weights and raises if the run or state has no EMA copy, and `ema=False` reads the live weights. `dew.pipeline`, the tasks' `from_run` and `from_pretrained`, `objective.pipeline` and `Pretrained.from_run` default to `ema=None`, which takes the EMA copy when the run or state has one and the live weights otherwise. DPO, GRPO and PPO use the EMA slot for a frozen reference, so their pipelines always publish the trained policy, never the reference. PPO also leaves out the critic.
 
 `objective.pipeline(state)` picks weights by the same rule and keeps the arrays the trainer has already placed. `LMObjective.policy(params, sampling)` returns a `TextGeneration` bound to the given tree, the task a GRPO rollout samples with. `task.bind(variables)` makes a task over another set of variables; it copies the mapping structure and shares the array buffers, so do not change or donate those arrays while a task uses them.
 
@@ -131,7 +131,7 @@ from dew.sampling import TextToImage
 from dew.training.quantization import Quantization
 
 pipe = TextToImage.from_pretrained("dewml/hybrid-dit-176m", dtype=jnp.bfloat16,
-                                   revision="0964f57387afc938927b1047f19ed32b63fe0619")
+                                   revision="32d59de89683d59824361144b87bdcaf3e742598")
 served = pipe.quantized(Quantization(dtype="int8", patterns=("^(?!.*spatial_fusion).*",)))
 images = served(["a red fox in a snowy forest"], steps=20, key=0).host().images
 ```

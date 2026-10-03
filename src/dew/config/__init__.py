@@ -46,7 +46,7 @@ from dew.checkpoints import RUN_FILE, Checkpoints, Keep
 from dew.config.sweep import Search, Space, _read, _write, override, random_search
 from dew.data import Dataset, DatasetSpec, Ramp
 from dew.data.dataset import json_list_argument, ramped
-from dew.lora import LoRA, _attach
+from dew.lora import LoRA, _Adapted, _attach
 from dew.nn.attention import AttentionImpl
 from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.records import JSON, duration, recorded_duration
@@ -64,7 +64,7 @@ from dew.training.optim import (
     param_labels,
     power_profiles,
 )
-from dew.training.quantization import Quantization, _quantize
+from dew.training.quantization import Quantization, _quantize, _Quantized
 from dew.training.selection import Best
 from dew.training.state import TrainState
 from dew.training.tracker import LocalTracker, Tracker, Trackers, WandbTracker
@@ -101,6 +101,10 @@ class ModelConfig:
 
     architecture: str = "simple_dit"
     config: JsonDict = dataclasses.field(default_factory=dict)
+    adapter: JsonDict | None = None
+    """The bound LoRA record; its factors are stored with the checkpoint variables."""
+    quantization: Quantization | None = None
+    """The quantized training the model was wrapped in, which `build` wraps it in again."""
     dtype: registry.DtypeName | None = "bfloat16"
     """Compute dtype; parameter storage is independent."""
     param_dtype: registry.DtypeName | None = None
@@ -140,8 +144,22 @@ class ModelConfig:
 
     @classmethod
     def from_model(cls, model) -> Self:
-        """The registered module's constructor fields, with its actual compute settings."""
-        architecture = models.name_of(type(model))
+        """The module's constructor fields, with its actual compute settings.
+
+        A registered class is recorded under its registered name. A class no
+        registry names is recorded under its own name in lower case, which a
+        loader asks the user to register it as: `build` needs the name, and
+        training, checkpointing and resuming do not.
+        """
+        model_type = type(model)
+        adapter, quantization = None, None
+        if isinstance(model_type, _Adapted):
+            adapter = model_type._dew_lora_spec.to_json()
+            model_type = model_type._dew_lora_base
+        if isinstance(model_type, _Quantized):
+            quantization = model_type._dew_quantization
+            model_type = model_type._unquantized_type
+        architecture = _architecture(model_type)
         fields = {}
         compute, storage, attention = None, None, 'auto'
         precision: Literal['default', 'high', 'highest'] | None = None
@@ -169,12 +187,29 @@ class ModelConfig:
             elif callable(value) and value is field.default:
                 continue
             else:
-                fields[field.name] = _to_json(value, _declared_type(type(model), field.name))
-        return cls(architecture, fields, dtype=compute, param_dtype=storage,
-                   matmul_precision=precision, attention_impl=attention)
+                fields[field.name] = _to_json(value, _declared_type(model_type, field.name))
+        return cls(architecture, fields, adapter=adapter, quantization=quantization, dtype=compute,
+                   param_dtype=storage, matmul_precision=precision, attention_impl=attention)
 
     def build(self):
-        return models.build(self.architecture, self.fields())
+        model = models.build(self.architecture, self.fields())
+        if self.quantization is not None:
+            model = self.quantization.apply(model)
+        return model if self.adapter is None else LoRA.from_json(self.adapter).adapt(model)
+
+
+def _architecture(model_type: type) -> str:
+    """The name a model class is recorded under: its registered name, or its
+    own name in lower case for a class no registry names yet."""
+    for name, member in models.items():
+        if member is model_type:
+            return name
+    name = model_type.__name__.lower()
+    if name in models:
+        raise ValueError(f"{model_type.__qualname__} is unregistered and {name!r} names "
+                         f"{models[name].__qualname__}; register it under a name of its own")
+    return name
+
 
 
 @dataclasses.dataclass(frozen=True)
@@ -540,8 +575,8 @@ def _to_json(value, annotation) -> JSON:
                                       for member in held.values()):
             raise ValueError(
                 f"{type(value).__qualname__} is not a registered {held.kind}; a "
-                f"run config can only record members that load back, register "
-                f"it with @{held.kind}s(...)")
+                f"run config can only record members that load back, so register "
+                f"it once with `@dew.registry.{held.kind}s(\"{type(value).__name__.lower()}\")`")
         if held is None:
             held = _registry_for(type(value))
         fields = {f.name: _to_json(getattr(value, f.name), _declared_type(type(value), f.name))

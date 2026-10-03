@@ -631,8 +631,9 @@ def test_a_dropped_row_is_conditioned_on_what_the_objective_holds(conditional_mm
                                  pretrained=variables)
     held = dropped.unconditional_conditions
     before = float(dropped.scalar_loss(variables, batch, step)[0])
-    dropped.unconditional_conditions = jax.tree.map(
-        lambda leaf: leaf + 1.0 if np.issubdtype(leaf.dtype, np.floating) else leaf, held)
+    # The branch is encoded once and held; moving it in place moves the step.
+    held.update(jax.tree.map(
+        lambda leaf: leaf + 1.0 if np.issubdtype(leaf.dtype, np.floating) else leaf, dict(held)))
 
     assert float(dropped.scalar_loss(variables, batch, step)[0]) != pytest.approx(before)
 

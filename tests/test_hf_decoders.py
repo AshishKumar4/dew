@@ -1309,8 +1309,8 @@ def test_scalar_mode_survives_scanning_and_rematerialized_backward(mode):
     scanned = plain.clone(scan_layers=True, remat="full")
     ids = jnp.asarray(np.load(GEMMA4_MOE / "input_ids.npy"), jnp.int32)
 
-    def loss(model, variables):
-        return jnp.mean(model.apply({**variables, "params": variables}, ids) ** 2)
+    def loss(model, params):
+        return jnp.mean(model.apply({**variables, "params": params}, ids) ** 2)
 
     expected, expected_grad = jax.jit(jax.value_and_grad(lambda params: loss(plain, params)))(
         variables["params"]

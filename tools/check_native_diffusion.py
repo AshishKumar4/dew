@@ -96,8 +96,8 @@ def train_and_reload(source, reference, key, given, noise):
         batch[source.inputs.mask.key] = (reference["mask"][None, ..., None] >= 128).astype(np.float32)
     variables = objective.init(key)
     step = Step(jnp.asarray(0), key, None)
-    def loss(variables):
-        value, _ = objective.loss({**variables, "params": variables}, batch, step)
+    def loss(params):
+        value, _ = objective.loss({**variables, "params": params}, batch, step)
         return value.total / value.mass
     value, grads = jax.jit(jax.value_and_grad(loss))(variables["params"])
     updated = jax.tree.map(lambda p, g: p - 1e-3 * g, variables["params"], grads)

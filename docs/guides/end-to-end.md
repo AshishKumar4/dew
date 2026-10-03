@@ -46,7 +46,7 @@ JAX_PLATFORMS=cpu python examples/sft_diffusion_gemma.py --smoke --out /tmp/dg-s
 
 ## Full-weight SFT of a Gemma 4 decoder
 
-[`examples/sft_gemma4.py`](https://github.com/AshishKumar4/dew/blob/main/examples/sft_gemma4.py) trains every weight of a Gemma 4 text decoder on a Hub chat dataset. It packs conversations into windows, and `LMObjective(loss_role=Role.ASSISTANT)` counts the loss only on assistant targets. The trainer shards over the visible devices and accumulates micro-batches into one update. The run writes `run.json` next to its checkpoints, so `dew.interop.export_run` can write a Hugging Face directory that both transformers and `Pretrained.load` read. The run directory is `<--out>/checkpoints/<name of --out>`, which is the path the `dew.eval` command below reads.
+[`examples/sft_gemma4.py`](https://github.com/AshishKumar4/dew/blob/main/examples/sft_gemma4.py) trains every weight of a Gemma 4 text decoder on a Hub chat dataset. It packs conversations into windows, and `LMObjective(loss_role=Role.ASSISTANT)` counts the loss only on assistant targets. The trainer shards over the visible devices and accumulates micro-batches into one update. The run writes `run.json` next to its checkpoints, so `PretrainedDecoder.from_run(run).save(directory)` can write a Hugging Face directory that both transformers and `Pretrained.load` read. The run directory is `<--out>/checkpoints/<name of --out>`, which is the path the `dew.eval` command below reads.
 
 ```bash
 python examples/sft_gemma4.py --model google/gemma-4-E2B \

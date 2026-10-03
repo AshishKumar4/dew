@@ -128,7 +128,7 @@ class Images(Generic[ArrayT]):
 class TextToImage:
     """`pipe(prompts, key=0)` or `pipe(prompts, steps=40, guidance=4.0, solver=Heun(), key=key)`.
 
-    `params` is the objective's whole tree, the EMA copy merged over the live
+    `variables` is the objective's whole tree, the EMA copy merged over the live
     weights when the run kept one, so a sample comes from the weights a run
     publishes. `steps`, `guidance` and `solver` are the defaults a call
     omits; an objective or a loaded source sets them. `grid` prepares the
@@ -147,7 +147,7 @@ class TextToImage:
     model: nn.Module
     process: Process
     inputs: InputSpec
-    params: Variables
+    variables: Variables
     autoencoder: AutoEncoder | None = None
     steps: int = 50
     guidance: Guidance | None = None
@@ -161,7 +161,7 @@ class TextToImage:
     None encodes it on every call, for a source that has none."""
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "params", freeze(dict(self.params)))
+        object.__setattr__(self, "variables", freeze(dict(self.variables)))
 
     def bind(self, variables: Variables) -> TextToImage:
         """Bind another snapshot. Changed encoder leaves get a new lazy blank;
@@ -171,7 +171,7 @@ class TextToImage:
         blank = self.blank
         if isinstance(blank, FixedBlank):
             blank = blank.rebind(variables.get("encoders", {}))
-        return replace(self, params=variables, blank=blank)
+        return replace(self, variables=variables, blank=blank)
 
     def quantized(self, spec: Quantization) -> TextToImage:
         """This task with its denoiser's weights stored quantized as `spec`
@@ -182,11 +182,11 @@ class TextToImage:
 
         example = self.prepare("", key=0, steps=1)
         denoiser = {
-            name: value for name, value in self.params.items() if name not in ("encoders", "autoencoder")
+            name: value for name, value in self.variables.items() if name not in ("encoders", "autoencoder")
         }
         model, variables = quantize_for_serving(self.model, denoiser, spec, example.noise,
                                                 jnp.zeros(example.noise.shape[:1]), **example.conditions)
-        return replace(self, model=model, params={**self.params, **variables})
+        return replace(self, model=model, variables={**self.variables, **variables})
 
     @classmethod
     def from_objective(cls, objective: DiffusionObjective, variables: Variables) -> TextToImage:
@@ -232,15 +232,34 @@ class TextToImage:
 
         record = run_record(directory, step)
         config = ModelConfig.from_dict(fields(record['model'], 'model'))
+        inputs_record = fields(record['inputs'], 'inputs')
+        autoencoder_record = None if record['autoencoder'] is None else fields(record['autoencoder'],
+                                                                               'autoencoder')
         compute = dtype_name(resolve_dtype(dtype))
         if compute is not None:
             config = replace(config, dtype=compute)
+            conditions = {keyword: fields(condition, keyword) for keyword, condition
+                          in fields(inputs_record['conditions'], 'conditions').items()}
+            inputs_record = {**inputs_record, 'conditions': {
+                keyword: {**condition,
+                          'encoder': _computing(fields(condition['encoder'], 'encoder'), compute)}
+                for keyword, condition in conditions.items()}}
+            if autoencoder_record is not None:
+                autoencoder_record = _computing(autoencoder_record, compute)
         averaged = False if objectives[text(record['objective'], 'objective')]._ema_is_reference else ema
-        params = Checkpoints(directory).variables(ema=averaged, step=step, mesh=mesh, layout=layout,
-                                                 param_dtype=param_dtype)
-        inputs = InputSpec.from_json(fields(record['inputs'], 'inputs'), params=params.get('encoders', {}))
-        autoencoder = None if record['autoencoder'] is None else AutoEncoder.from_json(
-            fields(record['autoencoder'], 'autoencoder'), params=params['autoencoder'])
+        params = Checkpoints(directory).variables(
+            ema=averaged, step=step, mesh=mesh, layout=layout, param_dtype=param_dtype,
+            parameter_roots=_parameter_roots(inputs_record, autoencoder_record))
+        inputs = InputSpec.from_json(inputs_record, params=params.get('encoders', {}))
+        end_to_end = record.get('end_to_end')
+        autoencoder = None
+        if autoencoder_record is not None and end_to_end is not None:
+            from dew.objectives.diffusion.end_to_end import AUTOENCODER, EndToEnd
+            tuning = _built(EndToEnd, fields(end_to_end, 'end_to_end'))
+            frozen = AutoEncoder.from_json(autoencoder_record, params=params['params'][AUTOENCODER])
+            autoencoder, params = tuning.tuned(frozen, params)
+        elif autoencoder_record is not None:
+            autoencoder = AutoEncoder.from_json(autoencoder_record, params=params['autoencoder'])
         solver_record = fields(record['solver'], 'solver')
         solver = solvers.build(text(solver_record['name'], 'solver name'),
                                 fields(solver_record['fields'], 'solver fields'))
@@ -310,8 +329,8 @@ class TextToImage:
             return self.blank(given)
         leaves = jax.tree.leaves(tokens)
         if leaves and leaves[0].shape[0] != 1:
-            return _encode(plan.sharding)(self._conditions, self.params, plan.place(plan.pad(tokens)))
-        return _encode(None)(self._conditions, self.params, jax.tree.map(jnp.asarray, tokens))
+            return _encode(plan.sharding)(self._conditions, self.variables, plan.place(plan.pad(tokens)))
+        return _encode(None)(self._conditions, self.variables, jax.tree.map(jnp.asarray, tokens))
 
 
     def prepare(
@@ -339,7 +358,7 @@ class TextToImage:
         Explicit times select a partial trajectory in the prepared process.
         encode_key samples a VAE posterior; None uses its mean.
         """
-        mesh = mesh_of(self.params)
+        mesh = mesh_of(self.variables)
 
         def resolve() -> _Resolved:
             return self._resolved(mesh, prompts, key=key, steps=steps,
@@ -517,7 +536,7 @@ class TextToImage:
         batch first because its single row would not carry the mask.
         """
         plan, process = settled.plan, settled.process
-        given = _encode(plan.sharding)(self._conditions, self.params,
+        given = _encode(plan.sharding)(self._conditions, self.variables,
                                        plan.place(plan.pad(settled.tokens)))
         null = self._unconditional(settled.null_tokens, plan, given, configured=configured)
         if not settled.samples:
@@ -525,7 +544,7 @@ class TextToImage:
                                                       settled.shape)
         start = process.times(settled.count)[0] if settled.times is None else settled.times[0]
         initial_state, spatial = _image_start(plan.sharding)(
-            self.autoencoder, process, settled.shape, self.params,
+            self.autoencoder, process, settled.shape, self.variables,
             plan.place(plan.pad(settled.samples)), plan.keys(settled.request),
             settled.posterior, start)
         if spatial:
@@ -549,7 +568,7 @@ class TextToImage:
         """Images in [-1, 1], `[rows, H, W, C]`. `guidance` is a classifier-free
         guidance scale, or a `CFG` with its interval, or None for the plain
         conditional prediction; omitted, it is the task's default."""
-        mesh = mesh_of(self.params)
+        mesh = mesh_of(self.variables)
 
         def resolve():
             return self._settings(mesh, prompts, steps=steps, guidance=guidance,
@@ -566,10 +585,44 @@ class TextToImage:
             assert prepared.rows is not None
             plan = RowPlan.over(mesh, prepared.rows)
             generated = _run(plan.sharding)(self.model, process, self.autoencoder, self.finish, count,
-                                         solver, chosen, self.final_denoise, times, decode, self.params,
+                                         solver, chosen, self.final_denoise, times, decode, self.variables,
                                          prepared.conditions, prepared.unconditional,
                                          prepared.noise, jax.random.fold_in(request, 1))
         return replace(generated, rows=plan.rows)
+
+
+def _parameter_roots(inputs: Mapping[str, object], autoencoder: Mapping[str, object] | None
+                     ) -> tuple[tuple[str, ...], ...]:
+    """The parameter roots of a recorded run's tree, which a storage override
+    casts: the denoiser's, each condition encoder's own collections and the
+    autoencoder's. The rest keep the dtypes they were saved in."""
+    from dew.objectives.base import FROZEN
+    from dew.records import record, text
+    from dew.registry import encoders
+
+    roots: list[tuple[str, ...]] = [("params",), (FROZEN,)]
+    for keyword, condition in record(inputs['conditions'], 'conditions').items():
+        name = text(record(record(condition, keyword)['encoder'], 'encoder')['name'], 'encoder name')
+        collections = encoders[name].parameter_collections
+        roots.extend([("encoders", keyword)] if collections is None else
+                     [("encoders", keyword, collection) for collection in collections])
+    if autoencoder is not None:
+        roots.append(("autoencoder",))
+    return tuple(roots)
+
+
+def _computing(owner: Mapping[str, object], compute: str) -> Mapping[str, object]:
+    """A recorded encoder or autoencoder computing in `compute`: its own
+    `dtype`, and the dtype of the model it wraps where it records one."""
+    from dew.records import record
+
+    recorded = dict(record(owner['fields'], 'fields'))
+    if 'dtype' in recorded:
+        recorded['dtype'] = compute
+    model = recorded.get('model')
+    if isinstance(model, Mapping) and 'dtype' in model:
+        recorded['model'] = {**record(model, 'model'), 'dtype': compute}
+    return {**owner, 'fields': recorded}
 
 
 def _time_grid(times) -> tuple[float, ...]:

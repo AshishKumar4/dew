@@ -876,7 +876,7 @@ def test_the_quantized_serving_benchmark_counts_nonfinite_values_before_it_clips
     class Pipe:
         """The part of TextToImage that sampling reads: latents, and an
         autoencoder that passes them through with one pixel infinite."""
-        params: ClassVar = {"autoencoder": {}}
+        variables: ClassVar = {"autoencoder": {}}
         autoencoder = SimpleNamespace(decode=lambda params, z: z.at[0, 0, 0, 0].set(jnp.inf))
 
         def __call__(self, prompts, **controls):

@@ -160,7 +160,7 @@ objective = DiffusionObjective(
 )
 ```
 
-After training, sample from the averaged weights with `state.averaged`. Use `state.params` instead to sample from the latest weights:
+After training, sample from the averaged weights with `state.averaged`. Use `state.variables` instead to sample from the latest weights:
 
 ```python
 from dew import sample
@@ -177,7 +177,7 @@ images = sample(
 )
 ```
 
-Set `ema_decay=None` to train without an averaged copy, then sample with `state.params`.
+Set `ema_decay=None` to train without an averaged copy, then sample with `state.variables`.
 
 `SimpleDiT(dtype=jnp.bfloat16)` sets the computation dtype; master weights and
 optimizer state stay fp32, so the optimizer still accumulates in full
@@ -311,7 +311,7 @@ and `Trainer` path. Images condition the clean encoder; their placeholder slots
 are not text targets. `BlockGeneration` takes the matching `images=` when it
 decodes. The objective makes `layer_scalar` trainable, so the export goes
 through the objective's model:
-`replace(loaded, model=objective.model).save(directory, variables=state.params)`.
+`replace(loaded, model=objective.model).save(directory, variables=state.variables)`.
 
 ### Masked-diffusion decoders
 
@@ -320,7 +320,7 @@ released weights.
 
 `MaskedDiffusionObjective(model, MDLM(mask_id=...)(), seq_len,
 pretrained=loaded.variables)` trains the MDLM negative ELBO from a loaded
-checkpoint. `loaded.save(directory, variables=state.params)` writes the trained
+checkpoint. `loaded.save(directory, variables=state.variables)` writes the trained
 weights back under the source's own tensor names, beside the config they came
 with: LLaDA's OLMo-style names and Dream's Qwen 2 layout.
 Transformers has no class for either release, so the export tests compare
@@ -416,7 +416,7 @@ model = CausalTransformer(vocab_size=tokenizer.vocab_size, emb_features=256, num
 objective = LMObjective(model, seq_len=256)
 lm_state = Trainer(objective, optax.adamw(1e-3), key=jax.random.key(0)).fit(
     data, steps=2000, log_every=500, eval_every=1000, metrics=(Perplexity(),))
-continuation = generate(model, lm_state.params, [tokenizer.encode("Once upon a time")],
+continuation = generate(model, lm_state.variables, [tokenizer.encode("Once upon a time")],
                         max_new_tokens=40, key=jax.random.key(1),
                         sampling=Sampling(temperature=0.0))
 print(tokenizer.decode(continuation.tokens[0]))
@@ -456,7 +456,7 @@ sft_data = Dataset(
 sft_objective = LMObjective(
     model,
     seq_len=len(row) - 1,
-    pretrained=lm_state.params,
+    pretrained=lm_state.variables,
     loss_role=Role.ASSISTANT,
 )
 sft_state = Trainer(
@@ -484,7 +484,7 @@ pair = {"chosen": prompt + response, "rejected": prompt + rejected,
         "rejected_mask": [0] * len(prompt) + [1] * len(rejected)}
 pairs = PreferencePairs(records=(json.dumps(pair),) * 8, seq_len=16,
                         loading=Loading(workers=0, threads=1, read_buffer=2)).load(batch=8)
-dpo = DPOObjective(model, seq_len=15, beta=0.1, pretrained=lm_state.params)
+dpo = DPOObjective(model, seq_len=15, beta=0.1, pretrained=lm_state.variables)
 dpo_state = Trainer(dpo, optax.adam(0.001), key=jax.random.key(2)).fit(
     pairs, steps=10, log_every=5)
 ```
@@ -532,7 +532,7 @@ rl_objective = GRPOObjective(
     model,
     seq_len=len(prompt) + 7,
     beta=0.01,
-    pretrained=lm_state.params,
+    pretrained=lm_state.variables,
 )
 rollout = SampledRollout(
     rl_objective,
@@ -771,7 +771,7 @@ data = Dataset.from_records({"x": x, "y": 2 * x + 1}, batch=32)
 objective = Regression()
 state = Trainer(objective, optax.sgd(0.1), key=jax.random.key(0)).fit(
     data, steps=100, log_every=25)
-print(objective.model.apply(state.params, jnp.array([[0.0], [1.0]])))
+print(objective.model.apply(state.variables, jnp.array([[0.0], [1.0]])))
 ```
 
 The predictions approach `1` and `3`. `init` creates the variables, `loss` computes a differentiable scalar, and `Aux` supplies metrics and optional mutable-variable updates. You can pass a custom objective directly to `Trainer`; registration is only needed to construct it by name from a configuration.
@@ -794,14 +794,14 @@ Which call continues a run depends on the artifact you kept:
 | A `TrainState` in memory | Generation from the weights you just trained | `objective.pipeline(state)` |
 | A saved run: `run.json` beside its checkpoints | Generation, with the model rebuilt from the record | `dew.pipeline(run_directory)` |
 | A source checkpoint directory or Hub repository | Generation, or training from those weights | `dew.pipeline(source)`, or `Pretrained.load(source)` for the variables |
-| Trained variables another runtime has to read | The source format, without Dew | `Pretrained.save(directory, variables=state.params)` |
-| A saved run another runtime has to read | The same layout, from the run alone | `dew.interop.export_run(run_directory, destination)`, or `dew export <run> <dest>` |
+| Trained variables another runtime has to read | The source format, without Dew | `Pretrained.save(directory, variables=state.variables)` |
+| A saved run another runtime has to read | The same layout, from the run alone | `PretrainedDecoder.from_run(run_directory).save(destination)`, or `dew export <run> <dest>` |
 
 `Pretrained.save` writes the weights, the config it derives, and the
 tokenizer or processor files. It does not include optimizer state or data
 position, so keep the native checkpoint if you want to resume training.
 [`examples/sft_gemma4.py`](examples/sft_gemma4.py) trains a run and exports
-it with `export_run`, the last row of the table.
+it with `PretrainedDecoder.from_run(...).save(...)`, the last row of the table.
 
 Reproducing a run bitwise on CUDA needs deterministic GPU reductions. The flag
 `--xla_gpu_deterministic_ops=true` requests them, and `TrainerConfig.xla_flags`
@@ -856,7 +856,7 @@ with LocalTracker("runs/lm-report", plots=True) as tracker:
     ).fit(data, steps=40, log_every=10)
     result = Evaluation.run(
         objective,
-        state.params,
+        state.variables,
         data.val,
         metrics=(Perplexity(),),
         key=jax.random.key(1),
@@ -935,7 +935,7 @@ config = RunConfig(
 def trial(run: RunConfig) -> float:
     """Train one point and score it: the perplexity its own run ends on."""
     state = run.train(objective, data, name=run.trainer.name or "lm-rate")
-    return float(Evaluation.run(objective, state.params, data.val, metrics=(Perplexity(),),
+    return float(Evaluation.run(objective, state.variables, data.val, metrics=(Perplexity(),),
                                 key=jax.random.key(1), step=int(state.step)).scores["val/perplexity"])
 
 
@@ -997,11 +997,11 @@ continues the decoder trained in [language modeling](#language-modeling):
 from dew.inference import TextGeneration
 
 prompt = tokenizer.encode("Once upon a time")
-task = objective.policy(lm_state.params, Sampling(temperature=0.0))
+task = objective.policy(lm_state.variables, Sampling(temperature=0.0))
 drawn = task([prompt], 8, key=jax.random.key(1))
 print(tokenizer.decode(drawn.tokens[0]), np.asarray(drawn.lengths))
 
-same = TextGeneration(model, lm_state.params, sampling=Sampling(temperature=0.0))
+same = TextGeneration(model, lm_state.variables, sampling=Sampling(temperature=0.0))
 print(np.array_equal(np.asarray(same([prompt], 8, key=jax.random.key(1)).tokens),
                      np.asarray(drawn.tokens)))
 ```
@@ -1133,7 +1133,7 @@ state = Trainer(LMObjective(model, seq_len=128),
                 optax.adamw(3e-3), key=jax.random.key(0)).fit(
     data, steps=400, log_every=200)
 
-PretrainedDecoder.from_model(model, state.params, tokenizer=tokenizer).save(export)
+PretrainedDecoder.from_model(model, state.variables, tokenizer=tokenizer).save(export)
 print(sorted(path.name for path in export.iterdir()))
 
 task = PretrainedDecoder.load(str(export), dtype=jnp.float32).text_generation()

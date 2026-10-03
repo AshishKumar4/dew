@@ -4,7 +4,7 @@
 writes as `run.json` next to the checkpoints. Beside the model, the data, the
 optimizer and the trainer every run carries, a decoder run records the
 tokenizer its ids came from and the preview policy it generates under, and
-those are the fields `TextGeneration.from_run` and `dew.interop.export_run`
+those are the fields `TextGeneration.from_run` and `Pretrained.from_run`
 read back out of that file: a run that does not record them loads as weights
 with no way to turn text into ids.
 

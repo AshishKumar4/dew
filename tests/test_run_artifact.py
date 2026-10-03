@@ -1,4 +1,5 @@
 """Python training saves the model/task declaration with its own checkpoint."""
+import dataclasses
 import inspect
 
 import grain.python as grain
@@ -30,6 +31,150 @@ def test_live_model_record_rebuilds_exact_constructor_fields():
     tokens = jnp.arange(1, 9)[None, :]
     variables = original.init(jax.random.key(0), tokens)
     np.testing.assert_array_equal(original.apply(variables, tokens), rebuilt.apply(variables, tokens))
+
+
+def test_a_composite_model_record_nests_its_part_and_rebuilds_it():
+    """DiffusionGemma holds a CausalTransformer: its record nests the part's own
+    record, and building it gives the part's precision to the part alone."""
+    from dew.nn.diffusion_gemma import DiffusionGemma
+
+    original = DiffusionGemma(model().clone(layer_scalar="frozen"), canvas_length=4)
+    record = ModelConfig.from_model(original)
+    assert record.dtype is None and record.config["text"]["name"] == "causal_transformer"
+    assert record.build() == original.clone(text=original.text.clone(dtype=jnp.float32))
+
+
+def test_an_unregistered_model_trains_and_saves_and_loads_once_registered(tmp_path, monkeypatch, caplog):
+    """A class no registry names trains and checkpoints as any other; loading
+    the run by its record names the line that registers it, and after that
+    line the same run loads."""
+    from dew.inference import TextGeneration
+    from dew.registry import models
+
+    class Custom(type(model())):
+        pass
+
+    objective = LMObjective(Custom(**{field.name: getattr(model(), field.name)
+                                      for field in dataclasses.fields(model())
+                                      if field.init and field.name not in ("parent", "name")}),
+                            seq_len=8, ema_decay=None)
+    rows = [{'text': np.arange(9, dtype=np.int32)} for _ in range(8)]
+    data = Dataset.from_grain(grain.MapDataset.source(rows), batch=8, loading=Loading(workers=0))
+    checkpoints = Checkpoints(str(tmp_path / 'run'))
+    with caplog.at_level("WARNING", logger="dew.training.trainer"):
+        Trainer(objective, optax.sgd(.01), key=0, checkpoints=checkpoints).fit(data, steps=1,
+                                                                               checkpoint_every=1)
+    checkpoints.wait()
+    assert "`@dew.registry.models('custom')` above the class" in caplog.text
+    with pytest.raises(ValueError, match=r"`@dew.registry.models\('custom'\)` above the class"):
+        TextGeneration.from_run(str(tmp_path / 'run'))
+    monkeypatch.setitem(models._members, "custom", Custom)
+    assert type(TextGeneration.from_run(str(tmp_path / 'run')).model) is Custom
+
+
+def test_a_model_no_record_can_describe_still_checkpoints_and_loading_says_why(tmp_path, monkeypatch, caplog):
+    import flax.linen as nn
+
+    from dew import Field, InputSpec
+    from dew.diffusion.presets import Flow
+    from dew.objectives.diffusion import DiffusionObjective
+    from dew.registry import models
+    from dew.sampling import TextToImage
+
+    class Opaque:
+        pass
+
+    class Noted(nn.Module):
+        note: object = Opaque()
+
+        @nn.compact
+        def __call__(self, x, temb, textcontext=None, train=False):
+            return nn.Dense(x.shape[-1])(x)
+
+    monkeypatch.setitem(models._members, "noted", Noted)
+    objective = DiffusionObjective(Noted(), Flow(), InputSpec(Field("image", (4, 4, 3))), guidance=None,
+                                   steps=2)
+    rows = [{"image": np.zeros((4, 4, 3), np.uint8)} for _ in range(8)]
+    data = Dataset.from_grain(grain.MapDataset.source(rows), batch=8, loading=Loading(workers=0))
+    checkpoints = Checkpoints(str(tmp_path / 'run'))
+    with caplog.at_level("WARNING", logger="dew.training.trainer"):
+        Trainer(objective, optax.sgd(.01), key=0, checkpoints=checkpoints).fit(data, steps=1,
+                                                                               checkpoint_every=1)
+    checkpoints.wait()
+    assert caplog.text.count("no loader can rebuild their model") == 1
+    assert checkpoints.variables(ema=False)["params"]
+    with pytest.raises(ValueError, match="no model to load: DiffusionObjective: Opaque is not something"):
+        TextToImage.from_run(str(tmp_path / 'run'))
+
+
+def test_an_adapted_run_records_its_base_and_adapter_and_loads_what_it_trained(tmp_path):
+    """The record of a LoRA run is the base model's record with the adapter's
+    rank, alpha and native modules; the loaded task computes what the trained
+    adapted model computes, with factors the training moved off zero."""
+    from dew.inference import TextGeneration
+    from dew.lora import LoRA
+    from dew.objectives.base import thaw
+
+    base = model()
+    adapter, variables = LoRA.fresh(base, base.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32)), {},
+                                    rank=2, modules=("q_proj", "v_proj"), key=jax.random.key(1))
+    objective = LMObjective(adapter.adapt(base), seq_len=8, ema_decay=None, pretrained=variables,
+                            trainable=adapter.trainable)
+    rows = [{'text': np.arange(9, dtype=np.int32)} for _ in range(8)]
+    data = Dataset.from_grain(grain.MapDataset.source(rows), batch=8, loading=Loading(workers=0))
+    checkpoints = Checkpoints(str(tmp_path / 'run'))
+    state = Trainer(objective, optax.sgd(1.0), key=0, checkpoints=checkpoints).fit(
+        data, steps=2, checkpoint_every=1)
+    checkpoints.wait()
+    record = checkpoints.artifact()['model']
+    assert record['architecture'] == 'causal_transformer'
+    assert record['adapter'] == {'rank': 2, 'alpha': 4.0, 'rslora': False, 'dropout': 0.0, 'modules': [
+        'params/layers_0/self_attn/q_proj', 'params/layers_0/self_attn/v_proj']}
+    assert any(np.abs(np.asarray(leaf)).max() > 0 for path, leaf in jax.tree_util.tree_leaves_with_path(
+        state.variables['params']) if 'lora_B' in jax.tree_util.keystr(path))
+    task = TextGeneration.from_run(str(tmp_path / 'run'), ema=False)
+    tokens = jnp.arange(1, 9)[None, :]
+    np.testing.assert_array_equal(np.asarray(task.model.apply(task.variables, tokens)),
+                                  np.asarray(objective.model.apply(thaw(state.variables), tokens)))
+
+
+def test_an_adapted_denoiser_run_loads_what_it_trained(tmp_path, monkeypatch):
+    import flax.linen as nn
+
+    from dew import Field, InputSpec
+    from dew.diffusion.presets import Flow
+    from dew.lora import LoRA
+    from dew.objectives.base import thaw
+    from dew.objectives.diffusion import DiffusionObjective
+    from dew.registry import models
+    from dew.sampling import TextToImage
+
+    class TinyDenoiser(nn.Module):
+        features: int = 8
+
+        @nn.compact
+        def __call__(self, x, temb, textcontext=None, train=False):
+            return x + nn.Dense(x.shape[-1], name="out")(nn.gelu(nn.Dense(self.features, name="hidden")(x)))
+
+    monkeypatch.setitem(models._members, "tiny_denoiser", TinyDenoiser)
+    base = TinyDenoiser()
+    sample = jnp.zeros((1, 4, 4, 3))
+    adapter, variables = LoRA.fresh(base, base.init(jax.random.key(0), sample, jnp.zeros((1,))), {}, rank=2,
+                                    modules=("hidden", "out"), key=jax.random.key(1))
+    objective = DiffusionObjective(adapter.adapt(base), Flow(), InputSpec(Field("image", (4, 4, 3))),
+                                   guidance=None, steps=2, ema_decay=None,
+                                   pretrained={**variables, "encoders": {}}, trainable=adapter.trainable)
+    rows = [{"image": np.full((4, 4, 3), 200, np.uint8)} for _ in range(8)]
+    data = Dataset.from_grain(grain.MapDataset.source(rows), batch=8, loading=Loading(workers=0))
+    checkpoints = Checkpoints(str(tmp_path / 'run'))
+    state = Trainer(objective, optax.sgd(1.0), key=0, checkpoints=checkpoints).fit(
+        data, steps=2, checkpoint_every=1)
+    checkpoints.wait()
+    assert checkpoints.artifact()['model']['adapter']['modules'] == ['params/hidden', 'params/out']
+    pipe = TextToImage.from_run(str(tmp_path / 'run'), ema=False)
+    x, t = jax.random.normal(jax.random.key(2), (2, 4, 4, 3)), jnp.zeros((2,))
+    np.testing.assert_array_equal(np.asarray(pipe.model.apply(thaw(pipe.variables), x, t)),
+                                  np.asarray(objective.model.apply(thaw(state.variables), x, t)))
 
 
 def test_python_lm_run_saves_its_inference_record_without_run_json(tmp_path):

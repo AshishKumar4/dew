@@ -122,7 +122,8 @@ class Registry[T: Callable[..., Any], Built](Mapping[str, T]):
         for name, held in self._members.items():
             if held is member:
                 return name
-        raise KeyError(f"{member.__name__} is not a registered {self.kind}")
+        raise KeyError(f"{member.__name__} is not a registered {self.kind}; register it once with "
+                       f"`@dew.registry.{self.kind}s(\"{member.__name__.lower()}\")` above its class")
 
     def build(self, name: str, record: Mapping[str, object] = NO_RECORD, /,
               **fields: Configured) -> Built:
@@ -293,6 +294,11 @@ def _rebuilt(annotation: Annotation, value: object) -> Configured:
         return configured(value)
     if isinstance(value, Mapping):
         held = _value_type(annotation)
+        named = _unwrapped(annotation)
+        if isinstance(named, type):
+            member, fields = _nested_member(named, value)
+            if fields is not value:
+                held, value = member, fields
         if held is None:
             # A record with no value class behind it, such as one of the unets'
             # per-stage attention settings: entries are walked and a "dtype"
@@ -314,6 +320,25 @@ def _rebuilt(annotation: Annotation, value: object) -> Configured:
                    for entry, record in zip(entries, value, strict=True)]
         return tuple(rebuilt) if wants_tuple(annotation) else type(value)(rebuilt)
     return configured(value)
+
+
+def _nested_member(held: type, value: Mapping[str, object]) -> tuple[type, Mapping[str, object]]:
+    """The class and fields a field's record names. A registered part of a
+    composite model is recorded as its registry writes it, `{"name": ...,
+    "fields": {...}}` or `{"kind": ..., **fields}` (`dew.config._to_json`), so
+    that record builds the member it names when that member is the field's
+    class or a subclass; any other record is the field class's own fields."""
+    for table in REGISTRIES:
+        if table.record == "name":
+            named, fields = value.get("name"), value.get("fields")
+            if set(value) != {"name", "fields"} or not isinstance(fields, Mapping):
+                continue
+        else:
+            named, fields = value.get("kind"), {key: field for key, field in value.items() if key != "kind"}
+        member = table._members.get(named) if isinstance(named, str) else None
+        if isinstance(member, type) and issubclass(member, held):
+            return member, fields
+    return held, value
 
 
 def configured(value: object) -> Configured:
@@ -427,7 +452,11 @@ def precision_fields(name: str, config: Mapping[str, object], *,
     """
     member = models[name]
     declared = {f.name for f in dataclasses.fields(member) if f.init}
-    written: PrecisionFields = {"dtype": dtype, "attention_impl": attention_impl}
+    written: PrecisionFields = {}
+    if "dtype" in declared:
+        written["dtype"] = dtype
+    if "attention_impl" in declared:
+        written["attention_impl"] = attention_impl
     if param_dtype is not None and "param_dtype" in declared:
         written["param_dtype"] = param_dtype
     if matmul_precision is not None and "precision" in declared:
@@ -484,10 +513,34 @@ def float64_twin(config: Mapping[str, object]) -> Mapping[str, object]:
 def with_precision(name: str, config: Mapping[str, object], *,
                    dtype: str | None, attention_impl: str, param_dtype: str | None = None,
                    matmul_precision: str | None = None) -> Mapping[str, object]:
-    """Return a model config with the run's compute dtype and attention kernel in it."""
-    return {**config, **precision_fields(
+    """Return a model config with the run's compute dtype and attention kernel in it.
+
+    A composite that declares no `dtype` of its own, DiffusionGemma around its
+    text decoder, passes the run's compute dtype to the registered model parts
+    its record nests, which own it."""
+    fields = {**config, **precision_fields(
         name, config, dtype=dtype, attention_impl=attention_impl,
         param_dtype=param_dtype, matmul_precision=matmul_precision)}
+    if dtype is None or "dtype" in {field.name for field in dataclasses.fields(models[name])}:
+        return fields
+    return {key: _with_part_dtype(configured(value), dtype) for key, value in fields.items()}
+
+
+def _with_part_dtype(value: Configured, dtype: str) -> Configured:
+    """A composite's part with the run's compute dtype, where the part is a
+    registered model, recorded or built, that declares one."""
+    from flax import linen as nn
+
+    if isinstance(value, nn.Module):
+        owns = type(value) in models.values() and "dtype" in {f.name for f in dataclasses.fields(value)}
+        return value.clone(dtype=resolve_dtype(dtype)) if owns else value
+    if not isinstance(value, Mapping) or set(value) != {"name", "fields"}:
+        return value
+    name, fields = value["name"], value["fields"]
+    if (isinstance(name, str) and name in models and isinstance(fields, Mapping)
+            and "dtype" in {field.name for field in dataclasses.fields(models[name])}):
+        return {"name": name, "fields": {**fields, "dtype": dtype}}
+    return value
 
 
 models: Registry[type[nn.Module], nn.Module] = Registry("model")

@@ -22,10 +22,11 @@ import dew
 import dew.nn.backbones  # registers the models
 from dew.artifacts import VideoGrid
 from dew.config import ModelConfig, RunConfig, TrainerConfig
-from dew.data import Dataset, TFDSImages, VideoDataset
+from dew.data import ByteTokenizer, Dataset, TFDSImages, VideoDataset
 from dew.diffusion import FlowMatchPredictionTransform
 from dew.diffusion.presets import EDM, Flow
 from dew.diffusion.schedules import FlowMatchingScheduler
+from dew.inference import RunProcessor
 from dew.inputs import Field, unit_range
 from dew.objectives.base import merge
 from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
@@ -164,17 +165,17 @@ def test_from_run_restores_the_averaged_weights_by_default(tmp_path):
 
     pipe = TextToImage.from_run(str(tmp_path))
     for expected, loaded in zip(jax.tree.leaves(averaged["params"]),
-                                jax.tree.leaves(pipe.params["params"]), strict=True):
+                                jax.tree.leaves(pipe.variables["params"]), strict=True):
         np.testing.assert_allclose(np.asarray(loaded), np.asarray(expected))
     live = TextToImage.from_run(str(tmp_path), ema=False)
     for expected, loaded in zip(jax.tree.leaves(state.variables["params"]),
-                                jax.tree.leaves(live.params["params"]), strict=True):
+                                jax.tree.leaves(live.variables["params"]), strict=True):
         np.testing.assert_allclose(np.asarray(loaded), np.asarray(expected))
     assert not all(np.allclose(np.asarray(a), np.asarray(b)) for a, b in zip(
-        jax.tree.leaves(pipe.params["params"]), jax.tree.leaves(live.params["params"]), strict=True))
+        jax.tree.leaves(pipe.variables["params"]), jax.tree.leaves(live.variables["params"]), strict=True))
     # the frozen encoder's table is the run's, not something re-drawn
     np.testing.assert_array_equal(
-        np.asarray(pipe.params["encoders"]["textcontext"]["table"]),
+        np.asarray(pipe.variables["encoders"]["textcontext"]["table"]),
         np.asarray(objective.inputs.conditions["textcontext"].encoder.params["table"]))
 
 
@@ -182,10 +183,10 @@ def test_a_run_that_keeps_one_copy_of_its_weights_samples_it_by_default(tmp_path
     """A published run may hold its weights once, with no average beside
     them; the default reads that copy, and asking for an average it does not
     keep is refused."""
-    _, state = make_run(tmp_path / "kept")
+    objective, state = make_run(tmp_path / "kept")
     single = tmp_path / "single"
     checkpoints = Checkpoints(str(single), keep=1)
-    checkpoints.save(int(state.step), state.replace(ema=None), None)
+    checkpoints.save(int(state.step), state.replace(ema=None), None, artifact=objective.inference_record())
     checkpoints.wait()
     dataclasses.replace(run_config(single), ema_decay=None).save(str(single))
 
@@ -229,7 +230,7 @@ def test_sampler_and_guidance_are_call_arguments(tmp_path):
     branches to differ; then guidance is visible in the sample."""
     make_run(tmp_path)
     loaded = TextToImage.from_run(str(tmp_path))
-    pipe = dataclasses.replace(loaded, params=jax.tree.map(lambda leaf: leaf + 0.05, loaded.params))
+    pipe = dataclasses.replace(loaded, variables=jax.tree.map(lambda leaf: leaf + 0.05, loaded.variables))
     key = jax.random.PRNGKey(1)
     plain = pipe(["x"], steps=8, guidance=None, solver=Heun(), key=key).host().images
     guided = (
@@ -373,8 +374,9 @@ def test_guidance_is_a_value_with_its_interval(tmp_path):
 
 
 def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16):
-    """Two training steps of a tiny byte-level decoder, its checkpoint and the
-    `run.json` the LM recipe writes: the resolved model, tokenizer and budget.
+    """Two training steps of a tiny byte-level decoder, its checkpoints, whose
+    record names the byte tokenizer it decodes through, and the `run.json` the
+    LM recipe writes: the resolved model, tokenizer and budget.
     `max_seq_len` is the model's window, which training at 9 ids does not
     reach."""
     import json
@@ -387,7 +389,8 @@ def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16):
                   "mlp_features": 32, "max_seq_len": max_seq_len}
     model_config = ModelConfig("causal_transformer", fields, dtype="float32", attention_impl="reference")
     objective = LMObjective(model_config.build(), 8, ema_decay=ema_decay,
-                            samples=Samples([1, 2, 3], 4, sampling=Sampling(temperature=0, eos_id=255)))
+                            samples=Samples([1, 2, 3], 4, sampling=Sampling(temperature=0, eos_id=255)),
+                            processor=RunProcessor(ByteTokenizer()))
     rng = np.random.RandomState(0)
     batch = {"text": rng.randint(1, 250, (8, 9)).astype(np.int32)}
 
@@ -429,10 +432,11 @@ def test_objective_pipeline_binds_the_trained_state_in_place(tmp_path):
     pipe = objective.pipeline(state)
     assert isinstance(pipe, TextToImage)
     assert (pipe.steps, pipe.guidance, pipe.solver) == (objective.steps, objective.guidance, objective.solver)
-    for expected, bound in zip(jax.tree.leaves(state.averaged), jax.tree.leaves(pipe.params), strict=True):
+    for expected, bound in zip(jax.tree.leaves(state.averaged), jax.tree.leaves(pipe.variables), strict=True):
         assert bound is expected
     live = objective.pipeline(state, ema=False)
-    for expected, bound in zip(jax.tree.leaves(state.variables), jax.tree.leaves(live.params), strict=True):
+    for expected, bound in zip(jax.tree.leaves(state.variables), jax.tree.leaves(live.variables),
+                               strict=True):
         assert bound is expected
     drawn = pipe(["a", "b"], key=4).host().images
     assert drawn.shape == (2, RES, RES, 3)
@@ -492,8 +496,8 @@ def test_pipeline_answers_an_lm_run_with_its_tokenizer_and_budget(tmp_path):
 def test_an_lm_run_without_an_average_publishes_and_exports_its_live_weights(tmp_path):
     """An LM keeps no EMA unless asked, so each reader's default takes the
     live weights of such a run: the objective's pipeline, `dew.pipeline`
-    and `export_run`."""
-    from dew.interop import Pretrained, export_run
+    and `Pretrained.from_run`."""
+    from dew.interop import Pretrained
 
     run = tmp_path / "run"
     run.mkdir()
@@ -503,7 +507,7 @@ def test_an_lm_run_without_an_average_publishes_and_exports_its_live_weights(tmp
         jax.tree.leaves(state.variables), jax.tree.leaves(published.variables), strict=True
     ):
         assert bound is expected
-    export_run(str(run), tmp_path / "export")
+    Pretrained.from_run(str(run)).save(tmp_path / "export")
     reloaded = Pretrained.load(tmp_path / "export", dtype="float32", attention_impl="reference")
     ids = jnp.asarray([[3, 4, 5, 6]], jnp.int32)
     np.testing.assert_array_equal(np.asarray(reloaded.model.apply(reloaded.variables, ids)),
@@ -630,32 +634,29 @@ def test_explicit_average_requests_do_not_substitute_live_weights(tmp_path):
                                   live("the ", key=7).host().tokens)
 
 
-def make_block_run(directory):
-    """A block-diffusion run directory: the committed DiffusionGemma fixture's
-    weights under a checkpoint, and the `run.json` a block run writes."""
+def make_block_run(directory, fixture="diffusion-gemma-workflow"):
+    """A block-diffusion run directory: a committed DiffusionGemma fixture's
+    weights under a checkpoint that records the objective and its byte
+    tokenizer. The default fixture reads images; `diffusion-gemma-sft` is
+    text-only, which is what has a published layout to export to."""
     from pathlib import Path
 
     from dew.interop import Pretrained
     from dew.objectives.diffusion.block import BlockDiffusionObjective
 
-    fixture = Path(__file__).resolve().parent / "fixtures/hf/diffusion-gemma-workflow"
+    fixture = Path(__file__).resolve().parent / "fixtures/hf" / fixture
     bundle = Pretrained.load(str(fixture), dtype="float32", attention_impl="xla", max_seq_len=32)
-    objective = BlockDiffusionObjective(bundle.model, prompt_length=3, pretrained=bundle.variables)
+    objective = BlockDiffusionObjective(bundle.model, prompt_length=3, pretrained=bundle.variables,
+                                        processor=RunProcessor(ByteTokenizer()))
     state = Trainer(objective, optax.sgd(0.01), key=jax.random.PRNGKey(2)).initial_state()
     checkpoints = Checkpoints(str(directory))
-    checkpoints.save(0, state, None)
+    checkpoints.save(0, state, None, artifact=objective.inference_record())
     checkpoints.wait()
-    config = ModelConfig("diffusion_gemma",
-                         {**bundle.config, "max_seq_len": bundle.model.max_seq_len},
-                         dtype="float32", attention_impl="auto")
-    (directory / "run.json").write_text(json.dumps({
-        "objective": "block_diffusion", "model": dataclasses.asdict(config),
-        "tokenizer": "byte", "pad_token_id": 0}))
 
 
 def make_masked_run(directory):
     """A masked-diffusion run directory: the committed llada-tiny weights under
-    a checkpoint, and the `run.json` a masked run writes."""
+    a checkpoint that records the objective and its byte tokenizer."""
     from pathlib import Path
 
     from dew.diffusion.discrete import MDLM
@@ -665,17 +666,12 @@ def make_masked_run(directory):
     fixture = Path(__file__).resolve().parent / "fixtures/hf/llada-tiny"
     source = Pretrained.load(fixture, dtype="float32", attention_impl="xla")
     objective = MaskedDiffusionObjective(source.model, MDLM(mask_id=120)(), 8,
-                                         pretrained=source.variables, ema_decay=None)
+                                         pretrained=source.variables, ema_decay=None,
+                                         processor=RunProcessor(ByteTokenizer()))
     state = Trainer(objective, optax.sgd(0.05), key=jax.random.PRNGKey(19)).initial_state()
     checkpoints = Checkpoints(str(directory))
-    checkpoints.save(0, state, None)
+    checkpoints.save(0, state, None, artifact=objective.inference_record())
     checkpoints.wait()
-    fields = {name: value for name, value in source.model_config.items()
-              if name not in ("dtype", "attention_impl")}
-    config = ModelConfig("causal_transformer", fields, dtype="float32", attention_impl="xla")
-    (directory / "run.json").write_text(json.dumps({
-        "objective": "masked_diffusion", "model": dataclasses.asdict(config),
-        "tokenizer": "byte", "sample_tokens": 8}))
 
 
 @pytest.mark.parametrize("make,task_type,prompt,budget", [
@@ -702,8 +698,15 @@ def test_every_saved_text_kind_constructs_through_its_own_task_class(
 
 @pytest.mark.parametrize("kind", ["jepa", "unregistered"])
 def test_saved_non_generation_objectives_fail_at_the_front_door(tmp_path, kind):
-    import json
-    (tmp_path / "run.json").write_text(json.dumps({"objective": kind}))
+    from dew.nn.backbones import CausalTransformer
+    from dew.objectives.lm import LMObjective
+
+    model = CausalTransformer(vocab_size=8, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
+                              max_seq_len=8)
+    state = Trainer(LMObjective(model, 4), optax.sgd(0.), key=jax.random.key(0)).initial_state()
+    checkpoints = Checkpoints(str(tmp_path))
+    checkpoints.save(0, state, None, artifact={"objective": kind})
+    checkpoints.wait()
     with pytest.raises(TypeError, match="no saved generation task") as refusal:
         dew.pipeline(str(tmp_path))
     named = str(refusal.value)
@@ -714,17 +717,16 @@ def test_saved_non_generation_objectives_fail_at_the_front_door(tmp_path, kind):
 
 
 def test_saved_sampling_policy_survives_a_disabled_preview_budget(tmp_path):
-    import json
-
     from dew.sampling import Sampling
 
-    objective, state = make_lm_run(tmp_path)
+    (tmp_path / "run").mkdir()
+    objective, state = make_lm_run(tmp_path / "run")
     policy = Sampling(temperature=0.37, top_k=3, eos_id=255)
-    path = tmp_path / "run.json"
-    record = json.loads(path.read_text())
-    record.update(sample_tokens=0, sampling=dataclasses.asdict(policy))
-    path.write_text(json.dumps(record))
-    task = dew.pipeline(str(tmp_path))
+    checkpoints = Checkpoints(str(tmp_path / "unbudgeted"))
+    checkpoints.save(int(state.step), state, None, artifact={
+        **objective.inference_record(), "sample_tokens": 0, "sampling": dataclasses.asdict(policy)})
+    checkpoints.wait()
+    task = dew.pipeline(str(tmp_path / "unbudgeted"))
     assert task.max_new_tokens is None
     with pytest.raises(ValueError, match="max_new_tokens is required"):
         task([[1, 2]], key=4)
@@ -774,7 +776,7 @@ def test_saved_diffusion_precision_reconstructs_owners_without_source_weights(
                 "constants": {"scale": jnp.asarray([1.007], jnp.float32)}}
     state = dataclasses.replace(initial, variables=params, ema=averaged)
     checkpoints = Checkpoints(str(directory))
-    checkpoints.save(0, state, None)
+    checkpoints.save(0, state, None, artifact=objective.inference_record())
     checkpoints.wait()
     config.save(str(directory))
 
@@ -800,7 +802,7 @@ def test_saved_diffusion_precision_reconstructs_owners_without_source_weights(
 
     expected_params = jax.tree_util.tree_map_with_path(expected_leaf, merged)
     for expected, actual in zip(
-        jax.tree.leaves(expected_params), jax.tree.leaves(restored.params), strict=True
+        jax.tree.leaves(expected_params), jax.tree.leaves(restored.variables), strict=True
     ):
         assert actual.dtype == expected.dtype
         np.testing.assert_array_equal(actual, expected)
@@ -836,13 +838,13 @@ def test_saved_diffusion_precision_reconstructs_owners_without_source_weights(
                                   reference(["a red bird"], steps=2, key=5).host().images)
     owned = restored.inputs.conditions["textcontext"].encoder.params
     for owner_leaf, bound_leaf in zip(
-        jax.tree.leaves(owned), jax.tree.leaves(restored.params["encoders"]["textcontext"]), strict=True
+        jax.tree.leaves(owned), jax.tree.leaves(restored.variables["encoders"]["textcontext"]), strict=True
     ):
         assert owner_leaf.dtype == bound_leaf.dtype and owner_leaf.sharding == bound_leaf.sharding
         np.testing.assert_array_equal(owner_leaf, bound_leaf)
     assert isinstance(restored.autoencoder, StableDiffusionVAE)
     for owner_leaf, bound_leaf in zip(jax.tree.leaves(restored.autoencoder.params),
-                                      jax.tree.leaves(restored.params["autoencoder"]), strict=True):
+                                      jax.tree.leaves(restored.variables["autoencoder"]), strict=True):
         assert owner_leaf.dtype == bound_leaf.dtype and owner_leaf.sharding == bound_leaf.sharding
         np.testing.assert_array_equal(owner_leaf, bound_leaf)
 
@@ -856,7 +858,7 @@ def test_saved_decoder_compute_and_storage_overrides_generate_from_the_same_weig
     from dew.inference import TextGeneration
     from dew.objectives.base import FROZEN
 
-    _, state = make_lm_run(tmp_path)
+    objective, state = make_lm_run(tmp_path)
     baseline = dew.pipeline(str(tmp_path))
     assert isinstance(baseline, TextGeneration)
     first = next(iter(state.variables["params"]))
@@ -871,7 +873,7 @@ def test_saved_decoder_compute_and_storage_overrides_generate_from_the_same_weig
     frozen = dataclasses.replace(state, step=jnp.asarray(step, state.step.dtype),
                                  variables=move_to_frozen(state.variables), ema=move_to_frozen(state.ema))
     checkpoints = Checkpoints(str(tmp_path))
-    checkpoints.save(step, frozen, None)
+    checkpoints.save(step, frozen, None, artifact=objective.inference_record())
     checkpoints.wait()
     params = baseline.variables
     if storage is not None:
@@ -901,7 +903,7 @@ def test_saved_bare_encoder_weights_follow_storage_without_changing_compute(tmp_
     assert isinstance(encoder, CharTable)
     stored = merge(state.variables, state.ema)
     expected_vars = jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16), stored)
-    table = restored.params["encoders"]["textcontext"]["table"]
+    table = restored.variables["encoders"]["textcontext"]["table"]
     assert table.dtype == jnp.bfloat16
     assert encoder.params["table"].dtype == table.dtype
     np.testing.assert_array_equal(encoder.params["table"], table)
@@ -994,11 +996,11 @@ def test_binding_new_encoder_weights_recomputes_the_warmed_blank(tmp_path):
     assert restored.blank is not None
     old_blank = restored.blank(old.conditions)
 
-    denoiser_update = {**restored.params, "params": jax.tree.map(lambda value: value + 0.03125,
-                                                             restored.params["params"])}
+    denoiser_update = {**restored.variables, "params": jax.tree.map(lambda value: value + 0.03125,
+                                                             restored.variables["params"])}
     assert restored.bind(denoiser_update).blank is restored.blank
-    encoders = jax.tree.map(lambda value: value + 0.03125, restored.params["encoders"])
-    changed = {**restored.params, "encoders": encoders}
+    encoders = jax.tree.map(lambda value: value + 0.03125, restored.variables["encoders"])
+    changed = {**restored.variables, "encoders": encoders}
     rebound = restored.bind(changed)
     fresh_objective = config.build(variables=changed)
     fresh = TextToImage.from_objective(fresh_objective, changed)
