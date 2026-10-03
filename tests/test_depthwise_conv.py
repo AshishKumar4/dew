@@ -253,7 +253,10 @@ def test_published_hybrid_dit_samples_within_fp32_rounding(tmp_path):
     the polyphase form is lax's convolution bit for bit. The trajectory
     turns one ulp into 5e-5, so an absolute bound tight enough to mean
     something would demand lax's bits. A missing tap moves the latents by
-    order 1. The published bf16 decoder is recorded separately, with no
+    order 1. Every run measures the floor again (`one_rounding_*` in the
+    report `tools/benchmark_depthwise.py checkpoint` writes); that command
+    outside the lane's flags gave latents max 2.30e-5 against one
+    rounding's 1.66e-5. The published bf16 decoder is recorded separately, with no
     image-identity assertion: its rounding maps latent noise of the same
     size to pixel differences of about 0.05.
     """
