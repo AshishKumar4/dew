@@ -2589,8 +2589,6 @@
     "hf/diffusion-gemma-sc-tiny/inputs.npy",
     "hf/diffusion-gemma-sc-tiny/model.safetensors",
     "hf/diffusion-gemma-sc-tiny/signal.npy",
-    "hf/dream-tiny/input_ids.npy",
-    "hf/dream-tiny/model.safetensors",
     "hf/gemma-tiny/input_ids.npy",
     "hf/gemma-tiny/model.safetensors",
     "hf/gemma2-tiny/input_ids.npy",
@@ -2612,8 +2610,6 @@
     "hf/gemma4-vision-wide-tiny/pixels.npy",
     "hf/gemma4-vision-wide-tiny/positions.npy",
     "hf/gemma4-vision-wide-tiny/projector.safetensors",
-    "hf/llada-tiny/input_ids.npy",
-    "hf/llada-tiny/model.safetensors",
     "hf/llama-tiny/input_ids.npy",
     "hf/llama31-tiny/input_ids.npy",
     "hf/llama31-tiny/model.safetensors",
@@ -2798,6 +2794,16 @@
    "what": "the published shard headers' tensor listing",
    "files": [
     "hf/kimi-linear-source/tensors.json.xz"
+   ]
+  },
+  {
+   "from": "AshishKumar4/dew@18511496038f9ca14652272a8081c698b244b580",
+   "what": "the random weights and probe ids tools/hf_reference.py's write_diffusion_tiny drew there; tools/remote_code_reference.py computes the released code's logits from them",
+   "files": [
+    "hf/dream-tiny/input_ids.npy",
+    "hf/dream-tiny/model.safetensors",
+    "hf/llada-tiny/input_ids.npy",
+    "hf/llada-tiny/model.safetensors"
    ]
   }
  ]

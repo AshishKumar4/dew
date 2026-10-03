@@ -91,6 +91,9 @@ def test_the_rule_refuses_what_it_is_for():
     assert problems(path, {**real, "sources": []})
     assert problems(path, {"generator": "dew", **real})
     assert problems("no/such/fixture.npz", {"generator": "dew"})
+    with pytest.raises(AssertionError):
+        test_an_input_group_names_what_wrote_its_files(
+            {"tool": "tools/audio_reference.py", "files": ["hf/llama-tiny/model.safetensors"]})
 
 
 def arrays() -> list[str]:
@@ -108,13 +111,29 @@ def owners(path: str) -> list[str]:
                       for group in INPUTS if path in group["files"]]
 
 
+def named_in(source: str, name: str) -> bool:
+    """Whether `source` names `name`: literally, or through a formatted
+    string such as f"qwen38-{kind}-tiny" or f"video_{index}.npy"."""
+    if name in source:
+        return True
+    templates = re.findall(r"""f["']([^"'\n]*\{[^"'\n]*)["']""", source)
+    return any(re.fullmatch(re.sub(r"\\\{[^}]*\\\}", ".+", re.escape(template)), name)
+               for template in templates)
+
+
 @pytest.mark.parametrize("group", INPUTS, ids=lambda group: group.get("tool") or group.get("from"))
 def test_an_input_group_names_what_wrote_its_files(group):
-    if "tool" in group:
-        assert (ROOT / group["tool"]).is_file(), group["tool"]
-    else:
-        assert re.fullmatch(r"[\w.-]+/[\w.-]+@[0-9a-f]{40}", group["from"]), group["from"]
+    """The group's tool exists and its source names the directory of each file
+    it claims to write (a top-level file, by its own name)."""
     assert [path for path in group["files"] if not (FIXTURES / path).is_file()] == []
+    if "from" in group:
+        assert re.fullmatch(r"[\w.-]+/[\w.-]+@[0-9a-f]{40}", group["from"]), group["from"]
+        return
+    assert (ROOT / group["tool"]).is_file(), group["tool"]
+    source = (ROOT / group["tool"]).read_text()
+    unnamed = [path for path in group["files"]
+               if not named_in(source, Path(path).parent.name or Path(path).name.split(".")[0])]
+    assert unnamed == []
 
 
 def test_every_array_file_has_exactly_one_record():
