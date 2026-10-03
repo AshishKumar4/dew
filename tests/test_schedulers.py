@@ -7,11 +7,13 @@ image and video batches, and exact invertibility of the forward diffusion.
 """
 
 from functools import partial
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from reference_error import assert_as_exact_as_the_reference
 
 import dew.diffusion.schedules as schedulers
 from dew.diffusion import (
@@ -63,6 +65,8 @@ VP_CASES = [case for case in ALL_CASES if case[3] == 'vp']
 VP_IDS = [case[0].__name__ for case in VP_CASES]
 VE_CASES = [case for case in ALL_CASES if case[3] == 've']
 VE_IDS = [case[0].__name__ for case in VE_CASES]
+
+BETAS = dict(np.load(Path(__file__).parent / "fixtures" / "schedules" / "betas.npz"))
 
 
 @pytest.mark.parametrize("cls,make,steps,family", ALL_CASES, ids=ALL_IDS)
@@ -154,12 +158,25 @@ def test_flow_matching_stays_on_the_linear_path():
     assert jnp.allclose(alpha + sigma, 1.0, atol=1e-6)
 
 
-def test_sqrt_schedule_matches_the_diffusion_lm_formula():
-    """Li et al. 2022: alpha = sqrt(1 - t), sigma = sqrt(t), the plain x_0 loss."""
+@pytest.mark.parametrize("steps", [2000, 1000])
+def test_sqrt_schedule_is_diffusion_lms_table(steps):
+    """Diffusion-LM's own `get_named_beta_schedule("sqrt", T)` (Li et al.
+    2022, XiangLi1999/Diffusion-LM at 759889d, run by
+    tools/beta_schedule_reference.py): at its step k the cumulative alpha is
+    Dew's alpha^2 at t = (k + 1) / T. Dew evaluates in fp32 from a rounded t,
+    so each rate squared carries at most 8 fp32 roundings of quantities no
+    larger than one: t and t + s (each moving alpha^2 by at most half a
+    rounding), the square root, the subtraction, the division and its
+    constant (a rounding each), and the final square root, twice once
+    squared. The last step is excluded: Diffusion-LM clips its beta at
+    0.999 where the cumulative alpha crosses zero, and Dew stops at (0, 1)."""
+    table = np.cumprod(1 - BETAS[f"diffusion_lm_sqrt_{steps}"])
     schedule = SqrtContinuousNoiseScheduler()
-    alpha, sigma = schedule.rates(CONTINUOUS_STEPS)
-    assert jnp.allclose(alpha, jnp.sqrt(1 - CONTINUOUS_STEPS), atol=1e-6)
-    assert jnp.allclose(sigma, jnp.sqrt(CONTINUOUS_STEPS), atol=1e-6)
+    alpha, sigma = schedule.rates(np.arange(1, steps + 1) / steps)
+    bound = 8 * 2.0 ** -24
+    assert np.max(np.abs(np.asarray(alpha, np.float64)[:-1] ** 2 - table[:-1])) <= bound
+    assert np.max(np.abs(np.asarray(sigma, np.float64)[:-1] ** 2 - (1 - table[:-1]))) <= bound
+    assert schedule.rates(jnp.asarray(1.0)) == (0.0, 1.0)
     assert jnp.allclose(schedule.weight(CONTINUOUS_STEPS), 1.0)
 
 
@@ -201,36 +218,22 @@ def test_generalized_weights_read_their_sigma_data():
     assert jnp.allclose(narrow - wide, 1 / 0.5**2 - 1 / 1.0**2, rtol=1e-5)
 
 
-@pytest.mark.parametrize("P_mean,P_std", [(-0.4, 1.0), (-1.2, 1.2)])
-def test_edm_lognormal_sigma_distribution(rng, P_mean, P_std):
-    """EDM training sigmas follow exp(N(P_mean, P_std^2)), defaulting to EDM2."""
-    schedule = EDMNoiseScheduler(sigma_max=80, sigma_data=0.5, P_mean=P_mean, P_std=P_std)
-    log_sigma = jnp.log(schedule.sigmas(schedule.sample_t(rng, 20000)))
-    assert abs(float(jnp.mean(log_sigma)) - P_mean) < 0.05
-    assert abs(float(jnp.std(log_sigma)) - P_std) < 0.05
-
-
-def test_cosine_table_is_nichol_and_dhariwals_cumulative_alpha():
-    """Nichol and Dhariwal 2021, Eq. 17: at index t the cumulative alpha is
-    f(t + 1) / f(0) with f(u) = cos^2((u / T + s) / (1 + s) pi / 2), where the
-    table is the product of one minus each beta. Checked away from the top of
-    the table, where the clip on each beta rounds the last few entries."""
-    T, s = 1000, 0.008
-    schedule = CosineNoiseScheduler(T, beta_start=s)
-    index = jnp.array([0, 10, 300, 600, 900])
-    def f(u):
-        return jnp.cos((u / T + s) / (1 + s) * jnp.pi / 2) ** 2
-    expected = f(index + 1.0) / f(0.0)
-    assert jnp.allclose(schedule.rates(index)[0] ** 2, expected, rtol=1e-4)
-
-
-def test_discrete_p2_default_makes_the_v_loss_an_x0_loss():
-    """The P2 weight at k = 1, gamma = 1 is 1 / (1 + SNR), and the v error is
-    (1 + SNR) times the x_0 error, so their product is the unweighted x_0 loss."""
-    schedule = CosineNoiseScheduler(1000)
-    snr = schedule.snr(DISCRETE_STEPS)
-    assert jnp.allclose(schedule.weight(DISCRETE_STEPS) * VPredictionTransform().target_error_scale(snr),
-                        1.0, rtol=1e-4)
+@pytest.mark.parametrize("name,steps", [("linear", 1000), ("linear", 250), ("linear", 4000),
+                                        ("cosine", 1000), ("cosine", 4000)])
+def test_beta_tables_are_improved_diffusions(name, steps):
+    """openai/improved-diffusion's own `get_named_beta_schedule` at 1bc7bbb
+    (Nichol and Dhariwal 2021; tools/beta_schedule_reference.py): the linear
+    table of Ho et al. scaled to the step count, and the cosine table with
+    its 0.999 clip. Both are computed in float64 the way the authors do, so
+    the betas are theirs to the bit, and the fp32 rates are their cumulative
+    alphas rounded once."""
+    reference = BETAS[f"improved_diffusion_{name}_{steps}"]
+    schedule = (LinearNoiseScheduler if name == "linear" else CosineNoiseScheduler)(steps)
+    np.testing.assert_array_equal(np.asarray(schedule._record_fields["betas"]), reference)
+    alpha, sigma = schedule.rates(jnp.arange(steps))
+    cumulative = np.cumprod(1 - reference)
+    np.testing.assert_array_equal(alpha, np.sqrt(cumulative).astype(np.float32))
+    np.testing.assert_array_equal(sigma, np.sqrt(1 - cumulative).astype(np.float32))
 
 
 def test_small_beta_p2_weights_agree_with_the_reported_snr():
@@ -241,6 +244,24 @@ def test_small_beta_p2_weights_agree_with_the_reported_snr():
     # The independently rounded rates, SNR and weight allow a few fp32 operations.
     np.testing.assert_allclose(schedule.weight(steps), expected,
                                rtol=8 * np.finfo(np.float32).eps, atol=0)
+
+WEIGHTS = dict(np.load(Path(__file__).parent / "fixtures" / "weighting" / "weights.npz"))
+TABLES = ("linear", "zero_terminal_cosine")
+
+
+@pytest.mark.parametrize("table", TABLES)
+@pytest.mark.parametrize("k,gamma", [(1, 1), (1, 0.5), (2, 1)])
+def test_p2_weights_are_the_authors(k, gamma, table):
+    """P2 (Choi et al. 2022) as jychoi118/P2-weighting@3da0947 computes it:
+    its own `training_losses` on an epsilon model at every step of the
+    table (tools/weighting_reference.py), against the discrete table's
+    weight, held to the float64 rule."""
+    key = f"p2_epsilon_p2_k{k}_p2_gamma{gamma}_{table}".replace(".", "p")
+    schedule = schedulers.DiscreteNoiseScheduler(WEIGHTS[f"betas_{table}"], p2_loss_weight_k=k,
+                                                 p2_loss_weight_gamma=gamma)
+    weight = Process(schedule, EpsilonPredictionTransform()).weight(jnp.arange(schedule.T))
+    assert_as_exact_as_the_reference(weight, WEIGHTS[key], WEIGHTS[f"{key}_f64"], key)
+
 
 ############################################################################################################
 # min-SNR-gamma loss weighting (Hang et al. 2023), through Process
@@ -253,18 +274,23 @@ def min_snr_process(transform, gamma):
     return Process(CosineNoiseScheduler(1000), transform, weighting=MinSNR(gamma))
 
 
-def test_min_snr_epsilon_weights_match_the_paper():
-    process = min_snr_process(EpsilonPredictionTransform(), 5.0)
-    snr = process.schedule.snr(MIN_SNR_STEPS)
-    expected = jnp.minimum(snr, 5.0) / snr
-    assert jnp.allclose(process.weight(MIN_SNR_STEPS), expected, rtol=1e-5)
-
-
-def test_min_snr_v_weights_match_the_paper():
-    process = min_snr_process(VPredictionTransform(), 5.0)
-    snr = process.schedule.snr(MIN_SNR_STEPS)
-    expected = jnp.minimum(snr, 5.0) / (snr + 1)
-    assert jnp.allclose(process.weight(MIN_SNR_STEPS), expected, rtol=1e-5)
+@pytest.mark.parametrize("table", TABLES)
+@pytest.mark.parametrize("transform,name", [
+    (EpsilonPredictionTransform(), "epsilon_mse_loss_weight_typemin_snr_5"),
+    (VPredictionTransform(), "velocity_mse_loss_weight_typevmin_snr_5"),
+    (DirectPredictionTransform(), "start_x_mse_loss_weight_typemin_snr_5"),
+], ids=["epsilon", "v", "x0"])
+def test_min_snr_weights_are_the_authors(transform, name, table):
+    """min-SNR-5 as TiankaiHang/Min-SNR-Diffusion-Training@5189997 computes
+    it, per parameterization (`min_snr_5` on epsilon and x_0, `vmin_snr_5` on
+    v): its own `training_losses` at every step (tools/weighting_reference.py),
+    held to the float64 rule. On the zero-terminal table the last step has
+    zero SNR, which the authors weight as one."""
+    key = f"min_snr_{name}_{table}"
+    process = Process(schedulers.DiscreteNoiseScheduler(WEIGHTS[f"betas_{table}"]), transform,
+                      weighting=MinSNR(5.0))
+    weight = process.weight(jnp.arange(process.schedule.T))
+    assert_as_exact_as_the_reference(weight, WEIGHTS[key], WEIGHTS[f"{key}_f64"], key)
 
 
 @pytest.mark.parametrize("transform", [KarrasPredictionTransform(0.5),

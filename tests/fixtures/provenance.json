@@ -269,6 +269,27 @@
    ],
    "note": "Executes fetched official edm_sampler; no installed upstream package import."
   },
+  "edm/loss.npz": {
+   "tool": "tools/edm_loss_reference.py",
+   "sources": [
+    {
+     "repo": "NVlabs/edm",
+     "version": "008a4e5316c8e3bfe61a62f874bddba254295afb",
+     "runs": "fetched"
+    },
+    {
+     "repo": "NVlabs/edm2",
+     "version": "4bf8162f601bcc09472ce8a32dd0cbe8889dc8fc",
+     "runs": "fetched"
+    },
+    {
+     "repo": "pytorch/pytorch",
+     "version": "2.14.0",
+     "runs": "torch"
+    }
+   ],
+   "note": "EDMLoss through EDMPrecond and EDM2Loss through Precond, around an affine stand-in network; images, draws and stand-in weights are inputs."
+  },
   "edm2": {
    "tool": "tools/edm2_reference.py",
    "sources": [
@@ -301,6 +322,28 @@
     }
    ],
    "note": "FlaxDiff 0.2.10, JAX 0.5.3 and Flax 0.10.6 documented at tool:29."
+  },
+  "flow/densities.npz": {
+   "tool": "tools/flow_density_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/diffusers",
+     "version": "0.34.0",
+     "runs": "diffusers"
+    }
+   ],
+   "note": "compute_density_for_timestep_sampling on the draws FlowMatchingScheduler.sample_t makes from jax.random.key(0)."
+  },
+  "flow/resolution_shift.npz": {
+   "tool": "tools/flux_shift_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/diffusers",
+     "version": "0.34.0",
+     "runs": "diffusers"
+    }
+   ],
+   "note": "Flux's calculate_shift read from the installed pipeline module and the scheduler's _time_shift_exponential."
   },
   "flux2_published.npz": {
    "tool": "tools/diffusers_flux2_reference.py",
@@ -2396,6 +2439,22 @@
    ],
    "note": "Executes upstream modules under their own names with training-stack imports stubbed, tools/parity_rl.py:177,197,219."
   },
+  "schedules/betas.npz": {
+   "tool": "tools/beta_schedule_reference.py",
+   "sources": [
+    {
+     "repo": "openai/improved-diffusion",
+     "version": "1bc7bbbdc414d83d4abf2ad8cc1446dc36c4e4d5",
+     "runs": "fetched"
+    },
+    {
+     "repo": "XiangLi1999/Diffusion-LM",
+     "version": "759889d58ef38e2eed41a8c34db8032e072826f4",
+     "runs": "fetched"
+    }
+   ],
+   "note": "The authors' get_named_beta_schedule and betas_for_alpha_bar, executed as written."
+  },
   "sd3_source.tar.xz": {
    "tool": "tools/diffusers_sd3_reference.py",
    "sources": [
@@ -2538,6 +2597,27 @@
     }
    ],
    "note": "Loads the saved Wan VAE fixture in bfloat16 and records posterior/decode and input gradients."
+  },
+  "weighting/weights.npz": {
+   "tool": "tools/weighting_reference.py",
+   "sources": [
+    {
+     "repo": "jychoi118/P2-weighting",
+     "version": "3da0947ac350072e457c211401218175bc94e137",
+     "runs": "fetched"
+    },
+    {
+     "repo": "TiankaiHang/Min-SNR-Diffusion-Training",
+     "version": "5189997d6bbde5a1301bcf31a54d2b3589f7309c",
+     "runs": "fetched"
+    },
+    {
+     "repo": "pytorch/pytorch",
+     "version": "2.14.0",
+     "runs": "torch"
+    }
+   ],
+   "note": "Each repo's own GaussianDiffusion.training_losses at every step; the beta tables in it are inputs."
   },
   "z_image_source.tar.xz": {
    "tool": "tools/diffusers_z_image_reference.py",
