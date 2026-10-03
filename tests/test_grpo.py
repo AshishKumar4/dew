@@ -19,6 +19,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
+from reference_error import assert_as_exact_as_the_reference
 from steady_state import steady_state
 from test_rl_surrogate import clipped_surrogate, token_mean
 
@@ -58,23 +59,12 @@ def terms(fixture):
             get("advantages"), get("response_mask"), float(fixture["beta"]))
 
 
-def test_grpo_loss_matches_verl(reference):
-    """Dew's composition against verl 0.9's PPO path on the fixed rollout.
-    Largest observed difference: 7.45e-08."""
-    old, current, ref, advantages, mask, beta = terms(reference)
-
-    ratio = token_log_ratio(jnp.asarray(current), jnp.asarray(old))
-    pg, _ = clipped_surrogate(ratio, jnp.asarray(advantages), jnp.asarray(mask))
-    kl = token_mean(k3_kl(jnp.asarray(current), jnp.asarray(ref)), jnp.asarray(mask))
-    loss = pg + beta * kl
-
-    difference = abs(float(loss) - float(reference["verl_loss"]))
-    assert difference < 1e-6, f"largest difference against verl: {difference}"
-
-
-def test_grpo_gradients_match_verl(reference):
-    """Autograd on both sides over the current log-probabilities. Largest
-    observed difference: exact, 0.0 across the 16 entries."""
+def test_grpo_loss_and_gradient_match_verl(reference):
+    """Dew's composition against verl 0.9.0's own `compute_policy_loss_vanilla`
+    and `kl_penalty` (tools/parity_grpo.py) on the fixed rollout, held to the
+    float64 rule over the loss and its gradient in the current
+    log-probabilities: Dew's RMS error from verl's float64 values at most
+    twice verl's own fp32 error."""
     old, current, ref, advantages, mask, beta = terms(reference)
 
     def loss(current):
@@ -83,10 +73,10 @@ def test_grpo_gradients_match_verl(reference):
         kl = token_mean(k3_kl(current, jnp.asarray(ref)), jnp.asarray(mask))
         return pg + beta * kl
 
-    grads = jax.grad(loss)(jnp.asarray(current))
-    expected = np.asarray(reference["verl_current_grad"], np.float32)
-    difference = float(np.abs(np.asarray(grads) - expected).max())
-    assert difference < 1e-6, f"largest difference against verl: {difference}"
+    value, gradient = jax.value_and_grad(loss)(jnp.asarray(current))
+    assert_as_exact_as_the_reference(
+        np.append(value, gradient), np.append(reference["verl_loss"], reference["verl_current_grad"]),
+        np.append(reference["verl_loss_f64"], reference["verl_current_grad_f64"]), "GRPO loss and gradient")
 
 
 def test_the_fixture_names_its_reference(reference):

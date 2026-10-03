@@ -2272,10 +2272,10 @@
    {
     "repo": "huggingface/trl",
     "version": "1.12.0",
-    "transcribed": true
+    "runs": "trl"
    }
   ],
-  "note": "Reimplements TRL DPO equations in torch; imported trl only supplies version metadata, tools/parity_dpo.py:73."
+  "note": "TRL's own DPOTrainer._compute_loss with its DPOConfig defaults, in fp32 and float64."
  },
  "rl/flow_transition.npz": {
   "tool": "tools/parity_flow_grpo.py",
@@ -2299,10 +2299,10 @@
    {
     "repo": "volcengine/verl",
     "version": "0.9.0",
-    "transcribed": true
+    "runs": "verl"
    }
   ],
-  "note": "Reimplements PPO/GRPO and k3 KL equations in torch; never imports or calls verl."
+  "note": "verl's compute_policy_loss_vanilla, kl_penalty and agg_loss, in fp32 and float64."
  },
  "rl/ppo.npz": {
   "tool": "tools/parity_ppo.py",
