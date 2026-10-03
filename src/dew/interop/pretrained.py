@@ -338,6 +338,9 @@ class Pretrained:
                     export_adapter=bundle.export_adapter, tokenizer=bundle.tokenizer)
         elif isinstance(model, DiffusionGemma):
             from dew.interop import diffusion_gemma
+            if declaration.get('diffusion_gemma') is None:
+                raise TypeError("a DiffusionGemma with a vision conditioner has no published layout to "
+                                "export to; load the run with BlockGeneration.from_run")
             settings = record(declaration['diffusion_gemma'], 'diffusion_gemma')
             config = record(settings['config'], 'diffusion_gemma config')
             generation = record(settings['generation_config'], 'generation_config')

@@ -991,6 +991,16 @@ class Trainer(Generic[Loss, Effects]):
         self._display.note(f"Resumed from step {resume} in {checkpoints.source(resume)}")
         return state, shardings, position
 
+    def _artifact(self) -> JSON:
+        """The objective's inference record, which a checkpoint carries for
+        loaders. Training and resuming never read it, so a model or component
+        no record can describe still checkpoints: the record says why, and a
+        loader raises that."""
+        try:
+            return self.objective.inference_record()
+        except (KeyError, TypeError, ValueError) as error:
+            return {'unrecorded': f"{type(self.objective).__name__}: {error}"}
+
     def _rung(self) -> JSON:
         """The fit ladder's rung this trainer's step compiles at: the
         objective's head tile, its model's remat (`remat_record`) and whether
@@ -2171,7 +2181,7 @@ class Trainer(Generic[Loss, Effects]):
                 ranking = (Ranking('train/loss', metadata['train/loss']),)
         checkpoints.save(step, state, position, metadata, share=DataPartition.of(self.device_mesh),
                          ranking=ranking, control=control, weights_only=weights_only,
-                         rung=self._rung(), artifact=self.objective.inference_record())
+                         rung=self._rung(), artifact=self._artifact())
         self._report(CheckpointRequested(checkpoints.directory), step)
         interval.saved(step)
         self._display.status("")
@@ -2193,7 +2203,7 @@ class Trainer(Generic[Loss, Effects]):
         paused = time.perf_counter()
         self._display.status("writing a local checkpoint")
         checkpoints.save_local(step, state, position, share=DataPartition.of(self.device_mesh),
-                               control=control, rung=self._rung(), artifact=self.objective.inference_record())
+                               control=control, rung=self._rung(), artifact=self._artifact())
         self._report(CheckpointRequested(str(checkpoints.local_directory), local=True), step)
         self._display.status("")
         return time.perf_counter() - paused

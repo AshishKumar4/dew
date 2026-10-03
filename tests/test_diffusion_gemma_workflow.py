@@ -65,8 +65,6 @@ def test_public_pipeline_preserves_the_block_model_layout_and_generation():
 
 
 def test_public_pipeline_source_storage_and_saved_block_compute_are_independent(tmp_path):
-    import json
-
     import jax.numpy as jnp
     import optax
 
@@ -95,15 +93,8 @@ def test_public_pipeline_source_storage_and_saved_block_compute_are_independent(
     objective = BlockDiffusionObjective(bundle.model, prompt_length=3, pretrained=bundle.variables)
     state = Trainer(objective, optax.sgd(0.01), key=jax.random.PRNGKey(2)).initial_state()
     checkpoints = Checkpoints(str(tmp_path))
-    checkpoints.save(0, state, None)
+    checkpoints.save(0, state, None, artifact=objective.inference_record())
     checkpoints.wait()
-    record = {"objective": "block_diffusion",
-              "model": {"architecture": "diffusion_gemma",
-                        "config": {**bundle.config, "max_seq_len": bundle.model.max_seq_len},
-                        "dtype": "float32", "param_dtype": None, "matmul_precision": None,
-                        "attention_impl": "auto"},
-              "tokenizer": "byte", "pad_token_id": 0}
-    (tmp_path / "run.json").write_text(json.dumps(record))
     restored = dew.pipeline(str(tmp_path), ema=False, dtype="bfloat16", param_dtype="float32")
     assert isinstance(restored, BlockGeneration)
     expected_vars = {name: jax.tree.map(lambda leaf: leaf.astype(jnp.float32), value)
