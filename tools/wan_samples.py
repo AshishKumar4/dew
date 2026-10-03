@@ -1,10 +1,12 @@
 """Text-to-video samples from Wan 2.1 T2V-1.3B through Dew, with their provenance.
 
-Loads the published pipeline with `load_diffusion_source` at the clip's
-geometry, computing in bfloat16 over float32 weights, which is what the
-source's bfloat16 pipeline computes, its float32-kept modules included.
-Every prompt is encoded first; the text encoder's weights then leave the
-task, and the transformer's and the VAE's go to the device once. Each clip
+Computes in bfloat16 over float32 weights, which is what the source's
+bfloat16 pipeline computes, its float32-kept modules included, in two
+pieces that never share the device or the host: `WanConditioner` alone
+encodes every prompt and the negative and is freed, then
+`load_diffusion_source(text=False)` loads the transformer and the VAE at the
+clip's geometry. Both stream their weights onto the device one leaf at a
+time (`mesh=MeshSpec()`), so the host holds one tensor at a time. Each clip
 is sampled with the source's own policy (UniPC over its flow-shifted grid,
 guidance 5.0) and the negative prompt Diffusers' Wan example uses, then
 decoded, and written as an H.264 MP4 at Wan's 16 frames per second (CRF
@@ -79,11 +81,15 @@ def main() -> None:
     parser.add_argument("--only", nargs="*", choices=sorted(CLIPS), default=sorted(CLIPS))
     args = parser.parse_args()
 
+    import gc
+
     import jax
     from PIL import Image
 
     from dew.artifacts import uint8_pixels
+    from dew.inputs.diffusion import WanConditioner
     from dew.interop.pretrained import load_diffusion_source
+    from dew.training import MeshSpec
 
     args.output.mkdir(parents=True, exist_ok=True)
     manifest_path = args.output / "manifest.json"
@@ -93,27 +99,32 @@ def main() -> None:
         return
     revision = REVISION if args.source == REPO else None
     start = time.perf_counter()
+    encoder = WanConditioner.from_pretrained(args.source, revision=revision, dtype="bfloat16",
+                                             param_dtype="float32", mesh=MeshSpec())
+    encode = jax.jit(encoder.encode)
+    negative = encode(encoder.params, encoder.tokenize([NEGATIVE]))
+    conditions, encode_seconds = {}, {}
+    for name in pending:
+        tick = time.perf_counter()
+        conditions[name] = jax.block_until_ready(encode(encoder.params, encoder.tokenize([CLIPS[name][1]])))
+        encode_seconds[name] = time.perf_counter() - tick
+    text_seconds = time.perf_counter() - start
+    # The prompts are encoded: the 5.7B-parameter encoder leaves the device.
+    del encoder, encode
+    gc.collect()
+    start = time.perf_counter()
     pipeline = load_diffusion_source(args.source, revision=revision, dtype="bfloat16", param_dtype="float32",
-                                     size=(args.frames, args.height, args.width))
+                                     size=(args.frames, args.height, args.width), mesh=MeshSpec(), text=False)
     load_seconds = time.perf_counter() - start
     task = pipeline.text_to_image()
-    prepared, encode_seconds = {}, {}
-    for name in pending:
-        seed, prompt = CLIPS[name]
-        start = time.perf_counter()
-        prepared[name] = task.prepare(prompt, unconditional=NEGATIVE, key=seed, steps=args.steps)
-        jax.block_until_ready(prepared[name])
-        encode_seconds[name] = time.perf_counter() - start
-    # The prompts are encoded: the 5.7B-parameter encoder leaves, and what
-    # sampling reads goes to the device once.
-    resident = jax.device_put({name: value for name, value in pipeline.variables.items()
-                               if name != "encoders"})
-    task = task.bind({**resident, "encoders": {}})
+    resident = pipeline.variables
     device = jax.devices()[0]
     for index, name in enumerate(pending):
         seed, prompt = CLIPS[name]
         start = time.perf_counter()
-        latents = jax.block_until_ready(task(prepared[name], decode=False, key=seed).latents)
+        prepared = task.prepare(conditions={"conditioning": conditions[name]},
+                                unconditional={"conditioning": negative}, key=seed, steps=args.steps)
+        latents = jax.block_until_ready(task(prepared, decode=False, key=seed).latents)
         sample_seconds = time.perf_counter() - start
         start = time.perf_counter()
         pixels = jax.block_until_ready(pipeline.autoencoder.decode(resident["autoencoder"], latents))
@@ -133,7 +144,7 @@ def main() -> None:
             "repo": args.source, "revision": pipeline.revision, "dew_commit": commit(),
             "dtype": {"compute": "bfloat16", "params": "float32"},
             "hardware": device.device_kind, "platform": device.platform, "jax": jax.__version__,
-            "seconds": {"load": load_seconds, "encode": encode_seconds[name],
+            "seconds": {"text_encoder": text_seconds, "load": load_seconds, "encode": encode_seconds[name],
                         "sample": sample_seconds, "decode": decode_seconds,
                         "includes_compile": index == 0},
             "created": datetime.now(UTC).isoformat(timespec="seconds"),

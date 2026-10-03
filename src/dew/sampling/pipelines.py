@@ -56,7 +56,9 @@ class _Resolved:
     `plan` is this process's rows of the request, `process` and `times` the
     trajectory it walks, `request` the key its noise is drawn from, and
     `posterior` the key a VAE encode samples with. `tokens` and `null_tokens`
-    are the two conditioning branches, `samples` whatever image, mask, noise
+    are the two conditioning branches, as tokens to encode or, where
+    `encoded` names the branch, already encoded (`null_tokens` None for an
+    encoded call with no unconditional branch), `samples` whatever image, mask, noise
     or latent state the caller handed over, and `signature` the value the
     pool compares before any of it reaches a device.
     """
@@ -65,13 +67,14 @@ class _Resolved:
     process: Process
     request: jax.Array
     tokens: dict
-    null_tokens: dict
+    null_tokens: dict | None
     shape: tuple[int, ...]
     count: int
     times: tuple[float, ...] | None
     samples: dict
     posterior: jax.Array | None
     signature: object
+    encoded: frozenset[str] = frozenset()
 
 
 @struct.dataclass
@@ -335,11 +338,12 @@ class TextToImage:
 
     def prepare(
         self,
-        prompts: str | Sequence[str | Mapping[str, object]],
+        prompts: str | Sequence[str | Mapping[str, object]] | None = None,
         *,
+        conditions: Mapping[str, Conditioning] | None = None,
         key: int | jax.Array | None = None,
         steps: int | None = None,
-        unconditional: str | Sequence[str | Mapping[str, object]] | None = None,
+        unconditional: str | Sequence[str | Mapping[str, object]] | Mapping[str, Conditioning] | None = None,
         image: ArrayLike | None = None,
         image_latents: ArrayLike | None = None,
         mask: ArrayLike | None = None,
@@ -357,11 +361,20 @@ class TextToImage:
         for a continuation or refiner handoff and is never noised again.
         Explicit times select a partial trajectory in the prepared process.
         encode_key samples a VAE posterior; None uses its mean.
+
+        `conditions` are prompts already encoded, `{keyword: condition}` with
+        one row per sample, in place of `prompts`: a pipeline's conditioner
+        loaded alone encodes them, so its text encoder need not share the
+        device with the denoiser (`load_diffusion_source(text=False)`).
+        `unconditional` encoded the same way, one row or one per sample, is
+        the branch guidance reads; without it the task's own blank prompt is
+        encoded where the text encoder is loaded, and otherwise the call
+        takes no guidance. Each row's noise is the one a prompted call draws.
         """
         mesh = mesh_of(self.variables)
 
         def resolve() -> _Resolved:
-            return self._resolved(mesh, prompts, key=key, steps=steps,
+            return self._resolved(mesh, prompts, conditions, key=key, steps=steps,
                                   unconditional=unconditional, image=image,
                                   image_latents=image_latents, mask=mask, noise=noise,
                                   initial=initial, times=times, encode_key=encode_key)
@@ -406,6 +419,9 @@ class TextToImage:
         solver = self.solver if solver is None else solver
         if prepared is not None:
             prepared = self._checked_inputs(prepared, mesh, count)
+            if chosen is not None and prepared.conditions and not prepared.unconditional:
+                raise ValueError("guidance reads the unconditional branch, which these inputs lack; prepare "
+                                 "them with an encoded unconditional= too, or call with guidance=None")
         controls = (count, times, solver, chosen, self.final_denoise, decode,
                     tuple(jax.device_get(jax.random.key_data(request))), prepared is not None,
                     None if prepared is None else prepared.rows)
@@ -440,7 +456,7 @@ class TextToImage:
                 raise ValueError("prepared conditions must match the noise batch")
         return prepared
 
-    def _resolved(self, mesh, prompts, *, key, steps, unconditional, image,
+    def _resolved(self, mesh, prompts, conditions, *, key, steps, unconditional, image,
                   image_latents, mask, noise, initial, times, encode_key) -> _Resolved:
         """Everything `prepare` settles on the host, in one value.
 
@@ -448,15 +464,22 @@ class TextToImage:
         earn is raised here, and the signature at the end is what the ranks
         compare before any of them touches a device.
         """
-        rows = [prompts] if isinstance(prompts, str) else list(prompts)
-        if not rows or not all(isinstance(prompt, (str, Mapping)) for prompt in rows):
-            raise ValueError("prompts must be a non-empty sequence of strings or conditioning records")
+        given: list | Mapping[str, Conditioning]
+        if prompts is not None and conditions is None:
+            given = [prompts] if isinstance(prompts, str) else list(prompts)
+            if not given or not all(isinstance(prompt, (str, Mapping)) for prompt in given):
+                raise ValueError("prompts must be a non-empty sequence of strings or conditioning records")
+            samples_count = len(given)
+        elif conditions is not None and prompts is None:
+            given, samples_count = conditions, _encoded_rows(conditions)
+        else:
+            raise ValueError("pass the prompts or their encoded conditions, one of the two")
         request = request_key(key)
         count = self.steps if steps is None else steps
         process, source_times = self.prepared_process(count)
         selected = _time_grid(times) if times is not None else source_times
-        plan = RowPlan.over(mesh, len(rows))
-        tokens, null_tokens = self._tokenized(rows, unconditional)
+        plan = RowPlan.over(mesh, samples_count)
+        tokens, null_tokens, encoded = self._branches(given, unconditional, samples_count)
         shape = self.latent_shape
         if image is not None and image_latents is not None:
             raise ValueError("pass image or image_latents, not both")
@@ -469,40 +492,78 @@ class TextToImage:
         posterior = encode_key
         if posterior is not None:
             posterior = request_key(posterior)
-        samples = self._supplied(len(rows), shape, image=image, image_latents=image_latents,
+        samples = self._supplied(samples_count, shape, image=image, image_latents=image_latents,
                                  mask=mask, noise=noise, initial=initial)
         controls = (plan.rows, count, selected, shape,
                     tuple(jax.device_get(jax.random.key_data(request))),
                     None if posterior is None else tuple(np.asarray(jax.random.key_data(posterior))))
         signature = generation_signature((tokens, null_tokens, samples), controls)
         return _Resolved(plan, process, request, tokens, null_tokens, shape, count,
-                         selected, samples, posterior, signature)
+                         selected, samples, posterior, signature, encoded)
 
-    def _tokenized(self, rows: list, unconditional) -> tuple[dict, dict]:
-        """The conditional and unconditional token fields, one row per prompt.
+    def _branches(self, given: list | Mapping[str, Conditioning], unconditional,
+                  count: int) -> tuple[dict, dict | None, frozenset[str]]:
+        """The conditional and unconditional branches, one row per sample, as
+        tokens the text encoder encodes or as the encodings a caller passed,
+        which the returned set names ("given", "null"). `given` is the prompt
+        rows, or the encodings `{keyword: condition}`.
 
-        `unconditional` None is the task's own blank prompt; a caller's
-        negatives are one row or one per prompt, and an encoder that answers
-        a different count is refused here.
+        Negatives are one row or one per sample. `unconditional` None is the
+        task's own blank prompt, encoded where the text encoder is loaded; an
+        encoded call without the text encoder then has no unconditional
+        branch (None), which only an unguided call takes.
         """
-        if unconditional is None:
-            negatives = None
+        encoded = set()
+        if isinstance(given, Mapping):
+            tokens = self._encodings(given, (count,), "conditions")
+            encoded.add("given")
         else:
+            self._text_encoder("a prompt is encoded with it")
+            tokens = {keyword: condition.encoder.tokenize(given)
+                      for keyword, condition in self.inputs.conditions.items()}
+            for leaf in jax.tree.leaves(tokens):
+                if leaf.ndim < 1 or leaf.shape[0] != count:
+                    raise ValueError("tokenized conditions must have one row per prompt")
+        if isinstance(unconditional, Mapping):
+            null = self._encodings(unconditional, (1, count), "unconditional")
+            return tokens, null, frozenset({*encoded, "null"})
+        if unconditional is None and isinstance(given, Mapping) and not self._text_held():
+            return tokens, None, frozenset(encoded)
+        self._text_encoder("an unconditional prompt is encoded with it")
+        negatives = None
+        if unconditional is not None:
             negatives = [unconditional] if isinstance(unconditional, str) else list(unconditional)
-            if len(negatives) not in (1, len(rows)):
+            if len(negatives) not in (1, count):
                 raise ValueError("unconditional inputs need one row or one row per prompt")
-        tokens = {keyword: condition.encoder.tokenize(rows)
-                  for keyword, condition in self.inputs.conditions.items()}
         null_tokens = {keyword: condition.encoder.tokenize(
             [condition.unconditional] if negatives is None else negatives)
             for keyword, condition in self.inputs.conditions.items()}
-        for leaf in jax.tree.leaves(tokens):
-            if leaf.ndim < 1 or leaf.shape[0] != len(rows):
-                raise ValueError("tokenized conditions must have one row per prompt")
         for leaf in jax.tree.leaves(null_tokens):
-            if leaf.ndim < 1 or leaf.shape[0] not in (1, len(rows)):
+            if leaf.ndim < 1 or leaf.shape[0] not in (1, count):
                 raise ValueError("unconditional tokens must have one row or one per prompt")
-        return tokens, null_tokens
+        return tokens, null_tokens, frozenset(encoded)
+
+    def _text_held(self) -> bool:
+        """Whether every condition's encoder has its weights in this task."""
+        held = self.variables.get("encoders", {})
+        return all(keyword in held for keyword in self.inputs.conditions)
+
+    def _text_encoder(self, needed: str) -> None:
+        if not self._text_held():
+            raise ValueError(
+                f"this task's text encoder is not loaded (load_diffusion_source(text=False)), and {needed}; "
+                "encode the prompts with the pipeline's conditioner alone and pass "
+                "prepare(conditions=..., unconditional=...)")
+
+    def _encodings(self, given: Mapping[str, Conditioning], rows: tuple[int, ...], name: str) -> dict:
+        """A caller's encoded branch, checked against the task's conditions."""
+        if set(given) != set(self.inputs.conditions):
+            raise ValueError(f"encoded {name} are keyed by {sorted(self.inputs.conditions)}, "
+                             f"not {sorted(given)}")
+        for leaf in jax.tree.leaves(dict(given)):
+            if leaf.ndim < 1 or leaf.shape[0] not in rows:
+                raise ValueError(f"encoded {name} need {' or '.join(map(str, rows))} rows, got {leaf.shape}")
+        return dict(given)
 
     def _supplied(self, rows: int, shape: tuple[int, ...], *, image, image_latents,
                   mask, noise, initial) -> dict[str, np.ndarray]:
@@ -536,9 +597,17 @@ class TextToImage:
         batch first because its single row would not carry the mask.
         """
         plan, process = settled.plan, settled.process
-        given = _encode(plan.sharding)(self._conditions, self.variables,
-                                       plan.place(plan.pad(settled.tokens)))
-        null = self._unconditional(settled.null_tokens, plan, given, configured=configured)
+        given = plan.place(plan.pad(settled.tokens))
+        if "given" not in settled.encoded:
+            given = _encode(plan.sharding)(self._conditions, self.variables, given)
+        if settled.null_tokens is None:
+            null = {}
+        elif "null" in settled.encoded:
+            single = jax.tree.leaves(settled.null_tokens)[0].shape[0] == 1
+            null = (jax.device_put(settled.null_tokens) if single
+                    else plan.place(plan.pad(settled.null_tokens)))
+        else:
+            null = self._unconditional(settled.null_tokens, plan, given, configured=configured)
         if not settled.samples:
             return given, null, _noise(plan.sharding)(process, plan.keys(settled.request),
                                                       settled.shape)
@@ -689,6 +758,14 @@ def _encode(rows: jax.sharding.NamedSharding | None):
         return {keyword: encoder.encode(params["encoders"][keyword], tokens[keyword])
                 for keyword, encoder in conditions}
     return jax.jit(encode, static_argnums=(0,), in_shardings=(None, rows), out_shardings=rows)
+
+
+def _encoded_rows(conditions: Mapping[str, Conditioning]) -> int:
+    """The samples an encoded branch holds: its leaves' common leading axis."""
+    counts = {leaf.shape[0] for leaf in jax.tree.leaves(dict(conditions)) if leaf.ndim}
+    if len(counts) != 1:
+        raise ValueError(f"encoded conditions need one row count across their leaves, got {sorted(counts)}")
+    return counts.pop()
 
 
 @functools.cache
