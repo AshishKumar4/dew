@@ -1,9 +1,9 @@
 """Peak host memory of loading a published diffusion pipeline, eager and streamed.
 
 Each mode runs in a fresh process, so one's pages do not count in the
-other's, and prints its peak resident set (`ru_maxrss`), the seconds the
-load took and a fingerprint of every leaf it bound: path, shape, dtype and
-the SHA-256 of its bytes. `compare` loads both ways and holds the two
+other's, and prints its peak resident set (`ru_maxrss`, read before the
+fingerprint), the seconds the load took and a fingerprint of every leaf it
+bound: path, shape, dtype and the SHA-256 of its bytes. `compare` loads both ways and holds the two
 fingerprints equal, which is the same tree bit for bit.
 
 - `eager`: `load_diffusion_source` as it reads by default, every leaf
@@ -34,12 +34,28 @@ import time
 
 
 def fingerprint(variables) -> dict[str, str]:
+    """Each leaf's digest, read through a device copy: a `jax.Array` keeps the
+    host value it was read to, so reading the leaves themselves would bring
+    the whole tree onto the host."""
     import jax
+    import jax.numpy as jnp
     import numpy as np
 
-    return {jax.tree_util.keystr(path): f"{leaf.shape} {leaf.dtype} "
-            + hashlib.sha256(np.asarray(jax.device_get(leaf)).tobytes()).hexdigest()
-            for path, leaf in jax.tree_util.tree_leaves_with_path(variables)}
+    digests = {}
+    for path, leaf in jax.tree_util.tree_leaves_with_path(variables):
+        if isinstance(leaf, jax.Array):
+            copy = jnp.copy(leaf)
+            value = np.asarray(jax.device_get(copy))
+            copy.delete()
+        else:
+            value = np.asarray(leaf)
+        digests[jax.tree_util.keystr(path)] = f"{leaf.shape} {leaf.dtype} " + hashlib.sha256(
+            value.tobytes()).hexdigest()
+    return digests
+
+
+def peak_rss_gib() -> float:
+    return round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2 ** 20, 2)
 
 
 def load(mode: str, checkpoint: str, revision: str | None, param_dtype: str, text: bool,
@@ -56,10 +72,9 @@ def load(mode: str, checkpoint: str, revision: str | None, param_dtype: str, tex
             checkpoint, revision=revision, dtype=param_dtype, param_dtype=param_dtype, mesh=MeshSpec())
         jax.block_until_ready(encoder.params)
         return {"mode": mode, "checkpoint": checkpoint, "conditioner": conditioner,
-                "param_dtype": param_dtype,
-                "seconds": round(time.perf_counter() - start, 1),
-                "peak_rss_gib": round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2 ** 20, 2),
-                "device": jax.devices()[0].device_kind, "leaves": fingerprint(encoder.params)}
+                "param_dtype": param_dtype, "seconds": round(time.perf_counter() - start, 1),
+                "peak_rss_gib": peak_rss_gib(), "device": jax.devices()[0].device_kind,
+                "leaves": fingerprint(encoder.params)}
     if mode == "eager":
         loaded = load_diffusion_source(checkpoint, revision=revision, dtype=param_dtype,
                                        param_dtype=param_dtype, text=text)
@@ -69,11 +84,9 @@ def load(mode: str, checkpoint: str, revision: str | None, param_dtype: str, tex
                                        param_dtype=param_dtype, mesh=MeshSpec(), text=text)
         variables = loaded.variables
     jax.block_until_ready(variables)
-    seconds = time.perf_counter() - start
+    seconds, peak = time.perf_counter() - start, peak_rss_gib()
     return {"mode": mode, "checkpoint": checkpoint, "revision": loaded.revision, "param_dtype": param_dtype,
-            "text_encoder": text,
-            "seconds": round(seconds, 1),
-            "peak_rss_gib": round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2 ** 20, 2),
+            "text_encoder": text, "seconds": round(seconds, 1), "peak_rss_gib": peak,
             "device": jax.devices()[0].device_kind, "leaves": fingerprint(variables)}
 
 
