@@ -5,6 +5,7 @@ import numpy as np
 import optax
 
 from dew.checkpoints import _filled
+from dew.nn.kernels.generation import device_generation
 from dew.training import trainer as trainer_module
 from dew.training.narrow import narrowed, narrowed_paths
 
@@ -78,7 +79,7 @@ def test_the_tied_decoder_reads_its_kernels_through_copies_with_the_same_gradien
     plain SGD, whose update reads the gradient once, every parameter after
     three steps is bitwise what the in-forward cast gives: the copies
     change no gradient, and the tied table's two uses still sum in fp32."""
-    narrow, losses = _trained(monkeypatch, {jax.devices()[0].platform}, optax.sgd(0.5))
+    narrow, losses = _trained(monkeypatch, {device_generation()}, optax.sgd(0.5))
     plain, plain_losses = _trained(monkeypatch, set(), optax.sgd(0.5))
     paths = {tuple(key.key for key in path)[1:]: leaf.dtype
              for path, leaf in jax.tree_util.tree_flatten_with_path(narrow.compute)[0]}
