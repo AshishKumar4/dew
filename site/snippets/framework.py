@@ -109,7 +109,7 @@ def sample_public(out, smoke):
     # Begin snippet: sample-public
     from dew.sampling import CFG, DPMSolverMultistep, TextToImage
     pipe = TextToImage.from_pretrained("dewml/hybrid-dit-176m",
-                                       revision="0964f57387afc938927b1047f19ed32b63fe0619")
+                                       revision="32d59de89683d59824361144b87bdcaf3e742598")
     result = pipe(["green and purple northern lights over a frozen lake"],
                   key=5, steps=20, solver=DPMSolverMultistep(), guidance=CFG(5))
     result.pil()[0].save(out / "sample.png")
