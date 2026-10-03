@@ -17,7 +17,10 @@ _E2M1_MAX = float(jnp.finfo(jnp.float4_e2m1fn).max)
 
 def _power_of_two_ceil(value):
     """2 ** ceil(log2(value)) off the fp32 bits, as the kernels' fast_round_scale
-    computes it (kernel.py:22-37)."""
+    computes it (kernel.py:22-37). Unclamped, unlike the host codecs'
+    `ceil_to_ue8m0` rule (exponents 1 to 254): only past the normal range do
+    they part, a zero giving 0.0 here and 2 ** -126 there, a value above
+    2 ** 127 inf here and 2 ** 127 there."""
     bits = jax.lax.bitcast_convert_type(value.astype(jnp.float32), jnp.int32)
     exponent = ((bits >> 23) & 0xFF) - 127 + ((bits & 0x7FFFFF) != 0).astype(jnp.int32)
     return jax.lax.bitcast_convert_type((exponent + 127) << 23, jnp.float32)

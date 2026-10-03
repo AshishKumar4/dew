@@ -1,12 +1,12 @@
 """DeepSeek's block-scaled FP8, read against `weight_dequant` and written
 against DeepGEMM's `per_block_cast_to_fp8`.
 
-`torch_per_block_cast` is the encoder's reference ported to torch operation
-for operation, `ceil_to_ue8m0` included, and `quantize_fp8_blocks` is held
-to its bytes. `decode_e4m3fn` reads a written file by E4M3FN's bit fields,
-sharing no code with ml_dtypes, torch or the writer. The network tests run
-the encoder over DeepSeek's own shipped bytes, the only oracle that can say
-the rule here is the rule that made the checkpoints.
+tools/deepgemm_fp8_reference.py runs `per_block_cast_to_fp8` of DeepGEMM's
+deep_gemm/utils/math.py, fetched at a pinned commit, on fixed operands, and
+`quantize_fp8_blocks` is held to its bytes (tests/fixtures/codecs/
+deepgemm_fp8.npz). `decode_e4m3fn` reads a written file by E4M3FN's bit
+fields, sharing no code with ml_dtypes, torch or the writer. The network
+tests run the encoder over DeepSeek's own shipped bytes.
 """
 
 import json
@@ -182,31 +182,10 @@ def write_safetensors(path, tensors):
     os.replace(temporary, path)
 
 
-def torch_per_block_cast(weight, block, ue8m0):
-    """`per_block_cast_to_fp8` of deep_gemm/utils/math.py, run in torch.
-
-    The reference operation for operation, `ceil_to_ue8m0` and the padding
-    out to whole blocks included, giving back the raw bytes and the scales
-    so the comparison never passes through ml_dtypes.
-    """
-    import torch
-
-    def ceil_to_ue8m0(value):
-        return torch.pow(2.0, torch.ceil(torch.log2(value.abs())))
-
-    values = torch.from_numpy(np.ascontiguousarray(weight, np.float32))
-    rows, cols = values.shape
-    padded = torch.zeros((-(-rows // block) * block, -(-cols // block) * block),
-                         dtype=values.dtype)
-    padded[:rows, :cols] = values
-    view = padded.view(-1, block, padded.size(1) // block, block)
-    amax = view.abs().float().amax(dim=(1, 3), keepdim=True).clamp(1e-4)
-    scale = amax / 448.0
-    if ue8m0:
-        scale = ceil_to_ue8m0(scale)
-    cast = (view * (1.0 / scale)).to(torch.float8_e4m3fn)
-    return (cast.view_as(padded)[:rows, :cols].contiguous().view(torch.uint8).numpy(),
-            scale.view(view.size(0), view.size(2)).numpy())
+def deepgemm():
+    """DeepGEMM's casts of the fixture's operands (tools/deepgemm_fp8_reference.py)."""
+    with np.load(Path(__file__).resolve().parent / "fixtures" / "codecs" / "deepgemm_fp8.npz") as loaded:
+        return dict(loaded)
 
 
 def decode_e4m3fn(codes):
@@ -339,26 +318,25 @@ def test_a_hand_computed_encoding_with_a_partial_column_block():
     np.testing.assert_array_equal(dequantize_fp8_blocks(codes, scale_inv, block=2), HAND)
 
 
-@pytest.mark.parametrize("shape, block", [((256, 384), 128), ((576, 200), 128),
-                                          ((5, 7), 128), ((130, 259), 128),
-                                          ((48, 32), 16), ((7, 3), 2)])
+@pytest.mark.parametrize("case", ["random/256x384/128", "random/130x259/128", "random/5x7/128",
+                                  "random/48x32/16", "random/7x3/2", "bf16/130x259/128"])
 @pytest.mark.parametrize("ue8m0", [False, True], ids=["float32-scales", "ue8m0-scales"])
-def test_the_encoder_writes_the_reference_casts_bytes(shape, block, ue8m0):
-    """`quantize_fp8_blocks` against `per_block_cast_to_fp8` in torch: whole
-    blocks and a partial block in each dimension, magnitudes spread over 50
-    binades so no two blocks share a scale, and both signed zeros and values
-    below the amax floor among the elements."""
-    rng = np.random.default_rng(0)
-    weight = (rng.standard_normal(shape)
-              * np.exp2(rng.integers(-30, 20, shape))).astype(np.float32)
-    weight.flat[:4] = np.array([0.0, -0.0, 1e-12, -1e-12], np.float32)
-    weight[0, :min(shape[1], 3)] = 0.0
+def test_the_encoder_writes_the_upstream_casts_bytes(case, ue8m0):
+    """`quantize_fp8_blocks` against DeepGEMM's `per_block_cast_to_fp8`:
+    whole blocks and a partial block in each dimension, magnitudes spread
+    over 50 binades so no two blocks share a scale, both signed zeros and
+    values below the amax floor among the elements, and a bfloat16 weight,
+    every code byte and every float32 scale bit equal."""
+    reference = deepgemm()
+    weight = reference[f"{case}/weight"]
+    if case.startswith("bf16"):
+        weight = weight.view(ml_dtypes.bfloat16)
+    suffix = "/ue8m0" if ue8m0 else ""
 
-    codes, scale_inv = quantize_fp8_blocks(weight, block, ue8m0=ue8m0)
+    codes, scale_inv = quantize_fp8_blocks(weight, int(case.rsplit("/", 1)[1]), ue8m0=ue8m0)
 
-    reference_codes, reference_scales = torch_per_block_cast(weight, block, ue8m0)
-    assert np.array_equal(codes.view(np.uint8), reference_codes)
-    assert np.array_equal(scale_inv.view(np.uint32), reference_scales.view(np.uint32))
+    assert np.array_equal(codes.view(np.uint8), reference[f"{case}/codes{suffix}"])
+    assert np.array_equal(scale_inv.view(np.uint32), reference[f"{case}/scales{suffix}"].view(np.uint32))
 
 
 def test_a_zero_block_takes_the_amax_floors_scale():
@@ -386,34 +364,28 @@ def test_a_block_under_the_amax_floor_scales_against_the_floor(amax, code):
     assert np.array_equal(codes.view(np.uint8), np.full((2, 2), code, np.uint8))
 
 
-def test_a_ue8m0_scale_rounds_as_the_references_float32_log2_does():
-    """`ceil_to_ue8m0` is `2 ** ceil(log2(x))` in float32, and float32 log2
-    lands on the integer k for a scale a few ULPs above 2 ** k once |k| is
-    large enough for log2's own ULP to swallow the offset. Each block here
-    is one element, 448 times 2 ** k times 1 + n * 2 ** -23, so its scale is
-    that quotient exactly. Measured against torch 2.14 CPU: at n = 4 the
-    reference keeps the lower power 2 ** k for 109 of the 141 exponents in
-    the scale range (k <= -17 and k >= 16), at n = 8 for 87 (k >= 32), at
-    n = 64 for none, where an exact rule on the bits would take 2 ** (k + 1)
-    every time. NumPy's float32 log2 agrees with torch on every one, and the
-    bytes follow: the amax lands on 448 under the lower power, 224 under
-    the higher, and E4M3FN holds 448.0002 as 448, so nothing saturates."""
-    ks = np.arange(-22, 119)
-    for ulps, lower in ((4, (ks <= -17) | (ks >= 16)), (8, ks >= 32), (64, np.zeros(len(ks), bool))):
-        scale = (np.exp2(ks.astype(np.float32)) * np.float32(1 + ulps * 2.0 ** -23)).astype(np.float32)
-        weight = (np.float32(E4M3_MAX) * scale)[:, None]
-        assert np.array_equal(weight[:, 0] / np.float32(E4M3_MAX), scale), "not an exact quotient"
+def test_a_ue8m0_scale_is_the_least_power_of_two_at_or_above_the_quotient():
+    """`ceil_to_ue8m0` reads the exponent off the float32 bits and adds one
+    when any mantissa bit is set, so a scale quotient n ULPs above 2 ** k
+    takes 2 ** (k + 1) for every n > 0 and every k in the scale range, and
+    an exact power keeps itself. Each block is one element, 448 * 2 ** k *
+    (1 + n * 2 ** -23), its quotient exactly that; DeepGEMM's own bytes say
+    the same. Before DeepGEMM's 26/04 release the rule was float32
+    `2 ** ceil(log2(x))`, which kept the lower power for up to 133 of these
+    141 exponents at n = 1; DeepSeek's own V3.2 and V4.1 kernels
+    (`fast_log2_ceil`) round on the bits too."""
+    reference = deepgemm()
+    weight = reference["edge/weight"]
+    quotient = weight[:, 0] / np.float32(E4M3_MAX)
+    exact = (quotient.view(np.uint32) & 0x7FFFFF) == 0
 
-        codes, scale_inv = quantize_fp8_blocks(weight, 1, ue8m0=True)
+    codes, scale_inv = quantize_fp8_blocks(weight, 1, ue8m0=True)
 
-        reference_codes, reference_scales = torch_per_block_cast(weight, 1, ue8m0=True)
-        assert np.array_equal(scale_inv.view(np.uint32), reference_scales.view(np.uint32))
-        assert np.array_equal(codes.view(np.uint8), reference_codes)
-        assert np.all(scale_inv.view(np.uint32) & 0x7FFFFF == 0), "not powers of two"
-        np.testing.assert_array_equal(scale_inv[:, 0] == np.exp2(ks), lower)
-        np.testing.assert_array_equal(scale_inv[:, 0] == np.exp2(ks + 1), ~lower)
-        np.testing.assert_array_equal(decode_e4m3fn(codes.view(np.uint8))[:, 0],
-                                      np.where(lower, 448.0, 224.0))
+    assert np.array_equal(codes.view(np.uint8), reference["edge/codes/ue8m0"])
+    assert np.array_equal(scale_inv.view(np.uint32), reference["edge/scales/ue8m0"].view(np.uint32))
+    assert np.all(scale_inv.view(np.uint32) & 0x7FFFFF == 0), "not powers of two"
+    assert np.all(scale_inv[:, 0] >= quotient) and np.all(scale_inv[:, 0] / 2 < quotient)
+    np.testing.assert_array_equal(decode_e4m3fn(codes.view(np.uint8))[:, 0], np.where(exact, 448.0, 224.0))
 
 
 @pytest.mark.parametrize("ue8m0", [False, True], ids=["float32-scales", "ue8m0-scales"])
@@ -620,14 +592,15 @@ def test_the_recorded_names_are_the_ones_the_source_shipped_quantized(reexport):
     assert reexport["names"] == QUANTIZED_TENSORS
 
 
-def test_a_trained_source_writes_the_reference_cast_of_its_trained_weights(reexport):
-    """The format claim, exact: every byte of every re-encoded tensor is the
-    byte `per_block_cast_to_fp8` produces for the trained fp32 weight the
-    layouts assembled, and every scale is the same float32."""
+def test_a_trained_source_writes_the_cast_of_its_trained_weights(reexport):
+    """Every byte of every re-encoded tensor is the cast of the trained fp32
+    weight the layouts assembled, and every scale the same float32: the
+    export writes what `quantize_fp8_blocks` gives, which the fixture above
+    holds to DeepGEMM's bytes."""
     for name in reexport["names"]:
-        codes, scales = torch_per_block_cast(reexport["dense"][name], REEXPORT_BLOCK,
-                                             reexport["ue8m0"])
-        assert np.array_equal(reexport["written"][name].view(np.uint8), codes), name
+        codes, scales = quantize_fp8_blocks(reexport["dense"][name], REEXPORT_BLOCK,
+                                            ue8m0=reexport["ue8m0"])
+        assert np.array_equal(reexport["written"][name].view(np.uint8), codes.view(np.uint8)), name
         assert np.array_equal(reexport["written"][name + SCALE_SUFFIX].view(np.uint32),
                               scales.view(np.uint32)), name
 

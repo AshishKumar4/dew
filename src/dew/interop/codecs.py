@@ -482,10 +482,23 @@ def dequantize_fp8_blocks(weight: np.ndarray, scale_inv: np.ndarray,
     return out
 
 
+def _ceil_exponent(values: np.ndarray) -> np.ndarray:
+    """The biased exponent of the smallest power of two at or above each
+    positive float32 value, read off its bits: the exponent, plus one if any
+    mantissa bit is set. DeepGEMM's `ceil_to_ue8m0` and the release kernels'
+    `fast_log2_ceil` both round this way."""
+    bits = np.asarray(values, np.float32).view(np.uint32)
+    return (bits >> 23) + ((bits & 0x007fffff) != 0)
+
+
 def _fp8_scale_inv(amax: np.ndarray, ue8m0: bool) -> np.ndarray:
-    """`per_block_cast_to_fp8`'s scale of a block from its float32 amax."""
+    """`per_block_cast_to_fp8`'s scale of a block from its float32 amax; ue8m0
+    rounds it up to a power of two on its bits, clamped to the normal
+    exponents as `ceil_to_ue8m0` clamps."""
     scale_inv = np.maximum(amax, np.float32(AMAX_FLOOR)) / np.float32(E4M3_MAX)
-    return np.exp2(np.ceil(np.log2(scale_inv))) if ue8m0 else scale_inv
+    if not ue8m0:
+        return scale_inv
+    return (np.clip(_ceil_exponent(scale_inv), 1, 254).astype(np.uint32) << 23).view(np.float32)
 
 
 def _finite_matrix(weight: ArrayLike, rows: int, cols: int) -> np.ndarray:
@@ -518,13 +531,13 @@ def quantize_fp8_blocks(weight: ArrayLike, block: int = BLOCK, *,
     ceil(cols / block)] `scale_inv`. `ue8m0` rounds the scales up to powers
     of two, as V3.2's config declares.
 
-    This is DeepGEMM's `per_block_cast_to_fp8` (deep_gemm/utils/math.py),
-    the cast that produces weights in this format, ported operation for
-    operation so the bytes agree with it exactly:
+    This is DeepGEMM's `per_block_cast_to_fp8` (deep_gemm/utils/math.py at
+    057ca596), the cast that produces weights in this format, ported
+    operation for operation so the bytes agree with it exactly:
 
         amax = max(|x|) over the block, in float32, clamped up to 1e-4
         scale_inv = amax / 448
-        scale_inv = 2 ** ceil(log2(scale_inv))    # ue8m0 only, float32 log2
+        scale_inv = smallest power of two >= scale_inv   # ue8m0 only, on the bits
         q = float8_e4m3fn(x * (1 / scale_inv))
 
     Not `act_quant` in DeepSeek's inference code, the activation rule: it
@@ -533,11 +546,9 @@ def quantize_fp8_blocks(weight: ArrayLike, block: int = BLOCK, *,
     in place here, which zeros and the 1e-4 floor make the same reduction.
 
     The cast needs no clamp. A float32 scale is amax / 448 to within a few
-    roundings, and a ue8m0 scale sits at most 2 ** -21 relative under the
-    quotient it rounds (float32 log2 lands on the integer for a quotient that
-    close above a power of two; measured against torch in tests), so a scaled
-    element stays under 448.001. E4M3FN rounds everything up to 464 to its
-    448, and that margin is where the libraries part: ml_dtypes sends a value
+    roundings and a ue8m0 scale is never under it, so a scaled element stays
+    within a rounding of 448. E4M3FN rounds everything up to 464 to its 448,
+    and that margin is where the libraries part: ml_dtypes sends a value
     above it to NaN where torch saturates. A weight that is not finite is
     refused by name rather than written as a block of NaN. The 1e-4 floor
     keeps every scale a float32 normal.
@@ -693,8 +704,7 @@ def quantize_deepseek_v4_fp4(weight: ArrayLike) -> tuple[np.ndarray, np.ndarray]
     """
     groups = _float_groups(weight, "DeepSeek-V4 FP4", ml_dtypes.bfloat16).astype(np.float32)
     amax = np.maximum(np.abs(groups).max(-1), np.float32(6 * 2.0 ** -126))
-    bits = (amax * np.float32(1 / 6)).view(np.uint32)
-    exponents = ((bits >> 23) + ((bits & 0x007fffff) != 0)).astype(np.uint8)
+    exponents = _ceil_exponent(amax * np.float32(1 / 6)).astype(np.uint8)
     codes = encode_e2m1(groups / e8m0_scales(exponents)[..., None], ties='even')
     return (codes.reshape(*groups.shape[:-2], groups.shape[-2] * GROUP // 2).view(np.int8),
             exponents.view(ml_dtypes.float8_e8m0fnu))
