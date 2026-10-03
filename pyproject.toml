@@ -48,6 +48,9 @@ dependencies = [
     "tyro",
     "typing_extensions>=4.14",
     "transformers>=5.16.1",
+    # A Wan pipeline's prompts are cleaned with it, as the source cleans them
+    # (dew.inputs.diffusion.wan_prompt); pure Python, with wcwidth its one dependency.
+    "ftfy",
     "jinja2",
     "filelock",
     "huggingface_hub",
