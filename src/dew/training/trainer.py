@@ -834,6 +834,8 @@ class Trainer(Generic[Loss, Effects]):
         # compiles. A resumed run starts at its checkpoint's rung, and says so
         # if its first compile has to climb past it (`_climb_to`).
         self._xla_defaults = False
+        # Why this run's checkpoints describe no model to load, said once.
+        self._unrecorded: str | None = None
         self._resumed_rung: JSON = None
 
     # ------------------------------------------------------------------
@@ -994,12 +996,28 @@ class Trainer(Generic[Loss, Effects]):
     def _artifact(self) -> JSON:
         """The objective's inference record, which a checkpoint carries for
         loaders. Training and resuming never read it, so a model or component
-        no record can describe still checkpoints: the record says why, and a
-        loader raises that."""
+        no record can describe still checkpoints: the record says why, a
+        loader raises that, and the first checkpoint warns it, as it does a
+        model no registry names."""
+        from dew.registry import models
+
+        artifact: JSON
         try:
-            return self.objective.inference_record()
+            artifact = self.objective.inference_record()
         except (KeyError, TypeError, ValueError) as error:
-            return {'unrecorded': f"{type(self.objective).__name__}: {error}"}
+            reason = f"{type(self.objective).__name__}: {error}"
+            artifact = {'unrecorded': reason}
+        else:
+            model = None if artifact is None else record(artifact, 'inference record').get('model')
+            name = model.get('architecture') if isinstance(model, Mapping) else None
+            reason = (None if not isinstance(name, str) or name in models else
+                      f"its model is not registered; `@dew.registry.models({name!r})` above the "
+                      f"class registers it")
+        if reason is not None and reason != self._unrecorded:
+            self._unrecorded = reason
+            _log.warning("this run's checkpoints resume, but no loader can rebuild their model "
+                         "(TextGeneration.from_run, dew.pipeline) until it is fixed: %s", reason)
+        return artifact
 
     def _rung(self) -> JSON:
         """The fit ladder's rung this trainer's step compiles at: the
