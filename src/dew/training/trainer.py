@@ -1519,8 +1519,10 @@ class Trainer(Generic[Loss, Effects]):
                 if self.rollout is not None:
                     batch, sampled = self._rolled_out(state, batch)
                     interval.rollout_seconds += sampled
-                if not compiled:
-                    agreed("training input declaration", functools.partial(self._check_inputs, batch))
+                inputs = self.objective.inputs
+                if not compiled and self.rollout is None and inputs is not None:
+                    # A rollout writes the batch its loss reads, from prompts it reads itself.
+                    agreed("training input declaration", functools.partial(inputs.check, batch))
                 first_compile = not compiled
                 train_step, measured_flops = self._compiled_for(compiled, state, batch)
                 if first_compile:
@@ -2027,25 +2029,6 @@ class Trainer(Generic[Loss, Effects]):
             return telemetry_profile.Profiler(profile.directory)
 
         return agreed("profiling window setup", own_window)
-
-    def _check_inputs(self, batch: Batch) -> None:
-        """Check the first real batch against the objective's declared sample and mask."""
-        inputs = self.objective.inputs
-        if inputs is None:
-            return
-        for condition in inputs.conditions.values():
-            if condition.field not in batch:
-                raise ValueError(f"objective.inputs needs condition field {condition.field!r} "
-                                 "in the training batch")
-        for field in (inputs.sample, inputs.mask):
-            if field is None:
-                continue
-            if field.key not in batch:
-                raise ValueError(f"objective.inputs needs field {field.key!r} in the training batch")
-            actual = batch[field.key].shape[1:]
-            if tuple(actual) != tuple(field.shape):
-                raise ValueError(f"objective.inputs field {field.key!r} declares shape {field.shape}, "
-                                 f"but the first training batch has shape {actual}")
 
     def _check_batch(self, batch: int, mesh: Mesh) -> None:
         """Refuse, before anything is placed, a global batch the mesh cannot
