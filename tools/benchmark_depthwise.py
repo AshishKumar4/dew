@@ -144,7 +144,7 @@ def checkpoint(args):
     from dew.sampling import TextToImage
 
     pipeline = TextToImage.from_pretrained('dewml/hybrid-dit-176m',
-                                           revision='0964f57387afc938927b1047f19ed32b63fe0619')
+                                           revision='32d59de89683d59824361144b87bdcaf3e742598')
     original = conv._polyphase_depthwise_3x3
     prompt = 'a watercolor painting of a mountain lake at sunrise'
     with jax.default_matmul_precision('highest'):
