@@ -13,6 +13,14 @@ Density = Literal["logit_normal", "mode", "cosmap", "uniform"]
 Transformers for High-Resolution Image Synthesis", section 3.1)."""
 
 
+def _token_mu(tokens: int, base_tokens: int, max_tokens: int, base_shift: float, max_shift: float) -> float:
+    """mu linear in a token count, `base_shift` at `base_tokens` and
+    `max_shift` at `max_tokens`: Diffusers' Flux `calculate_shift`, operation
+    for operation, so its double is the pipelines' own."""
+    slope = (max_shift - base_shift) / (max_tokens - base_tokens)
+    return tokens * slope + (base_shift - slope * base_tokens)
+
+
 class FlowMatchingScheduler(ContinuousNoiseScheduler):
     """Rectified flow / conditional flow matching on the linear path.
 

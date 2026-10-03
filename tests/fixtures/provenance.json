@@ -270,6 +270,17 @@
    ],
    "note": "compute_density_for_timestep_sampling on the draws FlowMatchingScheduler.sample_t makes from jax.random.key(0)."
   },
+  "flow/resolution_shift.npz": {
+   "tool": "tools/flux_shift_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/diffusers",
+     "version": "0.34.0",
+     "runs": "diffusers"
+    }
+   ],
+   "note": "Flux's calculate_shift read from the installed pipeline module and the scheduler's _time_shift_exponential."
+  },
   "flux2_published.npz": {
    "tool": "tools/diffusers_flux2_reference.py",
    "sources": [

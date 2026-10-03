@@ -7,6 +7,7 @@ forwards the family tests match against diffusers.
 """
 
 import dataclasses
+import math
 import shutil
 import tarfile
 from pathlib import Path
@@ -16,10 +17,13 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from reference_error import assert_as_exact_as_the_reference
 
 from dew.config import ModelConfig, TrainerConfig
 from dew.data import TFDSImages
 from dew.diffusion.presets import Flow, ResolutionShift
+from dew.diffusion.schedules import FlowMatchingScheduler
+from dew.diffusion.schedules.source import SourceSchedule
 from dew.objectives import Step
 from dew.objectives.diffusion import DiffusionRunConfig, FlowGRPO, TextCondition
 from dew.objectives.rl.flow import FlowGRPOObjective
@@ -112,26 +116,55 @@ def test_sd3_trains_at_its_static_shift_at_any_size(size, pipelines):
     assert flow_run("sd3", size, pipelines).build().process.schedule.shift == 3.0
 
 
+SHIFTS = dict(np.load(FIXTURES / "flow" / "resolution_shift.npz"))
+
+
+def flux_shift(tokens: int, constants: str = "flux") -> float:
+    """exp of Diffusers' Flux `calculate_shift` at `tokens` (tools/flux_shift_reference.py)."""
+    return math.exp(SHIFTS[f"{constants}/mu"][list(SHIFTS["tokens"]).index(tokens)])
+
+
 @pytest.mark.parametrize("size", [16, 32, 64])
 def test_flux_trains_at_the_shift_its_pipeline_samples_the_runs_size_at(size, pipelines):
-    """Flux's `calculate_shift`: mu is linear in the packed latent's token
-    count, 0.5 at 256 tokens and 1.15 at 4096, and the shift is exp(mu)."""
+    """The shift is exp of Diffusers 0.34.0's Flux `calculate_shift` at the
+    packed latent's token count, to the bit."""
     objective = flow_run("flux", size, pipelines).build()
     tokens = (size // (2 * objective.autoencoder.downscale_factor)) ** 2
-    mu = 0.5 + (tokens - 256) * (1.15 - 0.5) / (4096 - 256)
-    assert objective.process.schedule.shift == pytest.approx(np.exp(mu), rel=1e-12)
+    assert objective.process.schedule.shift == flux_shift(tokens)
 
 
 @pytest.mark.parametrize("size", [128, 256, 512, 1024])
 def test_a_scratch_flow_run_shifts_by_the_datas_resolution(size):
-    """The preset's resolution shift at the data's 16-pixel token count, as
-    the Flux pipeline's calculate_shift takes it."""
+    """The preset's resolution shift at the data's 16-pixel token count is
+    exp of Diffusers' Flux `calculate_shift` there, to the bit."""
     config = DiffusionRunConfig(preset=Flow(resolution_shift=ResolutionShift()),
                                 data=TFDSImages(image_size=size), text=None,
                                 model=ModelConfig("simple_dit"), val_metrics=())
-    tokens = (size // 16) ** 2
-    mu = 0.5 + (tokens - 256) * (1.15 - 0.5) / (4096 - 256)
-    assert config.preset().schedule.shift == pytest.approx(np.exp(mu), rel=1e-12)
+    assert config.preset().schedule.shift == flux_shift((size // 16) ** 2)
+
+
+@pytest.mark.parametrize("constants,fields", [
+    ("flux", {}),
+    ("long", {"max_tokens": 8192, "max_shift": 0.9}),
+])
+def test_the_resolution_shift_and_the_noise_levels_it_maps_to_are_diffusers(constants, fields):
+    """At every token count, `ResolutionShift` and a loaded dynamic-shift
+    scheduler file are exp(calculate_shift) to the bit, and the flow schedule
+    at that shift maps each time to the noise level Diffusers'
+    `_time_shift_exponential` gives it at mu, held to the float64 rule, for
+    Flux's constants and a pipeline with another slope and span."""
+    top_shift, top = fields.get("max_shift", 1.15), fields.get("max_tokens", 4096)
+    loaded = SourceSchedule.from_config({
+        "_class_name": "FlowMatchEulerDiscreteScheduler", "num_train_timesteps": 1000,
+        "use_dynamic_shifting": True, "base_shift": 0.5, "max_shift": top_shift,
+        "base_image_seq_len": 256, "max_image_seq_len": top})
+    for index, tokens in enumerate(SHIFTS["tokens"]):
+        shift = ResolutionShift(tokens=int(tokens), **fields).shift()
+        assert shift == flux_shift(int(tokens), constants)
+        assert loaded.training_process(int(tokens)).schedule.shift == shift
+        sigma = FlowMatchingScheduler(shift=shift).rates(SHIFTS["times"])[1]
+        assert_as_exact_as_the_reference(sigma, SHIFTS[f"{constants}/sigmas"][index],
+                                         SHIFTS[f"{constants}/sigmas_f64"][index], f"{constants} at {tokens}")
 
 
 def test_a_pretrained_run_refuses_a_model_of_its_own():
