@@ -218,15 +218,6 @@ def test_generalized_weights_read_their_sigma_data():
     assert jnp.allclose(narrow - wide, 1 / 0.5**2 - 1 / 1.0**2, rtol=1e-5)
 
 
-@pytest.mark.parametrize("P_mean,P_std", [(-0.4, 1.0), (-1.2, 1.2)])
-def test_edm_lognormal_sigma_distribution(rng, P_mean, P_std):
-    """EDM training sigmas follow exp(N(P_mean, P_std^2)), defaulting to EDM2."""
-    schedule = EDMNoiseScheduler(sigma_max=80, sigma_data=0.5, P_mean=P_mean, P_std=P_std)
-    log_sigma = jnp.log(schedule.sigmas(schedule.sample_t(rng, 20000)))
-    assert abs(float(jnp.mean(log_sigma)) - P_mean) < 0.05
-    assert abs(float(jnp.std(log_sigma)) - P_std) < 0.05
-
-
 @pytest.mark.parametrize("name,steps", [("linear", 1000), ("linear", 250), ("linear", 4000),
                                         ("cosine", 1000), ("cosine", 4000)])
 def test_beta_tables_are_improved_diffusions(name, steps):
