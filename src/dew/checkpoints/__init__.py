@@ -541,7 +541,8 @@ def _filled(template, restored: dict, step: int):
     if (not isinstance(template.window_size, jax.ShapeDtypeStruct)
             and int(restored["window_size"]) != int(template.window_size)):
         raise ValueError("checkpoint accumulation window_size differs from this run")
-    return template.replace(**restored)
+    # A template's narrow copies are of its own parameters, not the restored ones.
+    return template.replace(**restored, compute=None)
 
 
 class _RankedSteps(preservation.PreservationPolicy):

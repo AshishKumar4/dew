@@ -95,6 +95,7 @@ from dew.training.distributed import (
     shard_batch,
 )
 from dew.training.evaluation import Evaluation
+from dew.training.narrow import NARROW_COPY_GENERATIONS, narrowed, narrowed_paths
 from dew.training.runtime import Preempted, PreemptionNotice
 from dew.training.selection import Best
 from dew.training.state import Accumulation, TrainState
@@ -1292,6 +1293,10 @@ class Trainer(Generic[Loss, Effects]):
                     f"no pipeline, so every stage would compute the whole step; give those "
                     f"devices to the data or fsdp axis")
             prepared = self._initialize_accumulation(state, batch, shapes, shape_only=True)
+            copies = self._narrow_copies(state, batch)
+            if copies:
+                prepared = dataclasses.replace(prepared, compute=jax.eval_shape(
+                    lambda variables: narrowed(variables, copies), prepared.variables))
             shardings = self.shardings(prepared)
             replicated = NamedSharding(mesh, P())
             placement = batch_shardings(mesh, batch)
@@ -1301,7 +1306,8 @@ class Trainer(Generic[Loss, Effects]):
             refusals: list[RuntimeError] = []
             while True:
                 body = (self.step(self.objective, self.optimizer) if self.step is not None else
-                        Transaction(self.objective, self.optimizer, self.accumulation, shapes).step())
+                        Transaction(self.objective, self.optimizer, self.accumulation, shapes,
+                                    copies).step())
 
                 def step(current, batch, body=body):
                     # The body sees every field on the device; the out shardings
@@ -1349,8 +1355,33 @@ class Trainer(Generic[Loss, Effects]):
                 if current.accumulation is None and self.accumulation > 1 and self.step is None:
                     current = self._initialize_accumulation(current, batch, shapes)
                     current = jax.device_put(current, shardings)
+                if copies and current.compute is None:
+                    current = dataclasses.replace(current, compute=jax.jit(
+                        lambda variables: narrowed(variables, copies), out_shardings=shardings.compute)(
+                            current.variables))
                 return executable(current, batch)
         return run
+
+    def _narrow_copies(self, state: TrainState, batch: Batch) -> dict:
+        """The parameters the step reads through narrow copies
+        (`dew.training.narrow`), by path under `params`: on the CUDA
+        generations measured to gain, for a step this trainer composes that
+        commits every microbatch without a loss scale."""
+        if (device_generation() not in NARROW_COPY_GENERATIONS or self.step is not None
+                or self.accumulation != 1 or self.dynamic_scale or FROZEN in state.variables):
+            return {}
+        variables = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), state.variables)
+
+        def loss(params, rest, batch, microstep, key, step, ema):
+            # As `_loss_shape` traces it, the averaged weights the step hands
+            # the objective included: a parameter read there is used twice.
+            variables = {**rest, "params": params}
+            return self.objective._loss(
+                variables, batch, Step(microstep, jax.random.fold_in(key, step), with_ema(variables, ema)))
+
+        rest = {name: tree for name, tree in variables.items() if name != "params"}
+        return narrowed_paths(loss, variables["params"], rest, batch, state.microstep, state.key, state.step,
+                              state.ema)
 
     def _compile_host(self, state: TrainState, batch: Batch) -> CompiledStep:
         from dew.training.execution import HostExecution
