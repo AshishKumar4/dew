@@ -489,6 +489,7 @@ def write_gemma3_mm_tiny() -> None:
         "image_token_index": 202}, indent=1) + "\n")
     np.save(directory / "pixels.npy", system["pixels"])
     np.save(directory / "tower_ref.npy", system["last"])
+    np.save(directory / "projector_ref.npy", system["soft"])
     ids = np.array([[2, 5, 202, 7, 9], [202, 3, 4, 5, 6]], np.int32)
     with torch.no_grad():
         from transformers.models.gemma3.modeling_gemma3 import (

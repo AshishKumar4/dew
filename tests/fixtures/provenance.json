@@ -1,0 +1,2493 @@
+{
+ "attention_bf16.npz": {
+  "tool": "tools/numerics_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "audio/gemma3n/encoder_grad.safetensors": {
+  "tool": "tools/audio_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Expected encoder-parameter gradients; checkpoint-weight safetensors are excluded."
+ },
+ "audio/gemma3n/reference.npz": {
+  "tool": "tools/audio_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Metadata also records Torch 2.14.0+cpu."
+ },
+ "audio/gemma3n/stepped.npy": {
+  "tool": "tools/audio_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Projected output after one SGD update."
+ },
+ "audio/gemma4/encoder_grad.safetensors": {
+  "tool": "tools/audio_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Expected encoder-parameter gradients; checkpoint-weight safetensors are excluded."
+ },
+ "audio/gemma4/reference.npz": {
+  "tool": "tools/audio_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Metadata also records Torch 2.14.0+cpu."
+ },
+ "audio/gemma4/stepped.npy": {
+  "tool": "tools/audio_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Projected output after one SGD update."
+ },
+ "clip/large-patch14": {
+  "tool": "tools/clip_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "openai/clip-vit-large-patch14 at 32bd642; the tool rewrites reference.npz bit for bit."
+ },
+ "clip/tiny": {
+  "tool": "tools/clip_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "codecs/compressed_tensors.npz": {
+  "tool": "tools/compressed_tensors_reference.py",
+  "sources": [
+   {
+    "repo": "vllm-project/compressed-tensors",
+    "version": "0.17.1",
+    "runs": "compressed_tensors"
+   }
+  ],
+  "note": "Documented generation environment also uses Torch 2.8.0."
+ },
+ "codecs/compressed_tensors_mxfp4.npz": {
+  "tool": "tools/compressed_tensors_mxfp4_reference.py",
+  "sources": [
+   {
+    "repo": "vllm-project/compressed-tensors",
+    "version": "0.17.1",
+    "runs": "compressed_tensors"
+   }
+  ],
+  "note": "Documented generation environment also uses Torch 2.8.0."
+ },
+ "dc_ae.tar.xz": {
+  "tool": "tools/diffusers_dc_ae_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/diffusers",
+    "version": "0.34.0",
+    "runs": "diffusers"
+   }
+  ],
+  "note": "Calls AutoencoderDC encode/decode; bundle contains both conv and shuffle cases."
+ },
+ "decoder-default-dropout.jaxexport": {
+  "generator": "dew",
+  "note": "Dew's serialized pre-dropout CPU forward and gradient graph at 42ddfc1 (tools/generate_decoder_dropout_fixture.py); a Dew regression golden."
+ },
+ "diffusers/limits.npz": {
+  "tool": "tools/diffusers_limits_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/diffusers",
+    "version": "0.34.0",
+    "runs": "diffusers"
+   }
+  ],
+  "note": "Actual upstream updates with mpmath 1.3.0 scalar replacements and first-step DDIM cancellation removal."
+ },
+ "diffusers/schedulers.npz": {
+  "tool": "tools/diffusers_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/diffusers",
+    "version": "0.34.0",
+    "runs": "diffusers"
+   }
+  ],
+  "note": "Dew supplies grids/betas and JAX supplies replayed noise; expected trajectories/VJPs run upstream schedulers."
+ },
+ "diffusers/source_schedulers.npz": {
+  "tool": "tools/diffusers_source_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/diffusers",
+    "version": "0.34.0",
+    "runs": "diffusers"
+   }
+  ],
+  "note": "Brownian records call the upstream scheduler's torchsde-backed sampler (torchsde 0.2.6 documented at tool:28)."
+ },
+ "diffusers_pipeline_schedulers.npz": {
+  "tool": "tools/diffusers_scheduler_pipeline_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/diffusers",
+    "version": "0.34.0",
+    "runs": "diffusers"
+   },
+   {
+    "repo": "huggingface/transformers",
+    "version": "4.49.0",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Official Flax UNet/text predictions feed official Torch schedulers; output path is caller-supplied."
+ },
+ "distillation": {
+  "tool": "tools/distillation_reference.py",
+  "sources": [
+   {
+    "repo": "google/maxtext",
+    "version": "538fe7a3f3376d94cf3f04e77741aa6d7e8efa45",
+    "transcribed": true
+   }
+  ],
+  "note": "Dew draws the decoder logits and features it feeds the transcribed MaxText loss."
+ },
+ "edm": {
+  "tool": "tools/edm_reference.py",
+  "sources": [
+   {
+    "repo": "NVlabs/edm",
+    "version": "008a4e5316c8e3bfe61a62f874bddba254295afb",
+    "runs": "fetched"
+   }
+  ],
+  "note": "Executes fetched official edm_sampler; no installed upstream package import."
+ },
+ "edm2": {
+  "tool": "tools/edm2_reference.py",
+  "sources": [
+   {
+    "repo": "NVlabs/edm2",
+    "version": "4bf8162f601bcc09472ce8a32dd0cbe8889dc8fc",
+    "runs": "fetched"
+   }
+  ],
+  "note": "Executes fetched official networks_edm2 with pickling/constructor stubs and float64-retargeted casts."
+ },
+ "flaxdiff": {
+  "tool": "tools/flaxdiff_reference.py",
+  "sources": [
+   {
+    "repo": "AshishKumar4/FlaxDiff",
+    "version": "3e3497e924fe58ade3fbb4e3e67c5a33d5f6623a",
+    "runs": "flaxdiff"
+   }
+  ],
+  "note": "FlaxDiff 0.2.8 documented at tool:8; this unit excludes its separately listed hybrid_dit child."
+ },
+ "flaxdiff/hybrid_dit": {
+  "tool": "tools/flaxdiff_reference.py",
+  "sources": [
+   {
+    "repo": "AshishKumar4/FlaxDiff",
+    "version": "94d2d21caeb79aba48a505fa79d9a1a974751234",
+    "runs": "flaxdiff"
+   }
+  ],
+  "note": "FlaxDiff 0.2.10, JAX 0.5.3 and Flax 0.10.6 documented at tool:29."
+ },
+ "flux2_published.npz": {
+  "tool": "tools/diffusers_flux2_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/diffusers",
+    "version": "0.40.0",
+    "runs": "diffusers"
+   }
+  ],
+  "note": "Published VAE weights additionally pinned to black-forest-labs/FLUX.2-klein-4B@e7b7dc27f91deacad38e78976d1f2b499d76a294 (tool:179)."
+ },
+ "flux2_source.tar.xz": {
+  "tool": "tools/diffusers_flux2_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/diffusers",
+    "version": "0.40.0",
+    "runs": "diffusers"
+   },
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.17.0",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Calls actual models/pipelines with rounded timestep frequencies; packaging helper is in tools/diffusers_dc_ae_reference.py."
+ },
+ "flux_source.tar.xz": {
+  "tool": "tools/diffusers_flux_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/diffusers",
+    "version": "0.34.0",
+    "runs": "diffusers"
+   },
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Calls actual Flux models/pipeline with rounded timestep frequencies; packaging helper is in tools/diffusers_sd3_reference.py."
+ },
+ "gated_product": {
+  "tool": "tools/gated_product_reference.py",
+  "sources": [
+   {
+    "repo": "pytorch/pytorch",
+    "version": "2.14.0",
+    "runs": "torch"
+   }
+  ],
+  "note": "torch's bf16 activation, product and backward; the gated product itself is act(gate) * up."
+ },
+ "gemma3n/blocks.npz": {
+  "tool": "tools/hf_reference_b.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Version documented by the tool/test, not embedded in blocks.npz."
+ },
+ "gemma3n/rms_norm2d_bf16.npz": {
+  "tool": "tools/timm_rms_norm_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/pytorch-image-models",
+    "version": "1.0.29",
+    "runs": "timm"
+   }
+  ],
+  "note": "Stores timm and Torch version keys; Torch 2.14.0 CPU is documented at tool:10."
+ },
+ "gemma4": {
+  "tool": "tools/hf_reference_b.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Calls actual Gemma4TextDecoderLayer submodules; version documented rather than embedded in moe.npz."
+ },
+ "gpt_oss/attention.npz": {
+  "tool": "tools/gpt_oss_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "gpt_oss/exchange_random.npz": {
+  "tool": "tools/gpt_oss_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Torch 2.14.0+cpu additionally asserted at tool:162; full-MLP outputs and VJPs."
+ },
+ "gpt_oss/exchange_skewed.npz": {
+  "tool": "tools/gpt_oss_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Torch 2.14.0+cpu additionally asserted at tool:162; intentionally skewed router."
+ },
+ "gpt_oss/moe.npz": {
+  "tool": "tools/gpt_oss_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "gpt_oss/mxfp4.npz": {
+  "tool": "tools/gpt_oss_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "gpt_oss/mxfp4_encoder.npz": {
+  "tool": "tools/gpt_oss_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   },
+   {
+    "repo": "kernels-community/gpt-oss-triton-kernels",
+    "version": "0f351046d799bc4d2c9dbb2c7cf36753204b5916",
+    "runs": "numerics_details"
+   }
+  ],
+  "note": "Transformers delegates to the fetched kernel's numerics_details.mxfp.downcast_to_mxfp_torch CPU path."
+ },
+ "guidance/apg.npz": {
+  "tool": "tools/guidance_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/diffusers",
+    "version": "5ff8e59ff9fe81c6e2df4fb4c6ea0d97a5df5ab2",
+    "runs": "fetched"
+   }
+  ],
+  "note": "Fetches and executes published normalized_guidance/MomentumBuffer without importing diffusers."
+ },
+ "guidance/autoguidance.npz": {
+  "tool": "tools/guidance_reference.py",
+  "sources": [
+   {
+    "repo": "NVlabs/edm2",
+    "version": "4bf8162f601bcc09472ce8a32dd0cbe8889dc8fc",
+    "runs": "fetched"
+   }
+  ],
+  "note": "Fetches and executes upstream edm_sampler with closed-form stand-in networks."
+ },
+ "hf/deepseek-v2-tiny/logits.npy": {
+  "tool": "tools/hf_reference_b.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/deepseek-v3-tiny/generate.npz": {
+  "tool": "tools/numerics_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/deepseek-v3-tiny/logits.npy": {
+  "tool": "tools/hf_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/deepseek-v3-tiny/numerics.npz": {
+  "tool": "tools/numerics_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/deepseek-v32-tiny/logits.npy": {
+  "tool": "tools/hf_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/deepseek-v4-tiny/logits.npy": {
+  "tool": "tools/hf_reference_b.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1 (93c8b7b485963a10800c91f55304db6be211c2bd)",
+    "runs": "transformers"
+   }
+  ],
+  "note": "tools/deepseek_v4_reference.py also rewrites the release-shaped checkpoint."
+ },
+ "hf/deepseek-v4-tiny/mtp_logits.npy": {
+  "tool": "tools/deepseek_v4_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1 (93c8b7b485963a10800c91f55304db6be211c2bd)",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Local official-MTP composition calls Transformers modules, with official source pinned in source.json:12."
+ },
+ "hf/deepseek-v41-tiny": {
+  "tool": "tools/deepseek_v41_reference.py",
+  "sources": [
+   {
+    "repo": "deepseek-ai/DeepSeek-V4.1-Flash",
+    "version": "dba1be0a40aa45a94ad051997016db3960a90277",
+    "runs": "model"
+   }
+  ],
+  "note": "Downloaded release code with local kernel stand-ins and documented patches (tools/deepseek_v41_reference.py:54)."
+ },
+ "hf/diffusion-gemma-denoise-tiny/numerics.npz": {
+  "tool": "tools/numerics_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/diffusion-gemma-denoise-tiny/ref_bare.npy": {
+  "tool": "tools/hf_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "transformers 5.16.1 recomputes it bit for bit from the committed weights and inputs."
+ },
+ "hf/diffusion-gemma-denoise-tiny/ref_conditioned.npy": {
+  "tool": "tools/hf_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "transformers 5.16.1 recomputes it bit for bit from the committed weights and inputs."
+ },
+ "hf/diffusion-gemma-sc-tiny/ref.npy": {
+  "tool": "tools/hf_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "write_diffusion_sc_tiny rewrites it bit for bit under transformers 5.16.1."
+ },
+ "hf/diffusion-gemma-sft": {
+  "tool": "tools/diffusion_gemma_sft_reference.py",
+  "sources": [
+   {
+    "repo": "google-deepmind/gemma",
+    "version": "bf0b49901a428d13e9c2b2629f0eb9c153d3cbd3",
+    "runs": "gemma"
+   }
+  ],
+  "note": "Also calls hackable_diffusion 1.0.1 losses with kauldron 1.4.4 (tools/diffusion_gemma_sft_reference.py:4)."
+ },
+ "hf/diffusion-gemma-workflow/numerics.npz": {
+  "tool": "tools/numerics_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/diffusion-gemma-workflow/reference.npz": {
+  "tool": "tools/diffusion_gemma_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Upstream forward/generation with JAX-paired random draws."
+ },
+ "hf/dream-tiny/logits.npy": {
+  "tool": "tools/remote_code_reference.py",
+  "sources": [
+   {
+    "repo": "Dream-org/Dream-v0-Base-7B",
+    "version": "6572adb5535263e4d1a337b56942ba48b6dee2a9",
+    "runs": "fetched"
+   },
+   {
+    "repo": "huggingface/transformers",
+    "version": "4.46.3",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/dream-tiny/logits_f64.npy": {
+  "tool": "tools/remote_code_reference.py",
+  "sources": [
+   {
+    "repo": "Dream-org/Dream-v0-Base-7B",
+    "version": "6572adb5535263e4d1a337b56942ba48b6dee2a9",
+    "runs": "fetched"
+   },
+   {
+    "repo": "huggingface/transformers",
+    "version": "4.46.3",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/gemma-3n-audio-tiny/reference.npz": {
+  "tool": "tools/audio_wrapper_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/gemma-4-audio-tiny/reference.npz": {
+  "tool": "tools/audio_wrapper_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Audio uses SDPA and text eager to avoid the documented upstream mask bug."
+ },
+ "hf/gemma-tiny/logits.npy": {
+  "tool": "tools/hf_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/gemma2-tiny/logits.npy": {
+  "tool": "tools/hf_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/gemma3-native-tiny/continuation.npy": {
+  "tool": "tools/multimodal_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/gemma3-native-tiny/logits.npy": {
+  "tool": "tools/multimodal_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/gemma3-native-tiny/pixel_gradient.npy": {
+  "tool": "tools/multimodal_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/gemma3-native-tiny/updated_logits.npy": {
+  "tool": "tools/multimodal_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/gemma3-tiny-mm/projector_ref.npy": {
+  "tool": "tools/hf_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "write_gemma3_mm_tiny rewrites it bit for bit under transformers 5.16.1."
+ },
+ "hf/gemma3-tiny-mm/tower_ref.npy": {
+  "tool": "tools/hf_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/gemma3-tiny-mm/wrapper_ref.npy": {
+  "tool": "tools/hf_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/gemma3-tiny/generate.npz": {
+  "tool": "tools/numerics_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/gemma3-tiny/logits.npy": {
+  "tool": "tools/hf_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/gemma3-tiny/numerics.npz": {
+  "tool": "tools/numerics_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/gemma3n-native-tiny/continuation.npy": {
+  "tool": "tools/multimodal_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Wrapper uses timm 1.0.29 internally (tools/audio_wrapper_reference.py:16)."
+ },
+ "hf/gemma3n-native-tiny/logits.npy": {
+  "tool": "tools/multimodal_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Wrapper uses timm 1.0.29 internally (tools/audio_wrapper_reference.py:16)."
+ },
+ "hf/gemma3n-native-tiny/pixel_gradient.npy": {
+  "tool": "tools/multimodal_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Wrapper uses timm 1.0.29 internally (tools/audio_wrapper_reference.py:16)."
+ },
+ "hf/gemma3n-native-tiny/updated_logits.npy": {
+  "tool": "tools/multimodal_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Wrapper uses timm 1.0.29 internally (tools/audio_wrapper_reference.py:16)."
+ },
+ "hf/gemma3n-tiny/logits.npy": {
+  "tool": "tools/hf_reference_b.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/gemma3n-vision-tiny/hard_ref.npy": {
+  "tool": "tools/gemma3n_vision_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/gemma3n-vision-tiny/input_grad.npy": {
+  "tool": "tools/gemma3n_vision_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/pytorch-image-models",
+    "version": "1.0.29",
+    "runs": "timm"
+   }
+  ]
+ },
+ "hf/gemma3n-vision-tiny/soft_even.npy": {
+  "tool": "tools/gemma3n_vision_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Transformers projector after timm 1.0.29 encoder."
+ },
+ "hf/gemma3n-vision-tiny/soft_odd.npy": {
+  "tool": "tools/gemma3n_vision_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Transformers projector after timm 1.0.29 encoder."
+ },
+ "hf/gemma3n-vision-tiny/soft_pooled.npy": {
+  "tool": "tools/gemma3n_vision_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Transformers projector after timm 1.0.29 encoder."
+ },
+ "hf/gemma3n-vision-tiny/stepped_ref.npy": {
+  "tool": "tools/gemma3n_vision_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/pytorch-image-models",
+    "version": "1.0.29",
+    "runs": "timm"
+   }
+  ]
+ },
+ "hf/gemma3n-vision-tiny/tower_bf16.npy": {
+  "tool": "tools/gemma3n_vision_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/pytorch-image-models",
+    "version": "1.0.29",
+    "runs": "timm"
+   }
+  ],
+  "note": "Reloads pre-update weights before the bf16 forward."
+ },
+ "hf/gemma3n-vision-tiny/tower_even.npy": {
+  "tool": "tools/gemma3n_vision_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/pytorch-image-models",
+    "version": "1.0.29",
+    "runs": "timm"
+   }
+  ]
+ },
+ "hf/gemma3n-vision-tiny/tower_odd.npy": {
+  "tool": "tools/gemma3n_vision_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/pytorch-image-models",
+    "version": "1.0.29",
+    "runs": "timm"
+   }
+  ]
+ },
+ "hf/gemma3n-vision-tiny/tower_pooled.npy": {
+  "tool": "tools/gemma3n_vision_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/pytorch-image-models",
+    "version": "1.0.29",
+    "runs": "timm"
+   }
+  ]
+ },
+ "hf/gemma3n-vision-tiny/wrapper_ref.npy": {
+  "tool": "tools/gemma3n_vision_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Conditional wrapper includes timm 1.0.29 image encoder."
+ },
+ "hf/gemma4-e2b/logits.npy": {
+  "tool": "tools/hf_checkpoint_logits.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Recomputed bit for bit from the committed checkpoint and input ids."
+ },
+ "hf/gemma4-kvshare/logits.npy": {
+  "tool": "tools/hf_checkpoint_logits.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Recomputed bit for bit from the committed checkpoint and input ids."
+ },
+ "hf/gemma4-moe-tiny/logits.npy": {
+  "tool": "tools/hf_reference_b.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/gemma4-native-tiny/continuation.npy": {
+  "tool": "tools/multimodal_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/gemma4-native-tiny/logits.npy": {
+  "tool": "tools/multimodal_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/gemma4-native-tiny/pixel_gradient.npy": {
+  "tool": "tools/multimodal_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/gemma4-native-tiny/updated_logits.npy": {
+  "tool": "tools/multimodal_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/gemma4-ple/logits.npy": {
+  "tool": "tools/hf_checkpoint_logits.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Recomputed bit for bit from the committed checkpoint and input ids."
+ },
+ "hf/gemma4-tiny-mm/projector_ref.npy": {
+  "tool": "tools/hf_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/gemma4-tiny-mm/tower_ref.npy": {
+  "tool": "tools/hf_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/gemma4-tiny-mm/wrapper_ref.npy": {
+  "tool": "tools/hf_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/gemma4-vision-tiny/projector_ref.npy": {
+  "tool": "tools/hf_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/gemma4-vision-tiny/tower_ref.npy": {
+  "tool": "tools/hf_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/gemma4-vision-wide-tiny/projector_ref.npy": {
+  "tool": "tools/hf_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "No checked-in invocation writes the wide variant."
+ },
+ "hf/gemma4-vision-wide-tiny/tower_ref.npy": {
+  "tool": "tools/hf_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "No checked-in invocation writes the wide variant."
+ },
+ "hf/glm-moe-dsa-tiny/logits.npy": {
+  "tool": "tools/hf_reference_b.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/glm-moe-dsa-tiny/mtp_logits.npy": {
+  "tool": "tools/hf_reference_b.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Local MTP composition calls Transformers' sparse decoder/indexer."
+ },
+ "hf/glm4-moe-tiny/logits.npy": {
+  "tool": "tools/hf_reference_b.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/glm4-moe-tiny/mtp_logits.npy": {
+  "tool": "tools/hf_reference_b.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Local vLLM-style MTP composition calls Transformers decoder/norm modules (tools/hf_reference_b.py:478)."
+ },
+ "hf/glm5-next-tiny/logits.npy": {
+  "tool": "tools/hf_reference_b.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1 (93c8b7b485963a10800c91f55304db6be211c2bd)",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Local LM-head wrapper calls Transformers' Glm5NextTextModel, not Dew."
+ },
+ "hf/glm5-next-tiny/mtp_logits.npy": {
+  "tool": "tools/hf_reference_b.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1 (93c8b7b485963a10800c91f55304db6be211c2bd)",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Locally assembled plain MTP block reuses Transformers attention/MLP/norm modules."
+ },
+ "hf/gpt-neox-tiny/generated.npy": {
+  "tool": "tools/gpt_neox_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/gpt-neox-tiny/logits.npy": {
+  "tool": "tools/gpt_neox_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/gpt-oss-tiny/logits.npy": {
+  "tool": "tools/hf_reference_b.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "write_tiny uses the Transformers model; gpt_oss_reference.py supplies its constructor."
+ },
+ "hf/gpt2-tiny/generated.npy": {
+  "tool": "tools/classic_gpt_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "--fixture --family gpt2."
+ },
+ "hf/gpt2-tiny/logits.npy": {
+  "tool": "tools/classic_gpt_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "--fixture --family gpt2."
+ },
+ "hf/kimi-k2-tiny/logits.npy": {
+  "tool": "tools/hf_reference_b.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Actual Transformers DeepseekV3ForCausalLM, not released remote Kimi code; source.json also pins the Transformers commit."
+ },
+ "hf/kimi-k25-tiny/logits.npy": {
+  "tool": "tools/hf_reference_b.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Actual Transformers Kimi_K25ForConditionalGeneration, input_ids-only; source.json also pins the Transformers commit."
+ },
+ "hf/kimi-k3-tiny/numerics.npz": {
+  "tool": "tools/kimi_float64_reference.py",
+  "sources": [
+   {
+    "repo": "moonshotai/Kimi-K3",
+    "version": "f831ab66814297da540d832a5235f8e904f29d06",
+    "transcribed": true
+   },
+   {
+    "repo": "fla-org/flash-linear-attention",
+    "version": "0.5.2",
+    "transcribed": true
+   }
+  ],
+  "note": "Independent JAX float64 transcription; no Dew, remote-model or fla imports (tools/kimi_float64_reference.py:17)."
+ },
+ "hf/kimi-k3-tiny/reference.npz": {
+  "tool": "tools/kimi_k3_reference.py",
+  "sources": [
+   {
+    "repo": "moonshotai/Kimi-K3",
+    "version": "f831ab66814297da540d832a5235f8e904f29d06",
+    "runs": "fetched"
+   },
+   {
+    "repo": "fla-org/flash-linear-attention",
+    "version": "0.5.2",
+    "runs": "fla"
+   }
+  ],
+  "note": "Dynamic remote import; fla kernels forced IEEE; compressed-tensors 0.17.1 supplies packed/decompressed weight inputs."
+ },
+ "hf/kimi-linear-tiny/numerics.npz": {
+  "tool": "tools/kimi_float64_reference.py",
+  "sources": [
+   {
+    "repo": "moonshotai/Kimi-Linear-48B-A3B-Instruct",
+    "version": "e1df551a447157d4658b573f9a695d57658590e9",
+    "transcribed": true
+   },
+   {
+    "repo": "fla-org/flash-linear-attention",
+    "version": "0.4.0",
+    "transcribed": true
+   }
+  ],
+  "note": "Independent JAX float64 transcription; no Dew, remote-model or fla imports (tools/kimi_float64_reference.py:17)."
+ },
+ "hf/kimi-linear-tiny/reference.npz": {
+  "tool": "tools/kimi_linear_reference.py",
+  "sources": [
+   {
+    "repo": "moonshotai/Kimi-Linear-48B-A3B-Instruct",
+    "version": "e1df551a447157d4658b573f9a695d57658590e9",
+    "runs": "fetched"
+   },
+   {
+    "repo": "fla-org/flash-linear-attention",
+    "version": "0.4.0",
+    "runs": "fla"
+   }
+  ],
+  "note": "Dynamic remote import; routing weights use unshifted scores (tools/kimi_linear_reference.py:33); fla kernels forced IEEE."
+ },
+ "hf/llada-tiny/logits.npy": {
+  "tool": "tools/remote_code_reference.py",
+  "sources": [
+   {
+    "repo": "GSAI-ML/LLaDA-8B-Base",
+    "version": "0f2787f2d87eac5eed8a087d5ecd24277e6255b2",
+    "runs": "fetched"
+   },
+   {
+    "repo": "huggingface/transformers",
+    "version": "4.46.3",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/llada-tiny/logits_f64.npy": {
+  "tool": "tools/remote_code_reference.py",
+  "sources": [
+   {
+    "repo": "GSAI-ML/LLaDA-8B-Base",
+    "version": "0f2787f2d87eac5eed8a087d5ecd24277e6255b2",
+    "runs": "fetched"
+   },
+   {
+    "repo": "huggingface/transformers",
+    "version": "4.46.3",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/llama-tiny/generate.npz": {
+  "tool": "tools/numerics_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Actual Transformers cached greedy/sampled generate and teacher-forced float64 forwards."
+ },
+ "hf/llama-tiny/logits.npy": {
+  "tool": "tools/hf_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Dew's reference_logits helper calls the actual Transformers model; no Dew model forward."
+ },
+ "hf/llama-tiny/numerics.npz": {
+  "tool": "tools/numerics_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Actual Transformers float64 and bf16 forwards over the committed checkpoint."
+ },
+ "hf/llama31-tiny/logits.npy": {
+  "tool": "tools/hf_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Dew's reference_logits helper calls the actual Transformers model; no Dew model forward."
+ },
+ "hf/llama4-native-tiny/continuation.npy": {
+  "tool": "tools/multimodal_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Cached greedy continuation from the actual Transformers wrapper."
+ },
+ "hf/llama4-native-tiny/input_ids.npy": {
+  "tool": "tools/multimodal_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Expected processor tokens, explicitly compared in tests/test_multimodal_model.py:551."
+ },
+ "hf/llama4-native-tiny/logits.npy": {
+  "tool": "tools/multimodal_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/llama4-native-tiny/pixel_gradient.npy": {
+  "tool": "tools/multimodal_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/llama4-native-tiny/updated_logits.npy": {
+  "tool": "tools/multimodal_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Actual wrapper output after all-parameter SGD."
+ },
+ "hf/llama4-tiny-mm/projector_ref.npy": {
+  "tool": "tools/hf_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/llama4-tiny-mm/tower_ref.npy": {
+  "tool": "tools/hf_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/llama4-tiny-mm/wrapper_ref.npy": {
+  "tool": "tools/hf_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Actual Llama4ForConditionalGeneration on input_ids and pixels."
+ },
+ "hf/llama4-tiny/logits.npy": {
+  "tool": "tools/hf_reference_b.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/llama4-vision-tiny/projector_ref.npy": {
+  "tool": "tools/hf_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/llama4-vision-tiny/tower_ref.npy": {
+  "tool": "tools/hf_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/mamba2-tiny/logits.npy": {
+  "tool": "tools/mamba2_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "source.json also records Transformers commit 93c8b7b485963a10800c91f55304db6be211c2bd."
+ },
+ "hf/mamba2-tiny/numerics.npz": {
+  "tool": "tools/numerics_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Actual Transformers float64 and bf16 forwards over the committed checkpoint."
+ },
+ "hf/mistral-tiny/logits.npy": {
+  "tool": "tools/hf_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Dew's reference_logits helper calls the actual Transformers model; no Dew model forward."
+ },
+ "hf/mixtral-tiny/generate.npz": {
+  "tool": "tools/numerics_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Actual Transformers cached greedy/sampled generate and teacher-forced float64 forwards."
+ },
+ "hf/mixtral-tiny/logits.npy": {
+  "tool": "tools/hf_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Dew's reference_logits helper calls the actual Transformers model; no Dew model forward."
+ },
+ "hf/mixtral-tiny/numerics.npz": {
+  "tool": "tools/numerics_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Actual Transformers float64 and bf16 forwards over the committed checkpoint."
+ },
+ "hf/olmo3-tiny/logits.npy": {
+  "tool": "tools/hf_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Dew's reference_logits helper calls the actual Transformers model; no Dew model forward."
+ },
+ "hf/olmo3-yarn-tiny/logits.npy": {
+  "tool": "tools/hf_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Dew's reference_logits helper calls the actual Transformers model; no Dew model forward."
+ },
+ "hf/opt-tiny/generated.npy": {
+  "tool": "tools/classic_gpt_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "--fixture --family opt."
+ },
+ "hf/opt-tiny/logits.npy": {
+  "tool": "tools/classic_gpt_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "--fixture --family opt."
+ },
+ "hf/qwen2-tiny/logits.npy": {
+  "tool": "tools/hf_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Dew's reference_logits helper calls the actual Transformers model; no Dew model forward."
+ },
+ "hf/qwen3-0.6b": {
+  "tool": "tools/hf_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "4.51.0",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Pin is downloaded release config metadata, not a recorded generator version; reference.npz holds top-32 logits."
+ },
+ "hf/qwen3-moe-tiny/logits.npy": {
+  "tool": "tools/hf_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Dew's reference_logits helper calls the actual Transformers model; no Dew model forward."
+ },
+ "hf/qwen3-next-tiny/logits.npy": {
+  "tool": "tools/hf_reference_b.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Actual Qwen3NextForCausalLM; source records Transformers commit 93c8b7b485963a10800c91f55304db6be211c2bd."
+ },
+ "hf/qwen3-next-tiny/mtp_reference.npz": {
+  "tool": "tools/hf_reference_b.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   },
+   {
+    "repo": "vllm-project/vllm",
+    "version": "51da0ca66c8065619c79e35dff97aa99aeaf5644",
+    "transcribed": true
+   }
+  ],
+  "note": "Actual Transformers decoder/norm/rotary modules inside a locally transcribed vLLM MTP composition."
+ },
+ "hf/qwen3-tiny/generate.npz": {
+  "tool": "tools/numerics_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Actual Transformers cached greedy/sampled generate and teacher-forced float64 forwards."
+ },
+ "hf/qwen3-tiny/logits.npy": {
+  "tool": "tools/hf_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Dew's reference_logits helper calls the actual Transformers model; no Dew model forward."
+ },
+ "hf/qwen3-tiny/numerics.npz": {
+  "tool": "tools/numerics_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Actual Transformers float64 and bf16 forwards over the committed checkpoint."
+ },
+ "hf/qwen35-0.8b": {
+  "tool": "tools/qwen_linear_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "inv_freq.npy is built by the actual Transformers rotary class; config's 4.57.0.dev0 is the release metadata."
+ },
+ "hf/qwen35-moe-native-tiny/continuation.npy": {
+  "tool": "tools/qwen35_moe_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/qwen35-moe-native-tiny/logits.npy": {
+  "tool": "tools/qwen35_moe_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/qwen35-moe-native-tiny/text_logits.npy": {
+  "tool": "tools/qwen35_moe_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/qwen35-native-tiny/continuation.npy": {
+  "tool": "tools/multimodal_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Cached greedy continuation from the actual Transformers wrapper."
+ },
+ "hf/qwen35-native-tiny/input_ids.npy": {
+  "tool": "tools/multimodal_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Expected processor tokens, explicitly compared in tests/test_multimodal_model.py:551."
+ },
+ "hf/qwen35-native-tiny/logits.npy": {
+  "tool": "tools/multimodal_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/qwen35-native-tiny/pixel_gradient.npy": {
+  "tool": "tools/multimodal_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/qwen35-native-tiny/updated_logits.npy": {
+  "tool": "tools/multimodal_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Actual wrapper output after all-parameter SGD."
+ },
+ "hf/qwen35-tiny-mm/projector_ref.npy": {
+  "tool": "tools/hf_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Actual Qwen3_5VisionModel merger pooler_output."
+ },
+ "hf/qwen35-tiny-mm/tower_ref.npy": {
+  "tool": "tools/hf_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/qwen35-tiny-mm/wrapper_ref.npy": {
+  "tool": "tools/hf_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Actual wrapper on pre-merged inputs_embeds, not native image-grid positions."
+ },
+ "hf/qwen35-tiny/logits.npy": {
+  "tool": "tools/qwen_linear_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/qwen35-vision-tiny/projector_ref.npy": {
+  "tool": "tools/hf_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Actual Qwen3_5VisionModel merger pooler_output."
+ },
+ "hf/qwen35-vision-tiny/tower_ref.npy": {
+  "tool": "tools/hf_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "hf/qwen38-dense-tiny/mtp_reference.npz": {
+  "tool": "tools/qwen_qualification_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   },
+   {
+    "repo": "vllm-project/vllm",
+    "version": "51da0ca66c8065619c79e35dff97aa99aeaf5644",
+    "transcribed": true
+   }
+  ],
+  "note": "Actual Transformers decoder/norm/rotary modules inside a locally transcribed vLLM MTP composition."
+ },
+ "hf/qwen38-dense-tiny/reference.npz": {
+  "tool": "tools/qwen_qualification_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Actual Qwen3.5 Transformers classes; saved config retains older source version, not the generator version."
+ },
+ "hf/qwen38-dense-tiny/video_reference.npz": {
+  "tool": "tools/qwen_qualification_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   },
+   {
+    "repo": "vllm-project/vllm",
+    "version": "51da0ca66c8065619c79e35dff97aa99aeaf5644",
+    "transcribed": true
+   }
+  ],
+  "note": "Actual processor, wrapper and generation plus locally transcribed vLLM MTP composition."
+ },
+ "hf/qwen38-moe-tiny/mtp_reference.npz": {
+  "tool": "tools/qwen_qualification_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   },
+   {
+    "repo": "vllm-project/vllm",
+    "version": "51da0ca66c8065619c79e35dff97aa99aeaf5644",
+    "transcribed": true
+   }
+  ],
+  "note": "Actual Transformers decoder/norm/rotary modules inside a locally transcribed vLLM MTP composition."
+ },
+ "hf/qwen38-moe-tiny/reference.npz": {
+  "tool": "tools/qwen_qualification_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Actual Qwen3.5 Transformers classes; saved config retains older source version, not the generator version."
+ },
+ "hf/siglip-tiny/projector_ref.npy": {
+  "tool": "tools/hf_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Actual Gemma3MultiModalProjector; same Transformers upstream."
+ },
+ "hf/siglip-tiny/tower_ref.npy": {
+  "tool": "tools/hf_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Actual SiglipVisionModel."
+ },
+ "inception": {
+  "tool": "tools/pytorch_fid_reference.py",
+  "sources": [
+   {
+    "repo": "mseitzer/pytorch-fid",
+    "version": "0.3.0",
+    "runs": "pytorch_fid"
+   }
+  ],
+  "note": "Package version and weight URL/SHA256 are stored in the NPZ."
+ },
+ "inception/tiny": {
+  "generator": "dew",
+  "note": "The pool3 features Dew's tiny FID extractor gave before dew/eval/inception.py stopped taking its weights as constructor fields (source.json); a Dew regression golden."
+ },
+ "indexer": {
+  "tool": "tools/indexer_reference.py",
+  "sources": [
+   {
+    "repo": "google/maxtext",
+    "version": "0.2.4 (538fe7a3f3376d94cf3f04e77741aa6d7e8efa45)",
+    "transcribed": true
+   }
+  ],
+  "note": "NumPy transcription explicitly documented at tools/indexer_reference.py:12; meta.json present."
+ },
+ "jit": {
+  "tool": "tools/jit_reference.py",
+  "sources": [
+   {
+    "repo": "LTH14/JiT",
+    "version": "cbc743a2ada5e9762697da2c83f8c4f8379e8c17",
+    "runs": "fetched"
+   }
+  ],
+  "note": "Fetches and executes BottleneckPatchEmbed rather than importing an installed upstream package."
+ },
+ "linear_attention": {
+  "tool": "tools/qwen_linear_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "llama4": {
+  "tool": "tools/hf_reference_b.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Block files have no version metadata; pin inferred from same writer's documented release and companion tiny config."
+ },
+ "lm_engine": {
+  "tool": "tools/lm_engine_reference.py",
+  "sources": [
+   {
+    "repo": "open-lm-engine/lm-engine",
+    "version": "45b6b57b",
+    "runs": "lm_engine"
+   }
+  ]
+ },
+ "lora/flux-tiny": {
+  "tool": "tools/lora_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/diffusers",
+    "version": "0.34.0",
+    "runs": "diffusers"
+   }
+  ],
+  "note": "Expected adapted/base outputs are Diffusers; same tool also stores Dew's prediction, and meta pins PEFT 0.20.0/transformers 4.49.0."
+ },
+ "lora/llama-tiny": {
+  "tool": "tools/lora_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/peft",
+    "version": "0.20.0",
+    "runs": "peft"
+   },
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Reference calls PEFT's adapted transformer, including merged/trained logits and gradients."
+ },
+ "lora/sd-tiny": {
+  "tool": "tools/lora_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/diffusers",
+    "version": "0.34.0",
+    "runs": "diffusers"
+   },
+   {
+    "repo": "huggingface/transformers",
+    "version": "4.49.0",
+    "runs": "transformers"
+   },
+   {
+    "repo": "huggingface/peft",
+    "version": "0.20.0",
+    "runs": "peft"
+   }
+  ],
+  "note": "Expected context is CLIP; UNet and text adapters use PEFT."
+ },
+ "lora/sd3-tiny": {
+  "tool": "tools/lora_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/diffusers",
+    "version": "0.34.0",
+    "runs": "diffusers"
+   }
+  ],
+  "note": "Expected adapted/base outputs are Diffusers; same tool also stores Dew's prediction, and meta pins PEFT 0.20.0/transformers 4.49.0."
+ },
+ "mamba2": {
+  "tool": "tools/mamba2_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1 (93c8b7b485963a10800c91f55304db6be211c2bd)",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "meanflow": {
+  "tool": "tools/meanflow_reference.py",
+  "sources": [
+   {
+    "repo": "Gsunshine/meanflow",
+    "version": "d70cb55d298ee03c53bf6da67bec281082e4e2d9",
+    "runs": "fetched"
+   }
+  ],
+  "note": "Fetches and executes upstream MeanFlow class with a closed-form Flax stand-in network."
+ },
+ "mla": {
+  "tool": "tools/mla_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "moe": {
+  "tool": "tools/moe_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "native_diffusion_edges.tar.xz": {
+  "tool": "tools/native_diffusion_edges_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/diffusers",
+    "version": "0.34.0",
+    "runs": "diffusers"
+   }
+  ],
+  "note": "Also requires transformers 4.49.0, but expected scheduler/UNet numbers are computed by diffusers."
+ },
+ "native_unet_geometry.tar.xz": {
+  "tool": "tools/native_unet_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/diffusers",
+    "version": "0.34.0",
+    "runs": "diffusers"
+   }
+  ]
+ },
+ "qwen_image_source.tar.xz": {
+  "tool": "tools/diffusers_qwen_image_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/diffusers",
+    "version": "6256aa7666cedd47443adc8f82da9a10e110b09c",
+    "runs": "diffusers"
+   },
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.17.0",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Records transformer gradients and pipeline/text outputs; replaces only sinusoidal frequency rounding, tools/diffusers_qwen_image_reference.py:148."
+ },
+ "qwen_image_vae.tar.xz": {
+  "tool": "tools/diffusers_qwen_image_vae_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/diffusers",
+    "version": "6256aa7666cedd47443adc8f82da9a10e110b09c",
+    "runs": "diffusers"
+   }
+  ]
+ },
+ "rae.tar.xz": {
+  "tool": "tools/diffusers_rae_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/diffusers",
+    "version": "0.40.0",
+    "runs": "diffusers"
+   },
+   {
+    "repo": "huggingface/transformers",
+    "version": "4.57.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Includes three AutoencoderRAE cases and a separate plain Dinov2Model case; rae.json records both versions."
+ },
+ "rae_published.npz": {
+  "tool": "tools/diffusers_rae_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/diffusers",
+    "version": "0.40.0",
+    "runs": "diffusers"
+   },
+   {
+    "repo": "huggingface/transformers",
+    "version": "4.57.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Checkpoint revisions separately pinned in tools/diffusers_rae_reference.py:130 (RAEs) and :135 (plain DINOv2)."
+ },
+ "rcm": {
+  "tool": "tools/rcm_reference.py",
+  "sources": [
+   {
+    "repo": "NVlabs/rcm",
+    "version": "ed3cb14dd936f92cdc9f9381af7369991509b41f",
+    "runs": "fetched"
+   }
+  ],
+  "note": "Fetches and executes upstream student/critic methods with closed-form stand-in networks."
+ },
+ "reference_runs": {
+  "tool": "tools/reference_runs/lm_steps_fixture.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Stored meta also records torch 2.14.0+cpu; uses torch AdamW and a locally implemented warmup-cosine schedule."
+ },
+ "repa": {
+  "tool": "tools/repa_reference.py",
+  "sources": [
+   {
+    "repo": "sihyun-yu/REPA",
+    "version": "67f714503e3892f993844aab088ffc5791c92613",
+    "runs": "fetched"
+   },
+   {
+    "repo": "End2End-Diffusion/iREPA",
+    "version": "99ad4ac234efe8de52ce157120f72856e836d09f",
+    "runs": "fetched"
+   }
+  ],
+  "note": "Single losses.npz executes both upstreams' fetched projector/loss/z-score code."
+ },
+ "repae": {
+  "tool": "tools/repae_reference.py",
+  "sources": [
+   {
+    "repo": "End2End-Diffusion/REPA-E",
+    "version": "2ad4e9f69234c109497fb41d3e5e555de7b4b0de",
+    "runs": "fetched"
+   }
+  ],
+  "note": "KL executes fetched upstream class; reconstruction and BatchNorm setup are locally reproduced."
+ },
+ "rl/advantage.npz": {
+  "tool": "tools/parity_rl.py",
+  "sources": [
+   {
+    "repo": "volcengine/verl",
+    "version": "896a9bb",
+    "runs": "fetched"
+   },
+   {
+    "repo": "google/tunix",
+    "version": "b9f5e65",
+    "runs": "fetched"
+   }
+  ],
+  "note": "Executes upstream modules under their own names with training-stack imports stubbed, tools/parity_rl.py:177,197,219."
+ },
+ "rl/agentic.npz": {
+  "tool": "tools/parity_agentic.py",
+  "sources": [
+   {
+    "repo": "volcengine/verl",
+    "version": "12ebe0cb4d300c58449fb6c675379e8700015c51",
+    "runs": "fetched"
+   },
+   {
+    "repo": "microsoft/agent-lightning",
+    "version": "ff9457587fb6ec900e16e93be9ad2d77409afa08",
+    "runs": "fetched"
+   }
+  ],
+  "note": "Executes upstream modules directly with training-stack imports stubbed; revisions also stored in NPZ."
+ },
+ "rl/behavior.npz": {
+  "tool": "tools/parity_behavior.py",
+  "sources": [
+   {
+    "repo": "volcengine/verl",
+    "version": "d040717b21af2e23e8e789a3e354cff2394ae2de",
+    "runs": "verl"
+   }
+  ],
+  "note": "Checks installed VCS metadata against pinned revision before recording."
+ },
+ "rl/chat.npz": {
+  "tool": "tools/parity_chat.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   },
+   {
+    "repo": "huggingface/trl",
+    "version": "1.12.0",
+    "runs": "trl"
+   }
+  ],
+  "note": "Assistant mask/IDs are computed by transformers; TRL computes template-preserving/stop-token checks."
+ },
+ "rl/dpo.npz": {
+  "tool": "tools/parity_dpo.py",
+  "sources": [
+   {
+    "repo": "huggingface/trl",
+    "version": "1.12.0",
+    "transcribed": true
+   }
+  ],
+  "note": "Reimplements TRL DPO equations in torch; imported trl only supplies version metadata, tools/parity_dpo.py:73."
+ },
+ "rl/flow_transition.npz": {
+  "tool": "tools/parity_flow_grpo.py",
+  "sources": [
+   {
+    "repo": "yifan123/flow_grpo",
+    "version": "879042cf5707f8b90daa98d147d7deac2317c5da",
+    "runs": "fetched"
+   },
+   {
+    "repo": "pytorch/pytorch",
+    "version": "2.14.0+cpu",
+    "runs": "torch"
+   }
+  ],
+  "note": "Loads pinned author source via importlib; conditional_kl calls torch.distributions directly; diffusers 0.34.0 supplies schedule inputs."
+ },
+ "rl/grpo.npz": {
+  "tool": "tools/parity_grpo.py",
+  "sources": [
+   {
+    "repo": "volcengine/verl",
+    "version": "0.9.0",
+    "transcribed": true
+   }
+  ],
+  "note": "Reimplements PPO/GRPO and k3 KL equations in torch; never imports or calls verl."
+ },
+ "rl/ppo.npz": {
+  "tool": "tools/parity_ppo.py",
+  "sources": [
+   {
+    "repo": "volcengine/verl",
+    "version": "d040717b21af2e23e8e789a3e354cff2394ae2de",
+    "runs": "verl"
+   }
+  ],
+  "note": "episode_old_values are the critic values Dew handed verl's GAE."
+ },
+ "rl/surrogate.npz": {
+  "tool": "tools/parity_rl.py",
+  "sources": [
+   {
+    "repo": "volcengine/verl",
+    "version": "896a9bb",
+    "runs": "fetched"
+   },
+   {
+    "repo": "google/tunix",
+    "version": "b9f5e65",
+    "runs": "fetched"
+   }
+  ],
+  "note": "Executes upstream modules under their own names with training-stack imports stubbed, tools/parity_rl.py:177,197,219."
+ },
+ "sd3_source.tar.xz": {
+  "tool": "tools/diffusers_sd3_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/diffusers",
+    "version": "0.34.0",
+    "runs": "diffusers"
+   },
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Archive contains SD3 transformer, flow-scheduler, and pipeline/text-encoding outputs."
+ },
+ "shortcut": {
+  "tool": "tools/shortcut_reference.py",
+  "sources": [
+   {
+    "repo": "kvfrans/shortcut-models",
+    "version": "601004348667094e1b71f30942199759412d4432",
+    "runs": "fetched"
+   }
+  ],
+  "note": "Fetches and executes upstream get_targets with a closed-form stand-in network."
+ },
+ "stylegan_t": {
+  "tool": "tools/stylegan_t_reference.py",
+  "sources": [
+   {
+    "repo": "autonomousvision/stylegan-t",
+    "version": "36ab80ce76237fefe03e65e9b3161c040ae888e3",
+    "runs": "fetched"
+   }
+  ],
+  "note": "Fetches and executes published discriminator/shared classes."
+ },
+ "t5/tiny": {
+  "tool": "tools/t5_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "t5/tiny-umt5": {
+  "tool": "tools/t5_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ]
+ },
+ "tiny_diffusers.tar.xz": {
+  "tool": "tools/diffusers_pipeline_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/diffusers",
+    "version": "0.34.0",
+    "runs": "diffusers"
+   },
+   {
+    "repo": "huggingface/transformers",
+    "version": "4.49.0",
+    "runs": "transformers"
+   }
+  ],
+  "note": "tools/diffusers_extended_reference.py:73,131 writes xl-img2img/xl-inpaint/refiner/safety numerical members; bundle packs both tools' results."
+ },
+ "tread": {
+  "tool": "tools/tread_reference.py",
+  "sources": [
+   {
+    "repo": "CompVis/tread",
+    "version": "d7f6911f3ebead658212e0f9e22b27e1da428ba3",
+    "runs": "fetched"
+   }
+  ],
+  "note": "Fetches and executes published Router class."
+ },
+ "vae/sd3-tiny": {
+  "tool": "tools/vae_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/diffusers",
+    "version": "0.34.0",
+    "runs": "diffusers"
+   }
+  ]
+ },
+ "wan_pipeline.tar.xz": {
+  "tool": "tools/diffusers_wan_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/diffusers",
+    "version": "0.34.0",
+    "runs": "diffusers"
+   },
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.16.1",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Includes UMT5 prompt states, pipeline walks, and float32/float64 UniPC scheduler replays."
+ },
+ "wan_transformer.tar.xz": {
+  "tool": "tools/diffusers_wan_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/diffusers",
+    "version": "0.34.0",
+    "runs": "diffusers"
+   }
+  ],
+  "note": "Float64 oracle widens upstream float32 casts, tools/diffusers_wan_reference.py:95."
+ },
+ "wan_vae.tar.xz": {
+  "tool": "tools/diffusers_wan_vae_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/diffusers",
+    "version": "0.34.0",
+    "runs": "diffusers"
+   }
+  ]
+ },
+ "wan_vae_bf16.npz": {
+  "tool": "tools/diffusers_wan_vae_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/diffusers",
+    "version": "0.34.0",
+    "runs": "diffusers"
+   }
+  ],
+  "note": "Loads the saved Wan VAE fixture in bfloat16 and records posterior/decode and input gradients."
+ },
+ "z_image_source.tar.xz": {
+  "tool": "tools/diffusers_z_image_reference.py",
+  "sources": [
+   {
+    "repo": "huggingface/diffusers",
+    "version": "0.40.0",
+    "runs": "diffusers"
+   },
+   {
+    "repo": "huggingface/transformers",
+    "version": "5.17.0",
+    "runs": "transformers"
+   }
+  ],
+  "note": "Includes Qwen3 prompt states and pipeline/transformer outputs; timestep exp table locally rounded from float64."
+ }
+}
