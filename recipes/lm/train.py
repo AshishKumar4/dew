@@ -240,7 +240,8 @@ def build_masked_objective(config: LmRunConfig, model, fields, pretrained):
     decode = None if config.sample_tokens <= 0 else run_tokenizer(config.tokenizer).decode
     return MaskedDiffusionObjective(
         model, MDLM(mask_id=int(mask))(), config.data.seq_len + 1,
-        ema_decay=config.ema_decay, decode=decode, pretrained=pretrained)
+        ema_decay=config.ema_decay, decode=decode, pretrained=pretrained,
+        processor=RunProcessor(run_tokenizer(config.tokenizer)))
 
 
 def build_block_objective(config: LmRunConfig, model, pretrained):
@@ -256,7 +257,8 @@ def build_block_objective(config: LmRunConfig, model, pretrained):
         raise ValueError("seq_len + 1 must equal block_prompt_tokens plus whole training canvases")
     return BlockDiffusionObjective(
         model, prompt_length=config.block_prompt_tokens, num_canvases=response // width,
-        canvas_size=width, pretrained=pretrained, ema_decay=config.ema_decay)
+        canvas_size=width, pretrained=pretrained, ema_decay=config.ema_decay,
+        processor=RunProcessor(run_tokenizer(config.tokenizer)))
 
 
 def main(config: LmRunConfig) -> TrainState:

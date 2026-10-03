@@ -232,15 +232,27 @@ class TextToImage:
 
         record = run_record(directory, step)
         config = ModelConfig.from_dict(fields(record['model'], 'model'))
+        inputs_record = fields(record['inputs'], 'inputs')
+        autoencoder_record = None if record['autoencoder'] is None else fields(record['autoencoder'],
+                                                                               'autoencoder')
         compute = dtype_name(resolve_dtype(dtype))
         if compute is not None:
             config = replace(config, dtype=compute)
+            conditions = {keyword: fields(condition, keyword) for keyword, condition
+                          in fields(inputs_record['conditions'], 'conditions').items()}
+            inputs_record = {**inputs_record, 'conditions': {
+                keyword: {**condition,
+                          'encoder': _computing(fields(condition['encoder'], 'encoder'), compute)}
+                for keyword, condition in conditions.items()}}
+            if autoencoder_record is not None:
+                autoencoder_record = _computing(autoencoder_record, compute)
         averaged = False if objectives[text(record['objective'], 'objective')]._ema_is_reference else ema
-        params = Checkpoints(directory).variables(ema=averaged, step=step, mesh=mesh, layout=layout,
-                                                 param_dtype=param_dtype)
-        inputs = InputSpec.from_json(fields(record['inputs'], 'inputs'), params=params.get('encoders', {}))
-        autoencoder = None if record['autoencoder'] is None else AutoEncoder.from_json(
-            fields(record['autoencoder'], 'autoencoder'), params=params['autoencoder'])
+        params = Checkpoints(directory).variables(
+            ema=averaged, step=step, mesh=mesh, layout=layout, param_dtype=param_dtype,
+            parameter_roots=_parameter_roots(inputs_record, autoencoder_record))
+        inputs = InputSpec.from_json(inputs_record, params=params.get('encoders', {}))
+        autoencoder = None if autoencoder_record is None else AutoEncoder.from_json(
+            autoencoder_record, params=params['autoencoder'])
         solver_record = fields(record['solver'], 'solver')
         solver = solvers.build(text(solver_record['name'], 'solver name'),
                                 fields(solver_record['fields'], 'solver fields'))
@@ -570,6 +582,40 @@ class TextToImage:
                                          prepared.conditions, prepared.unconditional,
                                          prepared.noise, jax.random.fold_in(request, 1))
         return replace(generated, rows=plan.rows)
+
+
+def _parameter_roots(inputs: Mapping[str, object], autoencoder: Mapping[str, object] | None
+                     ) -> tuple[tuple[str, ...], ...]:
+    """The parameter roots of a recorded run's tree, which a storage override
+    casts: the denoiser's, each condition encoder's own collections and the
+    autoencoder's. The rest keep the dtypes they were saved in."""
+    from dew.objectives.base import FROZEN
+    from dew.records import record, text
+    from dew.registry import encoders
+
+    roots: list[tuple[str, ...]] = [("params",), (FROZEN,)]
+    for keyword, condition in record(inputs['conditions'], 'conditions').items():
+        name = text(record(record(condition, keyword)['encoder'], 'encoder')['name'], 'encoder name')
+        collections = encoders[name].parameter_collections
+        roots.extend([("encoders", keyword)] if collections is None else
+                     [("encoders", keyword, collection) for collection in collections])
+    if autoencoder is not None:
+        roots.append(("autoencoder",))
+    return tuple(roots)
+
+
+def _computing(owner: Mapping[str, object], compute: str) -> Mapping[str, object]:
+    """A recorded encoder or autoencoder computing in `compute`: its own
+    `dtype`, and the dtype of the model it wraps where it records one."""
+    from dew.records import record
+
+    recorded = dict(record(owner['fields'], 'fields'))
+    if 'dtype' in recorded:
+        recorded['dtype'] = compute
+    model = recorded.get('model')
+    if isinstance(model, Mapping) and 'dtype' in model:
+        recorded['model'] = {**record(model, 'model'), 'dtype': compute}
+    return {**owner, 'fields': recorded}
 
 
 def _time_grid(times) -> tuple[float, ...]:

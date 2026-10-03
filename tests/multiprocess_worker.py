@@ -1945,7 +1945,7 @@ def mode_host_training(args) -> dict:
 
     rows = np.arange(8, dtype=np.float32)
     local = np.array_split(rows, jax.process_count())[jax.process_index()]
-    for name, host in (("resident", ()), ("host", ("params",))):
+    for name, host in (("resident", ()), ("host", ("variables",))):
         trainer = SeparateLanes(Coupled(), optax.chain(optax.clip_by_global_norm(.5), optax.sgd(.1)),
                           key=jax.random.key(0), mesh=MeshSpec(fsdp=2),
                           layout=Layout(host=host, min_shard=1, tolerance=1.))

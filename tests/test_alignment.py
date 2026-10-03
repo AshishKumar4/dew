@@ -100,7 +100,7 @@ def test_the_objective_adds_the_weighted_alignment_to_the_denoising_mean(kind):
     assert float(jnp.abs(jax.tree.leaves(grads[ALIGNMENT])[0]).sum()) > 0
     assert float(sum(jnp.abs(leaf).sum() for leaf in jax.tree.leaves(grads["dit_block_0"]))) > 0
     assert float(sum(jnp.abs(leaf).sum() for leaf in jax.tree.leaves(grads["dit_block_1"]))) == 0
-    published = TextToImage.from_objective(objective, params).params
+    published = TextToImage.from_objective(objective, params).variables
     assert REPRESENTATION not in published and ALIGNMENT not in published["params"]
 
 

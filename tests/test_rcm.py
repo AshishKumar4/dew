@@ -228,7 +228,7 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     distilled = trainer.initial_state()
     distilled, *_ = trainer.compile(distilled, batch)(distilled, batch)
     checkpoints = Checkpoints(str(tmp_path / "student"))
-    checkpoints.save(1, distilled, None)
+    checkpoints.save(1, distilled, None, artifact=task.inference_record())
     checkpoints.wait()
     config.save(str(tmp_path / "student"))
     expected = task.pipeline(distilled, ema=False)(["a red bird"], key=9).host().images

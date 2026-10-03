@@ -165,7 +165,7 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
     state, *_ = trainer.compile(state, batch)(state, batch)
     run = tmp_path / "run"
     checkpoints = Checkpoints(str(run))
-    checkpoints.save(1, state, None)
+    checkpoints.save(1, state, None, artifact=task.inference_record())
     checkpoints.wait()
     config.save(str(run))
 

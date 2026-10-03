@@ -348,23 +348,24 @@ def test_a_placed_diffusion_gemma_task_keeps_its_rows_sharded_and_draws_the_same
 
 @pytest.mark.parametrize("kind", ["dpo", "grpo", "ppo"])
 def test_pipeline_publishes_the_updated_policy_not_the_frozen_reference(kind, tmp_path):
-    from dataclasses import asdict
-
     import dew
-    from dew.config import ModelConfig
     from dew.data import Dataset
     from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.lm import Samples
     from dew.objectives.rl import DPOObjective, GRPOObjective, PPOObjective, ValueHead
     from dew.training import Checkpoints, Trainer
 
     model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1, num_heads=2,
                               mlp_features=32, max_seq_len=8, dtype="float32", attention_impl="xla")
+    sampling = Sampling(temperature=0)
+    # One previewed token under greedy sampling: the budget and policy the run records.
+    samples = Samples([1], 1, sampling=sampling)
     if kind == "dpo":
-        objective = DPOObjective(model, seq_len=2)
+        objective = DPOObjective(model, seq_len=2, samples=samples)
     elif kind == "grpo":
-        objective = GRPOObjective(model, seq_len=2, beta=0.1)
+        objective = GRPOObjective(model, seq_len=2, beta=0.1, samples=samples)
     else:
-        objective = PPOObjective(model, seq_len=2, critic=ValueHead(model.clone()), beta=0.1)
+        objective = PPOObjective(model, seq_len=2, critic=ValueHead(model.clone()), beta=0.1, samples=samples)
     trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(0))
     count = max(2, jax.device_count())
     if kind == "dpo":
@@ -388,7 +389,6 @@ def test_pipeline_publishes_the_updated_policy_not_the_frozen_reference(kind, tm
             batch.update(old_values=values, returns=values + mask)
     data = Dataset(train=lambda partition: iter([batch, batch]), val=None, records=2 * count, batch=count)
     state = trainer.fit(data, steps=2, log_every=100, checkpoint_every=None)
-    sampling = Sampling(temperature=0)
     def draw(weights):
         task = objective.policy(weights) if kind == "ppo" else objective.policy(weights, sampling)
         return task([[1, 2]], 1, key=jax.random.key(3), sampling=sampling).host()
@@ -399,12 +399,8 @@ def test_pipeline_publishes_the_updated_policy_not_the_frozen_reference(kind, tm
     np.testing.assert_allclose(actual.raw_log_probs, expected.raw_log_probs, atol=1e-7, rtol=1e-7)
     assert not np.allclose(actual.raw_log_probs, reference.raw_log_probs, atol=1e-5, rtol=1e-5)
     checkpoints = Checkpoints(str(tmp_path))
-    checkpoints.save(int(state.step), state, None)
+    checkpoints.save(int(state.step), state, None, artifact=objective.inference_record())
     checkpoints.wait()
-    config = ModelConfig("causal_transformer", {"vocab_size": 8, "emb_features": 16, "num_layers": 1,
-        "num_heads": 2, "mlp_features": 32, "max_seq_len": 8}, dtype="float32", attention_impl="xla")
-    (tmp_path / "run.json").write_text(json.dumps({"objective": kind, "model": asdict(config),
-        "tokenizer": "byte", "sample_tokens": 1, "sampling": asdict(sampling)}))
     restored = dew.pipeline(str(tmp_path))([[1, 2]], key=3).host()
     np.testing.assert_array_equal(restored.tokens, expected.tokens)
     np.testing.assert_allclose(restored.raw_log_probs, expected.raw_log_probs, atol=1e-7, rtol=1e-7)

@@ -22,10 +22,11 @@ import dew
 import dew.nn.backbones  # registers the models
 from dew.artifacts import VideoGrid
 from dew.config import ModelConfig, RunConfig, TrainerConfig
-from dew.data import Dataset, TFDSImages, VideoDataset
+from dew.data import ByteTokenizer, Dataset, TFDSImages, VideoDataset
 from dew.diffusion import FlowMatchPredictionTransform
 from dew.diffusion.presets import EDM, Flow
 from dew.diffusion.schedules import FlowMatchingScheduler
+from dew.inference import RunProcessor
 from dew.inputs import Field, unit_range
 from dew.objectives.base import merge
 from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
@@ -182,10 +183,10 @@ def test_a_run_that_keeps_one_copy_of_its_weights_samples_it_by_default(tmp_path
     """A published run may hold its weights once, with no average beside
     them; the default reads that copy, and asking for an average it does not
     keep is refused."""
-    _, state = make_run(tmp_path / "kept")
+    objective, state = make_run(tmp_path / "kept")
     single = tmp_path / "single"
     checkpoints = Checkpoints(str(single), keep=1)
-    checkpoints.save(int(state.step), state.replace(ema=None), None)
+    checkpoints.save(int(state.step), state.replace(ema=None), None, artifact=objective.inference_record())
     checkpoints.wait()
     dataclasses.replace(run_config(single), ema_decay=None).save(str(single))
 
@@ -380,8 +381,6 @@ def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16):
     reach."""
     import json
 
-    from dew.data import ByteTokenizer
-    from dew.inference import RunProcessor
     from dew.objectives.lm import LMObjective, Samples
     from dew.sampling import Sampling
     from dew.training import MeshSpec
@@ -635,32 +634,29 @@ def test_explicit_average_requests_do_not_substitute_live_weights(tmp_path):
                                   live("the ", key=7).host().tokens)
 
 
-def make_block_run(directory):
-    """A block-diffusion run directory: the committed DiffusionGemma fixture's
-    weights under a checkpoint, and the `run.json` a block run writes."""
+def make_block_run(directory, fixture="diffusion-gemma-workflow"):
+    """A block-diffusion run directory: a committed DiffusionGemma fixture's
+    weights under a checkpoint that records the objective and its byte
+    tokenizer. The default fixture reads images; `diffusion-gemma-sft` is
+    text-only, which is what has a published layout to export to."""
     from pathlib import Path
 
     from dew.interop import Pretrained
     from dew.objectives.diffusion.block import BlockDiffusionObjective
 
-    fixture = Path(__file__).resolve().parent / "fixtures/hf/diffusion-gemma-workflow"
+    fixture = Path(__file__).resolve().parent / "fixtures/hf" / fixture
     bundle = Pretrained.load(str(fixture), dtype="float32", attention_impl="xla", max_seq_len=32)
-    objective = BlockDiffusionObjective(bundle.model, prompt_length=3, pretrained=bundle.variables)
+    objective = BlockDiffusionObjective(bundle.model, prompt_length=3, pretrained=bundle.variables,
+                                        processor=RunProcessor(ByteTokenizer()))
     state = Trainer(objective, optax.sgd(0.01), key=jax.random.PRNGKey(2)).initial_state()
     checkpoints = Checkpoints(str(directory))
-    checkpoints.save(0, state, None)
+    checkpoints.save(0, state, None, artifact=objective.inference_record())
     checkpoints.wait()
-    config = ModelConfig("diffusion_gemma",
-                         {**bundle.config, "max_seq_len": bundle.model.max_seq_len},
-                         dtype="float32", attention_impl="auto")
-    (directory / "run.json").write_text(json.dumps({
-        "objective": "block_diffusion", "model": dataclasses.asdict(config),
-        "tokenizer": "byte", "pad_token_id": 0}))
 
 
 def make_masked_run(directory):
     """A masked-diffusion run directory: the committed llada-tiny weights under
-    a checkpoint, and the `run.json` a masked run writes."""
+    a checkpoint that records the objective and its byte tokenizer."""
     from pathlib import Path
 
     from dew.diffusion.discrete import MDLM
@@ -670,17 +666,12 @@ def make_masked_run(directory):
     fixture = Path(__file__).resolve().parent / "fixtures/hf/llada-tiny"
     source = Pretrained.load(fixture, dtype="float32", attention_impl="xla")
     objective = MaskedDiffusionObjective(source.model, MDLM(mask_id=120)(), 8,
-                                         pretrained=source.variables, ema_decay=None)
+                                         pretrained=source.variables, ema_decay=None,
+                                         processor=RunProcessor(ByteTokenizer()))
     state = Trainer(objective, optax.sgd(0.05), key=jax.random.PRNGKey(19)).initial_state()
     checkpoints = Checkpoints(str(directory))
-    checkpoints.save(0, state, None)
+    checkpoints.save(0, state, None, artifact=objective.inference_record())
     checkpoints.wait()
-    fields = {name: value for name, value in source.model_config.items()
-              if name not in ("dtype", "attention_impl")}
-    config = ModelConfig("causal_transformer", fields, dtype="float32", attention_impl="xla")
-    (directory / "run.json").write_text(json.dumps({
-        "objective": "masked_diffusion", "model": dataclasses.asdict(config),
-        "tokenizer": "byte", "sample_tokens": 8}))
 
 
 @pytest.mark.parametrize("make,task_type,prompt,budget", [
@@ -707,8 +698,15 @@ def test_every_saved_text_kind_constructs_through_its_own_task_class(
 
 @pytest.mark.parametrize("kind", ["jepa", "unregistered"])
 def test_saved_non_generation_objectives_fail_at_the_front_door(tmp_path, kind):
-    import json
-    (tmp_path / "run.json").write_text(json.dumps({"objective": kind}))
+    from dew.nn.backbones import CausalTransformer
+    from dew.objectives.lm import LMObjective
+
+    model = CausalTransformer(vocab_size=8, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
+                              max_seq_len=8)
+    state = Trainer(LMObjective(model, 4), optax.sgd(0.), key=jax.random.key(0)).initial_state()
+    checkpoints = Checkpoints(str(tmp_path))
+    checkpoints.save(0, state, None, artifact={"objective": kind})
+    checkpoints.wait()
     with pytest.raises(TypeError, match="no saved generation task") as refusal:
         dew.pipeline(str(tmp_path))
     named = str(refusal.value)
@@ -719,17 +717,16 @@ def test_saved_non_generation_objectives_fail_at_the_front_door(tmp_path, kind):
 
 
 def test_saved_sampling_policy_survives_a_disabled_preview_budget(tmp_path):
-    import json
-
     from dew.sampling import Sampling
 
-    objective, state = make_lm_run(tmp_path)
+    (tmp_path / "run").mkdir()
+    objective, state = make_lm_run(tmp_path / "run")
     policy = Sampling(temperature=0.37, top_k=3, eos_id=255)
-    path = tmp_path / "run.json"
-    record = json.loads(path.read_text())
-    record.update(sample_tokens=0, sampling=dataclasses.asdict(policy))
-    path.write_text(json.dumps(record))
-    task = dew.pipeline(str(tmp_path))
+    checkpoints = Checkpoints(str(tmp_path / "unbudgeted"))
+    checkpoints.save(int(state.step), state, None, artifact={
+        **objective.inference_record(), "sample_tokens": 0, "sampling": dataclasses.asdict(policy)})
+    checkpoints.wait()
+    task = dew.pipeline(str(tmp_path / "unbudgeted"))
     assert task.max_new_tokens is None
     with pytest.raises(ValueError, match="max_new_tokens is required"):
         task([[1, 2]], key=4)
@@ -779,7 +776,7 @@ def test_saved_diffusion_precision_reconstructs_owners_without_source_weights(
                 "constants": {"scale": jnp.asarray([1.007], jnp.float32)}}
     state = dataclasses.replace(initial, variables=params, ema=averaged)
     checkpoints = Checkpoints(str(directory))
-    checkpoints.save(0, state, None)
+    checkpoints.save(0, state, None, artifact=objective.inference_record())
     checkpoints.wait()
     config.save(str(directory))
 
@@ -861,7 +858,7 @@ def test_saved_decoder_compute_and_storage_overrides_generate_from_the_same_weig
     from dew.inference import TextGeneration
     from dew.objectives.base import FROZEN
 
-    _, state = make_lm_run(tmp_path)
+    objective, state = make_lm_run(tmp_path)
     baseline = dew.pipeline(str(tmp_path))
     assert isinstance(baseline, TextGeneration)
     first = next(iter(state.variables["params"]))
@@ -876,7 +873,7 @@ def test_saved_decoder_compute_and_storage_overrides_generate_from_the_same_weig
     frozen = dataclasses.replace(state, step=jnp.asarray(step, state.step.dtype),
                                  variables=move_to_frozen(state.variables), ema=move_to_frozen(state.ema))
     checkpoints = Checkpoints(str(tmp_path))
-    checkpoints.save(step, frozen, None)
+    checkpoints.save(step, frozen, None, artifact=objective.inference_record())
     checkpoints.wait()
     params = baseline.variables
     if storage is not None:

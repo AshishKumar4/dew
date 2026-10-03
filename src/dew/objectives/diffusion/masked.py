@@ -75,6 +75,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         samples: int = 4,
         decode: Callable[[Sequence[int]], str] | None = None,
         pretrained: Variables | None = None,
+        processor: Processor | None = None,
     ):
         """Build an MDLM objective over `model` for `seq_len`-token rows.
 
@@ -84,7 +85,10 @@ class MaskedDiffusionObjective(Objective[Ratio]):
 
         `pretrained` is a released masked-diffusion checkpoint's variables as
         `Pretrained.load` returns them, so a run continues from LLaDA's or
-        Dream's weights instead of a fresh init; None draws the init."""
+        Dream's weights instead of a fresh init; None draws the init.
+
+        `processor` is what `pipeline` turns text into ids with and decodes
+        through, unless it is handed another; a run records its tokenizer."""
         if model.causal:
             raise ValueError(
                 "a masked diffusion model reads the whole corrupted row, so it needs "
@@ -98,18 +102,21 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         self.samples = samples
         self.decode = decode
         self.pretrained = pretrained
+        self.processor = processor
         self.inputs = InputSpec(sample=Field(TEXT_KEY, (seq_len,)))
         self.ema = None if ema_decay is None else EMASpec(decay=optax.constant_schedule(ema_decay))
         self._sample = jax.jit(self._sample_impl, static_argnames=("count",))
 
     def inference_record(self):
         from dew.config import ModelConfig, _to_json
+        from dew.inference.tasks import recorded_tokenizer
         from dew.registry import objectives
         if not any(member is type(self) for member in objectives.values()):
             return None
         model = _to_json(ModelConfig.from_model(self.model), ModelConfig)
         return {'objective': objectives.name_of(type(self)), 'model': model,
-                'seq_len': self.seq_len, 'sample_tokens': self.seq_len, 'tokenizer': None,
+                'seq_len': self.seq_len, 'sample_tokens': self.seq_len,
+                'tokenizer': recorded_tokenizer(self.processor),
                 'process': self.process.to_json(), 'solver': _to_json(self.solver, type(self.solver)),
                 'sampling_steps': self.steps}
 
@@ -119,7 +126,8 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         from dew.inference.tasks import MaskedGeneration
 
         return MaskedGeneration(self.model, self._pipeline_weights(state, ema), self.process,
-                                processor, solver=self.solver, steps=self.steps)
+                                self.processor if processor is None else processor,
+                                solver=self.solver, steps=self.steps)
 
     def held_variables(self) -> Variables | None:
         """Return the checkpoint this run continues from, or None for a fresh init."""

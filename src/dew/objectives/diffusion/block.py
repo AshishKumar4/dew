@@ -134,6 +134,9 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
     Every response token is corrupted, but only a uniformly selected valid
     canvas contributes diffusion CE.
 
+    `processor` is what `pipeline` turns text into ids with and decodes
+    through, unless it is handed another; a run records its tokenizer.
+
     `trainable` selects the parameter leaves the optimizer moves, by their
     full path (`dew.objectives.base.PathFilter`), the way `LMObjective`
     takes it; the rest of the tree is kept under `frozen`, which `init`
@@ -155,7 +158,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
                  stop_gradient_from_denoiser_to_encoder: bool = False,
                  encoder_loss_weight: float = 1.0, decoder_loss_weight: float = 1.0,
                  ema_decay: float | None = None, trainable: PathFilter | None = None,
-                 head_chunks: int = 4):
+                 head_chunks: int = 4, processor: Processor | None = None):
         canvas_size = model.canvas_length if canvas_size is None else canvas_size
         for name, value in (("prompt_length", prompt_length), ("num_canvases", num_canvases),
                             ("canvas_size", canvas_size), ("head_chunks", head_chunks)):
@@ -194,10 +197,12 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         self.ema = None if ema_decay is None else EMASpec(optax.constant_schedule(ema_decay))
         self.trainable = trainable
         self.head_chunks = head_chunks
+        self.processor = processor
 
     def inference_record(self):
         from dew.config import ModelConfig, _to_json
         from dew.diffusion.block import BlockProcess
+        from dew.inference.tasks import recorded_tokenizer
         from dew.interop.hf_decoders import _export_config
         from dew.registry import objectives
         if not any(member is type(self) for member in objectives.values()):
@@ -210,7 +215,8 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
             'generation_config': {}}
         model = _to_json(ModelConfig.from_model(self.model), ModelConfig)
         return {'objective': objectives.name_of(type(self)), 'model': model,
-                'seq_len': self.sequence_length, 'sample_tokens': self.canvas_size, 'tokenizer': None,
+                'seq_len': self.sequence_length, 'sample_tokens': self.canvas_size,
+                'tokenizer': recorded_tokenizer(self.processor),
                 'process': BlockProcess(self.canvas_size, self.model.vocab_size).to_json(),
                 'diffusion_gemma': export}
 
@@ -225,7 +231,8 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         from dew.inference.tasks import BlockGeneration
 
         process = BlockProcess(canvas_length=self.model.canvas_length, vocab_size=self.model.vocab_size)
-        return BlockGeneration(self.model, thaw(self._pipeline_weights(state, ema)), process, processor,
+        return BlockGeneration(self.model, thaw(self._pipeline_weights(state, ema)), process,
+                               self.processor if processor is None else processor,
                                pad_token_id=self.pad_token_id)
 
     @property
