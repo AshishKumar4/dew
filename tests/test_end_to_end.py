@@ -115,8 +115,8 @@ def test_a_step_moves_the_running_statistics_and_the_task_decodes_with_them():
     assert not np.allclose(np.asarray(after["mean"]), np.asarray(before["mean"]))
 
     published = TextToImage.from_objective(task, state.variables)
-    assert AUTOENCODER not in published.params["params"] and LATENT_STATS not in published.params
-    for got, want in zip(jax.tree.leaves(published.params["autoencoder"]),
+    assert AUTOENCODER not in published.variables["params"] and LATENT_STATS not in published.variables
+    for got, want in zip(jax.tree.leaves(published.variables["autoencoder"]),
                          jax.tree.leaves(state.variables["params"][AUTOENCODER]), strict=True):
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
     np.testing.assert_allclose(np.asarray(published.autoencoder.latent_scale),
