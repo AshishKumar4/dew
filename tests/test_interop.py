@@ -545,6 +545,53 @@ def test_a_registry_imports_the_module_that_registers_a_name_and_no_other():
     assert done.stdout.splitlines() == ["dew.objectives.rl.ppo Heun", "False False", "refused True"]
 
 
+REGISTRATIONS = """
+import importlib
+import json
+
+import dew.registry as registry
+
+index = registry._registering_modules()
+absent = set()
+for module in sorted({module for modules in index.values() for module in modules}):
+    try:
+        importlib.import_module(module)
+    except ModuleNotFoundError as missing:
+        if missing.name is None or missing.name.split(".")[0] == "dew":
+            raise
+        absent.add(module)  # an optional dependency this environment lacks
+drift = {}
+for attribute in dir(registry):
+    table = getattr(registry, attribute)
+    if not any(table is held for held in registry.REGISTRIES):
+        continue
+    indexed = {name for (named, name), modules in index.items()
+               if named == attribute and not set(modules) <= absent}
+    if indexed != set(table):
+        drift[attribute] = [sorted(indexed - set(table)), sorted(set(table) - indexed)]
+print(json.dumps({"tables": sum(1 for attribute in dir(registry)
+                                if any(getattr(registry, attribute) is held for held in registry.REGISTRIES)),
+                  "drift": drift}))
+"""
+
+
+def test_the_index_of_registrations_is_every_registration_dew_makes():
+    """The lookup's index reads the decorators off Dew's sources. Importing
+    every module it names fills each of the 11 registries with exactly the
+    names it attributes to them, so a registration it cannot see (a decorator
+    over several lines, an aliased registry) or a line it mistakes for one
+    fails here."""
+    import os
+    import subprocess
+
+    root = Path(__file__).resolve().parents[1]
+    env = {**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(root / "src")}
+    done = subprocess.run([sys.executable, "-c", REGISTRATIONS], capture_output=True, text=True, env=env,
+                          timeout=600)
+    assert done.returncode == 0, done.stderr[-2000:]
+    assert json.loads(done.stdout.splitlines()[-1]) == {"tables": 11, "drift": {}}
+
+
 def test_the_cli_exports_a_run_and_refuses_a_directory_that_is_not_one(tmp_path, capsys):
     """`dew export <run> <dest>` is the same call with two positional names."""
     from test_inference import make_lm_run
