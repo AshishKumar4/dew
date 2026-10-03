@@ -128,7 +128,7 @@ def test_eos_counts_as_action_and_reward_excludes_eos_and_padding():
 
     rollout = SampledRollout(objective, reward, groups=2, max_new_tokens=4,
                              sampling=Sampling(temperature=0, eos_id=eos, pad_id=12))
-    result = rollout(SimpleNamespace(params=params, updates=0), batch, jax.random.key(1))
+    result = rollout(SimpleNamespace(variables=params, updates=0), batch, jax.random.key(1))
     assert seen[:2] == [("a", "", "1", "")] * 2
     for index, (_, text, _, _) in enumerate(seen):
         where = result["session_index"] == index
@@ -178,7 +178,7 @@ def test_real_trainer_update_matches_raw_policy_ratio_with_behavior_recorded():
              for name, value in prompts().items()}
     run_key = jax.random.split(key)[1]
     rollout_key = jax.random.fold_in(jax.random.fold_in(run_key, 0), 1)
-    rolled = rollout(SimpleNamespace(params=params, updates=0), batch, rollout_key)
+    rolled = rollout(SimpleNamespace(variables=params, updates=0), batch, rollout_key)
     assert np.any(rolled["advantages"] != 0)
     assert np.max(np.abs(rolled["old_log_probs"] - rolled["behavior_log_probs"])) > 0.1
     def raw_policy_loss(p):

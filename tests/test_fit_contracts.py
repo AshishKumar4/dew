@@ -7,7 +7,7 @@ import pytest
 from test_trainer import RecordingTracker
 
 from dew.artifacts import Representations
-from dew.data import Dataset
+from dew.data import DataPartition, Dataset
 from dew.eval.common import Mean
 from dew.inputs import Field, InputSpec
 from dew.objectives.base import Aux, Objective, Ratio, Step
@@ -96,3 +96,30 @@ def test_injected_learning_rate_is_logged():
     recorded = next(values for _, values in tracker.scalars if 'train/learning_rate' in values)
     assert recorded['train/learning_rate'] == pytest.approx(.1)
 
+
+def test_the_documented_norm_recorder_holds_the_gradient_norm_and_shares_the_clips_reduction():
+    """docs/key-concepts.md's `record_norm` keeps the step's gradient norm in
+    the optimizer state, and beside `clip_by_global_norm` the compiled step
+    reduces no more than the clip alone does: the two norms are one."""
+    import re
+
+    from test_run_artifact import documented_block
+
+    scope: dict = {}
+    exec(documented_block("docs/key-concepts.md", "To track it, chain a transformation"), scope)
+    record_norm = scope["record_norm"]
+    # A first step from zero weights over rows of ones has gradient [-2, -2].
+    recorded = Trainer(ScalarRegression(), optax.chain(record_norm, optax.sgd(.1)), key=0).fit(
+        data(), steps=1)
+    assert float(recorded.opt_state[0]) == pytest.approx(np.sqrt(8))
+
+    def reductions(optimizer):
+        running = Trainer(ScalarRegression(), optimizer, key=0)
+        state, _, _ = running.place()
+        batch = next(iter(data().train(DataPartition())))
+        running.compile(state, batch)
+        return len(re.findall(r"= \S+ reduce\(", running.executable.as_text()))
+
+    clip = optax.clip_by_global_norm(1.0)
+    shared = reductions(optax.chain(record_norm, clip, optax.sgd(.1)))
+    assert shared == reductions(optax.chain(clip, optax.sgd(.1)))

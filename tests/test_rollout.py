@@ -295,8 +295,8 @@ def prompt_batch(rows=2):
 
 
 class FakeState:
-    def __init__(self, params, updates=0):
-        self.params = params
+    def __init__(self, variables, updates=0):
+        self.variables = variables
         self.updates = updates
 
 

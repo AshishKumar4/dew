@@ -286,7 +286,10 @@ class Objective(ABC, Generic[Loss, Effects]):
     def inputs(self) -> InputSpec | None:
         """Declared input shapes, or None for a custom initializer without an InputSpec.
 
-        A property lets built-in objectives narrow this optional research contract.
+        The sample is the batch field the loss reads, at its per-example
+        shape, and the trainer checks the first batch of a run without a
+        rollout against it (`InputSpec.check`). A property lets built-in
+        objectives narrow this optional research contract.
         """
         return self._inputs
 

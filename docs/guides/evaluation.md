@@ -174,10 +174,9 @@ from dew.config.sweep import grid_search
 from dew.data import TokenWindows
 
 config = RunConfig(
-    model=ModelConfig("causal_transformer", {"vocab_size": 4, "emb_features": 16,
-                                             "num_layers": 1, "num_heads": 2,
-                                             "mlp_features": 32, "max_seq_len": 16}),
-    # The synthetic batches above stand in for the dataset this names.
+    # The run records the model it trains, and the batches above stand in
+    # for the dataset this names.
+    model=ModelConfig.from_model(objective.model),
     data=TokenWindows(seq_len=8),
     optim=OptimConfig(optimizer="adam"),
     trainer=TrainerConfig(name="lm-rate", checkpoint_dir="runs/sweep", steps=10, batch_size=8,

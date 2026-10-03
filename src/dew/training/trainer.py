@@ -834,6 +834,8 @@ class Trainer(Generic[Loss, Effects]):
         # compiles. A resumed run starts at its checkpoint's rung, and says so
         # if its first compile has to climb past it (`_climb_to`).
         self._xla_defaults = False
+        # Why this run's checkpoints describe no model to load, said once.
+        self._unrecorded: str | None = None
         self._resumed_rung: JSON = None
 
     # ------------------------------------------------------------------
@@ -990,6 +992,32 @@ class Trainer(Generic[Loss, Effects]):
             raise ValueError("checkpoint accumulation window_size differs from this trainer")
         self._display.note(f"Resumed from step {resume} in {checkpoints.source(resume)}")
         return state, shardings, position
+
+    def _artifact(self) -> JSON:
+        """The objective's inference record, which a checkpoint carries for
+        loaders. Training and resuming never read it, so a model or component
+        no record can describe still checkpoints: the record says why, a
+        loader raises that, and the first checkpoint warns it, as it does a
+        model no registry names."""
+        from dew.registry import models
+
+        artifact: JSON
+        try:
+            artifact = self.objective.inference_record()
+        except (KeyError, TypeError, ValueError) as error:
+            reason = f"{type(self.objective).__name__}: {error}"
+            artifact = {'unrecorded': reason}
+        else:
+            model = None if artifact is None else record(artifact, 'inference record').get('model')
+            name = model.get('architecture') if isinstance(model, Mapping) else None
+            reason = (None if not isinstance(name, str) or name in models else
+                      f"its model is not registered; `@dew.registry.models({name!r})` above the "
+                      f"class registers it")
+        if reason is not None and reason != self._unrecorded:
+            self._unrecorded = reason
+            _log.warning("this run's checkpoints resume, but no loader can rebuild their model "
+                         "(TextGeneration.from_run, dew.pipeline) until it is fixed: %s", reason)
+        return artifact
 
     def _rung(self) -> JSON:
         """The fit ladder's rung this trainer's step compiles at: the
@@ -1491,8 +1519,10 @@ class Trainer(Generic[Loss, Effects]):
                 if self.rollout is not None:
                     batch, sampled = self._rolled_out(state, batch)
                     interval.rollout_seconds += sampled
-                if not compiled:
-                    agreed("training input declaration", functools.partial(self._check_inputs, batch))
+                inputs = self.objective.inputs
+                if not compiled and self.rollout is None and inputs is not None:
+                    # A rollout writes the batch its loss reads, from prompts it reads itself.
+                    agreed("training input declaration", functools.partial(inputs.check, batch))
                 first_compile = not compiled
                 train_step, measured_flops = self._compiled_for(compiled, state, batch)
                 if first_compile:
@@ -2000,25 +2030,6 @@ class Trainer(Generic[Loss, Effects]):
 
         return agreed("profiling window setup", own_window)
 
-    def _check_inputs(self, batch: Batch) -> None:
-        """Check the first real batch against the objective's declared sample and mask."""
-        inputs = self.objective.inputs
-        if inputs is None:
-            return
-        for condition in inputs.conditions.values():
-            if condition.field not in batch:
-                raise ValueError(f"objective.inputs needs condition field {condition.field!r} "
-                                 "in the training batch")
-        for field in (inputs.sample, inputs.mask):
-            if field is None:
-                continue
-            if field.key not in batch:
-                raise ValueError(f"objective.inputs needs field {field.key!r} in the training batch")
-            actual = batch[field.key].shape[1:]
-            if tuple(actual) != tuple(field.shape):
-                raise ValueError(f"objective.inputs field {field.key!r} declares shape {field.shape}, "
-                                 f"but the first training batch has shape {actual}")
-
     def _check_batch(self, batch: int, mesh: Mesh) -> None:
         """Refuse, before anything is placed, a global batch the mesh cannot
         split (`batch_divisor`): its rows shard over the batch axes as whole
@@ -2171,7 +2182,7 @@ class Trainer(Generic[Loss, Effects]):
                 ranking = (Ranking('train/loss', metadata['train/loss']),)
         checkpoints.save(step, state, position, metadata, share=DataPartition.of(self.device_mesh),
                          ranking=ranking, control=control, weights_only=weights_only,
-                         rung=self._rung(), artifact=self.objective.inference_record())
+                         rung=self._rung(), artifact=self._artifact())
         self._report(CheckpointRequested(checkpoints.directory), step)
         interval.saved(step)
         self._display.status("")
@@ -2193,7 +2204,7 @@ class Trainer(Generic[Loss, Effects]):
         paused = time.perf_counter()
         self._display.status("writing a local checkpoint")
         checkpoints.save_local(step, state, position, share=DataPartition.of(self.device_mesh),
-                               control=control, rung=self._rung(), artifact=self.objective.inference_record())
+                               control=control, rung=self._rung(), artifact=self._artifact())
         self._report(CheckpointRequested(str(checkpoints.local_directory), local=True), step)
         self._display.status("")
         return time.perf_counter() - paused

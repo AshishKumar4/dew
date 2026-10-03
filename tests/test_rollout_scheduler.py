@@ -66,7 +66,7 @@ class Publisher:
 
 class State:
     def __init__(self, updates):
-        self.params, self.updates = jnp.zeros(()), updates
+        self.variables, self.updates = jnp.zeros(()), updates
 
 
 def finished(reward=1.0, *versions, status=Status.COMPLETED, components=None):

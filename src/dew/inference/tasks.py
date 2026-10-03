@@ -266,9 +266,26 @@ def run_record(directory: str, step: int | str | None = None) -> Mapping[str, ob
     from dew.checkpoints import Checkpoints
     record = Checkpoints(directory).artifact(step)
     if record is None:
-        raise ValueError("this checkpoint names no registered inference model; register it and declare "
+        raise ValueError("this checkpoint's objective declares no inference record; declare "
                          "Objective.inference_record, or call objective.pipeline(state)")
-    return named_fields(record, 'checkpoint artifact')
+    record = named_fields(record, 'checkpoint artifact')
+    if 'unrecorded' in record:
+        raise ValueError(f"this run's checkpoints describe no model to load: {record['unrecorded']}")
+    model = record.get('model')
+    if isinstance(model, Mapping) and isinstance(model.get('architecture'), str):
+        # The modules whose classes a record names beyond dew.config's backbones.
+        import dew.nn.backbones.jepa
+        import dew.nn.diffusion_gemma
+        import dew.nn.multimodal  # noqa: F401  (registers the kind)
+        from dew.registry import models
+        name = model['architecture']
+        if name not in models:
+            raise ValueError(
+                f"this run's model is recorded as {name!r}, which no registered model is named. A "
+                f"class trained before it was registered is recorded under its name in lower case: "
+                f"register it once, `@dew.registry.models({name!r})` above the class, import it, and "
+                f"load again")
+    return record
 
 
 def _saved_model(record: Mapping[str, object], dtype: DTypeLike | None) -> ModelConfig:
@@ -279,6 +296,19 @@ def _saved_model(record: Mapping[str, object], dtype: DTypeLike | None) -> Model
     config = ModelConfig.from_dict(named_fields(record["model"], "model"))
     compute = dtype_name(resolve_dtype(dtype))
     return config if compute is None else replace(config, dtype=compute)
+
+
+def recorded_tokenizer(processor: Processor | None) -> str | None:
+    """The tokenizer name a run's record keeps for `processor`, which
+    `_saved_processor` rebuilds through `tokenizer_for`: a run tokenizer's
+    own name, byte or Hugging Face. Any other processor records none, and the
+    run loads as weights that take ids."""
+    from dew.data.text import ByteTokenizer, HFTokenizer
+    from dew.inference.pipeline import RunProcessor
+
+    if isinstance(processor, RunProcessor) and isinstance(processor.tokenizer, ByteTokenizer | HFTokenizer):
+        return processor.tokenizer.name
+    return None
 
 
 def _saved_processor(record: Mapping[str, object]) -> Processor | None:
@@ -341,20 +371,6 @@ def _saved_sampling(record: Mapping[str, object], budget: int | None) -> Samplin
     if not isinstance(controls, dict):
         raise ValueError("the run's sampling policy must be a Sampling record")
     return Sampling(**controls)
-
-
-def _saved_quantization(record: Mapping[str, object]) -> Quantization | None:
-    """Read the run's quantization spec from its `run.json`'s `trainer.quantization`.
-
-    It comes back through the config layer that wrote it, the one place a
-    saved dataclass record becomes its class again.
-    """
-    from dew.config import _built
-    from dew.training.quantization import Quantization
-
-    trainer = record.get("trainer")
-    section = None if trainer is None else named_fields(trainer, "trainer").get("quantization")
-    return None if section is None else _built(Quantization, named_fields(section, "quantization"))
 
 
 @dataclass(frozen=True)
@@ -477,9 +493,6 @@ class TextGeneration:
             from dew.objectives.rl.ppo import _part
             variables = _part(variables, "policy")
         model = model_config.build()
-        quantization = _saved_quantization(record)
-        if quantization is not None:
-            model = quantization.apply(model)
         return cls(model, thaw(variables), processor, sampling=_saved_sampling(record, budget),
                    max_new_tokens=budget if budget else None)
 

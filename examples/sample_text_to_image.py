@@ -45,7 +45,7 @@ SAMPLERS = {
 class Config:
     model: str = "dewml/hybrid-dit-176m"
     """A Hugging Face Hub repository, or a local Dew run directory."""
-    revision: str | None = "0964f57387afc938927b1047f19ed32b63fe0619"
+    revision: str | None = "32d59de89683d59824361144b87bdcaf3e742598"
     """The Hub commit or tag to load; local run directories do not use it."""
     out: Path = Path("runs/sample-text-to-image")
     """A new directory for the images, grids and manifest."""

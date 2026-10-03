@@ -356,8 +356,8 @@ def loss_and_grads(objective, spec, variables, batch, devices=None):
     batch = shard_batch(mesh, batch)
     step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(3), ema=None)
 
-    def loss(variables):
-        return objective.scalar_loss({**variables, "params": variables}, batch, step)
+    def loss(params):
+        return objective.scalar_loss({**variables, "params": params}, batch, step)
 
     with jax.set_mesh(mesh), pipeline_microbatches(spec.microbatches):
         (value, aux), grads = jax.jit(jax.value_and_grad(loss, has_aux=True))(placed["params"])
