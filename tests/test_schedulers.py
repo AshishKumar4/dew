@@ -13,6 +13,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from reference_error import assert_as_exact_as_the_reference
 
 import dew.diffusion.schedules as schedulers
 from dew.diffusion import (
@@ -244,15 +245,6 @@ def test_beta_tables_are_improved_diffusions(name, steps):
     np.testing.assert_array_equal(sigma, np.sqrt(1 - cumulative).astype(np.float32))
 
 
-def test_discrete_p2_default_makes_the_v_loss_an_x0_loss():
-    """The P2 weight at k = 1, gamma = 1 is 1 / (1 + SNR), and the v error is
-    (1 + SNR) times the x_0 error, so their product is the unweighted x_0 loss."""
-    schedule = CosineNoiseScheduler(1000)
-    snr = schedule.snr(DISCRETE_STEPS)
-    assert jnp.allclose(schedule.weight(DISCRETE_STEPS) * VPredictionTransform().target_error_scale(snr),
-                        1.0, rtol=1e-4)
-
-
 def test_small_beta_p2_weights_agree_with_the_reported_snr():
     """A rounded alpha-bar of one must not erase a nonzero training weight."""
     schedule = schedulers.DiscreteNoiseScheduler(np.array([1e-10, 1e-7, .01], np.float32))
@@ -261,6 +253,24 @@ def test_small_beta_p2_weights_agree_with_the_reported_snr():
     # The independently rounded rates, SNR and weight allow a few fp32 operations.
     np.testing.assert_allclose(schedule.weight(steps), expected,
                                rtol=8 * np.finfo(np.float32).eps, atol=0)
+
+WEIGHTS = dict(np.load(Path(__file__).parent / "fixtures" / "weighting" / "weights.npz"))
+TABLES = ("linear", "zero_terminal_cosine")
+
+
+@pytest.mark.parametrize("table", TABLES)
+@pytest.mark.parametrize("k,gamma", [(1, 1), (1, 0.5), (2, 1)])
+def test_p2_weights_are_the_authors(k, gamma, table):
+    """P2 (Choi et al. 2022) as jychoi118/P2-weighting@3da0947 computes it:
+    its own `training_losses` on an epsilon model at every step of the
+    table (tools/weighting_reference.py), against the discrete table's
+    weight, held to the float64 rule."""
+    key = f"p2_epsilon_p2_k{k}_p2_gamma{gamma}_{table}".replace(".", "p")
+    schedule = schedulers.DiscreteNoiseScheduler(WEIGHTS[f"betas_{table}"], p2_loss_weight_k=k,
+                                                 p2_loss_weight_gamma=gamma)
+    weight = Process(schedule, EpsilonPredictionTransform()).weight(jnp.arange(schedule.T))
+    assert_as_exact_as_the_reference(weight, WEIGHTS[key], WEIGHTS[f"{key}_f64"], key)
+
 
 ############################################################################################################
 # min-SNR-gamma loss weighting (Hang et al. 2023), through Process
@@ -273,18 +283,23 @@ def min_snr_process(transform, gamma):
     return Process(CosineNoiseScheduler(1000), transform, weighting=MinSNR(gamma))
 
 
-def test_min_snr_epsilon_weights_match_the_paper():
-    process = min_snr_process(EpsilonPredictionTransform(), 5.0)
-    snr = process.schedule.snr(MIN_SNR_STEPS)
-    expected = jnp.minimum(snr, 5.0) / snr
-    assert jnp.allclose(process.weight(MIN_SNR_STEPS), expected, rtol=1e-5)
-
-
-def test_min_snr_v_weights_match_the_paper():
-    process = min_snr_process(VPredictionTransform(), 5.0)
-    snr = process.schedule.snr(MIN_SNR_STEPS)
-    expected = jnp.minimum(snr, 5.0) / (snr + 1)
-    assert jnp.allclose(process.weight(MIN_SNR_STEPS), expected, rtol=1e-5)
+@pytest.mark.parametrize("table", TABLES)
+@pytest.mark.parametrize("transform,name", [
+    (EpsilonPredictionTransform(), "epsilon_mse_loss_weight_typemin_snr_5"),
+    (VPredictionTransform(), "velocity_mse_loss_weight_typevmin_snr_5"),
+    (DirectPredictionTransform(), "start_x_mse_loss_weight_typemin_snr_5"),
+], ids=["epsilon", "v", "x0"])
+def test_min_snr_weights_are_the_authors(transform, name, table):
+    """min-SNR-5 as TiankaiHang/Min-SNR-Diffusion-Training@5189997 computes
+    it, per parameterization (`min_snr_5` on epsilon and x_0, `vmin_snr_5` on
+    v): its own `training_losses` at every step (tools/weighting_reference.py),
+    held to the float64 rule. On the zero-terminal table the last step has
+    zero SNR, which the authors weight as one."""
+    key = f"min_snr_{name}_{table}"
+    process = Process(schedulers.DiscreteNoiseScheduler(WEIGHTS[f"betas_{table}"]), transform,
+                      weighting=MinSNR(5.0))
+    weight = process.weight(jnp.arange(process.schedule.T))
+    assert_as_exact_as_the_reference(weight, WEIGHTS[key], WEIGHTS[f"{key}_f64"], key)
 
 
 @pytest.mark.parametrize("transform", [KarrasPredictionTransform(0.5),
