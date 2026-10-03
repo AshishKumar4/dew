@@ -1066,6 +1066,54 @@ tokens a second, 64 slots 7175 to 7215, 128 slots 8219 to 8343 (both sides
 had slow runs, the slowest 5196 and 4685 at 32 slots), the tokens and
 log-probabilities identical.
 
+### The remaining gap, 2026-10-03
+
+At 64 slots Dew serves 7146 and 7197 tokens a second (medians of five
+runs, two processes, integration `6a220e31`) against vLLM 0.30.0's 7532
+and 7577 in-process (one run each, two processes). Whole measured runs
+traced, Dew under XProf (`f6047cf9`) and vLLM under Nsight with its CUDA
+graphs' nodes: Dew's device is busy 2.22 s of the run's 2.29 and vLLM's
+2.00 s of 2.18. Nsight warns that not every CUDA event was collected, and
+its run shows 249 steps where 128 requests of 128 tokens on 64 slots need
+at least 256, so vLLM's figure is low by a few percent. Where Dew's device
+time goes beside vLLM's:
+
+| | Dew | vLLM |
+|---|---:|---:|
+| GEMMs | 891 ms | 907 ms |
+| attention | 1016 ms, 7420 calls, 138.7 us median | 943 ms, 136.6 us median per decode call |
+| everything else | 313 ms | 154 ms |
+
+Attention is at parity call for call; Dew makes more calls because it runs
+265 steps to vLLM's 249 traced, its admission steps (8 prompts a step, as
+vLLM's 2048-token chunks hold) and a slot freed only when the host reads
+the step that finished it. The rest is many small kernels: the residual
+add with the split-K GEMM's sum and its cast (52.5 ms in 22859 launches),
+the norms (80.7 ms in 32201), the cache writes (61.0 ms) and the
+transposes around attention (48.8 ms), each one to three microseconds
+where vLLM fuses an add into its RMSNorm and writes K and V in one kernel.
+
+Measured and not adopted, each under 1% of the run:
+
+- K and V written by one Pallas kernel a layer instead of XLA's two
+  scatters: 0.141 against 0.166 ms a decode step for all 28 layers,
+  bitwise the same.
+- XLA's command buffers: on by default, cuDNN's attention among the
+  commands the decode step replays; every command type with no minimum
+  graph size measured within the default's spread, off is slower, and the
+  tokens are the same three ways.
+- JAX's Pallas split-KV decode attention (`gqa`): 0.43 ms a layer on the
+  cache as Dew stores it, which it transposes, against cuDNN's 0.165; its
+  kernel on a head-major cache 0.155 ms at its best tiles, with other bits
+  than cuDNN's.
+- Triton multi-output fusion and a single split-K, one traced run each:
+  device time 2222.2 and 2216.2 ms against 2222.3-2224.6.
+
+What remains is the small kernels vLLM fuses, at most about 1.5% of the
+run by the launches a fused add and norm would save, and the admission's
+extra steps. Evidence:
+`~/.cache/dew/verification-evidence/serving-gap-final/`.
+
 ## Quantized serving of the 176M text-to-image model, 2026-09-28
 
 `TextToImage.quantized` serves the denoiser with its kernels stored as int8
