@@ -454,8 +454,21 @@ at integration `8e92a4a6`:
 Every configuration's errors against fp32 XLA at HIGHEST are the same (out
 3.7e-3, dq 5.0e-3, dk 5.1e-3, dv 2.8e-3 of their maximum). The kernel now
 tiles by 1024 (narrowed to a divisor of each sequence) and runs its
-backward as one kernel: 0.53 ms less per layer, 14.9 ms of the 28-layer
-step at these shapes.
+backward as one kernel. The training steps on the v6e (integration
+`527a32e9`, three rounds each, one batch on the device, ms):
+
+| step | 512 tiles, dq and dkv apart | 1024 tiles, fused backward |
+|---|---:|---:|
+| Qwen3-0.6B widths, 8 x 1024 | 150.34-150.43 | 136.77-136.92 |
+| Qwen3-0.6B widths, 16 x 1024 (head tiled by the fit ladder) | 320.48-320.54 | 278.63-278.66 |
+| 4-layer decoder, 256-wide heads, 8 x 2048 | 80.90-80.95 | 75.36-75.45 |
+| 176M hybrid DiT, batch 16 (4 attention blocks of 256 tokens) | 17.24-17.30 | 17.25 |
+
+MaxText 0.2.4 runs Qwen3-0.6B at 8 x 1024 in 161.1 ms (minimal remat) and
+at 16 x 1024 in 298.2. Losses after the 45 steps differ in the third or
+fourth significant digit (0.003386 against 0.003389 at 8 x 1024), where
+reordering the backward's fp32 sums moves a training run's trajectory; each
+kernel call's errors against fp32 are the same.
 
 ### tokamax's attention, 2026-10-02
 
