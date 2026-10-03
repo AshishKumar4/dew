@@ -604,7 +604,7 @@ def mode_fit(args) -> dict:
     state = trainer.fit(Data(open_train, val=val, records=args.records),
                         steps=args.steps, log_every=1,
                         eval_every=args.steps if args.tokens else None,
-                        checkpoint_every=args.save_every, metrics=(counter,),
+                        checkpoint_every=args.save_every, metrics=(counter,) if args.tokens else (),
                         best=Best(counter, mode='max') if args.tokens else None)
     dump_params(args.out.with_suffix(".npz"), state.variables)
     _, final_position = restored_state(trainer)
@@ -1945,7 +1945,7 @@ def mode_host_training(args) -> dict:
 
     rows = np.arange(8, dtype=np.float32)
     local = np.array_split(rows, jax.process_count())[jax.process_index()]
-    for name, host in (("resident", ()), ("host", ("params",))):
+    for name, host in (("resident", ()), ("host", ("variables",))):
         trainer = SeparateLanes(Coupled(), optax.chain(optax.clip_by_global_norm(.5), optax.sgd(.1)),
                           key=jax.random.key(0), mesh=MeshSpec(fsdp=2),
                           layout=Layout(host=host, min_shard=1, tolerance=1.))

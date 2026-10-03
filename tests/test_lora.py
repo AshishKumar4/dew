@@ -764,8 +764,8 @@ def test_the_branch_reaches_every_layer_of_a_scanned_run(decoder, reference):
         np.asarray(scanned.apply(variables, tokens)), np.asarray(plain), rtol=1e-5, atol=1e-5
     )
 
-    def loss(variables):
-        return jnp.mean(scanned.apply({**variables, "params": variables}, tokens) ** 2)
+    def loss(params):
+        return jnp.mean(scanned.apply({**variables, "params": params}, tokens) ** 2)
 
     grads = jax.grad(loss)(variables["params"])
     for layer in ("layers_0", "layers_1"):

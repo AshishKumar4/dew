@@ -40,9 +40,9 @@ import tyro
 import dew
 from dew.artifacts import uint8_pixels
 from dew.config import ModelConfig, OptimConfig, TrainerConfig
-from dew.data import Loading, TokenWindows
+from dew.data import ByteTokenizer, Loading, TokenWindows
 from dew.eval import FID, CLIPScore
-from dew.inference import TextGeneration, TextToImage
+from dew.inference import RunProcessor, TextGeneration, TextToImage
 from dew.objectives.lm import LMObjective, LMRunConfig, Perplexity
 from dew.sampling import Sampling
 from dew.training import Evaluation
@@ -94,8 +94,8 @@ def smoke_run(out: Path) -> tuple[Path, Path]:
     """A two-step byte-level LM run and the token files it read.
 
     The same shape tests/test_inference.py's `make_lm_run` builds: a tiny
-    causal decoder, its checkpoint and the `run.json` that names the model,
-    the tokenizer and the preview budget.
+    causal decoder and its checkpoint, whose record names the model, the
+    byte tokenizer the objective decodes through and the preview budget.
     """
     tokens = out / "tokens"
     tokens.mkdir(parents=True, exist_ok=True)
@@ -118,7 +118,8 @@ def smoke_run(out: Path) -> tuple[Path, Path]:
         trainer=TrainerConfig(checkpoint_dir=str(out / "checkpoints"), batch_size=4, steps=2,
                               log_every=1, eval_every=None, checkpoint_every=2,
                               multi_host=False, compilation_cache_dir=None))
-    objective = LMObjective(run.model.build(), run.data.seq_len, ema_decay=0.9)
+    objective = LMObjective(run.model.build(), run.data.seq_len, ema_decay=0.9,
+                            processor=RunProcessor(ByteTokenizer()))
     run.train(objective, run.data.load(batch=run.trainer.batch_size), name="smoke")
     return Path(run.trainer.checkpoint_dir) / "smoke", tokens
 

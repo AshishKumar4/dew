@@ -15,6 +15,7 @@ import jax.numpy as jnp
 
 from dew.artifacts import TokenScores
 from dew.data.preferences import IDS_KEY, MASK_KEY
+from dew.inputs import Field, InputSpec
 from dew.objectives.base import Aux, Ratio, Variables
 from dew.registry import objectives
 from dew.rl.surrogate import preference_logsigmoid_terms
@@ -51,6 +52,8 @@ class DPOObjective(LMObjective):
                 "so loss_role is refused on a DPO objective")
         kwargs["ema_decay"] = 1.0
         super().__init__(model, seq_len, **kwargs)
+        # The batch is `input_ids` pairs, chosen then rejected, not text windows.
+        self.inputs = InputSpec(sample=Field(IDS_KEY, (2, seq_len + 1)))
         self.beta = beta
 
     def _halves(self, batch):

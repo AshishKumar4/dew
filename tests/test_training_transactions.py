@@ -303,9 +303,9 @@ def test_local_partial_snapshot_survives_continued_training_and_weight_restore(t
     resumed, *_ = step(resumed, data[2])
     for want, got in zip(jax.tree.leaves(final), jax.tree.leaves(resumed), strict=True):
         np.testing.assert_array_equal(raw_leaf(got), raw_leaf(want))
-    template = {"params": jax.tree.map(
+    template = {"variables": jax.tree.map(
         lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=x.sharding), restored.variables)}
     selected, _ = checkpoints.restore(template, 1)
-    for want, got in zip(jax.tree.leaves(prefix_params), jax.tree.leaves(selected["params"]), strict=True):
+    for want, got in zip(jax.tree.leaves(prefix_params), jax.tree.leaves(selected["variables"]), strict=True):
         np.testing.assert_array_equal(raw_leaf(got), raw_leaf(want))
 

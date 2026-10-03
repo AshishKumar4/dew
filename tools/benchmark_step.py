@@ -74,6 +74,7 @@ from dew.nn.backbones.flux2 import Flux2Transformer
 from dew.nn.backbones.qwen_image import QwenImageTransformer
 from dew.nn.backbones.sd3 import SD3Transformer
 from dew.nn.backbones.unet_condition import UNet2DCondition
+from dew.nn.backbones.wan import WanTransformer
 from dew.nn.backbones.z_image import ZImageTransformer
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.inputs import ModelInputs
@@ -485,6 +486,11 @@ def small_cases(dtype: str) -> list[Case]:
         Case("z_image_transformer", {"dim": 384, "n_layers": 3, "n_refiner_layers": 1, "n_heads": 6,
                                       "cap_feat_dim": TEXT_FEATURES, "axes_dims": (16, 24, 24)},
              batch_size=4, image_size=32, channels=16),
+        # Wan 2.1's text-to-video transformer at the 1.3B's head width and a
+        # tenth of its depth, over 1 + 4k latent frames of its VAE's 16 channels.
+        Case("wan_transformer", {"num_attention_heads": 6, "attention_head_dim": 64,
+                                  "text_dim": TEXT_FEATURES, "ffn_dim": 1536, "num_layers": 3},
+             batch_size=4, image_size=32, channels=16, frames=5),
         Case("uvit", {key: value for key, value in dit.items() if key != "mlp_ratio"},
              batch_size=16, image_size=64),
         Case("simple_udit", {**dit, "num_layers": 6}, batch_size=16, image_size=64),
@@ -714,6 +720,10 @@ def build_objective(case: Case, attention_impl: str = 'auto', *, widened: bool =
         if isinstance(model, QwenImageTransformer):
             keyword = "conditioning"
             encoder = _DenoisingTextTable.from_pretrained()
+            preset = presets.Flow()
+        elif isinstance(model, WanTransformer):
+            keyword = "conditioning"
+            encoder = _DenoisingTextTable.from_pretrained(features=model.text_dim)
             preset = presets.Flow()
         elif isinstance(model, ZImageTransformer):
             keyword = "conditioning"

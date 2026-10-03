@@ -41,7 +41,7 @@ from flax import linen as nn, struct
 from dew.artifacts import TextSamples, TokenScores, agreed, collective_host
 from dew.data.chat import ROLES_KEY, Role
 from dew.inference import TextGeneration
-from dew.inference.tasks import Processor
+from dew.inference.tasks import Processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
 from dew.nn.backbones.causal_transformer import INTERMEDIATES, CausalTransformer, layer_output, layer_outputs
 from dew.nn.inputs import ModelInputs
@@ -712,20 +712,18 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     def inference_record(self):
         """Describe this decoder without a training RunConfig or parameter copies."""
         from dew.config import ModelConfig, _to_json
-        from dew.registry import models, objectives
-        if (not any(member is type(self.model) for member in models.values())
-                or not any(member is type(self) for member in objectives.values())):
+        from dew.registry import objectives
+        if not any(member is type(self) for member in objectives.values()):
             return None
-        model = ModelConfig.from_model(self.model)
         kind = objectives.name_of(type(self))
         samples = self.samples
         return {
             'objective': kind,
-            'model': _to_json(model, ModelConfig),
+            'model': _to_json(ModelConfig.from_model(self.model), ModelConfig),
             'seq_len': self.seq_len,
             'sample_tokens': 0 if samples is None else samples.max_new_tokens,
             'sampling': _to_json(Sampling() if samples is None else samples.sampling, Sampling),
-            'tokenizer': None,
+            'tokenizer': recorded_tokenizer(self.processor),
         }
 
     def pipeline(self, state: TrainState, *, ema: bool | None = None,
