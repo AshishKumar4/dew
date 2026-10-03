@@ -124,6 +124,37 @@ and 2.0 times slower (its expert GEMMs and the XLA path of the SSD scan).
 The MaxText row ran on another VM, before the whole-logits head took Dew's
 step from 161.9 to 141 ms.
 
+## Rounding on the TPU, 2026-10-02
+
+`import dew` turns off XLA's excess precision (`--xla_allow_excess_precision=false`)
+so that every bf16 rounding a program states is kept. On one TPU v6e chip
+(Colab, jax 0.11.2.post3, libtpu 0.0.48, Dew at `f24b452a`) the policy is
+needed there too. With XLA's default, a bf16 round trip before a `tanh` or a
+sum is computed unrounded, and a bf16 decoder's outputs depend on the
+program's shape: Qwen3-0.6B's widths over 256 tokens give 10% of their
+elements equal between a batch of 4 and the same rows one at a time. With
+the policy, all of them are equal. Multi-chip layouts could not be tested
+on one chip and are unverified.
+
+The policy cost the 176M hybrid DiT's batch-16 step 8.1% on the v6e (16.95
+to 18.29 ms; on an A100 it was neutral, 45.31 to 45.42). The traces put
+0.93 ms of the 1.39 in the MLP's backward: the GELU ran as eight bf16
+elementwise steps, and each kept its rounding. A further 0.27 ms is the
+rounding of the residual sums the norms read, which is the policy's
+purpose. The MLP's GELU (`dew.nn.dit`, and an ungated decoder's `gelu`) now
+runs in fp32 and rounds once, as torch's bf16 GELU does, and as the gated
+MLPs already did (`dew.nn.moe.gated_product`). Over 2^20 bf16 values its
+RMS error against float64 drops from 2.19e-3 to 1.76e-3 (CPU and RTX 4080
+alike). The RTX 4080 steps are unchanged: the hybrid DiT at batch 16
+66.66/66.54 against 66.47/66.55 ms, SimpleDiT-B at 32 72.99/72.63 against
+72.77/72.71, a 3-layer GELU decoder at 16 x 512 44.40/44.30 against
+44.39/44.42. On the v6e (integration `8e92a4a6`, three rounds each) the
+hybrid DiT's batch-16 step runs 17.25-17.29 ms against 18.25, where XLA's
+excess precision would give 16.88-16.92: the policy now costs 2.2%, the
+residual roundings. Those roundings are real on the TPU too: an RMSNorm
+reading a fused bf16 residual sum matches the program that stores the sum
+on 98.8% of its outputs with excess precision, and on all of them without.
+
 ## Sampling the hybrid DiT on the CPU, 2026-10-02
 
 The landing page's live cell samples the published 176M hybrid DiT on a
