@@ -604,7 +604,7 @@ def mode_fit(args) -> dict:
     state = trainer.fit(Data(open_train, val=val, records=args.records),
                         steps=args.steps, log_every=1,
                         eval_every=args.steps if args.tokens else None,
-                        checkpoint_every=args.save_every, metrics=(counter,),
+                        checkpoint_every=args.save_every, metrics=(counter,) if args.tokens else (),
                         best=Best(counter, mode='max') if args.tokens else None)
     dump_params(args.out.with_suffix(".npz"), state.variables)
     _, final_position = restored_state(trainer)
