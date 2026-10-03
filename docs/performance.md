@@ -942,6 +942,17 @@ that layout ran at 28 GB/s. A write as wide as its buffer now gathers each
 slot's token (`dew.nn.kv_cache.write_cache`), with the same bits: tokens
 and both log-probability streams are identical at every slot count.
 
+A decode step's attention reads each key head once for its group of query
+heads: the group goes in as that head's query positions. cuDNN otherwise
+padded the lone query to two positions and ran each query head on its own.
+At 64 rows over 384 slots the kernel takes 0.146 against 0.154 ms a layer,
+and 0.072 against 0.129 when every row has 257 keys. Serving at integration
+`17e2b226`, five processes a side over two sessions, medians of 15 runs:
+32 slots 5489-5510 to 5521-5619 tokens a second, 64 slots 7175 to 7215,
+128 slots 8219 to 8343, the tokens and log-probabilities identical. This
+host was loaded through these runs, and both sides had slow runs (the
+slowest 5196 and 4685 at 32 slots).
+
 ## Quantized serving of the 176M text-to-image model, 2026-09-28
 
 `TextToImage.quantized` serves the denoiser with its kernels stored as int8
