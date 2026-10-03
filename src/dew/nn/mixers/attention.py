@@ -637,12 +637,22 @@ class CausalSelfAttention(nn.Module):
             # A row whose query is padding reads one key, so its (unused)
             # output stays finite as the masked kernels leave it.
             reads = jnp.maximum(jnp.asarray(positions).reshape(B, S)[:, 0] + 1, 1)
-            attention = checkpoint_name(scaled_dot_product_attention(
-                query, key, value, dtype=self.dtype, precision=self.precision,
+            # Each group's query heads read the same keys, so they go in as
+            # that key head's query positions: one pass over the group's keys
+            # where cuDNN otherwise padded the lone query to two and ran each
+            # query head on its own, 4.7% less a layer at 64 rows and the
+            # same bits (docs/performance.md).
+            heads, kv_heads = query.shape[-2], key.shape[-2]
+            group = heads // kv_heads
+            grouped = query.reshape(B, kv_heads, group, query.shape[-1]).transpose(0, 2, 1, 3)
+            attention = scaled_dot_product_attention(
+                grouped, key, value, dtype=self.dtype, precision=self.precision,
                 force_fp32_for_softmax=self.force_fp32_for_softmax,
                 implementation=self.attention_impl, causal=False,
                 softcap=self.attn_logit_softcap,
-                key_value_seq_lengths=reads.astype(jnp.int32)), 'context')
+                key_value_seq_lengths=reads.astype(jnp.int32))
+            attention = checkpoint_name(
+                attention.transpose(0, 2, 1, 3).reshape(B, 1, heads, attention.shape[-1]), 'context')
         else:
             attention = checkpoint_name(scaled_dot_product_attention(
                 query, key, value, dtype=self.dtype, precision=self.precision,
