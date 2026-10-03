@@ -261,8 +261,8 @@ def test_a_mistral3_encoder_reads_as_flux2_dev_reads_it(source, arrays, record):
 
     directory = source / "mistral3"
     encoder, layouts, _ = _hidden_states_conditioning(
-        directory, {}, jnp.float32, 16, pipeline="flux2", tokens=512, guidance=4.0, param_dtype="float32",
-        attention_impl="xla")
+        directory, {}, jnp.float32, (16, 16), pipeline="flux2", tokens=512, guidance=4.0,
+        param_dtype="float32", attention_impl="xla")
     assert (encoder.template, encoder.layers) == ("mistral3", (10, 20, 30))
     condition = encoder.encode(encoder.params, encoder.tokenize(record["pipeline"]["prompts"]))
     assert relative_gap(condition.context, arrays["mistral3.context"]) < FORWARD
