@@ -332,12 +332,15 @@ def _trainer(case, fields: dict[str, int], *, one_device: bool = False, accumula
     """The trainer of `case` on the layout `fields` names over the first
     `devices` devices (every device by default), or on this process's first
     device, stashing each gradient the optimizer is handed. Its initial
-    parameters have no all-zero leaf (`_drawn`). In a one-process run it
-    places the case's initial state from one device (`_initial`) once that
-    has been computed, rather than computing its own: the same state, without
-    a compile of the model's initialization on every layout."""
+    parameters have no all-zero leaf (`_drawn`). In a one-process run, once
+    the case's one-device state is computed (`_initial`), a trainer whose
+    mesh shards the variables in a way the case has not yet drawn them
+    computes its own state and must find it bitwise equal to that one, and
+    every other trainer copies it: the same state, without a compile of the
+    model's initialization on every layout."""
     import benchmark_step as bench
     import jax
+    import numpy as np
     import optax
 
     from dew.training import Layout, MeshSpec, Trainer
@@ -361,6 +364,26 @@ def _trainer(case, fields: dict[str, int], *, one_device: bool = False, accumula
             refuse_wide_floats(abstract, self.device_mesh)
             shardings = self.shardings(abstract)
             self.layout.check(abstract.variables, shardings.variables, self.device_mesh)
+            # The mesh axes the variables split over, with their sizes: an
+            # initializer drawn under a split the case has not drawn under
+            # yet could come out different, so that split draws its own.
+            split = tuple(sorted({(axis, self.device_mesh.shape[axis])
+                                  for sharding in jax.tree.leaves(shardings.variables)
+                                  for entry in sharding.spec if entry is not None
+                                  for axis in ((entry,) if isinstance(entry, str) else entry)
+                                  if self.device_mesh.shape[axis] > 1}))
+            if split and (repr(case), split) not in _drawn_splits:
+                state, shardings, position = super().place()
+                drawn, _ = jax.tree_util.tree_flatten_with_path(jax.device_get(state.variables))
+                wanted = jax.tree.leaves(jax.device_get(held.variables))
+                differing = [jax.tree_util.keystr(path)
+                             for (path, here), there in zip(drawn, wanted, strict=True)
+                             if np.asarray(here).tobytes() != np.asarray(there).tobytes()]
+                if differing:
+                    raise ValueError(f"the variables drawn split over {split} differ from one device's "
+                                     f"at {differing[:4]}")
+                _drawn_splits.add((repr(case), split))
+                return state, shardings, position
             return jax.device_put(jax.tree.map(lambda leaf: leaf.copy(), held), shardings), shardings, None
 
     trainer = Drawn(bench.build_objective(case), optax.chain(stash(), optax.adam(1e-3)),
@@ -379,6 +402,8 @@ _initial: dict[tuple[str, int], Any] = {}
 one-device trainer placed it on this process's first device: every layout's
 trainer draws the same state from the same key, so later trainers copy it
 onto their mesh."""
+_drawn_splits: set[tuple[str, tuple[tuple[str, int], ...]]] = set()
+"""Each case's variable splits whose own draw was found equal to `_initial`'s."""
 
 
 def _gradient(state) -> dict[str, NDArray]:
