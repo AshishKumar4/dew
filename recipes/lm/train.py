@@ -191,10 +191,13 @@ def run_tokenizer(name: str) -> ByteTokenizer | HFTokenizer:
     return ByteTokenizer() if name == "byte" else HFTokenizer(name)
 
 
-def build_samples(config: LmRunConfig) -> Samples | None:
-    """What the objective generates and decodes at every validation."""
+def build_samples(config: LmRunConfig) -> Samples:
+    """What the objective generates and decodes at every validation. The
+    policy is kept with no preview budget too: the run records it, and its
+    export and `dew.pipeline` decode with it."""
     if config.sample_tokens <= 0:
-        return None
+        # No preview, so no tokenizer to read: the policy alone.
+        return Samples(prompt=[], max_new_tokens=0, sampling=config.sampling)
     tokenizer = run_tokenizer(config.tokenizer)
     return Samples(
         prompt=tokenizer.encode(config.sample_prompt or "\n"),
@@ -310,7 +313,8 @@ def main(config: LmRunConfig) -> TrainState:
     summary = {"model": fields, "arguments": run_summary(config, fields),
                "dataset": {"path": read_corpora(config.data), "records": data.records,
                            "tokens": meta.get("train_tokens")}}
-    validation = (Perplexity(),)
+    # Perplexity scores each validation pass; --trainer.eval-every None runs none.
+    validation = () if config.trainer.eval_interval(data) is None else (Perplexity(),)
     pretrained = None if source is None else source.variables
     if config.objective == "masked_diffusion":
         return config.train(build_masked_objective(config, model, fields, pretrained), data,

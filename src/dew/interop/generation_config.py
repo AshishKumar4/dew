@@ -525,6 +525,36 @@ def _mtp_mode(value: object) -> bool:
     return True
 
 
+def generation_config_of(sampling: Sampling, max_new_tokens: int | None = None) -> dict[str, JSON]:
+    """The generation_config.json transformers reads `sampling` from, and
+    `source_decoding` reads back as the same policy: the inverse of
+    `_source_sampling`. A top_k of None is written 0, which both read as no
+    cut (transformers' own default is 50). transformers has no presence or
+    frequency penalty, so a policy using one is refused, not exported
+    without it."""
+    dropped = [name for name in ("presence_penalty", "frequency_penalty") if getattr(sampling, name) != 0.0]
+    if dropped:
+        raise ValueError(f"transformers' generation config has no {' or '.join(dropped)}; "
+                         "export a policy without it")
+    sample = sampling.temperature > 0
+    values: dict[str, JSON] = {"do_sample": sample, "use_cache": True}
+    if sample:
+        values.update(temperature=sampling.temperature, top_k=sampling.top_k or 0, top_p=sampling.top_p,
+                      min_p=sampling.min_p, typical_p=sampling.typical_p)
+    values.update(repetition_penalty=sampling.repetition_penalty,
+                  no_repeat_ngram_size=sampling.no_repeat_ngram_size, min_new_tokens=sampling.min_new_tokens)
+    if sampling.eos_id is not None:
+        values["eos_token_id"] = (sampling.eos_id if isinstance(sampling.eos_id, int)
+                                  else list(sampling.eos_id))
+    if sampling.pad_id is not None:
+        values["pad_token_id"] = sampling.pad_id
+    if sampling.stop:
+        values["stop_strings"] = list(sampling.stop)
+    if max_new_tokens:
+        values["max_new_tokens"] = max_new_tokens
+    return values
+
+
 def source_decoding(config: Mapping[str, object], generation_config: Mapping[str, object],
                      model: nn.Module, rows: int, override: Sampling | None
                      ) -> tuple[Sampling, tuple[decoding.LogitsTransform, ...] | None, Strategy | None]:

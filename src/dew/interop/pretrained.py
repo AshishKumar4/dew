@@ -35,6 +35,7 @@ from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import Origin, SourceSchedule
 from dew.inference import BlockGeneration, MaskedGeneration, TextGeneration
 from dew.inference.pipeline import place
+from dew.inference.tasks import Processor as TaskProcessor
 from dew.inputs import Condition, Field, InputSpec
 from dew.inputs.diffusion import (
     Composition,
@@ -49,6 +50,7 @@ from dew.interop.codecs import SourceQuantization, source_quantization
 from dew.interop.generation_config import (
     audit_masked,
     eos_ids,
+    generation_config_of,
     generation_limit,
     pad_id,
     return_sequences,
@@ -310,6 +312,17 @@ class Pretrained:
     """The vocabulary `save` writes beside the weights, by name or by object,
     for a bundle with no source processor to write (`from_model`)."""
 
+    @property
+    def _text_processor(self) -> TaskProcessor | None:
+        """What the bundle's tasks encode and decode text with: the source's
+        processor, or a run processor over the vocabulary `tokenizer` names
+        (a run's export, Dew's byte vocabulary included)."""
+        if self.processor is not None or not isinstance(self.tokenizer, str):
+            return self.processor
+        from dew.data.text import tokenizer_for
+        from dew.inference.pipeline import RunProcessor
+        return RunProcessor(tokenizer_for(self.tokenizer, local_files_only=True))
+
     @classmethod
     def from_run(cls, directory: str | Path, *, step: int | str | None = None,
                  ema: bool | None = None) -> Self:
@@ -325,8 +338,11 @@ class Pretrained:
         kind = text(declaration['objective'], 'objective')
         averaged = False if objectives[kind]._ema_is_reference else ema
         variables = Checkpoints(str(directory)).variables(step=step, ema=averaged)
+        # The run's policy and budget, in the format the export's readers read.
         sampling = declaration.get('sampling')
-        generation = None if sampling is None else record(sampling, 'sampling')
+        budget = declaration.get('sample_tokens')
+        generation = None if not isinstance(sampling, dict) else generation_config_of(
+            Sampling(**sampling), budget if isinstance(budget, int) else None)
         tokenizer = declaration.get('tokenizer')
         tokenizer = None if tokenizer is None else text(tokenizer, 'tokenizer')
         if isinstance(model, CausalTransformer):
@@ -621,7 +637,7 @@ class PretrainedDecoder(Pretrained):
                 raise ValueError("the adapter already selects what trains, its own factors; omit trainable=")
             options["trainable"] = self.adapter.trainable
         return LMObjective(self.model, seq_len, pretrained=self.variables,
-                           **{"processor": self.processor, **options})
+                           **{"processor": self._text_processor, **options})
 
     def text_generation(self, *, sampling: Sampling | None = None) -> TextGeneration:
         """Build the text generation task this source describes.
@@ -642,7 +658,7 @@ class PretrainedDecoder(Pretrained):
         return TextGeneration(
             self.model,
             self.variables,
-            self.processor,
+            self._text_processor,
             policy,
             max_new_tokens=generation_limit(self.config, self.generation_config, "max_new_tokens"),
             max_length=generation_limit(self.config, self.generation_config, "max_length"),
@@ -672,7 +688,7 @@ class PretrainedMaskedDecoder(Pretrained):
             raise TypeError("a masked decoder generates by unmasking, and this model names no mask token")
         audit_masked(config, generation)
         return MaskedGeneration(self.model, self.variables, MDLM(mask_id=mask_id)(),
-                                self.processor,
+                                self._text_processor,
                                 eos_token_ids=eos_ids(config, generation),
                                 pad_token_id=pad_id(config, generation),
                                 max_new_tokens=generation_limit(config, generation, "max_new_tokens"),
@@ -694,7 +710,7 @@ class PretrainedBlockDecoder(Pretrained):
             self.model,
             self.variables,
             diffusion_gemma.generation_process(self.config, self.generation_config),
-            self.processor,
+            self._text_processor,
             eos_ids(self.config, self.generation_config),
             pad_id(self.config, self.generation_config),
             max_new_tokens=generation_limit(self.config, self.generation_config, "max_new_tokens"),
@@ -817,7 +833,7 @@ class PretrainedFallback(Pretrained):
         if "pretrained" in options:
             raise ValueError("a Pretrained bundle already supplies the initial variables; omit pretrained=")
         return LMObjective(self.model, seq_len, pretrained=self.variables,
-                           **{"processor": self.processor, **options})
+                           **{"processor": self._text_processor, **options})
 
 
 def _native_variables(parts: Mapping[str, Mapping[str, ParamTree]]) -> dict[str, dict[str, ParamTree]]:
@@ -2205,13 +2221,18 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
     processor = _source_processor(directory, config, record, model, gguf_path)
     generation_config = _generation_config(directory)
 
+    # Dew's byte vocabulary has no files: an export names it in
+    # generation_config.json, and the name is the whole record of it.
+    named = generation_config.get("tokenizer_name") if processor is None else None
+
     def bundle[K: Pretrained](kind: type[K]) -> K:
         prepared = variables if prepare is None else prepare(model, variables)
         return kind(model, placed(prepared), processor, config, directory, built, generation_config,
                     layouts, retained, export_adapter, quantized_tensors=quantized_tensors,
                     quantized_scale_dtype=scale_dtype, quantization_grid=grid,
                     # The weights' commit: a pickle repo's may be its conversion's.
-                    revision=None if commit is None else directory.name)
+                    revision=None if commit is None else directory.name,
+                    tokenizer="byte" if named == "byte" else None)
 
     if isinstance(model, DiffusionGemma):
         return bundle(PretrainedBlockDecoder)

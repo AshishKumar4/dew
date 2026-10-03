@@ -300,6 +300,8 @@ class Samples:
 
     Prompts contain token IDs, with equal lengths for multiple prompts.
     This display count does not limit the teacher-forced scoring population.
+    A budget of 0 draws no preview and keeps `sampling` as the policy the
+    run records and publishes.
     """
     prompt: Sequence[int] | Sequence[Sequence[int]]
     max_new_tokens: int
@@ -644,7 +646,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         self.ema = None if ema_decay is None else EMASpec(
             decay=optax.constant_schedule(ema_decay),
             select=lambda path: path[0] != FROZEN)
-        if samples is not None:
+        if samples is not None and samples.max_new_tokens > 0:
             self._prompt = prompt_batch(samples.prompt)
 
     @property
@@ -738,7 +740,8 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         return TextGeneration(self.model, thaw(self._pipeline_weights(state, ema)),
                               self.processor if processor is None else processor,
                               sampling=Sampling() if samples is None else samples.sampling,
-                              max_new_tokens=None if samples is None else samples.max_new_tokens)
+                              max_new_tokens=None if samples is None or samples.max_new_tokens <= 0
+                              else samples.max_new_tokens)
 
     def token_scores(self, params, tokens, train: bool = False, rngs=None,
                      segment_ids=None, positions=None, routing: bool = False,
@@ -1219,7 +1222,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         settings = self.samples
 
         def setup():
-            if settings is None:
+            if settings is None or settings.max_new_tokens <= 0:
                 return None
             weights = params if step.ema is None or self._ema_is_reference else step.ema
             return (self.policy(weights, settings.sampling), self._prompt, settings.max_new_tokens)
