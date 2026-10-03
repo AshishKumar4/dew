@@ -130,6 +130,33 @@ and 2.0 times slower (its expert GEMMs and the XLA path of the SSD scan).
 The MaxText row ran on another VM, before the whole-logits head took Dew's
 step from 161.9 to 141 ms.
 
+TPU v6e (Colab, one chip), Dew against MaxText 0.2.4 on the same VM:
+`tools/reference_runs/dew_lm.py` (pretrained weights, the reference
+corpus) and `tools/reference_runs/maxtext_run.py` (MaxText's synthetic
+tokens), bf16 compute over fp32 weights, AdamW with a 1.0 global-norm
+clip, 90 steps with steps 30-89 timed and nothing profiled, two processes
+each, integration `8895763d` (jax 0.11.2.post3, libtpu 0.0.48). Dew's
+16 x 1024 row times steps 30-63, where its two epochs of data end. ms a
+step, the window's mean, and MaxText's median step beside it:
+
+| model | tokens | Dew | MaxText, minimal remat | MaxText, default remat | Dew / best MaxText |
+|---|---|---:|---:|---:|---:|
+| Qwen3-0.6B | 8 x 1024 | 145.3, MFU 26.3% | 154.0-154.1 (median 150.1), 24.8% | 167.9, 22.8% | 1.06 (1.03 by median) |
+| Qwen3-0.6B | 16 x 1024 | 288.9, 26.4% | 299.7-299.8, 25.5% | 343.7, 22.2% | 1.04 |
+| Qwen3-1.7B | 4 x 1024 | 153.3, 32.1% | 158.7-158.8 (median 154.9), 31.0% | 179.7, 27.4% | 1.04 (1.01 by median) |
+
+Dew's 0.6B at 16 x 1024 runs with the vocabulary head tiled, the fit
+ladder's first rung (the whole logits do not fit). MaxText's minimal-remat
+windows hold a few slow steps (at 8 x 1024 the median step is 150.1 ms and
+the mean 154.0), so its median is the kinder comparison. The global-norm
+clip costs Dew 8.1 ms a step here: Qwen3-0.6B's widths at 8 x 1024 through
+`tools/benchmark_step.py`, one batch on the device, take 137.2 ms with
+`optax.adam` and 145.3 with dew_lm's optimizer (the norm, the clip, AdamW
+and the schedule), the same as the reference runner's step; on the RTX
+4080 the same comparison at 1 x 1024 is 94.0 against 96.0. Compiled for
+the v6e, the clip's program writes 6.1 GiB more a step (80 to 86 GiB),
+copies of the gradients the norm holds until every one is in.
+
 ## Rounding on the TPU, 2026-10-02
 
 `import dew` turns off XLA's excess precision (`--xla_allow_excess_precision=false`)
@@ -543,9 +570,11 @@ backward as one kernel. The training steps on the v6e (integration
 | 4-layer decoder, 256-wide heads, 8 x 2048 | 80.90-80.95 | 75.36-75.45 |
 | 176M hybrid DiT, batch 16 (4 attention blocks of 256 tokens) | 17.24-17.30 | 17.25 |
 
-MaxText 0.2.4 runs Qwen3-0.6B at 8 x 1024 in 161.1 ms (minimal remat) and
-at 16 x 1024 in 298.2. Losses after the 45 steps differ in the third or
-fourth significant digit (0.003386 against 0.003389 at 8 x 1024), where
+These rows are `tools/benchmark_step.py`'s step, with `optax.adam`;
+against MaxText the matched step is the reference runner's, with AdamW and
+its clip ("Training scoreboard" above: 145.3 against MaxText's 154.0 at
+8 x 1024). Losses after the 45 steps differ in the third or fourth
+significant digit (0.003386 against 0.003389 at 8 x 1024), where
 reordering the backward's fp32 sums moves a training run's trajectory; each
 kernel call's errors against fp32 are the same.
 
