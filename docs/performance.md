@@ -108,25 +108,40 @@ backward (with its grouped-query head reduction) against FlashAttention-2's
 2.05 and 4.56 kernels; no alternative on this stack closes it ("At 128-wide heads"
 below).
 
-A100 40 GB (Colab), the latest records:
+A100 40 GB (Colab). The first rows are one session at integration
+`6a220e31` (c15: jax 0.11.2.post3, torch 2.13.0+cu130, transformers
+5.17.0), Dew and torch.compile alternating, two processes each where a
+range is given; the rest are the latest earlier records:
 
 | model | step | Dew | reference | Dew / reference | Dew commit |
 |---|---|---:|---:|---:|---|
-| Qwen3-0.6B, pretrained | 4 x 1024 tokens, AdamW | 141.0 ms | torch.compile 138.3 ms | 0.98 | `8c391009` |
+| Qwen3-0.6B, pretrained | 4 x 1024 tokens, AdamW | 128.4-129.0 ms, MFU 43.6-43.8% | torch.compile 138.7 ms, 40.5% | 1.08 | `6a220e31` |
+| 99M Qwen3-MoE shape, 8 experts, top 2 | 8 x 1024 tokens, AdamW | 45.5 ms | torch.compile 106.3-108.2 ms | 2.36 | `6a220e31` |
+| SimpleDiT, width 768, 12 layers, 64 px | batch 32, Adam, EMA | 39.1 ms (fresh batch or one on the device) | 38.2 ms (flash, one batch on the device), 38.4 (fresh) | 0.98 | `6a220e31` |
+| 176M hybrid DiT (published config) | batch 16 / 32 | 44.5 / 64.1 ms | no torch port | | `6a220e31` |
 | Qwen3-0.6B, pretrained | 4 x 1024 tokens | 161.9 ms | MaxText 0.2.4 GPU recipe 164.9 ms | 1.02 | `157bc21a` |
-| 99M Qwen3-MoE shape, 8 experts, top 2 | 8 x 1024 tokens | 74.4 ms | torch.compile 110.5 ms | 1.48 | `157bc21a` |
 | mamba2-130m | 4 x 1024 tokens | 127.9 ms | torch with mamba_ssm kernels, eager, 172.5 ms | 1.35 | `9490c9e6` |
 | SimpleDiT, width 384, 8 layers, 64 px | batch 64, EMA | 21.9 ms | flaxdiff 21.4 ms | 0.98 | `9490c9e6` |
 
-These rows predate every change listed above. On Qwen3-0.6B torch idles
-18.3 ms a step on the host, so its device does 120 ms of work against
-Dew's 138: Dew's attention is 21.4 against 16.6 ms (cuDNN's sm80 backward
+From `8c391009` to `6a220e31` Qwen3-0.6B at 4 x 1024 went from 141.0 to
+128.7 ms and the MoE from 74.4 to 45.5. On device time too Dew now wins
+both: Qwen3-0.6B 128.4 against torch's 136.1 ms busy (GEMMs 64.2 against
+70.9; attention 21.6 against 16.7, cuDNN's sm80 kernels against
+FlashAttention-2; the update and casts 30.4 against torch's copies and
+optimizer at 37.0), the MoE 45.1 against 78.1 (torch also idles 86 ms a
+step on its host). The SimpleDiT is the A100's one loss, by 2%; the session
+traced neither side, and on the RTX 4080 the same model's gap to torch is
+attention (cuDNN's kernels 5.6 ms a step against FlashAttention-2's 4.4,
+below), which there the optimizer's lead covers. The older rows predate
+every change listed above. On Qwen3-0.6B (at `8c391009`) torch idled 18.3
+ms a step on the host, so its device did 120 ms of work against Dew's 138: Dew's attention is 21.4 against 16.6 ms (cuDNN's sm80 backward
 against FlashAttention-2), its converts 17.8 ms and its reductions 10.9
 against 4.2 (the norms and the fp32 head), while its GEMMs are 64.9 against
 70.9 and its update, inside 22.7 ms of copies, beats torch's 19.2 ms of
-copies plus 17.8 of optimizer. The MoE and Mamba-2 rows win only because
-torch idles on the host (77 to 177 ms a step); on device time Dew is 1.7
-and 2.0 times slower (its expert GEMMs and the XLA path of the SSD scan).
+copies plus 17.8 of optimizer. The Mamba-2 row (and the MoE at
+`157bc21a`) won only because torch idled on the host (77 to 177 ms a step);
+on device time Dew was 1.7 and 2.0 times slower (its expert GEMMs and the
+XLA path of the SSD scan).
 The MaxText row ran on another VM, before the whole-logits head took Dew's
 step from 161.9 to 141 ms.
 
@@ -276,8 +291,11 @@ rounds each) is faster too: batch 1 101.0-102.0 to 97.5-98.1 ms, batch 4
 268.2-269.3 to 257.4-259.0, the denoising scan alone 93.0-93.2 to 90.1-90.5
 and 236.8-237.6 to 226.8-227.7, peak memory within the rounds' spread. Its
 latents and fp32 images move within twice what one rounding of the
-convolutions moves them (the published-sample test). The A100 has no fp32
-row for either form.
+convolutions moves them (the published-sample test). On an A100 (c15,
+integration `6a220e31`, two alternating rounds) the fp32 step is faster
+the same way, 66.73/66.78 to 63.44/63.37 ms at batch 16 and 117.43/117.47
+to 111.03/110.97 at 32, and bf16, polyphase either way, is the same
+program (42.17/42.39 and 42.12/43.01 ms, 63.96/64.12 and 64.01/64.18).
 
 The S5 layer ran its recurrence as `associative_scan` over complex
 states, whose backward spent 4.5 ms of the 4080's step in complex
