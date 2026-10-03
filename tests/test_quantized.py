@@ -1,7 +1,10 @@
 """DeepSeek's block-scaled FP8, read against `weight_dequant` and written
 against DeepGEMM's `per_block_cast_to_fp8`.
 
-tools/deepgemm_fp8_reference.py runs `per_block_cast_to_fp8` of DeepGEMM's
+tools/deepseek_kernels_reference.py runs V3's Triton `weight_dequant`,
+fetched at a pinned commit, on a CUDA GPU over fixed codes and scales, and
+`dequantize_fp8_blocks` is held to its float32 bits (tests/fixtures/codecs/
+deepseek_kernels.npz). tools/deepgemm_fp8_reference.py runs `per_block_cast_to_fp8` of DeepGEMM's
 deep_gemm/utils/math.py, fetched at a pinned commit, on fixed operands, and
 `quantize_fp8_blocks` is held to its bytes (tests/fixtures/codecs/
 deepgemm_fp8.npz). `decode_e4m3fn` reads a written file by E4M3FN's bit
@@ -38,15 +41,6 @@ FIXTURE = Path(__file__).resolve().parent / "fixtures" / "hf" / "deepseek-v3-tin
 FP8 = ml_dtypes.float8_e4m3fn
 
 
-def reference(weight, scale_inv, block):
-    """DeepSeek's kernel, one element at a time."""
-    out = np.empty(weight.shape, np.float32)
-    for i in range(weight.shape[0]):
-        for j in range(weight.shape[1]):
-            out[i, j] = np.float32(weight[i, j]) * np.float32(scale_inv[i // block, j // block])
-    return out
-
-
 def bits(x):
     return np.asarray(x, np.float32).view(np.uint32)
 
@@ -65,20 +59,19 @@ def test_a_hand_computed_case_with_a_partial_column_block():
     np.testing.assert_array_equal(out, expected)
 
 
-@pytest.mark.parametrize("shape", [(256, 384), (576, 200), (5, 7)])
-def test_random_blocks_equal_the_reference_bit_for_bit(shape):
-    """Random fp8 values (denormals and both zeros included) under random
-    scales, shapes with whole blocks and with a partial last block in each
-    dimension, equal the reference formula in every float32 bit."""
-    rng = np.random.default_rng(0)
-    weight = (rng.standard_normal(shape) * 64).astype(np.float32).astype(FP8)
-    weight[0, :3] = np.array([0.0, -0.0, 2 ** -9], FP8)
-    blocks = (-(-shape[0] // BLOCK), -(-shape[1] // BLOCK))
-    scale_inv = np.exp2(rng.integers(-12, 4, size=blocks)).astype(np.float32) * 1.7
+@pytest.mark.parametrize("shape", ["256x384", "130x259", "5x7"])
+def test_blocks_dequantize_as_v3s_weight_dequant_kernel_does(shape):
+    """V3's `weight_dequant`, run on a GPU: random E4M3 codes (subnormals and
+    both zeros among them) under float32 scales over 60 binades, one of them
+    2 ** -127 so its products are float32 subnormals, in whole blocks and a
+    partial last block in each dimension. Every float32 bit equal."""
+    with np.load(Path(__file__).resolve().parent / "fixtures" / "codecs" / "deepseek_kernels.npz") as kernels:
+        codes, scales = kernels[f"v3/{shape}/codes"], kernels[f"v3/{shape}/scales"]
+        expected = kernels[f"v3/{shape}/dequantized"]
 
-    out = dequantize_fp8_blocks(weight, scale_inv)
+    out = dequantize_fp8_blocks(codes.view(FP8), scales)
 
-    assert np.array_equal(bits(out), bits(reference(weight, scale_inv, BLOCK)))
+    assert np.array_equal(bits(out), bits(expected))
 
 
 def test_a_widened_weight_dequantizes_like_the_fp8_one():
@@ -699,6 +692,8 @@ def test_the_re_exported_model_tracks_the_trained_model(reexport):
 
 REPO = "deepseek-ai/DeepSeek-V3"
 SHARD = "model-00001-of-000163.safetensors"
+REVISIONS = {"deepseek-ai/DeepSeek-V3": "e815299b0bcbac849fa540c768ef21845365c9eb",
+             "deepseek-ai/DeepSeek-V3.2-Exp": "194c67e12b1b0d6df0ef373ddcf215bc84027409"}
 # [576, 7168] with a [5, 56] scale: the one projection of the model whose
 # rows do not fill their last block.
 TENSOR = "model.layers.0.self_attn.kv_a_proj_with_mqa.weight"
@@ -718,12 +713,13 @@ def fetch(url, start, end):
 @pytest.mark.network
 @pytest.mark.skipif(os.environ.get("DEW_NETWORK_TESTS") != "1",
                     reason="reads two tensors of DeepSeek-V3 from the hub; DEW_NETWORK_TESTS=1 runs it")
-def test_deepseek_v3_kv_a_proj_dequantizes_like_the_reference():
-    """The real tensor pair, read by byte range from the checkpoint's first
-    shard: fp8 weight, fp32 scale with a partial block row, equal to the
-    reference bit for bit, finite, and within fp8's range times the scales."""
+def test_deepseek_v3_kv_a_proj_dequantizes_within_its_range():
+    """The real tensor pair at a pinned commit, read by byte range from the
+    checkpoint's first shard: fp8 weight, fp32 scale with a partial block
+    row, finite, and within fp8's range times the scales. The decoder is
+    held to the release kernel's bits by the fixture test above."""
     from huggingface_hub import hf_hub_url
-    url = hf_hub_url(REPO, SHARD)
+    url = hf_hub_url(REPO, SHARD, revision=REVISIONS[REPO])
     length = struct.unpack("<Q", fetch(url, 0, 7))[0]
     header = json.loads(fetch(url, 8, 7 + length))
     data = 8 + length
@@ -742,7 +738,7 @@ def test_deepseek_v3_kv_a_proj_dequantizes_like_the_reference():
     out = fp8_blocks(BLOCK).dequantize({TENSOR: weight.astype(np.float32),
                                         TENSOR + "_scale_inv": scale_inv})[TENSOR]
 
-    assert np.array_equal(bits(out), bits(reference(weight, scale_inv, BLOCK)))
+    assert np.array_equal(bits(out), bits(dequantize_fp8_blocks(weight, scale_inv)))
     assert np.all(np.isfinite(out))
     assert np.max(np.abs(out)) <= 448 * np.max(scale_inv)
 
@@ -769,12 +765,12 @@ def test_the_encoder_reproduces_the_bytes_deepseek_shipped(repo, scale_fmt):
     therefore load-bearing, not decoration.
     """
     from huggingface_hub import hf_hub_url
-    quantization = json.loads(fetch(hf_hub_url(repo, "config.json"), 0, 200_000)
+    quantization = json.loads(fetch(hf_hub_url(repo, "config.json", revision=REVISIONS[repo]), 0, 200_000)
                               )["quantization_config"]
     assert quantization.get("scale_fmt") == scale_fmt
     block, ue8m0 = fp8_format(quantization)
     assert ue8m0 == (scale_fmt == "ue8m0")
-    url = hf_hub_url(repo, SHARD)
+    url = hf_hub_url(repo, SHARD, revision=REVISIONS[repo])
     length = struct.unpack("<Q", fetch(url, 0, 7))[0]
     header = json.loads(fetch(url, 8, 7 + length))
     data = 8 + length
