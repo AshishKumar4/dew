@@ -12,9 +12,11 @@ the step's folded key, so the two sides integrate one Brownian path.
 
 Three model conventions cover the schedulers:
 
-- the linear VP beta table Dew's `LinearNoiseScheduler(1000)` tabulates with
-  an epsilon oracle: DPM-Solver multistep and singlestep in every algorithm,
-  order and solver type Diffusers offers, DEIS, UniPC, PNDM, LCM and TCD;
+- improved-diffusion's linear VP beta table at 1000 steps (its own
+  `get_named_beta_schedule`, in tests/fixtures/schedules/betas.npz),
+  which Dew's `LinearNoiseScheduler(1000)` tabulates, with an epsilon
+  oracle: DPM-Solver multistep and singlestep in every algorithm, order
+  and solver type Diffusers offers, DEIS, UniPC, PNDM, LCM and TCD;
 - the Karras rho-7 grid between that table's sigma extremes, in the
   variance-exploding form k-diffusion samplers integrate: KDPM2, KDPM2
   ancestral and LMS;
@@ -52,14 +54,14 @@ from diffusers.schedulers import (
 )
 
 from dew.diffusion import EpsilonPredictionTransform, LinearNoiseScheduler, Process
-from dew.diffusion.schedules.linear import linear_beta_schedule
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "diffusers"
 DATA_STD = 0.3
 TRAIN_STEPS = 1000
 STEPS = 21
 SHAPE = (2, 2, 4, 4)
-BETAS = linear_beta_schedule(TRAIN_STEPS)
+# improved-diffusion's own linear table (tools/beta_schedule_reference.py).
+BETAS = np.load(FIXTURES.parent / "schedules" / "betas.npz")["improved_diffusion_linear_1000"]
 ALPHAS_CUMPROD = torch.cumprod(1 - torch.tensor(BETAS, dtype=torch.float64), dim=0)
 # The variance-exploding sigma of the table, sigma / alpha, at its two ends.
 SIGMA_VE = ((1 - ALPHAS_CUMPROD) / ALPHAS_CUMPROD).sqrt()
