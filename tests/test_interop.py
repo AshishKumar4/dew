@@ -473,6 +473,78 @@ def test_exporting_a_run_whose_model_has_no_published_layout_names_it(tmp_path):
         Pretrained.from_run(str(tmp_path))
 
 
+FRESH_TRAINING = """
+import sys
+
+import grain.python as grain
+import jax.numpy as jnp
+import numpy as np
+import optax
+
+from dew.checkpoints import Checkpoints
+from dew.data import ByteTokenizer, Dataset, Loading
+from dew.inference import RunProcessor
+from dew.nn.backbones import CausalTransformer
+from dew.objectives.{module} import {objective}
+from dew.training import Trainer
+
+model = CausalTransformer(vocab_size=256, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
+                          max_seq_len=16, dtype=jnp.float32, attention_impl="xla")
+objective = {objective}(model, 8, ema_decay=None, processor=RunProcessor(ByteTokenizer()))
+rows = [{{"text": np.arange(9, dtype=np.int32)}} for _ in range(8)]
+data = Dataset.from_grain(grain.MapDataset.source(rows), batch=8, loading=Loading(workers=0))
+checkpoints = Checkpoints(sys.argv[1])
+Trainer(objective, optax.sgd(.01), key=0, checkpoints=checkpoints).fit(data, steps=1, checkpoint_every=1)
+checkpoints.wait()
+"""
+
+
+def test_a_run_trained_in_one_process_exports_from_a_fresh_one(tmp_path):
+    """`dew export` in a new process reads the run by its record alone: the
+    registry imports the module that registers each name the record holds,
+    so nothing the training process happened to import is needed."""
+    import os
+    import subprocess
+
+    root = Path(__file__).resolve().parents[1]
+    env = {**{name: value for name, value in os.environ.items() if name != "XLA_FLAGS"},
+           "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(root / "src")}
+    program = FRESH_TRAINING.format(module="lm", objective="LMObjective")
+    trained = subprocess.run([sys.executable, "-c", program, str(tmp_path / "run")],
+                             capture_output=True, text=True, env=env, timeout=600)
+    assert trained.returncode == 0, trained.stderr[-2000:]
+    exported = subprocess.run([sys.executable, "-m", "dew.cli.main", "export", str(tmp_path / "run"),
+                               str(tmp_path / "export")],
+                              capture_output=True, text=True, env=env, timeout=600)
+    assert exported.returncode == 0, exported.stderr[-2000:]
+    assert (tmp_path / "export" / "model.safetensors").is_file()
+
+
+def test_a_registry_imports_the_module_that_registers_a_name_and_no_other():
+    """A lookup of a name nothing has registered yet imports the module whose
+    decorator registers it, found in Dew's sources, with what that module
+    imports, and no other registering module (JEPA's objective, the eval
+    harness); a name no module registers still raises."""
+    import os
+    import subprocess
+
+    root = Path(__file__).resolve().parents[1]
+    env = {**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(root / "src")}
+    program = ("import sys\n"
+               "from dew.registry import objectives, solvers\n"
+               "assert 'dew.objectives.rl.ppo' not in sys.modules\n"
+               "print(objectives['ppo'].__module__, solvers['heun'].__name__)\n"
+               "print('dew.objectives.jepa' in sys.modules, 'dew.eval.harness' in sys.modules)\n"
+               "try:\n"
+               "    objectives['no_such_objective']\n"
+               "except KeyError as error:\n"
+               "    print('refused', 'no_such_objective' in str(error))\n")
+    done = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True, env=env,
+                          timeout=300)
+    assert done.returncode == 0, done.stderr[-2000:]
+    assert done.stdout.splitlines() == ["dew.objectives.rl.ppo Heun", "False False", "refused True"]
+
+
 def test_the_cli_exports_a_run_and_refuses_a_directory_that_is_not_one(tmp_path, capsys):
     """`dew export <run> <dest>` is the same call with two positional names."""
     from test_inference import make_lm_run

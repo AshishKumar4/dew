@@ -222,7 +222,6 @@ def text_to_image(directory: str | os.PathLike, config: Mapping[str, object], *,
     way FlaxDiff's trainer previewed the run: Euler ancestral over 200 steps
     of the Karras grid, classifier-free guidance 3.
     """
-    import dew.nn.backbones  # noqa: F401  (registers the kind)
     from dew.diffusion.presets import EDM
     from dew.inputs import Field, InputSpec
     from dew.nn.dit import TextContext
