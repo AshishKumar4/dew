@@ -12,16 +12,25 @@ reference's RMS:
 - `prediction`: one transformer call on fixed noise at timestep 700 for
   both prompts, each side on the reference's prompt states;
 - `walk`: the unmodified `WanPipeline` call from fixed latents at `--steps`,
-  guided at its default 5.0 over its UniPC grid, against Dew's
-  `text_to_image()` from the same latents encoding its own prompts: the
-  latent each ends on and the frames it decodes.
+  guided at its default 5.0 over its UniPC grid, on the reference's prompt
+  states, in float32 and again widened to float64 (scheduler tables
+  included, `diffusers_wan_reference.widened`), against Dew's
+  `text_to_image()` from the same latents and states: the latent each ends
+  on.
 
 Both sides compute in true float32: TF32 is off in torch and JAX multiplies
-at HIGHEST. The run exits 1 when a largest gap passes its stage's bound
-(`BOUNDS`), so a command that runs on after it stops on a failed parity.
+at HIGHEST. A single call is held to an absolute bound (`BOUNDS`). A walk
+carries every step's rounding into the next through the model, so its two
+float32 runs part further than any one call does; it is held to
+tests/reference_error.py's rule instead, Dew's RMS distance from the
+float64 walk at most twice the float32 source's (`FACTOR`). The scheduler
+alone is held to the same rule on recorded model outputs in
+tests/test_wan_source.py. The run exits 1 when a stage fails its bound, so
+a command after it stops on a failed parity.
+
 The prompt states alone are 22.7 GB, so the reference runs on a GPU with
-that room (CUDA torch), or on the host. `--stages prediction` needs
-only the transformer; it reads a fixed stand-in for the prompt states
+that room (CUDA torch), or on the host. `--stages prediction` needs only
+the transformer; it reads a fixed stand-in for the prompt states
 (unit-variance states on the first 24 positions, zeros after, as a padded
 prompt looks). `--reference FILE` keeps the reference arrays: written when
 absent, read when present, so the two sides can run as two processes, the
@@ -34,6 +43,7 @@ first with `--reference-only`.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import gc
 import json
 import os
@@ -42,6 +52,7 @@ from pathlib import Path
 
 import numpy as np
 import transformers.utils as transformers_utils
+from diffusers_wan_reference import widened
 
 # Diffusers 0.34.0's pipeline modules import two names Transformers dropped
 # after 4.x, as tools/diffusers_sd3_reference.py restores them.
@@ -58,10 +69,17 @@ REVISION = "0fad780a534b6463e45facd96134c9f345acfa5b"
 PROMPTS = ["A red fox trotting through fresh snow at sunrise, its breath steaming in the cold air",
            "Waves rolling onto a black sand beach under a stormy sky"]
 TIMESTEP, GUIDANCE, SEED = 700.0, 5.0, 0
-# One call measured 2.0e-5 (RTX 4080 against torch on the host); a walk
-# carries each step's rounding into the next, ten steps of it. A wrong
-# shift, scale, sign or mask moves these by 1e-2 and more.
-BOUNDS = {"states": 1e-4, "prediction": 1e-4, "walk": 1e-3}
+# One call measured 2.0e-5 (RTX 4080 against torch on the host) and 1.7e-5
+# (A100); a wrong shift, scale, sign or mask moves it by 1e-2 and more.
+BOUNDS = {"states": 1e-4, "prediction": 1e-4}
+FACTOR = 2.0
+"""tests/reference_error.py's: Dew's RMS distance from float64 over the source's."""
+
+
+def distance(value, truth) -> float:
+    """The root-mean-square difference over every entry, in float64."""
+    difference = np.asarray(value, np.float64) - np.asarray(truth, np.float64)
+    return float(np.sqrt(np.mean(np.square(difference))))
 
 
 def gap(actual, expected) -> dict[str, float]:
@@ -110,12 +128,12 @@ def reference(directory, args, stages) -> dict[str, np.ndarray]:
     import types
 
     import torch
-    from diffusers import AutoencoderKLWan, UniPCMultistepScheduler, WanPipeline, WanTransformer3DModel
+    from diffusers import UniPCMultistepScheduler, WanPipeline, WanTransformer3DModel
     from transformers import AutoTokenizer, UMT5EncoderModel
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     arrays: dict[str, np.ndarray] = {"x_T": args.latents}
-    if "states" in stages:
+    if stages & {"states", "walk"}:
         encoder = UMT5EncoderModel.from_pretrained(directory / "text_encoder", torch_dtype=torch.float32)
         held = types.SimpleNamespace(text_encoder=encoder.to(device), _execution_device=device,
                                      tokenizer=AutoTokenizer.from_pretrained(directory / "tokenizer"))
@@ -138,38 +156,42 @@ def reference(directory, args, stages) -> dict[str, np.ndarray]:
                 noise, torch.full((len(PROMPTS),), TIMESTEP, device=device),
                 torch.from_numpy(states[:len(PROMPTS)]).to(device), return_dict=False)[0].cpu().numpy()
     if "walk" in stages:
-        vae = AutoencoderKLWan.from_pretrained(directory / "vae", torch_dtype=torch.float32).to(device)
-        scheduler = UniPCMultistepScheduler.from_pretrained(directory / "scheduler")
-        pipe = WanPipeline(tokenizer=None, text_encoder=None, transformer=transformer, vae=vae,
-                           scheduler=scheduler)
-        pipe.set_progress_bar_config(disable=True)
-        for row in range(len(PROMPTS)):
-            call = {"prompt_embeds": torch.from_numpy(states[row:row + 1]).to(device),
-                    "negative_prompt_embeds": torch.from_numpy(states[-1:]).to(device),
-                    "height": args.height, "width": args.width, "num_frames": args.frames,
-                    "num_inference_steps": args.steps, "guidance_scale": GUIDANCE}
-            with torch.no_grad():
-                start = time.perf_counter()
-                latents = pipe(**call, latents=torch.from_numpy(args.latents[row:row + 1]).to(device),
-                               output_type="latent").frames
-                arrays[f"seconds.{row}"] = np.asarray(time.perf_counter() - start)
-                frames = pipe(**call, latents=torch.from_numpy(args.latents[row:row + 1]).to(device),
-                              output_type="np").frames
-            arrays[f"latents.{row}"] = latents.cpu().numpy()
-            arrays[f"frames.{row}"] = np.asarray(frames)
-        del pipe, vae
+        # float32 first: the float64 run widens the transformer in place.
+        for precision, dtype in (("fp32", torch.float32), ("fp64", torch.float64)):
+            with widened() if dtype == torch.float64 else contextlib.nullcontext():
+                transformer = transformer.to(dtype)
+                scheduler = UniPCMultistepScheduler.from_pretrained(directory / "scheduler")
+                pipe = WanPipeline(tokenizer=None, text_encoder=None, transformer=transformer, vae=None,
+                                   scheduler=scheduler)
+                pipe.set_progress_bar_config(disable=True)
+                for row in range(len(PROMPTS)):
+                    with torch.no_grad():
+                        start = time.perf_counter()
+                        latents = pipe(
+                            prompt_embeds=torch.from_numpy(states[row:row + 1]).to(device, dtype),
+                            negative_prompt_embeds=torch.from_numpy(states[-1:]).to(device, dtype),
+                            height=args.height, width=args.width, num_frames=args.frames,
+                            num_inference_steps=args.steps, guidance_scale=GUIDANCE,
+                            latents=torch.from_numpy(args.latents[row:row + 1]).to(device, dtype),
+                            output_type="latent").frames
+                    arrays[f"{precision}.seconds.{row}"] = np.asarray(time.perf_counter() - start)
+                    arrays[f"{precision}.latents.{row}"] = latents.cpu().numpy()
+                del pipe
     del transformer
     free()
     return arrays
 
 
-def native(directory, args, stages, expected) -> dict[str, dict[str, float]]:
-    """Dew's side of every stage, each gap against the reference."""
+def native(directory, args, stages, expected) -> tuple[dict[str, dict[str, float]], list[str]]:
+    """Dew's side of every stage: each gap against the reference, and the
+    stages that failed their bound."""
     import jax
     import jax.numpy as jnp
 
     from dew.diffusion.process import DenoisingCondition
     from dew.interop.pretrained import _denoiser, load_diffusion_source
+    from dew.nn.autoencoders.wan import load_wan_vae
+    from dew.sampling.pipelines import DenoisingInputs
 
     gaps: dict[str, dict[str, float]] = {}
     if "prediction" in stages:
@@ -182,29 +204,42 @@ def native(directory, args, stages, expected) -> dict[str, dict[str, float]]:
         gaps["prediction"] = gap(flow, channels_last(expected["prediction"]))
         del denoiser, params, flow
         gc.collect()
-    if not stages & {"states", "walk"}:
-        return gaps
-    pipeline = load_diffusion_source(str(directory), dtype="float32", param_dtype="float32",
-                                     attention_impl=args.attention,
-                                     size=(args.frames, args.height, args.width))
+    size = (args.frames, args.height, args.width)
     if "states" in stages:
+        pipeline = load_diffusion_source(str(directory), dtype="float32", param_dtype="float32",
+                                         attention_impl=args.attention, size=size)
         encoder = pipeline.inputs.conditions["conditioning"].encoder
         states = encoder.encode(pipeline.variables["encoders"]["conditioning"],
                                 encoder.tokenize([*PROMPTS, ""])).context
         gaps["states"] = gap(states, expected["states"])
+        del pipeline, encoder, states
+        gc.collect()
+    failed = [name for name, value in gaps.items() if value["max"] > BOUNDS[name]]
     if "walk" in stages:
+        # The walk reads the reference's states, so it never runs UMT5: the
+        # transformer streams to the device and the VAE is bound unread.
+        _, vae, _, _ = load_wan_vae(directory)
+        pipeline = load_diffusion_source(
+            str(directory), dtype="float32", param_dtype="float32", attention_impl=args.attention, size=size,
+            variables={**device_weights(directory), "encoders": {"conditioning": {"text_encoder": {}}},
+                       "autoencoder": vae})
         task = pipeline.text_to_image()
-        prepared = [task.prepare(prompt, initial=channels_last(args.latents[row:row + 1]), key=0,
-                                 steps=args.steps) for row, prompt in enumerate(PROMPTS)]
-        # Encoded: the 22.7 GB encoder leaves the walk, which never reads it.
-        task = task.bind({**{name: value for name, value in pipeline.variables.items() if name != "encoders"},
-                          "encoders": {}})
+        states = expected["states"]
+        dew, source, truth = [], [], []
         for row in range(len(PROMPTS)):
-            walked = task(prepared[row], key=jax.random.PRNGKey(0)).host()
-            frames = np.clip(np.asarray(walked.images) / 2 + 0.5, 0.0, 1.0)
-            gaps[f"walk.latents.{row}"] = gap(walked.latents, channels_last(expected[f"latents.{row}"]))
-            gaps[f"walk.frames.{row}"] = gap(frames, expected[f"frames.{row}"])
-    return gaps
+            inputs = DenoisingInputs(
+                jnp.asarray(channels_last(args.latents[row:row + 1])),
+                {"conditioning": DenoisingCondition(jnp.asarray(states[row:row + 1]))},
+                {"conditioning": DenoisingCondition(jnp.asarray(states[-1:]))}, rows=1, grid_steps=args.steps)
+            dew.append(np.asarray(task(inputs, decode=False, key=0).latents))
+            source.append(channels_last(expected[f"fp32.latents.{row}"]))
+            truth.append(channels_last(expected[f"fp64.latents.{row}"]))
+            gaps[f"walk.{row}"] = gap(dew[-1], source[-1])
+        mine, theirs = distance(dew, truth), distance(source, truth)
+        gaps["walk.rule"] = {"dew_from_float64": mine, "source_from_float64": theirs, "ratio": mine / theirs}
+        if not mine <= FACTOR * theirs:
+            failed.append("walk.rule")
+    return gaps, failed
 
 
 def main() -> None:
@@ -225,13 +260,11 @@ def main() -> None:
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     stages = set(args.stages.split(","))
-    if "walk" in stages and "states" not in stages:
-        parser.error("the walk compares each side's own prompt encoding; it needs the states stage")
     from dew.interop import sources
 
     if args.source is None:
         directory = sources.snapshot(REPO, args.revision, weights=("text_encoder", "transformer", "vae")
-                                     if "states" in stages else ("transformer", "vae"))
+                                     if stages & {"states", "walk"} else ("transformer", "vae"))
     else:
         directory = Path(args.source)
     channels = json.loads((directory / "transformer" / "config.json").read_text())["in_channels"]
@@ -251,7 +284,7 @@ def main() -> None:
         print(json.dumps({"reference": str(args.reference), "seconds": reference_seconds}))
         return
     start = time.perf_counter()
-    gaps = native(directory, args, stages, expected)
+    gaps, failed = native(directory, args, stages, expected)
 
     import jax
 
@@ -266,10 +299,9 @@ def main() -> None:
                       "jax_devices": [str(device) for device in jax.devices()],
                       "torch_device": "cuda" if torch.cuda.is_available() else "cpu",
                       "versions": {"jax": jax.__version__, "torch": torch.__version__}}}, indent=1))
-    failed = {name: value["max"] for name, value in gaps.items()
-              if value["max"] > BOUNDS[name.split(".")[0]]}
     if failed:
-        raise SystemExit(f"parity bounds {BOUNDS} exceeded: {failed}")
+        raise SystemExit(f"failed {failed}: single calls are held to {BOUNDS}, the walk to {FACTOR} times "
+                         "the source's RMS distance from float64")
 
 
 if __name__ == "__main__":
