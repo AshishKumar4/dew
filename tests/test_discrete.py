@@ -38,8 +38,9 @@ def test_log_linear_schedule_and_its_nelbo_weight():
 def test_a_zero_time_row_contributes_nothing_to_the_loss(rng, monkeypatch):
     """t = 0 masks nothing, so its NELBO contribution is exactly zero: the
     loss stays finite and equals the batch with that row removed. The
-    stratified offset draws t = 0 about once in 2^24 rows, and a weight of
-    1 / t there would be a NaN the trainer aborts the run over."""
+    training draw is floored at SAMPLING_EPS, but the weight is the
+    process's for any time a caller hands it, and 1 / t at t = 0 would be a
+    NaN the trainer aborts the run over."""
     process = MDLM(mask_id=MASK)()
     objective = MaskedDiffusionObjective(transformer(causal=False), process, 8)
     params = objective.init(rng)
@@ -62,12 +63,24 @@ def test_corrupt_masks_the_schedules_fraction_and_keeps_the_rest(rng):
     assert jnp.all(jnp.where(is_masked, masked == MASK, masked == tokens))
 
 
-def test_training_times_are_stratified_over_the_batch(rng):
+def test_training_times_are_mdlms_antithetic_draw():
+    """MDLM's `_sample_t` (kuleshov-group/mdlm @c112c52, diffusion.py:800-808,
+    with configs/config.yaml's antithetic_sampling True and sampling_eps
+    1e-3): row i draws its own uniform u_i in the i-th of n strata,
+    (u_i + i) / n, and t = (1 - 1e-3) of that + 1e-3, so no row's weight
+    1 / t exceeds 1000. Each row's place in its stratum is its own draw;
+    one offset shared by the batch would put every row at the same place."""
     process = DiscreteProcess(LogLinear(), mask_id=MASK)
-    t = process.sample_t(rng, 10)
-    assert jnp.all((t >= 0) & (t < 1))
-    # one draw per tenth, so the weights 1 / t of a batch cover the trajectory
-    assert jnp.array_equal(jnp.floor(jnp.sort(t) * 10), jnp.arange(10))
+    n, sampling_eps = 8, 1e-3
+    draws = jnp.stack([process.sample_t(jax.random.key(seed), n) for seed in range(2000)])
+    assert float(draws.min()) >= sampling_eps and float(draws.max()) < 1
+    strata = (draws - sampling_eps) / (1 - sampling_eps) * n
+    np.testing.assert_array_equal(np.floor(np.asarray(strata)), np.broadcast_to(np.arange(n), draws.shape))
+    places = np.asarray(strata) % 1
+    assert np.all(np.ptp(places, axis=1) > 0)
+    # Within a stratum the place is uniform, and two rows' places are unrelated.
+    assert abs(float(places.mean()) - 0.5) < 0.01
+    assert abs(float(np.corrcoef(places[:, 0], places[:, 1])[0, 1])) < 0.08
 
 
 class Peaked(nn.Module):
