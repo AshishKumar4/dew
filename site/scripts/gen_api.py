@@ -417,14 +417,23 @@ def usage_code(relative: str, path: Path) -> Iterator[tuple[str, set[int] | None
         yield path.read_text(), None
 
 
+@dataclass(frozen=True)
+class Instance:
+    """A name a unit bound to an instance of a Dew class: `cls`'s members are
+    its attributes, and calling one is calling a method."""
+
+    cls: griffe.Object
+
+
 def unresolved_uses(package: griffe.Module, home: dict[str, str], pages: dict[str, Page],
                     code: str, shown: set[int] | None,
-                    bound: dict[str, griffe.Object]) -> Iterator[str]:
+                    bound: dict[str, griffe.Object | Instance]) -> Iterator[str]:
     """Each dotted use of a Dew name in `code` that does not reach the
     documented API: an attribute a module or class does not have, or a
     module member no page documents. Names come from `import dew...` and
     `from dew... import ...`, in this unit or an earlier one of the same file
-    (`bound`, which this updates); a name the code assigns is its own."""
+    (`bound`, which this updates); a name the code assigns is its own, except
+    `name = Class(...)`, which binds an `Instance` whose calls must be methods."""
     try:
         tree = ast.parse(code)
     except SyntaxError:
@@ -453,9 +462,6 @@ def unresolved_uses(package: griffe.Module, home: dict[str, str], pages: dict[st
                         bound[alias.asname or alias.name] = resolve(member)
             except (KeyError, Unresolved):
                 continue
-    for name in assigned:
-        bound.pop(name, None)
-
     def chain(node: ast.expr) -> list[str] | None:
         if isinstance(node, ast.Name):
             return [node.id]
@@ -463,6 +469,12 @@ def unresolved_uses(package: griffe.Module, home: dict[str, str], pages: dict[st
             inner = chain(node.value)
             return None if inner is None else [*inner, node.attr]
         return None
+
+    built = instances(tree, bound, chain)
+    for name in assigned:
+        bound.pop(name, None)
+    bound.update(built)
+    called = {id(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
 
     # Each outermost dotted name once: `dew.interop.hub.pull_from_hub`, not also `dew.interop.hub`.
     inner = {id(node.value) for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
@@ -475,18 +487,68 @@ def unresolved_uses(package: griffe.Module, home: dict[str, str], pages: dict[st
         if path is None or path[0] not in bound or ".".join(path) in seen:
             continue
         seen.add(".".join(path))
-        problem = unresolved_chain(bound[path[0]], path, home, pages)
+        start = bound[path[0]]
+        held = start if isinstance(start, Instance) else None
+        problem = unresolved_chain(start.cls if held else start, path, home, pages)
+        if problem is None and held is not None and id(node) in called and len(path) == 2:
+            problem = called_attribute(held.cls, path)
         if problem:
             yield problem
 
 
+def instances(tree: ast.Module, bound: dict[str, griffe.Object | Instance], chain) -> dict[str, Instance]:
+    """The names `tree` binds to an instance of a Dew class, each to that
+    class: a name every assignment of which is `name = Class(...)` for one
+    class the unit's imports reach (`objective = DiffusionObjective(...)`)."""
+    stores: dict[str, int] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            stores[node.id] = stores.get(node.id, 0) + 1
+    built: dict[str, list[griffe.Object]] = {}
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name) and isinstance(node.value, ast.Call)):
+            continue
+        path = chain(node.value.func)
+        if path is None or path[0] not in bound or isinstance(bound[path[0]], Instance):
+            continue
+        current = bound[path[0]]
+        try:
+            for attribute in path[1:]:
+                current = resolve(current.members[attribute])
+        except (KeyError, Unresolved):
+            continue
+        if current.is_class:
+            built.setdefault(node.targets[0].id, []).append(current)
+    return {name: Instance(classes[0]) for name, classes in built.items()
+            if len(classes) == stores[name] and len({cls.path for cls in classes}) == 1}
+
+
+def called_attribute(cls: griffe.Object, path: list[str]) -> str | None:
+    """Why calling `path`, an instance's member, leaves the documented API:
+    the member is a value an instance holds, not a method, which is what a
+    method renamed to make room for a field of the same name leaves behind."""
+    try:
+        member = resolve(cls.all_members[path[1]])
+    except (KeyError, Unresolved, griffe.AliasResolutionError, griffe.CyclicAliasError):
+        return None
+    if member.is_attribute and "instance-attribute" in member.labels and "property" not in member.labels:
+        return f"`{'.'.join(path)}(...)`: {path[1]} is a value {cls.path} holds, not a method"
+    return None
+
+
+MEMBERLESS_BASES = ("object", "ABC", "abc.ABC", "Generic", "typing.Generic", "Protocol", "typing.Protocol")
+"""Bases outside Dew that give an instance no public attribute of their own."""
+
+
 def outside_bases(cls: griffe.Class) -> bool:
-    """Whether a base of `cls`, or of one of its bases, is defined outside Dew."""
+    """Whether a base of `cls`, or of one of its bases, is defined outside Dew
+    and may define attributes (ABC, Generic and Protocol define none)."""
     try:
         resolved = cls.resolved_bases
     except (griffe.AliasResolutionError, griffe.CyclicAliasError):
         return True
-    named = [base for base in cls.bases if str(base) != "object"]
+    named = [base for base in cls.bases if str(base).split("[")[0] not in MEMBERLESS_BASES]
     return len(resolved) < len(named) or any(outside_bases(base) for base in resolved)
 
 
@@ -582,7 +644,7 @@ def unresolved_in(file: str, path: Path, package: griffe.Module, pages: dict[str
                   home: dict[str, str]) -> list[str]:
     """What `unresolved_uses` reports for each Python unit `path` shows, in
     order, a unit seeing the names the units before it bound."""
-    bound: dict[str, griffe.Object] = {}
+    bound: dict[str, griffe.Object | Instance] = {}
     return [problem for code, shown in usage_code(file, path)
             for problem in unresolved_uses(package, home, pages, code, shown, bound)]
 

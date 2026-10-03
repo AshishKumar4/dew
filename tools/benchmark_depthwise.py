@@ -144,7 +144,7 @@ def checkpoint(args):
     from dew.sampling import TextToImage
 
     pipeline = TextToImage.from_pretrained('dewml/hybrid-dit-176m',
-                                           revision='0964f57387afc938927b1047f19ed32b63fe0619')
+                                           revision='32d59de89683d59824361144b87bdcaf3e742598')
     original = conv._polyphase_depthwise_3x3
     prompt = 'a watercolor painting of a mountain lake at sunrise'
     with jax.default_matmul_precision('highest'):
@@ -160,11 +160,11 @@ def checkpoint(args):
         jax.block_until_ready(after)
         vae = pipeline.autoencoder
         float_vae = StableDiffusionVAE(
-            model=vae.model.clone(dtype=jnp.float32), params=pipeline.params['autoencoder'],
+            model=vae.model.clone(dtype=jnp.float32), params=pipeline.variables['autoencoder'],
             dtype=jnp.float32, latent_shift=vae.latent_shift, latent_scale=vae.latent_scale)
         decode = jax.jit(lambda params, z: jnp.clip(float_vae.decode(params, z), -1, 1))
-        before_fp32 = decode(pipeline.params['autoencoder'], before.latents)
-        after_fp32 = decode(pipeline.params['autoencoder'], after.latents)
+        before_fp32 = decode(pipeline.variables['autoencoder'], before.latents)
+        after_fp32 = decode(pipeline.variables['autoencoder'], after.latents)
         jax.block_until_ready((before_fp32, after_fp32))
         delta = np.asarray(after.latents, np.float64) - np.asarray(before.latents, np.float64)
         noise = np.random.default_rng(29).normal(size=delta.shape).astype(np.float32)
@@ -172,8 +172,8 @@ def checkpoint(args):
         noise.flat[0] = np.max(np.abs(delta))
         perturbed = before.latents + jnp.asarray(noise)
         decode_bf16 = jax.jit(lambda params, z: jnp.clip(vae.decode(params, z), -1, 1))
-        noisy_images = decode_bf16(pipeline.params['autoencoder'], perturbed)
-        original_images = decode_bf16(pipeline.params['autoencoder'], before.latents)
+        noisy_images = decode_bf16(pipeline.variables['autoencoder'], perturbed)
+        original_images = decode_bf16(pipeline.variables['autoencoder'], before.latents)
         jax.block_until_ready((noisy_images, original_images))
     report = {'latents': errors(before.latents, after.latents),
               'fp32_images': errors(before_fp32, after_fp32),

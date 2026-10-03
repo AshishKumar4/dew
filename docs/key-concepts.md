@@ -66,6 +66,28 @@ This is the output with stdout piped to a file; on a terminal, `fit` draws the s
 
 A model is a `flax.linen.Module` with `init` and `apply`. Its variables are a nested dictionary of arrays, and it has no knowledge of training. Build one from its class, `from dew.nn.backbones import CausalTransformer`. Each class is also registered under a name (`causal_transformer`), which is how recipes and saved runs rebuild a model from a configuration file.
 
+Your own model registers with one line, and its constructor fields are then its record:
+
+```python
+import flax.linen as nn
+
+from dew.registry import models
+
+
+@models("residual_mlp")
+class ResidualMLP(nn.Module):
+    """A denoiser `DiffusionObjective` can train: it maps a noisy sample, the
+    noise level's embedding and optional text context to its prediction."""
+
+    features: int = 64
+
+    @nn.compact
+    def __call__(self, x, temb, textcontext=None, train=False):
+        return x + nn.Dense(x.shape[-1])(nn.gelu(nn.Dense(self.features)(x)))
+```
+
+Every checkpoint a run of it writes records `"architecture": "residual_mlp"` and `"config": {"features": 64}`, from which `TextToImage.from_run` and `dew.pipeline` rebuild the model; a decoder's run loads the same way through `TextGeneration.from_run` and `Pretrained.from_run`. A composite model records each registered part inside its own record, and an adapted model records its base model with the adapter's rank, alpha and modules. Registration is only needed to load a run by its record: an unregistered model trains, checkpoints and resumes the same, its run records it under its class name in lower case, and both the first checkpoint's warning and a load of the run name the line that registers it. Once that line is in place, the same run loads.
+
 Dew's modules name the logical axes of their parameters, such as `embed`, `heads` and `mlp`. The trainer maps those names onto the device mesh, so the model code does not change when the mesh does. [Distributed training](concepts/distributed.md) describes the mapping.
 
 ## Objective
@@ -96,6 +118,17 @@ The built-in readers, such as `TokenWindows` for tokenized text and `HFImages` f
 ![Trainer.fit: the state is placed on the mesh, the dataset's iterator feeds a prefetcher, and each compiled step runs the loss, the gradient, the optimizer update and the EMA update; logging, evaluation and checkpoints run on the host between steps.](assets/training-loop-dark.svg)
 
 The same call runs on one device or many. `Trainer(..., mesh=MeshSpec(fsdp=4))` shards the parameters and optimizer state over four devices; the objective, the model and the data do not change.
+
+The trainer logs the loss, the objective's metrics and an injected learning rate, but not the gradient norm, which would be one more reduction over every gradient each step. To track it, chain a transformation that keeps the norm in the optimizer state and read `state.opt_state[0]` after `fit`. Next to `clip_by_global_norm`, XLA computes the norm once for both, so it costs nothing:
+
+```python
+import jax.numpy as jnp
+import optax
+
+record_norm = optax.GradientTransformation(
+    lambda params: jnp.zeros(()), lambda updates, state, params=None: (updates, optax.tree.norm(updates)))
+optimizer = optax.chain(record_norm, optax.clip_by_global_norm(1.0), optax.adamw(1e-3))
+```
 
 ## Training state
 

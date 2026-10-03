@@ -49,7 +49,7 @@ import importlib
 import re
 from collections.abc import Callable, Mapping, Sequence
 from types import ModuleType
-from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -155,7 +155,10 @@ class Quantization:
         """
         rules = _rules(self, training=True)
         methods = tuple(method for method in METHODS if hasattr(model, method))
-        return _qwix().quantize_model(model, _providers()[0](rules), methods=methods)
+        wrapped = _qwix().quantize_model(model, _providers()[0](rules), methods=methods)
+        # Qwix makes a class per call; it carries the spec, which a model record writes.
+        type(wrapped)._dew_quantization = self
+        return wrapped
 
 
 def _qwix(module: str = "qwix") -> ModuleType:
@@ -585,6 +588,15 @@ class ModelObjective(Protocol):
     there."""
 
     model: nn.Module
+
+
+@runtime_checkable
+class _Quantized(Protocol):
+    """Marks a module class `Quantization.apply` wrapped: Qwix's subclass of
+    the model's own class, and the spec that wrapped it."""
+
+    _unquantized_type: ClassVar[type[nn.Module]]
+    _dew_quantization: ClassVar[Quantization]
 
 
 def _quantize(objective: object, spec: Quantization) -> None:

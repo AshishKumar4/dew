@@ -23,7 +23,8 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew import registry
-from dew.objectives.base import Variables
+from dew.nn.inputs import ModelInputs
+from dew.objectives.base import Batch, Variables
 
 from .diffusion import DiffusionConditioner
 from .encoders import CharTable, CLIPText, ConditionEncoder, HFAudio, T5Text, rebuild
@@ -102,6 +103,25 @@ class InputSpec:
         """
         return {condition.field: condition.encoder.tokenize(captions)
                 for condition in self.conditions.values() if condition.encoder.reads_captions}
+
+    def check(self, batch: Batch) -> None:
+        """Refuse a batch that lacks a field this spec names, or holds the
+        sample or mask at another per-example shape. A `ModelInputs` field
+        is measured by its token rows."""
+        for condition in self.conditions.values():
+            if condition.field not in batch:
+                raise ValueError(f"objective.inputs needs condition field {condition.field!r} "
+                                 "in the training batch")
+        for declared in (self.sample, self.mask):
+            if declared is None:
+                continue
+            if declared.key not in batch:
+                raise ValueError(f"objective.inputs needs field {declared.key!r} in the training batch")
+            value = batch[declared.key]
+            actual = np.shape(value.tokens if isinstance(value, ModelInputs) else value)[1:]
+            if tuple(actual) != declared.shape:
+                raise ValueError(f"objective.inputs field {declared.key!r} declares shape {declared.shape}, "
+                                 f"but the first training batch has shape {tuple(actual)}")
 
     def to_json(self) -> dict:
         return {

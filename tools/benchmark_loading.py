@@ -70,7 +70,7 @@ def phases(args):
 
                 args.arrays.parent.mkdir(parents=True, exist_ok=True)
                 np.savez(args.arrays, latents=result.latents, images=result.images)
-    timings['bytes'] = sum(leaf.nbytes for leaf in jax.tree.leaves(pipe.params))
+    timings['bytes'] = sum(leaf.nbytes for leaf in jax.tree.leaves(pipe.variables))
     timings['jax'] = jax.__version__
     timings['orbax'] = importlib.metadata.version('orbax-checkpoint')
     timings['device'] = jax.devices()[0].device_kind

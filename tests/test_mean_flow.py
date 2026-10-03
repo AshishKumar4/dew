@@ -153,7 +153,7 @@ def test_a_run_config_trains_meanflow_and_its_saved_task_samples_in_one_step(tmp
     state, *_ = trainer.compile(state, batch)(state, batch)
     run = tmp_path / "run"
     checkpoints = Checkpoints(str(run))
-    checkpoints.save(1, state, None)
+    checkpoints.save(1, state, None, artifact=task.inference_record())
     checkpoints.wait()
     config.save(str(run))
     expected = task.pipeline(state, ema=False)(["a red bird"], key=9).host().images

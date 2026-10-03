@@ -858,8 +858,8 @@ def test_a_quantized_pipeline_has_finite_loss_and_gradients():
         info = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(3),
                     ema=None)
 
-        def loss(variables):
-            return objective.scalar_loss({**variables, "params": variables},
+        def loss(params):
+            return objective.scalar_loss({**variables, "params": params},
                                   placed_batch, info)
 
         with jax.set_mesh(mesh), pipeline_microbatches(spec.microbatches):

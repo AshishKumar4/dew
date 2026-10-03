@@ -1,7 +1,9 @@
 """The S5 layer against a float64 NumPy transcription of its recurrence.
 
 `S5Layer` discretizes diagonal complex poles by zero-order hold and runs the
-recurrence with `jax.lax.associative_scan`. The oracle here is written from
+recurrence in chunks of pole-power products (`diagonal_recurrence`), in real
+arithmetic over stacked real and imaginary parts, or on a TPU as a complex
+`associative_scan`; both forms are held to the same bounds. The oracle here is written from
 the equations (Smith, Warrington and Linderman, "Simplified State Space
 Layers for Sequence Modeling", 2023, eqs. 2-6), step by step, in complex128:
 
@@ -22,17 +24,19 @@ absolute terms by running the same recurrence and the same adjoint on the
 magnitudes of every factor. K counts the longest chain:
 
 - forward: the pole A dt and its exponential, complex, 8 roundings; A_bar's
-  error compounds once per step through the powers A_bar^k the scan forms,
-  plus the complex multiply-add of each combine, 9 per step over S steps;
-  the discretized input (A_bar - 1) / A * B and its F-term product with u,
-  F + 8; the N-term output product and the skip, N + 4. K = 9 S + F + N + 20.
+  error compounds once per step through the running products that form its
+  powers, at most S of them, and each state is a sum of at most 2 S real
+  terms; 9 per step over S steps bounds both; the discretized input
+  (A_bar - 1) / A * B and its F-term product with u, F + 8; the output
+  product, 2N real terms, and the skip, 2N + 4. K = 9 S + F + 2N + 20.
 - gradients: the forward chain, the adjoint recurrence run back over the
   same S steps with the same 9 roundings a step, the chain rule back
   through the discretization, 16, and the sum over the B S positions a
-  parameter gradient collects. K = 2 (9 S) + B S + F + N + 36.
+  parameter gradient collects. K = 2 (9 S) + B S + F + 2N + 36.
 
-At B 2, S 16, F 4, N 8 that is K = 176 forward (1.0e-5 relative to the
-absolute terms) and K = 356 on the gradients (2.1e-5).
+At B 2, F 4, N 8 and S 16 that is K = 184 forward (1.1e-5 relative to the
+absolute terms) and K = 376 on the gradients (2.2e-5); at S 40, two whole
+chunks and a padded third, K = 400 and 856.
 """
 
 import jax
@@ -40,12 +44,19 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.nn.ssm import S5Layer
+from dew.nn import ssm
+from dew.nn.ssm import BidirectionalS5Layer, S5Layer, diagonal_recurrence
 
 U = 2.0 ** -24
-BATCH, STEPS, FEATURES, STATE = 2, 16, 4, 8
-FORWARD_CHAIN = 9 * STEPS + FEATURES + STATE + 20
-GRADIENT_CHAIN = 2 * 9 * STEPS + BATCH * STEPS + FEATURES + STATE + 36
+BATCH, FEATURES, STATE = 2, 4, 8
+
+
+def forward_chain(steps: int, features: int = FEATURES, state: int = STATE) -> int:
+    return 9 * steps + features + 2 * state + 20
+
+
+def gradient_chain(steps: int, batch: int = BATCH, features: int = FEATURES, state: int = STATE) -> int:
+    return 2 * 9 * steps + batch * steps + features + 2 * state + 36
 LEAVES = ("log_A_real", "A_imag", "B_re", "B_im", "C_re", "C_im", "D", "log_dt")
 
 
@@ -144,16 +155,19 @@ def adjoint(p, u, w, op: Arithmetic):
 EXACT, MAGNITUDES = Arithmetic(absolute=False), Arithmetic(absolute=True)
 
 
-@pytest.fixture(scope="module")
-def case():
+# 16 positions are one chunk of the layer's recurrence; 40 are two whole
+# chunks and a padded third, so the carry between chunks is exercised.
+@pytest.fixture(scope="module", params=[16, 40])
+def case(request):
+    steps = request.param
     layer = S5Layer(features=FEATURES, state_dim=STATE)
     keys = jax.random.split(jax.random.key(0), 3)
-    u = jax.random.normal(keys[0], (BATCH, STEPS, FEATURES), jnp.float32)
+    u = jax.random.normal(keys[0], (BATCH, steps, FEATURES), jnp.float32)
     params = layer.init(keys[1], u)["params"]
     # Steps up to 1 instead of the init's 0.1, so every pole turns and
     # decays visibly inside 16 steps and the hold differs from an Euler step.
     params = {**params, "log_dt": jnp.log(jnp.linspace(0.05, 1.0, STATE))}
-    w = jax.random.normal(keys[2], (BATCH, STEPS, FEATURES), jnp.float32)
+    w = jax.random.normal(keys[2], (BATCH, steps, FEATURES), jnp.float32)
     return layer, params, u, w
 
 
@@ -184,20 +198,30 @@ def test_the_oracle_adjoint_is_the_derivative_of_the_oracle(case):
         assert np.max(np.abs(gradients[name] - numeric)) <= 1e-7 * scale, name
 
 
-def test_the_layer_computes_the_zero_order_hold_recurrence(case):
-    """Every output within K u of its absolute terms, K = 176."""
+@pytest.fixture(params=["chunked", "scanned"])
+def form(request, monkeypatch):
+    """The layer's directions run as a GPU runs them (`_chunked_directions`)
+    or as a TPU does (`_scanned_directions`), both here on the CPU."""
+    chosen = {"chunked": ssm._chunked_directions, "scanned": ssm._scanned_directions}[request.param]
+    monkeypatch.setattr(ssm, "_directions", chosen)
+    return request.param
+
+
+def test_the_layer_computes_the_zero_order_hold_recurrence(case, form):
+    """Every output within K u of its absolute terms, K = 184 at 16 positions."""
     layer, params, u, _ = case
     expected, _ = forward(float64_params(params), np.asarray(u, np.float64), EXACT)
-    bound = FORWARD_CHAIN * U * forward(float64_params(params), np.asarray(u, np.float64), MAGNITUDES)[0]
+    bound = forward_chain(u.shape[1]) * U * forward(
+        float64_params(params), np.asarray(u, np.float64), MAGNITUDES)[0]
 
     actual = np.asarray(layer.apply({"params": params}, u), np.float64)
 
     assert np.all(np.abs(actual - expected) <= bound)
 
 
-def test_the_layer_gradients_are_the_recurrence_gradients(case):
+def test_the_layer_gradients_are_the_recurrence_gradients(case, form):
     """Every parameter's and the input's gradient within K u of its absolute
-    terms, K = 356."""
+    terms, K = 376 at 16 positions."""
     layer, params, u, w = case
     p, u64, w64 = float64_params(params), np.asarray(u, np.float64), np.asarray(w, np.float64)
     expected = adjoint(p, u64, w64, EXACT)
@@ -211,7 +235,77 @@ def test_the_layer_gradients_are_the_recurrence_gradients(case):
 
     for name, value in actual.items():
         error = np.abs(np.asarray(value, np.float64) - expected[name])
-        assert np.all(error <= GRADIENT_CHAIN * U * terms[name]), name
+        assert np.all(error <= gradient_chain(u.shape[1]) * U * terms[name]), name
+
+
+def test_a_long_sequence_stays_within_the_bound():
+    """4096 positions are 256 chunks, whose carry runs as a scan of its
+    own. Steps from 0.001 keep the slowest pole's memory across the whole
+    sequence, and outputs and gradients stay within K u of their absolute
+    terms."""
+    batch, steps, features, state = 1, 4096, 2, 4
+    layer = S5Layer(features=features, state_dim=state)
+    keys = jax.random.split(jax.random.key(1), 3)
+    u = jax.random.normal(keys[0], (batch, steps, features), jnp.float32)
+    params = layer.init(keys[1], u)["params"]
+    params = {**params, "log_dt": jnp.log(jnp.linspace(0.001, 0.05, state))}
+    w = jax.random.normal(keys[2], u.shape, jnp.float32)
+    p, u64, w64 = float64_params(params), np.asarray(u, np.float64), np.asarray(w, np.float64)
+
+    expected, _ = forward(p, u64, EXACT)
+    bound = forward_chain(steps, features, state) * U * forward(p, u64, MAGNITUDES)[0]
+    assert np.all(np.abs(np.asarray(layer.apply({"params": params}, u), np.float64) - expected) <= bound)
+
+    # Under jit: run eagerly, the scan's gradient dispatches thousands of small ops.
+    parameters, inputs = jax.jit(jax.grad(lambda params, u: jnp.sum(w * layer.apply({"params": params}, u)),
+                                          argnums=(0, 1)))(params, u)
+    exact, terms = adjoint(p, u64, w64, EXACT), adjoint(p, u64, w64, MAGNITUDES)
+    for name, value in {**{name: parameters[name] for name in LEAVES}, "u": inputs}.items():
+        error = np.abs(np.asarray(value, np.float64) - exact[name])
+        assert np.all(error <= gradient_chain(steps, batch, features, state) * U * terms[name]), name
+
+
+def test_the_recurrence_holds_for_poles_all_around_the_circle():
+    """The chunks build the pole powers by doubling, so a pole past the
+    imaginary axis (negative real part) or at the branch cut has to give the
+    powers a running product gives. Poles at every angle of
+    the circle, the cut included, at radii up to 0.999 and over 100 positions
+    (seven chunks): the states within K u of their absolute terms, against a
+    complex128 recurrence. S4D-Lin's imaginary parts, up to pi (N - 1), put a
+    trained layer's poles anywhere on the circle once dt reaches 1 / N."""
+    states, steps = 33, 100
+    angles = np.linspace(-np.pi, np.pi, states)
+    radii = np.linspace(0.9, 0.999, states)
+    pole = (radii * np.exp(1j * angles)).astype(np.complex64)
+    rng = np.random.default_rng(3)
+    v = (rng.normal(size=(2, steps, states)) + 1j * rng.normal(size=(2, steps, states))).astype(np.complex64)
+
+    def run(pole, v):
+        x, out = np.zeros(v.shape[::2], v.dtype), []
+        for k in range(steps):
+            x = pole * x + v[:, k]
+            out.append(x)
+        return np.stack(out, axis=1)
+
+    expected = run(pole.astype(np.complex128), v.astype(np.complex128))
+    magnitude = run(np.abs(pole).astype(np.float64), np.abs(v).astype(np.float64))
+    inputs = np.concatenate([v.real, v.imag], axis=-1)
+    actual = np.asarray(jax.jit(diagonal_recurrence)(jnp.asarray(pole), jnp.asarray(inputs)), np.float64)
+    actual = actual[..., :states] + 1j * actual[..., states:]
+    assert np.all(np.abs(actual - expected) <= forward_chain(steps, 1, states) * U * magnitude)
+
+
+@pytest.mark.parametrize("platform, scanned", [("tpu", True), ("cuda", False), ("cpu", False)])
+def test_a_tpu_runs_the_layer_as_it_first_did(platform, scanned):
+    """The TPU lowering takes `_scanned_directions`, the layer's first form,
+    and the others the chunked pole-power products, whose Toeplitz product
+    names its einsum."""
+    layer = BidirectionalS5Layer(features=4, state_dim=4)
+    u = jnp.zeros((1, 40, 4), jnp.float32)
+    variables = layer.init(jax.random.key(0), u)
+    text = jax.jit(layer.apply).trace(variables, u).lower(lowering_platforms=(platform,)).as_text(
+        debug_info=True)
+    assert ("kjn,bcjn->bckn" not in text) == scanned
 
 
 def test_the_forward_bound_rejects_an_euler_step(case):
@@ -224,7 +318,7 @@ def test_the_forward_bound_rejects_an_euler_step(case):
     euler_b = b * (dt / hold)[:, None]
     euler = forward({**p, "B_re": euler_b.real, "B_im": euler_b.imag}, u64, EXACT)[0]
     expected = forward(p, u64, EXACT)[0]
-    bound = FORWARD_CHAIN * U * forward(p, u64, MAGNITUDES)[0]
+    bound = forward_chain(u.shape[1]) * U * forward(p, u64, MAGNITUDES)[0]
     assert np.any(np.abs(euler - expected) > bound)
 
 

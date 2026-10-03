@@ -114,7 +114,7 @@ def test_a_saved_student_samples_one_branch_at_its_conditioners_guidance(runs, t
     state = trainer.initial_state()
     state, *_ = trainer.compile(state, batch)(state, batch)
     checkpoints = Checkpoints(str(tmp_path / "student"))
-    checkpoints.save(1, state, None)
+    checkpoints.save(1, state, None, artifact=task.inference_record())
     checkpoints.wait()
     config.save(str(tmp_path / "student"))
     restored = TextToImage.from_run(str(tmp_path / "student"))

@@ -462,15 +462,15 @@ def test_a_trained_lm_run_exports_and_reloads_at_its_own_logits(tmp_path):
 
 def test_exporting_a_run_whose_model_has_no_published_layout_names_it(tmp_path):
     """A latent diffusion run: the denoiser is a native model with no file
-    to be written back into, so the refusal names the model and what does
-    export."""
+    to be written back into, so building its export bundle is refused,
+    naming the model and the task that loads the run."""
     from test_inference import make_run
 
     from dew.interop import Pretrained
 
     make_run(tmp_path)
-    with pytest.raises(ValueError, match="SimpleDiT has no published layout"):
-        Pretrained.from_run(str(tmp_path)).save(tmp_path / "export")
+    with pytest.raises(TypeError, match="SimpleDiT has no maintained exported bundle layout"):
+        Pretrained.from_run(str(tmp_path))
 
 
 def test_the_cli_exports_a_run_and_refuses_a_directory_that_is_not_one(tmp_path, capsys):
@@ -493,14 +493,14 @@ def test_the_cli_exports_a_run_and_refuses_a_directory_that_is_not_one(tmp_path,
 
 def test_a_block_diffusion_run_exports_under_its_published_config(tmp_path):
     """DiffusionGemma writes the reference's own encoder/decoder names, over
-    the published config the run recorded rather than a derived one."""
+    the published config the run's record carries."""
     from test_inference import make_block_run
 
     from dew.interop import Pretrained
 
     run = tmp_path / "run"
     run.mkdir()
-    make_block_run(run)
+    make_block_run(run, fixture="diffusion-gemma-sft")
     destination = tmp_path / "export"
 
     Pretrained.from_run(str(run), ema=False).save(destination)

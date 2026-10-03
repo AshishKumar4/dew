@@ -9,7 +9,9 @@ name: Tutorials
 
 on:
   push:
-    branches: [ "main" ]
+    # ci/** is the branch run a head gets before it lands, so a notebook a
+    # change breaks fails there rather than after the merge.
+    branches: [ "main", "ci/**" ]
     paths: [ "src/dew/**", "tutorials/**", "pyproject.toml", "tools/run_tutorials.py", "tools/check_tutorial_outputs.py", ".github/workflows/tutorials.yml" ]
   pull_request:
     branches: [ "main" ]

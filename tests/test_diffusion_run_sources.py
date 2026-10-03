@@ -213,12 +213,12 @@ def test_a_saved_flow_grpo_run_restores_its_policy_and_not_its_kl_reference(tmp_
     objective = config.build()
     checkpoints = Checkpoints(str(tmp_path / "run"))
     _, started, state = grpo_step(objective, config.rollout(objective), checkpoints=checkpoints)
-    checkpoints.save(1, state, None, {})
+    checkpoints.save(1, state, None, {}, artifact=objective.inference_record())
     checkpoints.wait()
     config.save(str(tmp_path / "run"))
 
-    restored = jax.tree.leaves(TextToImage.from_run(str(tmp_path / "run")).params["params"])
-    published = jax.tree.leaves(objective.pipeline(state).params["params"])
+    restored = jax.tree.leaves(TextToImage.from_run(str(tmp_path / "run")).variables["params"])
+    published = jax.tree.leaves(objective.pipeline(state).variables["params"])
     for got, want in zip(restored, published, strict=True):
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
     assert any(not np.array_equal(np.asarray(got), before)
