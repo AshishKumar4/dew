@@ -443,8 +443,10 @@ class ModulatedBlock(nn.Module):
         self.mlp = nn.Sequential([
             nn.Dense(features=hidden_features, dtype=self.dtype, precision=self.precision),
             # Column-parallel under a tensor axis; the activation holds the
-            # place so the layers keep their names.
-            lambda hidden: nn.gelu(constrain(hidden, MLP_HIDDEN)),
+            # place so the layers keep their names. GELU runs in fp32 and
+            # rounds once, as torch's bf16 GELU does (docs/performance.md).
+            lambda hidden: nn.gelu(constrain(hidden, MLP_HIDDEN).astype(at_least_fp32(hidden.dtype))
+                                   ).astype(hidden.dtype),
             nn.Dense(features=self.features, dtype=self.dtype, precision=self.precision),
         ])
         self.dropout = nn.Dropout(rate=self.dropout_rate)
