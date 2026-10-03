@@ -226,14 +226,23 @@ old scan). `tools/benchmark_step.py`, one batch on the device, ms per step
 
 | device | batch 16 | batch 32 |
 |---|---:|---:|
-| RTX 4080, traced with command buffers off | 68.29 to 62.42 | |
-| A100 40 GB (Colab, `db1761fd`) | 42.38 to 40.89 | 65.67 to 62.39 |
-| TPU v6e (Colab, `db1761fd`) | 21.12 to 20.91 | 36.41 to 36.61 |
+| RTX 4080 (integration `527a32e9`, two rounds) | 66.64/66.37 to 59.42/59.47 | 110.31/110.05 to 100.12/100.08 |
+| A100 40 GB (Colab, `db1761fd`, the first form) | 42.38 to 40.89 | 65.67 to 62.39 |
+| TPU v6e (Colab, `8e92a4a6`, the first form, three rounds) | 18.25-18.28 to 20.88-20.91 | 36.43-36.45 to 36.60-36.64 |
 
-One process a side on Colab. On the v6e a step waited on alone takes
-longer (p50 21.20 to 23.93 ms at batch 16), with the throughput above
-unchanged: the extra 2.7 ms is latency that a training loop's queued
-steps and a sampler's scanned steps never wait on.
+The first form built the powers as a running product (`cumprod`) and the
+`[L, L]` Toeplitz block from shifted copies of them. On the v6e those
+small serial pieces cost more than the products saved: compiled for a v6e
+chip, the S5 mixer's forward and backward at batch 16 is estimated at
+1.52 million cycles against the old scan's 1.08 million, 0.58 million of
+them in the running product, the copies and their transposes. The powers
+are now `exp(t log(pole))`, each rounded once, and the block is built
+elementwise from the lags `k - j`: 0.93 million cycles, and on the RTX
+4080 59.42/59.47 ms at batch 16 against the first form's 60.09/60.07. The
+errors against the complex128 oracle are the first form's (4096
+positions: forward RMS 1.155e-6 against 1.156e-6, every gradient within
+the same bound). The v6e step with this form is measured in the next TPU
+session.
 
 Unless a section says otherwise, the sections below were measured on jax
 0.11.1 / jaxlib 0.11.1 / jax_cuda12_plugin 0.11.1, driver 595.84, RTX 4080
