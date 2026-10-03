@@ -205,6 +205,27 @@
    ],
    "note": "Executes fetched official edm_sampler; no installed upstream package import."
   },
+  "edm/loss.npz": {
+   "tool": "tools/edm_loss_reference.py",
+   "sources": [
+    {
+     "repo": "NVlabs/edm",
+     "version": "008a4e5316c8e3bfe61a62f874bddba254295afb",
+     "runs": "fetched"
+    },
+    {
+     "repo": "NVlabs/edm2",
+     "version": "4bf8162f601bcc09472ce8a32dd0cbe8889dc8fc",
+     "runs": "fetched"
+    },
+    {
+     "repo": "pytorch/pytorch",
+     "version": "2.14.0",
+     "runs": "torch"
+    }
+   ],
+   "note": "EDMLoss through EDMPrecond and EDM2Loss through Precond, around an affine stand-in network; images, draws and stand-in weights are inputs."
+  },
   "edm2": {
    "tool": "tools/edm2_reference.py",
    "sources": [
@@ -237,6 +258,17 @@
     }
    ],
    "note": "FlaxDiff 0.2.10, JAX 0.5.3 and Flax 0.10.6 documented at tool:29."
+  },
+  "flow/densities.npz": {
+   "tool": "tools/flow_density_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/diffusers",
+     "version": "0.34.0",
+     "runs": "diffusers"
+    }
+   ],
+   "note": "compute_density_for_timestep_sampling on the draws FlowMatchingScheduler.sample_t makes from jax.random.key(0)."
   },
   "flux2_published.npz": {
    "tool": "tools/diffusers_flux2_reference.py",
