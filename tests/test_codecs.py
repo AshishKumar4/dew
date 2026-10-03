@@ -196,31 +196,23 @@ def test_a_v4_1_engram_row_decodes_as_the_releases_lookup_reads_it(v4_release):
                                   v4_release["v4_1/engram/values"])
 
 
-def test_the_v4_fp4_encoder_follows_the_releases_kernel():
-    """`fp4_quant_kernel` under E8M0 scales (inference/kernel.py), group by
-    group. Amax 6: 6 * float32(1 / 6) rounds to exactly 1, byte 127, and
-    0.75 ties to the even 1.0. Amax 3 rounds to exactly 0.5, byte 126, so
-    3 is code 7 and -1.4 / 0.5 = -2.8 rounds to -3. Amax 3.015625 is
-    0.5026 after the multiply, whose mantissa bits round it up to byte 127.
-    A zero group takes the 6 * 2 ** -126 floor, byte 1, and keeps -0.0 as
-    code 8. 0.7495 reaches the 0.75 tie through bf16 first. Amax 2 ** -120
-    is 1.33 * 2 ** -123 over 6, byte 5, so 2 ** -120 is 4 (code 6)."""
-    groups = np.zeros((6, 32), np.float32)
-    groups[0, :3] = [6.0, -3.0, 0.75]
-    groups[1, :2] = [3.0, -1.4]
-    groups[2, :2] = [3.015625, 1.0]
-    groups[3, 3] = -0.0
-    groups[4, :2] = [0.7495, 6.0]
-    groups[5, :2] = [2.0 ** -120, -(2.0 ** -122)]
+@pytest.mark.parametrize("release", ["v4", "v4_1"])
+def test_the_v4_fp4_encoder_writes_the_releases_kernels_bytes(release):
+    """`fp4_act_quant` (TileLang `fp4_quant_kernel` under E8M0 scales), run on
+    a GPU from each release's inference/kernel.py: bfloat16 rows whose groups
+    reach every rule (a group scale exactly a power of two and a hair above
+    one, ties between E2M1 values, every midpoint, an all-zero group and a
+    negative zero, values past 6, magnitudes over 80 binades). Every code
+    byte and every scale byte equal."""
+    with np.load(Path(__file__).parent / "fixtures" / "codecs" / "deepseek_kernels.npz") as kernels:
+        rows = kernels[f"{release}/input"].view(ml_dtypes.bfloat16).astype(np.float32)
+        codes, scales = kernels[f"{release}/codes"], kernels[f"{release}/scales"]
 
-    packed, scale = codecs.quantize_deepseek_v4_fp4(groups)
+    packed, scale = codecs.quantize_deepseek_v4_fp4(rows)
 
-    assert (packed.dtype, packed.shape, scale.dtype, scale.shape) == (
-        np.int8, (6, 16), ml_dtypes.float8_e8m0fnu, (6, 1))
-    assert scale.view(np.uint8)[:, 0].tolist() == [127, 126, 127, 1, 127, 5]
-    codes = np.stack([packed.view(np.uint8) & 15, packed.view(np.uint8) >> 4], axis=-1).reshape(6, 32)
-    assert codes[:, :4].tolist() == [[7, 13, 2, 0], [7, 13, 0, 0], [5, 2, 0, 0],
-                                     [0, 0, 0, 8], [2, 7, 0, 0], [6, 10, 0, 0]]
+    assert (packed.dtype, scale.dtype) == (np.int8, ml_dtypes.float8_e8m0fnu)
+    np.testing.assert_array_equal(packed.view(np.uint8), codes)
+    np.testing.assert_array_equal(scale.view(np.uint8), scales)
 
 
 def test_each_v4_layout_moves_a_weight_by_at_most_its_grid_step_and_holds_still_after():
