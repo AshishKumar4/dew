@@ -236,13 +236,19 @@ small serial pieces cost more than the products saved: compiled for a v6e
 chip, the S5 mixer's forward and backward at batch 16 is estimated at
 1.52 million cycles against the old scan's 1.08 million, 0.58 million of
 them in the running product, the copies and their transposes. The powers
-are now `exp(t log(pole))`, each rounded once, and the block is built
-elementwise from the lags `k - j`: 0.93 million cycles, and on the RTX
-4080 59.42/59.47 ms at batch 16 against the first form's 60.09/60.07. The
-errors against the complex128 oracle are the first form's (4096
-positions: forward RMS 1.155e-6 against 1.156e-6, every gradient within
-the same bound). The v6e step with this form is measured in the next TPU
-session.
+now come by doubling (the powers so far times the next squared power, so
+each rounds at most 2 log2(t) times) and the block is a one-hot product of
+them, exact at full precision, whose transpose is a product too: 1.01
+million cycles. `exp(t log(pole))` would be cheaper still (0.93 million,
+and 0.6-1.3% faster on the RTX 4080) but rounds the phase of a large-angle
+pole t times over: on poles all around the unit circle its states' RMS
+error against complex128 is 1.05e-5, against 1.57e-6 by doubling and
+8.5e-7 by the running product. On the RTX 4080 the doubled form runs the
+hybrid DiT at batch 16 in 60.21/60.80 ms against integration's
+66.64/66.37, and at 32 in 100.73/100.83 against 110.31/110.05; over 4096
+positions its forward RMS error against the oracle is 1.144e-6, the
+running product's 1.156e-6. The v6e step with this form is measured in
+the next TPU session.
 
 Unless a section says otherwise, the sections below were measured on jax
 0.11.1 / jaxlib 0.11.1 / jax_cuda12_plugin 0.11.1, driver 595.84, RTX 4080

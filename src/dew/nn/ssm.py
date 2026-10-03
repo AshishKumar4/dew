@@ -8,6 +8,7 @@ Spatial-Mamba's, and the two together are the SSM mixer of `ModulatedBlock`.
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
@@ -33,12 +34,17 @@ def _complex_blocks(re: jax.Array, im: jax.Array) -> jax.Array:
     return jnp.concatenate([jnp.concatenate([re, -im], 1), jnp.concatenate([im, re], 1)], 0)
 
 
-def _powers(log_pole: jax.Array, exponents: jax.Array) -> jax.Array:
-    """`pole ** exponents` for each of the N poles, `[*exponents.shape, N]`,
-    as `exp(exponent * log(pole))`: elementwise, so a TPU spends no serial
-    product or shifted-copy assembly on it, and each power rounds once
-    rather than once per factor of a running product."""
-    return jnp.exp(exponents[..., None].astype(log_pole.real.dtype) * log_pole)
+def _powers(pole: jax.Array, length: int) -> jax.Array:
+    """`pole ** t` for t = 0 .. length, `[length + 1, N]`, by doubling: the
+    powers so far times the next squared power, so each is a product of at
+    most 2 log2(length) roundings rather than t, in log2(length) elementwise
+    steps rather than a serial running product."""
+    powers = jnp.ones((1, pole.shape[0]), pole.dtype)
+    factor = pole
+    while powers.shape[0] <= length:
+        powers = jnp.concatenate([powers, powers * factor])
+        factor = factor * factor
+    return powers[:length + 1]
 
 
 def _carried(pole: jax.Array, last: jax.Array) -> jax.Array:
@@ -70,29 +76,32 @@ def diagonal_recurrence(pole: jax.Array, inputs: jax.Array, chunk: int = SCAN_CH
     chunks of `chunk`: inside a chunk the states are one product of the
     powers `pole^(k - j)` with the chunk's inputs, at fp32's full precision,
     and across chunks `associative_scan` carries each chunk's last state
-    forward by `pole^chunk`. The powers are `exp(t log(pole))`, and the
-    states stay within the fp32 running-error bound of the scan the layer
-    ran before (tests/test_ssm.py).
+    forward by `pole^chunk`. The powers come by doubling (`_powers`), and
+    the states stay within the fp32 running-error bound of the scan the
+    layer ran before (tests/test_ssm.py).
     """
     batch, steps, width = inputs.shape
     states = width // 2
     length = min(chunk, steps)
     chunks = -(-steps // length)
     highest = jax.lax.Precision.HIGHEST
-    log_pole = jnp.log(pole)
+    powers = _powers(pole, length)
     blocks = jnp.pad(inputs, ((0, 0), (0, chunks * length - steps), (0, 0)))
     blocks = blocks.reshape(batch, chunks, length, 2, states).transpose(0, 1, 3, 2, 4)
-    # Entry (k, j) is pole^(k - j) where k >= j, and zero above the diagonal.
-    lag = jnp.arange(length)[:, None] - jnp.arange(length)[None, :]
-    within = jnp.where((lag >= 0)[..., None], _powers(log_pole, jnp.maximum(lag, 0)), 0)
-    local = jnp.einsum("kjn,bcjn->bckn", _complex_blocks(within.real, within.imag),
+    # Entry (k, j) is pole^(k - j) where k >= j, and zero above the diagonal:
+    # a one-hot product, exact at full precision, whose transpose is a
+    # product too rather than a scatter or a stack of shifted copies.
+    lag = np.arange(length)[:, None] - np.arange(length)[None, :]
+    picks = (lag[..., None] == np.arange(length)).astype(np.float32)
+    within_re, within_im = (jnp.einsum("kjt,tn->kjn", picks, part, precision=highest)
+                            for part in (powers[:length].real, powers[:length].imag))
+    local = jnp.einsum("kjn,bcjn->bckn", _complex_blocks(within_re, within_im),
                        blocks.reshape(batch, chunks, 2 * length, states), precision=highest)
     local = local.reshape(batch, chunks, 2, length, states)
     if chunks > 1:
-        carry = _carried(_powers(log_pole, jnp.asarray(length)), local[:, :, :, -1].transpose(0, 2, 1, 3))
-        carry = carry[:, :, :, None]
+        carry = _carried(powers[-1], local[:, :, :, -1].transpose(0, 2, 1, 3))[:, :, :, None]
         # The state a chunk starts from, carried to each of its positions by pole^(k + 1).
-        lift = _powers(log_pole, jnp.arange(1, length + 1))
+        lift = powers[1:]
         local = local + jnp.stack([lift.real * carry[:, 0] - lift.imag * carry[:, 1],
                                    lift.real * carry[:, 1] + lift.imag * carry[:, 0]], axis=2)
     return local.transpose(0, 1, 3, 2, 4).reshape(batch, chunks * length, width)[:, :steps]
