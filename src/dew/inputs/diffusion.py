@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from transformers import CLIPTokenizer, PreTrainedTokenizerBase
 
     from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.training.distributed import Layout, MeshSpec
 
 
 def _prompt(record: Mapping[str, object], key: str, default: str) -> str:
@@ -167,11 +168,13 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
     @classmethod
     def from_pretrained(cls, checkpoint: str, *, dtype: str | None = "bfloat16",
                         param_dtype: str = "float32", revision: str | None = None,
-                        attention_impl: str = "auto", params: Variables | None = None):
+                        attention_impl: str = "auto", params: Variables | None = None,
+                        mesh: MeshSpec | None = None, layout: Layout | None = None):
         from dew.interop.pretrained import load_diffusion_conditioner
 
         return load_diffusion_conditioner(checkpoint, cls, dtype=dtype, param_dtype=param_dtype,
-                                          revision=revision, attention_impl=attention_impl, params=params)
+                                          revision=revision, attention_impl=attention_impl, params=params,
+                                          mesh=mesh, layout=layout)
 
     @property
     def stacked(self) -> bool:
@@ -387,12 +390,13 @@ class QwenImageConditioner(ConditionEncoder[str | Mapping[str, object]]):
     def from_pretrained(cls, checkpoint: str, *, dtype: str | None = "bfloat16",
                         param_dtype: str = "float32", revision: str | None = None,
                         attention_impl: str = "auto", tokens: int = 512,
-                        params: Variables | None = None):
+                        params: Variables | None = None, mesh: MeshSpec | None = None,
+                        layout: Layout | None = None):
         from dew.interop.pretrained import load_diffusion_conditioner
 
         return load_diffusion_conditioner(checkpoint, cls, dtype=dtype, param_dtype=param_dtype,
                                           revision=revision, attention_impl=attention_impl,
-                                          tokens=tokens, params=params)
+                                          tokens=tokens, params=params, mesh=mesh, layout=layout)
 
     def tokenize(self, texts: Sequence[str | Mapping[str, object]]):
         system = f"<|im_start|>system\n{self.SYSTEM}<|im_end|>\n"
@@ -488,12 +492,13 @@ class HiddenStatesConditioner(ConditionEncoder[str | Mapping[str, object]]):
     def from_pretrained(cls, checkpoint: str, *, dtype: str | None = "bfloat16",
                         param_dtype: str = "float32", revision: str | None = None,
                         attention_impl: str = "auto", tokens: int = 512,
-                        params: Variables | None = None):
+                        params: Variables | None = None, mesh: MeshSpec | None = None,
+                        layout: Layout | None = None):
         from dew.interop.pretrained import load_diffusion_conditioner
 
         return load_diffusion_conditioner(checkpoint, cls, dtype=dtype, param_dtype=param_dtype,
                                           revision=revision, attention_impl=attention_impl,
-                                          tokens=tokens, params=params)
+                                          tokens=tokens, params=params, mesh=mesh, layout=layout)
 
     def tokenize(self, texts: Sequence[str | Mapping[str, object]]):
         rows, guidance = [], []
@@ -581,12 +586,13 @@ class WanConditioner(ConditionEncoder[str | Mapping[str, object]]):
     def from_pretrained(cls, checkpoint: str, *, dtype: str | None = "bfloat16",
                         param_dtype: str = "float32", revision: str | None = None,
                         attention_impl: str = "auto", tokens: int = 512,
-                        params: Variables | None = None):
+                        params: Variables | None = None, mesh: MeshSpec | None = None,
+                        layout: Layout | None = None):
         from dew.interop.pretrained import load_diffusion_conditioner
 
         return load_diffusion_conditioner(checkpoint, cls, dtype=dtype, param_dtype=param_dtype,
                                           revision=revision, attention_impl=attention_impl,
-                                          tokens=tokens, params=params)
+                                          tokens=tokens, params=params, mesh=mesh, layout=layout)
 
     def tokenize(self, texts: Sequence[str | Mapping[str, object]]):
         rows = []
