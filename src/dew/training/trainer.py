@@ -1483,6 +1483,8 @@ class Trainer(Generic[Loss, Effects]):
                 or (bool(eval_every or metrics) and dataset.val is not None),
             )
             trained, complete = self._training_loop(plan, run, profiler, tracer, profile, checkpoints, state)
+            # The state a checkpoint would hold: the step rebuilds its narrow copies.
+            trained = dataclasses.replace(trained, compute=None)
         finally:
             primary = sys.exception()
             error = self._closed(run, primary, profiler)
