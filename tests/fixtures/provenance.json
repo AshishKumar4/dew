@@ -130,6 +130,22 @@
    ],
    "note": "per_block_cast_to_fp8 of deep_gemm/utils/math.py, checked by SHA-256; operands stored beside the outputs. Torch 2.14.0+cpu."
   },
+  "codecs/deepseek_v4_release.npz": {
+   "tool": "tools/deepseek_v4_release_reference.py",
+   "sources": [
+    {
+     "repo": "deepseek-ai/DeepSeek-V4-Flash",
+     "version": "60d8d70770c6776ff598c94bb586a859a38244f1",
+     "runs": "fetched"
+    },
+    {
+     "repo": "deepseek-ai/DeepSeek-V4.1-Flash",
+     "version": "dba1be0a40aa45a94ad051997016db3960a90277",
+     "runs": "fetched"
+    }
+   ],
+   "note": "inference/convert.py main (wo_a FP8 dequant, cast_e2m1fn_to_e4m3fn) of both releases and V4.1's ParallelEngramEmbedding.forward, fetched at the commits and SHA-256 checked; model.py's TileLang kernel module is a stand-in that raises if called. Torch 2.14.0+cpu."
+  },
   "codecs/integer.npz": {
    "tool": "tools/integer_codecs_reference.py",
    "sources": [
