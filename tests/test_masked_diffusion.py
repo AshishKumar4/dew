@@ -8,7 +8,7 @@ source-format export of both families lives in test_masked_diffusion_export.py.
 """
 
 import json
-from dataclasses import asdict, replace
+from dataclasses import replace
 from importlib import import_module
 from pathlib import Path
 
@@ -20,10 +20,9 @@ import optax
 import pytest
 
 from dew.checkpoints import Checkpoints
-from dew.config import ModelConfig
-from dew.data import Dataset
+from dew.data import ByteTokenizer, Dataset
 from dew.diffusion.discrete import MDLM, Unmask
-from dew.inference import pipeline
+from dew.inference import RunProcessor, pipeline
 from dew.interop import Pretrained
 from dew.interop.hf_decoders import translate_config, translate_weights
 from dew.nn.inputs import BATCH_AXES, ModelInputs
@@ -223,7 +222,7 @@ def test_masked_training_resume_publish_and_run_pipeline(masked_source, tmp_path
     source, prompt = masked_source
     model = source.model.clone(dtype=jnp.bfloat16)
     objective = MaskedDiffusionObjective(model, MDLM(mask_id=120)(), 8,
-        pretrained=source.variables, ema_decay=0.5)
+        pretrained=source.variables, ema_decay=0.5, processor=RunProcessor(ByteTokenizer()))
     rows = jax.device_count()
     batch = {"text": np.full((rows, 8), 7, np.int32)}
     stream = grain.MapDataset.source([batch]).repeat().to_iter_dataset()
@@ -241,12 +240,6 @@ def test_masked_training_resume_publish_and_run_pipeline(masked_source, tmp_path
     for left, right in zip(jax.tree.leaves(resumed.averaged), jax.tree.leaves(direct.averaged), strict=True):
         np.testing.assert_array_equal(left, right)
 
-    fields = {
-        name: value for name, value in source.model_config.items() if name not in ("dtype", "attention_impl")
-    }
-    config = ModelConfig("causal_transformer", fields, dtype="bfloat16", attention_impl="xla")
-    (tmp_path / "run" / "run.json").write_text(json.dumps({
-        "objective": "masked_diffusion", "model": asdict(config), "tokenizer": "byte", "sample_tokens": 8}))
     live = objective.pipeline(resumed, ema=False)
     averaged = objective.pipeline(resumed)
     restored = pipeline(str(tmp_path / "run"), ema=False)
