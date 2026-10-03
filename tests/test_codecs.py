@@ -525,71 +525,69 @@ def test_a_released_v4_tensor_decodes_as_the_release_reads_it_and_encodes_back(
 # AWQ and GPTQ integer groups
 # --------------------------------------------------------------------------
 
-def test_an_awq_word_holds_its_columns_in_awq_order():
-    """Nibble j of an AWQ gemm word is column AWQ_ORDER[j], and the weight is
-    (code - zero) * scale taken in fp16, transposed to torch's [out, in]."""
-    word = np.array([[sum((j + 1) << (4 * j) for j in range(8))]], np.uint32).view(np.int32)
-    zeros = np.array([[sum(1 << (4 * j) for j in range(8))]], np.uint32).view(np.int32)
-    tensors = {"m.qweight": word, "m.qzeros": zeros, "m.scales": np.full((1, 8), 0.1, np.float16)}
-    decoded = codecs.awq(4, 1).decode(tensors, "m.weight")
-    codes = np.empty(8)
-    codes[list(codecs.AWQ_ORDER)] = np.arange(1, 9)
-    expected = ((codes - 1).astype(np.float32) * np.float32(np.float16(0.1))).astype(np.float16)
-    np.testing.assert_array_equal(decoded, expected.astype(np.float32)[:, None])
+INTEGER_FIXTURE = Path(__file__).parent / "fixtures" / "codecs" / "integer.npz"
+"""tools/integer_codecs_reference.py's output: gptqmodel 7.5.0's and AutoAWQ
+0.2.9's own packing and dequantization."""
+
+GPTQ_CASES = [f"{bits}/{sym}/{order}" for bits in (2, 4, 8) for sym in ("asym", "sym")
+              for order in ("groups", "actorder")]
 
 
-def test_a_gptq_v1_zero_is_one_above_what_it_stores_and_its_groups_follow_g_idx():
-    """GPTQ packs eight inputs per word down each column; a v1 ('gptq')
-    checkpoint stores each zero one below itself, and g_idx puts each input
-    in its group, which act-order permutes."""
-    codes = np.array([[(i + c) % 16 for c in range(8)] for i in range(16)])  # [in, out]
-    stored_zeros = np.stack([np.arange(8), 14 - np.arange(8)])  # [groups, out]
-    scales = np.array([[0.5] * 8, [0.25] * 8], np.float16)
-    groups = np.array([1, 0] * 8, np.int32)
-    tensors = {"m.qweight": codecs._words(codes.T, 4).T, "m.qzeros": codecs._words(stored_zeros, 4),
-               "m.scales": scales, "m.g_idx": groups}
-    for v1, offset in ((True, 1), (False, 0)):
-        decoded = codecs.gptq(4, v1=v1).decode(tensors, "m.weight")
-        expected = (codes - (stored_zeros[groups] + offset)) * scales[groups].astype(np.float32)
-        np.testing.assert_array_equal(decoded, expected.T, err_msg=f"v1={v1}")
+@pytest.fixture(scope="module")
+def integer():
+    with np.load(INTEGER_FIXTURE) as loaded:
+        return dict(loaded)
 
 
-def integer_checkpoint(directory: Path, method: str) -> dict[str, np.ndarray]:
-    """qwen3-tiny's Linear weights as a 4-bit AWQ or GPTQ checkpoint in the
-    libraries' layout, groups of 16 inputs with per-group min/max grids."""
-    source = read_weights(FIXTURES / "qwen3-tiny")
-    stored: dict[str, np.ndarray] = {}
-    for name, weight in source.items():
-        if not re.search(r"(q|k|v|o|gate|up|down)_proj\.weight$", name):
-            stored[name] = weight
-            continue
-        w = np.asarray(weight, np.float32).T  # [in, out]
-        grouped = w.reshape(-1, 16, w.shape[1])
-        low, high = grouped.min(axis=1), grouped.max(axis=1)
-        scales = ((high - low) / 15).astype(np.float16)
-        zeros = np.clip(np.round(-low / scales.astype(np.float32)), 0, 15).astype(np.int32)
-        codes = np.clip(np.round(grouped / scales[:, None] + zeros[:, None]), 0, 15).astype(np.int32)
-        codes = codes.reshape(w.shape)
-        stem = name.removesuffix(".weight")
-        if method == "awq":
-            order = list(codecs.AWQ_ORDER)
-            def pack(values, *, order=order):
-                return codecs._words(
-                    values.reshape(values.shape[0], -1, 8)[..., order].reshape(values.shape), 4
-                )
+@pytest.mark.parametrize("group", [16, 32, 128])
+def test_awq_decodes_and_packs_as_autoawq_does(integer, group):
+    """AutoAWQ's `dequantize_gemm` of the words its `from_linear` packed is
+    Dew's decode, every fp16 value; and Dew packs the weight AutoAWQ was
+    given, against the same scales and zeros, into the same words."""
+    case = {part: integer[f"awq/{group}/{part}"] for part in ("qweight", "qzeros", "scales")}
+    tensors = {f"m.{part}": value for part, value in case.items()}
+    codec = codecs.awq(4, group, grid=tensors)
 
-            stored |= {
-                stem + ".qweight": pack(codes),
-                stem + ".qzeros": pack(zeros),
-                stem + ".scales": scales,
-            }
-        else:
-            stored |= {
-                stem + ".qweight": codecs._words(codes.T, 4).T,
-                stem + ".qzeros": codecs._words(zeros - 1, 4),
-                stem + ".scales": scales,
-                stem + ".g_idx": (np.arange(w.shape[0]) // 16).astype(np.int32),
-            }
+    np.testing.assert_array_equal(codec.decode(tensors, "m.weight"), integer[f"awq/{group}/dequantized"].T)
+    written = codec.encode("m.weight", integer[f"awq/{group}/weight"])
+    for part, value in tensors.items():
+        assert written[part].dtype == value.dtype and np.array_equal(written[part], value), part
+
+
+@pytest.mark.parametrize("case", GPTQ_CASES)
+@pytest.mark.parametrize("v1", [False, True], ids=["gptq_v2", "gptq"])
+def test_gptq_decodes_and_packs_as_gptqmodel_does(integer, case, v1):
+    """gptqmodel's `dequantize_weight` of the words its `pack_block` packed is
+    Dew's decode, every fp16 value, at 2, 4 and 8 bits, symmetric and
+    asymmetric, grouped and act-ordered; a v1 checkpoint's zeros are the
+    ones its `convert_gptq_v2_to_v1_format_module` writes, read back as its
+    v1-to-v2 conversion reads them. The asymmetric grids hold a zero of 0,
+    which v1 stores as -1 and borrows from the next zero's bits. Dew packs
+    the weight gptqmodel was given into the same words."""
+    def part(name):
+        return integer[f"gptq/{case}/{name}"]
+
+    if case.split("/")[1] == "asym":
+        assert part("grid_zeros").min() == 0 and part("grid_zeros").max() == (1 << int(case[0])) - 1
+    tensors = {"m.qweight": part("qweight"), "m.qzeros": part("qzeros_v1" if v1 else "qzeros"),
+               "m.scales": part("scales"), "m.g_idx": part("g_idx")}
+    codec = codecs.gptq(int(case.split("/")[0]), v1=v1, grid=tensors)
+
+    np.testing.assert_array_equal(codec.decode(tensors, "m.weight"),
+                                  part("dequantized_v1" if v1 else "dequantized").T)
+    written = codec.encode("m.weight", part("weight"))
+    for name, value in tensors.items():
+        assert written[name].dtype == value.dtype and np.array_equal(written[name], value), name
+
+
+def integer_checkpoint(directory: Path, method: str, integer) -> dict[str, np.ndarray]:
+    """qwen3-tiny as the 4-bit AWQ or GPTQ (v1) checkpoint AutoAWQ or
+    gptqmodel packed from it, groups of 16 inputs on per-group min/max
+    grids, its other tensors dense."""
+    prefix = f"checkpoint/{method}/"
+    stored = {name.removeprefix(prefix): value for name, value in integer.items() if name.startswith(prefix)}
+    stored |= {name: weight for name, weight in read_weights(FIXTURES / "qwen3-tiny").items()
+               if not re.search(r"(q|k|v|o|gate|up|down)_proj\.weight$", name)}
     config = json.loads((FIXTURES / "qwen3-tiny" / "config.json").read_text())
     config["quantization_config"] = ({"quant_method": "awq", "bits": 4, "group_size": 16, "version": "gemm",
                                       "zero_point": True} if method == "awq" else
@@ -603,12 +601,13 @@ def integer_checkpoint(directory: Path, method: str) -> dict[str, np.ndarray]:
 
 
 @pytest.mark.parametrize("method", ["awq", "gptq"])
-def test_an_integer_checkpoint_saves_back_its_own_bytes_and_refuses_a_value_off_its_grid(tmp_path, method):
-    """Loaded, an AWQ or GPTQ checkpoint runs on (code - zero) * scale; saved
-    untrained it writes every stored tensor back byte for byte. A trained
-    value its source grid cannot hold is refused: AutoAWQ's packing would
-    spill it into the neighbouring codes and gptqmodel's would clamp it."""
-    stored = integer_checkpoint(tmp_path / "source", method)
+def test_an_integer_checkpoint_saves_back_its_own_bytes_and_refuses_a_value_off_its_grid(
+        tmp_path, method, integer):
+    """Loaded, a checkpoint the library packed runs on (code - zero) * scale;
+    saved untrained it writes every stored tensor back byte for byte. A
+    trained value its source grid cannot hold is refused: AutoAWQ's packing
+    would spill it into the neighbouring codes and gptqmodel's would clamp it."""
+    stored = integer_checkpoint(tmp_path / "source", method, integer)
     loaded = Pretrained.load(tmp_path / "source", dtype="float32", attention_impl="reference")
     loaded.save(tmp_path / "export")
     written = read_weights(tmp_path / "export")

@@ -119,6 +119,22 @@
    ],
    "note": "Documented generation environment also uses Torch 2.8.0."
   },
+  "codecs/integer.npz": {
+   "tool": "tools/integer_codecs_reference.py",
+   "sources": [
+    {
+     "repo": "ModelCloud/GPTQModel",
+     "version": "7.5.0",
+     "runs": "gptqmodel"
+    },
+    {
+     "repo": "casper-hansen/AutoAWQ",
+     "version": "v0.2.9 (88e4c76b20755db275574e6a03c83c84ba3bece5)",
+     "runs": "fetched"
+    }
+   ],
+   "note": "gptqmodel pack_block/dequantize_weight/v1-v2 conversion imported; AutoAWQ's gemm files fetched at the commit, SHA-256 checked. Operands stored beside the outputs. Torch 2.14.0+cpu."
+  },
   "dc_ae.tar.xz": {
    "tool": "tools/diffusers_dc_ae_reference.py",
    "sources": [
