@@ -1114,6 +1114,7 @@ def main() -> None:
     write_siglip_tiny()
     write_llama4_vision_tiny()
     write_gemma4_vision_tiny()
+    write_gemma4_vision_tiny(head_dim=16, name="gemma4-vision-wide-tiny")
     write_qwen35_vision_tiny()
     write_gemma3_mm_tiny()
     write_llama4_mm_tiny()
