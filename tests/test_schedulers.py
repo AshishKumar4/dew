@@ -15,6 +15,7 @@ import pytest
 
 import dew.diffusion.schedules as schedulers
 from dew.diffusion import (
+    DirectPredictionTransform,
     EpsilonPredictionTransform,
     KarrasPredictionTransform,
     MinSNR,
@@ -266,14 +267,36 @@ def test_min_snr_v_weights_match_the_paper():
     assert jnp.allclose(process.weight(MIN_SNR_STEPS), expected, rtol=1e-5)
 
 
-def test_min_snr_karras_weights_match_the_paper():
-    """On the EDM preconditioning the x_0 error is c_out times the raw error,
-    so the x_0-space min-SNR weight divides by 1 / sigma_data^2 + SNR."""
-    process = Process(KarrasVENoiseScheduler(sigma_data=0.5), KarrasPredictionTransform(0.5),
-                      weighting=MinSNR(5.0))
-    snr = process.schedule.snr(CONTINUOUS_STEPS)
-    expected = jnp.minimum(snr, 5.0) / (1 / 0.5**2 + snr)
-    assert jnp.allclose(process.weight(CONTINUOUS_STEPS), expected, rtol=1e-5)
+@pytest.mark.parametrize("transform", [KarrasPredictionTransform(0.5),
+                                       KarrasPredictionTransform(0.5, velocity=True),
+                                       DirectPredictionTransform()],
+                         ids=["karras", "karras_velocity", "direct"])
+def test_min_snr_weights_the_same_clean_image_prediction_the_same_whatever_the_parameterization(transform):
+    """Min-SNR-gamma weights the x_0 loss by min(SNR, gamma), the
+    reference's START_X case (TiankaiHang/Min-SNR-Diffusion-Training
+    @5189997, guided_diffusion/gaussian_diffusion.py:881-884). The EDM
+    preconditioning computes its loss on the x_0 it reads out of the model,
+    as a direct x_0 prediction does, so two parameterizations whose outputs
+    read out the same clean image take the same weighted loss."""
+    schedule = KarrasVENoiseScheduler(sigma_data=0.5)
+    process = Process(schedule, transform, weighting=MinSNR(5.0))
+    x_0, epsilon = (jax.random.normal(key, (4, 3, 3, 1)) for key in jax.random.split(jax.random.key(0)))
+    estimate = x_0 + 0.1 * jax.random.normal(jax.random.key(1), x_0.shape)
+    rates = broadcast_rates(schedule, CONTINUOUS_STEPS, x_0)
+    x_t, _, target = transform.forward_diffusion(x_0, epsilon, rates)
+    # The raw output whose read-out is `estimate`: x_0 = c_skip x_t + c_out F.
+    sigma = rates[1]
+    c_out = sigma * 0.5 / jnp.sqrt(0.25 + sigma ** 2)
+    c_skip = 0.25 / (0.25 + sigma ** 2)
+    raw = ((estimate - c_skip * x_t) / c_out * (-1 if getattr(transform, "velocity", False) else 1)
+           if isinstance(transform, KarrasPredictionTransform) else estimate)
+    read = transform.pred_transform(x_t, raw, rates, CONTINUOUS_STEPS)
+    error = jnp.mean(jnp.square(read - target), axis=(1, 2, 3))
+    snr = schedule.snr(CONTINUOUS_STEPS)
+    np.testing.assert_allclose(process.weight(CONTINUOUS_STEPS), jnp.minimum(snr, 5.0), rtol=1e-5)
+    np.testing.assert_allclose(process.weight(CONTINUOUS_STEPS) * error,
+                               jnp.minimum(snr, 5.0) * jnp.mean(jnp.square(estimate - x_0), axis=(1, 2, 3)),
+                               rtol=1e-4)
 
 
 def test_min_snr_weights_are_capped_and_non_increasing_in_snr():
@@ -302,13 +325,15 @@ def test_the_schedule_weight_is_the_default():
 
 @pytest.mark.parametrize("preset, scale, ordinary", [
     (presets.Cosine, lambda snr: snr + 1, lambda snr: 1 / (snr + 1)),
-    (presets.EDM, lambda snr: snr + 4, lambda snr: snr + 4),
-    (presets.Karras, lambda snr: snr + 4, lambda snr: snr + 4),
+    (presets.EDM, jnp.ones_like, lambda snr: snr + 4),
+    (presets.Karras, jnp.ones_like, lambda snr: snr + 4),
     (presets.Flow, lambda snr: (1 + jnp.sqrt(snr)) ** 2, jnp.ones_like),
     (presets.Sqrt, jnp.ones_like, jnp.ones_like),
 ], ids=["cosine", "edm", "karras", "flow", "sqrt"])
 def test_preset_weights_the_training_schedule_with_min_snr(preset, scale, ordinary):
-    """The capped x_0 loss is converted to each preset's prediction space.
+    """The capped x_0 loss is converted to the space each preset computes its
+    loss in; the EDM preconditioning computes it on x_0, so it takes the cap
+    as is.
 
     Without the cap: P2 for cosine, EDM lambda for Karras preconditioning,
     and the unweighted velocity/x_0 loss for flow/square-root.
