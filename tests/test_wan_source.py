@@ -288,21 +288,21 @@ def test_a_trained_wan_step_exports_and_reloads(pipeline, walk, tmp_path):
         loss, _ = objective.loss(params, batch, fixed)
         return float(loss.total / loss.mass)
 
-    before = value(initial.params)
+    before = value(initial.variables)
     state, _, _, _, accepted = trainer.compile(initial, batch)(initial, batch)
     assert bool(accepted)
-    assert value(state.params) < before
-    assert not np.allclose(state.params["params"]["proj_out"]["kernel"],
-                           initial.params["params"]["proj_out"]["kernel"])
+    assert value(state.variables) < before
+    assert not np.allclose(state.variables["params"]["proj_out"]["kernel"],
+                           initial.variables["params"]["proj_out"]["kernel"])
     for held in ("encoders", "autoencoder"):
-        for got, want in zip(jax.tree.leaves(state.params[held]), jax.tree.leaves(initial.params[held]),
+        for got, want in zip(jax.tree.leaves(state.variables[held]), jax.tree.leaves(initial.variables[held]),
                              strict=True):
             np.testing.assert_array_equal(got, want)
 
-    pipeline.save(tmp_path / "export", variables=state.params)
+    pipeline.save(tmp_path / "export", variables=state.variables)
     reloaded = Pretrained.load(str(tmp_path / "export"), dtype="float32", attention_impl="xla")
     assert reloaded.inputs.sample.shape == pipeline.inputs.sample.shape
-    assert value(reloaded.variables) == value(state.params)
+    assert value(reloaded.variables) == value(state.variables)
 
 
 def test_a_wan_lora_starts_as_the_source_and_trains_its_factors_alone(pipeline, walk):
@@ -331,10 +331,10 @@ def test_a_wan_lora_starts_as_the_source_and_trains_its_factors_alone(pipeline, 
     initial = trainer.initial_state()
     state, _, _, _, accepted = trainer.compile(initial, batch)(initial, batch)
     assert bool(accepted)
-    factors = jax.tree_util.tree_leaves_with_path(state.params["params"])
+    factors = jax.tree_util.tree_leaves_with_path(state.variables["params"])
     assert factors and all(path[-1].key in ("lora_A", "lora_B") for path, _ in factors)
     assert all(bool(jnp.any(leaf)) for path, leaf in factors if path[-1].key == "lora_B")
     for collection in (FROZEN, "encoders", "autoencoder"):
-        for before, after in zip(jax.tree.leaves(initial.params[collection]),
-                                 jax.tree.leaves(state.params[collection]), strict=True):
+        for before, after in zip(jax.tree.leaves(initial.variables[collection]),
+                                 jax.tree.leaves(state.variables[collection]), strict=True):
             np.testing.assert_array_equal(np.asarray(before), np.asarray(after), err_msg=collection)

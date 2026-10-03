@@ -48,9 +48,6 @@ dependencies = [
     "tyro",
     "typing_extensions>=4.14",
     "transformers>=5.16.1",
-    # A Wan pipeline's prompts are cleaned with it, as the source cleans them
-    # (dew.inputs.diffusion.wan_prompt); pure Python, with wcwidth its one dependency.
-    "ftfy",
     "jinja2",
     "filelock",
     "huggingface_hub",
@@ -95,6 +92,8 @@ test = [
     "wandb",
     # The committed VAE fixture was generated with this reference release.
     "diffusers==0.34.0",
+    # tests/test_wan_source.py cleans prompts as Wan's pipelines do (the wan extra).
+    "ftfy",
     # Every decoder and MoE parity number is calibrated against this exact
     # release: the fixtures record it (tests/fixtures/hf/*/meta.json), the
     # tests cite its line numbers, and a resolve that moved it would compare
@@ -157,6 +156,9 @@ torch = ["torch"]
 # Original-format single-file diffusion checkpoints (Pretrained.load(..., single_file=)):
 # diffusers' own key maps, which are written in torch, convert them once.
 diffusers = ["diffusers>=0.34.0", "torch"]
+# Wan 2.1's pipelines clean every prompt with ftfy before UMT5 reads it, and so
+# does dew.inputs.diffusion.wan_prompt.
+wan = ["ftfy"]
 # GGUF files (Pretrained.load(..., gguf_file=)): llama.cpp's reader and block dequantizers.
 gguf = ["gguf==0.19.0"]
 # Official client transports and native request/result schemas; no model runtime.

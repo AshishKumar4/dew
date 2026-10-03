@@ -231,4 +231,4 @@ class WanTransformer(nn.Module):
                                 "b f h w pf ph pw c -> b (f pf) (h ph) (w pw) c")
 
 
-__all__ = ["WanAttention", "WanBlock", "WanTransformer", "wan_rotation"]
+__all__ = ["WanAttention", "WanBlock", "WanTransformer"]
