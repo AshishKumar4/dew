@@ -164,17 +164,17 @@ def test_from_run_restores_the_averaged_weights_by_default(tmp_path):
 
     pipe = TextToImage.from_run(str(tmp_path))
     for expected, loaded in zip(jax.tree.leaves(averaged["params"]),
-                                jax.tree.leaves(pipe.params["params"]), strict=True):
+                                jax.tree.leaves(pipe.variables["params"]), strict=True):
         np.testing.assert_allclose(np.asarray(loaded), np.asarray(expected))
     live = TextToImage.from_run(str(tmp_path), ema=False)
     for expected, loaded in zip(jax.tree.leaves(state.variables["params"]),
-                                jax.tree.leaves(live.params["params"]), strict=True):
+                                jax.tree.leaves(live.variables["params"]), strict=True):
         np.testing.assert_allclose(np.asarray(loaded), np.asarray(expected))
     assert not all(np.allclose(np.asarray(a), np.asarray(b)) for a, b in zip(
-        jax.tree.leaves(pipe.params["params"]), jax.tree.leaves(live.params["params"]), strict=True))
+        jax.tree.leaves(pipe.variables["params"]), jax.tree.leaves(live.variables["params"]), strict=True))
     # the frozen encoder's table is the run's, not something re-drawn
     np.testing.assert_array_equal(
-        np.asarray(pipe.params["encoders"]["textcontext"]["table"]),
+        np.asarray(pipe.variables["encoders"]["textcontext"]["table"]),
         np.asarray(objective.inputs.conditions["textcontext"].encoder.params["table"]))
 
 
@@ -229,7 +229,7 @@ def test_sampler_and_guidance_are_call_arguments(tmp_path):
     branches to differ; then guidance is visible in the sample."""
     make_run(tmp_path)
     loaded = TextToImage.from_run(str(tmp_path))
-    pipe = dataclasses.replace(loaded, params=jax.tree.map(lambda leaf: leaf + 0.05, loaded.params))
+    pipe = dataclasses.replace(loaded, variables=jax.tree.map(lambda leaf: leaf + 0.05, loaded.variables))
     key = jax.random.PRNGKey(1)
     plain = pipe(["x"], steps=8, guidance=None, solver=Heun(), key=key).host().images
     guided = (
@@ -429,10 +429,10 @@ def test_objective_pipeline_binds_the_trained_state_in_place(tmp_path):
     pipe = objective.pipeline(state)
     assert isinstance(pipe, TextToImage)
     assert (pipe.steps, pipe.guidance, pipe.solver) == (objective.steps, objective.guidance, objective.solver)
-    for expected, bound in zip(jax.tree.leaves(state.averaged), jax.tree.leaves(pipe.params), strict=True):
+    for expected, bound in zip(jax.tree.leaves(state.averaged), jax.tree.leaves(pipe.variables), strict=True):
         assert bound is expected
     live = objective.pipeline(state, ema=False)
-    for expected, bound in zip(jax.tree.leaves(state.variables), jax.tree.leaves(live.params), strict=True):
+    for expected, bound in zip(jax.tree.leaves(state.variables), jax.tree.leaves(live.variables), strict=True):
         assert bound is expected
     drawn = pipe(["a", "b"], key=4).host().images
     assert drawn.shape == (2, RES, RES, 3)
@@ -800,7 +800,7 @@ def test_saved_diffusion_precision_reconstructs_owners_without_source_weights(
 
     expected_params = jax.tree_util.tree_map_with_path(expected_leaf, merged)
     for expected, actual in zip(
-        jax.tree.leaves(expected_params), jax.tree.leaves(restored.params), strict=True
+        jax.tree.leaves(expected_params), jax.tree.leaves(restored.variables), strict=True
     ):
         assert actual.dtype == expected.dtype
         np.testing.assert_array_equal(actual, expected)
@@ -836,13 +836,13 @@ def test_saved_diffusion_precision_reconstructs_owners_without_source_weights(
                                   reference(["a red bird"], steps=2, key=5).host().images)
     owned = restored.inputs.conditions["textcontext"].encoder.params
     for owner_leaf, bound_leaf in zip(
-        jax.tree.leaves(owned), jax.tree.leaves(restored.params["encoders"]["textcontext"]), strict=True
+        jax.tree.leaves(owned), jax.tree.leaves(restored.variables["encoders"]["textcontext"]), strict=True
     ):
         assert owner_leaf.dtype == bound_leaf.dtype and owner_leaf.sharding == bound_leaf.sharding
         np.testing.assert_array_equal(owner_leaf, bound_leaf)
     assert isinstance(restored.autoencoder, StableDiffusionVAE)
     for owner_leaf, bound_leaf in zip(jax.tree.leaves(restored.autoencoder.params),
-                                      jax.tree.leaves(restored.params["autoencoder"]), strict=True):
+                                      jax.tree.leaves(restored.variables["autoencoder"]), strict=True):
         assert owner_leaf.dtype == bound_leaf.dtype and owner_leaf.sharding == bound_leaf.sharding
         np.testing.assert_array_equal(owner_leaf, bound_leaf)
 
@@ -901,7 +901,7 @@ def test_saved_bare_encoder_weights_follow_storage_without_changing_compute(tmp_
     assert isinstance(encoder, CharTable)
     stored = merge(state.variables, state.ema)
     expected_vars = jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16), stored)
-    table = restored.params["encoders"]["textcontext"]["table"]
+    table = restored.variables["encoders"]["textcontext"]["table"]
     assert table.dtype == jnp.bfloat16
     assert encoder.params["table"].dtype == table.dtype
     np.testing.assert_array_equal(encoder.params["table"], table)
@@ -994,11 +994,11 @@ def test_binding_new_encoder_weights_recomputes_the_warmed_blank(tmp_path):
     assert restored.blank is not None
     old_blank = restored.blank(old.conditions)
 
-    denoiser_update = {**restored.params, "params": jax.tree.map(lambda value: value + 0.03125,
-                                                             restored.params["params"])}
+    denoiser_update = {**restored.variables, "params": jax.tree.map(lambda value: value + 0.03125,
+                                                             restored.variables["params"])}
     assert restored.bind(denoiser_update).blank is restored.blank
-    encoders = jax.tree.map(lambda value: value + 0.03125, restored.params["encoders"])
-    changed = {**restored.params, "encoders": encoders}
+    encoders = jax.tree.map(lambda value: value + 0.03125, restored.variables["encoders"])
+    changed = {**restored.variables, "encoders": encoders}
     rebound = restored.bind(changed)
     fresh_objective = config.build(variables=changed)
     fresh = TextToImage.from_objective(fresh_objective, changed)

@@ -146,9 +146,9 @@ def test_weights_only_best_is_smaller_and_not_a_resume_state(tmp_path):
             metrics=[metric], best=Best(metric, weights_only=True))
     assert run.checkpoints.best == 1
     assert run.checkpoints.latest == 4
-    assert set(run.checkpoints.stored('best')) == {'params', 'ema'}
+    assert set(run.checkpoints.stored('best')) == {'variables', 'ema'}
     saved, _ = run.checkpoints.restore(None, 'best')
-    assert set(saved) == {'params', 'ema'}
+    assert set(saved) == {'variables', 'ema'}
     with pytest.raises(ValueError, match='inference-only'):
         run.checkpoints.restore(run.initial_state(), 'best')
     with pytest.raises(ValueError, match='requires full'):

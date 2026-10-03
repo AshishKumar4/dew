@@ -304,7 +304,7 @@ def test_the_rollout_batch_feeds_the_objective():
         TRUTH_KEY: np.stack([pad("1"), pad("2")]),
         INFO_KEY: np.stack([pad(""), pad("")]),
     }
-    state = SimpleNamespace(params=params, updates=0)
+    state = SimpleNamespace(variables=params, updates=0)
     rollout = SampledRollout(objective, lambda *args: 1.0, groups=2,
                              max_new_tokens=RESPONSE_WIDTH, sampling=Sampling(temperature=0.0))
     rolled = rollout(state, batch, jax.random.key(1))
@@ -323,7 +323,7 @@ def test_a_rollout_after_the_first_reuses_its_programs_and_reads_only_what_it_sc
     advantages by name and nothing else (`steady_state`). The prompts reach
     the device as each batch arrives, so only reads are held."""
     objective = GRPOObjective(TinyHead(vocab_size=VOCAB), PROMPT_WIDTH + RESPONSE_WIDTH - 1, beta=0.01)
-    state = SimpleNamespace(params=objective.init(jax.random.key(0)), updates=0)
+    state = SimpleNamespace(variables=objective.init(jax.random.key(0)), updates=0)
     rollout = SampledRollout(objective, lambda *args: float(len(args[0]) % 3), groups=2,
                              max_new_tokens=RESPONSE_WIDTH, sampling=Sampling(temperature=1.0))
     info = len("other")

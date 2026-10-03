@@ -160,7 +160,7 @@ def test_real_trainer_update_and_checkpoint_resume(source, tmp_path):
                       checkpoints=Checkpoints(str(tmp_path / "run"))).fit(
                           data, steps=2, checkpoint_every=1, log_every=1)
     direct = Trainer(obj, optax.sgd(0.001), key=run_key).fit(data, steps=2, log_every=1)
-    assert_tree_close(resumed.variables, direct.params, 0)
+    assert_tree_close(resumed.variables, direct.variables, 0)
     assert int(resumed.updates) == 2
 
 
@@ -302,7 +302,7 @@ def test_image_sft_trainer_resume_publish_and_generate(image_source, tmp_path):
                       checkpoints=Checkpoints(str(tmp_path / "run"))).fit(
                           data, steps=2, checkpoint_every=1, log_every=1)
     direct = Trainer(obj, optax.sgd(0.001), key=run_key).fit(data, steps=2, log_every=1)
-    assert_tree_close(resumed.variables, direct.params, 0)
+    assert_tree_close(resumed.variables, direct.variables, 0)
     assert_tree_close(resumed.opt_state, direct.opt_state, 0)
     assert int(resumed.updates) == 2
 
