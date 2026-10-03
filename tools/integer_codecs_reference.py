@@ -91,7 +91,11 @@ def autoawq():
         sys.modules[name] = module
         spec.loader.exec_module(module)
         loaded[name] = module
-    return loaded["awq.utils.packing_utils"], loaded["awq.modules.linear.gemm"]
+    gemm = loaded["awq.modules.linear.gemm"]
+    if gemm.awq_ext is not None or gemm.TRITON_AVAILABLE:
+        raise RuntimeError("AutoAWQ found its CUDA or triton kernels; the fixture records its torch "
+                           "path only")
+    return loaded["awq.utils.packing_utils"], gemm
 
 
 def grid(rng, out: int, groups: int, bits: int, *, sym: bool):
