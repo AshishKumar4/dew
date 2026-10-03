@@ -3,6 +3,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import pytest
 
 from dew.checkpoints import _filled
 from dew.nn.kernels.generation import device_generation
@@ -51,18 +52,20 @@ def test_a_scan_copies_its_stacked_layers_not_its_constants():
     assert paths == {("stacked",): jnp.dtype(jnp.bfloat16)}
 
 
-def _trained(monkeypatch, generations, optimizer, steps=3):
+def _trained(monkeypatch, generations, optimizer, steps=3, mesh=None):
     """A tied bf16 decoder over fp32 parameters, trained `steps` steps on
-    one batch, with copies on the generations named."""
+    one batch, with copies on the generations named, on `mesh` with every
+    parameter split where it divides."""
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import TEXT_KEY, LMObjective
-    from dew.training import Trainer
+    from dew.training import Layout, MeshSpec, Trainer
 
     monkeypatch.setattr(trainer_module, "NARROW_COPY_GENERATIONS", frozenset(generations))
     model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=2, num_heads=2, num_kv_heads=1,
                               mlp="swiglu", mlp_features=64, max_seq_len=16, qk_norm=True,
                               tie_embeddings=True, dtype=jnp.bfloat16)
-    trainer = Trainer(LMObjective(model, seq_len=8), optimizer, key=jax.random.key(0))
+    trainer = Trainer(LMObjective(model, seq_len=8), optimizer, key=jax.random.key(0),
+                      mesh=mesh or MeshSpec(), layout=Layout(min_shard=1, tolerance=1.0))
     state = trainer.initial_state()
     batch = {TEXT_KEY: jnp.asarray(np.random.default_rng(0).integers(0, 64, (8, 9)), jnp.int32)}
     step = trainer.compile(state, batch)
@@ -73,14 +76,22 @@ def _trained(monkeypatch, generations, optimizer, steps=3):
     return state, losses
 
 
-def test_the_tied_decoder_reads_its_kernels_through_copies_with_the_same_gradients(monkeypatch):
+@pytest.mark.parametrize("fsdp", [1, pytest.param(2, marks=pytest.mark.mesh(devices=2)),
+                                  pytest.param(8, marks=pytest.mark.mesh(devices=8))])
+def test_the_tied_decoder_reads_its_kernels_through_copies_with_the_same_gradients(monkeypatch, fsdp):
     """Through the trainer, a tied decoder's projection kernels are read
     through bf16 copies and its tied table and norm scales are not. Under
     plain SGD, whose update reads the gradient once, every parameter after
     three steps is bitwise what the in-forward cast gives: the copies
-    change no gradient, and the tied table's two uses still sum in fp32."""
-    narrow, losses = _trained(monkeypatch, {device_generation()}, optax.sgd(0.5))
-    plain, plain_losses = _trained(monkeypatch, set(), optax.sgd(0.5))
+    change no gradient, and the tied table's two uses still sum in fp32.
+    So too where the batch is split over data-parallel devices, whose
+    gradients are summed across them, and where every parameter is split
+    over fsdp devices too (the lane's eight: data 8, data 4 x fsdp 2, fsdp 8)."""
+    from dew.training import MeshSpec
+
+    mesh = MeshSpec(fsdp=fsdp)
+    narrow, losses = _trained(monkeypatch, {device_generation()}, optax.sgd(0.5), mesh=mesh)
+    plain, plain_losses = _trained(monkeypatch, set(), optax.sgd(0.5), mesh=mesh)
     paths = {tuple(key.key for key in path)[1:]: leaf.dtype
              for path, leaf in jax.tree_util.tree_flatten_with_path(narrow.compute)[0]}
     names = {"/".join(path) for path in paths}
