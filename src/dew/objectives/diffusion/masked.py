@@ -105,8 +105,10 @@ class MaskedDiffusionObjective(Objective[Ratio]):
     def inference_record(self):
         from dew.config import ModelConfig, _to_json
         from dew.registry import objectives
-        model = ModelConfig.from_model(self.model)
-        return {'objective': objectives.name_of(type(self)), 'model': _to_json(model, ModelConfig),
+        if not any(member is type(self) for member in objectives.values()):
+            return None
+        model = _to_json(ModelConfig.from_model(self.model), ModelConfig)
+        return {'objective': objectives.name_of(type(self)), 'model': model,
                 'seq_len': self.seq_len, 'sample_tokens': self.seq_len, 'tokenizer': None,
                 'process': self.process.to_json(), 'solver': _to_json(self.solver, type(self.solver)),
                 'sampling_steps': self.steps}

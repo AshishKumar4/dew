@@ -66,6 +66,28 @@ This is the output with stdout piped to a file; on a terminal, `fit` draws the s
 
 A model is a `flax.linen.Module` with `init` and `apply`. Its variables are a nested dictionary of arrays, and it has no knowledge of training. Build one from its class, `from dew.nn.backbones import CausalTransformer`. Each class is also registered under a name (`causal_transformer`), which is how recipes and saved runs rebuild a model from a configuration file.
 
+Your own model registers with one line, and its constructor fields are then its record:
+
+```python
+import flax.linen as nn
+
+from dew.registry import models
+
+
+@models("residual_mlp")
+class ResidualMLP(nn.Module):
+    """A denoiser `DiffusionObjective` can train: it maps a noisy sample, the
+    noise level's embedding and optional text context to its prediction."""
+
+    features: int = 64
+
+    @nn.compact
+    def __call__(self, x, temb, textcontext=None, train=False):
+        return x + nn.Dense(x.shape[-1])(nn.gelu(nn.Dense(self.features)(x)))
+```
+
+Every checkpoint a run of it writes records `"architecture": "residual_mlp"` and `"config": {"features": 64}`, from which `TextToImage.from_run` and `dew.pipeline` rebuild the model; a decoder's run loads the same way through `TextGeneration.from_run` and `Pretrained.from_run`. A composite model records each registered part inside its own record, and an adapted model records its base model with the adapter's rank, alpha and modules. Registration is only needed to load a run by its record: an unregistered model trains, checkpoints and resumes the same, its run records it under its class name in lower case, and loading that run names the line that registers it, after which the same run loads.
+
 Dew's modules name the logical axes of their parameters, such as `embed`, `heads` and `mlp`. The trainer maps those names onto the device mesh, so the model code does not change when the mesh does. [Distributed training](concepts/distributed.md) describes the mapping.
 
 ## Objective

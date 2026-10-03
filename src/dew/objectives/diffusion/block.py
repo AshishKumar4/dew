@@ -200,15 +200,19 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         from dew.diffusion.block import BlockProcess
         from dew.interop.hf_decoders import _export_config
         from dew.registry import objectives
-        if self.model.conditioner is not None:
-            raise TypeError("multimodal block training needs an explicit inference record declaration")
-        model = ModelConfig.from_model(self.model)
-        config = {'model_type': 'diffusion_gemma', 'text_config': _export_config(self.model.text),
-                  'canvas_length': self.canvas_size}
-        return {'objective': objectives.name_of(type(self)), 'model': _to_json(model, ModelConfig),
+        if not any(member is type(self) for member in objectives.values()):
+            return None
+        # The published text-only layout a trained model exports to; a model
+        # with a vision conditioner has none, and loads back as a task only.
+        export = None if self.model.conditioner is not None else {
+            'config': {'model_type': 'diffusion_gemma', 'text_config': _export_config(self.model.text),
+                       'canvas_length': self.canvas_size},
+            'generation_config': {}}
+        model = _to_json(ModelConfig.from_model(self.model), ModelConfig)
+        return {'objective': objectives.name_of(type(self)), 'model': model,
                 'seq_len': self.sequence_length, 'sample_tokens': self.canvas_size, 'tokenizer': None,
                 'process': BlockProcess(self.canvas_size, self.model.vocab_size).to_json(),
-                'diffusion_gemma': {'config': config, 'generation_config': {}}}
+                'diffusion_gemma': export}
 
     def pipeline(self, state: TrainState, *, ema: bool | None = None,
                  processor: Processor | None = None) -> BlockGeneration:
