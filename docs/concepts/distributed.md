@@ -90,7 +90,7 @@ Modules declare logical axes such as `embed`, `mlp`, `heads`, `kv`, `vocab` and 
 | `rules` | `DEFAULT_RULES` | Logical axis name to mesh axes, in precedence order |
 | `min_shard` | `2 ** 16` | Parameters with fewer elements stay replicated |
 | `tolerance` | `0.02` | The fraction of shardable parameter elements that may stay replicated before `Layout.check` raises |
-| `host` | `()` | Train-state fields kept in pinned host memory between steps: `"opt_state"`, `"ema"`, or `"params"` for a CPU-owned step |
+| `host` | `()` | Train-state fields kept in pinned host memory between steps: `"opt_state"`, `"ema"`, or `"variables"` for a CPU-owned step |
 | `host_parameters` | `()` | Globs of variables an inference placement keeps in pinned host memory |
 
 A parameter whose path no module declares is split on its largest dimension that divides the `fsdp` size. `Layout.check` raises `LayoutRefused` when more than `tolerance` of the shardable elements stay replicated, and lists the largest replicated parameters; raising `tolerance` hides the problem rather than fixing the placement. A rule that puts a parameter on `data`, `sequence` or `stage` is refused.
