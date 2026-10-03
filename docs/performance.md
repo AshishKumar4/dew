@@ -210,10 +210,30 @@ pixel's dilation-d taps are its neighbours in the grid of pixels sharing
 its row and column residues mod d, so the convolution now runs as cuDNN's
 dilation-1 kernel over the d^2 interleaved grids: forward and VJP 0.097 ms
 (dilation 2) and 0.089 ms (dilation 3) against 0.31 and 0.33, and the step
-75.30 to 70.17 ms. In fp32, where cuDNN's depthwise kernels are slower,
-the step goes from 109.70 to 113.68 ms; the published config trains in
-bf16. At HIGHEST precision the fp32 output and input gradient equal lax's
-dilated convolution's exactly.
+75.30 to 70.17 ms. At HIGHEST precision the fp32 output and input
+gradient equal lax's dilated convolution's exactly.
+
+In fp32 that form made the step slower (109.70 to 113.68 ms), so CUDA now
+picks by dtype: polyphase in bf16, and in fp32 the nine shifted products
+with fp32 input, kernel and output held in memory, the form before it. In
+fp32 cuDNN runs the polyphase convolutions with its grouped direct kernels
+(forward, input and filter gradient): 3.8 ms of the 5.2 ms a batch-16 step
+spent in the dilated layers, with 1.3 ms more in the interleaving
+transposes. The step at integration `f6047cf9` against the change, RTX
+4080, fixed batch, two alternating rounds:
+
+| dtype | batch | polyphase (before) | by dtype (after) |
+|---|---:|---:|---:|
+| fp32 | 16 | 105.87 / 105.77 | 101.57 / 101.54 |
+| fp32 | 32 | 265.81 / 265.18 | 254.71 / 254.50 |
+| bf16 | 16 | 60.13 / 60.08 | 60.12 / 60.09 |
+| bf16 | 32 | 100.68 / 100.60 | 100.69 / 100.62 |
+
+fp32 is 4.0% faster at batch 16 and 4.1% at 32; bf16 is the same program,
+with the same losses to the bit. The fp32 losses move in the 8th digit
+(0.56920904 to 0.56920898 at batch 16), within the forms' fp32 bound
+(tests/test_depthwise_conv.py). In bf16 the shifted form would cost 65.4
+and 107.0 ms. The A100 has no fp32 row for either form.
 
 The S5 layer ran its recurrence as `associative_scan` over complex
 states, whose backward spent 4.5 ms of the 4080's step in complex

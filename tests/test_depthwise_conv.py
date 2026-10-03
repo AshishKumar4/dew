@@ -9,7 +9,13 @@ import pytest
 from flax import linen as nn
 from reference_error import assert_fp32_reduction_bound
 
-from dew.nn.conv import Conv, _conv_general_dilated, _polyphase_depthwise_3x3, _shifted_depthwise_3x3
+from dew.nn.conv import (
+    Conv,
+    _conv_general_dilated,
+    _materialized_depthwise_3x3,
+    _polyphase_depthwise_3x3,
+    _shifted_depthwise_3x3,
+)
 from dew.nn.ssm import SpatialFusionConv
 
 
@@ -20,7 +26,8 @@ def convolve(x, kernel, dilation):
         precision=jax.lax.Precision.HIGHEST)
 
 
-@pytest.mark.parametrize('operation', [_polyphase_depthwise_3x3, _shifted_depthwise_3x3])
+@pytest.mark.parametrize('operation', [_polyphase_depthwise_3x3, _shifted_depthwise_3x3,
+                                       _materialized_depthwise_3x3])
 @pytest.mark.parametrize('dilation', [1, 2, 3])
 def test_depthwise_forward_and_gradients_keep_every_term_with_fp32_rounding(dilation, operation):
     """Two reductions differ by at most twice gamma_n times sum(abs(products)).
@@ -61,7 +68,8 @@ def test_depthwise_forward_and_gradients_keep_every_term_with_fp32_rounding(dila
     assert_fp32_reduction_bound(actual_loss, expected_loss, loss_magnitude, terms)
 
 
-@pytest.mark.parametrize('operation', [_polyphase_depthwise_3x3, _shifted_depthwise_3x3])
+@pytest.mark.parametrize('operation', [_polyphase_depthwise_3x3, _shifted_depthwise_3x3,
+                                       _materialized_depthwise_3x3])
 @pytest.mark.parametrize('dilation', [1, 2, 3])
 def test_bf16_depthwise_accumulates_before_rounding(dilation, operation):
     """Rounding each add to bf16 loses eight half-ulp terms at an interior pixel."""
@@ -79,6 +87,33 @@ def test_bf16_depthwise_accumulates_before_rounding(dilation, operation):
         np.testing.assert_array_equal(lhs, rhs)
     assert float(actual[0][0, dilation, dilation, 0]) == 1.03125
     assert float(actual[1][0, dilation, dilation, 0]) == 1.03125
+
+
+@pytest.mark.parametrize('dtype, dilation, form', [
+    (jnp.bfloat16, 2, 'polyphase'), (jnp.bfloat16, 3, 'polyphase'),
+    (jnp.float32, 2, 'shifted'), (jnp.float32, 3, 'shifted'),
+    (jnp.float32, 1, 'convolution'), (jnp.bfloat16, 1, 'convolution')])
+def test_cuda_takes_the_dilated_depthwise_form_measured_faster_for_its_dtype(dtype, dilation, form):
+    """On CUDA a dilated depthwise 3x3 convolution runs as the polyphase
+    convolution in bf16 and as nine shifted products in fp32, the forms the
+    hybrid DiT's step ran fastest in for each dtype on an RTX 4080; an
+    undilated one is the convolution. Read off the CUDA lowering: the
+    polyphase form convolves the dilation^2 grids along the batch, undilated,
+    and the shifted one convolves nothing."""
+    batch = 2
+    x = jnp.zeros((batch, 12, 12, 32), dtype)
+    kernel = jnp.zeros((3, 3, 1, 32), dtype)
+    shared = jax.jit(lambda x, kernel: _conv_general_dilated(
+        x, kernel, (1, 1), 'SAME', rhs_dilation=(dilation, dilation),
+        dimension_numbers=('NHWC', 'HWIO', 'NHWC'), feature_group_count=32))
+    text = shared.trace(x, kernel).lower(lowering_platforms=('cuda',)).as_text()
+    convolutions = [line for line in text.splitlines() if 'stablehlo.convolution' in line]
+    if form == 'shifted':
+        assert not convolutions
+    else:
+        assert len(convolutions) == 1
+        grids = batch * dilation ** 2 if form == 'polyphase' else batch
+        assert f'tensor<{grids}x' in convolutions[0], convolutions[0]
 
 
 @pytest.mark.skipif(jax.default_backend() != "cpu", reason="the shifted sum is the CPU's path")
@@ -156,7 +191,8 @@ def test_spatial_fusion_keeps_its_checkpoint_and_residual_add_order():
     assert_fp32_reduction_bound(actual, expected, magnitude, 28)
 
 
-def test_depthwise_boundaries_preserve_forward_and_higher_order_derivatives():
+@pytest.mark.parametrize('operation', [_polyphase_depthwise_3x3, _materialized_depthwise_3x3])
+def test_depthwise_boundaries_preserve_forward_and_higher_order_derivatives(operation):
     rng = np.random.default_rng(5)
     x = jnp.asarray(rng.normal(size=(1, 5, 6, 3)).astype(np.float32))
     kernel = jnp.asarray(rng.normal(size=(3, 3, 1, 3)).astype(np.float32))
@@ -170,7 +206,7 @@ def test_depthwise_boundaries_preserve_forward_and_higher_order_derivatives():
                 jax.jvp(jax.grad(loss, argnums=(0, 1)), (x, kernel), (dx, dw)))
 
     expected = jax.jit(partial(derivatives, partial(convolve, dilation=2)))(x, kernel, dx, dw)
-    actual = jax.jit(partial(derivatives, partial(_polyphase_depthwise_3x3, dilation=2)))(x, kernel, dx, dw)
+    actual = jax.jit(partial(derivatives, partial(operation, dilation=2)))(x, kernel, dx, dw)
     for lhs, rhs in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
         np.testing.assert_allclose(lhs, rhs, rtol=4e-6, atol=2e-5)
 

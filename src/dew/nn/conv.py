@@ -159,6 +159,37 @@ def _shifted_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -> jax
     return total.astype(lhs.dtype)
 
 
+def _materialized_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -> jax.Array:
+    """The depthwise convolution as its nine shifted products in fp32, with
+    its fp32 input, kernel and output held in memory (`_barrier`, in the
+    cotangents too), so XLA fuses the products and their weight reductions
+    into kernels of their own rather than into a neighbour's.
+
+    CUDA runs a dilated one in this form in fp32 and in the polyphase form
+    in bf16: the 176M hybrid DiT's training step on an RTX 4080, ms, with
+    each form for its dilation-2 and -3 layers (docs/performance.md):
+
+        dtype   batch   polyphase   this form
+        bf16      16       60.1        65.4
+        bf16      32      100.6       107.0
+        fp32      16      105.9       101.6
+        fp32      32      265.6       254.5
+
+    In fp32 cuDNN runs the polyphase convolutions with its grouped direct
+    kernels, 3.8 ms of the 5.2 ms a b16 step spent in those layers, and the
+    interleaving transposes 1.3 ms more."""
+    height, width = lhs.shape[1:3]
+    border = ((0, 0), (dilation, dilation), (dilation, dilation), (0, 0))
+    padded = jnp.pad(_barrier(lhs.astype(jnp.float32)), border)
+    kernel = _barrier(rhs.astype(jnp.float32))
+    output = jnp.zeros(lhs.shape, jnp.float32)
+    for row in range(3):
+        for column in range(3):
+            top, left = row * dilation, column * dilation
+            output = output + padded[:, top:top + height, left:left + width, :] * kernel[row, column, 0, :]
+    return _barrier(output).astype(lhs.dtype)
+
+
 def _conv_general_dilated(
         lhs: jax.Array, rhs: jax.Array, window_strides: Sequence[int],
         padding: str | Sequence[tuple[int, int]], lhs_dilation: Sequence[int] | None = None,
@@ -186,9 +217,12 @@ def _conv_general_dilated(
             and lhs.dtype == rhs.dtype and lhs.dtype in (jnp.float32, jnp.bfloat16)
             and jax.lax.conv_dimension_numbers(lhs.shape, rhs.shape, dimension_numbers)
             == jax.lax.ConvDimensionNumbers((0, 3, 1, 2), (3, 2, 0, 1), (0, 3, 1, 2))):
+        # A dilated one on CUDA takes the form measured faster for its dtype
+        # (`_materialized_depthwise_3x3`).
+        dilated = _polyphase_depthwise_3x3 if lhs.dtype == jnp.bfloat16 else _materialized_depthwise_3x3
         return jax.lax.platform_dependent(
             lhs, rhs,
-            cuda=convolve if dilation[0] == 1 else lambda x, w: _polyphase_depthwise_3x3(x, w, dilation[0]),
+            cuda=convolve if dilation[0] == 1 else lambda x, w: dilated(x, w, dilation[0]),
             cpu=((lambda x, w: _shifted_depthwise_3x3(x, w, dilation[0]))
                  if feature_group_count > 16 else convolve),
             default=convolve)
