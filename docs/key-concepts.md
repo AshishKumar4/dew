@@ -119,6 +119,17 @@ The built-in readers, such as `TokenWindows` for tokenized text and `HFImages` f
 
 The same call runs on one device or many. `Trainer(..., mesh=MeshSpec(fsdp=4))` shards the parameters and optimizer state over four devices; the objective, the model and the data do not change.
 
+The trainer logs the loss, the objective's metrics and an injected learning rate, but not the gradient norm, which would be one more reduction over every gradient each step. To track it, chain a transformation that keeps the norm in the optimizer state and read `state.opt_state[0]` after `fit`. Next to `clip_by_global_norm`, XLA computes the norm once for both, so it costs nothing:
+
+```python
+import jax.numpy as jnp
+import optax
+
+record_norm = optax.GradientTransformation(
+    lambda params: jnp.zeros(()), lambda updates, state, params=None: (updates, optax.tree.norm(updates)))
+optimizer = optax.chain(record_norm, optax.clip_by_global_norm(1.0), optax.adamw(1e-3))
+```
+
 ## Training state
 
 `TrainState` keeps three counters. `step` counts attempts, and together with the root key it determines the next random draw. `microstep` counts accepted microbatches. `updates` counts optimizer updates, which differs from `microstep` when gradients are accumulated. `state.variables` holds the live variables, and `state.averaged` holds the same tree with the EMA weights in place.
