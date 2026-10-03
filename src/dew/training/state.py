@@ -59,6 +59,10 @@ class TrainState:
     scale: DynamicScale | None
     window_size: jax.Array
     accumulation: Accumulation | None = None
+    compute: Variables | None = None
+    """The narrow copies of the parameters the forward reads, written by the
+    update (`dew.training.narrow`); derived from `variables`, so no
+    checkpoint holds them and a restored state starts without."""
 
     @property
     def averaged(self) -> Variables:
