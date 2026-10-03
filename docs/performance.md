@@ -235,7 +235,16 @@ scan alone), scan against chunks, 2026-10-02:
 | RTX 4080 (integration `527a32e9`, two rounds) | 66.64/66.37 to 60.21/60.80 | 110.31/110.05 to 100.73/100.83 | | |
 | A100 40 GB (Colab, `db1761fd`, a first form) | 42.38 to 40.89 | 65.67 to 62.39 | | |
 | TPU v6e (Colab, `527a32e9`, three rounds) | 17.25-17.25 to 18.03-18.05 | 34.39 to 32.17-32.20 | 22.0 to 18.8 ms | 63.6 to 65.2 ms |
+| CPU (i9-12900K, 4 threads, the live sampler's `0964f573`, ABAB) | | | 17.17 to 14.19 s | |
 
+On the CPU the row is the live sampler's call without its VAE decode, the
+median of nine calls in three alternating processes on a loaded host
+(14.55-20.52 s against 13.31-19.73), and a second session agreed (14.35
+and 14.50 against 13.07 and 13.57); with the decode, 25.47 against 22.06
+s. Peak RSS is within the processes' spread (medians 4370 and 4414 MiB,
+ranges 3937-4478 and 4221-4829). The image's bits change with the
+arithmetic (sha256 `923e1b09` to `10b80bfe` at key 0), as they do on any
+backend whose recurrence changes; both forms are held to the same bound.
 The v6e row is why a TPU keeps the scan: the chunks lost 4.5% at batch
 16 and 2.5% sampling 4 images (with 0.11 GB more at peak) while winning at
 batch 32 and for 1 image, and no form we tried won at every shape. A first
