@@ -148,7 +148,12 @@ RMS error against float64 drops from 2.19e-3 to 1.76e-3 (CPU and RTX 4080
 alike). The RTX 4080 steps are unchanged: the hybrid DiT at batch 16
 66.66/66.54 against 66.47/66.55 ms, SimpleDiT-B at 32 72.99/72.63 against
 72.77/72.71, a 3-layer GELU decoder at 16 x 512 44.40/44.30 against
-44.39/44.42.
+44.39/44.42. On the v6e (integration `8e92a4a6`, three rounds each) the
+hybrid DiT's batch-16 step runs 17.25-17.29 ms against 18.25, where XLA's
+excess precision would give 16.88-16.92: the policy now costs 2.2%, the
+residual roundings. Those roundings are real on the TPU too: an RMSNorm
+reading a fused bf16 residual sum matches the program that stores the sum
+on 98.8% of its outputs with excess precision, and on all of them without.
 
 ## Sampling the hybrid DiT on the CPU, 2026-10-02
 
