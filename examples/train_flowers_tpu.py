@@ -27,6 +27,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import tyro
 from PIL import Image
@@ -38,6 +39,7 @@ from dew.data import ArrayRecordImages, DataPartition, Loading, TFDSImages
 from dew.data.images import pack_dict_of_byte_arrays
 from dew.diffusion.presets import EDM
 from dew.eval import FID, CLIPScore
+from dew.nn.backbones import SimpleDiT
 from dew.objectives.diffusion import DiffusionRunConfig, TextCondition
 from dew.sampling import CFG
 from dew.sampling.solvers import Heun
@@ -104,8 +106,8 @@ def smoke_config(config: Config, out: Path) -> DiffusionRunConfig:
     """The same run at the size a laptop finishes: one device, tiny everything."""
     synthetic_records(out / "data", count=16, size=16)
     return DiffusionRunConfig(
-        model=ModelConfig("simple_dit", {"patch_size": 4, "emb_features": 32,
-                                        "num_layers": 1, "num_heads": 2}, dtype="float32"),
+        model=ModelConfig.from_model(SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2,
+                                               dtype=jnp.float32)),
         data=ArrayRecordImages(path=str(out / "data"), image_size=16, augmentation="none",
                                val_batches=1, loading=Loading(workers=0, threads=1,
                                                               read_buffer=2, worker_buffer=1)),
@@ -134,7 +136,7 @@ def slice_config(config: Config) -> DiffusionRunConfig:
     prepared = (ArrayRecordImages(path=path) if (config.data / "manifest.json").is_file()
                 else TFDSImages(path=path))
     return DiffusionRunConfig(
-        model=ModelConfig("simple_dit", dict(config.model), dtype="bfloat16"),
+        model=ModelConfig.from_model(SimpleDiT(**config.model, dtype=jnp.bfloat16)),
         data=replace(prepared, image_size=config.image_size, val_batches=4),
         preset=EDM(regime="pixel"),
         solver=Heun(),

@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Literal
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import tyro
 
@@ -43,6 +44,7 @@ from dew.config import ModelConfig, OptimConfig, TrainerConfig
 from dew.data import ByteTokenizer, Loading, TokenWindows
 from dew.eval import FID, CLIPScore
 from dew.inference import RunProcessor, TextGeneration, TextToImage
+from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective, LMRunConfig, Perplexity
 from dew.sampling import Sampling
 from dew.training import Evaluation
@@ -105,11 +107,11 @@ def smoke_run(out: Path) -> tuple[Path, Path]:
     (tokens / "meta.json").write_text(json.dumps(
         {"tokenizer": "byte", "vocab_size": 256, "dtype": "uint8"}))
 
-    fields = {"emb_features": 16, "num_layers": 1, "num_heads": 2, "head_dim": 8,
-              "mlp_features": 32, "vocab_size": 256, "max_seq_len": 48}
+    model = CausalTransformer(emb_features=16, num_layers=1, num_heads=2, head_dim=8, mlp_features=32,
+                              vocab_size=256, max_seq_len=48, dtype=jnp.float32,
+                              attention_impl="reference")
     run = LMRunConfig(
-        model=ModelConfig("causal_transformer", fields, dtype="float32",
-                          attention_impl="reference"),
+        model=ModelConfig.from_model(model),
         data=TokenWindows(path=str(tokens), seq_len=32,
                           loading=Loading(workers=0, threads=1, read_buffer=2,
                                           worker_buffer=1)),
@@ -118,7 +120,7 @@ def smoke_run(out: Path) -> tuple[Path, Path]:
         trainer=TrainerConfig(checkpoint_dir=str(out / "checkpoints"), batch_size=4, steps=2,
                               log_every=1, eval_every=None, checkpoint_every=2,
                               multi_host=False, compilation_cache_dir=None))
-    objective = LMObjective(run.model.build(), run.data.seq_len, ema_decay=0.9,
+    objective = LMObjective(model, run.data.seq_len, ema_decay=0.9,
                             processor=RunProcessor(ByteTokenizer()))
     run.train(objective, run.data.load(batch=run.trainer.batch_size), name="smoke")
     return Path(run.trainer.checkpoint_dir) / "smoke", tokens
