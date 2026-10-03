@@ -11,6 +11,10 @@ upstream's source at that commit (so the commit is in the tool), and
 rather than executing its code. A fixture Dew computed is a Dew regression
 golden and says so (`"generator": "dew"`), claiming no upstream. Inputs
 that both sides read (weights, ids, pixels) are no claim and need no record.
+
+What this does not see: a new fixture added with no record at all. The
+rule holds the records that exist; a reference written without one is
+caught in review, not here.
 """
 
 import json
