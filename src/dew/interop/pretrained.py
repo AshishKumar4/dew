@@ -762,6 +762,7 @@ class PretrainedPipeline(Pretrained):
 
         if "pretrained" in options:
             raise ValueError("a Pretrained bundle already supplies the initial variables; omit pretrained=")
+        self._text_encoder("training encodes its captions")
         if self.adapter is not None:
             if "trainable" in options:
                 raise ValueError("the adapter already selects what trains, its own factors; omit trainable=")
@@ -782,10 +783,19 @@ class PretrainedPipeline(Pretrained):
         from dew.interop import diffusion
 
         self._quantization()
+        self._text_encoder("a saved pipeline writes it back")
         values = self.variables if variables is None else variables
         if self.adapter is not None:
             values = self.adapter.merge(values)
         diffusion.save_source(self, values, Path(directory))
+
+    def _text_encoder(self, needed: str) -> None:
+        """Refuse an operation the text encoder's weights take, on a pipeline
+        `load_diffusion_source(text=False)` loaded without them."""
+        held = self.variables.get("encoders", {})
+        if any(keyword not in held for keyword in self.inputs.conditions):
+            raise ValueError(f"this pipeline was loaded without its text encoder (text=False), and {needed}; "
+                             "load it with its text encoder")
 
 
 @dataclass(frozen=True)
@@ -1054,7 +1064,8 @@ class _Denoiser:
 
 def _load_diffusion_source(directory: Path, index: Mapping[str, object], *, dtype: str,
                            attention_impl: str, param_dtype: str = "float32",
-                           variables: Variables | None = None, lazy: bool = False) -> PretrainedPipeline:
+                           variables: Variables | None = None, lazy: bool = False,
+                           text: bool = True) -> PretrainedPipeline:
     """Read a published latent diffusion directory into native modules and variables.
 
     The directory's own denoiser component selects the family (`_denoiser`),
@@ -1070,7 +1081,8 @@ def _load_diffusion_source(directory: Path, index: Mapping[str, object], *, dtyp
     mapped files, for a placement to read one device shard at a time
     (`dew.inference.pipeline.place`), but for the convolution kernels and a
     UNet's per-head attention kernels, which are read whole
-    (`dew.interop.diffusion.record_layouts`).
+    (`dew.interop.diffusion.record_layouts`). `text=False` binds the text
+    encoder to no weights and leaves it out of the variables.
     """
     compute = resolve_dtype(dtype)
     denoiser = _denoiser(directory, dtype=dtype, attention_impl=attention_impl)
@@ -1081,6 +1093,8 @@ def _load_diffusion_source(directory: Path, index: Mapping[str, object], *, dtyp
                               if name not in ("encoders", "autoencoder")}
         denoiser_layouts = ()
     held = {} if variables is None else variables["encoders"]
+    if not text:
+        held = {"conditioning": {name: {} for name in _text_components(denoiser.text, index)}}
     policy = _call_policy(index, denoiser)
     autoencoder, vae_params, vae_layouts, vae_config = _diffusion_vae(
         directory, compute, param_dtype=param_dtype,
@@ -1108,7 +1122,7 @@ def _load_diffusion_source(directory: Path, index: Mapping[str, object], *, dtyp
         sample, {encoder.keyword: Condition(encoder, unconditional=denoiser.text.unconditional(index))},
         mask=Field("mask", (height, width, 1)) if inpaint else None,
     )
-    encoders: dict[str, object] = {encoder.keyword: encoder.params}
+    encoders: dict[str, object] = {encoder.keyword: encoder.params} if text else {}
     finish, safety_layouts = None, ()
     if _present(index, "safety_checker"):
         finish, encoders["safety"], safety_layouts, safety_configs = _image_safety(
@@ -1136,7 +1150,8 @@ def _load_diffusion_source(directory: Path, index: Mapping[str, object], *, dtyp
 def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dtype: str = "float32",
                           revision: str | None = None, attention_impl: str = "auto",
                           size: tuple[int, ...] | None = None, variables: Variables | None = None,
-                          mesh: MeshSpec | None = None, layout: Layout | None = None) -> PretrainedPipeline:
+                          mesh: MeshSpec | None = None, layout: Layout | None = None,
+                          text: bool = True) -> PretrainedPipeline:
     """A published diffusion pipeline, to train from its own weights.
 
     `size` is the (height, width) in pixels the pipeline runs at instead of
@@ -1147,16 +1162,27 @@ def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dty
     directory's metadata and bind those variables, and no weight downloads.
     `mesh` and `layout` place the weights it reads as `Pretrained.load`'s
     do, streamed one leaf at a time.
+
+    `text=False` reads and downloads every component's weights but the text
+    encoder's, which then need not share the host or the device with the
+    denoiser: the conditioner is built from metadata and holds none, a call
+    takes the prompts its conditioner encoded alone
+    (`TextToImage.prepare(conditions=...)`), and a prompt, training or
+    `save`, which read the text encoder, are refused.
     """
     directory = sources.snapshot(checkpoint, revision, weights=False)
     if not (directory / "model_index.json").is_file():
         raise ValueError(f"{checkpoint} is not a diffusion pipeline: it has no model_index.json")
     with open(directory / "model_index.json") as handle:
         index = json.load(handle)
+    if variables is not None and not text:
+        raise ValueError("supplied variables bind every component; text=False skips reading one")
     if variables is None:
+        skipped = () if text else _text_components(
+            _denoiser(directory, dtype=dtype, attention_impl=attention_impl).text, index)
         # Both fetches at the commit the metadata resolved to.
         directory = sources.snapshot(checkpoint, directory.name, weights=tuple(
-            name for name in index if _present(index, name)))
+            name for name in index if _present(index, name) and name not in skipped))
     if size is not None:
         if len(size) not in (2, 3):
             raise ValueError(f"size is (height, width) or (frames, height, width), not {size}")
@@ -1165,7 +1191,7 @@ def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dty
             index["dew_frames"] = size[0]
     streaming = variables is None and (mesh is not None or layout is not None)
     loaded = _load_diffusion_source(directory, index, dtype=dtype, attention_impl=attention_impl,
-                                    param_dtype=param_dtype, variables=variables, lazy=streaming)
+                                    param_dtype=param_dtype, variables=variables, lazy=streaming, text=text)
     if streaming:
         loaded = replace(loaded, variables=place(loaded.variables, mesh, layout))
     return replace(loaded, revision=None if os.path.isdir(checkpoint) else directory.name)
@@ -1197,8 +1223,7 @@ def load_diffusion_conditioner[C: (DiffusionConditioner, QwenImageConditioner, H
     if params is None:
         # snapshot_download returns a commit directory. Keep both fetches on
         # that commit even when the requested Hub branch moves between them.
-        directory = sources.snapshot(checkpoint, directory.name,
-                                     weights=text.components(index) if towers else ("text_encoder",))
+        directory = sources.snapshot(checkpoint, directory.name, weights=_text_components(text, index))
     policy = _call_policy(index, denoiser)
     # The CLIP families' geometry is their VAE's; the language-model encoders
     # are bound at 16 pixels per latent position.
@@ -1424,6 +1449,12 @@ def _wan_denoiser(config: dict, directory: Path, *, dtype: str | None, attention
         built=_built("wan_transformer", fields, dtype), config=config, text=_WanText(),
         patch=fields["patch_size"][-1], latent_input=fields["in_channels"], sample_size=(60, 104),
         context_width=fields["text_dim"], pipeline="WanPipeline", frames=81)
+
+
+def _text_components(text: _TextTowers | _QwenImageText | _HiddenStatesText | _WanText,
+                     index: Mapping[str, object]) -> tuple[str, ...]:
+    """The components a pipeline's text conditioning reads its weights from."""
+    return text.components(index) if isinstance(text, _TextTowers) else ("text_encoder",)
 
 
 def _component_config(directory: Path, name: str) -> dict:

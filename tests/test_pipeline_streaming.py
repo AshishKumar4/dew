@@ -1,12 +1,17 @@
-"""A diffusion pipeline loaded onto a mesh streams its weights.
+"""A diffusion pipeline loads in pieces that fit: streamed, and without its text encoder.
 
-`Pretrained.load(..., mesh=)` reads a pipeline's denoiser and text encoders
-as `SourceLeaf` recipes over the mapped files and places them one leaf at a
-time, as it already does a decoder's. These tests hold the streamed load to
-the eager one on the committed tiny pipelines of every family: the same
-tree, leaf for leaf and bit for bit, and the same samples.
+`Pretrained.load(..., mesh=)` reads a pipeline's weights as `SourceLeaf`
+recipes over the mapped files and places them one leaf at a time, as it
+already does a decoder's. These tests hold the streamed load to the eager
+one on the committed tiny pipelines of every family: the same tree, leaf for
+leaf and bit for bit, and the same samples.
+
+`load_diffusion_source(text=False)` leaves the text encoder out, and a call
+takes prompts its conditioner encoded alone (`prepare(conditions=...)`): the
+same images as the prompted call, bit for bit.
 """
 
+import shutil
 import tarfile
 from pathlib import Path
 
@@ -115,3 +120,68 @@ def test_a_lazy_translation_reads_nothing_until_placed(extracted):
     assert kinds["['patch_embedding_3d']['kernel']"] is np.ndarray
     eager, _ = translate_wan_weights(tensors)
     assert all(type(leaf) is np.ndarray for leaf in jax.tree.leaves(eager))
+
+
+ENCODED = {"z_image": "HiddenStatesConditioner", "wan": "WanConditioner"}
+PROMPTS = ["a red bird", "two cats on a mat"]
+
+
+def encoded(directory: Path, conditioner: str, rows: list) -> dict:
+    """`rows` encoded with the pipeline's conditioner loaded alone."""
+    import dew.inputs.diffusion as conditioners
+
+    encoder = getattr(conditioners, conditioner).from_pretrained(str(directory), dtype="float32")
+    return {"conditioning": jax.jit(encoder.encode)(encoder.params, encoder.tokenize(rows))}
+
+
+@pytest.mark.parametrize("family", sorted(ENCODED))
+def test_an_encoded_call_without_the_text_encoder_draws_the_prompted_images(extracted, family):
+    """The prompts and the blank negative encoded by the conditioner alone,
+    walked by the pipeline loaded without it, guided at its own scale: the
+    prompted call's images, bit for bit, from the same per-row noise."""
+    directory = extracted[family]
+    whole = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla")
+    task = whole.text_to_image()
+    prompted = task(task.prepare(PROMPTS, key=3, steps=2), key=3).host().images
+    lean = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla", text=False)
+    assert "conditioning" not in lean.variables["encoders"]
+    blank = whole.inputs.conditions["conditioning"].unconditional
+    lean_task = lean.text_to_image()
+    walked = lean_task(lean_task.prepare(conditions=encoded(directory, ENCODED[family], PROMPTS),
+                                         unconditional=encoded(directory, ENCODED[family], [blank]),
+                                         key=3, steps=2), key=3).host().images
+    assert np.asarray(walked).tobytes() == np.asarray(prompted).tobytes()
+
+
+def test_a_pipeline_without_its_text_encoder_reads_none_of_its_weights(extracted, tmp_path):
+    """With the text encoder's weight files gone, `text=False` loads and the
+    whole pipeline does not."""
+    directory = tmp_path / "wan"
+    shutil.copytree(extracted["wan"], directory)
+    for weights in (directory / "text_encoder").glob("*.safetensors*"):
+        weights.unlink()
+    load_diffusion_source(str(directory), dtype="float32", text=False)
+    with pytest.raises(FileNotFoundError):
+        load_diffusion_source(str(directory), dtype="float32")
+
+
+def test_a_pipeline_without_its_text_encoder_refuses_what_reads_it(extracted, tmp_path):
+    """A prompt, training and saving each read the text encoder; each is
+    refused by name, never at a missing key. An encoded call with no
+    unconditional branch walks unguided and refuses guidance."""
+    lean = load_diffusion_source(str(extracted["wan"]), dtype="float32", attention_impl="xla", text=False)
+    task = lean.text_to_image()
+    with pytest.raises(ValueError, match="text=False"):
+        task(PROMPTS, steps=2, key=0)
+    with pytest.raises(ValueError, match="text=False"):
+        lean.diffusion_objective()
+    with pytest.raises(ValueError, match="text=False"):
+        lean.save(tmp_path / "saved")
+    given = encoded(extracted["wan"], "WanConditioner", PROMPTS)
+    with pytest.raises(ValueError, match="one of the two"):
+        task.prepare(PROMPTS, conditions=given, key=0, steps=2)
+    unguided = task.prepare(conditions=given, key=0, steps=2)
+    assert not unguided.unconditional
+    with pytest.raises(ValueError, match="unconditional branch"):
+        task(unguided, key=0)
+    assert np.isfinite(np.asarray(task(unguided, guidance=None, key=0).host().images)).all()
