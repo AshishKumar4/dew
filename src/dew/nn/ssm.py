@@ -75,11 +75,13 @@ def diagonal_recurrence(pole: jax.Array, inputs: jax.Array, chunk: int = SCAN_CH
     real parts and then its imaginary parts on the last axis, and the states
     come back the same way. On a GPU and the CPU they run in chunks of
     pole-power products (`_chunked_recurrence`); on a TPU as one
-    `associative_scan` over complex states (`_scanned_recurrence`), the form
-    a v6e ran faster at 16 images a step and when sampling 4 at a time,
-    where the chunks were faster at 32 and when sampling 1
-    (docs/performance.md). Both stay within the fp32 running-error bound of
-    the recurrence (tests/test_ssm.py).
+    `associative_scan` over complex states (`_scanned_recurrence`). The split
+    is measured, not chosen: on a v6e the scan ran the hybrid DiT's training
+    step 4.5% faster at batch 16 and its sampler 2.5% faster at 4 images,
+    and the chunks were faster at batch 32 and for 1 image, so neither form
+    wins every shape there; on a GPU the chunks win all of them
+    (docs/performance.md, the S5 table). Both stay within the fp32
+    running-error bound of the recurrence (tests/test_ssm.py).
     """
     return jax.lax.platform_dependent(
         pole, inputs, tpu=_scanned_recurrence,
