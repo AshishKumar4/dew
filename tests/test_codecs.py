@@ -24,7 +24,7 @@ import jax
 import ml_dtypes
 import numpy as np
 import pytest
-from test_quantized import decode_e4m3fn, fetch
+from test_quantized import fetch
 
 from dew.interop import Pretrained, codecs
 from dew.interop.safetensors_io import _STORED_DTYPES, read_weights, save_hf_layout
@@ -96,9 +96,10 @@ def test_a_group_rounding_past_the_largest_power_of_two_is_refused():
 # DeepSeek-V4 `.scale` storage, against the release's own dequantization
 # --------------------------------------------------------------------------
 
-FP4_TABLE = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-                      0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0], np.float32)
-"""inference/convert.py's FP4_TABLE, which reads code 8 as +0.0."""
+V4_RELEASE = Path(__file__).parent / "fixtures" / "codecs" / "deepseek_v4_release.npz"
+"""tools/deepseek_v4_release_reference.py's output: V4-Flash's and V4.1-Flash's
+own inference/convert.py `main` over a tiny checkpoint, and V4.1's
+`ParallelEngramEmbedding.forward`, at the pinned commits."""
 
 
 def e8m0(scale: np.ndarray) -> np.ndarray:
@@ -109,31 +110,19 @@ def e8m0(scale: np.ndarray) -> np.ndarray:
     )
 
 
-def release_scale(scale: np.ndarray) -> np.ndarray:
+def scale_values(scale: np.ndarray) -> np.ndarray:
     """A `.scale` as float32: E8M0 exponents, or the Base releases' float32 powers of two."""
     return scale if scale.dtype == np.float32 else e8m0(scale)
 
 
-def release_fp8(weight: np.ndarray, scale: np.ndarray, block: int) -> np.ndarray:
-    """inference/model.py's FP8 `Linear`: element (i, j) times scale[i // block,
-    j // block] over a ceil(out / block) x ceil(in / block) grid."""
-    i, j = np.indices(weight.shape)
-    return decode_e4m3fn(weight.view(np.uint8)) * release_scale(scale)[i // block, j // block]
+@pytest.fixture(scope="module")
+def v4_release():
+    with np.load(V4_RELEASE) as loaded:
+        return dict(loaded)
 
 
-def release_fp4(packed: np.ndarray, scale: np.ndarray) -> np.ndarray:
-    """convert.py's read of an FP4 expert (`cast_e2m1fn_to_e4m3fn`): FP4_TABLE
-    of each byte's low nibble, then its high one, times the scale of its 32 inputs."""
-    codes = packed.view(np.uint8)
-    values = np.stack([FP4_TABLE[codes & 0x0F], FP4_TABLE[(codes >> 4) & 0x0F]], axis=-1)
-    return values.reshape(codes.shape[0], -1) * np.repeat(e8m0(scale), 32, axis=1)
-
-
-def release_engram(weight: np.ndarray, scale: np.ndarray, block: int) -> np.ndarray:
-    """model.py's `ParallelEngramEmbedding.forward`: values.float().unflatten(-1,
-    (-1, block)) * scales.float().unsqueeze(-1)."""
-    rows = decode_e4m3fn(weight.view(np.uint8)).reshape(weight.shape[0], -1, block)
-    return (rows * release_scale(scale)[..., None]).reshape(weight.shape)
+def bfloat16_bits(values: np.ndarray) -> np.ndarray:
+    return np.asarray(values, np.float32).astype(ml_dtypes.bfloat16).view(np.int16)
 
 
 def e4m3_codes(rng: np.random.Generator, shape: tuple[int, ...]) -> np.ndarray:
@@ -149,57 +138,62 @@ def e8m0_codes(rng: np.random.Generator, shape: tuple[int, ...]) -> np.ndarray:
     return exponents.view(ml_dtypes.float8_e8m0fnu)
 
 
-@pytest.mark.parametrize("block, shape", [(32, (70, 100)), (128, (130, 257))])
-@pytest.mark.parametrize("scale_dtype", ["float8_e8m0fnu", "float32"])
-def test_a_v4_fp8_linear_decodes_as_the_release_reads_it(block, shape, scale_dtype):
-    """V4.1's 32 x 32 blocks and V4's 128 x 128, each shape ending on a
-    partial block both ways, under E8M0 scales (V4-Flash, V4.1-Flash) and
-    float32 ones (the Base releases): bit for bit, the overflow of 448 *
-    2 ** 127 to infinity and the subnormal products of byte 0 included."""
-    rng = np.random.default_rng(11)
-    weight = e4m3_codes(rng, shape)
-    scale = e8m0_codes(rng, (-(-shape[0] // block), -(-shape[1] // block)))
-    if scale_dtype == "float32":
-        scale = e8m0(scale)
-    tensors = {"layers.0.attn.wq_a.weight": weight, "layers.0.attn.wq_a.scale": scale}
+@pytest.mark.parametrize("release, block", [("v4", 128), ("v4_1", 32)])
+@pytest.mark.parametrize("layer, scale_dtype", [(0, "float8_e8m0fnu"), (1, "float32")])
+def test_a_v4_fp8_linear_decodes_as_the_releases_convert_reads_it(
+        v4_release, release, block, layer, scale_dtype):
+    """convert.py's `main` dequantizes an attention wo_a against its block
+    scales to bfloat16: V4's 128 x 128 blocks and V4.1's 32 x 32, under E8M0
+    scales (V4-Flash, V4.1-Flash, bytes 0 and 254 among them, so subnormal
+    and overflowing products included) and float32 ones (the Base
+    releases). Dew's decode, rounded to bfloat16, is the release's in every bit."""
+    def stored(name):
+        return v4_release[f"{release}/stored/model.layers.{layer}.self_attn.wo_a.{name}"]
+
+    weight, scale = stored("weight").view(codecs.E4M3), stored("weight_scale_inv")
+    scale = scale.view(ml_dtypes.float8_e8m0fnu if scale_dtype == "float8_e8m0fnu" else np.float32)
+    tensors = {"layers.0.attn.wo_a.weight": weight, "layers.0.attn.wo_a.scale": scale}
 
     with np.errstate(over="ignore"):
-        decoded = codecs.deepseek_v4(block, fp4_experts=True).read(tensors, "layers.0.attn.wq_a.weight")
-        expected = release_fp8(weight, scale, block)
+        decoded = codecs.deepseek_v4(block, fp4_experts=True).read(tensors, "layers.0.attn.wo_a.weight")
 
-    np.testing.assert_array_equal(decoded.view(np.uint32), expected.view(np.uint32))
+    np.testing.assert_array_equal(bfloat16_bits(decoded), v4_release[f"{release}/wo_a/{layer}"])
 
 
-def test_a_v4_fp4_expert_decodes_as_the_release_reads_it():
-    """Every byte three times, so every code in both nibbles, under
-    exponents down to byte 0, where 0.5 * 2 ** -127 is a float32 subnormal:
-    the release's values, and its bits but for code 8, which its table
+@pytest.mark.parametrize("release, block", [("v4", 128), ("v4_1", 32)])
+def test_a_v4_fp4_expert_decodes_as_the_releases_convert_reads_it(v4_release, release, block):
+    """convert.py's `main` turns an FP4 routed expert into FP8 under
+    `cast_e2m1fn_to_e4m3fn`, exactly while each FP8 block's E8M0 scales span
+    at most 2 ** 6, as here. Dew's decode is torch's reading of what it
+    wrote, in value; in sign too but for code 8, which the release's table
     reads as +0.0 and the codec as -0.0, so that it encodes back to 8."""
-    rng = np.random.default_rng(12)
-    packed = rng.permutation(np.tile(np.arange(256, dtype=np.uint8), 3)).reshape(6, 128).view(np.int8)
-    scale = e8m0_codes(rng, (6, 8))
-    tensors = {"mtp.0.ffn.experts.3.w2.weight": packed, "mtp.0.ffn.experts.3.w2.scale": scale}
+    packed = v4_release[f"{release}/stored/model.layers.0.mlp.experts.0.w1.weight"].view(np.int8)
+    scale = v4_release[f"{release}/stored/model.layers.0.mlp.experts.0.w1.weight_scale_inv"]
+    tensors = {"layers.0.ffn.experts.0.w1.weight": packed,
+               "layers.0.ffn.experts.0.w1.scale": scale.view(ml_dtypes.float8_e8m0fnu)}
 
-    with np.errstate(over="ignore"):
-        decoded = codecs.deepseek_v4(128, fp4_experts=True).read(tensors, "mtp.0.ffn.experts.3.w2.weight")
-        expected = release_fp4(packed, scale)
+    decoded = codecs.deepseek_v4(block, fp4_experts=True).read(tensors, "layers.0.ffn.experts.0.w1.weight")
 
+    expected = v4_release[f"{release}/expert/dense"]
     np.testing.assert_array_equal(decoded, expected)
-    codes = np.stack([packed.view(np.uint8) & 15, packed.view(np.uint8) >> 4], axis=-1).reshape(6, -1)
+    codes = np.stack([packed.view(np.uint8) & 15, packed.view(np.uint8) >> 4], axis=-1).reshape(decoded.shape)
     np.testing.assert_array_equal(np.signbit(decoded), np.signbit(expected) | (codes == 8))
 
 
-def test_a_v4_1_engram_row_decodes_as_the_release_reads_it():
-    """V4.1's n-gram hash table: a row of 256 values under one scale per 32."""
-    rng = np.random.default_rng(13)
-    weight, scale = e4m3_codes(rng, (9, 256)), e8m0_codes(rng, (9, 8))
+def test_a_v4_1_engram_row_decodes_as_the_releases_lookup_reads_it(v4_release):
+    """V4.1's `ParallelEngramEmbedding.forward` looks rows of the n-gram
+    table up and dequantizes each against one scale per 32 values, to
+    bfloat16, E8M0 bytes 0 and 254 among the scales: Dew's decoded rows,
+    rounded to bfloat16, are the release's in every bit."""
+    weight = v4_release["v4_1/engram/weight"].view(codecs.E4M3)
+    scale = v4_release["v4_1/engram/scale"].view(ml_dtypes.float8_e8m0fnu)
     tensors = {"layers.14.engram.embed.weight": weight, "layers.14.engram.embed.scale": scale}
 
     with np.errstate(over="ignore"):
-        decoded = codecs.deepseek_v4(32, fp4_experts=True).read(tensors, "layers.14.engram.embed.weight")
-        expected = release_engram(weight, scale, 32)
+        table = codecs.deepseek_v4(32, fp4_experts=True).read(tensors, "layers.14.engram.embed.weight")
 
-    np.testing.assert_array_equal(decoded.view(np.uint32), expected.view(np.uint32))
+    np.testing.assert_array_equal(bfloat16_bits(table[v4_release["v4_1/engram/indices"]]),
+                                  v4_release["v4_1/engram/values"])
 
 
 def test_the_v4_fp4_encoder_follows_the_releases_kernel():
@@ -250,7 +244,7 @@ def test_each_v4_layout_moves_a_weight_by_at_most_its_grid_step_and_holds_still_
     assert [stored[name].dtype for name in names] == [codecs.E4M3, np.int8, codecs.E4M3]
     for name in names:
         decoded, weight = read(stored, name), dense[name]
-        scale = release_scale(stored[name.removesuffix("weight") + "scale"])
+        scale = scale_values(stored[name.removesuffix("weight") + "scale"])
         if name.endswith("w3.weight"):
             group_scale = np.repeat(scale, 32, axis=1)
             rounded = weight.astype(ml_dtypes.bfloat16).astype(np.float32)
@@ -385,12 +379,9 @@ def v4_release_storage(
     stored = codecs.deepseek_v4(128, fp4_experts=experts == "fp4", scale_dtype=scale_dtype).requantize(
         dense, names
     )
-    decoded = dict(dense)
-    for name in names:
-        weight, scale = stored[name], stored[name.removesuffix("weight") + "scale"]
-        decoded[name] = (
-            release_fp4(weight, scale) if weight.dtype == np.int8 else release_fp8(weight, scale, 128)
-        )
+    # The decoder is held to the releases' own reading in the tests above.
+    read = codecs.deepseek_v4(128, fp4_experts=experts == "fp4", scale_dtype=scale_dtype).read
+    decoded = {**dense, **{name: read(stored, name) for name in names}}
     config = {**json.loads((V4_TINY / "config.json").read_text()), "moe_intermediate_size": 32}
     released = json.loads((V4_TINY.parent / "deepseek-v4-flash" / "config.json").read_text())
     save_hf_layout(stored, {**config, "expert_dtype": experts,
@@ -483,11 +474,11 @@ def test_a_released_v4_tensor_decodes_as_the_release_reads_it_and_encodes_back(
     repo, name, rows, block, fp4_experts
 ):
     """Real tensors at the pinned commits, one engram table read as 2048 of
-    its 384 M rows. Decoding matches the release's formulas bit for bit
-    (FP4: in value, code 8 aside). Encoding the decoded weight writes the
-    shipped bytes back: every FP4 group, whose largest code is 4 or 6, and
-    every FP8 block or engram group but those whose largest code is 224,
-    which the ceil rule moves to half the scale with the same values."""
+    its 384 M rows, decoded as the releases' own code reads them (held by the
+    fixture tests above). Encoding the decoded weight writes the shipped
+    bytes back: every FP4 group, whose largest code is 4 or 6, and every FP8
+    block or engram group but those whose largest code is 224, which the
+    ceil rule moves to half the scale with the same values."""
     partner = name.removesuffix("weight") + "scale"
     weight, scale = released_tensor(repo, name, rows), released_tensor(repo, partner, rows)
     read = codecs.deepseek_v4(block, fp4_experts=fp4_experts).read
@@ -499,14 +490,9 @@ def test_a_released_v4_tensor_decodes_as_the_release_reads_it_and_encodes_back(
 
     np.testing.assert_array_equal(read(again, name), decoded)
     if layout == "fp4":
-        np.testing.assert_array_equal(decoded, release_fp4(weight, scale))
         np.testing.assert_array_equal(again[name].view(np.uint8), weight.view(np.uint8))
         np.testing.assert_array_equal(again[partner].view(np.uint8), scale.view(np.uint8))
         return
-    expected = (
-        release_fp8(weight, scale, block) if layout == "blocks" else release_engram(weight, scale, block)
-    )
-    np.testing.assert_array_equal(decoded.view(np.uint32), expected.view(np.uint32))
     magnitudes = np.abs(weight.astype(np.float32))
     if layout == "blocks":
         largest = magnitudes.reshape(scale.shape[0], block, scale.shape[1], block).max(axis=(1, 3))
