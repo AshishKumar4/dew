@@ -1085,9 +1085,9 @@ time goes beside vLLM's:
 | everything else | 313 ms | 154 ms |
 
 Attention is at parity call for call; Dew makes more calls because it runs
-265 steps to vLLM's 249 traced, its admission steps (8 prompts a step, as
-vLLM's 2048-token chunks hold) and a slot freed only when the host reads
-the step that finished it. The rest is many small kernels: the residual
+265 steps, where vLLM needs at least 256, of which 249 were traced: Dew's
+admission steps (8 prompts a step, as vLLM's 2048-token chunks hold) and a
+slot freed only when the host reads the step that finished it. The rest is many small kernels: the residual
 add with the split-K GEMM's sum and its cast (52.5 ms in 22859 launches),
 the norms (80.7 ms in 32201), the cache writes (61.0 ms) and the
 transposes around attention (48.8 ms), each one to three microseconds
