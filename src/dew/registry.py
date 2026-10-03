@@ -8,19 +8,25 @@ name or a field the table does not know raises.
 
 The registries are empty at import. Each member registers itself where it is
 defined, so importing a package fills its table and the registry module
-imports none of them.
+imports none of them. A lookup of a name its table does not hold yet imports
+the modules of Dew whose decorator registers that name, read off the
+sources (`_registering_modules`), so a record loads in a process that
+imported nothing beforehand, and nothing else is imported.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import functools
+import importlib
 import operator
+import re
 import sys
 import types
 import typing
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from enum import Enum
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol, TypedDict, TypeVar, Union, overload
 
 import jax
@@ -71,6 +77,29 @@ type Configured = (JSON | DTypeLike | Enum | np.ndarray | np.generic
 NO_RECORD: Mapping[str, object] = types.MappingProxyType({})
 
 
+_DECORATOR = re.compile(r"""^[ \t]*@(?:dew\.)?(?:registry\.)?(\w+)\(\s*["']([^"']+)["']\s*\)[ \t]*$""", re.M)
+"""A registration as Dew's sources write it, `@models("simple_dit")` or
+`@registry.objectives("lm")`: the registry's name in this module and the
+member's."""
+
+
+@functools.cache
+def _registering_modules() -> Mapping[tuple[str, str], tuple[str, ...]]:
+    """Each `(registry, name)` Dew's sources register, and the modules that do.
+
+    The decorators are the one statement of what registers where, so this
+    reads them rather than keeping a second table: about 270 files in 20 ms,
+    once a process, and only when a lookup misses."""
+    root = Path(__file__).parent
+    found: dict[tuple[str, str], list[str]] = {}
+    for path in sorted(root.rglob("*.py")):
+        parts = path.relative_to(root.parent).with_suffix("").parts
+        module = ".".join(parts[:-1] if parts[-1] == "__init__" else parts)
+        for attribute, name in _DECORATOR.findall(path.read_text()):
+            found.setdefault((attribute, name), []).append(module)
+    return {key: tuple(modules) for key, modules in found.items()}
+
+
 class Registry[T: Callable[..., Any], Built](Mapping[str, T]):
     """Names one kind of thing: a decorator and a mapping from name to member."""
 
@@ -100,12 +129,21 @@ class Registry[T: Callable[..., Any], Built](Mapping[str, T]):
         return register
 
     def __getitem__(self, name: str) -> T:
+        if name not in self._members:
+            for module in self._registering(name):
+                importlib.import_module(module)
         try:
             return self._members[name]
         except KeyError:
-            raise KeyError(
-                f"no {self.kind} named {name!r}; known: {', '.join(sorted(self._members))}"
-            ) from None
+            known = set(self._members) | {held for attribute, held in _registering_modules()
+                                          if getattr(sys.modules[__name__], attribute, None) is self}
+            raise KeyError(f"no {self.kind} named {name!r}; known: {', '.join(sorted(known))}") from None
+
+    def _registering(self, name: str) -> tuple[str, ...]:
+        """The modules of Dew whose decorator registers `name` in this table."""
+        return tuple(module for (attribute, held), modules in _registering_modules().items()
+                     if held == name and getattr(sys.modules[__name__], attribute, None) is self
+                     for module in modules)
 
     def __iter__(self) -> Iterator[str]:
         return iter(self._members)
@@ -152,7 +190,7 @@ class Registry[T: Callable[..., Any], Built](Mapping[str, T]):
         """
         fields = dict(record)
         kind = fields.pop("kind", None)
-        if not isinstance(kind, str) or kind not in self._members:
+        if not isinstance(kind, str) or kind not in self:
             raise ValueError(
                 f"a {self.kind} record names its kind, one of "
                 f"{', '.join(sorted(self._members))}; got {kind!r}")
@@ -335,7 +373,7 @@ def _nested_member(held: type, value: Mapping[str, object]) -> tuple[type, Mappi
                 continue
         else:
             named, fields = value.get("kind"), {key: field for key, field in value.items() if key != "kind"}
-        member = table._members.get(named) if isinstance(named, str) else None
+        member = table.get(named) if isinstance(named, str) else None
         if isinstance(member, type) and issubclass(member, held):
             return member, fields
     return held, value

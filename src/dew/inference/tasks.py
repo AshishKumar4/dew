@@ -16,7 +16,6 @@ import dataclasses
 import functools
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from importlib import import_module
 from typing import TYPE_CHECKING, Protocol
 
 import jax
@@ -273,10 +272,6 @@ def run_record(directory: str, step: int | str | None = None) -> Mapping[str, ob
         raise ValueError(f"this run's checkpoints describe no model to load: {record['unrecorded']}")
     model = record.get('model')
     if isinstance(model, Mapping) and isinstance(model.get('architecture'), str):
-        # The modules whose classes a record names beyond dew.config's backbones.
-        import dew.nn.backbones.jepa
-        import dew.nn.diffusion_gemma
-        import dew.nn.multimodal  # noqa: F401  (registers the kind)
         from dew.registry import models
         name = model['architecture']
         if name not in models:
@@ -481,8 +476,6 @@ class TextGeneration:
         from dew.objectives.base import thaw
         from dew.registry import objectives
 
-        import_module("dew.objectives.lm")  # registers the saved objective kinds
-        import_module("dew.objectives.rl")
         record, model_config, processor = _saved_run(directory, dtype, step)
         kind = named(record["objective"], "objective")
         budget = _saved_budget(record)
