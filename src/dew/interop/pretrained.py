@@ -42,6 +42,7 @@ from dew.inputs.diffusion import (
     HiddenStatesConditioner,
     QwenImageConditioner,
     T5Segment,
+    WanConditioner,
 )
 from dew.interop import gguf, hf_decoders as decoders, mamba2, sources, verify
 from dew.interop.codecs import SourceQuantization, source_quantization
@@ -716,7 +717,9 @@ class PretrainedPipeline(Pretrained):
     finish: Callable[[Mapping[str, object], jax.Array], jax.Array] | None = field(default=None, repr=False)
 
     def text_to_image(self) -> TextToImage:
-        """Build the latent diffusion source as an image task with its published policy."""
+        """Build the latent diffusion source as a sampling task with its
+        published policy; a video source's (Wan's) samples clips,
+        `[N, frames, height, width, 3]`."""
         return TextToImage(self.model, self.process, self.inputs, self.variables, self.autoencoder,
                            grid=self.task.grid, final_denoise=False, solver=self.schedule.solver,
                            steps=self.task.steps, guidance=self.task.guidance, finish=self.finish)
@@ -820,7 +823,7 @@ class _Call(NamedTuple):
     it pads its T5 tower to. Qwen-Image's pipeline pads to the longest prompt
     of a call, so its budget is the prompt window Dew pads each row to."""
 
-    family: Literal["sd", "sdxl", "sd3", "flux", "flux2", "qwen_image", "z_image"]
+    family: Literal["sd", "sdxl", "sd3", "flux", "flux2", "qwen_image", "z_image", "wan"]
     steps: int
     guidance: float
     guided: bool
@@ -850,6 +853,7 @@ _PIPELINE_POLICY: Mapping[str, _Call] = MappingProxyType({
     # Z-Image guides as `pos + 5.0 (pos - neg)`, which is Dew's
     # `neg + 6.0 (pos - neg)`.
     "ZImagePipeline": _Call("z_image", 50, 6.0, guided=True, sequence=512),
+    "WanPipeline": _Call("wan", 50, 5.0, guided=True, sequence=512),
     "FlaxStableDiffusionPipeline": _Call("sd", 50, 7.5, guided=True),
     "FlaxStableDiffusionImg2ImgPipeline": _Call("sd", 50, 7.5, guided=True),
     "FlaxStableDiffusionInpaintPipeline": _Call("sd", 50, 7.5, guided=True),
@@ -920,7 +924,7 @@ class _TextTowers:
                      if name is not None and _present(index, name))
 
     def build(self, directory: Path, index: Mapping[str, object], denoiser: _Denoiser,
-              policy: _Call, compute, size: int, *, param_dtype: str,
+              policy: _Call, compute, size: tuple[int, int], *, param_dtype: str,
               attention_impl: str = "auto", params: Variables | None = None
               ) -> tuple[DiffusionConditioner, tuple[WeightLayout, ...], dict[str, Mapping[str, object]]]:
         """Construct the published text composition from metadata and either weight source."""
@@ -963,7 +967,7 @@ class _QwenImageText:
     conditioner: ClassVar[type[QwenImageConditioner]] = QwenImageConditioner
 
     def build(self, directory: Path, index: Mapping[str, object], denoiser: _Denoiser,
-              policy: _Call, compute, size: int, *, param_dtype: str,
+              policy: _Call, compute, size: tuple[int, int], *, param_dtype: str,
               attention_impl: str = "auto", params: Variables | None = None
               ) -> tuple[QwenImageConditioner, tuple[WeightLayout, ...], dict[str, Mapping[str, object]]]:
         """Construct `QwenImageConditioner` at the pipeline's prompt budget."""
@@ -989,7 +993,7 @@ class _HiddenStatesText:
     conditioner: ClassVar[type[HiddenStatesConditioner]] = HiddenStatesConditioner
 
     def build(self, directory: Path, index: Mapping[str, object], denoiser: _Denoiser,
-              policy: _Call, compute, size: int, *, param_dtype: str,
+              policy: _Call, compute, size: tuple[int, int], *, param_dtype: str,
               attention_impl: str = "auto", params: Variables | None = None
               ) -> tuple[HiddenStatesConditioner, tuple[WeightLayout, ...], dict[str, Mapping[str, object]]]:
         """Construct `HiddenStatesConditioner` at the pipeline's prompt budget."""
@@ -1004,10 +1008,33 @@ class _HiddenStatesText:
 
 
 @dataclass(frozen=True)
+class _WanText:
+    """Wan's UMT5 encoder, which `WanConditioner` runs at its pipeline's
+    prompt budget; it reads no geometry."""
+
+    conditioner: ClassVar[type[WanConditioner]] = WanConditioner
+
+    def build(self, directory: Path, index: Mapping[str, object], denoiser: _Denoiser,
+              policy: _Call, compute, size: tuple[int, int], *, param_dtype: str,
+              attention_impl: str = "auto", params: Variables | None = None
+              ) -> tuple[WanConditioner, tuple[WeightLayout, ...], dict[str, Mapping[str, object]]]:
+        """Construct `WanConditioner` at the pipeline's prompt budget."""
+        return _wan_conditioning(directory, compute, tokens=policy.sequence, param_dtype=param_dtype,
+                                 params=params)
+
+    def unconditional(self, index: Mapping[str, object]) -> dict:
+        """The empty negative prompt `WanPipeline` encodes by default."""
+        return {"text": ""}
+
+
+@dataclass(frozen=True)
 class _Denoiser:
     """Holds what one architecture contributes to a diffusion source, from
     metadata alone: only a complete source load calls `weights`, and `text`
-    is how the family conditions on its prompt.
+    is how the family conditions on its prompt. `sample_size` is the
+    (rows, columns) of latent positions its pipeline renders by default, and
+    `frames` the clip length in frames a video pipeline renders, None for an
+    image one.
     """
 
     component: str
@@ -1015,13 +1042,14 @@ class _Denoiser:
     weights: Callable[[str], tuple[Variables, tuple[WeightLayout, ...]]]
     built: Mapping[str, object]
     config: Mapping[str, object]
-    text: _TextTowers | _QwenImageText | _HiddenStatesText
+    text: _TextTowers | _QwenImageText | _HiddenStatesText | _WanText
     patch: int
     latent_input: int
-    sample_size: int
+    sample_size: tuple[int, int]
     context_width: int
     pipeline: str
     origin: Origin = "scheduler"
+    frames: int | None = None
 
 
 def _load_diffusion_source(directory: Path, index: Mapping[str, object], *, dtype: str,
@@ -1051,16 +1079,27 @@ def _load_diffusion_source(directory: Path, index: Mapping[str, object], *, dtyp
     autoencoder, vae_params, vae_layouts, vae_config = _diffusion_vae(
         directory, compute, param_dtype=param_dtype,
         params=None if variables is None else variables["autoencoder"])
+    rows, columns = denoiser.sample_size
+    size = (rows * autoencoder.downscale_factor, columns * autoencoder.downscale_factor)
     encoder, text_layouts, components = denoiser.text.build(
-        directory, index, denoiser, policy, compute,
-        denoiser.sample_size * autoencoder.downscale_factor, param_dtype=param_dtype,
+        directory, index, denoiser, policy, compute, size, param_dtype=param_dtype,
         attention_impl=attention_impl, params=held.get("conditioning"))
     components.update({denoiser.component: denoiser.config, "vae": vae_config})
-    height, width = encoder.height, encoder.width
+    height, width = _geometry(index, size)
+    # AutoencoderKLWan declares no channel count; it reads RGB.
+    channels = records.integer(vae_config.get("in_channels", 3), "in_channels")
+    if denoiser.frames is None:
+        sample = Field("image", (height, width, channels))
+    else:
+        frames = index.get("dew_frames", denoiser.frames)
+        if type(frames) is not int or frames < 1:
+            raise ValueError("A clip's frame count must be a positive integer")
+        sample = Field("video", (frames, height, width, channels))
+        # The VAE states which clip lengths it encodes and decodes whole.
+        autoencoder.latent_shape(sample.shape)
     inpaint = denoiser.latent_input == autoencoder.latent_channels * 2 + 1
     inputs = InputSpec(
-        Field("image", (height, width, records.integer(vae_config["in_channels"], "in_channels"))),
-        {encoder.keyword: Condition(encoder, unconditional=denoiser.text.unconditional(index))},
+        sample, {encoder.keyword: Condition(encoder, unconditional=denoiser.text.unconditional(index))},
         mask=Field("mask", (height, width, 1)) if inpaint else None,
     )
     encoders: dict[str, object] = {encoder.keyword: encoder.params}
@@ -1077,7 +1116,10 @@ def _load_diffusion_source(directory: Path, index: Mapping[str, object], *, dtyp
                       CFG(policy.guidance) if policy.guided and policy.guidance > 1 else None,
                       functools.partial(schedule.sampling, origin=denoiser.origin, tokens=tokens))
     variables = {**denoiser_variables, "encoders": encoders, "autoencoder": vae_params}
-    config = {"model_index": {**index, "dew_height": height, "dew_width": width}, **components}
+    geometry = {"dew_height": height, "dew_width": width}
+    if denoiser.frames is not None:
+        geometry["dew_frames"] = sample.shape[0]
+    config = {"model_index": {**index, **geometry}, **components}
     return PretrainedPipeline(model=denoiser.model, variables=variables, processor=None, config=config,
                               source=directory, model_config=denoiser.built,
                               weight_layouts=denoiser_layouts + vae_layouts + text_layouts + safety_layouts,
@@ -1087,16 +1129,16 @@ def _load_diffusion_source(directory: Path, index: Mapping[str, object], *, dtyp
 
 def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dtype: str = "float32",
                           revision: str | None = None, attention_impl: str = "auto",
-                          size: tuple[int, int] | None = None,
+                          size: tuple[int, ...] | None = None,
                           variables: Variables | None = None) -> PretrainedPipeline:
     """A published diffusion pipeline, to train from its own weights.
 
     `size` is the (height, width) in pixels the pipeline runs at instead of
-    its own: the geometry its conditioning, its training shift and its
-    sampling grid are bound to. Supplied `variables` are a saved tree of the
-    same pipeline, as a run that fine-tuned it wrote them: the modules are
-    built from the directory's metadata and bind those variables, and no
-    weight downloads.
+    its own, or a video pipeline's (frames, height, width): the geometry its
+    conditioning, its training shift and its sampling grid are bound to.
+    Supplied `variables` are a saved tree of the same pipeline, as a run
+    that fine-tuned it wrote them: the modules are built from the
+    directory's metadata and bind those variables, and no weight downloads.
     """
     directory = sources.snapshot(checkpoint, revision, weights=False)
     if not (directory / "model_index.json").is_file():
@@ -1108,13 +1150,18 @@ def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dty
         directory = sources.snapshot(checkpoint, directory.name, weights=tuple(
             name for name in index if _present(index, name)))
     if size is not None:
-        index = {**index, "dew_height": size[0], "dew_width": size[1]}
+        if len(size) not in (2, 3):
+            raise ValueError(f"size is (height, width) or (frames, height, width), not {size}")
+        index = {**index, "dew_height": size[-2], "dew_width": size[-1]}
+        if len(size) == 3:
+            index["dew_frames"] = size[0]
     loaded = _load_diffusion_source(directory, index, dtype=dtype, attention_impl=attention_impl,
                                     param_dtype=param_dtype, variables=variables)
     return replace(loaded, revision=None if os.path.isdir(checkpoint) else directory.name)
 
 
-def load_diffusion_conditioner[C: (DiffusionConditioner, QwenImageConditioner, HiddenStatesConditioner)](
+def load_diffusion_conditioner[C: (DiffusionConditioner, QwenImageConditioner, HiddenStatesConditioner,
+                                   WanConditioner)](
         checkpoint: str, kind: type[C], *, dtype: str | None = "bfloat16", param_dtype: str = "float32",
         revision: str | None = None, attention_impl: str = "auto", tokens: int | None = None,
         params: Variables | None = None) -> C:
@@ -1144,9 +1191,11 @@ def load_diffusion_conditioner[C: (DiffusionConditioner, QwenImageConditioner, H
     # are bound at 16 pixels per latent position.
     scale = (AutoencoderKL(channels=tuple(_component_config(directory, "vae")["block_out_channels"]))
              .downscale_factor if towers else 16)
+    rows, columns = denoiser.sample_size
     encoder, _, _ = text.build(
         directory, index, denoiser, policy if tokens is None else policy._replace(sequence=tokens), compute,
-        denoiser.sample_size * scale, param_dtype=param_dtype, attention_impl=attention_impl, params=params)
+        (rows * scale, columns * scale), param_dtype=param_dtype, attention_impl=attention_impl,
+        params=params)
     if not isinstance(encoder, kind):
         raise TypeError(f"{type(text).__name__} built a {type(encoder).__name__}, not a {kind.__name__}")
     return encoder
@@ -1180,7 +1229,7 @@ def _unet_denoiser(directory: Path, *, dtype: str | None, attention_impl: str) -
         text=_TextTowers("clip_pooled" if pooled else "clip", ("text_encoder", "text_encoder_2")),
         patch=1,
         latent_input=model.in_channels,
-        sample_size=records.integer(config["sample_size"], "sample_size"),
+        sample_size=_square(config),
         context_width=records.integer(config.get("cross_attention_dim", 1280), "cross_attention_dim"),
         pipeline="StableDiffusionXLPipeline" if pooled else "StableDiffusionPipeline",
     )
@@ -1203,6 +1252,8 @@ def _denoiser(directory: Path, *, dtype: str | None, attention_impl: str) -> _De
         return _flux2_denoiser(config, directory, dtype=dtype, attention_impl=attention_impl)
     if published == "ZImageTransformer2DModel":
         return _z_image_denoiser(config, directory, dtype=dtype, attention_impl=attention_impl)
+    if published == "WanTransformer3DModel":
+        return _wan_denoiser(config, directory, dtype=dtype, attention_impl=attention_impl)
     raise ValueError(f"Native diffusion does not implement the published transformer "
                      f"{published!r}")
 
@@ -1243,7 +1294,8 @@ def _sd3_denoiser(config: dict, directory: Path, *, dtype: str | None, attention
         built=_built("sd3_transformer", fields, dtype), config=config,
         text=_TextTowers("sd3", ("text_encoder", "text_encoder_2"), t5_tower="text_encoder_3"),
         patch=fields["patch_size"],
-        latent_input=fields["in_channels"], sample_size=records.integer(config["sample_size"], "sample_size"),
+        latent_input=fields["in_channels"],
+        sample_size=_square(config),
         context_width=fields["joint_attention_dim"], pipeline="StableDiffusion3Pipeline")
 
 
@@ -1266,7 +1318,7 @@ def _flux_denoiser(config: dict, directory: Path, *, dtype: str | None, attentio
         text=_TextTowers("flux", ("text_encoder",), t5_tower="text_encoder_2",
                          embeds_guidance=fields["guidance_embeds"]), patch=2,
         latent_input=fields["in_channels"] // 4,
-        sample_size=records.integer(config.get("sample_size", 128), "sample_size"),
+        sample_size=_square(config, 128),
         context_width=fields["joint_attention_dim"], pipeline="FluxPipeline",
         origin="linspace")
 
@@ -1290,7 +1342,7 @@ def _qwen_image_denoiser(config: dict, directory: Path, *, dtype: str | None,
         weights=_transformer_weights(directory, diffusion.translate_qwen_image_weights),
         built=_built("qwen_image_transformer", fields, dtype), config=config,
         text=_QwenImageText(), patch=1,
-        latent_input=fields["in_channels"], sample_size=64,
+        latent_input=fields["in_channels"], sample_size=(64, 64),
         context_width=fields["context_in_dim"], pipeline="QwenImage21Pipeline", origin="linspace")
 
 
@@ -1312,7 +1364,7 @@ def _flux2_denoiser(config: dict, directory: Path, *, dtype: str | None, attenti
         weights=_transformer_weights(directory, diffusion.translate_flux2_weights),
         built=_built("flux2_transformer", fields, dtype), config=config,
         text=_HiddenStatesText("flux2", embeds_guidance=guided), patch=1,
-        latent_input=fields["in_channels"], sample_size=64, context_width=fields["joint_attention_dim"],
+        latent_input=fields["in_channels"], sample_size=(64, 64), context_width=fields["joint_attention_dim"],
         pipeline="Flux2Pipeline" if guided else "Flux2KleinPipeline", origin="empirical")
 
 
@@ -1333,8 +1385,28 @@ def _z_image_denoiser(config: dict, directory: Path, *, dtype: str | None, atten
         component="transformer", model=ZImageTransformer(**fields),
         weights=_transformer_weights(directory, diffusion.translate_z_image_weights),
         built=_built("z_image_transformer", fields, dtype), config=config,
-        text=_HiddenStatesText("z_image"), patch=2, latent_input=fields["in_channels"], sample_size=128,
-        context_width=fields["cap_feat_dim"], pipeline="ZImagePipeline", origin="linspace")
+        text=_HiddenStatesText("z_image"), patch=2, latent_input=fields["in_channels"],
+        sample_size=(128, 128), context_width=fields["cap_feat_dim"], pipeline="ZImagePipeline",
+        origin="linspace")
+
+
+def _wan_denoiser(config: dict, directory: Path, *, dtype: str | None, attention_impl: str) -> _Denoiser:
+    """Build Wan 2.1's video transformer over its VAE's latent, cut into
+    1x2x2 patches, conditioned by its UMT5 encoder.
+
+    `WanPipeline` renders 81 frames at 480x832 by default, 60x104 latent
+    positions through the VAE's 8x, and walks its scheduler's own sigmas.
+    """
+    from dew.interop import diffusion
+    from dew.nn.backbones.wan import WanTransformer
+
+    fields = diffusion.wan_fields(config, dtype=dtype, attention_impl=attention_impl)
+    return _Denoiser(
+        component="transformer", model=WanTransformer(**fields),
+        weights=_transformer_weights(directory, diffusion.translate_wan_weights),
+        built=_built("wan_transformer", fields, dtype), config=config, text=_WanText(),
+        patch=fields["patch_size"][-1], latent_input=fields["in_channels"], sample_size=(60, 104),
+        context_width=fields["text_dim"], pipeline="WanPipeline", frames=81)
 
 
 def _component_config(directory: Path, name: str) -> dict:
@@ -1344,9 +1416,16 @@ def _component_config(directory: Path, name: str) -> dict:
         return json.load(handle)
 
 
-def _geometry(index: Mapping[str, object], size: int) -> tuple[int, int]:
-    """The (height, width) a pipeline is bound to: the index's own, or `size` square."""
-    height, width = index.get("dew_height", size), index.get("dew_width", size)
+def _square(config: Mapping[str, object], default: int | None = None) -> tuple[int, int]:
+    """A config's `sample_size`, one side of the square its pipeline renders."""
+    side = records.integer(config["sample_size"] if default is None else config.get("sample_size", default),
+                           "sample_size")
+    return side, side
+
+
+def _geometry(index: Mapping[str, object], size: tuple[int, int]) -> tuple[int, int]:
+    """The (height, width) a pipeline is bound to: the index's own, or `size`."""
+    height, width = index.get("dew_height", size[0]), index.get("dew_width", size[1])
     if type(height) is not int or type(width) is not int or height < 1 or width < 1:
         raise ValueError("Image geometry must contain positive integer dimensions")
     return height, width
@@ -1368,6 +1447,9 @@ def _diffusion_vae(directory: Path, compute, *, param_dtype: str = "float32",
     from dew.nn.autoencoders.vae import _vae_path
 
     config = _component_config(directory, "vae")
+    if config.get("_class_name") == "AutoencoderKLWan":
+        from dew.nn.autoencoders.wan import load_wan_vae
+        return load_wan_vae(directory, compute, param_dtype=param_dtype, params=params)
     if config.get("_class_name") == "AutoencoderKLQwenImage21":
         from dew.nn.autoencoders.qwen_image import load_qwen_image_vae
         return load_qwen_image_vae(directory, compute, param_dtype=param_dtype, params=params)
@@ -1446,6 +1528,32 @@ def _t5_tower(directory: Path, compute, component: str, tokens: int, *, param_dt
     return T5Segment(tower, tokenizer, component, tokens), params, layouts, config
 
 
+def _wan_conditioning(directory: Path, compute, *, tokens: int, param_dtype: str,
+                      params: Variables | None = None
+                      ) -> tuple[WanConditioner, tuple[WeightLayout, ...], dict[str, Mapping[str, object]]]:
+    """Build Wan's conditioner: the UMT5 encoder, its tokenizer, the
+    parameters and their layouts."""
+    from dew.data.text import load_tokenizer
+    from dew.interop import diffusion
+    from dew.nn.text_encoders import T5EncoderTransformer, _t5_path, t5_embedding, translate_t5_config
+
+    config = _component_config(directory, "text_encoder")
+    if config.get("model_type") != "umt5":
+        raise ValueError(f"Wan's text encoder is a umt5 model, not {config.get('model_type')!r}")
+    tower = T5EncoderTransformer(**translate_t5_config(config), dtype=compute)
+    layouts: tuple[WeightLayout, ...] = ()
+    if params is None:
+        tensors = diffusion.component_tensors(directory, "text_encoder")
+        t5_embedding(tensors)
+        tree, layouts = diffusion.record_layouts(
+            "text_encoder", tensors, _t5_path, ("encoders", "conditioning", "text_encoder"),
+            param_dtype=param_dtype)
+        params = {"text_encoder": tree}
+    encoder = WanConditioner(tower, load_tokenizer(str(directory / "tokenizer")), params, str(directory),
+                             tokens=tokens, param_dtype=param_dtype)
+    return encoder, layouts, {"text_encoder": config}
+
+
 def _qwen_vl_text_config(config: Mapping[str, object]) -> dict:
     """The Qwen3-VL encoder's text_config as the Qwen3 decoder it computes for a prompt.
 
@@ -1495,7 +1603,7 @@ def _qwen_text_path(record: decoders.DecoderFields):
     return path
 
 
-def _qwen_image_conditioning(directory: Path, index: Mapping[str, object], compute, size: int, *,
+def _qwen_image_conditioning(directory: Path, index: Mapping[str, object], compute, size: tuple[int, int], *,
                              tokens: int, param_dtype: str, attention_impl: str,
                              params: Variables | None = None
                              ) -> tuple[QwenImageConditioner, tuple[WeightLayout, ...],
@@ -1556,7 +1664,8 @@ def _hidden_states_path(record: decoders.DecoderFields, family: str, multimodal:
     return path
 
 
-def _hidden_states_conditioning(directory: Path, index: Mapping[str, object], compute, size: int, *,
+def _hidden_states_conditioning(directory: Path, index: Mapping[str, object], compute,
+                                size: tuple[int, int], *,
                                 pipeline: Literal["flux2", "z_image"], tokens: int, guidance: float | None,
                                 param_dtype: str, attention_impl: str, params: Variables | None = None
                                 ) -> tuple[HiddenStatesConditioner, tuple[WeightLayout, ...],

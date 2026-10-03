@@ -677,6 +677,100 @@ def translate_z_image_weights(tensors: Mapping[str, np.ndarray], *, param_dtype:
     return record_layouts("transformer", tensors, lambda name: _z_image_path(name, np.ndim(tensors[name])),
                           ("params",), param_dtype=param_dtype)
 
+
+class WanFields(TypedDict):
+    patch_size: tuple[int, ...]
+    num_attention_heads: int
+    attention_head_dim: int
+    in_channels: int
+    out_channels: int
+    text_dim: int
+    freq_dim: int
+    ffn_dim: int
+    num_layers: int
+    cross_attn_norm: bool
+    qk_norm: str | None
+    eps: float
+    rope_max_seq_len: int
+    dtype: object
+    attention_impl: str
+
+
+def wan_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float32",
+               attention_impl="auto") -> WanFields:
+    """Read a published `WanTransformer3DModel` config into native model
+    fields, refusing what the text-to-video port does not compute: the
+    image-to-video models' image embedder and added key and value
+    projections, and a query and key norm other than across all heads."""
+    for name in ("image_dim", "added_kv_proj_dim", "pos_embed_seq_len"):
+        if config.get(name) is not None:
+            raise ValueError(f"{name} belongs to Wan's image-to-video models, which the port does not "
+                             "compute")
+    qk_norm = config.get("qk_norm", "rms_norm_across_heads")
+    if qk_norm not in (None, "rms_norm_across_heads"):
+        raise ValueError(f"the port computes Wan's qk_norm 'rms_norm_across_heads', not {qk_norm!r}")
+    patch = records.integers(config.get("patch_size", (1, 2, 2)), "patch_size")
+    head_dim = records.integer(config.get("attention_head_dim", 128), "attention_head_dim")
+    if len(patch) != 3 or head_dim % 2:
+        raise ValueError("Wan's patches are (frames, rows, columns) and its heads rotate channel pairs")
+    channels = records.integer(config.get("in_channels", 16), "in_channels")
+    out_channels = config.get("out_channels")
+    return WanFields(
+        patch_size=patch,
+        num_attention_heads=records.integer(config.get("num_attention_heads", 40), "num_attention_heads"),
+        attention_head_dim=head_dim,
+        in_channels=channels,
+        out_channels=channels if out_channels is None else records.integer(out_channels, "out_channels"),
+        text_dim=records.integer(config.get("text_dim", 4096), "text_dim"),
+        freq_dim=records.integer(config.get("freq_dim", 256), "freq_dim"),
+        ffn_dim=records.integer(config.get("ffn_dim", 13824), "ffn_dim"),
+        num_layers=records.integer(config.get("num_layers", 40), "num_layers"),
+        cross_attn_norm=records.boolean(config.get("cross_attn_norm", True), "cross_attn_norm"),
+        qk_norm=qk_norm,
+        eps=records.number(config.get("eps", 1e-6), "eps"),
+        rope_max_seq_len=records.integer(config.get("rope_max_seq_len", 1024), "rope_max_seq_len"),
+        dtype=resolve_dtype(dtype),
+        attention_impl=attention_impl,
+    )
+
+
+_WAN_MODULES = {
+    "patch_embedding": ("patch_embedding_3d",), "proj_out": ("proj_out",),
+    "condition_embedder.time_embedder.linear_1": ("time_embedder_linear_1",),
+    "condition_embedder.time_embedder.linear_2": ("time_embedder_linear_2",),
+    "condition_embedder.time_proj": ("time_proj", "linear"),
+    "condition_embedder.text_embedder.linear_1": ("text_embedder_linear_1",),
+    "condition_embedder.text_embedder.linear_2": ("text_embedder_linear_2",),
+}
+
+
+def _wan_path(name: str) -> tuple[str, ...]:
+    """Return the `WanTransformer` path for a published Wan tensor name."""
+    parts = name.split(".")
+    if name == "scale_shift_table":
+        return (name,)
+    if parts[0] == "blocks" and len(parts) > 2 and parts[1].isdigit():
+        block, rest = (f"blocks_{parts[1]}",), parts[2:]
+        if rest == ["scale_shift_table"]:
+            return (*block, *rest)
+        if rest[0] in ("attn1", "attn2") and len(rest) > 2:
+            return _dit_attention(block, rest[0], rest[1:-1], rest[-1], name, joint=True)
+        if rest[0] == "norm2" and len(rest) == 2:
+            return (*block, "norm2", "scale" if rest[1] == "weight" else _dit_leaf(rest[1]))
+        if rest[:2] == ["ffn", "net"] and rest[2:-1] in (["0", "proj"], ["2"]):
+            return (*block, "ffn", "net_" + "_".join(rest[2:-1]), _dit_leaf(rest[-1]))
+    stem, _, leaf = name.rpartition(".")
+    if stem in _WAN_MODULES:
+        return (*_WAN_MODULES[stem], _dit_leaf(leaf))
+    raise ValueError(f"unknown tensor name {name!r}")
+
+
+def translate_wan_weights(tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
+                          ) -> tuple[ParamTree, tuple[WeightLayout, ...]]:
+    """Map Wan transformer tensors into a parameter tree and the layouts that
+    invert it; its rotary table is computed, so it stores no buffer."""
+    return record_layouts("transformer", tensors, _wan_path, ("params",), param_dtype=param_dtype)
+
 _FLUX_EMBEDDERS = {
     "x_embedder": ("x_embedder",),
     "context_embedder": ("context_embedder",),
@@ -958,8 +1052,10 @@ def save_source(source, values, destination: Path) -> None:
     config = dict(source.config)
     index = dict(config.pop("model_index"))
     if source.inputs is not None:
-        height, width = source.inputs.sample.shape[-3:-1]
-        index.update(dew_height=height, dew_width=width)
+        shape = source.inputs.sample.shape
+        index.update(dew_height=shape[-3], dew_width=shape[-2])
+        if len(shape) == 4:
+            index.update(dew_frames=shape[0])
     (destination / "model_index.json").write_text(json.dumps(index, indent=2))
     component_configs = {name: value for name, value in config.items() if isinstance(value, Mapping)}
     for name, component_config in component_configs.items():

@@ -379,6 +379,8 @@ class WanAutoencoder(AutoEncoder):
         if len(shape) == 3:
             return super().latent_shape(shape)
         frames, *image = shape
+        if frames < 1 or (frames - 1) % self.model.temporal_factor:
+            raise ValueError(f"a Wan VAE encodes 1 + {self.model.temporal_factor}k frames, not {frames}")
         return ((frames - 1) // self.model.temporal_factor + 1, *super().latent_shape(tuple(image)))
 
     def encode_batch(self, params, x, key=None):

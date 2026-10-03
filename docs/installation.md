@@ -64,6 +64,7 @@ The plain install includes Transformers, the Hugging Face Hub client and the ima
 | `torch` | PyTorch on the host, to read `pytorch_model.bin` files and to check unregistered decoders against Transformers |
 | `diffusers` | Loading original-format single-file diffusion checkpoints (`Pretrained.load(..., single_file=)`) |
 | `gguf` | Loading GGUF files (`Pretrained.load(..., gguf_file=)`) |
+| `wan` | ftfy, which cleans Wan 2.1's prompts as its pipeline does |
 | `torchax` | `Pretrained.load(fallback="torchax")`, which runs a Transformers PyTorch model lowered to JAX |
 | `guided` | Regex and JSON-schema guided decoding (`dew.sampling.guided`) |
 | `streaming` | Hugging Face `datasets` and online sources |
