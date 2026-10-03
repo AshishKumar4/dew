@@ -58,6 +58,9 @@ from transformers import (
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "clip"
 REAL_MODEL = "openai/clip-vit-large-patch14"
+REAL_REVISION = "32bd64288804d66eefd0ccbe215aa642df71cc41"
+"""The Hub commit large-patch14/ was written from; with transformers 5.16.1
+and Torch 2.14.0 CPU this tool rewrites reference.npz bit for bit."""
 MAX_LENGTH = 77
 # One patch per image: the vision tower's input is 8 pixels square.
 IMAGE_SIDE = 8
@@ -223,9 +226,9 @@ def write_tiny(directory: Path) -> None:
 
 def write_real(directory: Path) -> None:
     directory.mkdir(parents=True, exist_ok=True)
-    tokenizer = AutoTokenizer.from_pretrained(REAL_MODEL)
-    processor = CLIPImageProcessorPil.from_pretrained(REAL_MODEL)
-    model = CLIPModel.from_pretrained(REAL_MODEL, dtype=torch.float32)
+    tokenizer = AutoTokenizer.from_pretrained(REAL_MODEL, revision=REAL_REVISION)
+    processor = CLIPImageProcessorPil.from_pretrained(REAL_MODEL, revision=REAL_REVISION)
+    model = CLIPModel.from_pretrained(REAL_MODEL, revision=REAL_REVISION, dtype=torch.float32)
 
     reference = encode(model, tokenizer, REAL_PROMPTS)
     # The pixel values are 1.8 MB of upsampled noise; the test recomputes them
@@ -241,7 +244,7 @@ def write_real(directory: Path) -> None:
     # The repo's own config.json, byte for byte, so the translation test reads
     # the real nesting and the transformers 4.16 field dump around it without
     # a download.
-    shutil.copyfile(hf_hub_download(REAL_MODEL, "config.json"),
+    shutil.copyfile(hf_hub_download(REAL_MODEL, "config.json", revision=REAL_REVISION),
                     directory / "config.json")
     print(json.dumps({"hidden": list(reference["last_hidden_state"].shape)}))
 
