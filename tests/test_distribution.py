@@ -307,16 +307,23 @@ def test_a_gpu_process_keeps_its_temporaries_one_free_block(flags, kept):
 
 
 @pytest.mark.mesh(devices=0)
-@pytest.mark.parametrize("before, after", [
-    ((1024, 4096), (4096, 4096)),
-    ((100_000, 200_000), (100_000, 200_000)),
-], ids=["raised_to_a_lowered_hard_limit", "a_higher_soft_limit_kept"])
-def test_a_process_raises_its_descriptor_limit_within_the_hard_limit_it_was_given(before, after):
+@pytest.mark.parametrize("raised", [True, False],
+                         ids=["raised_to_a_lowered_hard_limit", "a_higher_soft_limit_kept"])
+def test_a_process_raises_its_descriptor_limit_within_the_hard_limit_it_was_given(raised):
     """A user without CAP_SYS_RESOURCE cannot raise a hard limit, and a
     container may lower it. The process raises its soft descriptor limit
     toward 65535 as far as its hard limit allows, lowers neither, and
     leaves the core-file limit it was started with as it was."""
     import resource
+
+    # Above 65535 the process keeps its soft limit, within whatever hard
+    # limit this machine gives the test (a GitHub runner's is 65536).
+    hard = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
+    above = 100_000 if hard == resource.RLIM_INFINITY else min(hard, 100_000)
+    if not raised and above <= 65535:
+        pytest.skip(f"this machine's hard descriptor limit, {hard}, leaves no soft limit above 65535")
+    before = (1024, 4096) if raised else (above, above)
+    after = (4096, 4096) if raised else before
 
     def lowered():
         resource.setrlimit(resource.RLIMIT_NOFILE, before)
