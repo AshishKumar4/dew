@@ -18,7 +18,10 @@ class SqrtContinuousNoiseScheduler(ContinuousNoiseScheduler):
     the cosine schedule, which spends fewer steps where an embedding carries
     little noise. The cumulative alpha reaches zero just before t = 1, and the
     rates stop there at (0, 1); Diffusion-LM's last step clips its beta at
-    0.999 instead. The paper trains the plain x_0 loss, so the weight is one.
+    0.999 instead. There, at t >= 1 - s, alpha's derivative in t is
+    infinite, so an objective that differentiates the rates in time
+    (MeanFlow, consistency training) must not draw t from the last 1e-4.
+    The paper trains the plain x_0 loss, so the weight is one.
     """
 
     s: float = 1e-4
