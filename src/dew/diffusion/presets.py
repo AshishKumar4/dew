@@ -20,7 +20,7 @@ from dew.diffusion.schedules import (
     KarrasVENoiseScheduler,
     SqrtContinuousNoiseScheduler,
 )
-from dew.diffusion.schedules.flow import Density
+from dew.diffusion.schedules.flow import Density, _token_mu
 from dew.diffusion.transforms import (
     DirectPredictionTransform,
     FlowMatchPredictionTransform,
@@ -196,8 +196,8 @@ class ResolutionShift:
         if self.tokens is None:
             raise ValueError("a resolution shift needs the image's token count; set tokens "
                              "or build through DiffusionRunConfig, which fills it")
-        slope = (self.max_shift - self.base_shift) / (self.max_tokens - self.base_tokens)
-        return math.exp(self.base_shift + slope * (self.tokens - self.base_tokens))
+        return math.exp(_token_mu(self.tokens, self.base_tokens, self.max_tokens, self.base_shift,
+                                  self.max_shift))
 
 
 @presets("flow")
