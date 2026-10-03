@@ -1457,7 +1457,7 @@ class Trainer(Generic[Loss, Effects]):
             state, shardings, position = self.place()
         else:
             shardings = self.shardings(initial)
-            self.layout.check(initial.params, shardings.params, self.device_mesh)
+            self.layout.check(initial.variables, shardings.variables, self.device_mesh)
             state = jax.device_put(initial, shardings)
             position = None
         run.last_checkpoint = time.perf_counter()
