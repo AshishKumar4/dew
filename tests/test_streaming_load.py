@@ -102,15 +102,18 @@ def test_a_transposed_read_across_many_tiles_is_the_strided_copy_bit_for_bit(dty
         assert stacked.read(index).tobytes() == expected.tobytes(), index
 
 
-def test_concatenated_projections_read_only_the_requested_columns_in_storage_precision():
+@pytest.mark.parametrize("transposed", [True, False])
+def test_concatenated_projections_read_only_the_requested_columns_in_storage_precision(transposed):
     """A shard can start inside Q and cross K/V, with no concatenated host model."""
     import ml_dtypes
 
     rng = np.random.default_rng(9)
-    members = tuple(rng.standard_normal((width, 6)).astype(np.float32) for width in (8, 4, 4))
+    members = tuple(rng.standard_normal((width, 6) if transposed else (6, width)).astype(np.float32)
+                    for width in (8, 4, 4))
     dtype = np.dtype(ml_dtypes.bfloat16)
-    leaf = SourceLeaf.concatenate([SourceLeaf((member,), dtype, transposed=True) for member in members])
-    whole = np.concatenate([member.T.astype(dtype) for member in members], axis=-1)
+    leaf = SourceLeaf.concatenate([SourceLeaf((member,), dtype, transposed=transposed) for member in members])
+    whole = np.concatenate([(member.T if transposed else member).astype(dtype) for member in members],
+                           axis=-1)
     assert leaf.shape == (6, 16)
     for index in ((slice(1, 4), slice(6, 14)), (slice(None), slice(8, 12)),
                   (slice(2, 5), slice(14, 3, -2)), (slice(None), slice(2, 15, 3)),
