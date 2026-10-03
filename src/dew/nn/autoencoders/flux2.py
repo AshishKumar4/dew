@@ -66,12 +66,15 @@ class Flux2Autoencoder(ModuleAutoEncoder[AutoencoderKL]):
 
 
 def load_flux2_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | None = None,
-                   subfolder: str = "vae", param_dtype: str = "float32", params: Variables | None = None
+                   subfolder: str = "vae", param_dtype: str = "float32", params: Variables | None = None,
+                   lazy: bool = False
                    ) -> tuple[Flux2Autoencoder, Variables, tuple[WeightLayout, ...], dict]:
     """Build a published FLUX.2 VAE, its parameters and their source layouts
     from `subfolder` of a pipeline directory or Hub repo. The batch norm's
     running statistics are read from the weights even where `params` are
-    supplied, since they are the latent normalization, not parameters."""
+    supplied, since they are the latent normalization, not parameters.
+    `lazy` leaves the parameters `SourceLeaf`s for a placement to read
+    (`dew.interop.diffusion.record_layouts`)."""
     from dew.interop import diffusion, sources
     from dew.nn.autoencoders.vae import _vae_path
 
@@ -107,6 +110,7 @@ def load_flux2_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: st
             lambda name: None if name in STATISTICS else _vae_path(name, np.ndim(tensors[name])),
             ("autoencoder",),
             param_dtype=param_dtype,
+            lazy=lazy,
         )
     frame = jax.ShapeDtypeStruct((1, model.downscale_factor, model.downscale_factor, model.image_channels),
                                  jnp.float32)
