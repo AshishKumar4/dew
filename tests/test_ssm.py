@@ -43,7 +43,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.nn.ssm import S5Layer
+from dew.nn.ssm import S5Layer, diagonal_recurrence
 
 U = 2.0 ** -24
 BATCH, FEATURES, STATE = 2, 4, 8
@@ -252,6 +252,36 @@ def test_a_long_sequence_stays_within_the_bound():
     for name, value in {**{name: parameters[name] for name in LEAVES}, "u": inputs}.items():
         error = np.abs(np.asarray(value, np.float64) - exact[name])
         assert np.all(error <= gradient_chain(steps, batch, features, state) * U * terms[name]), name
+
+
+def test_the_recurrence_holds_for_poles_all_around_the_circle():
+    """The pole powers are `exp(t log(pole))` with the principal log, so a
+    pole past the imaginary axis (negative real part) or at the branch cut
+    has to give the powers a running product gives. Poles at every angle of
+    the circle, the cut included, at radii up to 0.999 and over 100 positions
+    (seven chunks): the states within K u of their absolute terms, against a
+    complex128 recurrence. S4D-Lin's imaginary parts, up to pi (N - 1), put a
+    trained layer's poles anywhere on the circle once dt reaches 1 / N."""
+    states, steps = 33, 100
+    angles = np.linspace(-np.pi, np.pi, states)
+    radii = np.linspace(0.9, 0.999, states)
+    pole = (radii * np.exp(1j * angles)).astype(np.complex64)
+    rng = np.random.default_rng(3)
+    v = (rng.normal(size=(2, steps, states)) + 1j * rng.normal(size=(2, steps, states))).astype(np.complex64)
+
+    def run(pole, v):
+        x, out = np.zeros(v.shape[::2], v.dtype), []
+        for k in range(steps):
+            x = pole * x + v[:, k]
+            out.append(x)
+        return np.stack(out, axis=1)
+
+    expected = run(pole.astype(np.complex128), v.astype(np.complex128))
+    magnitude = run(np.abs(pole).astype(np.float64), np.abs(v).astype(np.float64))
+    inputs = np.concatenate([v.real, v.imag], axis=-1)
+    actual = np.asarray(jax.jit(diagonal_recurrence)(jnp.asarray(pole), jnp.asarray(inputs)), np.float64)
+    actual = actual[..., :states] + 1j * actual[..., states:]
+    assert np.all(np.abs(actual - expected) <= forward_chain(steps, 1, states) * U * magnitude)
 
 
 def test_the_forward_bound_rejects_an_euler_step(case):
