@@ -1137,6 +1137,35 @@ run by the launches a fused add and norm would save, and the idle between
 steps. Evidence:
 `~/.cache/dew/verification-evidence/serving-gap-final/`.
 
+The idle between steps, 2026-10-03. Two host costs left the device waiting.
+A request's key took three small programs to make at submission (the seed
+moved to the device, made a key, folded), which ran between steps after
+the device had drained; and the admitting step's inputs are fresh buffers
+every call, so XLA updated its CUDA command buffer before it could replay,
+about 5 ms before 9 of a run's 16 admitting steps. Now an integer seed
+stays on the host until the admission's one key program makes and folds
+every row's key (`_row_keys`, the same bits as an eager key), and the
+admitting step compiles without command buffers (`ADMISSION_OPTIONS`); the
+decoding step keeps them. The benchmark submits integer seeds, as a client
+sends them. RTX 4080, the change against its parent, three alternating
+rounds, medians of five runs, tokens a second:
+
+| slots | before | after |
+|---:|---:|---:|
+| 32 | 5664 / 5657 / 5663 | 3960 / 5728 / 5728 |
+| 64 | 7131 / 7229 / 7222 | 7360 / 7359 / 7357 |
+| 128 | 8329 / 8355 / 8346 | 8527 / 8528 / 8524 |
+
+One process ran all five of its 32-slot runs slow (3846-4054) and its
+64- and 128-slot runs at the others' rate; four more alternating rounds at
+32 slots gave 5729-5730 after against 5564-5669 before. An earlier
+session on a loaded host gave the same order at every slot count. The
+tokens and both log-probability streams are the same in every run. A
+traced 64-slot run idles 74.7-83.2 ms before and 40.9-42.1 after (one of
+five traces 76.0, one 838 on a host load spike); what is left is mostly the
+traced client's own keys. Evidence:
+`~/.cache/dew/verification-evidence/serving-idle/`.
+
 ## Quantized serving of the 176M text-to-image model, 2026-09-28
 
 `TextToImage.quantized` serves the denoiser with its kernels stored as int8

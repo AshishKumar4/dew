@@ -27,7 +27,8 @@ server with a batch does both.
 Per step the host does the admission bookkeeping and one copy of the drawn
 ids, and reads a step's draws only after dispatching the next, so the device
 never waits for it; a row's exit reaches the host a step late, and its slot
-is refilled the step after.
+is refilled the step after. Submitting a request with an integer seed
+launches nothing on the device: the admission's program makes its key.
 
 Over a paged cache (`kv_cache=KVCache(page_size=...)`) the rows share one
 page pool whose ledger is `dew.inference.pages.Pages`, and a prompt runs over
@@ -520,18 +521,20 @@ def _state_shardings(mesh: Mesh | None, state: Slots) -> Slots:
         logits=placed(state.decoder.logits, "activation_batch", "activation_vocab")))
 
 
-def _compiled(resident: Formats, carried: Formats, rows: NamedSharding | None) -> jax.stages.Wrapped:
+def _compiled(resident: Formats, carried: Formats, rows: NamedSharding | None,
+              options: dict[str, str] | None = None) -> jax.stages.Wrapped:
     """Compile the step program over a state split into resident and carried halves.
 
     The matrix half is donated so XLA updates the cache in place instead of
     copying it. `rows` places every leaf of an admission, whose rows come
     group by group, the way the slots are placed; None leaves them where they
-    are. The step sets no XLA flag of its own; pass XLA_FLAGS to change the
-    backend's defaults. See docs/performance.md for the measurements.
+    are. `options` are the program's own XLA options (`_program`); pass
+    XLA_FLAGS to change the backend's defaults. See docs/performance.md for
+    the measurements.
     """
     return jax.jit(_stepped, static_argnums=(0, 2, 3, 4), donate_argnums=(5,),
                    in_shardings=(None, resident, carried, rows, None, None, None),
-                   out_shardings=(None, (resident, carried, None)))
+                   out_shardings=(None, (resident, carried, None)), compiler_options=options)
 
 
 def _resident_formats(model: nn.Module, params: Variables, pad_id: int, placement: Placement, steps: int,
@@ -565,21 +568,31 @@ def _opened_in(formats: Formats) -> jax.stages.Wrapped:
     return jax.jit(_opened, static_argnums=(0, 2, 3, 4), out_shardings=formats)
 
 
-_PROGRAMS: dict[tuple[tuple[Format, ...], str, NamedSharding | None], jax.stages.Wrapped] = {}
-"""One step program per resident layout; see `_program`."""
+_PROGRAMS: dict[tuple[tuple[Format, ...], str, NamedSharding | None],
+                tuple[jax.stages.Wrapped, jax.stages.Wrapped]] = {}
+"""One pair of step programs per resident layout; see `_program`."""
+
+ADMISSION_OPTIONS = {"xla_gpu_enable_command_buffer": ""}
+"""The admitting step's XLA options: no CUDA command buffers. Its inputs are
+fresh buffers every call, so a command buffer is updated before it can
+replay, and the device waited out the update: on an RTX 4080 serving
+Qwen3-0.6B at 64 slots, about 5 ms before 9 of a run's 16 admitting steps
+(docs/performance.md). Other backends ignore the option."""
 
 
-def _program(formats: Formats, rows: NamedSharding | None) -> jax.stages.Wrapped:
-    """`_compiled` over `formats`, once per layout: one compile per (model,
+def _program(formats: Formats, rows: NamedSharding | None) -> tuple[jax.stages.Wrapped, jax.stages.Wrapped]:
+    """`_compiled` over `formats`, once per layout, for the decoding step and
+    the admitting one (`ADMISSION_OPTIONS`): one compile per (model,
     admission shape) serves every server that keeps its state in the same
     layout. The formats tree holds the cache mapping and is not hashable
     itself, so its leaves and its structure's text key the programs."""
     leaves, structure = jax.tree_util.tree_flatten(formats)
     key = (tuple(leaves), str(structure), rows)
-    program = _PROGRAMS.get(key)
-    if program is None:
-        program = _PROGRAMS[key] = _compiled(*_split(formats), rows)
-    return program
+    programs = _PROGRAMS.get(key)
+    if programs is None:
+        halves = _split(formats)
+        programs = _PROGRAMS[key] = (_compiled(*halves, rows), _compiled(*halves, rows, ADMISSION_OPTIONS))
+    return programs
 
 
 class Ticket(Future):
@@ -597,10 +610,32 @@ class Ticket(Future):
         self.finished: float | None = None
 
 
+_KEY_DATA = jax.eval_shape(lambda: jax.random.key_data(jax.random.key(0)))
+"""The shape and dtype of a default key's data, read without a device."""
+
+
+def _seed(key: int | jax.Array | None) -> int | jax.Array:
+    """A request's key as a row holds it: an integer seed as given, for
+    `_row_keys` to make into a key, or a key's data."""
+    if isinstance(key, (int, np.integer)) and not isinstance(key, bool):
+        return int(key)
+    return jax.random.key_data(request_key(key))
+
+
 @jax.jit
-def _stacked_keys(keys: tuple[jax.Array | np.ndarray, ...]) -> jax.Array:
-    """Assemble one fixed-width admission's key data without a device-to-host read."""
-    return jnp.stack(keys)
+def _row_keys(keys: tuple[jax.Array | np.ndarray, ...], seeds: jax.Array, seeded: jax.Array,
+              folds: jax.Array) -> jax.Array:
+    """One fixed-width admission's key data, without a device-to-host read:
+    each row's key, `key(seed)` where it came as an integer seed, folded by
+    the row's index in the batch it came in. A key made here has the bits
+    an eager `jax.random.key(seed)` has, so a request draws as it would
+    alone, and submitting it launched nothing (each submit's own small
+    programs left the RTX 4080 idle between serving steps)."""
+    def folded(row: jax.Array, fold: jax.Array) -> jax.Array:
+        return jax.random.key_data(jax.random.fold_in(jax.random.wrap_key_data(row), fold))
+
+    made = jax.vmap(lambda seed: jax.random.key_data(jax.random.key(seed)))(seeds)
+    return jax.vmap(folded)(jnp.where(seeded[:, None], made, jnp.stack(keys)), folds)
 
 
 @dataclass
@@ -609,7 +644,10 @@ class _Row:
 
     prompt: np.ndarray
     budget: int
-    keys: jax.Array
+    seed: int | jax.Array
+    """The request's integer seed, or its key's data where it came as a key."""
+    fold: int
+    """What the row's key is folded by: its index in the batch it came in."""
     ticket: Ticket
     tokens: list[int] = field(default_factory=list)
     behavior: list[float] = field(default_factory=list)
@@ -831,7 +869,7 @@ class Server:
             formats = _resident_formats(
                 model, self.variables, self.pad_id, rows.placement, decode_steps, shapes,
                 _state_shardings(self.mesh, shapes), self._admitted, transforms, stopping, grammar)
-            self._step = _program(formats, self._admitted)
+            self._step, self._admitting = _program(formats, self._admitted)
             self._resident, self._carried = _split(
                 _opened_in(formats)(model, self.variables, self.pad_id, slots, capacity))
 
@@ -1010,19 +1048,20 @@ class Server:
         resolves at once with the prompt alone.
         """
         # One row's key, folded the way `RowPlan.keys` folds row zero.
-        return self._enqueued(prompt, max_new_tokens, jax.random.fold_in(request_key(key), 0))
+        return self._enqueued(prompt, max_new_tokens, _seed(key), 0)
 
-    def _enqueued(self, prompt: Prompt, max_new_tokens: int | None, key: jax.Array) -> Ticket:
+    def _enqueued(self, prompt: Prompt, max_new_tokens: int | None, seed: int | jax.Array,
+                  fold: int) -> Ticket:
         if self._failed is not None:
             raise RuntimeError("the server stopped after a device check failed") from self._failed
-        row = self._prepared(prompt, max_new_tokens, key)
+        row = self._prepared(prompt, max_new_tokens, seed, fold)
         if row.budget == 0:
             self._finish(row, terminated=False)
         else:
             self._queue.append(row)
         return row.ticket
 
-    def _prepared(self, prompt: Prompt, max_new_tokens: int | None, key: jax.Array) -> _Row:
+    def _prepared(self, prompt: Prompt, max_new_tokens: int | None, seed: int | jax.Array, fold: int) -> _Row:
         if isinstance(prompt, (str, ModelInputs)):
             inputs = _prepared(self.processor, prompt, images=None)
             if set(inputs.token_fields) - {"attention_mask"} or inputs.conditioning:
@@ -1041,7 +1080,7 @@ class Server:
             raise ValueError("max_new_tokens is required; the source declares no default budget")
         valid = _check_inputs(self.model, ids, fields, budget, self.sampling, 1).astype(bool)
         self.rows.refuse(int(valid[0].sum()), budget)
-        return _Row(ids[0][valid[0]].astype(np.int32), budget, jax.random.key_data(key), Ticket())
+        return _Row(ids[0][valid[0]].astype(np.int32), budget, seed, fold, Ticket())
 
     def step(self) -> None:
         """One device call: admit what fits, run `decode_steps` iterations, read the last call's."""
@@ -1049,7 +1088,8 @@ class Server:
             raise RuntimeError("the server stopped after a device check failed") from self._failed
         admission = self._admit()
         with self._context():
-            error, (self._resident, self._carried, draws) = self._step(
+            program = self._step if admission is None else self._admitting
+            error, (self._resident, self._carried, draws) = program(
                 self.model, self.variables, self.pad_id, self.rows.placement, self.decode_steps,
                 self._resident, self._carried, admission, self.transforms, self.stopping, self.grammar)
         self.steps += self.decode_steps
@@ -1074,12 +1114,12 @@ class Server:
         Row `i` draws with the request key folded by `i`, as the same batch
         through `TextGeneration` would.
         """
-        base = request_key(key)
+        base = _seed(key)
         inputs = _prepared(self.processor, prompts, images=None)
         valid = inputs.token_fields.get("attention_mask")
         rows = np.asarray(inputs.tokens)
         mask = np.ones(rows.shape, bool) if valid is None else np.asarray(valid).astype(bool)
-        tickets = [self._enqueued(rows[index][mask[index]], max_new_tokens, jax.random.fold_in(base, index))
+        tickets = [self._enqueued(rows[index][mask[index]], max_new_tokens, base, index)
                    for index in range(rows.shape[0])]
         self.run()
         return [ticket.result() for ticket in tickets]
@@ -1118,8 +1158,11 @@ class Server:
         valid = np.zeros((count, width), bool)
         slots = np.full((count,), size, np.int32)
         budgets = np.zeros((count,), np.int32)
-        empty_key = np.zeros(chosen[0][2].keys.shape, chosen[0][2].keys.dtype)
+        empty_key = np.zeros(_KEY_DATA.shape, _KEY_DATA.dtype)
         keys: list[jax.Array | np.ndarray] = [empty_key] * count
+        seeds = np.zeros((count,), np.int64)
+        seeded = np.zeros((count,), bool)
+        folds = np.zeros((count,), np.int32)
         tables = np.zeros((count, self.rows.width), np.int32)
         cursors = np.zeros((count,), np.int32)
         final = np.zeros((count,), bool)
@@ -1129,7 +1172,11 @@ class Server:
             piece = row.prompt[row.prefilled:row.prefilled + width]
             tokens[index, width - len(piece):] = piece
             valid[index, width - len(piece):] = True
-            slots[index], budgets[index], keys[index] = slot % size, row.budget, row.keys
+            slots[index], budgets[index], folds[index] = slot % size, row.budget, row.fold
+            if isinstance(row.seed, int):
+                seeds[index], seeded[index] = row.seed, True
+            else:
+                keys[index] = row.seed
             table = self.rows.table(row)
             tables[index, :len(table)] = table
             cursors[index] = row.prefilled
@@ -1145,7 +1192,7 @@ class Server:
                 valid,
                 slots,
                 budgets,
-                _stacked_keys(tuple(keys)),
+                _row_keys(tuple(keys), seeds, seeded, folds),
                 tables,
                 cursors,
                 final,

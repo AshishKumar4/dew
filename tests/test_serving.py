@@ -279,6 +279,22 @@ def test_submission_keeps_device_keys_on_device_until_admission():
     assert_same_generation(ticket.result(), bound(prompt[None], 5, key=key))
 
 
+@pytest.mark.parametrize("seed", [7, 2**31, -1, 2**40 + 3])
+def test_a_request_with_an_integer_seed_launches_nothing_until_admission(seed):
+    """Submitting with an integer seed moves nothing to the device, not even
+    the seed: the admission's program makes the key (`_row_keys`), whose bits
+    are an eager `jax.random.key(seed)`'s, wrapped where the seed overflows
+    32 bits as eager keys wrap it. The request draws the sampled tokens and
+    likelihoods the one-row task draws with that seed."""
+    bound = task(Sampling(temperature=1.0, top_k=5, eos_id=None))
+    prompt = np.asarray([1, 2, 3], np.int32)
+    server = Server.from_task(bound, slots=2, capacity=128, admission=2)
+    with guarded():
+        ticket = server.submit(prompt, 5, key=seed)
+    server.run()
+    assert_same_generation(ticket.result(), bound(prompt[None], 5, key=seed))
+
+
 def test_repeated_requests_reuse_their_programs_and_read_back_only_results():
     """Text requests of one bucket after the first run the program it
     compiled, and the host waits on nothing but what a request asks for:
