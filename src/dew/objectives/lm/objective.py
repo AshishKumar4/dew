@@ -41,7 +41,7 @@ from flax import linen as nn, struct
 from dew.artifacts import TextSamples, TokenScores, agreed, collective_host
 from dew.data.chat import ROLES_KEY, Role
 from dew.inference import TextGeneration
-from dew.inference.tasks import Processor
+from dew.inference.tasks import Processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
 from dew.nn.backbones.causal_transformer import INTERMEDIATES, CausalTransformer, layer_output, layer_outputs
 from dew.nn.inputs import ModelInputs
@@ -113,18 +113,6 @@ class IndexerTraining:
             raise ValueError(
                 f"weight scales the indexer's KL, so it is positive, got "
                 f"{self.weight}")
-
-
-def _tokenizer_name(processor: Processor | None) -> str | None:
-    """The name a loader rebuilds `processor`'s tokenizer from (`tokenizer_for`),
-    where it is a run's tokenizer that has one; a run without one loads as
-    weights that take ids."""
-    from dew.data.text import ByteTokenizer, HFTokenizer
-    from dew.inference.pipeline import RunProcessor
-
-    if isinstance(processor, RunProcessor) and isinstance(processor.tokenizer, ByteTokenizer | HFTokenizer):
-        return processor.tokenizer.name
-    return None
 
 
 def _decoder(model: nn.Module) -> CausalTransformer | MultimodalTransformer | None:
@@ -735,7 +723,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             'seq_len': self.seq_len,
             'sample_tokens': 0 if samples is None else samples.max_new_tokens,
             'sampling': _to_json(Sampling() if samples is None else samples.sampling, Sampling),
-            'tokenizer': _tokenizer_name(self.processor),
+            'tokenizer': recorded_tokenizer(self.processor),
         }
 
     def pipeline(self, state: TrainState, *, ema: bool | None = None,

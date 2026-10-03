@@ -344,13 +344,13 @@ def test_masked_task_refuses_media_and_non_scalar_logical_positions(masked_sourc
 
 def test_saved_masked_run_refuses_invalid_sample_budget(masked_source, tmp_path):
     source, _ = masked_source
-    fields = {
-        name: value for name, value in source.model_config.items() if name not in ("dtype", "attention_impl")
-    }
-    config = ModelConfig("causal_transformer", fields, dtype="float32", attention_impl="xla")
-    for budget in (-1, True, "8"):
-        (tmp_path / "run.json").write_text(json.dumps({"objective": "masked_diffusion",
-            "model": asdict(config), "tokenizer": "byte", "sample_tokens": budget}))
+    objective = MaskedDiffusionObjective(source.model, MDLM(mask_id=120)(), 8,
+                                         pretrained=source.variables, ema_decay=None)
+    state = Trainer(objective, optax.sgd(0.05), key=jax.random.key(19)).initial_state()
+    for index, budget in enumerate((-1, True, "8")):
+        checkpoints = Checkpoints(str(tmp_path / str(index)))
+        checkpoints.save(0, state, None, artifact={**objective.inference_record(), "sample_tokens": budget})
+        checkpoints.wait()
         with pytest.raises(ValueError, match="sample_tokens"):
-            pipeline(str(tmp_path), ema=False)
+            pipeline(str(tmp_path / str(index)), ema=False)
 

@@ -298,6 +298,19 @@ def _saved_model(record: Mapping[str, object], dtype: DTypeLike | None) -> Model
     return config if compute is None else replace(config, dtype=compute)
 
 
+def recorded_tokenizer(processor: Processor | None) -> str | None:
+    """The tokenizer name a run's record keeps for `processor`, which
+    `_saved_processor` rebuilds through `tokenizer_for`: a run tokenizer's
+    own name, byte or Hugging Face. Any other processor records none, and the
+    run loads as weights that take ids."""
+    from dew.data.text import ByteTokenizer, HFTokenizer
+    from dew.inference.pipeline import RunProcessor
+
+    if isinstance(processor, RunProcessor) and isinstance(processor.tokenizer, ByteTokenizer | HFTokenizer):
+        return processor.tokenizer.name
+    return None
+
+
 def _saved_processor(record: Mapping[str, object]) -> Processor | None:
     """Build the run's tokenizer into a task's host processor."""
     from dew.data.text import tokenizer_for

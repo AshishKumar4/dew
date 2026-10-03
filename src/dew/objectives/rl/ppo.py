@@ -16,6 +16,7 @@ from dew.artifacts import agreed
 from dew.inference.tasks import Processor, TextGeneration
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of
 from dew.objectives.base import Aux, EMASpec, Objective, Ratio, Shown, Step, Variables
+from dew.records import JSON, json_value, record
 from dew.registry import objectives
 from dew.rl import gae
 from dew.rl.advantage import MEAN_EPS, WHITEN_EPS
@@ -148,6 +149,15 @@ class PPOObjective(Objective[Ratio, Variables]):
     def policy(self, variables: Variables) -> EpisodeInference:
         """Bind the policy subtree when an episode collector supplies the full tree."""
         return _Policy(self.actor.policy(_part(variables, "policy")))
+
+    def inference_record(self) -> JSON:
+        """The actor's decoder record under PPO's name: a loader rebuilds the
+        decoder and takes the policy half of the saved tree."""
+        actor = self.actor.inference_record()
+        if actor is None:
+            return None
+        return json_value({**record(actor, 'inference record'), 'objective': objectives.name_of(type(self))},
+                          'inference record')
 
     def pipeline(self, state: TrainState, *, ema: bool | None = None,
                  processor: Processor | None = None) -> TextGeneration:
