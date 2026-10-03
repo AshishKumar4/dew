@@ -137,7 +137,12 @@ class SourceLeaf:
                     stop = int(columns[last]) - offset + step
                     source = (*index[:-1], slice(int(columns[first]) - offset,
                                                 None if step < 0 and stop < 0 else stop, step))
-                    output[..., first:last + 1] = self._member(member, source)
+                    if self.transposed:
+                        output[..., first:last + 1] = self._member(member, source)
+                    else:
+                        # Storage dtype is part of the recipe: copy straight
+                        # into the shard, without a cast buffer.
+                        np.copyto(output[..., first:last + 1], member[source], casting="unsafe")
                 offset += view.shape[-1]
             return output
         if not self.stacked:
