@@ -330,8 +330,10 @@ def write_index(directory: Path, weight_map: Mapping[str, str], total_size: int 
     os.replace(temporary, index)
 
 
-_OWN_SHARD = re.compile(r"model-[0-9a-f]{8}-\d{5}-of-\d{5}\.safetensors")
-"""The shard names `save_sharded` writes."""
+_REPLACED = re.compile(r"model\.safetensors|model-(?:[0-9a-f]{8}-)?\d{5}-of-\d{5}\.safetensors")
+"""The weight files an export replaces: the single file, and shards named as
+`save_sharded` (`model-<token>-00001-of-00002`) and transformers'
+`save_pretrained` (`model-00001-of-00002`) name them."""
 
 
 def save_sharded(
@@ -353,9 +355,11 @@ def save_sharded(
     loader reads a mix of the two. Each shard takes a name no earlier export
     can hold, so no file an old index names is overwritten; the index (or,
     unsharded, `model.safetensors`) is published last, in one rename, and
-    commits the export. Only then are the files the old export named and
-    this one does not removed, with shards an interrupted export of this
-    writer left unindexed. transformers reads a local `model.safetensors`
+    commits the export. Only then are the earlier weight files removed: the
+    names `_REPLACED` matches that this export did not write, read off the
+    directory's own listing. An old index's contents name nothing to
+    delete, so one that names a path outside the directory, or a file of
+    another name, removes nothing. transformers reads a local `model.safetensors`
     before an index (modeling_utils.py:594-605, 5.16.1), so a crash while an
     export changes between one file and shards can leave Dew and transformers
     each reading a whole export, but not the same one. Any other file, a precision variant such as
@@ -370,9 +374,8 @@ def save_sharded(
         dict(specs), get_storage_size=lambda spec: math.prod(spec.shape) * np.dtype(spec.dtype).itemsize,
         filename_pattern="model{suffix}.safetensors", max_shard_size=max_shard_size)
     old_index = folder / INDEX_FILE
-    listing = _listing(folder)
     # An interrupted export may leave both an index and a single file.
-    previous = set(weight_files(listing, "", _json_reader(folder))) | ({WEIGHTS_FILE} & listing)
+    replaced = {name for name in _listing(folder) if _REPLACED.fullmatch(name)}
     token = secrets.token_hex(4)
     names = {filename: (filename.replace("model-", f"model-{token}-", 1) if split.is_sharded else filename)
              for filename in split.filename_to_tensors}
@@ -382,14 +385,9 @@ def save_sharded(
     if split.is_sharded:
         write_index(folder, {name: names[filename] for name, filename in split.tensor_to_filename.items()},
                     split.metadata["total_size"])
-        stale = previous - set(names.values())
     else:
         old_index.unlink(missing_ok=True)
-        stale = previous - {WEIGHTS_FILE}
-    # Shards an interrupted export published and never indexed carry this
-    # writer's own token pattern and are no one else's.
-    stale |= {name for name in listing if _OWN_SHARD.fullmatch(name)} - set(names.values())
-    for name in stale:
+    for name in replaced - set(names.values()):
         (folder / name).unlink(missing_ok=True)
 
 

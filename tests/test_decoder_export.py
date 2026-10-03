@@ -524,6 +524,34 @@ def test_an_interrupted_re_export_leaves_the_previous_export_whole(tmp_path, mon
         "model.fp16.safetensors", "model.safetensors"]
 
 
+@pytest.mark.parametrize("sharded", [False, True])
+def test_a_re_export_deletes_only_its_own_files_whatever_the_old_index_names(tmp_path, sharded):
+    """The old index is the directory's content, not the writer's: one whose
+    weight_map names a path outside the export, an absolute one or another
+    file beside it leaves those files alone. What a re-export removes is the
+    writer's own names, `model.safetensors` and `model-*-of-*.safetensors`
+    shards, that it did not just write."""
+    from dew.interop.safetensors_io import INDEX_FILE, read_weights, save_sharded
+
+    export, outside = tmp_path / "export", tmp_path / "outside.txt"
+    export.mkdir()
+    outside.write_text("not the export's")
+    (export / "notes.safetensors").write_text("not a weight file")
+    (export / "model-00001-of-00002.safetensors").write_bytes(b"a stale shard")
+    (export / INDEX_FILE).write_text(json.dumps({"metadata": {}, "weight_map": {
+        "a": "../outside.txt", "b": str(outside.resolve()), "c": "notes.safetensors",
+        "d": "model-00001-of-00002.safetensors"}}))
+    tensors = {f"layer{index}": np.full((64,), index, np.float32) for index in range(4)}
+    save_sharded(tensors, export, max_shard_size=300 if sharded else "5GB")
+
+    assert outside.read_text() == "not the export's"
+    assert (export / "notes.safetensors").read_text() == "not a weight file"
+    assert not (export / "model-00001-of-00002.safetensors").exists()
+    assert (export / INDEX_FILE).exists() == sharded
+    for name, value in read_weights(export).items():
+        np.testing.assert_array_equal(value, tensors[name])
+
+
 def test_a_quantized_source_exports_trained_weights_in_its_original_format(tmp_path):
     """The source config describes real FP8 bytes after a training update."""
     import torch
