@@ -134,11 +134,12 @@ traced neither side, and on the RTX 4080 the same model's gap to torch is
 attention (cuDNN's kernels 5.6 ms a step against FlashAttention-2's 4.4,
 below), which there the optimizer's lead covers. The older rows predate
 every change listed above. On Qwen3-0.6B (at `8c391009`) torch idled 18.3
-ms a step on the host, so its device did 120 ms of work against Dew's 138: Dew's attention is 21.4 against 16.6 ms (cuDNN's sm80 backward
-against FlashAttention-2), its converts 17.8 ms and its reductions 10.9
-against 4.2 (the norms and the fp32 head), while its GEMMs are 64.9 against
-70.9 and its update, inside 22.7 ms of copies, beats torch's 19.2 ms of
-copies plus 17.8 of optimizer. The Mamba-2 row (and the MoE at
+ms a step on the host, so its device did 120 ms of work against Dew's 138:
+Dew's attention was 21.4 against 16.6 ms (cuDNN's sm80 backward against
+FlashAttention-2), its converts 17.8 ms and its reductions 10.9 against 4.2
+(the norms and the fp32 head), while its GEMMs were 64.9 against 70.9 and
+its update, inside 22.7 ms of copies, beat torch's 19.2 ms of copies plus
+17.8 of optimizer. The Mamba-2 row (and the MoE at
 `157bc21a`) won only because torch idled on the host (77 to 177 ms a step);
 on device time Dew was 1.7 and 2.0 times slower (its expert GEMMs and the
 XLA path of the SSD scan).
