@@ -160,6 +160,20 @@ def write_cache(buffer: jax.Array, values: jax.Array, positions: jax.Array) -> j
     gathers the values and indices of every row onto every device first.
     """
     slots = jnp.where(positions >= 0, positions, DROPPED)
+    if values.shape[1] >= buffer.shape[1]:
+        # A write as wide as the buffer (a prefill into a cache at the
+        # prompt's width) gathers each slot's token instead: XLA lays such a
+        # buffer out with its slots minor for the attention that reads it,
+        # and a scatter of whole tokens into that layout ran at 28 GB/s, 8 ms
+        # of a 40 ms admission step on an RTX 4080 (docs/performance.md).
+        # Only the [rows, slots] map of which token lands where is scattered.
+        tokens = jnp.broadcast_to(jnp.arange(values.shape[1], dtype=jnp.int32), slots.shape)
+        source = jax.vmap(lambda at, index: jnp.full(buffer.shape[1], -1, jnp.int32).at[at].set(
+            index, mode="drop"))(slots, tokens)
+        picked = jnp.take_along_axis(values, jnp.maximum(source, 0).reshape(
+            *source.shape, *(1,) * (values.ndim - 2)), axis=1)
+        held = (source >= 0).reshape(*source.shape, *(1,) * (values.ndim - 2))
+        return jnp.where(held, picked.astype(buffer.dtype), buffer)
     return jax.vmap(lambda row, incoming, at: row.at[at].set(incoming.astype(row.dtype), mode="drop"))(
         buffer, values, slots)
 
