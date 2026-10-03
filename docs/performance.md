@@ -1368,8 +1368,8 @@ At 128 tokens the shapes disagree, in two more sessions of merged against apart:
 A bf16 model over fp32 parameters cast each weight to bf16 in the forward,
 a CUDA kernel per weight every step (on Qwen3-0.6B at 1 x 1024 on the RTX
 4080, 5.7 ms of casts), and widened each weight's bf16 gradient back to
-fp32 in the backward (1.8 ms). On `sm89` the update now writes the bf16
-copy of each such weight (`TrainState.compute`) from the new fp32 value,
+fp32 in the backward (1.8 ms). On `sm80` and `sm89` the update now writes
+the bf16 copy of each such weight (`TrainState.compute`) from the new fp32 value,
 the forward reads the copy, and the gradient reaches the update in bf16,
 widened as the update reads it (`dew.training.narrow`). Only a weight whose
 one use in the loss is that cast is copied: a tied embedding's table (two
@@ -1390,7 +1390,15 @@ its parent, two alternating rounds, ms:
 
 No row moved to another rung of the fit ladder. The MoE's experts run
 through the grouped matmul, which reads them otherwise, so it gains
-nothing.
+nothing. An A100 40 GB (Colab, integration `6a220e31`, copies off and on
+in one session, two alternating rounds, ms):
+
+| row | before | copies | peak GiB |
+|---|---:|---:|---:|
+| Qwen3-0.6B, 4 x 1024, AdamW (dew_lm) | 128.45 / 128.37 | 125.88 / 125.93 | 16.08 -> 16.08 |
+| 176M hybrid DiT, batch 16 | 45.71 / 45.01 | 40.79 / 41.07 | 5.77 -> 5.78 |
+| 176M hybrid DiT, batch 32 | 63.96 / 63.96 | 62.66 / 62.89 | 8.43 -> 8.45 |
+| SimpleDiT 768, batch 32 | 39.26 / 39.30 | 38.24 / 38.24 | 6.12 -> 6.13 |
 
 The forward and the gradients are the cast's to the bit: under plain SGD
 every parameter is bitwise the same after three steps
@@ -1403,7 +1411,12 @@ runs of the parent differ by 3.9e-3. `tools/lm_step_parity.py`'s decoder
 (100 steps) and the hybrid DiT on one batch (300 steps), twice each way:
 the DiT's four runs are bitwise equal at every step, and the decoder's two
 runs with copies equal one of the parent's two at every step, the parent's
-pair 6.9e-4 apart at most.
+pair 6.9e-4 apart at most. On the A100, whose runs are not repeatable, the
+decoder's runs with and without copies are at most 1.13e-3 apart at any
+step, within the 8.3e-4 and 1.13e-3 each side's pair differs by, and the
+DiT's at most 2.26e-2, against 2.23e-2 and 1.53e-2 within its pairs; the
+final losses are 0.36587 and 0.36163 without copies, 0.36583 and 0.36631
+with.
 
 A TPU fuses the cast into the matmul, so there the copies would only add
 writes (Qwen3-0.6B's widths at 8 x 1024 compiled for a v6e: 85.8 GiB

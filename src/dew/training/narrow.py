@@ -33,9 +33,10 @@ from jax.extend import core
 
 from dew.objectives.base import Variables, merge, select
 
-NARROW_COPY_GENERATIONS = frozenset({'sm89'})
-"""The CUDA generations whose steps read narrow copies: on an RTX 4080 Qwen3-0.6B
-at 1 x 1024 tokens runs 96.4 against 90.9 ms."""
+NARROW_COPY_GENERATIONS = frozenset({'sm80', 'sm89'})
+"""The CUDA generations whose steps read narrow copies: Qwen3-0.6B at 1 x 1024
+tokens runs 96.1 against 90.8 ms on an RTX 4080, and at 4 x 1024 128.4
+against 125.9 on an A100 (docs/performance.md)."""
 
 _PASSED_THROUGH = ("jit", "pjit", "closed_call", "core_call", "remat2", "checkpoint")
 
