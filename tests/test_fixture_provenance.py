@@ -1,20 +1,20 @@
-"""What a numerical fixture claims about where its numbers came from.
+"""Where every array file under tests/fixtures came from.
 
-tests/fixtures/provenance.json holds one record per fixture (a file, or a
-directory for every file in it) that claims its values came from somewhere
-other than the test reading them. A reference record names the generating
+tests/fixtures/provenance.json has two parts. `references` holds one record
+per fixture (a file, or a directory for every file in it) that claims its
+values came from somewhere other than the test reading them. A record names the generating
 tool and, for each upstream the numbers come from, its repo and the pinned
 release or commit, and how the tool gets them: `runs` names the package the
 tool imports and calls, `"runs": "fetched"` says the tool fetches the
 upstream's source at that commit (so the commit is in the tool), and
 `"transcribed": true` says the tool reimplements the upstream's equations
 rather than executing its code. A fixture Dew computed is a Dew regression
-golden and says so (`"generator": "dew"`), claiming no upstream. Inputs
-that both sides read (weights, ids, pixels) are no claim and need no record.
+golden and says so (`"generator": "dew"`), claiming no upstream.
 
-What this does not see: a new fixture added with no record at all. The
-rule holds the records that exist; a reference written without one is
-caught in review, not here.
+`inputs` groups the files both sides only read (weights, ids, pixels): the
+tool that wrote them, or the pinned repo they were taken from, and the
+files. Every .npz, .npy, .safetensors, .pt, .xz and .jaxexport file is in
+exactly one of the two parts, so a new array file with no record fails.
 """
 
 import json
@@ -25,7 +25,10 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tests" / "fixtures"
-RECORDS = json.loads((FIXTURES / "provenance.json").read_text())
+PROVENANCE = json.loads((FIXTURES / "provenance.json").read_text())
+RECORDS = PROVENANCE["references"]
+INPUTS = PROVENANCE["inputs"]
+ARRAYS = (".npz", ".npy", ".safetensors", ".pt", ".xz", ".jaxexport")
 
 
 def imports(source: str, package: str) -> bool:
@@ -76,7 +79,7 @@ def test_a_fixture_that_names_an_upstream_names_its_pin_and_the_tool_that_runs_i
 
 def test_the_rule_refuses_what_it_is_for():
     """Each way a record can overclaim is refused."""
-    real = {"tool": "tools/hf_checkpoint_logits.py",
+    real = {"tool": "tools/gemma4_tiny_reference.py",
             "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]}
     path = "hf/gemma4-ple/logits.npy"
     assert problems(path, real) == []
@@ -88,3 +91,52 @@ def test_the_rule_refuses_what_it_is_for():
     assert problems(path, {**real, "sources": []})
     assert problems(path, {"generator": "dew", **real})
     assert problems("no/such/fixture.npz", {"generator": "dew"})
+    with pytest.raises(AssertionError):
+        test_an_input_group_names_what_wrote_its_files(
+            {"tool": "tools/audio_reference.py", "files": ["hf/llama-tiny/model.safetensors"]})
+
+
+def arrays() -> list[str]:
+    """Every array file under tests/fixtures, relative to it."""
+    return sorted(str(path.relative_to(FIXTURES)) for path in FIXTURES.rglob("*")
+                  if path.is_file() and path.name.endswith(ARRAYS))
+
+
+def owners(path: str) -> list[str]:
+    """The records that cover `path`: the reference naming it or its nearest
+    directory, and input groups listing it."""
+    found = [key for key in RECORDS if path == key or path.startswith(key + "/")]
+    nearest = [max(found, key=len)] if found else []
+    return nearest + [f"inputs from {group.get('tool') or group.get('from')}"
+                      for group in INPUTS if path in group["files"]]
+
+
+def named_in(source: str, name: str) -> bool:
+    """Whether `source` names `name`: literally, or through a formatted
+    string such as f"qwen38-{kind}-tiny" or f"video_{index}.npy"."""
+    if name in source:
+        return True
+    templates = re.findall(r"""f["']([^"'\n]*\{[^"'\n]*)["']""", source)
+    return any(re.fullmatch(re.sub(r"\\\{[^}]*\\\}", ".+", re.escape(template)), name)
+               for template in templates)
+
+
+@pytest.mark.parametrize("group", INPUTS, ids=lambda group: group.get("tool") or group.get("from"))
+def test_an_input_group_names_what_wrote_its_files(group):
+    """The group's tool exists and its source names the directory of each file
+    it claims to write (a top-level file, by its own name)."""
+    assert [path for path in group["files"] if not (FIXTURES / path).is_file()] == []
+    if "from" in group:
+        assert re.fullmatch(r"[\w.-]+/[\w.-]+@[0-9a-f]{40}", group["from"]), group["from"]
+        return
+    assert (ROOT / group["tool"]).is_file(), group["tool"]
+    source = (ROOT / group["tool"]).read_text()
+    unnamed = [path for path in group["files"]
+               if not named_in(source, Path(path).parent.name or Path(path).name.split(".")[0])]
+    assert unnamed == []
+
+
+def test_every_array_file_has_exactly_one_record():
+    """A file in no record is a fixture nobody has said the origin of; a file
+    in two is either an input claimed as a reference or listed twice."""
+    assert {path: owners(path) for path in arrays() if len(owners(path)) != 1} == {}
