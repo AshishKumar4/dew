@@ -548,8 +548,9 @@ def wan_prompt(text: str) -> str:
     """
     try:
         import ftfy
-    except ImportError as missing:  # a dependency of Dew's, missing only from a stripped environment
-        raise ValueError("Wan's pipelines clean each prompt with ftfy; install ftfy") from missing
+    except ImportError as missing:  # the wan extra's one package
+        raise ValueError("Wan's pipelines clean each prompt with ftfy; install it with "
+                         "`pip install 'dewml[wan]'`") from missing
     text = html.unescape(html.unescape(ftfy.fix_text(text))).strip()
     return re.sub(r"\s+", " ", text).strip()
 

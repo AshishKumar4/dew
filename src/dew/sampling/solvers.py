@@ -1199,8 +1199,11 @@ class UniPC:
                           jnp.asarray(predictor, jnp.float32))
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
-        def weighted(row, terms):
-            return sum(row[index] * term for index, term in enumerate(terms))
+        def weighted(row: jax.Array, terms: list[jax.Array]) -> jax.Array:
+            total = row[0] * terms[0]
+            for index in range(1, len(terms)):
+                total = total + row[index] * terms[index]
+            return total
 
         interval = jnp.argmin(jnp.abs(state.grid - t.reshape(-1)[0]))
         here = denoised if self.predict_x0 else eps
