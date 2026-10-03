@@ -126,11 +126,11 @@ ENCODED = {"z_image": "HiddenStatesConditioner", "wan": "WanConditioner"}
 PROMPTS = ["a red bird", "two cats on a mat"]
 
 
-def encoded(directory: Path, conditioner: str, rows: list) -> dict:
+def encoded(directory: Path, conditioner: str, rows: list, placement: dict) -> dict:
     """`rows` encoded with the pipeline's conditioner loaded alone."""
     import dew.inputs.diffusion as conditioners
 
-    encoder = getattr(conditioners, conditioner).from_pretrained(str(directory), dtype="float32")
+    encoder = getattr(conditioners, conditioner).from_pretrained(str(directory), dtype="float32", **placement)
     return {"conditioning": jax.jit(encoder.encode)(encoder.params, encoder.tokenize(rows))}
 
 
@@ -147,10 +147,45 @@ def test_an_encoded_call_without_the_text_encoder_draws_the_prompted_images(extr
     assert "conditioning" not in lean.variables["encoders"]
     blank = whole.inputs.conditions["conditioning"].unconditional
     lean_task = lean.text_to_image()
-    walked = lean_task(lean_task.prepare(conditions=encoded(directory, ENCODED[family], PROMPTS),
-                                         unconditional=encoded(directory, ENCODED[family], [blank]),
-                                         key=3, steps=2), key=3).host().images
+    conditioner = ENCODED[family]
+    prepared = lean_task.prepare(conditions=encoded(directory, conditioner, PROMPTS, {}),
+                                 unconditional=encoded(directory, conditioner, [blank], {}), key=3, steps=2)
+    walked = lean_task(prepared, key=3).host().images
     assert np.asarray(walked).tobytes() == np.asarray(prompted).tobytes()
+
+
+@pytest.mark.mesh
+@pytest.mark.parametrize("family", sorted(ENCODED))
+def test_on_a_mesh_an_encoded_call_is_the_prompted_call(extracted, family):
+    """Over an FSDP mesh, which pads the rows to its devices: the encoded
+    call draws the prompted call's noise bit for bit, and given the
+    encodings the prompted call made it walks to its images bit for bit.
+    The conditioner alone encodes two rows where the task encodes them
+    padded and sharded, so XLA sums its contractions in another order: those
+    encodings sit within float32 rounding of the task's (1e-5 of their
+    largest value; 9e-7 observed), not on them."""
+    directory = extracted[family]
+    placement = {"mesh": MeshSpec(fsdp=jax.device_count()), "layout": LAYOUT}
+    whole = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla", **placement)
+    task = whole.text_to_image()
+    prompted = task.prepare(PROMPTS, key=3, steps=2)
+    lean = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla", text=False,
+                                 **placement)
+    lean_task = lean.text_to_image()
+    rows = len(PROMPTS)
+    own = lean_task.prepare(conditions=jax.tree.map(lambda leaf: leaf[:rows], prompted.conditions),
+                            unconditional=prompted.unconditional, key=3, steps=2)
+    assert np.asarray(own.noise).tobytes() == np.asarray(prompted.noise).tobytes()
+    walked = lean_task(own, key=3).host().images
+    assert np.asarray(walked).tobytes() == np.asarray(task(prompted, key=3).host().images).tobytes()
+    alone = encoded(directory, ENCODED[family], PROMPTS, placement)["conditioning"]
+    for got, want in zip(jax.tree.leaves(alone), jax.tree.leaves(prompted.conditions["conditioning"]),
+                         strict=True):
+        got, want = np.asarray(got), np.asarray(want)[:rows]
+        if want.dtype == bool:
+            np.testing.assert_array_equal(got, want)
+        else:
+            assert np.abs(got - want).max() <= 1e-5 * max(1.0, np.abs(want).max())
 
 
 def test_a_pipeline_without_its_text_encoder_reads_none_of_its_weights(extracted, tmp_path):
@@ -177,7 +212,7 @@ def test_a_pipeline_without_its_text_encoder_refuses_what_reads_it(extracted, tm
         lean.diffusion_objective()
     with pytest.raises(ValueError, match="text=False"):
         lean.save(tmp_path / "saved")
-    given = encoded(extracted["wan"], "WanConditioner", PROMPTS)
+    given = encoded(extracted["wan"], "WanConditioner", PROMPTS, {})
     with pytest.raises(ValueError, match="one of the two"):
         task.prepare(PROMPTS, conditions=given, key=0, steps=2)
     unguided = task.prepare(conditions=given, key=0, steps=2)
