@@ -23,7 +23,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.objectives.base import Variables
 from dew.training.host import evict
 
 
@@ -126,7 +125,7 @@ type LazyTree = dict[str, np.ndarray | SourceLeaf | LazyTree]
 """A variables collection whose leaves are stored arrays or `SourceLeaf` recipes."""
 
 
-def materialize(tree: LazyTree) -> Variables:
+def materialize(tree: LazyTree) -> LazyTree:
     """Read every `SourceLeaf` of `tree` whole, leaving arrays as they are."""
     return {name: (materialize(value) if isinstance(value, dict)
                    else value.read() if isinstance(value, SourceLeaf) else value)

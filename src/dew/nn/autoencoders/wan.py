@@ -397,7 +397,8 @@ class WanAutoencoder(AutoEncoder):
 
 
 def load_wan_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | None = None,
-                 subfolder: str = "vae", param_dtype: str = "float32", params: Variables | None = None
+                 subfolder: str = "vae", param_dtype: str = "float32", params: Variables | None = None,
+                 lazy: bool = False
                  ) -> tuple[WanAutoencoder, Variables, tuple[WeightLayout, ...], dict]:
     """Build a published Wan 2.1 VAE, its parameters and their source layouts
     from `subfolder` of a pipeline directory or Hub repo, such as
@@ -405,7 +406,8 @@ def load_wan_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str 
     tensor the module declares must be published, in the shape it declares.
 
     Supplied `params` are bound unchanged: only the config is read, and no
-    source layouts are returned."""
+    source layouts are returned. `lazy` leaves read ones `SourceLeaf`s for a
+    placement to read (`dew.interop.diffusion.record_layouts`)."""
     from dew.interop import diffusion, sources
 
     directory = sources.snapshot(
@@ -422,7 +424,7 @@ def load_wan_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str 
         tensors = diffusion.component_tensors(directory, subfolder)
         params, layouts = diffusion.record_layouts(
             "vae", tensors, lambda name: wan_vae_path(name, np.ndim(tensors[name])), ("autoencoder",),
-            param_dtype=param_dtype)
+            param_dtype=param_dtype, lazy=lazy)
     video = jax.ShapeDtypeStruct(
         (1, 1 + model.temporal_factor, model.downscale_factor, model.downscale_factor, 3), jnp.float32
     )
