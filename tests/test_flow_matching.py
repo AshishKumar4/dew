@@ -5,12 +5,15 @@ the DDIM and Euler solvers already integrate the flow ODE, and a toy
 end-to-end run proving the objective actually learns a distribution.
 """
 
+from pathlib import Path
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
 from flax import linen as nn
+from reference_error import assert_as_exact_as_the_reference
 
 from dew.diffusion import FlowMatchPredictionTransform, Process, broadcast_rates, expand, presets
 from dew.diffusion.schedules import FlowMatchingScheduler
@@ -40,26 +43,30 @@ def test_endpoints_are_data_and_noise(rng):
     assert jnp.allclose(at_one, noise, atol=1e-6)
 
 
-def test_timesteps_are_logit_normal(rng):
-    schedule = FlowMatchingScheduler(logit_mean=-0.3, logit_std=1.4)
-    steps = schedule.sample_t(rng, 50000)
-    assert jnp.all((steps > 0) & (steps < 1))
-    logits = jnp.log(steps) - jnp.log1p(-steps)
-    assert abs(float(jnp.mean(logits)) - (-0.3)) < 0.05
-    assert abs(float(jnp.std(logits)) - 1.4) < 0.05
+DENSITIES = dict(np.load(Path(__file__).parent / "fixtures" / "flow" / "densities.npz"))
 
 
-def test_mode_times_are_the_sd3_training_scripts_draws(monkeypatch):
-    """SD3's mode density (Esser et al. 2024, Eq. 20) as diffusers' SD3
-    training scripts draw it, fed the same uniform draws."""
-    torch = pytest.importorskip("torch")
-    training = pytest.importorskip("diffusers.training_utils")
-    key, count = jax.random.PRNGKey(4), 4096
-    uniform = jax.random.uniform(key, (count,), jnp.float32)
-    monkeypatch.setattr(torch, "rand", lambda size, **_: torch.from_numpy(np.asarray(uniform)))
-    expected = training.compute_density_for_timestep_sampling("mode", count, mode_scale=1.29)
-    drawn = FlowMatchingScheduler(density="mode", mode_scale=1.29).sample_t(key, count)
-    np.testing.assert_allclose(np.asarray(drawn), expected.numpy(), rtol=1e-6, atol=1e-7)
+@pytest.mark.parametrize("case,fields", [
+    ("logit_normal", {"density": "logit_normal"}),
+    ("logit_normal_shifted", {"density": "logit_normal", "logit_mean": 0.5, "logit_std": 0.8}),
+    ("mode", {"density": "mode", "mode_scale": 1.29}),
+    ("mode_negative", {"density": "mode", "mode_scale": -0.5}),
+])
+def test_training_times_are_diffusers_sd3_densities(case, fields):
+    """SD3's training-time densities (Esser et al. 2024, section 3.1) as
+    Diffusers 0.34.0's `compute_density_for_timestep_sampling` computes them
+    (tools/flow_density_reference.py), on the draw `sample_t` makes from the
+    same key, held to the float64 rule: logit-normal at its default and
+    shifted, and the mode density on both sides of uniform."""
+    drawn = FlowMatchingScheduler(**fields).sample_t(jax.random.key(0), DENSITIES[case].shape[0])
+    assert_as_exact_as_the_reference(drawn, DENSITIES[case], DENSITIES[f"{case}_f64"], case)
+
+
+def test_uniform_training_times_are_the_draw_itself():
+    """Diffusers' fallback density is the uniform draw unchanged, as Dew's is."""
+    count = DENSITIES["uniform"].shape[0]
+    drawn = FlowMatchingScheduler(density="uniform").sample_t(jax.random.key(0), count)
+    np.testing.assert_array_equal(drawn, DENSITIES["uniform"])
 
 
 def test_cosmap_times_follow_the_papers_density(rng):
