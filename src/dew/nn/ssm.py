@@ -1,8 +1,8 @@
 """Mix tokens with S5 state-space layers and a 2D state fusion convolution.
 
 The S5 layer is a diagonal SSM from the S4D-Lin poles, run in chunks of
-pole-power products on a GPU and as one complex scan on a TPU
-(`diagonal_recurrence`). The fusion convolution is
+pole-power products (`diagonal_recurrence`) on a GPU and the CPU, and by
+`associative_scan` on a TPU (`_directions`). The fusion convolution is
 Spatial-Mamba's, and the two together are the SSM mixer of `ModulatedBlock`.
 """
 
@@ -69,42 +69,18 @@ def _carried(pole: jax.Array, last: jax.Array) -> jax.Array:
 
 def diagonal_recurrence(pole: jax.Array, inputs: jax.Array, chunk: int = SCAN_CHUNK) -> jax.Array:
     """The states `x_k = pole * x_(k-1) + v_k`, from `x = 0` before the
-    first position, of N diagonal complex recurrences over axis 1.
+    first position, of N diagonal complex recurrences over axis 1, in real
+    arithmetic, in chunks of `chunk` positions.
 
     `pole` is `[N]` complex. `inputs` is `v` `[B, S, 2N]` in real form, its
     real parts and then its imaginary parts on the last axis, and the states
-    come back the same way. On a GPU and the CPU they run in chunks of
-    pole-power products (`_chunked_recurrence`); on a TPU as one
-    `associative_scan` over complex states (`_scanned_recurrence`). The split
-    is measured, not chosen: on a v6e the scan ran the hybrid DiT's training
-    step 4.5% faster at batch 16 and its sampler 2.5% faster at 4 images,
-    and the chunks were faster at batch 32 and for 1 image, so neither form
-    wins every shape there; on a GPU the chunks win all of them
-    (docs/performance.md, the S5 table). Both stay within the fp32
-    running-error bound of the recurrence (tests/test_ssm.py).
+    come back the same way. Inside a chunk the states are one product of the
+    powers `pole^(k - j)` with the chunk's inputs, at fp32's full precision,
+    and across chunks `associative_scan` carries each chunk's last state
+    forward by `pole^chunk`. The powers come by doubling (`_powers`), and
+    the states stay within the fp32 running-error bound of the recurrence
+    (tests/test_ssm.py).
     """
-    return jax.lax.platform_dependent(
-        pole, inputs, tpu=_scanned_recurrence,
-        default=lambda pole, inputs: _chunked_recurrence(pole, inputs, chunk))
-
-
-def _scanned_recurrence(pole: jax.Array, inputs: jax.Array) -> jax.Array:
-    """`diagonal_recurrence` as one `associative_scan` over complex states,
-    `(a1, b1) * (a2, b2) = (a1 a2, a2 b1 + b2)`."""
-    states = inputs.shape[-1] // 2
-    values = jax.lax.complex(inputs[..., :states], inputs[..., states:])
-    poles = jnp.broadcast_to(pole, values.shape)
-    _, x = jax.lax.associative_scan(lambda e1, e2: (e1[0] * e2[0], e2[0] * e1[1] + e2[1]),
-                                    (poles, values), axis=1)
-    return jnp.concatenate([x.real, x.imag], axis=-1)
-
-
-def _chunked_recurrence(pole: jax.Array, inputs: jax.Array, chunk: int) -> jax.Array:
-    """`diagonal_recurrence` in real arithmetic, in chunks of `chunk`
-    positions: inside a chunk the states are one product of the powers
-    `pole^(k - j)` with the chunk's inputs, at fp32's full precision, and
-    across chunks `associative_scan` carries each chunk's last state forward
-    by `pole^chunk`. The powers come by doubling (`_powers`)."""
     batch, steps, width = inputs.shape
     states = width // 2
     length = min(chunk, steps)
@@ -175,42 +151,82 @@ class S5Layer(nn.Module):
             (self.state_dim,))
 
     def operators(self) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-        """The zero-order hold of the recurrence, `(A_bar, B, C, D)`.
-
-        `A_bar = exp(A dt)` is the `[N]` complex poles. The complex products
-        with u and with the states run as real ones over stacked real and
-        imaginary parts, so `B` is `[Re B_bar; Im B_bar]` `[2N, F]`, with
-        `B_bar = (A_bar - 1) / A * B`, and `C` is `[C_re, -C_im]` `[F, 2N]`,
-        whose product with real-form states is `Re(C x)`. `D` is the `[F]`
-        skip.
-        """
+        """The zero-order hold of the recurrence, `(A_bar, B_bar, C, D)`:
+        `A_bar = exp(A dt)` the `[N]` complex poles, `B_bar = (A_bar - 1) /
+        A * B` `[N, F]` and `C` `[F, N]` complex, and `D` the `[F]` skip."""
         dt = jnp.exp(self.log_dt)
         A_diag = -jnp.exp(self.log_A_real) + 1j * self.A_imag
         A_bar = jnp.exp(A_diag * dt)
         B_bar = ((A_bar[:, None] - 1.0) / (A_diag[:, None] + 1e-8)) * (self.B_re + 1j * self.B_im)
-        return (A_bar, jnp.concatenate([B_bar.real, B_bar.imag]),
-                jnp.concatenate([self.C_re, -self.C_im], -1), self.D)
+        return A_bar, B_bar, self.C_re + 1j * self.C_im, self.D
 
     def __call__(self, u):
         """Scan `u` `[B, S, F]` through the discretized poles into `[B, S, F]`."""
         F = u.shape[-1]
         assert self.features == F, f"S5Layer built for {self.features} features, got {F}"
-        A_bar, B_bar, C, D = self.operators()
-        u_float = u.astype(at_least_fp32(u.dtype))
-        x = diagonal_recurrence(A_bar, jnp.einsum('bsf,nf->bsn', u_float, B_bar))
-        # The k-th output is Re(C x_k) plus the skip D u_k.
-        y = jnp.einsum('bsn,fn->bsf', x, C) + D * u_float
-        return y.astype(self.dtype) if self.dtype is not None else y.astype(u.dtype)
+        y, = _directions(u, (self.operators(),), (False,), self.dtype if self.dtype is not None else u.dtype)
+        return y
+
+
+def _directions(u: jax.Array, operators, reversed_: tuple[bool, ...], dtype) -> list[jax.Array]:
+    """Each direction's `Re(C x_k) + D u_k` in `dtype` over `u` `[B, S, F]`,
+    read in reverse where `reversed_` says, computed in at least fp32 by
+    backend. The split is measured, not chosen (docs/performance.md, the S5
+    table).
+
+    A GPU and the CPU run `_chunked_directions`, which won every shape
+    measured there. A TPU runs `_scanned_directions`, the layer's first form,
+    unchanged: on a v6e the chunks were faster at a batch of 32 and sampling
+    one image but slower at 16 and sampling 4, and the real input product
+    alone left the step at 16 1% slower.
+    """
+    return jax.lax.platform_dependent(
+        u, tpu=lambda u: _scanned_directions(u, operators, reversed_, dtype),
+        default=lambda u: _chunked_directions(u, operators, reversed_, dtype))
+
+
+def _chunked_directions(u: jax.Array, operators, reversed_: tuple[bool, ...], dtype) -> list[jax.Array]:
+    """`_directions` by `diagonal_recurrence`, every direction's complex
+    input product as one real one, the backward recurrence over the reversed
+    positions of its projected inputs rather than over a reversed copy of
+    `u`."""
+    u = u.astype(at_least_fp32(u.dtype))
+    width = 2 * operators[0][0].shape[0]
+    stacked = jnp.concatenate([jnp.concatenate([b.real, b.imag]) for _, b, _, _ in operators])
+    projected = jnp.einsum('bsf,nf->bsn', u, stacked)
+    out = []
+    for index, ((pole, _, c, d), backwards) in enumerate(zip(operators, reversed_, strict=True)):
+        v = projected[..., index * width:(index + 1) * width]
+        x = (jnp.flip(diagonal_recurrence(pole, jnp.flip(v, axis=1)), axis=1) if backwards
+             else diagonal_recurrence(pole, v))
+        # The k-th output is Re(C x_k), the real form's [C_re, -C_im] product.
+        y = jnp.einsum('bsn,fn->bsf', x, jnp.concatenate([c.real, -c.imag], -1)) + d * u
+        out.append(y.astype(dtype))
+    return out
+
+
+def _scanned_directions(u: jax.Array, operators, reversed_: tuple[bool, ...], dtype) -> list[jax.Array]:
+    """`_directions` as the layer first ran it: per direction, a complex input
+    product over `u` (reversed where the direction reads backwards) and an
+    `associative_scan` over complex states, `(a1, b1) * (a2, b2) = (a1 a2,
+    a2 b1 + b2)`."""
+    out = []
+    for (pole, b, c, d), backwards in zip(operators, reversed_, strict=True):
+        read = jnp.flip(u, axis=1) if backwards else u
+        read = read.astype(at_least_fp32(read.dtype))
+        bu = jnp.einsum('bsf,nf->bsn', read, b)
+        _, x = jax.lax.associative_scan(lambda e1, e2: (e1[0] * e2[0], e2[0] * e1[1] + e2[1]),
+                                        (jnp.broadcast_to(pole[None, None, :], bu.shape), bu), axis=1)
+        y = (jnp.einsum('fn,bsn->bsf', c, x).real + d[None, None, :] * read).astype(dtype)
+        out.append(jnp.flip(y, axis=1) if backwards else y)
+    return out
 
 
 class BidirectionalS5Layer(nn.Module):
     """Runs forward and backward S5 scans, concats and projects back to features.
     Patches have no inherent direction, so scan both ways.
 
-    Both directions read `u` in its own order through one input product,
-    and the backward recurrence runs over the reversed positions of its
-    projected inputs, the narrow `[B, S, 2N]` stream, rather than over a
-    reversed copy of `u`.
+    The directions run by backend (`_directions`).
     """
     features: int
     state_dim: int = 64
@@ -219,18 +235,10 @@ class BidirectionalS5Layer(nn.Module):
     @nn.compact
     def __call__(self, u):
         # The input u has shape [B, S, F].
-        (pole_fwd, b_fwd, c_fwd, d_fwd), (pole_bwd, b_bwd, c_bwd, d_bwd) = (
-            S5Layer(features=self.features, state_dim=self.state_dim, dtype=self.dtype,
-                    name=name).operators()
-            for name in ("s5_forward", "s5_backward"))
-        width = 2 * self.state_dim
-        u_float = u.astype(at_least_fp32(u.dtype))
-        projected = jnp.einsum('bsf,nf->bsn', u_float, jnp.concatenate([b_fwd, b_bwd]))
-        x_fwd = diagonal_recurrence(pole_fwd, projected[..., :width])
-        x_bwd = jnp.flip(diagonal_recurrence(pole_bwd, jnp.flip(projected[..., width:], axis=1)), axis=1)
+        operators = tuple(S5Layer(features=self.features, state_dim=self.state_dim, dtype=self.dtype,
+                                  name=name).operators() for name in ("s5_forward", "s5_backward"))
         dtype = self.dtype if self.dtype is not None else u.dtype
-        y_fwd = (jnp.einsum('bsn,fn->bsf', x_fwd, c_fwd) + d_fwd * u_float).astype(dtype)
-        y_bwd = (jnp.einsum('bsn,fn->bsf', x_bwd, c_bwd) + d_bwd * u_float).astype(dtype)
+        y_fwd, y_bwd = _directions(u, operators, (False, True), dtype)
         y_cat = jnp.concatenate([y_fwd, y_bwd], axis=-1)  # [B, S, 2F]
         return nn.Dense(features=self.features, dtype=self.dtype, name="out_proj")(y_cat)
 
