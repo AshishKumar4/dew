@@ -84,6 +84,7 @@ PIPELINES = {
     "Flux2KleinPipeline": ("FLUX.2 [klein]", "Text to image"),
     "ZImagePipeline": ("Z-Image", "Text to image"),
     "QwenImage21Pipeline": ("Qwen-Image 2.1", "Text to image"),
+    "WanPipeline": ("Wan 2.1", "Text to video"),
     "FlaxStableDiffusionPipeline": ("Stable Diffusion, Flax weights", "Text to image"),
     "FlaxStableDiffusionImg2ImgPipeline": ("Stable Diffusion, Flax weights", "Image to image"),
     "FlaxStableDiffusionInpaintPipeline": ("Stable Diffusion, Flax weights", "Inpainting"),
