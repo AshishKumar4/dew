@@ -52,15 +52,14 @@ def metrics(rows: list[dict[str, float]], wall: float, prompt: int) -> dict[str,
 
 
 def dew_run(server, prompts: np.ndarray, output: int):
-    import jax
-
     began = time.perf_counter()
     tickets, sent, active = [], [], []
     index, steps = 0, server.steps
     while index < len(prompts) or active:
         while index < len(prompts) and len(active) < server.slots:
             sent.append(time.perf_counter())
-            ticket = server.submit(prompts[index], output, key=jax.random.key(index))
+            # An integer seed, as a client sends one: the server makes the key.
+            ticket = server.submit(prompts[index], output, key=index)
             tickets.append(ticket)
             active.append(ticket)
             index += 1
@@ -88,8 +87,7 @@ def profile_decode(server, prompts: np.ndarray, output: int, steps: int, directo
 
     if -(-len(prompts) // server.admission) + 2 + 2 * steps * server.decode_steps >= output:
         raise ValueError("--output must cover admission, warmup and both decode profiles")
-    tickets = [server.submit(prompt, output, key=jax.random.key(index))
-               for index, prompt in enumerate(prompts)]
+    tickets = [server.submit(prompt, output, key=index) for index, prompt in enumerate(prompts)]
     while server.queued or any(row.prefilled < len(row.prompt) for row in server._rows.values()):
         server.step()
     for _ in range(2):
