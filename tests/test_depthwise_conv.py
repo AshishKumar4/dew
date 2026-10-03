@@ -241,17 +241,21 @@ def test_depthwise_quantization_keeps_the_original_provider_output(training):
 
 @pytest.mark.network
 def test_published_hybrid_dit_samples_within_fp32_rounding(tmp_path):
-    """Same 176M weights, prompt, seed 17 and 20 steps at highest precision.
-
-    RTX 4080 / JAX 0.11.2.post3: max latent error 1.88053e-5 (RMS
-    2.19756e-6), max fp32-decoded pixel error 3.99053e-5 (RMS 1.81749e-6).
-    The 3e-5/5e-5 absolute bounds cover fp32 reduction-order changes in the
-    20-step trajectory. Both paths disable TF32. The published bf16 decoder
-    is recorded separately, with no image-identity assertion: rounding its
-    activations maps independent max 1.88351e-5 / RMS 2.21749e-6 latent noise
-    to max 0.05078125 / RMS 0.002173656 pixel differences, the same as the
-    convolution change. The bf16 decoder's image sensitivity is recorded
-    alongside the fp32 parity; it is outside an fp32 rounding bound.
+    """Same 176M weights, prompt, seed 17 and 20 steps at highest precision,
+    with the dilated depthwise convolutions as production runs them and as
+    lax's dilated convolution: the latents and fp32-decoded images may
+    differ by at most twice what one rounding moves them, measured as lax's
+    convolution with every other output moved one ulp, in both the maximum
+    and the RMS. On the cuda lane (RTX 4080, jax 0.11.2.post3, deterministic
+    ops, no autotuning) the fp32 model's materialized shifted products give
+    latents max 6.72e-5 / RMS 9.82e-6 against one rounding's 5.42e-5 /
+    1.04e-5, and images max 1.39e-4 / RMS 8.59e-6 against 2.34e-4 / 9.17e-6;
+    the polyphase form is lax's convolution bit for bit. The trajectory
+    turns one ulp into 5e-5, so an absolute bound tight enough to mean
+    something would demand lax's bits. A missing tap moves the latents by
+    order 1. The published bf16 decoder is recorded separately, with no
+    image-identity assertion: its rounding maps latent noise of the same
+    size to pixel differences of about 0.05.
     """
     from argparse import Namespace
 
