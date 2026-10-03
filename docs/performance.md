@@ -56,8 +56,8 @@ on device time alone Dew is 1.26x faster (78.1 against 98.3 ms busy).
 From `4d392f0a` to `f6047cf9` the hybrid DiT went from 66.5 to 60.1 ms at
 batch 16 and from 110.2 to 100.6 at 32, over the merges in between (among
 them the S5 recurrence in real arithmetic, "The hybrid DiT's SSM blocks"
-below, and gradient norms compiled only at the log cadence); the other
-rows stayed within their spread.
+below, and the DiT MLP's GELU in fp32); the other rows stayed within
+their spread.
 
 Since `42ddfc14`: the hybrid DiT's dilated depthwise convolutions run as
 undilated ones over their interleaved grids (75.4 to 70.2 ms at batch 16);
@@ -135,20 +135,24 @@ TPU v6e (Colab, one chip), Dew against MaxText 0.2.4 on the same VM:
 corpus) and `tools/reference_runs/maxtext_run.py` (MaxText's synthetic
 tokens), bf16 compute over fp32 weights, AdamW with a 1.0 global-norm
 clip, 90 steps with steps 30-89 timed and nothing profiled, two processes
-each, integration `8895763d` (jax 0.11.2.post3, libtpu 0.0.48). Dew's
-16 x 1024 row times steps 30-63, where its two epochs of data end. ms a
-step, the window's mean, and MaxText's median step beside it:
+each, integration `8895763d` (jax 0.11.2.post3, libtpu 0.0.48). ms a step,
+each window's mean (its wall time over its steps), and the ratio of the
+means:
 
 | model | tokens | Dew | MaxText, minimal remat | MaxText, default remat | Dew / best MaxText |
 |---|---|---:|---:|---:|---:|
-| Qwen3-0.6B | 8 x 1024 | 145.3, MFU 26.3% | 154.0-154.1 (median 150.1), 24.8% | 167.9, 22.8% | 1.06 (1.03 by median) |
+| Qwen3-0.6B | 8 x 1024 | 145.3, MFU 26.3% | 154.0-154.1, 24.8% | 167.9, 22.8% | 1.06 |
 | Qwen3-0.6B | 16 x 1024 | 288.9, 26.4% | 299.7-299.8, 25.5% | 343.7, 22.2% | 1.04 |
-| Qwen3-1.7B | 4 x 1024 | 153.3, 32.1% | 158.7-158.8 (median 154.9), 31.0% | 179.7, 27.4% | 1.04 (1.01 by median) |
+| Qwen3-1.7B | 4 x 1024 | 153.3, 32.1% | 158.7-158.8, 31.0% | 179.7, 27.4% | 1.04 |
 
-Dew's 0.6B at 16 x 1024 runs with the vocabulary head tiled, the fit
-ladder's first rung (the whole logits do not fit). MaxText's minimal-remat
-windows hold a few slow steps (at 8 x 1024 the median step is 150.1 ms and
-the mean 154.0), so its median is the kinder comparison. The global-norm
+Dew's 16 x 1024 window is steps 30-63, where its two epochs of data end,
+against MaxText's 30-89, and runs with the vocabulary head tiled, the fit
+ladder's first rung (the whole logits do not fit). MaxText's
+minimal-remat windows hold a few slow steps: its median step is 150.1 ms
+at 0.6B 8 x 1024 and 154.9 at 1.7B, against means of 154.0 and 158.7.
+Dew's runner times only the window, so it has no median to set beside
+them; were all of MaxText's steps its median ones, the ratios would be
+1.03 and 1.01. The global-norm
 clip costs Dew 8.1 ms a step here: Qwen3-0.6B's widths at 8 x 1024 through
 `tools/benchmark_step.py`, one batch on the device, take 137.2 ms with
 `optax.adam` and 145.3 with dew_lm's optimizer (the norm, the clip, AdamW
