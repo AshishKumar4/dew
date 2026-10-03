@@ -44,7 +44,7 @@ def test_a_composite_model_record_nests_its_part_and_rebuilds_it():
     assert record.build() == original.clone(text=original.text.clone(dtype=jnp.float32))
 
 
-def test_an_unregistered_model_trains_and_saves_and_loads_once_registered(tmp_path, monkeypatch):
+def test_an_unregistered_model_trains_and_saves_and_loads_once_registered(tmp_path, monkeypatch, caplog):
     """A class no registry names trains and checkpoints as any other; loading
     the run by its record names the line that registers it, and after that
     line the same run loads."""
@@ -61,15 +61,18 @@ def test_an_unregistered_model_trains_and_saves_and_loads_once_registered(tmp_pa
     rows = [{'text': np.arange(9, dtype=np.int32)} for _ in range(8)]
     data = Dataset.from_grain(grain.MapDataset.source(rows), batch=8, loading=Loading(workers=0))
     checkpoints = Checkpoints(str(tmp_path / 'run'))
-    Trainer(objective, optax.sgd(.01), key=0, checkpoints=checkpoints).fit(data, steps=1, checkpoint_every=1)
+    with caplog.at_level("WARNING", logger="dew.training.trainer"):
+        Trainer(objective, optax.sgd(.01), key=0, checkpoints=checkpoints).fit(data, steps=1,
+                                                                               checkpoint_every=1)
     checkpoints.wait()
+    assert "`@dew.registry.models('custom')` above the class" in caplog.text
     with pytest.raises(ValueError, match=r"`@dew.registry.models\('custom'\)` above the class"):
         TextGeneration.from_run(str(tmp_path / 'run'))
     monkeypatch.setitem(models._members, "custom", Custom)
     assert type(TextGeneration.from_run(str(tmp_path / 'run')).model) is Custom
 
 
-def test_a_model_no_record_can_describe_still_checkpoints_and_loading_says_why(tmp_path, monkeypatch):
+def test_a_model_no_record_can_describe_still_checkpoints_and_loading_says_why(tmp_path, monkeypatch, caplog):
     import flax.linen as nn
 
     from dew import Field, InputSpec
@@ -94,8 +97,11 @@ def test_a_model_no_record_can_describe_still_checkpoints_and_loading_says_why(t
     rows = [{"image": np.zeros((4, 4, 3), np.uint8)} for _ in range(8)]
     data = Dataset.from_grain(grain.MapDataset.source(rows), batch=8, loading=Loading(workers=0))
     checkpoints = Checkpoints(str(tmp_path / 'run'))
-    Trainer(objective, optax.sgd(.01), key=0, checkpoints=checkpoints).fit(data, steps=1, checkpoint_every=1)
+    with caplog.at_level("WARNING", logger="dew.training.trainer"):
+        Trainer(objective, optax.sgd(.01), key=0, checkpoints=checkpoints).fit(data, steps=1,
+                                                                               checkpoint_every=1)
     checkpoints.wait()
+    assert caplog.text.count("no loader can rebuild their model") == 1
     assert checkpoints.variables(ema=False)["params"]
     with pytest.raises(ValueError, match="no model to load: DiffusionObjective: Opaque is not something"):
         TextToImage.from_run(str(tmp_path / 'run'))
