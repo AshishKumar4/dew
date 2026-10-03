@@ -75,15 +75,45 @@ def test_a_stacked_transposed_leaf_reads_any_block_as_the_whole_leaf_holds_it():
         np.testing.assert_array_equal(leaf.read(index), whole[index])
 
 
-def test_concatenated_projections_read_only_the_requested_columns_in_storage_precision():
+@pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16"])
+def test_a_transposed_read_across_many_tiles_is_the_strided_copy_bit_for_bit(dtype):
+    """A transposed leaf is read and cast in its stored layout, then swapped
+    in 64x64 tiles; on shapes that leave ragged tiles, at blocks, strides and
+    reversals, alone and stacked, that is numpy's own strided copy, bit for
+    bit and C-ordered."""
+    import ml_dtypes
+
+    storage = np.dtype(ml_dtypes.bfloat16) if dtype == "bfloat16" else np.dtype(dtype)
+    rng = np.random.default_rng(3)
+    member = rng.standard_normal((200, 131)).astype(np.float32)
+    leaf = SourceLeaf((member,), storage, transposed=True)
+    whole = member.T.astype(storage)
+    for index in [None, (slice(5, 190), slice(3, 130)), (slice(None, None, 3), slice(100, 0, -7)),
+                  (slice(64, 129), slice(None)), (slice(130, 131), slice(0, 1))]:
+        read = leaf.read(index)
+        expected = np.ascontiguousarray(whole if index is None else whole[index])
+        assert read.dtype == storage and read.flags.c_contiguous
+        assert read.shape == expected.shape and read.tobytes() == expected.tobytes(), index
+    members = tuple(rng.standard_normal((70, 90)).astype(np.float32) for _ in range(3))
+    stacked = SourceLeaf.stack([SourceLeaf((one,), storage, transposed=True) for one in members], "experts")
+    every = np.stack([one.T for one in members]).astype(storage)
+    for index in [None, (slice(1, 3), slice(10, 80), slice(None, None, -1))]:
+        expected = np.ascontiguousarray(every if index is None else every[index])
+        assert stacked.read(index).tobytes() == expected.tobytes(), index
+
+
+@pytest.mark.parametrize("transposed", [True, False])
+def test_concatenated_projections_read_only_the_requested_columns_in_storage_precision(transposed):
     """A shard can start inside Q and cross K/V, with no concatenated host model."""
     import ml_dtypes
 
     rng = np.random.default_rng(9)
-    members = tuple(rng.standard_normal((width, 6)).astype(np.float32) for width in (8, 4, 4))
+    members = tuple(rng.standard_normal((width, 6) if transposed else (6, width)).astype(np.float32)
+                    for width in (8, 4, 4))
     dtype = np.dtype(ml_dtypes.bfloat16)
-    leaf = SourceLeaf.concatenate([SourceLeaf((member,), dtype, transposed=True) for member in members])
-    whole = np.concatenate([member.T.astype(dtype) for member in members], axis=-1)
+    leaf = SourceLeaf.concatenate([SourceLeaf((member,), dtype, transposed=transposed) for member in members])
+    whole = np.concatenate([(member.T if transposed else member).astype(dtype) for member in members],
+                           axis=-1)
     assert leaf.shape == (6, 16)
     for index in ((slice(1, 4), slice(6, 14)), (slice(None), slice(8, 12)),
                   (slice(2, 5), slice(14, 3, -2)), (slice(None), slice(2, 15, 3)),
