@@ -9,9 +9,11 @@ classes), loads the fixture's committed weights and runs its committed token
 ids, in fp32 for logits.npy and in float64 for logits_f64.npy, the exact
 value the tests measure both fp32 runs from (tests/reference_error.py).
 
-The weights and ids are inputs: drawn once with dew.interop.verify's
-scatter_weights (seed 1234) and probe_ids under the released tensor names,
-and read here as they are.
+The weights and ids are inputs, read here as they are: drawn by
+tools/hf_reference.py's write_diffusion_tiny as of commit 18511496038f
+(dew.interop.verify's scatter_weights at seed 1234 over a port of each
+release's module order, which drawing over the release's own order does
+not reproduce, and probe_ids).
 
 The remote code was written against transformers 4.46 (both released
 config.json files record 4.46.x, and later releases drop attributes it
