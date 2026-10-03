@@ -55,7 +55,7 @@ def test_stats_only_loss_matches_auxiliary_loss_and_direct_differentiation(stati
     plain, paired = trainer(statistics=statistics), trainer(auxiliary=True, statistics=statistics)
     state = plain.fit(data(), steps=2, log_every=2)
     reference = paired.fit(data(), steps=2, log_every=2)
-    jax.tree.map(np.testing.assert_array_equal, state.params, reference.params)
+    jax.tree.map(np.testing.assert_array_equal, state.variables, reference.variables)
     variables = plain.objective.init(jax.random.key(0))
     step = Step(jnp.asarray(0), jax.random.key(0), None)
     batch = {'x': jnp.ones((8, 2))}
@@ -70,7 +70,7 @@ def test_supplied_state_continues_instead_of_initializing_again():
     middle = running.fit(data(), steps=2, log_every=2)
     resumed = running.fit(data(), state=middle, steps=4, log_every=4)
     assert int(resumed.step) == 4
-    jax.tree.map(np.testing.assert_array_equal, direct.params, resumed.params)
+    jax.tree.map(np.testing.assert_array_equal, direct.variables, resumed.variables)
 
 
 def test_first_actual_batch_is_checked_before_compilation():
