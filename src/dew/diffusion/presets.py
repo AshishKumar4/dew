@@ -145,13 +145,14 @@ class Karras:
 class Cosine:
     """The cosine beta table with v-prediction.
 
-    The table's P2 weight at its defaults (k = 1, gamma = 1) is 1 / (1 + SNR),
-    which makes the v loss an unweighted x_0 loss. `p2_loss_weight_gamma`
-    changes that.
+    The table is improved-diffusion's, its betas clipped at 0.999 so the last
+    step keeps some signal (`CosineNoiseScheduler`). Its P2 weight at its
+    defaults (k = 1, gamma = 1) is 1 / (1 + SNR), which makes the v loss an
+    unweighted x_0 loss. `p2_loss_weight_gamma` changes that.
     """
 
     timesteps: int = 1000
-    beta_end: float = 1.0
+    beta_end: float = 0.999
     p2_loss_weight_k: float = 1.0
     p2_loss_weight_gamma: float = 1.0
     min_snr_gamma: float | None = None
