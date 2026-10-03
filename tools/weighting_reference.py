@@ -104,7 +104,7 @@ def main() -> None:
     out = parser.parse_args().out
     tables = {"linear": np.load(FIXTURES / "schedules" / "betas.npz")["improved_diffusion_linear_1000"],
               "zero_terminal_cosine": zero_terminal_cosine()}
-    saved = dict({f"betas_{name}": table for name, table in tables.items()})
+    saved = {f"betas_{name}": table for name, table in tables.items()}
     with tempfile.TemporaryDirectory() as directory:
         for name, cases in CASES.items():
             module = guided_diffusion(name, Path(directory))
