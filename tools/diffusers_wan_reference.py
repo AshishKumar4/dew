@@ -18,7 +18,10 @@ tokenizer, the Wan VAE, the transformer and the published UniPC scheduler
 config with its flow shift - and walks the unmodified call from fixed
 latents, recording the prompt states, the latent it ends on and the frames
 it decodes. Its prompts carry what `prompt_clean` repairs: curly quotes,
-HTML entities and runs of whitespace. Cleaning needs ftfy installed.
+HTML entities and runs of whitespace. Cleaning needs ftfy installed. Beside
+the walk it steps the published UniPC scheduler alone, at 10 and 50 steps,
+on a fixed sequence of model outputs that no sample feeds back into: its
+timesteps and the sample after every step, in float32 and in float64.
 
 Run with the Dew test environment's diffusers 0.34.0 and torch, on CPU:
 
@@ -79,11 +82,25 @@ CASES: dict[str, Case] = {
 }
 
 
+class _Float64Numpy:
+    """numpy with its float32 read as float64, for a scheduler module whose
+    tables round through `np.float32`, as tools/diffusers_source_reference.py's
+    `Float64Library` widens them (that tool pins JAX to the CPU on import)."""
+
+    def __getattr__(self, name):
+        return getattr(np, "float64" if name == "float32" else name)
+
+
 @contextlib.contextmanager
 def widened():
     """The reference in float64: every float32 pin of the Wan modules
-    widened, which are their `.float()` and `.to(torch.float32)` casts and
-    the sinusoids' float32 `arange`, and float64 the default dtype."""
+    widened, which are their `.float()` and `.to(torch.float32)` casts, the
+    sinusoids' float32 `arange` and the UniPC scheduler's float32 sigma
+    table, and float64 the default dtype."""
+    from unittest.mock import patch
+
+    from diffusers.schedulers import scheduling_unipc_multistep
+
     float_, to, arange = torch.Tensor.float, torch.Tensor.to, torch.arange
 
     def wide(dtype):
@@ -100,7 +117,8 @@ def widened():
     default = torch.get_default_dtype()
     torch.set_default_dtype(torch.float64)
     try:
-        yield
+        with patch.object(scheduling_unipc_multistep, "np", _Float64Numpy()):
+            yield
     finally:
         torch.Tensor.float, torch.Tensor.to, torch.arange = float_, to, arange
         torch.set_default_dtype(default)
@@ -253,6 +271,36 @@ def build_pipeline(root: Path):
     return pipe
 
 
+REPLAY_STEPS = (10, 50)
+
+
+def scheduler_replay() -> dict[str, np.ndarray]:
+    """The published scheduler stepped on recorded model outputs, the one
+    model evaluation per step a guided Wan walk makes, from a fixed latent:
+    its timesteps and every step's sample, in float32 and widened."""
+    from diffusers import UniPCMultistepScheduler
+
+    config = json.loads((SOURCE / "scheduler" / "scheduler_config.json").read_text())
+    arrays: dict[str, np.ndarray] = {}
+    for steps in REPLAY_STEPS:
+        generator = torch.Generator().manual_seed(SEED + 10 + steps)
+        x_T = torch.randn((2, 4, 3, 4, 6), generator=generator)
+        outputs = torch.randn((steps, *x_T.shape), generator=generator)
+        arrays[f"replay.{steps}.x_T"], arrays[f"replay.{steps}.outputs"] = x_T.numpy(), outputs.numpy()
+        for precision, dtype in (("fp32", torch.float32), ("fp64", torch.float64)):
+            with widened() if dtype == torch.float64 else contextlib.nullcontext():
+                scheduler = UniPCMultistepScheduler.from_config(config)
+                scheduler.set_timesteps(steps)
+                x, latents = x_T.to(dtype), []
+                for index, time in enumerate(scheduler.timesteps):
+                    x = scheduler.step(outputs[index].to(dtype), time, x).prev_sample
+                    latents.append(x)
+            arrays[f"replay.{steps}.{precision}.latents"] = torch.stack(latents).numpy()
+            arrays[f"replay.{steps}.{precision}.timesteps"] = scheduler.timesteps.numpy()
+            arrays[f"replay.{steps}.{precision}.sigmas"] = scheduler.sigmas.numpy()
+    return arrays
+
+
 def pipeline(destination: str) -> None:
     """The prompt states each prompt (and the empty negative) encodes to, and
     the unmodified call's walk from fixed latents at `STEPS` steps, guided at
@@ -278,9 +326,10 @@ def pipeline(destination: str) -> None:
         arrays[f"latents.{row}"] = walked[0].numpy()
         arrays[f"frames.{row}"] = frames[0]
         print(f"pipeline {prompt!r}: latents {tuple(walked.shape)} frames {frames.shape}")
+    arrays.update(scheduler_replay())
     record = {"diffusers": DIFFUSERS, "torch": torch.__version__, "seed": SEED, "transformer": PIPELINE,
               "vae": PIPELINE_VAE, "prompts": PROMPTS, "frames": FRAMES, "height": HEIGHT, "width": WIDTH,
-              "steps": STEPS, "guidance": GUIDANCE}
+              "steps": STEPS, "guidance": GUIDANCE, "replay_steps": list(REPLAY_STEPS)}
     np.savez_compressed(root / "wan_pipeline.npz", **arrays)
     (root / "wan_pipeline.json").write_text(json.dumps(record, indent=1) + "\n")
     size = sum(path.stat().st_size for path in root.rglob("*") if path.is_file())

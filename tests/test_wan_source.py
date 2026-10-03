@@ -32,6 +32,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
 from reference_error import assert_as_exact_as_the_reference
 
 from dew.diffusion.process import DenoisingCondition
@@ -211,6 +212,41 @@ def test_pipeline_walk_matches_the_source(pipeline, walk):
         expected = channels_last(arrays[f"latents.{row}"][None])[0]
         assert relative_gap(np.asarray(walked.latents)[row], expected) < FORWARD, row
         assert relative_gap(frames[row], arrays[f"frames.{row}"]) < FORWARD, row
+
+
+class Replay(nn.Module):
+    """A model that answers each grid point's model time with the output the
+    source's scheduler was stepped on there, whatever the sample."""
+
+    timesteps: tuple[int, ...]
+    outputs: jax.Array
+
+    def __call__(self, x, time):
+        return self.outputs[jnp.argmin(jnp.abs(jnp.asarray(self.timesteps) - time[0]))]
+
+
+@pytest.mark.parametrize("steps", [10, 50])
+def test_the_scheduler_steps_as_the_source_on_the_same_model_outputs(pipeline, walk, steps):
+    """The grid and solver `text_to_image()` walks, stepped on the outputs the
+    source's own UniPC scheduler was stepped on: the same timesteps, and a
+    sample after every step as close to the scheduler's float64 run as its
+    float32 run is. No sample feeds back into a model, so this isolates the
+    flow-shifted sigmas, the timesteps and the bh2 update arithmetic.
+    Observed (Dew's RMS distance from float64 over the source's): 1.01 at
+    10 steps, 1.86 at 50; the sigma and alpha tables are bit-identical to the
+    source's float32 ones. UniPC of order 1, or bh1, lands 1e4 to 1e5 times
+    further."""
+    from test_samplers import walk as step_by_step
+
+    _, _, arrays = walk
+    process, times = pipeline.task.grid(steps)
+    timesteps = arrays[f"replay.{steps}.fp32.timesteps"]
+    np.testing.assert_array_equal(np.asarray(process.sampler_schedule.model_time(times[:-1])), timesteps)
+    model = Replay(tuple(int(time) for time in timesteps), jnp.asarray(arrays[f"replay.{steps}.outputs"]))
+    latents = step_by_step(pipeline.schedule.solver, process, model,
+                           jnp.asarray(arrays[f"replay.{steps}.x_T"]), times)
+    assert_as_exact_as_the_reference(np.asarray(latents), arrays[f"replay.{steps}.fp32.latents"],
+                                     arrays[f"replay.{steps}.fp64.latents"], f"{steps}-step replay")
 
 
 def test_a_clip_the_vae_cannot_decode_whole_is_refused(walk):
