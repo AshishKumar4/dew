@@ -373,12 +373,15 @@ def test_guidance_is_a_value_with_its_interval(tmp_path):
 
 
 def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16):
-    """Two training steps of a tiny byte-level decoder, its checkpoint and the
-    `run.json` the LM recipe writes: the resolved model, tokenizer and budget.
+    """Two training steps of a tiny byte-level decoder, its checkpoints, whose
+    record names the byte tokenizer it decodes through, and the `run.json` the
+    LM recipe writes: the resolved model, tokenizer and budget.
     `max_seq_len` is the model's window, which training at 9 ids does not
     reach."""
     import json
 
+    from dew.data import ByteTokenizer
+    from dew.inference import RunProcessor
     from dew.objectives.lm import LMObjective, Samples
     from dew.sampling import Sampling
     from dew.training import MeshSpec
@@ -387,7 +390,8 @@ def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16):
                   "mlp_features": 32, "max_seq_len": max_seq_len}
     model_config = ModelConfig("causal_transformer", fields, dtype="float32", attention_impl="reference")
     objective = LMObjective(model_config.build(), 8, ema_decay=ema_decay,
-                            samples=Samples([1, 2, 3], 4, sampling=Sampling(temperature=0, eos_id=255)))
+                            samples=Samples([1, 2, 3], 4, sampling=Sampling(temperature=0, eos_id=255)),
+                            processor=RunProcessor(ByteTokenizer()))
     rng = np.random.RandomState(0)
     batch = {"text": rng.randint(1, 250, (8, 9)).astype(np.int32)}
 
@@ -493,8 +497,8 @@ def test_pipeline_answers_an_lm_run_with_its_tokenizer_and_budget(tmp_path):
 def test_an_lm_run_without_an_average_publishes_and_exports_its_live_weights(tmp_path):
     """An LM keeps no EMA unless asked, so each reader's default takes the
     live weights of such a run: the objective's pipeline, `dew.pipeline`
-    and `export_run`."""
-    from dew.interop import Pretrained, export_run
+    and `Pretrained.from_run`."""
+    from dew.interop import Pretrained
 
     run = tmp_path / "run"
     run.mkdir()
@@ -504,7 +508,7 @@ def test_an_lm_run_without_an_average_publishes_and_exports_its_live_weights(tmp
         jax.tree.leaves(state.variables), jax.tree.leaves(published.variables), strict=True
     ):
         assert bound is expected
-    export_run(str(run), tmp_path / "export")
+    Pretrained.from_run(str(run)).save(tmp_path / "export")
     reloaded = Pretrained.load(tmp_path / "export", dtype="float32", attention_impl="reference")
     ids = jnp.asarray([[3, 4, 5, 6]], jnp.int32)
     np.testing.assert_array_equal(np.asarray(reloaded.model.apply(reloaded.variables, ids)),

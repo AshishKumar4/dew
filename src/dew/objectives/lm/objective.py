@@ -115,6 +115,18 @@ class IndexerTraining:
                 f"{self.weight}")
 
 
+def _tokenizer_name(processor: Processor | None) -> str | None:
+    """The name a loader rebuilds `processor`'s tokenizer from (`tokenizer_for`),
+    where it is a run's tokenizer that has one; a run without one loads as
+    weights that take ids."""
+    from dew.data.text import ByteTokenizer, HFTokenizer
+    from dew.inference.pipeline import RunProcessor
+
+    if isinstance(processor, RunProcessor) and isinstance(processor.tokenizer, ByteTokenizer | HFTokenizer):
+        return processor.tokenizer.name
+    return None
+
+
 def _decoder(model: nn.Module) -> CausalTransformer | MultimodalTransformer | None:
     """Return the decoder an objective trains, or None for a model that is not one.
 
@@ -723,7 +735,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             'seq_len': self.seq_len,
             'sample_tokens': 0 if samples is None else samples.max_new_tokens,
             'sampling': _to_json(Sampling() if samples is None else samples.sampling, Sampling),
-            'tokenizer': None,
+            'tokenizer': _tokenizer_name(self.processor),
         }
 
     def pipeline(self, state: TrainState, *, ema: bool | None = None,

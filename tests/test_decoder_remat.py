@@ -231,9 +231,9 @@ NAMED = [name for name in REMAT_POLICIES if name != 'full']
 def gradient_step(model, variables, key):
     objective = objective_for(model)
 
-    def loss(variables):
+    def loss(params):
         info = Step(jnp.zeros((), jnp.int32), key, None)
-        return objective.scalar_loss({**variables, "params": variables}, batch(), info)
+        return objective.scalar_loss({**variables, "params": params}, batch(), info)
 
     return jax.jit(jax.value_and_grad(loss, has_aux=True))(variables["params"])
 
@@ -265,9 +265,9 @@ def residuals(model, variables, capsys):
     `jax.ad_checkpoint.print_saved_residuals` reports it."""
     objective = objective_for(model)
 
-    def loss(variables):
+    def loss(params):
         info = Step(jnp.zeros((), jnp.int32), jax.random.key(1), None)
-        return objective.scalar_loss({**variables, "params": variables}, batch(), info)[0]
+        return objective.scalar_loss({**variables, "params": params}, batch(), info)[0]
 
     capsys.readouterr()
     jax.ad_checkpoint.print_saved_residuals(loss, variables["params"])
