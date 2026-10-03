@@ -235,7 +235,7 @@ def test_masked_training_resume_publish_and_run_pipeline(masked_source, tmp_path
     resumed = Trainer(objective, optax.sgd(0.05), key=key,
         checkpoints=Checkpoints(str(tmp_path / "run"))).fit(data, steps=2, checkpoint_every=1, log_every=1)
     direct = Trainer(objective, optax.sgd(0.05), key=key).fit(data, steps=2, log_every=1)
-    for left, right in zip(jax.tree.leaves(resumed.variables), jax.tree.leaves(direct.params), strict=True):
+    for left, right in zip(jax.tree.leaves(resumed.variables), jax.tree.leaves(direct.variables), strict=True):
         np.testing.assert_array_equal(left, right)
     for left, right in zip(jax.tree.leaves(resumed.averaged), jax.tree.leaves(direct.averaged), strict=True):
         np.testing.assert_array_equal(left, right)

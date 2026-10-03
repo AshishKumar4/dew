@@ -173,7 +173,7 @@ def test_an_adapted_denoiser_run_loads_what_it_trained(tmp_path, monkeypatch):
     assert checkpoints.artifact()['model']['adapter']['modules'] == ['params/hidden', 'params/out']
     pipe = TextToImage.from_run(str(tmp_path / 'run'), ema=False)
     x, t = jax.random.normal(jax.random.key(2), (2, 4, 4, 3)), jnp.zeros((2,))
-    np.testing.assert_array_equal(np.asarray(pipe.model.apply(thaw(pipe.params), x, t)),
+    np.testing.assert_array_equal(np.asarray(pipe.model.apply(thaw(pipe.variables), x, t)),
                                   np.asarray(objective.model.apply(thaw(state.variables), x, t)))
 
 
