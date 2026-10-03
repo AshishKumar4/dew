@@ -918,6 +918,30 @@ nothing raises an error. The losses go down (2.44 bf16 against 2.68 fp8 at
 width 256, 0.009 against 0.011 at width 1024, each after 14 steps from the
 same init). On this card, at these sizes, fp8 gives no speedup to adopt.
 
+## Serving against vLLM, 2026-10-03
+
+`tools/benchmark_lm_serving.py`, Qwen3-0.6B bf16 on the RTX 4080, 256-token
+prompts and 128 greedy output tokens, twice as many requests as slots,
+output tokens a second (three repeats; Dew two processes a side, vLLM
+0.30.0 on 2026-10-01):
+
+| slots | vLLM | Dew `1f8d5e72` | Dew, wide cache writes gathered |
+|---:|---:|---:|---:|
+| 32 | 6049-6053 | 5078-5323 | 5513-5532 |
+| 64 | 7614-7618 | 6869-6879 | 7171-7204 |
+| 128 | 9037-9050 | 7758-7773 | 8230-8289 |
+
+At 64 slots a Dew decode step takes 6.96 ms on the device: attention 4.0
+ms, at the bound of reading the dense cache's keys and values (2.8 GB a
+step at 716 GB/s), and the projections and head 2.1 ms, near the bound of
+reading the weights. Each of the 16 admission steps (8 prompts prefilled
+beside the other rows' decode) took 40 ms, and 8 of them were the prefill's
+key and value writes: XLA lays the prefill's fresh cache out with its slots
+minor, for the attention that reads it, and scattering whole tokens into
+that layout ran at 28 GB/s. A write as wide as its buffer now gathers each
+slot's token (`dew.nn.kv_cache.write_cache`), with the same bits: tokens
+and both log-probability streams are identical at every slot count.
+
 ## Quantized serving of the 176M text-to-image model, 2026-09-28
 
 `TextToImage.quantized` serves the denoiser with its kernels stored as int8
