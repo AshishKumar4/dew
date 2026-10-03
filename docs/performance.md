@@ -1069,29 +1069,30 @@ log-probabilities identical.
 ### The remaining gap, 2026-10-03
 
 At 64 slots Dew serves 7146 and 7197 tokens a second (medians of five
-runs, two processes, integration `6a220e31`) against vLLM 0.30.0's 7532
-and 7577 in-process (one run each, two processes). Whole measured runs
-traced, Dew under XProf (`f6047cf9`) and vLLM under Nsight with its CUDA
-graphs' nodes: Dew's device is busy 2.22 s of the run's 2.29 and vLLM's
-2.00 s of 2.18. Nsight warns that not every CUDA event was collected, and
-its run shows 249 steps where 128 requests of 128 tokens on 64 slots need
-at least 256, so vLLM's figure is low by a few percent. Where Dew's device
-time goes beside vLLM's:
+runs, two processes, integration `6a220e31`) against vLLM 0.30.0's
+7596-7609 in-process (three runs, one process). Both schedule alike: Dew
+runs 265 model steps a run, vLLM 267 (its scheduler's steps, counted in
+its engine process), each admitting up to 8 prompts a step beside the
+other rows' decode. So the gap is per step: 8.6 ms of Dew's wall against
+8.0 of vLLM's. Whole measured runs traced, Dew under XProf (`f6047cf9`)
+and vLLM under Nsight with its CUDA graphs' nodes:
 
-| | Dew | vLLM |
+| | Dew | vLLM, 249 of 267 steps traced |
 |---|---:|---:|
 | GEMMs | 891 ms | 907 ms |
-| attention | 1016 ms, 7420 calls, 138.7 us median | 943 ms, 136.6 us median per decode call |
+| attention | 1016 ms, 138.7 us a decode call | 943 ms, 136.6 us a decode call |
 | everything else | 313 ms | 154 ms |
+| device busy | 2.22 s of 2.29 | 2.00 s of 2.18 |
 
-Attention is at parity call for call; Dew makes more calls because it runs
-265 steps, where vLLM needs at least 256, of which 249 were traced: Dew's
-admission steps (8 prompts a step, as vLLM's 2048-token chunks hold) and a
-slot freed only when the host reads the step that finished it. The rest is many small kernels: the residual
-add with the split-K GEMM's sum and its cast (52.5 ms in 22859 launches),
-the norms (80.7 ms in 32201), the cache writes (61.0 ms) and the
-transposes around attention (48.8 ms), each one to three microseconds
-where vLLM fuses an add into its RMSNorm and writes K and V in one kernel.
+Nsight warned that not every CUDA event was collected, and its trace holds
+249 of the run's 267 steps, so vLLM's rows are low by about 7%: scaled to
+the whole run, its attention is Dew's and its GEMMs 80 ms slower. Dew's
+extra device time is many small kernels: the residual add with the split-K
+GEMM's sum and its cast (52.5 ms in 22859 launches), the norms (80.7 ms in
+32201), the cache writes (61.0 ms) and the transposes around attention
+(48.8 ms), each one to three microseconds, where vLLM fuses an add into
+its RMSNorm and writes K and V in one kernel. Dew's 2.29 s run also holds
+70 ms without a kernel running.
 
 Measured and not adopted, each under 1% of the run:
 
@@ -1108,10 +1109,13 @@ Measured and not adopted, each under 1% of the run:
   than cuDNN's.
 - Triton multi-output fusion and a single split-K, one traced run each:
   device time 2222.2 and 2216.2 ms against 2222.3-2224.6.
+- Freeing a slot in the step that finishes it, rather than when the host
+  reads that step's results: the schedule, counted step by step, would
+  take 263 steps instead of 265.
 
 What remains is the small kernels vLLM fuses, at most about 1.5% of the
-run by the launches a fused add and norm would save, and the admission's
-extra steps. Evidence:
+run by the launches a fused add and norm would save, and the idle between
+steps. Evidence:
 `~/.cache/dew/verification-evidence/serving-gap-final/`.
 
 ## Quantized serving of the 176M text-to-image model, 2026-09-28
