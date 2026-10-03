@@ -12,6 +12,7 @@
 // "steps": n}} with a small PNG preview, and the decode as {"dew-progress":
 // {"stage": "decode"}}; any other image is the cell's result.
 import { Code } from '@astrojs/starlight/components';
+import PythonEditor from './PythonEditor.astro';
 import { live } from '../../live.mjs';
 
 interface Props {
@@ -39,14 +40,7 @@ const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey);
 					}
 				</span>
 			</div>
-			<textarea
-				data-cell
-				spellcheck="false"
-				autocapitalize="off"
-				autocomplete="off"
-				aria-label="The sampling cell"
-				rows={cell.trimEnd().split('\n').length + 1}>{cell.trimEnd()}</textarea
-			>
+			<PythonEditor code={cell.trimEnd()} kind="image" rows={cell.trimEnd().split('\n').length + 1} label="The sampling cell" />
 		</div>
 		<details class="sampler-setup">
 			<summary>Setup: loads dewml/hybrid-dit-176m</summary>

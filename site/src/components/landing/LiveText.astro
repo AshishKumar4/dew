@@ -1,4 +1,5 @@
 ---
+import PythonEditor from './PythonEditor.astro';
 interface Props {
 	models: { id: string; label: string }[];
 	cell: string;
@@ -17,7 +18,7 @@ const { models, cell, recorded } = Astro.props;
 				<button type="button" class="sampler-reset" data-text-reset>Reset</button>
 				<button type="button" class="sampler-run" data-text-run>Run</button>
 			</span></div>
-			<textarea data-text-cell rows="5" spellcheck="false" autocapitalize="off" aria-label="Editable text generation cell">{cell}</textarea>
+			<PythonEditor code={cell} kind="text" rows={5} label="Editable text generation cell" />
 		</div>
 		<div class="live-text-result">
 			<div class="live-text-output" data-text-output><pre>{recorded}</pre></div>

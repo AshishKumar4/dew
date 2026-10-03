@@ -768,6 +768,63 @@ html[data-has-hero][data-past-hero] header.header {
 	overflow-x: auto;
 }
 
+.python-editor {
+	position: relative;
+	min-height: calc(var(--editor-rows) * 1.65 * 0.8125rem + 1.75rem);
+	font: 0.8125rem/1.65 var(--dew-font-mono);
+	text-align: left;
+}
+
+.python-editor-highlight {
+	position: absolute;
+	inset: 0;
+	overflow: hidden;
+	pointer-events: none;
+}
+
+.python-editor-highlight pre {
+	margin: 0;
+	padding: 0.875rem;
+	background: transparent !important;
+	font: inherit;
+	tab-size: 4;
+}
+
+.python-editor-highlight code {
+	font: inherit;
+}
+
+.python-editor-highlight .shiki,
+.python-editor-highlight .shiki span {
+	color: var(--shiki-dark) !important;
+}
+
+:root[data-theme='light'] .python-editor-highlight .shiki,
+:root[data-theme='light'] .python-editor-highlight .shiki span {
+	color: var(--shiki-light) !important;
+}
+
+.sampler-editor .python-editor textarea {
+	position: absolute;
+	inset: 0;
+	width: 100%;
+	height: 100%;
+	margin: 0;
+	padding: 0.875rem;
+	border: 0;
+	background: transparent;
+	color: transparent;
+	caret-color: var(--sl-color-white);
+	font: inherit;
+	tab-size: 4;
+	white-space: pre;
+	resize: none;
+}
+
+.python-editor textarea::selection {
+	background: color-mix(in srgb, var(--sl-color-accent) 30%, transparent);
+}
+
 .sampler-editor textarea:focus-visible {
 	outline: 2px solid var(--dew-accent-fill);
 	outline-offset: -2px;
