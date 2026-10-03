@@ -2,7 +2,8 @@
 
 `S5Layer` discretizes diagonal complex poles by zero-order hold and runs the
 recurrence in chunks of pole-power products (`diagonal_recurrence`), in real
-arithmetic over stacked real and imaginary parts. The oracle here is written from
+arithmetic over stacked real and imaginary parts, or on a TPU as a complex
+`associative_scan`; both forms are held to the same bounds. The oracle here is written from
 the equations (Smith, Warrington and Linderman, "Simplified State Space
 Layers for Sequence Modeling", 2023, eqs. 2-6), step by step, in complex128:
 
@@ -43,7 +44,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.nn.ssm import S5Layer, _chunked_recurrence, _scanned_recurrence, diagonal_recurrence
+from dew.nn import ssm
+from dew.nn.ssm import BidirectionalS5Layer, S5Layer, diagonal_recurrence
 
 U = 2.0 ** -24
 BATCH, FEATURES, STATE = 2, 4, 8
@@ -196,7 +198,16 @@ def test_the_oracle_adjoint_is_the_derivative_of_the_oracle(case):
         assert np.max(np.abs(gradients[name] - numeric)) <= 1e-7 * scale, name
 
 
-def test_the_layer_computes_the_zero_order_hold_recurrence(case):
+@pytest.fixture(params=["chunked", "scanned"])
+def form(request, monkeypatch):
+    """The layer's directions run as a GPU runs them (`_chunked_directions`)
+    or as a TPU does (`_scanned_directions`), both here on the CPU."""
+    chosen = {"chunked": ssm._chunked_directions, "scanned": ssm._scanned_directions}[request.param]
+    monkeypatch.setattr(ssm, "_directions", chosen)
+    return request.param
+
+
+def test_the_layer_computes_the_zero_order_hold_recurrence(case, form):
     """Every output within K u of its absolute terms, K = 184 at 16 positions."""
     layer, params, u, _ = case
     expected, _ = forward(float64_params(params), np.asarray(u, np.float64), EXACT)
@@ -208,7 +219,7 @@ def test_the_layer_computes_the_zero_order_hold_recurrence(case):
     assert np.all(np.abs(actual - expected) <= bound)
 
 
-def test_the_layer_gradients_are_the_recurrence_gradients(case):
+def test_the_layer_gradients_are_the_recurrence_gradients(case, form):
     """Every parameter's and the input's gradient within K u of its absolute
     terms, K = 376 at 16 positions."""
     layer, params, u, w = case
@@ -255,9 +266,9 @@ def test_a_long_sequence_stays_within_the_bound():
 
 
 def test_the_recurrence_holds_for_poles_all_around_the_circle():
-    """The pole powers are `exp(t log(pole))` with the principal log, so a
-    pole past the imaginary axis (negative real part) or at the branch cut
-    has to give the powers a running product gives. Poles at every angle of
+    """The chunks build the pole powers by doubling, so a pole past the
+    imaginary axis (negative real part) or at the branch cut has to give the
+    powers a running product gives. Poles at every angle of
     the circle, the cut included, at radii up to 0.999 and over 100 positions
     (seven chunks): the states within K u of their absolute terms, against a
     complex128 recurrence. S4D-Lin's imaginary parts, up to pi (N - 1), put a
@@ -279,19 +290,20 @@ def test_the_recurrence_holds_for_poles_all_around_the_circle():
     expected = run(pole.astype(np.complex128), v.astype(np.complex128))
     magnitude = run(np.abs(pole).astype(np.float64), np.abs(v).astype(np.float64))
     inputs = np.concatenate([v.real, v.imag], axis=-1)
-    for form in (lambda pole, v: _chunked_recurrence(pole, v, 16), _scanned_recurrence):
-        actual = np.asarray(jax.jit(form)(jnp.asarray(pole), jnp.asarray(inputs)), np.float64)
-        actual = actual[..., :states] + 1j * actual[..., states:]
-        assert np.all(np.abs(actual - expected) <= forward_chain(steps, 1, states) * U * magnitude)
+    actual = np.asarray(jax.jit(diagonal_recurrence)(jnp.asarray(pole), jnp.asarray(inputs)), np.float64)
+    actual = actual[..., :states] + 1j * actual[..., states:]
+    assert np.all(np.abs(actual - expected) <= forward_chain(steps, 1, states) * U * magnitude)
 
 
 @pytest.mark.parametrize("platform, scanned", [("tpu", True), ("cuda", False), ("cpu", False)])
-def test_a_tpu_runs_the_recurrence_as_one_scan(platform, scanned):
-    """The TPU lowering takes the complex scan and the others the chunked
-    pole-power products, whose Toeplitz product names its einsum."""
-    pole = jnp.full((4,), 0.9 + 0.1j, jnp.complex64)
-    inputs = jnp.zeros((1, 40, 8), jnp.float32)
-    text = jax.jit(diagonal_recurrence).trace(pole, inputs).lower(lowering_platforms=(platform,)).as_text(
+def test_a_tpu_runs_the_layer_as_it_first_did(platform, scanned):
+    """The TPU lowering takes `_scanned_directions`, the layer's first form,
+    and the others the chunked pole-power products, whose Toeplitz product
+    names its einsum."""
+    layer = BidirectionalS5Layer(features=4, state_dim=4)
+    u = jnp.zeros((1, 40, 4), jnp.float32)
+    variables = layer.init(jax.random.key(0), u)
+    text = jax.jit(layer.apply).trace(variables, u).lower(lowering_platforms=(platform,)).as_text(
         debug_info=True)
     assert ("kjn,bcjn->bckn" not in text) == scanned
 
