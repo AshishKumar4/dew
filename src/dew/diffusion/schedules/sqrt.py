@@ -8,17 +8,25 @@ from .continuous import ContinuousNoiseScheduler
 class SqrtContinuousNoiseScheduler(ContinuousNoiseScheduler):
     """Square-root schedule from Diffusion-LM (Li et al. 2022).
 
-    alpha(t) = sqrt(1 - t) and sigma(t) = sqrt(t) for t in [0, 1], so it is
-    variance preserving (alpha^2 + sigma^2 = 1) with SNR(t) = (1 - t) / t.
-    Noise ramps up much faster near t = 0 than in the cosine schedule. The
-    low-noise end carries little signal about the token identity for
-    discrete/embedding data, so the schedule spends fewer steps there. The
-    paper trains the plain x_0 loss, so the weight is one.
+    The cumulative alpha is 1 - sqrt(t + s), s = 1e-4, normalized to one at
+    t = 0 the way Diffusion-LM's `betas_for_alpha_bar` normalizes it:
+
+        alpha^2(t) = (1 - sqrt(t + s)) / (1 - sqrt(s)),   sigma^2 = 1 - alpha^2,
+
+    so at Diffusion-LM's step k of T the rates are its table's at
+    t = (k + 1) / T. Noise rises like t^(1/4) from t = 0, much faster than
+    the cosine schedule, which spends fewer steps where an embedding carries
+    little noise. The cumulative alpha reaches zero just before t = 1, and the
+    rates stop there at (0, 1); Diffusion-LM's last step clips its beta at
+    0.999 instead. The paper trains the plain x_0 loss, so the weight is one.
     """
+
+    s: float = 1e-4
 
     def rates(self, t):
         t = jnp.asarray(t, jnp.float32)
-        return jnp.sqrt(1 - t), jnp.sqrt(t)
+        alpha_bar = jnp.clip((1 - jnp.sqrt(t + self.s)) / (1 - jnp.sqrt(self.s)), 0.0, 1.0)
+        return jnp.sqrt(alpha_bar), jnp.sqrt(1 - alpha_bar)
 
     def weight(self, t):
         return jnp.ones_like(jnp.asarray(t, jnp.float32))

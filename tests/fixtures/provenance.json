@@ -2332,6 +2332,22 @@
    ],
    "note": "Executes upstream modules under their own names with training-stack imports stubbed, tools/parity_rl.py:177,197,219."
   },
+  "schedules/betas.npz": {
+   "tool": "tools/beta_schedule_reference.py",
+   "sources": [
+    {
+     "repo": "openai/improved-diffusion",
+     "version": "1bc7bbbdc414d83d4abf2ad8cc1446dc36c4e4d5",
+     "runs": "fetched"
+    },
+    {
+     "repo": "XiangLi1999/Diffusion-LM",
+     "version": "759889d58ef38e2eed41a8c34db8032e072826f4",
+     "runs": "fetched"
+    }
+   ],
+   "note": "The authors' get_named_beta_schedule and betas_for_alpha_bar, executed as written."
+  },
   "sd3_source.tar.xz": {
    "tool": "tools/diffusers_sd3_reference.py",
    "sources": [
