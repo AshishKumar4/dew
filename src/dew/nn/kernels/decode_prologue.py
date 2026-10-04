@@ -7,9 +7,14 @@ head's query heads as its query positions, `Attention._attended`). XLA runs
 that as five kernels a layer (two norms, the rotated key's scatter, the
 value's, the query's rotation and fold), each a few microseconds of launch
 for a few kilobytes; the kernel is one program a row. Its arithmetic is
-`rms_normalized`'s and `apply_rotary`'s op for op: on an RTX 4080 its
-caches and query are bitwise XLA's (tests/test_decode_prologue.py), and
-2^30 normed values over 2^23 random heads matched XLA's to the bit. It
+`rms_normalized`'s and `apply_rotary`'s op for op, but its norm sums a head
+in another order than XLA's reduction. What was measured on an RTX 4080:
+the caches and query bitwise XLA's in tests/test_decode_prologue.py's
+cases; Qwen3-0.6B's served tokens and log-probabilities bitwise in every
+run; Qwen3-1.7B's the same in four runs, which equal the unfused step's
+in four of six (the unfused runs differ among themselves); and 2^30
+normed 128-wide values over 2^23 random heads matched to the bit. Other
+widths are expected to match, not proven to. It
 reads each key head's query heads with a strided slice, which Pallas's
 interpreter does not take, so it runs on CUDA only.
 

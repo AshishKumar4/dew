@@ -27,7 +27,10 @@ dependencies = [
     # published dewml takes the release: Dew detects a jax without the fix and
     # compiles a GPU pool without the persistent cache
     # (dew.training.runtime._pool_keys_alike), and CI and development installs
-    # take the build through constraints.txt.
+    # take the build through constraints.txt. A bump runs
+    # tests/test_decode_prologue.py on a GPU first: CI is CPU-only, and the
+    # decode step's Pallas Triton kernel (dew.nn.kernels.decode_prologue) is
+    # on a backend JAX 0.11 deprecates; its `fits` is the off switch.
     "jax>=0.11.2,<0.11.3",
     "optax>=0.2.2",
     "orbax-checkpoint>=0.12.4",
