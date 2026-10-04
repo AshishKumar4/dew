@@ -6,7 +6,7 @@ FlaxDiff's model modules at a pinned commit, moves every parameter off its
 initialization, and records each model's output on images (or clips), times
 and text states and, against a fixed cotangent, the gradients of the image,
 the text and every parameter: in float32 and in float64, the truth both
-float32 runs are measured from (tests/fixtures/flaxdiff/family.npz). Dew's
+float32 runs are measured from (tests/fixtures/flaxdiff_family/family.npz). Dew's
 models on the same weights and Fourier table are held to
 tests/reference_error.py's rule: no further from float64 than twice the
 float32 reference.
@@ -36,7 +36,7 @@ from dew.nn.backbones.uvit import SimpleUDiT
 from dew.nn.backbones.video_dit import VideoDiT
 from dew.nn.dit import TextContext
 
-FIXTURE = Path(__file__).resolve().parent / "fixtures" / "flaxdiff" / "family.npz"
+FIXTURE = Path(__file__).resolve().parent / "fixtures" / "flaxdiff_family" / "family.npz"
 # On a CPU with performance and efficiency cores, XLA's float32 convolution
 # rounds one of two ways in a process, by the core type that ran its first
 # convolution (openxla/xla#50022); the fixture's tool pins its own to the

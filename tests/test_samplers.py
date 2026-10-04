@@ -222,7 +222,7 @@ def integrate(process, solver, x_T, steps):
     return x, process.schedule.sigmas(times[-1])
 
 
-FLAXDIFF = dict(np.load(Path(__file__).resolve().parent / "fixtures" / "flaxdiff" / "solvers.npz"))
+FLAXDIFF = dict(np.load(Path(__file__).resolve().parent / "fixtures" / "flaxdiff_solvers" / "solvers.npz"))
 
 
 @dataclass(frozen=True)
