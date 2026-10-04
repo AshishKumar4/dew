@@ -543,17 +543,20 @@ def served_alongside(bound, slots=4, admission=2, **options):
     {"kv_cache": KVCache(page_size=16, pages=12), "chunk": 2},
     {"kv_cache": KVCache(page_size=4, pages=40), "chunk": 3, "prefix_cache": True},
     {"kv_cache": KVCache(page_size=4, pages=40), "chunk": 3, "prefix_cache": True, "decode_steps": 3},
-], ids=["paged", "chunked", "prefix", "prefix-three-steps"])
+    {"chunk": 2},
+], ids=["paged", "chunked", "prefix", "prefix-three-steps", "dense-chunked"])
 def test_a_paged_server_draws_what_each_request_draws_alone(options):
     """A pool of 12 pages holds fewer tokens than the 4 x 128 slots the dense
     server reserves, a prompt prefilled two or three tokens a step
-    attends to its earlier pieces through the page table, and a repeated
-    prompt starts from the page its first run published. None of it
-    changes a greedy draw: every row is the lone task call's."""
+    attends to its earlier pieces through the page table (or its dense
+    row), and a repeated prompt starts from the page its first run
+    published. None of it changes a greedy draw: every row is the lone task
+    call's. Each runs the mixed admitting step."""
     bound = task()
     alone = [bound(prompt, budget, key=index)
              for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
     server, tickets = served_alongside(bound, **options)
+    assert server.mixed_refusal is None
     for ticket, lone in zip(tickets, [*alone, alone[2]], strict=True):
         assert_same_generation(ticket.result(), lone)
     # "1234567" keeps its last token to prefill: one full page of four is shared.
@@ -648,8 +651,22 @@ def test_a_server_on_an_expert_mesh_draws_what_one_device_draws(dispatch):
             served("12", 3, key=0)
 
 
-def test_chunks_and_prefix_sharing_need_a_paged_cache():
+def test_prefix_sharing_needs_a_paged_cache():
     with pytest.raises(ValueError, match="paged cache"):
+        Server.from_task(task(), slots=2, capacity=128, prefix_cache=True)
+
+
+def test_a_model_the_mixed_step_cannot_take_keeps_two_forwards_and_says_why(monkeypatch):
+    """A layer that refuses the mixed admitting step names why; the server
+    keeps the prompts' prefill in a forward of its own and reports the
+    reason, and refuses a dense chunked prefill, which only the mixed step
+    serves."""
+    from dew.nn.mixers.attention import CausalSelfAttention
+
+    monkeypatch.setattr(CausalSelfAttention, "mixed_refusal", lambda self: f"{self.name}: a test refusal")
+    server = Server.from_task(task(), slots=2, capacity=128)
+    assert "a test refusal" in (server.mixed_refusal or "") and not server.rows.placement.mixed
+    with pytest.raises(ValueError, match="a test refusal"):
         Server.from_task(task(), slots=2, capacity=128, chunk=4)
 
 

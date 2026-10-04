@@ -353,6 +353,44 @@ class KVStore:
     def read(self) -> tuple[jax.Array, jax.Array]:
         return self._read("cached_key", "key_scale"), self._read("cached_value", "value_scale")
 
+    def write_tokens(self, key: jax.Array, value: jax.Array, rows: jax.Array, positions: jax.Array) -> None:
+        """Keys and values `[tokens, kv_heads, head_dim]`, each at its own row
+        and slot (a serving step's mixed call, `dew.nn.inputs.Admitted`); a row
+        past the cache's or a slot of -1 drops. Full precision, unrotated, and
+        a paged pool in one group, which the mixed call requires."""
+        if self.layout.page_size is None:
+            for name, incoming in (("cached_key", key), ("cached_value", value)):
+                self._put(name, write_tokens(self._get(name), incoming, rows, positions))
+            return
+        size = self.layout.page_size
+        table = self._get(TABLE)
+        inside = (positions >= 0) & (rows < table.shape[0])
+        page = table[jnp.where(inside, rows, 0), jnp.maximum(positions, 0) // size]
+        page = jnp.where(inside, page, DROPPED)
+        offset = jnp.maximum(positions, 0) % size
+
+        def stored(pool: jax.Array, page: jax.Array, offset: jax.Array, incoming: jax.Array) -> jax.Array:
+            return pool.at[:, page, offset].set(jnp.moveaxis(incoming, 1, 0), mode="drop")
+
+        for name, incoming in (("cached_key", key), ("cached_value", value)):
+            pool = self._get(name)
+            # Mapped over a group of one, as `_written` writes: unmapped, under
+            # --xla_gpu_deterministic_ops on an RTX 4080 (jax 0.11.2) this
+            # scatter wrote another token's keys at a kept slot.
+            written = jax.vmap(stored, in_axes=(1, 0, 0, 0), out_axes=1)(
+                pool[:, None], page[None], offset[None], incoming.astype(pool.dtype)[None])
+            self._put(name, written[:, 0])
+
+    def read_rows(self, rows: jax.Array) -> tuple[jax.Array, jax.Array]:
+        """`read` of only `rows`, `[len(rows), capacity, kv_heads, head_dim]`."""
+        def rows_of(name: str) -> jax.Array:
+            stored = self._get(name)
+            if self.layout.page_size is not None:
+                return _gather_pages(stored, self._get(TABLE)[rows], 1).astype(self.dtype)
+            return stored[rows].astype(self.dtype)
+
+        return rows_of("cached_key"), rows_of("cached_value")
+
     def _read(self, name: str, scale_name: str) -> jax.Array:
         stored = self._get(name)
         scale = None if self.layout.quantized is None else self._get(scale_name)
