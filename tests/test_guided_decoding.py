@@ -1,6 +1,9 @@
 """A guided row only ever spells text its grammar accepts, and ends where it may.
 
-The model is random, so left alone it spells noise; the checks are that the
+The token automaton is outlines-core's own `Index`, state by state: every
+reachable state's allowed tokens and every transition match, over a
+vocabulary whose merged pieces cross states. The model is random, so left
+alone it spells noise; the remaining checks are that the
 grammar, not the model, decides the shape of the text: a JSON schema's
 documents parse and validate, a regex's strings match in full, a served
 guided request draws what the same request draws alone, and the raw
@@ -58,6 +61,94 @@ def continuation(tokenizer, generation):
     width = rows.tokens.shape[1] - rows.behavior_log_probs.shape[1]
     drawn = rows.tokens[0, width:width + int(rows.lengths[0])]
     return tokenizer.decode([int(token) for token in drawn if token != EOS])
+
+
+@pytest.fixture(scope="module")
+def merged(tmp_path_factory):
+    """A byte-level BPE over all 256 bytes with merges into longer pieces and
+    an EOS special token, so tokens of different lengths cross the same
+    automaton states and one token can spell what two others spell."""
+    from tokenizers import Tokenizer, decoders, models, pre_tokenizers
+    from transformers import AutoTokenizer, PreTrainedTokenizerFast
+    from transformers.convert_slow_tokenizer import bytes_to_unicode
+
+    alphabet = bytes_to_unicode()
+    vocab = {alphabet[byte]: byte for byte in range(256)}
+    space = alphabet[ord(" ")]
+    merges = [("a", "b"), ("ab", "c"), ('"', ":"), ("t", "r"), ("tr", "u"), ("tru", "e"), ("1", "2"),
+              (":", space), ('"', ",")]
+    for left, right in merges:
+        vocab[left + right] = len(vocab)
+    backend = Tokenizer(models.BPE(vocab, merges, unk_token=None))
+    backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    backend.decoder = decoders.ByteLevel()
+    path = tmp_path_factory.mktemp("merged")
+    PreTrainedTokenizerFast(tokenizer_object=backend, eos_token="<eos>").save_pretrained(path)
+    return AutoTokenizer.from_pretrained(path, local_files_only=True)
+
+
+def outlines_index(tokenizer, pattern):
+    """outlines-core's own `Index` of `pattern`, over the bytes each token
+    spells by GPT-2's byte alphabet, which is what a byte-level BPE token
+    means; the EOS spells nothing."""
+    from outlines_core import Index, Vocabulary
+    from transformers.convert_slow_tokenizer import bytes_to_unicode
+
+    byte = {char: value for value, char in bytes_to_unicode().items()}
+    spelled: dict[bytes, list[int]] = {}
+    for token, index in tokenizer.get_vocab().items():
+        if index != tokenizer.eos_token_id:
+            spelled.setdefault(bytes(byte[char] for char in token), []).append(index)
+    return Index(pattern, Vocabulary(tokenizer.eos_token_id, spelled))
+
+
+SCHEMA = {"type": "object", "properties": {"name": {"type": "string", "maxLength": 3},
+                                           "ok": {"type": "boolean"}, "n": {"type": "integer"}},
+          "required": ["name", "ok", "n"]}
+
+
+@pytest.mark.parametrize("pattern", [r"(abc|ab)+[0-9]{1,2}", r"true|tr[a-z]?u", "schema"])
+def test_every_reachable_state_allows_and_leads_where_outlines_index_does(merged, pattern):
+    """Walking outlines-core's `Index` breadth first from its initial state,
+    Dew's grammar at the matching state masks exactly the tokens `Index`
+    disallows (EOS allowed exactly in its final states, the head's padded ids
+    nowhere) and every allowed token leads to the state matching the one
+    `Index` names; the matching is one to one and reaches every Dew state.
+    A second stop id, one of the padded ids, ends a row wherever EOS does.
+    The schema compiles through outlines-core's schema-to-regex translation
+    on both sides."""
+    from outlines_core import json_schema as schemas
+
+    regex = schemas.build_regex_from_schema(json.dumps(SCHEMA), None) if pattern == "schema" else pattern
+    index = outlines_index(merged, regex)
+    eos, width = merged.eos_token_id, len(merged) + 3
+    stops = (eos, len(merged) + 1)
+    grammar = (guided.json_schema(merged, SCHEMA, stops, vocab_size=width) if pattern == "schema"
+               else guided.regex(merged, pattern, stops, vocab_size=width))
+    states = grammar.transitions.shape[0]
+    allowed = np.isfinite(np.asarray(grammar.masked(jnp.arange(states), jnp.zeros((states, width)))))
+    matching = {index.get_initial_state(): 0}
+    queue = [index.get_initial_state()]
+    while queue:
+        state = queue.pop()
+        here = matching[state]
+        want = set(index.get_allowed_tokens(state))
+        assert (eos in want) == index.is_final_state(state)
+        want |= {stops[1]} if eos in want else set()
+        assert set(np.flatnonzero(allowed[here]).tolist()) == want, (state, here)
+        tokens = jnp.asarray(sorted(want), jnp.int32)
+        drawn = jnp.ones(tokens.shape, bool)
+        following = np.asarray(grammar.advanced(jnp.full(tokens.shape, here), tokens, drawn))
+        for token, there in zip(sorted(want), following.tolist(), strict=True):
+            if token in stops:
+                assert there == here
+                continue
+            reached = index.get_next_state(state, token)
+            if reached not in matching:
+                matching[reached] = there
+                queue.append(reached)
+            assert matching[reached] == there, (state, token)
+    assert sorted(matching.values()) == list(range(states))
 
 
 def test_a_json_schema_guided_row_writes_a_document_the_schema_accepts(tokenizer):
