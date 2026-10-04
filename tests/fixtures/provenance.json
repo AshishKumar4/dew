@@ -323,6 +323,22 @@
    ],
    "note": "FlaxDiff 0.2.10, JAX 0.5.3 and Flax 0.10.6 documented at tool:29."
   },
+  "flaxdiff/solvers.npz": {
+   "tool": "tools/flaxdiff_solver_reference.py",
+   "sources": [
+    {
+     "repo": "AshishKumar4/FlaxDiff",
+     "version": "15c55b001304604147a2a8002a76cf5d4c32092f",
+     "runs": "fetched"
+    },
+    {
+     "repo": "jax-ml/jax",
+     "version": "0.11.2.post3",
+     "runs": "jax"
+    }
+   ],
+   "note": "RK4Sampler.sample_step and MultiStepDPM.take_next_step through DiffusionSampler.sample_step, on KarrasVENoiseScheduler, walked as generate_samples walks its grid, around a stand-in denoiser; x_T and the cotangent are inputs."
+  },
   "flow/densities.npz": {
    "tool": "tools/flow_density_reference.py",
    "sources": [
