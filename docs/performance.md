@@ -1160,7 +1160,11 @@ One process ran all five of its 32-slot runs slow (3846-4054) and its
 64- and 128-slot runs at the others' rate; four more alternating rounds at
 32 slots gave 5729-5730 after against 5564-5669 before. An earlier
 session on a loaded host gave the same order at every slot count. The
-tokens and both log-probability streams are the same in every run. A
+tokens and both log-probability streams are the same in every run. The
+admitting step was its own compile before too (the step's jit traced it
+apart from the decoding one), so a cold server's start is unchanged:
+`Server.from_task` to the first token, no compilation cache, two
+alternating rounds, 34.9 and 35.5 s before, 38.7 and 35.2 after. A
 traced 64-slot run idles 74.7-83.2 ms before and 40.9-42.1 after (one of
 five traces 76.0, one 838 on a host load spike); what is left is mostly the
 traced client's own keys. Evidence:

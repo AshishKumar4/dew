@@ -577,7 +577,7 @@ ADMISSION_OPTIONS = {"xla_gpu_enable_command_buffer": ""}
 fresh buffers every call, so a command buffer is updated before it can
 replay, and the device waited out the update: on an RTX 4080 serving
 Qwen3-0.6B at 64 slots, about 5 ms before 9 of a run's 16 admitting steps
-(docs/performance.md). Other backends ignore the option."""
+(docs/performance.md). Only a GPU backend is handed them."""
 
 
 def _program(formats: Formats, rows: NamedSharding | None) -> tuple[jax.stages.Wrapped, jax.stages.Wrapped]:
@@ -591,7 +591,8 @@ def _program(formats: Formats, rows: NamedSharding | None) -> tuple[jax.stages.W
     programs = _PROGRAMS.get(key)
     if programs is None:
         halves = _split(formats)
-        programs = _PROGRAMS[key] = (_compiled(*halves, rows), _compiled(*halves, rows, ADMISSION_OPTIONS))
+        options = ADMISSION_OPTIONS if jax.default_backend() == "gpu" else None
+        programs = _PROGRAMS[key] = (_compiled(*halves, rows), _compiled(*halves, rows, options))
     return programs
 
 
