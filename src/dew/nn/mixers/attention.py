@@ -34,7 +34,6 @@ from dew.nn.attention import (
 )
 from dew.nn.blocks import normal_kernel
 from dew.nn.inputs import AttentionMetadata
-from dew.nn.kernels import decode_prologue
 from dew.nn.kv_cache import Append, KVCache, rotated, write_cache
 from dew.nn.mixer_base import MixerBase, MixerContext, mixers
 from dew.nn.precision import at_least_fp32, scaled
@@ -362,12 +361,9 @@ class CausalSelfAttention(nn.Module):
         # policy saves or offloads (decoder_block.RESIDUALS).
         projected_kv = None
         if self.has_variable('params', 'qkv_proj'):
-            packed = self.qkv_proj(x)
-            if self._prologue_fuses(packed, decode, attention_metadata, kv_store):
-                return self._fused_decode(packed, positions, attention_metadata, train)
             width = self.num_heads * self.head_dim * (2 if self.output_gate else 1)
             projected, key, value = jnp.split(
-                packed, (width, width + self.num_kv_heads * self.head_dim), axis=-1)
+                self.qkv_proj(x), (width, width + self.num_kv_heads * self.head_dim), axis=-1)
             projected_kv = (key, value)
         else:
             projected = self.q_proj(x)
@@ -443,69 +439,6 @@ class CausalSelfAttention(nn.Module):
                                 kv_store, segment_ids, attention_metadata, decode)
         attention = self._attended(masking, positions, append, sinks, train)
         return self._output(attention, gate, B, S, own_value)
-
-    def _prologue_fuses(self, packed, decode: bool, attention_metadata: AttentionMetadata | None,
-                        kv_store) -> bool:
-        """Whether this decode step's norms, rotation and cache write run as
-        `decode_prologue`'s one kernel: one token a row, on CUDA, for the
-        plain layer the kernel computes, per-head norms and a whole-head
-        rotate-half rope into a dense full-precision cache, with nothing
-        reading the keys but this layer's cuDNN call and no metadata but the
-        rows' validity."""
-        layout = self.kv_cache
-        return (decode and packed.shape[1] == 1 and jax.default_backend() == 'gpu'
-                and packed.dtype == jnp.bfloat16 and self.causal and self.qk_norm
-                and self.qk_norm_scope == 'head' and not self.kv_shared and kv_store is None
-                and not (self.output_gate or self.v_norm or self.k_eq_v or self.nope)
-                and self.mrope_section is None and self.yarn is None and self._rot_dim() is None
-                and self.attention_scale is None and not self.attention_sinks
-                and self.attn_logit_softcap is None and self.sliding_window is None
-                and self.attention_chunk is None and not self.bidirectional_images
-                and not self.exclusive_self_attention
-                and (attention_metadata is None
-                     or all(getattr(attention_metadata, field.name) is None
-                            for field in dataclasses.fields(attention_metadata) if field.name != 'valid'))
-                and layout.page_size is None and layout.quantized is None
-                and layout.key_rotation(self.head_dim) is None and self.attention_impl in ('auto', 'cudnn')
-                and not self.is_mutable_collection("qk")
-                and self.has_variable("cache", "cached_key")
-                and decode_prologue.ADOPTED
-                and decode_prologue.fits(self.num_heads, self.num_kv_heads, self.head_dim))
-
-    def _fused_decode(self, packed, logical_positions, attention_metadata: AttentionMetadata | None,
-                      train: bool):
-        """A plain decode step with its prologue in one kernel: the norms, the
-        rotation and the cache write (`decode_prologue`), then the cache's keys
-        through `_attended` as the unfused step reads them."""
-        B = packed.shape[0]
-        heads, kv_heads, head_dim = self.num_heads, self.num_kv_heads, self.head_dim
-        shape = jax.ShapeDtypeStruct((B, 1, kv_heads, head_dim), packed.dtype)
-        positions, append, _ = self._step_positions(shape, None, None, attention_metadata, decode=True, S=1)
-        if append is None:
-            raise AssertionError("a causal layer with its own cache always opens it")
-        rotary_positions = positions if logical_positions is None else logical_positions
-        cos, sin = self._rotary_angles(rotary_positions, packed)
-        store = append.store
-
-        def weight(norm) -> jax.Array:
-            scale = norm.get_variable('params', 'scale')
-            return (1.0 + scale) if self.scale_offset else scale
-
-        key_cache, value_cache, folded = decode_prologue.decode_prologue(
-            packed.reshape(B, heads + 2 * kv_heads, head_dim), weight(self.q_norm), weight(self.k_norm),
-            cos[:, 0], sin[:, 0], positions[:, 0], store._get("cached_key"), store._get("cached_value"),
-            heads=heads, epsilon=self.norm_eps, scale_after_cast=self.scale_after_cast)
-        store._put("cached_key", key_cache)
-        store._put("cached_value", value_cache)
-        key, value = store.read()
-        # The query in the layout the step's own call reads; `_attended` folds
-        # it back, which XLA cancels.
-        query = folded.transpose(0, 2, 1, 3).reshape(B, 1, heads, head_dim)
-        cursor, mask = self._decode_masks(positions, key.shape[-3])
-        masking = _Masking(query, key, value, causal=False, window=None, mask=mask, documents=None,
-                           implementation=self.attention_impl, cursor=cursor)
-        attention = self._attended(masking, positions, append, None, train)
-        return self._output(attention, None, B, 1, None)
 
     def _step_positions(self, key, positions, segment_ids, attention_metadata: AttentionMetadata | None,
                         decode: bool, S: int):

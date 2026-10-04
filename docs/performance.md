@@ -1218,36 +1218,29 @@ at 32 slots 430 log-probabilities move by up to 3.8e-6, so the step still
 stores them.
 Evidence: `~/.cache/dew/verification-evidence/serving-kernels/`.
 
-Next, the attention's decode prologue: XLA ran a layer's q and k norms, the
-rotated key's scatter into the cache, the value's, and the query's rotation
-and GQA fold as five kernels of one to three microseconds each.
-`dew.nn.kernels.decode_prologue` does them in one Pallas Triton program a
-row, op for op the same arithmetic. 28 layers at Qwen3-0.6B's widths and 64
-rows, inside one program so the host's dispatch does not set the time:
-0.097 ms against XLA's 0.191. Its RMSNorm sums each head in another order
-than XLA's reduction, and 2^30 normed values over 2^23 random heads
-matched to the bit. The attention takes it on CUDA for a plain layer (per
-head q/k norms, whole-head rotate-half rope, a dense full-precision cache,
-packed qkv projections whose head counts make power-of-two blocks).
-Serving Qwen3-0.6B, three alternating rounds against the change above,
-tokens a second, the tokens and both log-probability streams the same in
-every run:
-
-| slots | vLLM | before | after |
-|---:|---:|---:|---:|
-| 32 | 6049 | 5780 / 5778 / 5695 | 5943 / 5942 / 5923 |
-| 64 | 7614 | 7419 / 7412 / 7412 | 7587 / 7427 / 7585 |
-| 128 | 9047 | 8606 / 8605 / 8609 | 8765 / 8594 / 8752 |
-
-But serving Qwen3-1.7B, whose heads have the same widths, the kernel's
-tokens differ from the unfused step's: 1349 of 8192 at 32 slots and 3328
-of 16384 at 64, each side repeatable across processes. (An earlier record
-here read that as the unfused step being unrepeatable; the run it came from
-had taken the kernel on both sides.) The kernel's arithmetic is not XLA's
-yet, so it is off (`decode_prologue.ADOPTED`) until both models are
-bitwise, and serving runs at the rates of the table before. JAX 0.11
-deprecates the Pallas Triton backend; Mosaic GPU, its successor, targets
-sm90 and later. Evidence:
+A fused decode prologue, measured and removed. XLA runs a layer's q and k
+norms, the rotated key's scatter into the cache, the value's, and the
+query's rotation and GQA fold as five kernels of one to three microseconds
+each. A Pallas Triton kernel doing all five in one program a row took 28
+layers at Qwen3-0.6B's widths from 0.191 to 0.097 ms and served Qwen3-0.6B
+2-3% faster with the tokens and log-probabilities bitwise in every run
+(5943 / 7587 / 8765 tokens a second at 32 / 64 / 128 slots against vLLM's
+6049 / 7614 / 9047). Serving Qwen3-1.7B, whose heads have the same widths,
+its tokens differed from the unfused step's (1349 of 8192 at 32 slots),
+each side repeatable. (A record here first read that as the unfused step
+being unrepeatable; the run had taken the kernel on both sides.) The
+difference was the norm: its sum over a head's 128 lanes, even given XLA's
+own statistics from a standalone reduction, put one or two elements a head
+on the other bf16 neighbour of the unfused step's. XLA's reduction order
+inside its norm fusion depends on the fusion, and its rsqrt is the
+hardware's approximation, so there was no fixed arithmetic to match. A
+kernel that left the norms to XLA's own fusions and took only the
+rotation, both cache writes and the fold was bitwise on both models, but
+saved 3 of the 5 kernels: the device's busy time per 64-slot run went from
+2211 to 2186 ms, and the Pallas call fell outside XLA's default CUDA
+command buffers, which then needed `CUSTOM_CALL` in the decoding step's
+options or the run idled 200 ms more. Under 1% for a kernel on a backend
+JAX 0.11 deprecates was not worth keeping, so it was removed. Evidence:
 `~/.cache/dew/verification-evidence/serving-kernels/prologue/`.
 
 ## Quantized serving of the 176M text-to-image model, 2026-09-28
