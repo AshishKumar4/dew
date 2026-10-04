@@ -1218,6 +1218,24 @@ at 32 slots 430 log-probabilities move by up to 3.8e-6, so the step still
 stores them.
 Evidence: `~/.cache/dew/verification-evidence/serving-kernels/`.
 
+The head's bf16 rounding, 2026-10-03. The logits are bf16 values held in
+fp32 (`dew.nn.precision.head_product`), and `rounded_to`'s reduce-precision
+did not join XLA's Triton head GEMM, so a serving step wrote the fp32 logits
+and read them back to round them before the draw's three readers (the
+well-formedness check, the argmax with the log-softmax maximum, and the sum
+of exponentials) read them again: a 157 to 178 us kernel of its own at 128
+rows. Under CUDA the logits are now cast to bf16 behind a barrier
+(`bf16_logits`), so the cast joins the GEMM's epilogue and each reader widens
+the bf16 copy itself. The values and cotangents are `rounded_to`'s, bitwise
+(tests/test_precision_policy.py), and so are the served tokens and
+log-probabilities at 32, 64 and 128 slots. The head and greedy draw alone
+went from 1.145 to 0.981 ms at 128 rows of Qwen3-0.6B's widths, and the
+serving run's device busy time from 2211.0 to 2198.5 ms at 64 slots and from
+3803.5 to 3768.7 ms at 128 (two traced runs each). Training's loss head
+rounds its tiles itself (`dew.objectives.lm.chunked`) and other platforms
+keep `rounded_to`. Evidence:
+`~/.cache/dew/verification-evidence/serving-held-logits/`.
+
 A fused decode prologue, measured and removed. XLA runs a layer's q and k
 norms, the rotated key's scatter into the cache, the value's, and the
 query's rotation and GQA fold as five kernels of one to three microseconds
