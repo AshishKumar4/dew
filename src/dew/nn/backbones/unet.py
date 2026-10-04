@@ -103,6 +103,12 @@ class Unet(nn.Module):
     Without text the attention stages self-attend (`TransformerBlock`'s
     context defaults to its input). Cross-attention reads the whole text
     sequence; the mask the DiT family pools with has no place here.
+
+    It is FlaxDiff's `Unet` but for one width: the decoder upsamples level i
+    into `feature_depths[-i - 2]`, the width of the level it enters, where
+    FlaxDiff's upsamples into `feature_depths[-i]`. The two agree for two
+    levels or equal depths, where tests/test_flaxdiff_family_source.py holds
+    this model to FlaxDiff's.
     """
     output_channels:int=3
     emb_features:int=64*4
