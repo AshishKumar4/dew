@@ -671,8 +671,11 @@ def test_an_nccl_push_holds_no_copy_of_the_policy_on_the_devices_that_do_not_sen
 
     def held(device):
         # A shard's `data` is an array of its own over the same buffer, so buffers are counted once.
+        # A donated shard holds nothing: on the CPU an array read to the host and then donated stays
+        # live with its other devices' buffers gone, as a trainer's state is after its first step.
         buffers = {shard.data.unsafe_buffer_pointer(): shard.data.nbytes for array in jax.live_arrays()
-                   for shard in array.addressable_shards if shard.device == device}
+                   for shard in array.addressable_shards
+                   if shard.device == device and not shard.data.is_deleted()}
         return sum(buffers.values())
 
     resident = held(devices[1])

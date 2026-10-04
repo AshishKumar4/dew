@@ -146,8 +146,9 @@ def test_a_host_source_is_placed_holding_one_device_shard_at_a_time():
 
         def read(self, index):
             gc.collect()
+            # A donated shard holds nothing (see the NCCL push test in test_rollout_servers.py).
             placed = {shard.data.unsafe_buffer_pointer() for array in jax.live_arrays()
-                      for shard in array.addressable_shards}
+                      for shard in array.addressable_shards if not shard.data.is_deleted()}
             held = [ref for ref, address in self.reads if ref() is not None and address not in placed]
             self.most = max(self.most, len(held) + 1)
             part = np.array(self.value[index])
