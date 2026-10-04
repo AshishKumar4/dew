@@ -906,7 +906,10 @@ class Server:
         once. Requests are seated and draws read at call boundaries, so a
         request waits up to `decode_steps` iterations for its slot; the
         default admission seats that many iterations' rows a call. The draws
-        are the same for any value.
+        are the same for any value. Serving Qwen3-0.6B on an RTX 4080, more
+        than one was slower at 32, 64 and 128 slots: the slots fill a call at
+        a time, and one iteration a call already leaves the device idle under
+        1% of a run (docs/performance.md).
         """
         mesh = mesh_of(task.variables)
         if mesh is not None:
