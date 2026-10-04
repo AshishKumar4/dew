@@ -2079,6 +2079,22 @@
    ],
    "note": "Package version and weight URL/SHA256 are stored in the NPZ."
   },
+  "inception/pytorch_fid_tiny.npz": {
+   "tool": "tools/pytorch_fid_tiny_reference.py",
+   "sources": [
+    {
+     "repo": "mseitzer/pytorch-fid",
+     "version": "v0.3.0 (0a754fb8e66021700478fd365b79c2eaa316e31b)",
+     "runs": "fetched"
+    },
+    {
+     "repo": "pytorch/vision",
+     "version": "0.29.0",
+     "runs": "torchvision"
+    }
+   ],
+   "note": "src/pytorch_fid/inception.py at the commit (SHA-256 checked): InceptionV3(resize_input, normalize_input, use_fid_inception) over torchvision's Inception3 narrowed by 16 through its BasicConv2d, release weights not fetched, every weight drawn; pool3 features of 8-bit images upsampled and downsampled, float32 and float64. Torch 2.14.0+cpu."
+  },
   "inception/tiny": {
    "generator": "dew",
    "note": "The pool3 features Dew's tiny FID extractor gave before dew/eval/inception.py stopped taking its weights as constructor fields (source.json); a Dew regression golden."

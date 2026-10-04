@@ -21,6 +21,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from reference_error import assert_as_exact_as_the_reference
 from test_chunked_cross_entropy import equations
 
 from dew.artifacts import ImageGrid, VideoGrid
@@ -348,6 +349,57 @@ def test_the_converted_extractor_reproduces_the_features_it_gave_as_a_pickle():
     features = np.asarray(_get_activations(str(INCEPTION_TINY))(images))
     reference = np.load(INCEPTION_TINY.parent / "reference_features.npy")
     np.testing.assert_allclose(features, reference, rtol=1e-5, atol=1e-7)
+
+
+PYTORCH_FID_TINY = Path(__file__).resolve().parent / "fixtures" / "inception" / "pytorch_fid_tiny.npz"
+# pytorch-fid's BasicConv2d leaves by the names jax-fid's pickle gives them.
+JAX_FID_LEAVES = {"conv.weight": ("conv", "kernel"), "bn.weight": ("bn", "scale"), "bn.bias": ("bn", "bias"),
+                  "bn.running_mean": ("bn", "mean"), "bn.running_var": ("bn", "var")}
+
+
+def jax_fid_layout(state: dict) -> dict:
+    """A pytorch-fid state dict as jax-fid's pickle holds it: nested by module,
+    kernels HWIO. tools/pytorch_fid_tiny_reference.py's names; checked against the
+    two published files (pt_inception-2015-12-05 and jax-fid's pickle), which
+    it maps tensor for tensor."""
+    tree: dict = {}
+    for name, value in state.items():
+        if name.endswith("num_batches_tracked") or name.startswith("fc."):
+            continue
+        *modules, layer, leaf = name.split(".")
+        node = tree
+        for step in (*modules, JAX_FID_LEAVES[f"{layer}.{leaf}"][0]):
+            node = node.setdefault(step, {})
+        node[JAX_FID_LEAVES[f"{layer}.{leaf}"][1]] = value.transpose(2, 3, 1, 0) if value.ndim == 4 else value
+    return tree
+
+
+@pytest.mark.parametrize("size", [64, 320])
+def test_the_converted_extractor_is_as_exact_as_pytorch_fid(tmp_path, size):
+    """pytorch-fid's own InceptionV3 at the tiny extractor's width
+    (tools/pytorch_fid_tiny_reference.py), its drawn weights written in jax-fid's
+    layout and read by `dew.interop.inception_fid.convert`, the way the
+    published checkpoint reaches the extractor: pool3 features of images it
+    resizes up and down, by the float64 rule. pytorch-fid scales [0, 1] after
+    resizing; the extractor takes [-1, 1] and resizes."""
+    import pickle
+
+    from dew.eval.fid import _get_activations
+    from dew.interop.inception_fid import convert, save
+
+    with np.load(PYTORCH_FID_TINY) as loaded:
+        arrays = dict(loaded)
+    divisor = json.loads(arrays["meta"].tobytes())["divisor"]
+    state = {name.removeprefix("state/"): value for name, value in arrays.items()
+             if name.startswith("state/")}
+    source = tmp_path / "inception_v3_fid.pickle"
+    source.write_bytes(pickle.dumps(jax_fid_layout(state), protocol=4))
+    weights = tmp_path / "inception_v3_fid.safetensors"
+    save(convert(source), weights, divisor)
+    images = arrays[f"{size}/pixels"].transpose(0, 2, 3, 1).astype(np.float32) / 255
+    features = _get_activations(str(weights))(2 * images - 1)
+    assert_as_exact_as_the_reference(np.asarray(features), arrays[f"{size}/fp32.features"],
+                                     arrays[f"{size}/fp64.features"], f"{size}x{size} pool3")
 
 
 def test_fid_extraction_is_independent_of_small_batch_boundaries():
