@@ -2515,6 +2515,17 @@
    ],
    "note": "Executes upstream modules under their own names with training-stack imports stubbed, tools/parity_rl.py:177,197,219."
   },
+  "router/vllm.npz": {
+   "tool": "tools/vllm_router_reference.py",
+   "sources": [
+    {
+     "repo": "vllm-project/vllm",
+     "version": "v0.30.0 (ced6857afa0ea7b2e3f0846a62e1394e90f15607)",
+     "runs": "fetched"
+    }
+   ],
+   "note": "grouped_topk's own body extracted from vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py at the commit (SHA-256 checked), torch.compile decorator dropped, torch path (fused kernel off, sorted top-k); float32 and float64 (widened return cast). Torch 2.14.0+cpu."
+  },
   "schedules/betas.npz": {
    "tool": "tools/beta_schedule_reference.py",
    "sources": [
