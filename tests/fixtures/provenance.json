@@ -2638,6 +2638,22 @@
    ],
    "note": "libs/uvit_t2i.py and libs/timm.py fetched at the commit, SHA-256 checked, math attention; float32 and float64 (widened) forward and gradients. Torch 2.14.0+cpu."
   },
+  "vae/contract.npz": {
+   "tool": "tools/autoencoder_contract_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/diffusers",
+     "version": "0.34.0",
+     "runs": "diffusers"
+    },
+    {
+     "repo": "pytorch/pytorch",
+     "version": "2.14.0",
+     "runs": "torch"
+    }
+   ],
+   "note": "Over vae/sd3-tiny: SD3 img2img's retrieve_latents (DiagonalGaussianDistribution.sample) and normalization per frame, vae.decode of the normalized means taken back SD3's way, and the posterior past its clamp; draws are JAX's normal for key 7 handed through randn_tensor; float32 and float64 (widened)."
+  },
   "vae/sd3-tiny": {
    "tool": "tools/vae_reference.py",
    "sources": [
