@@ -351,7 +351,7 @@ def test_the_converted_extractor_reproduces_the_features_it_gave_as_a_pickle():
     np.testing.assert_allclose(features, reference, rtol=1e-5, atol=1e-7)
 
 
-PYTORCH_FID_TINY = Path(__file__).resolve().parent / "fixtures" / "inception" / "pytorch_fid_tiny.npz"
+PYTORCH_FID_TINY = Path(__file__).resolve().parent / "fixtures" / "pytorch_fid_tiny" / "reference.npz"
 # pytorch-fid's BasicConv2d leaves by the names jax-fid's pickle gives them.
 JAX_FID_LEAVES = {"conv.weight": ("conv", "kernel"), "bn.weight": ("bn", "scale"), "bn.bias": ("bn", "bias"),
                   "bn.running_mean": ("bn", "mean"), "bn.running_var": ("bn", "var")}

@@ -222,7 +222,21 @@ def integrate(process, solver, x_T, steps):
     return x, process.schedule.sigmas(times[-1])
 
 
-FLAXDIFF = dict(np.load(Path(__file__).resolve().parent / "fixtures" / "flaxdiff" / "solvers.npz"))
+FLAXDIFF = dict(np.load(Path(__file__).resolve().parent / "fixtures" / "flaxdiff_solvers" / "solvers.npz"))
+
+
+@dataclass(frozen=True)
+class StandIn:
+    """The FlaxDiff fixture's stand-in denoiser, the Gaussian-data optimum
+    bent by a tanh, read through the process's own sigma."""
+
+    process: Process
+
+    def __call__(self, x, t):
+        _, sigma = self.process.rates(t, like=x)
+        bent = 0.25 * x + sigma * 0.5 * jnp.tanh(x / 0.5)
+        x_0 = bent / (0.25 + sigma**2)
+        return x_0, (x - x_0) / sigma
 
 
 def flaxdiff_walk(solver, x_T):
@@ -230,12 +244,7 @@ def flaxdiff_walk(solver, x_T):
     stand-in denoiser read through the Karras schedule's own sigma."""
     process, _ = karras_process()
     times = jnp.asarray(FLAXDIFF["times"])
-
-    def denoise(x, t):
-        _, sigma = process.rates(t, like=x)
-        bent = 0.25 * x + sigma * 0.5 * jnp.tanh(x / 0.5)
-        x_0 = bent / (0.25 + sigma**2)
-        return x_0, (x - x_0) / sigma
+    denoise = StandIn(process)
 
     x, state = x_T, solver.init(x_T, times, process, key=jax.random.PRNGKey(0))
     latents = []
@@ -245,6 +254,28 @@ def flaxdiff_walk(solver, x_T):
         x, state = solver.step(x, t, t_next, denoised, eps, state, jax.random.PRNGKey(i), process, denoise)
         latents.append(x)
     return jnp.stack(latents)
+
+
+@pytest.mark.parametrize("name,solver", [("rk4", RK4()), ("multistep", MultiStepDPM())],
+                         ids=["rk4", "multistep"])
+def test_the_closing_denoise_is_flaxdiffs_generate_samples(name, solver):
+    """`sample` with its default `final_denoise` against FlaxDiff's own
+    `generate_samples` (AshishKumar4/FlaxDiff@15c55b0, run as published by
+    tools/flaxdiff_solver_reference.py) from the same x_T over the same
+    twelve-point grid: eleven solver intervals, then the clean prediction
+    at the grid's last point. The output is held to FlaxDiff's float64 run
+    by the float64 rule, and, through the clip to [-1, 1] that FlaxDiff's
+    `post_process` applies as the pipeline's output step, to that run's
+    clipped images: the stand-in's clean predictions reach |x| = 3, so the
+    clip moves most entries and the unclipped comparison is the one that
+    reads the walk."""
+    process, _ = karras_process()
+    closed = sample(StandIn(process), jnp.asarray(FLAXDIFF["x_T"]), 12, solver=solver, key=jax.random.key(0))
+    assert_as_exact_as_the_reference(closed, FLAXDIFF[f"{name}/closed"], FLAXDIFF[f"{name}/closed_f64"],
+                                     f"{name} closed")
+    assert float(np.abs(FLAXDIFF[f"{name}/closed_f64"]).max()) > 2
+    assert_as_exact_as_the_reference(jnp.clip(closed, -1, 1), FLAXDIFF[f"{name}/clipped"],
+                                     FLAXDIFF[f"{name}/clipped_f64"], f"{name} clipped")
 
 
 @pytest.mark.parametrize("name,solver", [("rk4", RK4()), ("multistep", MultiStepDPM())],
