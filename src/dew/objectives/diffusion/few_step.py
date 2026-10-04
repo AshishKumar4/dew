@@ -21,7 +21,6 @@ from collections.abc import Callable
 import jax
 import jax.numpy as jnp
 import numpy as np
-import optax
 from flax import linen as nn
 
 from dew.diffusion.process import Process
@@ -260,7 +259,7 @@ class ShortcutObjective(DiffusionObjective):
                                        step_size[:rows])
         target = jnp.concatenate([bootstrapped, v[rows:]])
         u = velocity(self.model_variables(variables), conditions, train=True)(x, sigma, sigma - step_size)
-        losses = optax.l2_loss(u, target)
+        losses = jnp.square(u - target)
         return Ratio(jnp.sum(losses), jnp.asarray(losses.size, jnp.float32)), Aux(metrics={})
 
 
