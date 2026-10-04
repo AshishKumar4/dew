@@ -182,7 +182,10 @@ def write_tokens(buffer: jax.Array, values: jax.Array, rows: jax.Array, position
     at its own row and slot; a row past the buffer's or a slot of -1 drops.
 
     A serving step's mixed call (`dew.nn.inputs.Admitted`) writes its
-    decoding rows' tokens and its prompts' in this one scatter, as words."""
+    decoding rows' tokens and its prompts' in this one scatter, as words.
+    Rows and slots index the leading axes, which the CUDA test lane checks
+    under --xla_gpu_deterministic_ops (`KVStore.write_tokens` says why a
+    pool's write is mapped)."""
     slots = jnp.where(positions >= 0, positions, DROPPED)
     written = as_words(buffer).at[rows, slots].set(as_words(values.astype(buffer.dtype)), mode="drop")
     return from_words(written, buffer.dtype)
