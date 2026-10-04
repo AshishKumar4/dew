@@ -37,7 +37,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference, assert_rounds_where_the_reference_does
+from reference_error import (
+    assert_as_exact_as_the_reference,
+    assert_computes_the_oracle,
+    assert_rounds_where_the_reference_does,
+)
 from safetensors.numpy import load_file
 
 from dew.interop import Pretrained, diffusion_gemma as adapter
@@ -98,6 +102,24 @@ def test_the_diffusion_denoiser_is_as_exact_as_its_reference_in_bf16():
         logits = denoise(model, variables, prompt, reference["canvas"], **conditioning)
         assert_as_exact_as_the_reference(logits, reference[f"{name}_bf16"], reference[f"{name}_f64"],
                                          f"workflow {name}")
+
+
+def test_a_float64_twin_is_held_to_its_own_rounding_and_not_the_fp32_error():
+    """Row sums of 256 float64 terms, summed in reverse, sit a few float64
+    ulps off the exact (fsum) sums, however exact an fp32 run of the same
+    sums might land. The computation's own float64 rounding (256 roundings
+    of the sums' scale) holds them, and a twin that drops one term is
+    refused by many orders of magnitude."""
+    import math
+
+    terms = np.random.default_rng(0).standard_normal((64, 256))
+    truth = np.asarray([math.fsum(row) for row in terms])
+    # Left to right in reverse; Python's own `sum` of floats is compensated.
+    reordered = np.add.accumulate(terms[:, ::-1], axis=-1)[:, -1]
+    assert np.abs(reordered - truth).max() > 0
+    assert_computes_the_oracle(reordered, truth, "reordered sums", roundings=256)
+    with pytest.raises(AssertionError, match="more than float64 rounding"):
+        assert_computes_the_oracle(terms[:, 1:].sum(-1), truth, "a dropped term", roundings=256)
 
 
 def test_logits_coarser_than_the_reference_fail_the_rule():
