@@ -2435,9 +2435,19 @@
      "repo": "End2End-Diffusion/iREPA",
      "version": "99ad4ac234efe8de52ce157120f72856e836d09f",
      "runs": "fetched"
+    },
+    {
+     "repo": "pytorch/pytorch",
+     "version": "2.14.0",
+     "runs": "torch"
+    },
+    {
+     "repo": "pytorch/vision",
+     "version": "0.29.0",
+     "runs": "torchvision"
     }
    ],
-   "note": "Single losses.npz executes both upstreams' fetched projector/loss/z-score code."
+   "note": "Fetches and executes upstream projection loss code, REPA's SILoss with train.py's loss composition and preprocess_raw_image, and iREPA's DINOv2Encoder.preprocess and spatial_zscore, with a stand-in network and encoder; SILoss's draws are DiffusionObjective's from jax.random.key(3)."
   },
   "repae": {
    "tool": "tools/repae_reference.py",
