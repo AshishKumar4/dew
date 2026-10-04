@@ -649,6 +649,19 @@ cuDNN with gradients as accurate:
   ms, attention 9.09 against 9.11; SimpleDiT-B and the decoder alike).
   `uv pip install` resolves the newest cuDNN under 10, so a fresh install
   gets 9.27.
+- JAX's own Pallas-Triton `mha` (`jax.experimental.pallas.ops.gpu.attention`,
+  the keys repeated over each group's query heads), 2026-10-04 at
+  `0527ab19`: one call's forward plus backward over 28 layered calls takes
+  0.33 against cuDNN's 0.38 ms at 1 x 1024 and 1.30 against 1.36 at 4 x 1024,
+  its gradients' RMS distance from float64 1.00 to 1.04 times cuDNN's; in
+  the training step the two tie (two rounds alternating: attention 8.49
+  against 8.52 ms a step and the step 90.6 against 90.8 at 1 x 1024, 15.5
+  against 15.3 and 142.4 against 142.9 at 2 x 1024). tokamax's main has no
+  GPU attention change since `47d3d663`, and JAX exposes no cuDNN algorithm,
+  workspace or determinism choice for its fused attention (non-deterministic
+  is already the default). A kernel of Dew's own to close FlashAttention-2's
+  1.3-1.9 ms a step would be a Pallas-Triton backward, on the backend JAX
+  0.11 deprecates, for under 2% of steps Dew already wins.
 
 tokamax trails JAX's `mha` by 10-18% at 64-wide heads in its backward
 (0.35 against 0.29 ms of the SimpleDiT-B call; the forwards are 0.093 and
