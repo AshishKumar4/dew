@@ -36,6 +36,9 @@ pytestmark = [
                        reason="DEW_NETWORK_TESTS=1 pushes to and reads from throwaway Hub repos"),
 ]
 ORGANIZATION = "dewml"
+# Every repo these tests create is named under this prefix, and the cleanup
+# deletes nothing that is not.
+PREFIX = f"{ORGANIZATION}/dew-hub-test-"
 
 
 @pytest.fixture(scope="module")
@@ -49,16 +52,19 @@ def api():
 
 @pytest.fixture(scope="module")
 def throwaway(api):
-    """A fresh repo name under dewml, deleted when the module is done."""
+    """A fresh repo name under dewml, deleted when the module is done: only
+    names this fixture made, each under PREFIX with a random suffix."""
     created = []
 
     def name(kind: str) -> str:
-        repo = f"{ORGANIZATION}/dew-hub-test-{kind}-{uuid.uuid4().hex[:8]}"
+        repo = f"{PREFIX}{kind}-{uuid.uuid4().hex[:8]}"
         created.append(repo)
         return repo
 
     yield name
     for repo in created:
+        if not repo.startswith(PREFIX):
+            raise AssertionError(f"refusing to delete {repo}, which these tests did not name")
         api.delete_repo(repo, missing_ok=True)
 
 
