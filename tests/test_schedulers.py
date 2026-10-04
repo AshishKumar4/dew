@@ -106,6 +106,24 @@ def test_forward_diffusion_invertible(cls, make, steps, family, sample_shape, rn
     assert jnp.max(jnp.abs(recovered - x0)) < 1e-4
 
 
+@pytest.mark.parametrize("make", [SqrtContinuousNoiseScheduler,
+                                  partial(KarrasVENoiseScheduler, sigma_max=80, rho=7, sigma_data=0.5)],
+                         ids=["continuous", "generalized"])
+def test_uniform_training_times_follow_the_uniform_law(make):
+    """A continuous schedule (`ContinuousNoiseScheduler`) and a generalized
+    one (`GeneralizedNoiseScheduler`) train on times drawn uniformly over
+    [0, T). Over 2^16 draws, scipy's one-sample Kolmogorov-Smirnov test
+    against U(0, T) must not reject at one in a billion, which fails any law
+    whose CDF strays from the uniform's by more than 0.013 anywhere; every
+    draw lies in [0, T)."""
+    from scipy import stats
+
+    schedule = make()
+    t = np.asarray(schedule.sample_t(jax.random.key(17), 1 << 16), np.float64)
+    assert t.min() >= 0 and t.max() < schedule.T
+    assert stats.kstest(t, stats.uniform(0, schedule.T).cdf).pvalue > 1e-9
+
+
 @pytest.mark.parametrize("cls,make,steps,family", ALL_CASES, ids=ALL_IDS)
 def test_training_times_stay_in_the_domain(cls, make, steps, family, rng):
     """sample_t draws what rates accepts: indices below T for a table, [0, 1)
