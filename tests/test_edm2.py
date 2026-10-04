@@ -1,8 +1,10 @@
 """EDM2's magnitude-preserving U-Net and forced weight normalization.
 
-The fixture is NVlabs/edm2's own `UNet` on a tiny configuration
+The fixtures are NVlabs/edm2's own `UNet` on a tiny configuration
 (`tools/edm2_reference.py`), with every zero-initialized gain drawn so that
-no branch is switched off.
+no branch is switched off: its output (unet.npz), and a few steps of its
+training in train mode, where each forward writes the normalized weights
+back (train.npz).
 """
 
 import json
@@ -17,19 +19,20 @@ from reference_error import assert_as_exact_as_the_reference
 
 from dew.nn.backbones.edm2 import EDM2UNet
 from dew.nn.dit import TextContext
-from dew.nn.mp import MPConv, forced_weight_normalization
+from dew.nn.mp import MPConv, forced_weight_normalization, normalize
 
 EDM2 = np.load(Path(__file__).resolve().parent / "fixtures" / "edm2" / "unet.npz")
+TRAIN = np.load(Path(__file__).resolve().parent / "fixtures" / "edm2" / "train.npz")
 
 
-def converted(arrays) -> dict:
+def converted(arrays, prefix: str = "weights/") -> dict:
     """The reference's state dict as this model's variables: dotted names to
     nested modules, `weight` to `mp_kernel` in channels-last order."""
     variables: dict = {"params": {}, "constants": {}}
     for key in arrays.files:
-        if not key.startswith("weights/"):
+        if not key.startswith(prefix):
             continue
-        *path, leaf = key.removeprefix("weights/").split(".")
+        *path, leaf = key.removeprefix(prefix).split(".")
         value = arrays[key]
         if path and path[0] in ("enc", "dec"):
             path = [f"{path[0]}_{path[1]}", *path[2:]]
@@ -48,16 +51,64 @@ def converted(arrays) -> dict:
 
 def test_the_unet_is_edm2s_own():
     config = json.loads(str(EDM2["config"]))
-    model = EDM2UNet(output_channels=config["img_channels"], model_channels=config["model_channels"],
-                     channel_mult=config["channel_mult"], num_blocks=config["num_blocks"],
-                     attn_resolutions=config["attn_resolutions"],
-                     channels_per_head=config["channels_per_head"])
+    model = edm2_unet(config)
     x = jnp.asarray(np.moveaxis(EDM2["x"], 1, -1), jnp.float32)
     text = TextContext(hidden=jnp.asarray(EDM2["text"], jnp.float32)[:, None, :],
                        mask=jnp.ones((2, 1), jnp.int32))
     output = model.apply(converted(EDM2), x, jnp.asarray(EDM2["noise_labels"], jnp.float32), text)
     assert_as_exact_as_the_reference(np.moveaxis(np.asarray(output), -1, 1), EDM2["output32"],
                                      EDM2["output"], "edm2 unet")
+
+
+def edm2_unet(config: dict) -> EDM2UNet:
+    return EDM2UNet(output_channels=config["img_channels"], model_channels=config["model_channels"],
+                    channel_mult=config["channel_mult"], num_blocks=config["num_blocks"],
+                    attn_resolutions=config["attn_resolutions"],
+                    channels_per_head=config["channels_per_head"])
+
+
+def test_forced_weight_normalization_trains_as_edm2_does():
+    """EDM2 normalizes a weight in place at each training forward and uses
+    that weight normalized again (`MPConv.forward`, whose `w` aliases the
+    parameter it overwrites); Dew stores the normalized weight after each
+    update (`forced_weight_normalization`) and normalizes it at use. Both
+    use normalize(normalize(w + update)) and store normalize(w + update), at
+    a step's boundary apart, so from the reference's initial weights
+    normalized, under the same SGD, they train alike: each step's output,
+    and every stored weight and gain after it, as exact as the reference's
+    float32 trajectory by tests/reference_error.py's rule."""
+    config = json.loads(str(TRAIN["config"]))
+    sgd = json.loads(str(TRAIN["sgd"]))
+    model = edm2_unet(config)
+    variables = converted(TRAIN)
+    variables["params"] = jax.tree_util.tree_map_with_path(
+        lambda path, value: normalize(value) if path[-1].key == "mp_kernel" else value, variables["params"])
+    x = jnp.asarray(np.moveaxis(TRAIN["x"], 1, -1))
+    noise = jnp.asarray(TRAIN["noise_labels"])
+    text = TextContext(hidden=jnp.asarray(TRAIN["text"])[:, None, :], mask=jnp.ones((2, 1), jnp.int32))
+    probe = jnp.asarray(np.moveaxis(TRAIN["probe"], 1, -1))
+    optimizer = optax.chain(optax.sgd(sgd["lr"]), forced_weight_normalization())
+    state = optimizer.init(variables["params"])
+
+    def loss(params):
+        output = model.apply({**variables, "params": params}, x, noise, text)
+        return jnp.sum(output * probe), output
+
+    step = jax.jit(jax.value_and_grad(loss, has_aux=True))
+    params = variables["params"]
+    for index in range(int(TRAIN["steps"])):
+        (_, output), grads = step(params)
+        assert_as_exact_as_the_reference(np.moveaxis(np.asarray(output), -1, 1),
+                                         TRAIN[f"fp32/{index}/output"], TRAIN[f"fp64/{index}/output"],
+                                         f"step {index} output")
+        if index:
+            stored = [converted(TRAIN, f"{precision}/{index}/weights/")["params"]
+                      for precision in ("fp32", "fp64")]
+            leaves = [np.concatenate([np.ravel(leaf) for leaf in jax.tree_util.tree_leaves(tree)])
+                      for tree in (params, *stored)]
+            assert_as_exact_as_the_reference(*leaves, f"step {index} stored weights and gains")
+        updates, state = optimizer.update(grads, state, params)
+        params = optax.apply_updates(params, updates)
 
 
 def test_a_run_config_builds_the_unet_and_scores_a_batch():
