@@ -175,6 +175,16 @@ def pipeline(walk):
     return Pretrained.load(str(walk[0] / "pipeline"), dtype="float32", attention_impl="xla")
 
 
+@pytest.fixture(scope="module")
+def streamed(walk):
+    """The pipeline loaded onto a mesh, its weights streamed as recipes and
+    placed a leaf at a time (tests/test_pipeline_streaming.py)."""
+    from dew.interop.pretrained import Pretrained
+    from dew.training import MeshSpec
+
+    return Pretrained.load(str(walk[0] / "pipeline"), dtype="float32", attention_impl="xla", mesh=MeshSpec())
+
+
 def relative_gap(actual, expected) -> float:
     actual, expected = np.asarray(actual, np.float64), np.asarray(expected, np.float64)
     return float(np.abs(actual - expected).max() / max(1.0, float(np.abs(expected).max())))
@@ -197,10 +207,13 @@ def test_prompt_encoding_matches_the_source_pipeline(pipeline, walk):
         assert relative_gap(context[row], expected) < FORWARD, row
 
 
-def test_pipeline_walk_matches_the_source(pipeline, walk):
+@pytest.mark.parametrize("load", ["pipeline", "streamed"])
+def test_pipeline_walk_matches_the_source(load, walk, request):
     """`Pretrained.load().text_to_image()` samples a clip with the source's
     own policy, 50 steps guided at 5.0 over its UniPC grid, and at the
-    recorded step count ends on the source's latent and decodes its frames."""
+    recorded step count ends on the source's latent and decodes its frames,
+    loaded whole or streamed onto a mesh."""
+    pipeline = request.getfixturevalue(load)
     _, record, arrays = walk
     task = pipeline.text_to_image()
     assert task.steps == 50 and task.guidance is not None and task.guidance.scale == record["guidance"]

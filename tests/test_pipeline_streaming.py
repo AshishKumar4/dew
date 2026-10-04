@@ -4,7 +4,11 @@
 recipes over the mapped files and places them one leaf at a time, as it
 already does a decoder's. These tests hold the streamed load to the eager
 one on the committed tiny pipelines of every family: the same tree, leaf for
-leaf and bit for bit, and the same samples.
+leaf and bit for bit, and the same samples. Each family's upstream walk runs
+on the streamed load too, against the source's own recorded outputs
+(test_native_diffusion's streamed bundles for SD, XL and the safety
+checker; the pipeline walks of test_flux_source, test_sd3_source,
+test_z_image_source and test_wan_source).
 
 `load_diffusion_source(text=False)` leaves the text encoder out, and a call
 takes prompts its conditioner encoded alone (`prepare(conditions=...)`): the

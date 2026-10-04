@@ -17,6 +17,7 @@ from dew.diffusion.schedules.source import SourceSchedule
 from dew.inference import DenoisingInputs
 from dew.inputs import Condition, Field, unit_range
 from dew.inputs.diffusion import latent_image_conditions
+from dew.nn.inputs import RowPlan, mesh_of
 from dew.interop import Pretrained
 from dew.objectives.base import Step
 from dew.objectives.diffusion import DiffusionObjective
@@ -24,8 +25,12 @@ from dew.sampling.guidance import CFG
 from dew.sampling.sample import sample
 
 
-def bundle(directory):
-    return Pretrained.load(str(directory), dtype="float32", attention_impl="xla")
+def bundle(directory, streamed: bool = False):
+    """The pipeline, loaded whole, or streamed onto a mesh a leaf at a time."""
+    from dew.training import MeshSpec
+
+    return Pretrained.load(str(directory), dtype="float32", attention_impl="xla",
+                           **({"mesh": MeshSpec()} if streamed else {}))
 
 
 def compare(errors, name, actual, expected, tolerance=5e-5):
@@ -123,9 +128,9 @@ def train_and_reload(source, reference, key, given, noise):
     return {"loss_before": float(value), "loss_after": float(after)}
 
 
-def check_pipeline(directory):
+def check_pipeline(directory, streamed: bool = False):
     directory = Path(directory)
-    source = bundle(directory)
+    source = bundle(directory, streamed)
     reference = np.load(directory / "reference.npz")
     meta = json.loads((directory / "reference.json").read_text()) if (directory / "reference.json").exists() else {}
     errors, key = {}, jax.random.PRNGKey(17)
@@ -149,8 +154,11 @@ def check_pipeline(directory):
                                              method=source.finish.model.features)
         compare(errors, "checker_features", features, reference["checker_embeddings"])
     # The same prepared native trajectory also runs through the task facade.
+    # Placed as `prepare` places them: on the pipeline's mesh when it has one.
+    plan = RowPlan.over(mesh_of(source.variables), 1)
+    placed = DenoisingInputs(*plan.place(plan.pad((initial, given, null))), rows=1)
     task = replace(source.text_to_image(), grid=lambda count: (process, times))
-    output = task(DenoisingInputs(initial, given, null, rows=1), steps=meta.get("steps", 2), guidance=3.0, key=key)
+    output = task(placed, steps=meta.get("steps", 2), guidance=3.0, key=key)
     compare(errors, "task", output.host().images, images, 1e-5)
     training = train_and_reload(source, reference, key, given, jnp.asarray(reference["noise"]))
     errors["reload"] = 0.0
@@ -252,6 +260,7 @@ if __name__ == "__main__":
     parser.add_argument("--grids")
     parser.add_argument("--case")
     parser.add_argument("--model", action="store_true")
+    parser.add_argument("--streamed", action="store_true", help="load the pipeline streamed onto a mesh")
     args = parser.parse_args()
     if args.model:
         check_model(args.directory)
@@ -260,4 +269,4 @@ if __name__ == "__main__":
     elif args.case:
         regress(args.directory, args.case)
     else:
-        check_pipeline(args.directory)
+        check_pipeline(args.directory, args.streamed)
