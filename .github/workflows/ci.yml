@@ -22,7 +22,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  EXTRAS: test,av,tfds,metrics,plots,inference-clients,vision,quantization,profile
+  # torchax runs transformers' PyTorch forwards in JAX: without it the audio
+  # condition and the torchax fallback tests skip on import.
+  EXTRAS: test,av,tfds,metrics,plots,inference-clients,vision,quantization,profile,torchax
 
 jobs:
   lint:
@@ -41,7 +43,7 @@ jobs:
         pip install flake8 uv
         pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
         # pyright resolves every import in src/dew, the optional readers' included.
-        pip install -e ".[$EXTRAS,gguf,torchax]" -c constraints.txt
+        pip install -e ".[$EXTRAS,gguf]" -c constraints.txt
     - name: Lint with flake8
       run: |
         # stop the build if there are Python syntax errors or undefined names; the
