@@ -434,13 +434,27 @@ def test_pull_returns_the_snapshot_directory(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------------
 
 
+def assert_transformers_reads_the_run(export, task, ids):
+    """transformers' own class for the export's model_type loads its files
+    with a clean report (`decoder_export_reference.reference_model`) and,
+    over the same ids, holds the run's own logits to tests/reference_error.py's
+    rule: in fp32 the reference, in float64 the truth."""
+    from reference_error import assert_as_exact_as_the_reference
+
+    from tools.decoder_export_reference import Case, reference_logits
+
+    case = Case("run export", str(export))
+    ours = np.asarray(task.model.apply(task.variables, jnp.asarray(ids, jnp.int32)))
+    assert_as_exact_as_the_reference(ours, reference_logits(case, export, ids),
+                                     reference_logits(case, export, ids, wide=True), "run export logits")
+
+
 def test_a_trained_lm_run_exports_and_reloads_at_its_own_logits(tmp_path):
     """The whole way out of a run directory: run.json and the checkpoint in,
     a Hugging Face directory out, and `Pretrained.load` reads it back at the
-    logits the run's own task computes."""
+    logits the run's own task computes, as transformers does."""
     from test_inference import make_lm_run
 
-    import dew
     from dew.interop import Pretrained
 
     run = tmp_path / "run"
@@ -458,6 +472,7 @@ def test_a_trained_lm_run_exports_and_reloads_at_its_own_logits(tmp_path):
     ids = jnp.asarray([[3, 4, 5, 6]], jnp.int32)
     np.testing.assert_array_equal(np.asarray(reloaded.model.apply(reloaded.variables, ids)),
                                   np.asarray(task.model.apply(task.variables, ids)))
+    assert_transformers_reads_the_run(destination, task, np.asarray([[3, 4, 5, 6, 7, 8, 9, 10]]))
 
 
 def test_exporting_a_run_whose_model_has_no_published_layout_names_it(tmp_path):
@@ -502,9 +517,11 @@ checkpoints.wait()
 def test_a_run_trained_in_one_process_exports_from_a_fresh_one(tmp_path):
     """`dew export` in a new process reads the run by its record alone: the
     registry imports the module that registers each name the record holds,
-    so nothing the training process happened to import is needed."""
+    so nothing the training process happened to import is needed. What it
+    writes, transformers reads at the run's own logits."""
     import os
     import subprocess
+
 
     root = Path(__file__).resolve().parents[1]
     env = {**{name: value for name, value in os.environ.items() if name != "XLA_FLAGS"},
@@ -518,6 +535,8 @@ def test_a_run_trained_in_one_process_exports_from_a_fresh_one(tmp_path):
                               capture_output=True, text=True, env=env, timeout=600)
     assert exported.returncode == 0, exported.stderr[-2000:]
     assert (tmp_path / "export" / "model.safetensors").is_file()
+    assert_transformers_reads_the_run(tmp_path / "export", dew.pipeline(str(tmp_path / "run")),
+                                      np.arange(9).reshape(1, 9))
 
 
 def test_a_registry_imports_the_module_that_registers_a_name_and_no_other():
