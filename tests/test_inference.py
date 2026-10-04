@@ -637,8 +637,9 @@ def test_explicit_average_requests_do_not_substitute_live_weights(tmp_path):
 def make_block_run(directory, fixture="diffusion-gemma-workflow"):
     """A block-diffusion run directory: a committed DiffusionGemma fixture's
     weights under a checkpoint that records the objective and its byte
-    tokenizer. The default fixture reads images; `diffusion-gemma-sft` is
-    text-only, which is what has a published layout to export to."""
+    tokenizer. The default fixture reads images and is the published
+    layout's own; `diffusion-gemma-sft` is Google's dense text-only model,
+    which transformers' class cannot build, so its export is refused."""
     from pathlib import Path
 
     from dew.interop import Pretrained

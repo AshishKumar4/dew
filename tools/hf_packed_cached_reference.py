@@ -14,9 +14,9 @@ mistral-tiny (a sliding window of 4) checkpoints, transformers 5.16.1's own
   position and of every step; the tool checks they are the full sequence's.
 
 Each in float32 and in float64 (the model built and run under
-`diffusers_wan_reference.widened`, which widens its float32 pins, the
-rotary table among them, and with the eager attention's
-`softmax(dtype=torch.float32)` widened too), the truth
+`diffusers_wan_reference.float64`, which widens its float32 pins, the
+rotary table and the eager attention's `softmax(dtype=torch.float32)`
+among them), the truth
 tests/reference_error.py measures both from. The packed call asks for no
 cache: transformers looks for packing only when it builds none.
 
@@ -48,30 +48,6 @@ def model(family: str, dtype: torch.dtype):
                                                 attn_implementation="eager").eval()
 
 
-@contextlib.contextmanager
-def wide_softmax():
-    """The eager attention's `softmax(..., dtype=torch.float32)` in float64."""
-    softmax = torch.nn.functional.softmax
-
-    def widened(*args, dtype=None, **kwargs):
-        return softmax(*args, dtype=torch.float64 if dtype == torch.float32 else dtype, **kwargs)
-
-    torch.nn.functional.softmax = widened
-    try:
-        yield
-    finally:
-        torch.nn.functional.softmax = softmax
-
-
-def float64():
-    from diffusers_wan_reference import widened
-
-    stack = contextlib.ExitStack()
-    stack.enter_context(widened())
-    stack.enter_context(wide_softmax())
-    return stack
-
-
 def packed(net, ids: np.ndarray) -> torch.Tensor:
     positions = torch.tensor([[step for length in row for step in range(length)] for row in PACKING])
     return net(input_ids=torch.from_numpy(ids), position_ids=positions, use_cache=False).logits
@@ -100,6 +76,8 @@ def cached(net, ids: np.ndarray) -> torch.Tensor:
 
 
 def main():
+    from diffusers_wan_reference import float64
+
     if len(sys.argv) != 2:
         raise SystemExit(__doc__)
     torch.set_num_threads(1)

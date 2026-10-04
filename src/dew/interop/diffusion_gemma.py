@@ -162,19 +162,39 @@ def scalar_placement(text: CausalTransformer, variables: Variables) -> CausalTra
     return text
 
 
+def _refuse_unreadable(config: Mapping[str, object]) -> None:
+    """The published implementation, transformers' DiffusionGemmaForBlockDiffusion
+    (5.16.1), builds a routed mixture on every layer and a vision tower: a
+    config without `text_config.num_experts` or `vision_config` is one it
+    cannot build (modeling_diffusion_gemma.py:616, 1019), so files written in
+    its layout would be read by no one."""
+    text = config.get("text_config")
+    missing = [name for name, present in (
+        ("text_config.num_experts", isinstance(text, Mapping) and text.get("num_experts")),
+        ("vision_config", config.get("vision_config"))) if not present]
+    if missing:
+        raise ValueError(
+            f"this DiffusionGemma has no {' or '.join(missing)}, and transformers' "
+            "DiffusionGemmaForBlockDiffusion, the implementation its checkpoint layout is for, builds "
+            "both, so it cannot read an export of it; keep training it from the run's checkpoint "
+            "(dew.checkpoints) rather than a published directory")
+
+
 def export_weights(
     model: nn.Module, variables: Variables, config: Mapping[str, object]
 ) -> dict[str, np.ndarray]:
     """Return the checkpoint tensors for a DiffusionGemma, keyed by source name.
 
     The decoder half goes through `export_decoder_weights` and is renamed under
-    the reference's `model.decoder.` and `model.encoder.` prefixes.
+    the reference's `model.decoder.` and `model.encoder.` prefixes. A config
+    the published implementation cannot build is refused (`_refuse_unreadable`).
     """
     from dew.interop.hf_decoders import export_decoder_weights
     from dew.nn.vision import _GEMMA4_VISION_TENSORS
 
     if not isinstance(model, DiffusionGemma):
         raise TypeError("DiffusionGemma export requires its native model value")
+    _refuse_unreadable(config)
     params = variables["params"]
     text_variables = {collection: tree["text"] for collection, tree in variables.items()
                       if "text" in tree}
