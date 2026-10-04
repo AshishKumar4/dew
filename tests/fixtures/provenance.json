@@ -2523,7 +2523,7 @@
      "runs": "fetched"
     }
    ],
-   "note": "Fetches and executes upstream get_targets with a closed-form stand-in network."
+   "note": "Fetches and executes upstream get_targets and train.py's loss_fn with a closed-form stand-in network with per-pixel weights and an EMA copy; the float64 run replays the float32 run's jax.random draws."
   },
   "stylegan_t": {
    "tool": "tools/stylegan_t_reference.py",
