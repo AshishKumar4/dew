@@ -643,6 +643,17 @@
    ],
    "note": "Downloaded release code with local kernel stand-ins and documented patches (tools/deepseek_v41_reference.py:54)."
   },
+  "hf/deepseek-v41-tiny/kernels.npz": {
+   "tool": "tools/deepseek_v41_reference.py",
+   "sources": [
+    {
+     "repo": "deepseek-ai/DeepSeek-V4.1-Flash",
+     "version": "dba1be0a40aa45a94ad051997016db3960a90277",
+     "runs": "fetched"
+    }
+   ],
+   "note": "The release's own inference/kernel.py (tilelang 0.1.8, torch 2.10.0+cu128) run on an RTX 4080 by --kernels: act_quant and fp4_act_quant in place on bf16 rows, sparse_attn and hc_split_sinkhorn; inputs and outputs as bits."
+  },
   "hf/diffusion-gemma-denoise-tiny/numerics.npz": {
    "tool": "tools/numerics_reference.py",
    "sources": [

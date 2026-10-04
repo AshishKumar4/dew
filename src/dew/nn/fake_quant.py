@@ -52,6 +52,31 @@ def _e2m1(values):
     return _round(values, 1, 0)
 
 
+# E2M1's midpoints, each with whether a value exactly on it rounds up: to
+# even, so up where the lower neighbour's mantissa bit is 1 (0.5, 1.5, 3).
+_E2M1_MIDPOINTS = ((0.25, False), (0.75, True), (1.25, False), (1.75, True), (2.5, False), (3.5, True),
+                   (5.0, False))
+_E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+def _e2m1_quotient(values, scale):
+    """E2M1 of `values / scale` under an E4M3 scale, ties to even, clamped to
+    +-6, without dividing: |values| is compared with each midpoint times the
+    scale, a product of at most 7 significant bits and so exact, which
+    rounds the exact quotient. For bf16 values that is the rounding of the
+    correctly rounded quotient the kernel divides to, since a bf16 value off
+    a midpoint times the scale lies further from it than half an fp32 ulp of
+    the quotient. A division would not do: XLA divides by a broadcast
+    through its reciprocal, and XLA GPU's division is not correctly rounded,
+    either of which carries a quotient across a tie (-0.146484375 /
+    0.1171875 comes out -1.2500001, rounding to -1.5 where the kernel's
+    -1.25 rounds to -1.0)."""
+    magnitude = jnp.abs(values)
+    index = sum(((magnitude > point * scale) | ((magnitude == point * scale) if up else False))
+                .astype(jnp.int32) for point, up in _E2M1_MIDPOINTS)
+    return jnp.copysign(jnp.asarray(_E2M1_VALUES, jnp.float32)[index], values)
+
+
 def straight_through(x, rounded):
     """`rounded` forward, bit for bit in any dtype, and the identity's
     gradient backward. `stop_gradient(x) - x` is +0, and subtracting +0
@@ -84,8 +109,9 @@ def fake_quant_fp4(x, block: int, e4m3_scale: bool):
     if e4m3_scale:
         # the kernel's cast saturates at E4M3's 448 (cvt.rn.satfinite)
         scale = _round_e4m3fn(jnp.minimum(jnp.maximum(amax, _E2M1_MAX * 2 ** -9) / _E2M1_MAX, _E4M3_MAX))
+        rounded = _e2m1_quotient(blocks, scale)
     else:
         scale = _power_of_two_ceil(
             jnp.maximum(amax, _E2M1_MAX * 2 ** -126) * jnp.float32(1 / _E2M1_MAX))
-    rounded = _e2m1(jnp.clip(blocks / scale, -_E2M1_MAX, _E2M1_MAX))
+        rounded = _e2m1(jnp.clip(blocks / scale, -_E2M1_MAX, _E2M1_MAX))
     return straight_through(x, (rounded * scale).reshape(x.shape))

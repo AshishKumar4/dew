@@ -6,8 +6,9 @@ name so the pinned model code runs on CPU, in fp32 and under autograd. Each
 function reproduces its kernel's arithmetic operation for operation
 (kernel.py at DEEPSEEK_V41_REVISION, the lines cited per function), except
 that sparse_attn keeps its probabilities in fp32 where the kernel rounds
-them to bf16; `tools/deepseek_v41_reference.py --check-kernels` compares
-them against the tilelang kernels on a GPU.
+them to bf16. tests/test_deepseek_v41.py holds them to the tilelang
+kernels' own outputs, which `tools/deepseek_v41_reference.py --kernels`
+writes on a GPU (tests/fixtures/hf/deepseek-v41-tiny/kernels.npz).
 
 The quantizers are fake-quantizers, as the kernels' `inplace=True` path is:
 the value leaves in the input's dtype, rounded through the storage format.

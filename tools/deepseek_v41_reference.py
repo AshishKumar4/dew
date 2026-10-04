@@ -12,10 +12,11 @@ Run it in its own environment, never the project's:
     VIRTUAL_ENV=... uv pip install torch==2.10.0 numpy safetensors sympy \
         tokenizers transformers huggingface_hub tilelang==0.1.8
     PYTHONPATH=. ~/.cache/dew/reference-venvs/deepseek-v41/bin/python \
-        tools/deepseek_v41_reference.py [--search N | --check-kernels | --vision | --fp64]
+        tools/deepseek_v41_reference.py [--search N | --kernels | --vision | --fp64]
 
-`--check-kernels` compares the stand-ins with the release's tilelang kernels
-on a CUDA GPU (`check_kernels`). `--search N` ranks N seeds from `--seed` by
+`--kernels` runs the release's tilelang kernels on a CUDA GPU and writes
+kernels.npz beside the fixture (`write_kernels`), which the suite holds Dew's
+quantizers and the stand-ins to. `--search N` ranks N seeds from `--seed` by
 what fp32 noise can reach in them (`search`); SEED is the first of 119.
 `--vision` writes the vision half beside the fixture (`write_vision`), and
 `--fp64`, run after both, the float64 truth of everything they wrote
@@ -56,7 +57,7 @@ the engram lookup keeps the model's dtype where the release casts to its
 bf16 (model.py:320); Indexer.forward publishes its keys on every call, where
 the release publishes them only when a group of entries closes
 (`_publishing_indexer`); the sparse_attn stand-in keeps its probabilities in
-fp32 where the kernel rounds them to bf16 (`check_kernels`); and every
+fp32 where the kernel rounds them to bf16 (`write_kernels`); and every
 quantizer passes its gradient straight through, an estimator the release,
 inference code, and the paper leave unnamed.
 """
@@ -678,79 +679,47 @@ def official_kernels():
     return module
 
 
-def _bits(x: torch.Tensor) -> torch.Tensor:
-    return x.view(torch.int16) if x.dtype == torch.bfloat16 else x.view(torch.int32)
-
-
-def _emulated_sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale):
-    """sparse_attn as the kernel rounds it (kernel.py:363-387) for one block
-    of at most 64 indices: the unnormalized probabilities enter the value
-    product in bf16 (acc_s_cast), while their sum stays fp32."""
-    batch = torch.arange(q.size(0), device=q.device)[:, None, None]
-    valid = topk_idxs >= 0
-    keys = kv[batch, topk_idxs.clamp_min(0).long()].float()
-    logits = torch.einsum("bmhd,bmkd->bmhk", q.float(), keys) * softmax_scale
-    logits = logits.masked_fill(~valid[:, :, None, :], float("-inf"))
-    peak = logits.amax(-1, keepdim=True).clamp_min(-1e30)
-    weights = torch.exp(logits - peak)
-    total = weights.sum(-1, keepdim=True) + torch.exp(attn_sink.float()[None, None, :, None] - peak)
-    return (torch.einsum("bmhk,bmkd->bmhd", weights.bfloat16().float(), keys) / total).to(q.dtype)
-
-
-def check_kernels():
-    """Compare tools/deepseek_v41_kernels.py with the tilelang kernels on CUDA.
+def write_kernels():
+    """Run the release's tilelang kernels on CUDA and write kernels.npz, the
+    fixture tests/test_deepseek_v41.py holds Dew's quantizers and the torch
+    stand-ins (tools/deepseek_v41_kernels.py) to.
 
     The kernels take bf16 activations only ('input X dtype expected
-    bfloat16'), so the comparison runs on bf16 inputs over nine magnitude
+    bfloat16'), so the quantizers read bf16 rows over nine magnitude
     decades, from blocks under every amax floor to blocks whose E4M3 scale
-    saturates, with an all-zero block and every E2M1 tie. The quantizers
-    must match bit for bit. sparse_attn's stand-in keeps its probabilities
-    in fp32, which defines the fp32 semantics the fixture runs; the kernel
-    rounds them to bf16 before the value product, so the comparison
-    reports the stand-in's difference and then the emulated kernel's, which
-    has to stay within one bf16 ulp (accumulation order). hc_split_sinkhorn
-    has to stay within one fp32 ulp of its unit-scale outputs.
+    saturates, with an all-zero block, and a block of every E2M1 tie.
+    sparse_attn reads bf16 queries and keys, a query with nothing to attend
+    among them, and hc_split_sinkhorn fp32 mixes. Every input and output is
+    stored as its bits (bf16 as int16).
     """
     official = official_kernels()
-    kernels = sys.modules["kernel"] = importlib.import_module("tools.deepseek_v41_kernels")
     device = "cuda"
     generator = torch.Generator(device=device).manual_seed(0)
-    failures = []
+    arrays: dict[str, np.ndarray] = {}
 
-    def report(name, mismatches, total, **extra):
-        print(json.dumps({"check": name, "mismatches": int(mismatches), "of": int(total), **extra}))
-        if mismatches:
-            failures.append(name)
+    def bits(x: torch.Tensor) -> np.ndarray:
+        return x.cpu().view(torch.int16).numpy() if x.dtype == torch.bfloat16 else x.cpu().numpy()
 
-    quantizers = {
-        "act_quant fp8/32 ue8m0": lambda k, x: k.act_quant(x, 32, "ue8m0", torch.float8_e8m0fnu, inplace=True),
-        "fp4_act_quant fp4/16 e4m3": lambda k, x: k.fp4_act_quant(x, 16, inplace=True,
-                                                                  scale_dtype=torch.float8_e4m3fn),
-        "fp4_act_quant fp4/32 e8m0": lambda k, x: k.fp4_act_quant(x, 32, inplace=True),
-    }
     magnitudes = (1e-6, 1e-4, 1e-2, 0.3, 3.0, 40.0, 3e2, 3e3, 3e4)
     blocks = []
     for magnitude in magnitudes:
-        x = torch.randn(64, 512, device=device, generator=generator) * torch.rand(
-            64, 1, device=device, generator=generator) * (3 * magnitude)
+        x = torch.randn(16, 512, device=device, generator=generator) * torch.rand(
+            16, 1, device=device, generator=generator) * (3 * magnitude)
         blocks.append(x.bfloat16())
     x = torch.cat(blocks)
     x[3, :32] = 0
-    saturating = int((x.float().unflatten(-1, (-1, 16)).abs().amax(-1) / kernels.FP4_MAX
-                      > kernels.FP8_MAX).sum())
-    for name, quantize in quantizers.items():
-        theirs, ours = quantize(official, x.clone()), quantize(kernels, x.clone())
-        report(name, (_bits(theirs) != _bits(ours)).sum(), x.numel(),
-               **({"saturating_blocks": saturating} if "e4m3" in name else {}))
-
     grid = torch.tensor([0, .25, .5, .75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3, 3.5, 4, 5, 6], device=device)
     ties = torch.cat([grid, -grid, grid + 1e-3, grid - 1e-3]).clamp(-6, 6).repeat(3)[:64]
     t = torch.zeros(2, 32, device=device)
     t.view(-1)[:64] = ties
     t[:, 0] = 6.0  # each block's amax, so its power-of-two scale is exactly one
-    t = t.bfloat16()
-    theirs, ours = (quantizers["fp4_act_quant fp4/32 e8m0"](k, t.clone()) for k in (official, kernels))
-    report("fp4 E2M1 ties", (_bits(theirs) != _bits(ours)).sum(), t.numel())
+    for label, rows in (("quant", x), ("ties", t.bfloat16())):
+        arrays[f"{label}/input"] = bits(rows)
+        arrays[f"{label}/fp8_32_ue8m0"] = bits(official.act_quant(
+            rows.clone(), 32, "ue8m0", torch.float8_e8m0fnu, inplace=True))
+        arrays[f"{label}/fp4_16_e4m3"] = bits(official.fp4_act_quant(
+            rows.clone(), 16, inplace=True, scale_dtype=torch.float8_e4m3fn))
+        arrays[f"{label}/fp4_32_e8m0"] = bits(official.fp4_act_quant(rows.clone(), 32, inplace=True))
 
     batch, queries, heads, width, keys, top = 2, 5, 16, 512, 40, 24
     q = torch.randn(batch, queries, heads, width, device=device, generator=generator).bfloat16()
@@ -759,29 +728,26 @@ def check_kernels():
     idx = torch.randint(-1, keys, (batch, queries, top), device=device, generator=generator,
                         dtype=torch.int32)
     idx[0, 0] = -1  # a query with nothing to attend
-    theirs = official.sparse_attn(q, kv, sink, idx, width ** -0.5).float()
-    port = kernels.sparse_attn(q, kv, sink, idx, width ** -0.5).float()
-    emulated = _emulated_sparse_attn(q, kv, sink, idx, width ** -0.5).float()
-    ulp = torch.exp2(torch.floor(torch.log2(theirs.abs().clamp_min(2 ** -126))) - 7)
-    residual = (emulated - theirs).abs()
-    print(json.dumps({"check": "sparse_attn stand-in, fp32 probabilities",
-                      "differing": int((port != theirs).sum()), "of": theirs.numel(),
-                      "max_abs": float((port - theirs).abs().max()),
-                      "max_output": float(theirs.abs().max())}))
-    report("sparse_attn emulated bf16 probabilities, beyond one bf16 ulp",
-           (residual > ulp).sum(), theirs.numel(), differing=int((residual > 0).sum()),
-           max_abs=float(residual.max()))
+    arrays.update({"sparse_attn/q": bits(q), "sparse_attn/kv": bits(kv), "sparse_attn/sink": bits(sink),
+                   "sparse_attn/idx": bits(idx),
+                   "sparse_attn/out": bits(official.sparse_attn(q, kv, sink, idx, width ** -0.5))})
 
     mixes = torch.randn(3, 7, 24, device=device, generator=generator)
     scale = torch.randn(3, device=device, generator=generator)
     base = torch.randn(24, device=device, generator=generator)
-    theirs = official.hc_split_sinkhorn(mixes, scale, base, 4, 20, 1e-6)
-    ours = kernels.hc_split_sinkhorn(mixes, scale, base, 4, 20, 1e-6)
-    residual = max(float((a - b).abs().max()) for a, b in zip(theirs, ours, strict=True))
-    report("hc_split_sinkhorn beyond one fp32 ulp", residual > 2 ** -23, 1, max_abs=residual)
-    print(json.dumps({"device": torch.cuda.get_device_name(), "torch": torch.__version__}))
-    if failures:
-        raise SystemExit(f"the stand-ins depart from the kernels: {failures}")
+    arrays.update({"sinkhorn/mixes": bits(mixes), "sinkhorn/scale": bits(scale), "sinkhorn/base": bits(base)})
+    split = official.hc_split_sinkhorn(mixes, scale, base, 4, 20, 1e-6)
+    for part, value in zip(("pre", "post", "comb"), split, strict=True):
+        arrays[f"sinkhorn/{part}"] = bits(value)
+
+    import tilelang
+
+    meta = {"repo": REPO, "revision": DEEPSEEK_V41_REVISION, "code": "inference/kernel.py",
+            "device": torch.cuda.get_device_name(), "torch": torch.__version__,
+            "tilelang": tilelang.__version__}
+    arrays["meta"] = np.frombuffer(json.dumps(meta).encode(), np.uint8)
+    np.savez_compressed(FIXTURE / "kernels.npz", **arrays)
+    print(f"{FIXTURE / 'kernels.npz'}: {len(arrays)} arrays, {meta['device']}")
 
 
 # ModelArgs fields onto the release's config.json text_config spelling.
@@ -946,8 +912,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--search", type=int, default=0, help="rank this many seeds")
     parser.add_argument("--seed", type=int, default=SEED, help="the fixture's seed, or the first searched")
-    parser.add_argument("--check-kernels", action="store_true",
-                        help="compare the torch stand-ins with the tilelang kernels on CUDA")
+    parser.add_argument("--kernels", action="store_true",
+                        help="write the tilelang kernels' outputs (kernels.npz) on CUDA")
     parser.add_argument("--fp64", action="store_true", help="write the fixture's float64 truth")
     parser.add_argument("--vision", action="store_true", help="write the vision half beside the fixture")
     options = parser.parse_args()
@@ -955,8 +921,8 @@ def main():
     # One thread keeps every reduction in one order, so a rerun writes the
     # same bits.
     torch.set_num_threads(1)
-    if options.check_kernels:
-        check_kernels()
+    if options.kernels:
+        write_kernels()
     elif options.fp64:
         write_truth(options.seed)
     elif options.vision:
