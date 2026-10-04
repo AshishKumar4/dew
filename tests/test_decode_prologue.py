@@ -96,6 +96,7 @@ def test_a_served_decoder_takes_the_fused_step_with_the_same_draws(monkeypatch):
             server.run()
             return [ticket.result().host() for ticket in tickets]
 
+    monkeypatch.setattr(decode_prologue, "ADOPTED", True)
     calls = []
     original = decode_prologue.decode_prologue
     monkeypatch.setattr(decode_prologue, "decode_prologue",

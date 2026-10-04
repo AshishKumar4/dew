@@ -1229,9 +1229,9 @@ than XLA's reduction, and 2^30 normed values over 2^23 random heads
 matched to the bit. The attention takes it on CUDA for a plain layer (per
 head q/k norms, whole-head rotate-half rope, a dense full-precision cache,
 packed qkv projections whose head counts make power-of-two blocks).
-Serving, three alternating rounds against the change above, tokens a
-second, the tokens and both log-probability streams the same in every
-run:
+Serving Qwen3-0.6B, three alternating rounds against the change above,
+tokens a second, the tokens and both log-probability streams the same in
+every run:
 
 | slots | vLLM | before | after |
 |---:|---:|---:|---:|
@@ -1239,8 +1239,15 @@ run:
 | 64 | 7614 | 7419 / 7412 / 7412 | 7587 / 7427 / 7585 |
 | 128 | 9047 | 8606 / 8605 / 8609 | 8765 / 8594 / 8752 |
 
-JAX 0.11 deprecates the Pallas Triton backend; Mosaic GPU, its successor,
-targets sm90 and later. Evidence:
+But serving Qwen3-1.7B, whose heads have the same widths, the kernel's
+tokens differ from the unfused step's: 1349 of 8192 at 32 slots and 3328
+of 16384 at 64, each side repeatable across processes. (An earlier record
+here read that as the unfused step being unrepeatable; the run it came from
+had taken the kernel on both sides.) The kernel's arithmetic is not XLA's
+yet, so it is off (`decode_prologue.ADOPTED`) until both models are
+bitwise, and serving runs at the rates of the table before. JAX 0.11
+deprecates the Pallas Triton backend; Mosaic GPU, its successor, targets
+sm90 and later. Evidence:
 `~/.cache/dew/verification-evidence/serving-kernels/prologue/`.
 
 ## Quantized serving of the 176M text-to-image model, 2026-09-28

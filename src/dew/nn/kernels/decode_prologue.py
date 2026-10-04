@@ -10,11 +10,9 @@ for a few kilobytes; the kernel is one program a row. Its arithmetic is
 `rms_normalized`'s and `apply_rotary`'s op for op, but its norm sums a head
 in another order than XLA's reduction. What was measured on an RTX 4080:
 the caches and query bitwise XLA's in tests/test_decode_prologue.py's
-cases; Qwen3-0.6B's served tokens and log-probabilities bitwise in every
-run; Qwen3-1.7B's the same in four runs, which equal the unfused step's
-in four of six (the unfused runs differ among themselves); and 2^30
-normed 128-wide values over 2^23 random heads matched to the bit. Other
-widths are expected to match, not proven to. It
+cases, Qwen3-0.6B's served tokens and log-probabilities bitwise in every
+run, and 2^30 normed 128-wide values over 2^23 random heads matched to the
+bit; but Qwen3-1.7B's served tokens differ, so it is off (`ADOPTED`). It
 reads each key head's query heads with a strided slice, which Pallas's
 interpreter does not take, so it runs on CUDA only.
 
@@ -28,6 +26,12 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
+
+ADOPTED = False
+"""Off. Serving Qwen3-1.7B on an RTX 4080 the kernel's tokens differ from the
+unfused step's (1349 of 8192 at 32 slots, 3328 of 16384 at 64), though
+Qwen3-0.6B's were bitwise in every run: its arithmetic is not yet XLA's
+(docs/performance.md). On again when both models are bitwise."""
 
 WARPS = 4
 """Warps a program: on an RTX 4080 at Qwen3-0.6B's widths, 28 layers took
