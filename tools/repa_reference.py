@@ -10,6 +10,23 @@
 Each case lands its inputs, the projector's weights in Flax's layout, and
 the loss in float64 and float32.
 
+Two more fixtures:
+
+- composed.npz: REPA's whole training loss as train.py takes it,
+  `loss_mean + proj_loss_mean * proj_coeff` over `SILoss.__call__` (linear
+  path, v prediction, uniform times) with `build_mlp`'s projector, the
+  encoder's input from `preprocess_raw_image` (the "dinov1" branch: /255
+  and ImageNet's normalization at the data's size), all run as published,
+  and its gradient in every weight. The model is a stand-in, a patch
+  network whose block's tokens are aligned, and so is the encoder, a patch
+  projection of the preprocessed pixels. `SILoss`'s time and noise are the
+  ones `DiffusionObjective.loss` draws from `jax.random.key(3)`: the split's
+  third key for the times and its fourth for the noise.
+- preprocessed.npz: 256-pixel images through `preprocess_raw_image`'s
+  "dinov2" branch (/255, ImageNet's normalization, bicubic to 224) and
+  iREPA's `DINOv2Encoder.preprocess`, then iREPA's `spatial_zscore` of
+  them read as features, as published.
+
     PYTHONPATH=src python tools/repa_reference.py
 """
 
@@ -17,9 +34,11 @@ from __future__ import annotations
 
 import ast
 import json
+import types
 import urllib.request
 from pathlib import Path
 
+import jax
 import numpy as np
 import torch
 
@@ -92,5 +111,135 @@ def main() -> None:
     print(f"{FIXTURE}: REPA and iREPA projection losses")
 
 
+COMPOSED = {"batch": 2, "side": 8, "patch": 2, "width": 8, "projector": 16, "features": 6,
+            "proj_coeff": 0.5, "key": 3}
+# timm.data's ImageNet statistics, which REPA's train.py and iREPA's encoders import.
+TIMM = {"IMAGENET_DEFAULT_MEAN": (0.485, 0.456, 0.406), "IMAGENET_DEFAULT_STD": (0.229, 0.224, 0.225)}
+
+
+def patches(images: torch.Tensor, patch: int) -> torch.Tensor:
+    """`[B, H, W, C]` as `[B, N, p * p * C]` tokens in raster order."""
+    b, h, w, c = images.shape
+    grid = images.reshape(b, h // patch, patch, w // patch, patch, c).permute(0, 1, 3, 2, 4, 5)
+    return grid.reshape(b, (h // patch) * (w // patch), patch * patch * c)
+
+
+def image(tokens: torch.Tensor, patch: int, side: int) -> torch.Tensor:
+    b, _, _ = tokens.shape
+    grid = tokens.reshape(b, side // patch, side // patch, patch, patch, -1).permute(0, 1, 3, 2, 4, 5)
+    return grid.reshape(b, side, side, -1)
+
+
+class Network(torch.nn.Module):
+    """The stand-in model: tokens of the input's patches plus the time, one
+    block whose output REPA aligns, and a head back to patches. It returns
+    REPA's `(output, zs_tilde)`, the projector applied to the block's tokens,
+    in `[B, C, H, W]` as SiT's are."""
+
+    def __init__(self, weights: dict, projector: torch.nn.Module, patch: int, side: int):
+        super().__init__()
+        self.weights = torch.nn.ParameterDict({name: torch.nn.Parameter(value)
+                                               for name, value in weights.items()})
+        self.projector, self.patch, self.side = projector, patch, side
+
+    def forward(self, x, t):
+        tokens = patches(x.permute(0, 2, 3, 1), self.patch)
+        hidden = tokens @ self.weights["embed"] + t.reshape(-1, 1, 1) * self.weights["time"]
+        block = torch.tanh(hidden @ self.weights["block"])
+        output = image(block @ self.weights["head"], self.patch, self.side).permute(0, 3, 1, 2)
+        return output, [self.projector(block)]
+
+
+def replayed(times: torch.Tensor, noise: torch.Tensor) -> types.SimpleNamespace:
+    """torch whose `rand` is `times` and `randn_like` `noise`, SILoss's two draws."""
+    return types.SimpleNamespace(**{**vars(torch), "rand": lambda *_, **__: times,
+                                    "randn_like": lambda like: noise})
+
+
+def composed() -> None:
+    settings = COMPOSED
+    b, side, patch, width = settings["batch"], settings["side"], settings["patch"], settings["width"]
+    channels = 3
+    generator = np.random.default_rng(11)
+    pixels = generator.integers(0, 256, (b, side, side, channels), dtype=np.uint8)
+    flat = patch * patch * channels
+    weights = {"embed": generator.standard_normal((flat, width)) * 0.4,
+               "time": generator.standard_normal(width),
+               "block": generator.standard_normal((width, width)) * 0.5,
+               "head": generator.standard_normal((width, flat)) * 0.4}
+    encoder = generator.standard_normal((flat, settings["features"])) * 0.3
+    repa = extracted(REPA + "models/sit.py", ("build_mlp",), {"nn": torch.nn})
+    torch.manual_seed(3)
+    projector = repa["build_mlp"](width, settings["projector"], settings["features"])
+    from torchvision.transforms import Normalize
+    preprocess = extracted(REPA + "train.py", ("preprocess_raw_image",),
+                           {"torch": torch, "Normalize": Normalize, **TIMM})
+    loss_scope = extracted(REPA + "loss.py", ("SILoss", "mean_flat"), {"torch": torch, "np": np})
+    # DiffusionObjective.loss's draws: split(key, 5), times from the third key, noise the fourth.
+    keys = jax.random.split(jax.random.key(settings["key"]), 5)
+    times = np.array(jax.random.uniform(keys[2], (b,)))
+    noise = np.array(jax.random.normal(keys[3], (b, side, side, channels)))
+    text = urllib.request.urlopen(REPA + "train.py").read().decode()
+    composition = next(line.strip() for line in text.splitlines()
+                       if "loss = loss_mean + proj_loss_mean" in line)
+    arrays = {"pixels": pixels, "encoder": encoder, "times": times, "noise": noise,
+              "settings": np.asarray(json.dumps(settings)), "composition": np.asarray(composition)}
+    arrays.update({f"weights/{name}": value for name, value in weights.items()})
+    for name, layer in zip(("Dense_0", "Dense_1", "Dense_2"), (projector[0], projector[2], projector[4]),
+                           strict=True):
+        for leaf, value in dense(layer).items():
+            arrays[f"projector/{name}/{leaf}"] = value
+    for dtype, suffix in ((torch.float64, "_f64"), (torch.float32, "")):
+        network = Network({name: torch.as_tensor(value, dtype=dtype) for name, value in weights.items()},
+                          projector.to(dtype), patch, side)
+        raw = torch.as_tensor(pixels, dtype=dtype).permute(0, 3, 1, 2)
+        prepared = preprocess["preprocess_raw_image"](raw, "dinov1").permute(0, 2, 3, 1)
+        zs = [patches(prepared, patch) @ torch.as_tensor(encoder, dtype=dtype)]
+        loss_scope["torch"] = replayed(torch.as_tensor(times, dtype=dtype).reshape(-1, 1, 1, 1),
+                                       torch.as_tensor(noise, dtype=dtype).permute(0, 3, 1, 2))
+        images = raw / 127.5 - 1
+        denoising, projection = loss_scope["SILoss"]()(network, images, zs=zs)
+        scope = {"loss": denoising, "proj_loss": projection, "args": types.SimpleNamespace(**settings)}
+        exec(f"loss_mean = loss.mean()\nproj_loss_mean = proj_loss.mean()\n{composition}", scope)
+        total = scope["loss"]
+        total.backward()
+        arrays[f"loss{suffix}"] = total.detach().double().numpy()
+        for name, parameter in network.weights.items():
+            arrays[f"grad/{name}{suffix}"] = parameter.grad.double().numpy()
+        for name, layer in zip(("Dense_0", "Dense_1", "Dense_2"), (projector[0], projector[2], projector[4]),
+                               strict=True):
+            arrays[f"grad/projector/{name}/kernel{suffix}"] = layer.weight.grad.double().numpy().T
+            arrays[f"grad/projector/{name}/bias{suffix}"] = layer.bias.grad.double().numpy()
+            layer.weight.grad = layer.bias.grad = None
+    np.savez(FIXTURE / "composed.npz", **arrays)
+    print(f"{FIXTURE}: REPA's composed loss and its gradient")
+
+
+def preprocessed() -> None:
+    generator = np.random.default_rng(12)
+    pixels = generator.integers(0, 256, (2, 256, 256, 3), dtype=np.uint8)
+    from torchvision.transforms import Normalize
+    repa = extracted(REPA + "train.py", ("preprocess_raw_image",),
+                     {"torch": torch, "Normalize": Normalize, **TIMM})
+    irepa = extracted(IREPA + "vision_encoder.py", ("DINOv2Encoder",),
+                      {"torch": torch, "Normalize": Normalize, "VisionEncoder": object, "Dict": dict,
+                       "Optional": object, **TIMM})
+    zscore = extracted(IREPA + "utils.py", ("spatial_zscore",), {"torch": torch})["spatial_zscore"]
+    arrays = {"pixels": pixels, "gamma": np.asarray(GAMMA)}
+    for dtype, suffix in ((torch.float64, "_f64"), (torch.float32, "")):
+        raw = torch.as_tensor(pixels, dtype=dtype).permute(0, 3, 1, 2)
+        dinov2 = repa["preprocess_raw_image"](raw, "dinov2")
+        encoder = types.SimpleNamespace(resolution=256)
+        same = irepa["DINOv2Encoder"].preprocess(encoder, raw)
+        assert torch.equal(same, dinov2), "REPA's and iREPA's DINOv2 preprocessing differ"
+        features = dinov2.permute(0, 2, 3, 1).reshape(2, -1, 3)
+        arrays[f"dinov2{suffix}"] = features.double().numpy()
+        arrays[f"zscore{suffix}"] = zscore(features, alpha=GAMMA).double().numpy()
+    np.savez(FIXTURE / "preprocessed.npz", **arrays)
+    print(f"{FIXTURE}: REPA's and iREPA's DINOv2 preprocessing at 256 pixels")
+
+
 if __name__ == "__main__":
     main()
+    composed()
+    preprocessed()
