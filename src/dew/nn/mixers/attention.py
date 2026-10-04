@@ -481,6 +481,24 @@ class CausalSelfAttention(nn.Module):
             positions = jnp.asarray(positions)
         return positions, append, prefix
 
+    def _mask_kernel(self, query, decode: bool) -> str:
+        """The kernel a call that builds its mask runs: xla
+        (`kernel_for_materialized_mask`), except a cache call over several
+        queries (a prefill, a verified draft) where cuDNN runs. That call runs
+        forward only, where cuDNN takes the mask as its additive bias with
+        none of the backward's refusals: 8 prompts of 256 at Qwen3-0.6B's
+        widths took 4.0 against xla's 6.2 ms over 28 layers on an RTX 4080.
+        It rounds elsewhere, so the prefill is not bitwise xla's: its RMS
+        distance from an fp32 forward is 1.04 times xla's on Qwen3-0.6B and
+        1.00 on 1.7B (tests/reference_error.py allows 2), and greedy rows part
+        only at bf16 near-ties (docs/performance.md)."""
+        masked = kernel_for_materialized_mask(
+            self.attention_impl, query, dtype=self.dtype, precision=self.precision,
+            force_fp32_for_softmax=self.force_fp32_for_softmax)
+        if decode and query.shape[1] > 1 and masked == 'xla' and cudnn_runs(query, self.attn_logit_softcap):
+            return 'cudnn'
+        return masked
+
     def _masking(
         self,
         query,
@@ -504,9 +522,7 @@ class CausalSelfAttention(nn.Module):
         B, S = query.shape[:2]
         causal, mask, documents = self.causal, None, None
         implementation = self.attention_impl
-        masked = kernel_for_materialized_mask(
-            implementation, query, dtype=self.dtype, precision=self.precision,
-            force_fp32_for_softmax=self.force_fp32_for_softmax)
+        masked = self._mask_kernel(query, decode)
         window = None if decode else self.sliding_window
         cursor = None  # the decode mask the paged kernel stands in for, when this call builds it
         if prefix is not None:

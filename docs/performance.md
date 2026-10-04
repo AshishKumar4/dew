@@ -1243,6 +1243,40 @@ options or the run idled 200 ms more. Under 1% for a kernel on a backend
 JAX 0.11 deprecates was not worth keeping, so it was removed. Evidence:
 `~/.cache/dew/verification-evidence/serving-kernels/prologue/`.
 
+Where the gap sits at 128 slots, and the prefill's attention, 2026-10-03. A
+traced 128-slot run (integration `66a1848c`, command buffers off so each
+kernel is attributed to its program and HLO scope) puts attention and GEMMs
+at parity: cuDNN's decode attention took 259 us a call against vLLM FA2's
+266, and the GEMMs 4.68 against 4.74 ms a step. The gap is the small
+kernels: 1.26 ms of them a decode step against vLLM's 0.50, and 8.1 ms an
+admission (32 admissions of 8 prompts). The largest admission item was the
+prefill's attention. Admission left-pads its prompts and writes their keys
+compactly, so the cache prefill builds the cursor mask, and
+`kernel_for_materialized_mask`, a rule for training (cuDNN's bias backward
+refuses odd lengths), sent it to xla: two dense dots, a softmax and four
+mask transposes, 3.7 ms an admission. A cache call over more than one
+query now gives that mask to cuDNN as its bias where cuDNN runs (training,
+single-token decode, CPU and the deterministic-ops CUDA lane are
+unchanged): 4.0 against 6.2 ms over 28 layers in isolation, and the
+device's busy time per run went from 2212.6 to 2179.2 ms at 64 slots and
+from 3807.4 to 3745.1 ms at 128 (two traced runs each, the same in both).
+
+It is not bitwise: cuDNN rounds at other points than xla's dots and
+softmax. Under tests/reference_error.py's rule, against the same bf16
+weights computed in fp32 at the highest precision over 8 of the benchmark's
+prompts cut to mixed lengths and left-padded, the cuDNN prefill's RMS
+distance is 1.036 times xla's on Qwen3-0.6B's logits (1.088 on the
+log-probabilities) and 0.999 (0.987) on Qwen3-1.7B's, against an allowed 2;
+the argmax agrees with fp32 at 96.4 against 96.8% of positions on 0.6B and
+96.9 against 97.2% on 1.7B. Greedy generations over the benchmark's
+random-token prompts part in 56 of 128 rows at 64 slots, each run
+repeatable, and every first divergence is a bf16 near-tie: teacher-forced
+through the fp32 model, the two chosen tokens' logits are a median 0.64
+bf16 spacings apart at their magnitude, the largest 2.78, 77% under one and
+98% under two, and the fp32 argmax is the xla prefill's choice in 31 rows
+and cuDNN's in 23. Evidence:
+`~/.cache/dew/verification-evidence/serving-prefill-cudnn/`.
+
 ## Quantized serving of the 176M text-to-image model, 2026-09-28
 
 `TextToImage.quantized` serves the denoiser with its kernels stored as int8

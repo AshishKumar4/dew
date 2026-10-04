@@ -1398,3 +1398,31 @@ def test_a_plain_decode_step_attends_through_cudnn_where_it_runs(rng, without_de
     # The filled slots travel as lengths: no [rows, 1, 1, capacity] mask
     # rides in as a bias the kernel reads for every head.
     assert fused and not [line for line in fused if "Bias" in line], fused[:1]
+
+
+@pytest.mark.skipif(jax.default_backend() != "gpu", reason="needs a GPU")
+def test_a_padded_prefill_attends_through_cudnn_where_it_runs(rng, without_deterministic_ops):
+    """A cache prefill of left-padded prompts builds its cursor mask, which
+    sends a training call to xla (`kernel_for_materialized_mask`); a prefill
+    runs forward only, so cuDNN takes that mask as its bias (xla's dense dots
+    took 6.2 against 4.0 ms over Qwen3-0.6B's 28 layers for 8 prompts of 256
+    on an RTX 4080). The prefill still scores what the full pass does."""
+    from dew.nn.attention import cudnn_runs
+
+    model = tiny(dtype=jnp.bfloat16, num_kv_heads=2, head_dim=32)
+    ids = tokens(rng)
+    params = model.init(rng, ids)
+    valid = jnp.ones(ids.shape, bool).at[0, :3].set(False)
+    full = model.apply(params, ids, attention_mask=valid)
+    cache = model.apply(params, ids.shape[0], method=CausalTransformer.init_cache,
+                        mutable=['cache'])[1]['cache']
+    prefill = jax.jit(lambda cache, ids, valid: model.apply(
+        {**params, 'cache': cache}, ids, attention_mask=valid, decode=True, mutable=['cache'])[0])
+    np.testing.assert_allclose(np.asarray(prefill(cache, ids, valid), np.float32)[valid],
+                               np.asarray(full, np.float32)[valid], atol=0.05)
+    text = prefill.lower(cache, ids, valid).compile().as_text() or ""
+    fused = [line for line in text.splitlines() if 'custom_call_target="__cudnn$fmha' in line]
+    if not cudnn_runs(jnp.zeros((1, 1, 4, 32), jnp.bfloat16)):
+        assert not fused
+        return
+    assert fused and all("Bias" in line for line in fused), fused[:1]
