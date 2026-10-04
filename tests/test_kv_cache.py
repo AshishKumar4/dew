@@ -93,6 +93,27 @@ def test_a_cache_write_is_the_per_row_scatter_bit_for_bit(wide):
         assert widths == ({2} if wide else {4}), widths
 
 
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16, jnp.float8_e4m3fn, jnp.int8, jnp.float32,
+                                   jnp.bool_])
+def test_a_cache_write_moves_whole_words_with_the_same_bits(dtype):
+    """On a GPU a cache of one- or two-byte elements is written as uint32
+    words (`as_words`): XLA's scatter stores an element a thread, and
+    Qwen3-0.6B's admission write ran 2.3 times faster as words. The bits are
+    the per-row scatter's either way, and a word-wide or boolean cache is
+    written as it is."""
+    rng = np.random.default_rng(0)
+    buffer = jnp.asarray(rng.normal(size=(3, 6, 2, 8)) * 4).astype(dtype)
+    values = jnp.asarray(rng.normal(size=(3, 2, 2, 8)) * 4).astype(dtype)
+    positions = jnp.asarray([[2, -1], [-1, -1], [5, 0]], jnp.int32)
+    scattered = jax.vmap(lambda row, incoming, at: row.at[at].set(incoming, mode="drop"))(
+        buffer, values, jnp.where(positions >= 0, positions, DROPPED))
+    written = jax.jit(write_cache)(buffer, values, positions)
+    assert written.dtype == dtype and np.asarray(written).tobytes() == np.asarray(scattered).tobytes()
+    text = jax.jit(write_cache).lower(buffer, values, positions).compile().as_text() or ""
+    narrow = jnp.dtype(dtype).itemsize < 4 and dtype != jnp.bool_
+    assert ("u32[3,6,2," in text) == (narrow and jax.default_backend() == "gpu")
+
+
 def test_an_int8_cache_keeps_the_logits_outlier_key_channels_would_flatten():
     """Without the rotation int8's per-token scale is spent on the outlier
     channels and the ordinary ones round away; the stored keys are Hadamard
