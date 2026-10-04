@@ -180,7 +180,11 @@ _GEMMA4_ONLY = ("architectures", "use_cache", "attention_k_eq_v", "enable_moe_bl
                 "num_kv_shared_layers", "use_double_wide_mlp")
 # The run's own settings, which no config carries: precision and kernels,
 # training-time dropout and initialization, layout, and where the layer
-# scalar is stored (`scalar_placement`).
+# scalar is stored (`scalar_placement`). `causal` is no setting but is fixed
+# by the classes on both sides: Dew's text stack is the causal encoder view
+# DiffusionGemma requires, and transformers' encoder attends causally unless
+# use_bidirectional_attention is "all", which this config never writes,
+# while its decoder never does (modeling_diffusion_gemma.py:281, :383, 5.16.1).
 _RUN_SETTINGS = ("dtype", "precision", "force_fp32_for_softmax", "attention_impl", "kv_cache", "causal",
                  "scan_layers", "bank_layers", "remat", "dropout_rate", "embedding_dropout_rate",
                  "attention_dropout_rate", "initializer_range", "depth_scaled_init", "layer_scalar")
