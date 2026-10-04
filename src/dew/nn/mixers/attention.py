@@ -484,7 +484,9 @@ class CausalSelfAttention(nn.Module):
     def _mask_kernel(self, query, decode: bool) -> str:
         """The kernel a call that builds its mask runs: xla
         (`kernel_for_materialized_mask`), except a cache call over several
-        queries (a prefill, a verified draft) where cuDNN runs. That call runs
+        queries (a prefill, a verified draft) under 'auto' or 'cudnn' where
+        `cudnn_runs` (which also keeps the deterministic-ops lane off it); an
+        explicit 'xla' stays xla. That call runs
         forward only, where cuDNN takes the mask as its additive bias with
         none of the backward's refusals: 8 prompts of 256 at Qwen3-0.6B's
         widths took 4.0 against xla's 6.2 ms over 28 layers on an RTX 4080.
@@ -495,7 +497,8 @@ class CausalSelfAttention(nn.Module):
         masked = kernel_for_materialized_mask(
             self.attention_impl, query, dtype=self.dtype, precision=self.precision,
             force_fp32_for_softmax=self.force_fp32_for_softmax)
-        if decode and query.shape[1] > 1 and masked == 'xla' and cudnn_runs(query, self.attn_logit_softcap):
+        if (decode and query.shape[1] > 1 and masked == 'xla' and self.attention_impl in ('auto', 'cudnn')
+                and cudnn_runs(query, self.attn_logit_softcap)):
             return 'cudnn'
         return masked
 
