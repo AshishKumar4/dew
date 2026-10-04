@@ -632,7 +632,10 @@ def test_a_trained_block_diffusion_tree_saves_back_over_its_source(tmp_path):
     constant and the objective moves into `params`, so a trained tree and the
     source it came from disagree about where that tensor lives. The tree is
     what is being written, so `source.save(destination)` takes the trained one
-    and the model read back out of that directory computes the trained loss."""
+    and the model read back out of that directory computes the trained loss.
+    The checkpoint is the published layout's own (experts and a vision
+    tower): Google's dense text-only model has no published reader, and its
+    export is refused (tests/test_block_sft.py)."""
     import optax
 
     from dew import Dataset, Trainer
@@ -640,15 +643,12 @@ def test_a_trained_block_diffusion_tree_saves_back_over_its_source(tmp_path):
     from dew.objectives.base import Step, thaw
     from dew.objectives.diffusion.block import BlockDiffusionObjective
 
-    checkpoint = REPO_ROOT / "tests/fixtures/hf/diffusion-gemma-sft"
+    checkpoint = REPO_ROOT / "tests/fixtures/hf/diffusion-gemma-workflow"
     source = Pretrained.load(checkpoint, dtype="float32", attention_impl="xla", max_seq_len=32)
     objective = BlockDiffusionObjective(source.model, prompt_length=4, num_canvases=2,
                                         pretrained=source.variables)
-    rows = jax.device_count()
-    with np.load(checkpoint / "reference.npz") as arrays:
-        batch = {name: np.concatenate([arrays[source_name]] * (rows // 2))
-                 for name, source_name in (("text", "tokens"), ("canvas_mask", "canvas_mask"),
-                                           ("encoder_target_mask", "encoder_target_mask"))}
+    rows = 2 * jax.device_count()
+    batch = {"text": np.random.default_rng(0).integers(3, 60, (rows, 12)).astype(np.int32)}
     data = Dataset(train=lambda partition: iter([batch, batch]), val=None, records=rows, batch=rows)
 
     state = Trainer(objective, optax.sgd(0.05), key=jax.random.key(0)).fit(data, steps=1, log_every=1)

@@ -629,29 +629,28 @@ def test_the_cli_exports_a_run_and_refuses_a_directory_that_is_not_one(tmp_path,
         main(["export", str(tmp_path / "nothing"), str(tmp_path / "other")])
 
 
-def test_a_block_diffusion_run_exports_under_its_published_config(tmp_path):
-    """DiffusionGemma writes the reference's own encoder/decoder names, over
-    the published config the run's record carries."""
+def test_a_block_diffusion_run_writes_no_export_transformers_cannot_read(tmp_path):
+    """transformers' DiffusionGemmaForBlockDiffusion, the implementation the
+    checkpoint layout is for, builds experts and a vision tower. A run of
+    Google's dense text-only model records a text-only config it cannot
+    build, so its export is refused before a file is written; a run with a
+    vision conditioner records none, and is refused by `from_run`."""
     from test_inference import make_block_run
 
     from dew.interop import Pretrained
 
-    run = tmp_path / "run"
-    run.mkdir()
-    make_block_run(run, fixture="diffusion-gemma-sft")
-    destination = tmp_path / "export"
+    dense = tmp_path / "dense"
+    dense.mkdir()
+    make_block_run(dense, fixture="diffusion-gemma-sft")
+    with pytest.raises(ValueError, match="cannot read an export"):
+        Pretrained.from_run(str(dense), ema=False).save(tmp_path / "refused")
+    assert not (tmp_path / "refused").exists()
 
-    Pretrained.from_run(str(run), ema=False).save(destination)
-
-    reloaded = Pretrained.load(destination, dtype="float32", attention_impl="xla", max_seq_len=32)
-    task = dew.pipeline(str(run), ema=False)
-    # The export writes the layer scalars into the reference's buffers, so
-    # the reloaded tree is the source's shape, not the run's; what has to
-    # survive is the canvas the two decode.
-    wanted = task([[1, 5, 7]], 3, key=4).host()
-    actual = reloaded.block_generation()([[1, 5, 7]], 3, key=4).host()
-    np.testing.assert_array_equal(actual.tokens, wanted.tokens)
-    np.testing.assert_array_equal(actual.decoder_steps, wanted.decoder_steps)
+    vision = tmp_path / "vision"
+    vision.mkdir()
+    make_block_run(vision)
+    with pytest.raises(TypeError, match="vision conditioner"):
+        Pretrained.from_run(str(vision), ema=False)
 
 
 def test_the_fid_converter_refuses_a_pickle_that_is_missing_a_key(tmp_path):

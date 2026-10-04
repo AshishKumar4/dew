@@ -149,3 +149,61 @@ def test_a_text_decoder_takes_its_tokenizer_whatever_processor_files_ship(tmp_pa
     )
     reference = Pretrained.load(str(FIXTURE), dtype="float32", attention_impl="xla", max_seq_len=32)
     assert type(bundle.processor.reference) is type(reference.processor.reference)
+
+
+def test_transformers_reads_a_trained_export_at_dews_logits_and_tokens(tmp_path):
+    """The export of a changed DiffusionGemma is a checkpoint transformers'
+    DiffusionGemmaForBlockDiffusion loads with a clean report. On the
+    fixture's prompt and canvas its bare and self-conditioned logits, in fp32
+    and float64, hold Dew's on the changed weights to tests/reference_error.py's
+    rule, and its generation from matched draws
+    (tools/diffusion_gemma_reference.py) writes Dew's tokens."""
+    import torch
+    from reference_error import assert_as_exact_as_the_reference
+    from test_block_diffusion import prefill
+    from transformers.models.diffusion_gemma.modeling_diffusion_gemma import DiffusionGemmaForBlockDiffusion
+
+    from dew.nn.inputs import ModelInputs
+    from tools.diffusers_wan_reference import float64
+    from tools.diffusion_gemma_reference import reference_generation
+
+    bundle = Pretrained.load(str(FIXTURE), dtype="float32", attention_impl="xla", max_seq_len=32)
+    leaves, tree = jax.tree.flatten(bundle.variables)
+    keys = jax.random.split(jax.random.key(5), len(leaves))
+    changed = jax.tree.unflatten(tree, [leaf + 0.02 * jax.random.normal(key, leaf.shape, leaf.dtype)
+                                        for leaf, key in zip(leaves, keys, strict=True)])
+    bundle.save(str(tmp_path), variables=changed)
+    with np.load(FIXTURE / "reference.npz") as stored:
+        reference = {name: stored[name] for name in stored.files}
+
+    def theirs(dtype):
+        model, report = DiffusionGemmaForBlockDiffusion.from_pretrained(
+            str(tmp_path), dtype=dtype, local_files_only=True, output_loading_info=True,
+            experts_implementation="eager")
+        assert not any(report.values()), report
+        model = model.eval()
+        model.set_attn_implementation("eager")
+        prompt, canvas = (torch.from_numpy(reference[key]) for key in ("prompt", "canvas"))
+        previous = torch.from_numpy(reference["previous"]).to(dtype)
+        with torch.no_grad():
+            bare = model(input_ids=prompt, decoder_input_ids=canvas).logits
+            conditioned = model(input_ids=prompt, decoder_input_ids=canvas,
+                                self_conditioning_logits=previous).logits
+        return model, bare.numpy(), conditioned.numpy()
+
+    model, bare, conditioned = theirs(torch.float32)
+    with float64():
+        _, bare_f64, conditioned_f64 = theirs(torch.float64)
+    cache = prefill(bundle.model, changed, reference["prompt"])
+    ours_bare = bundle.model.apply({**changed, "cache": cache}, reference["canvas"])
+    ours_conditioned = bundle.model.apply({**changed, "cache": cache}, reference["canvas"],
+                                          self_conditioning_logits=reference["previous"])
+    assert_as_exact_as_the_reference(np.asarray(ours_bare), bare, bare_f64, "bare")
+    assert_as_exact_as_the_reference(np.asarray(ours_conditioned), conditioned, conditioned_f64,
+                                     "conditioned")
+
+    generated, _, _ = reference_generation(model, torch.from_numpy(reference["prompt"]))
+    process = bundle.block_generation().process
+    prompt = ModelInputs(jax.numpy.asarray(reference["prompt"]))
+    ours = process.generate(bundle.model, changed, prompt, 7, key=jax.random.key(11))
+    np.testing.assert_array_equal(ours.tokens, generated.sequences.numpy()[:, :12])
