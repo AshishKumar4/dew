@@ -9,6 +9,7 @@ import pytest
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import Admitted
+from dew.nn.kv_cache import KVCache
 from dew.nn.mixers import AttentionMixer
 
 VOCAB, ROWS, WIDTH = 50, 4, 6
@@ -22,6 +23,12 @@ def tiny(**overrides):
 
 def cache_of(model, params, rows):
     return model.apply(params, rows, method=CausalTransformer.init_cache, mutable=["cache"])[1]["cache"]
+
+
+def tables_of(cache, rows):
+    """The page-table rows of `rows` in a paged cache's first layer."""
+    first = next(iter(cache.values()))["self_attn"]
+    return first["page_table"][jnp.asarray(rows)]
 
 
 def prefilled(model, params):
@@ -39,16 +46,19 @@ FEATURES = {"plain": {}, "no qk norm": {"qk_norm": False}, "projection norm": {"
             "exclusive, no rope": {"mixer": AttentionMixer(nope=True, exclusive_self_attention=True)}}
 
 
+@pytest.mark.parametrize("paged", [False, True], ids=["dense", "paged"])
 @pytest.mark.parametrize("continuing", [True, False])
 @pytest.mark.parametrize("feature", list(FEATURES))
-def test_a_mixed_call_decodes_and_prefills_as_the_separate_calls_do(continuing, feature):
+def test_a_mixed_call_decodes_and_prefills_as_the_separate_calls_do(continuing, feature, paged):
     """Rows 0 and 1 decode a token each while row 3 is admitted with a
     four-token prompt (left-padded to the piece's width, as admission pads)
     and a padding piece rides along: the logits and every cache row match a
     decode call over the rows and a prefill of row 3 alone, whether the
     piece reads its row's cache or, starting the row, its own keys, under
-    each attention feature the mixed call takes."""
-    model = tiny(**FEATURES[feature])
+    each attention feature the mixed call takes, over a dense cache or a
+    page pool (row 3 writing through its own pages)."""
+    pool = {"kv_cache": KVCache(page_size=4, pages=ROWS * 4)} if paged else {}
+    model = tiny(**FEATURES[feature], **pool)
     params = model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))
     cache = prefilled(model, params)
     fed = jnp.asarray([7, 9, 0, 0], jnp.int32)
@@ -59,7 +69,8 @@ def test_a_mixed_call_decodes_and_prefills_as_the_separate_calls_do(continuing, 
     picked = jnp.asarray([[0, 1, 2, 3, ROWS + WIDTH - 1, ROWS + 2 * WIDTH - 1]])
     (_, logits), mixed = model.apply(
         {**params, "cache": cache}, tokens, picked, attention_mask=valid, decode=True, mutable=["cache"],
-        admitted=Admitted(slots=jnp.asarray([3, ROWS]), cursors=jnp.asarray([0, 0]), continuing=continuing),
+        admitted=Admitted(slots=jnp.asarray([3, ROWS]), cursors=jnp.asarray([0, 0]), continuing=continuing,
+                          tables=tables_of(cache, [3, 0]) if paged else None),
         method=CausalTransformer.states_and_logits_at)
 
     decoded, stepped = model.apply({**params, "cache": cache}, fed[:, None], attention_mask=feeding[:, None],
@@ -71,6 +82,8 @@ def test_a_mixed_call_decodes_and_prefills_as_the_separate_calls_do(continuing, 
     for layer, held in mixed["cache"].items():
         attention = held["self_attn"]
         np.testing.assert_array_equal(attention["cache_index"], [4, 6, 0, 4])
+        if paged:
+            continue  # the pool's pages: the logits read them, and `cache_index` is checked
         for name in ("cached_key", "cached_value"):
             written = np.asarray(attention[name])
             decoded_rows = np.asarray(stepped["cache"][layer]["self_attn"][name])[:2]

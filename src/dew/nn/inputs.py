@@ -229,10 +229,12 @@ class Admitted:
     their weights once for the decoding rows and the prompts together.
     Unless `continuing`, every piece starts its row (the cursors are 0), and
     a piece's queries read its own keys rather than the row's whole cache.
+    Over a paged cache `tables` are the admitted rows' page tables.
     """
 
     slots: jax.Array
     cursors: jax.Array
+    tables: jax.Array | None = None
     continuing: bool = struct.field(pytree_node=False, default=True)
 
 

@@ -1450,13 +1450,46 @@ from integration's, all at bf16 near-ties (a median 0.57 bf16 spacings in
 fp32, at most 1.44; fp32's argmax is the two-forward choice in 16 rows and
 the mixed one in 11).
 
-Open: the mixed step serves a dense cache and plain attention. A server
-says why it keeps two forwards (`Server.mixed_refusal`, logged at build).
-Still open: a paged cache, whose tokens would map to pages through the
-row's table; chunked prefill over a dense cache (`Admitted.continuing`
-reads a row's earlier keys, but dense admission does not split prompts yet);
-latent attention (MLA, DSA), sliding windows, sinks, and hybrids whose
-recurrent layers read their row's tokens in order; and prediction depths.
+Over a paged cache, 2026-10-04. The mixed step now runs over a page pool
+too: the admitted rows' tables go into the cache before the step writes, each
+token lands in its row's page, and the decoding rows read the pool through
+cuDNN's paged kernel as a decode step does. Pieces that continue a row (a
+chunked prompt, a shared prefix's pages) read the row's earlier keys from
+the pool; a server with neither has its pieces read only their own keys. A dense
+cache takes chunked prefill the same way (`chunk`), which only the mixed
+step serves. The paged decode-only programs are identical to integration's.
+Same session, two alternating rounds at integration `ab60614a`, the second
+round (the first ran under another lane's load):
+
+| slots | rate | paged, two forwards: TTFT p50 / p99, gap p99 (ms) | paged, mixed |
+|---:|---:|---|---|
+| 32 | 16 | 17.8 / 23.7, 9.9 | 16.5 / 22.4, 8.8 |
+| 32 | 24 | 18.2 / 27.3, 10.0 | 16.6 / 22.0, 8.9 |
+| 32 | 32 | 18.1 / 26.5, 10.3 | 16.9 / 24.0, 11.0 |
+| 128 | 32 | 40.3 / 58.5, 26.0 | 38.1 / 55.6, 23.7 |
+| 128 | 44 | 42.9 / 63.7, 26.3 | 41.0 / 61.0, 25.7 |
+| 128 | 56 | 50.6 / 231.3, 26.3 | 44.8 / 161.7, 25.8 |
+
+Closed loop the mixed step went from 5576-5577 to 5583-5656 tokens a
+second at 32 slots and from 8254-8274 to 8330-8334 at 128. A traced
+32-slot run at 24 requests a second put a one-row admitting step at 8.30
+against 9.22 ms. The paged decode step itself is slower than the dense one
+(at 128 slots and 32 requests a second a token gap's p50 is 11.7 ms paged
+against 5.4 dense), so a dense cache stays
+the faster way to serve where the memory fits. The served tokens part from
+the two forwards' as the dense cache's do: the same 27 of 64 rows at 32
+slots, all at bf16 near-ties.
+
+Under `--xla_gpu_deterministic_ops` (the CUDA test lane's flag) the paged
+write, a scatter into the pool's page and offset axes past an unindexed
+head axis, wrote another token's keys at a kept slot (jax 0.11.2, an RTX
+4080). Mapped over a group of one, as the paged cache's other write is, it
+does not, so `KVStore.write_tokens` writes that way.
+
+Open: latent attention (MLA, DSA), sliding windows, sinks, quantized or
+rotated caches, a pool split into groups, hybrids whose recurrent layers
+read their row's tokens in order, and prediction depths keep the two
+forwards; a server names which (`Server.mixed_refusal`, logged at build).
 
 ## Quantized serving of the 176M text-to-image model, 2026-09-28
 

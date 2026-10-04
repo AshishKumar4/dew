@@ -35,7 +35,7 @@ from dew.nn.attention import (
 )
 from dew.nn.blocks import normal_kernel
 from dew.nn.inputs import Admitted, AttentionMetadata
-from dew.nn.kv_cache import Append, KVCache, KVStore, filled_slots, rotated, write_cache, write_tokens
+from dew.nn.kv_cache import TABLE, Append, KVCache, KVStore, filled_slots, rotated, write_cache
 from dew.nn.mixer_base import MixerBase, MixerContext, mixers
 from dew.nn.precision import at_least_fp32, scaled
 from dew.nn.rope import (
@@ -642,13 +642,7 @@ class CausalSelfAttention(nn.Module):
                 deterministic=False), 'context')
         # A chunk, window or metadata mask replaces `cursor` and keeps the gather.
         plain_step = append is not None and mask is cursor and S == 1 and sinks is None and not sowing
-        page_kernel_runs = self.attention_impl in ('auto', 'tpu')
-        if jax.default_backend() == 'gpu':
-            page_kernel_runs = (self.attention_impl in ('auto', 'cudnn')
-                                and cudnn_runs(query, self.attn_logit_softcap)
-                                and not reference_only(query, self.dtype, self.precision,
-                                                       self.force_fp32_for_softmax))
-        if append is not None and plain_step and page_kernel_runs and append.store.kernel():
+        if append is not None and plain_step and self._page_kernel_runs(query) and append.store.kernel():
             attention = self._paged(append, query)
         elif plain_step:
             attention = self._decode_attention(query, key, value, jnp.asarray(positions).reshape(B, S)[:, 0])
@@ -663,10 +657,14 @@ class CausalSelfAttention(nn.Module):
 
     def mixed_refusal(self) -> str | None:
         """Why this layer cannot run a serving step's mixed call
-        (`dew.nn.inputs.Admitted`), or None: it reads a dense, full-precision
-        cache, whole and causal, and nothing a row carries besides."""
+        (`dew.nn.inputs.Admitted`), or None: it reads a full-precision cache,
+        dense or one page pool, whole and causal, and nothing a row carries
+        besides."""
+        layout = self.kv_cache
         refusals = {
-            "a paged or quantized cache": self.kv_cache != KVCache(),
+            "a quantized or rotated cache": (layout.quantized is not None
+                                              or layout.key_rotation(self.head_dim) is not None),
+            "a page pool split into groups": layout.page_size is not None and layout.groups != 1,
             "a sliding window or chunk": self.sliding_window is not None or self.attention_chunk is not None,
             "attention sinks": self.attention_sinks,
             "keys shared from another layer": self.kv_shared,
@@ -701,20 +699,25 @@ class CausalSelfAttention(nn.Module):
         rows, pieces = index.value.shape[0], admitted.slots.shape[0]
         width = (query.shape[1] - rows) // pieces
         positions = positions[0]
+        if admitted.tables is not None:
+            # A paged row reads and writes through the pages its admission assigned.
+            self.put_variable("cache", TABLE, self.get_variable("cache", TABLE).at[admitted.slots].set(
+                admitted.tables, mode="drop"))
         token_rows = jnp.concatenate([jnp.arange(rows), jnp.repeat(admitted.slots, width)])
-        for name, incoming in (("cached_key", key[0]), ("cached_value", value[0])):
-            self.put_variable("cache", name, write_tokens(self.get_variable("cache", name), incoming,
-                                                          token_rows, positions))
+        store.write_tokens(key[0], value[0], token_rows, positions)
         prompt = positions[rows:].reshape(pieces, width)
         index.value = (index.value + (positions[:rows] >= 0)).at[admitted.slots].set(
             admitted.cursors + jnp.sum(prompt >= 0, axis=1, dtype=jnp.int32), mode="drop")
-        cached_key, cached_value = store.read()
-        decoded = self._decode_attention(query[0, :rows, None], cached_key, cached_value, positions[:rows])
+        if self._page_kernel_runs(query) and store.kernel():
+            decoded = store.decode(query[0, :rows], index.value, self.attn_logit_softcap)
+            decoded = checkpoint_name(decoded[:, None], 'context')
+        else:
+            decoded = self._decode_attention(query[0, :rows, None], *store.read(), positions[:rows])
         queries = query[0, rows:].reshape(pieces, width, *query.shape[2:])
         if admitted.continuing:
             # A padding piece's row is past the cache's; it reads row 0 and is never drawn from.
             held = jnp.where(admitted.slots < rows, admitted.slots, 0)
-            keys, values = cached_key[held], cached_value[held]
+            keys, values = store.read_rows(held)
             keep = causal_attention_mask(prompt, self.max_seq_len,
                                          key_valid=filled_slots(index.value[held], self.max_seq_len))
         else:
@@ -762,6 +765,15 @@ class CausalSelfAttention(nn.Module):
             key_value_seq_lengths=reads.astype(jnp.int32))
         return checkpoint_name(
             attention.transpose(0, 2, 1, 3).reshape(rows, 1, heads, attention.shape[-1]), 'context')
+
+    def _page_kernel_runs(self, query) -> bool:
+        """Whether a decode step may read a paged pool through its device's
+        paged kernel (`KVStore.decode`) rather than the gathered rows."""
+        if jax.default_backend() != 'gpu':
+            return self.attention_impl in ('auto', 'tpu')
+        return (self.attention_impl in ('auto', 'cudnn')
+                and cudnn_runs(query, self.attn_logit_softcap)
+                and not reference_only(query, self.dtype, self.precision, self.force_fp32_for_softmax))
 
     def _decode_masks(self, positions, key_length: int) -> tuple[jax.Array, jax.Array]:
         """The cursor mask over the cache's filled slots, and the layer's decode mask.
