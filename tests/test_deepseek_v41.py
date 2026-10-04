@@ -291,6 +291,16 @@ def test_a_scale_on_an_e4m3_tie_rounds_to_even():
         assert [float(value) for value in rounded[0, :2]] == [6.0, 1.0], jnp.dtype(dtype).name
 
 
+def test_a_nan_reaches_its_whole_block():
+    """A NaN makes its block's amax and scale NaN, so every value of the
+    block reads back NaN, the element compared to no midpoint included."""
+    x = jnp.asarray([[jnp.nan, 1.0, -0.5] + [0.0] * 13, [2.0, 1.0, -0.5] + [0.0] * 13])
+    for dtype in (jnp.bfloat16, jnp.float32):
+        quantize = jax.jit(lambda v: fake_quant_fp4(v, 16, e4m3_scale=True))
+        rounded = np.asarray(quantize(x.astype(dtype)), np.float32)
+        assert np.isnan(rounded[0]).all() and not np.isnan(rounded[1]).any(), jnp.dtype(dtype).name
+
+
 def test_the_quantizers_pass_their_gradient_straight_through():
     x = jnp.linspace(-3.0, 3.0, 64).reshape(2, 32)
     for quant in (lambda v: fake_quant_fp8(v, 32), lambda v: fake_quant_fp4(v, 16, e4m3_scale=True)):
