@@ -1348,6 +1348,60 @@ served tokens and log-probabilities are bitwise at 32, 64 and 128 slots, and
 the device's busy time a run went from 1393.7 to 1388.3 ms at 32 slots,
 2147.5 to 2139.2 at 64 and 3645.2 to 3626.2 at 128 (two traced runs each).
 
+### Open loop, 2026-10-04
+
+The table above submits every request at once and keeps the slots full,
+which no user's traffic does. `tools/benchmark_lm_serving.py --rate` sends
+six times the slots in requests as a Poisson process at each rate (seeded
+per slot count) to a server that queues them; TTFT runs from a request's
+arrival and the token gaps are per token, each decoding row's time between
+consecutive tokens. Qwen3-0.6B, the same prompts and outputs, the RTX 4080
+on a quiet host, Dew at integration `420ea2c1`, then with bucketed admission
+in the same session as vLLM 0.30.0:
+
+| slots | rate | Dew `420ea2c1` tok/s, TTFT p50 / p99, gap p99 (ms) | Dew bucketed | vLLM |
+|---:|---:|---|---|---|
+| 32 | 16 | 1985, 34.6 / 61.2, 28.5 | 1990, 12.8 / 19.5, 8.0 | 1990, 13.8 / 33.5, 8.4 |
+| 32 | 24 | 2892, 55.3 / 257, 29.9 | 2929, 13.6 / 19.9, 8.5 | 2928, 15.4 / 30.1, 15.5 |
+| 32 | 32 | 3216, 536 / 1216, 30.2 | 3832, 15.5 / 31.9, 11.2 | 3829, 16.3 / 33.7, 11.3 |
+| 64 | 24 | 2877, 42.6 / 85.3, 30.9 | 2886, 15.0 / 25.3, 10.1 | 2893, 14.6 / 22.2, 7.0 |
+| 64 | 36 | 4071, 589 / 1047, 32.4 | 4170, 18.0 / 55.2, 16.5 | 4279, 16.5 / 26.1, 8.8 |
+| 64 | 48 | 4469, 1454 / 2258, 32.8 | 5580, 68.1 / 458, 55.4 | 5620, 21.3 / 33.7, 14.0 |
+| 128 | 32 | 4093, 80.5 / 647, 93.8 | 4210, 21.0 / 32.3, 14.2 | 4240, 16.7 / 27.5, 9.1 |
+| 128 | 44 | 5068, 1140 / 1989, 64.2 | 5701, 26.8 / 43.2, 18.6 | 5756, 20.2 / 32.4, 11.7 |
+| 128 | 56 | 5320, 2217 / 4449, 83.5 | 7064, 34.6 / 55.0, 23.4 | 7090, 35.8 / 57.2, 22.4 |
+
+The admitting program prefilled every row of its admission, so a request
+arriving alone was padded to eight prompts of prefill. Those admitting
+steps were the token gaps' p99, 28 to 94 ms, and they cut the server's
+capacity until its queue grew without bound at rates vLLM served with a
+TTFT p50 under 40 ms.
+Each admitting step is now padded only to the smallest power of two that
+holds its prompts (`dew.inference.serving.admission_share`), each width its
+own compiled program. The closed-loop runs are unchanged: an admission that
+fills its width is the same program, and the 32-, 64- and 128-slot
+generations are bitwise. With buckets Dew is level with vLLM at 32 slots,
+with shorter TTFT tails. At 64 and 128 slots its token gaps run 1.4 to 2
+times vLLM's at p99, and at 64 slots and 48 requests a second it sits at its
+capacity: a traced run had the device 97% busy, and that cell's TTFT swings
+between runs (p50 21 to 447 ms). The gap is in the admitting step. Dew
+prefills an arriving prompt in a forward of its own beside the decode
+forward, 9.9 ms against a 5.1 ms decode step for one 256-token prompt at 64
+slots, so the weights are read twice. vLLM's chunked prefill puts the
+prompt's tokens into the decode forward's batch.
+
+A narrower prefill runs its GEMMs at other shapes, so a request admitted in
+a narrower bucket than the padded eight can draw other bits: served one at
+a time at 32 slots, 6 of 16 Qwen3-0.6B rows and 8 of 16 Qwen3-1.7B rows
+part from the padded path, each at a bf16 near-tie (teacher-forced in fp32,
+a median 0.5 bf16 spacings apart, at most 1.81, the fp32 argmax the padded
+choice in 7 rows and the bucketed one in 7). Under tests/reference_error.py's
+rule the 1-, 2- and 4-row prefills' RMS distance from the same weights in
+fp32 is 0.96, 0.95 and 0.95 times the 8-row prefill's on Qwen3-0.6B's
+log-probabilities (1.00, 1.00 and 0.99 on the logits) and 1.02, 1.00
+(bitwise) and 1.08 on Qwen3-1.7B's (1.02, 1.00 and 1.07), against an
+allowed 2.
+
 ## Quantized serving of the 176M text-to-image model, 2026-09-28
 
 `TextToImage.quantized` serves the denoiser with its kernels stored as int8
