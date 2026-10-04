@@ -1,7 +1,10 @@
 """Native diffusion checkpoint, trajectory and update checks against saved oracles.
 
 The runtime under test uses only Dew modules, Process and native solvers.
-Diffusers/Transformers model implementations run only in the reference tools.
+Diffusers/Transformers model implementations run in the reference tools,
+and here on the trained export alone: Diffusers' own classes load every
+component Dew wrote and its UNet recomputes the trained prediction
+(`diffusers_reads`).
 """
 import argparse
 from dataclasses import replace
@@ -92,6 +95,36 @@ def trajectory(source, reference, meta, key):
     return images, latents, given, null, process, times, initial
 
 
+def diffusers_reads(source, export, prediction, noise, given):
+    """Diffusers' own classes load every weighted component of `export`
+    cleanly (tools/diffusers_consumer.py; a component nothing here reads, the
+    safety checker, is held to the `source` directory's file, which it
+    writes back untrained), and its declared UNet, over the
+    same noise, timestep and conditions in float32 and float64, holds Dew's
+    trained `prediction` to tests/reference_error.py's rule, and returns
+    the rule's ratio."""
+    from reference_error import assert_as_exact_as_the_reference, distance
+    from safetensors.numpy import load_file
+
+    from tools import diffusers_consumer as consumer
+
+    consumer.assert_components_load(export)
+    for name in consumer.unread(export):
+        held, written = (load_file(str(Path(root) / name / "model.safetensors")) for root in (source, export))
+        assert held.keys() == written.keys(), name
+        for key, value in held.items():
+            np.testing.assert_array_equal(written[key], value, err_msg=f"{name}/{key}")
+    condition = given["conditioning"]
+    sample = np.concatenate([np.asarray(noise)] + [np.asarray(given[name]) for name in ("mask", "masked_image")
+                                                   if name in given], -1)
+    inputs = (export, sample, 10.0, np.asarray(condition.context),
+              None if condition.pooled is None else np.asarray(condition.pooled),
+              None if condition.time_ids is None else np.asarray(condition.time_ids))
+    theirs, truth = consumer.unet_prediction(*inputs), consumer.unet_prediction(*inputs, wide=True)
+    assert_as_exact_as_the_reference(np.asarray(prediction), theirs, truth, "trained UNet")
+    return distance(np.asarray(prediction), truth) / distance(theirs, truth)
+
+
 def train_and_reload(source, reference, key, given, noise):
     objective = DiffusionObjective(source.model, source.process, source.inputs, autoencoder=source.autoencoder,
                                    pretrained=source.variables, unconditional_prob=0.0, ema_decay=None, steps=2)
@@ -115,6 +148,7 @@ def train_and_reload(source, reference, key, given, noise):
         before = source.model.apply(trained, noise, jnp.asarray([10]), **given)
         loaded = restored.model.apply(restored.variables, noise, jnp.asarray([10]), **given)
         np.testing.assert_array_equal(loaded, before)
+        ratio = diffusers_reads(source.source, saved, before, noise, given)
         np.testing.assert_array_equal(restored.autoencoder.decode(restored.variables["autoencoder"], noise),
                                       source.autoencoder.decode(trained["autoencoder"], noise))
         if source.finish is not None:
@@ -125,7 +159,7 @@ def train_and_reload(source, reference, key, given, noise):
             source.save(saved, variables=blocked)
             restored = bundle(saved)
             np.testing.assert_array_equal(restored.finish(restored.variables, images), -1)
-    return {"loss_before": float(value), "loss_after": float(after)}
+    return {"loss_before": float(value), "loss_after": float(after), "diffusers_ratio": ratio}
 
 
 def check_pipeline(directory, streamed: bool = False):
@@ -255,6 +289,11 @@ def check_model(directory):
 
 
 if __name__ == "__main__":
+    import sys
+
+    # tools.* and the tests' reference_error, as the test suite imports them.
+    ROOT = Path(__file__).resolve().parents[1]
+    sys.path[:0] = [str(ROOT), str(ROOT / "tests")]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory")
     parser.add_argument("--grids")
