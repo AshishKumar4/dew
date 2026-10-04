@@ -299,7 +299,7 @@
      "runs": "fetched"
     }
    ],
-   "note": "Executes fetched official networks_edm2 with pickling/constructor stubs and float64-retargeted casts."
+   "note": "Executes fetched official networks_edm2 with pickling/constructor stubs and float64-retargeted casts: unet.npz in eval mode, train.npz in train mode under torch's SGD (--train)."
   },
   "flaxdiff": {
    "tool": "tools/flaxdiff_reference.py",
