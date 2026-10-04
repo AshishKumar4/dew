@@ -1474,6 +1474,17 @@
     }
    ]
   },
+  "hf/llama-tiny/beam.npz": {
+   "tool": "tools/beam_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.16.1",
+     "runs": "transformers"
+    }
+   ],
+   "note": "Actual Transformers _beam_search per prompt in float32 and in float64 (its float32 casts widened), plain and with sequence_bias + renormalize_logits."
+  },
   "hf/llama-tiny/generate.npz": {
    "tool": "tools/numerics_reference.py",
    "sources": [
@@ -1828,6 +1839,17 @@
     }
    ],
    "note": "Actual Transformers decoder/norm/rotary modules inside a locally transcribed vLLM MTP composition."
+  },
+  "hf/qwen3-tiny/beam.npz": {
+   "tool": "tools/beam_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.16.1",
+     "runs": "transformers"
+    }
+   ],
+   "note": "Actual Transformers _beam_search per prompt in float32 and in float64 (its float32 casts widened), plain and with sequence_bias + renormalize_logits."
   },
   "hf/qwen3-tiny/generate.npz": {
    "tool": "tools/numerics_reference.py",
