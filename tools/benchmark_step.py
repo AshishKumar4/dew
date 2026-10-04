@@ -491,7 +491,7 @@ def small_cases(dtype: str) -> list[Case]:
         Case("wan_transformer", {"num_attention_heads": 6, "attention_head_dim": 64,
                                   "text_dim": TEXT_FEATURES, "ffn_dim": 1536, "num_layers": 3},
              batch_size=4, image_size=32, channels=16, frames=5),
-        Case("uvit", {key: value for key, value in dit.items() if key != "mlp_ratio"},
+        Case("uvit", dit,
              batch_size=16, image_size=64),
         Case("simple_udit", {**dit, "num_layers": 6}, batch_size=16, image_size=64),
         Case("simple_dit", dit, batch_size=16, image_size=64),
