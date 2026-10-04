@@ -364,7 +364,9 @@ def test_splash_is_as_exact_as_the_reference_attention(case):
     for name, mine, theirs, wide_theirs, want in zip(
             names, splash, reference(query, key, value, **structure), twin,
             exact_value_and_grads(query, key, value, **structure), strict=True):
-        assert_computes_the_oracle(wide_theirs, theirs, want, f"{case} {name}")
+        # A key's logit sums the head width, its weight the keys.
+        assert_computes_the_oracle(wide_theirs, want, f"{case} {name}",
+                                   roundings=query.shape[-1] + key.shape[1])
         assert_as_exact_as_the_reference(mine, theirs, want, f"{case} {name}")
 
 
