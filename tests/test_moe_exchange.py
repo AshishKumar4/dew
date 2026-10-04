@@ -1,6 +1,12 @@
-"""Dropless exchange and capacity dropping against the global sort/gather path on CPU."""
+"""Dropless exchange and capacity dropping against the global sort/gather path on CPU.
+
+Capacity dropping is also held to MaxText's own `generate_masks`
+(tests/fixtures/moe/maxtext_capacity.npz, tools/maxtext_capacity_reference.py)
+and the layer to a float64 expert loop over the slots it keeps.
+"""
 
 import functools
+import json
 import math
 import subprocess
 import sys
@@ -12,11 +18,14 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from jax.sharding import NamedSharding, PartitionSpec as P
+from reference_error import assert_as_exact_as_the_reference, assert_computes_the_oracle
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.moe import ExpertMLP, capacity_positions
 from dew.training import DEFAULT_RULES, MeshSpec
+
+MAXTEXT = Path(__file__).resolve().parent / "fixtures" / "moe" / "maxtext_capacity.npz"
 
 pytestmark = pytest.mark.mesh
 
@@ -32,7 +41,7 @@ def routing_case(tokens: int, experts: int, top_k: int, skewed: bool):
 
 def objective(module, indices, parameters, x, weights):
     out = module.apply(parameters, x, weights, indices)
-    return jnp.sum(jnp.sin(out.astype(jnp.float32))), out
+    return jnp.sum(jnp.sin(out.astype(jnp.promote_types(out.dtype, jnp.float32)))), out
 
 
 @pytest.mark.parametrize("shards,fsdp,tokens,top_k,skewed,scale_inputs,activation,limit", [
@@ -207,6 +216,91 @@ def test_capacity_drops_the_same_slots_on_every_layout(spec, batch, length, top_
     np.testing.assert_allclose(np.where(kept, d_weights, 0), np.where(kept, expected_weights, 0),
                                atol=3e-5, rtol=3e-5)
     np.testing.assert_array_equal(np.where(kept, 0, d_weights), 0)
+
+
+@pytest.fixture(scope="module")
+def maxtext():
+    with np.load(MAXTEXT) as loaded:
+        arrays = dict(loaded)
+    return arrays, json.loads(arrays.pop("meta").tobytes())["cases"]
+
+
+def maxtext_kept(arrays, case: str) -> np.ndarray:
+    """The slots MaxText's dispatch mask keeps, `[batch, length, top_k]`."""
+    kept = arrays[f"{case}/dispatch"].any(-1)  # [batch, length, experts]
+    return np.take_along_axis(kept, arrays[f"{case}/indices"], axis=-1)
+
+
+@pytest.mark.mesh(devices=1)
+@pytest.mark.parametrize("case", ["whole-sequences", "short", "loose", "tight"])
+def test_capacity_keeps_the_slots_maxtext_keeps(maxtext, case):
+    """Each slot's queue place and the capacity against MaxText's own
+    `generate_masks`: the slots kept, and the capacity its masks size."""
+    arrays, cases = maxtext
+    shape = cases[case]
+    positions, capacity = capacity_positions(jnp.asarray(arrays[f"{case}/indices"]), shape["experts"],
+                                             shape["factor"])
+    assert capacity == arrays[f"{case}/dispatch"].shape[-1]
+    np.testing.assert_array_equal(np.asarray(positions) < capacity, maxtext_kept(arrays, case))
+
+
+def expert_loop(x, weights, indices, kept, parameters):
+    """The routed experts slot by slot: each kept slot's swiglu expert at its
+    weight, summed per token (MaxText's combine), apart from Dew's dispatch."""
+    kernels = parameters["params"]
+    gate, up, down = (kernels[name]["kernel"][indices] for name in ("gate_proj", "up_proj", "down_proj"))
+    hidden = jax.nn.silu(jnp.einsum("bsm,bskmh->bskh", x, gate)) * jnp.einsum("bsm,bskmh->bskh", x, up)
+    slots = jnp.einsum("bskh,bskhm->bskm", hidden, down)
+    return jnp.einsum("bskm,bsk->bsm", slots, weights * kept)
+
+
+@pytest.mark.mesh(devices=4)
+@pytest.mark.parametrize("spec", [MeshSpec(expert=2, fsdp=2), MeshSpec(expert=4)],
+                         ids=["expert2-fsdp2", "expert4"])
+@pytest.mark.parametrize("dispatch", ["global", "exchange"])
+@pytest.mark.parametrize("case", ["whole-sequences", "short", "tight"])
+def test_capacity_drops_compute_maxtexts_experts(maxtext, case, dispatch, spec):
+    """The dropping layer, output and gradients (parameters, tokens and the
+    kept slots' weights), against the float64 expert loop over the slots
+    MaxText keeps, by the float64 rule against the dropless layer with the
+    dropped weights zeroed, whose own float64 run is first held to the loop.
+    A dropped slot's weight has no gradient."""
+    arrays, cases = maxtext
+    shape = cases[case]
+    indices, weights = arrays[f"{case}/indices"], arrays[f"{case}/weights"]
+    kept = maxtext_kept(arrays, case)
+    x = np.random.default_rng(29).normal(size=(shape["batch"], shape["length"], 8)).astype(np.float32)
+    dropless = ExpertMLP(shape["experts"], 12, 8)
+    parameters = dropless.init(jax.random.key(19), x, weights, indices)
+    gradient = functools.partial(jax.value_and_grad, argnums=(0, 1, 2), has_aux=True)
+
+    def run(module, values, given):
+        out = jax.jit(gradient(functools.partial(objective, module, jnp.asarray(indices))))(*values, given)
+        (_, output), grads = out
+        return [np.asarray(leaf) for leaf in jax.tree.leaves((output, grads))]
+
+    reference = run(dropless, (parameters, x), np.where(kept, weights, 0).astype(np.float32))
+    with jax.enable_x64(new_val=True):
+        wide = jax.tree.map(lambda leaf: jnp.asarray(np.asarray(leaf), jnp.float64), (parameters, x))
+        twin = run(dropless.clone(dtype=jnp.float64), wide, np.where(kept, weights, 0).astype(np.float64))
+
+        def loop(values, given):
+            out = expert_loop(values[1], given, indices, kept, values[0])
+            return jnp.sum(jnp.sin(out)), out
+
+        (_, output), grads = jax.value_and_grad(lambda p, xs, w: loop((p, xs), w), argnums=(0, 1, 2),
+                                                has_aux=True)(*wide, jnp.asarray(weights, jnp.float64))
+        truth = [np.asarray(leaf) for leaf in jax.tree.leaves((output, grads))]
+    with jax.set_mesh(spec.build(jax.devices()[:4])):
+        dropping = dropless.clone(dispatch=dispatch, capacity_factor=shape["factor"])
+        actual = run(dropping, (parameters, x), weights)
+    names = ["output", "down", "gate", "up", "tokens", "weights"]
+    for name, mine, theirs, wide_theirs, want in zip(names, actual, reference, twin, truth, strict=True):
+        if name == "weights":
+            np.testing.assert_array_equal(np.where(kept, 0, mine), 0)
+            mine, theirs, wide_theirs, want = (value[kept] for value in (mine, theirs, wide_theirs, want))
+        assert_computes_the_oracle(wide_theirs, theirs, want, f"{case} {name}")
+        assert_as_exact_as_the_reference(mine, theirs, want, f"{case} {dispatch} {name}")
 
 
 def test_exchange_collectives_work_across_two_real_processes(tmp_path):
