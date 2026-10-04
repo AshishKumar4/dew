@@ -348,7 +348,7 @@ The Gemma 3n and Gemma 4 audio encoders are `dew.nn.audio.Gemma3nAudio` and `Gem
 
 ## Masked diffusion language models
 
-`MaskedDiffusionObjective` trains a bidirectional decoder to recover masked tokens under MDLM's negative ELBO. Each row holds exactly `seq_len` tokens; there is no next-token shift, so `TokenWindows(seq_len=63)`, whose rows hold 64 IDs, feeds a 64-token objective. The mask token needs an ID of its own, here the one after the last byte:
+`MaskedDiffusionObjective` trains a bidirectional decoder to recover masked tokens under MDLM's negative ELBO. As in MDLM's SUBS parameterization, the mask token takes no probability mass: the cross entropy's partition leaves its column out, so the loss values differ from LLaDA's published training script, which takes the cross entropy over the whole vocabulary, by that term. Each row holds exactly `seq_len` tokens; there is no next-token shift, so `TokenWindows(seq_len=63)`, whose rows hold 64 IDs, feeds a 64-token objective. The mask token needs an ID of its own, here the one after the last byte:
 
 ```python
 from dew.diffusion.discrete import MDLM
