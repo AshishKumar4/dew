@@ -11,6 +11,15 @@ on a masked subset of the sequence, where a token's index in the sequence is
 not its position on the grid, so the spatial blocks run unrotated and
 position is carried entirely by the 2D sincos embedding that travels with
 each token.
+
+The image encoder and predictor compute V-JEPA's (facebookresearch/jepa,
+image mode, mask-token predictor) with one difference: their MLPs run the
+tanh GELU where V-JEPA's run exact (erf) GELU. tests/test_jepa_source.py
+holds them to V-JEPA's own code with that swap. Exact GELU
+(`ModulatedBlock.gelu_approximate=False`) made a training step 3.2% slower
+on the RTX 4080 (ViT-S/16 encoder at 224, 6-layer predictor, bf16, batch
+64: 36.35-36.51 ms against 35.24-35.30), and Dew loads no published
+I-JEPA or V-JEPA weights that would need it.
 """
 
 from typing import ClassVar, Literal
