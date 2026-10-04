@@ -264,12 +264,18 @@ def test_the_closing_denoise_is_flaxdiffs_generate_samples(name, solver):
     tools/flaxdiff_solver_reference.py) from the same x_T over the same
     twelve-point grid: eleven solver intervals, then the clean prediction
     at the grid's last point. The output is held to FlaxDiff's float64 run
-    by the float64 rule. FlaxDiff's `post_process` then clips the images
-    to [-1, 1], which is the pipeline's output step and not the walk's."""
+    by the float64 rule, and, through the clip to [-1, 1] that FlaxDiff's
+    `post_process` applies as the pipeline's output step, to that run's
+    clipped images: the stand-in's clean predictions reach |x| = 3, so the
+    clip moves most entries and the unclipped comparison is the one that
+    reads the walk."""
     process, _ = karras_process()
     closed = sample(StandIn(process), jnp.asarray(FLAXDIFF["x_T"]), 12, solver=solver, key=jax.random.key(0))
     assert_as_exact_as_the_reference(closed, FLAXDIFF[f"{name}/closed"], FLAXDIFF[f"{name}/closed_f64"],
                                      f"{name} closed")
+    assert float(np.abs(FLAXDIFF[f"{name}/closed_f64"]).max()) > 2
+    assert_as_exact_as_the_reference(jnp.clip(closed, -1, 1), FLAXDIFF[f"{name}/clipped"],
+                                     FLAXDIFF[f"{name}/clipped_f64"], f"{name} clipped")
 
 
 @pytest.mark.parametrize("name,solver", [("rk4", RK4()), ("multistep", MultiStepDPM())],

@@ -60,7 +60,7 @@ def published() -> dict:
     in one namespace."""
     scope: dict = {"jax": jax, "jnp": jnp, "Union": object, "List": list, "Tuple": tuple, "Dict": dict,
                    "struct": struct, "tqdm": types.SimpleNamespace(tqdm=lambda steps: steps)}
-    exec(compile(ast.Module(body=definitions("utils.py", {"MarkovState", "RandomMarkovState"}),
+    exec(compile(ast.Module(body=definitions("utils.py", {"MarkovState", "RandomMarkovState", "clip_images"}),
                             type_ignores=[]), "flaxdiff/utils.py", "exec"), scope)
     schedules = definitions("schedulers/common.py", {"get_coeff_shapes_tuple", "reshape_rates",
                                                      "NoiseScheduler", "GeneralizedNoiseScheduler"})
@@ -109,14 +109,14 @@ def walk(scope: dict, name: str, x_T, steps):
     return jnp.stack(latents)
 
 
-def closed(scope: dict, name: str, x_T, steps: int):
+def closed(scope: dict, name: str, x_T, steps: int, clipped: bool):
     """`generate_samples` as written from `x_T` (its `priors`) over
     `get_steps(1, 0, steps)`: every interval but the last grid point, then
     the clean prediction there. The instance holds what the published
     constructor would have bound: the stand-in as `sample_model`, no
-    autoencoder and no conditions; `post_process`, the pipeline's clip of
-    the decoded images to [-1, 1], is left out, since the closing
-    prediction is the walk's and the clip the output's."""
+    autoencoder and no conditions, and `post_process`, with no autoencoder
+    `clip_images` to [-1, 1], when `clipped`; without it the result is the
+    walk's own closing prediction, before the output's clip."""
     schedule = scope["KarrasVENoiseScheduler"](timesteps=1.0, sigma_max=SIGMA_MAX, rho=RHO,
                                                 sigma_data=SIGMA_DATA)
     sampler = scope[SAMPLERS[name][1]](schedule)
@@ -126,7 +126,8 @@ def closed(scope: dict, name: str, x_T, steps: int):
         x_0 = denoised(x_t, sigma)
         return x_0, (x_t - x_0) / sigma, None
 
-    sampler.sample_model, sampler.post_process = sample_model, lambda samples: samples
+    sampler.sample_model = sample_model
+    sampler.post_process = scope["clip_images"] if clipped else (lambda samples: samples)
     sampler.autoencoder = sampler.input_config = None
     return sampler.generate_samples(None, x_T.shape[0], x_T.shape[1], diffusion_steps=steps, priors=x_T)
 
@@ -154,9 +155,10 @@ def main() -> None:
             assert latents.dtype == dtype and gradient.dtype == dtype, (name, latents.dtype)
             arrays[f"{name}/latents{tail}"] = np.asarray(latents)
             arrays[f"{name}/grad{tail}"] = np.asarray(gradient)
-            closing = closed(scope, name, x_T, STEPS)
-            assert closing.dtype == dtype, closing.dtype
-            arrays[f"{name}/closed{tail}"] = np.asarray(closing)
+            for clipped, label in ((False, "closed"), (True, "clipped")):
+                closing = closed(scope, name, x_T, STEPS, clipped)
+                assert closing.dtype == dtype, closing.dtype
+                arrays[f"{name}/{label}{tail}"] = np.asarray(closing)
     FIXTURE.parent.mkdir(parents=True, exist_ok=True)
     np.savez(FIXTURE, **arrays)
     print(f"{FIXTURE}: {sorted(arrays)}")
