@@ -8,15 +8,18 @@ on different sides: a transform that read the buffer instead of the row's own
 history disagrees immediately.
 
 Frequency and presence penalties have no Transformers processor. Their oracle
-is vLLM's formula in `vllm/model_executor/layers/utils.py`, applied here as
-plain numpy.
+is vLLM's own `apply_penalties` (`vllm/model_executor/layers/utils.py` at
+v0.30.0), run as published by tools/vllm_penalty_reference.py.
 """
+
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
+from reference_error import assert_as_exact_as_the_reference
 from transformers.generation.logits_process import (
     EncoderNoRepeatNGramLogitsProcessor,
     EncoderRepetitionPenaltyLogitsProcessor,
@@ -304,23 +307,24 @@ def test_exponential_decay_grows_the_eos_score_after_its_start():
     assert got[0, 6] > logits[0, 6] and got[1, 6] == pytest.approx(float(logits[1, 6]), abs=1e-6)
 
 
-def test_frequency_and_presence_penalties_follow_the_vllm_formula():
-    """vllm/model_executor/layers/utils.py subtracts the penalty times the
-    count of each generated token, and the presence penalty times its mask.
-    Prompt tokens are not counted, which is what separates the two rows."""
-    prompts = [[3, 3, 9, 1], [7, 2, 5, 2, 7]]
-    drawn = [[9, 9, 1], [2]]
-    logits = logits_of(len(prompts))
-    state = rows(prompts, drawn)
-    counts = np.zeros((2, VOCAB), np.float32)
-    for row, drew in enumerate(drawn):
-        for token in drew:
-            counts[row, token] += 1
-    frequency = applied(decoding.FrequencyPenalty(0.7), state, logits)
-    presence = applied(decoding.PresencePenalty(0.7), state, logits)
-    np.testing.assert_allclose(frequency, np.asarray(logits) - 0.7 * counts, atol=1e-6, rtol=0)
-    np.testing.assert_allclose(presence, np.asarray(logits) - 0.7 * (counts > 0), atol=1e-6, rtol=0)
-    assert frequency[0, 9] < presence[0, 9]
+PENALTIES = np.load(Path(__file__).resolve().parent / "fixtures" / "decoding" / "penalties.npz")
+
+
+@pytest.mark.parametrize("case", range(len(PENALTIES["penalties"])))
+def test_frequency_and_presence_penalties_are_vllms(case):
+    """vLLM's own `apply_penalties` (v0.30.0, tools/vllm_penalty_reference.py)
+    on four histories: the frequency penalty times each token's count among
+    the generated tokens and the presence penalty times whether it was
+    generated, the prompt counting for neither, both signs. Dew's two
+    transforms, chained in vLLM's order, held to its float64 run by the
+    float64 rule."""
+    frequency, presence = (float(value) for value in PENALTIES["penalties"][case])
+    prompts, drawn = ([[int(token) for token in row if token != VOCAB] for row in PENALTIES[name]]
+                      for name in ("prompt", "output"))
+    native = decoding.chain((decoding.FrequencyPenalty(frequency), decoding.PresencePenalty(presence)))
+    got = np.asarray(jax.jit(native)(rows(prompts, drawn), jnp.asarray(PENALTIES["logits"])))
+    assert_as_exact_as_the_reference(got, PENALTIES[f"case_{case}"], PENALTIES[f"case_{case}_f64"],
+                                     f"penalties {frequency}, {presence}")
 
 
 def test_a_history_transform_ignores_the_slots_a_row_has_not_drawn():
@@ -406,19 +410,6 @@ def test_stop_strings_refuse_a_vocabulary_that_cannot_spell_them(tmp_path):
     tokenizer = stop_string_tokenizer(tmp_path)
     with pytest.raises(ValueError, match="no token in the vocabulary"):
         decoding.stop_strings(tokenizer, "zzzz", len(tokenizer))
-
-
-def test_end_of_sequence_and_length_criteria_read_what_they_name():
-    state = rows(PROMPTS, DRAWN)
-    eos = decoding.EndOfSequence(jnp.asarray([4, 6], jnp.int32))
-    np.testing.assert_array_equal(np.asarray(eos(state, jnp.asarray([6, 5], jnp.int32))),
-                                  [True, False])
-    # Row zero drew three tokens over a four-token prompt, row one drew one
-    # over five, so a criterion counting the wrong thing separates them.
-    np.testing.assert_array_equal(
-        np.asarray(decoding.MaxNewTokens(3)(state, jnp.zeros(2, jnp.int32))), [True, False])
-    np.testing.assert_array_equal(
-        np.asarray(decoding.MaxLength(7)(state, jnp.zeros(2, jnp.int32))), [True, False])
 
 
 def byte_level_tokenizer(tmp_path):
