@@ -8,7 +8,10 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 import pytest
+from flax import linen as nn
+from reference_error import assert_as_exact_as_the_reference
 
 from dew.nn.attention import forward_mode_attention, scaled_dot_product_attention
 from dew.objectives.diffusion.consistency import (
@@ -234,6 +237,94 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     expected = task.pipeline(distilled, ema=False)(["a red bird"], key=9).host().images
     np.testing.assert_array_equal(TextToImage.from_run(str(tmp_path / "student"))(["a red bird"], key=9)
                                   .host().images, expected)
+
+
+TRAINING = np.load(Path(__file__).resolve().parent / "fixtures" / "rcm" / "training.npz")
+
+
+class Weighted(nn.Module):
+    """`tools/rcm_reference.py`'s trained velocity network, four terms with
+    a weight per entry, at Dew's model time (rf time times 1000), its label
+    the condition's second token's table entry."""
+
+    @nn.compact
+    def __call__(self, x, time, textcontext):
+        time = time.reshape(-1, 1, 1, 1, 1) / 1000
+        label = textcontext.hidden[:, 1, 0].reshape(-1, 1, 1, 1, 1)
+        w = self.param("weights", nn.initializers.zeros, (4, *x.shape[1:]))
+        return (jnp.tanh(x) * w[0] + jnp.sin(2 * time) * x * w[1] + (0.1 + time) * label * w[2]
+                + jnp.cos(x) * time * w[3])
+
+
+def test_training_steps_the_student_and_the_fake_score_as_rcms_loop_does(monkeypatch):
+    """Ten updates of rCM's own loop (`ImaginaireTrainer_Distill.training_step`
+    over the model's closures, `tools/rcm_reference.py`): a warmup of three
+    student updates on sCM alone, then the student, sCM and DMD2, on one
+    update in three and the fake score on the other two, each network with
+    its own Adam and the power EMA (rate 0.1) on the student's updates at
+    the student's own count. On the reference's draws, `Trainer` over
+    `ConsistencyDistillationObjective` lands every network, the EMA and both
+    Adams' moments where rCM's float64 run does, held by the float64 rule.
+
+    rCM's loop backpropagates the rows' summed loss and Dew the mean, so
+    Dew's Adam takes rCM's epsilon over the eight rows and its moments are
+    rCM's over 8 and 64; the steps are the same. Adam's decays are 0.5 and
+    0.75, exact with their powers in binary, since optax rounds its bias
+    corrections in float32 where torch keeps float64."""
+    from dew.diffusion import presets
+    from dew.inputs import CharTable, Condition, Field, InputSpec
+    from dew.objectives.diffusion import ConsistencyDistillationObjective
+    from dew.objectives.diffusion.consistency import _Draws
+    from dew.objectives.diffusion.objective import FAKE_SCORE
+    from dew.training import Trainer
+    from dew.training.posthoc import power_decay
+
+    config = json.loads(str(TRAINING["config"]))
+    pixels, labels = TRAINING["pixels"], TRAINING["label"]
+    rows = pixels.shape[0]
+    table = CharTable.from_pretrained(tokens=2, features=1)
+    entries = np.zeros((table.vocab, 1), np.float32)
+    names = [str(row) for row in range(rows)]
+    for name, label in zip(names, labels, strict=True):
+        entries[table.tokenize([name])["input_ids"][0, 1]] = label
+    table = CharTable.from_pretrained(tokens=2, features=1, params={"table": jnp.asarray(entries)})
+    inputs = InputSpec(Field("image", pixels.shape[1:]), {"textcontext": Condition(table)})
+    (mean_g, std_g), (mean_d, std_d) = config["times"]["G"], config["times"]["D"]
+    teacher = {"params": {"weights": jnp.asarray(TRAINING["teacher"])}}
+    task = ConsistencyDistillationObjective(
+        Weighted(), presets.Flow()(), inputs, teacher=teacher,
+        consistency_weight=config["loss_scale"], dmd_weight=config["loss_scale_dmd"],
+        teacher_guidance=config["teacher_guidance"], tangent_warmup=config["tangent_warmup"],
+        student_update_freq=config["student_update_freq"],
+        max_simulation_steps=config["max_simulation_steps_fake"], student_times=(mean_g, std_g),
+        critic_times=(mean_d, std_d), ema_decay=power_decay(config["ema_rate"]))
+    drawn = {name: jnp.asarray(TRAINING[f"draws/{name}"]) for name in _Draws._fields}
+    monkeypatch.setattr(ConsistencyDistillationObjective, "_draws", lambda self, step, count, shape: _Draws(
+        **{name: value[step.step] for name, value in drawn.items()}))
+    b1, b2 = config["betas"]
+    trainer = Trainer(task, optax.adam(config["learning_rate"], b1=b1, b2=b2, eps=config["epsilon"] / rows),
+                      key=jax.random.PRNGKey(0))
+    state = trainer.initial_state()
+    batch = {"image": pixels, **inputs.tokenize(names)}
+    step = trainer.compile(state, batch)
+    for _ in range(config["iterations"]):
+        state, *_ = step(state, batch)
+
+    params, opt_state = state.variables["params"], state.opt_state
+    for name, got in (("student", params["weights"]), ("fake_score", params[FAKE_SCORE]["weights"]),
+                      ("ema", state.ema["params"]["weights"])):
+        assert_as_exact_as_the_reference(got, TRAINING[f"{name}/weights"], TRAINING[f"{name}/weights_f64"],
+                                         f"{name} weights")
+    for name, label, held in (("student", "student", lambda tree: tree["weights"]),
+                              ("fake_score", FAKE_SCORE, lambda tree: tree[FAKE_SCORE]["weights"])):
+        adam = opt_state.inner_states[label].inner_state.inner_state[0]
+        assert int(adam.count) == int(TRAINING[f"{name}/count"])
+        for moment, power in (("mu", 1), ("nu", 2)):
+            assert_as_exact_as_the_reference(
+                held(getattr(adam, moment)) * rows ** power, TRAINING[f"{name}/{moment}"],
+                TRAINING[f"{name}/{moment}_f64"], f"{name} Adam {moment}")
+    with pytest.raises(ValueError, match="accumulation=1"):
+        Trainer(task, optax.adam(1e-3), key=0, accumulation=2)
 
 
 def test_a_reverse_only_kernel_takes_forward_mode_through_its_reference():
