@@ -105,6 +105,16 @@ def head_logits(hidden, head_weight, *, softcap: float | None,
                                 hidden, head_weight, precision), softcap, temperature)
 
 
+def _without(logits, first, excluded):
+    """`logits` of the columns from `first` on, with column `excluded` (a
+    traced id) given no mass: -inf, so its probability is 0. With None the
+    logits pass untouched and the program holds no comparison."""
+    if excluded is None:
+        return logits
+    columns = first + jax.lax.broadcasted_iota(jnp.int32, logits.shape, logits.ndim - 1)
+    return jnp.where(columns == excluded, -jnp.inf, logits)
+
+
 def _tile_logits(states, matrix, precision: jax.lax.PrecisionLike):
     """Uncapped `[tokens, features] @ [columns, features].T` in at least fp32,
     over operands already in the dtype the head multiplies in. Under the
@@ -159,9 +169,10 @@ class _ChunkTerms(NamedTuple):
 
 def _chunk_terms(hidden, head_chunk, targets, start: int, stop: int,
                  softcap: float | None, precision: jax.lax.PrecisionLike,
-                 predict: bool, temperature: float) -> _ChunkTerms:
+                 predict: bool, temperature: float, excluded) -> _ChunkTerms:
     """One tile's `_ChunkTerms`."""
-    logits = _capped(_tile_logits(hidden, head_chunk, precision), softcap, temperature)
+    logits = _without(_capped(_tile_logits(hidden, head_chunk, precision), softcap, temperature),
+                      start, excluded)
 
     inside = (targets >= start) & (targets < stop)
     column = jnp.clip(targets - start, 0, stop - start - 1)
@@ -185,7 +196,7 @@ def _over_tiles(carry, count: int, width: int, body: Callable):
     return carry
 
 
-def _forward(hidden, table, targets, chunks: int, token_tile: int,
+def _forward(hidden, table, targets, excluded, chunks: int, token_tile: int,
              softcap, precision: jax.lax.PrecisionLike, predict: bool, temperature: float):
     """Losses, top-1 columns (None unless `predict`) and log partitions, a
     token tile at a time."""
@@ -207,7 +218,7 @@ def _forward(hidden, table, targets, chunks: int, token_tile: int,
         def columns(first, carry, count):
             terms = _chunk_terms(
                 states, jax.lax.dynamic_slice_in_dim(table, first, count),
-                picked_targets, first, first + count, softcap, precision, predict, temperature)
+                picked_targets, first, first + count, softcap, precision, predict, temperature, excluded)
             total = jnp.logaddexp(carry[0], terms.lse)
             target_logit = carry[1] + terms.picked
             if terms.best is None or terms.column is None:
@@ -233,17 +244,20 @@ def _forward(hidden, table, targets, chunks: int, token_tile: int,
     return losses, predicted[0] if predict else None, log_z
 
 
-def _bounded_head_impl(hidden, table, targets, chunks: int, tile: tuple[int, int],
+def _bounded_head_impl(hidden, table, targets, excluded, chunks: int, tile: tuple[int, int],
                        softcap, precision: jax.lax.PrecisionLike, predict: bool, temperature: float):
     """Run `_forward` behind a backward that recomputes its logits."""
-    return _forward(hidden, table, targets, chunks, tile[0], softcap, precision, predict, temperature)
+    return _forward(hidden, table, targets, excluded, chunks, tile[0], softcap, precision, predict,
+                    temperature)
 
 
-def _bounded_head_fwd(hidden, table, targets, chunks, tile, softcap, precision, predict, temperature):
-    outputs = _forward(hidden, table, targets, chunks, tile[0], softcap, precision, predict, temperature)
+def _bounded_head_fwd(hidden, table, targets, excluded, chunks, tile, softcap, precision, predict,
+                      temperature):
+    outputs = _forward(hidden, table, targets, excluded, chunks, tile[0], softcap, precision, predict,
+                       temperature)
     # The residuals are the inputs and one number per token. Everything the
     # backward needs beyond them is a recomputed tile.
-    return outputs, (hidden, table, targets, outputs[2], softcap)
+    return outputs, (hidden, table, targets, excluded, outputs[2], softcap)
 
 
 def _bounded_head_bwd(chunks, tile, precision, predict, temperature, residuals, cotangents):
@@ -256,7 +270,7 @@ def _bounded_head_bwd(chunks, tile, precision, predict, temperature, residuals, 
     vocabulary tile's head gradient in fp32 before it is stored.
     """
     del chunks, predict  # The backward tiles by column, and argmax has no gradient.
-    hidden, table, targets, log_z, softcap = residuals
+    hidden, table, targets, excluded, log_z, softcap = residuals
     # The logits are recomputed from operands that hold the forward's
     # values, so they are the forward's logits.
     work = at_least_fp32(hidden.dtype)
@@ -293,7 +307,7 @@ def _bounded_head_bwd(chunks, tile, precision, predict, temperature, residuals, 
             # log Z is the whole row's, so a tile's share of the softmax needs
             # no renormalisation, and a target outside the tile one-hots to
             # zero rather than to a wrapped column.
-            probabilities = jnp.exp(logits - token_z[:, None])
+            probabilities = jnp.exp(_without(logits, first, excluded) - token_z[:, None])
             selected = jax.nn.one_hot(
                 jax.lax.dynamic_slice_in_dim(labels, start, size) - first, width,
                 dtype=work)
@@ -328,16 +342,16 @@ def _bounded_head_bwd(chunks, tile, precision, predict, temperature, residuals, 
          jnp.zeros(table.shape, table.dtype),
          None if softcap is None else jnp.zeros_like(softcap)),
         table.shape[0], vocab_tile, columns)
-    return (d_states.reshape(hidden.shape).astype(hidden.dtype), d_table, None, d_cap)
+    return (d_states.reshape(hidden.shape).astype(hidden.dtype), d_table, None, None, d_cap)
 
 
 # `jax.custom_vjp` is generic in its return type, and a `functools.partial`
 # decorator loses that binding, so it is built by hand.
-_bounded_head = jax.custom_vjp(_bounded_head_impl, nondiff_argnums=(3, 4, 6, 7, 8))
+_bounded_head = jax.custom_vjp(_bounded_head_impl, nondiff_argnums=(4, 5, 7, 8, 9))
 _bounded_head.defvjp(_bounded_head_fwd, _bounded_head_bwd)
 
 
-def _whole_head_terms(hidden, table, targets, softcap, precision, predict, temperature):
+def _whole_head_terms(hidden, table, targets, excluded, softcap, precision, predict, temperature):
     """The whole `[tokens, vocab]` logits in at least fp32 and what
     `_forward` returns of them: losses, the top-1 column (None unless
     `predict`), log Z."""
@@ -345,7 +359,7 @@ def _whole_head_terms(hidden, table, targets, softcap, precision, predict, tempe
     flat = hidden.reshape(-1, table.shape[1]).astype(operands)
     labels = targets.reshape(-1)
     raw = _tile_logits(flat, table.astype(operands), precision)
-    logits = _capped(raw, softcap, temperature)
+    logits = _without(_capped(raw, softcap, temperature), 0, excluded)
     log_z, top = _row_terms(logits, predict)
     # A target outside the vocabulary picks no column, as in `_chunk_terms`:
     # the vocabulary-split head shifts each shard's targets by its first row
@@ -357,19 +371,20 @@ def _whole_head_terms(hidden, table, targets, softcap, precision, predict, tempe
     return raw, ((log_z - picked).reshape(targets.shape), best, log_z.reshape(targets.shape))
 
 
-def _whole_head_impl(hidden, table, targets, softcap, chunks, precision, predict, temperature):
+def _whole_head_impl(hidden, table, targets, excluded, softcap, chunks, precision, predict, temperature):
     """With nothing to differentiate, the tiled forward: no backward needs
     the whole logits, so an evaluation or a scoring pass stays bounded."""
-    return _forward(hidden, table, targets, chunks, 1024, softcap, precision, predict, temperature)
+    return _forward(hidden, table, targets, excluded, chunks, 1024, softcap, precision, predict,
+                    temperature)
 
 
-def _whole_head_fwd(hidden, table, targets, softcap, chunks, precision, predict, temperature):
+def _whole_head_fwd(hidden, table, targets, excluded, softcap, chunks, precision, predict, temperature):
     del chunks
-    raw, outputs = _whole_head_terms(hidden, table, targets, softcap, precision, predict,
+    raw, outputs = _whole_head_terms(hidden, table, targets, excluded, softcap, precision, predict,
                                      temperature)
     # The fp32 logits before the cap are kept, so the backward multiplies
     # nothing it did not have to: the state and head products alone.
-    return outputs, (hidden, table, targets, raw, outputs[2], softcap)
+    return outputs, (hidden, table, targets, excluded, raw, outputs[2], softcap)
 
 
 def _whole_head_bwd(chunks, precision, predict, temperature, residuals, cotangents):
@@ -377,14 +392,14 @@ def _whole_head_bwd(chunks, precision, predict, temperature, residuals, cotangen
     logits: the logits' cotangent as `_logits_cotangent` gives it to both
     products, and the head's gradient accumulated in fp32 once."""
     del chunks, predict
-    hidden, table, targets, raw, log_z, softcap = residuals
+    hidden, table, targets, excluded, raw, log_z, softcap = residuals
     loss_cotangent, _, partition_cotangent = cotangents
     work = at_least_fp32(hidden.dtype)
     operands = _operand_dtype(precision, work)
     features = table.shape[1]
     d_loss, d_partition = loss_cotangent.reshape(-1), partition_cotangent.reshape(-1)
     logits, pullback = jax.vjp(lambda raw, cap: _capped(raw, cap, temperature), raw, softcap)
-    probabilities = jnp.exp(logits - log_z.reshape(-1)[:, None])
+    probabilities = jnp.exp(_without(logits, 0, excluded) - log_z.reshape(-1)[:, None])
     selected = jax.nn.one_hot(targets.reshape(-1), table.shape[0], dtype=work)
     d_raw, d_cap = pullback((d_loss + d_partition)[:, None] * probabilities
                             - d_loss[:, None] * selected)
@@ -394,10 +409,10 @@ def _whole_head_bwd(chunks, precision, predict, temperature, residuals, cotangen
     d_table = jnp.einsum('tv,td->vd', d_raw, hidden.reshape(-1, features).astype(operands),
                          precision=precision, preferred_element_type=work)
     return (d_states.reshape(hidden.shape).astype(hidden.dtype), d_table.astype(table.dtype),
-            None, d_cap)
+            None, None, d_cap)
 
 
-_whole_head = jax.custom_vjp(_whole_head_impl, nondiff_argnums=(4, 5, 6, 7))
+_whole_head = jax.custom_vjp(_whole_head_impl, nondiff_argnums=(5, 6, 7, 8))
 _whole_head.defvjp(_whole_head_fwd, _whole_head_bwd)
 
 
@@ -449,7 +464,8 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
                           precision: PrecisionLike = None,
                           tile: tuple[int, int] | None = (1024, 8192),
                           vocab_major: bool = False,
-                          predict: bool = True, temperature: float = 1.0):
+                          predict: bool = True, temperature: float = 1.0,
+                          excluded: int | None = None):
     """Per-token cross entropy of `hidden @ head_weight`, its top-1 column
     and its log partition.
 
@@ -485,7 +501,11 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
     A100, Qwen3-0.6B's head at 4096 tokens took 33.1 ms with the logits
     held, at 4.6 GiB, against 60.2 ms tiled (`LMObjective.head_tile`).
     `temperature` divides the capped logits (`head_logits`), which
-    scores the draws of a sampler at that temperature.
+    scores the draws of a sampler at that temperature. `excluded` is a
+    column the distribution gives no mass, left out of the partition and the
+    prediction in every tile: a masked diffusion model's mask token, which
+    MDLM's SUBS parameterization never predicts. A target there scores +inf.
+    At None, the default, the compiled program holds no trace of it.
 
     On a mesh every device scores its own tokens (`_token_spec`): the token
     tiles are dynamic slices in a loop, which GSPMD would only compute on a
@@ -513,11 +533,11 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
     table = head_weight if vocab_major else head_weight.T
     product = BF16 if rounds_to_bf16(hidden.dtype, precision) else precision
 
-    def head(hidden, table, targets, cap):
+    def head(hidden, table, targets, excluded, cap):
         if tile is None:
-            return _whole_head(hidden, table, targets, cap, chunks, product, predict,
+            return _whole_head(hidden, table, targets, excluded, cap, chunks, product, predict,
                                float(temperature))
-        return _bounded_head(hidden, table, targets, chunks, tile, cap, product,
+        return _bounded_head(hidden, table, targets, excluded, chunks, tile, cap, product,
                              predict, float(temperature))
 
     def column_logits(states, rows, cap):
@@ -528,20 +548,22 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
         return _capped(jax.vmap(lambda state, row: _tile_logits(
             state[None].astype(operands), row[None], effective)[0, 0])(states, rows), cap, temperature)
 
+    left_out = None if excluded is None else jnp.asarray(excluded, jnp.int32)
     mesh = jax.sharding.get_abstract_mesh()
     if mesh.empty:
-        return head(hidden, table, targets, cap)
-    return _sharded_head(mesh, hidden, table, targets, cap, head, column_logits, predict=predict)
+        return head(hidden, table, targets, left_out, cap)
+    return _sharded_head(mesh, hidden, table, targets, left_out, cap, head, column_logits,
+                         predict=predict)
 
 
-def _sharded_head(mesh, hidden, table, targets, cap, head, column_logits, *, predict: bool):
+def _sharded_head(mesh, hidden, table, targets, excluded, cap, head, column_logits, *, predict: bool):
     """`head` on a mesh: each device scores its own tokens in a `shard_map`,
     against the head's own columns where they stay split (`_vocabulary_split`)
     or the head gathered whole (`chunked_cross_entropy`)."""
     spec = _token_spec(targets.shape)
     axes = {axis for entry in spec for axis in mesh_axes(entry)}
     if not axes:
-        return head(hidden, table, targets, cap)
+        return head(hidden, table, targets, excluded, cap)
     # The head arrives in its own shards on the token axes and is gathered
     # whole inside, so its gradient leaves reduce-scattered onto them rather
     # than summed whole. Unchecked, the transpose sums the cotangents of
@@ -559,14 +581,14 @@ def _sharded_head(mesh, hidden, table, targets, cap, head, column_logits, *, pre
         mesh.shape[axis] for axis in axes) * size * hidden.dtype.itemsize
         < table.size * table.dtype.itemsize)
 
-    def local(hidden, table, targets, cap):
+    def local(hidden, table, targets, excluded, cap):
         if widths:
             table = jax.lax.all_gather(table, widths, axis=1, tiled=True)
         if split:
-            return _vocabulary_split(hidden, table, targets, cap, group, head, column_logits)
+            return _vocabulary_split(hidden, table, targets, excluded, cap, group, head, column_logits)
         if group:
             table = jax.lax.all_gather(table, group, axis=0, tiled=True)
-        return head(hidden, table, targets, cap)
+        return head(hidden, table, targets, excluded, cap)
 
     # The map holds every axis manual, those that split no token too: in a map
     # that leaves axes automatic, JAX lowers a collective's reducer with its
@@ -584,13 +606,13 @@ def _sharded_head(mesh, hidden, table, targets, cap, head, column_logits, *, pre
         return (*mesh_axes(entry), *alone) or None
 
     return jax.shard_map(local, in_specs=(P(naming(spec[0]), *spec[1:], None), P(naming(held[0]), *held[1:]),
-                                          spec, P()),
+                                          spec, P(), P()),
                          out_specs=(spec, spec if predict else None, spec),
                          axis_names=set(mesh.axis_names) - set(mesh.manual_axes), check_vma=False)(
-        hidden, table, targets, cap)
+        hidden, table, targets, excluded, cap)
 
 
-def _vocabulary_split(hidden, table, targets, cap, group: tuple[str, ...], head, column_logits):
+def _vocabulary_split(hidden, table, targets, excluded, cap, group: tuple[str, ...], head, column_logits):
     """`head` inside a `shard_map` over a vocabulary split `group` ways: every
     token of the group against this device's rows of the head, the per-token
     terms combined over the group, and this device's own tokens returned.
@@ -610,7 +632,9 @@ def _vocabulary_split(hidden, table, targets, cap, group: tuple[str, ...], head,
     states = jax.lax.all_gather(hidden.reshape(count, features), group, axis=0, tiled=True)
     offset = jax.lax.axis_index(group) * table.shape[0]
     labels = jax.lax.all_gather(targets.reshape(count), group, axis=0, tiled=True) - offset
-    losses, predicted, log_z = head(states, table, labels, cap)
+    # The excluded column, like the targets, in this device's own numbering.
+    local_excluded = None if excluded is None else excluded - offset
+    losses, predicted, log_z = head(states, table, labels, local_excluded, cap)
     # Stopped before the max: pmax has no derivative rule, and a stop after it
     # still differentiates it.
     peak = jax.lax.pmax(jax.lax.stop_gradient(log_z), group)

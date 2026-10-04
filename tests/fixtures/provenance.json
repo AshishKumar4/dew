@@ -2156,6 +2156,22 @@
     }
    ]
   },
+  "mdlm/loss.npz": {
+   "tool": "tools/mdlm_reference.py",
+   "sources": [
+    {
+     "repo": "kuleshov-group/mdlm",
+     "version": "c112c526d193436838c98d81455ee51f90309470",
+     "runs": "fetched"
+    },
+    {
+     "repo": "pytorch/pytorch",
+     "version": "2.14.0",
+     "runs": "torch"
+    }
+   ],
+   "note": "Diffusion._loss (SUBS, continuous time, antithetic times floored at 1e-3) and _ddpm_update's categorical, around a hidden @ head stand-in backbone; rows, weights and uniforms are inputs."
+  },
   "meanflow": {
    "tool": "tools/meanflow_reference.py",
    "sources": [

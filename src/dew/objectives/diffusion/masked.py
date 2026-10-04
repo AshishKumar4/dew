@@ -3,7 +3,8 @@
 A row of token ids is corrupted by masking each position with the process's
 probability at a drawn time. The model, a `CausalTransformer` with
 `causal=False`, reads the whole corrupted row and predicts the original
-tokens. The loss is the cross entropy at the masked positions, weighted by
+tokens. The loss is the cross entropy at the masked positions, under a distribution
+that gives the mask token no mass (MDLM's SUBS parameterization), weighted by
 the process's NELBO weight and averaged over every position of the batch.
 That average is the continuous-time negative ELBO the paper trains. The
 cross entropy is the LM objective's chunked one, which holds one vocabulary
@@ -219,9 +220,12 @@ class MaskedDiffusionObjective(Objective[Ratio]):
             method=type(self.model).hidden_states,
         )
         head = self.model.apply(params, params["params"], method=type(self.model).head_weight)
+        # MDLM's SUBS parameterization gives the mask token no mass: it is
+        # never a target, so the partition and the prediction leave it out.
         losses, predicted, _ = chunked_cross_entropy(
             hidden, head, tokens, self.head_chunks,
-            softcap=self.model.final_logit_softcap, precision=self.model.precision)
+            softcap=self.model.final_logit_softcap, precision=self.model.precision,
+            excluded=self.process.mask_id)
         counted = is_masked.astype(losses.dtype)
         return tokens, losses, counted * self.process.weight(t)[:, None], counted, predicted, real
 
