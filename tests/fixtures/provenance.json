@@ -2263,6 +2263,17 @@
     }
    ]
   },
+  "moe/maxtext_capacity.npz": {
+   "tool": "tools/maxtext_capacity_reference.py",
+   "sources": [
+    {
+     "repo": "AI-Hypercomputer/maxtext",
+     "version": "733b5a9147ed87ecf509fbb4779ed187f56c6045",
+     "runs": "fetched"
+    }
+   ],
+   "note": "RoutedMoE.generate_masks' own body extracted from src/maxtext/layers/moe.py at the commit (SHA-256 checked), called on a stand-in self with its three fields and an identity sharding hint; dispatch and combine masks for four dropping cases. JAX 0.11.2.post3."
+  },
   "native_diffusion_edges.tar.xz": {
    "tool": "tools/native_diffusion_edges_reference.py",
    "sources": [
