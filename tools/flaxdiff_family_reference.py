@@ -14,8 +14,12 @@ tests/reference_error.py measures both from.
 The float64 walk runs a second copy of the same files with every
 `jnp.float32` reading `jnp.float64` (FlaxDiff pins its Fourier frequencies,
 time input, RoPE tables, output heads and UNet attention to float32), under
-`jax.enable_x64`. The 2D sincos table, which FlaxDiff builds in float32
-NumPy, stays the constant it is. Attention runs FlaxDiff's reference path
+`jax.enable_x64`. Every one of them is a dtype (a cast, a default, an
+initializer's dtype) but one comparison, common.py's weight-standardized
+convolution taking `eps = 1e-5 if self.dtype == jnp.float32 else 1e-3`:
+each walk compares against its own dtype, so the branch stays the same
+(and no case here builds that convolution). The 2D sincos table, which
+FlaxDiff builds in float32 NumPy, stays the constant it is. Attention runs FlaxDiff's reference path
 (`attention_impl=None`) with `force_fp32_for_softmax=False`: flax's forced
 softmax casts to float32 whenever the dtype is not, which would round the
 float64 walk, and in float32 it changes nothing.
