@@ -1,4 +1,5 @@
-"""LADD with ADD's distillation term: the hinge losses from their equations,
+"""LADD with ADD's distillation term: StyleGAN-T's head, one step against
+the papers' equations on StyleGAN-T's heads (`tools/ladd_reference.py`),
 each side's gradient from its own loss, and a run config over a saved
 teacher."""
 
@@ -10,6 +11,8 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from flax import linen as nn
+from reference_error import assert_as_exact_as_the_reference
 from test_diffusion_run_sources import batch_for
 
 from dew.checkpoints import Checkpoints
@@ -23,7 +26,7 @@ from dew.objectives.diffusion import (
     DiffusionRunConfig,
     TextCondition,
 )
-from dew.objectives.diffusion.adversarial import Head, hinge_discriminator, hinge_generator, r1_penalty
+from dew.objectives.diffusion.adversarial import Head
 from dew.objectives.diffusion.objective import DISCRIMINATOR, SPECTRAL, TEACHER
 from dew.sampling import Consistency, Euler, TextToImage
 from dew.training import Trainer
@@ -60,27 +63,105 @@ def test_a_head_is_stylegan_ts_at_grid_height_one():
         assert not np.allclose(np.asarray(updated[SPECTRAL]["cls"]["u"]), HEAD["cls.u"])
 
 
-def test_the_hinge_losses_are_the_papers():
-    """relu(1 - D(real)) + relu(1 + D(fake)) for the discriminator and
-    -D(fake) for the generator, meaned over every head's every logit."""
-    real = [jnp.asarray([[2.0, 0.5], [-1.0, 0.0]]), jnp.asarray([[0.2], [3.0]])]
-    fake = [jnp.asarray([[-2.0, 0.5], [1.0, -0.5]]), jnp.asarray([[0.0], [-1.5]])]
-    np.testing.assert_allclose(np.asarray(hinge_discriminator(real, fake)),
-                               [(0 + 0.5 + 0.8) / 3 + (0 + 1.5 + 1) / 3, (2 + 1 + 0) / 3 + (2 + 0.5 + 0) / 3])
-    np.testing.assert_allclose(np.asarray(hinge_generator(fake)), [-(-2 + 0.5 + 0) / 3, -(1 - 0.5 - 1.5) / 3])
+STEP = np.load(Path(__file__).resolve().parent / "fixtures" / "ladd" / "step.npz")
 
 
-def test_r1_is_the_squared_gradient_of_each_heads_mean_logit_at_its_input():
-    """ADD's R1 on each head's input, against the gradient written out for a
-    quadratic head: d/dx mean(x^2 w) = 2 x w / n."""
-    features = [jnp.asarray([[1.0, 2.0], [0.5, -1.0]]), jnp.asarray([[3.0], [-2.0]])]
-    weights = [jnp.asarray([0.5, 2.0]), jnp.asarray([1.0])]
+class Layer(nn.Module):
+    @nn.compact
+    def __call__(self, tokens):
+        return jnp.tanh(tokens @ self.param("kernel", nn.initializers.zeros, (tokens.shape[-1],) * 2))
 
-    def score(features):
-        return [jnp.square(f) * w for f, w in zip(features, weights, strict=True)]
-    expected = [np.sum(np.square(2 * np.asarray(f) * np.asarray(w) / f.shape[1]), axis=1)
-                for f, w in zip(features, weights, strict=True)]
-    np.testing.assert_allclose(np.asarray(r1_penalty(score, features)), expected[0] + expected[1], rtol=1e-6)
+
+class Tokens(nn.Module):
+    """`tools/ladd_reference.py`'s stand-in velocity network at Dew's model
+    time (t times 1000): the sample as one token plus the time, two layers
+    whose tokens the heads read, and a head back."""
+
+    width: int
+
+    @nn.compact
+    def __call__(self, x, time):
+        b = x.shape[0]
+        flat = x.reshape(b, 1, -1)
+        tokens = (flat @ self.param("embed", nn.initializers.zeros, (flat.shape[-1], self.width))
+                  + (time / 1000).reshape(-1, 1, 1)
+                  * self.param("time", nn.initializers.zeros, (self.width,)))
+        layer_b = Layer(name="layer_b")(Layer(name="layer_a")(tokens))
+        head = self.param("head", nn.initializers.zeros, (self.width, flat.shape[-1]))
+        return (layer_b @ head).reshape(x.shape)
+
+
+def unflattened(prefix: str) -> dict:
+    """The fixture's arrays under `prefix/` as a nested tree."""
+    tree: dict = {}
+    for key in STEP.files:
+        if key.startswith(prefix + "/"):
+            *path, leaf = key[len(prefix) + 1:].split("/")
+            node = tree
+            for name in path:
+                node = node.setdefault(name, {})
+            node[leaf] = jnp.asarray(STEP[key], jnp.float32)
+    return tree
+
+
+def test_one_step_is_the_papers_equations_on_stylegan_ts_heads():
+    """One LADD step against `tools/ladd_reference.py`'s oracle, which runs
+    StyleGAN-T's `DiscHead` and DiT's timestep embedding as published inside
+    the papers' equations, on the draws `AdversarialDistillationObjective.loss`
+    makes: the student's x_0 at its drawn time, the logit-normal renoising,
+    the teacher's tokens after both layers, the hinge losses meaned over
+    every head's logits, R1 at its real input, ADD's (1 - s)-weighted
+    distillation, and the heads' spectral norms at Dew's documented cadence
+    (the real pass iterates and keeps its `u`; the held, fake and R1 passes
+    iterate from it and keep nothing). The loss within 1e-6 of the oracle's
+    float64 run; every gradient, the student's through the fake pass and the
+    distillation and the heads' through the hinge and R1, and the kept
+    `u`s held to it by the float64 rule. The residual block's kernel is 1
+    here, as one token is all a stand-in's grid holds;
+    test_a_head_is_stylegan_ts_at_grid_height_one holds the kernel of 9."""
+    import json
+
+    from dew.inputs import Field, InputSpec
+
+    settings = json.loads(str(STEP["settings"]))
+    pixels = STEP["pixels"]
+    layers = {name: {"kernel": jnp.asarray(STEP[f"teacher/{name}"], jnp.float32)}
+              for name in ("layer_a", "layer_b")}
+    teacher = {"params": unflattened("teacher") | layers}
+    task = AdversarialDistillationObjective(
+        Tokens(settings["width"]), Flow()(), InputSpec(Field("image", pixels.shape[1:])), teacher=teacher,
+        feature_layers=settings["layers"], student_times=settings["student_times"],
+        renoise_times=tuple(settings["renoise_times"]), distillation_weight=settings["distillation_weight"],
+        r1_weight=settings["r1_weight"], cmap_dim=settings["cmap_dim"], kernel_size=(1, 1),
+        time_features=settings["time_features"], ema_decay=None)
+    variables = task.init(jax.random.PRNGKey(0))
+    student = unflattened("student")
+    for name in ("layer_a", "layer_b"):
+        student[name] = {"kernel": student[name]}
+    params = {**student, DISCRIMINATOR: unflattened("heads")}
+    variables = {**variables, SPECTRAL: unflattened("initial")}
+    step = Step(step=jnp.asarray(0), key=jax.random.key(settings["key"]), ema=None)
+
+    def loss(params):
+        return task.scalar_loss({**variables, "params": params}, {"image": pixels}, step)
+
+    (value, aux), gradient = jax.value_and_grad(loss, has_aux=True)(params)
+    np.testing.assert_allclose(float(value), float(STEP["loss_f64"]), rtol=1e-6)
+    student = {name: gradient[name]["kernel"] if name.startswith("layer") else gradient[name]
+               for name in ("embed", "time", "head", "layer_a", "layer_b")}
+    # Each tree is held whole, its leaves in one vector: a few entries' root
+    # mean square is no estimate of rounding, and the two biases a batch norm
+    # follows have a gradient of exactly zero, rounding alone in both runs.
+    for label, tree, prefix in (("student", student, "grad/student"),
+                                ("head 0", gradient[DISCRIMINATOR]["head_0"], "grad/heads/head_0"),
+                                ("head 1", gradient[DISCRIMINATOR]["head_1"], "grad/heads/head_1"),
+                                ("spectral u", aux.variables[SPECTRAL], "spectral")):
+        leaves = jax.tree_util.tree_flatten_with_path(tree)[0]
+        keys = ["/".join([prefix, *(entry.key for entry in path)]) for path, _ in leaves]
+        assert_as_exact_as_the_reference(
+            np.concatenate([np.ravel(leaf) for _, leaf in leaves]),
+            np.concatenate([np.ravel(STEP[key]) for key in keys]),
+            np.concatenate([np.ravel(STEP[f"{key}_f64"]) for key in keys]), label)
 
 
 @pytest.fixture(scope="module")

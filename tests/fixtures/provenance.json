@@ -2148,6 +2148,27 @@
    ],
    "note": "Fetches and executes BottleneckPatchEmbed rather than importing an installed upstream package."
   },
+  "ladd": {
+   "tool": "tools/ladd_reference.py",
+   "sources": [
+    {
+     "repo": "autonomousvision/stylegan-t",
+     "version": "36ab80ce76237fefe03e65e9b3161c040ae888e3",
+     "runs": "fetched"
+    },
+    {
+     "repo": "facebookresearch/DiT",
+     "version": "ed81ce2229091fd4ecc9a223645f95cf379d582b",
+     "runs": "fetched"
+    },
+    {
+     "repo": "pytorch/pytorch",
+     "version": "2.14.0",
+     "runs": "torch"
+    }
+   ],
+   "note": "An oracle of one LADD step from the papers' equations (no official training code), around StyleGAN-T's DiscHead and DiT's timestep_embedding executed as published; the draws are Dew's from jax.random.key(5)."
+  },
   "linear_attention": {
    "tool": "tools/qwen_linear_reference.py",
    "sources": [
