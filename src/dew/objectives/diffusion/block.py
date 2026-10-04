@@ -203,24 +203,14 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         from dew.config import ModelConfig, _to_json
         from dew.diffusion.block import BlockProcess
         from dew.inference.tasks import recorded_tokenizer
-        from dew.interop.hf_decoders import _export_config
         from dew.registry import objectives
         if not any(member is type(self) for member in objectives.values()):
             return None
-        # The text-only config a trained model's export is written over, which
-        # `diffusion_gemma.export_weights` refuses (transformers' class builds
-        # experts and a vision tower); a model with a vision conditioner
-        # records none, and loads back as a task only.
-        export = None if self.model.conditioner is not None else {
-            'config': {'model_type': 'diffusion_gemma', 'text_config': _export_config(self.model.text),
-                       'canvas_length': self.canvas_size},
-            'generation_config': {}}
         model = _to_json(ModelConfig.from_model(self.model), ModelConfig)
         return {'objective': objectives.name_of(type(self)), 'model': model,
                 'seq_len': self.sequence_length, 'sample_tokens': self.canvas_size,
                 'tokenizer': recorded_tokenizer(self.processor),
-                'process': BlockProcess(self.canvas_size, self.model.vocab_size).to_json(),
-                'diffusion_gemma': export}
+                'process': BlockProcess(self.canvas_size, self.model.vocab_size).to_json()}
 
     def pipeline(self, state: TrainState, *, ema: bool | None = None,
                  processor: Processor | None = None) -> BlockGeneration:

@@ -634,22 +634,31 @@ def test_explicit_average_requests_do_not_substitute_live_weights(tmp_path):
                                   live("the ", key=7).host().tokens)
 
 
-def make_block_run(directory, fixture="diffusion-gemma-workflow"):
+def make_block_run(directory, fixture="diffusion-gemma-workflow", moved=0.0, tokenizer="byte"):
     """A block-diffusion run directory: a committed DiffusionGemma fixture's
-    weights under a checkpoint that records the objective and its byte
-    tokenizer. The default fixture reads images and is the published
-    layout's own; `diffusion-gemma-sft` is Google's dense text-only model,
-    which transformers' class cannot build, so its export is refused."""
+    weights under a checkpoint that records the objective and the tokenizer
+    `tokenizer` names, each parameter moved by `moved` times a seeded normal
+    draw (a stand-in for training). The default fixture reads images and is the
+    published layout's own; `diffusion-gemma-sft` is Google's dense
+    text-only model, which transformers' class cannot build, so its export
+    is refused."""
     from pathlib import Path
 
+    from dew.data.text import tokenizer_for
     from dew.interop import Pretrained
     from dew.objectives.diffusion.block import BlockDiffusionObjective
 
     fixture = Path(__file__).resolve().parent / "fixtures/hf" / fixture
     bundle = Pretrained.load(str(fixture), dtype="float32", attention_impl="xla", max_seq_len=32)
     objective = BlockDiffusionObjective(bundle.model, prompt_length=3, pretrained=bundle.variables,
-                                        processor=RunProcessor(ByteTokenizer()))
+                                        processor=RunProcessor(tokenizer_for(tokenizer)))
     state = Trainer(objective, optax.sgd(0.01), key=jax.random.PRNGKey(2)).initial_state()
+    if moved:
+        leaves, tree = jax.tree.flatten(state.variables["params"])
+        keys = jax.random.split(jax.random.key(5), len(leaves))
+        params = jax.tree.unflatten(tree, [leaf + moved * jax.random.normal(key, leaf.shape, leaf.dtype)
+                                           for leaf, key in zip(leaves, keys, strict=True)])
+        state = state.replace(variables={**state.variables, "params": params})
     checkpoints = Checkpoints(str(directory))
     checkpoints.save(0, state, None, artifact=objective.inference_record())
     checkpoints.wait()
