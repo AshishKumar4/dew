@@ -9,6 +9,7 @@ import pytest
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import Admitted
+from dew.nn.mixers import AttentionMixer
 
 VOCAB, ROWS, WIDTH = 50, 4, 6
 
@@ -32,14 +33,22 @@ def prefilled(model, params):
     return updated["cache"]
 
 
+FEATURES = {"plain": {}, "no qk norm": {"qk_norm": False}, "projection norm": {"qk_norm_scope": "projection"},
+            "softcap": {"attn_logit_softcap": 5.0}, "output gate": {"output_gate": True},
+            "attention scale": {"attention_scale": 0.3}, "partial rope": {"partial_rotary_factor": 0.5},
+            "exclusive, no rope": {"mixer": AttentionMixer(nope=True, exclusive_self_attention=True)}}
+
+
 @pytest.mark.parametrize("continuing", [True, False])
-def test_a_mixed_call_decodes_and_prefills_as_the_separate_calls_do(continuing):
+@pytest.mark.parametrize("feature", list(FEATURES))
+def test_a_mixed_call_decodes_and_prefills_as_the_separate_calls_do(continuing, feature):
     """Rows 0 and 1 decode a token each while row 3 is admitted with a
     four-token prompt (left-padded to the piece's width, as admission pads)
     and a padding piece rides along: the logits and every cache row match a
     decode call over the rows and a prefill of row 3 alone, whether the
-    piece reads its row's cache or, starting the row, its own keys."""
-    model = tiny()
+    piece reads its row's cache or, starting the row, its own keys, under
+    each attention feature the mixed call takes."""
+    model = tiny(**FEATURES[feature])
     params = model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))
     cache = prefilled(model, params)
     fed = jnp.asarray([7, 9, 0, 0], jnp.int32)
