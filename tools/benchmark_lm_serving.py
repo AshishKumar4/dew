@@ -7,6 +7,12 @@ TTFT is submission to the first observed token and ITL is first-to-last time
 over the remaining tokens. Client queue time is separate. Dew and vllm-engine
 are called in-process; vllm includes its HTTP/streaming transport.
 
+`--rate` adds open-loop runs (Dew and vllm-engine): `--requests` (default
+six times the slots) arriving as a Poisson process at each rate, seeded per
+slot count, so a request waits in the server's queue rather than the
+client's. TTFT is then from the request's arrival, and the token gaps are
+per token: each decoding row's time between consecutive tokens.
+
 Start vLLM in its own environment with bf16, --generation-config vllm and
 --gpu-memory-utilization 0.90. Pass the same snapshot and --vocab-limit to
 all runs. Warmup uses disjoint prompts and the full measured output length.
@@ -49,6 +55,47 @@ def metrics(rows: list[dict[str, float]], wall: float, prompt: int) -> dict[str,
             "total_tokens_per_second": (generated + len(rows) * prompt) / wall,
             **{f"{name}_seconds": percentiles([row[name] for row in rows])
                for name in ("ttft", "itl", "latency", "client_queue")}}
+
+
+def arrivals_for(slots: int, count: int, rate: float) -> np.ndarray:
+    """Seconds from the start at which each of `count` requests arrives, Poisson at `rate` a second."""
+    return np.cumsum(np.random.default_rng(3000 + slots).exponential(1 / rate, count))
+
+
+def open_metrics(rate: float, ttft, gaps, wall: float, tokens: int) -> dict[str, object]:
+    return {"rate": rate, "requests": len(ttft), "wall_seconds": wall, "output_tokens": tokens,
+            "output_tokens_per_second": tokens / wall, "ttft_seconds": percentiles(ttft),
+            "token_gap_seconds": percentiles(gaps)}
+
+
+def dew_open(server, prompts: np.ndarray, output: int, rate: float):
+    """Open-loop Dew: requests submitted as they arrive, a step whenever any is live."""
+    arrivals = arrivals_for(server.slots, len(prompts), rate)
+    tickets, due, gaps = [], [], []
+    stamps: dict[int, float] = {}  # a decoding row's last step
+    live: list[int] = []
+    began = time.perf_counter()
+    while len(tickets) < len(prompts) or live:
+        now = time.perf_counter() - began
+        while len(tickets) < len(prompts) and arrivals[len(tickets)] <= now:
+            due.append(began + arrivals[len(tickets)])
+            live.append(len(tickets))
+            tickets.append(server.submit(prompts[len(tickets)], output, key=len(tickets)))
+        if not live:
+            time.sleep(max(0.0, arrivals[len(tickets)] - (time.perf_counter() - began)))
+            continue
+        server.step()
+        stamp = time.perf_counter()
+        for number in live:
+            if tickets[number].first is not None:
+                if number in stamps:
+                    gaps.append(stamp - stamps[number])
+                stamps[number] = stamp
+        live = [number for number in live if not tickets[number].done()]
+    wall = time.perf_counter() - began
+    server.run()
+    ttft = [ticket.first - arrival for ticket, arrival in zip(tickets, due, strict=True)]
+    return open_metrics(rate, ttft, gaps, wall, len(prompts) * output)
 
 
 def dew_run(server, prompts: np.ndarray, output: int):
@@ -178,6 +225,9 @@ def dew_points(args):
                                   kv_cache=KVCache(page_size=16 if args.kv == "paged" else None))
         print(f"slots {slots}: built in {time.perf_counter() - began:.2f}s", flush=True)
         dew_run(server, warm, args.output)
+        # Each power-of-two admission width is its own program (`admission_share`).
+        for rows in sorted({min(server.admission, 1 << bit) for bit in range(server.admission.bit_length())}):
+            dew_run(server, warm[:rows], args.output)
         print(f"slots {slots}: warm in {time.perf_counter() - began:.2f}s", flush=True)
         compiled = server._step._cache_size()
         repeats = []
@@ -192,6 +242,9 @@ def dew_points(args):
         point = {"slots": slots, "admission": server.admission, "repeats": repeats,
                  "prompt_sha256": hashlib.sha256(prompts.tobytes()).hexdigest(),
                  "measured_recompiles": server._step._cache_size() - compiled}
+        if args.rate:
+            opened = prompts_for(slots, args.requests or 6 * slots, args.prompt, args.vocab_limit)
+            point["open_loop"] = [dew_open(server, opened, args.output, rate) for rate in args.rate]
         if args.profile:
             point["profile"] = profile_decode(server, prompts[:slots], args.output, args.profile_steps,
                                               args.out.with_name(f"{args.out.stem}-slots{slots}-profile"))
@@ -200,7 +253,7 @@ def dew_points(args):
     return hardware, points
 
 
-async def async_sweep(args, request):
+async def async_sweep(args, request, streamed=None):
     points = []
     for slots in args.slots:
         count = args.requests or max(64, 2 * slots)
@@ -215,9 +268,30 @@ async def async_sweep(args, request):
             repeats.append(metrics(rows, time.perf_counter() - began, args.prompt))
         point = {"slots": slots, "repeats": repeats,
                  "prompt_sha256": hashlib.sha256(prompts.tobytes()).hexdigest()}
+        if args.rate:
+            opened = prompts_for(slots, args.requests or 6 * slots, args.prompt, args.vocab_limit)
+            point["open_loop"] = [await async_open(slots, opened, args.output, rate, streamed)
+                                  for rate in args.rate]
         points.append(point)
         print(json.dumps(point), flush=True)
     return points
+
+
+async def async_open(slots, prompts, output, rate, streamed):
+    """Open-loop requests to an engine whose own scheduler queues them."""
+    arrivals = arrivals_for(slots, len(prompts), rate)
+    began = time.perf_counter()
+
+    async def arrive(index):
+        await asyncio.sleep(max(0.0, began + arrivals[index] - time.perf_counter()))
+        stamps = await streamed(prompts[index], output)
+        assert len(stamps) == output, (len(stamps), output)
+        return stamps[0] - (began + arrivals[index]), np.diff(stamps)
+
+    results = await asyncio.gather(*(arrive(index) for index in range(len(prompts))))
+    wall = time.perf_counter() - began
+    return open_metrics(rate, [ttft for ttft, _ in results], np.concatenate([gaps for _, gaps in results]),
+                        wall, len(prompts) * output)
 
 
 async def vllm_points(args):
@@ -281,8 +355,19 @@ async def engine_points(args):
             return {"tokens": tokens, "ttft": first - sent, "itl": (last - first) / max(tokens - 1, 1),
                     "latency": last - sent, "client_queue": sent - queued}
 
+    async def streamed(prompt, output):
+        """The time each of a request's tokens reached the client."""
+        policy = SamplingParams(temperature=0, top_p=1, top_k=-1, min_p=0,
+                                repetition_penalty=1, max_tokens=output, ignore_eos=True)
+        stamps: list[float] = []
+        async for result in engine.generate(TokensPrompt(prompt_token_ids=prompt.tolist()), policy,
+                                            uuid.uuid4().hex):
+            arrived = len(result.outputs[0].token_ids) - len(stamps)
+            stamps.extend([time.perf_counter()] * arrived)
+        return stamps
+
     try:
-        points = await async_sweep(args, request)
+        points = await async_sweep(args, request, streamed)
     finally:
         engine.shutdown()
     return {"label": args.hardware}, points
@@ -306,9 +391,13 @@ def main():
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--profile-steps", type=int, default=20)
     parser.add_argument("--generations", action="store_true")
+    parser.add_argument("--rate", default="", help="open-loop Poisson arrival rates, requests a second")
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
     args.slots = [int(value) for value in args.slots.split(",")]
+    args.rate = [float(value) for value in args.rate.split(",") if value]
+    if args.rate and args.backend == "vllm":
+        parser.error("--rate runs Dew and vllm-engine in-process")
     if (min(args.slots) < 1 or min(args.prompt, args.output, args.repeats, args.profile_steps) < 1
             or args.requests < 0 or args.vocab_limit <= 100):
         parser.error("counts must be positive; --requests=0 chooses the default")

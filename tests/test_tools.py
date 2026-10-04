@@ -314,9 +314,14 @@ def test_lm_serving_benchmark_draws_the_full_budget_without_stopping(monkeypatch
     monkeypatch.setattr(tool, "prompts_for", lambda *args, **kwargs: prompts)
     args = argparse.Namespace(model="tiny", vocab_limit=13, prompt=2, output=4, slots=[2],
                               requests=2, repeats=1, admission=2, decode_steps=1, kv="dense",
-                              profile=False, profile_steps=20, generations=True, out=tmp_path / "serve.json")
+                              profile=False, profile_steps=20, generations=True, out=tmp_path / "serve.json",
+                              rate=[1000.0])
     _, points = tool.dew_points(args)
     assert points[0]["repeats"][0]["output_tokens"] == 8
+    # The open-loop run serves the same requests as they arrive, timing each token.
+    opened, = points[0]["open_loop"]
+    assert opened["output_tokens"] == 8 and opened["ttft_seconds"]["p50"] > 0
+    assert 0 < opened["token_gap_seconds"]["p50"] <= opened["token_gap_seconds"]["p99"]
     saved = np.load(tmp_path / "serve-slots2.npz")
     expected = [bound(prompt[None], 4, key=index).host() for index, prompt in enumerate(prompts)]
     np.testing.assert_array_equal(saved["tokens"], np.concatenate([row.tokens[:, -4:] for row in expected]))
