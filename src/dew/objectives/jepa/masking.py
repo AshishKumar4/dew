@@ -122,10 +122,10 @@ class MultiBlockMask:
         top = jnp.floor(corner[..., 0] * (H_P - heights[choice] + 1)).astype(jnp.int32)
         left = jnp.floor(corner[..., 1] * (W_P - widths[choice] + 1)).astype(jnp.int32)
         target_idx = (top * W_P + left)[..., None] + offsets[choice]
-        order = scan_indices(self.scan_order, H_P, W_P)
-        if order is not None:
+        scan = scan_indices(self.scan_order, H_P, W_P)
+        if scan is not None:
             # A grid position's place in the encoder's sequence.
-            target_idx = jnp.sort(jnp.asarray(inverse_permutation(order))[target_idx], axis=-1)
+            target_idx = jnp.sort(jnp.asarray(inverse_permutation(scan))[target_idx], axis=-1)
 
         is_target = jnp.zeros((batch_size, S), dtype=bool).at[
             jnp.arange(batch_size)[:, None], target_idx.reshape(batch_size, -1)].set(True)
