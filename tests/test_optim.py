@@ -467,6 +467,21 @@ def test_a_gated_query_clips_its_query_half_and_bounds_the_logits():
     np.testing.assert_allclose(after, before * eta, rtol=1e-5)
 
 
+def test_a_layer_that_norms_its_queries_and_keys_is_refused():
+    """A per-head QK-norm divides any scale of the query and key kernels
+    back out of the logits, so the clip would rescale the kernels and bound
+    nothing. Measured before this refusal on a one-layer normed decoder at
+    tau 0.90: maxima 1.937, 1.794, 1.802, 1.873 before the clip and 1.936,
+    1.794, 1.801, 1.873 after."""
+    model = tiny_decoder(qk_norm=True, num_layers=1)
+    variables = model.init(jax.random.key(0), jnp.ones((1, 8), jnp.int32))
+    _, sown = model.apply(variables, jnp.ones((1, 8), jnp.int32), mutable=["qk"])
+    params = variables["params"]
+    tx = scale_by_qk_clip(0.5)
+    with pytest.raises(ValueError, match=r"norms its queries and keys.*'muon'.*qk_norm=False"):
+        tx.update(jax.tree.map(jnp.zeros_like, params), tx.init(params), params, qk_stats=sown["qk"])
+
+
 def test_the_latent_branches_match_maxtext():
     """The MLA branches against MaxText 0.2.4's own outputs, committed as
     tests/fixtures/muonclip/maxtext_mla.json: `q_proj` stands in for `wq_b`

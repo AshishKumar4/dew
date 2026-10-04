@@ -195,8 +195,19 @@ def _mla_key_gamma(scale: jax.Array, nope: jax.Array, width: int) -> jax.Array:
                      jnp.ones((), scale.dtype))
 
 
-def _clip_leaf(qk_stats, tau: float, path: jax.tree_util.KeyPath, update: jax.Array,
-               param: jax.Array) -> jax.Array:
+def _qk_normed(params) -> set[tuple[str, ...]]:
+    """The layers whose parameters hold a query or key norm (`q_norm`,
+    `k_norm`), read off the tree's paths."""
+    layers = set()
+    for path, _ in jax.tree_util.tree_leaves_with_path(params):
+        names = _dict_names(path)
+        if len(names) >= 2 and names[-2] in ('q_norm', 'k_norm'):
+            layers.add(names[:-2])
+    return layers
+
+
+def _clip_leaf(qk_stats, tau: float, normed: set[tuple[str, ...]], path: jax.tree_util.KeyPath,
+               update: jax.Array, param: jax.Array) -> jax.Array:
     """Fold QK-Clip's post-step weight rescale into one leaf's update.
 
     The clip acts on the weights after the step, `gamma * (W + update)`.
@@ -206,7 +217,10 @@ def _clip_leaf(qk_stats, tau: float, path: jax.tree_util.KeyPath, update: jax.Ar
 
     Leaves outside `QK_PROJECTIONS` keep their update. A named leaf whose
     layer sowed no maxima raises naming the layer, since stepping it
-    unclipped would train a different model than the maxima describe.
+    unclipped would train a different model than the maxima describe. So
+    does one whose layer norms its queries or keys (`normed`): the norm
+    divides any scale of the kernels back out, so no rescale of them moves
+    the logits, which the norm's own scales bound instead.
 
     Queries and keys rescale per query group, as Megatron Core's
     `SelfAttention.clip_qk` does (attention.py at core_v0.19.2), multi-head
@@ -222,6 +236,11 @@ def _clip_leaf(qk_stats, tau: float, path: jax.tree_util.KeyPath, update: jax.Ar
     names = _dict_names(path)
     if len(names) < 2 or names[-1] != 'kernel' or names[-2] not in QK_PROJECTIONS:
         return update
+    if names[:-2] in normed:
+        raise ValueError(
+            f"QK-Clip reaches {'.'.join(names)}, whose layer norms its queries and keys: the "
+            "norm divides the kernels' scale back out of the logits, so the clip cannot bound "
+            "them. Train this model with 'muon', or build it with qk_norm=False")
     node = qk_stats
     for name in names[:-2]:
         node = node.get(name) if isinstance(node, Mapping) else None
@@ -292,7 +311,7 @@ def scale_by_qk_clip(tau: float = 100.0) -> optax.GradientTransformationExtraArg
         if qk_stats is None or params is None:
             return updates, state
         clipped = jax.tree_util.tree_map_with_path(
-            functools.partial(_clip_leaf, qk_stats, tau), updates, params)
+            functools.partial(_clip_leaf, qk_stats, tau, _qk_normed(params)), updates, params)
         return clipped, state
 
     return optax.GradientTransformationExtraArgs(init_fn, update_fn)
