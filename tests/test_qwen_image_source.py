@@ -401,7 +401,9 @@ def test_diffusers_reads_a_qwen_image_export(tmp_path):
     with np.load(ROOT / "tests/fixtures/qwen_image_export.npz") as stored:
         recorded = dict(stored)
     meta = json.loads(recorded.pop("meta").tobytes())
-    assert digests(tmp_path / "export") == meta["digests"]
+    assert digests(tmp_path / "export") == meta["digests"], (
+        "Dew's export changed: rerun both halves of tools/qwen_image_export_reference.py, "
+        "`consume` in the qwen-image reference environment, so Diffusers reads the new files")
     latent = jnp.asarray(nhwc(recorded["packed"], *GRID))
     context = jnp.asarray(recorded["context"])
     condition = DenoisingCondition(context, mask=jnp.ones(context.shape[:2], bool))
