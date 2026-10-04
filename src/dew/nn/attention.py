@@ -1708,6 +1708,9 @@ class NormalAttention(nn.Module):
 
     `freqs_cis` rotates the queries and keys of a self-attention call;
     `rotary_freqs` gives the pair, and None leaves them unrotated.
+    `use_bias` is the projections' bias; `qkv_bias`, when given, the
+    query, key and value projections' alone, as timm's ViT attention
+    (U-ViT's) has them without one and its output projection with one.
     """
     query_dim: int
     heads: int = 4
@@ -1715,6 +1718,7 @@ class NormalAttention(nn.Module):
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     use_bias: bool = True
+    qkv_bias: bool | None = None
     force_fp32_for_softmax: bool = True
     qk_norm: bool = False  # RMSNorm on q/k per head (SD3-style bf16 logit safety)
     attention_impl: str = "auto"  # an AttentionImpl
@@ -1725,7 +1729,7 @@ class NormalAttention(nn.Module):
             features=[self.heads, self.dim_head],
             axis=-1,
             precision=self.precision,
-            use_bias=self.use_bias,
+            use_bias=self.use_bias if self.qkv_bias is None else self.qkv_bias,
             dtype=self.dtype
         )
         self.query = dense(name="to_q")

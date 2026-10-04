@@ -2572,6 +2572,17 @@
    ],
    "note": "Fetches and executes published Router class."
   },
+  "uvit/bao.npz": {
+   "tool": "tools/uvit_reference.py",
+   "sources": [
+    {
+     "repo": "baofff/U-ViT",
+     "version": "ce551708dc9cde9818d2af7d84dfadfeb7bd9034",
+     "runs": "fetched"
+    }
+   ],
+   "note": "libs/uvit_t2i.py and libs/timm.py fetched at the commit, SHA-256 checked, math attention; float32 and float64 (widened) forward and gradients. Torch 2.14.0+cpu."
+  },
   "vae/sd3-tiny": {
    "tool": "tools/vae_reference.py",
    "sources": [
