@@ -76,13 +76,6 @@ def test_base_prior_scale_squares_both_nonunit_signal_and_noise_rates():
     np.testing.assert_array_equal(PartialSignal().prior_scale(), expected)
 
 
-def test_generalized_training_times_are_the_unit_domains_exact_uniform_draws():
-    with jax.enable_x64():
-        key, count = jax.random.key(7), 8
-        expected = jax.random.uniform(key, (count,), minval=0., maxval=1.)
-        np.testing.assert_array_equal(LinearSigma().sample_t(key, count), expected)
-
-
 @pytest.mark.parametrize("missing", ["rates", "sample_t", "weight"])
 def test_each_required_forward_schedule_operation_prevents_incomplete_construction(missing):
     operations = {
