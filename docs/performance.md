@@ -1295,6 +1295,20 @@ bf16 spacings apart at their magnitude, the largest 2.78, 77% under one and
 and cuDNN's in 23. Evidence:
 `~/.cache/dew/verification-evidence/serving-prefill-cudnn/`.
 
+The cache writes as words, 2026-10-03. XLA's scatter stores one element a
+thread, so a bf16 cache moved two bytes a store: each decode layer's key and
+value writes took 3.7 us apiece at 128 rows, and an admission's prefill
+windows 28 us a cache. On a GPU `write_cache` and admission's placement now
+move a one- or two-byte cache's bits as uint32 words
+(`dew.nn.kv_cache.as_words`; a word-wide or boolean leaf, an axis that does
+not fill whole words, and a TPU, which tiles two-byte arrays on another axis,
+are written as they are). Over 16 caches in isolation the decode write went
+from 0.113 to 0.099 ms and admission's from 0.627 to 0.277; the served tokens
+and log-probabilities are bitwise at 32, 64 and 128 slots, and the run's
+device busy time went from 2165.6 to 2149.5 ms at 64 slots and from 3704.2
+to 3649.5 ms at 128 (two traced runs each, integration `456a4b64`).
+Evidence: `~/.cache/dew/verification-evidence/serving-cache-words/`.
+
 ## Quantized serving of the 176M text-to-image model, 2026-09-28
 
 `TextToImage.quantized` serves the denoiser with its kernels stored as int8

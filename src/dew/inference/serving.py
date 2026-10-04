@@ -84,7 +84,9 @@ from dew.nn.kv_cache import (
     VALIDITY,
     KVCache,
     Layered,
+    as_words,
     filled_slots,
+    from_words,
     grouped,
     is_paged,
     leaf_name,
@@ -295,15 +297,16 @@ def _placed(resident: jax.Array, incoming: jax.Array, rows: jax.Array, groups: i
     from a prefill at the prompt's width, narrower on the cache-slot axis,
     lands in the first slots of its rows.
     """
-    window = tuple(slice(0, incoming.shape[axis]) if incoming.shape[axis] != resident.shape[axis]
-                   else slice(None) for axis in range(1, incoming.ndim))
+    words, fresh = as_words(resident), as_words(incoming.astype(resident.dtype))
+    window = tuple(slice(0, fresh.shape[axis]) if fresh.shape[axis] != words.shape[axis]
+                   else slice(None) for axis in range(1, fresh.ndim))
 
     def place(resident: jax.Array, incoming: jax.Array, rows: jax.Array) -> jax.Array:
         rows = jnp.where(rows < resident.shape[0], rows, DROPPED)
         return resident.at[(rows, *window)].set(incoming, mode="drop")
 
-    return jax.vmap(place)(*(grouped(leaf, 0, groups) for leaf in (resident, incoming, rows))
-                           ).reshape(resident.shape)
+    placed = jax.vmap(place)(*(grouped(leaf, 0, groups) for leaf in (words, fresh, rows)))
+    return from_words(placed.reshape(words.shape), resident.dtype)
 
 
 def _seated(state: Slots, decoder: DecoderState, real: jax.Array, admission: Admission, groups: int) -> Slots:

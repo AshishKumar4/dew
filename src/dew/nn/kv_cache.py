@@ -174,8 +174,34 @@ def write_cache(buffer: jax.Array, values: jax.Array, positions: jax.Array) -> j
             *source.shape, *(1,) * (values.ndim - 2)), axis=1)
         held = (source >= 0).reshape(*source.shape, *(1,) * (values.ndim - 2))
         return jnp.where(held, picked.astype(buffer.dtype), buffer)
-    return jax.vmap(lambda row, incoming, at: row.at[at].set(incoming.astype(row.dtype), mode="drop"))(
-        buffer, values, slots)
+    words = jax.vmap(lambda row, incoming, at: row.at[at].set(incoming, mode="drop"))(
+        as_words(buffer), as_words(values.astype(buffer.dtype)), slots)
+    return from_words(words, buffer.dtype)
+
+
+def as_words(x: jax.Array) -> jax.Array:
+    """`x`'s bits with its last axis packed into uint32 words, for a scatter
+    to move on a GPU.
+
+    XLA's scatter stores one element a thread, so bf16 caches moved two bytes
+    a store: Qwen3-0.6B's 8-prompt admission write took 0.63 against 0.28 ms
+    as words over 16 caches on an RTX 4080, the same bits (docs/performance.md).
+    `x` itself where its elements are bool or a word wide already, its last
+    axis does not fill whole words, or the backend is not a GPU, where a TPU
+    tiles two-byte arrays on another axis.
+    """
+    per_word = 4 // x.dtype.itemsize
+    if jax.default_backend() != 'gpu' or x.dtype == jnp.bool_ or per_word < 2 or x.shape[-1] % per_word:
+        return x
+    pairs = x.reshape(*x.shape[:-1], x.shape[-1] // per_word, per_word)
+    return jax.lax.bitcast_convert_type(pairs, jnp.uint32)
+
+
+def from_words(words: jax.Array, dtype: jnp.dtype) -> jax.Array:
+    """The `dtype` elements `as_words` packed into `words`."""
+    if words.dtype == jnp.dtype(dtype):
+        return words
+    return jax.lax.bitcast_convert_type(words, dtype).reshape(*words.shape[:-1], -1)
 
 
 def filled_slots(cursor: jax.Array, capacity: int) -> jax.Array:
