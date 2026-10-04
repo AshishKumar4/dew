@@ -84,9 +84,12 @@ def assert_computes_the_oracle(reference_in_float64, reference, truth, label: st
     """The reference run in float64 within FACTOR times its own fp32 error,
     scaled by the float64-to-fp32 ratio of unit roundoffs for each of the two
     float64 runs, of an independent float64 oracle: the two compute one
-    function, and any difference in it moves the twin by far more."""
+    function, and any difference in it moves the twin by far more. For a
+    rounded computation: one whose fp32 run is exact gives a bound of zero,
+    which the reference refuses (`assert_as_exact_as_the_reference` does too)."""
     twin = 2 * float(np.finfo(np.float64).eps / np.finfo(np.float32).eps)
     apart, theirs = distance(reference_in_float64, truth), distance(reference, truth)
+    assert theirs > 0, f"{label}: the reference equals float64, so it bounds nothing"
     assert apart <= FACTOR * twin * theirs, (
         f"{label}: the reference in float64 is {apart:.3e} from the oracle (rms), more than float64 "
         f"rounding of its fp32 error {theirs:.3e}")
