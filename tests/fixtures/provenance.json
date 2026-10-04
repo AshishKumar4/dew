@@ -310,7 +310,18 @@
      "runs": "flaxdiff"
     }
    ],
-   "note": "FlaxDiff 0.2.8 documented at tool:8; this unit excludes its separately listed hybrid_dit child."
+   "note": "FlaxDiff 0.2.8 documented at tool:8; this unit excludes its separately listed hybrid_dit and family.npz children."
+  },
+  "flaxdiff/family.npz": {
+   "tool": "tools/flaxdiff_family_reference.py",
+   "sources": [
+    {
+     "repo": "AshishKumar4/FlaxDiff",
+     "version": "15c55b001304604147a2a8002a76cf5d4c32092f",
+     "runs": "fetched"
+    }
+   ],
+   "note": "flaxdiff/models (hilbert, s5, common, attention, vit_common, dit_common, simple_unet, simple_vit, simple_dit, simple_mmdit) fetched at the commit, SHA-256 checked; reference attention without forced-fp32 softmax; float32 and float64 (every jnp.float32 read as jnp.float64, x64) forward and gradients. JAX 0.11.2.post3."
   },
   "flaxdiff/hybrid_dit": {
    "tool": "tools/flaxdiff_reference.py",
