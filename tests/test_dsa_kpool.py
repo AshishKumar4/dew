@@ -221,7 +221,7 @@ def decode_steps(block_module, variables, hidden, valid, prefill: int):
         return None if row_valid is None else AttentionMetadata(valid=row_valid[:, start:stop])
 
     _, allocated = block_module.apply(variables, x[:, :1], decode=True, mutable=["cache"])
-    assert not bool(jnp.any(allocated["cache"]["cache_valid"]))
+    assert not bool(jnp.any(allocated["cache"]["cache_index"]))
     out, state = block_module.apply({**variables, **allocated}, x[:, :prefill], decode=True,
                                     attention_metadata=metadata(0, prefill), mutable=["cache"])
     steps = [out]
@@ -374,7 +374,6 @@ def test_prediction_selection_rewind_recomputes_only_invalidated_row():
     inactive_rewound = {
         **drafted["cache"],
         "cache_index": drafted["cache"]["cache_index"].at[1].set(3),
-        "cache_valid": drafted["cache"]["cache_valid"].at[1].set(jnp.arange(block.max_seq_len) < 3),
     }
     _, held = selection_step(block, variables, inactive_rewound, x[:, 6:7],
                               jnp.asarray([[True], [False]]), "draft")

@@ -1337,6 +1337,17 @@ to 3649.5 ms at 128 (two traced runs each, integration `456a4b64`).
 `tests/test_kv_cache.py::test_a_cache_write_moves_whole_words_with_the_same_bits`
 holds the bits.
 
+The cache's validity, derived, 2026-10-04. Each attention cache stored a
+`[rows, capacity]` mask of its filled slots beside the cursor, though slots
+fill in order and the mask was always the cursor's `filled_slots`. A decode
+step rewrote it in every layer, 28 one-microsecond kernels whose only reader
+was the carried state. It is now derived where read
+(`dew.nn.attention.cached_validity`), in the attention, Llama 4, MLA, the
+DSA pool and DeepSeek V4, and serving no longer places or zeroes it. The
+served tokens and log-probabilities are bitwise at 32, 64 and 128 slots, and
+the device's busy time a run went from 1393.7 to 1388.3 ms at 32 slots,
+2147.5 to 2139.2 at 64 and 3645.2 to 3626.2 at 128 (two traced runs each).
+
 ## Quantized serving of the 176M text-to-image model, 2026-09-28
 
 `TextToImage.quantized` serves the denoiser with its kernels stored as int8
