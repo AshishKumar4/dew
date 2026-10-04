@@ -198,6 +198,22 @@
    "generator": "dew",
    "note": "Dew's serialized pre-dropout CPU forward and gradient graph at 42ddfc1 (tools/generate_decoder_dropout_fixture.py); a Dew regression golden."
   },
+  "decoding/penalties.npz": {
+   "tool": "tools/vllm_penalty_reference.py",
+   "sources": [
+    {
+     "repo": "vllm-project/vllm",
+     "version": "ced6857afa0ea7b2e3f0846a62e1394e90f15607",
+     "runs": "fetched"
+    },
+    {
+     "repo": "pytorch/pytorch",
+     "version": "2.14.0",
+     "runs": "torch"
+    }
+   ],
+   "note": "Fetches and executes vLLM v0.30.0's apply_penalties with its torch repetition-penalty path."
+  },
   "diffusers/limits.npz": {
    "tool": "tools/diffusers_limits_reference.py",
    "sources": [
@@ -1491,6 +1507,17 @@
    ],
    "note": "Actual Transformers float64 and bf16 forwards over the committed checkpoint."
   },
+  "hf/llama-tiny/stopping.npz": {
+   "tool": "tools/stopping_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.16.1",
+     "runs": "transformers"
+    }
+   ],
+   "note": "Actual Transformers greedy generate stopping on EOS ids, with min_new_tokens, and per row on max_length."
+  },
   "hf/llama31-tiny/logits.npy": {
    "tool": "tools/hf_reference.py",
    "sources": [
@@ -1834,6 +1861,17 @@
     }
    ],
    "note": "Actual Transformers float64 and bf16 forwards over the committed checkpoint."
+  },
+  "hf/qwen3-tiny/stopping.npz": {
+   "tool": "tools/stopping_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.16.1",
+     "runs": "transformers"
+    }
+   ],
+   "note": "Actual Transformers greedy generate stopping on EOS ids, with min_new_tokens, and per row on max_length."
   },
   "hf/qwen35-0.8b": {
    "tool": "tools/qwen_linear_reference.py",

@@ -24,6 +24,16 @@ filtered one, computed on z / T over the kept support, by at most
 Both are measured against the float64 path, where E is transformers' own
 largest decode error on that path.
 
+Stopping (tools/stopping_reference.py, llama-tiny and qwen3-tiny): the same
+prompts through generate with two EOS ids that end rows 0 and 1 at their
+third and fifth steps and never row 2, then with `min_new_tokens` 4 holding
+row 0's EOS off, and each row alone to `max_length` 9; `max_new_tokens` 6
+is the committed greedy path's first six. Dew's batched greedy decode must
+end, pad and count each row as transformers does. A left-padded
+transformers batch counts `max_length` over the padded width, so one row's
+stop would depend on its batchmates; Dew's `MaxLength` counts the row's own
+tokens, which is transformers' count for the row alone.
+
 gemma3-tiny and mixtral-tiny have a 4-token sliding window, so every row
 decodes past it; deepseek-v3-tiny decodes through MLA's compressed cache and
 a routed layer. gemma3-tiny's sampled path equals its greedy one (its logits
@@ -43,7 +53,7 @@ from reference_error import FACTOR
 
 from dew.interop import Pretrained
 from dew.nn.inputs import ModelInputs
-from dew.sampling import Sampling, generate
+from dew.sampling import Sampling, decoding, generate
 from dew.sampling.strategies import Draws
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
@@ -135,3 +145,50 @@ def test_the_sampled_path_scores_as_transformers_scored_it(family):
     behavior_error = np.max(np.abs(np.asarray(result.behavior_log_probs, np.float64)
                                    - fixture["sampled_behavior_f64"]))
     assert behavior_error <= 2 * FACTOR * error / SAMPLED.temperature, (name, behavior_error, error)
+
+
+@pytest.mark.parametrize("name", ["llama-tiny", "qwen3-tiny"])
+def test_rows_stop_pad_and_count_as_transformers_generate_ends_them(name):
+    directory = FIXTURES / name
+    pretrained = Pretrained.load(str(directory), dtype="float32", attention_impl="reference")
+    with np.load(directory / "generate.npz") as stored:
+        fixture = {key: stored[key] for key in stored.files}
+    with np.load(directory / "stopping.npz") as stored:
+        stopping = {key: stored[key] for key in stored.files}
+    # Every path's float64 top-2 margin clears four fp32 decode errors, so
+    # each greedy choice is the model's and not a rounding.
+    assert float(stopping["margin"]) > 2 * FACTOR * decode_error(fixture, "greedy")
+    eos, pad = tuple(int(token) for token in stopping["eos"]), int(stopping["pad"])
+    width = fixture["prompt"].shape[1]
+
+    def ended(**fields):
+        return generate(pretrained.model, pretrained.variables, prompts(fixture), NEW_TOKENS,
+                        key=jax.random.key(0), **fields)
+
+    for path, policy in (("eos", Sampling(temperature=0, eos_id=eos, pad_id=pad)),
+                         ("min_new", Sampling(temperature=0, eos_id=eos, pad_id=pad,
+                                              min_new_tokens=int(stopping["min_new"])))):
+        result = ended(sampling=policy)
+        want = stopping[f"{path}_tokens"]
+        np.testing.assert_array_equal(np.asarray(result.tokens)[:, width:], want, err_msg=path)
+        drew_eos = np.isin(want, eos)
+        lengths = np.where(drew_eos.any(-1), drew_eos.argmax(-1) + 1, NEW_TOKENS)
+        np.testing.assert_array_equal(np.asarray(result.lengths), lengths, err_msg=path)
+        np.testing.assert_array_equal(np.asarray(result.terminated), drew_eos.any(-1), err_msg=path)
+
+    # generate's greedy path is causal, so its first six tokens are what
+    # transformers draws with max_new_tokens 6.
+    result = ended(sampling=Sampling(temperature=0, pad_id=pad), stopping=(decoding.MaxNewTokens(6),))
+    tokens = np.asarray(result.tokens)[:, width:]
+    np.testing.assert_array_equal(tokens[:, :6], fixture["greedy_tokens"][:, :6])
+    assert np.all(tokens[:, 6:] == pad)
+    np.testing.assert_array_equal(np.asarray(result.lengths), 6)
+
+    result = ended(sampling=Sampling(temperature=0, pad_id=pad),
+                   stopping=(decoding.MaxLength(int(stopping["max_length"])),))
+    tokens, lengths = np.asarray(result.tokens)[:, width:], np.asarray(result.lengths)
+    for row in range(len(tokens)):
+        want = stopping[f"max_length_tokens_{row}"]
+        assert int(lengths[row]) == len(want), (row, int(lengths[row]), len(want))
+        np.testing.assert_array_equal(tokens[row, :len(want)], want)
+        assert np.all(tokens[row, len(want):] == pad)
