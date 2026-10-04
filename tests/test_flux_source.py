@@ -237,18 +237,21 @@ def test_published_flux_prompt_encoding_matches_the_source_pipeline(source, pipe
         assert relative_gap(crossed.context, arrays["pipeline.context"]) > 1e-3
 
 
-def test_published_flux_pipeline_walk_matches_the_source(source, pipeline_record):
+@pytest.mark.parametrize("streamed", [False, True])
+def test_published_flux_pipeline_walk_matches_the_source(source, pipeline_record, streamed):
     """`Pretrained.load().text_to_image()` reproduces the source's own call.
 
     Nothing is passed in: the directory's declared pipeline carries the step
     count, the guidance the transformer embeds and the sigma seed its call
-    lays out, and its own mu for this latent's packed token count.
+    lays out, and its own mu for this latent's packed token count. Loaded
+    whole or streamed onto a mesh (tests/test_pipeline_streaming.py).
     """
     from dew.interop.pretrained import Pretrained
+    from dew.training import MeshSpec
 
     with np.load(source / "flux_transformer.npz") as arrays:
-        loaded = Pretrained.load(str(source / "pipeline"), dtype="float32",
-                                 attention_impl="xla")
+        loaded = Pretrained.load(str(source / "pipeline"), dtype="float32", attention_impl="xla",
+                                 **({"mesh": MeshSpec()} if streamed else {}))
         task = loaded.text_to_image()
         assert task.steps == pipeline_record["default_steps"]
         assert task.guidance is None and pipeline_record["true_cfg"] == 1.0
