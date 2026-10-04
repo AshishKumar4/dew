@@ -1402,6 +1402,62 @@ log-probabilities (1.00, 1.00 and 0.99 on the logits) and 1.02, 1.00
 (bitwise) and 1.08 on Qwen3-1.7B's (1.02, 1.00 and 1.07), against an
 allowed 2.
 
+The mixed admitting step, 2026-10-04. An admitting step now runs one
+forward over every token it holds: each slot's last draw, then the admitted
+prompts, laid out in one row (`dew.nn.inputs.Admitted`). Projections, norms,
+the MLP and the head work token by token, so they read their weights once for
+the decoding rows and the prompts together. Attention writes every token's
+keys into its row of the cache in one scatter. Each decoding row's query
+then reads its row as a decode step does, and a prompt that starts its row
+reads its own keys. The decode-only program is untouched: its optimized
+HLO is identical to integration's and its device time per run equal (2540.4
+against 2540.0 ms at 128 slots). Same session, quiet host, Dew at
+integration `ab5966b1` (bucketed admission) and with the mixed step, and
+vLLM 0.30.0:
+
+| slots | rate | Dew `ab5966b1` TTFT p50 / p99, gap p99 (ms) | Dew mixed | vLLM |
+|---:|---:|---|---|---|
+| 32 | 16 | 17.3 / 36.5, 14.0 | 12.6 / 34.5, 9.4 | 13.2 / 17.7, 6.6 |
+| 32 | 24 | 14.6 / 37.8, 12.1 | 13.0 / 22.0, 7.8 | 14.6 / 19.9, 6.8 |
+| 32 | 32 | 14.9 / 27.9, 9.7 | 13.4 / 21.5, 8.2 | 15.3 / 21.7, 7.8 |
+| 64 | 24 | 14.8 / 25.3, 9.2 | 13.5 / 20.3, 8.0 | 14.7 / 22.9, 7.6 |
+| 64 | 36 | 17.0 / 27.8, 11.4 | 15.3 / 25.0, 10.3 | 17.0 / 26.6, 10.6 |
+| 64 | 48 | 20.8 / 37.4, 13.8 | 18.4 / 32.0, 12.1 | 21.1 / 33.7, 14.9 |
+| 128 | 32 | 20.6 / 33.9, 14.2 | 19.1 / 29.6, 13.1 | 17.1 / 34.8, 12.0 |
+| 128 | 44 | 26.3 / 42.3, 17.1 | 23.9 / 39.7, 15.9 | 24.6 / 79.2, 25.1 |
+| 128 | 56 | 34.7 / 55.4, 23.1 | 31.2 / 50.5, 22.5 | 38.4 / 64.6, 23.0 |
+
+The three serve the same tokens a second at every rate, within 0.8%. With
+the mixed step Dew's median TTFT is the shortest of the three in 8 of 9
+cells, and at 64 and 128 slots its p99 TTFT and token gap are at or below
+vLLM's from 36 requests a second up. At 32 slots vLLM keeps the shorter
+token-gap tails, by 0.4 to 2.8 ms at p99, and the shorter TTFT p99 at the
+two lower rates. (The 64-slot, 48-a-second cell that saturated in
+the earlier session did not here; that rate sits near the server's
+capacity.) Closed loop, three repeats in two alternating rounds: 32 slots
+5929 to 5994 tokens a second, 64 slots 7673 to 7766, 128 slots 9039 to
+9033-9072. Traced at 128 slots, the admitting program took 1068 against
+1078 ms a run: GEMMs 671 against 676, attention 253 against 252.
+
+The mixed step is not bitwise to the two forwards: its GEMMs run at other
+shapes. Against the same bf16 weights computed in fp32 at the highest
+precision, over 28 decoding rows and four admitted prompts of 64 to 256
+tokens, its RMS distance is 0.84 times the two forwards' on Qwen3-0.6B's
+decoding logits and 0.97 on its prompt logits (log-probabilities 0.83 and
+0.95), and 1.09 and 0.99 on Qwen3-1.7B's (1.14 and 0.98), against
+tests/reference_error.py's allowed 2. At 32 slots 27 of 64 greedy rows part
+from integration's, all at bf16 near-ties (a median 0.57 bf16 spacings in
+fp32, at most 1.44; fp32's argmax is the two-forward choice in 16 rows and
+the mixed one in 11).
+
+Open: the mixed step serves a dense cache and plain attention. A server
+says why it keeps two forwards (`Server.mixed_refusal`, logged at build).
+Still open: a paged cache, whose tokens would map to pages through the
+row's table; chunked prefill over a dense cache (`Admitted.continuing`
+reads a row's earlier keys, but dense admission does not split prompts yet);
+latent attention (MLA, DSA), sliding windows, sinks, and hybrids whose
+recurrent layers read their row's tokens in order; and prediction depths.
+
 ## Quantized serving of the 176M text-to-image model, 2026-09-28
 
 `TextToImage.quantized` serves the denoiser with its kernels stored as int8
