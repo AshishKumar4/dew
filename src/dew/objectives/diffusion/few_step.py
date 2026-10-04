@@ -102,8 +102,11 @@ class MeanFlowObjective(DiffusionObjective):
     training-time guidance, applied where t lies in `guidance_interval`;
     omega 1 and kappa 0 train without it. `norm_p` and `norm_eps` are the
     adaptive weighting's power and epsilon. The condition is dropped on
-    `unconditional_prob` of the rows, whose target is then the unguided v.
-    Sampling takes `steps - 1` Euler steps of the average velocity, one by
+    `unconditional_prob` of the rows, whose target is then the unguided v;
+    as the reference's `cond_drop` drops them, the dropped rows are the
+    first ones, as many as a draw at that rate counts, so they fall on the
+    instantaneous rows, which the training-time guidance reads the
+    unconditional velocity at. Sampling takes `steps - 1` Euler steps of the average velocity, one by
     default, with no guidance at sampling: it is trained in.
 
     The loss differentiates the model in time, so the model's time
@@ -132,18 +135,25 @@ class MeanFlowObjective(DiffusionObjective):
         self.norm_p = norm_p
         self.norm_eps = norm_eps
 
+    def _draws(self, key, count: int, shape) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+        """The loss's randomness: two training times per row, the noise, and a
+        uniform per row, whose count under `unconditional_prob` is how many
+        rows drop their condition."""
+        later, earlier, noise, dropping = jax.random.split(key, 4)
+        schedule = self.process.schedule
+        return (schedule.sample_t(later, count), schedule.sample_t(earlier, count),
+                jax.random.normal(noise, shape, dtype=jnp.float32), jax.random.uniform(dropping, (count,)))
+
     def loss(self, variables, batch, step: Step):
         samples = unit_range(batch[self.inputs.sample.key])
-        encode_key, drop_key, time_key, noise_key, dropout_key = jax.random.split(step.key, 5)
+        encode_key, condition_key, draw_key, dropout_key = jax.random.split(step.key, 4)
         if self.autoencoder is not None:
             samples = self.autoencoder.encode(variables["autoencoder"], samples, encode_key)
         count = samples.shape[0]
         schedule = self.process.schedule
-        given, blank = self._conditions(variables, batch, drop_key, dropout=False)
-        later, earlier = jax.random.split(time_key)
-        t, r = intervals(schedule.sample_t(later, count), schedule.sample_t(earlier, count),
-                         self.instantaneous)
-        noise = jax.random.normal(noise_key, samples.shape, dtype=jnp.float32)
+        given, blank = self._conditions(variables, batch, condition_key, dropout=False)
+        first, second, noise, uniform = self._draws(draw_key, count, samples.shape)
+        t, r = intervals(first, second, self.instantaneous)
         z, _, v = self.process.prediction.forward_diffusion(
             samples, noise, broadcast_rates(schedule, t, samples)
         )
@@ -174,7 +184,7 @@ class MeanFlowObjective(DiffusionObjective):
             )
         else:
             guided = v
-        dropped = jax.random.bernoulli(jax.random.fold_in(drop_key, 1), self.unconditional_prob, (count,))
+        dropped = jnp.arange(count) < jnp.sum(uniform < self.unconditional_prob)
         conditions = jax.tree.map(lambda value, null: jnp.where(expand(dropped, value), null, value),
                                   given, blank)
         guided = jnp.where(expand(dropped, v), v, guided)
