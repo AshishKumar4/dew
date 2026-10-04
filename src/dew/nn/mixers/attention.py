@@ -446,8 +446,8 @@ class CausalSelfAttention(nn.Module):
 
     def _prologue_fuses(self, packed, decode: bool, attention_metadata: AttentionMetadata | None,
                         kv_store) -> bool:
-        """Whether this decode step's norms, rotation and cache write run as
-        `decode_prologue`'s one kernel: one token a row, on CUDA, for the
+        """Whether this decode step's rotation, cache write and query fold run
+        as `decode_prologue`'s one kernel: one token a row, on CUDA, for the
         plain layer the kernel computes, per-head norms and a whole-head
         rotate-half rope into a dense full-precision cache, with nothing
         reading the keys but this layer's cuDNN call and no metadata but the
@@ -469,32 +469,28 @@ class CausalSelfAttention(nn.Module):
                 and layout.key_rotation(self.head_dim) is None and self.attention_impl in ('auto', 'cudnn')
                 and not self.is_mutable_collection("qk")
                 and self.has_variable("cache", "cached_key")
-                and decode_prologue.ADOPTED
                 and decode_prologue.fits(self.num_heads, self.num_kv_heads, self.head_dim))
 
     def _fused_decode(self, packed, logical_positions, attention_metadata: AttentionMetadata | None,
                       train: bool):
-        """A plain decode step with its prologue in one kernel: the norms, the
-        rotation and the cache write (`decode_prologue`), then the cache's keys
-        through `_attended` as the unfused step reads them."""
+        """A plain decode step with the rotation, the cache write and the
+        query's fold in one kernel (`decode_prologue`) after the layer's own
+        norms, then the cache's keys through `_attended` as the unfused step
+        reads them."""
         B = packed.shape[0]
         heads, kv_heads, head_dim = self.num_heads, self.num_kv_heads, self.head_dim
-        shape = jax.ShapeDtypeStruct((B, 1, kv_heads, head_dim), packed.dtype)
-        positions, append, _ = self._step_positions(shape, None, None, attention_metadata, decode=True, S=1)
+        query, key, value = jnp.split(packed.reshape(B, 1, heads + 2 * kv_heads, head_dim),
+                                      (heads, heads + kv_heads), axis=2)
+        query, key = self.q_norm(query), self.k_norm(key)
+        positions, append, _ = self._step_positions(key, None, None, attention_metadata, decode=True, S=1)
         if append is None:
             raise AssertionError("a causal layer with its own cache always opens it")
         rotary_positions = positions if logical_positions is None else logical_positions
-        cos, sin = self._rotary_angles(rotary_positions, packed)
+        cos, sin = self._rotary_angles(rotary_positions, query)
         store = append.store
-
-        def weight(norm) -> jax.Array:
-            scale = norm.get_variable('params', 'scale')
-            return (1.0 + scale) if self.scale_offset else scale
-
         key_cache, value_cache, folded = decode_prologue.decode_prologue(
-            packed.reshape(B, heads + 2 * kv_heads, head_dim), weight(self.q_norm), weight(self.k_norm),
-            cos[:, 0], sin[:, 0], positions[:, 0], store._get("cached_key"), store._get("cached_value"),
-            heads=heads, epsilon=self.norm_eps, scale_after_cast=self.scale_after_cast)
+            query[:, 0], key[:, 0], value[:, 0], cos[:, 0], sin[:, 0], positions[:, 0],
+            store._get("cached_key"), store._get("cached_value"))
         store._put("cached_key", key_cache)
         store._put("cached_value", value_cache)
         key, value = store.read()

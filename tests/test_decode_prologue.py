@@ -6,7 +6,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.nn.attention import rms_normalized
 from dew.nn.kernels import decode_prologue
 from dew.nn.kv_cache import write_cache
 from dew.nn.rope import apply_rotary, rotary_freqs
@@ -14,16 +13,11 @@ from dew.nn.rope import apply_rotary, rotary_freqs
 ROWS, SLOTS, HEADS, KV, DIM = 8, 32, 4, 2, 32
 
 
-def unfused(packed, q_weight, k_weight, cos, sin, slots, key_cache, value_cache, scale_after_cast):
+def unfused(query, key, value, cos, sin, slots, key_cache, value_cache):
     """The XLA steps the kernel replaces, as the attention's unfused decode runs them."""
-    def norm(x, weight):
-        return rms_normalized(x, weight, 1e-6, jnp.bfloat16, False, scale_after_cast, True)  # noqa: FBT003
-
-    query = norm(packed[:, None, :HEADS], q_weight)
-    key = norm(packed[:, None, HEADS:HEADS + KV], k_weight)
-    query, key = (apply_rotary(x, cos[:, None], sin[:, None]) for x in (query, key))
+    query, key = (apply_rotary(x[:, None], cos[:, None], sin[:, None]) for x in (query, key))
     key_cache = write_cache(key_cache, key, slots[:, None])
-    value_cache = write_cache(value_cache, packed[:, None, HEADS + KV:], slots[:, None])
+    value_cache = write_cache(value_cache, value[:, None], slots[:, None])
     return key_cache, value_cache, query[:, 0].reshape(ROWS, KV, HEADS // KV, DIM).transpose(0, 2, 1, 3)
 
 
@@ -31,36 +25,32 @@ CUDA = pytest.mark.skipif(jax.default_backend() != "gpu", reason="the kernel is 
 
 
 @CUDA
-@pytest.mark.parametrize("scale_after_cast", [True, False])
-@pytest.mark.parametrize("weight_dtype", [jnp.bfloat16, jnp.float32])
-def test_the_kernel_writes_and_folds_what_the_unfused_steps_do(scale_after_cast, weight_dtype):
-    """Norms, rotation, both cache writes and the GQA fold, bitwise the XLA
-    steps', for either side of the norm's cast and either weight dtype; a
-    row at slot -1 stores nothing."""
+def test_the_kernel_writes_and_folds_what_the_unfused_steps_do():
+    """Rotation, both cache writes and the GQA fold, bitwise the XLA steps';
+    a row at slot -1 stores nothing."""
     rng = np.random.default_rng(0)
     spread = rng.lognormal(0, 1, (ROWS, 1, 1))
-    packed = jnp.asarray(rng.normal(size=(ROWS, HEADS + 2 * KV, DIM)) * spread, jnp.bfloat16)
-    q_weight, k_weight = (jnp.asarray(rng.uniform(0.3, 2.0, DIM), weight_dtype) for _ in range(2))
+    query, key, value = (jnp.asarray(rng.normal(size=(ROWS, heads, DIM)) * spread, jnp.bfloat16)
+                         for heads in (HEADS, KV, KV))
     slots = jnp.asarray([3, -1, 0, 31, 7, 7, 12, -1], jnp.int32)
     cos, sin = rotary_freqs(jnp.maximum(slots, 0)[:, None], DIM, 1e6, dtype=jnp.float32)
     cos, sin = cos[:, 0], sin[:, 0]
     caches = [jnp.asarray(rng.normal(size=(ROWS, SLOTS, KV, DIM)), jnp.bfloat16) for _ in range(2)]
 
-    want = jax.jit(unfused, static_argnums=8)(
-        packed, q_weight, k_weight, cos, sin, slots, *caches, scale_after_cast)
-    got = jax.jit(lambda *args: decode_prologue.decode_prologue(
-        *args, heads=HEADS, epsilon=1e-6, scale_after_cast=scale_after_cast))(
-        packed, q_weight, k_weight, cos, sin, slots, *caches)
+    want = jax.jit(unfused)(query, key, value, cos, sin, slots, *caches)
+    got = jax.jit(decode_prologue.decode_prologue)(query, key, value, cos, sin, slots, *caches)
     for expected, actual in zip(want, got, strict=True):
         np.testing.assert_array_equal(np.asarray(actual).view(np.uint16),
                                       np.asarray(expected).view(np.uint16))
 
 
 def test_the_kernel_takes_power_of_two_blocks_only():
-    """Triton's blocks are powers of two: Qwen3-0.6B's 16 + 2 x 8 heads fit, a
-    48-head packing does not and keeps the unfused steps."""
+    """Triton's blocks are powers of two: Qwen3-0.6B's and 1.7B's 16 query
+    heads over 8 fit, and so do Qwen3-4B's 32 over 8; 40 heads or a 96-wide
+    head keep the unfused steps."""
     assert decode_prologue.fits(16, 8, 128)
-    assert not decode_prologue.fits(32, 8, 128)
+    assert decode_prologue.fits(32, 8, 128)
+    assert not decode_prologue.fits(40, 8, 128)
     assert not decode_prologue.fits(16, 8, 96)
 
 
@@ -96,7 +86,6 @@ def test_a_served_decoder_takes_the_fused_step_with_the_same_draws(monkeypatch):
             server.run()
             return [ticket.result().host() for ticket in tickets]
 
-    monkeypatch.setattr(decode_prologue, "ADOPTED", True)
     calls = []
     original = decode_prologue.decode_prologue
     monkeypatch.setattr(decode_prologue, "decode_prologue",
