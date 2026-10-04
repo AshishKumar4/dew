@@ -2408,6 +2408,22 @@
     }
    ]
   },
+  "muonclip/megatron.npz": {
+   "tool": "tools/muonclip_reference.py",
+   "sources": [
+    {
+     "repo": "NVIDIA/Megatron-LM",
+     "version": "4b4acac9a1d28ea6829c8d4f566d75698a21249d",
+     "runs": "fetched"
+    },
+    {
+     "repo": "pytorch/pytorch",
+     "version": "2.14.0",
+     "runs": "torch"
+    }
+   ],
+   "note": "Executes Megatron Core core_v0.19.2's SelfAttention.clip_qk and _clip_linear_qkv as published on a stand-in layer whose fused linear_qkv holds Dew-layout query, key and value kernels, grouped-query and multi-head, in float32 and float64."
+  },
   "native_diffusion_edges.tar.xz": {
    "tool": "tools/native_diffusion_edges_reference.py",
    "sources": [
