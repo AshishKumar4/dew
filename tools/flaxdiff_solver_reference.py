@@ -1,4 +1,4 @@
-"""FlaxDiff's RK4 and multistep samplers, for tests/fixtures/flaxdiff/solvers.npz.
+"""FlaxDiff's RK4 and multistep samplers, for tests/fixtures/flaxdiff_solvers/solvers.npz.
 
 Dew's `RK4` and `MultiStepDPM` are FlaxDiff's `RK4Sampler` and
 `MultiStepDPM`. The reference is AshishKumar4/FlaxDiff at a pinned commit:
@@ -36,7 +36,7 @@ from flax import struct
 jax.config.update("jax_enable_x64", val=True)
 
 COMMIT = "15c55b001304604147a2a8002a76cf5d4c32092f"
-FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "flaxdiff" / "solvers.npz"
+FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "flaxdiff_solvers" / "solvers.npz"
 STEPS, SIGMA_MAX, RHO, SIGMA_DATA = 12, 80.0, 7.0, 0.5
 SAMPLERS = {"rk4": ("rk4_sampler.py", "RK4Sampler"), "multistep": ("multistep_dpm.py", "MultiStepDPM")}
 

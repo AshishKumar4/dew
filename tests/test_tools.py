@@ -26,6 +26,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = REPO_ROOT / "tests" / "fixtures"
+CLAIMS = json.loads((FIXTURES / "provenance.json").read_text())["references"]
 
 # The existing family parity contracts, not bounds fitted to a CI CPU:
 # test_moe.py (routers and expert sums), test_text_encoders.py (tiny towers),
@@ -79,13 +80,16 @@ def assert_fixture_arrays(written: Path, committed: Path, numerical: dict[str, f
                 np.testing.assert_array_equal(actual, expected, err_msg=name)
 
 
-def assert_fixture_files(written: Path, committed: Path) -> None:
+def assert_fixture_files(written: Path, committed: Path, tool: str) -> None:
+    """The generator's listing against a directory provenance.json gives it
+    whole, which test_fixture_provenance keeps every other writer out of."""
+    assert CLAIMS.get(committed.relative_to(FIXTURES).as_posix(), {}).get("tool") == f"tools/{tool}.py"
     assert {p.name for p in written.iterdir() if p.is_file()} == {
         p.name for p in committed.iterdir() if p.is_file()}
 
 
-def assert_fixture_json(written: Path, committed: Path) -> None:
-    assert_fixture_files(written, committed)
+def assert_fixture_json(written: Path, committed: Path, tool: str) -> None:
+    assert_fixture_files(written, committed, tool)
     for path in committed.glob("*.json"):
         assert json.loads((written / path.name).read_text()) == json.loads(path.read_text()), path.name
 
@@ -109,7 +113,7 @@ def test_moe_fixtures_are_what_the_generator_writes(tmp_path):
     load("moe_reference").main(["--out", str(tmp_path)])
 
     committed = FIXTURES / "moe"
-    assert_fixture_json(tmp_path, committed)
+    assert_fixture_json(tmp_path, committed, "moe_reference")
     for name, outputs in MOE_OUTPUTS.items():
         assert_fixture_arrays(tmp_path / name, committed / name, outputs)
 
@@ -146,7 +150,7 @@ def test_clip_tiny_fixture_is_what_the_generator_writes(tmp_path):
     load("clip_reference").write_tiny(tmp_path)
 
     committed = FIXTURES / "clip" / "tiny"
-    assert_fixture_json(tmp_path, committed)
+    assert_fixture_json(tmp_path, committed, "clip_reference")
     assert_same_tensors(tmp_path / "model.safetensors", committed / "model.safetensors")
     assert_fixture_arrays(tmp_path / "reference.npz", committed / "reference.npz", CLIP_OUTPUTS)
 
@@ -160,7 +164,7 @@ def test_t5_tiny_fixture_is_what_the_generator_writes(tmp_path):
     load("t5_reference").main(["--out", str(tmp_path)])
 
     written, committed = tmp_path / "tiny", FIXTURES / "t5" / "tiny"
-    assert_fixture_json(written, committed)
+    assert_fixture_json(written, committed, "t5_reference")
     assert_same_tensors(written / "model.safetensors", committed / "model.safetensors")
     assert_fixture_arrays(written / "reference.npz", committed / "reference.npz", T5_OUTPUTS)
 
@@ -174,7 +178,7 @@ def test_vae_tiny_fixture_is_what_the_generator_writes(tmp_path):
     load("vae_reference").main(["--out", str(tmp_path)])
 
     written, committed = tmp_path / "sd3-tiny", FIXTURES / "vae" / "sd3-tiny"
-    assert_fixture_json(written, committed)
+    assert_fixture_json(written, committed, "vae_reference")
     assert_same_tensors(written / "diffusion_pytorch_model.safetensors",
                         committed / "diffusion_pytorch_model.safetensors")
     assert_fixture_arrays(written / "reference.npz", committed / "reference.npz", VAE_OUTPUTS)
@@ -221,7 +225,7 @@ def test_flaxdiff_fixture_is_what_the_generator_writes(tmp_path, architecture, c
                     "--flaxdiff-path", str(source), "--architecture", architecture,
                     "--out", str(written)], check=True)
 
-    assert_fixture_files(written, committed)
+    assert_fixture_files(written, committed, "flaxdiff_reference")
     actual = json.loads((written / "config.json").read_text())
     expected = json.loads((committed / "config.json").read_text())
     # jax_version records the generating environment, not the fixture's recipe.
