@@ -1726,6 +1726,22 @@
    ],
    "note": "--fixture --family opt."
   },
+  "hf/packed_cached.npz": {
+   "tool": "tools/hf_packed_cached_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.16.1",
+     "runs": "transformers"
+    },
+    {
+     "repo": "pytorch/pytorch",
+     "version": "2.14.0",
+     "runs": "torch"
+    }
+   ],
+   "note": "LlamaForCausalLM and MistralForCausalLM (eager) on the committed llama-tiny and mistral-tiny: packed rows by position_ids with transformers' own packed mask, and cached decoding past the sliding window; float32 and float64 (widened, softmax widened)."
+  },
   "hf/qwen2-tiny/logits.npy": {
    "tool": "tools/hf_reference.py",
    "sources": [
