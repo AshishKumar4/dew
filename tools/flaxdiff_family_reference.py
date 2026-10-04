@@ -189,13 +189,31 @@ def walk(case: str, params, inputs, probe, *, wide: bool) -> dict[str, np.ndarra
     return {key: np.asarray(value) for key, value in arrays.items()}
 
 
+def first_convolution_on_one_cpu():
+    """Run the process's first convolution with every thread on the lowest
+    CPU it may use. On a CPU with performance and efficiency cores, XLA's
+    float32 convolution rounds one of two ways for the rest of the process,
+    by the core type that ran its first one (openxla/xla#50022: the
+    contraction's blocking follows that core's cache sizes), which made
+    the Unet cases' float32 walk differ between regenerations."""
+    allowed = os.sched_getaffinity(0)
+    for tid in os.listdir("/proc/self/task"):
+        os.sched_setaffinity(int(tid), {min(allowed)})
+    ones = jnp.ones((1, 4, 4, 2), jnp.float32)
+    jax.lax.conv_general_dilated(ones, jnp.ones((3, 3, 2, 2), jnp.float32), (1, 1), "SAME",
+                                 dimension_numbers=("NHWC", "HWIO", "NHWC")).block_until_ready()
+    for tid in os.listdir("/proc/self/task"):  # the backend's threads too, started under the pin
+        os.sched_setaffinity(int(tid), allowed)
+
+
 def main():
     if len(sys.argv) != 2:
         raise SystemExit(__doc__)
-    # One thread and no XNNPACK, before JAX's first call: otherwise the
-    # CPU's float32 walk of the Unet rounds differently from run to run.
+    # One thread and no XNNPACK, before JAX's first call: a reduction split
+    # over threads can sum in another order from call to call.
     os.environ["XLA_FLAGS"] = (os.environ.get("XLA_FLAGS", "") + " --xla_cpu_use_xnnpack=false"
                                " --xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1")
+    first_convolution_on_one_cpu()
     arrays: dict[str, np.ndarray] = {}
     rng = np.random.default_rng(SEED)
     for case, (_, _, _, image_shape, text_shape) in CASES.items():
