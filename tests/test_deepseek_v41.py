@@ -2,8 +2,9 @@
 
 deepseek-v41-tiny comes from tools/deepseek_v41_reference.py: the release's
 inference/model.py at dba1be0a (DeepSeek-V4.1-Flash) run in fp32 over the
-torch stand-ins for its kernels, whose quantizers match the tilelang kernels
-bit for bit on bf16 input (`--check-kernels`). The architecture outputs are
+torch stand-ins for its kernels. kernels.npz holds the release's own tilelang
+kernels' outputs (`--kernels`, on a GPU), which Dew's quantizers and the
+stand-ins are held to bit for bit on bf16 input. The architecture outputs are
 taken with the quantizers off and repeated with them on (`qat_*`), and every
 quantizer and top-k call of both forwards is recorded. reference_f64.npz is
 the same run widened to fp64 (`--fp64`), the truth Dew and the reference are
@@ -32,6 +33,7 @@ from pathlib import Path
 import flax
 import jax
 import jax.numpy as jnp
+import ml_dtypes
 import numpy as np
 import pytest
 from flax.traverse_util import flatten_dict, unflatten_dict
@@ -62,6 +64,13 @@ ROOT = Path(__file__).parent / "fixtures" / "hf"
 TINY = ROOT / "deepseek-v41-tiny"
 RELEASED = ROOT / "deepseek-v41-flash"
 TRUTH = np.load(TINY / "reference_f64.npz")
+KERNELS = TINY / "kernels.npz"
+# kernels.npz's quantizer outputs by the Dew quantizer each is.
+KERNEL_QUANTIZERS = {
+    "fp8_32_ue8m0": lambda v: fake_quant_fp8(v, 32),
+    "fp4_16_e4m3": lambda v: fake_quant_fp4(v, 16, e4m3_scale=True),
+    "fp4_32_e8m0": lambda v: fake_quant_fp4(v, 32, e4m3_scale=False),
+}
 # float64 rounds 2**-29 times as finely as float32, so the reference's
 # arithmetic run in float64 lies that much closer to the truth than in fp32;
 # a float64 twin and the truth are two such runs, each carrying that rounding.
@@ -131,11 +140,81 @@ def rounding(name: str) -> float:
                     else np.load(TINY / "reference.npz")[name], TRUTH[name])
 
 
+def kernel_outputs() -> dict[str, np.ndarray]:
+    with np.load(KERNELS) as loaded:
+        return dict(loaded)
+
+
 def test_the_quantizers_round_as_the_release_kernels():
     """FP8 over 32 channels under power-of-two scales, FP4 over 16 under E4M3
     scales and over 32 under power-of-two scales, bit for bit against the
-    kernels' torch stand-ins (signed zeros included), ties, all-zero blocks
-    and saturation included, compiled, on whichever backend runs the test."""
+    release's tilelang kernels on bf16 rows over nine magnitude decades (an
+    all-zero block and saturating E4M3 scales among them) and on every E2M1
+    tie, compiled, on whichever backend runs the test."""
+    kernels = kernel_outputs()
+    for label in ("quant", "ties"):
+        x = jnp.asarray(kernels[f"{label}/input"].view(ml_dtypes.bfloat16))
+        for name, quantize in KERNEL_QUANTIZERS.items():
+            # under jit, where XLA GPU would delete a convert-pair rounding
+            actual = np.asarray(jax.jit(quantize)(x)).view(np.int16)
+            np.testing.assert_array_equal(actual, kernels[f"{label}/{name}"], err_msg=f"{label} {name}")
+
+
+def test_the_kernel_stand_ins_compute_what_the_release_kernels_do():
+    """The torch stand-ins the reference runs the release's model.py over
+    (tools/deepseek_v41_kernels.py) against the tilelang kernels' outputs:
+    the quantizers bit for bit; sparse_attn, whose stand-in keeps its
+    probabilities in fp32 where the kernel rounds them to bf16 before the
+    value product, within one bf16 ulp of the kernel once that rounding is
+    taken too; and hc_split_sinkhorn within one fp32 ulp of its unit-scale
+    outputs."""
+    torch = pytest.importorskip("torch")
+    from tools import deepseek_v41_kernels as stand_ins
+
+    kernels = kernel_outputs()
+
+    def tensor(name: str):
+        value = torch.from_numpy(kernels[name])
+        return value.view(torch.bfloat16) if value.dtype == torch.int16 else value
+
+    calls = {
+        "fp8_32_ue8m0": lambda v: stand_ins.act_quant(v, 32, "ue8m0", None, inplace=True),
+        "fp4_16_e4m3": lambda v: stand_ins.fp4_act_quant(v, 16, inplace=True,
+                                                         scale_dtype=torch.float8_e4m3fn),
+        "fp4_32_e8m0": lambda v: stand_ins.fp4_act_quant(v, 32, inplace=True),
+    }
+    for label in ("quant", "ties"):
+        for name, quantize in calls.items():
+            ours = quantize(tensor(f"{label}/input").clone()).view(torch.int16).numpy()
+            np.testing.assert_array_equal(ours, kernels[f"{label}/{name}"], err_msg=f"{label} {name}")
+
+    q, kv, sink, idx = (tensor(f"sparse_attn/{part}") for part in ("q", "kv", "sink", "idx"))
+    scale = q.shape[-1] ** -0.5
+    theirs = tensor("sparse_attn/out").float()
+    batch = torch.arange(q.size(0))[:, None, None]
+    keys = kv[batch, idx.clamp_min(0).long()].float()
+    logits = torch.einsum("bmhd,bmkd->bmhk", q.float(), keys) * scale
+    logits = logits.masked_fill(~(idx >= 0)[:, :, None, :], float("-inf"))
+    peak = logits.amax(-1, keepdim=True).clamp_min(-1e30)
+    weights = torch.exp(logits - peak)
+    total = weights.sum(-1, keepdim=True) + torch.exp(sink.float()[None, None, :, None] - peak)
+    rounded = (torch.einsum("bmhk,bmkd->bmhd", weights.bfloat16().float(), keys) / total).bfloat16().float()
+    ulp = torch.exp2(torch.floor(torch.log2(theirs.abs().clamp_min(2 ** -126))) - 7)
+    assert int(((rounded - theirs).abs() > ulp).sum()) == 0
+    port = stand_ins.sparse_attn(q, kv, sink, idx, scale).float()
+    assert torch.equal(port[0, 0], theirs[0, 0])  # nothing to attend
+
+    split = stand_ins.hc_split_sinkhorn(*(tensor(f"sinkhorn/{part}") for part in ("mixes", "scale", "base")),
+                                        4, 20, 1e-6)
+    for part, ours in zip(("pre", "post", "comb"), split, strict=True):
+        assert float((ours - tensor(f"sinkhorn/{part}")).abs().max()) <= 2 ** -23, part
+
+
+def test_the_quantizers_round_fp32_input_as_the_stand_ins():
+    """The kernels take bf16 only, so on fp32 input the stand-ins, held to
+    the kernels on bf16 above, define the rounding: Dew's quantizers match
+    them bit for bit (signed zeros included), ties, all-zero blocks and
+    saturation included, compiled."""
     torch = pytest.importorskip("torch")
     from tools import deepseek_v41_kernels as kernels
 
@@ -158,7 +237,6 @@ def test_the_quantizers_round_as_the_release_kernels():
         ),
     ):
         expected = torch_quant(torch.from_numpy(x.copy())).numpy()
-        # under jit, where XLA GPU would delete a convert-pair rounding
         actual = np.asarray(jax.jit(jax_quant)(jnp.asarray(x)))
         np.testing.assert_array_equal(actual.view(np.uint32), expected.view(np.uint32))
 
@@ -193,7 +271,7 @@ def test_every_quantizer_and_top_k_input_is_as_exact_as_the_reference(source, fo
 def test_a_quotient_on_an_e2m1_tie_rounds_to_even_under_an_e4m3_scale():
     """Amax 0.71875 gives the E4M3 scale 0.1171875, and -0.146484375 over it
     is the tie -1.25, which rounds to the even -1.0: the release's tilelang
-    kernel stores -0.1171875 there (on an RTX 4080). Multiplied by the scale's
+    kernel stores -0.1171875 there (in kernels.npz). Multiplied by the scale's
     reciprocal, as XLA rewrites a division by a broadcast, the quotient is
     -1.2500001 and rounds to -1.5."""
     x = jnp.asarray([[0.71875, -0.146484375] + [0.0] * 14], jnp.bfloat16)
