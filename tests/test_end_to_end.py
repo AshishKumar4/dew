@@ -128,7 +128,7 @@ def test_a_step_moves_the_running_statistics_and_the_task_decodes_with_them():
                          jax.tree.leaves(state.variables["params"][AUTOENCODER]), strict=True):
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
     np.testing.assert_allclose(np.asarray(published.autoencoder.latent_scale),
-                               1 / np.sqrt(np.asarray(after["var"]) + 1e-4), rtol=1e-6)
+                               1 / np.sqrt(np.asarray(after["var"])), rtol=1e-6)
 
 
 SIDE, LATENT, PATCH, WIDTH, FEATURES, PROJECTOR, DROPOUT = 32, 4, 2, 12, 6, 10, 0.1
@@ -248,7 +248,9 @@ def test_a_step_is_train_repae_s_step(tmp_path):
     the projector's are half the SiT update's, as Dew's L2 halves the
     denoising error and REPA's term with it; each network's is held to the
     reference by the float64 rule, the running statistics too, and the loss
-    and its terms within 1e-6 of the reference's float64 run."""
+    and its terms within 1e-6 of the reference's float64 run. The tuned
+    autoencoder a run then decodes with takes the latent scale and bias of
+    REPA-E's `extract_latents_stats`, by the float64 rule too."""
     with tarfile.open(FIXTURES / "tiny_diffusers.tar.xz") as archive:
         archive.extractall(tmp_path, filter="data")
     alignment = Alignment(Representation(), {"params": {"Conv_0": module("representation")}}, "block_0",
@@ -300,6 +302,12 @@ def test_a_step_is_train_repae_s_step(tmp_path):
     for term in ("alignment", "autoencoder_alignment", "reconstruction", "kl"):
         np.testing.assert_allclose(float(aux.metrics[term]), STEPPED[f"loss/{term}_f64"], rtol=1e-6,
                                    err_msg=term)
+    decoder, _ = task.published_autoencoder({**variables, "params": params, LATENT_STATS: statistics})
+    assert decoder is not None
+    want, exact = (np.concatenate([STEPPED[f"latents/latents_{name}{tail}"] for name in ("scale", "bias")])
+                   for tail in ("", "_f64"))
+    assert_as_exact_as_the_reference(np.concatenate([decoder.latent_scale, decoder.latent_shift]), want,
+                                     exact, "the latent scale and bias")
 
 
 def test_end_to_end_needs_alignment_and_a_kl_autoencoder():

@@ -65,12 +65,15 @@ class EndToEnd:
     def tuned(self, autoencoder: AutoEncoder, variables: Variables) -> tuple[AutoEncoder, Variables]:
         """The autoencoder a task over a tuned run's `variables` decodes with,
         and the variables with its weights under `autoencoder`: the trained
-        weights at `params/autoencoder`, its latents normalized by the
-        running statistics."""
+        weights at `params/autoencoder`, its latents shifted by the running
+        mean and scaled by the running variance's reciprocal square root,
+        without the batch norm's epsilon, as REPA-E's
+        `SiT.extract_latents_stats` gives the scale its sampling
+        denormalizes with."""
         tuned = copy.copy(autoencoder)
         statistics = variables[LATENT_STATS]
         tuned.latent_shift = statistics["mean"]
-        tuned.latent_scale = 1.0 / jnp.sqrt(statistics["var"] + self.epsilon)
+        tuned.latent_scale = jax.lax.rsqrt(statistics["var"])
         tuned.params = variables["params"][AUTOENCODER]
         return tuned, {**variables, "autoencoder": tuned.params}
 
