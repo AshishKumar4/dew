@@ -1170,6 +1170,29 @@ five traces 76.0, one 838 on a host load spike); what is left is mostly the
 traced client's own keys. Evidence:
 `~/.cache/dew/verification-evidence/serving-idle/`.
 
+Several decode iterations a device call (`decode_steps`), measured after
+that change, 2026-10-03: slower at every slot count, and with nothing left
+to gain. Tokens a second, RTX 4080, admission 8 rows, medians of five runs,
+vLLM from the table above:
+
+| slots | vLLM | 1 | 2 | 4 | 8 |
+|---:|---:|---:|---:|---:|---:|
+| 32 | 6049 | 5726 | 5696 | 5500 | 5106 |
+| 64 | 7614 | 7216 | 7271 | 6975 | 6573 |
+| 128 | 9047 | 8527 | 8357 | 7861 | 7231 |
+
+A call seats requests only before its first iteration, so filling 64 slots
+8 rows a call takes 8 calls of k iterations, and a run takes 265, 274,
+292 and 328 iterations. Seating at every iteration would at most win back
+the idle: a traced 64-slot run at one iteration a call keeps the device
+busy 2228 ms of 2242, idle 20 ms (0.9%), since the decoding step already
+replays as CUDA graphs and the host runs ahead. Seating 8k rows a call
+(the default) changes the prefill's shapes and so its GEMM kernels, and the
+tokens differ from one iteration a call; at 8 rows they are the same at 32
+and 64 slots (the log-probabilities within 9.5e-6), while at 128 the
+decoding GEMMs inside the longer program autotune to other kernels.
+Evidence: `~/.cache/dew/verification-evidence/serving-multistep/`.
+
 ## Quantized serving of the 176M text-to-image model, 2026-09-28
 
 `TextToImage.quantized` serves the denoiser with its kernels stored as int8
