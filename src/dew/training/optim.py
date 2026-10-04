@@ -213,10 +213,12 @@ def _clip_leaf(qk_stats, tau: float, path: jax.tree_util.KeyPath, update: jax.Ar
     attention being the group of one: the group's rescale is the smallest
     of its heads', tau over its largest logit, and its query heads and its
     key head each take the square root, so every logit of the group scales
-    by it. The layer sows its key-head count (`kv_heads`) beside the maxima.
-    An output-gated projection's gate half rescales with its query head.
-    Latent attention rescales per head instead, the rope slice of its
-    query by the full gamma."""
+    by it. The layer sows its key-head count (`kv_heads`) and head width
+    (`head_dim`) beside the maxima. An output-gated projection's head is its
+    query and then its gate, and the gate keeps its weights: it is no
+    logit, and the paper rescales the query and key weights alone. Latent
+    attention rescales per head instead, the rope slice of its query by the
+    full gamma."""
     names = _dict_names(path)
     if len(names) < 2 or names[-1] != 'kernel' or names[-2] not in QK_PROJECTIONS:
         return update
@@ -251,18 +253,20 @@ def _clip_leaf(qk_stats, tau: float, path: jax.tree_util.KeyPath, update: jax.Ar
                 "a latent key projection needs its layer's 'qk_nope'")
         return _rescaled_update(
             update, param, _mla_key_gamma(scale, nope, last // heads), heads)
-    kv_heads = _sown(node, 'kv_heads')
-    if kv_heads is None:
+    kv_heads, head_dim = _sown(node, 'kv_heads'), _sown(node, 'head_dim')
+    if kv_heads is None or head_dim is None:
         raise ValueError(
-            f"QK-Clip reaches {'.'.join(names)} with no key-head count sowed; "
-            "a query or key projection needs its layer's 'kv_heads'")
+            f"QK-Clip reaches {'.'.join(names)} with no key-head count or head width "
+            "sowed; a query or key projection needs its layer's 'kv_heads' and 'head_dim'")
     # Query head h is in group h // (heads / kv_heads), the grouping the
     # kernels repeat the keys over, and group g's rescale lands at index g.
     # `kv_heads` stays a traced value, so only the shapes are static.
     groups = jnp.arange(heads) // (heads // kv_heads)
     grouped = jax.ops.segment_min(scale, groups, num_segments=heads)
     if proj in ('q_proj', 'q_b_proj'):
-        return _rescaled_update(update, param, jnp.sqrt(grouped[groups])[:, None], heads)
+        query = jnp.arange(last // heads)[None, :] < head_dim
+        gamma = jnp.where(query, jnp.sqrt(grouped[groups])[:, None], jnp.ones((), scale.dtype))
+        return _rescaled_update(update, param, gamma, heads)
     columns = jnp.arange(last) // (last // kv_heads)
     return _rescaled_update(update, param, jnp.sqrt(grouped[columns])[None], 1)
 
