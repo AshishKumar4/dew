@@ -469,6 +469,7 @@ class CausalSelfAttention(nn.Module):
                 and layout.key_rotation(self.head_dim) is None and self.attention_impl in ('auto', 'cudnn')
                 and not self.is_mutable_collection("qk")
                 and self.has_variable("cache", "cached_key")
+                and decode_prologue.ADOPTED
                 and decode_prologue.fits(self.num_heads, self.num_kv_heads, self.head_dim))
 
     def _fused_decode(self, packed, logical_positions, attention_metadata: AttentionMetadata | None,
