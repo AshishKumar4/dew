@@ -378,8 +378,10 @@ class KVStore:
         for name, incoming in (("cached_key", key), ("cached_value", value)):
             pool = self._get(name)
             # Mapped over a group of one, as `_written` writes: unmapped, under
-            # --xla_gpu_deterministic_ops on an RTX 4080 (jax 0.11.2) this
-            # scatter wrote another token's keys at a kept slot.
+            # --xla_gpu_deterministic_ops (jax 0.11.2) a dropped token's keys
+            # landed at another head's kept slot, the implicit-dimension case
+            # openxla/xla#49498 fixes (issue #49380), after the jax pin. A jax
+            # bump past that fix can write unmapped, as `write_tokens` does.
             written = jax.vmap(stored, in_axes=(1, 0, 0, 0), out_axes=1)(
                 pool[:, None], page[None], offset[None], incoming.astype(pool.dtype)[None])
             self._put(name, written[:, 0])

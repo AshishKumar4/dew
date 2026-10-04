@@ -1482,9 +1482,12 @@ slots, all at bf16 near-ties.
 
 Under `--xla_gpu_deterministic_ops` (the CUDA test lane's flag) the paged
 write, a scatter into the pool's page and offset axes past an unindexed
-head axis, wrote another token's keys at a kept slot (jax 0.11.2, an RTX
-4080). Mapped over a group of one, as the paged cache's other write is, it
-does not, so `KVStore.write_tokens` writes that way.
+head axis, put a dropped token's keys at another head's kept slot (jax
+0.11.2, an RTX 4080): the expander's out-of-range rows were padded with 0
+on the unindexed axis, so a window offset along it collided with a kept
+index. openxla/xla#49498 fixes it (issue #49380), after the jax pin. Mapped
+over a group of one, as the paged cache's other write is, the scatter is
+right, so `KVStore.write_tokens` writes that way.
 
 Open: latent attention (MLA, DSA), sliding windows, sinks, quantized or
 rotated caches, a pool split into groups, hybrids whose recurrent layers
