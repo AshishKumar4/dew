@@ -1152,8 +1152,9 @@ Measured and not adopted, each under 1% of the run:
 
 What remains is the small kernels vLLM fuses, at most about 1.5% of the
 run by the launches a fused add and norm would save, and the idle between
-steps. Evidence:
-`~/.cache/dew/verification-evidence/serving-gap-final/`.
+steps. The rates are `tools/benchmark_lm_serving.py`'s; the traces are one
+measured run each, Dew's under `dew.Profiler` and vLLM's under Nsight
+Systems with `--cuda-graph-trace=node`, kernel time summed by family.
 
 The idle between steps, 2026-10-03. Two host costs left the device waiting.
 A request's key took three small programs to make at submission (the seed
@@ -1185,8 +1186,8 @@ apart from the decoding one), so a cold server's start is unchanged:
 alternating rounds, 34.9 and 35.5 s before, 38.7 and 35.2 after. A
 traced 64-slot run idles 74.7-83.2 ms before and 40.9-42.1 after (one of
 five traces 76.0, one 838 on a host load spike); what is left is mostly the
-traced client's own keys. Evidence:
-`~/.cache/dew/verification-evidence/serving-idle/`.
+traced client's own keys. Each trace is one measured 64-slot run of the
+benchmark's prompts under `dew.Profiler`, idle summed between kernels.
 
 Several decode iterations a device call (`decode_steps`), measured after
 that change, 2026-10-03: slower at every slot count, and with nothing left
@@ -1209,7 +1210,8 @@ replays as CUDA graphs and the host runs ahead. Seating 8k rows a call
 tokens differ from one iteration a call; at 8 rows they are the same at 32
 and 64 slots (the log-probabilities within 9.5e-6), while at 128 the
 decoding GEMMs inside the longer program autotune to other kernels.
-Evidence: `~/.cache/dew/verification-evidence/serving-multistep/`.
+Each cell is `tools/benchmark_lm_serving.py --decode-steps K --admission 8
+--generations`, its generations compared to K=1's.
 
 The decoding step's small kernels, 2026-10-03. Per 64-slot decode step on
 the RTX 4080 Dew's device spends 8.39 ms to vLLM's about 8.05: GEMMs 3.37
@@ -1234,7 +1236,9 @@ storing the step's logits at all lets XLA fuse that rounding into the
 draw, 27 us more, but the draw's log-softmax then sums in another order:
 at 32 slots 430 log-probabilities move by up to 3.8e-6, so the step still
 stores them.
-Evidence: `~/.cache/dew/verification-evidence/serving-kernels/`.
+The attribution traces a run under `dew.Profiler` with command buffers off
+(`--xla_gpu_enable_command_buffer=`) and the optimized HLO dumped, and
+names each kernel by its `hlo_op` there.
 
 The head's bf16 rounding, 2026-10-03. The logits are bf16 values held in
 fp32 (`dew.nn.precision.head_product`), and `rounded_to`'s reduce-precision
@@ -1251,8 +1255,10 @@ went from 1.145 to 0.981 ms at 128 rows of Qwen3-0.6B's widths, and the
 serving run's device busy time from 2211.0 to 2198.5 ms at 64 slots and from
 3803.5 to 3768.7 ms at 128 (two traced runs each). Training's loss head
 rounds its tiles itself (`dew.objectives.lm.chunked`) and other platforms
-keep `rounded_to`. Evidence:
-`~/.cache/dew/verification-evidence/serving-held-logits/`.
+keep `rounded_to`. The bits are
+`tests/test_precision_policy.py::test_bf16_logits_round_as_rounded_to_and_are_held_as_bf16_under_cuda`
+and `tools/benchmark_lm_serving.py --generations` on each tree; busy time is
+one traced run under `dew.Profiler`.
 
 A fused decode prologue, measured and removed. XLA runs a layer's q and k
 norms, the rotated key's scatter into the cache, the value's, and the
@@ -1276,8 +1282,8 @@ saved 3 of the 5 kernels: the device's busy time per 64-slot run went from
 2211 to 2186 ms, and the Pallas call fell outside XLA's default CUDA
 command buffers, which then needed `CUSTOM_CALL` in the decoding step's
 options or the run idled 200 ms more. Under 1% for a kernel on a backend
-JAX 0.11 deprecates was not worth keeping, so it was removed. Evidence:
-`~/.cache/dew/verification-evidence/serving-kernels/prologue/`.
+JAX 0.11 deprecates was not worth keeping, so it was removed; the
+rotation-only kernel stays on the `perf/prologue-bitwise` branch.
 
 Where the gap sits at 128 slots, and the prefill's attention, 2026-10-03. A
 traced 128-slot run (integration `66a1848c`, command buffers off so each
@@ -1310,8 +1316,11 @@ repeatable, and every first divergence is a bf16 near-tie: teacher-forced
 through the fp32 model, the two chosen tokens' logits are a median 0.64
 bf16 spacings apart at their magnitude, the largest 2.78, 77% under one and
 98% under two, and the fp32 argmax is the xla prefill's choice in 31 rows
-and cuDNN's in 23. Evidence:
-`~/.cache/dew/verification-evidence/serving-prefill-cudnn/`.
+and cuDNN's in 23.
+`tests/test_causal_transformer.py::test_a_padded_prefill_attends_through_cudnn_where_it_runs`
+holds the routing. The distances apply `tests/reference_error.py`'s
+`distance` to the cache prefill and to `dew.pipeline(..., dtype="float32")`
+under `jax.default_matmul_precision("highest")` over the same tokens.
 
 The cache writes as words, 2026-10-03. XLA's scatter stores one element a
 thread, so a bf16 cache moved two bytes a store: each decode layer's key and
@@ -1325,7 +1334,8 @@ from 0.113 to 0.099 ms and admission's from 0.627 to 0.277; the served tokens
 and log-probabilities are bitwise at 32, 64 and 128 slots, and the run's
 device busy time went from 2165.6 to 2149.5 ms at 64 slots and from 3704.2
 to 3649.5 ms at 128 (two traced runs each, integration `456a4b64`).
-Evidence: `~/.cache/dew/verification-evidence/serving-cache-words/`.
+`tests/test_kv_cache.py::test_a_cache_write_moves_whole_words_with_the_same_bits`
+holds the bits.
 
 ## Quantized serving of the 176M text-to-image model, 2026-09-28
 
