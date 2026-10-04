@@ -1,18 +1,20 @@
-"""The DiT family and the UNet against FlaxDiff's own models.
+"""The DiT family and the UNets, image and video, against FlaxDiff's own models.
 
 tools/flaxdiff_family_reference.py builds tiny SimpleDiT, SimpleUDiT,
-SimpleMMDiT, HierarchicalMMDiT and Unet models from FlaxDiff's model modules
-at a pinned commit, moves every parameter off its initialization, and
-records each model's output on images, times and text states and, against a
-fixed cotangent, the gradients of the image, the text and every parameter:
-in float32 and in float64, the truth both float32 runs are measured from
-(tests/fixtures/flaxdiff/family.npz). Dew's models on the same weights and
-Fourier table are held to tests/reference_error.py's rule: no further from
-float64 than twice the float32 reference.
+SimpleMMDiT, HierarchicalMMDiT, Unet, VideoDiT and UNet3D models from
+FlaxDiff's model modules at a pinned commit, moves every parameter off its
+initialization, and records each model's output on images (or clips), times
+and text states and, against a fixed cotangent, the gradients of the image,
+the text and every parameter: in float32 and in float64, the truth both
+float32 runs are measured from (tests/fixtures/flaxdiff/family.npz). Dew's
+models on the same weights and Fourier table are held to
+tests/reference_error.py's rule: no further from float64 than twice the
+float32 reference.
 
 The DiTs average the text over every position, as FlaxDiff's do: Dew builds
 them with `text_pooling="all"`, and is handed a padded mask the pooling
-must ignore. The MM-DiTs, which pool the real tokens, get no padding.
+must ignore. The MM-DiTs and the VideoDiT, which pool the real tokens, get
+no padding.
 """
 
 import json
@@ -29,15 +31,19 @@ from dew.nn.attention import Stage
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.backbones.mmdit import HierarchicalMMDiT, SimpleMMDiT
 from dew.nn.backbones.unet import Unet
+from dew.nn.backbones.unet3d import UNet3D
 from dew.nn.backbones.uvit import SimpleUDiT
+from dew.nn.backbones.video_dit import VideoDiT
 from dew.nn.dit import TextContext
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "flaxdiff" / "family.npz"
 CASES = ("simple_dit/published", "simple_dit/variant", "simple_udit/published", "simple_udit/variant",
          "simple_mmdit/published", "simple_mmdit/variant", "hierarchical_mmdit/published",
-         "hierarchical_mmdit/variant", "unet/published", "unet/variant")
+         "hierarchical_mmdit/variant", "unet/published", "unet/variant", "video_dit/published",
+         "video_dit/variant", "unet_3d/published", "unet_3d/variant")
 MODELS = {"SimpleDiT": SimpleDiT, "SimpleUDiT": SimpleUDiT, "SimpleMMDiT": SimpleMMDiT,
-          "HierarchicalMMDiT": HierarchicalMMDiT, "Unet": Unet}
+          "HierarchicalMMDiT": HierarchicalMMDiT, "Unet": Unet, "VideoDiT": VideoDiT, "UNet3D": UNet3D}
+UNETS = ("Unet", "UNet3D")
 # FlaxDiff's SimpleUDiT holds these at its root; Dew nests them under the
 # conditioning embed and the output head.
 UDIT_MOVED = {"time_embed": ("conditioning", "time_embed"),
@@ -64,7 +70,7 @@ def dew_model(cls: str, config: dict):
         fields.update(DIT_POOLING)
     if cls == "HierarchicalMMDiT":
         fields.update({key: tuple(fields[key]) for key in ("emb_features", "num_layers", "num_heads")})
-    if cls == "Unet":
+    if cls in UNETS:
         fields["feature_depths"] = tuple(fields["feature_depths"])
         fields["attention_configs"] = tuple(None if stage is None else Stage(**stage)
                                             for stage in fields["attention_configs"])
@@ -76,7 +82,7 @@ def dew_path(cls: str, name: str) -> tuple[str, ...]:
     path = tuple(name.split("/"))
     if cls == "SimpleUDiT" and path[0] in UDIT_MOVED:
         return (*UDIT_MOVED[path[0]], *path[1:])
-    if cls == "Unet":
+    if cls in UNETS:
         # FlaxDiff's ConvLayer wraps the convolution Dew's Conv is, and its
         # middle stage projects with a 1x1 convolution where Dew's is dense.
         return tuple(PROJECTIONS.get(part, part.replace("ConvLayer_", "Conv_")) for part in path
@@ -96,7 +102,7 @@ def from_dew(name: str, value: np.ndarray) -> np.ndarray:
 
 
 def fourier_path(cls: str) -> tuple[str, ...]:
-    return ("FourierEmbedding_0",) if cls == "Unet" else ("conditioning", "time_embed", "layers_0")
+    return ("FourierEmbedding_0",) if cls in UNETS else ("conditioning", "time_embed", "layers_0")
 
 
 def nest(flat: dict[tuple[str, ...], np.ndarray]) -> dict:

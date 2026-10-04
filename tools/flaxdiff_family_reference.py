@@ -4,12 +4,13 @@
 FlaxDiff (github.com/AshishKumar4/FlaxDiff) is the project Dew grew out of.
 Its model modules, fetched at commit 15c55b001304604147a2a8002a76cf5d4c32092f
 and checked against their SHA-256, build tiny SimpleDiT, SimpleUDiT,
-SimpleMMDiT, HierarchicalMMDiT and Unet models whose every parameter is moved
-off its initialization (and rounded to bfloat16-representable values, so the
-fixture compresses). The tool records each model's output on images, times
-and text states and, against a fixed cotangent, the gradients of the image,
-the text and every parameter: once in float32 and once in float64, the truth
-tests/reference_error.py measures both from.
+SimpleMMDiT, HierarchicalMMDiT, Unet, VideoDiT and UNet3D models whose every
+parameter is moved off its initialization (and rounded to bfloat16-
+representable values, so the fixture compresses). The tool records each
+model's output on images (or clips), times and text states and, against a
+fixed cotangent, the gradients of the image, the text and every parameter:
+once in float32 and once in float64, the truth tests/reference_error.py
+measures both from.
 
 The float64 walk runs a second copy of the same files with every
 `jnp.float32` reading `jnp.float64` (FlaxDiff pins its Fourier frequencies,
@@ -28,10 +29,13 @@ Cases, two per model:
 - `published`: the constructor's defaults, narrowed (raster scan, no
   qk-norm, MLP ratio 4; the Unet with attention at every level);
 - `variant`: the other paths: a zigzag or Hilbert scan, qk-norm, MLP ratio
-  2, odd head counts, a rectangular image, three hierarchy stages, and a
-  Unet with a level without attention, RMS norms, and stages that project
+  2, odd head counts, a rectangular image, three hierarchy stages, and
+  UNets with a level without attention, RMS norms, and stages that project
   in and out and run the full self, cross and feed-forward block (whose
   middle stage FlaxDiff projects with 1x1 convolutions).
+
+The video models take three-frame clips in `published` and two in
+`variant`.
 
 Run with the Dew test environment, on CPU:
 
@@ -40,6 +44,7 @@ Run with the Dew test environment, on CPU:
 
 import hashlib
 import json
+import os
 import sys
 import types
 import urllib.request
@@ -64,10 +69,12 @@ FILES = {
     "simple_vit": "579d6e981142d8aab267e8e7d30ef50f90332090148b925feeda465aa17dbab6",
     "simple_dit": "c3064f67c0da98add4656ea74e3aa3dd4fbbdc52d96f053dc90c4abb44263b79",
     "simple_mmdit": "1d67ca79eb12bdb5cd4ca58994b3909a0c8c642e6073c21cfba507b2eb891a7b",
+    "video_dit": "cecd0c05fa53f2078cf5dc7fcc5e55232be3cc9bb722de43429997616d377bac",
+    "unet_3d": "ec1323014ec4cedcccac84c7dfe6af46a1dbed9bb1fd8a5a9493a4063916ea6a",
 }
 CACHE = Path.home() / ".cache" / "dew" / "upstream" / "FlaxDiff" / COMMIT
 ATTENTION = {"attention_impl": None, "force_fp32_for_softmax": False}
-# case: (module, class, config, image [H, W, C], text [tokens, width])
+# case: (module, class, config, image [(T,) H, W, C], text [tokens, width])
 CASES = {
     "simple_dit/published": ("simple_dit", "SimpleDiT", {
         "output_channels": 4, "patch_size": 2, "emb_features": 16, "num_layers": 2, "num_heads": 2,
@@ -105,6 +112,22 @@ CASES = {
                               {"heads": 4, "use_projection": True, "only_pure_attention": False}),
         "num_res_blocks": 1, "num_middle_res_blocks": 2, "norm_groups": 0, "attention_impl": None},
         (8, 8, 3), (4, 7)),
+    "video_dit/published": ("video_dit", "VideoDiT", {
+        "output_channels": 4, "patch_size": 2, "emb_features": 16, "num_layers": 1, "num_heads": 2,
+        "mlp_ratio": 4, **ATTENTION}, (3, 8, 8, 4), (5, 12)),
+    "video_dit/variant": ("video_dit", "VideoDiT", {
+        "output_channels": 3, "patch_size": 2, "emb_features": 12, "num_layers": 2, "num_heads": 3,
+        "mlp_ratio": 2, "qk_norm": True, "use_zigzag": True, **ATTENTION}, (2, 8, 12, 3), (4, 7)),
+    "unet_3d/published": ("unet_3d", "UNet3D", {
+        "output_channels": 4, "emb_features": 16, "feature_depths": (8, 16),
+        "attention_configs": ({"heads": 2}, {"heads": 2}), "num_res_blocks": 2, "num_middle_res_blocks": 1,
+        "norm_groups": 4, "temporal_heads": 2, "attention_impl": None}, (3, 8, 8, 4), (5, 12)),
+    "unet_3d/variant": ("unet_3d", "UNet3D", {
+        "output_channels": 3, "emb_features": 12, "feature_depths": (8, 8, 8),
+        "attention_configs": ({"heads": 2, "use_projection": True, "only_pure_attention": False}, None,
+                              {"heads": 4, "use_projection": True, "only_pure_attention": False}),
+        "num_res_blocks": 1, "num_middle_res_blocks": 2, "norm_groups": 0, "temporal_heads": 4,
+        "attention_impl": None}, (2, 8, 8, 3), (4, 7)),
 }
 TIMES = (-1.3, 0.9)
 SEED = 59
@@ -169,6 +192,10 @@ def walk(case: str, params, inputs, probe, *, wide: bool) -> dict[str, np.ndarra
 def main():
     if len(sys.argv) != 2:
         raise SystemExit(__doc__)
+    # One thread and no XNNPACK, before JAX's first call: otherwise the
+    # CPU's float32 walk of the Unet rounds differently from run to run.
+    os.environ["XLA_FLAGS"] = (os.environ.get("XLA_FLAGS", "") + " --xla_cpu_use_xnnpack=false"
+                               " --xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1")
     arrays: dict[str, np.ndarray] = {}
     rng = np.random.default_rng(SEED)
     for case, (_, _, _, image_shape, text_shape) in CASES.items():
