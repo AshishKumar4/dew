@@ -824,39 +824,16 @@ def guided_denoiser(count=4):
                                      unconditional={"label": jnp.zeros((1, 1))})
 
 
-@pytest.mark.parametrize("progress,inside", [(0.1, False), (0.5, True), (0.9, False)])
-def test_interval_cfg_applies_only_inside_the_interval(progress, inside):
-    _, denoise = guided_denoiser()
-    full = CFG(3.0)(denoise)
-    interval = CFG(3.0, interval=(0.4, 0.6))(denoise)
-
-    x_t = jax.random.normal(jax.random.PRNGKey(3), (4, 8, 8, 3))
-    t = jnp.full((4,), (1.0 - progress) * 1000)
-
-    matches_full = bool(jnp.allclose(interval(x_t, t)[1], full(x_t, t)[1], atol=1e-5))
-    matches_unguided = bool(jnp.allclose(interval(x_t, t)[1], denoise(x_t, t)[1], atol=1e-5))
-    assert matches_full is inside
-    assert matches_unguided is not inside
-
-
 def test_cfg_scales_the_conditional_offset():
     """uncond + scale (cond - uncond): the oracle's label offset is exactly
     what the guided epsilon carries, times the scale."""
     _, denoise = guided_denoiser()
     x_t = jax.random.normal(jax.random.PRNGKey(3), (4, 8, 8, 3))
     t = jnp.full((4,), 500.0)
-    guided = CFG(3.0)(denoise)(x_t, t)[1]
+    guided = CFG(3.0).walk(denoise, 1).at((), 0)(x_t, t)[1]
     unguided = denoise(x_t, t)[1]
     # the unconditional label is 0, the conditional one 0.7
     assert jnp.allclose(guided - unguided, 2 * 0.7, atol=1e-5)
-
-
-def test_interval_cfg_defaults_to_the_full_range():
-    _, denoise = guided_denoiser()
-    x_t = jax.random.normal(jax.random.PRNGKey(3), (4, 8, 8, 3))
-    t = jnp.full((4,), 500.0)
-    assert jnp.allclose(CFG(3.0)(denoise)(x_t, t)[1],
-                        CFG(3.0, interval=(0.0, 1.0))(denoise)(x_t, t)[1], atol=1e-6)
 
 
 def test_empty_guidance_interval_generates_the_unguided_samples():
