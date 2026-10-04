@@ -163,6 +163,33 @@ def test_inference_projection_layout_preserves_special_attention_logits(case):
         np.testing.assert_array_equal(jnp.argmax(actual, axis=-1), jnp.argmax(expected, axis=-1))
 
 
+def test_an_admitting_step_pads_to_the_fewest_rows_that_hold_its_prompts():
+    """The admitting program prefills every row it is given: a request
+    arriving alone is one row, three together are four, never the whole
+    admission of eight (`admission_share`), and each draws what it draws alone."""
+    from dew.inference.serving import admission_share
+
+    assert [admission_share(waiting, 8) for waiting in range(1, 9)] == [1, 2, 4, 4, 8, 8, 8, 8]
+    assert admission_share(5, 6) == 6
+    bound = task()
+    server = Server.from_task(bound, slots=8, capacity=128, admission=8)
+    widths, admit = [], server._admit
+
+    def recorded():
+        admission = admit()
+        widths.append(None if admission is None else admission.prompts.tokens.shape[0])
+        return admission
+
+    server._admit = recorded
+    first = server.submit(PROMPTS[0], 3, key=0)
+    server.step()
+    rest = [server.submit(prompt, 3, key=index) for index, prompt in enumerate(PROMPTS[1:4], start=1)]
+    server.run()
+    assert [width for width in widths if width] == [1, 4]
+    for index, ticket in enumerate([first, *rest]):
+        assert ticket.result().text == bound(PROMPTS[index], 3, key=index).text
+
+
 @pytest.mark.parametrize("decode_steps", [1, 4])
 def test_mixed_lengths_and_budgets_submitted_together_draw_what_each_draws_alone(decode_steps):
     """Five prompts of different widths and budgets, greedy, one seed per

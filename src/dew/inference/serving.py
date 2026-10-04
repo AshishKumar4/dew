@@ -325,6 +325,23 @@ def _seated(state: Slots, decoder: DecoderState, real: jax.Array, admission: Adm
                  place(state.automaton, fresh))
 
 
+def admission_share(waiting: int, share: int) -> int:
+    """The rows a group's share of an admitting step is padded to: the
+    smallest power of two that holds `waiting` pieces, at most `share`.
+
+    The admitting program prefills every row it is given, so padding one
+    arriving prompt to the whole admission prefilled eight. Each width is its
+    own compiled program, one per power of two. Serving Qwen3-0.6B on an RTX
+    4080 to requests arriving as a Poisson process, 32 slots at 32 a second
+    went from 3216 to 3832 tokens a second, TTFT p50 536 to 15.5 ms and the
+    p99 token gap 30.2 to 11.2 ms; 128 slots at 56 a second from 5320 to 7064,
+    2217 to 34.6 ms and 83.5 to 23.4 ms. A narrower prefill's GEMMs run at
+    other shapes, so its bits can differ from the padded one's, within
+    tests/reference_error.py's bound (docs/performance.md).
+    """
+    return min(share, 1 << max(waiting - 1, 0).bit_length())
+
+
 @dataclasses.dataclass(frozen=True)
 class Dense:
     """Admission over a dense cache: whole prompts, each into its own rows, in `groups` groups."""
@@ -1151,14 +1168,17 @@ class Server:
             waiting = pending[slot // size]
             if row.prefilled < len(row.prompt) and len(waiting) < share:
                 waiting.append((slot, row))
+        if not any(pending):
+            return None
+        # Padded to the fewest rows that hold every group's pieces, not to the
+        # whole admission: a request arriving alone prefills one row.
+        share = admission_share(max(map(len, pending)), share)
         chosen = [(group * share + index, slot, row) for group, waiting in enumerate(pending)
                   for index, (slot, row) in enumerate(waiting)]
-        if not chosen:
-            return None
         # The capacity is whole tiles, not a bucket, so a piece's width bucket can pass it.
         width = min(_bucket(max(len(row.prompt) - row.prefilled for _, _, row in chosen), 64), self.capacity)
         width = width if self.rows.chunk is None else min(width, self.rows.chunk)
-        count, capacity = self.admission, self.capacity
+        count, capacity = share * self.groups, self.capacity
         tokens = np.zeros((count, width), np.int32)
         valid = np.zeros((count, width), bool)
         slots = np.full((count,), size, np.int32)
