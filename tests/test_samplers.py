@@ -221,25 +221,53 @@ def integrate(process, solver, x_T, steps):
     return x, process.schedule.sigmas(times[-1])
 
 
-def test_solvers_integrate_the_flow_ode_at_their_order():
-    """Twenty rho-spaced steps from sigma 80 down, against the ODE's closed
-    form: RK4 (fourth order) lands within 2e-3, Heun (second) within 8e-2 and
-    Euler (first) within 2e-1 of the solution's scale, and each is closer than
-    the next; the multistep integrator beats Euler. Observed 8.3e-4, 5.1e-2,
-    1.5e-1 and 6.9e-2. A dropped stage weight or a halved average moves an
-    integrator out of its bracket."""
+FLAXDIFF = dict(np.load(Path(__file__).resolve().parent / "fixtures" / "flaxdiff" / "solvers.npz"))
+
+
+def flaxdiff_walk(solver, x_T):
+    """Every interval of the fixture's grid from `x_T`, with the reference's
+    stand-in denoiser read through the Karras schedule's own sigma."""
     process, _ = karras_process()
-    x_T = jax.random.normal(jax.random.PRNGKey(0), (64, 4)) * 80.0
+    times = jnp.asarray(FLAXDIFF["times"])
 
-    def error(solver):
-        x, sigma = integrate(process, solver, x_T, steps=20)
-        exact = x_T * jnp.sqrt(DATA_STD**2 + sigma**2) / jnp.sqrt(DATA_STD**2 + 80.0**2)
-        return float(jnp.max(jnp.abs(x - exact)) / jnp.max(jnp.abs(exact)))
+    def denoise(x, t):
+        _, sigma = process.rates(t, like=x)
+        bent = 0.25 * x + sigma * 0.5 * jnp.tanh(x / 0.5)
+        x_0 = bent / (0.25 + sigma**2)
+        return x_0, (x - x_0) / sigma
 
-    euler, heun, rk4, multistep = error(Euler()), error(Heun()), error(RK4()), error(MultiStepDPM())
-    assert rk4 < 2e-3 and heun < 8e-2 and euler < 2e-1, (euler, heun, rk4)
-    assert rk4 < heun < euler
-    assert multistep < euler
+    x, state = x_T, solver.init(x_T, times, process, key=jax.random.PRNGKey(0))
+    latents = []
+    for i in range(times.shape[0] - 1):
+        t, t_next = jnp.full((x.shape[0],), times[i]), jnp.full((x.shape[0],), times[i + 1])
+        denoised, eps = denoise(x, t)
+        x, state = solver.step(x, t, t_next, denoised, eps, state, jax.random.PRNGKey(i), process, denoise)
+        latents.append(x)
+    return jnp.stack(latents)
+
+
+@pytest.mark.parametrize("name,solver", [("rk4", RK4()), ("multistep", MultiStepDPM())],
+                         ids=["rk4", "multistep"])
+def test_rk4_and_the_multistep_integrator_are_flaxdiffs(name, solver):
+    """`RK4` and `MultiStepDPM` are FlaxDiff's `RK4Sampler` and
+    `MultiStepDPM` (AshishKumar4/FlaxDiff@15c55b0, run as published by
+    tools/flaxdiff_solver_reference.py): from the same x_T over FlaxDiff's
+    twelve-point grid on a rho-7 Karras schedule, with a denoiser nonlinear
+    in x, the latent after every interval, so every RK4 stage and each of the
+    multistep's first, second and third order updates, and the gradient of
+    the last one through the walk, held to FlaxDiff's float64 run by the
+    float64 rule. The grid is Dew's own `times(12)`."""
+    process, _ = karras_process()
+    np.testing.assert_array_equal(process.times(12), FLAXDIFF["times"])
+    x_T = jnp.asarray(FLAXDIFF["x_T"])
+    latents = flaxdiff_walk(solver, x_T)
+    for step in range(latents.shape[0]):
+        assert_as_exact_as_the_reference(latents[step], FLAXDIFF[f"{name}/latents"][step],
+                                         FLAXDIFF[f"{name}/latents_f64"][step],
+                                         f"{name} after interval {step}")
+    (gradient,) = jax.vjp(lambda x: flaxdiff_walk(solver, x)[-1], x_T)[1](jnp.asarray(FLAXDIFF["cotangent"]))
+    assert_as_exact_as_the_reference(gradient, FLAXDIFF[f"{name}/grad"], FLAXDIFF[f"{name}/grad_f64"],
+                                     f"{name} gradient")
 
 
 def test_euler_ancestral_is_k_diffusions_ancestral_step():
@@ -752,9 +780,8 @@ def test_consistency_sampling_in_one_step_is_the_consistency_function():
     "solver", [DPMSolverMultistep(lower_order_final=False), UniPC(), DEIS(), KDPM2(), LMS()], ids=solver_id
 )
 def test_diffusers_solvers_resolve_the_karras_ode_more_accurately_than_euler(solver):
-    """Twenty rho-spaced steps from sigma 80 down against the closed form,
-    the bracket test_solvers_integrate_the_flow_ode_at_their_order sets:
-    each lands within 8e-2 like Heun and closer than Euler. Observed 5.7e-2
+    """Twenty rho-spaced steps from sigma 80 down against the closed form:
+    each lands within 8e-2 and closer than Euler. Observed 5.7e-2
     for DPM-Solver++ (2M), 4.2e-2 for UniPC, 2.6e-2 for DEIS, 2.9e-2 for
     KDPM2 and 4.2e-2 for LMS, against Euler's 1.5e-1 and Heun's 5.1e-2."""
     process, _ = karras_process()
