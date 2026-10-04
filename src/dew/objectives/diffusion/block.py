@@ -207,8 +207,10 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         from dew.registry import objectives
         if not any(member is type(self) for member in objectives.values()):
             return None
-        # The published text-only layout a trained model exports to; a model
-        # with a vision conditioner has none, and loads back as a task only.
+        # The text-only config a trained model's export is written over, which
+        # `diffusion_gemma.export_weights` refuses (transformers' class builds
+        # experts and a vision tower); a model with a vision conditioner
+        # records none, and loads back as a task only.
         export = None if self.model.conditioner is not None else {
             'config': {'model_type': 'diffusion_gemma', 'text_config': _export_config(self.model.text),
                        'canvas_length': self.canvas_size},
