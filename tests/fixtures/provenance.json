@@ -214,6 +214,22 @@
    ],
    "note": "Fetches and executes vLLM v0.30.0's apply_penalties with its torch repetition-penalty path."
   },
+  "decoding/speculative.npz": {
+   "tool": "tools/speculative_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.16.1",
+     "runs": "transformers"
+    },
+    {
+     "repo": "jax-ml/jax",
+     "version": "0.11.2.post3",
+     "runs": "jax"
+    }
+   ],
+   "note": "Actual Transformers _speculative_sampling on fixed logits, its uniforms Dew's from jax.random.key(11) and its multinomial recording the next-token distribution, in float32 and float64."
+  },
   "diffusers/limits.npz": {
    "tool": "tools/diffusers_limits_reference.py",
    "sources": [
