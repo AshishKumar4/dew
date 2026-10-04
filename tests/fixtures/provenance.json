@@ -2638,6 +2638,22 @@
    ],
    "note": "libs/uvit_t2i.py and libs/timm.py fetched at the commit, SHA-256 checked, math attention; float32 and float64 (widened) forward and gradients. Torch 2.14.0+cpu."
   },
+  "vae/encoder.npz": {
+   "tool": "tools/vae_encoder_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/diffusers",
+     "version": "0.34.0",
+     "runs": "diffusers"
+    },
+    {
+     "repo": "pytorch/pytorch",
+     "version": "2.14.0",
+     "runs": "torch"
+    }
+   ],
+   "note": "AutoencoderKL(...).encoder at tests/test_models.py's encoder geometry, parameters moved off init; moments and image/parameter VJPs at batch 1 and 4, float32 and float64 (widened)."
+  },
   "vae/sd3-tiny": {
    "tool": "tools/vae_reference.py",
    "sources": [

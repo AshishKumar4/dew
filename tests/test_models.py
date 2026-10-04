@@ -6,6 +6,8 @@ scan orders, the position signal, the mixing across frames, the inflation of
 a 2D UNet into a 3D one, and the stage values the UNets are configured with.
 """
 
+from pathlib import Path
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -16,7 +18,7 @@ from reference_error import assert_as_exact_as_the_reference
 
 from dew.diffusion.process import DenoisingCondition
 from dew.nn.attention import LayerNorm, Stage
-from dew.nn.autoencoders.vae import FlaxDecoder, FlaxEncoder
+from dew.nn.autoencoders.vae import FlaxDecoder, FlaxEncoder, translate_vae_weights
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.backbones.mmdit import SimpleMMDiT
 from dew.nn.backbones.ssm_dit import HybridSSMAttentionDiT
@@ -128,6 +130,67 @@ def test_a_vae_encoder_keeps_the_host_reference_precision(batch, backward):
     assert_as_exact_as_the_reference(
         actual, reference, truth, "VAE encoder VJP" if backward else "VAE encode"
     )
+
+
+VAE_ENCODER = Path(__file__).resolve().parent / "fixtures" / "vae" / "encoder.npz"
+
+
+@pytest.mark.parametrize("batch", [1, 4])
+@pytest.mark.parametrize("backward", [False, True], ids=["encode", "vjp"])
+def test_a_vae_encoder_is_as_exact_as_diffusers(batch, backward):
+    """The encoder above against Diffusers' own `Encoder` at its geometry
+    (tools/vae_encoder_reference.py): the moments, and the gradients of the
+    image and every parameter, on whichever backend runs the test, by the
+    float64 rule. The host-precision test holds the device to the host;
+    this holds both to the published model. On the CPU the ratios are 1.62
+    (moments) and 1.60 (gradients) at a batch of one, where XLA convolves
+    another way, and 0.99 and 1.01 at four."""
+    import ml_dtypes
+
+    with np.load(VAE_ENCODER) as loaded:
+        arrays = dict(loaded)
+    names = [key.removeprefix("param.") for key in arrays if key.startswith("param.")]
+    weights = {f"encoder.{name}": arrays[f"param.{name}"].view(ml_dtypes.bfloat16).astype(np.float32)
+               for name in names}
+    params = jax.tree.map(jnp.asarray, translate_vae_weights(weights)["encoder"])
+    model = FlaxEncoder(out_channels=4, block_out_channels=(32, 64), layers_per_block=1, norm_num_groups=8)
+    image = jnp.asarray(np.moveaxis(arrays["image"][:batch], 1, -1))
+    probe = jnp.asarray(np.moveaxis(arrays[f"{batch}/probe"], 1, -1))
+
+    def part(precision: str, name: str) -> np.ndarray:
+        return arrays[f"{batch}/{precision}.{name}"]
+
+    if not backward:
+        moments = jax.jit(model.apply)({"params": params}, image)
+        assert_as_exact_as_the_reference(np.moveaxis(np.asarray(moments), -1, 1), part("fp32", "moments"),
+                                         part("fp64", "moments"), f"batch {batch} moments")
+        return
+    grad_params, grad_image = jax.jit(jax.grad(
+        lambda p, x: jnp.sum(model.apply({"params": p}, x) * probe), argnums=(0, 1)))(params, image)
+
+    def source_layout(name: str) -> np.ndarray:
+        """A Dew gradient in Diffusers' layout: the one tensor translated
+        alone names its place, and kernels transpose back."""
+        shape = arrays[f"param.{name}"].shape
+        [(path, _)] = jax.tree_util.tree_flatten_with_path(
+            translate_vae_weights({f"encoder.{name}": np.zeros(shape, np.float32)})["encoder"])[0]
+        value = grad_params
+        for key in path:
+            value = value[key.key]
+        value = np.asarray(value)
+        if path[-1].key == "kernel":
+            return value.transpose(3, 2, 0, 1) if value.ndim == 4 else value.T
+        return value
+
+    native = [np.moveaxis(np.asarray(grad_image), -1, 1), *(source_layout(name) for name in names)]
+
+    def source_order(precision: str) -> np.ndarray:
+        leaves = [part(precision, "grad_image"), *(part(precision, f"grad_param.{name}") for name in names)]
+        return np.concatenate([np.ravel(leaf) for leaf in leaves])
+
+    native_order = np.concatenate([np.ravel(leaf) for leaf in native])
+    assert_as_exact_as_the_reference(native_order, source_order("fp32"), source_order("fp64"),
+                                     f"batch {batch} gradients")
 
 
 @pytest.mark.parametrize("transform", ["jvp", "transpose", "forward_over_reverse", "reverse_over_forward"])
