@@ -312,10 +312,34 @@ def test_a_trained_wan_step_exports_and_reloads(pipeline, walk, tmp_path):
                              strict=True):
             np.testing.assert_array_equal(got, want)
 
-    pipeline.save(tmp_path / "export", variables=state.variables)
-    reloaded = Pretrained.load(str(tmp_path / "export"), dtype="float32", attention_impl="xla")
+    export = tmp_path / "export"
+    pipeline.save(export, variables=state.variables)
+    reloaded = Pretrained.load(str(export), dtype="float32", attention_impl="xla")
     assert reloaded.inputs.sample.shape == pipeline.inputs.sample.shape
     assert value(reloaded.variables) == value(state.variables)
+
+    # Diffusers' own classes read the export: every component cleanly, the
+    # pipeline whole, and its transformer recomputes the trained flow.
+    from reference_error import assert_as_exact_as_the_reference
+
+    from tools import diffusers_consumer as consumer
+
+    consumer.assert_components_load(export)
+    config = json.loads((export / "transformer" / "config.json").read_text())
+    rng = np.random.default_rng(7)
+    latents = rng.standard_normal((1, 2, 4, 6, config["in_channels"])).astype(np.float32)
+    context = rng.standard_normal((1, 5, config["text_dim"])).astype(np.float32)
+    times = np.asarray([500.0], np.float32)
+    trained = pipeline.model.apply({"params": state.variables["params"]}, jnp.asarray(latents),
+                                   jnp.asarray(times), DenoisingCondition(jnp.asarray(context)))
+
+    def call(model, tensor):
+        output = model(hidden_states=tensor(np.moveaxis(latents, -1, 1)), timestep=tensor(times),
+                       encoder_hidden_states=tensor(context)).sample
+        return channels_last(output.numpy())
+
+    assert_as_exact_as_the_reference(np.asarray(trained), consumer.denoiser_prediction(export, call),
+                                     consumer.denoiser_prediction(export, call, wide=True), "trained Wan")
 
 
 def test_a_wan_lora_starts_as_the_source_and_trains_its_factors_alone(pipeline, walk):
