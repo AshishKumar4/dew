@@ -2208,7 +2208,7 @@
      "runs": "fetched"
     }
    ],
-   "note": "Fetches and executes upstream MeanFlow class with a closed-form Flax stand-in network."
+   "note": "Fetches and executes upstream MeanFlow.forward and its gradient with a closed-form Flax stand-in network with per-pixel weights; the float64 run replays the float32 run's jax.random draws."
   },
   "mla": {
    "tool": "tools/mla_reference.py",
