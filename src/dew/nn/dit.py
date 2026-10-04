@@ -395,7 +395,8 @@ class ModulatedBlock(nn.Module):
     is the plain pre-norm block with affine norms a JEPA encoder needs.
     `adaln_silu` is `AdaLNParams.silu`. `gelu_approximate` picks the MLP's
     GELU: tanh-approximate as Meta's DiT uses it, or exact (erf) as the
-    ViTs behind I-JEPA and V-JEPA use it.
+    ViTs behind I-JEPA and V-JEPA use it. `qkv_bias` is the attention's q,
+    k and v projections' bias (its output projection keeps one).
     """
     features: int
     num_heads: int
@@ -409,6 +410,7 @@ class ModulatedBlock(nn.Module):
     norm_epsilon: float = 1e-5
     adaln_silu: bool = True
     gelu_approximate: bool = True
+    qkv_bias: bool = True
     qk_norm: bool = False
     attention_impl: str = "auto"  # an AttentionImpl
     # ssm mixer options
@@ -442,6 +444,7 @@ class ModulatedBlock(nn.Module):
                 dtype=self.dtype,
                 precision=self.precision,
                 use_bias=True,
+                qkv_bias=self.qkv_bias,
                 qk_norm=self.qk_norm,
                 attention_impl=self.attention_impl,
                 force_fp32_for_softmax=self.force_fp32_for_softmax,
