@@ -20,6 +20,7 @@ from jax.ad_checkpoint import checkpoint_name
 
 from dew.nn.attention import (
     RMSNorm,
+    cached_validity,
     causal_attention_mask,
     chunk_mask,
     combined_attention_mask,
@@ -316,10 +317,8 @@ class CausalSelfAttention(nn.Module):
             if allocated:
                 stored.value = write_cache(stored.value, groups, query_slots)
             key_groups = stored.value
-        if decode:
-            valid = self.get_variable("cache", "cache_valid")
-        else:
-            valid = None if metadata is None else metadata.valid
+        valid = (cached_validity(self, key_length) if decode
+                 else None if metadata is None else metadata.valid)
         keep = (causal_attention_mask(query_slots, key_length)
                 if self.causal else jnp.ones((batch, 1, length, key_length), bool))
         if self.bidirectional_images:
@@ -536,7 +535,7 @@ class CausalSelfAttention(nn.Module):
             cached_value = self.get_variable("cache", "cached_value")
             alloc = cached_key.shape[-3]
             prefix_slots = jnp.arange(alloc)[None, :]
-            valid_prefix = self.get_variable("cache", "cache_valid")
+            valid_prefix = cached_validity(self, alloc)
             if self.sliding_window is not None:
                 valid_prefix = valid_prefix & (prefix_slots > prefix[:, None] - self.sliding_window)
             canvas_valid = (jnp.ones((B, S), bool) if attention_metadata is None
@@ -688,7 +687,7 @@ class CausalSelfAttention(nn.Module):
         is when the paged kernel, attending every filled slot, may stand in
         for the mask; a window builds a mask of its own.
         """
-        valid = self.get_variable("cache", "cache_valid")
+        valid = cached_validity(self, key_length)
         cursor = causal_attention_mask(positions, key_length, key_valid=valid)
         if self.sliding_window is None:
             return cursor, cursor

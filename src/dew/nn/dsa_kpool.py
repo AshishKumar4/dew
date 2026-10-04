@@ -38,6 +38,7 @@ from jax.ad_checkpoint import checkpoint_name
 from .attention import (
     LayerNorm,
     RMSNorm,
+    cached_validity,
     causal_attention_mask,
     kernel_for_materialized_mask,
     max_attention_logits,
@@ -320,7 +321,7 @@ class KPoolSparseAttention(nn.Module):
             # by slot against the query's, validity from the cache
             # (`get_visible_tokens`, modeling_glm5_next.py:879-897).
             visible = causal_attention_mask(
-                slots, key.shape[1], key_valid=self.get_variable("cache", "cache_valid"))[:, 0]
+                slots, key.shape[1], key_valid=cached_validity(self, key.shape[1]))[:, 0]
             # SGLang 97c6978 index_topk_share.py:22-28,48-64 carries the complete
             # token list; draft hits must not append the new query's tail.
             if prediction_phase != "ordinary" or self.has_variable("cache", "selection_position"):

@@ -81,11 +81,9 @@ from dew.nn.kv_cache import (
     CURSOR,
     POOLED,
     TABLE,
-    VALIDITY,
     KVCache,
     Layered,
     as_words,
-    filled_slots,
     from_words,
     grouped,
     is_paged,
@@ -340,18 +338,15 @@ class Dense:
         The prompts run over a fresh cache at their own bucket width, so the
         prefill's attention reads only the prompt's keys, not the resident
         capacity's f32 scores. A row's slots past the prompt keep a former
-        occupant's keys, hidden by the validity, which is written whole.
+        occupant's keys, past the cursor the prefill sets.
         """
         narrow = _sized(model, admission.prompts.tokens.shape[1])
         fresh, real = _prefill(narrow, params, admission.prompts,
                                _operations(narrow, params, pad_id, prediction_depths(narrow)))
-        rows = admission.slots
-        cache = jax.tree.map(
-            lambda leaf: _placed(leaf, jnp.zeros((rows.shape[0], *leaf.shape[1:]), bool), rows, self.groups)
-            if leaf.dtype == bool else leaf, state.decoder.cache)
-        decoder = dataclasses.replace(state.decoder, cache=cache)
-        return jax.tree.map(lambda resident, incoming: _placed(resident, incoming, rows, self.groups),
-                            decoder, fresh), real
+        def place(resident: jax.Array, incoming: jax.Array) -> jax.Array:
+            return _placed(resident, incoming, admission.slots, self.groups)
+
+        return jax.tree.map(place, state.decoder, fresh), real
 
 
 @dataclasses.dataclass(frozen=True)
@@ -375,8 +370,6 @@ class Paged:
                 return admission.tables
             if name == CURSOR:
                 return admission.cursors
-            if name == VALIDITY:
-                return filled_slots(admission.cursors, leaf.shape[1])
             return leaf
 
         fresh, real = _prefill(model, params, admission.prompts, _operations(model, params, pad_id, 0),
@@ -749,7 +742,7 @@ class PagedRows:
         if not is_paged(cache):
             raise ValueError("the model did not take the paged layout: none of its layers keeps a page table")
         for path, _ in leaves:
-            if leaf_name(path) not in POOLED | {TABLE, CURSOR, VALIDITY}:
+            if leaf_name(path) not in POOLED | {TABLE, CURSOR}:
                 raise ValueError(f"a paged server needs every cached layer to be paged attention; "
                                  f"{jax.tree_util.keystr(path)} is not")
 

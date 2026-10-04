@@ -566,7 +566,7 @@ def test_the_cache_a_call_builds_holds_the_request_not_the_model_context(roomy, 
     cache = seen["model"].apply(roomy.variables, 1, method="init_cache", mutable=["cache"])[1]["cache"]
     slots = {path[-1].key: leaf.shape[1]
              for path, leaf in jax.tree_util.tree_flatten_with_path(cache)[0] if leaf.ndim > 1}
-    assert slots == {"cache_valid": 512, "cached_key": 512, "cached_value": 512}
+    assert slots == {"cached_key": 512, "cached_value": 512}
 
 
 def test_a_request_the_ceiling_refuses_keeps_refusing_at_its_own_shapes(roomy):

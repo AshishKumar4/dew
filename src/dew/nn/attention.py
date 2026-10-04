@@ -319,20 +319,32 @@ class LayerNorm(nn.Module):
                                 canonicalize_dtype(x, scale, bias, dtype=self.dtype))
 
 
-def _cache_positions(module: nn.Module, batch: int, length: int, capacity: int, valid):
-    """Allocate compact cache slots for real tokens, independently per row."""
+def _cache_positions(module: nn.Module, batch: int, length: int, valid):
+    """Allocate compact cache slots for real tokens, independently per row.
+
+    A row's tokens fill its slots in order, so the cursor alone says which
+    hold one (`cached_validity`)."""
     valid = jnp.ones((batch, length), bool) if valid is None else jnp.asarray(valid, bool)
     if valid.shape != (batch, length):
         raise ValueError(f"cache validity must be {(batch, length)}, got {valid.shape}")
     allocated = module.has_variable("cache", "cache_index")
     index = module.variable("cache", "cache_index", jnp.zeros, (batch,), jnp.int32)
-    cached_valid = module.variable("cache", "cache_valid", jnp.zeros, (batch, capacity), bool)
     positions = index.value[:, None] + jnp.cumsum(valid, axis=1, dtype=jnp.int32) - 1
     positions = jnp.where(valid, positions, -1)
     if allocated:
         index.value = index.value + jnp.sum(valid, axis=1, dtype=jnp.int32)
-        cached_valid.value = filled_slots(index.value, capacity)
     return positions, allocated
+
+
+def cached_validity(module: nn.Module, length: int) -> jax.Array:
+    """Which of `module`'s `length` cache slots hold a token, `[rows, length]`:
+    those before the row's cursor, which `_cache_positions` fills in order.
+
+    Derived where it is read rather than stored beside the cursor, so a
+    decode step writes no `[rows, capacity]` copy of it a layer: 28 kernels
+    a step on Qwen3-0.6B, 0.6% of a 32-slot serving step on an RTX 4080
+    (docs/performance.md)."""
+    return filled_slots(module.get_variable("cache", "cache_index"), length)
 
 
 _DEFAULT_CACHE = KVCache()
@@ -344,7 +356,7 @@ def open_kv_cache(module: nn.Module, key, max_seq_len, *, valid=None, layout: KV
     Returns [B, S] compact slot positions and a writer. Invalid tokens have
     position -1 and do not advance the cursor. The allocation-only call leaves
     every row empty. The writer returns full cache arrays, including unused
-    slots which the caller excludes with cache_valid. `layout` chooses the
+    slots which the caller excludes with `cached_validity`. `layout` chooses the
     storage behind the slots, dense or paged, full or quantized
     (`dew.nn.kv_cache`); the slots and the cursor are the same for all.
     """
@@ -359,7 +371,7 @@ def open_kv_cache(module: nn.Module, key, max_seq_len, *, valid=None, layout: KV
     if valid is None and length > max_seq_len:
         raise ValueError(f"{length} tokens do not fit a KV cache of {max_seq_len}.")
     store = KVStore.open(module, layout, batch, max_seq_len, heads, head_dim, key.dtype)
-    positions, allocated = _cache_positions(module, batch, length, max_seq_len, valid)
+    positions, allocated = _cache_positions(module, batch, length, valid)
     return positions, Append(store, positions, allocated)
 
 

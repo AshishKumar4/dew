@@ -29,6 +29,7 @@ from dew.nn.attention import (
     LayerNorm,
     RMSNorm,
     _cache_positions,
+    cached_validity,
     causal_attention_mask,
     document_mask,
     kernel_for_materialized_mask,
@@ -69,7 +70,7 @@ def open_mla_cache(module: nn.Module, names: tuple[str, str], first, second, ind
     if index_keys is not None:
         cached_index = module.variable("cache", "cached_index", jnp.zeros,
                                        (batch, max_seq_len, index_keys.shape[-1]), index_keys.dtype)
-    positions, allocated = _cache_positions(module, batch, length, max_seq_len, valid)
+    positions, allocated = _cache_positions(module, batch, length, valid)
 
     def append(new_first, new_second, new_index_keys):
         if allocated:
@@ -594,7 +595,7 @@ class MultiHeadLatentAttention(nn.Module):
                     x, q_resid, index_full, freqs_cos, freqs_sin)
             keep = causal_attention_mask(
                 positions, key.shape[1],
-                key_valid=self.get_variable("cache", "cache_valid"))[:, 0]
+                key_valid=cached_validity(self, key.shape[1]))[:, 0]
             mask = selection_mask(self._select(index_scores, keep, kv_store),
                                   key.shape[1])[:, None]
         else:
@@ -607,7 +608,7 @@ class MultiHeadLatentAttention(nn.Module):
             latent, rot, _ = append(latent, rot, None)
             key, value = self._expand(latent, rot)
             mask = causal_attention_mask(
-                positions, key.shape[-3], key_valid=self.get_variable("cache", "cache_valid"))
+                positions, key.shape[-3], key_valid=cached_validity(self, key.shape[-3]))
         return q_rot, key, value, mask
 
     def _qk_open(self) -> bool:

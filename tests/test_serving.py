@@ -474,13 +474,16 @@ def test_a_server_holds_its_capacity_in_whole_tiles_not_a_power_of_two():
 
     def slots(**options):
         server = Server.from_task(bound, slots=2, **options)
-        held = {leaf.shape for path, leaf in jax.tree_util.tree_flatten_with_path(server.cache)[0]
-                if jax.tree_util.keystr(path).endswith("['cache_valid']")}
+        page = options.get("kv_cache", KVCache()).page_size
+        # A row's slots: the dense keys' second axis, or its pages' tokens.
+        leaves = jax.tree_util.tree_flatten_with_path(server.cache)[0]
+        held = {leaf.shape[1] * (page or 1) for path, leaf in leaves
+                if jax.tree_util.keystr(path).endswith("['page_table']" if page else "['cached_key']")}
         return server.capacity, held
 
-    assert slots(capacity=384) == (384, {(2, 384)})
-    assert slots(capacity=300) == (320, {(2, 320)})
-    assert slots(capacity=300, kv_cache=KVCache(page_size=128)) == (384, {(2, 384)})
+    assert slots(capacity=384) == (384, {384})
+    assert slots(capacity=300) == (320, {320})
+    assert slots(capacity=300, kv_cache=KVCache(page_size=128)) == (384, {384})
 
 
 def test_a_prompt_past_the_bucket_under_the_capacity_is_served_as_the_task_serves_it():

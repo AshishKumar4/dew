@@ -47,8 +47,6 @@ TABLE = "page_table"
 """A paged cache's per-row page table, `[rows, capacity // page_size]`."""
 CURSOR = "cache_index"
 """The per-row count of tokens a cache holds (`attention._cache_positions`)."""
-VALIDITY = "cache_valid"
-"""The per-row mask of filled slots, `[rows, capacity]`."""
 POOLED = frozenset({"cached_key", "cached_value", "key_scale", "value_scale"})
 """The leaves a paged cache keeps in its shared pool rather than per row."""
 
