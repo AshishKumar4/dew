@@ -339,9 +339,10 @@ def qk_tree(layers=1, heads=4, kv_heads=4, dim=8, seed=0):
     return params, grads
 
 
-def qk_stats(layers=1, heads=4, rows=3, values=None, nope=None, kv_heads=None):
+def qk_stats(layers=1, heads=4, rows=3, values=None, nope=None, kv_heads=None, head_dim=8):
     """The `qk` collection with per-layer maxima, as the model sows it: the
-    latent query's nope width, or the key-head count (`heads` unless given)."""
+    latent query's nope width, or the key-head count (`heads` unless given)
+    and the head width."""
     stats = {}
     for layer in range(layers):
         sown = {'max_logits': (jnp.asarray(
@@ -351,6 +352,7 @@ def qk_stats(layers=1, heads=4, rows=3, values=None, nope=None, kv_heads=None):
             sown['qk_nope'] = jnp.asarray(nope)
         else:
             sown['kv_heads'] = jnp.asarray(heads if kv_heads is None else kv_heads)
+            sown['head_dim'] = jnp.asarray(head_dim)
         stats[f'layers_{layer}'] = {'self_attn': sown}
     return stats
 
@@ -421,8 +423,9 @@ def test_a_query_group_clips_as_megatron_clips_it(case):
     parts = {"q_proj": "q", "k_proj": "k", "v_proj": "v"}
     params = {"attn": {proj: {"kernel": jnp.asarray(MEGATRON[f"{case}/{part}"])}
                        for proj, part in parts.items()}}
+    head_dim = MEGATRON[f"{case}/q"].shape[1] // heads
     stats = {"attn": {"max_logits": (jnp.asarray(MEGATRON[f"{case}/max_logits"])[None],),
-                      "kv_heads": jnp.asarray(width // (MEGATRON[f"{case}/q"].shape[1] // heads))}}
+                      "kv_heads": jnp.asarray(width // head_dim), "head_dim": jnp.asarray(head_dim)}}
     tx = scale_by_qk_clip(100.0)
     updates, _ = tx.update(jax.tree.map(jnp.zeros_like, params), tx.init(params), params, qk_stats=stats)
     applied = optax.apply_updates(params, updates)
@@ -433,6 +436,35 @@ def test_a_query_group_clips_as_megatron_clips_it(case):
         else:
             assert_as_exact_as_the_reference(got, MEGATRON[f"{case}/clipped_{part}"],
                                              MEGATRON[f"{case}/clipped_{part}_f64"], f"{case} {proj}")
+
+
+def test_a_gated_query_clips_its_query_half_and_bounds_the_logits():
+    """Qwen3.5's output gate doubles each query head to [query | gate]. The
+    paper's QK-Clip rescales the query and key weights and nothing else, so
+    the gate half keeps its kernel bitwise, and the layer's logits, read
+    again on the same tokens, are each head's own times its group's eta:
+    the firing group lands on tau and the other keeps its maxima, tau
+    between the two groups' largest. One layer, so the clip's input is the
+    embeddings both times."""
+    model = tiny_decoder(output_gate=True, num_layers=1)
+    variables = model.init(jax.random.key(0), jnp.ones((1, 8), jnp.int32))
+    ids = jnp.asarray(np.random.default_rng(1).integers(0, 32, (2, 8)), jnp.int32)
+    _, sown = model.apply(variables, ids, mutable=["qk"])
+    stats = sown["qk"]
+    before = np.max(np.asarray(stats["layers_0"]["self_attn"]["max_logits"][0]), axis=0)
+    tau = float(np.mean(before.reshape(2, 2).max(axis=1)))
+    tx = scale_by_qk_clip(tau)
+    params = variables["params"]
+    updates, _ = tx.update(jax.tree.map(jnp.zeros_like, params), tx.init(params), params, qk_stats=stats)
+    clipped = optax.apply_updates(params, updates)
+    _, resown = model.apply({**variables, "params": clipped}, ids, mutable=["qk"])
+    query, query_after = (np.asarray(tree["layers_0"]["self_attn"]["q_proj"]["kernel"]).reshape(16, 4, 2, -1)
+                          for tree in (params, clipped))
+    np.testing.assert_array_equal(query_after[:, :, 1], query[:, :, 1])
+    eta = np.minimum(1.0, tau / before.reshape(2, 2).max(axis=1)).repeat(2)
+    assert 0 < np.sum(eta < 1) < 4
+    after = np.max(np.asarray(resown["qk"]["layers_0"]["self_attn"]["max_logits"][0]), axis=0)
+    np.testing.assert_allclose(after, before * eta, rtol=1e-5)
 
 
 def test_the_latent_branches_match_maxtext():
