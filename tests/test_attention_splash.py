@@ -20,6 +20,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from reference_error import assert_as_exact_as_the_reference, assert_computes_the_oracle
 
 from dew.nn.attention import (
     SPLASH_BLOCK,
@@ -69,7 +70,8 @@ def qkv(shape, dtype, seed=0, kv_shape=None):
 
 
 def value_and_grads(implementation, query, key, value, sinks=None, live=None, **kwargs):
-    """The output and the gradients of every input, sinks included, fp32.
+    """The output and the gradients of every input, sinks included, in fp32
+    or the inputs' wider dtype.
 
     `live` `[B, S]` keeps the rows the loss reads and the output compares,
     which a packed row's padding is not.
@@ -79,12 +81,12 @@ def value_and_grads(implementation, query, key, value, sinks=None, live=None, **
                                            **kwargs)
         if live is not None:
             out = jnp.where(live[:, :, None, None], out, 0)
-        return jnp.sum(out.astype(jnp.float32) ** 2), out
+        return jnp.sum(out.astype(jnp.promote_types(out.dtype, jnp.float32)) ** 2), out
 
     argnums = (0, 1, 2) if sinks is None else (0, 1, 2, 3)
     (_, out), grads = jax.jit(jax.value_and_grad(loss, argnums=argnums, has_aux=True))(
         query, key, value, sinks)
-    return [np.asarray(x, np.float32) for x in (out, *grads)]
+    return [np.asarray(x, np.promote_types(x.dtype, np.float32)) for x in (out, *grads)]
 
 
 def reference(query, key, value, **kwargs):
@@ -270,6 +272,100 @@ def test_splash_keeps_packed_documents_apart_by_their_segment_ids(dtype, sliding
     unpacked = reference(query, key, value, causal=True, sliding_window=sliding_window, live=live)
     assert_sensitive(expected, unpacked, dtype)
     assert_agrees(value_and_grads('tpu', query, key, value, **structure), expected, dtype)
+
+
+def exact_value_and_grads(query, key, value, sinks=None, live=None, causal=False, sliding_window=None,
+                          mask=None, segment_ids=None, softcap=None):
+    """`value_and_grads`' output and gradients in float64, from attention
+    written out here apart from every Dew path: the logits of query head h
+    against key head h // (Hq // Hkv) over sqrt(D), capped `c tanh(l / c)`,
+    then the kept keys (k <= q, the window's w most recent, the explicit
+    mask, equal segment ids), a softmax whose denominator a sink joins, and
+    the values."""
+    def attention(q, k, v, s):
+        _, q_len, heads, width = q.shape
+        k_len, kv_heads = k.shape[1], k.shape[2]
+        group = jnp.arange(heads) // (heads // kv_heads)
+        logits = jnp.einsum('bqhd,bkhd->bhqk', q, k[:, :, group]) / np.sqrt(width)
+        if softcap is not None:
+            logits = softcap * jnp.tanh(logits / softcap)
+        rows, cols = np.arange(q_len)[:, None], np.arange(k_len)[None, :]
+        keep = np.ones((1, 1, q_len, k_len), bool)
+        if causal or sliding_window is not None:
+            keep = keep & (cols <= rows)
+        if sliding_window is not None:
+            keep = keep & (cols > rows - sliding_window)
+        if mask is not None:
+            keep = keep & np.asarray(mask, bool)
+        if segment_ids is not None:
+            ids = np.asarray(segment_ids)
+            keep = keep & (ids[:, None, :, None] == ids[:, None, None, :])
+        logits = jnp.where(keep, logits, -jnp.inf)
+        if s is not None:
+            sink = jnp.broadcast_to(s[None, :, None, None], (*logits.shape[:3], 1))
+            logits = jnp.concatenate([logits, sink], -1)
+        weights = jax.nn.softmax(logits, axis=-1)[..., :k_len]
+        return jnp.einsum('bhqk,bkhd->bqhd', weights, v[:, :, group])
+
+    def loss(q, k, v, s):
+        out = attention(q, k, v, s)
+        if live is not None:
+            out = jnp.where(np.asarray(live)[:, :, None, None], out, 0)
+        return jnp.sum(out ** 2), out
+
+    argnums = (0, 1, 2) if sinks is None else (0, 1, 2, 3)
+    with jax.enable_x64(new_val=True):
+        wide = [None if x is None else jnp.asarray(np.asarray(x, np.float64))
+                for x in (query, key, value, sinks)]
+        (_, out), grads = jax.value_and_grad(loss, argnums=argnums, has_aux=True)(*wide)
+        return [np.asarray(x) for x in (out, *grads)]
+
+
+ORACLE_CASES = {
+    "full": ((2, 256, 4, 64), None, {}),
+    "causal": ((2, 256, 4, 64), None, {"causal": True}),
+    "window": ((2, 256, 4, 64), None, {"sliding_window": 64}),
+    "grouped": ((2, 256, 8, 64), (2, 256, 2, 64), {"causal": True}),
+    "cross": ((2, 256, 4, 64), (2, 512, 4, 64), {}),
+    "softcap": ((2, 256, 8, 64), (2, 256, 2, 64), {"causal": True, "softcap": 1.0}),
+    "sinks": ((2, 256, 8, 64), (2, 256, 2, 64), {"causal": True, "sinks": True}),
+    "sinks-window": ((2, 256, 8, 64), (2, 256, 2, 64), {"sliding_window": 128, "sinks": True}),
+    "mask": ((2, 256, 4, 64), None, {"causal": True, "mask": True}),
+    "packed-window": ((2, 256, 4, 64), None, {"causal": True, "sliding_window": 64, "segment_ids": True}),
+}
+
+
+@pytest.mark.parametrize("case", ORACLE_CASES)
+def test_splash_is_as_exact_as_the_reference_attention(case):
+    """Splash in fp32, forward and every gradient (the sinks' included),
+    against attention computed in float64 apart from every Dew path
+    (`exact_value_and_grads`), by tests/reference_error.py's rule: no
+    further from it than twice the fp32 reference attention it replaces,
+    whose own arithmetic in float64 is first held to that oracle. Each
+    argument the kernel takes, grouped key heads among them."""
+    q_shape, kv_shape, structure = ORACLE_CASES[case]
+    query, _, _ = qkv(q_shape, jnp.float32)
+    _, key, value = qkv(kv_shape or q_shape, jnp.float32, seed=1)
+    structure = dict(structure)
+    if structure.pop("sinks", False):
+        structure["sinks"] = 2.0 + jax.random.normal(jax.random.PRNGKey(2), (q_shape[2],), jnp.float32)
+    if structure.pop("mask", False):
+        structure["mask"] = np.asarray(document_mask(packed_ids((100, 84, 72))[:1]))[:, None]
+    if structure.pop("segment_ids", False):
+        structure["segment_ids"] = packed_ids((100, 84, 50), (30, 190, 10))
+        structure["live"] = structure["segment_ids"] != 0
+    splash = value_and_grads('tpu', query, key, value, **structure)
+    with jax.enable_x64(new_val=True):
+        wide = {name: jnp.asarray(np.asarray(x, np.float64)) if name == "sinks" else x
+                for name, x in structure.items()}
+        widened = (jnp.asarray(np.asarray(x, np.float64)) for x in (query, key, value))
+        twin = value_and_grads('reference', *widened, force_fp32_for_softmax=False, **wide)
+    names = ("output", "query", "key", "value", "sinks")[:len(splash)]
+    for name, mine, theirs, wide_theirs, want in zip(
+            names, splash, reference(query, key, value, **structure), twin,
+            exact_value_and_grads(query, key, value, **structure), strict=True):
+        assert_computes_the_oracle(wide_theirs, theirs, want, f"{case} {name}")
+        assert_as_exact_as_the_reference(mine, theirs, want, f"{case} {name}")
 
 
 def dense(descriptor, heads, q_len, kv_len):
