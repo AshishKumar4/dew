@@ -124,6 +124,30 @@ def widened():
         torch.set_default_dtype(default)
 
 
+@contextlib.contextmanager
+def widened_softmax():
+    """`softmax(..., dtype=torch.float32)`, the pin transformers' eager
+    attention and routers carry, in float64."""
+    softmax = torch.nn.functional.softmax
+
+    def wide(*args, dtype=None, **kwargs):
+        return softmax(*args, dtype=torch.float64 if dtype == torch.float32 else dtype, **kwargs)
+
+    torch.nn.functional.softmax = wide
+    try:
+        yield
+    finally:
+        torch.nn.functional.softmax = softmax
+
+
+@contextlib.contextmanager
+def float64():
+    """A transformers model built and run in float64: `widened` and
+    `widened_softmax` together."""
+    with widened(), widened_softmax():
+        yield
+
+
 def walk(model, inputs: dict[str, torch.Tensor], probe: torch.Tensor, dtype) -> dict[str, np.ndarray]:
     """One call at `dtype` and the gradients of `sum(output * probe)` with
     respect to the latents, the prompt states and every parameter."""

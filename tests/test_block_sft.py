@@ -152,9 +152,12 @@ def test_real_trainer_update_and_checkpoint_resume(source, tmp_path):
     trainer = Trainer(obj, optax.sgd(0.001), key=run_key, checkpoints=Checkpoints(str(tmp_path / "run")))
     updated = trainer.fit(data, steps=1, checkpoint_every=1, log_every=1)
     assert_tree_close(updated.variables, expected, 2e-6)
-    replace(loaded, model=obj.model).save(tmp_path / "published", variables=updated.variables)
-    readback = Pretrained.load(tmp_path / "published", dtype="float32", attention_impl="xla", max_seq_len=32)
-    assert_tree_close(objective(readback).init(jax.random.key(0)), updated.variables, 0)
+    # Google's dense text-only model: transformers' DiffusionGemmaForBlockDiffusion
+    # builds experts and a vision tower, so no published implementation reads
+    # this layout, and the export is refused rather than written.
+    with pytest.raises(ValueError, match="cannot read an export"):
+        replace(loaded, model=obj.model).save(tmp_path / "published", variables=updated.variables)
+    assert not (tmp_path / "published").exists()
 
     resumed = Trainer(obj, optax.sgd(0.001), key=run_key,
                       checkpoints=Checkpoints(str(tmp_path / "run"))).fit(

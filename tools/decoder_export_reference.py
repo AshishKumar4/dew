@@ -96,6 +96,9 @@ CASES = (
     Case("llama4_text", "llama4-tiny"),
     Case("olmo3", "olmo3-yarn-tiny"),
     Case("qwen3_next", "qwen3-next-tiny", mtp_weight=0.3),
+    Case("opt", "opt-tiny"),
+    Case("gpt_neox", "gpt-neox-tiny"),
+    Case("mamba2", "mamba2-tiny"),
     Case("glm5_next", "glm5-next-tiny", balance_rate=1e-2, mtp_weight=0.3,
          reference_class="Glm5NextTextForCausalLM", reference_module="tools.hf_reference_b",
          conversion_type="glm5_next"),
@@ -114,6 +117,7 @@ class RoundTrip:
     ours: np.ndarray
     reloaded: Pretrained
     theirs: np.ndarray
+    truth: np.ndarray
     source_tensors: dict[str, np.ndarray] = field(repr=False)
     exported_tensors: dict[str, np.ndarray] = field(repr=False)
 
@@ -235,7 +239,7 @@ def lower_index_ties(model, block: torch.nn.Module | None = None) -> Iterator[No
             module.forward = original
 
 
-def reference_model(case: Case, directory: Path):
+def reference_model(case: Case, directory: Path, dtype=None):
     """The reference implementation over the exported directory, with its
     loading report.
 
@@ -267,8 +271,8 @@ def reference_model(case: Case, directory: Path):
         register_checkpoint_conversion_mapping(
             model_type, conversion, overwrite=True)
     loaded = factory.from_pretrained(
-        str(directory), dtype=torch.float32, local_files_only=True, output_loading_info=True,
-        experts_implementation="eager")
+        str(directory), dtype=torch.float32 if dtype is None else dtype, local_files_only=True,
+        output_loading_info=True, experts_implementation="eager")
     if not isinstance(loaded, tuple) or len(loaded) != 2:
         raise TypeError("output_loading_info must return a model and its loading report")
     model, report = loaded
@@ -290,16 +294,25 @@ def reference_model(case: Case, directory: Path):
     return model, report
 
 
-def reference_logits(case: Case, directory: Path, ids: np.ndarray) -> np.ndarray:
-    """transformers 5.16.1 over the exported directory, fp32 on the eager path."""
+def reference_logits(case: Case, directory: Path, ids: np.ndarray, *, wide: bool = False) -> np.ndarray:
+    """transformers 5.16.1 over the exported directory on the eager path, in
+    fp32, or `wide` in float64: the model built and run under
+    `diffusers_wan_reference.float64`, which widens its float32 pins too."""
+    import contextlib
+
     import torch
 
-    model, _ = reference_model(case, directory)
-    model.eval()
-    model.set_attn_implementation("eager")
-    with torch.no_grad(), lower_index_ties(model):
-        out = model(input_ids=torch.from_numpy(np.asarray(ids, np.int64)), use_cache=False)
-    return out.logits.to(torch.float32).numpy()
+    from tools.diffusers_wan_reference import float64
+
+    with float64() if wide else contextlib.nullcontext():
+        model, _ = reference_model(case, directory, torch.float64 if wide else torch.float32)
+        model.eval()
+        model.set_attn_implementation("eager")
+        with torch.no_grad(), lower_index_ties(model):
+            out = model(input_ids=torch.from_numpy(np.asarray(ids, np.int64)), use_cache=False)
+    if out.logits.dtype != (torch.float64 if wide else torch.float32):
+        raise TypeError(f"the reference returned {out.logits.dtype} logits")
+    return out.logits.numpy()
 
 
 def glm5_prediction_logits(case: Case, directory: Path, ids: np.ndarray) -> np.ndarray:
@@ -374,7 +387,7 @@ def round_trip(case: Case, workspace: Path) -> RoundTrip:
     reloaded = Pretrained.load(str(export), dtype="float32", attention_impl="reference")
     return RoundTrip(case, source, state.variables, export, ids,
                      logits(source, state.variables, ids), reloaded,
-                     reference_logits(case, export, ids),
+                     reference_logits(case, export, ids), reference_logits(case, export, ids, wide=True),
                      source_tensors(directory), source_tensors(export))
 
 
@@ -386,20 +399,27 @@ def moved(trip: RoundTrip) -> dict[str, float]:
     feed-forward, and DeepSeek V4's only unrouted feed-forward is its
     shared expert. Llama 4 spells its feed-forward `feed_forward` where
     most say `mlp`, V4 spells the block's halves `attn` and `ffn` and its
-    embedding `embed`, and a wrapper repo nests the decoder's own names
-    under its language model.
+    embedding `embed`, OPT its feed-forward `fc1` and `fc2`, GPT-NeoX its
+    attention `attention` and its embedding `embed_in`, Mamba 2 holds a
+    state-space `mixer` where the others attend, and a wrapper repo nests
+    the decoder's own names under its language model.
 
     Only bound tensors are measured. A retained one carries its source
     bytes out by construction, which
     `test_every_source_tensor_is_bound_or_retained_and_written_back` holds
-    to account, and a training step cannot move it.
+    to account, and a training step cannot move it. A family that binds no
+    layout (GPT-NeoX) writes every tensor through the decoder export's own
+    encoder, so all of them are measured.
     """
-    bound = {layout.name for layout in trip.source.weight_layouts}
-    kinds = {"embedding": lambda name: name.endswith(("model.embed_tokens.weight",
-                                                      "embed.weight")),
-             "attention": lambda name: ".self_attn." in name or ".attn." in name,
+    bound = ({layout.name for layout in trip.source.weight_layouts}
+             or set(trip.source_tensors) - set(trip.source.retained_tensors))
+    kinds = {"embedding": lambda name: name.endswith(("embed_tokens.weight", "embed.weight",
+                                                      "embed_in.weight", "embeddings.weight")),
+             "attention": lambda name: ".self_attn." in name or ".attn." in name or ".attention." in name,
+             "mixer": lambda name: ".mixer." in name,
              "feedforward": lambda name: (
-                 (".mlp." in name or ".feed_forward." in name or ".ffn." in name)
+                 (".mlp." in name or ".feed_forward." in name or ".ffn." in name
+                  or ".fc1." in name or ".fc2." in name)
                  and ".experts." not in name
                  and not name.endswith(("mlp.gate.weight", "router.weight",
                                         "ffn.gate.weight", "ffn.gate.bias", "ffn.gate.tid2eid"))),
@@ -677,7 +697,9 @@ def measure(trip: RoundTrip) -> dict[str, object]:
             "retained": len(trip.source.retained_tensors),
             "exported": len(trip.exported_tensors),
             "argmax equal": bool(np.array_equal(np.argmax(ours, -1), np.argmax(theirs, -1))),
-            "max |logit difference|": float(np.max(np.abs(ours - theirs)))}
+            "max |logit difference|": float(np.max(np.abs(ours - theirs))),
+            "rms ratio to the reference's fp32": float(
+                np.sqrt(np.mean((ours - trip.truth) ** 2)) / np.sqrt(np.mean((theirs - trip.truth) ** 2)))}
 
 
 def main() -> None:
