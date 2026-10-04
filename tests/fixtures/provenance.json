@@ -2574,9 +2574,19 @@
      "repo": "End2End-Diffusion/REPA-E",
      "version": "2ad4e9f69234c109497fb41d3e5e555de7b4b0de",
      "runs": "fetched"
+    },
+    {
+     "repo": "huggingface/diffusers",
+     "version": "0.34.0",
+     "runs": "diffusers"
+    },
+    {
+     "repo": "pytorch/pytorch",
+     "version": "2.14.0",
+     "runs": "torch"
     }
    ],
-   "note": "KL executes fetched upstream class; reconstruction and BatchNorm setup are locally reproduced."
+   "note": "regularizer.npz: KL executes fetched upstream class; reconstruction and BatchNorm setup are locally reproduced. step.npz: executes train_repae.py's loop body from vae.train() through the SiT update, with AutoencoderKL.forward, DiagonalGaussianDistribution, SiT.forward, interpolant, unpatchify, init_bn, LabelEmbedder, build_mlp, ReconstructionLoss_Single_Stage, requires_grad, update_ema and preprocess_imgs_vae as published, around tests/fixtures/tiny_diffusers' SD VAE run by diffusers and stand-in SiT layers, at l1_lpips_kl_gan.yaml with perceptual_weight and discriminator_weight 0 (Dew's L1 + KL scope); the draws are DiffusionObjective's from jax.random.key(11)."
   },
   "rl/advantage.npz": {
    "tool": "tools/parity_rl.py",
