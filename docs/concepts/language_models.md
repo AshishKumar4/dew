@@ -441,11 +441,9 @@ The last canvas is refined at full width, and the returned response is then cut 
 
 `BlockDiffusionObjective` ports Google's public SFT adapter, released after the model. It samples a valid response canvas, corrupts the whole response with uniform-vocabulary noise, and runs self-conditioning with a detached first pass. It then combines the canvas loss and the encoder loss, each normalized per row on its own. The default time safety margin is 1e-4 and the self-conditioning probability is 0.5. It is not the unpublished sampler-distillation and RL objective.
 
-The next example takes one optimizer step on the tiny reference model, with a synthetic vocabulary and unequal target support. The objective makes the per-layer scalars trainable, while the checkpoint's ordinary HF view keeps those tensors frozen, so the export passes the objective's native model.
+The next example takes one optimizer step on the tiny reference model, with a synthetic vocabulary and unequal target support. This dense model has neither the routed experts nor the vision tower that transformers' `DiffusionGemmaForBlockDiffusion` builds, so `save` refuses to export it, and its run checkpoint keeps it instead. A run of the image-reading model exports with `Pretrained.from_run(run).save(destination)`. That writes the config from the run's model: the text stack, the Gemma 4 tower's `vision_config` and the canvas length. Dew places images by position and keeps no image token ids, so transformers' defaults apply to them. Because transformers reads `generation_config.json` as a closed set of fields, the run must use a Hugging Face tokenizer, whose files are its whole record; a run on Dew's byte vocabulary is refused.
 
 ```python
-from dataclasses import replace
-
 from dew.objectives.diffusion import BlockDiffusionObjective
 
 sft_source = fixtures / "diffusion-gemma-sft"
@@ -458,10 +456,6 @@ block_objective = BlockDiffusionObjective(sft_bundle.model, prompt_length=4,
                                           num_canvases=2, pretrained=sft_bundle.variables)
 block_state = Trainer(block_objective, optax.sgd(0.001), key=jax.random.key(2)).fit(
     block_data, steps=1, log_every=1)
-with TemporaryDirectory() as checkpoint:
-    replace(sft_bundle, model=block_objective.model).save(checkpoint, variables=block_state.variables)
-    trained_bundle = PretrainedBlockDecoder.load(checkpoint, dtype=jnp.float32, attention_impl="xla",
-                                                 max_seq_len=32)
 print("Optimizer updates:", int(block_state.updates))
 ```
 

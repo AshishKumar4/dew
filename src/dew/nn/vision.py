@@ -1727,6 +1727,29 @@ def translate_gemma4_vision_config(hf_config: Mapping[str, object]) -> Mapping[s
     }
 
 
+def export_gemma4_vision_config(tower: Gemma4Vision) -> Mapping[str, object]:
+    """A Gemma4Vision value as the Gemma4VisionConfig that
+    `translate_gemma4_vision_config` reads back to it. An unset head_dim is
+    written as the width it stands for."""
+    return {
+        "model_type": "gemma4_vision",
+        "hidden_size": tower.hidden_size,
+        "intermediate_size": tower.intermediate_size,
+        "num_hidden_layers": tower.num_layers,
+        "num_attention_heads": tower.num_heads,
+        "num_key_value_heads": tower.num_key_value_heads,
+        "head_dim": tower.hidden_size // tower.num_heads if tower.head_dim is None else tower.head_dim,
+        "patch_size": tower.patch_size,
+        "pooling_kernel_size": tower.pooling_kernel_size,
+        "position_embedding_size": tower.position_embedding_size,
+        "hidden_activation": tower.hidden_act,
+        "rms_norm_eps": tower.rms_norm_eps,
+        "rope_parameters": {"rope_type": "default", "rope_theta": tower.rope_theta},
+        "standardize": tower.standardize,
+        "use_clipped_linears": tower.use_clipped_linears,
+    }
+
+
 def translate_gemma4_projector_config(vision: Mapping[str, object],
                                       text_width: int) -> Mapping[str, object]:
     """A Gemma 4 wrapper's projector fields: decoder width, norm epsilon."""

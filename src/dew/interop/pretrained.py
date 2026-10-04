@@ -311,6 +311,9 @@ class Pretrained:
     tokenizer: str | decoders.ExportTokenizer | None = None
     """The vocabulary `save` writes beside the weights, by name or by object,
     for a bundle with no source processor to write (`from_model`)."""
+    names_tokenizer: ClassVar[bool] = True
+    """Whether generation_config.json may record the tokenizer's name; not
+    where the family's reader takes that file as a closed set of fields."""
 
     @property
     def _text_processor(self) -> TaskProcessor | None:
@@ -355,14 +358,9 @@ class Pretrained:
                     export_adapter=bundle.export_adapter, tokenizer=bundle.tokenizer)
         elif isinstance(model, DiffusionGemma):
             from dew.interop import diffusion_gemma
-            if declaration.get('diffusion_gemma') is None:
-                raise TypeError("a DiffusionGemma with a vision conditioner has no published layout to "
-                                "export to; load the run with BlockGeneration.from_run")
-            settings = record(declaration['diffusion_gemma'], 'diffusion_gemma')
-            config = record(settings['config'], 'diffusion_gemma config')
-            generation = record(settings['generation_config'], 'generation_config')
-            bundle = PretrainedBlockDecoder(model, variables, None, config, None, model_config.fields(),
-                                             generation, export_adapter=diffusion_gemma.export_weights,
+            config = diffusion_gemma.published_config(model)
+            bundle = PretrainedBlockDecoder(model, variables, None, config, None, model_config.fields(), {},
+                                             export_adapter=diffusion_gemma.export_weights,
                                              tokenizer=tokenizer)
         else:
             raise TypeError(f"{type(model).__name__} has no maintained exported bundle layout; "
@@ -542,10 +540,13 @@ class Pretrained:
         from dew.interop.safetensors_io import save_hf_layout
         values = self.variables if variables is None else variables
         destination = Path(directory)
-        save_hf_layout(self.export(values), dict(self.config), destination, max_shard_size)
+        # Either half may refuse the bundle, each before it writes a file.
+        tensors = self.export(values)
         decoders.save_export_assets(destination,
                                     tokenizer=self.processor if self.tokenizer is None else self.tokenizer,
-                                    generation_config=dict(self.generation_config))
+                                    generation_config=dict(self.generation_config),
+                                    named=self.names_tokenizer)
+        save_hf_layout(tensors, dict(self.config), destination, max_shard_size)
 
     def push_to_hub(self, repo_id: str, *, variables: Mapping[str, object] | None = None,
                     private: bool = False, commit_message: str = "Upload dew export",
@@ -701,6 +702,10 @@ class PretrainedBlockDecoder(Pretrained):
     """DiffusionGemma, which decodes whole canvases."""
 
     model: DiffusionGemma
+    # transformers reads its generation_config.json into
+    # DiffusionGemmaGenerationConfig, which raises on any field it does not
+    # declare (generation_diffusion_gemma.py, 5.16.1).
+    names_tokenizer: ClassVar[bool] = False
 
     def block_generation(self) -> BlockGeneration:
         """Build the DiffusionGemma as a canvas task, defaulting to the source's sampler config."""

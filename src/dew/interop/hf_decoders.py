@@ -1814,13 +1814,16 @@ def save_export_assets(
     *,
     tokenizer: str | ExportTokenizer | None = None,
     generation_config: Mapping[str, object] | None = None,
+    named: bool = True,
 ) -> None:
     """Write the tokenizer files and generation_config.json beside exported weights.
 
     Readers of the HF layout (transformers, llama.cpp and the runtimes on it) locate the
     vocabulary through tokenizer_config.json, so a name alone is not a loadable export.
     A name is resolved through `tokenizer_for` from local files only and recorded under
-    `tokenizer_name`, which is the whole record for the byte vocabulary.
+    `tokenizer_name`, which is the whole record for the byte vocabulary. Unless
+    `named`: then the files are the whole record, and a vocabulary with none
+    (the byte vocabulary) is refused before anything is written.
     """
     values = dict(GENERATION_DEFAULTS if generation_config is None else generation_config)
     name: str | None = None
@@ -1836,10 +1839,14 @@ def save_export_assets(
     elif tokenizer is not None:
         writer = tokenizer
         name = tokenizer.name if isinstance(tokenizer, NamedTokenizer) else None
+    if not named and writer is None and name is not None:
+        raise ValueError(f"the {name!r} vocabulary has no tokenizer files, and this layout's "
+                         "generation_config.json has no field to name it by; export a run trained "
+                         "on a Hugging Face tokenizer")
     os.makedirs(directory, exist_ok=True)
     if writer is not None:
         writer.save_pretrained(str(directory))
-    if name is not None:
+    if name is not None and named:
         values.setdefault('tokenizer_name', name)
     with open(os.path.join(directory, GENERATION_CONFIG_FILE), 'w') as handle:
         json.dump(values, handle, indent=2)
