@@ -2528,7 +2528,7 @@
      "runs": "torch"
     }
    ],
-   "note": "ImaginaireTrainer_Distill.training_step over T2VDistillModel_rCM's closures, its two torch Adam optimizers and FastEmaModelUpdater, ten iterations from a teacher stand-in network with per-entry weights; the float64 run replays the float32 run's draws, and each run takes its own precision where the source names one."
+   "note": "ImaginaireTrainer_Distill.training_step over T2VDistillModel_rCM's closures, its two torch Adam optimizers and FastEmaModelUpdater, ten iterations from a teacher stand-in network with per-entry weights; the float64 run replays the float32 run's draws, and each run takes its own precision where the source names one. A second run (dcm/*) takes rCM's discrete-time consistency (_student_dcm_step)."
   },
   "reference_runs": {
    "tool": "tools/reference_runs/lm_steps_fixture.py",
