@@ -393,6 +393,27 @@
    ],
    "note": "compute_density_for_timestep_sampling on the draws FlowMatchingScheduler.sample_t makes from jax.random.key(0)."
   },
+  "flow/loss.npz": {
+   "tool": "tools/flow_loss_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/diffusers",
+     "version": "50dea89dc6036e71a00bc3d57ac062a80206d9eb",
+     "runs": "fetched"
+    },
+    {
+     "repo": "huggingface/diffusers",
+     "version": "0.34.0",
+     "runs": "diffusers"
+    },
+    {
+     "repo": "pytorch/pytorch",
+     "version": "2.14.0",
+     "runs": "torch"
+    }
+   ],
+   "note": "Executes the Flux DreamBooth script's noising and loss statements (v0.34.0) with compute_loss_weighting_for_sd3, around a stand-in velocity network, on Dew's draws; FlowMatchEulerDiscreteScheduler(shift=3)'s sigma grid."
+  },
   "flow/resolution_shift.npz": {
    "tool": "tools/flux_shift_reference.py",
    "sources": [
