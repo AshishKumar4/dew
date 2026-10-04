@@ -107,7 +107,10 @@ def head_logits(hidden, head_weight, *, softcap: float | None,
 
 def _without(logits, first, excluded):
     """`logits` of the columns from `first` on, with column `excluded` (a
-    traced id, -1 for none) given no mass: -inf, so its probability is 0."""
+    traced id) given no mass: -inf, so its probability is 0. With None the
+    logits pass untouched and the program holds no comparison."""
+    if excluded is None:
+        return logits
     columns = first + jax.lax.broadcasted_iota(jnp.int32, logits.shape, logits.ndim - 1)
     return jnp.where(columns == excluded, -jnp.inf, logits)
 
@@ -502,6 +505,7 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
     column the distribution gives no mass, left out of the partition and the
     prediction in every tile: a masked diffusion model's mask token, which
     MDLM's SUBS parameterization never predicts. A target there scores +inf.
+    At None, the default, the compiled program holds no trace of it.
 
     On a mesh every device scores its own tokens (`_token_spec`): the token
     tiles are dynamic slices in a loop, which GSPMD would only compute on a
@@ -544,7 +548,7 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
         return _capped(jax.vmap(lambda state, row: _tile_logits(
             state[None].astype(operands), row[None], effective)[0, 0])(states, rows), cap, temperature)
 
-    left_out = jnp.asarray(-1 if excluded is None else excluded, jnp.int32)
+    left_out = None if excluded is None else jnp.asarray(excluded, jnp.int32)
     mesh = jax.sharding.get_abstract_mesh()
     if mesh.empty:
         return head(hidden, table, targets, left_out, cap)
@@ -629,7 +633,8 @@ def _vocabulary_split(hidden, table, targets, excluded, cap, group: tuple[str, .
     offset = jax.lax.axis_index(group) * table.shape[0]
     labels = jax.lax.all_gather(targets.reshape(count), group, axis=0, tiled=True) - offset
     # The excluded column, like the targets, in this device's own numbering.
-    losses, predicted, log_z = head(states, table, labels, excluded - offset, cap)
+    local_excluded = None if excluded is None else excluded - offset
+    losses, predicted, log_z = head(states, table, labels, local_excluded, cap)
     # Stopped before the max: pmax has no derivative rule, and a stop after it
     # still differentiates it.
     peak = jax.lax.pmax(jax.lax.stop_gradient(log_z), group)
