@@ -184,6 +184,9 @@ TRAINING = {"teacher_guidance": 2.5, "fd_type": 0, "tangent_warmup": 3, "loss_sc
             "trainer": types.SimpleNamespace(grad_accum_iter=1, distributed_parallelism="none")}
 ITERATIONS, LEARNING_RATE, EPSILON = 10, 1e-2, 1e-8
 BETAS = (0.5, 0.75)
+PUBLISHED = {"lr": 1e-4, "betas": (0.9, 0.99), "eps": 1e-8, "weight_decay": 0.1}
+"""rCM's published optimizer (rcm/configs/defaults/optimizer.py, AdamWConfig),
+which a coarser test holds Dew to within that bias-correction rounding."""
 """Adam's decays, exact in binary with their powers: optax rounds its bias
 corrections 1 - beta^t in float32 and torch in float64, which at the
 default 0.999 alone moves a float32 step by 6e-6 of itself, more than the
@@ -273,7 +276,7 @@ class Precision:
         torch.Tensor.float, torch.Tensor.double = self.kept
 
 
-def trained(dtype, pixels, label, teacher, replayed=None) -> tuple[dict, list[torch.Tensor]]:
+def trained(dtype, pixels, label, teacher, replayed=None, optimizer=None) -> tuple[dict, list[torch.Tensor]]:
     """`ITERATIONS` of the reference's `ImaginaireTrainer_Distill.training_step`
     over the model's closures, with its two Adam optimizers and its EMA,
     from student and fake score copies of `teacher`."""
@@ -305,8 +308,12 @@ def trained(dtype, pixels, label, teacher, replayed=None) -> tuple[dict, list[to
             for name in ("net", "net_fake_score", "net_ema")}
     teacher_net = Velocity(torch.as_tensor(teacher, dtype=dtype)).requires_grad_(requires_grad=False)
     nets["net_ema"].requires_grad_(requires_grad=False)
-    optimizers = {name: torch.optim.Adam(nets[network].parameters(), lr=LEARNING_RATE, betas=BETAS,
-                                         eps=EPSILON)
+    def made(parameters):
+        if optimizer is None:
+            return torch.optim.Adam(parameters, lr=LEARNING_RATE, betas=BETAS, eps=EPSILON)
+        return torch.optim.AdamW(parameters, **optimizer)
+
+    optimizers = {name: made(nets[network].parameters())
                   for name, network in (("net", "net"), ("fake_score", "net_fake_score"))}
     model = types.SimpleNamespace(
         config=types.SimpleNamespace(**TRAINING), tensor_kwargs={"dtype": dtype},
@@ -378,6 +385,11 @@ def training() -> None:
     arrays.update(narrow)
     arrays.update({f"{name}_f64": value for name, value in wide.items()})
     arrays.update(by_role(drawn))
+    published, _ = trained(torch.float32, pixels, label, teacher, replayed=drawn, optimizer=PUBLISHED)
+    published_wide, _ = trained(torch.float64, pixels, label, teacher, replayed=drawn, optimizer=PUBLISHED)
+    arrays.update({f"published/{name}": value for name, value in published.items()})
+    arrays.update({f"published/{name}_f64": value for name, value in published_wide.items()})
+    arrays["published"] = np.asarray(json.dumps(PUBLISHED))
     np.savez(FIXTURE / "training.npz", **arrays)
     print(f"{FIXTURE}: rCM's loop over {ITERATIONS} iterations, float32 and float64")
 
