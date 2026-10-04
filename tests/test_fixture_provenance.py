@@ -15,6 +15,10 @@ golden and says so (`"generator": "dew"`), claiming no upstream.
 tool that wrote them, or the pinned repo they were taken from, and the
 files. Every .npz, .npy, .safetensors, .pt, .xz and .jaxexport file is in
 exactly one of the two parts, so a new array file with no record fails.
+
+A record keyed by a directory claims it: its tool writes the directory whole,
+and tests/test_tools.py compares a generator's listing only against a
+directory it claims, so no other writer's file may sit in one.
 """
 
 import json
@@ -134,6 +138,44 @@ def test_an_input_group_names_what_wrote_its_files(group):
     unnamed = [path for path in group["files"]
                if not named_in(source, Path(path).parent.name or Path(path).name.split(".")[0])]
     assert unnamed == []
+
+
+def claimed() -> set[str]:
+    """The directories a record claims whole."""
+    return {key for key in RECORDS if (FIXTURES / key).is_dir()}
+
+
+def writer(record: dict) -> str:
+    return record.get("tool") or f"generator {record.get('generator')}"
+
+
+def intruders(records: dict, directories: set[str]) -> dict[str, str]:
+    """Each record inside a claimed directory that names another writer,
+    with the directory. A claimed directory nested in another is its own."""
+    found = {}
+    for key, record in records.items():
+        above = [directory for directory in directories if key.startswith(directory + "/")]
+        if key in directories or not above:
+            continue
+        owner = max(above, key=len)
+        if writer(record) != writer(records[owner]):
+            found[key] = owner
+    return found
+
+
+def test_a_claimed_directory_holds_only_its_own_tools_files():
+    """Two tools writing into one directory break the generator test that
+    compares the directory's listing. Files the owning tool also records one
+    by one pass; an input group's file inside a claimed directory already
+    has two records and fails the test below."""
+    assert intruders(RECORDS, claimed()) == {}
+    moe = {"tool": "tools/moe_reference.py"}
+    assert intruders({"moe": moe, "moe/solvers.npz": {"tool": "tools/flaxdiff_solver_reference.py"}},
+                     {"moe"}) == {"moe/solvers.npz": "moe"}
+    golden = {"generator": "dew"}
+    assert intruders({"moe": moe, "moe/golden.npz": golden}, {"moe"}) == {"moe/golden.npz": "moe"}
+    assert intruders({"moe": moe, "moe/tiny.npz": moe, "moe/sub": golden, "moe/sub/golden.npz": golden},
+                     {"moe", "moe/sub"}) == {}
 
 
 def test_every_array_file_has_exactly_one_record():

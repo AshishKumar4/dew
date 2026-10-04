@@ -1,4 +1,4 @@
-"""EDM's and EDM2's training losses, for tests/fixtures/edm/loss.npz.
+"""EDM's and EDM2's training losses, for tests/fixtures/edm_loss/loss.npz.
 
 The references are NVlabs' own loss classes and preconditioners, read at the
 pinned commits the sampler and network fixtures use and executed as
@@ -39,7 +39,7 @@ import torch
 
 EDM = "008a4e5316c8e3bfe61a62f874bddba254295afb"
 EDM2 = "4bf8162f601bcc09472ce8a32dd0cbe8889dc8fc"
-FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "edm" / "loss.npz"
+FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "edm_loss" / "loss.npz"
 IMAGES, CHANNELS, SIZE, LOGVAR_CHANNELS = 6, 3, 4, 16
 TINY_UNET = {"model_channels": 8, "channel_mult": [1], "num_blocks": 1, "attn_resolutions": []}
 """Precond builds a U-Net it is then given the stand-in in place of; a tiny one."""
