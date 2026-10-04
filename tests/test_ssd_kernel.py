@@ -556,7 +556,8 @@ def test_the_interpreted_kernel_is_as_exact_as_the_xla_scan(shape, chunk_size):
     for name, mine, theirs, wide, want in zip(names, (*kernel, *kernel_gradients), (*xla, *xla_gradients),
                                               twin, truth, strict=True):
         assert np.all(np.isfinite(np.asarray(mine))), name
-        assert_computes_the_oracle(wide, np.asarray(theirs), want, name)
+        # The carry runs over every step; each step sums the state and head widths.
+        assert_computes_the_oracle(wide, want, name, roundings=shape[1] + shape[3] + shape[4])
         assert_as_exact_as_the_reference(np.asarray(mine), np.asarray(theirs), want, name)
 
 

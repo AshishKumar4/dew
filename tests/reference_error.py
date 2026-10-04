@@ -42,8 +42,8 @@ Where the truth is an oracle written apart from the reference (a recurrence
 or an equation, not the reference run in float64), the rule only measures
 rounding if the reference computes the oracle's function: a reference that
 shares Dew's mistake would widen the bound to fit it. So the reference's own
-arithmetic in float64 is held to the oracle first, within the float64 share
-of the reference's rounding (`assert_computes_the_oracle`).
+arithmetic in float64 is held to the oracle first, within the float64
+rounding of the computation itself (`assert_computes_the_oracle`).
 """
 
 import numpy as np
@@ -80,19 +80,20 @@ def assert_as_exact_as_the_reference(dew, reference, truth, label: str) -> None:
         f"(ratio {mine / theirs:.2f}, allowed {FACTOR})")
 
 
-def assert_computes_the_oracle(reference_in_float64, reference, truth, label: str) -> None:
-    """The reference run in float64 within FACTOR times its own fp32 error,
-    scaled by the float64-to-fp32 ratio of unit roundoffs for each of the two
-    float64 runs, of an independent float64 oracle: the two compute one
-    function, and any difference in it moves the twin by far more. For a
-    rounded computation: one whose fp32 run is exact gives a bound of zero,
-    which the reference refuses (`assert_as_exact_as_the_reference` does too)."""
-    twin = 2 * float(np.finfo(np.float64).eps / np.finfo(np.float32).eps)
-    apart, theirs = distance(reference_in_float64, truth), distance(reference, truth)
-    assert theirs > 0, f"{label}: the reference equals float64, so it bounds nothing"
-    assert apart <= FACTOR * twin * theirs, (
+def assert_computes_the_oracle(reference_in_float64, truth, label: str, *, roundings: int) -> None:
+    """The reference run in float64 within the float64 rounding of the
+    computation itself of an independent float64 oracle: FACTOR times
+    `roundings` (the longest chain of roundings an output goes through, its
+    reductions' lengths summed along the way) float64 unit roundoffs of the
+    truth's RMS scale. Two float64 runs of one function part by that much at
+    most; any difference in the function moves the twin by many orders of
+    magnitude more. The fp32 error is no measure of it: a near-exact fp32 path
+    leaves the float64 runs a few ulps apart all the same."""
+    eps = float(np.finfo(np.float64).eps)
+    apart, scale = distance(reference_in_float64, truth), float(np.sqrt(np.mean(np.square(truth))))
+    assert apart <= FACTOR * roundings * eps * scale, (
         f"{label}: the reference in float64 is {apart:.3e} from the oracle (rms), more than float64 "
-        f"rounding of its fp32 error {theirs:.3e}")
+        f"rounding over {roundings} steps of its scale {scale:.3e}")
 
 
 def assert_rounds_where_the_reference_does(dew, reference, truth, label: str) -> None:

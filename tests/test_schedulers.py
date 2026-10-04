@@ -19,6 +19,7 @@ import dew.diffusion.schedules as schedulers
 from dew.diffusion import (
     DirectPredictionTransform,
     EpsilonPredictionTransform,
+    FlowMatchPredictionTransform,
     KarrasPredictionTransform,
     MinSNR,
     Process,
@@ -103,6 +104,24 @@ def test_forward_diffusion_invertible(cls, make, steps, family, sample_shape, rn
     recovered, _ = EpsilonPredictionTransform().backward_diffusion(xt, target, rates)
     assert xt.shape == x0.shape
     assert jnp.max(jnp.abs(recovered - x0)) < 1e-4
+
+
+@pytest.mark.parametrize("make", [SqrtContinuousNoiseScheduler,
+                                  partial(KarrasVENoiseScheduler, sigma_max=80, rho=7, sigma_data=0.5)],
+                         ids=["continuous", "generalized"])
+def test_uniform_training_times_follow_the_uniform_law(make):
+    """A continuous schedule (`ContinuousNoiseScheduler`) and a generalized
+    one (`GeneralizedNoiseScheduler`) train on times drawn uniformly over
+    [0, T). Over 2^16 draws, scipy's one-sample Kolmogorov-Smirnov test
+    against U(0, T) must not reject at one in a billion, which fails any law
+    whose CDF strays from the uniform's by more than 0.013 anywhere; every
+    draw lies in [0, T)."""
+    from scipy import stats
+
+    schedule = make()
+    t = np.asarray(schedule.sample_t(jax.random.key(17), 1 << 16), np.float64)
+    assert t.min() >= 0 and t.max() < schedule.T
+    assert stats.kstest(t, stats.uniform(0, schedule.T).cdf).pvalue > 1e-9
 
 
 @pytest.mark.parametrize("cls,make,steps,family", ALL_CASES, ids=ALL_IDS)
@@ -323,6 +342,32 @@ def test_min_snr_weights_the_same_clean_image_prediction_the_same_whatever_the_p
     np.testing.assert_allclose(process.weight(CONTINUOUS_STEPS) * error,
                                jnp.minimum(snr, 5.0) * jnp.mean(jnp.square(estimate - x_0), axis=(1, 2, 3)),
                                rtol=1e-4)
+
+
+def test_min_snr_weights_a_flow_velocity_as_the_clean_image_it_reads_out():
+    """Min-SNR-gamma's START_X weight, min(SNR, gamma) on the x_0 loss, on
+    the rectified-flow path x_t = (1 - t) x_0 + t eps, where SNR is
+    ((1 - t) / t)^2 and a velocity v reads out x_0 = x_t - t v: the weighted
+    velocity loss of a model whose read-out is `estimate` is min(SNR, gamma)
+    times the clean image's squared error, as a direct x_0 prediction of
+    the same image on the same path is weighted."""
+    schedule = FlowMatchingScheduler()
+    t = CONTINUOUS_STEPS
+    x_0, epsilon = (jax.random.normal(key, (4, 3, 3, 1)) for key in jax.random.split(jax.random.key(2)))
+    estimate = x_0 + 0.1 * jax.random.normal(jax.random.key(3), x_0.shape)
+    path_t = np.asarray(t, np.float64)
+    snr = ((1 - path_t) / path_t) ** 2
+    want = np.minimum(snr, 5.0) * np.mean(np.square(np.asarray(estimate - x_0, np.float64)), axis=(1, 2, 3))
+    rates = broadcast_rates(schedule, t, x_0)
+    for transform in (FlowMatchPredictionTransform(), DirectPredictionTransform()):
+        process = Process(schedule, transform, weighting=MinSNR(5.0))
+        x_t, _, target = transform.forward_diffusion(x_0, epsilon, rates)
+        velocity = isinstance(transform, FlowMatchPredictionTransform)
+        raw = (x_t - estimate) / expand(t, x_0) if velocity else estimate
+        read = transform.pred_transform(x_t, raw, rates, t)
+        error = jnp.mean(jnp.square(read - target), axis=(1, 2, 3))
+        np.testing.assert_allclose(process.weight(t) * error, want, rtol=2e-5,
+                                   err_msg=type(transform).__name__)
 
 
 def test_min_snr_weights_are_capped_and_non_increasing_in_snr():

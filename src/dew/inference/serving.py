@@ -10,11 +10,15 @@ its own cursor, length and budget, and the attention mask hides free rows
 and bucket filler.
 
 The model's attention indexes its cache by batch row (`open_kv_cache` writes
-`cache[row, cursor]`), so the admitted prompts run as one forward at their
-own width and the decode trip as another, in one program. The admission
-forward is `admission` rows at a `SHAPE_BUCKETS` width capped at the
-capacity, so a server compiles one program per prompt bucket plus the
-decode-only one.
+`cache[row, cursor]`). Where every cached layer is plain attention over a
+dense cache, an admitting step is one forward over every token it runs: each
+row's last draw and the admitted prompts, laid out in one row
+(`dew.nn.inputs.Admitted`), so the projections read their weights once.
+Otherwise (`Server.mixed_refusal` says why) the prompts run as one forward at
+their own width and the decode trip as another, in one program. The prompts
+are the fewest power-of-two rows that hold them (`admission_share`) at a
+`SHAPE_BUCKETS` width capped at the capacity, so a server compiles one
+program per prompt bucket plus the decode-only one.
 
 `Server.from_task(task, slots=, capacity=)` builds it, so `dew.pipeline`
 stays the one way to load weights and a processor, and every request runs
@@ -53,6 +57,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import functools
+import logging
 import math
 import time
 from collections import deque
@@ -76,7 +81,7 @@ from dew.interop.streaming import SourceLeaf
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import GatedMLP
 from dew.nn.backbones.layer_plan import group_layers
-from dew.nn.inputs import ModelInputs, host_token_rows, mesh_of, request_key
+from dew.nn.inputs import Admitted, ModelInputs, host_token_rows, mesh_of, request_key
 from dew.nn.kv_cache import (
     CURSOR,
     POOLED,
@@ -234,6 +239,8 @@ class Slots:
     automaton: jax.Array
 
 
+_log = logging.getLogger(__name__)
+
 @struct.dataclass
 class Admission:
     """The prompt pieces one step prefills, `[rows, width]`, and per row:
@@ -344,9 +351,15 @@ def admission_share(waiting: int, share: int) -> int:
 
 @dataclasses.dataclass(frozen=True)
 class Dense:
-    """Admission over a dense cache: whole prompts, each into its own rows, in `groups` groups."""
+    """Admission over a dense cache: whole prompts, each into its own rows, in `groups` groups.
+
+    `mixed` runs the admitting step as one forward over the decoding rows'
+    tokens and the prompts (`_mixed_step`) where the model allows it
+    (`_mixed_refusal`); otherwise the prompts prefill in a forward of their own.
+    """
 
     groups: int = 1
+    mixed: bool = False
 
     def prefilled(self, model: nn.Module, params: Variables, pad_id: int, state: Slots,
                   admission: Admission) -> tuple[DecoderState, jax.Array]:
@@ -420,15 +433,24 @@ def _advanced(model: nn.Module, params: Variables, pad_id: int, placement: Place
     in the step after the one that drew it, and a row that feeds nothing,
     one seated this step, keeps the logits its prompt left.
     """
-    if admission is not None:
+    mixed = admission is not None and isinstance(placement, Dense) and placement.mixed
+    if mixed:
+        assert admission is not None
+        real = jnp.any(admission.prompts.token_fields["attention_mask"], axis=1)
+        state = _seated(state, state.decoder, real, admission, placement.groups)
+    elif admission is not None:
         state = _seated(state, *placement.prefilled(model, params, pad_id, state, admission), admission,
                         placement.groups)
-    ops = _operations(model, params, pad_id, prediction_depths(model))
     capacity = state.tokens.shape[1] // 2
     fed = state.active & (state.step > 0)
     last = jnp.take_along_axis(state.tokens, (capacity + state.step - 1)[:, None], axis=1)[:, 0]
-    decoder = ops.advance(state.decoder, last, fed)
-    if admission is not None:
+    if mixed:
+        assert admission is not None
+        decoder = _mixed_step(model, params, pad_id, state.decoder, last, fed, admission)
+    else:
+        ops = _operations(model, params, pad_id, prediction_depths(model))
+        decoder = ops.advance(state.decoder, last, fed)
+    if admission is not None and not mixed:
         # Only a row seated this step draws without feeding; with no admission
         # every drawing row fed, and the step's logits replace the held ones
         # whole, without a pass over every slot's vocabulary to merge them.
@@ -446,6 +468,68 @@ def _advanced(model: nn.Module, params: Variables, pad_id: int, placement: Place
                   drawn & ~stopped & (committed.step < state.budget), state.keys,
                   state.automaton if grammar is None else grammar.advanced(state.automaton, token, drawn)),
             Draws(token, drawn, stopped, jnp.where(drawn, behavior, 0.0), jnp.where(drawn, raw, 0.0)))
+
+
+def _mixed_step(model: nn.Module, params: Variables, pad_id: int, decoder: DecoderState, last: jax.Array,
+                fed: jax.Array, admission: Admission) -> DecoderState:
+    """The admitting step's forward over every token it runs: each slot's
+    last draw where it feeds, then the admitted prompts, left-padded, in one
+    row (`dew.nn.inputs.Admitted`). The projections read their weights once
+    for both, where a prefill of its own read them a second time. A fed
+    row's logits are its token's; a seated row's are its prompt's last."""
+    rows = last.shape[0]
+    tokens, valid = admission.prompts.tokens, admission.prompts.token_fields["attention_mask"]
+    pieces, width = tokens.shape
+    flat = jnp.concatenate([jnp.where(fed, last, pad_id), jnp.where(valid, tokens, pad_id).reshape(-1)])
+    real = jnp.concatenate([fed, valid.reshape(-1)])
+    scored = jnp.concatenate([jnp.arange(rows), rows + jnp.arange(pieces) * width + width - 1])
+    (_, logits), updated = model.apply(
+        {**params, "cache": decoder.cache}, flat[None], scored[None], decode=True, attention_mask=real[None],
+        admitted=Admitted(slots=admission.slots, cursors=admission.cursors, continuing=False),
+        mutable=["cache"],
+        method="states_and_logits_at")
+    held = jnp.where(fed[:, None], logits[0, :rows], decoder.logits)
+    seated = jnp.where(admission.final, admission.slots, rows)
+    return dataclasses.replace(decoder, cache=updated["cache"],
+                               logits=held.at[seated].set(logits[0, rows:], mode="drop"))
+
+
+def _mixed_refusal(model: nn.Module, params: Variables, shapes: Slots, groups: int) -> str | None:
+    """Why a dense server's admitting step keeps the prompts' prefill in a
+    forward of its own, or None when one mixed forward (`_mixed_step`) runs
+    the model as the two would."""
+    if not isinstance(model, CausalTransformer):
+        return f"{type(model).__name__} is not a CausalTransformer"
+    if groups > 1:
+        return "its slots split into the mesh's row groups"
+    if prediction_depths(model):
+        return "it runs prediction depths"
+    if shapes.decoder.positions is not None:
+        return "its rows carry their own rotary positions"
+    if model.position_embedding == "learned" or model.engram is not None or model.hash_layers:
+        return "a learned position embedding, n-gram or hash routing reads beyond the token"
+    for path, _ in jax.tree_util.tree_leaves_with_path(shapes.decoder.cache):
+        if leaf_name(path) not in {"cached_key", "cached_value", CURSOR}:
+            return f"{jax.tree_util.keystr(path)} is not plain attention's cache"
+    rows = shapes.decoder.logits.shape[0]
+    try:
+        jax.eval_shape(lambda params, decoder: _mixed_step(
+            model, params, 0, decoder, jnp.zeros(rows, jnp.int32), jnp.zeros(rows, bool), _probe_admission()),
+            params, shapes.decoder)
+    except ValueError as refused:
+        if "mixed serving step" not in str(refused):
+            raise
+        return str(refused)
+    return None
+
+
+def _probe_admission() -> Admission:
+    """One admitted row of 64 tokens for `_mixed_refusal`'s trace, which
+    reads its prompt, slot, cursor and finality."""
+    one = jnp.zeros(1, jnp.int32)
+    return Admission(ModelInputs(jnp.zeros((1, 64), jnp.int32), {"attention_mask": jnp.zeros((1, 64), bool)}),
+                     slots=one, budgets=one, keys=one, tables=one, cursors=one,
+                     final=jnp.zeros(1, bool), history=one, history_valid=one)
 
 
 def _split(state: Slots) -> tuple[Slots, Slots]:
@@ -881,6 +965,15 @@ class Server:
             shapes = jax.eval_shape(functools.partial(_opened, model, pad_id=self.pad_id, slots=slots,
                                                       capacity=capacity), variables)
             rows.check(shapes.decoder.cache)
+            self.mixed_refusal = "a paged cache"
+            """Why the admitting step prefills in a forward of its own, or None
+            when it runs one mixed forward (`_mixed_step`)."""
+            if isinstance(rows, DenseRows):
+                self.mixed_refusal = _mixed_refusal(model, self.variables, shapes, self.groups)
+                if self.mixed_refusal is None:
+                    rows.placement = Dense(self.groups, mixed=True)
+            if self.mixed_refusal is not None:
+                _log.info("the admitting step prefills in a forward of its own: %s", self.mixed_refusal)
             if isinstance(rows, PagedRows) and prediction_depths(model):
                 raise ValueError("a paged server runs no prediction depths; their cache is seeded "
                                  "over the whole prompt at once")

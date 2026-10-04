@@ -177,6 +177,17 @@ def write_cache(buffer: jax.Array, values: jax.Array, positions: jax.Array) -> j
     return from_words(words, buffer.dtype)
 
 
+def write_tokens(buffer: jax.Array, values: jax.Array, rows: jax.Array, positions: jax.Array) -> jax.Array:
+    """`values` `[tokens, ...]` written to `buffer` `[rows, slots, ...]`, each
+    at its own row and slot; a row past the buffer's or a slot of -1 drops.
+
+    A serving step's mixed call (`dew.nn.inputs.Admitted`) writes its
+    decoding rows' tokens and its prompts' in this one scatter, as words."""
+    slots = jnp.where(positions >= 0, positions, DROPPED)
+    written = as_words(buffer).at[rows, slots].set(as_words(values.astype(buffer.dtype)), mode="drop")
+    return from_words(written, buffer.dtype)
+
+
 def as_words(x: jax.Array) -> jax.Array:
     """`x`'s bits with its last axis packed into uint32 words, for a scatter
     to move on a GPU.

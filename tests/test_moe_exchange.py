@@ -1,7 +1,7 @@
 """Dropless exchange and capacity dropping against the global sort/gather path on CPU.
 
 Capacity dropping is also held to MaxText's own `generate_masks`
-(tests/fixtures/moe/maxtext_capacity.npz, tools/maxtext_capacity_reference.py)
+(tests/fixtures/maxtext/capacity.npz, tools/maxtext_capacity_reference.py)
 and the layer to a float64 expert loop over the slots it keeps.
 """
 
@@ -25,7 +25,7 @@ from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.moe import ExpertMLP, capacity_positions
 from dew.training import DEFAULT_RULES, MeshSpec
 
-MAXTEXT = Path(__file__).resolve().parent / "fixtures" / "moe" / "maxtext_capacity.npz"
+MAXTEXT = Path(__file__).resolve().parent / "fixtures" / "maxtext" / "capacity.npz"
 
 pytestmark = pytest.mark.mesh
 
@@ -299,7 +299,9 @@ def test_capacity_drops_compute_maxtexts_experts(maxtext, case, dispatch, spec):
         if name == "weights":
             np.testing.assert_array_equal(np.where(kept, 0, mine), 0)
             mine, theirs, wide_theirs, want = (value[kept] for value in (mine, theirs, wide_theirs, want))
-        assert_computes_the_oracle(wide_theirs, theirs, want, f"{case} {name}")
+        # The two projections' widths, the experts a token sums and the tokens a weight sums.
+        assert_computes_the_oracle(wide_theirs, want, f"{case} {name}",
+                                   roundings=8 + 12 + shape["top_k"] + shape["batch"] * shape["length"])
         assert_as_exact_as_the_reference(mine, theirs, want, f"{case} {dispatch} {name}")
 
 
