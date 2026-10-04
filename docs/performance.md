@@ -1065,8 +1065,8 @@ output tokens a second (three repeats; Dew two processes a side, vLLM
 The same benchmark later the same day, Dew at `88620c1d` (the prefill's
 cuDNN attention, the head's bf16 logits held as bf16 and the cache writes
 as words, all below) and vLLM 0.30.0 in one session, alternating, two
-processes each, every repeat shown, with another lane holding the host's
-load average near 50:
+processes each, the range over every repeat, with another lane holding the
+host's load average near 50:
 
 | slots | vLLM | Dew `88620c1d` | Dew / vLLM, medians |
 |---:|---:|---:|---:|
@@ -1075,8 +1075,10 @@ load average near 50:
 | 128 | 8949-9049 | 8957-8985 | 1.00 |
 
 Dew is level with vLLM at 64 and 128 slots and 4% behind at 32, where a
-step is shortest and the host's share largest. Evidence:
-`~/.cache/dew/verification-evidence/serving-board-1003/`.
+step is shortest and the host's share largest. Each process is
+`tools/benchmark_lm_serving.py --backend dew` (or `vllm-engine`, with
+`VLLM_ENABLE_V1_MULTIPROCESSING=0`) `--slots 32,64,128 --repeats 3` over the
+Qwen3-0.6B checkpoint; its JSON holds each repeat's `output_tokens_per_second`.
 
 At 64 slots a Dew decode step takes 6.96 ms on the device: attention 4.0
 ms, at the bound of reading the dense cache's keys and values (2.8 GB a
