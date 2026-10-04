@@ -43,6 +43,7 @@ import jax.extend
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from reference_error import assert_as_exact_as_the_reference, assert_computes_the_oracle
 
 from dew.nn.kernels.ssd import MIN_CHUNK, MIN_WIDTH, ssd_chunk_scan, ssd_kernel_platform, ssd_kernel_runs
 from dew.nn.mixers.mamba2 import RESET_DECAY, chunk_ssd, xla_chunk_scan
@@ -500,6 +501,63 @@ def test_the_compiled_kernel_is_as_exact_as_the_xla_scan(shape, chunk_size):
         assert np.all(np.isfinite(np.asarray(mine))), name
         ours, reference = root_mean_square(mine, want), root_mean_square(theirs, want)
         assert ours <= 2 * reference, (name, ours, reference, largest(mine, theirs))
+
+
+# (batch, steps, heads, head width, state, groups), chunk: a tail of one step
+# short, whole chunks, a tail of one step over, four chunks with a ragged
+# tail, at widths the kernel takes and fewer groups than heads; then the
+# default chunk at a production head width and state.
+ORACLE_SHAPES = [
+    pytest.param((2, 63, 4, 8, 8, 2), 64, id="one-short"),
+    pytest.param((2, 64, 4, 8, 8, 2), 64, id="whole-chunk"),
+    pytest.param((2, 65, 4, 16, 8, 2), 64, id="one-over"),
+    pytest.param((2, 193, 4, 16, 8, 2), 64, id="four-chunks-ragged"),
+    pytest.param((2, 257, 2, 64, 128, 1), 256, id="default-chunk"),
+]
+
+
+@pytest.mark.parametrize(("shape", "chunk_size"), ORACLE_SHAPES)
+def test_the_interpreted_kernel_is_as_exact_as_the_xla_scan(shape, chunk_size):
+    """The kernel, interpreted on this host, forward and all five gradients,
+    against the stepwise recurrence in float64 (`stepwise_scan`, which
+    shares no line with either chunked path), by tests/reference_error.py's
+    rule: no further from it than twice the XLA path's fp32 rounding, whose
+    own arithmetic in float64 is first held to the recurrence. A
+    nonzero entering state, steps that decay a chunk's state by about e
+    (Mamba-2's small steps; at `mixer_operands`' own a chunk's carry
+    vanishes and its gradient with it), and document resets at a chunk's
+    first step and inside one, in chunks apart from ones that carry."""
+    x, dt, A, B, C, _, state = mixer_operands(shape)
+    x_c, b_c, c_c, a_c, state = blocks(x, dt / chunk_size, A, B, C, state, chunk_size)
+    # A reset zeroes its chunk's carry, so the chunks it misses keep one.
+    if a_c.shape[1] > 1:
+        a_c = a_c.at[0, -1, :, 5].set(RESET_DECAY)
+    if a_c.shape[0] > 1:
+        a_c = a_c.at[1, 0, :, 0].set(RESET_DECAY)
+    operands = (x_c, b_c, c_c, a_c, state)
+    seeded = cotangents(*xla_chunk_scan(*operands))
+    with jax.enable_x64(new_val=True):
+        exact = [jnp.asarray(np.asarray(t), jnp.float64) for t in operands]
+        truth = jax.jit(stepwise_scan)(*exact)
+        truth_gradients = jax.jit(lambda *o: jax.vjp(stepwise_scan, *o)[1](
+            tuple(jnp.asarray(np.asarray(t), jnp.float64) for t in seeded)))(*exact)
+        truth = [np.asarray(t) for t in (*truth, *truth_gradients)]
+        twin = jax.jit(xla_chunk_scan)(*exact)
+        twin_gradients = jax.jit(lambda *o: jax.vjp(xla_chunk_scan, *o)[1](
+            tuple(jnp.asarray(np.asarray(t), jnp.float64) for t in seeded)))(*exact)
+        twin = [np.asarray(t) for t in (*twin, *twin_gradients)]
+
+    xla = jax.jit(xla_chunk_scan)(*operands)
+    xla_gradients = jax.jit(lambda *o: jax.vjp(xla_chunk_scan, *o)[1](seeded))(*operands)
+    kernel = ssd_chunk_scan(*operands, "tpu")
+    kernel_gradients = jax.vjp(lambda *o: ssd_chunk_scan(*o, "tpu"), *operands)[1](seeded)
+
+    names = ("output", "final", "x", "B", "C", "A dt", "state")
+    for name, mine, theirs, wide, want in zip(names, (*kernel, *kernel_gradients), (*xla, *xla_gradients),
+                                              twin, truth, strict=True):
+        assert np.all(np.isfinite(np.asarray(mine))), name
+        assert_computes_the_oracle(wide, np.asarray(theirs), want, name)
+        assert_as_exact_as_the_reference(np.asarray(mine), np.asarray(theirs), want, name)
 
 
 def test_the_kernel_indexes_its_blocks_in_int32_under_x64(reference):

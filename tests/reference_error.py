@@ -37,6 +37,13 @@ rounding boundary: an entry flips with probability about sqrt(K) 2^-24 /
 rounding error, so the ratio is near 2 sqrt(sqrt(K) 2^-16), 0.04 at K 512.
 One rounding at a point the reference does not round is an independent
 error of the reference's own size and puts the ratio near one.
+
+Where the truth is an oracle written apart from the reference (a recurrence
+or an equation, not the reference run in float64), the rule only measures
+rounding if the reference computes the oracle's function: a reference that
+shares Dew's mistake would widen the bound to fit it. So the reference's own
+arithmetic in float64 is held to the oracle first, within the float64 share
+of the reference's rounding (`assert_computes_the_oracle`).
 """
 
 import numpy as np
@@ -71,6 +78,21 @@ def assert_as_exact_as_the_reference(dew, reference, truth, label: str) -> None:
     assert mine <= FACTOR * theirs, (
         f"{label}: dew is {mine:.3e} from float64 (rms), the reference {theirs:.3e} "
         f"(ratio {mine / theirs:.2f}, allowed {FACTOR})")
+
+
+def assert_computes_the_oracle(reference_in_float64, reference, truth, label: str) -> None:
+    """The reference run in float64 within FACTOR times its own fp32 error,
+    scaled by the float64-to-fp32 ratio of unit roundoffs for each of the two
+    float64 runs, of an independent float64 oracle: the two compute one
+    function, and any difference in it moves the twin by far more. For a
+    rounded computation: one whose fp32 run is exact gives a bound of zero,
+    which the reference refuses (`assert_as_exact_as_the_reference` does too)."""
+    twin = 2 * float(np.finfo(np.float64).eps / np.finfo(np.float32).eps)
+    apart, theirs = distance(reference_in_float64, truth), distance(reference, truth)
+    assert theirs > 0, f"{label}: the reference equals float64, so it bounds nothing"
+    assert apart <= FACTOR * twin * theirs, (
+        f"{label}: the reference in float64 is {apart:.3e} from the oracle (rms), more than float64 "
+        f"rounding of its fp32 error {theirs:.3e}")
 
 
 def assert_rounds_where_the_reference_does(dew, reference, truth, label: str) -> None:
