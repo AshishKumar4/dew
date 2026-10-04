@@ -25,6 +25,7 @@ from flax.training import dynamic_scale as dynamic_scale_lib
 from typing_extensions import TypeVar
 
 from dew.objectives.base import FROZEN, Aux, Batch, Ratio, Step, Variables, merge
+from dew.training.narrow import forward_variables, narrowed
 from dew.training.state import Accumulation
 
 Loss = TypeVar("Loss", default=Ratio | jax.Array | float)
@@ -167,15 +168,18 @@ class Transaction:
     once here. `step` composes them for a resident run or for a host-master
     run; only where each phase executes differs.
     """
-    def __init__(self, objective, optimizer, accumulation: int, shapes):
+    def __init__(self, objective, optimizer, accumulation: int, shapes, copies=None):
         """Hold the objective, the optimizer and the shapes a step traces for.
 
         `shapes` is the traced result of the objective's loss, statistics and
         `Aux`. Statistics that are a `Ratio` or a bare scalar pool into one
         shared mean, which the window can sum and never has to replay.
+        `copies` names the parameters the forward reads through the state's
+        narrow copies, which the commit rewrites (`dew.training.narrow`).
         """
         self.objective = objective
         self.optimizer = optimizer
+        self.copies = copies or {}
         self.size = accumulation
         stats_shape, self.aux_shape = shapes
         self.shared = isinstance(stats_shape, (Ratio, jax.ShapeDtypeStruct))
@@ -354,8 +358,9 @@ class Transaction:
                     if averaged is None:
                         raise ValueError("the objective declares EMA but the state carries none")
                     averaged = ema_update(averaged, params, self.objective.ema.decay(current.updates))
+                compute = None if current.compute is None else narrowed(params, self.copies)
                 return dataclasses.replace(current, variables=params, opt_state=opt_state, ema=averaged,
-                                           updates=current.updates + 1)
+                                           updates=current.updates + 1, compute=compute)
 
             if scale is None:
                 return apply(current), native_finite
@@ -425,9 +430,14 @@ class Transaction:
             step_info = Step(state.microstep, jax.random.fold_in(state.key, state.step),
                         with_ema(state.variables, state.ema))
             factor = jnp.asarray(1., jnp.float32) if state.scale is None else state.scale.scale
-            realized = realize(state.variables, batch, step_info)
+            realized = realize(forward_variables(state.variables, state.compute), batch, step_info)
             loss, cotangent = reduce(realized.stats, factor)
-            gradient = unscale(realized.pullback(cotangent), factor)
+            gradient = realized.pullback(cotangent)
+            if state.compute is None:
+                gradient = unscale(gradient, factor)
+            # Otherwise no loss scale divides it (`Trainer._narrow_copies`),
+            # and a copied parameter's gradient stays bf16 until the update
+            # widens it as it reads it.
             pending = prepare(state, realized.stats, realized.aux, loss, gradient)
 
             def replay(_):
