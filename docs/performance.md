@@ -1193,6 +1193,31 @@ and 64 slots (the log-probabilities within 9.5e-6), while at 128 the
 decoding GEMMs inside the longer program autotune to other kernels.
 Evidence: `~/.cache/dew/verification-evidence/serving-multistep/`.
 
+The decoding step's small kernels, 2026-10-03. Per 64-slot decode step on
+the RTX 4080 Dew's device spends 8.39 ms to vLLM's about 8.05: GEMMs 3.37
+against 3.64, attention 3.84 against 3.79, everything else 1.18 against
+0.62. The largest of the rest was one kernel, 136 us a step: the held
+logits merged with the step's over every slot's vocabulary in fp32, so
+that a row seated this step drew from its prompt's. A step that seats no
+row has every drawing row fed, so it now takes the model's logits whole;
+only a seating step merges. Tokens a second, three alternating rounds,
+medians of five runs, the tokens and both log-probability streams the same
+in every run:
+
+| slots | before | after |
+|---:|---:|---:|
+| 32 | 5710 / 5729 / 3389 | 5780 / 5779 / 5746 |
+| 64 | 7364 / 7363 / 7236 | 7410 / 6545 / 7407 |
+| 128 | 8543 / 8527 / 8461 | 8610 / 8559 / 8609 |
+
+(one process each side ran on a load spike, 3389 and 6545). The bf16
+rounding of the logits now runs as its own kernel, 57 us a step. Not
+storing the step's logits at all lets XLA fuse that rounding into the
+draw, 27 us more, but the draw's log-softmax then sums in another order:
+at 32 slots 430 log-probabilities move by up to 3.8e-6, so the step still
+stores them.
+Evidence: `~/.cache/dew/verification-evidence/serving-kernels/`.
+
 ## Quantized serving of the 176M text-to-image model, 2026-09-28
 
 `TextToImage.quantized` serves the denoiser with its kernels stored as int8

@@ -295,6 +295,41 @@ def test_a_request_with_an_integer_seed_launches_nothing_until_admission(seed):
     assert_same_generation(ticket.result(), bound(prompt[None], 5, key=seed))
 
 
+def test_a_step_without_admission_draws_from_its_own_logits_without_merging_every_slot():
+    """With no admission every drawing row fed this step, so the logits it
+    draws from are the model's whole: no select over every slot's vocabulary
+    keeps a held row's (on an RTX 4080 at 64 slots, 136 us of an 8.4 ms
+    step). A step that seats rows still merges, since those draw from their
+    prompt's logits."""
+    from dew.inference.serving import _advanced, _joined
+
+    server = Server.from_task(task(Sampling(temperature=0, eos_id=None)), slots=2, capacity=64, admission=1)
+    server.submit(np.asarray([1, 2, 3], np.int32), 4, key=0)
+    admission = server._admit()
+    state = _joined(server._resident, server._carried)
+
+    def merges(admission):
+        jaxpr = jax.make_jaxpr(lambda state: _advanced(
+            server.model, server.variables, server.pad_id, server.rows.placement, state, admission,
+            server.transforms, server.stopping, server.grammar))(state)
+        return _selects(jaxpr.jaxpr, state.decoder.logits.shape)
+
+    assert admission is not None and merges(admission)
+    assert not merges(None)
+
+
+def _selects(jaxpr, shape) -> bool:
+    """Whether `jaxpr` or a jaxpr it calls selects an array of `shape`."""
+    for eqn in jaxpr.eqns:
+        if eqn.primitive.name == "select_n" and eqn.outvars[0].aval.shape == shape:
+            return True
+        for value in eqn.params.values():
+            inner = getattr(value, "jaxpr", value)
+            if hasattr(inner, "eqns") and _selects(inner, shape):
+                return True
+    return False
+
+
 def test_repeated_requests_reuse_their_programs_and_read_back_only_results():
     """Text requests of one bucket after the first run the program it
     compiled, and the host waits on nothing but what a request asks for:

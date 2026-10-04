@@ -414,9 +414,13 @@ def _advanced(model: nn.Module, params: Variables, pad_id: int, placement: Place
     capacity = state.tokens.shape[1] // 2
     fed = state.active & (state.step > 0)
     last = jnp.take_along_axis(state.tokens, (capacity + state.step - 1)[:, None], axis=1)[:, 0]
-    advanced = ops.advance(state.decoder, last, fed)
-    decoder = dataclasses.replace(advanced, logits=jnp.where(fed[:, None], advanced.logits,
-                                                             state.decoder.logits))
+    decoder = ops.advance(state.decoder, last, fed)
+    if admission is not None:
+        # Only a row seated this step draws without feeding; with no admission
+        # every drawing row fed, and the step's logits replace the held ones
+        # whole, without a pass over every slot's vocabulary to merge them.
+        decoder = dataclasses.replace(decoder, logits=jnp.where(fed[:, None], decoder.logits,
+                                                                state.decoder.logits))
     view = StepState(state.tokens, state.valid, state.step, state.active,
                      jax.random.wrap_key_data(state.keys), prompt_width=capacity)
     chain = decoding.chain(transforms)
