@@ -525,7 +525,7 @@
      "runs": "fetched"
     }
    ],
-   "note": "Fetches and executes published normalized_guidance/MomentumBuffer without importing diffusers."
+   "note": "Fetches and executes Diffusers' published AdaptiveProjectedGuidance guider (BaseGuidance.__init__/set_state, prepare_inputs, forward, _is_apg_enabled, normalized_guidance, MomentumBuffer) without importing diffusers; its batching helper and output container are stand-ins."
   },
   "guidance/autoguidance.npz": {
    "tool": "tools/guidance_reference.py",
@@ -537,6 +537,17 @@
     }
    ],
    "note": "Fetches and executes upstream edm_sampler with closed-form stand-in networks."
+  },
+  "guidance/interval.npz": {
+   "tool": "tools/guidance_reference.py",
+   "sources": [
+    {
+     "repo": "kynkaat/guidance-interval",
+     "version": "be70a2334f7ebf4e55fec981d518d5036a2ca19b",
+     "runs": "fetched"
+    }
+   ],
+   "note": "Fetches and executes the paper's edm_sampler with guidance_interval, closed-form stand-in networks."
   },
   "hf/deepseek-v2-tiny/logits.npy": {
    "tool": "tools/hf_reference_b.py",
