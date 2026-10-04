@@ -1062,6 +1062,22 @@ output tokens a second (three repeats; Dew two processes a side, vLLM
 | 64 | 7614-7618 | 6869-6879 | 7171-7204 |
 | 128 | 9037-9050 | 7758-7773 | 8230-8289 |
 
+The same benchmark later the same day, Dew at `88620c1d` (the prefill's
+cuDNN attention, the head's bf16 logits held as bf16 and the cache writes
+as words, all below) and vLLM 0.30.0 in one session, alternating, two
+processes each, every repeat shown, with another lane holding the host's
+load average near 50:
+
+| slots | vLLM | Dew `88620c1d` | Dew / vLLM, medians |
+|---:|---:|---:|---:|
+| 32 | 5903-6046 | 5490-5883 | 0.96 |
+| 64 | 7532-7563 | 7540-7619 | 1.01 |
+| 128 | 8949-9049 | 8957-8985 | 1.00 |
+
+Dew is level with vLLM at 64 and 128 slots and 4% behind at 32, where a
+step is shortest and the host's share largest. Evidence:
+`~/.cache/dew/verification-evidence/serving-board-1003/`.
+
 At 64 slots a Dew decode step takes 6.96 ms on the device: attention 4.0
 ms, at the bound of reading the dense cache's keys and values (2.8 GB a
 step at 716 GB/s), and the projections and head 2.1 ms, near the bound of
