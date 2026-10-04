@@ -167,7 +167,9 @@ def test_a_claimed_directory_holds_only_its_own_tools_files():
     """Two tools writing into one directory break the generator test that
     compares the directory's listing. Files the owning tool also records one
     by one pass; an input group's file inside a claimed directory already
-    has two records and fails the test below."""
+    has two records and fails the test below. A file with no record at all
+    counts as the owner's here: where tests/test_tools.py has a listing test
+    for the directory, that test refuses it, since the tool does not write it."""
     assert intruders(RECORDS, claimed()) == {}
     moe = {"tool": "tools/moe_reference.py"}
     assert intruders({"moe": moe, "moe/solvers.npz": {"tool": "tools/flaxdiff_solver_reference.py"}},
