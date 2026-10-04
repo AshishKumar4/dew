@@ -533,3 +533,27 @@ def test_a_value_already_in_the_dtype_keeps_its_rounding_under_jit():
         return rounded_operand(narrow, jnp.bfloat16).astype(jnp.float32) * 1.0
 
     assert jnp.array_equal(jax.jit(held)(x), x.astype(jnp.bfloat16).astype(jnp.float32))
+
+
+def test_bf16_logits_round_as_rounded_to_and_are_held_as_bf16_under_cuda():
+    """The head's logits take `rounded_to`'s values and cotangents, bitwise;
+    under CUDA the program holds them as bf16 instead of rounding fp32 in a
+    reduce-precision of its own, which a serving draw's readers made a full
+    fp32 pass (docs/performance.md)."""
+    from dew.nn.precision import bf16_logits, rounded_to
+    rng = np.random.default_rng(0)
+    x = jnp.asarray(rng.normal(size=(16, 512)).astype(np.float32) * 8)
+    weights = jnp.asarray(rng.normal(size=(16, 512)).astype(np.float32))
+
+    def rounded(v):
+        return rounded_to(v, jnp.bfloat16)
+
+    def loss(head):
+        return lambda v: jnp.sum(jax.nn.log_softmax(head(v * 1.5)) * weights)
+
+    held = jax.jit(bf16_logits)(x)
+    assert jnp.array_equal(held, jax.jit(rounded)(x)) and not jnp.array_equal(held, x)
+    assert jnp.array_equal(jax.jit(jax.grad(loss(bf16_logits)))(x), jax.jit(jax.grad(loss(rounded)))(x))
+    if jax.default_backend() == "gpu":
+        text = jax.jit(jax.value_and_grad(loss(bf16_logits))).lower(x).compile().as_text()
+        assert "reduce-precision" not in text and "bf16[16,512]" in text
