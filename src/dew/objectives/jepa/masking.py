@@ -14,18 +14,23 @@ construction, against the static patch grid:
     union is at most num_targets disjoint blocks), and when the blocks happen
     to overlap the context drops the surplus and keeps its shape.
 
-Indices refer to positions in the scan-ordered token sequence that
-PatchSequenceEmbed produces, and come out sorted so that an SSM mixer scans
-them in a meaningful order.
+Blocks are drawn on the grid; their indices refer to positions in the
+scan-ordered token sequence that PatchSequenceEmbed produces under the
+encoder's `scan_order`, and come out sorted, the context and each target
+block, so that an SSM mixer scans them in a meaningful order.
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Literal
 
 import jax
 import jax.numpy as jnp
+
+from dew.nn.dit import scan_indices
+from dew.nn.scan_orders import inverse_permutation
 
 
 def _factorizations(area: int, grid: tuple[int, int], aspect: tuple[float, float]):
@@ -43,17 +48,21 @@ def _factorizations(area: int, grid: tuple[int, int], aspect: tuple[float, float
 
 @dataclass(frozen=True)
 class MultiBlockMask:
-    """Hold one patch grid's static mask geometry, and sample masks over it."""
+    """Hold one patch grid's static mask geometry, and sample masks over it.
+    `scan_order` is the encoder's, which orders its token sequence."""
     grid: tuple[int, int]
     num_targets: int
     block_shapes: tuple[tuple[int, int], ...]
     num_context: int
+    scan_order: Literal["raster", "hilbert", "zigzag"] = "raster"
 
     @classmethod
     def for_grid(cls, grid: tuple[int, int], num_targets: int = 4,
                  scale: tuple[float, float] = (0.15, 0.2),
-                 aspect: tuple[float, float] = (0.75, 1.5)) -> MultiBlockMask:
-        """Resolve the I-JEPA mask geometry for a patch grid."""
+                 aspect: tuple[float, float] = (0.75, 1.5),
+                 scan_order: Literal["raster", "hilbert", "zigzag"] = "raster") -> MultiBlockMask:
+        """Resolve the I-JEPA mask geometry for a patch grid whose tokens the
+        encoder sequences in `scan_order`."""
         S = grid[0] * grid[1]
         candidates = [
             (area, _factorizations(area, grid, aspect))
@@ -79,6 +88,7 @@ class MultiBlockMask:
             num_targets=num_targets,
             block_shapes=tuple(shapes),
             num_context=num_context,
+            scan_order=scan_order,
         )
 
     @property
@@ -112,6 +122,10 @@ class MultiBlockMask:
         top = jnp.floor(corner[..., 0] * (H_P - heights[choice] + 1)).astype(jnp.int32)
         left = jnp.floor(corner[..., 1] * (W_P - widths[choice] + 1)).astype(jnp.int32)
         target_idx = (top * W_P + left)[..., None] + offsets[choice]
+        scan = scan_indices(self.scan_order, H_P, W_P)
+        if scan is not None:
+            # A grid position's place in the encoder's sequence.
+            target_idx = jnp.sort(jnp.asarray(inverse_permutation(scan))[target_idx], axis=-1)
 
         is_target = jnp.zeros((batch_size, S), dtype=bool).at[
             jnp.arange(batch_size)[:, None], target_idx.reshape(batch_size, -1)].set(True)

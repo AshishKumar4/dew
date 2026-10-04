@@ -113,6 +113,33 @@ def test_block_shapes_and_positions_actually_vary(mask):
     assert len(widths) > 1, "every block came out the same shape"
 
 
+@pytest.mark.parametrize("scan_order", ["raster", "hilbert", "zigzag"])
+def test_every_target_is_a_rectangle_of_the_grid_in_the_encoders_scan_order(scan_order):
+    """The encoder sequences its patches in `scan_order`: a target block's
+    tokens, sent back through that order, cover a whole h x w rectangle of
+    the grid, and the context, sorted in the sequence, sees none of them."""
+    from dew.nn.dit import scan_indices
+
+    mask = MultiBlockMask.for_grid(GRID, num_targets=4, scale=(0.15, 0.2), scan_order=scan_order)
+    order = scan_indices(scan_order, *GRID)
+    grid_of = np.arange(mask.num_patches) if order is None else order
+    context, targets = (np.asarray(part) for part in mask.sample(jax.random.PRNGKey(3), 8))
+    for row, blocks in enumerate(targets):
+        for block in blocks:
+            assert np.all(np.diff(block) > 0), "a target block is not sorted in the sequence"
+            rows, columns = np.divmod(grid_of[block], GRID[1])
+            extent = (rows.max() - rows.min() + 1) * (columns.max() - columns.min() + 1)
+            assert extent == mask.block_area, "a target block is not a rectangle of the grid"
+        assert np.all(np.diff(context[row]) > 0)
+        assert not set(context[row]) & set(blocks.reshape(-1))
+
+
+def test_an_objective_refuses_a_mask_in_another_scan_order(mask):
+    with pytest.raises(ValueError, match="one scan order"):
+        JepaObjective(make_encoder(scan_order="hilbert"), make_predictor(scan_order="hilbert"), mask,
+                      sample=Field("image", (RES, RES, 3)))
+
+
 def test_geometry_that_cannot_exist_is_rejected():
     with pytest.raises(ValueError, match="aspect ratio"):
         MultiBlockMask.for_grid((4, 4), num_targets=2, scale=(0.18, 0.19))
