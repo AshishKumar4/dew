@@ -37,6 +37,10 @@ from dew.nn.backbones.video_dit import VideoDiT
 from dew.nn.dit import TextContext
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "flaxdiff" / "family.npz"
+# Dew's float32 Unet on the CPU lands on one of two roundings per process
+# (XLA's CPU path; the fixture's reference pins its own). Over 28 processes
+# the unet ratios (output/gradients, published then variant) were only
+# 0.97/0.98, 0.99/0.75 or 1.05/1.00, 1.18/1.51: the worst is 1.51.
 CASES = ("simple_dit/published", "simple_dit/variant", "simple_udit/published", "simple_udit/variant",
          "simple_mmdit/published", "simple_mmdit/variant", "hierarchical_mmdit/published",
          "hierarchical_mmdit/variant", "unet/published", "unet/variant", "video_dit/published",
