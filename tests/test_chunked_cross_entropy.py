@@ -197,9 +197,10 @@ def mutating_chunk_terms(monkeypatch, mutate):
     """
     original = chunked._chunk_terms
 
-    def mutated(hidden, head_chunk, targets, start, stop, softcap, precision, predict, temperature):
+    def mutated(hidden, head_chunk, targets, start, stop, softcap, precision, predict, temperature,
+                excluded):
         terms = original(hidden, head_chunk, targets, start, stop, softcap,
-                         precision, predict, temperature)
+                         precision, predict, temperature, excluded)
         return mutate(terms, start, stop)
 
     monkeypatch.setattr(chunked, "_chunk_terms", mutated)
@@ -439,6 +440,44 @@ def test_an_integer_softcap_gives_the_same_gradients_as_a_float_one():
     for whole, fractional in zip(gradient(hidden, head, 30),
                                  gradient(hidden, head, 30.), strict=True):
         assert jnp.array_equal(whole, fractional)
+
+
+@pytest.mark.parametrize("tile", [RAGGED, None], ids=["tiled", "whole"])
+@pytest.mark.parametrize("excluded", [0, 41, RAGGED_VOCAB - 1], ids=["first", "inside", "last"])
+def test_an_excluded_column_takes_no_mass_in_the_loss_the_prediction_or_the_gradient(tile, excluded):
+    """The excluded column leaves the partition and the prediction, in
+    whichever tile holds it: the losses, log partitions, predictions and both
+    gradients are the full pass's with that column's logits at -inf, and its
+    own head column receives no gradient."""
+    hidden, head, targets = inputs(vocab=RAGGED_VOCAB, features=7, tokens=(1, RAGGED_TOKENS))
+    targets = jnp.where(targets == excluded, (excluded + 1) % RAGGED_VOCAB, targets)
+    precision = jax.lax.Precision.HIGHEST
+    # The excluded column scores highest everywhere, so a prediction that kept it would show.
+    head = head.at[:, excluded].set(jnp.abs(head).max(axis=1) * 4)
+
+    def full(states, matrix):
+        logits = chunked.head_logits(states, matrix, softcap=None, precision=precision)
+        logits = logits.at[..., excluded].set(-jnp.inf)
+        log_z = jax.nn.logsumexp(logits, axis=-1)
+        losses = log_z - jnp.take_along_axis(logits, targets[..., None], axis=-1)[..., 0]
+        return jnp.sum(losses + 0.7 * jnp.square(log_z)), (losses, log_z, jnp.argmax(logits, axis=-1))
+
+    def chunked_pass(states, matrix):
+        losses, predicted, log_z = chunked_cross_entropy(
+            states, matrix, targets, 4, precision=precision, tile=tile, excluded=excluded)
+        return jnp.sum(losses + 0.7 * jnp.square(log_z)), (losses, log_z, predicted)
+
+    (_, want), want_grads = jax.value_and_grad(full, argnums=(0, 1), has_aux=True)(hidden, head)
+    (_, got), got_grads = jax.jit(jax.value_and_grad(chunked_pass, argnums=(0, 1), has_aux=True))(
+        hidden, head)
+
+    np.testing.assert_allclose(got[0], want[0], rtol=1e-5)
+    np.testing.assert_allclose(got[1], want[1], rtol=1e-5)
+    np.testing.assert_array_equal(got[2], want[2])
+    assert not jnp.any(got[2] == excluded)
+    for expected, actual in zip(want_grads, got_grads, strict=True):
+        assert jnp.abs(actual - expected).max() <= 1e-5 * jnp.abs(expected).max()
+    assert jnp.all(got_grads[1][:, excluded] == 0)
 
 
 def test_a_target_outside_the_vocabulary_scores_the_partition_alone():

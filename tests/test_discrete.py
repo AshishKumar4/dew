@@ -241,35 +241,26 @@ def test_the_masked_objective_refuses_a_causal_model():
         MaskedDiffusionObjective(transformer(causal=True), MDLM(mask_id=MASK)(), 8)
 
 
-def test_the_loss_is_the_nelbo_of_the_row_the_model_saw(rng, monkeypatch):
-    """At fixed times and a fixed corruption, the loss is the cross entropy
-    of each masked token under the model's logits for the corrupted row,
-    weighted by 1/t and averaged over every position of the batch.
-    Evaluation reports each position's term, zero where the token stayed
-    visible, under the averaged weights it is handed, so a validation pass's
-    perplexity is exp of this bound per token."""
+def test_the_loss_is_the_mean_of_the_terms_evaluation_reports_under_the_weights_it_is_handed(rng):
+    """The training loss is the batch's per-token NELBO terms averaged over
+    every position, and evaluation reports those terms, zero where a token
+    stayed visible, under the averaged weights it is handed, so a validation
+    pass's perplexity is exp of this bound per token. The terms themselves
+    are MDLM's (tests/test_mdlm_reference.py)."""
     model = transformer(causal=False)
     objective = MaskedDiffusionObjective(model, MDLM(mask_id=MASK)(), 8)
     params = objective.init(rng)
     rows = jnp.array([[1, 2, 3, 4, 5, 1, 2, 3], [3, 2, 1, 0, 4, 5, 1, 2]])
-    times = jnp.array([0.25, 0.5])
-    hidden = jnp.array([[1, 0, 0, 1, 0, 0, 1, 0], [0, 1, 1, 0, 0, 0, 0, 1]], bool)
-    monkeypatch.setattr(DiscreteProcess, "sample_t", lambda self, key, n: times)
-    monkeypatch.setattr(DiscreteProcess, "corrupt",
-                        lambda self, key, tokens, t: (jnp.where(hidden, MASK, tokens), hidden))
+    step = Step(jnp.asarray(0), rng, None)
 
-    def terms(variables):
-        log_probs = jax.nn.log_softmax(model.apply(variables, jnp.where(hidden, MASK, rows)), axis=-1)
-        cross_entropy = -jnp.take_along_axis(log_probs, rows[..., None], axis=-1)[..., 0]
-        return jnp.where(hidden, cross_entropy / times[:, None], 0.0)
-
-    loss, _ = objective.scalar_loss(params, {"text": rows}, Step(jnp.asarray(0), rng, None))
-    np.testing.assert_allclose(loss, terms(params).sum() / rows.size, rtol=1e-5)
+    loss, _ = objective.scalar_loss(params, {"text": rows}, step)
+    terms = objective.evaluate(params, {"text": rows}, step)
+    np.testing.assert_allclose(loss, terms.losses.sum() / rows.size, rtol=1e-6)
+    np.testing.assert_array_equal(terms.weights, 1.0)
 
     averaged = jax.tree.map(lambda leaf: 1.5 * leaf, params)
-    scored = objective.evaluate(params, {"text": rows}, Step(jnp.asarray(0), rng, averaged))
-    np.testing.assert_allclose(scored.losses, terms(averaged), rtol=1e-5, atol=1e-6)
-    np.testing.assert_array_equal(scored.weights, 1.0)
+    handed = objective.evaluate(params, {"text": rows}, Step(jnp.asarray(0), rng, averaged))
+    np.testing.assert_array_equal(handed.losses, objective.evaluate(averaged, {"text": rows}, step).losses)
 
 
 def test_a_packed_window_scores_as_its_documents_would_one_by_one(rng, monkeypatch):
