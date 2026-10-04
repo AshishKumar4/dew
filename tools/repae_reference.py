@@ -34,7 +34,8 @@ is what LPIPS contributes. The draws are `DiffusionObjective.loss`'s from
 `randn_like` replay in its order: the posterior's sample, the training
 times, the noise and the label-dropout uniforms. The gradients are each
 network's as the step's `clip_grad_norm_` reads them, before clipping, in
-float64 and in float32.
+float64 and in float32. After the step, `SiT.extract_latents_stats` gives
+the latent scale and bias the script's sampling denormalizes with.
 
     PYTHONPATH=src python tools/repae_reference.py
 """
@@ -399,6 +400,8 @@ def run(dtype, drawn: dict[str, np.ndarray], pixels: np.ndarray, classes: np.nda
     for name, value in before.items():
         result[f"bn/{name}_before{tail}"] = value.numpy()
         result[f"bn/{name}{tail}"] = getattr(model.bn, name).numpy()
+    result.update({f"latents/{name}{tail}": value.numpy()
+                   for name, value in model.extract_latents_stats().items()})
     terms = scope["vae_loss_dict"]
     result.update({
         f"loss/vae{tail}": scope["vae_loss"].detach().numpy(),
