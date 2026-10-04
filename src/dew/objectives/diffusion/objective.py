@@ -202,7 +202,7 @@ class DiffusionObjective(Objective[Ratio]):
         *,
         autoencoder: AutoEncoder | None = None,
         unconditional_prob: float = 0.12,
-        ema_decay: float | None = 0.999,
+        ema_decay: float | optax.Schedule | None = 0.999,
         solver: Solver = _DEFAULT_SOLVER,
         guidance: Guidance | None = _DEFAULT_GUIDANCE,
         steps: int = 200,
@@ -216,7 +216,10 @@ class DiffusionObjective(Objective[Ratio]):
 
         `process` is a preset or a custom `Process`; presets build once here.
         `solver`, `guidance` and `steps` are how evaluation samples;
-        `guidance` None is the plain conditional prediction.
+        `guidance` None is the plain conditional prediction. `ema_decay` is
+        the EMA's decay, a number or a schedule of the updates before it,
+        such as EDM2's power EMA (`dew.training.posthoc.power_decay`); None
+        keeps no EMA.
 
         `uncertainty` learns EDM2's loss weighting (Karras et al. 2024,
         Eq. 21): a head u of the model time, `dew.nn.mp.Uncertainty` with
@@ -269,8 +272,9 @@ class DiffusionObjective(Objective[Ratio]):
         self.solver = solver
         self.guidance = guidance
         self.steps = steps
-        self.ema = (None if ema_decay is None else
-                    EMASpec(decay=optax.constant_schedule(ema_decay), select=under("params")))
+        self.ema = (None if ema_decay is None else EMASpec(
+            decay=ema_decay if callable(ema_decay) else optax.constant_schedule(ema_decay),
+            select=under("params")))
         self.artifact = VideoGrid if len(inputs.sample.shape) == 4 else ImageGrid
         check_solver(self.process, solver, steps)
         self._sample = jax.jit(self._sample_impl, static_argnames=("count",))
