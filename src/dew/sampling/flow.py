@@ -24,7 +24,7 @@ from dew.diffusion.schedules import FlowMatchingScheduler, expand
 from dew.diffusion.transforms import FlowMatchPredictionTransform
 from dew.registry import solvers
 
-from .guidance import Guidance
+from .guidance import Guidance, Walk
 
 
 @struct.dataclass
@@ -159,24 +159,28 @@ class FlowSDE:
 
         steps counts grid points, including both endpoints. A ten-transition
         rollout therefore uses steps=11. Guidance is applied identically before
-        constructing each Gaussian, and must be stateless, as the rescoring of
-        each transition reads it alone. Rectified flow's clean prediction at t=0
-        is its state, so the last transition already produces the final sample.
+        constructing each Gaussian, each step's as `sample` decides it, and must
+        be stateless, as the rescoring of each transition reads it alone.
+        Rectified flow's clean prediction at t=0 is its state, so the last
+        transition already produces the final sample.
         """
         if steps < 2:
             raise ValueError("a trajectory needs at least two time points")
         from dew.nn.inputs import request_key
         key = request_key(key)
         process = denoise.process
-        predict = denoise if guidance is None else guidance(denoise)
-        times = process.times(steps)
         x_T = jnp.asarray(x_T, jnp.float32)
+        walk = Walk.over(denoise, guidance, steps - 1)
+        if jax.tree.leaves(walk.init(x_T)):
+            raise ValueError("a flow trajectory's transitions are rescored one at a time, so its "
+                             "guidance carries nothing between steps; APG's momentum does")
+        times = process.times(steps)
         batch = x_T.shape[0]
 
         def body(x, inputs):
             t, t_next, index = inputs
             t, t_next = jnp.full((batch,), t), jnp.full((batch,), t_next)
-            denoised, eps = predict(x, t)
+            denoised, eps = walk.at((), index)(x, t)
             transition = self.transition(x, t, t_next, denoised, eps, process)
             following = transition.sample(jax.random.fold_in(key, index))
             return following, (following, transition.log_prob(following), transition.stochastic)

@@ -5,17 +5,28 @@ combines the two. `CFG` and `APG` read the same model without its condition,
 `CFGPlusPlus` renoises with that unconditional prediction, and `Autoguidance`
 reads a weaker model under the same condition.
 
-A guidance applied to a denoiser, `guidance(denoise)`, is the guided
-`(x_t, t) -> (x_0, epsilon)`. `sample` walks it through `walk(denoise)`, a
-`Walk` that also carries whatever the guidance keeps from one step to the
-next: nothing for all but `APG` with momentum, whose running average of the
-guidance direction rides in the walk's state.
+A guidance applied to a denoiser over a walk of N steps,
+`guidance.walk(denoise, N)`, is a `Walk`: each step's guided
+`(x_t, t) -> (x_0, epsilon)`, and whatever the guidance keeps from one step
+to the next: nothing for all but `APG` with momentum, whose running average
+of the guidance direction rides in the walk's state.
+
+Every guidance's `interval` is the part of the walk it guides, in fractions
+of the walk, closed at both ends: step i of N is guided when start <= i / N
+<= stop, and the closing denoise is step N. A step decides once and every
+evaluation within it (a corrector, a midpoint, a stage) takes that decision,
+as Kynkaanniemi et al.'s own sampler and Diffusers' guiders decide. The
+paper's `guidance_interval=[a, b]` over N steps is `interval=(a / N,
+b / N)`, and a Diffusers guider's `start` and `stop`, which guide its steps
+[int(start N), int(stop N)), are `interval=(int(start N) / N,
+(int(stop N) - 1) / N)`.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from fractions import Fraction
 from typing import Any
 
 import jax
@@ -23,42 +34,71 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from dew.diffusion.process import Denoiser
-from dew.diffusion.schedules import expand
 
 Predict = Callable[[jax.Array, jax.Array], tuple[jax.Array, jax.Array]]
+# A step's index in its walk: traced inside the walk's scan, a Python int at
+# its closing denoise.
+Index = jax.Array | int
 
 
 @dataclass(frozen=True)
 class Walk:
-    """A guided denoiser over one trajectory and the state it carries.
+    """A guided denoiser over one walk and the state it carries.
 
-    `init(x_T)` is the state before the first step. `step(x, t, state)` is
-    the guided prediction a step starts from and the state after it. `at`
-    is the guided prediction under a state without advancing it, which a
-    solver's own extra evaluations (a corrector, a midpoint) read.
+    `init(x_T)` is the state before the first step. `step(x, t, index,
+    state)` is the guided prediction step `index` starts from and the state
+    after it. `at(state, index)` is step `index`'s guided prediction under a
+    state without advancing it, which a solver's own evaluations within the
+    step (a corrector, a midpoint) and the closing denoise read.
     """
 
     init: Callable[[jax.Array], Any]
-    step: Callable[[jax.Array, jax.Array, Any], tuple[tuple[jax.Array, jax.Array], Any]]
-    at: Callable[[Any], Predict]
+    step: Callable[[jax.Array, jax.Array, Index, Any], tuple[tuple[jax.Array, jax.Array], Any]]
+    at: Callable[[Any, Index], Predict]
 
     @classmethod
-    def stateless(cls, predict: Predict) -> Walk:
-        return cls(lambda x: (), lambda x, t, state: (predict(x, t), state), lambda state: predict)
+    def stateless(cls, predict: Callable[[Index], Predict]) -> Walk:
+        """The walk of `predict`, which maps a step's index to its guided prediction."""
+        return cls(lambda x: (), lambda x, t, index, state: (predict(index)(x, t), state),
+                   lambda state, index: predict(index))
+
+    @classmethod
+    def over(cls, denoise: Predict, guidance: Guidance | None, steps: int | jax.Array) -> Walk:
+        """`guidance`'s walk of `denoise` over `steps` steps, or the unguided walk."""
+        if guidance is None:
+            return cls.stateless(lambda index: denoise)
+        if not isinstance(denoise, Denoiser):
+            raise TypeError("guidance needs a continuous Denoiser; the masked diffusion LM takes none")
+        return guidance.walk(denoise, steps)
 
 
-def _scale(denoise: Denoiser, scale: float, interval: tuple[float, float], x, t) -> jax.Array:
-    """`scale` inside `interval` and 1 outside it, shaped against `x`.
+# An interval's edges are read as the nearest fractions with denominators up
+# to this, so a step's fraction that an edge rounds is that edge (0.3 of ten
+# steps is step 3, though 0.3 * 10 is 3.0000000000000004 in binary), and the
+# integer products a step's decision compares stay inside int32 for walks of
+# up to 2**16 steps.
+_DENOMINATOR = 1 << 15
 
-    Progress is the fraction of the trajectory walked, so it lives in
-    [0, 1]: t = T is 0 and the terminal point past the grid's end is 1.
-    Clamping it there is that definition, and it also keeps the top of a walk
-    inside the default interval, which a fused 1 - t / T can miss by an ulp.
+
+def _scales(scale: float, interval: tuple[float, float],
+            steps: int | jax.Array) -> Callable[[Index], jax.Array]:
+    """Each step's scale over a walk of `steps` steps: `scale` on the steps i
+    with start <= i / steps <= stop, 1 on the rest.
+
+    The comparison is exact: i q >= p steps in integers against an edge p / q,
+    so no rounding of a time or of i / steps moves an edge. `steps` may be
+    traced, as a recorded rollout's is. A walk of no steps is its closing
+    denoise alone, step 0.
     """
-    progress = jnp.clip(1.0 - jnp.asarray(t, jnp.float32) / denoise.process.sampler_schedule.T,
-                        0.0, 1.0)
-    start, stop = interval
-    return expand(jnp.where((progress >= start) & (progress <= stop), scale, 1.0), x)
+    start, stop = (Fraction(edge).limit_denominator(_DENOMINATOR) for edge in interval)
+    steps = jnp.maximum(steps, 1)
+
+    def at(index: Index) -> jax.Array:
+        inside = ((index * start.denominator >= start.numerator * steps)
+                  & (index * stop.denominator <= stop.numerator * steps))
+        return jnp.where(inside, scale, 1.0)
+
+    return at
 
 
 def _interval(interval) -> tuple[float, float]:
@@ -100,10 +140,9 @@ class CFG:
         object.__setattr__(self, "interval", _interval(self.interval))
         object.__setattr__(self, "rescale", float(self.rescale))
 
-    def __call__(self, denoise: Denoiser) -> Predict:
+    def _guided(self, denoise: Denoiser, scale: jax.Array) -> Predict:
         def guided(x, t):
             output, unconditional = denoise.raw_both(x, t)
-            scale = _scale(denoise, self.scale, self.interval, x, t)
             combined = unconditional + scale * (output - unconditional)
             if self.rescale:
                 axes = tuple(range(1, combined.ndim))
@@ -115,8 +154,9 @@ class CFG:
 
         return guided
 
-    def walk(self, denoise: Denoiser) -> Walk:
-        return Walk.stateless(self(denoise))
+    def walk(self, denoise: Denoiser, steps: int | jax.Array) -> Walk:
+        scales = _scales(self.scale, self.interval, steps)
+        return Walk.stateless(lambda index: self._guided(denoise, scales(index)))
 
 
 @dataclass(frozen=True)
@@ -139,18 +179,18 @@ class CFGPlusPlus:
             raise ValueError(f"CFG++ interpolates with a scale in [0, 1], got {self.scale}")
         object.__setattr__(self, "interval", _interval(self.interval))
 
-    def __call__(self, denoise: Denoiser) -> Predict:
+    def _guided(self, denoise: Denoiser, scale: jax.Array) -> Predict:
         def guided(x, t):
             output, unconditional = denoise.raw_both(x, t)
-            scale = _scale(denoise, self.scale, self.interval, x, t)
             clean, _ = denoise.convert(x, t, unconditional + scale * (output - unconditional))
             _, noise = denoise.convert(x, t, unconditional)
             return clean, noise
 
         return guided
 
-    def walk(self, denoise: Denoiser) -> Walk:
-        return Walk.stateless(self(denoise))
+    def walk(self, denoise: Denoiser, steps: int | jax.Array) -> Walk:
+        scales = _scales(self.scale, self.interval, steps)
+        return Walk.stateless(lambda index: self._guided(denoise, scales(index)))
 
 
 @dataclass(frozen=True)
@@ -166,8 +206,7 @@ class APG:
     conditional output is scaled by `eta`: uncond + scale (orthogonal + eta
     parallel). eta 1 without clipping or momentum is CFG. Where guidance is
     off (outside `interval`, or at scale 1) the average rests, as Diffusers'
-    buffer does; Diffusers' interval counts steps, [int(start N), int(stop
-    N)), where this one is closed in progress, so the two agree without one.
+    buffer does.
     """
 
     scale: float
@@ -179,7 +218,7 @@ class APG:
     def __post_init__(self):
         object.__setattr__(self, "interval", _interval(self.interval))
 
-    def _guided(self, denoise: Denoiser, x, t, average):
+    def _guided(self, denoise: Denoiser, scale: jax.Array, x, t, average):
         output, unconditional = denoise.raw_both(x, t)
         direction = output - unconditional + self.momentum * average
         axes = tuple(range(1, direction.ndim))
@@ -190,28 +229,23 @@ class APG:
             jnp.sqrt(jnp.sum(jnp.square(output), axis=axes, keepdims=True)), 1e-12)
         parallel = jnp.sum(direction * unit, axis=axes, keepdims=True) * unit
         update = direction - parallel + self.eta * parallel
-        scale = _scale(denoise, self.scale, self.interval, x, t)
         off = scale == 1.0
         combined = jnp.where(off, output, unconditional + scale * update)
         running = jnp.where(off, average, output - unconditional + self.momentum * average)
         return denoise.convert(x, t, combined), running
 
-    def __call__(self, denoise: Denoiser) -> Predict:
-        if self.momentum:
-            raise ValueError("APG's momentum runs over a walk; sample it with `sample`, which "
-                             "carries the running average")
-        return lambda x, t: self._guided(denoise, x, t, 0.0)[0]
-
-    def walk(self, denoise: Denoiser) -> Walk:
+    def walk(self, denoise: Denoiser, steps: int | jax.Array) -> Walk:
+        scales = _scales(self.scale, self.interval, steps)
         if not self.momentum:
-            return Walk.stateless(self(denoise))
+            return Walk.stateless(
+                lambda index: lambda x, t: self._guided(denoise, scales(index), x, t, 0.0)[0])
 
-        def step(x, t, average):
-            pair, running = self._guided(denoise, x, t, average)
+        def step(x, t, index, average):
+            pair, running = self._guided(denoise, scales(index), x, t, average)
             return pair, running.astype(average.dtype)
 
-        return Walk(jnp.zeros_like, step,
-                    lambda average: lambda x, t: self._guided(denoise, x, t, average)[0])
+        return Walk(jnp.zeros_like, step, lambda average, index: lambda x, t: self._guided(
+            denoise, scales(index), x, t, average)[0])
 
 
 @dataclass(frozen=True)
@@ -234,7 +268,7 @@ class Autoguidance:
     def __post_init__(self):
         object.__setattr__(self, "interval", _interval(self.interval))
 
-    def __call__(self, denoise: Denoiser) -> Predict:
+    def walk(self, denoise: Denoiser, steps: int | jax.Array) -> Walk:
         if "guide" not in denoise.params:
             raise ValueError("autoguidance reads its guide's variables under `guide` in the "
                              "denoiser's variables")
@@ -242,16 +276,16 @@ class Autoguidance:
                         {name: tree for name, tree in denoise.params.items() if name != "guide"},
                         denoise.conditions)
         guide = Denoiser(denoise.process, self.model, denoise.params["guide"], denoise.conditions)
+        scales = _scales(self.scale, self.interval, steps)
 
-        def guided(x, t):
-            output, weak = main.raw(x, t), guide.raw(x, t)
-            scale = _scale(denoise, self.scale, self.interval, x, t)
-            return denoise.convert(x, t, weak + scale * (output - weak))
+        def guided(scale):
+            def predict(x, t):
+                output, weak = main.raw(x, t), guide.raw(x, t)
+                return denoise.convert(x, t, weak + scale * (output - weak))
 
-        return guided
+            return predict
 
-    def walk(self, denoise: Denoiser) -> Walk:
-        return Walk.stateless(self(denoise))
+        return Walk.stateless(lambda index: guided(scales(index)))
 
 
 Guidance = CFG | CFGPlusPlus | APG | Autoguidance
