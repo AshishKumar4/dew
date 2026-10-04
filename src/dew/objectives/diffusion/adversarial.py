@@ -197,7 +197,12 @@ class AdversarialDistillationObjective(DiffusionObjective):
     `student_times` and the renoising level from LADD's logit-normal at
     `renoise_times` (mean 1, std 1: high noise, the paper's for images).
     The discriminator and the student train in the same step, each through
-    its own loss with the other stopped. The discriminator adds `r1_weight`
+    its own loss with the other stopped; StyleGAN-T, whose heads these are,
+    alternates a generator step and a discriminator step, and neither LADD
+    nor ADD says which. The heads' spectral norms take one power iteration
+    a step: the real pass iterates and keeps its `u`, and the held, fake and
+    R1 passes iterate from that `u` and keep nothing, where StyleGAN-T's
+    keeps each training pass's. The discriminator adds `r1_weight`
     (ADD's gamma, 1e-5) times R1 on its real inputs, and the student
     `distillation_weight` (ADD's lambda, 2.5) times alpha_t ||x_0 -
     sg(teacher's x_0 of the renoised x_0)||^2, summed over the sample;
