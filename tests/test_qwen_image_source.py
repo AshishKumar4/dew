@@ -382,3 +382,30 @@ def test_a_trained_qwen_image_step_exports_and_reloads(source, loaded, arrays, r
     trained = loaded.model.apply({"params": state.variables["params"]}, latent, times, condition)
     reloaded = again.model.apply({"params": again.variables["params"]}, latent, times, condition)
     np.testing.assert_array_equal(reloaded, trained)
+
+
+def test_diffusers_reads_a_qwen_image_export(tmp_path):
+    """Qwen-Image 2.1's classes are Diffusers 6256aa76's, which this
+    environment does not install, so their reading of an export is recorded
+    (tools/qwen_image_export_reference.py): the committed pipeline with its
+    transformer perturbed by a seeded draw, saved by Dew, then loaded whole by
+    `QwenImage21Pipeline` with every component's loading report empty, and its
+    transformer run on fixed inputs in float32 and float64. The same export
+    written here is the one that was read, file for file by SHA-256, and Dew's
+    forward on the perturbed weights holds the float64 rule against it."""
+    from reference_error import assert_as_exact_as_the_reference
+
+    from tools.qwen_image_export_reference import GRID, digests, perturbed_export
+
+    loaded, variables = perturbed_export(tmp_path / "export", tmp_path / "scratch")
+    with np.load(ROOT / "tests/fixtures/qwen_image_export.npz") as stored:
+        recorded = dict(stored)
+    meta = json.loads(recorded.pop("meta").tobytes())
+    assert digests(tmp_path / "export") == meta["digests"]
+    latent = jnp.asarray(nhwc(recorded["packed"], *GRID))
+    context = jnp.asarray(recorded["context"])
+    condition = DenoisingCondition(context, mask=jnp.ones(context.shape[:2], bool))
+    times = jnp.asarray(recorded["times"])
+    ours = loaded.model.apply({"params": variables["params"]}, latent, times, condition)
+    assert_as_exact_as_the_reference(np.asarray(ours), nhwc(recorded["fp32.output"], *GRID),
+                                     nhwc(recorded["fp64.output"], *GRID), "exported Qwen-Image 2.1")

@@ -2408,6 +2408,22 @@
     }
    ]
   },
+  "qwen_image_export.npz": {
+   "tool": "tools/qwen_image_export_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/diffusers",
+     "version": "6256aa7666cedd47443adc8f82da9a10e110b09c",
+     "runs": "diffusers"
+    },
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.17.0",
+     "runs": "transformers"
+    }
+   ],
+   "note": "A Dew export of the committed Qwen-Image 2.1 pipeline (transformer perturbed by a seeded draw), loaded whole by QwenImage21Pipeline with clean per-component loading reports; the transformer's pipeline call in float32 and float64 (diffusers_wan_reference.float64) on fixed inputs; the export's SHA-256 per file. Torch 2.14.0+cpu, the qwen-image reference environment."
+  },
   "qwen_image_source.tar.xz": {
    "tool": "tools/diffusers_qwen_image_reference.py",
    "sources": [
