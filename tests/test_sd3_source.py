@@ -335,21 +335,25 @@ def test_published_prompt_encoding_matches_the_source_pipeline(source, pipeline_
     assert relative_gap(crossed.context, arrays[f"{case}.context"]) > 1e-3
 
 
+@pytest.mark.parametrize("streamed", [False, True])
 @pytest.mark.parametrize("case", PIPELINE_CASES)
-def test_published_pipeline_walk_matches_the_source(source, pipeline_record, case):
+def test_published_pipeline_walk_matches_the_source(source, pipeline_record, case, streamed):
     """`Pretrained.load().text_to_image()` reproduces the source's own call.
 
     The published directory decides everything: the transformer, the wide
     latent VAE with its shift and scale, the flow schedule's shifted sigmas,
     the guidance the call applies to the raw velocity, and the geometry the
     grid is bound to. The walk starts from the source's own latents so only
-    the trajectory is under test.
+    the trajectory is under test. Loaded whole or streamed onto a mesh
+    (tests/test_pipeline_streaming.py).
     """
     from dew.interop.pretrained import Pretrained
     from dew.sampling.guidance import CFG
+    from dew.training import MeshSpec
 
     arrays = np.load(source / "sd3_pipeline.npz")
-    loaded = Pretrained.load(str(source / case), dtype="float32", attention_impl="xla")
+    loaded = Pretrained.load(str(source / case), dtype="float32", attention_impl="xla",
+                             **({"mesh": MeshSpec()} if streamed else {}))
     task = loaded.text_to_image()
     prepared = task.prepare(pipeline_record["prompts"], unconditional=pipeline_record["negatives"],
                             initial=arrays[f"{case}.x_T"], steps=pipeline_record["steps"], key=0)
