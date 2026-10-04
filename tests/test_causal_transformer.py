@@ -1416,13 +1416,22 @@ def test_a_padded_prefill_attends_through_cudnn_where_it_runs(rng, without_deter
     full = model.apply(params, ids, attention_mask=valid)
     cache = model.apply(params, ids.shape[0], method=CausalTransformer.init_cache,
                         mutable=['cache'])[1]['cache']
-    prefill = jax.jit(lambda cache, ids, valid: model.apply(
-        {**params, 'cache': cache}, ids, attention_mask=valid, decode=True, mutable=['cache'])[0])
-    np.testing.assert_allclose(np.asarray(prefill(cache, ids, valid), np.float32)[valid],
+
+    def prefill(model):
+        return jax.jit(lambda cache, ids, valid: model.apply(
+            {**params, 'cache': cache}, ids, attention_mask=valid, decode=True, mutable=['cache'])[0])
+
+    def fused(model):
+        text = prefill(model).lower(cache, ids, valid).compile().as_text() or ""
+        return [line for line in text.splitlines() if 'custom_call_target="__cudnn$fmha' in line]
+
+    np.testing.assert_allclose(np.asarray(prefill(model)(cache, ids, valid), np.float32)[valid],
                                np.asarray(full, np.float32)[valid], atol=0.05)
-    text = prefill.lower(cache, ids, valid).compile().as_text() or ""
-    fused = [line for line in text.splitlines() if 'custom_call_target="__cudnn$fmha' in line]
+
+    # An explicit 'xla' is the caller's choice, often for its bits: it stays.
+    assert not fused(tiny(dtype=jnp.bfloat16, num_kv_heads=2, head_dim=32, attention_impl='xla'))
+    chosen = fused(model)
     if not cudnn_runs(jnp.zeros((1, 1, 4, 32), jnp.bfloat16)):
-        assert not fused
+        assert not chosen
         return
-    assert fused and all("Bias" in line for line in fused), fused[:1]
+    assert chosen and all("Bias" in line for line in chosen), chosen[:1]
