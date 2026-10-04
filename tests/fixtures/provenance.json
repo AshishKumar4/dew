@@ -301,7 +301,18 @@
    ],
    "note": "Executes fetched official edm_sampler; no installed upstream package import."
   },
-  "edm/loss.npz": {
+  "edm2": {
+   "tool": "tools/edm2_reference.py",
+   "sources": [
+    {
+     "repo": "NVlabs/edm2",
+     "version": "4bf8162f601bcc09472ce8a32dd0cbe8889dc8fc",
+     "runs": "fetched"
+    }
+   ],
+   "note": "Executes fetched official networks_edm2 with pickling/constructor stubs and float64-retargeted casts: unet.npz in eval mode, train.npz in train mode under torch's SGD (--train)."
+  },
+  "edm_loss": {
    "tool": "tools/edm_loss_reference.py",
    "sources": [
     {
@@ -322,17 +333,6 @@
    ],
    "note": "EDMLoss through EDMPrecond and EDM2Loss through Precond, around an affine stand-in network; images, draws and stand-in weights are inputs."
   },
-  "edm2": {
-   "tool": "tools/edm2_reference.py",
-   "sources": [
-    {
-     "repo": "NVlabs/edm2",
-     "version": "4bf8162f601bcc09472ce8a32dd0cbe8889dc8fc",
-     "runs": "fetched"
-    }
-   ],
-   "note": "Executes fetched official networks_edm2 with pickling/constructor stubs and float64-retargeted casts: unet.npz in eval mode, train.npz in train mode under torch's SGD (--train)."
-  },
   "flaxdiff": {
    "tool": "tools/flaxdiff_reference.py",
    "sources": [
@@ -342,18 +342,7 @@
      "runs": "flaxdiff"
     }
    ],
-   "note": "FlaxDiff 0.2.8 documented at tool:8; this unit excludes its separately listed hybrid_dit and family.npz children."
-  },
-  "flaxdiff/family.npz": {
-   "tool": "tools/flaxdiff_family_reference.py",
-   "sources": [
-    {
-     "repo": "AshishKumar4/FlaxDiff",
-     "version": "15c55b001304604147a2a8002a76cf5d4c32092f",
-     "runs": "fetched"
-    }
-   ],
-   "note": "flaxdiff/models (hilbert, s5, common, attention, vit_common, dit_common, simple_unet, simple_vit, simple_dit, simple_mmdit, video_dit, unet_3d) fetched at the commit, SHA-256 checked; reference attention without forced-fp32 softmax; float32 and float64 (every jnp.float32 read as jnp.float64, x64) forward and gradients, on one CPU thread without XNNPACK. JAX 0.11.2.post3."
+   "note": "FlaxDiff 0.2.8 documented at tool:8; this unit excludes its separately listed hybrid_dit child."
   },
   "flaxdiff/hybrid_dit": {
    "tool": "tools/flaxdiff_reference.py",
@@ -366,7 +355,18 @@
    ],
    "note": "FlaxDiff 0.2.10, JAX 0.5.3 and Flax 0.10.6 documented at tool:29."
   },
-  "flaxdiff/solvers.npz": {
+  "flaxdiff_family": {
+   "tool": "tools/flaxdiff_family_reference.py",
+   "sources": [
+    {
+     "repo": "AshishKumar4/FlaxDiff",
+     "version": "15c55b001304604147a2a8002a76cf5d4c32092f",
+     "runs": "fetched"
+    }
+   ],
+   "note": "flaxdiff/models (hilbert, s5, common, attention, vit_common, dit_common, simple_unet, simple_vit, simple_dit, simple_mmdit, video_dit, unet_3d) fetched at the commit, SHA-256 checked; reference attention without forced-fp32 softmax; float32 and float64 (every jnp.float32 read as jnp.float64, x64) forward and gradients, on one CPU thread without XNNPACK. JAX 0.11.2.post3."
+  },
+  "flaxdiff_solvers": {
    "tool": "tools/flaxdiff_solver_reference.py",
    "sources": [
     {
@@ -2192,22 +2192,6 @@
    ],
    "note": "Package version and weight URL/SHA256 are stored in the NPZ."
   },
-  "inception/pytorch_fid_tiny.npz": {
-   "tool": "tools/pytorch_fid_tiny_reference.py",
-   "sources": [
-    {
-     "repo": "mseitzer/pytorch-fid",
-     "version": "v0.3.0 (0a754fb8e66021700478fd365b79c2eaa316e31b)",
-     "runs": "fetched"
-    },
-    {
-     "repo": "pytorch/vision",
-     "version": "0.29.0",
-     "runs": "torchvision"
-    }
-   ],
-   "note": "src/pytorch_fid/inception.py at the commit (SHA-256 checked): InceptionV3(resize_input, normalize_input, use_fid_inception) over torchvision's Inception3 narrowed by 16 through its BasicConv2d, release weights not fetched, every weight drawn; pool3 features of 8-bit images upsampled and downsampled, float32 and float64. Torch 2.14.0+cpu."
-  },
   "inception/tiny": {
    "generator": "dew",
    "note": "The pool3 features Dew's tiny FID extractor gave before dew/eval/inception.py stopped taking its weights as constructor fields (source.json); a Dew regression golden."
@@ -2444,6 +2428,22 @@
      "runs": "diffusers"
     }
    ]
+  },
+  "pytorch_fid_tiny": {
+   "tool": "tools/pytorch_fid_tiny_reference.py",
+   "sources": [
+    {
+     "repo": "mseitzer/pytorch-fid",
+     "version": "v0.3.0 (0a754fb8e66021700478fd365b79c2eaa316e31b)",
+     "runs": "fetched"
+    },
+    {
+     "repo": "pytorch/vision",
+     "version": "0.29.0",
+     "runs": "torchvision"
+    }
+   ],
+   "note": "src/pytorch_fid/inception.py at the commit (SHA-256 checked): InceptionV3(resize_input, normalize_input, use_fid_inception) over torchvision's Inception3 narrowed by 16 through its BasicConv2d, release weights not fetched, every weight drawn; pool3 features of 8-bit images upsampled and downsampled, float32 and float64. Torch 2.14.0+cpu."
   },
   "qwen_image_source.tar.xz": {
    "tool": "tools/diffusers_qwen_image_reference.py",

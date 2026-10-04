@@ -1,6 +1,6 @@
 """EDM's and EDM2's training losses against NVlabs' own.
 
-tests/fixtures/edm/loss.npz holds NVlabs/edm's `EDMLoss` through
+tests/fixtures/edm_loss/loss.npz holds NVlabs/edm's `EDMLoss` through
 `EDMPrecond` and NVlabs/edm2's `EDM2Loss` through `Precond` with its logvar
 head (tools/edm_loss_reference.py), each run on the same images, the same
 standard normal behind every training sigma and the same noise, around an
@@ -31,7 +31,7 @@ from dew.diffusion.schedules import expand
 from dew.diffusion.transforms import broadcast_rates
 from dew.nn.mp import MP_KERNEL, Uncertainty
 
-REFERENCE = dict(np.load(Path(__file__).parent / "fixtures" / "edm" / "loss.npz"))
+REFERENCE = dict(np.load(Path(__file__).parent / "fixtures" / "edm_loss" / "loss.npz"))
 
 
 def nhwc(array):
