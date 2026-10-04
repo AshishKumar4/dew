@@ -1,6 +1,8 @@
 """Speculative decoding: the emitted law, and the cache the block leaves behind.
 
-The law is checked against fixed distributions rather than a model, so nothing
+The acceptance and the token after it are transformers' `_speculative_sampling`
+on fixed logits and the same uniforms (tools/speculative_reference.py). The
+law is checked against fixed distributions rather than a model, so nothing
 but the acceptance rule, the residual and the bonus decide the answer. The
 cache is checked against greedy sampling on real models: with a zero
 temperature the target's point mass wins every rejection, so a block has to
@@ -9,12 +11,14 @@ after a rejection is the state the accepted prefix would have left.
 """
 
 import dataclasses
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax.experimental import checkify
+from reference_error import assert_as_exact_as_the_reference
 from test_text_rollout_contract import decoder
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -94,6 +98,48 @@ def spread(weights):
     for token, weight in weights.items():
         full[token] = np.log(weight)
     return jnp.asarray(full)
+
+
+SPECULATIVE = np.load(Path(__file__).resolve().parent / "fixtures" / "decoding" / "speculative.npz")
+
+
+def test_acceptance_and_the_next_token_are_transformers_speculative_sampling(monkeypatch):
+    """transformers' `_speculative_sampling` (tools/speculative_reference.py)
+    verifies three drafted candidates per row on fixed target and draft
+    logits, its uniforms the ones `Speculative` draws from the same keys:
+    the block keeps the same candidates on all 256 rows, which end at every
+    length, and the next token's distribution (the normalized positive part
+    of p - q after a rejection, p after a block accepted whole) is held to
+    transformers' float64 run by the float64 rule."""
+    from dew.sampling import strategies
+
+    block = SPECULATIVE["target"].shape[1] - 1
+    rows = SPECULATIVE["target"].shape[0]
+    keys = jax.random.split(jax.random.key(int(SPECULATIVE["seed"])), rows * (2 * block + 1)).reshape(
+        rows, 2 * block + 1)
+    # The uniforms transformers compared are the ones drawn here.
+    drawn = [np.asarray(jax.vmap(jax.random.uniform)(keys[:, block + at])) for at in range(1, block)]
+    np.testing.assert_array_equal(np.stack(drawn, 1), SPECULATIVE["uniforms"])
+    targets = [jnp.asarray(SPECULATIVE["target"][:, at]) for at in range(block + 1)]
+    candidates = [jnp.zeros(rows, jnp.int32)] + [
+        jnp.asarray(SPECULATIVE["candidates"][:, at - 1], jnp.int32) for at in range(1, block)]
+    drafts = [jnp.asarray(SPECULATIVE["draft"][:, at]) for at in range(block)]
+    drafted = strategies._Drafted(state=None, candidates=candidates, scores=drafts, steps=None,
+                                  offered=[jnp.ones(rows, bool)] * block,
+                                  ending=[jnp.zeros(rows, bool)] * block)
+    step = StepState(tokens=jnp.zeros((rows, 1), jnp.int32), valid=jnp.ones((rows, 1), bool),
+                     step=jnp.zeros(rows, jnp.int32), active=jnp.ones(rows, bool), keys=keys[:, 0])
+    seen = []
+
+    def recorded(keys, scores, active):
+        seen.append(scores)
+        return jnp.zeros(scores.shape[0], jnp.int32)
+
+    monkeypatch.setattr(strategies, "select", recorded)
+    matched, _ = strategies._accepted(block, keys, targets, drafted, step, jnp.ones(rows, bool), 64)
+    np.testing.assert_array_equal(np.asarray(matched), SPECULATIVE["matches"] + 1)
+    assert_as_exact_as_the_reference(jax.nn.softmax(seen[0]), SPECULATIVE["next"], SPECULATIVE["next_f64"],
+                                     "next token's distribution")
 
 
 def test_the_emitted_tokens_follow_the_target_distribution():
