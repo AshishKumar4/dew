@@ -789,7 +789,9 @@ class Trainer(Generic[Loss, Effects]):
         being in `fit`, so constructing a Trainer allocates nothing.
 
         `accumulation` is how many microbatches pool into one optimizer
-        commit. `step` replaces the built-in transaction. A custom step then
+        commit. The optimizer the run steps is the objective's
+        (`Objective.optimizer`), made from `optimizer`. `step` replaces the
+        built-in transaction. A custom step then
         owns the clocks, the scaler, the EMA and the mutable writes, and the
         compiled wrapper owns only the attempted-step counter. `rollout` runs
         once per batch read, before the step and outside replay. `layout` and
@@ -803,7 +805,7 @@ class Trainer(Generic[Loss, Effects]):
                 "custom steps own their execution"
             )
         self.objective = objective
-        self.optimizer = optimizer
+        self.optimizer = objective.optimizer(optimizer, accumulation=accumulation)
         from dew.nn.inputs import request_key
         self.seed = int(key) if isinstance(key, (int, np.integer)) and not isinstance(key, bool) else None
         self.key = request_key(key)

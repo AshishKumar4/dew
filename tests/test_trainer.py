@@ -1829,6 +1829,83 @@ def test_a_custom_step_alternates_two_optimizers_on_the_same_checkpoints_and_tra
     assert Checkpoints(str(tmp_path / "gan")).latest == 4
 
 
+class Alternating(TwoPlayers):
+    """`TwoPlayers` under the built-in transaction: even updates train the
+    generator and odd ones the discriminator, each with its own copy of the
+    optimizer (`Objective.optimizer`), and the EMA follows the generator's
+    updates alone (`Objective.averages`)."""
+
+    ema = EMASpec(decay=optax.constant_schedule(0.5), select=under("params", "gen"))
+
+    def loss(self, variables, batch, step):
+        return jax.lax.cond(self.generating(step.step), self.generator_loss, self.discriminator_loss,
+                            variables["params"], batch)
+
+    @staticmethod
+    def generating(update):
+        return update % 2 == 0
+
+    def optimizer(self, tx, *, accumulation):
+        if accumulation > 1:
+            raise ValueError("the players alternate update by update; train with accumulation=1")
+        return optax.multi_transform(
+            {"gen": optax.conditionally_mask(tx, self.generating),
+             "disc": optax.conditionally_mask(tx, lambda update: ~self.generating(update))},
+            {"gen": "gen", "disc": "disc"})
+
+    def averages(self, update):
+        return self.generating(update)
+
+
+def test_an_objective_alternates_two_networks_each_with_its_own_optimizer(tmp_path):
+    """The same alternation without a custom step. Each network steps only
+    on its own updates, from its own Adam state: after four updates the
+    generator has taken Adam's steps one and two on its two gradients and the
+    discriminator its own, as two separate Adams would, though each
+    network's gradient is zero on the other's updates and Adam's momentum
+    would move it there. The EMA averages on generator updates only, and a
+    resumed run continues both optimizers where they were."""
+    tx = optax.adam(0.1)
+
+    def trainer():
+        return Trainer(Alternating(), tx, key=jax.random.key(0),
+                       layout=Layout(min_shard=1, tolerance=1.0),
+                       checkpoints=Checkpoints(str(tmp_path / "players"), keep=2))
+
+    halfway = trainer().fit(Data(), steps=2, log_every=10)
+    state = trainer().fit(Data(), steps=4, log_every=10)
+    objective = TwoPlayers()
+
+    def own(network, loss, others):
+        """`network` stepped alone by its own Adam, the other at `others`."""
+        params = {"gen": {"g": jnp.zeros(())}, "disc": {"d": jnp.zeros(())}}
+        opt_state = tx.init(params[network])
+        history = []
+        for other in others:
+            grads = jax.grad(loss)({**params, **other}, None)[network]
+            update, opt_state = tx.update(grads, opt_state, params[network])
+            params = {**params, network: optax.apply_updates(params[network], update)}
+            history.append(params[network])
+        return history
+
+    generator = own("gen", objective.generator_loss, [{}, {}])
+    # The compiled step and the eager loop round once differently: an ulp.
+    def near(value):
+        return pytest.approx(float(value), rel=1e-6)
+
+    assert float(halfway.variables["params"]["gen"]["g"]) == near(generator[0]["g"])
+    assert float(state.variables["params"]["gen"]["g"]) == near(generator[1]["g"])
+    first, second = (float(value["g"]) for value in generator)
+    discriminator = own("disc", objective.discriminator_loss, [{"gen": {"g": jnp.asarray(first)}},
+                                                               {"gen": {"g": jnp.asarray(second)}}])
+    assert float(halfway.variables["params"]["disc"]["d"]) == near(discriminator[0]["d"])
+    assert float(state.variables["params"]["disc"]["d"]) == near(discriminator[1]["d"])
+    # Averaged on updates 0 and 2: half the generator after each, from zero.
+    assert float(state.ema["params"]["gen"]["g"]) == near(0.5 * (0.5 * first) + 0.5 * second)
+    with pytest.raises(ValueError, match="accumulation=1"):
+        Trainer(Alternating(), tx, key=jax.random.key(0), accumulation=2)
+
+
 GiB = 2**30
 
 

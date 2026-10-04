@@ -306,6 +306,31 @@ class Objective(ABC, Generic[Loss, Effects]):
     reports them under, and the loss itself, under `loss`, where the
     trainer's default (lower is better) does not hold."""
 
+    def optimizer(self, tx: optax.GradientTransformation, *,
+                  accumulation: int) -> optax.GradientTransformation:
+        """The optimizer the trainer steps this objective's `params` with,
+        made from the one it was handed, `tx`.
+
+        The default is `tx` itself. An objective that trains several networks
+        of its own, such as a few-step student beside the fake score that
+        criticizes it, can give each its own copy of `tx`, with its own state
+        and update count, by `optax.multi_transform` over the networks, and
+        alternate them by `optax.conditionally_mask`, whose count is the
+        trainer's committed updates. `accumulation` is the trainer's: an
+        objective whose loss alternates networks step by step refuses more
+        than one microbatch per update, since a window would mix phases.
+        """
+        return tx
+
+    def averages(self, update: jax.Array) -> jax.Array:
+        """Whether the update after `update` committed ones moves the EMA.
+
+        The default averages every update. An objective whose EMA follows
+        one of the networks it alternates averages on that network's updates
+        only, as rCM's does on its student's.
+        """
+        return jnp.asarray(a=True)
+
     def held_variables(self) -> Variables | None:
         """The arrays this objective starts from, or None when it draws them.
 

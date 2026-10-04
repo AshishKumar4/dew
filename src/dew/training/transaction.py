@@ -357,7 +357,9 @@ class Transaction:
                 if self.objective.ema is not None:
                     if averaged is None:
                         raise ValueError("the objective declares EMA but the state carries none")
-                    averaged = ema_update(averaged, params, self.objective.ema.decay(current.updates))
+                    averaged = chosen(self.objective.averages(current.updates),
+                                      ema_update(averaged, params, self.objective.ema.decay(current.updates)),
+                                      averaged)
                 compute = None if current.compute is None else narrowed(params, self.copies)
                 return dataclasses.replace(current, variables=params, opt_state=opt_state, ema=averaged,
                                            updates=current.updates + 1, compute=compute)
