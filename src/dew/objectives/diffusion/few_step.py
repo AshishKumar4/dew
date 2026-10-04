@@ -182,6 +182,11 @@ class MeanFlowObjective(DiffusionObjective):
         return Ratio(jnp.sum(losses), jnp.asarray(count, jnp.float32)), Aux(metrics={})
 
 
+# The noise a shortcut model's path keeps at the data end, the reference's
+# (1 - 1e-5) in x_t = (1 - (1 - 1e-5) t) x_0 + t x_1.
+_NOISE_FLOOR = 1e-5
+
+
 @objectives("shortcut")
 class ShortcutObjective(DiffusionObjective):
     """A shortcut model on an interval process (`presets.Shortcut`).
@@ -192,6 +197,9 @@ class ShortcutObjective(DiffusionObjective):
     at a level of `shortcut_levels`, on times of that level's grid, against
     two half steps of the EMA weights when the run keeps them. The
     condition is dropped on `unconditional_prob` of the flow-matching rows.
+    The path is the reference's, whose noise never quite vanishes: data
+    at t is (1 - (1 - 1e-5) t) noise + t data, Dew's sigma being 1 - t,
+    and the velocity toward the noise is (1 - 1e-5) noise - data.
     Sampling walks `steps - 1` equal Euler steps with no guidance; a count
     of steps that is a power of two up to `sections` is one the model
     trained at.
@@ -214,27 +222,34 @@ class ShortcutObjective(DiffusionObjective):
         self.sections = sections
         self.bootstrap_every = bootstrap_every
 
+    def _draws(self, key, count: int, grid: jax.Array, shape) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """The loss's randomness: each row's time index below its `grid`, the
+        noise, and whether a flow-matching row drops its condition."""
+        times, noise, dropping = jax.random.split(key, 3)
+        return (jax.random.randint(times, (count,), 0, grid.astype(jnp.int32)),
+                jax.random.normal(noise, shape, dtype=jnp.float32),
+                jax.random.bernoulli(dropping, self.unconditional_prob, (count,)))
+
     def loss(self, variables, batch, step: Step):
         samples = unit_range(batch[self.inputs.sample.key])
-        encode_key, drop_key, time_key, noise_key, dropout_key = jax.random.split(step.key, 5)
+        encode_key, condition_key, draw_key, dropout_key = jax.random.split(step.key, 4)
         if self.autoencoder is not None:
             samples = self.autoencoder.encode(variables["autoencoder"], samples, encode_key)
         count = samples.shape[0]
         rows = count // self.bootstrap_every
         schedule = self.process.schedule
-        given, blank = self._conditions(variables, batch, drop_key, dropout=False)
+        given, blank = self._conditions(variables, batch, condition_key, dropout=False)
 
         levels = shortcut_levels(rows, self.sections)
         grid = jnp.concatenate([2.0 ** levels, jnp.full((count - rows,), float(self.sections))])
-        # Data at t = k / grid, k below grid, in the reference's time; noise is Dew's sigma = 1 - t.
-        sigma = 1 - jax.random.randint(time_key, (count,), 0, grid.astype(jnp.int32)) / grid
+        index, noise, dropping = self._draws(draw_key, count, grid, samples.shape)
+        # Data at t = index / grid in the reference's time, on its path; Dew's sigma is 1 - t.
+        t = index / grid
+        sigma = 1 - t
+        x = (1 - (1 - _NOISE_FLOOR) * expand(t, samples)) * noise + expand(t, samples) * samples
+        v = (1 - _NOISE_FLOOR) * noise - samples
         step_size = jnp.concatenate([2.0 ** -levels, jnp.full((count - rows,), 1 / self.sections)])
-        noise = jax.random.normal(noise_key, samples.shape, dtype=jnp.float32)
-        x, _, v = self.process.prediction.forward_diffusion(
-            samples, noise, broadcast_rates(schedule, sigma, samples)
-        )
-        dropped = jnp.arange(count) >= rows
-        dropped &= jax.random.bernoulli(jax.random.fold_in(drop_key, 1), self.unconditional_prob, (count,))
+        dropped = (jnp.arange(count) >= rows) & dropping
         conditions = jax.tree.map(lambda value, null: jnp.where(expand(dropped, value), null, value),
                                   given, blank)
 
