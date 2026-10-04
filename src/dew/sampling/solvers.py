@@ -306,7 +306,7 @@ class Heun:
 class RK4:
     """Classical Runge-Kutta over dx/dsigma = eps, on a variance exploding
     schedule; the stages at half steps read the model at the time the schedule
-    maps that sigma back to."""
+    maps that sigma back to. FlaxDiff's `RK4Sampler`."""
 
     def init(self, x, times, process, *, key):
         return ()
@@ -543,7 +543,8 @@ class DPMSolverSDE:
 @dataclass(frozen=True)
 class MultiStepDPM:
     """A third order multistep integrator of dx/dsigma = eps on a variance
-    exploding schedule, from finite differences of the last three eps."""
+    exploding schedule, from finite differences of the last three eps:
+    FlaxDiff's `MultiStepDPM`, which despite the name is not DPM-Solver."""
 
     def init(self, x, times, process, *, key):
         coefficient = jnp.zeros((x.shape[0],) + (1,) * (x.ndim - 1), jnp.float32)
