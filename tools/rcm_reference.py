@@ -192,6 +192,10 @@ corrections 1 - beta^t in float32 and torch in float64, which at the
 default 0.999 alone moves a float32 step by 6e-6 of itself, more than the
 rest of the step's rounding."""
 TRAINING_SHAPE = (8, 2, 1, 4, 4)
+DISCRETE = {"cm_type": "dcm", "dcm_total_steps": 8, "dcm_skipping_interval_steps": 1,
+            "dcm_timestep_shift": 5.0}
+"""The same loop on rCM's discrete-time consistency, two teacher Euler steps
+apart on an 8-point grid at shift 5."""
 """Eight rows, a row for each of the test's eight devices."""
 TIMES = {"G": (-0.8, 1.6), "D": (0.0, 1.6)}
 """The log-normal training times in rf time, (mean, std), as the stand-in
@@ -276,10 +280,13 @@ class Precision:
         torch.Tensor.float, torch.Tensor.double = self.kept
 
 
-def trained(dtype, pixels, label, teacher, replayed=None, optimizer=None) -> tuple[dict, list[torch.Tensor]]:
+def trained(dtype, pixels, label, teacher, replayed=None, optimizer=None,
+            settings: dict | None = None) -> tuple[dict, list[torch.Tensor]]:
     """`ITERATIONS` of the reference's `ImaginaireTrainer_Distill.training_step`
     over the model's closures, with its two Adam optimizers and its EMA,
-    from student and fake score copies of `teacher`."""
+    from student and fake score copies of `teacher`, under `TRAINING` with
+    `settings` over it."""
+    settings = {**TRAINING, **(settings or {})}
     generator = torch.Generator().manual_seed(7)
     draws = Replayed(dtype, generator, replayed)
     scope = {"torch": draws, "np": np, "math": math, "rearrange": rearrange, "repeat": repeat,
@@ -291,10 +298,12 @@ def trained(dtype, pixels, label, teacher, replayed=None, optimizer=None) -> tup
                           {"torch": types.SimpleNamespace(**{**vars(torch), "float64": dtype})}
                           )["RectifiedFlow_TrigFlowWrapper"]
     methods = ("denoise", "student_F_withT", "backward_simulation", "_student_scm_step", "_student_dmd_step",
-               "training_step_critic", "training_step_closures", "_make_training_ctx", "is_student_phase",
-               "get_effective_iteration", "get_effective_iteration_fake", "get_optimizers",
-               "get_lr_schedulers", "on_before_zero_grad", "ema_beta")
+               "_student_dcm_step", "training_step_critic", "training_step_closures", "_make_training_ctx",
+               "is_student_phase", "get_effective_iteration", "get_effective_iteration_fake",
+               "get_optimizers", "get_lr_schedulers", "on_before_zero_grad", "ema_beta")
     definitions(RCM + "rcm/models/t2v_model_distill_rcm.py", methods, scope, within="T2VDistillModel_rCM")
+    definitions(RCM + "rcm/utils/timestep_utils.py",
+                ("shift_rf_time", "rf_to_trig_time", "rf_to_sigma", "sigma_to_trig_time"), scope)
     definitions(RCM + "imaginaire/utils/ema.py", ("FastEmaModelUpdater",), scope)
     unsynced = types.SimpleNamespace(ddp_sync_grad=lambda *_: contextlib.nullcontext())
     # The loop's total-loss tensor without the CUDA device it names.
@@ -316,15 +325,15 @@ def trained(dtype, pixels, label, teacher, replayed=None, optimizer=None) -> tup
     optimizers = {name: made(nets[network].parameters())
                   for name, network in (("net", "net"), ("fake_score", "net_fake_score"))}
     model = types.SimpleNamespace(
-        config=types.SimpleNamespace(**TRAINING), tensor_kwargs={"dtype": dtype},
+        config=types.SimpleNamespace(**settings), tensor_kwargs={"dtype": dtype},
         scaling=scaling(1.0, 1000.0), net_teacher=teacher_net, sync=lambda *xs: xs if len(xs) > 1 else xs[0],
         optimizer_dict=optimizers,
         scheduler_dict={name: torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
                         for name, optimizer in optimizers.items()},
         net_ema_worker=scope["FastEmaModelUpdater"](), **nets,
         # set_up_model's power-EMA exponent for the configured rate.
-        ema_exp_coefficient=np.roots([1, 7, 16 - TRAINING["ema"].rate ** -2,
-                                      12 - TRAINING["ema"].rate ** -2]).real.max(),
+        ema_exp_coefficient=np.roots([1, 7, 16 - settings["ema"].rate ** -2,
+                                      12 - settings["ema"].rate ** -2]).real.max(),
         get_data_and_condition=lambda batch: (None, x0, Condition(label.to(dtype)),
                                               Condition(torch.zeros_like(label, dtype=dtype))))
     times = {"G": [], "D": []}
@@ -342,7 +351,7 @@ def trained(dtype, pixels, label, teacher, replayed=None, optimizer=None) -> tup
     for name in methods:
         setattr(model, name, types.MethodType(scope[name], model))
     trainer = types.SimpleNamespace(
-        config=types.SimpleNamespace(trainer=TRAINING["trainer"]),
+        config=types.SimpleNamespace(trainer=settings["trainer"]),
         callbacks=types.SimpleNamespace(**{hook: lambda *args, **kwargs: None for hook in (
             "on_before_forward", "on_after_forward", "on_before_backward", "on_after_backward",
             "on_before_optimizer_step", "on_before_zero_grad")}),
@@ -390,16 +399,22 @@ def training() -> None:
     arrays.update({f"published/{name}": value for name, value in published.items()})
     arrays.update({f"published/{name}_f64": value for name, value in published_wide.items()})
     arrays["published"] = np.asarray(json.dumps(PUBLISHED))
+    discrete, drawn = trained(torch.float32, pixels, label, teacher, settings=DISCRETE)
+    discrete_wide, _ = trained(torch.float64, pixels, label, teacher, replayed=drawn, settings=DISCRETE)
+    arrays.update({f"dcm/{name}": value for name, value in discrete.items()})
+    arrays.update({f"dcm/{name}_f64": value for name, value in discrete_wide.items()})
+    arrays.update({f"dcm/{name}": value for name, value in by_role(drawn, discrete=True).items()})
+    arrays["dcm"] = np.asarray(json.dumps(DISCRETE))
     np.savez(FIXTURE / "training.npz", **arrays)
     print(f"{FIXTURE}: rCM's loop over {ITERATIONS} iterations, float32 and float64")
 
 
-def by_role(drawn: list[torch.Tensor]) -> dict[str, np.ndarray]:
+def by_role(drawn: list[torch.Tensor], discrete: bool = False) -> dict[str, np.ndarray]:
     """The draws of each iteration under the names Dew's `_Draws` gives them,
     zero where an iteration reads none. A student iteration draws sCM's time
-    and noise, then past the warmup the DMD2 ones; a critic iteration the
-    DMD2 ones: the sample's start, its times, its renoising, the critic's
-    time and noise."""
+    and noise (dCM: the noise, then its uniform), then past the warmup the
+    DMD2 ones; a critic iteration the DMD2 ones: the sample's start, its
+    times, its renoising, the critic's time and noise."""
     rows, simulated = TRAINING_SHAPE[0], TRAINING["max_simulation_steps_fake"] - 1
     roles = {"consistency_time": (rows,), "consistency_noise": TRAINING_SHAPE, "start": TRAINING_SHAPE,
              "simulation_times": (simulated, rows), "simulation_noises": (simulated, *TRAINING_SHAPE),
@@ -410,7 +425,10 @@ def by_role(drawn: list[torch.Tensor]) -> dict[str, np.ndarray]:
     for iteration in range(ITERATIONS):
         student = iteration < warmup or (iteration - warmup) % every == 0
         effective = iteration if iteration < warmup else warmup + (iteration - warmup) // every
-        if student:
+        if student and discrete:
+            out["consistency_noise"][iteration] = queue.pop(0).numpy()
+            out["consistency_time"][iteration] = queue.pop(0).numpy().reshape(rows)
+        elif student:
             out["consistency_time"][iteration] = queue.pop(0).numpy().reshape(rows)
             out["consistency_noise"][iteration] = queue.pop(0).numpy()
         if student and iteration < warmup:
