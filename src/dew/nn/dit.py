@@ -366,6 +366,25 @@ def remat_block(block_cls, enabled: RematChoice, policy: str | None = 'dots'):
     )
 
 
+def _gelu(hidden: jax.Array, approximate: bool) -> jax.Array:
+    """GELU in at least fp32, rounded once to `hidden`'s dtype, as torch's bf16
+    GELU does (docs/performance.md): tanh-approximate, or exact."""
+    if approximate:
+        return nn.gelu(hidden.astype(at_least_fp32(hidden.dtype)), approximate=True).astype(hidden.dtype)
+    return _exact_gelu(hidden)
+
+
+@jax.checkpoint
+def _exact_gelu(hidden: jax.Array) -> jax.Array:
+    """Exact GELU, recomputed in the backward from `hidden` in its own dtype,
+    which the next matmul keeps anyway. Saved instead, XLA writes the fp32
+    value out for the backward, which made a JEPA training step (ViT-S/16 at
+    224, batch 64, bf16, RTX 4080) 10.4% slower than with tanh GELU;
+    recomputed, 3.2% slower. The rest is erfc's own arithmetic: torch's erf
+    form measured slower still."""
+    return nn.gelu(hidden.astype(at_least_fp32(hidden.dtype)), approximate=False).astype(hidden.dtype)
+
+
 @logical_axes({("mlp", "layers_0"): ("embed", "mlp"), ("mlp", "layers_2"): ("mlp", "embed")})
 class ModulatedBlock(nn.Module):
     """adaLN-Zero modulated residual block with a pluggable token mixer.
@@ -374,7 +393,9 @@ class ModulatedBlock(nn.Module):
     leaves it unrotated); mixer='ssm' is a bidirectional S5 scan, optionally
     with Spatial-Mamba 2D state fusion, and ignores freqs_cis. modulated=False
     is the plain pre-norm block with affine norms a JEPA encoder needs.
-    `adaln_silu` is `AdaLNParams.silu`.
+    `adaln_silu` is `AdaLNParams.silu`. `gelu_approximate` picks the MLP's
+    GELU: tanh-approximate as Meta's DiT uses it, or exact (erf) as the
+    ViTs behind I-JEPA and V-JEPA use it.
     """
     features: int
     num_heads: int
@@ -387,6 +408,7 @@ class ModulatedBlock(nn.Module):
     force_fp32_for_softmax: bool = True
     norm_epsilon: float = 1e-5
     adaln_silu: bool = True
+    gelu_approximate: bool = True
     qk_norm: bool = False
     attention_impl: str = "auto"  # an AttentionImpl
     # ssm mixer options
@@ -445,8 +467,7 @@ class ModulatedBlock(nn.Module):
             # Column-parallel under a tensor axis; the activation holds the
             # place so the layers keep their names. GELU runs in fp32 and
             # rounds once, as torch's bf16 GELU does (docs/performance.md).
-            lambda hidden: nn.gelu(constrain(hidden, MLP_HIDDEN).astype(at_least_fp32(hidden.dtype))
-                                   ).astype(hidden.dtype),
+            lambda hidden: _gelu(constrain(hidden, MLP_HIDDEN), self.gelu_approximate),
             nn.Dense(features=self.features, dtype=self.dtype, precision=self.precision),
         ])
         self.dropout = nn.Dropout(rate=self.dropout_rate)

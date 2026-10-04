@@ -369,6 +369,42 @@ def test_a_bf16_dit_runs_its_gelu_in_fp32(family, rng):
     assert dtypes and all(dtype == jnp.float32 for dtype in dtypes), dtypes
 
 
+def test_an_exact_gelu_reads_fp32_and_keeps_only_its_bf16_input_for_the_backward(rng):
+    """Exact GELU (`gelu_approximate=False`, U-ViT's) runs in fp32 and rounds
+    once like the tanh one, inside a remat whose only input is the bf16
+    activation: saved instead, XLA wrote the fp32 value out for the backward,
+    10.4% of a JEPA step on the RTX 4080 (dew.nn.dit._exact_gelu)."""
+    from dew.nn.dit import ModulatedBlock
+
+    block = ModulatedBlock(features=32, num_heads=2, modulated=False, gelu_approximate=False,
+                           dtype=jnp.bfloat16)
+    tokens = jax.random.normal(rng, (2, 8, 32), jnp.bfloat16)
+    params = block.init(rng, tokens, None, None)
+
+    def loss(params):
+        return jnp.sum(block.apply(params, tokens, None, None).astype(jnp.float32))
+
+    found = []
+
+    def walk(jaxpr, remat_inputs=None):
+        for equation in jaxpr.eqns:
+            if equation.primitive.name == "erfc":
+                found.append((equation.invars[0].aval.dtype, remat_inputs))
+            inputs = ([variable.aval.dtype for variable in equation.invars]
+                      if equation.primitive.name in ("checkpoint", "remat2") else remat_inputs)
+            for parameter in equation.params.values():
+                inner = getattr(parameter, "jaxpr", parameter)
+                if hasattr(inner, "eqns"):
+                    walk(inner, inputs)
+
+    walk(jax.make_jaxpr(jax.value_and_grad(loss))(params).jaxpr)
+    assert found and all(dtype == jnp.float32 for dtype, _ in found), found
+    # The backward recomputes erfc in a remat that reads the bf16 activation
+    # and its bf16 cotangent, nothing wider.
+    recomputed = [inputs for _, inputs in found if inputs is not None]
+    assert recomputed and all(dtype == jnp.bfloat16 for inputs in recomputed for dtype in inputs), found
+
+
 def test_the_split_counts_every_flop_dew_counts(rng):
     """The denominator is dew's own step-FLOP number, not a second opinion:
     splitting the module by operand dtype adds back up to `hlo_flops`."""
