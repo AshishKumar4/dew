@@ -328,7 +328,8 @@ def test_a_trained_flux_step_exports_and_reloads(source, pipeline_record, tmp_pa
     again = Pretrained.load(str(export), dtype="float32", attention_impl="xla")
     with np.load(source / "flux_transformer.npz") as arrays:
         grid = pipeline_record["size"] // 4
-        latent = jnp.asarray(unpacked(arrays["pipeline.x_T"], grid, grid))
+        packed = np.asarray(arrays["pipeline.x_T"])
+        latent = jnp.asarray(unpacked(packed, grid, grid))
         condition = DenoisingCondition(
             jnp.asarray(arrays["pipeline.context"]), jnp.asarray(arrays["pipeline.pooled"]),
             guidance=jnp.full((2,), pipeline_record["default_guidance"], jnp.float32))
@@ -336,6 +337,30 @@ def test_a_trained_flux_step_exports_and_reloads(source, pipeline_record, tmp_pa
     trained = loaded.model.apply({"params": state.variables["params"]}, latent, times, condition)
     reloaded = again.model.apply({"params": again.variables["params"]}, latent, times, condition)
     np.testing.assert_array_equal(reloaded, trained)
+
+    # Diffusers' own classes read the export: every component cleanly, the
+    # pipeline whole, and its transformer recomputes the trained forward on
+    # the packed latent with FluxPipeline's own position ids.
+    from reference_error import assert_as_exact_as_the_reference
+
+    from tools import diffusers_consumer as consumer
+
+    consumer.assert_components_load(export)
+
+    def call(model, tensor):
+        # Imported after the consumer, which restores the transformers names
+        # Diffusers' pipeline modules read.
+        from diffusers import FluxPipeline
+
+        positions = FluxPipeline._prepare_latent_image_ids(1, grid, grid, "cpu", model.dtype)
+        output = model(hidden_states=tensor(packed), encoder_hidden_states=tensor(condition.context),
+                       pooled_projections=tensor(condition.pooled), timestep=tensor(times) / 1000,
+                       guidance=tensor(condition.guidance), img_ids=positions,
+                       txt_ids=tensor(np.zeros((condition.context.shape[1], 3)))).sample
+        return unpacked(output.numpy(), grid, grid)
+
+    assert_as_exact_as_the_reference(np.asarray(trained), consumer.denoiser_prediction(export, call),
+                                     consumer.denoiser_prediction(export, call, wide=True), "trained Flux")
 
 
 def test_each_records_guidance_reaches_the_model_and_survives_the_shared_seams(
