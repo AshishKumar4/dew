@@ -672,6 +672,29 @@ def test_bf16_state_keeps_the_second_moments_small_increments():
     assert have == pytest.approx(want, rel=1e-2)
 
 
+def test_lamb_is_optax_lamb_on_the_configs_schedule_decay_options_and_clip():
+    """`optimizer='lamb'` runs optax.lamb itself (`OPTIMIZER_MAP`), so what
+    Dew adds is the wiring: the config's schedule, weight decay and
+    `optimizer_opts` reach it, behind the global-norm clip. Three steps on
+    changing gradients are bitwise the transform built from optax
+    directly."""
+    params = decoder_params()["params"]
+    cosine = Cosine(peak=1e-2, warmup_steps=2, end=1e-3, init=1e-4)
+    opts = {"b1": 0.8, "b2": 0.95, "eps": 1e-5, "eps_root": 1e-9}
+    solver = OptimConfig(optimizer="lamb", optimizer_opts=opts, schedule=cosine, weight_decay=0.05,
+                         clip_grads=0.5).build(10)
+    reference = optax.chain(optax.clip_by_global_norm(0.5),
+                            optax.lamb(cosine.schedule(10), weight_decay=0.05, **opts))
+    state, expected_state = solver.init(params), reference.init(params)
+    for step in range(3):
+        grads = jax.tree.map(lambda grad, step=step: grad * (step + 1) * 0.3, fixed_gradients(params))
+        updates, state = solver.update(grads, state, params)
+        expected, expected_state = reference.update(grads, expected_state, params)
+        for have, want in zip(jax.tree.leaves(updates), jax.tree.leaves(expected), strict=True):
+            np.testing.assert_array_equal(np.asarray(have), np.asarray(want))
+        params = optax.apply_updates(params, updates)
+
+
 def test_bf16_state_is_refused_where_there_is_no_adam_moment():
     with pytest.raises(ValueError, match="state_dtype"):
         OptimConfig(optimizer='lamb', state_dtype='bfloat16').build(10)
