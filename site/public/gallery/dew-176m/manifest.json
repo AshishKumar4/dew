@@ -1,628 +1,614 @@
 {
- "model": {
-  "model": "dewml/hybrid-dit-176m",
-  "revision": "90d1717ac262e1b33a65ac602812ef442129c7ea",
-  "loaded_with": "dew.sampling.TextToImage.from_run(pull_from_hub('dewml/hybrid-dit-176m', revision=...)), the run from_pretrained loads",
-  "checkpoint_step": 1350000,
-  "parameters": 175640848,
-  "dew_commit": "aaffb62c07ffad78c72b29758673d1c4f5c37f4a",
-  "device": "NVIDIA GeForce RTX 4080",
-  "jax": "0.11.2.post3",
-  "compute": "published run dtypes, unquantized",
-  "run_json_sha256": "ba2160cd785227b4460c8ce1d76b28d74386039601b7cd1b5acbc7f32f1f477a",
-  "tools_commit": "70831a757 (branch landing/visuals: tools/landing_visuals.py on top of integration/all aaffb62c0; library unchanged)"
- },
- "note": "One image per prompt. square_256 only for band-free renders; wide_3x2 is the largest centred 3:2 box inside any flat edge bands (crop_3x2 = left, top, right, bottom).",
- "images": [
-  {
-   "id": "dpm40_cfg7.5i_negB/aurora2.vivid.s28",
-   "file": "aurora2-vivid-k28.webp",
-   "prompt": "green and purple northern lights reflected in a frozen lake, snowy mountains at night, vivid colors, dramatic lighting, highly detailed",
-   "key": 28,
-   "solver": "DPMSolverMultistep",
-   "steps": 40,
-   "cfg": 7.5,
-   "guidance_interval": [
-    0.15,
-    0.9
-   ],
-   "negative_prompt": "letterbox, white border, black border, frame, text, watermark, collage, blurry, lowres, low quality, dull colors, washed out, low contrast, grainy",
-   "resolution": [
-    256,
-    256
-   ],
-   "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=28, steps=40, unconditional=negative); pipe(inputs, key=28, steps=40, solver=DPMSolverMultistep(), guidance=CFG(7.5, interval=(0.15, 0.9)))",
-   "clip_score": 28.24,
-   "aesthetic": 5.758,
-   "framing": "square",
-   "png_sha256": "4308144f72bd9397d47dec40a1483fbbd6561d79ae2b2c2521e247bab7056999",
-   "seconds_on_rtx4080": 0.26,
-   "files": {
-    "square_256": "aurora2-vivid-k28.webp",
-    "wide_3x2": "aurora2-vivid-k28-3x2.webp"
-   },
-   "crop_3x2": [
-    0,
-    42,
-    256,
-    213
-   ]
+  "model": {
+    "model": "dewml/hybrid-dit-176m",
+    "revision": "90d1717ac262e1b33a65ac602812ef442129c7ea",
+    "loaded_with": "dew.sampling.TextToImage.from_run(pull_from_hub('dewml/hybrid-dit-176m', revision=...)), the run from_pretrained loads",
+    "checkpoint_step": 1350000,
+    "parameters": 175640848,
+    "dew_commit": "aaffb62c07ffad78c72b29758673d1c4f5c37f4a",
+    "device": "NVIDIA GeForce RTX 4080",
+    "jax": "0.11.2.post3",
+    "compute": "published run dtypes, unquantized",
+    "run_json_sha256": "ba2160cd785227b4460c8ce1d76b28d74386039601b7cd1b5acbc7f32f1f477a",
+    "tools_commit": "70831a757 (branch landing/visuals: tools/landing_visuals.py on top of integration/all aaffb62c0; library unchanged)"
   },
-  {
-   "id": "unipc30_cfg6i2_negB/lake.vivid.s50",
-   "file": "lake-vivid-k50.webp",
-   "prompt": "a mountain lake reflecting snowy peaks, vivid colors, dramatic lighting, highly detailed",
-   "key": 50,
-   "solver": "UniPC",
-   "steps": 30,
-   "cfg": 6.0,
-   "guidance_interval": [
-    0.2,
-    0.9
-   ],
-   "negative_prompt": "letterbox, white border, black border, frame, text, watermark, collage, blurry, lowres, low quality, dull colors, washed out, low contrast, grainy",
-   "resolution": [
-    256,
-    256
-   ],
-   "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=50, steps=30, unconditional=negative); pipe(inputs, key=50, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
-   "clip_score": 27.69,
-   "aesthetic": 6.026,
-   "framing": "square",
-   "png_sha256": "95c3d7278eddc7262bdaf55a96495717b5125392943efafc60f222a7b066e15c",
-   "seconds_on_rtx4080": 0.19,
-   "files": {
-    "square_256": "lake-vivid-k50.webp",
-    "wide_3x2": "lake-vivid-k50-3x2.webp"
-   },
-   "crop_3x2": [
-    0,
-    42,
-    256,
-    213
-   ]
-  },
-  {
-   "id": "unipc30_cfg6i2_negB/roerich.vivid.s32",
-   "file": "roerich-vivid-k32.webp",
-   "prompt": "a red and gold mountain landscape, a painting in the style of Nicholas Roerich, vivid colors, dramatic lighting, highly detailed",
-   "key": 32,
-   "solver": "UniPC",
-   "steps": 30,
-   "cfg": 6.0,
-   "guidance_interval": [
-    0.2,
-    0.9
-   ],
-   "negative_prompt": "letterbox, white border, black border, frame, text, watermark, collage, blurry, lowres, low quality, dull colors, washed out, low contrast, grainy",
-   "resolution": [
-    256,
-    256
-   ],
-   "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=32, steps=30, unconditional=negative); pipe(inputs, key=32, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
-   "clip_score": 31.92,
-   "aesthetic": 6.744,
-   "framing": "square",
-   "png_sha256": "9c706d6205d959292b4ee146d016960b8bed6bf6fb14af995b280b97d56f0fcc",
-   "seconds_on_rtx4080": 0.19,
-   "files": {
-    "square_256": "roerich-vivid-k32.webp",
-    "wide_3x2": "roerich-vivid-k32-3x2.webp"
-   },
-   "crop_3x2": [
-    0,
-    42,
-    256,
-    213
-   ]
-  },
-  {
-   "id": "unipc30_cfg6i2_negB/lighthouse.vivid.s03",
-   "file": "lighthouse-vivid-k3.webp",
-   "prompt": "a lighthouse on a rocky coast at sunset, dramatic waves and golden light, vivid colors, dramatic lighting, highly detailed",
-   "key": 3,
-   "solver": "UniPC",
-   "steps": 30,
-   "cfg": 6.0,
-   "guidance_interval": [
-    0.2,
-    0.9
-   ],
-   "negative_prompt": "letterbox, white border, black border, frame, text, watermark, collage, blurry, lowres, low quality, dull colors, washed out, low contrast, grainy",
-   "resolution": [
-    256,
-    256
-   ],
-   "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=3, steps=30, unconditional=negative); pipe(inputs, key=3, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
-   "clip_score": 28.66,
-   "aesthetic": 6.609,
-   "framing": "square",
-   "png_sha256": "b902b61bc11fc61f715d2e4b10522a80bf530893b816dea109e15053f9a408ea",
-   "seconds_on_rtx4080": 0.19,
-   "files": {
-    "square_256": "lighthouse-vivid-k3.webp",
-    "wide_3x2": "lighthouse-vivid-k3-3x2.webp"
-   },
-   "crop_3x2": [
-    0,
-    42,
-    256,
-    213
-   ]
-  },
-  {
-   "id": "unipc30_cfg6i2_negB/village.vivid.s60",
-   "file": "village-vivid-k60.webp",
-   "prompt": "a snowy mountain village at dusk, warm glowing windows and blue snow, vivid colors, dramatic lighting, highly detailed",
-   "key": 60,
-   "solver": "UniPC",
-   "steps": 30,
-   "cfg": 6.0,
-   "guidance_interval": [
-    0.2,
-    0.9
-   ],
-   "negative_prompt": "letterbox, white border, black border, frame, text, watermark, collage, blurry, lowres, low quality, dull colors, washed out, low contrast, grainy",
-   "resolution": [
-    256,
-    256
-   ],
-   "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=60, steps=30, unconditional=negative); pipe(inputs, key=60, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
-   "clip_score": 29.0,
-   "aesthetic": 6.337,
-   "framing": "square",
-   "png_sha256": "698729d8aa2ebf7cdb778a284d1a9ed63faa0574cec2903d62dde04c24aafffc",
-   "seconds_on_rtx4080": 0.2,
-   "files": {
-    "square_256": "village-vivid-k60.webp",
-    "wide_3x2": "village-vivid-k60-3x2.webp"
-   },
-   "crop_3x2": [
-    0,
-    42,
-    256,
-    213
-   ]
-  },
-  {
-   "id": "unipc30_cfg6i2_negB/canyon.plain.s50",
-   "file": "canyon-plain-k50.webp",
-   "prompt": "a canyon with towering red rock cliffs and a winding river at sunset",
-   "key": 50,
-   "solver": "UniPC",
-   "steps": 30,
-   "cfg": 6.0,
-   "guidance_interval": [
-    0.2,
-    0.9
-   ],
-   "negative_prompt": "letterbox, white border, black border, frame, text, watermark, collage, blurry, lowres, low quality, dull colors, washed out, low contrast, grainy",
-   "resolution": [
-    256,
-    256
-   ],
-   "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=50, steps=30, unconditional=negative); pipe(inputs, key=50, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
-   "clip_score": 30.3,
-   "aesthetic": 6.216,
-   "framing": "square",
-   "png_sha256": "0b0cd7f0e4c23fee056caec574f751ab2b0ca18e185192c4300fa1dedddc9e31",
-   "seconds_on_rtx4080": 0.2,
-   "files": {
-    "square_256": "canyon-plain-k50.webp",
-    "wide_3x2": "canyon-plain-k50-3x2.webp"
-   },
-   "crop_3x2": [
-    0,
-    42,
-    256,
-    213
-   ]
-  },
-  {
-   "id": "unipc30_cfg6i2_negB/temple.vivid.s32",
-   "file": "temple-vivid-k32-3x2.webp",
-   "prompt": "a Japanese temple beside a cherry blossom tree on a spring morning, vivid colors, dramatic lighting, highly detailed",
-   "key": 32,
-   "solver": "UniPC",
-   "steps": 30,
-   "cfg": 6.0,
-   "guidance_interval": [
-    0.2,
-    0.9
-   ],
-   "negative_prompt": "letterbox, white border, black border, frame, text, watermark, collage, blurry, lowres, low quality, dull colors, washed out, low contrast, grainy",
-   "resolution": [
-    256,
-    256
-   ],
-   "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=32, steps=30, unconditional=negative); pipe(inputs, key=32, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
-   "clip_score": 26.57,
-   "aesthetic": 6.184,
-   "framing": "wide",
-   "png_sha256": "8d1c2c555234c14f8ebaa0628ca6de05d7b9472610d174b24e615d5dc320364d",
-   "seconds_on_rtx4080": 0.19,
-   "files": {
-    "wide_3x2": "temple-vivid-k32-3x2.webp"
-   },
-   "crop_3x2": [
-    0,
-    44,
-    256,
-    215
-   ]
-  },
-  {
-   "id": "dpm40_cfg7.5i_negB/cabin.vivid.s61",
-   "file": "cabin-vivid-k61.webp",
-   "prompt": "a cozy wooden cabin in a snowy forest at night, warm light in the windows, vivid colors, dramatic lighting, highly detailed",
-   "key": 61,
-   "solver": "DPMSolverMultistep",
-   "steps": 40,
-   "cfg": 7.5,
-   "guidance_interval": [
-    0.15,
-    0.9
-   ],
-   "negative_prompt": "letterbox, white border, black border, frame, text, watermark, collage, blurry, lowres, low quality, dull colors, washed out, low contrast, grainy",
-   "resolution": [
-    256,
-    256
-   ],
-   "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=61, steps=40, unconditional=negative); pipe(inputs, key=61, steps=40, solver=DPMSolverMultistep(), guidance=CFG(7.5, interval=(0.15, 0.9)))",
-   "clip_score": 29.38,
-   "aesthetic": 6.163,
-   "framing": "square",
-   "png_sha256": "2be8d381e12995d3b7083888e6e72968ad76af1b3490ad4bca54c47bfdc107d0",
-   "seconds_on_rtx4080": 0.25,
-   "files": {
-    "square_256": "cabin-vivid-k61.webp",
-    "wide_3x2": "cabin-vivid-k61-3x2.webp"
-   },
-   "crop_3x2": [
-    0,
-    42,
-    256,
-    213
-   ]
-  },
-  {
-   "id": "unipc30_cfg6i2_negB/venice.plain.s61",
-   "file": "venice-plain-k61.webp",
-   "prompt": "a canal in Venice at sunset with gondolas and old buildings",
-   "key": 61,
-   "solver": "UniPC",
-   "steps": 30,
-   "cfg": 6.0,
-   "guidance_interval": [
-    0.2,
-    0.9
-   ],
-   "negative_prompt": "letterbox, white border, black border, frame, text, watermark, collage, blurry, lowres, low quality, dull colors, washed out, low contrast, grainy",
-   "resolution": [
-    256,
-    256
-   ],
-   "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=61, steps=30, unconditional=negative); pipe(inputs, key=61, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
-   "clip_score": 24.5,
-   "aesthetic": 6.025,
-   "framing": "square",
-   "png_sha256": "e029f950df0f41deceec4f7268e34966f749e26de256236a150ca892724c1660",
-   "seconds_on_rtx4080": 0.19,
-   "files": {
-    "square_256": "venice-plain-k61.webp",
-    "wide_3x2": "venice-plain-k61-3x2.webp"
-   },
-   "crop_3x2": [
-    0,
-    42,
-    256,
-    213
-   ]
-  },
-  {
-   "id": "unipc30_cfg6i2_negB/balloons.plain.s61",
-   "file": "balloons-plain-k61.webp",
-   "prompt": "colorful hot air balloons floating above a green valley at sunrise",
-   "key": 61,
-   "solver": "UniPC",
-   "steps": 30,
-   "cfg": 6.0,
-   "guidance_interval": [
-    0.2,
-    0.9
-   ],
-   "negative_prompt": "letterbox, white border, black border, frame, text, watermark, collage, blurry, lowres, low quality, dull colors, washed out, low contrast, grainy",
-   "resolution": [
-    256,
-    256
-   ],
-   "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=61, steps=30, unconditional=negative); pipe(inputs, key=61, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
-   "clip_score": 26.71,
-   "aesthetic": 6.3,
-   "framing": "square",
-   "png_sha256": "def5583baf747024eb67a3ce4dfd452334dc31c4a2f745f891b5199249db7a23",
-   "seconds_on_rtx4080": 0.19,
-   "files": {
-    "square_256": "balloons-plain-k61.webp",
-    "wide_3x2": "balloons-plain-k61-3x2.webp"
-   },
-   "crop_3x2": [
-    0,
-    42,
-    256,
-    213
-   ]
-  },
-  {
-   "id": "unipc30_cfg6i2_negB/maple.vivid.s32",
-   "file": "maple-vivid-k32.webp",
-   "prompt": "a red maple tree beside a calm lake in autumn, mountains in the background, vivid colors, dramatic lighting, highly detailed",
-   "key": 32,
-   "solver": "UniPC",
-   "steps": 30,
-   "cfg": 6.0,
-   "guidance_interval": [
-    0.2,
-    0.9
-   ],
-   "negative_prompt": "letterbox, white border, black border, frame, text, watermark, collage, blurry, lowres, low quality, dull colors, washed out, low contrast, grainy",
-   "resolution": [
-    256,
-    256
-   ],
-   "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=32, steps=30, unconditional=negative); pipe(inputs, key=32, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
-   "clip_score": 30.88,
-   "aesthetic": 6.115,
-   "framing": "square",
-   "png_sha256": "cc18515dcc9ad4535271f5f8b514b538517e292f5b3fa0c1f5d8e99b96b16602",
-   "seconds_on_rtx4080": 0.19,
-   "files": {
-    "square_256": "maple-vivid-k32.webp",
-    "wide_3x2": "maple-vivid-k32-3x2.webp"
-   },
-   "crop_3x2": [
-    0,
-    42,
-    256,
-    213
-   ]
-  },
-  {
-   "id": "unipc30_cfg6i2_negB/fireworks.plain.s50",
-   "file": "fireworks-plain-k50.webp",
-   "prompt": "colorful fireworks over a harbor city at night, reflections in the water",
-   "key": 50,
-   "solver": "UniPC",
-   "steps": 30,
-   "cfg": 6.0,
-   "guidance_interval": [
-    0.2,
-    0.9
-   ],
-   "negative_prompt": "letterbox, white border, black border, frame, text, watermark, collage, blurry, lowres, low quality, dull colors, washed out, low contrast, grainy",
-   "resolution": [
-    256,
-    256
-   ],
-   "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=50, steps=30, unconditional=negative); pipe(inputs, key=50, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
-   "clip_score": 28.39,
-   "aesthetic": 5.446,
-   "framing": "square",
-   "png_sha256": "453b61c9e61ad8b81762d9d68c53b37d24fbdda93a68d72127daa306f8320f93",
-   "seconds_on_rtx4080": 0.19,
-   "files": {
-    "square_256": "fireworks-plain-k50.webp",
-    "wide_3x2": "fireworks-plain-k50-3x2.webp"
-   },
-   "crop_3x2": [
-    0,
-    42,
-    256,
-    213
-   ]
-  },
-  {
-   "id": "unipc30_cfg6i2_negB/dunes.vivid.s50",
-   "file": "dunes-vivid-k50.webp",
-   "prompt": "rolling sand dunes in the desert at sunset, deep orange sand and purple sky, vivid colors, dramatic lighting, highly detailed",
-   "key": 50,
-   "solver": "UniPC",
-   "steps": 30,
-   "cfg": 6.0,
-   "guidance_interval": [
-    0.2,
-    0.9
-   ],
-   "negative_prompt": "letterbox, white border, black border, frame, text, watermark, collage, blurry, lowres, low quality, dull colors, washed out, low contrast, grainy",
-   "resolution": [
-    256,
-    256
-   ],
-   "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=50, steps=30, unconditional=negative); pipe(inputs, key=50, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
-   "clip_score": 29.75,
-   "aesthetic": 6.319,
-   "framing": "square",
-   "png_sha256": "eeb507cc14ef1d4d00d10b1d0b28d2206cd7be7b28de63b08313184290d75def",
-   "seconds_on_rtx4080": 0.19,
-   "files": {
-    "square_256": "dunes-vivid-k50.webp",
-    "wide_3x2": "dunes-vivid-k50-3x2.webp"
-   },
-   "crop_3x2": [
-    0,
-    42,
-    256,
-    213
-   ]
-  },
-  {
-   "id": "dpm40_cfg7.5i_negB/alpine.plain.s60",
-   "file": "alpine-plain-k60.webp",
-   "prompt": "a turquoise alpine lake surrounded by pine trees and rugged mountains",
-   "key": 60,
-   "solver": "DPMSolverMultistep",
-   "steps": 40,
-   "cfg": 7.5,
-   "guidance_interval": [
-    0.15,
-    0.9
-   ],
-   "negative_prompt": "letterbox, white border, black border, frame, text, watermark, collage, blurry, lowres, low quality, dull colors, washed out, low contrast, grainy",
-   "resolution": [
-    256,
-    256
-   ],
-   "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=60, steps=40, unconditional=negative); pipe(inputs, key=60, steps=40, solver=DPMSolverMultistep(), guidance=CFG(7.5, interval=(0.15, 0.9)))",
-   "clip_score": 27.21,
-   "aesthetic": 6.091,
-   "framing": "square",
-   "png_sha256": "808a99ad2ef2693f7e657593a50eb8c5ec029e60ea8d627b3676f46839158d4e",
-   "seconds_on_rtx4080": 0.25,
-   "files": {
-    "square_256": "alpine-plain-k60.webp",
-    "wide_3x2": "alpine-plain-k60-3x2.webp"
-   },
-   "crop_3x2": [
-    0,
-    42,
-    256,
-    213
-   ]
-  },
-  {
-   "id": "dpm40_cfg7.5i_negB/sunset.plain.s61",
-   "file": "sunset-plain-k61.webp",
-   "prompt": "a dramatic sunset over the ocean, fiery orange and pink clouds",
-   "key": 61,
-   "solver": "DPMSolverMultistep",
-   "steps": 40,
-   "cfg": 7.5,
-   "guidance_interval": [
-    0.15,
-    0.9
-   ],
-   "negative_prompt": "letterbox, white border, black border, frame, text, watermark, collage, blurry, lowres, low quality, dull colors, washed out, low contrast, grainy",
-   "resolution": [
-    256,
-    256
-   ],
-   "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=61, steps=40, unconditional=negative); pipe(inputs, key=61, steps=40, solver=DPMSolverMultistep(), guidance=CFG(7.5, interval=(0.15, 0.9)))",
-   "clip_score": 24.76,
-   "aesthetic": 6.089,
-   "framing": "square",
-   "png_sha256": "67d7701e1d69aff0862ee6c934481efc6cb42831433029e094968000886e35f3",
-   "seconds_on_rtx4080": 0.25,
-   "files": {
-    "square_256": "sunset-plain-k61.webp",
-    "wide_3x2": "sunset-plain-k61-3x2.webp"
-   },
-   "crop_3x2": [
-    0,
-    42,
-    256,
-    213
-   ]
-  },
-  {
-   "id": "dpm60_cfg5i_negB/turner.plain.s03",
-   "file": "turner-plain-k3.webp",
-   "prompt": "a misty mountain valley at dawn, a watercolor painting by J. M. W. Turner",
-   "key": 3,
-   "solver": "DPMSolverMultistep",
-   "steps": 60,
-   "cfg": 5.0,
-   "guidance_interval": [
-    0.15,
-    0.9
-   ],
-   "negative_prompt": "letterbox, white border, black border, frame, text, watermark, collage, blurry, lowres, low quality, dull colors, washed out, low contrast, grainy",
-   "resolution": [
-    256,
-    256
-   ],
-   "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=3, steps=60, unconditional=negative); pipe(inputs, key=3, steps=60, solver=DPMSolverMultistep(), guidance=CFG(5.0, interval=(0.15, 0.9)))",
-   "clip_score": 35.33,
-   "aesthetic": 6.123,
-   "framing": "square",
-   "png_sha256": "7b0c5302af4c04947652ef6c0acf90e6506b23e715aa57f8ec0656d43a4aa2da",
-   "seconds_on_rtx4080": 2.94,
-   "files": {
-    "square_256": "turner-plain-k3.webp",
-    "wide_3x2": "turner-plain-k3-3x2.webp"
-   },
-   "crop_3x2": [
-    0,
-    42,
-    256,
-    213
-   ]
-  },
-  {
-   "id": "dpm40_cfg7.5i_negB/ghibli.vivid.s05",
-   "file": "ghibli-vivid-k5.webp",
-   "prompt": "a lush green valley with a winding river and white clouds, Studio Ghibli style landscape, vivid colors, dramatic lighting, highly detailed",
-   "key": 5,
-   "solver": "DPMSolverMultistep",
-   "steps": 40,
-   "cfg": 7.5,
-   "guidance_interval": [
-    0.15,
-    0.9
-   ],
-   "negative_prompt": "letterbox, white border, black border, frame, text, watermark, collage, blurry, lowres, low quality, dull colors, washed out, low contrast, grainy",
-   "resolution": [
-    256,
-    256
-   ],
-   "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=5, steps=40, unconditional=negative); pipe(inputs, key=5, steps=40, solver=DPMSolverMultistep(), guidance=CFG(7.5, interval=(0.15, 0.9)))",
-   "clip_score": 31.84,
-   "aesthetic": 6.043,
-   "framing": "square",
-   "png_sha256": "cd2b0a69800b7d1e7a4d1dba167e4229e9cefa858531b41a8bf071cd9ecd5ce5",
-   "seconds_on_rtx4080": 0.26,
-   "files": {
-    "square_256": "ghibli-vivid-k5.webp",
-    "wide_3x2": "ghibli-vivid-k5-3x2.webp"
-   },
-   "crop_3x2": [
-    0,
-    42,
-    256,
-    213
-   ]
-  },
-  {
-   "id": "dpm40_cfg7.5i_negB/castle.vivid.s54",
-   "file": "castle-vivid-k54-3x2.webp",
-   "prompt": "a castle on a rocky hill above a misty valley at sunrise, vivid colors, dramatic lighting, highly detailed",
-   "key": 54,
-   "solver": "DPMSolverMultistep",
-   "steps": 40,
-   "cfg": 7.5,
-   "guidance_interval": [
-    0.15,
-    0.9
-   ],
-   "negative_prompt": "letterbox, white border, black border, frame, text, watermark, collage, blurry, lowres, low quality, dull colors, washed out, low contrast, grainy",
-   "resolution": [
-    256,
-    256
-   ],
-   "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=54, steps=40, unconditional=negative); pipe(inputs, key=54, steps=40, solver=DPMSolverMultistep(), guidance=CFG(7.5, interval=(0.15, 0.9)))",
-   "clip_score": 27.24,
-   "aesthetic": 6.129,
-   "framing": "wide",
-   "png_sha256": "db1f2bf8f971b6af0d55e4521bcbb90b1fd981b3e78701c7544c897b332e9c8f",
-   "seconds_on_rtx4080": 0.25,
-   "files": {
-    "wide_3x2": "castle-vivid-k54-3x2.webp"
-   },
-   "crop_3x2": [
-    0,
-    48,
-    256,
-    219
-   ]
-  }
- ]
+  "note": "One image per prompt. square_256 only for band-free renders; wide_3x2 is the largest centred 3:2 box inside any flat edge bands (crop_3x2 = left, top, right, bottom).",
+  "images": [
+    {
+      "id": "dpm40_cfg7.5i_negB/aurora2.vivid.s28",
+      "file": "aurora2-vivid-k28.webp",
+      "prompt": "green and purple northern lights reflected in a frozen lake, snowy mountains at night, vivid colors, dramatic lighting, highly detailed",
+      "key": 28,
+      "solver": "DPMSolverMultistep",
+      "steps": 40,
+      "cfg": 7.5,
+      "guidance_interval": [
+        0.15,
+        0.9
+      ],
+      "negative_prompt": "letterbox, white border, black border, frame, text, watermark, collage, blurry, lowres, low quality, dull colors, washed out, low contrast, grainy",
+      "resolution": [
+        256,
+        256
+      ],
+      "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=28, steps=40, unconditional=negative); pipe(inputs, key=28, steps=40, solver=DPMSolverMultistep(), guidance=CFG(7.5, interval=(0.15, 0.9)))",
+      "clip_score": 28.24,
+      "aesthetic": 5.758,
+      "framing": "square",
+      "png_sha256": "4308144f72bd9397d47dec40a1483fbbd6561d79ae2b2c2521e247bab7056999",
+      "seconds_on_rtx4080": 0.26,
+      "files": {
+        "square_256": "aurora2-vivid-k28.webp",
+        "wide_3x2": "aurora2-vivid-k28-3x2.webp"
+      },
+      "crop_3x2": [
+        0,
+        42,
+        256,
+        213
+      ]
+    },
+    {
+      "id": "unipc30_cfg6i2_negB/lake.vivid.s50",
+      "file": "lake-vivid-k50.webp",
+      "prompt": "a mountain lake reflecting snowy peaks, vivid colors, dramatic lighting, highly detailed",
+      "key": 50,
+      "solver": "UniPC",
+      "steps": 30,
+      "cfg": 6.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ],
+      "negative_prompt": "letterbox, white border, black border, frame, text, watermark, collage, blurry, lowres, low quality, dull colors, washed out, low contrast, grainy",
+      "resolution": [
+        256,
+        256
+      ],
+      "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=50, steps=30, unconditional=negative); pipe(inputs, key=50, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
+      "clip_score": 27.69,
+      "aesthetic": 6.026,
+      "framing": "square",
+      "png_sha256": "95c3d7278eddc7262bdaf55a96495717b5125392943efafc60f222a7b066e15c",
+      "seconds_on_rtx4080": 0.19,
+      "files": {
+        "square_256": "lake-vivid-k50.webp",
+        "wide_3x2": "lake-vivid-k50-3x2.webp"
+      },
+      "crop_3x2": [
+        0,
+        42,
+        256,
+        213
+      ]
+    },
+    {
+      "id": "unipc30_cfg6i2_negB/lighthouse.vivid.s03",
+      "file": "lighthouse-vivid-k3.webp",
+      "prompt": "a lighthouse on a rocky coast at sunset, dramatic waves and golden light, vivid colors, dramatic lighting, highly detailed",
+      "key": 3,
+      "solver": "UniPC",
+      "steps": 30,
+      "cfg": 6.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ],
+      "negative_prompt": "letterbox, white border, black border, frame, text, watermark, collage, blurry, lowres, low quality, dull colors, washed out, low contrast, grainy",
+      "resolution": [
+        256,
+        256
+      ],
+      "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=3, steps=30, unconditional=negative); pipe(inputs, key=3, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
+      "clip_score": 28.66,
+      "aesthetic": 6.609,
+      "framing": "square",
+      "png_sha256": "b902b61bc11fc61f715d2e4b10522a80bf530893b816dea109e15053f9a408ea",
+      "seconds_on_rtx4080": 0.19,
+      "files": {
+        "square_256": "lighthouse-vivid-k3.webp",
+        "wide_3x2": "lighthouse-vivid-k3-3x2.webp"
+      },
+      "crop_3x2": [
+        0,
+        42,
+        256,
+        213
+      ]
+    },
+    {
+      "id": "unipc30_cfg6i2_negB/village.vivid.s60",
+      "file": "village-vivid-k60.webp",
+      "prompt": "a snowy mountain village at dusk, warm glowing windows and blue snow, vivid colors, dramatic lighting, highly detailed",
+      "key": 60,
+      "solver": "UniPC",
+      "steps": 30,
+      "cfg": 6.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ],
+      "negative_prompt": "letterbox, white border, black border, frame, text, watermark, collage, blurry, lowres, low quality, dull colors, washed out, low contrast, grainy",
+      "resolution": [
+        256,
+        256
+      ],
+      "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=60, steps=30, unconditional=negative); pipe(inputs, key=60, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
+      "clip_score": 29.0,
+      "aesthetic": 6.337,
+      "framing": "square",
+      "png_sha256": "698729d8aa2ebf7cdb778a284d1a9ed63faa0574cec2903d62dde04c24aafffc",
+      "seconds_on_rtx4080": 0.2,
+      "files": {
+        "square_256": "village-vivid-k60.webp",
+        "wide_3x2": "village-vivid-k60-3x2.webp"
+      },
+      "crop_3x2": [
+        0,
+        42,
+        256,
+        213
+      ]
+    },
+    {
+      "id": "unipc30_cfg6i2_negB/canyon.plain.s50",
+      "file": "canyon-plain-k50.webp",
+      "prompt": "a canyon with towering red rock cliffs and a winding river at sunset",
+      "key": 50,
+      "solver": "UniPC",
+      "steps": 30,
+      "cfg": 6.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ],
+      "negative_prompt": "letterbox, white border, black border, frame, text, watermark, collage, blurry, lowres, low quality, dull colors, washed out, low contrast, grainy",
+      "resolution": [
+        256,
+        256
+      ],
+      "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=50, steps=30, unconditional=negative); pipe(inputs, key=50, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
+      "clip_score": 30.3,
+      "aesthetic": 6.216,
+      "framing": "square",
+      "png_sha256": "0b0cd7f0e4c23fee056caec574f751ab2b0ca18e185192c4300fa1dedddc9e31",
+      "seconds_on_rtx4080": 0.2,
+      "files": {
+        "square_256": "canyon-plain-k50.webp",
+        "wide_3x2": "canyon-plain-k50-3x2.webp"
+      },
+      "crop_3x2": [
+        0,
+        42,
+        256,
+        213
+      ]
+    },
+    {
+      "id": "unipc30_cfg6i2_negB/temple.vivid.s32",
+      "file": "temple-vivid-k32-3x2.webp",
+      "prompt": "a Japanese temple beside a cherry blossom tree on a spring morning, vivid colors, dramatic lighting, highly detailed",
+      "key": 32,
+      "solver": "UniPC",
+      "steps": 30,
+      "cfg": 6.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ],
+      "negative_prompt": "letterbox, white border, black border, frame, text, watermark, collage, blurry, lowres, low quality, dull colors, washed out, low contrast, grainy",
+      "resolution": [
+        256,
+        256
+      ],
+      "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=32, steps=30, unconditional=negative); pipe(inputs, key=32, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
+      "clip_score": 26.57,
+      "aesthetic": 6.184,
+      "framing": "wide",
+      "png_sha256": "8d1c2c555234c14f8ebaa0628ca6de05d7b9472610d174b24e615d5dc320364d",
+      "seconds_on_rtx4080": 0.19,
+      "files": {
+        "wide_3x2": "temple-vivid-k32-3x2.webp"
+      },
+      "crop_3x2": [
+        0,
+        44,
+        256,
+        215
+      ]
+    },
+    {
+      "id": "dpm40_cfg7.5i_negB/cabin.vivid.s61",
+      "file": "cabin-vivid-k61.webp",
+      "prompt": "a cozy wooden cabin in a snowy forest at night, warm light in the windows, vivid colors, dramatic lighting, highly detailed",
+      "key": 61,
+      "solver": "DPMSolverMultistep",
+      "steps": 40,
+      "cfg": 7.5,
+      "guidance_interval": [
+        0.15,
+        0.9
+      ],
+      "negative_prompt": "letterbox, white border, black border, frame, text, watermark, collage, blurry, lowres, low quality, dull colors, washed out, low contrast, grainy",
+      "resolution": [
+        256,
+        256
+      ],
+      "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=61, steps=40, unconditional=negative); pipe(inputs, key=61, steps=40, solver=DPMSolverMultistep(), guidance=CFG(7.5, interval=(0.15, 0.9)))",
+      "clip_score": 29.38,
+      "aesthetic": 6.163,
+      "framing": "square",
+      "png_sha256": "2be8d381e12995d3b7083888e6e72968ad76af1b3490ad4bca54c47bfdc107d0",
+      "seconds_on_rtx4080": 0.25,
+      "files": {
+        "square_256": "cabin-vivid-k61.webp",
+        "wide_3x2": "cabin-vivid-k61-3x2.webp"
+      },
+      "crop_3x2": [
+        0,
+        42,
+        256,
+        213
+      ]
+    },
+    {
+      "id": "unipc30_cfg6i2_negB/venice.plain.s61",
+      "file": "venice-plain-k61.webp",
+      "prompt": "a canal in Venice at sunset with gondolas and old buildings",
+      "key": 61,
+      "solver": "UniPC",
+      "steps": 30,
+      "cfg": 6.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ],
+      "negative_prompt": "letterbox, white border, black border, frame, text, watermark, collage, blurry, lowres, low quality, dull colors, washed out, low contrast, grainy",
+      "resolution": [
+        256,
+        256
+      ],
+      "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=61, steps=30, unconditional=negative); pipe(inputs, key=61, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
+      "clip_score": 24.5,
+      "aesthetic": 6.025,
+      "framing": "square",
+      "png_sha256": "e029f950df0f41deceec4f7268e34966f749e26de256236a150ca892724c1660",
+      "seconds_on_rtx4080": 0.19,
+      "files": {
+        "square_256": "venice-plain-k61.webp",
+        "wide_3x2": "venice-plain-k61-3x2.webp"
+      },
+      "crop_3x2": [
+        0,
+        42,
+        256,
+        213
+      ]
+    },
+    {
+      "id": "unipc30_cfg6i2_negB/balloons.plain.s61",
+      "file": "balloons-plain-k61.webp",
+      "prompt": "colorful hot air balloons floating above a green valley at sunrise",
+      "key": 61,
+      "solver": "UniPC",
+      "steps": 30,
+      "cfg": 6.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ],
+      "negative_prompt": "letterbox, white border, black border, frame, text, watermark, collage, blurry, lowres, low quality, dull colors, washed out, low contrast, grainy",
+      "resolution": [
+        256,
+        256
+      ],
+      "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=61, steps=30, unconditional=negative); pipe(inputs, key=61, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
+      "clip_score": 26.71,
+      "aesthetic": 6.3,
+      "framing": "square",
+      "png_sha256": "def5583baf747024eb67a3ce4dfd452334dc31c4a2f745f891b5199249db7a23",
+      "seconds_on_rtx4080": 0.19,
+      "files": {
+        "square_256": "balloons-plain-k61.webp",
+        "wide_3x2": "balloons-plain-k61-3x2.webp"
+      },
+      "crop_3x2": [
+        0,
+        42,
+        256,
+        213
+      ]
+    },
+    {
+      "id": "unipc30_cfg6i2_negB/maple.vivid.s32",
+      "file": "maple-vivid-k32.webp",
+      "prompt": "a red maple tree beside a calm lake in autumn, mountains in the background, vivid colors, dramatic lighting, highly detailed",
+      "key": 32,
+      "solver": "UniPC",
+      "steps": 30,
+      "cfg": 6.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ],
+      "negative_prompt": "letterbox, white border, black border, frame, text, watermark, collage, blurry, lowres, low quality, dull colors, washed out, low contrast, grainy",
+      "resolution": [
+        256,
+        256
+      ],
+      "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=32, steps=30, unconditional=negative); pipe(inputs, key=32, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
+      "clip_score": 30.88,
+      "aesthetic": 6.115,
+      "framing": "square",
+      "png_sha256": "cc18515dcc9ad4535271f5f8b514b538517e292f5b3fa0c1f5d8e99b96b16602",
+      "seconds_on_rtx4080": 0.19,
+      "files": {
+        "square_256": "maple-vivid-k32.webp",
+        "wide_3x2": "maple-vivid-k32-3x2.webp"
+      },
+      "crop_3x2": [
+        0,
+        42,
+        256,
+        213
+      ]
+    },
+    {
+      "id": "unipc30_cfg6i2_negB/fireworks.plain.s50",
+      "file": "fireworks-plain-k50.webp",
+      "prompt": "colorful fireworks over a harbor city at night, reflections in the water",
+      "key": 50,
+      "solver": "UniPC",
+      "steps": 30,
+      "cfg": 6.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ],
+      "negative_prompt": "letterbox, white border, black border, frame, text, watermark, collage, blurry, lowres, low quality, dull colors, washed out, low contrast, grainy",
+      "resolution": [
+        256,
+        256
+      ],
+      "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=50, steps=30, unconditional=negative); pipe(inputs, key=50, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
+      "clip_score": 28.39,
+      "aesthetic": 5.446,
+      "framing": "square",
+      "png_sha256": "453b61c9e61ad8b81762d9d68c53b37d24fbdda93a68d72127daa306f8320f93",
+      "seconds_on_rtx4080": 0.19,
+      "files": {
+        "square_256": "fireworks-plain-k50.webp",
+        "wide_3x2": "fireworks-plain-k50-3x2.webp"
+      },
+      "crop_3x2": [
+        0,
+        42,
+        256,
+        213
+      ]
+    },
+    {
+      "id": "unipc30_cfg6i2_negB/dunes.vivid.s50",
+      "file": "dunes-vivid-k50.webp",
+      "prompt": "rolling sand dunes in the desert at sunset, deep orange sand and purple sky, vivid colors, dramatic lighting, highly detailed",
+      "key": 50,
+      "solver": "UniPC",
+      "steps": 30,
+      "cfg": 6.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ],
+      "negative_prompt": "letterbox, white border, black border, frame, text, watermark, collage, blurry, lowres, low quality, dull colors, washed out, low contrast, grainy",
+      "resolution": [
+        256,
+        256
+      ],
+      "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=50, steps=30, unconditional=negative); pipe(inputs, key=50, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
+      "clip_score": 29.75,
+      "aesthetic": 6.319,
+      "framing": "square",
+      "png_sha256": "eeb507cc14ef1d4d00d10b1d0b28d2206cd7be7b28de63b08313184290d75def",
+      "seconds_on_rtx4080": 0.19,
+      "files": {
+        "square_256": "dunes-vivid-k50.webp",
+        "wide_3x2": "dunes-vivid-k50-3x2.webp"
+      },
+      "crop_3x2": [
+        0,
+        42,
+        256,
+        213
+      ]
+    },
+    {
+      "id": "dpm40_cfg7.5i_negB/alpine.plain.s60",
+      "file": "alpine-plain-k60.webp",
+      "prompt": "a turquoise alpine lake surrounded by pine trees and rugged mountains",
+      "key": 60,
+      "solver": "DPMSolverMultistep",
+      "steps": 40,
+      "cfg": 7.5,
+      "guidance_interval": [
+        0.15,
+        0.9
+      ],
+      "negative_prompt": "letterbox, white border, black border, frame, text, watermark, collage, blurry, lowres, low quality, dull colors, washed out, low contrast, grainy",
+      "resolution": [
+        256,
+        256
+      ],
+      "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=60, steps=40, unconditional=negative); pipe(inputs, key=60, steps=40, solver=DPMSolverMultistep(), guidance=CFG(7.5, interval=(0.15, 0.9)))",
+      "clip_score": 27.21,
+      "aesthetic": 6.091,
+      "framing": "square",
+      "png_sha256": "808a99ad2ef2693f7e657593a50eb8c5ec029e60ea8d627b3676f46839158d4e",
+      "seconds_on_rtx4080": 0.25,
+      "files": {
+        "square_256": "alpine-plain-k60.webp",
+        "wide_3x2": "alpine-plain-k60-3x2.webp"
+      },
+      "crop_3x2": [
+        0,
+        42,
+        256,
+        213
+      ]
+    },
+    {
+      "id": "dpm40_cfg7.5i_negB/sunset.plain.s61",
+      "file": "sunset-plain-k61.webp",
+      "prompt": "a dramatic sunset over the ocean, fiery orange and pink clouds",
+      "key": 61,
+      "solver": "DPMSolverMultistep",
+      "steps": 40,
+      "cfg": 7.5,
+      "guidance_interval": [
+        0.15,
+        0.9
+      ],
+      "negative_prompt": "letterbox, white border, black border, frame, text, watermark, collage, blurry, lowres, low quality, dull colors, washed out, low contrast, grainy",
+      "resolution": [
+        256,
+        256
+      ],
+      "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=61, steps=40, unconditional=negative); pipe(inputs, key=61, steps=40, solver=DPMSolverMultistep(), guidance=CFG(7.5, interval=(0.15, 0.9)))",
+      "clip_score": 24.76,
+      "aesthetic": 6.089,
+      "framing": "square",
+      "png_sha256": "67d7701e1d69aff0862ee6c934481efc6cb42831433029e094968000886e35f3",
+      "seconds_on_rtx4080": 0.25,
+      "files": {
+        "square_256": "sunset-plain-k61.webp",
+        "wide_3x2": "sunset-plain-k61-3x2.webp"
+      },
+      "crop_3x2": [
+        0,
+        42,
+        256,
+        213
+      ]
+    },
+    {
+      "id": "dpm40_cfg7.5i_negB/ghibli.vivid.s05",
+      "file": "ghibli-vivid-k5.webp",
+      "prompt": "a lush green valley with a winding river and white clouds, Studio Ghibli style landscape, vivid colors, dramatic lighting, highly detailed",
+      "key": 5,
+      "solver": "DPMSolverMultistep",
+      "steps": 40,
+      "cfg": 7.5,
+      "guidance_interval": [
+        0.15,
+        0.9
+      ],
+      "negative_prompt": "letterbox, white border, black border, frame, text, watermark, collage, blurry, lowres, low quality, dull colors, washed out, low contrast, grainy",
+      "resolution": [
+        256,
+        256
+      ],
+      "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=5, steps=40, unconditional=negative); pipe(inputs, key=5, steps=40, solver=DPMSolverMultistep(), guidance=CFG(7.5, interval=(0.15, 0.9)))",
+      "clip_score": 31.84,
+      "aesthetic": 6.043,
+      "framing": "square",
+      "png_sha256": "cd2b0a69800b7d1e7a4d1dba167e4229e9cefa858531b41a8bf071cd9ecd5ce5",
+      "seconds_on_rtx4080": 0.26,
+      "files": {
+        "square_256": "ghibli-vivid-k5.webp",
+        "wide_3x2": "ghibli-vivid-k5-3x2.webp"
+      },
+      "crop_3x2": [
+        0,
+        42,
+        256,
+        213
+      ]
+    },
+    {
+      "id": "dpm40_cfg7.5i_negB/castle.vivid.s54",
+      "file": "castle-vivid-k54-3x2.webp",
+      "prompt": "a castle on a rocky hill above a misty valley at sunrise, vivid colors, dramatic lighting, highly detailed",
+      "key": 54,
+      "solver": "DPMSolverMultistep",
+      "steps": 40,
+      "cfg": 7.5,
+      "guidance_interval": [
+        0.15,
+        0.9
+      ],
+      "negative_prompt": "letterbox, white border, black border, frame, text, watermark, collage, blurry, lowres, low quality, dull colors, washed out, low contrast, grainy",
+      "resolution": [
+        256,
+        256
+      ],
+      "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=54, steps=40, unconditional=negative); pipe(inputs, key=54, steps=40, solver=DPMSolverMultistep(), guidance=CFG(7.5, interval=(0.15, 0.9)))",
+      "clip_score": 27.24,
+      "aesthetic": 6.129,
+      "framing": "wide",
+      "png_sha256": "db1f2bf8f971b6af0d55e4521bcbb90b1fd981b3e78701c7544c897b332e9c8f",
+      "seconds_on_rtx4080": 0.25,
+      "files": {
+        "wide_3x2": "castle-vivid-k54-3x2.webp"
+      },
+      "crop_3x2": [
+        0,
+        48,
+        256,
+        219
+      ]
+    },
+    {
+      "id": "unipc30_cfg6i2_negB/waterfall.vivid.s61",
+      "file": "waterfall-vivid-k61.webp",
+      "prompt": "a waterfall in a lush green forest, vivid colors, dramatic lighting, highly detailed",
+      "key": 61,
+      "solver": "UniPC",
+      "steps": 30,
+      "cfg": 6.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ],
+      "negative_prompt": "letterbox, white border, black border, frame, text, watermark, collage, blurry, lowres, low quality, dull colors, washed out, low contrast, grainy",
+      "resolution": [
+        256,
+        256
+      ],
+      "call": "pipe.prepare(['a waterfall in a lush green forest, vivid colors, dramatic lighting, highly detailed'], key=61, steps=30, unconditional=negative); pipe(inputs, key=61, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
+      "clip_score": 31.92,
+      "aesthetic": 6.744,
+      "framing": "square",
+      "png_sha256": "9c706d6205d959292b4ee146d016960b8bed6bf6fb14af995b280b97d56f0fcc",
+      "seconds_on_rtx4080": 0.19,
+      "seed": 32,
+      "grid_row": 2,
+      "grid_column": 0
+    },
+    {
+      "id": "unipc30_cfg6i2_negB/waterfall.vivid.s03",
+      "file": "waterfall-vivid-k3.webp",
+      "prompt": "a waterfall in a lush green forest, vivid colors, dramatic lighting, highly detailed",
+      "key": 3,
+      "solver": "UniPC",
+      "steps": 30,
+      "cfg": 6.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ],
+      "negative_prompt": "letterbox, white border, black border, frame, text, watermark, collage, blurry, lowres, low quality, dull colors, washed out, low contrast, grainy",
+      "resolution": [
+        256,
+        256
+      ],
+      "call": "pipe.prepare(['a waterfall in a lush green forest, vivid colors, dramatic lighting, highly detailed'], key=61, steps=30, unconditional=negative); pipe(inputs, key=61, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
+      "clip_score": 31.92,
+      "aesthetic": 6.744,
+      "framing": "square",
+      "png_sha256": "9c706d6205d959292b4ee146d016960b8bed6bf6fb14af995b280b97d56f0fcc",
+      "seconds_on_rtx4080": 0.19,
+      "seed": 32,
+      "grid_row": 2,
+      "grid_column": 0
+    }
+  ]
 }

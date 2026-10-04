@@ -1,6 +1,6 @@
 {
- "prompt": "a lighthouse on a rocky coast at sunset, dramatic waves and golden light",
- "seed": 52,
+ "prompt": "a snowy mountain village at dusk, warm glowing windows and blue snow, vivid colors, dramatic lighting, highly detailed",
+ "seed": 50,
  "sampler": "DPMSolverMultistep",
  "steps": 40,
  "cfg": 7.5,
