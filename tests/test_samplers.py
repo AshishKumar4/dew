@@ -9,6 +9,7 @@ form x(sigma) = x(sigma_max) sqrt(s^2 + sigma^2) / sqrt(s^2 + sigma_max^2).
 Each solver's order of accuracy is measured against that closed form.
 """
 
+import itertools
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -1102,20 +1103,60 @@ def test_the_native_brownian_bridge_holds_the_reference_identities():
                                atol=1e-5, rtol=1e-5)
 
 
-def test_the_native_brownian_increments_have_the_variance_of_the_interval():
-    """A normalized query is a standard normal draw: over the sixteen dyadic
-    intervals of the tree's own domain the increments have unit variance and
-    zero mean, and two disjoint intervals are uncorrelated. Observed a
-    standard deviation of 0.99 and a correlation of 0.02."""
-    low, high = (float(value) for value in SOURCE_ARRAYS["brownian.bounds"])
-    query = source_bridge()
-    edges = np.linspace(low, high, 17)
-    draws = np.stack([np.asarray(query(edges[i], edges[i + 1], (8, 8, 8)))
-                      for i in range(16)])
-    assert abs(float(draws.std()) - 1.0) < 0.06
-    assert abs(float(draws.mean())) < 0.05
-    left, right = draws[3].ravel(), draws[11].ravel()
-    assert abs(float(np.corrcoef(left, right)[0, 1])) < 0.06
+def brownian_covariance(queries, low: float) -> np.ndarray:
+    """Brownian motion's law for normalized increments, in float64: W(p) and
+    W(q) of a path started at `low` covary by min(p, q) - low, so the
+    increments over [a, b] and [c, d] covary by the sum of those four
+    terms, divided by the square roots of the two widths."""
+    def covariance(p, q):
+        return np.minimum(p, q) - low
+
+    table = np.empty((len(queries), len(queries)))
+    for i, (a, b) in enumerate(queries):
+        for j, (c, d) in enumerate(queries):
+            table[i, j] = ((covariance(b, d) - covariance(b, c) - covariance(a, d) + covariance(a, c))
+                           / np.sqrt(abs(b - a) * abs(d - c)))
+    return table
+
+
+def test_the_native_brownian_noise_has_brownian_motions_law():
+    """Every noise draw a `DPMSolverSDE` walk asks the path for, over the
+    published DPMSolverSDE file's ten-step grid: the two per interval with a
+    positive target, from sigma_t to the geometric midpoint and from sigma_t
+    to sigma_s, eighteen normalized increments of one path. Over 65536
+    independent paths they have the joint covariance Brownian motion gives
+    those intervals, computed in float64 from min(p, q) at the float32
+    positions the bridge reads, so each draw's variance, the correlation of
+    the nested pair and the independence of disjoint intervals are all one
+    test. The likelihood ratio of the sample covariance against that
+    covariance (mean zero, known) is chi-square with 171 degrees of freedom;
+    306.2 is its one-in-a-billion level (scipy.stats.chi2.isf(1e-9, 171))."""
+    from dew.diffusion.schedules.source import SourceSchedule
+    from dew.sampling.solvers import MAX_BROWNIAN_DEPTH, _Brownian, _brownian_noise
+
+    schedule = SourceSchedule.from_config(json.loads(str(SOURCE_ARRAYS["dpm_sde.default.config"])))
+    process, times = schedule.sampling(10)
+    sampler = process.sampler_schedule
+    _, sigmas = process.rates(times, like=jnp.zeros(times.shape))
+    sigmas = np.asarray(sigmas, np.float32).ravel()
+    queries = []
+    for sigma_t, sigma_s in itertools.pairwise(sigmas):
+        if sigma_s > 0:
+            middle = np.exp(0.5 * (np.log(sigma_t) + np.log(sigma_s)), dtype=np.float32)
+            queries += [(sigma_t, middle), (sigma_t, sigma_s)]
+    assert len(queries) == 18
+    state = _Brownian(jax.random.PRNGKey(6), jnp.asarray(sampler.sigma_min, jnp.float32),
+                      jnp.asarray(sampler.sigma_max, jnp.float32))
+    paths = 65536
+    firsts, seconds = (jnp.asarray(ends, jnp.float32) for ends in zip(*queries, strict=True))
+    draws = jax.jit(jax.vmap(lambda a, b: _brownian_noise(state, a, b, (paths,), MAX_BROWNIAN_DEPTH)))(
+        firsts, seconds)
+    sample = np.asarray(draws, np.float64).T
+    expected = brownian_covariance([(float(a), float(b)) for a, b in queries], float(state.low))
+    relative = np.linalg.solve(expected, sample.T @ sample / paths)
+    _, log_determinant = np.linalg.slogdet(relative)
+    statistic = paths * (np.trace(relative) - log_determinant - len(queries))
+    assert statistic < 306.2, statistic
 
 
 def test_a_grid_the_source_scheduler_cannot_walk_is_refused():
