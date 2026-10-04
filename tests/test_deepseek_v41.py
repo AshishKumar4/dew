@@ -190,6 +190,29 @@ def test_every_quantizer_and_top_k_input_is_as_exact_as_the_reference(source, fo
         assert_as_exact_as_the_reference(*scores(record, reference, TRUTH, prefix), f"{prefix}selection_rows")
 
 
+def test_a_quotient_on_an_e2m1_tie_rounds_to_even_under_an_e4m3_scale():
+    """Amax 0.71875 gives the E4M3 scale 0.1171875, and -0.146484375 over it
+    is the tie -1.25, which rounds to the even -1.0: the release's tilelang
+    kernel stores -0.1171875 there (on an RTX 4080). Multiplied by the scale's
+    reciprocal, as XLA rewrites a division by a broadcast, the quotient is
+    -1.2500001 and rounds to -1.5."""
+    x = jnp.asarray([[0.71875, -0.146484375] + [0.0] * 14], jnp.bfloat16)
+    for dtype in (jnp.bfloat16, jnp.float32):
+        rounded = jax.jit(lambda v: fake_quant_fp4(v, 16, e4m3_scale=True))(x.astype(dtype))
+        assert float(rounded[0, 1]) == -0.1171875, jnp.dtype(dtype).name
+
+
+def test_a_scale_on_an_e4m3_tie_rounds_to_even():
+    """Amax 6.375 over 6 is 1.0625, the tie between E4M3's 1.0 and 1.125,
+    which rounds to the even 1.0, so 6.375 stores 6 * 1.0 and 1.0625 stores
+    1.0 (every bf16 amax's scale, its 125 ties among them, matches the
+    exact quotient's rounding on the CPU and the RTX 4080)."""
+    x = jnp.asarray([[6.375, 1.0625] + [0.0] * 14], jnp.bfloat16)
+    for dtype in (jnp.bfloat16, jnp.float32):
+        rounded = jax.jit(lambda v: fake_quant_fp4(v, 16, e4m3_scale=True))(x.astype(dtype))
+        assert [float(value) for value in rounded[0, :2]] == [6.0, 1.0], jnp.dtype(dtype).name
+
+
 def test_the_quantizers_pass_their_gradient_straight_through():
     x = jnp.linspace(-3.0, 3.0, 64).reshape(2, 32)
     for quant in (lambda v: fake_quant_fp8(v, 32), lambda v: fake_quant_fp4(v, 16, e4m3_scale=True)):
