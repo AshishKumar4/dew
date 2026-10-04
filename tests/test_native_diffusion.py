@@ -51,6 +51,13 @@ def test_native_bundle_trajectory_update_and_source_roundtrip(saved_pipelines, t
     run_check(saved_pipelines / task)
 
 
+@pytest.mark.parametrize("task", ["sd", "xl", "safety"])
+def test_a_streamed_bundle_matches_the_source(saved_pipelines, task):
+    """The same checks, on the pipeline streamed onto a mesh a leaf at a time
+    (tests/test_pipeline_streaming.py)."""
+    run_check(saved_pipelines / task, "--streamed")
+
+
 @pytest.mark.parametrize("solver", ["pndm-prk", "pndm-plms", "lms", "lms-v", "lms-karras", "euler", "dpm"])
 def test_native_solver_consumes_the_complete_source_grid(saved_pipelines, solver):
     run_check(
