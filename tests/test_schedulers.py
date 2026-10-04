@@ -19,6 +19,7 @@ import dew.diffusion.schedules as schedulers
 from dew.diffusion import (
     DirectPredictionTransform,
     EpsilonPredictionTransform,
+    FlowMatchPredictionTransform,
     KarrasPredictionTransform,
     MinSNR,
     Process,
@@ -323,6 +324,32 @@ def test_min_snr_weights_the_same_clean_image_prediction_the_same_whatever_the_p
     np.testing.assert_allclose(process.weight(CONTINUOUS_STEPS) * error,
                                jnp.minimum(snr, 5.0) * jnp.mean(jnp.square(estimate - x_0), axis=(1, 2, 3)),
                                rtol=1e-4)
+
+
+def test_min_snr_weights_a_flow_velocity_as_the_clean_image_it_reads_out():
+    """Min-SNR-gamma's START_X weight, min(SNR, gamma) on the x_0 loss, on
+    the rectified-flow path x_t = (1 - t) x_0 + t eps, where SNR is
+    ((1 - t) / t)^2 and a velocity v reads out x_0 = x_t - t v: the weighted
+    velocity loss of a model whose read-out is `estimate` is min(SNR, gamma)
+    times the clean image's squared error, as a direct x_0 prediction of
+    the same image on the same path is weighted."""
+    schedule = FlowMatchingScheduler()
+    t = CONTINUOUS_STEPS
+    x_0, epsilon = (jax.random.normal(key, (4, 3, 3, 1)) for key in jax.random.split(jax.random.key(2)))
+    estimate = x_0 + 0.1 * jax.random.normal(jax.random.key(3), x_0.shape)
+    path_t = np.asarray(t, np.float64)
+    snr = ((1 - path_t) / path_t) ** 2
+    want = np.minimum(snr, 5.0) * np.mean(np.square(np.asarray(estimate - x_0, np.float64)), axis=(1, 2, 3))
+    rates = broadcast_rates(schedule, t, x_0)
+    for transform in (FlowMatchPredictionTransform(), DirectPredictionTransform()):
+        process = Process(schedule, transform, weighting=MinSNR(5.0))
+        x_t, _, target = transform.forward_diffusion(x_0, epsilon, rates)
+        velocity = isinstance(transform, FlowMatchPredictionTransform)
+        raw = (x_t - estimate) / expand(t, x_0) if velocity else estimate
+        read = transform.pred_transform(x_t, raw, rates, t)
+        error = jnp.mean(jnp.square(read - target), axis=(1, 2, 3))
+        np.testing.assert_allclose(process.weight(t) * error, want, rtol=2e-5,
+                                   err_msg=type(transform).__name__)
 
 
 def test_min_snr_weights_are_capped_and_non_increasing_in_snr():
