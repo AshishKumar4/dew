@@ -43,7 +43,7 @@ import jax.extend
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact_as_the_reference, assert_computes_the_oracle
 
 from dew.nn.kernels.ssd import MIN_CHUNK, MIN_WIDTH, ssd_chunk_scan, ssd_kernel_platform, ssd_kernel_runs
 from dew.nn.mixers.mamba2 import RESET_DECAY, chunk_ssd, xla_chunk_scan
@@ -521,7 +521,8 @@ def test_the_interpreted_kernel_is_as_exact_as_the_xla_scan(shape, chunk_size):
     """The kernel, interpreted on this host, forward and all five gradients,
     against the stepwise recurrence in float64 (`stepwise_scan`, which
     shares no line with either chunked path), by tests/reference_error.py's
-    rule: no further from it than twice the XLA path's fp32 rounding. A
+    rule: no further from it than twice the XLA path's fp32 rounding, whose
+    own arithmetic in float64 is first held to the recurrence. A
     nonzero entering state, steps that decay a chunk's state by about e
     (Mamba-2's small steps; at `mixer_operands`' own a chunk's carry
     vanishes and its gradient with it), and document resets at a chunk's
@@ -541,6 +542,10 @@ def test_the_interpreted_kernel_is_as_exact_as_the_xla_scan(shape, chunk_size):
         truth_gradients = jax.jit(lambda *o: jax.vjp(stepwise_scan, *o)[1](
             tuple(jnp.asarray(np.asarray(t), jnp.float64) for t in seeded)))(*exact)
         truth = [np.asarray(t) for t in (*truth, *truth_gradients)]
+        twin = jax.jit(xla_chunk_scan)(*exact)
+        twin_gradients = jax.jit(lambda *o: jax.vjp(xla_chunk_scan, *o)[1](
+            tuple(jnp.asarray(np.asarray(t), jnp.float64) for t in seeded)))(*exact)
+        twin = [np.asarray(t) for t in (*twin, *twin_gradients)]
 
     xla = jax.jit(xla_chunk_scan)(*operands)
     xla_gradients = jax.jit(lambda *o: jax.vjp(xla_chunk_scan, *o)[1](seeded))(*operands)
@@ -548,9 +553,10 @@ def test_the_interpreted_kernel_is_as_exact_as_the_xla_scan(shape, chunk_size):
     kernel_gradients = jax.vjp(lambda *o: ssd_chunk_scan(*o, "tpu"), *operands)[1](seeded)
 
     names = ("output", "final", "x", "B", "C", "A dt", "state")
-    for name, mine, theirs, want in zip(names, (*kernel, *kernel_gradients), (*xla, *xla_gradients), truth,
-                                        strict=True):
+    for name, mine, theirs, wide, want in zip(names, (*kernel, *kernel_gradients), (*xla, *xla_gradients),
+                                              twin, truth, strict=True):
         assert np.all(np.isfinite(np.asarray(mine))), name
+        assert_computes_the_oracle(wide, np.asarray(theirs), want, name)
         assert_as_exact_as_the_reference(np.asarray(mine), np.asarray(theirs), want, name)
 
 
