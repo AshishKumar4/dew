@@ -57,14 +57,15 @@ LABEL_KEY = "label"
 
 
 def representation_health(z) -> dict[str, jax.Array]:
-    """Report collapse telemetry for pooled embeddings [B, D].
+    """Return two collapse measures for pooled embeddings `[B, D]`, as metrics.
 
-    repr_std is the per-dimension standard deviation across the batch. It goes
-    to zero exactly when the encoder stops distinguishing inputs. repr_cov_offdiag
-    is the RMS magnitude of the off-diagonal covariance, which rises when the
-    dimensions become redundant (dimensional collapse) while repr_std holds.
+    `repr_std` is the per-dimension standard deviation across the batch. It
+    goes to zero exactly when the encoder stops distinguishing inputs.
+    `repr_cov_offdiag` is the RMS magnitude of the off-diagonal covariance,
+    which rises when the dimensions become redundant (dimensional collapse)
+    while `repr_std` holds.
 
-    Both are computed in fp32. A run's compute dtype then does not set the
+    Both are computed in fp32, so a run's compute dtype does not set the
     noise floor of the drift, and bf16 and fp32 runs read off the same curves.
     """
     batch_size, dim = z.shape
@@ -79,11 +80,11 @@ def representation_health(z) -> dict[str, jax.Array]:
 
 
 def normalize_targets(x, epsilon: float = 1e-6):
-    """Feature-wise layer norm with no learned affine.
+    """Layer-normalize `x` over its feature axis, with no learned affine.
 
-    Applied to the target encoder's output so the prediction problem keeps a
-    fixed scale as the encoder drifts. Shrinking the representation then does
-    not lower the loss.
+    The objective applies it to the target encoder's output, so the
+    prediction problem keeps a fixed scale as the encoder drifts, and
+    shrinking the representation does not lower the loss.
     """
     mean = jnp.mean(x, axis=-1, keepdims=True)
     variance = jnp.var(x, axis=-1, keepdims=True)
@@ -92,17 +93,20 @@ def normalize_targets(x, epsilon: float = 1e-6):
 
 @objectives("jepa")
 class JepaObjective(Objective[Ratio]):
-    """Joint-embedding prediction over images (B,H,W,C) or video (B,T,H,W,C).
+    """Trains a JEPA encoder and predictor over images (B,H,W,C) or video (B,T,H,W,C).
 
     Evaluation returns the pooled target-encoder embeddings of a batch with
-    its labels, which the probe metrics score.
+    its labels, which the probe metrics score. `momentum` is the target
+    encoder's EMA decay, which rises linearly from its first value to its
+    second over `momentum_steps` updates.
 
     `encoder_variables` and `predictor_variables` are the trees each module
     starts from, as `model.init`, `Pretrained.load` or `LoRA.apply` return
-    them; one left None is drawn. Every collection of each is kept, under
-    the module's name: an adapted encoder's factors train under `params`
-    and its base rides under `frozen`, and the target encoder is the
-    trainer's average of what trains over that same frozen base.
+    them; a module whose tree is None is initialized from the key. Every
+    collection of each tree is kept under the module's name. For an adapted
+    encoder, the factors train under `params` and the base stays under
+    `frozen`, and the target encoder is the trainer's average of the trained
+    leaves over that same frozen base.
     """
     artifact = Representations
     # A collapsing encoder's spread falls to zero; a redundant one's
@@ -224,7 +228,7 @@ class JepaObjective(Objective[Ratio]):
         return loss, Aux(representation_health(pooled))
 
     def evaluate(self, params, batch, step: Step):
-        """The frozen target encoder's pooled embeddings, with the batch labels."""
+        """Return the pooled embeddings of the target encoder, the EMA copy, with the batch labels."""
         features = self._embed(self._target_variables(step), batch[self.sample.key])
         return Representations(features=features, labels=jnp.asarray(batch[self.label_key]))
 
