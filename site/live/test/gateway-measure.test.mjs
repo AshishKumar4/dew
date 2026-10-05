@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { build } from 'esbuild';
-import { Miniflare } from 'miniflare';
+import { Miniflare, convertV4MiniflareOptions } from 'miniflare';
 
 let worker;
 before(async () => {
@@ -10,10 +10,11 @@ before(async () => {
 		entryPoints: [fileURLToPath(new URL('../measure/index.ts', import.meta.url))],
 		bundle: true, write: false, format: 'esm', platform: 'browser', external: ['cloudflare:workers'],
 	});
-	worker = new Miniflare({
-		modules: true, script: result.outputFiles[0].text,
-		bindings: { ADMIN_TOKEN: 'private-test-token' }, durableObjects: { LAB: 'GatewayLab' },
-	});
+	worker = new Miniflare(convertV4MiniflareOptions({
+		modules: [{ type: 'ESModule', path: 'gateway.mjs', contents: result.outputFiles[0].text }],
+		compatibilityDate: '2026-09-29',
+		bindings: { ADMIN_TOKEN: 'private-test-token' }, durableObjects: { LAB: { className: 'GatewayLab', useSQLite: true } },
+	}));
 });
 after(async () => { await worker?.dispose(); });
 
