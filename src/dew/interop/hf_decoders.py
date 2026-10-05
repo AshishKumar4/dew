@@ -30,7 +30,7 @@ from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Literal, NoReturn, Protocol, TypedDict, Unpack, runtime_checkable
+from typing import TYPE_CHECKING, Literal, NoReturn, Protocol, TypedDict, Unpack
 
 import jax
 import numpy as np
@@ -1795,15 +1795,6 @@ class ExportTokenizer(Protocol):
         ...
 
 
-@runtime_checkable
-class NamedTokenizer(Protocol):
-    """A tokenizer that knows the name it was resolved from, which is what
-    `dew.data.text.HFTokenizer` keeps and a host tokenizer object states
-    nowhere. An export records the name beside the files."""
-
-    name: str
-
-
 GENERATION_DEFAULTS: Mapping[str, object] = MappingProxyType({"do_sample": True, "use_cache": True})
 """The generation_config.json an export writes when nothing names one: sampling
 with the KV cache, which is what transformers' generate reads by default."""
@@ -1819,35 +1810,35 @@ def save_export_assets(
     """Write the tokenizer files and generation_config.json beside exported weights.
 
     Readers of the HF layout (transformers, llama.cpp and the runtimes on it) locate the
-    vocabulary through tokenizer_config.json, so a name alone is not a loadable export.
-    A name is resolved through `tokenizer_for` from local files only and recorded under
-    `tokenizer_name`, which is the whole record for the byte vocabulary. Unless
-    `named`: then the files are the whole record, and a vocabulary with none
-    (the byte vocabulary) is refused before anything is written.
+    vocabulary through tokenizer_config.json, so the tokenizer writes its own files here
+    (`save_pretrained`) and the directory is the whole record of it: a name, a hub repo
+    or a path on the machine that exported it, is recorded nowhere, and a
+    `tokenizer_name` the source's generation config carried is dropped. A name is
+    resolved through `tokenizer_for` from local files only. Dew's byte vocabulary has
+    no files, so it alone is recorded, as `tokenizer_name: "byte"`; unless `named`,
+    where the layout has no such field and it is refused before anything is written.
     """
     values = dict(GENERATION_DEFAULTS if generation_config is None else generation_config)
-    name: str | None = None
+    values.pop('tokenizer_name', None)
+    byte = False
     writer: ExportTokenizer | None = None
     if isinstance(tokenizer, str):
         from dew.data.text import ByteTokenizer, tokenizer_for
 
-        name = tokenizer
         resolved = tokenizer_for(tokenizer, local_files_only=True)
-        # Dew's byte vocabulary is no HF tokenizer and no HF file describes
-        # it, so the name it was exported with is the whole record of it.
+        byte = isinstance(resolved, ByteTokenizer)
         writer = None if isinstance(resolved, ByteTokenizer) else resolved
     elif tokenizer is not None:
         writer = tokenizer
-        name = tokenizer.name if isinstance(tokenizer, NamedTokenizer) else None
-    if not named and writer is None and name is not None:
-        raise ValueError(f"the {name!r} vocabulary has no tokenizer files, and this layout's "
+    if byte and not named:
+        raise ValueError("the byte vocabulary has no tokenizer files, and this layout's "
                          "generation_config.json has no field to name it by; export a run trained "
                          "on a Hugging Face tokenizer")
     os.makedirs(directory, exist_ok=True)
     if writer is not None:
         writer.save_pretrained(str(directory))
-    if name is not None and named:
-        values.setdefault('tokenizer_name', name)
+    if byte:
+        values['tokenizer_name'] = "byte"
     with open(os.path.join(directory, GENERATION_CONFIG_FILE), 'w') as handle:
         json.dump(values, handle, indent=2)
 

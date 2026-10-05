@@ -152,12 +152,10 @@ def pretrained_source(pretrained: str, model_config: ModelConfig, vocab_size: in
     loaded = Pretrained.load(
         name, dtype=model_config.dtype, attention_impl=model_config.attention_impl,
         max_seq_len=context, revision=revision)
-    expected = checkpoint_tokenizer(loaded.source, name)
-    if meta["tokenizer"] != expected:
+    if not same_vocabulary(str(meta["tokenizer"]), loaded, name):
         raise ValueError(
-            f"the token files were written with {meta['tokenizer']}, and "
-            f"{pretrained} expects {expected}. Retokenize with "
-            f"--tokenizer {expected}.")
+            f"the token files were written with {meta['tokenizer']}, and {pretrained} "
+            f"expects its own tokenizer's ids. Retokenize with --tokenizer {name}.")
     # A decoder's embedding table is usually padded past the tokenizer's ids
     # (Qwen3 stores 151936 rows for 151669 tokens), so covering them is the
     # requirement, not matching the count.
@@ -169,20 +167,22 @@ def pretrained_source(pretrained: str, model_config: ModelConfig, vocab_size: in
     return loaded, reference
 
 
-def checkpoint_tokenizer(directory: Path, name: str) -> str:
-    """The tokenizer name the checkpoint in `directory`, read as `name`,
-    expects its ids to come from.
+def same_vocabulary(written: str, loaded, name: str) -> bool:
+    """Whether the token files' tokenizer `written` is the vocabulary of the
+    checkpoint `loaded`, read as `name`.
 
-    A checkpoint written by `PretrainedDecoder.from_model(...).save` records
-    the name it was exported with, since the path or repo it happens to sit at
-    says nothing; any other hub repo is its own tokenizer's name.
+    An export carries its tokenizer's own files, not the name it was made
+    with, so the vocabularies are compared: the byte vocabulary, which has
+    no files, by the `byte` an export records for it; an HF one by its
+    token-to-id table, against the files in the checkpoint's directory, or
+    by name where the checkpoint carries none.
     """
-    generation_config = directory / "generation_config.json"
-    if generation_config.is_file():
-        recorded = json.loads(generation_config.read_text()).get("tokenizer_name")
-        if recorded:
-            return recorded
-    return name
+    if written == "byte" or loaded.tokenizer == "byte":
+        return written == loaded.tokenizer
+    if loaded.processor is None:
+        return written == name
+    carried = HFTokenizer(str(loaded.source), local_files_only=True).tokenizer
+    return run_tokenizer(written).tokenizer.get_vocab() == carried.get_vocab()
 
 
 def run_tokenizer(name: str) -> ByteTokenizer | HFTokenizer:
