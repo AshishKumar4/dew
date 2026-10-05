@@ -291,8 +291,8 @@ dilation-1 kernel over the d^2 interleaved grids. Forward and VJP take
 and the step went from 75.30 to 70.17 ms. At HIGHEST precision the fp32
 output and input gradient equal those of lax's dilated convolution exactly.
 
-In fp32 that polyphase form made the step slower (109.70 to 113.68 ms). In
-fp32, cuDNN runs the polyphase convolutions (forward, input gradient and
+In fp32 that polyphase form made the step slower (109.70 to 113.68 ms).
+There cuDNN runs the polyphase convolutions (forward, input gradient and
 filter gradient) with its grouped direct kernels, which took 3.8 ms of the
 5.2 ms a batch-16 step spent in the dilated layers, and the interleaving
 transposes took 1.3 ms more. So on CUDA the form now depends on the dtype:
@@ -446,11 +446,11 @@ On the smallest step, the host takes 94% of the device's time with a fresh
 batch every step, and 106% without command buffers.
 
 The Python in `Compiled.__call__` costs up to 4.5 us per leaf, and this
-state has 396 leaves (more on a mesh). So since `de6b22c`, `Trainer.compile`
-returns the jitted step. On this card that leaves the wall time the same and
-cuts host time by 1.8 ms a step. Since the sequence axis was added, the
-jitted step is wrapped in the mesh context, and a dispatch costs 32 us on
-the i9-12900K with or without that wrapper.
+state has 396 leaves (more on a mesh). That is why `Trainer.compile` has
+returned the jitted step since `de6b22c`. On this card that leaves the wall
+time the same and cuts host time by 1.8 ms a step. After the sequence axis
+was added, the jitted step is wrapped in the mesh context, and a dispatch
+costs 32 us on the i9-12900K with or without that wrapper.
 
 A fresh batch costs 1.5 ms more than a fixed one, because the command buffer
 has to be updated for the new buffer addresses. That cost limits how far the
@@ -804,7 +804,7 @@ Gemma applies it before (1.4e-2 apart on CPU with a bias, identical without
 one). The second is attention sinks, which no tokamax implementation takes.
 
 Dew does not route any call to this kernel. A forward-only kernel cannot
-serve training, and the only backward tiling that works is reachable only
+serve training, and the one backward tiling that works is reachable only
 through private tokamax classes. A route needs an upstream tokamax release
 whose VJP picks a tiling that fits the card, or a public tiling setting,
 with a correctness check next to it. Installing tokamax 0.0.13 next to Dew
@@ -1461,14 +1461,14 @@ checks the bits.
 The cache's validity, derived, 2026-10-04. Each attention cache stored a
 `[rows, capacity]` mask of its filled slots next to the cursor. Slots fill
 in order, so the mask always equalled the cursor's `filled_slots`. A decode
-step rewrote it in every layer, in 28 one-microsecond kernels, and the only
-thing that read the result was the decode loop's state. The mask is now
-derived where it is read (`dew.nn.attention.cached_validity`), in the
-attention, Llama 4, MLA, the DSA pool and DeepSeek V4, and serving no longer
-places or zeroes it. The served tokens and log-probabilities are bitwise the
-same at 32, 64 and 128 slots, and the device's busy time a run went from
-1393.7 to 1388.3 ms at 32 slots, from 2147.5 to 2139.2 at 64 and from 3645.2
-to 3626.2 at 128 (two traced runs each).
+step rewrote it in every layer, in 28 one-microsecond kernels, only to store
+it in the state passed to the next step. The mask is now derived where it is
+read (`dew.nn.attention.cached_validity`), in the attention, Llama 4, MLA,
+the DSA pool and DeepSeek V4, and serving no longer places or zeroes it. The
+served tokens and log-probabilities are bitwise the same at 32, 64 and 128
+slots, and the device's busy time a run went from 1393.7 to 1388.3 ms at 32
+slots, from 2147.5 to 2139.2 at 64 and from 3645.2 to 3626.2 at 128 (two
+traced runs each).
 
 ### Open loop, 2026-10-04
 
