@@ -1,6 +1,6 @@
 # Training data
 
-A `Dataset` supplies the batches a run trains and validates on. A batch is a dictionary of arrays, and the first dimension of each array holds this process's rows of the global batch (all of the rows when there is one process). Most readers yield NumPy arrays, but device image augmentation yields pixels that are already JAX arrays on the device. The trainer joins the processes' rows into global arrays, and the objective reads the fields it needs by name.
+A `Dataset` supplies the batches a run trains and validates on. A batch is a dictionary of arrays whose first dimension holds this process's rows of the global batch (all of them with one process). Most readers yield NumPy arrays, but device image augmentation yields pixels that are already JAX arrays on the device. The trainer joins the processes' rows into global arrays, and the objective reads the fields it needs by name.
 
 This page covers the `Dataset` class, the fields each built-in objective expects, the built-in readers, reading data that TFDS or Hugging Face already holds, and resuming the data stream from a checkpoint.
 
