@@ -1,11 +1,12 @@
-"""DiffusionGemma's shared native encoder/decoder and self-conditioning MLP.
+"""DiffusionGemma's shared encoder and decoder, and its self-conditioning MLP.
 
-The MLP follows Transformers modeling_diffusion_gemma.py:790-823: a scaled
-pre-norm, gated feed-forward, and scale-free post-norm. Previous logits become
+The MLP follows the Transformers implementation: a scaled pre-norm, a gated
+feed-forward and a post-norm without scale. The previous step's logits become
 soft embeddings through an fp32 softmax against the scaled embedding table.
-An explicit self-conditioning mask zeros embeddings for the first inference
-step. The official SFT objective instead supplies zero logits for its dropout
-branch; those are uniform soft embeddings, not a zero signal.
+On the first inference step, an explicit self-conditioning mask zeros those
+embeddings. The official SFT objective supplies zero logits for its dropout
+branch instead, and zero logits give uniform soft embeddings, which are not a
+zero signal.
 """
 
 from __future__ import annotations
@@ -29,8 +30,9 @@ from dew.nn.precision import at_least_fp32
 from dew.registry import models
 
 
+# The layers follow Transformers' modeling_diffusion_gemma.py:790-823.
 class SelfConditioning(nn.Module):
-    """The previous step's soft embeddings folded into the canvas embeddings."""
+    """Folds the previous step's soft embeddings into the canvas embeddings."""
 
     hidden_size: int
     intermediate_size: int
@@ -74,12 +76,13 @@ def soft_embeddings(logits: jax.typing.ArrayLike, embed_weight: jax.typing.Array
 
 @models("diffusion_gemma")
 class DiffusionGemma(nn.Module):
-    """One text parameter tree, read causally for context and bidirectionally for canvases.
+    """Reads one text parameter tree causally for the context and bidirectionally for canvases.
 
     ``encode`` appends clean tokens to the cache. ``__call__`` refines a canvas
-    against that frozen cache and feeds previous logits through self-conditioning.
-    Each method is a separate apply: sharing scopes keeps the encoder and decoder
-    parameters identical without storing a second tree.
+    against that frozen cache and feeds the previous logits through
+    self-conditioning. Each method is a separate apply. The encoder and the
+    decoder share one scope, so their parameters are identical and no second
+    tree is stored.
     """
 
     text: CausalTransformer
@@ -120,11 +123,12 @@ class DiffusionGemma(nn.Module):
                attention_pairwise_mask=None, attention_key_positions=None,
                conditioning: Mapping[str, jax.Array] | None = None, train: bool = False,
                states: bool = False):
-        """Append a clean prompt or committed canvas, evaluating media only when supplied.
+        """Append a clean prompt or committed canvas to the cache, evaluating media only when given.
 
-        The logits, or with `states` the final normalized states before the
-        head: what a loss that scores the vocabulary a tile at a time reads,
-        so the vocabulary-sized logits of a whole row never exist at once.
+        It returns the logits, or with `states` the final normalized states
+        before the head. A loss that scores the vocabulary a tile at a time
+        reads the states, so the vocabulary-sized logits of a whole row never
+        exist at once.
         """
         read = self.text.hidden_states if states else self.text
         if not conditioning:
@@ -150,21 +154,26 @@ class DiffusionGemma(nn.Module):
                     attention_key_positions=attention_key_positions)
 
     def head_weight(self, params):
-        """The `[D, vocab]` head the encoder and the decoder score with, from
-        the text tree of `params`, in its stored dtype (`CausalTransformer.head_weight`)."""
+        """Return the `[D, vocab]` head the encoder and the decoder score with, in its stored dtype.
+
+        It is read from the text tree of `params` by `CausalTransformer.head_weight`."""
         return self.text.head_weight(params["text"])
 
     def head_table(self, params):
-        """The head as the text tree stores it and whether its rows are the
-        vocabulary (`CausalTransformer.head_table`)."""
+        """Return the head as the text tree stores it, and whether its rows are the vocabulary.
+
+        It is read from the text tree of `params` by `CausalTransformer.head_table`."""
         return self.text.head_table(params["text"])
 
     def __call__(self, tokens, *, self_conditioning_logits=None,
                  self_conditioning_mask=None, train: bool = False, positions=None,
                  attention_pairwise_mask=None, attention_key_positions=None,
                  states: bool = False):
-        """The canvas logits, or with `states` the final normalized states
-        before the head (`encode` says why)."""
+        """Return the canvas logits, or with `states` the final normalized states before the head.
+
+        `encode` explains why a loss reads the states. Self-conditioning reads
+        `self_conditioning_logits`, and rows where `self_conditioning_mask` is
+        false get a zero signal, as they do when no logits are given."""
         tokens = jnp.asarray(tokens, jnp.int32)
         if self.is_initializing() and self.conditioner is not None:
             self.conditioner.initialize_parameters()
