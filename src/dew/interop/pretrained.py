@@ -266,18 +266,18 @@ def _share_quantized_aliases(tensors: dict[str, np.ndarray], aliases: tuple[tupl
 
 @dataclass(frozen=True)
 class Pretrained:
-    """Holds a native model, explicit variables and its checkpoint's host processor.
+    """A native model with explicit variables and its checkpoint's host processor.
 
-    `Pretrained.load` returns the kind of source it read, each a subclass
-    with the methods that work for it: `PretrainedDecoder` for an
-    autoregressive decoder, `PretrainedMaskedDecoder` for a masked-diffusion
-    one, `PretrainedBlockDecoder` for DiffusionGemma, `PretrainedPipeline` for
-    a latent diffusion pipeline and `PretrainedFallback` for transformers'
-    forward through torchax. Every kind saves back to the source's format.
+    `Pretrained.load` returns a subclass for the kind of source it read, with the
+    methods that work for that kind: `PretrainedDecoder` for an autoregressive
+    decoder, `PretrainedMaskedDecoder` for a masked-diffusion one,
+    `PretrainedBlockDecoder` for DiffusionGemma, `PretrainedPipeline` for a latent
+    diffusion pipeline, and `PretrainedFallback` for transformers' own forward run
+    through torchax. Every kind saves back to the source's format.
 
     `model_config` is the record the model was built from, in Dew's own
-    vocabulary with the run's compute dtype and attention kernel, so a caller
-    logs the model it ran.
+    vocabulary with the run's compute dtype and attention kernel, so a caller can
+    log exactly the model it ran.
     """
 
     model: nn.Module
@@ -285,8 +285,10 @@ class Pretrained:
     processor: Processor | None
     config: Mapping[str, object]
     source: Path | None
-    """The directory the source was read from; None for a model trained in
-    Dew (`PretrainedDecoder.from_model`)."""
+    """The directory the source was read from.
+
+    None for a model trained in Dew (`PretrainedDecoder.from_model`).
+    """
     model_config: Mapping[str, object]
     generation_config: Mapping[str, object] = field(default_factory=dict)
     weight_layouts: tuple[WeightLayout, ...] = ()
@@ -296,31 +298,46 @@ class Pretrained:
     ) = field(default=None, repr=False)
     quantized_tensors: tuple[str, ...] = ()
     quantized_scale_dtype: str | None = None
-    """The dtype a quantized source stored its scales in, where its format
-    leaves that to the checkpoint (DeepSeek-V4's `.scale`: float8_e8m0fnu,
-    float32 in the Base releases), so `save` writes them back in it."""
+    """The dtype a quantized source stored its scales in, when its format leaves that to the checkpoint.
+
+    DeepSeek-V4's `.scale`, for example, is float8_e8m0fnu, and float32 in the
+    Base releases. `save` writes the scales back in this dtype.
+    """
     quantization_grid: Mapping[str, np.ndarray] = field(default_factory=dict, repr=False)
-    """The scales and zeros an integer format (AWQ, GPTQ) encodes a saved
-    weight against, as the source stored them."""
+    """The scales and zeros an integer format (AWQ, GPTQ) encodes a saved weight against.
+
+    They are kept as the source stored them.
+    """
     revision: str | None = None
-    """The Hub commit the source resolved to, whatever branch or tag was
-    asked for; None for a local directory."""
+    """The Hub commit the source resolved to, whatever branch or tag was requested.
+
+    None for a local directory.
+    """
     adapter: Adapter | None = None
-    """The low-rank adapter `adapt` bound to the model, whose factors the
-    variables hold under `params` beside the base under `frozen`; None for
-    the source as published."""
+    """The low-rank adapter that `adapt` attached to the model, or None for the source as published.
+
+    The variables hold its factors under `params`, next to the base weights under
+    `frozen`.
+    """
     tokenizer: str | decoders.ExportTokenizer | None = None
-    """The vocabulary `save` writes beside the weights, by name or by object,
-    for a bundle with no source processor to write (`from_model`)."""
+    """The vocabulary `save` writes next to the weights, by name or as an object.
+
+    It is used by a bundle that has no source processor to write (`from_model`).
+    """
     names_tokenizer: ClassVar[bool] = True
-    """Whether generation_config.json may record the tokenizer's name; not
-    where the family's reader takes that file as a closed set of fields."""
+    """Whether generation_config.json may record the tokenizer's name.
+
+    It is False for a family whose reader treats that file as a closed set of
+    fields.
+    """
 
     @property
     def text_processor(self) -> TaskProcessor | None:
-        """What the bundle's tasks encode and decode text with: the source's
-        processor, or a run processor over the vocabulary `tokenizer` names
-        (a run's export, Dew's byte vocabulary included)."""
+        """Return what the bundle's tasks encode and decode text with.
+
+        That is the source's processor, or a run processor over the vocabulary that
+        `tokenizer` names (a run's export, including Dew's byte vocabulary).
+        """
         if self.processor is not None or not isinstance(self.tokenizer, str):
             return self.processor
         from dew.data.text import tokenizer_for
@@ -330,7 +347,7 @@ class Pretrained:
     @classmethod
     def from_run(cls, directory: str | Path, *, step: int | str | None = None,
                  ema: bool | None = None) -> Self:
-        """A trained run's selected checkpoint, rebuilt from its own inference record."""
+        """Return a trained run's selected checkpoint, rebuilt from the run's own inference record."""
         from dew.checkpoints import Checkpoints
         from dew.config import ModelConfig
         from dew.inference.tasks import run_record
@@ -384,56 +401,55 @@ class Pretrained:
              single_file: str | None = None, dduf_file: str | None = None,
              mesh: MeshSpec | None = None, layout: Layout | None = None,
              fallback: str | None = None) -> Self:
-        """Load a source into a native Flax model with explicit parameter trees, as
-        the kind of source it is.
+        """Load a source as a native Flax model with explicit parameter trees, as the kind of source it is.
 
-        ``name_or_dir`` is a local HF directory or a Hub model identifier. The
-        decoder/tower/projector maps preserve their established internal paths;
-        wrapper variables join under their existing component names. Processor
-        artifacts are loaded only when the source contains them.
-        dtype selects computation; param_dtype independently selects floating
-        parameter storage and defaults to FP32 masters, or 'auto' stores the
-        checkpoint's own dtype (`_checkpoint_dtype`). Each is a dtype
-        (`jnp.bfloat16`) or its name, and the model's record keeps the name. Frozen component weights
-        (text encoders and VAE) follow it too; router, clipping, positional and
-        safety state retain their own FP32/integer contracts.
+        `name_or_dir` is a local HF directory or a Hub model ID. Decoder, tower and
+        projector weights keep their usual internal paths, and a wrapper's variables
+        join under its existing component names. Processor files are loaded only when
+        the source has them.
 
-        Without `mesh` or `layout` the variables are host arrays. With either,
-        they are placed on that mesh (the default `MeshSpec()` when only
-        `layout` is given) under that layout, one leaf at a time: a decoder's
-        leaves, and a diffusion pipeline's, are read from the mapped checkpoint
-        one device shard at a time and cast and transposed there
-        (`dew.interop.streaming`), so the host never holds the translated
-        model. Towers, projectors, a quantized source's dequantized tensors
-        and a pipeline's convolution kernels are still built whole on the
-        host first.
+        `dtype` sets the compute dtype, and `param_dtype` separately sets the storage
+        dtype of floating parameters. It defaults to FP32 master weights, and 'auto'
+        keeps the checkpoint's own dtype. Each is a dtype (`jnp.bfloat16`) or its
+        name, and the model's record keeps the name. Frozen components (text encoders
+        and the VAE) follow `param_dtype` too, while router, clipping, positional and
+        safety state keep their own FP32 or integer dtypes.
 
-        ``gguf_file`` names a GGUF file in the repo or directory: its metadata is
-        the config, its block-quantized tensors are dequantized to float32
-        (`dew.interop.gguf`), and its tokenizer is the processor where the repo
-        ships no tokenizer.
+        Without `mesh` or `layout`, the variables are host arrays. With either, they
+        are placed on that mesh (the default `MeshSpec()` when only `layout` is given)
+        under that layout, one leaf at a time. A decoder's or a diffusion pipeline's
+        leaves are read from the memory-mapped checkpoint one device shard at a time,
+        and cast and transposed there (`dew.interop.streaming`), so the host never
+        holds the whole translated model. Towers, projectors, a quantized source's
+        dequantized tensors and a pipeline's convolution kernels are still built
+        whole on the host first.
 
-        ``single_file`` names an original-format diffusion checkpoint in the
-        repo or directory: diffusers' own key maps convert it once into Dew's
-        cache as the diffusers pipeline it describes (`dew.interop.single_file`),
-        which then loads; the cache entry is published only once that load
-        succeeds. The configs are the repo or directory's own when it has a
-        model_index.json, and otherwise the diffusers repo diffusers infers from
-        the checkpoint, at the commit fetched. A component the file lacks gets
-        its weights from the same place, or is refused by name.
+        `gguf_file` names a GGUF file in the repo or directory. Its metadata is the
+        config, its block-quantized tensors are dequantized to float32
+        (`dew.interop.gguf`), and its tokenizer is the processor when the repo ships
+        no tokenizer.
 
-        ``dduf_file`` names a DDUF file in the repo or directory, a diffusers
-        pipeline packed into one archive: it is unpacked once into Dew's cache
-        (`dew.interop.dduf`) and loads as the directory it packs, as diffusers'
-        own `from_pretrained(..., dduf_file=)` reads it.
+        `single_file` names an original-format diffusion checkpoint in the repo or
+        directory. Diffusers' own key maps convert it once into Dew's cache as the
+        diffusers pipeline it describes (`dew.interop.single_file`), which then loads;
+        the cache entry is published only after that load succeeds. The configs come
+        from the repo or directory when it has a model_index.json, and otherwise from
+        the diffusers repo that diffusers infers from the checkpoint, at the commit
+        fetched. A component the file lacks gets its weights from the same place, or
+        is refused by name.
 
-        `fallback="torchax"` opts into tier 3 for any causal LM transformers
-        can build, registered or not: transformers' PyTorch forward lowered to
-        JAX by torchax (`dew.interop.torchax_fallback`), with no Dew kernels,
-        sharding rules or cached generation.
+        `dduf_file` names a DDUF file in the repo or directory, which is a diffusers
+        pipeline packed into one archive. It is unpacked once into Dew's cache
+        (`dew.interop.dduf`) and loads as the directory it packs, the same way
+        diffusers' own `from_pretrained(..., dduf_file=)` reads it.
 
-        Called on a kind (`PretrainedDecoder.load`), a source of another kind
-        is refused naming the kind it is.
+        `fallback="torchax"` opts into tier 3 for any causal LM that transformers can
+        build, registered or not: transformers' PyTorch forward lowered to JAX by
+        torchax (`dew.interop.torchax_fallback`), with no Dew kernels, sharding rules
+        or cached generation.
+
+        Called on a specific kind (`PretrainedDecoder.load`), it refuses a source of
+        another kind and names that kind.
         """
         return cls._load(name_or_dir, dtype=dtype, param_dtype=param_dtype, attention_impl=attention_impl,
                          max_seq_len=max_seq_len, revision=revision, gguf_file=gguf_file,
@@ -484,11 +500,11 @@ class Pretrained:
 
     @property
     def layouts(self) -> Mapping[str, WeightLayout]:
-        """Map each source module name to the layout of its weight: `model.<module>`
-        for a decoder, `unet.<module>` for a pipeline component.
+        """Map each source module name to the layout of its weight.
 
-        These are the names a published adapter file writes, so this is what
-        `dew.lora` binds a low-rank delta through.
+        The names are `model.<module>` for a decoder and `unet.<module>` for a
+        pipeline component. A published adapter file uses these names, so `dew.lora`
+        attaches a low-rank delta through them.
         """
         return {layout.name.removesuffix(".weight").replace("/", "."): layout
                 for layout in self.weight_layouts if layout.name.endswith(".weight")}
@@ -499,15 +515,16 @@ class Pretrained:
         return self.layouts
 
     def adapt(self, lora: LoRA, *, key: int | jax.Array) -> Self:
-        """This source with `lora` bound to its model and its factors drawn
-        (`LoRA.apply`): the adapted model, the variables with the factors
-        under `params` and the base under `frozen`, and the bound `adapter`.
-        Any objective built over it trains the factors alone; B is zero, so
-        it computes what the source does. `adapter.save` writes the factors
-        under the source's own names (PEFT's directory for a decoder, the
-        Diffusers file for a pipeline) and `save` the source with them
-        merged in. A pipeline binds its denoiser's projections alone, so the
-        text towers and the VAE stay as published.
+        """Return this source with `lora` attached to its model and its factors drawn (`LoRA.apply`).
+
+        The result holds the adapted model, the variables with the factors under
+        `params` and the base weights under `frozen`, and the bound `adapter`. Any
+        objective built over it trains only the factors, and since B starts at zero it
+        computes what the source does. `adapter.save` writes the factors under the
+        source's own names (PEFT's directory for a decoder, the Diffusers file for a
+        pipeline), and `save` writes the source with them merged in. A pipeline
+        adapts only its denoiser's projections, so the text towers and the VAE stay
+        as published.
         """
         if self.adapter is not None:
             raise ValueError("this bundle already carries an adapter; adapt the source it was made from")
@@ -515,12 +532,12 @@ class Pretrained:
         return replace(self, model=adapter.model, variables=adapter.variables, adapter=adapter)
 
     def export(self, variables: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
-        """The tensors `save` writes, by their source names; `dew.inference.NCCLPush` sends these.
+        """Return the tensors `save` writes, by their source names; `dew.inference.NCCLPush` sends these.
 
-        An adapted bundle (`lora`) writes the source's own tensors with the
-        factors merged into their kernels, PEFT's `merge_and_unload`, from
-        its variables or a trainer's split of them; `adapter.save` writes
-        the factors alone.
+        An adapted bundle (`lora`) writes the source's own tensors with the factors
+        merged into their kernels, as PEFT's `merge_and_unload` does, from its
+        variables or a trainer's split of them; `adapter.save` writes the factors
+        alone.
         """
         values = self.variables if variables is None else variables
         if self.adapter is not None:
@@ -568,8 +585,10 @@ class Pretrained:
 
     def save(self, directory: str | Path, *, variables: Mapping[str, object] | None = None,
              max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
-        """Write `export`'s tensors, in shards of at most `max_shard_size`, the
-        source's own config.json, as published, and its tokenizer assets."""
+        """Write `export`'s tensors, the source's own config.json as published, and its tokenizer files.
+
+        The tensors are written in shards of at most `max_shard_size`.
+        """
         from dew.interop.safetensors_io import save_hf_layout
         values = self.variables if variables is None else variables
         destination = Path(directory)
@@ -584,10 +603,12 @@ class Pretrained:
     def push_to_hub(self, repo_id: str, *, variables: Mapping[str, object] | None = None,
                     private: bool = False, commit_message: str = "Upload dew export",
                     max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
-        """Upload what `save` writes to the Hub repo `repo_id`, created when
-        it is missing: `save` into a staging directory, then
-        `huggingface_hub.HfApi`'s `create_repo` and `upload_folder`. Retries,
-        progress and authentication are the hub client's."""
+        """Upload what `save` writes to the Hub repo `repo_id`, creating the repo if it is missing.
+
+        It calls `save` into a staging directory, then `huggingface_hub.HfApi`'s
+        `create_repo` and `upload_folder`. The Hub client handles retries, progress
+        and authentication.
+        """
         import tempfile
 
         from huggingface_hub import HfApi
@@ -601,9 +622,11 @@ class Pretrained:
 
 @dataclass(frozen=True)
 class PretrainedDecoder(Pretrained):
-    """An autoregressive decoder, alone or inside a multimodal wrapper: it
-    generates through its KV cache, fine-tunes next-token and takes a
-    low-rank adapter."""
+    """An autoregressive decoder, alone or inside a multimodal wrapper.
+
+    It generates through its KV cache, fine-tunes on next-token prediction and
+    takes a low-rank adapter.
+    """
 
     model: CausalTransformer | MultimodalTransformer
 
@@ -611,21 +634,19 @@ class PretrainedDecoder(Pretrained):
     def from_model(cls, model: CausalTransformer, variables: Variables, *,
                    tokenizer: str | decoders.ExportTokenizer | None = None,
                    generation_config: Mapping[str, object] | None = None) -> PretrainedDecoder:
-        """A decoder trained in Dew, as the bundle `save` writes in its family's
-        Hugging Face layout.
+        """Wrap a decoder trained in Dew as a bundle that `save` writes in its family's Hugging Face layout.
 
-        The config is derived from the native computation and every variable
-        collection is encoded through the matching family, which is the
-        encoder a loaded source of a derived family exports through, so the
-        two leave the same weights behind. Gemma 4 writes frozen or trainable
-        layer-scalar values into HF buffers; reloading that layout preserves
-        computation, not the native scalar training policy.
+        The config is derived from the native computation, and every variable
+        collection is encoded through the matching family. That is the same encoder a
+        loaded source of the derived family exports through, so both write the same
+        weights. Gemma 4 writes frozen or trainable layer-scalar values into HF
+        buffers; reloading that layout reproduces the computation, but not which
+        scalars were trainable.
 
-        `tokenizer` is the vocabulary the weights were trained against, by
-        object or by name; `save` writes its files beside them, so the
-        directory `Pretrained.load` reads back carries its processor.
-        `generation_config` is what generation_config.json records,
-        `GENERATION_DEFAULTS` when None.
+        `tokenizer` is the vocabulary the weights were trained with, as an object or
+        by name. `save` writes its files next to the weights, so the directory that
+        `Pretrained.load` reads back includes its processor. `generation_config` is
+        what generation_config.json records, `GENERATION_DEFAULTS` when None.
         """
         config = decoders._export_config(model)
         decoders._refuse_lossy_export(model, config)
@@ -638,15 +659,16 @@ class PretrainedDecoder(Pretrained):
     def text_generation(self, *, sampling: Sampling | None = None) -> TextGeneration:
         """Build the text generation task this source describes.
 
-        Without an override the task runs the source's policy (`task.sampling`
-        holds every common control its config sets), any chain the rarer
-        controls need, and the strategy its config names. An explicit
-        `sampling` replaces the policy and clears that chain with it, because
-        the chain was built around the policy the caller just replaced; the
-        source's EOS and pad ids fill the ones it leaves None, and
-        `num_return_sequences` still comes from the source.
-        The task shares the bundle's canonical weights; `dew.pipeline` packs its decoder during placement.
-        Unmerged LoRA models retain their projection paths and are not packed.
+        Without an override, the task runs the source's policy (`task.sampling` holds
+        every common control its config sets), any transform chain the rarer controls
+        need, and the strategy its config names. An explicit `sampling` replaces the
+        policy and drops that chain, because the chain was built for the policy the
+        caller replaced; the source's EOS and pad ids fill the ones it leaves None,
+        and `num_return_sequences` still comes from the source.
+
+        The task shares the bundle's weights, and `dew.pipeline` packs its decoder
+        when it places them. An adapted model whose factors are not merged keeps its
+        projection paths and is not packed.
         """
         rows = return_sequences(self.config, self.generation_config)
         policy, logits, strategy = source_decoding(
@@ -667,15 +689,20 @@ class PretrainedDecoder(Pretrained):
 
 @dataclass(frozen=True)
 class PretrainedMaskedDecoder(Pretrained):
-    """A masked-diffusion decoder (LLaDA, Dream): a non-causal decoder with a
-    mask id, which generates by unmasking a full response."""
+    """A masked-diffusion decoder (LLaDA, Dream).
+
+    It is a non-causal decoder with a mask id that generates by unmasking a whole
+    response.
+    """
 
     model: CausalTransformer
 
     def text_generation(self) -> MaskedGeneration:
-        """Build the masked generation task this source describes: native MDLM
-        refining a full response with Unmask, not the source family's custom
-        generation recipe."""
+        """Build the masked generation task this source describes.
+
+        It uses Dew's MDLM sampler, which refines a whole response with Unmask, not
+        the source family's own generation recipe.
+        """
         from dew.diffusion.discrete import MDLM
 
         config, generation = self.config, self.generation_config
@@ -694,7 +721,7 @@ class PretrainedMaskedDecoder(Pretrained):
 
 @dataclass(frozen=True)
 class PretrainedBlockDecoder(Pretrained):
-    """DiffusionGemma, which decodes whole canvases."""
+    """A DiffusionGemma source, which decodes whole canvases."""
 
     model: DiffusionGemma
     # transformers reads its generation_config.json into
@@ -703,7 +730,7 @@ class PretrainedBlockDecoder(Pretrained):
     names_tokenizer: ClassVar[bool] = False
 
     def block_generation(self) -> BlockGeneration:
-        """Build the DiffusionGemma as a canvas task, defaulting to the source's sampler config."""
+        """Build the DiffusionGemma canvas task, with the source's sampler config as its default."""
         from dew.interop import diffusion_gemma
 
         return BlockGeneration(
@@ -722,11 +749,12 @@ class PretrainedBlockDecoder(Pretrained):
 
 @dataclass(frozen=True, kw_only=True)
 class PretrainedPipeline(Pretrained):
-    """A latent diffusion pipeline: the denoiser as `model`, its processes,
-    conditions and autoencoder, and the policy the source calls it with. It
-    samples, fine-tunes by denoising and takes a low-rank adapter on its
-    denoiser; `save` writes one tensor set per component, in the diffusers
-    layout."""
+    """A latent diffusion pipeline: the denoiser as `model`, with its process, conditions and autoencoder.
+
+    It also holds the policy the source samples with. It samples, fine-tunes by
+    denoising and takes a low-rank adapter on its denoiser. `save` writes one
+    tensor set per component, in the diffusers layout.
+    """
 
     process: Process
     inputs: InputSpec
@@ -736,9 +764,11 @@ class PretrainedPipeline(Pretrained):
     finish: Callable[[Mapping[str, object], jax.Array], jax.Array] | None = field(default=None, repr=False)
 
     def text_to_image(self) -> TextToImage:
-        """Build the latent diffusion source as a sampling task with its
-        published policy; a video source's (Wan's) samples clips,
-        `[N, frames, height, width, 3]`."""
+        """Build the pipeline as a sampling task with its published policy.
+
+        A video source's task (Wan's) samples clips of shape
+        `[N, frames, height, width, 3]`.
+        """
         return TextToImage(self.model, self.process, self.inputs, self.variables, self.autoencoder,
                            grid=self.task.grid, final_denoise=False, solver=self.schedule.solver,
                            steps=self.task.steps, guidance=self.task.guidance, finish=self.finish)
@@ -753,10 +783,12 @@ class PretrainedPipeline(Pretrained):
 
     def save(self, directory: str | Path, *, variables: Mapping[str, object] | None = None,
              max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
-        """Write each component's tensors and config in the diffusers layout,
-        an adapted bundle's factors merged into the denoiser's kernels
-        (PEFT's `merge_and_unload`) from its variables or a trainer's split
-        of them; `adapter.save` writes the factors alone."""
+        """Write each component's tensors and config in the diffusers layout.
+
+        An adapted bundle's factors are merged into the denoiser's kernels (PEFT's
+        `merge_and_unload`), from its variables or a trainer's split of them;
+        `adapter.save` writes the factors alone.
+        """
         from dew.interop import diffusion
 
         self._quantization()
@@ -777,11 +809,13 @@ class PretrainedPipeline(Pretrained):
 
 @dataclass(frozen=True)
 class PretrainedFallback(Pretrained):
-    """transformers' PyTorch forward lowered to JAX by torchax (tier 3): it
-    fine-tunes next-token, with no Dew kernels, sharding rules or cached
-    generation; generate with transformers' own
-    `AutoModelForCausalLM.from_pretrained(source).generate`. Train it as
-    any source, `LMObjective(fallback, seq_len)`."""
+    """A causal LM run as transformers' PyTorch forward, lowered to JAX by torchax (tier 3).
+
+    It fine-tunes on next-token prediction, without Dew's kernels, sharding rules
+    or cached generation; to generate, use transformers' own
+    `AutoModelForCausalLM.from_pretrained(source).generate`. Train it like any
+    source, `LMObjective(fallback, seq_len)`.
+    """
 
 
 def _native_variables(parts: Mapping[str, Mapping[str, ParamTree]]) -> dict[str, dict[str, ParamTree]]:
@@ -1855,9 +1889,9 @@ def _source_processor(directory: Path, config: Mapping[str, object], record: Map
 def split_revision(source: str) -> tuple[str, str | None]:
     """Split a `repo@revision` reference into the repo and the revision.
 
-    Levanter's `RepoRef` spelling: a branch, tag or commit after the last
-    '@'. A local directory, or a reference without '@', names no revision.
-    Hub repo ids cannot contain '@'.
+    This is Levanter's `RepoRef` spelling: a branch, tag or commit after the last
+    '@'. A local directory, or a reference without '@', names no revision. Hub
+    repo IDs cannot contain '@'.
     """
     if os.path.isdir(source) or "@" not in source:
         return source, None
