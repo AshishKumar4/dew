@@ -1,13 +1,14 @@
-"""Image datasets: TFDS, Hugging Face hub and arrayrecord shards, one transform.
+"""Image datasets read from TFDS, the Hugging Face hub and arrayrecord shards.
 
-Every image dataset resizes, augments and captions its records the same way.
-What differs is where the records come from and how one is read, which is
-the three hooks a subclass fills in. Records leave as
+Every image dataset resizes, augments and captions its records with the same
+transform. The datasets differ in where the records come from and how one
+record is read, which a subclass defines in its `source` and `record`
+methods. Each record comes out as
 `{"image": uint8 [size, size, 3], "caption": str}`, plus `"label"` when the
-source carries a class index. `load(tokenize=)` is where a run's own
-condition reads the captions: the dataset carries the text, the encoder
-decides what tokens it becomes. cv2, tensorflow_datasets and HF datasets are
-imported on use, so `import dew.data` costs none of them.
+source has a class index. The run's condition reads the captions through
+`load(tokenize=)`, so the dataset keeps only the text and the encoder
+decides which tokens it becomes. cv2, tensorflow_datasets and HF datasets
+are imported only when used, so `import dew.data` loads none of them.
 """
 
 from __future__ import annotations
@@ -82,8 +83,12 @@ def unpack_dict_of_byte_arrays(packed_data: bytes) -> dict[str, bytes]:
     return unpacked_dict
 
 def pack_dict_of_byte_arrays(unpacked: dict) -> bytes:
-    """`unpacked`'s entries length-prefixed in dict order, the layout
-    `unpack_dict_of_byte_arrays` reads."""
+    """Pack `unpacked`'s entries in dict order, in the layout
+    `unpack_dict_of_byte_arrays` reads.
+
+    Each entry is a uint32 key length, the utf-8 key, a uint32 value length
+    and the value.
+    """
     packed = bytearray()
     for key, byte_array in unpacked.items():
         encoded = key.encode('utf-8')
@@ -169,8 +174,11 @@ def resize_image(image: np.ndarray, size: int) -> np.ndarray:
 
 @dataclasses.dataclass(frozen=True)
 class Augment:
-    """Says which augmentations a mode applies: flip for flip_only, both for
-    flip_jitter. 'none' maps to no Augment at all."""
+    """The augmentations an augmentation mode applies.
+
+    'flip_only' sets `flip`, 'flip_jitter' sets both `flip` and `jitter`, and
+    'none' gives no Augment at all.
+    """
 
     flip: bool
     jitter: bool
@@ -219,7 +227,10 @@ def augment_image(augment: Augment | None, image: np.ndarray,
 
 @functools.cache
 def class_names(path: str) -> tuple[str, ...]:
-    """The class names of a labels file, one per line, read once per process."""
+    """Read the class names of a labels file, one per line.
+
+    The result is cached, so each file is read once per process.
+    """
     with open(os.path.expanduser(path)) as handle:
         return tuple(line.strip() for line in handle)
 
@@ -249,11 +260,11 @@ def _fields(element: Batch | bytes, name: str) -> Batch:
 
 
 class ImageTransform(pygrain.RandomMapTransform):
-    """Resizes, augments and captions one record, seeded by the record's own rng.
+    """Resizes, augments and captions one record, using the record's own rng.
 
-    It is built where its loader opens and unpickled where a spawned worker
-    starts, both before any reader thread runs, and both import OpenCV
-    (`import_opencv`).
+    The constructor runs when its loader opens, and unpickling runs when a
+    spawned worker starts. Both import OpenCV (`import_opencv`), and both
+    happen before any reader thread starts.
     """
 
     def __init__(self, spec: ImageDataset):
@@ -298,26 +309,29 @@ class ImageTransform(pygrain.RandomMapTransform):
 class ImageDataset(DatasetSpec):
     """Reads captioned images through grain, resized to `image_size`.
 
-    Validation comes from one of two places. `val_split` names a split of the
-    dataset's own, which is opened as a second source and scored in record
-    order, `val_batches` batches of it or all of it when that is None.
-    Without one, `val_batches` batches of records are held out of the head of
-    the training source, in canonical order, so FID and CLIP are never
-    measured on records the model trained on. None or 0 holds nothing out and
-    validates nothing.
+    Validation data comes from one of two places. If `val_split` names
+    another split of the same dataset, that split is opened as a second
+    source and scored in record order, `val_batches` batches of it or all of
+    it when `val_batches` is None. Without `val_split`, `val_batches` batches
+    of records are held out of the head of the training source, in canonical
+    order, so FID and CLIP are never measured on records the model trained
+    on. In that case None or 0 holds nothing out and runs no validation.
 
-    `count` takes that many records from the head of the source. A source
-    that reports no length needs it set.
+    `count` uses only that many records from the head of the source. It must
+    be set for a source that reports no length.
     """
 
     image_size: int = 128
     augmentation: Augmentation = "flip_jitter"
     augmentation_backend: Literal["host", "device"] = "host"
-    """Host OpenCV/NumPy, or JAX augmentation of the decoded device batch."""
+    """Where augmentation runs: "host" uses OpenCV and NumPy on each record, and "device" uses JAX on
+    the decoded batch on the device."""
     crop_scale: tuple[float, float] = (1.0, 1.0)
-    """Uniform retained area fraction, resized bilinearly; (1, 1) keeps the full image."""
+    """The range of the image area a random crop keeps, drawn uniformly; the crop is resized
+    bilinearly, and (1, 1) keeps the full image."""
     augmentation_size: int | None = None
-    """Square decoded staging size before random crop; None uses image_size."""
+    """The side of the square each image is decoded and resized to before the random crop; None
+    uses `image_size`."""
     val_batches: int | None = 4
     val_split: str | None = None
     count: int | None = None
@@ -333,17 +347,26 @@ class ImageDataset(DatasetSpec):
 
     @property
     def staging_size(self) -> int:
-        """The dense host shape; none retains the old evaluation resize."""
+        """The side of the square image on the host before augmentation.
+
+        It is `augmentation_size` when that is set and `image_size` otherwise.
+        With `augmentation="none"` it is always `image_size`, so evaluation
+        resizes straight to the output size.
+        """
         if self.augmentation == "none":
             return self.image_size
         return self.image_size if self.augmentation_size is None else self.augmentation_size
 
     def processed(self, stream: Reader) -> Reader:
-        """Tokenize on the host, then optionally augment the pixels on device.
+        """Return `stream` with device augmentation added, or unchanged when
+        `augmentation_backend` is "host".
 
-        `mapped` forwards Grain's saved position and close/stop methods. No
-        second RNG state or batch counter needs checkpointing, and changing
-        reader threads, process shares or batch size changes no record draw.
+        On the device backend, a jitted JAX function augments each batch's
+        images with the `image_augmentation_key` that `ImageTransform` drew
+        from each record's rng. `mapped` forwards Grain's saved position and
+        its close and stop methods. So no second RNG state or batch counter
+        needs checkpointing, and changing the reader threads, the process
+        shares or the batch size changes no record's draw.
         """
         if self.augmentation_backend == "host":
             return stream
@@ -364,29 +387,33 @@ class ImageDataset(DatasetSpec):
         return mapped(stream, stage)
 
     def source(self, split: str | None = None) -> Records:
-        """Opens the records by index (`__getitem__`, and `__len__` unless
-        `count` says how many there are).
+        """Open the records for reading by index.
 
-        `split` names a split other than the one this spec reads, which is
-        how `val_split` opens a second source. A dataset whose records are
-        one pile refuses it.
+        The source has `__getitem__`, and `__len__` unless `count` gives the
+        number of records. `split` names a split other than the one this spec
+        reads, which is how `val_split` opens a second source. A dataset with
+        no named splits, such as `ArrayRecordImages`, raises `ValueError` for
+        it.
         """
         raise NotImplementedError
 
     def record(self, element: Batch | bytes,
                rng: np.random.Generator) -> tuple[np.ndarray | bytes, str, int | None]:
-        """One record as `(image, caption, class index or None)`.
+        """Return one record as `(image, caption, class index or None)`.
 
-        The image is RGB uint8, or the encoded bytes for the transform to
-        decode at the size it needs.
+        The image is RGB uint8, or encoded bytes that the transform decodes
+        at the size it needs.
         """
         raise NotImplementedError
 
     def records(self, source: Records) -> int:
-        """The records the run uses, from the head of the source.
+        """Return how many records the run uses, counted from the head of the
+        source.
 
-        A source that cannot count itself (no `__len__`) is the other case, where
-        the spec's own `count` is the whole record of how many there are.
+        That is `count` when it is set and the source's length otherwise. A
+        `count` larger than the source raises `ValueError`. A source without
+        `__len__` cannot count itself, so it needs `count`, and without one
+        it raises `ValueError`.
         """
         name = type(self).__name__
         if self.count is None:
@@ -431,23 +458,24 @@ class ImageDataset(DatasetSpec):
 @datasets("tfds_images")
 @dataclasses.dataclass(frozen=True)
 class TFDSImages(ImageDataset):
-    """Reads a prepared TFDS image dataset's ArrayRecords, captioned from its
-    class names: the `image` and `label` features of oxford_flowers102,
-    cifar10, food101 and the like.
+    """Reads the ArrayRecords of a prepared TFDS image dataset and captions
+    each record with its class name.
 
-    Preparation runs separately. Reading uses TFDS metadata and NumPy image
-    decoding through its read-only builder, without TensorFlow or dataset
-    generation code in the training process.
+    It reads the `image` and `label` features, as in oxford_flowers102,
+    cifar10, food101 and similar datasets. You prepare the dataset
+    separately. Reading goes through the TFDS metadata and read-only builder,
+    and the image bytes are decoded by `decode_image`, so the training
+    process runs no TensorFlow or dataset generation code.
 
-    A record's caption is one of `caption_templates`, drawn from the
-    record's rng, filled with its class name.
+    A record's caption is one of `caption_templates`, chosen with the
+    record's rng and filled in with its class name.
     """
 
     path: str | None = None
-    """Prepared version directory containing dataset_info.json and ArrayRecords."""
+    """The prepared version directory, which holds dataset_info.json and the ArrayRecords."""
     split: str = "all"
     labels: str | None = None
-    """Class-name file override; unset reads label.labels.txt in path."""
+    """A file of class names to use; None reads label.labels.txt in `path`."""
     caption_templates: tuple[str, ...] = ("a photo of a {}",)
 
     def source(self, split: str | None = None):
@@ -484,21 +512,21 @@ class TFDSImages(ImageDataset):
 class HFImages(ImageDataset):
     """Reads a Hugging Face hub dataset of images by index.
 
-    `name` is the repo id and `split` the split to read. `options` is
-    everything else `datasets.load_dataset` takes, the same value the `hf`
-    provider holds, so a dataset behind a config name, a revision, its own
-    `data_files` or a token is read here too.
+    `name` is the repo id and `split` the split to read. `options` holds the
+    other arguments `datasets.load_dataset` takes, the same value the `hf`
+    provider holds, so it can also read a dataset that needs a config name,
+    a revision, its own `data_files` or a token.
 
-    The columns say where a record keeps its fields. `image_column` holds the
-    image; the caption is the first of `caption_columns` a record has, and
-    an empty tuple reads an uncaptioned dataset, such as a class-labelled
-    one, for an unconditional or class-conditional run. A `label` column,
-    where the dataset has one, is the class index a record carries. A column
-    the split does not hold is refused when the spec loads.
+    `image_column` is the column that holds the image. The caption comes from
+    the first of `caption_columns` that a record has. An empty tuple reads a
+    dataset without captions, such as a class-labelled one, for an
+    unconditional or class-conditional run; passing `tokenize` to `load`
+    then raises `TypeError`. If the dataset has a `label` column, it gives
+    each record's class index. Loading raises `ValueError` when the split
+    lacks the image column or every caption column.
 
-    Its images arrive decoded by `datasets` rather than by `decode_image`,
-    so a JPEG's EXIF orientation is applied, where `decode_image` keeps the
-    stored one.
+    `datasets` decodes these images itself, so a JPEG's EXIF orientation is
+    applied. `decode_image` keeps the stored orientation.
     """
 
     name: str = ""
@@ -544,16 +572,19 @@ class HFImages(ImageDataset):
 @dataclasses.dataclass(frozen=True)
 class ArrayRecordImages(ImageDataset):
     """Reads image and caption pairs from arrayrecord shards under
-    `path/<shard>/`, each record a packed dict.
+    `path/<shard>/`, where each record is a packed dict.
 
-    Two layouts are read. 'jpg'/'txt' entries hold an encoded image, decoded
-    on read. The `prepare_images.py` layout holds 'image'/'shape'/'caption',
-    where the image is uint8 HxWx3 already at training size, the shape is two
-    little-endian int32s, and 'label' is optional.
+    It reads two layouts. In one, 'jpg' and 'txt' entries hold an encoded
+    image, decoded on read, and its caption. The `prepare_images.py` layout
+    has 'image', 'shape' and 'caption' entries and an optional 'label'. There
+    the image is uint8 HxWx3, already at training size, and the shape is two
+    little-endian int32s.
 
-    `path` is the bucket mount or directory the shards live under. An empty
-    `shards` reads every arrayrecord file in `path` itself, which is the
-    layout prepare_images.py writes.
+    `path` is the bucket mount or directory that contains the shards. An
+    empty `shards` reads every arrayrecord file directly in `path`, which is
+    the layout prepare_images.py writes. The shards have no named splits, so
+    `val_split` raises `ValueError`; `val_batches` holds validation records
+    out of the head instead.
     """
 
     path: str | None = None
