@@ -3,6 +3,7 @@
 from functools import partial
 
 from dew.interop import mamba2
+from dew.interop.families.bloom import _BLOOM_NAMES, _bloom_config, _bloom_export, _bloom_path
 from dew.interop.families.deepseek import (
     _deepseek_config,
     _deepseek_v2_mixture,
@@ -116,6 +117,16 @@ from dew.nn.mixers.mamba2 import Mamba2Mixer
 from dew.nn.mla import MLAMixer
 
 ENTRIES = (
+    DecoderFamily(
+        ('bloom',), _bloom_config,
+        lambda fields: fields.position_embedding == 'alibi' and fields.embedding_norm,
+        'bloom', 'BloomForCausalLM', _bloom_export,
+        weight_path=_bloom_path, export_path=partial(_renamed_name, _BLOOM_NAMES),
+        prepare=partial(_gpt_neox_prepare, attention_name='self_attention'),
+        export_weights=partial(_gpt_neox_export_weights, attention_name='self_attention'),
+        preserve_source_layout=False,
+        tied_head_names=('lm_head.weight', 'transformer.word_embeddings.weight'),
+    ),
     DecoderFamily(
         ("nemotron_h",),
         _nemotron_h_config,

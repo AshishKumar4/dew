@@ -76,7 +76,7 @@ from huggingface_hub import get_safetensors_metadata, hf_hub_download
 import numpy as np
 import torch
 from transformers import (
-    AutoModelForCausalLM, AutoTokenizer, DeepseekV3Config, DeepseekV3ForCausalLM,
+    AutoModelForCausalLM, AutoTokenizer, BloomConfig, BloomForCausalLM, DeepseekV3Config, DeepseekV3ForCausalLM,
     Gemma2Config, Gemma2ForCausalLM, Gemma3Config, Gemma3ForCausalLM, Gemma3TextConfig,
     GemmaConfig, GemmaForCausalLM, LlamaConfig, LlamaForCausalLM,
     Qwen3Config, Qwen3ForCausalLM, MistralConfig, MistralForCausalLM, PreTrainedModel,
@@ -128,6 +128,46 @@ NEMOTRON_H_CONFIGS = (
     ("nemotron-h-4b", "nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16", "dfaf35de3e30f1867dd8dbc38a7fc9fb52d3914f"),
     ("nemotron-h-30b-a3b", "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", "bf77c3174f68ad409e1c2aa60daeb46e32d1c606"),
 )
+BLOOM_CONFIG = ('bloom-560m', 'bigscience/bloom-560m', 'ac2ae5fab2ce3f9f40dc79b5ca9f637430d24971')
+
+
+def tiny_bloom() -> BloomForCausalLM:
+    """Three heads exercise the non-power-of-two ALiBi slopes and fused qkv."""
+    torch.manual_seed(0)
+    return BloomForCausalLM(BloomConfig(
+        vocab_size=64, hidden_size=24, n_layer=2, n_head=3,
+        layer_norm_epsilon=3e-5, hidden_dropout=0., attention_dropout=0.,
+        bos_token_id=1, eos_token_id=None, pad_token_id=0))
+
+
+def write_classic_tiny(name: str, model: PreTrainedModel) -> None:
+    """Same-weight fp32 and float64 logits, padded rows and greedy continuation."""
+    from diffusers_wan_reference import float64
+
+    model.config._attn_implementation = 'eager'
+    write_tiny(name, model)
+    directory = FIXTURES / name
+    ids = np.load(directory / 'input_ids.npy')
+    mask = np.ones_like(ids, bool)
+    mask[1, :3] = False
+    padded = np.where(mask, ids, 0)
+    np.save(directory / 'padded_ids.npy', padded)
+    np.save(directory / 'attention_mask.npy', mask)
+    model.eval()
+    with torch.no_grad():
+        generated = model.generate(torch.from_numpy(ids[:, :4]).long(), do_sample=False,
+                                   max_new_tokens=6, eos_token_id=None, pad_token_id=0).numpy()
+        logits = model(torch.from_numpy(padded).long(), attention_mask=torch.from_numpy(mask),
+                       use_cache=False).logits.numpy()
+    np.save(directory / 'generated.npy', generated)
+    np.save(directory / 'padded_logits.npy', logits)
+    with float64(), torch.no_grad():
+        model.double()
+        truth = model(torch.from_numpy(ids).long(), use_cache=False).logits.double().numpy()
+        padded_truth = model(torch.from_numpy(padded).long(), attention_mask=torch.from_numpy(mask),
+                             use_cache=False).logits.double().numpy()
+    np.save(directory / 'logits_f64.npy', truth)
+    np.save(directory / 'padded_logits_f64.npy', padded_truth)
 
 
 def tiny_qwen3() -> Qwen3ForCausalLM:
@@ -1131,9 +1171,15 @@ def main() -> None:
                         help="only the tiny fixtures, no 1.5 GB download")
     parser.add_argument("--nemotron-h-only", action="store_true",
                         help="only the Nemotron-H tiny fixture and two pinned released configs")
+    parser.add_argument('--classic-family', choices=('bloom',),
+                        help='only this classic decoder fixture and its pinned released config')
     args = parser.parse_args()
 
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    if args.classic_family == 'bloom':
+        write_classic_tiny('bloom-tiny', tiny_bloom())
+        write_released_config(*BLOOM_CONFIG)
+        return
     write_nemotron_h()
     for name, repo, revision in NEMOTRON_H_CONFIGS:
         write_released_config(name, repo, revision)
