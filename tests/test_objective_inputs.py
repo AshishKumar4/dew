@@ -25,18 +25,16 @@ from dew.nn.backbones import CausalTransformer, SimpleDiT
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.objectives import DistillationObjective
 from dew.objectives.diffusion import (
+    AdversarialDistillation,
     AdversarialDistillationObjective,
+    ConsistencyDistillation,
     ConsistencyDistillationObjective,
     GuidanceDistillationObjective,
-)
-from dew.objectives.diffusion.block import BlockDiffusionObjective
-from dew.objectives.diffusion.config import (
-    DiffusionRunConfig,
-    FlowGRPO,
     MeanFlowTraining,
     ShortcutTraining,
-    TextCondition,
 )
+from dew.objectives.diffusion.block import BlockDiffusionObjective
+from dew.objectives.diffusion.config import DiffusionRunConfig, FlowGRPO, TextCondition
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.jepa import JepaEncoder, JepaObjective, JepaPredictor, MultiBlockMask
 from dew.objectives.lm import LMObjective
@@ -88,10 +86,10 @@ def with_teacher(kind):
     shared = (base.model, base.process, base.inputs)
     built = {
         "ladd": lambda: AdversarialDistillationObjective(
-            *shared, teacher=teacher, feature_layers=("dit_block_0",), cmap_dim=4, kernel_size=(1, 1),
-            guidance=None, steps=2),
-        "rcm": lambda: ConsistencyDistillationObjective(*shared, teacher=teacher, guidance=None,
-                                                                steps=2),
+            *shared, AdversarialDistillation(feature_layers=("dit_block_0",), cmap_dim=4, kernel_size=(1, 1)),
+            teacher=teacher, guidance=None, steps=2),
+        "rcm": lambda: ConsistencyDistillationObjective(*shared, ConsistencyDistillation(), teacher=teacher,
+                                                        guidance=None, steps=2),
         "guidance_distillation": lambda: GuidanceDistillationObjective(
             *shared, teacher=base, teacher_variables=teacher, steps=2),
     }[kind]()
@@ -161,10 +159,10 @@ def cases(windows):
         "ppo": lambda: packed(lambda seq_len: PPOObjective(decoder(), seq_len,
                                                            critic=ValueHead(decoder()))),
         "diffusion": lambda: built(diffusion()),
-        "mean_flow": lambda: built(diffusion(MeanFlow(), mean_flow=MeanFlowTraining())),
-        "shortcut": lambda: built(diffusion(Shortcut(), shortcut=ShortcutTraining(sections=4,
+        "mean_flow": lambda: built(diffusion(MeanFlow(), mode=MeanFlowTraining())),
+        "shortcut": lambda: built(diffusion(Shortcut(), mode=ShortcutTraining(sections=4,
                                                                                   bootstrap_every=2))),
-        "flow_grpo": lambda: built(diffusion(rl=FlowGRPO())),
+        "flow_grpo": lambda: built(diffusion(mode=FlowGRPO())),
         "ladd": lambda: with_teacher("ladd"),
         "rcm": lambda: with_teacher("rcm"),
         "guidance_distillation": lambda: with_teacher("guidance_distillation"),

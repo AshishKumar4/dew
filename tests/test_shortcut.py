@@ -15,7 +15,7 @@ from reference_error import assert_as_exact_as_the_reference
 from dew.diffusion import presets
 from dew.inputs import CharTable, Condition, Field, InputSpec
 from dew.objectives.base import Step
-from dew.objectives.diffusion.few_step import ShortcutObjective
+from dew.objectives.diffusion.few_step import ShortcutObjective, ShortcutTraining
 
 CASE = np.load(Path(__file__).resolve().parent / "fixtures" / "shortcut" / "targets.npz")
 SETTINGS = json.loads(str(CASE["settings"]))
@@ -63,8 +63,9 @@ def test_the_loss_and_its_gradient_are_the_references(monkeypatch):
     count = SETTINGS["batch_size"]
     rows = count // SETTINGS["bootstrap_every"]
     inputs = InputSpec(Field("image", CASE["pixels"].shape[1:]), {"textcontext": Condition(labelled())})
-    task = ShortcutObjective(Tiny(), presets.Shortcut()(), inputs, sections=SETTINGS["denoise_timesteps"],
-                             bootstrap_every=SETTINGS["bootstrap_every"],
+    task = ShortcutObjective(Tiny(), presets.Shortcut()(), inputs,
+                             ShortcutTraining(sections=SETTINGS["denoise_timesteps"],
+                                              bootstrap_every=SETTINGS["bootstrap_every"]),
                              unconditional_prob=SETTINGS["class_dropout_prob"])
     # The reference draws its self-consistency rows and its flow rows apart
     # and keeps the first of the flow draws, and its flow rows take the
@@ -113,7 +114,7 @@ def test_a_run_config_trains_a_shortcut_model_on_its_own_targets():
         sampling_steps=3,
         val_metrics=(),
         text=TextCondition(encoder="char_table", checkpoint="char_table"),
-        shortcut=ShortcutTraining(sections=4, bootstrap_every=2),
+        mode=ShortcutTraining(sections=4, bootstrap_every=2),
     )
     task = config.build()
     assert isinstance(task, ShortcutObjective) and task.model.interval

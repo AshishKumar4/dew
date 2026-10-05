@@ -143,7 +143,7 @@ By default the recipe trains on Oxford Flowers with a CLIP text encoder and scor
 
 To train one of these published architectures from scratch, name it in `--model.architecture` and put its fields in `--model.config`. To condition it on a pipeline's text encoders, pass `--text.encoder diffusion_text --text.checkpoint REPO`.
 
-`rl:flow-grpo` trains the model with Flow-GRPO in place of the denoising loss, and it needs a flow preset. For each prompt it samples `--rl.groups` images through the flow SDE and scores them with the image metric named by `--rl.reward`. That metric has to give better images higher scores, as `clip_score` does.
+`mode:flow-grpo` trains the model with Flow-GRPO in place of the denoising loss, and it needs a flow preset. For each prompt it samples `--mode.groups` images through the flow SDE and scores them with the image metric named by `--mode.reward`. That metric has to give better images higher scores, as `clip_score` does.
 
 A JEPA configuration adds predictor fields, target-mask settings, an EMA momentum schedule for the target encoder, and optional representation probes. The predictor estimates the encoded features of hidden image or video regions. The dataset and the model must both be image or both be video. Set the run length explicitly and prepare the dataset before starting.
 
