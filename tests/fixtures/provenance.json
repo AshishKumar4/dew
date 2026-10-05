@@ -108,6 +108,22 @@
    ],
    "note": "Documented generation environment also uses Torch 2.8.0."
   },
+  "codecs/nvfp4_qdq/unrounded/reference.npz": {
+   "tool": "tools/nvfp4_qdq_reference.py",
+   "sources": [
+    {"repo": "vllm-project/compressed-tensors", "version": "0.17.1", "runs": "compressed_tensors"},
+    {"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}
+   ],
+   "note": "Torch 2.14.0+cpu. Local NVFP4 input scales have scale_dtype=null, as pinned RedHatAI/Qwen3-32B-NVFP4 declares; each Linear carries a different non-power-of-two input_global_scale. CPU from_pretrained reads the same files, decoded bf16 Linear weights are promoted to fp32 while dense tensors remain fp32, and redundant weight QDQ removal is checked bit for bit. Continuous operations widen for float64; input QDQ keeps its published fp32 discrete function. Per-Linear fp32/bf16 QDQ outputs include zero, tiny-group and boundary probes."
+  },
+  "codecs/nvfp4_qdq/e4m3/reference.npz": {
+   "tool": "tools/nvfp4_qdq_reference.py",
+   "sources": [
+    {"repo": "vllm-project/compressed-tensors", "version": "0.17.1", "runs": "compressed_tensors"},
+    {"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}
+   ],
+   "note": "The same same-file reference as the unrounded variant, with scale_dtype=torch.float8_e4m3fn as CT's NVFP4 preset declares. The input scale is rounded to E4M3 before dividing by its stored inverse global scale."
+  },
   "codecs/storage/fp8/reference.npz": {
    "tool": "tools/nvfp4_storage_reference.py",
    "sources": [
@@ -3219,6 +3235,11 @@
    "tool": "tools/nvfp4_storage_reference.py",
    "what": "tiny weight-only FP8 and NVFP4 checkpoints written by the reference compressors",
    "files": ["codecs/storage/fp8/model.safetensors", "codecs/storage/nvfp4/model.safetensors"]
+  },
+  {
+   "tool": "tools/nvfp4_qdq_reference.py",
+   "what": "tiny NVFP4 checkpoints with calibrated local input quantizers",
+   "files": ["codecs/nvfp4_qdq/unrounded/model.safetensors", "codecs/nvfp4_qdq/e4m3/model.safetensors"]
   },
   {
    "tool": "tools/audio_reference.py",

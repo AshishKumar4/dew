@@ -47,6 +47,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import importlib
+import math
 import re
 from collections.abc import Callable, Mapping, Sequence
 from types import ModuleType
@@ -183,6 +184,138 @@ def _qwix(module: str = "qwix") -> ModuleType:
         raise ModuleNotFoundError(
             'quantization runs on Qwix; install it with pip install "dewml[quantization]"', name="qwix"
         ) from error
+
+
+@dataclasses.dataclass(frozen=True)
+class NVFP4Input:
+    """One checkpoint Linear's static inverse global scale and local-scale rounding."""
+
+    global_scale: float
+    e4m3_scale: bool
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.global_scale) or self.global_scale <= 0:
+            raise ValueError(f"NVFP4 input_global_scale must be positive and finite, got {self.global_scale}")
+
+
+def _nvfp4_divide(numerator: jax.Array, denominator: jax.Array) -> jax.Array:
+    """CT's correctly rounded fp32 quotient, including on XLA's approximate GPU divider.
+
+    A Dekker TwoProduct gives the exact residual of the approximate
+    quotient, split into two fp32 values. One residual correction puts the
+    quotient within one ulp; comparing its exact residual with each
+    neighbour's half-spacing times the divisor chooses nearest-even.
+    That threshold product is exact because the half-spacing is a power
+    of two. The quantizer's observed scales and quotients keep these
+    intermediates normal; dense and midpoint checks hold the result to
+    NumPy's IEEE divide without enabling x64. Dense keeps its own precision.
+    """
+    barrier = jax.lax.optimization_barrier
+
+    def product_error(a, b, product):
+        ah = jax.lax.bitcast_convert_type(
+            jax.lax.bitcast_convert_type(a, jnp.uint32) & jnp.uint32(0xfffff000), jnp.float32)
+        bh = jax.lax.bitcast_convert_type(
+            jax.lax.bitcast_convert_type(b, jnp.uint32) & jnp.uint32(0xfffff000), jnp.float32)
+        al, bl = barrier(a - ah), barrier(b - bh)
+        remainder = barrier(product - barrier(ah * bh))
+        remainder = barrier(remainder - barrier(al * bh))
+        remainder = barrier(remainder - barrier(ah * bl))
+        return barrier(barrier(al * bl) - remainder)
+
+    quotient = barrier(numerator / denominator)
+    product = barrier(quotient * denominator)
+    error = product_error(quotient, denominator, product)
+    residual = barrier(barrier(numerator - product) - error)
+    quotient = barrier(quotient + barrier(residual / denominator))
+    product = barrier(quotient * denominator)
+    error = product_error(quotient, denominator, product)
+    difference = barrier(numerator - product)
+    high = barrier(difference - error)
+    recovered = barrier(high - difference)
+    low = barrier(barrier(difference - barrier(high - recovered)) - barrier(error + recovered))
+    above, below = jnp.nextafter(quotient, jnp.inf), jnp.nextafter(quotient, -jnp.inf)
+    upper = barrier(barrier((above - quotient) * 0.5) * denominator)
+    lower = barrier(barrier((quotient - below) * 0.5) * denominator)
+    odd = (jax.lax.bitcast_convert_type(quotient, jnp.uint32) & 1) != 0
+    up = (high > upper) | ((high == upper) & ((low > 0) | ((low == 0) & odd)))
+    down = (high < -lower) | ((high == -lower) & ((low < 0) | ((low == 0) & odd)))
+    return jnp.where(up, above, jnp.where(down, below, quotient))
+
+
+def nvfp4_input_qdq(x: jax.Array, spec: NVFP4Input) -> jax.Array:
+    """CT 0.17.1's local input QDQ with Qwix's E2M1 QArray representation.
+
+    A local amax/6 is computed in the input dtype, multiplied by the stored
+    fp32 inverse global scale, and rounded to E4M3 only when declared. CT
+    replaces zero scales by that scale dtype's eps, divides by the global
+    scale in fp32, then QDQs the fp32 quotient and returns the input dtype.
+    Qwix's automatic NVFP4 calibration has no checkpoint global scale and
+    always rounds local scales; quantize_with_scale_zero_point takes CT's
+    effective scales instead. The original Dense/dot retains its precision
+    policy and the backward uses the same straight-through estimator as
+    Dew's other fake quantizers.
+    """
+    from dew.nn.fake_quant import straight_through
+    from dew.nn.precision import rounded_operand
+
+    qarray = _qwix("qwix._src.core.qarray")
+    if x.shape[-1] % 16:
+        raise ValueError(f"NVFP4 input width must be divisible by 16, got {x.shape}")
+    values = jax.lax.stop_gradient(x)
+    groups = values.reshape(*x.shape[:-1], -1, 16)
+    largest = jnp.max(jnp.abs(groups), -1)
+    # CT divides before the global multiplication; broadcasting inside the
+    # barrier prevents XLA replacing a constant divisor by its reciprocal.
+    divisor = jax.lax.optimization_barrier(jnp.full(largest.shape, 6, jnp.float32))
+    scale = jnp.asarray(
+        rounded_operand(_nvfp4_divide(largest.astype(jnp.float32), divisor), x.dtype), jnp.float32)
+    overall = jax.lax.optimization_barrier(jnp.full(scale.shape, spec.global_scale, jnp.float32))
+    scale = jax.lax.optimization_barrier(scale * overall)
+    if spec.e4m3_scale:
+        scale = jax.lax.optimization_barrier(jnp.clip(scale, 0, 448).astype(jnp.float8_e4m3fn)).astype(
+            jnp.float32)
+    eps = jnp.finfo(jnp.float8_e4m3fn if spec.e4m3_scale else jnp.float32).eps
+    scale = jax.lax.optimization_barrier(jnp.where(scale == 0, jnp.asarray(eps, jnp.float32), scale))
+    scale = jax.lax.optimization_barrier(_nvfp4_divide(scale, overall))
+    # Qwix divides by generic-broadcast scales. XLA can turn that broadcast
+    # into a reciprocal multiply, which crosses E2M1 ties for bf16 inputs.
+    expanded = jax.lax.optimization_barrier(jnp.broadcast_to(scale[..., None], groups.shape)).reshape(x.shape)
+    quotients = _nvfp4_divide(values.astype(jnp.float32), expanded)
+    quantized = qarray.quantize_with_scale_zero_point(quotients, 'nvfp4', jnp.ones_like(expanded), None)
+    # A convert pair may otherwise disappear under GPU excess precision.
+    quantized = quantized.replace(qvalue=jax.lax.optimization_barrier(quantized.qvalue), scale=expanded)
+    rounded = qarray.dequantize(quantized)
+    # CT adds its symmetric zero point before casting, so exact -0 is +0.
+    rounded = jnp.where(values == 0, jnp.zeros_like(rounded), rounded)
+    return straight_through(x, rounded)
+
+
+def checkpoint_input_quantization(model: nn.Module, inputs: Mapping[str, NVFP4Input]) -> nn.Module:
+    """Wrap the checkpoint's Linear scopes through the existing Qwix provider path.
+
+    The weights already hold the source reader's decoded values. Input QDQ
+    happens before the existing dot, so dtype, accumulation precision and
+    Dense's bias placement stay where the model defines them.
+    """
+    qwix = _qwix()
+    by_pattern = {re.escape(path): spec for path, spec in inputs.items()}
+
+    class CheckpointInputs(qwix.QtProvider):
+        def dot_general(self, lhs, rhs, dimension_numbers, precision=None,
+                        preferred_element_type=None, *, out_sharding=None):
+            rule, _ = self._get_current_rule_and_op_id('dot_general', only_rule=True)
+            if rule is not None:
+                if dimension_numbers[0][0] != (lhs.ndim - 1,):
+                    raise ValueError("checkpoint NVFP4 input QDQ requires the Linear's trailing input axis")
+                lhs = nvfp4_input_qdq(lhs, by_pattern[rule.module_path])
+            return jax.lax.dot_general(lhs, rhs, dimension_numbers, precision=precision,
+                                       preferred_element_type=preferred_element_type,
+                                       out_sharding=out_sharding)
+
+    rules = [qwix.QtRule(module_path=pattern, op_names=('dot_general',)) for pattern in by_pattern]
+    return qwix.quantize_model(model, CheckpointInputs(rules),
+                               methods=tuple(method for method in METHODS if hasattr(model, method)))
 
 
 def _qtype(dtype: QuantizedDtype) -> jax.typing.DTypeLike:
