@@ -43,7 +43,7 @@ export class GatewayLab extends DurableObject<Env> {
 		}
 	}
 
-	private decode(result: { exitCode: number; stdout: Uint8Array; stderr: Uint8Array }) {
+	private decode(result: ExecOutput) {
 		return { exitCode: result.exitCode, stdout: new TextDecoder().decode(result.stdout),
 			stderr: new TextDecoder().decode(result.stderr) };
 	}
