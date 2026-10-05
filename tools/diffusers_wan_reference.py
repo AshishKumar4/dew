@@ -34,6 +34,7 @@ Run with the Dew test environment's diffusers 0.34.0 and torch, on CPU:
 from __future__ import annotations
 
 import contextlib
+import copy
 import json
 import sys
 from dataclasses import dataclass, field
@@ -352,31 +353,42 @@ def scheduler_replay() -> dict[str, np.ndarray]:
     return arrays
 
 
-def pipeline(destination: str) -> None:
+def encoded_and_walked(pipe, latents: torch.Tensor, suffix: str = "") -> dict[str, np.ndarray]:
     """The prompt states each prompt (and the empty negative) encodes to, and
-    the unmodified call's walk from fixed latents at `STEPS` steps, guided at
+    the unmodified call's walk from `latents` at `STEPS` steps, guided at
     its default scale: the latent it ends on and the frames it decodes."""
-    root = output_root(destination)
-    pipe = build_pipeline(root)
-    generator = torch.Generator().manual_seed(SEED + 9)
-    shape = (len(PROMPTS), PIPELINE_VAE["z_dim"], (FRAMES - 1) // 4 + 1, HEIGHT // 8, WIDTH // 8)
-    latents = torch.randn(shape, generator=generator)
-    arrays: dict[str, np.ndarray] = {"x_T": latents.numpy()}
+    arrays: dict[str, np.ndarray] = {}
     for row, prompt in enumerate([*PROMPTS, ""]):
         with torch.no_grad():
             # `encode_prompt` defaults to 226 tokens; the call passes its own 512.
             states, _ = pipe.encode_prompt(prompt, do_classifier_free_guidance=False, max_sequence_length=512,
                                            device=torch.device("cpu"))
-        arrays[f"context.{row}"] = states[0].numpy()
+        arrays[f"context{suffix}.{row}"] = states[0].numpy()
     for row, prompt in enumerate(PROMPTS):
         call = {"prompt": prompt, "height": HEIGHT, "width": WIDTH, "num_frames": FRAMES,
                 "num_inference_steps": STEPS, "guidance_scale": GUIDANCE}
         with torch.no_grad():
             walked = pipe(**call, latents=latents[row:row + 1].clone(), output_type="latent").frames
             frames = pipe(**call, latents=latents[row:row + 1].clone(), output_type="np").frames
-        arrays[f"latents.{row}"] = walked[0].numpy()
-        arrays[f"frames.{row}"] = frames[0]
-        print(f"pipeline {prompt!r}: latents {tuple(walked.shape)} frames {frames.shape}")
+        arrays[f"latents{suffix}.{row}"] = walked[0].numpy()
+        arrays[f"frames{suffix}.{row}"] = frames[0]
+        print(f"pipeline{suffix} {prompt!r}: latents {tuple(walked.shape)} frames {frames.shape}")
+    return arrays
+
+
+def pipeline(destination: str) -> None:
+    """`encoded_and_walked` as the pipeline runs, in float32, and its truth,
+    the whole pipeline in float64 (`float64`: the Wan modules' float32 pins,
+    the call's float32 latents and the UniPC tables widened with it), under
+    `_f64` names."""
+    root = output_root(destination)
+    pipe = build_pipeline(root)
+    generator = torch.Generator().manual_seed(SEED + 9)
+    shape = (len(PROMPTS), PIPELINE_VAE["z_dim"], (FRAMES - 1) // 4 + 1, HEIGHT // 8, WIDTH // 8)
+    latents = torch.randn(shape, generator=generator)
+    arrays: dict[str, np.ndarray] = {"x_T": latents.numpy(), **encoded_and_walked(pipe, latents)}
+    with float64():
+        arrays.update(encoded_and_walked(copy.deepcopy(pipe).to(torch.float64), latents.double(), "_f64"))
     arrays.update(scheduler_replay())
     record = {"diffusers": DIFFUSERS, "torch": torch.__version__, "seed": SEED, "transformer": PIPELINE,
               "vae": PIPELINE_VAE, "prompts": PROMPTS, "frames": FRAMES, "height": HEIGHT, "width": WIDTH,
