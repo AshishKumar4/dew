@@ -37,7 +37,8 @@ import ml_dtypes
 import numpy as np
 import pytest
 from flax.traverse_util import flatten_dict, unflatten_dict
-from reference_error import FACTOR, assert_as_exact_as_the_reference, distance
+from reference_error import FACTOR, assert_as_exact_as_the_reference, assert_as_exact_over_orders, distance
+from residual_orders import permuted
 
 from dew.interop import Pretrained
 from dew.interop.hf_decoders import _wrapper_sources, families, translate_config, translate_wrapper_config
@@ -474,7 +475,15 @@ def test_the_candidate_pool_decides_the_logits(source):
 def test_the_update_exports_and_decodes_as_the_reference(source, tmp_path):
     """Loss, one SGD step with every gradient (the indexer's are zero, as the
     reference's selection passes none), the source-layout export read back
-    bit for bit, and greedy decoding after the fixture's prompt."""
+    bit for bit, and greedy decoding after the fixture's prompt.
+
+    Updated logits concentrate the step's rounding in a few directions.
+    They use the K-order rule over 52 residual orders, whose reference
+    distances and float64 invariance tools/deepseek_v41_reference.py's
+    orders mode records. Each order moves every mHC stream's units and
+    Engram's projected keys and values with the residual. The same
+    float64-decided selections apply to the whole step in each order.
+    """
     loaded, plain, reference = source
     ids = jnp.asarray(reference["input_ids"])
     (value, gradient), (twin_value, _), _ = decided(
@@ -494,10 +503,19 @@ def test_the_update_exports_and_decodes_as_the_reference(source, tmp_path):
     assert held.keys() == again.keys()
     for name, leaf in again.items():
         np.testing.assert_array_equal(np.asarray(leaf), np.asarray(held[name]), err_msg=name)
-    # The float64 twin of this forward starts from the fp32 step, which the
-    # truth does not take, so only its decisions count here.
-    close(decided(lambda model, variables: forward(model, variables, ids), unquantized(restored.model),
-                  restored.variables)[0], reference, "updated_logits")
+    with np.load(TINY / "orders.npz") as drawn:
+        orders, theirs = drawn["orders"], drawn["updated_logits"]
+
+    def ordered_updates(model, variables):
+        update = jax.jit(lambda held: updated(model, held, ids, reference["learning_rate"])[1])
+        return [np.asarray(update(permuted(variables, order))) for order in orders]
+
+    logits, twins, _ = decided(ordered_updates, plain, loaded.variables)
+    for twin in twins:
+        twin_close(twin, "updated_logits")
+    assert_as_exact_over_orders([distance(got, TRUTH["updated_logits"]) for got in logits],
+                                theirs, "updated_logits")
+    np.testing.assert_array_equal(logits[0].argmax(-1), reference["updated_logits"].argmax(-1))
     prompt = int(reference["decode_prompt"])
     generated = generate(plain, loaded.variables, ModelInputs(ids[:, :prompt]),
                          reference["generated"].shape[1], key=jax.random.key(1),
