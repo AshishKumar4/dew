@@ -226,8 +226,10 @@ def _product_pair(left, right):
 def _projected_components(direction, output):
     """Diffusers projects in float64 and rounds the parallel and orthogonal
     components separately. Two-float products, sums and a corrected quotient
-    reproduce that projection in the device's own arithmetic. A plain fp32
-    projection loses the small orthogonal component to cancellation."""
+    keep the small orthogonal component through cancellation. The projected
+    Euler walk matches its float64-projection twin bitwise over 52 spatial
+    orders on CPU (default, AVX and SDE-ICX). Raw predictions meet the
+    reference-error rule on an RTX 4080. TPU arithmetic has not been measured."""
     dtype = jnp.result_type(direction, output, jnp.float32)
     vector, conditioned = direction.astype(dtype), output.astype(dtype)
     axes = tuple(range(1, output.ndim))
