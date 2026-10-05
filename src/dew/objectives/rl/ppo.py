@@ -137,7 +137,7 @@ class PPOObjective(Objective[Ratio, Variables]):
         return joined({"policy": self.actor.init(key, variables), "critic": critic})
 
     def policy(self, variables: Variables) -> EpisodeInference:
-        """Return the actor's episode inference task, whose `bind` uses only the `policy` subtree of a tree."""
+        """Return the actor's episode inference task, whose `bind` reads only a tree's `policy` subtree."""
         return _Policy(self.actor.policy(part(variables, "policy")))
 
     def inference_record(self) -> JSON:
