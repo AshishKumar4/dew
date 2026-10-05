@@ -400,12 +400,12 @@ def write_file(
 
 def save_hf_layout(params, config: Mapping[str, object], directory,
                    max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
-    """Write the weights (`save_sharded`) and config.json into `directory`.
+    """Write the weights and config.json into `directory`, the layout a Hugging Face style loader reads.
 
-    That is what a Hugging Face style loader looks for. `params` is a flat
-    table of named tensors, or a tree whose '/'-joined paths name them. The
-    config is written as given. Dew does not translate its own config
-    vocabulary into anyone else's.
+    `save_sharded` writes the weights, as one file or as shards of at most
+    `max_shard_size`. `params` is a flat table of named tensors, or a tree
+    whose '/'-joined paths name them. The config is written as given; Dew
+    does not translate its own config vocabulary into anyone else's.
     """
     os.makedirs(directory, exist_ok=True)
     if not isinstance(params, LazyTensors):
