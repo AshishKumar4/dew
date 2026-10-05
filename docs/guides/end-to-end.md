@@ -94,7 +94,7 @@ The smoke run trains the committed tiny Qwen2 for two updates on the native back
 
 - perplexity through [`Evaluation.run`](evaluation.md), which is the trainer's validation call without the optimizer or the tracker;
 - an lm-evaluation-harness suite through `dew.eval.harness.DewLM`;
-- FID and CLIPScore of a diffusion run's samples against a directory of reference images;
+- CLIPScore of a diffusion run's samples against their prompts, and FID against a directory of reference images;
 - a greedy continuation.
 
 `--openai-base-url` and `--ollama-host` also send the same prompt to a served model through the adapters in `dew.inference.clients`. Both SDKs are optional extras. If one is not installed, the report says so and the script carries on.
