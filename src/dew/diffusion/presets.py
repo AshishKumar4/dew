@@ -312,7 +312,10 @@ class JiT:
 @presets("sqrt")
 @dataclass(frozen=True)
 class Sqrt:
-    """The square-root schedule with the plain x_0 loss, from Diffusion-LM (Li et al. 2022)."""
+    """The square-root schedule with the plain x_0 loss, from Diffusion-LM.
+
+    Diffusion-LM is Li et al. 2022.
+    """
 
     min_snr_gamma: float | None = None
 

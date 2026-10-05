@@ -151,13 +151,13 @@ class FlowMatchPredictionTransform(PredictionTransform):
 
 
 class KarrasPredictionTransform(PredictionTransform):
-    """The EDM preconditioning of Karras et al. 2022, Table 1.
+    """The EDM preconditioning of the model's input and output.
 
-    The model's input is c_in x_t, and its raw output F gives
-    x_0 = c_skip x_t + c_out F. The loss compares that x_0 with the clean
-    sample, so the target is x_0, and a weight defined on the x_0 loss, such
-    as min-SNR's, applies without conversion. EDM's lambda = 1 / c_out^2 is
-    the schedule's own weight on this loss.
+    This is Table 1 of Karras et al. 2022. The model's input is c_in x_t,
+    and its raw output F gives x_0 = c_skip x_t + c_out F. The loss compares
+    that x_0 with the clean sample, so the target is x_0, and a weight
+    defined on the x_0 loss, such as min-SNR's, applies without conversion.
+    EDM's lambda = 1 / c_out^2 is the schedule's own weight on this loss.
 
     `velocity` matches Diffusers 0.34.0's EDM
     `prediction_type="v_prediction"`. Its `precondition_outputs` negates
@@ -300,12 +300,13 @@ class ScheduleWeighting:
 
 @dataclass(frozen=True)
 class MinSNR:
-    """Weights the loss with min-SNR-gamma (Hang et al. 2023).
+    """Weights the loss with min-SNR-gamma.
 
-    The weight is min(SNR, gamma) on the x_0 loss, converted into the space
-    the model trains in, and it replaces the schedule's own weight. At zero
-    SNR (a table whose last step keeps no signal) the epsilon conversion is
-    0 / 0, so the weight there is one, as the authors' code sets it.
+    min-SNR-gamma is from Hang et al. 2023. The weight is min(SNR, gamma) on
+    the x_0 loss, converted into the space the model trains in, and it
+    replaces the schedule's own weight. At zero SNR (a table whose last step
+    keeps no signal) the epsilon conversion is 0 / 0, so the weight there is
+    one, as the authors' code sets it.
     """
 
     gamma: float

@@ -169,10 +169,9 @@ class FlowGrid(_UniformGrid):
 
     The source's forward process is x_t = (1 - sigma) x_0 + sigma eps, so
     signal and noise sum to one; in a normalized VP pair, their squares do.
-    Model times are the sigmas times the training step count,
-    which is where the source's `timesteps` come from. The prior at sigma 1
-    is the unit Gaussian. Training draws times uniformly with a constant
-    loss weight.
+    Model times are the sigmas times the training step count, which is where
+    the source's `timesteps` come from. The prior at sigma 1 is the unit
+    Gaussian. Training draws times uniformly with a constant loss weight.
     """
 
     def rates(self, t):

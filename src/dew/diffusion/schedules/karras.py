@@ -7,9 +7,9 @@ from .common import GeneralizedNoiseScheduler
 
 
 class KarrasVENoiseScheduler(GeneralizedNoiseScheduler):
-    """Places sigmas along t with the rho spacing of Karras et al. 2022 (Eq. 5).
+    """Places sigmas along t with the rho spacing of the EDM paper.
 
-    The sigmas are
+    The spacing is Eq. 5 of Karras et al. 2022,
     sigma(t) = (sigma_max^(1/rho) + (1 - t) (sigma_min^(1/rho) - sigma_max^(1/rho)))^rho,
     so a uniform grid in t is the paper's sampling grid in sigma.
     """
