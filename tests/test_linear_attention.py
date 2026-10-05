@@ -478,3 +478,28 @@ def test_the_decode_kernel_steps_as_the_recurrence_does(rows):
     got, got_state = jax.jit(decode_gated_delta_rule)(query, key, value, g, beta, state)
     np.testing.assert_allclose(got, want, atol=2e-6)
     np.testing.assert_allclose(got_state, want_state, atol=2e-6)
+
+
+@pytest.mark.skipif(jax.default_backend() != "gpu", reason="the kernel runs on CUDA")
+def test_the_decode_kernel_leaves_an_idle_row_alone():
+    """A serving step holds every slot, drawing or not. A row the step marks
+    idle keeps its state bit for bit, unread and unwritten, and outputs
+    zeros; the drawing rows step exactly as they do with every row active."""
+    from dew.nn.linear import decode_gated_delta_rule
+
+    rng = np.random.default_rng(1)
+    rows, H, D = 8, 16, 128
+    unit = [rng.normal(size=(rows, 1, H, D)) for _ in range(2)]
+    query, key = (jnp.asarray(x / np.linalg.norm(x, axis=-1, keepdims=True), jnp.float32) for x in unit)
+    value = jnp.asarray(rng.normal(size=(rows, 1, H, D)), jnp.float32)
+    g = jnp.asarray(-rng.random((rows, 1, H)) * 3, jnp.float32)
+    beta = jnp.asarray(rng.random((rows, 1, H)), jnp.float32)
+    state = jnp.asarray(rng.normal(size=(rows, H, D, D)) * 0.1, jnp.float32)
+    active = jnp.asarray([True, False, True, True, False, False, True, False])
+    every, every_state = jax.jit(decode_gated_delta_rule)(query, key, value, g, beta, state)
+    got, got_state = jax.jit(decode_gated_delta_rule)(query, key, value, g, beta, state, active)
+    drawing = np.asarray(active)
+    np.testing.assert_array_equal(np.asarray(got)[drawing], np.asarray(every)[drawing])
+    np.testing.assert_array_equal(np.asarray(got_state)[drawing], np.asarray(every_state)[drawing])
+    np.testing.assert_array_equal(np.asarray(got)[~drawing], 0)
+    np.testing.assert_array_equal(np.asarray(got_state)[~drawing], np.asarray(state)[~drawing])
