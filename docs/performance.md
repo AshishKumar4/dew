@@ -1150,10 +1150,10 @@ adopt.
 
 ## Serving against vLLM, 2026-10-03
 
-`tools/benchmark_lm_serving.py` serves Qwen3-0.6B in bf16 on the RTX 4080.
-Requests have 256-token prompts and 128 greedy output tokens, with twice
-as many requests as slots. The table reports output tokens a second over
-three repeats, with two Dew processes a side and vLLM 0.30.0 on
+I served Qwen3-0.6B in bf16 on the RTX 4080 with
+`tools/benchmark_lm_serving.py`: 256-token prompts, 128 greedy output
+tokens, and twice as many requests as slots. The table gives output tokens a
+second over three repeats, with two Dew processes a side; vLLM 0.30.0 ran on
 2026-10-01:
 
 | slots | vLLM | Dew `1f8d5e72` | Dew, wide cache writes gathered |
@@ -1162,12 +1162,12 @@ three repeats, with two Dew processes a side and vLLM 0.30.0 on
 | 64 | 7614-7618 | 6869-6879 | 7171-7204 |
 | 128 | 9037-9050 | 7758-7773 | 8230-8289 |
 
-Later the same day, the benchmark alternated Dew at `88620c1d` and vLLM
-0.30.0 in one session, with two processes each. That Dew revision uses
-cuDNN prefill attention, stores the head's bf16 logits as bf16, and writes
-caches as words; these changes are described below. The table gives the
-range over every repeat. Another lane kept the host's load average near
-50 during the session:
+Later the same day I ran the same benchmark with Dew at `88620c1d` and vLLM
+0.30.0 in one session, alternating, two processes each. That Dew revision
+has the prefill's cuDNN attention, keeps the head's bf16 logits as bf16 and
+writes the cache as words (all described below). The table gives the range
+over every repeat. Another lane held the host's load average near 50
+throughout:
 
 | slots | vLLM | Dew `88620c1d` | Dew / vLLM, medians |
 |---:|---:|---:|---:|
@@ -1175,50 +1175,49 @@ range over every repeat. Another lane kept the host's load average near
 | 64 | 7532-7563 | 7540-7619 | 1.01 |
 | 128 | 8949-9049 | 8957-8985 | 1.00 |
 
-Dew is level with vLLM at 64 and 128 slots and 4% behind at 32, where a
-step is shortest and the host accounts for the largest share. Each process runs
+Dew is level with vLLM at 64 and 128 slots and 4% behind at 32, where a step
+is shortest and the host's share of it is largest. Each process is
 `tools/benchmark_lm_serving.py --backend dew` (or `vllm-engine`, with
 `VLLM_ENABLE_V1_MULTIPROCESSING=0`) `--slots 32,64,128 --repeats 3` over the
-Qwen3-0.6B checkpoint. Its JSON records each repeat's `output_tokens_per_second`.
+Qwen3-0.6B checkpoint, and its JSON holds each repeat's
+`output_tokens_per_second`.
 
-At 64 slots, a Dew decode step takes 6.96 ms on the device. Attention
-uses 4.0 ms, limited by reading the dense cache's keys and values
-(2.8 GB a step at 716 GB/s). Projections and the head use 2.1 ms, near
-the weight-reading limit. Each of the 16 admission steps prefilled
-8 prompts alongside the other rows' decode and took 40 ms. Prefill key
-and value writes accounted for 8 of those ms. XLA makes slots the minor
-dimension in the fresh prefill cache, to suit attention reads. Scattering
-whole tokens into that layout achieved 28 GB/s.
+At 64 slots a Dew decode step takes 6.96 ms on the device. Attention takes
+4.0 ms, at the bound of reading the dense cache's keys and values (2.8 GB a
+step at 716 GB/s), and the projections and head take 2.1 ms, near the bound
+of reading the weights. Each of the 16 admission steps, which prefill 8
+prompts next to the other rows' decode, took 40 ms, and 8 ms of that was the
+prefill's key and value writes. XLA lays the prefill's fresh cache out with
+its slots minor, to suit the attention that reads it, and scattering whole
+tokens into that layout ran at 28 GB/s. So a write as wide as its buffer now
+gathers each slot's token (`dew.nn.kv_cache.write_cache`). The output is
+bit-identical; tokens and both log-probability streams match at every slot
+count.
 
-A write as wide as its buffer now gathers each slot's token
-(`dew.nn.kv_cache.write_cache`). The bits stay the same: tokens and both
-log-probability streams are identical at every slot count.
+A decode step's attention reads each key head once for its group of query
+heads, by passing the group in as that head's query positions. Without that,
+cuDNN padded the lone query to two positions and ran each query head on its
+own. The kernel timings show the gain. At 64 rows over 384 slots it takes
+0.146 against 0.154 ms a layer, and 0.072 against 0.129 when every row has
+257 keys, with the same bits.
 
-Decode attention reads each key head once for its group of query heads,
-using the group as that head's query positions. Without this grouping,
-cuDNN padded the lone query to two positions and ran each query head
-separately. At 64 rows over 384 slots, the kernel takes 0.146 against
-0.154 ms a layer. With 257 keys in every row, it takes 0.072 against
-0.129, with identical bits.
-
-Serving at integration `17e2b226` agrees with this result, but its
-differences fall within the loaded host's spread. Medians over 15 runs
-change from 5489-5510 to 5521-5619 tokens a second at 32 slots, from
-7175 to 7215 at 64, and from 8219 to 8343 at 128. Both versions had
-slow runs, the slowest at 5196 and 4685 with 32 slots. Tokens and
+Serving at integration `17e2b226` is consistent with that but shows no more,
+because the host was loaded and the differences are inside its spread.
+Medians of 15 runs went from 5489-5510 to 5521-5619 tokens a second at 32
+slots, from 7175 to 7215 at 64, and from 8219 to 8343 at 128. Both sides had
+slow runs (the slowest 5196 and 4685 at 32 slots), and the tokens and
 log-probabilities are identical.
 
 ### The remaining gap, 2026-10-03
 
-At 64 slots, Dew serves 7146 and 7197 tokens a second (medians of five
-runs, two processes, integration `6a220e31`) against vLLM 0.30.0's
-7596-7609 in-process (three runs, one process). Their schedules are similar.
-Dew runs 265 model steps per run; vLLM runs 267 scheduler steps, counted
-in its engine process. Each admits up to 8 prompts a step alongside
-the other rows' decode. The throughput gap comes from step time: 8.6 ms
-wall time for Dew against 8.0 for vLLM. These traces cover whole measured
-runs, using XProf for Dew at `f6047cf9` and Nsight with CUDA graph nodes
-for vLLM:
+At 64 slots Dew serves 7146 and 7197 tokens a second (medians of five runs,
+two processes, integration `6a220e31`) against vLLM 0.30.0's 7596-7609
+in-process (three runs, one process). The two schedule alike. Dew runs 265
+model steps a run and vLLM 267 (its scheduler's steps, counted in its engine
+process), and each admits up to 8 prompts a step next to the other rows'
+decode. So the gap is per step, 8.6 ms of wall time for Dew against 8.0 for
+vLLM. I traced whole measured runs, Dew under XProf (`f6047cf9`) and vLLM
+under Nsight with its CUDA graphs' nodes:
 
 | | Dew | vLLM, 249 of 267 steps traced |
 |---|---:|---:|
@@ -1227,54 +1226,55 @@ for vLLM:
 | everything else | 313 ms | 154 ms |
 | device busy | 2.22 s of 2.29 | 2.00 s of 2.18 |
 
-Nsight warned that it missed CUDA events. Its trace contains 249 of the
-267 steps, so vLLM's rows undercount by about 7%. Scaled to the whole
-run, vLLM's attention time matches Dew's and its GEMMs take 80 ms longer.
-Dew spends the extra device time on many small kernels, each one to
-three microseconds. The residual add, split-K GEMM sum and cast total
-52.5 ms in 22859 launches; norms total 80.7 ms in 32201. Cache writes
-take 61.0 ms and attention transposes take 48.8 ms. vLLM fuses an add
-into RMSNorm and writes K and V in one kernel. Dew's 2.29 s run also
-includes 70 ms without a kernel running.
+Nsight warned that it had not collected every CUDA event, and its trace
+holds 249 of the run's 267 steps, so vLLM's rows are low by about 7%. Scaled
+to the whole run, vLLM's attention matches Dew's and its GEMMs are 80 ms
+slower. Dew's extra device time is in many small kernels of one to three
+microseconds each: the residual add with the split-K GEMM's sum and its cast
+(52.5 ms in 22859 launches), the norms (80.7 ms in 32201), the cache writes
+(61.0 ms) and the transposes around attention (48.8 ms). vLLM fuses an add
+into its RMSNorm and writes K and V in one kernel. Dew's 2.29 s run also has
+70 ms with no kernel running.
 
-These options were measured. None was adopted; any gain was under 1% of the run:
+I measured these and did not adopt them, because each gains under 1% of the
+run:
 
-- Writing K and V with one Pallas kernel per layer takes 0.141 ms a
-  decode step for all 28 layers, against 0.166 for XLA's two scatters.
-  The results are bitwise identical.
-- XLA's command buffers are on by default and replay cuDNN attention in
-  the decode step. Enabling every command type with no minimum graph size
-  stays within the default's spread. Disabling them is slower. Tokens are
-  identical in all three cases.
-- JAX's Pallas split-KV decode attention (`gqa`) takes 0.43 ms a layer,
-  including transposing Dew's cache, against cuDNN's 0.165. On a head-major
-  cache, its best tiles take 0.155 ms, with different bits from cuDNN.
+- K and V written by one Pallas kernel a layer, in place of XLA's two
+  scatters: 0.141 against 0.166 ms a decode step for all 28 layers, bitwise
+  the same.
+- XLA's command buffers. They are on by default, and cuDNN's attention is
+  among the commands the decode step replays. Enabling every command type
+  with no minimum graph size measured within the default's spread, turning
+  them off is slower, and the tokens are the same all three ways.
+- JAX's Pallas split-KV decode attention (`gqa`). It takes 0.43 ms a layer
+  on the cache as Dew stores it, which it has to transpose, against cuDNN's
+  0.165. On a head-major cache its kernel takes 0.155 ms at its best tiles,
+  with different bits from cuDNN's.
 - Triton multi-output fusion and a single split-K, one traced run each:
   device time 2222.2 and 2216.2 ms against 2222.3-2224.6.
-- Freeing a slot in the step that finishes it would take 263 steps
-  instead of 265, counted step by step. Currently the host frees it when
-  it reads the step's results.
+- Freeing a slot in the step that finishes it, where today the slot is freed
+  when the host reads that step's results. Counted step by step, the
+  schedule would take 263 steps in place of 265.
 
-The remaining gap comes from small kernels and idle time between steps.
-Fusing add and norm would save launches worth at most about 1.5% of the
-run. Rates come from `tools/benchmark_lm_serving.py`. Each trace covers
-one measured run: Dew under `dew.Profiler`, and vLLM under Nsight Systems
-with `--cuda-graph-trace=node`. Kernel times are summed by family.
+What remains is the small kernels that vLLM fuses, worth at most about 1.5%
+of the run by the launches a fused add and norm would save, and the idle
+time between steps. The rates come from `tools/benchmark_lm_serving.py`. The
+traces are one measured run each, Dew's under `dew.Profiler` and vLLM's
+under Nsight Systems with `--cuda-graph-trace=node`, with kernel time summed
+by family.
 
 The idle between steps, 2026-10-03. Two host costs left the device waiting.
-At submission, making a request's key took three small programs: move
-the seed to the device, make the key, and fold it. These ran between
-steps after the device had finished its queued work. Admission also uses
-fresh input buffers on every call, requiring XLA to update its CUDA
-command buffer before replay. This took about 5 ms before 9 of the
-run's 16 admission steps.
-
-An integer seed now stays on the host until one admission program makes
-and folds every row's key (`_row_keys`, bitwise equal to an eager key).
-The admission step compiles without command buffers (`ADMISSION_OPTIONS`),
-while decoding keeps them. The benchmark submits integer seeds, as clients
-do. This table compares the change with its parent on the RTX 4080:
-tokens a second, three alternating rounds, medians of five runs.
+At submission, making a request's key took three small programs (move the
+seed to the device, make a key, fold it), and they ran between steps after
+the device had drained. And the admitting step's inputs are fresh buffers on
+every call, so XLA updated its CUDA command buffer before it could replay,
+which took about 5 ms before 9 of a run's 16 admitting steps. Now an integer
+seed stays on the host until the admission's one key program makes and folds
+every row's key (`_row_keys`, the same bits as an eager key), and the
+admitting step compiles without command buffers (`ADMISSION_OPTIONS`); the
+decoding step keeps them. The benchmark submits integer seeds, as a client
+sends them. On the RTX 4080, the change against its parent, three
+alternating rounds, medians of five runs, in tokens a second:
 
 | slots | before | after |
 |---:|---:|---:|
@@ -1282,28 +1282,27 @@ tokens a second, three alternating rounds, medians of five runs.
 | 64 | 7131 / 7229 / 7222 | 7360 / 7359 / 7357 |
 | 128 | 8329 / 8355 / 8346 | 8527 / 8528 / 8524 |
 
-One process was slow in all five 32-slot runs (3846-4054), while its
-64- and 128-slot runs matched the others. Four more alternating rounds
-at 32 slots gave 5729-5730 after against 5564-5669 before. An earlier
-session on a loaded host gave the same ordering at every slot count.
-Tokens and both log-probability streams are identical in every run.
+One process ran all five of its 32-slot runs slow (3846-4054) and its 64-
+and 128-slot runs at the others' rate. Four more alternating rounds at 32
+slots gave 5729-5730 after against 5564-5669 before, and an earlier session
+on a loaded host gave the same order at every slot count. The tokens and
+both log-probability streams are the same in every run.
 
-Admission already compiled separately from decoding because the step's jit
-traced each separately. Cold startup is therefore unchanged. Without a
-compilation cache, `Server.from_task` to the first token took 34.9 and
-35.5 s before, against 38.7 and 35.2 after, in two alternating rounds.
-A traced 64-slot run idles 74.7-83.2 ms before and 40.9-42.1 after. Of
-five traces, one took 76.0 and one 838 during a host load spike. Most
-remaining idle time comes from the traced client's own keys. Each trace
-covers one measured 64-slot run of the benchmark's prompts under
-`dew.Profiler`, summing idle time between kernels.
+The admitting step was already compiled on its own before (the step's jit
+traced it separately from the decoding step), so a cold server's start is
+unchanged. From `Server.from_task` to the first token, with no compilation
+cache and two alternating rounds, it took 34.9 and 35.5 s before and 38.7
+and 35.2 after. A traced 64-slot run idles 74.7-83.2 ms before and 40.9-42.1
+after (one of five traces read 76.0, and one 838 during a host load spike).
+Most of what is left is the traced client's own keys. Each trace is one
+measured 64-slot run of the benchmark's prompts under `dew.Profiler`, with
+idle time summed between kernels.
 
-Several decode iterations per device call (`decode_steps`), measured after
-that change, 2026-10-03. More iterations slow the run at every slot count
-except 64 slots with two iterations, which reaches 7271 tokens a second
-against 7216 with one. The table gives tokens a second on the RTX 4080,
-with admission 8 rows and medians of five runs. vLLM rates come from
-the table above:
+Several decode iterations a device call (`decode_steps`), measured after
+that change, 2026-10-03. More iterations are slower at every slot count
+except 64 slots, where two iterations read 7271 tokens a second against 7216
+for one. Tokens a second on the RTX 4080, admission 8 rows, medians of five
+runs, with vLLM from the table above:
 
 | slots | vLLM | 1 | 2 | 4 | 8 |
 |---:|---:|---:|---:|---:|---:|
@@ -1311,33 +1310,31 @@ the table above:
 | 64 | 7614 | 7216 | 7271 | 6975 | 6573 |
 | 128 | 9047 | 8527 | 8357 | 7861 | 7231 |
 
-A call admits requests only before its first iteration. Filling 64 slots
-at 8 rows a call takes 8 calls of k iterations; a run takes 265, 274,
-292 and 328 iterations. Admitting at every iteration could recover only
-the idle time. At one iteration a call, a traced 64-slot run keeps the
-device busy 2228 ms of 2242, with 20 ms idle (0.9%). Decoding already
-replays CUDA graphs, and the host runs ahead.
+There is little left for more iterations to gain. A call seats requests only
+before its first iteration, so filling 64 slots at 8 rows a call takes 8
+calls of k iterations, and a run takes 265, 274, 292 and 328 iterations.
+Seating at every iteration could at most win back the idle time, and a
+traced 64-slot run at one iteration a call keeps the device busy 2228 ms of
+2242, idle 20 ms (0.9%), because the decoding step already replays as CUDA
+graphs and the host runs ahead.
 
-Admitting 8k rows a call, the default, changes prefill shapes and GEMM
-kernels. Its tokens differ from a run with one iteration a call. At
-8 rows, tokens match at 32 and 64 slots, with log-probabilities within
-9.5e-6. At 128 slots, the longer program's decoding GEMMs autotune to
-different kernels. Each cell runs `tools/benchmark_lm_serving.py --decode-steps K --admission 8
---generations` and compares generations with K=1.
+Seating 8k rows a call (the default) changes the prefill's shapes and so its
+GEMM kernels, and the tokens differ from one iteration a call. At 8 rows
+they are the same at 32 and 64 slots (the log-probabilities within 9.5e-6),
+while at 128 slots the decoding GEMMs inside the longer program autotune to
+other kernels. Each cell is `tools/benchmark_lm_serving.py --decode-steps K
+--admission 8 --generations`, with its generations compared to K=1's.
 
-The decoding step's small kernels, 2026-10-03. At 64 slots on the RTX
-4080, Dew uses 8.39 ms of device time per decode step against vLLM's
-about 8.05. GEMMs take 3.37 against 3.64, attention 3.84 against 3.79,
-and everything else 1.18 against 0.62. The largest remaining kernel took
-136 us a step. It merged stored logits with the step's logits across
-every slot's vocabulary in fp32 so that a newly admitted row drew from
-its prompt logits.
-
-On a step without admission, the model computes logits for every drawing
-row. That step now uses the model's logits directly; only admission
-steps merge them. The table reports tokens a second over three
-alternating rounds, as medians of five runs. Tokens and both
-log-probability streams are identical in every run:
+The decoding step's small kernels, 2026-10-03. Per 64-slot decode step on
+the RTX 4080, Dew's device spends 8.39 ms to vLLM's about 8.05: GEMMs 3.37
+against 3.64, attention 3.84 against 3.79, and everything else 1.18 against
+0.62. The largest item in the rest was one kernel of 136 us a step. It
+merged the held logits with the step's over every slot's vocabulary in fp32,
+so that a row seated in this step drew from its prompt's logits. In a step
+that seats no row, every row that draws was fed through the model, so that
+step now takes the model's logits whole, and only a seating step merges.
+Tokens a second, three alternating rounds, medians of five runs, with the
+tokens and both log-probability streams the same in every run:
 
 | slots | before | after |
 |---:|---:|---:|
@@ -1345,137 +1342,133 @@ log-probability streams are identical in every run:
 | 64 | 7364 / 7363 / 7236 | 7410 / 6545 / 7407 |
 | 128 | 8543 / 8527 / 8461 | 8610 / 8559 / 8609 |
 
-One process on each side hit a load spike (3389 and 6545). Rounding
-the logits to bf16 now takes its own kernel, at 57 us a step. Omitting
-stored step logits would let XLA fuse rounding into the draw, saving
-another 27 us. However, the draw's log-softmax would sum in a different
-order: at 32 slots, 430 log-probabilities change by up to 3.8e-6. The
-step therefore still stores its logits.
+One process on each side ran during a load spike (3389 and 6545). The bf16
+rounding of the logits now runs as its own kernel, 57 us a step. If the step
+did not store its logits at all, XLA could fuse that rounding into the draw
+and save 27 us more, but the draw's log-softmax would then sum in another
+order. At 32 slots, 430 log-probabilities move by up to 3.8e-6, so the step
+still stores them. The attribution comes from a run traced under
+`dew.Profiler` with command buffers off (`--xla_gpu_enable_command_buffer=`)
+and the optimized HLO dumped, which names each kernel by its `hlo_op`.
 
-Attribution uses a run traced under `dew.Profiler` with command buffers
-off (`--xla_gpu_enable_command_buffer=`) and optimized HLO dumped. Each
-kernel is named by its `hlo_op` in that HLO.
+The head's bf16 rounding, 2026-10-03. The logits are bf16 values held in
+fp32 (`dew.nn.precision.head_product`), and the reduce-precision in
+`rounded_to` did not fuse into XLA's Triton head GEMM. So a serving step
+wrote the fp32 logits and read them back to round them, before the draw's
+three readers read them again (the well-formedness check, the argmax with
+the log-softmax maximum, and the sum of exponentials). The rounding was a
+kernel of its own, 157 to 178 us at 128 rows. Under CUDA the logits are now
+cast to bf16 behind a barrier (`bf16_logits`), so the cast fuses into the
+GEMM's epilogue and each reader widens the bf16 copy itself.
 
-The head's bf16 rounding, 2026-10-03. `dew.nn.precision.head_product` produces
-bf16 values stored in fp32. The reduce-precision operation in `rounded_to`
-did not fuse with XLA's Triton head GEMM. A serving step therefore wrote
-fp32 logits, read them back for rounding, then read them three more ways:
-the well-formedness check, argmax with the log-softmax maximum, and the
-sum of exponentials. Rounding alone took 157 to 178 us at 128 rows.
-
-On CUDA, `bf16_logits` now casts logits to bf16 behind a barrier. The
-cast fuses with the GEMM's epilogue, and each reader widens the bf16
-copy. Values and cotangents are bitwise equal to `rounded_to`'s
-(tests/test_precision_policy.py). Served tokens and log-probabilities are
-also bitwise equal at 32, 64 and 128 slots. At 128 rows with Qwen3-0.6B's
-widths, the head and greedy draw fell from 1.145 to 0.981 ms. Device
-busy time per serving run fell from 2211.0 to 2198.5 ms at 64 slots
-and from 3803.5 to 3768.7 ms at 128, with two traced runs each.
-
-Training's loss head rounds its own tiles (`dew.objectives.lm.chunked`);
-other platforms keep `rounded_to`. Bitwise checks use
+The values and cotangents are bitwise those of `rounded_to`
+(tests/test_precision_policy.py), and so are the served tokens and
+log-probabilities at 32, 64 and 128 slots. The head and greedy draw alone
+went from 1.145 to 0.981 ms at 128 rows of Qwen3-0.6B's widths, and the
+serving run's device busy time went from 2211.0 to 2198.5 ms at 64 slots and
+from 3803.5 to 3768.7 ms at 128 (two traced runs each). Training's loss head
+rounds its tiles itself (`dew.objectives.lm.chunked`), and other platforms
+keep `rounded_to`. The bits come from
 `tests/test_precision_policy.py::test_bf16_logits_round_as_rounded_to_and_are_held_as_bf16_under_cuda`
-and `tools/benchmark_lm_serving.py --generations` on each tree. Busy time
-comes from one traced run under `dew.Profiler`.
+and `tools/benchmark_lm_serving.py --generations` on each tree; the busy
+time is one traced run under `dew.Profiler`.
 
-A fused decode prologue, measured and removed. XLA uses five kernels per
-layer for q and k norms, rotated-key and value cache scatters, query
-rotation and GQA folding. Each takes one to three microseconds. A Pallas
-Triton kernel combined all five in one program per row. It reduced time
-over 28 layers at Qwen3-0.6B's widths from 0.191 to 0.097 ms, and served
-Qwen3-0.6B 2-3% faster. Tokens and log-probabilities stayed bitwise equal
-in every run: 5943 / 7587 / 8765 tokens a second at 32 / 64 / 128 slots,
-against vLLM's 6049 / 7614 / 9047.
+A fused decode prologue, measured and removed. XLA runs a layer's q and k
+norms, the rotated key's scatter into the cache, the value's scatter, and
+the query's rotation and GQA fold as five kernels of one to three
+microseconds each. A Pallas Triton kernel that did all five in one program a
+row took 28 layers at Qwen3-0.6B's widths from 0.191 to 0.097 ms. It served
+Qwen3-0.6B 2-3% faster, and the tokens and log-probabilities were bitwise
+the same in every run (5943 / 7587 / 8765 tokens a second at 32 / 64 / 128
+slots, against vLLM's 6049 / 7614 / 9047).
 
-Qwen3-1.7B has the same head widths, but its tokens differed from the
-unfused step's: 1349 of 8192 at 32 slots. Each version was repeatable.
-The first record here incorrectly described the unfused step as
-unrepeatable; that run had used the kernel on both sides. The norm caused
-the difference. Even with XLA's statistics from a standalone reduction,
-summing over a head's 128 lanes rounded one or two elements per head
-to the other bf16 neighbour. XLA's reduction order depends on the norm
-fusion, and rsqrt uses the hardware approximation. There was no fixed
-arithmetic for the Pallas kernel to match.
+On Qwen3-1.7B, whose heads have the same widths, the kernel's served tokens
+differed from the unfused step's (1349 of 8192 at 32 slots), and each side
+was repeatable. (A record here first read that as the unfused step being
+unrepeatable; that run had used the kernel on both sides.) The difference
+came from the norm. Its sum over a head's 128 lanes, even given XLA's own
+statistics from a standalone reduction, put one or two elements a head on
+the other bf16 neighbour of the unfused step's value. XLA's reduction order
+inside its norm fusion depends on the fusion, and its rsqrt is the
+hardware's approximation, so there was no fixed arithmetic for the kernel to
+match.
 
-Leaving norms in XLA's fusions and combining only rotation, cache writes
-and folding was bitwise equal on both models. It saved 3 of the 5
-kernels, reducing device busy time per 64-slot run from 2211 to 2186 ms.
-The Pallas call was outside default CUDA command buffers, so the decode
-step needed `CUSTOM_CALL` in its options or the run idled 200 ms longer.
-A gain under 1% did not justify a kernel on a backend JAX 0.11 deprecates.
-It was removed; the rotation-only kernel remains on `perf/prologue-bitwise`.
+A kernel that left the norms to XLA's own fusions and did only the rotation,
+both cache writes and the fold was bitwise on both models, but it saved only
+3 of the 5 kernels. The device's busy time per 64-slot run went from 2211 to
+2186 ms. The Pallas call also fell outside XLA's default CUDA command
+buffers, so the decoding step's options needed `CUSTOM_CALL`, or the run
+idled 200 ms more. Under 1% was not worth a kernel on a backend JAX 0.11
+deprecates, so I removed it; the rotation-only kernel stays on the
+`perf/prologue-bitwise` branch.
 
-The 128-slot gap and prefill attention, 2026-10-03. A traced run at
-integration `66a1848c` disabled command buffers to attribute each kernel to
-its program and HLO scope. Attention and GEMM times match vLLM: cuDNN
-decode attention takes 259 us a call against vLLM FA2's 266, and GEMMs
-take 4.68 against 4.74 ms a step. Small kernels account for the gap:
-1.26 ms per decode step against vLLM's 0.50, and 8.1 ms per admission
-across 32 admissions of 8 prompts.
+Where the gap sits at 128 slots, and the prefill's attention, 2026-10-03. I
+traced a 128-slot run at integration `66a1848c` with command buffers off, so
+each kernel is attributed to its program and HLO scope. Attention and GEMMs
+are at parity: cuDNN's decode attention took 259 us a call against vLLM
+FA2's 266, and the GEMMs 4.68 against 4.74 ms a step. The gap is the small
+kernels, 1.26 ms of them a decode step against vLLM's 0.50, and 8.1 ms an
+admission (32 admissions of 8 prompts).
 
-Prefill attention was the largest admission cost. Admission left-pads
-prompts and writes keys compactly, so cache prefill builds a cursor mask.
-`kernel_for_materialized_mask` sent it to xla because cuDNN's bias backward
-refuses odd lengths. This training rule caused two dense dots, a softmax
-and four mask transposes, costing 3.7 ms per admission.
+The largest admission item was the prefill's attention. Admission left-pads
+its prompts and writes their keys compactly, so the cache prefill builds the
+cursor mask. `kernel_for_materialized_mask`, a rule meant for training
+(cuDNN's bias backward refuses odd lengths), sent that mask to xla, which
+cost two dense dots, a softmax and four mask transposes, 3.7 ms an
+admission. A cache call over more than one query now gives the mask to cuDNN
+as its bias wherever cuDNN runs; training, single-token decode, CPU and the
+deterministic-ops CUDA lane are unchanged. Over 28 layers in isolation it
+takes 4.0 against 6.2 ms, and the device's busy time per run went from
+2212.6 to 2179.2 ms at 64 slots and from 3807.4 to 3745.1 ms at 128 (two
+traced runs each, the same in both).
 
-A cache call with more than one query now passes that mask as cuDNN
-bias where cuDNN runs. Training, single-token decode, CPU and the
-deterministic-ops CUDA lane are unchanged. Over 28 layers in isolation,
-the call takes 4.0 against 6.2 ms. Device busy time per run fell from
-2212.6 to 2179.2 ms at 64 slots and from 3807.4 to 3745.1 ms at 128.
-There were two traced runs each, with the same result in both.
+It is not bitwise, because cuDNN rounds at other points than xla's dots and
+softmax. I measured the error under tests/reference_error.py's rule, against
+the same bf16 weights computed in fp32 at the highest precision, over 8 of
+the benchmark's prompts cut to mixed lengths and left-padded. The cuDNN
+prefill's RMS distance is 1.036 times xla's on Qwen3-0.6B's logits (1.088 on
+the log-probabilities) and 0.999 (0.987) on Qwen3-1.7B's, against an
+allowed 2. The argmax agrees with fp32 at 96.4% of positions against 96.8% on 0.6B,
+and 96.9% against 97.2% on 1.7B.
 
-The results are not bitwise equal because cuDNN rounds at different points
-from xla's dots and softmax. Reference checks use tests/reference_error.py's
-rule over 8 benchmark prompts cut to mixed lengths and left-padded. The
-same bf16 weights are computed in fp32 at the highest precision. CuDNN
-prefill's RMS distance is 1.036 times xla's for Qwen3-0.6B logits and
-1.088 for log-probabilities. For Qwen3-1.7B, the ratios are 0.999 and
-0.987, against an allowed 2. Argmax agrees with fp32 at 96.4 against
-96.8% of positions on 0.6B, and 96.9 against 97.2% on 1.7B.
-
-Greedy generations from the benchmark's random-token prompts diverge in
-56 of 128 rows at 64 slots, with each run repeatable. Every first
-divergence is a bf16 near-tie. Teacher-forced through the fp32 model,
-the chosen tokens' logits are a median 0.64 bf16 spacings apart at
-their magnitude, with a largest gap of 2.78. Of these gaps, 77% are
-under one spacing and 98% under two. The fp32 argmax matches the xla
-prefill's choice in 31 rows and cuDNN's in 23.
+Greedy generations over the benchmark's random-token prompts part in 56 of
+128 rows at 64 slots, each run repeatable, and every first divergence is a
+bf16 near-tie. Teacher-forced through the fp32 model, the two chosen tokens'
+logits are a median 0.64 bf16 spacings apart at their magnitude and at most
+2.78; 77% are under one spacing and 98% under two. The fp32 argmax is the
+xla prefill's choice in 31 rows and cuDNN's in 23.
 `tests/test_causal_transformer.py::test_a_padded_prefill_attends_through_cudnn_where_it_runs`
-checks routing. The comparisons apply `tests/reference_error.py`'s
+checks the routing. The distances apply `tests/reference_error.py`'s
 `distance` to the cache prefill and to `dew.pipeline(..., dtype="float32")`
 under `jax.default_matmul_precision("highest")` over the same tokens.
 
-The cache writes as words, 2026-10-03. XLA's scatter stores one element
-per thread, so bf16 caches moved two bytes per store. At 128 rows,
-each decode layer's key and value writes took 3.7 us apiece; prefill
-windows took 28 us per cache during admission. On GPU, `write_cache` and
-admission placement now move one- or two-byte cache values' bits as uint32 words
-(`dew.nn.kv_cache.as_words`). Word-wide and boolean leaves, and axes that
-do not fill whole words, keep their original writes. So do TPUs, which
-tile two-byte arrays on a different axis.
-
-Over 16 caches in isolation, decode writes fell from 0.113 to 0.099 ms
-and admission writes from 0.627 to 0.277. Served tokens and
-log-probabilities are bitwise equal at 32, 64 and 128 slots. Device busy
-time per run fell from 2165.6 to 2149.5 ms at 64 slots and from 3704.2
-to 3649.5 ms at 128, with two traced runs each at integration `456a4b64`.
+The cache writes as words, 2026-10-03. XLA's scatter stores one element a
+thread, so a bf16 cache moved two bytes a store. At 128 rows each decode
+layer's key and value writes took 3.7 us apiece, and an admission's prefill
+windows took 28 us a cache. On a GPU, `write_cache` and admission's
+placement now move a one- or two-byte cache's bits as uint32 words
+(`dew.nn.kv_cache.as_words`). A word-wide or boolean leaf and an axis that
+does not fill whole words are written as they are, and so is every cache on
+a TPU, which tiles two-byte arrays on another axis. Over 16 caches in
+isolation the decode write went from 0.113 to 0.099 ms and admission's from
+0.627 to 0.277. The served tokens and log-probabilities are bitwise the same
+at 32, 64 and 128 slots, and the run's device busy time went from 2165.6 to
+2149.5 ms at 64 slots and from 3704.2 to 3649.5 ms at 128 (two traced runs
+each, integration `456a4b64`).
 `tests/test_kv_cache.py::test_a_cache_write_moves_whole_words_with_the_same_bits`
 checks the bits.
 
 The cache's validity, derived, 2026-10-04. Each attention cache stored a
-`[rows, capacity]` mask of filled slots beside the cursor. Because slots
-fill in order, this mask always equalled the cursor's `filled_slots`.
-Every decode step rewrote it in every layer, using 28 one-microsecond
-kernels only to store the next state. `dew.nn.attention.cached_validity`
-now derives it at each read in attention, Llama 4, MLA, the DSA pool
-and DeepSeek V4. Serving no longer places or zeroes the mask.
-
-Served tokens and log-probabilities are bitwise equal at 32, 64 and
-128 slots. Device busy time per run fell from 1393.7 to 1388.3 ms at
-32 slots, from 2147.5 to 2139.2 at 64, and from 3645.2 to 3626.2 at
-128, with two traced runs each.
+`[rows, capacity]` mask of its filled slots next to the cursor. Slots fill
+in order, so the mask always equalled the cursor's `filled_slots`. A decode
+step rewrote it in every layer, in 28 one-microsecond kernels, and the only
+thing that read the result was the decode loop's state. The mask is now
+derived where it is read (`dew.nn.attention.cached_validity`), in the
+attention, Llama 4, MLA, the DSA pool and DeepSeek V4, and serving no longer
+places or zeroes it. The served tokens and log-probabilities are bitwise the
+same at 32, 64 and 128 slots, and the device's busy time a run went from
+1393.7 to 1388.3 ms at 32 slots, from 2147.5 to 2139.2 at 64 and from 3645.2
+to 3626.2 at 128 (two traced runs each).
 
 ### Open loop, 2026-10-04
 
