@@ -41,6 +41,7 @@ from dew.nn.linear import (
     _masked_conv1d,
     _stream_order,
     causal_conv1d,
+    chunk_decay,
     chunk_gated_delta_rule,
     l2norm,
     recurrent_gated_delta_rule,
@@ -435,6 +436,34 @@ def test_the_chunk_inverse_is_exact_where_its_series_cancels(chunk):
     a = -jnp.tril(jnp.ones((2, chunk, chunk), jnp.float32), -1)
     want = np.eye(chunk) - np.eye(chunk, k=-1)
     np.testing.assert_allclose(strictly_lower_inverse(a), np.broadcast_to(want, a.shape), atol=1e-6)
+
+
+def test_a_decay_deep_in_a_chunk_keeps_its_own_precision():
+    """Each pairwise decay's exponent is summed over its own range, so its
+    fp32 error is that of a sum of the range's k terms, in any order
+    gamma_k sum|g| (the zeros outside it add exactly), plus exp's own
+    rounding, however far into the chunk the pair sits. A difference of
+    cumulative sums carries the error of the whole accumulated magnitude
+    instead: at g near -2 over 64 positions, ~128 eps on a decay between
+    neighbours, which the KDA gradient amplified to twice the reference's
+    distance from float64 (tests/test_kimi_linear.py)."""
+    g = np.random.default_rng(7).uniform(-3, -1, (2, 64, 4)).astype(np.float32)
+    _, decay = chunk_decay(jnp.asarray(g))
+    wide = np.asarray(g, np.float64)
+    rows, cols = np.tril_indices(64)
+    ranges = [wide[:, c + 1:r + 1] for r, c in zip(rows, cols, strict=True)]
+    exponent = np.array([part.sum(1) for part in ranges])
+    magnitude = np.array([np.abs(part).sum(1) for part in ranges])
+    eps = np.finfo(np.float32).eps / 2
+    terms = (rows - cols)[:, None, None]
+    gamma = np.broadcast_to(terms * eps / (1 - terms * eps), magnitude.shape)
+    got = np.asarray(decay, np.float64)[:, rows, cols].transpose(1, 0, 2)
+    kept = got > np.finfo(np.float32).tiny
+    error = np.abs(np.log(got[kept]) - exponent[kept])
+    bound = gamma[kept] * magnitude[kept] + 2 * eps
+    assert np.all(error <= bound), float(np.max(error / bound))
+    above = ~np.tril(np.ones((64, 64), bool))
+    assert not np.asarray(decay)[:, above].any()
 
 
 def test_the_chunked_rule_holds_with_aligned_keys():

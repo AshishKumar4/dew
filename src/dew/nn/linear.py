@@ -173,23 +173,39 @@ def _masked_conv1d(x, kernel, valid, state=None, bias=None, segments=None):
     return jnp.where(valid[:, None, :], output, 0), history
 
 
+def segment_sum(x):
+    """`segment_sum` (modeling_mamba2.py:73-90): over the last axis of `x`,
+    `out[..., i, j] = sum_{j < k <= i} x[..., k]` on and below the diagonal,
+    `-inf` above, as the reference's masked cumulative sum rather than a
+    difference of cumulative sums, so exp of it is the same numbers."""
+    size = x.shape[-1]
+    strict = jnp.tril(jnp.ones((size, size), jnp.bool_), -1)
+    expanded = jnp.where(strict, jnp.broadcast_to(x[..., :, None], (*x.shape, size)), 0.0)
+    summed = jnp.cumsum(expanded, axis=-2)
+    inclusive = jnp.tril(jnp.ones((size, size), jnp.bool_))
+    return jnp.where(inclusive, summed, -jnp.inf)
+
+
 def chunk_decay(g):
     """Cumulate per-chunk log decays and build the pairwise decay between positions.
 
     `g` is `[..., C, F]`: the C positions of a chunk and F decay channels.
     Returns the inclusive cumulative sum `gc` over C, `[..., C, F]`, and
-    `decay[..., s, t, f] = exp(gc[s, f] - gc[t, f])` for s >= t, zero above
-    the diagonal, `[..., C, C, F]`.
+    `decay[..., s, t, f] = exp(sum_{t < u <= s} g[u, f])` for s >= t, zero
+    above the diagonal, `[..., C, C, F]`.
+
+    The references exponentiate `gc[s] - gc[t]`. Each exponent here is
+    summed over its own range instead (`segment_sum`, as Mamba-2's SSD
+    does): the difference loses the chunk's accumulated magnitude to
+    cancellation, which exp turns into a relative error on every decay. On
+    tests/fixtures/hf/kimi-linear-tiny that error dominated the gradient;
+    over 16 orderings of the residual stream (an exact symmetry, so only
+    the rounding moves) the updated logits sat at an RMS 2.04 times the
+    reference's distance from float64 with the difference, 0.87 with this,
+    against the reference's own 0.98.
     """
-    chunk_size = g.shape[-2]
-    gc = jnp.cumsum(g, axis=-2)
-    inclusive = jnp.tril(jnp.ones((chunk_size, chunk_size), jnp.bool_))[..., None]
-    diff = gc[..., :, None, :] - gc[..., None, :, :]
-    # Masked before exp, as the references do. The unused positive
-    # differences can overflow, and an outer where alone leaves 0 * inf in
-    # the decay gradient.
-    diff = jnp.where(inclusive, diff, 0.0)
-    return gc, jnp.where(inclusive, jnp.exp(diff), 0.0)
+    sums = segment_sum(jnp.swapaxes(g, -1, -2))  # [..., F, C, C], -inf above the diagonal
+    return jnp.cumsum(g, axis=-2), jnp.exp(jnp.moveaxis(sums, -3, -1))
 
 
 def strictly_lower_inverse(a):
