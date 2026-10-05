@@ -44,8 +44,10 @@ class EpisodeStatus(IntEnum):
 
 @dataclass(frozen=True)
 class EpisodeId:
-    """Identify one sample within an attempt, reproducibly from checkpointed work.
+    """The identity of one sample within an attempt, reproducible from checkpointed work.
 
+    `task` is the task id, `attempt` the trainer step that collected the
+    sample, `sample` its global index, and `seed` the key data drawn for it.
     The harness can use this identity for its own idempotency records. Dew
     does not guarantee exactly-once external effects across process failure.
     """
@@ -58,11 +60,12 @@ class EpisodeId:
 
 @dataclass(frozen=True)
 class Observation:
-    """Carry the exact next model context, or a terminal environment result.
+    """The exact next model context, or a terminal environment result.
 
-    The harness owns chat formatting, tool-call parsing, and context
-    compaction. Terminal contexts may be empty. Detail can hold a verifier
-    result or an artifact reference without encoding it into device arrays.
+    The harness handles chat formatting, tool-call parsing and context
+    compaction. A terminal observation's context may be empty, but a running
+    one needs a context. `detail` can hold a verifier result or an artifact
+    reference without encoding it into device arrays.
     """
 
     context: tuple[int, ...]
@@ -80,13 +83,15 @@ class Observation:
 
 @dataclass(frozen=True)
 class Action:
-    """Record one actual model call, including EOS and both likelihood distributions.
+    """One actual model call, with its EOS and its likelihoods under both distributions.
 
-    Raw probabilities belong to the unmodified model; behavior probabilities
-    include Sampling controls. EOS ends the model turn, not the episode.
-    Context and action ids are nonnegative integers. Actions stop at the
-    first configured EOS, and terminated agrees with that final token.
-    Vocabulary upper bounds belong to the model-aware caller.
+    `raw_log_probs` are the unmodified model's likelihoods, and
+    `behavior_log_probs` include the `Sampling` controls. EOS ends the model
+    turn, not the episode. Context and action ids are nonnegative integers.
+    An action stops at the first configured EOS, and `terminated` is true
+    exactly when its last token is that EOS; anything else raises
+    ValueError. Checking ids against the vocabulary size is left to the
+    caller, which knows the model.
     """
 
     context: tuple[int, ...]
@@ -142,7 +147,13 @@ class Episode:
 
 
 class Environment(Protocol):
-    """The caller owns execution and releases resources on context exit."""
+    """Executes one episode's tool calls for the caller.
+
+    `reset` returns the first observation, and `step` returns the
+    observation that follows an action. The caller provides each
+    environment through a context manager and releases its resources when
+    the context exits.
+    """
 
     def reset(self) -> Observation: ...
 
@@ -151,7 +162,11 @@ class Environment(Protocol):
 
 @runtime_checkable
 class RecoverableEnvironment(Environment, Protocol):
-    """Restore tool state from an opaque snapshot, without replaying completed calls."""
+    """Saves and restores its tool state as an opaque snapshot, so a resume replays no completed call.
+
+    `get_state` returns the snapshot as bytes, and `set_state` restores it.
+    `EpisodeJournal` needs an environment of this kind.
+    """
 
     def get_state(self) -> bytes: ...
 
@@ -163,7 +178,11 @@ EpisodeRecorder = Callable[[Episode], None]
 
 
 class EpisodeInference(Protocol):
-    """Draw actions from a bound policy, returning the actual sampling likelihoods."""
+    """Draws actions from a bound policy and returns the actual sampling likelihoods.
+
+    `bind(variables)` returns an inference that generates from that one
+    weight snapshot.
+    """
 
     def bind(self, variables: Variables, /) -> EpisodeInference: ...
 
@@ -172,7 +191,7 @@ class EpisodeInference(Protocol):
 
 
 class EpisodeFailure(RuntimeError):
-    """Report a failed collection, keeping the partial episode available to the caller."""
+    """Reports a failed collection and keeps the partial episode in `episode` for the caller."""
 
     def __init__(self, episode: Episode):
         self.episode = episode
@@ -262,29 +281,33 @@ def step_action(environment: Environment, action: Action) -> Observation:
 
 @dataclass(frozen=True)
 class EpisodeRollout:
-    """Collect complete episode groups under one policy snapshot, then train on their actions.
+    """Collects complete episode groups under one policy snapshot and turns their actions into training rows.
 
-    Input batches contain integer task_id rows. The environment factory
-    resolves each task and owns its tools, timeouts and isolation. A finite
-    verifier reward is required for completed and truncated episodes. Errors
-    and cancellation abort the whole group before a Trainer update; record
-    receives the partial episode before the exception propagates.
+    Input batches hold integer `task_id` rows. The `environment` factory
+    resolves each task and is responsible for its tools, timeouts and
+    isolation. Completed and truncated episodes need a finite reward from
+    `verifier`. An error or a cancellation aborts the whole group before a
+    `Trainer` update, and `record` receives the partial episodes before the
+    exception propagates. `groups` must be at least 2, and `sampling` must
+    set an EOS id.
 
-    Episodes train through `sessions.pack`: a call whose context extends the
-    previous call's context and actions merges into its chain, and chains
-    share rows of max_prompt_tokens + max_new_tokens ids, so set the
-    objective's seq_len one below that. The batch keeps one row per possible
-    call, which always fits and keeps shapes fixed. The terminal group
-    advantage is shared by the episode's actions; no per-turn credit rule is
-    inferred, and truncated episodes are masked. Host records and numeric
-    rows carry the trainer's committed update clock. Raw and behavior likelihoods come from actual draws.
+    Episodes train through `sessions.pack`. A call whose context extends the
+    previous call's context and actions merges into that call's chain, and
+    chains share rows of `max_prompt_tokens + max_new_tokens` ids, so set
+    the objective's `seq_len` one below that. The batch keeps one row per
+    possible call, so it always fits and its shapes stay fixed. Every action
+    in an episode gets the same group advantage, computed from the episode's
+    final reward; Dew infers no per-turn credit, and truncated episodes are
+    masked. Host records and numeric rows carry the trainer's committed
+    update count. Raw and behavior likelihoods come from the actual draws.
 
-    The policy binds one immutable variables snapshot for the whole
-    collection. It must use that binding, not a mutable serving default.
-    The Trainer cannot update or donate the tree until this call returns.
-    EpisodeJournal adds durable turn boundaries for environments exposing
-    get_state/set_state. Pending external effects require environment-owned
-    idempotency; Trainer checkpoints remain the optimizer's recovery boundary.
+    `policy.bind` fixes one immutable variables snapshot for the whole
+    collection, and the policy must generate from it, not from a mutable
+    serving default. The `Trainer` cannot update or donate the tree until
+    this call returns. An `EpisodeJournal` (`journal`) saves each turn
+    durably for environments that provide `get_state` and `set_state`. The
+    environment itself must make pending external effects idempotent; the
+    optimizer still recovers only from `Trainer` checkpoints.
     """
 
     policy: EpisodeInference
@@ -584,7 +607,12 @@ class EpisodeRollout:
             agreed("episode verification", lambda: self._verify(slots, policy_step, binding_id, run))
 
     def collect(self, state: TrainState, batch: Batch, key: jax.Array) -> tuple[Episode, ...]:
-        """Collect fixed cohorts, agreeing host phases before every generation."""
+        """Collect and return the episodes for one batch of tasks.
+
+        The cohorts have fixed shapes, and every process agrees on each host
+        phase before each generation. `record`, when set, receives every
+        episode.
+        """
         def prepare():
             tasks = local_rows(batch["task_id"])
             if tasks.ndim != 1 or not tasks.size or not np.issubdtype(tasks.dtype, np.integer):
@@ -638,14 +666,17 @@ class EpisodeRollout:
     def project(self, episodes: Sequence[Episode]) -> dict[str, np.ndarray]:
         """Pack one collection's episodes into GRPO rows through `sessions.pack`.
 
-        Each episode becomes a `Session` (`session_of`), so its calls merge
-        into one chain wherever the environment's next context extends the
+        Each episode becomes a `Session` (`session_of`). Its calls merge into
+        one chain wherever the environment's next context extends the
         previous one, and the chains share `[rows, width]` rows with segment
-        ids. `old_log_probs` carries the sampler's raw likelihoods, recorded
+        ids. `old_log_probs` holds the sampler's raw likelihoods, recorded
         under the same snapshot. A truncated episode is masked, not scored.
 
-        Every episode and action must retain that collection's private binding
-        origin. Equal training clocks do not establish equal weight snapshots.
+        Every episode and action must keep the private binding id of the
+        collection that produced it, because equal training step counts do
+        not prove equal weight snapshots. Episodes from different
+        collections, incomplete groups, and episodes that are not verified
+        as completed or truncated raise ValueError.
         """
         if not episodes or len(episodes) % self.groups:
             raise ValueError("projection requires complete episode groups")
@@ -683,12 +714,14 @@ class EpisodeRollout:
 
 
 def session_of(episode: Episode, *, group: str) -> Session:
-    """Read an episode as an engine-style `Session` of the advantage group `group`.
+    """Return `episode` as an engine-style `Session` in the advantage group `group`.
 
-    Each transition's action is one call: its context is the prompt, its
-    tokens the sampled ids with their behavior likelihoods, `stop` when it
-    ended on EOS and `length` otherwise. An environment-reported error is an
-    infrastructure failure; how well the agent did is the verifier's reward.
+    Each transition's action becomes one call. The call's prompt is the
+    action's context, its sampled ids are the action's tokens with their
+    behavior likelihoods, and its finish reason is `stop` when the action
+    ended on EOS and `length` otherwise. An error the environment reports
+    becomes `INFRA_ERROR`, because the verifier's reward, not the status,
+    says how well the agent did.
     """
     status = {
         EpisodeStatus.COMPLETED: Status.COMPLETED,
