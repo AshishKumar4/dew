@@ -4,6 +4,7 @@ from functools import partial
 
 from dew.interop import mamba2
 from dew.interop.families.deepseek import (
+    _MINIMAX_M2_NAMES,
     _deepseek_config,
     _deepseek_v2_mixture,
     _deepseek_v4_config,
@@ -11,6 +12,7 @@ from dew.interop.families.deepseek import (
     _deepseek_v4_prepare,
     _kimi_k25_config,
     _kimi_k25_path,
+    _minimax_m2_config,
 )
 from dew.interop.families.deepseek_v41 import DEEPSEEK_V41
 from dew.interop.families.gemma import (
@@ -116,6 +118,18 @@ from dew.nn.mixers.mamba2 import Mamba2Mixer
 from dew.nn.mla import MLAMixer
 
 ENTRIES = (
+    DecoderFamily(
+        ('minimax_m2',),
+        _minimax_m2_config,
+        lambda fields: bool(fields.qk_norm and fields.qk_norm_scope == 'projection'
+                            and fields.pre_norms and fields.mixture is not None),
+        'minimax_m2',
+        'MiniMaxM2ForCausalLM',
+        lambda model: {},
+        weight_path=partial(_renamed_path, _MINIMAX_M2_NAMES),
+        export_path=partial(_renamed_name, _MINIMAX_M2_NAMES),
+        preserve_source_layout=True,
+    ),
     DecoderFamily(
         ("nemotron_h",),
         _nemotron_h_config,

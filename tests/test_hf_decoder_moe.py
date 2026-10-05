@@ -12,6 +12,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from reference_error import assert_as_exact_as_the_reference, distance
 from test_hf_decoders import GEMMA4_MOE, fixture_config, flat_tree, fp32_decoder
 
 from dew.interop import Pretrained, PretrainedDecoder
@@ -21,6 +22,100 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.registry import models, with_precision
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
+
+MINIMAX_M2 = FIXTURES / 'minimax-m2-tiny'
+
+
+@pytest.mark.parametrize('name', ('minimax-m2', 'minimax-m2.5', 'minimax-m2.7'))
+def test_minimax_m2_released_configs_read_partial_rotary_and_sigmoid_routing(name):
+    config = translate_config(fixture_config(name))
+    assert config['qk_norm_scope'] == 'projection'
+    assert config['partial_rotary_factor'] == 0.5
+    assert config['partial_rotary_type'] == 'default'
+    assert config['mixture'] == {'experts': 256, 'top_k': 8, 'score_function': 'sigmoid', 'bias': True}
+    assert (config['num_layers'], config['num_heads'], config['num_kv_heads']) == (62, 48, 8)
+
+
+@pytest.mark.network
+@pytest.mark.parametrize('name', ('minimax-m2', 'minimax-m2.5', 'minimax-m2.7'))
+def test_minimax_m2_pinned_configs_and_indexes_have_no_prediction_weights(name):
+    from huggingface_hub import hf_hub_download
+
+    source = json.loads((FIXTURES / name / 'source.json').read_text())
+    config = json.loads(Path(hf_hub_download(source['repo'], 'config.json',
+                                           revision=source['revision'])).read_text())
+    assert config == fixture_config(name)
+    assert translate_config(config)['partial_rotary_factor'] == 0.5
+    index = json.loads(Path(hf_hub_download(source['repo'], 'model.safetensors.index.json',
+                                          revision=source['revision'])).read_text())
+    assert not any('mtp' in key for key in index['weight_map'])
+
+
+@pytest.mark.parametrize('changes, field', (
+    ({'use_qk_norm': False}, 'use_qk_norm'),
+    ({'use_routing_bias': False}, 'use_routing_bias'),
+    ({'router_jitter_noise': 0.1}, 'router_jitter_noise'),
+    ({'partial_rotary_factor': 1.0}, 'rotary_dim'),
+    ({'shared_intermediate_size': 4}, 'shared_intermediate_size'),
+))
+def test_minimax_m2_refuses_settings_that_change_the_released_block(changes, field):
+    with pytest.raises(ValueError, match=field):
+        translate_config({**fixture_config('minimax-m2'), **changes})
+
+
+@pytest.mark.parametrize('name', ('minimax-m2-tiny', 'minimax-m2-fp8-tiny'))
+def test_minimax_m2_logits_match_the_corrected_reference(name):
+    directory = FIXTURES / name
+    model, variables = fp32_decoder(directory)
+    ids = np.load(directory / 'input_ids.npy')
+    reference = np.load(directory / 'logits.npy')
+    truth = np.load(directory / 'logits_f64.npy')
+    logits = np.asarray(model.apply(variables, ids))
+    assert_as_exact_as_the_reference(logits, reference, truth, 'MiniMax-M2 logits')
+    np.testing.assert_array_equal(logits.argmax(-1), reference.argmax(-1))
+    print(name, 'RMS ratio', distance(logits, truth) / distance(reference, truth))
+
+
+def test_minimax_m2_prefill_and_token_steps_match_the_corrected_reference():
+    model, variables = fp32_decoder(MINIMAX_M2)
+    ids = np.load(MINIMAX_M2 / 'input_ids.npy')
+    state = model.apply(variables, ids.shape[0], method='init_cache', mutable=['cache'])[1]
+    out, state = model.apply({**variables, **state}, ids[:, :4], decode=True, mutable=['cache'])
+    pieces = [np.asarray(out)]
+    for index in range(4, ids.shape[1]):
+        out, state = model.apply({**variables, **state}, ids[:, index:index + 1],
+                                 decode=True, mutable=['cache'])
+        pieces.append(np.asarray(out))
+    assert_as_exact_as_the_reference(np.concatenate(pieces, axis=1),
+        np.load(MINIMAX_M2 / 'logits.npy'), np.load(MINIMAX_M2 / 'logits_f64.npy'), 'MiniMax-M2 cache')
+
+
+def test_minimax_m2_export_keeps_source_weights_and_router_state(tmp_path):
+    loaded = Pretrained.load(str(MINIMAX_M2), dtype='float32', attention_impl='reference')
+    loaded.save(tmp_path / 'export')
+    again = Pretrained.load(str(tmp_path / 'export'), dtype='float32', attention_impl='reference')
+    for path, leaf in flat_tree(loaded.variables).items():
+        np.testing.assert_array_equal(leaf, flat_tree(again.variables)[path])
+    assert json.loads((tmp_path / 'export/config.json').read_text()) == fixture_config('minimax-m2-tiny')
+
+
+def test_minimax_m2_runs_a_backward_update_without_moving_router_bias():
+    model, variables = fp32_decoder(MINIMAX_M2)
+    ids = jnp.asarray(np.load(MINIMAX_M2 / 'input_ids.npy'))
+
+    def loss(params):
+        return jnp.mean(jnp.square(model.apply({**variables, 'params': params}, ids)))
+
+    before, gradients = jax.value_and_grad(loss)(variables['params'])
+    updated = jax.tree_util.tree_map(lambda p, g: p - 1e-3 * g, variables['params'], gradients)
+    assert np.isfinite(float(before)) and float(loss(updated)) < float(before)
+    assert set(variables['moe']['layers_0']['mlp']['gate']) == {'e_score_correction_bias'}
+
+
+def test_minimax_m2_refuses_unimplemented_prediction_tensors():
+    config = translate_config(fixture_config('minimax-m2-tiny'))
+    with pytest.raises(ValueError, match='mtp'):
+        translate_weights({'mtp.0.weight': np.ones((2, 2), np.float32)}, config, 'minimax_m2')
 
 # --------------------------------------------------------------------------
 # GPT OSS: attention sinks, biased interleaved experts, YaRN over GQA

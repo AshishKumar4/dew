@@ -1,5 +1,15 @@
 {
  "references": {
+  "hf/minimax-m2-fp8-tiny": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.18.0", "runs": "transformers"}],
+   "note": "--minimax-m2-only; released 128x128 E4M3 storage under per-expert weight/weight_scale_inv names, loaded by FineGrainedFP8Config(dequantize=True)."
+  },
+  "hf/minimax-m2-tiny": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.18.0", "runs": "transformers"}],
+   "note": "--minimax-m2-only; PR 48486 fixes the released rotary_dim mapping absent in 5.16.1. Per-expert weights, nonzero routing bias, fp32 and float64 logits."
+  },
   "attention_bf16.npz": {
    "tool": "tools/numerics_reference.py",
    "sources": [
