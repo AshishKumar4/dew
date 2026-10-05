@@ -42,7 +42,6 @@ from dew.nn.backbones.wan import WanTransformer
 ROOT = Path(__file__).resolve().parents[1]
 PUBLISHED = ROOT / "tests/fixtures/hf/wan-source"
 CASES = ("published", "variant")
-FORWARD = 1e-5
 
 
 @pytest.fixture(scope="module")
@@ -185,9 +184,15 @@ def streamed(walk):
     return Pretrained.load(str(walk[0] / "pipeline"), dtype="float32", attention_impl="xla", mesh=MeshSpec())
 
 
-def relative_gap(actual, expected) -> float:
-    actual, expected = np.asarray(actual, np.float64), np.asarray(expected, np.float64)
-    return float(np.abs(actual - expected).max() / max(1.0, float(np.abs(expected).max())))
+def assert_walked_as_the_source(walked, arrays, rows: int) -> None:
+    """Each row's final latent and decoded frames by tests/reference_error.py's
+    rule, against the source pipeline's float32 walk and its float64 one."""
+    frames = np.clip(np.asarray(walked.images) / 2 + 0.5, 0.0, 1.0)
+    for row in range(rows):
+        latent = (channels_last(arrays[name][None])[0] for name in (f"latents.{row}", f"latents_f64.{row}"))
+        assert_as_exact_as_the_reference(np.asarray(walked.latents)[row], *latent, f"latent {row}")
+        assert_as_exact_as_the_reference(frames[row], arrays[f"frames.{row}"], arrays[f"frames_f64.{row}"],
+                                         f"frames {row}")
 
 
 def test_prompt_encoding_matches_the_source_pipeline(pipeline, walk):
@@ -204,7 +209,8 @@ def test_prompt_encoding_matches_the_source_pipeline(pipeline, walk):
         expected = arrays[f"context.{row}"]
         assert context[row].shape == expected.shape == (512, record["transformer"]["text_dim"])
         np.testing.assert_array_equal(np.asarray(context[row]) == 0, expected == 0)
-        assert relative_gap(context[row], expected) < FORWARD, row
+        assert_as_exact_as_the_reference(np.asarray(context[row]), expected, arrays[f"context_f64.{row}"],
+                                         f"prompt {row}")
 
 
 @pytest.mark.parametrize("load", ["pipeline", "streamed"])
@@ -220,11 +226,7 @@ def test_pipeline_walk_matches_the_source(load, walk, request):
     assert pipeline.inputs.sample.shape == (record["frames"], record["height"], record["width"], 3)
     walked = task(task.prepare(record["prompts"], initial=channels_last(arrays["x_T"]), key=0,
                                steps=record["steps"]), key=jax.random.PRNGKey(0)).host()
-    frames = np.clip(np.asarray(walked.images) / 2 + 0.5, 0.0, 1.0)
-    for row in range(len(record["prompts"])):
-        expected = channels_last(arrays[f"latents.{row}"][None])[0]
-        assert relative_gap(np.asarray(walked.latents)[row], expected) < FORWARD, row
-        assert relative_gap(frames[row], arrays[f"frames.{row}"]) < FORWARD, row
+    assert_walked_as_the_source(walked, arrays, len(record["prompts"]))
 
 
 def test_a_text_free_walk_from_the_sources_own_encodings_matches_the_source(walk):
@@ -246,14 +248,7 @@ def test_a_text_free_walk_from_the_sources_own_encodings_matches_the_source(walk
     negative = DenoisingCondition(jnp.asarray(arrays[f"context.{rows}"][None]))
     prepared = task.prepare(conditions={"conditioning": given}, unconditional={"conditioning": negative},
                             initial=channels_last(arrays["x_T"]), key=0, steps=record["steps"])
-    walked = task(prepared, key=jax.random.PRNGKey(0)).host()
-    frames = np.clip(np.asarray(walked.images) / 2 + 0.5, 0.0, 1.0)
-    # Measured: 2.2e-6 to 2.5e-6 relative on the latents and the frames,
-    # under FORWARD's 1e-5.
-    for row in range(rows):
-        expected = channels_last(arrays[f"latents.{row}"][None])[0]
-        assert relative_gap(np.asarray(walked.latents)[row], expected) < FORWARD, row
-        assert relative_gap(frames[row], arrays[f"frames.{row}"]) < FORWARD, row
+    assert_walked_as_the_source(task(prepared, key=jax.random.PRNGKey(0)).host(), arrays, rows)
 
 
 class Replay(nn.Module):

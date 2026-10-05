@@ -3071,7 +3071,7 @@
      "runs": "transformers"
     }
    ],
-   "note": "Includes UMT5 prompt states, pipeline walks, and float32/float64 UniPC scheduler replays."
+   "note": "Includes UMT5 prompt states and pipeline walks (final latents and decoded frames), each in float32 as the pipeline runs and in float64 (diffusers_wan_reference.float64), and float32/float64 UniPC scheduler replays."
   },
   "wan_transformer.tar.xz": {
    "tool": "tools/diffusers_wan_reference.py",
