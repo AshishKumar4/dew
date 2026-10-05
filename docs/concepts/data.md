@@ -157,7 +157,10 @@ Validation reads each image through the deterministic resize, without the crop, 
 random crop/resize, horizontal flip and colour jitter to each decoded batch
 with JAX. The default remains `"host"`, preserving existing runs' OpenCV/NumPy
 augmentation. `augmentation="flip_only"` disables colour jitter and `"none"`
-keeps the deterministic resize, without random cropping.
+keeps the deterministic resize, without random cropping. The colour jitter on
+either backend is torchvision's float `ColorJitter(brightness=0.2,
+contrast=0.05, saturation=0.2)`: the three factors in a random order, each op
+clamped to the pixel range, rounded to uint8 once at the end.
 
 <!-- not run: needs a prepared Oxford Flowers version directory -->
 ```python
