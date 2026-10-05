@@ -301,7 +301,7 @@ def grpo_run(beta: float = 0.0, directory: str = "./checkpoints") -> DiffusionRu
         guidance=None, sampling_steps=2, val_metrics=(),
         trainer=TrainerConfig(checkpoint_dir=directory),
         text=TextCondition(encoder="char_table", checkpoint="char_table"),
-        rl=FlowGRPO(reward="psnr", groups=2, rollout_steps=3, clip_range=0.2, beta=beta))
+        mode=FlowGRPO(reward="psnr", groups=2, rollout_steps=3, clip_range=0.2, beta=beta))
 
 
 def grpo_step(objective, rollout, **trainer):

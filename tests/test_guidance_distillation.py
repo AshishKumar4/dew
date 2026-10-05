@@ -68,7 +68,7 @@ def runs(tmp_path_factory):
     checkpoints.wait()
     teacher.save(str(root / "teacher"))
     student = dataclasses.replace(
-        teacher, guidance_distill=GuidanceDistillation(teacher=str(root / "teacher"), scales=(1.0, 6.0))
+        teacher, mode=GuidanceDistillation(teacher=str(root / "teacher"), scales=(1.0, 6.0))
     )
     return root, student, batch
 
