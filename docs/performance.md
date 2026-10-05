@@ -823,6 +823,21 @@ The Gated DeltaNet short conv had the same kind of problem inside it.
 history still. At `14622ba` it compacts each row's real tokens by
 `cumsum(valid) - 1` and calls the same fp32 `causal_conv1d` once.
 
+The chunked delta rule's inverse, 2026-10-05. Each chunk's (I - A)^-1 was
+summed as the series I + A + A^2 + ..., doubling powers of A. On
+Qwen3.5-0.8B's real keys (near-aligned keys, beta near one) the powers grew
+as binomials while the inverse's entries stay under 1, and the cancellation
+left its fifth delta-rule layer 1e24 off in fp32 on a 256-token prompt:
+every later layer, the logits and every served request were NaN.
+`strictly_lower_inverse` now joins diagonal-block inverses, doubling their
+size, so each product is the size of its entries. Every layer's chunked rule
+is within 8e-7 of a float64 token-by-token run, and the logits within 3.3e-05
+of transformers' fp32 forward with every argmax equal. It is cheaper too. At
+Qwen3.5-0.8B's widths (16 heads, 128 wide, 4096 tokens, bf16) one forward
+plus backward took 15.1 against 12.5-12.9 ms at batch 1 and 47.1 against
+32.3-32.8 ms at batch 4 on an RTX 4080, and a v6e's compiled program has 42%
+of the flops with 3% more temporaries.
+
 Conditions: one RTX 4080, bf16 compute with fp32 master parameters, one fresh
 process per case, `XLA_PYTHON_CLIENT_PREALLOCATE=false`, no XLA flags, 5
 warmups then 3 windows of 50 calls. The numbers are medians of the time from
