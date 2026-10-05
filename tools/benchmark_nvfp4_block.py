@@ -36,7 +36,7 @@ from dew.interop.codecs import source_quantization
 from dew.interop.safetensors_io import _STORED_DTYPES, read_weights, save_hf_layout
 from dew.nn.backbones import CausalTransformer
 from dew.registry import from_record
-from dew.training.quantization import NVFP4Input, checkpoint_input_quantization
+from dew.training.quantization import NVFP4Input, checkpoint_input_quantization, nvfp4_input_qdq
 
 REPO = "RedHatAI/Qwen3-8B-NVFP4"
 REVISION = "e391349c110709b87bfc2ad2fde3f50dc5839fd8"
@@ -137,12 +137,17 @@ def benchmark(directory: Path, dtype: str) -> None:
     decode = paired(calls, {name: ({**variables, "cache": cache},) for name in models}, 30)
     for value in decode.values():
         value["one_block_tokens_per_s"] = 8000 / value["median_ms"]
+    spec = inputs["self_attn/q_proj"]
+    quantize = jax.jit(lambda values: nvfp4_input_qdq(values, spec))
+    qdq = paired({"training": quantize, "decode": quantize},
+                 {"training": (x,), "decode": (token,)}, 30)
     print(json.dumps({"repo": REPO, "revision": REVISION, "block": 0, "dtype": dtype,
                       "param_dtype": "float32", "matmul_precision": "highest",
                       "device": str(jax.devices()[0]), "jax": jax.__version__,
                       "training_shape": [1, 2048, 4096], "decode_shape": [8, 1, 4096],
                       "cache_context": 2048, "train_compile_s": compile_times,
-                      "forward_backward": train, "decode": decode}, indent=2))
+                      "forward_backward": train, "decode": decode,
+                      "one_4096_wide_projection_input_qdq": qdq}, indent=2))
 
 
 if __name__ == "__main__":
