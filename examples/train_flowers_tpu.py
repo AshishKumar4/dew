@@ -36,6 +36,7 @@ import dew
 from dew.artifacts import uint8_pixels
 from dew.config import ModelConfig, OptimConfig, TrainerConfig
 from dew.data import ArrayRecordImages, DataPartition, Loading, TFDSImages
+from dew.data.dataset import COUNTED
 from dew.data.images import pack_dict_of_byte_arrays
 from dew.diffusion.presets import EDM
 from dew.eval import FID, CLIPScore
@@ -163,7 +164,9 @@ def held_out(run: DiffusionRunConfig) -> np.ndarray:
         raise ValueError("scoring FID needs a held-out split: set data.val_batches")
     # This process's share of the pass on the run's plain data-parallel mesh.
     share = DataPartition.of(run.trainer.mesh.build())
-    return np.concatenate([np.asarray(batch["image"], np.uint8) for batch in data.val(share)])
+    # The pass fills its last batch with copies, which COUNTED marks False.
+    return np.concatenate([np.asarray(batch["image"], np.uint8)[np.asarray(batch[COUNTED])]
+                           for batch in data.val(share)])
 
 
 def grid(images: np.ndarray, path: Path) -> None:

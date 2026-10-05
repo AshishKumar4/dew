@@ -30,7 +30,7 @@ print(data.records, data.steps_per_epoch)
 16 2
 ```
 
-`from_records` takes a mapping of columns whose first axis is the record (as here), a list of per-record mappings, or any source with `__len__` and `__getitem__`. Training reshuffles the records from `seed` every epoch and reads each one once per epoch. Its position goes into each checkpoint, so a resumed run reads the records it had not reached yet. With several processes, each reads its own share of every batch. `validation` is read once in order, in whole batches. The example validates on its training records only to show the argument; a real validation score needs records the model does not train on.
+`from_records` takes a mapping of columns whose first axis is the record (as here), a list of per-record mappings, or any source with `__len__` and `__getitem__`. Training reshuffles the records from `seed` every epoch and reads each one once per epoch. Its position goes into each checkpoint, so a resumed run reads the records it had not reached yet. With several processes, each reads its own share of every batch. `validation` is read once in order, every record of it. The last batch is filled out with copies of records so it shards like the others, and its `counted` field marks which rows are records, so evaluation scores each record once. The example validates on its training records only to show the argument; a real validation score needs records the model does not train on.
 
 Every reader returns the same `Dataset` value:
 

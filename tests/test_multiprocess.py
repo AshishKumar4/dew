@@ -370,16 +370,14 @@ def test_processes_read_disjoint_windows_of_one_packing(tmp_path):
 
 
 @pytest.mark.distributed
-def test_a_validation_split_packed_unevenly_ends_on_every_process(tmp_path):
-    """Every process scores the batch count all of them have.
+def test_a_validation_split_packed_unevenly_is_whole_batches_on_every_process(tmp_path):
+    """Every process scores every batch of a pass whose windows the processes do not divide.
 
     Of these 60 documents, 36 fill a nine-id window and 24 are one eos each,
-    which the plan packs into 39 windows; process 0 reads 20 of them and
-    process 1 the other 19, so their passes are 5 and 4 batches of 4. Each
-    batch is agreed before it is scored, so both score 4; a process that
-    bounded its own pass with an islice would issue a fifth validation
-    collective after the other had left the pass, and the pool would sit in
-    it until the heartbeat killed both.
+    which the plan packs into 39 windows. The pass fills its last batch with
+    a copy, so process 0 and process 1 each read 20 windows, 5 batches of 4,
+    and both score all 5. Unfilled, process 1 would hold 19 windows and 4
+    batches, and process 0's fifth batch would go unscored.
     """
     seq_len, val_steps = 8, 5
     lengths = [seq_len if index // 2 < (16, 20)[index % 2] else 0 for index in range(60)]
@@ -388,9 +386,9 @@ def test_a_validation_split_packed_unevenly_ends_on_every_process(tmp_path):
                        fsdp_size=2, steps=2, records=RECORDS, tokens=corpus,
                        seq_len=seq_len, val_steps=val_steps)
 
-    assert [report["val_available"] for report in reports] == [5, 4]
+    assert [report["val_available"] for report in reports] == [5, 5]
     for report in reports:
-        assert report["val_batches"] == 4
+        assert report["val_batches"] == 5
         assert report["step"] == 2
 
 

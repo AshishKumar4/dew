@@ -23,7 +23,7 @@ import pytest
 from absl import flags
 
 from dew.data import ByteTokenizer, DataPartition, Loading, PackedTokens, TokenCorpus, TokenWindows
-from dew.data.dataset import describe
+from dew.data.dataset import COUNTED, describe
 from dew.data.sources.text import TokenBytes, TokenDocumentSource, TokenRecords, TokenWindowSource, dtype_for
 from dew.data.tokens import PackedWindows
 from dew.nn import attention
@@ -943,12 +943,12 @@ def test_a_token_validation_pass_ends_when_the_split_runs_out(tmp_path):
     assert len(set(_rows(batches))) == 8, "a pass must not repeat a window"
 
 
-def test_a_token_validation_pass_stops_at_the_last_full_batch(tmp_path):
-    """Ten windows at batch four are two batches, in file order, then the end.
+def test_a_token_validation_pass_counts_the_windows_past_the_last_full_batch(tmp_path):
+    """Ten windows at batch four are three batches, in file order, then the end.
 
-    Validation batches keep drop_remainder so their shapes fit the configured
-    device mesh. The two windows past the last full batch are not scored,
-    which is a reason to hold out a whole number of batches.
+    Validation batches are whole so their shapes fit the configured device
+    mesh. The two windows past the second batch arrive in a third, filled
+    out with copies that `COUNTED` marks, so every window is scored once.
     """
     seq_len = 4
     val_tokens = np.arange(900, 900 + 11 * seq_len, dtype=np.int64)
@@ -956,10 +956,12 @@ def test_a_token_validation_pass_stops_at_the_last_full_batch(tmp_path):
     (tmp_path / "val.bin").write_bytes(val_tokens.astype("<u2").tobytes())
     data = _windows(tmp_path, seq_len=seq_len).load(batch=4)
 
-    batches, ended = _bounded(data.val(DataPartition()), 3)
+    batches, ended = _bounded(data.val(DataPartition()), 4)
 
-    assert len(batches) == 10 // 4 and ended, ENDLESS_VAL
-    assert len(set(_rows(batches))) == 8, "a pass must not repeat a window"
+    assert len(batches) == 3 and ended, ENDLESS_VAL
+    counted = [row.tobytes() for batch in batches
+               for row, kept in zip(batch["text"], batch[COUNTED], strict=True) if kept]
+    assert len(counted) == len(set(counted)) == 10, "a pass counts every window once"
     np.testing.assert_array_equal(batches[0]["text"][0], val_tokens[:seq_len + 1])
 
 
@@ -974,7 +976,8 @@ def test_a_packed_validation_pass_reads_each_window_once_and_stops(tmp_path):
     data = _packed_tokens(tmp_path, seq_len=8, packing_bins=2).load(batch=2)
 
     batches, ended = _bounded(data.val(DataPartition()), 2 + len(documents))
-    heads = [int(t) for batch in batches for row in batch["text"] for t in row
+    heads = [int(t) for batch in batches
+             for row, kept in zip(batch["text"], batch[COUNTED], strict=True) if kept for t in row
              if int(t) in {d[0] for d in documents}]
     again, _ = _bounded(data.val(DataPartition()), len(batches))
 

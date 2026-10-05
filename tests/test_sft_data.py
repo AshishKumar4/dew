@@ -17,6 +17,7 @@ from transformers import AutoTokenizer
 
 from dew.data import ChatMessages, DataPartition, Loading
 from dew.data.chat import ROLES_KEY, Conversation, Role, render_conversation
+from dew.data.dataset import COUNTED
 
 TOKENIZER = Path(__file__).resolve().parent / "fixtures" / "tokenizers" / "tiny-chat"
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "rl" / "chat.npz"
@@ -102,7 +103,7 @@ def test_a_packed_sft_batch_carries_four_aligned_fields(tmp_path, tokenizer):
     assert len(batches) == 1
     batch = batches[0]
 
-    assert set(batch) == {"text", ROLES_KEY, "text_segment_ids", "text_positions"}, (
+    assert set(batch) == {"text", ROLES_KEY, "text_segment_ids", "text_positions", COUNTED}, (
         "one segment/position pair serves every aligned field")
     assert batch["text"].shape == (2, window)
     assert batch[ROLES_KEY].shape == (2, window)

@@ -35,7 +35,15 @@ from dew.data import (
     images,
     video,
 )
-from dew.data.dataset import Forwarding, GlobalStream, _batches, hold_out, train_stream, validation_pass
+from dew.data.dataset import (
+    COUNTED,
+    Forwarding,
+    GlobalStream,
+    _batches,
+    hold_out,
+    train_stream,
+    validation_pass,
+)
 from dew.data.images import ImageTransform, decode_image
 from dew.data.sources import av_utils
 from dew.data.sources.av_utils import choose_clip_start
@@ -474,17 +482,42 @@ def test_which_records_a_batch_holds_does_not_depend_on_who_stacked_it(workers):
 @pytest.mark.parametrize("workers", [0, pytest.param(2, marks=pytest.mark.slow)])
 def test_a_pass_over_a_split_the_workers_do_not_divide_is_still_whole_batches(workers):
     """Thirty records at a batch of four is seven whole batches and two
-    records over. Two workers take a batch each in turn, so the seventh batch
-    is one worker's alone and the last round is half empty: it still arrives,
-    in its place, and what is dropped is the two records over."""
+    records over. The two over arrive in an eighth batch, filled out with
+    copies of the first records, which `COUNTED` marks. Two workers take a
+    batch each in turn, so each has four batches and the last round is whole."""
     passes = validation_pass(_Indexed(30), [], batch=4, seed=0, loading=Loading(
         workers=workers, threads=2, read_buffer=4, worker_buffer=2))
 
     batches, ended = _bounded(passes(DataPartition()), 12)
 
     assert [[int(index) for index in batch["index"]] for batch in batches] == [
-        list(range(start, start + 4)) for start in range(0, 28, 4)]
+        *(list(range(start, start + 4)) for start in range(0, 28, 4)), [28, 29, 0, 1]]
+    assert [np.asarray(batch[COUNTED]).tolist() for batch in batches] == [
+        *([True] * 4 for _ in range(7)), [True, True, False, False]]
     assert ended
+
+
+@pytest.mark.parametrize("length, batch, shares", [(30, 4, 1), (30, 4, 2), (3, 4, 1), (70, 16, 8)])
+def test_a_pass_counts_every_record_of_its_split_once_across_shares(length, batch, shares):
+    """Every share reads the same number of whole batches, and the rows
+    marked counted, over every share, are the split's records, each once."""
+    passes = validation_pass(_Indexed(length), [], batch=batch, seed=0, loading=Loading())
+    counted, sizes = [], set()
+    for index in range(shares):
+        batches, ended = _bounded(passes(DataPartition(index, shares)), 2 * length)
+        assert ended
+        sizes.add(len(batches))
+        for read in batches:
+            assert len(read["index"]) == batch // shares
+            counted += [int(record) for record, kept in zip(read["index"], read[COUNTED], strict=True) if kept]
+    assert sizes == {-(-length // batch)}
+    assert sorted(counted) == list(range(length))
+
+
+def test_a_validation_record_that_already_has_the_counted_field_is_refused():
+    passes = validation_pass([{"index": 0, COUNTED: True}], [], batch=1, seed=0, loading=Loading())
+    with pytest.raises(ValueError, match="rename the field"):
+        next(passes(DataPartition()))
 
 
 @pytest.mark.parametrize("workers", [0, pytest.param(2, marks=pytest.mark.slow)])
@@ -1575,9 +1608,13 @@ def test_held_out_records_are_one_ordered_pass():
     assert _indices(data.val(DataPartition()), 5) == [[0, 1, 2, 3], [4, 5, 6, 7]]
 
 
-def test_held_out_records_too_few_for_one_batch_are_refused():
-    with pytest.raises(ValueError, match="3 validation records, fewer than one batch of 4"):
-        Dataset.from_records(_columns(), batch=4, validation=_columns(3))
+def test_held_out_records_fewer_than_one_batch_are_one_filled_batch():
+    data = Dataset.from_records(_columns(), batch=4, validation=_columns(3))
+
+    assert data.val is not None
+    (read,) = list(data.val(DataPartition()))
+    assert read["index"].tolist() == [0, 1, 2, 0]
+    assert read[COUNTED].tolist() == [True, True, True, False]
 
 
 def test_records_whose_field_lengths_differ_are_refused_with_the_remedy():

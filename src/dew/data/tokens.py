@@ -8,7 +8,7 @@ The corpus is the `train.bin`, `val.bin` and `meta.json` that
 `PackedTokens` packs whole documents into windows of that size and carries
 the segment ids and positions the backbone's mask needs. Train shuffles from
 `seed`, reshuffles per epoch and runs forever; val reads `val.bin` once, in
-file order, in whole batches, so every validation pass scores the same
+file order, every window once, so every validation pass scores the same
 windows. Both shard by JAX process.
 
 Both put the sharding last, so both resume from a global record count.

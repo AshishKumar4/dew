@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import sys
 import time
 from collections.abc import Iterator, Mapping, Sequence
@@ -21,7 +22,7 @@ from dew.artifacts import (
     broadcast_from_process_zero,
     collective_host,
 )
-from dew.data.dataset import Closeable, DataPartition, Reader
+from dew.data.dataset import COUNTED, Closeable, DataPartition, Reader
 from dew.objectives.base import Batch, Effects, Loss, Metric, Objective, Step, Variables
 
 from .distributed import MeshSpec, shard_batch
@@ -34,7 +35,8 @@ class Evaluation:
     Every process holds the same `scores`, row counts and RNG identity
     (`event_key`). Each score's name starts with the split, as in
     `val/loss`. `coordinated_batches` is the number of batches every process
-    scored, `records` the rows those batches held, and `uneven_shards`
+    scored, `records` the records those batches held, not counting the
+    copies that fill out a validation pass's last batch (`COUNTED`), and `uneven_shards`
     whether scoring stopped because some processes ran out of batches before
     others. `elapsed_seconds` is process 0's wall time, including closing
     the batch iterator. The metric accumulators and the validation batches
@@ -77,7 +79,11 @@ class Evaluation:
         the split (`DataPartition.of(mesh)`) and returns a fresh iterator,
         which this call opens and closes; you can pass `Dataset.val`
         directly. Scoring stops at the first batch that some process does not
-        have, so every process scores the same batches. With no `metrics`, no
+        have, so every process scores the same batches. A batch with a
+        `COUNTED` field, as every `validation_pass` batch has, is scored by
+        the metrics over its counted rows alone. The objective's loss sums
+        over every row it is given, so `loss` is taken over the batches whose
+        rows all count. With no `metrics`, no
         `loss` and no preview, no iterator is opened and the objective does
         no work, and a preview alone reads at most the first batch. Only
         process 0's `preview` flag counts, and the preview is made once per
@@ -258,14 +264,19 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
                 break
             assert batch is not None
             batch, rows = _placed_batch(mesh, batch, scored)
+            counted = None
+            if COUNTED in batch:
+                counted = np.asarray(collective_host(batch[COUNTED], phase=f"counted rows {scored}"), bool)
+                rows = int(counted.sum())
             records += rows
+            whole = counted is None or bool(counted.all())
             produced = None
             if metrics or loss:
                 # The objective scores under the mesh, as the step trains
                 # under it: the model's placements and its sequence and stage
                 # splits read it. A preview decodes, which neither split does.
                 with jax.set_mesh(mesh):
-                    if loss:
+                    if loss and whole:
                         assert batch is not None
                         loss_batch = batch
                         loss_variables = (
@@ -289,7 +300,8 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
                     if metrics:
                         produced = _scored_batch(objective, variables, batch, context, scored,
                                                  metrics=metrics, summaries=summaries,
-                                                 score_key=score_key, root=root)
+                                                 score_key=score_key, root=root,
+                                                 counted=None if whole else counted)
             if scored == 0 and preview_enabled:
                 previews = _previewed(objective, variables, batch, context,
                                       preview_key=preview_key, scored=produced, root=root)
@@ -343,17 +355,23 @@ def _placed_batch(mesh: Mesh, batch: Batch, index: int) -> tuple[Batch, int]:
 
 def _scored_batch(objective: Objective[Loss, Effects], variables: Variables, batch: Batch,
                   context: Step, index: int, *, metrics: Sequence[Metric],
-                  summaries: _Accumulators, score_key: jax.Array, root: bool):
+                  summaries: _Accumulators, score_key: jax.Array, root: bool,
+                  counted: np.ndarray | None = None):
     """Score one batch into `summaries`, returning what the objective produced.
 
     The report and the batch come home together, so each metric on root
     reads hosted arrays. Every rank reaches every metric's agreement,
-    whether or not it holds an accumulator.
+    whether or not it holds an accumulator. With `counted`, the metrics
+    read only the rows it marks, of the report and of the batch; the
+    objective and the preview see the whole batch.
     """
     produced = agreed(f"scoring batch {index}", lambda: objective.evaluate(
         variables, batch, replace(context, key=_folded(score_key, index))))
     produced, home = collective_host((produced, batch), phase=f"scoring batch {index}")
     artifacts = _artifacts(produced)
+    if counted is not None:
+        artifacts = tuple(_counted_rows(artifact, counted) for artifact in artifacts)
+        home = _counted_fields(home, counted)
     for metric in metrics:
         def merge(metric=metric) -> None:
             if not root:
@@ -362,6 +380,37 @@ def _scored_batch(objective: Objective[Loss, Effects], variables: Variables, bat
 
         agreed(f"metric {metric.name} batch {index}", merge)
     return produced
+
+
+def _counted_rows[A: Artifact](artifact: A, counted: np.ndarray) -> A:
+    """`artifact` with only the rows `counted` marks.
+
+    Every artifact is row-major: each array field leads with the batch's
+    rows, and a tuple of captions or texts, when present, has one per row.
+    """
+    def rows(name: str, value):
+        if isinstance(value, str) or (isinstance(value, tuple) and not value):
+            return value
+        if isinstance(value, tuple):
+            return tuple(text for text, kept in zip(value, counted, strict=True) if kept)
+        held = np.asarray(value)
+        if not held.ndim or held.shape[0] != len(counted):
+            raise ValueError(f"{type(artifact).__name__}.{name} has shape {held.shape}, and the batch has "
+                             f"{len(counted)} rows; an evaluation artifact leads with the batch's rows")
+        return held[counted]
+
+    return dataclasses.replace(artifact, **{field.name: rows(field.name, getattr(artifact, field.name))
+                                            for field in dataclasses.fields(artifact)})
+
+
+def _counted_fields(batch: Batch, counted: np.ndarray) -> Batch:
+    """`batch` with only the rows `counted` marks.
+
+    A field that is one value for the whole batch, with no row axis, is kept
+    as it is (`dew.data.dataset.rows_of`).
+    """
+    return jax.tree.map(lambda leaf: leaf[counted] if np.ndim(leaf) and np.shape(leaf)[0] == len(counted)
+                        else leaf, batch)
 
 
 def _previewed(objective: Objective[Loss, Effects], variables: Variables, batch: Batch,

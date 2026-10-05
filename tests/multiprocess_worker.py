@@ -84,7 +84,8 @@ def make_objective():
         def evaluate(self, params, batch, step):
             # The validation split here is a token split whose contents the
             # objective has no use for: what the pass exercises is its length.
-            return Representations(features=jnp.zeros((1, 1)), labels=jnp.zeros((1,), jnp.int32))
+            rows = jnp.shape(batch["text"])[0]
+            return Representations(features=jnp.zeros((rows, 1)), labels=jnp.zeros((rows,), jnp.int32))
 
     return Reconstruction()
 

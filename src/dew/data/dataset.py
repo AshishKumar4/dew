@@ -158,6 +158,12 @@ def _partition(mesh: Mesh) -> DataPartition:
 
 
 type Reader = Callable[[DataPartition], Iterator[Batch]]
+
+COUNTED = "counted"
+"""The field a validation pass marks each row of its batches with: True for a
+record of the split, False for a copy that fills out its last batch.
+Evaluation scores metrics over the counted rows alone, so every record counts
+once whatever the batch size."""
 """Opens a fresh iterator over one share of every global batch, the share the
 partition names. The iterator is its caller's to close."""
 
@@ -650,14 +656,10 @@ class Dataset:
         read by index. Training reshuffles the records from `seed` every epoch,
         with the same stream every spec reads (`train_stream`), so the position
         a checkpoint saves is a global record count and each process reads its
-        own share of every batch. `validation` is read once, in order, in whole
-        batches.
+        own share of every batch. `validation` is read once, in order, every
+        record of it (`validation_pass`).
         """
         held = None if validation is None else in_memory(validation)
-        if held is not None and len(held) < batch:
-            raise ValueError(
-                f"{len(held)} validation records, fewer than one batch of {batch}: a "
-                f"pass is whole batches, so it would score nothing")
         source = in_memory(records)
         if len(source) < batch:
             raise ValueError(
@@ -1070,6 +1072,40 @@ def mixed_records(corpora: Sequence[Corpus]) -> int:
     """
     return max(math.ceil(len(corpus.source) / share)
                for corpus, share in zip(corpora, _shares(corpora), strict=True))
+
+
+class _Filled(pygrain.MapDataset[Batch]):
+    """`parent`'s records marked `COUNTED`, then copies marked uncounted, up to `length`.
+
+    Copy k is record `k % len(parent)`, a real record, so the model reads
+    values it can handle rather than zeros, and a split shorter than the
+    fill still has a record for each copy.
+    """
+
+    _MUTATES_ELEMENT_SPEC = False
+
+    def __init__(self, parent: pygrain.MapDataset[Batch], length: int):
+        super().__init__(parent)
+        self._records, self._length = len(parent), length
+
+    def __len__(self) -> int:
+        return self._length
+
+    @overload
+    def __getitem__(self, index: slice) -> pygrain.MapDataset[Batch]: ...
+    @overload
+    def __getitem__(self, index: int) -> Batch: ...
+
+    def __getitem__(self, index: int | slice) -> Batch | pygrain.MapDataset[Batch]:
+        if isinstance(index, slice):
+            return self.slice(index)
+        record = self._parent[index % self._records]
+        if not isinstance(record, Mapping):
+            raise TypeError(f"a validation record is a mapping of fields, not {type(record).__name__}")
+        if COUNTED in record:
+            raise ValueError(f"a validation record has a field {COUNTED!r}, which the pass writes "
+                             f"to mark its records; rename the field")
+        return {**record, COUNTED: np.bool_(index < self._records)}
 
 
 class _WorkerBatches[Record](pygrain.MapDataset[Record]):
@@ -1593,17 +1629,27 @@ def validation_pass(source: Records, transformations: Sequence[pygrain.Transform
     because grain keys a record's rng by its index in the dataset the random
     map sits on. Applied after the slice, record k would take its key from
     its place in the slice, and one seed would augment it differently on one
-    host than on a pod. A pass is whole batches only, because a part-full
-    batch cannot be sharded over a device mesh.
+    host than on a pod.
+
+    Every record is read once. A part-full batch cannot be sharded over a
+    device mesh, so the last batch is filled out with copies of records, and
+    each row's `COUNTED` field says which rows are the split's own; the
+    copies sit at the end of the order, so every process reads the same
+    number of whole batches.
     """
+    if not len(source):
+        raise ValueError("a validation split with no records has nothing to score")
+
     def stream(partition: DataPartition) -> Iterator[Batch]:
         records = pygrain.MapDataset.source(source).seed(seed).apply(list(transformations))
+        records = _Filled(records, math.ceil(len(records) / batch) * batch)
         return _batches(records, rows=partition.rows(batch), partition=partition, loading=loading)
 
     return stream
 
 
 __all__ = [
+    "COUNTED",
     "Budgeted",
     "Checkpointable",
     "Closeable",
