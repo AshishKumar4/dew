@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import itertools
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Literal, overload
 
@@ -15,6 +15,7 @@ import numpy as np
 from flax import struct
 from jax.core import Tracer
 
+from dew.artifacts import agreed
 from dew.nn.sharding import DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS
 
 if TYPE_CHECKING:
@@ -551,6 +552,63 @@ class RowPlan:
     def host(self, leaf) -> np.ndarray:
         """This process's real rows of a result leaf as a host array."""
         return local_rows(leaf)[:self.rows]
+
+
+@dataclass(frozen=True)
+class Request:
+    """One sampler request as this process holds it, ready to place.
+
+    `inputs` are this process's rows as the sampler checked them, `plan`
+    places them and `key` is the request's one PRNG key. When the weights sit
+    on a mesh across processes the pool has agreed, before anything is
+    placed, on the check's outcome, one validity schema and the signature of
+    `inputs` with the sampler's controls, so every process enters the program
+    with the same shapes; otherwise each process serves its own request.
+    """
+
+    inputs: ModelInputs
+    plan: RowPlan
+    key: jax.Array
+
+    @classmethod
+    def prepare[CheckedT](
+            cls, inputs: ModelInputs | jax.typing.ArrayLike | Sequence[Sequence[int]],
+            key: int | jax.Array | None, mesh: jax.sharding.Mesh | None,
+            check: Callable[[ModelInputs, bool], tuple[ModelInputs, tuple, CheckedT]],
+            *, phase: str) -> tuple[Request, CheckedT]:
+        """The request, with whatever else `check` resolved.
+
+        `check` takes the request as `ModelInputs` and whether a pool shares
+        it, and returns the inputs the sampler runs, the controls a pool
+        compares (each with a deterministic repr) and anything else it
+        resolved. What it raises, a pool raises together, before any rank
+        enters a collective.
+        """
+        pooled = mesh is not None and jax.process_count() > 1
+
+        def setup() -> tuple[jax.Array, tuple[ModelInputs, tuple, CheckedT]]:
+            return request_key(key), check(ModelInputs.from_value(inputs), pooled)
+
+        random_key, (prepared, controls, checked) = (agreed(f"{phase} setup", setup) if pooled
+                                                     else setup())
+        if pooled:
+            from jax.experimental import multihost_utils
+
+            prepared = agreed_validity(prepared, jax.process_count(), controls=controls,
+                                       phase=f"{phase} input")
+            multihost_utils.assert_equal(generation_signature(prepared, controls),
+                                         f"{phase} input shapes and controls must agree across processes")
+        return cls(prepared, RowPlan.over(mesh, prepared.tokens.shape[0]), random_key), checked
+
+    def padded(self) -> ModelInputs:
+        """`inputs` filled out to the rows the devices take, the repeats
+        marked invalid, so they hold no real token and finish at once."""
+        plan, padded = self.plan, self.plan.pad(self.inputs)
+        if plan.count == plan.rows:
+            return padded
+        valid = padded.token_fields.get(VALIDITY_FIELD, jnp.ones(padded.tokens.shape, bool))
+        valid = jnp.asarray(valid, bool) & ~plan.padding[:, None]
+        return replace(padded, token_fields={**padded.token_fields, VALIDITY_FIELD: valid})
 
 
 __all__ = ["AttentionMetadata", "LayerInputs", "ModelInputs", "RowPlan"]
