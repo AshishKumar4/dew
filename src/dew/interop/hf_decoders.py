@@ -138,6 +138,14 @@ def _any_value(key: str, hf_config: Mapping[str, object]) -> bool:
     return True
 
 
+def _repeats_text(name: str) -> Callable[[str, Mapping[str, object]], bool]:
+    """A wrapper field inert when it repeats its text config's value."""
+    def repeats(key: str, hf_config: Mapping[str, object]) -> bool:
+        text = hf_config.get('text_config')
+        return isinstance(text, Mapping) and text.get(name) == hf_config[key]
+    return repeats
+
+
 # Fields released configs carry that the pinned reference (transformers
 # 5.16.1) neither declares on the family's config class nor reads in its
 # modeling, so the reference computes the same model whatever they hold.
@@ -174,6 +182,12 @@ _INERT_FIELDS: Mapping[str | None, Mapping[str, Callable[[str, Mapping[str, obje
         'time_step_init_scheme': _any_value,
         'time_step_scale': _any_value,
     },
+    # Ornith's Qwen3.5 wrappers repeat the text width at the top level.
+    # Qwen3_5(Moe)Config declares no such field, and the wrapper's model sizes
+    # its head from text_config.hidden_size (modeling_qwen3_5.py:1683,
+    # modeling_qwen3_5_moe.py:1868).
+    'qwen3_5': {'hidden_size': _repeats_text('hidden_size')},
+    'qwen3_5_moe': {'hidden_size': _repeats_text('hidden_size')},
 }
 
 
