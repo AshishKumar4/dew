@@ -25,8 +25,10 @@ for file in guest_limits.py guest_entry.py gateway_manager.py start-gateway.sh b
     curl -fsSL "https://raw.githubusercontent.com/AshishKumar4/dew/$source/site/live/container/$file" -o "/opt/live/$file"
 done
 printf '%s\n' "$commit" > /opt/live/dew-commit
+install -m 0644 -o model -g model /dev/null /opt/live/prepared.json
 runuser -u model -- env HF_HOME=/opt/hf JAX_PLATFORMS=cpu \
     JAX_COMPILATION_CACHE_DIR=/opt/xla JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS=0 \
     JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES=-1 XLA_FLAGS=--xla_cpu_max_isa=AVX2 \
     /opt/venv/bin/python /opt/live/warm-managed.py
+chmod 0750 /opt/models /opt/hf /opt/xla
 rm -rf /var/lib/apt/lists/* /root/.cache
