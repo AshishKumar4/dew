@@ -2028,25 +2028,9 @@ Against a float64 oracle at 2048 tokens the output error is 2.7e-3 relative and 
 
 ## Expert parallelism on 4x RTX 3090, 2026-09-23
 
-The machine has one host and four RTX 3090s. GPU0 and GPU1 connect
-through NVLink (NV4). GPU2 and GPU3 share a PCIe host bridge. Every
-other pair crosses the two sockets. The run uses jax 0.11.2, bf16
-compute and Pallas grouped matmul, with `tools/benchmark_step.py` timing
-12 steps after 3 warmup and tracing 3.
+The machine is one host with four RTX 3090s. GPU0 and GPU1 are joined by NVLink (NV4), GPU2 and GPU3 share a PCIe host bridge, and every other pair crosses the two sockets. The runs use jax 0.11.2, bf16 compute and the Pallas grouped matmul, through `tools/benchmark_step.py` with 12 timed steps after 3 warmup and 3 traced. Each row's attribution is benchmark_step's reading of its trace, in milliseconds per device per step: compute kernels, each collective, and the communication that no compute kernel overlapped. The model is a `causal_transformer` with 8 layers, width 1024, 16 heads and vocabulary 50304, with 32 experts of width 1024 and top-4 routing on every layer, at 4096 tokens a device (batch 16 of 1024 on four GPUs, 8 on two).
 
-`benchmark_step` reads each row's trace to attribute ms per device per
-step to compute kernels, each collective and communication without
-overlapping compute. The model is a `causal_transformer` with 8 layers,
-width 1024, 16 heads and vocabulary 50304. Each layer has 32 experts
-of width 1024 and top-4 routing. There are 4096 tokens per device:
-batch 16 of 1024 on four GPUs, or 8 on two.
-
-JAX collectives move 128 MB of bf16 per device in these link tests.
-`all_to_all` reaches 33.4 GB/s over NVLink, 6.9 over the PCIe pair and
-6.7 across sockets. In the same order, `all_gather` reaches 31.0, 5.8
-and 5.8, and `psum` reaches 33.4, 5.7 and 6.3. PCIe is no faster
-than a cross-socket pair, leaving GPU0 and GPU1 as the only fast pair
-on this box.
+I measured the links first, with JAX collectives of 128 MB of bf16 a device. `all_to_all` moves 33.4 GB/s over the NVLink pair, 6.9 over the PCIe pair and 6.7 across the sockets; `all_gather` gives 31.0, 5.8 and 5.8, and `psum` 33.4, 5.7 and 6.3. The PCIe pair is no faster than a cross-socket pair, so GPU0 and GPU1 are the only fast pair on this box.
 
 | mesh | expert axis joins | dispatch | ms/step | tokens/s | compute | exposed comm | all-to-all | all-gather | reduce-scatter | all-reduce | peak GiB |
 |---|---|---|---|---|---|---|---|---|---|---|---|
@@ -2072,76 +2056,27 @@ One pair at a time, `MeshSpec(expert=2)` at the same 4096 tokens a device:
 | GPU0-2, cross-socket | exchange | 454.9 | 241.4 | 210.3 | 172.6 | 0 | 0 | 73.7 |
 | GPU0-2, cross-socket | global | 795.5 | 188.0 | 620.9 | 0 | 279.9 | 273.8 | 67.2 |
 
-- Exchange beats global dispatch on slow links: 1.46x on four GPUs,
-  1.71x on the PCIe pair and 1.75x across sockets. They tie on NVLink
-  because global dispatch's expert all-gather and gradient reduce-scatter
-  cost 92 ms there, against 622 ms on the PCIe pair.
-- Most communication does not overlap compute. Four-way exchange spends
-  272 ms computing and 352 ms waiting on collectives, mostly all-to-all.
-  Capacity 1.25 bounds buckets and drops later rounds, reducing the step
-  to 550.6 ms.
-- With data x expert, the data-axis gradient all-reduce moves more bytes
-  than token exchange. Putting the expert axis across sockets and data
-  on the pairs is faster: 702.9 ms against 753.8. With expert x fsdp,
-  placements tie (788.1 against 800.3) because fsdp's all-gather and
-  reduce-scatter trade places with all-to-all.
+From the traces:
 
-Each change was measured before and after in one hold:
+- The exchange beats the global dispatch wherever the link is slow: 1.46x on four GPUs, 1.71x on the PCIe pair and 1.75x across the sockets. On the NVLink pair the two tie, because the global dispatch's expert all-gather and gradient reduce-scatter cost 92 ms there, against 622 ms on the PCIe pair.
+- Most of the communication is exposed. The four-way exchange spends 272 ms computing and 352 ms waiting on collectives that no compute overlaps, most of it the all-to-all. Capacity 1.25 bounds the buckets and drops the later rounds, which takes the step to 550.6 ms.
+- Under data x expert, the gradient all-reduce over the data axis moves more bytes than the token exchange, so the expert axis belongs across the sockets and the data axis on the pairs (702.9 ms against 753.8). Under expert x fsdp the two placements tie (788.1 against 800.3), because fsdp's all-gather and reduce-scatter trade places with the all-to-all.
 
-- Expert parameters enter the dispatch's `shard_map` as stored shards and
-  are gathered inside. Their gradient is reduce-scattered rather than
-  all-reduced whole. `fsdp 4` falls from 1157.1 to 904.0 ms as a
-  614 ms all-reduce becomes a 375 ms reduce-scatter. Expert 2 x fsdp 2
-  falls from 856.0 to 788.1 ms.
-- The first exchange round runs outside the checkpointed scan of later
-  rounds. Backward keeps its intermediates without recomputing them.
-  Expert 4 falls from 705.9 to 634.0 ms, and compute from 307.0 to 272.4.
-- Exchange gathers bucket rows through the sort index and scatters
-  returned rows directly to their slots, saving two row copies per round.
-  On NVLink, dropless falls from 300.5 to 295.8 ms and capacity 1.25
-  from 218.5 to 212.3. Peak memory falls from 14.1 to 13.7 GiB and
-  from 12.6 to 12.0.
+I made three changes, each measured before and after in one hold:
 
-One bf16 `ExpertMLP` layer under `MeshSpec(fsdp=2)` on NVLink uses
-8192 tokens, 32 experts and top 4. Forward plus backward with Pallas
-inside the dispatch map takes 26.2 ms, against 25.1 in the earlier
-row map. `jax.lax.ragged_dot` inside the map takes 271.9 ms and 6.5 GiB
-of temporaries because XLA computes a product over every expert. Outside
-any map, the global path ran out of memory on the 24 GiB cards.
-The earlier kernel selector sent fsdp-only meshes to XLA there.
+- Expert parameters enter the dispatch's `shard_map` in their stored shards and are gathered inside it, so their gradient is reduce-scattered and not all-reduced whole. fsdp 4 goes from 1157.1 to 904.0 ms, as a 614 ms all-reduce becomes a 375 ms reduce-scatter, and expert 2 x fsdp 2 from 856.0 to 788.1 ms.
+- The exchange's first round runs outside the checkpointed scan that holds the later rounds, so the backward keeps its intermediates and does not recompute them. expert 4 goes from 705.9 to 634.0 ms, and its compute from 307.0 to 272.4.
+- The exchange gathers each bucket's rows through the sort's index and scatters what returns straight to its slots, which saves two row copies a round. On the NVLink pair, dropless goes from 300.5 to 295.8 ms and capacity 1.25 from 218.5 to 212.3, with peak memory going from 14.1 to 13.7 GiB and from 12.6 to 12.0.
+
+I also timed one bf16 `ExpertMLP` layer forward plus backward under `MeshSpec(fsdp=2)` on the NVLink pair (8192 tokens, 32 experts, top 4). The Pallas kernels inside the dispatch's map take 26.2 ms (25.1 under the earlier row map), and `jax.lax.ragged_dot` inside the map takes 271.9 ms with 6.5 GiB of temporaries, because XLA runs it as a product over every expert. The same layer through the global path outside any map, which is where the earlier kernel selector sent fsdp-only meshes to XLA, ran out of memory on the 24 GiB cards.
 
 ### Rematerialization: the trainer's ladder
 
-The model's `remat` sets the starting policy. If a compiled step does
-not fit in device memory, the trainer moves to the next policy.
-For decoders, it tries none, `'minimal'` (MaxText's name for keeping
-every projection output), then `'full'`. For diffusion backbones, it
-tries `False`, `'dots'` (keeping matmul outputs and the attention forward),
-then `'full'`. Each policy uses less memory and takes more time, so
-the first that fits is the fastest that can run.
+A model's `remat` is where its step starts, and the trainer moves it up one rung whenever the compiled step does not fit its devices' memory. A decoder goes from none to `'minimal'` (MaxText's name: every projection output kept) to `'full'`, and a diffusion backbone from `False` to `'dots'` (matmul outputs and the attention forward kept) to `'full'`. Each rung is slower and smaller, so the first that fits is the fastest that runs.
 
-`dew.training.trainer.step_fits` checks allocation space. XLA places GPU
-step temporaries in one allocation. These temporaries, outputs that
-cannot reuse donated state, and batches `fit` prefetches beside the step's own
-batch must fit in one free block on each device. Total free bytes alone
-are insufficient. For BFC, the block is the pool's largest free block,
-or unused space within a growing pool's limit. Allocators reporting no
-pool, such as cuda_async and a TPU's allocator, use free bytes. Each
-process checks its devices, and the process pool uses the tightest limit.
+`dew.training.trainer.step_fits` decides whether a step fits. XLA places a GPU step's temporaries in one allocation, so the temporaries, the outputs that do not reuse the donated state and the batches `fit` prefetches next to the step's own all have to fit in one free block of each device, not just in its free bytes. The block is the BFC pool's largest, or the part of its limit that a growing pool has not taken yet. An allocator that reports no pool (cuda_async, or a TPU's) is read by its free bytes. Each process reads its own devices, and the pool of processes takes the tightest. Where the allocator can leave the temporaries no block to return to once a batch is prefetched next to them, the check holds room for them twice (`strands_temporaries`). That happens with cuda_async and with XLA's spatially partitioned pool, which `prepare_process` turns off.
 
-Prefetching a batch can leave no block large enough for the temporaries
-to return to. In that case, the check reserves room for them twice
-(`strands_temporaries`). This applies to cuda_async and XLA's spatially
-partitioned pool; `prepare_process` turns off the latter.
-
-A checkpoint records the policy used for training, head tile, remat and
-XLA options. A resumed run compiles that policy and moves up only if
-it does not fit, reporting the change. A restoring process may have
-different free memory from the original process, but selecting a lighter
-policy would run a different program. The compiled policy appears as
-`remat` in the run's `StepCompiled` record and `tools/benchmark_step.py`'s
-rows. This table measures forward, backward and AdamW with bf16 compute
-over 10 timed steps, using `tools/benchmark_kernels.py step --remat`:
+A checkpoint records the rung its state trained on (head tile, remat and XLA options). A resumed run compiles that rung and climbs from it only where it does not fit, and reports the climb. A process that restores a state may find other free memory than the process that built it, and a lighter rung would run a different program, so a resumed run does not step down. The rung a step compiled under is the `remat` of the run's `StepCompiled` record and of `tools/benchmark_step.py`'s rows. The table times forward plus backward plus AdamW in bf16 compute over 10 timed steps, with `tools/benchmark_kernels.py step --remat`:
 
 | device | model, batch x tokens | none | minimal / dots | full |
 |---|---|---|---|---|
@@ -2156,7 +2091,4 @@ over 10 timed steps, using `tools/benchmark_kernels.py step --remat`:
 | RTX 3090 | 359.8M decoder, 8 x 1024 | 420.9 ms, 13.16 GiB | 438.3 ms, 9.77 GiB | 505.1 ms, 6.33 GiB |
 | RTX 3090 | 321.8M MoE decoder, 4 x 1024 | 126.5 ms, 7.82 GiB | 133.6 ms, 6.26 GiB | 150.2 ms, 6.02 GiB |
 
-For decoders where all three policies ran, `'minimal'` costs 4-10% over
-no recomputation, and `'full'` costs 15-21%. Models that fit run without
-either. The L4 rows use jax 0.11.2 on Colab (2026-09-23). The RTX 3090
-rows use one GPU from the box.
+In the rows where all three ran (the decoders), `'minimal'` costs 4-10% over no recomputation and `'full'` 15-21%, so a model that fits runs without either. The L4 rows are jax 0.11.2 on Colab (2026-09-23), and the RTX 3090 rows ran on one GPU of the box.
