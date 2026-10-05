@@ -1,26 +1,28 @@
-"""JEPA encoders and predictors, arranged from the shared DiT machinery.
+"""JEPA encoders and predictors, built from the shared DiT blocks.
 
-A JEPA encoder is the DiT sandwich without the diffusion parts: patchify with
-the 2D sincos signal, run unmodulated ModulatedBlocks over the tokens, norm.
+A JEPA encoder is the DiT structure without the diffusion parts: patchify with
+the 2D sincos signal, run ModulatedBlocks over the tokens, then normalize.
 There is no timestep to condition on, so the blocks run in their unmodulated
-(plain pre-norm) mode, and the mixer is still pluggable; mixer patterns with
-'ssm' give a linear-time S5 encoder.
+(plain pre-norm) mode. The mixer is still configurable, and mixer patterns
+with 'ssm' give a linear-time S5 encoder.
 
 Position never comes from RoPE here. Both the encoder and the predictor work
 on a masked subset of the sequence, where a token's index in the sequence is
-not its position on the grid, so the spatial blocks run unrotated and
-position is carried entirely by the 2D sincos embedding that travels with
-each token.
+not its position on the grid, so the spatial blocks run unrotated and the 2D
+sincos embedding that stays with each token carries all the position
+information.
 
-The image encoder and predictor compute V-JEPA's (facebookresearch/jepa,
-image mode, mask-token predictor) with one difference: their MLPs run the
-tanh GELU where V-JEPA's run exact (erf) GELU. tests/test_jepa_source.py
-holds them to V-JEPA's own code with that swap. Exact GELU
+The image encoder and predictor compute what V-JEPA's do (facebookresearch/jepa,
+image mode, mask-token predictor) with one difference: their MLPs use the
+tanh GELU where V-JEPA's use exact (erf) GELU. Exact GELU
 (`ModulatedBlock.gelu_approximate=False`) made a training step 3.2% slower
-on the RTX 4080 (ViT-S/16 encoder at 224, 6-layer predictor, bf16, batch
-64: 36.35-36.51 ms against 35.24-35.30), and Dew loads no published
-I-JEPA or V-JEPA weights that would need it.
+on an RTX 4080, and Dew loads no published I-JEPA or V-JEPA weights that
+would need it.
 """
+
+# tests/test_jepa_source.py checks these modules against V-JEPA's own code with
+# the GELU swapped. The 3.2% was a ViT-S/16 encoder at 224 with a 6-layer
+# predictor, bf16, batch 64: 36.35-36.51 ms against 35.24-35.30.
 
 from typing import ClassVar, Literal
 
@@ -111,8 +113,11 @@ class JepaEncoder(_JepaStackOptions):
     scan_order: Literal["raster", "hilbert", "zigzag"] = "raster"
 
     stack_type: ClassVar[type[TokenStack | FactorizedTokenStack]] = TokenStack
-    """The layers between the patches and the norm: `TokenStack` over one
-    image's tokens, `FactorizedTokenStack` over a clip's frames."""
+    """The layers between the patches and the norm.
+
+    `TokenStack` runs over one image's tokens and `FactorizedTokenStack` over a
+    clip's frames.
+    """
 
     def setup(self):
         self.embed = self._embedding(self.patch_size, self.emb_features, self.scan_order)
@@ -150,18 +155,18 @@ class JepaVideoEncoder(JepaEncoder):
 
 @models("jepa_predictor")
 class JepaPredictor(_JepaStackOptions):
-    """Narrow transformer from context embeddings to target embeddings.
+    """A narrow transformer that maps context embeddings to target embeddings.
 
     Context tokens are projected down, mask tokens stand in for the targets,
-    and both carry the sincos signal for the grid position they belong to.
+    and both get the sincos signal for the grid position they belong to.
 
     The projections in and out split no tensor width, so under a tensor axis
-    each runs where `down_projection` places it: on each tensor shard's own
-    tokens where the measured link pays for gathering them, as multi-head
-    latent attention's down-projections do. On every token of every shard,
-    the two made layout_parity's JEPA compute 1.11 times one device's FLOPs
-    on tensor4.
+    each runs where `down_projection` places it. When the measured link is
+    fast enough to gather the results, each tensor shard projects only its
+    own tokens, as multi-head latent attention's down-projections do.
     """
+    # Run on every token of every shard, the two projections made
+    # tools/layout_parity's JEPA compute 1.11 times one device's FLOPs on tensor4.
     grid: tuple[int, int] = (14, 14)
     emb_features: int = 384      # encoder width, in and out
     predictor_features: int = 192
@@ -185,7 +190,7 @@ class JepaPredictor(_JepaStackOptions):
                                  precision=self.precision, name="proj_out")
 
     def __call__(self, context, context_idx, target_idx, train: bool = False):
-        """context: [B, (T,) N_ctx, F] -> predictions [B, (T,) N_tgt, F]."""
+        """Map context embeddings [B, (T,) N_ctx, F] to predictions [B, (T,) N_tgt, F]."""
         pos_embed = jnp.asarray(
             scan_ordered_pos_embed(self.predictor_features, *self.grid, self.scan_order),
             dtype=self.dtype or jnp.float32)
