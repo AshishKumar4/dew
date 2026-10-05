@@ -105,9 +105,10 @@ def test_forward_matches_the_reference_over_left_padding(source):
     """fp32 logits over 70 tokens (past one KDA chunk), one row left-padded
     by 9, against fla 0.4.0 on CUDA in IEEE fp32
     (tools/kimi_linear_reference.py): Dew's RMS distance from the float64
-    logits at most twice the reference's, and argmax exact. Observed RMS
-    from float64: Dew 1.28e-6, the reference 1.04e-6 (ratio 1.23 on CPU,
-    1.12 on an RTX 4080 and an RTX 3090)."""
+    logits at most twice the reference's, and argmax exact. The reference
+    sits 1.04e-6 from float64 (RMS); Dew at 0.90 of that on CPU, 0.80 on an
+    AVX-512 CPU (Intel SDE's Ice Lake server, the CI runners' ISA) and 0.67
+    on an RTX 4080."""
     loaded, inputs, reference = source
     logits = loaded.model.apply(loaded.variables, inputs.tokens, **inputs.kwargs())
     valid = reference["attention_mask"].astype(bool)
@@ -120,9 +121,13 @@ def test_update_exports_the_trained_model_back_in_the_source_layout(source, tmp_
     """One all-parameter SGD step at the reference's learning rate (1e-2,
     which moves the logits by up to 3.8). The loss is within 1e-5 of the
     reference's (4.8e-7 apart), and the updated logits are held to the
-    reference's own distance from a float64 step as the forward is.
-    Observed RMS from float64: Dew 5.47e-6, the reference 4.94e-6 (ratio
-    1.11 on CPU, 0.33 on an RTX 4080, 0.53 on an RTX 3090).
+    reference's own distance from a float64 step as the forward is. The
+    reference sits 4.94e-6 from float64 (RMS); Dew at 0.32 of that on CPU,
+    0.35 on an AVX-512 CPU and 1.44 on an RTX 4080. Over 16 orderings of the
+    residual stream (an exact symmetry, so only the rounding moves) Dew's
+    RMS is 0.87 of it on CPU and 0.72 on the 4080, the reference's own 0.98:
+    the gradient through the KDA decays is where `chunk_decay`'s segment sums
+    matter (2.04 on CPU when they were differences of cumulative sums).
 
     The export writes every source name back at its stored shape, A_log as
     [1, 1, heads, 1], and reloading restores the trained weights exactly."""

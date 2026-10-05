@@ -56,7 +56,14 @@ from jax.sharding import PartitionSpec as P
 from dew.nn.blocks import normal_kernel
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.kernels.ssd import ssd_chunk_scan, ssd_kernel_platform
-from dew.nn.linear import DepthwiseConv1d, _masked_conv1d, causal_conv1d, document_conv1d, document_starts
+from dew.nn.linear import (
+    DepthwiseConv1d,
+    _masked_conv1d,
+    causal_conv1d,
+    document_conv1d,
+    document_starts,
+    segment_sum,
+)
 from dew.nn.mixer_base import MixerBase, MixerContext, mixers
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import (
@@ -81,19 +88,6 @@ It stays finite because the Pallas kernel forms its segment sums as a
 matmul against a 0/1 triangle, where an infinity times 0 is a NaN; and it
 stays small enough that thousands of resets in one shard's total decay are
 nowhere near fp32's range."""
-
-
-def segment_sum(x):
-    """`segment_sum` (modeling_mamba2.py:73-90): over the last axis of `x`,
-    `out[..., i, j] = sum_{j < k <= i} x[..., k]` on and below the diagonal,
-    `-inf` above, as the reference's masked cumulative sum rather than a
-    difference of cumulative sums, so exp of it is the same numbers."""
-    size = x.shape[-1]
-    strict = jnp.tril(jnp.ones((size, size), jnp.bool_), -1)
-    expanded = jnp.where(strict, jnp.broadcast_to(x[..., :, None], (*x.shape, size)), 0.0)
-    summed = jnp.cumsum(expanded, axis=-2)
-    inclusive = jnp.tril(jnp.ones((size, size), jnp.bool_))
-    return jnp.where(inclusive, summed, -jnp.inf)
 
 
 def _expand_groups(x, num_heads: int):
