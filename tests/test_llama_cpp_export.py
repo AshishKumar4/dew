@@ -4,10 +4,10 @@ tools/llama_cpp_reference.py records llama.cpp v0.5.0 converting a tiny
 Llama's export with its own convert_hf_to_gguf.py to an F32 GGUF, and
 libllama's float32 logits over fixed ids, beside transformers' float64
 logits on the same export, and the vocabulary the GGUF carries. Here the
-export is written again and has to be the one llama.cpp read, config and
-weights; its tokenizer has to be the GGUF's vocabulary, piece for piece
-and special id for special id; and Dew's logits hold
-tests/reference_error.py's rule against llama.cpp's.
+export is written again and has to be the one llama.cpp read, config,
+generation config and weights; its tokenizer has to be the GGUF's
+vocabulary, piece for piece and special id for special id; and Dew's
+logits hold tests/reference_error.py's rule against llama.cpp's.
 """
 
 import json
