@@ -64,6 +64,7 @@ from dew.objectives.base import (
     Prediction,
     Ratio,
     Shown,
+    Source,
     Step,
     Variables,
     freeze,
@@ -458,15 +459,13 @@ class LMStatistics:
     router_z: tuple[Ratio, ...] = ()
 
 
-def _trainable_with(model: nn.Module, indexer: IndexerTraining | None, trainable: PathFilter | None,
-                    terms: Mapping[str, object]) -> PathFilter | None:
-    """The leaves the optimizer moves, once an indexer phase is checked
-    against `trainable` and the main loss's `terms`: the warm-up trains the
-    indexer alone and refuses every term."""
+def _phase_filter(model: nn.Module, indexer: IndexerTraining | None,
+                  terms: Mapping[str, object]) -> PathFilter | None:
+    """The leaves an indexer phase trains, once it is checked against the
+    main loss's `terms`: the warm-up trains the indexer alone and refuses
+    every term. None trains what the starting variables leave in `params`."""
     if indexer is None:
-        return trainable
-    if trainable is not None:
-        raise ValueError("the indexer's phase decides what trains, so trainable is not taken with it")
+        return None
     _check_indexer(model, indexer, terms)
     return _is_indexer if indexer.phase == "warmup" else None
 
@@ -505,10 +504,8 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     the default, keeps none: no second copy of the weights, and validation
     scores the weights that trained.
 
-    `pretrained` is a variables dict to start from instead of a fresh
-    init. A `dew.interop.PretrainedDecoder.load(...)` bundle's `lm_objective`
-    builds the objective with its model and variables together. The
-    trainer takes its whole initial state from `init`.
+    The trainer takes its whole initial state from `init`, which starts
+    from `variables` (described below).
 
     `balance_rate` moves each sparse layer's routing bias against its
     load by this much every step, which is DeepSeek's aux-loss-free
@@ -542,7 +539,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     carries the indexer. The warm-up phase keeps only the indexer in
     the `params` collection and the rest of the model under `frozen`,
     which is what `init` returns and a checkpoint stores. A
-    `pretrained` tree for that phase may omit the indexer's weights, as
+    starting tree for that phase may omit the indexer's weights, as
     a dense checkpoint does, and the fresh init fills them. The sparse
     phase reads a whole tree, either layout. The warm-up trains nothing
     but the indexer, so the terms of the main loss (`balance_rate`,
@@ -562,19 +559,19 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     switch loss before `router_aux_loss_coef`, which is
     `router_z_loss = 0.1 * aux_loss_alpha` here. Zero adds nothing.
 
-    `trainable` selects the parameter leaves the optimizer moves, by
-    their full path (`dew.objectives.base.PathFilter`). The rest of the
-    tree is kept under `frozen`, the split the warm-up uses for the
-    indexer, so `init` returns it and a checkpoint stores it. An
-    adapter's own filter (`dew.lora.LoRA.trainable`) goes here. None
-    trains every leaf.
+    `variables` is the tree training starts from, as `model.init`,
+    `Pretrained.load` or `LoRA.apply` return it; None draws a fresh one. A
+    split tree (`dew.objectives.base.freeze`, or an adapter's) is kept as
+    given: the optimizer moves what it leaves in `params`, and the rest
+    rides under `frozen`. `model` may be a loaded source in place of the
+    model (`LMObjective(qwen, seq_len=512)`), which supplies its model, its
+    variables and its processor; `variables` and `processor` override them.
 
     `token_accuracy` reports the argmax accuracy; False skips the pass
     over every logit it costs (0.77 ms of the head's 8.0 on a TPU v6e).
 
     `processor` is what `pipeline` turns text into ids with and decodes
-    through, unless it is handed another. A bundle's `lm_objective` passes
-    the source's own.
+    through, unless it is handed another.
     """
 
     artifact = TokenScores
@@ -600,7 +597,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         head_chunks: int = 4,
         head_tile: tuple[int, int] | Literal['whole', 'tiled'] | None = None,
         samples: Samples | None = None,
-        pretrained: Variables | None = None,
+        variables: Variables | None = None,
         balance_rate: float | None = None,
         aux_loss_alpha: float | None = None,
         seq_aux: bool = True,
@@ -610,11 +607,14 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         router_z_loss: float = 0.0,
         qk_stats: bool = False,
         indexer: IndexerTraining | None = None,
-        trainable: PathFilter | None = None,
         token_accuracy: bool = True,
         processor: Processor | None = None,
     ):
         """Build the objective; the class docstring describes each argument."""
+        if isinstance(model, Source):
+            variables = model.variables if variables is None else variables
+            processor = model.text_processor if processor is None else processor
+            model = model.model
         decoder = _decoder(model)
         if decoder is not None and decoder.causal is False:
             raise ValueError("LMObjective requires a causal model for next-token likelihoods")
@@ -624,7 +624,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         self.head_chunks = head_chunks
         self.head_tile = _head_tile(head_tile, self.keeps_whole_logits)
         self.samples = samples
-        self.pretrained = pretrained
+        self.variables = variables
         self.processor = processor
         self.balance_rate = balance_rate
         _check_terms(decoder, aux_loss_alpha=aux_loss_alpha, mtp_weight=mtp_weight, z_loss=z_loss,
@@ -638,7 +638,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         self.qk_stats = qk_stats
         self.token_accuracy = token_accuracy
         self.indexer = indexer
-        self.trainable = _trainable_with(model, indexer, trainable, {
+        self.phase = _phase_filter(model, indexer, {
             "balance_rate": balance_rate, "aux_loss_alpha": aux_loss_alpha,
             "mtp_weight": mtp_weight, "loss_role": loss_role, "z_loss": z_loss or None,
             "router_z_loss": router_z_loss or None})
@@ -661,46 +661,42 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         JIT as data; read off `self` inside a nullary trace it would be
         compiled into the executable as a constant.
         """
-        return self.pretrained
+        return self.variables
 
     @property
     def bank_sites(self) -> tuple[DecoderBank, ...]:
         return self.model.bank_sites
 
     def init(self, key, variables: Variables | None = None) -> Variables:
-        pretrained = self.pretrained if variables is None else variables
-        tree = self._whole_tree(pretrained, key)
-        return tree if self.trainable is None else freeze(tree, self.trainable)
+        tree = self._starting_tree(self.variables if variables is None else variables, key)
+        return tree if self.phase is None else freeze(tree, self.phase)
 
-    def _whole_tree(self, pretrained: Variables | None, key) -> Variables:
-        """Return the model's variables in one `params` collection.
-
-        Either the pretrained tree with its frozen split undone, or a
-        fresh init.
-        """
+    def _starting_tree(self, given: Variables | None, key) -> Variables:
+        """Return the tree training starts from: the given one as it is,
+        split or whole, or a fresh init. The indexer's warm-up decides its
+        own split, so it starts from the given tree whole."""
         def fresh() -> Variables:
             return self.model.init(key, jnp.zeros((1, self.seq_len), jnp.int32))
 
-        if pretrained is None:
+        if given is None:
             return fresh()
-        if "params" not in pretrained:
+        if "params" not in given:
             raise ValueError(
-                "pretrained is the variables dict ({'params': ...}) that "
+                "variables is the variables dict ({'params': ...}) that "
                 "Pretrained.load and model.init return")
-        pretrained = thaw(pretrained)
         if not self._warmup:
-            return pretrained
+            return given
+        whole = thaw(given)
         # The warm-up may start from a dense checkpoint that has no indexer
         # yet; the fresh init supplies exactly those weights.
         variables = fresh()
-        given = _leaf_paths(pretrained["params"])
-        missing = _leaf_paths(variables["params"]) - given
+        missing = _leaf_paths(variables["params"]) - _leaf_paths(whole["params"])
         outside = sorted("/".join(path) for path in missing if not _is_indexer(path))
         if outside:
             raise ValueError(
                 "the warm-up initialises the indexer and nothing else, but the "
-                f"pretrained tree lacks {outside[:3]}{'...' if len(outside) > 3 else ''}")
-        return merge(variables, pretrained)
+                f"starting tree lacks {outside[:3]}{'...' if len(outside) > 3 else ''}")
+        return merge(variables, whole)
 
 
     def policy(self, params: Variables, sampling: Sampling = _DEFAULT_SAMPLING) -> TextGeneration:
@@ -710,7 +706,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         from it; the result records the actual and raw-policy likelihoods
         the objective's ratio needs.
         """
-        return TextGeneration(self.model, thaw(params), sampling=sampling)
+        return TextGeneration(self.model, params, sampling=sampling)
 
     def inference_record(self):
         """Describe this decoder without a training RunConfig or parameter copies."""
@@ -738,7 +734,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         decodes.
         """
         samples = self.samples
-        return TextGeneration(self.model, thaw(self._pipeline_weights(state, ema)),
+        return TextGeneration(self.model, self._pipeline_weights(state, ema),
                               self.processor if processor is None else processor,
                               sampling=Sampling() if samples is None else samples.sampling,
                               max_new_tokens=None if samples is None or samples.max_new_tokens <= 0
@@ -928,6 +924,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         if temperature == 1.0 and support is None:
             return log_probs
         softcap = self.model.final_logit_softcap
+        params = thaw(params)
         head = self.model.apply(params, params["params"], method=type(self.model).head_weight)
         targets = tokens[:, 1:]
         if temperature != 1.0:

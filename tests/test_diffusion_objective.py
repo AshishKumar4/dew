@@ -586,7 +586,7 @@ def conditional_mmdit():
     # The objective encodes the unconditional branch from the weights it is
     # built over, so it is rebuilt over the ones these tests sample under.
     objective = DiffusionObjective(model, preset, inputs, steps=3, solver=Euler(),
-                                   guidance=CFG(2.0), pretrained=variables)
+                                   guidance=CFG(2.0), variables=variables)
     batch = {"image": np.arange(64, dtype=np.uint8).reshape(4, 4, 4, 1) * 3,
              **inputs.tokenize(["ab", "cd", "ef", "gh"])}
     step = Step(jnp.asarray(0), jax.random.key(4), None)
@@ -598,10 +598,10 @@ def test_null_dropout_matches_explicit_tokens_under_current_encoder(conditional_
     source, variables, batch, step = conditional_mmdit
     dropped = DiffusionObjective(source.model, source.process, source.inputs,
                                  unconditional_prob=probability, steps=3, solver=Euler(),
-                                 pretrained=variables)
+                                 variables=variables)
     conditional = DiffusionObjective(source.model, source.process, source.inputs,
                                      unconditional_prob=0.0, steps=3, solver=Euler(),
-                                     pretrained=variables)
+                                     variables=variables)
     mask = jax.random.bernoulli(jax.random.split(step.key, 5)[1], probability, (4,))
     explicit = source.inputs.tokenize([""] * 4)
     explicit = {"image": batch["image"], "text": jax.tree.map(
@@ -628,7 +628,7 @@ def test_a_dropped_row_is_conditioned_on_what_the_objective_holds(conditional_mm
     source, variables, batch, step = conditional_mmdit
     dropped = DiffusionObjective(source.model, source.process, source.inputs,
                                  unconditional_prob=1.0, steps=3, solver=Euler(),
-                                 pretrained=variables)
+                                 variables=variables)
     held = dropped.unconditional_conditions
     before = float(dropped.scalar_loss(variables, batch, step)[0])
     # The branch is encoded once and held; moving it in place moves the step.

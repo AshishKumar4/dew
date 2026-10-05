@@ -215,12 +215,11 @@ def test_host_task_and_server_preserve_nonzero_lora_branches():
     from dew.lora import LoRA
 
     bound = task(Sampling(temperature=0, eos_id=None))
-    adapter, fresh = LoRA.fresh(bound.model, bound.variables, {}, rank=2,
-                                modules=("q_proj", "gate_proj"), key=jax.random.key(17))
+    adapter = LoRA(rank=2, modules=("q_proj", "gate_proj")).apply(bound.model, bound.variables, key=17)
     trained = jax.tree_util.tree_map_with_path(
         lambda path, leaf: leaf + jax.random.normal(jax.random.key(29), leaf.shape) * .25
-        if getattr(path[-1], "key", None) == "lora_B" else leaf, fresh)
-    model = adapter.adapt(bound.model)
+        if getattr(path[-1], "key", None) == "lora_B" else leaf, adapter.variables)
+    model = adapter.model
     unplaced = TextGeneration(model, jax.tree.map(np.asarray, trained), bound.processor,
                              sampling=bound.sampling)
     placed = TextGeneration(model, trained, bound.processor, sampling=bound.sampling)

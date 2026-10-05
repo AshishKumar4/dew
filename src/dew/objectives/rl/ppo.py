@@ -15,7 +15,7 @@ from jax.experimental import multihost_utils
 from dew.artifacts import agreed
 from dew.inference.tasks import Processor, TextGeneration
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of
-from dew.objectives.base import Aux, EMASpec, Objective, Ratio, Shown, Step, Variables
+from dew.objectives.base import Aux, EMASpec, Objective, Ratio, Shown, Step, Variables, joined, part
 from dew.records import JSON, json_value, record
 from dew.registry import objectives
 from dew.rl import gae
@@ -65,31 +65,12 @@ class ValueHead(nn.Module):
         return nn.Dense(1, dtype=jnp.float32, name="value")(hidden)[..., 0]
 
 
-def _part(variables: Variables, name: str) -> Variables:
-    """Cut the `name` subtree out of every collection that holds one.
-
-    The joint tree nests the collection above the side, `params/policy`,
-    so a side's own tree is the same collections one level down.
-    """
-    return {collection: subtree[name] for collection, subtree in variables.items() if name in subtree}
-
-
-def _join(policy: Variables, critic: Variables) -> Variables:
-    """Nest a policy and a critic tree under one collection per side.
-
-    The inverse of `_part`: each collection the two share becomes a
-    `{"policy": ..., "critic": ...}` node.
-    """
-    return {collection: {name: tree[collection] for name, tree in (("policy", policy), ("critic", critic))
-                         if collection in tree} for collection in policy.keys() | critic.keys()}
-
-
 @dataclass(frozen=True)
 class _Policy:
     task: EpisodeInference
 
     def bind(self, variables: Variables, /) -> EpisodeInference:
-        return self.task.bind(_part(variables, "policy"))
+        return self.task.bind(part(variables, "policy"))
 
     def __call__(self, inputs: ModelInputs | Sequence[Sequence[int]], max_new_tokens: int, /,
                  *, key: jax.Array, sampling: Sampling) -> Generation:
@@ -145,11 +126,11 @@ class PPOObjective(Objective[Ratio, Variables]):
     def init(self, key: jax.Array, variables: Variables | None = None) -> Variables:
         critic = self.critic.init(jax.random.fold_in(key, 1),
                                   jnp.zeros((1, self.seq_len), jnp.int32))
-        return _join(self.actor.init(key, variables), critic)
+        return joined({"policy": self.actor.init(key, variables), "critic": critic})
 
     def policy(self, variables: Variables) -> EpisodeInference:
         """Bind the policy subtree when an episode collector supplies the full tree."""
-        return _Policy(self.actor.policy(_part(variables, "policy")))
+        return _Policy(self.actor.policy(part(variables, "policy")))
 
     def inference_record(self) -> JSON:
         """The actor's decoder record under PPO's name: a loader rebuilds the
@@ -163,7 +144,7 @@ class PPOObjective(Objective[Ratio, Variables]):
     def pipeline(self, state: TrainState, *, ema: bool | None = None,
                  processor: Processor | None = None) -> TextGeneration:
         """Publish the trained actor, without the critic or the frozen KL reference."""
-        actor_state = replace(state, variables=_part(state.variables, "policy"))
+        actor_state = replace(state, variables=part(state.variables, "policy"))
         return self.actor.pipeline(actor_state, ema=ema, processor=processor)
 
     def values(self, variables: Variables, batch: Mapping[str, object]) -> jax.Array:
@@ -175,7 +156,7 @@ class PPOObjective(Objective[Ratio, Variables]):
         """
         ids = jnp.asarray(batch[IDS_KEY], jnp.int32)
         segments = jnp.asarray(batch[SEGMENT_IDS_KEY], jnp.int32)
-        values = self.critic.apply(_part(variables, "critic"), ids[:, :-1], segment_ids=segments[:, :-1],
+        values = self.critic.apply(part(variables, "critic"), ids[:, :-1], segment_ids=segments[:, :-1],
                                    positions=jnp.asarray(batch[POSITIONS_KEY], jnp.int32)[:, :-1])
         if not isinstance(values, jax.Array) or values.shape != ids[:, :-1].shape:
             raise ValueError("PPO critic must return one scalar value per input position")
@@ -189,8 +170,8 @@ class PPOObjective(Objective[Ratio, Variables]):
         for field in (OLD_VALUES_KEY, RETURNS_KEY):
             if field not in batch or jnp.shape(batch[field]) != jnp.shape(batch[RESPONSE_MASK_KEY]):
                 raise ValueError(f"PPO requires response-aligned {field} from the rollout")
-        policy_step = replace(step, ema=None if step.ema is None else _part(step.ema, "policy"))
-        pg, aux = self.actor.loss(_part(variables, "policy"), batch, policy_step)
+        policy_step = replace(step, ema=None if step.ema is None else part(step.ema, "policy"))
+        pg, aux = self.actor.loss(part(variables, "policy"), batch, policy_step)
         mask = jnp.asarray(batch[RESPONSE_MASK_KEY])
         terms = clipped_value_loss_terms(self.values(variables, batch), jnp.asarray(batch[RETURNS_KEY]),
                                          jnp.asarray(batch[OLD_VALUES_KEY]), self.value_clip)
@@ -199,10 +180,10 @@ class PPOObjective(Objective[Ratio, Variables]):
         return Ratio(pg.total + self.value_coefficient * critic.total, pg.mass), Aux(metrics)
 
     def evaluate(self, params: Variables, batch, step: Step):
-        return self.actor.evaluate(_part(params, "policy"), batch, replace(step, ema=None))
+        return self.actor.evaluate(part(params, "policy"), batch, replace(step, ema=None))
 
     def preview(self, params: Variables, batch, step: Step, *, scored=None):
-        return self.actor.preview(_part(params, "policy"), batch, replace(step, ema=None), scored=scored)
+        return self.actor.preview(part(params, "policy"), batch, replace(step, ema=None), scored=scored)
 
 
 @dataclass(frozen=True)

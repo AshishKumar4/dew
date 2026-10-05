@@ -188,18 +188,17 @@ Import `LMObjective` from `dew.objectives.lm`.
 
 ```text
 LMObjective(model, seq_len, *, ema_decay=None, pad_id=None, head_chunks=4, head_tile=None,
-            samples=None, pretrained=None, balance_rate=None, aux_loss_alpha=None,
+            samples=None, variables=None, balance_rate=None, aux_loss_alpha=None,
             seq_aux=True, loss_role=None, mtp_weight=None, z_loss=0.0, router_z_loss=0.0,
-            qk_stats=False, indexer=None, trainable=None, token_accuracy=True,
-            processor=None)
+            qk_stats=False, indexer=None, token_accuracy=True, processor=None)
 IndexerTraining(phase, weight=1.0)
 ```
 
-`Pretrained.load` returns a bundle whose `lm_objective(seq_len, **options)` builds this objective with its model, initial variables and processor, which `pipeline` then decodes with. It refuses `pretrained=` because the bundle supplies those weights. `bundle.lora(...)` returns a bundle with a fresh adapter whose `lm_objective` trains the factors alone, and whose `save` and `export` merge them. The model must implement Linen `hidden_states(tokens, train=..., positions=..., segment_ids=...)`, returning `(B, S, D)`, and `head_weight(params)`, returning the `(D, vocab)` vocabulary matrix. The objective also reads `final_logit_softcap` and `precision`. Prediction-depth training needs `mtp_hidden_states` and compatible prediction-depth configuration. Mutable router, QK and indexer collections are required when their options are enabled.
+`model` may be a decoder bundle `Pretrained.load` returned: the objective reads its model, initial variables and processor, which `pipeline` then decodes with, and `variables=` or `processor=` beside it overrides that part. An adapted bundle (`bundle.adapt(LoRA(...), key=)`) trains the factors alone, and its `save` and `export` merge them. The model must implement Linen `hidden_states(tokens, train=..., positions=..., segment_ids=...)`, returning `(B, S, D)`, and `head_weight(params)`, returning the `(D, vocab)` vocabulary matrix. The objective also reads `final_logit_softcap` and `precision`. Prediction-depth training needs `mtp_hidden_states` and compatible prediction-depth configuration. Mutable router, QK and indexer collections are required when their options are enabled.
 
-`pretrained` supplies the complete variables tree; `loss_role` requires aligned `text_roles`. `pad_id` masks matching targets. `head_chunks` controls vocabulary tiling, and `head_tile` the head's backward tile (`'whole'`, `'tiled'` or a tile shape; `None` picks one for the objective); `samples` configures text previews. `ema_decay` defaults to `None`, which trains without an averaged copy; a decay such as `0.999` keeps one that evaluation and previews read, and `1.0` retains a frozen one. Routing balance, auxiliary loss, prediction-depth weight, and QK statistics require matching model computation. These interfaces make `LMObjective` specific to compatible decoders. `z_loss` adds PaLM's auxiliary term, the coefficient times the squared log partition of every counted prediction; zero adds nothing. `router_z_loss` is the routers' own z-loss (ST-MoE), and zero adds nothing. `token_accuracy=False` drops the `token_accuracy` metric and the pass over every logit it costs. `trainable` is a path filter over the parameter leaves the optimizer moves; the rest of the tree is kept under `frozen`. An adapter's filter, `dew.lora.LoRA.trainable`, goes here. `None` trains every leaf, and `trainable` cannot be combined with `indexer`.
+`variables` is the tree training starts from, whole, or split into what trains and what stays frozen by `dew.objectives.base.freeze` or an adapter; `loss_role` requires aligned `text_roles`. `pad_id` masks matching targets. `head_chunks` controls vocabulary tiling, and `head_tile` the head's backward tile (`'whole'`, `'tiled'` or a tile shape; `None` picks one for the objective); `samples` configures text previews. `ema_decay` defaults to `None`, which trains without an averaged copy; a decay such as `0.999` keeps one that evaluation and previews read, and `1.0` retains a frozen one. Routing balance, auxiliary loss, prediction-depth weight, and QK statistics require matching model computation. These interfaces make `LMObjective` specific to compatible decoders. `z_loss` adds PaLM's auxiliary term, the coefficient times the squared log partition of every counted prediction; zero adds nothing. `router_z_loss` is the routers' own z-loss (ST-MoE), and zero adds nothing. `token_accuracy=False` drops the `token_accuracy` metric and the pass over every logit it costs. `trainable` is a path filter over the parameter leaves the optimizer moves; the rest of the tree is kept under `frozen`. An adapter's filter, `dew.lora.LoRA.trainable`, goes here. `None` trains every leaf, and `trainable` cannot be combined with `indexer`.
 
-`indexer` trains DeepSeek-V3.2's lightning indexer on a model whose `mla` mixer names `index_n_heads` and `index_head_dim`. `IndexerTraining("warmup")` needs a mixer without `index_topk`: the model runs dense attention, `init` keeps the indexer alone in `params` and the rest of the tree under `frozen` (a `pretrained` tree may omit the indexer, as a dense checkpoint does), and the loss is the KL of the indexer's softmax from the attention distribution, reported as `indexer_kl`. `IndexerTraining("sparse")` needs a mixer with `index_topk`: the whole tree trains, the cross entropy trains the main weights and the KL over the selected keys trains the indexer, whose inputs are detached; a warm-up checkpoint's split tree is accepted as `pretrained`. `weight` scales the KL term.
+`indexer` trains DeepSeek-V3.2's lightning indexer on a model whose `mla` mixer names `index_n_heads` and `index_head_dim`. `IndexerTraining("warmup")` needs a mixer without `index_topk`: the model runs dense attention, `init` keeps the indexer alone in `params` and the rest of the tree under `frozen` (a `variables` tree may omit the indexer, as a dense checkpoint does), and the loss is the KL of the indexer's softmax from the attention distribution, reported as `indexer_kl`. `IndexerTraining("sparse")` needs a mixer with `index_topk`: the whole tree trains, the cross entropy trains the main weights and the KL over the selected keys trains the indexer, whose inputs are detached; a warm-up checkpoint's split tree is accepted as `variables`. `weight` scales the KL term.
 
 Import `generate`, `Sampling` and `Generation` from `dew.sampling`:
 
@@ -472,14 +471,15 @@ Pretrained.load(name_or_dir, *, dtype=jnp.bfloat16, param_dtype=jnp.float32, att
                 max_seq_len=None, revision=None, gguf_file=None, single_file=None, mesh=None,
                 layout=None, fallback=None) -> the kind it is called on, or the kind the source is
 PretrainedDecoder.text_generation(*, sampling=None) -> TextGeneration
-PretrainedDecoder.lm_objective(seq_len, **options) -> LMObjective
-PretrainedDecoder.lora(*, rank, modules, key, alpha=None, rslora=False, dropout=0.0) -> PretrainedDecoder
 PretrainedMaskedDecoder.text_generation() -> MaskedGeneration
 PretrainedBlockDecoder.block_generation() -> BlockGeneration
 PretrainedPipeline.text_to_image() -> TextToImage
-PretrainedPipeline.diffusion_objective(**options) -> DiffusionObjective
-PretrainedPipeline.lora(*, rank, modules, key, alpha=None, rslora=False, dropout=0.0) -> PretrainedPipeline
-PretrainedFallback.lm_objective(seq_len, **options) -> LMObjective
+Pretrained.adapt(lora, *, key) -> the same kind, with the bound adapter as `adapter`
+LoRA(rank, modules, alpha=None, rslora=False, dropout=0.0)
+LoRA.apply(model, variables, *, key, layouts=None) -> Adapter
+LoRA.load(model, variables, path, *, layouts=None) -> Adapter
+Adapter.from_run(directory, *, step=None, ema=None) -> Adapter
+Adapter.merge(variables) -> variables;  Adapter.save(variables, path)
 Pretrained.save(directory, *, variables=None, max_shard_size="5GB")
 Pretrained.push_to_hub(repo_id, *, variables=None, private=False, commit_message=..., max_shard_size="5GB")
 PPOObjective.pipeline(state, *, ema=None, processor=None) -> TextGeneration
@@ -573,12 +573,13 @@ A decoder trained through the LM recipe, exported with `PretrainedDecoder.from_m
 ```text
 DiffusionObjective(model, process, inputs, *, autoencoder=None,
                    unconditional_prob=0.12, ema_decay=0.999, solver=DDIM(),
-                   guidance=CFG(3.0), steps=200, pretrained=None, trainable=None)
+                   guidance=CFG(3.0), steps=200, variables=None)
 JepaObjective(encoder, predictor, mask, sample, momentum=(0.996, 1.0),
-              momentum_steps=100000, label_key="label")
+              momentum_steps=100000, label_key="label", encoder_variables=None,
+              predictor_variables=None)
 ```
 
-Import `DiffusionObjective` from `dew.objectives.diffusion`. `process` takes a preset such as `Flow()` or `EDM(regime="pixel")`, or a custom `Process`. A preset builds once and `objective.process` holds the resulting Gaussian process; masked-token presets are refused. `FlowGRPOObjective` accepts the same values. `TextToImage.from_objective` keeps the objective's built process, and a manually built image task takes a `Process`. Its model accepts noisy arrays shaped `(B, *latent_shape)`, model noise levels shaped `(B,)`, and conditioning keywords from `InputSpec`. It returns a prediction with the sample's channel/spatial geometry. The `Process` determines the training target and prediction conversion. The objective passes `train=True` and a dropout RNG during training. An autoencoder changes sample geometry and must expose compatible encode/decode operations. `ema_decay=None` keeps no averaged copy, so previews and evaluation read the live variables. `steps`, `solver`, and `guidance` configure preview sampling; they do not set the number of optimization steps.
+Import `DiffusionObjective` from `dew.objectives.diffusion`. `model` may be a pipeline bundle, `DiffusionObjective(pipe)`: the objective reads its denoiser, process, conditions, autoencoder, initial variables and sampling policy, and a keyword beside it overrides that part. `JepaObjective`'s `encoder_variables` and `predictor_variables` are the trees each module starts from, a pretrained or adapted encoder's included. `process` takes a preset such as `Flow()` or `EDM(regime="pixel")`, or a custom `Process`. A preset builds once and `objective.process` holds the resulting Gaussian process; masked-token presets are refused. `FlowGRPOObjective` accepts the same values. `TextToImage.from_objective` keeps the objective's built process, and a manually built image task takes a `Process`. Its model accepts noisy arrays shaped `(B, *latent_shape)`, model noise levels shaped `(B,)`, and conditioning keywords from `InputSpec`. It returns a prediction with the sample's channel/spatial geometry. The `Process` determines the training target and prediction conversion. The objective passes `train=True` and a dropout RNG during training. An autoencoder changes sample geometry and must expose compatible encode/decode operations. `ema_decay=None` keeps no averaged copy, so previews and evaluation read the live variables. `steps`, `solver`, and `guidance` configure preview sampling; they do not set the number of optimization steps.
 
 Import `JepaObjective` from `dew.objectives.jepa`. The encoder receives normalized images/video and optional token indices plus `train` and RNG settings. It returns token features with the feature dimension last. The predictor consumes context features and context/target position indices and returns target features of the encoder width. Mask grid, patch geometry, and predictor dimensions must agree. `momentum` specifies the EMA schedule endpoints over `momentum_steps` optimizer updates; `label_key` identifies labels for representation evaluation. See the [JEPA example](../guides/representation-learning.md).
 
@@ -657,7 +658,7 @@ from dew.interop import PretrainedPipeline
 
 source = PretrainedPipeline.load("./image-checkpoint", dtype=jnp.float32)
 images = source.text_to_image()(["a flower"], steps=20, key=0).host().images
-objective = source.diffusion_objective()
+objective = DiffusionObjective(source)
 ```
 
 Training batches contain uint8 NHWC images and `source.inputs.tokenize(captions)`. A nine-channel inpainting source also specifies `inputs.mask`: binary, one-channel NHWC masks with white marking the region to repaint. Caption dropout preserves the mask and masked-image latents. These inputs condition the network but do not guarantee that decoded unmasked pixels equal the original image.

@@ -15,7 +15,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import group_layers
 from dew.nn.inputs import ModelInputs
-from dew.objectives.base import FROZEN, Aux, EMASpec, Objective, Ratio, merge
+from dew.objectives.base import FROZEN, Aux, EMASpec, Objective, Ratio, freeze, merge
 from dew.objectives.lm import LMObjective
 from dew.training import Layout, Trainer
 from dew.training.host import companion_mesh, transfer
@@ -387,8 +387,14 @@ def test_streamed_banks_train_a_mixed_frozen_root_decoder_like_the_resident_stac
     def trainable(path):
         return "layers_1" not in path and path[-2:] != ("gate_proj", "kernel")
 
+    model = decoder()
+    start = freeze(LMObjective(model, 8).init(jax.random.key(0)), trainable)
+
     def objective():
-        return LMObjective(decoder(), 8, head_chunks=1, trainable=trainable, ema_decay=0.999)
+        # A host placement leaves its banks in the held tree's rows, so each
+        # trainer starts from its own copy.
+        return LMObjective(model, 8, head_chunks=1, variables=jax.tree.map(np.asarray, start),
+                           ema_decay=0.999)
 
     batch = tokens()
     resident = updated(objective(), batch, DEVICE)
@@ -460,7 +466,7 @@ def test_a_nested_decoder_bank_trains_beside_frozen_media_entries():
         return path[1] == "language_model" and "layers_1" not in path
 
     def objective():
-        return LMObjective(model, 8, head_chunks=1, pretrained=held, trainable=trainable)
+        return LMObjective(model, 8, head_chunks=1, variables=freeze(held, trainable))
 
     trainer = Trainer(objective(), optax.adam(.01), key=jax.random.key(5), layout=DEVICE)
     start, _, _ = trainer.place()
@@ -499,8 +505,8 @@ def test_an_unscanned_decoder_is_refused_by_a_host_layout():
     held = model.init(jax.random.key(0), batch["text"].tokens,
                       image_indices=batch["text"].token_fields["image_indices"],
                       conditioning=batch["text"].conditioning)
-    objective = LMObjective(model, 8, head_chunks=1, pretrained=held,
-                            trainable=lambda path: path[1] == "language_model")
+    objective = LMObjective(model, 8, head_chunks=1,
+                            variables=freeze(held, lambda path: path[1] == "language_model"))
     with pytest.raises(ValueError, match="language_model runs a plain loop"):
         updated(objective, batch, HOST)
     assert multimodal(scan_layers=True).bank_sites[0].scanned
@@ -534,7 +540,7 @@ def test_a_shared_text_owner_sums_both_block_losses_through_one_bank(detached):
 
     def objective():
         return BlockDiffusionObjective(
-            scanned, prompt_length=4, num_canvases=2, pretrained=loaded.variables,
+            scanned, prompt_length=4, num_canvases=2, variables=loaded.variables,
             stop_gradient_from_denoiser_to_encoder=detached)
 
     (site,) = objective().bank_sites
@@ -570,7 +576,9 @@ def test_frozen_leaves_stay_resident_and_snapshots_alias_them():
     def trainable(path):
         return path[-2:] == ("q_proj", "kernel")
 
-    objective = LMObjective(decoder(scan_layers=True), 8, head_chunks=1, trainable=trainable)
+    model = decoder(scan_layers=True)
+    objective = LMObjective(model, 8, head_chunks=1,
+                            variables=freeze(LMObjective(model, 8).init(jax.random.key(0)), trainable))
     trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(5), layout=HOST)
     state, _placement, _ = trainer.place()
     frozen = state.variables[FROZEN]
@@ -605,43 +613,35 @@ def test_place_streams_the_held_tree_and_releases_each_source():
     the state and the objective share one array per leaf and no numpy copy
     stays beside it."""
     model = decoder()
-    held = jax.tree.map(np.asarray, model.init(jax.random.key(1), jnp.zeros((1, 8), jnp.int32)))
-    objective = LMObjective(model, 8, head_chunks=1, pretrained=held,
-                            trainable=lambda path: path[-2:] == ("q_proj", "kernel"))
+    held = freeze(jax.tree.map(np.asarray, model.init(jax.random.key(1), jnp.zeros((1, 8), jnp.int32))),
+                  lambda path: path[-2:] == ("q_proj", "kernel"))
+    objective = LMObjective(model, 8, head_chunks=1, variables=held)
     trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(5), layout=HOST)
     state, _, _ = trainer.place()
-    for path, leaf in _named_leaves(held["params"]):
+    for path, leaf in _named_leaves(held):
         assert isinstance(leaf, jax.Array), path
     # A leaf every row froze lives once, as the run's bank; the held tree
     # holds that bank where each row was, so no row copy stays beside it.
     bank = state.variables[FROZEN]["layers_0_1"]["mlp"]["gate_proj"]["kernel"]
-    assert held["params"]["layers_1"]["mlp"]["gate_proj"]["kernel"] is bank
-    assert held["params"]["layers_0"]["mlp"]["gate_proj"]["kernel"] is bank
+    assert held[FROZEN]["layers_1"]["mlp"]["gate_proj"]["kernel"] is bank
+    assert held[FROZEN]["layers_0"]["mlp"]["gate_proj"]["kernel"] is bank
     assert (
         state.variables["params"]["layers_0"]["self_attn"]["q_proj"]["kernel"]
         is held["params"]["layers_0"]["self_attn"]["q_proj"]["kernel"]
     )
     fresh = jax.tree.map(np.asarray, model.init(jax.random.key(1), jnp.zeros((1, 8), jnp.int32)))
+
+    def queries(path):
+        return path[-2:] == ("q_proj", "kernel")
+
     resident = updated(
-        LMObjective(
-            model,
-            8,
-            head_chunks=1,
-            pretrained=fresh,
-            trainable=lambda path: path[-2:] == ("q_proj", "kernel"),
-        ),
+        LMObjective(model, 8, head_chunks=1, variables=freeze(fresh, queries)),
         tokens(),
         DEVICE,
     )
     close(
         updated(
-            LMObjective(
-                model,
-                8,
-                head_chunks=1,
-                pretrained=jax.tree.map(np.asarray, fresh),
-                trainable=lambda path: path[-2:] == ("q_proj", "kernel"),
-            ),
+            LMObjective(model, 8, head_chunks=1, variables=freeze(jax.tree.map(np.asarray, fresh), queries)),
             tokens(),
             HOST,
         ).variables,
@@ -702,8 +702,8 @@ def test_place_lets_a_mapped_checkpoint_page_go_once_the_leaf_has_landed(tmp_pat
     pages = banked_row.nbytes // 4096
     assert pages >= 1024
 
-    objective = LMObjective(model, 8, head_chunks=1, pretrained=held,
-                            trainable=lambda path: path[-2:] == ("q_proj", "kernel"))
+    objective = LMObjective(model, 8, head_chunks=1,
+                            variables=freeze(held, lambda path: path[-2:] == ("q_proj", "kernel")))
     trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(5), layout=HOST)
     state, _, _ = trainer.place()
     assert _resident_pages(banked_row) < pages // 10

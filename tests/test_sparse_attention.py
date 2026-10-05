@@ -11,7 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.lora import LoRA, Target
+from dew.lora import LoRA
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.mla import MultiHeadLatentAttention
 from dew.nn.sparse_selection import selection_mask, sparse_latent_attention, top_k_selection
@@ -109,10 +109,10 @@ def test_an_adapter_dropping_out_kv_b_proj_keeps_the_masked_kernel():
         emb_features=32, num_heads=HEADS, max_seq_len=64, q_lora_rank=16, kv_lora_rank=RANK,
         qk_nope_head_dim=NOPE, qk_rope_head_dim=ROPE, v_head_dim=VALUE,
         index_topk=5, index_n_heads=2, index_head_dim=16, attention_impl="reference")
-    adapter = LoRA({("params", "kv_b_proj"): Target(rank=4, alpha=8.0)}, dropout=0.5)
-    adapted = adapter.adapt(layer)
     hidden = jax.random.normal(jax.random.key(2), (2, 21, 32))
-    variables = adapted.init(jax.random.key(3), hidden)
+    adapter = LoRA(rank=4, modules=("kv_b_proj",), alpha=8.0, dropout=0.5).apply(
+        layer, layer.init(jax.random.key(3), hidden), key=3)
+    adapted, variables = adapter.model, adapter.variables
     factor = variables["params"]["kv_b_proj"]["lora_B"]
     variables["params"]["kv_b_proj"]["lora_B"] = jax.random.normal(jax.random.key(4), factor.shape)
     rngs = {"dropout": jax.random.key(5)}

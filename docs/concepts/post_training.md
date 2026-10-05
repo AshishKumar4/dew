@@ -57,7 +57,7 @@ roles = np.array([Role.USER] * len(prompt) + [Role.ASSISTANT] * len(response), d
 sft_batch = {"text": np.tile(row, (8, 1)), "text_roles": np.tile(roles, (8, 1))}
 sft_data = Dataset(train=lambda partition: itertools.repeat(sft_batch), val=None,
                    records=8, batch=8)
-sft_objective = LMObjective(model, seq_len=len(row) - 1, pretrained=base,
+sft_objective = LMObjective(model, seq_len=len(row) - 1, variables=base,
                             loss_role=Role.ASSISTANT)
 sft_state = Trainer(sft_objective, optax.adamw(1e-3), key=jax.random.key(1)).fit(
     sft_data, steps=20, log_every=10)
@@ -83,7 +83,7 @@ pair = {"chosen": prompt + response, "rejected": prompt + rejected,
 width = max(len(pair["chosen"]), len(pair["rejected"]))
 pairs = PreferencePairs(records=(json.dumps(pair),) * 8, seq_len=width,
                         loading=Loading(workers=0, threads=1, read_buffer=2)).load(batch=8)
-dpo = DPOObjective(model, seq_len=width - 1, beta=0.1, pretrained=sft_state.variables)
+dpo = DPOObjective(model, seq_len=width - 1, beta=0.1, variables=sft_state.variables)
 dpo_state = Trainer(dpo, optax.adam(1e-3), key=jax.random.key(2)).fit(
     pairs, steps=10, log_every=5)
 ```
@@ -120,7 +120,7 @@ def reward(data_source, completion, ground_truth, extra_info):
 rl_data = Dataset(train=lambda partition: itertools.repeat(prompt_batch), val=None,
                   records=8, batch=8)
 rl_objective = GRPOObjective(model, seq_len=len(story) + 7, beta=0.01,
-                             pretrained=dpo_state.variables)
+                             variables=dpo_state.variables)
 rollout = SampledRollout(rl_objective, reward=reward, groups=4, max_new_tokens=8,
                          sampling=Sampling(temperature=1.0, top_k=40),
                          decode=tokenizer.decode)

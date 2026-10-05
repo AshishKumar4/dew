@@ -679,7 +679,7 @@ def make_block_run(directory, fixture="diffusion-gemma-workflow", moved=0.0, tok
 
     fixture = Path(__file__).resolve().parent / "fixtures/hf" / fixture
     bundle = Pretrained.load(str(fixture), dtype="float32", attention_impl="xla", max_seq_len=32)
-    objective = BlockDiffusionObjective(bundle.model, prompt_length=3, pretrained=bundle.variables,
+    objective = BlockDiffusionObjective(bundle.model, prompt_length=3, variables=bundle.variables,
                                         processor=RunProcessor(tokenizer_for(tokenizer)))
     state = Trainer(objective, optax.sgd(0.01), key=jax.random.PRNGKey(2)).initial_state()
     if moved:
@@ -705,7 +705,7 @@ def make_masked_run(directory):
     fixture = Path(__file__).resolve().parent / "fixtures/hf/llada-tiny"
     source = Pretrained.load(fixture, dtype="float32", attention_impl="xla")
     objective = MaskedDiffusionObjective(source.model, MDLM(mask_id=120)(), 8,
-                                         pretrained=source.variables, ema_decay=None,
+                                         variables=source.variables, ema_decay=None,
                                          processor=RunProcessor(ByteTokenizer()))
     state = Trainer(objective, optax.sgd(0.05), key=jax.random.PRNGKey(19)).initial_state()
     checkpoints = Checkpoints(str(directory))

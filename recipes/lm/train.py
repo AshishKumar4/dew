@@ -243,7 +243,7 @@ def build_masked_objective(config: LmRunConfig, model, fields, pretrained):
     decode = None if config.sample_tokens <= 0 else run_tokenizer(config.tokenizer).decode
     return MaskedDiffusionObjective(
         model, MDLM(mask_id=int(mask))(), config.data.seq_len + 1,
-        ema_decay=config.ema_decay, decode=decode, pretrained=pretrained,
+        ema_decay=config.ema_decay, decode=decode, variables=pretrained,
         processor=RunProcessor(run_tokenizer(config.tokenizer)))
 
 
@@ -260,7 +260,7 @@ def build_block_objective(config: LmRunConfig, model, pretrained):
         raise ValueError("seq_len + 1 must equal block_prompt_tokens plus whole training canvases")
     return BlockDiffusionObjective(
         model, prompt_length=config.block_prompt_tokens, num_canvases=response // width,
-        canvas_size=width, pretrained=pretrained, ema_decay=config.ema_decay,
+        canvas_size=width, variables=pretrained, ema_decay=config.ema_decay,
         processor=RunProcessor(run_tokenizer(config.tokenizer)))
 
 
@@ -316,6 +316,14 @@ def main(config: LmRunConfig) -> TrainState:
     # Perplexity scores each validation pass; --trainer.eval-every None runs none.
     validation = () if config.trainer.eval_interval(data) is None else (Perplexity(),)
     pretrained = None if source is None else source.variables
+    if config.lora is not None:
+        # The adapter binds to the source's model and weights, so the
+        # objective trains its factors alone.
+        if source is None:
+            raise ValueError("--lora adapts the weights --pretrained loads; a run from scratch "
+                             "trains the whole model")
+        source = source.adapt(config.lora, key=config.trainer.key)
+        model, pretrained = source.model, source.variables
     if config.objective == "masked_diffusion":
         return config.train(build_masked_objective(config, model, fields, pretrained), data,
                             name=name, metrics=validation, summary=summary)
@@ -336,8 +344,8 @@ def main(config: LmRunConfig) -> TrainState:
         "qk_stats": config.optim.optimizer == "muonclip",
         "token_accuracy": config.token_accuracy,
     }
-    objective = (LMObjective(model, config.data.seq_len, **options) if source is None else
-                 source.lm_objective(config.data.seq_len, **options))
+    objective = LMObjective(model if source is None else source, config.data.seq_len,
+                            variables=pretrained, **options)
     return config.train(objective, data, name=name, metrics=validation, summary=summary)
 
 

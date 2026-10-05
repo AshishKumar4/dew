@@ -425,7 +425,7 @@ def test_the_warmup_starts_a_fresh_indexer_beside_a_dense_checkpoint():
                                         "v_head_dim": 8})
     checkpoint = dense.init(jax.random.key(5), jnp.zeros((1, SEQ), jnp.int32))
     objective = LMObjective(deepseek_stack(None), SEQ, indexer=IndexerTraining("warmup"),
-                            pretrained=checkpoint)
+                            variables=checkpoint)
     params = objective.init(jax.random.key(0))
     frozen = dict(jax.tree_util.tree_leaves_with_path(params[FROZEN]))
     given = dict(jax.tree_util.tree_leaves_with_path(checkpoint["params"]))
@@ -439,7 +439,7 @@ def test_the_warmup_starts_a_fresh_indexer_beside_a_dense_checkpoint():
                              if name != "embed_tokens"}}
     with pytest.raises(ValueError, match="embed_tokens"):
         LMObjective(deepseek_stack(None), SEQ, indexer=IndexerTraining("warmup"),
-                    pretrained=incomplete).init(jax.random.key(0))
+                    variables=incomplete).init(jax.random.key(0))
 
 
 def test_the_sparse_phase_reads_the_warmup_tree():
@@ -448,8 +448,8 @@ def test_the_sparse_phase_reads_the_warmup_tree():
     warmup = LMObjective(deepseek_stack(None), SEQ, indexer=IndexerTraining("warmup"))
     split = warmup.init(jax.random.key(0))
     for objective in (LMObjective(deepseek_stack(4), SEQ, indexer=IndexerTraining("sparse"),
-                                  pretrained=split),
-                      LMObjective(deepseek_stack(4), SEQ, pretrained=split)):
+                                  variables=split),
+                      LMObjective(deepseek_stack(4), SEQ, variables=split)):
         params = objective.init(jax.random.key(1))
         assert sorted(params) == ["params"]
         leaves = dict(jax.tree_util.tree_leaves_with_path(params["params"]))
@@ -466,7 +466,7 @@ def test_evaluation_and_scoring_read_the_split_tree():
     params = objective.init(jax.random.key(0))
     batch = token_batch()
     scored = objective.evaluate(params, batch, step_at())
-    merged = LMObjective(deepseek_stack(None), SEQ, pretrained=params).init(jax.random.key(0))
+    merged = LMObjective(deepseek_stack(None), SEQ, variables=params).init(jax.random.key(0))
     expected = objective.token_scores(merged, batch["text"])
     np.testing.assert_allclose(scored.losses, expected.losses, rtol=1e-6, atol=1e-6)
     assert not objective.ema.select((FROZEN, "layers_0"))

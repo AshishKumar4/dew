@@ -244,7 +244,7 @@ def test_flow_rollout_groups_rewards_selects_steps_and_preserves_likelihoods():
     params = jax.tree.unflatten(tree, [leaf + 0.1 * jax.random.normal(key, leaf.shape, leaf.dtype)
                                        for leaf, key in zip(leaves, noise, strict=True)])
     objective = FlowGRPOObjective(model, process, inputs, guidance=guidance, steps=7,
-                                  pretrained={**initial, "params": params})
+                                  variables={**initial, "params": params})
 
     optimizer = optax.sgd(1e-3)
     state = Trainer(objective, optimizer, key=jax.random.key(21)).initial_state()

@@ -193,34 +193,35 @@ With gradient accumulation, the cross-entropy and multi-token-prediction (MTP) l
 
 ## Pretrained checkpoints
 
-`Pretrained.load(name_or_dir)` reads a local Hugging Face directory or a Hub identifier into a `Pretrained` bundle: the native Flax model, its variables, the checkpoint's processor or tokenizer, the source config and the generation defaults. The bundle is the kind of source it read, each with the methods that work for it: `PretrainedDecoder` (text generation, `lm_objective`, `lora`), `PretrainedMaskedDecoder` (LLaDA, Dream), `PretrainedBlockDecoder` (DiffusionGemma), `PretrainedPipeline` (latent diffusion, `text_to_image`, `diffusion_objective`, `lora`) and `PretrainedFallback` (`fallback="torchax"`, `lm_objective`). Calling `load` on a kind, as `PretrainedDecoder.load(...)`, refuses a source of another kind by name. `dew.pipeline(source)` wraps the same loader and returns a `TextGeneration` (a `BlockGeneration` for DiffusionGemma, a `MaskedGeneration` for LLaDA and Dream) with the weights placed on the current devices and the sampling policy and budget taken from the checkpoint.
+`Pretrained.load(name_or_dir)` reads a local Hugging Face directory or a Hub identifier into a `Pretrained` bundle: the native Flax model, its variables, the checkpoint's processor or tokenizer, the source config and the generation defaults. The bundle is the kind of source it read, each with the methods that work for it: `PretrainedDecoder` (text generation), `PretrainedMaskedDecoder` (LLaDA, Dream), `PretrainedBlockDecoder` (DiffusionGemma), `PretrainedPipeline` (latent diffusion, `text_to_image`) and `PretrainedFallback` (`fallback="torchax"`, training only). Every kind takes an adapter (`adapt`) and stands in for the model in the objective that trains it. Calling `load` on a kind, as `PretrainedDecoder.load(...)`, refuses a source of another kind by name. `dew.pipeline(source)` wraps the same loader and returns a `TextGeneration` (a `BlockGeneration` for DiffusionGemma, a `MaskedGeneration` for LLaDA and Dream) with the weights placed on the current devices and the sampling policy and budget taken from the checkpoint.
 
-A decoder's `bundle.lm_objective(seq_len, **options)` builds an `LMObjective` starting from its loaded weights. With token files prepared using the checkpoint's tokenizer (`dew tokenize --tokenizer Qwen/Qwen3-0.6B`), fine-tuning uses the same trainer as training from scratch:
+`LMObjective(bundle, seq_len, **options)` trains a decoder bundle from its loaded weights. With token files prepared using the checkpoint's tokenizer (`dew tokenize --tokenizer Qwen/Qwen3-0.6B`), fine-tuning uses the same trainer as training from scratch:
 
 ```python
 from dew.interop import PretrainedDecoder
 
 data = TokenWindows(path="data/qwen3-tokens", seq_len=512).load(batch=4)
 bundle = PretrainedDecoder.load("Qwen/Qwen3-0.6B", max_seq_len=512)
-objective = bundle.lm_objective(seq_len=512)
+objective = LMObjective(bundle, seq_len=512)
 state = Trainer(objective, optax.adamw(1e-5), key=jax.random.key(0)).fit(data, steps=100)
 ```
 
-This downloads the Hub weights and needs memory for the model, gradients and optimizer. A bundle already supplies the initial variables, so passing `pretrained=` as well is refused. It also hands the objective its processor, so `objective.pipeline(state)` takes text prompts; `processor=` overrides it.
+This downloads the Hub weights and needs memory for the model, gradients and optimizer. The bundle supplies the model, the initial variables and its processor, so `objective.pipeline(state)` takes text prompts; `variables=` or `processor=` beside it overrides that part.
 
-`bundle.lora(rank=, modules=, key=)` returns the same kind of bundle with a fresh low-rank adapter (LoRA) on the projections `modules` names, PEFT's `target_modules`. Its `lm_objective` trains the adapter's factors and leaves every other weight frozen. `tuned.adapter.save` writes PEFT's adapter directory, and `tuned.save` writes the source's layout with the factors merged into the kernels. Both read the trainer's `state.variables` as it comes back:
+`dew.lora.LoRA` describes a low-rank adapter by PEFT's own fields (`rank`, `modules` as PEFT's `target_modules`, `alpha`, `rslora`, `dropout`), and `bundle.adapt(lora, key=)` returns the same kind of bundle with it bound: the adapted model, the variables with the factors under `params` and every base weight under `frozen`, and the bound `adapter`. Any objective over it trains the factors and leaves every other weight as loaded. `tuned.adapter.save` writes PEFT's adapter directory, and `tuned.save` writes the source's layout with the factors merged into the kernels. Both read the trainer's `state.variables` as it comes back:
 
 ```python
-key = jax.random.key(0)
-tuned = bundle.lora(rank=8, modules=("q_proj", "v_proj"), key=key)
-objective = tuned.lm_objective(seq_len=512)
-state = Trainer(objective, optax.adamw(1e-4), key=key).fit(data, steps=100)
+from dew.lora import LoRA
+
+tuned = bundle.adapt(LoRA(rank=8, modules=("q_proj", "v_proj")), key=0)
+objective = LMObjective(tuned, seq_len=512)
+state = Trainer(objective, optax.adamw(1e-4), key=0).fit(data, steps=100)
 tuned.adapter.save(state.variables, "qwen3-adapter")
 tuned.save("qwen3-merged", variables=state.variables)
-print(objective.pipeline(state)("The capital of France is", 8, key=key).text[0])
+print(objective.pipeline(state)("The capital of France is", 8, key=0).text[0])
 ```
 
-`bundle` itself is unchanged; `lora` returns a new value. Calling `lora` on an adapted bundle is refused, as is `trainable=` beside an adapter. `dew.lora.LoRA.fresh` and `LoRA.load` build the same adapter over any model and variables, for a model built from the registry or a pipeline component.
+`bundle` itself is unchanged; `adapt` returns a new value, and adapting an adapted bundle is refused. `LoRA(...).apply(model, variables, key=)` binds the same adapter to any model and variables, a model built from its class included, and `LoRA.load(model, variables, path, layouts=)` reads one PEFT or Diffusers wrote; both return the bound `Adapter`, whose `model` and `variables` go to an objective. A run on the command line takes the same spec as `lora:lora --lora.rank 8 --lora.modules q_proj v_proj` beside `--pretrained`, and `Pretrained.from_run(run).adapter.save(...)` writes its factors under the source's names from the run alone. To train part of a model without an adapter, split its starting variables with `dew.objectives.base.freeze(variables, filter)`: the leaves the filter keeps train and the rest stay frozen.
 
 `PretrainedDecoder.from_model` wraps a trained `CausalTransformer` for export, and `save` writes it in the Hugging Face layout. This exports the decoder from the example and loads it back:
 
@@ -328,7 +329,7 @@ import optax
 from dew.data.dataset import Dataset
 from dew.training import Layout, MeshSpec
 
-mm_objective = bundle.lm_objective(inputs.tokens.shape[1] - 1, pad_id=0)
+mm_objective = LMObjective(bundle, inputs.tokens.shape[1] - 1, pad_id=0)
 rows = 2 * jax.device_count()
 batch = inputs.take_rows(jax.numpy.arange(rows) % 2)
 mm_data = Dataset(train=lambda partition: iter([{"text": batch}]), val=None,
@@ -469,7 +470,7 @@ with np.load(sft_source / "reference.npz") as reference:
 block_data = Dataset(train=lambda partition: iter([{"text": train_tokens}]), val=None,
                      records=len(train_tokens), batch=len(train_tokens))
 block_objective = BlockDiffusionObjective(sft_bundle.model, prompt_length=4,
-                                          num_canvases=2, pretrained=sft_bundle.variables)
+                                          num_canvases=2, variables=sft_bundle.variables)
 block_state = Trainer(block_objective, optax.sgd(0.001), key=jax.random.key(2)).fit(
     block_data, steps=1, log_every=1)
 print("Optimizer updates:", int(block_state.updates))

@@ -29,6 +29,7 @@ from reference_error import assert_as_exact_as_the_reference
 from dew.interop.diffusion import component_tensors, translate_wan_weights
 from dew.interop.pretrained import Pretrained, load_diffusion_source
 from dew.interop.streaming import SourceLeaf
+from dew.objectives.diffusion import DiffusionObjective
 from dew.training import Layout, MeshSpec
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -235,7 +236,7 @@ def test_a_pipeline_without_its_text_encoder_refuses_what_reads_it(extracted, tm
     with pytest.raises(ValueError, match="text=False"):
         task(PROMPTS, steps=2, key=0)
     with pytest.raises(ValueError, match="text=False"):
-        lean.diffusion_objective()
+        DiffusionObjective(lean)
     with pytest.raises(ValueError, match="text=False"):
         lean.save(tmp_path / "saved")
     given = encoded(extracted["wan"], "WanConditioner", PROMPTS, {})
