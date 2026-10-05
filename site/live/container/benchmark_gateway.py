@@ -7,7 +7,6 @@ import pathlib
 import statistics
 import time
 import urllib.request
-from queue import Empty
 
 from jupyter_client import BlockingKernelClient
 
@@ -63,17 +62,7 @@ def main():
             client.start_channels()
             kernels.append((model["id"], client, 0))
             try:
-                deadline=time.perf_counter()+30
-                while True:
-                    client.kernel_info()
-                    try:
-                        message=client.get_shell_msg(timeout=1)
-                        if message['msg_type']=='kernel_info_reply':
-                            break
-                    except Empty:
-                        pass
-                    if time.perf_counter()>deadline:
-                        raise TimeoutError('kernel_info did not reply within 30 seconds')
+                client.wait_for_ready(timeout=30)
             except Exception:
                 print('KERNEL_STATUS',request('/api/kernels/'+model['id']),flush=True)
                 dump_processes()
@@ -123,6 +112,7 @@ def main():
         for identifier, client, _ in kernels:
             client.stop_channels()
             request("/api/kernels/" + identifier, method="DELETE")
+        assert not list(pathlib.Path("/sessions/connections").glob("kernel-*.json"))
 
 
 if __name__ == "__main__":
