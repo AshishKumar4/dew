@@ -78,6 +78,19 @@ def test_the_distance_and_its_gradient_are_repa_es():
 
         gradient = np.asarray(jax.grad(mean)(first))
         roundings = chain_roundings(jax.make_jaxpr(jax.grad(mean))(first))
+        import platform, os
+        print("DIAG x64", jax.config.jax_enable_x64, "first", first.dtype, "second", second.dtype,
+              "wide", {str(leaf.dtype) for leaf in jax.tree.leaves(wide)}, "gradient", gradient.dtype,
+              "cache", jax.config.jax_compilation_cache_dir, "XLA_FLAGS", os.environ.get("XLA_FLAGS"),
+              "cpu", platform.processor(), open("/proc/cpuinfo").read().split("model name")[1].split("\n")[0],
+              "flags avx512f", "avx512f" in open("/proc/cpuinfo").read(), "devices", jax.device_count())
+        truth64 = reference["gradient_f64"]
+        print("DIAG apart", float(np.sqrt(np.mean((gradient - truth64) ** 2))), "images dtype", reference["images"].dtype,
+              "jaxpr dtypes", sorted({str(v.aval.dtype) for e in jax.make_jaxpr(jax.grad(mean))(first).eqns for v in e.outvars}))
+        jax.config.update("jax_compilation_cache_dir", None)
+        jax.clear_caches()
+        again = np.asarray(jax.grad(mean)(first))
+        print("DIAG no-cache apart", float(np.sqrt(np.mean((again - truth64) ** 2))))
     assert_computes_the_oracle(gradient, reference["gradient_f64"], "the gradient", roundings=roundings)
 
 
