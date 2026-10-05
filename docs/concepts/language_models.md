@@ -151,7 +151,7 @@ The binary files use the smallest unsigned dtype that holds the vocabulary. Two 
 | `router_z_loss` | `0.0` | ST-MoE router z-loss coefficient. |
 | `mtp_weight` | `None` | Weight of DeepSeek V3's multi-token prediction loss. |
 | `z_loss` | `0.0` | PaLM's squared log-partition auxiliary. |
-| `qk_stats` | `False` | Report per-head attention logit maxima and the key-head count for `muonclip`, which clips per query group as Megatron Core does. |
+| `qk_stats` | `False` | Report per-head attention logit maxima, the key-head count and the head width for `muonclip`, which clips per query group as Megatron Core does and leaves an output gate's weights alone. |
 | `trainable` | `None` | `PathFilter` selecting the leaves the optimizer moves; the rest go under `frozen`. |
 | `token_accuracy` | `True` | Report argmax accuracy. |
 
