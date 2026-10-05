@@ -1718,6 +1718,29 @@ three took fp32's argmax. It gained nothing measurable:
 
 171 added lines were not worth that.
 
+A serving step decodes every slot, drawing or not, and the decode kernel
+read and wrote every row's state. Under open-loop arrivals most of 128
+slots sit idle, and the state is most of a decode step's bytes, so the
+step cost as much as a full one: a 15 ms median token gap at 16 requests
+a second against vLLM's 4.2. The kernel now skips a row the step marks
+idle (`active`, the row's validity). Its state is neither read nor
+written, the output aliases it, and the row outputs zeros. Eighteen layers
+at 128 rows took 8.43 ms with every row drawing, 2.22 with a quarter and
+0.20 with none. Serving, two rounds alternating, with generations bitwise
+the same at 32 and 128 slots:
+
+| slots | rate | before: TTFT p50 / p99, gap p50 / p99 (ms) | after |
+|---:|---:|---|---|
+| 32 | 8 | 23.3-23.8 / 35.0-35.2, 5.55-5.56 / 12.6-13.3 | 19.5-19.8 / 29.7-33.1, 4.05 / 10.7-10.9 |
+| 32 | 16 | 24.8-25.1 / 40.5-48.4, 5.56-5.59 / 15.2-16.7 | 21.2-21.3 / 34.0-37.6, 4.36-4.38 / 13.7-14.0 |
+| 32 | 24 | 25.6-25.7 / 42.2-44.3, 5.57-5.59 / 15.1-15.6 | 23.5 / 38.8-40.1, 4.86-4.88 / 14.5-14.6 |
+| 128 | 16 | 57.0-57.9 / 87.4-94.0, 15.2-15.3 / 33.7-34.1 | 37.2-37.5 / 59.4-60.8, 8.94-8.96 / 21.9-22.2 |
+| 128 | 24 | 62.3-62.7 / 93.3-93.8, 15.4-15.6 / 34.4-35.0 | 44.7-44.9 / 72.3-74.5, 10.6-10.7 / 25.4-26.4 |
+| 128 | 32 | 66.6-66.9 / 97.3-106, 18.4-21.9 / 36.1-36.7 | 54.8-55.2 / 82.7-85.2, 13.5 / 31.6 |
+
+Closed loop is unchanged at 32 slots (4503-4506 against 4408-4533 tokens
+a second). At 128 it rose from 5801-5818 to 5966.
+
 ## Quantized serving of the 176M text-to-image model, 2026-09-28
 
 `TextToImage.quantized` serves the denoiser with its kernels stored as int8
