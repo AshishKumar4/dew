@@ -650,14 +650,15 @@ def share[T: Registry[Any, Any]](table: T) -> T:
     for held in REGISTRIES:
         if held.kind == table.kind and held is not table:
             raise ValueError(f"a {table.kind} registry is already shared; a kind has one table")
-    if table not in REGISTRIES:
+    # By identity: a table is a Mapping, and `in` would call two empty
+    # tables of different kinds equal.
+    if not any(held is table for held in REGISTRIES):
         REGISTRIES.append(table)
     return table
 
 __all__ = [
     "REGISTRIES",
     "Registry",
-    "share",
     "datasets",
     "encoders",
     "metrics",
@@ -667,6 +668,7 @@ __all__ = [
     "presets",
     "projectors",
     "schedules",
+    "share",
     "solvers",
     "towers",
     "with_precision",
