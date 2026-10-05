@@ -240,7 +240,8 @@ def _gemma3n_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderF
     used.add('chunk_size_feed_forward')
     clip = hf_config.get('altup_coef_clip', 120.0)
     # AltUp's own checks name the reference's fields, so a config out of
-    # their range is refused here.
+    # their range is refused here; that is why the value is built before its
+    # record, which states all four of AltUp's fields.
     altup = AltUp(num_inputs=records.integer(hf_config.get('altup_num_inputs', 4), 'altup_num_inputs'),
                   active_idx=records.integer(hf_config.get('altup_active_idx', 0), 'altup_active_idx'),
                   coef_clip=None if clip is None else records.number(clip, 'altup_coef_clip'),
