@@ -35,6 +35,8 @@ from jax.typing import DTypeLike
 from dew import records
 
 if TYPE_CHECKING:
+    from dew.diffusion.process import Process
+    from dew.registry import DtypeName
     from dew.sampling.pipelines import TextToImage
 
 # FlaxDiff 0.2's DiTs held these at their root; Dew nests them under the
@@ -208,6 +210,15 @@ def _condition(input_config: Mapping[str, object]) -> tuple[str, str, str]:
             records.text(condition.get("unconditional_input", ""), "unconditional_input"))
 
 
+def _towers(clip: str, unconditional: str, vae: str, dtype: DtypeName):
+    """A run's CLIP condition and SD VAE, computing in `dtype`; FlaxDiff read
+    the VAE's main branch."""
+    from dew.objectives.diffusion.config import PretrainedAutoencoder, TextCondition
+
+    return (TextCondition(checkpoint=clip, dtype=dtype, unconditional=unconditional).build(),
+            PretrainedAutoencoder(modelname=vae, revision="main", dtype=dtype).build())
+
+
 def text_to_image(directory: str | os.PathLike, config: Mapping[str, object], *, jax_version: str,
                   ema: bool = True, best: bool = False, dtype: DTypeLike | None = None) -> TextToImage:
     """A FlaxDiff text-to-image run as a Dew `TextToImage` (`TextToImage.from_flaxdiff`).
@@ -219,14 +230,14 @@ def text_to_image(directory: str | os.PathLike, config: Mapping[str, object], *,
 
     The text tower and the VAE load from the Hub under the names the config
     records, both computing in bfloat16 as FlaxDiff's did. A call samples the
-    way FlaxDiff's trainer previewed the run: Euler ancestral over 200 steps
-    of the Karras grid, classifier-free guidance 3.
+    way FlaxDiff's trainer previewed the run: Euler ancestral with
+    classifier-free guidance 3 over FlaxDiff's own grid of the Karras
+    schedule, 200 steps unless the call names another count.
     """
     from dew.diffusion.presets import EDM
     from dew.inputs import Field, InputSpec
     from dew.nn.dit import TextContext
     from dew.nn.text_encoders import check_tree
-    from dew.objectives.diffusion.config import PretrainedAutoencoder, TextCondition
     from dew.registry import models, resolve_dtype
     from dew.sampling import CFG, EulerAncestral, TextToImage
 
@@ -253,10 +264,8 @@ def text_to_image(directory: str | os.PathLike, config: Mapping[str, object], *,
     variables = convert(read_checkpoint(directory, ema=ema, best=best),
                          model_config, jax_version=jax_version)
 
-    # FlaxDiff's encoders ran in bfloat16, and it read the VAE's main branch.
-    condition = TextCondition(checkpoint=clip, dtype="bfloat16", unconditional=unconditional).build()
-    vae = PretrainedAutoencoder(modelname=records.text(options["modelname"], "modelname"),
-                                     revision="main").build()
+    # FlaxDiff's encoders ran in bfloat16.
+    condition, vae = _towers(clip, unconditional, records.text(options["modelname"], "modelname"), "bfloat16")
     encoder = condition.encoder
     context = encoder.encode(encoder.params, encoder.tokenize([unconditional]))
     if not isinstance(context, TextContext):
@@ -268,5 +277,14 @@ def text_to_image(directory: str | os.PathLike, config: Mapping[str, object], *,
 
     inputs = InputSpec(sample=Field("image", (height, width, channels)), conditions={keyword: condition})
     params = {**variables, "encoders": {keyword: encoder.params}, "autoencoder": vae.params}
-    return TextToImage(model, EDM(regime="latent")(), inputs, params, vae, steps=200, guidance=CFG(3.0),
-                       solver=EulerAncestral())
+    process = EDM(regime="latent")()
+
+    def grid(steps: int) -> tuple[Process, jax.Array]:
+        # FlaxDiff's `get_steps(1000, 0, steps)` truncates an evenly spaced
+        # per-mille grid to int16 and `scale_steps` maps it back onto the
+        # schedule's [0, 1], so its times sit up to a thousandth below an
+        # even ramp's.
+        return process, jnp.linspace(0, 1000, steps, dtype=jnp.int16)[::-1] * (1 / 1000)
+
+    return TextToImage(model, process, inputs, params, vae, steps=200, guidance=CFG(3.0),
+                       solver=EulerAncestral(), grid=grid)
