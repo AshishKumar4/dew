@@ -31,6 +31,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.nn.kernels import delta_rule
 from dew.nn.scatter import DROPPED
 
 from .attention import unweighted_rmsnorm
@@ -345,6 +346,18 @@ def recurrent_delta_rule(query, key, value, g, beta, state=None):
     return jnp.moveaxis(out, 0, 1).astype(dtype), state.astype(dtype)
 
 
+def decode_gated_delta_rule(query, key, value, g, beta, state):
+    """`recurrent_gated_delta_rule` for one decode token `[B, 1, H, D]`
+    through `dew.nn.kernels.delta_rule.step`, which reads and writes the
+    state once (CUDA, where `delta_rule.fits` the state)."""
+    work = state.dtype
+    query, key, value = (x[:, 0].astype(work) for x in (query, key, value))
+    decay = jnp.broadcast_to(jnp.exp(g[:, 0].astype(work))[..., None], key.shape)
+    final, out = delta_rule.step(state, query * key.shape[-1] ** -0.5, key, value, decay,
+                                 beta[:, 0].astype(work))
+    return out[:, None], final
+
+
 def recurrent_gated_delta_rule(query, key, value, g, beta, state=None):
     """`torch_recurrent_gated_delta_rule` (modeling_qwen3_next.py:456-506):
     the delta rule with one log decay per head, `g` `[B, S, H]`."""
@@ -541,14 +554,13 @@ class GatedDeltaNet(nn.Module):
             beta = jnp.where(valid[:, :, None], beta, 0.0)
             g = jnp.where(valid[:, :, None], g, 0.0)
 
-        out, final = (recurrent_gated_delta_rule(
-                          query, key, value, g, beta,
-                          None if recurrent is None else recurrent.value)
-                      if S == 1 else
-                      chunk_gated_delta_rule(
-                          query, key, value, g, beta,
-                          None if recurrent is None else recurrent.value,
-                          self.chunk_size))
+        state = None if recurrent is None else recurrent.value
+        if S == 1 and state is not None and delta_rule.fits(state):
+            out, final = decode_gated_delta_rule(query, key, value, g, beta, state)
+        elif S == 1:
+            out, final = recurrent_gated_delta_rule(query, key, value, g, beta, state)
+        else:
+            out, final = chunk_gated_delta_rule(query, key, value, g, beta, state, self.chunk_size)
         if recurrent is not None:
             recurrent.value = final
 

@@ -1655,6 +1655,25 @@ passes (decay, the memory read, the write, the query read), where vLLM's
 fused recurrent kernel passes once over the rows it holds. Tracing 32
 slots, those passes were a quarter of the decode program's device time.
 
+The decode token now goes through a Pallas kernel on CUDA
+(`dew.nn.kernels.delta_rule`). It reads each row-head's fp32 state once and
+writes it once: both readouts are products with the old state (the query's
+of the update is `(q . k) delta`). At 128 rows the four XLA passes over 2.4
+GB were two thirds of the decode program. In isolation, 18 layers took 9.1
+against 13.0 ms at 128 rows and 2.7 against 3.7 at 32. Serving, two rounds
+alternating, 128 slots went from 4208-4210 to 5819-5823 tokens a second,
+above vLLM's 5410-5577 above, and 32 slots from 4267-4278 to 4109-4459. The
+kernel's outputs differ from XLA's in reduction order. On Qwen3.5-0.8B's own
+delta-rule inputs, decoded token by token, its RMS distance from float64 is
+0.95 to 1.14 times XLA's (tests/reference_error.py allows 2). 16 of 256
+greedy rows part at 128 slots, each at a bf16 near-tie: a median 0.55 bf16
+spacings apart in fp32, at most 1.74, and fp32's argmax is XLA's choice in 7
+rows and the kernel's in 8. The kernel's body is whole-block arithmetic, so
+a Mosaic GPU kernel, the backend JAX keeps, takes it as is. On a TPU,
+tokamax's Mosaic TPU `causal_conv1d_gated_delta_rule` covers the conv, the
+gating and the rule over a step's tokens in one ragged call. That call is
+the layout of the mixed admitting step, where it would plug in.
+
 ## Quantized serving of the 176M text-to-image model, 2026-09-28
 
 `TextToImage.quantized` serves the denoiser with its kernels stored as int8

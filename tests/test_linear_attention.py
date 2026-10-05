@@ -456,3 +456,25 @@ def test_the_chunked_rule_holds_with_aligned_keys():
     got, state = chunk_gated_delta_rule(query, key, value, g, beta)
     np.testing.assert_allclose(got, want, atol=2e-4)
     np.testing.assert_allclose(state, want_state, atol=2e-4)
+
+
+@pytest.mark.skipif(jax.default_backend() != "gpu", reason="the kernel runs on CUDA")
+@pytest.mark.parametrize("rows", [3, 32])
+def test_the_decode_kernel_steps_as_the_recurrence_does(rows):
+    """One decode token through `dew.nn.kernels.delta_rule` (one read and one
+    write of the state) gives the reference recurrence's output and state,
+    at Qwen3.5-0.8B's widths (16 heads, 128 wide)."""
+    from dew.nn.linear import decode_gated_delta_rule
+
+    rng = np.random.default_rng(0)
+    H, D = 16, 128
+    unit = [rng.normal(size=(rows, 1, H, D)) for _ in range(2)]
+    query, key = (jnp.asarray(x / np.linalg.norm(x, axis=-1, keepdims=True), jnp.float32) for x in unit)
+    value = jnp.asarray(rng.normal(size=(rows, 1, H, D)), jnp.float32)
+    g = jnp.asarray(-rng.random((rows, 1, H)) * 3, jnp.float32)
+    beta = jnp.asarray(rng.random((rows, 1, H)), jnp.float32)
+    state = jnp.asarray(rng.normal(size=(rows, H, D, D)) * 0.1, jnp.float32)
+    want, want_state = recurrent_gated_delta_rule(query, key, value, g, beta, state)
+    got, got_state = jax.jit(decode_gated_delta_rule)(query, key, value, g, beta, state)
+    np.testing.assert_allclose(got, want, atol=2e-6)
+    np.testing.assert_allclose(got_state, want_state, atol=2e-6)
