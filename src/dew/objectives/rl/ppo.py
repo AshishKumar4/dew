@@ -48,10 +48,10 @@ class ValueBackbone(Protocol):
 
 
 class ValueHead(nn.Module):
-    """Project a decoder's hidden states to one float32 value per position.
+    """Projects a decoder's hidden states to one float32 value per position.
 
     Packed rows pass their chains' `segment_ids` and `positions`, so no
-    state reads another chain.
+    hidden state sees another chain.
     """
 
     backbone: ValueBackbone
@@ -79,15 +79,23 @@ class _Policy:
 
 @objectives("ppo")
 class PPOObjective(Objective[Ratio, Variables]):
-    """Train a policy and a critic together on one token mass.
+    """Trains a policy and a critic together, with both losses over the same token mass.
 
-    The params collection holds policy and critic subtrees, both optimized by
-    the ordinary Trainer. The unit-decay reference selects only policy leaves.
-    Rollout targets are detached. beta and policy clip controls are GRPO's
-    existing composition; value_coefficient weights verl's half-squared,
-    clipped value error. A critic consumes packed token rows with their
-    segment_ids and positions and returns [B, T] values; ValueHead supplies
-    that interface for a decoder.
+    The `params` collection holds a `policy` subtree and a `critic` subtree,
+    and the ordinary `Trainer` optimizes both. The frozen reference, an EMA
+    at unit decay, tracks only the policy leaves. Rollout targets are
+    detached.
+
+    The policy is a `GRPOObjective` built from `model`, `seq_len` and the
+    remaining keyword arguments, so `beta` and the clip settings work as they
+    do there. It keeps `"token-mean"` aggregation and takes no sequence
+    masks, because the critic shares the actor's token mass.
+    `value_coefficient` weights verl's half-squared, clipped value error, and
+    `value_clip` is that error's clip range.
+
+    `critic` reads packed token rows with their `segment_ids` and
+    `positions` and returns `[B, T]` values; `ValueHead` gives a decoder that
+    interface.
     """
 
     # The loss is a policy-gradient surrogate plus the critic's, so only the
@@ -115,11 +123,11 @@ class PPOObjective(Objective[Ratio, Variables]):
             lambda path: len(path) > 1 and path[1] == "policy" and reference.select((path[0], *path[2:])))
 
     def held_variables(self) -> Variables | None:
-        """Return whatever the actor starts from: a loaded policy checkpoint.
+        """Return the actor's held variables, such as a loaded policy checkpoint, or None.
 
-        The critic is drawn from the key, so the actor's tree is the only
-        held data here, and it reaches the trainer's state JIT as the
-        initializer's argument rather than as a captured constant.
+        The critic is initialized from the key, so the actor's tree is the
+        only held data. It reaches the trainer's state JIT as the
+        initializer's argument, not as a captured constant.
         """
         return self.actor.held_variables()
 
@@ -129,12 +137,14 @@ class PPOObjective(Objective[Ratio, Variables]):
         return joined({"policy": self.actor.init(key, variables), "critic": critic})
 
     def policy(self, variables: Variables) -> EpisodeInference:
-        """Bind the policy subtree when an episode collector supplies the full tree."""
+        """Return the actor's episode inference task, which binds only the `policy` subtree of a full tree."""
         return _Policy(self.actor.policy(part(variables, "policy")))
 
     def inference_record(self) -> JSON:
-        """The actor's decoder record under PPO's name: a loader rebuilds the
-        decoder and takes the policy half of the saved tree."""
+        """Return the actor's decoder record under PPO's registered name, or None when the actor has none.
+
+        A loader rebuilds the decoder from it and takes the policy half of
+        the saved tree."""
         actor = self.actor.inference_record()
         if actor is None:
             return None
@@ -143,16 +153,19 @@ class PPOObjective(Objective[Ratio, Variables]):
 
     def pipeline(self, state: TrainState, *, ema: bool | None = None,
                  processor: Processor | None = None) -> TextGeneration:
-        """Publish the trained actor, without the critic or the frozen KL reference."""
+        """Return the trained actor as a `TextGeneration`, without the critic or the frozen KL reference."""
         actor_state = replace(state, variables=part(state.variables, "policy"))
         return self.actor.pipeline(actor_state, ema=ema, processor=processor)
 
     def values(self, variables: Variables, batch: Mapping[str, object]) -> jax.Array:
-        """Score the state before each packed id, `[rows, width]` aligned with `input_ids`.
+        """Return the critic's value of the state before each packed id, as `[rows, width]`.
 
-        Entry t is the critic's value of the chain prefix that predicts id
-        t, the state its action was taken from; chain starts and padding,
-        which no action follows, are zero.
+        The result is aligned with `input_ids`. Entry t is the value of the
+        chain prefix that predicts id t, which is the state that action was
+        taken from. Entries are zero where `response_mask` is zero, which
+        includes chain starts and padding, since no action follows them. A
+        critic that does not return one value per input position raises
+        `ValueError`.
         """
         ids = jnp.asarray(batch[IDS_KEY], jnp.int32)
         segments = jnp.asarray(batch[SEGMENT_IDS_KEY], jnp.int32)
@@ -166,7 +179,11 @@ class PPOObjective(Objective[Ratio, Variables]):
         return jnp.where(jnp.asarray(batch[RESPONSE_MASK_KEY]) != 0, aligned, 0.0)
 
     def loss(self, variables: Variables, batch, step: Step) -> tuple[Ratio, Aux[Variables]]:
-        """Add the actor's policy loss to the clipped value error on the same mass."""
+        """Return the actor's policy loss plus the weighted, clipped value error, over the same mass.
+
+        The batch must carry `old_values` and `returns` from the rollout,
+        aligned with `response_mask`, or the loss raises `ValueError`.
+        """
         for field in (OLD_VALUES_KEY, RETURNS_KEY):
             if field not in batch or jnp.shape(batch[field]) != jnp.shape(batch[RESPONSE_MASK_KEY]):
                 raise ValueError(f"PPO requires response-aligned {field} from the rollout")
@@ -188,15 +205,22 @@ class PPOObjective(Objective[Ratio, Variables]):
 
 @dataclass(frozen=True)
 class PPORollout:
-    """Collect episodes, then add critic baselines and verl's masked GAE.
+    """Collects episodes, then adds critic baselines and targets from verl's masked GAE.
 
-    GAE continues across the action tokens of all turns in one episode,
-    wherever the packer placed them. Tool observations and padding have no
-    support. The terminal verifier reward lands on the last action with zero
-    tail bootstrap, matching the pinned verl GAE input convention; truncated
-    episodes are masked by the packer and take no targets; a cohort with no
-    trainable token at all returns zero targets and zero mass, while a single
-    trainable token, whose whitening is undefined, is refused.
+    GAE runs across the action tokens of all turns in one episode, wherever
+    the packer placed them. Tool observations and padding are outside the
+    mask, so they get no targets. The verifier's terminal reward goes on the
+    last action, with no bootstrap value after it, which matches the input
+    convention of the pinned verl GAE. The packer masks truncated episodes,
+    so they take no targets either.
+
+    A cohort with no trainable token at all returns zero targets and zero
+    mass. A cohort with a single trainable token raises `ValueError`,
+    because whitening is undefined for one token.
+
+    `gamma` and `lam` are GAE's discount and lambda, each in [0, 1]. The
+    objective's `seq_len` must equal the episodes' `max_prompt_tokens` plus
+    `max_new_tokens` minus one.
     """
 
     objective: PPOObjective
