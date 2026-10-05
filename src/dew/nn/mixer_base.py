@@ -98,7 +98,7 @@ class MixerContext:
 class MixerBase:
     """One mixer kind's value: its fields, and how it builds its mixer.
 
-    Registered under its name (`@mixers("mla")`); a `{"kind": ...}` record
+    Registered under its name (`@mixers("mla")`); a `{"name": ..., "fields": ...}` record
     builds it through `mixers.from_record`, which refuses unknown kinds and
     fields. `build` returns the `DecoderBlock` factory called with
     `name='self_attn'`. The backbone types its field as this base because a

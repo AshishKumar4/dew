@@ -275,7 +275,7 @@ def test_the_fused_path_returns_the_value_columns_and_not_the_padding():
 def mla_record(settings: dict) -> dict:
     """The fixture's reference config as the `mla` kind's record."""
     return {
-        "kind": "mla",
+        "name": "mla", "fields": {
         "q_lora_rank": settings["q_lora_rank"],
         "kv_lora_rank": settings["kv_lora_rank"],
         "qk_nope_head_dim": settings["qk_nope_head_dim"],
@@ -289,7 +289,7 @@ def mla_record(settings: dict) -> dict:
         "index_topk": settings.get("index_topk"),
         "index_n_heads": settings.get("index_n_heads"),
         "index_head_dim": settings.get("index_head_dim"),
-    }
+    }}
 
 
 def mla_model(settings: dict, **overrides) -> CausalTransformer:
@@ -306,7 +306,7 @@ def mla_model(settings: dict, **overrides) -> CausalTransformer:
 
 
 def test_the_mla_record_and_value_agree():
-    """`mixer={"kind": "mla", ...}` from a config is the dataclass from code,
+    """`mixer={"name": "mla", "fields": {...}}` from a config is the dataclass from code,
     yarn record included."""
     settings = CONFIG["v32"]
     built = mla_model(settings).mixer
@@ -354,8 +354,9 @@ def test_the_mla_kind_refuses_the_dials_it_cannot_honour():
     with pytest.raises(ValueError, match="no attention_scale, v_norm"):
         mla_model(settings, v_norm=True, attention_scale=0.25).init(
             jax.random.key(0), tokens)
-    mismatched = dict(mla_record(settings))
-    mismatched["yarn"] = dict(mismatched["yarn"], rope_theta=5000.0)
+    record = mla_record(settings)
+    mismatched = {"name": record["name"], "fields": {
+        **record["fields"], "yarn": dict(record["fields"]["yarn"], rope_theta=5000.0)}}
     with pytest.raises(ValueError, match=r"rope_theta .* disagree"):
         mla_model(settings, mixer=mismatched).init(jax.random.key(0), tokens)
 
@@ -376,9 +377,9 @@ def deepseek_stack() -> CausalTransformer:
     return CausalTransformer(
         vocab_size=64, emb_features=32, num_layers=2, num_heads=2,
         head_dim=16, mlp_features=64, max_seq_len=16,
-        mixer={"kind": "mla", "q_lora_rank": 8, "kv_lora_rank": 8,
+        mixer={"name": "mla", "fields": {"q_lora_rank": 8, "kv_lora_rank": 8,
                "qk_nope_head_dim": 8, "qk_rope_head_dim": 8, "v_head_dim": 8,
-               "index_topk": 4, "index_n_heads": 2, "index_head_dim": 16},
+               "index_topk": 4, "index_n_heads": 2, "index_head_dim": 16}},
         mixture={"experts": 8, "top_k": 2, "layers": (1,),
                  "score_function": "sigmoid", "groups": 4, "groups_per_token": 2,
                  "bias": True, "expert_features": 16, "shared_features": 16})
