@@ -5,6 +5,7 @@ interface Env {
 	ADMIN_TOKEN: string;
 	SNAPSHOT_ID: string;
 	SOURCE_COMMIT: string;
+	REQUESTS?: string;
 }
 
 export class GatewayLab extends DurableObject<Env> {
@@ -14,6 +15,8 @@ export class GatewayLab extends DurableObject<Env> {
 		if (!container) throw new Error('measurement container is not configured');
 		if (this.busy || container.running) throw new Error('a measurement is already running');
 		if (!/^[0-9a-f]{40}$/.test(this.env.SOURCE_COMMIT)) throw new Error('source commit is not pinned');
+		const count = this.env.REQUESTS ?? '1';
+		if (!['1', '10', '50'].includes(count)) throw new Error('invalid measurement request count');
 		this.busy = true;
 		const started = Date.now();
 		let stage = 'alarm';
@@ -35,7 +38,7 @@ export class GatewayLab extends DurableObject<Env> {
 			const launched = await launch.output();
 			stage = 'kernel readiness';
 			const result = launched.exitCode !== 0 ? launched : await (await container.exec([
-				'/opt/venv/bin/python', '/opt/live/benchmark_gateway.py', '1',
+				'/opt/venv/bin/python', '/opt/live/benchmark_gateway.py', count,
 			])).output();
 			const logs = await container.exec(['sh', '-c', 'tail -c 16000 /run/dew/gateway.log']);
 			const log = await logs.output();
