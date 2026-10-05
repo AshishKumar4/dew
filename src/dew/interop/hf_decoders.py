@@ -138,6 +138,14 @@ def _any_value(key: str, hf_config: Mapping[str, object]) -> bool:
     return True
 
 
+def _repeats_text(name: str) -> Callable[[str, Mapping[str, object]], bool]:
+    """A wrapper field inert when it repeats its text config's value."""
+    def repeats(key: str, hf_config: Mapping[str, object]) -> bool:
+        text = hf_config.get('text_config')
+        return isinstance(text, Mapping) and text.get(name) == hf_config[key]
+    return repeats
+
+
 # Fields released configs carry that the pinned reference (transformers
 # 5.16.1) neither declares on the family's config class nor reads in its
 # modeling, so the reference computes the same model whatever they hold.
@@ -147,14 +155,6 @@ def _any_value(key: str, hf_config: Mapping[str, object]) -> bool:
 # in neither place is still refused as unknown.
 # tests/test_pretrained_sources.py checks every entry against the installed
 # reference config classes.
-def _repeats_text(name: str) -> Callable[[str, Mapping[str, object]], bool]:
-    """A wrapper field inert when it repeats its text config's value."""
-    def repeats(key: str, hf_config: Mapping[str, object]) -> bool:
-        text = hf_config.get('text_config')
-        return isinstance(text, Mapping) and text.get(name) == hf_config[key]
-    return repeats
-
-
 _INERT_FIELDS: Mapping[str | None, Mapping[str, Callable[[str, Mapping[str, object]], bool]]] = {
     # Tooling records no reference reads: transformers.js's loading hints
     # (SmolLM2-*-Instruct), Unsloth's patch markers (unsloth/* re-uploads) and
