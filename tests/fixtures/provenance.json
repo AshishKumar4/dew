@@ -2355,6 +2355,27 @@
    ],
    "note": "Adapters Dew writes (llama-tiny fresh, rsLoRA and patterned; tiny SD, FLUX and SD3 denoisers), factors moved by seeded draws, read by PEFT's PeftModel and Diffusers' load_lora_weights with every file tensor landing; adapted and merge_and_unload/fuse_lora outputs in float32 and float64 (diffusers_wan_reference.float64); content SHA-256 of each adapter file. Torch 2.14.0+cpu. The sd case: the outputs are Diffusers' PyTorch UNet's, which differs from the Flax-declared tiny SD in its exact GELU and its attention GroupNorm epsilon (1e-6, Flax 1e-5); Dew runs that twin (test_lora.torch_unet)."
   },
+  "lora_peft": {
+   "tool": "tools/lora_peft_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/peft",
+     "version": "0.20.0",
+     "runs": "peft"
+    },
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.16.1",
+     "runs": "transformers"
+    },
+    {
+     "repo": "pytorch/pytorch",
+     "version": "2.14.0",
+     "runs": "torch"
+    }
+   ],
+   "note": "PEFT 0.20.0's get_peft_model on tests/fixtures/hf/llama-tiny writes each adapter directory and runs its forward and backward: use_rslora with a rank and an alpha pattern, and lora_dropout 0.25 in training mode with each target's dropout module on a recorded mask; logits, mean next-token cross entropy and every factor's gradient in float32 and float64."
+  },
   "mamba2": {
    "tool": "tools/mamba2_reference.py",
    "sources": [
