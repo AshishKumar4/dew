@@ -582,14 +582,15 @@ for module in sorted({module for modules in index.values() for module in modules
 drift = {}
 for attribute in dir(registry):
     table = getattr(registry, attribute)
-    if not any(table is held for held in registry.REGISTRIES):
+    if not any(table is held for held in registry.Registry.shared()):
         continue
     indexed = {name for (named, name), modules in index.items()
                if named == attribute and not set(modules) <= absent}
     if indexed != set(table):
         drift[attribute] = [sorted(indexed - set(table)), sorted(set(table) - indexed)]
+shared = registry.Registry.shared()
 print(json.dumps({"tables": sum(1 for attribute in dir(registry)
-                                if any(getattr(registry, attribute) is held for held in registry.REGISTRIES)),
+                                if any(getattr(registry, attribute) is held for held in shared)),
                   "drift": drift}))
 """
 
