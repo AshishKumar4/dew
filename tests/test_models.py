@@ -379,6 +379,26 @@ def test_hilbert_patchify_roundtrip(rng):
     assert jnp.array_equal(rec, x)
 
 
+@pytest.mark.parametrize("options, forwarded, stack_only", [
+    ("_TransformerOptions", "_BlockOptions", set()),
+    ("_AttentionStackOptions", "_AttentionBlockOptions", set()),
+    ("_DiTStackOptions", "_AttentionBlockOptions",
+     {"output_channels", "patch_size", "emb_features", "num_layers", "num_heads", "remat", "scan_order"}),
+    ("_JepaStackOptions", "_TokenStackOptions", set()),
+])
+def test_a_stack_option_class_forwards_every_control_it_declares(options, forwarded, stack_only):
+    """The DiT stacks hand their shared controls to blocks through a
+    TypedDict, whose literal pyright checks; a control added to the class and
+    not to its TypedDict would silently not reach the blocks."""
+    import dataclasses
+
+    import dew.nn.dit as dit
+
+    declared = {field.name for field in dataclasses.fields(getattr(dit, options))} - {"parent", "name"}
+    keys = getattr(dit, forwarded).__required_keys__ | getattr(dit, forwarded).__optional_keys__
+    assert declared - stack_only == keys
+
+
 def test_dropout_is_active_in_train_mode(rng):
     """Dropout is applied in train mode, so `dropout_rate` reaches the blocks."""
     model = SimpleDiT(patch_size=4, emb_features=64, num_layers=2, num_heads=2,
