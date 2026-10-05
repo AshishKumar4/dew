@@ -31,7 +31,7 @@ from dew.diffusion.process import Process
 from dew.inputs import InputSpec
 from dew.nn.autoencoders import AutoEncoder
 from dew.objectives.base import Aux, Batch, Ratio, Shown, Step, Variables
-from dew.objectives.diffusion.objective import VALIDATION_SAMPLES, DiffusionObjective
+from dew.objectives.diffusion.objective import DiffusionObjective
 from dew.registry import objectives
 from dew.sampling.flow import FlowSDE, FlowTrajectory, GaussianTransition
 from dew.sampling.guidance import CFG, Walk
@@ -228,53 +228,9 @@ class FlowGRPOObjective(DiffusionObjective):
             metrics["reward"] = jnp.asarray(batch[REWARDS_KEY], jnp.float32).mean()
         return Ratio(pg + self.beta * kl, mass), Aux(metrics)
 
-    def _draw(self, params: Variables, batch: Batch, key: jax.Array,
-              limit: int | None = None) -> tuple[jax.Array, Batch]:
-        """Sample the batch's conditions on every rank, agreeing at each phase.
-
-        `limit` caps the rows drawn, which is what a preview takes.
-        Returns the samples and the condition tokens behind them.
-        """
-        def setup() -> tuple[int, Batch]:
-            count = _source(self.inputs, batch).shape[0]
-            sample_batch = self._sampling_batch(batch)
-            if limit is not None:
-                count = min(limit, count)
-                sample_batch = jax.tree.map(lambda value: value[:count], sample_batch)
-            return count, sample_batch
-
-        count, sample_batch = agreed("flow sample setup", setup)
-        samples = agreed("flow sample generation",
-                         lambda: self._sample(params, sample_batch, key, count=count))
-        return samples, {keyword: sample_batch[condition.field]
-                         for keyword, condition in self.inputs.conditions.items()}
-
-    def evaluate(self, params: Variables, batch: Batch, step: Step):
-        """Return one sample from the live policy for each source row, including for prompt-only batches."""
-        samples, _ = self._draw(params, batch, step.key)
-        assert self.artifact is not None
-        return self.artifact(samples)
-
-    def preview(self, params: Variables, batch: Batch, step: Step, *, scored=None):
-        """Return preview samples and their captions, drawn on every process and decoded on process zero.
-
-        Every process draws up to `VALIDATION_SAMPLES` samples, and they are
-        gathered to the host before process zero decodes the captions. The
-        other processes return None.
-        """
-        samples, tokens = self._draw(params, batch, step.key, VALIDATION_SAMPLES)
-        samples, tokens = collective_host((samples, tokens), phase="flow preview")
-        if jax.process_index() != 0:
-            return None
-        captions = ()
-        for keyword, condition in self.inputs.conditions.items():
-            captions = condition.encoder.captions(tokens[keyword])
-            if captions:
-                break
-        assert self.artifact is not None
-        return self.artifact(samples, captions)
-
-
+    def _rows(self, batch: Batch) -> int:
+        """One sample per source row, which a prompt-only batch has too."""
+        return _source(self.inputs, batch).shape[0]
 
 
 type FlowReward = Callable[[np.ndarray, Batch], np.ndarray | jax.Array | Sequence[float]]
