@@ -40,6 +40,7 @@ DECODERS = {
     "olmo3": ("OLMo 3", "Dense decoders"),
     "mixtral": ("Mixtral", "Mixture of experts"),
     "qwen3_moe": ("Qwen3-MoE", "Mixture of experts"),
+    "qwen2_moe": ("Qwen 2 MoE", "Mixture of experts"),
     "qwen3_5_moe_text": ("Qwen 3.5 MoE, text", "Mixture of experts"),
     "gpt_oss": ("gpt-oss", "Mixture of experts"),
     "llama4_text": ("Llama 4, text", "Mixture of experts"),

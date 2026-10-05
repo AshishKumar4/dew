@@ -1,5 +1,10 @@
 {
  "references": {
+  "hf/qwen2-moe-tiny": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}],
+   "note": "--qwen2-moe-only; mixed full/sliding GQA, two softmax MoE layers around a dense layer, unnormalized top-k and sigmoid-gated shared expert."
+  },
   "attention_bf16.npz": {
    "tool": "tools/numerics_reference.py",
    "sources": [
