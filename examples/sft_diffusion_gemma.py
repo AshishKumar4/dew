@@ -1,6 +1,6 @@
 """LoRA SFT of DiffusionGemma on chat data, with the base weights host-streamed.
 
-The adapter is the only thing the optimizer moves, and `Layout(host=("variables",))`
+The optimizer updates only the adapter, and `Layout(host=("variables",))`
 keeps the whole train state on the host between steps, with the scanned stack
 fetching one layer at a time. The 26B-A4B base has not been run through it:
 

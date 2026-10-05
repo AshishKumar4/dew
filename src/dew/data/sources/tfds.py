@@ -191,16 +191,17 @@ class Prepared:
 
 @dataclasses.dataclass(frozen=True)
 class TFDSOptions:
-    """Says where a prepared TFDS dataset is and which of it to read.
+    """Where a prepared TFDS dataset is, and which part of it to read.
 
     `path` is what a preparation run wrote, either the version directory or
-    the `data_dir` above it. `config` and `version` say which directory
-    inside a data_dir, and the prepared metadata confirms both. `decoders` is
-    TFDS's own decoder tree and reaches the builder unchanged, so a caller
-    can ask for the bytes on disk with `SkipDecoding()`.
+    the `data_dir` above it. `config` and `version` pick the directory inside
+    a data_dir, and both are checked against the prepared metadata.
+    `decoders` is TFDS's own decoder tree, passed to the builder unchanged,
+    so a caller can ask for the bytes on disk with `SkipDecoding()`.
 
-    The name of the builder and the split expression are not here, because a
-    mixture reads several builders through one set of these options.
+    The builder's name and the split expression are not options here,
+    because a mixture reads several builders through one set of these
+    options.
     """
 
     path: str | None = None
@@ -209,7 +210,11 @@ class TFDSOptions:
     decoders: DecoderTree | None = None
 
     def source(self, name: str, split: str) -> Records:
-        """Reads `split` of the prepared builder `name` by index."""
+        """Open `split` of the prepared builder `name` for reading by index.
+
+        Raises `ValueError` when `path` is not set, because training never
+        prepares its own data.
+        """
         if not self.path:
             raise ValueError(
                 "a tfds source needs path= naming what a preparation run wrote: its "

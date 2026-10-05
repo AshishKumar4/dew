@@ -22,11 +22,10 @@ from typing import TYPE_CHECKING, TypedDict
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
-import numpy as np
 from flax.typing import Dtype
 
 from dew import records
-from dew.nn.text_encoders import check_tree
+from dew.interop.components import bind_component, component_source
 from dew.objectives.base import Variables
 
 from ..conv import Conv
@@ -503,25 +502,14 @@ def load_dc_ae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | 
 
     Supplied `params` are bound unchanged: only the config is read, and no
     source layouts are returned."""
-    import json
-
-    from dew.interop import diffusion, sources
-
-    directory = sources.snapshot(
-        str(name_or_dir), revision, weights=(subfolder,) if params is None else False
-    )
-    config = json.loads((directory / subfolder / "config.json").read_text())
+    directory, config = component_source(name_or_dir, revision, subfolder, weights=params is None)
     if config.get("_class_name") != "AutoencoderDC":
-        raise ValueError(f"{directory / subfolder} holds a {config.get('_class_name')}, not an AutoencoderDC")
+        raise ValueError(f"{directory} holds a {config.get('_class_name')}, not an AutoencoderDC")
     model = DCAE(**dc_ae_fields(config), dtype=compute)
-    layouts: tuple[WeightLayout, ...] = ()
-    if params is None:
-        tensors = diffusion.component_tensors(directory, subfolder)
-        params, layouts = diffusion.record_layouts(
-            "vae", tensors, lambda name: dc_ae_path(name, np.ndim(tensors[name])), ("autoencoder",),
-            param_dtype=param_dtype)
     frame = jax.ShapeDtypeStruct((1, model.downscale_factor, model.downscale_factor, model.image_channels),
                                  jnp.float32)
-    check_tree({"params": params}, model, frame)
-    autoencoder = DCAutoencoder(model=model, params=params, latent_scale=config.get("scaling_factor", 1.0))
-    return autoencoder, params, layouts, config
+    return bind_component(
+        directory, "vae", config, model, dc_ae_path,
+        lambda bound: DCAutoencoder(model=model, params=bound,
+                                    latent_scale=config.get("scaling_factor", 1.0)),
+        prefix=("autoencoder",), params=params, param_dtype=param_dtype, inputs=(frame,))

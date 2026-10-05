@@ -1,8 +1,6 @@
 # Dew documentation
 
-Dew is a library for training neural networks with JAX and Flax. You supply a Flax model and an `Objective` that defines its variables and loss. A `Dataset` supplies batches, and `Trainer` runs the optimizer on one device or a device mesh.
-
-Dew includes objectives for language models, image and video diffusion, diffusion language models and JEPA encoders. It also has post-training objectives for SFT, DPO, GRPO and PPO.
+Dew is a library for training neural networks with JAX and Flax. A training run is a Flax model, an `Objective` that defines the variables and the loss, a `Dataset` that yields batches, and a `Trainer` that runs the optimization on one device or a mesh of devices. Dew ships objectives for language models, image and video diffusion, diffusion language models, JEPA encoders and post-training (SFT, DPO, GRPO, PPO).
 
 ```python
 import itertools
@@ -36,7 +34,7 @@ trainer = Trainer(Regression(nn.Dense(1)), optax.sgd(0.1), key=jax.random.key(0)
 state = trainer.fit(data, steps=100, log_every=50)
 ```
 
-You need Python, NumPy and the basics of training with gradients to follow these pages. Any Flax or sharding prerequisites appear at the top of the page.
+The pages assume you know Python, NumPy and the basics of training with gradients. Pages that also need Flax or sharding say so at the top.
 
 ## Getting started
 
@@ -66,6 +64,6 @@ You need Python, NumPy and the basics of training with gradients to follow these
 
 ## Status
 
-Dew is research software before version 1.0. The API and checkpoint formats can change between versions. I have run it on CPU, in pools of local processes, on single GPUs, on one host with four GPUs and on one TPU v6e chip. I have not run it on two physical nodes. [Multiple hosts](guides/multi-node.md) records those runs and the work still to do.
+Dew is research software before version 1.0, so the API and checkpoint formats can change between versions. I have run it on CPU, on pools of local processes, on single GPUs, on one host with four GPUs and on one TPU v6e chip, but not on two physical nodes. [Multiple hosts](guides/multi-node.md) lists what has and has not been run.
 
 [Papers and attribution](references.md) lists the papers and upstream code behind the models and methods. Design history and research notes stay in the repository under `docs/design` and `docs/research`.

@@ -29,11 +29,16 @@ from .distributed import MeshSpec, shard_batch
 
 @dataclass(frozen=True)
 class Evaluation:
-    """Holds one evaluation event, with bounded hosted previews on rank zero.
+    """The result of one evaluation, with its previews kept on process 0.
 
-    Scores, logical row counts and RNG identity agree across ranks. Scores
-    include the split prefix. elapsed_seconds is rank zero's wall time through
-    iterator cleanup. Metric accumulators and validation batches are not kept.
+    Every process holds the same `scores`, row counts and RNG identity
+    (`event_key`). Each score's name starts with the split, as in
+    `val/loss`. `coordinated_batches` is the number of batches every process
+    scored, `records` the rows those batches held, and `uneven_shards`
+    whether scoring stopped because some processes ran out of batches before
+    others. `elapsed_seconds` is process 0's wall time, including closing
+    the batch iterator. The metric accumulators and the validation batches
+    are not kept.
     """
 
     step: int
@@ -64,26 +69,36 @@ class Evaluation:
             preview: bool = False, mesh: Mesh | None = None, split: str = "val",
             schedule_step: int | jax.Array | None = None, loss: bool = False,
             training: Mapping[str, jax.Array] | None = None) -> Evaluation:
-        """Evaluate a finite coordinated prefix without an optimizer or tracker.
+        """Evaluate `variables` on the batches every process can read, without
+        an optimizer or a tracker.
 
-        batches opens a fresh iterator over this process's share of the split
-        (`DataPartition.of(mesh)`), owned and closed by this call;
-        Dataset.val can be passed directly. Every rank runs it with
-        the same objective, metrics and numerical settings. Only root's preview
-        flag controls the once-per-event display. No consumers means no iterator
-        or objective work; preview alone consumes at most the first coordinated batch.
+        Every process calls this with the same objective, metrics and
+        numerical settings. `batches` is called with this process's share of
+        the split (`DataPartition.of(mesh)`) and returns a fresh iterator,
+        which this call opens and closes; you can pass `Dataset.val`
+        directly. Scoring stops at the first batch that some process does not
+        have, so every process scores the same batches. With no `metrics`, no
+        `loss` and no preview, no iterator is opened and the objective does
+        no work, and a preview alone reads at most the first batch. Only
+        process 0's `preview` flag counts, and the preview is made once per
+        call.
 
-        variables is the complete Flax variables tree. averaged, when supplied,
-        is the complete overlay seen as Step.ema, not an optimizer state. Passing
-        state.averaged as variables evaluates those weights directly. step tags
-        the event RNG and report; schedule_step defaults to step and preserves an
-        objective's accepted-work schedule when training attempts were rejected.
+        `variables` is the complete Flax variables tree. `averaged`, when
+        given, is the complete set of averaged weights the objective sees as
+        `Step.ema`, not an optimizer state; to evaluate those weights
+        directly, pass `state.averaged` as `variables`. `step` keys the
+        evaluation's RNG and labels the result. `schedule_step` is the step
+        the objective's schedules read and defaults to `step`. When training
+        attempts were rejected, pass the count of accepted microbatches
+        (`TrainState.microstep`, as `fit` does) so the schedule follows only
+        the work training accepted.
 
-        Scalars are broadcast to every rank. Previews remain hosted on root and
-        are bounded by one objective preview, independent of validation length.
-        Reporting is the caller's job; pool callers must agree reporting failures
-        before entering their next collective. In-flight device failures still
-        require distributed runtime termination.
+        The scores are broadcast to every process. Previews stay on process 0,
+        and there is at most one objective preview, however long the
+        validation split is. Reporting the result is the caller's job, and
+        callers in a process pool must agree on any reporting failure before
+        they enter their next collective. A device failure in flight still
+        requires ending the distributed runtime.
         """
         from dew.nn.inputs import request_key
         key = request_key(key)

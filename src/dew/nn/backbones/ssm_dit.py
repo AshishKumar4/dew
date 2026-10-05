@@ -16,12 +16,12 @@ DEFAULT_SSM_RATIO = "3:1"
 
 @models("hybrid_dit")
 class HybridSSMAttentionDiT(SimpleDiT):
-    """DiT that interleaves SSM blocks with attention blocks.
+    """A DiT that interleaves SSM blocks with attention blocks.
 
-    The mixer of every layer comes from `ssm_attention_ratio`, a shorthand
-    that reads the same at any depth ("3:1", "all-ssm"), or from
-    `block_pattern`, which names each layer. Setting both raises a ValueError
-    at setup. Everything around the layers is `SimpleDiT`'s.
+    Each layer's mixer comes from `ssm_attention_ratio`, a shorthand that
+    reads the same at any depth ("3:1", "all-ssm"), or from `block_pattern`,
+    which names each layer. Setting both raises a ValueError at setup.
+    Everything around the layers is `SimpleDiT`'s.
     """
     ssm_state_dim: int = 64
     block_pattern: Sequence[str] | None = None  # e.g., ['ssm','ssm','ssm','attn']
@@ -30,7 +30,7 @@ class HybridSSMAttentionDiT(SimpleDiT):
     use_2d_fusion: bool = False  # 2D state fusion in SSM blocks (see SpatialFusionConv)
 
     def block(self, index: int, block_type: str) -> ModulatedBlock:
-        """Build layer `index`'s block, an SSM mixer or an attention one.
+        """Build layer `index`'s block, with an SSM mixer or an attention mixer.
 
         The two share the width, the MLP ratio and the norms. They differ
         in the mixer they name, the fields only that mixer reads, the remat
@@ -69,7 +69,11 @@ class HybridSSMAttentionDiT(SimpleDiT):
         )
 
     def stack(self) -> list[ModulatedBlock]:
-        """Layer `i` is the block `ssm_attention_ratio` or `block_pattern` names."""
+        """Return the layers' blocks, each the block that `ssm_attention_ratio` or `block_pattern` names.
+
+        Raises `ValueError` when both are set, or when TREAD's routes are
+        combined with `use_2d_fusion`.
+        """
         if self.block_pattern is not None and self.ssm_attention_ratio != DEFAULT_SSM_RATIO:
             raise ValueError(
                 f"block_pattern names every layer's mixer and ssm_attention_ratio "
