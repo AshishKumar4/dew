@@ -1,11 +1,11 @@
-"""The blocks the published MM-DiT family shares: SD3, Flux, FLUX.2, Z-Image
-and Qwen-Image.
+"""The blocks shared by the published MM-DiT family: SD3, Flux, FLUX.2, Z-Image and Qwen-Image.
 
-Each is a stack of modulated residual blocks whose attention joins an image
-stream and a text stream, as Diffusers 0.34.0 to 0.40.0 run them. What they
-share is here: the adaLN modulation, the affine-free layer norm, one joint
-attention, the double-stream block SD3, Flux and FLUX.2 run, the feed-forwards
-and the embedders. Each family's module keeps what it alone does.
+Each of these models is a stack of modulated residual blocks whose attention
+joins an image stream and a text stream, as Diffusers 0.34.0 to 0.40.0 run
+them. This module holds the shared parts: the adaLN modulation, the layer
+norm without affine parameters, one joint attention, the double-stream block
+that SD3, Flux and FLUX.2 run, the feed-forwards and the embedders. Each
+family's own module keeps what only that family does.
 """
 
 from __future__ import annotations
@@ -24,11 +24,13 @@ from dew.nn.sharding import logical_axes
 
 def rotary_table(positions: np.ndarray, axes: Sequence[int], *, theta: float = 10000.0,
                  ) -> tuple[np.ndarray, np.ndarray]:
-    """`FluxPosEmbed` over ids: one angle per channel pair, per axis.
+    """Return `FluxPosEmbed`'s cosines and sines for the ids in `positions`.
+
+    There is one angle per channel pair, per axis.
 
     The source computes its frequencies and their cosines in float64 from a
-    static id grid, so this is the same host computation, and the pair of
-    channels that shares an angle is adjacent rather than half a width apart.
+    static id grid, so this function does the same computation on the host.
+    The two channels that share an angle are adjacent, not half a width apart.
     """
     cosines, sines = [], []
     for index, dim in enumerate(axes):
@@ -41,17 +43,21 @@ def rotary_table(positions: np.ndarray, axes: Sequence[int], *, theta: float = 1
 
 
 def apply_rotary(x: jax.Array, cos: jax.Array, sin: jax.Array) -> jax.Array:
-    """The rotation `apply_rotary_emb` applies with `use_real_unbind_dim=-1`:
-    adjacent channels are one complex pair, so the rotated copy is
-    `(-x1, x0)` within each pair."""
+    """Apply the rotation that `apply_rotary_emb` applies with `use_real_unbind_dim=-1`.
+
+    Adjacent channels form one complex pair, so the rotated copy is
+    `(-x1, x0)` within each pair.
+    """
     pairs = x.reshape(*x.shape[:-1], -1, 2)
     rotated = jnp.stack([-pairs[..., 1], pairs[..., 0]], axis=-1).reshape(x.shape)
     return x * cos + rotated * sin
 
 
 class Modulation(nn.Module):
-    """A source `AdaLayerNormZero`-family projection: SiLU then one linear
-    whose output is `pieces` chunks of the width, in the source's order."""
+    """Projects the conditioning as the source's `AdaLayerNormZero` family does: SiLU, then one linear layer.
+
+    The output is `pieces` chunks of the width, in the source's order.
+    """
 
     features: int
     pieces: int
@@ -67,30 +73,38 @@ class Modulation(nn.Module):
 
 
 def modulate(x, shift, scale):
-    """The source's `norm(x) * (1 + scale) + shift`, broadcast over tokens."""
+    """Return the source's `norm(x) * (1 + scale) + shift` for a normed `x`, broadcast over tokens."""
     return x * (1 + scale[:, None]) + shift[:, None]
 
 
 def layer_norm(dtype, epsilon: float = 1e-6):
-    """The source's `LayerNorm(elementwise_affine=False)`, at the eps of 1e-6
-    SD3 and Flux fix unless a config reads another."""
+    """Return the source's `LayerNorm(elementwise_affine=False)`.
+
+    Its eps is 1e-6, the value SD3 and Flux fix, unless a config gives another.
+    """
     return LayerNorm(epsilon=epsilon, use_scale=False, use_bias=False, dtype=dtype)
 
 
 def embedding(x, features: int, name: str, *, bias: bool = True, dtype: Dtype | None = None,
               precision: PrecisionLike = None, activation: Callable[[jax.Array], jax.Array] = nn.silu):
-    """`TimestepEmbedding` and `PixArtAlphaTextProjection`: a linear, the
-    activation (SiLU, or Wan's tanh GELU) and a linear, stored flat as
-    `{name}_linear_1` and `{name}_linear_2` in the calling module."""
+    """Apply `TimestepEmbedding` or `PixArtAlphaTextProjection` to `x`.
+
+    Both are a linear layer, an activation and a second linear layer. The
+    activation is SiLU, or Wan's tanh GELU. The two layers are stored flat
+    as `{name}_linear_1` and `{name}_linear_2` in the calling module.
+    """
     hidden = nn.Dense(features, use_bias=bias, dtype=dtype, precision=precision, name=f"{name}_linear_1")(x)
     return nn.Dense(features, use_bias=bias, dtype=dtype, precision=precision,
                     name=f"{name}_linear_2")(activation(hidden))
 
 
 def guided_time(embed: Callable[[jax.Array, str], jax.Array], time, guidance, *, guidance_embeds: bool):
-    """The time's `embed` plus, where the checkpoint embeds its distilled
-    guidance, the guidance's, scaled by a thousand as the source scales it.
-    A guidance-embedded checkpoint needs the value and any other refuses it."""
+    """Return the time's `embed`, plus the guidance's when the checkpoint embeds its distilled guidance.
+
+    The guidance is multiplied by a thousand before embedding, as the source
+    does. A guidance-embedded checkpoint requires `guidance`, and any other
+    checkpoint raises `ValueError` when `guidance` is given.
+    """
     embedded = embed(time, "timestep_embedder")
     if guidance_embeds:
         if guidance is None:
@@ -112,32 +126,36 @@ def guided_time(embed: Callable[[jax.Array, str], jax.Array], time, guidance, *,
                    ("to_out_0", (None, "embed")),
                    ("to_add_out", (None, "embed")))})
 class JointAttention(nn.Module):
-    """The source's `Attention` over an image stream and an optional context.
+    """Runs the source's `Attention` over an image stream and an optional context.
 
-    Each stream projects its own queries, keys and values (the context's are
-    the `add_*` projections), per-head RMS norms take the queries and keys,
-    the rotation turns them, and one softmax attends over the joined
-    sequence, which splits back into each stream's output projection. SD3's
-    `JointAttnProcessor2_0` joins the image first, Flux's processor the
-    context; without a context it is self-attention over the image. The
-    rotation is the cosines and sines of every joined token laid out against
-    the heads, `[B or 1, S, 1, D]`, and `lengths` the real keys of each row.
+    Each stream projects its own queries, keys and values; the context uses
+    the `add_*` projections. Per-head RMS norms normalize the queries and
+    keys, the rotation is applied to them, and one softmax attends over the
+    joined sequence. The result is split back into the two streams, and each
+    goes through its own output projection. SD3's `JointAttnProcessor2_0`
+    puts the image first in the joined sequence, and Flux's processor puts
+    the context first. Without a context, it is self-attention over the
+    image. The rotation is the cosines and sines of every joined token laid
+    out against the heads, `[B or 1, S, 1, D]`, and `lengths` is the number
+    of real keys in each row.
     """
 
     heads: int
     head_dim: int
     bias: bool = True
-    """Whether every projection carries a bias; FLUX.2's, Z-Image's and Qwen-Image's carry none."""
+    """Whether every projection has a bias. FLUX.2's, Z-Image's and Qwen-Image's have none."""
     qk_norm: bool = True
-    """SD3 without a `qk_norm` config leaves its queries and keys unnormalized."""
+    """Whether the queries and keys are RMS-normed. SD3 without a `qk_norm` config leaves them as they are."""
     epsilon: float = 1e-6
     context_first: bool = False
-    """Flux's order: the context's tokens lead the joined sequence."""
+    """Whether the context's tokens come first in the joined sequence, as in Flux."""
     project: bool = True
-    """Flux's single-stream block projects the attention itself, beside its
-    feed-forward, so it takes the output unprojected."""
+    """Whether the attention applies its own output projection. Flux's
+    single-stream block projects the attention output itself, together with
+    its feed-forward, so it takes the output unprojected."""
     context_out: bool = True
-    """SD3's last block reads no context back, so it holds no `to_add_out`."""
+    """Whether the context's output is projected and returned. SD3's last block
+    reads no context back, so it has no `to_add_out`."""
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     attention_impl: str = "auto"  # an AttentionImpl
@@ -151,7 +169,7 @@ class JointAttention(nn.Module):
         return RMSNorm(epsilon=self.epsilon, dtype=self.dtype, name=name)(x) if self.qk_norm else x
 
     def attend(self, query, key, value, lengths):
-        """One softmax over the joined sequence, each row's keys past `lengths` masked."""
+        """Return one softmax attention over the joined sequence, masking each row's keys past `lengths`."""
         return scaled_dot_product_attention(query, key, value, implementation=self.attention_impl,
                                             precision=self.precision, key_value_seq_lengths=lengths)
 
@@ -186,10 +204,13 @@ class JointAttention(nn.Module):
 
 @logical_axes({("net_0_proj",): ("embed", "mlp"), ("net_2",): ("mlp", "embed")})
 class FeedForward(nn.Module):
-    """The source's `FeedForward(activation_fn="gelu-approximate")`: one
-    projection to `hidden` (four times the width unless a config names its
-    `inner_dim`, as Wan's `ffn_dim` does) into the tanh GELU, then one back,
-    stored as `net.0.proj` and `net.2`."""
+    """Applies the source's `FeedForward(activation_fn="gelu-approximate")`.
+
+    One projection to the `hidden` width feeds the tanh GELU, and a second
+    projects back. `hidden` is four times the width unless a config names its
+    `inner_dim`, as Wan's `ffn_dim` does. The weights are stored as
+    `net.0.proj` and `net.2`.
+    """
 
     features: int
     hidden: int | None = None
@@ -207,8 +228,9 @@ class FeedForward(nn.Module):
 
 @logical_axes({("linear_in",): ("embed", "mlp"), ("linear_out",): ("mlp", "embed")})
 class SwiGLU(nn.Module):
-    """`Flux2FeedForward`: `linear_in` to twice the hidden width, SiLU of the
-    first half times the second, `linear_out` back; no biases."""
+    """Applies `Flux2FeedForward`: `linear_in` to twice the hidden width, SiLU of the
+    first half times the second, then `linear_out` back. Neither projection has a
+    bias."""
 
     features: int
     hidden: int
@@ -224,37 +246,39 @@ class SwiGLU(nn.Module):
 
 
 class DoubleStreamBlock(nn.Module):
-    """One double-stream block: SD3's `JointTransformerBlock`, Flux's
-    `FluxTransformerBlock` and FLUX.2's `Flux2TransformerBlock`.
+    """Runs one double-stream block of SD3, Flux or FLUX.2.
 
-    The image and the context each modulate and norm their own residual
-    stream, meet in one `JointAttention`, gate its output back, then modulate
-    and gate their own feed-forward. A block's modulation is its own
-    projection of the conditioning vector (`norm1`, `norm1_context`): six
-    pieces per stream, shift, scale and gate before the attention and again
-    before the feed-forward.
+    It matches SD3's `JointTransformerBlock`, Flux's `FluxTransformerBlock`
+    and FLUX.2's `Flux2TransformerBlock`. The image and the context each
+    modulate and norm their own residual stream. They meet in one
+    `JointAttention`, and each adds its gated attention output back to its
+    stream. Then each runs its own modulated feed-forward and adds the gated
+    output. A block's modulation is its own projection of the conditioning
+    vector (`norm1`, `norm1_context`): six pieces per stream, a shift, scale
+    and gate before the attention and again before the feed-forward.
     """
 
     features: int
     heads: int
     head_dim: int
     context_first: bool = False
-    """Flux's and FLUX.2's: the context leads the joined attention."""
+    """Whether the context comes first in the joined attention, as in Flux and FLUX.2."""
     qk_norm: bool = True
     bias: bool = True
-    """FLUX.2's projections carry no bias."""
+    """Whether the projections have biases. FLUX.2's have none."""
     epsilon: float = 1e-6
     mlp_hidden: int | None = None
-    """FLUX.2's SwiGLU width; None is the four-times GELU feed-forward."""
+    """FLUX.2's SwiGLU width. None gives the GELU feed-forward at four times the width."""
     shared_modulation: bool = False
-    """FLUX.2's: the conditioning is the model's (image, context) pair of six
-    pieces each, which every block reads."""
+    """Whether the conditioning is the model's shared modulation, as in FLUX.2: an
+    (image, context) pair of six pieces each, which every block reads."""
     context_pre_only: bool = False
-    """SD3's last block: the context is read and returned as it came, so its
-    norm takes a scale and a shift and it holds no output or feed-forward."""
+    """Whether this is SD3's last block, which reads the context and returns it
+    unchanged. Its context norm then takes only a scale and a shift, and it has
+    no context output projection or feed-forward."""
     dual_attention: bool = False
-    """SD3.5's: three more image pieces modulate a second self-attention over
-    the same normalized input."""
+    """Whether the block runs SD3.5's second self-attention over the same
+    normalized input, modulated by three more image pieces."""
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     attention_impl: str = "auto"  # an AttentionImpl
