@@ -1,7 +1,7 @@
-"""Checkpoint readers and translators, imported when their API is used.
+"""Checkpoint readers and translators, each imported only when you use its API.
 
-Reading Hub metadata or a safetensors file needs neither the decoder
-translators nor the diffusion pipeline loader.
+So reading Hub metadata or a safetensors file does not import the decoder
+translators or the diffusion pipeline loader.
 """
 
 from collections.abc import Callable
