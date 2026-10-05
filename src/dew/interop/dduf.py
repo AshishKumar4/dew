@@ -24,9 +24,16 @@ _CHUNK = 1 << 24
 
 
 def _key(path: Path) -> str:
-    """The cache key of one DDUF file: its resolved path (a Hub file's is its
-    content-addressed blob), size and modification time, which stand in for
-    a hash of its bytes."""
+    """The cache key of one DDUF file: its resolved path, size and
+    modification time, which stand in for a hash of its bytes.
+
+    Hashing the contents would read the whole archive on every cache hit,
+    the cost the cache exists to avoid. A Hub file resolves to its
+    content-addressed blob, so for a published file the key is a content
+    key. A local file relies on its mtime: rewriting it in place at the
+    same size within one mtime tick, or `cp -p` of another file of the same
+    size over it, reuses the stale unpack; deleting `dew_cache_dir()/dduf`
+    clears it."""
     status = path.stat()
     identity = f"{path.resolve()}\0{status.st_size}\0{status.st_mtime_ns}"
     return hashlib.sha256(identity.encode()).hexdigest()[:24]
