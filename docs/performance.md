@@ -197,48 +197,46 @@ the gradients, which the norm holds until every one is in.
 
 ## Rounding on the TPU, 2026-10-02
 
-`import dew` turns off XLA's excess precision (`--xla_allow_excess_precision=false`)
-to keep every bf16 rounding specified by the program. Tests on one TPU
-v6e chip found that this policy is needed there too (Colab, jax
-0.11.2.post3, libtpu 0.0.48, Dew at `f24b452a`). With XLA's default, a
-bf16 round trip before a `tanh` or sum runs without rounding. This makes
-a bf16 decoder's outputs depend on the program's shape. At Qwen3-0.6B's
-widths over 256 tokens, only 10% of elements agree between a batch of 4
-and the same rows run separately. With the policy, every element agrees.
-Multi-chip layouts remain unverified because this test used one chip.
+`import dew` turns off XLA's excess precision
+(`--xla_allow_excess_precision=false`) so that every bf16 rounding a program
+states is kept. I checked on one TPU v6e chip (Colab, jax 0.11.2.post3,
+libtpu 0.0.48, Dew at `f24b452a`) that the policy is needed there too. With
+XLA's default, a bf16 round trip before a `tanh` or a sum is computed
+without the rounding, so a bf16 decoder's outputs depend on the program's
+shape. At Qwen3-0.6B's widths over 256 tokens, only 10% of the elements are
+equal between a batch of 4 and the same rows run one at a time. With the
+policy, all of them are equal. I could not test multi-chip layouts on one
+chip, so they are unverified.
 
-The policy slowed the 176M hybrid DiT's batch-16 step by 8.1% on the v6e
-(16.95 to 18.29 ms). It was neutral on an A100 (45.31 to 45.42). The
-traces attribute 0.93 ms of the 1.39 to the MLP's backward pass. GELU ran
-as eight bf16 elementwise steps, each with its own rounding. Rounding the
-residual sums before the norms read them added another 0.27 ms; this is
-the rounding the policy is meant to preserve.
+The policy cost the 176M hybrid DiT's batch-16 step 8.1% on the v6e (16.95
+to 18.29 ms); on an A100 it was neutral (45.31 to 45.42). In the traces the
+policy added 1.39 ms, 0.93 of it in the MLP's backward, where the GELU ran
+as eight bf16 elementwise steps and each kept its rounding. A further
+0.27 ms is the rounding of the residual sums the norms read, which is what
+the policy is for. The MLP's GELU (`dew.nn.dit`, and an ungated decoder's
+`gelu`) now runs in fp32 and rounds once, as torch's bf16 GELU does and as
+the gated MLPs already did (`dew.nn.moe.gated_product`). Over 2^20 bf16
+values its RMS error against float64 drops from 2.19e-3 to 1.76e-3, on the
+CPU and the RTX 4080 alike. The RTX 4080 steps are unchanged. The hybrid DiT
+at batch 16 takes 66.66/66.54 against 66.47/66.55 ms, SimpleDiT-B at 32
+takes 72.99/72.63 against 72.77/72.71, and a 3-layer GELU decoder at
+16 x 512 takes 44.40/44.30 against 44.39/44.42.
 
-The MLP's GELU (`dew.nn.dit`, and an ungated decoder's `gelu`) now runs
-in fp32 and rounds once. Torch's bf16 GELU and Dew's gated MLPs already
-do this (`dew.nn.moe.gated_product`). Over 2^20 bf16 values, its RMS error
-against float64 drops from 2.19e-3 to 1.76e-3 on both CPU and RTX 4080.
-The RTX 4080 steps are unchanged: the hybrid DiT at batch 16 takes
-66.66/66.54 against 66.47/66.55 ms, SimpleDiT-B at 32 takes 72.99/72.63
-against 72.77/72.71, and a 3-layer GELU decoder at 16 x 512 takes
-44.40/44.30 against 44.39/44.42.
-
-On the v6e (integration `8e92a4a6`, three rounds each), the hybrid DiT's
-batch-16 step takes 17.25-17.29 ms against 18.25. Allowing XLA's excess
-precision would give 16.88-16.92. The policy now costs 2.2%, from rounding
-the residual sums. On the TPU, these roundings affect the results too.
-With excess precision, an RMSNorm reading a fused bf16 residual sum
-matches a program that stores the sum on 98.8% of outputs. Without excess
-precision, every output matches.
+On the v6e (integration `8e92a4a6`, three rounds each) the hybrid DiT's
+batch-16 step now runs in 17.25-17.29 ms against 18.25, and with XLA's
+excess precision it would run in 16.88-16.92. So the policy now costs 2.2%,
+which is the residual roundings. Those roundings change results on the TPU
+as well. An RMSNorm reading a fused bf16 residual sum matches the program
+that stores the sum on 98.8% of its outputs with excess precision, and on
+all of them without.
 
 ## Sampling the hybrid DiT on the CPU, 2026-10-02
 
 The landing page's live cell samples the published 176M hybrid DiT on a
-4-vCPU container. It uses one prompt and 15 DPM-Solver++ steps under CFG
-5.0, then a bf16 SD VAE decode to 256 x 256. This run reproduced the
-cell on one P-core of an i9-12900K (two threads, `taskset -c 2,3`, jax
-0.11.2.post3). The table gives operation time by JAX scope for one traced
-warm call at `db1761fd`:
+4-vCPU container: one prompt, 15 DPM-Solver++ steps under CFG 5.0, and a
+bf16 SD VAE decode to 256 x 256. I reproduced it at `db1761fd` on one P-core
+of an i9-12900K (two threads, `taskset -c 2,3`, jax 0.11.2.post3), traced
+one warm call and summed the op time by JAX scope:
 
 | scope | s |
 |---|---:|
@@ -249,28 +247,28 @@ warm call at `db1761fd`:
 | attention blocks | 1.9 |
 | the rest | 0.6 |
 
-The dots and decoder convolutions run near the core's fp32 rate. The
-depthwise convolutions were much slower. XLA:CPU uses YNNPACK for a grouped
-convolution, which took 6.4 ms for one 2 x 16 x 16 x 768 map, 7 MFLOP.
-On the CPU, a depthwise 3x3 convolution with more than 16 features now
-runs as nine shifted products. Each product rounds to fp32 before the
-sum in the kernel's row-major order. This matches YNNPACK bit for bit and
-takes 1.4 ms a map. For 16 features or fewer, YNNPACK sums differently,
-so Dew keeps the convolution.
+The dots and the decoder's convolutions run near the core's fp32 rate, but
+the depthwise convolutions did not. XLA:CPU runs a grouped convolution
+through YNNPACK, which took 6.4 ms for one 2 x 16 x 16 x 768 map of 7 MFLOP.
+On the CPU, a depthwise 3x3 convolution of more than 16 features now runs as
+its nine shifted products. Each product is rounded to fp32 before it is
+summed in the kernel's row-major order, which is YNNPACK's arithmetic bit
+for bit, and a map takes 1.4 ms. YNNPACK sums 16 features or fewer in
+another order, so those keep the convolution.
 
-On a shared, loaded host, three alternating processes ran each version,
-with three calls each. The cell's median fell from 24.45 s to 21.37
-(fastest 22.68 to 20.51). Without the decode, it fell from 18.96 to 15.99
-(17.52 to 14.91). Every image's sha256 stayed the same (`923e1b09`).
+I ran three alternating processes each way, three calls each, on a shared
+and loaded host. The cell's median went from 24.45 s to 21.37 (fastest 22.68
+to 20.51), and without the decode from 18.96 to 15.99 (17.52 to 14.91).
+Every image's sha256 is the same (`923e1b09`).
 
 ## The hybrid DiT's SSM blocks, 2026-10-01
 
-The published 176M hybrid DiT has 16 blocks, 12 of them S5 blocks with
-the 2D fusion convolution. It uses 32x32x4 latents and patch 2. This
-experiment ran it at batch 16, bf16, on an RTX 4080, using
-`tools/benchmark_step.py` with its config passed through `--cases`.
-With command buffers off, XProf names each kernel's HLO instruction; the
-optimized HLO gives its JAX scope. Times per step at `42ddfc14`:
+The published 176M hybrid DiT has 16 blocks, 12 of them S5 blocks with the
+2D fusion convolution, and works on 32x32x4 latents with patch 2. I ran it
+at batch 16 in bf16 on the RTX 4080 through `tools/benchmark_step.py`,
+passing its config as `--cases`. With command buffers off, XProf names each
+kernel's HLO instruction, and the optimized HLO gives that instruction's JAX
+scope. Per step, at `42ddfc14`:
 
 | scope | ms |
 |---|---:|
@@ -284,24 +282,24 @@ optimized HLO gives its JAX scope. Times per step at `42ddfc14`:
 | unattributed (converts and reductions outside a scope) | 6.5 |
 
 Each dilated depthwise convolution (dilations 2 and 3) ran as nine shifted
-products in fp32 because cuDNN's dilated grouped kernels are slow. Its
-weight gradient read the input and output cotangent once per tap. A
-pixel's dilation-d taps are neighbours with the same row and column
-residues mod d. The convolution can therefore use cuDNN's dilation-1
-kernel over the d^2 interleaved grids. Forward and VJP take 0.097 ms
-(dilation 2) and 0.089 ms (dilation 3), against 0.31 and 0.33. The step
-fell from 75.30 to 70.17 ms. At HIGHEST precision, the fp32 output and
-input gradient equal lax's dilated convolution exactly.
+products in fp32, because cuDNN's dilated grouped kernels are slow, and its
+weight gradient read the input and the output's cotangent once per tap. A
+pixel's dilation-d taps are its neighbours in the grid of pixels that share
+its row and column residues mod d. So the convolution now runs as cuDNN's
+dilation-1 kernel over the d^2 interleaved grids. Forward and VJP take
+0.097 ms at dilation 2 and 0.089 ms at dilation 3, against 0.31 and 0.33,
+and the step went from 75.30 to 70.17 ms. At HIGHEST precision the fp32
+output and input gradient equal those of lax's dilated convolution exactly.
 
-In fp32, the interleaved form made the step slower (109.70 to 113.68 ms).
-CUDA now selects the form by dtype: polyphase in bf16, and the original
-nine shifted products in fp32. The fp32 form keeps the input, kernel and
-output in fp32 memory. In fp32, cuDNN's grouped direct kernels compute
-the polyphase forward, input gradient and filter gradient. They took
-3.8 ms of the 5.2 ms spent in the dilated layers per batch-16 step.
-Interleaving transposes took another 1.3 ms. The table compares integration
-`f6047cf9` with the change on an RTX 4080, with a fixed batch and two
-alternating rounds:
+In fp32 that polyphase form made the step slower (109.70 to 113.68 ms). In
+fp32, cuDNN runs the polyphase convolutions (forward, input gradient and
+filter gradient) with its grouped direct kernels, which took 3.8 ms of the
+5.2 ms a batch-16 step spent in the dilated layers, and the interleaving
+transposes took 1.3 ms more. So on CUDA the form now depends on the dtype:
+bf16 uses the polyphase form, and fp32 uses the nine shifted products from
+before, with the fp32 input, kernel and output held in memory. The step at
+integration `f6047cf9` against the change, on the RTX 4080 with a fixed
+batch and two alternating rounds:
 
 | dtype | batch | polyphase (before) | by dtype (after) |
 |---|---:|---:|---:|
@@ -310,46 +308,46 @@ alternating rounds:
 | bf16 | 16 | 60.13 / 60.08 | 60.12 / 60.09 |
 | bf16 | 32 | 100.68 / 100.60 | 100.69 / 100.62 |
 
-fp32 is 4.0% faster at batch 16 and 4.1% at 32. The bf16 program and
-losses are bit-identical. The fp32 losses change in the 8th digit
-(0.56920904 to 0.56920898 at batch 16), within the forms' fp32 bound
-(tests/test_depthwise_conv.py). In bf16, the shifted form would cost 65.4
-and 107.0 ms.
+fp32 is 4.0% faster at batch 16 and 4.1% at 32. bf16 compiles to the same
+program, and its losses are the same to the bit. The fp32 losses move in the
+8th digit (0.56920904 to 0.56920898 at batch 16), within the forms' fp32
+bound (tests/test_depthwise_conv.py). In bf16 the shifted form would cost
+65.4 and 107.0 ms.
 
-The published model samples in fp32. Its live sampler call is faster too
-(15 DPM-Solver++ steps under CFG, `0964f573`, median of five, two rounds
-each). Batch 1 falls from 101.0-102.0 to 97.5-98.1 ms and batch 4 from
-268.2-269.3 to 257.4-259.0. The denoising scan alone falls from 93.0-93.2
-to 90.1-90.5 and from 236.8-237.6 to 226.8-227.7. Peak memory stays
-within the rounds' spread. Changes in the latents and fp32 images stay
-within twice the change from one rounding of the convolutions (the
-published-sample test).
+The published model samples in fp32, so the live sampler's call is faster
+too (15 DPM-Solver++ steps under CFG, `0964f573`, median of five, two rounds
+each). Batch 1 went from 101.0-102.0 to 97.5-98.1 ms and batch 4 from
+268.2-269.3 to 257.4-259.0. The denoising scan alone went from 93.0-93.2 to
+90.1-90.5 and from 236.8-237.6 to 226.8-227.7. Peak memory stayed within the
+rounds' spread. The latents and fp32 images move by less than twice what one
+rounding of the convolutions moves them (the published-sample test).
 
-On an A100 (c15, integration `6a220e31`, two alternating rounds), the fp32
-step improves too: 66.73/66.78 to 63.44/63.37 ms at batch 16 and
-117.43/117.47 to 111.03/110.97 at 32. The bf16 program uses polyphase in
-both versions and stays unchanged (42.17/42.39 and 42.12/43.01 ms,
+On an A100 (c15, integration `6a220e31`, two alternating rounds) the fp32
+step is faster in the same way, 66.73/66.78 to 63.44/63.37 ms at batch 16
+and 117.43/117.47 to 111.03/110.97 at 32. bf16 uses the polyphase form in
+both builds, so it is the same program (42.17/42.39 and 42.12/43.01 ms,
 63.96/64.12 and 64.01/64.18).
 
-The S5 layer ran `associative_scan` over complex states. Its backward pass
-spent 4.5 ms of the 4080's step in complex arithmetic alone. On GPU and
-CPU, it now uses chunks in real arithmetic. Inside a chunk, one fp32
-product of the pole's powers and the inputs computes the states.
-`associative_scan` combines only the chunks' last states.
+The S5 layer ran its recurrence as `associative_scan` over complex states,
+and the backward of that scan spent 4.5 ms of the RTX 4080's step in complex
+arithmetic alone. On a GPU and on the CPU the recurrence now runs in real
+arithmetic, in chunks. Inside a chunk, the states are one fp32 product of
+the pole's powers with the chunk's inputs, and `associative_scan` runs only
+over the chunks' last states.
 
-Doubling computes the powers by multiplying those already computed by
-the next squared power. Each power rounds at most 2 log2(t) times. A
-one-hot product constructs the `[L, L]` Toeplitz block, exact at full
-precision; its transpose is a product too. The complex input products
-for both directions run as one real product. The TPU keeps the original
-layer (`dew.nn.ssm._directions`). Compiled for a v6e, it has the same
+The powers are built by doubling, multiplying the powers so far by the next
+squared power, so each one is rounded at most 2 log2(t) times. The `[L, L]`
+Toeplitz block is a one-hot product of the powers, exact at full precision,
+and its transpose is a product too. Both directions' complex input products
+run as one real product. A TPU still runs the layer in its first form
+(`dew.nn.ssm._directions`); compiled for a v6e, its program has the same
 5125 instructions and estimated cycles as before.
 
-The table compares the scan with the chunks on 2026-10-03. Training
-times come from `tools/benchmark_step.py` and report ms per step at the
-asynchronous throughput of a run. Sampling times cover the live sampler's
-denoising scan alone (`dit_sample_time.py`: 15 DPM-Solver++ steps under
-CFG 5.0):
+The rows below compare the scan with the chunks, measured on 2026-10-03. The
+step columns come from `tools/benchmark_step.py`, in ms per step (the
+asynchronous throughput a run sees). The sampler columns time the live
+sampler's call (`dit_sample_time.py`: 15 DPM-Solver++ steps under CFG 5.0,
+the denoising scan alone):
 
 | device | step, batch 16 | step, batch 32 | sampler, 1 image | sampler, 4 images |
 |---|---:|---:|---:|---:|
@@ -357,43 +355,42 @@ CFG 5.0):
 | A100 40 GB (Colab, `db1761fd`, a first form) | 42.38 to 40.89 | 65.67 to 62.39 | | |
 | CPU (i9-12900K, 4 threads, the live sampler's `0964f573`, ABAB) | | | 17.17 to 14.19 s | |
 
-The CPU row measures the live sampler without its VAE decode. It is the
+On the CPU the row is the live sampler's call without its VAE decode, the
 median of nine calls in three alternating processes on a loaded host
 (14.55-20.52 s against 13.31-19.73). A second session agreed (14.35 and
-14.50 against 13.07 and 13.57). Including the decode gives 25.47 against
-22.06 s. Peak RSS stays within the processes' spread (medians 4370 and
-4414 MiB, ranges 3937-4478 and 4221-4829). Changing the recurrence
-arithmetic changes the image's bits (sha256 `923e1b09` to `10b80bfe` at
-key 0). This happens on every backend whose recurrence changes. Both
-forms must meet the same error bound.
+14.50 against 13.07 and 13.57). With the decode, the call takes 25.47
+against 22.06 s. Peak RSS is within the processes' spread (medians 4370 and
+4414 MiB, ranges 3937-4478 and 4221-4829). The image's bits change with the
+arithmetic (sha256 `923e1b09` to `10b80bfe` at key 0), as they do on any
+backend whose recurrence changes, and both forms are held to the same error
+bound.
 
-On a v6e (Colab, three rounds each), neither form was faster at every
-shape. With doubled chunks at `527a32e9`, batch 16 changed from 17.25 to
-18.03-18.05 ms and batch 32 from 34.39 to 32.17-32.20. Sampling 1 image
-changed from 22.0 to 18.8 ms, while 4 images changed from 63.6 to 65.2
-with 0.11 GB more peak memory. With a scan after the real input product
-at `1f8d5e72`, batch 16 changed from 17.26-17.29 to 17.43-17.46 and
-batch 32 from 34.40-34.43 to 32.35-32.38. Sampling 1 image changed from
-22.0 to 16.7, and 4 images from 63.4-63.5 to 63.0-63.6. The TPU
-therefore keeps the original form throughout.
+On a v6e (Colab, three rounds each) neither form won at every shape. The
+doubled chunks, at `527a32e9`, took batch 16 from 17.25 to 18.03-18.05 ms
+and batch 32 from 34.39 to 32.17-32.20. Sampling went from 22.0 to 18.8 ms
+for 1 image and from 63.6 to 65.2 for 4 images, with 0.11 GB more at peak.
+The scan with the real input product in front of it, at `1f8d5e72`, took
+batch 16 from 17.26-17.29 to 17.43-17.46 and batch 32 from 34.40-34.43 to
+32.35-32.38. Sampling went from 22.0 to 16.7 for 1 image and from 63.4-63.5
+to 63.0-63.6 for 4. So a TPU keeps the first form whole.
 
-An earlier chunked form computed the powers with a running product
-(`cumprod`) and the Toeplitz block with shifted copies. `exp(t log(pole))`
-was cheaper, but rounds a large-angle pole's phase t times over. On poles
-around the unit circle, its RMS error against complex128 was 1.05e-5,
-against 1.57e-6 for doubling and 8.5e-7 for the running product. Over
-4096 positions, the doubled chunks' forward RMS error against the
-complex128 oracle is 1.144e-6; the old scan's is 1.156e-6.
+A first chunked form built the powers as a running product (`cumprod`) and
+the Toeplitz block from shifted copies. Computing the powers as `exp(t
+log(pole))` was cheaper, but it rounds the phase of a large-angle pole t
+times over. On poles all around the unit circle its RMS error against
+complex128 is 1.05e-5, against 1.57e-6 by doubling and 8.5e-7 by the running
+product. Over 4096 positions, the doubled chunks' forward RMS error against
+the complex128 oracle is 1.144e-6, and the old scan's is 1.156e-6.
 
-Unless stated otherwise, the sections below were measured with jax
+Unless a section says otherwise, the sections below were measured on jax
 0.11.1 / jaxlib 0.11.1 / jax_cuda12_plugin 0.11.1, driver 595.84, RTX 4080
 16 GiB, single device, bf16 compute, adam, 3 warmup and 10 measured steps,
-one architecture per process. The card was idle before each measurement.
+one architecture per process. The card was idle before each measurement;
 `nvidia-smi --query-compute-apps=process_name` showed only
-gnome-remote-desktop-daemon, the desktop process. The card ran at 210 MHz
-and 30 W at rest, and at 2760 MHz and 120-220 W under load. Each flag
-configuration ran in a fresh process because XLA reads flags once, when
-the backend opens.
+gnome-remote-desktop-daemon, which is the desktop itself. The card ran at
+210 MHz and 30 W at rest and at 2760 MHz and 120-220 W under load. XLA reads
+a flag once, when a backend opens, so every flag configuration ran in a
+fresh process.
 
 ## Step time breakdown, 2026-09-05
 
