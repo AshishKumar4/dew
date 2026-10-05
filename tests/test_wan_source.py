@@ -186,7 +186,16 @@ def streamed(walk):
 
 def assert_walked_as_the_source(walked, arrays, rows: int) -> None:
     """Each row's final latent and decoded frames by tests/reference_error.py's
-    rule, against the source pipeline's float32 walk and its float64 one."""
+    rule, against the source pipeline's float32 walk and its float64 one.
+
+    Observed: latents 1.58 to 1.80, frames 0.95 to 1.61. The walk is the
+    recorded 4 steps of the same host-table UniPC the replay below steps,
+    which at 4 steps measures 0.85, so the margin is the transformer's.
+    Teacher-forced on the walk's own inputs its forwards run 1.1 to 1.66:
+    every stage up to the cross-attention's inputs at most 1.05, the
+    cross-attention 1.93. XLA's float32 attention over Wan's 512 text keys
+    rounds 2.07 times as far from float64 as torch's SDPA does on the same
+    call (its math and flash backends both measure 1.0)."""
     frames = np.clip(np.asarray(walked.images) / 2 + 0.5, 0.0, 1.0)
     for row in range(rows):
         latent = (channels_last(arrays[name][None])[0] for name in (f"latents.{row}", f"latents_f64.{row}"))
