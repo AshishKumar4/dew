@@ -15,6 +15,7 @@ from collections.abc import Callable, Mapping
 import numpy as np
 
 from dew import records
+from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.hf_decoders import (
     _SERIALIZED_ENCODER_FIELDS,
     _SERIALIZED_TEXT_FIELDS,
@@ -35,6 +36,9 @@ from dew.interop.hf_decoders import (
     _yarn_record,
     translate_config,
 )
+from dew.nn.backbones.decoder_block import Mixture
+from dew.nn.backbones.layer_plan import LayerKind
+from dew.nn.hyper_connections import HyperConnections
 
 
 def _deepseek_rope(hf_config: Mapping[str, object], used: set
@@ -94,13 +98,13 @@ def _deepseek_mixture(hf_config: Mapping[str, object], layers: int,
         _refuse(f"topk_method {method!r}",
                 "the reference selects with the bias and the group limit, "
                 "which is what noaux_tc names")
-    return {
+    return NativeFields(Mixture, {
         **_deepseek_layout(hf_config, layers, used),
         'score_function': 'sigmoid',
         'groups': records.integer(hf_config.get('n_group') or 1, 'n_group'),
         'groups_per_token': records.integer(hf_config.get('topk_group') or 1, 'topk_group'),
         'bias': True,
-    }
+    })
 
 
 def _deepseek_v2_mixture(hf_config: Mapping[str, object], layers: int,
@@ -128,14 +132,14 @@ def _deepseek_v2_mixture(hf_config: Mapping[str, object], layers: int,
     if method == 'greedy' and (groups, per_token) != (1, 1):
         _refuse(f"n_group {groups} with topk_method 'greedy'",
                 "the greedy selection ignores the groups")
-    return {
+    return NativeFields(Mixture, {
         **_deepseek_layout(hf_config, layers, used),
         'score_function': 'softmax',
         'norm_topk_prob': False,
         'groups': groups,
         'groups_per_token': per_token,
         'group_score': 'max',
-    }
+    })
 
 
 def _deepseek_layout(hf_config: Mapping[str, object], layers: int,
@@ -189,14 +193,14 @@ def _deepseek_layout(hf_config: Mapping[str, object], layers: int,
             _refuse("moe_intermediate_size",
                     "the shared experts need their width")
         shared_features = shared * records.integer(width, 'moe_intermediate_size')
-    return {
-        'experts': records.integer(experts, 'n_routed_experts'),
-        'top_k': records.integer(hf_config['num_experts_per_tok'], 'num_experts_per_tok'),
-        'layers': sparse,
-        'scaling': records.number(hf_config.get('routed_scaling_factor', 1.0), 'routed_scaling_factor'),
-        'shared_features': shared_features,
-        'expert_features': records.integer(hf_config['moe_intermediate_size'], 'moe_intermediate_size'),
-    }
+    return native_fields(Mixture)(
+        experts=records.integer(experts, 'n_routed_experts'),
+        top_k=records.integer(hf_config['num_experts_per_tok'], 'num_experts_per_tok'),
+        layers=sparse,
+        scaling=records.number(hf_config.get('routed_scaling_factor', 1.0), 'routed_scaling_factor'),
+        shared_features=shared_features,
+        expert_features=records.integer(hf_config['moe_intermediate_size'], 'moe_intermediate_size'),
+    )
 
 
 def _deepseek_config(hf_config: Mapping[str, object], used: set[str], *,
@@ -280,7 +284,7 @@ def _deepseek_config(hf_config: Mapping[str, object], used: set[str], *,
     config.update(
         head_dim=nope + rope,
         mixer={
-            'kind': 'mla',
+            'name': 'mla', 'fields': {
             'q_lora_rank': (None if hf_config.get('q_lora_rank') is None
                             else records.integer(hf_config['q_lora_rank'], 'q_lora_rank')),
             'kv_lora_rank': records.integer(kv_rank, 'kv_lora_rank'),
@@ -293,7 +297,7 @@ def _deepseek_config(hf_config: Mapping[str, object], used: set[str], *,
             'index_n_heads': None if index is None else index['index_n_heads'],
             'index_head_dim': (None if index is None
                                else index['index_head_dim']),
-        },
+        }},
         mixture=mixture(hf_config, layers, used),
     )
     return config
@@ -646,18 +650,18 @@ def _v4_mixture(hf_config: Mapping[str, object], layers: int,
                 "the router selects on the scores plus its balancing bias, "
                 "which is what noaux_tc names")
     width = _record_int(hf_config, 'moe_intermediate_size')
-    return {
-        'experts': _record_int(hf_config, 'n_routed_experts'),
-        'top_k': _record_int(hf_config, 'num_experts_per_tok'),
-        'layers': tuple(range(layers)),
-        'score_function': scoring,
-        'bias': True,
-        'scaling': _record_float(hf_config, 'routed_scaling_factor', 1.5),
-        'shared_features': width,
-        'expert_features': width,
-        'hash_layers': tuple(index for index, kind in enumerate(mlp_kinds)
+    return native_fields(Mixture)(
+        experts=_record_int(hf_config, 'n_routed_experts'),
+        top_k=_record_int(hf_config, 'num_experts_per_tok'),
+        layers=tuple(range(layers)),
+        score_function=scoring,
+        bias=True,
+        scaling=_record_float(hf_config, 'routed_scaling_factor', 1.5),
+        shared_features=width,
+        expert_features=width,
+        hash_layers=tuple(index for index, kind in enumerate(mlp_kinds)
                              if kind == 'hash_moe'),
-    }
+    )
 
 
 def _deepseek_v4_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
@@ -724,19 +728,19 @@ def _deepseek_v4_config(hf_config: Mapping[str, object], used: set[str]) -> Deco
     used.update(('num_nextn_predict_layers', 'output_router_logits',
                  'router_aux_loss_coef', 'router_jitter_noise', 'ep_size'))
     groups = _record_int(hf_config, 'o_groups')
-    mixer: dict[str, object] = {
-        'kind': 'deepseek_v4',
+    fields: dict[str, object] = {
         'q_lora_rank': _record_int(hf_config, 'q_lora_rank'),
         'o_groups': groups,
         'o_lora_rank': _record_int(hf_config, 'o_lora_rank'),
         'rope_head_dim': rope_width,
         'compressor': None, 'compress_rate': None,
         'index_topk': None, 'index_n_heads': None, 'index_head_dim': None}
+    mixer = {'name': 'deepseek_v4', 'fields': fields}
     if groups < 1 or heads * head_dim % groups:
-        _refuse(f"o_groups {mixer['o_groups']}",
+        _refuse(f"o_groups {groups}",
                 f"the grouped output projection splits the {heads * head_dim} "
                 "stacked head dims into equal groups")
-    kinds = _v4_attention_kinds(hf_config, used, layer_types, mixer, window,
+    kinds = _v4_attention_kinds(hf_config, used, layer_types, fields, window,
                                 (compress_theta, compress_ramp))
     depth = hf_config.get('num_nextn_predict_layers', 1)
     if type(depth) is not int or depth not in (0, 1):
@@ -745,7 +749,9 @@ def _deepseek_v4_config(hf_config: Mapping[str, object], used: set[str]) -> Deco
         ratios = hf_config.get('compress_ratios')
         if isinstance(ratios, (list, tuple)) and len(ratios) > layers and ratios[layers] != 0:
             _refuse('compress_ratios prediction depth', 'the released V4 prediction block is sliding-only')
-        kinds['mtp_attention'] = {'window': int(window), 'rope_theta': main_theta, 'mixer': mixer}
+        kinds['mtp_attention'] = native_fields(LayerKind)(window=int(window), rope_theta=main_theta,
+                                                         mixer=None)
+        kinds['mtp_attention']['mixer'] = mixer
         config['mtp_layer_type'] = 'mtp_attention'
     config['num_nextn_predict_layers'] = depth
     streams = _v4_streams(hf_config)
@@ -764,7 +770,7 @@ def _deepseek_v4_config(hf_config: Mapping[str, object], used: set[str]) -> Deco
 def _v4_attention_kinds(hf_config: Mapping[str, object], used: set[str],
                         layer_types: tuple[str, ...], mixer: Mapping[str, object],
                         window: int, compress: tuple[float, Ramp | None]) -> dict[str, KindFields]:
-    """Build each attention kind's own record.
+    """Build each attention kind's own record from the shared `mixer` fields.
 
     Every V4 layer attends its window; a compressed one rotates at the
     compress base and hands its compressor and rate to the mixer, the sparse
@@ -777,7 +783,7 @@ def _v4_attention_kinds(hf_config: Mapping[str, object], used: set[str],
     rates = _v4_compress_rates(hf_config, layer_types, used)
     kinds: dict[str, KindFields] = {}
     for kind in dict.fromkeys(layer_types):
-        record: KindFields = {'window': window}
+        record: KindFields = native_fields(LayerKind)(window=window)
         compressor = _V4_KINDS[kind]
         if compressor is not None:
             layer_mixer = {**mixer, 'compressor': compressor,
@@ -785,7 +791,7 @@ def _v4_attention_kinds(hf_config: Mapping[str, object], used: set[str],
             if compressor == 'csa':
                 layer_mixer.update(index)
             record.update(rope_theta=compress_theta, yarn=compress_ramp,
-                          mixer=layer_mixer)
+                          mixer={'name': 'deepseek_v4', 'fields': layer_mixer})
         kinds[kind] = record
     return kinds
 
@@ -796,11 +802,11 @@ def _v4_streams(hf_config: Mapping[str, object]) -> HyperConnectionsFields:
     A layer collapses them through a learned head of its own
     (DeepseekV4HyperHead, modeling_deepseek_v4.py:946-962).
     """
-    return {
-        'hc_mult': _record_int(hf_config, 'hc_mult', 4),
-        'hc_eps': _record_float(hf_config, 'hc_eps', 1e-6),
-        'hc_sinkhorn_iters': _record_int(hf_config, 'hc_sinkhorn_iters', 20),
-        'head': 'weighted'}
+    return native_fields(HyperConnections)(
+        hc_mult=_record_int(hf_config, 'hc_mult', 4),
+        hc_eps=_record_float(hf_config, 'hc_eps', 1e-6),
+        hc_sinkhorn_iters=_record_int(hf_config, 'hc_sinkhorn_iters', 20),
+        head='weighted')
 
 
 # The layer names V4 and V4.1 releases share, onto the module names

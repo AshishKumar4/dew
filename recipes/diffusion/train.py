@@ -17,7 +17,7 @@ checkpoints, and training and inference both build from `config.build()`.
 
 `--pretrained stabilityai/stable-diffusion-3.5-medium preset:none` fine-tunes a
 published pipeline (SD3, Flux, Qwen-Image or a UNet) on its own conditioning,
-autoencoder and convention; `rl:flow-grpo --rl.reward clip_score` trains the
+autoencoder and convention; `mode:flow-grpo --mode.reward clip_score` trains the
 model with Flow-GRPO on that reward instead of the denoising loss.
 """
 
@@ -168,4 +168,4 @@ def main(config: DiffusionRunConfig) -> TrainState:
 
 
 if __name__ == '__main__':
-    main(tyro.cli(tyro.conf.CascadeSubcommandArgs[DiffusionRecipeConfig]))
+    main(DiffusionRecipeConfig.cli())

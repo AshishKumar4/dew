@@ -21,7 +21,11 @@ Two more fixtures:
   network whose block's tokens are aligned, and so is the encoder, a patch
   projection of the preprocessed pixels. `SILoss`'s time and noise are the
   ones `DiffusionObjective.loss` draws from `jax.random.key(3)`: the split's
-  third key for the times and its fourth for the noise.
+  third key for the times and its fourth for the noise. Beside the
+  gradient, REPA's fp32 gradient's distance from its float64 one over
+  ORDERS orders of the stand-in's hidden units (tests/residual_orders.py),
+  for tests/reference_error.py's K-order rule; order 1 in float64 is
+  checked to land on the float64 gradient.
 - preprocessed.npz: 256-pixel images through `preprocess_raw_image`'s
   "dinov2" branch (/255, ImageNet's normalization, bicubic to 224) and
   iREPA's `DINOv2Encoder.preprocess`, then iREPA's `spatial_zscore` of
@@ -33,7 +37,9 @@ Two more fixtures:
 from __future__ import annotations
 
 import ast
+import copy
 import json
+import sys
 import types
 import urllib.request
 from pathlib import Path
@@ -46,6 +52,10 @@ REPA = "https://raw.githubusercontent.com/sihyun-yu/REPA/67f714503e3892f993844aa
 IREPA = "https://raw.githubusercontent.com/End2End-Diffusion/iREPA/99ad4ac234efe8de52ce157120f72856e836d09f/ldm/"
 FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "repa"
 BATCH, SIDE, WIDTH, FEATURES, HIDDEN = 2, 4, 12, 10, 16
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
+from reference_error import ORDERS, distance  # noqa: E402
+from residual_orders import orders  # noqa: E402
+
 GAMMA = 0.6
 
 
@@ -189,9 +199,20 @@ def composed() -> None:
                            strict=True):
         for leaf, value in dense(layer).items():
             arrays[f"projector/{name}/{leaf}"] = value
-    for dtype, suffix in ((torch.float64, "_f64"), (torch.float32, "")):
-        network = Network({name: torch.as_tensor(value, dtype=dtype) for name, value in weights.items()},
-                          projector.to(dtype), patch, side)
+
+    def run(dtype, order: np.ndarray) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+        """The composed loss and its gradient in `dtype`, the network's hidden
+        units in `order` (embed's columns, time, block's rows and columns,
+        head's rows, the projector's inputs), the gradient back in the
+        fixture's order."""
+        moved = {"embed": weights["embed"][:, order], "time": weights["time"][order],
+                 "block": weights["block"][np.ix_(order, order)], "head": weights["head"][order]}
+        layers = copy.deepcopy(projector).to(dtype)
+        with torch.no_grad():
+            layers[0].weight.copy_(layers[0].weight[:, torch.from_numpy(order)])
+        # C order: a fancy index leaves embed's copy strided, which takes another BLAS path.
+        network = Network({name: torch.as_tensor(np.ascontiguousarray(value), dtype=dtype)
+                           for name, value in moved.items()}, layers, patch, side)
         raw = torch.as_tensor(pixels, dtype=dtype).permute(0, 3, 1, 2)
         prepared = preprocess["preprocess_raw_image"](raw, "dinov1").permute(0, 2, 3, 1)
         zs = [patches(prepared, patch) @ torch.as_tensor(encoder, dtype=dtype)]
@@ -203,14 +224,33 @@ def composed() -> None:
         exec(f"loss_mean = loss.mean()\nproj_loss_mean = proj_loss.mean()\n{composition}", scope)
         total = scope["loss"]
         total.backward()
-        arrays[f"loss{suffix}"] = total.detach().double().numpy()
-        for name, parameter in network.weights.items():
-            arrays[f"grad/{name}{suffix}"] = parameter.grad.double().numpy()
-        for name, layer in zip(("Dense_0", "Dense_1", "Dense_2"), (projector[0], projector[2], projector[4]),
+        back = np.argsort(order)
+        found = {name: parameter.grad.double().numpy() for name, parameter in network.weights.items()}
+        grads = {"grad/embed": found["embed"][:, back], "grad/time": found["time"][back],
+                 "grad/block": found["block"][np.ix_(back, back)], "grad/head": found["head"][back]}
+        for name, layer in zip(("Dense_0", "Dense_1", "Dense_2"), (layers[0], layers[2], layers[4]),
                                strict=True):
-            arrays[f"grad/projector/{name}/kernel{suffix}"] = layer.weight.grad.double().numpy().T
-            arrays[f"grad/projector/{name}/bias{suffix}"] = layer.bias.grad.double().numpy()
-            layer.weight.grad = layer.bias.grad = None
+            kernel = layer.weight.grad.double().numpy().T
+            grads[f"grad/projector/{name}/kernel"] = kernel[back] if name == "Dense_0" else kernel
+            grads[f"grad/projector/{name}/bias"] = layer.bias.grad.double().numpy()
+        return total.detach().double().numpy(), grads
+
+    drawn = orders(width, ORDERS, settings["key"])
+    for dtype, suffix in ((torch.float64, "_f64"), (torch.float32, "")):
+        arrays[f"loss{suffix}"], grads = run(dtype, drawn[0])
+        arrays.update({f"{name}{suffix}": value for name, value in grads.items()})
+    # The orders are a symmetry of REPA's computation too: order 1 in float64
+    # lands on the fixture's float64 gradient within float64 rounding.
+    _, moved = run(torch.float64, drawn[1])
+    for name, value in moved.items():
+        truth = arrays[f"{name}_f64"]
+        assert np.abs(value - truth).max() <= 1e-12 * np.abs(truth).max(), name
+    distances = {name: [distance(arrays[name], arrays[f"{name}_f64"])] for name in grads}
+    for order in drawn[1:]:
+        for name, value in run(torch.float32, order)[1].items():
+            distances[name].append(distance(value, arrays[f"{name}_f64"]))
+    arrays["orders"] = drawn.astype(np.uint8)
+    arrays.update({f"orders/{name}": np.asarray(values) for name, values in distances.items()})
     np.savez(FIXTURE / "composed.npz", **arrays)
     print(f"{FIXTURE}: REPA's composed loss and its gradient")
 

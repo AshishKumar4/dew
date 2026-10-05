@@ -16,15 +16,21 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from reference_error import assert_as_exact_as_the_reference, assert_fp32_reduction_bound, distance
 
 from dew.nn import kernels
 from dew.nn.attention import (
     SPLASH_LANES,
     SPLASH_MIN_LENGTH,
+    VALUE_BLOCK,
     attention_kernel,
     cudnn_runs,
+    folded_attention,
+    folds,
+    resolve_implementation,
     scaled_dot_product_attention,
     tpu_runs,
+    weighted_values,
 )
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.kernels import bf16_dot_runs
@@ -512,3 +518,132 @@ def test_the_sm75_route_applies_on_a_gpu_backend_only(monkeypatch):
     monkeypatch.setattr(jax, 'default_backend', lambda: 'cpu')
     query = jnp.zeros((1, 16, 2, 64), jnp.bfloat16)
     assert resolve_implementation('xla', query, query) == 'xla'
+
+
+@pytest.mark.parametrize("dtype, keys, chosen", [
+    (jnp.float32, VALUE_BLOCK, "xla"), (jnp.float32, VALUE_BLOCK + 1, "reference"),
+    (jnp.float32, 2048, "reference"), (jnp.bfloat16, 2048, "xla")])
+def test_cpu_fp32_attention_over_more_than_a_block_of_keys_takes_the_reference_path(monkeypatch, dtype, keys,
+                                                                                     chosen):
+    """jax.nn's xla attention on XLA:CPU sums an fp32 value product over all
+    its keys in one YNNPACK chain; past VALUE_BLOCK keys 'auto' and 'xla'
+    take the reference path, whose product sums in blocks. A shorter call
+    and a bf16 one compute as before."""
+    monkeypatch.setattr(jax, 'default_backend', lambda: 'cpu')
+    query, key = jnp.zeros((1, 16, 2, 64), dtype), jnp.zeros((1, keys, 2, 64), dtype)
+    for requested in ('auto', 'xla'):
+        assert resolve_implementation(requested, query, key) == chosen
+
+
+@pytest.mark.skipif(jax.default_backend() != 'cpu', reason="the blocked sum is XLA:CPU's")
+def test_cpu_fp32_attention_rounds_closer_to_float64_in_blocks():
+    """Over 2048 keys of cross-attention-like inputs, Dew's fp32 attention on
+    XLA:CPU is at most three quarters of jax.nn's xla distance from float64
+    (measured 0.55 of it; torch's SDPA sits between, docs/performance.md),
+    and the blocked product's gradients are the plain product's."""
+    rng = np.random.default_rng(0)
+    query, key = (rng.normal(size=(1, length, 2, 128)).astype(np.float32) * 0.6 for length in (128, 2048))
+    value = rng.normal(size=(1, 2048, 2, 128)).astype(np.float32)
+    q, k, v = (np.asarray(x, np.float64) for x in (query, key, value))
+    logits = np.einsum('btnh,bsnh->bnts', q, k) / np.sqrt(128)
+    probs = np.exp(logits - logits.max(-1, keepdims=True))
+    truth = np.einsum('bnts,bsnh->btnh', probs / probs.sum(-1, keepdims=True), v)
+    dew = scaled_dot_product_attention(query, key, value)
+    plain = jax.nn.dot_product_attention(query, key, value, implementation='xla')
+    mine, theirs = distance(dew, truth), distance(plain, truth)
+    assert mine <= 0.75 * theirs, (mine, theirs)
+
+    weights = jax.nn.softmax(jnp.asarray(logits, jnp.float32))
+    blocked = jax.grad(lambda w, v: jnp.sum(weighted_values('...hqk,...khd->...qhd', w, v) ** 2), (0, 1))
+    out = weighted_values('...hqk,...khd->...qhd', weights, value)
+    cotangent = 2 * out
+    want = (jnp.einsum('...qhd,...khd->...hqk', cotangent, value),
+            jnp.einsum('...hqk,...qhd->...khd', weights, cotangent))
+    for got, expected in zip(blocked(weights, value), want, strict=True):
+        np.testing.assert_array_equal(got, expected)
+
+
+@pytest.mark.parametrize("call, taken", [
+    ({}, True), ({"positions": 8, "heads": 2}, True), ({"positions": 9, "heads": 2}, False),
+    ({"kv_heads": 1}, False), ({"causal": True}, False), ({"mask": True}, False),
+    ({"backend": "cpu"}, False)])
+def test_a_decode_shaped_xla_call_on_a_gpu_folds_its_heads(monkeypatch, call, taken):
+    """An xla call of at most FOLDED_PAIRS query positions times heads, over
+    keys of its own heads and masked by key lengths at most, reads the cache
+    in its layout on a GPU (`folded_attention`); anything else is jax.nn's."""
+    monkeypatch.setattr(jax, 'default_backend', lambda: call.get("backend", "gpu"))
+    heads = call.get("heads", 2)
+    query = jnp.zeros((3, call.get("positions", 4), heads, 256), jnp.bfloat16)
+    key = jnp.zeros((3, 40, call.get("kv_heads", heads), 256), jnp.bfloat16)
+    mask = jnp.ones((3, 1, query.shape[1], 40), bool) if call.get("mask") else None
+    assert folds(query, key, None, mask, call.get("causal", False), None) == taken
+
+
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize("heads", [1, 2])
+def test_folded_attention_is_jax_nn_attention(dtype, heads):
+    """Every query head against every (key, head) pair, the other heads'
+    products thrown away, computes jax.nn's xla attention. In fp32 it only
+    reorders three sums, the logits' over the width, the softmax's over the
+    keys and the value product's over keys times heads (exact zeros between),
+    so it sits within their summed chains of jax.nn's
+    (`assert_fp32_reduction_bound`), the logits' rounding carried through the
+    softmax at twice the largest logit magnitude. In bf16 it is within
+    tests/reference_error.py's rule of jax.nn against float64. Rows read 1,
+    17 and all 40 keys."""
+    rng = np.random.default_rng(0)
+    query = rng.normal(size=(3, 4, heads, 256))
+    key, value = rng.normal(size=(2, 3, 40, heads, 256)) * np.array([0.3, 1.0])[:, None, None, None, None]
+    lengths = jnp.asarray([1, 17, 40], jnp.int32)
+    q, k, v = (jnp.asarray(x, dtype) for x in (query, key, value))
+    folded = folded_attention(q, k, v, lengths)
+    plain = jax.nn.dot_product_attention(q, k, v, key_value_seq_lengths=lengths,
+                                         implementation='xla')
+    assert folded.shape == plain.shape and folded.dtype == plain.dtype
+
+    q, k, v = (np.asarray(x, np.float64) for x in (q, k, v))
+    read = np.arange(40)[None, None, None, :] < np.asarray(lengths)[:, None, None, None]
+    logits = np.where(read, np.einsum('btnd,bsnd->bnts', q, k) / 16.0, -np.inf)
+    probs = np.exp(logits - logits.max(-1, keepdims=True))
+    probs /= probs.sum(-1, keepdims=True)
+    truth = np.einsum('bnts,bsnd->btnd', probs, v)
+    if dtype == jnp.float32:
+        spread = np.where(read, np.einsum('btnd,bsnd->bnts', np.abs(q), np.abs(k)) / 16.0, 0).max(-1)
+        carried = 1 + 2 * spread.transpose(0, 2, 1)[..., None]
+        magnitudes = np.einsum('bnts,bsnd->btnd', probs, np.abs(v)) * carried
+        assert_fp32_reduction_bound(folded, plain, magnitudes, terms=256 + 40 + 40 * heads)
+        return
+    assert_as_exact_as_the_reference(np.asarray(folded, np.float32), np.asarray(plain, np.float32), truth,
+                                     "folded")
+
+
+@pytest.mark.skipif(jax.default_backend() != 'gpu', reason="the kernel runs on CUDA")
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
+def test_the_decode_kernel_reads_each_row_to_its_length(dtype):
+    """`dew.nn.kernels.decode_attention` reads each row's keys up to its
+    length, block by block, and is within tests/reference_error.py's rule of
+    jax.nn's xla attention against float64: rows reading 1 key (an idle
+    slot), a block's worth, one past it, and the whole capacity, at
+    Qwen3.5-0.8B's widths (4 query positions over 2 key heads of 256)."""
+    from dew.nn.kernels import decode_attention
+
+    rng = np.random.default_rng(0)
+    capacity = 4 * decode_attention.BLOCK
+    lengths = jnp.asarray([1, decode_attention.BLOCK, decode_attention.BLOCK + 1, 77, capacity], jnp.int32)
+    rows = lengths.shape[0]
+    query = jnp.asarray(rng.normal(size=(rows, 4, 2, 256)), dtype)
+    key = jnp.asarray(rng.normal(size=(rows, capacity, 2, 256)) * 0.3, dtype)
+    value = jnp.asarray(rng.normal(size=(rows, capacity, 2, 256)), dtype)
+    assert decode_attention.fits(query, key)
+    out = jax.jit(decode_attention.attend)(query, key, value, lengths)
+    plain = jax.nn.dot_product_attention(query, key, value, key_value_seq_lengths=lengths,
+                                         implementation='xla')
+    assert out.shape == plain.shape and out.dtype == plain.dtype
+    q, k, v = (np.asarray(x, np.float64) for x in (query, key, value))
+    read = np.arange(capacity)[None, None, None, :] < np.asarray(lengths)[:, None, None, None]
+    logits = np.where(read, np.einsum('btnd,bsnd->bnts', q, k) / 16.0, -np.inf)
+    probs = np.exp(logits - logits.max(-1, keepdims=True))
+    truth = np.einsum('bnts,bsnd->btnd', probs / probs.sum(-1, keepdims=True), v)
+    assert_as_exact_as_the_reference(np.asarray(out, np.float32), np.asarray(plain, np.float32), truth,
+                                     "decode kernel")
+

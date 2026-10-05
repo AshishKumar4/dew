@@ -132,13 +132,12 @@ def write_token_files(directory: Path, tokenizer: HFTokenizer) -> dict:
 def train_and_export(root: Path) -> Path:
     """A short real run on those tokens, written back out in the HF layout
     with the tokenizer that produced the ids, which writes its own files."""
-    import tyro
 
     recipe = load_recipe()
     tokenizer = HFTokenizer(str(TOKENIZER))
     tokens = root / "tokens"
     meta = write_token_files(tokens, tokenizer)
-    config = tyro.cli(tyro.conf.CascadeSubcommandArgs[recipe.LmRunConfig], args=[
+    config = recipe.LmRunConfig.cli( [
         "--data.path", str(tokens), "--data.seq-len", str(SEQ),
         "--data.loading.workers", "0", "--tokenizer", str(TOKENIZER),
         "--trainer.batch-size", "16", "--trainer.steps", str(STEPS),

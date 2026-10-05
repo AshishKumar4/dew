@@ -463,8 +463,8 @@ BlockGeneration(model, variables, process, processor=None, eos_token_ids=(), pad
 task(request, max_new_tokens=None, *, key=None, n=None, process=None,
      images=None) -> CanvasGeneration
 Pretrained.load(name_or_dir, *, dtype=jnp.bfloat16, param_dtype=jnp.float32, attention_impl="auto",
-                max_seq_len=None, revision=None, gguf_file=None, single_file=None, mesh=None,
-                layout=None, fallback=None) -> the kind it is called on, or the kind the source is
+                max_seq_len=None, revision=None, gguf_file=None, single_file=None, dduf_file=None,
+                mesh=None, layout=None, fallback=None) -> the kind it is called on, or the kind the source is
 PretrainedDecoder.text_generation(*, sampling=None) -> TextGeneration
 PretrainedMaskedDecoder.text_generation() -> MaskedGeneration
 PretrainedBlockDecoder.block_generation() -> BlockGeneration

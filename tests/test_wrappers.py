@@ -50,10 +50,10 @@ def test_gemma3_wrapper_translates_to_three_records():
         json.loads((directory / "config.json").read_text()))
     assert record["text_model_type"] == "gemma3_text"
     assert record["text"]["emb_features"] == 64
-    assert record["tower"]["kind"] == "siglip"
-    assert record["tower"]["hidden_size"] == 32
-    assert record["projector"]["kind"] == "gemma"
-    assert record["projector"]["text_width"] == 64
+    assert record["tower"]["name"] == "siglip"
+    assert record["tower"]["fields"]["hidden_size"] == 32
+    assert record["projector"]["name"] == "gemma"
+    assert record["projector"]["fields"]["text_width"] == 64
     assert record["image_token_id"] == 202
     assert record["tokens_per_image"] == 1
 
@@ -63,8 +63,8 @@ def test_llama4_wrapper_translates_to_three_records():
     record = translate_wrapper_config(
         json.loads((directory / "config.json").read_text()))
     assert record["text_model_type"] == "llama4_text"
-    assert record["tower"]["kind"] == "llama4"
-    assert record["projector"]["kind"] == "llama4"
+    assert record["tower"]["name"] == "llama4"
+    assert record["projector"]["name"] == "llama4"
     assert record["image_token_id"] == 92
     assert record["tokens_per_image"] == 1
 
@@ -75,13 +75,13 @@ def test_gemma4_wrapper_translates_to_three_records():
         json.loads((directory / "config.json").read_text()))
     assert record["text_model_type"] == "gemma4_text"
     assert record["text"]["emb_features"] == 32
-    assert record["tower"]["kind"] == "gemma4"
-    assert record["tower"]["hidden_size"] == 32
-    assert record["tower"]["pooling_kernel_size"] == 2
-    assert record["projector"]["kind"] == "gemma4"
+    assert record["tower"]["name"] == "gemma4"
+    assert record["tower"]["fields"]["hidden_size"] == 32
+    assert record["tower"]["fields"]["pooling_kernel_size"] == 2
+    assert record["projector"]["name"] == "gemma4"
     assert record["projector"] == {
-        "kind": "gemma4", "text_width": 32,
-        "norm_eps": 1e-06}
+        "name": "gemma4", "fields": {"text_width": 32,
+        "norm_eps": 1e-06}}
     assert record["image_token_id"] == 60
     # The pooled count follows the image resolution, so the record leaves it
     # open; the fixture's 4x4 patch grid pools to four soft tokens.
@@ -93,14 +93,44 @@ def test_qwen35_wrapper_translates_to_three_records():
     record = translate_wrapper_config(
         json.loads((directory / "config.json").read_text()))
     assert record["text_model_type"] == "qwen3_5_text"
-    assert record["tower"]["kind"] == "qwen3_5"
-    assert record["tower"]["spatial_merge_size"] == 2
-    assert record["tower"]["temporal_patch_size"] == 2
-    assert record["projector"]["kind"] == "qwen3_5"
+    assert record["tower"]["name"] == "qwen3_5"
+    assert record["tower"]["fields"]["spatial_merge_size"] == 2
+    assert record["tower"]["fields"]["temporal_patch_size"] == 2
+    assert record["projector"]["name"] == "qwen3_5"
     assert record["projector"] == {
-        "kind": "qwen3_5", "vision_width": 32, "merge_size": 2, "out_width": 64}
+        "name": "qwen3_5", "fields": {"vision_width": 32, "merge_size": 2, "out_width": 64}}
     assert record["image_token_id"] == 200
     assert record["tokens_per_image"] is None
+
+
+@pytest.mark.parametrize("name", ["qwen35-tiny-mm", "qwen35-moe-native-tiny"])
+def test_a_qwen35_wrapper_repeating_its_text_width_translates_the_same(name):
+    """Ornith's Qwen3.5 wrappers state hidden_size at the top level too. The
+    wrapper config declares no such field and its model reads the text
+    config's, so a repeated value translates as if absent; another value
+    is refused by name, since it describes no model the reference builds."""
+    config = json.loads((FIXTURES / name / "config.json").read_text())
+    width = config["text_config"]["hidden_size"]
+
+    assert translate_wrapper_config({**config, "hidden_size": width}) == translate_wrapper_config(config)
+    with pytest.raises(ValueError, match=f"^hidden_size={2 * width} is not expressible"):
+        translate_wrapper_config({**config, "hidden_size": 2 * width})
+
+
+@pytest.mark.network
+@pytest.mark.parametrize("repo, revision", [
+    ("ornith-ai/Ornith-1.0-9B", "83dc1f5e24ef8527af019a6b3bf66ac0f1c2c999"),
+    ("ornith-ai/Ornith-1.0-35B", "5df2ed3f675c7beaa490328cc70bb573b65fb660"),
+])
+def test_ornith_wrappers_translate_from_their_released_configs(repo, revision):
+    """The two most downloaded Ornith wrappers (qwen3_5 and qwen3_5_moe),
+    config only: each repeats its text width at the top level."""
+    from huggingface_hub import hf_hub_download
+
+    config = json.loads(Path(hf_hub_download(repo, "config.json", revision=revision)).read_text())
+    assert config["hidden_size"] == config["text_config"]["hidden_size"]
+    record = translate_wrapper_config(config)
+    assert record["text_model_type"] == config["text_config"]["model_type"]
 
 
 def test_the_released_gemma4_wrapper_translates():
@@ -110,10 +140,10 @@ def test_the_released_gemma4_wrapper_translates():
     config = json.loads((FIXTURES / "gemma4-26b-a4b" / "config.json").read_text())
     record = translate_wrapper_config(config)
     assert translate_config(config["text_config"])["emb_features"] == 2816
-    assert record["tower"]["hidden_size"] == 1152
-    assert record["tower"]["pooling_kernel_size"] == 3
-    assert record["tower"]["rope_theta"] == 100.0
-    assert record["projector"]["text_width"] == 2816
+    assert record["tower"]["fields"]["hidden_size"] == 1152
+    assert record["tower"]["fields"]["pooling_kernel_size"] == 3
+    assert record["tower"]["fields"]["rope_theta"] == 100.0
+    assert record["projector"]["fields"]["text_width"] == 2816
     assert record["tokens_per_image"] is None
 
 
@@ -123,10 +153,10 @@ def test_the_released_qwen35_wrapper_translates():
     decoder width."""
     config = json.loads((FIXTURES / "qwen35-0.8b" / "config.json").read_text())
     record = translate_wrapper_config(config)
-    assert record["tower"]["hidden_size"] == 768
+    assert record["tower"]["fields"]["hidden_size"] == 768
     assert record["projector"] == {
-        "kind": "qwen3_5", "vision_width": 768, "merge_size": 2,
-        "out_width": 1024}
+        "name": "qwen3_5", "fields": {"vision_width": 768, "merge_size": 2,
+        "out_width": 1024}}
     assert record["image_token_id"] == 248056
 
 
@@ -136,22 +166,22 @@ def test_the_released_scout_wrapper_translates():
     from the 24x24 patch grid shuffled by a half."""
     config = json.loads((FIXTURES / "llama-4-scout" / "config.json").read_text())
     record = translate_wrapper_config(config)
-    assert record["tower"]["rope_theta"] == 10000.0
-    assert record["tower"]["image_size"] == 336
+    assert record["tower"]["fields"]["rope_theta"] == 10000.0
+    assert record["tower"]["fields"]["image_size"] == 336
     assert record["tokens_per_image"] == 144
     assert record["projector"] == {
-        "kind": "llama4", "text_width": 5120}
+        "name": "llama4", "fields": {"text_width": 5120}}
 
 
 def wrapper_pixels(directory, record):
     """Fixture pixels as the tower reads them: the Gemma 4 fixture stores
     processor patches, which fold back into the image row-major."""
     pixels = np.load(directory / "pixels.npy")
-    if record["tower"]["kind"] != "gemma4":
+    if record["tower"]["name"] != "gemma4":
         return pixels
     batch, count, _ = pixels.shape
     grid = int(count ** 0.5)
-    patch = int(record["tower"]["patch_size"])
+    patch = int(record["tower"]["fields"]["patch_size"])
     side = grid * patch
     return pixels.reshape(batch, grid, grid, patch, patch, 3).transpose(
         0, 5, 1, 3, 2, 4).reshape(batch, 3, side, side)

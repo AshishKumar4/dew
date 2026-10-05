@@ -121,14 +121,15 @@ SHAPES = {
     "narrow": {"num_layers": 8, "emb_features": 4, "num_heads": 1, "num_kv_heads": 1, "mlp_features": 8},
     "moe": {"num_layers": 4, "mixture": {"experts": 4, "top_k": 2, "bias": True}},
     "gated_delta_net": {"num_layers": 4, "layer_types": ("linear_attention",) * 4,
-                            "kinds": {"linear_attention": {"mixer": {"kind": "gated_delta_net"}}}},
+                            "kinds": {"linear_attention": {
+                                "mixer": {"name": "gated_delta_net", "fields": {}}}}},
     "latent_attention": {"num_layers": 4, "mixer": {
-        "kind": "mla", "kv_lora_rank": 16, "q_lora_rank": 16, "qk_rope_head_dim": 4,
-        "qk_nope_head_dim": 4, "v_head_dim": 8}},
+        "name": "mla", "fields": {"kv_lora_rank": 16, "q_lora_rank": 16, "qk_rope_head_dim": 4,
+        "qk_nope_head_dim": 4, "v_head_dim": 8}}},
     "indexed_latent_attention": {"num_layers": 4, "mixer": {
-        "kind": "mla", "kv_lora_rank": 16, "q_lora_rank": 16, "qk_rope_head_dim": 4,
+        "name": "mla", "fields": {"kv_lora_rank": 16, "q_lora_rank": 16, "qk_rope_head_dim": 4,
         "qk_nope_head_dim": 4, "v_head_dim": 8, "index_n_heads": 2, "index_head_dim": 8,
-        "index_topk": 4}},
+        "index_topk": 4}}},
     "untied_head": {"num_layers": 4, "tie_embeddings": False},
     "unequal_runs": {"num_layers": 5, "layer_types": (
         "full_attention", "sliding_attention", "sliding_attention", "sliding_attention",

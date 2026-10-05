@@ -10,15 +10,14 @@ layer the MTP checkpoints carry past `num_hidden_layers`.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import asdict
 
 from dew import records
+from dew.interop.config_records import native_fields
 from dew.interop.hf_decoders import (
     _LINEAR_FIELDS,
     _MOE_SHARED,
     DEFAULT_MAX_SEQ_LEN,
     DecoderFields,
-    MixtureFields,
     _base_config,
     _dew_path,
     _kinds_of,
@@ -26,11 +25,12 @@ from dew.interop.hf_decoders import (
     _refuse,
     _rope,
     _Ropes,
-    _softmax_mixture,
+    _softmax_top_k,
     _specified_layer_types,
 )
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
+from dew.nn.backbones.layer_plan import LayerKind
 
 
 def _qwen_layer_types(hf_config: Mapping[str, object], used: set[str]) -> tuple[str, ...]:
@@ -152,10 +152,13 @@ def _qwen3_moe_config(hf_config: Mapping[str, object], used: set[str]) -> Decode
     if not sparse:
         _refuse("mlp_only_layers with decoder_sparse_step",
                 "together they leave no routed layer, which is a dense qwen3 model")
-    config['mixture'] = _softmax_mixture(
-        hf_config, used, experts=records.integer(experts, 'num_experts/num_local_experts'), layers=sparse,
-        norm_topk_prob=bool(hf_config.get('norm_topk_prob', False)),
-        expert_features=records.integer(hf_config['moe_intermediate_size'], 'moe_intermediate_size'))
+    expert_count = records.integer(experts, 'num_experts/num_local_experts')
+    norm_topk = bool(hf_config.get('norm_topk_prob', False))
+    expert_width = records.integer(hf_config['moe_intermediate_size'], 'moe_intermediate_size')
+    config['mixture'] = native_fields(Mixture)(
+        top_k=_softmax_top_k(hf_config, used), experts=expert_count, layers=sparse,
+        norm_topk_prob=norm_topk,
+        expert_features=expert_width)
     return config
 
 
@@ -179,8 +182,9 @@ def _qwen_hybrid_config(hf_config: Mapping[str, object], used: set[str], *,
     used.update(('rope_parameters', 'rope_theta', 'partial_rotary_factor'))
     kinds = dict(_kinds_of(config))
     if 'linear_attention' in layer_types:
-        kinds['linear_attention'] = {'mixer': {
-            'kind': 'gated_delta_net',
+        kinds['linear_attention'] = native_fields(LayerKind)(mixer=None)
+        kinds['linear_attention']['mixer'] = {
+            'name': 'gated_delta_net', 'fields': {
             **{field: records.integer(hf_config[field], field) for field in _LINEAR_FIELDS},
             **mixer}}
     unknown_kinds = sorted(set(layer_types) - {'linear_attention', 'full_attention'})
@@ -262,11 +266,13 @@ def _qwen3_next_config(hf_config: Mapping[str, object], used: set[str]) -> Decod
     )
     # `num_experts > 0` gates the routed block too (modeling_qwen3_next.py:814).
     if sparse and experts > 0:
-        config['mixture'] = _softmax_mixture(
-            hf_config, used, experts=experts, layers=sparse,
-            norm_topk_prob=bool(hf_config.get('norm_topk_prob', True)),
-            expert_features=_record_int(hf_config, 'moe_intermediate_size'),
-            shared_features=_record_int(hf_config, 'shared_expert_intermediate_size'),
+        norm_topk = bool(hf_config.get('norm_topk_prob', True))
+        expert_width = _record_int(hf_config, 'moe_intermediate_size')
+        shared_width = _record_int(hf_config, 'shared_expert_intermediate_size')
+        config['mixture'] = native_fields(Mixture)(
+            top_k=_softmax_top_k(hf_config, used), experts=experts, layers=sparse,
+            norm_topk_prob=norm_topk,
+            expert_features=expert_width, shared_features=shared_width,
             shared_gate=True)
     config['num_nextn_predict_layers'] = _single_prediction_depth(hf_config, used, 'num_nextn_predict_layers')
     return config
@@ -282,12 +288,12 @@ def _qwen35_moe_config(hf_config: Mapping[str, object], used: set[str]) -> Decod
     """
     width = _record_int(hf_config, "moe_intermediate_size")
     config = _qwen35_config({**hf_config, "intermediate_size": width}, used)
-    config["mixture"] = MixtureFields(**asdict(Mixture(
+    config["mixture"] = native_fields(Mixture)(
         experts=_record_int(hf_config, "num_experts"),
         top_k=_record_int(hf_config, "num_experts_per_tok"),
         expert_features=width,
         shared_features=_record_int(hf_config, "shared_expert_intermediate_size"),
-        shared_gate=True)))
+        shared_gate=True)
     used.update(("moe_intermediate_size", "num_experts", "num_experts_per_tok",
                  "shared_expert_intermediate_size", "output_router_logits", "router_aux_loss_coef"))
     return config

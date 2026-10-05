@@ -10,7 +10,6 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-import tyro
 from test_diffusion_objective import RES, StubText
 
 from dew.config import RunConfig
@@ -43,7 +42,7 @@ def load_recipe(name):
 
 
 def parse(cls, args):
-    return tyro.cli(tyro.conf.CascadeSubcommandArgs[cls], args=args)
+    return cls.cli(args)
 
 
 def test_the_flags_pick_a_dataset_a_preset_and_a_solver_from_the_registries():

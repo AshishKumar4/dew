@@ -10,11 +10,11 @@ pins.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TypedDict
 
 import numpy as np
 
 from dew import records
+from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.families.deepseek import _V4_LAYER_NAMES, _V4_SCORES, _deepseek_v4_prepare
 from dew.interop.hf_decoders import (
     _NO_AUDIO,
@@ -33,7 +33,12 @@ from dew.interop.hf_decoders import (
     _yarn_record,
 )
 from dew.nn import vision as vision_nn
+from dew.nn.backbones.decoder_block import Mixture
+from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.deepseek_v4 import DeepseekV4Mixer
+from dew.nn.dspark import DSpark
+from dew.nn.engram import Engram
+from dew.nn.hyper_connections import HyperConnections
 
 # The release's config.json nests the text model's fields under text_config
 # beside a vision tower.
@@ -45,30 +50,10 @@ _V41_TEXT_INERT = frozenset((
     'num_key_value_heads', 'attention_bias', 'topk_method', 'max_position_embeddings'))
 
 
-class EngramFields(TypedDict):
-    """Describes one `dew.nn.engram.Engram`, by its dataclass fields."""
-
-    layer_ids: tuple[int, ...]
-    num_embeddings: tuple[int, ...]
-    max_ngram_size: int
-    vocab_size: int
-    n_heads: int
-    head_dim: int
-    compressed_vocab_size: int
-    pad_token_id: int
+type EngramFields = NativeFields[Engram]
 
 
-class DSparkFields(TypedDict):
-    """Describes one `dew.nn.dspark.DSpark`, by its dataclass fields."""
-
-    stages: int
-    block_size: int
-    noise_token_id: int
-    target_layers: tuple[int, ...]
-    markov_rank: int
-    experts: int
-    top_k: int
-    layer_type: str
+type DSparkFields = NativeFields[DSpark]
 
 
 def _v41_modes(text: Mapping[str, object], layers: int) -> tuple[tuple[int, ...], tuple[str, ...]]:
@@ -187,14 +172,17 @@ def _v41_decoder(hf_config: Mapping[str, object], used: set[str], *, media_bias:
              'index_n_heads': _record_int(text, 'index_n_heads'),
              'index_head_dim': _record_int(text, 'index_head_dim')}
     seen.update(index)
-    mixer: dict[str, object] = {
-        'kind': 'deepseek_v4', 'q_lora_rank': _record_int(text, 'q_lora_rank'),
+    fields: dict[str, object] = {
+        'q_lora_rank': _record_int(text, 'q_lora_rank'),
         'o_groups': _record_int(text, 'o_groups'), 'o_lora_rank': _record_int(text, 'o_lora_rank'),
         'rope_head_dim': rope_width, 'compressor': None, 'compress_rate': None,
         'query_norm': False, 'kv_qat': True}
+    mixer = {'name': 'deepseek_v4', 'fields': fields}
     seen.update(('q_lora_rank', 'o_groups', 'o_lora_rank'))
-    kinds, layer_types, shared = _v41_kinds(text, layers, ratios[:layers], modes, mixer, {
-        'window': window, 'rope_theta': compress_theta, 'yarn': ramp}, index, seen)
+    compressed = native_fields(LayerKind)(window=window, rope_theta=compress_theta, yarn=None)
+    compressed['yarn'] = ramp
+    kinds, layer_types, shared = _v41_kinds(text, layers, ratios[:layers], modes, fields,
+                                          compressed, index, seen)
     moe = _record_int(text, 'moe_intermediate_size')
     base_used: set[str] = set()
     config = _base_config({**text, 'intermediate_size': moe, 'num_key_value_heads': 1,
@@ -214,17 +202,16 @@ def _v41_decoder(hf_config: Mapping[str, object], used: set[str], *, media_bias:
                  'hc_mult', 'hc_eps', 'hc_sinkhorn_iters'))
     config.update(
         mixer=mixer, kinds=kinds, kv_shared_layers=tuple(shared),
-        mixture={'experts': _record_int(text, 'n_routed_experts'),
-                 'top_k': _record_int(text, 'num_experts_per_tok'),
-                 'layers': tuple(range(layers)), 'score_function': scoring, 'bias': True,
-                 'norm_topk_prob': norm_topk,
-                 'scaling': _record_float(text, 'routed_scaling_factor', 1.0),
-                 'shared_features': moe, 'expert_features': moe, 'media_bias': media_bias},
+        mixture=native_fields(Mixture)(experts=_record_int(text, 'n_routed_experts'),
+                 top_k=_record_int(text, 'num_experts_per_tok'),
+                 layers=tuple(range(layers)), score_function=scoring, bias=True,
+                 norm_topk_prob=norm_topk,
+                 scaling=_record_float(text, 'routed_scaling_factor', 1.0),
+                 shared_features=moe, expert_features=moe, media_bias=media_bias),
         swiglu_limit=_record_float(text, 'swiglu_limit', 0.0) or None,
-        hyper_connections={'hc_mult': _record_int(text, 'hc_mult', 4),
-                           'hc_eps': _record_float(text, 'hc_eps', 1e-6),
-                           'hc_sinkhorn_iters': _record_int(text, 'hc_sinkhorn_iters', 20),
-                           'head': 'carried', 'single_pass': True},
+        hyper_connections=native_fields(HyperConnections)(
+            hc_mult=_record_int(text, 'hc_mult', 4), hc_eps=_record_float(text, 'hc_eps', 1e-6),
+            hc_sinkhorn_iters=_record_int(text, 'hc_sinkhorn_iters', 20), head='carried', single_pass=True),
         max_seq_len=min(_record_int(text, 'max_position_embeddings', DEFAULT_MAX_SEQ_LEN),
                         DEFAULT_MAX_SEQ_LEN))
     engram = _v41_engram(text, seen)
@@ -257,7 +244,9 @@ def _v41_kinds(text: Mapping[str, object], layers: int, ratios, modes, mixer: Ma
             _refuse(f"candidate_source_layer_id {candidate}", "the candidate pool is a Full layer's")
         pool = {'candidate_blocks': _record_int(text, 'candidate_topk_blocks'),
                 'candidate_block_size': _record_int(text, 'candidate_block_size')}
-    kinds: dict[str, KindFields] = {'sliding_attention': {'window': compressed.get('window'), 'mixer': mixer}}
+    sliding = native_fields(LayerKind)(window=compressed.value.window, mixer=None)
+    sliding['mixer'] = {'name': 'deepseek_v4', 'fields': mixer}
+    kinds: dict[str, KindFields] = {'sliding_attention': sliding}
     layer_types, shared = [], []
     for layer, (rate, mode) in enumerate(zip(ratios, modes, strict=True)):
         if mode == 'sliding':
@@ -272,10 +261,11 @@ def _v41_kinds(text: Mapping[str, object], layers: int, ratios, modes, mixer: Ma
             role = 'source'
         elif mode == 'reindex' and 0 <= candidate < layer:
             role = 'restrict'
-        record: KindFields = {**compressed,
-                              'mixer': {**mixer, 'compressor': 'csa2', 'compress_rate': rate, **index,
+        record: KindFields = NativeFields(LayerKind, {**compressed,
+                              'mixer': {'name': 'deepseek_v4', 'fields': {
+                                        **mixer, 'compressor': 'csa2', 'compress_rate': rate, **index,
                                         'reindex': mode == 'reindex', 'candidates': role,
-                                        **(pool if role else {})}}
+                                        **(pool if role else {})}}})
         held = kinds.setdefault(name, record)
         if mode != 'reuse' and held != record:
             _refuse(f"layer {layer}", f"the {name} layers would need different candidate "
@@ -299,16 +289,16 @@ def _v41_dspark(text: Mapping[str, object], layers: int, ratios, seen: set[str])
         return None
     if ratios[layers:layers + stages] != (0,) * stages:
         _refuse('compress_ratios', "the DSpark stages are sliding layers, one trailing 0 each")
-    return {'stages': stages, 'block_size': block,
-            'noise_token_id': _record_int(text, 'dspark_noise_token_id'),
-            'target_layers': records.integers(text.get('dspark_target_layer_ids', ()),
+    return native_fields(DSpark)(stages=stages, block_size=block,
+            noise_token_id=_record_int(text, 'dspark_noise_token_id'),
+            target_layers=records.integers(text.get('dspark_target_layer_ids', ()),
                                               'dspark_target_layer_ids'),
-            'markov_rank': _record_int(text, 'dspark_markov_rank'),
-            'experts': _record_int(text, 'dspark_n_routed_experts',
+            markov_rank=_record_int(text, 'dspark_markov_rank'),
+            experts=_record_int(text, 'dspark_n_routed_experts',
                                    _record_int(text, 'n_routed_experts')),
-            'top_k': _record_int(text, 'dspark_num_experts_per_tok',
+            top_k=_record_int(text, 'dspark_num_experts_per_tok',
                                  _record_int(text, 'num_experts_per_tok')),
-            'layer_type': 'sliding_attention'}
+            layer_type='sliding_attention')
 
 
 def _v41_engram(text: Mapping[str, object], seen: set[str]) -> EngramFields | None:
@@ -321,13 +311,13 @@ def _v41_engram(text: Mapping[str, object], seen: set[str]) -> EngramFields | No
     if not layers:
         return None
     embeddings = records.integers(text.get('engram_num_embeddings', ()), 'engram_num_embeddings')
-    return {'layer_ids': layers, 'num_embeddings': embeddings,
-            'max_ngram_size': _record_int(text, 'engram_max_ngram_size'),
-            'vocab_size': _record_int(text, 'engram_vocab_size'),
-            'n_heads': _record_int(text, 'engram_n_heads'),
-            'head_dim': _record_int(text, 'engram_head_dim'),
-            'compressed_vocab_size': _record_int(text, 'engram_compressed_vocab_size'),
-            'pad_token_id': _record_int(text, 'engram_pad_token_id', 2)}
+    return native_fields(Engram)(layer_ids=layers, num_embeddings=embeddings,
+            max_ngram_size=_record_int(text, 'engram_max_ngram_size'),
+            vocab_size=_record_int(text, 'engram_vocab_size'),
+            n_heads=_record_int(text, 'engram_n_heads'),
+            head_dim=_record_int(text, 'engram_head_dim'),
+            compressed_vocab_size=_record_int(text, 'engram_compressed_vocab_size'),
+            pad_token_id=_record_int(text, 'engram_pad_token_id', 2))
 
 
 # The release's own names inside a layer, before those V4 shares

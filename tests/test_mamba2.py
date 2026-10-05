@@ -336,8 +336,8 @@ def test_padded_packed_rows_reset_at_each_document():
 
 
 def test_the_kind_builds_from_the_configs_fields():
-    record = {"kind": "mamba2", "num_heads": 4, "head_dim": 6, "state_size": 5, "n_groups": 2,
-              "conv_kernel": 4, "chunk_size": 8}
+    record = {"name": "mamba2", "fields": {"num_heads": 4, "head_dim": 6, "state_size": 5, "n_groups": 2,
+              "conv_kernel": 4, "chunk_size": 8}}
     mixer = mixers.from_record(record)
     assert isinstance(mixer, Mamba2Mixer)
     assert mixer.n_groups == 2 and mixer.chunk_size == 8
@@ -349,8 +349,8 @@ def tiny_lm(**overrides) -> CausalTransformer:
     """Two SSD layers with no feed-forward, the reference's block."""
     config = {"vocab_size": 32, "emb_features": 16, "num_layers": 2, "num_heads": 4, "mlp_features": 0,
               "max_seq_len": 16, "tie_embeddings": False, "qk_norm": False,
-              "mixer": {"kind": "mamba2", "num_heads": 4, "head_dim": 8, "state_size": 5,
-                        "n_groups": 2, "chunk_size": 4}}
+              "mixer": {"name": "mamba2", "fields": {"num_heads": 4, "head_dim": 8, "state_size": 5,
+                        "n_groups": 2, "chunk_size": 4}}}
     return CausalTransformer(**{**config, **overrides})
 
 

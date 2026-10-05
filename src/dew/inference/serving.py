@@ -936,14 +936,21 @@ Rows = DenseRows | PagedRows
 
 
 class Server:
-    """A slot scheduler over a resident KV cache; see the module docstring.
+    """Serves text requests with continuous batching over one resident KV cache.
 
-    Build one with `from_task`. `slots` rows run at once over `capacity`
-    cache slots each; `admission` bounds the prompts one step prefills. A
-    request whose prompt and budget do not fit the capacity is refused at
-    `submit`, with the error `TextGeneration` raises for a request over the
-    model's context. Over a mesh both counts split evenly over the groups
-    of rows, and so do the pages of a paged pool.
+    A `TextGeneration` call runs its batch as one program, so no request can
+    join until it returns. A server keeps `slots` rows of `capacity` cache
+    slots each and refills them from a queue. Each step prefills the prompts
+    admitted that step into free rows and draws one token for every occupied
+    row. A row leaves on EOS or at its budget, and the next request takes its
+    slot. Every request runs the task's policy and draws the same tokens it
+    would draw through the task alone with the same key.
+
+    Build one with `from_task`. `admission` bounds the prompts one step
+    prefills. A request whose prompt and budget do not fit the capacity is
+    refused at `submit`, with the error `TextGeneration` raises for a request
+    over the model's context. Over a mesh, the slots and the admission split
+    evenly over the groups of rows, and so do the pages of a paged pool.
     """
 
     def __init__(self, model: nn.Module, variables: Variables, processor: Processor | None, *,
@@ -985,7 +992,7 @@ class Server:
         self.rows = rows
         self.grammar = grammar
         self.prefix_hits = 0
-        """Prompt tokens served from shared prefix pages instead of prefilled."""
+        """The number of prompt tokens served from shared prefix pages instead of prefilled."""
         self._admitted = (
             None if self.mesh is None else NamedSharding(self.mesh, P(batch_axes(self.mesh) or None))
         )
@@ -1008,9 +1015,13 @@ class Server:
             shapes = jax.eval_shape(functools.partial(_opened, model, pad_id=self.pad_id, slots=slots,
                                                       capacity=capacity), variables)
             rows.check(shapes.decoder.cache)
+            # None selects the one mixed forward of `_mixed_step`.
             self.mixed_refusal = _mixed_refusal(model, self.variables, shapes, rows.placement, rows.width)
-            """Why the admitting step prefills in a forward of its own, or None
-            when it runs one mixed forward (`_mixed_step`)."""
+            """Why the admitting step prefills in a separate forward, or None when it runs one mixed forward.
+
+            The mixed forward covers each row's last draw and the admitted
+            prompts in one pass, so the projections read their weights once.
+            """
             if self.mixed_refusal is None:
                 rows.placement = dataclasses.replace(rows.placement, mixed=True)
             elif isinstance(rows, DenseRows) and rows.chunk is not None:
@@ -1036,36 +1047,41 @@ class Server:
     def from_task(cls, task: TextGeneration, *, slots: int, capacity: int,
                   admission: int | None = None, kv_cache: KVCache | None = None,
                   chunk: int | None = None, prefix_cache: bool = False, decode_steps: int = 1) -> Server:
-        """A server over the task's model, weights, processor and policy.
+        """Build a server over the task's model, weights, processor and policy.
 
-        `capacity` rounds up to whole 64-slot tiles and pages, within the
-        model's context. The task's `n` has to be one and its strategy the
-        row-wise sampler, with or without a grammar.
+        `capacity` is rounded up to whole 64-slot tiles and whole pages, and
+        must stay within the model's context. The task's `n` must be one, and
+        its strategy must be the row-wise sampler, with or without a grammar.
 
         `kv_cache` replaces the model's cache layout (`dew.nn.kv_cache`). A
-        paged layout pools every row's pages, so short requests fit more rows
-        than `pages * page_size / capacity`; `chunk` prefills a prompt in
-        pieces of at most that many tokens, one a step, so a long prompt does
-        not stall the rows beside it (over a dense cache too, where the
-        admitting step is mixed), and `prefix_cache` shares the pages of a
-        prompt prefix an earlier request computed.
+        paged layout pools the pages of every row, so short requests fit more
+        rows than `pages * page_size / capacity`. `chunk` prefills a prompt in
+        pieces of at most that many tokens, one piece a step, so a long prompt
+        does not stall the rows beside it. It also works over a dense cache
+        where the admitting step is mixed. `prefix_cache` lets a request reuse
+        the pages of a prompt prefix an earlier request computed, and needs a
+        paged cache.
 
-        Weights on a mesh are served on it, the slots, admission and pages
-        split over its row axes, which have to divide them; admission
+        Weights on a mesh are served on that mesh. The slots, the admission
+        and the pages are split over its row axes, so the number of row
+        groups must divide the slots and the admission. The admission
         defaults to the largest multiple of the group count up to eight rows
-        an iteration. A stage or sequence axis above one, or a mesh over
-        several processes, is refused.
+        an iteration. A stage or sequence axis larger than one, or a mesh
+        over several processes, is refused.
 
-        `decode_steps` runs that many iterations per device call, paying the
-        host's kernel launches (on a tensor axis about as long as the step)
-        once. Requests are seated and draws read at call boundaries, so a
-        request waits up to `decode_steps` iterations for its slot; the
-        default admission seats that many iterations' rows a call. The draws
-        are the same for any value. It pays where the host's launches leave
-        the devices idle, as across an NVLink pair at 128 slots
-        (docs/concepts/inference.md); on one RTX 4080, already busy, more than
-        one was slower at 32, 64 and 128 slots, the slots filling a call at a
-        time (docs/performance.md).
+        `decode_steps` runs that many iterations per device call, so the host
+        launches the step's kernels once per call; on a tensor axis those
+        launches take about as long as the step. Requests are seated, and
+        draws read, only at call boundaries, so a request waits up to
+        `decode_steps` iterations for its slot. The default admission seats
+        that many iterations' rows per call. The draws are the same for any
+        value. More iterations pay off where the host's launches leave the
+        devices idle, as across an NVLink pair at 128 slots
+        (docs/concepts/inference.md). On one RTX 4080, which was already
+        busy, more iterations were slower at 32 and 128 slots, and at 64
+        slots only two iterations gained, by under 1%. A call seats requests
+        only before its first iteration, so the slots take more iterations
+        to fill (docs/performance.md).
         """
         mesh = mesh_of(task.variables)
         if mesh is not None:
@@ -1151,7 +1167,7 @@ class Server:
 
     @property
     def occupancy(self) -> int:
-        """Rows the host knows to be running, one step behind the device."""
+        """The number of rows the host knows to be running, one step behind the device."""
         return len(self._rows)
 
     @property
@@ -1161,13 +1177,14 @@ class Server:
     def reload(self, variables: Variables) -> None:
         """Serve `variables` from the next step on, in place of the current weights.
 
-        The tree must match the served one leaf for leaf in shape, and a
-        floating leaf is cast to the served precision, so the compiled step
-        runs on unchanged. The leaves are copied onto the served placement, so
-        the caller may donate its buffers right after. Running rows keep
-        their cache and draw their next token from the new weights; prefix
-        pages the old weights wrote are no longer shared. Not thread-safe
-        against `step`: the caller serializes the two.
+        The tree must match the served one leaf for leaf in shape, and a leaf
+        that is not floating point must match its dtype too. A floating leaf
+        is cast to the served precision, so the compiled step keeps running
+        without a recompile. The leaves are copied onto the served placement,
+        so the caller may donate its buffers right after. Running rows keep
+        their cache and draw their next token from the new weights, and
+        prefix pages the old weights wrote are no longer shared. `reload` is
+        not thread-safe against `step`, so the caller must serialize the two.
         """
         # A frozen and a plain mapping flatten to different tree structures but
         # the same leaf paths, so the paths are what must match.
@@ -1201,11 +1218,13 @@ class Server:
 
     def submit(self, prompt: Prompt, max_new_tokens: int | None = None, *,
                key: int | jax.Array | None = None) -> Ticket:
-        """Queue one request; the ticket resolves to its `Generation`.
+        """Queue one request and return a ticket that resolves to its `Generation`.
 
-        The prompt is validated as `TextGeneration` validates it, against
-        the server's capacity in place of the model's context. A zero budget
-        resolves at once with the prompt alone.
+        `prompt` is one text prompt, `ModelInputs` row or token row, without
+        media or positions. It is validated as `TextGeneration` validates it,
+        against the server's capacity in place of the model's context.
+        Without `max_new_tokens`, the task's default budget applies. A
+        request with a zero budget resolves at once, with the prompt alone.
         """
         # One row's key, folded the way `RowPlan.keys` folds row zero.
         return self._enqueued(prompt, max_new_tokens, _seed(key), 0)
@@ -1243,7 +1262,11 @@ class Server:
         return _Row(ids[0][valid[0]].astype(np.int32), budget, seed, fold, Ticket())
 
     def step(self) -> None:
-        """One device call: admit what fits, run `decode_steps` iterations, read the last call's."""
+        """Run one device call and read the previous call's draws.
+
+        The call admits the queued requests that fit and runs `decode_steps`
+        iterations. Its own draws are read by the next `step`, or by `run`.
+        """
         if self._failed is not None:
             raise RuntimeError("the server stopped after a device check failed") from self._failed
         admission = self._admit()

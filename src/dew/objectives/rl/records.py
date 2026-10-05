@@ -39,7 +39,7 @@ def observation_record(value: Mapping[str, object]) -> Observation:
 
 
 def action_record(value: Mapping[str, object]) -> Action:
-    from dew.config import _built
+    from dew.registry import from_record
 
     record = section(value, "action")
     terminated = record["terminated"]
@@ -49,7 +49,7 @@ def action_record(value: Mapping[str, object]) -> Action:
                   reals(record["raw_log_probs"], "raw_log_probs"),
                   reals(record["behavior_log_probs"], "behavior_log_probs"),
                   terminated, integer(record["policy_step"], "policy_step"),
-                  _built(Sampling, section(record["sampling"], "sampling")),
+                  from_record(Sampling, section(record["sampling"], "sampling"), dtypes=False),
                   _binding_id=text(record["_binding_id"], "_binding_id"))
 
 

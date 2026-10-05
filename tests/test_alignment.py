@@ -9,7 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact_as_the_reference, assert_as_exact_over_orders, distance
 
 from dew.diffusion import presets
 from dew.inputs import Field, InputSpec
@@ -162,7 +162,12 @@ def test_repa_trains_on_repas_composed_loss_and_its_gradient():
     `DiffusionObjective.loss` draws: Dew's loss is half of it, as Dew's L2
     halves the denoising error, and its gradient in every weight, the
     model's up to and past the aligned block and the projector's, is half
-    of REPA's, held to its float64 run by the float64 rule."""
+    of REPA's, held to its float64 run by the K-order rule: over ORDERS
+    orders of the stand-in's hidden units, an exact symmetry, against REPA's
+    fp32 runs over the same orders. One run against one is a coin flip on
+    the time weight's gradient, a sum over every token: Dew's runs spread
+    from 0.65 to 1.87 times REPA's identity run, and with XLA capped to AVX
+    the identity run reached 2.23."""
     from dew.diffusion import FlowMatchingScheduler, FlowMatchPredictionTransform, Process
 
     settings = json.loads(str(COMPOSED["settings"]))
@@ -187,17 +192,31 @@ def test_repa_trains_on_repas_composed_loss_and_its_gradient():
     def loss(params):
         return objective.scalar_loss({**variables, "params": params}, {"image": pixels}, step)[0]
 
-    value, gradient = jax.value_and_grad(loss)(params)
+    value = loss(params)
     np.testing.assert_allclose(2 * float(value), float(COMPOSED["loss_f64"]), rtol=2e-6)
-    for name, got in (("embed", gradient["embed"]), ("time", gradient["time"]), ("head", gradient["head"]),
-                      ("block", gradient["block"]["kernel"])):
-        assert_as_exact_as_the_reference(2 * got, COMPOSED[f"grad/{name}"], COMPOSED[f"grad/{name}_f64"],
-                                         name)
-    for name in ("Dense_0", "Dense_1", "Dense_2"):
-        for leaf in ("kernel", "bias"):
-            key = f"grad/projector/{name}/{leaf}"
-            assert_as_exact_as_the_reference(2 * gradient[ALIGNMENT][name][leaf], COMPOSED[key],
-                                             COMPOSED[f"{key}_f64"], key)
+    gradient = jax.jit(jax.grad(loss))
+    distances = {}
+    projector = params[ALIGNMENT]
+    for order in COMPOSED["orders"].astype(np.intp):
+        back = np.argsort(order)
+        first = {**projector["Dense_0"], "kernel": projector["Dense_0"]["kernel"][order]}
+        moved = {**params, "embed": params["embed"][:, order], "time": params["time"][order],
+                 "head": params["head"][order],
+                 "block": {"kernel": params["block"]["kernel"][np.ix_(order, order)]},
+                 ALIGNMENT: {**projector, "Dense_0": first}}
+        got = jax.tree.map(lambda leaf: 2 * np.asarray(leaf), gradient(moved))
+        found = {"grad/embed": got["embed"][:, back], "grad/time": got["time"][back],
+                 "grad/head": got["head"][back], "grad/block": got["block"]["kernel"][np.ix_(back, back)]}
+        for name in ("Dense_0", "Dense_1", "Dense_2"):
+            kernel = got[ALIGNMENT][name]["kernel"]
+            found[f"grad/projector/{name}/kernel"] = kernel[back] if name == "Dense_0" else kernel
+            found[f"grad/projector/{name}/bias"] = got[ALIGNMENT][name]["bias"]
+        for key, leaf in found.items():
+            distances.setdefault(key, []).append(distance(leaf, COMPOSED[f"{key}_f64"]))
+    recorded = {name.removeprefix("orders/") for name in COMPOSED.files if name.startswith("orders/")}
+    assert set(distances) == recorded
+    for key, mine in distances.items():
+        assert_as_exact_over_orders(mine, COMPOSED[f"orders/{key}"], key)
 
 
 class Unchanged(nn.Module):

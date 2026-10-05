@@ -11,6 +11,7 @@ import dataclasses
 from collections.abc import Mapping
 
 from dew import records
+from dew.interop.config_records import native_fields
 from dew.interop.hf_decoders import (
     _MOE_SHARED,
     DecoderFields,
@@ -24,6 +25,8 @@ from dew.interop.hf_decoders import (
 )
 from dew.nn import llama4 as llama4_nn
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.decoder_block import Mixture
+from dew.nn.backbones.layer_plan import LayerKind
 
 
 def _llama4_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
@@ -61,31 +64,30 @@ def _llama4_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
                  'moe_layers', 'interleave_moe_layer_step', 'attention_chunk_size',
                  'use_qk_norm', 'attn_temperature_tuning', 'floor_scale', 'attn_scale'))
     rule = {
-        'kind': 'llama4',
         'use_qk_norm': bool(hf_config.get('use_qk_norm', True)),
         'attn_temperature_tuning': bool(hf_config.get('attn_temperature_tuning', True)),
         'floor_scale': records.number(hf_config.get('floor_scale', 8192), 'floor_scale'),
         'attn_scale': records.number(hf_config.get('attn_scale', 0.1), 'attn_scale'),
     }
     chunk = hf_config.get('attention_chunk_size')
-    kinds: dict[str, KindFields] = {
-        "full_attention": {"mixer": {**rule, "use_rope": False}},
-        "chunked_attention": {
-            "chunk": None if chunk is None else records.integer(chunk, "attention_chunk_size"),
-            "mixer": {**rule, "use_rope": True},
-        },
-    }
+    full = native_fields(LayerKind)(mixer=None)
+    full['mixer'] = {'name': 'llama4', 'fields': {**rule, 'use_rope': False}}
+    chunked = native_fields(LayerKind)(chunk=None if chunk is None else records.integer(chunk,
+                                                                                    'attention_chunk_size'),
+                                      mixer=None)
+    chunked['mixer'] = {'name': 'llama4', 'fields': {**rule, 'use_rope': True}}
+    kinds: dict[str, KindFields] = {'full_attention': full, 'chunked_attention': chunked}
     moe_layers = hf_config.get('moe_layers')
     step = records.integer(hf_config.get('interleave_moe_layer_step', 1), 'interleave_moe_layer_step')
-    mixture: MixtureFields = {
-        'experts': records.integer(hf_config['num_local_experts'], 'num_local_experts'),
-        'top_k': records.integer(hf_config.get('num_experts_per_tok', 1), 'num_experts_per_tok'),
-        'score_function': 'sigmoid',
-        'norm_topk_prob': False,
-        'scale_inputs': True,
-        'expert_features': records.integer(hf_config['intermediate_size'], 'intermediate_size'),
-        'shared_features': records.integer(hf_config['intermediate_size'], 'intermediate_size'),
-    }
+    mixture: MixtureFields = native_fields(Mixture)(
+        experts=records.integer(hf_config['num_local_experts'], 'num_local_experts'),
+        top_k=records.integer(hf_config.get('num_experts_per_tok', 1), 'num_experts_per_tok'),
+        score_function='sigmoid',
+        norm_topk_prob=False,
+        scale_inputs=True,
+        expert_features=records.integer(hf_config['intermediate_size'], 'intermediate_size'),
+        shared_features=records.integer(hf_config['intermediate_size'], 'intermediate_size'),
+    )
     if moe_layers is None:
         if step < 1:
             _refuse(f"interleave_moe_layer_step {step}", "the routed layers are every step-th one")
