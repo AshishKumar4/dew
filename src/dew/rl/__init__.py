@@ -1,22 +1,22 @@
-"""Reinforcement learning as array math, one module per function.
+"""Reinforcement-learning math on plain arrays, with advantages and losses in separate modules.
 
-`advantage` turns rewards into advantages, `surrogate` turns log-probabilities
-and advantages into a scalar loss. Neither knows about a model, an objective,
-the trainer or a batch dict, so an objective composes them and this package
-is testable on fixed tensors.
+`advantage` turns rewards into advantages, and `surrogate` turns
+log-probabilities and advantages into a loss. Neither knows about a model,
+an objective, the trainer or a batch dict. An objective combines them, and
+the package can be tested on fixed tensors.
 
-The import arrow points one way. `dew.rl` may read `dew`; nothing under `dew`
-outside `dew.rl` and `dew.objectives.rl` may read `dew.rl`, which keeps the
-split into a separate distribution a directory move (`docs/design/plan.md`,
-section 5.1).
+Imports go one way. `dew.rl` may import from `dew`, but nothing in `dew`
+outside `dew.rl` and `dew.objectives.rl` may import `dew.rl`. That way,
+splitting it into a separate distribution only means moving a directory
+(`docs/design/plan.md`, section 5.1).
 
 `sandbox` runs untrusted programs and tool sessions in bounded subprocesses
-or containers, which a verifiable reward scores completions with. It reads
-the episode types in `dew.objectives.rl`, so it is imported as
-`dew.rl.sandbox` and not from this package.
+or containers, and a verifiable reward uses it to score completions. It
+imports the episode types from `dew.objectives.rl`, so you import it as
+`dew.rl.sandbox`; this package does not re-export it.
 
-`advantage` and `surrogate` port Apache-2.0 code from Tunix and verl and carry
-their notice; the rest of Dew is MIT.
+`advantage` and `surrogate` port Apache-2.0 code from Tunix and verl and
+carry their notice. The rest of Dew is MIT.
 """
 
 from .advantage import gae, group_advantage, masked_mean, masked_whiten, rloo_advantage
