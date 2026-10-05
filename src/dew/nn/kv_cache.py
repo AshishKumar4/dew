@@ -47,8 +47,6 @@ TABLE = "page_table"
 """A paged cache's per-row page table, `[rows, capacity // page_size]`."""
 CURSOR = "cache_index"
 """The per-row count of tokens a cache holds (`attention._cache_positions`)."""
-VALIDITY = "cache_valid"
-"""The per-row mask of filled slots, `[rows, capacity]`."""
 POOLED = frozenset({"cached_key", "cached_value", "key_scale", "value_scale"})
 """The leaves a paged cache keeps in its shared pool rather than per row."""
 
@@ -160,8 +158,62 @@ def write_cache(buffer: jax.Array, values: jax.Array, positions: jax.Array) -> j
     gathers the values and indices of every row onto every device first.
     """
     slots = jnp.where(positions >= 0, positions, DROPPED)
-    return jax.vmap(lambda row, incoming, at: row.at[at].set(incoming.astype(row.dtype), mode="drop"))(
-        buffer, values, slots)
+    if values.shape[1] >= buffer.shape[1]:
+        # A write as wide as the buffer (a prefill into a cache at the
+        # prompt's width) gathers each slot's token instead: XLA lays such a
+        # buffer out with its slots minor for the attention that reads it,
+        # and a scatter of whole tokens into that layout ran at 28 GB/s, 8 ms
+        # of a 40 ms admission step on an RTX 4080 (docs/performance.md).
+        # Only the [rows, slots] map of which token lands where is scattered.
+        tokens = jnp.broadcast_to(jnp.arange(values.shape[1], dtype=jnp.int32), slots.shape)
+        source = jax.vmap(lambda at, index: jnp.full(buffer.shape[1], -1, jnp.int32).at[at].set(
+            index, mode="drop"))(slots, tokens)
+        picked = jnp.take_along_axis(values, jnp.maximum(source, 0).reshape(
+            *source.shape, *(1,) * (values.ndim - 2)), axis=1)
+        held = (source >= 0).reshape(*source.shape, *(1,) * (values.ndim - 2))
+        return jnp.where(held, picked.astype(buffer.dtype), buffer)
+    words = jax.vmap(lambda row, incoming, at: row.at[at].set(incoming, mode="drop"))(
+        as_words(buffer), as_words(values.astype(buffer.dtype)), slots)
+    return from_words(words, buffer.dtype)
+
+
+def write_tokens(buffer: jax.Array, values: jax.Array, rows: jax.Array, positions: jax.Array) -> jax.Array:
+    """`values` `[tokens, ...]` written to `buffer` `[rows, slots, ...]`, each
+    at its own row and slot; a row past the buffer's or a slot of -1 drops.
+
+    A serving step's mixed call (`dew.nn.inputs.Admitted`) writes its
+    decoding rows' tokens and its prompts' in this one scatter, as words.
+    Rows and slots index the leading axes, which the CUDA test lane checks
+    under --xla_gpu_deterministic_ops (`KVStore.write_tokens` says why a
+    pool's write is mapped)."""
+    slots = jnp.where(positions >= 0, positions, DROPPED)
+    written = as_words(buffer).at[rows, slots].set(as_words(values.astype(buffer.dtype)), mode="drop")
+    return from_words(written, buffer.dtype)
+
+
+def as_words(x: jax.Array) -> jax.Array:
+    """`x`'s bits with its last axis packed into uint32 words, for a scatter
+    to move on a GPU.
+
+    XLA's scatter stores one element a thread, so bf16 caches moved two bytes
+    a store: Qwen3-0.6B's 8-prompt admission write took 0.63 against 0.28 ms
+    as words over 16 caches on an RTX 4080, the same bits (docs/performance.md).
+    `x` itself where its elements are bool or a word wide already, its last
+    axis does not fill whole words, or the backend is not a GPU, where a TPU
+    tiles two-byte arrays on another axis.
+    """
+    per_word = 4 // x.dtype.itemsize
+    if jax.default_backend() != 'gpu' or x.dtype == jnp.bool_ or per_word < 2 or x.shape[-1] % per_word:
+        return x
+    pairs = x.reshape(*x.shape[:-1], x.shape[-1] // per_word, per_word)
+    return jax.lax.bitcast_convert_type(pairs, jnp.uint32)
+
+
+def from_words(words: jax.Array, dtype: jnp.dtype) -> jax.Array:
+    """The `dtype` elements `as_words` packed into `words`."""
+    if words.dtype == jnp.dtype(dtype):
+        return words
+    return jax.lax.bitcast_convert_type(words, dtype).reshape(*words.shape[:-1], -1)
 
 
 def filled_slots(cursor: jax.Array, capacity: int) -> jax.Array:
@@ -303,6 +355,46 @@ class KVStore:
 
     def read(self) -> tuple[jax.Array, jax.Array]:
         return self._read("cached_key", "key_scale"), self._read("cached_value", "value_scale")
+
+    def write_tokens(self, key: jax.Array, value: jax.Array, rows: jax.Array, positions: jax.Array) -> None:
+        """Keys and values `[tokens, kv_heads, head_dim]`, each at its own row
+        and slot (a serving step's mixed call, `dew.nn.inputs.Admitted`); a row
+        past the cache's or a slot of -1 drops. Full precision, unrotated, and
+        a paged pool in one group, which the mixed call requires."""
+        if self.layout.page_size is None:
+            for name, incoming in (("cached_key", key), ("cached_value", value)):
+                self._put(name, write_tokens(self._get(name), incoming, rows, positions))
+            return
+        size = self.layout.page_size
+        table = self._get(TABLE)
+        inside = (positions >= 0) & (rows < table.shape[0])
+        page = table[jnp.where(inside, rows, 0), jnp.maximum(positions, 0) // size]
+        page = jnp.where(inside, page, DROPPED)
+        offset = jnp.maximum(positions, 0) % size
+
+        def stored(pool: jax.Array, page: jax.Array, offset: jax.Array, incoming: jax.Array) -> jax.Array:
+            return pool.at[:, page, offset].set(jnp.moveaxis(incoming, 1, 0), mode="drop")
+
+        for name, incoming in (("cached_key", key), ("cached_value", value)):
+            pool = self._get(name)
+            # Mapped over a group of one, as `_written` writes: unmapped, under
+            # --xla_gpu_deterministic_ops (jax 0.11.2) a dropped token's keys
+            # landed at another head's kept slot, the implicit-dimension case
+            # openxla/xla#49498 fixes (issue #49380), after the jax pin. A jax
+            # bump past that fix can write unmapped, as `write_tokens` does.
+            written = jax.vmap(stored, in_axes=(1, 0, 0, 0), out_axes=1)(
+                pool[:, None], page[None], offset[None], incoming.astype(pool.dtype)[None])
+            self._put(name, written[:, 0])
+
+    def read_rows(self, rows: jax.Array) -> tuple[jax.Array, jax.Array]:
+        """`read` of only `rows`, `[len(rows), capacity, kv_heads, head_dim]`."""
+        def rows_of(name: str) -> jax.Array:
+            stored = self._get(name)
+            if self.layout.page_size is not None:
+                return _gather_pages(stored, self._get(TABLE)[rows], 1).astype(self.dtype)
+            return stored[rows].astype(self.dtype)
+
+        return rows_of("cached_key"), rows_of("cached_value")
 
     def _read(self, name: str, scale_name: str) -> jax.Array:
         stored = self._get(name)

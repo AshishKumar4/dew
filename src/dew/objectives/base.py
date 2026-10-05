@@ -23,7 +23,7 @@ import jax.numpy as jnp
 import optax
 from flax import struct
 from jax.tree_util import Partial
-from typing_extensions import TypeVar
+from typing_extensions import TypeIs, TypeVar
 
 from dew.artifacts import Artifact, Artifacts
 from dew.records import JSON
@@ -124,6 +124,10 @@ class Aux(Generic[Effects]):
     collection, in which case the clip steps aside."""
     effects: Effects | None = None
     """Additive observations applied once on a supported optimizer commit."""
+
+
+def _has_aux(loss: Loss | tuple[Loss, Aux[Effects]]) -> TypeIs[tuple[Loss, Aux[Effects]]]:
+    return isinstance(loss, tuple) and len(loss) == 2 and isinstance(loss[1], Aux)
 
 
 @dataclass(frozen=True)
@@ -276,8 +280,23 @@ class EMASpec:
 class Objective(ABC, Generic[Loss, Effects]):
     """Define what is being learned: the parameters, the loss, what evaluation produces."""
 
-    inputs: InputSpec
-    """Per-example shapes and dtypes the parameter tree is initialised from."""
+    _inputs: InputSpec | None = None
+
+    @property
+    def inputs(self) -> InputSpec | None:
+        """Declared input shapes, or None for a custom initializer without an InputSpec.
+
+        The sample is the batch field the loss reads, at its per-example
+        shape, and the trainer checks the first batch of a run without a
+        rollout against it (`InputSpec.check`). A property lets built-in
+        objectives narrow this optional research contract.
+        """
+        return self._inputs
+
+    @inputs.setter
+    def inputs(self, inputs: InputSpec | None) -> None:
+        self._inputs = inputs
+
     ema: EMASpec | None = None
     _ema_is_reference: ClassVar[bool] = False
     artifact: type | None = None
@@ -286,6 +305,31 @@ class Objective(ABC, Generic[Loss, Effects]):
     """How the display shows the metrics `loss` reports, by the names it
     reports them under, and the loss itself, under `loss`, where the
     trainer's default (lower is better) does not hold."""
+
+    def optimizer(self, tx: optax.GradientTransformation, *,
+                  accumulation: int) -> optax.GradientTransformation:
+        """The optimizer the trainer steps this objective's `params` with,
+        made from the one it was handed, `tx`.
+
+        The default is `tx` itself. An objective that trains several networks
+        of its own, such as a few-step student beside the fake score that
+        criticizes it, can give each its own copy of `tx`, with its own state
+        and update count, by `optax.multi_transform` over the networks, and
+        alternate them by `optax.conditionally_mask`, whose count is the
+        trainer's committed updates. `accumulation` is the trainer's: an
+        objective whose loss alternates networks step by step refuses more
+        than one microbatch per update, since a window would mix phases.
+        """
+        return tx
+
+    def averages(self, update: jax.Array) -> jax.Array:
+        """Whether the update after `update` committed ones moves the EMA.
+
+        The default averages every update. An objective whose EMA follows
+        one of the networks it alternates averages on that network's updates
+        only, as rCM's does on its student's.
+        """
+        return jnp.asarray(a=True)
 
     def held_variables(self) -> Variables | None:
         """The arrays this objective starts from, or None when it draws them.
@@ -348,7 +392,7 @@ class Objective(ABC, Generic[Loss, Effects]):
         model, head = held.get('model'), held.get('head_tile')
         cached = held.get('_validation_loss_cache')
         if cached is None or cached[0] is not model or cached[1] != head:
-            compiled = jax.jit(lambda variables, batch, step: self.loss(variables, batch, step)[0])
+            compiled = jax.jit(lambda variables, batch, step: self._loss(variables, batch, step)[0])
             cached = (model, head, compiled)
             self._validation_loss_cache = cached
         return cached[2]
@@ -369,13 +413,19 @@ class Objective(ABC, Generic[Loss, Effects]):
         return TrainingScalar(self, name, self.shown.get(name, Shown(better='lower')))
 
     @abstractmethod
-    def loss(self, params: Variables, batch: Batch, step: Step) -> tuple[Loss, Aux[Effects]]:
-        """Additive loss statistics and the reports from one realized batch.
+    def loss(self, variables: Variables, batch: Batch, step: Step) -> Loss | tuple[Loss, Aux[Effects]]:
+        """Additive loss statistics, optionally paired with auxiliary reports.
 
         Ratio declares a shared normalization mass. A plain scalar is one
         unit-mass term. Composite statistics are objective-owned Flax PyTrees;
         their leaves add across records before reduce_loss is evaluated.
         """
+
+    def _loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Loss, Aux[Effects]]:
+        loss = self.loss(variables, batch, step)
+        if _has_aux(loss):
+            return loss
+        return loss, Aux(metrics={})
 
     def reduce_loss(self, stats: Loss) -> tuple[jax.Array, jax.Array]:
         """The objective value and whether its statistical support is active."""
@@ -391,7 +441,7 @@ class Objective(ABC, Generic[Loss, Effects]):
 
     def scalar_loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[jax.Array, Aux[Effects]]:
         """Evaluate and reduce the canonical statistics, for direct JAX differentiation."""
-        stats, aux = self.loss(variables, batch, step)
+        stats, aux = self._loss(variables, batch, step)
         value, _ = self.reduce_loss(stats)
         return value, aux
 
@@ -432,7 +482,7 @@ class Objective(ABC, Generic[Loss, Effects]):
 
     def _pipeline_weights(self, state: TrainState, ema: bool | None) -> Variables:
         if self._ema_is_reference or ema is False or (ema is None and state.ema is None):
-            return state.params
+            return state.variables
         return state.averaged
 
     def inference_record(self) -> JSON:

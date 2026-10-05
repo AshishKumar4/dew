@@ -8,7 +8,7 @@ source-format export of both families lives in test_masked_diffusion_export.py.
 """
 
 import json
-from dataclasses import asdict, replace
+from dataclasses import replace
 from importlib import import_module
 from pathlib import Path
 
@@ -20,10 +20,9 @@ import optax
 import pytest
 
 from dew.checkpoints import Checkpoints
-from dew.config import ModelConfig
-from dew.data import Dataset
+from dew.data import ByteTokenizer, Dataset
 from dew.diffusion.discrete import MDLM, Unmask
-from dew.inference import pipeline
+from dew.inference import RunProcessor, pipeline
 from dew.interop import Pretrained
 from dew.interop.hf_decoders import translate_config, translate_weights
 from dew.nn.inputs import BATCH_AXES, ModelInputs
@@ -130,7 +129,7 @@ def test_the_trainer_builds_its_state_from_the_held_checkpoint():
 
     state = Trainer(objective, optax.sgd(1e-2), key=jax.random.key(0)).initial_state()
 
-    built, held = flat(state.params), flat(variables)
+    built, held = flat(state.variables), flat(variables)
     assert built.keys() == held.keys()
     for name, leaf in built.items():
         np.testing.assert_array_equal(np.asarray(leaf), np.asarray(held[name]))
@@ -223,7 +222,7 @@ def test_masked_training_resume_publish_and_run_pipeline(masked_source, tmp_path
     source, prompt = masked_source
     model = source.model.clone(dtype=jnp.bfloat16)
     objective = MaskedDiffusionObjective(model, MDLM(mask_id=120)(), 8,
-        pretrained=source.variables, ema_decay=0.5)
+        pretrained=source.variables, ema_decay=0.5, processor=RunProcessor(ByteTokenizer()))
     rows = jax.device_count()
     batch = {"text": np.full((rows, 8), 7, np.int32)}
     stream = grain.MapDataset.source([batch]).repeat().to_iter_dataset()
@@ -235,17 +234,12 @@ def test_masked_training_resume_publish_and_run_pipeline(masked_source, tmp_path
     resumed = Trainer(objective, optax.sgd(0.05), key=key,
         checkpoints=Checkpoints(str(tmp_path / "run"))).fit(data, steps=2, checkpoint_every=1, log_every=1)
     direct = Trainer(objective, optax.sgd(0.05), key=key).fit(data, steps=2, log_every=1)
-    for left, right in zip(jax.tree.leaves(resumed.params), jax.tree.leaves(direct.params), strict=True):
+    for left, right in zip(jax.tree.leaves(resumed.variables), jax.tree.leaves(direct.variables),
+                           strict=True):
         np.testing.assert_array_equal(left, right)
     for left, right in zip(jax.tree.leaves(resumed.averaged), jax.tree.leaves(direct.averaged), strict=True):
         np.testing.assert_array_equal(left, right)
 
-    fields = {
-        name: value for name, value in source.model_config.items() if name not in ("dtype", "attention_impl")
-    }
-    config = ModelConfig("causal_transformer", fields, dtype="bfloat16", attention_impl="xla")
-    (tmp_path / "run" / "run.json").write_text(json.dumps({
-        "objective": "masked_diffusion", "model": asdict(config), "tokenizer": "byte", "sample_tokens": 8}))
     live = objective.pipeline(resumed, ema=False)
     averaged = objective.pipeline(resumed)
     restored = pipeline(str(tmp_path / "run"), ema=False)
@@ -265,7 +259,7 @@ def test_masked_training_resume_publish_and_run_pipeline(masked_source, tmp_path
     assert converted.model.dtype == jnp.float32
     assert all(leaf.dtype == jnp.bfloat16 for leaf in jax.tree.leaves(converted.variables))
 
-    source.save(tmp_path / "published", variables=resumed.params)
+    source.save(tmp_path / "published", variables=resumed.variables)
     reloaded = Pretrained.load(tmp_path / "published", dtype="bfloat16", attention_impl="xla")
     expected = live(prompt, 8, key=7).host().tokens
     np.testing.assert_array_equal(reloaded.text_generation()(prompt, 8, key=7).host().tokens, expected)
@@ -343,13 +337,13 @@ def test_masked_task_refuses_media_and_non_scalar_logical_positions(masked_sourc
 
 def test_saved_masked_run_refuses_invalid_sample_budget(masked_source, tmp_path):
     source, _ = masked_source
-    fields = {
-        name: value for name, value in source.model_config.items() if name not in ("dtype", "attention_impl")
-    }
-    config = ModelConfig("causal_transformer", fields, dtype="float32", attention_impl="xla")
-    for budget in (-1, True, "8"):
-        (tmp_path / "run.json").write_text(json.dumps({"objective": "masked_diffusion",
-            "model": asdict(config), "tokenizer": "byte", "sample_tokens": budget}))
+    objective = MaskedDiffusionObjective(source.model, MDLM(mask_id=120)(), 8,
+                                         pretrained=source.variables, ema_decay=None)
+    state = Trainer(objective, optax.sgd(0.05), key=jax.random.key(19)).initial_state()
+    for index, budget in enumerate((-1, True, "8")):
+        checkpoints = Checkpoints(str(tmp_path / str(index)))
+        checkpoints.save(0, state, None, artifact={**objective.inference_record(), "sample_tokens": budget})
+        checkpoints.wait()
         with pytest.raises(ValueError, match="sample_tokens"):
-            pipeline(str(tmp_path), ema=False)
+            pipeline(str(tmp_path / str(index)), ema=False)
 

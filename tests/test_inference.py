@@ -22,10 +22,11 @@ import dew
 import dew.nn.backbones  # registers the models
 from dew.artifacts import VideoGrid
 from dew.config import ModelConfig, RunConfig, TrainerConfig
-from dew.data import Dataset, TFDSImages, VideoDataset
+from dew.data import ByteTokenizer, Dataset, TFDSImages, VideoDataset
 from dew.diffusion import FlowMatchPredictionTransform
 from dew.diffusion.presets import EDM, Flow
 from dew.diffusion.schedules import FlowMatchingScheduler
+from dew.inference import RunProcessor
 from dew.inputs import Field, unit_range
 from dew.objectives.base import merge
 from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
@@ -157,24 +158,53 @@ def test_images_as_pil_are_this_processs_real_rows_as_8_bit_pixels():
         Images(jnp.zeros((1, 4, 2, 3, 3)), rows=1).pil()
 
 
+def test_pil_bytes_and_unit_range_are_diffusers_image_processor():
+    """Diffusers 0.34.0's `VaeImageProcessor` is the reference both ways.
+    `postprocess(..., output_type="pil")` writes the same bytes as `pil()` on
+    every level's centre, every tie between two levels, the float32
+    neighbours either side of each, and values past the range (both round
+    half to even in float32, so both miss exact rounding on the same 191
+    near-tie inputs). `unit_range` holds the float64 rule against
+    `pil_to_numpy`'s division and `normalize` over all 256 bytes (3.7e-8
+    against 2.7e-8 rms)."""
+    import torch
+    from diffusers.image_processor import VaeImageProcessor
+    from reference_error import assert_as_exact_as_the_reference
+
+    processor = VaeImageProcessor()
+    levels = np.arange(256, dtype=np.float64)
+    marks = np.concatenate([levels / 127.5 - 1, (levels[:-1] + 0.5) / 127.5 - 1]).astype(np.float32)
+    neighbours = [np.nextafter(marks, np.float32(side)) for side in (-np.inf, np.inf)]
+    values = np.concatenate([marks, *neighbours, np.asarray([-1.5, -1.0001, 1.0001, 3.0], np.float32)])
+    pixels = np.repeat(values.reshape(1, 1, -1, 1), 3, axis=-1)
+    ours = np.asarray(Images(jnp.asarray(pixels), rows=1).pil()[0])
+    channels_first = torch.from_numpy(pixels).permute(0, 3, 1, 2)
+    theirs = np.asarray(processor.postprocess(channels_first, output_type="pil")[0])
+    np.testing.assert_array_equal(ours, theirs)
+
+    data = np.arange(256, dtype=np.uint8)
+    normalized = processor.normalize(torch.from_numpy(data.astype(np.float32) / 255.0)).numpy()
+    assert_as_exact_as_the_reference(np.asarray(unit_range(data)), normalized, data / 127.5 - 1, "unit_range")
+
+
 def test_from_run_restores_the_averaged_weights_by_default(tmp_path):
     """The EMA copy is what a run publishes; `ema=False` reads the live ones."""
     objective, state = make_run(tmp_path)
-    averaged = merge(state.params, state.ema)
+    averaged = merge(state.variables, state.ema)
 
     pipe = TextToImage.from_run(str(tmp_path))
     for expected, loaded in zip(jax.tree.leaves(averaged["params"]),
-                                jax.tree.leaves(pipe.params["params"]), strict=True):
+                                jax.tree.leaves(pipe.variables["params"]), strict=True):
         np.testing.assert_allclose(np.asarray(loaded), np.asarray(expected))
     live = TextToImage.from_run(str(tmp_path), ema=False)
-    for expected, loaded in zip(jax.tree.leaves(state.params["params"]),
-                                jax.tree.leaves(live.params["params"]), strict=True):
+    for expected, loaded in zip(jax.tree.leaves(state.variables["params"]),
+                                jax.tree.leaves(live.variables["params"]), strict=True):
         np.testing.assert_allclose(np.asarray(loaded), np.asarray(expected))
     assert not all(np.allclose(np.asarray(a), np.asarray(b)) for a, b in zip(
-        jax.tree.leaves(pipe.params["params"]), jax.tree.leaves(live.params["params"]), strict=True))
+        jax.tree.leaves(pipe.variables["params"]), jax.tree.leaves(live.variables["params"]), strict=True))
     # the frozen encoder's table is the run's, not something re-drawn
     np.testing.assert_array_equal(
-        np.asarray(pipe.params["encoders"]["textcontext"]["table"]),
+        np.asarray(pipe.variables["encoders"]["textcontext"]["table"]),
         np.asarray(objective.inputs.conditions["textcontext"].encoder.params["table"]))
 
 
@@ -182,10 +212,10 @@ def test_a_run_that_keeps_one_copy_of_its_weights_samples_it_by_default(tmp_path
     """A published run may hold its weights once, with no average beside
     them; the default reads that copy, and asking for an average it does not
     keep is refused."""
-    _, state = make_run(tmp_path / "kept")
+    objective, state = make_run(tmp_path / "kept")
     single = tmp_path / "single"
     checkpoints = Checkpoints(str(single), keep=1)
-    checkpoints.save(int(state.step), state.replace(ema=None), None)
+    checkpoints.save(int(state.step), state.replace(ema=None), None, artifact=objective.inference_record())
     checkpoints.wait()
     dataclasses.replace(run_config(single), ema_decay=None).save(str(single))
 
@@ -210,11 +240,17 @@ def test_from_run_rebuilds_the_training_process_exactly(tmp_path):
 
 
 def test_from_pretrained_is_from_run_on_the_pulled_snapshot(tmp_path, monkeypatch):
-    make_run(tmp_path)
+    main, pinned = tmp_path / "main", tmp_path / "pinned"
+    make_run(main)
+    make_run(pinned, preset=Flow(shift=3.0))
     import dew.interop.hub as hub
-    monkeypatch.setattr(hub, "pull_from_hub", lambda repo_id, revision=None: tmp_path)
+    monkeypatch.setattr(hub, "snapshot_download", lambda repo_id, revision=None: main if revision is None
+                        else {"pinned": pinned}[revision])
     pipe = TextToImage.from_pretrained("user/flowers-dit")
     assert pipe.inputs.conditions["textcontext"].encoder.checkpoint == "stub-clip"
+    selected = TextToImage.from_pretrained("user/flowers-dit", revision="pinned")
+    assert isinstance(selected.process.schedule, FlowMatchingScheduler)
+    assert selected.process.schedule.shift == 3.0
 
 
 def test_sampler_and_guidance_are_call_arguments(tmp_path):
@@ -223,7 +259,7 @@ def test_sampler_and_guidance_are_call_arguments(tmp_path):
     branches to differ; then guidance is visible in the sample."""
     make_run(tmp_path)
     loaded = TextToImage.from_run(str(tmp_path))
-    pipe = dataclasses.replace(loaded, params=jax.tree.map(lambda leaf: leaf + 0.05, loaded.params))
+    pipe = dataclasses.replace(loaded, variables=jax.tree.map(lambda leaf: leaf + 0.05, loaded.variables))
     key = jax.random.PRNGKey(1)
     plain = pipe(["x"], steps=8, guidance=None, solver=Heun(), key=key).host().images
     guided = (
@@ -295,7 +331,7 @@ def test_an_unconditional_unet_takes_a_step():
         Dataset(train=lambda partition: batches(), val=None, records=None, batch=8), steps=1, log_every=100)
 
     assert int(state.step) == 1
-    leaves = jax.tree.leaves(state.params["params"])
+    leaves = jax.tree.leaves(state.variables["params"])
     assert leaves and all(np.all(np.isfinite(np.asarray(leaf))) for leaf in leaves)
 
 
@@ -367,8 +403,9 @@ def test_guidance_is_a_value_with_its_interval(tmp_path):
 
 
 def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16):
-    """Two training steps of a tiny byte-level decoder, its checkpoint and the
-    `run.json` the LM recipe writes: the resolved model, tokenizer and budget.
+    """Two training steps of a tiny byte-level decoder, its checkpoints, whose
+    record names the byte tokenizer it decodes through, and the `run.json` the
+    LM recipe writes: the resolved model, tokenizer and budget.
     `max_seq_len` is the model's window, which training at 9 ids does not
     reach."""
     import json
@@ -381,7 +418,8 @@ def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16):
                   "mlp_features": 32, "max_seq_len": max_seq_len}
     model_config = ModelConfig("causal_transformer", fields, dtype="float32", attention_impl="reference")
     objective = LMObjective(model_config.build(), 8, ema_decay=ema_decay,
-                            samples=Samples([1, 2, 3], 4, sampling=Sampling(temperature=0, eos_id=255)))
+                            samples=Samples([1, 2, 3], 4, sampling=Sampling(temperature=0, eos_id=255)),
+                            processor=RunProcessor(ByteTokenizer()))
     rng = np.random.RandomState(0)
     batch = {"text": rng.randint(1, 250, (8, 9)).astype(np.int32)}
 
@@ -423,10 +461,11 @@ def test_objective_pipeline_binds_the_trained_state_in_place(tmp_path):
     pipe = objective.pipeline(state)
     assert isinstance(pipe, TextToImage)
     assert (pipe.steps, pipe.guidance, pipe.solver) == (objective.steps, objective.guidance, objective.solver)
-    for expected, bound in zip(jax.tree.leaves(state.averaged), jax.tree.leaves(pipe.params), strict=True):
+    for expected, bound in zip(jax.tree.leaves(state.averaged), jax.tree.leaves(pipe.variables), strict=True):
         assert bound is expected
     live = objective.pipeline(state, ema=False)
-    for expected, bound in zip(jax.tree.leaves(state.params), jax.tree.leaves(live.params), strict=True):
+    for expected, bound in zip(jax.tree.leaves(state.variables), jax.tree.leaves(live.variables),
+                               strict=True):
         assert bound is expected
     drawn = pipe(["a", "b"], key=4).host().images
     assert drawn.shape == (2, RES, RES, 3)
@@ -486,18 +525,18 @@ def test_pipeline_answers_an_lm_run_with_its_tokenizer_and_budget(tmp_path):
 def test_an_lm_run_without_an_average_publishes_and_exports_its_live_weights(tmp_path):
     """An LM keeps no EMA unless asked, so each reader's default takes the
     live weights of such a run: the objective's pipeline, `dew.pipeline`
-    and `export_run`."""
-    from dew.interop import Pretrained, export_run
+    and `Pretrained.from_run`."""
+    from dew.interop import Pretrained
 
     run = tmp_path / "run"
     run.mkdir()
     objective, state = make_lm_run(run, ema_decay=None)
     published = objective.pipeline(state)
     for expected, bound in zip(
-        jax.tree.leaves(state.params), jax.tree.leaves(published.variables), strict=True
+        jax.tree.leaves(state.variables), jax.tree.leaves(published.variables), strict=True
     ):
         assert bound is expected
-    export_run(str(run), tmp_path / "export")
+    Pretrained.from_run(str(run)).save(tmp_path / "export")
     reloaded = Pretrained.load(tmp_path / "export", dtype="float32", attention_impl="reference")
     ids = jnp.asarray([[3, 4, 5, 6]], jnp.int32)
     np.testing.assert_array_equal(np.asarray(reloaded.model.apply(reloaded.variables, ids)),
@@ -572,7 +611,7 @@ def test_pipeline_places_a_run_on_a_mesh_and_answers_the_same_images(tmp_path):
     make_run(tmp_path)
     plain = TextToImage.from_run(str(tmp_path))
     placed = dew.pipeline(str(tmp_path), mesh=MeshSpec(fsdp=2), layout=Layout(min_shard=2 ** 6))
-    specs = {leaf.sharding.spec for leaf in jax.tree.leaves(placed.params)}
+    specs = {leaf.sharding.spec for leaf in jax.tree.leaves(placed.variables)}
     assert any("fsdp" in str(spec) for spec in specs)
     result = placed(["a", "b", "c"], steps=3, key=7)
     assert result.images.sharding.spec == jax.sharding.PartitionSpec(BATCH_AXES)
@@ -591,7 +630,7 @@ def test_a_grid_prepares_the_process_and_times_and_final_denoise_ends_the_trajec
     prediction, and over a one-point grid hands the noise itself to the
     decode and clip that end every call."""
     objective, state = make_run(tmp_path)
-    plain = TextToImage.from_objective(objective, state.params)
+    plain = TextToImage.from_objective(objective, state.variables)
     same = dataclasses.replace(plain, grid=lambda steps: (plain.process, plain.process.times(steps)))
     key = jax.random.key(3)
     reference = plain(["a"], steps=4, solver=Heun(), key=key).host().images
@@ -624,32 +663,39 @@ def test_explicit_average_requests_do_not_substitute_live_weights(tmp_path):
                                   live("the ", key=7).host().tokens)
 
 
-def make_block_run(directory):
-    """A block-diffusion run directory: the committed DiffusionGemma fixture's
-    weights under a checkpoint, and the `run.json` a block run writes."""
+def make_block_run(directory, fixture="diffusion-gemma-workflow", moved=0.0, tokenizer="byte"):
+    """A block-diffusion run directory: a committed DiffusionGemma fixture's
+    weights under a checkpoint that records the objective and the tokenizer
+    `tokenizer` names, each parameter moved by `moved` times a seeded normal
+    draw (a stand-in for training). The default fixture reads images and is the
+    published layout's own; `diffusion-gemma-sft` is Google's dense
+    text-only model, which transformers' class cannot build, so its export
+    is refused."""
     from pathlib import Path
 
+    from dew.data.text import tokenizer_for
     from dew.interop import Pretrained
     from dew.objectives.diffusion.block import BlockDiffusionObjective
 
-    fixture = Path(__file__).resolve().parent / "fixtures/hf/diffusion-gemma-workflow"
+    fixture = Path(__file__).resolve().parent / "fixtures/hf" / fixture
     bundle = Pretrained.load(str(fixture), dtype="float32", attention_impl="xla", max_seq_len=32)
-    objective = BlockDiffusionObjective(bundle.model, prompt_length=3, pretrained=bundle.variables)
+    objective = BlockDiffusionObjective(bundle.model, prompt_length=3, pretrained=bundle.variables,
+                                        processor=RunProcessor(tokenizer_for(tokenizer)))
     state = Trainer(objective, optax.sgd(0.01), key=jax.random.PRNGKey(2)).initial_state()
+    if moved:
+        leaves, tree = jax.tree.flatten(state.variables["params"])
+        keys = jax.random.split(jax.random.key(5), len(leaves))
+        params = jax.tree.unflatten(tree, [leaf + moved * jax.random.normal(key, leaf.shape, leaf.dtype)
+                                           for leaf, key in zip(leaves, keys, strict=True)])
+        state = state.replace(variables={**state.variables, "params": params})
     checkpoints = Checkpoints(str(directory))
-    checkpoints.save(0, state, None)
+    checkpoints.save(0, state, None, artifact=objective.inference_record())
     checkpoints.wait()
-    config = ModelConfig("diffusion_gemma",
-                         {**bundle.config, "max_seq_len": bundle.model.max_seq_len},
-                         dtype="float32", attention_impl="auto")
-    (directory / "run.json").write_text(json.dumps({
-        "objective": "block_diffusion", "model": dataclasses.asdict(config),
-        "tokenizer": "byte", "pad_token_id": 0}))
 
 
 def make_masked_run(directory):
     """A masked-diffusion run directory: the committed llada-tiny weights under
-    a checkpoint, and the `run.json` a masked run writes."""
+    a checkpoint that records the objective and its byte tokenizer."""
     from pathlib import Path
 
     from dew.diffusion.discrete import MDLM
@@ -659,17 +705,12 @@ def make_masked_run(directory):
     fixture = Path(__file__).resolve().parent / "fixtures/hf/llada-tiny"
     source = Pretrained.load(fixture, dtype="float32", attention_impl="xla")
     objective = MaskedDiffusionObjective(source.model, MDLM(mask_id=120)(), 8,
-                                         pretrained=source.variables, ema_decay=None)
+                                         pretrained=source.variables, ema_decay=None,
+                                         processor=RunProcessor(ByteTokenizer()))
     state = Trainer(objective, optax.sgd(0.05), key=jax.random.PRNGKey(19)).initial_state()
     checkpoints = Checkpoints(str(directory))
-    checkpoints.save(0, state, None)
+    checkpoints.save(0, state, None, artifact=objective.inference_record())
     checkpoints.wait()
-    fields = {name: value for name, value in source.model_config.items()
-              if name not in ("dtype", "attention_impl")}
-    config = ModelConfig("causal_transformer", fields, dtype="float32", attention_impl="xla")
-    (directory / "run.json").write_text(json.dumps({
-        "objective": "masked_diffusion", "model": dataclasses.asdict(config),
-        "tokenizer": "byte", "sample_tokens": 8}))
 
 
 @pytest.mark.parametrize("make,task_type,prompt,budget", [
@@ -696,8 +737,15 @@ def test_every_saved_text_kind_constructs_through_its_own_task_class(
 
 @pytest.mark.parametrize("kind", ["jepa", "unregistered"])
 def test_saved_non_generation_objectives_fail_at_the_front_door(tmp_path, kind):
-    import json
-    (tmp_path / "run.json").write_text(json.dumps({"objective": kind}))
+    from dew.nn.backbones import CausalTransformer
+    from dew.objectives.lm import LMObjective
+
+    model = CausalTransformer(vocab_size=8, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
+                              max_seq_len=8)
+    state = Trainer(LMObjective(model, 4), optax.sgd(0.), key=jax.random.key(0)).initial_state()
+    checkpoints = Checkpoints(str(tmp_path))
+    checkpoints.save(0, state, None, artifact={"objective": kind})
+    checkpoints.wait()
     with pytest.raises(TypeError, match="no saved generation task") as refusal:
         dew.pipeline(str(tmp_path))
     named = str(refusal.value)
@@ -708,17 +756,16 @@ def test_saved_non_generation_objectives_fail_at_the_front_door(tmp_path, kind):
 
 
 def test_saved_sampling_policy_survives_a_disabled_preview_budget(tmp_path):
-    import json
-
     from dew.sampling import Sampling
 
-    objective, state = make_lm_run(tmp_path)
+    (tmp_path / "run").mkdir()
+    objective, state = make_lm_run(tmp_path / "run")
     policy = Sampling(temperature=0.37, top_k=3, eos_id=255)
-    path = tmp_path / "run.json"
-    record = json.loads(path.read_text())
-    record.update(sample_tokens=0, sampling=dataclasses.asdict(policy))
-    path.write_text(json.dumps(record))
-    task = dew.pipeline(str(tmp_path))
+    checkpoints = Checkpoints(str(tmp_path / "unbudgeted"))
+    checkpoints.save(int(state.step), state, None, artifact={
+        **objective.inference_record(), "sample_tokens": 0, "sampling": dataclasses.asdict(policy)})
+    checkpoints.wait()
+    task = dew.pipeline(str(tmp_path / "unbudgeted"))
     assert task.max_new_tokens is None
     with pytest.raises(ValueError, match="max_new_tokens is required"):
         task([[1, 2]], key=4)
@@ -757,7 +804,7 @@ def test_saved_diffusion_precision_reconstructs_owners_without_source_weights(
         autoencoder=PretrainedAutoencoder(modelname=str(tmp_path / "source/sd/vae"), dtype="float32"))
     objective = config.build()
     initial = Trainer(objective, optax.sgd(0.01), key=jax.random.PRNGKey(3)).initial_state()
-    params = unfreeze(jax.tree.map(lambda leaf: (leaf + 0.015625).astype(jnp.bfloat16), initial.params))
+    params = unfreeze(jax.tree.map(lambda leaf: (leaf + 0.015625).astype(jnp.bfloat16), initial.variables))
     params = {**params, "constants": {**params["constants"], "scale": jnp.asarray([1.003], jnp.float32)}}
     params["params"]["packed"] = jnp.asarray([16777217], jnp.int32)
     params["encoders"]["textcontext"]["constants"] = {
@@ -766,9 +813,9 @@ def test_saved_diffusion_precision_reconstructs_owners_without_source_weights(
     averaged = {"params": {first: jax.tree.map(lambda leaf: leaf.astype(jnp.float32) + 0.03125,
                                              params["params"][first])},
                 "constants": {"scale": jnp.asarray([1.007], jnp.float32)}}
-    state = dataclasses.replace(initial, params=params, ema=averaged)
+    state = dataclasses.replace(initial, variables=params, ema=averaged)
     checkpoints = Checkpoints(str(directory))
-    checkpoints.save(0, state, None)
+    checkpoints.save(0, state, None, artifact=objective.inference_record())
     checkpoints.wait()
     config.save(str(directory))
 
@@ -794,7 +841,7 @@ def test_saved_diffusion_precision_reconstructs_owners_without_source_weights(
 
     expected_params = jax.tree_util.tree_map_with_path(expected_leaf, merged)
     for expected, actual in zip(
-        jax.tree.leaves(expected_params), jax.tree.leaves(restored.params), strict=True
+        jax.tree.leaves(expected_params), jax.tree.leaves(restored.variables), strict=True
     ):
         assert actual.dtype == expected.dtype
         np.testing.assert_array_equal(actual, expected)
@@ -830,13 +877,13 @@ def test_saved_diffusion_precision_reconstructs_owners_without_source_weights(
                                   reference(["a red bird"], steps=2, key=5).host().images)
     owned = restored.inputs.conditions["textcontext"].encoder.params
     for owner_leaf, bound_leaf in zip(
-        jax.tree.leaves(owned), jax.tree.leaves(restored.params["encoders"]["textcontext"]), strict=True
+        jax.tree.leaves(owned), jax.tree.leaves(restored.variables["encoders"]["textcontext"]), strict=True
     ):
         assert owner_leaf.dtype == bound_leaf.dtype and owner_leaf.sharding == bound_leaf.sharding
         np.testing.assert_array_equal(owner_leaf, bound_leaf)
     assert isinstance(restored.autoencoder, StableDiffusionVAE)
     for owner_leaf, bound_leaf in zip(jax.tree.leaves(restored.autoencoder.params),
-                                      jax.tree.leaves(restored.params["autoencoder"]), strict=True):
+                                      jax.tree.leaves(restored.variables["autoencoder"]), strict=True):
         assert owner_leaf.dtype == bound_leaf.dtype and owner_leaf.sharding == bound_leaf.sharding
         np.testing.assert_array_equal(owner_leaf, bound_leaf)
 
@@ -850,10 +897,10 @@ def test_saved_decoder_compute_and_storage_overrides_generate_from_the_same_weig
     from dew.inference import TextGeneration
     from dew.objectives.base import FROZEN
 
-    _, state = make_lm_run(tmp_path)
+    objective, state = make_lm_run(tmp_path)
     baseline = dew.pipeline(str(tmp_path))
     assert isinstance(baseline, TextGeneration)
-    first = next(iter(state.params["params"]))
+    first = next(iter(state.variables["params"]))
 
     def move_to_frozen(variables):
         trainable = dict(variables["params"])
@@ -863,9 +910,9 @@ def test_saved_decoder_compute_and_storage_overrides_generate_from_the_same_weig
     assert state.ema is not None
     step = int(state.step) + 1
     frozen = dataclasses.replace(state, step=jnp.asarray(step, state.step.dtype),
-                                 params=move_to_frozen(state.params), ema=move_to_frozen(state.ema))
+                                 variables=move_to_frozen(state.variables), ema=move_to_frozen(state.ema))
     checkpoints = Checkpoints(str(tmp_path))
-    checkpoints.save(step, frozen, None)
+    checkpoints.save(step, frozen, None, artifact=objective.inference_record())
     checkpoints.wait()
     params = baseline.variables
     if storage is not None:
@@ -893,9 +940,9 @@ def test_saved_bare_encoder_weights_follow_storage_without_changing_compute(tmp_
     assert isinstance(restored, TextToImage)
     encoder = restored.inputs.conditions["textcontext"].encoder
     assert isinstance(encoder, CharTable)
-    stored = merge(state.params, state.ema)
+    stored = merge(state.variables, state.ema)
     expected_vars = jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16), stored)
-    table = restored.params["encoders"]["textcontext"]["table"]
+    table = restored.variables["encoders"]["textcontext"]["table"]
     assert table.dtype == jnp.bfloat16
     assert encoder.params["table"].dtype == table.dtype
     np.testing.assert_array_equal(encoder.params["table"], table)
@@ -916,3 +963,95 @@ def test_saved_bare_encoder_weights_follow_storage_without_changing_compute(tmp_
 
 
 
+
+
+@pytest.mark.parametrize("precision", ["highest", None])
+def test_restored_bf16_clip_blank_and_samples_are_the_objectives_bits(tmp_path, precision):
+    """The checkpoint's task and the objective's pipeline encode the empty
+    CLIP prompt with the same eager arithmetic, not a fused one-row JIT.
+    Keep the denoiser float32 and CLIP bf16, as the published hybrid DiT is.
+    The construction precision travels with the artifact, not the caller's
+    context at restore.
+    """
+    from pathlib import Path
+
+    config = dataclasses.replace(
+        run_config(tmp_path, preset=Flow()),
+        text=TextCondition(encoder="clip_text", checkpoint=str(Path(__file__).parent / "fixtures/clip/tiny"),
+                           dtype="bfloat16"),
+        guidance=CFG(5.0), ema_decay=None)
+    with jax.default_matmul_precision(precision):
+        objective = config.build()
+    trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.key(0))
+    state = trainer.initial_state()
+    batch = {"image": np.full((jax.device_count(), RES, RES, 3), 180, np.uint8),
+             **objective.inputs.tokenize(["a bird"] * jax.device_count())}
+    state, *_ = trainer.compile(state, batch)(state, batch)
+    checkpoints = Checkpoints(str(tmp_path))
+    artifact = objective.inference_record()
+    assert artifact["condition_precision"] == precision
+    checkpoints.save(1, state, None, artifact=artifact)
+    checkpoints.wait()
+    original = objective.pipeline(state, ema=False)
+    with jax.default_matmul_precision("default" if precision == "highest" else "highest"):
+        restored = TextToImage.from_run(str(tmp_path), ema=False)
+
+    prepared = original.prepare(["a bird", "a cat"], key=0, steps=8)
+    assert restored.blank is not None
+    assert restored.blank.precision == precision
+    want = objective.blank_conditions(prepared.conditions)
+    got = restored.blank(prepared.conditions)
+    for actual, expected in zip(jax.tree.leaves(got), jax.tree.leaves(want), strict=True):
+        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+    np.testing.assert_array_equal(restored(["a bird", "a cat"], steps=8, key=0).host().images,
+                                  original(["a bird", "a cat"], steps=8, key=0).host().images)
+
+
+def test_binding_new_encoder_weights_recomputes_the_warmed_blank(tmp_path):
+    """A restored task warms both branches, then binds a new encoder tree.
+    Its conditional and unconditional features and samples match a fresh
+    task over those weights, not the old cached unconditional features.
+    Binding only a denoiser update preserves the cache.
+    """
+    from pathlib import Path
+
+    config = dataclasses.replace(
+        run_config(tmp_path, preset=Flow()),
+        text=TextCondition(encoder="clip_text", checkpoint=str(Path(__file__).parent / "fixtures/clip/tiny"),
+                           dtype="bfloat16"),
+        guidance=CFG(5.0), ema_decay=None)
+    objective = config.build()
+    trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.key(0))
+    state = trainer.initial_state()
+    batch = {"image": np.full((jax.device_count(), RES, RES, 3), 180, np.uint8),
+             **objective.inputs.tokenize(["a bird"] * jax.device_count())}
+    state, *_ = trainer.compile(state, batch)(state, batch)
+    checkpoints = Checkpoints(str(tmp_path))
+    checkpoints.save(1, state, None, artifact=objective.inference_record())
+    checkpoints.wait()
+    restored = TextToImage.from_run(str(tmp_path), ema=False)
+    prompts = ["a bird", "a cat"]
+    old = restored.prepare(prompts, key=0, steps=8)
+    assert restored.blank is not None
+    old_blank = restored.blank(old.conditions)
+
+    denoiser_update = {**restored.variables, "params": jax.tree.map(lambda value: value + 0.03125,
+                                                             restored.variables["params"])}
+    assert restored.bind(denoiser_update).blank is restored.blank
+    encoders = jax.tree.map(lambda value: value + 0.03125, restored.variables["encoders"])
+    changed = {**restored.variables, "encoders": encoders}
+    rebound = restored.bind(changed)
+    fresh_objective = config.build(variables=changed)
+    fresh = TextToImage.from_objective(fresh_objective, changed)
+    bound_inputs = rebound.prepare(prompts, key=0, steps=8)
+    fresh_inputs = fresh.prepare(prompts, key=0, steps=8)
+    assert rebound.blank is not None and fresh.blank is not None
+    new_blank = rebound.blank(bound_inputs.conditions)
+    expected_blank = fresh.blank(fresh_inputs.conditions)
+    assert any(not np.array_equal(np.asarray(left), np.asarray(right))
+               for left, right in zip(jax.tree.leaves(old_blank), jax.tree.leaves(new_blank), strict=True))
+    for actual, expected in zip(jax.tree.leaves((bound_inputs.conditions, new_blank)),
+                                jax.tree.leaves((fresh_inputs.conditions, expected_blank)), strict=True):
+        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+    np.testing.assert_array_equal(rebound(prompts, steps=8, key=0).host().images,
+                                  fresh(prompts, steps=8, key=0).host().images)

@@ -135,7 +135,7 @@ class EMASpec:
 class InputSpec(Mapping[str, jax.ShapeDtypeStruct]): ...
 ```
 
-`make_validation_step(**kwargs)` and `log_validation_artifacts(wandb, ...)` go. Evaluation options are constructor arguments of the objective, so nothing tunnels through `fit`. The trainer writes the collections in `Aux.variables` back into `state.params`; that rule serves MoE balancing, batch statistics and sown values (section 6.2). One `PathFilter` selects the EMA subtree, `optax.multi_transform` labels and frozen subtrees; today those are three conventions.
+`make_validation_step(**kwargs)` and `log_validation_artifacts(wandb, ...)` go. Evaluation options are constructor arguments of the objective, so nothing tunnels through `fit`. The trainer writes the collections in `Aux.variables` back into `state.variables`; that rule serves MoE balancing, batch statistics and sown values (section 6.2). One `PathFilter` selects the EMA subtree, `optax.multi_transform` labels and frozen subtrees; today those are three conventions.
 
 ### 3.4 `Trainer`
 

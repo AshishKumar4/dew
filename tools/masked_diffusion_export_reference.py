@@ -283,11 +283,11 @@ def round_trip(case: Case, workspace: Path) -> RoundTrip:
     source = Pretrained.load(str(directory), dtype="float32", attention_impl="reference")
     state = train(source, ids)
     export = workspace / case.name
-    source.save(export, variables=state.params)
+    source.save(export, variables=state.variables)
     reloaded = Pretrained.load(str(export), dtype="float32", attention_impl="reference")
     theirs, report = reference_logits(case, export, ids, workspace)
-    return RoundTrip(case, source, state.params, export, ids,
-                     logits(source, state.params, ids), reloaded, theirs, report,
+    return RoundTrip(case, source, state.variables, export, ids,
+                     logits(source, state.variables, ids), reloaded, theirs, report,
                      source_tensors(directory), source_tensors(export))
 
 

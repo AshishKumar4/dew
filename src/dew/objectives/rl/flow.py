@@ -32,7 +32,7 @@ from dew.objectives.base import Aux, Batch, Ratio, Shown, Step, Variables
 from dew.objectives.diffusion.objective import VALIDATION_SAMPLES, DiffusionObjective
 from dew.registry import objectives
 from dew.sampling.flow import FlowSDE, FlowTrajectory, GaussianTransition
-from dew.sampling.guidance import CFG
+from dew.sampling.guidance import CFG, Walk
 from dew.sampling.solvers import Euler, Solver
 
 from .sessions import ADVANTAGES_KEY, OLD_LOG_PROBS_KEY
@@ -114,11 +114,14 @@ class FlowGRPOObjective(DiffusionObjective):
         self.clip_range = clip_range
         self.adv_clip_max = adv_clip_max
 
-    def _predictor(self, params: Variables, batch: Batch) -> Predictor:
-        """Build the denoiser this batch's conditions select, guidance included."""
+    def _walk(self, params: Variables, batch: Batch) -> Walk:
+        """The walk of the denoiser this batch's conditions select, guided as
+        the rollout's walk was: over its `rollout_steps` points, a
+        transition's column being its step's index."""
         given = self.encoded_conditions(params, batch)
         denoise = self.denoiser(params, given, self.blank_conditions(given))
-        return denoise if self.guidance is None else self.guidance(denoise)
+        points = jnp.asarray(batch["rollout_steps"], jnp.int32)
+        return Walk.over(denoise, self.guidance, points[0] - 1)
 
     def _transition(self, predict: Predictor, x: jax.Array,
                     t: jax.Array, following: jax.Array) -> GaussianTransition:
@@ -144,22 +147,25 @@ class FlowGRPOObjective(DiffusionObjective):
             raise ValueError("timesteps and next_timesteps must mark every recorded transition")
         if not times.shape[0] or not times.shape[1]:
             raise ValueError("a recorded batch needs rows and transition slots")
+        if np.shape(batch["rollout_steps"]) != times.shape[:1]:
+            raise ValueError("rollout_steps must give every row its rollout's grid points")
         return jax.tree.map(jax.lax.stop_gradient, (latents, following, times, next_times))
 
     def log_probs(self, params: Variables, batch: Batch) -> jax.Array:
         """Rescore joint transition log densities with the rollout's guidance."""
         latents, following, times, next_times = self._window(batch)
-        predict = self._predictor(params, batch)
+        walk = self._walk(params, batch)
 
         def score(_, values):
-            x, action, t, s = values
-            return None, self._transition(predict, x, t, s).log_prob(action)
+            x, action, t, s, index = values
+            return None, self._transition(walk.at((), index), x, t, s).log_prob(action)
 
-        _, values = jax.lax.scan(score, None, tuple(
-            jnp.swapaxes(value, 0, 1) for value in (latents, following, times, next_times)))
+        _, values = jax.lax.scan(score, None, (*(
+            jnp.swapaxes(value, 0, 1) for value in (latents, following, times, next_times)),
+            jnp.arange(times.shape[1])))
         return values.T
 
-    def loss(self, params: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
+    def loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
         """Score the clipped policy gradient over the recorded transitions.
 
         The scan carries nothing between transitions; each one contributes
@@ -177,17 +183,17 @@ class FlowGRPOObjective(DiffusionObjective):
         if advantages.shape != times.shape:
             raise ValueError("advantages must hold one value per trajectory or per transition")
         advantages = jnp.clip(advantages, -self.adv_clip_max, self.adv_clip_max)
-        predict = self._predictor(params, batch)
+        walk = self._walk(variables, batch)
         reference = None
         if self.beta > 0:
             if step.ema is None:
                 raise ValueError("FlowGRPO's conditional KL needs its frozen reference in step.ema")
-            reference = self._predictor(jax.tree.map(jax.lax.stop_gradient, step.ema), batch)
+            reference = self._walk(jax.tree.map(jax.lax.stop_gradient, step.ema), batch)
         dimensions = math.prod(self.latent_shape)
 
         def terms(_, values):
-            x, action, t, s, old_log_prob, advantage, selected = values
-            transition = self._transition(predict, x, t, s)
+            x, action, t, s, old_log_prob, advantage, selected, index = values
+            transition = self._transition(walk.at((), index), x, t, s)
             # NaN variance remains selected and fails the numerical check. Only
             # a zero-variance interval is outside the Gaussian policy's support.
             keep = selected & (transition.variance != 0)
@@ -199,13 +205,13 @@ class FlowGRPOObjective(DiffusionObjective):
             pg = jnp.where(keep, jnp.maximum(unclipped, clipped), 0).sum()
             kl = jnp.asarray(0.0)
             if reference is not None:
-                reference_mean = self._transition(reference, x, t, s).mean
+                reference_mean = self._transition(reference.at((), index), x, t, s).mean
                 kl = jnp.where(keep, transition.kl(reference_mean) / dimensions, 0).sum()
             clipped_count = (keep & (jnp.abs(ratio - 1) > self.clip_range)).sum()
             return None, (pg, kl, keep.astype(jnp.float32).sum(), clipped_count)
 
-        _, summed = jax.lax.scan(terms, None, tuple(jnp.swapaxes(value, 0, 1) for value in (
-            latents, following, times, next_times, old, advantages, mask)))
+        _, summed = jax.lax.scan(terms, None, (*(jnp.swapaxes(value, 0, 1) for value in (
+            latents, following, times, next_times, old, advantages, mask)), jnp.arange(times.shape[1])))
         pg, kl, mass, clipped_count = (value.sum() for value in summed)
         denominator = jnp.where(mass > 0, mass, 1)
         metrics = {"pg": pg / denominator, "actor/clipfrac": clipped_count / denominator}
@@ -301,7 +307,7 @@ class FlowRollout:
             raise ValueError("train_steps must select between one and steps-1 transitions")
         if self.objective.sde.noise_level == 0:
             raise ValueError("online FlowGRPO needs positive noise for stochastic transitions")
-        reserved = {"latents", "next_latents", "timesteps", "next_timesteps",
+        reserved = {"latents", "next_latents", "timesteps", "next_timesteps", "rollout_steps",
                     OLD_LOG_PROBS_KEY, ADVANTAGES_KEY, REWARDS_KEY, "transition_mask"}
         if any(condition.field in reserved for condition in self.objective.inputs.conditions.values()):
             raise ValueError("conditioning fields must not overwrite FlowGRPO transition fields")
@@ -388,6 +394,7 @@ class FlowRollout:
             "next_latents": np.asarray(trajectory.states)[owned, 1:selected + 1],
             "timesteps": np.broadcast_to(trajectory.times[:selected], shape),
             "next_timesteps": np.broadcast_to(trajectory.times[1:selected + 1], shape),
+            "rollout_steps": np.full(shape[:1], self.steps, np.int32),
             OLD_LOG_PROBS_KEY: np.asarray(trajectory.log_probs)[owned, :selected],
             "transition_mask": (np.asarray(trajectory.stochastic)[owned, :selected]
                                 & (local_advantages[:, None] != 0)),
@@ -406,7 +413,7 @@ class FlowRollout:
         the next collective.
         """
         expanded, owned, count = agreed("flow rollout setup", lambda: self._expanded(batch))
-        generated = agreed("flow rollout generation", lambda: self._generate(state.params, expanded, key))
+        generated = agreed("flow rollout generation", lambda: self._generate(state.variables, expanded, key))
         (trajectory, images), context = collective_host(
             (generated, expanded), phase="flow rollout")
 

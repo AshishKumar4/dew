@@ -129,6 +129,7 @@ def main(config: JepaRunConfig) -> TrainState:
         num_targets=config.num_target_blocks,
         scale=config.target_scale,
         aspect=config.target_aspect,
+        scan_order=encoder.scan_order,
     )
     print(f"Mask geometry: {mask.block_area} tokens per target block "
           f"({mask.block_shapes}), {mask.num_context} context tokens of {mask.num_patches}")

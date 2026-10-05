@@ -23,8 +23,30 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.objectives.base import Variables
 from dew.training.host import evict
+
+_TILE = 64
+"""The side of the squares `_swapped` copies: a 64x64 block of float32 is
+16 KiB, so a block and its transpose stay in a core's cache."""
+
+
+def _swapped(values: np.ndarray) -> np.ndarray:
+    """`values` with its last two axes swapped, C-ordered.
+
+    numpy copies a whole transposed matrix with one strided pass, which
+    misses the cache on every element: 0.39 GiB/s for a 10240x4096 float32
+    kernel, where a contiguous copy runs at 9.7. Square tiles small enough
+    for the cache copy at 3.5 GiB/s."""
+    *lead, rows, columns = values.shape
+    if values.size == 0:
+        return np.empty((*lead, columns, rows), values.dtype)
+    flat = np.ascontiguousarray(values).reshape(-1, rows, columns)
+    out = np.empty((flat.shape[0], columns, rows), values.dtype)
+    for row in range(0, rows, _TILE):
+        for column in range(0, columns, _TILE):
+            out[:, column:column + _TILE, row:row + _TILE] = (
+                flat[:, row:row + _TILE, column:column + _TILE].swapaxes(-1, -2))
+    return out.reshape(*lead, columns, rows)
 
 
 @dataclass(frozen=True, eq=False)
@@ -81,6 +103,16 @@ class SourceLeaf:
     def _view(self, member: np.ndarray) -> np.ndarray:
         return np.swapaxes(member, -1, -2) if self.transposed else member
 
+    def _member(self, member: np.ndarray, index: tuple[slice, ...]) -> np.ndarray:
+        """One member's values at `index` of its view, C-ordered in `dtype`:
+        read and cast in the stored layout, which is contiguous, then
+        swapped in tiles (`_swapped`) where the leaf is transposed."""
+        if not self.transposed:
+            return np.asarray(member[index], dtype=self.dtype, order="C")
+        index = (*index, *(slice(None) for _ in range(member.ndim - len(index))))
+        stored = (*index[:-2], index[-1], index[-2])
+        return _swapped(np.asarray(member[stored], dtype=self.dtype, order="C"))
+
     def read(self, index: tuple[slice, ...] | None = None) -> np.ndarray:
         """The leaf's values at `index` (None: all of it), C-ordered in `dtype`.
 
@@ -105,16 +137,18 @@ class SourceLeaf:
                     stop = int(columns[last]) - offset + step
                     source = (*index[:-1], slice(int(columns[first]) - offset,
                                                 None if step < 0 and stop < 0 else stop, step))
-                    # Storage dtype is part of the recipe, as in the ordinary
-                    # read: copy directly into the shard, without a cast buffer.
-                    np.copyto(output[..., first:last + 1], view[source], casting="unsafe")
+                    if self.transposed:
+                        output[..., first:last + 1] = self._member(member, source)
+                    else:
+                        # Storage dtype is part of the recipe: copy straight
+                        # into the shard, without a cast buffer.
+                        np.copyto(output[..., first:last + 1], member[source], casting="unsafe")
                 offset += view.shape[-1]
             return output
         if not self.stacked:
-            return np.asarray(self._view(self.members[0])[index], dtype=self.dtype, order="C")
+            return self._member(self.members[0], index)
         experts, rest = (index[0], index[1:]) if index else (slice(None), ())
-        return np.stack([np.asarray(self._view(member)[rest], dtype=self.dtype)
-                         for member in self.members[experts]])
+        return np.stack([self._member(member, rest) for member in self.members[experts]])
 
     def release(self) -> None:
         """Give back the mapped pages the reads faulted in."""
@@ -126,7 +160,7 @@ type LazyTree = dict[str, np.ndarray | SourceLeaf | LazyTree]
 """A variables collection whose leaves are stored arrays or `SourceLeaf` recipes."""
 
 
-def materialize(tree: LazyTree) -> Variables:
+def materialize(tree: LazyTree) -> LazyTree:
     """Read every `SourceLeaf` of `tree` whole, leaving arrays as they are."""
     return {name: (materialize(value) if isinstance(value, dict)
                    else value.read() if isinstance(value, SourceLeaf) else value)

@@ -100,7 +100,7 @@ def training_step(model):
 def train_state(step, variables, opt_state, key):
     """A single-microbatch state after `step` committed updates."""
     count = jnp.asarray(step, jnp.int32)
-    return TrainState(step=count, microstep=count, updates=count, params=variables,
+    return TrainState(step=count, microstep=count, updates=count, variables=variables,
                       opt_state=opt_state, ema=None, key=key, scale=None,
                       window_size=jnp.asarray(1, jnp.int32))
 
@@ -218,9 +218,9 @@ def test_checkpoint_resumes_with_remat_switched(tmp_path, saved_remat):
     restored, position = checkpoints.restore(template)
     assert position is None
     assert int(restored.step) == 1 and int(restored.updates) == 1
-    expected = run(state.params, state.opt_state, batch(), state.key)
+    expected = run(state.variables, state.opt_state, batch(), state.key)
     resume, _ = training_step(resumed_model)
-    actual = resume(restored.params, restored.opt_state, batch(), restored.key)
+    actual = resume(restored.variables, restored.opt_state, batch(), restored.key)
     assert abs(float(actual[2] - expected[2])) < 2e-5
     assert difference(actual[0], expected[0]) < 2e-5
 

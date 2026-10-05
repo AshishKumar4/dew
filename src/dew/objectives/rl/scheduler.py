@@ -338,7 +338,7 @@ class RolloutScheduler:
         """
         if 0 <= updates - self.weights.version < self.sync_every:
             return
-        self.weights.load(state.params, updates)
+        self.weights.load(state.variables, updates)
         if self.weights.version != updates:
             raise RuntimeError(f"the weights pushed at update {updates} did not take: the engines still "
                                f"serve version {self.weights.version}")
@@ -486,10 +486,10 @@ class RolloutScheduler:
             if sampling
             else {}
         )
-        mesh = mesh_of(state.params)
+        mesh = mesh_of(state.variables)
         if mesh is not None:
             packed = first_reader_batch(mesh, packed)
-        packed[OLD_LOG_PROBS_KEY] = self._proximal(state.params, packed, mesh) * packed[RESPONSE_MASK_KEY]
+        packed[OLD_LOG_PROBS_KEY] = self._proximal(state.variables, packed, mesh) * packed[RESPONSE_MASK_KEY]
         if sampling:
             versions = [call.version for rollout in rollouts for call in rollout.calls]
             oldest = min(versions, default=updates)

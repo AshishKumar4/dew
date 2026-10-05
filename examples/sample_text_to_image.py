@@ -45,6 +45,8 @@ SAMPLERS = {
 class Config:
     model: str = "dewml/hybrid-dit-176m"
     """A Hugging Face Hub repository, or a local Dew run directory."""
+    revision: str | None = "32d59de89683d59824361144b87bdcaf3e742598"
+    """The Hub commit or tag to load; local run directories do not use it."""
     out: Path = Path("runs/sample-text-to-image")
     """A new directory for the images, grids and manifest."""
     prompts: tuple[str, ...] = (
@@ -62,10 +64,10 @@ class Config:
     keeps the one the loaded model is configured with (empty for the recorded model)."""
 
 
-def load(model: str) -> TextToImage:
+def load(model: str, revision: str | None) -> TextToImage:
     if Path(model).is_dir():
         return TextToImage.from_run(model)
-    return TextToImage.from_pretrained(model)
+    return TextToImage.from_pretrained(model, revision=revision)
 
 
 def grid(title: str, prompts, seeds, images: np.ndarray) -> Image.Image:
@@ -97,7 +99,7 @@ def main(config: Config):
     out.mkdir(parents=True, exist_ok=False)
     prompts = list(config.prompts)
     started = time.perf_counter()
-    pipe = load(config.model)
+    pipe = load(config.model, config.revision)
     print(f"Loaded in {time.perf_counter() - started:.1f} s on {jax.devices()[0].device_kind}")
     manifest = {"model": config.model, "device": jax.devices()[0].device_kind,
                 "negative": config.negative, "batches": [], "images": []}

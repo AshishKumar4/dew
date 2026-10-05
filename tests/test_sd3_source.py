@@ -274,8 +274,8 @@ def test_native_sd3_agrees_across_a_sequence_sharded_mesh(source):
     context = jax.random.normal(jax.random.PRNGKey(5), (rows, 77, config["joint_attention_dim"]))
     probe = jax.random.normal(jax.random.PRNGKey(6), latent.shape)
 
-    def loss(params):
-        output = model.apply({"params": params, "buffers": buffers}, latent, times,
+    def loss(variables):
+        output = model.apply({"params": variables, "buffers": buffers}, latent, times,
                              DenoisingCondition(context, pooled))
         return jnp.sum(output * probe)
 
@@ -335,21 +335,25 @@ def test_published_prompt_encoding_matches_the_source_pipeline(source, pipeline_
     assert relative_gap(crossed.context, arrays[f"{case}.context"]) > 1e-3
 
 
+@pytest.mark.parametrize("streamed", [False, True])
 @pytest.mark.parametrize("case", PIPELINE_CASES)
-def test_published_pipeline_walk_matches_the_source(source, pipeline_record, case):
+def test_published_pipeline_walk_matches_the_source(source, pipeline_record, case, streamed):
     """`Pretrained.load().text_to_image()` reproduces the source's own call.
 
     The published directory decides everything: the transformer, the wide
     latent VAE with its shift and scale, the flow schedule's shifted sigmas,
     the guidance the call applies to the raw velocity, and the geometry the
     grid is bound to. The walk starts from the source's own latents so only
-    the trajectory is under test.
+    the trajectory is under test. Loaded whole or streamed onto a mesh
+    (tests/test_pipeline_streaming.py).
     """
     from dew.interop.pretrained import Pretrained
     from dew.sampling.guidance import CFG
+    from dew.training import MeshSpec
 
     arrays = np.load(source / "sd3_pipeline.npz")
-    loaded = Pretrained.load(str(source / case), dtype="float32", attention_impl="xla")
+    loaded = Pretrained.load(str(source / case), dtype="float32", attention_impl="xla",
+                             **({"mesh": MeshSpec()} if streamed else {}))
     task = loaded.text_to_image()
     prepared = task.prepare(pipeline_record["prompts"], unconditional=pipeline_record["negatives"],
                             initial=arrays[f"{case}.x_T"], steps=pipeline_record["steps"], key=0)
@@ -434,7 +438,7 @@ def test_a_trained_step_keeps_the_frozen_buffer_and_exports_for_the_source(sourc
     trainer = Trainer(objective, optax.sgd(1e-2), key=jax.random.PRNGKey(3),
                       checkpoints=checkpoints)
     initial = trainer.initial_state()
-    buffer = initial.params["buffers"]["pos_embed"]
+    buffer = initial.variables["buffers"]["pos_embed"]
     np.testing.assert_array_equal(buffer, loaded.variables["buffers"]["pos_embed"])
 
     fixed = Step(jnp.asarray(0), jax.random.PRNGKey(5), None)
@@ -443,19 +447,19 @@ def test_a_trained_step_keeps_the_frozen_buffer_and_exports_for_the_source(sourc
         loss, _ = objective.loss(params, batch, fixed)
         return float(loss.total / loss.mass)
 
-    before = value(initial.params)
+    before = value(initial.variables)
     state, _, _, _, accepted = trainer.compile(initial, batch)(initial, batch)
     assert bool(accepted)
-    assert value(state.params) < before
+    assert value(state.variables) < before
     # The step moved weights and left the buffer alone.
-    assert not np.allclose(state.params["params"]["proj_out"]["kernel"],
-                           initial.params["params"]["proj_out"]["kernel"])
-    np.testing.assert_array_equal(state.params["buffers"]["pos_embed"], buffer)
+    assert not np.allclose(state.variables["params"]["proj_out"]["kernel"],
+                           initial.variables["params"]["proj_out"]["kernel"])
+    np.testing.assert_array_equal(state.variables["buffers"]["pos_embed"], buffer)
     # The released towers and the autoencoder are state, not weights: the
     # optimizer never sees them, so every leaf is the loaded one.
     for held in ("encoders", "autoencoder"):
-        for got, want in zip(jax.tree.leaves(state.params[held]),
-                             jax.tree.leaves(initial.params[held]), strict=True):
+        for got, want in zip(jax.tree.leaves(state.variables[held]),
+                             jax.tree.leaves(initial.variables[held]), strict=True):
             np.testing.assert_array_equal(got, want)
 
     checkpoints.save(1, state, None, {})
@@ -466,16 +470,33 @@ def test_a_trained_step_keeps_the_frozen_buffer_and_exports_for_the_source(sourc
         np.testing.assert_array_equal(raw_leaf(got), raw_leaf(want))
 
     export = tmp_path / "export"
-    loaded.save(export, variables=state.params)
+    loaded.save(export, variables=state.variables)
     again = Pretrained.load(str(export), dtype="float32", attention_impl="xla")
     np.testing.assert_array_equal(again.variables["buffers"]["pos_embed"], buffer)
     latent = jnp.asarray(np.load(source / "sd3_pipeline.npz")["pipeline.x_T"][:1])
     condition = DenoisingCondition(jnp.ones((1, 4, 32), jnp.float32),
                                    jnp.ones((1, 10), jnp.float32))
-    trained = loaded.model.apply({"params": state.params["params"],
-                                  "buffers": state.params["buffers"]},
+    trained = loaded.model.apply({"params": state.variables["params"],
+                                  "buffers": state.variables["buffers"]},
                                  latent, jnp.asarray([0.5]), condition)
     reloaded = again.model.apply({"params": again.variables["params"],
                                   "buffers": again.variables["buffers"]},
                                  latent, jnp.asarray([0.5]), condition)
     np.testing.assert_array_equal(reloaded, trained)
+
+    # Diffusers' own classes read the export: every component cleanly, the
+    # pipeline whole, and its transformer recomputes the trained forward.
+    from reference_error import assert_as_exact_as_the_reference
+
+    from tools import diffusers_consumer as consumer
+
+    consumer.assert_components_load(export)
+
+    def call(model, tensor):
+        output = model(hidden_states=tensor(latent).permute(0, 3, 1, 2),
+                       encoder_hidden_states=tensor(condition.context),
+                       pooled_projections=tensor(condition.pooled), timestep=tensor([0.5])).sample
+        return output.permute(0, 2, 3, 1).numpy()
+
+    assert_as_exact_as_the_reference(np.asarray(trained), consumer.denoiser_prediction(export, call),
+                                     consumer.denoiser_prediction(export, call, wide=True), "trained SD3")

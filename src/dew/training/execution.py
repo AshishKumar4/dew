@@ -288,7 +288,7 @@ class HostExecution:
         self.objective, self.layout = objective, layout
         self.accelerator, self.cpu = accelerator, cpu
         self.sites = bank_sites(objective) if objective.bank_sites else ()
-        self.loss = jax.jit(objective.loss)
+        self.loss = jax.jit(objective._loss)
         self.unstack = jax.jit(functools.partial(_logical, sites=self.sites))
 
     def snapshot(self, variables):

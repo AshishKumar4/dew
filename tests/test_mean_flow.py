@@ -9,67 +9,81 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
+from reference_error import assert_as_exact_as_the_reference
 
 from dew.diffusion import presets
 from dew.inputs import CharTable, Condition, Field, InputSpec
 from dew.nn.backbones import SimpleDiT
 from dew.objectives.base import Step
-from dew.objectives.diffusion.few_step import (
-    MeanFlowObjective,
-    adaptive_loss,
-    guided_velocity,
-    intervals,
-    mean_flow_target,
-)
+from dew.objectives.diffusion.few_step import MeanFlowObjective
 from dew.sampling import Euler, sample
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "meanflow"
+CLASSES = 10
 
 
-def tiny(x, t, h, y):
-    """`tools/meanflow_reference.py`'s closed-form average velocity."""
-    def column(value):
-        return value.reshape(-1, 1, 1, 1)
+class Tiny(nn.Module):
+    """`tools/meanflow_reference.py`'s average velocity u(x, t, h, y) in
+    Dew's calling convention: the model times are the flow time and the
+    duration times 1000, and the class is the condition's second token,
+    whose table entry is the class, the blank prompt's padding reading the
+    reference's null class."""
 
-    return (jnp.tanh(x) * 0.6 + jnp.sin(3 * column(t)) * x * 0.3
-            + column(h) * jnp.cos(x) * 0.2 + column(y.astype(jnp.float32)) * 0.05)
+    @nn.compact
+    def __call__(self, x, time, textcontext, duration=None, train=False):
+        def column(value):
+            return value.reshape(-1, 1, 1, 1)
+
+        # The objective initializes the model without a duration.
+        duration = jnp.zeros_like(time) if duration is None else duration
+        t, h, y = time / 1000, duration / 1000, textcontext.hidden[:, 1, 0]
+        weights = self.param("weights", nn.initializers.zeros, (4, *x.shape[1:]))
+        return (jnp.tanh(x) * weights[0] + jnp.sin(3 * column(t)) * x * weights[1]
+                + column(h) * jnp.cos(x) * weights[2] + column(y) * weights[3])
+
+
+def labelled() -> CharTable:
+    """Character tables of one feature: the digit k reads k, and the padding
+    id 0 reads the null class."""
+    table = CharTable.from_pretrained(tokens=2, features=1)
+    entries = np.zeros((table.vocab, 1), np.float32)
+    entries[0] = CLASSES
+    for digit in range(CLASSES):
+        entries[table.tokenize([str(digit)])["input_ids"][0, 1]] = digit
+    return CharTable.from_pretrained(tokens=2, features=1, params={"table": jnp.asarray(entries)})
 
 
 @pytest.mark.parametrize("power", ["0", "1"])
-def test_the_loss_is_the_references(power):
-    """On the reference's own draws: the guided velocity inside and outside
-    the guidance interval, and the loss over the dropped condition, the JVP
-    target and the adaptive weight."""
+def test_the_loss_and_its_gradient_are_the_references(power, monkeypatch):
+    """`MeanFlowObjective.loss` on Gsunshine/meanflow's `forward`'s own
+    draws, two times, the noise and the dropout uniforms: the interval with
+    its instantaneous rows, the guided velocity inside and outside the
+    guidance interval, the condition dropped on the first rows as many as the
+    uniforms under the rate count, the JVP target and the adaptive weight.
+    The loss within 1e-6 of the reference's float64 run and the gradient in
+    the network's 192 weights held to it by the float64 rule."""
     case = np.load(FIXTURES / f"loss_p{power}.npz")
     settings = json.loads(str(case["settings"]))
-    t, r = jnp.asarray(case["t"]).ravel(), jnp.asarray(case["r"]).ravel()
-    z, v = jnp.asarray(case["z"]), jnp.asarray(case["v"])
-    classes = jnp.asarray(case["classes"])
-    inside = ((t >= settings["t_start"]) & (t <= settings["t_end"])).reshape(-1, 1, 1, 1)
-    null = jnp.full_like(classes, settings["num_classes"])
-    guided = guided_velocity(
-        v,
-        tiny(z, t, 0 * t, null),
-        tiny(z, t, 0 * t, classes),
-        jnp.where(inside, settings["omega"], 1.0),
-        jnp.where(inside, settings["kappa"], 0.0),
-    )
-    # Both sides run the same float32 JAX operations in the same order, up
-    # to the association of the three-term sum: a few ulps.
-    np.testing.assert_allclose(np.asarray(guided), case["guided"], rtol=1e-5, atol=1e-6)
+    assert settings["num_classes"] == CLASSES
+    inputs = InputSpec(Field("image", case["pixels"].shape[1:]), {"textcontext": Condition(labelled())})
+    task = MeanFlowObjective(
+        Tiny(), presets.MeanFlow()(), inputs, ema_decay=None, instantaneous=settings["data_proportion"],
+        omega=settings["omega"], kappa=settings["kappa"],
+        guidance_interval=(settings["t_start"], settings["t_end"]), norm_p=settings["norm_p"],
+        norm_eps=settings["norm_eps"], unconditional_prob=settings["class_dropout_prob"])
+    drawn = tuple(jnp.asarray(case[name]) for name in ("later", "earlier", "noise", "uniform"))
+    monkeypatch.setattr(MeanFlowObjective, "_draws", lambda self, key, count, shape: drawn)
+    variables = task.init(jax.random.PRNGKey(0))
+    batch = {"image": case["pixels"], **inputs.tokenize([str(int(label)) for label in case["classes"]])}
+    step = Step(step=jnp.asarray(0), key=jax.random.PRNGKey(1), ema=None)
 
-    labels = jnp.asarray(case["labels"])
-    u, target = mean_flow_target(
-        lambda z, t, r: tiny(z, t, t - r, labels), z, t, r, jnp.asarray(case["dropped"])
-    )
-    loss = jnp.mean(adaptive_loss(u, target, settings["norm_p"], settings["norm_eps"]))
-    np.testing.assert_allclose(float(loss), float(case["loss"]), rtol=1e-5)
+    def loss(weights):
+        return task.scalar_loss({**variables, "params": {"weights": weights}}, batch, step)[0]
 
-
-def test_the_first_fraction_of_rows_is_instantaneous():
-    t, r = intervals(jnp.asarray([0.2, 0.9, 0.5, 0.1]), jnp.asarray([0.6, 0.3, 0.4, 0.7]), 0.5)
-    np.testing.assert_array_equal(np.asarray(t), np.float32([0.6, 0.9, 0.5, 0.7]))
-    np.testing.assert_array_equal(np.asarray(r), np.float32([0.6, 0.9, 0.4, 0.1]))
+    value, gradient = jax.value_and_grad(loss)(jnp.asarray(case["weights"]))
+    np.testing.assert_allclose(float(value), float(case["loss_f64"]), rtol=1e-6)
+    assert_as_exact_as_the_reference(gradient, case["grad"], case["grad_f64"], f"gradient at norm_p {power}")
 
 
 def objective(**fields):
@@ -153,7 +167,7 @@ def test_a_run_config_trains_meanflow_and_its_saved_task_samples_in_one_step(tmp
     state, *_ = trainer.compile(state, batch)(state, batch)
     run = tmp_path / "run"
     checkpoints = Checkpoints(str(run))
-    checkpoints.save(1, state, None)
+    checkpoints.save(1, state, None, artifact=task.inference_record())
     checkpoints.wait()
     config.save(str(run))
     expected = task.pipeline(state, ema=False)(["a red bird"], key=9).host().images

@@ -67,9 +67,9 @@ class DeterministicObjective(Objective):
     def init(self, key, variables=None):
         return self.model.init(key, jnp.ones((1, RES, RES, 3)), jnp.zeros((1,)))
 
-    def loss(self, params, batch, step):
+    def loss(self, variables, batch, step):
         data = unit_range(batch["image"])
-        preds = self.model.apply(params, data, jnp.zeros((data.shape[0],), jnp.float32))
+        preds = self.model.apply(variables, data, jnp.zeros((data.shape[0],), jnp.float32))
         return jnp.mean((preds - data) ** 2), Aux({})
 
     def evaluate(self, params, batch, step):
@@ -149,7 +149,7 @@ def reference_losses(trainer, steps):
     objective, optimizer = trainer.objective, trainer.optimizer
     state = trainer.initial_state()
     device = jax.devices()[0]
-    params = jax.device_put(state.params, device)
+    params = jax.device_put(state.variables, device)
     opt_state = jax.device_put(state.opt_state, device)
 
     @jax.jit
@@ -353,8 +353,8 @@ class Indivisible(Objective):
     def init(self, key, variables=None):
         return IndivisibleModel().init(key, jnp.ones((1, 15)))
 
-    def loss(self, params, batch, step):
-        return jnp.sum(IndivisibleModel().apply(params, batch["image"][:, 0, 0, :]) ** 2), Aux({})
+    def loss(self, variables, batch, step):
+        return jnp.sum(IndivisibleModel().apply(variables, batch["image"][:, 0, 0, :]) ** 2), Aux({})
 
 
 def build_indivisible(tolerance):
@@ -375,7 +375,7 @@ def test_sharding_tolerance_names_the_largest_replicated_parameter():
 
 def test_sharding_tolerance_can_allow_intentional_replication():
     state = build_indivisible(tolerance=1.0)
-    assert state.params["params"]["indivisible"]["kernel"].sharding.spec == P()
+    assert state.variables["params"]["indivisible"]["kernel"].sharding.spec == P()
 
 
 def test_the_layout_default_tolerance_is_two_percent():
@@ -537,7 +537,7 @@ def test_fsdp_losses_match_replicated():
 
 def test_fsdp_shards_parameters_and_optimizer_state():
     state = make_trainer(fsdp=2).fit(Data(batches), steps=1, log_every=1)
-    leaves = jax.tree.leaves(state.params)
+    leaves = jax.tree.leaves(state.variables)
     sharded = [x for x in leaves if 'fsdp' in str(x.sharding.spec)]
     assert sharded, "no parameter was sharded over the fsdp axis"
 
@@ -559,8 +559,8 @@ def test_fsdp_shards_parameters_and_optimizer_state():
     def specs(tree):
         return [x.sharding.spec for x in jax.tree.leaves(tree)]
 
-    assert specs(state.params["params"]) == specs(state.opt_state[0].mu)
-    assert specs(state.params) == specs(state.ema)
+    assert specs(state.variables["params"]) == specs(state.opt_state[0].mu)
+    assert specs(state.variables) == specs(state.ema)
 
 
 def test_muon_masked_optimizer_state_shards_with_its_parameters():
@@ -577,7 +577,7 @@ def test_muon_masked_optimizer_state_shards_with_its_parameters():
         state.opt_state, is_leaf=is_placeholder) if is_placeholder(leaf)]
     assert placeholders, "muon left no masked placeholder for the derivation to carry"
 
-    kernel = state.params["params"]["dit_block_0"]["mlp"]["layers_0"]["kernel"]
+    kernel = state.variables["params"]["dit_block_0"]["mlp"]["layers_0"]["kernel"]
     assert kernel.sharding.spec == P(None, "fsdp")
     moment_specs = {leaf.sharding.spec for leaf in jax.tree.leaves(state.opt_state)}
     assert kernel.sharding.spec in moment_specs
@@ -585,7 +585,7 @@ def test_muon_masked_optimizer_state_shards_with_its_parameters():
 
 def test_replicated_run_shards_nothing():
     state = make_trainer(fsdp=1).fit(Data(batches), steps=0)
-    for leaf in jax.tree.leaves(state.params):
+    for leaf in jax.tree.leaves(state.variables):
         assert leaf.sharding.spec == P()
 
 
@@ -598,8 +598,8 @@ def test_sharded_checkpoint_roundtrips(tmp_path):
     restored = make_trainer(tmp_path, fsdp=2).fit(Data(batches), steps=1)
 
     assert int(restored.step) == 1
-    for before, after in zip(jax.tree.leaves(trained.params),
-                             jax.tree.leaves(restored.params), strict=True):
+    for before, after in zip(jax.tree.leaves(trained.variables),
+                             jax.tree.leaves(restored.variables), strict=True):
         assert before.sharding.spec == after.sharding.spec
         np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
 
@@ -610,10 +610,10 @@ def test_checkpoint_restores_onto_a_different_mesh(tmp_path):
     restored = make_trainer(tmp_path, fsdp=1).fit(Data(batches), steps=1)
 
     assert int(restored.step) == 1
-    for leaf in jax.tree.leaves(restored.params):
+    for leaf in jax.tree.leaves(restored.variables):
         assert leaf.sharding.spec == P()
-    for before, after in zip(jax.tree.leaves(trained.params),
-                             jax.tree.leaves(restored.params), strict=True):
+    for before, after in zip(jax.tree.leaves(trained.variables),
+                             jax.tree.leaves(restored.variables), strict=True):
         np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
 
 
@@ -628,9 +628,9 @@ def test_a_checkpoint_restores_across_the_whole_fsdp_range(tmp_path, written, re
     """
     trained = make_trainer(tmp_path, fsdp=written).fit(Data(batches), steps=1, log_every=1)
     before = {field: [np.asarray(leaf).copy() for leaf in jax.tree.leaves(getattr(trained, field))]
-              for field in ("params", "ema")}
+              for field in ("variables", "ema")}
     assert any(not np.array_equal(average, live) for average, live
-               in zip(before["ema"], before["params"], strict=True)), "the EMA is its weights"
+               in zip(before["ema"], before["variables"], strict=True)), "the EMA is its weights"
 
     reopened = make_trainer(tmp_path, fsdp=restored).fit(Data(batches), steps=1)
     assert int(reopened.step) == 1
@@ -694,13 +694,13 @@ def test_gradient_accumulation_updates_only_on_the_boundary():
     accum = 3
     trainer = make_accumulating(accumulation=accum)
     state = trainer.initial_state()
-    reference = snapshot(state.params)
+    reference = snapshot(state.variables)
     for micro in range(1, accum * 2 + 1):
         state = micro_steps(trainer, 1, state)
         at_boundary = micro % accum == 0
-        assert moved(reference, snapshot(state.params)) == at_boundary, f"micro-step {micro}"
+        assert moved(reference, snapshot(state.variables)) == at_boundary, f"micro-step {micro}"
         if at_boundary:
-            reference = snapshot(state.params)
+            reference = snapshot(state.variables)
 
 
 def test_ema_moves_only_on_accumulation_boundaries():
@@ -730,8 +730,8 @@ def test_accumulated_ema_matches_a_plain_run_at_equal_update_counts():
     accumulated = micro_steps(make_accumulating(accumulation=accum), updates * accum)
 
     # the comparison is only meaningful if the EMA left its starting point
-    assert moved(snapshot(plain.params), snapshot(plain.ema))
-    for a, b in zip(jax.tree.leaves(plain.params), jax.tree.leaves(accumulated.params), strict=True):
+    assert moved(snapshot(plain.variables), snapshot(plain.ema))
+    for a, b in zip(jax.tree.leaves(plain.variables), jax.tree.leaves(accumulated.variables), strict=True):
         np.testing.assert_allclose(np.asarray(a), np.asarray(b), rtol=1e-6, atol=1e-7)
     for a, b in zip(jax.tree.leaves(plain.ema), jax.tree.leaves(accumulated.ema), strict=True):
         np.testing.assert_allclose(np.asarray(a), np.asarray(b), rtol=1e-6, atol=1e-7)
@@ -757,9 +757,9 @@ def test_a_resume_inside_an_accumulation_window_keeps_the_ema_clock(tmp_path):
     resumed = make_accumulating(tmp_path / "split", accum).fit(Data(batches), steps=total)
 
     assert int(resumed.step) == int(whole.step) == total
-    assert moved(snapshot(whole.params), snapshot(whole.ema))
-    for expected, actual in zip(jax.tree.leaves(whole.params),
-                                jax.tree.leaves(resumed.params), strict=True):
+    assert moved(snapshot(whole.variables), snapshot(whole.ema))
+    for expected, actual in zip(jax.tree.leaves(whole.variables),
+                                jax.tree.leaves(resumed.variables), strict=True):
         np.testing.assert_allclose(np.asarray(expected), np.asarray(actual),
                                    rtol=1e-6, atol=1e-7)
     for expected, actual in zip(jax.tree.leaves(whole.ema),

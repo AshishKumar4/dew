@@ -539,7 +539,7 @@ def one_step(spec, batch, tolerance=0.02, model=tiny):
     placed = shard_batch(trainer.device_mesh, batch)
     state, loss, _, _, _ = trainer.compile(state, placed)(state, placed)
     assert trainer.program is not None
-    return float(loss), jax.tree.map(np.asarray, state.params["params"]), trainer.program.as_text()
+    return float(loss), jax.tree.map(np.asarray, state.variables["params"]), trainer.program.as_text()
 
 
 def assert_same_step(whole, split):

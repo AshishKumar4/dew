@@ -2,14 +2,24 @@
 
 Nothing here asserts reconstruction quality: what matters is the contract the
 samplers and input config depend on (the advertised latent geometry, video
-flattening, and the latent normalization seam).
+flattening, and the latent normalization seam). The last tests hold that
+contract to Diffusers' own VAE, posterior and SD3 pipeline normalization
+(tests/fixtures/vae/contract.npz, tools/autoencoder_contract_reference.py).
 """
+
+import json
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
+from reference_error import assert_as_exact_as_the_reference
 
 from dew.nn.autoencoders import AutoencoderKL, StableDiffusionVAE
+from dew.nn.autoencoders.kl import posterior_latent
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures" / "vae"
 
 IMAGE_SIZE = 8
 
@@ -76,3 +86,48 @@ def test_latent_normalization_is_inverted_by_decode(autoencoder, image):
     assert jnp.allclose(latent, (raw_latent - 0.3) * 2.5, atol=1e-5)
     assert jnp.allclose(normalized.decode(normalized.params, latent),
                         autoencoder.decode(autoencoder.params, raw_latent), atol=1e-5)
+
+
+@pytest.fixture(scope="module")
+def contract():
+    with np.load(FIXTURES / "contract.npz") as loaded:
+        return dict(loaded)
+
+
+@pytest.fixture(scope="module")
+def sd3_tiny():
+    return StableDiffusionVAE(str(FIXTURES / "sd3-tiny"), dtype=jnp.float32)
+
+
+def test_a_clip_samples_and_normalizes_as_diffusers_does_frame_by_frame(contract, sd3_tiny):
+    """A clip's frames encoded as one `[B, T]` batch draw the latent SD3's
+    img2img pipeline draws for each frame as an image (`retrieve_latents`,
+    then `(z - shift) * scale`), from one standard normal draw, and their
+    normalized means are its: by the float64 rule, against Diffusers'
+    own VAE and posterior."""
+    batch, frames, height, width = json.loads(contract["meta"].tobytes())["clip"]
+    clip = jnp.asarray(contract["frames"]).reshape(batch, frames, height, width, 3)
+    sampled = sd3_tiny.encode(sd3_tiny.params, clip, key=jax.random.key(7))
+    mean = sd3_tiny.encode(sd3_tiny.params, clip)
+    assert sampled.shape[:2] == (batch, frames)
+    for name, value in (("latents", sampled), ("normalized_mean", mean)):
+        assert_as_exact_as_the_reference(np.asarray(value).reshape(-1, *value.shape[2:]),
+                                         contract[f"fp32.{name}"], contract[f"fp64.{name}"], name)
+
+
+def test_a_clip_decodes_as_diffusers_decodes_its_frames(contract, sd3_tiny):
+    """Normalized latents of a clip decode to what Diffusers' VAE decodes of
+    each frame's latent taken back SD3's way (`z / scale + shift`)."""
+    latents = jnp.asarray(contract["fp32.normalized_mean"])
+    clip = latents.reshape(2, 3, *latents.shape[1:])
+    decoded = sd3_tiny.decode(sd3_tiny.params, clip)
+    assert_as_exact_as_the_reference(np.asarray(decoded).reshape(-1, *decoded.shape[2:]),
+                                     contract["fp32.decoded"], contract["fp64.decoded"], "decoded")
+
+
+def test_a_posterior_draw_clamps_its_log_variance_as_diffusers_does(contract):
+    """`posterior_latent` against `DiagonalGaussianDistribution.sample` from
+    one draw, on log-variances past the [-30, 20] clamp on both sides."""
+    drawn = posterior_latent(jnp.asarray(contract["moments"]), jax.random.key(7))
+    assert_as_exact_as_the_reference(np.asarray(drawn), contract["fp32.posterior"],
+                                     contract["fp64.posterior"], "posterior")

@@ -160,19 +160,6 @@ def _clip_scale(s_max: jax.Array, tau: float) -> jax.Array:
     return jnp.where(s_max > 0, jnp.minimum(1.0, tau / (s_max + 1e-6)), 1.0)
 
 
-def _query_widths(params) -> dict[tuple[str, ...], int]:
-    """Read each module's query-projection width off the static shapes.
-
-    A key projection's head count is measured against it."""
-    widths = {}
-    for path, leaf in jax.tree_util.tree_leaves_with_path(params):
-        names = _dict_names(path)
-        if (len(names) >= 2 and names[-1] == 'kernel'
-                and names[-2] in ('q_proj', 'q_b_proj')):
-            widths[tuple(names[:-2])] = leaf.shape[-1]
-    return widths
-
-
 def _rescaled_update(update: jax.Array, param: jax.Array, gamma: jax.Array,
                      split: int) -> jax.Array:
     """Rescale one update so that applying it rescales the weights by `gamma`.
@@ -208,9 +195,19 @@ def _mla_key_gamma(scale: jax.Array, nope: jax.Array, width: int) -> jax.Array:
                      jnp.ones((), scale.dtype))
 
 
-def _clip_leaf(qk_stats, tau: float, qdims: dict[tuple[str, ...], int],
-               path: jax.tree_util.KeyPath, update: jax.Array,
-               param: jax.Array) -> jax.Array:
+def _qk_normed(params) -> set[tuple[str, ...]]:
+    """The layers whose parameters hold a query or key norm (`q_norm`,
+    `k_norm`), read off the tree's paths."""
+    layers = set()
+    for path, _ in jax.tree_util.tree_leaves_with_path(params):
+        names = _dict_names(path)
+        if len(names) >= 2 and names[-2] in ('q_norm', 'k_norm'):
+            layers.add(names[:-2])
+    return layers
+
+
+def _clip_leaf(qk_stats, tau: float, normed: set[tuple[str, ...]], path: jax.tree_util.KeyPath,
+               update: jax.Array, param: jax.Array) -> jax.Array:
     """Fold QK-Clip's post-step weight rescale into one leaf's update.
 
     The clip acts on the weights after the step, `gamma * (W + update)`.
@@ -220,19 +217,30 @@ def _clip_leaf(qk_stats, tau: float, qdims: dict[tuple[str, ...], int],
 
     Leaves outside `QK_PROJECTIONS` keep their update. A named leaf whose
     layer sowed no maxima raises naming the layer, since stepping it
-    unclipped would train a different model than the maxima describe.
+    unclipped would train a different model than the maxima describe. So
+    does one whose layer norms its queries or keys (`normed`): the norm
+    divides any scale of the kernels back out, so no rescale of them moves
+    the logits, which the norm's own scales bound instead.
 
-    Queries rescale per head over the whole projection, the gate half of an
-    output-gated projection with its query head, and the latent query's rope
-    slice by the full gamma. Keys rescale per head where the head count is
-    known from static shapes: equal query and key widths are multi-head
-    attention. Anything else is grouped-query attention, whose per-group
-    minima need the group count where only dynamic values cross. There the
-    whole projection takes the layer's strongest head, the conservative
-    side: it never under-clips."""
+    Queries and keys rescale per query group, as Megatron Core's
+    `SelfAttention.clip_qk` does (attention.py at core_v0.19.2), multi-head
+    attention being the group of one: the group's rescale is the smallest
+    of its heads', tau over its largest logit, and its query heads and its
+    key head each take the square root, so every logit of the group scales
+    by it. The layer sows its key-head count (`kv_heads`) and head width
+    (`head_dim`) beside the maxima. An output-gated projection's head is its
+    query and then its gate, and the gate keeps its weights: it is no
+    logit, and the paper rescales the query and key weights alone. Latent
+    attention rescales per head instead, the rope slice of its query by the
+    full gamma."""
     names = _dict_names(path)
     if len(names) < 2 or names[-1] != 'kernel' or names[-2] not in QK_PROJECTIONS:
         return update
+    if names[:-2] in normed:
+        raise ValueError(
+            f"QK-Clip reaches {'.'.join(names)}, whose layer norms its queries and keys: the "
+            "norm divides the kernels' scale back out of the logits, so the clip cannot bound "
+            "them. Train this model with 'muon', or build it with qk_norm=False")
     node = qk_stats
     for name in names[:-2]:
         node = node.get(name) if isinstance(node, Mapping) else None
@@ -254,10 +262,7 @@ def _clip_leaf(qk_stats, tau: float, qdims: dict[tuple[str, ...], int],
             f"{heads} heads")
     proj = names[-2]
     nope = _sown(node, 'qk_nope')
-    if proj in ('q_proj', 'q_b_proj'):
-        if nope is None:
-            return _rescaled_update(update, param, jnp.sqrt(scale)[:, None],
-                                    heads)
+    if proj in ('q_proj', 'q_b_proj') and nope is not None:
         return _rescaled_update(
             update, param, _mla_query_gamma(scale, nope, last // heads), heads)
     if proj == 'kv_b_proj':
@@ -267,16 +272,29 @@ def _clip_leaf(qk_stats, tau: float, qdims: dict[tuple[str, ...], int],
                 "a latent key projection needs its layer's 'qk_nope'")
         return _rescaled_update(
             update, param, _mla_key_gamma(scale, nope, last // heads), heads)
-    width = qdims.get(tuple(names[:-2]))
-    if width is not None and width == last:
-        return _rescaled_update(update, param, jnp.sqrt(scale)[:, None], heads)
-    scoped = jnp.min(scale).astype(update.dtype)
-    return (scoped - 1) * param + scoped * update
+    kv_heads, head_dim = _sown(node, 'kv_heads'), _sown(node, 'head_dim')
+    if kv_heads is None or head_dim is None:
+        raise ValueError(
+            f"QK-Clip reaches {'.'.join(names)} with no key-head count or head width "
+            "sowed; a query or key projection needs its layer's 'kv_heads' and 'head_dim'")
+    # Query head h is in group h // (heads / kv_heads), the grouping the
+    # kernels repeat the keys over, and group g's rescale lands at index g.
+    # `kv_heads` stays a traced value, so only the shapes are static.
+    groups = jnp.arange(heads) // (heads // kv_heads)
+    grouped = jax.ops.segment_min(scale, groups, num_segments=heads)
+    if proj in ('q_proj', 'q_b_proj'):
+        query = jnp.arange(last // heads)[None, :] < head_dim
+        gamma = jnp.where(query, jnp.sqrt(grouped[groups])[:, None], jnp.ones((), scale.dtype))
+        return _rescaled_update(update, param, gamma, heads)
+    columns = jnp.arange(last) // (last // kv_heads)
+    return _rescaled_update(update, param, jnp.sqrt(grouped[columns])[None], 1)
+
 
 def scale_by_qk_clip(tau: float = 100.0) -> optax.GradientTransformationExtraArgs:
     """Rescale the query and key projections of every head past `tau`.
 
-    This is Kimi K2's MuonClip (arXiv 2507.20534), applied after the update.
+    This is Kimi K2's MuonClip (arXiv 2507.20534), applied after the update,
+    per query group under grouped-query attention as Megatron Core clips it.
 
     The per-head maxima arrive as `qk_stats`, the `qk` collection the model
     sowed, which the trainer forwards from the loss's `Aux`. Without them
@@ -293,8 +311,7 @@ def scale_by_qk_clip(tau: float = 100.0) -> optax.GradientTransformationExtraArg
         if qk_stats is None or params is None:
             return updates, state
         clipped = jax.tree_util.tree_map_with_path(
-            functools.partial(_clip_leaf, qk_stats, tau, _query_widths(params)),
-            updates, params)
+            functools.partial(_clip_leaf, qk_stats, tau, _qk_normed(params)), updates, params)
         return clipped, state
 
     return optax.GradientTransformationExtraArgs(init_fn, update_fn)

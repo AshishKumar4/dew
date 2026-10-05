@@ -145,6 +145,16 @@ def pipeline(source):
     return Pretrained.load(str(source / "pipeline"), dtype="float32", attention_impl="xla")
 
 
+@pytest.fixture(scope="module")
+def streamed(source):
+    """The pipeline loaded onto a mesh, its weights streamed as recipes and
+    placed a leaf at a time (tests/test_pipeline_streaming.py)."""
+    from dew.interop.pretrained import Pretrained
+    from dew.training import MeshSpec
+
+    return Pretrained.load(str(source / "pipeline"), dtype="float32", attention_impl="xla", mesh=MeshSpec())
+
+
 def test_prompt_encoding_matches_the_source_pipeline(pipeline, arrays, record):
     """The conditioner reads what `_encode_prompt` reads: the chat template
     with thinking on, the output of the encoder's second-to-last layer, and
@@ -160,10 +170,13 @@ def test_prompt_encoding_matches_the_source_pipeline(pipeline, arrays, record):
         assert relative_gap(condition.context[row, :length], expected) < FORWARD, row
 
 
-def test_pipeline_walk_matches_the_source(pipeline, arrays, record):
+@pytest.mark.parametrize("load", ["pipeline", "streamed"])
+def test_pipeline_walk_matches_the_source(load, arrays, record, request):
     """`Pretrained.load().text_to_image()` reproduces the source's call: its
     50 default steps guided at 5.0 its way, which is Dew's 6.0, and at the
-    recorded step count the latent it ends on and the image it decodes."""
+    recorded step count the latent it ends on and the image it decodes,
+    loaded whole or streamed onto a mesh."""
+    pipeline = request.getfixturevalue(load)
     recorded = record["pipeline"]
     task = pipeline.text_to_image()
     assert task.steps == 50 and task.guidance is not None and task.guidance.scale == recorded["guidance"] + 1

@@ -38,6 +38,7 @@ The five families are the shapes those `set_timesteps` take:
 """
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -51,7 +52,7 @@ from dew import records
 from dew.diffusion.process import Process
 from dew.diffusion.schedules.common import NoiseScheduler
 from dew.diffusion.schedules.discrete import DiscreteNoiseScheduler
-from dew.diffusion.schedules.flow import FlowMatchingScheduler
+from dew.diffusion.schedules.flow import FlowMatchingScheduler, _token_mu
 from dew.diffusion.schedules.karras import EDMNoiseScheduler
 from dew.diffusion.schedules.source_grids import FlowGrid, SigmaGrid, StageSigmaGrid, TabulatedVP, VPGrid
 from dew.diffusion.transforms import (
@@ -352,8 +353,7 @@ class _Flow:
         mu is interpolated linearly in the token count and is not
         exponentiated here.
         """
-        slope = (self.max_shift - self.base_shift) / (self.max_tokens - self.base_tokens)
-        return tokens * slope + self.base_shift - slope * self.base_tokens
+        return _token_mu(tokens, self.base_tokens, self.max_tokens, self.base_shift, self.max_shift)
 
     def base(self, tokens: int | None, mu: float | None = None) -> float:
         """The shift this file names at `tokens` latent tokens, or at the
@@ -370,7 +370,9 @@ class _Flow:
                 raise ValueError("Dynamic shifting needs the latent token count; bind the "
                                  "geometry through the task's grid")
             mu = self.mu(tokens)
-        return float(np.exp(mu)) if self.kind == "exponential" else mu
+        # math.exp, as Diffusers' `_time_shift_exponential` takes it: numpy's
+        # SIMD exp rounds differently on AVX-512 machines, by an ulp here.
+        return math.exp(mu) if self.kind == "exponential" else mu
 
     def shifted(self, sigmas: np.ndarray, tokens: int | None, mu: float | None = None) -> np.ndarray:
         """The sigmas after this file's shift."""

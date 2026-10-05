@@ -78,13 +78,7 @@ def sample[StateT](
     from dew.nn.inputs import request_key
     key = request_key(key)
     process = denoise.process
-    if guidance is not None and not isinstance(denoise, Denoiser):
-        raise TypeError("guidance needs a continuous Denoiser; the masked diffusion LM takes none")
 
-    def walked(denoiser):
-        return Walk.stateless(denoiser) if guidance is None else guidance.walk(denoiser)
-
-    walk = walked(denoise)
     # A process whose model predicts over an interval reads, at each step,
     # the interval to the next grid point.
     spanned = denoise if isinstance(denoise, Denoiser) and denoise.process.interval else None
@@ -98,10 +92,12 @@ def sample[StateT](
                 raise ValueError(f"times must be a descending grid of at least one point, got {times.shape}")
         if bool(jnp.any(~jnp.isfinite(times))) or bool(jnp.any(jnp.diff(times) > 0)):
             raise ValueError("times must be a finite descending grid")
+    count = times.shape[0] - 1
+    walk = Walk.over(denoise, guidance, count)
     batch = x_T.shape[0]
     guided = walk.init(x_T)
     if times.shape[0] == 1:
-        return walk.at(guided)(x_T, jnp.full((batch,), times[0]))[0] if final_denoise else x_T
+        return walk.at(guided, count)(x_T, jnp.full((batch,), times[0]))[0] if final_denoise else x_T
 
     with jax.ensure_compile_time_eval():
         initial = solver.init(x_T, times, process, key=key)
@@ -111,10 +107,10 @@ def sample[StateT](
         t, t_next, index = inputs
         t = jnp.full((batch,), t)
         t_next = jnp.full((batch,), t_next)
-        stepping = walk if spanned is None else walked(spanned.spanning(t, t_next))
-        (denoised, eps), guided = stepping.step(x, t, guided)
+        stepping = walk if spanned is None else Walk.over(spanned.spanning(t, t_next), guidance, count)
+        (denoised, eps), guided = stepping.step(x, t, index, guided)
         x, state = solver.step(x, t, t_next, denoised, eps, state, jax.random.fold_in(key, index),
-                               process, stepping.at(guided))
+                               process, stepping.at(guided, index))
         return (x, state, guided), None
 
     (x, _, guided), _ = lax.scan(
@@ -122,4 +118,4 @@ def sample[StateT](
         (times[:-1], times[1:], jnp.arange(times.shape[0] - 1)))
     if not final_denoise:
         return x
-    return walk.at(guided)(x, jnp.full((batch,), times[-1]))[0]
+    return walk.at(guided, count)(x, jnp.full((batch,), times[-1]))[0]

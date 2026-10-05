@@ -121,7 +121,7 @@ def measure(depth: int, scan: bool, config: StackConfig, counter: CompileCounter
             "stage": config.stage,
             "microbatches": config.microbatches,
             "fsdp": config.fsdp,
-            "params": parameter_count(state.params),
+            "params": parameter_count(state.variables),
             "compile_seconds": round(compile_seconds, 2),
             "compilations": counter.steps,
             "ms_per_step": round(elapsed / config.steps * 1e3, 2),

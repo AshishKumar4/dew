@@ -1,6 +1,6 @@
-"""Shortcut models against kvfrans/shortcut-models' `get_targets`
-(`tools/shortcut_reference.py`), and the objective and run config around
-them."""
+"""Shortcut models against kvfrans/shortcut-models' `get_targets` and the
+loss its `update` takes (`tools/shortcut_reference.py`), and the run config
+around them."""
 
 import json
 from pathlib import Path
@@ -9,41 +9,85 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+from flax import linen as nn
+from reference_error import assert_as_exact_as_the_reference
 
 from dew.diffusion import presets
-from dew.objectives.diffusion.few_step import ShortcutObjective, shortcut_levels, shortcut_target
+from dew.inputs import CharTable, Condition, Field, InputSpec
+from dew.objectives.base import Step
+from dew.objectives.diffusion.few_step import ShortcutObjective
 
 CASE = np.load(Path(__file__).resolve().parent / "fixtures" / "shortcut" / "targets.npz")
 SETTINGS = json.loads(str(CASE["settings"]))
 
 
-def reference(x, t, level, labels):
-    """`tools/shortcut_reference.py`'s velocity, data minus noise, in the
-    reference's time and step level."""
-    def column(value):
-        return jnp.asarray(value, jnp.float32).reshape(-1, 1, 1, 1)
+class Tiny(nn.Module):
+    """`tools/shortcut_reference.py`'s velocity in Dew's convention: Dew's
+    sigma is 1 - t and its velocity noise minus data, the reference's
+    negated; the model times are sigma and the step times 1000, a step of
+    2^-level being the reference's level; and the class is the condition's
+    second token, whose table entry is the class."""
 
-    return (jnp.tanh(x) * 0.5 + jnp.sin(2 * column(t)) * x * 0.3
-            + 0.1 * column(level) * jnp.cos(x) + 0.05 * column(labels))
+    @nn.compact
+    def __call__(self, x, time, textcontext, duration=None, train=False):
+        def column(value):
+            return value.reshape(-1, 1, 1, 1)
+
+        # The objective initializes the model without a duration.
+        duration = 1000 * jnp.ones_like(time) if duration is None else duration
+        t, level, y = 1 - time / 1000, jnp.round(jnp.log2(1000 / duration)), textcontext.hidden[:, 1, 0]
+        weights = self.param("weights", nn.initializers.zeros, (4, *x.shape[1:]))
+        return -(jnp.tanh(x) * weights[0] + jnp.sin(2 * column(t)) * x * weights[1]
+                 + column(level) * jnp.cos(x) * weights[2] + column(y) * weights[3])
 
 
-def test_the_self_consistency_targets_are_the_references():
-    """Dew's sigma is 1 - t and its velocity noise minus data, the
-    reference's negated; a step of 2^-level is the reference's level. On the
-    reference's draws the levels and every bootstrapped target agree."""
-    rows = SETTINGS["batch_size"] // SETTINGS["bootstrap_every"]
-    levels = shortcut_levels(rows, SETTINGS["denoise_timesteps"])
-    np.testing.assert_array_equal(np.asarray(levels), CASE["level"][:rows])
-    labels = jnp.asarray(CASE["classes"][:rows])
+def labelled() -> CharTable:
+    """Character tables of one feature: the digit k reads k, and the padding
+    id 0 reads the null class."""
+    table = CharTable.from_pretrained(tokens=2, features=1)
+    entries = np.zeros((table.vocab, 1), np.float32)
+    entries[0] = SETTINGS["num_classes"]
+    for digit in range(SETTINGS["num_classes"]):
+        entries[table.tokenize([str(digit)])["input_ids"][0, 1]] = digit
+    return CharTable.from_pretrained(tokens=2, features=1, params={"table": jnp.asarray(entries)})
 
-    def velocity(x, sigma, following):
-        return -reference(x, 1 - sigma, jnp.log2(1 / (sigma - following)), labels)
 
-    target = shortcut_target(velocity, jnp.asarray(CASE["x_t"][:rows]), 1 - jnp.asarray(CASE["t"][:rows]),
-                             2.0 ** -levels)
-    # Dyadic times and steps map exactly; the rest is the same float32
-    # arithmetic with the sign flipped.
-    np.testing.assert_allclose(np.asarray(target), -CASE["v_t"][:rows], rtol=1e-6, atol=1e-6)
+def test_the_loss_and_its_gradient_are_the_references(monkeypatch):
+    """`ShortcutObjective.loss` on the reference's own draws: the
+    self-consistency rows' levels and dyadic times, their targets two half
+    steps of the EMA weights, the flow-matching rows on the finest grid with
+    their condition dropped, the path whose noise keeps 1e-5 at the data
+    end, and the mean squared error. The loss within 1e-6 of the reference's
+    float64 run and the gradient in the network's 192 weights held to it by
+    the float64 rule."""
+    count = SETTINGS["batch_size"]
+    rows = count // SETTINGS["bootstrap_every"]
+    inputs = InputSpec(Field("image", CASE["pixels"].shape[1:]), {"textcontext": Condition(labelled())})
+    task = ShortcutObjective(Tiny(), presets.Shortcut()(), inputs, sections=SETTINGS["denoise_timesteps"],
+                             bootstrap_every=SETTINGS["bootstrap_every"],
+                             unconditional_prob=SETTINGS["class_dropout_prob"])
+    # The reference draws its self-consistency rows and its flow rows apart
+    # and keeps the first of the flow draws, and its flow rows take the
+    # batch's first images again, as its self-consistency rows do; here each
+    # row holds the image and draws the reference gave it.
+    images = np.concatenate([np.arange(rows), np.arange(count - rows)])
+    drawn = (jnp.concatenate([CASE["bootstrap_times"], CASE["flow_times"][:count - rows]]),
+             jnp.concatenate([CASE["bootstrap_noise"], CASE["flow_noise"][:count - rows]]),
+             # Self-consistency rows keep their condition whatever they draw.
+             jnp.concatenate([jnp.ones(rows, bool), CASE["dropout"][:count - rows]]))
+    monkeypatch.setattr(ShortcutObjective, "_draws", lambda self, key, count, grid, shape: drawn)
+    variables = task.init(jax.random.PRNGKey(0))
+    teacher = {**variables, "params": {"weights": jnp.asarray(CASE["teacher"])}}
+    batch = {"image": CASE["pixels"][images],
+             **inputs.tokenize([str(int(label)) for label in CASE["classes"][images]])}
+    step = Step(step=jnp.asarray(0), key=jax.random.PRNGKey(1), ema=teacher)
+
+    def loss(weights):
+        return task.scalar_loss({**variables, "params": {"weights": weights}}, batch, step)[0]
+
+    value, gradient = jax.value_and_grad(loss)(jnp.asarray(CASE["weights"]))
+    np.testing.assert_allclose(float(value), float(CASE["loss_f64"]), rtol=1e-6)
+    assert_as_exact_as_the_reference(gradient, CASE["grad"], CASE["grad_f64"], "gradient")
 
 
 def test_a_run_config_trains_a_shortcut_model_on_its_own_targets():

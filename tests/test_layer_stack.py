@@ -209,8 +209,8 @@ def test_runs_of_like_layers_scan_and_the_rest_unroll(shape):
     training = gemma3n_training_variables(variables) if shape == "gemma3n" else variables
 
     def measured(model, forward, trained):
-        def loss(params):
-            current = {**trained, "params": params}
+        def loss(variables):
+            current = {**trained, "params": variables}
             if shape == "gemma3n":
                 return next_token_loss(model, current, ids)
             return jnp.mean(model.apply(current, ids) ** 2)

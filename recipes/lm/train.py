@@ -26,6 +26,7 @@ import tyro
 
 from dew.config import ModelConfig
 from dew.data import ByteTokenizer, HFTokenizer, PackedTokens, TokenWindows
+from dew.inference import RunProcessor
 from dew.objectives.lm import LMObjective, LMRunConfig, Perplexity, Samples
 from dew.registry import datasets, models
 from dew.training import TrainState, prepare_process, run_timestamp
@@ -190,10 +191,13 @@ def run_tokenizer(name: str) -> ByteTokenizer | HFTokenizer:
     return ByteTokenizer() if name == "byte" else HFTokenizer(name)
 
 
-def build_samples(config: LmRunConfig) -> Samples | None:
-    """What the objective generates and decodes at every validation."""
+def build_samples(config: LmRunConfig) -> Samples:
+    """What the objective generates and decodes at every validation. The
+    policy is kept with no preview budget too: the run records it, and its
+    export and `dew.pipeline` decode with it."""
     if config.sample_tokens <= 0:
-        return None
+        # No preview, so no tokenizer to read: the policy alone.
+        return Samples(prompt=[], max_new_tokens=0, sampling=config.sampling)
     tokenizer = run_tokenizer(config.tokenizer)
     return Samples(
         prompt=tokenizer.encode(config.sample_prompt or "\n"),
@@ -239,7 +243,8 @@ def build_masked_objective(config: LmRunConfig, model, fields, pretrained):
     decode = None if config.sample_tokens <= 0 else run_tokenizer(config.tokenizer).decode
     return MaskedDiffusionObjective(
         model, MDLM(mask_id=int(mask))(), config.data.seq_len + 1,
-        ema_decay=config.ema_decay, decode=decode, pretrained=pretrained)
+        ema_decay=config.ema_decay, decode=decode, pretrained=pretrained,
+        processor=RunProcessor(run_tokenizer(config.tokenizer)))
 
 
 def build_block_objective(config: LmRunConfig, model, pretrained):
@@ -255,7 +260,8 @@ def build_block_objective(config: LmRunConfig, model, pretrained):
         raise ValueError("seq_len + 1 must equal block_prompt_tokens plus whole training canvases")
     return BlockDiffusionObjective(
         model, prompt_length=config.block_prompt_tokens, num_canvases=response // width,
-        canvas_size=width, pretrained=pretrained, ema_decay=config.ema_decay)
+        canvas_size=width, pretrained=pretrained, ema_decay=config.ema_decay,
+        processor=RunProcessor(run_tokenizer(config.tokenizer)))
 
 
 def main(config: LmRunConfig) -> TrainState:
@@ -307,7 +313,8 @@ def main(config: LmRunConfig) -> TrainState:
     summary = {"model": fields, "arguments": run_summary(config, fields),
                "dataset": {"path": read_corpora(config.data), "records": data.records,
                            "tokens": meta.get("train_tokens")}}
-    validation = (Perplexity(),)
+    # Perplexity scores each validation pass; --trainer.eval-every None runs none.
+    validation = () if config.trainer.eval_interval(data) is None else (Perplexity(),)
     pretrained = None if source is None else source.variables
     if config.objective == "masked_diffusion":
         return config.train(build_masked_objective(config, model, fields, pretrained), data,
@@ -318,6 +325,8 @@ def main(config: LmRunConfig) -> TrainState:
     options = {
         "ema_decay": config.ema_decay,
         "samples": samples,
+        # The run's tokenizer, which its checkpoints record for every loader.
+        "processor": RunProcessor(run_tokenizer(config.tokenizer)),
         "balance_rate": config.balance_rate,
         "aux_loss_alpha": config.aux_loss_alpha,
         "seq_aux": config.seq_aux,

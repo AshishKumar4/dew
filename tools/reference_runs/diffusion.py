@@ -137,14 +137,14 @@ def flaxdiff_side(args, images, total, attention):
     class FixedDraws(DiffusionObjective):
         """flaxdiff's `DiffusionObjective.loss`, the two draws read from the batch."""
 
-        def loss(self, params, ema_params, batch, rng, step):
+        def loss(self, variables, ema_params, batch, rng, step):
             data = (jnp.asarray(batch["image"], dtype=jnp.float32) - 127.5) / 127.5
             noise_level, noise = batch["t"], batch["noise"]
             rates = self.noise_schedule.get_rates(noise_level, get_coeff_shapes_tuple(data))
             noisy_data, c_in, expected_output = self.model_output_transform.forward_diffusion(
                 data, noise, rates)
             inputs = self.noise_schedule.transform_inputs(noisy_data * c_in, noise_level)
-            preds = self.model.apply(params, *inputs, train=True, rngs={"dropout": rng})
+            preds = self.model.apply(variables, *inputs, train=True, rngs={"dropout": rng})
             preds = self.model_output_transform.pred_transform(noisy_data, preds, rates)
             sample_losses = self.loss_fn(preds, expected_output)
             weights = self.noise_schedule.get_weights(noise_level, get_coeff_shapes_tuple(sample_losses))
@@ -167,11 +167,11 @@ def flaxdiff_side(args, images, total, attention):
     state = trainer.state
     init = Path(args.init)
     if not init.exists():
-        save_tree(init, jax.device_get(state.params))
+        save_tree(init, jax.device_get(state.variables))
     initial = load_tree(init)
     params = jax.device_put(initial, trainer.state_sharding.params)
     state = state.replace(
-        params=params, ema_params=jax.device_put(initial, trainer.state_sharding.ema_params),
+        variables=params, ema_params=jax.device_put(initial, trainer.state_sharding.ema_params),
         opt_state=jax.jit(optimizer.init, out_shardings=trainer.state_sharding.opt_state)(params))
     step_fn = trainer._define_train_step(args.batch)
     rng_state = trainer.rngstate
@@ -203,13 +203,13 @@ def dew_side(args, images, total, attention):
     class FixedDraws(DiffusionObjective):
         """Dew's `DiffusionObjective.loss`, the two draws read from the batch."""
 
-        def loss(self, params, batch, step):
+        def loss(self, variables, batch, step):
             samples = unit_range(batch[self.inputs.sample.key])
             schedule = self.process.schedule
             t, noise = batch["t"], batch["noise"]
             rates = broadcast_rates(schedule, t, samples)
             noisy, c_in, target = self.process.prediction.forward_diffusion(samples, noise, rates)
-            preds = self.model.apply(self.model_variables(params), noisy * c_in, schedule.model_time(t),
+            preds = self.model.apply(self.model_variables(variables), noisy * c_in, schedule.model_time(t),
                                      train=True, rngs={"dropout": step.key})
             preds = self.process.prediction.pred_transform(noisy, preds, rates, t)
             losses = optax.l2_loss(preds, target)

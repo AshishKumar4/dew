@@ -136,20 +136,20 @@ def main(config: Config):
     finally:
         stream.close()
     initial = trainer.initial_state()
-    vision_before = jax.tree.map(np.asarray, initial.params["params"]["conditioner"])
+    vision_before = jax.tree.map(np.asarray, initial.variables["params"]["conditioner"])
     score = jax.jit(lambda params, inputs: objective.scalar_loss(params, {"text": inputs},
                    Step(step=jnp.asarray(0), key=jax.random.key(7), ema=None))[0])
-    before = float(score(initial.params, probe["text"]))
+    before = float(score(initial.variables, probe["text"]))
     del initial
     state = trainer.fit(data, steps=config.steps, log_every=1, checkpoint_every=config.steps)
     checkpoints.wait()
-    after = float(score(state.params, probe["text"]))
+    after = float(score(state.variables, probe["text"]))
     changed_pixels = probe["text"].replace(conditioning={**probe["text"].conditioning,
                     "pixel_values": -probe["text"].conditioning["pixel_values"]})
-    changed_loss = float(score(state.params, changed_pixels))
+    changed_loss = float(score(state.variables, changed_pixels))
     vision_delta = max(float(np.max(np.abs(np.asarray(after_leaf) - before_leaf)))
                        for before_leaf, after_leaf in zip(jax.tree.leaves(vision_before),
-                           jax.tree.leaves(state.params["params"]["conditioner"]), strict=True))
+                           jax.tree.leaves(state.variables["params"]["conditioner"]), strict=True))
     if not np.isfinite([before, after, changed_loss, vision_delta]).all():
         raise ValueError("image SFT produced a non-finite loss or parameter change")
     if vision_delta == 0 or changed_loss == after:

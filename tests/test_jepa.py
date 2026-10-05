@@ -113,6 +113,33 @@ def test_block_shapes_and_positions_actually_vary(mask):
     assert len(widths) > 1, "every block came out the same shape"
 
 
+@pytest.mark.parametrize("scan_order", ["raster", "hilbert", "zigzag"])
+def test_every_target_is_a_rectangle_of_the_grid_in_the_encoders_scan_order(scan_order):
+    """The encoder sequences its patches in `scan_order`: a target block's
+    tokens, sent back through that order, cover a whole h x w rectangle of
+    the grid, and the context, sorted in the sequence, sees none of them."""
+    from dew.nn.dit import scan_indices
+
+    mask = MultiBlockMask.for_grid(GRID, num_targets=4, scale=(0.15, 0.2), scan_order=scan_order)
+    order = scan_indices(scan_order, *GRID)
+    grid_of = np.arange(mask.num_patches) if order is None else order
+    context, targets = (np.asarray(part) for part in mask.sample(jax.random.PRNGKey(3), 8))
+    for row, blocks in enumerate(targets):
+        for block in blocks:
+            assert np.all(np.diff(block) > 0), "a target block is not sorted in the sequence"
+            rows, columns = np.divmod(grid_of[block], GRID[1])
+            extent = (rows.max() - rows.min() + 1) * (columns.max() - columns.min() + 1)
+            assert extent == mask.block_area, "a target block is not a rectangle of the grid"
+        assert np.all(np.diff(context[row]) > 0)
+        assert not set(context[row]) & set(blocks.reshape(-1))
+
+
+def test_an_objective_refuses_a_mask_in_another_scan_order(mask):
+    with pytest.raises(ValueError, match="one scan order"):
+        JepaObjective(make_encoder(scan_order="hilbert"), make_predictor(scan_order="hilbert"), mask,
+                      sample=Field("image", (RES, RES, 3)))
+
+
 def test_geometry_that_cannot_exist_is_rejected():
     with pytest.raises(ValueError, match="aspect ratio"):
         MultiBlockMask.for_grid((4, 4), num_targets=2, scale=(0.18, 0.19))
@@ -280,7 +307,7 @@ def test_training_makes_the_prediction_depend_on_the_context(mask):
                                 momentum=(0.9, 0.99), momentum_steps=150)
     objective = trainer.objective
     initial = trainer.initial_state()
-    before = context_ablation(objective, initial.params, initial.ema,
+    before = context_ablation(objective, initial.variables, initial.ema,
                               normalized_test, mask, jax.random.PRNGKey(9))
     assert before[1] / before[0] < 1.5, "a fresh predictor should not favour any context"
 
@@ -290,7 +317,7 @@ def test_training_makes_the_prediction_depend_on_the_context(mask):
 
     state = trainer.fit(Data(batches, batch=16), steps=150, log_every=50)
 
-    after = context_ablation(objective, state.params, state.ema,
+    after = context_ablation(objective, state.variables, state.ema,
                              normalized_test, mask, jax.random.PRNGKey(9))
     assert after[0] < before[0] / 2, "held-out prediction error did not improve"
     assert after[1] / after[0] > 5.0, "the predictor still ignores its context"
@@ -410,7 +437,7 @@ def test_target_encoder_tracks_the_context_encoder(mask):
 
     # and it followed without jumping: still between where it started and now
     ema = jax.tree.leaves(state.ema["params"]["context_encoder"])
-    live = jax.tree.leaves(state.params["params"]["context_encoder"])
+    live = jax.tree.leaves(state.variables["params"]["context_encoder"])
     assert any(not np.allclose(a, b) for a, b in zip(ema, live, strict=True)), "EMA is not lagging"
 
 
@@ -436,7 +463,7 @@ def test_jepa_trains_under_fsdp(mask):
     trainer.tracker = Tracker()
     state = trainer.fit(Data(image_batches, batch=jax.device_count()), steps=2, log_every=1)
 
-    sharded = [p for p in jax.tree.leaves(state.params) if 'fsdp' in str(p.sharding.spec)]
+    sharded = [p for p in jax.tree.leaves(state.variables) if 'fsdp' in str(p.sharding.spec)]
     assert sharded, "no JEPA parameter was sharded over the fsdp axis"
     for param in sharded:
         assert param.addressable_shards[0].data.size == param.size // 2
@@ -444,7 +471,7 @@ def test_jepa_trains_under_fsdp(mask):
     # The target encoder is a second copy of the same subtree, so it must land
     # on the mesh the same way, not gathered onto every device
     encoder_specs = [p.sharding.spec for p in
-                     jax.tree.leaves(state.params["params"]["context_encoder"])]
+                     jax.tree.leaves(state.variables["params"]["context_encoder"])]
     assert encoder_specs == [p.sharding.spec for p in jax.tree.leaves(state.ema)]
     assert int(state.step) == 2
     ticks = [entry for entry in logged if "train/loss" in entry]

@@ -1340,6 +1340,34 @@ def test_mup_fields_refuse_blocks_that_do_not_carry_them(extra):
         model.init(jax.random.key(0), jnp.ones((1, 4), jnp.int32))
 
 
+def test_a_decode_step_reads_each_key_head_once_for_its_group(rng, monkeypatch):
+    """A decode step's grouped query heads reach the attention as their key
+    head's query positions, [rows, group, kv_heads, width], so a kernel reads
+    each key head once (cuDNN ran each query head on its own and padded the
+    lone query to two: 0.154 against 0.146 ms a layer of Qwen3-0.6B at 64
+    rows on an RTX 4080). The steps decode what the full pass computes."""
+    from dew.nn.mixers import attention as attention_module
+
+    model = tiny(num_heads=4, num_kv_heads=2, head_dim=8)
+    ids = tokens(rng)
+    params = model.init(rng, ids)
+    full = model.apply(params, ids)
+    shapes = []
+    called = attention_module.scaled_dot_product_attention
+
+    def recorded(query, key, value, **kwargs):
+        if kwargs.get("key_value_seq_lengths") is not None:
+            shapes.append((query.shape, key.shape))
+        return called(query, key, value, **kwargs)
+
+    monkeypatch.setattr(attention_module, "scaled_dot_product_attention", recorded)
+    prompt, rest = ids[:, :4], ids[:, 4:]
+    incremental = decode_logits(model, params, prompt, rest)
+    np.testing.assert_allclose(np.asarray(incremental), np.asarray(full[:, 3:]), atol=1e-5)
+    rows = ids.shape[0]
+    assert shapes and all(query[:3] == (rows, 2, 2) and key[2] == 2 for query, key in shapes), shapes
+
+
 @pytest.mark.skipif(jax.default_backend() != "gpu", reason="needs a GPU")
 def test_a_plain_decode_step_attends_through_cudnn_where_it_runs(rng, without_deterministic_ops):
     """A decode step's keys are the cache's filled slots, a count per row, so
@@ -1370,3 +1398,40 @@ def test_a_plain_decode_step_attends_through_cudnn_where_it_runs(rng, without_de
     # The filled slots travel as lengths: no [rows, 1, 1, capacity] mask
     # rides in as a bias the kernel reads for every head.
     assert fused and not [line for line in fused if "Bias" in line], fused[:1]
+
+
+@pytest.mark.skipif(jax.default_backend() != "gpu", reason="needs a GPU")
+def test_a_padded_prefill_attends_through_cudnn_where_it_runs(rng, without_deterministic_ops):
+    """A cache prefill of left-padded prompts builds its cursor mask, which
+    sends a training call to xla (`kernel_for_materialized_mask`); a prefill
+    runs forward only, so cuDNN takes that mask as its bias (xla's dense dots
+    took 6.2 against 4.0 ms over Qwen3-0.6B's 28 layers for 8 prompts of 256
+    on an RTX 4080). The prefill still scores what the full pass does."""
+    from dew.nn.attention import cudnn_runs
+
+    model = tiny(dtype=jnp.bfloat16, num_kv_heads=2, head_dim=32)
+    ids = tokens(rng)
+    params = model.init(rng, ids)
+    valid = jnp.ones(ids.shape, bool).at[0, :3].set(False)
+    full = model.apply(params, ids, attention_mask=valid)
+    cache = model.apply(params, ids.shape[0], method=CausalTransformer.init_cache,
+                        mutable=['cache'])[1]['cache']
+
+    def prefill(model):
+        return jax.jit(lambda cache, ids, valid: model.apply(
+            {**params, 'cache': cache}, ids, attention_mask=valid, decode=True, mutable=['cache'])[0])
+
+    def fused(model):
+        text = prefill(model).lower(cache, ids, valid).compile().as_text() or ""
+        return [line for line in text.splitlines() if 'custom_call_target="__cudnn$fmha' in line]
+
+    np.testing.assert_allclose(np.asarray(prefill(model)(cache, ids, valid), np.float32)[valid],
+                               np.asarray(full, np.float32)[valid], atol=0.05)
+
+    # An explicit 'xla' is the caller's choice, often for its bits: it stays.
+    assert not fused(tiny(dtype=jnp.bfloat16, num_kv_heads=2, head_dim=32, attention_impl='xla'))
+    chosen = fused(model)
+    if not cudnn_runs(jnp.zeros((1, 1, 4, 32), jnp.bfloat16)):
+        assert not chosen
+        return
+    assert chosen and all("Bias" in line for line in chosen), chosen[:1]

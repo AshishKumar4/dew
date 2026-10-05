@@ -154,14 +154,14 @@ class SampledRollout:
             prepared = self._prepared(batch, key)
         except BaseException as failure:
             error = failure
-        if mesh_of(state.params) is not None:
+        if mesh_of(state.variables) is not None:
             agree_process_phase(error, phase="rollout input preparation")
         elif error is not None:
             raise error
         assert prepared is not None
         prompts, prompt_lengths, sources, truths, infos, inputs = prepared
         rows, width = prompts.shape
-        policy = self.objective.policy(state.params, self.sampling)
+        policy = self.objective.policy(state.variables, self.sampling)
         generated = [policy(inputs, self.max_new_tokens, key=jax.random.fold_in(key, group)).host()
                      for group in range(self.groups)]
         sampled = np.stack([generation.tokens[:, width:] for generation in generated], axis=1)

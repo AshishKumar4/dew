@@ -52,13 +52,17 @@ class TrainState:
     step: jax.Array
     microstep: jax.Array
     updates: jax.Array
-    params: Variables
+    variables: Variables
     opt_state: optax.OptState
     ema: Variables | None
     key: jax.Array
     scale: DynamicScale | None
     window_size: jax.Array
     accumulation: Accumulation | None = None
+    compute: Variables | None = None
+    """The narrow copies of the parameters the forward reads, written by the
+    update (`dew.training.narrow`); derived from `variables`, so no
+    checkpoint holds them and a restored state starts without."""
 
     @property
     def averaged(self) -> Variables:
@@ -66,5 +70,5 @@ class TrainState:
         if self.ema is None:
             raise ValueError(
                 "the objective keeps no EMA, so there are no averaged weights; "
-                "read state.params")
-        return merge(self.params, self.ema)
+                "read state.variables")
+        return merge(self.variables, self.ema)

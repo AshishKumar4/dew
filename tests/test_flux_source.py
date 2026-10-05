@@ -237,18 +237,21 @@ def test_published_flux_prompt_encoding_matches_the_source_pipeline(source, pipe
         assert relative_gap(crossed.context, arrays["pipeline.context"]) > 1e-3
 
 
-def test_published_flux_pipeline_walk_matches_the_source(source, pipeline_record):
+@pytest.mark.parametrize("streamed", [False, True])
+def test_published_flux_pipeline_walk_matches_the_source(source, pipeline_record, streamed):
     """`Pretrained.load().text_to_image()` reproduces the source's own call.
 
     Nothing is passed in: the directory's declared pipeline carries the step
     count, the guidance the transformer embeds and the sigma seed its call
-    lays out, and its own mu for this latent's packed token count.
+    lays out, and its own mu for this latent's packed token count. Loaded
+    whole or streamed onto a mesh (tests/test_pipeline_streaming.py).
     """
     from dew.interop.pretrained import Pretrained
+    from dew.training import MeshSpec
 
     with np.load(source / "flux_transformer.npz") as arrays:
-        loaded = Pretrained.load(str(source / "pipeline"), dtype="float32",
-                                 attention_impl="xla")
+        loaded = Pretrained.load(str(source / "pipeline"), dtype="float32", attention_impl="xla",
+                                 **({"mesh": MeshSpec()} if streamed else {}))
         task = loaded.text_to_image()
         assert task.steps == pipeline_record["default_steps"]
         assert task.guidance is None and pipeline_record["true_cfg"] == 1.0
@@ -302,15 +305,15 @@ def test_a_trained_flux_step_exports_and_reloads(source, pipeline_record, tmp_pa
         loss, _ = objective.loss(params, batch, fixed)
         return float(loss.total / loss.mass)
 
-    before = value(initial.params)
+    before = value(initial.variables)
     state, _, _, _, accepted = trainer.compile(initial, batch)(initial, batch)
     assert bool(accepted)
-    assert value(state.params) < before
-    assert not np.allclose(state.params["params"]["proj_out"]["kernel"],
-                           initial.params["params"]["proj_out"]["kernel"])
+    assert value(state.variables) < before
+    assert not np.allclose(state.variables["params"]["proj_out"]["kernel"],
+                           initial.variables["params"]["proj_out"]["kernel"])
     for held in ("encoders", "autoencoder"):
-        for got, want in zip(jax.tree.leaves(state.params[held]),
-                             jax.tree.leaves(initial.params[held]), strict=True):
+        for got, want in zip(jax.tree.leaves(state.variables[held]),
+                             jax.tree.leaves(initial.variables[held]), strict=True):
             np.testing.assert_array_equal(got, want)
 
     checkpoints.save(1, state, None, {})
@@ -321,18 +324,43 @@ def test_a_trained_flux_step_exports_and_reloads(source, pipeline_record, tmp_pa
         np.testing.assert_array_equal(raw_leaf(got), raw_leaf(want))
 
     export = tmp_path / "export"
-    loaded.save(export, variables=state.params)
+    loaded.save(export, variables=state.variables)
     again = Pretrained.load(str(export), dtype="float32", attention_impl="xla")
     with np.load(source / "flux_transformer.npz") as arrays:
         grid = pipeline_record["size"] // 4
-        latent = jnp.asarray(unpacked(arrays["pipeline.x_T"], grid, grid))
+        packed = np.asarray(arrays["pipeline.x_T"])
+        latent = jnp.asarray(unpacked(packed, grid, grid))
         condition = DenoisingCondition(
             jnp.asarray(arrays["pipeline.context"]), jnp.asarray(arrays["pipeline.pooled"]),
             guidance=jnp.full((2,), pipeline_record["default_guidance"], jnp.float32))
     times = jnp.asarray([500.0, 100.0])
-    trained = loaded.model.apply({"params": state.params["params"]}, latent, times, condition)
+    trained = loaded.model.apply({"params": state.variables["params"]}, latent, times, condition)
     reloaded = again.model.apply({"params": again.variables["params"]}, latent, times, condition)
     np.testing.assert_array_equal(reloaded, trained)
+
+    # Diffusers' own classes read the export: every component cleanly, the
+    # pipeline whole, and its transformer recomputes the trained forward on
+    # the packed latent with FluxPipeline's own position ids.
+    from reference_error import assert_as_exact_as_the_reference
+
+    from tools import diffusers_consumer as consumer
+
+    consumer.assert_components_load(export)
+
+    def call(model, tensor):
+        # Imported after the consumer, which restores the transformers names
+        # Diffusers' pipeline modules read.
+        from diffusers import FluxPipeline
+
+        positions = FluxPipeline._prepare_latent_image_ids(1, grid, grid, "cpu", model.dtype)
+        output = model(hidden_states=tensor(packed), encoder_hidden_states=tensor(condition.context),
+                       pooled_projections=tensor(condition.pooled), timestep=tensor(times) / 1000,
+                       guidance=tensor(condition.guidance), img_ids=positions,
+                       txt_ids=tensor(np.zeros((condition.context.shape[1], 3)))).sample
+        return unpacked(output.numpy(), grid, grid)
+
+    assert_as_exact_as_the_reference(np.asarray(trained), consumer.denoiser_prediction(export, call),
+                                     consumer.denoiser_prediction(export, call, wide=True), "trained Flux")
 
 
 def test_each_records_guidance_reaches_the_model_and_survives_the_shared_seams(

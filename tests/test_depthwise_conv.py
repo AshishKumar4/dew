@@ -9,7 +9,13 @@ import pytest
 from flax import linen as nn
 from reference_error import assert_fp32_reduction_bound
 
-from dew.nn.conv import Conv, _conv_general_dilated, _polyphase_depthwise_3x3, _shifted_depthwise_3x3
+from dew.nn.conv import (
+    Conv,
+    _conv_general_dilated,
+    _materialized_depthwise_3x3,
+    _polyphase_depthwise_3x3,
+    _shifted_depthwise_3x3,
+)
 from dew.nn.ssm import SpatialFusionConv
 
 
@@ -20,7 +26,8 @@ def convolve(x, kernel, dilation):
         precision=jax.lax.Precision.HIGHEST)
 
 
-@pytest.mark.parametrize('operation', [_polyphase_depthwise_3x3, _shifted_depthwise_3x3])
+@pytest.mark.parametrize('operation', [_polyphase_depthwise_3x3, _shifted_depthwise_3x3,
+                                       _materialized_depthwise_3x3])
 @pytest.mark.parametrize('dilation', [1, 2, 3])
 def test_depthwise_forward_and_gradients_keep_every_term_with_fp32_rounding(dilation, operation):
     """Two reductions differ by at most twice gamma_n times sum(abs(products)).
@@ -61,7 +68,8 @@ def test_depthwise_forward_and_gradients_keep_every_term_with_fp32_rounding(dila
     assert_fp32_reduction_bound(actual_loss, expected_loss, loss_magnitude, terms)
 
 
-@pytest.mark.parametrize('operation', [_polyphase_depthwise_3x3, _shifted_depthwise_3x3])
+@pytest.mark.parametrize('operation', [_polyphase_depthwise_3x3, _shifted_depthwise_3x3,
+                                       _materialized_depthwise_3x3])
 @pytest.mark.parametrize('dilation', [1, 2, 3])
 def test_bf16_depthwise_accumulates_before_rounding(dilation, operation):
     """Rounding each add to bf16 loses eight half-ulp terms at an interior pixel."""
@@ -79,6 +87,33 @@ def test_bf16_depthwise_accumulates_before_rounding(dilation, operation):
         np.testing.assert_array_equal(lhs, rhs)
     assert float(actual[0][0, dilation, dilation, 0]) == 1.03125
     assert float(actual[1][0, dilation, dilation, 0]) == 1.03125
+
+
+@pytest.mark.parametrize('dtype, dilation, form', [
+    (jnp.bfloat16, 2, 'polyphase'), (jnp.bfloat16, 3, 'polyphase'),
+    (jnp.float32, 2, 'shifted'), (jnp.float32, 3, 'shifted'),
+    (jnp.float32, 1, 'convolution'), (jnp.bfloat16, 1, 'convolution')])
+def test_cuda_takes_the_dilated_depthwise_form_measured_faster_for_its_dtype(dtype, dilation, form):
+    """On CUDA a dilated depthwise 3x3 convolution runs as the polyphase
+    convolution in bf16 and as nine shifted products in fp32, the forms the
+    hybrid DiT's step ran fastest in for each dtype on an RTX 4080; an
+    undilated one is the convolution. Read off the CUDA lowering: the
+    polyphase form convolves the dilation^2 grids along the batch, undilated,
+    and the shifted one convolves nothing."""
+    batch = 2
+    x = jnp.zeros((batch, 12, 12, 32), dtype)
+    kernel = jnp.zeros((3, 3, 1, 32), dtype)
+    shared = jax.jit(lambda x, kernel: _conv_general_dilated(
+        x, kernel, (1, 1), 'SAME', rhs_dilation=(dilation, dilation),
+        dimension_numbers=('NHWC', 'HWIO', 'NHWC'), feature_group_count=32))
+    text = shared.trace(x, kernel).lower(lowering_platforms=('cuda',)).as_text()
+    convolutions = [line for line in text.splitlines() if 'stablehlo.convolution' in line]
+    if form == 'shifted':
+        assert not convolutions
+    else:
+        assert len(convolutions) == 1
+        grids = batch * dilation ** 2 if form == 'polyphase' else batch
+        assert f'tensor<{grids}x' in convolutions[0], convolutions[0]
 
 
 @pytest.mark.skipif(jax.default_backend() != "cpu", reason="the shifted sum is the CPU's path")
@@ -156,7 +191,8 @@ def test_spatial_fusion_keeps_its_checkpoint_and_residual_add_order():
     assert_fp32_reduction_bound(actual, expected, magnitude, 28)
 
 
-def test_depthwise_boundaries_preserve_forward_and_higher_order_derivatives():
+@pytest.mark.parametrize('operation', [_polyphase_depthwise_3x3, _materialized_depthwise_3x3])
+def test_depthwise_boundaries_preserve_forward_and_higher_order_derivatives(operation):
     rng = np.random.default_rng(5)
     x = jnp.asarray(rng.normal(size=(1, 5, 6, 3)).astype(np.float32))
     kernel = jnp.asarray(rng.normal(size=(3, 3, 1, 3)).astype(np.float32))
@@ -170,7 +206,7 @@ def test_depthwise_boundaries_preserve_forward_and_higher_order_derivatives():
                 jax.jvp(jax.grad(loss, argnums=(0, 1)), (x, kernel), (dx, dw)))
 
     expected = jax.jit(partial(derivatives, partial(convolve, dilation=2)))(x, kernel, dx, dw)
-    actual = jax.jit(partial(derivatives, partial(_polyphase_depthwise_3x3, dilation=2)))(x, kernel, dx, dw)
+    actual = jax.jit(partial(derivatives, partial(operation, dilation=2)))(x, kernel, dx, dw)
     for lhs, rhs in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
         np.testing.assert_allclose(lhs, rhs, rtol=4e-6, atol=2e-5)
 
@@ -205,17 +241,24 @@ def test_depthwise_quantization_keeps_the_original_provider_output(training):
 
 @pytest.mark.network
 def test_published_hybrid_dit_samples_within_fp32_rounding(tmp_path):
-    """Same 176M weights, prompt, seed 17 and 20 steps at highest precision.
-
-    RTX 4080 / JAX 0.11.2.post3: max latent error 1.88053e-5 (RMS
-    2.19756e-6), max fp32-decoded pixel error 3.99053e-5 (RMS 1.81749e-6).
-    The 3e-5/5e-5 absolute bounds cover fp32 reduction-order changes in the
-    20-step trajectory. Both paths disable TF32. The published bf16 decoder
-    is recorded separately, with no image-identity assertion: rounding its
-    activations maps independent max 1.88351e-5 / RMS 2.21749e-6 latent noise
-    to max 0.05078125 / RMS 0.002173656 pixel differences, the same as the
-    convolution change. The bf16 decoder's image sensitivity is recorded
-    alongside the fp32 parity; it is outside an fp32 rounding bound.
+    """Same 176M weights, prompt, seed 17 and 20 steps at highest precision,
+    with the dilated depthwise convolutions as production runs them and as
+    lax's dilated convolution: the latents and fp32-decoded images may
+    differ by at most twice what one rounding moves them, measured as lax's
+    convolution with every other output moved one ulp, in both the maximum
+    and the RMS. On the cuda lane (RTX 4080, jax 0.11.2.post3, deterministic
+    ops, no autotuning) the fp32 model's materialized shifted products give
+    latents max 6.72e-5 / RMS 9.82e-6 against one rounding's 5.42e-5 /
+    1.04e-5, and images max 1.39e-4 / RMS 8.59e-6 against 2.34e-4 / 9.17e-6;
+    the polyphase form is lax's convolution bit for bit. The trajectory
+    turns one ulp into 5e-5, so an absolute bound tight enough to mean
+    something would demand lax's bits. A missing tap moves the latents by
+    order 1. Every run measures the floor again (`one_rounding_*` in the
+    report `tools/benchmark_depthwise.py checkpoint` writes); that command
+    outside the lane's flags gave latents max 2.30e-5 against one
+    rounding's 1.66e-5. The published bf16 decoder is recorded separately, with no
+    image-identity assertion: its rounding maps latent noise of the same
+    size to pixel differences of about 0.05.
     """
     from argparse import Namespace
 

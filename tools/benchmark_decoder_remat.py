@@ -83,8 +83,8 @@ def main():
     shapes = jax.eval_shape(objective.init, jax.random.key(0))["params"]
     optimizer = optax.adamw(1e-4)
 
-    def loss(params, tokens):
-        return objective.scalar_loss({"params": params}, tokens, info)[0]
+    def loss(variables, tokens):
+        return objective.scalar_loss({"params": variables}, tokens, info)[0]
 
     residuals = saved_residuals(loss, shapes, jax.tree.map(
         lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), tokens))

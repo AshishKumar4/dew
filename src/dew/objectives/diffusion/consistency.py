@@ -23,10 +23,11 @@ from __future__ import annotations
 import itertools
 import math
 from collections.abc import Callable
-from typing import Literal
+from typing import Literal, NamedTuple
 
 import jax
 import jax.numpy as jnp
+import optax
 from flax import linen as nn
 
 from dew.diffusion.process import Process
@@ -34,7 +35,7 @@ from dew.diffusion.schedules import FlowMatchingScheduler, expand
 from dew.diffusion.transforms import FlowMatchPredictionTransform
 from dew.inputs import InputSpec, unit_range
 from dew.nn.attention import forward_mode_attention
-from dew.objectives.base import Aux, Ratio, Step, Variables
+from dew.objectives.base import Aux, EMASpec, Ratio, Step, Variables
 from dew.registry import objectives
 from dew.sampling.solvers import Consistency
 
@@ -156,6 +157,23 @@ def critic_loss(generated, fake, t) -> jax.Array:
     return rows(jnp.square(generated - fake) / expand(jnp.sin(t) ** 2, generated))
 
 
+class _Draws(NamedTuple):
+    """Every random value one rCM step reads. A student step reads the
+    consistency draws and, past the warmup, the DMD2 ones; a critic step the
+    DMD2 ones. Times are standard normals the log-normal time maps."""
+
+    consistency_time: jax.Array
+    """sCM's training time, a normal per row, or dCM's grid point, a uniform."""
+    consistency_noise: jax.Array
+    start: jax.Array
+    """The student's sample's starting noise, x_T."""
+    simulation_times: jax.Array
+    """`max_simulation_steps - 1` rows of time normals, those past a step's count unread."""
+    simulation_noises: jax.Array
+    critic_time: jax.Array
+    critic_noise: jax.Array
+
+
 @objectives("rcm")
 class ConsistencyDistillationObjective(DiffusionObjective):
     """rCM: sCM distillation of a flow teacher, regularized by DMD2.
@@ -167,10 +185,15 @@ class ConsistencyDistillationObjective(DiffusionObjective):
     both. For the first `tangent_warmup` steps the tangent's warmup ratio
     rises from 0 to 1 and only the student trains; after them one step in
     `student_update_freq` trains the student and the rest the fake score, as
-    rCM alternates its two optimizers. The student's DMD2 sample takes 1 to
-    `max_simulation_steps` steps, cycling with the step count. Training
-    times are rCM's log-normals in rf time, `student_times` for sCM and
-    `critic_times` for DMD2 and the critic.
+    rCM alternates its two optimizers. Each network has its own copy of the
+    optimizer the trainer is handed and steps only on its own updates
+    (`optimizer`), and the EMA averages the student's updates alone, its
+    decay reading the student's own update count (`averages`): with
+    `ema_decay=dew.training.posthoc.power_decay(0.1)`, rCM's power EMA at
+    rate 0.1. The student's DMD2 sample takes 1 to `max_simulation_steps`
+    steps, cycling with the step count. Training times are rCM's
+    log-normals in rf time, `student_times` for sCM and `critic_times` for
+    DMD2 and the critic.
 
     `consistency` "discrete" trains rCM's discrete consistency (dCM, Song
     et al. 2023's consistency distillation) in place of sCM: the student's
@@ -178,11 +201,12 @@ class ConsistencyDistillationObjective(DiffusionObjective):
     `discrete_shift`, against its own stopped x_0 `discrete_skip` teacher
     Euler steps later.
 
-    Where rCM steps one optimizer and leaves the other network's state as
-    it was, here the idle network's gradient is zero for that step: an
-    optimizer whose update moves on a zero gradient, such as Adam's momentum,
-    still moves it. Sampling walks the student's multistep consistency
-    solver, `Consistency`.
+    The loss is the mean over rows, where rCM's trainer backpropagates
+    their sum: under Adam the two take the same steps at an epsilon of
+    rCM's over the batch size. The phases alternate update by update, so a
+    trainer accumulating more than one microbatch per update is refused.
+    Sampling walks the student's multistep consistency solver,
+    `Consistency`.
 
     sCM's loss differentiates the student in time, so its time embedding
     must be smooth in it: `simple_dit(time_scale=0.002)`, which a run config
@@ -237,6 +261,46 @@ class ConsistencyDistillationObjective(DiffusionObjective):
         self.discrete_steps = discrete_steps
         self.discrete_skip = discrete_skip
         self.discrete_shift = discrete_shift
+        if self.ema is not None:
+            decay = self.ema.decay
+            self.ema = EMASpec(decay=lambda count: decay(self._effective(count)),
+                               select=lambda path: path[0] == "params" and path[1:2] != (FAKE_SCORE,))
+
+    def _student(self, iteration) -> jax.Array:
+        """Whether update `iteration` trains the student (`is_student_phase`)."""
+        return ((self.dmd_weight <= 0) | (iteration < self.tangent_warmup)
+                | ((iteration - self.tangent_warmup) % self.student_update_freq == 0))
+
+    def _effective(self, iteration) -> jax.Array:
+        """The student updates before update `iteration` (`get_effective_iteration`)."""
+        if self.dmd_weight <= 0:
+            return jnp.asarray(iteration)
+        return jnp.where(iteration < self.tangent_warmup, iteration, self.tangent_warmup
+                         + (iteration - self.tangent_warmup) // self.student_update_freq)
+
+    def optimizer(self, tx: optax.GradientTransformation, *,
+                  accumulation: int) -> optax.GradientTransformation:
+        """The student and the fake score, each with its own copy of `tx`,
+        each stepped on its own updates only, as rCM's two optimizers are."""
+        if accumulation > 1 and self.dmd_weight > 0:
+            raise ValueError(
+                "rCM alternates its student and fake-score updates update by update, so an update "
+                "takes one microbatch: train with accumulation=1 and a larger batch")
+
+        def network(params):
+            return {name: FAKE_SCORE if name == FAKE_SCORE else "student" for name in params}
+
+        def student(step, **_):
+            return self._student(step)
+
+        def critic(step, **_):
+            return ~self._student(step)
+
+        return optax.multi_transform({"student": optax.conditionally_mask(tx, student),
+                                      FAKE_SCORE: optax.conditionally_mask(tx, critic)}, network)
+
+    def averages(self, update: jax.Array) -> jax.Array:
+        return self._student(update)
 
     def held_variables(self) -> Variables:
         return {**super().held_variables(), TEACHER: self.teacher}
@@ -275,52 +339,65 @@ class ConsistencyDistillationObjective(DiffusionObjective):
         clean_u, F_u = trig_prediction(self._network(teacher, blank), x, t)
         return guided(clean_u, clean, self.teacher_guidance), guided(F_u, F, self.teacher_guidance)
 
-    def _times(self, key, count, moments) -> jax.Array:
+    @staticmethod
+    def _times(normal, moments) -> jax.Array:
+        """rCM's log-normal training time in rf time, as TrigFlow time."""
         mean, std = moments
-        return trig_time(jnp.clip(jax.nn.sigmoid(mean + std * jax.random.normal(key, (count,))), 0.0, 1.0))
+        return trig_time(jnp.clip(jax.nn.sigmoid(mean + std * normal), 0.0, 1.0))
 
-    def _generated(self, student_params, given, x_T, key, iteration) -> jax.Array:
+    def _draws(self, step: Step, count: int, shape) -> _Draws:
+        """Every random value the step at `step` reads, from its key."""
+        keys = jax.random.split(step.key, 7)
+        simulated = self.max_simulation_steps - 1
+        return _Draws(
+            consistency_time=(jax.random.uniform(keys[0], (count,)) if self.consistency == "discrete"
+                              else jax.random.normal(keys[0], (count,))),
+            consistency_noise=jax.random.normal(keys[1], shape),
+            start=jax.random.normal(keys[2], shape),
+            simulation_times=jax.random.normal(keys[3], (simulated, count)),
+            simulation_noises=jax.random.normal(keys[4], (simulated, *shape)),
+            critic_time=jax.random.normal(keys[5], (count,)),
+            critic_noise=jax.random.normal(keys[6], shape))
+
+    def _generated(self, student_params, given, draws: _Draws, iteration) -> jax.Array:
         """The student's DMD2 sample: `max_simulation_steps` noisings drawn,
         the first `steps - 1` walked, where steps cycles with `iteration`."""
         steps = iteration % self.max_simulation_steps + 1
-        time_key, noise_key = jax.random.split(key)
-        count = x_T.shape[0]
-        times = self._times(time_key, count * (self.max_simulation_steps - 1), self.critic_times)
-        times = times.reshape(self.max_simulation_steps - 1, count)
-        noises = jax.random.normal(noise_key, (self.max_simulation_steps - 1, *x_T.shape))
+        times = self._times(draws.simulation_times, self.critic_times)
         # Steps past the drawn count leave the time where it is: from t = 0
         # nothing is noised again.
         live = jnp.arange(self.max_simulation_steps - 1) < steps - 1
         network = self._network(student_params, given)
-        return backward_simulation(lambda x, t: trig_prediction(network, x, t)[0], x_T, times, noises, live)
+        return backward_simulation(lambda x, t: trig_prediction(network, x, t)[0], draws.start, times,
+                                   draws.simulation_noises, live)
 
-    def loss(self, params, batch, step: Step):
+    def loss(self, variables, batch, step: Step):
         samples = unit_range(batch[self.inputs.sample.key])
-        encode_key, drop_key, time_key, noise_key, generate_key = jax.random.split(step.key, 5)
+        encode_key, drop_key = jax.random.split(jax.random.fold_in(step.key, 1))
         if self.autoencoder is not None:
-            samples = self.autoencoder.encode(params["autoencoder"], samples, encode_key)
+            samples = self.autoencoder.encode(variables["autoencoder"], samples, encode_key)
         count = samples.shape[0]
-        given, blank = self._conditions(params, batch, drop_key, dropout=False)
+        given, blank = self._conditions(variables, batch, drop_key, dropout=False)
+        draws = self._draws(step, count, samples.shape)
         iteration = step.step
         warm = iteration < self.tangent_warmup
-        student_phase = (self.dmd_weight <= 0) | warm | (
-            (iteration - self.tangent_warmup) % self.student_update_freq == 0)
-        effective = jnp.where(warm, iteration, self.tangent_warmup
-                              + (iteration - self.tangent_warmup) // self.student_update_freq)
+        student_phase = self._student(iteration)
+        effective = self._effective(iteration)
+
         def student_losses(params):
             student_params = self.model_variables(params)
             total = jnp.zeros((count,), jnp.float32)
             if self.consistency_weight > 0 and self.consistency == "discrete":
                 network = self._network(student_params, given)
-                u = jax.random.uniform(time_key, (count,)) * (1 - self.discrete_skip / self.discrete_steps)
+                u = draws.consistency_time * (1 - self.discrete_skip / self.discrete_steps)
                 total = total + discrete_consistency_loss(
                     lambda x, t: trig_prediction(network, x, t)[0],
                     lambda x, t: self._teacher(params, given, blank, x, t)[1],
-                    samples, jax.random.normal(noise_key, samples.shape), u, self.discrete_steps,
+                    samples, draws.consistency_noise, u, self.discrete_steps,
                     self.discrete_skip, self.discrete_shift, self.consistency_weight)
             elif self.consistency_weight > 0:
-                t = self._times(time_key, count, self.student_times)
-                noise = jax.random.normal(noise_key, samples.shape)
+                t = self._times(draws.consistency_time, self.student_times)
+                noise = draws.consistency_noise
                 x = expand(jnp.cos(t), samples) * samples + expand(jnp.sin(t), samples) * noise
                 _, teacher_F = self._teacher(params, given, blank, x, t)
                 ratio = 1.0 if self.tangent_warmup == 0 else jnp.minimum(1.0, iteration / self.tangent_warmup)
@@ -328,31 +405,27 @@ class ConsistencyDistillationObjective(DiffusionObjective):
                 total = total + consistency_loss(lambda x, t: trig_prediction(network, x, t)[1], x, t,
                                                  teacher_F, ratio, self.consistency_weight)
             if self.dmd_weight > 0:
-                distribution = self._distribution_matching(params, student_params, given, blank, generate_key,
-                                                           effective, count, samples.shape)
+                distribution = self._distribution_matching(params, student_params, given, blank, draws,
+                                                           effective)
                 total = total + jnp.where(warm, 0.0, distribution)
             return total
 
         def critic_losses(params):
-            generate, time_key, noise_key = jax.random.split(generate_key, 3)
-            x_T = jax.random.normal(noise_key, samples.shape)
             generated = jax.lax.stop_gradient(self._generated(
-                self.model_variables(params), given, x_T, generate, iteration - effective - 1))
-            t = self._times(time_key, count, self.critic_times)
-            noise = jax.random.normal(jax.random.fold_in(noise_key, 1), samples.shape)
+                self.model_variables(params), given, draws, iteration - effective - 1))
+            t = self._times(draws.critic_time, self.critic_times)
+            noise = draws.critic_noise
             x = expand(jnp.cos(t), generated) * generated + expand(jnp.sin(t), generated) * noise
             fake, _ = trig_prediction(self._network(self._fake(params), given), x, t)
             return critic_loss(generated, fake, t)
 
-        losses = jax.lax.cond(student_phase, student_losses, critic_losses, params)
+        losses = jax.lax.cond(student_phase, student_losses, critic_losses, variables)
         return Ratio(jnp.sum(losses), jnp.asarray(count, jnp.float32)), Aux(metrics={})
 
-    def _distribution_matching(self, params, student_params, given, blank, key, iteration, count, shape):
-        generate, time_key, noise_key = jax.random.split(key, 3)
-        x_T = jax.random.normal(noise_key, shape)
-        generated = self._generated(student_params, given, x_T, generate, iteration)
-        t = self._times(time_key, count, self.critic_times)
-        noise = jax.random.normal(jax.random.fold_in(noise_key, 1), shape)
+    def _distribution_matching(self, params, student_params, given, blank, draws: _Draws, iteration):
+        generated = self._generated(student_params, given, draws, iteration)
+        t = self._times(draws.critic_time, self.critic_times)
+        noise = draws.critic_noise
         x = expand(jnp.cos(t), generated) * generated + expand(jnp.sin(t), generated) * noise
         fake, _ = trig_prediction(self._network(jax.lax.stop_gradient(self._fake(params)), given), x, t)
         teacher, _ = self._teacher(params, given, blank, x, t)

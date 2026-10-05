@@ -50,3 +50,30 @@ def test_a_docs_page_carries_its_imports_from_block_to_block(gen_api, documented
                     "```python\nMeshSpec().build()\nMeshSpec.build_mesh()\n```\n")
     assert gen_api.unresolved_in("page.md", page, *documented) == [
         "`MeshSpec.build_mesh`: dew.training.distributed.MeshSpec has no build_mesh"]
+
+
+def test_an_instance_of_a_dew_class_is_held_to_its_members_across_cells(gen_api, documented, tmp_path):
+    """`name = Class(...)` binds an instance: a later cell's attribute it
+    does not have is reported, and so is calling a value it holds as though
+    it were a method, which is what a method renamed to make room for a
+    field of its old name leaves behind. A name assigned otherwise too is
+    not held to the class."""
+    notebook = tmp_path / "instance.ipynb"
+    notebook.write_text(json.dumps({"cells": [
+        {"cell_type": "code", "source": [
+            "from dew.objectives.diffusion import DiffusionObjective\n",
+            "objective = DiffusionObjective(model, process, inputs)\n",
+            "other = DiffusionObjective(model, process, inputs)\n",
+            "other = something_else()\n"]},
+        {"cell_type": "code", "source": [
+            "objective.model_variables(params)\n",
+            "objective.pipeline(state)\n",
+            "objective.process.denoiser(model, params, {})\n",
+            "objective.trainable(params)\n",
+            "objective.sampler\n",
+            "other.anything(params)\n"]},
+    ]}))
+    assert gen_api.unresolved_in("instance.ipynb", notebook, *documented) == [
+        "`objective.sampler`: dew.objectives.diffusion.objective.DiffusionObjective has no sampler",
+        "`objective.trainable(...)`: trainable is a value "
+        "dew.objectives.diffusion.objective.DiffusionObjective holds, not a method"]

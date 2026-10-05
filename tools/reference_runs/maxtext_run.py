@@ -79,10 +79,11 @@ def maxtext_argv(args: argparse.Namespace, workdir: Path) -> list[str]:
         "opt_type": "adamw", "learning_rate": args.lr_peak, "adam_b1": args.b1, "adam_b2": args.b2,
         "adam_eps": args.eps, "adam_weight_decay": args.weight_decay,
         "gradient_clipping_threshold": args.clip,
-        "profiler": "xplane" if args.profile_steps else "",
-        "skip_first_n_steps_for_profiler": args.steps - args.profile_steps,
-        "profiler_steps": args.profile_steps,
     }
+    if args.profile_steps:
+        # MaxText reads an empty `profiler=` as None, which its config refuses.
+        settings.update({"profiler": "xplane", "profiler_steps": args.profile_steps,
+                         "skip_first_n_steps_for_profiler": args.steps - args.profile_steps})
     if os.environ.get("JAX_COMPILATION_CACHE_DIR"):
         settings["jax_cache_dir"] = os.environ["JAX_COMPILATION_CACHE_DIR"]
     return ["train.py", str(base), *(f"{key}={value}" for key, value in settings.items()), *args.overrides]

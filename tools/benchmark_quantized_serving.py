@@ -76,6 +76,8 @@ class Config:
     """Names of modules to leave unquantized, matched anywhere in their path."""
     model: str = "dewml/hybrid-dit-176m"
     """A Hugging Face Hub repository, or a local Dew run directory."""
+    revision: str | None = "32d59de89683d59824361144b87bdcaf3e742598"
+    """The Hub commit or tag to load; local run directories do not use it."""
     clip: bool = True
     """Sample every prompt at both seeds and score the images with CLIP."""
     decode_batch: int = 4
@@ -99,7 +101,7 @@ def forward(pipe: TextToImage) -> dict:
     it (`Denoiser.raw_both`), and read its compiled memory."""
     prepared = pipe.prepare(list(PROMPTS), key=0, steps=STEPS)
     x, t = prepared.noise, jnp.full(prepared.noise.shape[:1], 0.5)
-    variables = {name: value for name, value in pipe.params.items() if name not in ("encoders", "autoencoder")}
+    variables = {name: value for name, value in pipe.variables.items() if name not in ("encoders", "autoencoder")}
 
     def step(variables, x, t):
         return pipe.process.denoiser(pipe.model, variables, prepared.conditions,
@@ -131,7 +133,7 @@ def sample(pipe: TextToImage, key: int | jax.Array, decode_batch: int) -> tuple[
     latents = pipe(list(PROMPTS), key=key, steps=STEPS, solver=DPMSolverMultistep(), guidance=GUIDANCE,
                    decode=False).latents
     decode = jax.jit(pipe.autoencoder.decode)
-    decoded = np.concatenate([np.asarray(decode(pipe.params["autoencoder"], latents[i:i + decode_batch]), np.float32)
+    decoded = np.concatenate([np.asarray(decode(pipe.variables["autoencoder"], latents[i:i + decode_batch]), np.float32)
                               for i in range(0, len(latents), decode_batch)])
     return (uint8_pixels(np.clip(decoded, -1.0, 1.0)),
             {"latents": nonfinite(latents), "pixels": nonfinite(decoded)})
@@ -157,8 +159,10 @@ def quality(pipe: TextToImage, decode_batch: int) -> dict:
 
 
 def main(config: Config) -> None:
-    load = TextToImage.from_run if Path(config.model).is_dir() else TextToImage.from_pretrained
-    pipe = load(config.model, dtype=config.dtype)
+    if Path(config.model).is_dir():
+        pipe = TextToImage.from_run(config.model, dtype=config.dtype)
+    else:
+        pipe = TextToImage.from_pretrained(config.model, revision=config.revision, dtype=config.dtype)
     row = {"device": jax.devices()[0].device_kind, "dtype": config.dtype, "precision": config.precision,
            "float": list(config.float)}
     try:

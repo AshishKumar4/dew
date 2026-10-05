@@ -1,12 +1,10 @@
 """DPO: the preference loss against TRL, and the objective around it.
 
 `preference_logsigmoid_terms`, averaged over pairs as `DPOObjective` does,
-must match TRL 1.12's DPO path with the defaults
-(`sigmoid` loss, `reverse_kl`): the same per-token terms summed under the
-shifted completion mask, the `[chosen, rejected]` chunking, and
-`mean(-logsigmoid(beta * delta))`. The reference is
-tests/fixtures/rl/dpo.npz, written by tools/parity_dpo.py from torch
-autograd over fixed tensors. `DPOObjective` composes that term with the
+must match TRL 1.12's DPO path with the defaults (`sigmoid` loss,
+`reverse_kl`): the reference is tests/fixtures/rl/dpo.npz, which
+tools/parity_dpo.py writes by running TRL's own `DPOTrainer._compute_loss`
+on fixed logits. `DPOObjective` composes that term with the
 chunked head's per-token log-probabilities, reading the reference from the
 frozen `step.ema`, and `PreferencePairs` stacks the batches it trains on.
 """
@@ -19,6 +17,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
+from reference_error import assert_as_exact_as_the_reference
 
 from dew.data import DataPartition, Loading, PreferencePairs
 from dew.data.preferences import IDS_KEY, MASK_KEY, PreferenceSource
@@ -43,50 +42,39 @@ def reference():
     return dict(np.load(FIXTURE, allow_pickle=True))
 
 
-def halves(fixture):
-    """The fixture's TRL-layout stack as chosen/rejected halves with the mask
-    shifted the way both implementations read it."""
-    policy = np.asarray(fixture["policy_logps"], np.float32)
-    ref = np.asarray(fixture["ref_logps"], np.float32)
-    mask = np.asarray(fixture["completion_mask"], np.float32)[:, 1:]
+def trl_layout_loss(policy_logits, fixture):
+    """Dew's DPO loss and mean chosen and rejected rewards over the fixture's
+    TRL-layout batch: token log-probabilities read off the shifted logits,
+    the shifted completion mask, and `preference_logsigmoid_terms` over the
+    [chosen; rejected] halves, averaged over pairs as `DPOObjective` does."""
+    ids = jnp.asarray(fixture["input_ids"], jnp.int32)[:, 1:, None]
+    mask = jnp.asarray(fixture["completion_mask"], jnp.float32)[:, 1:]
+
+    def token_log_probs(logits):
+        return jnp.take_along_axis(jax.nn.log_softmax(logits[:, :-1]), ids, axis=-1)[..., 0]
+
+    policy = token_log_probs(policy_logits)
+    ref = token_log_probs(jnp.asarray(fixture["ref_logits"], jnp.float32))
     half = policy.shape[0] // 2
-    beta = float(fixture["beta"])
-    return (policy[:half], policy[half:], ref[:half], ref[half:],
-            mask[:half], mask[half:], beta)
+    terms, (chosen, rejected) = preference_logsigmoid_terms(
+        policy[:half], policy[half:], ref[:half], ref[half:], mask[:half], mask[half:],
+        float(fixture["beta"]))
+    return jnp.mean(terms), (jnp.mean(chosen), jnp.mean(rejected))
 
 
-def test_dpo_loss_matches_trl(reference):
-    """Dew's term against TRL 1.12's `dpo_loss` on the same fixed tensors.
-    Largest observed difference: 5.96e-08."""
-    policy_c, policy_r, ref_c, ref_r, mask_c, mask_r, beta = halves(reference)
-
-    loss = preference_logsigmoid(
-        jnp.asarray(policy_c), jnp.asarray(policy_r), jnp.asarray(ref_c),
-        jnp.asarray(ref_r), jnp.asarray(mask_c), jnp.asarray(mask_r), beta)
-
-    difference = abs(float(loss) - float(reference["trl_loss"]))
-    assert difference < 1e-6, f"largest difference against TRL: {difference}"
-
-
-def test_dpo_gradients_match_trl(reference):
-    """Autograd on both sides over the four per-token tensors. Largest
-    observed difference: exact, 0.0 across the 120 entries."""
-    policy_c, policy_r, ref_c, ref_r, mask_c, mask_r, beta = halves(reference)
-    args = [jnp.asarray(a) for a in (policy_c, policy_r, ref_c, ref_r)]
-    masks = [jnp.asarray(a) for a in (mask_c, mask_r)]
-
-    def loss(policy_c, policy_r, ref_c, ref_r):
-        return preference_logsigmoid(policy_c, policy_r, ref_c, ref_r,
-                                     masks[0], masks[1], beta)
-
-    grads = jax.grad(loss, argnums=(0, 1, 2, 3))(*args)
-    trl_policy = np.asarray(reference["trl_policy_grad"], np.float32)
-    trl_ref = np.asarray(reference["trl_ref_grad"], np.float32)
-    half = trl_policy.shape[0] // 2
-    expected = [trl_policy[:half], trl_policy[half:], trl_ref[:half], trl_ref[half:]]
-    difference = max(float(np.abs(np.asarray(g) - e).max())
-                     for g, e in zip(grads, expected, strict=True))
-    assert difference < 1e-6, f"largest difference against TRL: {difference}"
+def test_dpo_loss_rewards_and_gradient_match_trl(reference):
+    """Dew against TRL 1.12.0's own `DPOTrainer._compute_loss` with its
+    default settings (tools/parity_dpo.py), on fixed policy and reference
+    logits, held to the float64 rule over the loss, its gradient in the
+    policy logits and the chosen and rejected rewards: Dew's RMS error from
+    TRL's float64 values at most twice TRL's own fp32 error."""
+    (loss, rewards), gradient = jax.value_and_grad(trl_layout_loss, has_aux=True)(
+        jnp.asarray(reference["policy_logits"], jnp.float32), reference)
+    mine = np.concatenate([[loss], np.ravel(gradient), rewards])
+    theirs, truth = (np.concatenate([np.ravel(reference[f"trl_loss{tail}"]),
+                                     np.ravel(reference[f"trl_policy_logits_grad{tail}"]),
+                                     reference[f"trl_rewards{tail}"]]) for tail in ("", "_f64"))
+    assert_as_exact_as_the_reference(mine, theirs, truth, "DPO loss, gradient and rewards")
 
 
 def test_the_fixture_names_its_reference(reference):

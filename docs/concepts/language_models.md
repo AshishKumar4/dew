@@ -57,7 +57,7 @@ model = CausalTransformer(vocab_size=tokenizer.vocab_size,
 objective = LMObjective(model, seq_len=64)
 lm_state = Trainer(objective, optax.adamw(3e-3), key=jax.random.key(0)).fit(
     data, steps=300, log_every=100, eval_every=300, metrics=(Perplexity(),))
-continuation = generate(model, lm_state.params, [tokenizer.encode("One day, Lily")],
+continuation = generate(model, lm_state.variables, [tokenizer.encode("One day, Lily")],
                         max_new_tokens=40, key=jax.random.key(1),
                         sampling=Sampling(temperature=0.0))
 print(tokenizer.decode(continuation.tokens[0]))
@@ -76,7 +76,7 @@ One day, Lily saw a big dog in the park. The dog want
 
 `TokenWindows(seq_len=64)` yields rows of 65 IDs under the key `text`. `LMObjective(model, seq_len=64)` feeds the first 64 to the model and scores the predictions against the next 64. Token IDs must be integers inside the model's vocabulary. `temperature=0.0` picks the most likely token at every step, and the returned row holds the prompt followed by the continuation.
 
-The training loss is near zero because four sentences repeat, and the held-out head of the same stream scores as low. Validation and the generation above both read the trained `lm_state.params`, since the objective keeps no moving average unless `ema_decay` is set.
+The training loss is near zero because four sentences repeat, and the held-out head of the same stream scores as low. Validation and the generation above both read the trained `lm_state.variables`, since the objective keeps no moving average unless `ema_decay` is set.
 
 ## TinyStories
 
@@ -151,7 +151,7 @@ The binary files use the smallest unsigned dtype that holds the vocabulary. Two 
 | `router_z_loss` | `0.0` | ST-MoE router z-loss coefficient. |
 | `mtp_weight` | `None` | Weight of DeepSeek V3's multi-token prediction loss. |
 | `z_loss` | `0.0` | PaLM's squared log-partition auxiliary. |
-| `qk_stats` | `False` | Report per-head attention logit maxima for `muonclip`. |
+| `qk_stats` | `False` | Report per-head attention logit maxima, the key-head count and the head width for `muonclip`, which clips per query group as Megatron Core does and leaves an output gate's weights alone. |
 | `trainable` | `None` | `PathFilter` selecting the leaves the optimizer moves; the rest go under `frozen`. |
 | `token_accuracy` | `True` | Report argmax accuracy. |
 
@@ -202,15 +202,15 @@ state = Trainer(objective, optax.adamw(1e-5), key=jax.random.key(0)).fit(data, s
 
 This downloads the Hub weights and needs memory for the model, gradients and optimizer. A bundle already supplies the initial variables, so passing `pretrained=` as well is refused. It also hands the objective its processor, so `objective.pipeline(state)` takes text prompts; `processor=` overrides it.
 
-`bundle.lora(rank=, modules=, key=)` returns the same kind of bundle with a fresh low-rank adapter (LoRA) on the projections `modules` names, PEFT's `target_modules`. Its `lm_objective` trains the adapter's factors and leaves every other weight frozen. `tuned.adapter.save` writes PEFT's adapter directory, and `tuned.save` writes the source's layout with the factors merged into the kernels. Both read the trainer's `state.params` as it comes back:
+`bundle.lora(rank=, modules=, key=)` returns the same kind of bundle with a fresh low-rank adapter (LoRA) on the projections `modules` names, PEFT's `target_modules`. Its `lm_objective` trains the adapter's factors and leaves every other weight frozen. `tuned.adapter.save` writes PEFT's adapter directory, and `tuned.save` writes the source's layout with the factors merged into the kernels. Both read the trainer's `state.variables` as it comes back:
 
 ```python
 key = jax.random.key(0)
 tuned = bundle.lora(rank=8, modules=("q_proj", "v_proj"), key=key)
 objective = tuned.lm_objective(seq_len=512)
 state = Trainer(objective, optax.adamw(1e-4), key=key).fit(data, steps=100)
-tuned.adapter.save(state.params, "qwen3-adapter")
-tuned.save("qwen3-merged", variables=state.params)
+tuned.adapter.save(state.variables, "qwen3-adapter")
+tuned.save("qwen3-merged", variables=state.variables)
 print(objective.pipeline(state)("The capital of France is", 8, key=key).text[0])
 ```
 
@@ -224,7 +224,7 @@ import jax.numpy as jnp
 import dew
 from dew.interop import PretrainedDecoder
 
-trained = PretrainedDecoder.from_model(model, lm_state.params, tokenizer="byte",
+trained = PretrainedDecoder.from_model(model, lm_state.variables, tokenizer="byte",
                                        generation_config={"do_sample": False, "max_new_tokens": 24})
 trained.save("stories-decoder")
 task = dew.pipeline("stories-decoder", dtype=jnp.float32)
@@ -328,7 +328,7 @@ mm_data = Dataset(train=lambda partition: iter([{"text": batch}]), val=None,
 mm_trainer = Trainer(mm_objective, optax.sgd(1e-4), key=jax.random.key(3),
                      mesh=MeshSpec(), layout=Layout(min_shard=2**30))
 mm_state = mm_trainer.fit(mm_data, steps=1, log_every=1)
-bundle.save("gemma3-tiny-step1", variables=mm_state.params)
+bundle.save("gemma3-tiny-step1", variables=mm_state.variables)
 ```
 
 `bundle.save(directory, variables=...)` writes the trained weights back under the source tensor names, together with the processor, so the directory loads again both in Dew and in Transformers. This includes Gemma 4's frozen standardization and clipping buffers, which live in the `constants` collection and stay bit-for-bit unchanged through training. Past `max_shard_size` (default `"5GB"`) the weights go out as numbered shards with their index. A dense decoder or a source-layout checkpoint builds each tensor on the host only when its shard is written; a quantized source, a `from_model` export of a Gemma 4 or GLM-5-next model, and a DiffusionGemma export build the whole export first. Saving over an earlier export replaces it in one step: the new shards take fresh names and the index is written last, so a save that stops partway leaves the previous export whole, and files the export did not write, such as `model.fp16.safetensors`, are left alone.
@@ -348,7 +348,7 @@ The Gemma 3n and Gemma 4 audio encoders are `dew.nn.audio.Gemma3nAudio` and `Gem
 
 ## Masked diffusion language models
 
-`MaskedDiffusionObjective` trains a bidirectional decoder to recover masked tokens under MDLM's negative ELBO. Each row holds exactly `seq_len` tokens; there is no next-token shift, so `TokenWindows(seq_len=63)`, whose rows hold 64 IDs, feeds a 64-token objective. The mask token needs an ID of its own, here the one after the last byte:
+`MaskedDiffusionObjective` trains a bidirectional decoder to recover masked tokens under MDLM's negative ELBO. As in MDLM's SUBS parameterization, the mask token takes no probability mass: the cross entropy's partition leaves its column out, so the loss values differ from LLaDA's published training script, which takes the cross entropy over the whole vocabulary, by that term. Each row holds exactly `seq_len` tokens; there is no next-token shift, so `TokenWindows(seq_len=63)`, whose rows hold 64 IDs, feeds a 64-token objective. The mask token needs an ID of its own, here the one after the last byte:
 
 ```python
 from dew.diffusion.discrete import MDLM
@@ -364,7 +364,7 @@ masked_model = CausalTransformer(vocab_size=mask_id + 1,
 masked_objective = MaskedDiffusionObjective(masked_model, process, seq_len=64)
 masked_state = Trainer(masked_objective, optax.adamw(3e-3), key=jax.random.key(4)).fit(
     masked_data, steps=1000, log_every=500)
-drawn = process.generate(masked_model, masked_state.params,
+drawn = process.generate(masked_model, masked_state.variables,
                          [tokenizer.encode("One day, Lily")], 24, key=jax.random.key(5))
 print(tokenizer.decode(drawn.tokens[0]))
 ```
@@ -441,11 +441,9 @@ The last canvas is refined at full width, and the returned response is then cut 
 
 `BlockDiffusionObjective` ports Google's public SFT adapter, released after the model. It samples a valid response canvas, corrupts the whole response with uniform-vocabulary noise, and runs self-conditioning with a detached first pass. It then combines the canvas loss and the encoder loss, each normalized per row on its own. The default time safety margin is 1e-4 and the self-conditioning probability is 0.5. It is not the unpublished sampler-distillation and RL objective.
 
-The next example takes one optimizer step on the tiny reference model, with a synthetic vocabulary and unequal target support. The objective makes the per-layer scalars trainable, while the checkpoint's ordinary HF view keeps those tensors frozen, so the export passes the objective's native model.
+The next example takes one optimizer step on the tiny reference model, with a synthetic vocabulary and unequal target support. This dense model has neither the routed experts nor the vision tower that transformers' `DiffusionGemmaForBlockDiffusion` builds, so `save` refuses to export it, and its run checkpoint keeps it instead. A run of the image-reading model exports with `Pretrained.from_run(run).save(destination)`. That writes the config from the run's model: the text stack, the Gemma 4 tower's `vision_config` and the canvas length. Dew places images by position and keeps no image token ids, so transformers' defaults apply to them. Because transformers reads `generation_config.json` as a closed set of fields, the run must use a Hugging Face tokenizer, whose files are its whole record; a run on Dew's byte vocabulary is refused.
 
 ```python
-from dataclasses import replace
-
 from dew.objectives.diffusion import BlockDiffusionObjective
 
 sft_source = fixtures / "diffusion-gemma-sft"
@@ -458,10 +456,6 @@ block_objective = BlockDiffusionObjective(sft_bundle.model, prompt_length=4,
                                           num_canvases=2, pretrained=sft_bundle.variables)
 block_state = Trainer(block_objective, optax.sgd(0.001), key=jax.random.key(2)).fit(
     block_data, steps=1, log_every=1)
-with TemporaryDirectory() as checkpoint:
-    replace(sft_bundle, model=block_objective.model).save(checkpoint, variables=block_state.params)
-    trained_bundle = PretrainedBlockDecoder.load(checkpoint, dtype=jnp.float32, attention_impl="xla",
-                                                 max_seq_len=32)
 print("Optimizer updates:", int(block_state.updates))
 ```
 

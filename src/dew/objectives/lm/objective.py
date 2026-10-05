@@ -41,7 +41,7 @@ from flax import linen as nn, struct
 from dew.artifacts import TextSamples, TokenScores, agreed, collective_host
 from dew.data.chat import ROLES_KEY, Role
 from dew.inference import TextGeneration
-from dew.inference.tasks import Processor
+from dew.inference.tasks import Processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
 from dew.nn.backbones.causal_transformer import INTERMEDIATES, CausalTransformer, layer_output, layer_outputs
 from dew.nn.inputs import ModelInputs
@@ -300,6 +300,8 @@ class Samples:
 
     Prompts contain token IDs, with equal lengths for multiple prompts.
     This display count does not limit the teacher-forced scoring population.
+    A budget of 0 draws no preview and keeps `sampling` as the policy the
+    run records and publishes.
     """
     prompt: Sequence[int] | Sequence[Sequence[int]]
     max_new_tokens: int
@@ -644,7 +646,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         self.ema = None if ema_decay is None else EMASpec(
             decay=optax.constant_schedule(ema_decay),
             select=lambda path: path[0] != FROZEN)
-        if samples is not None:
+        if samples is not None and samples.max_new_tokens > 0:
             self._prompt = prompt_batch(samples.prompt)
 
     @property
@@ -712,20 +714,18 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     def inference_record(self):
         """Describe this decoder without a training RunConfig or parameter copies."""
         from dew.config import ModelConfig, _to_json
-        from dew.registry import models, objectives
-        if (not any(member is type(self.model) for member in models.values())
-                or not any(member is type(self) for member in objectives.values())):
+        from dew.registry import objectives
+        if not any(member is type(self) for member in objectives.values()):
             return None
-        model = ModelConfig.from_model(self.model)
         kind = objectives.name_of(type(self))
         samples = self.samples
         return {
             'objective': kind,
-            'model': _to_json(model, ModelConfig),
+            'model': _to_json(ModelConfig.from_model(self.model), ModelConfig),
             'seq_len': self.seq_len,
             'sample_tokens': 0 if samples is None else samples.max_new_tokens,
             'sampling': _to_json(Sampling() if samples is None else samples.sampling, Sampling),
-            'tokenizer': None,
+            'tokenizer': recorded_tokenizer(self.processor),
         }
 
     def pipeline(self, state: TrainState, *, ema: bool | None = None,
@@ -740,7 +740,8 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         return TextGeneration(self.model, thaw(self._pipeline_weights(state, ema)),
                               self.processor if processor is None else processor,
                               sampling=Sampling() if samples is None else samples.sampling,
-                              max_new_tokens=None if samples is None else samples.max_new_tokens)
+                              max_new_tokens=None if samples is None or samples.max_new_tokens <= 0
+                              else samples.max_new_tokens)
 
     def token_scores(self, params, tokens, train: bool = False, rngs=None,
                      segment_ids=None, positions=None, routing: bool = False,
@@ -1045,10 +1046,10 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
                 f"so the targets can be the shifted input, got {tokens.shape[-1]}")
         return tokens[:, :-1], tokens[:, 1:]
 
-    def loss(self, params, batch, step: Step) -> tuple[Ratio | LMStatistics, Aux[Variables]]:
+    def loss(self, variables, batch, step: Step) -> tuple[Ratio | LMStatistics, Aux[Variables]]:
         if self._warmup:
-            return self._warmup_loss(params, batch, step)
-        statistics, aux, _ = self._scored_loss(params, batch, step, train=True)
+            return self._warmup_loss(variables, batch, step)
+        statistics, aux, _ = self._scored_loss(variables, batch, step, train=True)
         return statistics, aux
 
     def predict(self, params, batch, step: Step, *, train: bool,
@@ -1221,7 +1222,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         settings = self.samples
 
         def setup():
-            if settings is None:
+            if settings is None or settings.max_new_tokens <= 0:
                 return None
             weights = params if step.ema is None or self._ema_is_reference else step.ema
             return (self.policy(weights, settings.sampling), self._prompt, settings.max_new_tokens)

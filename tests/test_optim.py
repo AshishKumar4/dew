@@ -13,6 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from reference_error import assert_as_exact_as_the_reference
 
 from dew.config import OptimConfig
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -311,6 +312,7 @@ def test_the_router_gate_takes_the_adamw_update():
 # --------------------------------------------------------------------------
 
 QK_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "muonclip" / "maxtext_mla.json"
+MEGATRON = np.load(QK_FIXTURE.parent / "megatron.npz")
 
 
 def muonclip_solver(**kwargs):
@@ -337,8 +339,10 @@ def qk_tree(layers=1, heads=4, kv_heads=4, dim=8, seed=0):
     return params, grads
 
 
-def qk_stats(layers=1, heads=4, rows=3, values=None, nope=None):
-    """The `qk` collection with per-layer maxima, as the model sows it."""
+def qk_stats(layers=1, heads=4, rows=3, values=None, nope=None, kv_heads=None, head_dim=8):
+    """The `qk` collection with per-layer maxima, as the model sows it: the
+    latent query's nope width, or the key-head count (`heads` unless given)
+    and the head width."""
     stats = {}
     for layer in range(layers):
         sown = {'max_logits': (jnp.asarray(
@@ -346,6 +350,9 @@ def qk_stats(layers=1, heads=4, rows=3, values=None, nope=None):
             else np.asarray(values, np.float32).reshape(rows, heads), jnp.float32),)}
         if nope is not None:
             sown['qk_nope'] = jnp.asarray(nope)
+        else:
+            sown['kv_heads'] = jnp.asarray(heads if kv_heads is None else kv_heads)
+            sown['head_dim'] = jnp.asarray(head_dim)
         stats[f'layers_{layer}'] = {'self_attn': sown}
     return stats
 
@@ -400,28 +407,79 @@ def test_the_clip_matches_the_paper_equations():
         assert float(np.max(np.abs(applied - expected))) < 1e-6
 
 
-def test_grouped_keys_clip_by_the_strongest_head():
-    """Two key heads behind four query heads: one firing query head rescales
-    the whole key projection by its gamma, the conservative side, while the
-    quiet query heads keep Muon's update bitwise. Observed on CPU: key at
-    half, quiet query slices bitwise."""
-    params, grads = qk_tree(kv_heads=2)
-    stats = qk_stats(values=[[200.0, 10.0, 10.0, 10.0],
-                             [10.0, 10.0, 10.0, 10.0],
-                             [10.0, 10.0, 10.0, 10.0]])
+@pytest.mark.parametrize("case", ["gqa", "mha"])
+def test_a_query_group_clips_as_megatron_clips_it(case):
+    """Grouped-query and multi-head attention against Megatron Core's own
+    `SelfAttention.clip_qk` and `_clip_linear_qkv` (core_v0.19.2), run as
+    published by tools/muonclip_reference.py: per query group, eta is
+    tau over the group's largest logit, at most 1, and the group's query
+    heads and its key head each scale by sqrt(eta). Under grouped queries a
+    group with one firing head clips all four of its query heads and its
+    key, and the quiet group keeps its weights; multi-head attention is the
+    group of one. The kernels a zero gradient's update lands on are held to
+    Megatron's float64 run by the float64 rule, and the values are
+    untouched."""
+    heads, width = MEGATRON[f"{case}/max_logits"].shape[0], MEGATRON[f"{case}/k"].shape[1]
+    parts = {"q_proj": "q", "k_proj": "k", "v_proj": "v"}
+    params = {"attn": {proj: {"kernel": jnp.asarray(MEGATRON[f"{case}/{part}"])}
+                       for proj, part in parts.items()}}
+    head_dim = MEGATRON[f"{case}/q"].shape[1] // heads
+    stats = {"attn": {"max_logits": (jnp.asarray(MEGATRON[f"{case}/max_logits"])[None],),
+                      "kv_heads": jnp.asarray(width // head_dim), "head_dim": jnp.asarray(head_dim)}}
     tx = scale_by_qk_clip(100.0)
-    updates, _ = tx.update(grads, tx.init(params), params, qk_stats=stats)
-    key, key_update = (params['layers_0']['self_attn']['k_proj']['kernel'],
-                       updates['layers_0']['self_attn']['k_proj']['kernel'])
-    grad_update = grads['layers_0']['self_attn']['k_proj']['kernel']
-    assert float(jnp.max(jnp.abs(
-        (np.asarray(key) + np.asarray(key_update))
-        - 0.5 * (np.asarray(key) + np.asarray(grad_update))))) < 1e-6
-    query_update = updates['layers_0']['self_attn']['q_proj']['kernel']
-    plain = grads['layers_0']['self_attn']['q_proj']['kernel']
-    assert largest_update_difference(
-        query_update.reshape(16, 4, 8)[:, 1:, :],
-        plain.reshape(16, 4, 8)[:, 1:, :]) == 0.0
+    updates, _ = tx.update(jax.tree.map(jnp.zeros_like, params), tx.init(params), params, qk_stats=stats)
+    applied = optax.apply_updates(params, updates)
+    for proj, part in parts.items():
+        got = np.asarray(applied["attn"][proj]["kernel"])
+        if part == "v":
+            np.testing.assert_array_equal(got, MEGATRON[f"{case}/clipped_v_f64"])
+        else:
+            assert_as_exact_as_the_reference(got, MEGATRON[f"{case}/clipped_{part}"],
+                                             MEGATRON[f"{case}/clipped_{part}_f64"], f"{case} {proj}")
+
+
+def test_a_gated_query_clips_its_query_half_and_bounds_the_logits():
+    """Qwen3.5's output gate doubles each query head to [query | gate]. The
+    paper's QK-Clip rescales the query and key weights and nothing else, so
+    the gate half keeps its kernel bitwise, and the layer's logits, read
+    again on the same tokens, are each head's own times its group's eta:
+    the firing group lands on tau and the other keeps its maxima, tau
+    between the two groups' largest. One layer, so the clip's input is the
+    embeddings both times."""
+    model = tiny_decoder(output_gate=True, num_layers=1)
+    variables = model.init(jax.random.key(0), jnp.ones((1, 8), jnp.int32))
+    ids = jnp.asarray(np.random.default_rng(1).integers(0, 32, (2, 8)), jnp.int32)
+    _, sown = model.apply(variables, ids, mutable=["qk"])
+    stats = sown["qk"]
+    before = np.max(np.asarray(stats["layers_0"]["self_attn"]["max_logits"][0]), axis=0)
+    tau = float(np.mean(before.reshape(2, 2).max(axis=1)))
+    tx = scale_by_qk_clip(tau)
+    params = variables["params"]
+    updates, _ = tx.update(jax.tree.map(jnp.zeros_like, params), tx.init(params), params, qk_stats=stats)
+    clipped = optax.apply_updates(params, updates)
+    _, resown = model.apply({**variables, "params": clipped}, ids, mutable=["qk"])
+    query, query_after = (np.asarray(tree["layers_0"]["self_attn"]["q_proj"]["kernel"]).reshape(16, 4, 2, -1)
+                          for tree in (params, clipped))
+    np.testing.assert_array_equal(query_after[:, :, 1], query[:, :, 1])
+    eta = np.minimum(1.0, tau / before.reshape(2, 2).max(axis=1)).repeat(2)
+    assert 0 < np.sum(eta < 1) < 4
+    after = np.max(np.asarray(resown["qk"]["layers_0"]["self_attn"]["max_logits"][0]), axis=0)
+    np.testing.assert_allclose(after, before * eta, rtol=1e-5)
+
+
+def test_a_layer_that_norms_its_queries_and_keys_is_refused():
+    """A per-head QK-norm divides any scale of the query and key kernels
+    back out of the logits, so the clip would rescale the kernels and bound
+    nothing. Measured before this refusal on a one-layer normed decoder at
+    tau 0.90: maxima 1.937, 1.794, 1.802, 1.873 before the clip and 1.936,
+    1.794, 1.801, 1.873 after."""
+    model = tiny_decoder(qk_norm=True, num_layers=1)
+    variables = model.init(jax.random.key(0), jnp.ones((1, 8), jnp.int32))
+    _, sown = model.apply(variables, jnp.ones((1, 8), jnp.int32), mutable=["qk"])
+    params = variables["params"]
+    tx = scale_by_qk_clip(0.5)
+    with pytest.raises(ValueError, match=r"norms its queries and keys.*'muon'.*qk_norm=False"):
+        tx.update(jax.tree.map(jnp.zeros_like, params), tx.init(params), params, qk_stats=sown["qk"])
 
 
 def test_the_latent_branches_match_maxtext():
@@ -670,6 +728,29 @@ def test_bf16_state_keeps_the_second_moments_small_increments():
     have = float(jnp.mean(state[0].nu['w'].astype(jnp.float32)))
     assert want < 0.4
     assert have == pytest.approx(want, rel=1e-2)
+
+
+def test_lamb_is_optax_lamb_on_the_configs_schedule_decay_options_and_clip():
+    """`optimizer='lamb'` runs optax.lamb itself (`OPTIMIZER_MAP`), so what
+    Dew adds is the wiring: the config's schedule, weight decay and
+    `optimizer_opts` reach it, behind the global-norm clip. Three steps on
+    changing gradients are bitwise the transform built from optax
+    directly."""
+    params = decoder_params()["params"]
+    cosine = Cosine(peak=1e-2, warmup_steps=2, end=1e-3, init=1e-4)
+    opts = {"b1": 0.8, "b2": 0.95, "eps": 1e-5, "eps_root": 1e-9}
+    solver = OptimConfig(optimizer="lamb", optimizer_opts=opts, schedule=cosine, weight_decay=0.05,
+                         clip_grads=0.5).build(10)
+    reference = optax.chain(optax.clip_by_global_norm(0.5),
+                            optax.lamb(cosine.schedule(10), weight_decay=0.05, **opts))
+    state, expected_state = solver.init(params), reference.init(params)
+    for step in range(3):
+        grads = jax.tree.map(lambda grad, step=step: grad * (step + 1) * 0.3, fixed_gradients(params))
+        updates, state = solver.update(grads, state, params)
+        expected, expected_state = reference.update(grads, expected_state, params)
+        for have, want in zip(jax.tree.leaves(updates), jax.tree.leaves(expected), strict=True):
+            np.testing.assert_array_equal(np.asarray(have), np.asarray(want))
+        params = optax.apply_updates(params, updates)
 
 
 def test_bf16_state_is_refused_where_there_is_no_adam_moment():

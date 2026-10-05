@@ -104,6 +104,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from reference_error import assert_as_exact_as_the_reference
 
 from dew.interop import Pretrained, PretrainedDecoder, hf_decoders
 from dew.interop.hf_decoders import translate_config, translate_weights
@@ -1094,21 +1095,18 @@ def _diffusion_fp32(name):
     assert model.mask_token_id == 120
     variables = translate_weights(load_file(str(directory / "model.safetensors")), config)
     return (model, variables, np.load(directory / "input_ids.npy"),
-            np.load(directory / "logits.npy"))
+            np.load(directory / "logits.npy"), np.load(directory / "logits_f64.npy"))
 
 
-def test_llada_logits_match_the_reference_implementation():
-    """fp32 parity on the tiny LLaDA decoder: tolerance 1e-4, observed max
-    |logit difference| 9.3e-07 with identical argmax.
-
-    The reference is the torch port in tools/hf_reference.py following
-    modeling_llada.py's LLaDALlamaBlock (RMS pre-norms, unbiased projections,
-    rotate-half rope at theta 500000, SwiGLU with ff_proj as gate) at fp32 on
-    random weights, not the released 8B weights. A causal model on the same
-    weights misses by 1.5, so the fixture exercises full attention."""
-    model, variables, ids, reference = _diffusion_fp32("llada-tiny")
-    assert np.max(np.abs(np.asarray(model.apply(variables, ids)) - reference)) < 1e-4
-    assert (np.asarray(model.apply(variables, ids)).argmax(-1) == reference.argmax(-1)).all()
+def test_llada_logits_match_the_released_model_code():
+    """fp32 parity with LLaDA's own modeling_llada.py (GSAI-ML/LLaDA-8B-Base
+    at 0f2787f, run by tools/remote_code_reference.py under transformers
+    4.46.3) on a tiny random-weight checkpoint, held to the float64 rule:
+    Dew's RMS error from the release's float64 logits at most twice the
+    release's own fp32 error. A causal model on the same weights misses by
+    1.5, so the fixture exercises full attention."""
+    model, variables, ids, reference, truth = _diffusion_fp32("llada-tiny")
+    assert_as_exact_as_the_reference(model.apply(variables, ids), reference, truth, "llada-tiny logits")
     causal = model.clone(causal=True)
     assert np.max(np.abs(np.asarray(causal.apply(variables, ids)) - reference)) > 1.0
 
@@ -1151,8 +1149,8 @@ def test_glm5_prediction_index_reuse_does_not_change_forward_or_sft(glm5_next_so
     enabled = source.model
     disabled = enabled.clone(index_share_for_mtp_iteration=False)
 
-    def loss(model, params):
-        variables = {**source.variables, "params": params}
+    def loss(model, variables):
+        variables = {**source.variables, "params": variables}
         hidden = model.apply(variables, ids, method="hidden_states")
         predicted = model.apply(variables, hidden, ids, train=True, method="mtp_logits")[0]
         return jnp.mean(predicted ** 2)
@@ -1282,18 +1280,14 @@ def test_standalone_glm5_refuses_computation_without_a_source_inverse(
     assert not (tmp_path / "config.json").exists()
 
 
-def test_dream_logits_match_the_reference_implementation():
-    """fp32 parity on the tiny Dream decoder: tolerance 1e-4, observed max
-    |logit difference| 4.5e-06 with identical argmax, on logits up to 4.8.
-
-    The reference is the torch port in tools/hf_reference.py following
-    modeling_dream.py's DreamAttention (biased q/k/v over a bias-free o_proj,
-    hard-coded full attention) and bias-free SwiGLU at fp32 on random weights,
-    not the released 7B weights. A causal model on the same weights misses by
-    4.9, so the fixture exercises full attention."""
-    model, variables, ids, reference = _diffusion_fp32("dream-tiny")
-    assert np.max(np.abs(np.asarray(model.apply(variables, ids)) - reference)) < 1e-4
-    assert (np.asarray(model.apply(variables, ids)).argmax(-1) == reference.argmax(-1)).all()
+def test_dream_logits_match_the_released_model_code():
+    """fp32 parity with Dream's own modeling_dream.py (Dream-org/Dream-v0-Base-7B
+    at 6572adb, run by tools/remote_code_reference.py under transformers
+    4.46.3) on a tiny random-weight checkpoint, held to the float64 rule. A
+    causal model on the same weights misses by 4.9, so the fixture exercises
+    full attention."""
+    model, variables, ids, reference, truth = _diffusion_fp32("dream-tiny")
+    assert_as_exact_as_the_reference(model.apply(variables, ids), reference, truth, "dream-tiny logits")
     causal = model.clone(causal=True)
     assert np.max(np.abs(np.asarray(causal.apply(variables, ids)) - reference)) > 1.0
 

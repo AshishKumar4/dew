@@ -12,7 +12,17 @@ drawn too, so no branch is switched off. What lands: every weight and buffer
 under its reference name, the inputs, the class labels as the reference
 reads them, and the output computed in float64 and in float32.
 
-    PYTHONPATH=src python tools/edm2_reference.py
+`--train` writes train.npz beside it: the same network trained in train
+mode, where `MPConv.forward` writes the normalized weight back into the
+parameter before using it (forced weight normalization, Equation 66), for
+STEPS steps of torch's SGD on `sum(output * probe)`. Each step records the
+output and every stored weight and gain after its forward, in float32 and
+in the float64 twin, from one initial state. SGD rather than EDM2's Adam:
+the normalization does not depend on the optimizer, and Adam's first steps
+are near sign(gradient) steps, which turn a near-zero gradient's float32
+rounding into a whole step's difference.
+
+    PYTHONPATH=src python tools/edm2_reference.py [--train]
 """
 
 from __future__ import annotations
@@ -29,6 +39,10 @@ import torch
 COMMIT = "4bf8162f601bcc09472ce8a32dd0cbe8889dc8fc"
 SOURCE = f"https://raw.githubusercontent.com/NVlabs/edm2/{COMMIT}/training/networks_edm2.py"
 FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "edm2" / "unet.npz"
+TRAIN = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "edm2" / "train.npz"
+STEPS = 3
+# A rate that moves the weights and the output visibly in STEPS steps.
+SGD = {"lr": 0.002}
 CONFIG = {"img_resolution": 8, "img_channels": 3, "label_dim": 4, "model_channels": 8,
           "channel_mult": [1, 2], "num_blocks": 1, "attn_resolutions": [4],
           "channels_per_head": 4}
@@ -82,5 +96,40 @@ def main() -> None:
     print(f"{FIXTURE}: output |max| {np.abs(arrays['output']).max():.3f}")
 
 
+def train() -> None:
+    published, twin = networks("float32"), networks("float64")
+    torch.manual_seed(0)
+    initial = published.UNet(**CONFIG)
+    with torch.no_grad():
+        for value in initial.parameters():
+            if value.ndim == 0:
+                value.copy_(torch.randn(()) * 0.5 + 1.0)
+    generator = torch.Generator().manual_seed(2)
+    x, noise_labels, text = (torch.randn(*shape, generator=generator)
+                             for shape in ((2, 3, 8, 8), (2,), (2, 4)))
+    probe = torch.randn((2, 3, 8, 8), generator=generator)
+    arrays = {"x": x.numpy(), "noise_labels": noise_labels.numpy(), "text": text.numpy(),
+              "probe": probe.numpy(), "config": np.asarray(json.dumps(CONFIG)),
+              "sgd": np.asarray(json.dumps(SGD)), "steps": np.asarray(STEPS)}
+    for name, value in initial.state_dict().items():
+        arrays[f"weights/{name}"] = value.numpy()
+    for precision, module, dtype in (("fp32", published, torch.float32), ("fp64", twin, torch.float64)):
+        net = module.UNet(**CONFIG).train().to(dtype)
+        net.load_state_dict({name: value.to(dtype) for name, value in initial.state_dict().items()})
+        optimizer = torch.optim.SGD(net.parameters(), **SGD)
+        labels = twin.normalize(text.double()).to(dtype) / np.sqrt(CONFIG["label_dim"])
+        for step in range(STEPS):
+            output = net(x.to(dtype), noise_labels.to(dtype), labels)
+            arrays[f"{precision}/{step}/output"] = output.detach().numpy()
+            for name, value in net.state_dict().items():
+                arrays[f"{precision}/{step}/weights/{name}"] = value.numpy().copy()
+            optimizer.zero_grad()
+            (output * probe.to(dtype)).sum().backward()
+            optimizer.step()
+    TRAIN.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(TRAIN, **arrays)
+    print(f"{TRAIN}: {TRAIN.stat().st_size / 1e6:.2f} MB, {len(arrays)} arrays")
+
+
 if __name__ == "__main__":
-    main()
+    train() if sys.argv[1:] == ["--train"] else main()

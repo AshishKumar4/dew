@@ -8,7 +8,10 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 import pytest
+from flax import linen as nn
+from reference_error import assert_as_exact_as_the_reference, distance
 
 from dew.nn.attention import forward_mode_attention, scaled_dot_product_attention
 from dew.objectives.diffusion.consistency import (
@@ -203,13 +206,13 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     task = config.build()
     assert isinstance(task, ConsistencyDistillationObjective)
     params = task.init(jax.random.PRNGKey(0))
-    expected = task.model_variables(state.params)
+    expected = task.model_variables(state.variables)
     for got, want in zip(jax.tree.leaves(params[TEACHER]), jax.tree.leaves(expected), strict=True):
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
     # The student reads the teacher's Fourier table, built at the teacher's time scale.
     table = params["constants"]["conditioning"]["time_embed"]["layers_0"]["frequencies"]
     np.testing.assert_array_equal(np.asarray(table), np.asarray(
-        state.params["constants"]["conditioning"]["time_embed"]["layers_0"]["frequencies"]))
+        state.variables["constants"]["conditioning"]["time_embed"]["layers_0"]["frequencies"]))
 
     def gradients(step):
         def loss(tree):
@@ -228,12 +231,155 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     distilled = trainer.initial_state()
     distilled, *_ = trainer.compile(distilled, batch)(distilled, batch)
     checkpoints = Checkpoints(str(tmp_path / "student"))
-    checkpoints.save(1, distilled, None)
+    checkpoints.save(1, distilled, None, artifact=task.inference_record())
     checkpoints.wait()
     config.save(str(tmp_path / "student"))
     expected = task.pipeline(distilled, ema=False)(["a red bird"], key=9).host().images
     np.testing.assert_array_equal(TextToImage.from_run(str(tmp_path / "student"))(["a red bird"], key=9)
                                   .host().images, expected)
+
+
+TRAINING = np.load(Path(__file__).resolve().parent / "fixtures" / "rcm" / "training.npz")
+
+
+class Weighted(nn.Module):
+    """`tools/rcm_reference.py`'s trained velocity network, four terms with
+    a weight per entry, at Dew's model time (rf time times 1000), its label
+    the condition's second token's table entry."""
+
+    @nn.compact
+    def __call__(self, x, time, textcontext):
+        time = time.reshape(-1, 1, 1, 1, 1) / 1000
+        label = textcontext.hidden[:, 1, 0].reshape(-1, 1, 1, 1, 1)
+        w = self.param("weights", nn.initializers.zeros, (4, *x.shape[1:]))
+        return (jnp.tanh(x) * w[0] + jnp.sin(2 * time) * x * w[1] + (0.1 + time) * label * w[2]
+                + jnp.cos(x) * time * w[3])
+
+
+def discrete_fields(prefix: str) -> dict:
+    """The objective's fields for rCM's dCM settings, none for sCM."""
+    if not prefix:
+        return {}
+    settings = json.loads(str(TRAINING["dcm"]))
+    return {"consistency": "discrete", "discrete_steps": settings["dcm_total_steps"],
+            "discrete_skip": settings["dcm_skipping_interval_steps"],
+            "discrete_shift": settings["dcm_timestep_shift"]}
+
+
+def distilled(monkeypatch, optimizer, prefix=""):
+    """`ConsistencyDistillationObjective` over the fixture's network, labels
+    and settings, trained by `Trainer` with `optimizer` for the fixture's
+    iterations on the reference's draws: the objective and its final state.
+    `prefix` "dcm/" trains rCM's discrete-time consistency on its draws."""
+    from dew.diffusion import presets
+    from dew.inputs import CharTable, Condition, Field, InputSpec
+    from dew.objectives.diffusion import ConsistencyDistillationObjective
+    from dew.objectives.diffusion.consistency import _Draws
+    from dew.training import Trainer
+    from dew.training.posthoc import power_decay
+
+    config = json.loads(str(TRAINING["config"]))
+    pixels, labels = TRAINING["pixels"], TRAINING["label"]
+    table = CharTable.from_pretrained(tokens=2, features=1)
+    entries = np.zeros((table.vocab, 1), np.float32)
+    names = [str(row) for row in range(pixels.shape[0])]
+    for name, label in zip(names, labels, strict=True):
+        entries[table.tokenize([name])["input_ids"][0, 1]] = label
+    table = CharTable.from_pretrained(tokens=2, features=1, params={"table": jnp.asarray(entries)})
+    inputs = InputSpec(Field("image", pixels.shape[1:]), {"textcontext": Condition(table)})
+    (mean_g, std_g), (mean_d, std_d) = config["times"]["G"], config["times"]["D"]
+    teacher = {"params": {"weights": jnp.asarray(TRAINING["teacher"])}}
+    task = ConsistencyDistillationObjective(
+        Weighted(), presets.Flow()(), inputs, teacher=teacher,
+        consistency_weight=config["loss_scale"], dmd_weight=config["loss_scale_dmd"],
+        teacher_guidance=config["teacher_guidance"], tangent_warmup=config["tangent_warmup"],
+        student_update_freq=config["student_update_freq"],
+        max_simulation_steps=config["max_simulation_steps_fake"], student_times=(mean_g, std_g),
+        critic_times=(mean_d, std_d), ema_decay=power_decay(config["ema_rate"]),
+        **discrete_fields(prefix))
+    drawn = {name: jnp.asarray(TRAINING[f"{prefix}draws/{name}"]) for name in _Draws._fields}
+    monkeypatch.setattr(ConsistencyDistillationObjective, "_draws", lambda self, step, count, shape: _Draws(
+        **{name: value[step.step] for name, value in drawn.items()}))
+    trainer = Trainer(task, optimizer, key=jax.random.PRNGKey(0))
+    state = trainer.initial_state()
+    batch = {"image": pixels, **inputs.tokenize(names)}
+    step = trainer.compile(state, batch)
+    for _ in range(config["iterations"]):
+        state, *_ = step(state, batch)
+    return task, state
+
+
+@pytest.mark.parametrize("prefix", ["", "dcm/"], ids=["scm", "dcm"])
+def test_training_steps_the_student_and_the_fake_score_as_rcms_loop_does(monkeypatch, prefix):
+    """Ten updates of rCM's own loop (`ImaginaireTrainer_Distill.training_step`
+    over the model's closures, `tools/rcm_reference.py`): a warmup of three
+    student updates on sCM alone, then the student, sCM and DMD2, on one
+    update in three and the fake score on the other two, each network with
+    its own Adam and the power EMA (rate 0.1) on the student's updates at
+    the student's own count. On the reference's draws, `Trainer` over
+    `ConsistencyDistillationObjective` lands every network, the EMA and both
+    Adams' moments where rCM's float64 run does, held by the float64 rule.
+
+    rCM's loop backpropagates the rows' summed loss and Dew the mean, so
+    Dew's Adam takes rCM's epsilon over the eight rows and its moments are
+    rCM's over 8 and 64; the steps are the same. Adam's decays are 0.5 and
+    0.75, exact with their powers in binary, since optax rounds its bias
+    corrections in float32 where torch keeps float64. `dcm` runs the same
+    loop on rCM's discrete-time consistency (`_student_dcm_step`): two
+    teacher Euler steps apart on an 8-point grid at shift 5."""
+    from dew.objectives.diffusion.objective import FAKE_SCORE
+    from dew.training import Trainer
+
+    config = json.loads(str(TRAINING["config"]))
+    rows = TRAINING["pixels"].shape[0]
+    b1, b2 = config["betas"]
+    task, state = distilled(monkeypatch, optax.adam(config["learning_rate"], b1=b1, b2=b2,
+                                                    eps=config["epsilon"] / rows), prefix)
+    params, opt_state = state.variables["params"], state.opt_state
+    for name, got in (("student", params["weights"]), ("fake_score", params[FAKE_SCORE]["weights"]),
+                      ("ema", state.ema["params"]["weights"])):
+        key = f"{prefix}{name}/weights"
+        assert_as_exact_as_the_reference(got, TRAINING[key], TRAINING[f"{key}_f64"], key)
+    for name, label, held in (("student", "student", lambda tree: tree["weights"]),
+                              ("fake_score", FAKE_SCORE, lambda tree: tree[FAKE_SCORE]["weights"])):
+        adam = opt_state.inner_states[label].inner_state.inner_state[0]
+        assert int(adam.count) == int(TRAINING[f"{prefix}{name}/count"])
+        for moment, power in (("mu", 1), ("nu", 2)):
+            key = f"{prefix}{name}/{moment}"
+            assert_as_exact_as_the_reference(held(getattr(adam, moment)) * rows ** power, TRAINING[key],
+                                             TRAINING[f"{key}_f64"], f"{prefix}{name} Adam {moment}")
+    with pytest.raises(ValueError, match="accumulation=1"):
+        Trainer(task, optax.adam(1e-3), key=0, accumulation=2)
+
+
+def test_training_at_rcms_published_optimizer_is_rcms_up_to_optax_rounding(monkeypatch):
+    """The same loop at rCM's published AdamW (lr 1e-4, betas 0.9 and
+    0.99, weight decay 0.1). optax rounds Adam's bias corrections 1 - b^k in
+    float32, and each Adam step is at most the learning rate (Kingma & Ba,
+    section 2.1, as (1 - b1) = sqrt(1 - b2) here), so step k of a network
+    lands up to lr (|e1_k| + |e2_k| / 2 + |e1_k e2_k|) from torch's, e_k the
+    relative error of optax's float32 correction, computed here as optax
+    computes it. The student's distance from rCM's float64 run is held to
+    twice the reference's float32 one plus the sum of those over its steps."""
+    config = json.loads(str(TRAINING["config"]))
+    published = json.loads(str(TRAINING["published"]))
+    rows = TRAINING["pixels"].shape[0]
+    (b1, b2), lr = published["betas"], published["lr"]
+    _, state = distilled(monkeypatch, optax.adamw(lr, b1=b1, b2=b2, eps=published["eps"] / rows,
+                                                  weight_decay=published["weight_decay"]))
+
+    def error(decay, step):
+        rounded = 1 - jnp.asarray(decay, jnp.float32) ** jnp.asarray(step, jnp.int32)
+        exact = 1 - decay ** step
+        return abs(float(rounded) - exact) / exact
+
+    steps = range(1, int(TRAINING["published/student/count"]) + 1)
+    slack = sum(lr * (error(b1, k) + error(b2, k) / 2 + error(b1, k) * error(b2, k)) for k in steps)
+    student = np.asarray(state.variables["params"]["weights"], np.float64)
+    truth = TRAINING["published/student/weights_f64"]
+    theirs = distance(TRAINING["published/student/weights"], truth)
+    assert distance(student, truth) <= 2 * theirs + slack, (distance(student, truth), theirs, slack)
+    assert config["iterations"] == 10
 
 
 def test_a_reverse_only_kernel_takes_forward_mode_through_its_reference():

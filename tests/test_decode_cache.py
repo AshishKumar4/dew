@@ -6,7 +6,12 @@ import numpy as np
 import pytest
 from flax import linen as nn
 
-from dew.nn.attention import causal_attention_mask, open_kv_cache, scaled_dot_product_attention
+from dew.nn.attention import (
+    cached_validity,
+    causal_attention_mask,
+    open_kv_cache,
+    scaled_dot_product_attention,
+)
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.linear import GatedDeltaNet
 from dew.nn.mla import MultiHeadLatentAttention
@@ -18,7 +23,7 @@ class CachedAttention(nn.Module):
         positions, append = open_kv_cache(self, values, 8, valid=valid)
         keys, cached_values = append(values, values)
         mask = causal_attention_mask(
-            positions, keys.shape[1], key_valid=self.get_variable("cache", "cache_valid"))
+            positions, keys.shape[1], key_valid=cached_validity(self, keys.shape[1]))
         return scaled_dot_product_attention(values, keys, cached_values,
                                             implementation="xla", mask=mask)
 

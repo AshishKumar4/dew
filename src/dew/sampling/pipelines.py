@@ -56,7 +56,9 @@ class _Resolved:
     `plan` is this process's rows of the request, `process` and `times` the
     trajectory it walks, `request` the key its noise is drawn from, and
     `posterior` the key a VAE encode samples with. `tokens` and `null_tokens`
-    are the two conditioning branches, `samples` whatever image, mask, noise
+    are the two conditioning branches, as tokens to encode or, where
+    `encoded` names the branch, already encoded (`null_tokens` None for an
+    encoded call with no unconditional branch), `samples` whatever image, mask, noise
     or latent state the caller handed over, and `signature` the value the
     pool compares before any of it reaches a device.
     """
@@ -65,13 +67,14 @@ class _Resolved:
     process: Process
     request: jax.Array
     tokens: dict
-    null_tokens: dict
+    null_tokens: dict | None
     shape: tuple[int, ...]
     count: int
     times: tuple[float, ...] | None
     samples: dict
     posterior: jax.Array | None
     signature: object
+    encoded: frozenset[str] = frozenset()
 
 
 @struct.dataclass
@@ -128,7 +131,7 @@ class Images(Generic[ArrayT]):
 class TextToImage:
     """`pipe(prompts, key=0)` or `pipe(prompts, steps=40, guidance=4.0, solver=Heun(), key=key)`.
 
-    `params` is the objective's whole tree, the EMA copy merged over the live
+    `variables` is the objective's whole tree, the EMA copy merged over the live
     weights when the run kept one, so a sample comes from the weights a run
     publishes. `steps`, `guidance` and `solver` are the defaults a call
     omits; an objective or a loaded source sets them. `grid` prepares the
@@ -147,7 +150,7 @@ class TextToImage:
     model: nn.Module
     process: Process
     inputs: InputSpec
-    params: Variables
+    variables: Variables
     autoencoder: AutoEncoder | None = None
     steps: int = 50
     guidance: Guidance | None = None
@@ -161,11 +164,17 @@ class TextToImage:
     None encodes it on every call, for a source that has none."""
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "params", freeze(dict(self.params)))
+        object.__setattr__(self, "variables", freeze(dict(self.variables)))
 
     def bind(self, variables: Variables) -> TextToImage:
-        """Bind another variables snapshot without rebuilding the model or encoders."""
-        return replace(self, params=variables)
+        """Bind another snapshot. Changed encoder leaves get a new lazy blank;
+        a denoiser-only change keeps the already encoded branch."""
+        from dew.objectives.diffusion.objective import FixedBlank
+
+        blank = self.blank
+        if isinstance(blank, FixedBlank):
+            blank = blank.rebind(variables.get("encoders", {}))
+        return replace(self, variables=variables, blank=blank)
 
     def quantized(self, spec: Quantization) -> TextToImage:
         """This task with its denoiser's weights stored quantized as `spec`
@@ -176,11 +185,11 @@ class TextToImage:
 
         example = self.prepare("", key=0, steps=1)
         denoiser = {
-            name: value for name, value in self.params.items() if name not in ("encoders", "autoencoder")
+            name: value for name, value in self.variables.items() if name not in ("encoders", "autoencoder")
         }
         model, variables = quantize_for_serving(self.model, denoiser, spec, example.noise,
                                                 jnp.zeros(example.noise.shape[:1]), **example.conditions)
-        return replace(self, model=model, params={**self.params, **variables})
+        return replace(self, model=model, variables={**self.variables, **variables})
 
     @classmethod
     def from_objective(cls, objective: DiffusionObjective, variables: Variables) -> TextToImage:
@@ -192,7 +201,7 @@ class TextToImage:
         return cls(objective.model, objective.process, objective.inputs,
                    _without_loss_heads(variables), autoencoder,
                    steps=objective.steps, guidance=objective.guidance, solver=objective.solver,
-                   blank=objective.blank_conditions)
+                   blank=objective._fixed_blank.rebind(variables.get("encoders", {})))
 
     @classmethod
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
@@ -208,6 +217,10 @@ class TextToImage:
         policy. With `mesh` the weights restore straight onto that mesh under
         `layout`, the way the trainer places them; without one the default
         mesh uses the current pool.
+        The configured unconditional prompt uses the same eager encoding as
+        an objective's pipeline, at its recorded construction-time matmul
+        precision. The required `condition_precision` field is None when
+        the objective used JAX's default, independent of the caller's context.
         dtype overrides computation in the model, encoders and VAE. param_dtype
         overrides parameter storage; None preserves checkpoint storage exactly.
         """
@@ -216,37 +229,63 @@ class TextToImage:
         from dew.diffusion.process import Process
         from dew.inference.tasks import run_record
         from dew.nn.autoencoders import AutoEncoder
+        from dew.objectives.diffusion.objective import FixedBlank, _without_loss_heads
         from dew.records import integer, record as fields, text
         from dew.registry import objectives, solvers
 
         record = run_record(directory, step)
         config = ModelConfig.from_dict(fields(record['model'], 'model'))
+        inputs_record = fields(record['inputs'], 'inputs')
+        autoencoder_record = None if record['autoencoder'] is None else fields(record['autoencoder'],
+                                                                               'autoencoder')
         compute = dtype_name(resolve_dtype(dtype))
         if compute is not None:
             config = replace(config, dtype=compute)
+            conditions = {keyword: fields(condition, keyword) for keyword, condition
+                          in fields(inputs_record['conditions'], 'conditions').items()}
+            inputs_record = {**inputs_record, 'conditions': {
+                keyword: {**condition,
+                          'encoder': _computing(fields(condition['encoder'], 'encoder'), compute)}
+                for keyword, condition in conditions.items()}}
+            if autoencoder_record is not None:
+                autoencoder_record = _computing(autoencoder_record, compute)
         averaged = False if objectives[text(record['objective'], 'objective')]._ema_is_reference else ema
-        params = Checkpoints(directory).variables(ema=averaged, step=step, mesh=mesh, layout=layout,
-                                                 param_dtype=param_dtype)
-        inputs = InputSpec.from_json(fields(record['inputs'], 'inputs'), params=params.get('encoders', {}))
-        autoencoder = None if record['autoencoder'] is None else AutoEncoder.from_json(
-            fields(record['autoencoder'], 'autoencoder'), params=params['autoencoder'])
+        params = Checkpoints(directory).variables(
+            ema=averaged, step=step, mesh=mesh, layout=layout, param_dtype=param_dtype,
+            parameter_roots=_parameter_roots(inputs_record, autoencoder_record))
+        inputs = InputSpec.from_json(inputs_record, params=params.get('encoders', {}))
+        end_to_end = record.get('end_to_end')
+        autoencoder = None
+        if autoencoder_record is not None and end_to_end is not None:
+            from dew.objectives.diffusion.end_to_end import AUTOENCODER, EndToEnd
+            tuning = _built(EndToEnd, fields(end_to_end, 'end_to_end'))
+            frozen = AutoEncoder.from_json(autoencoder_record, params=params['params'][AUTOENCODER])
+            autoencoder, params = tuning.tuned(frozen, params)
+        elif autoencoder_record is not None:
+            autoencoder = AutoEncoder.from_json(autoencoder_record, params=params['autoencoder'])
         solver_record = fields(record['solver'], 'solver')
         solver = solvers.build(text(solver_record['name'], 'solver name'),
                                 fields(solver_record['fields'], 'solver fields'))
         guidance = None if record['guidance'] is None else _built(CFG, fields(record['guidance'], 'guidance'))
+        precision = record['condition_precision']
+        precision = None if precision is None else text(precision, 'condition_precision')
         return cls(config.build(), Process.from_json(fields(record['process'], 'process')),
-                   inputs, params, autoencoder, steps=integer(record['sampling_steps'], 'sampling_steps'),
-                   guidance=guidance, solver=solver)
+                   inputs, _without_loss_heads(params), autoencoder,
+                   steps=integer(record['sampling_steps'], 'sampling_steps'),
+                   guidance=guidance, solver=solver,
+                   blank=FixedBlank(inputs, params.get("encoders", {}), precision))
 
     @classmethod
-    def from_pretrained(cls, repo_id: str, *, ema: bool | None = None, mesh: MeshSpec | None = None,
+    def from_pretrained(cls, repo_id: str, *, revision: str | None = None,
+                        ema: bool | None = None, mesh: MeshSpec | None = None,
                         layout: Layout | None = None, dtype: DTypeLike | None = None,
                         param_dtype: DTypeLike | None = None) -> TextToImage:
         """A run directory published to the Hugging Face Hub, as
         `HfApi().upload_folder` of the run directory writes it."""
         from dew.interop.hub import pull_from_hub
 
-        return cls.from_run(os.fspath(pull_from_hub(repo_id)), ema=ema, mesh=mesh, layout=layout,
+        return cls.from_run(os.fspath(pull_from_hub(repo_id, revision=revision)),
+                            ema=ema, mesh=mesh, layout=layout,
                             dtype=dtype, param_dtype=param_dtype)
 
     @classmethod
@@ -293,17 +332,18 @@ class TextToImage:
             return self.blank(given)
         leaves = jax.tree.leaves(tokens)
         if leaves and leaves[0].shape[0] != 1:
-            return _encode(plan.sharding)(self._conditions, self.params, plan.place(plan.pad(tokens)))
-        return _encode(None)(self._conditions, self.params, jax.tree.map(jnp.asarray, tokens))
+            return _encode(plan.sharding)(self._conditions, self.variables, plan.place(plan.pad(tokens)))
+        return _encode(None)(self._conditions, self.variables, jax.tree.map(jnp.asarray, tokens))
 
 
     def prepare(
         self,
-        prompts: str | Sequence[str | Mapping[str, object]],
+        prompts: str | Sequence[str | Mapping[str, object]] | None = None,
         *,
+        conditions: Mapping[str, Conditioning] | None = None,
         key: int | jax.Array | None = None,
         steps: int | None = None,
-        unconditional: str | Sequence[str | Mapping[str, object]] | None = None,
+        unconditional: str | Sequence[str | Mapping[str, object]] | Mapping[str, Conditioning] | None = None,
         image: ArrayLike | None = None,
         image_latents: ArrayLike | None = None,
         mask: ArrayLike | None = None,
@@ -321,11 +361,20 @@ class TextToImage:
         for a continuation or refiner handoff and is never noised again.
         Explicit times select a partial trajectory in the prepared process.
         encode_key samples a VAE posterior; None uses its mean.
+
+        `conditions` are prompts already encoded, `{keyword: condition}` with
+        one row per sample, in place of `prompts`: a pipeline's conditioner
+        loaded alone encodes them, so its text encoder need not share the
+        device with the denoiser (`load_diffusion_source(text=False)`).
+        `unconditional` encoded the same way, one row or one per sample, is
+        the branch guidance reads; without it the task's own blank prompt is
+        encoded where the text encoder is loaded, and otherwise the call
+        takes no guidance. Each row's noise is the one a prompted call draws.
         """
-        mesh = mesh_of(self.params)
+        mesh = mesh_of(self.variables)
 
         def resolve() -> _Resolved:
-            return self._resolved(mesh, prompts, key=key, steps=steps,
+            return self._resolved(mesh, prompts, conditions, key=key, steps=steps,
                                   unconditional=unconditional, image=image,
                                   image_latents=image_latents, mask=mask, noise=noise,
                                   initial=initial, times=times, encode_key=encode_key)
@@ -370,6 +419,9 @@ class TextToImage:
         solver = self.solver if solver is None else solver
         if prepared is not None:
             prepared = self._checked_inputs(prepared, mesh, count)
+            if chosen is not None and prepared.conditions and not prepared.unconditional:
+                raise ValueError("guidance reads the unconditional branch, which these inputs lack; prepare "
+                                 "them with an encoded unconditional= too, or call with guidance=None")
         controls = (count, times, solver, chosen, self.final_denoise, decode,
                     tuple(jax.device_get(jax.random.key_data(request))), prepared is not None,
                     None if prepared is None else prepared.rows)
@@ -404,7 +456,7 @@ class TextToImage:
                 raise ValueError("prepared conditions must match the noise batch")
         return prepared
 
-    def _resolved(self, mesh, prompts, *, key, steps, unconditional, image,
+    def _resolved(self, mesh, prompts, conditions, *, key, steps, unconditional, image,
                   image_latents, mask, noise, initial, times, encode_key) -> _Resolved:
         """Everything `prepare` settles on the host, in one value.
 
@@ -412,15 +464,22 @@ class TextToImage:
         earn is raised here, and the signature at the end is what the ranks
         compare before any of them touches a device.
         """
-        rows = [prompts] if isinstance(prompts, str) else list(prompts)
-        if not rows or not all(isinstance(prompt, (str, Mapping)) for prompt in rows):
-            raise ValueError("prompts must be a non-empty sequence of strings or conditioning records")
+        given: list | Mapping[str, Conditioning]
+        if prompts is not None and conditions is None:
+            given = [prompts] if isinstance(prompts, str) else list(prompts)
+            if not given or not all(isinstance(prompt, (str, Mapping)) for prompt in given):
+                raise ValueError("prompts must be a non-empty sequence of strings or conditioning records")
+            samples_count = len(given)
+        elif conditions is not None and prompts is None:
+            given, samples_count = conditions, _encoded_rows(conditions)
+        else:
+            raise ValueError("pass the prompts or their encoded conditions, one of the two")
         request = request_key(key)
         count = self.steps if steps is None else steps
         process, source_times = self.prepared_process(count)
         selected = _time_grid(times) if times is not None else source_times
-        plan = RowPlan.over(mesh, len(rows))
-        tokens, null_tokens = self._tokenized(rows, unconditional)
+        plan = RowPlan.over(mesh, samples_count)
+        tokens, null_tokens, encoded = self._branches(given, unconditional, samples_count)
         shape = self.latent_shape
         if image is not None and image_latents is not None:
             raise ValueError("pass image or image_latents, not both")
@@ -433,40 +492,78 @@ class TextToImage:
         posterior = encode_key
         if posterior is not None:
             posterior = request_key(posterior)
-        samples = self._supplied(len(rows), shape, image=image, image_latents=image_latents,
+        samples = self._supplied(samples_count, shape, image=image, image_latents=image_latents,
                                  mask=mask, noise=noise, initial=initial)
         controls = (plan.rows, count, selected, shape,
                     tuple(jax.device_get(jax.random.key_data(request))),
                     None if posterior is None else tuple(np.asarray(jax.random.key_data(posterior))))
         signature = generation_signature((tokens, null_tokens, samples), controls)
         return _Resolved(plan, process, request, tokens, null_tokens, shape, count,
-                         selected, samples, posterior, signature)
+                         selected, samples, posterior, signature, encoded)
 
-    def _tokenized(self, rows: list, unconditional) -> tuple[dict, dict]:
-        """The conditional and unconditional token fields, one row per prompt.
+    def _branches(self, given: list | Mapping[str, Conditioning], unconditional,
+                  count: int) -> tuple[dict, dict | None, frozenset[str]]:
+        """The conditional and unconditional branches, one row per sample, as
+        tokens the text encoder encodes or as the encodings a caller passed,
+        which the returned set names ("given", "null"). `given` is the prompt
+        rows, or the encodings `{keyword: condition}`.
 
-        `unconditional` None is the task's own blank prompt; a caller's
-        negatives are one row or one per prompt, and an encoder that answers
-        a different count is refused here.
+        Negatives are one row or one per sample. `unconditional` None is the
+        task's own blank prompt, encoded where the text encoder is loaded; an
+        encoded call without the text encoder then has no unconditional
+        branch (None), which only an unguided call takes.
         """
-        if unconditional is None:
-            negatives = None
+        encoded = set()
+        if isinstance(given, Mapping):
+            tokens = self._encodings(given, (count,), "conditions")
+            encoded.add("given")
         else:
+            self._text_encoder("a prompt is encoded with it")
+            tokens = {keyword: condition.encoder.tokenize(given)
+                      for keyword, condition in self.inputs.conditions.items()}
+            for leaf in jax.tree.leaves(tokens):
+                if leaf.ndim < 1 or leaf.shape[0] != count:
+                    raise ValueError("tokenized conditions must have one row per prompt")
+        if isinstance(unconditional, Mapping):
+            null = self._encodings(unconditional, (1, count), "unconditional")
+            return tokens, null, frozenset({*encoded, "null"})
+        if unconditional is None and isinstance(given, Mapping) and not self._text_held():
+            return tokens, None, frozenset(encoded)
+        self._text_encoder("an unconditional prompt is encoded with it")
+        negatives = None
+        if unconditional is not None:
             negatives = [unconditional] if isinstance(unconditional, str) else list(unconditional)
-            if len(negatives) not in (1, len(rows)):
+            if len(negatives) not in (1, count):
                 raise ValueError("unconditional inputs need one row or one row per prompt")
-        tokens = {keyword: condition.encoder.tokenize(rows)
-                  for keyword, condition in self.inputs.conditions.items()}
         null_tokens = {keyword: condition.encoder.tokenize(
             [condition.unconditional] if negatives is None else negatives)
             for keyword, condition in self.inputs.conditions.items()}
-        for leaf in jax.tree.leaves(tokens):
-            if leaf.ndim < 1 or leaf.shape[0] != len(rows):
-                raise ValueError("tokenized conditions must have one row per prompt")
         for leaf in jax.tree.leaves(null_tokens):
-            if leaf.ndim < 1 or leaf.shape[0] not in (1, len(rows)):
+            if leaf.ndim < 1 or leaf.shape[0] not in (1, count):
                 raise ValueError("unconditional tokens must have one row or one per prompt")
-        return tokens, null_tokens
+        return tokens, null_tokens, frozenset(encoded)
+
+    def _text_held(self) -> bool:
+        """Whether every condition's encoder has its weights in this task."""
+        held = self.variables.get("encoders", {})
+        return all(keyword in held for keyword in self.inputs.conditions)
+
+    def _text_encoder(self, needed: str) -> None:
+        if not self._text_held():
+            raise ValueError(
+                f"this task's text encoder is not loaded (load_diffusion_source(text=False)), and {needed}; "
+                "encode the prompts with the pipeline's conditioner alone and pass "
+                "prepare(conditions=..., unconditional=...)")
+
+    def _encodings(self, given: Mapping[str, Conditioning], rows: tuple[int, ...], name: str) -> dict:
+        """A caller's encoded branch, checked against the task's conditions."""
+        if set(given) != set(self.inputs.conditions):
+            raise ValueError(f"encoded {name} are keyed by {sorted(self.inputs.conditions)}, "
+                             f"not {sorted(given)}")
+        for leaf in jax.tree.leaves(dict(given)):
+            if leaf.ndim < 1 or leaf.shape[0] not in rows:
+                raise ValueError(f"encoded {name} need {' or '.join(map(str, rows))} rows, got {leaf.shape}")
+        return dict(given)
 
     def _supplied(self, rows: int, shape: tuple[int, ...], *, image, image_latents,
                   mask, noise, initial) -> dict[str, np.ndarray]:
@@ -500,15 +597,23 @@ class TextToImage:
         batch first because its single row would not carry the mask.
         """
         plan, process = settled.plan, settled.process
-        given = _encode(plan.sharding)(self._conditions, self.params,
-                                       plan.place(plan.pad(settled.tokens)))
-        null = self._unconditional(settled.null_tokens, plan, given, configured=configured)
+        given = plan.place(plan.pad(settled.tokens))
+        if "given" not in settled.encoded:
+            given = _encode(plan.sharding)(self._conditions, self.variables, given)
+        if settled.null_tokens is None:
+            null = {}
+        elif "null" in settled.encoded:
+            single = jax.tree.leaves(settled.null_tokens)[0].shape[0] == 1
+            null = (jax.device_put(settled.null_tokens) if single
+                    else plan.place(plan.pad(settled.null_tokens)))
+        else:
+            null = self._unconditional(settled.null_tokens, plan, given, configured=configured)
         if not settled.samples:
             return given, null, _noise(plan.sharding)(process, plan.keys(settled.request),
                                                       settled.shape)
         start = process.times(settled.count)[0] if settled.times is None else settled.times[0]
         initial_state, spatial = _image_start(plan.sharding)(
-            self.autoencoder, process, settled.shape, self.params,
+            self.autoencoder, process, settled.shape, self.variables,
             plan.place(plan.pad(settled.samples)), plan.keys(settled.request),
             settled.posterior, start)
         if spatial:
@@ -532,7 +637,7 @@ class TextToImage:
         """Images in [-1, 1], `[rows, H, W, C]`. `guidance` is a classifier-free
         guidance scale, or a `CFG` with its interval, or None for the plain
         conditional prediction; omitted, it is the task's default."""
-        mesh = mesh_of(self.params)
+        mesh = mesh_of(self.variables)
 
         def resolve():
             return self._settings(mesh, prompts, steps=steps, guidance=guidance,
@@ -549,10 +654,44 @@ class TextToImage:
             assert prepared.rows is not None
             plan = RowPlan.over(mesh, prepared.rows)
             generated = _run(plan.sharding)(self.model, process, self.autoencoder, self.finish, count,
-                                         solver, chosen, self.final_denoise, times, decode, self.params,
+                                         solver, chosen, self.final_denoise, times, decode, self.variables,
                                          prepared.conditions, prepared.unconditional,
                                          prepared.noise, jax.random.fold_in(request, 1))
         return replace(generated, rows=plan.rows)
+
+
+def _parameter_roots(inputs: Mapping[str, object], autoencoder: Mapping[str, object] | None
+                     ) -> tuple[tuple[str, ...], ...]:
+    """The parameter roots of a recorded run's tree, which a storage override
+    casts: the denoiser's, each condition encoder's own collections and the
+    autoencoder's. The rest keep the dtypes they were saved in."""
+    from dew.objectives.base import FROZEN
+    from dew.records import record, text
+    from dew.registry import encoders
+
+    roots: list[tuple[str, ...]] = [("params",), (FROZEN,)]
+    for keyword, condition in record(inputs['conditions'], 'conditions').items():
+        name = text(record(record(condition, keyword)['encoder'], 'encoder')['name'], 'encoder name')
+        collections = encoders[name].parameter_collections
+        roots.extend([("encoders", keyword)] if collections is None else
+                     [("encoders", keyword, collection) for collection in collections])
+    if autoencoder is not None:
+        roots.append(("autoencoder",))
+    return tuple(roots)
+
+
+def _computing(owner: Mapping[str, object], compute: str) -> Mapping[str, object]:
+    """A recorded encoder or autoencoder computing in `compute`: its own
+    `dtype`, and the dtype of the model it wraps where it records one."""
+    from dew.records import record
+
+    recorded = dict(record(owner['fields'], 'fields'))
+    if 'dtype' in recorded:
+        recorded['dtype'] = compute
+    model = recorded.get('model')
+    if isinstance(model, Mapping) and 'dtype' in model:
+        recorded['model'] = {**record(model, 'model'), 'dtype': compute}
+    return {**owner, 'fields': recorded}
 
 
 def _time_grid(times) -> tuple[float, ...]:
@@ -619,6 +758,14 @@ def _encode(rows: jax.sharding.NamedSharding | None):
         return {keyword: encoder.encode(params["encoders"][keyword], tokens[keyword])
                 for keyword, encoder in conditions}
     return jax.jit(encode, static_argnums=(0,), in_shardings=(None, rows), out_shardings=rows)
+
+
+def _encoded_rows(conditions: Mapping[str, Conditioning]) -> int:
+    """The samples an encoded branch holds: its leaves' common leading axis."""
+    counts = {leaf.shape[0] for leaf in jax.tree.leaves(dict(conditions)) if leaf.ndim}
+    if len(counts) != 1:
+        raise ValueError(f"encoded conditions need one row count across their leaves, got {sorted(counts)}")
+    return counts.pop()
 
 
 @functools.cache

@@ -78,10 +78,10 @@ def main(config: Config):
         stream.close()
     score = jax.jit(lambda params: objective.scalar_loss(params, probe,
                    Step(step=jnp.asarray(0), key=jax.random.key(7), ema=None))[0])
-    initial_loss = float(score(trainer.initial_state().params))
+    initial_loss = float(score(trainer.initial_state().variables))
     state = trainer.fit(data, steps=config.steps, log_every=1, checkpoint_every=config.steps)
     checkpoints.wait()
-    final_loss = float(score(state.params))
+    final_loss = float(score(state.variables))
     task = objective.pipeline(state, ema=False, processor=RunProcessor(tokenizer))
     generated = task(config.prompt, config.sample_tokens, key=1).text[0]
     (config.out / "sample.txt").write_text(config.prompt + generated + "\n")

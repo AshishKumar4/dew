@@ -17,7 +17,10 @@ _E2M1_MAX = float(jnp.finfo(jnp.float4_e2m1fn).max)
 
 def _power_of_two_ceil(value):
     """2 ** ceil(log2(value)) off the fp32 bits, as the kernels' fast_round_scale
-    computes it (kernel.py:22-37)."""
+    computes it (kernel.py:22-37). Unclamped, unlike the host codecs'
+    `ceil_to_ue8m0` rule (exponents 1 to 254): only past the normal range do
+    they part, a zero giving 0.0 here and 2 ** -126 there, a value above
+    2 ** 127 inf here and 2 ** 127 there."""
     bits = jax.lax.bitcast_convert_type(value.astype(jnp.float32), jnp.int32)
     exponent = ((bits >> 23) & 0xFF) - 127 + ((bits & 0x7FFFFF) != 0).astype(jnp.int32)
     return jax.lax.bitcast_convert_type((exponent + 127) << 23, jnp.float32)
@@ -47,6 +50,31 @@ def _e2m1(values):
     """Round fp32 values within +-6 to E2M1, ties to even (`_round`); IEEE-style
     e2m1 would stop at 3 where E2M1 reaches 6, so reduce_precision cannot."""
     return _round(values, 1, 0)
+
+
+# E2M1's midpoints, each with whether a value exactly on it rounds up: to
+# even, so up where the lower neighbour's mantissa bit is 1 (0.5, 1.5, 3).
+_E2M1_MIDPOINTS = ((0.25, False), (0.75, True), (1.25, False), (1.75, True), (2.5, False), (3.5, True),
+                   (5.0, False))
+_E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+def _e2m1_quotient(values, scale):
+    """E2M1 of `values / scale` under an E4M3 scale, ties to even, clamped to
+    +-6, without dividing: |values| is compared with each midpoint times the
+    scale, a product of at most 7 significant bits and so exact, which
+    rounds the exact quotient. For bf16 values that is the rounding of the
+    correctly rounded quotient the kernel divides to, since a bf16 value off
+    a midpoint times the scale lies further from it than half an fp32 ulp of
+    the quotient. A division would not do: XLA divides by a broadcast
+    through its reciprocal, and XLA GPU's division is not correctly rounded,
+    either of which carries a quotient across a tie (-0.146484375 /
+    0.1171875 comes out -1.2500001, rounding to -1.5 where the kernel's
+    -1.25 rounds to -1.0)."""
+    magnitude = jnp.abs(values)
+    index = sum(((magnitude > point * scale) | ((magnitude == point * scale) if up else False))
+                .astype(jnp.int32) for point, up in _E2M1_MIDPOINTS)
+    return jnp.copysign(jnp.asarray(_E2M1_VALUES, jnp.float32)[index], values)
 
 
 def straight_through(x, rounded):
@@ -81,8 +109,9 @@ def fake_quant_fp4(x, block: int, e4m3_scale: bool):
     if e4m3_scale:
         # the kernel's cast saturates at E4M3's 448 (cvt.rn.satfinite)
         scale = _round_e4m3fn(jnp.minimum(jnp.maximum(amax, _E2M1_MAX * 2 ** -9) / _E2M1_MAX, _E4M3_MAX))
+        rounded = _e2m1_quotient(blocks, scale)
     else:
         scale = _power_of_two_ceil(
             jnp.maximum(amax, _E2M1_MAX * 2 ** -126) * jnp.float32(1 / _E2M1_MAX))
-    rounded = _e2m1(jnp.clip(blocks / scale, -_E2M1_MAX, _E2M1_MAX))
+        rounded = _e2m1(jnp.clip(blocks / scale, -_E2M1_MAX, _E2M1_MAX))
     return straight_through(x, (rounded * scale).reshape(x.shape))

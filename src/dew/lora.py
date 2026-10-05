@@ -89,6 +89,45 @@ class LoRA:
     and cannot save itself. A run record leaves it out: the source the
     record names is where the bindings come from."""
 
+    def to_json(self) -> dict:
+        """The bound adapter on native module paths, independent of source tensor names."""
+        ranks = {target.rank for target in self.targets.values()}
+        alphas = {target.alpha for target in self.targets.values()}
+        if len(ranks) != 1 or len(alphas) != 1:
+            raise ValueError("a recorded LoRA requires one rank and alpha across its modules")
+        return {'rank': next(iter(ranks)), 'alpha': next(iter(alphas)),
+                'rslora': self.rslora, 'dropout': self.dropout,
+                'modules': ['/'.join(path) for path in sorted(self.targets)]}
+
+    @classmethod
+    def from_json(cls, record: Mapping) -> LoRA:
+        """Rebuild the interceptor; the checkpoint, not this record, supplies its factors."""
+        from dew.records import integer, text
+        if set(record) != {'rank', 'alpha', 'rslora', 'dropout', 'modules'}:
+            raise ValueError("a LoRA record needs rank, alpha, rslora, dropout and modules")
+        rank = integer(record['rank'], 'adapter rank')
+        alpha = record['alpha']
+        if alpha is None:
+            alpha = 2 * rank
+        if (rank < 1 or isinstance(alpha, bool) or not isinstance(alpha, (int, float))
+                or not math.isfinite(alpha)):
+            raise ValueError("adapter rank must be positive and alpha must be a finite number")
+        if type(record['rslora']) is not bool:
+            raise ValueError("adapter rslora must be boolean")
+        dropout = record['dropout']
+        if isinstance(dropout, bool) or not isinstance(dropout, (int, float)) or not 0 <= dropout < 1:
+            raise ValueError("adapter dropout must be in [0, 1)")
+        modules = record['modules']
+        if not isinstance(modules, list) or not modules:
+            raise ValueError("adapter modules must be a nonempty list of native module names")
+        targets = {}
+        for module in modules:
+            path = tuple(text(module, 'adapter module').split('/'))
+            if any(not name or name in ('.', '..') for name in path) or path in targets:
+                raise ValueError("adapter modules must be distinct native module names")
+            targets[path] = Target(rank, float(alpha))
+        return cls(targets, record['rslora'], float(dropout))
+
     def scale(self, target: Target) -> float:
         return target.alpha / (math.sqrt(target.rank) if self.rslora else target.rank)
 
@@ -137,6 +176,8 @@ class LoRA:
 
         class Adapted(base):
             _dew_lora_interceptor: ClassVar[Interceptor] = staticmethod(branch)
+            _dew_lora_base: ClassVar[type[nn.Module]] = base
+            _dew_lora_spec: ClassVar[LoRA] = self
 
             def apply(self, *args, **kwargs):
                 with nn.intercept_methods(self._dew_lora_interceptor):
@@ -687,6 +728,8 @@ class _Adapted(Protocol):
     """
 
     _dew_lora_interceptor: ClassVar[Interceptor]
+    _dew_lora_base: ClassVar[type[nn.Module]]
+    _dew_lora_spec: ClassVar[LoRA]
 
 
 @runtime_checkable

@@ -951,7 +951,7 @@ def test_the_expert_shards_train_the_same_model():
 @pytest.mark.mesh
 def test_the_experts_are_really_split_across_the_expert_axis():
     state = moe_trainer(expert_size=4, fsdp_size=2).fit(Data(token_batches), steps=0)
-    experts = state.params["params"]["layers_1"]["mlp"]["experts"]
+    experts = state.variables["params"]["layers_1"]["mlp"]["experts"]
     kernel = experts["gate_proj"]["kernel"]
 
     assert kernel.sharding.spec == P('expert', None, 'fsdp')
@@ -978,13 +978,13 @@ def test_a_from_scratch_run_logs_the_load_and_moves_the_deepseek_bias():
     tracker = RecordingTracker()
     trainer = moe_trainer(1, 2, tracker=tracker, bias=True)
     fresh = trainer.initial_state()
-    assert set(fresh.params) == {"params", "moe"}
+    assert set(fresh.variables) == {"params", "moe"}
     np.testing.assert_array_equal(
-        np.asarray(fresh.params["moe"]["layers_1"]["mlp"]["gate"]["e_score_correction_bias"]), 0.0)
+        np.asarray(fresh.variables["moe"]["layers_1"]["mlp"]["gate"]["e_score_correction_bias"]), 0.0)
 
     state = trainer.fit(Data(token_batches), steps=steps, log_every=1)
 
-    bias = np.asarray(state.params["moe"]["layers_1"]["mlp"]["gate"]["e_score_correction_bias"])
+    bias = np.asarray(state.variables["moe"]["layers_1"]["mlp"]["gate"]["e_score_correction_bias"])
     assert np.any(bias != 0), "the bias never moved"
     assert bias.min() < 0 < bias.max(), bias
     # Every step moved every expert by the rate, one way or the other.
@@ -1001,7 +1001,7 @@ def test_a_from_scratch_run_logs_the_load_and_moves_the_deepseek_bias():
 def test_balancing_needs_a_router_with_a_bias():
     trainer = moe_trainer(1, 2)
     trainer.objective.balance_rate = 0.01
-    params = trainer.initial_state().params
+    params = trainer.initial_state().variables
     with pytest.raises(ValueError, match="bias=True"):
         trainer.objective.scalar_loss(params, next(token_batches()),
                                Step(step=jnp.asarray(0), key=jax.random.key(0), ema=None))
@@ -1022,7 +1022,7 @@ def test_the_balancing_bias_is_one_replicated_value_across_every_shard():
     """
     steps = 3
     state = moe_trainer(4, 2, bias=True).fit(Data(token_batches), steps=steps)
-    bias = state.params["moe"]["layers_1"]["mlp"]["gate"]["e_score_correction_bias"]
+    bias = state.variables["moe"]["layers_1"]["mlp"]["gate"]["e_score_correction_bias"]
 
     assert bias.sharding.spec == jax.sharding.PartitionSpec(), bias.sharding
     assert len(bias.addressable_shards) == jax.device_count()
@@ -1060,7 +1060,7 @@ trainer = Trainer(LMObjective(model, suite.SEQ_LEN, balance_rate=0.01),
                   optax.adam(1e-3), key=jax.random.key(0),
                   mesh=MeshSpec(), layout=Layout(min_shard=suite.TINY_SHARD))
 state = trainer.fit(suite.Data(suite.token_batches), steps={steps})
-bias = state.params["moe"]["layers_1"]["mlp"]["gate"]["e_score_correction_bias"]
+bias = state.variables["moe"]["layers_1"]["mlp"]["gate"]["e_score_correction_bias"]
 print(",".join(repr(float(value)) for value in np.asarray(bias)))
 """
     environment = {**os.environ, "XLA_FLAGS": "--xla_force_host_platform_device_count=1",

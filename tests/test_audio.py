@@ -129,8 +129,8 @@ def test_audio_input_gradients_and_sgd_step_match_reference(audio):
                                data["input_features_mask"])
         return projector.apply({"params": params["projector"]}, encoded.features, method=method)
 
-    def loss(params, inputs):
-        return jnp.mean(forward(params, inputs) * data["coefficient"])
+    def loss(variables, inputs):
+        return jnp.mean(forward(variables, inputs) * data["coefficient"])
 
     value, (grads, input_grad) = jax.jit(jax.value_and_grad(loss, argnums=(0, 1)))(
         state, data["input_features"]

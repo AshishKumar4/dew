@@ -7,8 +7,8 @@ from dew.sampling import CFG, DPMSolverMultistep, EulerAncestral, Heun, Sampling
 
 
 @cache
-def from_pretrained(repo_id):
-    return TextToImage.from_pretrained(repo_id)
+def from_pretrained(repo_id, *, revision=None):
+    return TextToImage.from_pretrained(repo_id, revision=revision)
 
 
 @cache
@@ -17,4 +17,4 @@ def text_model(name):
     return model.text_generation(sampling=Sampling(temperature=0))
 
 
-pipe = from_pretrained("dewml/hybrid-dit-176m")
+pipe = from_pretrained("dewml/hybrid-dit-176m", revision="32d59de89683d59824361144b87bdcaf3e742598")

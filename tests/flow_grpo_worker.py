@@ -90,7 +90,7 @@ def main() -> None:
     initial = trainer.place()[0]
     rolled = rollout(initial, shard_batch(trainer.device_mesh, local), jax.random.key(71))
     reassembled = shard_batch(trainer.device_mesh, rolled)
-    scores = objective.log_probs(initial.params, reassembled)
+    scores = objective.log_probs(initial.variables, reassembled)
     compared = collective_host((scores, reassembled["old_log_probs"], reassembled["rewards"],
                                 reassembled["advantages"]), phase="flow test likelihoods")
     error = float(np.max(np.abs(compared[0] - compared[1])))
@@ -102,10 +102,10 @@ def main() -> None:
     )
     final = trainer.fit(data, steps=1, log_every=1, eval_every=1, metrics=(metric,), preview=True)
     change = float(optax.tree.norm(jax.tree.map(
-        lambda a, b: a - b, final.params["params"], initial.params["params"])))
+        lambda a, b: a - b, final.variables["params"], initial.variables["params"])))
     frozen = all(np.array_equal(np.asarray(a), np.asarray(b))
                  for a, b in zip(jax.tree.leaves(final.ema), jax.tree.leaves(initial.ema), strict=True))
-    params = collective_host(final.params["params"], phase="flow test parameters")
+    params = collective_host(final.variables["params"], phase="flow test parameters")
     np.savez(output.with_suffix(".npz"), **{
         jax.tree_util.keystr(path): np.asarray(value)
         for path, value in jax.tree_util.tree_flatten_with_path(params)[0]})

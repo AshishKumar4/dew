@@ -16,7 +16,6 @@ import dataclasses
 import functools
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from importlib import import_module
 from typing import TYPE_CHECKING, Protocol
 
 import jax
@@ -253,12 +252,12 @@ def _requested(generated: Generation, budget: int, padding: int) -> Generation:
                    raw_log_probs=generated.raw_log_probs[:, :budget])
 
 
-def _pulled(repo_id: str) -> str:
+def _pulled(repo_id: str, revision: str | None) -> str:
     """Download a run directory published to the Hub and return its local path."""
     import os
 
     from dew.interop.hub import pull_from_hub
-    return os.fspath(pull_from_hub(repo_id))
+    return os.fspath(pull_from_hub(repo_id, revision=revision))
 
 
 def run_record(directory: str, step: int | str | None = None) -> Mapping[str, object]:
@@ -266,9 +265,22 @@ def run_record(directory: str, step: int | str | None = None) -> Mapping[str, ob
     from dew.checkpoints import Checkpoints
     record = Checkpoints(directory).artifact(step)
     if record is None:
-        raise ValueError("this checkpoint names no registered inference model; register it and declare "
+        raise ValueError("this checkpoint's objective declares no inference record; declare "
                          "Objective.inference_record, or call objective.pipeline(state)")
-    return named_fields(record, 'checkpoint artifact')
+    record = named_fields(record, 'checkpoint artifact')
+    if 'unrecorded' in record:
+        raise ValueError(f"this run's checkpoints describe no model to load: {record['unrecorded']}")
+    model = record.get('model')
+    if isinstance(model, Mapping) and isinstance(model.get('architecture'), str):
+        from dew.registry import models
+        name = model['architecture']
+        if name not in models:
+            raise ValueError(
+                f"this run's model is recorded as {name!r}, which no registered model is named. A "
+                f"class trained before it was registered is recorded under its name in lower case: "
+                f"register it once, `@dew.registry.models({name!r})` above the class, import it, and "
+                f"load again")
+    return record
 
 
 def _saved_model(record: Mapping[str, object], dtype: DTypeLike | None) -> ModelConfig:
@@ -279,6 +291,19 @@ def _saved_model(record: Mapping[str, object], dtype: DTypeLike | None) -> Model
     config = ModelConfig.from_dict(named_fields(record["model"], "model"))
     compute = dtype_name(resolve_dtype(dtype))
     return config if compute is None else replace(config, dtype=compute)
+
+
+def recorded_tokenizer(processor: Processor | None) -> str | None:
+    """The tokenizer name a run's record keeps for `processor`, which
+    `_saved_processor` rebuilds through `tokenizer_for`: a run tokenizer's
+    own name, byte or Hugging Face. Any other processor records none, and the
+    run loads as weights that take ids."""
+    from dew.data.text import ByteTokenizer, HFTokenizer
+    from dew.inference.pipeline import RunProcessor
+
+    if isinstance(processor, RunProcessor) and isinstance(processor.tokenizer, ByteTokenizer | HFTokenizer):
+        return processor.tokenizer.name
+    return None
 
 
 def _saved_processor(record: Mapping[str, object]) -> Processor | None:
@@ -343,20 +368,6 @@ def _saved_sampling(record: Mapping[str, object], budget: int | None) -> Samplin
     return Sampling(**controls)
 
 
-def _saved_quantization(record: Mapping[str, object]) -> Quantization | None:
-    """Read the run's quantization spec from its `run.json`'s `trainer.quantization`.
-
-    It comes back through the config layer that wrote it, the one place a
-    saved dataclass record becomes its class again.
-    """
-    from dew.config import _built
-    from dew.training.quantization import Quantization
-
-    trainer = record.get("trainer")
-    section = None if trainer is None else named_fields(trainer, "trainer").get("quantization")
-    return None if section is None else _built(Quantization, named_fields(section, "quantization"))
-
-
 @dataclass(frozen=True)
 class TextGeneration:
     """Generates next tokens from a decoder, its weights and its processor.
@@ -401,12 +412,7 @@ class TextGeneration:
     _stops: tuple[Stopping, ...] = dataclasses.field(default=(), init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        variables = self.variables
-        if all(isinstance(leaf, np.ndarray) for leaf in jax.tree.leaves(variables)):
-            from dew.inference.serving import _inference_projections
-
-            variables = jax.device_put(_inference_projections(self.model, variables))
-        _freeze_variables(self, variables)
+        _freeze_variables(self, self.variables)
         object.__setattr__(self, "_stops", self._stop_criteria(self.sampling.stop))
 
     def _stop_criteria(self, strings: tuple[str, ...]) -> tuple[Stopping, ...]:
@@ -470,8 +476,6 @@ class TextGeneration:
         from dew.objectives.base import thaw
         from dew.registry import objectives
 
-        import_module("dew.objectives.lm")  # registers the saved objective kinds
-        import_module("dew.objectives.rl")
         record, model_config, processor = _saved_run(directory, dtype, step)
         kind = named(record["objective"], "objective")
         budget = _saved_budget(record)
@@ -482,14 +486,12 @@ class TextGeneration:
             from dew.objectives.rl.ppo import _part
             variables = _part(variables, "policy")
         model = model_config.build()
-        quantization = _saved_quantization(record)
-        if quantization is not None:
-            model = quantization.apply(model)
         return cls(model, thaw(variables), processor, sampling=_saved_sampling(record, budget),
                    max_new_tokens=budget if budget else None)
 
     @classmethod
-    def from_pretrained(cls, repo_id: str, *, ema: bool | None = None, step: int | str | None = None,
+    def from_pretrained(cls, repo_id: str, *, revision: str | None = None,
+                        ema: bool | None = None, step: int | str | None = None,
                         mesh: MeshSpec | None = None, layout: Layout | None = None,
                         dtype: DTypeLike | None = None,
                         param_dtype: DTypeLike | None = None) -> TextGeneration:
@@ -497,7 +499,7 @@ class TextGeneration:
 
         `HfApi().upload_folder` of the run directory itself is what writes it.
         """
-        return cls.from_run(_pulled(repo_id), ema=ema, step=step, mesh=mesh, layout=layout,
+        return cls.from_run(_pulled(repo_id, revision), ema=ema, step=step, mesh=mesh, layout=layout,
                             dtype=dtype, param_dtype=param_dtype)
 
 
@@ -581,7 +583,8 @@ class BlockGeneration:
                    max_new_tokens=_saved_budget(record) or None)
 
     @classmethod
-    def from_pretrained(cls, repo_id: str, *, ema: bool | None = None, step: int | str | None = None,
+    def from_pretrained(cls, repo_id: str, *, revision: str | None = None,
+                        ema: bool | None = None, step: int | str | None = None,
                         mesh: MeshSpec | None = None, layout: Layout | None = None,
                         dtype: DTypeLike | None = None,
                         param_dtype: DTypeLike | None = None) -> BlockGeneration:
@@ -589,7 +592,7 @@ class BlockGeneration:
 
         `HfApi().upload_folder` of the run directory itself is what writes it.
         """
-        return cls.from_run(_pulled(repo_id), ema=ema, step=step, mesh=mesh, layout=layout,
+        return cls.from_run(_pulled(repo_id, revision), ema=ema, step=step, mesh=mesh, layout=layout,
                             dtype=dtype, param_dtype=param_dtype)
 
 
@@ -678,7 +681,8 @@ class MaskedGeneration:
                    max_new_tokens=budget or None)
 
     @classmethod
-    def from_pretrained(cls, repo_id: str, *, ema: bool | None = None, step: int | str | None = None,
+    def from_pretrained(cls, repo_id: str, *, revision: str | None = None,
+                        ema: bool | None = None, step: int | str | None = None,
                         mesh: MeshSpec | None = None, layout: Layout | None = None,
                         dtype: DTypeLike | None = None,
                         param_dtype: DTypeLike | None = None) -> MaskedGeneration:
@@ -686,7 +690,7 @@ class MaskedGeneration:
 
         `HfApi().upload_folder` of the run directory itself is what writes it.
         """
-        return cls.from_run(_pulled(repo_id), ema=ema, step=step, mesh=mesh, layout=layout,
+        return cls.from_run(_pulled(repo_id, revision), ema=ema, step=step, mesh=mesh, layout=layout,
                             dtype=dtype, param_dtype=param_dtype)
 
 

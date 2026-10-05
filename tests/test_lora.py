@@ -12,8 +12,10 @@ Observed against the references, all under the 1e-4 bound:
   1.1e-05, stepped factors 7.1e-08, merged export reloaded 8.8e-06.
 - sd-tiny text encoder hidden states 3.6e-07; UNet prediction 7.3e-06
   adapted and merged, fused weights 6.0e-08. The bundle is the Flax
-  pipeline, whose UNet approximates the GELU; the torch reference computes
-  it exactly, so the UNet runs with `approximate_gelu=False` here.
+  pipeline, whose UNet approximates the GELU and normalizes attention
+  inputs with an epsilon of 1e-5; the torch reference computes the GELU
+  exactly and uses 1e-6, so the UNet runs as the torch one here
+  (`torch_unet`).
 """
 
 import dataclasses
@@ -202,16 +204,17 @@ def test_one_trainer_step_moves_the_adapter_and_nothing_else(decoder, loaded, re
     state = trainer.fit(data, steps=1, log_every=1)
 
     for before, after in zip(
-        jax.tree.leaves(initial.params[FROZEN]), jax.tree.leaves(state.params[FROZEN]), strict=True
+        jax.tree.leaves(initial.variables[FROZEN]), jax.tree.leaves(state.variables[FROZEN]), strict=True
     ):
         np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
     assert all(
         bool(jnp.any(before != after))
         for before, after in zip(
-            jax.tree.leaves(initial.params["params"]), jax.tree.leaves(state.params["params"]), strict=True
+            jax.tree.leaves(initial.variables["params"]),
+            jax.tree.leaves(state.variables["params"]), strict=True
         )
     )
-    trained = thaw(state.params)
+    trained = thaw(state.variables)
     logits = adapter.adapt(decoder.model).apply(trained, jnp.asarray(tokens))
     np.testing.assert_allclose(np.asarray(logits), reference["updated_logits"], atol=1e-4, rtol=0)
     exported = _factors(adapter, trained, tmp_path / "adapter")
@@ -253,25 +256,25 @@ def test_a_source_fine_tunes_through_its_own_adapted_bundle(decoder, reference, 
         log_every=2,
     )
 
-    assert set(_flat(state.params["params"])) == {
+    assert set(_flat(state.variables["params"])) == {
         f"{'.'.join(target[1:])}.{factor}" for target in tuned.adapter.targets for factor in lora.FACTORS}
     for before, after in zip(
-        jax.tree.leaves(initial.params[FROZEN]), jax.tree.leaves(state.params[FROZEN]), strict=True
+        jax.tree.leaves(initial.variables[FROZEN]), jax.tree.leaves(state.variables[FROZEN]), strict=True
     ):
         np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
-    trained = thaw(state.params)
-    tuned.adapter.save(state.params, tmp_path / "adapter")
+    trained = thaw(state.variables)
+    tuned.adapter.save(state.variables, tmp_path / "adapter")
     _, read = LoRA.load(source.model, source.variables, source.layouts, tmp_path / "adapter")
     for name, leaf in _flat(read).items():
         np.testing.assert_array_equal(np.asarray(leaf), np.asarray(_flat(trained)[name]), err_msg=name)
     # The export is the merged weights in the source's layout, so the reload
     # computes exactly what the source model computes on them; how close the
     # merge is to the adapted forward is the PEFT parity test's to bound.
-    tuned.save(tmp_path / "merged", variables=state.params)
+    tuned.save(tmp_path / "merged", variables=state.variables)
     reloaded = Pretrained.load(tmp_path / "merged", dtype="float32", attention_impl="reference")
     ids = jnp.asarray(tokens)
     np.testing.assert_array_equal(np.asarray(reloaded.model.apply(reloaded.variables, ids)),
-                                  np.asarray(source.model.apply(tuned.adapter.merge(state.params), ids)))
+                                  np.asarray(source.model.apply(tuned.adapter.merge(state.variables), ids)))
 
     # A source that ships a tokenizer hands its processor to the objective.
     processor = RunProcessor(ByteTokenizer())
@@ -549,8 +552,15 @@ def pipeline(tmp_path_factory):
         archive.extractall(destination, members=[m for m in archive.getmembers() if m.name.startswith("sd/")],
                            filter="data")
     source = Pretrained.load(destination / "sd", dtype="float32", attention_impl="reference")
-    # The torch reference computes the GELU the Flax class approximates.
-    return dataclasses.replace(source, model=dataclasses.replace(source.model, approximate_gelu=False))
+    return dataclasses.replace(source, model=torch_unet(source.model))
+
+
+def torch_unet(model):
+    """The Flax-declared tiny SD UNet as Diffusers' PyTorch UNet computes it:
+    the exact GELU, and 1e-6 for the epsilon of the attention blocks'
+    GroupNorm, where the Flax class uses 1e-5 (attention_flax.py:368,
+    transformer_2d.py:176, Diffusers 0.34.0)."""
+    return dataclasses.replace(model, approximate_gelu=False, attention_norm_epsilon=1e-6)
 
 
 @pytest.fixture(scope="module")
@@ -712,13 +722,13 @@ def test_a_run_config_adapter_trains_its_factors_and_nothing_else(tmp_path):
     assert selects(("params", "layers_0", "self_attn", "q_proj", "lora_A"))
     assert not selects(("params", "layers_0", "self_attn", "q_proj", "kernel"))
     initial = Trainer(objective, optax.sgd(0.0), key=config.trainer.key).initial_state()
-    moved = _flat(state.params["params"])
+    moved = _flat(state.variables["params"])
     assert set(moved) == {f"{'.'.join(target[1:])}.{factor}"
                           for target in config.lora.targets for factor in lora.FACTORS}
     for name, leaf in moved.items():
-        assert bool(jnp.any(leaf != _flat(initial.params["params"])[name])), f"{name} did not move"
-    for before, after in zip(jax.tree.leaves(initial.params[FROZEN]),
-                             jax.tree.leaves(state.params[FROZEN]), strict=True):
+        assert bool(jnp.any(leaf != _flat(initial.variables["params"])[name])), f"{name} did not move"
+    for before, after in zip(jax.tree.leaves(initial.variables[FROZEN]),
+                             jax.tree.leaves(state.variables[FROZEN]), strict=True):
         np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
     record = json.loads((tmp_path / "run" / "run.json").read_text())
     assert record["lora"]["targets"]["params/layers_0/self_attn/q_proj"] == {"rank": 2, "alpha": 4.0}
@@ -881,13 +891,13 @@ def test_a_pipeline_lora_run_moves_its_factors_and_nothing_else(family, pipeline
     data = Dataset(train=lambda partition: iter([batch] * 3), val=None, records=rows, batch=rows)
     state = trainer.fit(data, steps=3, log_every=3)
 
-    assert set(_flat(state.params["params"])) == {
+    assert set(_flat(state.variables["params"])) == {
         f"{'.'.join(path[1:])}.{factor}" for path in tuned.adapter.targets for factor in lora.FACTORS}
     for collection in (FROZEN, "encoders", "autoencoder"):
-        for before, after in zip(jax.tree.leaves(initial.params[collection]),
-                                 jax.tree.leaves(state.params[collection]), strict=True):
+        for before, after in zip(jax.tree.leaves(initial.variables[collection]),
+                                 jax.tree.leaves(state.variables[collection]), strict=True):
             np.testing.assert_array_equal(np.asarray(before), np.asarray(after), err_msg=collection)
-    assert all(bool(jnp.any(leaf)) for name, leaf in _flat(state.params["params"]).items()
+    assert all(bool(jnp.any(leaf)) for name, leaf in _flat(state.variables["params"]).items()
                if name.endswith("lora_B"))
     assert np.isfinite(_sampled(objective.pipeline(state))).all()
     with pytest.raises(ValueError, match="already selects what trains"):
@@ -920,34 +930,78 @@ def test_a_tuned_pipeline_saves_its_adapter_and_its_merged_weights(family, pipel
     assert np.abs(_sampled(merged.text_to_image()) - _sampled(source.text_to_image())).max() > 0
 
 
-@pytest.mark.parametrize("family", ["flux", "sd3"])
-def test_diffusers_loads_a_saved_pipeline_adapter_and_predicts_what_dew_does(family, pipelines, tmp_path):
-    """tools/lora_reference.py wrote this file with `source.lora(...).adapter.save`
-    and recorded the transformer's prediction after Diffusers'
-    `load_lora_weights` on fixed inputs. The file reads back here to the
-    same prediction, and writes back unchanged."""
-    source = pipelines[family]
-    directory = FIXTURES / f"{family}-tiny"
-    adapter, variables = LoRA.load(source.model, source.variables, source.layouts, directory)
-    with np.load(directory / "reference.npz") as data:
-        arrays = {key: data[key] for key in data}
-    guidance = jnp.asarray(arrays["guidance"]) if arrays["guidance"].size else None
-    condition = DenoisingCondition(jnp.asarray(arrays["context"]), jnp.asarray(arrays["pooled"]),
-                                   guidance=guidance)
-    own = {name: tree for name, tree in variables.items() if name not in ("encoders", "autoencoder")}
-    predicted = adapter.adapt(source.model).apply(
-        own, jnp.asarray(arrays["latent"]), jnp.asarray(arrays["times"]), condition)
-    gap = np.abs(np.asarray(predicted) - arrays["adapted"]).max() / np.abs(arrays["adapted"]).max()
-    assert gap < 1e-5, gap
-    assert np.abs(arrays["adapted"] - arrays["base"]).max() > 1e-2
+EXPORTS = ROOT / "tests" / "fixtures" / "lora_exports"
 
-    adapter.save(variables, tmp_path)
-    ours, metadata = read_file(tmp_path / lora.DIFFUSERS_WEIGHTS)
-    theirs, published = read_file(directory / lora.DIFFUSERS_WEIGHTS)
-    assert ours.keys() == theirs.keys()
-    for name in theirs:
-        np.testing.assert_array_equal(ours[name], theirs[name], err_msg=name)
-    assert json.loads(metadata[lora.DIFFUSERS_METADATA]) == json.loads(published[lora.DIFFUSERS_METADATA])
+
+def _recorded(name: str):
+    with np.load(EXPORTS / f"{name}.npz") as data:
+        arrays = {key: data[key] for key in data}
+    return arrays, json.loads(arrays.pop("meta").tobytes())
+
+
+def _assert_written_as_read(name: str, directory: Path, meta) -> None:
+    from tools.lora_export_reference import digests
+
+    assert digests(directory) == meta["digests"], (
+        "Dew's adapter changed: rerun both halves of tools/lora_export_reference.py, "
+        "`consume` in its PEFT environment, so PEFT and Diffusers read the new files")
+
+
+@pytest.mark.parametrize("name", ["llama", "llama-rslora", "llama-patterns"])
+def test_peft_reads_the_adapter_dew_writes_at_dews_logits(name, decoder, tmp_path):
+    """tools/lora_export_reference.py records PEFT 0.20.0 reading the
+    adapter a case writes (a fresh one at a rank and alpha, one with
+    rsLoRA, and the committed one whose rank and alpha patterns Dew writes
+    back, each with its factors moved) onto transformers' llama-tiny: every
+    tensor of the file lands, and the adapted and `merge_and_unload` logits
+    are recorded in float32 and float64. The adapter written here is the
+    one that was read, and Dew's adapted and merged logits hold the float64
+    rule against PEFT's."""
+    from tools.lora_export_reference import CASES, export_case
+
+    adapter, variables = export_case(CASES[name], decoder, tmp_path)
+    arrays, meta = _recorded(name)
+    _assert_written_as_read(name, tmp_path, meta)
+    ids = jnp.asarray(arrays["input_ids"])
+    adapted = adapter.adapt(decoder.model).apply(variables, ids)
+    merged = decoder.model.apply(adapter.merge(variables), ids)
+    assert np.abs(arrays["fp32.adapted"] - arrays["fp32.base"]).max() > 1
+    assert_as_exact_as_the_reference(np.asarray(adapted), arrays["fp32.adapted"], arrays["fp64.adapted"],
+                                     f"{name} adapted")
+    assert_as_exact_as_the_reference(np.asarray(merged), arrays["fp32.merged"], arrays["fp64.merged"],
+                                     f"{name} merged")
+
+
+@pytest.mark.parametrize("family", ["sd", "flux", "sd3"])
+def test_diffusers_reads_the_adapter_dew_writes_at_dews_prediction(family, pipelines, tmp_path):
+    """The pipelines' counterpart: Diffusers 0.34.0's `load_lora_weights`
+    reads the file a case writes (rsLoRA on FLUX), every tensor lands in the
+    denoiser, and its adapted and `fuse_lora` predictions are recorded in
+    float32 and float64. Dew's adapted and merged predictions hold the
+    float64 rule against them. The tiny SD source declares Flax classes,
+    whose pipeline loads no adapter; its PyTorch UNet reads the file, so
+    Dew's runs as that UNet (`torch_unet`)."""
+    from tools.lora_export_reference import CASES, export_case
+
+    source = pipelines[family]
+    adapter, variables = export_case(CASES[family], source, tmp_path)
+    arrays, meta = _recorded(family)
+    _assert_written_as_read(family, tmp_path, meta)
+    model = torch_unet(source.model) if family == "sd" else source.model
+    own = {name: tree for name, tree in variables.items() if name not in ("encoders", "autoencoder")}
+    guidance = jnp.asarray(arrays["guidance"]) if arrays.get("guidance", np.zeros(0)).size else None
+    condition = DenoisingCondition(jnp.asarray(arrays["context"]),
+                                   jnp.asarray(arrays["pooled"]) if "pooled" in arrays else None,
+                                   guidance=guidance)
+    latent, times = jnp.asarray(arrays["latent"]), jnp.asarray(arrays["times"])
+    # The UNet takes its condition by keyword alone.
+    adapted = adapter.adapt(model).apply(own, latent, times, conditioning=condition)
+    merged = model.apply(adapter.merge(own), latent, times, conditioning=condition)
+    assert np.abs(arrays["fp32.adapted"] - arrays["fp32.base"]).max() > 0.1
+    assert_as_exact_as_the_reference(np.asarray(adapted), arrays["fp32.adapted"], arrays["fp64.adapted"],
+                                     f"{family} adapted")
+    assert_as_exact_as_the_reference(np.asarray(merged), arrays["fp32.merged"], arrays["fp64.merged"],
+                                     f"{family} merged")
 
 
 def test_a_filter_trains_the_denoising_loss_alone(pipelines):
@@ -995,12 +1049,12 @@ def test_a_run_config_adapter_trains_a_diffusion_models_factors_and_nothing_else
 
     assert objective.trainable is not None
     initial = Trainer(objective, optax.sgd(0.0), key=config.trainer.key).initial_state()
-    moved = _flat(state.params["params"])
+    moved = _flat(state.variables["params"])
     assert set(moved) == {f"{'.'.join(target[1:])}.{factor}"
                           for target in adapter.targets for factor in lora.FACTORS}
     for name, leaf in moved.items():
-        assert bool(jnp.any(leaf != _flat(initial.params["params"])[name])), f"{name} did not move"
+        assert bool(jnp.any(leaf != _flat(initial.variables["params"])[name])), f"{name} did not move"
     for collection in (FROZEN, "encoders"):
-        for before, after in zip(jax.tree.leaves(initial.params[collection]),
-                                 jax.tree.leaves(state.params[collection]), strict=True):
+        for before, after in zip(jax.tree.leaves(initial.variables[collection]),
+                                 jax.tree.leaves(state.variables[collection]), strict=True):
             np.testing.assert_array_equal(np.asarray(before), np.asarray(after), err_msg=collection)

@@ -26,6 +26,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = REPO_ROOT / "tests" / "fixtures"
+CLAIMS = json.loads((FIXTURES / "provenance.json").read_text())["references"]
 
 # The existing family parity contracts, not bounds fitted to a CI CPU:
 # test_moe.py (routers and expert sums), test_text_encoders.py (tiny towers),
@@ -79,13 +80,16 @@ def assert_fixture_arrays(written: Path, committed: Path, numerical: dict[str, f
                 np.testing.assert_array_equal(actual, expected, err_msg=name)
 
 
-def assert_fixture_files(written: Path, committed: Path) -> None:
+def assert_fixture_files(written: Path, committed: Path, tool: str) -> None:
+    """The generator's listing against a directory provenance.json gives it
+    whole, which test_fixture_provenance keeps every other writer out of."""
+    assert CLAIMS.get(committed.relative_to(FIXTURES).as_posix(), {}).get("tool") == f"tools/{tool}.py"
     assert {p.name for p in written.iterdir() if p.is_file()} == {
         p.name for p in committed.iterdir() if p.is_file()}
 
 
-def assert_fixture_json(written: Path, committed: Path) -> None:
-    assert_fixture_files(written, committed)
+def assert_fixture_json(written: Path, committed: Path, tool: str) -> None:
+    assert_fixture_files(written, committed, tool)
     for path in committed.glob("*.json"):
         assert json.loads((written / path.name).read_text()) == json.loads(path.read_text()), path.name
 
@@ -109,7 +113,7 @@ def test_moe_fixtures_are_what_the_generator_writes(tmp_path):
     load("moe_reference").main(["--out", str(tmp_path)])
 
     committed = FIXTURES / "moe"
-    assert_fixture_json(tmp_path, committed)
+    assert_fixture_json(tmp_path, committed, "moe_reference")
     for name, outputs in MOE_OUTPUTS.items():
         assert_fixture_arrays(tmp_path / name, committed / name, outputs)
 
@@ -146,7 +150,7 @@ def test_clip_tiny_fixture_is_what_the_generator_writes(tmp_path):
     load("clip_reference").write_tiny(tmp_path)
 
     committed = FIXTURES / "clip" / "tiny"
-    assert_fixture_json(tmp_path, committed)
+    assert_fixture_json(tmp_path, committed, "clip_reference")
     assert_same_tensors(tmp_path / "model.safetensors", committed / "model.safetensors")
     assert_fixture_arrays(tmp_path / "reference.npz", committed / "reference.npz", CLIP_OUTPUTS)
 
@@ -160,7 +164,7 @@ def test_t5_tiny_fixture_is_what_the_generator_writes(tmp_path):
     load("t5_reference").main(["--out", str(tmp_path)])
 
     written, committed = tmp_path / "tiny", FIXTURES / "t5" / "tiny"
-    assert_fixture_json(written, committed)
+    assert_fixture_json(written, committed, "t5_reference")
     assert_same_tensors(written / "model.safetensors", committed / "model.safetensors")
     assert_fixture_arrays(written / "reference.npz", committed / "reference.npz", T5_OUTPUTS)
 
@@ -174,7 +178,7 @@ def test_vae_tiny_fixture_is_what_the_generator_writes(tmp_path):
     load("vae_reference").main(["--out", str(tmp_path)])
 
     written, committed = tmp_path / "sd3-tiny", FIXTURES / "vae" / "sd3-tiny"
-    assert_fixture_json(written, committed)
+    assert_fixture_json(written, committed, "vae_reference")
     assert_same_tensors(written / "diffusion_pytorch_model.safetensors",
                         committed / "diffusion_pytorch_model.safetensors")
     assert_fixture_arrays(written / "reference.npz", committed / "reference.npz", VAE_OUTPUTS)
@@ -221,7 +225,7 @@ def test_flaxdiff_fixture_is_what_the_generator_writes(tmp_path, architecture, c
                     "--flaxdiff-path", str(source), "--architecture", architecture,
                     "--out", str(written)], check=True)
 
-    assert_fixture_files(written, committed)
+    assert_fixture_files(written, committed, "flaxdiff_reference")
     actual = json.loads((written / "config.json").read_text())
     expected = json.loads((committed / "config.json").read_text())
     # jax_version records the generating environment, not the fixture's recipe.
@@ -314,9 +318,14 @@ def test_lm_serving_benchmark_draws_the_full_budget_without_stopping(monkeypatch
     monkeypatch.setattr(tool, "prompts_for", lambda *args, **kwargs: prompts)
     args = argparse.Namespace(model="tiny", vocab_limit=13, prompt=2, output=4, slots=[2],
                               requests=2, repeats=1, admission=2, decode_steps=1, kv="dense",
-                              profile=False, profile_steps=20, generations=True, out=tmp_path / "serve.json")
+                              profile=False, profile_steps=20, generations=True, out=tmp_path / "serve.json",
+                              rate=[1000.0])
     _, points = tool.dew_points(args)
     assert points[0]["repeats"][0]["output_tokens"] == 8
+    # The open-loop run serves the same requests as they arrive, timing each token.
+    opened, = points[0]["open_loop"]
+    assert opened["output_tokens"] == 8 and opened["ttft_seconds"]["p50"] > 0
+    assert 0 < opened["token_gap_seconds"]["p50"] <= opened["token_gap_seconds"]["p99"]
     saved = np.load(tmp_path / "serve-slots2.npz")
     expected = [bound(prompt[None], 4, key=index).host() for index, prompt in enumerate(prompts)]
     np.testing.assert_array_equal(saved["tokens"], np.concatenate([row.tokens[:, -4:] for row in expected]))
@@ -577,11 +586,11 @@ def parameter_movement(tool, case, steps: int = 2):
     trainer = tool.build_trainer(case, "reference")
     source = tool.batches(case, trainer.device_mesh)
     state = jax.jit(trainer.initial_state)()
-    before = jax.tree.map(np.asarray, named(state.params))  # the step consumes the state
+    before = jax.tree.map(np.asarray, named(state.variables))  # the step consumes the state
     compiled = trainer.compile(state, next(source))
     for _ in range(steps):
         state, loss, _, finite, _ = compiled(state, next(source))
-    after = named(state.params)
+    after = named(state.variables)
     assert bool(finite) and np.isfinite(float(loss))
     moved = {name: float(jnp.max(jnp.abs(value - before[name])))
              for name, value in after.items()}
@@ -859,6 +868,26 @@ def test_a_scoreboard_row_waits_for_every_reference_record(monkeypatch):
         "Dew (dew) LOSES to torch, bf16 experts: 0.880x")
 
 
+def test_maxtext_names_its_profiler_only_for_profiled_steps(monkeypatch, tmp_path):
+    """MaxText reads an empty `profiler=` as None, which its config refuses,
+    so a run that profiles no steps leaves the profiler's settings out; one
+    that profiles the last five names the profiler and where it starts."""
+    from types import SimpleNamespace
+
+    monkeypatch.syspath_prepend(str(REPO_ROOT / "tools" / "reference_runs"))
+    package = SimpleNamespace(__file__=str(tmp_path / "maxtext" / "__init__.py"))
+    monkeypatch.setitem(sys.modules, "maxtext", package)
+    runner = load("reference_runs/maxtext_run")
+    args = SimpleNamespace(
+        model_name="qwen3-0.6b", batch=8, seq=1024, steps=90, schedule_steps=256, attention=None,
+        remat="minimal", mesh="fsdp", lr_peak=2e-5, b1=0.9, b2=0.95, eps=1e-8, weight_decay=0.1, clip=1.0,
+        profile_steps=0, overrides=[])
+    unprofiled = runner.maxtext_argv(args, tmp_path)
+    assert not [setting for setting in unprofiled if setting.startswith("profiler")]
+    profiled = runner.maxtext_argv(SimpleNamespace(**{**vars(args), "profile_steps": 5}), tmp_path)
+    assert {"profiler=xplane", "profiler_steps=5", "skip_first_n_steps_for_profiler=85"} <= set(profiled)
+
+
 # ---------------------------------------------------------------------------
 # tools/benchmark_quantized_serving.py
 # ---------------------------------------------------------------------------
@@ -876,7 +905,7 @@ def test_the_quantized_serving_benchmark_counts_nonfinite_values_before_it_clips
     class Pipe:
         """The part of TextToImage that sampling reads: latents, and an
         autoencoder that passes them through with one pixel infinite."""
-        params: ClassVar = {"autoencoder": {}}
+        variables: ClassVar = {"autoencoder": {}}
         autoencoder = SimpleNamespace(decode=lambda params, z: z.at[0, 0, 0, 0].set(jnp.inf))
 
         def __call__(self, prompts, **controls):
