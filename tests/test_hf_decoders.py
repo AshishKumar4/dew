@@ -846,11 +846,20 @@ def test_nemotron_h_legacy_patterns_and_mamba_aliases_read_as_the_modern_config(
     assert translate_config(legacy) == translate_config(modern)
 
 
-def test_nemotron_h_stale_nano9b_geometry_fields_change_no_computation():
-    """Transformers 5.16.1 reads n_groups, ssm_state_size and num_key_value_heads instead."""
+@pytest.mark.parametrize("legacy, read", [
+    ("mamba_num_groups", "n_groups"),
+    ("mamba_state_dim", "ssm_state_size"),
+    ("num_query_groups", "num_key_value_heads"),
+    ("rms_norm_eps", "layer_norm_epsilon"),
+    ("norm_eps", "layer_norm_epsilon"),
+])
+def test_nemotron_h_legacy_geometry_must_repeat_the_field_the_reference_reads(legacy, read):
+    """Released duplicates agree; a contradiction cannot silently name two geometries."""
     modern = fixture_config("nemotron-h-tiny")
-    stale = {**modern, "mamba_num_groups": 8, "mamba_state_dim": 128, "num_query_groups": 8}
-    assert translate_config(stale) == translate_config(modern)
+    repeated = {**modern, legacy: modern[read]}
+    assert translate_config(repeated) == translate_config(modern)
+    with pytest.raises(ValueError, match=legacy):
+        translate_config({**repeated, legacy: modern[read] + 1})
 
 
 @pytest.mark.parametrize("changes, message", [
