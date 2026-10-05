@@ -64,6 +64,6 @@ The pages assume you know Python, NumPy and the basics of training with gradient
 
 ## Status
 
-Dew is research software before version 1.0; the API and checkpoint formats can change between versions. It has been run on CPU, on pools of local processes, on single GPUs, on one host with four GPUs and on one TPU v6e chip. It has not been run on two physical nodes. [Multiple hosts](guides/multi-node.md) lists what has and has not been run.
+Dew is research software before version 1.0, so the API and checkpoint formats can change between versions. I have run it on CPU, on pools of local processes, on single GPUs, on one host with four GPUs and on one TPU v6e chip, but not on two physical nodes. [Multiple hosts](guides/multi-node.md) lists what has and has not been run.
 
 [Papers and attribution](references.md) lists the papers and upstream code behind the models and methods. Design history and research notes stay in the repository under `docs/design` and `docs/research`.

@@ -32,13 +32,17 @@ class FlowMatchingScheduler(ContinuousNoiseScheduler):
       which concentrates training on the middle of the trajectory, where the
       velocity is hardest to predict.
     - `mode`: t = 1 - u - s (cos^2(pi u / 2) - 1 + u), u ~ U(0, 1), with
-      s = `mode_scale` in [-1, 2 / (pi - 2)] (Eq. 20): a density with a mode
-      in the middle that keeps weight on both ends, uniform at s = 0.
+      s = `mode_scale` in [-1, 2 / (pi - 2)] (Eq. 20). This density has a
+      mode in the middle, keeps weight on both ends, and is uniform at
+      s = 0.
     - `cosmap`: t = 1 - 1 / (tan(pi u / 2) + 1) (Eq. 21).
     - `uniform`: t = u.
 
-    The draw is of the unshifted time; `shift` maps it, and the sampling
-    grid, to the resolution's noise levels.
+    Training draws the unshifted time. `shift` then maps it, and the
+    sampling grid, to the resolution's noise levels with
+    shift t / (1 + (shift - 1) t), and the model is conditioned on the
+    shifted time times 1000. An unknown `density`, or a `mode_scale` outside
+    its range for `mode`, raises `ValueError`.
     """
 
     def __init__(self, shift: float = 1.0, logit_mean: float = 0.0, logit_std: float = 1.0,

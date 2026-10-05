@@ -1,13 +1,14 @@
 """What the trainer is optimizing.
 
-The trainer owns training mechanics: the mesh, the compiled step, EMA
-bookkeeping, checkpoints, logging. An `Objective` owns what is being learned:
-the parameter tree it initialises, the loss it computes from a batch, and what
-its evaluation produces. Swapping the objective swaps the research question
-without touching any of the mechanics.
+The trainer handles the mechanics of training: the mesh, the compiled step,
+the EMA copy, checkpoints and logging. An `Objective` defines what is learned:
+it initialises the parameter tree, computes the loss from a batch and decides
+what evaluation produces. To study a different question you write a different
+objective, and the trainer stays the same.
 
-An objective receives schedule and randomness through Step, and returns
-additive loss statistics with Aux reports. These values are JAX PyTrees.
+The trainer gives an objective the step count and a random key in a `Step`.
+The objective returns additive loss statistics, optionally with an `Aux` of
+reports. These values are JAX pytrees.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ import functools
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, ClassVar, Generic, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, ClassVar, Generic, Literal, Protocol, Self, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -29,52 +30,59 @@ from dew.artifacts import Artifact, Artifacts
 from dew.records import JSON
 
 if TYPE_CHECKING:
-    from dew.inference.tasks import BlockGeneration, MaskedGeneration, TextGeneration
+    from flax import linen as nn
+    from jax.typing import DTypeLike
+
+    from dew.inference.tasks import BlockGeneration, MaskedGeneration, Processor, TextGeneration
     from dew.inputs import InputSpec
     from dew.nn.backbones.causal_transformer import DecoderBank
     from dew.sampling.pipelines import TextToImage
+    from dew.training.distributed import Layout, MeshSpec
     from dew.training.state import TrainState
 
     type Task = TextGeneration | BlockGeneration | MaskedGeneration | TextToImage
 
 type Variables = Mapping[str, Any]
-"""A flax variables dict: the `params` collection plus any other collection
+"""A Flax variables dict: the `params` collection plus any other collection
 the modules keep (`moe`, `batch_stats`, an objective's frozen encoders)."""
 
 type Batch = Mapping[str, Any]
-"""One training example set, as the trainer and every objective read it.
+"""One batch of training examples, as the trainer and every objective read it.
 
-Declared once here and imported by `dew.data.dataset`, so a field added on
-one side is the same type on the other. The leaves are heterogeneous by
-measurement, not by omission: alongside the arrays a step consumes, a batch
-carries the prepared text inputs of a language run, the file paths a video
-corpus resolves lazily, the integer row counts a packer keeps and the record
-lists a mixture reads, so a narrower leaf type is untrue of what `dew.data`
-already builds."""
+It is declared here and imported by `dew.data.dataset`, so a field added on
+one side has the same type on the other. The values are not all arrays.
+Besides the arrays a step consumes, a batch can hold the prepared text inputs
+of a language run, the file paths a video corpus loads lazily, the integer
+row counts a packer keeps and the record lists a mixture reads. A narrower
+value type would be wrong about what `dew.data` already builds."""
 type Path = tuple[str, ...]
 type PathFilter = Callable[[Path], bool]
-"""Selects leaves of a variables tree by the tuple of dict keys above them.
-One filter type serves the EMA selection, `optax.multi_transform` labels and
-frozen subtrees."""
+"""A function that selects leaves of a variables tree by the tuple of dict keys above them.
+
+One filter type is used for the EMA selection, for `optax.multi_transform`
+labels and for frozen subtrees."""
 type Initializer = Partial
 """An objective's `init` with its held variables bound as `Partial` children,
 which a JIT takes as arguments (`Objective.initializer` says why)."""
 
 @struct.dataclass
 class Ratio:
-    """Keep a numerator and its denominator apart until the reduction.
+    """A loss numerator and its denominator, kept apart until the loss is reduced.
 
-    They sum across microbatches and devices before `mean` divides.
+    Both parts sum across microbatches and devices, and only then does `mean`
+    divide one by the other.
 
-    The denominator (mass) is nonnegative and does not depend on the parameters. Zero
-    mass declares a zero numerator and no contribution.
+    The denominator (`mass`) is nonnegative and does not depend on the
+    parameters. Zero mass means a zero numerator and no contribution.
     """
     total: jax.Array
     mass: jax.Array
 
     def mean(self) -> tuple[jax.Array, jax.Array]:
-        """Reduce a shared-denominator estimator, including empty support:
-        the mean, or zero where the mass is zero, and whether any mass was."""
+        """Return `total` over `mass`, or zero where the mass is zero, and whether there is any mass.
+
+        The mass is treated as a constant, so no gradient flows through it.
+        """
         mass = jax.lax.stop_gradient(self.mass)
         active = mass > 0
         dtype = jnp.result_type(self.total.dtype, mass.dtype, jnp.float32)
@@ -91,8 +99,9 @@ class Step:
     """What the trainer tells an objective about the current step.
 
     `step` is the count of accepted microbatches, which is what an
-    objective's own schedules index by. `key` is drawn fresh for every
-    attempt, so a replayed microbatch draws the same randomness.
+    objective's own schedules index by. `key` is new for every attempt at a
+    microbatch, and a replayed microbatch gets the key of the attempt that
+    first read it, so it draws the same randomness.
     """
     step: jax.Array
     key: jax.Array
@@ -105,25 +114,28 @@ class Step:
 class Aux(Generic[Effects]):
     """Everything a loss returns besides its statistics.
 
-    `metrics` go to the tracker. `variables` replace nonparameter
-    collections outright. `effects` are additive observations the
-    optimizer applies once per commit rather than per microbatch.
+    `metrics` go to the tracker. `variables` replace whole nonparameter
+    collections. `effects` are additive observations that the optimizer
+    applies once per committed update, not once per microbatch.
     """
     metrics: dict[str, jax.Array]
     variables: Variables | None = None
-    """Complete nonparameter replacements from one accepted microbatch,
-    such as BatchNorm statistics. The optimizer owns the params collection;
-    deferred router-bias updates belong in effects instead."""
+    """Whole nonparameter collections from one accepted microbatch, such as BatchNorm statistics.
+
+    Each one replaces the collection of the same name. The optimizer updates
+    the `params` collection, so it cannot appear here. Deferred router-bias
+    updates go in `effects`."""
     qk_stats: Variables | None = None
-    """The `qk` collection the attention layers sowed, for the optimizer's
-    QK-Clip: nested by module path, each attention layer holding
-    `max_logits` as a one-tuple of an fp32 `[rows, heads]` array of per-head
-    logit maxima, an MLA layer additionally holding `qk_nope` as an int
-    scalar naming its nope width. Rows are the batch's rows, microbatches
-    concatenated under a pipeline. None when the loss never opened the
-    collection, in which case the clip steps aside."""
+    """The `qk` collection the attention layers sowed, which the optimizer's QK-Clip reads.
+
+    It is nested by module path. Each attention layer holds `max_logits`, a
+    one-tuple of an fp32 `[rows, heads]` array of per-head logit maxima, and
+    an MLA layer also holds `qk_nope`, an int scalar giving its nope width.
+    Rows are the batch's rows, with microbatches concatenated under a
+    pipeline. It is None when the loss never opened the collection, and then
+    the clip does nothing."""
     effects: Effects | None = None
-    """Additive observations applied once on a supported optimizer commit."""
+    """Additive observations that `Objective.apply_effects` applies once per optimizer commit."""
 
 
 def _has_aux(loss: Loss | tuple[Loss, Aux[Effects]]) -> TypeIs[tuple[Loss, Aux[Effects]]]:
@@ -134,10 +146,11 @@ def _has_aux(loss: Loss | tuple[Loss, Aux[Effects]]) -> TypeIs[tuple[Loss, Aux[E
 class Shown:
     """How the training display shows one reported metric.
 
-    `better` says which way the metric improves, "higher" or "lower", and
-    colours its change as progress or regress; `percent` shows a fraction as
-    a percentage; `group` files it under a heading other than its name's
-    prefix. A metric nothing declares is shown by its name, plainly.
+    `better` says which way the metric improves, "higher" or "lower", and the
+    display colours its change as progress or regress by it. `percent` shows a
+    fraction as a percentage. `group` puts the metric under a heading other
+    than its name's prefix. A metric with no `Shown` is shown under its name,
+    without colour.
     """
     better: Literal["higher", "lower"] | None = None
     percent: bool = False
@@ -147,17 +160,18 @@ class Shown:
 
 @dataclass(frozen=True)
 class TrainingScalar[Statistics, Additions]:
-    """An objective-owned training report selected for ranking or stopping."""
+    """A training metric an objective reports, chosen for `Best` to rank by or `Plateau` to stop on."""
     owner: Objective[Statistics, Additions]
     name: str
     shown: Shown
 
 
 class TrainingScalars[Statistics, Additions]:
-    """Typed, completable attributes for the objective's declared training reports.
+    """The training metrics an objective declares, as typed attributes an editor can complete.
 
-    Dynamic objectives may use item lookup. Undeclared attributes fail at
-    access, before a fit starts; completion lists the objective's own names.
+    An objective whose metric names are known only at run time can be read by
+    item lookup instead. Reading an undeclared name fails at once, before a
+    fit starts, and completion lists only the objective's own names.
     """
     loss: TrainingScalar[Statistics, Additions]
 
@@ -179,12 +193,13 @@ class TrainingScalars[Statistics, Additions]:
 
 @struct.dataclass
 class Prediction:
-    """Hold what a token objective scored a batch with, for a teacher to compare.
+    """What a token objective scored a batch with, for comparison with a teacher.
 
-    `logits` are the `[B, S, vocab]` fp32 scores the model's forward
-    produces, `losses` and `weights` the `[B, S]` per-position loss the
-    objective sums and the weight it gives each position, and `hidden` the
-    `[B, S, D]` states of the layers a caller asked for, in the order asked.
+    - `logits`: the `[B, S, vocab]` fp32 scores from the model's forward pass.
+    - `losses`: the `[B, S]` per-position loss the objective sums.
+    - `weights`: the `[B, S]` weight the objective gives each position.
+    - `hidden`: the `[B, S, D]` states of the layers the caller asked for,
+      in the order asked.
     """
     logits: jax.Array
     losses: jax.Array
@@ -197,9 +212,9 @@ def everything(path: Path) -> bool:
 
 
 def under(*prefix: str) -> PathFilter:
-    """Build a filter that accepts the leaves below `prefix`.
+    """Return a filter that accepts the leaves below `prefix`.
 
-    As in `under("params", "context_encoder")`.
+    For example, `under("params", "context_encoder")`.
     """
     return lambda path: path[:len(prefix)] == prefix
 
@@ -207,8 +222,9 @@ def under(*prefix: str) -> PathFilter:
 def select(tree: Variables, keep: PathFilter) -> Variables:
     """Return the subtree of `tree` whose leaves `keep` accepts, nested the same way.
 
-    A branch that keeps no leaf is dropped, so the result is what the EMA
-    stores and what `merge` puts back.
+    A branch with no accepted leaf is dropped, so the result is what the EMA
+    stores and what `merge` puts back. Raises `ValueError` when `keep`
+    accepts no leaf at all.
     """
     def prune(node, path):
         if isinstance(node, Mapping):
@@ -223,7 +239,7 @@ def select(tree: Variables, keep: PathFilter) -> Variables:
 
 
 def merge(tree: Variables, overlay: Variables) -> Variables:
-    """Return `tree` with every leaf `overlay` holds replaced by the overlay's."""
+    """Return a copy of `tree` with every leaf in `overlay` written over it."""
     merged = dict(tree)
     for name, child in overlay.items():
         held = tree.get(name)
@@ -234,17 +250,19 @@ def merge(tree: Variables, overlay: Variables) -> Variables:
 
 
 FROZEN = "frozen"
-"""The collection a partially trained run keeps its held weights under.
-The optimizer moves the `params` collection and nothing else, so what
-`freeze` leaves there is what trains; the rest rides beside it as state,
-and the model sees them merged by `thaw`."""
+"""The name of the collection where a partially trained run keeps its frozen weights.
+
+The optimizer updates the `params` collection and nothing else, so the
+leaves that `freeze` keeps in `params` are the ones that train. The frozen
+leaves stay in this collection as part of the state, and `thaw` merges the
+two before the model reads them."""
 
 
 def freeze(variables: Variables, trainable: PathFilter) -> Variables:
-    """Move the `params` leaves `trainable` rejects under `FROZEN`.
+    """Move the `params` leaves that `trainable` rejects into the `FROZEN` collection.
 
-    Paths are full leaf paths, `("params", ...)`. A filter that keeps every
-    leaf or none names nothing to split and is refused.
+    `trainable` sees full leaf paths, `("params", ...)`. Raises `ValueError`
+    when it keeps every leaf or none, since then there is nothing to split.
     """
     leaves = jax.tree_util.tree_leaves_with_path(variables["params"])
     kept = sum(trainable(("params", *(entry.key for entry in path))) for path, _ in leaves)
@@ -258,38 +276,72 @@ def freeze(variables: Variables, trainable: PathFilter) -> Variables:
 
 
 def thaw(variables: Variables) -> Variables:
-    """Undo a frozen split, leaving one `params` collection again."""
+    """Undo `freeze`, merging the frozen leaves back into one `params` collection.
+
+    Variables without a `FROZEN` collection are returned unchanged.
+    """
     if FROZEN not in variables:
         return variables
     rest = {name: value for name, value in variables.items() if name != FROZEN}
     return {**rest, "params": merge(variables[FROZEN], variables["params"])}
 
 
+def part(variables: Variables, name: str) -> Variables:
+    """Cut the `name` subtree out of every collection that holds one: one
+    module's own tree out of an objective's that nests several under each
+    collection, `params/policy` and `frozen/policy`, so an adapted module's
+    base comes with its factors."""
+    return {collection: subtree[name] for collection, subtree in variables.items() if name in subtree}
+
+
+def joined(parts: Mapping[str, Variables]) -> Variables:
+    """Nest each module's tree under its name in every collection it holds;
+    the inverse of `part`."""
+    collections = {collection for tree in parts.values() for collection in tree}
+    return {collection: {name: tree[collection] for name, tree in parts.items() if collection in tree}
+            for collection in sorted(collections)}
+
+
 @dataclass(frozen=True)
 class EMASpec:
-    """Say which leaves the EMA copy tracks, and how fast it follows them.
+    """Which leaves the EMA copy tracks, and how fast it follows them.
 
-    decay is a step-indexed schedule, since momentum ramps matter for some
-    objectives (I-JEPA anneals 0.996 to 1.0). The step it reads is the count
-    of completed optimizer updates.
+    `decay` is a schedule over steps because some objectives ramp the
+    momentum; I-JEPA anneals it from 0.996 to 1.0. The step it reads is the
+    count of completed optimizer updates. `select` picks the tracked leaves
+    and defaults to all of them.
     """
     decay: optax.Schedule
     select: PathFilter = everything
 
 
+class SavedTask(Protocol):
+    """The task class a saved run of an objective loads as (`Objective.saved_task`).
+
+    It is a class whose `from_run` builds the task from a run directory.
+    Dew's tasks (`TextToImage`, `TextGeneration`, `BlockGeneration`,
+    `MaskedGeneration`) are such classes, and a plugin can supply its own."""
+
+    @classmethod
+    def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
+                 mesh: MeshSpec | None = None, layout: Layout | None = None,
+                 dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None) -> Self: ...
+
+
 class Objective(ABC, Generic[Loss, Effects]):
-    """Define what is being learned: the parameters, the loss, what evaluation produces."""
+    """Defines what is learned: the parameters, the loss and what evaluation produces."""
 
     _inputs: InputSpec | None = None
 
     @property
     def inputs(self) -> InputSpec | None:
-        """Declared input shapes, or None for a custom initializer without an InputSpec.
+        """The declared input shapes, or None for a custom initializer without an `InputSpec`.
 
-        The sample is the batch field the loss reads, at its per-example
-        shape, and the trainer checks the first batch of a run without a
-        rollout against it (`InputSpec.check`). A property lets built-in
-        objectives narrow this optional research contract.
+        The spec's sample is the batch field the loss reads, at its
+        per-example shape. In a run without a rollout, the trainer checks the
+        first batch against it (`InputSpec.check`). It is a property so that
+        built-in objectives can narrow it; a diffusion objective, for example,
+        requires a spec.
         """
         return self._inputs
 
@@ -298,86 +350,97 @@ class Objective(ABC, Generic[Loss, Effects]):
         self._inputs = inputs
 
     ema: EMASpec | None = None
+    saved_task: ClassVar[type[SavedTask] | None] = None
+    """The task class a saved run of this objective loads as, which `dew.pipeline` builds from the run.
+
+    A subclass inherits its parent's. None means a saved run of this
+    objective loads as no task."""
     _ema_is_reference: ClassVar[bool] = False
     artifact: type | None = None
     """The artifact type `evaluate` returns, or None when it returns nothing."""
     shown: Mapping[str, Shown] = {}
-    """How the display shows the metrics `loss` reports, by the names it
-    reports them under, and the loss itself, under `loss`, where the
+    """How the display shows the metrics `loss` reports, keyed by the names it reports them under.
+
+    An entry under `loss` covers the loss itself, for an objective where the
     trainer's default (lower is better) does not hold."""
 
     def optimizer(self, tx: optax.GradientTransformation, *,
                   accumulation: int) -> optax.GradientTransformation:
-        """The optimizer the trainer steps this objective's `params` with,
-        made from the one it was handed, `tx`.
+        """Return the optimizer the trainer steps this objective's `params` with, built from `tx`.
 
-        The default is `tx` itself. An objective that trains several networks
-        of its own, such as a few-step student beside the fake score that
-        criticizes it, can give each its own copy of `tx`, with its own state
-        and update count, by `optax.multi_transform` over the networks, and
-        alternate them by `optax.conditionally_mask`, whose count is the
-        trainer's committed updates. `accumulation` is the trainer's: an
-        objective whose loss alternates networks step by step refuses more
-        than one microbatch per update, since a window would mix phases.
+        The default returns `tx` itself. An objective that trains several
+        networks of its own, such as a few-step student and the fake score
+        that critiques it, can give each network its own copy of `tx`, with
+        its own state and update count, by `optax.multi_transform` over the
+        networks. It can then alternate them with `optax.conditionally_mask`,
+        whose count is the trainer's number of committed updates.
+
+        `accumulation` is the trainer's setting. An objective whose loss
+        alternates networks from one update to the next refuses more than one
+        microbatch per update, because an accumulation window would mix the
+        phases.
         """
         return tx
 
     def averages(self, update: jax.Array) -> jax.Array:
-        """Whether the update after `update` committed ones moves the EMA.
+        """Return whether the next update moves the EMA, given `update` committed updates so far.
 
-        The default averages every update. An objective whose EMA follows
-        one of the networks it alternates averages on that network's updates
-        only, as rCM's does on its student's.
+        The default averages every update. An objective whose EMA follows one
+        of the networks it alternates averages only on that network's
+        updates; the rCM objective does this for its student.
         """
         return jnp.asarray(a=True)
 
     def held_variables(self) -> Variables | None:
-        """The arrays this objective starts from, or None when it draws them.
+        """Return the arrays this objective starts from, or None when it initializes them from a key.
 
-        A continued-pretraining objective returns its checkpoint here; one
-        that keeps a frozen tower beside the model it trains returns that.
-        The trainer reads this once and hands the result back to `init`, so
+        A continued-pretraining objective returns its checkpoint here, and one
+        that keeps a frozen tower next to the model it trains returns the
+        tower. The trainer calls this once and passes the result to `init`, so
         an objective never has to read its own held arrays inside a trace.
         """
         return None
 
     @property
     def bank_sites(self) -> tuple[DecoderBank, ...]:
-        """Physical scanned stacks this objective evaluates, for an execution snapshot.
+        """The scanned layer stacks this objective runs, which a host layout streams as banks.
 
-        Each site names a decoder namespace below every variables collection
-        and its StackView, as the model declares them. Objectives without a
-        layer stack have only entry variables. The canonical variables and
-        optimizer trees never adopt these banks.
+        Each site names a decoder's namespace below every variables
+        collection, and its `StackView`, as the model declares them. An
+        objective without a layer stack returns an empty tuple, and all its
+        variables are entry variables. Only the execution snapshot uses
+        these banks; the variables and optimizer trees the trainer keeps
+        never take them on.
         """
         return ()
 
     @property
     def initializer(self) -> Initializer:
-        """`init` as one value a JIT can take, with held arrays as arguments.
+        """`init` as one value a JIT can take, with the held arrays as its arguments.
 
-        The trainer builds the initial state inside one JIT. A nullary
-        function forces every concrete array its body reads to be captured
-        as a compiled constant, which for a loaded checkpoint means the whole
-        parameter tree is embedded in the executable: 2.2 GiB for a 0.6B
-        model, a module too large for the compilation cache to store.
+        The trainer builds the initial state inside one JIT. If that JIT took a
+        function with no arguments, every concrete array the body reads would
+        be captured as a compiled constant. For a loaded checkpoint, the whole
+        parameter tree would then be embedded in the executable: 2.2 GiB for
+        a 0.6B model, a module too large for the compilation cache to store.
 
-        This is the one boundary where held variables cross into that JIT as
-        data. `Partial` is a pytree whose bound arguments are children, so
+        This property is the one place where held variables enter that JIT as
+        data. `Partial` is a pytree whose bound arguments are its children, so
         they arrive as JIT arguments however deeply `init` nests its own
-        compilation, and the call always dispatches through public `init`.
+        compilation, and the call always goes through the public `init`.
         """
         held = self.held_variables()
         return Partial(self.init) if held is None else Partial(self.init, variables=held)
 
     @abstractmethod
     def init(self, key: jax.Array, variables: Variables | None = None) -> Variables:
-        """The whole variables tree, every collection, from one key. Pure, so
-        the trainer traces it once for shapes and once for values.
+        """Return the whole variables tree, every collection, from one key.
 
-        `variables` is the held tree the caller supplies, which is how the
-        trainer passes it as data; None means take it from this objective's
-        own `held_variables`. An objective that holds nothing ignores it.
+        It must be pure, because the trainer traces it once for shapes and
+        once for values. `variables` is the held tree the caller supplies,
+        which is how the trainer passes it as data; None means take it from
+        this objective's own `held_variables`. An objective that holds nothing
+        ignores it.
         """
 
     @property
@@ -414,11 +477,12 @@ class Objective(ABC, Generic[Loss, Effects]):
 
     @abstractmethod
     def loss(self, variables: Variables, batch: Batch, step: Step) -> Loss | tuple[Loss, Aux[Effects]]:
-        """Additive loss statistics, optionally paired with auxiliary reports.
+        """Return additive loss statistics for `batch`, optionally paired with an `Aux` of reports.
 
-        Ratio declares a shared normalization mass. A plain scalar is one
-        unit-mass term. Composite statistics are objective-owned Flax PyTrees;
-        their leaves add across records before reduce_loss is evaluated.
+        A `Ratio` declares a shared normalization mass, and a plain scalar is
+        one term of unit mass. Composite statistics are Flax pytrees the
+        objective defines; their leaves add across microbatches before
+        `reduce_loss` runs on the sum.
         """
 
     def _loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Loss, Aux[Effects]]:
@@ -428,7 +492,12 @@ class Objective(ABC, Generic[Loss, Effects]):
         return loss, Aux(metrics={})
 
     def reduce_loss(self, stats: Loss) -> tuple[jax.Array, jax.Array]:
-        """The objective value and whether its statistical support is active."""
+        """Return the objective value of summed statistics and whether they have any mass.
+
+        A `Ratio` reduces by `Ratio.mean`, and a scalar is its own value with
+        mass one. Composite statistics need an override, since the default
+        raises `TypeError` for them.
+        """
         if isinstance(stats, Ratio):
             return stats.mean()
         if isinstance(stats, (jax.Array, float, int)):
@@ -440,43 +509,51 @@ class Objective(ABC, Generic[Loss, Effects]):
         raise TypeError("custom loss statistics require Objective.reduce_loss")
 
     def scalar_loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[jax.Array, Aux[Effects]]:
-        """Evaluate and reduce the canonical statistics, for direct JAX differentiation."""
+        """Return the reduced loss and the `Aux` for `batch`, so JAX can differentiate the loss directly."""
         stats, aux = self._loss(variables, batch, step)
         value, _ = self.reduce_loss(stats)
         return value, aux
 
     def tile_head(self, tile: tuple[int, int] | None = None) -> str | None:
-        """Move a head that holds its whole logits for the backward to a
-        bounded tile, `tile` or the objective's own, and say what it moved
-        to, or None when there was nothing to move: the fit ladder's first
-        rung (`dew.training.trainer.recompute_more`), which logs it, and the
-        rung a resumed run takes back. An objective with no such head has
-        nothing to move."""
+        """Move a head that keeps its whole logits for the backward pass to a bounded tile.
+
+        The tile is `tile`, or the objective's own when that is None. The
+        return value describes the new tile, or is None when there was nothing
+        to move, as for an objective with no such head. This is the first rung
+        of the fit ladder (`dew.training.trainer.recompute_more`), which logs
+        the description, and a resumed run moves to the same rung again.
+        """
         return None
 
     def apply_effects(self, variables: Variables, effects: Effects) -> Variables:
-        """Nonparameter replacements from accepted-window observations."""
+        """Return replacement nonparameter collections computed from one accepted window's `effects`.
+
+        The trainer calls this once per committed update with the effects
+        summed over the window's microbatches. The default raises `TypeError`.
+        """
         raise TypeError("deferred effects require Objective.apply_effects")
 
     def predict(self, params: Variables, batch: Batch, step: Step, *, train: bool,
                 layers: Sequence[int] = ()) -> tuple[Ratio, Aux[Effects], Prediction]:
-        """The loss over `batch` as `loss` computes it, with the prediction
-        behind it: the statistics, the reports, and the token logits with the
-        weight of every position and the hidden states of `layers`.
+        """Return the loss over `batch` as `loss` computes it, together with the prediction behind it.
 
-        The statistics are one `Ratio` over the positions the weights count,
-        so a distillation can mix in terms over the same mass. `train` gates
-        dropout the way `loss` has it on; a frozen teacher scores with it
-        off. Objectives that score no token logits raise.
+        The result holds the statistics, the `Aux` reports and a `Prediction`
+        with the token logits, the weight of every position and the hidden
+        states of `layers`. The statistics are one `Ratio` over the positions
+        the weights count, so a distillation can mix in terms over the same
+        mass. `train` turns dropout on, as `loss` has it; a frozen teacher
+        scores with it off. Objectives that score no token logits raise
+        `TypeError`.
         """
         raise TypeError(f"{type(self).__name__} scores no token logits")
 
     def evaluate(self, params: Variables, batch: Batch, step: Step) -> Artifacts | None:
-        """Scoring artifacts for every row of the coordinated global batch.
+        """Return scoring artifacts for every row of the global batch that all processes evaluate.
 
-        Every rank participates in numerical work outside the optimizer jit.
-        No display sampling or decoding belongs here. Each scoring batch has
-        a distinct key; `step.ema` holds the averaged weights.
+        Every process runs this numerical work, outside the optimizer's jit.
+        Display sampling and decoding go in `preview`. Each scoring batch has
+        its own key, and `step.ema` holds the averaged weights. The default
+        returns None.
         """
         return None
 
@@ -486,36 +563,62 @@ class Objective(ABC, Generic[Loss, Effects]):
         return state.averaged
 
     def inference_record(self) -> JSON:
-        """The registered model and task settings a saved step can rebuild.
+        """Return the registered model and task settings that let a saved step be rebuilt.
 
-        An objective without a declared inference contract returns None;
-        raw state restore remains available for custom research methods.
+        An objective without a declared inference contract returns None. A
+        custom research method can still restore its raw state.
         """
 
     def pipeline(self, state: TrainState, *, ema: bool | None = None) -> Task:
-        """The trained model as its inference task over `state`'s weights.
+        """Return the trained model as its inference task, over `state`'s weights.
 
-        `ema` None takes `state.averaged` when the objective keeps an
-        average and the live parameters otherwise, as `dew.pipeline` reads a
-        run; True requires the average and False selects live parameters.
-        Reference-policy objectives publish the trained policy, never their
-        frozen loss reference. Arrays retain their placement. Objectives
-        without a generation task raise.
+        With `ema` None, the task uses `state.averaged` when the objective
+        keeps an average and the live parameters otherwise, which is how
+        `dew.pipeline` reads a run. True requires the average, and False
+        selects the live parameters. An objective with a reference policy
+        returns the trained policy, never the frozen reference its loss
+        compares against. The arrays keep their placement. Objectives
+        without a generation task raise `TypeError`.
         """
         raise TypeError(f"{type(self).__name__} has no inference task")
 
     def preview(self, params: Variables, batch: Batch, step: Step, *,
                 scored: Artifacts | None = None) -> Artifacts | None:
-        """One display per event, reusing first-batch scoring when available.
+        """Return one event's display artifacts, reusing the first batch's scores when given.
 
-        Called on every rank with a separate preview key. Before an internal
-        collective, coordinate local setup and generation failures with
-        agree_process_phase so every rank reaches the same boundary. Complete
-        all gathers before root-only decoding. The trainer coordinates the
-        hook's final outcome before any subsequent collective.
+        The trainer calls this on every process, with a preview key in
+        `step.key` that is separate from the scoring keys. Before any
+        collective inside it, use `agree_process_phase` to agree on local
+        setup and generation failures, so every process reaches the same
+        point. Finish all gathers before decoding on the root process alone.
+        The trainer agrees on the hook's final outcome across processes before
+        it runs any later collective. The default returns `scored` when given,
+        and otherwise the result of `evaluate`.
         """
         return scored if scored is not None else self.evaluate(params, batch, step)
 
+
+
+M = TypeVar("M", bound="nn.Module", covariant=True)
+
+
+@runtime_checkable
+class Source(Protocol[M]):
+    """A loaded model an objective can train in place of a bare model:
+    `LMObjective(qwen, seq_len=512)` reads its `model`, its `variables` as
+    the starting tree and its `text_processor`. `dew.interop.Pretrained` is
+    one; the protocol keeps `dew.objectives` from importing `dew.interop`.
+    `M` is the kind of model it carries, which an objective that trains one
+    kind checks when it reads it."""
+
+    @property
+    def model(self) -> M: ...
+
+    @property
+    def variables(self) -> Variables: ...
+
+    @property
+    def text_processor(self) -> Processor | None: ...
 
 
 S = TypeVar("S")
@@ -523,14 +626,16 @@ S = TypeVar("S")
 
 @runtime_checkable
 class Metric(Protocol[S]):
-    """Reduce a validation pass to one scalar, on the host.
+    """Reduces a validation pass to one scalar, on the host.
 
-    Statistics are merged as each batch arrives and finalized once.
+    The metric computes statistics for each batch as it arrives, merges them
+    into an accumulator and finalizes the accumulator once at the end.
 
-    The first contribution initializes a pass. State belongs to that pass
-    alone; merge may update its owned buffers in place. Metrics must never
-    perform process collectives or retain state between passes. A metric
-    may carry `shown`, a `Shown` for how the training display shows it.
+    The first batch's statistics become the pass's accumulator. That state
+    belongs to the one pass, so `merge` may update its buffers in place. A
+    metric must never run process collectives or keep state between passes.
+    It may have a `shown` attribute, a `Shown` for how the training display
+    shows it.
     """
 
     @property
@@ -542,16 +647,15 @@ class Metric(Protocol[S]):
         ...
 
     def __call__(self, artifact: Artifact, batch: Batch, /) -> S:
-        """Compute one complete batch's sufficient statistics, out of the
-        scoring artifact `reads` names."""
+        """Compute one complete batch's sufficient statistics from the scoring artifact of type `reads`."""
         ...
 
     def merge(self, accumulated: S, contribution: S, /) -> S:
-        """Combine a contribution with the pass-owned accumulator."""
+        """Merge one batch's statistics into the pass's accumulator and return the result."""
         ...
 
     def finalize(self, accumulated: S, /) -> float:
-        """The completed pass's scalar."""
+        """Return the scalar for the completed pass."""
         ...
 
 
@@ -581,14 +685,18 @@ __all__ = [
     "PathFilter",
     "Prediction",
     "Ratio",
+    "SavedTask",
     "Shown",
+    "Source",
     "Step",
     "TrainingScalar",
     "TrainingScalars",
     "Variables",
     "everything",
     "freeze",
+    "joined",
     "merge",
+    "part",
     "select",
     "thaw",
     "under",

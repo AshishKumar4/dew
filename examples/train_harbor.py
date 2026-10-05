@@ -102,7 +102,7 @@ def main(config: Config) -> dict:
         param_dtype=jnp.float32,
         max_seq_len=config.width,
     )
-    objective = GRPOObjective(source.model, config.width - 1, pretrained=source.variables,
+    objective = GRPOObjective(source.model, config.width - 1, variables=source.variables,
                               behavior_importance=2.0, epsilon_high=0.28)
     fake = None
     if config.smoke:

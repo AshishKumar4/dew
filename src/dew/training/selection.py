@@ -12,10 +12,13 @@ from dew.objectives.base import Metric, TrainingScalar
 
 @dataclasses.dataclass(frozen=True, init=False)
 class Best:
-    """Keep top-K evaluations of a metric, a recorded metric name, or a custom score.
+    """Keeps the `top` best evaluations by a metric, a recorded metric name, or a custom score.
 
-    Names bind to fit's metric objects. A custom score minimizes by default;
-    named and object metrics take direction from their Shown declaration.
+    A name refers to one of the metric objects passed to `fit`. `mode` sets
+    the direction, 'min' or 'max'. When it is None, a custom score is
+    minimized, and a named metric or a metric object takes its direction
+    from its `Shown` declaration. An evaluation whose score is not better
+    than `threshold` is not ranked.
     """
     metric: str
     top: int = 1

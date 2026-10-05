@@ -48,12 +48,10 @@ from dew.nn.text_encoders import (
     CLIPTextTransformer,
     CLIPVisionTransformer,
     T5EncoderTransformer,
-    T5Fields,
-    TextFields,
-    VisionFields,
     translate_clip_config,
     translate_clip_weights,
     translate_config,
+    translate_t5_config,
     translate_vision_config,
     translate_weights,
 )
@@ -95,20 +93,56 @@ def largest_difference(actual, expected) -> float:
     return float(np.max(np.abs(np.asarray(actual, np.float32) - expected)))
 
 
-# What a translated config carries, against the module it builds. Each pair is
-# one TypedDict and the module whose init fields it names, so a field added,
-# renamed or dropped there fails here instead of becoming a key nobody reads.
+# Each translator must actually state every checkpoint-controlled field of
+# its tower, even when the constructor could supply a default instead.
 # `dtype` and `precision` are the caller's execution choices and `parent` and
 # `name` are flax's binding, so a config states none of the four.
-@pytest.mark.parametrize("record, module", [
-    (TextFields, CLIPTextTransformer),
-    (VisionFields, CLIPVisionTransformer),
-    (T5Fields, T5EncoderTransformer),
+@pytest.mark.parametrize("translate, module, directory", [
+    (translate_config, CLIPTextTransformer, TINY),
+    (translate_vision_config, CLIPVisionTransformer, TINY),
+    (translate_t5_config, T5EncoderTransformer, FIXTURES.parent / "t5" / "tiny"),
 ])
-def test_a_translated_config_names_every_field_of_the_tower_it_builds(record, module):
+def test_a_translated_config_names_every_field_of_the_tower_it_builds(translate, module, directory):
+    record = translate(fixture_config(directory))
     declared = {field.name for field in dataclasses.fields(module)
                 if field.init} - {"parent", "name", "dtype", "precision"}
-    assert set(record.__required_keys__) | set(record.__optional_keys__) == declared
+    assert set(record) == declared
+    value = record.value
+    assert {name: getattr(value, name) for name in record} == record
+
+
+def test_a_constructor_record_keeps_defaults_implicit_and_reads_its_current_fields():
+    from dew.interop.config_records import native_fields
+
+    record = native_fields(CLIPTextTransformer)(vocab_size=31, hidden_size=8)
+    assert record == {"vocab_size": 31, "hidden_size": 8}
+    assert record.value.num_layers == 12
+    record["hidden_size"] = 16
+    assert record.value.hidden_size == 16
+    record["hidden_features"] = 8
+    with pytest.raises(ValueError, match="hidden_features"):
+        _ = record.value
+
+
+def test_translating_inside_a_module_keeps_its_native_parameter_names():
+    import jax
+    import jax.numpy as jnp
+    from flax import linen as nn
+
+    config = fixture_config(TINY)
+
+    class Encoded(nn.Module):
+        @nn.compact
+        def __call__(self, input_ids):
+            return translate_config(config).value(input_ids).last_hidden_state
+
+    input_ids = jnp.zeros((1, 2), jnp.int32)
+    module = Encoded()
+    variables = module.init(jax.random.key(9), input_ids)
+    assert set(variables["params"]) == {"CLIPTextTransformer_0"}
+    direct = translate_config(config).value
+    expected = direct.apply({"params": variables["params"]["CLIPTextTransformer_0"]}, input_ids)
+    np.testing.assert_array_equal(module.apply(variables, input_ids), expected.last_hidden_state)
 
 
 def test_tiny_checkpoint_matches_the_reference():

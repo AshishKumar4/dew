@@ -6,54 +6,29 @@ scheduler implementation is imported by this module.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, TypedDict
+from typing import TYPE_CHECKING
 
 import numpy as np
-from flax.typing import Dtype
 from jax.typing import DTypeLike
 
 from dew import records
+from dew.interop import weights
+from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.safetensors_io import read_weights
+from dew.interop.weights import ParamTree, checkpoint_dtype, insert, source_alias
+from dew.nn.backbones.flux import FluxTransformer
+from dew.nn.backbones.flux2 import Flux2Transformer
+from dew.nn.backbones.qwen_image import QwenImageTransformer
+from dew.nn.backbones.sd3 import SD3Transformer
 from dew.nn.backbones.unet_condition import UNet2DCondition, UNetStage
-from dew.nn.text_encoders import ParamTree, checkpoint_dtype, insert
+from dew.nn.backbones.wan import WanTransformer
+from dew.nn.backbones.z_image import ZImageTransformer
 from dew.registry import resolve_dtype
 
 if TYPE_CHECKING:
     from dew.interop.streaming import LazyTree, WeightLayout
-
-
-def _source_alias(tensors: Mapping[str, np.ndarray], owners: dict[tuple[str, ...], str],
-                  path: tuple[str, ...], name: str) -> None:
-    """Record `name` as the owner of `path`, and raise if another name differs there.
-
-    The check runs on the source values, before the storage cast, because two
-    different values can round to the same BF16 leaf.
-    """
-    previous = owners.setdefault(path, name)
-    if previous != name and not np.array_equal(tensors[previous], tensors[name]):
-        raise ValueError(f"Two different source tensors {previous!r} and {name!r} map to {path}")
-
-
-
-class UNetFields(TypedDict):
-    stages: tuple[UNetStage, ...]
-    in_channels: int
-    out_channels: int
-    blocks_per_level: int
-    linear_projection: bool
-    additional_time_features: int
-    middle_attention: bool
-    frequency_shift: float
-    cosine_first: bool
-    dropout: float
-    norm_groups: int
-    norm_epsilon: float
-    attention_norm_epsilon: float
-    approximate_gelu: bool
-    dtype: Dtype
-    attention_impl: str
 
 
 def flag(config: Mapping[str, object], name: str, *, default: bool) -> bool:
@@ -69,7 +44,7 @@ def flag(config: Mapping[str, object], name: str, *, default: bool) -> bool:
 
 
 def unet_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float32",
-                attention_impl="auto") -> UNetFields:
+                attention_impl="auto") -> NativeFields[UNet2DCondition]:
     """Read a Diffusers UNet config into the fields `UNet2DCondition` takes.
 
     A control whose active value this UNet cannot compute raises rather than
@@ -154,7 +129,7 @@ def unet_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "floa
     flax_semantics = source_name == "FlaxUNet2DConditionModel"
     if flax_semantics and (groups != 32 or epsilon != 1e-5):
         raise ValueError("The published Flax UNet has fixed normalization groups and epsilon")
-    return UNetFields(
+    return native_fields(UNet2DCondition)(
         stages=tuple(
             UNetStage(width, head, depth, attended, cross_only)
             for width, head, depth, attended, cross_only in zip(
@@ -263,7 +238,7 @@ def translate_unet_weights(tensors: Mapping[str, np.ndarray], model: UNet2DCondi
 
     Each leaf is cast to `param_dtype` before its transpose. Attention kernels
     are also reshaped to per-head axes, which is why this does not go through
-    `record_layouts`. Read eagerly, a transposed kernel is a view of the
+    `weights.record_layouts`. Read eagerly, a transposed kernel is a view of the
     stored tensor. With `lazy` every other linear kernel and every
     untransposed leaf is a `SourceLeaf`, read when it is placed; a reshaped
     attention kernel and a convolution are read whole either way.
@@ -274,7 +249,7 @@ def translate_unet_weights(tensors: Mapping[str, np.ndarray], model: UNet2DCondi
     owners: dict[tuple[str, ...], str] = {}
     for name, tensor in tensors.items():
         path = _unet_path(name, tensor.ndim)
-        _source_alias(tensors, owners, path, name)
+        source_alias(tensors, owners, path, name)
         stored = np.asarray(tensor)
         dtype = checkpoint_dtype(stored.dtype, param_dtype)
         kernel = path[-1] == "kernel"
@@ -283,7 +258,7 @@ def translate_unet_weights(tensors: Mapping[str, np.ndarray], model: UNet2DCondi
             layouts.append(WeightLayout("unet/" + name, (("params", *path),), stored.shape,
                                         (1, 0) if kernel else None))
             if owners[path] == name:
-                # A second name `_source_alias` proved equal adds no leaf.
+                # Equal source aliases add export names without another leaf.
                 insert(parameters, path, SourceLeaf((stored,), dtype, transposed=kernel), name)
             continue
         value = stored.astype(dtype, copy=False)
@@ -312,26 +287,8 @@ def translate_unet_weights(tensors: Mapping[str, np.ndarray], model: UNet2DCondi
 
 
 
-class SD3Fields(TypedDict):
-    patch_size: int
-    in_channels: int
-    out_channels: int
-    num_layers: int
-    heads: int
-    head_dim: int
-    joint_attention_dim: int
-    caption_projection_dim: int
-    pooled_projection_dim: int
-    sample_size: int
-    pos_embed_max_size: int
-    dual_attention_layers: tuple[int, ...]
-    qk_norm: str | None
-    dtype: object
-    attention_impl: str
-
-
 def sd3_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float32",
-               attention_impl="auto") -> SD3Fields:
+               attention_impl="auto") -> NativeFields[SD3Transformer]:
     """Read a published `SD3Transformer2DModel` config into native model fields.
 
     Every geometry control the source declares is read. A control whose active
@@ -348,7 +305,7 @@ def sd3_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float
     qk_norm = config.get("qk_norm")
     if qk_norm not in (None, "rms_norm"):
         raise ValueError(f"Native SD3 implements qk_norm 'rms_norm', not {qk_norm!r}")
-    return SD3Fields(
+    return native_fields(SD3Transformer)(
         patch_size=records.integer(config["patch_size"], "patch_size"), in_channels=channels,
         out_channels=channels if out_channels is None else records.integer(out_channels, "out_channels"),
         num_layers=records.integer(config["num_layers"], "num_layers"), heads=heads, head_dim=head_dim,
@@ -446,24 +403,8 @@ def _sd3_path(name: str) -> tuple[str, ...] | None:
     raise ValueError(f"unknown tensor name {name!r}")
 
 
-class FluxFields(TypedDict):
-    patch_size: int
-    in_channels: int
-    out_channels: int
-    num_layers: int
-    num_single_layers: int
-    heads: int
-    head_dim: int
-    joint_attention_dim: int
-    pooled_projection_dim: int
-    guidance_embeds: bool
-    axes_dims_rope: tuple[int, ...]
-    dtype: object
-    attention_impl: str
-
-
 def flux_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float32",
-                attention_impl="auto") -> FluxFields:
+                attention_impl="auto") -> NativeFields[FluxTransformer]:
     """Read a published `FluxTransformer2DModel` config into native model fields.
 
     Every geometry control the source declares is read, including whether it
@@ -481,7 +422,7 @@ def flux_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "floa
         raise ValueError(f"axes_dims_rope {tuple(axes)} must cover the {head_dim} head channels")
     if any(size % 2 for size in axes):
         raise ValueError(f"axes_dims_rope {tuple(axes)} rotates channel pairs, so each is even")
-    return FluxFields(
+    return native_fields(FluxTransformer)(
         patch_size=records.integer(config.get("patch_size", 1), "patch_size"), in_channels=channels,
         out_channels=channels if out_channels is None else records.integer(out_channels, "out_channels"),
         num_layers=records.integer(config["num_layers"], "num_layers"),
@@ -495,26 +436,8 @@ def flux_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "floa
 
 
 
-class Flux2Fields(TypedDict):
-    in_channels: int
-    out_channels: int
-    num_layers: int
-    num_single_layers: int
-    heads: int
-    head_dim: int
-    joint_attention_dim: int
-    timestep_guidance_channels: int
-    mlp_ratio: float
-    axes_dims_rope: tuple[int, ...]
-    rope_theta: float
-    eps: float
-    guidance_embeds: bool
-    dtype: object
-    attention_impl: str
-
-
 def flux2_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float32",
-                 attention_impl="auto") -> Flux2Fields:
+                 attention_impl="auto") -> NativeFields[Flux2Transformer]:
     """Read a published `Flux2Transformer2DModel` config into native model
     fields, refusing a patch size the pipeline does not use."""
     if records.integer(config.get("patch_size", 1), "patch_size") != 1:
@@ -529,7 +452,7 @@ def flux2_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "flo
     if sum(axes) != head_dim or len(axes) != 4:
         raise ValueError(f"axes_dims_rope {tuple(axes)} must split the {head_dim} head channels over the "
                          f"four axes the pipeline's ids carry")
-    return Flux2Fields(
+    return native_fields(Flux2Transformer)(
         in_channels=channels,
         out_channels=channels if out_channels is None else records.integer(out_channels, "out_channels"),
         num_layers=records.integer(config.get("num_layers", 8), "num_layers"),
@@ -589,28 +512,12 @@ def translate_flux2_weights(tensors: Mapping[str, np.ndarray], *, param_dtype: s
                             ) -> tuple[LazyTree, tuple[WeightLayout, ...]]:
     """Map FLUX.2 tensors into a parameter tree and the layouts that invert
     it; its rotary tables are computed from ids, so it stores no buffer."""
-    return record_layouts("transformer", tensors, _flux2_path, ("params",), param_dtype=param_dtype,
+    return weights.record_layouts("transformer", tensors, _flux2_path, ("params",), param_dtype=param_dtype,
                           lazy=lazy)
 
 
-class ZImageFields(TypedDict):
-    in_channels: int
-    dim: int
-    n_layers: int
-    n_refiner_layers: int
-    n_heads: int
-    norm_eps: float
-    cap_feat_dim: int
-    rope_theta: float
-    t_scale: float
-    axes_dims: tuple[int, ...]
-    axes_lens: tuple[int, ...]
-    dtype: object
-    attention_impl: str
-
-
 def z_image_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float32",
-                   attention_impl="auto") -> ZImageFields:
+                   attention_impl="auto") -> NativeFields[ZImageTransformer]:
     """Read a published `ZImageTransformer2DModel` config into native model
     fields, refusing what the port does not compute: another patch size,
     grouped keys and values, no query and key norms, or the Omni model's
@@ -630,7 +537,7 @@ def z_image_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "f
     lengths = records.integers(config.get("axes_lens", (1024, 512, 512)), "axes_lens")
     if sum(axes) != dim // heads or len(axes) != 3 or len(lengths) != 3:
         raise ValueError(f"axes_dims {axes} must split the {dim // heads} head channels over three axes")
-    return ZImageFields(
+    return native_fields(ZImageTransformer)(
         in_channels=records.integer(config.get("in_channels", 16), "in_channels"),
         dim=dim,
         n_layers=records.integer(config.get("n_layers", 30), "n_layers"),
@@ -692,30 +599,13 @@ def translate_z_image_weights(tensors: Mapping[str, np.ndarray], *, param_dtype:
                               ) -> tuple[LazyTree, tuple[WeightLayout, ...]]:
     """Map Z-Image tensors into a parameter tree and the layouts that invert
     it; its rotary table is computed, so it stores no buffer."""
-    return record_layouts("transformer", tensors, lambda name: _z_image_path(name, np.ndim(tensors[name])),
-                          ("params",), param_dtype=param_dtype, lazy=lazy)
-
-
-class WanFields(TypedDict):
-    patch_size: tuple[int, ...]
-    num_attention_heads: int
-    attention_head_dim: int
-    in_channels: int
-    out_channels: int
-    text_dim: int
-    freq_dim: int
-    ffn_dim: int
-    num_layers: int
-    cross_attn_norm: bool
-    qk_norm: str | None
-    eps: float
-    rope_max_seq_len: int
-    dtype: object
-    attention_impl: str
+    return weights.record_layouts(
+        "transformer", tensors, lambda name: _z_image_path(name, np.ndim(tensors[name])),
+        ("params",), param_dtype=param_dtype, lazy=lazy)
 
 
 def wan_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float32",
-               attention_impl="auto") -> WanFields:
+               attention_impl="auto") -> NativeFields[WanTransformer]:
     """Read a published `WanTransformer3DModel` config into native model
     fields, refusing what the text-to-video port does not compute: the
     image-to-video models' image embedder and added key and value
@@ -733,7 +623,7 @@ def wan_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float
         raise ValueError("Wan's patches are (frames, rows, columns) and its heads rotate channel pairs")
     channels = records.integer(config.get("in_channels", 16), "in_channels")
     out_channels = config.get("out_channels")
-    return WanFields(
+    return native_fields(WanTransformer)(
         patch_size=patch,
         num_attention_heads=records.integer(config.get("num_attention_heads", 40), "num_attention_heads"),
         attention_head_dim=head_dim,
@@ -788,7 +678,8 @@ def translate_wan_weights(tensors: Mapping[str, np.ndarray], *, param_dtype: str
                           ) -> tuple[LazyTree, tuple[WeightLayout, ...]]:
     """Map Wan transformer tensors into a parameter tree and the layouts that
     invert it; its rotary table is computed, so it stores no buffer."""
-    return record_layouts("transformer", tensors, _wan_path, ("params",), param_dtype=param_dtype, lazy=lazy)
+    return weights.record_layouts("transformer", tensors, _wan_path, ("params",),
+                                  param_dtype=param_dtype, lazy=lazy)
 
 _FLUX_EMBEDDERS = {
     "x_embedder": ("x_embedder",),
@@ -842,7 +733,8 @@ def translate_flux_weights(tensors: Mapping[str, np.ndarray], *, param_dtype: st
     Rotary tables are computed from input ids, so Flux stores no positional
     buffer and there is nothing to place outside `params`.
     """
-    return record_layouts("transformer", tensors, _flux_path, ("params",), param_dtype=param_dtype, lazy=lazy)
+    return weights.record_layouts("transformer", tensors, _flux_path, ("params",),
+                                  param_dtype=param_dtype, lazy=lazy)
 
 
 def translate_sd3_weights(tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32",
@@ -857,7 +749,7 @@ def translate_sd3_weights(tensors: Mapping[str, np.ndarray], *, param_dtype: str
     """
     from dew.interop.streaming import WeightLayout
 
-    parameters, layouts = record_layouts(
+    parameters, layouts = weights.record_layouts(
         "transformer", tensors, _sd3_path, ("params",), param_dtype=param_dtype, lazy=lazy)
     buffers: ParamTree = {}
     position = tensors.get("pos_embed.pos_embed")
@@ -872,23 +764,8 @@ def translate_sd3_weights(tensors: Mapping[str, np.ndarray], *, param_dtype: str
     return parameters, buffers, layouts
 
 
-class QwenImageFields(TypedDict):
-    in_channels: int
-    out_channels: int
-    num_layers: int
-    heads: int
-    head_dim: int
-    context_in_dim: int
-    mlp_ratio: int
-    axes_dims_rope: tuple[int, ...]
-    eps: float
-    causal_condition: bool
-    dtype: object
-    attention_impl: str
-
-
 def qwen_image_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float32",
-                      attention_impl="auto") -> QwenImageFields:
+                      attention_impl="auto") -> NativeFields[QwenImageTransformer]:
     """Read a published `QwenImage21Transformer2DModel` config into native fields.
 
     Every control the class declares is read. Its pipeline hands the latent
@@ -906,7 +783,7 @@ def qwen_image_fields(config: Mapping[str, object], *, dtype: DTypeLike | None =
     head_dim = records.integer(config.get("attention_head_dim", 128), "attention_head_dim")
     if sum(axes) != head_dim:
         raise ValueError(f"axes_dims_rope {tuple(axes)} must cover the {head_dim} head channels")
-    return QwenImageFields(
+    return native_fields(QwenImageTransformer)(
         in_channels=channels,
         out_channels=channels if out_channels is None else records.integer(out_channels, "out_channels"),
         num_layers=records.integer(config.get("num_layers", 32), "num_layers"),
@@ -969,7 +846,7 @@ def translate_qwen_image_weights(tensors: Mapping[str, np.ndarray], *, param_dty
     """Map Qwen-Image 2.1 transformer tensors into a parameter tree and the
     layouts that invert it. Its rotary table is computed from positions, so
     it stores no buffer."""
-    return record_layouts("transformer", tensors, _qwen_image_path, ("params",),
+    return weights.record_layouts("transformer", tensors, _qwen_image_path, ("params",),
                           param_dtype=param_dtype, lazy=lazy)
 
 
@@ -977,48 +854,6 @@ def component_tensors(directory: Path, component: str) -> dict[str, np.ndarray]:
     """Read one published component's weights: the shards its index names or
     its one weights file, never a precision variant beside them."""
     return read_weights(directory / component)
-
-
-def record_layouts(component: str, tensors: Mapping[str, np.ndarray],
-                   path_of: Callable[[str], tuple[str, ...] | None], prefix: tuple[str, ...], *,
-                   param_dtype: str = "float32", lazy: bool = False
-                   ) -> tuple[LazyTree, tuple[WeightLayout, ...]]:
-    """Map a component's tensors into a parameter tree and the layouts that invert it.
-
-    `path_of` gives each tensor's tree path, or None to skip it. Kernels are
-    transposed from torch's `[out, in, *window]` to Flax's `[*window, in, out]`
-    (a linear layer's, a 2-D or a 3-D convolution's) and the transpose is
-    recorded in the layout, so `WeightLayout.export`
-    writes the tensor back unchanged. Each leaf is cast to `param_dtype` before
-    the transpose; buffers and scoring state are the caller's to keep in FP32.
-
-    With `lazy` a linear kernel or an untransposed leaf is a `SourceLeaf`
-    over the stored tensor, read only when it is placed
-    (`dew.interop.streaming`). A convolution kernel's transpose is not the
-    trailing pair a `SourceLeaf` swaps, and convolutions are small, so it is
-    read whole either way.
-    """
-    from dew.interop.streaming import SourceLeaf, WeightLayout, materialize
-    parameters: LazyTree = {}
-    layouts = []
-    owners: dict[tuple[str, ...], str] = {}
-    for name, tensor in tensors.items():
-        path = path_of(name)
-        if path is None:
-            continue
-        _source_alias(tensors, owners, path, name)
-        stored = np.asarray(tensor)
-        order = (*range(2, stored.ndim), 1, 0) if path[-1] == "kernel" else None
-        transpose = None if order is None else tuple(int(axis) for axis in np.argsort(order))
-        layouts.append(WeightLayout(f"{component}/{name}", ((*prefix, *path),), tensor.shape, transpose))
-        if owners[path] != name:
-            # A second name for a tensor `_source_alias` proved equal: one leaf, two exports.
-            continue
-        dtype = checkpoint_dtype(stored.dtype, param_dtype)
-        insert(parameters, path, np.ascontiguousarray(stored.astype(dtype, copy=False).transpose(order))
-               if order is not None and stored.ndim != 2
-               else SourceLeaf((stored,), dtype, transposed=order is not None), name)
-    return (parameters if lazy else materialize(parameters)), tuple(layouts)
 
 
 def flax_component_parameters(component: str, tensors: Mapping[str, np.ndarray]) -> ParamTree:

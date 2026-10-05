@@ -826,6 +826,38 @@ def test_a_traced_window_splits_into_compute_exposed_collectives_and_idle():
                                + split["idle_input"] + split["idle_host"])
 
 
+def test_a_trace_counts_a_gpus_stream_lines_and_a_tpus_xla_ops_alone(tmp_path, monkeypatch):
+    """XProf derives `XLA Ops` and `XLA Modules` lines from a GPU's stream
+    kernels, and a module's span covers the idle gaps between them; a TPU
+    runs its ops on `XLA Ops` alone. Every tool reads its JAX traces through
+    `device_events`, so none counts a derived line's time twice."""
+    from types import SimpleNamespace
+
+    import jax.profiler
+
+    def line(name, *spans):
+        return SimpleNamespace(name=name, events=[SimpleNamespace(name=f"{name}/{start}", start_ns=start,
+                                                                  end_ns=end) for start, end in spans])
+
+    planes = [SimpleNamespace(name="/host:CPU", lines=[line("python", (0, 9))]),
+              SimpleNamespace(name="/device:GPU:0", lines=[
+                  line("Stream #14(Compute)", (0, 2), (5, 6)), line("XLA Ops", (0, 2), (5, 6)),
+                  line("XLA Modules", (0, 6))]),
+              SimpleNamespace(name="/device:TPU:1", lines=[line("XLA Ops", (1, 3)),
+                                                           line("XLA Modules", (1, 3))])]
+    (tmp_path / "run.xplane.pb").touch()
+    monkeypatch.setattr(jax.profiler, "ProfileData",
+                        SimpleNamespace(from_file=lambda path: SimpleNamespace(planes=planes)))
+
+    events, lines = load("trace_window").device_events(tmp_path)
+
+    assert {plane: [event.name for event in kept] for plane, kept in events.items()} == {
+        "/device:GPU:0": ["Stream #14(Compute)/0", "Stream #14(Compute)/5"],
+        "/device:TPU:1": ["XLA Ops/1"]}
+    assert lines == ["/device:GPU:0:Stream #14(Compute)", "/device:GPU:0:XLA Modules",
+                     "/device:GPU:0:XLA Ops", "/device:TPU:1:XLA Modules", "/device:TPU:1:XLA Ops"]
+
+
 @pytest.mark.parametrize("name,category", [
     ("loop_convert_fusion", "convert"),  # whole tokens: convert is not conv
     ("void cudnn::cnn::conv2d_grouped_direct_kernel<false, true, false, true, false, false, 0, 0, "

@@ -1,19 +1,23 @@
-"""Masked (absorbing-state) discrete diffusion, shaped like the Gaussian one.
+"""Masked (absorbing-state) discrete diffusion, with the interface of the Gaussian one.
 
-The forward process replaces each token by a mask id independently, with a
-probability that grows along t in [0, 1]; `MaskingSchedule.alpha(t)` is the
-fraction of tokens still visible. Training is the continuous-time negative
-ELBO of MDLM (Sahoo et al. 2024, "Simple and Effective Masked Diffusion
-Language Models"): the cross entropy of the model's prediction at the masked
-positions, weighted by -alpha'(t) / (1 - alpha(t)). Sampling reverses the
-process one interval at a time: a masked token is revealed with probability
-(alpha(s) - alpha(t)) / (1 - alpha(t)) and, when revealed, drawn from the
-model's categorical, which is MDLM's `_ddpm_update`.
+The forward process replaces each token with a mask id independently, with
+a probability that grows with t in [0, 1]. `MaskingSchedule.alpha(t)` is
+the fraction of tokens still visible at t. Training minimizes the
+continuous-time negative ELBO of MDLM (Sahoo et al. 2024, "Simple and
+Effective Masked Diffusion Language Models"), which is the cross entropy of
+the model's prediction at the masked positions, weighted by
+-alpha'(t) / (1 - alpha(t)).
 
-`DiscreteProcess` has the surface `dew.sampling.sample` walks: a time grid,
-an initial state, and a denoiser whose two outputs are the model's argmax
-fill of the masked positions and the log-probabilities the solver draws
-from, in the slots a Gaussian denoiser puts x_0 and epsilon.
+Sampling reverses the process one interval at a time. A masked token is
+revealed with probability (alpha(s) - alpha(t)) / (1 - alpha(t)), and a
+revealed token is drawn from the model's categorical distribution. This is
+MDLM's `_ddpm_update`.
+
+`DiscreteProcess` provides what `dew.sampling.sample` needs from a process:
+a time grid, an initial state and a denoiser. The denoiser's two outputs
+sit where a Gaussian denoiser returns x_0 and epsilon. They are the model's
+argmax fill of the masked positions and the log-probabilities the solver
+draws from.
 """
 
 from __future__ import annotations
@@ -53,7 +57,7 @@ SAMPLING_EPS = 1e-3
 
 
 class MaskingSchedule(ABC):
-    """Says how fast tokens are masked along t.
+    """Sets how fast tokens are masked as t grows.
 
     `alpha(t)` in (0, 1] is the fraction of tokens left unmasked at t, with
     alpha(0) = 1.
@@ -64,7 +68,7 @@ class MaskingSchedule(ABC):
 
     @abstractmethod
     def alpha_prime(self, t) -> jax.Array:
-        """d alpha / dt, negative."""
+        """Return d alpha / dt, which is negative."""
 
 
 @dataclass(frozen=True)
@@ -91,7 +95,7 @@ class DiscreteProcess:
     schedule: MaskingSchedule
     mask_id: int
     T = 1.0
-    """The fully masked end of the time domain, as a Gaussian process names it."""
+    """The fully masked end of the time domain, named `T` as in a Gaussian `Process`."""
 
     def to_json(self) -> dict:
         if not isinstance(self.schedule, LogLinear):
@@ -103,27 +107,27 @@ class DiscreteProcess:
         return cls(LogLinear(eps=record['eps']), record['mask_id'])
 
     def sample_t(self, key, n: int) -> jax.Array:
-        """`n` times stratified over [SAMPLING_EPS, 1), MDLM's antithetic draw.
+        """Return `n` training times stratified over [SAMPLING_EPS, 1), MDLM's antithetic draw.
 
-        Row i draws its own place in the i-th of n strata, so the weights
-        1 / t of one batch cover the trajectory, and the floor keeps every
-        weight at most 1 / SAMPLING_EPS (`_sample_t`, kuleshov-group/mdlm
-        @c112c52, diffusion.py:800-808).
+        Row i draws its own point in the i-th of n strata, so the weights
+        1 / t of one batch cover the whole trajectory. The floor at
+        SAMPLING_EPS keeps every weight at most 1 / SAMPLING_EPS.
         """
+        # MDLM's `_sample_t`, kuleshov-group/mdlm@c112c52, diffusion.py:800-808.
         stratified = (jax.random.uniform(key, (n,)) + jnp.arange(n, dtype=jnp.float32)) / n
         return (1 - SAMPLING_EPS) * stratified + SAMPLING_EPS
 
     def corrupt(self, key, tokens, t) -> tuple[jax.Array, jax.Array]:
-        """`(masked tokens, is_masked)` at `t`, one t per row."""
+        """Return `(masked tokens, is_masked)` at `t`, with one t per row."""
         move_chance = 1 - self.schedule.alpha(t)
         is_masked = jax.random.uniform(key, tokens.shape) < move_chance[:, None]
         return jnp.where(is_masked, self.mask_id, tokens), is_masked
 
     def weight(self, t) -> jax.Array:
-        """The NELBO weight -alpha'(t) / (1 - alpha(t)) on the masked cross entropy.
+        """Return the NELBO weight -alpha'(t) / (1 - alpha(t)) on the masked cross entropy.
 
-        It is exactly zero at t = 0, where nothing is masked, no token
-        contributes, and the quotient itself is undefined.
+        The weight is exactly zero at t = 0. Nothing is masked there, so no
+        token contributes, and the quotient itself is undefined.
         """
         t = jnp.asarray(t, jnp.float32)
         return jnp.where(t > 0, -self.schedule.alpha_prime(t) / (1 - self.schedule.alpha(t)), 0.0)
@@ -132,9 +136,10 @@ class DiscreteProcess:
         return jnp.linspace(self.T, 0.0, steps, dtype=jnp.float32)
 
     def noise(self, key, shape) -> jax.Array:
-        """x_T, with every position masked.
+        """Return x_T, with every position masked.
 
-        `key` goes unread: the fully masked state is one point, not a draw.
+        `key` is not used, because the fully masked state is a single point
+        and needs no random draw.
         """
         return jnp.full(shape, self.mask_id, jnp.int32)
 
@@ -156,11 +161,20 @@ class DiscreteProcess:
                  max_new_tokens: int, *, key: int | jax.Array | None = None,
                  n: int = 1, steps: int = MDLM_STEPS, solver: Unmask | None = None,
                  eos_token_ids: tuple[int, ...] = (), pad_token_id: int = 0) -> CanvasGeneration:
-        """Runs native MDLM over one full response span.
+        """Generate `max_new_tokens` tokens after each prompt with native MDLM.
 
-        Prompt tokens are immutable, including literal mask ids. EOS trims
-        the completed response and does not stop bidirectional refinement
+        The whole response span starts masked, and `solver` (`Unmask` by
+        default) unmasks it over a grid of `steps` times. Each prompt row
+        gets `n` continuations in the returned `CanvasGeneration`. Prompt
+        tokens never change, including literal mask ids. An EOS token trims
+        the finished response, and the tokens after it become
+        `pad_token_id`, but it does not end the bidirectional refinement
         early.
+
+        Raises `ValueError` when the model is not a bidirectional
+        transformer, when the prompt plus `max_new_tokens` exceeds its
+        `max_seq_len`, or when the inputs include conditioning or token fields
+        that masked generation cannot extend.
         """
         solver = Unmask() if solver is None else solver
 
@@ -191,17 +205,18 @@ class DiscreteProcess:
 
 @dataclass(frozen=True)
 class DiscreteDenoiser:
-    """`(x_t, t) -> (argmax fill, log-probabilities)` for `model` under `params`.
+    """Maps `(x_t, t)` to `(argmax fill, log-probabilities)` for `model` under `params`.
 
-    `t` goes unread here: the masked model is conditioned on the corruption
-    it sees rather than on the time, and `Unmask.step` reads the time from
-    the process instead. It stays in the signature because `sample` calls
+    The denoiser ignores `t`, because the masked model is conditioned on the
+    corruption it sees and not on the time. `Unmask.step` reads the time
+    from the process. `t` stays in the signature because `sample` calls
     every denoiser as `(x_t, t)`.
 
-    The model's own logits at an unmasked position are irrelevant, since the
+    The model's own logits at an unmasked position do not matter, since the
     position keeps its token (MDLM's carry-over parameterization). The mask
-    token itself carries no mass: it marks corruption, so the categorical a
-    reveal draws from never offers it, however the model scores it.
+    token gets zero probability, whatever score the model gives it, because
+    it marks corruption and a revealed position must never draw it. When
+    `mutable_mask` is given, only masked positions inside it can change.
     """
 
     process: DiscreteProcess
@@ -234,8 +249,9 @@ class Unmask:
     """Integrates a `DiscreteProcess` with MDLM's reverse step from t to s < t.
 
     Each masked position is revealed with probability
-    (alpha(s) - alpha(t)) / (1 - alpha(t)), taking a token drawn from the
-    model's categorical. The rest stay masked.
+    (alpha(s) - alpha(t)) / (1 - alpha(t)), and a revealed position takes a
+    token drawn from the model's categorical distribution. The rest stay
+    masked. Stepping any other kind of process raises `ValueError`.
     """
 
     def init(self, x, times, process, *, key) -> tuple:
@@ -259,7 +275,10 @@ class Unmask:
 @presets("mdlm")
 @dataclass(frozen=True)
 class MDLM:
-    """Builds the process of Sahoo et al. 2024, on the log-linear schedule."""
+    """Builds MDLM's masked diffusion process on the log-linear schedule.
+
+    MDLM is Sahoo et al. 2024.
+    """
 
     mask_id: int
     eps: float = 1e-3

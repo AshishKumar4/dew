@@ -1,12 +1,13 @@
 """Small runnable examples behind the landing page, using the public API.
 
 python site/snippets/framework.py --section lm --out /tmp/dew-landing
-Every displayed block is between its show/end markers; the surrounding code
-prepares the small synthetic fixtures. --smoke uses an offline tiny checkpoint
-in place of the Hub model and shortens training for CI, not for the recording.
+The page shows the code between each "Begin snippet" and "End snippet" marker.
+The code around the markers builds small synthetic fixtures. For CI, --smoke
+swaps the Hub model for an offline tiny checkpoint and trains for fewer steps;
+the recordings on the page do not use it.
 """
 
-# Command-line examples print results for capture_snippets.py.
+# Each section prints its result for capture_snippets.py.
 
 import argparse
 import itertools
@@ -192,7 +193,7 @@ def pretrained(out, smoke):
                    val=None, records=1, batch=1)
     text = task(prompt, 12, key=0).text
     # Begin snippet: finetune
-    objective = bundle.lm_objective(seq_len=training_tokens.shape[1] - 1, ema_decay=None)
+    objective = LMObjective(bundle, seq_len=training_tokens.shape[1] - 1, ema_decay=None)
     trainer = Trainer(objective, optax.sgd(1e-5), key=jax.random.key(0))
     state = trainer.fit(data, steps=1)
     bundle.save(out / "export", variables=state.variables, max_shard_size="128MB")

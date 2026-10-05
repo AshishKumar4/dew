@@ -1,12 +1,12 @@
-"""Search hyperparameters over the ordinary training path.
+"""Hyperparameter search that trains each trial through the ordinary training path.
 
-`RunConfig.sweep` overrides a config through its own record, hands each trial to
-the recipe's train entry point, and records the score that entry point
-returns. Trials land in a JSON ledger before they are reported, so an
-interrupted sweep resumes at the trial it stopped on instead of retraining
-the finished ones. `random_search` and `grid_search` need nothing beyond
-numpy; `optuna_search` asks Optuna's sampler for the next point and tells it
-the ledger's trials, and needs `dewml[hpo]`.
+`RunConfig.sweep` overrides fields of a config through its record, passes
+each trial to the recipe's train function, and records the score that
+function returns. Each trial is written to a JSON ledger before it is
+reported, so an interrupted sweep resumes at the trial it stopped on and
+does not retrain the finished ones. `random_search` and `grid_search` need
+only numpy. `optuna_search` gives Optuna's sampler the trials in the ledger
+and asks it for the next point; it needs `dewml[hpo]`.
 """
 
 from __future__ import annotations
@@ -25,19 +25,20 @@ if TYPE_CHECKING:
     from dew.config import RunConfig
 
 type Choice = None | bool | int | float | str
-"""One candidate value for a swept field: what JSON and Optuna both hold."""
+"""One candidate value for a swept field, of a type both JSON and Optuna can hold."""
 
 type Space = Mapping[str, Sequence[Choice]]
-"""Dotted paths into a run record, each with the values a trial draws from."""
+"""A mapping from dotted paths in a run record to the values a trial draws from there."""
 
 type Point = dict[str, Choice]
 
 
 class Search(Protocol):
-    """Chooses the next point of a space, given the trials already finished.
+    """Chooses the next point in a space, given the trials already finished.
 
-    `seed` is read by the samplers that draw at random, `random_search` and
-    `optuna_search`; `grid_search` walks the product in order and ignores it.
+    Only the searches that draw at random, `random_search` and
+    `optuna_search`, read `seed`. `grid_search` goes through the product in
+    order and ignores it.
     """
 
     def __call__(self, space: Space, finished: Sequence[TrialFinished], seed: int) -> Point: ...
@@ -63,7 +64,7 @@ def override[C: RunConfig](config: C, point: Point) -> C:
 
 
 def random_search(space: Space, finished: Sequence[TrialFinished], seed: int) -> Point:
-    """Draw one independent value per field, reproducible from the trial's number."""
+    """Draw one value per field independently, reproducibly from `seed` and the trial's number."""
     rng = np.random.default_rng([seed, len(finished)])
     return {path: values[int(rng.integers(len(values)))] for path, values in space.items()}
 
@@ -71,8 +72,9 @@ def random_search(space: Space, finished: Sequence[TrialFinished], seed: int) ->
 def grid_search(space: Space, finished: Sequence[TrialFinished], seed: int) -> Point:
     """Return the next point of the space's cartesian product, in order.
 
-    `seed` is the `Search` protocol's, and this walk draws nothing, so it goes
-    unread here.
+    `seed` is part of the `Search` protocol, and this search draws nothing at
+    random, so it ignores `seed`. Asking for more trials than the grid has
+    points raises `ValueError`.
     """
     points = list(itertools.product(*space.values()))
     if len(finished) >= len(points):
@@ -82,10 +84,11 @@ def grid_search(space: Space, finished: Sequence[TrialFinished], seed: int) -> P
 
 
 def optuna_search(space: Space, finished: Sequence[TrialFinished], seed: int) -> Point:
-    """Ask Optuna's sampler for the next point over the same space.
+    """Ask Optuna's TPE sampler for the next point in the space.
 
-    The study is built from the ledger on every call rather than kept across
-    them, so a resumed sweep asks from the same trials a fresh one would.
+    Each call builds a new study from the finished trials, seeded with
+    `seed`, so a resumed sweep asks from the same trials as a sweep that
+    never stopped.
     """
     import optuna
 

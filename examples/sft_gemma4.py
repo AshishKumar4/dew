@@ -32,7 +32,7 @@ from dew.data import ChatMessages, HFTokenizer, Loading
 from dew.data.chat import Role
 from dew.inference import RunProcessor
 from dew.interop import PretrainedDecoder
-from dew.objectives.lm import LMRunConfig, Perplexity, Samples
+from dew.objectives.lm import LMObjective, LMRunConfig, Perplexity, Samples
 from dew.training import MeshSpec, TrainState, prepare_process
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests/fixtures"
@@ -124,8 +124,8 @@ def main(config: Config) -> Path:
                                     max_seq_len=config.sequence_length + run.sample_tokens)
     words = HFTokenizer(tokenizer)
     # The run decodes through this tokenizer, so its checkpoints record its name.
-    objective = source.lm_objective(
-        config.sequence_length,
+    objective = LMObjective(
+        source, config.sequence_length,
         loss_role=Role.ASSISTANT,
         processor=RunProcessor(words),
         samples=Samples(words.encode("user : hello "), run.sample_tokens,

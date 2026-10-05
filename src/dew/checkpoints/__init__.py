@@ -1,34 +1,34 @@
-"""Save and restore a run's train state and data position through orbax.
+"""Save and restore a run's training state and data position with Orbax.
 
 A checkpoint holds `step`, `variables`, `opt_state`, `ema`, `key` and, when the
 data iterator can report one, `position`. Metrics, the loss scale and epoch
-counters are the loop's business and are rebuilt on resume. A position is
-either global, and readable by any partition of the data, or one share's
-own offset, and readable only by a reader of that share; `dew.position` is
+counters belong to the training loop, which rebuilds them on resume. A position
+is either global, which any partition of the data can read, or one share's own
+offset, which only a reader of that same share can read; `dew.position` marks
 the difference and `read_position` acts on it.
 
-The EMA copy is stored as its difference from the weights: each EMA leaf
-with its weight's floating dtype and shape as the XOR of the two, split
+The EMA copy is stored as its difference from the weights. Each EMA leaf with
+its weight's floating dtype and shape is stored as the XOR of the two, split
 into byte planes (a leading uint8 axis, least significant byte first). An
-average agrees with the weights it follows in its leading bits, and zstd,
-which orbax applies to every array, stores the runs of zeros that leaves
-for little: the EMA of a 176M-parameter DiT at step 1.35M takes 25% fewer
-bytes. The step's custom metadata records which leaves are stored so;
-`restore` and `stored` hand them back as they were trained, bit for bit,
-and a checkpoint that records none reads as it was written.
+average agrees with the weights it follows in its leading bits, and the zstd
+compression Orbax applies to every array stores the resulting runs of zeros
+cheaply: the EMA of a 176M-parameter DiT at step 1.35M takes 25% fewer bytes.
+The step's custom metadata records which leaves are stored this way, so
+`restore` and `stored` return them bit for bit as they were trained, and a
+checkpoint that records none reads as it was written.
 
-Beside the persistent directory a run may keep a local checkpoint on every
-host, written more often, so a preempted pod resumes from its own disks
-instead of from storage. That is orbax's emergency checkpointing
-(orbax.checkpoint.experimental.emergency), whose local checkpoints are built
-here from the same pieces it uses, an `ArrayHandler` with no primary host
-and no replica dedup so every process writes every shard it holds. Its
-manager itself is not used: it takes over the persistent directory with a
-single fixed-shape state item (no metrics, so no best step, and no room for
-the per-process data position), and it restores a local checkpoint only
-where each data-parallel replica is a whole set of hosts, which a mesh whose
-fsdp axis spans hosts is not. The semantics are its: two directories, and
-the newest checkpoint every process can read wins.
+Besides the persistent directory, a run can keep a local checkpoint on every
+host, written more often, so a preempted pod resumes from its own disks rather
+than from remote storage. This is Orbax's emergency checkpointing
+(orbax.checkpoint.experimental.emergency). The local checkpoints are built here
+from the same pieces it uses, an `ArrayHandler` with no primary host and no
+replica dedup, so every process writes every shard it holds. Orbax's manager
+itself is not used, for two reasons: it takes over the persistent directory
+with a single fixed-shape state item (no metrics, so no best step, and no room
+for the per-process data position), and it restores a local checkpoint only
+where each data-parallel replica is a whole set of hosts, which is not true
+when the fsdp axis spans hosts. The semantics match Orbax's: two directories,
+and the newest checkpoint every process can read wins.
 """
 
 from __future__ import annotations
@@ -118,11 +118,10 @@ def is_uri(path: str) -> bool:
 
 
 def location(directory: str) -> epath.Path:
-    """Return where a run's files go: a bucket URI as given, a local path absolute.
+    """Return the directory a run writes to: a bucket URI unchanged, a local path made absolute.
 
     `epath` reads and writes both, but `Path.resolve` turns `gs://bucket/run`
-    into a local `gs:/bucket/run`, so the absolute step is for a path with no
-    scheme.
+    into a local `gs:/bucket/run`, so only a path with no scheme is resolved.
     """
     path = epath.Path(directory)
     return path if is_uri(directory) else path.resolve()
@@ -134,10 +133,11 @@ def _processes(count: int) -> str:
 
 @dataclasses.dataclass(frozen=True)
 class Keep:
-    """Union of latest steps, periodic steps, wall-time-spaced checkpoints and a predicate.
+    """Keeps the union of the latest steps, periodic steps, wall-time-spaced steps and a predicate's steps.
 
-    `interval` keeps checkpoints at least this wall time apart, not all old
-    checkpoints. `where` receives a retained-step record with its metrics.
+    `interval` keeps checkpoints at least this much wall time apart; it does
+    not keep every old checkpoint. `where` receives a retained-step record
+    with its metrics.
     """
     latest: int = 2
     every: int | None = None
@@ -155,7 +155,7 @@ class Keep:
 
 @dataclasses.dataclass(frozen=True)
 class Ranking:
-    """Evaluation's ranking of these weights; storage only retains it."""
+    """How an evaluation ranked these weights; checkpoint storage records it without computing it."""
     metric: str
     value: float
     mode: Literal['min', 'max'] = 'min'
@@ -249,13 +249,13 @@ def gather_positions(saved: bytes, share: DataPartition) -> dict:
     'rows' is a uint8 [process_count, longest] array with one row per
     process, 'lengths' the unpadded length of each, and 'shares' the
     `[index, count]` of the data share each process read. A process reports
-    the position it holds, and orbax writes a host array from process 0
+    the position it holds, and Orbax writes a host array from process 0
     alone, so the rows are gathered onto every process before a save. The
-    rows differ in length, so the lengths ride along.
+    rows differ in length, so their lengths are stored with them.
 
-    One row per process whichever kind the position is: a global one is the
-    same bytes on every process, and gathering it is what lets `read_position`
-    check that they really do agree before another partition reads it.
+    There is one row per process whatever kind the position is. A global
+    position is the same bytes on every process, and gathering it lets
+    `read_position` check that the rows agree before another partition reads it.
     """
     lengths = multihost_utils.process_allgather(np.asarray(len(saved), np.int64))
     row = np.zeros(int(lengths.max()), np.uint8)
@@ -273,12 +273,11 @@ def _row(table: dict, index: int) -> bytes:
 def read_position(table: dict, where: str, share: DataPartition) -> bytes:
     """Read the position the reader of `share` resumes from, out of a saved table.
 
-    A global position is a record count over an order that is the same order
-    at any partition, so every row is every reader's position:
-    `dew.position` is where that promise is written down and `read_position`
-    is where it is taken up. A share's own offset resumes only the readers of
-    that same share, whichever processes they are, and anything else is
-    refused with the shares named.
+    A global position is a record count over an order that is the same at
+    any partition, so every row is a valid position for every reader;
+    `dew.position` declares that property and `read_position` relies on it.
+    A share's own offset resumes only readers of that same share, whichever
+    processes they are, and any other reader is refused with the shares named.
     """
     written = len(table['lengths'])
     # Row order, not set order: bytes hash differently per interpreter, and
@@ -328,8 +327,9 @@ def _written_in_place(tree: Mapping[str, StateLeaf]) -> bool:
 
 
 def placement(tree: Mapping[str, StateLeaf]) -> dict[str, str]:
-    """Return where each array leaf of `tree` sits, by path, as the string of its
-    sharding; a local checkpoint restores onto this placement and no other."""
+    """Return the sharding of each array leaf of `tree` as a string, keyed by path.
+
+    A local checkpoint restores onto this placement and no other."""
     leaves, _ = jax.tree_util.tree_flatten_with_path(tree)
     return {jax.tree_util.keystr(path): str(leaf.sharding)
             for path, leaf in leaves
@@ -607,7 +607,7 @@ class _ProfileSteps(preservation.PreservationPolicy):
 
 
 class Checkpoints:
-    """Holds the checkpoints of one run, in one directory.
+    """Manages the checkpoints of one run in one directory.
 
     Constructing one opens nothing; the orbax managers are created on first
     use. The directory keeps the latest `keep` steps, so a resume has
@@ -615,12 +615,12 @@ class Checkpoints:
     reported. A save without metrics can never become the best step.
 
     `local_directory` names a path on every host's own disk where the run
-    keeps one more checkpoint, the latest, written every `local_every` steps
-    by `fit`; each process writes the shards its devices hold under a
-    directory of its own, so the same path serves a pod and a single host
+    keeps one more checkpoint, the latest, which `fit` writes every
+    `local_every` steps. Each process writes the shards its devices hold under
+    its own subdirectory, so the same path works for a pod and for one host
     running several processes. `latest` is the newest step every process can
     read, local or persistent, and `restore` reads it from wherever it is. A
-    local checkpoint restores onto the placement it was written with, since
+    local checkpoint restores onto the placement it was written with, because
     no process holds another process's shards; the persistent checkpoint
     restores onto any mesh.
     """
@@ -668,7 +668,7 @@ class Checkpoints:
         return tuple(candidates)
 
     def would_keep(self, ranking: Ranking | Sequence[Ranking]) -> bool:
-        """Whether an evaluation would enter any of its trackers' best-K sets."""
+        """Return whether an evaluation would enter the best-K set of any of its trackers."""
         return bool(self._candidates((ranking,) if isinstance(ranking, Ranking) else ranking))
 
     def _cache_step(self, step: int, metadata) -> Kept:
@@ -687,7 +687,7 @@ class Checkpoints:
         return checkpoint
 
     def kept(self) -> list[Kept]:
-        """Committed retained steps, oldest first; immutable metadata is cached."""
+        """Return the committed retained steps, oldest first; their immutable metadata is cached."""
         persistent = self._open()
         active = set(persistent.all_steps())
         for step in set(self._step_cache) - active:
@@ -706,8 +706,9 @@ class Checkpoints:
         return retained
 
     def artifact(self, step: int | str | None = None) -> JSON:
-        """The selected step's inference declaration, or None when its objective
-        declares no inference record."""
+        """Return the selected step's inference declaration.
+
+        It is None when the step's objective declares no inference record."""
         step = self.resolve(step)
         step = self.latest if step is None else step
         if step is None:
@@ -873,9 +874,11 @@ class Checkpoints:
         return str(epath.Path(self.directory) / str(step))
 
     def source(self, step: int) -> str:
-        """Return the directory `restore` reads `step` from: this process's local one
-        when the step is the local one every process holds, else the
-        persistent one."""
+        """Return the directory `restore` reads `step` from.
+
+        That is this process's local directory when the step is the local one
+        every process holds, and the persistent directory otherwise.
+        """
         return self.local_path if step == self._local_latest() else self.directory
 
     def save(
@@ -895,24 +898,24 @@ class Checkpoints:
     ) -> None:
         """Write `state` under `step`, asynchronously.
 
-        Sharded arrays go straight to orbax: gathering them onto the host
-        first would serialise the whole state through one process and undo
-        the point of an async checkpointer. A stream reports its position as
-        JSON bytes, which tensorstore has no dtype for; the raw bytes ride
-        along as uint8 rows instead, one per process beside the data `share`
-        it read, so a global position and a share's offset are stored the
-        same way and told apart on restore. A position without its share is
-        refused, since no reader could be matched to it.
-        A write that fails surfaces from `wait`, which is deliberately
-        unguarded: a checkpoint that did not land is data loss.
+        Sharded arrays go straight to Orbax. Gathering them onto the host
+        first would serialise the whole state through one process and defeat
+        the purpose of an async checkpointer. A stream reports its position as
+        JSON bytes, which tensorstore has no dtype for, so the bytes are stored
+        as uint8 rows, one per process, next to the data `share` that process
+        read. A global position and a share's offset are stored the same way
+        and told apart on restore. A position without its share is refused,
+        since no reader could be matched to it. A failed write surfaces from
+        `wait`, which deliberately does not catch it: a checkpoint that did
+        not land is lost data.
 
         A state with arrays in pinned host memory is written before this
-        returns (`_written_in_place`): the write reads those arrays' own
-        buffers, which the next step donates. Handing orbax a copy instead
-        would keep the next step waiting only for the copy, but hold a
-        second copy of that state in pinned host memory until the write
-        lands: 12 bytes a parameter for fp32 Adam moments and EMA, 84 GB at
-        7B parameters, on hosts that keep the state there for want of room.
+        returns, because the write reads those arrays' own buffers and the
+        next step donates them. Giving Orbax a copy instead would make the
+        next step wait only for the copy, but it would hold a second copy of
+        that state in pinned host memory until the write lands: 12 bytes a
+        parameter for fp32 Adam moments and EMA, 84 GB at 7B parameters, on
+        hosts that keep the state there because device memory is short.
         """
         profiles = None if weights_only else _power_profiles(state.opt_state)
         profile_metadata = None if profiles is None else {
@@ -956,19 +959,20 @@ class Checkpoints:
                 },
             )
         self._pending = (step, scores)
+        # Pinned-host state is written before returning; the docstring says why.
         if _written_in_place(state_tree):
             with region("checkpoint.write_in_place"):
                 persistent.wait_until_finished()
 
     def profile_steps(self) -> list[int]:
-        """The complete checkpoints holding post-hoc EMA snapshots, oldest first."""
+        """Return the complete checkpoints that hold post-hoc EMA snapshots, oldest first."""
         persistent = self._open()
         return sorted(step for step in self._profile_snapshots if step in persistent.all_steps()
                       and epath.Path(self.path(step)).exists()
                       and ocp.utils.is_checkpoint_finalized(self.path(step)))
 
     def profile_metadata(self, step: int) -> tuple[int, tuple[float, ...]]:
-        """The updates and relative standard deviations of a snapshot, without reading its averages."""
+        """Return a snapshot's recorded updates and relative standard deviations, without its averages."""
         self.kept()
         custom = self._custom_cache.get(step) or self._open().metadata(step).custom_metadata or {}
         profiles = custom.get('profiles')
@@ -991,14 +995,14 @@ class Checkpoints:
         return tuple(_averages_of(_power_profiles(restored['opt_state'])))
 
     def posthoc_ema(self, std: float, step: int | None = None) -> Variables:
-        """The post-hoc EMA of relative standard deviation `std` at checkpoint
-        `step` (default: the latest snapshot), as host arrays in the params'
-        structure and dtypes.
+        """Return the post-hoc EMA with relative standard deviation `std` at checkpoint `step`.
 
-        Sums every snapshot up to `step`, of every tracked profile, with the
-        weights `coefficients` solves for, one snapshot read at a time and
-        accumulated in fp32 or wider. The result goes where the run's params
-        go: `merge(variables, {"params": checkpoints.posthoc_ema(...)})`.
+        `step` defaults to the latest snapshot. The result is host arrays in
+        the params' structure and dtypes. It sums every snapshot up to `step`,
+        from every tracked profile, with the weights `coefficients` solves for,
+        reading one snapshot at a time and accumulating in fp32 or wider. Use
+        the result where the run's params go:
+        `merge(variables, {"params": checkpoints.posthoc_ema(...)})`.
         """
         from dew.training.posthoc import coefficients
 
@@ -1044,11 +1048,14 @@ class Checkpoints:
         rung: JSON = None,
         artifact: JSON = None,
     ) -> None:
-        """Write `state` under `step` to this process's local directory,
-        asynchronously, in place of the local step before it, and as `save`
-        does, a state with arrays in pinned host memory before it returns.
-        The placement rides along; a resume onto another one raises before
-        reading shards from directories that do not hold them."""
+        """Write `state` under `step` to this process's local directory, asynchronously.
+
+        The new step replaces the previous local step. As with `save`, a state
+        with arrays in pinned host memory is written before this returns. The
+        placement is saved with the state, so a resume onto a different
+        placement raises before it reads shards from directories that do not
+        hold them.
+        """
         state_tree = self._item(state, saved, share)
         written = placement(state_tree)
         state_tree, deltas = _with_ema_deltas(state_tree)
@@ -1088,9 +1095,12 @@ class Checkpoints:
         return state_tree
 
     def rung(self, step: int) -> JSON:
-        """The fit ladder's rung the state at `step` trained on, as `save`
-        recorded it, from the directory `restore` reads the step from; None
-        for a state saved outside `fit`, which trained on no ladder."""
+        """Return the rung of `fit`'s ladder that the state at `step` trained on.
+
+        The value is what `save` recorded, read from the directory `restore`
+        reads the step from. It is None for a state saved outside `fit`,
+        which trained on no ladder.
+        """
         checkpointer = self._open_local() if step == self._local_latest() else self._open()
         return json_value((checkpointer.metadata(step).custom_metadata or {}).get('rung'), 'rung')
 
@@ -1185,18 +1195,18 @@ class Checkpoints:
         """Restore the state at `step` and the data position of `share`.
 
         `template` is a pytree of `jax.ShapeDtypeStruct` naming the state
-        leaves to restore; a leaf's sharding, when set, is where the array is
-        placed, so a checkpoint written on one mesh restores onto whatever
-        mesh this run is using. `None` restores every leaf as a host array.
-        A template leaf the checkpoint lacks is refused by name, unless the
-        template holds it as a concrete array, which is then restored as it
-        stands.
+        leaves to restore. When a leaf has a sharding, the array is placed
+        there, so a checkpoint written on one mesh restores onto whatever mesh
+        this run uses. `None` restores every leaf as a host array. A template
+        leaf that the checkpoint lacks raises an error naming it, unless the
+        template holds it as a concrete array, which is then kept as it is.
 
         A step that is the local one every process holds is read from the
         local directory, onto the placement it was written with; any other
-        step from the persistent one. The data position comes back as the
-        bytes the reader of `share` resumes from (`read_position`); without a
-        share, as for a caller that reads weights and no data, it is None.
+        step is read from the persistent directory. The data position is
+        returned as the bytes the reader of `share` resumes from (see
+        `read_position`). Without a share, as for a caller that reads weights
+        and no data, it is None.
         """
         step = self.resolve(step)
         local = self._local_latest()

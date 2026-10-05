@@ -30,11 +30,13 @@ def peak_signal_noise_ratio(
     data_range: float,
     per_example: bool = False,
 ) -> jnp.ndarray:
-    """PSNR = 10 log10(data_range^2 / MSE), per frame, as skimage defines it.
+    """Return the PSNR per frame, `10 log10(data_range^2 / MSE)`, as skimage defines it.
 
-    `data_range` is the dynamic range of the signal, 2.0 for [-1, 1] inputs
-    and 255 for uint8. The mean over frames comes back unless `per_example`
-    asks for the (N,) per-frame scores. Identical inputs give +inf.
+    The inputs are (B, H, W, C) images or (B, T, H, W, C) videos, and every
+    video frame is scored on its own. `data_range` is the dynamic range of
+    the signal, 2.0 for [-1, 1] inputs and 255 for uint8. The function
+    returns the mean over frames, or the (N,) per-frame scores when
+    `per_example` is set. Identical inputs give +inf.
     """
     pred, targ = frame_batch(predictions), frame_batch(targets)
     mse = jnp.mean((pred - targ) ** 2, axis=(1, 2, 3))
@@ -44,13 +46,12 @@ def peak_signal_noise_ratio(
 
 @metrics("psnr")
 class PSNR(ImageMetric):
-    """Mean PSNR in dB between the sampled frames and the batch's, higher is
-    better.
+    """Measures the mean PSNR in dB between the sampled frames and the batch's; higher is better.
 
-    The artifact is in [-1, 1] and the batch holds uint8 pixels, which are
-    put on the objective's scale, so both sides span the range that the
-    default data_range of 2.0 describes. `reads` names the artifact type the
-    trainer hands this metric; a video run passes `VideoGrid`.
+    The sampled artifact is in [-1, 1]. The batch's uint8 pixels, read from
+    `field`, are moved to the same scale, so both sides span the range the
+    default `data_range` of 2.0 describes. `reads` names the artifact type
+    the trainer passes this metric; a video run passes `VideoGrid`.
     """
 
     def __init__(self, data_range: float = 2.0, field: str = "image", reads: type = ImageGrid):

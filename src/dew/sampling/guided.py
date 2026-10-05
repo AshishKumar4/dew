@@ -47,12 +47,14 @@ from dew.sampling.decoding import (
 
 @struct.dataclass
 class Grammar:
-    """A token automaton on the device.
+    """A token automaton on the device that keeps sampled text inside a regex or JSON schema.
 
-    `transitions[state, class]` is the state a token of that class leads to,
-    -1 where the token is not allowed; `classes[token]` is the token's
-    class. State 0 is the state before the first draw, so a zeroed carry
-    starts a row.
+    `dew.sampling.guided.regex` and `dew.sampling.guided.json_schema`
+    compile one against a tokenizer's vocabulary, and `Sample(grammar)`
+    applies it. `transitions[state, class]` is the state a token of that
+    class leads to, or -1 where the token is not allowed, and
+    `classes[token]` is the token's class. State 0 is the state before the
+    first draw, so a zeroed carry starts a row.
     """
 
     transitions: jax.Array
@@ -62,21 +64,21 @@ class Grammar:
         return jnp.zeros((rows,), jnp.int32)
 
     def masked(self, state: jax.Array, logits: jax.Array) -> jax.Array:
-        """`logits` `[rows, vocab]` with the tokens each row's state forbids at -inf."""
+        """Return `logits` `[rows, vocab]` with the tokens each row's state forbids set to -inf."""
         allowed = jnp.take(self.transitions[state], self.classes, axis=1) >= 0
         return jnp.where(allowed, logits, FILTER)
 
     def guiding(self, transform: Callable[[StepState, jax.Array], jax.Array],
                 state: jax.Array) -> Callable[[StepState, jax.Array], jax.Array]:
-        """`transform` behind the mask of each row's state."""
+        """Return `transform`, applied after masking the tokens each row's state forbids."""
         return lambda step, logits: transform(step, self.masked(state, logits))
 
     def advanced(self, state: jax.Array, token: jax.Array, drawn: jax.Array) -> jax.Array:
-        """Each row's state after `token`; a row that did not draw keeps its state.
+        """Return each row's state after `token`; a row that did not draw keeps its state.
 
-        A drawn token the state forbids can only come from a transform that
-        forces a token after the mask (`ForcedEOS`, say), and fails the
-        device check rather than leaving the text outside the language.
+        A drawn token that the state forbids can only come from a transform
+        that forces a token after the mask, such as `ForcedEOS`. Such a
+        token fails the device check, so the text never leaves the language.
         """
         following = self.transitions[state, self.classes[token]]
         checkify.check(jnp.all(~drawn | (following >= 0)),

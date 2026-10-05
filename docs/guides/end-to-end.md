@@ -25,11 +25,11 @@ The smoke run writes synthetic captioned records, conditions on the tiny CLIP fi
 
 [`examples/sft_diffusion_gemma.py`](https://github.com/AshishKumar4/dew/blob/main/examples/sft_diffusion_gemma.py) fine-tunes a DiffusionGemma checkpoint on chat data with a low-rank adapter. The script works in these steps:
 
-1. `Pretrained.load` loads the base weights and their layouts.
-2. `LoRA.fresh` adds low-rank factors to the projections that `--modules` names.
-3. `BlockDiffusionObjective` trains the adapted module, with the adapter's own filter as `trainable`.
+1. `PretrainedBlockDecoder.load` loads the base weights and their layouts.
+2. `adapt(LoRA(...), key=0)` adds low-rank factors to the projections that `--modules` names, with every base weight frozen.
+3. `BlockDiffusionObjective` trains the adapted model from the adapted variables, so only the factors change.
 4. `Layout(host=("variables",))` keeps the train state in host memory between steps, so only the factors move to the device. For this the decoder is cloned with `scan_layers=True`: a host layout streams one layer per scan iteration, while a plain Python loop would have all its fetches hoisted onto the device together.
-5. `adapter.save` writes the PEFT adapter directory.
+5. `source.adapter.save` writes the PEFT adapter directory.
 6. The second half of the script loads the base weights again through `dew.pipeline`, reads the adapter onto them with `LoRA.load`, merges the factors into the weights and decodes a canvas.
 
 ```bash
@@ -76,7 +76,15 @@ JAX_PLATFORMS=cpu python examples/train_rlvr.py --smoke --out /tmp/rlvr-smoke
 JAX_PLATFORMS=cpu python examples/train_rlvr.py --smoke --turns 2 --out /tmp/rlvr-smoke-turns
 ```
 
-`--backend native` samples from Dew's own `Server` in the training process and pushes weights to it in place. `--backend vllm` exports the checkpoint, starts a vLLM server on it with `VLLM_SERVER_DEV_MODE=1`, samples from it by token ids, and pushes weights by writing safetensors and asking vLLM to reload them. vLLM can live in its own environment; `--vllm` names its executable. `--vllm-memory` is vLLM's share of the GPU, and `XLA_PYTHON_CLIENT_MEM_FRACTION` should leave it that much; on a 40 GB A100 the run fits at 0.12 for vLLM and 0.82 for JAX. `--backend sglang` does the same with an SGLang server (`sglang serve`), pushing weights through its `/update_weights_from_disk`; `--sglang` names its executable. `--sglang-memory` is SGLang's `--mem-fraction-static`, which SGLang takes as a fraction of the memory free when it starts, after JAX has taken its share; on a 40 GB A100 the run fits at 0.75 for JAX and 0.8 for SGLang. The run prints one line per update and writes `rewards.json` with each update's reward, policy version and lag, and, on vLLM and SGLang, the seconds each weight push took. `--turns N` gives each task up to N attempts through an in-process `EnvironmentSource`: an attempt that fails a test hears how many of the three passed and tries again, and the reward is the last attempt's. The smoke run trains the committed tiny Qwen2 for two updates on the native backend; the second trains on draws submitted one update earlier. Its eight-token budget cuts off every completion, and the example still scores and trains on those (`truncation="score"` on the `RolloutScheduler`), as a single-turn RLVR run should; an agentic run keeps the default `"mask"`. It checks that the pieces connect; learning needs the full run.
+The rollout backend is chosen with `--backend`:
+
+- `native` samples from Dew's own `Server` in the training process and pushes weights to it in place.
+- `vllm` exports the checkpoint, starts a vLLM server on it with `VLLM_SERVER_DEV_MODE=1`, samples from it by token ids, and pushes weights by writing safetensors and asking vLLM to reload them. vLLM can live in its own environment; `--vllm` names its executable. `--vllm-memory` is vLLM's share of the GPU, and `XLA_PYTHON_CLIENT_MEM_FRACTION` should leave it that much. On a 40 GB A100 the run fits at 0.12 for vLLM and 0.82 for JAX.
+- `sglang` does the same with an SGLang server (`sglang serve`) and pushes weights through its `/update_weights_from_disk`; `--sglang` names its executable. `--sglang-memory` is SGLang's `--mem-fraction-static`, which SGLang takes as a fraction of the memory still free when it starts, after JAX has taken its share. On a 40 GB A100 the run fits at 0.75 for JAX and 0.8 for SGLang.
+
+The run prints one line per update and writes `rewards.json` with each update's reward, policy version and lag, plus, on vLLM and SGLang, the seconds each weight push took. `--turns N` gives each task up to N attempts through an in-process `EnvironmentSource`. An attempt that fails a test is told how many of the three passed and tries again, and the reward is the last attempt's.
+
+The smoke run trains the committed tiny Qwen2 for two updates on the native backend, and the second update trains on draws submitted one update earlier. Its eight-token budget cuts off every completion, and the example still scores and trains on those (`truncation="score"` on the `RolloutScheduler`), as a single-turn RLVR run should; an agentic run keeps the default `"mask"`. The smoke run checks that the pieces connect. Learning needs the full run.
 
 ## Scoring and serving a finished run
 
@@ -84,7 +92,7 @@ JAX_PLATFORMS=cpu python examples/train_rlvr.py --smoke --turns 2 --out /tmp/rlv
 
 - perplexity through [`Evaluation.run`](evaluation.md), which is the trainer's validation call without the optimizer or the tracker;
 - an lm-evaluation-harness suite through `dew.eval.harness.DewLM`;
-- FID and CLIPScore of a diffusion run's samples against a directory of reference images;
+- CLIPScore of a diffusion run's samples against their prompts, and FID against a directory of reference images;
 - a greedy continuation.
 
 `--openai-base-url` and `--ollama-host` also send the same prompt to a served model, through the adapters in `dew.inference.clients`. Both SDKs are optional extras. If one is not installed, the report says so and the script carries on.
@@ -102,4 +110,4 @@ python examples/evaluate_and_serve.py --run runs/shakespeare/lm-shakespeare \
 JAX_PLATFORMS=cpu python examples/evaluate_and_serve.py --smoke --out /tmp/eval-smoke
 ```
 
-The smoke run first trains a byte-level model for two steps and then scores it. Given a diffusion run with `--image-run`, the smoke run also scores CLIPScore and FID offline. A smoke run has no held-out set, so the reference images are a second draw from the same run; that checks the metric code, not the model.
+The smoke run first trains a byte-level model for two steps and then scores it. Given a diffusion run with `--image-run`, the smoke run also scores CLIPScore and FID offline. A smoke run has no held-out set, so the reference images are a second draw from the same run. That exercises the metric code but says nothing about the model.

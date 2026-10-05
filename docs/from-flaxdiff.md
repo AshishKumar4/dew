@@ -1,6 +1,6 @@
 # Coming from FlaxDiff
 
-FlaxDiff was an earlier name for Dew, when it was built around diffusion. Dew separates model construction, data loading, objectives and training, so the same trainer also runs language models and representation learning. This page maps FlaxDiff's modules to Dew's and describes the one FlaxDiff checkpoint format Dew loads. Dew's names are not import aliases; code does not migrate by search and replace.
+Dew started as a fork of FlaxDiff, my earlier framework built around diffusion. Dew separates model construction, data loading, objectives and training, so the same trainer also runs language models and representation learning. This page maps FlaxDiff's modules to Dew's and describes the one FlaxDiff checkpoint format Dew loads. Dew's names are not import aliases; code does not migrate by search and replace.
 
 ## Module map
 
@@ -8,8 +8,8 @@ FlaxDiff was an earlier name for Dew, when it was built around diffusion. Dew se
 | --- | --- | --- |
 | `flaxdiff.models` | `dew.nn.backbones` | Build the model from its class with its current fields; old constructor fields need review. |
 | `flaxdiff.schedulers` and `flaxdiff.predictors` | `dew.diffusion.schedules` and `dew.diffusion.transforms` | A diffusion preset composes schedule, target, weighting, and preconditioning choices. A schedule alone does not describe the whole training convention. |
-| The diffusion trainer in `flaxdiff.trainer` | `dew.Trainer` plus `dew.objectives.diffusion.DiffusionObjective` | The objective owns diffusion-specific computation; the trainer owns updates, state placement, logging, and checkpoint orchestration. |
-| `flaxdiff.jepa` | `dew.objectives.jepa` and `dew.nn.backbones.jepa` | Encoder/predictor/target behavior belongs to the objective and its modules. |
+| The diffusion trainer in `flaxdiff.trainer` | `dew.Trainer` plus `dew.objectives.diffusion.DiffusionObjective` | The objective computes the diffusion-specific parts; the trainer runs the updates, places the state, logs and manages checkpoints. |
+| `flaxdiff.jepa` | `dew.objectives.jepa` and `dew.nn.backbones.jepa` | The objective and its modules implement the encoder, the predictor and the target. |
 | `flaxdiff.samplers` and `flaxdiff.inference` | `dew.sampling` | Construct sampling with the model's training process and compatible conditions. |
 | `flaxdiff.metrics` | `dew.eval` | Choose metrics that consume the current objective's evaluation outputs. |
 | `training.py` and `training_jepa.py` | `recipes/diffusion/train.py` and `recipes/jepa/train.py` | Recipes use dataclass configurations and generated CLI flags instead of the old argparse interface. |
@@ -39,7 +39,7 @@ pipe = TextToImage.from_flaxdiff("checkpoints/350000", config, jax_version="0.5.
 images = pipe(["a lighthouse on a rocky coast"], key=0, steps=25, solver=Heun()).host().images
 ```
 
-`images` is a float array in `[-1, 1]`, `[prompts, 256, 256, 3]` for a 256px run. The text tower (CLIP ViT-L/14) and the VAE download from the Hugging Face Hub under the names the config records. By default a call samples the way the older trainer previewed its runs: Euler ancestral over 200 steps of that trainer's own time grid, classifier-free guidance 3. A call naming another `steps` walks the same grid at that count. `tests/test_flaxdiff.py` holds a call against the older package's own preview sampling of the same run, run from its source at the pinned commit. The loader reads the averaged (EMA) weights of the last state; `ema=False` and `best=True` choose the others. It builds the matching Dew architecture with `adaln_silu=False` and `text_pooling="all"`, the two places where the blocks of the `flaxdiff` 0.2 package differ from Dew's defaults, and `tests/test_flaxdiff.py` checks its output against that package's own code.
+`images` is a float array in `[-1, 1]`, `[prompts, 256, 256, 3]` for a 256px run. The text tower (CLIP ViT-L/14) and the VAE download from the Hugging Face Hub under the names the config records. By default a call samples the way the older trainer previewed its runs, with Euler ancestral over 200 steps of that trainer's own time grid and classifier-free guidance 3. Passing another `steps` samples the same grid at that count. `tests/test_flaxdiff.py` compares a call with the older package's own preview sampling of the same run, run from its source at the pinned commit. The loader reads the averaged (EMA) weights of the last state; `ema=False` and `best=True` choose the others. It builds the matching Dew architecture with `adaln_silu=False` and `text_pooling="all"`, the two places where the blocks of the `flaxdiff` 0.2 package differ from Dew's defaults, and `tests/test_flaxdiff.py` checks its output against that package's own code.
 
 Anything else, including the older UNets and the 2024 checkpoints, has no loader. Keep each of those runs together with the source revision, environment, data and encoder files that produced it.
 

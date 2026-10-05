@@ -30,7 +30,7 @@ from reference_error import assert_as_exact_as_the_reference
 
 from dew.config import OptimConfig
 from dew.interop import Pretrained
-from dew.objectives.lm import TEXT_KEY
+from dew.objectives.lm import TEXT_KEY, LMObjective
 from dew.training import MeshSpec, Trainer
 from dew.training.optim import Cosine
 
@@ -56,7 +56,7 @@ def test_lm_fine_tune_steps_are_as_exact_as_torch():
     options = {"lr_peak": 1e-2, "lr_init": 1e-3, "lr_end": 1e-3, "warmup": 2}
     pretrained = Pretrained.load(str(FIXTURES / "hf" / "qwen3-tiny"), dtype="float32",
                                  attention_impl="xla")
-    objective = pretrained.lm_objective(width - 1, ema_decay=None)
+    objective = LMObjective(pretrained, width - 1, ema_decay=None)
     schedule = Cosine(peak=options["lr_peak"], warmup_steps=options["warmup"], end=options["lr_end"],
                       init=options["lr_init"])
     solver = OptimConfig(

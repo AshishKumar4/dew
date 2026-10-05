@@ -1,11 +1,12 @@
-"""DiffusionGemma's shared native encoder/decoder and self-conditioning MLP.
+"""DiffusionGemma's shared encoder and decoder, and its self-conditioning MLP.
 
-The MLP follows Transformers modeling_diffusion_gemma.py:790-823: a scaled
-pre-norm, gated feed-forward, and scale-free post-norm. Previous logits become
+The MLP follows the Transformers implementation: a scaled pre-norm, a gated
+feed-forward and a post-norm without scale. The previous step's logits become
 soft embeddings through an fp32 softmax against the scaled embedding table.
-An explicit self-conditioning mask zeros embeddings for the first inference
-step. The official SFT objective instead supplies zero logits for its dropout
-branch; those are uniform soft embeddings, not a zero signal.
+On the first inference step, an explicit self-conditioning mask zeros those
+embeddings. The official SFT objective supplies zero logits for its dropout
+branch instead, and zero logits give uniform soft embeddings, which are not a
+zero signal.
 """
 
 from __future__ import annotations
@@ -20,17 +21,18 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.interop.weights import ParamTree, translate_parameters
 from dew.nn.attention import RMSNorm
 from dew.nn.backbones.causal_transformer import CausalTransformer, DecoderBank
 from dew.nn.moe import gated_product
 from dew.nn.multimodal import VisionConditioner
 from dew.nn.precision import at_least_fp32
-from dew.nn.text_encoders import checkpoint_array
 from dew.registry import models
 
 
+# The layers follow Transformers' modeling_diffusion_gemma.py:790-823.
 class SelfConditioning(nn.Module):
-    """The previous step's soft embeddings folded into the canvas embeddings."""
+    """Folds the previous step's soft embeddings into the canvas embeddings."""
 
     hidden_size: int
     intermediate_size: int
@@ -74,12 +76,13 @@ def soft_embeddings(logits: jax.typing.ArrayLike, embed_weight: jax.typing.Array
 
 @models("diffusion_gemma")
 class DiffusionGemma(nn.Module):
-    """One text parameter tree, read causally for context and bidirectionally for canvases.
+    """Reads one text parameter tree causally for the context and bidirectionally for canvases.
 
     ``encode`` appends clean tokens to the cache. ``__call__`` refines a canvas
-    against that frozen cache and feeds previous logits through self-conditioning.
-    Each method is a separate apply: sharing scopes keeps the encoder and decoder
-    parameters identical without storing a second tree.
+    against that frozen cache and feeds the previous logits through
+    self-conditioning. Each method is a separate apply. The encoder and the
+    decoder share one scope, so their parameters are identical and no second
+    tree is stored.
     """
 
     text: CausalTransformer
@@ -120,11 +123,12 @@ class DiffusionGemma(nn.Module):
                attention_pairwise_mask=None, attention_key_positions=None,
                conditioning: Mapping[str, jax.Array] | None = None, train: bool = False,
                states: bool = False):
-        """Append a clean prompt or committed canvas, evaluating media only when supplied.
+        """Append a clean prompt or committed canvas to the cache, evaluating media only when given.
 
-        The logits, or with `states` the final normalized states before the
-        head: what a loss that scores the vocabulary a tile at a time reads,
-        so the vocabulary-sized logits of a whole row never exist at once.
+        It returns the logits, or with `states` the final normalized states
+        before the head. A loss that scores the vocabulary a tile at a time
+        reads the states, so the vocabulary-sized logits of a whole row never
+        exist at once.
         """
         read = self.text.hidden_states if states else self.text
         if not conditioning:
@@ -150,21 +154,26 @@ class DiffusionGemma(nn.Module):
                     attention_key_positions=attention_key_positions)
 
     def head_weight(self, params):
-        """The `[D, vocab]` head the encoder and the decoder score with, from
-        the text tree of `params`, in its stored dtype (`CausalTransformer.head_weight`)."""
+        """Return the `[D, vocab]` head the encoder and the decoder score with, in its stored dtype.
+
+        It is read from the text tree of `params` by `CausalTransformer.head_weight`."""
         return self.text.head_weight(params["text"])
 
     def head_table(self, params):
-        """The head as the text tree stores it and whether its rows are the
-        vocabulary (`CausalTransformer.head_table`)."""
+        """Return the head as the text tree stores it, and whether its rows are the vocabulary.
+
+        It is read from the text tree of `params` by `CausalTransformer.head_table`."""
         return self.text.head_table(params["text"])
 
     def __call__(self, tokens, *, self_conditioning_logits=None,
                  self_conditioning_mask=None, train: bool = False, positions=None,
                  attention_pairwise_mask=None, attention_key_positions=None,
                  states: bool = False):
-        """The canvas logits, or with `states` the final normalized states
-        before the head (`encode` says why)."""
+        """Return the canvas logits, or with `states` the final normalized states before the head.
+
+        `encode` explains why a loss reads the states. Self-conditioning reads
+        `self_conditioning_logits`, and rows where `self_conditioning_mask` is
+        false get a zero signal, as they do when no logits are given."""
         tokens = jnp.asarray(tokens, jnp.int32)
         if self.is_initializing() and self.conditioner is not None:
             self.conditioner.initialize_parameters()
@@ -192,7 +201,7 @@ class DiffusionGemma(nn.Module):
 
 def translate_weights(
     hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
-) -> dict[str, dict[str, np.ndarray]]:
+) -> ParamTree:
     """Self-conditioning parameters, cast per weight before the layout copy."""
     paths = {
         "pre_norm.weight": ("pre_norm", "scale"),
@@ -200,17 +209,20 @@ def translate_weights(
         "up_proj.weight": ("up_proj", "kernel"),
         "down_proj.weight": ("down_proj", "kernel"),
     }
-    params: dict[str, dict[str, np.ndarray]] = {}
-    for name, tensor in hf_tensors.items():
+    seen = set()
+
+    def path_of(name: str) -> tuple[str, ...]:
         bare = name.removeprefix("self_conditioning.")
         if bare not in paths:
             raise ValueError(f"unknown tensor name {name!r}")
-        module, key = paths[bare]
-        if module in params:
+        path = paths[bare]
+        if path[0] in seen:
             raise ValueError(f"duplicate self-conditioning tensor {name!r}")
-        leaf = checkpoint_array(tensor, param_dtype)
-        params[module] = {key: np.ascontiguousarray(leaf.T) if key == "kernel" else leaf}
-    missing = {path[0] for path in paths.values()} - set(params)
+        seen.add(path[0])
+        return path
+
+    params = translate_parameters(hf_tensors, path_of, param_dtype)
+    missing = {path[0] for path in paths.values()} - seen
     if missing:
         raise ValueError(f"missing self-conditioning tensors for {sorted(missing)}")
     return params

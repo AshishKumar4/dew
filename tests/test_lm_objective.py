@@ -309,7 +309,7 @@ def test_pretrained_weights_are_what_init_returns():
     trained = objective.init(jax.random.key(0))
     loaded = jax.tree.map(lambda leaf: leaf + 1.0, trained)
 
-    resumed = make_objective(pretrained=loaded).init(jax.random.key(1))
+    resumed = make_objective(variables=loaded).init(jax.random.key(1))
 
     for restored, expected in zip(jax.tree.leaves(resumed), jax.tree.leaves(loaded), strict=True):
         assert jnp.array_equal(restored, expected)
@@ -318,7 +318,7 @@ def test_pretrained_weights_are_what_init_returns():
 def test_pretrained_params_without_the_variables_dict_are_refused():
     params = make_objective().init(jax.random.key(0))["params"]
     with pytest.raises(ValueError, match="variables dict"):
-        make_objective(pretrained=params).init(jax.random.key(0))
+        make_objective(variables=params).init(jax.random.key(0))
 
 
 def make_trainer(tmp_path=None, fsdp=1, learning_rate=3e-3, tracker=None, **objective_kwargs):

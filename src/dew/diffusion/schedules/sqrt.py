@@ -6,20 +6,21 @@ from .continuous import ContinuousNoiseScheduler
 
 
 class SqrtContinuousNoiseScheduler(ContinuousNoiseScheduler):
-    """Square-root schedule from Diffusion-LM (Li et al. 2022).
+    """Square-root schedule from Diffusion-LM.
 
-    The cumulative alpha is 1 - sqrt(t + s), s = 1e-4, normalized to one at
-    t = 0 the way Diffusion-LM's `betas_for_alpha_bar` normalizes it:
+    Diffusion-LM is Li et al. 2022. The cumulative alpha is 1 - sqrt(t + s),
+    s = 1e-4, normalized to one at t = 0 the way Diffusion-LM's
+    `betas_for_alpha_bar` normalizes it:
 
         alpha^2(t) = (1 - sqrt(t + s)) / (1 - sqrt(s)),   sigma^2 = 1 - alpha^2,
 
     so at Diffusion-LM's step k of T the rates are its table's at
     t = (k + 1) / T. Noise rises like t^(1/4) from t = 0, much faster than
-    the cosine schedule, which spends fewer steps where an embedding carries
-    little noise. The cumulative alpha reaches zero just before t = 1, and the
-    rates stop there at (0, 1); Diffusion-LM's last step clips its beta at
-    0.999 instead. There, at t >= 1 - s, alpha's derivative in t is
-    infinite, so an objective that differentiates the rates in time
+    in the cosine schedule, so fewer steps are spent where an embedding
+    carries little noise. The cumulative alpha reaches zero just before
+    t = 1, and the rates stay at (0, 1) from there; Diffusion-LM's last step
+    instead clips its beta at 0.999. At t >= 1 - s, alpha's derivative in t
+    is infinite, so an objective that differentiates the rates in time
     (MeanFlow, consistency training) must not draw t from the last 1e-4.
     The paper trains the plain x_0 loss, so the weight is one.
     """

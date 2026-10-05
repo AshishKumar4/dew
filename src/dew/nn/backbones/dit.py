@@ -3,21 +3,10 @@ from typing import Literal
 
 import jax
 import jax.numpy as jnp
-from flax import linen as nn
-from flax.typing import Dtype, PrecisionLike
 
 from dew.registry import models
 
-from ..dit import (
-    ROPE_THETA,
-    ConditioningEmbed,
-    ModulatedBlock,
-    PatchSequenceEmbed,
-    PatchSequenceOutput,
-    RematChoice,
-    remat_block,
-    rope_for_scan,
-)
+from ..dit import ROPE_THETA, ModulatedBlock, _DiTStackOptions, remat_block, rope_for_scan
 from ..precision import at_least_fp32
 from ..rope import rotary_freqs
 
@@ -35,36 +24,24 @@ def scatter_tokens(held: jax.Array, kept: jax.Array, tokens: jax.Array) -> jax.A
 
 
 @models("simple_dit")
-class SimpleDiT(nn.Module):
-    """Standard DiT: a plain stack of adaLN-Zero attention blocks.
+class SimpleDiT(_DiTStackOptions):
+    """The standard DiT: a plain stack of adaLN-Zero attention blocks.
 
-    `adaln_silu=False` and `text_pooling="all"` are FlaxDiff 0.2's conditioning,
-    as in `SimpleUDiT`. `routes` is TREAD's token routing (Krause et al. 2025)
-    in training: each `(ratio, start, end)` draws `int(tokens * ratio)` tokens
-    per example, from the `dropout` stream, that skip blocks `start` to `end`
-    and rejoin after `end` with the values they entered with, as CompVis/tread's
-    `Router` does; kept tokens stay in order at their own positions. Sampling
-    runs every token through every block. `patch_bottleneck` is JiT's bottleneck
-    patch embedding (Li & He 2025), 128 in its models. `interval` reads the
-    `duration` of the predicted interval beside the time (MeanFlow, shortcut
-    models; `Process.interval`), and `time_scale` scales the Fourier
-    frequencies, small for a model trained through a JVP in time.
+    - `adaln_silu=False` and `text_pooling="all"` give FlaxDiff 0.2's
+      conditioning, as in `SimpleUDiT`.
+    - `routes` is TREAD's token routing (Krause et al. 2025) during training.
+      Each `(ratio, start, end)` draws `int(tokens * ratio)` tokens per
+      example, from the `dropout` stream, that skip blocks `start` to `end`
+      and rejoin after `end` with the values they had on entry, as
+      CompVis/tread's `Router` does; the kept tokens stay in order at their
+      own positions. Sampling runs every token through every block.
+    - `patch_bottleneck` is JiT's bottleneck patch embedding (Li and He 2025),
+      128 in its models.
+    - `interval` adds the `duration` of the predicted interval next to the
+      time, for MeanFlow and shortcut models (`Process.interval`).
+    - `time_scale` scales the Fourier frequencies; keep it small for a model
+      trained through a JVP in time.
     """
-    output_channels: int = 3
-    patch_size: int = 16
-    emb_features: int = 768
-    num_layers: int = 12
-    num_heads: int = 12
-    mlp_ratio: int = 4
-    dropout_rate: float = 0.0  # Typically 0 for diffusion
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-    force_fp32_for_softmax: bool = True
-    norm_epsilon: float = 1e-5
-    qk_norm: bool = False
-    attention_impl: str = "auto"  # an AttentionImpl
-    remat: RematChoice = False
-    scan_order: Literal["raster", "hilbert", "zigzag"] = "raster"
     adaln_silu: bool = True
     text_pooling: Literal["real", "all"] = "real"
     routes: Sequence[Sequence[float]] = ()
@@ -74,31 +51,12 @@ class SimpleDiT(nn.Module):
 
 
     def setup(self):
-        self.embed = PatchSequenceEmbed(
-            patch_size=self.patch_size,
-            emb_features=self.emb_features,
-            scan_order=self.scan_order,
-            dtype=self.dtype,
-            precision=self.precision,
-            bottleneck=self.patch_bottleneck,
-        )
-        self.conditioning = ConditioningEmbed(
-            emb_features=self.emb_features,
-            mlp_ratio=self.mlp_ratio,
-            dtype=self.dtype,
-            precision=self.precision,
-            text_pooling=self.text_pooling,
-            interval=self.interval,
-            time_scale=self.time_scale,
-        )
+        self.embed = self._embedding(self.patch_size, self.emb_features, self.scan_order,
+                                     bottleneck=self.patch_bottleneck)
+        self.conditioning = self._conditioning(self.emb_features, text_pooling=self.text_pooling,
+                                              interval=self.interval, time_scale=self.time_scale)
         self.blocks = self.stack()
-        self.output = PatchSequenceOutput(
-            patch_size=self.patch_size,
-            output_channels=self.output_channels,
-            norm_epsilon=self.norm_epsilon,
-            dtype=self.dtype,
-            precision=self.precision,
-        )
+        self.output = self._output(self.patch_size, self.output_channels)
 
     def stack(self) -> list[ModulatedBlock]:
         """The layers between the patch embedding and the output, all attention."""
@@ -107,15 +65,8 @@ class SimpleDiT(nn.Module):
                 features=self.emb_features,
                 num_heads=self.num_heads,
                 mixer='attention',
-                mlp_ratio=self.mlp_ratio,
-                dropout_rate=self.dropout_rate,
-                dtype=self.dtype,
-                precision=self.precision,
-                force_fp32_for_softmax=self.force_fp32_for_softmax,
-                norm_epsilon=self.norm_epsilon,
                 adaln_silu=self.adaln_silu,
-                qk_norm=self.qk_norm,
-                attention_impl=self.attention_impl,
+                **self._block_options(),
                 name=f"dit_block_{i}"
             ) for i in range(self.num_layers)
         ]
@@ -146,8 +97,10 @@ class SimpleDiT(nn.Module):
         return self.output(x_seq, inv_idx, H, W)
 
     def checked_routes(self) -> list[tuple[float, int, int]]:
-        """`routes` as `(ratio, start, end)`, refused unless each ratio is in
-        (0, 1) and the spans are ordered, disjoint and inside the stack."""
+        """Return `routes` as `(ratio, start, end)` tuples, after checking them.
+
+        Each ratio must be in (0, 1), and the spans must be ordered, disjoint
+        and inside the stack."""
         routes = [(float(ratio), int(start), int(end)) for ratio, start, end in self.routes]
         following = 0
         for ratio, start, end in routes:
@@ -158,8 +111,10 @@ class SimpleDiT(nn.Module):
         return routes
 
     def kept_tokens(self, tokens: jax.Array, ratio: float, start: int) -> jax.Array:
-        """The `[B, keep]` indices of the tokens a route at `start` computes on:
-        the reference's first `keep` of a uniform shuffle, in sequence order."""
+        """Return the `[B, keep]` indices of the tokens a route at `start` computes on.
+
+        As in the reference, these are the first `keep` of a uniform shuffle,
+        in sequence order."""
         batch, count, _ = tokens.shape
         noise = jax.random.uniform(self.make_rng("dropout"), (batch, count))
         kept = jnp.sort(jnp.argsort(noise, axis=1)[:, :count - int(count * ratio)], axis=1)

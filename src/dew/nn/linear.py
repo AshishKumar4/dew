@@ -25,13 +25,13 @@ value head.
 """
 
 import functools
-import math
 
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.nn.kernels import delta_rule
 from dew.nn.scatter import DROPPED
 
 from .attention import unweighted_rmsnorm
@@ -193,23 +193,49 @@ def chunk_decay(g):
 
 
 def strictly_lower_inverse(a):
-    """Return (I - A)^-1 = I + A + A^2 + ... for strictly lower triangular `a` `[..., C, C]`.
+    """Return (I - A)^-1 for strictly lower triangular `a` `[..., C, C]`, the
+    chunked delta rules' `attn[i, :i] += sum_k attn[i, k] attn[k, :i]` loop.
 
-    The chunked delta rules' loop `attn[i, :i] += sum_k attn[i, k] attn[k, :i]`
-    computes exactly this for the nilpotent A (agreeing to 4e-15 at C=4 and 64).
-    Doubling, S <- S + A^(2^k) S and A <- A^2, takes log2(C) matmuls. The first
-    step is written S = I + A rather than `A @ I`: XLA TPU rewrites a matmul by
-    the broadcast identity into a dilated convolution whose fusion with the add
-    fails register allocation on a v6e (`live_range_finder.cc:57 RET_CHECK`,
-    jax 0.11.2).
+    Built from its diagonal blocks, doubling their size: with X1 and X2 the
+    inverses of two neighbouring blocks, their union's is X1 and X2 on the
+    diagonal and X2 A21 X1 below. Each block is a diagonal block of the
+    whole inverse, so every product stays the size of its entries. The
+    series I + A + A^2 + ..., summed by doubling powers of A, did not: on
+    Qwen3.5-0.8B's aligned keys the powers grew as binomials (1.8e17 at C=64)
+    and cancelled to an inverse whose entries are at most 1, 1e24 off in
+    fp32. The first level is written out rather than as products with
+    one-wide identity blocks: XLA TPU rewrites a matmul by a broadcast
+    identity into a dilated convolution whose fusion fails register
+    allocation on a v6e (`live_range_finder.cc:57 RET_CHECK`, jax 0.11.2).
     """
     chunk_size = a.shape[-1]
-    inv = a + jnp.eye(chunk_size, dtype=a.dtype)
-    power = a @ a
-    for _ in range(max(1, math.ceil(math.log2(chunk_size))) - 1):
-        inv = inv + power @ inv
-        power = power @ power
-    return inv
+    if chunk_size == 1:
+        return jnp.ones_like(a)
+    width = 1 << (chunk_size - 1).bit_length()
+    if width != chunk_size:  # zero rows and columns extend it by the identity
+        pad = [(0, 0)] * (a.ndim - 2) + [(0, width - chunk_size)] * 2
+        return strictly_lower_inverse(jnp.pad(a, pad))[..., :chunk_size, :chunk_size]
+    lead = a.shape[:-2]
+
+    def diagonal_blocks(size):
+        """`a`'s `[..., width // size, size, size]` blocks on the diagonal."""
+        count = width // size
+        blocked = a.reshape(*lead, count, size, count, size)
+        return jnp.moveaxis(jnp.diagonal(blocked, axis1=-4, axis2=-2), -1, -3)
+
+    # Two-wide blocks: [[1, 0], [a, 1]].
+    below = diagonal_blocks(2)[..., 1, 0]
+    one, zero = jnp.ones_like(below), jnp.zeros_like(below)
+    inverse = jnp.stack([jnp.stack([one, zero], -1), jnp.stack([below, one], -1)], -2)
+    size = 2
+    while size < width:
+        pairs = inverse.reshape(*lead, width // (2 * size), 2, size, size)
+        first, second = pairs[..., 0, :, :], pairs[..., 1, :, :]
+        joined = second @ diagonal_blocks(2 * size)[..., size:, :size] @ first
+        top = jnp.concatenate([first, jnp.zeros_like(first)], -1)
+        inverse = jnp.concatenate([top, jnp.concatenate([joined, second], -1)], -2)
+        size *= 2
+    return inverse.reshape(*lead, width, width)
 
 
 def chunk_gated_delta_rule(query, key, value, g, beta, state=None,
@@ -217,8 +243,8 @@ def chunk_gated_delta_rule(query, key, value, g, beta, state=None,
     """The chunked form of the gated delta rule, `torch_chunk_gated_delta_rule`
     (modeling_qwen3_next.py:374-453) line for line in fp32, over [B, S, H, D]
     operands; returns `(output [B, S, H, Dv], final_state [B, H, Dk, Dv])` in
-    the input dtype. The reference's sequential correction is the forward
-    substitution `strictly_lower_inverse` sums as a series.
+    the input dtype. The reference's sequential correction is the inverse
+    `strictly_lower_inverse` builds from its diagonal blocks.
     """
     dtype, work = query.dtype, at_least_fp32(query.dtype)
     query, key, value, g, beta = (
@@ -318,6 +344,18 @@ def recurrent_delta_rule(query, key, value, g, beta, state=None):
         {name: jnp.moveaxis(x, 1, 0) for name, x in
          (('q', query), ('k', key), ('v', value), ('g', g), ('beta', beta))})
     return jnp.moveaxis(out, 0, 1).astype(dtype), state.astype(dtype)
+
+
+def decode_gated_delta_rule(query, key, value, g, beta, state):
+    """`recurrent_gated_delta_rule` for one decode token `[B, 1, H, D]`
+    through `dew.nn.kernels.delta_rule.step`, which reads and writes the
+    state once (CUDA, where `delta_rule.fits` the state)."""
+    work = state.dtype
+    query, key, value = (x[:, 0].astype(work) for x in (query, key, value))
+    decay = jnp.broadcast_to(jnp.exp(g[:, 0].astype(work))[..., None], key.shape)
+    final, out = delta_rule.step(state, query * key.shape[-1] ** -0.5, key, value, decay,
+                                 beta[:, 0].astype(work))
+    return out[:, None], final
 
 
 def recurrent_gated_delta_rule(query, key, value, g, beta, state=None):
@@ -516,14 +554,13 @@ class GatedDeltaNet(nn.Module):
             beta = jnp.where(valid[:, :, None], beta, 0.0)
             g = jnp.where(valid[:, :, None], g, 0.0)
 
-        out, final = (recurrent_gated_delta_rule(
-                          query, key, value, g, beta,
-                          None if recurrent is None else recurrent.value)
-                      if S == 1 else
-                      chunk_gated_delta_rule(
-                          query, key, value, g, beta,
-                          None if recurrent is None else recurrent.value,
-                          self.chunk_size))
+        state = None if recurrent is None else recurrent.value
+        if S == 1 and state is not None and delta_rule.fits(state):
+            out, final = decode_gated_delta_rule(query, key, value, g, beta, state)
+        elif S == 1:
+            out, final = recurrent_gated_delta_rule(query, key, value, g, beta, state)
+        else:
+            out, final = chunk_gated_delta_rule(query, key, value, g, beta, state, self.chunk_size)
         if recurrent is not None:
             recurrent.value = final
 

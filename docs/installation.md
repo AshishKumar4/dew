@@ -45,7 +45,7 @@ The [JAX installation guide](https://docs.jax.dev/en/latest/installation.html) l
 
 ### Process pools across GPUs
 
-JAX 0.11.2 keys a compiled step by the topology of the process that compiled it, which on a GPU includes its NVLink links. In a process pool across GPUs that are linked differently, the processes would key the same step apart: on the next run some would load it from the persistent compilation cache while the others compiled it, and that compile waits for every process for ever. The fix ([jax-ml/jax#40940](https://github.com/jax-ml/jax/issues/40940)) is in no JAX release yet. With the 0.11.2 release, Dew compiles a GPU pool without the persistent cache and prints on every process that it does; the pool trains correctly, but compiles its steps again on every run. To keep the cache, install the patched build of 0.11.2 that `constraints.txt` names:
+JAX 0.11.2 keys a compiled step by the topology of the process that compiled it, which on a GPU includes its NVLink links. In a process pool across GPUs that are linked differently, the processes key the same step differently. On the next run some load it from the persistent compilation cache while the others compile it, and that compile then waits forever for every process to join. The fix ([jax-ml/jax#40940](https://github.com/jax-ml/jax/issues/40940)) is in no JAX release yet. With the 0.11.2 release, Dew compiles a GPU pool without the persistent cache and prints on every process that it does; the pool trains correctly, but compiles its steps again on every run. To keep the cache, install the patched build of 0.11.2 that `constraints.txt` names:
 
 ```bash
 uv pip install "dewml[cuda13] @ git+https://github.com/AshishKumar4/dew" \
@@ -94,7 +94,7 @@ uv pip install 'dewml[interop,vision] @ git+https://github.com/AshishKumar4/dew'
 
 The `profile` extra installs XProf 2.23.1 or a later release, never 2.23.2. XProf 2.23.2 declares `setuptools<70`, and PyTorch 2.13 and later declare `setuptools>=77.0.3`, so 2.23.2 can't be installed beside the `torch`, `vision`, `diffusers`, `torchax` or `test` extras. Don't upgrade XProf to 2.23.2 by hand in such an environment.
 
-tokamax is not a dependency. With it installed, 'auto' runs its Pallas-Triton attention on sm80 and later for heads up to 64 wide (`dew.nn.attention.triton_runs`). Install it as `uv pip install tokamax -c https://raw.githubusercontent.com/AshishKumar4/dew/main/constraints.txt`: tokamax 0.0.14, its latest release, pins `typeguard==2.13.3`, which tyro excludes, and the constraints name the tokamax commit that dropped it.
+tokamax is not a dependency. With it installed, `"auto"` runs its Pallas-Triton attention on sm80 and later for heads up to 64 wide (`dew.nn.attention.triton_runs`). Install it with `uv pip install tokamax -c https://raw.githubusercontent.com/AshishKumar4/dew/main/constraints.txt`. The constraints file matters because tokamax 0.0.14, its latest release, pins `typeguard==2.13.3`, which tyro excludes; the constraints name the tokamax commit that dropped that pin.
 
 ## Development install
 
@@ -107,7 +107,7 @@ uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cp
 uv pip install -e '.[test,av,tfds,metrics,plots,inference-clients,vision,quantization,profile]' -c constraints.txt
 ```
 
-These are the extras CI installs, on the JAX CI runs on: `constraints.txt` names the patched build of 0.11.2, which the multi-process cache tests need. PyTorch is used only by the reference tests and the image processors; Dew's model computation runs in JAX.
+These are the extras CI installs, with the same JAX build CI uses: `constraints.txt` names the patched build of 0.11.2, which the multi-process cache tests need. PyTorch is used only by the reference tests and the image processors; Dew's model computation runs in JAX.
 
 ## Compilation cache
 
@@ -115,12 +115,12 @@ Dew stores compiled executables in `~/.cache/dew/xla/python3.X`, or `$XDG_CACHE_
 
 ## Preparing TFDS data
 
-Training reads prepared TFDS ArrayRecords and does not import TensorFlow. Preparing a dataset does need TensorFlow and sometimes dataset-specific packages (Oxford Flowers reads its label files with SciPy). TensorFlow 2.21.0 has no Python 3.14 wheels, so prepare in a separate Python 3.13 environment:
+Training reads prepared TFDS ArrayRecords and does not import TensorFlow. Preparing a dataset does need TensorFlow and sometimes dataset-specific packages (Oxford Flowers reads its label files with SciPy). TFDS 4.9.10 also imports `importlib_resources` while it prepares a dataset but only declares it for Python before 3.9, so the command installs it too. TensorFlow 2.21.0 has no Python 3.14 wheels, so prepare in a separate Python 3.13 environment:
 
 ```bash
 uv venv --python 3.13 .venv-tfds-prepare
 uv pip install --python .venv-tfds-prepare/bin/python \
-    tensorflow-datasets==4.9.10 tensorflow==2.21.0 scipy
+    tensorflow-datasets==4.9.10 tensorflow==2.21.0 scipy importlib_resources
 export TFDS_DATA_DIR="$HOME/tensorflow_datasets"
 .venv-tfds-prepare/bin/python - <<'PY'
 import shlex

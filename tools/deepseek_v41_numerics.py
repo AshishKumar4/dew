@@ -79,7 +79,7 @@ def forward(model, variables, ids):
 
 def loss_and_gradient(model, variables, ids):
     """The next-token loss LMObjective reports and its gradient in the parameters."""
-    objective = LMObjective(model, ids.shape[1] - 1, pretrained=variables, ema_decay=None)
+    objective = LMObjective(model, ids.shape[1] - 1, variables=variables, ema_decay=None)
     step = Step(step=jnp.int32(0), key=jax.random.key(0), ema=None)
 
     def loss(params):

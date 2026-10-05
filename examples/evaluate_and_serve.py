@@ -1,8 +1,8 @@
 """Score a finished run four ways, then compare it against a served model.
 
 Perplexity over held-out tokens, an lm-evaluation-harness suite, greedy
-continuations, and, for a diffusion run, FID and CLIPScore of a sampled
-grid against a reference set. Everything is read through `dew.pipeline`, so
+continuations, and, for a diffusion run, CLIPScore of a sampled grid against
+its prompts and FID against a reference set. Everything is read through `dew.pipeline`, so
 a run directory, a published checkpoint and a Hub repository all work.
 
     python examples/evaluate_and_serve.py --run runs/shakespeare/lm-shakespeare \\
@@ -18,7 +18,7 @@ point with Dew's model registered:
         --tasks hellaswag --limit 200
 
 `--openai-base-url` adds a served comparison: the same prompts through the
-OpenAI SDK (a vLLM endpoint speaks it too), or `--ollama-host` through
+OpenAI SDK (vLLM serves the same API), or `--ollama-host` through
 ollama's. Both are optional extras; without them, or with the endpoint
 unreachable, the report says so and the rest of the run is unaffected. The
 OpenAI key is `OPENAI_API_KEY` when set; a vLLM server started without
@@ -51,8 +51,8 @@ from dew.training import Evaluation
 
 GREEDY = Sampling(temperature=0.0)
 FIXTURES = Path(__file__).resolve().parents[1] / "tests/fixtures"
-# An InceptionV3 at a sixteenth of every channel width with drawn
-# parameters: the FID path runs offline on it, and the value is its own.
+# An InceptionV3 with every channel width cut to a sixteenth and randomly
+# drawn parameters. FID runs offline on it; its values mean nothing elsewhere.
 SMOKE_INCEPTION = FIXTURES / "inception/tiny/inception_v3_fid.safetensors"
 
 
@@ -185,9 +185,9 @@ def image_metrics(config: Config) -> dict[str, float]:
         reference = np.stack([np.asarray(Image.open(path).convert("RGB"))
                               for path in sorted(config.reference_images.glob("*.png"))])
     elif config.smoke:
-        # A held-out set is what FID is measured against, and a smoke has
-        # none: a second draw of the same run is a population to measure, so
-        # the metric runs end to end on a number that says nothing.
+        # FID needs a held-out reference set and a smoke run has none, so a
+        # second draw of the same run stands in. The metric runs end to end,
+        # but the number says nothing about the model.
         reference = draw(pipe, config, key=1)
     else:
         return scores

@@ -4,13 +4,13 @@ Three concepts extend decoding. A `LogitsTransform` is a pure callable from
 the step state and `[rows, vocab]` logits to new logits. A `Stopping` is a
 pure callable from the step state and the tokens just drawn to a per-row
 finished flag; criteria combine with OR after every committed token. A
-`Strategy` in `dew.sampling.strategies` owns the device loop.
+`Strategy` in `dew.sampling.strategies` runs the device loop.
 
-Transforms and criteria read `StepState`, which carries the token history and
-nothing about the model: no parameters, no cache. Every built-in here is a
+Transforms and criteria read `StepState`, which holds the token history and
+nothing about the model: no parameters and no cache. Every built-in here is a
 pytree, so a configuration holding arrays crosses `jax.jit` as data instead of
 entering a compilation cache key. A plain function works as well, and
-`jax.tree_util.Partial` carries array configuration for one.
+`jax.tree_util.Partial` can hold array configuration for one.
 
 The numerical reference is Transformers 5.16.1
 `generation/logits_process.py` and `generation/stopping_criteria.py`, with two
@@ -73,11 +73,11 @@ class StepState:
         return self.tokens.shape[0]
 
     def total(self) -> jax.Array:
-        """Real tokens each row holds, prompt and generated together."""
+        """Return the number of real tokens each row holds, prompt and generated together."""
         return jnp.sum(self.valid, axis=-1, dtype=jnp.int32)
 
     def history(self) -> tuple[jax.Array, jax.Array]:
-        """Each row's real tokens left aligned, and how many there are.
+        """Return each row's real tokens left-aligned, and how many there are.
 
         Prompts pad wherever their batch needed it, so a transform that reads
         order (n-grams, biased sequences, stop strings) needs the row's own
@@ -86,12 +86,12 @@ class StepState:
         return _compact(self.tokens, self.valid)
 
     def prompt_history(self) -> tuple[jax.Array, jax.Array]:
-        """The prompt region's real tokens left aligned, and how many."""
+        """Return the prompt region's real tokens left-aligned, and how many there are."""
         width = self.prompt_width
         return _compact(self.tokens[:, :width], self.valid[:, :width])
 
     def commit(self, tokens: jax.Array, drawn: jax.Array) -> StepState:
-        """The state after `drawn` rows appended `tokens` at their next slot."""
+        """Return the state after the `drawn` rows append `tokens` at their next slot."""
         rows = jnp.arange(self.rows)
         slot = self.prompt_width + self.step
         slot = jnp.where(slot < self.tokens.shape[1], slot, DROPPED)
@@ -182,7 +182,7 @@ def _size(name: str, value: int) -> int:
 
 @runtime_checkable
 class LogitsTransform(Protocol):
-    """A pure `[rows, vocab]` score rewrite, applied before the draw."""
+    """A pure rewrite of `[rows, vocab]` scores, applied before the draw."""
 
     def __call__(self, state: StepState, logits: jax.Array, /) -> jax.Array: ...
 
@@ -239,7 +239,7 @@ def _min_p(p: float, state: StepState, logits: jax.Array) -> jax.Array:
 
 @struct.dataclass
 class Temperature:
-    """`logits / value`, as `TemperatureLogitsWarper`."""
+    """Divides the logits by `value`, as `TemperatureLogitsWarper`."""
 
     value: float = struct.field(pytree_node=False, default=1.0)
 
@@ -252,7 +252,7 @@ class Temperature:
 
 @struct.dataclass
 class TopK:
-    """Keep the `k` highest scores, as `TopKLogitsWarper`."""
+    """Keeps the `k` highest scores, as `TopKLogitsWarper`."""
 
     k: int = struct.field(pytree_node=False, default=1)
 
@@ -323,7 +323,7 @@ class Typical:
 
 @struct.dataclass
 class EpsilonCutoff:
-    """Remove tokens below an absolute probability, as `EpsilonLogitsWarper`."""
+    """Removes tokens below an absolute probability, as `EpsilonLogitsWarper`."""
 
     epsilon: float = struct.field(pytree_node=False, default=0.0)
 
@@ -393,7 +393,7 @@ class TopH:
 
 @struct.dataclass
 class Renormalize:
-    """Replace scores by their log softmax, as `LogitNormalization`."""
+    """Replaces scores by their log softmax, as `LogitNormalization`."""
 
     def __call__(self, state: StepState, logits: jax.Array) -> jax.Array:
         return jax.nn.log_softmax(logits)
@@ -401,10 +401,10 @@ class Renormalize:
 
 @struct.dataclass
 class RemoveInvalidValues:
-    """Map NaN to zero and infinities to the float range, as `InfNanRemoveLogitsProcessor`.
+    """Maps NaN to zero and infinities to the float range, as `InfNanRemoveLogitsProcessor`.
 
-    Nothing else in the chain repairs a broken distribution: an undefined draw
-    raises instead. Ask for this transform to sanitize one.
+    Nothing else in the chain repairs a broken distribution; an undefined
+    draw raises instead. Add this transform if you want one sanitized.
     """
 
     def __call__(self, state: StepState, logits: jax.Array) -> jax.Array:
@@ -413,7 +413,7 @@ class RemoveInvalidValues:
 
 @struct.dataclass
 class RepetitionPenalty:
-    """Divide positive scores of seen tokens and multiply negative ones.
+    """Divides the positive scores of seen tokens by the penalty and multiplies negative ones.
 
     The history is the row's valid prompt and drawn tokens, as
     `RepetitionPenaltyLogitsProcessor` reads the whole `input_ids`.
@@ -431,7 +431,7 @@ class RepetitionPenalty:
 
 @struct.dataclass
 class PromptRepetitionPenalty:
-    """Raise the scores of prompt tokens, as `EncoderRepetitionPenaltyLogitsProcessor`.
+    """Raises the scores of prompt tokens, as `EncoderRepetitionPenaltyLogitsProcessor`.
 
     The reference inverts its argument, so a penalty above one rewards
     repeating the prompt. A decoder-only prompt is the encoder input here.
@@ -454,11 +454,11 @@ def _scaled(logits: jax.Array, penalty: float) -> jax.Array:
 
 @struct.dataclass
 class FrequencyPenalty:
-    """Subtract `penalty` times each token's count among the drawn tokens.
+    """Subtracts `penalty` times each token's count among the drawn tokens.
 
-    vLLM's formula, `logits -= frequency_penalties * output_bin_counts`
+    This is vLLM's formula, `logits -= frequency_penalties * output_bin_counts`
     (`model_executor/layers/utils.py`), which is also OpenAI's
-    `frequency_penalty`. It counts generated tokens, not the prompt.
+    `frequency_penalty`. It counts generated tokens only, not the prompt.
     """
 
     penalty: float = struct.field(pytree_node=False, default=0.0)
@@ -471,10 +471,10 @@ class FrequencyPenalty:
 
 @struct.dataclass
 class PresencePenalty:
-    """Subtract `penalty` from every token already drawn.
+    """Subtracts `penalty` from every token already drawn.
 
-    vLLM's `logits -= presence_penalties * output_mask`, which is OpenAI's
-    `presence_penalty`. It reads generated tokens, not the prompt.
+    This is vLLM's `logits -= presence_penalties * output_mask`, which is also
+    OpenAI's `presence_penalty`. It reads generated tokens only, not the prompt.
     """
 
     penalty: float = struct.field(pytree_node=False, default=0.0)
@@ -487,11 +487,11 @@ class PresencePenalty:
 
 @struct.dataclass
 class NoRepeatNGram:
-    """Ban tokens that would repeat an n-gram of the row's own history.
+    """Bans tokens that would repeat an n-gram of the row's own history.
 
-    The tensorised form of `NoRepeatNGramLogitsProcessor`: the current suffix
-    is matched against every window, and a matching window bans the token that
-    followed it. The window starting at the suffix itself needs one token more
+    This is the tensorised form of `NoRepeatNGramLogitsProcessor`: the current
+    suffix is matched against every window, and a matching window bans the
+    token that followed it. The window starting at the suffix itself needs one token more
     than the row has, so a suffix never bans its own successor.
     """
 
@@ -508,7 +508,7 @@ class NoRepeatNGram:
 
 @struct.dataclass
 class PromptNoRepeatNGram:
-    """Ban tokens that would repeat an n-gram of the prompt.
+    """Bans tokens that would repeat an n-gram of the prompt.
 
     `EncoderNoRepeatNGramLogitsProcessor` builds its table from the encoder
     input and matches it against the decoder's suffix. The prompt is the
@@ -543,9 +543,9 @@ def _ngram_ban(logits: jax.Array, table: jax.Array, table_lengths: jax.Array,
 
 @struct.dataclass
 class SequenceBias:
-    """Add a bias to the token that would complete each biased sequence.
+    """Adds a bias to the token that would complete each biased sequence.
 
-    `SequenceBiasLogitsProcessor` as a table: `sequences` is `[count, width]`
+    This is `SequenceBiasLogitsProcessor` as a table: `sequences` is `[count, width]`
     right-aligned token ids, `lengths` their real lengths and `bias` the value
     added to the last id when the row's suffix matches the preceding ones. A
     sequence longer than the row's history is skipped, as the reference skips
@@ -603,7 +603,7 @@ def bad_words(ids: Sequence[Sequence[int]], eos_id: int | Sequence[int] | None =
 
 @struct.dataclass
 class SuppressTokens:
-    """Remove a fixed set of tokens, as `SuppressTokensLogitsProcessor`."""
+    """Removes a fixed set of tokens, as `SuppressTokensLogitsProcessor`."""
 
     tokens: jax.Array
 
@@ -613,7 +613,7 @@ class SuppressTokens:
 
 @struct.dataclass
 class BeginSuppressTokens:
-    """Remove tokens at one generated position, as `SuppressTokensAtBeginLogitsProcessor`.
+    """Removes tokens at one generated position, as `SuppressTokensAtBeginLogitsProcessor`.
 
     The reference suppresses where the sequence still has its prompt width, so
     `offset` is the generated index the suppression applies at, zero for the
@@ -634,7 +634,7 @@ def _membership(tokens: jax.Array, vocab: int) -> jax.Array:
 
 @struct.dataclass
 class ForcedBOS:
-    """Force one token as the first of the whole sequence, as `ForcedBOSTokenLogitsProcessor`."""
+    """Forces one token as the first of the whole sequence, as `ForcedBOSTokenLogitsProcessor`."""
 
     token: int = struct.field(pytree_node=False, default=0)
 
@@ -644,14 +644,14 @@ class ForcedBOS:
 
 @struct.dataclass
 class ForcedEOS:
-    """Force EOS one step before the end, as `ForcedEOSTokenLogitsProcessor`.
+    """Forces EOS one step before the end, as `ForcedEOSTokenLogitsProcessor`.
 
     `eos` may name several ids, all of which the forced step allows, as the
     reference allows every id its tensor holds. `max_length` counts prompt and
-    generated tokens together; left as None the end is the request's own, the
-    prompt width plus the token budget, so a caller that changes the budget
-    per call forces at the new end rather than at a length the task was built
-    with.
+    generated tokens together. Left as None, the end is the request's own
+    (the prompt width plus the token budget), so a caller that changes the
+    budget per call forces EOS at the new end rather than at a length the task
+    was built with.
     """
 
     eos: jax.Array = struct.field(default_factory=lambda: jnp.zeros((0,), jnp.int32))
@@ -672,7 +672,7 @@ def _forced(logits: jax.Array, token: int, rows: jax.Array) -> jax.Array:
 
 @struct.dataclass
 class MinLength:
-    """Suppress EOS until the whole sequence reaches `length`, as `MinLengthLogitsProcessor`."""
+    """Suppresses EOS until the whole sequence reaches `length`, as `MinLengthLogitsProcessor`."""
 
     length: int = struct.field(pytree_node=False, default=0)
     eos: jax.Array = struct.field(default_factory=lambda: jnp.zeros((0,), jnp.int32))
@@ -683,7 +683,7 @@ class MinLength:
 
 @struct.dataclass
 class MinNewTokens:
-    """Suppress EOS until `count` tokens are drawn, as `MinNewTokensLengthLogitsProcessor`."""
+    """Suppresses EOS until `count` tokens are drawn, as `MinNewTokensLengthLogitsProcessor`."""
 
     count: int = struct.field(pytree_node=False, default=0)
     eos: jax.Array = struct.field(default_factory=lambda: jnp.zeros((0,), jnp.int32))
@@ -698,7 +698,7 @@ def _suppress_eos(logits: jax.Array, eos: jax.Array, rows: jax.Array) -> jax.Arr
 
 @struct.dataclass
 class ExponentialDecayLengthPenalty:
-    """Grow the EOS score after `start` drawn tokens, as `ExponentialDecayLengthPenalty`.
+    """Raises the EOS score after `start` drawn tokens, as `ExponentialDecayLengthPenalty`.
 
     The reference measures from `start_index + prompt_width`, which is the
     generated count used here, and adds `|score| * (factor ** index - 1)` so a
@@ -722,7 +722,7 @@ class ExponentialDecayLengthPenalty:
 
 @struct.dataclass
 class EndOfSequence:
-    """Finish a row that drew one of the EOS ids, as `EosTokenCriteria`."""
+    """Finishes a row that drew one of the EOS ids, as `EosTokenCriteria`."""
 
     eos: jax.Array
 
@@ -732,7 +732,7 @@ class EndOfSequence:
 
 @struct.dataclass
 class MaxNewTokens:
-    """Finish a row once it has drawn `count` tokens."""
+    """Finishes a row once it has drawn `count` tokens."""
 
     count: int = struct.field(pytree_node=False, default=0)
 
@@ -746,7 +746,7 @@ class MaxNewTokens:
 
 @struct.dataclass
 class MaxLength:
-    """Finish a row once prompt and generated tokens reach `length`, as `MaxLengthCriteria`."""
+    """Finishes a row once prompt and generated tokens reach `length`, as `MaxLengthCriteria`."""
 
     length: int = struct.field(pytree_node=False, default=0)
 
@@ -760,12 +760,12 @@ class MaxLength:
 
 @struct.dataclass
 class StopStrings:
-    """Finish a row whose text ends with one of the compiled stop strings.
+    """Finishes a row whose text ends with one of the compiled stop strings.
 
     The tables come from `stop_strings`, which reads the tokenizer once. The
-    device check is `StopStringCriteria`'s: walk the row's tokens backwards,
-    require the last token to overlap the end of a stop string, and keep
-    matching earlier tokens against the positions where they can sit. A match
+    device check is `StopStringCriteria`'s: it goes through the row's tokens
+    backwards, requires the last token to overlap the end of a stop string,
+    and keeps matching earlier tokens against the positions they can occupy. A match
     counts only when the string touches the final token, so a string produced
     earlier does not stop the row later.
     """
@@ -819,15 +819,20 @@ def _decoder_has(config: JSON, name: str) -> bool:
 
 
 class PieceDecoder(Protocol):
-    """A `tokenizers` decoder, which pickles as the JSON that configures it;
-    `matching_mode` reads the decoder kinds that JSON names."""
+    """A `tokenizers` decoder, which pickles as the JSON that configures it.
+
+    `matching_mode` reads the decoder kinds that JSON names.
+    """
 
     def __getstate__(self) -> bytes | str | None: ...
 
 
 class Backend(Protocol):
-    """The Rust tokenizer a fast Transformers tokenizer wraps: its decoder
-    says how pieces spell bytes, and is None on a tokenizer without one."""
+    """The Rust tokenizer that a fast Transformers tokenizer wraps.
+
+    Its decoder says how pieces spell bytes, and is None on a tokenizer
+    without one.
+    """
 
     @property
     def decoder(self) -> PieceDecoder | None: ...
@@ -835,8 +840,10 @@ class Backend(Protocol):
 
 @runtime_checkable
 class Fast(Protocol):
-    """A fast Transformers tokenizer, which carries its Rust backend; a slow
-    one has no backend and its pieces are read through their text."""
+    """A fast Transformers tokenizer, which holds its Rust backend.
+
+    A slow tokenizer has no backend, so its pieces are read through their text.
+    """
 
     @property
     def backend_tokenizer(self) -> Backend: ...
@@ -844,8 +851,10 @@ class Fast(Protocol):
 
 @runtime_checkable
 class Referencing(Protocol):
-    """A processor that holds the source's own processor or tokenizer as
-    `reference`, as `dew.interop.pretrained.Processor` does."""
+    """A processor that holds the source's own processor or tokenizer as `reference`.
+
+    `dew.interop.pretrained.Processor` is one.
+    """
 
     @property
     def reference(self) -> Vocabulary | Tokenizing | HostProcessor: ...
@@ -853,8 +862,11 @@ class Referencing(Protocol):
 
 @runtime_checkable
 class Tokenizing(Protocol):
-    """A processor that holds its tokenizer: a Transformers processor, a
-    run's `RunProcessor`, or `dew.data.HFTokenizer` over the hub one."""
+    """A processor that holds its tokenizer.
+
+    Examples are a Transformers processor, a run's `RunProcessor`, and
+    `dew.data.HFTokenizer` over a Hub tokenizer.
+    """
 
     @property
     def tokenizer(self) -> Vocabulary | Tokenizing: ...
@@ -1058,7 +1070,7 @@ def components(values: LogitsTransform | Sequence[LogitsTransform]) -> tuple[Log
 
 @dataclasses.dataclass(frozen=True, eq=False)
 class LogitsChain:
-    """The ordered transforms, retaining a terminal Greedy for the sampler.
+    """The ordered transforms, keeping a terminal Greedy for the sampler.
 
     An arbitrary transform after Greedy may restore a nondegenerate
     distribution, so only the final built-in Greedy proves an argmax draw.

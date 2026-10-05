@@ -1,23 +1,23 @@
-"""Tokenized corpora as one stream of ids, and the two records cut out of it.
+"""Tokenized corpora as one stream of ids, and the two kinds of record read from it.
 
-A corpus is a stream of token ids, whatever holds it: the `.bin` files
-`TokenCorpus.write` (and `dew tokenize`) writes, or ArrayRecord shards of
-token arrays. `TokenSource` is that stream, read by slice, and the two
-readers below are the two stores it can live in. `token_corpus`
-resolves a directory to the train and validation pair a run needs, by what
-the files in it are.
+A corpus is a stream of token ids, stored either as the `.bin` files that
+`TokenCorpus.write` (and `dew tokenize`) writes or as ArrayRecord shards of
+token arrays. `TokenSource` is that stream, read by slice, and `TokenBytes`
+and `TokenRecords` read it from the two stores. `token_corpus` finds the
+train and validation corpora a run needs in a directory, and picks the
+reader from the files it finds there.
 
 `TokenWindowSource` reads a record as a contiguous window of `seq_len + 1`
 ids starting at `i * stride`. The default stride is `seq_len`, so record
 i's last token is record i+1's first and every transition appears once.
-Smaller strides overlap windows. There is no decoding or randomness here;
-the shuffle lives in the sampler.
+Smaller strides overlap windows. Nothing here decodes or draws random
+numbers; the sampler does the shuffling.
 
 `TokenDocumentSource` reads a record as one document: the span from after the
-previous eos id through its own. It exists for the packed pipeline, which
-cares where documents end and lets grain pack several of them into one
-window. Both read through `TokenSource` and nothing else, so the same corpus
-in either store gives the same windows and the same packing plan.
+previous eos id through its own. The packed pipeline uses it, because it
+needs to know where documents end so it can pack several into one window.
+Both read through `TokenSource` and nothing else, so the same corpus in
+either store gives the same windows and the same packing plan.
 """
 
 from __future__ import annotations
@@ -25,6 +25,8 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import tempfile
+import uuid
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
@@ -43,15 +45,17 @@ _DEFAULT_DTYPE = np.dtype("<u2")
 class TokenSource(Protocol):
     """Reads a tokenized corpus as one stream of ids.
 
-    `len` is the tokens it holds and `source[start:stop]` is that span of
-    them. Both record readers below cut their records out of this and nothing
-    else: a fixed window is a strided span, and a document is the span
+    `len(source)` is the number of tokens it holds, and `source[start:stop]`
+    returns that span of them as an array. `TokenWindowSource` and
+    `TokenDocumentSource` read their records through these two operations
+    only. A fixed window is a strided span, and a document is the span
     between two eos ids.
 
-    `eos_id` is the id that closes a document, which only the packed reader
-    needs and a corpus written without boundaries does not have. A source
-    also describes itself by what it reads rather than by its address, which
-    is what a saved position compares against (`describe`).
+    `eos_id` is the id that ends a document. Only the packed reader needs it,
+    and it is None for a corpus written without document boundaries. A
+    source's repr names what it reads, such as its path, because a saved
+    position compares against that description (`describe`). A repr with a
+    memory address would never match after a restart.
     """
 
     @property
@@ -115,8 +119,11 @@ CHUNK_CHARS = 1 << 20
 
 @dataclasses.dataclass(frozen=True)
 class TokenCorpus:
-    """A token directory: `train.bin`, `val.bin` and the `meta.json` that
-    records these fields."""
+    """The metadata of a token directory, as its `meta.json` records it.
+
+    The directory holds `train.bin`, `val.bin` and `meta.json`, and `write`
+    creates all three.
+    """
 
     tokenizer: str
     vocab_size: int
@@ -127,7 +134,7 @@ class TokenCorpus:
 
     @classmethod
     def read(cls, directory: str | os.PathLike[str]) -> TokenCorpus:
-        """What `meta.json` in `directory` records."""
+        """Read the `meta.json` in `directory`."""
         return cls(**json.loads((Path(directory) / "meta.json").read_text()))
 
     @classmethod
@@ -138,18 +145,22 @@ class TokenCorpus:
         `documents` is a text file, a directory read as every `*.txt` under it
         in path order (each file one document), or any iterable of strings, one
         document each, such as `(row["text"] for row in hf_split)`. A str is
-        always a path; pass text itself in a list. `tokenizer` is `"byte"` or a
-        Hugging Face tokenizer name, recorded in `meta.json` so a run can check
-        the ids against its model.
+        always taken as a path, so pass text itself in a list. `tokenizer` is
+        `"byte"` or a Hugging Face tokenizer name. It is recorded in
+        `meta.json` so a run can check the ids against its model.
 
-        The ids go to `train.bin` and `val.bin` at the smallest unsigned width
-        the vocabulary fits, with `val_fraction` of the stream, from its head,
-        held out. The ids the tokenizer adds to one encode, a bos id for many,
-        are written once per document. `pack` ends every document with the
-        tokenizer's eos id, which `PackedTokens` cuts documents at. A file is
-        read in line-bounded chunks so a corpus larger than memory costs disk,
-        and each chunk ends at a newline, so a tokenizer that merges across its
-        input sees whole lines.
+        The ids are written to `train.bin` and `val.bin` with the smallest
+        unsigned dtype that holds the vocabulary. `val_fraction`, in [0, 1),
+        is the share of the stream held out for `val.bin`, taken from its
+        head. The ids the tokenizer adds to a single encode (for many
+        tokenizers, a bos id) are written once per document. With `pack`,
+        every document ends with the tokenizer's eos id, which is where
+        `PackedTokens` cuts documents; a tokenizer without one raises
+        `ValueError`. A file is read in chunks that each end at a newline. So
+        a corpus larger than memory needs only disk space, and a tokenizer
+        that merges across its input sees whole lines.
+
+        Returns the `TokenCorpus` that was written to `meta.json`.
         """
         from dew.data.text import tokenizer_for
 
@@ -165,15 +176,20 @@ class TokenCorpus:
 
         # One encode pass writes the whole stream to a scratch file; the split
         # point needs the total count, and slicing a memmap of it costs a linear
-        # copy, not a second tokenization.
-        scratch = root / "all.bin"
+        # copy, not a second tokenization. The scratch file is created for this
+        # run alone (O_EXCL under a unique name), so no file already in `out`,
+        # an input included, is opened, truncated or removed; each output is
+        # written beside its name and renamed over it only once complete.
+        descriptor, name = tempfile.mkstemp(prefix=".tokenize-", suffix=".bin", dir=root)
+        scratch = Path(name)
         opening, closing = _added(encoder)
         # Every document is terminated, the last included, because the packing
         # source reads a record as the span up to an eos.
         closing = closing if eos is None else [*closing, eos]
         total = 0
+        staged: list[tuple[Path, str]] = []
         try:
-            with open(scratch, "wb") as handle:
+            with os.fdopen(descriptor, "wb") as handle:
                 for document in _documents(documents):
                     written = 0
                     for chunk in document:
@@ -190,14 +206,24 @@ class TokenCorpus:
                 raise ValueError(f"the corpus tokenized to {total} tokens; a window needs at least 2")
             held_out = min(round(total * val_fraction), total - 1)
             stream = np.memmap(scratch, dtype=dtype, mode="r")
-            stream[:held_out].tofile(root / "val.bin")
-            stream[held_out:].tofile(root / "train.bin")
+            corpus = cls(tokenizer=tokenizer, vocab_size=encoder.vocab_size, dtype=dtype.name,
+                         train_tokens=total - held_out, val_tokens=held_out, eos_id=eos)
+            meta = (json.dumps(dataclasses.asdict(corpus), indent=2) + "\n").encode()
+            pieces = (("val.bin", stream[:held_out].tofile), ("train.bin", stream[held_out:].tofile),
+                      ("meta.json", lambda handle: handle.write(meta)))
+            for target, write in pieces:
+                path = root / f".{target}.{uuid.uuid4().hex}"
+                with open(path, "xb") as handle:
+                    staged.append((path, target))
+                    write(handle)
+            del stream
+            while staged:
+                path, target = staged.pop(0)
+                os.replace(path, root / target)
         finally:
             scratch.unlink(missing_ok=True)
-
-        corpus = cls(tokenizer=tokenizer, vocab_size=encoder.vocab_size, dtype=dtype.name,
-                     train_tokens=total - held_out, val_tokens=held_out, eos_id=eos)
-        (root / "meta.json").write_text(json.dumps(dataclasses.asdict(corpus), indent=2) + "\n")
+            for path, _ in staged:
+                path.unlink(missing_ok=True)
         return corpus
 
 
@@ -265,9 +291,10 @@ def _chunks(path: Path) -> Iterator[str]:
 class TokenBytes(_Reopened):
     """Reads a flat `.bin` of token ids through a memmap.
 
-    The dtype comes from the sibling `meta.json` when present, where the
-    tokenize tool records it, and is uint16 otherwise. The file is never
-    loaded into memory: a worker reads only the span it is asked for.
+    The dtype comes from the `meta.json` beside the file, where the tokenize
+    tool records it, and is uint16 when there is none. `eos_id` defaults to
+    the one `meta.json` records. The file is never loaded into memory; a
+    worker reads only the span it asks for.
     """
 
     handle = "_tokens"
@@ -334,10 +361,12 @@ class _Sharded:
 class TokenRecords(_Reopened, _Sharded):
     """Reads token arrays in ArrayRecord shards as one stream.
 
-    Each record holds one array of ids, as its raw bytes or under `field` of
-    the packed dict `dew.data.images.pack_dict_of_byte_arrays` writes. The
-    records are the corpus in file order, so a tokenizer that wrote one
-    document per record and one that wrote fixed blocks read back the same.
+    Each record holds one array of ids, either as raw bytes or, with
+    `field`, under that key of a dict packed by
+    `dew.data.images.pack_dict_of_byte_arrays`. `dtype` is the width of the
+    stored ids, uint16 by default. The stream is the records joined in file
+    order, so a corpus written one document per record reads back the same
+    as one written in fixed blocks.
     """
 
     handle = "_records"
@@ -435,9 +464,10 @@ def _split(root: Path, split: str, name: str, field: str | None) -> TokenSource:
 class TokenWindowSource:
     """Reads fixed `seq_len + 1` windows over a token corpus, by index.
 
-    Record i starts at `i * stride`. With the default stride of `seq_len`,
-    the last token of one window is the first of the next. A stride of one
-    reads every complete contiguous window; incomplete tails are excluded.
+    Record i is `{"text": ids}`, with the int32 ids starting at
+    `i * stride`. With the default stride of `seq_len`, the last token of
+    one window is the first of the next. A stride of one reads every complete
+    contiguous window; incomplete tails are excluded.
     """
 
     def __init__(self, tokens: TokenSource, seq_len: int, *, stride: int | None = None):
@@ -475,20 +505,22 @@ class TokenDocumentSource:
     """Reads one document per record over a token corpus, by index.
 
     A document is the span from after the previous `eos_id` through its own,
-    so the eos tokens are the record separators. The tail after the last eos
-    is a document too, and a split with no eos at all is one document. A
-    train/val split cuts the stream wherever the token fraction falls, and
-    --pack closes input files instead of that cut, so the head of the stream
-    can carry no boundary while the tokens are still a document.
+    so the eos tokens separate the records. The tail after the last eos is a
+    document too, and a split with no eos at all is one document. Partial
+    documents like these occur because the train/val split cuts the stream
+    wherever the token fraction falls, while --pack puts eos ids only at the
+    ends of input documents. So a split can begin or end partway through a
+    document.
 
-    `eos_id` is the corpus's own unless one is given; without it the stream
-    has no boundaries to find. Finding them reads the corpus once at
-    construction, after which a worker touches only the span it is asked for.
+    `eos_id` defaults to the corpus's own. If neither is set, the constructor
+    raises `ValueError`, because the stream has no boundaries to find.
+    Finding them reads the corpus once at construction, and after that a
+    worker reads only the span it asks for.
 
-    `chunk_len` cuts every document into consecutive records of at most that
-    many tokens, as the packer would (`dew.data.tokens.DocumentChunks`), so a
-    record of a document longer than a window reads its own span rather than
-    the whole document.
+    `chunk_len` splits every document into consecutive records of at most
+    that many tokens, as the packer does (`dew.data.tokens.DocumentChunks`).
+    So each record of a document longer than a window reads only its own
+    span.
     """
 
     def __init__(self, tokens: TokenSource, eos_id: int | None = None, *,

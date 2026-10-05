@@ -1,21 +1,21 @@
-"""EDM2's magnitude-preserving layers (Karras et al. 2024, "Analyzing and
-Improving the Training Dynamics of Diffusion Models", section 3 and
-appendix B).
+"""EDM2's magnitude-preserving layers.
 
-Every layer keeps the expected magnitude of its activations at one: the
-weights are normalized in the forward pass and scaled by the fan-in (Eq. 47),
-the nonlinearity is divided by its expected output magnitude (Eq. 81), and a
-sum or a concatenation weighs its operands so the result has unit magnitude
+The layers follow Karras et al. 2024, "Analyzing and Improving the Training
+Dynamics of Diffusion Models", section 3 and appendix B. Every layer keeps
+the expected magnitude of its activations at one. The weights are normalized
+in the forward pass and scaled by the fan-in (Eq. 47), the nonlinearity is
+divided by its expected output magnitude (Eq. 81), and a sum or a
+concatenation weights its operands so the result has unit magnitude
 (Eqs. 88, 103). The layers are NVlabs/edm2's `training/networks_edm2.py`, in
 Flax's channels-last layout.
 
-Forced weight normalization (Eq. 66) keeps each stored weight at unit
-magnitude as well, so an update's relative size, and with it the effective
-learning rate, does not decay as the weights grow. The paper applies it in
-the training forward pass, in place; here it is `forced_weight_normalization`,
-an optimizer step that renormalizes every `mp_kernel` after its update, which
-`OptimConfig.build` appends under
-`OptimConfig.forced_weight_normalization`.
+Forced weight normalization (Eq. 66) also keeps each stored weight at unit
+magnitude, so an update's relative size, and with it the effective learning
+rate, does not decay as the weights grow. The paper applies it in place in
+the training forward pass. Here it is `forced_weight_normalization`, an
+optimizer step that renormalizes every `mp_kernel` after its update;
+`OptimConfig.build` appends it when `OptimConfig.forced_weight_normalization`
+is set.
 """
 
 from __future__ import annotations
@@ -32,13 +32,16 @@ from flax import linen as nn
 from dew.nn.precision import at_least_fp32
 
 MP_KERNEL = "mp_kernel"
-"""The parameter name of a magnitude-preserving weight, which forced weight
-normalization keeps at unit magnitude."""
+"""The parameter name of a magnitude-preserving weight. Forced weight
+normalization keeps these weights at unit magnitude."""
 
 
 def normalize(x: jax.Array, axes: Sequence[int] | None = None, eps: float = 1e-4) -> jax.Array:
-    """`x` over `axes` at unit root-mean-square magnitude, all but the last
-    by default: each output channel of a kernel, or each feature vector."""
+    """Return `x` scaled to unit root-mean-square magnitude over `axes`.
+
+    `axes` defaults to all but the last, which normalizes each output channel
+    of a kernel, or each feature vector.
+    """
     axes = tuple(range(x.ndim - 1)) if axes is None else tuple(axes)
     count = math.prod(x.shape[axis] for axis in axes)
     norm = jnp.sqrt(jnp.sum(jnp.square(x.astype(at_least_fp32(x.dtype))), axis=axes, keepdims=True))
@@ -46,18 +49,26 @@ def normalize(x: jax.Array, axes: Sequence[int] | None = None, eps: float = 1e-4
 
 
 def mp_silu(x: jax.Array) -> jax.Array:
-    """SiLU divided by its expected output magnitude on a unit normal (Eq. 81)."""
+    """Return SiLU divided by its expected output magnitude on a unit normal input.
+
+    This is Eq. 81 of the EDM2 paper.
+    """
     return jax.nn.silu(x) / 0.596
 
 
 def mp_sum(a: jax.Array, b: jax.Array, t: float = 0.5) -> jax.Array:
-    """The interpolation (1 - t) a + t b at unit magnitude (Eq. 88)."""
+    """Return the interpolation (1 - t) a + t b, scaled to unit magnitude.
+
+    This is Eq. 88 of the EDM2 paper.
+    """
     return (a + t * (b - a)) / math.sqrt((1 - t) ** 2 + t ** 2)
 
 
 def mp_cat(a: jax.Array, b: jax.Array, t: float = 0.5) -> jax.Array:
-    """The channel concatenation of `a` and `b`, weighted by `t` and at unit
-    magnitude (Eq. 103)."""
+    """Return the channel concatenation of `a` and `b`, weighted by `t` and scaled to unit magnitude.
+
+    This is Eq. 103 of the EDM2 paper.
+    """
     na, nb = a.shape[-1], b.shape[-1]
     # Python floats, which take the operands' dtype rather than promoting it.
     scale = math.sqrt((na + nb) / ((1 - t) ** 2 + t ** 2))
@@ -66,8 +77,11 @@ def mp_cat(a: jax.Array, b: jax.Array, t: float = 0.5) -> jax.Array:
 
 
 class MPFourier(nn.Module):
-    """Fourier features of a scalar at unit magnitude (Eq. 75): random
-    frequencies and phases, drawn once and held under `constants`."""
+    """Computes Fourier features of a scalar at unit magnitude.
+
+    The random frequencies and phases are drawn once and held in the
+    `constants` collection. This is Eq. 75 of the EDM2 paper.
+    """
 
     channels: int
     bandwidth: float = 1.0
@@ -89,12 +103,12 @@ class MPFourier(nn.Module):
 
 
 class MPConv(nn.Module):
-    """A convolution, or a dense layer for an empty `kernel_size`, whose
-    weight is normalized per output channel and scaled by the fan-in (Eq. 47).
+    """Applies a convolution whose weight is normalized per output channel and scaled by the fan-in.
 
-    The weight is `mp_kernel`, spatial axes first, then input and output
-    channels. A convolution pads to keep the size, as the reference's odd
-    kernels do.
+    An empty `kernel_size` makes it a dense layer. This is Eq. 47 of the
+    EDM2 paper. The weight is `mp_kernel`, with the spatial axes first, then
+    the input and output channels. A convolution pads to keep the size, as
+    the reference's odd kernels do.
     """
 
     features: int
@@ -115,9 +129,12 @@ class MPConv(nn.Module):
 
 
 class Uncertainty(nn.Module):
-    """EDM2's learned uncertainty u(sigma) (Eq. 21; `Precond`'s logvar head):
-    magnitude-preserving Fourier features of the model time through one
-    magnitude-preserving dense layer, one log-variance per example."""
+    """Computes EDM2's learned uncertainty u(sigma), one log-variance per example.
+
+    Magnitude-preserving Fourier features of the model time go through one
+    magnitude-preserving dense layer. This is Eq. 21 of the EDM2 paper, and
+    the logvar head of the reference's `Precond`.
+    """
 
     channels: int = 128
 
@@ -127,8 +144,13 @@ class Uncertainty(nn.Module):
 
 
 def forced_weight_normalization() -> optax.GradientTransformation:
-    """The update that leaves every `mp_kernel` at unit magnitude per output
-    channel once applied (Eq. 66); every other update passes through."""
+    """Return an optax transformation that keeps every `mp_kernel` at unit magnitude.
+
+    It changes each `mp_kernel` update so that the kernel has unit magnitude
+    per output channel once the update is applied (Eq. 66 of the EDM2
+    paper). Every other update passes through unchanged. The transformation
+    needs the parameters and raises `ValueError` without them.
+    """
 
     def update(updates, state, params=None):
         if params is None:

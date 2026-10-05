@@ -11,7 +11,6 @@ sees.
 """
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -19,7 +18,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.nn.text_encoders import check_tree
+from dew.interop.components import bind_component, component_source
 from dew.objectives.base import Variables
 
 from ..scan_orders import pixel_shuffle, pixel_unshuffle
@@ -74,15 +73,15 @@ def load_flux2_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: st
     running statistics are read from the weights even where `params` are
     supplied, since they are the latent normalization, not parameters.
     `lazy` leaves the parameters `SourceLeaf`s for a placement to read
-    (`dew.interop.diffusion.record_layouts`)."""
-    from dew.interop import diffusion, sources
+    (`dew.interop.weights.record_layouts`)."""
+    from dew.interop import diffusion
+    from dew.interop.safetensors_io import read_weights
     from dew.nn.autoencoders.vae import _vae_path
 
-    directory = sources.snapshot(str(name_or_dir), revision, weights=(subfolder,))
-    config = json.loads((directory / subfolder / "config.json").read_text())
+    directory, config = component_source(name_or_dir, revision, subfolder, weights=True)
     if config.get("_class_name") != "AutoencoderKLFlux2":
         raise ValueError(
-            f"{directory / subfolder} holds a {config.get('_class_name')}, not an AutoencoderKLFlux2"
+            f"{directory} holds a {config.get('_class_name')}, not an AutoencoderKLFlux2"
         )
     if tuple(config.get("patch_size", (2, 2))) != (2, 2):
         raise ValueError(f"FLUX.2's pipeline folds 2x2 latent blocks, not {config.get('patch_size')}")
@@ -101,25 +100,14 @@ def load_flux2_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: st
         else None,
         dtype=compute,
     )
-    tensors = diffusion.component_tensors(directory, subfolder)
-    layouts: tuple[WeightLayout, ...] = ()
-    if params is None:
-        params, layouts = diffusion.record_layouts(
-            "vae",
-            tensors,
-            lambda name: None if name in STATISTICS else _vae_path(name, np.ndim(tensors[name])),
-            ("autoencoder",),
-            param_dtype=param_dtype,
-            lazy=lazy,
-        )
+    tensors = read_weights(directory)
     frame = jax.ShapeDtypeStruct((1, model.downscale_factor, model.downscale_factor, model.image_channels),
                                  jnp.float32)
-    check_tree({"params": params}, model, frame)
-    autoencoder = Flux2Autoencoder(
-        model=model,
-        params=params,
-        mean=tensors["bn.running_mean"],
-        variance=tensors["bn.running_var"],
-        epsilon=config.get("batch_norm_eps", 1e-4),
-    )
-    return autoencoder, params, layouts, config
+    return bind_component(
+        directory, "vae", config, model,
+        lambda name, rank: None if name in STATISTICS else _vae_path(name, rank),
+        lambda bound: Flux2Autoencoder(model=model, params=bound, mean=tensors["bn.running_mean"],
+                                       variance=tensors["bn.running_var"],
+                                       epsilon=config.get("batch_norm_eps", 1e-4)),
+        prefix=("autoencoder",), params=params, param_dtype=param_dtype, lazy=lazy,
+        inputs=(frame,), tensors=tensors)

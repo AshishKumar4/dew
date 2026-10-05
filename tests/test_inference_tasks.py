@@ -14,6 +14,7 @@ from test_text_rollout_contract import decoder
 from dew.inference import BlockGeneration, TextGeneration
 from dew.interop import Pretrained
 from dew.nn.inputs import ModelInputs
+from dew.objectives.lm import LMObjective
 from dew.sampling import Sampling, generate
 
 FIXTURES = Path(__file__).parent / "fixtures" / "hf"
@@ -116,8 +117,8 @@ def test_a_pretrained_bundle_fine_tunes_identically_to_explicit_wiring():
     source = Pretrained.load(FIXTURES / "llama-tiny", dtype="float32", attention_impl="xla",
                              max_seq_len=8)
     options = {"ema_decay": None, "head_chunks": 1, "pad_id": 0, "z_loss": 1e-4}
-    explicit = LMObjective(source.model, 4, pretrained=source.variables, **options)
-    bundled = source.lm_objective(4, **options)
+    explicit = LMObjective(source.model, 4, variables=source.variables, **options)
+    bundled = LMObjective(source, 4, **options)
     key = jax.random.key(41)
     np.testing.assert_array_equal(jax.tree.leaves(bundled.init(key))[0],
                                   jax.tree.leaves(source.variables)[0])
@@ -140,10 +141,14 @@ def test_a_pretrained_bundle_fine_tunes_identically_to_explicit_wiring():
                zip(jax.tree.leaves(states[1].variables), jax.tree.leaves(source.variables), strict=True))
 
 
-def test_a_pretrained_bundle_refuses_a_second_initial_tree():
+def test_a_keyword_overrides_what_a_bundle_supplies():
+    """A bundle stands in for the model, its weights and its processor; a
+    keyword given beside it wins."""
     source = Pretrained.load(FIXTURES / "llama-tiny", dtype="float32", attention_impl="xla")
-    with pytest.raises(ValueError, match="already supplies"):
-        source.lm_objective(4, pretrained=source.variables)
+    zeros = jax.tree.map(jnp.zeros_like, source.variables)
+    objective = LMObjective(source, 4, variables=zeros)
+    assert objective.processor is source.text_processor
+    assert not any(bool(jnp.any(leaf)) for leaf in jax.tree.leaves(objective.init(jax.random.key(0))))
 
 
 def test_media_prompts_are_processed_once_and_keep_their_continuations():

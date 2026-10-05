@@ -22,7 +22,7 @@ from dew.checkpoints import Checkpoints
 from dew.interop import Pretrained
 from dew.interop.diffusion_gemma import translate_weights
 from dew.nn.inputs import ModelInputs
-from dew.objectives.base import FROZEN, Step
+from dew.objectives.base import FROZEN, Step, freeze
 from dew.objectives.diffusion.block import BlockDiffusionObjective
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures/hf/diffusion-gemma-sft"
@@ -40,15 +40,15 @@ def source():
     return loaded, batch, step, reference
 
 
-def objective(loaded, *, pretrained=None, **kwargs):
-    values = loaded.variables if pretrained is None else pretrained
+def objective(loaded, *, variables=None, **kwargs):
+    values = loaded.variables if variables is None else variables
     return BlockDiffusionObjective(loaded.model, prompt_length=4, num_canvases=2,
-                                   pretrained=values, **kwargs)
+                                   variables=values, **kwargs)
 
 
 def reference_variables(loaded, name):
     values = translate_weights(load_file(str(REFERENCES / name)), loaded.config)
-    return objective(loaded, pretrained=values).init(jax.random.key(0))
+    return objective(loaded, variables=values).init(jax.random.key(0))
 
 
 def assert_tree_close(actual, expected, tolerance):
@@ -206,7 +206,7 @@ def image_source():
                                  "image_groups": jnp.where(indices >= 0, indices // 2, -1),
                                  "positions": positions},
                          {"pixel_values": pixels, "image_lengths": jnp.asarray([1, 2])})
-    obj = BlockDiffusionObjective(loaded.model, prompt_length=8, pretrained=loaded.variables)
+    obj = BlockDiffusionObjective(loaded.model, prompt_length=8, variables=loaded.variables)
     variables = jax.tree.map(jnp.asarray, obj.init(jax.random.key(0)))
     step = Step(step=jnp.asarray(0, jnp.int32), key=jax.random.key(3), ema=None)
     return loaded, inputs, obj, variables, step
@@ -269,7 +269,7 @@ def test_denoiser_image_gradient_obeys_encoder_detachment(image_source):
     loaded, inputs, _, variables, step = image_source
     norms = []
     for detach in (False, True):
-        obj = BlockDiffusionObjective(loaded.model, prompt_length=8, pretrained=loaded.variables,
+        obj = BlockDiffusionObjective(loaded.model, prompt_length=8, variables=loaded.variables,
                                       encoder_loss_weight=0,
                                       stop_gradient_from_denoiser_to_encoder=detach)
         def loss(pixels, *, obj=obj):
@@ -311,7 +311,7 @@ def test_image_sft_trainer_resume_publish_and_generate(image_source, tmp_path):
 
     replace(loaded, model=obj.model).save(tmp_path / "published", variables=resumed.variables)
     readback = Pretrained.load(tmp_path / "published", dtype="float32", attention_impl="xla", max_seq_len=32)
-    restored = BlockDiffusionObjective(readback.model, prompt_length=8, pretrained=readback.variables)
+    restored = BlockDiffusionObjective(readback.model, prompt_length=8, variables=readback.variables)
     assert_tree_close(restored.init(jax.random.key(0)), resumed.variables, 0)
     original_loss = obj.scalar_loss(resumed.variables, {"text": inputs}, step)[0]
     restored_loss = restored.scalar_loss(restored.init(jax.random.key(0)), {"text": inputs}, step)[0]
@@ -327,17 +327,17 @@ def test_image_sft_trainer_resume_publish_and_generate(image_source, tmp_path):
     assert np.all(np.asarray(generated.decoder_steps) > 0)
 
 
-def test_trainable_filter_freezes_the_rest_and_moves_only_what_it_keeps(source):
-    """`trainable` splits the tree the way LMObjective's does: the frozen
-    collection holds what the filter rejects, the loss is the loss of the
-    whole tree, only the kept leaves take a gradient, and the published
-    weights are one `params` collection again."""
+def test_a_frozen_split_moves_only_what_the_filter_keeps(source):
+    """Starting variables `freeze` split keep their split, as LMObjective's
+    do: the frozen collection holds what the filter rejects, the loss is the
+    loss of the whole tree, only the kept leaves take a gradient, and the
+    published weights are one `params` collection again."""
     loaded, batch, step, reference = source
 
     def attention(path):
         return "self_attn" in path
 
-    obj = objective(loaded, trainable=attention)
+    obj = objective(loaded, variables=freeze(loaded.variables, attention))
     variables = jax.tree.map(jnp.asarray, obj.init(jax.random.key(0)))
     assert set(variables) >= {"params", FROZEN}
     kept = [path for path, _ in jax.tree_util.tree_leaves_with_path(variables["params"])]

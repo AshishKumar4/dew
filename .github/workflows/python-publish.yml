@@ -2,6 +2,12 @@ name: Publish to PyPI
 
 # Releases only. Pushes to main must not ship untested code to PyPI.
 #
+# A release publishes only what passed on its own commit: the whole CI
+# (lint, package and every test shard) runs here on the release's commit,
+# the wheel and sdist are built from it, and that same artifact is installed
+# into an empty environment, compiled, run through its `dew` entry point and
+# trained on before the publish job, which needs all three, uploads it.
+#
 # Trusted publishing: PyPI accepts this workflow's short-lived OIDC token, so
 # the repository holds no PyPI secret. PyPI's project `dewml` names this
 # repository, this workflow file and the `pypi` environment as its publisher
@@ -13,7 +19,13 @@ on:
     types: [published]
 
 jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
   build:
+    needs: ci
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -33,8 +45,26 @@ jobs:
           name: dist
           path: dist/
 
-  publish:
+  # The artifact the publish job uploads, not a rebuild of it.
+  smoke:
     needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Install the wheel into an empty environment, compile it, run `dew --help` and train
+        run: python tools/smoke_wheel.py dist/*.whl
+
+  publish:
+    needs: [ci, build, smoke]
     runs-on: ubuntu-latest
     environment:
       name: pypi
