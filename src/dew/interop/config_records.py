@@ -13,9 +13,9 @@ class NativeFields[Value](dict[str, Configured]):
     to a field are read against the same native declarations.
     """
 
-    def __init__(self, value: Value, fields: Mapping[str, Configured]):
+    def __init__(self, owner: type[Value], fields: Mapping[str, Configured]):
         super().__init__(fields)
-        self._owner = type(value)
+        self._owner = owner
 
     @property
     def value(self) -> Value:
@@ -26,10 +26,12 @@ class NativeFields[Value](dict[str, Configured]):
 def native_fields[**Fields, Value](constructor: Callable[Fields, Value]
                                  ) -> Callable[Fields, NativeFields[Value]]:
     """Use the native constructor's signature to check a translated record."""
+    if not isinstance(constructor, type):
+        raise TypeError("a native record names its value class")
+
     def recorded(*args: Fields.args, **kwargs: Fields.kwargs) -> NativeFields[Value]:
         if args:
             raise TypeError("a constructor record states its fields by name")
-        return NativeFields(constructor(*args, **kwargs),
-                            {name: configured(value) for name, value in kwargs.items()})
+        return NativeFields(constructor, {name: configured(value) for name, value in kwargs.items()})
 
     return recorded

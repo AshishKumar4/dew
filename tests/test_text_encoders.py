@@ -124,6 +124,27 @@ def test_a_constructor_record_keeps_defaults_implicit_and_reads_its_current_fiel
         _ = record.value
 
 
+def test_translating_inside_a_module_keeps_its_native_parameter_names():
+    import jax
+    import jax.numpy as jnp
+    from flax import linen as nn
+
+    config = fixture_config(TINY)
+
+    class Encoded(nn.Module):
+        @nn.compact
+        def __call__(self, input_ids):
+            return translate_config(config).value(input_ids).last_hidden_state
+
+    input_ids = jnp.zeros((1, 2), jnp.int32)
+    module = Encoded()
+    variables = module.init(jax.random.key(9), input_ids)
+    assert set(variables["params"]) == {"CLIPTextTransformer_0"}
+    direct = translate_config(config).value
+    expected = direct.apply({"params": variables["params"]["CLIPTextTransformer_0"]}, input_ids)
+    np.testing.assert_array_equal(module.apply(variables, input_ids), expected.last_hidden_state)
+
+
 def test_tiny_checkpoint_matches_the_reference():
     """Both towers of a CLIP checkpoint in one file, the text one loaded out of
     it, run on the reference's own token ids."""
