@@ -38,6 +38,7 @@ import json
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import ModuleType
 
 import numpy as np
 import torch
@@ -82,13 +83,39 @@ CASES: dict[str, Case] = {
 }
 
 
-class _Float64Numpy:
-    """numpy with its float32 read as float64, for a scheduler module whose
-    tables round through `np.float32`, as tools/diffusers_source_reference.py's
-    `Float64Library` widens them (that tool pins JAX to the CPU on import)."""
+class Float64Library:
+    """A library (numpy, torch) with its float32 read as float64, for a
+    scheduler module whose tables round through an explicit float32."""
+
+    def __init__(self, library):
+        self.library = library
 
     def __getattr__(self, name):
-        return getattr(np, "float64" if name == "float32" else name)
+        return getattr(self.library, "float64" if name == "float32" else name)
+
+
+@contextlib.contextmanager
+def float64_scheduler(module: ModuleType):
+    """Evaluate the published formulas in float64, including table creation.
+
+    Casting already-built tables would retain their float32 cumprod and
+    interpolation errors. Some step methods also explicitly upcast a sample
+    to float32; that minimum precision must become float64 for this oracle.
+    Only this scheduler module sees the widened libraries, and the default
+    dtype is restored before the native float32 reference runs.
+    """
+    from unittest.mock import patch
+
+    previous = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.float64)
+        with contextlib.ExitStack() as scope:
+            for name, library in (("torch", torch), ("np", np)):
+                if hasattr(module, name):
+                    scope.enter_context(patch.object(module, name, Float64Library(library)))
+            yield
+    finally:
+        torch.set_default_dtype(previous)
 
 
 @contextlib.contextmanager
@@ -117,7 +144,7 @@ def widened():
     default = torch.get_default_dtype()
     torch.set_default_dtype(torch.float64)
     try:
-        with patch.object(scheduling_unipc_multistep, "np", _Float64Numpy()):
+        with patch.object(scheduling_unipc_multistep, "np", Float64Library(np)):
             yield
     finally:
         torch.Tensor.float, torch.Tensor.to, torch.arange = float_, to, arange
