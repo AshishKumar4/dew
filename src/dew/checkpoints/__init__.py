@@ -801,21 +801,31 @@ class Checkpoints:
 
     def _open_local(self) -> ocp.CheckpointManager:
         if self._local_manager is None:
-            # No primary host: every process writes its own metadata, and
-            # every shard it holds, one copy per process, so each process's
-            # directory is complete for its devices.
+            # Each process is a pool of one for its local manager: it writes
+            # its own metadata, and every shard it holds, one copy per
+            # process, so each process's directory is complete for its
+            # devices, and orbax's barriers wait for this process alone. Over
+            # the whole pool, a save that failed in one process's background
+            # thread (FileExistsError creating its tmp directory, a CI shard
+            # on 2026-10-05) left that process's finalize waiting at a
+            # barrier the others had passed, and the pool hung until orbax's
+            # 600 s timeout; alone, the failure reaches the process's next
+            # save, which raises and ends the pool.
             # Only device arrays are registered, because orbax writes a host
             # array from process 0 alone whatever the options say; the
             # position table rides as a replicated device array instead. The
             # prefix keeps this manager's barriers apart from the persistent
-            # one's, whose keys are otherwise the same at a step both write.
-            multiprocessing = MultiprocessingOptions(primary_host=None,
-                                                     barrier_sync_key_prefix='local')
+            # one's and from the other processes' own.
+            me = jax.process_index()
+            multiprocessing = MultiprocessingOptions(primary_host=me, active_processes={me},
+                                                     barrier_sync_key_prefix=f'local{me}')
             registry = ocp.type_handlers.create_type_handler_registry(
                 (jax.Array, ocp.type_handlers.ArrayHandler(
                     primary_host=None, replica_id=None, use_replica_parallel=False)))
+            # orbax creates no directory for a manager over a subset of the pool.
+            epath.Path(self.local_path).mkdir(parents=True, exist_ok=True)
             options = ocp.CheckpointManagerOptions(
-                max_to_keep=1, create=True, cleanup_tmp_directories=True,
+                max_to_keep=1, create=False, cleanup_tmp_directories=True,
                 enable_async_checkpointing=True, multiprocessing_options=multiprocessing)
             self._local_manager = ocp.CheckpointManager(
                 self.local_path, options=options,
