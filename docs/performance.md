@@ -815,31 +815,33 @@ environment.
 
 ## Odd sequence lengths on cudnn
 
-CuDNN's fused kernel has no backward pass for odd query or key lengths.
-The forward accepts any length, so the failure appeared only at the
-first training step: `NotImplementedError: Unsupported sequence length Q 333, KV
-333` from jax. CLIP's 77 text tokens have an odd length, as does a
-concatenation of 256+77.
+cudnn's fused kernel has no backward pass for an odd query or key length.
+The forward pass takes any length, so the problem only showed up at the
+first training step, as `NotImplementedError: Unsupported sequence length Q
+333, KV 333` from jax. CLIP's 77 text tokens are an odd length, and so is
+256 + 77 after concatenation.
 
-Until 2026-09-05, `'auto'` sent those shapes to the xla kernel. That kernel
-stores the [B, H, Q, K] logits and probabilities in fp32 for backward.
-`cudnn_attention` now pads odd lengths to even ones. It adds one zero query
-row and slices it off the output. It also adds one zero key and hides it
-with the kernel's padding mask (`key_value_seq_lengths`). Each real query
-therefore attends to its original keys. On GPU, `'auto'` selects cudnn at
-any sequence length, and an explicit `'cudnn'` also accepts any length.
+Until 2026-09-05, `'auto'` sent those shapes to the xla kernel, which
+materializes the [B, H, Q, K] logits and their probabilities in fp32 and
+keeps them for the backward pass. Now `cudnn_attention` pads an odd length
+to an even one. It adds one zero row to the query and slices it off the
+output. It also adds one zero key and hides it with the kernel's own padding
+mask (`key_value_seq_lengths`), so every real query attends to exactly the
+keys it had. On a GPU, `'auto'` picks cudnn at any sequence length, and an
+explicit `'cudnn'` also takes any length.
 
 `tests/test_kernels.py::test_cudnn_trains_odd_lengths_and_agrees_with_xla`
 checks this at q1024/kv77, q9/kv7 and q333/kv333 causal. The outputs and the
 three input gradients agree with the xla kernel to within two bf16 ulps of
-their scale. The kernels differ by the same amount at an even length
+their scale. At an even length the two kernels are the same distance apart
 (q256: 1.6e-2 at scale 2.9 on the output, 7.8e-2 at scale 15.6 on the
 gradients, both one ulp). If the pad key is left unmasked, the q9/kv7 output
 moves by 0.26 at scale 2.4 and the test fails. If the pad query row is left
 in, the shape changes and the test fails.
 
-Padding results from `--warmup 3 --steps 50` on the small preset, comparing
-`'xla'` (used before padding) with `'auto'`:
+The table measures what the padding gains, with `--warmup 3 --steps 50` on
+the small preset, comparing `'xla'` (the kernel these shapes ran on before
+the padding) with `'auto'`:
 
 | architecture | shapes | xla ms/step | cudnn ms/step | xla peak GiB | cudnn peak GiB | loss at the end, xla / cudnn |
 |---|---|---:|---:|---:|---:|---|
@@ -847,28 +849,29 @@ Padding results from `--warmup 3 --steps 50` on the small preset, comparing
 | simple_mmdit | q333/kv333 | 12.86 | 11.01 | 1.43 | 1.08 | 0.584398 / 0.584407 |
 | unet | q256/kv77, q1024/kv77 | 16.30 | 16.13 | 0.78 | 0.71 | 0.597518 / 0.597516 |
 
-The xla attention on the 1101-token stage kept fp32 logits and probabilities
-for backward, accounting for 1.65 GiB and 13 ms. Attention is a small
-part of the unet's step, so padding saves little there. Losses after
-103 steps on one fixed batch differ in the sixth digit because of the
-kernels' bf16 rounding, compounded by Adam. Decoding uses one query
-position at a time, an odd length. It runs on cudnn with the cache mask
-as additive bias; decoding speed was not measured.
+On hierarchical_mmdit, the xla attention on the 1101-token stage kept its
+fp32 logits and probabilities for the backward pass, and that is where the
+1.65 GiB and the 13 ms went. Attention is a small part of the unet's step,
+so the unet gains little. The losses are after 103 steps on one fixed batch
+and differ in the sixth digit, which is the two kernels' bf16 rounding
+compounded by Adam. Decoding asks for one query position at a time, which is
+an odd length. It runs on cudnn with the cache mask as an additive bias; I
+did not measure its speed.
 
 ## Attention metadata and the masked conv, 2026-09-07
 
-Before `14622ba`, supplying any `AttentionMetadata` disabled the fused kernel.
-The mixer built a `[B, 1, S, S]` mask and selected xla even when the metadata
-only specified rotary positions or marked every slot as valid. Those
-batches computed a mask that excluded nothing.
-
-At `14622ba`, the mixer checks whether metadata restricts key validity
-or image groups on a bidirectional-image layer. It cannot read a validity
-array at trace time, so even an all-true array still requires a mask.
-Host code now omits the array when it knows the rows are whole. This
-includes `pad_token_rows`, the processor's `from_hf`, generation input
-validation, the rollout collector and episode cohorts, the PPO critic
-without lengths, and every MTP depth.
+Before `14622ba`, passing any `AttentionMetadata` lost the fused kernel,
+whatever the metadata said. The mixer built its `[B, 1, S, S]` mask and took
+the xla path as soon as any metadata arrived. So a batch that only gave
+rotary positions, or one whose validity marked every slot as real, paid for
+a mask that excluded nothing. At `14622ba` the mixer checks whether the
+metadata restricts anything, meaning key validity, or image groups on a
+bidirectional-image layer. A validity array's values are unknown at trace
+time, so an all-true array still builds the mask. The host code that used to
+emit one now leaves it out when it knows the rows are whole:
+`pad_token_rows`, the processor's `from_hf`, generation's input validation,
+the rollout collector and episode cohorts, the PPO critic without lengths,
+and every MTP depth.
 
 The Gated DeltaNet short conv had the same kind of problem inside it.
 `_masked_conv1d` convolved one token per scan step to keep a paused row's
@@ -909,54 +912,56 @@ The attention cases use batch 1, 2048 tokens, and 8 query and 4 key heads of
 128. The GDN cases use batch 2, 2048 tokens, 8 key and 16 value heads, and
 conv kernel 4. Peaks and kernel counts are the forward+backward figures.
 
-The canonical row uses the opaque row's batch with redundant validity
-omitted, matching a real unpadded request. Its before column measures the
-same call at `83f08e5`. The compiled HLO contains a `__cudnn$fmhaSoftmax`
-custom call after the change, and none before. This confirms that routing
-changed; the speedup is not clock noise. The opaque and packed rows
-are unchanged by design, with differences within their spread across windows.
+The canonical row is the opaque row's batch with the redundant validity left
+out, which is what a real unpadded request looks like. Its before column is
+that same call measured at `83f08e5`. The compiled HLO has a
+`__cudnn$fmhaSoftmax` custom call after the change and none before, so the
+route changed and the gain is not clock noise. The opaque and packed rows
+are unchanged by design, and their spread across windows covers the
+difference.
 
-The process allocator's reported peaks vary by up to 20 MiB between
-identical runs. Two repeats of the same packed forward gave 496.02 and
-476.02 MiB, although the executable's `memory_analysis` was byte-identical.
-Read the peak column at that resolution.
+The peaks the process allocator reports move by up to 20 MiB between
+identical runs. The packed forward gave 496.02 and 476.02 MiB on two repeats
+of the same executable, whose own `memory_analysis` is byte-identical, so
+read the peak column at that resolution.
 
-Canonical metadata uses the plain call. Its outputs are bitwise equal
-to the no-metadata forward, and parameter gradients agree within 2.4e-06.
-The opaque all-true mask stays on xla at its old cost because the
-array's shape cannot establish that every entry is true.
+With canonical metadata the call is exactly the plain call. Its outputs are
+bitwise equal to the no-metadata forward, and its parameter gradients are
+within 2.4e-06 of it. The opaque all-true mask stays on the xla kernel at
+its old cost, because the shape of a validity array does not say that its
+contents are all true.
 
-The GDN rows time the whole mixer: projections, gates, rule and norm.
-Only the masked conv changed. With a mask, the mixer is 3.3 times
-faster forward and 3.0 times faster with the gradient. Kernel launches
-fall 22.8 times forward (10707 to 470 a call) and 19.5 times with the
-gradient (36700 to 1884). The HLO replaces the scan's `while` loop with
-the unmasked path's `__cudnn$convForward`. At lengths 2048 and 1537,
-outputs agree with row-by-row evaluation to 2.4e-04 (the layer's bound
-is 5e-4). The padded row's input gradients and outputs are exactly zero.
-Against the fp32 token scan on CPU, the largest difference is 4.8e-07
-over left, right, interior and paused padding at kernels 2, 4 and 8.
+The GDN rows time the whole mixer (projections, gates, rule and norm), and
+the masked conv is the only part that changed. With a mask, the mixer is 3.3
+times faster forward and 3.0 times faster with the gradient. Its kernel
+launches drop 22.8 times forward (10707 to 470 a call) and 19.5 times with
+the gradient (36700 to 1884), because the scan's `while` loop is gone from
+the HLO and the unmasked path's `__cudnn$convForward` replaces it. On
+lengths 2048 and 1537 the outputs agree with row-by-row evaluation to
+2.4e-04 (the layer's bound is 5e-4), and the padded row's input gradients
+and outputs are exactly zero. Against the token scan on CPU at fp32, the
+largest difference over left, right, interior and paused padding at kernels
+2, 4 and 8 is 4.8e-07.
 
-Omitting the field changes the batch's pytree, so every process in a pool
-must agree on its presence. Each process knows only whether its own
-rows need padding. If some omit the field and others include it, they
-give the same step different pytrees.
+Leaving the field out changes the batch's pytree, so every process in a pool
+has to agree on it. Only a process itself knows whether its own rows needed
+padding, and if one process leaves the field out while another includes it,
+the same step gets two different pytrees. So a generation request first
+agrees on the signature that ignores validity, then on one fixed-size
+presence vector. Every process runs the same collectives in the same order,
+whatever rows it holds. If any process includes the field, every process
+materializes it; if none does, the field stays out and the call keeps the
+fused kernel.
 
-For generation, processes first agree on the signature without validity,
-then on a fixed-size presence vector. They run the same collectives in
-the same order regardless of their local inputs. If any process includes
-the field, every process adds it. If none includes it, they omit it and
-keep the fused kernel.
+`shard_batch` cannot run that agreement, because placement runs on the
+worker thread of `DevicePrefetchIterator` while the step's collectives run
+on the caller's thread. So in a pool, every `ModelInputs` of a training
+batch that lacks the field gets it materialized. Single-process runs, which
+the table measures, are unaffected, and so are batches of plain token
+arrays, which have no validity field.
 
-`shard_batch` cannot perform that agreement: `DevicePrefetchIterator` places
-batches on a worker thread, while step collectives run on the caller's
-thread. In a pool, it therefore adds the field to every training batch's
-`ModelInputs` that lacks it. Single-process runs, as measured in the
-table, are unchanged. Batches of plain token arrays are also unchanged;
-they have no validity field.
-
-The head-chunk and head-dimension-256 cases were not rerun because this
-change does not affect them.
+I did not rerun the head-chunk and head-dimension-256 cases, because this
+change does not touch them.
 
 ## XLA flags
 
