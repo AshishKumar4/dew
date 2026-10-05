@@ -16,9 +16,9 @@ from collections.abc import Mapping
 from flax.traverse_util import flatten_dict
 
 from dew import records
+from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.hf_decoders import (
     _MOE_SHARED,
-    AltUpFields,
     DecoderFields,
     MixtureFields,
     _base_config,
@@ -39,6 +39,7 @@ from dew.interop.hf_decoders import (
 from dew.interop.safetensors_io import LazyTensors
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
+from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.gemma3n import AltUp
 from dew.nn.mixers import AttentionMixer
 
@@ -165,7 +166,7 @@ def _gemma2_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     config = _base_config(hf_config, used, scale_after_cast=False,
                           tie_embeddings=True, layer_types=layer_types,
                           reads=frozenset({'layer_types', 'sliding_window', 'attention_bias'}))
-    sliding = (config.get('kinds') or {}).get('sliding_attention') or {}
+    sliding = _kinds_of(config).get('sliding_attention', native_fields(LayerKind)())
     if 'rope_theta' in sliding or 'yarn' in sliding or 'rope_scaling' in sliding:
         _refuse("rope_parameters.sliding_attention",
                 "Gemma2RotaryEmbedding rotates every layer at one base and ramp")
@@ -251,7 +252,7 @@ def _gemma3n_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderF
         v_norm=True,
         activation_sparsity_pattern=tuple(float(fraction) for fraction in sparsity),
         laurel_rank=records.integer(hf_config.get("laurel_rank", 64), "laurel_rank"),
-        altup=AltUpFields(**dataclasses.asdict(altup)),
+        altup=NativeFields(AltUp, dataclasses.asdict(altup)),
         per_layer_input_dim=records.integer(
             hf_config.get("hidden_size_per_layer_input", 256), "hidden_size_per_layer_input"
         ),
@@ -357,7 +358,7 @@ def _gemma4_config(hf_config: Mapping[str, object], used: set[str], *,
         rope_theta=rope_theta,
         kinds=_kinds(
             layer_types,
-            _kinds_of(config).get("sliding_attention", {}).get("window"),
+            _kinds_of(config).get("sliding_attention", native_fields(LayerKind)()).value.window,
             rope_local_theta,
             None,
             None if full_dim == sliding_dim else full_dim,
@@ -387,7 +388,7 @@ def _gemma4_config(hf_config: Mapping[str, object], used: set[str], *,
     if softcap is not None:
         config['final_logit_softcap'] = records.number(softcap, 'final_logit_softcapping')
     if full_kv != kv_heads:
-        _kinds_of(config).setdefault('full_attention', {})['num_kv_heads'] = full_kv
+        _kinds_of(config).setdefault('full_attention', native_fields(LayerKind)())['num_kv_heads'] = full_kv
     # Every released Gemma 4 checkpoint carries the layer_scalar buffer the
     # reference initialises to one, so the tree always holds it.
     config.update(attention_k_eq_v=k_eq_v, layer_scalar="frozen")
@@ -405,10 +406,10 @@ def _gemma4_config(hf_config: Mapping[str, object], used: set[str], *,
 
 def _parallel_experts(hf_config: Mapping[str, object]) -> MixtureFields:
     """The routed branch a Gemma 4 layer runs beside its dense MLP."""
-    return {'experts': records.integer(hf_config['num_experts'], 'num_experts'),
-            'top_k': records.integer(hf_config['top_k_experts'], 'top_k_experts'),
-            'expert_features': records.integer(hf_config['moe_intermediate_size'], 'moe_intermediate_size'),
-            'parallel': True}
+    return native_fields(Mixture)(experts=records.integer(hf_config['num_experts'], 'num_experts'),
+            top_k=records.integer(hf_config['top_k_experts'], 'top_k_experts'),
+            expert_features=records.integer(hf_config['moe_intermediate_size'], 'moe_intermediate_size'),
+            parallel=True)
 
 
 def _gemma3_export(model: CausalTransformer) -> Mapping[str, object]:

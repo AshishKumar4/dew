@@ -98,8 +98,6 @@ from dew.interop.hf_decoders import (
     DecoderFamily,
     _every_layer_windowed,
     _kind_mixers,
-    _mixer_value,
-    _mixture_value,
     _renamed_name,
     _renamed_path,
 )
@@ -116,10 +114,10 @@ ENTRIES = (
         ("gpt_neox",),
         _gpt_neox_config,
         lambda fields: bool(
-            fields.get("norm_type") == "layer"
-            and fields.get("norm_bias")
-            and fields.get("mlp_bias")
-            and fields.get("position_embedding") == "rotary"
+            fields.norm_type == "layer"
+            and fields.norm_bias
+            and fields.mlp_bias
+            and fields.position_embedding == "rotary"
         ),
         "gpt_neox",
         "GPTNeoXForCausalLM",
@@ -134,7 +132,7 @@ ENTRIES = (
     DecoderFamily(
         ("opt",),
         _opt_config,
-        lambda fields: fields.get("position_embedding_offset") == 2,
+        lambda fields: fields.position_embedding_offset == 2,
         "opt",
         "OPTForCausalLM",
         _opt_export,
@@ -146,7 +144,7 @@ ENTRIES = (
     DecoderFamily(
         ("gpt2",),
         _gpt2_config,
-        lambda fields: fields.get("position_embedding") == "learned",
+        lambda fields: fields.position_embedding == "learned",
         "gpt2",
         "GPT2LMHeadModel",
         _gpt2_export,
@@ -175,11 +173,11 @@ ENTRIES = (
         ("diffusion_gemma_text",),
         _diffusion_gemma_text_config,
         lambda fields: bool(
-            fields.get("causal") is False
+            fields.causal is False
             and (
-                fields.get("v_norm")
-                or fields.get("per_layer_input_dim")
-                or fields.get("kv_shared_layers")
+                fields.v_norm
+                or fields.per_layer_input_dim
+                or fields.kv_shared_layers
             )
         ),
         "diffusion_gemma_text",
@@ -196,9 +194,9 @@ ENTRIES = (
         ("dream", "Dream"),
         _dream_config,
         lambda fields: bool(
-            fields.get("causal") is False
-            and fields.get("attention_bias")
-            and fields.get("o_proj_bias") is False
+            fields.causal is False
+            and fields.attention_bias
+            and fields.o_proj_bias is False
         ),
         "dream",
         "DreamModel",
@@ -209,16 +207,16 @@ ENTRIES = (
         ("llada",),
         _llada_config,
         lambda fields: bool(
-            fields.get("causal") is False
-            and not fields.get("attention_bias")
-            and fields.get("mixture") is None
+            fields.causal is False
+            and not fields.attention_bias
+            and fields.mixture is None
             and not (
-                fields.get("v_norm")
-                or fields.get("per_layer_input_dim")
-                or fields.get("kv_shared_layers")
+                fields.v_norm
+                or fields.per_layer_input_dim
+                or fields.kv_shared_layers
             )
-            and not fields.get("output_gate")
-            and not fields.get("qk_norm")
+            and not fields.output_gate
+            and not fields.qk_norm
         ),
         "llada",
         "LLaDAModelLM",
@@ -230,7 +228,7 @@ ENTRIES = (
     DecoderFamily(
         ("gpt_oss",),
         _gpt_oss_config,
-        lambda fields: fields.get("mlp") == "swigluoai",
+        lambda fields: fields.mlp == "swigluoai",
         "gpt_oss",
         "GptOssForCausalLM",
         _gpt_oss_export,
@@ -253,8 +251,8 @@ ENTRIES = (
         ("glm4_moe",),
         _glm4_moe_config,
         lambda fields: (
-            fields.get("partial_rotary_type") == "default"
-            and (mixture := _mixture_value(fields)) is not None
+            fields.partial_rotary_type == "default"
+            and (mixture := fields.mixture) is not None
             and mixture.bias
         ),
         "glm4_moe",
@@ -269,7 +267,7 @@ ENTRIES = (
         ("glm_moe_dsa",),
         _glm_moe_dsa_config,
         lambda fields: (
-            isinstance(mixer := _mixer_value(fields), MLAMixer)
+            isinstance(mixer := fields.mixer, MLAMixer)
             and mixer.index_topk is not None
             and mixer.index_rope_interleave
         ),
@@ -285,7 +283,7 @@ ENTRIES = (
     DecoderFamily(
         ("deepseek_v4",),
         _deepseek_v4_config,
-        lambda fields: isinstance(_mixer_value(fields), DeepseekV4Mixer),
+        lambda fields: isinstance(fields.mixer, DeepseekV4Mixer),
         "deepseek_v4",
         "DeepseekV4ForCausalLM",
         lambda model: {},
@@ -297,7 +295,7 @@ ENTRIES = (
     DecoderFamily(
         ("deepseek_v32",),
         partial(_deepseek_config, sparse=True),
-        lambda fields: (isinstance(mixer := _mixer_value(fields), MLAMixer) and mixer.index_topk is not None),
+        lambda fields: (isinstance(mixer := fields.mixer, MLAMixer) and mixer.index_topk is not None),
         "deepseek_v32",
         "DeepseekV32ForCausalLM",
         lambda model: {},
@@ -307,8 +305,8 @@ ENTRIES = (
         ("deepseek_v2",),
         partial(_deepseek_config, mixture=_deepseek_v2_mixture),
         lambda fields: (
-            isinstance(_mixer_value(fields), MLAMixer)
-            and (mixture := _mixture_value(fields)) is not None
+            isinstance(fields.mixer, MLAMixer)
+            and (mixture := fields.mixture) is not None
             and not mixture.bias
         ),
         "deepseek_v2",
@@ -369,7 +367,7 @@ ENTRIES = (
     DecoderFamily(
         ("deepseek_v3",),
         _deepseek_config,
-        lambda fields: isinstance(_mixer_value(fields), MLAMixer),
+        lambda fields: isinstance(fields.mixer, MLAMixer),
         "deepseek_v3",
         "DeepseekV3ForCausalLM",
         lambda model: {},
@@ -391,7 +389,7 @@ ENTRIES = (
     DecoderFamily(
         ("qwen3_5_moe_text",),
         _qwen35_moe_config,
-        lambda fields: bool(fields.get("output_gate") and _mixture_value(fields) is not None),
+        lambda fields: bool(fields.output_gate and fields.mixture is not None),
         "qwen3_5_moe_text",
         "Qwen3_5MoeForCausalLM",
         lambda model: {},
@@ -403,7 +401,7 @@ ENTRIES = (
         (_QWEN35,),
         _qwen35_config,
         lambda fields: bool(
-            fields.get("output_gate") or "linear_attention" in (fields.get("layer_types") or ())
+            fields.output_gate or "linear_attention" in (fields.layer_types or ())
         ),
         _QWEN35,
         "Qwen3_5ForCausalLM",
@@ -414,7 +412,7 @@ ENTRIES = (
     DecoderFamily(
         ("olmo3",),
         _olmo3_config,
-        lambda fields: not fields.get("pre_norms"),
+        lambda fields: not fields.pre_norms,
         "olmo3",
         "Olmo3ForCausalLM",
         lambda model: {},
@@ -424,7 +422,7 @@ ENTRIES = (
     DecoderFamily(
         ("gemma3n_text",),
         _gemma3n_config,
-        lambda fields: fields.get("altup") is not None,
+        lambda fields: fields.altup is not None,
         "gemma3n_text",
         "Gemma3nForCausalLM",
         _gemma3_export,
@@ -436,7 +434,7 @@ ENTRIES = (
         ("gemma4_text",),
         _gemma4_config,
         lambda fields: bool(
-            fields.get("v_norm") or fields.get("per_layer_input_dim") or fields.get("kv_shared_layers")
+            fields.v_norm or fields.per_layer_input_dim or fields.kv_shared_layers
         ),
         "gemma4_text",
         "Gemma4ForCausalLM",
@@ -451,7 +449,7 @@ ENTRIES = (
     DecoderFamily(
         (_GEMMA,),
         _gemma3_config,
-        lambda fields: bool(fields.get("sandwich_norms") and fields.get("qk_norm")),
+        lambda fields: bool(fields.sandwich_norms and fields.qk_norm),
         _GEMMA,
         "Gemma3ForCausalLM",
         _gemma3_export,
@@ -461,7 +459,7 @@ ENTRIES = (
     DecoderFamily(
         ("gemma2",),
         _gemma2_config,
-        lambda fields: bool(fields.get("sandwich_norms")),
+        lambda fields: bool(fields.sandwich_norms),
         "gemma2",
         "Gemma2ForCausalLM",
         _gemma2_export,
@@ -471,7 +469,7 @@ ENTRIES = (
     DecoderFamily(
         ("gemma",),
         _gemma_config,
-        lambda fields: bool(fields.get("embedding_scale")),
+        lambda fields: bool(fields.embedding_scale),
         "gemma",
         "GemmaForCausalLM",
         lambda model: {},
@@ -480,7 +478,7 @@ ENTRIES = (
     DecoderFamily(
         ("qwen3_moe",),
         _qwen3_moe_config,
-        lambda fields: bool(fields.get("qk_norm") and fields.get("mixture") is not None),
+        lambda fields: bool(fields.qk_norm and fields.mixture is not None),
         "qwen3_moe",
         "Qwen3MoeForCausalLM",
         _qwen3_export,
@@ -489,7 +487,7 @@ ENTRIES = (
     DecoderFamily(
         ("qwen3",),
         _qwen3_config,
-        lambda fields: bool(fields.get("qk_norm")),
+        lambda fields: bool(fields.qk_norm),
         "qwen3",
         "Qwen3ForCausalLM",
         _qwen3_export,
@@ -498,7 +496,7 @@ ENTRIES = (
     DecoderFamily(
         ("qwen2",),
         _qwen2_config,
-        lambda fields: bool(fields.get("attention_bias") and fields.get("o_proj_bias") is False),
+        lambda fields: bool(fields.attention_bias and fields.o_proj_bias is False),
         "qwen2",
         "Qwen2ForCausalLM",
         _qwen3_export,
@@ -507,7 +505,7 @@ ENTRIES = (
     DecoderFamily(
         ("mixtral",),
         _mixtral_config,
-        lambda fields: fields.get("mixture") is not None,
+        lambda fields: fields.mixture is not None,
         "mixtral",
         "MixtralForCausalLM",
         lambda model: {},
@@ -527,7 +525,7 @@ ENTRIES = (
     DecoderFamily(
         ("mamba2",),
         mamba2.config_from_hf,
-        lambda fields: isinstance(_mixer_value(fields), Mamba2Mixer),
+        lambda fields: isinstance(fields.mixer, Mamba2Mixer),
         "mamba2",
         "Mamba2ForCausalLM",
         lambda model: {},
@@ -539,7 +537,7 @@ ENTRIES = (
     DecoderFamily(
         ("ministral",),
         _ministral_config,
-        lambda fields: "sliding_attention" in (fields.get("layer_types") or ()),
+        lambda fields: "sliding_attention" in (fields.layer_types or ()),
         "ministral",
         "MinistralForCausalLM",
         lambda model: {},

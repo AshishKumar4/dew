@@ -9,9 +9,11 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import asdict
 
+from dew.interop.config_records import native_fields
 from dew.interop.families.deepseek import _deepseek_rope
 from dew.interop.hf_decoders import DecoderFields, _base_config, _dew_path, _hf_name, _refuse, _Ropes
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.decoder_block import Mixture
 
 
 def _gpt_oss_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
@@ -26,7 +28,7 @@ def _gpt_oss_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderF
     config = _base_config(hf_config, used, layer_types=pattern,
                           rope=_Ropes(theta), scale_after_cast=False)
     config.update(mlp='swigluoai', attention_sinks=True, yarn=yarn,
-                  mixture={'experts': experts, 'top_k': top_k})
+                  mixture=native_fields(Mixture)(experts=experts, top_k=top_k))
     if hf_config.get('swiglu_limit', 7.0) != 7.0:
         _refuse('swiglu_limit', 'GptOssExperts clamps at 7.0')
     if hf_config.get('experts_per_token', top_k) != top_k:

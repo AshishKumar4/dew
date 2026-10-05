@@ -1,5 +1,7 @@
 """Constructor-checked records that keep only the fields a translator states."""
 
+from __future__ import annotations
+
 from collections.abc import Callable, Mapping
 
 from dew.registry import Configured, configured, from_record
@@ -15,9 +17,13 @@ class NativeFields[Value](dict[str, Configured]):
     record itself, or build its value first.
     """
 
-    def __init__(self, owner: type[Value], fields: Mapping[str, Configured]):
-        super().__init__(fields)
+    def __init__(self, owner: type[Value], fields: Mapping[str, object]):
+        super().__init__((name, configured(value)) for name, value in fields.items())
         self._owner = owner
+
+    def copy(self) -> NativeFields[Value]:
+        """Keep the native owner when a caller edits a shallow record copy."""
+        return NativeFields(self._owner, self)
 
     @property
     def value(self) -> Value:
