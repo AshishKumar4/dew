@@ -1472,16 +1472,14 @@ to 3626.2 at 128 (two traced runs each).
 
 ### Open loop, 2026-10-04
 
-The closed-loop table above submits every request at once and keeps slots
-full. In open loop, `tools/benchmark_lm_serving.py --rate` sends requests
-over time as a Poisson process at each rate, seeded per slot count.
-It sends six times as many requests as slots to a server that queues
-them. Time to first token (TTFT) starts at request arrival. Token gaps
-measure the time between consecutive tokens for each decoding row.
-
-This run uses Qwen3-0.6B, the same prompts and outputs, and the RTX 4080
-on a quiet host. Dew ran at integration `420ea2c1`, then with bucketed
-admission in the same session as vLLM 0.30.0:
+The table above submits every request at once and keeps the slots full. With
+`--rate`, `tools/benchmark_lm_serving.py` sends six times the slots in
+requests as a Poisson process at each rate (seeded per slot count) to a
+server that queues them. Time to first token (TTFT) runs from a request's
+arrival, and the token gap is each decoding row's time between consecutive
+tokens. I served Qwen3-0.6B with the same prompts and outputs on the RTX
+4080 on a quiet host, with Dew at integration `420ea2c1` and then with
+bucketed admission, in the same session as vLLM 0.30.0:
 
 | slots | rate | Dew `420ea2c1` tok/s, TTFT p50 / p99, gap p99 (ms) | Dew bucketed | vLLM |
 |---:|---:|---|---|---|
@@ -1495,55 +1493,52 @@ admission in the same session as vLLM 0.30.0:
 | 128 | 44 | 5068, 1140 / 1989, 64.2 | 5701, 26.8 / 43.2, 18.6 | 5756, 20.2 / 32.4, 11.7 |
 | 128 | 56 | 5320, 2217 / 4449, 83.5 | 7064, 34.6 / 55.0, 23.4 | 7090, 35.8 / 57.2, 22.4 |
 
-The admission program prefilled every row, padding a lone request to
-eight prompts. Admission steps set the token-gap p99 at 28 to 94 ms.
-They reduced server capacity until the queue grew without bound at
-rates where vLLM kept TTFT p50 under 40 ms.
+The admitting program prefilled every row of its admission, so a request
+arriving alone was padded to eight prompts of prefill. Those admitting steps
+were the p99 token gaps, 28 to 94 ms, and they cut the server's capacity
+until its queue grew without bound at rates where vLLM kept a TTFT p50 under
+40 ms.
 
-Each admission step now pads to the smallest power of two that fits
-its prompts (`dew.inference.serving.admission_share`). Each width has its
-own compiled program. Closed-loop runs are unchanged because an admission
-that fills its width uses the same program. Generations at 32, 64 and
-128 slots are bitwise equal.
+Each admitting step is now padded only to the smallest power of two that
+holds its prompts (`dew.inference.serving.admission_share`), and each width
+is its own compiled program. The closed-loop runs are unchanged, because an
+admission that fills its width is the same program, and the 32-, 64- and
+128-slot generations are bitwise the same.
 
-With buckets, Dew matches vLLM at 32 slots and has shorter TTFT tails.
-At 64 and 128 slots, Dew's token-gap p99 is 1.4 to 2 times vLLM's.
-At 64 slots and 48 requests a second, Dew reaches capacity: a traced
-run was 97% device busy, and TTFT p50 varies from 21 to 447 ms
-between runs. Admission accounts for the gap. Dew prefills an arriving
-prompt in a separate forward alongside decoding, reading the weights twice.
-With one 256-token prompt at 64 slots, admission takes 9.9 ms against
-5.1 ms for a decode step. vLLM's chunked prefill puts prompt tokens in
-the decode forward's batch.
+With buckets Dew is level with vLLM at 32 slots, with shorter TTFT tails. At
+64 and 128 slots its p99 token gaps are 1.4 to 2 times vLLM's. At 64 slots
+and 48 requests a second it runs at its capacity. A traced run had the
+device 97% busy, and that cell's TTFT p50 swings between 21 and 447 ms from
+run to run. The gap is in the admitting step. Dew prefills an arriving
+prompt in a forward of its own next to the decode forward, so the weights
+are read twice; for one 256-token prompt at 64 slots that prefill takes
+9.9 ms against a 5.1 ms decode step. vLLM's chunked prefill puts the
+prompt's tokens into the decode forward's batch.
 
-A narrower prefill changes GEMM shapes, so admitting fewer than the padded
-eight prompts can change the drawn bits. Serving one request at a time
-at 32 slots, 6 of 16 Qwen3-0.6B rows and 8 of 16 Qwen3-1.7B rows
-diverge from the padded path at bf16 near-ties. Teacher-forced in fp32,
-the chosen logits are a median 0.5 bf16 spacings apart, at most 1.81.
-FP32 argmax matches the padded choice in 7 rows and the bucketed choice
-in 7.
+A narrower prefill runs its GEMMs at other shapes, so a request admitted in
+a narrower bucket than the padded eight can draw other bits. Served one at a
+time at 32 slots, 6 of 16 Qwen3-0.6B rows and 8 of 16 Qwen3-1.7B rows part
+from the padded path, each at a bf16 near-tie. Teacher-forced in fp32, the
+two chosen tokens' logits are a median 0.5 bf16 spacings apart and at most
+1.81, and the fp32 argmax is the padded choice in 7 rows and the bucketed
+one in 7. Under tests/reference_error.py's rule, the 1-, 2- and 4-row
+prefills' RMS distance from the same weights in fp32 is 0.96, 0.95 and 0.95
+times the 8-row prefill's on Qwen3-0.6B's log-probabilities (1.00, 1.00 and
+0.99 on the logits), and 1.02, 1.00 (bitwise) and 1.08 on Qwen3-1.7B's
+(1.02, 1.00 and 1.07), against an allowed 2.
 
-Under tests/reference_error.py's rule, the 1-, 2- and 4-row prefills'
-RMS distances from the same weights in fp32 are 0.96, 0.95 and 0.95
-times the 8-row prefill's on Qwen3-0.6B log-probabilities. The logits'
-ratios are 1.00, 1.00 and 0.99. For Qwen3-1.7B, log-probability ratios
-are 1.02, 1.00 (bitwise) and 1.08, and logits ratios are 1.02, 1.00
-and 1.07. The allowed ratio is 2.
-
-The mixed admitting step, 2026-10-04. Admission now runs one forward over
-each slot's last draw and the admitted prompts, arranged in one row
-(`dew.nn.inputs.Admitted`). Projections, norms, MLP and head work token by
-token. They read weights once for decoding rows and prompts together.
-Attention scatters every token's keys into its cache row in one call.
-Decoding queries read their cache rows as in a decode step. Prompts that
-start a row read their own keys.
-
-The decode-only program is unchanged. Its optimized HLO is identical to
-integration's, and device time per run matches (2540.4 against 2540.0 ms
-at 128 slots). This session compared Dew at integration `ab5966b1`
-(bucketed admission), Dew with the mixed step, and vLLM 0.30.0 on a
-quiet host:
+The mixed admitting step, 2026-10-04. An admitting step now runs one forward
+over every token it holds, laid out in one row (`dew.nn.inputs.Admitted`):
+each slot's last draw, then the admitted prompts. Projections, norms, the
+MLP and the head work token by token, so they read their weights once for
+the decoding rows and the prompts together. Attention writes every token's
+keys into its row of the cache in one scatter. Each decoding row's query
+then reads its row as a decode step does, and a prompt that starts its row
+reads its own keys. The decode-only program is untouched; its optimized HLO
+is identical to integration's and its device time per run is the same
+(2540.4 against 2540.0 ms at 128 slots). In one session on a quiet host, I
+compared Dew at integration `ab5966b1` (bucketed admission), Dew with the
+mixed step, and vLLM 0.30.0:
 
 | slots | rate | Dew `ab5966b1` TTFT p50 / p99, gap p99 (ms) | Dew mixed | vLLM |
 |---:|---:|---|---|---|
@@ -1557,45 +1552,41 @@ quiet host:
 | 128 | 44 | 26.3 / 42.3, 17.1 | 23.9 / 39.7, 15.9 | 24.6 / 79.2, 25.1 |
 | 128 | 56 | 34.7 / 55.4, 23.1 | 31.2 / 50.5, 22.5 | 38.4 / 64.6, 23.0 |
 
-All three serve the same tokens a second at every rate, within 0.8%.
-With the mixed step, Dew has the shortest median TTFT in 8 of 9 cells.
-At 64 and 128 slots, its p99 TTFT and token gap are at or below
-vLLM's from 36 requests a second up. At 32 slots, vLLM's token-gap p99
-is shorter by 0.4 to 2.8 ms. vLLM also has shorter TTFT p99 at the
-two lower rates. The 64-slot cell at 48 requests a second saturated
-in the earlier session but not here; this rate is near server capacity.
+The three serve the same tokens a second at every rate, within 0.8%. With
+the mixed step Dew's median TTFT is the shortest of the three in 8 of 9
+cells, and at 64 and 128 slots its p99 TTFT and token gap are at or below
+vLLM's from 36 requests a second up. At 32 slots vLLM keeps the shorter
+token-gap tails, by 0.4 to 2.8 ms at p99, and the shorter TTFT p99 at the
+two lower rates. The 64-slot cell at 48 requests a second, which saturated
+in the earlier session, did not saturate here; that rate is near the
+server's capacity. In closed loop, over three repeats in two alternating
+rounds, 32 slots went from 5929 to 5994 tokens a second, 64 slots from 7673
+to 7766, and 128 slots from 9039 to 9033-9072. Traced at 128 slots, the
+admitting program took 1068 against 1078 ms a run, with GEMMs at 671 against
+676 and attention at 253 against 252.
 
-In closed loop, three repeats in two alternating rounds gave 5929 to
-5994 tokens a second at 32 slots, 7673 to 7766 at 64, and 9039 to
-9033-9072 at 128. Traced at 128 slots, the admission program took 1068
-against 1078 ms per run: GEMMs 671 against 676, attention 253 against
-252.
+The mixed step is not bitwise the same as the two forwards, because its
+GEMMs run at other shapes. Against the same bf16 weights computed in fp32 at
+the highest precision, over 28 decoding rows and four admitted prompts of 64
+to 256 tokens, its RMS distance is 0.84 times the two forwards' on
+Qwen3-0.6B's decoding logits and 0.97 on its prompt logits
+(log-probabilities 0.83 and 0.95), and 1.09 and 0.99 on Qwen3-1.7B's (1.14
+and 0.98), against tests/reference_error.py's allowed 2. At 32 slots 27 of
+64 greedy rows part from integration's, all at bf16 near-ties (a median 0.57
+bf16 spacings apart in fp32, at most 1.44). The fp32 argmax is the
+two-forward choice in 16 rows and the mixed one in 11.
 
-The mixed step changes GEMM shapes, so it is not bitwise equal to two
-separate forwards. Reference checks compute the same bf16 weights in fp32
-at the highest precision, over 28 decoding rows and four admitted prompts
-of 64 to 256 tokens. RMS distance is 0.84 times the two forwards' for
-Qwen3-0.6B decoding logits and 0.97 for prompt logits. Log-probability
-ratios are 0.83 and 0.95. On Qwen3-1.7B, the logits ratios are 1.09
-and 0.99, and log-probability ratios are 1.14 and 0.98. The allowed
-ratio in tests/reference_error.py is 2.
-
-At 32 slots, 27 of 64 greedy rows diverge from integration's, all at
-bf16 near-ties. In fp32, the chosen logits are a median 0.57 bf16
-spacings apart, at most 1.44. FP32 argmax matches the two-forward choice
-in 16 rows and the mixed choice in 11.
-
-Over a paged cache, 2026-10-04. The mixed step also runs over a page
-pool. It installs admitted rows' tables before writing each token to
-its row's page. Decoding rows read the pool through cuDNN's paged kernel,
-as in a decode step. A chunked prompt or shared prefix reads the row's
-earlier keys from the pool. Without either, each piece reads only its
-own keys. Dense caches support chunked prefill the same way (`chunk`);
-only the mixed step serves it.
-
-Paged decode-only programs are identical to integration's. Two alternating
-rounds ran in one session at integration `ab60614a`. The table gives the
-second round; the first ran under another lane's load:
+Over a paged cache, 2026-10-04. The mixed step now runs over a page pool
+too. The admitted rows' tables go into the cache before the step writes,
+each token is written to its row's page, and the decoding rows read the pool
+through cuDNN's paged kernel as a decode step does. Pieces that continue a
+row (a chunked prompt, a shared prefix's pages) read the row's earlier keys
+from the pool; on a server with neither, each piece reads only its own keys.
+A dense cache takes chunked prefill the same way (`chunk`), and only the
+mixed step serves it. The paged decode-only programs are identical to
+integration's. I ran two alternating rounds in one session at integration
+`ab60614a`; the table is the second round, because the first ran under
+another lane's load:
 
 | slots | rate | paged, two forwards: TTFT p50 / p99, gap p99 (ms) | paged, mixed |
 |---:|---:|---|---|
@@ -1606,23 +1597,24 @@ second round; the first ran under another lane's load:
 | 128 | 44 | 42.9 / 63.7, 26.3 | 41.0 / 61.0, 25.7 |
 | 128 | 56 | 50.6 / 231.3, 26.3 | 44.8 / 161.7, 25.8 |
 
-In closed loop, the mixed step increased throughput from 5576-5577 to
-5583-5656 tokens a second at 32 slots and from 8254-8274 to 8330-8334
-at 128. A traced 32-slot run at 24 requests a second measured one-row
-admission at 8.30 against 9.22 ms. Paged decoding is slower than dense:
-at 128 slots and 32 requests a second, token-gap p50 is 11.7 ms paged
-against 5.4 dense. Use a dense cache for speed when it fits in memory.
-Served tokens diverge from the two forwards in the same 27 of 64 rows
-at 32 slots as with a dense cache, all at bf16 near-ties.
+In closed loop the mixed step went from 5576-5577 to 5583-5656 tokens a
+second at 32 slots and from 8254-8274 to 8330-8334 at 128. A traced 32-slot
+run at 24 requests a second put a one-row admitting step at 8.30 against
+9.22 ms. The paged decode step itself is slower than the dense one (at 128
+slots and 32 requests a second, a token gap's p50 is 11.7 ms paged against
+5.4 dense), so a dense cache stays the faster way to serve where the memory
+fits. The served tokens part from the two forwards' in the same 27 of 64
+rows at 32 slots as with the dense cache, all at bf16 near-ties.
 
-Under `--xla_gpu_deterministic_ops`, the CUDA test lane's flag, a paged write
-put a dropped token's keys in another head's kept slot (jax 0.11.2,
-RTX 4080). The write scatters into page and offset axes past an unindexed
-head axis. The expander padded out-of-range rows with 0 on that unindexed
-axis, so a window offset collided with a kept index. openxla/xla#49498
-fixes this (issue #49380), after the jax pin. Mapping over a group of
-one makes the scatter correct, as in the paged cache's other write.
-`KVStore.write_tokens` uses that form.
+Under `--xla_gpu_deterministic_ops` (the CUDA test lane's flag), the paged
+write put a dropped token's keys at another head's kept slot (jax 0.11.2, an
+RTX 4080). The write is a scatter into the pool's page and offset axes past
+an unindexed head axis. The scatter expander padded the out-of-range rows
+with 0 on the unindexed axis, so a window offset along that axis collided
+with a kept index. openxla/xla#49498 fixes it (issue #49380), in an XLA
+later than Dew's jax pin. Mapped over a group of one, as the paged cache's
+other write already is, the scatter is right, so `KVStore.write_tokens`
+writes that way.
 
 Open: latent attention (MLA, DSA), sliding windows, sinks, quantized or
 rotated caches, a pool split into groups, hybrids whose recurrent layers
