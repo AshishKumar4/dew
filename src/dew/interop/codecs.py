@@ -205,6 +205,9 @@ class SourceQuantization:
     `grid(name)` names the partners an integer format encodes against rather
     than recomputes (AWQ's and GPTQ's scales and zeros): the loader keeps
     them, and `source_quantization(..., grid=)` hands them back to `encode`.
+    ModelOpt also retains original packed words there: its author reader
+    maps code 8 to +0, so only those words preserve the source's signed-zero
+    code for a byte-exact untrained export.
     """
 
     names: Callable[[Mapping[str, np.ndarray]], tuple[str, ...]]
@@ -214,6 +217,8 @@ class SourceQuantization:
     scale_dtype: Callable[[Mapping[str, np.ndarray]], str | None] = lambda tensors: None
     grid: Callable[[str], tuple[str, ...]] = lambda name: ()
     input_scale_dtype: Literal['unrounded', 'float8_e4m3fn'] | None = None
+    input_format: Literal['compressed-tensors', 'modelopt'] = 'compressed-tensors'
+    input_suffix: Literal['.input_global_scale', '.input_scale'] = '.input_global_scale'
 
     def tensor_names(self, tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
         """The names left once every quantized weight is decoded."""
@@ -1276,6 +1281,109 @@ def compressed_tensors(quantization: Mapping[str, object],
         input_scale_dtype=scheme.input_scale_dtype)
 
 
+MODELOPT_PARTS = ('.weight_scale', '.weight_scale_2', '.input_scale')
+"""ModelOpt's E4M3 block scales, fp32 global weight multiplier and fp32 input multiplier."""
+
+
+def _modelopt_names(tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
+    stems = sorted({name.removesuffix(suffix) for name in tensors
+                    for suffix in MODELOPT_PARTS if name.endswith(suffix)})
+    for stem in stems:
+        parts = ('.weight', *MODELOPT_PARTS)
+        missing = [stem + part for part in parts if stem + part not in tensors]
+        if missing:
+            raise ValueError(f"{stem}.weight is ModelOpt NVFP4 and the checkpoint holds no {missing}")
+        if stem == 'lm_head':
+            raise ValueError("ModelOpt lm_head input quantization is not computed by the chunked loss head")
+        if any(stem + part in tensors for part in ('.pre_quant_scale', '.input_pre_quant_scale')):
+            raise ValueError(f"{stem} has ModelOpt pre_quant_scale, "
+                             "which this input provider does not compute")
+    return tuple(stem + '.weight' for stem in stems)
+
+
+def _modelopt_parts(name: str) -> tuple[str, ...]:
+    return tuple(name.removesuffix('.weight') + suffix for suffix in MODELOPT_PARTS)
+
+
+def _modelopt_decode(tensors: Mapping[str, np.ndarray], name: str) -> np.ndarray:
+    """ModelOpt 0.47.0's NVFP4QTensor.dequantize: block scale times global, then codes, then bf16."""
+    packed = np.asarray(tensors[name])
+    scale, overall, inputs = (np.asarray(tensors[part]) for part in _modelopt_parts(name))
+    if (packed.dtype != np.uint8 or packed.ndim != 2 or packed.shape[1] % 8
+            or scale.dtype != np.dtype(E4M3) or scale.shape != (packed.shape[0], packed.shape[1] // 8)
+            or overall.dtype != np.float32 or overall.size != 1
+            or inputs.dtype != np.float32 or inputs.size != 1):
+        raise ValueError(f"{name} must be ModelOpt U8 E2M1 pairs with one E4M3 scale per 16 inputs "
+                         "and scalar float32 weight_scale_2/input_scale")
+    if (not np.isfinite(scale.astype(np.float32)).all()
+            or not np.isfinite(overall).all() or (overall < 0).any()):
+        raise ValueError(f"{name} ModelOpt scales must be finite and nonnegative")
+    values = _E2M1_BYTES[packed].reshape(packed.shape[0], -1, 16)
+    # The author's Python reader maps code 8 to +0; packed bytes remain in
+    # the export grid so an untrained save can still keep that source code.
+    values = np.where(values == 0, np.float32(0), values)
+    effective = scale.astype(np.float32) * overall.reshape(())
+    return (values * effective[..., None]).reshape(packed.shape[0], -1).astype(
+        ml_dtypes.bfloat16).astype(np.float32)
+
+
+def _modelopt_encode(name: str, weight: np.ndarray, *, grid: Mapping[str, np.ndarray] | None
+                     ) -> dict[str, np.ndarray]:
+    parts = _modelopt_parts(name)
+    scale, overall, inputs, original = _gridded(grid, name, (*parts, name))
+    effective = np.repeat(scale.astype(np.float32) * overall.reshape(()), 16, axis=-1)
+    if np.any((effective == 0) & (weight != 0)):
+        raise ValueError(f"{name} has a zero ModelOpt weight scale and trained values outside its grid")
+    quotients = np.divide(weight.astype(np.float32), effective, out=np.zeros_like(effective),
+                          where=effective != 0)
+    packed = encode_e2m1(np.clip(quotients, -6, 6), ties='even')
+    low_zero = ((original & 15) == 8) & (weight[:, 0::2] == 0)
+    high_zero = ((original >> 4) == 8) & (weight[:, 1::2] == 0)
+    packed = np.where(low_zero, (packed & 0xf0) | 8, packed)
+    packed = np.where(high_zero, (packed & 0x0f) | 0x80, packed).astype(np.uint8)
+    return {name: packed, **dict(zip(parts, (scale, overall, inputs), strict=True))}
+
+
+def modelopt_nvfp4(config: Mapping[str, object], quantization: Mapping[str, object],
+                   grid: Mapping[str, np.ndarray] | None) -> SourceQuantization:
+    """Dense ModelOpt NVFP4 W4A4, held to the author's exporter and own sm89 fake quantizer.
+
+    Mixed FP8/NVFP4 and per-expert input scales need other input rules and
+    remain refused. Each accepted source Linear owns its input multiplier;
+    the checkpoint Qwix provider reads it after the weight codec binds it.
+    """
+    if quantization.get('quant_algo') != 'NVFP4':
+        raise ValueError(f"quant_method 'modelopt' quant_algo {quantization.get('quant_algo')!r} needs "
+                         "other input activations; this loader reads dense NVFP4 W4A4")
+    if quantization.get('kv_cache_quant_algo') is not None or quantization.get('kv_cache_scheme') is not None:
+        raise ValueError("ModelOpt KV cache quantization is not computed by this loader")
+    text = config.get('text_config')
+    architecture = text if isinstance(text, Mapping) else config
+    for key in ('num_experts', 'num_local_experts', 'n_routed_experts', 'num_routed_experts'):
+        experts = architecture.get(key)
+        if isinstance(experts, int) and experts > 1:
+            raise ValueError("ModelOpt per-expert input activations need a provider "
+                             "this loader does not compute")
+    groups = records.record(quantization.get('config_groups'), 'ModelOpt config_groups')
+    expected = {'num_bits': 4, 'type': 'float', 'group_size': 16, 'dynamic': False}
+    if not groups:
+        raise ValueError("ModelOpt config_groups must declare the NVFP4 W4A4 scheme")
+    for name, group in groups.items():
+        group = records.record(group, f'ModelOpt config_groups.{name}')
+        for side in ('weights', 'input_activations'):
+            args = records.record(group.get(side), f'ModelOpt {name}.{side}')
+            if (any(args.get(key) != value for key, value in expected.items())
+                    or args.get('symmetric', True) is not True):
+                raise ValueError(f"ModelOpt {name}.{side} must declare "
+                                 "static-global 4-bit float groups of 16")
+        if group.get('output_activations') is not None:
+            raise ValueError(f"ModelOpt {name}.output_activations is not computed by this input provider")
+    return SourceQuantization(
+        _modelopt_names, _modelopt_parts, _modelopt_decode, partial(_modelopt_encode, grid=grid),
+        grid=lambda name: (*_modelopt_parts(name), name), input_scale_dtype='float8_e4m3fn',
+        input_format='modelopt', input_suffix='.input_scale')
+
+
 # --------------------------------------------------------------------------
 # Dispatch from quantization_config
 # --------------------------------------------------------------------------
@@ -1359,11 +1467,7 @@ def source_quantization(config: Mapping[str, object], *, scale_dtype: str | None
         return gptq(_integer_bits(quantization, method),
                     v1=quantization.get("checkpoint_format", "gptq") == "gptq", grid=grid)
     if method == "modelopt":
-        raise ValueError(
-            "quantization_config names quant_method 'modelopt' with quant_algo "
-            f"{quantization.get('quant_algo')!r}; ModelOpt NVFP4/FP8 quantizes input activations, "
-            "which this weight-only loader does not compute; transformers 5.16.1 has no ModelOpt "
-            "checkpoint reader, so its unquantized load is not a parity reference")
+        return modelopt_nvfp4(config, quantization, grid)
     raise ValueError(
         f"quantization_config names quant_method {method!r}; this loader reads DeepSeek's "
         f"fp8 blocks and V4 `.scale` storage, GPT OSS's mxfp4, compressed-tensors' "

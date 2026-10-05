@@ -188,14 +188,18 @@ def _qwix(module: str = "qwix") -> ModuleType:
 
 @dataclasses.dataclass(frozen=True)
 class NVFP4Input:
-    """One checkpoint Linear's static inverse global scale and local-scale rounding."""
+    """One checkpoint Linear's stored global scale and published local-scale arithmetic."""
 
     global_scale: float
     e4m3_scale: bool
+    format: Literal['compressed-tensors', 'modelopt'] = 'compressed-tensors'
 
     def __post_init__(self) -> None:
-        if not math.isfinite(self.global_scale) or self.global_scale <= 0:
+        if (not math.isfinite(self.global_scale) or self.global_scale < 0
+                or (self.global_scale == 0 and self.format == 'compressed-tensors')):
             raise ValueError(f"NVFP4 input_global_scale must be positive and finite, got {self.global_scale}")
+        if self.format == 'modelopt' and not self.e4m3_scale:
+            raise ValueError("ModelOpt NVFP4 always rounds its local scales to E4M3")
 
 
 def _nvfp4_divide(numerator: jax.Array, denominator: jax.Array) -> jax.Array:
@@ -269,6 +273,8 @@ def nvfp4_input_qdq(x: jax.Array, spec: NVFP4Input) -> jax.Array:
         raise ValueError(f"NVFP4 input width must be divisible by 16, got {x.shape}")
     values = jax.lax.stop_gradient(x)
     groups = values.reshape(*x.shape[:-1], -1, 16)
+    if spec.format == 'modelopt':
+        return _modelopt_input_qdq(x, spec, qarray)
     largest = jnp.max(jnp.abs(groups), -1)
     divisor = jnp.full(largest.shape, 6, jnp.float32)
     # CT's local division must round before global scaling, including its bf16 cast.
@@ -289,6 +295,39 @@ def nvfp4_input_qdq(x: jax.Array, spec: NVFP4Input) -> jax.Array:
     # CT adds its symmetric zero point before casting, so exact -0 is +0.
     rounded = jnp.where(values == 0, jnp.zeros_like(rounded), rounded)
     return straight_through(x, rounded)
+
+
+def _modelopt_input_qdq(x: jax.Array, spec: NVFP4Input, qarray: ModuleType) -> jax.Array:
+    """ModelOpt's direct-RN E4M3 scale rule, with Qwix's E2M1 representation.
+
+    fp4_kernel_hopper.py:76-99 widens before amax, rounds amax/(6*g) to
+    E4M3, multiplies by stored g, and replaces an effective scale below
+    1e-5 by 1. NVFP4QTensor's torch scale cast and TensorRT-LLM's
+    quantization.cuh:501 use direct RN E4M3. The reference corrects the
+    sm89 Triton backend's fp16 truncation before that cast and attributes
+    its differences against the uncorrected kernel separately.
+    Its div.full.f32 implements a reciprocal multiply: an input
+    0.044189453125 over 0.0589192733168602 becomes 0.75, which rounds to
+    1, while IEEE divide gives 0.74999994 and rounds to 0.5. The compiled
+    negative-zero FMA yields +0 for a zero code. The 32 pinned real q_proj
+    rows and the author's exporter fixture hold this order bit for bit.
+    """
+    from dew.nn.fake_quant import straight_through
+
+    values = jax.lax.stop_gradient(x).astype(jnp.float32)
+    groups = values.reshape(*x.shape[:-1], -1, 16)
+    largest = jnp.max(jnp.abs(groups), -1)
+    global_scale = jnp.float32(spec.global_scale if spec.global_scale > 0 else 1e-12)
+    denominator = jnp.full(largest.shape, 6, jnp.float32) * global_scale
+    normalized = largest * _nvfp4_divide(jnp.ones_like(largest), denominator)
+    saturated = jnp.minimum(normalized, 448)
+    scales = saturated.astype(jnp.float8_e4m3fn).astype(jnp.float32) * global_scale
+    scales = jnp.where(scales >= 1e-5, scales, 1)
+    spread = jnp.broadcast_to(scales[..., None], groups.shape).reshape(x.shape)
+    quotients = values * _nvfp4_divide(jnp.ones_like(values), spread)
+    quantized = qarray.quantize_with_scale_zero_point(quotients, 'nvfp4', jnp.ones_like(spread), None)
+    rounded = qarray.dequantize(quantized.replace(scale=spread))
+    return straight_through(x, jnp.where(rounded == 0, jnp.zeros_like(rounded), rounded))
 
 
 def checkpoint_input_quantization(model: nn.Module, inputs: Mapping[str, NVFP4Input]) -> nn.Module:
