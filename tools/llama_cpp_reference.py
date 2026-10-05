@@ -9,9 +9,11 @@ an F32 KV cache, flash attention off, on one thread. transformers runs the
 export in float64 (`diffusers_wan_reference.float64`) for the truth both
 are measured from.
 
-The decoder is a tiny Llama from the registry, its initialization moved by
-a seeded draw (a stand-in for training that every machine reproduces bit
-for bit), exported by `PretrainedDecoder.from_model(...).save` with the
+The decoder is a tiny Llama from the registry with weights on a grid of
+2^-8 drawn from numpy's PCG64 integers (`weights`): fixed values every
+machine reproduces bit for bit, where a draw through jax.random's
+transcendentals rounds by the CPU's instruction set. It is exported by
+`PretrainedDecoder.from_model(...).save` with the
 committed tokenizer in tests/fixtures/llama_cpp/tokenizer: a Llama-style
 byte-fallback BPE, which the converter reads without a pre-tokenizer hash
 (gguf-py's LlamaHfVocab); a byte-level BPE such as the other committed
@@ -176,14 +178,27 @@ def export(directory: Path):
 
     model = models.build("causal_transformer", **with_precision(
         "causal_transformer", FIELDS, dtype="float32", attention_impl="xla"))
-    variables = model.init(jax.random.key(SEED), jnp.zeros((1, 8), jnp.int32))
-    # Every parameter moved, the norms' unit scales too.
-    leaves, tree = jax.tree.flatten(variables)
-    keys = jax.random.split(jax.random.key(SEED + 1), len(leaves))
-    variables = jax.tree.unflatten(tree, [leaf + 0.05 * jax.random.normal(key, leaf.shape, leaf.dtype)
-                                          for leaf, key in zip(leaves, keys, strict=True)])
+    variables = weights(jax.eval_shape(model.init, jax.random.key(SEED), jnp.zeros((1, 8), jnp.int32)))
     PretrainedDecoder.from_model(model, variables, tokenizer=HFTokenizer(str(TOKENIZER))).save(str(directory))
     return model, variables
+
+
+def weights(shapes):
+    """Every leaf of `shapes` on a grid of 2^-8, exact in float32: a norm's
+    scale 1 + k / 256 for k in [-16, 16], every other leaf k / 256 for k in
+    [-24, 24] (a uniform spread of 0.055, about a Linear's initialization
+    at width 64), drawn in order from PCG64 integers seeded with SEED."""
+    import jax
+    import jax.numpy as jnp
+
+    rng = np.random.default_rng(SEED)
+
+    def draw(path, shape):
+        scale = jax.tree_util.keystr(path).endswith("['scale']")
+        steps = rng.integers(-16, 17, shape.shape) if scale else rng.integers(-24, 25, shape.shape)
+        return jnp.asarray((256 * scale + steps) / 256, shape.dtype)
+
+    return jax.tree_util.tree_map_with_path(draw, shapes)
 
 
 def digests(directory: Path) -> dict[str, str]:
