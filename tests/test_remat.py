@@ -376,6 +376,75 @@ def test_a_step_that_does_not_fit_compiles_again_one_rung_up(monkeypatch, option
     assert trainer.objective.model.remat == REMAT_POLICIES['minimal']
 
 
+def recording_runs(monkeypatch, fits):
+    """A decoder trainer factory whose fit check answers by rung: `fits` maps
+    a rung (whether the head is tiled, the remat's record) to whether it
+    fits, and every rung it does not name fits. Returns the factory and the
+    rungs each trainer compiled."""
+    import optax
+
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.lm import LMObjective
+    from dew.training import Trainer, trainer as trainer_module
+
+    compiled, current = [], []
+
+    def headroom(executable, devices, held=0):
+        trainer = current[-1]
+        rung = (trainer.objective.head_tile is not None,
+                trainer_module.remat_record(trainer.objective.model.remat))
+        compiled.append(rung)
+        return 0 if fits.get(rung, True) else -1
+
+    monkeypatch.setattr(trainer_module, 'step_headroom', headroom)
+    monkeypatch.setattr(trainer_module, 'step_compiler_options', lambda objective, rows, frozen: None)
+
+    def run():
+        model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=1,
+                                  mlp_features=16, max_seq_len=8)
+        current.append(Trainer(LMObjective(model, seq_len=4), optax.sgd(1e-3), key=jax.random.key(0)))
+        state, _, _ = current[-1].place()
+        current[-1].compile(state, {'text': jnp.zeros((8, 5), jnp.int32)})
+        return current[-1]
+
+    return run, compiled
+
+
+def test_a_later_run_of_a_step_starts_at_the_rung_an_earlier_run_chose(monkeypatch):
+    """Identical runs of a step can read different free memory. On an RTX
+    4080 the 99M MoE at 8 x 1024 tiled its head in the process that compiled
+    the step, whose growing pool kept its autotuner's scratch, and kept the
+    whole logits in one that loaded it from the compilation cache (98.2
+    against 78.4 ms a step). The first run's rung is recorded beside the
+    compilation cache, for the program and the devices, and a later run
+    starts there, as a resumed run starts at its checkpoint's rung."""
+    fits = {(False, None): False}
+    run, compiled = recording_runs(monkeypatch, fits)
+    assert run().objective.head_tile is not None
+    assert compiled == [(False, None), (True, None)]
+    fits.clear()  # the next process finds room for the whole logits
+    compiled.clear()
+    assert run().objective.head_tile is not None
+    assert compiled == [(True, None)]
+
+
+def test_a_rung_record_for_another_step_is_refused_by_its_path(monkeypatch):
+    """A record holds its key, and one whose key is not the run's is refused
+    by its path rather than followed: deleting it lets the run decide again."""
+    import json
+
+    from dew.training import rungs
+
+    run, _ = recording_runs(monkeypatch, {})
+    run()
+    [path] = list(rungs.rung_records().glob("*.json"))
+    written = json.loads(path.read_text())
+    written["key"]["program"] = "0" * 64
+    path.write_text(json.dumps(written))
+    with pytest.raises(ValueError, match=f"rung record {path}"):
+        run()
+
+
 def refusing_trainer(monkeypatch, refused, error="RESOURCE_EXHAUSTED: Ran out of memory on HBM, the total "
                      "memory required for HLO temporaries (38.47G) exceeds available HBM (31.24G)."):
     """A decoder trainer whose compiles XLA refuses with `error` at every rung

@@ -178,7 +178,9 @@ def mxfp4(weight: torch.Tensor):
     return packed["weight_packed"].contiguous(), packed["weight_scale"].contiguous(), decoded
 
 
-def main() -> None:
+def released_modules():
+    """The pinned configuration, modeling and linear modules, with fla's
+    intra-chunk solve held to IEEE fp32."""
     if os.environ.get("TRITON_F32_DEFAULT") != "ieee":
         raise SystemExit("run with TRITON_F32_DEFAULT=ieee so fla's kernels keep fp32")
     os.environ["TRITON_CACHE_DIR"] = str(CACHE / "triton-ieee")
@@ -189,6 +191,25 @@ def main() -> None:
     from triton.language import constexpr
 
     chunk_intra.SOLVE_TRIL_DOT_PRECISION = constexpr("ieee")
+    return configuration, modeling, linear
+
+
+def load_weights(model: torch.nn.Module, tensors: dict[str, torch.Tensor]) -> None:
+    """Copy stored tensors into `model`: MXFP4 experts decoded, A_log cut to its heads."""
+    with torch.no_grad():
+        for name, parameter in model.named_parameters():
+            if ".block_sparse_moe.experts." in name:
+                stem = name.removesuffix(".weight")
+                source = mxfp4_decode(tensors[stem + ".weight_packed"], tensors[stem + ".weight_scale"])
+            elif name.endswith("A_log"):
+                source = tensors[name].reshape(-1)[:parameter.numel()].reshape(parameter.shape)
+            else:
+                source = tensors[name]
+            parameter.copy_(source.to(parameter))
+
+
+def main() -> None:
+    configuration, modeling, linear = released_modules()
     config = tiny_config()
     DESTINATION.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(3180)
@@ -250,6 +271,42 @@ def main() -> None:
     print("wrote", DESTINATION, "tensors", len(tensors))
 
 
+def orders(drawn: Path) -> None:
+    """The reference's own rounding draws: the SGD step over each residual
+    order tools/rounding_orders.py wrote under `drawn` (in MXFP4's groups of
+    32), its updated logits' RMS distance from float64 written to
+    DESTINATION/orders.npz beside the orders (tests/reference_error.py's
+    K-order rule). Order 0 must reproduce the fixture's run bit for bit."""
+    from safetensors.torch import load_file
+
+    configuration, modeling, linear = released_modules()
+    config = json.loads((DESTINATION / "config.json").read_text())
+    model = modeling.KimiK3ForConditionalGeneration(
+        configuration.KimiK3Config(**copy.deepcopy(config))).float()
+    model.language_model.config._attn_implementation = "eager"
+    model = model.cuda().eval()
+    moe = linear.KimiSparseMoeBlock
+    moe.moe_infer = moe.moe_infer.__wrapped__
+    ids, mask = fixture_batch()
+    input_ids, attention_mask = torch.tensor(ids, device="cuda"), torch.tensor(mask, device="cuda")
+    valid = mask.astype(bool)
+    with np.load(DESTINATION / "numerics.npz") as exact, np.load(DESTINATION / "reference.npz") as stored:
+        truth, recorded = exact["updated_logits_f64"][valid], stored["updated_logits"]
+    drawn_orders = np.load(drawn / "orders.npy")
+    distances = []
+    for k in range(len(drawn_orders)):
+        load_weights(model, load_file(str(drawn / str(k) / "model.safetensors")))
+        _, _, updated = sgd_step(model, input_ids, attention_mask,
+                                 lambda name: name.startswith("language_model."))
+        updated = updated.cpu().numpy()
+        if k == 0:
+            assert np.array_equal(updated, recorded), "order 0 must reproduce the fixture's run"
+        distances.append(np.sqrt(np.mean(np.square(updated[valid].astype(np.float64) - truth))))
+    np.savez(DESTINATION / "orders.npz", orders=drawn_orders.astype(np.min_scalar_type(drawn_orders.max())),
+             updated_logits=np.asarray(distances))
+    print("orders", len(distances), "distances", np.round(np.asarray(distances) / distances[0], 2))
+
+
 def mxfp4_decode(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """compressed-tensors' decompression of one packed pair."""
     from compressed_tensors.compressors.mxfp4.base import MXFP4PackedCompressor
@@ -262,4 +319,9 @@ def mxfp4_decode(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+
+    if sys.argv[1:2] == ["orders"]:
+        orders(Path(sys.argv[2]))
+    else:
+        main()

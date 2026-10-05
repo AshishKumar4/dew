@@ -127,9 +127,11 @@ against 99%, an sCM student 11% against 98.6%."""
 @trainings("mean_flow")
 @dataclasses.dataclass(frozen=True)
 class MeanFlowTraining(Training):
-    """Train the model with MeanFlow's loss (`MeanFlowObjective`, which
-    documents the fields) under the `MeanFlow` preset; one step samples it,
-    unguided, since the guidance is trained in."""
+    """MeanFlow training under the `MeanFlow` preset, where one step samples the model.
+
+    `MeanFlowObjective` documents the fields. Sampling is unguided, because the
+    guidance is trained in.
+    """
 
     preset_class = MeanFlow
     guided = False
@@ -156,8 +158,10 @@ class MeanFlowTraining(Training):
 @trainings("shortcut")
 @dataclasses.dataclass(frozen=True)
 class ShortcutTraining(Training):
-    """Train a shortcut model (`ShortcutObjective`, which documents the
-    fields) under the `Shortcut` preset; it samples unguided."""
+    """Shortcut-model training under the `Shortcut` preset.
+
+    `ShortcutObjective` documents the fields. Sampling is unguided.
+    """
 
     preset_class = Shortcut
     guided = False

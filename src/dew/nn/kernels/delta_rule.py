@@ -39,37 +39,53 @@ def fits(state: jax.Array) -> bool:
             and dv % BLOCK == 0 and (dv // BLOCK) & (dv // BLOCK - 1) == 0)
 
 
-def _kernel(state_ref, query_ref, key_ref, value_ref, decay_ref, beta_ref, state_out, out_ref):
-    state = state_ref[...]                                   # [Dk, BLOCK]
-    query, key, decay = query_ref[...], key_ref[...], decay_ref[...]   # [Dk]
-    read_key = jnp.sum((key * decay)[:, None] * state, axis=0)          # [BLOCK]
-    read_query = jnp.sum((query * decay)[:, None] * state, axis=0)
-    delta = (value_ref[...] - read_key) * beta_ref[...]
-    out_ref[...] = read_query + jnp.sum(query * key) * delta
-    state_out[...] = state * decay[:, None] + key[:, None] * delta[None, :]
+def _kernel(active_ref, state_ref, query_ref, key_ref, value_ref, decay_ref, beta_ref, state_out, out_ref):
+    active = active_ref[0] != 0
+
+    @pl.when(active)
+    def _():
+        state = state_ref[...]                                   # [Dk, BLOCK]
+        query, key, decay = query_ref[...], key_ref[...], decay_ref[...]   # [Dk]
+        read_key = jnp.sum((key * decay)[:, None] * state, axis=0)          # [BLOCK]
+        read_query = jnp.sum((query * decay)[:, None] * state, axis=0)
+        delta = (value_ref[...] - read_key) * beta_ref[...]
+        out_ref[...] = read_query + jnp.sum(query * key) * delta
+        state_out[...] = state * decay[:, None] + key[:, None] * delta[None, :]
+
+    # An idle row's state is neither read nor written: the output aliases it.
+    @pl.when(jnp.logical_not(active))
+    def _():
+        out_ref[...] = jnp.zeros(out_ref.shape, out_ref.dtype)
 
 
-def step(state, query, key, value, decay, beta):
+def step(state, query, key, value, decay, beta, active=None):
     """`(state', out)` for one token: `state` `[rows, heads, Dk, Dv]` fp32,
     `query` (already scaled), `key` and `decay` (`exp(g)`, per key dimension)
     `[rows, heads, Dk]`, `value` `[rows, heads, Dv]`, `beta` `[rows, heads]`,
-    all fp32. The state is updated in place where the caller lets it go."""
+    all fp32. The state is updated in place where the caller lets it go.
+
+    A row `active` `[rows]` marks False draws nothing: its state stays as
+    it was without being read, and its output is zeros. A serving step
+    holds every slot, drawing or not, and the state is most of a decode
+    step's bytes."""
     from jax.experimental.pallas import triton as plgpu
 
     rows, heads, dk, dv = state.shape
     flat = rows * heads
+    flagged = pl.BlockSpec((None, 1), lambda i, j: (i, 0))
     keyed = pl.BlockSpec((None, dk), lambda i, j: (i, 0))
     valued = pl.BlockSpec((None, BLOCK), lambda i, j: (i, j))
     held = pl.BlockSpec((None, dk, BLOCK), lambda i, j: (i, 0, j))
     updated, out = pl.pallas_call(
         _kernel, grid=(flat, dv // BLOCK),
-        in_specs=[held, keyed, keyed, valued, keyed, valued],
+        in_specs=[flagged, held, keyed, keyed, valued, keyed, valued],
         out_specs=[held, valued],
         out_shape=[jax.ShapeDtypeStruct((flat, dk, dv), state.dtype),
                    jax.ShapeDtypeStruct((flat, dv), state.dtype)],
-        input_output_aliases={0: 0},
+        input_output_aliases={1: 0},
         compiler_params=plgpu.CompilerParams(num_warps=WARPS),
-    )(state.reshape(flat, dk, dv), query.reshape(flat, dk), key.reshape(flat, dk),
+    )(jnp.repeat(jnp.ones(rows, jnp.int32) if active is None else active.astype(jnp.int32), heads)[:, None],
+      state.reshape(flat, dk, dv), query.reshape(flat, dk), key.reshape(flat, dk),
       value.reshape(flat, dv), decay.reshape(flat, dk),
       jnp.broadcast_to(beta.reshape(flat, 1), (flat, dv)))
     return updated.reshape(state.shape), out.reshape(rows, heads, dv)

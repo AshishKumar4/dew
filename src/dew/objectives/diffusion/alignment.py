@@ -169,15 +169,16 @@ __all__ = ["ALIGNMENT", "REPRESENTATION", "Alignment", "Projector", "spatial_zsc
 
 @dataclasses.dataclass(frozen=True)
 class RepresentationAlignment:
-    """Align the model's hidden tokens with a frozen DINOv2's patch features,
-    REPA (Yu et al. 2025) or iREPA (Singh et al. 2026), and optionally tune
-    the autoencoder end to end through it, REPA-E (Leng et al. 2025).
+    """Alignment of the model's hidden tokens with a frozen DINOv2's patch features.
 
-    `encoder` is a transformers `Dinov2Model` checkpoint, `repo`,
-    `repo@revision` or a directory, REPA's DINOv2-B/14 by default, read at
-    `resolution` pixels; a run's record pins it to a commit. `layer` names the model's
-    submodule whose output is aligned: REPA aligns after the eighth block,
-    `dit_block_7` on `simple_dit`. The other fields are `Alignment`'s, and
+    This is REPA (Yu et al. 2025) or iREPA (Singh et al. 2026), optionally with the
+    autoencoder tuned end to end through it, as in REPA-E (Leng et al. 2025).
+
+    `encoder` is a transformers `Dinov2Model` checkpoint given as `repo`,
+    `repo@revision` or a directory, by default REPA's DINOv2-B/14, read at
+    `resolution` pixels; a run's record pins it to a commit. `layer` names the
+    model's submodule whose output is aligned: REPA aligns after the eighth block,
+    which is `dit_block_7` on `simple_dit`. The other fields are `Alignment`'s, and
     `end_to_end` is REPA-E's `EndToEnd`, which needs a KL `autoencoder`.
     """
 
@@ -192,9 +193,11 @@ class RepresentationAlignment:
     end_to_end: EndToEnd | None = None
 
     def build(self, variables: Variables | None = None) -> Alignment:
-        """The alignment over the encoder's weights: `variables`' own
-        `representation` when a saved tree supplies them, else the
-        checkpoint's."""
+        """Return the alignment over the encoder's weights.
+
+        It uses the `representation` subtree of `variables` when a saved tree supplies
+        it, and the checkpoint's weights otherwise.
+        """
         from dew.interop.pretrained import split_revision
         from dew.nn.autoencoders.rae import load_dinov2
 

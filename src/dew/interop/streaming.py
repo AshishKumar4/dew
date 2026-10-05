@@ -23,30 +23,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.interop.weights import swapped
 from dew.training.host import evict
-
-_TILE = 64
-"""The side of the squares `_swapped` copies: a 64x64 block of float32 is
-16 KiB, so a block and its transpose stay in a core's cache."""
-
-
-def _swapped(values: np.ndarray) -> np.ndarray:
-    """`values` with its last two axes swapped, C-ordered.
-
-    numpy copies a whole transposed matrix with one strided pass, which
-    misses the cache on every element: 0.39 GiB/s for a 10240x4096 float32
-    kernel, where a contiguous copy runs at 9.7. Square tiles small enough
-    for the cache copy at 3.5 GiB/s."""
-    *lead, rows, columns = values.shape
-    if values.size == 0:
-        return np.empty((*lead, columns, rows), values.dtype)
-    flat = np.ascontiguousarray(values).reshape(-1, rows, columns)
-    out = np.empty((flat.shape[0], columns, rows), values.dtype)
-    for row in range(0, rows, _TILE):
-        for column in range(0, columns, _TILE):
-            out[:, column:column + _TILE, row:row + _TILE] = (
-                flat[:, row:row + _TILE, column:column + _TILE].swapaxes(-1, -2))
-    return out.reshape(*lead, columns, rows)
 
 
 @dataclass(frozen=True, eq=False)
@@ -106,12 +84,12 @@ class SourceLeaf:
     def _member(self, member: np.ndarray, index: tuple[slice, ...]) -> np.ndarray:
         """One member's values at `index` of its view, C-ordered in `dtype`:
         read and cast in the stored layout, which is contiguous, then
-        swapped in tiles (`_swapped`) where the leaf is transposed."""
+        swapped in tiles (`swapped`) where the leaf is transposed."""
         if not self.transposed:
             return np.asarray(member[index], dtype=self.dtype, order="C")
         index = (*index, *(slice(None) for _ in range(member.ndim - len(index))))
         stored = (*index[:-2], index[-1], index[-2])
-        return _swapped(np.asarray(member[stored], dtype=self.dtype, order="C"))
+        return swapped(np.asarray(member[stored], dtype=self.dtype, order="C"))
 
     def read(self, index: tuple[slice, ...] | None = None) -> np.ndarray:
         """The leaf's values at `index` (None: all of it), C-ordered in `dtype`.
