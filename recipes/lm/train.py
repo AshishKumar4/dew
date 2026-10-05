@@ -22,6 +22,8 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import jax
+import jax.numpy as jnp
 import tyro
 
 from dew.config import ModelConfig
@@ -317,13 +319,17 @@ def main(config: LmRunConfig) -> TrainState:
     validation = () if config.trainer.eval_interval(data) is None else (Perplexity(),)
     pretrained = None if source is None else source.variables
     if config.lora is not None:
-        # The adapter binds to the source's model and weights, so the
+        # The adapter binds to the model and the tree training starts from,
+        # the loaded weights or a fresh draw from the run's key, so the
         # objective trains its factors alone.
         if source is None:
-            raise ValueError("--lora adapts the weights --pretrained loads; a run from scratch "
-                             "trains the whole model")
-        source = source.adapt(config.lora, key=config.trainer.key)
-        model, pretrained = source.model, source.variables
+            key = jax.random.key(config.trainer.key)
+            base = model.init(key, jnp.zeros((1, config.data.seq_len), jnp.int32))
+            adapter = config.lora.apply(model, base, key=jax.random.fold_in(key, 1))
+            model, pretrained = adapter.model, adapter.variables
+        else:
+            source = source.adapt(config.lora, key=config.trainer.key)
+            model, pretrained = source.model, source.variables
     if config.objective == "masked_diffusion":
         return config.train(build_masked_objective(config, model, fields, pretrained), data,
                             name=name, metrics=validation, summary=summary)

@@ -1056,3 +1056,59 @@ def test_a_custom_objective_trains_only_an_adapters_factors(decoder, reference):
     for before, after in zip(jax.tree.leaves(initial.variables[FROZEN]),
                              jax.tree.leaves(state.variables[FROZEN]), strict=True):
         np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
+
+
+def test_a_scratch_diffusion_run_trains_its_lora_and_saves_it_from_the_run(tmp_path):
+    """`lora:lora --lora.rank 2 --lora.modules final_proj` on a diffusion run
+    from scratch: the config binds the adapter to the objective's own fresh
+    draw of the denoiser from the run's key, with the factors from the key
+    folded with 1. Two steps move every factor and leave the drawn weights
+    and the text tower bitwise, and `Adapter.from_run` writes the PEFT
+    directory an adapter bound the same way in process writes. The DiT's
+    blocks are adaLN-Zero, so with their modulation frozen at zero only the
+    output projection carries a gradient; it is the one target."""
+    import grain.python as grain
+
+    from dew.config import ModelConfig, TrainerConfig
+    from dew.data import Loading, TFDSImages
+    from dew.objectives.diffusion import DiffusionRunConfig, TextCondition
+    from dew.sampling import Euler
+
+    rows = jax.device_count()
+    config = DiffusionRunConfig(
+        model=ModelConfig("simple_dit", {"patch_size": 2, "emb_features": 16, "num_layers": 1,
+                                         "num_heads": 2}, dtype="float32", attention_impl="xla"),
+        data=TFDSImages(image_size=8), solver=Euler(), guidance=None, sampling_steps=2, ema_decay=None,
+        val_metrics=(), text=TextCondition(encoder="char_table", checkpoint="char_table"),
+        lora=LoRA(rank=2, modules=("final_proj",)),
+        trainer=TrainerConfig(checkpoint_dir=str(tmp_path), batch_size=rows, steps=2, eval_every=None,
+                              checkpoint_every=2, compilation_cache_dir=None))
+    objective = config.build()
+    caption = jax.tree.map(lambda ids: ids[0], objective.inputs.tokenize(["a"]))
+    examples = [{"image": np.full((8, 8, 3), 200, np.uint8), **caption} for _ in range(2 * rows)]
+    data = Dataset.from_grain(grain.MapDataset.source(examples), batch=rows, loading=Loading(workers=0))
+    initial = Trainer(objective, optax.sgd(0.0), key=config.trainer.key).initial_state()
+
+    state = config.train(objective, data, name="run")
+
+    moved = _flat(state.variables["params"])
+    assert set(moved) == {f"output.final_proj.{factor}" for factor in lora.FACTORS}
+    before = _flat(initial.variables["params"])
+    assert all(bool(jnp.any(leaf != before[name])) for name, leaf in moved.items())
+    for collection in (FROZEN, "encoders"):
+        for before, after in zip(jax.tree.leaves(initial.variables[collection]),
+                                 jax.tree.leaves(state.variables[collection]), strict=True):
+            np.testing.assert_array_equal(np.asarray(before), np.asarray(after), err_msg=collection)
+    plain = dataclasses.replace(config, lora=None).build()
+    key = jax.random.key(config.trainer.key)
+    drawn = plain.model_variables(plain.init(key))
+    for before, after in zip(jax.tree.leaves(drawn["params"]), jax.tree.leaves(state.variables[FROZEN]),
+                             strict=True):
+        np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
+    assert config.lora is not None
+    config.lora.apply(plain.model, drawn, key=jax.random.fold_in(key, 1)).save(state.variables,
+                                                                               tmp_path / "in-process")
+    rebuilt = Adapter.from_run(tmp_path / "run")
+    rebuilt.save(rebuilt.variables, tmp_path / "from-run")
+    for name in (lora.PEFT_CONFIG, lora.PEFT_WEIGHTS):
+        assert (tmp_path / "from-run" / name).read_bytes() == (tmp_path / "in-process" / name).read_bytes()

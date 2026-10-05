@@ -14,6 +14,7 @@ import os
 from importlib import import_module
 from typing import TYPE_CHECKING, ClassVar, Literal
 
+import jax
 import numpy as np
 
 from dew.config import ModelConfig, RunConfig
@@ -30,12 +31,14 @@ from dew.sampling.solvers import EulerAncestral
 
 from .alignment import REPRESENTATION, Alignment
 from .end_to_end import AUTOENCODER, EndToEnd
-from .objective import DiffusionObjective
+from .objective import LOSS_HEADS, DiffusionObjective
 
 import_module("dew.eval")  # registers the image metrics
 import_module("dew.nn.backbones")  # registers the models before the config's unions are built
 
 if TYPE_CHECKING:
+    from flax import linen as nn
+
     from dew.diffusion.presets import Preset
     from dew.sampling.solvers import Solver
 
@@ -644,17 +647,36 @@ class DiffusionRunConfig(RunConfig):
         Supplied variables are the authoritative saved snapshot. Encoders and
         the VAE read only configuration/tokenizer metadata and bind their
         respective subtrees without a source weight load or storage cast.
+
+        A `lora` binds to the denoiser `pretrained` loads, or from scratch to
+        a fresh draw of it from the run's key, so the objective trains its
+        factors and any loss head of its own.
         """
+        if self.lora is not None and variables is not None:
+            raise ValueError("a --lora run's saved variables hold its factors, which "
+                             "TextToImage.from_run binds through the run's own adapter record")
+        objective = self._objective(variables, None)
+        if self.lora is None or self.pretrained is not None:
+            return objective
+        # The objective's own init draws the denoiser beside its heads and
+        # towers; the adapter freezes the denoiser's weights, and the heads
+        # stay under `params` to train.
+        key = jax.random.key(self.trainer.key)
+        drawn = objective.init(key)
+        adapter = self.lora.apply(objective.model, objective.model_variables(drawn),
+                                  key=jax.random.fold_in(key, 1))
+        heads = {name: tree for name, tree in drawn["params"].items() if name in LOSS_HEADS}
+        start = {**drawn, **adapter.variables, "params": {**heads, **adapter.variables["params"]}}
+        return self._objective(start, adapter.model)
+
+    def _objective(self, variables: Variables | None, adapted: nn.Module | None) -> DiffusionObjective:
+        """The configured objective over `variables`, with `adapted` in place
+        of the model a run from scratch builds."""
         if self.pretrained is None:
-            if self.lora is not None:
-                raise ValueError("--lora adapts the pipeline --pretrained loads; a run from scratch "
-                                 "trains the whole model")
             model, conditions, autoencoder = self._scratch(variables)
+            model = model if adapted is None else adapted
             sample, convention = self.sample_field(), None
         else:
-            if self.lora is not None and variables is not None:
-                raise ValueError("a --lora run's saved variables hold its factors, which "
-                                 "TextToImage.from_run binds through the run's own adapter record")
             source = self._source(variables)
             if self.lora is not None:
                 # The adapter binds to the denoiser and the pipeline's

@@ -745,7 +745,8 @@ class RunConfig:
     lora: Annotated[LoRA, tyro.conf.subcommand("lora")] | None = None
     """The low-rank adapter the run trains instead of the whole model
     (`lora:lora --lora.rank 16 --lora.modules q_proj v_proj`). A recipe binds it to the
-    source `--pretrained` loads (`Pretrained.adapt`), and the objective then
+    source `--pretrained` loads (`Pretrained.adapt`), or from scratch to a
+    fresh draw of the model from the run's key, and the objective then
     trains the factors alone; the run records the bound adapter on its
     model."""
 

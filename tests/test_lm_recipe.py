@@ -299,8 +299,7 @@ def test_a_pretrained_run_trains_a_lora_that_saves_from_the_run_alone(tmp_path):
     binds the adapter to the loaded weights, two steps move every factor and
     leave the base bitwise, and `Pretrained.from_run` rebuilds the adapter
     from the run's own record, so its `adapter.save` writes the files the
-    in-process adapter writes, byte for byte. From scratch there is nothing
-    to adapt, and the recipe says so."""
+    in-process adapter writes, byte for byte."""
     from dew.interop import Pretrained
     from dew.lora import LoRA
     from dew.objectives.base import FROZEN
@@ -331,8 +330,42 @@ def test_a_pretrained_run_trains_a_lora_that_saves_from_the_run_alone(tmp_path):
     for name in ("adapter_config.json", "adapter_model.safetensors"):
         assert (tmp_path / "from-run" / name).read_bytes() == (tmp_path / "in-process" / name).read_bytes()
 
-    with pytest.raises(ValueError, match="--lora adapts the weights --pretrained loads"):
-        recipe.main(run_config(recipe, tokens, "--trainer.steps", "1", "--sample-tokens", "0", *lora))
+
+def test_a_scratch_run_trains_a_lora_that_saves_from_the_run_alone(tmp_path):
+    """From scratch, `lora:lora --lora.rank 2 --lora.modules q_proj v_proj`
+    binds the adapter to a fresh draw of the model from the run's key and
+    the factors from the key folded with 1: two steps move every B and
+    leave that draw bitwise under `frozen`, and `Adapter.from_run` writes
+    the files an adapter bound the same way in process writes, byte for
+    byte. (A model with no exported family, as this one, has no
+    `Pretrained` bundle; the adapter needs none.)"""
+    from dew.lora import Adapter
+    from dew.objectives.base import FROZEN
+
+    recipe = load_recipe()
+    tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
+    config = run_config(recipe, tokens, "--trainer.steps", "2", "--sample-tokens", "0", "--trainer.name",
+                        "scratch", "lora:lora", "--lora.rank", "2", "--lora.modules", "q_proj", "v_proj")
+
+    state = recipe.main(config)
+
+    recorded = recipe.LmRunConfig.load(str(tmp_path / "runs" / "scratch"))
+    assert recorded.lora == config.lora
+    model = recorded.model.build()
+    key = jax.random.key(recorded.trainer.key)
+    base = model.init(key, jnp.zeros((1, SEQ), jnp.int32))
+    for before, after in zip(jax.tree.leaves(base["params"]), jax.tree.leaves(state.variables[FROZEN]),
+                             strict=True):
+        np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
+    moved = jax.tree_util.tree_leaves_with_path(state.variables["params"])
+    assert moved and all(path[-1].key in ("lora_A", "lora_B") for path, _ in moved)
+    assert all(bool(jnp.any(leaf)) for path, leaf in moved if path[-1].key == "lora_B")
+    adapter = recorded.lora.apply(model, base, key=jax.random.fold_in(key, 1))
+    adapter.save(state.variables, tmp_path / "in-process")
+    rebuilt = Adapter.from_run(tmp_path / "runs" / "scratch")
+    rebuilt.save(rebuilt.variables, tmp_path / "from-run")
+    for name in ("adapter_config.json", "adapter_model.safetensors"):
+        assert (tmp_path / "from-run" / name).read_bytes() == (tmp_path / "in-process" / name).read_bytes()
 
 
 def test_a_hub_reference_at_a_revision_is_recorded_at_its_commit(tmp_path, monkeypatch):
