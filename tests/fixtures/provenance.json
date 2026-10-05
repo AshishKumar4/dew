@@ -2316,7 +2316,7 @@
      "runs": "peft"
     }
    ],
-   "note": "Expected context is CLIP; UNet and text adapters use PEFT."
+   "note": "Expected context is CLIP; UNet and text adapters use PEFT. The outputs are Diffusers' PyTorch UNet's, which differs from the Flax-declared tiny SD in its exact GELU and its attention GroupNorm epsilon (1e-6, Flax 1e-5); Dew runs that twin (test_lora.torch_unet)."
   },
   "lora_exports": {
    "tool": "tools/lora_export_reference.py",
@@ -2337,7 +2337,7 @@
      "runs": "diffusers"
     }
    ],
-   "note": "Adapters Dew writes (llama-tiny fresh, rsLoRA and patterned; tiny SD, FLUX and SD3 denoisers), factors moved by seeded draws, read by PEFT's PeftModel and Diffusers' load_lora_weights with every file tensor landing; adapted and merge_and_unload/fuse_lora outputs in float32 and float64 (diffusers_wan_reference.float64); content SHA-256 of each adapter file. Torch 2.14.0+cpu."
+   "note": "Adapters Dew writes (llama-tiny fresh, rsLoRA and patterned; tiny SD, FLUX and SD3 denoisers), factors moved by seeded draws, read by PEFT's PeftModel and Diffusers' load_lora_weights with every file tensor landing; adapted and merge_and_unload/fuse_lora outputs in float32 and float64 (diffusers_wan_reference.float64); content SHA-256 of each adapter file. Torch 2.14.0+cpu. The sd case: the outputs are Diffusers' PyTorch UNet's, which differs from the Flax-declared tiny SD in its exact GELU and its attention GroupNorm epsilon (1e-6, Flax 1e-5); Dew runs that twin (test_lora.torch_unet)."
   },
   "mamba2": {
    "tool": "tools/mamba2_reference.py",
