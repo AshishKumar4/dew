@@ -1,12 +1,12 @@
-"""From raw conditioning data to the value a model keyword takes.
+"""Encoders that turn raw conditioning data into the value a model keyword takes.
 
 An encoder tokenizes on the host, in the data workers or before a sampling
-call, and encodes on device as a pure function of explicit parameters. The
-parameters are a leaf of the objective's tree, placed by the trainer's layout
-like any other, so a frozen tower's weights arrive at the compiled step as
-arguments, not as constants baked into it.
+call. It encodes on device, as a pure function of explicit parameters. The
+parameters are a leaf of the objective's tree, and the trainer's layout
+places them like any other leaf, so a frozen tower's weights reach the
+compiled step as arguments, not as constants compiled into it.
 
-An encoder is rebuilt from a run's record by `rebuild(name, fields)`, where
+`rebuild(name, fields)` rebuilds an encoder from a run's record, where
 `fields` is what `to_json` wrote.
 """
 
@@ -52,62 +52,68 @@ its callers nothing about the value beyond what it hands the model."""
 
 
 class ConditionEncoder(ABC, Generic[Raw, Encoded]):
-    """Carries one modality from raw data to a conditioning value."""
+    """Turns one modality's raw data into a conditioning value.
+
+    Subclasses implement `from_pretrained`, `tokenize`, `encode` and
+    `to_json`.
+    """
 
     params: Variables
     parameter_collections: ClassVar[tuple[str, ...] | None] = None
-    """None declares a bare parameter tree; otherwise these collections own
-    learned weights, including frozen ones. Other collections retain their dtype."""
+    """The collections that hold learned weights, frozen ones included, or None
+    for a bare parameter tree. Collections not named here keep their dtype."""
     reads_captions: ClassVar[bool] = True
-    """Whether a dataset's captions are this encoder's raw data. One that is
-    not reads the batch field its dataset writes itself, audio for instance,
-    and `InputSpec.tokenize` leaves that field alone."""
+    """Whether a dataset's captions are this encoder's raw data. An encoder
+    that does not read captions reads a batch field its dataset writes
+    itself, such as audio, and `InputSpec.tokenize` leaves that field alone."""
     keyword: ClassVar[str] = "textcontext"
-    """The model keyword this encoder's value is passed under. A value is
-    read by the models written for its type: a `TextContext` by the native
-    architectures' `textcontext`, a `DenoisingCondition` by the published
-    families' `conditioning`."""
+    """The model keyword this encoder's value is passed under. Each value
+    type goes to the models written for it: a `TextContext` to the native
+    architectures' `textcontext`, and a `DenoisingCondition` to the
+    published families' `conditioning`."""
 
     @classmethod
     @abstractmethod
     def from_pretrained(cls, checkpoint: str, *, params: Variables | None = None) -> Self:
-        """Loads the tower named `checkpoint`, the one call that opens files.
+        """Load the tower named `checkpoint`. This is the one call that opens files.
 
-        Whatever else a checkpoint needs is a keyword field with a default,
-        which is what `to_json` records and the registry rebuilds from.
-        Supplied params are authoritative: the load reads metadata and never
-        source weights, and keeps their values, dtypes and placement.
+        Anything else a checkpoint needs is a keyword field with a default;
+        `to_json` records those fields, and the registry rebuilds the encoder
+        from them. When you pass `params`, the load uses them as they are. It
+        reads the checkpoint's metadata but none of its weights, and keeps
+        the values, dtypes and placement of `params`.
         """
 
     @abstractmethod
     def tokenize(self, texts: Sequence[Raw]) -> Mapping[str, np.ndarray]:
-        """Raw data to the host arrays `encode` reads, one row per item."""
+        """Turn raw data into the host arrays `encode` reads, one row per item."""
 
     @abstractmethod
     def encode(self, params: Variables, tokens) -> Encoded:
-        """Tokens to the conditioning value, on device, under `params`."""
+        """Encode tokens into the conditioning value on device, under `params`."""
 
     def captions(self, tokens) -> tuple[str, ...]:
-        """What the tokens say, for a rendered artifact.
+        """Return the text the tokens stand for, to show in a rendered artifact.
 
-        A modality that is not text has nothing to say and answers nothing.
+        A modality that is not text returns an empty tuple.
         """
         return ()
 
     @abstractmethod
     def to_json(self) -> dict:
-        """The keyword fields `from_pretrained` rebuilds this encoder from."""
+        """Return the keyword fields that `from_pretrained` rebuilds this encoder from."""
 
 
 def rebuild(name: str, fields: Mapping[str, object], *,
             params: Variables | None = None) -> ConditionEncoder:
-    """The named encoder rebuilt from its JSON fields.
+    """Rebuild the encoder registered as `name` from its JSON fields.
 
-    A run's record stores the registry name with the keyword fields `to_json`
-    wrote. Those fields are unpacked here, so each encoder's `from_pretrained`
-    keeps its own concrete signature. The checkpoint is the one field every
-    encoder takes and is read here; the rest are the encoder's own and its
-    signature checks them.
+    A run's record stores the registry name and the keyword fields `to_json`
+    wrote. This function unpacks those fields into the encoder's
+    `from_pretrained`, so each encoder keeps its own concrete signature.
+    `checkpoint` is the one field every encoder takes, and this function
+    reads it; a record without one raises ValueError. The other fields
+    belong to the encoder, and its signature checks them.
     """
     checkpoint = fields.get("checkpoint")
     if not isinstance(checkpoint, str):
@@ -185,11 +191,13 @@ class _TextTower(ConditionEncoder[str, TextContext]):
 @encoders("clip_text")
 @dataclass(frozen=True, eq=False)
 class CLIPText(_TextTower):
-    """The CLIP text tower, vendored in `dew.nn.text_encoders`, with the
-    checkpoint's tokenizer.
+    """Encodes text with a CLIP text tower and its checkpoint's tokenizer.
 
-    Prompts are padded to the checkpoint's own context length, which the
-    tokenizer reports.
+    The tower is the one vendored in `dew.nn.text_encoders`. Prompts are
+    padded to the checkpoint's own context length, which the tokenizer
+    reports. `encode` returns the tower's last hidden state and the
+    attention mask as a `TextContext`, so a model can pool over the real
+    tokens only.
     """
 
     transformer: CLIPTextTransformer
@@ -216,12 +224,13 @@ class CLIPText(_TextTower):
 @encoders("t5")
 @dataclass(frozen=True, eq=False)
 class T5Text(_TextTower):
-    """The T5 encoder tower, vendored in `dew.nn.text_encoders`, with the
-    checkpoint's tokenizer.
+    """Encodes text with a T5 encoder tower and its checkpoint's tokenizer.
 
-    It is the text half of an SD3.5/Flux-class run, whose MMDiT conditions on
-    T5-XXL's last hidden states. Prompts are padded to `max_length`, which
-    the run's record carries.
+    The tower is the one vendored in `dew.nn.text_encoders`. It is the text
+    half of an SD3.5/Flux-class run, whose MMDiT conditions on T5-XXL's last
+    hidden states. Prompts are padded to `max_length` (256 by default), which
+    the run's record carries. `encode` returns the tower's last hidden state
+    and the attention mask as a `TextContext`.
     """
 
     transformer: T5EncoderTransformer
@@ -257,10 +266,10 @@ class CharTable(ConditionEncoder[str, TextContext]):
     """Encodes text as a table lookup: one id per character, one fixed random
     vector per id.
 
-    It costs nothing and downloads nothing, which makes it the text encoder
-    of tests, benchmarks and smoke runs. It has the shape of a real one, a
-    `TextContext` with a mask, so a model that takes CLIP's output takes this
-    one unchanged.
+    It costs nothing and downloads nothing, so tests, benchmarks and smoke
+    runs use it as their text encoder. Its output has the form of a real
+    encoder's, a `TextContext` with a mask, so a model that takes CLIP's
+    output takes this one unchanged.
     """
 
     params: Variables
@@ -276,11 +285,11 @@ class CharTable(ConditionEncoder[str, TextContext]):
                         tokens: int = 8, features: int = 16, vocab: int = 130,
                         seed: int = 0, param_dtype: str = "float32",
                         params: Variables | None = None):
-        """The table `seed` draws, or the one `params` already holds.
+        """Return an encoder with the table `seed` draws, or with the table `params` already holds.
 
-        There is nothing to load, so `checkpoint` goes unread here. It is on
-        the signature because `rebuild` hands every encoder the name its
-        `to_json` wrote, and this one writes the fixed `"char_table"`.
+        There is nothing to load, so `checkpoint` is ignored. It is in the
+        signature because `rebuild` passes every encoder the checkpoint name
+        its `to_json` wrote, and this encoder always writes `"char_table"`.
         """
         compute = resolve_dtype(dtype)
         storage = resolve_dtype(param_dtype)
@@ -334,25 +343,25 @@ def _last_hidden_state(model, features, *, key: str):
 @encoders("hf_audio")
 @dataclass(frozen=True, eq=False)
 class HFAudio(ConditionEncoder[AudioRow, TextContext]):
-    """A transformers audio model's last hidden state, with the checkpoint's
-    own feature extractor.
+    """Encodes audio as a transformers model's last hidden state, using the checkpoint's feature extractor.
 
-    The extractor's first model input (`model_input_names[0]`) is the one
-    array the model is called with, and transformers' PyTorch forward runs
-    lowered to JAX by torchax. A checkpoint serves when `AutoModel` builds
-    it, its forward (or, for an encoder-decoder, its encoder's) takes that
-    one input and returns `last_hidden_state`, and torchax lowers every op
-    it runs; wav2vec2 (`input_values`) and Whisper's encoder
-    (`input_features`) are the ones tested. Weight-norm parametrizations are
-    folded into plain weights, which the frozen tower computes the same. The
-    states come back as a `TextContext` with every position real, so a model
-    that cross-attends to text attends to them unchanged.
+    The model is called with one array, the extractor's first model input
+    (`model_input_names[0]`), and torchax lowers transformers' PyTorch
+    forward to JAX. A checkpoint works when `AutoModel` builds it, when its
+    forward (or, for an encoder-decoder, its encoder's forward) takes that
+    one input and returns `last_hidden_state`, and when torchax lowers every
+    op it runs. wav2vec2 (`input_values`) and Whisper's encoder
+    (`input_features`) are the tested ones. Weight-norm parametrizations are
+    folded into plain weights, which compute the same result for a frozen
+    tower. The states come back as a `TextContext` in which every position
+    is real, so a model that cross-attends to text attends to them
+    unchanged.
 
-    Every waveform is cut or zero-padded to `seconds`, so every clip, and
-    the constant the unconditional branch is encoded from, has one length.
-    A dataset that writes the extractor's arrays itself (`VideoDataset`'s
-    `audio` field) hands them to `encode` unchanged, which is why this
-    encoder reads no captions.
+    Every waveform is cut or zero-padded to `seconds`, so every clip has the
+    same length, including the constant the unconditional branch is encoded
+    from. A dataset that writes the extractor's arrays itself
+    (`VideoDataset`'s `audio` field) passes them to `encode` unchanged, which
+    is why this encoder reads no captions.
     """
 
     checkpoint: str
@@ -409,16 +418,20 @@ class HFAudio(ConditionEncoder[AudioRow, TextContext]):
 
     @property
     def input_name(self) -> str:
-        """The extractor's array the model reads."""
+        """The name of the extractor's array that the model reads."""
         return self.audio.processor.model_input_names[0]
 
     @property
     def samples(self) -> int:
-        """How many samples every waveform is cut or padded to."""
+        """The number of samples every waveform is cut or padded to."""
         return round(self.seconds * self.audio.sampling_rate)
 
     def waveform(self, row: AudioRow) -> np.ndarray:
-        """One row as a float32 waveform `samples` long."""
+        """Return one row as a float32 waveform `samples` long.
+
+        A constant fills the whole clip, and a mapping holds the waveform or
+        the constant under `"audio"`. Text raises ValueError.
+        """
         value = row.get("audio") if isinstance(row, Mapping) else row
         if value is None:
             raise ValueError("an audio conditioning record holds its waveform under 'audio'")
