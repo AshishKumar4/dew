@@ -200,11 +200,13 @@ def r1_penalty(score, features: Sequence[jax.Array]) -> jax.Array:
 class AdversarialDistillation(Training):
     """Adversarial distillation of a saved flow run into a few-step student.
 
-    This is LADD with ADD's R1 penalty and distillation term
-    (`AdversarialDistillationObjective`, which documents the fields), under the
-    `Flow` preset, sampling unguided. `teacher` is the teacher run's directory a
-    run loads it from, and its model is this run's `model`; an objective built in
-    code takes the teacher's weights instead.
+    This is LADD with ADD's R1 penalty and distillation term. It trains under the
+    `Flow` preset and samples unguided. `AdversarialDistillationObjective` documents
+    the fields, and `feature_layers` must name at least one layer.
+
+    `teacher` is the teacher run's directory, which a run loads; a run without one
+    is refused. The teacher's model is this run's `model`. An objective built in
+    code is given the teacher's weights directly.
     """
 
     preset_class = Flow
