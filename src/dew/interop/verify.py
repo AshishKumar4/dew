@@ -345,7 +345,9 @@ def verify_mapping(hf_config: Mapping[str, object]) -> VerifiedMapping:
     `CONVENTIONS` candidate whose reading takes the real config loads that
     directory and runs the same ids in fp32. The first whose max |Δlogits|
     is within twice `_ROUNDING` eps per layer per unit of the reference's
-    largest logit is the mapping. With none, the refusal names every
+    largest logit is the mapping. When several read the config and match,
+    the `CONVENTIONS` order is the tie-break: each computed the probe's
+    logits, so any of them is sound. With none, the refusal names every
     candidate's reason.
     """
     model_type = hf_config.get('model_type')
