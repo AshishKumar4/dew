@@ -965,24 +965,28 @@ change does not touch them.
 
 ## XLA flags
 
-`TrainerConfig.xla_flags` appends to `XLA_FLAGS`. `prepare_process` applies
-it before JAX opens a backend. It also sets
-`--xla_allow_excess_precision=false` unless the run explicitly sets that flag
-(`dew.training.runtime.keep_roundings`). With XLA's default, a fusion may
-skip bf16 rounding specified by the program. The skipped rounding depends
-on layout, so one device and four produced different bf16 forwards for
-the same model.
+`TrainerConfig.xla_flags` appends to `XLA_FLAGS`, and `prepare_process`
+applies it before JAX opens a backend. The recipes and the CLI call
+`prepare_process` first; a script or notebook that builds a `Trainer` itself
+calls it before its first JAX call, or sets `XLA_FLAGS` in the environment.
 
-The recipes and CLI call `prepare_process`. If your script or notebook
-builds a `Trainer` directly, call it first or set
-`XLA_FLAGS=--xla_allow_excess_precision=false` before importing jax. On the
-RTX 4080, the flag reduced step time: the 176M hybrid DiT at batch 16
-fell from 69.60 to 66.62 ms, SimpleDiT-B at batch 32 from 76.00 to 73.03,
+Separately, `import dew` sets `--xla_allow_excess_precision=false` unless
+`XLA_FLAGS` already names that flag
+(`dew.telemetry.devices.keep_roundings`). With XLA's default, a fusion may
+skip a bf16 rounding the program states, and which roundings it skips
+depends on the layout, so one device and four devices computed different
+bf16 forwards of the same model. XLA reads its flags when a backend opens,
+so import Dew before the first JAX computation. If the backend is already
+open, Dew logs a warning and the policy does not take effect; restart with
+`XLA_FLAGS=--xla_allow_excess_precision=false` set before importing JAX. On
+the RTX 4080 the policy also made steps faster: the 176M hybrid DiT at batch
+16 went from 69.60 to 66.62 ms, SimpleDiT-B at batch 32 from 76.00 to 73.03,
 and Qwen3-0.6B's widths at 1 x 1024 from 110.52 to 109.62.
 
-The following sweep is why `xla_flags` defaults to None. It covers three
-architectures, with a fresh process per configuration. Each cell gives
-the median, with a range and count for repeated configurations.
+The default `xla_flags` is None because of the sweep below. It covers three
+architectures, with one fresh process per configuration. Each cell is the
+median of the runs, with the range and count where a configuration was
+repeated.
 
 | configuration | simple_dit | causal_transformer | unet |
 |---|---|---|---|
@@ -995,21 +999,21 @@ the median, with a range and count for repeated configurations.
 | `--xla_gpu_enable_while_loop_double_buffering=true` | 6.95 [6.93-7.09] n=5 | 75.73 | 17.30 |
 | the two above with any signal, together | 7.00 [6.99-7.02] n=2 | 75.75 [75.67-75.84] n=2 | 17.09 [16.93-17.26] n=2 |
 
-No flag was adopted from this sweep because the differences fell within
-measurement noise. Four repeats of the same simple_dit configuration ranged
-from 6.97 to 7.53 ms, or 8%, because each fresh process autotunes again.
-Every simple_dit result in the table fits that distribution. The
-causal_transformer varies by 0.7%, and no flag changes it by more than
-0.2%. Only unet shows a measurable effect:
-`--xla_gpu_triton_gemm_any=true` takes the median from 17.38 to 17.05 ms, or
+I adopted no flag, because of the noise. Four repeats of the same
+configuration on simple_dit spread from 6.97 to 7.53 ms, or 8%, because each
+fresh process autotunes again, and against that spread every simple_dit
+number in the table comes from one distribution. The causal_transformer is
+the quiet measurement, with a spread of 0.7%, and no flag moves it by more
+than 0.2%. The unet is the only architecture where a flag shows an effect;
+`--xla_gpu_triton_gemm_any=true` takes its median from 17.38 to 17.05 ms, or
 1.9%, over four runs each.
 
-The unet gains 2%, the decoder is unchanged, and simple_dit's noise
-obscures any difference. A default flag must be faster on all three
-architectures by more than each one's noise, so the default stays None.
-To use the unet flag for a run, pass `--trainer.xla-flags`.
+To be adopted, a flag has to be faster on all three architectures and
+outside the noise on each. That one gains 2% on the unet, leaves the decoder
+unchanged and is lost in simple_dit's noise, so the default stays None. A
+run that wants it can pass `--trainer.xla-flags`.
 
-Two flags affect autotuning or dispatch:
+Two of the rows have their own explanations:
 
 - `--xla_gpu_autotune_level=4` changes nothing on any architecture, because
   it is already the default in this build. Level 0 turns autotuning off,
@@ -1018,20 +1022,21 @@ Two flags affect autotuning or dispatch:
   slowed the 176M hybrid DiT's step from 139 to 151 ms and a 67M decoder's
   from 79.8 to 81.5 ms, two fresh processes each.
 - `--xla_gpu_enable_command_buffer=` (command buffers off) is the only
-  configuration that is reliably slower: 17.90 against 17.38 on the unet over
-  four runs, and slower on the other two as well. Command buffers are on by
-  default and save 3% on the launch-heavy architecture. Passing a longer type
-  list than the default adds nothing to that.
+  configuration that is reliably slower: 17.90 against 17.38 on the unet
+  over four runs, and slower on the other two as well. Command buffers are
+  on by default and save 3% on the launch-heavy architecture. Passing a
+  longer type list than the default adds nothing to that.
 
-None of the candidate flags changes numerics. The sweep covered only kernel
-selection and scheduling; it did not test flags that relax precision.
-Such flags would not be adopted because a change must keep a fixed-seed
-20-step loss trajectory within 1e-5.
+None of the candidate flags changes numerics; the sweep covered only kernel
+selection and scheduling. I tested no flag that relaxes precision, and none
+would be adopted, because an adopted change has to keep a fixed-seed 20-step
+loss trajectory within 1e-5.
 
 ## UNet batch scaling
 
-UNet's step time is the least sensitive to batch size among these
-architectures. This experiment measures how it scales; no change was adopted.
+These numbers show where the unet, the architecture whose step is least
+sensitive to batch, still has room to get faster. I adopted nothing from
+them.
 
 ```
 python tools/benchmark_step.py --preset small --architectures unet \
@@ -1049,21 +1054,21 @@ for the extended rows.
 | unet, command buffers extended | 16 | 17.12 |
 | unet, command buffers extended | 64 | 57.94 |
 
-Increasing the batch fourfold increases step time 3.3 times. About 4 ms
-of the 17.4 ms step (23%) is independent of batch size; the rest scales
-at 0.84 ms per sample.
+Four times the batch costs 3.3 times the step. So about 4 ms of the 17.4 ms
+step (23%) does not scale with the batch, and 0.84 ms per sample does.
 Command buffers save 1.4% at batch 16 and nothing at batch 64.
 
-The original utilisation column reported 1.7%, which was wrong. XLA's
-`cost_analysis()` cannot count operations inside the backend's cuDNN convolution
-calls. It undercounted this model 22.5 times. Counting from the optimized
-HLO gives 40.5% of peak, as reported in `docs/benchmarks.md`.
+When first recorded, these rows had a utilisation column that read 1.7%, and
+the FLOP counter made it wrong. XLA's `cost_analysis()` cannot see inside
+the cuDNN convolution calls the backend emits, so it undercounted this model
+22.5 times. Counted from the optimized HLO, the unet runs at 40.5% of peak,
+as `docs/benchmarks.md` reports.
 
 ## Muon against AdamW at equal tokens
 
-These CPU runs compare optimizers at equal token budgets. Accelerator
-speed is not measured. One workstation CPU
-can finish nine of these small runs in under an hour.
+These rows ran on a CPU. They compare optimizers at equal token budgets, not
+accelerator speed, and the run is small enough that one workstation CPU does
+nine of them in under an hour.
 
 ```
 curl -o data/shakespeare.txt --create-dirs \
@@ -1079,19 +1084,19 @@ JAX_PLATFORMS=cpu taskset -c 0-5 python tools/optimizer_curve.py \
 The first command downloads the corpus, which is not in the repository. The
 last command ran once per arm, learning rate and seed.
 
-Conditions: `causal_transformer`, 128 wide, 2 layers, 2 heads, tied head, byte
-vocabulary of 256, sequence length 128, batch 16, 557,952 parameters, bf16
-compute, weight decay 0.1 on both groups, no schedule, no clipping. 2000
-steps is 4,096,000 tokens, which is 3.75 passes over the 1,093,086 training
-tokens of the Shakespeare corpus. 12th Gen i9-12900K, jax 0.11.1,
+Conditions: `causal_transformer`, 128 wide, 2 layers, 2 heads, tied head,
+byte vocabulary of 256, sequence length 128, batch 16, 557,952 parameters,
+bf16 compute, weight decay 0.1 on both groups, no schedule, no clipping.
+2000 steps is 4,096,000 tokens, which is 3.75 passes over the 1,093,086
+training tokens of the Shakespeare corpus. 12th Gen i9-12900K, jax 0.11.1,
 `JAX_PLATFORMS=cpu`, six cores pinned per run, three runs at a time on
-disjoint cores. At a given seed, every arm sees the same batches in the
-same order, so differences between arms come from the solver.
+disjoint cores. Every arm sees the same batches in the same order at the
+same seed, so a difference between two arms comes from the solver.
 
-The three arms are `adamw` (AdamW), `muon` (Dew's Muon with parameter
-groups) and `muon-unsplit` (`optax.contrib.muon` with its ndim == 2 rule).
-The 'muon' entry used the unsplit rule before parameter groups were added.
-Final loss is the mean over the last 50 steps.
+There are three arms: `adamw` is AdamW, `muon` is Dew's Muon with its
+parameter groups, and `muon-unsplit` is `optax.contrib.muon` with its own
+ndim == 2 rule, which is how the 'muon' entry worked before the parameter
+groups. Final loss is the mean over the last 50 steps.
 
 | arm | lr 1e-3 | lr 3e-3 | lr 1e-2 |
 |---|---|---|---|
@@ -1099,8 +1104,8 @@ Final loss is the mean over the last 50 steps.
 | muon | 1.5229 | 1.4438 | 1.4713 |
 | muon-unsplit | 1.5762 | 1.4598 | 1.4916 |
 
-Loss at five token counts, using each arm's best learning rate and
-averaging over seeds 0, 1 and 2:
+This table shows each arm at its own best learning rate, averaged over seeds
+0, 1 and 2, as the loss at five token counts:
 
 | arm | 0.51M | 1.02M | 2.05M | 3.07M | 4.10M |
 |---|---|---|---|---|---|
@@ -1108,18 +1113,17 @@ averaging over seeds 0, 1 and 2:
 | muon, lr 3e-3 | 1.9885 | 1.6744 | 1.5179 | 1.4572 | 1.4386 |
 | muon-unsplit, lr 3e-3 | 2.2454 | 1.7646 | 1.5559 | 1.4812 | 1.4561 |
 
-Muon with parameter groups reaches 1.4386 against AdamW's 1.4764,
-0.038 nats lower at the same token count. Loss varies by 0.007 to 0.013
-across each arm's three seeds, so the AdamW gap is three times that
-noise. The gap to unsplit Muon is 0.018, one and a half times the noise.
-The split version is ahead on all three seeds, by 0.016, 0.020 and
-0.017. Raising the learning rate from each arm's best to 1e-2 increases
-Muon's loss by 0.028
-(3.3 times its best rate) and AdamW's by 0.116 (10 times its best rate).
+Muon with the parameter groups reaches 1.4386 where AdamW reaches 1.4764,
+0.038 nats lower after the same tokens. The three seeds of an arm spread
+0.007 to 0.013, so the gap to AdamW is three times that noise. The gap to
+unsplit Muon is 0.018, one and a half times the noise, and the split version
+is ahead on each of the three seeds, by 0.016, 0.020 and 0.017. Raising the
+learning rate from each arm's best to 1e-2 costs Muon 0.028 (3.3 times its
+best rate) and AdamW 0.116 (10 times its best rate).
 
-The 0.4B-parameter run requested in section 4.9 of `docs/design/plan.md`
-needs a v5e-16 and is not measured here. These runs shared a machine,
-so their wall-clock times are also not comparable.
+These numbers say nothing about 0.4B parameters. That is the run section 4.9
+of `docs/design/plan.md` asks for, and it needs a v5e-16. The wall-clock
+times are not comparable either, because the runs shared a machine.
 
 ## Quantized training on the RTX 4080
 
@@ -1136,13 +1140,13 @@ process: 8 layers of width 256 (mlp 512) and 8 layers of width 1024 (mlp
 | 256 | 7.95 s | 2.01 | 5.58 s | 2.18 |
 | 1024 | 8.36 s | 9.59 | 6.29 s | 9.75 |
 
-The compiled fp8 step contains `f8e4m3fn` converts: 146 mentions in the
-HLO at width 256, against 12 GPU gemm calls. Quantization therefore runs
-on the device, without errors, but the converts cost more than the gemms
-save at these sizes. Losses decrease to 2.44 for bf16 against 2.68 for
-fp8 at width 256, and 0.009 against 0.011 at width 1024. Each is after
-14 steps from the same initialization. FP8 gives no speedup to adopt
-on this card at these sizes.
+The compiled fp8 step contains `f8e4m3fn` converts (146 mentions in the HLO
+at width 256, against 12 GPU gemm calls), so the quantization does reach the
+device. At these sizes the converts cost more than the gemms save. Nothing
+raises an error, and the losses go down (2.44 bf16 against 2.68 fp8 at width
+256, 0.009 against 0.011 at width 1024, each after 14 steps from the same
+init). So on this card, at these sizes, fp8 runs but gives no speedup to
+adopt.
 
 ## Serving against vLLM, 2026-10-03
 
