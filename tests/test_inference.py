@@ -158,6 +158,35 @@ def test_images_as_pil_are_this_processs_real_rows_as_8_bit_pixels():
         Images(jnp.zeros((1, 4, 2, 3, 3)), rows=1).pil()
 
 
+def test_pil_bytes_and_unit_range_are_diffusers_image_processor():
+    """Diffusers 0.34.0's `VaeImageProcessor` is the reference both ways.
+    `postprocess(..., output_type="pil")` writes the same bytes as `pil()` on
+    every level's centre, every tie between two levels, the float32
+    neighbours either side of each, and values past the range (both round
+    half to even in float32, so both miss exact rounding on the same 191
+    near-tie inputs). `unit_range` holds the float64 rule against
+    `pil_to_numpy`'s division and `normalize` over all 256 bytes (3.7e-8
+    against 2.7e-8 rms)."""
+    import torch
+    from diffusers.image_processor import VaeImageProcessor
+    from reference_error import assert_as_exact_as_the_reference
+
+    processor = VaeImageProcessor()
+    levels = np.arange(256, dtype=np.float64)
+    marks = np.concatenate([levels / 127.5 - 1, (levels[:-1] + 0.5) / 127.5 - 1]).astype(np.float32)
+    neighbours = [np.nextafter(marks, np.float32(side)) for side in (-np.inf, np.inf)]
+    values = np.concatenate([marks, *neighbours, np.asarray([-1.5, -1.0001, 1.0001, 3.0], np.float32)])
+    pixels = np.repeat(values.reshape(1, 1, -1, 1), 3, axis=-1)
+    ours = np.asarray(Images(jnp.asarray(pixels), rows=1).pil()[0])
+    channels_first = torch.from_numpy(pixels).permute(0, 3, 1, 2)
+    theirs = np.asarray(processor.postprocess(channels_first, output_type="pil")[0])
+    np.testing.assert_array_equal(ours, theirs)
+
+    data = np.arange(256, dtype=np.uint8)
+    normalized = processor.normalize(torch.from_numpy(data.astype(np.float32) / 255.0)).numpy()
+    assert_as_exact_as_the_reference(np.asarray(unit_range(data)), normalized, data / 127.5 - 1, "unit_range")
+
+
 def test_from_run_restores_the_averaged_weights_by_default(tmp_path):
     """The EMA copy is what a run publishes; `ema=False` reads the live ones."""
     objective, state = make_run(tmp_path)
