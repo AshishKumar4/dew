@@ -1797,20 +1797,7 @@ other GPU.
 
 ## Kernel choices per generation, 2026-09-22
 
-Each kernel has one place that selects its implementation by hardware
-generation (`dew.nn.kernels.device_generation`: `sm80`, `sm86`, `sm89`,
-`v5e`, `v6e`, ...). Generations without a measurement here use XLA.
-`tools/benchmark_kernels.py` and `tools/benchmark_lm_head.py` reproduce the
-rows. Each row runs in its own process with jax 0.11.1 and bf16 compute.
-Hardware is a Colab NVIDIA L4 (the RTX 4080's sm_89 architecture), a
-Colab TPU v6e-1, and the local RTX 4080 for kernel-level rows.
-
-Step rows use `tools/benchmark_kernels.py step`, built on
-`tools/benchmark_step.py`'s trainer, with 30 timed steps after 5 warmup.
-The lm-moe model has 321.8M parameters and 8 experts with top-2 routing;
-lm-dense has 359.8M. Both use sequence 1024. Batch sizes are 4 (moe)
-and 1 (dense) on the L4, and 8 and 8 on the v6e. "before" means main
-at c1f7e2dd.
+Each kernel's implementation is chosen in one place and keyed by hardware generation (`dew.nn.kernels.device_generation`: `sm80`, `sm86`, `sm89`, `v5e`, `v6e`, ...), and a generation without a measurement here runs the XLA path. `tools/benchmark_kernels.py` and `tools/benchmark_lm_head.py` reproduce the rows. Each row is one process with jax 0.11.1 and bf16 compute, on a Colab NVIDIA L4 (the RTX 4080's architecture, sm_89), a Colab TPU v6e-1, or, for the kernel-level rows, the local RTX 4080. The step rows come from `tools/benchmark_kernels.py step` (built on `tools/benchmark_step.py`'s trainer), with 30 timed steps after 5 warmup. lm-moe has 321.8M parameters with 8 experts and top-2 routing, and lm-dense has 359.8M; both run at sequence 1024. The batch is 4 (moe) and 1 (dense) on the L4, and 8 and 8 on the v6e. "before" is main at c1f7e2dd.
 
 ### The MoE grouped matmul: `GROUPED_MATMUL_BY_GENERATION`
 
@@ -1823,69 +1810,19 @@ at c1f7e2dd.
 | v6e | lm-moe after, `auto` = xla | 74.68 | 75.25 | 5.05 |
 | v6e | lm-moe after, tokamax (`mosaic_tpu_v2`) | 75.40 | 76.04 | 5.05 |
 
-A rerun with jax 0.11.2 used one Colab L4 session on 2026-09-22,
-19:55 to 20:13 CDT. With `tools/benchmark_kernels.py step --path lm-moe --batch 4`,
-`auto` (pallas) took 224.90 ms with an 8.15 GiB peak; `--implementation xla`
-took 602.36 ms with 12.46 GiB. The `projection` forward plus backward
-took 3.37 ms in Pallas and 25.19 ms in XLA.
+A rerun at jax 0.11.2 in one Colab L4 session (2026-09-22, 19:55 to 20:13 CDT), with `tools/benchmark_kernels.py step --path lm-moe --batch 4`, gave 224.90 ms and an 8.15 GiB peak for `auto` (pallas), and 602.36 ms and 12.46 GiB for `--implementation xla`. The `projection` alone took 3.37 ms forward plus backward in Pallas and 25.19 ms in XLA.
 
-On a 2x RTX 3090 mesh (jax 0.11.2), one bf16 ExpertMLP layer's forward
-plus backward takes 141.9 ms in XLA against 64.4 in Pallas with fsdp 1
-expert 1. With fsdp 2, it takes 83.3 against 98.1 ms. Pallas all-gathers
-the fsdp-sharded expert kernel, using 128 MiB of temporaries against
-XLA's 3120. Expert 2 global takes 174.0 against 102.7, and expert 2
-exchange takes 93.0 against 14.9.
+On a mesh of 2x RTX 3090 (jax 0.11.2), I timed one bf16 ExpertMLP layer forward plus backward, XLA against Pallas. With fsdp 1 and expert 1 it took 141.9 against 64.4 ms. With fsdp 2 it took 83.3 against 98.1 ms, because there the Pallas path all-gathers the fsdp-sharded expert kernel (128 MiB of temporaries against XLA's 3120). Expert 2 global took 174.0 against 102.7, and expert 2 exchange 93.0 against 14.9. Whole lm-moe steps took 1024.0 against 578.3 ms with data 2 and 780.9 against 537.1 with expert 2 exchange, with the same losses. Those numbers made `auto` take XLA where fsdp alone sharded the experts, until the dispatch moved every routed layer inside its row map. There both kernels see gathered experts, and the Pallas kernels win on the RTX 3090 ([Expert parallelism on 4x RTX 3090](#expert-parallelism-on-4x-rtx-3090-2026-09-23)).
 
-Whole lm-moe steps take 1024.0 against 578.3 ms with data 2, and 780.9
-against 537.1 with expert 2 exchange, with the same losses. These results
-first made `auto` select XLA when fsdp alone sharded experts. Dispatch
-later moved every routed layer inside its row map, so both kernels see
-gathered experts. Pallas wins there on the RTX 3090
-([Expert parallelism on 4x RTX 3090](#expert-parallelism-on-4x-rtx-3090-2026-09-23)).
+The kernel-matrix rows time forward plus backward at jax 0.11.2, checked against float64. At lm-moe's up projection the Pallas kernels take 1.21 ms against XLA's 6.25 on an A100, 3.15 against 25.9 on an L4 and 1.59 against 15.7 on the RTX 4080. At 128 experts they take 0.43 against 15.7 (A100), 1.38 against 77.9 (L4) and 0.55 against 33.5 (RTX 4080). On a TPU v5e and v6e XLA wins at 128 experts (on the v6e, 0.346 ms against `mosaic_tpu_v2`'s 0.408). On an RTX 3090 (sm86, jax 0.11.2) Pallas takes 2.54 ms against 17.40 for the up projection and 2.37 against 16.97 for the down projection, with the same forward error. An sm75 card (T4) cannot compile the Triton kernels, and I had no sm90 or sm120 card, so those generations run XLA.
 
-The kernel matrix measures forward plus backward with jax 0.11.2 and
-checks against float64. At lm-moe's up projection, Pallas takes 1.21 ms
-against XLA's 6.25 on an A100, 3.15 against 25.9 on an L4, and 1.59
-against 15.7 on the RTX 4080. At 128 experts, the times are 0.43 against
-15.7 (A100), 1.38 against 77.9 (L4), and 0.55 against 33.5 (RTX 4080).
+`expert_projection` alone (8192 rows, 768 to 2048, 8 experts, forward plus backward) takes 26.21 ms in XLA and 3.38 ms in Pallas on the L4, and 14.84 and 1.86 ms on the RTX 4080. Against a float64 oracle of the rounded operands, Pallas's errors are the same as XLA's or lower (kernel gradient 4.2e-6 against 6.8e-6 relative). The L4 step is 2.82x faster. JAX's stock Pallas lowering with an out-sharding fix measured 1.97x on the same step, because its tangents run in fp32, while Dew's backward multiplies the bf16 cotangent.
 
-XLA wins at 128 experts on TPU v5e and v6e. On v6e, it takes 0.346 ms
-against `mosaic_tpu_v2`'s 0.408. On an RTX 3090 (sm86, jax 0.11.2),
-Pallas takes 2.54 ms against 17.40 for up and 2.37 against 16.97 for
-down, with the same forward error. The sm75 T4 cannot compile Triton
-kernels. No sm90 or sm120 card was available. Those generations use XLA.
+I rejected a pure-JAX loop of dense per-tile products. On the RTX 4080 it was 2.2x faster than XLA for the projection alone (6.67 ms), but it doubled the step's temporaries (4.22 GiB against 2.17 at batch 1), and on the v6e it was 2.2x slower than XLA (1.71 ms against 0.79).
 
-For `expert_projection` alone, the inputs are 8192 rows, 768 to 2048,
-8 experts. Forward plus backward takes 26.21 ms in XLA and 3.38 ms in
-Pallas on the L4; on the RTX 4080, it takes 14.84 and 1.86 ms.
-Pallas's errors match or improve on XLA against a float64 oracle of
-rounded operands (kernel gradient 4.2e-6 against 6.8e-6 relative).
-The L4 step is 2.82x faster. JAX's stock Pallas lowering with an
-out-sharding fix gave 1.97x on the same step. Its tangents run in fp32,
-while Dew's backward multiplies the bf16 cotangent.
+The Pallas kernels are JAX's own `gmm` and `tgmm` from the jax-v0.11.2 source tree, vendored because no wheel ships them and called through a custom VJP. jax 0.11.2 deprecates the Pallas Triton backend they run on and warns at every lowering. They stay the sm80 to sm89 path anyway, because JAX's Mosaic GPU grouped matmul (`pallas/ops/gpu/ragged_dot_mgpu.py`) uses wgmma and fails to compile on the RTX 4080, and tokamax's sm80 Mosaic config exceeds Ada's shared memory. Dew does not silence the warning, so filtering it is up to you. Moving this path to Mosaic GPU on sm90 and later is open, and waits for Hopper hardware to measure on. On a mesh the kernels run inside `shard_map` on each device's share of the sorted rows. That path is checked for parity on an 8-device CPU mesh and not measured on multiple GPUs.
 
-A pure-JAX loop of dense per-tile products was rejected. On the RTX
-4080, the projection alone was 2.2x faster than XLA (6.67 ms), but
-step temporaries doubled to 4.22 GiB against 2.17 at batch 1. On the
-v6e, it was 2.2x slower than XLA (1.71 ms against 0.79).
-
-The Pallas kernels are JAX's `gmm` and `tgmm` from the jax-v0.11.2 source
-tree. They are vendored because no wheel ships them, and use a custom
-VJP. JAX 0.11.2 deprecates their Pallas Triton backend and warns at
-every lowering. They remain the sm80 to sm89 path because JAX's Mosaic
-GPU grouped matmul (`pallas/ops/gpu/ragged_dot_mgpu.py`) uses wgmma and
-fails to compile on the RTX 4080. Tokamax's sm80 Mosaic config also
-exceeds Ada's shared memory. Dew leaves the warning visible; you can
-filter it. Moving to Mosaic GPU on sm90 and later remains open until
-Hopper hardware is available for measurements.
-
-On a mesh, the kernels run inside `shard_map` over each device's share
-of sorted rows. Parity is checked on an 8-device CPU mesh; this path
-was not measured on multiple GPUs.
-
-On TPU, tokamax's `mosaic_tpu_v2` is within 1% of XLA step time. Its
-default dispatch selects the v1 kernel, which is 13x slower, so Dew
-selects the kernel explicitly.
+On TPU, tokamax's `mosaic_tpu_v2` is within 1% of XLA on the step. tokamax's default dispatch picks its v1 kernel there, which is 13x slower, so Dew names the kernel.
 
 ### bf16 Adam state: `OptimConfig.state_dtype`
 
@@ -1898,13 +1835,7 @@ selects the kernel explicitly.
 | v6e | lm-dense step | 123.85 ms, 5.77 GiB | 124.94 ms, 4.50 GiB | |
 | v6e | lm-moe step | 74.68 ms, 5.05 GiB | 71.96 ms, 3.87 GiB | |
 
-The two L4 step rows use jax 0.11.2 from one Colab session on
-2026-09-22, 19:55 to 20:13 CDT. Update rows and v6e rows use jax
-0.11.1. Rounding noise comes from a counter hash of step, leaf and
-element index. Threefry noise (`jax.random.bits`) makes updates slower
-than fp32 state on both devices. Bf16 state saves memory everywhere,
-but slows the v6e lm-dense step by 0.9%. The option stays off by
-default.
+The two L4 step rows are jax 0.11.2 from one Colab session (2026-09-22, 19:55 to 20:13 CDT); the update rows and the v6e rows are jax 0.11.1. The rounding noise is a counter hash of the step, the leaf and the element index. threefry noise (`jax.random.bits`) makes the update slower than fp32 state on both devices. bf16 state saves memory everywhere, but on the v6e lm-dense step it costs 0.9% in time, so the option stays off by default.
 
 ### The vocabulary head: the compute dtype's product
 
