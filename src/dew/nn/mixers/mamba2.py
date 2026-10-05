@@ -246,6 +246,8 @@ class MambaRMSNormGated(nn.Module):
     cast-back values."""
 
     epsilon: float = 1e-5
+    groups: int = 1
+    """Nemotron-H normalizes each B/C group's channels separately after the gate."""
     dtype: Dtype | None = None
 
     @nn.compact
@@ -253,7 +255,15 @@ class MambaRMSNormGated(nn.Module):
         dtype = self.dtype if self.dtype is not None else x.dtype
         wide = at_least_fp32(x.dtype)
         y = x.astype(wide) * nn.silu(gate.astype(wide))
-        y = y * jax.lax.rsqrt(jnp.mean(jnp.square(y), axis=-1, keepdims=True) + self.epsilon)
+        if self.groups == 1:
+            y = y * jax.lax.rsqrt(jnp.mean(jnp.square(y), axis=-1, keepdims=True) + self.epsilon)
+        else:
+            if self.groups < 1 or x.shape[-1] % self.groups:
+                raise ValueError(f"norm groups ({self.groups}) must divide the width ({x.shape[-1]})")
+            grouped = y.reshape(*y.shape[:-1], self.groups, y.shape[-1] // self.groups)
+            grouped = grouped * jax.lax.rsqrt(
+                jnp.mean(jnp.square(grouped), axis=-1, keepdims=True) + self.epsilon)
+            y = grouped.reshape(y.shape)
         scale = self.param('weight', nn.initializers.ones, (x.shape[-1],), jnp.float32)
         return (scale.astype(dtype) * y.astype(dtype)).astype(dtype)
 
@@ -291,6 +301,7 @@ class Mamba2(nn.Module):
     chunk_size: int = CHUNK_SIZE
     use_bias: bool = False
     use_conv_bias: bool = True
+    norm_groups: int = 1
     time_step_limit: tuple[float, float] = (0.0, float('inf'))
     norm_eps: float = 1e-5
     init_std: float | None = None
@@ -334,7 +345,8 @@ class Mamba2(nn.Module):
         self.A_log = self.param('A_log', _log_head_index, (self.num_heads,))
         self.dt_bias = self.param('dt_bias', _inverse_softplus_step, (self.num_heads,))
         self.D = self.param('D', nn.initializers.ones, (self.num_heads,), jnp.float32)
-        self.norm = MambaRMSNormGated(epsilon=self.norm_eps, dtype=self.dtype, name='norm')
+        self.norm = MambaRMSNormGated(
+            epsilon=self.norm_eps, groups=self.norm_groups, dtype=self.dtype, name='norm')
         self.out_proj = dense(self.emb_features, name='out_proj', **normal_kernel(
             self.init_std if self.output_init_std is None else self.output_init_std))
 
@@ -554,6 +566,8 @@ class Mamba2Mixer(MixerBase):
     chunk_size: int = CHUNK_SIZE
     use_bias: bool = False
     use_conv_bias: bool = True
+    norm_groups: int = 1
+    """One for Mamba-2's whole-width norm; n_groups for Nemotron-H's grouped norm."""
     time_step_limit: tuple[float, float] = (0.0, float('inf'))
 
     def build(self, ctx: MixerContext):
@@ -570,6 +584,7 @@ class Mamba2Mixer(MixerBase):
             chunk_size=self.chunk_size,
             use_bias=self.use_bias,
             use_conv_bias=self.use_conv_bias,
+            norm_groups=self.norm_groups,
             time_step_limit=(float(self.time_step_limit[0]), float(self.time_step_limit[1])),
             norm_eps=ctx.norm_eps,
             init_std=ctx.init_std,
