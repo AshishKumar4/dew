@@ -1,30 +1,30 @@
-"""Train a small mixture-of-experts decoder on a device mesh, generate from it, and draw where its tokens go.
+"""Train a small mixture-of-experts decoder and draw its token routing on a mesh.
 
 On eight CPU devices simulated in one process, as a mesh of data 2, expert 2 and fsdp 2:
 
     XLA_FLAGS=--xla_force_host_platform_device_count=8 JAX_PLATFORMS=cpu \
         python examples/moe_mesh.py --out runs/moe-mesh
 
-On one accelerator, where the experts cannot be split, each device computes every expert:
+On one accelerator, all experts are computed locally:
 
     python examples/moe_mesh.py --out runs/moe-mesh-gpu --expert 1 --fsdp 1 --dispatch global
 
 The training text mixes three kinds of line: short English sentences, sums and assignments.
-Before every training step the script runs the step's batch through the step's parameters
-once more, reads the experts each token's router picked, and counts, for each MoE layer,
-the slots each device sends to every other device and the most exchange rounds any expert
-group needs for them, predicted by the exchange's own rule. The
-drawing reads the placement from the objects the run used: the device grid from the mesh,
-each device's experts and kernel slice from the expert kernel's sharding, each device's
-rows from the sharding the layout gives the layer's input, and the all-to-all operations
-the compiled training step's program holds.
+Before each step, an extra forward pass records the router's expert choices for that
+step's batch and parameters. For each MoE layer, the script counts slots sent between
+each pair of devices. It also predicts the maximum exchange rounds needed by any expert
+group, using the exchange's own rule.
 
-After training, `dew.inference.serving.Server` generates greedy continuations of eight
-prompts on the same mesh, with the model's own dispatch. (`dew.sampling.generate` refuses
-the exchange dispatch until jax-ml/jax#40907 is fixed.)
+The drawing uses the run's actual placement. The mesh gives the device grid, and expert
+kernel sharding gives each device's experts and kernel slice. The layer input's layout
+gives each device's rows. The compiled step gives the all-to-all operations.
 
-Writes OUT/moe-mesh.json with every step's traffic, and OUT/moe-mesh.svg, an animation
-with a frame every `snapshot_every` steps and a last frame that routes the generated text.
+After training, `dew.inference.serving.Server` generates greedy continuations for eight
+prompts on that mesh using the model's dispatch. `dew.sampling.generate` refuses exchange
+dispatch until jax-ml/jax#40907 is fixed.
+
+The script writes every step's traffic to OUT/moe-mesh.json. OUT/moe-mesh.svg animates it
+with a frame every `snapshot_every` steps, then a final frame for the generated text's routing.
 """
 import html
 import json
@@ -58,10 +58,10 @@ class Config:
     expert: int = 2
     """Devices the experts are split over."""
     fsdp: int = 2
-    """Devices the parameter widths are split over; data parallelism takes the rest."""
+    """Device count for splitting parameter widths. Remaining devices use data parallelism."""
     dispatch: str = "exchange"
-    """`exchange` sends each token to the device that holds its expert (all-to-all);
-    `global` computes every expert where the token is, and needs no expert axis."""
+    """`exchange` sends tokens to their experts' devices through all-to-all.
+    `global` computes every expert locally and needs no expert axis."""
     experts: int = 8
     top_k: int = 2
     steps: int = 300
@@ -108,7 +108,7 @@ def write_tokens(directory: Path, seed: int) -> None:
 
 
 def token_class(tokens: np.ndarray) -> np.ndarray:
-    """The index into CLASSES of every byte."""
+    """Each byte's index in CLASSES."""
     text = np.asarray(tokens, np.uint8)
     letter = ((text >= ord("a")) & (text <= ord("z"))) | ((text >= ord("A")) & (text <= ord("Z")))
     digit = (text >= ord("0")) & (text <= ord("9"))
@@ -118,7 +118,7 @@ def token_class(tokens: np.ndarray) -> np.ndarray:
 
 @dataclass
 class Placement:
-    """Where the mesh and the shardings put things, one entry per device in mesh order."""
+    """Expert and batch placement, with one entry per device in mesh order."""
     mesh: jax.sharding.Mesh
     devices: list
     held: list[range]
@@ -128,12 +128,12 @@ class Placement:
     rows: list[slice]
     """The rows of a batch each device holds at an MoE layer's input."""
     owner: np.ndarray
-    """[device, expert]: the device a token on `device` is computed on for `expert`."""
+    """[device, expert]: the device computing that expert for tokens from `device`."""
 
 
 def placement(mesh, kernel: jax.Array, batch_shape: tuple[int, int, int], layout: Layout,
               dispatch: str) -> Placement:
-    """Read the placement off the mesh, the expert kernel and the layout's activation rule."""
+    """Read placement from the mesh, expert kernel and layout's activation rule."""
     devices = list(mesh.devices.flat)
     stored = kernel.sharding.devices_indices_map(kernel.shape)
     held = [range(*stored[device][0].indices(kernel.shape[0])) for device in devices]
@@ -147,8 +147,8 @@ def placement(mesh, kernel: jax.Array, batch_shape: tuple[int, int, int], layout
     experts = kernel.shape[0]
     owner = np.tile(np.arange(len(devices))[:, None], (1, experts))
     if dispatch == "exchange":
-        # The exchange's all-to-all runs over the expert axis alone: a device
-        # trades with the devices that share its place on every other axis.
+        # All-to-all uses only the expert axis. Peers share the device's
+        # coordinates on every other axis.
         position = {device: np.argwhere(mesh.devices == device)[0] for device in devices}
         axis = mesh.axis_names.index("expert")
         for index, device in enumerate(devices):
@@ -161,8 +161,10 @@ def placement(mesh, kernel: jax.Array, batch_shape: tuple[int, int, int], layout
 
 def routing_record(selections, tokens: np.ndarray, where: Placement, experts: int, shards: int,
                    dispatch: str) -> list[dict]:
-    """Per MoE layer: slots sent between devices, the most exchange rounds they
-    take, slots per expert and each byte class's slots per expert."""
+    """Record each MoE layer's traffic, maximum exchange rounds and slot counts.
+
+    Slot counts are recorded per expert and per byte class within each expert.
+    """
     classes = token_class(tokens)
     layers = []
     for name in sorted(selections, key=lambda name: int(name.split("_")[1])):
@@ -185,11 +187,12 @@ def routing_record(selections, tokens: np.ndarray, where: Placement, experts: in
 
 
 def exchange_rounds(sent: np.ndarray, shards: int, dispatch: str) -> int:
-    """The most all-to-all rounds any expert group runs in one MoE layer's
-    forward, predicted by the rule in `dew.nn.moe._exchange_shard`: a first
-    round sends every peer a bucket of ceil(slots / shards) rows, and the
-    overflow of the fullest bucket in an expert group takes further rounds of
-    the same size. Each group runs its own count; 0 under `global`."""
+    """Predict the largest all-to-all round count across expert groups in one MoE forward.
+
+    `dew.nn.moe._exchange_shard` first sends each peer ceil(slots / shards) rows.
+    The fullest bucket's overflow sets the number of further rounds of that size.
+    Each expert group runs its own count. `global` dispatch uses 0 rounds.
+    """
     if dispatch != "exchange":
         return 0
     first = -(-sent.sum(axis=1, keepdims=True) // shards)
@@ -198,16 +201,17 @@ def exchange_rounds(sent: np.ndarray, shards: int, dispatch: str) -> int:
 
 
 def routing(selections, params, tokens: jax.Array, trainer: Trainer) -> dict:
-    """The routers' sown selections for `tokens`, computed on the trainer's mesh."""
+    """Router selections recorded with `sow` for `tokens` on the trainer's mesh."""
     with jax.set_mesh(trainer.device_mesh), nn.logical_axis_rules(trainer.layout.axis_rules):
         return jax.tree.map(np.asarray, selections(params, tokens))
 
 
 def all_to_all_ops(hlo: str) -> tuple[int, str]:
-    """How many all-to-all operations a compiled program holds, and the
-    replica groups of the first. The count is of the program's text: an op
-    inside a loop or a conditional runs as many times as the loop or the
-    branch does."""
+    """Count all-to-all operations in compiled text and read the first's replica groups.
+
+    This counts occurrences in the program, not runtime executions. A loop
+    or conditional can execute an operation as many times as its body runs.
+    """
     ops = [line for line in hlo.splitlines() if re.search(r"= .*\ball-to-all\(", line)]
     groups = re.search(r"replica_groups=(\S+(?: \{[^}]*\})?)", ops[0]) if ops else None
     return len(ops), groups.group(1) if groups else ""
@@ -234,8 +238,8 @@ def main(config: Config) -> None:
     shards = mesh.shape["expert"]
     where = placement(mesh, kernel, (config.batch_size, config.sequence_length, 64), trainer.layout,
                       config.dispatch)
-    # The compiled step returns no routing, so a second forward over the
-    # step's parameters and inputs reads the routers' sown selections.
+    # A second forward pass reads routing recorded with sow, which the
+    # compiled step does not return. It uses that step's parameters and inputs.
     selections = jax.jit(lambda params, tokens: model.apply(params, tokens, mutable=["router"])[1]["router"])
 
     steps, frames = [], []
@@ -264,9 +268,8 @@ def main(config: Config) -> None:
                                "layers": layers})
             batch = next(source)
 
-    # Serve on the same mesh: the weights keep their placement, the server's
-    # rows split over the batch axes, and under `exchange` its decode steps
-    # run the same dispatch.
+    # Weights keep their mesh placement during serving. Server rows split over
+    # the batch axes. With exchange dispatch, decode steps use that dispatch too.
     tokenizer = ByteTokenizer()
     starts = ["the cat ", "a dog li", "my frien", "12+30=", "7+41=", "x = y * ", "total = ", "count = "]
     width = max(len(start) for start in starts)
@@ -368,8 +371,8 @@ def drawing(record: dict, where: Placement, config: Config) -> str:
                    text(x + 10, y + 16, f"data {data}", 12, fill="#666")]
     ops = (f"compiled step: its program holds {record['all_to_all_ops']} all-to-all ops"
            + (f" over {record['all_to_all_groups']}" if record["all_to_all_groups"] else ""))
-    # Several CPU devices in one run are XLA's host platform split by
-    # --xla_force_host_platform_device_count, not separate hardware.
+    # --xla_force_host_platform_device_count simulates multiple devices on
+    # XLA's host platform. These CPU devices share the same hardware.
     kind = ("simulated CPU devices" if where.devices[0].platform == "cpu" and len(where.devices) > 1
             else f"{record['device_kind']} device(s)")
     static += [
@@ -471,7 +474,7 @@ def series(values: list[float], label: str, x: float, y: float, width: float, he
 
 
 def frame_group(frame: dict, centre: dict, config: Config, chart_x: float, top: float) -> str:
-    """One frame: the title, the traffic arrows, each device's slot counts and the per-layer charts."""
+    """Draw a frame with its title, traffic arrows, device slot counts and layer charts."""
     label = frame["label"] + (f", loss {frame['loss']:.3f}" if frame["loss"] is not None else "")
     if config.dispatch == "exchange":
         label += (", predicted exchange rounds per MoE layer (max over expert groups) "

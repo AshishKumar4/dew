@@ -5,14 +5,15 @@
     python examples/sft_diffusion_gemma_images.py --flowers data/oxford_flowers102/2.1.1 \
         --smoke --out runs/flowers-caption-smoke
 
-This trains a fresh, byte-vocabulary, 2-layer DiffusionGemma with a small
-Gemma4 vision tower; it does not load or qualify the released 26B model.
-Flowers has class labels rather than human captions, so each target is a
-deterministic class-name description. The same real image conditions the
-clean encoder and the denoiser's prefix cache. The smoke run records loss,
-vision-parameter movement and a generated caption; it is a workflow check,
-not a caption-quality benchmark. Preparation is separate, as for the other
-Flowers examples (TFDS ArrayRecords).
+This trains a fresh 2-layer DiffusionGemma with a byte vocabulary and a small
+Gemma4 vision tower. It does not load or qualify the released 26B model.
+Flowers supplies class labels, so each target is a deterministic class-name
+description, without human captions. Each real image conditions both the
+clean encoder and the denoiser's prefix cache.
+
+The smoke run records loss, changes to vision parameters and a generated
+caption to check the workflow. It does not benchmark caption quality.
+Prepare TFDS ArrayRecords separately, as in the other Flowers examples.
 """
 
 import json
@@ -71,7 +72,7 @@ def model_config(config: Config):
 
 
 def caption_batch(batch, config: Config, labels):
-    """One padded prompt/image block followed by the caption canvas, no packing."""
+    """A padded prompt/image block followed by its caption canvas, without packing."""
     tokenizer = ByteTokenizer()
     rows = len(batch["image"])
     image_tokens = (config.image_size // 8) ** 2
