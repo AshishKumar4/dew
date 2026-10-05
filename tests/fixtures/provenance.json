@@ -1820,6 +1820,28 @@
    ],
    "note": "Dew's reference_logits helper calls the actual Transformers model; no Dew model forward."
   },
+  "hf/nemotron-h-tiny/logits.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.16.1",
+     "runs": "transformers"
+    }
+   ],
+   "note": "--nemotron-h-only; grouped SSD, positionless GQA and ReLU² MLP. source.json pins commit 93c8b7b485963a10800c91f55304db6be211c2bd and seed 2024."
+  },
+  "hf/nemotron-h-tiny/logits_f64.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.16.1",
+     "runs": "transformers"
+    }
+   ],
+   "note": "--nemotron-h-only; the same fp32 checkpoint widened through the reference's SSD, norm, softmax and head casts."
+  },
   "hf/mixtral-tiny/generate.npz": {
    "tool": "tools/numerics_reference.py",
    "sources": [
@@ -3464,6 +3486,14 @@
     "hf/qwen38-dense-tiny/video_0.npy",
     "hf/qwen38-dense-tiny/video_1.npy",
     "hf/qwen38-moe-tiny/model.safetensors"
+   ]
+  },
+  {
+   "tool": "tools/hf_reference.py",
+   "what": "the random weights and probe ids its Nemotron-H references are computed on",
+   "files": [
+    "hf/nemotron-h-tiny/input_ids.npy",
+    "hf/nemotron-h-tiny/model.safetensors"
    ]
   },
   {

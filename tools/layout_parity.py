@@ -200,6 +200,9 @@ def zoo() -> dict[str, Any]:
                        "n_groups": 1, "chunk_size": 8}}}
     hybrid = {**dense, "layer_types": ("mamba", "attention") * 2,
               "kinds": {"mamba": mamba, "attention": {}}}
+    nemotron_h = _fixture("nemotron-h-tiny")
+    nemotron_h.update(vocab_size=512, num_layers=20, max_seq_len=33,
+                     layer_types=tuple(nemotron_h["layer_types"]) * 4)
     window = {**dense, "layer_types": ("sliding",) * 4, "kinds": {"sliding": {"window": 12}}}
     mla = {**dense, "mixer": {"name": "mla", "fields": {"q_lora_rank": 48, "kv_lora_rank": 32, "qk_nope_head_dim": 16,
                               "qk_rope_head_dim": 8, "v_head_dim": 8}}}
@@ -230,6 +233,7 @@ def zoo() -> dict[str, Any]:
         "moe": Case("causal_transformer", moe, **lm),
         "moe128": Case("causal_transformer", moe128, **lm),
         "hybrid": Case("causal_transformer", hybrid, **lm),
+        "nemotron_h": Case("causal_transformer", nemotron_h, **lm),
         "window": Case("causal_transformer", window, **lm),
         "mla": Case("causal_transformer", mla, **lm),
         "mamba2": Case("causal_transformer", mamba2, **lm),
