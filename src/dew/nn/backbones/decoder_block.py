@@ -191,10 +191,7 @@ class GatedMLP(nn.Module):
         self.down_proj = dense(self.out_features, name='down_proj', **normal_kernel(
             self.init_std if self.output_init_std is None else self.output_init_std))
 
-    def __call__(self, x, decode: bool = False, positions=None, segment_ids=None, kv_store=None,
-                 attention_metadata=None):
-        # Nemotron-H's MLP-only blocks use this module in the mixer slot.
-        del decode, positions, segment_ids, kv_store, attention_metadata
+    def __call__(self, x):
         # Column-parallel under a tensor axis: the hidden width splits and
         # down_proj's sum returns to the residual placement in the block.
         if self.activation in ('gelu', 'gelu_exact', 'relu', 'relu2'):

@@ -138,11 +138,11 @@ def _any_value(key: str, hf_config: Mapping[str, object]) -> bool:
     return True
 
 
-def _repeats_text(name: str) -> Callable[[str, Mapping[str, object]], bool]:
-    """A wrapper field inert when it repeats its text config's value."""
+def _repeats(name: str, section: str | None = None) -> Callable[[str, Mapping[str, object]], bool]:
+    """A legacy field is inert only when it repeats the reference's field."""
     def repeats(key: str, hf_config: Mapping[str, object]) -> bool:
-        text = hf_config.get('text_config')
-        return isinstance(text, Mapping) and text.get(name) == hf_config[key]
+        record = hf_config if section is None else hf_config.get(section)
+        return isinstance(record, Mapping) and record.get(name) == hf_config[key]
     return repeats
 
 
@@ -169,9 +169,14 @@ _INERT_FIELDS: Mapping[str | None, Mapping[str, Callable[[str, Mapping[str, obje
     # Released Nemotron-H configs retain these older names. The native
     # reference reads layer_norm_epsilon, has no rotary positions, and
     # derives dt directly from the Mamba projection.
-    'nemotron_h': dict.fromkeys(
-        ('rms_norm_eps', 'norm_eps', 'time_step_rank', 'rope_theta', 'partial_rotary_factor',
-         'mamba_num_groups', 'mamba_state_dim', 'num_query_groups'), _any_value),
+    'nemotron_h': {
+        'mamba_num_groups': _repeats('n_groups'),
+        'mamba_state_dim': _repeats('ssm_state_size'),
+        'num_query_groups': _repeats('num_key_value_heads'),
+        'rms_norm_eps': _repeats('layer_norm_epsilon'),
+        'norm_eps': _repeats('layer_norm_epsilon'),
+        **dict.fromkeys(('time_step_rank', 'rope_theta', 'partial_rotary_factor'), _any_value),
+    },
     # The published HF ports carry mamba_ssm's own fields. The reference
     # normalizes with MambaRMSNormGated alone and gates before it
     # normalizes (modeling_mamba2.py:417, :477 passes norm_before_gate=False,
@@ -192,8 +197,8 @@ _INERT_FIELDS: Mapping[str | None, Mapping[str, Callable[[str, Mapping[str, obje
     # Qwen3_5(Moe)Config declares no such field, and the wrapper's model sizes
     # its head from text_config.hidden_size (modeling_qwen3_5.py:1683,
     # modeling_qwen3_5_moe.py:1868).
-    'qwen3_5': {'hidden_size': _repeats_text('hidden_size')},
-    'qwen3_5_moe': {'hidden_size': _repeats_text('hidden_size')},
+    'qwen3_5': {'hidden_size': _repeats('hidden_size', section='text_config')},
+    'qwen3_5_moe': {'hidden_size': _repeats('hidden_size', section='text_config')},
 }
 
 
