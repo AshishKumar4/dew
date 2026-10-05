@@ -173,6 +173,19 @@ def _masked_conv1d(x, kernel, valid, state=None, bias=None, segments=None):
     return jnp.where(valid[:, None, :], output, 0), history
 
 
+def _compensated_add(left, right):
+    """Add two double-float values, `(hi, lo)` pairs whose sum is the value:
+    `hi` is the rounded sum and `lo` carries what its rounding dropped
+    (Knuth's TwoSum), so a running sum keeps fp32's precision squared.
+    XLA reassociates no float arithmetic unless fast math is on; with it,
+    `lo` cancels to zero and the sum is the plain one."""
+    (left_hi, left_lo), (right_hi, right_lo) = left, right
+    total = left_hi + right_hi
+    part = total - left_hi
+    dropped = (left_hi - (total - part)) + (right_hi - part)
+    return total, dropped + left_lo + right_lo
+
+
 def chunk_decay(g):
     """Cumulate per-chunk log decays and build the pairwise decay between positions.
 
@@ -180,16 +193,32 @@ def chunk_decay(g):
     Returns the inclusive cumulative sum `gc` over C, `[..., C, F]`, and
     `decay[..., s, t, f] = exp(gc[s, f] - gc[t, f])` for s >= t, zero above
     the diagonal, `[..., C, C, F]`.
+
+    The references subtract two fp32 cumulative sums, so every exponent
+    carries the rounding of the chunk's whole accumulated magnitude, which
+    exp turns into a relative error on every decay. Here the cumulative sum
+    is compensated (`_compensated_add`) and the difference takes both
+    halves, so an exponent is as precise as its own range. On
+    tests/fixtures/hf/kimi-linear-tiny that error dominated the gradient:
+    over 16 orderings of the residual stream (an exact symmetry, so only the
+    rounding moves) the updated logits sat at an RMS 2.04 times the
+    reference's distance from float64 with plain sums on CPU and 1.83 on an
+    RTX 4080, and 0.92 and 0.72 with these, against the reference's own
+    0.98. Summing each pair's range instead (Mamba-2's `segment_sum`) is as
+    exact and made a KDA layer's forward and backward 25% slower; this
+    costs about 1% (on an RTX 4080, Kimi Linear's KDA layer over 1024 tokens
+    47.6 against 48.0 ms, Qwen3.5-0.8B's gated delta net over 4096 16.3
+    against 16.5).
     """
     chunk_size = g.shape[-2]
-    gc = jnp.cumsum(g, axis=-2)
+    hi, lo = jax.lax.associative_scan(_compensated_add, (g, jnp.zeros_like(g)), axis=g.ndim - 2)
     inclusive = jnp.tril(jnp.ones((chunk_size, chunk_size), jnp.bool_))[..., None]
-    diff = gc[..., :, None, :] - gc[..., None, :, :]
+    diff = ((hi[..., :, None, :] - hi[..., None, :, :]) + (lo[..., :, None, :] - lo[..., None, :, :]))
     # Masked before exp, as the references do. The unused positive
     # differences can overflow, and an outer where alone leaves 0 * inf in
     # the decay gradient.
     diff = jnp.where(inclusive, diff, 0.0)
-    return gc, jnp.where(inclusive, jnp.exp(diff), 0.0)
+    return hi, jnp.where(inclusive, jnp.exp(diff), 0.0)
 
 
 def strictly_lower_inverse(a):
