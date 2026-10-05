@@ -137,7 +137,7 @@ from dew.sampling import TextToImage
 from dew.training.quantization import Quantization
 
 pipe = TextToImage.from_pretrained("dewml/hybrid-dit-176m", dtype=jnp.bfloat16,
-                                   revision="32d59de89683d59824361144b87bdcaf3e742598")
+                                   revision="84e2079043b56509cec9aea6274f1dcca2538c8c")
 served = pipe.quantized(Quantization(dtype="int8", patterns=("^(?!.*spatial_fusion).*",)))
 images = served(["a red fox in a snowy forest"], steps=20, key=0).host().images
 ```
@@ -384,5 +384,7 @@ Decode on a tensor axis is bound by the host on these cards. Each step runs 57 a
 To serve with vLLM or Ollama, export with `Pretrained.save` (for a model you trained, through `PretrainedDecoder.from_model`) and point the runtime at the directory. `OllamaCompletion` and `OpenAICompletion` (`dew.inference`) call those projects' official clients. Their results keep the backend's metadata, and they do not make up the raw-policy or behavior-policy likelihoods that Dew's own tasks compute.
 
 Whether llama.cpp can make a GGUF file from an export depends on the tokenizer. llama.cpp's `convert_hf_to_gguf.py` (checked at v0.5.0) converts a decoder export whose tokenizer it recognizes. It reads a Llama-style byte-fallback BPE (byte pieces `<0x00>` to `<0xFF>` in the vocabulary, with `▁` marking word starts) directly. It recognizes a byte-level BPE only by its pre-tokenizer's hash, and it lists only published models' hashes, so any byte-level BPE trained from scratch, such as a custom tokenizer for a Dew run, stops the converter with `NotImplementedError: BPE pre-tokenizer was not recognized`. The converter's own pinned environment (transformers 4.57.6) also cannot read a `tokenizer_config.json` saved by transformers 5, which names its class `TokenizersBackend`, so run the converter with transformers 5 and `sentencepiece` installed.
+
+llama.cpp's F32 logits on the CPU are tighter than Dew's, torch's or a BLAS's. ggml's `vec_dot_f32` sums in 32 lanes (four AVX2 registers of eight), while XLA's CPU dot, OpenBLAS and torch each sum one product chain per output. Measured on one fp32 dot against float64, as RMS error over RMS result in units of fp32 rounding: XLA is 2.4 at K=64, 4.9 at K=256, 6.8 at K=1024 and 7.0 at K=4096, and the 32-lane sum is 1.8, 2.1, 2.7 and 3.9 (1.3 to 2.5 times tighter). On `tests/test_llama_cpp_export.py`'s tiny Llama, Dew's logits sit at 1.74 times llama.cpp's distance from float64; with Dew's dots in float64 they sit at 0.75. No XLA:CPU flag in jaxlib 0.11 changes it (XNNPACK, oneDNN, single-threaded Eigen, strict dot math); https://github.com/openxla/xla/issues/50060 asks for lane-blocked accumulation.
 
 For a byte-level tokenizer trained from scratch, use Ollama. `ollama create` with `FROM <export directory>` in the Modelfile runs Ollama's own converter, which accepts the tokenizer, and the result serves Dew's greedy continuation token for token. Ollama records the pre-tokenizer as `default`, which splits a run of digits into groups of three where a byte-level tokenizer keeps the run whole, so a prompt with long numbers can tokenize differently there.
