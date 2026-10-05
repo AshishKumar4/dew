@@ -2,10 +2,12 @@
 # SPDX-License-Identifier: MIT
 """Stochastic rectified-flow transitions and their Gaussian likelihoods.
 
-Flow-GRPO (arXiv:2505.05470v5, equations 8-9), read against
+Flow-GRPO (arXiv:2505.05470v5, equations 8-9) uses the diffusion
+coefficient a * sqrt(t / (1 - t)), where a is `FlowSDE.noise_level`. At
+t = 1, the reference implementation replaces the time in the denominator
+with the first interior grid point. This module reads the equations as
+that implementation does:
 https://github.com/yifan123/flow_grpo/blob/879042cf5707f8b90daa98d147d7deac2317c5da/flow_grpo/diffusers_patch/sd3_sde_with_logprob.py
-uses diffusion coefficient a * sqrt(t / (1 - t)). At t=1, the reference
-replaces the denominator's time with the first interior grid point.
 """
 
 from __future__ import annotations
@@ -29,12 +31,12 @@ from .guidance import Guidance, Walk
 
 @struct.dataclass
 class GaussianTransition:
-    """An isotropic transition with one variance per batch row.
+    """An isotropic Gaussian transition with one variance per batch row.
 
-    Sampling and density arithmetic use float32. Densities and KL sum over
-    the sample dimensions. A zero variance is a
-    deterministic transition: sampling returns its mean and log_prob is NaN,
-    since a Dirac measure has no density with respect to Lebesgue measure.
+    Sampling and density arithmetic use float32, and densities and KL sum
+    over the sample dimensions. A zero variance makes the transition
+    deterministic. Sampling then returns the mean, and `log_prob` is NaN,
+    because a Dirac measure has no density with respect to Lebesgue measure.
     """
 
     mean: jax.Array
@@ -55,7 +57,10 @@ class GaussianTransition:
         return jax.lax.cond(jnp.all(variance == 0), lambda: mean, draw)
 
     def log_prob(self, value: ArrayLike) -> jax.Array:
-        """Joint log density of an observed next state, one value per row."""
+        """Return the joint log density of an observed next state, one value per row.
+
+        Raises `ValueError` when `value` and the mean differ in shape.
+        """
         mean = jnp.asarray(self.mean, jnp.float32)
         variance = jnp.asarray(self.variance, jnp.float32)
         value = jnp.asarray(value, jnp.float32)
@@ -69,9 +74,11 @@ class GaussianTransition:
         return jnp.where(variance > 0, log_prob, jnp.nan)
 
     def kl(self, reference_mean: ArrayLike) -> jax.Array:
-        """KL to a reference transition with the same policy-independent variance.
+        """Return the KL divergence to a reference transition with mean `reference_mean`.
 
-        Equal Dirac measures have KL zero; distinct ones have infinite KL.
+        The reference has the same variance, because the variance does not
+        depend on the policy. Equal Dirac measures have KL zero, and
+        distinct ones have infinite KL.
         """
         mean = jnp.asarray(self.mean, jnp.float32)
         variance = jnp.asarray(self.variance, jnp.float32)
@@ -120,10 +127,12 @@ def flow_transition(x: ArrayLike, velocity: ArrayLike, sigma: ArrayLike,
 @solvers("flow_sde")
 @dataclass(frozen=True)
 class FlowSDE:
-    """Flow-GRPO's Euler-Maruyama solver on a rectified-flow Process.
+    """Samples a rectified-flow `Process` with Flow-GRPO's Euler-Maruyama solver.
 
     Process times may be resolution-shifted. The transition integrates in
-    the resulting physical noise rate, as the reference scheduler does.
+    the noise rate sigma that results, as the reference scheduler does. A
+    process without a rectified-flow schedule and velocity prediction raises
+    `ValueError`.
     """
 
     noise_level: float = 0.7
@@ -155,14 +164,16 @@ class FlowSDE:
 
     def trajectory(self, denoise: Denoiser, x_T: jax.Array, steps: int, *,
                    guidance: Guidance | None = None, key: int | jax.Array) -> FlowTrajectory:
-        """Record this solver's transitions over the same time grid and keys as sample.
+        """Record this solver's transitions over the same time grid and keys as `sample`.
 
-        steps counts grid points, including both endpoints. A ten-transition
-        rollout therefore uses steps=11. Guidance is applied identically before
-        constructing each Gaussian, each step's as `sample` decides it, and must
-        be stateless, as the rescoring of each transition reads it alone.
-        Rectified flow's clean prediction at t=0 is its state, so the last
-        transition already produces the final sample.
+        `steps` counts grid points, including both endpoints, so a
+        ten-transition rollout uses steps=11 and fewer than 2 raises
+        `ValueError`. Guidance is applied the same way before each Gaussian
+        is built, and each step is guided or not exactly as in `sample`. The
+        guidance must keep no state between steps, because each transition
+        is later rescored on its own, so APG with momentum raises
+        `ValueError`. Rectified flow's clean prediction at t=0 is its state,
+        so the last transition already produces the final sample.
         """
         if steps < 2:
             raise ValueError("a trajectory needs at least two time points")
@@ -197,7 +208,8 @@ class FlowTrajectory:
 
     states is [batch, points, ...], times is [points], and log_probs and
     stochastic are [batch, points - 1]. Deterministic intervals have NaN
-    log density and a false stochastic mark. The final state is the sample.
+    log density and a false stochastic mark. The final state is the sample,
+    which `samples` returns.
     """
 
     states: jax.Array
