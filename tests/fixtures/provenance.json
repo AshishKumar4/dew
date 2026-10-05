@@ -1,5 +1,10 @@
 {
  "references": {
+  "hf/granitemoe-tiny": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}],
+   "note": "--granitemoe-only; PowerMoE embedding/residual/attention/logit multipliers, packed input_linear/output_linear and nested router names."
+  },
   "attention_bf16.npz": {
    "tool": "tools/numerics_reference.py",
    "sources": [
