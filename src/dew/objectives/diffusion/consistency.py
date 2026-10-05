@@ -20,26 +20,33 @@ process. `trig_prediction` reads one on TrigFlow the way rCM's
 
 from __future__ import annotations
 
+import dataclasses
 import itertools
 import math
 from collections.abc import Callable
-from typing import Literal, NamedTuple
+from typing import TYPE_CHECKING, Literal, NamedTuple
 
 import jax
 import jax.numpy as jnp
 import optax
 from flax import linen as nn
 
+from dew.diffusion.presets import Flow
 from dew.diffusion.process import Process
 from dew.diffusion.schedules import FlowMatchingScheduler, expand
 from dew.diffusion.transforms import FlowMatchPredictionTransform
 from dew.inputs import InputSpec, unit_range
 from dew.nn.attention import forward_mode_attention
+from dew.nn.autoencoders import AutoEncoder
 from dew.objectives.base import Aux, EMASpec, Ratio, Step, Variables
-from dew.registry import objectives
+from dew.registry import models, objectives, trainings
 from dew.sampling.solvers import Consistency
 
-from .objective import FAKE_SCORE, TEACHER, DiffusionObjective, _own_loss
+from .few_step import SMOOTH_TIME_SCALE
+from .objective import FAKE_SCORE, TEACHER, DiffusionObjective, Training, _own_loss, teacher_variables
+
+if TYPE_CHECKING:
+    from .config import DiffusionRunConfig
 
 Velocity = Callable[[jax.Array, jax.Array], jax.Array]
 """A rectified-flow velocity v(x, rf) at rf time."""
@@ -189,6 +196,83 @@ class _Draws(NamedTuple):
     critic_noise: jax.Array
 
 
+@trainings("rcm")
+@dataclasses.dataclass(frozen=True)
+class ConsistencyDistillation(Training):
+    """Distill a saved flow run into a few-step student with rCM
+    (`ConsistencyDistillationObjective`, which documents the other fields):
+    sCM's consistency loss regularized by DMD2's, or either alone at the
+    other's weight 0, under the `Flow` preset, sampling unguided. `teacher`
+    is the teacher run's directory a run loads it from; its model is the
+    run's `model`, and the student and the fake score start from its
+    weights. An objective built in code takes the teacher's weights instead."""
+
+    preset_class = Flow
+    guided = False
+
+    teacher: str = ""
+    consistency_weight: float = 100.0
+    dmd_weight: float = 1.0
+    teacher_guidance: float = 1.0
+    tangent_warmup: int = 0
+    student_update_freq: int = 5
+    max_simulation_steps: int = 4
+    student_times: tuple[float, float] = (-0.8, 1.6)
+    critic_times: tuple[float, float] = (0.0, 1.6)
+    consistency: Literal["continuous", "discrete"] = "continuous"
+    discrete_steps: int = 48
+    discrete_skip: int = 1
+    discrete_shift: float = 5.0
+
+    def __post_init__(self) -> None:
+        if self.consistency_weight <= 0 and self.dmd_weight <= 0:
+            raise ValueError("rCM needs a consistency or a distribution-matching loss")
+        if self.consistency not in ("continuous", "discrete"):
+            raise ValueError(f"consistency is continuous (sCM) or discrete (dCM), not {self.consistency!r}")
+        for name in ("student_times", "critic_times"):
+            mean, std = (float(value) for value in getattr(self, name))
+            object.__setattr__(self, name, (mean, std))
+
+    def check(self, run: DiffusionRunConfig) -> None:
+        super().check(run)
+        if not self.teacher:
+            raise ValueError("rCM distills a teacher; name its run directory")
+
+    def objective(self, run: DiffusionRunConfig, model: nn.Module, process: Process, inputs: InputSpec, *,
+                  autoencoder: AutoEncoder | None,
+                  variables: Variables | None) -> ConsistencyDistillationObjective:
+        self.check_teacher(run.model.architecture)
+        return ConsistencyDistillationObjective(
+            model, process, inputs, self, teacher=teacher_variables(self.teacher, variables),
+            autoencoder=autoencoder, variables=variables, ema_decay=run.ema_decay, solver=run.solver,
+            guidance=None, steps=run.sampling_steps)
+
+    def check_teacher(self, architecture: str) -> None:
+        """Refuse sCM over a teacher whose time embedding is too fast in time.
+
+        The student starts from the teacher's variables, its Fourier table
+        among them, so the time scale the student trains through is the one
+        the teacher was trained at, whatever this run's model config says.
+        """
+        from .config import DiffusionRunConfig
+
+        if self.consistency != "continuous" or self.consistency_weight <= 0:
+            return
+        if "time_scale" not in {field.name for field in dataclasses.fields(models[architecture])}:
+            return
+        teacher = DiffusionRunConfig.load(self.teacher)
+        scale = teacher.model_fields(None).get("time_scale",
+                                               {f.name: f.default for f in dataclasses.fields(
+                                                   models[teacher.model.architecture])}["time_scale"])
+        if scale != SMOOTH_TIME_SCALE:
+            raise ValueError(
+                f"sCM differentiates the student in time, and the student starts from a teacher trained at "
+                f"time_scale={scale}, whose time embedding is too fast in it to learn from; "
+                "train the teacher "
+                f"with time_scale={SMOOTH_TIME_SCALE}, or distill with dmd only (consistency_weight=0)"
+            )
+
+
 @objectives("rcm")
 class ConsistencyDistillationObjective(DiffusionObjective):
     """Trains rCM: sCM distillation of a flow teacher, regularized by DMD2.
@@ -235,20 +319,9 @@ class ConsistencyDistillationObjective(DiffusionObjective):
         model: nn.Module,
         process: Process,
         inputs: InputSpec,
+        distillation: ConsistencyDistillation,
         *,
         teacher: Variables,
-        consistency_weight: float = 100.0,
-        dmd_weight: float = 1.0,
-        teacher_guidance: float = 1.0,
-        tangent_warmup: int = 0,
-        student_update_freq: int = 5,
-        max_simulation_steps: int = 4,
-        student_times: tuple[float, float] = (-0.8, 1.6),
-        critic_times: tuple[float, float] = (0.0, 1.6),
-        consistency: Literal["continuous", "discrete"] = "continuous",
-        discrete_steps: int = 48,
-        discrete_skip: int = 1,
-        discrete_shift: float = 5.0,
         **kwargs,
     ):
         schedule = process.schedule
@@ -257,27 +330,12 @@ class ConsistencyDistillationObjective(DiffusionObjective):
             raise ValueError("rCM distills a velocity model on the unshifted linear path; build the "
                              "process with presets.Flow()")
         _own_loss("rCM", kwargs)
-        if consistency_weight <= 0 and dmd_weight <= 0:
-            raise ValueError("rCM needs a consistency or a distribution-matching loss")
         kwargs.setdefault("guidance", None)
         kwargs.setdefault("solver", Consistency())
         kwargs.setdefault("steps", 3)
         super().__init__(model, process, inputs, **kwargs)
         self.teacher = teacher
-        self.consistency_weight = consistency_weight
-        self.dmd_weight = dmd_weight
-        self.teacher_guidance = teacher_guidance
-        self.tangent_warmup = tangent_warmup
-        self.student_update_freq = student_update_freq
-        self.max_simulation_steps = max_simulation_steps
-        self.student_times = student_times
-        self.critic_times = critic_times
-        if consistency not in ("continuous", "discrete"):
-            raise ValueError(f"consistency is continuous (sCM) or discrete (dCM), not {consistency!r}")
-        self.consistency = consistency
-        self.discrete_steps = discrete_steps
-        self.discrete_skip = discrete_skip
-        self.discrete_shift = discrete_shift
+        self.distillation = distillation
         if self.ema is not None:
             decay = self.ema.decay
             self.ema = EMASpec(decay=lambda count: decay(self._effective(count)),
@@ -285,15 +343,17 @@ class ConsistencyDistillationObjective(DiffusionObjective):
 
     def _student(self, iteration) -> jax.Array:
         """Whether update `iteration` trains the student (`is_student_phase`)."""
-        return ((self.dmd_weight <= 0) | (iteration < self.tangent_warmup)
-                | ((iteration - self.tangent_warmup) % self.student_update_freq == 0))
+        options = self.distillation
+        return ((options.dmd_weight <= 0) | (iteration < options.tangent_warmup)
+                | ((iteration - options.tangent_warmup) % options.student_update_freq == 0))
 
     def _effective(self, iteration) -> jax.Array:
         """The student updates before update `iteration` (`get_effective_iteration`)."""
-        if self.dmd_weight <= 0:
+        if self.distillation.dmd_weight <= 0:
             return jnp.asarray(iteration)
-        return jnp.where(iteration < self.tangent_warmup, iteration, self.tangent_warmup
-                         + (iteration - self.tangent_warmup) // self.student_update_freq)
+        options = self.distillation
+        return jnp.where(iteration < options.tangent_warmup, iteration, options.tangent_warmup
+                         + (iteration - options.tangent_warmup) // options.student_update_freq)
 
     def optimizer(self, tx: optax.GradientTransformation, *,
                   accumulation: int) -> optax.GradientTransformation:
@@ -303,7 +363,7 @@ class ConsistencyDistillationObjective(DiffusionObjective):
         optimizers do. With DMD2 on, an `accumulation` above one raises
         `ValueError`.
         """
-        if accumulation > 1 and self.dmd_weight > 0:
+        if accumulation > 1 and self.distillation.dmd_weight > 0:
             raise ValueError(
                 "rCM alternates its student and fake-score updates update by update, so an update "
                 "takes one microbatch: train with accumulation=1 and a larger batch")
@@ -355,10 +415,11 @@ class ConsistencyDistillationObjective(DiffusionObjective):
     def _teacher(self, params, given, blank, x, t) -> tuple[jax.Array, jax.Array]:
         teacher = jax.lax.stop_gradient(params[TEACHER])
         clean, F = trig_prediction(self._network(teacher, given), x, t)
-        if self.teacher_guidance <= 1.0:
+        if self.distillation.teacher_guidance <= 1.0:
             return clean, F
         clean_u, F_u = trig_prediction(self._network(teacher, blank), x, t)
-        return guided(clean_u, clean, self.teacher_guidance), guided(F_u, F, self.teacher_guidance)
+        scale = self.distillation.teacher_guidance
+        return guided(clean_u, clean, scale), guided(F_u, F, scale)
 
     @staticmethod
     def _times(normal, moments) -> jax.Array:
@@ -369,9 +430,10 @@ class ConsistencyDistillationObjective(DiffusionObjective):
     def _draws(self, step: Step, count: int, shape) -> _Draws:
         """Every random value the step at `step` reads, from its key."""
         keys = jax.random.split(step.key, 7)
-        simulated = self.max_simulation_steps - 1
+        simulated = self.distillation.max_simulation_steps - 1
         return _Draws(
-            consistency_time=(jax.random.uniform(keys[0], (count,)) if self.consistency == "discrete"
+            consistency_time=(jax.random.uniform(keys[0], (count,))
+                              if self.distillation.consistency == "discrete"
                               else jax.random.normal(keys[0], (count,))),
             consistency_noise=jax.random.normal(keys[1], shape),
             start=jax.random.normal(keys[2], shape),
@@ -383,16 +445,17 @@ class ConsistencyDistillationObjective(DiffusionObjective):
     def _generated(self, student_params, given, draws: _Draws, iteration) -> jax.Array:
         """The student's DMD2 sample: `max_simulation_steps` noisings drawn,
         the first `steps - 1` walked, where steps cycles with `iteration`."""
-        steps = iteration % self.max_simulation_steps + 1
-        times = self._times(draws.simulation_times, self.critic_times)
+        steps = iteration % self.distillation.max_simulation_steps + 1
+        times = self._times(draws.simulation_times, self.distillation.critic_times)
         # Steps past the drawn count leave the time where it is: from t = 0
         # nothing is noised again.
-        live = jnp.arange(self.max_simulation_steps - 1) < steps - 1
+        live = jnp.arange(self.distillation.max_simulation_steps - 1) < steps - 1
         network = self._network(student_params, given)
         return backward_simulation(lambda x, t: trig_prediction(network, x, t)[0], draws.start, times,
                                    draws.simulation_noises, live)
 
     def loss(self, variables, batch, step: Step):
+        options = self.distillation
         samples = unit_range(batch[self.inputs.sample.key])
         encode_key, drop_key = jax.random.split(jax.random.fold_in(step.key, 1))
         if self.autoencoder is not None:
@@ -401,31 +464,32 @@ class ConsistencyDistillationObjective(DiffusionObjective):
         given, blank = self._conditions(variables, batch, drop_key, dropout=False)
         draws = self._draws(step, count, samples.shape)
         iteration = step.step
-        warm = iteration < self.tangent_warmup
+        warm = iteration < options.tangent_warmup
         student_phase = self._student(iteration)
         effective = self._effective(iteration)
 
         def student_losses(params):
             student_params = self.model_variables(params)
             total = jnp.zeros((count,), jnp.float32)
-            if self.consistency_weight > 0 and self.consistency == "discrete":
+            if options.consistency_weight > 0 and options.consistency == "discrete":
                 network = self._network(student_params, given)
-                u = draws.consistency_time * (1 - self.discrete_skip / self.discrete_steps)
+                u = draws.consistency_time * (1 - options.discrete_skip / options.discrete_steps)
                 total = total + discrete_consistency_loss(
                     lambda x, t: trig_prediction(network, x, t)[0],
                     lambda x, t: self._teacher(params, given, blank, x, t)[1],
-                    samples, draws.consistency_noise, u, self.discrete_steps,
-                    self.discrete_skip, self.discrete_shift, self.consistency_weight)
-            elif self.consistency_weight > 0:
-                t = self._times(draws.consistency_time, self.student_times)
+                    samples, draws.consistency_noise, u, options.discrete_steps,
+                    options.discrete_skip, options.discrete_shift, options.consistency_weight)
+            elif options.consistency_weight > 0:
+                t = self._times(draws.consistency_time, options.student_times)
                 noise = draws.consistency_noise
                 x = expand(jnp.cos(t), samples) * samples + expand(jnp.sin(t), samples) * noise
                 _, teacher_F = self._teacher(params, given, blank, x, t)
-                ratio = 1.0 if self.tangent_warmup == 0 else jnp.minimum(1.0, iteration / self.tangent_warmup)
+                warmup = options.tangent_warmup
+                ratio = 1.0 if warmup == 0 else jnp.minimum(1.0, iteration / warmup)
                 network = self._network(student_params, given)
                 total = total + consistency_loss(lambda x, t: trig_prediction(network, x, t)[1], x, t,
-                                                 teacher_F, ratio, self.consistency_weight)
-            if self.dmd_weight > 0:
+                                                 teacher_F, ratio, options.consistency_weight)
+            if options.dmd_weight > 0:
                 distribution = self._distribution_matching(params, student_params, given, blank, draws,
                                                            effective)
                 total = total + jnp.where(warm, 0.0, distribution)
@@ -434,7 +498,7 @@ class ConsistencyDistillationObjective(DiffusionObjective):
         def critic_losses(params):
             generated = jax.lax.stop_gradient(self._generated(
                 self.model_variables(params), given, draws, iteration - effective - 1))
-            t = self._times(draws.critic_time, self.critic_times)
+            t = self._times(draws.critic_time, options.critic_times)
             noise = draws.critic_noise
             x = expand(jnp.cos(t), generated) * generated + expand(jnp.sin(t), generated) * noise
             fake, _ = trig_prediction(self._network(self._fake(params), given), x, t)
@@ -444,13 +508,14 @@ class ConsistencyDistillationObjective(DiffusionObjective):
         return Ratio(jnp.sum(losses), jnp.asarray(count, jnp.float32)), Aux(metrics={})
 
     def _distribution_matching(self, params, student_params, given, blank, draws: _Draws, iteration):
+        options = self.distillation
         generated = self._generated(student_params, given, draws, iteration)
-        t = self._times(draws.critic_time, self.critic_times)
+        t = self._times(draws.critic_time, options.critic_times)
         noise = draws.critic_noise
         x = expand(jnp.cos(t), generated) * generated + expand(jnp.sin(t), generated) * noise
         fake, _ = trig_prediction(self._network(jax.lax.stop_gradient(self._fake(params)), given), x, t)
         teacher, _ = self._teacher(params, given, blank, x, t)
-        return distribution_matching_loss(generated, jax.lax.stop_gradient(fake), teacher, self.dmd_weight)
+        return distribution_matching_loss(generated, jax.lax.stop_gradient(fake), teacher, options.dmd_weight)
 
 
 __all__ = [

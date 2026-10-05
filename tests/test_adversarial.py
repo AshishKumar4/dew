@@ -130,11 +130,13 @@ def test_one_step_is_the_papers_equations_on_stylegan_ts_heads():
               for name in ("layer_a", "layer_b")}
     teacher = {"params": unflattened("teacher") | layers}
     task = AdversarialDistillationObjective(
-        Tokens(settings["width"]), Flow()(), InputSpec(Field("image", pixels.shape[1:])), teacher=teacher,
-        feature_layers=settings["layers"], student_times=settings["student_times"],
-        renoise_times=tuple(settings["renoise_times"]), distillation_weight=settings["distillation_weight"],
-        r1_weight=settings["r1_weight"], cmap_dim=settings["cmap_dim"], kernel_size=(1, 1),
-        time_features=settings["time_features"], ema_decay=None)
+        Tokens(settings["width"]), Flow()(), InputSpec(Field("image", pixels.shape[1:])),
+        AdversarialDistillation(feature_layers=settings["layers"], student_times=settings["student_times"],
+                                renoise_times=tuple(settings["renoise_times"]),
+                                distillation_weight=settings["distillation_weight"],
+                                r1_weight=settings["r1_weight"], cmap_dim=settings["cmap_dim"],
+                                kernel_size=(1, 1)),
+        teacher=teacher, time_features=settings["time_features"], ema_decay=None)
     variables = task.init(jax.random.PRNGKey(0))
     student = unflattened("student")
     for name in ("layer_a", "layer_b"):
@@ -184,7 +186,7 @@ def runs(tmp_path_factory):
     checkpoints.save(1, state, None, artifact=objective.inference_record())
     checkpoints.wait()
     teacher.save(str(root / "teacher"))
-    student = dataclasses.replace(teacher, solver=Consistency(), adversarial=AdversarialDistillation(
+    student = dataclasses.replace(teacher, solver=Consistency(), mode=AdversarialDistillation(
         teacher=str(root / "teacher"), feature_layers=("dit_block_0", "dit_block_1"), cmap_dim=8,
         kernel_size=(3, 3)))
     return student, batch
@@ -206,7 +208,8 @@ def test_each_side_trains_on_its_own_loss(runs):
             total, aux = task.loss({**params, "params": tree}, batch, step)
             if name is None:
                 return total.total
-            return sum(aux.metrics[key] * (task.r1_weight if key == "r1" else 1) for key in name) * total.mass
+            gamma = task.distillation.r1_weight
+            return sum(aux.metrics[key] * (gamma if key == "r1" else 1) for key in name) * total.mass
         return jax.grad(loss)(params["params"])
 
     everything = part(None)

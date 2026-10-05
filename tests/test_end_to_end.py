@@ -398,8 +398,13 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
     from dew.checkpoints import Checkpoints
     from dew.config import ModelConfig, TrainerConfig
     from dew.data import TFDSImages
-    from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
-    from dew.objectives.diffusion.config import RepresentationAlignment
+    from dew.objectives.diffusion import (
+        Denoising,
+        DiffusionRunConfig,
+        PretrainedAutoencoder,
+        RepresentationAlignment,
+        TextCondition,
+    )
 
     for name in ("tiny_diffusers", "rae"):
         with tarfile.open(FIXTURES / f"{name}.tar.xz") as archive:
@@ -411,8 +416,9 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
         sampling_steps=2, ema_decay=None, val_metrics=(), trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
         text=TextCondition(encoder="char_table", checkpoint="char_table"),
         autoencoder=PretrainedAutoencoder(modelname=str(tmp_path / "tiny_diffusers/sd/vae"), dtype="float32"),
-        alignment=RepresentationAlignment(encoder=str(tmp_path / "rae/dinov2_plain"), layer="dit_block_0",
-                                          width=8, resolution=112, end_to_end=EndToEnd()))
+        mode=Denoising(alignment=RepresentationAlignment(
+            encoder=str(tmp_path / "rae/dinov2_plain"), layer="dit_block_0", width=8, resolution=112,
+            end_to_end=EndToEnd())))
     task = config.build()
     trainer = Trainer(task, optax.adam(1e-2), key=jax.random.PRNGKey(3))
     state = trainer.initial_state()

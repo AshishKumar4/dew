@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     from dew.nn.mixers import MixerBase
     from dew.nn.vision import ProjectorBase, TowerBase
     from dew.objectives.base import Metric, Objective
+    from dew.objectives.diffusion.objective import Training
     from dew.sampling.solvers import Solver
     from dew.training.optim import ScheduleBase
 
@@ -731,6 +732,7 @@ mixers: Registry[type[MixerBase], MixerBase] = Registry("mixer").share()
 towers: Registry[type[TowerBase], TowerBase] = Registry("tower").share()
 projectors: Registry[type[ProjectorBase], ProjectorBase] = Registry("projector").share()
 schedules: Registry[type[ScheduleBase], ScheduleBase] = Registry("schedule").share()
+trainings: Registry[type[Training], Training] = Registry("training").share()
 
 __all__ = [
     "PLUGINS",

@@ -1,25 +1,13 @@
-from .adversarial import AdversarialDistillationObjective
-from .alignment import Alignment
+from .adversarial import AdversarialDistillation, AdversarialDistillationObjective
+from .alignment import Alignment, RepresentationAlignment
 from .block import BlockDiffusionObjective
-from .config import (
-    AdversarialDistillation,
-    AudioCondition,
-    ConsistencyDistillation,
-    DiffusionRunConfig,
-    FlowGRPO,
-    GuidanceDistillation,
-    MeanFlowTraining,
-    PretrainedAutoencoder,
-    RepresentationAlignment,
-    ShortcutTraining,
-    TextCondition,
-)
-from .consistency import ConsistencyDistillationObjective
+from .config import AudioCondition, DiffusionRunConfig, FlowGRPO, PretrainedAutoencoder, TextCondition
+from .consistency import ConsistencyDistillation, ConsistencyDistillationObjective
 from .end_to_end import EndToEnd
-from .few_step import MeanFlowObjective, ShortcutObjective
-from .guidance_distillation import GuidanceDistillationObjective
+from .few_step import MeanFlowObjective, MeanFlowTraining, ShortcutObjective, ShortcutTraining
+from .guidance_distillation import GuidanceDistillation, GuidanceDistillationObjective
 from .masked import MaskedDiffusionObjective
-from .objective import VALIDATION_SAMPLES, DiffusionObjective
+from .objective import VALIDATION_SAMPLES, Denoising, DiffusionObjective
 
 __all__ = [
     "VALIDATION_SAMPLES",
@@ -30,6 +18,7 @@ __all__ = [
     "BlockDiffusionObjective",
     "ConsistencyDistillation",
     "ConsistencyDistillationObjective",
+    "Denoising",
     "DiffusionObjective",
     "DiffusionRunConfig",
     "EndToEnd",
