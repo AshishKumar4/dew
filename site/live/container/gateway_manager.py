@@ -10,6 +10,7 @@ import json
 import os
 import shlex
 import subprocess
+import tempfile
 from pathlib import Path
 
 from kernel_gateway.services.kernels.manager import (
@@ -56,9 +57,15 @@ class LimitedKernelManager(KernelGatewayIOLoopKernelManager):
         connection.parent.mkdir(mode=0o711, exist_ok=True)
         data = json.loads(Path(self.connection_file).read_text())
         data['ip'] = '/work/ipc/kernel'
-        connection.write_text(json.dumps(data))
-        os.chown(connection, uid, uid)
-        os.chmod(connection, 0o400)
+        descriptor, temporary = tempfile.mkstemp(dir=connection.parent)
+        try:
+            with os.fdopen(descriptor, 'w') as stream:
+                json.dump(data, stream)
+                os.fchown(stream.fileno(), uid, uid)
+                os.fchmod(stream.fileno(), 0o400)
+            os.replace(temporary, connection)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
         directory = Path(self.ip).parent
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chown(directory, uid, uid)
