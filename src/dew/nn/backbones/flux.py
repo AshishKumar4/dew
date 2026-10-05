@@ -1,16 +1,17 @@
 """Flux's transformer, as Diffusers 0.34.0's `FluxTransformer2DModel` runs it.
 
-The published model reads a packed latent: 2x2 patches already folded into
-the channel axis by its pipeline, one position per patch. Its stack has two
-halves. The double-stream blocks carry the image and the text in separate
-residual streams with their own modulation and feed-forwards, joined only
-inside attention; the single-stream blocks concatenate the two and run one
-stream whose attention and feed-forward share a projection. Every attention
-call rotates its queries and keys with a three-axis rotary table over the
-text and image ids, in the interleaved-real form Flux uses.
+The published model reads a packed latent, in which its pipeline has already
+folded 2x2 patches into the channel axis, one position per patch. Its stack
+has two halves. The double-stream blocks keep the image and the text in
+separate residual streams, each with its own modulation and feed-forward,
+and join them only inside attention. The single-stream blocks concatenate
+the two and run one stream whose attention and feed-forward share an output
+projection. Every attention call rotates its queries and keys with a
+three-axis rotary table over the text and image ids, in the interleaved-real
+form Flux uses.
 
-The double-stream blocks are `DoubleStreamBlock`s with the text leading;
-what Flux alone does is here.
+The double-stream blocks are `DoubleStreamBlock`s with the text first. This
+module holds what only Flux does.
 """
 
 from __future__ import annotations
@@ -45,8 +46,11 @@ if TYPE_CHECKING:
 
 
 def flux_positions(rows: int, columns: int, text: int) -> np.ndarray:
-    """The ids a Flux pipeline lays out: the text at the origin, then one
-    position per packed patch, indexed by its row and column."""
+    """Return the position ids a Flux pipeline lays out.
+
+    The text sits at the origin, followed by one position per packed patch,
+    indexed by its row and column.
+    """
     positions = np.zeros((text + rows * columns, 3), dtype=np.float32)
     grid = np.indices((rows, columns), dtype=np.float32).reshape(2, -1)
     positions[text:, 1], positions[text:, 2] = grid[0], grid[1]
@@ -55,8 +59,10 @@ def flux_positions(rows: int, columns: int, text: int) -> np.ndarray:
 
 @logical_axes({("proj_mlp",): ("embed", "mlp"), ("proj_fused",): (None, "embed")})
 class FluxSingleBlock(nn.Module):
-    """One single-stream block: attention and a feed-forward over the joined
-    sequence, whose outputs are concatenated and projected together."""
+    """Runs one single-stream block: attention and a feed-forward over the joined sequence.
+
+    Their outputs are concatenated and projected back together.
+    """
 
     features: int
     heads: int
@@ -95,16 +101,16 @@ class FluxSingleBlock(nn.Module):
                ("text_embedder_linear_1",): (None, "embed"),
                ("text_embedder_linear_2",): (None, "embed")})
 class FluxTransformer(nn.Module):
-    """Diffusers 0.34.0's `FluxTransformer2DModel` over Dew's interface.
+    """Runs Diffusers 0.34.0's `FluxTransformer2DModel` behind Dew's model interface.
 
-    `__call__` takes NHWC latents, the model time the schedule supplies -
-    the sigma times the training count, which is the product the source
-    reaches by dividing its timestep and multiplying it back - and a
-    `DenoisingCondition` whose `context` is the T5
-    token states, whose `pooled` is the CLIP pooled vector and whose
-    `guidance` is the distilled guidance value a guidance-embedded checkpoint
-    reads. The 2x2 packing its pipeline performs is here, so a caller works
-    in latents and the position ids follow the latent grid.
+    `__call__` takes NHWC latents, the model time the schedule supplies, and
+    a `DenoisingCondition`. The model time is the sigma times the training
+    count; the source reaches the same product by dividing its timestep by a
+    thousand and multiplying it back. The condition's `context` is the T5
+    token states, its `pooled` is the CLIP pooled vector, and its `guidance`
+    is the distilled guidance value that a guidance-embedded checkpoint
+    reads. The model does the 2x2 packing that the source's pipeline does,
+    so a caller works in latents and the position ids follow the latent grid.
     """
 
     patch_size: int = 1
@@ -146,8 +152,13 @@ class FluxTransformer(nn.Module):
 
     @nn.compact
     def __call__(self, x, time, conditioning: DenoisingCondition, train: bool = False):
-        """`train` is the objective's standard call contract; the published
-        transformer holds no dropout, so it changes nothing here."""
+        """Return the flow for the latents `x` at `time` under `conditioning`.
+
+        `train` is part of the objective's standard call; the published
+        transformer has no dropout, so it changes nothing here. Raises
+        `ValueError` for latents that are not NHWC or do not pack into 2x2
+        patches, and for a condition without `pooled`.
+        """
         if x.ndim != 4:
             raise ValueError(f"Flux takes NHWC latents, got shape {x.shape}")
         rows, columns = x.shape[1] // 2, x.shape[2] // 2

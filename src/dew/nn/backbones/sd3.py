@@ -1,15 +1,16 @@
 """Stable Diffusion 3's own MM-DiT, as the published transformer computes it.
 
-The arithmetic of Diffusers 0.34.0's `SD3Transformer2DModel`, apart from
-`SimpleMMDiT`: the modulation channel order, the image-then-context joint
-attention, the position buffer's centred crop, the summed timestep and
-pooled-text embedders, the last block's context-only norm, and SD3.5's
-ninefold modulation with a second self-attention; the blocks are
-`DoubleStreamBlock`s with the image leading. The interface is Dew's:
-NHWC latents, a model time, a `DenoisingCondition` with the text tokens and
-pooled vector, NHWC velocity out. The source's sin/cos position buffer rides
-in the `buffers` collection, so no optimizer sees it and the checkpoint's
-stored values are what is read and exported.
+This module has the arithmetic of Diffusers 0.34.0's `SD3Transformer2DModel`
+where it differs from `SimpleMMDiT`: the modulation channel order, the joint
+attention with the image first, the centred crop of the position buffer, the
+summed timestep and pooled-text embedders, the last block's context-only
+norm, and SD3.5's ninefold modulation with a second self-attention. The
+blocks are `DoubleStreamBlock`s with the image first. The interface is
+Dew's: NHWC latents, a model time and a `DenoisingCondition` with the text
+tokens and pooled vector go in, and NHWC velocity comes out. The source's
+sin/cos position buffer is stored in the `buffers` collection, so no
+optimizer sees it, and the model reads and exports the checkpoint's stored
+values.
 """
 
 from __future__ import annotations
@@ -35,11 +36,12 @@ if TYPE_CHECKING:
 
 
 def sincos_position(channels: int, grid: int, *, base_size: int):
-    """`get_2d_sincos_pos_embed` at the grid the source builds its buffer on:
-    the leading half of the channels carries the column, the trailing half the
-    row, each sine then cosine over 10000^-(2i/half), both axes divided by
-    `grid / base_size`. Only the initializer; a loaded checkpoint brings its
-    stored buffer.
+    """Return `get_2d_sincos_pos_embed` at the grid the source builds its buffer on.
+
+    The leading half of the channels encodes the column and the trailing half
+    the row, each as sines then cosines over 10000^-(2i/half), with both axes
+    divided by `grid / base_size`. This only initializes the buffer; a loaded
+    checkpoint brings its stored buffer.
     """
     steps = jnp.arange(grid, dtype=jnp.float32) / (grid / base_size)
     columns, rows = jnp.meshgrid(steps, steps, indexing="xy")  # width goes first
@@ -61,13 +63,13 @@ def sincos_position(channels: int, grid: int, *, base_size: int):
                ("text_embedder_linear_1",): (None, "embed"),
                ("text_embedder_linear_2",): (None, "embed")})
 class SD3Transformer(nn.Module):
-    """Diffusers 0.34.0's `SD3Transformer2DModel` over Dew's interface.
+    """Runs Diffusers 0.34.0's `SD3Transformer2DModel` behind Dew's model interface.
 
-    `__call__` takes NHWC latents, the model time and a `DenoisingCondition`
-    whose `context` is the text token states and whose `pooled` is the pooled
-    text vector, and returns NHWC velocity. The latent grid may be any even
-    rectangle the position buffer covers; the buffer is cropped centred on it,
-    the way the source crops.
+    `__call__` takes NHWC latents, the model time and a `DenoisingCondition`,
+    and returns NHWC velocity. The condition's `context` is the text token
+    states and its `pooled` is the pooled text vector. The latent grid may be
+    any even rectangle that the position buffer covers; the buffer is cropped
+    centred on it, the way the source crops it.
     """
 
     patch_size: int = 2
@@ -92,7 +94,11 @@ class SD3Transformer(nn.Module):
         return self.heads * self.head_dim
 
     def position(self, height: int, width: int):
-        """The stored position buffer cropped centred on this patch grid."""
+        """Return the stored position buffer, cropped centred on a `height` by `width` patch grid.
+
+        A grid larger than `pos_embed_max_size` on either side raises
+        `ValueError`.
+        """
         maximum = self.pos_embed_max_size
         buffer = self.variable(
             "buffers", "pos_embed",
@@ -108,8 +114,14 @@ class SD3Transformer(nn.Module):
 
     @nn.compact
     def __call__(self, x, time, conditioning: DenoisingCondition, train: bool = False):
-        """`train` is the objective's standard call contract; the published
-        transformer holds no dropout, so it changes nothing here."""
+        """Return the velocity for the latents `x` at `time` under `conditioning`.
+
+        `train` is part of the objective's standard call; the published
+        transformer has no dropout, so it changes nothing here. Raises
+        `ValueError` for latents that are not NHWC or not whole patches, for a
+        condition without `pooled`, and for a `qk_norm` other than 'rms_norm'
+        or None.
+        """
         if x.ndim != 4:
             raise ValueError(f"SD3 takes NHWC latents, got shape {x.shape}")
         patch = self.patch_size

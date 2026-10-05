@@ -1,9 +1,10 @@
 """Pallas kernels for the operations XLA does not fuse.
 
-Each module here owns one operation, exports the predicate that says which
-shapes and backends its kernel covers, and leaves the XLA form that it
-replaces in the module the operation belongs to, as the oracle its tests
-compare against and as the path every other shape and backend takes.
+Each module here implements one operation and exports the predicate that
+says which shapes and backends its kernel covers. The XLA form that the
+kernel replaces stays in the module the operation belongs to. That form is
+the reference the kernel's tests compare against, and the path every other
+shape and backend takes.
 """
 
 from .generation import bf16_dot_runs, device_generation, triton_runs

@@ -66,13 +66,14 @@ def _program_words(chunk_size: int, head_dim: int, state_size: int) -> int:
 
 def ssd_kernel_runs(chunk_size: int, head_dim: int, state_size: int, backend: str, *,
                     dtype: DTypeLike) -> bool:
-    """Whether the SSD kernel is chosen for this geometry and the scan's
-    `dtype`: a tpu backend, a float32 scan (a wider one takes the XLA path in
-    its own dtype), a chunk long enough to pay for a program, three
-    power-of-two widths so Mosaic's tiling wastes no lanes, and a tile inside
-    the per-program budget. A Triton port ran 6x to 12x slower than XLA on an
-    RTX 4080 and overflowed shared memory at chunks of 128 and 256
-    (docs/performance.md), so a GPU takes the XLA path.
+    """Return whether the SSD kernel is chosen for this geometry and the scan's `dtype`.
+
+    The kernel needs a tpu backend, a float32 scan (a wider scan takes the
+    XLA path in its own dtype), a chunk long enough to pay for a program,
+    three power-of-two widths so that Mosaic's tiling wastes no lanes, and a
+    tile inside the per-program budget. A Triton port ran 6x to 12x slower
+    than XLA on an RTX 4080 and overflowed shared memory at chunks of 128 and
+    256 (docs/performance.md), so a GPU takes the XLA path.
     """
     if backend != 'tpu' or jnp.dtype(dtype) != jnp.float32:
         return False
@@ -96,7 +97,10 @@ def _announce(backend: str, chunk_size: int, head_dim: int, state_size: int,
 
 def ssd_kernel_platform(chunk_size: int, head_dim: int, state_size: int, *,
                         dtype: DTypeLike) -> str | None:
-    """The backend to build this `dtype` scan's kernel for, or None for the XLA path."""
+    """Return the backend to build this `dtype` scan's kernel for, or None for the XLA path.
+
+    The choice is logged once per geometry.
+    """
     backend = jax.default_backend()
     platform = backend if ssd_kernel_runs(chunk_size, head_dim, state_size, backend,
                                           dtype=dtype) else None

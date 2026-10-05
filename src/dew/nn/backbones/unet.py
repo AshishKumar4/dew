@@ -98,25 +98,26 @@ def unet_body(model: "Unet", x, temb, text, temporal=None):
 
 @models("unet")
 class Unet(nn.Module):
-    """A convolutional UNet with residual blocks and cross-attention stages.
+    """Denoises images with a convolutional UNet of residual blocks and cross-attention stages.
 
-    Without text the attention stages self-attend (`TransformerBlock`'s
+    Without text, the attention stages self-attend (`TransformerBlock`'s
     context defaults to its input). Cross-attention reads the whole text
-    sequence; the mask the DiT family pools with has no place here.
+    sequence, so the mask that the DiT family pools with is not used here.
 
-    It is FlaxDiff's `Unet` but for one width: the decoder upsamples level i
-    into `feature_depths[-i - 2]`, the width of the level it enters, where
+    It is FlaxDiff's `Unet` except for one width. The decoder upsamples level
+    i into `feature_depths[-i - 2]`, the width of the level it enters, where
     FlaxDiff's upsamples into `feature_depths[-i]`. The two agree for two
-    levels or equal depths, where tests/test_flaxdiff_family_source.py holds
-    this model to FlaxDiff's.
+    levels or for equal depths.
     """
+    # tests/test_flaxdiff_family_source.py holds this model to FlaxDiff's in
+    # the configurations where the two agree.
     output_channels:int=3
     emb_features:int=64*4
     feature_depths: Sequence[int] = (64, 128, 256, 512)
     attention_configs: Sequence[Stage | None] = (
         Stage(heads=8), Stage(heads=8), Stage(heads=8), Stage(heads=8))
-    """Attention per resolution stage, one entry per feature depth; None is a
-    stage with no attention."""
+    """The attention of each resolution stage, one entry per feature depth.
+    None is a stage with no attention."""
     num_res_blocks:int=2
     num_middle_res_blocks:int=1
     activation:Callable = jax.nn.swish
