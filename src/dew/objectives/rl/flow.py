@@ -295,9 +295,9 @@ class FlowRollout:
     equal prompt text in other rows does not merge groups. Rows with zero
     advantage are masked, as the reference training loop filters them out.
 
-    The callback's scores, their JSON and byte transport and the population
-    statistics stay in float64, and so do the rewards on the host. The
-    training advantages are float32 after normalization. The `reward` metric
+    Rewards stay in float64 from the callback, through the JSON and byte
+    transport, to the population statistics, and they stay float64 on the
+    host. The training advantages are float32 after normalization. The `reward` metric
     is a float32 diagnostic, and JAX's device transfer also narrows the
     reward column when x64 is off.
 
