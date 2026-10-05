@@ -138,7 +138,7 @@ const tutorialNames: Record<string, string> = {
 
 		<section class="band" data-reveal>
 			<h2 class="band-title">Serving</h2>
-			<p class="band-lede">A <code>TextGeneration</code> task holds the model, its weights and the sampling settings. <code>Server</code> runs many requests through one task in shared batches, and each request keeps its own seed and KV cache.</p>
+			<p class="band-lede">A <code>TextGeneration</code> task holds the model, its weights and the sampling settings. <code>Server</code> runs many requests through one task in shared batches, and each request keeps its own random key and KV cache.</p>
 			<Code code={snippet('serving')} lang="python" title="framework.py (batched decoding)" />
 			<pre class="shown-output">{records.serving.result.text.join('\n')}</pre>
 			<p class="framework-note">Store weights in int8 or fp8:</p>
