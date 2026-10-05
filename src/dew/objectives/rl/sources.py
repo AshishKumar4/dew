@@ -80,17 +80,18 @@ class _Handle:
 
 
 class EnvironmentSource:
-    """Run `Environment` sessions against a `RolloutServer`, one worker thread each.
+    """Runs `Environment` sessions against a `RolloutServer`, each on its own worker thread.
 
-    `environment(task, identity)` enters one environment per session and
-    `verifier(task, episode)` scores completed and truncated episodes; both
+    `environment(task, identity)` enters one environment per session, and
+    `verifier(task, episode)` scores completed and truncated episodes. Both
     read the task's own payload, and `identity.task` is the submission's
-    serial number. `workers` bounds concurrent sessions; the server
-    batches their calls. `cancel` stops a session at its next turn or
-    mid-draw, never inside `environment.step`: an environment must bound its
-    own step time, or a hung step holds its worker until it returns.
+    serial number. `workers` is the most sessions that run at once, and the
+    server batches their calls. The server's sampling policy must set an EOS
+    id. `cancel` stops a session at its next turn or during a draw, but
+    never inside `environment.step`. So an environment must bound its own
+    step time, or a hung step holds its worker until it returns.
     Environments see the draw's raw likelihoods when the server reports
-    them, and its behavior likelihoods otherwise, which are the same
+    them, and its behavior likelihoods otherwise; the two are the same
     distribution only for a sampling policy without transforms.
     """
 
@@ -132,7 +133,7 @@ class EnvironmentSource:
         return futures
 
     def cancel(self, futures: Sequence[Future[Session]]) -> None:
-        """Stop sessions at their next turn; queued ones never start."""
+        """Stop the given sessions at their next turn, or during a draw. Queued sessions never start."""
         for future in futures:
             if future.cancel():
                 continue
@@ -233,9 +234,10 @@ class EnvironmentSource:
 
 
 def prompt_tasks(batch: Batch) -> list[Task]:
-    """One single-turn task per prompt row: its ids and the three reward strings.
+    """Return one single-turn task per prompt row, with its prompt ids and the reward's three strings.
 
-    The id is a digest of the prompt ids; groups, not ids, keep repeats apart.
+    A task's id is a digest of its prompt ids, so repeated prompts share an
+    id; their groups keep them apart.
     """
     prompts, lengths, sources, truths, infos = prompt_rows(batch)
     rows, width = prompts.shape
@@ -271,13 +273,14 @@ class _Prompt:
 
 
 class PromptSource:
-    """Draw one completion per sample of a `prompt_tasks` task and score its decoded text.
+    """Draws one completion per sample of a `prompt_tasks` task and scores its decoded text.
 
-    `reward` scores the completion with EOS excluded, on `scorers` threads.
-    A draw that ends on its token budget is
-    TRUNCATED and still scored; a failed draw or reward is an
-    infrastructure failure. Anything else that fails resolves the rollout's
-    future with the exception, so no future is left pending.
+    `decode` turns the sampled ids into text, and `reward` scores that text,
+    without the EOS, on `scorers` threads as soon as each draw finishes. A
+    draw that ends on its token budget is TRUNCATED and still scored, and a
+    failed draw or reward gives an INFRA_ERROR session. Any other failure
+    resolves the rollout's future with the exception, so no future is left
+    pending.
     """
 
     def __init__(
@@ -309,12 +312,12 @@ class PromptSource:
                 for k in range(samples)]
 
     def cancel(self, futures: Sequence[Future[Session]]) -> None:
-        """Forget the rollouts; their draws finish on the server and are not scored."""
+        """Cancel the rollouts' futures. Their draws still finish on the server but are not scored."""
         for future in futures:
             future.cancel()
 
     def close(self) -> None:
-        """Stop the reward threads; the server belongs to the caller."""
+        """Stop the reward threads. The caller closes the server; this method does not."""
         self._scorers.shutdown(wait=True, cancel_futures=True)
 
     def _rollout(self, task: Task, prompt: _Prompt, drawn: Future[Draw]) -> Session:
