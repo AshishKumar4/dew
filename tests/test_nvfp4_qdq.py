@@ -12,9 +12,33 @@ from reference_error import assert_as_exact_as_the_reference
 
 from dew.interop import Pretrained, codecs
 from dew.interop.safetensors_io import read_weights
-from dew.training.quantization import NVFP4Input, nvfp4_input_qdq
+from dew.training.quantization import NVFP4Input, _nvfp4_divide, nvfp4_input_qdq
 
 FIXTURE = Path(__file__).parent / "fixtures" / "codecs" / "nvfp4_qdq"
+
+
+def test_the_quantizer_divider_is_ieee_fp32_across_its_scale_ranges():
+    """2.5M normal ratios, half at or beside E2M1 boundaries, with x64 disabled.
+
+    Denominators span 2**-24 to 2**24 over normed activations, MLP products
+    and inverse global scales; quotients reach 128 before E2M1 saturation.
+    NumPy's IEEE fp32 divide supplies every expected bit. The correction
+    runs in fp32 even when the surrounding application enables x64.
+    """
+    rng = np.random.default_rng(2046)
+    count = 1_000_000
+    denominators = np.exp2(rng.uniform(-24, 24, count)).astype(np.float32)
+    quotients = (rng.uniform(-8, 8, count) * np.exp2(rng.uniform(-24, 4, count))).astype(np.float32)
+    numerators = (denominators.astype(np.float64) * quotients.astype(np.float64)).astype(np.float32)
+    boundaries = np.array([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5], np.float32)
+    q, b = rng.choice(boundaries, count // 2), denominators[:count // 2]
+    a = (q.astype(np.float64) * b.astype(np.float64)).astype(np.float32)
+    numerators = np.concatenate([numerators, a, np.nextafter(a, np.inf), np.nextafter(a, -np.inf)])
+    denominators = np.concatenate([denominators, b, b, b])
+    with jax.enable_x64(new_val=False):
+        actual = jax.jit(_nvfp4_divide)(jnp.asarray(numerators), jnp.asarray(denominators))
+    np.testing.assert_array_equal(np.asarray(actual).view(np.uint32),
+                                  (numerators / denominators).view(np.uint32))
 
 
 @pytest.fixture(scope="module", params=["unrounded", "e4m3"])
