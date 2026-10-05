@@ -336,24 +336,47 @@ def test_the_daemon_draws_dews_own_greedy_continuation(imported, client):
                                 f"({tokenizer.decode(ours)!r})")
 
 
+def drawn_logprobs(logits, head: list[int], drawn: list[int]) -> list[float]:
+    """The log-probability each row of `logits` gives the token drawn after it."""
+    rows = np.asarray(logits, np.float64)[len(head) - 1:len(head) - 1 + len(drawn)]
+    shifted = rows - rows.max(-1, keepdims=True)
+    normalised = shifted - np.log(np.exp(shifted).sum(-1, keepdims=True))
+    return [float(normalised[offset, token]) for offset, token in enumerate(drawn)]
+
+
 def test_the_daemon_reports_dews_own_logprobs(imported, client):
     """Tighter than the token identity above, and it drifts first.
 
     `/api/generate` answers `logprobs` with the log-probability it assigned
     each token it drew, so the two engines can be compared as numbers rather
-    than as decisions. F16 tensors under llama.cpp's kernels against fp32
-    under XLA is worth a few thousandths of a logprob here, far less than
-    what separates the model's first choice from its second, which is why
-    the argmax agreement above is not luck. A kernel or precision change
-    that started to matter would widen this before it flipped a token.
+    than as decisions. The daemon serves the F16 GGUF `ollama create`
+    converts the export to, so it cannot reach the float32 model's
+    logprobs; what it may cost is what the conversion costs. Dew's own
+    forward over the weights rounded to F16 measures that, from
+    transformers' float64 forward of the export, and the daemon has to be
+    within tests/reference_error.py's FACTOR of it, RMS over every drawn
+    token. Observed: the daemon 9.0e-4 from float64, the conversion alone
+    6.5e-4 (ratio 1.39; llama.cpp also rounds activations and the KV cache
+    to F16, which the conversion leaves out), Dew's float32 forward 8.6e-7.
+    A kernel or precision change that started to matter would widen this
+    before it flipped a token.
     """
-    _, export, _ = imported
-    from transformers import AutoTokenizer
+    import torch
+    from reference_error import FACTOR, distance
+    from transformers import AutoModelForCausalLM, AutoTokenizer
 
+    from tools.diffusers_wan_reference import float64
+
+    _, export, _ = imported
     tokenizer = AutoTokenizer.from_pretrained(str(export), local_files_only=True)
     loaded = Pretrained.load(str(export), dtype="float32", attention_impl="xla")
+    rounded = jax.tree.map(lambda leaf: leaf.astype(jnp.float16).astype(leaf.dtype)
+                           if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf, loaded.variables)
+    with float64():
+        reference = AutoModelForCausalLM.from_pretrained(str(export), dtype=torch.float64,
+                                                         attn_implementation="eager").eval()
 
-    worst = 0.0
+    daemon, converted, truth = [], [], []
     for prompt in PROMPTS:
         head = tokenizer.encode(prompt, add_special_tokens=False)
         answer = draw(client, prompt, DRAWN, sampling=GREEDY, logprobs=True)
@@ -362,14 +385,17 @@ def test_the_daemon_reports_dews_own_logprobs(imported, client):
         theirs = tokenizer.encode(answer.texts[0], add_special_tokens=False)
         assert len(theirs) == len(reported), prompt
 
-        logits = np.asarray(loaded.model.apply(
-            loaded.variables, jnp.asarray([head + theirs], jnp.int32)))[0]
-        for offset, (token, entry) in enumerate(zip(theirs, reported, strict=True)):
-            row = logits[len(head) + offset - 1].astype(np.float64)
-            ours = float(row[token] - (np.log(np.exp(row - row.max()).sum()) + row.max()))
-            worst = max(worst, abs(ours - float(entry.logprob)))
+        daemon += [float(entry.logprob) for entry in reported]
+        converted += drawn_logprobs(loaded.model.apply(rounded, jnp.asarray([head + theirs], jnp.int32))[0],
+                                    head, theirs)
+        with float64(), torch.no_grad():
+            logits = reference(torch.tensor([head + theirs])).logits[0].numpy()
+        truth += drawn_logprobs(logits, head, theirs)
 
-    assert worst < 0.05, f"max |dew - daemon| logprob {worst:.5f}"
+    mine, conversion = distance(daemon, truth), distance(converted, truth)
+    assert mine <= FACTOR * conversion, (
+        f"the daemon is {mine:.3e} from float64 (rms logprob), the F16 conversion alone "
+        f"{conversion:.3e} (ratio {mine / conversion:.2f}, allowed {FACTOR})")
 
 
 def test_backend_options_alone_are_not_the_models_policy(client):
