@@ -40,7 +40,15 @@ from dew.objectives.base import Aux, Ratio, Step, Variables
 from dew.registry import objectives, trainings
 from dew.sampling.solvers import Consistency
 
-from .objective import DISCRIMINATOR, SPECTRAL, TEACHER, DiffusionObjective, Training, teacher_variables
+from .objective import (
+    DISCRIMINATOR,
+    SPECTRAL,
+    TEACHER,
+    DiffusionObjective,
+    Training,
+    _unadapted,
+    teacher_variables,
+)
 
 if TYPE_CHECKING:
     from .config import DiffusionRunConfig
@@ -270,6 +278,9 @@ class AdversarialDistillationObjective(DiffusionObjective):
     over the sample. LADD itself drops that term when it trains on synthetic
     data, and on CIFAR-10 at 32 pixels the term at 2.5 dominated and the
     student did better without it. Sampling runs `Consistency`.
+
+    The teacher runs through the student's model, so a LoRA-adapted student,
+    whose model asks every tree for its factors, is refused.
     """
 
     def __init__(self, model: nn.Module, process: Process, inputs: InputSpec,
@@ -284,6 +295,7 @@ class AdversarialDistillationObjective(DiffusionObjective):
                         if kwargs.get(key) is not None)
         if unused:
             raise ValueError(f"LADD trains on its own losses, which read none of {unused}")
+        _unadapted("LADD", model, "teacher")
         kwargs.setdefault("guidance", None)
         kwargs.setdefault("solver", Consistency())
         kwargs.setdefault("steps", 2)
