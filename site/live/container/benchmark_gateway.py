@@ -84,8 +84,10 @@ def main():
                 "try:\n socket.create_connection(('127.0.0.1', 8890), timeout=1)\n"
                 "except OSError:\n pass\nelse:\n raise AssertionError('guest reached gateway TCP')\n"
                 "try:\n bytearray(1024 * 1024 * 1024)\n"
-                "except MemoryError:\n pass\nelse:\n raise AssertionError('guest exceeded memory allowance')\n"
-                "try:\n resource.setrlimit(resource.RLIMIT_AS, (resource.RLIM_INFINITY, resource.RLIM_INFINITY))\n"
+                "except MemoryError:\n pass\nelse:\n"
+                " raise AssertionError('guest exceeded memory allowance')\n"
+                "try:\n resource.setrlimit(resource.RLIMIT_AS, "
+                "(resource.RLIM_INFINITY, resource.RLIM_INFINITY))\n"
                 "except (PermissionError, ValueError):\n pass\n"
                 "else:\n raise AssertionError('guest raised hard memory limit')\n"
                 "try:\n pid = os.fork()\n"
@@ -127,7 +129,8 @@ def main():
             rows = [row for future in futures for row in future.result()]
         assert len({row["uid"] for row in rows}) == len(kernels)
         memory = {row["uid"]: row["pss_bytes"] for row in rows}
-        print(json.dumps({"requests": args.count, "contexts": len(kernels), "state_isolation": True, "sandbox_checks": True,
+        print(json.dumps({"requests": args.count, "contexts": len(kernels),
+                          "state_isolation": True, "sandbox_checks": True,
                           "startup_seconds": [kernel[2] for kernel in kernels], "kernel_pss_bytes": memory,
                           "kernel_fd_counts": {row["uid"]: row["fds"] for row in rows},
                           "median_execute_seconds": statistics.median(row["execute_seconds"] for row in rows),
