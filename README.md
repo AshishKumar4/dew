@@ -1336,6 +1336,8 @@ dew launch --hosts 10.0.0.1,10.0.0.2 \
 `dew.pipeline` loads a published checkpoint and returns a task you can call. Set `JAX_PLATFORMS=cuda` before starting Python. I have not run this released Gemma 4 checkpoint on the 4080, so check that it fits in memory before you try it.
 
 ```python
+import jax.numpy as jnp
+
 import dew
 
 chat = dew.pipeline("google/gemma-4-E2B-it", dtype=jnp.bfloat16)
@@ -1363,6 +1365,7 @@ Save this as `generate_tpu.py`:
 import os
 
 import jax
+import jax.numpy as jnp
 
 
 def main():

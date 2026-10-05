@@ -1,4 +1,4 @@
-"""Train an I-JEPA encoder on Oxford Flowers, probe it, save the encoder.
+"""Train an I-JEPA encoder on Oxford Flowers, then probe and save it.
 
 python examples/train_jepa.py --data-path /data/oxford_flowers102/2.1.1 --epochs 300
 python examples/train_jepa.py --data-path /data/oxford_flowers102/2.1.1 \
@@ -35,7 +35,7 @@ class Config:
     batch_size: int = 64
     epochs: int = 300
     steps: int | None = None
-    """Run length in steps; unset trains for `epochs` passes over the data."""
+    """Training steps. If unset, train for `epochs` passes over the data."""
     learning_rate: float = 1e-3
     model: dict = field(default_factory=lambda: {
         "emb_features": 384, "num_layers": 12, "num_heads": 6})

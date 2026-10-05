@@ -16,7 +16,7 @@ import functools
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, ClassVar, Generic, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, ClassVar, Generic, Literal, Protocol, Self, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -29,10 +29,13 @@ from dew.artifacts import Artifact, Artifacts
 from dew.records import JSON
 
 if TYPE_CHECKING:
+    from jax.typing import DTypeLike
+
     from dew.inference.tasks import BlockGeneration, MaskedGeneration, TextGeneration
     from dew.inputs import InputSpec
     from dew.nn.backbones.causal_transformer import DecoderBank
     from dew.sampling.pipelines import TextToImage
+    from dew.training.distributed import Layout, MeshSpec
     from dew.training.state import TrainState
 
     type Task = TextGeneration | BlockGeneration | MaskedGeneration | TextToImage
@@ -277,6 +280,18 @@ class EMASpec:
     select: PathFilter = everything
 
 
+class SavedTask(Protocol):
+    """What a saved run of an objective loads as (`Objective.saved_task`):
+    a class whose `from_run` builds it from a run directory. Dew's tasks
+    (`TextToImage`, `TextGeneration`, `BlockGeneration`, `MaskedGeneration`)
+    are, and so is a plugin's own."""
+
+    @classmethod
+    def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
+                 mesh: MeshSpec | None = None, layout: Layout | None = None,
+                 dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None) -> Self: ...
+
+
 class Objective(ABC, Generic[Loss, Effects]):
     """Define what is being learned: the parameters, the loss, what evaluation produces."""
 
@@ -298,6 +313,10 @@ class Objective(ABC, Generic[Loss, Effects]):
         self._inputs = inputs
 
     ema: EMASpec | None = None
+    saved_task: ClassVar[type[SavedTask] | None] = None
+    """The task a saved run of this objective loads as, which `dew.pipeline`
+    builds from the run; a subclass inherits its parent's. None: a run of it
+    loads as no task."""
     _ema_is_reference: ClassVar[bool] = False
     artifact: type | None = None
     """The artifact type `evaluate` returns, or None when it returns nothing."""
@@ -581,6 +600,7 @@ __all__ = [
     "PathFilter",
     "Prediction",
     "Ratio",
+    "SavedTask",
     "Shown",
     "Step",
     "TrainingScalar",

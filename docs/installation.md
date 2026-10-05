@@ -1,6 +1,6 @@
 # Installation
 
-Dew's package name is `dewml` and its import name is `dew`; it is installed from the GitHub repository. It needs Python 3.12 or newer; CI tests Python 3.12 and 3.14. The commands below use [uv](https://docs.astral.sh/uv/getting-started/installation/) and a POSIX shell.
+Install `dewml` from the GitHub repository and import it as `dew`. You need Python 3.12 or newer. CI tests Python 3.12 and 3.14. The commands below use [uv](https://docs.astral.sh/uv/getting-started/installation/) and a POSIX shell.
 
 ## Installing from GitHub
 
@@ -10,7 +10,7 @@ source .venv/bin/activate
 uv pip install "dewml @ git+https://github.com/AshishKumar4/dew"
 ```
 
-This installs the current revision of the repository. To reproduce a run later, pin a commit: `"dewml @ git+https://github.com/AshishKumar4/dew@<commit>"`. Dew installs JAX 0.11.2 and Flax 0.12.10 or a later 0.12 release from PyPI. A process pool across GPUs needs a patched JAX to keep its compilation cache; [Process pools across GPUs](#process-pools-across-gpus) covers it.
+This installs the repository's current revision. To reproduce a run later, pin a commit with `"dewml @ git+https://github.com/AshishKumar4/dew@<commit>"`. Dew installs JAX 0.11.2 and Flax 0.12.10 or a later 0.12 release from PyPI. For a process pool across GPUs, you need a patched JAX to keep the compilation cache. See [Process pools across GPUs](#process-pools-across-gpus).
 
 The plain install runs JAX on the CPU, which is enough for the [Quickstart](getting-started.md).
 
@@ -39,24 +39,26 @@ Add the extra that matches the hardware:
 | NVIDIA GPU, CUDA 12 driver | `uv pip install "dewml[cuda12] @ git+https://github.com/AshishKumar4/dew"` |
 | Google TPU VM | `uv pip install "dewml[tpu] @ git+https://github.com/AshishKumar4/dew"` |
 
-Each extra installs the accelerator build of JAX 0.11.2, the version Dew requires; they are JAX's own extras of the same names. A later `-U "jax[...]"` would replace it with a release Dew isn't tested on. Extras combine, as in `dewml[cuda13,interop,streaming]`.
+These are JAX's own extras, with the same names. Each installs the accelerator build of JAX 0.11.2, the version Dew requires. Running `-U "jax[...]"` later would replace it with a release Dew has not been tested on. You can combine extras, as in `dewml[cuda13,interop,streaming]`.
 
-The [JAX installation guide](https://docs.jax.dev/en/latest/installation.html) lists the driver each build needs. `JAX_PLATFORMS` selects the backend before JAX is imported; `JAX_PLATFORMS=cpu python train.py` runs on the CPU on a GPU machine. On Colab the tutorials install `dewml[cuda13]`. [Cloud TPUs](tpu.md) covers TPU provisioning.
+The [JAX installation guide](https://docs.jax.dev/en/latest/installation.html) lists the driver each build needs. Set `JAX_PLATFORMS` before importing JAX to select the backend. For example, `JAX_PLATFORMS=cpu python train.py` runs on the CPU even on a GPU machine. The Colab tutorials install `dewml[cuda13]`. See [Cloud TPUs](tpu.md) to provision a TPU.
 
 ### Process pools across GPUs
 
-JAX 0.11.2 keys a compiled step by the topology of the process that compiled it, which on a GPU includes its NVLink links. In a process pool across GPUs that are linked differently, the processes would key the same step apart: on the next run some would load it from the persistent compilation cache while the others compiled it, and that compile waits for every process for ever. The fix ([jax-ml/jax#40940](https://github.com/jax-ml/jax/issues/40940)) is in no JAX release yet. With the 0.11.2 release, Dew compiles a GPU pool without the persistent cache and prints on every process that it does; the pool trains correctly, but compiles its steps again on every run. To keep the cache, install the patched build of 0.11.2 that `constraints.txt` names:
+JAX 0.11.2 uses the compiling process's topology in its cache key, including the GPU's NVLink connections. If GPUs in a process pool have different connections, their cache keys differ for the same step. On the next run, some processes load the step from the persistent cache while others compile it. Compilation then waits indefinitely for every process to join.
+
+The fix ([jax-ml/jax#40940](https://github.com/jax-ml/jax/issues/40940)) is not in a JAX release yet. With the released 0.11.2, Dew disables the persistent cache for GPU pools and prints a notice on every process. Training works, but each run recompiles its steps. To keep the cache, install the patched build of 0.11.2 named in `constraints.txt`:
 
 ```bash
 uv pip install "dewml[cuda13] @ git+https://github.com/AshishKumar4/dew" \
     -c https://raw.githubusercontent.com/AshishKumar4/dew/main/constraints.txt
 ```
 
-A pool of one process, and a TPU or CPU pool, needs nothing more.
+A single-process pool or a TPU or CPU pool needs no patch.
 
 ## Optional extras
 
-The plain install includes Transformers, the Hugging Face Hub client and the image libraries. These extras add more:
+The plain install includes Transformers, the Hugging Face Hub client and the image libraries. Use these extras for other dependencies:
 
 | Extra | Adds |
 |---|---|
@@ -85,16 +87,16 @@ The plain install includes Transformers, the Hugging Face Hub client and the ima
 uv pip install 'dewml[interop,streaming] @ git+https://github.com/AshishKumar4/dew'
 ```
 
-The `vision` extra expects CPU builds of PyTorch and torchvision, installed first, so that no CUDA PyTorch sits beside JAX's accelerator runtime. Without it the native multimodal checkpoints still load, but their processors raise an error when given images.
+Before installing the `vision` extra, install CPU builds of PyTorch and torchvision. This keeps CUDA PyTorch out of JAX's accelerator environment. Without `vision`, native multimodal checkpoints still load, but their processors raise an error when given images.
 
 ```bash
 uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 uv pip install 'dewml[interop,vision] @ git+https://github.com/AshishKumar4/dew'
 ```
 
-The `profile` extra installs XProf 2.23.1 or a later release, never 2.23.2. XProf 2.23.2 declares `setuptools<70`, and PyTorch 2.13 and later declare `setuptools>=77.0.3`, so 2.23.2 can't be installed beside the `torch`, `vision`, `diffusers`, `torchax` or `test` extras. Don't upgrade XProf to 2.23.2 by hand in such an environment.
+The `profile` extra installs XProf 2.23.1 or later, excluding 2.23.2. That release requires `setuptools<70`, while PyTorch 2.13 and later require `setuptools>=77.0.3`. The conflicting requirements prevent installation with the `torch`, `vision`, `diffusers`, `torchax` or `test` extras. Don't upgrade XProf to 2.23.2 by hand in such an environment.
 
-tokamax is not a dependency. With it installed, 'auto' runs its Pallas-Triton attention on sm80 and later for heads up to 64 wide (`dew.nn.attention.triton_runs`). Install it as `uv pip install tokamax -c https://raw.githubusercontent.com/AshishKumar4/dew/main/constraints.txt`: tokamax 0.0.14, its latest release, pins `typeguard==2.13.3`, which tyro excludes, and the constraints name the tokamax commit that dropped it.
+tokamax is optional. If you install it, `auto` uses its Pallas-Triton attention on sm80 and later for heads up to 64 wide (`dew.nn.attention.triton_runs`). Install it with `uv pip install tokamax -c https://raw.githubusercontent.com/AshishKumar4/dew/main/constraints.txt`. The latest release, tokamax 0.0.14, pins `typeguard==2.13.3`, which tyro excludes. The constraints select the tokamax commit that removed that pin.
 
 ## Development install
 
@@ -107,15 +109,17 @@ uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cp
 uv pip install -e '.[test,av,tfds,metrics,plots,inference-clients,vision,quantization,profile]' -c constraints.txt
 ```
 
-These are the extras CI installs, on the JAX CI runs on: `constraints.txt` names the patched build of 0.11.2, which the multi-process cache tests need. PyTorch is used only by the reference tests and the image processors; Dew's model computation runs in JAX.
+CI installs these extras with the patched JAX 0.11.2 named in `constraints.txt`. The multi-process cache tests need that patch. Only the reference tests and image processors use PyTorch. Dew runs model computation in JAX.
 
 ## Compilation cache
 
-Dew stores compiled executables in `~/.cache/dew/xla/python3.X`, or `$XDG_CACHE_HOME/dew/xla/python3.X` when `XDG_CACHE_HOME` is set. Each Python minor version has its own directory because JAX 0.11 on Python 3.14 compresses entries with `compression.zstd` while its cache key still says `zlib`, and an older interpreter cannot read them. A run that passes its own `compilation_cache_dir` uses that path as given, so do not share one explicit directory between Python versions.
+Dew stores compiled executables in `~/.cache/dew/xla/python3.X`. If `XDG_CACHE_HOME` is set, it uses `$XDG_CACHE_HOME/dew/xla/python3.X` instead. Each Python minor version gets a separate directory. JAX 0.11 on Python 3.14 compresses entries with `compression.zstd`, but its cache key still says `zlib`. Older interpreters cannot read those entries.
+
+If you pass `compilation_cache_dir`, Dew uses that path as given. Do not share an explicit cache directory between Python versions.
 
 ## Preparing TFDS data
 
-Training reads prepared TFDS ArrayRecords and does not import TensorFlow. Preparing a dataset does need TensorFlow and sometimes dataset-specific packages (Oxford Flowers reads its label files with SciPy). TensorFlow 2.21.0 has no Python 3.14 wheels, so prepare in a separate Python 3.13 environment:
+Training reads prepared TFDS ArrayRecords without importing TensorFlow. To prepare a dataset, you need TensorFlow and sometimes dataset-specific packages. Oxford Flowers, for example, reads its label files with SciPy. TensorFlow 2.21.0 has no Python 3.14 wheels, so prepare the data in a separate Python 3.13 environment:
 
 ```bash
 uv venv --python 3.13 .venv-tfds-prepare
@@ -135,7 +139,7 @@ print("export DEW_FLOWERS_PATH=" + shlex.quote(str(builder.data_dir)))
 PY
 ```
 
-The script downloads the data if needed and prints an `export` line with the prepared version directory. Run that line in the shell you train from:
+The script downloads the data if needed and prints an `export` line for the prepared version directory. Run that line in the shell where you will train:
 
 <!-- not run: needs the prepared TFDS directory the script above writes -->
 ```python
@@ -149,11 +153,11 @@ data = TFDSImages(
 ).load(batch=4)
 ```
 
-Recipes take the same path as `--data.path "$DEW_FLOWERS_PATH"`; the diffusion recipe's `data:oxford-flowers102` reads it with flower captions. With `labels=None`, `TFDSImages` reads the class names from the `label.labels.txt` file TFDS writes there; `--data.labels` names another file. If the metadata or shards are missing, the reader raises an error that asks you to prepare the data. Training never downloads or prepares TFDS data.
+Pass the same path to a recipe with `--data.path "$DEW_FLOWERS_PATH"`. The diffusion recipe's `data:oxford-flowers102` reads it with flower captions. With `labels=None`, `TFDSImages` reads class names from the `label.labels.txt` file that TFDS writes there. To use another file, set `--data.labels`. If metadata or shards are missing, the reader raises an error asking you to prepare the data. Training never downloads or prepares TFDS data.
 
 ## Building the documentation
 
-The site at [dewml.dev](https://dewml.dev) is built from `docs/`, the notebooks in `tutorials/` with their recorded outputs, and API pages generated from the docstrings in `src/dew`. It needs Node 22.12 or newer, [pnpm](https://pnpm.io) and uv:
+The site at [dewml.dev](https://dewml.dev) uses pages from `docs/`, notebooks from `tutorials/` with their recorded outputs, and API pages generated from `src/dew` docstrings. To build it, you need Node 22.12 or newer, [pnpm](https://pnpm.io) and uv:
 
 ```bash
 cd site

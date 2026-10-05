@@ -24,6 +24,7 @@ import optax
 from flax import struct
 
 from dew.artifacts import TokenScores
+from dew.inference.tasks import BlockGeneration
 from dew.inputs import Field, InputSpec
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.inputs import ModelInputs
@@ -44,7 +45,7 @@ from dew.objectives.lm.chunked import chunked_cross_entropy, head_logits
 from dew.registry import objectives
 
 if TYPE_CHECKING:
-    from dew.inference.tasks import BlockGeneration, Processor
+    from dew.inference.tasks import Processor
     from dew.nn.backbones.causal_transformer import DecoderBank
     from dew.training.state import TrainState
 
@@ -150,6 +151,8 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
     denoising pass, whose logits condition the second and carry no
     gradient, is the one place a full row of logits exists.
     """
+
+    saved_task = BlockGeneration
 
     def __init__(self, model: DiffusionGemma, *, prompt_length: int,
                  num_canvases: int = 1, canvas_size: int | None = None,
