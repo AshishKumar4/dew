@@ -237,7 +237,7 @@ def _fixed_mixture(mixture: Mixture, defaults: Mixture, represented: Collection[
 
 def _kind_name(record: Mapping[str, object], section: str) -> str:
     """Return the registry name of one nested value record."""
-    return records.text(records.record(record[section], section)['kind'], f"{section} kind")
+    return records.text(records.record(record[section], section)['name'], f"{section} name")
 
 
 class Llama3Ramp(TypedDict):
@@ -273,7 +273,7 @@ type Ramp = Llama3Ramp | YarnRamp
 
 class KindFields(TypedDict, total=False):
     """Describes one `LayerKind`: what the layers of one kind do
-    differently. A mixer record dispatches on its own `kind`."""
+    differently. A mixer record dispatches on the member it names."""
 
     window: int | None
     chunk: int | None
@@ -1017,7 +1017,7 @@ def _gemma3_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     mm = records.integer(hf_config.get("mm_tokens_per_image"), "mm_tokens_per_image")
     used.add("mm_tokens_per_image")
     projector = vision_nn.translate_gemma_projector_config(
-        tower, records.integer(text.get("emb_features"), "emb_features"), mm)
+        tower["fields"], records.integer(text.get("emb_features"), "emb_features"), mm)
     image = _wrapper_token_id(hf_config, used, "image_token_index", "image_token_id")
     _wrapper_tokens(used)
     return {
@@ -1027,7 +1027,7 @@ def _gemma3_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
         "tower": tower,
         "projector": projector,
         "image_token_id": image,
-        "tokens_per_image": _record_int(projector, "tokens_per_side") ** 2,
+        "tokens_per_image": _record_int(projector["fields"], "tokens_per_side") ** 2,
         **_NO_AUDIO,
     }
 
@@ -1041,11 +1041,12 @@ def _llama4_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
         records.integer(text.get("emb_features"), "emb_features"))
     image = _wrapper_token_id(hf_config, used, "image_token_index", "image_token_id")
     _wrapper_tokens(used)
-    grid = _record_int(tower, "image_size") // _record_int(tower, "patch_size")
-    ratio = _record_float(tower, "pixel_shuffle_ratio")
+    vision = tower["fields"]
+    grid = _record_int(vision, "image_size") // _record_int(vision, "patch_size")
+    ratio = _record_float(vision, "pixel_shuffle_ratio")
     tokens = grid * grid * ratio ** 2
     if tokens != int(tokens):
-        _refuse(f"pixel_shuffle_ratio {tower['pixel_shuffle_ratio']!r}",
+        _refuse(f"pixel_shuffle_ratio {vision['pixel_shuffle_ratio']!r}",
                 f"it leaves {tokens} soft tokens per image, not a whole count")
     return {
         "model_type": "llama4",
@@ -1083,12 +1084,12 @@ def _wrapper_audio(hf_config: Mapping[str, object], used: set, text_width: int) 
         slots = records.integer(hf_config.get("audio_soft_tokens_per_image"), "audio_soft_tokens_per_image")
         if slots < 1:
             _refuse("audio_soft_tokens_per_image", "Gemma 3n audio needs its fixed slot count per clip")
-        projector = {"kind": "gemma3n", **asdict(from_record(vision_nn.Gemma3nProjector, {
+        projector = {"name": "gemma3n", "fields": {**asdict(from_record(vision_nn.Gemma3nProjector, {
             "vision_width": encoder.hidden_size, "text_width": text_width,
             "vocab_size": audio.get("vocab_size", 128), "vocab_offset": audio.get("vocab_offset", 262272),
-            "norm_eps": encoder.rms_norm_eps}))}
-    return {"audio": {"kind": records.text(audio["model_type"], "audio_config model_type"),
-                      **asdict(encoder)},
+            "norm_eps": encoder.rms_norm_eps}))}}
+    return {"audio": {"name": records.text(audio["model_type"], "audio_config model_type"), "fields": {
+                      **asdict(encoder)}},
             "audio_token_id": _wrapper_token_id(hf_config, used, "audio_token_id"),
             "audio_soft_tokens": slots, "audio_projector": projector}
 
@@ -1099,7 +1100,7 @@ def _gemma4_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     tower = vision_nn.translate_gemma4_vision_config(hf_config)
     used.add("vision_config")
     projector = vision_nn.translate_gemma4_projector_config(
-        tower, records.integer(text.get("emb_features"), "emb_features"))
+        tower["fields"], records.integer(text.get("emb_features"), "emb_features"))
     image = _wrapper_token_id(hf_config, used, "image_token_id", "image_token_index")
     _wrapper_tokens(used)
     # The soft-token count follows the image resolution, so the record leaves
@@ -1152,7 +1153,7 @@ def _gemma3n_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wrapper
     tower = vision_nn.translate_gemma3n_vision_config(hf_config)
     projector = vision_nn.translate_gemma3n_projector_config(hf_config, _record_int(text, "emb_features"))
     used.add("vision_config")
-    count = _record_int(tower, "msfa_output_resolution") ** 2
+    count = _record_int(tower["fields"], "msfa_output_resolution") ** 2
     if hf_config.get("vision_soft_tokens_per_image", count) != count:
         _refuse("vision_soft_tokens_per_image", f"the MobileNet adapter produces {count} tokens")
     image = _wrapper_token_id(hf_config, used, "image_token_id")
@@ -1389,7 +1390,7 @@ def translate_wrapper_weights(
     if audio is not None:
         encoder = towers.from_record(audio)
         if not isinstance(encoder, (audio_nn.Gemma3nAudio, audio_nn.Gemma4Audio)):
-            raise ValueError(f"audio tower kind {audio['kind']!r} has no weight map here")
+            raise ValueError(f"audio tower {audio['name']!r} has no weight map here")
         variables["audio_tower"] = audio_nn.audio_weights(
             tables["audio_tower"], encoder, param_dtype=param_dtype
         )

@@ -762,7 +762,11 @@ def triton_attention(query, key, value, causal: bool):
     return manual_map(local, (queries, keys, keys), queries)(query, key, value)
 
 
-def weighted_values(equation, weights, value, *, precision=None):
+VALUE_BLOCK = 256
+"""Keys per block of `weighted_values`' fp32 sum on XLA:CPU."""
+
+
+def weighted_values(equation, weights, value, *, precision=None) -> jax.Array:
     """The probability-value product, with the probabilities in the value's dtype.
 
     An fp32 softmax leaves fp32 probabilities, and `jnp.einsum` promotes to
@@ -773,8 +777,49 @@ def weighted_values(equation, weights, value, *, precision=None):
     (`probs.astype(key.dtype)`), so the two paths multiply alike; the softmax
     that produced them still reduced in fp32, which is where the precision
     was needed.
+
+    `equation` is flax's value product, '...hqk,...khd->...qhd'. On XLA:CPU
+    an fp32 product sums each block of VALUE_BLOCK keys apart and the
+    blocks' sums after. YNNPACK, XLA:CPU's dot, sums up to about 1024 keys
+    in one chain: fp32 attention over 512, 2048 and 8192 keys rounded 1.34,
+    1.75 and 1.63 times as far from float64 as torch's SDPA does, and 0.98,
+    0.96 and 0.87 times in blocks. Writing each block's product costs a
+    forward 3% to 9% at 512 to 1024 keys on two threads (docs/performance.md).
     """
-    return jnp.einsum(equation, weights.astype(value.dtype), value, precision=precision)
+    if equation != '...hqk,...khd->...qhd':
+        raise ValueError(f"weighted_values takes flax's value product, got {equation!r}")
+    weights = weights.astype(value.dtype)
+    if value.dtype != jnp.float32 or value.shape[-3] <= VALUE_BLOCK or jax.default_backend() != 'cpu':
+        return jnp.einsum(equation, weights, value, precision=precision)
+    return _blocked_values(weights, value, precision)
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(2,))
+def _blocked_values(weights, value, precision) -> jax.Array:
+    """`weighted_values`' product summed in blocks of VALUE_BLOCK keys. Its
+    gradients are the plain product's: neither sums over the keys, and the
+    blocked form's own cost the backward an eighth more on two threads."""
+    keys = value.shape[-3]
+    blocks = -(-keys // VALUE_BLOCK)
+    pad = blocks * VALUE_BLOCK - keys
+    weights = jnp.pad(weights, [(0, 0)] * (weights.ndim - 1) + [(0, pad)])
+    value = jnp.pad(value, [(0, 0)] * (value.ndim - 3) + [(0, pad), (0, 0), (0, 0)])
+    weights = weights.reshape(*weights.shape[:-1], blocks, VALUE_BLOCK)
+    value = value.reshape(*value.shape[:-3], blocks, VALUE_BLOCK, *value.shape[-2:])
+    return jnp.einsum('...hqck,...ckhd->...qhdc', weights, value, precision=precision).sum(-1)
+
+
+def _blocked_values_forward(weights, value, precision):
+    return _blocked_values(weights, value, precision), (weights, value)
+
+
+def _blocked_values_backward(precision, saved, cotangent):
+    weights, value = saved
+    return (jnp.einsum('...qhd,...khd->...hqk', cotangent, value, precision=precision),
+            jnp.einsum('...hqk,...qhd->...khd', weights, cotangent, precision=precision))
+
+
+_blocked_values.defvjp(_blocked_values_forward, _blocked_values_backward)
 
 
 def softcapped_attention(query, key, value, softcap: float, dtype=None, precision=None,
@@ -1227,6 +1272,14 @@ def _xla_kernel_narrows(query) -> bool:
         query.dtype == jnp.bfloat16 and jax.default_backend() == 'gpu' and not bf16_dot_runs())
 
 
+def _xla_kernel_chains(query, key) -> bool:
+    """Whether jax.nn's xla attention would sum this call's fp32 value
+    product over more than VALUE_BLOCK keys in one chain, as YNNPACK,
+    XLA:CPU's dot, does, so 'auto' and 'xla' take the reference path, whose
+    `weighted_values` sums it in blocks."""
+    return query.dtype == jnp.float32 and key.shape[-3] > VALUE_BLOCK and jax.default_backend() == 'cpu'
+
+
 def resolve_implementation(implementation, query, key, *, dtype=None, precision=None,
                            force_fp32_for_softmax=True, softcap=None, sinks=None, causal=False,
                            sliding_window=None, mask=None, bias=None) -> str:
@@ -1243,7 +1296,7 @@ def resolve_implementation(implementation, query, key, *, dtype=None, precision=
     """
     if implementation not in ('auto', 'reference', 'xla', 'cudnn', 'triton', 'tpu'):
         raise ValueError(f"Unknown attention implementation: {implementation}")
-    if implementation in ('auto', 'xla') and _xla_kernel_narrows(query):
+    if implementation in ('auto', 'xla') and (_xla_kernel_narrows(query) or _xla_kernel_chains(query, key)):
         return 'reference'
     if implementation != 'auto':
         return implementation

@@ -6,6 +6,7 @@ reach the environment before the first JAX call of the process.
 """
 
 import ctypes
+import importlib.util
 import logging
 import os
 import sys
@@ -66,6 +67,42 @@ def keep_roundings() -> None:
         return
     if xla_flag("xla_allow_excess_precision") is None:
         apply_xla_flags("--xla_allow_excess_precision=false")
+
+
+def unpartition_gpu_pool() -> None:
+    """Turn off XLA's spatial partitioning of a preallocated GPU pool,
+    unless the run named it.
+
+    There a step's temporaries can lose their block between steps
+    (`dew.training.trainer.strands_temporaries`). The partitioning lets the
+    pool's upper end hold XLA's collective memory space
+    (xla/pjrt/gpu/se_gpu_pjrt_client.cc, `GetStreamExecutorGpuDeviceAllocator`
+    at openxla/xla 91888df, the commit jax 0.11.2 builds), which a buffer
+    takes only for NCCL user or symmetric buffers, a one-shot ragged
+    all-to-all or a Mosaic kernel's symmetric operand
+    (xla/service/gpu/gpu_memory_space_assignment.cc); Dew asks for none of
+    them. With it off XLA serves that space from an allocator of its own, and
+    steps ran as fast on an A100 (a DiT and a decoder within 0.5%).
+
+    `import dew` applies it before the process's first JAX computation, as it
+    does `keep_roundings`, so a Trainer built without `prepare_process` (a
+    notebook, a tool) gets it too. With the partitioning on, the fit check
+    holds room for a step's temporaries twice, and the 99M MoE at 8 x 1024
+    on an RTX 4080 tiled its head (98.2 against 78.5 ms a step,
+    docs/performance.md)."""
+    bridge = sys.modules.get("jax._src.xla_bridge")
+    if bridge is not None and bridge.backends_are_initialized():
+        return
+    if cuda_plugin() and xla_flag("xla_gpu_enable_allocator_spatial_partitioning") is None:
+        apply_xla_flags("--xla_gpu_enable_allocator_spatial_partitioning=false")
+
+
+def cuda_plugin() -> bool:
+    """Whether JAX's CUDA plugin is installed, the one reader of XLA's GPU
+    flags; asked before the backend opens, which no other question can be."""
+    return (importlib.util.find_spec("jax_plugins") is not None
+            and any(importlib.util.find_spec(f"jax_plugins.xla_cuda{major}") is not None
+                    for major in (12, 13)))
 
 
 def deterministic_ops_requested() -> bool:

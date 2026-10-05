@@ -29,23 +29,13 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn, struct
 from flax.traverse_util import flatten_dict, unflatten_dict
-from jax.experimental import checkify, multihost_utils
+from jax.experimental import checkify
 from jax.typing import ArrayLike
 from typing_extensions import TypeVar
 
-from dew.artifacts import agreed
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.dspark import DSpark
-from dew.nn.inputs import (
-    ModelInputs,
-    PredictionPhase,
-    RowPlan,
-    agreed_validity,
-    generation_signature,
-    local_rows,
-    mesh_of,
-    request_key,
-)
+from dew.nn.inputs import ModelInputs, PredictionPhase, Request, local_rows, mesh_of
 from dew.nn.kv_cache import Layered, gather_cache_rows, refuse_unassigned
 from dew.objectives.base import Variables
 from dew.sampling import decoding, strategies
@@ -771,30 +761,27 @@ def _digest(components: Components) -> tuple[Identity, str]:
     return (_stable(components), payload.hexdigest())
 
 
-def _request(model: nn.Module, params: Variables,
-             inputs: ModelInputs | ArrayLike | Sequence[Sequence[int]], max_new_tokens: int,
-             key: int | jax.Array | None, sampling: Sampling, n: int,
-             logits: Transforms | None, stopping: Criteria | None, strategy: Strategy | None,
-             *, pooled: bool) -> tuple[ModelInputs, jax.Array, Components, tuple[Identity, ...]]:
-    """This process's validated request and the controls a pool compares.
+def _check(model: nn.Module, params: Variables, inputs: ModelInputs, max_new_tokens: int,
+           sampling: Sampling, n: int, logits: Transforms | None, stopping: Criteria | None,
+           strategy: Strategy | None, pooled: bool) -> tuple[ModelInputs, tuple, Components]:
+    """This process's validated request, the controls a pool compares, and
+    the decoding components.
 
-    Everything a rank can get wrong on its own is raised from here, the
-    component digest included, so a pool agrees on the failure before any
-    rank enters a collective. A single process never digests: refusing a
-    component only a pool could disagree about would cost it nothing.
+    The component digest is raised from here with the rest, so a pool agrees
+    on the failure before any rank enters a collective. A single process
+    never digests: refusing a component only a pool could disagree about
+    would cost it nothing.
     """
-    random_key = request_key(key)
-    canonical = ModelInputs.from_value(inputs)
-    ids = local_rows(canonical.tokens)
-    fields = {name: local_rows(value) for name, value in canonical.token_fields.items()}
-    conditioning = {name: local_rows(value, host=False) for name, value in canonical.conditioning.items()}
+    ids = local_rows(inputs.tokens)
+    fields = {name: local_rows(value) for name, value in inputs.token_fields.items()}
+    conditioning = {name: local_rows(value, host=False) for name, value in inputs.conditioning.items()}
     if "params" not in params:
         raise ValueError("generate takes the full variables dict ({'params': ...})")
     _refuse_exchange(model)
     prepared = _validated(model, ids, fields, conditioning, max_new_tokens, sampling, n)
     components = resolve(sampling, logits, stopping, strategy)
     controls = (max_new_tokens, n, sampling.pad) + ((_digest(components),) if pooled else ())
-    return prepared, random_key, components, controls
+    return prepared, controls, components
 
 
 def _checked(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax.Array,
@@ -822,38 +809,6 @@ def _compiled(rows: jax.sharding.NamedSharding | None):
     return jax.jit(_checked, static_argnames=("model", "max_new_tokens", "pad_id", "n"),
                    in_shardings=(None, rows, rows, None, None, None),
                    out_shardings=(None, rows))
-
-
-def _agreed_request(prepared: ModelInputs, processes: int, controls) -> ModelInputs:
-    """`prepared` under one validity schema, with the pool agreed on the rest.
-
-    Whether this process's own prompts needed padding is rank-local, and the
-    digest would refuse a pool that disagrees only about that, so the schema
-    is agreed first. The digest then covers all conditioning and token
-    fields, not token length alone, because different traced shapes would
-    issue mismatched collectives.
-    """
-    prepared = agreed_validity(prepared, processes, controls=controls, phase="generation input")
-    multihost_utils.assert_equal(
-        generation_signature(prepared, controls),
-        "generation input shapes, continuations, decoding components and padding "
-        "must agree across processes")
-    return prepared
-
-
-def _padded(plan: RowPlan, prepared: ModelInputs) -> ModelInputs:
-    """`prepared` filled out to the rows the devices take.
-
-    Repeated rows carry no real token, so they finish at once and emit
-    nothing. Their validity is the field an unpadded request omitted.
-    """
-    padded = plan.pad(prepared)
-    if plan.count == plan.rows:
-        return padded
-    existing = padded.token_fields.get("attention_mask")
-    valid = jnp.ones(padded.tokens.shape, bool) if existing is None else existing
-    return replace(padded, token_fields={**padded.token_fields,
-                                         "attention_mask": valid & ~plan.padding[:, None]})
 
 
 _DEFAULT_SAMPLING = Sampling()
@@ -894,24 +849,17 @@ def generate(model: nn.Module, params: Variables,
         raise ValueError("stop strings compile against a tokenizer's vocabulary, which generate does not "
                          "have; generate through a TextGeneration with a processor, or pass "
                          "stopping=(decoding.stop_strings(tokenizer, strings, vocab_size),)")
-    mesh = mesh_of(params)
-    processes = jax.process_count() if mesh is not None else 1
-
-    def resolve():
-        return _request(model, params, inputs, max_new_tokens, key, sampling, n,
-                        logits, stopping, strategy, pooled=processes > 1)
-
-    request = (agreed("generation input validation", resolve) if processes > 1 else resolve())
-    prepared, random_key, components, controls = request
-    if processes > 1:
-        prepared = _agreed_request(prepared, processes, controls)
-    plan = RowPlan.over(mesh, prepared.tokens.shape[0])
+    request, components = Request.prepare(
+        inputs, key, mesh_of(params),
+        lambda canonical, pooled: _check(model, params, canonical, max_new_tokens, sampling, n,
+                                         logits, stopping, strategy, pooled),
+        phase="generation")
+    plan = request.plan
     capacity = model.max_seq_len if isinstance(model, Bounded) else None
     if isinstance(model, Layered) and capacity is not None:
         refuse_unassigned(model.kv_cache, plan.count, capacity)
-    padded = _padded(plan, prepared)
-    failure, output = _compiled(plan.sharding)(model, params, plan.place(padded),
-                                               plan.keys(random_key), max_new_tokens, sampling.pad, n,
+    failure, output = _compiled(plan.sharding)(model, params, plan.place(request.padded()),
+                                               plan.keys(request.key), max_new_tokens, sampling.pad, n,
                                                *components)
     # The error's flags are the one read a request waits on.
     jax.device_get(failure).throw()

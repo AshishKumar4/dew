@@ -180,7 +180,7 @@ def _wrapper_layouts(tensors, record, variables):
     """
     from dew.nn import vision
 
-    tower_kind = record["tower"]["kind"]
+    tower_kind = record["tower"]["name"]
     audio_encoder = None if record["audio"] is None else towers.from_record(record["audio"])
     bindings = []
     retained = {}
@@ -197,7 +197,7 @@ def _wrapper_layouts(tensors, record, variables):
         paths: tuple[tuple[str, ...], ...] = ()
         transpose = None
         if group == "projector":
-            path = vision.projector_weight_path(record["projector"]["kind"], local)
+            path = vision.projector_weight_path(record["projector"]["name"], local)
             paths = (("params", "projector", *path),)
             if path[-1] == "kernel" and local != "mm_input_projection_weight":
                 transpose = (1, 0)
@@ -212,7 +212,7 @@ def _wrapper_layouts(tensors, record, variables):
                 if path[-1] == "kernel":
                     transpose = (1, 0) if tensor.ndim in (2, 5) else (3, 2, 0, 1)
         elif group == "audio_projector":
-            path = vision.projector_weight_path(record["audio_projector"]["kind"], local)
+            path = vision.projector_weight_path(record["audio_projector"]["name"], local)
             paths = (("params", "audio_projector", *path),)
             if path[-1] == "kernel":
                 transpose = (1, 0)
@@ -1775,12 +1775,12 @@ def _wrapper_text_fields(config: Mapping[str, object], record: decoders.WrapperF
         text_fields["max_seq_len"] = max_seq_len
     if family == "gemma3":
         text_fields["final_logit_softcap"] = None
-        text_fields["mixer"] = {"kind": "attention", "bidirectional_images": True}
+        text_fields["mixer"] = {"name": "attention", "fields": {"bidirectional_images": True}}
     if family == "gemma4" and text_config.get("use_bidirectional_attention") == "vision":
         kinds = dict(text_fields.get("kinds") or {})
         sliding: decoders.KindFields = {
             **kinds.get("sliding_attention", {}),
-            "mixer": {"kind": "attention", "bidirectional_images": True}}
+            "mixer": {"name": "attention", "fields": {"bidirectional_images": True}}}
         kinds["sliding_attention"] = sliding
         text_fields["kinds"] = kinds
     if family in _QWEN35_TYPES:
@@ -1792,8 +1792,8 @@ def _wrapper_text_fields(config: Mapping[str, object], record: decoders.WrapperF
         kinds = dict(text_fields.get("kinds") or {})
         full: decoders.KindFields = {
             **kinds.get("full_attention", {}),
-            "mixer": {"kind": "attention",
-                      "mrope_section": [sections[0], sections[1], sections[2]]}}
+            "mixer": {"name": "attention", "fields": {
+                      "mrope_section": [sections[0], sections[1], sections[2]]}}}
         kinds["full_attention"] = full
         text_fields["kinds"] = kinds
     return text_fields

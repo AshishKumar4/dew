@@ -418,7 +418,7 @@ def test_deepseek_configs_translate_field_by_field():
     v32 = translate_config(fixture_config("deepseek-v32-tiny"))
 
     assert v3['mixer'] == {
-        'kind': 'mla', 'q_lora_rank': 8, 'kv_lora_rank': 8,
+        'name': 'mla', 'fields': {'q_lora_rank': 8, 'kv_lora_rank': 8,
         'qk_nope_head_dim': 8, 'qk_rope_head_dim': 8, 'v_head_dim': 8,
         'rope_interleave': True,
         'yarn': {'rope_type': 'yarn', 'rope_theta': 10000.0, 'factor': 40.0,
@@ -426,7 +426,7 @@ def test_deepseek_configs_translate_field_by_field():
                  'beta_slow': 1.0, 'mscale': 1.0, 'mscale_all_dim': 1.0,
                  'truncate': True, 'attention_factor': None},
         'index_topk': None, 'index_n_heads': None, 'index_head_dim': None,
-    }
+    }}
     assert v3['mixture'] == {
         'experts': 8, 'top_k': 4, 'layers': (1,), 'score_function': 'sigmoid',
         'scaling': 2.5, 'groups': 4, 'groups_per_token': 2, 'bias': True,
@@ -435,8 +435,8 @@ def test_deepseek_configs_translate_field_by_field():
     assert v3['head_dim'] == 16 and v3['scale_after_cast'] and not v3['qk_norm']
     assert v3['layer_types'] == ('full_attention', 'full_attention')
 
-    assert v32['mixer'] == {**v3['mixer'], 'index_topk': 4, 'index_n_heads': 8,
-                            'index_head_dim': 16}
+    assert v32['mixer'] == {'name': 'mla', 'fields': {**v3['mixer']['fields'], 'index_topk': 4,
+                                                      'index_n_heads': 8, 'index_head_dim': 16}}
     assert v32['mixture'] == v3['mixture']
     assert v32['layer_types'] == ('deepseek_sparse_attention',) * 2
 
@@ -451,8 +451,8 @@ def test_the_v32_fixture_is_the_sparse_model():
                            translate_config(fixture_config("deepseek-v32-tiny")),
                            dtype='float32', attention_impl='reference')
     dense = models.build('causal_transformer', **{
-        **built, 'mixer': {**built['mixer'], 'index_topk': None,
-                           'index_n_heads': None, 'index_head_dim': None}})
+        **built, 'mixer': {'name': 'mla', 'fields': {**built['mixer']['fields'], 'index_topk': None,
+                                                     'index_n_heads': None, 'index_head_dim': None}}})
     params = {layer: ({**block, 'self_attn': {name: leaf for name, leaf
                                               in block['self_attn'].items()
                                               if name != 'indexer'}}
@@ -506,9 +506,9 @@ def test_qwen35_config_translates_field_by_field():
 
     assert config["layer_types"] == ("linear_attention",) * 3 + ("full_attention",)
     assert config["kinds"] == {"linear_attention": {"mixer": {
-        "kind": "gated_delta_net", "linear_num_key_heads": 2,
+        "name": "gated_delta_net", "fields": {"linear_num_key_heads": 2,
         "linear_num_value_heads": 4, "linear_key_head_dim": 12,
-        "linear_value_head_dim": 16, "linear_conv_kernel_dim": 4}}}
+        "linear_value_head_dim": 16, "linear_conv_kernel_dim": 4}}}}
     assert config["output_gate"] and config["qk_norm"] and config["scale_offset"]
     assert not config["scale_after_cast"] and "sandwich_norms" not in config
     assert config["partial_rotary_factor"] == 0.25
@@ -530,9 +530,9 @@ def test_the_real_qwen35_0_8b_config_translates():
     assert config["layer_types"].count("full_attention") == 6
     assert config["layer_types"][3::4] == ("full_attention",) * 6
     assert config["kinds"]["linear_attention"]["mixer"] == {
-        "kind": "gated_delta_net", "linear_num_key_heads": 16,
+        "name": "gated_delta_net", "fields": {"linear_num_key_heads": 16,
         "linear_num_value_heads": 16, "linear_key_head_dim": 128,
-        "linear_value_head_dim": 128, "linear_conv_kernel_dim": 4}
+        "linear_value_head_dim": 128, "linear_conv_kernel_dim": 4}}
     assert config["num_heads"] == 8 and config["num_kv_heads"] == 2
     assert config["head_dim"] == 256 and config["emb_features"] == 1024
     assert config["partial_rotary_factor"] == 0.25
@@ -719,9 +719,9 @@ def test_qwen3_next_config_translates_field_by_field():
 
     assert config["layer_types"] == ("linear_attention",) * 3 + ("full_attention",)
     assert config["kinds"] == {"linear_attention": {"mixer": {
-        "kind": "gated_delta_net", "linear_num_key_heads": 2,
+        "name": "gated_delta_net", "fields": {"linear_num_key_heads": 2,
         "linear_num_value_heads": 4, "linear_key_head_dim": 8,
-        "linear_value_head_dim": 12, "linear_conv_kernel_dim": 4, "fused_in_proj": True}}}
+        "linear_value_head_dim": 12, "linear_conv_kernel_dim": 4, "fused_in_proj": True}}}}
     assert config["mixture"] == {"experts": 8, "top_k": 2, "layers": (0, 1, 2, 3),
                                  "norm_topk_prob": True, "expert_features": 16,
                                  "shared_features": 16, "shared_gate": True}
@@ -743,9 +743,9 @@ def test_the_real_qwen3_next_80b_config_translates():
 
     assert config["num_layers"] == 48 and config["layer_types"][3::4] == ("full_attention",) * 12
     assert config["kinds"]["linear_attention"]["mixer"] == {
-        "kind": "gated_delta_net", "linear_num_key_heads": 16,
+        "name": "gated_delta_net", "fields": {"linear_num_key_heads": 16,
         "linear_num_value_heads": 32, "linear_key_head_dim": 128,
-        "linear_value_head_dim": 128, "linear_conv_kernel_dim": 4, "fused_in_proj": True}
+        "linear_value_head_dim": 128, "linear_conv_kernel_dim": 4, "fused_in_proj": True}}
     assert config["num_heads"] == 16 and config["num_kv_heads"] == 2 and config["head_dim"] == 256
     assert int(config["head_dim"] * config["partial_rotary_factor"]) == 64
     assert config["rope_theta"] == 1e7 and config["mlp_features"] == 5120
