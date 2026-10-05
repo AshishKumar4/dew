@@ -380,7 +380,7 @@ class Pretrained:
              param_dtype: DTypeLike | Literal["auto"] = jnp.float32,
              attention_impl: str = "auto", max_seq_len: int | None = None,
              revision: str | None = None, gguf_file: str | None = None,
-             single_file: str | None = None,
+             single_file: str | None = None, dduf_file: str | None = None,
              mesh: MeshSpec | None = None, layout: Layout | None = None,
              fallback: str | None = None) -> Self:
         """Load a source into a native Flax model with explicit parameter trees, as
@@ -421,6 +421,11 @@ class Pretrained:
         the checkpoint, at the commit fetched. A component the file lacks gets
         its weights from the same place, or is refused by name.
 
+        ``dduf_file`` names a DDUF file in the repo or directory, a diffusers
+        pipeline packed into one archive: it is unpacked once into Dew's cache
+        (`dew.interop.dduf`) and loads as the directory it packs, as diffusers'
+        own `from_pretrained(..., dduf_file=)` reads it.
+
         `fallback="torchax"` opts into tier 3 for any causal LM transformers
         can build, registered or not: transformers' PyTorch forward lowered to
         JAX by torchax (`dew.interop.torchax_fallback`), with no Dew kernels,
@@ -431,13 +436,15 @@ class Pretrained:
         """
         return cls._load(name_or_dir, dtype=dtype, param_dtype=param_dtype, attention_impl=attention_impl,
                          max_seq_len=max_seq_len, revision=revision, gguf_file=gguf_file,
-                         single_file=single_file, mesh=mesh, layout=layout, fallback=fallback)
+                         single_file=single_file, dduf_file=dduf_file, mesh=mesh, layout=layout,
+                         fallback=fallback)
 
     @classmethod
     def _load(cls, name_or_dir: str | Path, *, dtype: DTypeLike = jnp.bfloat16,
               param_dtype: DTypeLike | Literal["auto"] = jnp.float32,
               attention_impl: str = "auto", max_seq_len: int | None = None,
               revision: str | None = None, gguf_file: str | None = None, single_file: str | None = None,
+              dduf_file: str | None = None,
               mesh: MeshSpec | None = None, layout: Layout | None = None, fallback: str | None = None,
               prepare: Callable[[nn.Module, Variables], Variables] | None = None) -> Self:
         """Share the source reader with inference's pre-placement projection packing."""
@@ -461,8 +468,8 @@ class Pretrained:
                                            max_seq_len=max_seq_len)
             loaded = replace(loaded, variables=placed(loaded.variables))
         else:
-            loaded = _pipeline_source(name_or_dir, directory, commit, single_file, placed, dtype=dtype,
-                                      attention_impl=attention_impl, param_dtype=param_dtype,
+            loaded = _pipeline_source(name_or_dir, directory, commit, single_file, dduf_file, placed,
+                                      dtype=dtype, attention_impl=attention_impl, param_dtype=param_dtype,
                                       streaming=streaming)
         if loaded is None:
             loaded = _load_native_source(name_or_dir, directory, commit, gguf_file=gguf_file, placed=placed,
@@ -1889,11 +1896,12 @@ def _checkpoint_dtype(config: Mapping[str, object], tensors: Mapping[str, np.nda
 
 
 def _pipeline_source(name_or_dir: str | Path, directory: Path, commit: str | None, single_file: str | None,
-                     placed: Callable[[Variables], Variables], *, dtype: str, attention_impl: str,
-                     param_dtype: str, streaming: bool) -> PretrainedPipeline | None:
+                     dduf_file: str | None, placed: Callable[[Variables], Variables], *, dtype: str,
+                     attention_impl: str, param_dtype: str, streaming: bool) -> PretrainedPipeline | None:
     """The source as a latent diffusion pipeline, or None when it is a decoder.
 
-    A single file converts into the pipeline it describes; a directory with
+    A single file converts into the pipeline it describes, and a DDUF file
+    unpacks into the one it packs; a directory with
     a model_index.json and no config.json of its own is one. A decoder that
     also ships a pipeline index for its sampler (DiffusionGemma) is loaded as
     the decoder its config names. `placed` puts the pipeline's variables on
@@ -1913,6 +1921,12 @@ def _pipeline_source(name_or_dir: str | Path, directory: Path, commit: str | Non
                                         param_dtype=storage, lazy=streaming)
         return replace(loaded, variables=placed(loaded.variables), revision=commit)
 
+    if single_file is not None and dduf_file is not None:
+        raise ValueError(f"single_file={single_file!r} and dduf_file={dduf_file!r} each name a whole "
+                         "pipeline; pass one")
+    if dduf_file is not None:
+        from dew.interop import dduf
+        return pipeline(dduf.unpacked(sources.repo_file(name_or_dir, directory, dduf_file)))
     if single_file is not None:
         from dew.interop import single_file as original
         # A repo or directory that describes the pipeline (model_index.json
