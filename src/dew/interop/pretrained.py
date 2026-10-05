@@ -498,9 +498,8 @@ class Pretrained:
         elif (
             isinstance(self.model, CausalTransformer)
             and isinstance(family, str)
-            and not decoders.families().get(
-                family, decoders.families()[verify.CONVENTION]
-            ).preserve_source_layout
+            and family in decoders.families()
+            and not decoders.families()[family].preserve_source_layout
             and quantization is None
         ):
             # The decoder export's own encoder, so this and `PretrainedDecoder.from_model`
@@ -2147,7 +2146,7 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
         family = records.text(config.get("model_type"), "model_type")
     else:
         record = verified.translate(config, tensors)
-        family = verify.CONVENTION
+        family = verified.family
     if max_seq_len is not None:
         record["max_seq_len"] = max_seq_len
     built = with_precision("causal_transformer", record, dtype=dtype, attention_impl=attention_impl)
