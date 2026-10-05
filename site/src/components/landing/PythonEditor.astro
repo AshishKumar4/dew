@@ -1,0 +1,59 @@
+---
+import { createHighlighterCore } from 'shiki/core';
+import { createJavaScriptRegexEngine } from 'shiki/engine/javascript';
+import python from 'shiki/langs/python.mjs';
+import dark from 'shiki/themes/vitesse-dark.mjs';
+import light from 'shiki/themes/vitesse-light.mjs';
+
+interface Props {
+	code: string;
+	kind: 'image' | 'text';
+	rows: number;
+	label: string;
+}
+const { code, kind, rows, label } = Astro.props;
+const highlighter = await createHighlighterCore({ themes: [dark, light], langs: [python], engine: createJavaScriptRegexEngine() });
+const highlighted = highlighter.codeToHtml(code, { lang: 'python', defaultColor: false, themes: { dark: 'vitesse-dark', light: 'vitesse-light' } });
+---
+<div class="python-editor" data-python-editor style={`--editor-rows: ${rows}`}>
+	<div class="python-editor-highlight" data-highlight aria-hidden="true" set:html={highlighted} />
+	<textarea data-editable-python data-cell={kind === 'image' ? '' : undefined} data-text-cell={kind === 'text' ? '' : undefined}
+		rows={rows} spellcheck="false" autocapitalize="off" wrap="off" aria-label={label}>{code}</textarea>
+</div>
+<script>
+	import { createHighlighterCore } from 'shiki/core';
+	import { createJavaScriptRegexEngine } from 'shiki/engine/javascript';
+	import python from 'shiki/langs/python.mjs';
+	import dark from 'shiki/themes/vitesse-dark.mjs';
+	import light from 'shiki/themes/vitesse-light.mjs';
+	const highlighter = await createHighlighterCore({ themes: [dark, light], langs: [python], engine: createJavaScriptRegexEngine() });
+	for (const editor of document.querySelectorAll<HTMLElement>('[data-python-editor]')) {
+		const text = editor.querySelector<HTMLTextAreaElement>('textarea')!;
+		const highlight = editor.querySelector<HTMLElement>('[data-highlight]')!;
+		let composing = false;
+		let queued = false;
+		const update = () => {
+			if (queued || composing) return;
+			queued = true;
+			requestAnimationFrame(() => {
+				queued = false;
+				highlight.innerHTML = highlighter.codeToHtml(`${text.value}\n`, {
+					lang: 'python', defaultColor: false, themes: { dark: 'vitesse-dark', light: 'vitesse-light' },
+				});
+				highlight.scrollTop = text.scrollTop;
+				highlight.scrollLeft = text.scrollLeft;
+			});
+		};
+		text.addEventListener('input', update);
+		text.addEventListener('compositionstart', () => { composing = true; });
+		text.addEventListener('compositionend', () => { composing = false; update(); });
+		text.addEventListener('scroll', () => {
+			highlight.scrollTop = text.scrollTop;
+			highlight.scrollLeft = text.scrollLeft;
+		});
+		// Model selection and Reset change the editor programmatically.
+		text.addEventListener('change', update);
+		editor.closest('.live-sampler, .live-text')?.addEventListener('click', () => requestAnimationFrame(update));
+		editor.closest('.live-text')?.addEventListener('change', () => requestAnimationFrame(update));
+	}
+</script>

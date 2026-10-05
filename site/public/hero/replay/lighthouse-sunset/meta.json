@@ -1,0 +1,62 @@
+{
+ "prompt": "a lighthouse on a rocky coast at sunset, dramatic waves and golden light, vivid colors, dramatic lighting, highly detailed",
+ "seed": 3,
+ "sampler": "UniPC",
+ "steps": 30,
+ "cfg": 6.0,
+ "guidance_interval": [
+  0.2,
+  0.9
+ ],
+ "negative_prompt": "letterbox, white border, black border, frame, text, watermark, collage, blurry, lowres, low quality, dull colors, washed out, low contrast, grainy",
+ "batch_prompts": null,
+ "batch_row": null,
+ "model": {
+  "model": "dewml/hybrid-dit-176m",
+  "parameters": 175640848,
+  "dew_commit": "aaffb62c07ffad78c72b29758673d1c4f5c37f4a",
+  "device": "NVIDIA GeForce RTX 4080"
+ },
+ "frames": 30,
+ "kept_steps": [
+  0,
+  1,
+  2,
+  3,
+  4,
+  5,
+  6,
+  7,
+  8,
+  9,
+  10,
+  11,
+  12,
+  13,
+  14,
+  15,
+  16,
+  17,
+  18,
+  19,
+  20,
+  21,
+  22,
+  23,
+  24,
+  25,
+  26,
+  27,
+  28,
+  29
+ ],
+ "columns": 8,
+ "crop": [
+  0,
+  42,
+  256,
+  213
+ ],
+ "width": 256,
+ "height": 171
+}
