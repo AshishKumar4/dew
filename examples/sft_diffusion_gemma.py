@@ -97,8 +97,9 @@ def main(config: Config) -> Path:
     adapter, variables = LoRA.fresh(source.model, source.variables, source.layouts,
                                     rank=config.rank, alpha=config.alpha,
                                     modules=list(config.modules), key=jax.random.key(0))
-    # The host layout fetches one layer per scan iteration. A plain loop's
-    # fetches would be hoisted together, putting the whole base on the device.
+    # A host layout streams the stack one layer per scan iteration, so the
+    # decoder runs as a scan; a plain loop's fetches would all be hoisted and
+    # the whole base would land on the device this is keeping it off.
     scanned = source.model.clone(text=source.model.text.clone(scan_layers=True))
     objective = BlockDiffusionObjective(
         adapter.adapt(scanned), prompt_length=config.prompt_tokens,
