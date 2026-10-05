@@ -59,6 +59,7 @@ from collections.abc import Mapping
 import numpy as np
 
 from dew import records
+from dew.interop.config_records import native_fields
 from dew.interop.hf_decoders import (
     _ACTIVATIONS,
     _CODEC_FIELDS,
@@ -76,6 +77,11 @@ from dew.interop.hf_decoders import (
     _refuse,
     _refuse_encoder_fields,
 )
+from dew.nn.attention_residuals import AttentionResiduals
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.decoder_block import Mixture
+from dew.nn.backbones.layer_plan import LayerKind
+from dew.nn.moe import Situ
 
 # KimiLinearConfig's __init__ arguments (configuration_kimi.py:11-52 of
 # Kimi-Linear-48B-A3B-Instruct at e1df551).
@@ -124,12 +130,12 @@ def _situ(text: Mapping[str, object]) -> SituFields:
     beta is 1.0 (`beta or 1.0`), an unset linear beta leaves up uncapped."""
     beta = text.get('activation_situ_beta')
     linear = text.get('activation_situ_linear_beta')
-    return {
-        "beta": float(records.number(beta, "activation_situ_beta")) if beta else 1.0,
-        "linear_beta": None
+    return native_fields(Situ)(
+        beta=float(records.number(beta, "activation_situ_beta")) if beta else 1.0,
+        linear_beta=None
         if linear is None
         else float(records.number(linear, "activation_situ_linear_beta")),
-    }
+    )
 
 
 def _mixture(text: Mapping[str, object], layers: int) -> MixtureFields | None:
@@ -155,18 +161,18 @@ def _mixture(text: Mapping[str, object], layers: int) -> MixtureFields | None:
     width = _record_int(text, 'moe_intermediate_size')
     shared = _record_int(text, 'num_shared_experts', 0)
     latent = text.get('routed_expert_hidden_size')
-    mixture: MixtureFields = {
-        'experts': experts, 'top_k': top_k,
-        'layers': tuple(index for index in range(layers) if index >= first and index % every == 0),
-        'score_function': score, 'bias': True,
-        'norm_topk_prob': bool(text.get('moe_renormalize', True)) and top_k > 1,
-        'scaling': _record_float(text, 'routed_scaling_factor', 1.0),
-        'groups': groups if groups > per_token else 1,
-        'groups_per_token': per_token if groups > per_token else 1,
-        'expert_features': width, 'shared_features': width * shared,
-        'latent_features': None if latent is None else records.integer(latent, 'routed_expert_hidden_size'),
-        'latent_norm': bool(text.get('latent_moe_use_norm', False)) and latent is not None,
-    }
+    mixture: MixtureFields = native_fields(Mixture)(
+        experts=experts, top_k=top_k,
+        layers=tuple(index for index in range(layers) if index >= first and index % every == 0),
+        score_function=score, bias=True,
+        norm_topk_prob=bool(text.get('moe_renormalize', True)) and top_k > 1,
+        scaling=_record_float(text, 'routed_scaling_factor', 1.0),
+        groups=groups if groups > per_token else 1,
+        groups_per_token=per_token if groups > per_token else 1,
+        expert_features=width, shared_features=width * shared,
+        latent_features=None if latent is None else records.integer(latent, 'routed_expert_hidden_size'),
+        latent_norm=bool(text.get('latent_moe_use_norm', False)) and latent is not None,
+    )
     return mixture
 
 
@@ -196,15 +202,17 @@ def _decoder(text: Mapping[str, object], tied: bool, max_seq_len: int) -> Decode
     kinds: dict[str, KindFields] = {}
     if 'linear_attention' in types:
         bound = linear.get('gate_lower_bound')
-        kinds['linear_attention'] = {'mixer': {
+        kinds['linear_attention'] = native_fields(LayerKind)(mixer=None)
+        kinds['linear_attention'].update(mixer={
             'kind': 'kimi_delta_attention',
             'linear_num_heads': _record_int(linear, 'num_heads'),
             'linear_head_dim': _record_int(linear, 'head_dim'),
             'linear_conv_kernel_dim': _record_int(linear, 'short_conv_kernel_size'),
             'linear_lower_bound': None if bound is None else float(records.number(bound, 'gate_lower_bound')),
-            'use_full_rank_gate': bool(linear.get('use_full_rank_gate', False))}}
+            'use_full_rank_gate': bool(linear.get('use_full_rank_gate', False))})
     if 'full_attention' in types:
-        kinds['full_attention'] = {'mixer': {
+        kinds['full_attention'] = native_fields(LayerKind)(mixer=None)
+        kinds['full_attention'].update(mixer={
             'kind': 'mla',
             'q_lora_rank': None if text.get('q_lora_rank') is None else _record_int(text, 'q_lora_rank'),
             'kv_lora_rank': _record_int(text, 'kv_lora_rank'),
@@ -212,30 +220,33 @@ def _decoder(text: Mapping[str, object], tied: bool, max_seq_len: int) -> Decode
             'qk_rope_head_dim': _record_int(text, 'qk_rope_head_dim'),
             'v_head_dim': _record_int(text, 'v_head_dim'),
             'mla_use_nope': True,
-            'mla_use_output_gate': bool(text.get('mla_use_output_gate', False))}}
+            'mla_use_output_gate': bool(text.get('mla_use_output_gate', False))})
     block = text.get('attn_res_block_size')
-    config: DecoderFields = {
-        "vocab_size": _record_int(text, "vocab_size"),
-        "emb_features": hidden,
-        "num_layers": layers,
-        "num_heads": heads,
-        "num_kv_heads": heads,
-        "head_dim": hidden // heads,
-        "mlp": _situ(text) if activation == "situ" else _ACTIVATIONS[activation],
-        "mlp_features": _record_int(text, "intermediate_size"),
-        "max_seq_len": max_seq_len,
-        "layer_types": types,
-        "kinds": kinds,
+    config: DecoderFields = native_fields(CausalTransformer)(
+        vocab_size=_record_int(text, "vocab_size"),
+        emb_features=hidden,
+        num_layers=layers,
+        num_heads=heads,
+        num_kv_heads=heads,
+        head_dim=hidden // heads,
+        mlp="swiglu",
+        mlp_features=_record_int(text, "intermediate_size"),
+        max_seq_len=max_seq_len,
+        layer_types=types,
+        kinds={},
         # KimiRMSNorm scales after the cast (modeling_kimi.py:224-239).
-        "norm_eps": _record_float(text, "rms_norm_eps", 1e-6),
-        "scale_after_cast": True,
-        "qk_norm": False,
-        "tie_embeddings": tied,
-        "mixture": _mixture(text, layers),
-        "attention_residuals": None
-        if block is None
-        else {"block_size": records.integer(block, "attn_res_block_size")},
-    }
+        norm_eps=_record_float(text, "rms_norm_eps", 1e-6),
+        scale_after_cast=True,
+        qk_norm=False,
+        tie_embeddings=tied,
+        mixture=None,
+        attention_residuals=None,
+    )
+    config.update(
+        mlp=_situ(text) if activation == "situ" else _ACTIVATIONS[activation],
+        kinds=kinds, mixture=_mixture(text, layers),
+        attention_residuals=None if block is None else native_fields(AttentionResiduals)(
+            block_size=records.integer(block, "attn_res_block_size")))
     return config
 
 

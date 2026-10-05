@@ -30,32 +30,32 @@ from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Literal, NoReturn, Protocol, TypedDict, Unpack
+from typing import NoReturn, Protocol, TypedDict
 
 import jax
 import numpy as np
 from flax import linen as nn
 from flax.traverse_util import flatten_dict
-from flax.typing import Dtype, PrecisionLike
 
 from dew import records
 from dew._model_types import _QWEN35_TEXT_TYPES, _QWEN35_TYPES
+from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.safetensors_io import LazyTensors
-
-if TYPE_CHECKING:
-    from dew.interop.families.deepseek_v41 import DSparkFields, EngramFields
 from dew.interop.streaming import LazyTree, SourceLeaf, WeightLayout, materialize
 from dew.interop.weights import checkpoint_dtype, insert
 from dew.nn import audio as audio_nn, vision as vision_nn
+from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.backbones.decoder_block import Mixture, RematPolicy
+from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
-from dew.nn.kv_cache import KVCache
+from dew.nn.gemma3n import AltUp
+from dew.nn.hyper_connections import HyperConnections
 from dew.nn.mixers import AttentionMixer, MixerBase
 from dew.nn.moe import GatedActivation, Situ
+from dew.nn.rope import RopeScaling, YarnScaling
 from dew.nn.text_encoders import check_tree
 from dew.objectives.base import Variables
-from dew.registry import from_record, mixers, towers
+from dew.registry import from_record, towers
 
 GENERATION_CONFIG_FILE = "generation_config.json"
 
@@ -240,207 +240,21 @@ def _kind_name(record: Mapping[str, object], section: str) -> str:
     return records.text(records.record(record[section], section)['kind'], f"{section} kind")
 
 
-class Llama3Ramp(TypedDict):
-    """Describes Llama 3.1's frequency ramp, under the reference's own field names.
-    `dew.nn.rope.RopeScaling` is built from these keys."""
-
-    rope_type: Literal['llama3']
-    factor: float
-    low_freq_factor: float
-    high_freq_factor: float
-    original_max_position_embeddings: int
-
-
-class YarnRamp(TypedDict):
-    """Describes a YaRN frequency table, under the reference's own field names.
-    `dew.nn.rope.YarnScaling` is built from these keys."""
-
-    rope_type: Literal['yarn']
-    rope_theta: float
-    factor: float
-    original_max_position_embeddings: int
-    beta_fast: float
-    beta_slow: float
-    mscale: float | None
-    mscale_all_dim: float | None
-    truncate: bool
-    attention_factor: float | None
+type Llama3Ramp = NativeFields[RopeScaling]
+type YarnRamp = NativeFields[YarnScaling]
 
 
 # Which ramp a record is, read off the `rope_type` it carries.
 type Ramp = Llama3Ramp | YarnRamp
 
 
-class KindFields(TypedDict, total=False):
-    """Describes one `LayerKind`: what the layers of one kind do
-    differently. A mixer record dispatches on its own `kind`."""
-
-    window: int | None
-    chunk: int | None
-    num_kv_heads: int | None
-    rope_theta: float | None
-    rope_scaling: Ramp | None
-    yarn: Ramp | None
-    head_dim: int | None
-    mixer: Mapping[str, object] | None
-
-
-class MixtureFields(TypedDict, total=False):
-    """Describes one `Mixture`: the experts some layers route to, and how
-    the router chooses."""
-
-    experts: int
-    top_k: int
-    layers: tuple[int, ...] | None
-    score_function: str
-    norm_topk_prob: bool
-    scaling: float
-    groups: int
-    groups_per_token: int
-    group_score: str
-    bias: bool
-    scale_inputs: bool
-    parallel: bool
-    expert_features: int | None
-    shared_features: int
-    shared_gate: bool
-    implementation: str
-    dispatch: str
-    capacity_factor: float | None
-    hash_layers: tuple[int, ...] | None
-    latent_features: int | None
-    latent_norm: bool
-    media_bias: bool
-
-
-class AltUpFields(TypedDict, total=False):
-    """Describes one `AltUp`: Gemma 3n's stack of residual copies."""
-
-    num_inputs: int
-    active_idx: int
-    coef_clip: float | None
-    correct_scale: bool
-
-
-class HyperConnectionsFields(TypedDict, total=False):
-    """Describes one `HyperConnections`: how many residual streams a layer
-    reads and writes, and how they collapse."""
-
-    hc_mult: int
-    hc_eps: float
-    hc_sinkhorn_iters: int
-    head: str
-    single_pass: bool
-
-
-class AttentionResidualsFields(TypedDict, total=False):
-    """Describes one `AttentionResiduals`: Kimi K3's block size over depth."""
-
-    block_size: int
-
-
-class SituFields(TypedDict, total=False):
-    """Describes one `Situ`: Kimi K3's SiTU betas."""
-
-    beta: float
-    linear_beta: float | None
-
-
-class DecoderFields(TypedDict, total=False):
-    """Names every field of `CausalTransformer` a translated config can set.
-
-    The keys are the dataclass's own init fields, which
-    `tests/test_hf_decoders.py` pins, so a field renamed there is a failing
-    test here rather than a key nobody reads. The values are what a config
-    carries: a ramp, a mixture, a mixer, a kind and an mHC stack arrive as
-    records, which the module builds in its `__post_init__`, and every other
-    field arrives as the value it declares.
-    """
-
-    vocab_size: int
-    emb_features: int
-    num_layers: int
-    num_heads: int
-    num_kv_heads: int | None
-    head_dim: int | None
-    mlp: str | SituFields
-    mlp_bias: bool
-    mlp_features: int | tuple[int, ...] | None
-    max_seq_len: int
-    position_embedding: Literal['rotary', 'learned']
-    position_embedding_size: int | None
-    position_embedding_offset: int
-    rope_theta: float
-    rope_scaling: Ramp | None
-    partial_rotary_factor: float | None
-    partial_rotary_type: str
-    layer_types: tuple[str, ...] | None
-    kinds: dict[str, KindFields]
-    norm_eps: float
-    norm_type: Literal['rms', 'layer']
-    norm_bias: bool
-    scale_offset: bool
-    scale_after_cast: bool
-    sandwich_norms: bool
-    pre_norms: bool
-    parallel_residual: bool
-    qk_norm: bool
-    qk_norm_scope: str
-    v_norm: bool
-    attention_k_eq_v: bool
-    layer_scalar: Literal['frozen', 'trainable'] | None
-    attention_bias: bool
-    o_proj_bias: bool | None
-    attention_scale: float | None
-    attention_sinks: bool
-    yarn: Ramp | None
-    attn_logit_softcap: float | None
-    output_gate: bool
-    embedding_scale: bool
-    embedding_multiplier: float
-    residual_multiplier: float
-    logits_scaling: float
-    initializer_range: float | None
-    depth_scaled_init: bool
-    final_logit_softcap: float | None
-    tie_embeddings: bool
-    embedding_zero_ids: tuple[int, ...]
-    dropout_rate: float
-    embedding_dropout_rate: float
-    attention_dropout_rate: float
-    dtype: Dtype | None
-    precision: PrecisionLike
-    force_fp32_for_softmax: bool
-    attention_impl: str
-    kv_cache: KVCache
-    """The decode cache's storage layout. Like attention_impl it is the
-    runtime's choice, not the checkpoint's: no HF config field sets it, and a
-    caller's record may."""
-    mixture: MixtureFields | None
-    use_double_wide_mlp: bool
-    causal: bool
-    per_layer_input_dim: int | None
-    per_layer_input_vocab: int | None
-    kv_shared_layers: tuple[int, ...] | None
-    mixer: Mapping[str, object] | MixerBase | None
-    """The mixer as its registry record, or as the built value a family
-    constructs directly (`_mixer_value` accepts both)."""
-    num_nextn_predict_layers: int
-    index_share_for_mtp_iteration: bool
-    mtp_layer_type: str | None
-    mtp_hyper_connections: HyperConnectionsFields | None
-    altup: AltUpFields | None
-    laurel_rank: int | None
-    hyper_connections: HyperConnectionsFields | None
-    attention_residuals: AttentionResidualsFields | None
-    engram: "EngramFields | None"
-    dspark: "DSparkFields | None"
-    swiglu_limit: float | None
-    activation_sparsity_pattern: tuple[float, ...] | None
-    mask_token_id: int | None
-    scan_layers: bool
-    bank_layers: int | None
-    remat: RematPolicy | None
+type KindFields = NativeFields[LayerKind]
+type MixtureFields = NativeFields[Mixture]
+type AltUpFields = NativeFields[AltUp]
+type HyperConnectionsFields = NativeFields[HyperConnections]
+type AttentionResidualsFields = NativeFields[AttentionResiduals]
+type SituFields = NativeFields[Situ]
+type DecoderFields = NativeFields[CausalTransformer]
 
 
 class AudioFields(TypedDict):
@@ -474,11 +288,14 @@ def _kinds_of(config: DecoderFields) -> dict[str, KindFields]:
     kinds = config.get('kinds')
     if kinds is None:
         _refuse('kinds', 'the shared decoder fields carry one record per named kind')
-    return kinds
+    parsed = {name: NativeFields(LayerKind, records.record(kind, f'kinds.{name}'))
+              for name, kind in records.record(kinds, 'kinds').items()}
+    config['kinds'] = parsed
+    return parsed
 
 
-_LLAMA3_FIELDS: tuple[str, ...] = ('factor', 'low_freq_factor', 'high_freq_factor',
-                                   'original_max_position_embeddings')
+_LLAMA3_FIELDS = tuple(field.name for field in dataclasses.fields(RopeScaling)
+                       if field.name != 'rope_type')
 
 @dataclass(frozen=True)
 class _Rope:
@@ -523,15 +340,15 @@ def _rope_entry(entry: Mapping[str, object] | None, field: str,
                     f"missing {missing}, unexpected {extra}")
         return _Rope(
             theta,
-            {
-                "rope_type": "llama3",
-                "factor": records.number(entry["factor"], "factor"),
-                "low_freq_factor": records.number(entry["low_freq_factor"], "low_freq_factor"),
-                "high_freq_factor": records.number(entry["high_freq_factor"], "high_freq_factor"),
-                "original_max_position_embeddings": records.integer(
+            native_fields(RopeScaling)(
+                rope_type="llama3",
+                factor=records.number(entry["factor"], "factor"),
+                low_freq_factor=records.number(entry["low_freq_factor"], "low_freq_factor"),
+                high_freq_factor=records.number(entry["high_freq_factor"], "high_freq_factor"),
+                original_max_position_embeddings=records.integer(
                     entry["original_max_position_embeddings"], "original_max_position_embeddings"
                 ),
-            },
+            ),
         )
     if rope_type == 'yarn' and yarn_max_pos is not None:
         # The base an entry names, or the shared default until `_at_base`
@@ -588,7 +405,7 @@ def _at_base(scaling: Ramp | None, theta: float) -> Ramp | None:
     """
     if scaling is None or scaling['rope_type'] != 'yarn':
         return scaling
-    return {**scaling, 'rope_theta': theta}
+    return NativeFields(YarnScaling, {**scaling, 'rope_theta': theta})
 
 
 def _rope(hf_config: Mapping[str, object], used: set,
@@ -671,12 +488,12 @@ def _kinds(layer_types: tuple[str, ...], window: int | None,
     """
     kinds: dict[str, KindFields] = {}
     if 'sliding_attention' in layer_types:
-        sliding: KindFields = {'window': window}
+        sliding: KindFields = native_fields(LayerKind)(window=window)
         if local_theta is not None:
             sliding['rope_theta'] = local_theta
         kinds['sliding_attention'] = sliding
     if 'full_attention' in layer_types:
-        full: KindFields = {}
+        full: KindFields = native_fields(LayerKind)()
         if full_theta is not None:
             full['rope_theta'] = full_theta
         if full_head_dim is not None:
@@ -686,11 +503,8 @@ def _kinds(layer_types: tuple[str, ...], window: int | None,
     return kinds
 
 
-_YARN_FIELDS = frozenset({
-    'rope_type', 'type', 'rope_theta', 'factor', 'beta_fast', 'beta_slow',
-    'mscale', 'mscale_all_dim', 'original_max_position_embeddings',
-    'truncate', 'attention_factor', 'partial_rotary_factor',
-})
+_YARN_FIELDS = frozenset(field.name for field in dataclasses.fields(YarnScaling)) | {
+    'type', 'partial_rotary_factor'}
 
 
 # vLLM's spelling of a YaRN attention scale, which DeepSeek-R1-0528-Qwen3-8B
@@ -726,28 +540,28 @@ def _yarn_record(entry: Mapping[str, object], field: str, theta: float,
         factor = float(max_pos) / records.number(
             entry["original_max_position_embeddings"], "original_max_position_embeddings"
         )
-    return {
-        "rope_type": "yarn",
-        "rope_theta": theta,
-        "factor": records.number(factor, f"{field} factor"),
-        "original_max_position_embeddings": records.integer(
+    return native_fields(YarnScaling)(
+        rope_type="yarn",
+        rope_theta=theta,
+        factor=records.number(factor, f"{field} factor"),
+        original_max_position_embeddings=records.integer(
             entry["original_max_position_embeddings"], "original_max_position_embeddings"
         ),
-        "beta_fast": records.number(entry.get("beta_fast") or 32, "beta_fast"),
-        "beta_slow": records.number(entry.get("beta_slow") or 1, "beta_slow"),
-        "mscale": (None if entry.get("mscale") is None else records.number(entry["mscale"], "mscale")),
-        "mscale_all_dim": (
+        beta_fast=records.number(entry.get("beta_fast") or 32, "beta_fast"),
+        beta_slow=records.number(entry.get("beta_slow") or 1, "beta_slow"),
+        mscale=(None if entry.get("mscale") is None else records.number(entry["mscale"], "mscale")),
+        mscale_all_dim=(
             None
             if entry.get("mscale_all_dim") is None
             else records.number(entry["mscale_all_dim"], "mscale_all_dim")
         ),
-        "truncate": bool(entry.get("truncate", True)),
-        "attention_factor": (
+        truncate=bool(entry.get("truncate", True)),
+        attention_factor=(
             None
             if entry.get("attention_factor") is None
             else records.number(entry["attention_factor"], "attention_factor")
         ),
-    }
+    )
 
 
 def _mlp_features(hf_config: Mapping[str, object]) -> int | tuple[int, ...]:
@@ -829,36 +643,37 @@ def _base_config(hf_config: Mapping[str, object], used: set[str], *,
                       if 'sliding_attention' in layer_types else None)
 
     kinds = _kinds(layer_types, sliding_window, rope_local_theta, None, None)
-    config: DecoderFields = {
-        'vocab_size': records.integer(hf_config['vocab_size'], 'vocab_size'),
-        'emb_features': hidden,
-        'num_layers': records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers'),
-        'num_heads': heads,
-        'num_kv_heads': heads if kv_heads is None else records.integer(kv_heads, 'num_key_value_heads'),
-        'head_dim': head_dim,
-        'mlp': mapped,
-        'mlp_features': _mlp_features(hf_config),
-        'max_seq_len': min(records.integer(hf_config.get('max_position_embeddings',
+    config: DecoderFields = native_fields(CausalTransformer)(
+        vocab_size=records.integer(hf_config['vocab_size'], 'vocab_size'),
+        emb_features=hidden,
+        num_layers=records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers'),
+        num_heads=heads,
+        num_kv_heads=heads if kv_heads is None else records.integer(kv_heads, 'num_key_value_heads'),
+        head_dim=head_dim,
+        mlp=mapped,
+        mlp_features=_mlp_features(hf_config),
+        max_seq_len=min(records.integer(hf_config.get('max_position_embeddings',
                                              DEFAULT_MAX_SEQ_LEN), 'max_position_embeddings'),
                            DEFAULT_MAX_SEQ_LEN),
-        'rope_theta': rope_theta,
-        'layer_types': layer_types,
-        'kinds': kinds,
-        'norm_eps': records.number(hf_config.get('rms_norm_eps', 1e-6), 'rms_norm_eps'),
+        rope_theta=rope_theta,
+        layer_types=layer_types,
+        kinds={},
+        norm_eps=records.number(hf_config.get('rms_norm_eps', 1e-6), 'rms_norm_eps'),
         # LlamaRMSNorm, Qwen3RMSNorm and DeepseekV3RMSNorm multiply the scale
         # into the activations after casting them (modeling_qwen3.py:61-64,
         # modeling_deepseek_v3.py:47-52); Gemma3's, Gemma4's and Qwen3.5's
         # norms scale in fp32 and cast the product (modeling_gemma3.py:147-150,
         # modeling_gemma4.py:197-215, modeling_qwen3_5.py:732-737).
-        'scale_after_cast': scale_after_cast,
-        'qk_norm': qk_norm,
-        'attention_bias': 'attention_bias' in reads and bool(hf_config.get('attention_bias', False)),
+        scale_after_cast=scale_after_cast,
+        qk_norm=qk_norm,
+        attention_bias='attention_bias' in reads and bool(hf_config.get('attention_bias', False)),
         # Gemma3TextConfig ties by default, and so does Gemma4TextConfig; the
         # others do not, so a config that omits the field (gemma-3-1b-pt
         # does) takes its family's default.
-        'tie_embeddings': bool(hf_config.get(
+        tie_embeddings=bool(hf_config.get(
             'tie_word_embeddings', tie_embeddings)),
-    }
+    )
+    config['kinds'] = kinds
     used.update(('vocab_size', 'intermediate_size', 'max_position_embeddings',
                  'rms_norm_eps', 'tie_word_embeddings'))
     if 'attention_bias' in reads:
@@ -868,7 +683,7 @@ def _base_config(hf_config: Mapping[str, object], used: set[str], *,
     # the llama3 ramp over the plain frequencies, `yarn` replaces them.
     if ropes.scaling is not None:
         if ropes.full_only and 'sliding_attention' in layer_types:
-            full = kinds.setdefault('full_attention', {})
+            full = kinds.setdefault('full_attention', native_fields(LayerKind)())
             if ropes.scaling['rope_type'] == 'llama3':
                 full['rope_scaling'] = ropes.scaling
             else:
@@ -886,16 +701,12 @@ def _base_config(hf_config: Mapping[str, object], used: set[str], *,
     return config
 
 
-def _softmax_mixture(hf_config: Mapping[str, object], used: set[str],
-                     **fields: Unpack[MixtureFields]) -> MixtureFields:
-    """Build the Mixtral-style mixture: a softmax over the experts, the top k, and
-    the renormalisation the family's `norm_topk_prob` says (Mixtral always
-    renormalises, modeling_mixtral.py:109; Qwen3-MoE reads the field,
-    modeling_qwen3_moe.py:263-264). The router's aux loss coefficient and
-    logit output are training-time knobs the forward pass never reads."""
+def _softmax_top_k(hf_config: Mapping[str, object], used: set[str]) -> int:
+    """Read the top-k count without treating training-only routing controls
+    as model fields. Each family's native Mixture owns its routing options."""
     used.update(('num_experts_per_tok', 'output_router_logits',
                  'router_aux_loss_coef'))
-    return {'top_k': records.integer(hf_config['num_experts_per_tok'], 'num_experts_per_tok'), **fields}
+    return records.integer(hf_config['num_experts_per_tok'], 'num_experts_per_tok')
 
 
 def translate_config(hf_config: Mapping[str, object]) -> DecoderFields:
@@ -2236,7 +2047,7 @@ class DecoderFamily:
 
     model_types: tuple[str, ...]
     translate_config: Callable[[Mapping[str, object], set[str]], DecoderFields]
-    matches: Callable[[DecoderFields], bool]
+    matches: Callable[[CausalTransformer], bool]
     export_model_type: str
     architecture: str
     export_fields: Callable[[CausalTransformer], Mapping[str, object]]
@@ -2305,33 +2116,15 @@ def _bundles(config: Mapping[str, object]) -> bool:
             and config.get("vision_config") is not None)
 
 
-def _kind_mixers(fields: DecoderFields) -> list[MixerBase]:
-    """Return the mixer value of every kind a config names, records built."""
-    found = []
-    for kind in (fields.get('kinds') or {}).values():
-        mixer = kind.mixer if isinstance(kind, LayerKind) else kind.get('mixer')
-        if isinstance(mixer, Mapping):
-            mixer = mixers.from_record(mixer)
-        if mixer is not None:
-            found.append(mixer)
-    return found
+def _kind_mixers(fields: CausalTransformer) -> list[MixerBase]:
+    """Return the mixer values of the model's named kinds."""
+    return [kind.mixer for kind in (fields.kinds or {}).values() if kind.mixer is not None]
 
 
-def _mixer_value(fields: DecoderFields) -> MixerBase | None:
-    mixer = fields.get('mixer')
-    return mixers.from_record(mixer) if isinstance(mixer, Mapping) else mixer
-
-
-def _mixture_value(fields: DecoderFields) -> Mixture | None:
-    mixture = fields.get('mixture')
-    return Mixture(**mixture) if isinstance(mixture, Mapping) else mixture
-
-def _every_layer_windowed(fields: DecoderFields) -> bool:
-    kinds = fields.get('kinds') or {}
-    windows = {name: (kind.window if isinstance(kind, LayerKind) else kind.get('window'))
-               for name, kind in kinds.items()}
+def _every_layer_windowed(fields: CausalTransformer) -> bool:
+    windows = {name: kind.window for name, kind in (fields.kinds or {}).items()}
     return all(windows.get(layer) is not None
-               for layer in fields.get('layer_types') or ('full_attention',))
+               for layer in fields.layer_types or ('full_attention',))
 
 
 def _check_tree(variables: Mapping[str, object], model) -> None:
@@ -2354,33 +2147,17 @@ def families() -> dict[str, DecoderFamily]:
     """The single mutable name table, also used for registered source aliases."""
     return {name: family for family in family_entries() for name in family.model_types}
 
-def _backbone_defaults() -> DecoderFields:
-    """Return what the backbone takes for a field a config leaves unset, so a partial
-    config (a layer's worth of tensors in a test) selects its family the way
-    the built model would."""
-    found = {}
-    for declared in dataclasses.fields(CausalTransformer):
-        if declared.default_factory is not dataclasses.MISSING:
-            found[declared.name] = declared.default_factory()
-        elif declared.default is not dataclasses.MISSING:
-            found[declared.name] = declared.default
-    return DecoderFields(**found)
-
-
-_BACKBONE_DEFAULTS = _backbone_defaults()
-
-
-def _family_of(fields: DecoderFields) -> DecoderFamily:
+def _family_of(fields: CausalTransformer) -> DecoderFamily:
     return next(family for family in family_entries() if family.matches(fields))
 
 
-def _family_for_config(config: DecoderFields) -> DecoderFamily:
-    return _family_of({**_BACKBONE_DEFAULTS, **config})
+def _family_for_config(config: Mapping[str, object]) -> DecoderFamily:
+    # Weight-path probes may state only a layer's fields, with no vocabulary.
+    return _family_of(from_record(CausalTransformer, {'vocab_size': 0, **config, 'parent': None}))
 
 
 def _family_for_model(model: CausalTransformer) -> DecoderFamily:
-    return _family_of(DecoderFields(**{field.name: getattr(model, field.name)
-                                       for field in dataclasses.fields(model)}))
+    return _family_of(model)
 
 
 def with_constants(variables: Variables, record: DecoderFields, directory: Path) -> Variables:

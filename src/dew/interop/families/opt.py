@@ -3,6 +3,7 @@
 from collections.abc import Mapping
 
 from dew import records
+from dew.interop.config_records import native_fields
 from dew.interop.hf_decoders import DEFAULT_MAX_SEQ_LEN, DecoderFields, Renames, _refuse
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
@@ -33,22 +34,22 @@ def _opt_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     activations = {'relu': 'relu', 'gelu': 'gelu_exact', 'gelu_new': 'gelu'}
     if activation not in activations:
         _refuse(f'activation_function={activation!r}', 'the ungated MLP supports ReLU and GELU')
-    return {
-        'vocab_size': records.integer(hf.get('vocab_size', 50272), 'vocab_size'),
-        'emb_features': hidden,
-        'num_layers': records.integer(hf.get('num_hidden_layers', 12), 'num_hidden_layers'),
-        'num_heads': heads, 'num_kv_heads': heads, 'head_dim': hidden // heads,
-        'mlp_features': records.integer(hf.get('ffn_dim', 3072), 'ffn_dim'),
-        'mlp': activations[activation], 'mlp_bias': bool(hf.get('enable_bias', True)),
-        'norm_type': 'layer', 'norm_bias': True, 'norm_eps': 1e-5,
-        'qk_norm': False, 'attention_bias': bool(hf.get('enable_bias', True)),
-        'position_embedding': 'learned', 'position_embedding_size': positions + 2,
-        'max_seq_len': min(positions, DEFAULT_MAX_SEQ_LEN),
-        'position_embedding_offset': 2,
-        'tie_embeddings': bool(hf.get('tie_word_embeddings', True)),
-        'dropout_rate': records.number(hf.get('dropout', .1), 'dropout'),
-        'attention_dropout_rate': records.number(hf.get('attention_dropout', 0.), 'attention_dropout'),
-    }
+    return native_fields(CausalTransformer)(
+        vocab_size=records.integer(hf.get('vocab_size', 50272), 'vocab_size'),
+        emb_features=hidden,
+        num_layers=records.integer(hf.get('num_hidden_layers', 12), 'num_hidden_layers'),
+        num_heads=heads, num_kv_heads=heads, head_dim=hidden // heads,
+        mlp_features=records.integer(hf.get('ffn_dim', 3072), 'ffn_dim'),
+        mlp=activations[activation], mlp_bias=bool(hf.get('enable_bias', True)),
+        norm_type='layer', norm_bias=True, norm_eps=1e-5,
+        qk_norm=False, attention_bias=bool(hf.get('enable_bias', True)),
+        position_embedding='learned', position_embedding_size=positions + 2,
+        max_seq_len=min(positions, DEFAULT_MAX_SEQ_LEN),
+        position_embedding_offset=2,
+        tie_embeddings=bool(hf.get('tie_word_embeddings', True)),
+        dropout_rate=records.number(hf.get('dropout', .1), 'dropout'),
+        attention_dropout_rate=records.number(hf.get('attention_dropout', 0.), 'attention_dropout'),
+    )
 
 
 _OPT_NAMES: Renames = (
