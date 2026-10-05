@@ -140,13 +140,7 @@
    ],
    "note": "Torch 2.14.0+cpu. CT's NVFP4 decompress always returns bf16 weights; from_pretrained(dtype=float32) cannot run its mixed-dtype first forward. A bf16 reader checks redundant weight QDQ removal bit for bit. The fp32 reader keeps dense checkpoint tensors in fp32 and promotes only its decoded bf16 Linear weights before fp32/float64 forwards. Each weight's direct fp32 dequantize is recorded under /unrounded and must round to the published bf16 decode bit for bit. Dew uses that published bf16 decode."
   },
-  "codecs/storage/activation_forwards.npz": {
-   "tool": "tools/nvfp4_storage_reference.py",
-   "sources": [
-    {"repo": "vllm-project/compressed-tensors", "version": "0.17.1", "runs": "compressed_tensors"}
-   ],
-   "note": "Torch 2.14.0+cpu; static FP8, dynamic=True FP8, dynamic=local NVFP4 input QDQ forwards after the library's weight decompression. Removing input QDQ is checked against the same decoded dense Linear; the forwards differ. NVFP4 runs in its published bf16 decode dtype."
-  },
+
   "codecs/compressed_tensors_mxfp4.npz": {
    "tool": "tools/compressed_tensors_mxfp4_reference.py",
    "sources": [

@@ -12,11 +12,11 @@ RoPE and softmax pins widened by diffusers_wan_reference.float64. NVFP4's
 unrounded fp32 dequantize is recorded too, and its bf16 rounding must equal
 the published decoder. There are no activation quantizers in these files.
 
-The separate QDQ fixture records real compressed-tensors Linear forwards
-with static FP8, dynamic FP8 and local NVFP4 inputs, and the same decoded
-weights without input QDQ. Decompressing the weights leaves the activation
-quantizer enabled. These three forwards demonstrate why a weight-only
-loader must refuse each activation scheme.
+Generation also runs real compressed-tensors Linear forwards with static
+FP8, dynamic FP8 and local NVFP4 inputs, and the same decoded weights
+without input QDQ. Decompressing the weights leaves the activation quantizer
+enabled. The generation-time assertions show why each scheme needs its
+activation forward; those diagnostic outputs are not fixtures.
 
 Environment (~/.cache/dew/reference-venvs/nvfp4-storage): torch 2.14.0+cpu,
 transformers 5.16.1, compressed-tensors 0.17.1, diffusers 0.34.0. Run:
@@ -132,7 +132,6 @@ def checkpoint(kind: str) -> None:
 
 def activation_forwards() -> None:
     """CPU QDQ runs through the library's wrapped Linear, after real decompression."""
-    arrays = {}
     for label, kind, dynamic in (("fp8_static", "fp8", False), ("fp8_dynamic", "fp8", True),
                                  ("nvfp4_local", "nvfp4", "local")):
         generator = torch.Generator().manual_seed(7301)
@@ -166,12 +165,8 @@ def activation_forwards() -> None:
             dense = module(inputs)
         np.testing.assert_array_equal(no_input_qdq.float().numpy(), dense.float().numpy())
         assert not torch.equal(output, dense)
-        arrays.update({label + "/" + name: value.float().numpy() for name, value in
-                       {"inputs": inputs, "weight": module.weight.detach(), "qdq": output,
-                        "weight_only": dense}.items()})
         rms = float(torch.mean((output.float() - dense.float()) ** 2).sqrt())
         print(label, "QDQ RMS from weight-only", rms)
-    np.savez(ROOT / "activation_forwards.npz", **arrays)
 
 
 def main() -> None:
