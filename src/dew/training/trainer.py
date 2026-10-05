@@ -1,13 +1,13 @@
-"""The trainer: mesh, compiled step, EMA, checkpoints, logging.
+"""The trainer: mesh, compiled step, EMA, checkpoints and logging.
 
-What is learned is the objective's business (`dew.objectives.base`). The
-trainer materialises the objective's tree on the mesh, compiles one step over
-the global batch, and keeps the EMA copy on the optimizer's clock. Effects go
-to the capabilities it was given: a `Checkpoints` for disk, a `Tracker` for
+What is learned is up to the objective (`dew.objectives.base`). The trainer
+creates the objective's variables on the mesh, compiles one step over the
+global batch, and updates the EMA copy once per optimizer update. Side effects
+go to the objects it was given: a `Checkpoints` for disk and a `Tracker` for
 numbers and artifacts.
 
-Constructing one opens nothing; the mesh, the compiled step and the
-capabilities' resources come into being in `fit`.
+Constructing a trainer opens nothing; the mesh, the compiled step and those
+objects' resources are created in `fit`.
 """
 
 from __future__ import annotations
@@ -138,30 +138,33 @@ def batch_shapes(batch: Batch) -> Shapes:
 class Rollout(Protocol):
     """Produces a batch on the host, before the compiled step reads it.
 
-    Sampling is effectful and untraceable, so it lives outside `jit`. The
+    Sampling has side effects and cannot be traced, so it runs outside `jit`. The
     trainer calls the rollout with the state, the prefetched batch and a key
-    folded from the run key and the step, then reshards what comes back with
-    `shard_batch`. The returned batch must hold arrays in fixed shapes, so
-    the step still compiles once per run.
+    folded from the run key and the step, then reshards the result with
+    `shard_batch`. The returned batch must hold arrays of fixed shapes, so the
+    step still compiles once per run.
 
-    A rollout may hold `metrics`, a mapping of names to floats describing
-    its latest call (rewards, lag, truncation); each logging interval sends
-    them to the tracker and the display as `rollout/<name>`. It may declare
-    how the display shows them in `shown`, as an objective does."""
+    A rollout may have `metrics`, a mapping of names to floats about its latest
+    call (rewards, lag, truncation); each logging interval sends them to the
+    tracker and the display as `rollout/<name>`. It may declare how the display
+    shows them in `shown`, as an objective does.
+    """
 
     def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> Batch: ...
 
 
 @dataclasses.dataclass(frozen=True)
 class ProfileWindow:
-    """Asks for one profiler window per fit: `steps` steps traced into
-    `directory` after `warmup` steps have run, so the trace holds the loop
-    and not the compile.
+    """A request for one profiler window per fit.
 
-    `dew.Profiler` is the other way to capture one, a context manager around
-    any code at all; a fit refuses to schedule a window inside one. The
-    window the loop wrote is reported as the `ProfileWindow` record of
-    `dew.telemetry.records`."""
+    It traces `steps` steps into `directory` after `warmup` steps have run, so the
+    trace shows the loop and not the compile.
+
+    `dew.Profiler` is the other way to capture a trace, as a context manager
+    around any code; a fit refuses to schedule a window inside one. The loop
+    reports the window it wrote as the `ProfileWindow` record of
+    `dew.telemetry.records`.
+    """
     directory: str
     steps: int
     warmup: int = 2
@@ -173,9 +176,11 @@ streak of non-finite losses, and the longest streak since the last check."""
 
 
 def fresh_book(loss: jax.Array) -> Book:
-    """Return the counters a fresh logging interval starts from, placed where
-    the step returns `loss`. Counters on any other device would move to the
-    step's devices at every count, and `bookkeep` would compile once more."""
+    """Return the counters a fresh logging interval starts from, on the device the step returns `loss` on.
+
+    Counters on any other device would move to the step's devices at every count,
+    and `bookkeep` would compile again.
+    """
     dtype = jnp.promote_types(loss.dtype, jnp.float32)
     zeros = (np.zeros((), dtype), np.zeros((), np.int32), np.zeros((), np.int32))
     return jax.device_put(zeros, loss.sharding)
@@ -183,8 +188,10 @@ def fresh_book(loss: jax.Array) -> Book:
 
 @jax.jit
 def bookkeep(book: Book, loss: jax.Array, finite: jax.Array) -> Book:
-    """Advance the loop's counters for one step, in one dispatch instead of
-    five eager ops' (176 against 37 us a step on a CPU)."""
+    """Advance the loop's counters for one step in a single dispatch.
+
+    Five eager ops would cost more: 176 against 37 us a step on a CPU.
+    """
     interval_loss, bad_run, worst_bad_run = book
     bad_run = jnp.where(finite, 0, bad_run + 1)
     dtype = jnp.promote_types(loss.dtype, jnp.float32)
@@ -192,10 +199,13 @@ def bookkeep(book: Book, loss: jax.Array, finite: jax.Array) -> Book:
 
 
 def learning_rate(opt_state: optax.OptState) -> jax.typing.ArrayLike | None:
-    """The learning rate in `opt_state`, where the optimizer carries one:
-    under `optax.inject_hyperparams`, the way optax exposes a schedule's
-    value, as the state holds it, a scalar the caller reads. None for a rate
-    the optimizer closes over, or for parameter groups that carry several."""
+    """Return the learning rate stored in `opt_state`, if the optimizer stores one.
+
+    Optax exposes a schedule's value through `optax.inject_hyperparams`, which
+    keeps it in the state as a scalar the caller can read. The result is None when
+    the optimizer closes over the rate, or when parameter groups hold several
+    rates.
+    """
     injected = (optax.InjectHyperparamsState, optax.InjectStatefulHyperparamsState)
     rates = [node.hyperparams["learning_rate"]
              for node in jax.tree.leaves(opt_state, is_leaf=lambda node: isinstance(node, injected))
@@ -215,17 +225,15 @@ TRAINER_SHOWN = {"loss": Shown(better="lower"),
 
 
 def goodput(wall: float, first_step: float | None, other: float) -> dict[str, float]:
-    """Compute the two goodput numbers from MaxText's report that need no
-    cluster telemetry.
+    """Compute the two goodput numbers from MaxText's report that need no cluster telemetry.
 
-    `first_step` is the time from the start of `fit` to the first step's
-    result: the placement or restore, the first batch, the compile and the
-    step itself. It is None when no step ran. `other` is the time spent
-    outside steps after that: evaluations, checkpoint writes and the wait for
-    them at the end.
+    `first_step` is the time from the start of `fit` to the first step's result:
+    the placement or restore, the first batch, the compile and the step itself.
+    It is None when no step ran. `other` is the time spent outside steps after
+    that: evaluations, checkpoint writes and the wait for them at the end.
 
-    The step fraction is what is left of `wall`. That counts a step's own
-    data stall as step time, as MaxText's start-to-start step time does.
+    The step fraction is what is left of `wall`. A step's own data stall therefore
+    counts as step time, as it does in MaxText's start-to-start step time.
     """
     numbers = {}
     if first_step is not None:
@@ -236,18 +244,18 @@ def goodput(wall: float, first_step: float | None, other: float) -> dict[str, fl
 
 
 def step_compiler_options(objective, tokens: float, frozen: bool) -> jax.stages.CompilerOptions | None:
-    """XLA options for this objective's training step on this device, each
-    unless the run set its flag itself. `tokens` is what one device steps
-    (`_device_tokens`), and `frozen` says whether the step trains beside
-    frozen weights.
+    """Return the XLA options for this objective's training step on this device.
 
-    On a GPU, dots that share an input (q, k and v; gate and up) run apart:
-    XLA's dot merger would run them as one GEMM over their weights
-    concatenated afresh every step, 4.0 ms of Qwen3-0.6B's step at 1 x 1024.
-    A step beside frozen weights (a LoRA adapter's) on 128 tokens or fewer a
-    device keeps the merger, as decoding does, whose 32-token GEMMs ran 5-15%
-    faster merged. On an RTX 4080, bf16, ms a step (docs/performance.md has
-    every row):
+    Each option applies unless the run set that flag itself. `tokens` is the
+    number of tokens one device steps (`_device_tokens`), and `frozen` says
+    whether the step trains next to frozen weights.
+
+    On a GPU, dots that share an input (q, k and v; gate and up) run separately.
+    XLA's dot merger would run them as one GEMM over their weights, concatenated
+    again every step, which costs 4.0 ms of Qwen3-0.6B's step at 1 x 1024. A step
+    next to frozen weights (a LoRA adapter's) with 128 tokens or fewer per device
+    keeps the merger, as decoding does, because 32-token GEMMs ran 5-15% faster
+    merged. On an RTX 4080, bf16, ms per step (docs/performance.md has every row):
 
         step                       tokens    merged   apart
         Qwen3-0.6B, LoRA r16       1 x 32     15.92   16.48
@@ -260,14 +268,15 @@ def step_compiler_options(objective, tokens: float, frozen: bool) -> jax.stages.
         Qwen3-0.6B widths, full  1 x 1024     97.7    94.1
         3-layer decoder, full      1 x 32      5.01    4.89
 
-    At 128 tokens the shapes disagree: 1 x 128 runs faster apart, 2 x 64
-    and 4 x 32 merged. The boundary includes 128, so no step runs slower
-    than XLA's default, and 1 x 128 gives up 1.6 ms to apart.
+    At 128 tokens the shapes disagree: 1 x 128 runs faster apart, while 2 x 64
+    and 4 x 32 run faster merged. The boundary includes 128, so no step runs
+    slower than XLA's default, and 1 x 128 gives up the 1.6 ms it would gain apart.
 
-    Only an LM objective names the tokens in a row, its `seq_len`, so
-    another objective's frozen step runs apart. And Triton GEMM fusions go
-    off where `TRITON_GEMM_OFF_GENERATIONS` measured a win and no mixer of
-    the model keeps them."""
+    Only an LM objective gives the tokens per row, its `seq_len`, so any other
+    objective's frozen step runs apart. Triton GEMM fusions are turned off where
+    `TRITON_GEMM_OFF_GENERATIONS` measured a win and no mixer of the model needs
+    them.
+    """
     generation = device_generation()
     options: dict[str, bool | int] = {}
     small = tokens <= 128
@@ -283,13 +292,15 @@ def step_compiler_options(objective, tokens: float, frozen: bool) -> jax.stages.
 
 def compiled_if_it_fits(program: jax.stages.Lowered, options: jax.stages.CompilerOptions | None,
                         refusals: list[RuntimeError]) -> jax.stages.Compiled | None:
-    """`program` compiled under `options`, or None where XLA refuses it for
-    memory, the refusal appended to `refusals`. XLA:TPU checks a program's
-    temporaries against HBM as it compiles and raises RESOURCE_EXHAUSTED
-    instead of returning an executable whose memory `step_fits` could read,
-    so the refusal is the step not fitting: on a v6e Qwen3-0.6B at 16 x 1024
-    tokens asked for 38.47G of temporaries beside 31.24G of HBM. Any other
-    compile error raises."""
+    """Return `program` compiled under `options`, or None if XLA refuses it for memory.
+
+    A refusal is appended to `refusals`. XLA:TPU checks a program's temporaries
+    against HBM while it compiles and raises RESOURCE_EXHAUSTED instead of
+    returning an executable whose memory `step_fits` could read, so the refusal
+    means the step does not fit. For example, on a v6e, Qwen3-0.6B at 16 x 1024
+    tokens asked for 38.47G of temporaries next to 31.24G of HBM. Any other
+    compile error is raised.
+    """
     try:
         return program.compile(options)
     except jax.errors.JaxRuntimeError as error:
@@ -303,12 +314,13 @@ def compiled_if_it_fits(program: jax.stages.Lowered, options: jax.stages.Compile
 def fitting_default(program: jax.stages.Lowered, executable: jax.stages.Compiled | None,
                     mesh: Mesh, held: int, refusals: list[RuntimeError]
                     ) -> tuple[jax.stages.Compiled | None, bool]:
-    """Fall back to the step compiled under XLA's default options where it
-    fits and the one compiled under `step_compiler_options` does not.
-    Returns the step to run and whether it fits; `held` is `step_fits`'s and
-    `refusals` `compiled_if_it_fits`'s. The Triton GEMM fusions can hold
-    fewer temporaries, so XLA's defaults come back before the ladder's first
-    rung."""
+    """Fall back to the step compiled under XLA's default options if only that one fits.
+
+    It returns the step to run and whether it fits; `held` is as in `step_fits`
+    and `refusals` as in `compiled_if_it_fits`. Turning the Triton GEMM fusions
+    back on can need fewer temporaries, so XLA's defaults are tried before the
+    ladder's first rung.
+    """
     default = compiled_if_it_fits(program, None, refusals)
     if not step_fits(default, mesh, held):
         return executable, False
@@ -380,9 +392,11 @@ def _keeps_triton_gemm(model: nn.Module) -> bool:
 
 
 def climb_to(objective, rung: Mapping[str, object]) -> None:
-    """Move `objective` up to the head tile and remat a checkpoint's
-    `rung` records (`Trainer._rung`), each where it stands below them: the
-    ladder `recompute_more` climbs, taken in one move."""
+    """Move `objective` up to the head tile and remat recorded in a checkpoint's `rung` (`Trainer._rung`).
+
+    Each setting is raised only where it is below the recorded one. This takes the
+    ladder `recompute_more` climbs in one move.
+    """
     tile = rung.get('head_tile')
     if tile is not None and _head_tile_of(objective) is None:
         rows, columns = integers(tile, 'rung head_tile')
@@ -428,16 +442,18 @@ DIFFUSION_REMAT = (False, 'dots', 'full')
 
 
 def step_headroom(executable: jax.stages.Compiled, devices: Sequence, held: int = 0) -> int | None:
-    """The bytes the tightest of `devices` has to spare once the compiled
-    step's temporaries and new outputs are placed beside `held` more bytes
-    the loop keeps outside the step, None where the executable or a device
-    reports no memory. The arguments, the state and the batch, are already
-    resident and counted in use; the donated state's buffers are reused for
-    the outputs that alias them.
+    """Return the bytes the tightest of `devices` has to spare once the step's memory is placed.
 
-    XLA's GPU step takes all its temporaries in one allocation, so it needs
-    one free block that large, not that many free bytes (`placeable`). Where
-    the allocator `strands_temporaries`, they need room twice."""
+    The step's temporaries and new outputs are placed next to `held` more bytes
+    that the loop keeps outside the step. The result is None if the executable or
+    a device reports no memory. The arguments (the state and the batch) are
+    already resident and counted as in use, and the donated state's buffers are
+    reused for the outputs that alias them.
+
+    XLA's GPU step takes all its temporaries in one allocation, so it needs one
+    free block that large, not that many free bytes in total (`placeable`). Where
+    the allocator `strands_temporaries`, they need room twice.
+    """
     stats = executable.memory_analysis()
     memory = [device.memory_stats() or {} for device in devices]
     if stats is None or not all('bytes_limit' in m and 'bytes_in_use' in m for m in memory):
@@ -449,23 +465,27 @@ def step_headroom(executable: jax.stages.Compiled, devices: Sequence, held: int 
 
 
 def unclaimed(device, memory: Mapping[str, int]) -> int | None:
-    """The bytes free on a GPU whose pool grows (`gpu_free_bytes`), the
-    most a new region of it can take; None for any other device."""
+    """Return the bytes free on a GPU whose pool grows (`gpu_free_bytes`), or None for any other device.
+
+    That is the most a new region of the pool can take.
+    """
     if device.platform != 'gpu' or memory.get('pool_bytes', memory['bytes_limit']) >= memory['bytes_limit']:
         return None
     return gpu_free_bytes(device.local_hardware_id)
 
 
 def placeable(memory: Mapping[str, int], unclaimed: int | None = None) -> int:
-    """The bytes one allocation can take from a device whose allocator
-    reports `memory` (`Device.memory_stats`), the most a step's temporaries
-    and every buffer beside them can need of one block.
+    """Return the largest allocation a device can satisfy, given the `memory` its allocator reports.
+
+    That is the most a step's temporaries, and every buffer next to them, can
+    take from one block (`Device.memory_stats`).
 
     XLA's GPU pool, its BFC allocator, reports its size (pool_bytes) and its
-    largest free block; a pool that grows (XLA_PYTHON_CLIENT_PREALLOCATE=false)
-    can also take a new block from the part of its limit it has not taken,
-    as far as the GPU has `unclaimed` bytes free. cuda_async and a TPU's
-    allocator report no pool, and their free bytes are all there is to read."""
+    largest free block. A pool that grows (XLA_PYTHON_CLIENT_PREALLOCATE=false) can
+    also take a new block from the part of its limit it has not taken yet, up to
+    the GPU's `unclaimed` free bytes. cuda_async and a TPU's allocator report no
+    pool, so their free bytes are all there is to read.
+    """
     free = memory['bytes_limit'] - memory['bytes_in_use']
     if 'pool_bytes' not in memory:
         return free
@@ -476,17 +496,18 @@ def placeable(memory: Mapping[str, int], unclaimed: int | None = None) -> int:
 
 
 def strands_temporaries(platform: str, memory: Mapping[str, int]) -> bool:
-    """Whether the allocator of a device of `platform`, which reports
-    `memory`, can leave a step's temporaries no block to return to, so that
-    the next step needs a second block as large.
+    """Whether a device's allocator can leave a step's temporaries no block to return to.
+
+    If so, the next step needs a second block as large. `platform` and `memory`
+    describe the device and what its allocator reports.
 
     XLA's spatially partitioned BFC pool can (a preallocated pool with
-    --xla_gpu_enable_allocator_spatial_partitioning left on, its default):
-    a free block below a buffer serves every small allocation before the
-    open space past it, so a batch prefetched past the temporaries lets the
-    next step's outputs take a few bytes of their block. `prepare_process`
-    turns the partitioning off. cuda_async can too, inside a pool it does not
-    report."""
+    --xla_gpu_enable_allocator_spatial_partitioning left on, its default): a free
+    block below a buffer serves every small allocation before the open space past
+    it, so a batch prefetched past the temporaries lets the next step's outputs
+    take a few bytes of their block. `prepare_process` turns the partitioning off.
+    cuda_async can do the same inside a pool it does not report.
+    """
     if 'pool_bytes' not in memory:
         return platform == 'gpu'
     partitioning = xla_flag('xla_gpu_enable_allocator_spatial_partitioning') or 'true'
@@ -494,9 +515,11 @@ def strands_temporaries(platform: str, memory: Mapping[str, int]) -> bool:
 
 
 def fits_everywhere(headroom: int | None) -> bool:
-    """Whether every process's headroom is non-negative, the same answer on
-    every process. A process reads only its own devices' memory, so the pool
-    takes the minimum; one that reports none decides nothing."""
+    """Whether every process's headroom is non-negative, with the same answer on every process.
+
+    A process reads only its own devices' memory, so the pool takes the minimum;
+    a process that reports none does not affect the result.
+    """
     if jax.process_count() == 1:
         return headroom is None or headroom >= 0
     # float32 because a pool without x64 gathers no wider type; its sign is
@@ -507,26 +530,34 @@ def fits_everywhere(headroom: int | None) -> bool:
 
 
 def step_fits(executable: jax.stages.Compiled | None, mesh: Mesh, held: int = 0) -> bool:
-    """Whether the compiled step fits the free memory of every device of
-    `mesh` beside `held` bytes more on each, agreed across the processes that
-    hold them. A step XLA refused for memory (`compiled_if_it_fits`) does
-    not, and its process still takes part in the agreement."""
+    """Whether the compiled step fits in the free memory of every device of `mesh`.
+
+    Each device must also hold `held` more bytes, and the processes that hold
+    them agree on the answer. A step that XLA refused for memory
+    (`compiled_if_it_fits`) does not fit, and its process still takes part in the
+    agreement.
+    """
     local = [device for device in mesh.devices.flat if device.process_index == jax.process_index()]
     return fits_everywhere(-1 if executable is None else step_headroom(executable, local, held=held))
 
 
 def prefetched_bytes(batch: Batch, shardings: Placement[Batch]) -> int:
-    """The bytes a device holds of the batches `fit` places while a step
-    runs, beside the one the step reads: the `PREFETCH_DEPTH` it queues and
-    the one it is placing, each laid out as `shardings` places `batch`."""
+    """Return the bytes a device holds of the batches `fit` places while a step runs.
+
+    These are the batches next to the one the step reads: the `PREFETCH_DEPTH` it
+    queues and the one it is placing, each laid out as `shardings` places `batch`.
+    """
     shares = jax.tree.map(lambda leaf, sharding: math.prod(sharding.shard_shape(np.shape(leaf)))
                           * np.dtype(leaf.dtype).itemsize, batch, shardings)
     return (PREFETCH_DEPTH + 1) * sum(jax.tree.leaves(shares))
 
 
 def remat_record(remat: RematPolicy | bool | str | None) -> JSON:
-    """A model's remat as a record reads it: a policy by its name in
-    `REMAT_POLICIES` where it has one, else its two lists."""
+    """Return a model's remat as a record stores it.
+
+    That is a policy's name in `REMAT_POLICIES` if it has one, and its two lists
+    otherwise.
+    """
     if isinstance(remat, RematPolicy):
         names = [name for name, policy in REMAT_POLICIES.items() if policy == remat]
         return names[0] if names else {'save': list(remat.save), 'offload': list(remat.offload)}
@@ -557,10 +588,12 @@ def refuse_wide_floats(state: TrainState, mesh: Mesh) -> None:
 
 
 def recompute_more(objective) -> bool:
-    """Move the objective one rung up its ladder, and say whether there was a
-    rung to move to. A head that keeps its whole logits for the backward
-    moves to the generation's tile first (`LMObjective.head_tile`); then the
-    model's remat climbs."""
+    """Move the objective one rung up its ladder, and return whether there was a rung to move to.
+
+    A head that keeps its whole logits for the backward pass moves to the
+    generation's tile first (`LMObjective.head_tile`); after that, the model's
+    remat goes up.
+    """
     moved = objective.tile_head()
     if moved is not None:
         _log.warning(
@@ -588,7 +621,7 @@ def recompute_more(objective) -> bool:
 
 @dataclasses.dataclass(frozen=True)
 class Plateau:
-    """Stop after `evals` eligible evaluations without an improvement larger than min_delta."""
+    """Stops training after `evals` eligible evaluations without an improvement larger than `min_delta`."""
     metric: Metric | TrainingScalar | types.MethodType
     evals: int = 5
     min_delta: float = 0.0
@@ -765,7 +798,7 @@ _DEFAULT_LAYOUT = Layout()
 
 
 class Trainer(Generic[Loss, Effects]):
-    """Runs an `Objective`: gradients, sharding, EMA, checkpoints, logging."""
+    """Runs an `Objective`: gradients, sharding, EMA, checkpoints and logging."""
 
     def __init__(
         self,
@@ -849,16 +882,15 @@ class Trainer(Generic[Loss, Effects]):
                       key: int | jax.Array | None = None) -> TrainState:
         """Build the state a fresh run starts from.
 
-        It is pure, so `fit` traces it once for its shapes and once, sharded,
-        for its values.
+        It is pure, so `fit` traces it once for its shapes and once, sharded, for its
+        values.
 
-        Both inputs are the run's own by default, and `place` passes them
-        explicitly so that what it compiles takes them as arguments. A held
-        checkpoint then reaches the device as an argument instead of as a
-        constant embedded in the executable. Passing None means resolve the
-        configured input, which is what a no-argument call does. This is the
-        one state implementation, so a subclass overrides it here and every
-        path sees the override.
+        Both inputs default to the run's own, and `place` passes them explicitly so
+        that what it compiles takes them as arguments. A held checkpoint then reaches
+        the device as an argument instead of a constant embedded in the executable.
+        Passing None means "use the configured input", which is what a call without
+        arguments does. This is the only implementation of the state, so a subclass
+        overrides it here and every path sees the override.
         """
         initializer = self.objective.initializer if initializer is None else initializer
         from dew.nn.inputs import request_key
@@ -888,8 +920,7 @@ class Trainer(Generic[Loss, Effects]):
 
     @functools.cached_property
     def device_mesh(self) -> Mesh:
-        """Build the mesh `MeshSpec` describes over this process pool's devices,
-        on first use."""
+        """Build the mesh `MeshSpec` describes over this process pool's devices, on first use."""
         return self.mesh.build()
 
     @property
@@ -904,13 +935,13 @@ class Trainer(Generic[Loss, Effects]):
         return companion_mesh(self.device_mesh)
 
     def shardings(self, state: TrainState) -> Placement[TrainState]:
-        """Place every field of `state`, each on the axes its own kind takes.
+        """Return where each field of `state` is placed, on the axes that suit its kind.
 
-        Parameter gradients follow parameters, replay records follow batches,
-        and the layout's host-resident fields sit in pinned host memory.
-        Under a CPU-owned state the frozen collection is the exception: it
-        sits where the realization reads it (`execution.resident`) for the
-        whole run."""
+        Parameter gradients follow parameters, replay records follow batches, and the
+        layout's host-resident fields go in pinned host memory. Under a CPU-owned
+        state, the frozen collection is the exception: it stays where the realization
+        reads it (`execution.resident`) for the whole run.
+        """
         mesh = self.state_mesh
         params = dict(state.variables)
         frozen = params.pop(FROZEN, None) if self.host_master else None
@@ -952,8 +983,9 @@ class Trainer(Generic[Loss, Effects]):
     def place(self) -> tuple[TrainState, Placement[TrainState], bytes | None]:
         """Put the state on the mesh, fresh or restored.
 
-        Returns it with its shardings and the data position a resume
-        continues from."""
+        It returns the state with its shardings and the data position a resume
+        continues from.
+        """
         # Resolved once, so that the shapes and the values are the same
         # inputs through the same overridable method, and the objective is
         # asked for what it holds exactly once.
@@ -1266,18 +1298,17 @@ class Trainer(Generic[Loss, Effects]):
             yield schedule
 
     def compile(self, state: TrainState, batch: Batch) -> CompiledStep:
-        """Compile a transaction over state and one already-produced global batch.
+        """Compile a transaction over the state and one already-produced global batch.
 
-        The step consumes the state it is given. The returned state takes
-        over its buffers, so the update runs in place and peak memory holds
-        one copy of the parameters and optimizer state, not two. Keep no
-        reference to a state after stepping it; `new = step(old, batch)` is
-        the whole contract.
+        The step consumes the state it is given. The returned state takes over its
+        buffers, so the update runs in place and peak memory holds one copy of the
+        parameters and optimizer state, not two. Keep no reference to a state after
+        stepping it; `new = step(old, batch)` is the whole contract.
 
-        A checkpoint saved before the step is safe. Orbax copies every array
-        to the host before `save` returns, as long as `Checkpoints` names no
-        prioritized keys and no concurrent transfer limit. The batch is not
-        donated; the loader owns it.
+        A checkpoint saved before the step is safe: Orbax copies every array to the
+        host before `save` returns, as long as `Checkpoints` names no prioritized keys
+        and no concurrent transfer limit. The batch is not donated, because the loader
+        owns it.
         """
         if int(state.window_size) != self.accumulation:
             raise ValueError("checkpoint accumulation window_size differs from this trainer")
@@ -1434,30 +1465,31 @@ class Trainer(Generic[Loss, Effects]):
         restore_best: bool = False,
         state: TrainState | None = None,
     ) -> TrainState:
-        """Train to `steps` total steps, resuming from the checkpoints' latest
-        step when the directory holds one. An explicit `state` takes precedence
-        over initialization and checkpoint restoration; its input reader starts
-        at the position supplied by `dataset`, not a checkpoint's data position.
+        """Train to `steps` total steps, resuming from the latest checkpoint if the directory has one.
 
-        Every `log_every` steps the tracker receives the loss, the objective's
+        An explicit `state` takes precedence over initialization and checkpoint
+        restoration; its input reader starts at the position `dataset` supplies, not
+        at a checkpoint's data position.
+
+        Every `log_every` steps, the tracker receives the loss, the objective's
         metrics and the throughput.
 
-        Every `eval_every` steps, and at the end, the validation split is
-        scored. The objective's artifacts go to the tracker and to `metrics`,
-        whose reductions are logged as `val/<name>`.
+        Every `eval_every` steps, and at the end, the validation split is scored. The
+        objective's artifacts go to the tracker and to `metrics`, whose reductions are
+        logged as `val/<name>`.
 
-        Every `checkpoint_every` steps, and at the end, the state and the
-        data position are written. Every `checkpoints.local_every` steps they
-        are written to the local directory as well.
+        Every `checkpoint_every` steps, and at the end, the state and the data
+        position are written. Every `checkpoints.local_every` steps they are also
+        written to the local directory.
 
-        A preemption notice (a scheduler's SIGTERM; `PreemptionNotice`) stops
-        the run at the next step every process agrees on: that step's state
-        and data position are written, the final validation is skipped, and
-        fit raises `Preempted`, which ends the program with 143 unless caught.
-        Run again, fit resumes there.
+        A preemption notice (a scheduler's SIGTERM; `PreemptionNotice`) stops the run
+        at the next step every process agrees on. That step's state and data position
+        are written, the final validation is skipped, and fit raises `Preempted`,
+        which ends the program with status 143 unless caught. Run it again and fit
+        resumes from there.
 
-        Previews are generated only when `preview=True` and a tracker
-        receives them; scalar reporting never triggers preview work.
+        Previews are generated only when `preview=True` and a tracker receives them;
+        scalar reporting never triggers preview work.
         """
         selection, stop = self._fit_policies(best, stop, metrics, validation, checkpoint_every, restore_best)
         self._preflight(dataset, stop, eval_every, metrics, preview=preview)
