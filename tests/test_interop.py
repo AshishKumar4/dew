@@ -617,7 +617,7 @@ print(json.dumps({"tables": sum(1 for attribute in dir(registry)
 
 def test_the_index_of_registrations_is_every_registration_dew_makes():
     """The lookup's index reads the decorators off Dew's sources. Importing
-    every module it names fills each of the 11 registries with exactly the
+    every module it names fills each of the 12 registries with exactly the
     names it attributes to them, so a registration it cannot see (a decorator
     over several lines, an aliased registry) or a line it mistakes for one
     fails here."""
@@ -629,7 +629,7 @@ def test_the_index_of_registrations_is_every_registration_dew_makes():
     done = subprocess.run([sys.executable, "-c", REGISTRATIONS], capture_output=True, text=True, env=env,
                           timeout=600)
     assert done.returncode == 0, done.stderr[-2000:]
-    assert json.loads(done.stdout.splitlines()[-1]) == {"tables": 11, "drift": {}}
+    assert json.loads(done.stdout.splitlines()[-1]) == {"tables": 12, "drift": {}}
 
 
 def test_the_cli_exports_a_run_and_refuses_a_directory_that_is_not_one(tmp_path, capsys):

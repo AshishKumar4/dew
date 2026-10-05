@@ -1,6 +1,4 @@
 {
-  "adversarial": null,
-  "alignment": null,
   "audio": null,
   "autoencoder": {
     "dtype": "bfloat16",
@@ -36,7 +34,6 @@
     },
     "name": "array_record_images"
   },
-  "distill": null,
   "ema_decay": null,
   "guidance": {
     "interval": [
@@ -46,9 +43,14 @@
     "rescale": 0.0,
     "scale": 5.0
   },
-  "guidance_distill": null,
   "lora": null,
-  "mean_flow": null,
+  "mode": {
+    "fields": {
+      "alignment": null,
+      "uncertainty": null
+    },
+    "name": "diffusion"
+  },
   "model": {
     "adapter": null,
     "architecture": "hybrid_dit",
@@ -99,9 +101,7 @@
     "name": "edm"
   },
   "pretrained": null,
-  "rl": null,
   "sampling_steps": 20,
-  "shortcut": null,
   "solver": {
     "fields": {
       "algorithm": "dpmsolver++",
@@ -300,7 +300,6 @@
     "wandb": null,
     "xla_flags": null
   },
-  "uncertainty": null,
   "unconditional_prob": 0.12,
   "val_metrics": []
 }

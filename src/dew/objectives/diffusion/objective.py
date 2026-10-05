@@ -16,8 +16,10 @@ uses; the preview hook limits itself to the display count.
 
 from __future__ import annotations
 
+import dataclasses
+from abc import ABC, abstractmethod
 from functools import cached_property
-from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -38,15 +40,17 @@ from dew.nn.autoencoders.api import ModuleAutoEncoder
 from dew.nn.autoencoders.kl import AutoencoderKL, posterior_latent
 from dew.nn.mp import Uncertainty
 from dew.objectives.base import OMITTED, Aux, EMASpec, Objective, Omitted, Ratio, Step, Variables, thaw, under
-from dew.objectives.diffusion.alignment import ALIGNMENT, REPRESENTATION, Alignment
+from dew.objectives.diffusion.alignment import ALIGNMENT, REPRESENTATION, Alignment, RepresentationAlignment
 from dew.objectives.diffusion.end_to_end import AUTOENCODER, LATENT_STATS, EndToEnd
-from dew.registry import objectives
+from dew.registry import objectives, trainings
 from dew.sampling.guidance import CFG, Guidance
 from dew.sampling.pipelines import TextToImage
 from dew.sampling.sample import sample
 from dew.sampling.solvers import DDIM, Solver
 
 if TYPE_CHECKING:
+    from dew.objectives.diffusion.config import DiffusionRunConfig
+    from dew.objectives.rl.flow import FlowRollout
     from dew.training.state import TrainState
 
 # Samples a validation batch draws, conditioned or not.
@@ -690,3 +694,93 @@ class DiffusionObjective(Objective[Ratio]):
                 break
         assert self.artifact is not None
         return self.artifact(samples, captions)
+
+
+class Training(ABC):
+    """How a diffusion run trains: the denoising loss, or a loss of its own in its place.
+
+    A run holds one (`DiffusionRunConfig.mode`), registered in
+    `dew.registry.trainings` under the name of the objective it builds, which is
+    the name the run's record gives that objective. `preset_class` is the preset
+    the objective's loss trains under, None for any, and `guided` is whether
+    validation samples with the run's guidance, which a few-step student or a
+    model with its guidance trained in does not.
+    """
+
+    preset_class: ClassVar[type[Preset] | None] = None
+    guided: ClassVar[bool] = True
+
+    @abstractmethod
+    def objective(self, run: DiffusionRunConfig, model: nn.Module, process: Process, inputs: InputSpec, *,
+                  autoencoder: AutoEncoder | None, variables: Variables | None) -> DiffusionObjective:
+        """Return this mode's objective over the run's model, process, inputs, autoencoder and variables.
+
+        It samples as the run says.
+        """
+
+    def check(self, run: DiffusionRunConfig) -> None:
+        """Refuse a run this mode cannot train.
+
+        That is a run under another preset than `preset_class`, or a guided one when
+        this mode samples unguided.
+        """
+        name = trainings.name_of(type(self))
+        if self.preset_class is not None and not isinstance(run.preset, self.preset_class):
+            raise ValueError(f"{name} trains on its own loss under the {self.preset_class.__name__} preset; "
+                             f"the run names {type(run.preset).__name__ if run.preset else None}")
+        if not self.guided and run.guidance is not None:
+            raise ValueError(f"{name} samples unguided; set guidance None")
+
+    def rollout(self, objective: DiffusionObjective) -> FlowRollout | None:
+        """Return the trainer's rollout over `objective`.
+
+        Without one, as here, the trainer trains on each batch as it comes.
+        """
+        return
+
+
+@trainings("diffusion")
+@dataclasses.dataclass(frozen=True)
+class Denoising(Training):
+    """The denoising loss, `DiffusionObjective`'s.
+
+    `uncertainty` is the number of Fourier channels of a head that learns EDM2's
+    loss weighting; EDM2 uses 128, and None keeps the preset's fixed weighting.
+    `alignment` aligns the model's hidden tokens with a frozen DINOv2's (REPA or
+    iREPA), and with its `end_to_end` also tunes the autoencoder through the
+    alignment (REPA-E).
+    """
+
+    uncertainty: int | None = None
+    alignment: RepresentationAlignment | None = None
+
+    def objective(self, run: DiffusionRunConfig, model: nn.Module, process: Process, inputs: InputSpec, *,
+                  autoencoder: AutoEncoder | None, variables: Variables | None) -> DiffusionObjective:
+        return DiffusionObjective(
+            model, process, inputs, autoencoder=autoencoder, variables=variables,
+            unconditional_prob=run.unconditional_prob, ema_decay=run.ema_decay, solver=run.solver,
+            guidance=run.guidance, steps=run.sampling_steps, uncertainty=self.uncertainty,
+            alignment=None if self.alignment is None else self.alignment.build(variables),
+            end_to_end=None if self.alignment is None else self.alignment.end_to_end)
+
+    def check(self, run: DiffusionRunConfig) -> None:
+        super().check(run)
+        if self.alignment is not None and run.pretrained is not None:
+            raise ValueError("representation alignment trains a scratch model on the denoising loss; "
+                             "it takes no `pretrained`")
+        if self.alignment is not None and self.alignment.end_to_end is not None and run.autoencoder is None:
+            raise ValueError("end-to-end tuning trains the run's autoencoder; set `autoencoder`")
+
+
+def teacher_variables(directory: str, variables: Variables | None) -> Variables:
+    """Return a distilled run's teacher model variables.
+
+    They are a saved distilled tree's own copy, else the teacher run's published ones.
+    """
+    from dew.checkpoints import Checkpoints
+
+    if variables is not None:
+        return variables[TEACHER]
+    restored = Checkpoints(directory).variables(ema=None, step=None, mesh=None, layout=None, param_dtype=None)
+    return _without_loss_heads({name: tree for name, tree in restored.items()
+                                if name not in ("encoders", "autoencoder")})
