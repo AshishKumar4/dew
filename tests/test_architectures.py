@@ -190,9 +190,9 @@ CASES = [
     # the group limit and a shared expert.
     Case("causal_transformer", {
         **LM, "head_dim": 16,
-        "mixer": {"kind": "mla", "q_lora_rank": 8, "kv_lora_rank": 8,
+        "mixer": {"name": "mla", "fields": {"q_lora_rank": 8, "kv_lora_rank": 8,
                   "qk_nope_head_dim": 8, "qk_rope_head_dim": 8, "v_head_dim": 8,
-                  "index_topk": 4, "index_n_heads": 2, "index_head_dim": 16},
+                  "index_topk": 4, "index_n_heads": 2, "index_head_dim": 16}},
         "mixture": {"experts": 8, "top_k": 2, "layers": (1,), "score_function": "sigmoid",
                     "groups": 4, "groups_per_token": 2, "bias": True,
                     "expert_features": 16, "shared_features": 16},
@@ -202,8 +202,8 @@ CASES = [
     # the best expert, unnormalised, with a shared expert and no bias.
     Case("causal_transformer", {
         **LM, "head_dim": 16,
-        "mixer": {"kind": "mla", "kv_lora_rank": 8, "qk_nope_head_dim": 8,
-                  "qk_rope_head_dim": 8, "v_head_dim": 8},
+        "mixer": {"name": "mla", "fields": {"kv_lora_rank": 8, "qk_nope_head_dim": 8,
+                  "qk_rope_head_dim": 8, "v_head_dim": 8}},
         "mixture": {"experts": 8, "top_k": 4, "layers": (1,), "score_function": "softmax",
                     "norm_topk_prob": False, "groups": 4, "groups_per_token": 2,
                     "group_score": "max", "expert_features": 16, "shared_features": 32},
@@ -224,9 +224,9 @@ CASES = [
         **LM, "head_dim": 8, "qk_norm": False,
         "layer_types": ("chunked_attention", "full_attention"),
         "kinds": {"chunked_attention": {"chunk": 4, "mixer": {
-                      "kind": "llama4", "use_rope": True, "floor_scale": 4.0}},
-                  "full_attention": {"mixer": {"kind": "llama4", "use_rope": False,
-                                               "floor_scale": 4.0}}},
+                      "name": "llama4", "fields": {"use_rope": True, "floor_scale": 4.0}}},
+                  "full_attention": {"mixer": {"name": "llama4", "fields": {"use_rope": False,
+                                               "floor_scale": 4.0}}}},
         "mixture": {"experts": 8, "top_k": 1, "layers": (1,), "score_function": "sigmoid",
                     "norm_topk_prob": False, "scale_inputs": True, "expert_features": 16,
                     "shared_features": 16},
@@ -268,9 +268,9 @@ CASES = [
         "partial_rotary_factor": 0.5, "partial_rotary_type": "default",
         "layer_types": ("linear_attention",) * 3 + ("full_attention",),
         "kinds": {"linear_attention": {"mixer": {
-            "kind": "gated_delta_net", "linear_num_key_heads": 2,
+            "name": "gated_delta_net", "fields": {"linear_num_key_heads": 2,
             "linear_num_value_heads": 4, "linear_key_head_dim": 8,
-            "linear_value_head_dim": 8, "linear_conv_kernel_dim": 4}}}},
+            "linear_value_head_dim": 8, "linear_conv_kernel_dim": 4}}}}},
         seq_len=SEQ_LEN, label="qwen35"),
 ]
 

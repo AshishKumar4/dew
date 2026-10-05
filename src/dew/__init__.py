@@ -6,11 +6,13 @@ training layer, with no modality, encoder or tracker backend. Importing
 `dew` opens no JAX backend and loads no optional dependency; encoders,
 decoders and datasets load what they need when they are built.
 
-`import dew` does set one XLA flag before the backend opens,
-`--xla_allow_excess_precision=false`, so that values declared in a narrow
-dtype such as bf16 are rounded where the program rounds them. If you set
-that flag yourself in XLA_FLAGS, your value is kept. If the JAX backend has
-already opened, the flag cannot take effect, and Dew logs a warning.
+`import dew` does set two XLA flags before the backend opens.
+`--xla_allow_excess_precision=false` rounds values declared in a narrow
+dtype such as bf16 where the program rounds them. Where JAX's CUDA plugin
+is installed, `--xla_gpu_enable_allocator_spatial_partitioning=false` keeps
+a preallocated GPU pool in one piece for a step's temporaries. If you set
+either flag yourself in XLA_FLAGS, your value is kept. If the JAX backend has
+already opened, the flags cannot take effect, and Dew logs a warning.
 """
 
 from collections.abc import Callable
@@ -18,10 +20,14 @@ from importlib import import_module
 from typing import TYPE_CHECKING
 
 from dew.logging import configure as _configure_logging
-from dew.telemetry.devices import keep_roundings as _keep_roundings
+from dew.telemetry.devices import (
+    keep_roundings as _keep_roundings,
+    unpartition_gpu_pool as _unpartition_gpu_pool,
+)
 
 _configure_logging()
 _keep_roundings()
+_unpartition_gpu_pool()
 
 if TYPE_CHECKING:  # the surface above, with its types, for checkers and editors
     from dew.artifacts import ImageGrid, Representations, TextSamples, TokenScores, VideoGrid

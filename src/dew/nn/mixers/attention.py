@@ -836,7 +836,7 @@ class AttentionMixer(MixerBase):
     Geometry, norms and kernel policy come from the decoder context. Image
     bidirectionality, spatial rotary sections, NoPE and exclusive self attention
     are this mixer's own fields, which a hybrid names on its attention kind
-    (`{"kind": "attention", "nope": true}`).
+    (`{"name": "attention", "fields": {"nope": true}}`).
     """
 
     bidirectional_images: bool = False

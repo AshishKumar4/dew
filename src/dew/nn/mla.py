@@ -694,7 +694,7 @@ class MultiHeadLatentAttention(nn.Module):
 class MLAMixer(MixerBase):
     """The `mla` kind: DeepSeek's latent attention under the reference's names.
 
-    `mixer={"kind": "mla", ...}` takes a DeepSeek config.json's fields, so
+    `mixer={"name": "mla", "fields": {...}}` takes a DeepSeek config.json's fields, so
     translation renames nothing; `yarn` is the rope-scaling record. The rope base
     is the model's `rope_theta`, transformed by the ramp. The context's GQA
     geometry and `qk_norm` are not read (the latent norms are always present).

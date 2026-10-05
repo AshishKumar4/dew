@@ -16,11 +16,11 @@ import optax
 import pytest
 from reference_error import assert_fp32_reduction_bound
 
-from dew.config import OptimConfig, _rebuild
+from dew.config import OptimConfig
 from dew.nn.sharding import pipeline_microbatches
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
-from dew.registry import models
+from dew.registry import from_record, models
 from dew.training.distributed import Layout, MeshSpec, shard_batch
 from dew.training.quantization import Quantization, quantize_for_serving
 
@@ -65,7 +65,7 @@ def test_the_value_round_trips_through_json():
                         calibration="absmax,0.8", tile_size=32,
                         bwd_qtype="int8", bwd_stochastic_rounding="uniform")
     record = json.loads(json.dumps(dataclasses.asdict(spec)))
-    assert _rebuild(Quantization, record) == spec
+    assert from_record(Quantization, record, dtypes=False) == spec
 
 
 def test_without_qwix_quantization_names_the_extra_that_installs_it(monkeypatch):

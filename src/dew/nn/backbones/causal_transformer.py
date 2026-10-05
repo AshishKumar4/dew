@@ -781,10 +781,10 @@ class CausalTransformer(nn.Module):
             object.__setattr__(self, "kinds", flax.core.freeze({
                 name: kind if isinstance(kind, LayerKind) else LayerKind(**kind)
                 for name, kind in self.kinds.items()}))
-        # A mixer arrives as a kind value from code and as a {"kind": ...}
-        # record from a config; the record dispatches on its kind through the
-        # same `mixers.build` a value is constructed with, so an unknown kind
-        # or field raises either way. Anything else is neither.
+        # A mixer arrives as a kind value from code and as a {"name": ...,
+        # "fields": ...} record from a config; the record dispatches on its
+        # name through the same `mixers.build` a value is constructed with,
+        # so an unknown kind or field raises either way. Anything else is neither.
         if isinstance(self.mixer, Mapping):
             object.__setattr__(self, "mixer", mixers.from_record(self.mixer))
         elif self.mixer is not None and not isinstance(self.mixer, MixerBase):
