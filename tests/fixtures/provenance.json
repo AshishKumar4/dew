@@ -2924,6 +2924,17 @@
    ],
    "note": "Executes SFTTrainer.compute_loss's token-accuracy statements (with utils.py's entropy_from_logits) fetched at v1.12.0, on a fixed tiny Dew decoder's logits with assistant-only labels over two uneven batches, and on logits with planted exact ties; records counts and SFTTrainer.log's mean of batch accuracies."
   },
+  "tokenizers/reference.json": {
+   "tool": "tools/tokenizer_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.16.1",
+     "runs": "transformers"
+    }
+   ],
+   "note": "AutoTokenizer's encode (with and without special tokens), decode, length and eos/bos ids on GPT-2's and T5-small's published tokenizers and the committed qwen38-dense-tiny and llama_cpp tokenizers."
+  },
   "tread": {
    "tool": "tools/tread_reference.py",
    "sources": [
@@ -3386,6 +3397,24 @@
     "hf/dream-tiny/model.safetensors",
     "hf/llada-tiny/input_ids.npy",
     "hf/llada-tiny/model.safetensors"
+   ]
+  },
+  {
+   "from": "openai-community/gpt2@607a30d783dfa663caf39e06633721c8d4cfcd7e",
+   "what": "GPT-2's published tokenizer files, as the Hub serves them",
+   "files": [
+    "tokenizers/gpt2/config.json",
+    "tokenizers/gpt2/tokenizer.json",
+    "tokenizers/gpt2/tokenizer_config.json"
+   ]
+  },
+  {
+   "from": "google-t5/t5-small@df1b051c49625cf57a3d0d8d3863ed4d13564fe4",
+   "what": "T5-small's published tokenizer files, as the Hub serves them",
+   "files": [
+    "tokenizers/t5-small/config.json",
+    "tokenizers/t5-small/tokenizer.json",
+    "tokenizers/t5-small/tokenizer_config.json"
    ]
   }
  ]
