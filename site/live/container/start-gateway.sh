@@ -28,14 +28,14 @@ import urllib.request
 from pathlib import Path
 
 token = Path('/run/dew/gateway-token').read_text()
-request = urllib.request.Request('http://127.0.0.1:8890/api/kernels',
+request = urllib.request.Request('http://127.0.0.1:8890/api/swagger.json',
                                  headers={'Authorization': 'token ' + token})
 deadline = time.monotonic() + 30
 while True:
     try:
         with urllib.request.urlopen(request, timeout=1) as response:
             if response.status != 200:
-                raise RuntimeError('Kernel Gateway did not accept the administrative token')
+                raise RuntimeError('Kernel Gateway did not serve its API specification')
         break
     except urllib.error.HTTPError as error:
         detail = error.read().decode(errors='replace')[:1000]
