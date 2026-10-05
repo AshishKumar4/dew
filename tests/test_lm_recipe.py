@@ -347,7 +347,7 @@ def test_a_pretrained_run_refuses_overrides_and_a_foreign_tokenizer(tmp_path):
     # the tokenizer it names rather than only recording the name.
     foreign = export_tiny_decoder(tmp_path / "foreign", tokenizer=str(TOKENIZER),
                                   vocab_size=384)
-    with pytest.raises(ValueError, match=r"expects .*tiny-tools"):
+    with pytest.raises(ValueError, match=r"written with byte, and .*foreign expects its own tokenizer"):
         recipe.main(pretrained_config(recipe, tokens, foreign, "--trainer.steps", "1"))
 
 
