@@ -382,6 +382,22 @@
    ],
    "note": "flaxdiff/models (hilbert, s5, common, attention, vit_common, dit_common, simple_unet, simple_vit, simple_dit, simple_mmdit, video_dit, unet_3d) fetched at the commit, SHA-256 checked; reference attention without forced-fp32 softmax; float32 and float64 (every jnp.float32 read as jnp.float64, x64) forward and gradients, on one CPU thread without XNNPACK. JAX 0.11.2.post3."
   },
+  "flaxdiff_pipeline": {
+   "tool": "tools/flaxdiff_pipeline_reference.py",
+   "sources": [
+    {
+     "repo": "AshishKumar4/FlaxDiff",
+     "version": "3e3497e924fe58ade3fbb4e3e67c5a33d5f6623a",
+     "runs": "fetched"
+    },
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.16.1",
+     "runs": "transformers"
+    }
+   ],
+   "note": "FlaxDiff's own preview sampling (EulerAncestralSampler, KarrasVENoiseScheduler, KarrasPredictionTransform, guidance 3, generate_samples over 200 steps, StableDiffusionVAE decode through Diffusers 0.34.0's FlaxAutoencoderKL, and clip), its archive SHA-256 pinned and imported as written, of a tiny SimpleUDiT run (weights N(0, 0.05^2) rounded to bfloat16 values) over tiny_diffusers' sd CLIP and VAE; transformers' PyTorch CLIPTextModel stands in for the FlaxCLIPTextModel transformers 5 dropped, and an empty module for the Flax SD pipeline FlaxDiff's VAE wrapper imports unused. Dew's initial and ancestral draws, captured from TextToImage.from_flaxdiff's own call. Images as run (bfloat16 towers), with float32 towers, and in float64."
+  },
   "flaxdiff_solvers": {
    "tool": "tools/flaxdiff_solver_reference.py",
    "sources": [
