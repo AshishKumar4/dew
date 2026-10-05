@@ -176,9 +176,9 @@ class DDPM:
 @solvers("ddim")
 @dataclass(frozen=True)
 class DDIM:
-    """DDIM (Song et al. 2021), where `eta` sets the stochasticity: 0 is deterministic, 1 is DDPM-like.
+    """The DDIM update, where `eta` sets the stochasticity: 0 is deterministic, 1 is DDPM-like.
 
-    Diffusers 0.34.0's `DDIMScheduler` limits the clean prediction under
+    DDIM is from Song et al. (2021). Diffusers 0.34.0's `DDIMScheduler` limits the clean prediction under
     `clip_sample` or `thresholding` and keeps the model's own output as its
     epsilon, so the direction term uses the unlimited one. That pairing comes
     from `SourceLimitedPrediction`, in the process's conversion.
@@ -245,8 +245,9 @@ class EulerAncestral:
 @solvers("heun")
 @dataclass(frozen=True)
 class Heun:
-    """Heun's second order method (Karras et al. 2022, Algorithm 2): an Euler
-    step, the derivative re-evaluated at its end, and the average of the two.
+    """Heun's second-order method: an Euler step, the derivative re-evaluated at its end, and their average.
+
+    This is Algorithm 2 of Karras et al. (2022).
 
     `s_churn`, `s_tmin`, `s_tmax` and `s_noise` are the algorithm's
     stochasticity. At a sigma in [s_tmin, s_tmax] each step first raises the
@@ -693,9 +694,10 @@ def _dpm_terms(algorithm: str, alpha_s, sigma_s, alpha_t, sigma_t, h):
 @solvers("dpmsolver_multistep")
 @dataclass(frozen=True)
 class DPMSolverMultistep:
-    """DPM-Solver (Lu et al. 2022, arXiv 2206.00927) and DPM-Solver++
-    (arXiv 2211.01095) as multistep integrators in lambda = log(alpha) -
-    log(sigma): the four algorithms, three orders and two second-order forms
+    """DPM-Solver and DPM-Solver++ as multistep integrators in lambda = log(alpha) - log(sigma).
+
+    The papers are Lu et al. (2022, arXiv 2206.00927) and arXiv 2211.01095.
+    This covers the four algorithms, three orders and two second-order forms
     of Diffusers 0.34.0's `DPMSolverMultistepScheduler`, with its defaults.
 
     `dpmsolver++` and `sde-dpmsolver++` integrate the clean prediction, the
@@ -1163,10 +1165,11 @@ def _unipc_tables(alpha: np.ndarray, sigma: np.ndarray, solver: UniPC) -> tuple[
 @solvers("unipc")
 @dataclass(frozen=True)
 class UniPC:
-    """UniPC (Zhao et al. 2023, arXiv 2302.04867), Diffusers 0.34.0's
-    `UniPCMultistepScheduler`: a unified predictor and corrector in lambda
-    whose weights solve a small linear system over the history's positions.
-    Each step first corrects the sample the last predictor produced, with
+    """UniPC, a unified predictor and corrector in lambda, as Diffusers 0.34.0's `UniPCMultistepScheduler`.
+
+    UniPC is from Zhao et al. (2023, arXiv 2302.04867). Its weights solve a
+    small linear system over the history's positions. Each step first
+    corrects the sample the last predictor produced, with
     the model output just read there and that predictor's order, then
     predicts the next sample from the corrected one. `solver_type` picks
     B(h) as h (`bh1`) or e^h - 1 (`bh2`); `predict_x0` integrates the clean
@@ -1247,9 +1250,10 @@ def _pndm_step(x, eps, rates_t, rates_s):
 @solvers("pndm")
 @dataclass(frozen=True)
 class PNDM:
-    """PNDM (Liu et al. 2022, arXiv 2202.09778), Diffusers 0.34.0's
-    `PNDMScheduler`: Adams-Bashforth over eps with DDIM as the transfer,
-    fourth order once four outputs are in hand. The warmup is the paper's,
+    """PNDM as Diffusers 0.34.0's `PNDMScheduler`: Adams-Bashforth over eps with DDIM as the transfer.
+
+    PNDM is from Liu et al. (2022, arXiv 2202.09778). It is fourth order once
+    four outputs are available. The warmup is the paper's,
     three pseudo Runge-Kutta steps of four model evaluations each (the
     stages at the interval's midpoint and end), which seed the history with
     each step's first eps; under `skip_prk_steps`, the PLMS form Stable
@@ -1372,10 +1376,11 @@ class LMS:
 @solvers("consistency")
 @dataclass(frozen=True)
 class Consistency:
-    """Multistep consistency sampling (Song et al. 2023, Algorithm 1), the
-    update of Diffusers 0.34.0's `LCMScheduler`: the clean prediction is
-    noised again to the next level with fresh noise, x_s = alpha_s x_0 +
-    sigma_s z, and the last step keeps x_0 as it is. A latent consistency
+    """Multistep consistency sampling, the update of Diffusers 0.34.0's `LCMScheduler`.
+
+    This is Algorithm 1 of Song et al. (2023). The clean prediction is noised
+    again to the next level with fresh noise, x_s = alpha_s x_0 + sigma_s z,
+    and the last step keeps x_0 as it is. A latent consistency
     model's x_0 is the consistency function's output, which
     `ConsistencyBoundary` reads out of the model's prediction.
     """
@@ -1394,10 +1399,12 @@ class Consistency:
 @solvers("tcd")
 @dataclass(frozen=True)
 class TCD:
-    """Trajectory consistency sampling (Zheng et al. 2024, arXiv 2402.19159),
-    Diffusers 0.34.0's `TCDScheduler`: the deterministic DDIM step lands at
-    (1 - eta) t_next, and the forward process noises it up to t_next with
-    fresh noise, the paper's gamma-sampling with gamma = `eta`. At eta 0 it
+    """Trajectory consistency sampling, as Diffusers 0.34.0's `TCDScheduler`.
+
+    This is from Zheng et al. (2024, arXiv 2402.19159). The deterministic DDIM
+    step lands at (1 - eta) t_next, and the forward process noises it up to
+    t_next with fresh noise; this is the paper's gamma-sampling with
+    gamma = `eta`. At eta 0 it
     is DDIM; at eta 1 the step goes through the clean end of the schedule.
     A tabulated schedule reads the intermediate time at its truncated
     index, as the reference floors it. The last step of a walk lands on the
