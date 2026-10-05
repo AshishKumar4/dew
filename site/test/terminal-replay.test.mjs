@@ -96,7 +96,7 @@ test('prepared frames preserve the final recorded screen and cast provenance', a
 	assert.equal(replay.frames.at(-1).time, replay.seconds);
 	assert.equal(replay.columns, capture.hero.columns);
 	const expanded = [...replay.frames.at(-1).screen];
-	while (expanded.length <= replay.final_cursor_row) expanded.push([]);
+	while (expanded.length < Math.max(replay.final_cursor_row + 1, replay.source_rows)) expanded.push([]);
 	assert.deepEqual(expanded.slice(-replay.source_rows), replay.source_final_screen);
 	assert.equal(replay.source_rows, 30);
 	assert.equal(replay.viewer_rows, 200);
