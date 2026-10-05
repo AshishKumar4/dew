@@ -463,10 +463,10 @@ class DiffusionObjective(Objective[Ratio]):
             network = self.end_to_end.discriminator
             if network is not None:
                 given = state.pop(DISCRIMINATOR, None)
-                drawn_discriminator = network.init(jax.random.fold_in(key, 3),
-                                                   jnp.zeros((2, *self.inputs.sample.shape)))
-                state["params"] = {**state["params"], DISCRIMINATOR: (
-                    drawn_discriminator if given is None else given)["params"]}
+                if given is None:
+                    given = network.init(jax.random.fold_in(key, 3),
+                                         jnp.zeros((2, *self.inputs.sample.shape)))
+                state["params"] = {**state["params"], DISCRIMINATOR: given["params"]}
         if self.alignment is not None and ALIGNMENT not in state["params"]:
             state["params"] = {**state["params"], ALIGNMENT: self._projector_init(
                 jax.random.fold_in(key, 2), state)}
