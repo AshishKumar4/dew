@@ -9,6 +9,7 @@ import itertools
 import os
 import shlex
 import shutil
+import subprocess
 from pathlib import Path
 
 from kernel_gateway.services.kernels.manager import (
@@ -21,6 +22,24 @@ _uids = itertools.count(6100)
 
 
 class LimitedKernelManager(KernelGatewayIOLoopKernelManager):
+    @default("transport")
+    def _transport_default(self):
+        return "ipc"
+
+    @default("ip")
+    def _ip_default(self):
+        if not self.connection_file:
+            raise ValueError("the private connection file must be assigned before IPC startup")
+        return str(Path('/sessions/ipc') / Path(self.connection_file).stem / 'kernel')
+
+    def cleanup_ipc_files(self):
+        super().cleanup_ipc_files()
+        directory = Path(self.ip).parent
+        if directory.is_mount():
+            subprocess.run(['umount', str(directory)], check=True)
+        if directory.exists():
+            directory.rmdir()
+
     def cleanup_connection_file(self):
         super().cleanup_connection_file()
         if self.connection_file:
@@ -38,12 +57,18 @@ class LimitedKernelManager(KernelGatewayIOLoopKernelManager):
         shutil.copyfile(self.connection_file, connection)
         os.chown(connection, uid, uid)
         os.chmod(connection, 0o400)
+        directory = Path(self.ip).parent
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        subprocess.run(['mount', '-t', 'tmpfs', '-o',
+                        f'size=16m,uid={uid},gid={uid},mode=0700,nosuid,nodev',
+                        'tmpfs', str(directory)], check=True)
         arguments = ["/kernel.json" if arg == self.connection_file else arg for arg in kernel_cmd[3:]]
         command = [
-            "bwrap", "--unshare-user", "--die-with-parent", "--new-session", "--ro-bind", "/", "/",
+            "bwrap", "--unshare-user", "--unshare-net", "--die-with-parent", "--new-session", "--ro-bind", "/", "/",
             "--size", str(64 * 1024 * 1024), "--tmpfs", "/work",
             "--size", str(16 * 1024 * 1024), "--tmpfs", "/tmp",
-            "--ro-bind", str(connection), "/kernel.json", "--chdir", "/work", "--cap-drop", "ALL",
+            "--ro-bind", str(connection), "/kernel.json",
+            "--bind", str(directory), str(directory), "--chdir", "/work", "--cap-drop", "ALL",
             "/opt/venv/bin/python", "/opt/live/guest_entry.py", *arguments,
         ]
         limited = ["/usr/sbin/capsh", "--drop=all", "--no-new-privs", f"--user=ctx{uid - 6100}",
