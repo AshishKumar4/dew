@@ -1,8 +1,8 @@
-"""LoRA SFT of DiffusionGemma on chat data, with the base weights host-streamed.
+"""LoRA SFT of DiffusionGemma on chat data, with the base weights in host memory.
 
-The adapter is the only thing the optimizer moves, and `Layout(host=("variables",))`
-keeps the whole train state on the host between steps, with the scanned stack
-fetching one layer at a time. The 26B-A4B base has not been run through it:
+The optimizer updates only the adapter. `Layout(host=("variables",))` keeps
+the whole training state on the host between steps, and the scanned stack
+fetches one layer at a time. The 26B-A4B base has not been run through this workflow:
 
     python examples/sft_diffusion_gemma.py \\
         --model google/diffusiongemma-26B-A4B-it \\
@@ -52,9 +52,9 @@ PROMPTS = ["<bos> t5 t7 t9 t11", "<bos> t6 t8 t10 t12"]
 @dataclass
 class Config:
     model: str = "google/diffusiongemma-26B-A4B-it"
-    """Hub repo or local directory the base weights and tokenizer come from."""
+    """Hub repo or local directory containing the base weights and tokenizer."""
     chat: str | None = None
-    """Hub dataset id, .jsonl or parquet of conversations; --smoke writes its own."""
+    """Hub dataset ID, .jsonl or parquet of conversations; --smoke writes its own."""
     out: Path = Path("runs/diffusion-gemma-lora")
     prompt_tokens: int = 256
     """Clean prompt prefix of a training row; the canvases follow it."""
@@ -66,14 +66,14 @@ class Config:
     rank: int = 16
     alpha: float = 32.0
     modules: tuple[str, ...] = ("q_proj", "k_proj", "v_proj", "o_proj")
-    """PEFT's target_modules: which projections carry a delta."""
+    """Projections to adapt, following PEFT's target_modules."""
     response_tokens: int = 32
     smoke: bool = False
     """Fine-tune the committed tiny checkpoint on three canned turns instead."""
 
 
 def smoke_conversations(out: Path) -> Path:
-    """The canned turns as the JSONL `ChatMessages` reads line by line."""
+    """Write the canned turns as JSONL for `ChatMessages`."""
     jsonl = out / "chat.jsonl"
     jsonl.write_text("".join(json.dumps({"messages": turns}) + "\n" for turns in CONVERSATIONS))
     return jsonl
@@ -97,9 +97,8 @@ def main(config: Config) -> Path:
     adapter, variables = LoRA.fresh(source.model, source.variables, source.layouts,
                                     rank=config.rank, alpha=config.alpha,
                                     modules=list(config.modules), key=jax.random.key(0))
-    # A host layout streams the stack one layer per scan iteration, so the
-    # decoder runs as a scan; a plain loop's fetches would all be hoisted and
-    # the whole base would land on the device this is keeping it off.
+    # The host layout fetches one layer per scan iteration. A plain loop's
+    # fetches would be hoisted together, putting the whole base on the device.
     scanned = source.model.clone(text=source.model.text.clone(scan_layers=True))
     objective = BlockDiffusionObjective(
         adapter.adapt(scanned), prompt_length=config.prompt_tokens,
@@ -107,8 +106,8 @@ def main(config: Config) -> Path:
         pad_token_id=int(source.config["text_config"]["pad_token_id"]),
         trainable=adapter.trainable)
 
-    # A packed window is seq_len + 1 ids wide, and the objective reads rows of
-    # exactly prompt + canvases: the spec is asked for one less.
+    # Packed windows have seq_len + 1 IDs, while the objective needs exactly
+    # prompt + canvases. The dataset spec therefore uses one fewer token.
     data = ChatMessages(tokenizer=tokenizer, path=config.chat,
                         seq_len=sequence_length - 1, val_batches=None,
                         loading=Loading(workers=0, threads=1, read_buffer=2,
@@ -125,9 +124,8 @@ def main(config: Config) -> Path:
     adapter_dir = config.out / "adapter"
     adapter.save(thaw(state.variables), adapter_dir)
 
-    # The other half of the workflow, from the files alone: the base weights
-    # back through `dew.pipeline`, the adapter directory read onto them, and
-    # the factors folded into the kernels so the task runs the base model.
+    # Loading from files needs the base weights through `dew.pipeline` and
+    # the adapter directory. Merging folds the factors into the base kernels.
     base = dew.pipeline(config.model, dtype=jnp.float32)
     trained, weights = LoRA.load(base.model, base.variables, source.layouts, adapter_dir)
     task = base.bind(trained.merge(weights))
