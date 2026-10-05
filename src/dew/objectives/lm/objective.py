@@ -1,27 +1,27 @@
-"""The autoregressive language modelling objective.
+"""The autoregressive language-modelling objective.
 
-Next-token prediction over packed token ids. A batch row holds `seq_len + 1`
-ids, the model sees all but the last, and the targets are the same row shifted
-by one; the causal mask lives in the backbone, so nothing here has to know how
-the model keeps the future out of a prediction.
+It trains next-token prediction over packed token ids. A batch row holds
+`seq_len + 1` ids; the model sees all but the last, and the targets are the
+same row shifted by one. The causal mask is in the backbone, so this module
+does not need to know how the model hides the future from a prediction.
 
-Cross entropy is computed in float32 even when the model runs in bfloat16. A
-bf16 logsumexp over a large vocabulary loses enough precision to move the loss
-and, through it, the gradient. It is also computed one vocabulary chunk at a
-time, because the full `[tokens, vocab]` logits tensor is the largest thing in
-a step and every pass over it costs bandwidth; `chunked` holds the arithmetic
-and the reason. Padding is excluded only when the run names the pad id.
-Packed token files have no padding, and masking out a real id would drop
-those tokens from the average.
+Cross entropy is computed in float32 even when the model runs in bfloat16,
+because a bf16 logsumexp over a large vocabulary loses enough precision to
+change the loss and, through it, the gradient. It is also computed one
+vocabulary chunk at a time, because the full `[tokens, vocab]` logits tensor is
+the largest array in a step and every pass over it costs memory bandwidth;
+`chunked` holds the arithmetic and the reasoning. Padding is excluded only when
+the run names the pad id. Packed token files have no padding, and masking a
+real id would drop those tokens from the average.
 
-The auxiliary terms ride on the same batch: PaLM's z-loss on the log
-partition, DeepSeek's router balancing and balance loss, the multi-token
-prediction depths, and V3.2's lightning indexer, which the attention layers
-score and sow the KL of when the objective opens their `indexer` collection
-(`IndexerTraining` names the phase). `predict` hands the scores, the logits
-and named layers' states to a distillation. Evaluation returns
-teacher-forced per-token scores for streaming perplexity. The separate
-preview hook writes text from a fixed prompt once per event.
+The auxiliary terms use the same batch: PaLM's z-loss on the log partition,
+DeepSeek's router balancing and balance loss, the multi-token prediction
+depths, and V3.2's lightning indexer, whose KL the attention layers compute and
+record when the objective opens their `indexer` collection (`IndexerTraining`
+names the phase). `predict` returns the scores, the logits and named layers'
+states for a distillation. Evaluation returns teacher-forced per-token scores
+for streaming perplexity. The separate preview hook writes text from a fixed
+prompt once per event.
 """
 
 from __future__ import annotations
@@ -64,6 +64,7 @@ from dew.objectives.base import (
     Prediction,
     Ratio,
     Shown,
+    Source,
     Step,
     Variables,
     freeze,
@@ -85,20 +86,23 @@ TEXT_KEY = "text"
 
 @dataclass(frozen=True)
 class IndexerTraining:
-    """Train DeepSeek-V3.2's lightning indexer, one stage at a time.
+    """One stage of training DeepSeek-V3.2's lightning indexer.
 
-    The two stages of the continued pre-training (arXiv 2512.02556, section
-    2.1.1). `warmup` trains a fresh indexer alone: the model runs dense
-    attention with the indexer scoring beside it (an mla mixer with the
-    indexer's heads and no top-k), every other weight is frozen, and the
-    loss is the KL of the indexer's softmax from the dense attention
-    distribution over every allowed key. `sparse` trains everything: the
-    model selects its top-k (a mixer with `index_topk`), the cross entropy
-    trains the main weights, and the KL over the selected keys alone trains
-    the indexer, whose inputs are detached so neither reaches the other.
-    `weight` scales the KL term (MaxText's `indexer_loss_scaling_factor`);
-    the reference sets the indexer's pace by its learning rate, 1e-3 for
-    the 1000 warm-up steps and 7.3e-6 for the sparse stage.
+    These are the two stages of the continued pre-training (arXiv 2512.02556,
+    section 2.1.1):
+
+    - `warmup` trains a fresh indexer alone. The model runs dense attention with
+      the indexer scoring next to it (an mla mixer with the indexer's heads and no
+      top-k), every other weight is frozen, and the loss is the KL of the indexer's
+      softmax from the dense attention distribution over every allowed key.
+    - `sparse` trains everything. The model selects its top-k keys (a mixer with
+      `index_topk`), the cross entropy trains the main weights, and the KL over the
+      selected keys alone trains the indexer, whose inputs are detached so that
+      neither loss reaches the other's weights.
+
+    `weight` scales the KL term (MaxText's `indexer_loss_scaling_factor`). The
+    reference sets the indexer's pace with its learning rate: 1e-3 for the 1000
+    warm-up steps and 7.3e-6 for the sparse stage.
     """
 
     phase: Literal["warmup", "sparse"]
@@ -201,12 +205,11 @@ def _streamed_depths(model: nn.Module) -> bool:
 
 
 def indexed_mixers(model: nn.Module) -> list[MLAMixer]:
-    """Collect the model's mla mixers that carry the indexer, the model's
-    own and each layer kind's, in that order.
+    """Collect the model's mla mixers that have the indexer: the model's own, then each layer kind's.
 
-    A mixer is a decoder's own field: the multimodal wrapper forwards the
-    geometry its callers read and no mixer, so a model that is not a
-    `CausalTransformer` carries none to train.
+    A mixer is a field of a decoder. The multimodal wrapper forwards the geometry
+    its callers read but no mixer, so a model that is not a `CausalTransformer`
+    has no indexer to train.
     """
     if not isinstance(model, CausalTransformer):
         return []
@@ -296,12 +299,12 @@ def prompt_batch(prompt) -> jax.Array:
 
 @dataclass(frozen=True)
 class Samples:
-    """Configure the text preview drawn once per event.
+    """Settings for the text preview drawn once per event.
 
-    Prompts contain token IDs, with equal lengths for multiple prompts.
-    This display count does not limit the teacher-forced scoring population.
-    A budget of 0 draws no preview and keeps `sampling` as the policy the
-    run records and publishes.
+    Prompts hold token IDs; several prompts must have equal lengths. This display
+    count does not limit the teacher-forced scoring population. A budget of 0
+    draws no preview but keeps `sampling` as the policy the run records and
+    publishes.
     """
     prompt: Sequence[int] | Sequence[Sequence[int]]
     max_new_tokens: int
@@ -386,14 +389,16 @@ def _updated_bias(bias: jax.Array, counts: jax.Array, rate: float) -> jax.Array:
 
 
 def router_z_terms(routing: Variables, weight: float) -> tuple[Ratio, ...]:
-    """ST-MoE's router z-loss (arXiv 2202.08906, eq. 5), one `Ratio` per router:
-    `weight` times the squared log partition of the gate logits, summed over
-    the positions the router saw and divided by their count. The count adds
-    across micro-batches, so a step's term is its routed positions' mean, and
-    the routers' terms add, as lm-engine's `(logsumexp(logits) ** 2).mean()`
-    per layer does (moe/module.py at 45b6b57b, before its 0.1 and
-    `router_aux_loss_coef`)."""
+    """Return ST-MoE's router z-loss, one `Ratio` per router.
+
+    This is eq. 5 of ST-MoE (arXiv 2202.08906): `weight` times the squared log
+    partition of the gate logits, summed over the positions the router saw and
+    divided by their count. The count adds across micro-batches, so a step's term
+    is the mean over its routed positions, and the routers' terms add up, as
+    lm-engine's per-layer `(logsumexp(logits) ** 2).mean()` does.
+    """
     terms = []
+    # lm-engine: moe/module.py at 45b6b57b, before its 0.1 and router_aux_loss_coef.
     for node in _sown_nodes(routing, "log_z"):
         (log_z,) = node["log_z"]
         work = log_z.astype(jnp.promote_types(log_z.dtype, jnp.float32))
@@ -423,17 +428,16 @@ def _global_qk_max(qk) -> jax.Array | None:
 
 
 class Scores(NamedTuple):
-    """What `LMObjective.token_scores` computes over a `[B, seq_len + 1]` batch.
+    """The per-token results `LMObjective.token_scores` computes over a `[B, seq_len + 1]` batch.
 
     `losses`, `weights` and `log_z` are `[B, seq_len]`: the next-token cross
-    entropy, 1 where the target counts, and the log partition of each
-    prediction's distribution (what PaLM's z-loss squares). `correct` is 1
-    where the argmax was the target, None unless the objective reports
-    `token_accuracy`. `hidden` is the `[B, seq_len, D]` final
-    states the head scored, `layers` the states of the layers `token_scores`
-    was asked for, in that order. `routing` is what the routers sowed,
-    `depths` the prediction depths' (losses, weights) pairs, `qk` the
-    attention layers' per-head logit maxima, `indexer` their per-query
+    entropy, 1 where the target counts, and the log partition of each prediction's
+    distribution (what PaLM's z-loss squares). `correct` is 1 where the argmax was
+    the target, and None unless the objective reports `token_accuracy`. `hidden` is
+    the `[B, seq_len, D]` final states the head scored, and `layers` the states of
+    the layers `token_scores` was asked for, in that order. `routing` is what the
+    routers recorded, `depths` the prediction depths' (losses, weights) pairs, `qk`
+    the attention layers' per-head logit maxima, and `indexer` their per-query
     indexer KL; each is None or empty unless its flag asked for it.
     """
 
@@ -451,22 +455,20 @@ class Scores(NamedTuple):
 
 @struct.dataclass
 class LMStatistics:
-    """Hold the prediction's statistics beside independently normalized router terms."""
+    """The prediction's statistics, next to the separately normalized router terms."""
     prediction: Ratio
     sequence: tuple[Ratio, ...]
     global_routers: tuple[RouterMoments, ...]
     router_z: tuple[Ratio, ...] = ()
 
 
-def _trainable_with(model: nn.Module, indexer: IndexerTraining | None, trainable: PathFilter | None,
-                    terms: Mapping[str, object]) -> PathFilter | None:
-    """The leaves the optimizer moves, once an indexer phase is checked
-    against `trainable` and the main loss's `terms`: the warm-up trains the
-    indexer alone and refuses every term."""
+def _phase_filter(model: nn.Module, indexer: IndexerTraining | None,
+                  terms: Mapping[str, object]) -> PathFilter | None:
+    """The leaves an indexer phase trains, once it is checked against the
+    main loss's `terms`: the warm-up trains the indexer alone and refuses
+    every term. None trains what the starting variables leave in `params`."""
     if indexer is None:
-        return trainable
-    if trainable is not None:
-        raise ValueError("the indexer's phase decides what trains, so trainable is not taken with it")
+        return None
     _check_indexer(model, indexer, terms)
     return _is_indexer if indexer.phase == "warmup" else None
 
@@ -476,50 +478,48 @@ _DEFAULT_SAMPLING = Sampling()
 
 @objectives("lm")
 class LMObjective(Objective[Ratio | LMStatistics, Variables]):
-    """Train a next-token model: shifted cross entropy, teacher-forced scoring, optional previews.
+    """Trains a next-token model with shifted cross entropy, teacher-forced scoring and optional previews.
 
     `LMObjective(model, seq_len, ...)` scores `seq_len`-token rows. Every
-    auxiliary term below is off until its argument is set; the rest trade
-    memory against time.
+    auxiliary term below is off until its argument is set; the other options
+    trade memory for time.
 
     `head_tile` is the head's backward tile (`chunked_cross_entropy`'s
     `tile`), or 'whole' or 'tiled'. None, the default, is 'whole' on an
     objective that keeps the whole logits (`keeps_whole_logits`) and
     the generation's tile on one that does not. Whole logits are the
-    fastest head where they fit: on one A100, a Qwen3-0.6B
-    step at 4 x 1024 tokens took 142 ms against 163 ms tiled, for 5.3 GiB
-    more peak. A trainer whose compiled step does not fit the devices
+    fastest head where they fit: on one A100, a Qwen3-0.6B step at 4 x 1024
+    tokens took 142 ms against 163 ms tiled, at the cost of 5.3 GiB more
+    peak memory. A trainer whose compiled step does not fit the devices
     moves it to the generation's tile (`chunked.chunked_tile`) before it
     recomputes any block. A pass with no backward (evaluation, scoring)
     runs the tiled forward either way, so it never holds the logits
     whole.
 
-    `head_chunks` is how many vocabulary slices a tiled head scores in:
-    four costs 2.2% of the step and saves 1.2 GiB of peak memory at
-    vocabulary 50,304 on one RTX 4080 (docs/benchmarks.md), and one is
-    the full pass. It also slices the forward that an evaluation or a
-    scoring pass runs.
+    `head_chunks` is the number of vocabulary slices a tiled head scores in.
+    Four slices cost 2.2% of the step and save 1.2 GiB of peak memory at
+    vocabulary 50,304 on one RTX 4080 (docs/benchmarks.md), and one slice is
+    the full pass. It also slices the forward pass of an evaluation or a
+    scoring pass.
 
     `ema_decay` keeps an exponential moving average of the trained leaves
     at that decay, and evaluation and previews then read the average. None,
-    the default, keeps none: no second copy of the weights, and validation
-    scores the weights that trained.
+    the default, keeps no average, so there is no second copy of the weights
+    and validation scores the weights that trained.
 
-    `pretrained` is a variables dict to start from instead of a fresh
-    init. A `dew.interop.PretrainedDecoder.load(...)` bundle's `lm_objective`
-    builds the objective with its model and variables together. The
-    trainer takes its whole initial state from `init`.
+    The trainer takes its whole initial state from `init`, which starts
+    from `variables` (described below).
 
-    `balance_rate` moves each sparse layer's routing bias against its
-    load by this much every step, which is DeepSeek's aux-loss-free
-    balancing. The model has to keep that bias, `bias=True` on the
-    CausalTransformer's mixture. Unset leaves the bias where it is.
+    `balance_rate` moves each sparse layer's routing bias against its load
+    by this much every step, which is DeepSeek's aux-loss-free balancing. The
+    model has to have that bias (`bias=True` on the CausalTransformer's
+    mixture). Unset, the bias does not change.
 
     `aux_loss_alpha` scales DeepSeek V2's expert-level balance loss
     (`dew.nn.moe.global_router_loss`), summed over every sparse
     layer, and `seq_aux` chooses its per-sequence form
-    (`dew.nn.moe.sequence_router_losses`). The released V2
-    configs carry both under these names. Unset adds nothing.
+    (`dew.nn.moe.sequence_router_losses`). The released V2 configs set both
+    under these names. Unset, it adds nothing.
 
     `loss_role` counts only the targets whose `text_roles` entry matches
     it, for SFT on the chat data path (`dew.data.chat.Role`). None
@@ -532,17 +532,17 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     model needs `num_nextn_predict_layers` above zero. Unset leaves
     the term out and the depths untrained.
 
-    `qk_stats` opens the `qk` collection the attention layers sow their
-    per-head logit maxima under, and reports them for the optimizer's
-    QK-Clip. The recipe sets it when the optimizer is `muonclip`. Unset
-    leaves the collection closed, which costs no extra matmul.
+    `qk_stats` opens the `qk` collection where the attention layers record
+    their per-head logit maxima, and reports them for the optimizer's
+    QK-Clip. The recipe sets it when the optimizer is `muonclip`. Unset, the
+    collection stays closed and costs no extra matmul.
 
     `indexer` trains DeepSeek-V3.2's lightning indexer, one
-    `IndexerTraining` phase at a time, on a model whose mla mixer
-    carries the indexer. The warm-up phase keeps only the indexer in
+    `IndexerTraining` phase at a time, on a model whose mla mixer has the
+    indexer. The warm-up phase keeps only the indexer in
     the `params` collection and the rest of the model under `frozen`,
     which is what `init` returns and a checkpoint stores. A
-    `pretrained` tree for that phase may omit the indexer's weights, as
+    starting tree for that phase may omit the indexer's weights, as
     a dense checkpoint does, and the fresh init fills them. The sparse
     phase reads a whole tree, either layout. The warm-up trains nothing
     but the indexer, so the terms of the main loss (`balance_rate`,
@@ -556,25 +556,25 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
 
     `router_z_loss` is the routers' own z-loss (ST-MoE, arXiv
     2202.08906): this coefficient times the squared log partition of
-    every router's gate logits, averaged over the positions each router
-    saw in the step and summed over the routers (`router_z_terms`). It
-    sits beside the balance loss; lm-engine's MoE adds 0.1 of it to its
-    switch loss before `router_aux_loss_coef`, which is
+    every router's gate logits, averaged over the positions each router saw
+    in the step and summed over the routers (`router_z_terms`). It is added
+    next to the balance loss. lm-engine's MoE adds 0.1 of it to its switch
+    loss before `router_aux_loss_coef`, which corresponds to
     `router_z_loss = 0.1 * aux_loss_alpha` here. Zero adds nothing.
 
-    `trainable` selects the parameter leaves the optimizer moves, by
-    their full path (`dew.objectives.base.PathFilter`). The rest of the
-    tree is kept under `frozen`, the split the warm-up uses for the
-    indexer, so `init` returns it and a checkpoint stores it. An
-    adapter's own filter (`dew.lora.LoRA.trainable`) goes here. None
-    trains every leaf.
+    `variables` is the tree training starts from, as `model.init`,
+    `Pretrained.load` or `LoRA.apply` return it; None draws a fresh one. A
+    split tree (`dew.objectives.base.freeze`, or an adapter's) is kept as
+    given: the optimizer updates what is in `params`, and the rest stays
+    under `frozen`. `model` may be a loaded source in place of the model
+    (`LMObjective(qwen, seq_len=512)`), which supplies its model, variables
+    and processor; `variables` and `processor` override them.
 
     `token_accuracy` reports the argmax accuracy; False skips the pass
     over every logit it costs (0.77 ms of the head's 8.0 on a TPU v6e).
 
-    `processor` is what `pipeline` turns text into ids with and decodes
-    through, unless it is handed another. A bundle's `lm_objective` passes
-    the source's own.
+    `processor` is what `pipeline` uses to turn text into ids and decode
+    them, unless it is given another one.
     """
 
     artifact = TokenScores
@@ -582,13 +582,15 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     shown: Mapping[str, Shown] = {"ce": Shown(better="lower"), "perplexity": Shown(better="lower"),
              "token_accuracy": Shown(better="higher", percent=True)}
 
+    # tests/test_packed_grpo.py covers the tiled default.
     keeps_whole_logits: ClassVar[bool] = True
-    """Whether the head's default (`head_tile` None) keeps the whole fp32
-    logits for the backward. A plain LM step does: the trainer's fit ladder
-    tiles it when the step does not fit (`recompute_more`). An objective
-    whose device also holds rollouts or a frozen reference, as GRPO's and
-    DPO's do, keeps the tiled head as its default, so the loss's temporaries
-    stay a tile whatever the vocabulary (tests/test_packed_grpo.py)."""
+    """Whether the head's default (`head_tile` None) keeps the whole fp32 logits for the backward pass.
+
+    A plain LM step does, and the trainer's fit ladder tiles it when the step does
+    not fit (`recompute_more`). An objective whose devices also hold rollouts or a
+    frozen reference, as GRPO's and DPO's do, keeps the tiled head as its default,
+    so the loss's temporaries stay one tile in size whatever the vocabulary.
+    """
 
     def __init__(
         self,
@@ -600,7 +602,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         head_chunks: int = 4,
         head_tile: tuple[int, int] | Literal['whole', 'tiled'] | None = None,
         samples: Samples | None = None,
-        pretrained: Variables | None = None,
+        variables: Variables | None = None,
         balance_rate: float | None = None,
         aux_loss_alpha: float | None = None,
         seq_aux: bool = True,
@@ -610,11 +612,14 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         router_z_loss: float = 0.0,
         qk_stats: bool = False,
         indexer: IndexerTraining | None = None,
-        trainable: PathFilter | None = None,
         token_accuracy: bool = True,
         processor: Processor | None = None,
     ):
         """Build the objective; the class docstring describes each argument."""
+        if isinstance(model, Source):
+            variables = model.variables if variables is None else variables
+            processor = model.text_processor if processor is None else processor
+            model = model.model
         decoder = _decoder(model)
         if decoder is not None and decoder.causal is False:
             raise ValueError("LMObjective requires a causal model for next-token likelihoods")
@@ -624,7 +629,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         self.head_chunks = head_chunks
         self.head_tile = _head_tile(head_tile, self.keeps_whole_logits)
         self.samples = samples
-        self.pretrained = pretrained
+        self.variables = variables
         self.processor = processor
         self.balance_rate = balance_rate
         _check_terms(decoder, aux_loss_alpha=aux_loss_alpha, mtp_weight=mtp_weight, z_loss=z_loss,
@@ -638,7 +643,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         self.qk_stats = qk_stats
         self.token_accuracy = token_accuracy
         self.indexer = indexer
-        self.trainable = _trainable_with(model, indexer, trainable, {
+        self.phase = _phase_filter(model, indexer, {
             "balance_rate": balance_rate, "aux_loss_alpha": aux_loss_alpha,
             "mtp_weight": mtp_weight, "loss_role": loss_role, "z_loss": z_loss or None,
             "router_z_loss": router_z_loss or None})
@@ -657,63 +662,62 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     def held_variables(self) -> Variables | None:
         """Return the checkpoint a continued-pretraining run starts from.
 
-        Bound as the initializer's argument this reaches the trainer's state
-        JIT as data; read off `self` inside a nullary trace it would be
+        Passed as the initializer's argument, the tree reaches the trainer's state JIT
+        as data; read from `self` inside a trace with no arguments, it would be
         compiled into the executable as a constant.
         """
-        return self.pretrained
+        return self.variables
 
     @property
     def bank_sites(self) -> tuple[DecoderBank, ...]:
         return self.model.bank_sites
 
     def init(self, key, variables: Variables | None = None) -> Variables:
-        pretrained = self.pretrained if variables is None else variables
-        tree = self._whole_tree(pretrained, key)
-        return tree if self.trainable is None else freeze(tree, self.trainable)
+        tree = self._starting_tree(self.variables if variables is None else variables, key)
+        return tree if self.phase is None else freeze(tree, self.phase)
 
-    def _whole_tree(self, pretrained: Variables | None, key) -> Variables:
-        """Return the model's variables in one `params` collection.
-
-        Either the pretrained tree with its frozen split undone, or a
-        fresh init.
-        """
+    def _starting_tree(self, given: Variables | None, key) -> Variables:
+        """Return the tree training starts from: the given one as it is,
+        split or whole, or a fresh init. An indexer phase decides its own
+        split, the warm-up the indexer alone and the sparse phase the whole
+        tree, so it starts from the given tree whole."""
         def fresh() -> Variables:
             return self.model.init(key, jnp.zeros((1, self.seq_len), jnp.int32))
 
-        if pretrained is None:
+        if given is None:
             return fresh()
-        if "params" not in pretrained:
+        if "params" not in given:
             raise ValueError(
-                "pretrained is the variables dict ({'params': ...}) that "
+                "variables is the variables dict ({'params': ...}) that "
                 "Pretrained.load and model.init return")
-        pretrained = thaw(pretrained)
+        if self.indexer is None:
+            return given
+        whole = thaw(given)
         if not self._warmup:
-            return pretrained
+            return whole
         # The warm-up may start from a dense checkpoint that has no indexer
         # yet; the fresh init supplies exactly those weights.
         variables = fresh()
-        given = _leaf_paths(pretrained["params"])
-        missing = _leaf_paths(variables["params"]) - given
+        missing = _leaf_paths(variables["params"]) - _leaf_paths(whole["params"])
         outside = sorted("/".join(path) for path in missing if not _is_indexer(path))
         if outside:
             raise ValueError(
                 "the warm-up initialises the indexer and nothing else, but the "
-                f"pretrained tree lacks {outside[:3]}{'...' if len(outside) > 3 else ''}")
-        return merge(variables, pretrained)
+                f"starting tree lacks {outside[:3]}{'...' if len(outside) > 3 else ''}")
+        return merge(variables, whole)
 
 
     def policy(self, params: Variables, sampling: Sampling = _DEFAULT_SAMPLING) -> TextGeneration:
-        """Expose the model over this training tree as a generation task.
+        """Return the model over this training tree as a generation task.
 
-        A rollout binds one snapshot of the policy and draws every completion
-        from it; the result records the actual and raw-policy likelihoods
-        the objective's ratio needs.
+        A rollout uses one snapshot of the policy and draws every completion from it;
+        the result records the actual and raw-policy likelihoods that the objective's
+        ratio needs.
         """
-        return TextGeneration(self.model, thaw(params), sampling=sampling)
+        return TextGeneration(self.model, params, sampling=sampling)
 
     def inference_record(self):
-        """Describe this decoder without a training RunConfig or parameter copies."""
+        """Describe this decoder for inference, without a training RunConfig or copies of the parameters."""
         from dew.config import ModelConfig, _to_json
         from dew.registry import objectives
         if not any(member is type(self) for member in objectives.values()):
@@ -731,14 +735,13 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
 
     def pipeline(self, state: TrainState, *, ema: bool | None = None,
                  processor: Processor | None = None) -> TextGeneration:
-        """Publish the decoder over the state's weights as a generation task.
+        """Return the decoder over the state's weights as a generation task.
 
-        It samples and is budgeted the way this objective's previews are,
-        and `processor`, or the objective's own when it is None, encodes and
-        decodes.
+        It samples, and uses the same token budget, as this objective's previews do.
+        `processor`, or the objective's own when it is None, encodes and decodes.
         """
         samples = self.samples
-        return TextGeneration(self.model, thaw(self._pipeline_weights(state, ema)),
+        return TextGeneration(self.model, self._pipeline_weights(state, ema),
                               self.processor if processor is None else processor,
                               sampling=Sampling() if samples is None else samples.sampling,
                               max_new_tokens=None if samples is None or samples.max_new_tokens <= 0
@@ -869,8 +872,10 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         return weights
 
     def tile_head(self, tile: tuple[int, int] | None = None) -> str | None:
-        """Move a head that keeps its whole logits to `tile`, by default the
-        generation's (`chunked.chunked_tile`), and say what it moved to."""
+        """Move a head that keeps its whole logits to `tile`, and report what it moved to.
+
+        `tile` defaults to the generation's tile (`chunked.chunked_tile`).
+        """
         if self.head_tile is not None:
             return None
         self.head_tile = chunked_tile() if tile is None else tile
@@ -914,20 +919,21 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     def sampled_log_probs(self, params: Variables, scores: Scores, tokens: jax.Array,
                           support: tuple[jax.Array, jax.Array] | None = None,
                           temperature: float = 1.0) -> jax.Array:
-        """Each next-token target's likelihood as the sampler that drew it saw it.
+        """Return each next-token target's likelihood as the sampler that drew it saw it.
 
-        `scores` is `token_scores` over `tokens`, `[B, S + 1]`; the result is
-        `[B, S]`. At unit temperature without `support` that is the raw
-        policy, `-scores.losses`. `temperature` divides the capped logits
-        (`head_logits`). `support` is the per-row ragged `(ids, columns)`
-        pair `sessions.pack` builds, `[B, C]` each, `columns` the column in
-        `tokens` of the id each kept id belongs to; a target with entries is
-        renormalized over them (`support_log_probs`).
+        `scores` is `token_scores` over `tokens`, `[B, S + 1]`, and the result is
+        `[B, S]`. At unit temperature without `support`, that is the raw policy,
+        `-scores.losses`. `temperature` divides the capped logits (`head_logits`).
+        `support` is the per-row ragged `(ids, columns)` pair that `sessions.pack`
+        builds, each `[B, C]`, where `columns` is the column in `tokens` of the id
+        each kept id belongs to; a target with entries is renormalized over them
+        (`support_log_probs`).
         """
         log_probs = -scores.losses
         if temperature == 1.0 and support is None:
             return log_probs
         softcap = self.model.final_logit_softcap
+        params = thaw(params)
         head = self.model.apply(params, params["params"], method=type(self.model).head_weight)
         targets = tokens[:, 1:]
         if temperature != 1.0:
@@ -1055,15 +1061,14 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
 
     def predict(self, params, batch, step: Step, *, train: bool,
                 layers: Sequence[int] = ()) -> tuple[Ratio, Aux[Variables], Prediction]:
-        """Score the loss with the logits, the target weights and the outputs
-        of `layers` behind it, for a teacher to compare (`Objective.predict`).
+        """Return the loss with the logits, target weights and `layers` outputs behind it.
 
-        The logits are the whole `[B, seq_len, vocab]` fp32 tensor the
-        chunked loss never holds; a distillation's KL reads every column.
-        `aux_loss_alpha`'s router terms carry their own normalisation, so
-        they cannot ride a distillation's token mass and are refused;
-        `balance_rate` balances without a loss term. The indexer warm-up
-        scores no token, so it has nothing to distil.
+        A teacher compares these (`Objective.predict`). The logits are the whole
+        `[B, seq_len, vocab]` fp32 tensor that the chunked loss never holds, because a
+        distillation's KL reads every column. `aux_loss_alpha`'s router terms have
+        their own normalization, so they cannot share a distillation's token mass and
+        are refused; `balance_rate` balances without a loss term. The indexer warm-up
+        scores no tokens, so it has nothing to distill.
         """
         if self._warmup:
             raise ValueError("the indexer warm-up scores no token, so it has no prediction")
@@ -1259,11 +1264,11 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
 
 @metrics("perplexity")
 class Perplexity:
-    """Report exp of the cross entropy per counted target over a whole pass.
+    """Reports exp of the cross entropy per counted target over a whole pass.
 
-    Every batch weighs by its own count of counted targets, so a packed or
-    padded pass whose batches differ in size is scored per token, and a batch
-    with no counted target contributes nothing.
+    Each batch is weighted by its own count of counted targets, so a packed or
+    padded pass whose batches differ in size is scored per token, and a batch with
+    no counted target contributes nothing.
     """
 
     name = "perplexity"

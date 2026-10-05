@@ -25,11 +25,11 @@ The smoke run writes synthetic captioned records, conditions on the tiny CLIP fi
 
 [`examples/sft_diffusion_gemma.py`](https://github.com/AshishKumar4/dew/blob/main/examples/sft_diffusion_gemma.py) fine-tunes a DiffusionGemma checkpoint on chat data with a low-rank adapter. The script works in these steps:
 
-1. `Pretrained.load` loads the base weights and their layouts.
-2. `LoRA.fresh` adds low-rank factors to the projections that `--modules` names.
-3. `BlockDiffusionObjective` trains the adapted module, with the adapter's own filter as `trainable`.
+1. `PretrainedBlockDecoder.load` loads the base weights and their layouts.
+2. `adapt(LoRA(...), key=0)` adds low-rank factors to the projections that `--modules` names, with every base weight frozen.
+3. `BlockDiffusionObjective` trains the adapted model from the adapted variables, so only the factors change.
 4. `Layout(host=("variables",))` keeps the train state in host memory between steps, so only the factors move to the device. For this the decoder is cloned with `scan_layers=True`: a host layout streams one layer per scan iteration, while a plain Python loop would have all its fetches hoisted onto the device together.
-5. `adapter.save` writes the PEFT adapter directory.
+5. `source.adapter.save` writes the PEFT adapter directory.
 6. The second half of the script loads the base weights again through `dew.pipeline`, reads the adapter onto them with `LoRA.load`, merges the factors into the weights and decodes a canvas.
 
 ```bash

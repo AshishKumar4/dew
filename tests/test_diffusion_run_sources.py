@@ -26,7 +26,7 @@ from dew.diffusion.presets import Flow, ResolutionShift
 from dew.diffusion.schedules import FlowMatchingScheduler
 from dew.diffusion.schedules.source import SourceSchedule
 from dew.objectives import Step
-from dew.objectives.diffusion import DiffusionRunConfig, FlowGRPO, TextCondition
+from dew.objectives.diffusion import DiffusionObjective, DiffusionRunConfig, FlowGRPO, TextCondition
 from dew.objectives.rl.flow import FlowGRPOObjective
 from dew.sampling import Euler
 from dew.training import Trainer
@@ -97,7 +97,7 @@ def test_a_run_fine_tunes_a_published_pipeline_and_rebinds_it_without_weights(
 @pytest.mark.parametrize("family", ["sd3", "flux", "qwen_image"])
 def test_a_run_config_builds_the_objective_the_python_api_builds(family, pipelines):
     """The wiring half of a configured run: `DiffusionRunConfig` over a
-    published pipeline builds what `Pretrained.load(...).diffusion_objective`
+    published pipeline builds what `DiffusionObjective(Pretrained.load(...))`
     builds with the same settings at the data's resolution
     (`load_diffusion_source(size=)`): the same model, process (its
     resolution shift too), tokenized ids and autoencoder kind over the
@@ -114,7 +114,7 @@ def test_a_run_config_builds_the_objective_the_python_api_builds(family, pipelin
                                     data=TFDSImages(image_size=size), solver=Euler(), sampling_steps=2,
                                     val_metrics=(), **settings).build()
     source = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla", size=(size, size))
-    written = source.diffusion_objective(solver=Euler(), steps=2, **settings)
+    written = DiffusionObjective(source, solver=Euler(), steps=2, **settings)
     assert configured.model == written.model
     assert configured.process.to_json() == written.process.to_json()
     assert type(configured.autoencoder) is type(written.autoencoder)

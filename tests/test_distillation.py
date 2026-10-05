@@ -56,8 +56,8 @@ def fixture_objective(arrays: dict, **overrides) -> tuple[DistillationObjective,
     """The objective over the fixture's variables, its projections included."""
     student_model, teacher_model = models()
     student = LMObjective(student_model, SEQ, pad_id=META["pad_id"], ema_decay=None,
-                          pretrained=tree(arrays, "student/"))
-    teacher = LMObjective(teacher_model, SEQ, ema_decay=None, pretrained=tree(arrays, "teacher/"))
+                          variables=tree(arrays, "student/"))
+    teacher = LMObjective(teacher_model, SEQ, ema_decay=None, variables=tree(arrays, "teacher/"))
     settings = {"alpha": META["alpha"], "temperature": META["temperature"], "beta": META["beta"],
                 "features": [tuple(pair) for pair in META["pairs"]], **overrides}
     objective = DistillationObjective(student, teacher, **settings)

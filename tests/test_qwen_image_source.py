@@ -324,7 +324,7 @@ def test_a_trained_qwen_image_step_exports_and_reloads(source, loaded, arrays, r
     height, width, channels = loaded.inputs.sample.shape
     assert channels == 4
     objective = DiffusionObjective(loaded.model, loaded.process, loaded.inputs,
-                                   autoencoder=loaded.autoencoder, pretrained=loaded.variables,
+                                   autoencoder=loaded.autoencoder, variables=loaded.variables,
                                    unconditional_prob=0.0, ema_decay=None, steps=2)
     rows = jax.device_count()
     pixels = np.tile(np.arange(height * width * channels, dtype=np.uint8).reshape(

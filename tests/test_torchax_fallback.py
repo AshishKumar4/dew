@@ -31,6 +31,7 @@ from dew.data.dataset import Dataset
 from dew.interop import Pretrained
 from dew.interop.torchax_fallback import TorchLayout
 from dew.objectives.base import Step
+from dew.objectives.lm import LMObjective
 from dew.training import MeshSpec, Trainer
 
 pytest.importorskip("torchax")
@@ -85,7 +86,7 @@ def test_the_logits_and_the_objective_loss_are_transformers(source, loaded, toke
     _, model = source
     logits = np.asarray(loaded.model.apply(loaded.variables, jnp.asarray(tokens)))
     assert np.abs(logits - torch_logits(model, tokens)).max() <= LOGITS
-    objective = loaded.lm_objective(seq_len=SEQ, ema_decay=None)
+    objective = LMObjective(loaded, seq_len=SEQ, ema_decay=None)
     ids = torch.from_numpy(tokens.astype(np.int64))
     with torch.no_grad():
         expected = float(model(ids, labels=ids).loss)
@@ -96,7 +97,7 @@ def test_the_gradients_are_transformers(source, loaded, tokens):
     """jax.grad of LMObjective's loss is torch autograd of transformers' own
     loss, leaf for leaf, so every path to the head and the embedding trains."""
     _, model = source
-    objective = loaded.lm_objective(seq_len=SEQ, ema_decay=None)
+    objective = LMObjective(loaded, seq_len=SEQ, ema_decay=None)
     ids = torch.from_numpy(tokens.astype(np.int64))
     model.zero_grad()
     model(ids, labels=ids).loss.backward()
@@ -124,7 +125,7 @@ def test_trainer_steps_move_the_params_and_place_them_by_name(loaded, tokens):
     params, buffers = loaded.variables["params"], loaded.variables["buffers"]
     assert set(buffers) == {"gpt_neox.rotary_emb.inv_freq", "gpt_neox.rotary_emb.original_inv_freq"}
     assert not set(params) & set(buffers)
-    objective = loaded.lm_objective(seq_len=SEQ, ema_decay=None)
+    objective = LMObjective(loaded, seq_len=SEQ, ema_decay=None)
     rows = math.lcm(ROWS, jax.device_count())
     batch = tokens[np.arange(rows) % ROWS]
     data = Dataset(train=lambda partition: iter([{"text": batch}] * 4), val=None, records=rows, batch=rows)
