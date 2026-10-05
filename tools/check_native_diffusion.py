@@ -20,7 +20,6 @@ from dew.diffusion.schedules.source import SourceSchedule
 from dew.inference import DenoisingInputs
 from dew.inputs import Condition, Field, unit_range
 from dew.inputs.diffusion import latent_image_conditions
-from dew.nn.inputs import RowPlan, mesh_of
 from dew.interop import Pretrained
 from dew.objectives.base import Step
 from dew.objectives.diffusion import DiffusionObjective
@@ -93,6 +92,44 @@ def trajectory(source, reference, meta, key):
     if source.finish is not None:
         images = source.finish(source.variables, images)
     return images, latents, given, null, process, times, initial
+
+
+def public_start(task, source, reference, meta, key, given, null, process, times):
+    """The trajectory's start through the public `prepare`, from what the
+    reference pipeline was handed: its pixels (uint8), mask, noise, clean
+    latents or already-noisy latents. Diffusers' own preparation
+    (prepare_latents, prepare_mask_latents, the refiner's denoising_start)
+    made the reference's start, so its images hold the image, image-latents,
+    mask and encode-key branches here. Strength and denoising_start reach
+    `prepare` as the selected `times`, which is the caller's conversion."""
+    kind = task_kind(source, meta)
+    noise = jnp.asarray(reference["noise"])
+    pixels = reference["pixels"][None] if "pixels" in reference else None
+    # The text conditions alone: `prepare` builds the spatial ones itself.
+    shared = {"conditions": {"conditioning": given["conditioning"]},
+              "unconditional": {"conditioning": null["conditioning"]},
+              "key": key, "steps": meta.get("steps", 2), "times": times}
+    if kind == "img2img":
+        return task.prepare(**shared, image=pixels, noise=noise, encode_key=key)
+    def clean():
+        pixels_in_range = unit_range(jnp.asarray(pixels))
+        return source.autoencoder.encode(source.variables["autoencoder"], pixels_in_range, None)
+
+    if kind == "xl-img2img":
+        prepared = task.prepare(**shared, image=pixels, noise=noise)
+        bypassed = task.prepare(**shared, image_latents=clean(), noise=noise)
+        np.testing.assert_allclose(bypassed.noise, prepared.noise, atol=1e-6, rtol=0)
+        return prepared
+    if kind == "refiner":
+        return task.prepare(**shared, initial=clean())
+    prior = noise * process.sampler_schedule.prior_scale()
+    if kind in ("inpaint", "xl-inpaint"):
+        # Full strength: the reference starts from noise alone, its image and
+        # mask as conditions.
+        encode_key = jax.random.split(key)[1] if kind == "inpaint" else None
+        return task.prepare(**shared, image=pixels, mask=reference["mask"][None, ..., None], initial=prior,
+                            encode_key=encode_key)
+    return task.prepare(**shared, initial=prior)
 
 
 def diffusers_reads(source, export, prediction, noise, given):
@@ -187,13 +224,19 @@ def check_pipeline(directory, streamed: bool = False):
         features = source.finish.model.apply({"params": source.variables["encoders"]["safety"]}, pixels,
                                              method=source.finish.model.features)
         compare(errors, "checker_features", features, reference["checker_embeddings"])
-    # The same prepared native trajectory also runs through the task facade.
-    # Placed as `prepare` places them: on the pipeline's mesh when it has one.
-    plan = RowPlan.over(mesh_of(source.variables), 1)
-    placed = DenoisingInputs(*plan.place(plan.pad((initial, given, null))), rows=1)
-    task = replace(source.text_to_image(), grid=lambda count: (process, times))
-    output = task(placed, steps=meta.get("steps", 2), guidance=3.0, key=key)
+    # The same trajectory through the task facade, its start prepared by the
+    # public `prepare` from the reference's own inputs.
+    task = source.text_to_image()
+    prepared = public_start(task, source, reference, meta, key, given, null, process, times)
+    # Its real rows: on a mesh the rows pad to fill the devices.
+    compare(errors, "prepared", np.asarray(prepared.noise)[:prepared.rows], initial, 1e-6)
+    for name in ("mask", "masked_image"):
+        if name in given:
+            compare(errors, f"prepared_{name}", np.asarray(prepared.conditions[name])[:prepared.rows],
+                    given[name], 1e-6)
+    output = task(prepared, steps=meta.get("steps", 2), guidance=3.0, key=key)
     compare(errors, "task", output.host().images, images, 1e-5)
+    compare(errors, "task_reference", (output.host().images + 1) / 2, reference["images"], 1e-4)
     training = train_and_reload(source, reference, key, given, jnp.asarray(reference["noise"]))
     errors["reload"] = 0.0
     print(json.dumps({"directory": str(directory), "errors": errors, "training": training}))
@@ -214,6 +257,76 @@ def check_grids(directory, grids, case=None):
         expected = jnp.clip(source.autoencoder.decode(source.variables["autoencoder"], jnp.asarray(oracle[name + ".latents"])), -1, 1)
         compare(errors, name, output.host().images, expected, 1e-4)
     print(json.dumps({"grids": errors}))
+
+
+def handoff(directory, source, task, key):
+    """SDXL's base walks the steps at or above the cutoff and stops
+    (final_denoise=False, decode=False); the refiner continues from those
+    latents (`initial=`) below it, as Diffusers' denoising_end and
+    denoising_start split them. tools/diffusers_handoff_reference.py
+    recorded Diffusers' own base and refiner pipelines doing so."""
+    from reference_error import assert_as_exact_as_the_reference
+
+    recorded = np.load(Path(__file__).resolve().parents[1] / "tests/fixtures/diffusers_handoff.npz")
+    refiner = bundle(Path(directory).parent / "refiner")
+    steps = 4
+
+    def start(task, rows):
+        encoder = task.inputs.conditions["conditioning"].encoder
+        params = task.variables["encoders"]["conditioning"]
+        given, null = ({"conditioning": encoder.encode(params, encoder.tokenize([row]))}
+                       for row in ({"text": "cat"}, {"text": "dog", "negative": True}))
+        process, times = task.prepared_process(steps)
+        # Diffusers' discrete cutoff for denoising_end = denoising_start = 0.5.
+        cutoff = round(len(source.schedule.betas) * 0.5)
+        model_times = np.asarray(process.sampler_schedule.model_time(jnp.asarray(times[:-1])))
+        split = int(np.flatnonzero(model_times < cutoff)[0])
+        return given, null, process, (times[:split + 1] if rows == "prefix" else times[split:])
+
+    # The base declares Flax classes; the reference runs their PyTorch
+    # twin, whose UNet computes the exact GELU and normalizes attention
+    # inputs at 1e-6 (tests/test_lora.py `torch_unet`).
+    twin = replace(task.model, approximate_gelu=False, attention_norm_epsilon=1e-6)
+    base_task = replace(task, model=twin, final_denoise=False)
+    given, null, process, prefix = start(base_task, "prefix")
+    initial = jnp.asarray(recorded["noise"]) * process.sampler_schedule.prior_scale()
+    prepared = base_task.prepare(conditions=given, unconditional=null, key=key, steps=steps, initial=initial,
+                                 times=prefix)
+    latents = base_task(prepared, steps=steps, guidance=3.0, key=key, decode=False).host().latents
+    refiner_task = replace(refiner.text_to_image(), final_denoise=False)
+    given, null, _, tail = start(refiner_task, "tail")
+    prepared = refiner_task.prepare(conditions=given, unconditional=null, key=key, steps=steps,
+                                    initial=latents, times=tail)
+    final = refiner_task(prepared, steps=steps, guidance=3.0, key=key, decode=False).host().latents
+    images = refiner.autoencoder.decode(refiner.variables["autoencoder"], jnp.asarray(final))
+    for name, ours in (("prefix", latents), ("final", final), ("images", images)):
+        assert_as_exact_as_the_reference(np.asarray(ours), recorded[f"fp32.{name}"], recorded[f"fp64.{name}"],
+                                         f"handoff {name}")
+
+
+def mask_levels(directory, source, task, key):
+    """Every byte level fills one latent cell's block of a mask, through the
+    public `prepare` and through the inpainting pipeline's own mask
+    processor and its nearest resize to the latent grid."""
+    import torch
+    from diffusers.image_processor import VaeImageProcessor
+    from PIL import Image
+
+    reference = np.load(Path(directory) / "reference.npz")
+    height, width = reference["mask"].shape
+    factor = source.autoencoder.downscale_factor
+    grid = (height // factor, width // factor)
+    rows = -(-256 // (grid[0] * grid[1]))
+    levels = np.resize(np.arange(256, dtype=np.uint8), (rows, *grid))
+    masks = np.repeat(np.repeat(levels, factor, axis=1), factor, axis=2)[..., None]
+    prepared = task.prepare(["cat"] * rows, key=key, steps=2, image=reference["pixels"][None], mask=masks)
+    processor = VaeImageProcessor(vae_scale_factor=factor, do_normalize=False, do_binarize=True,
+                                  do_convert_grayscale=True)
+    pictures = [Image.fromarray(mask[..., 0]) for mask in masks]
+    theirs = processor.preprocess(pictures, height=height, width=width)
+    theirs = torch.nn.functional.interpolate(theirs, size=grid)
+    np.testing.assert_array_equal(np.asarray(prepared.conditions["mask"])[..., 0], theirs[:, 0].numpy())
+    assert set(np.unique(theirs.numpy())) == {0.0, 1.0}
 
 
 def regress(directory, case):
@@ -247,6 +360,10 @@ def regress(directory, case):
             (Path(saved) / "model_index.json").write_text(json.dumps(index))
             np.testing.assert_allclose(bundle(saved).text_to_image()(["cat"], **options).host().images, expected, atol=1e-5, rtol=1e-5)
         assert not np.allclose(task(["cat"], **options).host().images, expected, atol=1e-7)
+    elif case == "handoff":
+        handoff(directory, source, task, key)
+    elif case == "mask-levels":
+        mask_levels(directory, source, task, key)
     elif case == "mask-dropout":
         reference = np.load(Path(directory) / "reference.npz")
         objective = DiffusionObjective(source.model, source.process, source.inputs, autoencoder=source.autoencoder,
