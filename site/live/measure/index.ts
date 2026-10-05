@@ -26,6 +26,12 @@ export class GatewayLab extends DurableObject<Env> {
 			container.start({ containerSnapshot: { id: this.env.SNAPSHOT_ID }, instance: 'standard-4',
 				enableInternet: false, entrypoint: ['sleep', 'infinity'] });
 			await container.setInactivityTimeout(15 * 60_000);
+			stage = 'parent tmpfs capability';
+			const capability = await container.exec(['sh', '-c',
+				'grep "^CapEff:" /proc/self/status; mkdir -p /sessions/ipc-probe; ' +
+				'if mount -t tmpfs -o size=1m,nosuid,nodev tmpfs /sessions/ipc-probe; then ' +
+				'echo parent_tmpfs_supported; umount /sessions/ipc-probe; else echo parent_tmpfs_refused; fi']);
+			const capabilities = await capability.output();
 			for (const name of ['guest_limits.py', 'guest_entry.py', 'gateway_manager.py', 'start-gateway.sh', 'benchmark_gateway.py']) {
 				stage = `copy ${name}`;
 				const source = await fetch(`https://raw.githubusercontent.com/AshishKumar4/dew/${this.env.SOURCE_COMMIT}/site/live/container/${name}`);
@@ -44,7 +50,7 @@ export class GatewayLab extends DurableObject<Env> {
 			const log = await logs.output();
 			return { stage: launched.exitCode === 0 ? 'kernel' : 'launch',
 				seconds: (Date.now() - started) / 1000, commit: this.env.SOURCE_COMMIT,
-				...this.decode(result), gatewayLog: this.decode(log).stdout };
+				...this.decode(result), parentCapability: this.decode(capabilities), gatewayLog: this.decode(log).stdout };
 		} catch (error) {
 			return { stage, error: String(error), seconds: (Date.now() - started) / 1000 };
 		} finally {
