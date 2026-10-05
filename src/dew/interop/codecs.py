@@ -213,6 +213,7 @@ class SourceQuantization:
     encode: Callable[[str, np.ndarray], dict[str, np.ndarray]]
     scale_dtype: Callable[[Mapping[str, np.ndarray]], str | None] = lambda tensors: None
     grid: Callable[[str], tuple[str, ...]] = lambda name: ()
+    input_scale_dtype: Literal['unrounded', 'float8_e4m3fn'] | None = None
 
     def tensor_names(self, tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
         """The names left once every quantized weight is decoded."""
@@ -985,13 +986,35 @@ class _WeightScheme:
     strategy: Literal['tensor', 'channel', 'group', 'block', 'tensor_group']
     group: int | None
     block: tuple[int, int] | None
+    input_scale_dtype: Literal['unrounded', 'float8_e4m3fn'] | None
+
+
+def _nvfp4_input(activations: Mapping[str, object], form: str,
+                 name: str) -> Literal['unrounded', 'float8_e4m3fn']:
+    """The local NVFP4 input scheme computed by the checkpoint Qwix provider.
+
+    CT 0.17.1 rounds local scales to E4M3 only when scale_dtype says so;
+    RedHatAI/Qwen3-32B-NVFP4 omits it and keeps those scales unrounded.
+    """
+    expected = {'num_bits': 4, 'type': 'float', 'strategy': 'tensor_group', 'group_size': 16,
+                'symmetric': True, 'dynamic': 'local', 'actorder': None, 'block_structure': None}
+    required = {'num_bits', 'type', 'strategy', 'group_size', 'dynamic'}
+    wrong = [key for key, value in expected.items()
+             if activations.get(key, None if key in required else value) != value]
+    scale = activations.get('scale_dtype')
+    if form != 'nvfp4-pack-quantized' or wrong or scale not in (None, 'torch.float8_e4m3fn'):
+        raise ValueError(
+            f"config_groups.{name}.input_activations have dynamic={activations.get('dynamic')!r}; "
+            "this loader computes local symmetric NVFP4 inputs in groups of 16, with unrounded or "
+            "E4M3 scales, and refuses other input quantizers")
+    return 'unrounded' if scale is None else 'float8_e4m3fn'
 
 
 def _weight_scheme(quantization: Mapping[str, object]) -> _WeightScheme:
     """The one weights scheme a compressed-tensors config declares, refusing
-    what this loader cannot compute. compressed-tensors keeps input QDQ in
-    its forward after decompressing weights, including dynamic quantizers
-    with no stored scale. A weight-only load cannot reproduce that forward."""
+    what this loader cannot compute. Local NVFP4 inputs run through the
+    checkpoint Qwix provider; other input quantizers remain refused since
+    compressed-tensors keeps their QDQ after decompressing weights."""
     form = quantization.get('format')
     if form not in COMPRESSED_TENSORS_FORMATS:
         raise ValueError(f"compressed-tensors format {form!r}: this loader reads "
@@ -1004,15 +1027,9 @@ def _weight_scheme(quantization: Mapping[str, object]) -> _WeightScheme:
                 f"config_groups.{name}.output_activations quantizes outputs, which this loader does not"
             )
         activations = group.get('input_activations')
-        dynamic = (
-            None if activations is None else records.record(activations, "input_activations").get("dynamic")
-        )
-        if activations is not None:
-            raise ValueError(
-                f"config_groups.{name}.input_activations have dynamic={dynamic!r}; compressed-tensors "
-                "quantizes inputs in its forward, which this weight-only loader does not compute; "
-                "load a checkpoint with input_activations=null"
-            )
+        input_dtype = (None if activations is None
+                       else _nvfp4_input(records.record(activations, "input_activations"),
+                                         str(form), str(name)))
         weights = records.record(group.get('weights'), f'config_groups.{name}.weights')
         strategy, kind = weights.get('strategy'), weights.get('type')
         if strategy not in ("tensor", "channel", "group", "block", "tensor_group") or kind not in (
@@ -1036,6 +1053,7 @@ def _weight_scheme(quantization: Mapping[str, object]) -> _WeightScheme:
                 if weights.get("group_size") is None
                 else records.integer(weights["group_size"], "group_size"),
                 _block_structure(weights),
+                input_dtype,
             )
         )
     if len(schemes) != 1:
@@ -1098,6 +1116,8 @@ def _ct_parts(scheme: _WeightScheme, name: str) -> dict[str, str]:
         parts |= {'packed': stem + '.weight_packed', 'shape': stem + '.weight_shape'}
     if scheme.format == 'nvfp4-pack-quantized':
         parts |= {'packed': stem + '.weight_packed', 'global': stem + '.weight_global_scale'}
+        if scheme.input_scale_dtype is not None:
+            parts['input_global'] = stem + '.input_global_scale'
     if not scheme.symmetric:
         parts['zero'] = stem + '.weight_zero_point'
     return parts
@@ -1193,7 +1213,8 @@ def _ct_encode(name: str, weight: np.ndarray, *, scheme: _WeightScheme,
     and the zero point taken in torch's promotion of the weight's dtype and
     the scales' (float32 when either is, or for bfloat16 with float16)."""
     parts = _ct_parts(scheme, name)
-    kept = {role: part for role, part in parts.items() if role in ('scale', 'zero', 'shape', 'global')}
+    kept = {role: part for role, part in parts.items()
+            if role in ('scale', 'zero', 'shape', 'global', 'input_global')}
     order_name = name.removesuffix('.weight') + '.weight_g_idx'
     stored = dict(zip(kept, _gridded(grid, name, tuple(kept.values())), strict=True))
     order = None if grid is None or order_name not in grid else np.asarray(grid[order_name])
@@ -1247,7 +1268,8 @@ def compressed_tensors(quantization: Mapping[str, object],
         partial(_ct_names, scheme), partial(_ct_partners, scheme),
         partial(_ct_decode, scheme=scheme), partial(_ct_encode, scheme=scheme, grid=grid),
         grid=lambda name: (*(part for role, part in _ct_parts(scheme, name).items() if role != 'packed'),
-                           name.removesuffix('.weight') + '.weight_g_idx'))
+                           name.removesuffix('.weight') + '.weight_g_idx'),
+        input_scale_dtype=scheme.input_scale_dtype)
 
 
 # --------------------------------------------------------------------------
