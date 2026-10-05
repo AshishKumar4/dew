@@ -29,7 +29,7 @@ class Config:
     batch_size: int = 64
     epochs: int = 4
     steps: int | None = None
-    """Run length in steps; unset trains for `epochs` passes over the data."""
+    """Training steps. If unset, train for `epochs` passes over the data."""
     learning_rate: float = 1e-3
     model: dict = field(default_factory=lambda: {
         "emb_features": 384, "num_layers": 6, "num_heads": 6})
@@ -64,8 +64,8 @@ def main(config: Config):
                       checkpoints=Checkpoints(str(config.out / "checkpoints")))
     state = trainer.fit(data, steps=steps, log_every=50)
 
-    # No reload is needed; the weights stay where the trainer placed them, and
-    # the tokenizer decodes the rows.
+    # The task uses the trained weights in place, without reloading them.
+    # Its tokenizer decodes the generated rows.
     task = objective.pipeline(state, processor=RunProcessor(tokenizer))
     text = config.prompt + task(config.prompt, key=1).text[0]
     config.out.mkdir(parents=True, exist_ok=True)

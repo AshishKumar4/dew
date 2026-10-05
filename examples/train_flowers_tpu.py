@@ -1,7 +1,7 @@
-"""Text-to-image DiT from scratch on Oxford Flowers, across a TPU slice.
+"""Train a text-to-image DiT from scratch on Oxford Flowers across a TPU slice.
 
-Prepare the records once, at the resolution the run trains at, so a training
-read is a memcpy rather than a JPEG decode:
+Prepare records once at the training resolution. Training then reads pixels
+with a memcpy, without decoding JPEGs:
 
     python -c "import tensorflow_datasets as tfds; tfds.builder('oxford_flowers102', \\
         data_dir='~/.cache/dew/datasets').download_and_prepare(\\
@@ -14,10 +14,9 @@ Then launch the same file on every worker of the slice:
 
     python examples/train_flowers_tpu.py --data prepared/flowers-256 --steps 200000
 
-`--data` reads whichever of the two layouts it is given: the TFDS version
-directory loads as `tfds_images`, the `prepare_images.py` output as
-`array_record_images`. The smoke run writes a handful of synthetic records in
-that second layout and trains on them on one CPU device:
+`--data` accepts a TFDS version directory as `tfds_images` or the output of
+`prepare_images.py` as `array_record_images`. The smoke run writes a few
+synthetic records in the second layout and trains on one CPU device:
 
     JAX_PLATFORMS=cpu python examples/train_flowers_tpu.py --smoke --out /tmp/flowers-smoke
 """
@@ -48,12 +47,11 @@ from dew.training.optim import Cosine
 
 PROMPTS = ("a water lily", "a sunflower", "a red rose", "a purple orchid")
 
-# The tiny CLIP text tower committed for the tests: a real checkpoint, 77
-# tokens of context and 32 features, so the smoke run exercises the same
-# conditioning path as the real one without reaching the Hub.
+# This committed CLIP checkpoint has 77 context tokens and 32 features.
+# The smoke run uses the same conditioning path as the full run without Hub access.
 SMOKE_CLIP = Path(__file__).resolve().parents[1] / "tests/fixtures/clip/tiny"
-# The FID extractor at a sixteenth of every channel width, drawn rather than
-# trained: the same pooled statistics and distance, on numbers of its own.
+# This FID extractor has one-sixteenth of each channel width and untrained
+# parameters. It computes the same pooled statistics and distance for the fixture.
 SMOKE_INCEPTION = (Path(__file__).resolve().parents[1]
                    / "tests/fixtures/inception/tiny/inception_v3_fid.safetensors")
 
@@ -70,21 +68,21 @@ class Config:
     sampling_steps: int = 40
     guidance: float = 3.0
     clip_model: str = "openai/clip-vit-large-patch14"
-    """The checkpoint CLIPScore is read from, for conditioning and for scoring."""
+    """CLIP checkpoint used for both conditioning and CLIPScore."""
     inception_weights: str | None = None
-    """The FID extractor's parameters as a file; unset downloads the published
-    checkpoint. --smoke reads the committed tiny one instead."""
+    """FID extractor weights file. If unset, download the published checkpoint.
+    --smoke uses the committed tiny checkpoint."""
     model: dict = field(default_factory=lambda: {
         "patch_size": 2, "emb_features": 1024, "num_layers": 24, "num_heads": 16})
     smoke: bool = False
-    """Train the synthetic fixture on one device for a few steps instead."""
+    """Train the synthetic fixture for a few steps on one device."""
 
 
 def synthetic_records(directory: Path, count: int, size: int) -> None:
-    """`count` captioned noise images in the layout prepare_images.py writes.
+    """Write `count` captioned noise images in prepare_images.py's layout.
 
-    The pixels are tests/test_data.py's own fixture, one image per index from
-    that index's seed, so the smoke run reads the records the data tests read.
+    Each index seeds one image, matching the pixel fixture in tests/test_data.py.
+    The smoke run therefore reads the same records as the data tests.
     """
     from array_record.python.array_record_module import ArrayRecordWriter
 
@@ -103,7 +101,7 @@ def synthetic_records(directory: Path, count: int, size: int) -> None:
 
 
 def smoke_config(config: Config, out: Path) -> DiffusionRunConfig:
-    """The same run at the size a laptop finishes: one device, tiny everything."""
+    """Configure a small version of the run for one device."""
     synthetic_records(out / "data", count=16, size=16)
     return DiffusionRunConfig(
         model=ModelConfig.from_model(SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2,
@@ -117,9 +115,8 @@ def smoke_config(config: Config, out: Path) -> DiffusionRunConfig:
         sampling_steps=2,
         ema_decay=0.9,
         text=TextCondition(encoder="clip_text", checkpoint=config.clip_model),
-        # A validation pass needs a consumer; a smoke that walks the
-        # validation path names a metric that downloads nothing (fid and
-        # clip_score pull their own weights).
+        # PSNR exercises validation without downloads. Both fid and clip_score
+        # would download metric weights.
         val_metrics=("psnr",),
         optim=OptimConfig(learning_rate=1e-3),
         trainer=TrainerConfig(checkpoint_dir=str(out / "checkpoints"), batch_size=4, steps=3,
@@ -129,7 +126,7 @@ def smoke_config(config: Config, out: Path) -> DiffusionRunConfig:
 
 
 def slice_config(config: Config) -> DiffusionRunConfig:
-    """The real run: a DiT over the whole slice, CLIP-conditioned, EMA'd."""
+    """Configure a CLIP-conditioned DiT with EMA over the whole TPU slice."""
     if config.data is None:
         raise ValueError("--data is the prepared record directory; --smoke writes its own")
     path = str(config.data.expanduser())
@@ -180,9 +177,8 @@ def main(config: Config) -> Path:
     prepare_process(run.trainer.wandb, run.trainer.multi_host, run.trainer.xla_flags,
                     run.trainer.compilation_cache_dir, layout=run.trainer.layout)
     if not config.smoke:
-        # Only now: counting devices opens the backend, which has to come
-        # after the slice's processes join, and a pool's count is every
-        # host's devices.
+        # Counting devices opens the backend, so the slice's processes must join
+        # first. In a pool, the count includes devices on every host.
         run = replace(run, trainer=replace(run.trainer, mesh=MeshSpec(fsdp=jax.device_count())))
 
     objective = run.build()

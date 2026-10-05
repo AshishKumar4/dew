@@ -1,9 +1,9 @@
 """Score a finished run four ways, then compare it against a served model.
 
-Perplexity over held-out tokens, an lm-evaluation-harness suite, greedy
-continuations, and, for a diffusion run, FID and CLIPScore of a sampled
-grid against a reference set. Everything is read through `dew.pipeline`, so
-a run directory, a published checkpoint and a Hub repository all work.
+The script measures held-out perplexity, runs an lm-evaluation-harness suite
+and generates greedy continuations. For diffusion, it computes FID and
+CLIPScore on a sampled grid, using a reference set for FID. `dew.pipeline`
+loads a run directory, published checkpoint or Hub repository.
 
     python examples/evaluate_and_serve.py --run runs/shakespeare/lm-shakespeare \\
         --tokens data/shakespeare --tasks hellaswag arc_easy --harness-limit 200
@@ -11,18 +11,18 @@ a run directory, a published checkpoint and a Hub repository all work.
         --image-run runs/flowers-tpu/checkpoints/flowers-256 \\
         --reference-images data/flowers-heldout
 
-The same suites run from the command line, which is the harness's own entry
-point with Dew's model registered:
+To run these suites from the harness's command-line entry point, use Dew's
+registered model:
 
     python -m dew.eval --model dew --model_args run=runs/shakespeare/lm-shakespeare \\
         --tasks hellaswag --limit 200
 
-`--openai-base-url` adds a served comparison: the same prompts through the
-OpenAI SDK (a vLLM endpoint speaks it too), or `--ollama-host` through
-ollama's. Both are optional extras; without them, or with the endpoint
-unreachable, the report says so and the rest of the run is unaffected. The
-OpenAI key is `OPENAI_API_KEY` when set; a vLLM server started without
-`--api-key` takes any key, so an unset one sends vLLM's placeholder.
+To compare server output for the same prompts, set `--openai-base-url` for
+the OpenAI SDK (including vLLM endpoints), or `--ollama-host` for ollama's SDK.
+Both SDKs are optional extras. Missing SDKs or unreachable endpoints are
+reported without interrupting local evaluation. The OpenAI client uses
+`OPENAI_API_KEY` when set. Otherwise it sends vLLM's placeholder key, which
+a vLLM server accepts when started without `--api-key`.
 
     JAX_PLATFORMS=cpu python examples/evaluate_and_serve.py --smoke --out /tmp/eval-smoke
 """
@@ -51,8 +51,8 @@ from dew.training import Evaluation
 
 GREEDY = Sampling(temperature=0.0)
 FIXTURES = Path(__file__).resolve().parents[1] / "tests/fixtures"
-# An InceptionV3 at a sixteenth of every channel width with drawn
-# parameters: the FID path runs offline on it, and the value is its own.
+# This InceptionV3 has one-sixteenth of each channel width and untrained
+# parameters. It exercises FID offline; its scores are specific to this fixture.
 SMOKE_INCEPTION = FIXTURES / "inception/tiny/inception_v3_fid.safetensors"
 
 
@@ -61,23 +61,23 @@ class Config:
     run: Path | None = None
     """The run directory, published checkpoint or Hub repo to score."""
     tokens: Path | None = None
-    """Token directory from `dew tokenize`; its val split is the perplexity set."""
+    """Token directory from `dew tokenize`; perplexity uses its val split."""
     out: Path = Path("reports/evaluation")
     sequence_length: int = 256
     batch_size: int = 8
     prompt: str = "ROMEO:"
     max_new_tokens: int = 64
     tasks: tuple[str, ...] = ()
-    """lm-eval-harness task names; empty runs no suite."""
+    """lm-eval-harness task names. An empty tuple skips the suite."""
     harness_limit: int = 64
-    """Documents per task, the harness's own --limit."""
+    """Documents per task, passed as the harness's --limit."""
     image_run: Path | None = None
     """A diffusion run to sample and score; unset skips the image metrics."""
     reference_images: Path | None = None
-    """Directory of PNGs FID is measured against; --smoke draws its own."""
+    """Reference PNG directory for FID. --smoke generates its own reference."""
     inception_weights: str | None = None
-    """The FID extractor's parameters as a file; unset downloads the
-    published checkpoint. --smoke reads the committed tiny one."""
+    """FID extractor weights file. If unset, download the published checkpoint.
+    --smoke uses the committed tiny checkpoint."""
     image_prompts: tuple[str, ...] = ("a water lily", "a sunflower", "a red rose", "a purple orchid")
     image_steps: int = 40
     clip_model: str = "openai/clip-vit-large-patch14"
@@ -85,19 +85,19 @@ class Config:
     """An OpenAI-compatible endpoint (vLLM included) to compare against."""
     openai_model: str = "gpt-4o-mini"
     openai_provider: Literal["openai", "vllm"] = "openai"
-    """vLLM takes top-k, min-p and stop ids that the OpenAI API has no field for."""
+    """vLLM accepts top-k, min-p and stop IDs absent from the OpenAI API."""
     ollama_host: str | None = None
     ollama_model: str = "llama3.2"
     smoke: bool = False
-    """Train a tiny byte-level run here first and score that instead."""
+    """Train and score a tiny byte-level run locally."""
 
 
 def smoke_run(out: Path) -> tuple[Path, Path]:
-    """A two-step byte-level LM run and the token files it read.
+    """Train a two-step byte-level LM and return its run and token directories.
 
-    The same shape tests/test_inference.py's `make_lm_run` builds: a tiny
-    causal decoder and its checkpoint, whose record names the model, the
-    byte tokenizer the objective decodes through and the preview budget.
+    This uses the same shape as tests/test_inference.py's `make_lm_run`.
+    The tiny causal decoder's checkpoint record includes the model, the
+    objective's byte tokenizer and the preview budget.
     """
     tokens = out / "tokens"
     tokens.mkdir(parents=True, exist_ok=True)
@@ -127,11 +127,11 @@ def smoke_run(out: Path) -> tuple[Path, Path]:
 
 
 def perplexity(task: TextGeneration, config: Config) -> dict[str, float]:
-    """The run's loss over a held-out split, through the evaluation contract.
+    """Score the run's held-out split with the trainer's evaluation API.
 
-    `Evaluation.run` is what the trainer calls at a validation step, minus the
-    optimizer and the tracker: the same objective, the same metric, one
-    finite pass, and scalars every rank agrees on.
+    `Evaluation.run` uses the same objective and metric as trainer validation.
+    It makes one finite pass and returns scalars agreed by every rank,
+    without an optimizer or tracker.
     """
     if config.tokens is None:
         return {}
@@ -148,8 +148,8 @@ def perplexity(task: TextGeneration, config: Config) -> dict[str, float]:
 def harness(task: TextGeneration, config: Config) -> dict[str, float]:
     """One lm-evaluation-harness suite over the same weights.
 
-    `DewLM` is the adapter the `dew` model name resolves to, so this is what
-    `python -m dew.eval --model dew` runs, with the suite chosen in Python.
+    The `dew` model name resolves to the `DewLM` adapter. This runs the same
+    evaluation as `python -m dew.eval --model dew`, with tasks chosen in Python.
     """
     if not config.tasks:
         return {}
@@ -165,7 +165,7 @@ def harness(task: TextGeneration, config: Config) -> dict[str, float]:
 
 
 def draw(pipe: TextToImage, config: Config, *, key: int) -> np.ndarray:
-    """The prompts sampled once, as the uint8 images both metrics read."""
+    """Sample the prompts once and return uint8 images for both metrics."""
     drawn = pipe(list(config.image_prompts), steps=config.image_steps, key=key).host().images
     return uint8_pixels(drawn)
 
@@ -185,9 +185,8 @@ def image_metrics(config: Config) -> dict[str, float]:
         reference = np.stack([np.asarray(Image.open(path).convert("RGB"))
                               for path in sorted(config.reference_images.glob("*.png"))])
     elif config.smoke:
-        # A held-out set is what FID is measured against, and a smoke has
-        # none: a second draw of the same run is a population to measure, so
-        # the metric runs end to end on a number that says nothing.
+        # With no held-out set, smoke mode uses a second draw as the FID reference.
+        # This exercises the metric end to end but cannot measure model quality.
         reference = draw(pipe, config, key=1)
     else:
         return scores
@@ -196,12 +195,11 @@ def image_metrics(config: Config) -> dict[str, float]:
 
 
 def served(config: Config) -> dict[str, str]:
-    """The same prompt through a served model, when one is configured.
+    """Generate from a configured server using the local evaluation's prompt.
 
-    Both adapters bind an SDK client the caller owns, and both SDKs are
-    optional extras; an absent one or an endpoint that does not answer is
-    reported rather than raised, because the local numbers above do not
-    depend on it.
+    Both adapters use caller-owned SDK clients from optional extras.
+    Missing SDKs and unreachable endpoints are reported without raising,
+    since local evaluation does not depend on the server.
     """
     answers: dict[str, str] = {}
     if config.openai_base_url is not None:
@@ -212,9 +210,8 @@ def served(config: Config) -> dict[str, str]:
         else:
             from dew.inference import OpenAICompletion
 
-            # The SDK refuses to build a client with no key, and a local
-            # vLLM endpoint needs none: "EMPTY" is the placeholder vLLM's
-            # own OpenAI-client examples send.
+            # The SDK requires a key even when a local vLLM endpoint does not.
+            # "EMPTY" is the placeholder used in vLLM's OpenAI-client examples.
             sdk = OpenAI(base_url=config.openai_base_url,
                          api_key=os.environ.get("OPENAI_API_KEY", "EMPTY"))
             client = OpenAICompletion(config.openai_model, sdk, provider=config.openai_provider)
