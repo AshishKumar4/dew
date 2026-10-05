@@ -35,7 +35,7 @@ const fullScript = 'https://github.com/AshishKumar4/dew/blob/main/site/snippets/
 const hero = capture.hero;
 const terminalReplay = JSON.parse(readPublic('hero', 'train.json'));
 const expanded = [...terminalReplay.frames.at(-1).screen];
-while (expanded.length <= terminalReplay.final_cursor_row) expanded.push([]);
+while (expanded.length < Math.max(terminalReplay.final_cursor_row + 1, terminalReplay.source_rows)) expanded.push([]);
 if (JSON.stringify(expanded.slice(-terminalReplay.source_rows)) !== JSON.stringify(terminalReplay.source_final_screen)) {
 	throw new Error('Training replay changes the recorded final viewport');
 }
