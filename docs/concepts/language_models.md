@@ -146,7 +146,7 @@ The binary files use the smallest unsigned dtype that holds the vocabulary. Two 
 | `head_chunks` | `4` | Vocabulary slices the tiled head scores in. `1` is the full pass. |
 | `head_tile` | `None` | Backward tile of the head, or `'whole'` / `'tiled'`. `None` keeps the whole logits where they fit. |
 | `samples` | `None` | `Samples` configuration for generated previews at evaluation. |
-| `variables` | `None` | The tree to start from instead of a fresh init, whole or split by `freeze` or an adapter; a split is kept, so its `params` train and its `frozen` stays put. |
+| `variables` | `None` | The tree to start from instead of a fresh init, whole or split by `freeze` or an adapter. A split tree stays split, so its `params` train and its `frozen` part does not change. |
 | `loss_role` | `None` | Count only targets whose `text_roles` entry equals this `Role` (SFT). |
 | `balance_rate` | `None` | Aux-loss-free routing-bias update rate for mixture layers. |
 | `aux_loss_alpha`, `seq_aux` | `None`, `True` | DeepSeek V2 expert balance loss and its per-sequence form. |
@@ -192,7 +192,7 @@ With gradient accumulation, the cross-entropy and multi-token-prediction (MTP) l
 
 ## Pretrained checkpoints
 
-`Pretrained.load(name_or_dir)` reads a local Hugging Face directory or a Hub identifier into a `Pretrained` bundle: the native Flax model, its variables, the checkpoint's processor or tokenizer, the source config and the generation defaults. The bundle is the kind of source it read, each with the methods that work for it: `PretrainedDecoder` (text generation), `PretrainedMaskedDecoder` (LLaDA, Dream), `PretrainedBlockDecoder` (DiffusionGemma), `PretrainedPipeline` (latent diffusion, `text_to_image`) and `PretrainedFallback` (`fallback="torchax"`, training only). Every kind takes an adapter (`adapt`) and stands in for the model in the objective that trains it. Calling `load` on a kind, as `PretrainedDecoder.load(...)`, refuses a source of another kind by name. `dew.pipeline(source)` wraps the same loader and returns a `TextGeneration` (a `BlockGeneration` for DiffusionGemma, a `MaskedGeneration` for LLaDA and Dream) with the weights placed on the current devices and the sampling policy and budget taken from the checkpoint.
+`Pretrained.load(name_or_dir)` reads a local Hugging Face directory or a Hub identifier into a `Pretrained` bundle that holds the native Flax model, its variables, the checkpoint's processor or tokenizer, the source config and the generation defaults. The bundle's class depends on the kind of source it read, and each class has the methods that work for that kind: `PretrainedDecoder` (text generation), `PretrainedMaskedDecoder` (LLaDA, Dream), `PretrainedBlockDecoder` (DiffusionGemma), `PretrainedPipeline` (latent diffusion, `text_to_image`) and `PretrainedFallback` (`fallback="torchax"`, training only). Every kind can take an adapter (`adapt`), and you can pass any of them in place of the model to the objective that trains it. Calling `load` on a specific kind, as in `PretrainedDecoder.load(...)`, refuses a source of another kind and names it. `dew.pipeline(source)` wraps the same loader and returns a `TextGeneration` (a `BlockGeneration` for DiffusionGemma, a `MaskedGeneration` for LLaDA and Dream) with the weights placed on the current devices and the sampling policy and budget taken from the checkpoint.
 
 `LMObjective(bundle, seq_len, **options)` trains a decoder bundle from its loaded weights. With token files prepared using the checkpoint's tokenizer (`dew tokenize --tokenizer Qwen/Qwen3-0.6B`), fine-tuning uses the same trainer as training from scratch:
 
@@ -205,9 +205,9 @@ objective = LMObjective(bundle, seq_len=512)
 state = Trainer(objective, optax.adamw(1e-5), key=jax.random.key(0)).fit(data, steps=100)
 ```
 
-This downloads the Hub weights and needs memory for the model, gradients and optimizer. The bundle supplies the model, the initial variables and its processor, so `objective.pipeline(state)` takes text prompts; `variables=` or `processor=` beside it overrides that part.
+This downloads the Hub weights and needs memory for the model, gradients and optimizer. The bundle supplies the model, the initial variables and its processor, so `objective.pipeline(state)` takes text prompts. Passing `variables=` or `processor=` as well overrides that part of the bundle.
 
-`dew.lora.LoRA` describes a low-rank adapter by PEFT's own fields (`rank`, `modules` as PEFT's `target_modules`, `alpha`, `rslora`, `dropout`), and `bundle.adapt(lora, key=)` returns the same kind of bundle with it bound: the adapted model, the variables with the factors under `params` and every base weight under `frozen`, and the bound `adapter`. Any objective over it trains the factors and leaves every other weight as loaded. `tuned.adapter.save` writes PEFT's adapter directory, and `tuned.save` writes the source's layout with the factors merged into the kernels. Both read the trainer's `state.variables` as it comes back:
+`dew.lora.LoRA` describes a low-rank adapter with PEFT's own fields (`rank`, `modules` as PEFT's `target_modules`, `alpha`, `rslora`, `dropout`). `bundle.adapt(lora, key=)` returns the same kind of bundle with the adapter attached: the adapted model, the variables with the factors under `params` and every base weight under `frozen`, and the bound `adapter`. Any objective over that bundle trains the factors and leaves every other weight as loaded. `tuned.adapter.save` writes PEFT's adapter directory, and `tuned.save` writes the source's layout with the factors merged into the kernels. Both take the trainer's `state.variables` as they come back from `fit`:
 
 ```python
 from dew.lora import LoRA
@@ -220,7 +220,9 @@ tuned.save("qwen3-merged", variables=state.variables)
 print(objective.pipeline(state)("The capital of France is", 8, key=0).text[0])
 ```
 
-`bundle` itself is unchanged; `adapt` returns a new value, and adapting an adapted bundle is refused. `LoRA(...).apply(model, variables, key=)` binds the same adapter to any model and variables, a model built from its class included, and `LoRA.load(model, variables, path, layouts=)` reads one PEFT or Diffusers wrote; both return the bound `Adapter`, whose `model` and `variables` go to an objective. A run on the command line takes the same spec as `lora:lora --lora.rank 8 --lora.modules q_proj v_proj`: beside `--pretrained` it binds to the loaded weights, and from scratch to a fresh draw of the model from the run's key. `Pretrained.from_run(run).adapter.save(...)` writes its factors under the source's names from the run alone. To train part of a model without an adapter, split its starting variables with `dew.objectives.base.freeze(variables, filter)`: the leaves the filter keeps train and the rest stay frozen.
+`adapt` leaves `bundle` itself unchanged and returns a new value; adapting an already adapted bundle is refused. `LoRA(...).apply(model, variables, key=)` attaches the same adapter to any model and variables, including a model built from its class, and `LoRA.load(model, variables, path, layouts=)` reads an adapter that PEFT or Diffusers wrote. Both return the bound `Adapter`, whose `model` and `variables` you pass to an objective.
+
+On the command line, a run takes the same spec as `lora:lora --lora.rank 8 --lora.modules q_proj v_proj`. With `--pretrained`, the adapter goes on the loaded weights; without it, on a fresh draw of the model from the run's key. `Pretrained.from_run(run).adapter.save(...)` writes the run's factors under the source's names from the run alone. To train part of a model without an adapter, split its starting variables with `dew.objectives.base.freeze(variables, filter)`. The leaves the filter keeps are trained and the rest stay frozen.
 
 `PretrainedDecoder.from_model` wraps a trained `CausalTransformer` as a source bundle so you can export it, and the bundle's `save` writes the Hugging Face layout. This exports the decoder from the example and loads it back:
 

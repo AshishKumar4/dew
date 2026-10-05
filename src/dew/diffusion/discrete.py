@@ -31,20 +31,10 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
-from dew.artifacts import agreed
 from dew.diffusion.block import CanvasGeneration
 from dew.diffusion.process import Conditioning
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.inputs import (
-    ModelInputs,
-    RowPlan,
-    agreed_validity,
-    continuation_keys,
-    generation_signature,
-    local_rows,
-    mesh_of,
-    request_key,
-)
+from dew.nn.inputs import ModelInputs, Request, continuation_keys, local_rows, mesh_of
 from dew.nn.multimodal import MultimodalTransformer
 from dew.objectives.base import Variables
 from dew.registry import presets, solvers
@@ -178,29 +168,18 @@ class DiscreteProcess:
         """
         solver = Unmask() if solver is None else solver
 
-        def resolve() -> tuple[jax.Array, ModelInputs]:
-            request = request_key(key)
-            canonical = ModelInputs.from_value(inputs)
+        def check(canonical: ModelInputs, pooled: bool) -> tuple[ModelInputs, tuple, None]:
             prepared = jax.tree.map(lambda leaf: local_rows(leaf, host=False), canonical)
             _validate_request(model, self, prepared, max_new_tokens, steps, n, eos_token_ids, pad_token_id)
-            return request, prepared
-
-        request, prepared = agreed("masked generation setup", resolve)
-        if jax.process_count() > 1:
-            from jax.experimental import multihost_utils
             controls = (max_new_tokens, steps, n, self, solver, eos_token_ids, pad_token_id, model)
-            prepared = agreed_validity(prepared, jax.process_count(), controls=controls, phase="masked input")
-            multihost_utils.assert_equal(generation_signature(prepared, controls),
-                                        "masked input schemas and generation policy must agree")
-        plan = RowPlan.over(mesh_of(variables), prepared.tokens.shape[0])
-        padded = plan.pad(prepared)
-        if plan.count != plan.rows:
-            valid = padded.token_fields.get("attention_mask", jnp.ones(padded.tokens.shape, bool))
-            padded = replace(padded, token_fields={**padded.token_fields,
-                "attention_mask": jnp.asarray(valid, bool) & ~plan.padding[:, None]})
-        generated = _compiled(plan.sharding)(model, variables, plan.place(padded), plan.keys(request),
-            self, solver, max_new_tokens, steps, n, eos_token_ids, pad_token_id)
-        return replace(generated, rows=plan.rows * n, prompt_width=prepared.tokens.shape[1])
+            return prepared, controls, None
+
+        request, _ = Request.prepare(inputs, key, mesh_of(variables), check, phase="masked generation")
+        plan = request.plan
+        generated = _compiled(plan.sharding)(model, variables, plan.place(request.padded()),
+                                             plan.keys(request.key), self, solver, max_new_tokens, steps, n,
+                                             eos_token_ids, pad_token_id)
+        return replace(generated, rows=plan.rows * n, prompt_width=request.inputs.tokens.shape[1])
 
 
 @dataclass(frozen=True)

@@ -50,11 +50,13 @@ def guided_target(conditional: jax.Array, unconditional: jax.Array, scale: jax.A
 @trainings("guidance_distillation")
 @dataclasses.dataclass(frozen=True)
 class GuidanceDistillation(Training):
-    """Distill a saved run's classifier-free guidance into this run's model,
-    which reads the scale as its conditioning's guidance input
-    (`GuidanceDistillationObjective`) and samples one branch. `teacher` is
-    the teacher run's directory and `scales` the range each row's scale is
-    drawn from."""
+    """Distillation of a saved run's classifier-free guidance into this run's model.
+
+    The student reads the guidance scale as its conditioning's guidance input
+    (`GuidanceDistillationObjective`) and samples one branch. `teacher` is the
+    teacher run's directory, and `scales` is the range each row's scale is drawn
+    from.
+    """
 
     guided = False
 
@@ -73,8 +75,11 @@ class GuidanceDistillation(Training):
     def objective(self, run: DiffusionRunConfig, model: nn.Module, process: Process, inputs: InputSpec, *,
                   autoencoder: AutoEncoder | None,
                   variables: Variables | None) -> GuidanceDistillationObjective:
-        """The student over the teacher run's objective and its weights: a
-        saved student tree's copy of them, else the run's published ones."""
+        """Return the student over the teacher run's objective and its variables.
+
+        The variables are a saved student tree's copy of them if there is one, and the
+        teacher run's published ones otherwise.
+        """
         from dew.checkpoints import Checkpoints
 
         from .config import DiffusionRunConfig

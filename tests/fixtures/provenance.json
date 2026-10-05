@@ -1497,6 +1497,22 @@
    ],
    "note": "Independent JAX float64 transcription; no Dew, remote-model or fla imports (tools/kimi_float64_reference.py:17)."
   },
+  "hf/kimi-k3-tiny/orders.npz": {
+   "tool": "tools/kimi_k3_reference.py",
+   "sources": [
+    {
+     "repo": "moonshotai/Kimi-K3",
+     "version": "f831ab66814297da540d832a5235f8e904f29d06",
+     "runs": "fetched"
+    },
+    {
+     "repo": "fla-org/flash-linear-attention",
+     "version": "0.5.2",
+     "runs": "fla"
+    }
+   ],
+   "note": "The reference's own rounding draws: reference.npz's SGD step over 52 residual orders in MXFP4's groups of 32 (tools/rounding_orders.py draws them and writes the weights in each order through Dew's export; tools/kimi_float64_reference.py orders checks they are a symmetry of the float64 truth); per order, the updated logits' RMS distance from float64. Dynamic remote import; fla kernels forced IEEE; compressed-tensors 0.17.1 supplies packed/decompressed weight inputs."
+  },
   "hf/kimi-k3-tiny/reference.npz": {
    "tool": "tools/kimi_k3_reference.py",
    "sources": [
@@ -1528,6 +1544,22 @@
     }
    ],
    "note": "Independent JAX float64 transcription; no Dew, remote-model or fla imports (tools/kimi_float64_reference.py:17)."
+  },
+  "hf/kimi-linear-tiny/orders.npz": {
+   "tool": "tools/kimi_linear_reference.py",
+   "sources": [
+    {
+     "repo": "moonshotai/Kimi-Linear-48B-A3B-Instruct",
+     "version": "e1df551a447157d4658b573f9a695d57658590e9",
+     "runs": "fetched"
+    },
+    {
+     "repo": "fla-org/flash-linear-attention",
+     "version": "0.4.0",
+     "runs": "fla"
+    }
+   ],
+   "note": "The reference's own rounding draws: reference.npz's SGD step over 52 residual orders (tools/rounding_orders.py draws them and writes the weights in each order through Dew's export; tools/kimi_float64_reference.py orders checks they are a symmetry of the float64 truth); per order, the updated logits' RMS distance from float64. Dynamic remote import; routing weights use unshifted scores (tools/kimi_linear_reference.py:33); fla kernels forced IEEE."
   },
   "hf/kimi-linear-tiny/reference.npz": {
    "tool": "tools/kimi_linear_reference.py",

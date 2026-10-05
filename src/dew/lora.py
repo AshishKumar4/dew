@@ -1,34 +1,35 @@
-"""Adapt a model with low-rank deltas (LoRA, arXiv 2106.09685).
+"""Low-rank adapters (LoRA) for Dew models.
 
-Beside a target kernel `W`, `[in..., out...]`, the tree holds `lora_A`,
-`[in..., r]`, and `lora_B`, `[r, out...]`, and the module computes
-`x W + scale * (x A) B` with `scale = alpha / r` (`alpha / sqrt(r)` for
-rsLoRA, arXiv 2312.03732). Merged, `scale * A B` is added into the kernel and
-the factors are gone. A target is its module's path in the tree,
-`("params", "layers_0", "self_attn", "q_proj")`, so one description serves
-every model.
+LoRA is from arXiv 2106.09685. Next to a target kernel `W` of shape
+`[in..., out...]`, the tree holds `lora_A` of shape `[in..., r]` and `lora_B` of
+shape `[r, out...]`, and the module computes `x W + scale * (x A) B` with
+`scale = alpha / r` (`alpha / sqrt(r)` for rsLoRA, arXiv 2312.03732). Merging
+adds `scale * A B` into the kernel and removes the factors. A target is its
+module's path in the tree, such as `("params", "layers_0", "self_attn", "q_proj")`,
+so one description works for every model.
 
-`LoRA` is the adapter a user writes and a run records, by PEFT's own fields.
-`LoRA.apply` binds it to a model and its variables and `LoRA.load` reads one
-off disk; either returns an `Adapter`: the adapted model, the variables with
-the factors under `params` and every base weight under `FROZEN`, so any
-objective trains the factors alone, and the bindings `merge` and `save` fold
-and write it through. The adapted model wraps `apply` and `init` in a Flax
-method interceptor rather than swapping modules, folds `FROZEN` back into
-`params` itself, and owns what PEFT's wrapper layers do: the factor shapes
-of a `DenseGeneral` with several contracted axes, the kernel path's compute
-dtype, dropout on the branch input, and the parameter names the merge and
-the export agree on.
+`LoRA` is the adapter spec a user writes and a run records, with PEFT's own
+fields. `LoRA.apply` attaches it to a model and its variables, and `LoRA.load`
+reads one from disk. Both return an `Adapter`, which holds the adapted model;
+the variables, with the factors under `params` and every base weight under
+`FROZEN`, so any objective trains only the factors; and the bindings that
+`merge` and `save` use. The adapted model wraps `apply` and `init` in a Flax
+method interceptor instead of swapping modules, and adds `FROZEN` back into
+`params` itself. It also handles what PEFT's wrapper layers do: the factor
+shapes of a `DenseGeneral` with several contracted axes, the kernel path's
+compute dtype, dropout on the branch input, and the parameter names that the
+merge and the export agree on.
 
-The files are the references' own: PEFT's directory (`adapter_config.json`,
-`adapter_model.safetensors`, keys `base_model.model.<module>.lora_A.weight`),
-which Transformers loads, and the Diffusers file
-(`pytorch_lora_weights.safetensors`, keys `<component>.<module>.lora_A.weight`,
-each component's PEFT config in the header's `lora_adapter_metadata`), which a
-pipeline's `load_lora_weights` reads. Kohya/sgm keys are not accepted. Names
-resolve to tree paths through a loaded source's `Pretrained.layouts`; a model
-built from the registry passes none, and `bound_layouts` reads the names and
-shapes off its own kernels.
+The file formats are the references' own. PEFT's directory
+(`adapter_config.json`, `adapter_model.safetensors`, keys
+`base_model.model.<module>.lora_A.weight`) is what Transformers loads. The
+Diffusers file (`pytorch_lora_weights.safetensors`, keys
+`<component>.<module>.lora_A.weight`, with each component's PEFT config in the
+header's `lora_adapter_metadata`) is what a pipeline's `load_lora_weights`
+reads. Kohya/sgm keys are not accepted. Module names resolve to tree paths
+through a loaded source's `Pretrained.layouts`; a model built from the registry
+passes none, and `bound_layouts` reads the names and shapes from its own
+kernels.
 """
 from __future__ import annotations
 
@@ -69,7 +70,7 @@ INIT_B = nn.initializers.zeros
 
 @dataclass(frozen=True)
 class Target:
-    """Holds one adapted kernel's rank and alpha."""
+    """One adapted kernel's rank and alpha."""
 
     rank: int
     alpha: float
@@ -77,15 +78,17 @@ class Target:
 
 @dataclass(frozen=True)
 class LoRA:
-    """A low-rank adapter, by PEFT's own fields: what a user writes and a run
-    records (`RunConfig.lora`, `lora:lora --lora.rank 16 --lora.modules q_proj v_proj`).
+    """A low-rank adapter spec with PEFT's own fields.
+
+    This is what a user writes and a run records (`RunConfig.lora`,
+    `lora:lora --lora.rank 16 --lora.modules q_proj v_proj`).
 
     `modules` are PEFT's `target_modules`: a projection matches when its name
     relative to the model (`model.layers.0.self_attn.q_proj`, or `to_q` under a
-    pipeline component) is the entry or ends in `.` and the entry. `alpha`
-    None is PEFT's own default for a rank, twice it. `rslora` scales by
-    `alpha / sqrt(rank)`; `dropout` drops the branch's input in a training
-    forward.
+    pipeline component) equals an entry or ends in `.` followed by the entry.
+    `alpha` None uses PEFT's own default, twice the rank. `rslora` scales by
+    `alpha / sqrt(rank)`, and `dropout` drops the branch's input in a training
+    forward pass.
     """
 
     rank: int
@@ -109,14 +112,13 @@ class LoRA:
 
     def apply(self, model: nn.Module, variables: Variables, *, key: int | jax.Array,
               layouts: Mapping[str, WeightLayout] | None = None) -> Adapter:
-        """Bind this adapter to `model` over `variables` and draw its factors.
+        """Attach this adapter to `model` over `variables` and draw its factors.
 
-        `layouts` are the bindings module names resolve through:
-        `Pretrained.layouts` for a loaded source, None for a model built from
-        its class, whose own module paths are its names. An entry of
-        `modules` that matches no projection is refused. A is drawn per
-        module from `key` in sorted name order, the way PEFT draws it, and B
-        is zero, so the adapted model computes what the source does.
+        `layouts` maps module names to tree paths: `Pretrained.layouts` for a loaded
+        source, or None for a model built from its class, whose own module paths are
+        its names. An entry of `modules` that matches no projection is refused. A is
+        drawn per module from `key` in sorted name order, the way PEFT draws it, and B
+        is zero, so the adapted model computes exactly what the source does.
         """
         from dew.nn.inputs import request_key
 
@@ -139,14 +141,13 @@ class LoRA:
     @staticmethod
     def load(model: nn.Module, variables: Variables, path: str | FilePath, *,
              layouts: Mapping[str, WeightLayout] | None = None) -> Adapter:
-        """The adapter a PEFT directory or a Diffusers file holds, bound to
-        `model` over `variables` with its factors in place.
+        """Return the adapter a PEFT directory or Diffusers file holds, attached to `model`.
 
-        `path` is a PEFT adapter directory or a Diffusers file (or the
-        directory holding one); `layouts` are as `apply` reads them. Targets
-        the model does not bind, tensors whose shapes do not fit the bound
-        weight, ranks that disagree with the config, and PEFT features this
-        loader does not carry are refused by name.
+        The adapter goes over `variables` with its factors in place. `path` is a PEFT
+        adapter directory or a Diffusers file (or the directory that holds one), and
+        `layouts` is read as in `apply`. Targets the model does not have, tensors
+        whose shapes do not fit the bound weight, ranks that disagree with the config,
+        and PEFT features this loader does not support are refused by name.
         """
         if isinstance(type(model), _Adapted):
             raise ValueError("The model is already adapted")
@@ -169,17 +170,18 @@ class LoRA:
 
 @dataclass(frozen=True, eq=False)
 class Adapter:
-    """A low-rank adapter bound to one model: what `LoRA.apply` and
-    `LoRA.load` return. Two adapters are the same object or different ones;
-    compare their `targets` and `layouts` to compare what they bind.
+    """A low-rank adapter bound to one model, as `LoRA.apply` and `LoRA.load` return it.
 
-    `model` computes the adapter branch in every target module and folds
-    `FROZEN` back into `params` itself, so any objective applies it on the
-    split tree; `variables` hold the factors under `params` and every base
-    weight under `FROZEN`, so the optimizer moves the factors alone.
-    `targets` are the adapted modules' paths with their rank and alpha;
-    `layouts` the bindings, by the name a file writes each module under,
-    that `save` writes the factors back through.
+    Two adapters compare equal only if they are the same object; compare their
+    `targets` and `layouts` to compare what they bind.
+
+    `model` computes the adapter branch in every target module and adds `FROZEN`
+    back into `params` itself, so any objective can apply it to the split tree.
+    `variables` holds the factors under `params` and every base weight under
+    `FROZEN`, so the optimizer updates only the factors. `targets` lists the
+    adapted modules' paths with their rank and alpha. `layouts` holds the
+    bindings, keyed by the name a file stores each module under, that `save`
+    writes the factors back through.
     """
 
     model: nn.Module
@@ -192,8 +194,10 @@ class Adapter:
     @classmethod
     def bound(cls, model: nn.Module, variables: Variables, targets: Mapping[Path, Target], rslora: bool,
               dropout: float, layouts: Mapping[str, WeightLayout]) -> Adapter:
-        """Adapt `model` to `targets` and split `variables`, the factors under
-        `params` and the rest under `FROZEN`."""
+        """Adapt `model` to `targets` and split `variables` into factors and frozen weights.
+
+        The factors go under `params` and everything else under `FROZEN`.
+        """
         adapted = _adapted(model, _Branch(targets, rslora, dropout), layouts)
         factors = {(*path, factor) for path in targets for factor in FACTORS}
         return cls(adapted, freeze(thaw(variables), lambda path: path in factors), targets, rslora, dropout,
@@ -202,11 +206,13 @@ class Adapter:
     @classmethod
     def from_run(cls, directory: str | FilePath, *, step: int | str | None = None,
                  ema: bool | None = None) -> Adapter:
-        """The adapter a run trained, from its own record and checkpoint: the
-        adapted model, the checkpoint's variables and the bindings the run
-        recorded, so `save` writes its factors under the source's names with
-        no source at hand. A recorded binding whose shapes do not fit the
-        restored factors is refused by name."""
+        """Return the adapter a run trained, rebuilt from the run's own record and checkpoint.
+
+        It holds the adapted model, the checkpoint's variables and the bindings the
+        run recorded, so `save` writes the factors under the source's names without
+        the source at hand. A recorded binding whose shapes do not fit the restored
+        factors is refused by name.
+        """
         from dew.checkpoints import Checkpoints
         from dew.config import ModelConfig
         from dew.inference.tasks import run_record
@@ -225,8 +231,10 @@ class Adapter:
 
     @classmethod
     def recorded(cls, model: nn.Module, variables: Variables, adapter: Mapping) -> Adapter:
-        """The adapter `adapter`, a model record's, over the adapted `model` and
-        a checkpoint's `variables`."""
+        """Return the adapter a model record's `adapter` describes.
+
+        It goes over the adapted `model` and a checkpoint's `variables`.
+        """
         if not isinstance(type(model), _Adapted):
             raise ValueError(f"{type(model).__name__} is not adapted, so it carries no adapter")
         targets, rslora, dropout, layouts = _read_record(adapter)
@@ -252,10 +260,9 @@ class Adapter:
     def merge(self, variables: Variables) -> Variables:
         """Return `variables` with every delta added into its kernel and the factors removed.
 
-        `variables` is the adapted tree, whole or split as a trainer keeps
-        it. The sum runs in at least fp32 at full precision and lands in the
-        kernel's dtype, PEFT's `merge_and_unload`. The result is one
-        `params` collection.
+        `variables` is the adapted tree, whole or split as a trainer keeps it. The sum
+        runs in at least fp32 at full precision and is stored in the kernel's dtype,
+        as PEFT's `merge_and_unload` does. The result is one `params` collection.
         """
         variables = thaw(variables)
         merged: dict = {}
@@ -276,12 +283,11 @@ class Adapter:
     def save(self, variables: Variables, path: str | FilePath) -> None:
         """Write the adapter's factors from `variables` under its own module names.
 
-        The names are the ones this adapter bound, so a run saves what it
-        trained with the tree it trained it in, split or whole. One unnamed
-        component writes PEFT's directory, which is a decoder source and a
-        model built from its class; a pipeline source, whose weights are
-        named under several components, writes the Diffusers file with each
-        component's PEFT config in its header.
+        The names are the ones this adapter bound, so a run saves what it trained from
+        the tree it trained, split or whole. With a single unnamed component (a
+        decoder source, or a model built from its class), it writes PEFT's directory.
+        A pipeline source, whose weights are named under several components, gets the
+        Diffusers file with each component's PEFT config in its header.
         """
         variables = thaw(variables)
         components = _components(self.layouts)
@@ -700,12 +706,12 @@ def _pattern(patterns: Mapping[str, object], relative: str) -> str:
 
 
 class PeftConfig(TypedDict):
-    """Describes `adapter_config.json` as PEFT writes and reads it.
+    """The contents of `adapter_config.json`, as PEFT writes and reads it.
 
-    It carries the defaults every target takes and the per-module exceptions.
-    `fan_in_fan_out`, `bias`, `init_lora_weights` and `inference_mode` are
-    fixed because dew builds its adapters one way. Nothing here reads those
-    four back; they are written so a PEFT reader finds the keys it expects.
+    It holds the defaults every target uses and the per-module exceptions.
+    `fan_in_fan_out`, `bias`, `init_lora_weights` and `inference_mode` are fixed
+    because Dew builds its adapters one way. Nothing here reads those four back;
+    they are written so that a PEFT reader finds the keys it expects.
     """
 
     peft_type: str

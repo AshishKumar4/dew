@@ -2,18 +2,18 @@
 
 One dataclass tree describes a run: what to build, what to feed it, how to
 optimize it, and how the trainer runs. Recipes parse it with tyro, build the
-objective and the data it names, and hand both to `RunConfig.train`, so
-`to_dict()` is a full record of a run and `from_dict()` puts it back together.
+objective and the data it names, and pass both to `RunConfig.train`, so
+`to_dict()` is a full record of a run and `from_dict()` rebuilds it.
 
-Model kwargs are an opaque JSON dict; the registry knows which architecture
-takes which fields. A dataset is the registered spec itself, which tyro
-turns into a subcommand (`data:token-windows --data.path ...`).
+Model kwargs are an opaque JSON dict, and the registry knows which
+architecture takes which fields. A dataset is the registered spec itself,
+which tyro turns into a subcommand (`data:token-windows --data.path ...`).
 
 The resolved config is the run's spec. A recipe writes it to `run.json` next
 to the checkpoints with `save`, and `load` reads it back into the same class,
 so inference rebuilds a run from what training was built from. A field the
 file lacks takes its declared default, and a field the class does not have
-raises.
+raises an error.
 """
 
 import dataclasses
@@ -111,22 +111,29 @@ class ModelConfig:
     quantization: Quantization | None = None
     """The quantized training the model was wrapped in, which `build` wraps it in again."""
     dtype: registry.DtypeName | None = "bfloat16"
-    """Compute dtype; parameter storage is independent."""
+    """The compute dtype; parameter storage is set separately."""
     param_dtype: registry.DtypeName | None = None
-    """Parameter storage, where the model declares the field. Unset stores
-    float32, which is the model's own default."""
+    """The parameter storage dtype, where the model declares that field.
+
+    Unset stores float32, the model's own default.
+    """
     matmul_precision: Literal["default", "high", "highest"] | None = None
-    """What every matmul of the model asks XLA for, where the model declares
-    a `precision` field: `default` is the backend's fastest algorithm,
-    `high` and `highest` trade throughput for mantissa bits (on Ampere and
-    later, tf32 and fp32 against bf16x3). Unset leaves the model's own, the
-    default. Under bf16 compute a decoder's vocabulary head at the default
-    rounds its logits and their gradient to bf16, as torch autocast does;
-    `high` and `highest` keep that head fp32, the setting for comparing
-    parallel layouts in bf16 (`dew.nn.precision.head_product`)."""
+    """The precision every matmul in the model asks XLA for, where the model declares a `precision` field.
+
+    `default` is the backend's fastest algorithm; `high` and `highest` trade
+    throughput for mantissa bits (on Ampere and later, tf32 and fp32 against
+    bf16x3). Unset keeps the model's own setting, `default`. Under bf16 compute, a
+    decoder's vocabulary head at `default` rounds its logits and their gradient to
+    bf16, as torch autocast does. `high` and `highest` keep that head in fp32,
+    which is the setting to use when comparing parallel layouts in bf16
+    (`dew.nn.precision.head_product`).
+    """
     attention_impl: AttentionImpl = "auto"
-    """Attention kernel; 'auto' is cudnn on a GPU for the shapes cudnn
-    supports and xla for the rest, xla on any other backend."""
+    """The attention kernel.
+
+    `dew.nn.attention` documents the kernels and how 'auto' chooses among them for
+    each call.
+    """
 
     def fields(self) -> Mapping[str, object]:
         """Return the model's fields with the run's precision settings in them."""
@@ -136,10 +143,12 @@ class ModelConfig:
                               matmul_precision=self.matmul_precision)
 
     def precision_settings(self) -> frozenset[str]:
-        """Return the names `fields()` writes that `config` did not carry: the run's
-        precision settings, as this architecture takes them. A resolved
-        record leaves them out, since this value writes them again every
-        time it builds."""
+        """Return the names `fields()` writes that `config` did not have.
+
+        These are the run's precision settings, as this architecture takes them. A
+        resolved record leaves them out, because this value writes them again every
+        time it builds the model.
+        """
         return frozenset(self.fields()) - frozenset(self.config)
 
     @classmethod
@@ -149,12 +158,12 @@ class ModelConfig:
 
     @classmethod
     def from_model(cls, model) -> Self:
-        """The module's constructor fields, with its actual compute settings.
+        """Return the module's constructor fields, with its actual compute settings.
 
-        A registered class is recorded under its registered name. A class no
-        registry names is recorded under its own name in lower case, which a
-        loader asks the user to register it as: `build` needs the name, and
-        training, checkpointing and resuming do not.
+        A registered class is recorded under its registered name. A class that no
+        registry names is recorded under its own name in lower case, and a loader asks
+        the user to register it under that name: `build` needs the name, but training,
+        checkpointing and resuming do not.
         """
         model_type = type(model)
         adapter, quantization = None, None
@@ -226,39 +235,49 @@ class OptimConfig:
     learning_rate: float = 2.7e-4
     """The constant rate, when no schedule is named."""
     schedule: ScheduleSpec | None = None
-    """The learning-rate schedule, one typed record per kind
-    (`dew.training.optim`): cosine, power (lm-engine's power law with an
-    optional linear tail) or linear; each holds only its own fields."""
+    """The learning-rate schedule, as one typed record per kind (`dew.training.optim`).
+
+    The kinds are cosine, power (lm-engine's power law with an optional linear
+    tail) and linear; each record holds only its own fields.
+    """
     weight_decay: float | None = None
     param_groups: Annotated[tuple[ParamGroup, ...], json_list_argument(ParamGroup)] = ()
-    """Per-group learning-rate multipliers and weight decay, first match wins;
-    empty moves every parameter alike. `ParamGroup.mup` is lm-engine's muP
-    split."""
+    """Per-group learning-rate multipliers and weight decay; the first matching group wins.
+
+    Empty treats every parameter alike. `ParamGroup.mup` is lm-engine's muP split.
+    """
     clip_grads: float = 0.0
     state_dtype: Literal["float32", "bfloat16"] = "float32"
-    """Adam's moments in memory. bfloat16 stores both stochastically rounded
-    (`dew.training.optim.bf16_moments`), for adam and adamw
-    only: half the optimizer state and less of the update's memory traffic."""
+    """The dtype of Adam's moments in memory.
+
+    bfloat16 stores both with stochastic rounding (`dew.training.optim.bf16_moments`),
+    for adam and adamw only. That halves the optimizer state and reduces the
+    update's memory traffic.
+    """
     forced_weight_normalization: bool = False
-    """Renormalize every magnitude-preserving weight (`dew.nn.mp.MPConv`)
-    after each update, EDM2's forced weight normalization, which its
-    `edm2_unet` trains with (`dew.nn.mp.forced_weight_normalization`)."""
+    """Whether to renormalize every magnitude-preserving weight (`dew.nn.mp.MPConv`) after each update.
+
+    This is EDM2's forced weight normalization, which its `edm2_unet` trains with
+    (`dew.nn.mp.forced_weight_normalization`).
+    """
     ema_profiles: tuple[float, ...] = ()
-    """Relative standard deviations of the power-function EMAs a run keeps
-    for post-hoc EMA (`dew.training.optim.power_profiles`), such as Karras
-    et al.'s (0.05, 0.10); every checkpoint save snapshots them, and
-    `Checkpoints.posthoc_ema` builds an average of any other
-    relative standard deviation from the snapshots. Empty keeps none."""
+    """Relative standard deviations of the power-function EMAs a run keeps for post-hoc EMA.
+
+    See `dew.training.optim.power_profiles`; Karras et al. use (0.05, 0.10). Every
+    checkpoint save snapshots these averages, and `Checkpoints.posthoc_ema` builds
+    an average with any other relative standard deviation from the snapshots.
+    Empty keeps none.
+    """
 
     def build(self, steps: int) -> optax.GradientTransformation:
-        """Build the solver this config describes, with its schedule, parameter
-        groups and clipping.
+        """Build the optimizer this config describes, with its schedule, parameter groups and clipping.
 
-        `steps` is the run's length, which a schedule decays over unless the
-        config names its own end. `param_groups` runs one solver per group under
-        `optax.multi_transform`, each on the schedule times its multiplier and
-        with its own weight decay; the global-norm clip still reads every
-        gradient together, before the groups split them."""
+        `steps` is the run's length, which the schedule decays over unless the config
+        names its own end. With `param_groups`, one optimizer runs per group under
+        `optax.multi_transform`, each on the schedule times its multiplier and with its
+        own weight decay; the global-norm clip still reads every gradient together,
+        before the groups split them.
+        """
         learning_rate = learning_rate_schedule(self, steps)
         opts = dict(self.optimizer_opts)
         if self.weight_decay is not None:
@@ -312,8 +331,11 @@ def _scaled(learning_rate: float | optax.Schedule, multiplier: float) -> float |
 
 @dataclasses.dataclass(frozen=True)
 class Wandb:
-    """Says where a run reports to. Setting it turns tracking on; the entity and
-    the offline switch mean nothing without a project."""
+    """Where a run reports to Weights & Biases.
+
+    Setting it turns tracking on; the entity and the offline switch have no effect
+    without a project.
+    """
 
     project: str
     entity: str | None = None
@@ -394,56 +416,75 @@ class TrainerConfig:
     name: str | None = None
     checkpoint_dir: str = "./checkpoints"
     keep: Annotated[int | Keep, _keep_argument()] = 2
-    """Latest checkpoints kept, besides the best one."""
+    """The number of latest checkpoints kept, besides the best one."""
     best: Annotated[str | Best | tuple[Best, ...] | None, _best_argument()] = None
-    """Metric name and ranking policy; None selects validation loss or training loss."""
+    """The metric name and ranking policy; None selects validation loss or training loss."""
     batch_size: int = 32
-    """Global batch, over every process."""
+    """The global batch size, over every process."""
     key: int = 0
-    """Seed of the run key: parameter init and every per-step draw."""
+    """The seed of the run key, which sets parameter init and every per-step draw."""
     steps: int | None = None
     epochs: int | None = None
-    """Run length as passes over the data; `steps` names it directly instead."""
+    """The run length as passes over the data; `steps` sets it directly instead."""
     log_every: int = 100
     eval_every: int | Literal["epoch"] | None = "epoch"
-    """Steps between validation passes: a number of steps, "epoch" for one
-    pass over the data, None to never validate. "epoch" over a stream that
-    reports no record count raises a ValueError, since it has no pass."""
+    """The steps between validation passes.
+
+    It is a number of steps, "epoch" for one pass over the data, or None to never
+    validate. "epoch" over a stream that reports no record count raises a
+    ValueError, since such a stream has no pass.
+    """
     checkpoint_every: Annotated[int | str | datetime.timedelta | None, _cadence_argument()] = "epoch"
-    """Steps between checkpoints, the same three answers. None is what a
-    stream whose iterator cannot report a read position trains with; the
-    trainer refuses any other answer for one."""
+    """The steps between checkpoints, with the same three choices as `eval_every`.
+
+    A stream whose iterator cannot report its read position must train with None;
+    the trainer refuses any other value for it.
+    """
     accumulation: int = 1
-    """Micro-batches per optimizer update."""
+    """The number of micro-batches per optimizer update."""
     batch_ramp: Ramp | None = None
-    """Grow `batch_size` over the run's first records instead of starting
-    there: the global batch the run starts at, what a stage adds and the
-    records the whole ramp spans. Unset trains at `batch_size` throughout.
-    One optimizer update a step either way, and the compiled step is traced
-    once per stage."""
+    """A ramp that grows `batch_size` over the run's first records instead of starting there.
+
+    It sets the global batch the run starts at, what each stage adds, and the
+    records the whole ramp spans. Unset trains at `batch_size` throughout. Either
+    way there is one optimizer update a step, and the compiled step is traced
+    once per stage.
+    """
     dynamic_scale: bool = False
     mesh: MeshSpec = dataclasses.field(default_factory=MeshSpec)
     layout: Layout = dataclasses.field(default_factory=Layout)
     profile: ProfileWindow | None = None
-    """One profiler window: the steps to trace, the warmup before it and the
-    directory it is written to. Unset traces nothing."""
+    """One profiler window: the steps to trace, the warmup before them and the output directory.
+
+    Unset traces nothing.
+    """
     compilation_cache_dir: str | None = dataclasses.field(
         default_factory=default_compilation_cache_dir)
-    """Persisted XLA cache, so a restart skips recompiling the step. None
-    compiles from scratch every run."""
+    """The directory for a persistent XLA cache, so a restart skips recompiling the step.
+
+    None compiles from scratch every run.
+    """
     wandb: Wandb | None = None
-    """Optional W&B sink in addition to the local tracking journal."""
+    """An optional W&B sink, in addition to the local tracking journal."""
     multi_host: bool | None = None
-    """Join the JAX process pool. None asks and continues alone only when no
-    cluster is configured; True requires the pool; False never asks."""
+    """Whether to join the JAX process pool.
+
+    None tries, and continues alone only when no cluster is configured; True
+    requires the pool; False never joins.
+    """
     xla_flags: str | None = None
-    """Extra XLA_FLAGS for this run, appended to the environment by
-    `prepare_process` before JAX opens a backend. Library users set XLA_FLAGS
-    themselves; see docs/performance.md for what was measured."""
+    """Extra XLA_FLAGS for this run, appended to the environment by `prepare_process`.
+
+    `prepare_process` appends them before JAX opens a backend. Library users set
+    XLA_FLAGS themselves; docs/performance.md records what was measured.
+    """
     quantization: Quantization | None = None
-    """Quantized-training spec, wrapped around the module the objective
-    trains before the run initialises it; unset trains in the compute dtype.
-    `dew.training.quantization` says what the wrap does and what it keeps."""
+    """The quantized-training spec, wrapped around the module the objective trains.
+
+    The wrapper is applied before the run initializes the module. Unset trains in
+    the compute dtype. `dew.training.quantization` describes what the wrapper does
+    and what it keeps.
+    """
 
     def __post_init__(self):
         if self.steps is not None and self.epochs is not None:
@@ -492,7 +533,7 @@ class TrainerConfig:
         return self._interval(self.eval_every, dataset, "eval-every")
 
     def checkpoint_interval(self, dataset: Dataset) -> int | datetime.timedelta | None:
-        """Steps, or a recorded duration such as 30m, between checkpoints."""
+        """Return the steps, or a recorded duration such as 30m, between checkpoints."""
         value = self.checkpoint_every
         if isinstance(value, datetime.timedelta):
             if value.total_seconds() <= 0:
@@ -617,7 +658,7 @@ def _key(key: object) -> str:
 
 @dataclasses.dataclass(frozen=True)
 class RunConfig:
-    """Describes a whole run. Recipes add their objective's knobs by subclassing this."""
+    """A whole run's configuration; recipes subclass it to add their objective's settings."""
 
     model: ModelConfig = dataclasses.field(default_factory=ModelConfig)
     data: DataSpec = dataclasses.field(default_factory=lambda: datasets["tfds_images"]())
@@ -625,12 +666,14 @@ class RunConfig:
     trainer: TrainerConfig = dataclasses.field(default_factory=TrainerConfig)
     objective: str | None = None
     lora: Annotated[LoRA, tyro.conf.subcommand("lora")] | None = None
-    """The low-rank adapter the run trains instead of the whole model
-    (`lora:lora --lora.rank 16 --lora.modules q_proj v_proj`). A recipe binds it to the
-    source `--pretrained` loads (`Pretrained.adapt`), or from scratch to a
-    fresh draw of the model from the run's key, and the objective then
-    trains the factors alone; the run records the bound adapter on its
-    model."""
+    """The low-rank adapter the run trains instead of the whole model.
+
+    On the command line it is `lora:lora --lora.rank 16 --lora.modules q_proj v_proj`.
+    A recipe attaches it to the source `--pretrained` loads (`Pretrained.adapt`),
+    or, from scratch, to a fresh draw of the model from the run's key. The
+    objective then trains only the factors, and the run records the bound adapter
+    on its model.
+    """
 
     def to_dict(self) -> dict[str, JSON]:
         """Return a JSON-safe record of the run.
@@ -650,8 +693,8 @@ class RunConfig:
     def save(self, directory: str) -> str:
         """Write this config as `run.json` in `directory` and return the path.
 
-        The path goes through `epath`, the same filesystem layer orbax writes
-        the checkpoints with, so a `gs://` run directory takes the record too.
+        The path goes through `epath`, the same filesystem layer Orbax writes the
+        checkpoints with, so a `gs://` run directory gets the record too.
         """
         path = epath.Path(directory)
         path.mkdir(parents=True, exist_ok=True)
@@ -678,29 +721,27 @@ class RunConfig:
     def train(self, objective: Objective[Loss, Effects], dataset: Dataset, *, name: str,
               metrics: Sequence[Metric] = (), rollout: Rollout | None = None,
               summary: Mapping[str, object] | None = None) -> TrainState:
-        """Train `objective` on `data` as this run says; every recipe calls
-        this once it has built both.
+        """Train `objective` on `data` as this config describes; every recipe calls this after building both.
 
-        The run lives under `name` in `trainer.checkpoint_dir`, and process
-        zero writes the record there before anything trains. A `trainer.wandb`
-        opens a tracker under the same name, with the record, `summary` (the
-        recipe's own view of the run) and the step count as its config, and
-        the checkpoint the run ends on is published to the registry under the
-        name with slashes and spaces replaced, since an artifact name allows
-        neither. Local tracking journals live in a separate tracking directory.
+        The run lives under `name` in `trainer.checkpoint_dir`, and process zero writes
+        the record there before training starts. A `trainer.wandb` opens a tracker
+        under the same name, with the record, `summary` (the recipe's own view of the
+        run) and the step count as its config. The final checkpoint is published to
+        the W&B registry under the name with slashes and spaces replaced, because an
+        artifact name allows neither. Local tracking journals live in a separate
+        tracking directory.
 
-        `dataset` is the one a recipe loaded at `trainer.batch_size`, and a
-        dataset at any other batch is refused here: the record, the ramp and
-        the run's reported throughput all name the configured number, while
-        every step reads the dataset's, so the two disagreeing is a run that
-        trains at a batch it does not report.
+        `dataset` must be the one the recipe loaded at `trainer.batch_size`; a dataset
+        at any other batch size is refused here. The record, the ramp and the reported
+        throughput all use the configured batch size while each step reads the
+        dataset's, so a mismatch would train at a batch size the run does not report.
 
-        A `trainer.quantization` wraps the module `objective` trains before
-        anything initialises it, so the quantized forward is what the run
-        learns through. A `lora` is not applied here: the recipe binds it to
-        the model and variables it builds the objective from.
-        `rollout` is the trainer's, which turns each prefetched batch into the
-        one the step trains on, as an on-policy objective samples it.
+        A `trainer.quantization` wraps the module `objective` trains before anything
+        initializes it, so the run learns through the quantized forward pass. A
+        `lora` is not applied here: the recipe attaches it to the model and variables
+        it builds the objective from. `rollout` is the trainer's rollout, which turns
+        each prefetched batch into the one the step trains on, as an on-policy
+        objective samples it.
         """
         if dataset.batch != self.trainer.batch_size:
             raise ValueError(
@@ -769,12 +810,12 @@ class RunConfig:
               tracker: Tracker, search: Search = random_search, seed: int = 0) -> list[TrialFinished]:
         """Train `trials` trials of this config over `space` and return the ledger.
 
-        Each trial draws a point from `space`, trains under the run name
-        `<trainer.name>/trial-<index>` so trials keep their own checkpoints and
-        tracking, and records the score `train` returns for it. `tracker`
-        receives that score as `sweep/value` at the trial's number and the
-        trial's `TrialFinished` record. A trial reaches `ledger` before it is
-        reported, so rerunning the same call continues an interrupted sweep.
+        Each trial draws a point from `space` and trains under the run name
+        `<trainer.name>/trial-<index>`, so trials keep their own checkpoints and
+        tracking, and the score `train` returns is recorded for it. `tracker` receives
+        that score as `sweep/value` at the trial's number, along with the trial's
+        `TrialFinished` record. A trial is written to `ledger` before it is reported,
+        so rerunning the same call continues an interrupted sweep.
         """
         path = Path(ledger)
         if self.trainer.name is None:

@@ -27,7 +27,13 @@ from dew.telemetry.devices import deterministic_ops_requested
 from .attention_sinks import attention_with_sinks
 from .kernels.generation import bf16_dot_runs
 from .kv_cache import Append, KVCache, KVStore, filled_slots
-from .precision import at_default_precision, at_least_fp32, precision_names, rounded_to
+from .precision import (
+    at_default_precision,
+    at_least_fp32,
+    bf16_operand_precision,
+    precision_names,
+    rounded_to,
+)
 from .rope import apply_rotary
 from .sharding import (
     HEADS,
@@ -756,7 +762,11 @@ def triton_attention(query, key, value, causal: bool):
     return manual_map(local, (queries, keys, keys), queries)(query, key, value)
 
 
-def weighted_values(equation, weights, value, *, precision=None):
+VALUE_BLOCK = 256
+"""Keys per block of `weighted_values`' fp32 sum on XLA:CPU."""
+
+
+def weighted_values(equation, weights, value, *, precision=None) -> jax.Array:
     """The probability-value product, with the probabilities in the value's dtype.
 
     An fp32 softmax leaves fp32 probabilities, and `jnp.einsum` promotes to
@@ -767,8 +777,49 @@ def weighted_values(equation, weights, value, *, precision=None):
     (`probs.astype(key.dtype)`), so the two paths multiply alike; the softmax
     that produced them still reduced in fp32, which is where the precision
     was needed.
+
+    `equation` is flax's value product, '...hqk,...khd->...qhd'. On XLA:CPU
+    an fp32 product sums each block of VALUE_BLOCK keys apart and the
+    blocks' sums after. YNNPACK, XLA:CPU's dot, sums up to about 1024 keys
+    in one chain: fp32 attention over 512, 2048 and 8192 keys rounded 1.34,
+    1.75 and 1.63 times as far from float64 as torch's SDPA does, and 0.98,
+    0.96 and 0.87 times in blocks. Writing each block's product costs a
+    forward 3% to 9% at 512 to 1024 keys on two threads (docs/performance.md).
     """
-    return jnp.einsum(equation, weights.astype(value.dtype), value, precision=precision)
+    if equation != '...hqk,...khd->...qhd':
+        raise ValueError(f"weighted_values takes flax's value product, got {equation!r}")
+    weights = weights.astype(value.dtype)
+    if value.dtype != jnp.float32 or value.shape[-3] <= VALUE_BLOCK or jax.default_backend() != 'cpu':
+        return jnp.einsum(equation, weights, value, precision=precision)
+    return _blocked_values(weights, value, precision)
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(2,))
+def _blocked_values(weights, value, precision) -> jax.Array:
+    """`weighted_values`' product summed in blocks of VALUE_BLOCK keys. Its
+    gradients are the plain product's: neither sums over the keys, and the
+    blocked form's own cost the backward an eighth more on two threads."""
+    keys = value.shape[-3]
+    blocks = -(-keys // VALUE_BLOCK)
+    pad = blocks * VALUE_BLOCK - keys
+    weights = jnp.pad(weights, [(0, 0)] * (weights.ndim - 1) + [(0, pad)])
+    value = jnp.pad(value, [(0, 0)] * (value.ndim - 3) + [(0, pad), (0, 0), (0, 0)])
+    weights = weights.reshape(*weights.shape[:-1], blocks, VALUE_BLOCK)
+    value = value.reshape(*value.shape[:-3], blocks, VALUE_BLOCK, *value.shape[-2:])
+    return jnp.einsum('...hqck,...ckhd->...qhdc', weights, value, precision=precision).sum(-1)
+
+
+def _blocked_values_forward(weights, value, precision):
+    return _blocked_values(weights, value, precision), (weights, value)
+
+
+def _blocked_values_backward(precision, saved, cotangent):
+    weights, value = saved
+    return (jnp.einsum('...qhd,...khd->...hqk', cotangent, value, precision=precision),
+            jnp.einsum('...hqk,...qhd->...khd', weights, cotangent, precision=precision))
+
+
+_blocked_values.defvjp(_blocked_values_forward, _blocked_values_backward)
 
 
 def softcapped_attention(query, key, value, softcap: float, dtype=None, precision=None,
@@ -928,6 +979,57 @@ def refuse_reference_only_arguments(implementation, query, dtype, precision,
             "the reference implementation (attention_impl 'reference').")
 
 
+FOLDED_PAIRS = 16
+"""Most query positions times key heads `folded_attention` takes."""
+
+
+def folds(query, key, bias, mask, causal, sliding_window) -> bool:
+    """Whether an xla call goes to `folded_attention`: on a GPU, a call of
+    few query positions over keys of the query's heads, masked by key
+    lengths at most, such as a decode step's grouped query
+    (`CausalSelfAttention._decode_attention`) where cudnn does not run."""
+    return (jax.default_backend() == 'gpu' and query.shape[-2] == key.shape[-2]
+            and query.shape[-3] * key.shape[-2] <= FOLDED_PAIRS
+            and bias is None and mask is None and not causal and sliding_window is None)
+
+
+def folded_attention(query, key, value, key_value_seq_lengths):
+    """jax.nn's xla attention for query `[B, T, N, D]` over keys and values
+    `[B, S, N, D]` of the same heads, with every query head against every
+    (key, head) pair.
+
+    XLA's GPU products take each head's keys apart, so jax.nn's attention
+    transposed the whole cache, keys and values, at every decode step where
+    cudnn does not run: a tenth of Qwen3.5-0.8B's decode program at 128
+    rows, its 256-wide heads. Here both products read the keys and values
+    as `[B, S * N, D]`, their own layout, and the cross-head products are
+    thrown away: N times the multiplications, of a step bound by reading
+    the cache. The arithmetic is jax.nn's otherwise (fp32 logits of the
+    operands, the scale after, an fp32 softmax of logits masked to -0.7
+    times the largest fp32, probabilities in the value's dtype). Six layers
+    of Qwen3.5's decode took 1.21 against 2.48 ms at 128 rows and 0.33
+    against 0.47 at 32 on an RTX 4080 (docs/performance.md).
+    """
+    batch, positions, heads, width = query.shape
+    keys = key.shape[-3]
+    wide = jnp.promote_types(query.dtype, jnp.float32)
+    precision = bf16_operand_precision(query.dtype)
+    logits = jnp.einsum('bxd,byd->bxy', query.reshape(batch, positions * heads, width),
+                        key.reshape(batch, keys * heads, width), precision=precision,
+                        preferred_element_type=wide)
+    logits = jnp.diagonal(logits.reshape(batch, positions, heads, keys, heads), axis1=2, axis2=4)
+    logits = logits * jnp.asarray(1 / math.sqrt(width), wide)  # [B, T, S, N]
+    if key_value_seq_lengths is not None:
+        valid = jnp.arange(keys)[None, None, :, None] < key_value_seq_lengths[:, None, None, None]
+        logits = jnp.where(valid, logits, jnp.asarray(-0.7 * jnp.finfo(jnp.float32).max, wide))
+    probs = jax.nn.softmax(logits.astype(jnp.float32), axis=2).astype(value.dtype)
+    # Each query head's probabilities over its own head's keys, zeros elsewhere.
+    spread = jnp.moveaxis(probs, 3, 2)[..., None] * jnp.eye(heads, dtype=probs.dtype)[:, None, :]
+    out = jnp.einsum('bxy,byd->bxd', spread.reshape(batch, positions * heads, keys * heads),
+                     value.reshape(batch, keys * heads, value.shape[-1]))
+    return out.reshape(batch, positions, heads, value.shape[-1])
+
+
 def fused_attention(query, key, value, bias, mask, causal, sliding_window, implementation, *,
                     softcap, sinks, segment_ids, key_value_seq_lengths):
     """Run the fused kernel `implementation` names, at the query's head width.
@@ -978,6 +1080,8 @@ def fused_attention(query, key, value, bias, mask, causal, sliding_window, imple
                 "attention implementation 'triton' takes no sinks, softcap, bias, mask, "
                 "window or key lengths; use attention_impl 'cudnn' or 'xla' for this call.")
         out = triton_attention(query, key, value, causal)
+    elif implementation == 'xla' and folds(query, key, bias, mask, causal, sliding_window):
+        out = folded_attention(query, key, value, key_value_seq_lengths)
     elif implementation == 'xla':
         # A left window of l means the l+1 most recent keys on both the xla and
         # the cudnn path, which is the window this function counts.
@@ -1168,6 +1272,14 @@ def _xla_kernel_narrows(query) -> bool:
         query.dtype == jnp.bfloat16 and jax.default_backend() == 'gpu' and not bf16_dot_runs())
 
 
+def _xla_kernel_chains(query, key) -> bool:
+    """Whether jax.nn's xla attention would sum this call's fp32 value
+    product over more than VALUE_BLOCK keys in one chain, as YNNPACK,
+    XLA:CPU's dot, does, so 'auto' and 'xla' take the reference path, whose
+    `weighted_values` sums it in blocks."""
+    return query.dtype == jnp.float32 and key.shape[-3] > VALUE_BLOCK and jax.default_backend() == 'cpu'
+
+
 def resolve_implementation(implementation, query, key, *, dtype=None, precision=None,
                            force_fp32_for_softmax=True, softcap=None, sinks=None, causal=False,
                            sliding_window=None, mask=None, bias=None) -> str:
@@ -1184,7 +1296,7 @@ def resolve_implementation(implementation, query, key, *, dtype=None, precision=
     """
     if implementation not in ('auto', 'reference', 'xla', 'cudnn', 'triton', 'tpu'):
         raise ValueError(f"Unknown attention implementation: {implementation}")
-    if implementation in ('auto', 'xla') and _xla_kernel_narrows(query):
+    if implementation in ('auto', 'xla') and (_xla_kernel_narrows(query) or _xla_kernel_chains(query, key)):
         return 'reference'
     if implementation != 'auto':
         return implementation

@@ -199,13 +199,15 @@ class _Draws(NamedTuple):
 @trainings("rcm")
 @dataclasses.dataclass(frozen=True)
 class ConsistencyDistillation(Training):
-    """Distill a saved flow run into a few-step student with rCM
-    (`ConsistencyDistillationObjective`, which documents the other fields):
-    sCM's consistency loss regularized by DMD2's, or either alone at the
-    other's weight 0, under the `Flow` preset, sampling unguided. `teacher`
-    is the teacher run's directory a run loads it from; its model is the
-    run's `model`, and the student and the fake score start from its
-    weights. An objective built in code takes the teacher's weights instead."""
+    """rCM distillation of a saved flow run into a few-step student.
+
+    rCM is sCM's consistency loss regularized by DMD2's, or either one alone when
+    the other's weight is 0 (`ConsistencyDistillationObjective` documents the other
+    fields), under the `Flow` preset, sampling unguided. `teacher` is the teacher
+    run's directory a run loads it from. Its model is this run's `model`, and the
+    student and the fake score start from its weights; an objective built in code
+    takes the teacher's weights instead.
+    """
 
     preset_class = Flow
     guided = False
@@ -248,11 +250,11 @@ class ConsistencyDistillation(Training):
             guidance=None, steps=run.sampling_steps)
 
     def check_teacher(self, architecture: str) -> None:
-        """Refuse sCM over a teacher whose time embedding is too fast in time.
+        """Refuse sCM over a teacher whose time embedding changes too fast in time.
 
-        The student starts from the teacher's variables, its Fourier table
-        among them, so the time scale the student trains through is the one
-        the teacher was trained at, whatever this run's model config says.
+        The student starts from the teacher's variables, including its Fourier table,
+        so it trains with the teacher's time scale whatever this run's model config
+        says.
         """
         from .config import DiffusionRunConfig
 

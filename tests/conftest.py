@@ -34,6 +34,23 @@ def pytest_runtest_setup(item):
                     f"{jax.device_count()} {jax.default_backend()} device(s)")
 
 
+@pytest.fixture(autouse=True)
+def own_rung_records(monkeypatch, tmp_path_factory):
+    """Each test keeps its own rung records (`dew.training.rungs`). The suite
+    shares one compilation cache, beside which a run records its step's
+    rung, and a rung one test forces would be another's floor."""
+    from dew.training import rungs
+
+    directory = []
+
+    def records():
+        if not directory:
+            directory.append(tmp_path_factory.mktemp("rungs"))
+        return directory[0]
+
+    monkeypatch.setattr(rungs, "rung_records", records)
+
+
 @pytest.fixture
 def without_deterministic_ops(monkeypatch):
     """The cuda lane runs the whole suite under --xla_gpu_deterministic_ops,

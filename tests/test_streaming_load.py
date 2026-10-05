@@ -102,6 +102,28 @@ def test_a_transposed_read_across_many_tiles_is_the_strided_copy_bit_for_bit(dty
         assert stacked.read(index).tobytes() == expected.tobytes(), index
 
 
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+def test_an_eager_translation_swaps_kernels_in_tiles_as_the_strided_copy_does(dtype):
+    """`translate_parameters` casts each kernel in its stored layout and
+    swaps it in the same 64x64 tiles as a transposed read; on ragged shapes
+    that is numpy's own strided copy, bit for bit. A 4-D convolution kernel,
+    whose layout is no swap of the last two axes, keeps numpy's copy."""
+    import ml_dtypes
+
+    from dew.interop.weights import translate_parameters
+
+    storage = np.dtype(ml_dtypes.bfloat16) if dtype == "bfloat16" else np.dtype(dtype)
+    rng = np.random.default_rng(5)
+    tensors = {"dense": rng.standard_normal((200, 131)).astype(np.float32),
+               "conv": rng.standard_normal((8, 3, 3, 5)).astype(np.float32)}
+    params = translate_parameters(tensors, lambda name: ("params", name, "kernel"), dtype)
+    for name, order in (("dense", (1, 0)), ("conv", (2, 3, 1, 0))):
+        leaf = params["params"][name]["kernel"]
+        expected = np.ascontiguousarray(tensors[name].astype(storage).transpose(order))
+        assert leaf.dtype == storage and leaf.flags.c_contiguous
+        assert leaf.shape == expected.shape and leaf.tobytes() == expected.tobytes(), name
+
+
 @pytest.mark.parametrize("transposed", [True, False])
 def test_concatenated_projections_read_only_the_requested_columns_in_storage_precision(transposed):
     """A shard can start inside Q and cross K/V, with no concatenated host model."""

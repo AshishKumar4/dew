@@ -1,10 +1,10 @@
-"""The diffusion run, as one typed record and one construction.
+"""The diffusion run as one typed record, and the one function that builds it.
 
 `DiffusionRunConfig` is what a diffusion recipe parses from its command line
-and writes as `run.json` next to the checkpoints, and `build()` is the one
-function that turns it into the `DiffusionObjective`. The recipe trains what
-it returns, and `TextToImage.from_run` samples from what it returns for the
-same file.
+and writes as `run.json` next to the checkpoints. `build()` is the single
+function that turns it into a `DiffusionObjective`: the recipe trains the
+objective it returns, and `TextToImage.from_run` samples from the objective it
+returns for the same file.
 """
 
 from __future__ import annotations
@@ -82,33 +82,38 @@ DEFAULT_MODEL_CONFIG = {
 
 @dataclasses.dataclass(frozen=True)
 class TextCondition:
-    """Condition the model on text: which registered encoder reads the
-    batch's tokens, and from which checkpoint."""
+    """Text conditioning: which registered encoder reads the batch's tokens, and from which checkpoint."""
 
     encoder: str = "clip_text"
     checkpoint: str = DEFAULT_MODEL
     dtype: DtypeName | None = None
     """The encoder's compute dtype; None follows the model's compute dtype."""
     param_dtype: DtypeName = "float32"
-    """Storage precision when loading source weights; supplied params retain theirs."""
+    """The storage dtype when loading source weights; supplied params keep theirs."""
     field: str = "text"
     """The batch field holding the tokenized text."""
     unconditional: str = ""
     """The prompt the unconditional branch is encoded from."""
     max_length: int | None = None
-    """Tokens every prompt is padded to; None keeps the encoder's own
-    default, which for CLIP is the checkpoint's context length."""
+    """The token length every prompt is padded to.
+
+    None keeps the encoder's own default, which for CLIP is the checkpoint's
+    context length.
+    """
     revision: str | None = None
-    """The checkpoint's git revision. A rerun then conditions on the weights
-    the run named, even after the branch has moved on."""
+    """The checkpoint's git revision.
+
+    With it, a rerun conditions on the weights the run named, even after the
+    branch has moved on.
+    """
 
     def build(self, *, params: Variables | None = None,
               dtype: DtypeName | None = None) -> Condition:
-        """Bind supplied encoder params without a source weight load or storage cast.
+        """Build the encoder over supplied params, without loading source weights or casting storage.
 
-        `dtype` is the run's own compute dtype, which an unset `self.dtype`
-        follows: the tower runs beside the model it conditions, in every
-        step, and a checkpoint stored in float32 is no reason to run it there.
+        `dtype` is the run's own compute dtype, which an unset `self.dtype` follows:
+        the tower runs next to the model it conditions in every step, so a checkpoint
+        stored in float32 is no reason to run it in float32.
         """
         fields = {name: value for name, value in
                   (("max_length", self.max_length), ("revision", self.revision))
@@ -122,24 +127,23 @@ class TextCondition:
 
 @dataclasses.dataclass(frozen=True)
 class AudioCondition:
-    """Condition the model on each clip's audio, through the video dataset's
-    own audio model.
+    """Audio conditioning on each clip, through the video dataset's own audio model.
 
     The dataset's `audio_model` names the `hf_audio` tower, whose feature
-    extractor already wrote the batch's `audio` field, and the dataset's
-    clip length sets the waveform length every clip and the silent
-    unconditional input are encoded at, so the two can never disagree.
+    extractor already wrote the batch's `audio` field. The dataset's clip length
+    sets the waveform length used to encode every clip and the silent
+    unconditional input, so the two always agree.
     """
 
     encoder: ClassVar[str] = "hf_audio"
     dtype: DtypeName | None = None
     """The tower's compute dtype; None follows the model's compute dtype."""
     param_dtype: DtypeName = "float32"
-    """Storage precision when loading source weights; supplied params retain theirs."""
+    """The storage dtype when loading source weights; supplied params keep theirs."""
 
     def build(self, clips: VideoDataset, *, params: Variables | None = None,
               dtype: DtypeName | None = None) -> Condition:
-        """Bind supplied tower params without a source weight load or storage cast."""
+        """Build the tower over supplied params, without loading source weights or casting storage."""
         return Condition(
             rebuild(self.encoder, {"checkpoint": clips.audio_model, "seconds": clips.audio_seconds,
                                    "dtype": dtype if self.dtype is None else self.dtype,
@@ -149,9 +153,11 @@ class AudioCondition:
 
 @dataclasses.dataclass(frozen=True)
 class PretrainedAutoencoder:
-    """Run latent diffusion behind a published autoencoder: a Stable
-    Diffusion AutoencoderKL, or a DC-AE where the checkpoint's config names
-    `AutoencoderDC` (`dew.nn.autoencoders.pretrained.load_autoencoder`)."""
+    """A published autoencoder for latent diffusion.
+
+    It is a Stable Diffusion AutoencoderKL, or a DC-AE when the checkpoint's
+    config names `AutoencoderDC` (`dew.nn.autoencoders.pretrained.load_autoencoder`).
+    """
 
     modelname: str = "pcuenq/sd-vae-ft-mse-flax"
     revision: str = "bf16"
@@ -161,7 +167,7 @@ class PretrainedAutoencoder:
     """Per-dataset latent statistics; None keeps the checkpoint's."""
 
     def build(self, *, params: Variables | None = None) -> AutoEncoder:
-        """Bind supplied params while reconstructing the model from its config."""
+        """Build the autoencoder from its config over supplied params."""
         import jax.numpy as jnp
 
         from dew.nn.autoencoders.pretrained import load_autoencoder
@@ -174,18 +180,20 @@ class PretrainedAutoencoder:
 @trainings("flow_grpo")
 @dataclasses.dataclass(frozen=True)
 class FlowGRPO(Training):
-    """Train the model as a Flow-GRPO policy (Liu et al. 2025) on an image
-    reward: groups of rollouts through the flow SDE per prompt, scored,
-    normalized within the group and trained on the clipped likelihood ratio,
-    with the conditional KL to the initial model at weight `beta`.
+    """Flow-GRPO training of the model as a policy on an image reward.
 
-    The fields are `FlowGRPOObjective`'s and `FlowRollout`'s, which document
-    them; `reward` names a registered image metric measured per sample
-    against its own prompt, and higher must be better (`clip_score`).
+    Flow-GRPO is from Liu et al. (2025). For each prompt, a group of rollouts runs
+    through the flow SDE; their rewards are normalized within the group, and the
+    model trains on the clipped likelihood ratio, with the conditional KL to the
+    initial model at weight `beta`.
 
-    Under it the run's `ema_decay` and `unconditional_prob` go unused: the
-    EMA slot holds the frozen KL reference when `beta` > 0 and nothing
-    otherwise, and no training row drops its condition.
+    The fields are `FlowGRPOObjective`'s and `FlowRollout`'s, which document them.
+    `reward` names a registered image metric that scores each sample against its
+    own prompt, where higher must be better (`clip_score`).
+
+    Under Flow-GRPO, the run's `ema_decay` and `unconditional_prob` are unused: the
+    EMA slot holds the frozen KL reference when `beta` > 0 and nothing otherwise,
+    and no training row drops its condition.
     """
 
     reward: str = "clip_score"
@@ -213,7 +221,7 @@ class FlowGRPO(Training):
             steps=run.sampling_steps, variables=variables)
 
     def rollout(self, objective: DiffusionObjective) -> FlowRollout:
-        """The trainer's rollout over `objective`, scored by the named metric."""
+        """Return the trainer's rollout over `objective`, scored by the named metric."""
         from dew.artifacts import ImageGrid
         from dew.eval.common import ImageMetric
         from dew.objectives.rl.flow import FlowGRPOObjective, FlowRollout
@@ -237,54 +245,71 @@ class FlowGRPO(Training):
 
 @dataclasses.dataclass(frozen=True)
 class DiffusionRunConfig(RunConfig):
-    """Describe a run, plus the diffusion objective's own knobs."""
+    """A diffusion run's configuration: the shared run fields plus the diffusion objective's own settings."""
 
     objective: str = "diffusion"
-    """The objective `build` returns, the name `mode` is registered under, so a
-    saved record names what trained."""
+    """The objective `build` returns: the name `mode` is registered under.
+
+    It follows `mode`, so a saved record names what trained.
+    """
     model: ModelConfig = dataclasses.field(
         default_factory=lambda: ModelConfig("unet", dict(DEFAULT_MODEL_CONFIG)))
     data: CaptionedSpec = dataclasses.field(default_factory=TFDSImages)
     preset: PresetSpec | None = dataclasses.field(default_factory=EDM)
-    """The convention the model is trained and sampled with. None is the one
-    the `pretrained` pipeline's scheduler reads, which a preset may restate."""
+    """The convention the model is trained and sampled with.
+
+    None uses the one the `pretrained` pipeline's scheduler reads, which a preset
+    may restate.
+    """
     solver: SolverSpec = dataclasses.field(default_factory=EulerAncestral)
     """The solver validation samples with."""
     guidance: CFG | None = dataclasses.field(default_factory=lambda: CFG(3.0))
-    """How validation samples are guided, scale and interval; None samples
-    the conditional prediction alone."""
+    """How validation samples are guided, with scale and interval.
+
+    None samples the conditional prediction alone.
+    """
     sampling_steps: int = 200
     unconditional_prob: float = 0.12
-    """Fraction of training examples whose condition is dropped."""
+    """The fraction of training examples whose condition is dropped."""
     ema_decay: float | None = 0.999
-    """None disables EMA; 1.0 retains a frozen copy."""
+    """The EMA decay; None disables the EMA and 1.0 keeps a frozen copy."""
     text: TextCondition | None = dataclasses.field(default_factory=TextCondition)
-    """The text condition, under the keyword its encoder's value is read by
-    (`ConditionEncoder.keyword`); None trains unconditionally, or on `audio`."""
+    """The text condition, passed under its encoder's keyword (`ConditionEncoder.keyword`).
+
+    None trains unconditionally, or on `audio`.
+    """
     audio: AudioCondition | None = None
-    """The audio condition, under its encoder's keyword in place of text, so
-    it needs `text` None and a `VideoDataset`, whose clips carry the audio."""
+    """The audio condition, passed under its encoder's keyword in place of text.
+
+    It needs `text` to be None and a `VideoDataset`, whose clips hold the audio.
+    """
     autoencoder: PretrainedAutoencoder | None = None
-    """Set for latent diffusion; None trains in pixel space."""
+    """The autoencoder for latent diffusion; None trains in pixel space."""
     pretrained: str | None = None
-    """A published diffusion pipeline to fine-tune: a Hub repo, `repo@revision`
-    or a local directory in the diffusers layout. The checkpoint decides the
-    model, its text conditioning and its autoencoder, so `--model` carries
-    the precision settings alone and `text` and `autoencoder` are left
-    unset."""
+    """A published diffusion pipeline to fine-tune.
+
+    It is a Hub repo, `repo@revision` or a local directory in the diffusers layout.
+    The checkpoint decides the model, its text conditioning and its autoencoder, so
+    `--model` holds only the precision settings and `text` and `autoencoder` stay
+    unset.
+    """
     mode: TrainingSpec = dataclasses.field(default_factory=Denoising)
-    """How the run trains: the denoising loss (`Denoising`, with EDM2's learned
-    weighting or representation alignment), or a loss of its own in its place
-    (`FlowGRPO`, `MeanFlowTraining`, `ShortcutTraining`,
-    `ConsistencyDistillation`, `GuidanceDistillation`,
-    `AdversarialDistillation`). Each refuses a preset or guidance its loss
+    """How the run trains: the denoising loss, or a loss of its own in its place.
+
+    `Denoising` is the denoising loss, with EDM2's learned weighting or
+    representation alignment. `FlowGRPO`, `MeanFlowTraining`, `ShortcutTraining`,
+    `ConsistencyDistillation`, `GuidanceDistillation` and `AdversarialDistillation`
+    train on their own losses. Each mode refuses a preset or guidance its loss
     cannot train or sample with, and `objective` is the name it is registered
-    under. On the command line it is `mode:mean-flow-training --mode.omega 2`."""
+    under. On the command line it is `mode:mean-flow-training --mode.omega 2`.
+    """
     val_metrics: tuple[str, ...] = ("clip",)
-    """Names in the metrics registry, scored on every validation pass. The
-    registry is the list of what a run can name, so a metric registered
-    elsewhere is spelled here without this class knowing it; `__post_init__`
-    refuses a name nothing is registered under."""
+    """Names in the metrics registry, scored on every validation pass.
+
+    The registry lists what a run can name, so a metric registered elsewhere can
+    be named here without this class knowing about it. `__post_init__` refuses a
+    name that nothing is registered under.
+    """
 
     def __post_init__(self) -> None:
         # A record carries every sequence as a JSON list and a command line
@@ -337,7 +362,7 @@ class DiffusionRunConfig(RunConfig):
                 f"{datasets.name_of(type(self.data))} carries none")
 
     def sample_field(self) -> Field:
-        """The batch field the model generates, at the resolution the data comes in."""
+        """Return the batch field the model generates, at the resolution the data comes in."""
         spec = self.data
         if isinstance(spec, VideoDataset):
             return Field("video", (spec.frames, spec.frame_size, spec.frame_size, 3))
@@ -350,10 +375,12 @@ class DiffusionRunConfig(RunConfig):
             f"{datasets.name_of(type(spec))}")
 
     def model_fields(self, autoencoder: AutoEncoder | None) -> dict:
-        """The fields the registry builds the model from: the run's precision
-        settings over `model.config`, and the channels the model denoises
-        where the architecture takes them as `output_channels`. The published
-        families name theirs as their sources do, in `model.config`."""
+        """Return the fields the registry builds the model from.
+
+        These are the run's precision settings over `model.config`, plus the channels
+        the model denoises when the architecture takes them as `output_channels`. The
+        published families name theirs as their sources do, in `model.config`.
+        """
         fields = dict(self.model.fields())
         declared = {field.name for field in dataclasses.fields(models[self.model.architecture])}
         if "interval" in declared and self.preset is not None:
@@ -373,12 +400,12 @@ class DiffusionRunConfig(RunConfig):
 
     @property
     def context(self) -> TextCondition | AudioCondition | None:
-        """The condition the model reads, text or audio, if any."""
+        """Return the condition the model reads, text or audio, if any."""
         return self.text if self.text is not None else self.audio
 
     @property
     def parameter_roots(self) -> tuple[tuple[str, ...], ...]:
-        """Parameter ownership in the variables tree this config builds."""
+        """Return which parts of the variables tree this config builds own which parameters."""
         roots: list[tuple[str, ...]] = [("params",), (FROZEN,)]
         if self.pretrained is not None:
             # Every published pipeline's conditioner owns a bare tree.
@@ -396,14 +423,14 @@ class DiffusionRunConfig(RunConfig):
         return tuple(roots)
 
     def build(self, *, variables: Variables | None = None) -> DiffusionObjective:
-        """Build the configured compute owners around their parameters.
+        """Build the objective, with each component built around its parameters.
 
-        Supplied variables are the authoritative saved snapshot. Encoders and
-        the VAE read only configuration/tokenizer metadata and bind their
-        respective subtrees without a source weight load or storage cast.
+        Supplied variables are the authoritative saved snapshot. The encoders and the
+        VAE read only configuration and tokenizer metadata, and use their subtrees of
+        the supplied variables without loading source weights or casting storage.
 
-        A `lora` binds to the denoiser `pretrained` loads, or from scratch to
-        a fresh draw of it from the run's key, so the objective trains its
+        A `lora` goes on the denoiser that `pretrained` loads, or, from scratch, on a
+        fresh draw of it from the run's key. The objective then trains the adapter's
         factors and any loss head of its own.
         """
         if self.lora is not None and variables is not None:
@@ -451,14 +478,19 @@ class DiffusionRunConfig(RunConfig):
         return self.mode.objective(self, model, process, inputs, autoencoder=autoencoder, variables=variables)
 
     def rollout(self, objective: DiffusionObjective):
-        """The trainer's rollout for `objective`, the mode's: Flow-GRPO's, or
-        None for a loss that trains on the batch as it comes."""
+        """Return the trainer's rollout for `objective`.
+
+        That is the mode's: Flow-GRPO's rollout, or None for a loss that trains on
+        each batch as it comes.
+        """
         return self.mode.rollout(objective)
 
     def pinned(self) -> DiffusionRunConfig:
-        """This run with its Hub sources, `pretrained` and the alignment's
-        encoder, pinned to the commits they resolve to now, so the record
-        names the weights the run started from."""
+        """Return this run with its Hub sources pinned to the commits they resolve to now.
+
+        The sources are `pretrained` and the alignment's encoder, so the record names
+        the weights the run started from.
+        """
         from dew.interop import sources
         from dew.interop.pretrained import split_revision
 
@@ -539,10 +571,12 @@ class DiffusionRunConfig(RunConfig):
         return process
 
     def build_eval_metrics(self) -> list:
-        """Validation metrics for `val_metrics`, each pulling its own weights
-        on construction. A video run scores `VideoGrid` against its `video`
-        field, so `psnr` and `ssim` read that grid there, and an image-only
-        metric raises a ValueError naming it here, before the trainer."""
+        """Build the validation metrics `val_metrics` names, each loading its own weights.
+
+        A video run scores a `VideoGrid` against its `video` field, so `psnr` and
+        `ssim` read that grid there, and an image-only metric raises a ValueError
+        naming it here, before the trainer starts.
+        """
         from dew.artifacts import ImageGrid, VideoGrid
 
         video = len(self.sample_field().shape) == 4
