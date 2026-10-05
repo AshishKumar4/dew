@@ -18,7 +18,7 @@ before(async () => {
 });
 after(async () => { await worker?.dispose(); });
 
-for (const authorization of [undefined, 'Bearer wrong-token']) {
+for (const authorization of [undefined, 'Bearer wrong-token', `Bearer ${'x'.repeat('private-test-token'.length)}`]) {
 	test(`a measurement refuses ${authorization ? 'an invalid token' : 'no token'}`, async () => {
 		const headers = authorization ? { Authorization: authorization } : {};
 		const response = await worker.dispatchFetch('https://admin.test/measure', { method: 'POST', headers });
