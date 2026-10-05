@@ -1,19 +1,21 @@
 """Build and place parameter banks for generation, one bank at a time.
 
-A scanned run of like layers reads its parameters as one array with the layer
-axis in front (`dew.nn.backbones.causal_transformer.StackView` adapts it to
-the `layers_N` subtrees a checkpoint stores). This builds that banked store
-directly: each bank is read, stacked and placed on its own, and its rows are
-released before the next is read, so a stack that does not fit in device
-memory never exists per layer and banked at once.
+A scanned run of identical layers reads each parameter as one array with
+the layer axis in front; that stacked array is a bank, and one layer's
+slice of it is a row. (`dew.nn.backbones.causal_transformer.StackView`
+adapts banks to the `layers_N` subtrees a checkpoint stores.) This module
+builds the banked store directly. It reads, stacks and places each bank
+separately and releases that bank's rows before reading the next, so a
+stack that does not fit in device memory is never held as separate layers
+and as banks at the same time.
 
-`Layout.host_parameters` puts banks in pinned host memory, which the stack
-fetches a layer at a time (`run_stack`); everything else is placed as the
-trainer places a parameter. A `LayerBanks` source is a run directory
-(`CheckpointBanks`), a tree in memory (`HeldBanks`) or local HF safetensors
-(`SafetensorsBanks`). A source's `place` puts whole banks on the mesh;
-`SafetensorsBanks.stream` leaves decoder weights on disk for the prefetch
-loop to read at execution.
+`Layout.host_parameters` puts banks in pinned host memory, and the stack
+fetches them one layer at a time (`run_stack`). Everything else is placed
+the way the trainer places a parameter. A `LayerBanks` source reads from a
+run directory (`CheckpointBanks`), a tree in memory (`HeldBanks`) or local
+HF safetensors (`SafetensorsBanks`). A source's `place` puts whole banks on
+the mesh. `SafetensorsBanks.stream` leaves the decoder weights on disk
+instead, and the prefetch loop reads them during execution.
 """
 
 from __future__ import annotations
@@ -50,9 +52,10 @@ class LayerBanks(Protocol):
     """Serves a banked store's values, read one bank at a time.
 
     Paths are canonical below each collection, and a namespace selects a
-    decoder inside a wrapper. What holding one bank costs is the source's
-    own business, and is what bounds a load. A source subclasses this for
-    `place`, which builds a model's banked store from it.
+    decoder inside a wrapper model. The memory a source needs to hold one
+    bank depends on the source, and it bounds what a load costs. A source
+    subclasses this class to inherit `place`, which builds a model's banked
+    store from the source.
     """
 
     def shapes(self) -> Variables:
@@ -60,30 +63,35 @@ class LayerBanks(Protocol):
         ...
 
     def entry(self, placement: Placement) -> Variables:
-        """Read exactly the canonical leaves selected by placement."""
+        """Read the canonical leaves that `placement` selects, and only those."""
         ...
 
     def bank(self, layers: Sequence[int], placement: Placement, *,
              namespace: tuple[str, ...] = ()) -> Variables:
-        """Return one run's bank on the given shardings or Formats: layers stacked
-        on a new leading axis in order, or a single layer's own subtree.
-        Formats carry a physical layout which the source must preserve.
-        Returned collections are local to namespace."""
+        """Return the bank of one run of `layers`, on the shardings or Formats in `placement`.
+
+        The layers are stacked in order on a new leading axis; a run of one
+        layer returns that layer's own subtree. A Format carries a physical
+        layout, which the source must preserve. The returned collections are
+        local to `namespace`.
+        """
         ...
 
     def place(self, model: BankedModel, *, mesh: MeshSpec | Mesh | None = None,
               layout: Layout | None = None) -> Variables:
-        """Build the banked store `model`'s runs read from these weights.
+        """Build, from these weights, the banked store that `model`'s runs read.
 
-        Each bank's copies are waited for before the next bank is read, so a
-        load has one bank's transfers in flight, and costs the store plus what
-        this source holds. Nothing here donates or deletes a source's arrays.
+        It waits for each bank's copies to finish before reading the next
+        bank, so a load has one bank's transfers in flight and costs the store
+        plus what this source holds. It does not donate or delete any of the
+        source's arrays.
 
-        `layout.host_parameters` may name only layers of the stack, which fetches
-        a layer as it reaches it; an embedding or head brought over whole would
-        cost the device memory it was meant to save. A run whose layers the
-        patterns place differently is refused too, since a bank is one array
-        with one sharding. Both are refused before anything is read.
+        `layout.host_parameters` may name only layers of the stack, because
+        the stack fetches each layer when it reaches it. An embedding or head
+        in host memory would be copied over whole and cost the device memory
+        it was meant to save. A run whose layers the layout's patterns place
+        differently is refused as well, because a bank is one array with one
+        sharding. Both checks raise ValueError before anything is read.
         """
         sites, shapes, _device_mesh, placement, entries = _bank_plan(model, self, mesh, layout)
 
@@ -158,13 +166,13 @@ def at_namespace(subtrees: Variables, namespace: tuple[str, ...]) -> Variables:
 
 @dataclasses.dataclass(frozen=True)
 class HeldBanks(LayerBanks):
-    """Serve banks from a variables tree already held in memory.
+    """Serves banks from a variables tree already held in memory.
 
-    The tree is the one `model.init` or a loader produced, one subtree per
-    layer. Arrays are borrowed: nothing is donated or deleted, so the caller's
-    tree stays usable. A load therefore holds the source and the growing banked
-    store at once, which costs two copies of the model. Use `CheckpointBanks`
-    for weights that do not fit twice.
+    `variables` is the tree that `model.init` or a loader produced, with one
+    subtree per layer. The source borrows its arrays and never donates or
+    deletes them, so the caller's tree stays usable. A load therefore holds
+    the source and the growing banked store at once, which costs two copies
+    of the model. Use `CheckpointBanks` for weights that do not fit twice.
     """
 
     variables: Variables
@@ -187,24 +195,25 @@ class HeldBanks(LayerBanks):
 
 @dataclasses.dataclass(frozen=True)
 class CheckpointBanks(LayerBanks):
-    """Serve banks by restoring a run's published weights one bank at a time.
+    """Serves banks by restoring a run's published weights one bank at a time.
 
-    `ema` merges the averaged copy over the live weights, as
-    `Checkpoints.variables` does, so a bank holds what the
-    run publishes. `step` selects a checkpoint and is resolved to the latest
-    one when it is built, so every bank of one load comes from one
-    checkpoint.
+    With `ema`, the averaged copy is merged over the live weights, as
+    `Checkpoints.variables` does, so a bank holds what the run publishes.
+    `step` selects a checkpoint. When it is None, the source resolves it to
+    the latest checkpoint once, when the source is built, so every bank of
+    one load comes from the same checkpoint. A `directory` without a
+    checkpoint raises FileNotFoundError.
 
-    Rows are restored to device memory, where stacking them computes, and
-    the stacked bank goes where the store wants it, so a load stages one
-    bank's rows and one bank, never the model.
+    Rows are restored to device memory, where the stacking runs, and the
+    stacked bank goes wherever the store places it. So a load stages one
+    bank's rows and one bank at a time, never the whole model.
     """
 
     directory: str
     step: int | None = None
     ema: bool = False
     stored: Variables = dataclasses.field(init=False, repr=False, compare=False)
-    """What the checkpoint at `step` holds, read once, when the source is built."""
+    """The shape and dtype trees the checkpoint at `step` holds, read once when the source is built."""
 
     def __post_init__(self):
         from dew.checkpoints import Checkpoints
@@ -250,7 +259,14 @@ class CheckpointBanks(LayerBanks):
 
 @dataclasses.dataclass(frozen=True)
 class DiskBankStats:
-    """Cumulative host reads; read time includes layout conversion and can overlap compute."""
+    """Cumulative host-read statistics of a `SafetensorsBanks` source, as its `stats()` returns them.
+
+    `cache_bytes` is the size of the layers cached now. `hits` and `misses`
+    count layer reads served from the cache and from disk, and `bytes_read`
+    is the bytes read on misses. `read_seconds` is the time spent reading,
+    which includes layout conversion and can overlap compute. `wait_seconds`
+    is the time callers of `read` waited for a row.
+    """
 
     cache_bytes: int
     hits: int
@@ -261,24 +277,27 @@ class DiskBankStats:
 
 
 class SafetensorsBanks(LayerBanks):
-    """Read a local HF decoder checkpoint without materializing its layer stack.
+    """Reads a local HF decoder checkpoint without materializing its layer stack.
 
-    Translation reuses the ordinary decoder's `SourceLeaf` recipes over
-    read-only memory maps, including expert stacking, transposition and dtype
-    binding. Quantized sources are refused: their codec may dequantize the
-    entire checkpoint before translation, which would violate this bound.
+    It translates the weights with the ordinary decoder's `SourceLeaf`
+    recipes over read-only memory maps, including expert stacking,
+    transposition and the cast to `param_dtype` (by default the
+    checkpoint's dtype). Quantized checkpoints are refused, because their
+    codec may dequantize the entire checkpoint before translation, which
+    would break the memory bound below.
 
-    The cache admits complete layers in read order until `cache_bytes` is
-    full and retains them until `close`: a sequential decoder visits every
-    layer each token, so LRU would evict all of them once the model exceeds
-    the cache, while a retained prefix keeps a partial cache useful. One
-    read-ahead slot holds the next layer, even with a zero cache. Host weight
-    storage is bounded by cache bytes, two rows and one leaf's conversion
-    scratch; embeddings, heads and the KV cache stay resident outside that
-    bound, and the kernel's page cache is not counted.
+    The cache keeps complete layers in read order until `cache_bytes` is
+    full, and holds them until `close`. A sequential decoder visits every
+    layer for each token, so an LRU cache would evict every layer once the
+    model is larger than the cache; keeping a fixed prefix of layers makes a
+    partial cache useful. One read-ahead slot holds the next layer, even
+    with a zero cache, unless `read_ahead` is False. Host memory for weights
+    is bounded by `cache_bytes`, two rows and one leaf's conversion scratch.
+    Embeddings, heads and the KV cache stay resident outside that bound, and
+    the bound does not count the kernel's page cache.
 
-    Keep the source open, and its files unmodified, until all executions
-    finish; a compiled callback cannot read a closed source.
+    Keep the source open and its files unchanged until all executions
+    finish, because a compiled callback cannot read a closed source.
     """
 
     def __init__(self, directory: str | Path, *, cache_bytes: int = 0,
@@ -391,16 +410,19 @@ class SafetensorsBanks(LayerBanks):
 
     def stream(self, model: BankedModel, *, mesh: MeshSpec | Mesh | None = None,
                layout: Layout | None = None) -> Variables:
-        """Bind disk rows to the ordinary banked inference loop on one device.
+        """Return variables whose decoder layers the banked inference loop reads from disk, on one device.
 
-        Only non-decoder leaves are loaded now. Each declared run receives a
-        static handle in the runtime-only `streaming` collection, which the
-        stack's two-row prefetch carry calls at execution.
+        Only the non-decoder leaves are loaded now. Each declared run gets a
+        static `StreamedBank` handle in the runtime-only `streaming`
+        collection, and the stack's prefetch, which carries two rows, calls
+        it during execution.
 
-        Single-device inference only: a mesh above one, host placement or an
-        unscanned stack is refused before loading weights. The host callback
-        needs the CPU backend beside the accelerator (`JAX_PLATFORMS=cuda,cpu`
-        when platforms are explicit). Keep this source open until executions complete.
+        This works for single-device inference only. A mesh of more than one
+        device, host placement in `layout`, or a stack without `scan_layers`
+        raises ValueError before any weight is loaded. The host callback
+        needs the CPU backend beside the accelerator, so set
+        `JAX_PLATFORMS=cuda,cpu` if you set platforms explicitly. Keep this
+        source open until executions complete.
         """
         sites, _shapes, device_mesh, placement, entries = _bank_plan(model, self, mesh, layout)
         if device_mesh.size != 1:
@@ -441,11 +463,13 @@ class SafetensorsBanks(LayerBanks):
 
     def read(self, index: int, *, namespace: tuple[str, ...] = (),
              following: int | None = None) -> Variables:
-        """Read one row and start at most one following row before returning.
+        """Read the row of layer `index` and start reading the `following` layer before returning.
 
-        Reads serialize across executions sharing this source. Read-ahead
-        is joined before a different request, so concurrent calls cannot
-        accumulate an unbounded queue of rows.
+        The read-ahead happens only when `following` is given and the
+        source's `read_ahead` is on. Reads from executions that share this
+        source run one at a time. A pending read-ahead finishes before a
+        different request is served, so concurrent calls cannot build up an
+        unbounded queue of rows.
         """
         key = (namespace, index)
         with self._requests:
@@ -513,11 +537,13 @@ class SafetensorsBanks(LayerBanks):
 @jax.tree_util.register_static
 @dataclasses.dataclass(frozen=True, eq=False)
 class StreamedBank:
-    """A runtime-only bank handle: no parameter buffer or serialized model field.
+    """Fetches one run's layers from a `SafetensorsBanks` source during execution.
 
-    Its identity is static in the variables pytree; changing the source
-    retraces, changing tokens does not. The callback is effectful, so it is
-    neither folded at trace time nor elided when an executable is reused.
+    It is a runtime-only handle, with no parameter buffer and no serialized
+    model field. The handle is a static pytree node compared by identity, so
+    changing the source retraces and changing the tokens does not. The
+    callback has side effects, so JAX neither folds it at trace time nor
+    skips it when an executable is reused.
     """
 
     source: SafetensorsBanks
