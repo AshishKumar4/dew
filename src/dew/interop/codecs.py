@@ -442,6 +442,14 @@ def fp8_format(quantization: Mapping[str, object]) -> tuple[int, bool]:
     square block, the scales float32 (`scale_fmt` absent or 'float', V3)
     or ue8m0 (V3.2). A per-tensor or rectangular scale, or a scale format
     with no rounding rule here, is not this format.
+
+    This codec follows transformers 5.16.1's dequantize=True reader: its
+    finegrained FP8 quantizer chooses that path on CPU without a GPU/XPU,
+    leaves plain Linear modules and decodes their weights to the requested
+    dtype. Its CUDA FP8Linear kernels also quantize activations; that
+    quantized-kernel forward is outside this weight-only loader's contract.
+    compressed-tensors keeps input QDQ even after decompressing weights,
+    so its activation schemes cannot take the same weight-only path.
     """
     fmt, block, scale_fmt = (quantization.get(key)
                              for key in ('fmt', 'weight_block_size', 'scale_fmt'))
