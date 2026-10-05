@@ -175,8 +175,8 @@ def test_deepseek_v2_config_translates_field_by_field():
     that never renormalises, and two shared experts of width 16."""
     config = translate_config(fixture_config("deepseek-v2-tiny"))
 
-    assert config["mixer"]["kind"] == "mla" and config["mixer"]["q_lora_rank"] is None
-    assert config["mixer"]["yarn"]["mscale"] == 0.707
+    assert config["mixer"]["name"] == "mla" and config["mixer"]["fields"]["q_lora_rank"] is None
+    assert config["mixer"]["fields"]["yarn"]["mscale"] == 0.707
     assert config["mixture"] == {
         "experts": 8, "top_k": 4, "layers": (1,), "scaling": 2.5, "shared_features": 32,
         "expert_features": 16, "score_function": "softmax", "norm_topk_prob": False,
@@ -195,9 +195,10 @@ def test_the_real_deepseek_v2_lite_config_translates():
     assert config["mixture"]["shared_features"] == 2816
     assert config["mixture"]["groups"] == 1 and config["mixture"]["group_score"] == "max"
     assert config["mixture"]["norm_topk_prob"] is False
-    assert config["mixer"]["kv_lora_rank"] == 512 and config["mixer"]["q_lora_rank"] is None
-    assert config["mixer"]["yarn"]["factor"] == 40.0
-    assert config["mixer"]["yarn"]["mscale_all_dim"] == 0.707
+    mixer = config["mixer"]["fields"]
+    assert mixer["kv_lora_rank"] == 512 and mixer["q_lora_rank"] is None
+    assert config["mixer"]["fields"]["yarn"]["factor"] == 40.0
+    assert config["mixer"]["fields"]["yarn"]["mscale_all_dim"] == 0.707
     assert config["vocab_size"] == 102400 and config["head_dim"] == 192
 
 
@@ -237,8 +238,8 @@ def test_the_real_kimi_k2_config_translates():
     assert config["mixture"]["experts"] == 384 and config["mixture"]["top_k"] == 8
     assert config["mixture"]["scaling"] == 2.827 and config["mixture"]["bias"]
     assert config["mixture"]["groups"] == 1 and config["mixture"]["shared_features"] == 2048
-    assert config["mixer"]["q_lora_rank"] == 1536
-    assert config["mixer"]["yarn"]["factor"] == 32.0 and config["rope_theta"] == 50000.0
+    assert config["mixer"]["fields"]["q_lora_rank"] == 1536
+    assert config["mixer"]["fields"]["yarn"]["factor"] == 32.0 and config["rope_theta"] == 50000.0
 
 
 def test_the_kimi_k2_fixture_translates_the_releases_own_choices():
@@ -260,11 +261,11 @@ def test_the_kimi_k2_fixture_translates_the_releases_own_choices():
             == {name: released["mixture"][name] for name in shared}
             == {"score_function": "sigmoid", "bias": True, "groups": 1,
                 "groups_per_token": 1, "scaling": 2.827})
-    assert tiny["mixer"]["yarn"] == released["mixer"]["yarn"]
-    assert tiny["mixer"]["yarn"]["factor"] == 32.0
-    assert (tiny["mixer"]["yarn"]["beta_fast"],
-            tiny["mixer"]["yarn"]["beta_slow"]) == (1.0, 1.0)
-    assert tiny["mixer"]["yarn"]["original_max_position_embeddings"] == 4096
+    assert tiny["mixer"]["fields"]["yarn"] == released["mixer"]["fields"]["yarn"]
+    assert tiny["mixer"]["fields"]["yarn"]["factor"] == 32.0
+    assert (tiny["mixer"]["fields"]["yarn"]["beta_fast"],
+            tiny["mixer"]["fields"]["yarn"]["beta_slow"]) == (1.0, 1.0)
+    assert tiny["mixer"]["fields"]["yarn"]["original_max_position_embeddings"] == 4096
     assert tiny["rope_theta"] == released["rope_theta"] == 50000.0
     assert tiny["mixture"]["layers"] == (1,) and tiny["num_layers"] == 2
 
@@ -275,7 +276,7 @@ def test_the_kimi_k2_fixture_translates_the_releases_own_choices():
     for name in differ:
         assert tiny["mixture"][name] != v3["mixture"][name], name
     assert tiny["rope_theta"] != v3["rope_theta"]
-    assert tiny["mixer"]["yarn"]["factor"] != v3["mixer"]["yarn"]["factor"]
+    assert tiny["mixer"]["fields"]["yarn"]["factor"] != v3["mixer"]["fields"]["yarn"]["factor"]
 
 
 def test_the_kimi_k2_fixture_keeps_the_releases_mla_proportions():
@@ -287,12 +288,12 @@ def test_the_kimi_k2_fixture_keeps_the_releases_mla_proportions():
     released = translate_config(fixture_config("kimi-k2"))
 
     for config in (tiny, released):
-        mixer = config["mixer"]
-        assert mixer["kind"] == "mla"
+        assert config["mixer"]["name"] == "mla"
+        mixer = config["mixer"]["fields"]
         assert mixer["qk_nope_head_dim"] == 2 * mixer["qk_rope_head_dim"]
         assert mixer["v_head_dim"] == mixer["qk_nope_head_dim"]
         assert config["head_dim"] == mixer["qk_nope_head_dim"] + mixer["qk_rope_head_dim"]
-    assert tiny["mixer"]["q_lora_rank"] == 8 and released["mixer"]["q_lora_rank"] == 1536
+    assert tiny["mixer"]["fields"]["q_lora_rank"] == 8 and released["mixer"]["fields"]["q_lora_rank"] == 1536
 
 
 # --------------------------------------------------------------------------
@@ -321,15 +322,15 @@ def test_kimi_k25_translates_the_wrapper_into_its_text_decoder():
             == {name: released["mixture"][name] for name in shared}
             == {"score_function": "sigmoid", "bias": True, "groups": 1,
                 "groups_per_token": 1, "scaling": 2.827})
-    assert tiny["mixer"]["yarn"] == released["mixer"]["yarn"]
-    assert (tiny["mixer"]["yarn"]["factor"], tiny["mixer"]["yarn"]["beta_fast"],
-            tiny["mixer"]["yarn"]["beta_slow"]) == (64.0, 32.0, 1.0)
-    assert tiny["mixer"]["yarn"]["original_max_position_embeddings"] == 4096
+    assert tiny["mixer"]["fields"]["yarn"] == released["mixer"]["fields"]["yarn"]
+    assert (tiny["mixer"]["fields"]["yarn"]["factor"], tiny["mixer"]["fields"]["yarn"]["beta_fast"],
+            tiny["mixer"]["fields"]["yarn"]["beta_slow"]) == (64.0, 32.0, 1.0)
+    assert tiny["mixer"]["fields"]["yarn"]["original_max_position_embeddings"] == 4096
     assert tiny["rope_theta"] == released["rope_theta"] == 50000.0
     assert tiny["norm_eps"] == released["norm_eps"] == 1e-5
-    assert tiny["mixer"]["kind"] == "mla" and tiny["mixture"]["layers"] == (1,)
-    assert tiny["mixer"]["qk_nope_head_dim"] == 2 * tiny["mixer"]["qk_rope_head_dim"]
-    assert tiny["mixer"]["v_head_dim"] == tiny["mixer"]["qk_nope_head_dim"]
+    assert tiny["mixer"]["name"] == "mla" and tiny["mixture"]["layers"] == (1,)
+    assert tiny["mixer"]["fields"]["qk_nope_head_dim"] == 2 * tiny["mixer"]["fields"]["qk_rope_head_dim"]
+    assert tiny["mixer"]["fields"]["v_head_dim"] == tiny["mixer"]["fields"]["qk_nope_head_dim"]
     # The wrapper's tie_word_embeddings decides the head, not the nested
     # text config's, which describes a DeepseekV3Model with no head.
     assert tiny["tie_embeddings"] is False and released["tie_embeddings"] is False
@@ -337,7 +338,7 @@ def test_kimi_k25_translates_the_wrapper_into_its_text_decoder():
                              "tie_word_embeddings": True})["tie_embeddings"] is True
 
     # K2.5 is not K2-Instruct: the ramp and the norm epsilon moved.
-    assert k2["mixer"]["yarn"]["factor"] == 32.0 and k2["norm_eps"] == 1e-6
+    assert k2["mixer"]["fields"]["yarn"]["factor"] == 32.0 and k2["norm_eps"] == 1e-6
 
 
 def test_the_real_kimi_k25_config_translates():
@@ -355,8 +356,9 @@ def test_the_real_kimi_k25_config_translates():
     assert config["mixture"]["shared_features"] == 2048
     assert config["mixture"]["layers"] == tuple(range(1, 61))
     assert (config["num_heads"], config["num_kv_heads"]) == (64, 64)
-    assert config["mixer"]["q_lora_rank"] == 1536 and config["mixer"]["kv_lora_rank"] == 512
-    assert config["mixer"]["qk_nope_head_dim"] == 128 and config["mixer"]["qk_rope_head_dim"] == 64
+    mixer = config["mixer"]["fields"]
+    assert mixer["q_lora_rank"] == 1536 and mixer["kv_lora_rank"] == 512
+    assert mixer["qk_nope_head_dim"] == 128 and mixer["qk_rope_head_dim"] == 64
     assert config["head_dim"] == 192 and config["norm_eps"] == 1e-5
 
 
@@ -671,10 +673,10 @@ def test_glm_moe_dsa_config_translates_field_by_field():
 
     assert config["layer_types"] == ("deepseek_sparse_attention",) * 8
     assert config["mixer"] == {
-        "kind": "mla", "q_lora_rank": 12, "kv_lora_rank": 8, "qk_nope_head_dim": 12,
+        "name": "mla", "fields": {"q_lora_rank": 12, "kv_lora_rank": 8, "qk_nope_head_dim": 12,
         "qk_rope_head_dim": 4, "v_head_dim": 16, "rope_interleave": True, "yarn": None,
         "index_topk": 4, "index_n_heads": 4, "index_head_dim": 8,
-        "index_rope_interleave": True}
+        "index_rope_interleave": True}}
     assert config["kv_shared_layers"] == (3, 4, 5, 7)
     assert config["mixture"]["layers"] == (3, 4, 5, 6, 7)
     assert config["mixture"]["bias"] and config["mixture"]["shared_features"] == 12
@@ -695,7 +697,7 @@ def test_the_released_glm_5_configs_translate(name, sharing):
     assert config["num_layers"] == 78 and config["mixture"]["layers"] == tuple(range(3, 78))
     assert (config["mixture"]["experts"], config["mixture"]["top_k"]) == (256, 8)
     assert config["mixture"]["scaling"] == 2.5 and config["mixture"]["shared_features"] == 2048
-    mixer = config["mixer"]
+    mixer = config["mixer"]["fields"]
     assert (mixer["q_lora_rank"], mixer["kv_lora_rank"]) == (2048, 512)
     assert (mixer["qk_nope_head_dim"], mixer["qk_rope_head_dim"], mixer["v_head_dim"]) == (192, 64, 256)
     assert (mixer["index_topk"], mixer["index_n_heads"], mixer["index_head_dim"]) == (2048, 32, 128)
@@ -835,9 +837,9 @@ V4_YARN = {"rope_type": "yarn", "rope_theta": 160000.0, "factor": 16.0,
            "original_max_position_embeddings": 65536, "beta_fast": 32.0,
            "beta_slow": 1.0, "mscale": None, "mscale_all_dim": None,
            "truncate": True, "attention_factor": 1.0}
-V4_MIXER = {"kind": "deepseek_v4", "q_lora_rank": 8, "o_groups": 2, "o_lora_rank": 8,
+V4_MIXER = {"name": "deepseek_v4", "fields": {"q_lora_rank": 8, "o_groups": 2, "o_lora_rank": 8,
             "rope_head_dim": 4, "compressor": None, "compress_rate": None,
-            "index_topk": None, "index_n_heads": None, "index_head_dim": None}
+            "index_topk": None, "index_n_heads": None, "index_head_dim": None}}
 
 
 def test_deepseek_v4_config_translates_field_by_field():
@@ -860,11 +862,13 @@ def test_deepseek_v4_config_translates_field_by_field():
     assert config["kinds"] == {
         "heavily_compressed_attention": {
             "window": 4, "rope_theta": 160000.0, "yarn": V4_YARN,
-            "mixer": {**V4_MIXER, "compressor": "hca", "compress_rate": 4}},
+            "mixer": {"name": "deepseek_v4", "fields": {**V4_MIXER["fields"], "compressor": "hca",
+                                                        "compress_rate": 4}}},
         "compressed_sparse_attention": {
             "window": 4, "rope_theta": 160000.0, "yarn": V4_YARN,
-            "mixer": {**V4_MIXER, "compressor": "csa", "compress_rate": 2,
-                      "index_topk": 2, "index_n_heads": 2, "index_head_dim": 8}},
+            "mixer": {"name": "deepseek_v4", "fields": {**V4_MIXER["fields"], "compressor": "csa",
+                                                        "compress_rate": 2, "index_topk": 2,
+                                                        "index_n_heads": 2, "index_head_dim": 8}}},
         "sliding_attention": {"window": 4},
         "mtp_attention": {"window": 4, "rope_theta": 10000.0, "mixer": V4_MIXER}}
     assert config["mixture"] == {
@@ -896,11 +900,11 @@ def test_the_released_deepseek_v4_flash_config_translates():
         "compressed_sparse_attention", "heavily_compressed_attention")
     assert config["layer_types"][-1] == "compressed_sparse_attention"
     assert (config["num_heads"], config["head_dim"], config["num_kv_heads"]) == (64, 512, 1)
-    mixer = config["mixer"]
+    mixer = config["mixer"]["fields"]
     assert (mixer["q_lora_rank"], mixer["o_groups"], mixer["o_lora_rank"]) == (1024, 8, 1024)
     assert mixer["rope_head_dim"] == 64 and mixer["compressor"] is None
-    sparse = config["kinds"]["compressed_sparse_attention"]["mixer"]
-    heavy = config["kinds"]["heavily_compressed_attention"]["mixer"]
+    sparse = config["kinds"]["compressed_sparse_attention"]["mixer"]["fields"]
+    heavy = config["kinds"]["heavily_compressed_attention"]["mixer"]["fields"]
     assert (sparse["compress_rate"], heavy["compress_rate"]) == (4, 128)
     assert (sparse["index_topk"], sparse["index_n_heads"], sparse["index_head_dim"]) == (512, 64, 128)
     assert heavy["index_topk"] is None
@@ -1267,11 +1271,10 @@ def test_llama4_config_translates_field_by_field():
     config = translate_config(fixture_config("llama4-tiny"))
 
     assert config["layer_types"] == ("chunked_attention",) * 3 + ("full_attention",)
-    rule = {"kind": "llama4", "use_qk_norm": True, "attn_temperature_tuning": True,
-            "floor_scale": 4.0, "attn_scale": 0.1}
+    rule = {"use_qk_norm": True, "attn_temperature_tuning": True, "floor_scale": 4.0, "attn_scale": 0.1}
     assert config["kinds"] == {
-        "full_attention": {"mixer": {**rule, "use_rope": False}},
-        "chunked_attention": {"chunk": 4, "mixer": {**rule, "use_rope": True}}}
+        "full_attention": {"mixer": {"name": "llama4", "fields": {**rule, "use_rope": False}}},
+        "chunked_attention": {"chunk": 4, "mixer": {"name": "llama4", "fields": {**rule, "use_rope": True}}}}
     assert config["mixture"] == {
         "experts": 4, "top_k": 2, "score_function": "sigmoid", "norm_topk_prob": False,
         "scale_inputs": True, "expert_features": 48, "shared_features": 48, "layers": (1, 3)}
@@ -1298,7 +1301,7 @@ def test_the_real_llama_4_scout_text_config_translates():
         "layers": tuple(range(48))}
     assert config["mlp_features"] == 16384 and config["vocab_size"] == 202048
     local = config["kinds"]["chunked_attention"]
-    assert local["chunk"] == 8192 and local["mixer"]["floor_scale"] == 8192.0
+    assert local["chunk"] == 8192 and local["mixer"]["fields"]["floor_scale"] == 8192.0
     assert config["rope_theta"] == 500000.0
     assert config["rope_scaling"] == {
         "rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0,

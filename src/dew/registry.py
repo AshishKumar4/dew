@@ -38,7 +38,7 @@ import re
 import sys
 import types
 import typing
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequence
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol, TypedDict, TypeVar, Union, overload
@@ -146,9 +146,8 @@ class Registry[T: Callable[..., Any], Built](Mapping[str, T]):
     plugin shares a kind of its own the same way.
     """
 
-    def __init__(self, kind: str, *, record: Literal["name", "kind"] = "name"):
+    def __init__(self, kind: str):
         self.kind = kind
-        self.record = record
         # A decorator has no base class to test the member against, and it
         # hands back the class it decorated so a caller's checker keeps the
         # concrete type (`DiffusionObjective`, not `Objective`). The table is
@@ -207,7 +206,7 @@ class Registry[T: Callable[..., Any], Built](Mapping[str, T]):
 
     def share(self) -> Registry[T, Built]:
         """Make this table one a record names members of, and return it, as
-        `activations = Registry("activation", record="kind").share()`.
+        `activations = Registry("activation").share()`.
 
         A record then rebuilds a member of it wherever a field declares the
         member's base class, and writes it back by name. Share a plugin's
@@ -252,43 +251,34 @@ class Registry[T: Callable[..., Any], Built](Mapping[str, T]):
         that would have to know the member's fields to write it.
         """
         member = self[name]
-        return member(**self._declared_fields(name, member, {**record, **fields}))
+        given: Mapping[str, object] = {**record, **fields}
+        held = _record_class(member)
+        if held is not None:
+            given = _declared(held, given, dtypes=True)
+        return member(**given)
 
     def from_record(self, record: Mapping[str, object]) -> Built:
-        """Construct the member a `{"kind": ..., **fields}` record names.
+        """Construct the member a `{"name": ..., "fields": {...}}` record names.
 
         A config writes a mixer, a tower or a projector this way where code
         passes the value `build` makes, so the two meet here. A record that
-        names no registered kind raises ValueError, with the known ones.
+        names no registered member raises, with the known ones.
         """
-        fields = dict(record)
-        kind = fields.pop("kind", None)
-        if not isinstance(kind, str) or kind not in self:
-            raise ValueError(
-                f"a {self.kind} record names its kind, one of "
-                f"{', '.join(sorted(self._members))}; got {kind!r}")
-        return self.build(kind, fields)
-
-    def _declared_fields(self, name: str, member: Callable[..., Built],
-                         fields: Mapping[str, object]) -> Mapping[str, object]:
-        """Return `fields` as the member declares them, or raise naming what it
-        has no field for. A member that is not a dataclass takes them as given."""
-        if not (isinstance(member, type) and dataclasses.is_dataclass(member)):
-            return fields
-        declared = {f.name for f in dataclasses.fields(member) if f.init}
-        unknown = sorted(set(fields) - declared)
-        if unknown:
-            raise ValueError(
-                f"{self.kind} {name!r} ({member.__name__}) has no field for "
-                f"{unknown}; its fields are {sorted(declared)}")
-        return {key: resolve_dtype(value) if key == "dtype"
-                else _rebuilt(_declared_type(member, key), value)
-                for key, value in fields.items()}
+        name, fields = _named(self, record)
+        return self.build(name, fields)
 
     @property
     def union(self) -> type[Built] | types.UnionType:
         """Return `Union[...]` of the members, for a tyro subcommand over the table."""
         return functools.reduce(operator.or_, self._members.values())
+
+
+class Record(TypedDict):
+    """A registered member as a record writes it: the name its table holds it
+    under and its constructor fields, `{"name": "mla", "fields": {...}}`."""
+
+    name: str
+    fields: Mapping[str, object]
 
 
 class Named(Protocol):
@@ -319,13 +309,6 @@ def _declared_type(member: type, field: str) -> Annotation:
             # Only this field's unavailable dependency leaves its value opaque.
             break
     return None
-
-
-def _value_type(annotation: Annotation) -> type | None:
-    """Return a dataclass type behind an Optional, but not a multi-member union."""
-    annotation = _unwrapped(annotation)
-    return (annotation if isinstance(annotation, type) and dataclasses.is_dataclass(annotation)
-            else None)
 
 
 def resolve_alias(annotation: Annotation) -> Annotation:
@@ -371,85 +354,166 @@ def wants_tuple(annotation: Annotation) -> bool:
             or typing.get_origin(annotation) in (tuple, Sequence))
 
 
-def from_record[ValueT](annotation: type[ValueT], value: Configured) -> ValueT:
+def from_record[ValueT](annotation: type[ValueT], value: Configured, *, dtypes: bool = True) -> ValueT:
     """Return `value` as the class `annotation` names, from a record or already one.
 
     The class is the witness: what comes back is an instance of it or a
     `ValueError` naming what the record built instead, so a caller reads a
     value of the type it asked for rather than one it has to narrow again.
-    `_rebuilt` is the same walk over an annotation that is not a class -- a
-    union, a generic, an alias -- which only this module's own recursion has.
+    `dtypes` is the one policy the two readers differ in: a module field
+    takes a `dtype` as the dtype its name says (True), and a run record
+    keeps the name it wrote (`RunConfig.from_dict`, False).
     """
-    built = _rebuilt(annotation, value)
+    built = _rebuilt(annotation, value, dtypes=dtypes)
     if not isinstance(built, annotation):
         raise ValueError(f"{value!r} builds {type(built).__name__}, "
                          f"not the {annotation.__name__} the field declares")
     return built
 
 
-def _rebuilt(annotation: Annotation, value: object) -> Configured:
+_MAPPINGS = (dict, Mapping, MutableMapping)
+
+
+def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str = "") -> Configured:
     """Return `value` as its annotation asks for it: a record becomes the value it
     describes, and anything already built is left alone.
 
-    Containers are walked, so a mapping of records and a tuple of records
-    build their values too, and a model config is a dict from the command
-    line all the way to the module.
-
-    `dew.config._rebuild` is the sibling walk over a run record. It reads a
-    registered member out of its `kind`/`name` record and honours the
-    `record: False` field metadata, neither of which a module field has; this
-    one resolves a `dtype` entry and walks a record with no value class.
+    This is the one walk from a record to a value, for a module field and a
+    run record alike. A registered member is the record that names it,
+    `{"name": ..., "fields": {...}}` (`dew.config._to_json` writes it), where
+    the field declares the table's members or a class the member derives
+    from; a dataclass is the record of its fields. Containers are walked, so
+    a mapping of records and a tuple of records build their values too, a
+    JSON list becomes the tuple a field declares, and a mapping's key
+    becomes the tuple path its key type declares. `dtypes` is as
+    `from_record` reads it, for a field or entry `name`d `dtype`.
     """
+    if dtypes and name == "dtype":
+        return resolve_dtype(value)
     annotation = resolve_alias(annotation)
-    if typing.get_origin(annotation) in (Union, types.UnionType) and _unwrapped(annotation) is None:
-        return configured(value)
+    # A union of a table's members takes a record naming one of them; a field
+    # typed with one class takes its own fields or a member's record below.
+    table = _table_of(annotation) if typing.get_args(annotation) else None
+    if table is not None:
+        if isinstance(value, tuple(member for member in table.values() if isinstance(member, type))):
+            return configured(value)
+        name, fields = _named(table, value)
+        member = _record_class(table[name])
+        if member is None:
+            raise ValueError(f"the {table.kind} {name!r} is not a class, and a record names "
+                             "the fields of one")
+        return _construct(member, fields, dtypes=dtypes)
+    if typing.get_origin(annotation) in (Union, types.UnionType):
+        if value is None:
+            return value
+        inner = [member for member in typing.get_args(annotation) if member is not type(None)]
+        if len(inner) == 1:
+            return _rebuilt(inner[0], value, dtypes=dtypes)
+        # A union of a table's members (a schedule or None) rebuilds through
+        # the table; any other union holds the value as it is.
+        members = functools.reduce(operator.or_, inner)
+        return (_rebuilt(members, value, dtypes=dtypes) if _table_of(members) is not None
+                else configured(value))
     if isinstance(value, Mapping):
-        held = _value_type(annotation)
-        named = _unwrapped(annotation)
-        if isinstance(named, type):
-            member, fields = _nested_member(named, value)
-            if fields is not value:
-                held, value = member, fields
-        if held is None:
-            # A record with no value class behind it, such as one of the unets'
-            # per-stage attention settings: entries are walked and a "dtype"
-            # entry resolves the same way as a dtype field.
-            entries = entry_types(annotation, len(value))
-            return {key: resolve_dtype(record) if key == "dtype" else _rebuilt(entry, record)
-                    for entry, (key, record) in zip(entries, value.items(), strict=True)}
-        declared = sorted(f.name for f in dataclasses.fields(held) if f.init)
-        unknown = sorted(set(value) - set(declared))
-        if unknown:
-            raise ValueError(f"{held.__name__} has no field for {unknown}; its "
-                             f"fields are {declared}")
-        return held(**{key: resolve_dtype(record) if key == "dtype"
-                       else _rebuilt(_declared_type(held, key), record)
-                       for key, record in value.items()})
+        if isinstance(annotation, type) and annotation is not object:
+            # A field typed with a base class takes a record of any shared
+            # member derived from it, or of the class itself; `object`
+            # declares nothing, and its record stays the record it is.
+            member, fields = _nested(annotation, value)
+            held = _record_class(member)
+            if held is not None:
+                return _construct(held, fields, dtypes=dtypes)
+        if typing.get_origin(annotation) in _MAPPINGS:
+            keys, entries = typing.get_args(annotation)
+            return {_key(keys, str(name)): _rebuilt(entries, entry, dtypes=dtypes, name=str(name))
+                    for name, entry in value.items()}
+        # A record with no value class behind it, such as one of the unets'
+        # per-stage attention settings: entries are walked.
+        return {name: _rebuilt(entry, record, dtypes=dtypes, name=str(name))
+                for entry, (name, record) in zip(entry_types(annotation, len(value)), value.items(),
+                                                 strict=True)}
     if isinstance(value, (list, tuple)):
-        entries = entry_types(annotation, len(value))
-        rebuilt = [_rebuilt(entry, record)
-                   for entry, record in zip(entries, value, strict=True)]
+        rebuilt = [_rebuilt(entry, record, dtypes=dtypes)
+                   for entry, record in zip(entry_types(annotation, len(value)), value, strict=True)]
         return tuple(rebuilt) if wants_tuple(annotation) else type(value)(rebuilt)
     return configured(value)
 
 
-def _nested_member(held: type, value: Mapping[str, object]) -> tuple[type, Mapping[str, object]]:
-    """The class and fields a field's record names. A registered part of a
-    composite model is recorded as its registry writes it, `{"name": ...,
-    "fields": {...}}` or `{"kind": ..., **fields}` (`dew.config._to_json`), so
-    that record builds the member it names when that member is the field's
-    class or a subclass; any other record is the field class's own fields."""
+def _key(annotation: Annotation, key: str) -> str | tuple[str, ...]:
+    """One record key as the mapping declares it: a name, or the tuple path
+    `dew.config._key` joined with `/`."""
+    return tuple(key.split("/")) if wants_tuple(annotation) else key
+
+
+def _record_class(member: Callable[..., Configured]) -> type | None:
+    """`member` when it is a dataclass, whose fields a record names; None for
+    a function or a plain class, which declares no fields to narrow."""
+    return member if isinstance(member, type) and dataclasses.is_dataclass(member) else None
+
+
+def _construct(member: type, fields: Mapping[str, object], *, dtypes: bool) -> Configured:
+    """Build the dataclass `member` from a record of its fields."""
+    return configured(member(**_declared(member, fields, dtypes=dtypes)))
+
+
+def _declared(member: type, fields: Mapping[str, object], *, dtypes: bool) -> dict[str, Configured]:
+    """The record's fields as `member` declares them, each walked against its
+    own annotation. A field the record lacks takes its declared default; a
+    field `member` does not declare, or a required one the record lacks,
+    raises. A field marked `metadata={"record": False}` is a binding the
+    value picks up at runtime, not something a record carries."""
+    declared = [f for f in dataclasses.fields(member) if _recorded(f)]
+    names = sorted(f.name for f in declared)
+    unknown = sorted(set(fields) - set(names))
+    missing = [f.name for f in declared if f.name not in fields
+               and f.default is dataclasses.MISSING and f.default_factory is dataclasses.MISSING]
+    if unknown or missing:
+        raise ValueError(f"{member.__name__} does not match the record: unknown fields {unknown}, "
+                         f"missing fields {missing}; its fields are {names}")
+    return {name: _rebuilt(_declared_type(member, name), configured(value), dtypes=dtypes, name=name)
+            for name, value in fields.items()}
+
+
+def _recorded(field: dataclasses.Field) -> bool:
+    """Return whether a field is part of a record: one the constructor takes,
+    not marked `metadata={"record": False}`."""
+    return field.init and field.metadata.get("record", True)
+
+
+def _table_of(annotation: Annotation) -> Registry | None:
+    """The shared table whose members the annotation names, all of them, or None."""
+    members = typing.get_args(annotation) or (annotation,)
     for table in Registry.shared():
-        if table.record == "name":
-            named, fields = value.get("name"), value.get("fields")
-            if set(value) != {"name", "fields"} or not isinstance(fields, Mapping):
-                continue
-        else:
-            named, fields = value.get("kind"), {key: field for key, field in value.items() if key != "kind"}
-        member = table.get(named) if isinstance(named, str) else None
-        if isinstance(member, type) and issubclass(member, held):
-            return member, fields
-    return held, value
+        if all(any(member is held for held in table.values()) for member in members):
+            return table
+    return None
+
+
+def _named(table: Registry, record: object) -> tuple[str, Mapping[str, object]]:
+    """The name and fields of a `{"name": ..., "fields": {...}}` record of `table`."""
+    if (not isinstance(record, Mapping) or set(record) != {"name", "fields"}
+            or not isinstance(record["name"], str) or not isinstance(record["fields"], Mapping)):
+        raise ValueError(f"a {table.kind} is the record that names it, {{'name': ..., 'fields': {{...}}}}, "
+                         f"not {record!r}")
+    try:
+        table[record["name"]]
+    except KeyError as error:
+        # A record naming nothing registered is a bad config, not a lookup.
+        raise ValueError(error.args[0]) from error
+    return record["name"], record["fields"]
+
+
+def _nested(held: type, record: Mapping[str, object]) -> tuple[type, Mapping[str, object]]:
+    """The class and fields a record builds for a field typed `held`: the
+    shared member a name/fields record names, where that member is `held`
+    or derives from it, or else `held` and the record as its own fields."""
+    if set(record) == {"name", "fields"} and isinstance(record["name"], str) and isinstance(
+            record["fields"], Mapping):
+        for table in Registry.shared():
+            member = table.get(record["name"])
+            if isinstance(member, type) and issubclass(member, held):
+                return member, record["fields"]
+    return held, record
 
 
 def configured(value: object) -> Configured:
@@ -654,8 +718,8 @@ def _with_part_dtype(value: Configured, dtype: str) -> Configured:
     return value
 
 
-# Core records nest their fields under a name; model component records inline
-# their fields beside the kind discriminator `Registry.from_record` reads.
+# Every table's record is `{"name": ..., "fields": {...}}`, which
+# `Registry.from_record` and the run record's walk read alike.
 models: Registry[type[nn.Module], nn.Module] = Registry("model").share()
 presets: Registry[type[Preset], Preset] = Registry("preset").share()
 solvers: Registry[type[Solver[Any]], Solver[Any]] = Registry("solver").share()
@@ -663,10 +727,10 @@ datasets: Registry[type[DatasetSpec], DatasetSpec] = Registry("dataset").share()
 encoders: Registry[type[ConditionEncoder[Any]], ConditionEncoder[Any]] = Registry("encoder").share()
 metrics: Registry[Callable[..., Metric], Metric] = Registry("metric").share()
 objectives: Registry[type[Objective], Objective] = Registry("objective").share()
-mixers: Registry[type[MixerBase], MixerBase] = Registry("mixer", record="kind").share()
-towers: Registry[type[TowerBase], TowerBase] = Registry("tower", record="kind").share()
-projectors: Registry[type[ProjectorBase], ProjectorBase] = Registry("projector", record="kind").share()
-schedules: Registry[type[ScheduleBase], ScheduleBase] = Registry("schedule", record="kind").share()
+mixers: Registry[type[MixerBase], MixerBase] = Registry("mixer").share()
+towers: Registry[type[TowerBase], TowerBase] = Registry("tower").share()
+projectors: Registry[type[ProjectorBase], ProjectorBase] = Registry("projector").share()
+schedules: Registry[type[ScheduleBase], ScheduleBase] = Registry("schedule").share()
 
 __all__ = [
     "PLUGINS",

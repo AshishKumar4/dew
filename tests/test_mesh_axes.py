@@ -147,8 +147,8 @@ def test_tensor_parallelism_computes_latent_attentions_down_projections_once():
     model = models.build(
         "causal_transformer", vocab_size=VOCAB, emb_features=64, num_layers=1, num_heads=4,
         mlp_features=64, max_seq_len=SEQ_LEN,
-        mixer={"kind": "mla", "q_lora_rank": 48, "kv_lora_rank": 32, "qk_nope_head_dim": 16,
-               "qk_rope_head_dim": 8, "v_head_dim": 16})
+        mixer={"name": "mla", "fields": {"q_lora_rank": 48, "kv_lora_rank": 32, "qk_nope_head_dim": 16,
+               "qk_rope_head_dim": 8, "v_head_dim": 16}})
 
     def flops(mesh: MeshSpec, devices) -> float:
         trainer = Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0),
