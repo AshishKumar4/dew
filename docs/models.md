@@ -1,6 +1,6 @@
 # Supported models
 
-The site builds these tables from Dew's source registries. `Pretrained.load(source)` reads a Hugging Face directory or Hub repository with a `config.json` whose `model_type` is listed below. `dew.pipeline(source)` loads it as a generation task. `Pretrained.save` writes trained weights back in the source's own layout, so the directory loads again in Transformers.
+The site builds these tables from Dew's source registries. `Pretrained.load(source)` reads a Hugging Face directory or Hub repository with a `config.json` whose `model_type` is listed below. `dew.pipeline(source)` loads it as a generation task. `Pretrained.save` writes trained weights back in the source's own layout. Transformers loads the exported directory for the registered causal decoder families; a text-only DiffusionGemma export is refused before anything is written.
 
 A port is supported when a test loads the same weights into Dew and the reference implementation, then compares float32 outputs. Most families use a small fixture with the release's configuration and tensor shapes. The "Checked with" column notes comparisons against full-size released checkpoints. Most families have no full-size runs, so their full-size memory use and throughput are unmeasured.
 

@@ -119,12 +119,12 @@ If you pass `compilation_cache_dir`, Dew uses that path as given. Do not share a
 
 ## Preparing TFDS data
 
-Training reads prepared TFDS ArrayRecords without importing TensorFlow. To prepare a dataset, you need TensorFlow and sometimes dataset-specific packages. Oxford Flowers, for example, reads its label files with SciPy. TensorFlow 2.21.0 has no Python 3.14 wheels, so prepare the data in a separate Python 3.13 environment:
+Training reads prepared TFDS ArrayRecords without importing TensorFlow. To prepare a dataset, you need TensorFlow and sometimes dataset-specific packages. Oxford Flowers, for example, reads its label files with SciPy. TFDS 4.9.10 imports `importlib_resources` while it prepares a dataset but only declares it for Python before 3.9, so the command installs it too. TensorFlow 2.21.0 has no Python 3.14 wheels, so prepare the data in a separate Python 3.13 environment:
 
 ```bash
 uv venv --python 3.13 .venv-tfds-prepare
 uv pip install --python .venv-tfds-prepare/bin/python \
-    tensorflow-datasets==4.9.10 tensorflow==2.21.0 scipy
+    tensorflow-datasets==4.9.10 tensorflow==2.21.0 scipy importlib_resources
 export TFDS_DATA_DIR="$HOME/tensorflow_datasets"
 .venv-tfds-prepare/bin/python - <<'PY'
 import shlex
