@@ -7,12 +7,13 @@ training layer, with no modality, encoder or tracker backend. Importing
 decoders and datasets load what they need when they are built.
 
 `import dew` does set two XLA flags before the backend opens.
-`--xla_allow_excess_precision=false` rounds values declared in a narrow
-dtype such as bf16 where the program rounds them. Where JAX's CUDA plugin
-is installed, `--xla_gpu_enable_allocator_spatial_partitioning=false` keeps
-a preallocated GPU pool in one piece for a step's temporaries. If you set
-either flag yourself in XLA_FLAGS, your value is kept. If the JAX backend has
-already opened, the flags cannot take effect, and Dew logs a warning.
+`--xla_allow_excess_precision=false` makes XLA round values declared in a
+narrow dtype such as bf16 where the program rounds them. When JAX's CUDA
+plugin is installed, `--xla_gpu_enable_allocator_spatial_partitioning=false`
+keeps a preallocated GPU pool in one piece for a step's temporaries. If you
+set either flag yourself in XLA_FLAGS, your value is kept. If the JAX
+backend has already opened, the flags cannot take effect, and Dew logs a
+warning.
 """
 
 from collections.abc import Callable
