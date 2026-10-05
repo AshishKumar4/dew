@@ -77,6 +77,8 @@ Checkpoints in a published layout load through `dew.interop.Pretrained.load`, in
 
 Stable Diffusion 1.x, SDXL and FLUX.1 files are checked against diffusers' own `from_single_file`. The released SD 1.5 file and tiny SD 1.x, SDXL and Flux files convert to the same tensors as in diffusers, and the released SDXL base, FLUX.1-dev and FLUX.1-schnell files convert to the names and shapes that diffusers' models have.
 
+A pipeline packed into one DDUF file loads with `Pretrained.load(repo_or_dir, dduf_file="name.dduf")`. huggingface_hub's own reader checks the archive and maps its entries, which are unpacked once into Dew's cache. The pipeline then loads as the directory the file packs, the same way diffusers' `from_pretrained(..., dduf_file=)` reads it. An entry whose name points outside that directory is refused. `tests/test_dduf.py` checks a packed Flux pipeline against diffusers' own DDUF load.
+
 This exports the decoder from the example in the Hugging Face layout and loads it back:
 
 ```python
