@@ -93,6 +93,47 @@ def test_a_run_fine_tunes_a_published_pipeline_and_rebinds_it_without_weights(
     assert value(rebuilt, state.variables, batch) == trained
 
 
+@pytest.mark.parametrize("family", ["sd3", "flux", "qwen_image"])
+def test_a_run_config_builds_the_objective_the_python_api_builds(family, pipelines):
+    """The wiring half of a configured run: `DiffusionRunConfig` over a
+    published pipeline builds what `Pretrained.load(...).diffusion_objective`
+    builds with the same settings at the data's resolution
+    (`load_diffusion_source(size=)`): the same model, process (its
+    resolution shift too), tokenized ids and autoencoder kind over the
+    same initial variables, so both score a batch alike, through the VAE
+    and the text towers. The loss the two share is held to Diffusers'
+    train_dreambooth_flux.py statements on matched draws in
+    tests/test_flow_matching.py (ad63cc6a)."""
+    from dew.interop.pretrained import load_diffusion_source
+
+    directory = pipelines / family / "pipeline"
+    size = 16 if family != "qwen_image" else 32
+    settings = {"guidance": None, "unconditional_prob": 0.25, "ema_decay": None}
+    configured = DiffusionRunConfig(pretrained=str(directory), preset=None, model=precision(),
+                                    data=TFDSImages(image_size=size), solver=Euler(), sampling_steps=2,
+                                    val_metrics=(), **settings).build()
+    source = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla", size=(size, size))
+    written = source.diffusion_objective(solver=Euler(), steps=2, **settings)
+    assert configured.model == written.model
+    assert configured.process.to_json() == written.process.to_json()
+    assert type(configured.autoencoder) is type(written.autoencoder)
+    assert configured.inputs.sample == written.inputs.sample
+    assert configured.inputs.conditions.keys() == written.inputs.conditions.keys()
+    # Tokenizers are host objects without equality; they agree by the ids
+    # they write, and the towers by what the loss below reads from them.
+    for ours, theirs in zip(jax.tree.leaves(configured.inputs.tokenize(PROMPTS)),
+                            jax.tree.leaves(written.inputs.tokenize(PROMPTS)), strict=True):
+        np.testing.assert_array_equal(ours, theirs)
+    states = [Trainer(objective, optax.sgd(1e-2), key=jax.random.PRNGKey(3)).initial_state()
+              for objective in (configured, written)]
+    leaves = [jax.tree.leaves(state.variables) for state in states]
+    assert len(leaves[0]) == len(leaves[1])
+    for ours, theirs in zip(*leaves, strict=True):
+        np.testing.assert_array_equal(ours, theirs)
+    batch = batch_for(configured, size)
+    assert value(configured, states[0].variables, batch) == value(written, states[1].variables, batch)
+
+
 def test_a_pretrained_run_refuses_a_preset_of_another_kind(pipelines):
     """Flux was trained as a velocity flow; the default EDM preset is not
     that convention, and a flow preset is."""
