@@ -44,24 +44,29 @@ def pipeline(
     step: int | str | None = None,
     revision: str | None = None,
 ) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration | SavedTask:
-    """Load the inference task for `source`, its weights placed once.
+    """Load the inference task for `source`, with its weights placed once.
 
-    `source` is a run directory, or a source checkpoint directory or Hub
+    `source` is a run directory, a source checkpoint directory or a Hub
     repository. A run loads as the task its recorded objective declares
-    (`Objective.saved_task`), a plugin objective's own included. `mesh`
-    places the weights on that mesh under `layout` (the trainer's default
-    when None). Without `mesh`, data parallelism uses the
-    current pool's devices. dtype selects computation, a dtype (`jnp.bfloat16`)
-    or its name. param_dtype selects parameter storage: None preserves a
-    run's stored dtypes and uses FP32 masters for a source, and 'auto' stores
-    the stored dtypes either way (a source's config dtype or first floating
-    tensor, as transformers' dtype='auto' reads it). ema reads a run's
-    averaged weights: None when the run kept them and its live weights
-    otherwise, True always; step selects its checkpoint and revision pins a
-    Hub source.
+    (`Objective.saved_task`), including a plugin objective's own task.
+    `mesh` places the weights on that mesh under `layout`, or under the
+    trainer's default layout when `layout` is None. Without `mesh`, data
+    parallelism uses the current pool's devices.
 
-    Loading a task also points XLA at the on-disk executable cache, so a
-    restarted process reuses what it already compiled.
+    `dtype` sets the computation dtype, given as a dtype (`jnp.bfloat16`) or
+    its name. `param_dtype` sets parameter storage. None keeps a run's
+    stored dtypes and uses FP32 masters for a source, and `'auto'` keeps the
+    stored dtypes either way; for a source, that is its config dtype or its
+    first floating tensor, as Transformers' `dtype='auto'` reads it. `ema`
+    selects a run's averaged weights: None reads them when the run kept them
+    and its live weights otherwise, and True always reads them. `step`
+    selects a run's checkpoint and `revision` pins a Hub source; passing
+    `revision` for a run directory or `step` for a source raises
+    `ValueError`.
+
+    Loading a task also points XLA at the on-disk executable cache, unless a
+    cache directory is already set, so a restarted process reuses what it
+    already compiled.
     """
     _persist_compilations()
     dtype = dtype_name(dtype)
@@ -188,9 +193,11 @@ class RunTokenizer(Protocol):
 
 @dataclass(frozen=True)
 class RunProcessor:
-    """Adapts a run's tokenizer to a task's host processor.
+    """Adapts a run's tokenizer to the `Processor` interface a task uses.
 
-    Left-padded prompt rows go in and one string per row comes out.
+    Calling it encodes each text prompt and left-pads the rows into
+    `ModelInputs`; a text run takes no images or audio. `decode` returns one
+    string per token row.
     """
 
     tokenizer: RunTokenizer
