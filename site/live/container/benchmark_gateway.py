@@ -22,6 +22,21 @@ def dump_processes():
         except OSError:
             pass
 
+def execute(client, code):
+    message = client.execute(code, allow_stdin=False)
+    stdout = ""
+    while True:
+        result = client.get_iopub_msg(timeout=30)
+        if result["parent_header"].get("msg_id") != message:
+            continue
+        if result["msg_type"] == "stream":
+            stdout += result["content"]["text"]
+        if result["msg_type"] == "error":
+            raise RuntimeError(str(result["content"]))
+        if result["msg_type"] == "status" and result["content"]["execution_state"] == "idle":
+            return stdout
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("count", type=int, choices=(1, 10, 50))
@@ -64,35 +79,29 @@ def main():
                 dump_processes()
                 raise
             kernels[-1]=(model["id"],client,time.perf_counter()-start)
+            execute(client, f"from pathlib import Path\n"
+                    f"assert '__measurement' not in globals()\n"
+                    f"assert not Path('/work/context').exists()\n"
+                    f"__measurement = {model['id']!r}\n"
+                    f"Path('/work/context').write_text(__measurement)")
         submitted = time.perf_counter()
 
         def run(kernel, indices):
-            _, client, _ = kernel
+            identifier, client, _ = kernel
             rows = []
             for index in indices:
                 started = time.perf_counter()
-                msg = client.execute(
+                stdout = execute(client,
+                    f"assert __measurement == {identifier!r}\n"
+                    f"assert Path('/work/context').read_text() == {identifier!r}\n"
                     "import json, os\nfrom pathlib import Path\n"
                     "pss = next(line for line in Path('/proc/self/smaps_rollup').read_text().splitlines() "
                     "if line.startswith('Pss:'))\n"
                     "print(json.dumps({'uid': os.getuid(), 'fds': len(os.listdir('/proc/self/fd')), "
-                    "'pss_bytes': int(pss.split()[1]) * 1024}))",
-                    allow_stdin=False,
-                )
-                stdout = ""
-                while True:
-                    result = client.get_iopub_msg(timeout=30)
-                    if result["parent_header"].get("msg_id") != msg:
-                        continue
-                    if result["msg_type"] == "stream":
-                        stdout += result["content"]["text"]
-                    if result["msg_type"] == "error":
-                        raise RuntimeError(str(result["content"]))
-                    if result["msg_type"] == "status" and result["content"]["execution_state"] == "idle":
-                        break
+                    "'pss_bytes': int(pss.split()[1]) * 1024}))")
                 usage = json.loads(stdout)
                 assert usage['uid'] >= 6100
-                rows.append({"visitor": index, "execute_seconds": time.perf_counter() - started,
+                rows.append({"request": index, "execute_seconds": time.perf_counter() - started,
                              "arrival_to_result_seconds": time.perf_counter() - submitted,
                              "uid": usage["uid"], "fds": usage["fds"],
                              "pss_bytes": usage["pss_bytes"]})
@@ -102,8 +111,9 @@ def main():
             futures = [pool.submit(run, kernel, range(index, args.count, len(kernels)))
                        for index, kernel in enumerate(kernels)]
             rows = [row for future in futures for row in future.result()]
+        assert len({row["uid"] for row in rows}) == len(kernels)
         memory = {row["uid"]: row["pss_bytes"] for row in rows}
-        print(json.dumps({"requests": args.count, "contexts": len(kernels),
+        print(json.dumps({"requests": args.count, "contexts": len(kernels), "state_isolation": True,
                           "startup_seconds": [kernel[2] for kernel in kernels], "kernel_pss_bytes": memory,
                           "kernel_fd_counts": {row["uid"]: row["fds"] for row in rows},
                           "median_execute_seconds": statistics.median(row["execute_seconds"] for row in rows),
