@@ -735,7 +735,7 @@ def _softmax_top_k(hf_config: Mapping[str, object], used: set[str]) -> int:
 
 
 def translate_config(hf_config: Mapping[str, object]) -> DecoderFields:
-    """Translate one registered family, refusing computation with no counterpart."""
+    """Translate one registered family's config, refusing any setting Dew does not compute."""
 
     model_type = hf_config.get('model_type')
     # A multimodal repo's config.json is a wrapper whose model_type names the
@@ -1547,29 +1547,30 @@ def translate_weights(
     param_dtype: str = "float32",
     lazy: bool = False,
 ) -> Variables:
-    """Map HF tensors into a CausalTransformer tree. Parameters default to FP32.
+    """Map HF tensors into a CausalTransformer tree, with parameters in FP32 by default.
 
-    Each tensor goes through its family's `prepare_weights` and `weight_path`;
-    a 2-D kernel is transposed from torch's [out, in] to Dense's [in, out],
-    and per-expert tensors stack onto an expert axis.
+    Each tensor goes through its family's `prepare_weights` and `weight_path`. A
+    2-D kernel is transposed from torch's [out, in] to Dense's [in, out], and
+    per-expert tensors are stacked on an expert axis.
 
-    A tied checkpoint carries lm_head.weight as well, as a copy of the
-    embedding (Qwen3-0.6B does). The copy is checked and dropped. The tree has
-    one leaf for the two, and a checkpoint whose "tied" head is a different
-    matrix would otherwise load as a model that computes something else.
-    param_dtype changes floating parameter storage, independently of compute
-    dtype. Router and frozen state remain FP32; integer indices retain their
-    native dtype. Conversion happens per leaf before its layout copy.
+    A tied checkpoint also stores lm_head.weight as a copy of the embedding
+    (Qwen3-0.6B does). The copy is checked and dropped, because the tree has one
+    leaf for both, and a checkpoint whose "tied" head were a different matrix
+    would otherwise load as a model that computes something else.
 
-    With `lazy` every leaf is a `SourceLeaf` over the stored tensors, read
-    only when it is placed (`dew.interop.streaming`); otherwise each is read
+    `param_dtype` sets the storage dtype of floating parameters, separately from
+    the compute dtype. Router and frozen state stay in FP32, and integer indices
+    keep their own dtype. Each leaf is converted before its layout copy.
+
+    With `lazy`, every leaf is a `SourceLeaf` over the stored tensors that is read
+    only when it is placed (`dew.interop.streaming`); otherwise each leaf is read
     whole here.
 
-    `model_type` names the source's own family where the caller read it off
-    a config.json. Without it the family comes from the record, which is
-    what the backbone would be built from and so cannot tell two families
-    apart that compute the same thing under different tensor names: Kimi
-    K2.5's decoder is DeepSeek V3's computation nested under
+    `model_type` names the source's own family when the caller read it from a
+    config.json. Without it, the family comes from the record, which describes
+    what the backbone would be built from, so it cannot tell apart two families
+    that compute the same thing under different tensor names. Kimi K2.5's
+    decoder, for example, is DeepSeek V3's computation nested under
     `language_model.`.
     """
     family = (_family_for_config(config) if model_type is None
