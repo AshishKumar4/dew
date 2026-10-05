@@ -48,7 +48,8 @@ def mid_accumulation(state) -> bool:
 
 def write_reference(path: Path, source, variables, probe, step) -> None:
     """The fp32 loss of the probe batch and each source tensor's gradient,
-    from the model at its reference attention."""
+    from the model at its reference attention, with fp32 matmuls on any
+    backend (a GPU's default is TF32-class)."""
     parity = LMObjective(source.model.clone(dtype=jnp.float32, attention_impl='reference'),
                          SEQUENCE, ema_decay=None)
 
@@ -56,7 +57,8 @@ def write_reference(path: Path, source, variables, probe, step) -> None:
         stats, _ = parity.loss({"params": params}, probe, step)
         return parity.reduce_loss(stats)[0]
 
-    loss, gradients = jax.value_and_grad(reference_loss)(variables["params"])
+    with jax.default_matmul_precision("highest"):
+        loss, gradients = jax.value_and_grad(reference_loss)(variables["params"])
     arrays = {"ids": np.asarray(probe["text"]), "loss": np.asarray(loss)}
     for layout in source.weight_layouts:
         arrays["gradient/" + layout.name] = layout.export({"params": gradients})
@@ -86,8 +88,9 @@ def export(run: Path, source, variables, probe) -> None:
     source.save(run / "export", variables=variables)
     reloaded = Pretrained.load(run / "export", dtype="float32", attention_impl="reference")
     ids = jnp.asarray(probe["text"][:, :-1])
-    expected = source.model.clone(dtype=jnp.float32, attention_impl='reference').apply(variables, ids)
-    actual = reloaded.model.apply(reloaded.variables, ids)
+    with jax.default_matmul_precision("highest"):
+        expected = source.model.clone(dtype=jnp.float32, attention_impl='reference').apply(variables, ids)
+        actual = reloaded.model.apply(reloaded.variables, ids)
     np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), atol=1e-4, rtol=0)
     np.savez(run / "export_logits.npz", ids=np.asarray(ids), logits=np.asarray(actual))
 
