@@ -12,6 +12,9 @@ on:
   pull_request:
     branches: [ "main" ]
   workflow_dispatch:
+  # The release workflow runs all of this on the release's own commit and
+  # publishes only if every job passes.
+  workflow_call:
 
 permissions:
   contents: read
@@ -98,6 +101,8 @@ jobs:
         python -m build
         python -m twine check --strict dist/*
         python tools/check_distribution.py dist/*
+    - name: Install the wheel into an empty environment, compile it, run `dew --help` and train
+      run: python tools/smoke_wheel.py dist/*.whl
     - name: Install the wheel from PyPI into an empty environment
       run: |
         python -m venv "$RUNNER_TEMP/clean"
