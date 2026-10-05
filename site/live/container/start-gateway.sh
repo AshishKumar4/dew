@@ -37,8 +37,9 @@ while True:
             if response.status != 200:
                 raise RuntimeError('Kernel Gateway did not accept the administrative token')
         break
-    except urllib.error.HTTPError:
-        raise
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode(errors='replace')[:1000]
+        raise RuntimeError(f'Gateway HTTP {error.code}: {detail}') from error
     except (urllib.error.URLError, TimeoutError):
         if time.monotonic() >= deadline:
             raise TimeoutError('Kernel Gateway did not listen within 30 seconds') from None

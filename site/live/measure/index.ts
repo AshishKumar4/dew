@@ -29,12 +29,13 @@ export class GatewayLab extends DurableObject<Env> {
 			}
 			const launch = await container.exec(['sh', '-c', 'DEW_GUEST_TRACE=1 sh /opt/live/start-gateway.sh']);
 			const launched = await launch.output();
-			if (launched.exitCode !== 0) return { stage: 'launch', ...this.decode(launched) };
-			const process = await container.exec(['/opt/venv/bin/python', '/opt/live/benchmark_gateway.py', '1']);
-			const result = await process.output();
+			const result = launched.exitCode !== 0 ? launched : await (await container.exec([
+				'/opt/venv/bin/python', '/opt/live/benchmark_gateway.py', '1',
+			])).output();
 			const logs = await container.exec(['sh', '-c', 'tail -c 16000 /run/dew/gateway.log']);
 			const log = await logs.output();
-			return { seconds: (Date.now() - started) / 1000, commit: this.env.SOURCE_COMMIT,
+			return { stage: launched.exitCode === 0 ? 'kernel' : 'launch',
+				seconds: (Date.now() - started) / 1000, commit: this.env.SOURCE_COMMIT,
 				...this.decode(result), gatewayLog: this.decode(log).stdout };
 		} finally {
 			this.busy = false;
