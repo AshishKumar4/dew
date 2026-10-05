@@ -346,19 +346,19 @@ class DiffusionObjective(Objective[Ratio]):
 
     def inference_record(self):
         """Declare the model, input encoders and sampling convention of this step."""
-        from dew.config import ModelConfig, _to_json
+        from dew.config import ModelConfig, to_json
         from dew.registry import objectives
         if not any(member is type(self) for member in objectives.values()):
             return None
-        model = _to_json(ModelConfig.from_model(self.model), ModelConfig)
+        model = to_json(ModelConfig.from_model(self.model), ModelConfig)
         return {'objective': objectives.name_of(type(self)), 'model': model,
                 'process': self.process.to_json(), 'inputs': self.inputs.to_json(),
                 'autoencoder': None if self.autoencoder is None else self.autoencoder.to_json(),
-                'solver': _to_json(self.solver, type(self.solver)),
-                'guidance': _to_json(self.guidance, type(self.guidance)), 'sampling_steps': self.steps,
+                'solver': to_json(self.solver, type(self.solver)),
+                'guidance': to_json(self.guidance, type(self.guidance)), 'sampling_steps': self.steps,
                 'condition_precision': self._condition_precision,
                 # A tuned autoencoder's weights and statistics sit in the run's own tree.
-                'end_to_end': None if self.end_to_end is None else _to_json(self.end_to_end, EndToEnd)}
+                'end_to_end': None if self.end_to_end is None else to_json(self.end_to_end, EndToEnd)}
 
     def pipeline(self, state: TrainState, *, ema: bool | None = None) -> TextToImage:
         """The model over the state's published weights as a `TextToImage`

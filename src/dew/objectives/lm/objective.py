@@ -722,7 +722,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
 
     def inference_record(self):
         """Describe this decoder for inference, without a training RunConfig or copies of the parameters."""
-        from dew.config import ModelConfig, _to_json
+        from dew.config import ModelConfig, to_json
         from dew.registry import objectives
         if not any(member is type(self) for member in objectives.values()):
             return None
@@ -730,10 +730,10 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         samples = self.samples
         return {
             'objective': kind,
-            'model': _to_json(ModelConfig.from_model(self.model), ModelConfig),
+            'model': to_json(ModelConfig.from_model(self.model), ModelConfig),
             'seq_len': self.seq_len,
             'sample_tokens': 0 if samples is None else samples.max_new_tokens,
-            'sampling': _to_json(Sampling() if samples is None else samples.sampling, Sampling),
+            'sampling': to_json(Sampling() if samples is None else samples.sampling, Sampling),
             'tokenizer': recorded_tokenizer(self.processor),
         }
 

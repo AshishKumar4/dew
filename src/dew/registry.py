@@ -394,7 +394,7 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
 
     This is the one walk from a record to a value, for a module field and a
     run record alike. A registered member is the record that names it,
-    `{"name": ..., "fields": {...}}` (`dew.config._to_json` writes it), where
+    `{"name": ..., "fields": {...}}` (`dew.config.to_json` writes it), where
     the field declares the table's members or a class the member derives
     from; a dataclass is the record of its fields. Containers are walked, so
     a mapping of records and a tuple of records build their values too, a

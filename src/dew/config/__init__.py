@@ -201,7 +201,7 @@ class ModelConfig:
             elif callable(value) and value is field.default:
                 continue
             else:
-                fields[field.name] = _to_json(value, _declared_type(model_type, field.name))
+                fields[field.name] = to_json(value, _declared_type(model_type, field.name))
         return cls(architecture, fields, adapter=adapter, quantization=quantization, dtype=compute,
                    param_dtype=storage, matmul_precision=precision, attention_impl=attention)
 
@@ -364,9 +364,9 @@ def _best_argument():
             return [policy]
         return [
             json.dumps(
-                [_to_json(entry, Best) for entry in policy]
+                [to_json(entry, Best) for entry in policy]
                 if isinstance(policy, tuple)
-                else _to_json(policy, Best)
+                else to_json(policy, Best)
             )
         ]
 
@@ -385,7 +385,7 @@ def _keep_argument():
         else int(given[0]),
         is_instance=lambda keep: isinstance(keep, (int, Keep)),
         str_from_instance=lambda keep: [
-            json.dumps(_to_json(keep, Keep)) if isinstance(keep, Keep) else str(keep)
+            json.dumps(to_json(keep, Keep)) if isinstance(keep, Keep) else str(keep)
         ],
     )
 
@@ -598,10 +598,14 @@ def _artifact_name(name: str) -> str:
     return re.sub(r"[^\w.-]", "-", name)
 
 
-def _to_json(value, annotation) -> JSON:
+def to_json(value, annotation) -> JSON:
     """Return `value` as JSON: a dict, a list, or a scalar json.dump can write.
     `annotation` is the declared field type, so the write side names the same
-    registry and member types the read side rebuilds from."""
+    registry and member types the read side rebuilds from.
+
+    Objectives call it to write their `inference_record`, a plugin's among
+    them, which is why it is public: the record must be the one a run's
+    config reader takes back."""
     if isinstance(value, datetime.timedelta):
         return recorded_duration(value)
     if isinstance(value, type) and value.__module__ in ('jax.numpy', 'numpy', 'ml_dtypes'):
@@ -616,7 +620,7 @@ def _to_json(value, annotation) -> JSON:
                 f"it once with `@dew.registry.{held.kind}s(\"{type(value).__name__.lower()}\")`")
         if held is None:
             held = _table_of(type(value))
-        fields = {f.name: _to_json(getattr(value, f.name), _declared_type(type(value), f.name))
+        fields = {f.name: to_json(getattr(value, f.name), _declared_type(type(value), f.name))
                   for f in dataclasses.fields(value) if _recorded(f)
                   and not (isinstance(value, nn.Module) and f.name in ('parent', 'name'))}
         if held is None:
@@ -624,11 +628,11 @@ def _to_json(value, annotation) -> JSON:
         return {"name": held.name_of(type(value)), "fields": fields}
     if isinstance(value, (list, tuple)):
         entries = registry.entry_types(annotation, len(value))
-        return [_to_json(entry_value, entry)
+        return [to_json(entry_value, entry)
                 for entry_value, entry in zip(value, entries, strict=True)]
     if isinstance(value, Mapping):
         entries = registry.entry_types(annotation, len(value))
-        return {_key(key): _to_json(entry_value, entry)
+        return {_key(key): to_json(entry_value, entry)
                 for (key, entry_value), entry in zip(value.items(), entries, strict=True)}
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
@@ -684,7 +688,7 @@ class RunConfig:
 
         A registered member is written as its name and its fields.
         """
-        return {field.name: _to_json(getattr(self, field.name),
+        return {field.name: to_json(getattr(self, field.name),
                                      _declared_type(type(self), field.name))
                 for field in dataclasses.fields(self)}
 
@@ -858,4 +862,4 @@ class RunConfig:
         return finished
 
 
-__all__ = ["JsonDict", "ModelConfig", "OptimConfig", "RunConfig", "TrainerConfig", "Wandb"]
+__all__ = ["JsonDict", "ModelConfig", "OptimConfig", "RunConfig", "TrainerConfig", "Wandb", "to_json"]
