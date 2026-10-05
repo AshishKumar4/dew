@@ -656,6 +656,47 @@ def test_prefix_sharing_needs_a_paged_cache():
         Server.from_task(task(), slots=2, capacity=128, prefix_cache=True)
 
 
+@pytest.mark.parametrize("scan_layers", [False, True])
+def test_a_plain_decoder_takes_the_mixed_step_scanned_or_not(scan_layers):
+    """The holder walk names plain attention whether the stack is a loop or
+    scanned (a decode runs the plain loop, so a scanned stack's caches sit
+    under its layers too): neither loses the mixed admitting step."""
+    model = CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=2, num_heads=2, head_dim=8,
+                              mlp_features=32, max_seq_len=128, dtype="float32", scan_layers=scan_layers)
+    bound = TextGeneration(model, model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)),
+                           RunProcessor(Digits()))
+    assert Server.from_task(bound, slots=4, capacity=128).mixed_refusal is None
+
+
+@pytest.mark.parametrize("kind", ["llama4", "mla", "gated_delta_net"])
+def test_a_layer_that_cannot_run_the_mixed_step_keeps_two_forwards_by_name(kind):
+    """A cache any layer but plain attention holds keeps the admitting step's
+    two forwards, named: such a layer does not read the mixed call's layout
+    and would take its one row of tokens as one sequence (a Llama 4 server
+    failed to build). Served rows are still each request's alone."""
+    from dew.nn.llama4 import Llama4Mixer
+    from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
+    from dew.nn.mla import MLAMixer
+
+    linear = GatedDeltaNetMixer(linear_num_key_heads=2, linear_num_value_heads=2,
+                                linear_key_head_dim=8, linear_value_head_dim=8)
+    extra = {
+        "llama4": {"mixer": Llama4Mixer()},
+        "mla": {"mixer": MLAMixer(kv_lora_rank=8, qk_nope_head_dim=8, qk_rope_head_dim=8, v_head_dim=8)},
+        "gated_delta_net": {"layer_types": ("linear", "full"), "kinds": {"linear": {"mixer": linear}}},
+    }[kind]
+    model = CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=2, num_heads=2, head_dim=8,
+                              mlp_features=32, max_seq_len=128, dtype="float32", qk_norm=False, **extra)
+    bound = TextGeneration(model, model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)),
+                           RunProcessor(Digits()))
+    server = Server.from_task(bound, slots=4, capacity=128)
+    assert "which a mixed step does not run" in (server.mixed_refusal or "")
+    tickets = [server.submit(prompt, 3, key=index) for index, prompt in enumerate(PROMPTS[:2])]
+    server.run()
+    for index, ticket in enumerate(tickets):
+        assert_same_generation(ticket.result(), bound(PROMPTS[index], 3, key=index))
+
+
 def test_a_model_the_mixed_step_cannot_take_keeps_two_forwards_and_says_why(monkeypatch):
     """A layer that refuses the mixed admitting step names why; the server
     keeps the prompts' prefill in a forward of its own and reports the
