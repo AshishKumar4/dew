@@ -229,7 +229,7 @@ def train(source: Pretrained, ids: np.ndarray):
         raise ValueError("a masked diffusion checkpoint reserves its mask id")
     objective = MaskedDiffusionObjective(
         model, MDLM(mask_id=int(mask_id))(), seq_len=int(ids.shape[1]),
-        ema_decay=None, pretrained=source.variables)
+        ema_decay=None, variables=source.variables)
     count = math.lcm(int(ids.shape[0]), jax.device_count())
     rows = np.concatenate([ids] * (count // int(ids.shape[0])), axis=0)
     entries = [{"text": rows[row]} for row in range(count)]

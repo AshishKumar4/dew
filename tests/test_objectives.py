@@ -111,13 +111,13 @@ def captured_bytes(function, *args) -> int:
                for value in consts)
 
 
-def lm_objective(pretrained=None, **options):
+def lm_objective(variables=None, **options):
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import LMObjective
 
     model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=1,
                               mlp_features=16, max_seq_len=8)
-    return LMObjective(model, seq_len=4, pretrained=pretrained, **options)
+    return LMObjective(model, seq_len=4, variables=variables, **options)
 
 
 def model_constants(objective) -> int:
@@ -148,7 +148,7 @@ def test_a_held_tree_crosses_into_a_jit_as_data_rather_than_as_a_constant():
     compiles it into the executable."""
     tiny = lm_objective()
     weights = jax.jit(tiny.init)(jax.random.key(0))
-    objective = lm_objective(pretrained=weights)
+    objective = lm_objective(variables=weights)
     tree_bytes = sum(int(np.asarray(leaf).nbytes) for leaf in jax.tree.leaves(weights))
 
     assert held_bytes(objective.initializer) == tree_bytes
@@ -166,11 +166,11 @@ def test_a_held_tree_stays_data_through_an_objectives_own_jit():
     class Nested(LMObjective):
         def init(self, key, variables=None):
             return jax.jit(lambda held: LMObjective.init(self, key, held))(
-                self.pretrained if variables is None else variables)
+                self.variables if variables is None else variables)
 
     tiny = lm_objective()
     weights = jax.jit(tiny.init)(jax.random.key(0))
-    objective = Nested(tiny.model, seq_len=4, pretrained=weights)
+    objective = Nested(tiny.model, seq_len=4, variables=weights)
 
     assert captured_bytes(lambda initializer, key: initializer(key),
                           objective.initializer, jax.random.key(0)) == 0
@@ -188,7 +188,7 @@ def test_the_initializer_dispatches_through_the_public_init():
 
     tiny = lm_objective()
     weights = jax.jit(tiny.init)(jax.random.key(0))
-    objective = Zeroed(tiny.model, seq_len=4, pretrained=weights)
+    objective = Zeroed(tiny.model, seq_len=4, variables=weights)
     key = jax.random.key(0)
 
     for tree in (objective.init(key), objective.initializer(key),
@@ -204,7 +204,7 @@ def test_the_initializer_and_init_return_the_same_tree():
     caller of `init` and the trainer's state JIT cannot disagree."""
     tiny = lm_objective()
     weights = jax.jit(tiny.init)(jax.random.key(0))
-    for objective in (lm_objective(), lm_objective(pretrained=weights)):
+    for objective in (lm_objective(), lm_objective(variables=weights)):
         key = jax.random.key(4)
         direct, through = objective.init(key), objective.initializer(key)
         assert jax.tree.structure(direct) == jax.tree.structure(through)
@@ -220,5 +220,5 @@ def test_the_held_variables_hook_is_what_the_initializer_binds():
     weights = jax.jit(tiny.init)(jax.random.key(0))
 
     assert tiny.held_variables() is None
-    holding = lm_objective(pretrained=weights)
+    holding = lm_objective(variables=weights)
     assert held_bytes(holding.initializer) == held_bytes(holding.held_variables())

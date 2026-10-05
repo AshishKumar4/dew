@@ -25,7 +25,7 @@ from dew.artifacts import TokenScores
 from dew.data.prompts import LENGTH_KEY, PROMPT_KEY
 from dew.inputs import Field, InputSpec
 from dew.nn.precision import at_least_fp32
-from dew.objectives.base import Aux, Ratio, Shown, Variables
+from dew.objectives.base import Aux, Ratio, Shown, Variables, thaw
 from dew.objectives.lm.chunked import chunked_cross_entropy
 from dew.registry import objectives
 from dew.rl import behavior_importance_weights, k3_kl, masked_mean, sequence_log_ratio, token_log_ratio
@@ -334,6 +334,7 @@ class GRPOObjective(LMObjective):
         weights, taken off the row's `prompt_length`. Pads predict nothing
         and count nothing.
         """
+        params = thaw(params)
         prompts = jnp.asarray(batch[PROMPT_KEY])
         lengths = jnp.asarray(batch[LENGTH_KEY]).reshape(-1)
         if prompts.shape[1] < 2:

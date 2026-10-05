@@ -646,10 +646,20 @@ class DiffusionRunConfig(RunConfig):
         respective subtrees without a source weight load or storage cast.
         """
         if self.pretrained is None:
+            if self.lora is not None:
+                raise ValueError("--lora adapts the pipeline --pretrained loads; a run from scratch "
+                                 "trains the whole model")
             model, conditions, autoencoder = self._scratch(variables)
             sample, convention = self.sample_field(), None
         else:
+            if self.lora is not None and variables is not None:
+                raise ValueError("a --lora run's saved variables hold its factors, which "
+                                 "TextToImage.from_run binds through the run's own adapter record")
             source = self._source(variables)
+            if self.lora is not None:
+                # The adapter binds to the denoiser and the pipeline's
+                # weights, so the objective trains its factors alone.
+                source = source.adapt(self.lora, key=self.trainer.key)
             if source.inputs is None:
                 raise ValueError(f"{self.pretrained} loads no diffusion inputs to train on")
             if source.inputs.mask is not None:
@@ -670,13 +680,13 @@ class DiffusionRunConfig(RunConfig):
                 model, process, inputs, sde=FlowSDE(self.rl.noise_level), beta=self.rl.beta,
                 clip_range=self.rl.clip_range, adv_clip_max=self.rl.adv_clip_max,
                 autoencoder=autoencoder, guidance=self.guidance, solver=self.solver,
-                steps=self.sampling_steps, pretrained=variables)
+                steps=self.sampling_steps, variables=variables)
         if self.mean_flow is not None:
             from .few_step import MeanFlowObjective
 
             return MeanFlowObjective(
                 model, process, inputs, **dataclasses.asdict(self.mean_flow),
-                autoencoder=autoencoder, pretrained=variables, unconditional_prob=self.unconditional_prob,
+                autoencoder=autoencoder, variables=variables, unconditional_prob=self.unconditional_prob,
                 ema_decay=self.ema_decay, solver=self.solver, guidance=None, steps=self.sampling_steps)
         if self.adversarial is not None:
             from .adversarial import AdversarialDistillationObjective
@@ -685,7 +695,7 @@ class DiffusionRunConfig(RunConfig):
                       for field in dataclasses.fields(self.adversarial) if field.name != "teacher"}
             return AdversarialDistillationObjective(
                 model, process, inputs, teacher=teacher_model(self.adversarial.teacher, variables), **fields,
-                autoencoder=autoencoder, pretrained=variables, unconditional_prob=self.unconditional_prob,
+                autoencoder=autoencoder, variables=variables, unconditional_prob=self.unconditional_prob,
                 ema_decay=self.ema_decay, solver=self.solver, guidance=None, steps=self.sampling_steps)
         if self.guidance_distill is not None:
             from .guidance_distillation import GuidanceDistillationObjective
@@ -693,7 +703,7 @@ class DiffusionRunConfig(RunConfig):
             teacher, held = self.guidance_distill.teacher_objective(variables)
             return GuidanceDistillationObjective(
                 model, process, inputs, teacher=teacher, teacher_variables=held,
-                scales=self.guidance_distill.scales, autoencoder=autoencoder, pretrained=variables,
+                scales=self.guidance_distill.scales, autoencoder=autoencoder, variables=variables,
                 ema_decay=self.ema_decay, solver=self.solver, guidance=None, steps=self.sampling_steps)
         if self.distill is not None:
             from .consistency import ConsistencyDistillationObjective
@@ -707,18 +717,18 @@ class DiffusionRunConfig(RunConfig):
             }
             return ConsistencyDistillationObjective(
                 model, process, inputs, teacher=self.distill.teacher_variables(variables), **fields,
-                autoencoder=autoencoder, pretrained=variables, ema_decay=self.ema_decay, solver=self.solver,
+                autoencoder=autoencoder, variables=variables, ema_decay=self.ema_decay, solver=self.solver,
                 guidance=None, steps=self.sampling_steps)
         if self.shortcut is not None:
             from .few_step import ShortcutObjective
 
             return ShortcutObjective(
                 model, process, inputs, **dataclasses.asdict(self.shortcut),
-                autoencoder=autoencoder, pretrained=variables, unconditional_prob=self.unconditional_prob,
+                autoencoder=autoencoder, variables=variables, unconditional_prob=self.unconditional_prob,
                 ema_decay=self.ema_decay, solver=self.solver, guidance=None, steps=self.sampling_steps)
         return DiffusionObjective(
             model, process, inputs,
-            autoencoder=autoencoder, pretrained=variables,
+            autoencoder=autoencoder, variables=variables,
             unconditional_prob=self.unconditional_prob,
             ema_decay=self.ema_decay,
             solver=self.solver,

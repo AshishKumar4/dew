@@ -30,6 +30,7 @@ from dew.interop.hf_decoders import families, translate_config
 from dew.nn.inputs import ModelInputs
 from dew.nn.moe import Situ
 from dew.objectives.base import Step
+from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.sampling import Sampling, generate
 
@@ -156,7 +157,7 @@ def test_update_exports_the_trained_model_back_in_the_source_layout(source, tmp_
     zero-padded to its stored length, trained experts as MXFP4 pairs,
     everything else as trained; reloading reproduces that."""
     loaded, inputs, reference = source
-    objective = loaded.lm_objective(inputs.tokens.shape[1] - 1,
+    objective = LMObjective(loaded, inputs.tokens.shape[1] - 1,
                             ema_decay=None, pad_id=0)
     step = Step(step=jnp.int32(0), key=jax.random.key(0), ema=None)
 

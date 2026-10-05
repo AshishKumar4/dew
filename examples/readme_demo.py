@@ -93,7 +93,7 @@ def preferences(model, pretrained):
         loading=Loading(workers=0, threads=1, read_buffer=2),
     ).load(batch=8)
     # The objective predicts three next tokens from each four-ID sequence.
-    objective = DPOObjective(model, seq_len=3, beta=0.1, pretrained=pretrained)
+    objective = DPOObjective(model, seq_len=3, beta=0.1, variables=pretrained)
     reference = jax.tree.map(lambda x: np.array(x, copy=True), pretrained)
     trainer = Trainer(objective, optax.adam(0.001), key=jax.random.key(2))
     state = trainer.fit(data, steps=4, log_every=1)

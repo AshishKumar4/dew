@@ -161,7 +161,7 @@ def worker(directory: Path, mode: str, dtype: str) -> None:
     objective = LMObjective(
         source.model.clone(dropout_rate=0.1),
         SEQUENCE,
-        pretrained=source.variables,
+        variables=source.variables,
         ema_decay=0.9,
     )
     data = TokenWindows(
