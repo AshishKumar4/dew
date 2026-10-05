@@ -16,15 +16,19 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from reference_error import distance
 
 from dew.nn import kernels
 from dew.nn.attention import (
     SPLASH_LANES,
     SPLASH_MIN_LENGTH,
+    VALUE_BLOCK,
     attention_kernel,
     cudnn_runs,
+    resolve_implementation,
     scaled_dot_product_attention,
     tpu_runs,
+    weighted_values,
 )
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.kernels import bf16_dot_runs
@@ -512,3 +516,47 @@ def test_the_sm75_route_applies_on_a_gpu_backend_only(monkeypatch):
     monkeypatch.setattr(jax, 'default_backend', lambda: 'cpu')
     query = jnp.zeros((1, 16, 2, 64), jnp.bfloat16)
     assert resolve_implementation('xla', query, query) == 'xla'
+
+
+@pytest.mark.parametrize("dtype, keys, chosen", [
+    (jnp.float32, VALUE_BLOCK, "xla"), (jnp.float32, VALUE_BLOCK + 1, "reference"),
+    (jnp.float32, 2048, "reference"), (jnp.bfloat16, 2048, "xla")])
+def test_cpu_fp32_attention_over_more_than_a_block_of_keys_takes_the_reference_path(monkeypatch, dtype, keys,
+                                                                                     chosen):
+    """jax.nn's xla attention on XLA:CPU sums an fp32 value product over all
+    its keys in one YNNPACK chain; past VALUE_BLOCK keys 'auto' and 'xla'
+    take the reference path, whose product sums in blocks. A shorter call
+    and a bf16 one compute as before."""
+    monkeypatch.setattr(jax, 'default_backend', lambda: 'cpu')
+    query, key = jnp.zeros((1, 16, 2, 64), dtype), jnp.zeros((1, keys, 2, 64), dtype)
+    for requested in ('auto', 'xla'):
+        assert resolve_implementation(requested, query, key) == chosen
+
+
+@pytest.mark.skipif(jax.default_backend() != 'cpu', reason="the blocked sum is XLA:CPU's")
+def test_cpu_fp32_attention_rounds_closer_to_float64_in_blocks():
+    """Over 2048 keys of cross-attention-like inputs, Dew's fp32 attention on
+    XLA:CPU is at most three quarters of jax.nn's xla distance from float64
+    (measured 0.55 of it; torch's SDPA sits between, docs/performance.md),
+    and the blocked product's gradients are the plain product's."""
+    rng = np.random.default_rng(0)
+    query, key = (rng.normal(size=(1, length, 2, 128)).astype(np.float32) * 0.6 for length in (128, 2048))
+    value = rng.normal(size=(1, 2048, 2, 128)).astype(np.float32)
+    q, k, v = (np.asarray(x, np.float64) for x in (query, key, value))
+    logits = np.einsum('btnh,bsnh->bnts', q, k) / np.sqrt(128)
+    probs = np.exp(logits - logits.max(-1, keepdims=True))
+    truth = np.einsum('bnts,bsnh->btnh', probs / probs.sum(-1, keepdims=True), v)
+    dew = scaled_dot_product_attention(query, key, value)
+    plain = jax.nn.dot_product_attention(query, key, value, implementation='xla')
+    mine, theirs = distance(dew, truth), distance(plain, truth)
+    assert mine <= 0.75 * theirs, (mine, theirs)
+
+    weights = jax.nn.softmax(jnp.asarray(logits, jnp.float32))
+    blocked = jax.grad(lambda w, v: jnp.sum(weighted_values('...hqk,...khd->...qhd', w, v) ** 2), (0, 1))
+    out = weighted_values('...hqk,...khd->...qhd', weights, value)
+    cotangent = 2 * out
+    want = (jnp.einsum('...qhd,...khd->...hqk', cotangent, value),
+            jnp.einsum('...hqk,...qhd->...khd', weights, cotangent))
+    for got, expected in zip(blocked(weights, value), want, strict=True):
+        np.testing.assert_array_equal(got, expected)
+
