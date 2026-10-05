@@ -18,8 +18,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.interop.weights import ParamTree, translate_parameters
 from dew.nn.conv import Conv
-from dew.nn.text_encoders import ParamTree, insert
 
 
 def _conv(features: int, dtype, name: str) -> Conv:
@@ -257,16 +257,14 @@ def translate_vae_weights(torch_tensors: ParamTree) -> ParamTree:
     and biases keep their layout. Every tensor maps, so an unknown name
     raises rather than loading half an autoencoder.
     """
-    params: ParamTree = {}
-    for name, tensor in torch_tensors.items():
+    def stored(name: str) -> np.ndarray:
+        tensor = torch_tensors[name]
         if isinstance(tensor, dict):
             raise ValueError(f"{name} is a subtree; a diffusers VAE table is flat")
-        leaf = np.asarray(tensor, dtype=np.float32)
-        path = _vae_path(name, leaf.ndim)
-        if path[-1] == "kernel":
-            leaf = leaf.transpose(2, 3, 1, 0) if leaf.ndim == 4 else leaf.T
-        insert(params, path, leaf, name)
-    return params
+        return np.asarray(tensor, dtype=np.float32)
+
+    tensors = {name: stored(name) for name in torch_tensors}
+    return translate_parameters(tensors, lambda name: _vae_path(name, tensors[name].ndim))
 
 
 # The SD1-era flax weights live on their own branches, so these name a layout,

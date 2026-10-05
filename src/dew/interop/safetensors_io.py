@@ -22,7 +22,7 @@ import jax
 import ml_dtypes
 import numpy as np
 
-from dew.nn.text_encoders import ParamTree, insert
+from dew.interop.weights import ParamTree, insert
 from dew.records import JSON
 
 SEPARATOR = "/"

@@ -26,7 +26,7 @@ import numpy as np
 from flax.typing import Dtype
 
 from dew import records
-from dew.nn.text_encoders import check_tree
+from dew.interop.components import bind_component
 from dew.objectives.base import Variables
 
 from .api import ModuleAutoEncoder
@@ -377,20 +377,13 @@ def load_qwen_image_vae(directory: Path, compute, *, param_dtype: str = "float32
     from `directory/vae`. Every tensor the module declares must be published,
     in the shape it declares. Supplied `params` are bound without a weight read;
     `lazy` leaves read ones `SourceLeaf`s for a placement to read
-    (`dew.interop.diffusion.record_layouts`)."""
-    from dew.interop import diffusion
-
+    (`dew.interop.weights.record_layouts`)."""
     config = json.loads((directory / "vae" / "config.json").read_text())
     model = QwenImageVAE(**qwen_image_vae_fields(config), dtype=compute)
-    layouts: tuple[WeightLayout, ...] = ()
-    if params is None:
-        tensors = diffusion.component_tensors(directory, "vae")
-        params, layouts = diffusion.record_layouts(
-            "vae", tensors, lambda name: qwen_image_vae_path(name, np.ndim(tensors[name])),
-            ("autoencoder",), param_dtype=param_dtype, lazy=lazy)
     frame = jax.ShapeDtypeStruct((1, model.downscale_factor, model.downscale_factor, model.image_channels),
                                  jnp.float32)
-    check_tree({"params": params}, model, frame)
-    autoencoder = QwenImageAutoencoder(model=model, params=params, latents_mean=config["latents_mean"],
-                                       latents_std=config["latents_std"])
-    return autoencoder, params, layouts, config
+    return bind_component(
+        directory / "vae", "vae", config, model, qwen_image_vae_path,
+        lambda bound: QwenImageAutoencoder(model=model, params=bound, latents_mean=config["latents_mean"],
+                                           latents_std=config["latents_std"]),
+        prefix=("autoencoder",), params=params, param_dtype=param_dtype, lazy=lazy, inputs=(frame,))

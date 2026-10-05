@@ -210,7 +210,7 @@ def test_public_source_precision_covers_denoiser_and_frozen_component_weights(
 def test_component_binding_preserves_large_integer_indices():
     import numpy as np
 
-    from dew.interop.diffusion import record_layouts
+    from dew.interop.weights import record_layouts
 
     indices = np.asarray([1, 16777217], np.int64)
     values, _ = record_layouts("component", {"indices": indices}, lambda name: (name,),

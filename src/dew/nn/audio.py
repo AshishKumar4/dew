@@ -20,12 +20,12 @@ import numpy as np
 from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
+from dew.interop.weights import ParamTree, translate_parameters
 from dew.registry import from_record, towers
 
 from .attention import LayerNorm, RMSNorm
 from .conv import Conv
 from .sharding import logical_axes
-from .text_encoders import ParamTree, checkpoint_array, insert
 from .vision import TowerBase, TowerGeometry
 
 
@@ -761,17 +761,19 @@ def audio_weights(
     retain their native dtype, and every shape is checked against the encoder.
     """
     expected = _audio_template(config)
-    placed: ParamTree = {}
     seen = set()
-    for name, array in tensors.items():
+
+    def path_of(name: str) -> tuple[str, ...]:
         path = audio_weight_path(name, config)
-        value = checkpoint_array(array, param_dtype if path[0] == "params" else "float32")
+        shape = tensors[name].shape
         if path[-1] == "kernel":
-            value = np.ascontiguousarray(value.transpose(*range(2, value.ndim), 1, 0))
-        if path not in expected or value.shape != expected[path].shape:
-            raise ValueError(f"audio tensor {name!r} with shape {value.shape} does not match the encoder")
+            shape = (*shape[2:], shape[1], shape[0])
+        if path not in expected or shape != expected[path].shape:
+            raise ValueError(f"audio tensor {name!r} with shape {shape} does not match the encoder")
         seen.add(path)
-        insert(placed, path, value, name)
+        return path
+
+    placed = translate_parameters(tensors, path_of, param_dtype)
     missing = expected.keys() - seen
     if missing:
         raise ValueError(f"audio checkpoint is missing {sorted('/'.join(path) for path in missing)}")
