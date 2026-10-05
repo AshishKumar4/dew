@@ -1,19 +1,19 @@
 """The optimizer a recipe builds from an OptimConfig.
 
-Every recipe wires the same solver: a warmup-cosine schedule when one is
-asked for, weight decay folded into the optimizer's own kwargs, and
-global-norm clipping. That wiring is library behavior, so it lives here and
-the recipes call it. The Trainer forms the normalized effective-window
-gradient before calling this solver.
+Every recipe builds the same solver: the config's learning-rate schedule
+when it names one, weight decay passed in the optimizer's own keyword
+arguments, and global-norm clipping. That is library behavior, so the
+pieces are here and the recipes call them. The Trainer pools and normalizes
+the gradient over the whole accumulation window before it calls this solver.
 
-The 'muon' entry is the production parameter-group split the labs converged
-on (docs/research/frontier-training.md:183). AdamW takes the embeddings, the
-head, the router and the norms; Muon takes the matrices.
+The 'muon' entry uses the production parameter-group split that the labs
+converged on (docs/research/frontier-training.md). AdamW updates the
+embeddings, the head, the router and the norms, and Muon updates the
+matrices.
 
-`optax.contrib.muon` owns the masked composition, partitioning with
-`optax.masked` per group (optax/contrib/_muon.py:694). What Dew supplies is
-the parameter spec: which group a parameter belongs to, and which of its
-axes are the matrix.
+`optax.contrib.muon` combines the two optimizers, applying each to its own
+group of parameters. Dew supplies the parameter spec, which says which group
+a parameter belongs to and which of its axes form the matrix.
 """
 
 from __future__ import annotations
@@ -47,7 +47,7 @@ BATCH_AXES = frozenset({'exp'})
 
 # A parameter that maps into or out of a discrete index is a lookup, so AdamW
 # keeps the embeddings, the head and the router
-# (docs/research/frontier-training.md:183). An expert dimension is one of
+# (docs/research/frontier-training.md:257). An expert dimension is one of
 # these when it is the output, counting the experts a router scores, and a
 # batch axis when it leads, stacking one matrix per expert.
 SELECTION_AXES = frozenset({'vocab', 'output'})
@@ -124,6 +124,8 @@ def muon_weight_dimension_numbers(params):
 
 def _muon_groups(learning_rate, **opts):
     """Run Muon over the matrices and AdamW over the rest, on one schedule."""
+    # optax partitions the parameters into the two groups and masks each
+    # optimizer to its own (optax/contrib/_muon.py:694).
     return optax.contrib.muon(
         learning_rate,
         muon_weight_dimension_numbers=muon_weight_dimension_numbers,
@@ -419,9 +421,9 @@ def _bf16_adamw(learning_rate, b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0,
 
 
 class PowerProfilesState(NamedTuple):
-    """The state `power_profiles` keeps beside its solver's."""
+    """The optimizer state of `power_profiles`, kept beside the wrapped solver's state."""
     updates: jax.Array
-    """Updates made, the t of the averages' profiles."""
+    """The number of updates made so far, the t in the averages' power-function profiles."""
     stds: jax.Array
     """The relative standard deviation of each average."""
     averages: tuple[optax.Params, ...]
@@ -484,15 +486,17 @@ OPTIMIZER_MAP = {
 
 @dataclasses.dataclass(frozen=True)
 class ParamGroup:
-    """Parameters the optimizer moves at their own learning rate and decay.
+    """A group of parameters the optimizer updates with their own learning
+    rate and weight decay.
 
-    `patterns` are `fnmatch` patterns over a parameter's path, its dict keys
-    joined by '/' (`layers_3/self_attn/q_proj/kernel`); `*` crosses '/'. A
-    parameter joins the first group of `OptimConfig.param_groups` a pattern
-    of which it matches, lm-engine's rule (optimization/params_group.py at
-    45b6b57b), and one that matches none raises. The group's learning rate
-    is the schedule's times `learning_rate_multiplier`; `weight_decay`
-    replaces the config's, None keeping it.
+    `patterns` are `fnmatch` patterns matched against a parameter's path,
+    which is its dict keys joined by '/' (`layers_3/self_attn/q_proj/kernel`);
+    `*` also matches '/'. A parameter belongs to the first group in
+    `OptimConfig.param_groups` that has a pattern it matches, as in
+    lm-engine, and a parameter that matches no group raises `ValueError`.
+    The group's learning rate is the schedule's rate times
+    `learning_rate_multiplier`. `weight_decay` replaces the config's weight
+    decay; None keeps it.
     """
 
     name: str
@@ -511,12 +515,16 @@ class ParamGroup:
 
     @classmethod
     def mup(cls, width_multiplier: float) -> tuple[ParamGroup, ...]:
-        """lm-engine's muP parameter groups (configs/param-groups/mup.yml at
-        45b6b57b), in its order: norms, biases and `dt_bias` without weight
-        decay at the base rate; the token embeddings at the base rate with decay;
-        everything else, the router, `A_log`, `D` and the conv taps included, at
-        the base rate divided by `width_multiplier` (lm-engine's m_width, the
-        model's `logits_scaling`)."""
+        """Return lm-engine's muP parameter groups, in lm-engine's order.
+
+        The groups are: norms, biases and `dt_bias` at the base rate without
+        weight decay; the token embeddings at the base rate with weight decay;
+        and everything else, including the router, `A_log`, `D` and the conv
+        taps, at the base rate divided by `width_multiplier`.
+        `width_multiplier` is lm-engine's m_width, which is the model's
+        `logits_scaling`.
+        """
+        # lm-engine's configs/param-groups/mup.yml at 45b6b57b.
         return (
             cls("no_weight_decay", NO_DECAY_PATTERNS, weight_decay=0.0),
             cls("normal", ("*embed_tokens/*",)),
@@ -532,6 +540,8 @@ here, Mamba-2's gated norm `weight`) and Mamba-2's `dt_bias`."""
 
 def param_labels(groups: Sequence[ParamGroup]):
     """The `optax.multi_transform` labeller: each leaf's first matching group."""
+    # The first match wins, as in lm-engine's optimization/params_group.py at
+    # 45b6b57b.
     def labels(params):
         def label(path: jax.tree_util.KeyPath, _) -> str:
             name = "/".join(_dict_names(path))
@@ -594,20 +604,27 @@ def linear_schedule(peak: float, warmup_steps: int, decay_start: int | None,
 
 
 class ScheduleBase:
-    """One learning-rate schedule's record: its own fields and its optax
-    schedule. Registered under `dew.registry.schedules`, so a run's record
-    names its kind and holds no field another schedule reads."""
+    """The base of the learning-rate schedule records, each of which holds its
+    own fields and builds an optax schedule.
+
+    Subclasses are registered under `dew.registry.schedules`, so a run's
+    record names the schedule's kind and holds only the fields that schedule
+    reads.
+    """
 
     def schedule(self, steps: int) -> optax.Schedule:
-        """The rate at each update of a `steps`-update run."""
+        """Return the learning rate at each update of a run of `steps` updates, as an optax schedule."""
         raise NotImplementedError
 
 
 @schedules("cosine")
 @dataclasses.dataclass(frozen=True)
 class Cosine(ScheduleBase):
-    """Linear warmup from `init` to `peak`, cosine to `end` at `decay_steps`
-    (None: the run's end); `optax.warmup_cosine_decay_schedule`."""
+    """A linear warmup from `init` to `peak`, then a cosine decay to `end` at
+    step `decay_steps`, or at the run's end when that is None.
+
+    It is `optax.warmup_cosine_decay_schedule`.
+    """
 
     peak: float
     warmup_steps: int = 10000
@@ -624,8 +641,8 @@ class Cosine(ScheduleBase):
 
 @dataclasses.dataclass(frozen=True)
 class PowerTail:
-    """A power schedule's linear tail: from the law's rate at `start` to
-    `end` at step `steps` (None: the run's end)."""
+    """The linear tail of a power schedule, from the power law's rate at step
+    `start` to `end` at step `steps`, or at the run's end when that is None."""
 
     start: int
     steps: int | None = None
@@ -635,10 +652,13 @@ class PowerTail:
 @schedules("power")
 @dataclasses.dataclass(frozen=True)
 class Power(ScheduleBase):
-    """lm-engine's power scheduler, `power_schedule`: warmup, then
-    min(peak, a * (step * c) ** b), and with a `tail` a linear decay after
-    the law (Rigel's last 29%). lm-engine's examples take `a` = 4 * batch
-    size and `c` = tokens per step."""
+    """lm-engine's power schedule (`power_schedule`), a power law of the step after a linear warmup.
+
+    After the warmup, the rate is min(peak, a * (step * c) ** b). With a
+    `tail`, a linear decay follows the power law, as in the last 29% of
+    Rigel's run. lm-engine's examples set `a` to 4 * batch size and `c` to
+    the tokens per step.
+    """
 
     peak: float
     warmup_steps: int
@@ -659,9 +679,12 @@ class Power(ScheduleBase):
 @schedules("linear")
 @dataclasses.dataclass(frozen=True)
 class Linear(ScheduleBase):
-    """lm-engine's linear scheduler, `linear_schedule`: warmup to `peak`,
-    constant to `decay_start` (None: the warmup's end), linear to `end` at
-    `decay_steps` (None: the run's end)."""
+    """lm-engine's linear schedule (`linear_schedule`), with a warmup, a constant rate and a linear decay.
+
+    The rate warms up from zero to `peak`, stays constant until
+    `decay_start` (the end of the warmup when None), then falls linearly to
+    `end` at `decay_steps` (the run's end when None).
+    """
 
     peak: float
     warmup_steps: int = 0

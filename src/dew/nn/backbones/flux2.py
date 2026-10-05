@@ -1,16 +1,22 @@
 """FLUX.2's transformer, as Diffusers 0.40.0's `Flux2Transformer2DModel` runs it.
 
-Flux's double-stream blocks (image and text meet only in attention) then
-single-stream blocks, with these changes: no projection carries a bias and
-the feed-forwards are SwiGLU; one modulation per call from the time (and
-guidance) embedding, one set each for the double blocks' two streams and
-the single blocks; a single block's qkv and feed-forward input are one map
-and its attention output and gated state one map back; the rotary table has
-four axes (time, row, column, token) of 32 channels at theta 2000, a text
-token at (0, 0, 0, i) and an image position at (0, row, column, 0); and the
-text is the Mistral-3 encoder's stacked hidden states, with no pooled
-vector. The latent is the pipeline's 32 VAE channels folded 2x2 into 128,
-which `dew.nn.autoencoders.flux2` produces.
+Like Flux, it runs double-stream blocks, where the image and the text meet
+only in attention, and then single-stream blocks. It differs from Flux in
+these ways:
+
+- No projection has a bias, and the feed-forwards are SwiGLU.
+- The time (and guidance) embedding gives one modulation per call: one set
+  for each of the double blocks' two streams, and one for the single blocks.
+- A single block computes its qkv and its feed-forward input with one map,
+  and maps its attention output and gated state back with one map.
+- The rotary table has four axes (time, row, column, token) of 32 channels
+  at theta 2000. A text token sits at (0, 0, 0, i) and an image position at
+  (0, row, column, 0).
+- The text is the Mistral-3 encoder's stacked hidden states, with no pooled
+  vector.
+
+The latent is the pipeline's 32 VAE channels folded 2x2 into 128, which
+`dew.nn.autoencoders.flux2` produces.
 """
 
 from __future__ import annotations
@@ -45,8 +51,11 @@ if TYPE_CHECKING:
 
 
 def flux2_positions(rows: int, columns: int, text: int) -> np.ndarray:
-    """The ids `Flux2Pipeline` lays out, text first: token i at (0, 0, 0, i),
-    then the latent grid row-major at (0, row, column, 0)."""
+    """Return the position ids `Flux2Pipeline` lays out, text first.
+
+    Text token i sits at (0, 0, 0, i), followed by the latent grid in
+    row-major order at (0, row, column, 0).
+    """
     positions = np.zeros((text + rows * columns, 4), dtype=np.float32)
     positions[:text, 3] = np.arange(text)
     grid = np.indices((rows, columns), dtype=np.float32).reshape(2, -1)
@@ -56,10 +65,12 @@ def flux2_positions(rows: int, columns: int, text: int) -> np.ndarray:
 
 @logical_axes({("to_qkv_mlp_proj",): ("embed", None), ("proj_fused",): (None, "embed")})
 class Flux2SingleBlock(nn.Module):
-    """One `Flux2SingleTransformerBlock`: the joined sequence's queries, keys,
-    values and SwiGLU input from one map, per-head RMS norms and the rotary
-    on the queries and keys, and the attention output beside the gated
-    hidden state through one map back."""
+    """Runs one `Flux2SingleTransformerBlock` over the joined sequence.
+
+    One map gives the queries, keys, values and SwiGLU input. Per-head RMS
+    norms and the rotary apply to the queries and keys. One map back takes
+    the attention output together with the gated hidden state.
+    """
 
     features: int
     heads: int
@@ -104,14 +115,15 @@ class Flux2SingleBlock(nn.Module):
                ("guidance_embedder_linear_1",): (None, "embed"),
                ("guidance_embedder_linear_2",): (None, "embed")})
 class Flux2Transformer(nn.Module):
-    """Diffusers 0.40.0's `Flux2Transformer2DModel` over Dew's interface.
+    """Runs Diffusers 0.40.0's `Flux2Transformer2DModel` behind Dew's model interface.
 
     `__call__` takes the pipeline's NHWC latent (the VAE's channels folded
-    2x2), the model time the schedule supplies - the sigma times the training
-    count, the product the source reaches by dividing its timestep by a
-    thousand and multiplying it back - and a `DenoisingCondition` whose
-    `context` is the stacked encoder states and whose `guidance` is the
-    distilled guidance a guidance-embedded checkpoint reads.
+    2x2), the model time the schedule supplies, and a `DenoisingCondition`.
+    The model time is the sigma times the training count; the source reaches
+    the same product by dividing its timestep by a thousand and multiplying
+    it back. The condition's `context` is the stacked encoder states, and its
+    `guidance` is the distilled guidance that a guidance-embedded checkpoint
+    reads.
     """
 
     in_channels: int = 128
@@ -137,8 +149,12 @@ class Flux2Transformer(nn.Module):
 
     @nn.compact
     def __call__(self, x, time, conditioning: DenoisingCondition, train: bool = False):
-        """`train` is the objective's standard call contract; the published
-        transformer holds no dropout, so it changes nothing here."""
+        """Return the flow for the latents `x` at `time` under `conditioning`.
+
+        `train` is part of the objective's standard call; the published
+        transformer has no dropout, so it changes nothing here. Raises
+        `ValueError` for latents that are not NHWC.
+        """
         if x.ndim != 4:
             raise ValueError(f"FLUX.2 takes NHWC latents, got shape {x.shape}")
         batch, rows, columns, _ = x.shape

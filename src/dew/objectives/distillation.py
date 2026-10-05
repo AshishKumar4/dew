@@ -1,29 +1,29 @@
 """Knowledge distillation from a frozen teacher, as MaxText 0.2.4 trains it.
 
-A student objective scores a batch the way it always does, a frozen teacher
-scores the same batch, and the loss mixes the student's own with the KL
-between the two temperature-softened token distributions and, over named
-layer pairs, a distance between their hidden states:
+A student objective scores a batch the way it always does, and a frozen
+teacher scores the same batch. The loss mixes the student's own loss with
+the KL between the two temperature-softened token distributions and, over
+named layer pairs, with a distance between their hidden states:
 
     (1 - alpha) * student + alpha * T^2 * KL(teacher_T || student_T) + beta * feature
 
-every term summed over the positions the student counts, with the student's
-weights, and divided by the student's mass (`distillation_utils.py:492-547`,
-`:562-566`). The feature term averages the pairs' per-position cosine
-distance or mean squared error (`:418-436`). alpha, T and beta are
-`optax` schedules of the step the trainer hands the objective, or constants;
-MaxText's linear and cosine anneals (`:165-194`) are `optax.linear_schedule`
-and `optax.cosine_decay_schedule(start, steps, alpha=end / start)`.
+Every term is summed over the positions the student counts, with the
+student's weights, and divided by the student's mass. The feature term
+averages the pairs' per-position cosine distance or mean squared error.
+alpha, T and beta are each a constant or an `optax` schedule of the step the
+trainer passes the objective. MaxText's linear and cosine anneals are
+`optax.linear_schedule` and
+`optax.cosine_decay_schedule(start, steps, alpha=end / start)`.
 
-The teacher's variables live in the tree's `teacher` collection beside the
-student's, so they reach the compiled step as arguments and the optimizer,
+The teacher's variables are in the tree's `teacher` collection beside the
+student's, so they reach the compiled step as arguments, and the optimizer,
 the EMA and the student's published weights never see them. A layer pair
 whose widths differ gets a trainable `[student, teacher]` projection under
-`params/distillation`; the student is projected onto the teacher.
+`params/distillation`, which projects the student onto the teacher.
 
-Any objective that scores token logits serves as student or teacher through
-`Objective.predict`; `LMObjective` does. Both score the same batch, so they
-share a tokenizer, and a vocabulary mismatch is refused.
+Any objective that scores token logits can be the student or the teacher
+through `Objective.predict`; `LMObjective` does. Both score the same batch,
+so they must share a tokenizer, and a vocabulary mismatch is refused.
 """
 
 from __future__ import annotations
@@ -59,12 +59,13 @@ FeatureLoss = Literal["cosine", "l2"]
 
 def _schedule(value: Weight) -> optax.Schedule:
     """Wrap a constant as the step-indexed schedule every weight is read as."""
+    # MaxText's anneals: distillation_utils.py:165-194.
     return value if callable(value) else optax.constant_schedule(value)
 
 
 @objectives("distillation")
 class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
-    """Mix the student's own loss with a frozen teacher's soft targets."""
+    """Mixes the student's own loss with a frozen teacher's soft targets."""
 
     def __init__(
         self,
@@ -80,17 +81,20 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
         """Build a distillation of `teacher` into `student` over one batch.
 
         `alpha` weights the KL against the student's own loss (MaxText's
-        `distill_alpha`), and `temperature` softens both distributions
-        before the KL and scales it by its square (`distill_temperature`).
+        `distill_alpha`). `temperature` softens both distributions before the
+        KL and scales the KL by its square (`distill_temperature`).
 
         `features` names `(teacher layer, student layer)` pairs whose output
-        states the feature term compares, `beta` weights it
-        (`distill_beta`) and `feature_loss` picks the distance
+        states the feature term compares. `beta` weights that term
+        (`distill_beta`), and `feature_loss` picks the distance
         (`distill_feature_loss_type`): the cosine distance with MaxText's
-        1e-6 norm floor, or the squared error averaged over the width. No
-        pairs leaves the term out; a `beta` with no pairs is refused.
+        1e-6 norm floor, or the squared error averaged over the width. With
+        no pairs the term is left out, and a nonzero `beta` with no pairs
+        raises `ValueError`.
 
-        Each of the three is a constant or an `optax.Schedule` of the step.
+        Each of `alpha`, `temperature` and `beta` is a constant or an
+        `optax.Schedule` of the step. A constant outside its range (alpha in
+        [0, 1], temperature above 0, beta at least 0) raises `ValueError`.
         """
         for name, value, ok in (("alpha", alpha, lambda v: 0 <= v <= 1),
                                 ("temperature", temperature, lambda v: v > 0),
@@ -150,10 +154,10 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
         return tree
 
     def student_variables(self, params: Variables) -> Variables:
-        """Cut the student's own tree out of the whole.
+        """Return the student's own tree, without the teacher or the feature projections.
 
-        That is what the student's methods read, and what a distilled
-        checkpoint hands on to a plain student run.
+        The student's methods read this tree, and a distilled checkpoint
+        passes it on to a plain student run.
         """
         own = {name: value for name, value in params.items() if name != TEACHER}
         if PROJECTIONS in own["params"]:
@@ -182,6 +186,7 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
 
     def _distance(self, student: jax.Array, teacher: jax.Array) -> jax.Array:
         """The pair's per-position feature distance, `[B, S]`, in fp32."""
+        # MaxText's distillation_utils.py:418-436.
         student, teacher = student.astype(jnp.float32), teacher.astype(jnp.float32)
         if self.feature_loss == "cosine":
             return optax.cosine_distance(student, teacher, epsilon=1e-6)
@@ -192,7 +197,8 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
         alpha, temperature, beta = (jnp.asarray(schedule(step.step), jnp.float32) for schedule in
                                     (self.alpha, self.temperature, self.beta))
         # Every term is summed with the student's weights and divided by its
-        # mass, the teacher's reported loss included.
+        # mass, the teacher's reported loss included (MaxText's
+        # distillation_utils.py:492-547 and :562-566).
         weights = student.weights.astype(jnp.float32)
         mass = statistics.mass
         counted = jnp.where(mass > 0, mass, 1)
@@ -227,7 +233,7 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
                                     scored=scored)
 
     def pipeline(self, state: TrainState, *, ema: bool | None = None):
-        """The student as its inference task; the teacher stays behind."""
+        """Return the student's inference pipeline, without the teacher."""
         return self.student.pipeline(
             replace(state, variables=self.student_variables(state.variables),
                     ema=None if state.ema is None else self.student_variables(state.ema)),

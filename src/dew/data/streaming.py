@@ -18,21 +18,21 @@ if TYPE_CHECKING:
 @datasets("online_images")
 @dataclasses.dataclass(frozen=True)
 class OnlineImages(DatasetSpec):
-    """Fetches images by url as they are read, an endless stream.
+    """Fetches images by url as they are read, as an endless stream.
 
-    `sources` name hub datasets or `gs://` directories saved with
-    `save_to_disk`, whose rows carry a url and a caption. The rows are
+    `sources` names hub datasets, or `gs://` directories saved with
+    `save_to_disk`, whose rows hold a url and a caption. The rows are
     concatenated, shuffled once and sharded by the reader's share. Each
-    reader then walks its shard forever, reshuffling between passes, so
-    nothing is held out and the stream cannot resume mid-epoch. What a share
-    yields is whichever fetches succeed first, so no two processes can read
-    one share alike, and a partition whose shares have several readers is
-    refused.
+    reader then reads its shard over and over, reshuffling between passes.
+    So nothing is held out for validation, and the stream cannot resume
+    partway through an epoch. A share yields whichever fetches succeed
+    first, so two processes cannot read one share identically, and a
+    partition whose shares have more than one reader raises `ValueError`.
 
     A row is dropped and counted when its url yields no image, or when the
-    image is not RGB, under `min_image_size` on its shorter side, more than
-    2.4 times as long as wide, or a single flat colour. Needs the streaming
-    extra (HF `datasets`).
+    image is not RGB, is under `min_image_size` on its shorter side, is more
+    than 2.4 times as long as it is wide, or is a single flat colour. This
+    needs the streaming extra (HF `datasets`).
     """
 
     sources: tuple[str, ...] = ()
@@ -40,16 +40,18 @@ class OnlineImages(DatasetSpec):
     min_image_size: int = 128
     loading: Loading = dataclasses.field(
         default=Loading(workers=16, threads=512, worker_buffer=20), kw_only=True)
-    """How the fetch pool runs, which is this spec's own and not a grain
-    reader. `workers` and `threads` are the pool's, `worker_buffer` is how
-    many batches the fetchers run ahead, and `read_buffer` does not reach
-    this path. The grain default is shaped for file reads rather than for a
-    pool waiting on urls."""
+    """The settings of this spec's own fetch pool, which is not a grain reader.
+
+    `workers` and `threads` size the pool, `worker_buffer` is how many
+    batches the fetchers run ahead, and `read_buffer` is not used. The
+    default differs from grain's, which is sized for file reads and not for
+    a pool waiting on urls.
+    """
     timeout: int = 15
     retries: int = 3
 
     def fetch(self) -> Fetch:
-        """How a fetcher turns one of this spec's urls into a sample."""
+        """Return the settings a fetcher uses to turn one of this spec's urls into a sample."""
         from .online_loader import Fetch
 
         return Fetch(size=self.image_size, min_size=self.min_image_size,
@@ -83,14 +85,14 @@ class OnlineImages(DatasetSpec):
 @datasets("online_videos")
 @dataclasses.dataclass(frozen=True)
 class OnlineVideos(OnlineImages):
-    """Fetches video clips by url as they are read, an endless stream.
+    """Fetches video clips by url as they are read, as an endless stream.
 
     Each url's video is decoded the way `VideoDataset` reads a local clip:
     `frames` consecutive frames at 25 fps from a random start, each resized
-    to an `image_size` square, and no audio. A row is dropped and counted
-    when its url yields no video `frames` long, or when the video is under
-    `min_image_size` on its shorter side. Needs the streaming extra and the
-    `av` extra.
+    to an `image_size` square, without audio. A row is dropped and counted
+    when its url yields no video at least `frames` frames long, or when the
+    video is under `min_image_size` on its shorter side. This needs the
+    streaming extra and the `av` extra.
     """
 
     frames: int = 16

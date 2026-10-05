@@ -1,10 +1,11 @@
 """Online RL objectives: rollouts, preference losses and group updates.
 
-These compose the array math in `dew.rl`; the import gate in
-tests/test_rl_imports.py keeps that arrow one way. `dew.rl` may read `dew`,
-and nothing under `dew` outside these two packages may read `dew.rl`.
+These objectives combine the array math in `dew.rl`. Imports go one way:
+`dew.rl` may import from `dew`, and nothing in `dew` outside `dew.rl` and
+this package may import `dew.rl`.
 """
 
+# tests/test_rl_imports.py enforces the one-way import rule above.
 from .episodes import (
                        Action,
                        Environment,

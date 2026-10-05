@@ -1,18 +1,19 @@
 """Z-Image's single-stream transformer (S3-DiT), as Diffusers 0.40.0's
 `ZImageTransformer2DModel` runs it for text-to-image.
 
-2x2 latent patches are one token each; each stream pads to a multiple of 32
-tokens with a learned pad token (the image's at position (0, 0, 0)). Two
-time-modulated refiner blocks run over the image, two unmodulated over the
-prompt, then the main blocks over both, image first; every block RMS-norms
-before and after attention and the SwiGLU, its residuals gated by the tanh
-of the time modulation. The three-axis rotary places prompt token i at
-(1 + i, 0, 0) and patch (h, w) at (1 + P, h, w), P the padded prompt length,
-looked up in a float64 table rounded to float32 as the source does. The
-source pads a batch to its longest row and masks; here the prompt region is
-the conditioner's budget rounded up to 32, masked the same way. The source
-takes time 1 - sigma and returns the negated flow; this takes Dew's model
-time and returns Dew's flow.
+Each 2x2 latent patch is one token. Each stream is padded to a multiple of 32
+tokens with a learned pad token, and the image's pad tokens sit at position
+(0, 0, 0). Two time-modulated refiner blocks run over the image and two
+unmodulated ones over the prompt, then the main blocks run over both, image
+first. Every block RMS-norms before and after the attention and the SwiGLU,
+and the tanh of the time modulation gates its residuals. The three-axis
+rotary places prompt token i at (1 + i, 0, 0) and patch (h, w) at
+(1 + P, h, w), where P is the padded prompt length. The angles are looked up
+in a float64 table rounded to float32, as the source does. The source pads a
+batch to its longest row and masks; here the prompt region is the
+conditioner's budget rounded up to 32, masked the same way. The source takes
+time 1 - sigma and returns the negated flow, while this module takes Dew's
+model time and returns Dew's flow.
 """
 
 from __future__ import annotations
@@ -45,10 +46,12 @@ modulate by: `min(dim, 256)`."""
 
 
 def rotary_table(dim: int, length: int, theta: float) -> tuple[np.ndarray, np.ndarray]:
-    """One axis of `RopeEmbedder.precompute_freqs_cis`: the cosine and sine
-    of each integer position's angles, `[length, dim // 2]`. The angles are
-    float64 products rounded to float32, and the source takes their float32
-    cosine and sine."""
+    """Return one axis of `RopeEmbedder.precompute_freqs_cis`: cosines and sines `[length, dim // 2]`.
+
+    There is one angle per channel pair at each integer position. The angles
+    are float64 products rounded to float32, and the source takes their
+    float32 cosine and sine.
+    """
     frequencies = 1.0 / theta ** (np.arange(0, dim, 2, dtype=np.float64) / dim)
     angles = np.outer(np.arange(length, dtype=np.float64), frequencies).astype(np.float32).astype(np.float64)
     return np.cos(angles).astype(np.float32), np.sin(angles).astype(np.float32)
@@ -86,9 +89,13 @@ class _FeedForward(nn.Module):
 
 
 class ZImageBlock(nn.Module):
-    """One `ZImageTransformerBlock`. With `modulation`, the time embedding's
-    one map gives the attention's and the feed-forward's input scales (one
-    plus) and output gates (tanh)."""
+    """Runs one `ZImageTransformerBlock`.
+
+    With `modulation`, one projection of the time embedding gives the input
+    scales (one plus the projection) and the output gates (its tanh) of the
+    attention and the feed-forward. Without it, as in the prompt's refiner
+    blocks, the block has no time modulation.
+    """
 
     features: int
     heads: int
@@ -132,12 +139,12 @@ class ZImageBlock(nn.Module):
                ("final_linear",): ("embed", None), ("final_modulation",): (None, "embed"),
                ("t_embedder_1",): (None, "mlp"), ("t_embedder_2",): ("mlp", None)})
 class ZImageTransformer(nn.Module):
-    """Diffusers 0.40.0's `ZImageTransformer2DModel` over Dew's interface.
+    """Runs Diffusers 0.40.0's `ZImageTransformer2DModel` behind Dew's model interface.
 
     `__call__` takes NHWC latents, the model time the schedule supplies (the
-    sigma times the training count) and a `DenoisingCondition` whose
-    `context` is the prompt states padded on the right to a fixed budget and
-    whose `mask` marks the real tokens, and returns the flow.
+    sigma times the training count) and a `DenoisingCondition`, and returns
+    the flow. The condition's `context` is the prompt states, padded on the
+    right to a fixed budget, and its `mask` marks the real tokens.
     """
 
     in_channels: int = 16
@@ -168,8 +175,13 @@ class ZImageTransformer(nn.Module):
 
     @nn.compact
     def __call__(self, x, time, conditioning: DenoisingCondition, train: bool = False):
-        """`train` is the objective's standard call contract; the published
-        transformer holds no dropout, so it changes nothing here."""
+        """Return the flow for the latents `x` at `time` under `conditioning`.
+
+        `train` is part of the objective's standard call; the published
+        transformer has no dropout, so it changes nothing here. Raises
+        `ValueError` for latents of odd height or width, and for a condition
+        without a `mask`.
+        """
         if x.ndim != 4 or x.shape[1] % 2 or x.shape[2] % 2:
             raise ValueError(f"Z-Image takes NHWC latents of even height and width, got shape {x.shape}")
         if conditioning.mask is None:

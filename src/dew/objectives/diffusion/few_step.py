@@ -1,17 +1,18 @@
 """Few-step generators trained from scratch: MeanFlow and shortcut models.
 
-MeanFlow (Geng et al. 2025, "Ratio Flows for One-step Generative Modeling")
+MeanFlow (Geng et al. 2025, "Mean Flows for One-step Generative Modeling")
 trains a model of the average velocity u(z_t, r, t) over [r, t] through the
-MeanFlow identity u = v - (t - r) du/dt, the total derivative taken along
-the flow with one JVP. One step of the average velocity then crosses the
+MeanFlow identity u = v - (t - r) du/dt, where one JVP takes the total
+derivative along the flow. One step of the average velocity then crosses the
 whole interval. The official code is Gsunshine/meanflow's `MeanFlow`, in
 JAX, which `tools/meanflow_reference.py` runs.
 
 Shortcut models (Frans et al. 2025, "One Step Diffusion via Shortcut
-Models") train a velocity conditioned on its step size d: flow matching at
-the smallest step, and self-consistency, one step of 2d is two of d, on a
-fraction of the batch. The official code is kvfrans/shortcut-models'
-`get_targets`, in JAX, which `tools/shortcut_reference.py` runs.
+Models") train a velocity conditioned on its step size d. They train flow
+matching at the smallest step, and on a fraction of the batch they train
+self-consistency: one step of 2d equals two steps of d. The official code is
+kvfrans/shortcut-models' `get_targets`, in JAX, which
+`tools/shortcut_reference.py` runs.
 """
 
 from __future__ import annotations
@@ -38,53 +39,70 @@ Velocity = Callable[[jax.Array, jax.Array, jax.Array], jax.Array]
 
 
 def intervals(t: jax.Array, r: jax.Array, instantaneous: float) -> tuple[jax.Array, jax.Array]:
-    """MeanFlow's interval draw from two independent times: the later is t
-    and the earlier r, and the first `instantaneous` fraction of the rows
-    takes r = t, the plain flow-matching case (`sample_tr`)."""
+    """Return MeanFlow's (t, r) interval draw from two independent times.
+
+    The later time is t and the earlier is r. The first `instantaneous`
+    fraction of the rows takes r = t, the plain flow-matching case (the
+    reference's `sample_tr`).
+    """
     t, r = jnp.maximum(t, r), jnp.minimum(t, r)
     count = t.shape[0]
     return t, jnp.where(jnp.arange(count) < int(count * instantaneous), t, r)
 
 
 def guided_velocity(v, unconditional, conditional, omega, kappa):
-    """MeanFlow's training-time guidance (`guidance_fn`): the target
-    velocity mixes the sample's v with the model's own unconditional and
-    conditional velocities, omega v + (1 - omega - kappa) v_u + kappa v_c;
-    kappa 0 is v_u + omega (v - v_u)."""
+    """Return MeanFlow's training-time guided target velocity (the reference's `guidance_fn`).
+
+    It mixes the sample's v with the model's own unconditional and
+    conditional velocities: omega v + (1 - omega - kappa) v_u + kappa v_c.
+    With kappa 0 this is v_u + omega (v - v_u).
+    """
     return omega * v + (1 - omega - kappa) * unconditional + kappa * conditional
 
 
 def mean_flow_target(velocity: Velocity, z, t, r, v) -> tuple[jax.Array, jax.Array]:
-    """The model's average velocity at (z, t, r) and its regression target
-    v - (t - r) du/dt, the derivative along (dz/dt, dt/dt, dr/dt) = (v, 1,
-    0) by one JVP, with no gradient through the target."""
+    """Return the model's average velocity at (z, t, r) and its regression target v - (t - r) du/dt.
+
+    One JVP takes the derivative along (dz/dt, dt/dt, dr/dt) = (v, 1, 0). No
+    gradient flows through the target.
+    """
     u, derivative = jax.jvp(velocity, (z, t, r), (v, jnp.ones_like(t), jnp.zeros_like(r)))
     target = v - expand(jnp.clip(t - r, 0.0, 1.0), derivative) * derivative
     return u, jax.lax.stop_gradient(target)
 
 
 def adaptive_loss(u, target, power: float, epsilon: float) -> jax.Array:
-    """Each row's squared error summed over its entries, divided by the
-    stopped (error + epsilon)^power: MeanFlow's adaptive weighting, whose
-    power 0 is the plain error and power 1 a near-unit loss per row."""
+    """Return MeanFlow's adaptively weighted loss for each row.
+
+    Each row's squared error is summed over its entries and divided by the
+    stopped (error + epsilon)^power. Power 0 gives the plain error, and
+    power 1 gives a loss near one per row.
+    """
     error = jnp.sum(jnp.square(u - target), axis=tuple(range(1, u.ndim)))
     return error / jax.lax.stop_gradient((error + epsilon) ** power)
 
 
 def shortcut_levels(rows: int, sections: int) -> jax.Array:
-    """The step levels of the self-consistency rows, a step of 2^-level:
-    `rows // log2(sections)` rows per level from the coarsest, the rest at
-    level 0, one step across the whole path (`get_targets`)."""
+    """Return the step levels of the self-consistency rows, where level l is a step of 2^-l.
+
+    Each level gets `rows // log2(sections)` rows, starting with the finest
+    level, log2(sections) - 1, and ending with level 0. The remaining rows are
+    also at level 0, one step across the whole path (the reference's
+    `get_targets`).
+    """
     count = int(np.log2(sections))
     levels = jnp.repeat(count - 1 - jnp.arange(count), rows // count)
     return jnp.concatenate([levels, jnp.zeros(rows - levels.shape[0], levels.dtype)])
 
 
 def shortcut_target(velocity: Velocity, x, sigma, step) -> jax.Array:
-    """Self-consistency: the velocity of one step of `step` from `x` at
-    `sigma` is the mean of two of half that size, each state clipped to
-    [-4, 4] as the reference clips it. `velocity(x, sigma, sigma - step)`
-    is the model's over the interval to `sigma - step`."""
+    """Return the self-consistency target for one step of size `step` from `x` at `sigma`.
+
+    The target is the mean velocity of two steps of half that size, with each
+    state clipped to [-4, 4] as the reference clips it.
+    `velocity(x, sigma, sigma - step)` is the model's velocity over the
+    interval to `sigma - step`.
+    """
     half = step / 2
     first = velocity(x, sigma, sigma - half)
     midway = jnp.clip(x - expand(half, x) * first, -4, 4)
@@ -94,23 +112,26 @@ def shortcut_target(velocity: Velocity, x, sigma, step) -> jax.Array:
 
 @objectives("mean_flow")
 class MeanFlowObjective(DiffusionObjective):
-    """MeanFlow on an interval process (`presets.MeanFlow`).
+    """Trains MeanFlow on an interval process (`presets.MeanFlow`).
 
-    `instantaneous` is the fraction of rows trained at r = t (the
-    reference's `data_proportion`, 0.75). `omega` and `kappa` are its
-    training-time guidance, applied where t lies in `guidance_interval`;
-    omega 1 and kappa 0 train without it. `norm_p` and `norm_eps` are the
-    adaptive weighting's power and epsilon. The condition is dropped on
-    `unconditional_prob` of the rows, whose target is then the unguided v;
-    as the reference's `cond_drop` drops them, the dropped rows are the
-    first ones, as many as a draw at that rate counts, so they fall on the
-    instantaneous rows, which the training-time guidance reads the
-    unconditional velocity at. Sampling takes `steps - 1` Euler steps of the average velocity, one by
-    default, with no guidance at sampling: it is trained in.
+    `instantaneous` is the fraction of rows trained at r = t (the reference's
+    `data_proportion`, 0.75). `omega` and `kappa` set the training-time
+    guidance, applied where t lies in `guidance_interval`; omega 1 and kappa
+    0 train without guidance. `norm_p` and `norm_eps` are the adaptive
+    weighting's power and epsilon.
 
-    The loss differentiates the model in time, so the model's time
-    embedding must be smooth in it: `simple_dit(time_scale=0.002)`, which
-    a run config sets for it, rather than the default 16.
+    The condition is dropped on `unconditional_prob` of the rows, and the
+    target of a dropped row is the unguided v. As in the reference's
+    `cond_drop`, the dropped rows are the first ones, as many as a draw at
+    that rate counts. They therefore fall on the instantaneous rows, which is
+    where the training-time guidance reads the unconditional velocity.
+    Sampling takes `steps - 1` Euler steps of the average velocity, one by
+    default. It uses no guidance, because the guidance is trained into the
+    model.
+
+    The loss differentiates the model with respect to time, so the model's
+    time embedding must be smooth in time. A run config sets
+    `simple_dit(time_scale=0.002)` for this, in place of the default 16.
     """
 
     def __init__(self, model: nn.Module, process: Process, inputs: InputSpec, *,
@@ -199,20 +220,20 @@ _NOISE_FLOOR = 1e-5
 
 @objectives("shortcut")
 class ShortcutObjective(DiffusionObjective):
-    """A shortcut model on an interval process (`presets.Shortcut`).
+    """Trains a shortcut model on an interval process (`presets.Shortcut`).
 
-    `sections` is the finest grid, the reference's `denoise_timesteps`
-    (128): flow-matching rows train at one step of 1 / sections, on times
-    of that grid. One row in `bootstrap_every` (8) trains self-consistency
-    at a level of `shortcut_levels`, on times of that level's grid, against
-    two half steps of the EMA weights when the run keeps them. The
-    condition is dropped on `unconditional_prob` of the flow-matching rows.
-    The path is the reference's, whose noise never quite vanishes: data
-    at t is (1 - (1 - 1e-5) t) noise + t data, Dew's sigma being 1 - t,
-    and the velocity toward the noise is (1 - 1e-5) noise - data.
-    Sampling walks `steps - 1` equal Euler steps with no guidance; a count
-    of steps that is a power of two up to `sections` is one the model
-    trained at.
+    `sections` is the finest grid, the reference's `denoise_timesteps` (128).
+    Flow-matching rows train at one step of 1 / sections, on times of that
+    grid. One row in `bootstrap_every` (8) trains self-consistency at a level
+    from `shortcut_levels`, on times of that level's grid. Its target is two
+    half steps of the EMA weights when the run keeps them. The condition is
+    dropped on `unconditional_prob` of the flow-matching rows.
+
+    The path is the reference's, whose noise never quite vanishes. The state
+    at t is (1 - (1 - 1e-5) t) noise + t data, where Dew's sigma is 1 - t,
+    and the velocity toward the noise is (1 - 1e-5) noise - data. Sampling
+    takes `steps - 1` equal Euler steps with no guidance. Step counts that
+    are powers of two up to `sections` are the ones the model trained at.
     """
 
     def __init__(self, model: nn.Module, process: Process, inputs: InputSpec, *,

@@ -159,11 +159,13 @@ def _row_start(reference: HostProcessor) -> int | None:
 
 @dataclass(frozen=True)
 class Processor:
-    """Runs host text and image preprocessing, then normalizes the numeric layout.
+    """Runs a checkpoint's own processor on the host and arranges its outputs as native model inputs.
 
-    The checkpoint processor owns resizing, normalization and special-token
-    expansion. Dew organizes its outputs into row-aligned arrays; it does
-    not reproduce the checkpoint's image preprocessing algorithms.
+    The checkpoint's processor does the resizing, normalization and
+    special-token expansion. Dew arranges its outputs into row-aligned
+    arrays; it does not reproduce the checkpoint's image preprocessing
+    algorithms. Calling it with text, and optionally `images`, `audio` or
+    `videos`, returns `ModelInputs`.
     """
 
     reference: HostProcessor
@@ -208,11 +210,11 @@ class Processor:
 
     def chat(self, messages: Sequence[Mapping[str, object]], *, add_generation_prompt: bool = True,
              **template_options: JSON) -> ModelInputs:
-        """Run the source's actual chat template and processor into numeric inputs.
+        """Apply the checkpoint's own chat template and processor to `messages` and return numeric inputs.
 
-        Template controls such as reasoning_effort and preserve_thinking are
-        interpreted by the checkpoint template. Media-bearing content uses
-        the same reference processor and numeric normalization as plain text.
+        The checkpoint's template interprets template options such as
+        `reasoning_effort` and `preserve_thinking`. Messages with media go
+        through the same processor and numeric normalization as plain text.
         """
         values = self.reference.apply_chat_template(
             messages, tokenize=True, return_dict=True, return_tensors="pt",
@@ -233,7 +235,11 @@ class Processor:
         return self.from_hf(arrays)
 
     def from_hf(self, values: Mapping[str, object]) -> ModelInputs:
-        """Validate and normalize actual processor outputs before device use."""
+        """Check a processor's raw outputs and turn them into `ModelInputs` for the device.
+
+        A field with no native model input, or `input_ids` that are not
+        nonempty integer `[B, S]` rows, raises ValueError.
+        """
         known = {"input_ids", "attention_mask", "pixel_values", "token_type_ids", "mm_token_type_ids",
                  "image_position_ids", "image_grid_thw", "input_features", "input_features_mask",
                  "pixel_values_videos", "video_grid_thw", "video_position_ids"}
@@ -576,7 +582,7 @@ class Processor:
         return jnp.asarray(prepared)
 
     def decode(self, tokens: jax.typing.ArrayLike) -> list[str]:
-        """Decode token rows with the tokenizer retained by the source processor."""
+        """Decode integer `[B, S]` token rows with the processor's tokenizer, skipping special tokens."""
         array = np.asarray(tokens)
         if array.ndim != 2 or not np.issubdtype(array.dtype, np.integer):
             raise ValueError("decode expects integer [B, S] token rows")
@@ -588,5 +594,5 @@ class Processor:
         return _row_start(self.reference)
 
     def save_pretrained(self, directory: str | Path) -> None:
-        """Save the same processor and tokenizer used by this source."""
+        """Save the processor and tokenizer this object uses to `directory`."""
         self.reference.save_pretrained(str(directory))
