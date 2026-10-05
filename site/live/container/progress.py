@@ -126,6 +126,9 @@ def _ready(result: Any) -> bool:
 class StalePage(ValueError):
     """A page requests a model revision absent from the offline runtime."""
 
+    def _render_traceback_(self) -> list[str]:
+        return [str(self)]
+
 
 class ReportingModels:
     """`load`, one of the setup cell's loaders, reporting each model's load and
