@@ -45,6 +45,7 @@ from dew.interop.safetensors_io import LazyTensors
 if TYPE_CHECKING:
     from dew.interop.families.deepseek_v41 import DSparkFields, EngramFields
 from dew.interop.streaming import LazyTree, SourceLeaf, WeightLayout, materialize
+from dew.interop.weights import checkpoint_dtype, insert
 from dew.nn import audio as audio_nn, vision as vision_nn
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture, RematPolicy
@@ -52,7 +53,7 @@ from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.kv_cache import KVCache
 from dew.nn.mixers import AttentionMixer, MixerBase
 from dew.nn.moe import GatedActivation, Situ
-from dew.nn.text_encoders import check_tree, checkpoint_dtype, insert
+from dew.nn.text_encoders import check_tree
 from dew.objectives.base import Variables
 from dew.registry import from_record, mixers, towers
 

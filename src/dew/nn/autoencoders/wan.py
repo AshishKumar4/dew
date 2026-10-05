@@ -22,7 +22,6 @@ causal convolution that doubles the channels. The decoder clamps pixels to
 """
 from __future__ import annotations
 
-import json
 import math
 from collections.abc import Mapping
 from itertools import pairwise
@@ -36,7 +35,7 @@ import numpy as np
 from flax.typing import Dtype
 
 from dew import records
-from dew.nn.text_encoders import check_tree
+from dew.interop.components import bind_component, component_source
 from dew.objectives.base import Variables
 
 from ..conv import Conv
@@ -491,28 +490,18 @@ def load_wan_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str 
 
     Supplied `params` are bound unchanged: only the config is read, and no
     source layouts are returned. `lazy` leaves read ones `SourceLeaf`s for a
-    placement to read (`dew.interop.diffusion.record_layouts`)."""
-    from dew.interop import diffusion, sources
-
-    directory = sources.snapshot(
-        str(name_or_dir), revision, weights=(subfolder,) if params is None else False
-    )
-    config = json.loads((directory / subfolder / "config.json").read_text())
+    placement to read (`dew.interop.weights.record_layouts`)."""
+    directory, config = component_source(name_or_dir, revision, subfolder, weights=params is None)
     if config.get("_class_name") != "AutoencoderKLWan":
         raise ValueError(
-            f"{directory / subfolder} holds a {config.get('_class_name')}, not an AutoencoderKLWan"
+            f"{directory} holds a {config.get('_class_name')}, not an AutoencoderKLWan"
         )
     model = WanVAE(**wan_vae_fields(config), dtype=compute)
-    layouts: tuple[WeightLayout, ...] = ()
-    if params is None:
-        tensors = diffusion.component_tensors(directory, subfolder)
-        params, layouts = diffusion.record_layouts(
-            "vae", tensors, lambda name: wan_vae_path(name, np.ndim(tensors[name])), ("autoencoder",),
-            param_dtype=param_dtype, lazy=lazy)
     video = jax.ShapeDtypeStruct(
         (1, 1 + model.temporal_factor, model.downscale_factor, model.downscale_factor, 3), jnp.float32
     )
-    check_tree({"params": params}, model, video)
-    autoencoder = WanAutoencoder(model=model, params=params, latents_mean=config["latents_mean"],
-                                 latents_std=config["latents_std"])
-    return autoencoder, params, layouts, config
+    return bind_component(
+        directory, "vae", config, model, wan_vae_path,
+        lambda bound: WanAutoencoder(model=model, params=bound, latents_mean=config["latents_mean"],
+                                     latents_std=config["latents_std"]),
+        prefix=("autoencoder",), params=params, param_dtype=param_dtype, lazy=lazy, inputs=(video,))

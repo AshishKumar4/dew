@@ -45,8 +45,9 @@ from dew.inputs.diffusion import (
     T5Segment,
     WanConditioner,
 )
-from dew.interop import gguf, hf_decoders as decoders, mamba2, sources, verify
+from dew.interop import gguf, hf_decoders as decoders, mamba2, sources, verify, weights as checkpoint_weights
 from dew.interop.codecs import SourceQuantization, source_quantization
+from dew.interop.components import bind_component
 from dew.interop.generation_config import (
     audit_masked,
     eos_ids,
@@ -64,12 +65,12 @@ from dew.interop.processors import (
 )
 from dew.interop.safetensors_io import MAX_SHARD_SIZE
 from dew.interop.streaming import LazyTree, SourceLeaf, WeightLayout
+from dew.interop.weights import ParamTree
 from dew.nn import audio as audio_nn
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.multimodal import MultimodalTransformer
-from dew.nn.text_encoders import ParamTree
 from dew.objectives.base import Variables
 from dew.registry import (
     dtype_name,
@@ -1105,7 +1106,7 @@ def _load_diffusion_source(directory: Path, index: Mapping[str, object], *, dtyp
     mapped files, for a placement to read one device shard at a time
     (`dew.inference.pipeline.place`), but for the convolution kernels and a
     UNet's per-head attention kernels, which are read whole
-    (`dew.interop.diffusion.record_layouts`). `text=False` binds the text
+    (`dew.interop.weights.record_layouts`). `text=False` binds the text
     encoder to no weights and leaves it out of the variables.
     """
     compute = resolve_dtype(dtype)
@@ -1539,16 +1540,12 @@ def _diffusion_vae(directory: Path, compute, *, param_dtype: str = "float32",
         post_quantize=diffusion.flag(config, "use_post_quant_conv", default=True),
         dtype=compute,
     )
-    layouts: tuple[WeightLayout, ...] = ()
-    if params is None:
-        tensors = diffusion.component_tensors(directory, "vae")
-        params, layouts = diffusion.record_layouts(
-            "vae", tensors, lambda name: _vae_path(name, np.ndim(tensors[name])), ("autoencoder",),
-            param_dtype=param_dtype, lazy=lazy)
-    autoencoder = StableDiffusionVAE(str(directory), dtype=compute, params=params, model=model,
-                                     latent_shift=config.get("shift_factor") or 0.0,
-                                     latent_scale=config.get("scaling_factor", 0.18215))
-    return autoencoder, params, layouts, config
+    return bind_component(
+        directory / "vae", "vae", config, model, _vae_path,
+        lambda bound: StableDiffusionVAE(str(directory), dtype=compute, params=bound, model=model,
+                                         latent_shift=config.get("shift_factor") or 0.0,
+                                         latent_scale=config.get("scaling_factor", 0.18215)),
+        prefix=("autoencoder",), params=params, param_dtype=param_dtype, lazy=lazy)
 
 
 def _clip_towers(directory: Path, names: tuple[str, ...], compute, *, param_dtype: str = "float32",
@@ -1557,19 +1554,20 @@ def _clip_towers(directory: Path, names: tuple[str, ...], compute, *, param_dtyp
     the layouts those parameters came from."""
     from transformers import CLIPTokenizer
 
-    from dew.interop import diffusion
     from dew.nn.text_encoders import CLIPTextTransformer, translate_config
 
     towers, tokenizers, layouts = [], [], ()
     bound = {} if params is None else params
     for name in names:
         config = _component_config(directory, name)
-        towers.append(CLIPTextTransformer(**translate_config(config), dtype=compute))
+        model = CLIPTextTransformer(**translate_config(config), dtype=compute)
+        tower, tree, recorded, _ = bind_component(
+            directory / name, name, config, model, lambda name, rank: _text_head_path(name),
+            lambda bound, model=model: model, prefix=("encoders", "conditioning", name),
+            params=params, param_dtype=param_dtype, lazy=lazy)
+        towers.append(tower)
         if params is None:
-            tower, recorded = diffusion.record_layouts(
-                name, diffusion.component_tensors(directory, name), _text_head_path,
-                ("encoders", "conditioning", name), param_dtype=param_dtype, lazy=lazy)
-            bound = {**bound, name: tower}
+            bound = {**bound, name: tree}
             layouts += recorded
         tokenizers.append(CLIPTokenizer.from_pretrained(
             directory / ("tokenizer" + name.removeprefix("text_encoder"))))
@@ -1586,20 +1584,16 @@ def _t5_tower(directory: Path, compute, component: str, tokens: int, *, param_dt
     the pipeline pads to.
     """
     from dew.data.text import load_tokenizer
-    from dew.interop import diffusion
     from dew.nn.text_encoders import T5EncoderTransformer, _t5_path, t5_embedding, translate_t5_config
 
     config = _component_config(directory, component)
     tower = T5EncoderTransformer(**translate_t5_config(config), dtype=compute)
-    layouts = ()
-    if params is None:
-        tensors = diffusion.component_tensors(directory, component)
-        t5_embedding(tensors)
-        params, layouts = diffusion.record_layouts(
-            component, tensors, _t5_path, ("encoders", "conditioning", component), param_dtype=param_dtype,
-            lazy=lazy)
-    tokenizer = load_tokenizer(str(directory / ("tokenizer" + component.removeprefix("text_encoder"))))
-    return T5Segment(tower, tokenizer, component, tokens), params, layouts, config
+    return bind_component(
+        directory / component, component, config, tower, lambda name, rank: _t5_path(name),
+        lambda bound: T5Segment(tower, load_tokenizer(str(directory / (
+            "tokenizer" + component.removeprefix("text_encoder")))), component, tokens),
+        prefix=("encoders", "conditioning", component), params=params,
+        param_dtype=param_dtype, lazy=lazy, validate=t5_embedding)
 
 
 def _wan_conditioning(directory: Path, compute, *, tokens: int, param_dtype: str,
@@ -1608,23 +1602,19 @@ def _wan_conditioning(directory: Path, compute, *, tokens: int, param_dtype: str
     """Build Wan's conditioner: the UMT5 encoder, its tokenizer, the
     parameters and their layouts."""
     from dew.data.text import load_tokenizer
-    from dew.interop import diffusion
     from dew.nn.text_encoders import T5EncoderTransformer, _t5_path, t5_embedding, translate_t5_config
 
     config = _component_config(directory, "text_encoder")
     if config.get("model_type") != "umt5":
         raise ValueError(f"Wan's text encoder is a umt5 model, not {config.get('model_type')!r}")
     tower = T5EncoderTransformer(**translate_t5_config(config), dtype=compute)
-    layouts: tuple[WeightLayout, ...] = ()
-    if params is None:
-        tensors = diffusion.component_tensors(directory, "text_encoder")
-        t5_embedding(tensors)
-        tree, layouts = diffusion.record_layouts(
-            "text_encoder", tensors, _t5_path, ("encoders", "conditioning", "text_encoder"),
-            param_dtype=param_dtype, lazy=lazy)
-        params = {"text_encoder": tree}
-    encoder = WanConditioner(tower, load_tokenizer(str(directory / "tokenizer")), params, str(directory),
-                             tokens=tokens, param_dtype=param_dtype)
+    encoder, _, layouts, _ = bind_component(
+        directory / "text_encoder", "text_encoder", config, tower, lambda name, rank: _t5_path(name),
+        lambda bound: WanConditioner(tower, load_tokenizer(str(directory / "tokenizer")),
+                                     bound if params is not None else {"text_encoder": bound},
+                                     str(directory), tokens=tokens, param_dtype=param_dtype),
+        prefix=("encoders", "conditioning", "text_encoder"), params=params,
+        param_dtype=param_dtype, lazy=lazy, validate=t5_embedding)
     return encoder, layouts, {"text_encoder": config}
 
 
@@ -1696,7 +1686,7 @@ def _qwen_image_conditioning(directory: Path, index: Mapping[str, object], compu
     decoder = from_record(CausalTransformer, built)
     layouts: tuple[WeightLayout, ...] = ()
     if params is None:
-        tower, layouts = diffusion.record_layouts(
+        tower, layouts = checkpoint_weights.record_layouts(
             "text_encoder", diffusion.component_tensors(directory, "text_encoder"),
             _qwen_text_path(record), ("encoders", "conditioning", "text_encoder"),
             param_dtype=param_dtype, lazy=lazy)
@@ -1778,7 +1768,7 @@ def _hidden_states_conditioning(directory: Path, index: Mapping[str, object], co
                          "encoder does not have before its final norm")
     layouts: tuple[WeightLayout, ...] = ()
     if params is None:
-        tower, layouts = diffusion.record_layouts(
+        tower, layouts = checkpoint_weights.record_layouts(
             "text_encoder", diffusion.component_tensors(directory, "text_encoder"),
             _hidden_states_path(record, records.text(text["model_type"], "model_type"), multimodal),
             ("encoders", "conditioning", "text_encoder"), param_dtype=param_dtype, lazy=lazy)
@@ -1811,10 +1801,10 @@ def _image_safety(directory: Path, compute, *, param_dtype: str = "float32",
         state = {name: value for name, value in tensors.items()
                  if (path := _safety_path(name)) is not None and len(path) == 1}
         weights = {name: value for name, value in tensors.items() if name not in state}
-        params, layouts = diffusion.record_layouts(
+        params, layouts = checkpoint_weights.record_layouts(
             "safety_checker", weights, _safety_path, ("encoders", "safety"), param_dtype=param_dtype,
             lazy=lazy)
-        scoring, state_layouts = diffusion.record_layouts(
+        scoring, state_layouts = checkpoint_weights.record_layouts(
             "safety_checker", state, _safety_path, ("encoders", "safety"), param_dtype="float32", lazy=lazy)
         params.update(scoring)
         layouts += state_layouts
