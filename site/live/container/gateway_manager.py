@@ -21,6 +21,12 @@ _uids = itertools.count(6100)
 
 
 class LimitedKernelManager(KernelGatewayIOLoopKernelManager):
+    def cleanup_connection_file(self):
+        super().cleanup_connection_file()
+        if self.connection_file:
+            connection = Path('/sessions/connections') / Path(self.connection_file).name
+            connection.unlink(missing_ok=True)
+
     async def _async_launch_kernel(self, kernel_cmd, **kwargs):
         uid = next(_uids)
         if uid >= 6200:
