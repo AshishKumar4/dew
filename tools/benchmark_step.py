@@ -44,7 +44,6 @@ Usage:
 
 import contextlib
 import dataclasses
-import glob
 import io
 import json
 import os
@@ -95,7 +94,7 @@ from dew.training.runtime import prepare_process
 from dew.training.trainer import remat_record
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from trace_window import kernel_category, length, overlap, union, window_split
+from trace_window import device_events, kernel_category, length, overlap, union, window_split
 
 # The CLIP-L/14 context's shape, from the library's table encoder: a benchmark
 # of the model should not spend its first minute downloading a text tower, and
@@ -906,16 +905,8 @@ def device_timeline(directory: str, steps: int) -> dict[str, Any]:
     not average utilization across devices. Category timings sum events
     and can overlap; they are not an additional wall-clock measurement.
     """
-    from jax.profiler import ProfileData
-
-    traces = sorted(glob.glob(os.path.join(directory, "**", "*.xplane.pb"), recursive=True),
-                    key=os.path.getmtime)
-    kernels = []
-    for plane in ProfileData.from_file(traces[-1]).planes:
-        if not plane.name.startswith("/device:"):
-            continue
-        kernels.extend((event.name, event.start_ns, event.end_ns)
-                       for line in plane.lines for event in line.events)
+    kernels = [(event.name, event.start_ns, event.end_ns)
+               for events in device_events(directory)[0].values() for event in events]
     if not kernels:
         raise ValueError(
             f"the trace under {directory} holds no device kernels: the profiler "
@@ -967,27 +958,15 @@ def communication(directory: str, steps: int) -> dict[str, Any]:
     overlapped, and idle time ended by a host-to-device copy (input) or by
     anything else (host), averaged over the devices.
 
-    Only the stream lines are read, since the derived lines (`XLA Ops`,
-    `XLA Modules`) repeat the same time under the program's names.
     `exposed_communication_ms_per_step` is the collective time no compute
     kernel on the same device ran beside: what overlap did not hide. Each
     HLO collective (`HLO_COLLECTIVES`) gets its own time and exposed time,
     `all_to_all_ms_per_step` and `all_to_all_exposed_ms_per_step`, from the
     op each NCCL kernel ran for.
     """
-    from jax.profiler import ProfileData
-
-    traces = sorted(glob.glob(os.path.join(directory, "**", "*.xplane.pb"), recursive=True),
-                    key=os.path.getmtime)
-    devices = []
-    for plane in ProfileData.from_file(traces[-1]).planes:
-        if not plane.name.startswith("/device:"):
-            continue
-        streams = [line for line in plane.lines if line.name.startswith("Stream")]
-        kernels = [event for line in streams or plane.lines for event in line.events]
-        if kernels:
-            devices.append(([(event.name, event.start_ns, event.end_ns) for event in kernels],
-                            [_hlo_collective(event) for event in kernels]))
+    devices = [([(event.name, event.start_ns, event.end_ns) for event in kernels],
+                [_hlo_collective(event) for event in kernels])
+               for kernels in device_events(directory)[0].values() if kernels]
     if not devices:
         raise ValueError(f"the trace under {directory} holds no device kernels")
 

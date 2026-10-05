@@ -1,13 +1,22 @@
 """Where one device's traced time went, read the same way by every tool.
 
 `tools/benchmark_step.py` reads JAX traces and `tools/reference_runs` reads
-both JAX and torch.profiler traces; each reduces its own trace format to
+both JAX and torch.profiler traces; each reduces its trace to
 `(name, start_ns, end_ns)` kernel records per device, and this module splits
-and names them. The standard library only, so a torch venv imports it too.
+and names them. Every JAX trace is read by `device_events`. The standard
+library only at import, so a torch venv imports it too.
 """
 
+from __future__ import annotations
+
+import os
 import re
 from collections.abc import Sequence
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from jax.profiler import ProfileEvent
 
 # NCCL names its kernels after the collective it runs:
 # `ncclDevKernel_AllGather_RING_LL`, `ncclDevKernel_ReduceScatter_Sum_bf16_RING_LL`,
@@ -37,6 +46,35 @@ KERNEL_CATEGORIES = (
               "pad", "broadcast", "select", "dynamic", "index", "embedding", "catarraybatchedcopy")),
     ("elementwise", ("fusion", "elementwise", "triton")),
 )
+
+
+def device_events(directory: str | Path) -> tuple[dict[str, list[ProfileEvent]], list[str]]:
+    """The kernel events of the newest JAX trace under `directory`, by device
+    plane (`/device:GPU:0`) in the trace's order, and the names of every
+    device line.
+
+    A GPU plane holds one line per CUDA stream; its `XLA Ops` and `XLA
+    Modules` lines are derived from the same kernels, and a module's span
+    runs across the idle gaps between them, so only stream lines count. A TPU
+    plane runs its HLO ops on one `XLA Ops` line, named after the HLO
+    instruction (`fusion.12`, `convolution.3`)."""
+    from jax.profiler import ProfileData
+
+    traces = sorted(Path(directory).rglob("*.xplane.pb"), key=os.path.getmtime)
+    if not traces:
+        raise FileNotFoundError(f"no xplane.pb under {directory}")
+    planes: dict[str, list[ProfileEvent]] = {}
+    lines = set()
+    for plane in ProfileData.from_file(str(traces[-1])).planes:
+        match = re.match(r"/device:(GPU|TPU):\d+", plane.name)
+        if match is None:
+            continue
+        for line in plane.lines:
+            lines.add(f"{plane.name}:{line.name}")
+            if (line.name.lower().startswith("stream") if match.group(1) == "GPU"
+                    else line.name == "XLA Ops"):
+                planes.setdefault(plane.name, []).extend(line.events)
+    return planes, sorted(lines)
 
 
 def kernel_category(name: str) -> str:
