@@ -393,6 +393,22 @@
    ],
    "note": "compute_density_for_timestep_sampling on the draws FlowMatchingScheduler.sample_t makes from jax.random.key(0)."
   },
+  "flow/draws.npz": {
+   "tool": "tools/flow_draw_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/diffusers",
+     "version": "v0.34.0 (50dea89dc6036e71a00bc3d57ac062a80206d9eb)",
+     "runs": "fetched"
+    },
+    {
+     "repo": "huggingface/diffusers",
+     "version": "0.34.0",
+     "runs": "diffusers"
+    }
+   ],
+   "note": "train_dreambooth_sd3.py and train_dreambooth_flux.py (SHA-256 pinned): their density draw, table indices, get_sigmas and compute_loss_weighting_for_sd3 statements read out of main and executed at the scripts' own defaults over the tiny sources' (published) scheduler configs, on Dew's FlowMatchingScheduler draws from jax.random.key(0), reflected for the descending table."
+  },
   "flow/loss.npz": {
    "tool": "tools/flow_loss_reference.py",
    "sources": [
