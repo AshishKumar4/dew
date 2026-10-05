@@ -18,12 +18,8 @@ from flax.traverse_util import flatten_dict
 
 from dew import records
 from dew.diffusion.block import BlockProcess
-from dew.interop.hf_decoders import (
-    DecoderFields,
-    _export_config,
-    translate_config,
-    translate_denoiser_weights,
-)
+from dew.interop.config_records import NativeFields
+from dew.interop.hf_decoders import _export_config, translate_config, translate_denoiser_weights
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.multimodal import VisionConditioner
@@ -72,8 +68,8 @@ def build(config: Mapping[str, object], *, dtype: str | None = "bfloat16",
     fields["causal"] = True
     if max_seq_len is not None:
         fields["max_seq_len"] = max_seq_len
-    precise: DecoderFields = {**fields, **precision_fields(
-        "causal_transformer", fields, dtype=dtype, attention_impl=attention_impl)}
+    precise = NativeFields(CausalTransformer, {**fields, **precision_fields(
+        "causal_transformer", fields, dtype=dtype, attention_impl=attention_impl)})
     text = from_record(CausalTransformer, precise)
     conditioner = None
     if config.get("vision_config") is not None:

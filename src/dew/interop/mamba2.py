@@ -26,6 +26,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from dew import records
+from dew.interop.config_records import native_fields
+from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.mixers.mamba2 import Mamba2Mixer
 
 if TYPE_CHECKING:
@@ -104,19 +106,19 @@ def config_from_hf(hf_config: Mapping[str, object], used: set[str] | None = None
         use_bias=flag("use_bias", default=False),
         use_conv_bias=flag("use_conv_bias", default=True),
         time_step_limit=(lower, upper))
-    fields: DecoderFields = {
-        "vocab_size": integer("vocab_size", 32768),
-        "emb_features": hidden,
-        "num_layers": integer("num_hidden_layers", 64),
-        "num_heads": 1,
-        "num_kv_heads": 1,
-        "head_dim": hidden,
-        "mlp_features": 0,
-        "qk_norm": False,
-        "norm_eps": records.number(hf_config.get("layer_norm_epsilon", 1e-5), "layer_norm_epsilon"),
-        "tie_embeddings": flag("tie_word_embeddings", default=False),
-        "mixer": mixer,
-    }
+    fields: DecoderFields = native_fields(CausalTransformer)(
+        vocab_size=integer("vocab_size", 32768),
+        emb_features=hidden,
+        num_layers=integer("num_hidden_layers", 64),
+        num_heads=1,
+        num_kv_heads=1,
+        head_dim=hidden,
+        mlp_features=0,
+        qk_norm=False,
+        norm_eps=records.number(hf_config.get("layer_norm_epsilon", 1e-5), "layer_norm_epsilon"),
+        tie_embeddings=flag("tie_word_embeddings", default=False),
+        mixer=mixer,
+    )
     return fields
 
 

@@ -48,6 +48,7 @@ from dew.inputs.diffusion import (
 from dew.interop import gguf, hf_decoders as decoders, mamba2, sources, verify, weights as checkpoint_weights
 from dew.interop.codecs import SourceQuantization, source_quantization
 from dew.interop.components import bind_component
+from dew.interop.config_records import NativeFields
 from dew.interop.generation_config import (
     audit_masked,
     eos_ids,
@@ -1770,17 +1771,17 @@ def _wrapper_text_fields(config: Mapping[str, object], record: decoders.WrapperF
     """
     family = config.get("model_type")
     text_config = records.record(config["text_config"], "text_config")
-    text_fields: decoders.DecoderFields = {**record["text"]}
+    text_fields = record["text"].copy()
     if max_seq_len is not None:
         text_fields["max_seq_len"] = max_seq_len
     if family == "gemma3":
         text_fields["final_logit_softcap"] = None
         text_fields["mixer"] = {"name": "attention", "fields": {"bidirectional_images": True}}
     if family == "gemma4" and text_config.get("use_bidirectional_attention") == "vision":
-        kinds = dict(text_fields.get("kinds") or {})
-        sliding: decoders.KindFields = {
+        kinds = decoders._kinds_of(text_fields).copy()
+        sliding = NativeFields(decoders.LayerKind, {
             **kinds.get("sliding_attention", {}),
-            "mixer": {"name": "attention", "fields": {"bidirectional_images": True}}}
+            "mixer": {"name": "attention", "fields": {"bidirectional_images": True}}})
         kinds["sliding_attention"] = sliding
         text_fields["kinds"] = kinds
     if family in _QWEN35_TYPES:
@@ -1789,11 +1790,11 @@ def _wrapper_text_fields(config: Mapping[str, object], record: decoders.WrapperF
         if (not isinstance(sections, (list, tuple)) or len(sections) != 3
                 or any(type(value) is not int or value < 0 for value in sections)):
             raise ValueError("mrope_section must contain three nonnegative integer widths")
-        kinds = dict(text_fields.get("kinds") or {})
-        full: decoders.KindFields = {
+        kinds = decoders._kinds_of(text_fields).copy()
+        full = NativeFields(decoders.LayerKind, {
             **kinds.get("full_attention", {}),
             "mixer": {"name": "attention", "fields": {
-                      "mrope_section": [sections[0], sections[1], sections[2]]}}}
+                      "mrope_section": [sections[0], sections[1], sections[2]]}}})
         kinds["full_attention"] = full
         text_fields["kinds"] = kinds
     return text_fields
@@ -2051,8 +2052,8 @@ def _wrapper_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
             and not any(name.startswith(('mtp.', 'model.mtp.')) for name in tensors)):
         text_fields['num_nextn_predict_layers'] = 0
         record['text']['num_nextn_predict_layers'] = 0
-    text: decoders.DecoderFields = {**text_fields, **precision_fields(
-        "causal_transformer", text_fields, dtype=dtype, attention_impl=attention_impl)}
+    text = NativeFields(CausalTransformer, {**text_fields, **precision_fields(
+        "causal_transformer", text_fields, dtype=dtype, attention_impl=attention_impl)})
     wrapper: decoders.WrapperFields = {**record, "text": text}
     language_model = from_record(CausalTransformer, wrapper["text"])
     model = _wrapper_model(config, record, language_model, dtype=dtype)

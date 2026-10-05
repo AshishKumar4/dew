@@ -106,7 +106,7 @@ import numpy as np
 import pytest
 from reference_error import assert_as_exact_as_the_reference
 
-from dew.interop import Pretrained, PretrainedDecoder, hf_decoders
+from dew.interop import Pretrained, PretrainedDecoder
 from dew.interop.hf_decoders import translate_config, translate_weights
 from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -137,24 +137,32 @@ def fixture_config(name):
     return json.loads((FIXTURES / name / "config.json").read_text())
 
 
-# The records a translated config carries, against the values they build. Each
-# pair is one TypedDict and the dataclass whose init fields it names, so a
-# field added, renamed or dropped there fails here instead of becoming a key
-# the backbone never reads.
-@pytest.mark.parametrize("record, value", [
-    (hf_decoders.DecoderFields, CausalTransformer),
-    (hf_decoders.KindFields, LayerKind),
-    (hf_decoders.MixtureFields, Mixture),
-    (hf_decoders.AltUpFields, AltUp),
-    (hf_decoders.HyperConnectionsFields, HyperConnections),
-    (hf_decoders.AttentionResidualsFields, AttentionResiduals),
-    (hf_decoders.SituFields, Situ),
+# A sparse record uses its native owner to read every supplied field and to
+# reject stale names. Copies retain that owner and the wire's explicit keys.
+@pytest.mark.parametrize("fixture, path, value", [
+    ("qwen3-tiny", (), CausalTransformer),
+    ("gemma3-tiny", ("kinds", "sliding_attention"), LayerKind),
+    ("qwen3-moe-tiny", ("mixture",), Mixture),
+    ("gemma3n-tiny", ("altup",), AltUp),
+    ("glm5-next-tiny", ("hyper_connections",), HyperConnections),
+    ("kimi-k3-source", ("attention_residuals",), AttentionResiduals),
+    ("kimi-k3-source", ("mlp",), Situ),
 ])
-def test_a_config_record_names_every_field_of_the_value_it_builds(record, value):
-    # `parent` and `name` are flax's binding, not fields a config states.
-    declared = {field.name for field in dataclasses.fields(value)
-                if field.init} - {"parent", "name"}
-    assert set(record.__optional_keys__) | set(record.__required_keys__) == declared
+def test_a_config_record_uses_its_native_owner_after_a_copy(fixture, path, value):
+    from dew.interop.config_records import NativeFields
+
+    record = translate_config(fixture_config(fixture))
+    for name in path:
+        record = record[name]
+    assert isinstance(record, NativeFields)
+    copied = record.copy()
+    assert type(copied.value) is value
+    assert copied == record
+    assert copied.value == value(**record)
+    copied["not_a_native_field"] = None
+    with pytest.raises(ValueError, match="not_a_native_field"):
+        _ = copied.value
+    assert "not_a_native_field" not in record
 
 
 def test_registered_family_alias_preserves_its_source_when_exported(tmp_path, monkeypatch):
