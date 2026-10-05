@@ -1654,19 +1654,22 @@ slots, those passes were a quarter of the decode program's device time.
 ## Quantized serving of the 176M text-to-image model, 2026-09-28
 
 `TextToImage.quantized` serves the denoiser with its kernels stored as int8
-or fp8 values and scales, using Qwix's post-training quantization
+or fp8 values and their scales, through Qwix's post-training quantization
 (`dew.training.quantization.quantize_for_serving`). `int8` and `fp8`
-quantize weights and activations. A matmul of two quantized operands runs
-in the quantized dtype. `int8w` and `fp8w` quantize weights only, then
-dequantize to the compute dtype. The model is dewml/hybrid-dit-176m.
+quantize weights and activations, so a matmul of two quantized operands runs
+in the quantized dtype. `int8w` and `fp8w` quantize weights only and
+dequantize them into the compute dtype. The model is dewml/hybrid-dit-176m.
 
-Each row runs in one process of `tools/benchmark_quantized_serving.py`.
-Forward time measures a warm guided denoiser call over 12 prompts
-(batch 24, median of 5). Sample time is warm wall time for 12 images
-with 20 DPM-Solver++(2M) steps at guidance 5, including text encoding and
-decoding. CLIP is mean ViT-L/14 cosine over 12 prompts at seeds 0 and
-1. Memory reports denoiser weight bytes and compiled-forward temporaries
-in MiB.
+Each row is one process of `tools/benchmark_quantized_serving.py`, and the
+columns are:
+
+- forward: the warm guided denoiser call over 12 prompts (batch 24, median
+  of 5).
+- sample: the warm wall time of 12 images with 20 DPM-Solver++(2M) steps at
+  guidance 5, including text encoding and decoding.
+- CLIP: the mean ViT-L/14 cosine over 12 prompts at seeds 0 and 1.
+- weights and temporaries: the denoiser's weight bytes and the compiled
+  forward's temporaries, in MiB.
 
 RTX 4080 16 GiB, jax 0.11.2, Qwix 0.1.8:
 
@@ -1683,12 +1686,12 @@ RTX 4080 16 GiB, jax 0.11.2, Qwix 0.1.8:
 | bf16 | int8, fusion in bf16 | 28.3 | 0.72 | 0.2490 | 183 | 108 |
 | bf16 | fp8, fusion in bf16 | 28.3 | 0.78 | 0.2464 | 183 | 106 |
 
-Weight-only quantization reduces kernel storage to 27% of fp32 bytes.
-Forward time matches the unquantized model in the same compute dtype.
-Quantizing weights and activations to int8 or fp8 reduces bf16 forward
-time by 21% (28.3 ms against 36.0). It reduces fp32 forward time by
-35% to 39% (34.7 and 32.5 ms against 53.3). Every quantized row keeps
-CLIP within 0.002 of fp32.
+Weight-only quantization saves memory and no time. The kernels take 27% of
+their fp32 bytes, and the forward runs as fast as the unquantized one in the
+same compute dtype. Quantizing weights and activations to int8 or fp8 takes
+21% off the bf16 forward's time (28.3 ms against 36.0) and 35% to 39% off
+the fp32 forward's (34.7 and 32.5 ms against 53.3). Every quantized row
+keeps CLIP within 0.002 of fp32.
 
 The RTX 4080's bf16 rows with quantized activations were measured before
 serving scaled the product of two quantized operands in float32 (below). On
@@ -1712,11 +1715,10 @@ fp8 activations are from 2026-09-30, the rest from 2026-09-28:
 | bf16 | int8, fusion in bf16 | 28.4 | 1.90 | 0.2484 | 183 | 118 |
 | bf16 | fp8, fusion in bf16 | 31.7 | 2.05 | 0.2467 | 183 | 171 |
 
-On the A100, quantization saves memory without reducing time. Quantizing
-weights and activations makes forward slower than the unquantized model
-in the same compute dtype: 28.4 ms in bf16 int8 against 25.0, and
-30.3 ms in fp32 int8 against 27.5. FP8 is slower still because the
-A100 has no fp8 units.
+On the A100 quantizing saves memory and no time. With weights and
+activations quantized, the forward is slower than unquantized in the same
+compute dtype (28.4 ms in bf16 int8 against 25.0, 30.3 ms in fp32 int8
+against 27.5), and slower again in fp8, which the A100 has no units for.
 Every quantized row keeps CLIP within 0.0025 of fp32.
 
 TPU v6e, one chip on Colab, jax 0.11.2, libtpu 0.0.48, Qwix 0.1.8. The bf16
@@ -1740,28 +1742,27 @@ rows without a weight-only precision are from 2026-09-30, the rest from
 | bf16 | int8, fusion in bf16 | 6.3 | 28.40 | 0.2521 | 183 | 50 |
 | bf16 | fp8, fusion in bf16 | 9.3 | 28.56 | 0.2443 | 183 | 50 |
 
-On the v6e, int8 weights and activations halve fp32 forward time
-(7.1 ms against 13.7) when depthwise convolutions are also quantized.
-Keeping those convolutions in fp32 gives 14.9 ms. In bf16, weight-only
-times match the unquantized forward (5.2 and 5.6 ms against 5.7).
-Quantizing activations makes it slower (6.3 to 9.8 ms).
+On the v6e, int8 weights and activations halve the fp32 forward (7.1 ms
+against 13.7) when the depthwise convolutions are quantized too; with them
+kept in fp32, the forward takes 14.9 ms. In bf16 the weight-only rows run in
+the unquantized forward's time (5.2 and 5.6 ms against 5.7), and with
+activations quantized the forward is slower (6.3 to 9.8 ms). Sampling takes
+28 to 31 s in every row, whatever the forward's time, so on this machine
+something other than the denoiser's 20 steps sets the sampling time. I did
+not break that cost down. Every quantized row keeps CLIP within 0.005 of
+fp32.
 
-Sampling takes 28 to 31 s in every row regardless of forward time.
-Something outside the denoiser's 20 steps limits this machine; these
-measurements do not break down that cost. Every quantized row keeps
-CLIP within 0.005 of fp32.
-
-Before serving scaled quantized products in float32, every bf16 row with
-int8 or fp8 activations sampled NaN images on the v6e. CLIP was 0.1481,
-whether depthwise convolutions were quantized or not. Qwix 0.1.8 scales
-the product of two quantized operands in the scales' dtype, which is
-bf16 for a bf16 model. In plain JAX on the v6e, scaling an int8
-depthwise convolution's int32 product in bf16 produced NaN in almost
-all outputs. The model's dense and attention forms stayed finite with
-the same scaling. In the served model, NaN first appeared in int8
-depthwise convolutions and in an fp8 attention block. Scaling in float32
-gives the bf16 model's 8-bit operations the fp32 model's result types,
-and it samples as shown above.
+Before serving scaled the product of two quantized operands in float32,
+every bf16 row with int8 or fp8 activations sampled NaN images on the v6e
+(CLIP 0.1481, with the depthwise convolutions quantized or not). Qwix 0.1.8
+scales that product in the scales' dtype, which is bf16 in a bf16 model. In
+plain JAX on the v6e, an int8 depthwise convolution whose int32 product is
+scaled in bf16 came out NaN in all but a few outputs, while the model's
+dense and attention forms scaled the same way stayed finite. In the served
+model the NaN began in the depthwise convolutions in int8 and in an
+attention block in fp8. Scaled in float32, the bf16 model's 8-bit operations
+have the same result types as the fp32 model's, and it samples as the table
+shows.
 
 XLA:CPU, 12 threads of a Colab L4 host, jax 0.11.2, Qwix 0.1.8, latents
 decoded two at a time (`--decode-batch 2`). The bf16 int8 row is from
@@ -1776,24 +1777,23 @@ decoded two at a time (`--decode-batch 2`). The bf16 int8 row is from
 | bf16 | int8w | 5550 | 123.50 | 0.2494 | 183 | 584 |
 | bf16 | int8 | 10550 | 224.61 | 0.2497 | 182 | 152 |
 
-On XLA:CPU, int8 weights and activations double forward time (9.8 s
-against 4.9 in fp32). Weight-only int8 leaves it unchanged. Every
+On XLA:CPU, int8 weights and activations double the forward's time (9.8 s
+against 4.9 in fp32), and weight-only int8 leaves it as it was. Every
 quantized row keeps CLIP within 0.0025 of fp32.
 
-On GPU, Dew refuses to quantize grouped-convolution activations. These
-GPU rows therefore keep spatial-fusion depthwise convolutions in float
-with `--float spatial_fusion`; `TextToImage.quantized` raises without it.
-XLA:GPU at jax 0.11.2 computes these convolutions incorrectly or fails
-to compile them.
-
-On the RTX 4080, int8 convolutions with one or two input channels per
-group return wrong values without errors. Before Dew refused them,
-whole-model int8 took 42.3 ms and scored CLIP 0.1391. In fp8, the same
-convolutions fail to compile there (`Failed to get configs for: 36 out of 126 instructions`,
-one per depthwise convolution). On the A100, whole-model int8 scored
-CLIP 0.1373 in fp32 and failed to compile in bf16 (`UNIMPLEMENTED`).
-FP8 ran on the A100, scoring CLIP 0.2443 in fp32, but Dew refuses
-it there as on every other GPU.
+On a GPU, Dew refuses to quantize the activations of a grouped convolution,
+because XLA:GPU (jax 0.11.2) computes those convolutions wrongly or not at
+all. So the GPU rows with quantized activations keep the spatial fusion's
+depthwise convolutions in float (`--float spatial_fusion`), and
+`TextToImage.quantized` raises without that option. On the RTX 4080, an int8
+convolution with one or two input channels per group returns wrong values
+without an error; before the refusal, the whole-model int8 row ran in
+42.3 ms and scored CLIP 0.1391. In fp8 the same convolutions fail to compile
+there (`Failed to get configs for: 36 out of 126 instructions`, one per
+depthwise convolution). On the A100 the whole-model int8 row scored CLIP
+0.1373 in fp32 and failed to compile in bf16 (`UNIMPLEMENTED`). fp8 ran on
+the A100 (CLIP 0.2443 in fp32), but Dew refuses it there too, as on every
+other GPU.
 
 ## Kernel choices per generation, 2026-09-22
 
