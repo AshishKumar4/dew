@@ -140,30 +140,49 @@ def tiny_qwen3() -> Qwen3ForCausalLM:
     return Qwen3ForCausalLM(config)
 
 
-def write_nemotron_h() -> None:
-    """Two grouped SSD blocks, two ReLU² blocks and positionless GQA.
+def write_nemotron_h(*, moe: bool = False, latent: bool = False) -> None:
+    """Two grouped SSD blocks, two dense or routed ReLU² blocks and positionless GQA.
 
     Four-token chunks cross two boundaries on the twelve-token probe. The
     dt floor is active, the SSD projections have biases, and expand does
     not determine the inner width. Float64 widens the reference's explicit
     fp32 casts in the SSD, norms, softmax and head as well as its parameters.
+    MoE uses nonzero selection bias, two routing groups and an ungated shared
+    expert; the latent case leaves top-k weights unnormalized.
     """
     from diffusers_wan_reference import float64
+    from unittest.mock import patch
     import transformers
 
     torch.manual_seed(0)
-    model = NemotronHForCausalLM(NemotronHConfig(
+    name = "nemotron-h-moe-latent-tiny" if latent else "nemotron-h-moe-tiny" if moe else "nemotron-h-tiny"
+    config = NemotronHConfig(
         vocab_size=64, hidden_size=16,
-        layers_block_type=["linear_attention", "mlp", "full_attention", "linear_attention", "mlp"],
+        layers_block_type=(["linear_attention", "moe", "full_attention", "moe", "linear_attention"] if moe else
+                          ["linear_attention", "mlp", "full_attention", "linear_attention", "mlp"]),
         num_attention_heads=4, num_key_value_heads=2, head_dim=8, intermediate_size=32,
         mamba_num_heads=4, mamba_head_dim=8, ssm_state_size=4, n_groups=2,
         conv_kernel=4, chunk_size=4, time_step_min=0.7, expand=3, use_bias=True,
         mlp_hidden_act="relu2", layer_norm_epsilon=3e-5, max_position_embeddings=64,
-        tie_word_embeddings=False, use_mamba_kernels=False))
-    write_tiny("nemotron-h-tiny", model, seed=2024)
-    directory = FIXTURES / "nemotron-h-tiny"
+        tie_word_embeddings=False, use_mamba_kernels=False)
+    if moe:
+        config.n_routed_experts, config.num_experts_per_tok = 8, 2
+        config.moe_intermediate_size, config.moe_shared_expert_intermediate_size = 16, 24
+        config.n_group, config.topk_group, config.routed_scaling_factor = 2, 1, 2.5
+        config.moe_latent_size = 8 if latent else None
+        config.norm_topk_prob = not latent
+        config._experts_implementation = "eager"
+    model = NemotronHForCausalLM(config)
+    write_tiny(name, model, seed=2024)
+    directory = FIXTURES / name
     ids = torch.from_numpy(np.load(directory / "input_ids.npy")).long()
-    with float64(), torch.no_grad():
+    type_ = torch.Tensor.type
+
+    def wide_type(tensor, dtype=None, **kwargs):
+        # Nemotron's router pins .type(torch.float32), beyond the shared cast widener.
+        return type_(tensor, torch.float64 if dtype == torch.float32 else dtype, **kwargs)
+
+    with float64(), patch.object(torch.Tensor, "type", wide_type), torch.no_grad():
         truth = model.double()(input_ids=ids, use_cache=False).logits.double().numpy()
     np.save(directory / "logits_f64.npy", truth)
     (directory / "source.json").write_text(json.dumps({
@@ -1135,6 +1154,8 @@ def main() -> None:
 
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     write_nemotron_h()
+    write_nemotron_h(moe=True)
+    write_nemotron_h(moe=True, latent=True)
     for name, repo, revision in NEMOTRON_H_CONFIGS:
         write_released_config(name, repo, revision)
     if args.nemotron_h_only:

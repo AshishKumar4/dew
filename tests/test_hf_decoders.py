@@ -96,6 +96,10 @@ Tolerances and the differences actually observed, fp32 on CPU:
   fp32 logit difference 1.25e-6 and equal argmax. Grouped gated SSD norms,
   a dt floor, biased SSD projections, positionless GQA and ReLU² MLPs
   live in independent pre-norm residual blocks.
+- nemotron-h-moe-tiny and its latent variant use the same float64 rule.
+  Native CPU ratios are 0.967 and 1.215, max fp32 logit difference 1.43e-6
+  for each, with equal argmax. They carry ungated routed and shared experts,
+  nonzero selection bias, grouped sigmoid routing and optional latent projections.
 """
 
 import dataclasses
@@ -133,7 +137,7 @@ TINY = ("qwen3-tiny", "gemma3-tiny", "llama-tiny", "mistral-tiny", "qwen2-tiny",
         "llama31-tiny", "gpt2-tiny", "opt-tiny", "gpt-neox-tiny")
 DEEPSEEK = ("deepseek-v3-tiny", "deepseek-v32-tiny")
 ROUTED = (*DEEPSEEK, "kimi-k2-tiny", "mixtral-tiny", "qwen3-moe-tiny")
-HYBRID = ("nemotron-h-tiny",)
+HYBRID = ("nemotron-h-tiny", "nemotron-h-moe-tiny", "nemotron-h-moe-latent-tiny")
 GEMMA4_MOE = FIXTURES / "gemma4-moe-tiny"
 REAL = FIXTURES / "qwen3-0.6b"
 
@@ -816,7 +820,7 @@ def test_nemotron_h_weight_names_invert():
     assert export_path("lm_head.kernel", {"tie_embeddings": True}) is None
     with pytest.raises(ValueError, match="no place"):
         weight_path("backbone.layers.0.mixer.rotary_emb.inv_freq", config)
-    with pytest.raises(ValueError, match="not a dense Nemotron-H"):
+    with pytest.raises(ValueError, match="not a Nemotron-H"):
         export_path("layers_0.mlp.gate_proj.kernel", config)
 
 
@@ -863,7 +867,6 @@ def test_nemotron_h_legacy_geometry_must_repeat_the_field_the_reference_reads(le
 
 
 @pytest.mark.parametrize("changes, message", [
-    ({"layers_block_type": ["moe"]}, "ungated ReLU² routed experts"),
     ({"num_nextn_predict_layers": 1}, "multi-token prediction"),
     ({"mlp_hidden_act": "silu"}, "mlp_hidden_act"),
     ({"mamba_hidden_act": "relu"}, "mamba_hidden_act"),
@@ -878,8 +881,14 @@ def test_nemotron_h_refuses_a_block_it_cannot_compute(changes, message):
 
 def _assert_nemotron_h_released_config(config, name):
     if name == "nemotron-h-30b-a3b":
-        with pytest.raises(ValueError, match="ungated ReLU² routed experts"):
-            translate_config(config)
+        model = translate_config(config).value
+        assert model.num_layers == 52 and model.emb_features == 2688
+        assert model.per_layer_types.count("moe") == 23
+        mixer = model.kind_of("moe").mixer
+        assert isinstance(mixer, MLPMixer) and mixer.activation == "relu2"
+        assert mixer.mixture == Mixture(
+            experts=128, top_k=6, score_function="sigmoid", scaling=2.5, bias=True,
+            expert_features=1856, shared_features=3712)
         return
     model = translate_config(config).value
     assert model.num_layers == 42 and model.emb_features == 3136 and model.max_seq_len == 262144
@@ -894,8 +903,42 @@ def _assert_nemotron_h_released_config(config, name):
 
 
 @pytest.mark.parametrize("name", ("nemotron-h-4b", "nemotron-h-30b-a3b"))
-def test_nemotron_h_released_configs_translate_or_name_the_missing_experts(name):
+def test_nemotron_h_released_configs_translate(name):
     _assert_nemotron_h_released_config(fixture_config(name), name)
+
+
+@pytest.mark.parametrize("name", HYBRID[1:])
+def test_nemotron_h_fused_experts_export_the_source_layout(name, tmp_path):
+    """The native 3-D layout and transformers' per-expert save layout compute the same model."""
+    from safetensors.numpy import save_file
+
+    from dew.interop.sources import load_shards
+
+    tensors = load_shards(FIXTURES / name)
+    packed = {key: value for key, value in tensors.items() if ".experts." not in key}
+    for layer in (1, 3):
+        for projection in ("up_proj", "down_proj"):
+            stem = f"backbone.layers.{layer}.mixer.experts"
+            packed[f"{stem}.{projection}"] = np.stack(
+                [tensors[f"{stem}.{index}.{projection}.weight"] for index in range(8)])
+    source = tmp_path / "packed"
+    source.mkdir()
+    (source / "config.json").write_text(json.dumps(fixture_config(name)))
+    save_file(packed, source / "model.safetensors")
+    loaded = Pretrained.load(source, dtype="float32", attention_impl="reference")
+    expected = Pretrained.load(FIXTURES / name, dtype="float32", attention_impl="reference")
+    for path, tensor in flat_tree(expected.variables).items():
+        np.testing.assert_array_equal(tensor, flat_tree(loaded.variables)[path])
+    destination = tmp_path / "export"
+    loaded.save(destination)
+    exported = load_shards(destination)
+    assert exported.keys() == packed.keys()
+    for key, tensor in packed.items():
+        np.testing.assert_array_equal(tensor, exported[key])
+    ids = np.load(FIXTURES / name / "input_ids.npy")
+    assert_as_exact_as_the_reference(loaded.model.apply(loaded.variables, ids),
+                                     np.load(FIXTURES / name / "logits.npy"),
+                                     np.load(FIXTURES / name / "logits_f64.npy"), f"{name} packed logits")
 
 
 @pytest.mark.network
@@ -910,15 +953,16 @@ def test_nemotron_h_pinned_hub_configs_read_as_the_committed_releases(name):
     _assert_nemotron_h_released_config(config, name)
 
 
-def test_nemotron_h_export_preserves_the_source_config_weights_and_logits(tmp_path):
+@pytest.mark.parametrize("name", HYBRID)
+def test_nemotron_h_export_preserves_the_source_config_weights_and_logits(name, tmp_path):
     """The loaded hybrid exports in its source layout, as Mamba-2 and Qwen3-Next do."""
     from dew.interop.sources import load_shards
 
-    directory = FIXTURES / "nemotron-h-tiny"
+    directory = FIXTURES / name
     loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
     destination = tmp_path / "nemotron-h"
     loaded.save(destination)
-    assert json.loads((destination / "config.json").read_text()) == fixture_config("nemotron-h-tiny")
+    assert json.loads((destination / "config.json").read_text()) == fixture_config(name)
     source, exported = load_shards(directory), load_shards(destination)
     assert source.keys() == exported.keys()
     for name, tensor in source.items():
