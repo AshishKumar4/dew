@@ -37,7 +37,7 @@ export class SnapshotRegistry extends DurableObject<SnapshotEnv> {
 		try {
 			const preparer = this.env.PREPARER.get(this.env.PREPARER.idFromName('trusted'));
 			const candidate = await preparer.prepare(commit);
-			if (candidate.commit !== commit || !candidate.snapshot.id || candidate.created < now) {
+			if (candidate.commit !== commit || !candidate.snapshot.id || !Number.isFinite(candidate.created) || candidate.created < now) {
 				throw new Error('prepared snapshot does not match the requested generation');
 			}
 			await this.ctx.storage.transaction(async (storage) => {
