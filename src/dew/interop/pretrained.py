@@ -1511,13 +1511,13 @@ def _clip_towers(directory: Path, names: tuple[str, ...], compute, *, param_dtyp
     from transformers import CLIPTokenizer
 
     from dew.interop import diffusion
-    from dew.nn.text_encoders import CLIPTextTransformer, translate_config
+    from dew.nn.text_encoders import translate_config
 
     towers, tokenizers, layouts = [], [], ()
     bound = {} if params is None else params
     for name in names:
         config = _component_config(directory, name)
-        towers.append(CLIPTextTransformer(**translate_config(config), dtype=compute))
+        towers.append(translate_config(config).value.clone(dtype=compute))
         if params is None:
             tower, recorded = diffusion.record_layouts(
                 name, diffusion.component_tensors(directory, name), _text_head_path,
@@ -1540,10 +1540,10 @@ def _t5_tower(directory: Path, compute, component: str, tokens: int, *, param_dt
     """
     from dew.data.text import load_tokenizer
     from dew.interop import diffusion
-    from dew.nn.text_encoders import T5EncoderTransformer, _t5_path, t5_embedding, translate_t5_config
+    from dew.nn.text_encoders import _t5_path, t5_embedding, translate_t5_config
 
     config = _component_config(directory, component)
-    tower = T5EncoderTransformer(**translate_t5_config(config), dtype=compute)
+    tower = translate_t5_config(config).value.clone(dtype=compute)
     layouts = ()
     if params is None:
         tensors = diffusion.component_tensors(directory, component)
@@ -1562,12 +1562,12 @@ def _wan_conditioning(directory: Path, compute, *, tokens: int, param_dtype: str
     parameters and their layouts."""
     from dew.data.text import load_tokenizer
     from dew.interop import diffusion
-    from dew.nn.text_encoders import T5EncoderTransformer, _t5_path, t5_embedding, translate_t5_config
+    from dew.nn.text_encoders import _t5_path, t5_embedding, translate_t5_config
 
     config = _component_config(directory, "text_encoder")
     if config.get("model_type") != "umt5":
         raise ValueError(f"Wan's text encoder is a umt5 model, not {config.get('model_type')!r}")
-    tower = T5EncoderTransformer(**translate_t5_config(config), dtype=compute)
+    tower = translate_t5_config(config).value.clone(dtype=compute)
     layouts: tuple[WeightLayout, ...] = ()
     if params is None:
         tensors = diffusion.component_tensors(directory, "text_encoder")
@@ -1751,7 +1751,7 @@ def _image_safety(directory: Path, compute, *, param_dtype: str = "float32",
     a weight read."""
     from dew.inputs.diffusion import CLIPImageTransform, CLIPSafetyHead, ImageSafety
     from dew.interop import diffusion
-    from dew.nn.text_encoders import CLIPVisionTransformer, translate_vision_config
+    from dew.nn.text_encoders import translate_vision_config
 
     config = _component_config(directory, "safety_checker")
     with open(directory / "feature_extractor" / "preprocessor_config.json") as handle:
@@ -1771,7 +1771,7 @@ def _image_safety(directory: Path, compute, *, param_dtype: str = "float32",
             "safety_checker", state, _safety_path, ("encoders", "safety"), param_dtype="float32", lazy=lazy)
         params.update(scoring)
         layouts += state_layouts
-    head = CLIPSafetyHead(CLIPVisionTransformer(**translate_vision_config(config), dtype=compute),
+    head = CLIPSafetyHead(translate_vision_config(config).value.clone(dtype=compute),
                           int(config["projection_dim"]), dtype=compute)
     return (ImageSafety(head, CLIPImageTransform.from_config(transform)), params, layouts,
             {"safety_checker": config, "feature_extractor": transform})
