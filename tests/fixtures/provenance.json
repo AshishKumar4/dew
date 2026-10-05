@@ -2892,6 +2892,22 @@
    ],
    "note": "tools/diffusers_extended_reference.py:73,131 writes xl-img2img/xl-inpaint/refiner/safety numerical members; bundle packs both tools' results."
   },
+  "token_accuracy": {
+   "tool": "tools/token_accuracy_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/trl",
+     "version": "v1.12.0 (59c4a8e104413fa9f4ca1a54eaf2ff93c0f299be)",
+     "runs": "fetched"
+    },
+    {
+     "repo": "pytorch/pytorch",
+     "version": "2.14.0",
+     "runs": "torch"
+    }
+   ],
+   "note": "Executes SFTTrainer.compute_loss's token-accuracy statements (with utils.py's entropy_from_logits) fetched at v1.12.0, on a fixed tiny Dew decoder's logits with assistant-only labels over two uneven batches, and on logits with planted exact ties; records counts and SFTTrainer.log's mean of batch accuracies."
+  },
   "tread": {
    "tool": "tools/tread_reference.py",
    "sources": [
