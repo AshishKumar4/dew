@@ -16,6 +16,7 @@ import numpy as np
 from flax.traverse_util import flatten_dict
 
 from dew import records
+from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.families.deepseek import _deepseek_config, _deepseek_layout, _deepseek_mixture
 from dew.interop.families.qwen import _single_prediction_depth
 from dew.interop.hf_decoders import (
@@ -37,7 +38,9 @@ from dew.interop.hf_decoders import (
 )
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
+from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.dsa_kpool import KPoolSparseAttentionMixer
+from dew.nn.hyper_connections import HyperConnections
 from dew.nn.kda import KimiDeltaAttentionMixer
 
 
@@ -122,14 +125,14 @@ def _glm5_mixture(hf_config: Mapping[str, object], used: set[str],
     mixture: MixtureFields | None = None
     if routed:
         geometry = _deepseek_layout(hf_config, layers, used, sparse_layers=routed)
-        mixture = {
+        mixture = NativeFields(Mixture, {
             **geometry,
             "score_function": "sigmoid",
             "bias": True,
             "norm_topk_prob": norm_topk,
             "groups": _record_int({"n_group": hf_config.get("n_group") or 1}, "n_group"),
             "groups_per_token": _record_int({"topk_group": hf_config.get("topk_group") or 1}, "topk_group"),
-        }
+        })
     else:
         used.update(('n_routed_experts', 'num_local_experts', 'num_experts_per_tok',
                      'routed_scaling_factor', 'n_group', 'topk_group', 'n_shared_experts',
@@ -167,21 +170,20 @@ def _glm5_next_config(hf_config: Mapping[str, object], used: set[str]) -> Decode
                           used, rope=_Ropes(10000.0))
     kinds: dict[str, KindFields] = {}
     if 'linear_attention' in types:
-        kinds['linear_attention'] = {'mixer': {'name': 'kimi_delta_attention', 'fields': {**linear}}}
+        kinds['linear_attention'] = native_fields(LayerKind)(mixer=None)
+        kinds['linear_attention'].update(mixer={'name': 'kimi_delta_attention', 'fields': {**linear}})
     if 'full_attention' in types:
-        kinds['full_attention'] = {'mixer': {'name': 'kpool_sparse_attention', 'fields': {**sparse,
-            'index_kpool_always_select_tail': hf_config.get('index_kpool_always_select_tail', True)}}}
+        kinds['full_attention'] = native_fields(LayerKind)(mixer=None)
+        kinds['full_attention'].update(mixer={'name': 'kpool_sparse_attention', 'fields': {**sparse,
+            'index_kpool_always_select_tail': hf_config.get('index_kpool_always_select_tail', True)}})
     mixture, routed = _glm5_mixture(hf_config, used, layers)
     hc_fields = ('hc_mult', 'hc_eps', 'hc_sinkhorn_iters')
     config.update(
         kinds=kinds,
         mixture=mixture,
-        hyper_connections={
-            "hc_mult": _record_int(hf_config, "hc_mult"),
-            "hc_eps": _record_float(hf_config, "hc_eps"),
-            "hc_sinkhorn_iters": _record_int(hf_config, "hc_sinkhorn_iters"),
-            "head": "mean",
-        },
+        hyper_connections=native_fields(HyperConnections)(
+            hc_mult=_record_int(hf_config, "hc_mult"), hc_eps=_record_float(hf_config, "hc_eps"),
+            hc_sinkhorn_iters=_record_int(hf_config, "hc_sinkhorn_iters"), head="mean"),
         swiglu_limit=_record_float(hf_config, "swiglu_limit"),
         index_share_for_mtp_iteration=bool(hf_config.get("index_share_for_mtp_iteration", False)),
         num_nextn_predict_layers=_single_prediction_depth(hf_config, used, "num_nextn_predict_layers"),

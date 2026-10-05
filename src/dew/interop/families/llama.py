@@ -12,7 +12,9 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 from dew import records
-from dew.interop.hf_decoders import _base_config, _dew_path, _refuse, _softmax_mixture
+from dew.interop.config_records import native_fields
+from dew.interop.hf_decoders import _base_config, _dew_path, _refuse, _softmax_top_k
+from dew.nn.backbones.decoder_block import Mixture
 
 
 def _llama_config(hf_config, used):
@@ -32,8 +34,9 @@ def _mixtral_config(hf_config, used):
     used.update(('num_local_experts', 'router_jitter_noise'))
     if hf_config.get('router_jitter_noise', 0.0):
         _refuse('router_jitter_noise', 'training-time input jitter has no counterpart')
-    config['mixture'] = _softmax_mixture(
-        hf_config, used, experts=records.integer(hf_config['num_local_experts'], 'num_local_experts'))
+    experts = records.integer(hf_config['num_local_experts'], 'num_local_experts')
+    config['mixture'] = native_fields(Mixture)(
+        top_k=_softmax_top_k(hf_config, used), experts=experts)
     return config
 
 

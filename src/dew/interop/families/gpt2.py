@@ -5,6 +5,7 @@ from collections.abc import Mapping
 import numpy as np
 
 from dew import records
+from dew.interop.config_records import native_fields
 from dew.interop.hf_decoders import DecoderFields, Packed, Renames, _refuse, _renamed_path
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
@@ -34,22 +35,22 @@ def _gpt2_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
         _refuse(f'activation_function={activation!r}', 'the ungated MLP uses GELU or ReLU')
     if hidden % heads:
         _refuse('n_embd/n_head', 'the hidden width must divide into whole attention heads')
-    return {
-        'vocab_size': records.integer(hf.get('vocab_size', 50257), 'vocab_size'),
-        'emb_features': hidden, 'num_layers': layers, 'num_heads': heads,
-        'num_kv_heads': heads, 'head_dim': hidden // heads,
-        'mlp_features': records.integer(hf.get('n_inner') or 4 * hidden, 'n_inner'),
-        'mlp': activations[activation], 'mlp_bias': True,
-        'norm_type': 'layer', 'norm_bias': True,
-        'norm_eps': records.number(hf.get('layer_norm_epsilon', 1e-5), 'layer_norm_epsilon'),
-        'qk_norm': False, 'attention_bias': True,
-        'attention_scale': None if hf.get('scale_attn_weights', True) else 1.0,
-        'position_embedding': 'learned', 'position_embedding_size': positions,
-        'max_seq_len': positions, 'tie_embeddings': bool(hf.get('tie_word_embeddings', True)),
-        'dropout_rate': records.number(hf.get('resid_pdrop', 0.1), 'resid_pdrop'),
-        'embedding_dropout_rate': records.number(hf.get('embd_pdrop', 0.1), 'embd_pdrop'),
-        'attention_dropout_rate': records.number(hf.get('attn_pdrop', 0.1), 'attn_pdrop'),
-    }
+    return native_fields(CausalTransformer)(
+        vocab_size=records.integer(hf.get('vocab_size', 50257), 'vocab_size'),
+        emb_features=hidden, num_layers=layers, num_heads=heads,
+        num_kv_heads=heads, head_dim=hidden // heads,
+        mlp_features=records.integer(hf.get('n_inner') or 4 * hidden, 'n_inner'),
+        mlp=activations[activation], mlp_bias=True,
+        norm_type='layer', norm_bias=True,
+        norm_eps=records.number(hf.get('layer_norm_epsilon', 1e-5), 'layer_norm_epsilon'),
+        qk_norm=False, attention_bias=True,
+        attention_scale=None if hf.get('scale_attn_weights', True) else 1.0,
+        position_embedding='learned', position_embedding_size=positions,
+        max_seq_len=positions, tie_embeddings=bool(hf.get('tie_word_embeddings', True)),
+        dropout_rate=records.number(hf.get('resid_pdrop', 0.1), 'resid_pdrop'),
+        embedding_dropout_rate=records.number(hf.get('embd_pdrop', 0.1), 'embd_pdrop'),
+        attention_dropout_rate=records.number(hf.get('attn_pdrop', 0.1), 'attn_pdrop'),
+    )
 
 
 def _gpt2_prepare(tensors: Mapping[str, np.ndarray],
