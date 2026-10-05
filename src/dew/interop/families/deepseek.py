@@ -284,7 +284,7 @@ def _deepseek_config(hf_config: Mapping[str, object], used: set[str], *,
     config.update(
         head_dim=nope + rope,
         mixer={
-            'kind': 'mla',
+            'name': 'mla', 'fields': {
             'q_lora_rank': (None if hf_config.get('q_lora_rank') is None
                             else records.integer(hf_config['q_lora_rank'], 'q_lora_rank')),
             'kv_lora_rank': records.integer(kv_rank, 'kv_lora_rank'),
@@ -297,7 +297,7 @@ def _deepseek_config(hf_config: Mapping[str, object], used: set[str], *,
             'index_n_heads': None if index is None else index['index_n_heads'],
             'index_head_dim': (None if index is None
                                else index['index_head_dim']),
-        },
+        }},
         mixture=mixture(hf_config, layers, used),
     )
     return config
@@ -728,19 +728,19 @@ def _deepseek_v4_config(hf_config: Mapping[str, object], used: set[str]) -> Deco
     used.update(('num_nextn_predict_layers', 'output_router_logits',
                  'router_aux_loss_coef', 'router_jitter_noise', 'ep_size'))
     groups = _record_int(hf_config, 'o_groups')
-    mixer: dict[str, object] = {
-        'kind': 'deepseek_v4',
+    fields: dict[str, object] = {
         'q_lora_rank': _record_int(hf_config, 'q_lora_rank'),
         'o_groups': groups,
         'o_lora_rank': _record_int(hf_config, 'o_lora_rank'),
         'rope_head_dim': rope_width,
         'compressor': None, 'compress_rate': None,
         'index_topk': None, 'index_n_heads': None, 'index_head_dim': None}
+    mixer = {'name': 'deepseek_v4', 'fields': fields}
     if groups < 1 or heads * head_dim % groups:
-        _refuse(f"o_groups {mixer['o_groups']}",
+        _refuse(f"o_groups {groups}",
                 f"the grouped output projection splits the {heads * head_dim} "
                 "stacked head dims into equal groups")
-    kinds = _v4_attention_kinds(hf_config, used, layer_types, mixer, window,
+    kinds = _v4_attention_kinds(hf_config, used, layer_types, fields, window,
                                 (compress_theta, compress_ramp))
     depth = hf_config.get('num_nextn_predict_layers', 1)
     if type(depth) is not int or depth not in (0, 1):
@@ -770,7 +770,7 @@ def _deepseek_v4_config(hf_config: Mapping[str, object], used: set[str]) -> Deco
 def _v4_attention_kinds(hf_config: Mapping[str, object], used: set[str],
                         layer_types: tuple[str, ...], mixer: Mapping[str, object],
                         window: int, compress: tuple[float, Ramp | None]) -> dict[str, KindFields]:
-    """Build each attention kind's own record.
+    """Build each attention kind's own record from the shared `mixer` fields.
 
     Every V4 layer attends its window; a compressed one rotates at the
     compress base and hands its compressor and rate to the mixer, the sparse
@@ -791,7 +791,7 @@ def _v4_attention_kinds(hf_config: Mapping[str, object], used: set[str],
             if compressor == 'csa':
                 layer_mixer.update(index)
             record.update(rope_theta=compress_theta, yarn=compress_ramp,
-                          mixer=layer_mixer)
+                          mixer={'name': 'deepseek_v4', 'fields': layer_mixer})
         kinds[kind] = record
     return kinds
 

@@ -29,30 +29,42 @@ Dew rows from `tools/reference_runs/dew_lm.py` and
 `tools/benchmark_step.py`. `tools/reference_runs/scoreboard.py` collects the
 reference-run rows into one table.
 
-RTX 4080 16 GiB, Dew at `f6047cf9` (jax 0.11.2.post3), torch 2.13.0+cu130,
-transformers 5.17.0, SDPA attention. Each Dew row gives the range over two
-processes. Each torch row is one process, or two where it gives a range. Dew
-runs as installed, with cuDNN attention; where a row names tokamax, tokamax
-was installed as well (docs/installation.md):
+RTX 4080 16 GiB, Dew at `6464cb95` (2026-10-05, jax 0.11.2.post3), torch
+2.13.0+cu130, transformers 5.17.0, SDPA attention. The torch rows come from
+the 2026-10-03 session; neither torch nor its models changed since. Each Dew
+row gives the range over two processes. Each torch row is one process, or
+two where it gives a range. Dew runs as installed, with cuDNN attention;
+where a row names tokamax, tokamax was installed as well
+(docs/installation.md):
 
 | model | step | Dew | best torch.compile | Dew / torch |
 |---|---|---:|---:|---:|
-| Qwen3-0.6B, pretrained | 1 x 1024 tokens, AdamW | 96.0-96.1 ms, MFU 46.8% | 112.1-112.4 ms, 40.0% | 1.17 |
-| Qwen3-0.6B, pretrained | 2 x 1024 tokens, AdamW | 148.0-148.3 ms, MFU 60.6-60.8% | 168.6-169.1 ms, 53.3% | 1.14 |
-| 99M Qwen3-MoE shape, 8 experts, top 2 | 8 x 1024 tokens, AdamW | 78.1-78.2 ms | 112.5 ms | 1.44 |
-| decoder, GPT-2 small widths, 3 layers | 16 x 512, Adam, EMA | 49.0-49.3 ms; tokamax 48.5 | 49.4 ms (flash), 50.0 (cuDNN) | 1.00-1.01; 1.02 |
-| SimpleDiT, width 384, 6 layers, 64 px | batch 16, Adam, EMA | 7.41-7.42 ms | 8.07 ms | 1.09 |
-| SimpleDiT, width 768, 12 layers, 64 px | batch 32, Adam, EMA | 72.6-72.7 ms, MFU 62.4%; tokamax 70.9-71.0 | 76.4 ms (flash) | 1.05; 1.08 |
-| 176M hybrid DiT (published config) | batch 16, Adam, EMA | 60.1 ms, MFU 44.4%; tokamax 60.0-60.2 | no torch port | |
-| 176M hybrid DiT (published config) | batch 32 | 100.6 ms, MFU 53.1%; tokamax 100.0-100.1 | no torch port | |
+| Qwen3-0.6B, pretrained | 1 x 1024 tokens, AdamW | 90.65-90.69 ms, MFU 49.6% | 112.1-112.4 ms, 40.0% | 1.24 |
+| Qwen3-0.6B, pretrained | 2 x 1024 tokens, AdamW | 142.6-142.8 ms, MFU 63.0-63.1% | 168.6-169.1 ms, 53.3% | 1.18 |
+| 99M Qwen3-MoE shape, 8 experts, top 2 | 8 x 1024 tokens, AdamW | 78.4 ms (98.0 where the fit check tiled the head) | 112.5 ms | 1.15-1.43 |
+| decoder, GPT-2 small widths, 3 layers | 16 x 512, Adam, EMA | 48.80-48.82 ms; tokamax 48.12-48.14 | 49.4 ms (flash), 50.0 (cuDNN) | 1.01; 1.03 |
+| SimpleDiT, width 384, 6 layers, 64 px | batch 16, Adam, EMA | 7.21-7.28 ms; tokamax 7.19-7.20 | 8.07 ms | 1.11-1.12; 1.12 |
+| SimpleDiT, width 768, 12 layers, 64 px | batch 32, Adam, EMA | 71.23-71.28 ms, MFU 63.6%; tokamax 69.82-69.92 | 76.4 ms (flash) | 1.07; 1.09 |
+| 176M hybrid DiT (published config) | batch 16, Adam, EMA | 57.76-57.87 ms, MFU 46.2%; tokamax 57.58-57.69 | no torch port | |
+| 176M hybrid DiT (published config) | batch 32 | 99.28-99.59 ms, MFU 53.6-53.8%; tokamax 98.69-99.28 | no torch port | |
+
+From `f6047cf9` to `6464cb95`, most of the gain is the update writing each
+weight's bf16 copy ("The forward's bf16 weights" below). Qwen3-0.6B went from
+96.0 to 90.7 ms at 1 x 1024 and from 148.1 to 142.7 at 2 x 1024, and the
+hybrid DiT from 60.1 to 57.8 ms at batch 16. In one of the two MoE
+processes the fit check judged that the whole logits would not fit, and
+it tiled the head (98.0 ms, 1.15x torch). The other kept the whole logits
+(1.43x), as the earlier session did. The first process compiled the step,
+and its growing pool kept the autotuner's scratch; the second loaded the step
+from the compilation cache ("Rematerialization: the trainer's ladder" below).
 
 The Dew decoder and SimpleDiT rows take a fresh batch from the host every
 step, and their times match the fixed-batch rows. "Comparison with PyTorch"
-below runs both frameworks both ways and gives the commands. With Qwen3-0.6B
-at 1 x 1024 both devices stay busy (torch for 110.3 ms of its 112.1 ms step
-in the second process, Dew for 96.0 of 96.2). On the MoE, torch idles
-20.9 ms a step on the host, and on device time alone Dew is 1.26x faster
-(78.1 against 98.3 ms busy).
+below runs both frameworks both ways and gives the commands. At `f6047cf9`,
+with Qwen3-0.6B at 1 x 1024 both devices stayed busy (torch for 110.3 ms of
+its 112.1 ms step in the second process, Dew for 96.0 of 96.2). On the MoE,
+torch idles 20.9 ms a step on the host, and on device time alone Dew was
+1.26x faster (78.1 against 98.3 ms busy).
 
 From `4d392f0a` to `f6047cf9` the hybrid DiT went from 66.5 to 60.1 ms at
 batch 16 and from 110.2 to 100.6 at batch 32. The merges in between include
@@ -963,6 +975,75 @@ arrays, which have no validity field.
 I did not rerun the head-chunk and head-dimension-256 cases, because this
 change does not touch them.
 
+## fp32 attention on the CPU, 2026-10-05
+
+On XLA:CPU, `jax.nn.dot_product_attention`'s xla path rounded fp32
+attention further from float64 than torch's SDPA does. Wan's walk measured
+2.07 times torch's distance at its 512 text keys. The probability-value
+product causes it. YNNPACK, XLA:CPU's dot library in the pinned jax, sums
+a contraction of up to about 1024 terms in one chain. Torch's CPU GEMM and
+Eigen sum it in shorter blocks. Replacing each stage in turn with its
+float64 value isolated the product: an exact product removed four fifths
+of the error, while exact logits or probabilities changed nothing.
+
+Over 512 to 8192 keys, an fp32 call on the CPU now takes the reference
+path whenever it has more than `VALUE_BLOCK` (256) keys
+(`_xla_kernel_chains`). That path's `weighted_values` sums the product over
+each block of 256 keys separately and then sums the blocks. Its gradients
+are the plain product's, and neither of them sums over keys. Calls with 256
+keys or fewer, bf16 calls and GPU and TPU calls compute exactly as before.
+The inputs were cross-attention-like: 128 queries, 2 heads of width 128,
+and logits with standard deviation 0.36. Torch's math and flash backends
+measured the same distance.
+
+| keys | torch SDPA, RMS from float64 | jax.nn xla (before) | blocks of 256 | blocks of 128 | Eigen dots |
+|---:|---:|---:|---:|---:|---:|
+| 512 | 1.46e-8 | 1.34x | 0.98x | 0.76x | 0.69x |
+| 2048 | 7.62e-9 | 1.75x | 0.96x | 0.74x | 0.74x |
+| 8192 | 4.26e-9 | 1.63x | 0.87x | 0.66x | 0.73x |
+
+Times are from one process on two pinned threads of an i9-12900K, with
+the paths interleaved. The table gives the minimum of seven runs on a
+loaded shared host:
+
+| call (fp32, heads 128 wide) | forward before / after, ms | forward + backward before / after, ms |
+|---|---:|---:|
+| cross, 2048 queries x 512 keys, 12 heads | 78.1 / 83.1 | 225.7 / 236.6 |
+| cross, 4096 queries x 512 keys, 12 heads | 146.9 / 151.8 | 442.2 / 433.7 |
+| causal GQA 16/8 heads, 1024 | 105.9 / 115.9 | 372.8 / 383.9 |
+| causal GQA 16/8 heads, 2048 | 446.1 / 419.1 | 2075.8 / 1735.6 |
+
+Writing each block's partial product before the sum leaves a small cost
+in the forward. This run measured +3% to +9% at 512 to 1024 keys. A second
+sweep, on two other pinned threads, measured -5% to +12% on the minimum and
+-9% to +5% on the median. Run to run noise here is about 10%, so the cost
+is near that noise but not shown to be zero. It was kept for the
+accuracy. A training step's attention runs within 5% of its old time, and
+the 2048-token causal step is 16% faster because the reference path's
+backward is.
+
+The landing page's live sampler attends over at most 256 keys, so it is
+unchanged. Its 17 compiled programs are the same apart from source
+locations, so its time is the same too, and its image's sha256 is the
+same before and after (`d9ce11b0`).
+
+The sweep covered three block sizes and three ways to sum the blocks. It
+kept the cheapest one that brings 512 keys, Wan's case, within the rule:
+
+- Blocks of 512 or 1024 keys leave a 512-key call as it was (1.34x torch).
+  At 1024, every length rounds as before, because YNNPACK's chain is about
+  that long.
+- The blocks' sum as the last axis of one product (kept) was faster than
+  the same sum over a leading axis and than a loop of per-block products,
+  which cost 10-30% more.
+- Blocks of 128 keys round closer to float64 (0.66-0.76x torch), but they
+  double the partial products, and their forward cost up to 18% more.
+- Turning YNNPACK's dots off with
+  `--xla_cpu_experimental_ynn_fusion_type=-individual_dot` gives every CPU
+  dot Eigen's blocks. On two threads, Eigen ran the 176M hybrid DiT's MLP
+  shapes (512 x 768 x 3072) 12% slower. It would also change every CPU
+  result, including the live sampler's image.
+
 ## XLA flags
 
 `TrainerConfig.xla_flags` appends to `XLA_FLAGS`, and `prepare_process`
@@ -1576,6 +1657,13 @@ At 32 slots 27 of 64 greedy rows part from integration's, all at bf16
 near-ties (a median 0.57 bf16 spacings apart in fp32, at most 1.44). The
 fp32 argmax is the two-forward choice in 16 rows and the mixed one in 11.
 
+The 32-slot tails above did not repeat on 2026-10-05 (integration
+`dfd31d58`). In two alternating rounds against vLLM in one session, the
+second round put Dew at or below vLLM on TTFT p50 and p99 and on token gap
+p50 and p99 at 16, 24 and 32 requests a second. Gap p99 was 8.16, 7.42 and
+8.32 ms against 8.65, 16.4 and 9.56. The first round had a TTFT p99 outlier
+at 16 requests a second on both sides: 46.4 ms for Dew and 51.6 for vLLM.
+
 Over a paged cache, 2026-10-04. The mixed step now runs over a page pool
 too. The admitted rows' tables go into the cache before the step writes,
 each token is written to its row's page, and the decoding rows read the pool
@@ -1717,6 +1805,59 @@ three took fp32's argmax. It gained nothing measurable:
   5.6 ms on both sides.
 
 171 added lines were not worth that.
+
+A serving step decodes every slot, drawing or not, and the decode kernel
+read and wrote every row's state. Under open-loop arrivals most of 128
+slots sit idle, and the state is most of a decode step's bytes, so the
+step cost as much as a full one: a 15 ms median token gap at 16 requests
+a second against vLLM's 4.2. The kernel now skips a row the step marks
+idle (`active`, the row's validity). Its state is neither read nor
+written, the output aliases it, and the row outputs zeros. Eighteen layers
+at 128 rows took 8.43 ms with every row drawing, 2.22 with a quarter and
+0.20 with none. Serving, two rounds alternating, with generations bitwise
+the same at 32 and 128 slots:
+
+| slots | rate | before: TTFT p50 / p99, gap p50 / p99 (ms) | after |
+|---:|---:|---|---|
+| 32 | 8 | 23.3-23.8 / 35.0-35.2, 5.55-5.56 / 12.6-13.3 | 19.5-19.8 / 29.7-33.1, 4.05 / 10.7-10.9 |
+| 32 | 16 | 24.8-25.1 / 40.5-48.4, 5.56-5.59 / 15.2-16.7 | 21.2-21.3 / 34.0-37.6, 4.36-4.38 / 13.7-14.0 |
+| 32 | 24 | 25.6-25.7 / 42.2-44.3, 5.57-5.59 / 15.1-15.6 | 23.5 / 38.8-40.1, 4.86-4.88 / 14.5-14.6 |
+| 128 | 16 | 57.0-57.9 / 87.4-94.0, 15.2-15.3 / 33.7-34.1 | 37.2-37.5 / 59.4-60.8, 8.94-8.96 / 21.9-22.2 |
+| 128 | 24 | 62.3-62.7 / 93.3-93.8, 15.4-15.6 / 34.4-35.0 | 44.7-44.9 / 72.3-74.5, 10.6-10.7 / 25.4-26.4 |
+| 128 | 32 | 66.6-66.9 / 97.3-106, 18.4-21.9 / 36.1-36.7 | 54.8-55.2 / 82.7-85.2, 13.5 / 31.6 |
+
+Closed loop is unchanged at 32 slots (4503-4506 against 4408-4533 tokens
+a second). At 128 it rose from 5801-5818 to 5966.
+
+The same session against vLLM 0.30.0 at integration `be10d331` (the decode
+kernel, the folded attention and idle rows skipped), on a quiet host, Dew
+and vLLM alternating, two rounds:
+
+| slots | rate | Dew TTFT p50 / p99, gap p50 / p99 (ms) | vLLM |
+|---:|---:|---|---|
+| 32 | closed | 4657-4664 tokens a second | 4693-4938 |
+| 32 | 8 | 19.3-19.5 / 27.1-28.3, 3.88-3.89 / 10.1-11.5 | 25.6-27.1 / 56.3-56.5, 3.48-3.49 / 20.7-21.9 |
+| 32 | 16 | 20.6-20.9 / 33.5-40.8, 4.18-4.19 / 13.4-13.6 | 26.4-29.4 / 58.0-67.3, 4.05-4.08 / 21.3-23.0 |
+| 32 | 24 | 22.6-23.0 / 38.5-39.7, 4.66-4.70 / 14.2-15.5 | 30.9-36.6 / 63.9-95.0, 4.45-4.48 / 21.8-26.6 |
+| 128 | closed | 6309-6316 | 7393-7406 |
+| 128 | 16 | 32.9-33.3 / 55.6-57.6, 7.62 / 19.1-20.1 | 29.0-32.7 / 70.3-71.7, 4.17-4.20 / 23.9-25.2 |
+| 128 | 24 | 39.3 / 64.1-66.7, 8.83-8.88 / 22.8-23.0 | 39.4-41.5 / 81.6-86.4, 4.76-4.86 / 26.0-29.3 |
+| 128 | 32 | 47.8-48.3 / 77.7-78.4, 11.7 / 28.7-28.8 | 48.1-52.4 / 81.1-176, 6.76-7.21 / 31.9-77.1 |
+
+At 32 slots Dew is level with vLLM: 0.94-0.99 of its throughput, shorter
+TTFTs and token-gap tails, and a median gap 0.1-0.4 ms longer. At 128
+slots Dew serves 0.85 of vLLM's closed-loop throughput, its TTFTs and
+tails are level or shorter, and its median gap is 3.4-4.9 ms longer. Two
+causes remain. The first, counted by its bytes, is the fp32 recurrent
+state, above, twice vLLM's bytes per drawing row. The second, which the
+trace's per-program costs suggest but no A/B has isolated, is that a step
+still runs all 128 slots' rows through the projections, the MLP, the
+vocabulary head and the full-attention layers' cache reads, where vLLM
+batches only the rows that are running. To reproduce the Dew side:
+`tools/benchmark_lm_serving.py` asks `Server.from_task` for a dense cache,
+which a `MultimodalTransformer` refuses because it declares no `kv_cache`
+layout. These runs dropped that request, and the dense cache is the
+default anyway.
 
 ## Quantized serving of the 176M text-to-image model, 2026-09-28
 
@@ -2141,9 +2282,11 @@ I also timed one bf16 `ExpertMLP` layer forward plus backward under `MeshSpec(fs
 
 A model's `remat` is where its step starts, and the trainer moves it up one rung whenever the compiled step does not fit its devices' memory. A decoder goes from none to `'minimal'` (MaxText's name: every projection output kept) to `'full'`, and a diffusion backbone from `False` to `'dots'` (matmul outputs and the attention forward kept) to `'full'`. Each rung is slower and smaller, so the first that fits is the fastest that runs.
 
-`dew.training.trainer.step_fits` decides whether a step fits. XLA places a GPU step's temporaries in one allocation, so the temporaries, the outputs that do not reuse the donated state and the batches `fit` prefetches next to the step's own all have to fit in a single free block on each device, which can be smaller than the device's total free bytes. The block is the BFC pool's largest, or the part of its limit that a growing pool has not taken yet. An allocator that reports no pool (cuda_async, or a TPU's) is read by its free bytes. Each process reads its own devices, and the pool of processes takes the tightest. Where the allocator can leave the temporaries no block to return to once a batch is prefetched next to them, the check holds room for them twice (`strands_temporaries`). That happens with cuda_async and with XLA's spatially partitioned pool, which `prepare_process` turns off.
+`dew.training.trainer.step_fits` decides whether a step fits. XLA places a GPU step's temporaries in one allocation, so the temporaries, the outputs that do not reuse the donated state and the batches `fit` prefetches next to the step's own all have to fit in a single free block on each device, which can be smaller than the device's total free bytes. The block is the BFC pool's largest, or the part of its limit that a growing pool has not taken yet. An allocator that reports no pool (cuda_async, or a TPU's) is read by its free bytes. Each process reads its own devices, and the pool of processes takes the tightest. Where the allocator can leave the temporaries no block to return to once a batch is prefetched next to them, the check holds room for them twice (`strands_temporaries`). That happens with cuda_async and with XLA's spatially partitioned pool, which `import dew` turns off where JAX's CUDA plugin is installed. Before that only `prepare_process` turned it off. A Trainer built without it, such as `tools/reference_runs/dew_lm.py` or a notebook, held room for the 99M MoE's 8.34 GiB of temporaries twice in a preallocated pool on the RTX 4080, and tiled its head at 98.2 ms a step. With the partitioning off it keeps the whole logits at 78.3 ms, from a cold compile cache and from a warm one.
 
-A checkpoint records the rung its state trained on (head tile, remat and XLA options). A resumed run compiles that rung and climbs from it only where it does not fit, and reports the climb. A process that restores a state may find other free memory than the process that built it, and a lighter rung would run a different program, so a resumed run does not step down. The rung a step compiled under is the `remat` of the run's `StepCompiled` record and of `tools/benchmark_step.py`'s rows. The table times forward plus backward plus AdamW in bf16 compute over 10 timed steps, with `tools/benchmark_kernels.py step --remat`:
+A pool that grows (`XLA_PYTHON_CLIENT_PREALLOCATE=false`) never gives back a region it has grown (openxla/xla#50052). A process that compiles the step autotunes it, and the pool grows for the autotuner's scratch. A process that loads the step from the persistent cache does not. So the same program can fit in the second process and not in the first: the MoE kept its whole logits from a warm cache and tiled its head from a cold one. A check that ignored where the free bytes lie said it fit in the cold process, which then ran out of memory allocating its 8.34 GiB of temporaries.
+
+A checkpoint records the rung its state trained on (head tile, remat and XLA options). A resumed run compiles that rung and climbs from it only where it does not fit, and reports the climb. A fresh run does the same with the rung that an earlier run of the same step chose. That rung is recorded beside the persistent compilation cache (`dew-rungs/`), keyed by the step's program at its starting rung, the devices' kind and allocator limit, and XLA_FLAGS. Identical runs can read different free memory: a process that compiles the step autotunes it, and a growing pool keeps the autotuner's scratch. Without the record, the 99M MoE at 8 x 1024 tiled its head in the run that compiled it (98.2 ms a step) and kept its whole logits in the next one (78.4). With it, both take the first run's rung. A record whose key is not the run's, or whose rung the objective cannot take, is refused with its path. Deleting it lets the run decide again, for example after a run that shared the device with another process. A process that restores a state may find other free memory than the process that built it, and a lighter rung would run a different program, so a resumed run does not step down. The rung a step compiled under is the `remat` of the run's `StepCompiled` record and of `tools/benchmark_step.py`'s rows. The table times forward plus backward plus AdamW in bf16 compute over 10 timed steps, with `tools/benchmark_kernels.py step --remat`:
 
 | device | model, batch x tokens | none | minimal / dots | full |
 |---|---|---|---|---|

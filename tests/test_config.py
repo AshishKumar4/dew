@@ -54,7 +54,7 @@ def test_a_record_with_an_unknown_field_or_without_a_required_one_is_refused():
         RunConfig.from_dict({**record, "trainer": {**record["trainer"], "epochs_per_eval": 1}})
     with pytest.raises(ValueError, match="missing fields \\['project'\\]"):
         RunConfig.from_dict({**record, "trainer": {**record["trainer"], "wandb": {"entity": "dew"}}})
-    with pytest.raises(KeyError, match="no dataset named 'flowers'"):
+    with pytest.raises(ValueError, match="no dataset named 'flowers'"):
         RunConfig.from_dict({**record, "data": {"name": "flowers", "fields": {}}})
 
 
@@ -196,7 +196,7 @@ def test_a_model_config_that_names_the_precision_twice_is_refused():
 
 
 def test_an_unknown_model_field_is_refused():
-    with pytest.raises(ValueError, match="no field for \\['depth'\\]"):
+    with pytest.raises(ValueError, match="unknown fields \\['depth'\\]"):
         ModelConfig("simple_dit", {"depth": 3}).build()
 
 
@@ -329,7 +329,7 @@ def test_a_dtype_is_a_dtype_wherever_it_is_named():
 
 
 def test_a_record_that_names_a_field_the_value_does_not_have_is_refused():
-    with pytest.raises(ValueError, match=r"Kind has no field for \['theta'\]"):
+    with pytest.raises(ValueError, match=r"Kind does not match the record: unknown fields \['theta'\]"):
         shapes().build("shape", mix={"theta": 1e6})
 
 

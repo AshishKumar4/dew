@@ -20,22 +20,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import struct
-from jax.experimental import multihost_utils
 from typing_extensions import TypeVar
 
-from dew.artifacts import agreed
 from dew.nn.diffusion_gemma import DiffusionGemma
-from dew.nn.inputs import (
-    ModelInputs,
-    RowPlan,
-    agreed_validity,
-    continuation_keys,
-    generation_signature,
-    local_rows,
-    mesh_of,
-    prompt_major,
-    request_key,
-)
+from dew.nn.inputs import ModelInputs, Request, continuation_keys, local_rows, mesh_of, prompt_major
 from dew.objectives.base import Variables
 
 ArrayT = TypeVar("ArrayT", bound=jax.Array | np.ndarray, default=jax.Array, covariant=True)
@@ -238,29 +226,19 @@ class BlockProcess:
         prompt, in prompt order. Continuation zero refines with the request's
         own key, so it is what a single continuation draws.
         """
-        def resolve() -> tuple[jax.Array, ModelInputs]:
-            request = request_key(key)
-            canonical = ModelInputs.from_value(inputs)
+        def check(canonical: ModelInputs, pooled: bool) -> tuple[ModelInputs, tuple, None]:
             prepared = jax.tree.map(lambda leaf: local_rows(leaf, host=False), canonical)
             _validated(model, self, prepared, max_new_tokens, eos_token_ids, pad_token_id, n)
-            return request, prepared
+            return prepared, (max_new_tokens, n, self, eos_token_ids, pad_token_id, model), None
 
-        request, prepared = agreed("canvas generation setup", resolve)
-        if jax.process_count() > 1:
-            controls = (max_new_tokens, n, self, eos_token_ids, pad_token_id, model)
-            # A process whose own rows needed no padding carries no validity,
-            # so the pool agrees one validity schema before the digest reads it.
-            prepared = agreed_validity(prepared, jax.process_count(), controls=controls,
-                                       phase="canvas input")
-            multihost_utils.assert_equal(
-                generation_signature(prepared, controls),
-                "canvas input schemas, model geometry and generation policy must agree")
-        plan = RowPlan.over(mesh_of(variables), prepared.tokens.shape[0])
-        placed = plan.place(plan.pad(prepared))
+        request, _ = Request.prepare(inputs, key, mesh_of(variables), check, phase="canvas generation")
+        plan = request.plan
+        # The canvas sampler draws one batch-wide key per refinement, so its
+        # repeats stay as they are and its rows take the request's own key.
         generation = _compiled(plan.sharding)(
-            model, variables, placed, request,
+            model, variables, plan.place(plan.pad(request.inputs)), request.key,
             CanvasPlan(self, tuple(eos_token_ids), pad_token_id, max_new_tokens), n)
-        return replace(generation, rows=plan.rows * n, prompt_width=prepared.tokens.shape[1])
+        return replace(generation, rows=plan.rows * n, prompt_width=request.inputs.tokens.shape[1])
 
 
 @dataclass(frozen=True)

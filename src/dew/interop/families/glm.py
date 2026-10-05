@@ -171,11 +171,11 @@ def _glm5_next_config(hf_config: Mapping[str, object], used: set[str]) -> Decode
     kinds: dict[str, KindFields] = {}
     if 'linear_attention' in types:
         kinds['linear_attention'] = native_fields(LayerKind)(mixer=None)
-        kinds['linear_attention'].update(mixer={'kind': 'kimi_delta_attention', **linear})
+        kinds['linear_attention'].update(mixer={'name': 'kimi_delta_attention', 'fields': {**linear}})
     if 'full_attention' in types:
         kinds['full_attention'] = native_fields(LayerKind)(mixer=None)
-        kinds['full_attention'].update(mixer={'kind': 'kpool_sparse_attention', **sparse,
-            'index_kpool_always_select_tail': hf_config.get('index_kpool_always_select_tail', True)})
+        kinds['full_attention'].update(mixer={'name': 'kpool_sparse_attention', 'fields': {**sparse,
+            'index_kpool_always_select_tail': hf_config.get('index_kpool_always_select_tail', True)}})
     mixture, routed = _glm5_mixture(hf_config, used, layers)
     hc_fields = ('hc_mult', 'hc_eps', 'hc_sinkhorn_iters')
     config.update(
@@ -499,8 +499,9 @@ def _glm_moe_dsa_config(hf_config: Mapping[str, object], used: set[str]) -> Deco
     shared = tuple(index for index, kind in
                    enumerate(_glm_indexer_types(hf_config, layers, used))
                    if kind == 'shared')
-    config['mixer'] = {**records.record(config.get('mixer'), 'mixer'),
-                       'index_rope_interleave': True}
+    mixer = records.record(config.get('mixer'), 'mixer')
+    config['mixer'] = {'name': mixer['name'], 'fields': {**records.record(mixer['fields'], 'mixer fields'),
+                                                         'index_rope_interleave': True}}
     if shared:
         config['kv_shared_layers'] = shared
     config["num_nextn_predict_layers"] = records.integer(

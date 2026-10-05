@@ -1301,10 +1301,12 @@ def test_glm5_next_empty_nested_config_still_applies_safe_gate():
     config = fixture_config('glm5-next-tiny')
     del config['linear_attn_config']
     config['linear_lower_bound'] = None
-    absent = translate_config(config)['kinds']['linear_attention']['mixer']
-    empty = translate_config({**config, 'linear_attn_config': {}})['kinds']['linear_attention']['mixer']
-    disabled = translate_config({**config, 'linear_attn_config': {'safe_gate': False}})[
-        'kinds']['linear_attention']['mixer']
+    def mixer(record):
+        return translate_config(record)['kinds']['linear_attention']['mixer']['fields']
+
+    absent = mixer(config)
+    empty = mixer({**config, 'linear_attn_config': {}})
+    disabled = mixer({**config, 'linear_attn_config': {'safe_gate': False}})
     assert absent['linear_lower_bound'] is None
     assert empty['linear_lower_bound'] == -5.0
     assert disabled['linear_lower_bound'] is None

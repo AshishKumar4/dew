@@ -83,7 +83,7 @@ def test_gemma_projector_matches_the_reference_implementation():
     fixture = load_fixture("siglip-tiny")
     trunk = V.translate_siglip_vision_config(fixture["config"])
     record = V.translate_gemma_projector_config(
-        trunk, fixture["projector"]["text_width"],
+        trunk["fields"], fixture["projector"]["text_width"],
         fixture["projector"]["mm_tokens_per_image"])
     projector = projectors.from_record(record).build()
     variables = {"params": V.translate_gemma_projector_weights(
@@ -129,12 +129,12 @@ def test_llama4_projector_matches_the_reference_implementation():
         - fixture["projector_ref"])) < 1e-4
 
 
-@pytest.mark.parametrize("record", [{"kind": "clip"}, {"kind": "mlp"}, {}])
+@pytest.mark.parametrize("record", [{"name": "clip", "fields": {}}, {"name": "mlp", "fields": {}}, {}])
 def test_an_unknown_tower_or_projector_kind_is_refused(record):
-    """A kind neither registry holds names itself with the known names."""
-    with pytest.raises(ValueError, match="kind"):
+    """A record naming nothing either registry holds is refused, with the known names."""
+    with pytest.raises(ValueError, match=r"no tower named|the record that names it"):
         towers.from_record(record)
-    with pytest.raises(ValueError, match="kind"):
+    with pytest.raises(ValueError, match=r"no projector named|the record that names it"):
         projectors.from_record(record)
 
 
@@ -182,7 +182,7 @@ def test_gemma4_tower_matches_the_reference_implementation():
     record = V.translate_gemma4_vision_config(fixture["config"])
     tower = towers.from_record(record).build()
     variables = V.translate_gemma4_vision_weights(fixture["tensors"])
-    patch = record["patch_size"]
+    patch = record["fields"]["patch_size"]
     assert isinstance(patch, int)
     image = gemma4_image(fixture["pixels"], patch)
     assert np.max(np.abs(
@@ -208,7 +208,7 @@ def test_gemma4_projector_matches_the_reference_implementation():
     fixture = load_fixture("gemma4-vision-tiny")
     trunk = V.translate_gemma4_vision_config(fixture["config"])
     record = V.translate_gemma4_projector_config(
-        trunk, fixture["projector"]["text_width"])
+        trunk["fields"], fixture["projector"]["text_width"])
     projector = projectors.from_record(record).build()
     variables = {"params": V.translate_gemma4_projector_weights(
         fixture["projector_tensors"])}

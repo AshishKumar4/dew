@@ -6,7 +6,7 @@ today's grouped-query causal attention), and each kind builds its own
 value and plugs in with no branch on the backbone, which `test_scale` here
 proves by being one: a second member that exists only in this file, yet
 builds, runs and refuses unknown fields through the same paths a reference
-kind will. Records (`mixer={"kind": ...}`) and values agree, and an unknown
+kind will. Records (`mixer={"name": ..., "fields": ...}`) and values agree, and an unknown
 kind or field raises naming what was asked for.
 """
 
@@ -71,7 +71,7 @@ def test_mixer_records_and_values_compute_the_same_logits():
     ids = jnp.asarray([[1, 2, 3, 4]], jnp.int32)
     params = expected.init(jax.random.key(0), ids)
     logits = expected.apply(params, ids)
-    record = {"kind": "test_scale", "scale": 3.0}
+    record = {"name": "test_scale", "fields": {"scale": 3.0}}
     for model in (tiny(mixer=record),
                   models.build("causal_transformer", **TINY, mixer=record)):
         assert jnp.array_equal(model.apply(params, ids), logits)
@@ -81,20 +81,20 @@ def test_mixer_records_and_values_compute_the_same_logits():
 def test_an_unknown_mixer_kind_is_refused():
     """A record naming no registered kind is a bad config, refused as a
     tower or projector record is."""
-    with pytest.raises(ValueError, match="got 'nope'"):
-        tiny(mixer={"kind": "nope"})
+    with pytest.raises(ValueError, match="no mixer named 'nope'"):
+        tiny(mixer={"name": "nope", "fields": {}})
 
 
 def test_a_mixer_record_without_a_kind_is_refused():
-    with pytest.raises(ValueError, match="names its kind"):
+    with pytest.raises(ValueError, match="is the record that names it"):
         tiny(mixer={"scale": 3.0})
 
 
 def test_a_mixer_field_no_kind_declares_is_refused():
-    with pytest.raises(ValueError, match="has no field for"):
-        tiny(mixer={"kind": "attention", "scale": 3.0})
-    with pytest.raises(ValueError, match="has no field for"):
-        tiny(mixer={"kind": "test_scale", "kv_lora_rank": 4})
+    with pytest.raises(ValueError, match="unknown fields"):
+        tiny(mixer={"name": "attention", "fields": {"scale": 3.0}})
+    with pytest.raises(ValueError, match="unknown fields"):
+        tiny(mixer={"name": "test_scale", "fields": {"kv_lora_rank": 4}})
 
 
 def test_something_that_is_neither_a_value_nor_a_record_is_refused():
@@ -105,7 +105,7 @@ def test_something_that_is_neither_a_value_nor_a_record_is_refused():
 def test_the_mixer_registry_refuses_unknown_kinds_and_fields():
     with pytest.raises(KeyError, match="no mixer named 'nope'"):
         mixers.build("nope")
-    with pytest.raises(ValueError, match="has no field for"):
+    with pytest.raises(ValueError, match="unknown fields"):
         mixers.build("test_scale", nope=1.0)
 
 
@@ -137,7 +137,8 @@ def test_a_kind_selects_the_mixer_its_layers_run():
     ids = jnp.ones((2, 8), jnp.int32)
     key = jax.random.key(0)
     per_kind = hybrid(kinds={"linear": LayerKind(mixer=ScaleMixer(scale=0.0))})
-    swapped = hybrid(mixer=ScaleMixer(scale=0.0), kinds={"linear": LayerKind(mixer={"kind": "attention"})})
+    swapped = hybrid(mixer=ScaleMixer(scale=0.0),
+                     kinds={"linear": LayerKind(mixer={"name": "attention", "fields": {}})})
     plain = hybrid()
 
     kind_logits = per_kind.apply(per_kind.init(key, ids), ids)
@@ -152,15 +153,15 @@ def test_a_kind_selects_the_mixer_its_layers_run():
 def test_invalid_kind_mixer_records_are_refused():
     with pytest.raises(ValueError, match="kind's mixer"):
         LayerKind(mixer="test_scale")
-    with pytest.raises(ValueError, match="got 'nope'"):
-        LayerKind(mixer={"kind": "nope"})
+    with pytest.raises(ValueError, match="no mixer named 'nope'"):
+        LayerKind(mixer={"name": "nope", "fields": {}})
 
 
 def test_models_build_takes_kind_mixer_records():
     """The CLI path builds per-kind mixers through `models.build`."""
     model = models.build(
         "causal_transformer", **TINY, layer_types=("full_attention", "linear"),
-        kinds={"linear": {"mixer": {"kind": "test_scale", "scale": 3.0}}})
+        kinds={"linear": {"mixer": {"name": "test_scale", "fields": {"scale": 3.0}}}})
     expected = hybrid(kinds={"linear": LayerKind(mixer=ScaleMixer(3.0))})
     ids = jnp.asarray([[1, 2, 3, 4]], jnp.int32)
     params = expected.init(jax.random.key(0), ids)
