@@ -2271,6 +2271,22 @@
    ],
    "note": "Block files have no version metadata; pin inferred from same writer's documented release and companion tiny config."
   },
+  "llama_cpp": {
+   "tool": "tools/llama_cpp_reference.py",
+   "sources": [
+    {
+     "repo": "ggml-org/llama.cpp",
+     "version": "v0.5.0 (7fe450e19305b828c199d602c23a8337aaa1f03b)",
+     "runs": "fetched"
+    },
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.16.1",
+     "runs": "transformers"
+    }
+   ],
+   "note": "A tiny registry Llama Dew exports (parameters moved by a seeded draw) with the committed Llama-style tokenizer, converted by llama.cpp's own convert_hf_to_gguf.py to F32 GGUF (in the Dew environment plus sentencepiece 0.2.2: its declared transformers 4.57.6 cannot read the TokenizersBackend class transformers 5 writes) and run by libllama built from the archive (SHA-256 pinned) for the CPU, F32 KV cache, one thread; transformers float64 logits on the same export as the truth; SHA-256 of the export's config, generation config and weights."
+  },
   "lm_engine": {
    "tool": "tools/lm_engine_reference.py",
    "sources": [
