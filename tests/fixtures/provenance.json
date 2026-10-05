@@ -3216,6 +3216,11 @@
  },
  "inputs": [
   {
+   "tool": "tools/nvfp4_storage_reference.py",
+   "what": "tiny weight-only FP8 and NVFP4 checkpoints written by the reference compressors",
+   "files": ["codecs/storage/fp8/model.safetensors", "codecs/storage/nvfp4/model.safetensors"]
+  },
+  {
    "tool": "tools/audio_reference.py",
    "what": "audio encoder weights and synthetic waveforms",
    "files": [
