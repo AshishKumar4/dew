@@ -103,7 +103,7 @@ def main():
                        for index, kernel in enumerate(kernels)]
             rows = [row for future in futures for row in future.result()]
         memory = {row["uid"]: row["pss_bytes"] for row in rows}
-        print(json.dumps({"visitors": args.count, "contexts": len(kernels),
+        print(json.dumps({"requests": args.count, "contexts": len(kernels),
                           "startup_seconds": [kernel[2] for kernel in kernels], "kernel_pss_bytes": memory,
                           "kernel_fd_counts": {row["uid"]: row["fds"] for row in rows},
                           "median_execute_seconds": statistics.median(row["execute_seconds"] for row in rows),
