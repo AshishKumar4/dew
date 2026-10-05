@@ -7,6 +7,7 @@ forwards the family tests match against diffusers.
 """
 
 import dataclasses
+import json
 import math
 import shutil
 import tarfile
@@ -177,17 +178,27 @@ DRAWS = dict(np.load(FIXTURES / "flow" / "draws.npz"))
     ("sd3", Flow(shift=3.0)),
     ("flux", Flow(shift=1.0, density="uniform")),
 ], ids=["sd3", "flux"])
-def test_a_flow_preset_reproduces_a_diffusers_scripts_default_draw_and_weighting(family, preset):
+def test_a_flow_preset_reproduces_a_diffusers_scripts_default_draw_and_weighting(family, preset, pipelines):
     """tools/flow_draw_reference.py runs Diffusers 0.34.0's SD3 and Flux
     DreamBooth scripts' own draw-to-weighting statements, at their own
     defaults and over the published scheduler files, on this preset's
-    draws (reflected, as the scripts' tables descend). The scripts index a
-    1000-entry table where Dew draws a continuous time, so each noise level
-    is the preset's or above it by at most the table's step there; the
+    draws (reflected, as the scripts' tables descend). The script's table
+    index is a function of the draw, floor((1 - t) * 1000) in float32, and
+    the preset's times give every index the script took; the scheduler's
+    table at those indices is the script's noise level exactly, which the
+    preset's continuous level reaches from below within one table step. The
     weights are equal, all one."""
+    from diffusers import FlowMatchEulerDiscreteScheduler
+
     schedule = preset().schedule
     times = np.asarray(schedule.sample_t(jax.random.key(int(DRAWS["key"])), DRAWS[f"{family}/times"].size))
     np.testing.assert_array_equal(times, DRAWS[f"{family}/times"])
+    indices = np.floor((np.float32(1) - times) * np.float32(1000)).astype(np.int64)
+    np.testing.assert_array_equal(indices, DRAWS[f"{family}/indices"])
+    config = json.loads((pipelines / family / "pipeline" / "scheduler" / "scheduler_config.json").read_text())
+    table = FlowMatchEulerDiscreteScheduler.from_config(config).sigmas.numpy()
+    np.testing.assert_array_equal(table[indices], DRAWS[f"{family}/sigmas"])
+
     wide = times.astype(np.float64)
 
     def shifted(t):
