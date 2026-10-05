@@ -13,11 +13,11 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact_as_the_reference, assert_computes_the_oracle
 from test_mean_flow import CLASSES, labelled
 
 from dew.diffusion import presets
-from dew.inputs import Condition, Field, InputSpec
+from dew.inputs import Condition, Field, InputSpec, unit_range
 from dew.nn.autoencoders.kl import AutoencoderKL
 from dew.nn.autoencoders.sd_vae import StableDiffusionVAE
 from dew.nn.autoencoders.vae import translate_vae_weights
@@ -229,6 +229,55 @@ def autoencoder_gradients(tail: str) -> dict:
     return jax.tree.map(lambda index: flat[index.astype(np.int64)], translate_vae_weights(indices))
 
 
+def gamma(roundings: int) -> float:
+    """Higham's gamma_k for float32: k roundings of unit roundoff 2^-24 bound
+    a relative error by k u / (1 - k u)."""
+    unit = float(np.finfo(np.float32).eps) / 2
+    return roundings * unit / (1 - roundings * unit)
+
+
+def batch_norm(latents, before: dict, momentum: float = 0.1) -> dict:
+    """torch `BatchNorm2d`'s training-mode update of the running statistics
+    `before` by `latents` `[..., C]`, in float64: the batch's mean and
+    unbiased variance over every axis but the channels, mixed in at
+    `momentum`."""
+    rows = np.asarray(latents, np.float64).reshape(-1, np.shape(latents)[-1])
+    count = rows.shape[0]
+    return {"mean": (1 - momentum) * np.asarray(before["mean"], np.float64) + momentum * rows.mean(0),
+            "var": (1 - momentum) * np.asarray(before["var"], np.float64)
+            + momentum * rows.var(0) * count / (count - 1)}
+
+
+def assert_the_batch_norm_of(latents, before: dict, after: dict, momentum: float = 0.1) -> None:
+    """Dew's float32 running statistics `after` against `batch_norm` of the
+    same float32 `latents` in float64, within the float32 rounding that
+    computation can make. Summing n terms in any order errs by at most
+    gamma_{n-1} times the sum of their magnitudes, so the batch mean, the
+    sum and one division, is within gamma_n of the mean magnitude S. The
+    centered variance's terms (x - mean)^2 take three roundings each before
+    the n-term sum and the division, gamma_{n+3} of the variance, plus the
+    square of the mean's own error, which shifts the centering. Mixing
+    adds the stored statistics' float32 conversion, each momentum constant's
+    float32 rounding, the multiplies, the variance's n / (n - 1) (two more
+    roundings) and the sum. A dropped or extra term (a biased variance, a
+    momentum off its value) moves a statistic by a share of 1 / n or more,
+    hundreds of times these bounds; the rounding a runner's vector width
+    reorders stays inside them."""
+    rows = np.asarray(latents, np.float64).reshape(-1, np.shape(latents)[-1])
+    count = rows.shape[0]
+    exact = batch_norm(latents, before, momentum)
+    magnitude = np.abs(rows).mean(0)
+    drift = gamma(count) * magnitude
+    stored = {name: np.abs(np.asarray(before[name], np.float64)) for name in ("mean", "var")}
+    bounds = {"mean": gamma(count + 4) * ((1 - momentum) * stored["mean"] + momentum * magnitude),
+              "var": gamma(count + 9) * ((1 - momentum) * stored["var"]
+                                         + momentum * count / (count - 1) * (rows.var(0) + drift ** 2))
+              + momentum * count / (count - 1) * drift ** 2}
+    for name, bound in bounds.items():
+        error = np.abs(np.asarray(after[name], np.float64) - exact[name])
+        assert np.all(error <= bound), (name, error.tolist(), bound.tolist())
+
+
 def test_a_step_is_train_repae_s_step(tmp_path):
     """One DiffusionObjective step under `EndToEnd` against
     `train_repae.py`'s loop body run as published on DiffusionObjective's
@@ -292,22 +341,44 @@ def test_a_step_is_train_repae_s_step(tmp_path):
         got, want, exact = (np.concatenate([np.ravel(part) for part in parts])
                             for parts in (dew, reference, truth))
         assert_as_exact_as_the_reference(got, want, exact, label)
+    # The running statistics are eight numbers, too few for the float64
+    # rule's RMS to settle: a runner's vector width alone moved its ratio
+    # from 1.00 to 2.46. So the rule holds the posterior's sample they are
+    # computed from, 2048 entries, and they are held to the reference's
+    # batch norm of Dew's own sample within that computation's float32
+    # rounding, the reference's batch norm being that function in float64.
     statistics = aux.variables[LATENT_STATS]
-    want, exact = (np.concatenate([STEPPED[f"bn/running_mean{tail}"], STEPPED[f"bn/running_var{tail}"]])
-                   for tail in ("", "_f64"))
-    assert_as_exact_as_the_reference(np.concatenate([statistics["mean"], statistics["var"]]), want, exact,
-                                     "the running statistics")
+    tuned = task._end_to_end_latents({**variables, "params": params}, unit_range(batch["image"]),
+                                     jax.random.split(step.key, 5)[0])
+    for name in ("mean", "var"):
+        np.testing.assert_array_equal(np.asarray(tuned.statistics[name]), np.asarray(statistics[name]))
+    assert_as_exact_as_the_reference(np.asarray(tuned.raw), STEPPED["latents/sample"],
+                                     STEPPED["latents/sample_f64"], "the posterior's sample")
+    before = {name: STEPPED[f"bn/running_{name}_before"] for name in ("mean", "var")}
+    published = batch_norm(STEPPED["latents/sample_f64"], {name: STEPPED[f"bn/running_{name}_before_f64"]
+                                                           for name in ("mean", "var")})
+    assert_computes_the_oracle(
+        np.concatenate([STEPPED["bn/running_mean_f64"], STEPPED["bn/running_var_f64"]]),
+        np.concatenate([published["mean"], published["var"]]), "the reference's batch norm",
+        roundings=2 * 512)
+    assert_the_batch_norm_of(tuned.raw, before, statistics)
     np.testing.assert_allclose(float(value), 0.5 * STEPPED["loss/sit_f64"] + STEPPED["loss/vae_f64"],
                                rtol=1e-6)
     for term in ("alignment", "autoencoder_alignment", "reconstruction", "kl"):
         np.testing.assert_allclose(float(aux.metrics[term]), STEPPED[f"loss/{term}_f64"], rtol=1e-6,
                                    err_msg=term)
+    # REPA-E's `extract_latents_stats` is the running mean and the running
+    # variance's reciprocal square root, with no epsilon; the tuned
+    # autoencoder takes Dew's own statistics through the same, within the
+    # square root's and the division's roundings.
+    np.testing.assert_array_equal(STEPPED["latents/latents_bias_f64"], STEPPED["bn/running_mean_f64"])
+    np.testing.assert_allclose(STEPPED["latents/latents_scale_f64"],
+                               1 / np.sqrt(STEPPED["bn/running_var_f64"]), rtol=4 * np.finfo(np.float64).eps)
     decoder, _ = task.published_autoencoder({**variables, "params": params, LATENT_STATS: statistics})
     assert decoder is not None
-    want, exact = (np.concatenate([STEPPED[f"latents/latents_{name}{tail}"] for name in ("scale", "bias")])
-                   for tail in ("", "_f64"))
-    assert_as_exact_as_the_reference(np.concatenate([decoder.latent_scale, decoder.latent_shift]), want,
-                                     exact, "the latent scale and bias")
+    np.testing.assert_array_equal(np.asarray(decoder.latent_shift), np.asarray(statistics["mean"]))
+    np.testing.assert_allclose(np.asarray(decoder.latent_scale, np.float64),
+                               1 / np.sqrt(np.asarray(statistics["var"], np.float64)), rtol=gamma(2), atol=0)
 
 
 def test_end_to_end_needs_alignment_and_a_kl_autoencoder():
