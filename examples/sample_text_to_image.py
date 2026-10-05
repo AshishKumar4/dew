@@ -9,16 +9,16 @@ model from the Hugging Face Hub:
 
     python examples/sample_text_to_image.py --model RUN_DIR
 
-The default model, dewml/hybrid-dit-176m, is a hybrid DiT of state-space and
-attention blocks trained with Dew. Its denoiser holds 175.6M parameters,
-beside a 123.1M-parameter CLIP text encoder and an 83.7M-parameter Stable
-Diffusion autoencoder, and it samples 256x256 images.
+The default model, dewml/hybrid-dit-176m, combines state-space and attention
+blocks in a DiT trained with Dew. It samples 256x256 images. The denoiser has
+175.6M parameters, with a 123.1M-parameter CLIP text encoder and an
+83.7M-parameter Stable Diffusion autoencoder.
 
-Each sampler draws one batch per seed, holding every prompt. The output
-directory gets one PNG per image, one grid per sampler (rows are prompts,
-columns are seeds) and manifest.json, which records each image's prompt, seed,
-sampler, steps and guidance, and each batch's wall time. The first batch of a
-sampler includes compiling it, or reading it from JAX's compilation cache.
+Each sampler generates one batch per seed with all prompts. The output
+directory contains a PNG per image and a grid per sampler. Grid rows are
+prompts; columns are seeds. manifest.json records each image's prompt, seed,
+sampler, steps and guidance, plus each batch's wall time. For each sampler,
+the first batch's time includes compilation or loading from JAX's compilation cache.
 """
 import json
 import time
@@ -60,8 +60,8 @@ class Config:
     seeds: tuple[int, ...] = (0, 1, 2, 3)
     samplers: tuple[str, ...] = tuple(SAMPLERS)
     negative: str | None = None
-    """The prompt for the unconditional branch of classifier-free guidance; None
-    keeps the one the loaded model is configured with (empty for the recorded model)."""
+    """Prompt for the unconditional branch of classifier-free guidance.
+    None uses the loaded model's default, empty for the recorded model."""
 
 
 def load(model: str, revision: str | None) -> TextToImage:
@@ -71,15 +71,15 @@ def load(model: str, revision: str | None) -> TextToImage:
 
 
 def grid(title: str, prompts, seeds, images: np.ndarray) -> Image.Image:
-    """`images[row, column]` as one image, labelled with prompts and seeds.
+    """Combine `images[row, column]` into a grid labelled with prompts and seeds.
 
-    The background is grey, so the white or black bands the model draws along
-    some images' edges stay visible as part of those images."""
+    A grey background keeps model-generated white or black edge bands visible.
+    """
     rows, columns, height, width = images.shape[:4]
     font = ImageFont.load_default(size=14)
     label, gap = 22, 4
     heading = title + "   seeds " + ", ".join(map(str, seeds))
-    # As wide as the images, or as the longest caption where it is wider.
+    # The sheet must fit both the images and the longest caption.
     widest = max(font.getlength(caption) for caption in (heading, *prompts)) + 8
     sheet = Image.new(
         "RGB", (max(columns * (width + gap) - gap, int(widest)), label + rows * (label + height)), "#b0b0b0"
