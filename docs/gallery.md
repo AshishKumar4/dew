@@ -1,12 +1,12 @@
 # Gallery
 
-These samples come from models trained with Dew. [Diffusion training](guides/diffusion.md) and [Recipes](recipes.md) explain how to train a model. [Diffusion processes and solvers](concepts/diffusion.md) describes the samplers used below.
+Samples from models trained with Dew. [Diffusion training](guides/diffusion.md) and [Recipes](recipes.md) describe how to train one, and [Diffusion processes and solvers](concepts/diffusion.md) the samplers named below.
 
 ## Text-to-image, 176M hybrid DiT
 
-This 176M-parameter model generates 256×256 images from text. It was trained with Dew. Weights: [`dewml/hybrid-dit-176m`](https://huggingface.co/dewml/hybrid-dit-176m).
+A 176M-parameter text-to-image model at 256×256, trained with Dew. Weights: [`dewml/hybrid-dit-176m`](https://huggingface.co/dewml/hybrid-dit-176m).
 
-Each caption is the prompt used for that image. To reproduce a sample, use the seed, solver, guidance and batch context in the [manifest](../site/public/examples/curated/manifest.json). Settings differ between images.
+Each image is captioned with its prompt. The [manifest](../site/public/examples/curated/manifest.json) records the actual seed, solver, guidance and batch context for reproducing each draw; settings differ between images.
 
 <div class="curated-gallery">
 
@@ -62,7 +62,7 @@ Each caption is the prompt used for that image. To reproduce a sample, use the s
 
 ## Unconditional models
 
-The two grids below come from unconditional models trained with Dew on Oxford Flowers 102. Their records include image sizes, sampling settings and model fields. They lack complete environment details, checkpoints, seeds and quality evaluations. Scheduler and model names refer to the Dew version used for each run.
+The two grids below come from unconditional models trained with Dew on Oxford Flowers 102. Their records give the image size, sampling settings and model fields, but no complete environment, checkpoint, seed or quality evaluation, and their scheduler and model names are those of the Dew version the runs used.
 
 ### DDPM sampling
 
@@ -81,13 +81,13 @@ This grid used DDPM sampling for 1,000 steps, with `CosineNoiseScheduler` for bo
 | Residual blocks | 2 |
 | Middle residual blocks | 1 |
 
-The attention and feature-depth lists describe the recorded run. They are not arguments of the current UNet.
+The attention list and the feature-depth list are the recorded settings, not arguments of the current UNet.
 
 ![unconditional Oxford Flowers grid using 1000-step DDPM sampling](assets/gallery/ddpm2.png)
 
 ### Heun sampling
 
-This grid used a 10-step Heun sampler. Heun predicts and corrects on each sampling interval. The exact number of network evaluations depends on how the solver handles the last step. The recorded caption says 20 model evaluations, but no trace confirms that count.
+This grid used a 10-step Heun sampler. Heun takes a prediction step and then a correction on each sampling interval, so the exact number of network evaluations depends on how the solver handles the last step. The recorded caption said 20 model evaluations; no trace confirms that count.
 
 | Setting | Recorded value |
 | --- | --- |
@@ -101,4 +101,4 @@ This grid used a 10-step Heun sampler. Heun predicts and corrects on each sampli
 
 ![unconditional Oxford Flowers grid using 10-step Heun sampling](assets/gallery/heun.png)
 
-The records do not establish a controlled sampler comparison between these two grids. They do not show matching checkpoints, seeds or training settings. This gallery does not redistribute datasets; each has its own license and access conditions. [Papers and attribution](references.md) lists the research and upstream implementations for these methods.
+The two unconditional grids are not a controlled comparison of samplers: the records do not show that they used the same checkpoints, seeds or training settings. The gallery does not redistribute the datasets; each has its own license and access conditions. [Papers and attribution](references.md) lists the research and the upstream implementations behind these methods.
