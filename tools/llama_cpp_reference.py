@@ -36,9 +36,11 @@ which transformers parses the tokenizer.
 
 `consume` fetches and builds llama.cpp under ~/.cache/dew/upstream (cmake,
 ninja and a C++ compiler) and writes tests/fixtures/llama_cpp/reference.npz:
-the ids, llama.cpp's float32 logits, transformers' float64 ones, and the
+the ids, llama.cpp's float32 logits, transformers' float64 ones, the
 SHA-256 of the export's config, generation config and weights (the weights
-by contents, as tools/lora_export_reference.py's `digest` hashes them).
+by contents, as tools/lora_export_reference.py's `digest` hashes them), and
+the vocabulary the GGUF carries (its pieces by id, and its unknown,
+beginning and end ids), read back with the pinned gguf-py.
 """
 
 from __future__ import annotations
@@ -65,7 +67,10 @@ SEED = 61
 IDS = (np.arange(3, 3 + 24 * 7, 7) % FIELDS["vocab_size"]).astype(np.int32)
 DIGESTED = ("config.json", "generation_config.json", "model.safetensors")
 """The files the forward reads. The tokenizer files are transformers' own
-serialization, which the tokenizers release decides."""
+serialization, which the tokenizers release decides; what the GGUF carries
+of them is recorded as a vocabulary instead (`gguf_vocabulary`)."""
+SPECIAL_KEYS = ("tokenizer.ggml.unknown_token_id", "tokenizer.ggml.bos_token_id",
+                "tokenizer.ggml.eos_token_id")
 
 CORPUS = """Dew is a JAX research framework for diffusion models and language models.
 It trains, samples and exports models, and reads published checkpoints back.
@@ -225,6 +230,16 @@ def build(source: Path) -> Path:
     return program
 
 
+def gguf_vocabulary(source: Path, gguf: Path) -> tuple[np.ndarray, np.ndarray]:
+    """The GGUF's pieces by id, and its unknown, beginning and end ids."""
+    sys.path.insert(0, str(source / "gguf-py"))
+    from gguf import GGUFReader
+
+    fields = GGUFReader(str(gguf)).fields
+    pieces = np.asarray(fields["tokenizer.ggml.tokens"].contents())
+    return pieces, np.asarray([fields[key].contents() for key in SPECIAL_KEYS], np.int64)
+
+
 def consume(directory: Path, converter_python: str) -> None:
     import torch
     import transformers
@@ -253,8 +268,9 @@ def consume(directory: Path, converter_python: str) -> None:
             "converter transformers": converter[1], "truth transformers": transformers.__version__,
             "truth torch": torch.__version__}
     FIXTURE.mkdir(parents=True, exist_ok=True)
-    arrays = {"ids": IDS[None], "llama_cpp.fp32": theirs, "transformers.fp64": truth,
-              "meta": np.frombuffer(json.dumps(meta).encode(), np.uint8)}
+    pieces, special = gguf_vocabulary(source, gguf)
+    arrays = {"ids": IDS[None], "llama_cpp.fp32": theirs, "transformers.fp64": truth, "gguf.pieces": pieces,
+              "gguf.special": special, "meta": np.frombuffer(json.dumps(meta).encode(), np.uint8)}
     np.savez_compressed(FIXTURE / "reference.npz", **arrays)
     gap = float(np.sqrt(np.mean((theirs - truth) ** 2)))
     print(f"{FIXTURE / 'reference.npz'}: llama.cpp off float64 by {gap:.3g} (rms)")
