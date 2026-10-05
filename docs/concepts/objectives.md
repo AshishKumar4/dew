@@ -48,7 +48,7 @@ class Continued(Objective):
         return self.model.init(key, jnp.zeros((1, 4), jnp.float32))
 ```
 
-With `variables=None`, `init(key)` uses the objective's configured input. The trainer always passes the tree through the initializer, so the trace does not read it from the objective. It remains an argument even through nested `jax.jit` calls inside `init`. If an objective wraps another, it passes the held tree to the wrapped objective's `init`. Subclasses of objectives that hold weights must also accept `variables`; otherwise the call raises.
+`variables=None` means the objective's own configured input, which is what a plain `init(key)` uses. The trainer always passes the tree through the initializer, so nothing is read off the objective inside the trace. Because the tree is an argument, it stays an argument however deeply `init` nests its own `jax.jit`. An objective that wraps another passes the held tree on to that objective's `init`. A subclass of an objective that holds weights must accept the `variables` parameter; if it does not, the call raises.
 
 `Trainer.initial_state(initializer=None, key=None)` builds the starting state, using the run's settings for each `None` argument. `Trainer.place` calls it once for shapes and once for values, so `trainer.initial_state()` returns the state the run starts from.
 
