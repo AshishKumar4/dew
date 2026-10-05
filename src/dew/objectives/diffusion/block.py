@@ -113,32 +113,34 @@ def _row_mean(losses: jax.Array, mask: jax.Array) -> Ratio:
 
 @objectives("block_diffusion")
 class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
-    """Fine-tune DiffusionGemma on clean ``text`` rows split into prompt and canvases.
+    """Fine-tunes DiffusionGemma on clean ``text`` rows split into a prompt and canvases.
 
     A row has ``prompt_length + canvas_size * num_canvases`` tokens. ``text``
-    accepts token arrays or ModelInputs; media conditions only the clean encoder.
-    Supplied attention validity controls cache occupancy, otherwise the pad ID
-    and canvas mask do. Optional ``canvas_mask`` and ``encoder_target_mask``
-    select text targets; media placeholders are never labels. Default encoder
-    targets require adjacent valid slots, matching Google's SequenceTargetShift.
-    Every response token is corrupted, but only a uniformly selected valid
-    canvas contributes diffusion CE.
+    holds token arrays or `ModelInputs`, and any media in it conditions only
+    the clean encoder. When the batch supplies attention validity, that
+    decides which cache slots are occupied; otherwise the pad ID and the
+    canvas mask decide. The optional ``canvas_mask`` and
+    ``encoder_target_mask`` select the text targets, and media placeholders
+    are never labels. By default an encoder target requires adjacent valid
+    slots, as Google's SequenceTargetShift does. Every response token is
+    corrupted, but only one valid canvas, chosen uniformly, contributes the
+    diffusion cross entropy.
 
-    `processor` is what `pipeline` turns text into ids with and decodes
-    through, unless it is handed another; a run records its tokenizer.
+    `processor` is what `pipeline` uses to turn text into ids and decode
+    them, unless it is given another one. A run records its tokenizer.
 
-    `variables` is the tree training starts from, the SFT source's or an
-    adapter's split of it; a split (`dew.objectives.base.freeze`) is kept,
-    so the optimizer moves what it leaves in `params`. `model` may be the
-    loaded source itself, which supplies its model, variables and
-    processor. None draws a fresh init.
+    `variables` is the tree training starts from: the SFT source's, or an
+    adapter's split of it. A split (`dew.objectives.base.freeze`) is kept,
+    so the optimizer updates only what the split leaves in `params`. `model`
+    may be the loaded source itself, which supplies its model, variables and
+    processor. With no variables, training starts from a fresh init.
 
-    Both cross-entropies score the final states through the bounded head
+    Both cross entropies score the final states through the bounded head
     (`dew.objectives.lm.chunked.chunked_cross_entropy`), `head_chunks`
-    vocabulary tiles at a time, so no vocabulary-sized fp32 logits or
-    softmax of a whole row is held for the backward pass. The first
-    denoising pass, whose logits condition the second and carry no
-    gradient, is the one place a full row of logits exists.
+    vocabulary tiles at a time. The backward pass therefore never holds
+    vocabulary-sized fp32 logits or the softmax of a whole row. The one
+    place a full row of logits exists is the first denoising pass, whose
+    logits condition the second pass and receive no gradient.
     """
 
     saved_task = BlockGeneration
@@ -214,10 +216,10 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
 
     def pipeline(self, state: TrainState, *, ema: bool | None = None,
                  processor: Processor | None = None) -> BlockGeneration:
-        """Publish the state's weights as a `BlockGeneration` task.
+        """Return the trained model as a `BlockGeneration` task over the state's weights.
 
-        The sampler keeps the published defaults, and the tokenizer's EOS
-        ids are the caller's to set.
+        The sampler keeps the published defaults, and the caller sets the
+        tokenizer's EOS ids.
         """
         from dew.diffusion.block import BlockProcess
         from dew.inference.tasks import BlockGeneration
@@ -229,11 +231,11 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
 
     @property
     def bank_sites(self) -> tuple[DecoderBank, ...]:
-        """Name the shared text stack, as the training model declares it."""
+        """The shared text stack, as the training model declares it."""
         return self.training_model.bank_sites
 
     def held_variables(self) -> Variables | None:
-        """Return the SFT source this objective starts from."""
+        """Return the SFT source this objective starts from, or None for a fresh init."""
         return self.variables
 
     def init(self, key: jax.Array, variables: Variables | None = None) -> Variables:
@@ -300,12 +302,12 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
                                   "encoder_ce": encoder_stats.mean()[0]})
 
     def evaluate(self, params: Variables, batch: Batch, step: Step) -> TokenScores:
-        """Score the denoiser's cross entropy on every canvas target of the batch.
+        """Return the denoiser's cross entropy on every canvas target of the batch.
 
         One noise level and one canvas per row are drawn from the pass's key,
-        as training draws them, with dropout off and the averaged weights
-        when the run keeps them, so `perplexity` over a validation pass is
-        exp of the denoising loss per target."""
+        as in training. Dropout is off, and the averaged weights are used when
+        the run keeps them. So `perplexity` over a validation pass is the
+        exponential of the denoising loss per target."""
         params = params if step.ema is None else step.ema
         losses, weights, correct = self._scored(params, batch, step.key)
         return TokenScores(losses=losses, weights=weights, correct=correct)

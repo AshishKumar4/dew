@@ -25,13 +25,12 @@ from ..lm import LMObjective
 
 @objectives("dpo")
 class DPOObjective(LMObjective):
-    """Train a policy on preference pairs with the DPO loss (arXiv:2305.18290, eq. 7).
+    """Trains a policy on preference pairs with the DPO loss (arXiv:2305.18290, equation 7).
 
-    The reference is frozen.
-
-    `beta` is the KL strength; `model` and `seq_len` are the LMObjective's,
-    with `seq_len` one below the row width. The reference never moves, so an
-    `ema_decay` argument is refused, and `loss_role` is refused with it: the
+    The reference is the starting policy, frozen. `beta` is the KL strength
+    and must be positive. `model` and `seq_len` are as in `LMObjective`, with
+    `seq_len` one less than the row width. The reference never moves, so an
+    `ema_decay` argument is refused, and so is `loss_role`, because the
     completion mask already says which targets count. Validation scores the
     chosen responses' perplexity under the policy.
     """
@@ -82,7 +81,11 @@ class DPOObjective(LMObjective):
         return (ids[:, 0], ids[:, 1], mask[:, 0, 1:], mask[:, 1, 1:])
 
     def loss(self, variables, batch, step):
-        """Score the preference term over each pair's completion tokens."""
+        """Compute the preference term over each pair's completion tokens.
+
+        It also reports `rewards/chosen`, `rewards/rejected` and `accuracy`,
+        the fraction of pairs whose chosen reward is higher.
+        """
         if step.ema is None:
             raise ValueError(
                 "the DPO reference reads step.ema, but the objective keeps no EMA; "
@@ -103,9 +106,9 @@ class DPOObjective(LMObjective):
         })
 
     def evaluate(self, params, batch, step):
-        """Score the chosen responses' perplexity under the policy.
+        """Return per-token scores of the chosen responses under the policy, for their perplexity.
 
-        The per-token cross entropies carry the shifted completion mask as
+        The per-token cross entropies take the shifted completion mask as
         weights.
         """
         chosen_ids, _, chosen_mask, _ = self._halves(batch)
