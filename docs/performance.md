@@ -606,12 +606,11 @@ against 5.8 for torch's elementwise and norm kernels and 8.9 for its copies.
 ### Splash's tiles on the TPU, 2026-10-02
 
 Splash attention took 34 ms of Dew's 156 ms Qwen3-0.6B step at 8 x 1024
-tokens on a TPU v6e. MaxText's attention took 50 ms of its step. Both ran
-at about 13% of the chip's peak. This tile comparison measures forward
-plus backward for Qwen3-0.6B's attention: 8 x 1024 tokens, 16 query heads
-over 8, 128 wide, causal, bf16. Each time is the median of 7 rounds of
-10 calls through `dew.nn.attention.splash_attention` at integration
-`8e92a4a6`:
+tokens on a TPU v6e, and MaxText's attention took 50 ms of its own step;
+both ran at about 13% of the chip's peak. The table times the tiles on the
+forward plus backward of Qwen3-0.6B's attention (8 x 1024 tokens, 16 query
+heads over 8, 128 wide, causal, bf16), as the median of 7 rounds of 10 calls
+through `dew.nn.attention.splash_attention` at integration `8e92a4a6`:
 
 | forward tiles | backward tiles | backward kernels | ms |
 |---:|---:|---|---:|
@@ -624,10 +623,10 @@ over 8, 128 wide, causal, bf16. Each time is the median of 7 rounds of
 | 256 | 256 | dq and dkv apart | 3.647 |
 
 Every configuration has the same errors against fp32 XLA at HIGHEST (out
-3.7e-3, dq 5.0e-3, dk 5.1e-3, dv 2.8e-3 of their maximum). The kernel now
-tiles by 1024, reduced to a divisor of each sequence, and runs backward
-in one kernel. Training times in ms on the v6e (integration `527a32e9`,
-three rounds each, one batch reused on the device):
+3.7e-3, dq 5.0e-3, dk 5.1e-3, dv 2.8e-3 of their maximum). So the kernel now
+tiles by 1024, narrowed to a divisor of each sequence, and runs its backward
+as one fused kernel. The training steps on the v6e (integration `527a32e9`,
+three rounds each, one batch kept on the device), in ms:
 
 | step | 512 tiles, dq and dkv apart | 1024 tiles, fused backward |
 |---|---:|---:|
@@ -636,21 +635,20 @@ three rounds each, one batch reused on the device):
 | 4-layer decoder, 256-wide heads, 8 x 2048 | 80.90-80.95 | 75.36-75.45 |
 | 176M hybrid DiT, batch 16 (4 attention blocks of 256 tokens) | 17.24-17.30 | 17.25 |
 
-These rows use `tools/benchmark_step.py` with `optax.adam`. The matched
-comparison against MaxText uses the reference runner's AdamW and clip
-("Training scoreboard" above: 145.3 against MaxText's 154.0 at 8 x 1024).
-After 45 steps, losses differ in the third or fourth significant digit
-(0.003386 against 0.003389 at 8 x 1024). Reordering fp32 sums in the
-backward pass changes the training trajectory, although each kernel
-call has the same errors against fp32.
+These rows are `tools/benchmark_step.py`'s step with `optax.adam`. The step
+to compare against MaxText is the reference runner's, with AdamW and its
+clip ("Training scoreboard" above has 145.3 against MaxText's 154.0 at
+8 x 1024). Losses after the 45 steps differ in the third or fourth
+significant digit (0.003386 against 0.003389 at 8 x 1024), because the
+backward's fp32 sums are reordered and that moves a training run's
+trajectory. Each kernel call's errors against fp32 are the same.
 
 ### tokamax's attention, 2026-10-02
 
-This compares tokamax's Pallas-Triton flash attention (openxla/tokamax
-main at `47d3d663`) with cuDNN on an RTX 4080. Inputs are bf16. Times
-cover forward plus backward, as medians of 7 rounds of 10 calls.
-Each call is checked against fp32 XLA at HIGHEST
-(`max|err| / max|ref|` for dq and dk):
+I compared tokamax's Pallas-Triton flash attention (openxla/tokamax main at
+`47d3d663`) with cuDNN on an RTX 4080, in bf16, timing forward plus backward
+as medians of 7 rounds of 10 calls. Each call is checked against fp32 XLA at
+HIGHEST (`max|err| / max|ref|` for dq and dk):
 
 | shape | cuDNN | tokamax, its heuristic config | tokamax, best of a config grid | JAX's Pallas `mha`, best blocks |
 |---|---:|---:|---:|---:|
@@ -661,69 +659,71 @@ Each call is checked against fp32 XLA at HIGHEST
 | 4 x 1024 causal, 16 over 8, of 128 (Qwen3-0.6B) | 1.541 | 1.288 | 1.242 | 1.260 |
 | 4 x 1024 causal, window of 256 | 0.579 | 0.587 | 0.535 | no window |
 
-At 64-wide shapes, tokamax matches cuDNN's errors (dq and dk 4.8e-3 to
-6.6e-3). At 128, its errors differ; see below. JAX's `mha` reaches
-8.5e-3 because its backward computes `rowsum(o * do)` as a bf16 product.
-An fp32 product matches cuDNN's errors at the same speed.
+At the 64-wide shapes tokamax's errors are cuDNN's (dq and dk 4.8e-3 to
+6.6e-3); at 128 they are not (below). JAX's `mha` reaches 8.5e-3 because its
+backward forms `rowsum(o * do)` as a bf16 product, and an fp32 product gives
+cuDNN's errors at the same speed.
 
-Tokamax reduces training time at 64-wide heads but not at 128. On SimpleDiT-B at batch
-32, attention falls from 5.62 to 4.33 ms and the step from 73.1 to 71.5.
-For the 3-layer decoder, attention falls from 1.82 to 1.24 ms and the
-step from 50.8 to 50.2. At Qwen3-0.6B's widths with 1 x 1024, attention
-increases from 9.13 to 9.24 ms and the step from 97.6 to 98.4. With
-tokamax installed, 'auto' therefore selects its heuristic config for
-heads up to 64 wide and calls without a window, mask or bias
-(`dew.nn.attention.triton_runs`).
+Tokamax reduces training time at 64-wide heads but not at 128. On
+SimpleDiT-B at batch 32, attention goes from 5.62 to 4.33 ms and the step
+from 73.1 to 71.5; on the 3-layer decoder, attention goes from 1.82 to
+1.24 ms and the step from 50.8 to 50.2. At Qwen3-0.6B's widths and 1 x 1024,
+attention goes from 9.13 to 9.24 ms and the step from 97.6 to 98.4. So with
+tokamax installed, 'auto' takes it for heads up to 64 wide and for calls
+with no window, mask or bias (`dew.nn.attention.triton_runs`), at tokamax's
+heuristic config.
 
 At 128-wide heads, 2026-10-02 (Qwen3-0.6B's: 16 query heads over 8, causal,
-1024 tokens; RTX 4080, bf16; Dew at `14087252`). No kernel on this stack
-beats cuDNN while matching its gradient accuracy:
+1024 tokens; RTX 4080, bf16; Dew at `14087252`), I found nothing on this
+stack that beats cuDNN with gradients as accurate as its own:
 
-- At 1 x 1024, tokamax's forward is faster and its backward slower
-  (XProf, command buffers on, kernels per step). Forward takes 2.16 ms
-  against cuDNN's 2.56. Backward takes 7.14 plus 0.27 for
-  `rowsum(o * do)`, against cuDNN's 5.07 plus 0.18 for its head reduction.
-  The step takes 95.96 against 94.07 ms. Torch's FlashAttention-2 kernels
-  take 2.05 and 4.56.
-- Tokamax's gradients are less accurate at these shapes. At batch 1, dk
-  and dv errors reach 5.2e-3 and 4.6e-3 of their maximum, against
-  cuDNN's 4.9e-3 and 2.8e-3. At batch 2, they reach 6.7e-3 and 4.8e-3
-  against 4.7e-3 and 3.5e-3. Its best grid config has the same errors
-  (blocks of 32, keeping openxla/tokamax#1494's constraint).
-- BNTH and BTNH inputs give similar cuDNN times: 0.385 against 0.381 ms
-  a call at batch 1, and 0.721 against 0.716 at batch 2. Upgrading from
-  cuDNN 9.25.1 to 9.27.0 also makes no difference. Qwen3-0.6B's widths at
-  1 x 1024 take 94.20 and 94.08 against 94.23 and 94.19 ms, with attention
-  at 9.09 against 9.11; SimpleDiT-B and the decoder behave similarly.
-  `uv pip install` resolves the newest cuDNN under 10, so a fresh install
-  gets 9.27.
-- JAX's Pallas-Triton `mha` repeats keys over each group's query heads
-  (`jax.experimental.pallas.ops.gpu.attention`). At `0527ab19` on
-  2026-10-04, forward plus backward per call, measured over 28 layered
-  calls, takes 0.33 against cuDNN's 0.38 ms at 1 x 1024 and 1.30 against
-  1.36 at 4 x 1024. Its gradients' RMS distance from float64 is 1.00 to
-  1.04 times cuDNN's. In training, the two tie over two alternating rounds.
-  At 1 x 1024, attention takes 8.49 against 8.52 ms and the step 90.6
-  against 90.8. At 2 x 1024, attention takes 15.5 against 15.3 and the
-  step 142.4 against 142.9. Tokamax's main has no GPU attention change
-  since `47d3d663`. JAX exposes no cuDNN algorithm, workspace or determinism
-  choice for fused attention; non-deterministic is already the default.
-  Closing FlashAttention-2's 1.3-1.9 ms gap would require a Dew
-  Pallas-Triton backward kernel on a backend JAX 0.11 deprecates. That
-  would save under 2% on steps where Dew already beats torch.
+- In the training step at 1 x 1024 (XProf, command buffers on, kernels per
+  step), tokamax's forward is faster and its backward slower. The forward
+  takes 2.16 ms against cuDNN's 2.56. The backward takes 7.14 ms plus 0.27
+  for `rowsum(o * do)`, against cuDNN's 5.07 plus 0.18 for its head
+  reduction. The step takes 95.96 against 94.07 ms. torch's FlashAttention-2
+  kernels take 2.05 and 4.56.
+- tokamax's gradients are less accurate there. dk and dv reach 5.2e-3 and
+  4.6e-3 of their maximum at batch 1, against cuDNN's 4.9e-3 and 2.8e-3, and
+  6.7e-3 and 4.8e-3 at batch 2, against 4.7e-3 and 3.5e-3. Its best grid
+  config (blocks of 32, keeping openxla/tokamax#1494's constraint) has the
+  same errors.
+- cuDNN runs as fast with BNTH inputs as with BTNH (0.385 against 0.381 ms a
+  call at batch 1, 0.721 against 0.716 at batch 2), and cuDNN 9.27.0 as fast
+  as 9.25.1. Qwen3-0.6B's widths at 1 x 1024 take 94.20 and 94.08 against
+  94.23 and 94.19 ms, with attention at 9.09 against 9.11, and SimpleDiT-B
+  and the decoder show the same. `uv pip install` resolves the newest cuDNN
+  under 10, so a fresh install gets 9.27.
+- JAX's own Pallas-Triton `mha`
+  (`jax.experimental.pallas.ops.gpu.attention`, with the keys repeated over
+  each group's query heads) is faster per call and ties in the step,
+  measured 2026-10-04 at `0527ab19`. Timed over 28 layered calls, one call's
+  forward plus backward takes 0.33 against cuDNN's 0.38 ms at 1 x 1024 and
+  1.30 against 1.36 at 4 x 1024, and its gradients' RMS distance from
+  float64 is 1.00 to 1.04 times cuDNN's. In the training step the two tie
+  over two alternating rounds: attention takes 8.49 against 8.52 ms a step
+  and the step 90.6 against 90.8 at 1 x 1024, and 15.5 against 15.3 and
+  142.4 against 142.9 at 2 x 1024.
+- tokamax's main has had no GPU attention change since `47d3d663`, and JAX
+  exposes no cuDNN algorithm, workspace or determinism choice for its fused
+  attention (non-deterministic is already the default).
+- Closing FlashAttention-2's lead of 1.3-1.9 ms a step would take a
+  Pallas-Triton backward of Dew's own, on the backend JAX 0.11 deprecates,
+  and it would save under 2% on steps where Dew is already faster than
+  torch.
 
-At 64-wide heads, tokamax's backward is 10-18% slower than JAX's `mha`:
-0.35 against 0.29 ms for the SimpleDiT-B call. The forwards take 0.093
-and 0.087. None of the block sizes, warp counts or stage counts in
-tokamax's grid closes the gap.
+At 64-wide heads tokamax's backward trails JAX's `mha` by 10-18% (0.35
+against 0.29 ms of the SimpleDiT-B call; the forwards take 0.093 and 0.087),
+and no block size, warp count or stage count in tokamax's own grid closes
+that.
 
-Its VJP computes wrong causal gradients when `block_m1 > block_n1` (dk
-and dv off by 10^2) or `block_n2 > block_m2` (dq off by 0.7). These
-configs are in its autotuning grid, but its heuristic config avoids them.
-Dew therefore uses the heuristic and checks each routed shape
-(`tests/test_kernels.py`). At 256-wide heads, tokamax's heuristic fails
-because it requests more shared memory than sm89 has (102784 of 101376
-bytes). CuDNN also refuses 256-wide heads, so those calls use XLA.
+Its VJP computes wrong gradients for a causal call when `block_m1 >
+block_n1` (dk and dv off by 10^2) or `block_n2 > block_m2` (dq off by 0.7),
+and its autotuning grid includes such configs. Its heuristic config is not
+one of them, so Dew runs the heuristic config and checks each shape it
+routes (`tests/test_kernels.py`). At 256-wide heads tokamax's heuristic asks
+for more shared memory than sm89 has (102784 of 101376 bytes) and fails.
+cuDNN takes no 256-wide head either, so those calls run on XLA.
 
 `tools/benchmark_attention.py`, bf16. The batch is chosen so that query tokens
 times heads is 524288 in every row. The table shows the forward pass alone,
@@ -745,20 +745,20 @@ milliseconds.
 | 4096 | 128 | no | oom | oom | 12.12 | oom | oom | 46.89 |
 | 4096 | 128 | yes | oom | oom | 6.96 | oom | oom | 26.38 |
 
-The reference and xla paths store the S x S logits and run out of 16 GiB
-at S=4096. Where they fit, they are 3 to 12 times slower than the fused
-kernel. These measurements favor cudnn for GPU forward and backward;
-`'auto'` selects it wherever it can.
+The reference and xla paths materialize the S x S logits. They run out of
+16 GiB at S=4096, and wherever they fit they are 3 to 12 times slower than
+the fused kernel. cudnn is the kernel to use for a GPU run, forward and
+backward, and `'auto'` picks it wherever it can.
 
 ### Head dimension 256 through tokamax's Triton flash attention
 
-On pre-Hopper GPUs, cudnn refuses head dimensions above 128. A Gemma 3
-4B or 12B shape, with heads of 256, therefore trains through xla on
-Ampere and Ada. That path stores the S x S logits. Tokamax 0.0.13
-provides Pallas-Triton flash attention for compute capability 8.0 and up,
-with forward and backward passes. It supports grouped query heads, causal
-masks, windows and power-of-two head dimensions. JAX 0.11.1 deprecates its
-own `jax.experimental.pallas.ops.gpu.attention` in favor of tokamax.
+Before Hopper, cudnn refuses head dimensions above 128. So a Gemma 3 4B or
+12B shape (heads of 256) trains through the xla path on every Ampere and Ada
+card, and that path materializes the S x S logits. tokamax 0.0.13 ships a
+Pallas-Triton flash attention for compute capability 8.0 and up. It has a
+forward and a backward, and it takes grouped query heads, causal masks,
+windows and any power-of-two head dimension. JAX 0.11.1 deprecates its own
+`jax.experimental.pallas.ops.gpu.attention` in favour of it.
 
 Measured on the RTX 4080 (compute capability 8.9, 99 KiB of shared memory per
 block), driver 595.84, jax/jaxlib 0.11.1, tokamax 0.0.13. Inputs were bf16,
@@ -777,38 +777,40 @@ but not the 4080.
 | 4096 (B=1) | none | 3.97 | 1.03 | 768 MiB | 0 | 10.5 | fails, shared memory |
 | 4096 (B=1) | 1024 | 4.10 | 0.540 | 768 MiB | 0 | 10.7 | fails, shared memory |
 
-The Triton forward is 2.2 to 7.6 times faster than xla and uses no
-temporary memory. Its error is also smaller: 0.0081 against xla's 0.0112,
-on outputs of size 3.4. The backward does not run. Tokamax's Triton VJP
-uses one fixed tiling for every card (`pallas_triton_vjp.py` contains
-`TODO: Implement heuristics`). At head dimension 256, that tiling requests
-102784 bytes of shared memory from a card with 101376. It fails with `RESOURCE_EXHAUSTED:
-Shared memory size limit exceeded`.
+The Triton forward is 2.2 to 7.6 times faster than xla, uses no temporary
+memory, and has a smaller error (0.0081 against xla's 0.0112, on outputs of
+size 3.4). The backward does not run. tokamax's Triton VJP uses one fixed
+tiling for every card (`pallas_triton_vjp.py` contains a `TODO: Implement
+heuristics`). At head dimension 256 that tiling asks for 102784 bytes of
+shared memory, and the card has 101376, so it fails with
+`RESOURCE_EXHAUSTED: Shared memory size limit exceeded`.
 
-Probing tokamax's private classes found a 32x32 tiling with one stage
-that fits and is correct (gradient error 0.031, the same as xla). It
-takes 1.80 ms forward and backward against xla's 2.66 at S=2048. Two
-16-row tilings compile and run at the same speed, but return wrong
-gradients (error 6.6 on gradients of size 6.3). Tokamax's autotuner chooses
-by timing random inputs without comparing numerics. It cannot be trusted
-to choose a correct tiling. At head dimension 128, Triton ties cudnn
-(0.235 against 0.236 ms forward, 0.75 against 0.78 forward and backward
-at S=2048), giving no gain where cudnn already runs.
+I probed other tilings through tokamax's private classes. A 32x32 tiling
+with one stage fits and is correct (gradient error 0.031, the same as xla),
+and it runs forward and backward in 1.80 ms against xla's 2.66 at S=2048.
+Two 16-row tilings compile and run at the same speed, but they return wrong
+gradients (error 6.6 on gradients of size 6.3). tokamax's autotuner picks a
+tiling by its time on random inputs and never compares numerics, so
+autotuning cannot be trusted to find the correct one. At head dimension 128
+the Triton kernel ties cudnn (0.235 against 0.236 ms forward, 0.75 against
+0.78 forward and backward at S=2048), so it gains nothing where cudnn
+already runs.
 
-The Triton forward supports Gemma 2's logit softcap (0.35 against xla's
-1.01 ms at S=2048, head dimension 256), but the VJP raises
-`NotImplementedError: logits_soft_cap unsupported`. Tokamax also applies
-the cap after adding bias, while Gemma applies it before. On CPU, the
-outputs differ by 1.4e-2 with bias and are identical without it. No
-tokamax implementation supports attention sinks.
+Two other features are still missing. The first is Gemma 2's logit softcap.
+The Triton forward takes it (0.35 against xla's 1.01 ms at S=2048, head
+dimension 256), but the VJP raises `NotImplementedError: logits_soft_cap
+unsupported`. tokamax also applies the cap after adding the bias, while
+Gemma applies it before (1.4e-2 apart on CPU with a bias, identical without
+one). The second is attention sinks, which no tokamax implementation takes.
 
-Dew does not route calls to this kernel. Training needs a backward pass,
-and the only working tiling is available through private tokamax classes.
-Routing needs an upstream release that selects a fitting VJP tiling, or
-a public tiling setting, together with a correctness check. Installing
-tokamax 0.0.13 beside Dew also pins `typeguard==2.13.3`, while tyro 1.0.16
-requires `typeguard>=4.0.0`. This breaks every recipe's command line, so
-these measurements called the tool's `main` function in a separate
+Dew does not route any call to this kernel. A forward-only kernel cannot
+serve training, and the only backward tiling that works is reachable only
+through private tokamax classes. A route needs an upstream tokamax release
+whose VJP picks a tiling that fits the card, or a public tiling setting,
+with a correctness check next to it. Installing tokamax 0.0.13 next to Dew
+also pins `typeguard==2.13.3`, while tyro 1.0.16 requires
+`typeguard>=4.0.0`. That breaks the command line of every recipe, so for
+these measurements I ran the tool through its `main` function in a separate
 environment.
 
 ## Odd sequence lengths on cudnn
