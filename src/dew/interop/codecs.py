@@ -981,9 +981,9 @@ class _WeightScheme:
 
 def _weight_scheme(quantization: Mapping[str, object]) -> _WeightScheme:
     """The one weights scheme a compressed-tensors config declares, refusing
-    what this loader cannot read. A dynamic activation quantizer holds no
-    state, so the weights alone are the checkpoint; this loader computes the
-    activations in the model's dtype, as it does for DeepSeek's FP8 blocks."""
+    what this loader cannot compute. compressed-tensors keeps input QDQ in
+    its forward after decompressing weights, including dynamic quantizers
+    with no stored scale. A weight-only load cannot reproduce that forward."""
     form = quantization.get('format')
     if form not in COMPRESSED_TENSORS_FORMATS:
         raise ValueError(f"compressed-tensors format {form!r}: this loader reads "
@@ -999,11 +999,11 @@ def _weight_scheme(quantization: Mapping[str, object]) -> _WeightScheme:
         dynamic = (
             None if activations is None else records.record(activations, "input_activations").get("dynamic")
         )
-        if activations is not None and dynamic is not True:
+        if activations is not None:
             raise ValueError(
-                f"config_groups.{name}.input_activations have dynamic={dynamic!r}, with scales stored "
-                "beside the weights that this loader would drop; load a weight-only checkpoint or one "
-                "whose activations are quantized dynamically"
+                f"config_groups.{name}.input_activations have dynamic={dynamic!r}; compressed-tensors "
+                "quantizes inputs in its forward, which this weight-only loader does not compute; "
+                "load a checkpoint with input_activations=null"
             )
         weights = records.record(group.get('weights'), f'config_groups.{name}.weights')
         strategy, kind = weights.get('strategy'), weights.get('type')
@@ -1324,6 +1324,12 @@ def source_quantization(config: Mapping[str, object], *, scale_dtype: str | None
     if method == "gptq":
         return gptq(_integer_bits(quantization, method),
                     v1=quantization.get("checkpoint_format", "gptq") == "gptq", grid=grid)
+    if method == "modelopt":
+        raise ValueError(
+            "quantization_config names quant_method 'modelopt' with quant_algo "
+            f"{quantization.get('quant_algo')!r}; ModelOpt NVFP4/FP8 quantizes input activations, "
+            "which this weight-only loader does not compute; transformers 5.16.1 has no ModelOpt "
+            "checkpoint reader, so its unquantized load is not a parity reference")
     raise ValueError(
         f"quantization_config names quant_method {method!r}; this loader reads DeepSeek's "
         f"fp8 blocks and V4 `.scale` storage, GPT OSS's mxfp4, compressed-tensors' "
