@@ -227,6 +227,33 @@ def test_pipeline_walk_matches_the_source(load, walk, request):
         assert relative_gap(frames[row], arrays[f"frames.{row}"]) < FORWARD, row
 
 
+def test_a_text_free_walk_from_the_sources_own_encodings_matches_the_source(walk):
+    """A pipeline loaded without its text encoder (`load_diffusion_source(
+    text=False)`) samples from encoded conditions alone: handed the UMT5
+    states the source's own `encode_prompt` wrote for each prompt and for
+    its empty negative, it walks from the recorded latents to the source's
+    latent and decodes its frames, as the prompted walk above does. The
+    encodings are Diffusers' and transformers', not Dew's tower's."""
+    from dew.interop.pretrained import load_diffusion_source
+
+    _, record, arrays = walk
+    source = load_diffusion_source(str(walk[0] / "pipeline"), dtype="float32", attention_impl="xla",
+                                   text=False)
+    assert "conditioning" not in source.variables.get("encoders", {})
+    task = source.text_to_image()
+    rows = len(record["prompts"])
+    given = DenoisingCondition(jnp.asarray(np.stack([arrays[f"context.{row}"] for row in range(rows)])))
+    negative = DenoisingCondition(jnp.asarray(arrays[f"context.{rows}"][None]))
+    prepared = task.prepare(conditions={"conditioning": given}, unconditional={"conditioning": negative},
+                            initial=channels_last(arrays["x_T"]), key=0, steps=record["steps"])
+    walked = task(prepared, key=jax.random.PRNGKey(0)).host()
+    frames = np.clip(np.asarray(walked.images) / 2 + 0.5, 0.0, 1.0)
+    for row in range(rows):
+        expected = channels_last(arrays[f"latents.{row}"][None])[0]
+        assert relative_gap(np.asarray(walked.latents)[row], expected) < FORWARD, row
+        assert relative_gap(frames[row], arrays[f"frames.{row}"]) < FORWARD, row
+
+
 class Replay(nn.Module):
     """A model that answers each grid point's model time with the output the
     source's scheduler was stepped on there, whatever the sample."""
