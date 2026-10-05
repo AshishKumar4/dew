@@ -80,7 +80,7 @@ export class SharedHost extends DurableObject<Env> {
 		}
 	}
 
-	async connect(session: string, request: Request): Promise<Response> {
+	async relay(session: string, request: Request): Promise<Response> {
 		await this.allocate(session);
 		return this.request(session, 'ws', request);
 	}

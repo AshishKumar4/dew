@@ -1,4 +1,5 @@
 import { DurableObject } from 'cloudflare:workers';
+import { prepareSnapshot } from '../src/preparer';
 
 interface Env {
 	LAB: DurableObjectNamespace<GatewayLab>;
@@ -74,33 +75,11 @@ export class GatewayLab extends DurableObject<Env> {
 	}
 
 	private async prepareManaged(commit: string): Promise<unknown> {
-		const container = this.ctx.container!;
-		const started = Date.now();
-		container.start({ image: 'cloudflare/debian-trixie', instance: 'standard-4',
-			enableInternet: true, entrypoint: ['sleep', 'infinity'] });
-		await container.setInactivityTimeout(15 * 60_000);
-		const source = await fetch(`https://raw.githubusercontent.com/AshishKumar4/dew/${this.env.SOURCE_COMMIT}/site/live/container/setup-managed.sh`);
-		if (!source.ok || !source.body) throw new Error('cannot read pinned preparation script');
-		const copy = await container.exec(['sh', '-c', 'cat > /root/setup-managed.sh'], { stdin: source.body });
-		if (await copy.exitCode !== 0) throw new Error('cannot install preparation script');
-		const process = await container.exec(['timeout', '780', 'sh', '/root/setup-managed.sh', commit, this.env.SOURCE_COMMIT]);
-		const prepared = await process.output();
-		if (prepared.exitCode !== 0) return { stage: 'prepare', ...this.decode(prepared), seconds: (Date.now() - started) / 1000 };
-		const prepareSeconds = (Date.now() - started) / 1000;
-		const snapshotStart = Date.now();
-		const snapshot = await container.snapshotContainer({ name: 'dew-warm-pinned' });
-		const snapshotSeconds = (Date.now() - snapshotStart) / 1000;
-		await container.destroy();
-		container.start({ containerSnapshot: snapshot, instance: 'standard-4',
-			enableInternet: false, entrypoint: ['sleep', 'infinity'] });
-		await container.setInactivityTimeout(15 * 60_000);
-		const smokeStarted = Date.now();
-		const smoke = await container.exec(['runuser', '-u', 'model', '--', 'env', 'HF_HOME=/opt/hf',
-			'HF_HUB_OFFLINE=1', 'JAX_PLATFORMS=cpu', 'JAX_COMPILATION_CACHE_DIR=/opt/xla',
-			'XLA_FLAGS=--xla_cpu_max_isa=AVX2', '/opt/venv/bin/python', '/opt/live/warm-managed.py']);
-		const result = await smoke.output();
-		return { stage: 'offline smoke', commit, created: Date.now(), snapshot, prepareSeconds, snapshotSeconds,
-			smokeSeconds: (Date.now() - smokeStarted) / 1000, ...this.decode(result) };
+		const generation = await prepareSnapshot(this.ctx.container!, commit, this.env.SOURCE_COMMIT);
+		const result = await (await this.ctx.container!.exec([
+			'/opt/venv/bin/python', '/opt/live/benchmark_gateway.py', this.env.REQUESTS ?? '1',
+		])).output();
+		return { stage: 'native shared inference', ...generation, ...this.decode(result) };
 	}
 
 	private decode(result: ExecOutput) {
