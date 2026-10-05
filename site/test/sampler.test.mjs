@@ -181,3 +181,29 @@ test('editable Python highlighting follows edits, scrolling and theme', async ()
 	assert.deepEqual(errors, []);
 	await page.close();
 });
+
+
+test('a stale model revision asks for a reload instead of showing a traceback', async () => {
+	const page = await browser.newPage();
+	await page.route('https://challenges.cloudflare.com/**', (route) => route.fulfill({
+		contentType: 'text/javascript',
+		body: 'window.turnstile = { render: (el, o) => { o.callback("token"); return "w"; }, remove() {} };',
+	}));
+	await page.route(`${live.endpoint}/v1/sessions`, (route) => route.fulfill({ json: { socket: SOCKET } }));
+	await page.routeWebSocket(SOCKET, (socket) => {
+		socket.send(JSON.stringify({ type: 'ready', uptime: 1, setup: 1 }));
+		socket.onMessage((raw) => {
+			const message = JSON.parse(String(raw));
+			if (message.op !== 'execute') return;
+			socket.send(JSON.stringify({ id: message.id, type: 'error', ename: 'ValueError',
+				evalue: 'This page was updated. Reload it to use the current model.', traceback: ['private traceback'] }));
+			socket.send(JSON.stringify({ id: message.id, type: 'done', status: 'error', count: 1 }));
+		});
+	});
+	await page.goto(`http://127.0.0.1:${server.address().port}/sample/`);
+	await page.locator('[data-run]').click();
+	await page.waitForFunction(() => document.querySelector('.sampler-stage').dataset.stage === 'error');
+	assert.equal(await page.locator('[data-status]').textContent(), 'This page was updated. Reload it to use the current model.');
+	assert.equal(await page.locator('[data-output]').textContent(), '');
+	await page.close();
+});
