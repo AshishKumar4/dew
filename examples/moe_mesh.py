@@ -13,7 +13,8 @@ The training text mixes three kinds of line: short English sentences, sums and a
 Before every training step the script runs the step's batch through the step's parameters
 once more and reads the experts each token's router picked. For each MoE layer it counts
 the slots each device sends to every other device, and predicts, by the exchange's own
-rule, the most exchange rounds any expert group needs for them. The drawing reads the placement from the objects the run used: the device grid from the mesh,
+rule, the most exchange rounds any expert group needs for them. The drawing reads the
+placement from the objects the run used: the device grid from the mesh,
 each device's experts and kernel slice from the expert kernel's sharding, each device's
 rows from the sharding the layout gives the layer's input, and the all-to-all operations
 the compiled training step's program holds.
