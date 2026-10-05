@@ -1829,6 +1829,38 @@ the same at 32 and 128 slots:
 Closed loop is unchanged at 32 slots (4503-4506 against 4408-4533 tokens
 a second). At 128 it rose from 5801-5818 to 5966.
 
+Idle slots cost a serving step its time. A step decodes every slot, so a
+128-slot server with 16 rows drawing stepped in 8.8-9.1 ms against 5.5-7.0
+for a 32-slot server with the same 16 (RTX 4080, capacity 384; the wall
+time of a decode-only step, both measured the same way). Traced, the
+128-slot decode program spent 1.15 ms of its 7.4 ms in the full-attention
+layers' attention, because the folded form above reads every row's keys
+across the whole capacity. A decode-shaped xla call with key lengths now
+runs through a Pallas kernel on CUDA (`dew.nn.kernels.decode_attention`).
+Each program takes one row and one key head and reads only the key blocks
+below that row's length, with an online softmax, so an idle row reads one
+block. Six of the 256-wide layers took 0.28 ms against the folded form's
+1.12 and jax.nn's 2.40 at 128 rows with 16 drawing, and 0.20 against 0.33
+and 0.41 at 32. The decode program's device time per forward fell from 7.42
+to 6.35 ms at 128 slots and from 4.11 to 3.87 at 32. Serving, two rounds
+alternating on a loaded host, the 128-slot median token gap went from
+8.49-8.80 to 7.13-7.62 ms at 16 requests a second, from 10.7-11.0 to
+8.85-9.54 at 24 and from 14.8-15.1 to 12.9-14.1 at 32. Closed loop went
+from 5593-5726 to 5713-5936 tokens a second. The 32-slot cells moved within
+the run-to-run spread of the base itself (gap p50 4.22-4.62 against
+3.93-5.44 at 8 requests a second). The kernel's RMS distance from float64
+is within tests/reference_error.py's rule of jax.nn's. 4 of 64 greedy rows
+parted at 32 slots and 25 of 256 at 128, at a median of 0.11 and 0.59 bf16
+spacings apart in fp32 (at most 1.75 and 2.04). At 128 slots fp32's argmax
+was the base's choice in 12 rows and the kernel's in 13.
+
+What else scales with the slots, traced at 128 slots with 16 drawing: each
+gated delta layer's conv state, 0.61 ms in a select over every row and
+0.55 ms of layout copies, which a one-token form of the masked conv
+(`_masked_conv1d`) did not change, because the cost is writing every row's
+state; and the vocabulary head and the MLP's GEMMs at 128 rows, which
+read their weights the same as at 32.
+
 The same session against vLLM 0.30.0 at integration `be10d331` (the decode
 kernel, the folded attention and idle rows skipped), on a quiet host, Dew
 and vLLM alternating, two rounds:

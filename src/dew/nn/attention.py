@@ -25,6 +25,7 @@ from jax.sharding import PartitionSpec as P
 from dew.telemetry.devices import deterministic_ops_requested
 
 from .attention_sinks import attention_with_sinks
+from .kernels import decode_attention
 from .kernels.generation import bf16_dot_runs
 from .kv_cache import Append, KVCache, KVStore, filled_slots
 from .precision import (
@@ -1080,6 +1081,9 @@ def fused_attention(query, key, value, bias, mask, causal, sliding_window, imple
                 "attention implementation 'triton' takes no sinks, softcap, bias, mask, "
                 "window or key lengths; use attention_impl 'cudnn' or 'xla' for this call.")
         out = triton_attention(query, key, value, causal)
+    elif (implementation == 'xla' and folds(query, key, bias, mask, causal, sliding_window)
+          and key_value_seq_lengths is not None and decode_attention.fits(query, key)):
+        out = decode_attention.attend(query, key, value, key_value_seq_lengths)
     elif implementation == 'xla' and folds(query, key, bias, mask, causal, sliding_window):
         out = folded_attention(query, key, value, key_value_seq_lengths)
     elif implementation == 'xla':
