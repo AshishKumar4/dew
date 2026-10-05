@@ -54,10 +54,10 @@ _DEFAULT_SOLVER = Unmask()
 
 @objectives("masked_diffusion")
 class MaskedDiffusionObjective(Objective[Ratio]):
-    """Train a masked diffusion model on the MDLM negative ELBO.
+    """Trains a masked diffusion model on the MDLM negative ELBO.
 
-    The rows are `[B, seq_len]` token ids under `batch["text"]`; packed
-    windows carry `text_segment_ids` and `text_positions` beside them.
+    A batch holds `[B, seq_len]` token ids under `batch["text"]`, and packed
+    windows also carry `text_segment_ids` and `text_positions`.
     """
 
     artifact = TextSamples
@@ -82,18 +82,21 @@ class MaskedDiffusionObjective(Objective[Ratio]):
     ):
         """Build an MDLM objective over `model` for `seq_len`-token rows.
 
-        `solver`, `steps` and `samples` are how evaluation unmasks.
-        `decode` turns a row of ids into the text the artifact shows, and
-        None shows the ids alone.
+        `model` must be a `CausalTransformer` with `causal=False`. `solver`
+        and `steps` set how generation unmasks, in the preview and in the
+        task `pipeline` returns, and `samples` is how many rows the preview
+        draws. `decode` turns a row of ids into the text the artifact shows;
+        with None, the artifact shows the ids alone.
 
-        `variables` is the tree training starts from, a released
-        masked-diffusion checkpoint's as `Pretrained.load` returns it (so a
-        run continues from LLaDA's or Dream's weights) or an adapter's split
-        of one, kept as given; None draws the init. `model` may be the loaded
-        source itself, which supplies its model, variables and processor.
+        `variables` is the tree training starts from: a released
+        masked-diffusion checkpoint as `Pretrained.load` returns it, so a run
+        continues from LLaDA's or Dream's weights, or an adapter's split of
+        one, kept as given. None starts from a fresh init. `model` may be the
+        loaded source itself, which supplies its model, variables and
+        processor.
 
-        `processor` is what `pipeline` turns text into ids with and decodes
-        through, unless it is handed another; a run records its tokenizer."""
+        `processor` is what `pipeline` uses to turn text into ids and decode
+        them, unless it is given another one. A run records its tokenizer."""
         if isinstance(model, Source):
             from dew.nn.backbones.causal_transformer import CausalTransformer
 
@@ -138,7 +141,10 @@ class MaskedDiffusionObjective(Objective[Ratio]):
 
     def pipeline(self, state: TrainState, *, ema: bool | None = None,
                  processor: Processor | None = None) -> MaskedGeneration:
-        """Publish the state's weights as a native full-response MDLM task."""
+        """Return the trained model as a full-response MDLM task over the state's weights.
+
+        The task is a `MaskedGeneration` with this objective's solver and steps.
+        """
         from dew.inference.tasks import MaskedGeneration
 
         return MaskedGeneration(self.model, self._pipeline_weights(state, ema), self.process,
@@ -170,14 +176,15 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         })
 
     def evaluate(self, params, batch, step: Step) -> TokenScores:
-        """Score the negative ELBO of every token in the batch.
+        """Return the negative ELBO of every token in the batch.
 
-        One noise level and one masking are drawn from the pass's key, as
-        training draws them, with dropout off and the averaged weights when
-        the run keeps them. Every real token counts and carries its weighted
-        masked cross entropy, zero where it was left visible, and a packed
-        window's padding weighs nothing, so `perplexity` over a validation
-        pass is exp of the ELBO bound per token, the number MDLM reports."""
+        One noise level and one masking are drawn from the pass's key, as in
+        training. Dropout is off, and the averaged weights are used when the
+        run keeps them. Every real token counts: a masked token carries its
+        weighted cross entropy, a visible one carries zero, and a packed
+        window's padding has no weight. So `perplexity` over a validation
+        pass is the exponential of the ELBO bound per token, the number MDLM
+        reports."""
         params = params if step.ema is None else step.ema
         losses, weights, correct = self._scored(params, batch, step.key)
         return TokenScores(losses=losses, weights=weights, correct=correct)
@@ -251,7 +258,11 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         return sample(denoise, x_T, self.steps, solver=self.solver, key=key)
 
     def preview(self, params, batch, step: Step, *, scored=None):
-        """Generate the configured display count, then decode on process zero."""
+        """Generate `samples` rows on every process, then decode them on process zero.
+
+        The other processes return None. Without `decode`, the artifact holds
+        the ids alone.
+        """
         def setup():
             return params if step.ema is None else step.ema, self.samples
 
