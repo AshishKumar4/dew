@@ -145,7 +145,11 @@ def rounding(destination: Path, copies: int) -> None:
     rounding draw. More independent states average their per-input variance
     without changing the reference rule. The float64 namespace widens the
     source's explicit float32 timestep casts as well as the input; otherwise
-    its sigma calculations retain float32 roundings in the oracle.
+    its sigma calculations retain float32 roundings in the oracle. Every
+    `jnp.float32` the widening replaces is a dtype argument or cast:
+    schedulers/common.py:18 (a dtype default), karras.py:49 (astype) and :71
+    (a random draw's dtype, unused by the walk), samplers/common.py:144 and
+    :206 (the step array's dtype), at the pinned commit.
     """
     generator = np.random.default_rng(4)
     initial = (generator.standard_normal((32 * copies, 64)) * SIGMA_MAX).astype(np.float32)
