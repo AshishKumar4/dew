@@ -53,11 +53,11 @@ from dew.objectives.diffusion.alignment import ALIGNMENT, REPRESENTATION, Alignm
 from dew.objectives.diffusion.end_to_end import AUTOENCODER, LATENT_STATS, EndToEnd
 from dew.registry import objectives
 from dew.sampling.guidance import CFG, Guidance
+from dew.sampling.pipelines import TextToImage
 from dew.sampling.sample import sample
 from dew.sampling.solvers import DDIM, Solver
 
 if TYPE_CHECKING:
-    from dew.sampling.pipelines import TextToImage
     from dew.training.state import TrainState
 
 # Samples a validation batch draws, conditioned or not.
@@ -183,6 +183,8 @@ _DEFAULT_GUIDANCE = CFG(3.0)
 @objectives("diffusion")
 class DiffusionObjective(Objective[Ratio]):
     """Denoising diffusion: sample a noise level, corrupt, predict, weight."""
+
+    saved_task = TextToImage
 
     @property
     def inputs(self) -> InputSpec:

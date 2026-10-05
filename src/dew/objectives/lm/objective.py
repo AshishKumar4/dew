@@ -578,6 +578,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     """
 
     artifact = TokenScores
+    saved_task = TextGeneration
     shown: Mapping[str, Shown] = {"ce": Shown(better="lower"), "perplexity": Shown(better="lower"),
              "token_accuracy": Shown(better="higher", percent=True)}
 

@@ -12,6 +12,19 @@ imports none of them. A lookup of a name its table does not hold yet imports
 the modules of Dew whose decorator registers that name, read off the
 sources (`_registering_modules`), so a record loads in a process that
 imported nothing beforehand, and nothing else is imported.
+
+A package outside Dew registers its members the same way and names a module
+whose import registers them under the `dew.plugins` entry-point group:
+
+    [project.entry-points."dew.plugins"]
+    sparx = "sparx"
+
+Only a name Dew's own sources do not register loads the plugins: every
+entry is imported once (`entry.load()`), and the lookup tries again. An
+entry that fails to import is named in the error of a lookup that then
+still misses, and in no other lookup. A plugin's own kind of member is a
+`Registry` it creates and `share`s, in the module that defines the kind's
+base class, so a record whose field declares that class rebuilds it.
 """
 
 from __future__ import annotations
@@ -19,6 +32,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import importlib
+import importlib.metadata
 import operator
 import re
 import sys
@@ -100,8 +114,37 @@ def _registering_modules() -> Mapping[tuple[str, str], tuple[str, ...]]:
     return {key: tuple(modules) for key, modules in found.items()}
 
 
+PLUGINS = "dew.plugins"
+"""The entry-point group a package outside Dew names its registering module under."""
+
+
+@functools.cache
+def _loaded_plugins() -> tuple[tuple[str, BaseException], ...]:
+    """Import every `dew.plugins` entry, once a process, and return those
+    that failed, each with its exception. Importing an entry is what
+    registers its members; nothing of a plugin is read without importing it."""
+    failed = []
+    for entry in sorted(importlib.metadata.entry_points(group=PLUGINS), key=lambda entry: entry.name):
+        try:
+            entry.load()
+        except Exception as error:
+            # Reported by the lookup that needed the entry, and no other.
+            failed.append((f"{entry.name} = {entry.value}", error))
+    return tuple(failed)
+
+
+_SHARED: list[Registry] = []
+"""Every table a record may name a member of, in the order shared; written
+only by `Registry.share`. The tables hold different kinds, so this names
+none: a reader asks each table for a member and tests what it got."""
+
+
 class Registry[T: Callable[..., Any], Built](Mapping[str, T]):
-    """Names one kind of thing: a decorator and a mapping from name to member."""
+    """Names one kind of thing: a decorator and a mapping from name to member.
+
+    A table records read is shared (`share`): Dew's eleven are, and a
+    plugin shares a kind of its own the same way.
+    """
 
     def __init__(self, kind: str, *, record: Literal["name", "kind"] = "name"):
         self.kind = kind
@@ -132,12 +175,20 @@ class Registry[T: Callable[..., Any], Built](Mapping[str, T]):
         if name not in self._members:
             for module in self._registering(name):
                 importlib.import_module(module)
+        failed: tuple[tuple[str, BaseException], ...] = ()
+        if name not in self._members:
+            failed = _loaded_plugins()
         try:
             return self._members[name]
         except KeyError:
             known = set(self._members) | {held for attribute, held in _registering_modules()
                                           if getattr(sys.modules[__name__], attribute, None) is self}
-            raise KeyError(f"no {self.kind} named {name!r}; known: {', '.join(sorted(known))}") from None
+            message = f"no {self.kind} named {name!r}; known: {', '.join(sorted(known))}"
+            if not failed:
+                raise KeyError(message) from None
+            broken = "; ".join(f"{entry} ({type(error).__name__}: {error})" for entry, error in failed)
+            raise KeyError(f"{message}. These {PLUGINS} entries failed to import, so a name they register "
+                           f"is not known: {broken}") from failed[0][1]
 
     def _registering(self, name: str) -> tuple[str, ...]:
         """The modules of Dew whose decorator registers `name` in this table."""
@@ -153,6 +204,28 @@ class Registry[T: Callable[..., Any], Built](Mapping[str, T]):
 
     def __repr__(self) -> str:
         return f"Registry({self.kind!r}, {sorted(self._members)})"
+
+    def share(self) -> Registry[T, Built]:
+        """Make this table one a record names members of, and return it, as
+        `activations = Registry("activation", record="kind").share()`.
+
+        A record then rebuilds a member of it wherever a field declares the
+        member's base class, and writes it back by name. Share a plugin's
+        kind in the module that defines that base class, so any field typed
+        with it finds the table. A kind has one shared table; sharing the
+        same table again does nothing.
+        """
+        for held in _SHARED:
+            if held.kind == self.kind and held is not self:
+                raise ValueError(f"a {self.kind} registry is already shared; a kind has one table")
+        if not any(held is self for held in _SHARED):
+            _SHARED.append(self)
+        return self
+
+    @staticmethod
+    def shared() -> tuple[Registry, ...]:
+        """Every shared table: Dew's eleven, then any a plugin shared."""
+        return tuple(_SHARED)
 
     def name_of(self, member: Named) -> str:
         """Return the name a member was registered under. The table is scanned by
@@ -366,7 +439,7 @@ def _nested_member(held: type, value: Mapping[str, object]) -> tuple[type, Mappi
     "fields": {...}}` or `{"kind": ..., **fields}` (`dew.config._to_json`), so
     that record builds the member it names when that member is the field's
     class or a subclass; any other record is the field class's own fields."""
-    for table in REGISTRIES:
+    for table in Registry.shared():
         if table.record == "name":
             named, fields = value.get("name"), value.get("fields")
             if set(value) != {"name", "fields"} or not isinstance(fields, Mapping):
@@ -581,25 +654,22 @@ def _with_part_dtype(value: Configured, dtype: str) -> Configured:
     return value
 
 
-models: Registry[type[nn.Module], nn.Module] = Registry("model")
-presets: Registry[type[Preset], Preset] = Registry("preset")
-solvers: Registry[type[Solver[Any]], Solver[Any]] = Registry("solver")
-datasets: Registry[type[DatasetSpec], DatasetSpec] = Registry("dataset")
-encoders: Registry[type[ConditionEncoder[Any]], ConditionEncoder[Any]] = Registry("encoder")
-metrics: Registry[Callable[..., Metric], Metric] = Registry("metric")
-objectives: Registry[type[Objective], Objective] = Registry("objective")
-mixers: Registry[type[MixerBase], MixerBase] = Registry("mixer", record="kind")
-towers: Registry[type[TowerBase], TowerBase] = Registry("tower", record="kind")
-projectors: Registry[type[ProjectorBase], ProjectorBase] = Registry("projector", record="kind")
-schedules: Registry[type[ScheduleBase], ScheduleBase] = Registry("schedule", record="kind")
-
 # Core records nest their fields under a name; model component records inline
 # their fields beside the kind discriminator `Registry.from_record` reads.
-REGISTRIES = (models, presets, solvers, datasets, encoders, metrics, objectives,
-              mixers, towers, projectors, schedules)
+models: Registry[type[nn.Module], nn.Module] = Registry("model").share()
+presets: Registry[type[Preset], Preset] = Registry("preset").share()
+solvers: Registry[type[Solver[Any]], Solver[Any]] = Registry("solver").share()
+datasets: Registry[type[DatasetSpec], DatasetSpec] = Registry("dataset").share()
+encoders: Registry[type[ConditionEncoder[Any]], ConditionEncoder[Any]] = Registry("encoder").share()
+metrics: Registry[Callable[..., Metric], Metric] = Registry("metric").share()
+objectives: Registry[type[Objective], Objective] = Registry("objective").share()
+mixers: Registry[type[MixerBase], MixerBase] = Registry("mixer", record="kind").share()
+towers: Registry[type[TowerBase], TowerBase] = Registry("tower", record="kind").share()
+projectors: Registry[type[ProjectorBase], ProjectorBase] = Registry("projector", record="kind").share()
+schedules: Registry[type[ScheduleBase], ScheduleBase] = Registry("schedule", record="kind").share()
 
 __all__ = [
-    "REGISTRIES",
+    "PLUGINS",
     "Registry",
     "datasets",
     "encoders",
