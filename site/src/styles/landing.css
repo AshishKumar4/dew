@@ -42,11 +42,13 @@ html[data-has-hero][data-past-hero] header.header {
 	display: grid;
 	grid-template-columns: minmax(0, 1fr);
 	align-items: end;
-	min-height: 85vh;
-	min-height: 85svh;
+	min-height: 100vh;
+	min-height: 100svh;
 	margin-top: calc(-1 * var(--sl-nav-height));
 	margin-inline: calc(50% - 50vw);
-	padding: calc(var(--sl-nav-height) + 2rem) clamp(1.25rem, 5vw, 4.5rem) clamp(1.25rem, 4vh, 2.5rem);
+	padding: calc(var(--sl-nav-height) + 2rem) clamp(1.25rem, 5vw, 4.5rem)
+		calc(clamp(1.25rem, 4vh, 2.5rem) + 15vh);
+	padding-bottom: calc(clamp(1.25rem, 4vh, 2.5rem) + 15svh);
 }
 
 .hero-stage {
