@@ -55,7 +55,10 @@ export class GatewayLab extends DurableObject<Env> {
 
 export default {
 	async fetch(request: Request, env: Env): Promise<Response> {
-		if (!env.ADMIN_TOKEN || request.headers.get('Authorization') !== `Bearer ${env.ADMIN_TOKEN}`) {
+		const encoder = new TextEncoder();
+		const expected = encoder.encode(`Bearer ${env.ADMIN_TOKEN}`);
+		const supplied = encoder.encode(request.headers.get('Authorization') ?? '');
+		if (!env.ADMIN_TOKEN || expected.length !== supplied.length || !crypto.subtle.timingSafeEqual(expected, supplied)) {
 			return new Response('Forbidden', { status: 403 });
 		}
 		if (request.method !== 'POST' || new URL(request.url).pathname !== '/measure') return new Response('Not found', { status: 404 });
