@@ -1,4 +1,4 @@
-"""Inference tasks: native generation bound to weights, and external engines."""
+"""Inference tasks: native generation with a model and its weights, and clients for external engines."""
 
 from dew.sampling.pipelines import DenoisingInputs, Images, TextToImage
 
