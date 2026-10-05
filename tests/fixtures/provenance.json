@@ -2571,6 +2571,17 @@
    ],
    "note": "Checkpoint revisions separately pinned in tools/diffusers_rae_reference.py:130 (RAEs) and :135 (plain DINOv2)."
   },
+  "ramp/maxtext.json": {
+   "tool": "tools/ramp_reference.py",
+   "sources": [
+    {
+     "repo": "AI-Hypercomputer/maxtext",
+     "version": "538fe7a3f3376d94cf3f04e77741aa6d7e8efa45",
+     "runs": "fetched"
+    }
+   ],
+   "note": "Executes utils/rampup_batch.py's RampupBatchManager as published, driven as RampUpDataLoader drives it (read global_batch_size_current, then update()), from step 0 and resumed by its own replay, over five configs."
+  },
   "rcm": {
    "tool": "tools/rcm_reference.py",
    "sources": [
