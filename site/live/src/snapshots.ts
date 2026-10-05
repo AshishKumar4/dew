@@ -35,7 +35,11 @@ export class SnapshotRegistry extends DurableObject<SnapshotEnv> {
 	}
 
 	override async alarm(): Promise<void> {
-		await this.refresh(this.env.SNAPSHOT_COMMIT);
+		try {
+			await this.refresh(this.env.SNAPSHOT_COMMIT);
+		} finally {
+			await this.ctx.storage.setAlarm(Date.now() + 7 * 24 * 60 * 60_000);
+		}
 	}
 
 	async refresh(commit: string, now = Date.now()): Promise<{ rebuilding: boolean; generation: SnapshotGeneration | null }> {
