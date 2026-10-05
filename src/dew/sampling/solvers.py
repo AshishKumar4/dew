@@ -1,18 +1,16 @@
-"""One reverse step each, from t to t_next, given the model's denoising at t.
+"""Diffusion solvers, each taking one reverse step from t to t_next with the model's prediction at t.
 
-A solver is a value. What it needs between steps travels in its state, which
-`init` builds and `step` threads through `sample`'s scan. The rates come from
-`process`; a solver that needs another model evaluation (Heun's corrector,
-RK4's stages, KDPM2's midpoint) calls `denoise`. A solver that integrates
-dx / dsigma = eps refuses a schedule whose alpha is not one.
+A solver is a value. Whatever it needs between steps is kept in its state,
+which `init` builds and `step` carries through `sample`'s scan. The signal and
+noise rates come from `process`. A solver that needs another model evaluation
+(Heun's corrector, RK4's stages, KDPM2's midpoint) calls `denoise`. A solver
+that integrates dx / dsigma = eps refuses a schedule whose alpha is not one.
 
 The solvers named after Diffusers 0.34.0 schedulers reproduce their
-arithmetic; `tests/test_samplers.py` holds their trajectories and trajectory
-gradients against the fixtures `tools/diffusers_reference.py` records. `init`
-checks each algorithm's endpoint domain on the concrete grid before the
-compiled scan; finite endpoint limits are verified in
-tools/diffusers_limits_reference.py, and undefined ones raise rather than
-substitute an update.
+arithmetic. Before the compiled scan, `init` checks each algorithm's endpoint
+domain on the concrete grid; finite endpoint limits are tested, and endpoints
+where the update is undefined raise an error instead of substituting another
+update.
 """
 
 from __future__ import annotations
@@ -30,6 +28,10 @@ from dew.diffusion.process import Process
 from dew.diffusion.schedules import GeneralizedNoiseScheduler, expand
 from dew.registry import solvers
 
+# tests/test_samplers.py checks the Diffusers-named solvers' trajectories and
+# trajectory gradients against fixtures recorded by tools/diffusers_reference.py;
+# tools/diffusers_limits_reference.py verifies the finite endpoint limits.
+
 # A solver whose state nobody names is a solver over any state: `StateT` is
 # covariant, so `Solver` written bare is the type every concrete solver
 # satisfies, and a call site that carries the state names it.
@@ -37,26 +39,31 @@ StateT = TypeVar("StateT", covariant=True, default=object)
 
 
 class Solver(Protocol[StateT]):
-    """One step of a diffusion solver, and whatever it carries between steps.
+    """The interface for one diffusion solver step and the state it keeps between steps.
 
-    `StateT` is that carried value: nothing for a one-step solver, the
-    previous model outputs for a multi-step one. It is a type parameter, so a
-    solver's own state type is checked at its call sites.
+    `StateT` is that state: nothing for a one-step solver, the previous model
+    outputs for a multistep one. It is a type parameter, so each solver's own
+    state type is checked at its call sites.
     """
 
     def init(self, x, times, process, *, key) -> StateT:
-        """The state for a walk from `x` over the concrete grid `times`,
-        checking its endpoint domains at compile time. `key` is the walk's
-        root key, which only `DPMSolverSDE`'s whole-trajectory Brownian tree
-        reads; steps draw from the folded key they are handed."""
+        """Return the initial state for sampling from `x` over the concrete grid `times`.
+
+        It checks the grid's endpoint domains at compile time. `key` is the
+        root key of the whole sampling run; only `DPMSolverSDE` reads it, for
+        its whole-trajectory Brownian tree. Each step draws from the folded key
+        passed to it.
+        """
         ...
 
     def step(self, x, t, t_next, denoised, eps, state, key, process,
              denoise, /) -> tuple[jax.Array, StateT]:
-        """`x` at `t_next` from `x` at `t` and the model's `(denoised, eps)` at
-        `t`. `sample` passes every argument by position, so a solver over
-        another algebra names the pair for what it reads (the discrete one
-        takes log-probabilities where a Gaussian one takes eps)."""
+        """Return the sample at `t_next` and the new state, from `x` and the model's `(denoised, eps)` at `t`.
+
+        `sample` passes every argument by position, so a solver over another
+        algebra can name the pair for what it reads: the discrete solver takes
+        log-probabilities where a Gaussian one takes eps.
+        """
         ...
 
 
@@ -120,18 +127,20 @@ class DDPM:
     posterior mean is alpha_s x_0 + alpha_t sigma_s^2 / (alpha_s sigma_t) eps
     and its variance is sigma_s^2 (1 - alpha_t^2 sigma_s^2 / (alpha_s^2 sigma_t^2)).
 
-    `variance` is which of Diffusers 0.34.0's fixed `DDPMScheduler` posterior
-    variances the draw takes. `"small"` is that posterior's own, written in
-    rates and so defined on any schedule. `"large"` is the forward step's
-    beta, 1 - alpha_t^2 / alpha_s^2, the wider `Glide` choice: that is a
-    variance-preserving statement, and it is zero wherever alpha is one, so a
-    variance-exploding grid is refused rather than sampled without noise.
+    `variance` selects which of Diffusers 0.34.0's fixed `DDPMScheduler`
+    posterior variances the draw uses. `"small"` is the posterior's own
+    variance, written in rates so it is defined on any schedule. `"large"` is
+    the forward step's beta, 1 - alpha_t^2 / alpha_s^2, the wider choice from
+    `Glide`. That is a variance-preserving quantity and it is zero wherever
+    alpha is one, so a variance-exploding grid is refused rather than sampled
+    without noise.
 
-    Neither draws on the step whose own time is the schedule's zero: x_t is
-    the least noised state the schedule holds there, and the source gates its
-    draw on that time the same way. Elsewhere the wide variance at a terminal
-    alpha of one is exactly sigma_t, which is what the source's own
-    `current_beta_t` reduces to.
+    Neither choice adds noise on the step whose own time is the schedule's
+    zero, where x_t is already the least noisy state the schedule holds; the
+    source skips its draw at that time the same way. Elsewhere, when the
+    target's alpha is one on a variance-preserving schedule, the wide noise
+    has standard deviation sigma_t, the square root of the source's own
+    `current_beta_t`.
     """
 
     variance: Literal["small", "large"] = "small"
@@ -167,13 +176,12 @@ class DDPM:
 @solvers("ddim")
 @dataclass(frozen=True)
 class DDIM:
-    """DDIM (Song et al. 2021); `eta` is the stochasticity, 0 deterministic and
-    1 DDPM-like.
+    """DDIM (Song et al. 2021), where `eta` sets the stochasticity: 0 is deterministic, 1 is DDPM-like.
 
     Diffusers 0.34.0's `DDIMScheduler` limits the clean prediction under
     `clip_sample` or `thresholding` and keeps the model's own output as its
-    epsilon, so the direction term is the unlimited one. That pairing is
-    `SourceLimitedPrediction`'s, in the process's conversion.
+    epsilon, so the direction term uses the unlimited one. That pairing comes
+    from `SourceLimitedPrediction`, in the process's conversion.
     """
 
     eta: float = 0.0
@@ -214,10 +222,12 @@ class Euler:
 @solvers("euler_ancestral")
 @dataclass(frozen=True)
 class EulerAncestral:
-    """Euler with the ancestral noise injection of k-diffusion
-    (`get_ancestral_step`, eta 1). The step goes down to sigma_down, and
-    sigma_up of fresh noise brings the marginal back to sigma_s. Integrates a
-    `GeneralizedNoiseScheduler`."""
+    """Euler with k-diffusion's ancestral noise injection (`get_ancestral_step`, eta 1).
+
+    Each step goes down to sigma_down, then adds fresh noise of standard
+    deviation sigma_up to bring the marginal back to sigma_s. It integrates a
+    `GeneralizedNoiseScheduler`.
+    """
 
     def init(self, x, times, process, *, key):
         return ()
@@ -243,11 +253,11 @@ class Heun:
     noise level to sigma (1 + gamma), gamma = min(s_churn / N, sqrt(2) - 1)
     for an N-interval walk, by adding fresh noise of standard deviation
     s_noise sqrt(sigma_hat^2 - sigma^2), and then takes the Heun step from
-    there. The churn walks sigma, so it needs a variance-exploding schedule,
-    and a raised level past the schedule's top has no model time, so a walk
-    that would churn there is refused. Churned, the step evaluates the model
-    at the raised level itself, and the evaluation `sample` made at the grid
-    point goes unread, which the compiler removes.
+    there. The churn moves sigma directly, so it needs a variance-exploding
+    schedule, and a raised level past the schedule's top has no model time, so
+    a sampling run that would churn there is refused. With churn, the step
+    evaluates the model at the raised level, and the evaluation `sample` made
+    at the grid point is unused, so the compiler removes it.
 
     Diffusers 0.34.0's `HeunDiscreteScheduler` limits the clean prediction of
     both stages under `clip_sample`; that limit belongs to the process's
@@ -304,9 +314,11 @@ class Heun:
 @solvers("rk4")
 @dataclass(frozen=True)
 class RK4:
-    """Classical Runge-Kutta over dx/dsigma = eps, on a variance exploding
-    schedule; the stages at half steps read the model at the time the schedule
-    maps that sigma back to. FlaxDiff's `RK4Sampler`."""
+    """Classical fourth-order Runge-Kutta over dx/dsigma = eps on a variance-exploding schedule.
+
+    The half-step stages evaluate the model at the time the schedule maps
+    their sigma back to. This is FlaxDiff's `RK4Sampler`.
+    """
 
     def init(self, x, times, process, *, key):
         return ()
@@ -334,8 +346,8 @@ class KDPM2:
     0.34.0's `KDPM2DiscreteScheduler`, and with `ancestral` its
     `sample_dpm_2_ancestral` and `KDPM2AncestralDiscreteScheduler`.
 
-    An Euler step to the geometric midpoint of sigma_t and the target level,
-    the model read there, and the step from x taken with that midpoint
+    It takes an Euler step to the geometric midpoint of sigma_t and the target
+    level, evaluates the model there, and steps from x with that midpoint
     derivative. The target is sigma_s, or under `ancestral` the sigma_down of
     k-diffusion's ancestral step with sigma_up of fresh noise added after.
     The midpoint's time comes from the schedule's `t_of_sigma`, so this
@@ -459,8 +471,8 @@ class DPMSolverSDE:
     `sample_dpmpp_sde` midpoint solver over a Brownian tree.
 
     Each interval takes two ancestral first-order steps from its own start:
-    one to the geometric midpoint of sigma_t and sigma_s, which the model is
-    read at, and one to sigma_s with that midpoint's clean prediction. Both
+    one to the geometric midpoint of sigma_t and sigma_s, where the model is
+    evaluated, and one to sigma_s with that midpoint's clean prediction. Both
     steps go down to k-diffusion's sigma_down and add sigma_up of noise, and
     both draw that noise from one Brownian path over the trajectory's sigma
     interval: the first over `[sigma_t, sigma_mid]` and the second over
@@ -694,8 +706,8 @@ class DPMSolverMultistep:
 
         x_t = (sigma_t / sigma_s0) x - alpha_t (e^-h - 1) D0 + c D1 + c_2 D2
 
-    and `_dpm_terms` holds each algorithm's coefficients as Diffusers writes
-    them. The first step has no history and is first order, the second at
+    with each algorithm's coefficients written as Diffusers writes them. The
+    first step has no history and is first order, the second at
     most second. `lower_order_final` is Diffusers' rule verbatim, which acts
     only in a walk under 15 steps: first order on the last step and at most
     second on the one before. `euler_at_final` makes the last step first
@@ -710,6 +722,7 @@ class DPMSolverMultistep:
     algorithm="dpmsolver++", solver_type="midpoint", lower_order_final=False,
     euler_at_final=False.
     """
+    # `_dpm_terms` holds each algorithm's coefficients.
 
     order: int = 2
     algorithm: Algorithm = "dpmsolver++"
@@ -1168,10 +1181,11 @@ class UniPC:
     same Vandermonde system with column scaling.
 
     Every coefficient depends on the grid alone, so `init` solves them in
-    float64 for each interval and order (`_unipc_tables`), and a step reads
+    float64 for each interval and order, and a step reads
     its interval's row by where `t` sits on that grid and its order from
     the state. A step's `t` is a point of the grid `init` was given.
     """
+    # `_unipc_tables` solves the coefficient tables in `init`.
 
     order: int = 2
     solver_type: Literal["bh1", "bh2"] = "bh2"
@@ -1241,7 +1255,7 @@ class PNDM:
     each step's first eps; under `skip_prk_steps`, the PLMS form Stable
     Diffusion runs, the first step is a predictor-corrector pair (an Euler
     step, eps re-read at its end, the step retaken with the mean) and the
-    orders grow from there. The schedule owns the transfer stride: ordinary
+    orders grow from there. The schedule sets the transfer stride: ordinary
     native grids use their adjacent interval, while published integer grids
     retain their fixed training stride. Transfers cannot start at alpha = 0.
     """
