@@ -7,9 +7,16 @@ quantizers off, for DSpark's drafts, and transformers 5.16.1's DeepseekV4
 over the same checkpoint for the trunk's logits. reference_f64.npz is both
 run in float64, the truth tests/reference_error.py's rule measures Dew and
 each reference from. As in tests/test_deepseek_v41.py, each run here takes
-its expert, indexer and draft picks from its own float64 twin (`decided`),
-which the tool checks both references make as their float64 runs do, so
-the rule measures fp32 rounding alone.
+its expert and indexer picks from its own float64 twin (`decided`), which
+the tool checks both references make as their float64 runs do, so the rule
+measures fp32 rounding alone.
+
+Beyond the quantizers, the tie order is the one documented difference from
+the release: both references' indexers break equal scores toward the lower
+entry, as jax.lax.top_k does, where torch.topk leaves the order unspecified
+(`lower_index_ties`). The seed is the first tried, and the indexer's ReLU
+leaves exact-zero ties in eight of the release's selections (source.json),
+so the order decides picks here.
 
 The drafter is V4.1's but for two things: each target layer's context is
 the stream mean of its output (0731 model.py:918-921) where V4.1 averages
@@ -66,6 +73,16 @@ def close(actual, name: str, wide):
     apart = distance(wide, TRUTH[name])
     assert apart <= FACTOR * TWIN * distance(REFERENCE[name], TRUTH[name]), (
         f"{name}: the float64 twin is {apart:.3e} from the truth")
+
+
+def ties(rows, picks) -> int:
+    """How many top-k rows hold equal finite k-th and next scores, the picks
+    the tie order alone decides."""
+    k = picks.shape[-1]
+    if k >= rows.shape[-1]:
+        return 0
+    ordered = -np.sort(-rows, -1)
+    return int(np.sum(np.isfinite(ordered[:, k - 1]) & (ordered[:, k - 1] == ordered[:, k])))
 
 
 def test_the_released_config_reads_three_stages_over_the_last_layers_outputs():
@@ -135,9 +152,11 @@ def test_the_trunk_matches_transformers(source):
     DeepseekV4: sliding, CSA and HCA layers, a hash-routed one, and the
     trunk's mHC head."""
     ids = jnp.asarray(REFERENCE["input_ids"])
-    logits, wide, _ = decided(lambda model, variables: forward(model, variables, ids),
-                              source.model, source.variables)
+    logits, wide, record = decided(lambda model, variables: forward(model, variables, ids),
+                                   source.model, source.variables)
     close(logits, "logits", wide)
+    # The forward meets selections only the shared lower-index order decides.
+    assert sum(ties(rows, picks) for rows, picks in zip(record.rows, record.picks, strict=True)) > 0
 
 
 def test_the_cached_trunk_and_the_drafter_match_their_references(source):

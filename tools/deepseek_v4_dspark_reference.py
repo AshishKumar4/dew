@@ -13,7 +13,7 @@ CPU over dense weights. The trunk's logits come from transformers 5.16.1's
 DeepseekV4ForCausalLM over the same checkpoint. Run it in the project's
 environment:
 
-    PYTHONPATH=src:.:tools python tools/deepseek_v4_dspark_reference.py [--seed N] [--search N | --released]
+    PYTHONPATH=src:.:tools python tools/deepseek_v4_dspark_reference.py [--seed N] [--released]
 
 It writes tests/fixtures/hf/deepseek-v4-dspark-tiny: config.json in the
 release's spelling at toy width, model.safetensors under the release's
@@ -28,22 +28,30 @@ tensor names, source.json, and
                        weights widened, the release under
                        tools/deepseek_v41_reference.py's `widened`
 
-`--search N` reports N seeds from `--seed` by `margin` and stops at the
-first whose picks clear the fp32 noise; SEED is that seed. The tool
-refuses a seed that does not, one where either reference, in fp32, picks another
-expert, indexer entry or draft token than its float64 run does, and where
-the two references' float64 trunks part by more than float64 rounding.
+The tool refuses a seed where either reference, in fp32, picks another
+expert, indexer entry or draft token than its float64 run does, or where
+the two references' float64 trunks part by more than float64 rounding. It
+counts the tied selections the release met, top-k rows whose k-th and next
+scores are equal, which the exact zeros of the indexer's ReLU make
+(model.py:427) and only the tie order decides; source.json records the
+count. SEED is the first seed tried, not one searched for.
+
 `--released` writes tests/fixtures/hf/deepseek-v4-flash-0731 instead: the
 release's config.json and tensor_names.json, its weight index with the
 `.scale` partners dropped and the expert index as K.
 
-Where the reference departs from the release it says so: act_quant and
-fp4_act_quant are the identity, the quantizers off, since neither Dew's V4
-mixer nor transformers' DeepseekV4 rounds the cache; rotate_activation, the
-indexer's Hadamard rotation of its queries and keys alike, is the identity,
-which leaves the scores it ranks unchanged in exact arithmetic (it spreads
-values before the FP4 rounding that is off, model.py:253-257, :374-376,
-:420-422); and the head returns every position's logits (`_full_head`).
+Where the reference departs from the release it says so. The quantizers
+are off: act_quant and fp4_act_quant are the identity, since neither Dew's
+V4 mixer nor transformers' DeepseekV4 rounds the cache. With them off,
+rotate_activation, the indexer's Hadamard rotation of its queries and keys
+alike, leaves the scores it ranks unchanged in exact arithmetic, so it is
+the identity (model.py:253-257, :374-376, :420-422), and the head returns
+every position's logits (`_full_head`). Beyond the quantizers, the tie order
+is the one documented difference from the release: each indexer breaks
+equal scores toward the lower entry, as jax.lax.top_k does, where torch.topk
+leaves the order unspecified (`lower_index_ties` of
+tools/decoder_export_reference.py, on the release's Indexer and
+transformers' alike).
 """
 
 from __future__ import annotations
@@ -59,16 +67,18 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from torch.overrides import TorchFunctionMode
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 import deepseek_v41_reference as v41  # noqa: E402
+from decoder_export_reference import lower_index_ties  # noqa: E402
 
 REPO = "deepseek-ai/DeepSeek-V4-Flash-0731"
 DEEPSEEK_V4_0731_REVISION = "7872f01b1d1fe23eabc4c98b48bffcef5a386062"
 FIXTURE = ROOT / "tests" / "fixtures" / "hf" / "deepseek-v4-dspark-tiny"
 RELEASED = ROOT / "tests" / "fixtures" / "hf" / "deepseek-v4-flash-0731"
-SEED = 18
+SEED = 0
 LENGTH = 16
 # Past the 4-token window, so the prefill wraps the trunk's and DSpark's
 # rings, and a multiple of neither compress ratio, so each compressor
@@ -227,44 +237,78 @@ def inputs(seed: int) -> torch.Tensor:
     return torch.randint(2, TINY["vocab_size"] - 1, (2, LENGTH), generator=generator)
 
 
+class _Selections(TorchFunctionMode):
+    """Every top-k inside a module's forward, appended to `found` as its
+    scored rows and sorted picks. Entered inside `lower_index_ties`'s mode,
+    it sees each call first and passes it on to be broken toward the lower
+    index."""
+
+    def __init__(self, found: list):
+        super().__init__()
+        self.found = found
+
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        out = func(*args, **(kwargs or {}))
+        if func in (torch.topk, torch.Tensor.topk):
+            rows, picks = args[0].detach(), out.indices
+            self.found.append((rows.reshape(-1, rows.size(-1)).double(),
+                               picks.reshape(-1, picks.size(-1)).sort(-1).values))
+        return out
+
+
+@contextlib.contextmanager
+def selections(model, classes: tuple[type, ...], indexer: type | None = None):
+    """Record every top-k the modules of `classes` make (`_Selections`), the
+    indexer's under the lower-index tie order."""
+    found: list = []
+    held = [(module, module.forward) for module in model.modules() if isinstance(module, classes)]
+
+    def recording(original):
+        def forward(*args, **kwargs):
+            with _Selections(found):
+                return original(*args, **kwargs)
+        return forward
+
+    try:
+        for module, original in held:
+            module.forward = recording(original)
+        with lower_index_ties(model, indexer=indexer):
+            yield found
+    finally:
+        for module, original in held:
+            module.forward = original
+
+
+def tied(found: list) -> int:
+    """How many recorded selections the tie order decided: rows whose k-th
+    and next finite scores are equal."""
+    count = 0
+    for rows, picks in found:
+        k = picks.size(-1)
+        if k < rows.size(-1):
+            ordered = rows.sort(-1, descending=True).values
+            kth, after = ordered[:, k - 1], ordered[:, k]
+            count += int((torch.isfinite(kth) & (kth == after)).sum())
+    return count
+
+
+def differ(found: list, wide: list) -> int:
+    """How many picks an fp32 run made otherwise than its float64 run."""
+    if len(found) != len(wide):
+        return max(len(found), len(wide))
+    return sum(int((picks != other).sum()) for (_, picks), (_, other) in zip(found, wide, strict=True))
+
+
 def released_outputs(module, seed: int, ids: torch.Tensor, widen: bool = False):
     """The release's full-forward logits and its cached run, the net, and
-    the record of every top-k both made (`v41.install_selection_probe`)."""
-    record = v41.Record()
-    v41.RECORDS[:] = [record]
+    every top-k its indexers and routers made (`selections`)."""
     with torch.no_grad():
         net = build(module, seed, widen)
-        reset(net)
-        _, logits, _ = forward(net, ids)
-        outputs = {"release_logits": logits.numpy(), **cached(net, ids)}
-    v41.RECORDS.clear()
-    return net, outputs, record
-
-
-def margin(outputs: dict[str, np.ndarray], record) -> float:
-    """How close the run came to another pick, over the row's largest
-    magnitude: a top-k's k-th value to the next (`v41.selection_margins`),
-    whose exact zeros the indexer's ReLU makes ties of, and a drafted
-    token's logit to the runner-up's. Dew's picks follow its own float64
-    run, so a pick within fp32 noise of another, or tied, would part from
-    the release's."""
-    drafted = np.sort(outputs["draft_logits"].reshape(-1, TINY["vocab_size"]), -1)
-    gap = (drafted[:, -1] - drafted[:, -2]) / np.abs(drafted).max(-1)
-    return min(float(record.joined("selection", "margin").min()), float(gap.min()))
-
-
-def search(first: int, count: int):
-    """Each seed's `margin`, then the first that clears twice the fp32 noise
-    tools/deepseek_v41_reference.py measured for a selection."""
-    module = import_reference()
-    install_topk_probe()
-    for seed in range(first, first + count):
-        _, outputs, record = released_outputs(module, seed, inputs(seed))
-        found = margin(outputs, record)
-        print(json.dumps({"seed": seed, "margin": found}), flush=True)
-        if found > 2 * v41.NOISE["selection"]:
-            return seed
-    raise SystemExit(f"no seed of {count} from {first} clears the selection noise")
+        with selections(net, (module.Indexer, module.Gate), module.Indexer) as found:
+            reset(net)
+            _, logits, _ = forward(net, ids)
+            outputs = {"release_logits": logits.numpy(), **cached(net, ids)}
+    return net, outputs, found
 
 
 @contextlib.contextmanager
@@ -295,8 +339,10 @@ def widened_transformers(module):
 
 def transformers_logits(directory: Path, ids: torch.Tensor, dtype: torch.dtype):
     """transformers' logits over `ids` from the checkpoint in `directory`, and
-    every top-k pick it made; refused if it leaves a trunk tensor unread."""
+    every top-k its indexers and routers made (`selections`); refused if it
+    leaves a trunk tensor unread."""
     from transformers import DeepseekV4ForCausalLM
+    from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4Indexer, DeepseekV4TopKRouter
 
     # The eager experts, since torch's grouped_mm takes no float64.
     loaded = DeepseekV4ForCausalLM.from_pretrained(str(directory), dtype=dtype, local_files_only=True,
@@ -311,40 +357,19 @@ def transformers_logits(directory: Path, ids: torch.Tensor, dtype: torch.dtype):
         raise SystemExit(f"{directory}: transformers does not read the checkpoint: {unread} {stray}")
     model.eval()
     model.set_attn_implementation("eager")
-    record = v41.Record()
-    v41.RECORDS[:] = [record]
-    with torch.no_grad():
+    with torch.no_grad(), selections(model, (DeepseekV4Indexer, DeepseekV4TopKRouter)) as found:
         logits = model(input_ids=ids, use_cache=False).logits.numpy()
-    v41.RECORDS.clear()
-    return logits, record.arrays("")["selection_picks"]
-
-
-def install_topk_probe():
-    """`v41.install_selection_probe`, over `torch.topk` as well, which
-    transformers' router calls (modeling_deepseek_v4.py:1038)."""
-    v41.install_selection_probe()
-    if getattr(torch.topk, "probed", False):
-        return
-    probe = torch.Tensor.topk
-
-    def topk(values, k, dim=-1, largest=True, sorted=True):
-        return probe(values, k, dim=dim, largest=largest, sorted=sorted)
-
-    topk.probed = True
-    torch.topk = topk
+    return logits, found
 
 
 def write(seed: int):
     from dew.interop.safetensors_io import write_file
 
     module = import_reference()
-    install_topk_probe()
     ids = inputs(seed)
-    net, outputs, record = released_outputs(module, seed, ids)
-    if margin(outputs, record) <= 2 * v41.NOISE["selection"]:
-        raise SystemExit(f"seed {seed} picks within fp32 noise of another pick; search for another")
+    net, outputs, found = released_outputs(module, seed, ids)
     with v41.widened(module):
-        _, wide, wide_record = released_outputs(module, seed, ids, widen=True)
+        _, wide, wide_found = released_outputs(module, seed, ids, widen=True)
     FIXTURE.mkdir(parents=True, exist_ok=True)
     # Each stage holds the trunk's embedding and head as attributes
     # (model.py:903-904), which the release's index does not repeat.
@@ -360,12 +385,12 @@ def write(seed: int):
     with widened_transformers(module):
         truth, truth_picks = transformers_logits(FIXTURE, ids, torch.float64)
 
-    picks_of = functools.partial(v41.Record.joined, kind="selection", name="picks")
-    differing = {"release picks": int((picks_of(record) != picks_of(wide_record)).sum()),
-                 "transformers picks": int(np.sum(picks != truth_picks)),
+    differing = {"release picks": differ(found, wide_found), "transformers picks": differ(picks, truth_picks),
                  "draft_ids": int(np.sum(outputs["draft_ids"] != wide["draft_ids"]))}
     trunks = float(np.max(np.abs(wide["release_logits"] - truth)))
-    print(json.dumps({"seed": seed, "differing": differing, "float64 trunks apart": trunks}))
+    ties = tied(found)
+    print(json.dumps({"seed": seed, "differing": differing, "float64 trunks apart": trunks,
+                      "tied selections": ties, "selections": sum(len(picks) for _, picks in found)}))
     if any(differing.values()) or trunks > 1e-9:
         raise SystemExit(f"seed {seed}: a reference decides otherwise than its float64 run, or the "
                          "release's trunk is not transformers'")
@@ -376,7 +401,7 @@ def write(seed: int):
              draft_confidence=wide["draft_confidence"])
     (FIXTURE / "source.json").write_text(json.dumps({
         "release": {"repo": REPO, "revision": DEEPSEEK_V4_0731_REVISION, "path": "inference/model.py"},
-        "transformers": {"version": "5.16.1"}, "seed": seed}, indent=1) + "\n")
+        "transformers": {"version": "5.16.1"}, "seed": seed, "tied_selections": ties}, indent=1) + "\n")
     print(f"{FIXTURE}: {len(tensors)} tensors, seed {seed}")
 
 
@@ -410,13 +435,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--seed", type=int, default=SEED)
-    parser.add_argument("--search", type=int, default=0)
     parser.add_argument("--released", action="store_true")
     args = parser.parse_args()
     if args.released:
         write_released()
-    elif args.search:
-        print(json.dumps({"seed": search(args.seed, args.search)}))
     else:
         write(args.seed)
 
