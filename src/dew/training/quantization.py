@@ -317,6 +317,8 @@ def _modelopt_input_qdq(x: jax.Array, spec: NVFP4Input, qarray: ModuleType) -> j
     values = jax.lax.stop_gradient(x).astype(jnp.float32)
     groups = values.reshape(*x.shape[:-1], -1, 16)
     largest = jnp.max(jnp.abs(groups), -1)
+    # At g=0 every effective scale falls below the 1e-5 guard and becomes 1;
+    # a tiny positive stand-in keeps that result while avoiding 0/0 NaNs.
     global_scale = jnp.float32(spec.global_scale if spec.global_scale > 0 else 1e-12)
     denominator = jnp.full(largest.shape, 6, jnp.float32) * global_scale
     normalized = largest * _nvfp4_divide(jnp.ones_like(largest), denominator)
