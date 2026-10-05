@@ -6,6 +6,7 @@ trains it and not the model."""
 
 import tarfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -14,9 +15,11 @@ import optax
 import pytest
 from flax import linen as nn
 from reference_error import assert_as_exact_as_the_reference, assert_computes_the_oracle
+from test_lpips import drawn_weights
 from test_mean_flow import CLASSES, labelled
 
 from dew.diffusion import presets
+from dew.eval.lpips import variables_from_torch
 from dew.inputs import Condition, Field, InputSpec, unit_range
 from dew.nn.autoencoders.kl import AutoencoderKL
 from dew.nn.autoencoders.sd_vae import StableDiffusionVAE
@@ -24,8 +27,15 @@ from dew.nn.autoencoders.vae import translate_vae_weights
 from dew.nn.backbones import SimpleDiT
 from dew.objectives.base import Step
 from dew.objectives.diffusion import Alignment, DiffusionObjective
-from dew.objectives.diffusion.alignment import ALIGNMENT
-from dew.objectives.diffusion.end_to_end import AUTOENCODER, LATENT_STATS, EndToEnd
+from dew.objectives.diffusion.alignment import ALIGNMENT, REPRESENTATION
+from dew.objectives.diffusion.end_to_end import (
+    AUTOENCODER,
+    LATENT_STATS,
+    PERCEPTUAL,
+    EndToEnd,
+    PatchDiscriminator,
+)
+from dew.objectives.diffusion.objective import DISCRIMINATOR
 from dew.sampling import Euler, TextToImage
 from dew.training import Trainer
 
@@ -34,10 +44,16 @@ CASE = np.load(FIXTURES / "repae" / "regularizer.npz")
 STEPPED = np.load(FIXTURES / "repae" / "step.npz")
 
 
+L1_KL = {"perceptual_weight": 0.0, "discriminator_weight": 0.0}
+"""The regularizer without its perceptual and adversarial terms, whose
+networks an 8-pixel image is too small for."""
+
+
 def test_the_regularizer_is_repa_es():
-    total, terms = EndToEnd().regularizer(jnp.asarray(CASE["images"], jnp.float32),
-                                          jnp.asarray(CASE["reconstruction"], jnp.float32),
-                                          jnp.asarray(CASE["moments"], jnp.float32))
+    total, hinge, terms = EndToEnd(**L1_KL).regularizer(
+        jnp.asarray(CASE["images"], jnp.float32), jnp.asarray(CASE["reconstruction"], jnp.float32),
+        jnp.asarray(CASE["moments"], jnp.float32), perceptual=None, discriminator=None, step=jnp.asarray(0))
+    assert float(hinge) == 0 and set(terms) == {"reconstruction", "kl"}
     # float32 sums of a few hundred O(1) terms: 1e-5 relative is rounding.
     np.testing.assert_allclose(float(terms["kl"]), float(CASE["kl"]), rtol=1e-5)
     np.testing.assert_allclose(float(total), float(CASE["regularizer"]), rtol=1e-5)
@@ -93,28 +109,41 @@ def total(tree) -> float:
     return float(sum(jnp.abs(leaf).sum() for leaf in jax.tree.leaves(tree)))
 
 
+PATCHGAN = {"perceptual_weight": 0.0, "discriminator_width": 4, "discriminator_layers": 1}
+"""The regularizer with a one-layer PatchGAN, which an 8-pixel image fits."""
+
+
 def test_each_loss_trains_its_own_side():
     """With the autoencoder's own loss weighted to zero, nothing reaches it:
     the denoising and alignment losses read a detached latent. With it on,
     the model's and projector's gradients are unchanged: the autoencoder's
-    alignment reads them frozen."""
-    params, joint = gradients(EndToEnd())
-    _, model_only = gradients(EndToEnd(align_weight=0.0, reconstruction_weight=0.0, kl_weight=0.0))
-    assert total(model_only[AUTOENCODER]) == 0
-    assert total(joint[AUTOENCODER]) > 0
+    alignment reads them frozen. The discriminator trains on its hinge loss
+    alone, whatever the autoencoder's weights, and its generator term
+    reaches the autoencoder and not the discriminator."""
+    params, joint = gradients(EndToEnd(**PATCHGAN))
+    _, model_only = gradients(EndToEnd(**PATCHGAN, align_weight=0.0, reconstruction_weight=0.0, kl_weight=0.0,
+                                       discriminator_start=1))
+    assert total(model_only[AUTOENCODER]) == 0 and total(model_only[DISCRIMINATOR]) == 0
+    assert total(joint[AUTOENCODER]) > 0 and total(joint[DISCRIMINATOR]) > 0
     for name in joint:
-        if name != AUTOENCODER:
+        if name not in (AUTOENCODER, DISCRIMINATOR):
             for got, want in zip(
                 jax.tree.leaves(joint[name]), jax.tree.leaves(model_only[name]), strict=True
             ):
                 np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
-    _, aligned_only = gradients(EndToEnd(reconstruction_weight=0.0, kl_weight=0.0))
+    _, aligned_only = gradients(EndToEnd(**L1_KL, reconstruction_weight=0.0, kl_weight=0.0))
     assert total(aligned_only[AUTOENCODER]) > 0
+    _, adversarial_only = gradients(EndToEnd(**PATCHGAN, align_weight=0.0, reconstruction_weight=0.0,
+                                             kl_weight=0.0))
+    for got, want in zip(jax.tree.leaves(adversarial_only[DISCRIMINATOR]),
+                         jax.tree.leaves(joint[DISCRIMINATOR]), strict=True):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    assert total(adversarial_only[AUTOENCODER]) > 0
     assert set(params) >= {LATENT_STATS} and "autoencoder" not in params
 
 
 def test_a_step_moves_the_running_statistics_and_the_task_decodes_with_them():
-    task = objective(EndToEnd())
+    task = objective(EndToEnd(**PATCHGAN))
     trainer = Trainer(task, optax.adam(1e-3), key=jax.random.PRNGKey(3))
     state = trainer.initial_state()
     before = jax.tree.map(np.asarray, state.variables[LATENT_STATS])
@@ -124,6 +153,7 @@ def test_a_step_moves_the_running_statistics_and_the_task_decodes_with_them():
 
     published = TextToImage.from_objective(task, state.variables)
     assert AUTOENCODER not in published.variables["params"] and LATENT_STATS not in published.variables
+    assert DISCRIMINATOR not in published.variables["params"]
     for got, want in zip(jax.tree.leaves(published.variables["autoencoder"]),
                          jax.tree.leaves(state.variables["params"][AUTOENCODER]), strict=True):
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
@@ -131,7 +161,7 @@ def test_a_step_moves_the_running_statistics_and_the_task_decodes_with_them():
                                1 / np.sqrt(np.asarray(after["var"])), rtol=1e-6)
 
 
-SIDE, LATENT, PATCH, WIDTH, FEATURES, PROJECTOR, DROPOUT = 32, 4, 2, 12, 6, 10, 0.1
+SIDE, LATENT, PATCH, WIDTH, FEATURES, PROJECTOR, DROPOUT, DISCRIMINATOR_WIDTH = 32, 4, 2, 12, 6, 10, 0.1, 8
 
 
 class Block(nn.Module):
@@ -278,7 +308,8 @@ def assert_the_batch_norm_of(latents, before: dict, after: dict, momentum: float
         assert np.all(error <= bound), (name, error.tolist(), bound.tolist())
 
 
-def test_a_step_is_train_repae_s_step(tmp_path):
+@pytest.fixture(scope="module")
+def repae_step(tmp_path_factory) -> SimpleNamespace:
     """One DiffusionObjective step under `EndToEnd` against
     `train_repae.py`'s loop body run as published on DiffusionObjective's
     own draws (`tools/repae_reference.py`): its two passes, the VAE's
@@ -288,18 +319,22 @@ def test_a_step_is_train_repae_s_step(tmp_path):
     running statistics moved, a label dropped), on the same posterior
     sample, times and noise, with the tiny SD VAE and a stand-in SiT.
 
-    This is Dew's current scope, the L1 reconstruction and the KL: the
-    reference runs l1_lpips_kl_gan.yaml with `perceptual_weight` and
-    `discriminator_weight` at 0, where the published recipe has LPIPS at 1
-    and the PatchGAN at 0.1 from step 0.
+    The loss is the published l1_lpips_kl_gan.yaml: LPIPS at 1 through
+    REPA-E's own `PerceptualLoss` (on VGG16 and heads both sides draw), and
+    the PatchGAN at 0.1 from step 0, REPA-E's `NLayerDiscriminator` at an
+    eighth of its width, whose own update on the hinge loss runs in the
+    same step, starting from weights the fixture carries (a pretrained
+    discriminator, given to `init` under `discriminator`).
 
-    The autoencoder's gradient is the VAE update's, and the model's and
-    the projector's are half the SiT update's, as Dew's L2 halves the
-    denoising error and REPA's term with it; each network's is held to the
-    reference by the float64 rule, the running statistics too, and the loss
-    and its terms within 1e-6 of the reference's float64 run. The tuned
+    The autoencoder's gradient is the VAE update's and the discriminator's
+    the discriminator update's, and the model's and the projector's are
+    half the SiT update's, as Dew's L2 halves the denoising error and REPA's
+    term with it; each network's is held to the reference by the float64
+    rule, the running statistics too, and the loss and its terms within
+    1e-6 of the reference's float64 run. The tuned
     autoencoder a run then decodes with takes the latent scale and bias of
     REPA-E's `extract_latents_stats`, by the float64 rule too."""
+    tmp_path = tmp_path_factory.mktemp("repae")
     with tarfile.open(FIXTURES / "tiny_diffusers.tar.xz") as archive:
         archive.extractall(tmp_path, filter="data")
     alignment = Alignment(Representation(), {"params": {"Conv_0": module("representation")}}, "block_0",
@@ -308,10 +343,18 @@ def test_a_step_is_train_repae_s_step(tmp_path):
     task = DiffusionObjective(
         StandIn(), presets.Flow(density="uniform")(), inputs, guidance=None, solver=Euler(), steps=2,
         autoencoder=StableDiffusionVAE(modelname=str(tmp_path / "sd" / "vae"), dtype=jnp.float32),
-        alignment=alignment, end_to_end=EndToEnd(), ema_decay=None, unconditional_prob=DROPOUT)
-    variables = task.init(jax.random.PRNGKey(0))
+        alignment=alignment, end_to_end=EndToEnd(discriminator_width=DISCRIMINATOR_WIDTH), ema_decay=None,
+        unconditional_prob=DROPOUT)
+    assert task.autoencoder is not None
+    discriminator = PatchDiscriminator(DISCRIMINATOR_WIDTH).variables_from_torch(
+        {key.removeprefix("weights/discriminator."): STEPPED[key] for key in STEPPED.files
+         if key.startswith("weights/discriminator.")})
+    variables = task.init(jax.random.PRNGKey(0), {
+        "encoders": task.encoder_params(), "autoencoder": task.autoencoder.params,
+        REPRESENTATION: alignment.variables, PERCEPTUAL: variables_from_torch(*drawn_weights()),
+        DISCRIMINATOR: discriminator})
     params = {**nested((path, module(name)) for name, path in LAYOUT),
-              AUTOENCODER: variables["params"][AUTOENCODER]}
+              AUTOENCODER: variables["params"][AUTOENCODER], DISCRIMINATOR: discriminator["params"]}
     assert jax.tree.structure(params) == jax.tree.structure(variables["params"])
     variables = {**variables, LATENT_STATS: {"mean": STEPPED["bn/running_mean_before"],
                                              "var": STEPPED["bn/running_var_before"]}}
@@ -320,12 +363,32 @@ def test_a_step_is_train_repae_s_step(tmp_path):
     (value, aux), gradients = jax.value_and_grad(
         lambda tree: task.scalar_loss({**variables, "params": tree}, batch, step), has_aux=True)(params)
 
-    def flat(tree):
-        return np.concatenate([np.ravel(leaf) for leaf in jax.tree.leaves(tree)])
+    return SimpleNamespace(task=task, variables=variables, params=params, batch=batch, step=step, value=value,
+                           aux=aux, gradients=gradients)
 
+
+def _flat(tree) -> np.ndarray:
+    return np.concatenate([np.ravel(leaf) for leaf in jax.tree.leaves(tree)])
+
+
+def test_a_repae_step_moves_each_network_as_train_repae_does(repae_step):
+    """The autoencoder's gradient is the VAE update's and the
+    discriminator's the discriminator update's, and the model's and the
+    projector's are half the SiT update's, as Dew's L2 halves the denoising
+    error and REPA's term with it; each is held to the reference by the
+    float64 rule."""
+    gradients = repae_step.gradients
     assert jax.tree.structure(gradients[AUTOENCODER]) == jax.tree.structure(autoencoder_gradients(""))
-    assert_as_exact_as_the_reference(flat(gradients[AUTOENCODER]), flat(autoencoder_gradients("")),
-                                     flat(autoencoder_gradients("_f64")), "the autoencoder's gradient")
+    assert_as_exact_as_the_reference(_flat(gradients[AUTOENCODER]), _flat(autoencoder_gradients("")),
+                                     _flat(autoencoder_gradients("_f64")), "the autoencoder's gradient")
+    discriminator_gradients = [PatchDiscriminator(DISCRIMINATOR_WIDTH).variables_from_torch(
+        {key.removeprefix("grad/discriminator.").removesuffix(tail): STEPPED[key]
+         for key in STEPPED.files if key.startswith("grad/discriminator.") and key.endswith(tail)
+         and (tail or not key.endswith("_f64"))}
+    )["params"] for tail in ("", "_f64")]
+    assert jax.tree.structure(gradients[DISCRIMINATOR]) == jax.tree.structure(discriminator_gradients[0])
+    assert_as_exact_as_the_reference(_flat(gradients[DISCRIMINATOR]), *map(_flat, discriminator_gradients),
+                                     "the discriminator's gradient")
     for label, entries in (("the model's gradient", LAYOUT[:-3]), ("the projector's gradient", LAYOUT[-3:])):
         dew, reference, truth = [], [], []
         for name, path in entries:
@@ -341,6 +404,13 @@ def test_a_step_is_train_repae_s_step(tmp_path):
         got, want, exact = (np.concatenate([np.ravel(part) for part in parts])
                             for parts in (dew, reference, truth))
         assert_as_exact_as_the_reference(got, want, exact, label)
+
+
+def test_a_repae_step_moves_the_running_statistics_as_train_repae_does(repae_step):
+    """The batch norm's running statistics and the tuned autoencoder's
+    latent scale and bias, as REPA-E's `extract_latents_stats` takes them."""
+    task, variables, params, batch, step, aux = (repae_step.task, repae_step.variables, repae_step.params,
+                                                 repae_step.batch, repae_step.step, repae_step.aux)
     # The running statistics are eight numbers, too few for the float64
     # rule's RMS to settle: a runner's vector width alone moved its ratio
     # from 1.00 to 2.46. So the rule holds the posterior's sample they are
@@ -349,7 +419,7 @@ def test_a_step_is_train_repae_s_step(tmp_path):
     # rounding, the reference's batch norm being that function in float64.
     statistics = aux.variables[LATENT_STATS]
     tuned = task._end_to_end_latents({**variables, "params": params}, unit_range(batch["image"]),
-                                     jax.random.split(step.key, 5)[0])
+                                     jax.random.split(step.key, 5)[0], step.step)
     for name in ("mean", "var"):
         np.testing.assert_array_equal(np.asarray(tuned.statistics[name]), np.asarray(statistics[name]))
     assert_as_exact_as_the_reference(np.asarray(tuned.raw), STEPPED["latents/sample"],
@@ -362,11 +432,6 @@ def test_a_step_is_train_repae_s_step(tmp_path):
         np.concatenate([published["mean"], published["var"]]), "the reference's batch norm",
         roundings=2 * 512)
     assert_the_batch_norm_of(tuned.raw, before, statistics)
-    np.testing.assert_allclose(float(value), 0.5 * STEPPED["loss/sit_f64"] + STEPPED["loss/vae_f64"],
-                               rtol=1e-6)
-    for term in ("alignment", "autoencoder_alignment", "reconstruction", "kl"):
-        np.testing.assert_allclose(float(aux.metrics[term]), STEPPED[f"loss/{term}_f64"], rtol=1e-6,
-                                   err_msg=term)
     # REPA-E's `extract_latents_stats` is the running mean and the running
     # variance's reciprocal square root, with no epsilon; the tuned
     # autoencoder takes Dew's own statistics through the same, within the
@@ -381,11 +446,29 @@ def test_a_step_is_train_repae_s_step(tmp_path):
                                1 / np.sqrt(np.asarray(statistics["var"], np.float64)), rtol=gamma(2), atol=0)
 
 
+def test_a_repae_step_s_loss_and_terms_are_train_repae_s(repae_step):
+    """The loss is half the SiT's plus the VAE's and the discriminator's,
+    within 1e-6 of the reference's float64 run: the reference computes the
+    three apart and never their sum in float32, so no float32 reference
+    measures the sum. Each term is held to the reference by the float64
+    rule: the generator's hinge is a mean of logits of both signs, whose
+    float32 rounding is large beside its value (the reference's own is
+    2.6e-5 relative)."""
+    np.testing.assert_allclose(
+        float(repae_step.value),
+        0.5 * STEPPED["loss/sit_f64"] + STEPPED["loss/vae_f64"] + STEPPED["loss/discriminator_f64"],
+        rtol=1e-6)
+    for term in ("alignment", "autoencoder_alignment", "reconstruction", "kl", "perceptual", "generator",
+                 "discriminator"):
+        assert_as_exact_as_the_reference(np.asarray(repae_step.aux.metrics[term]), STEPPED[f"loss/{term}"],
+                                         STEPPED[f"loss/{term}_f64"], term)
+
+
 def test_end_to_end_needs_alignment_and_a_kl_autoencoder():
-    task = objective(EndToEnd())
+    task = objective(EndToEnd(**L1_KL))
     with pytest.raises(ValueError, match="needs `alignment`"):
         DiffusionObjective(task.model, task.process, task.inputs, autoencoder=task.autoencoder,
-                           end_to_end=EndToEnd())
+                           end_to_end=EndToEnd(**L1_KL))
 
 
 def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_one(tmp_path):
@@ -418,7 +501,7 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
         autoencoder=PretrainedAutoencoder(modelname=str(tmp_path / "tiny_diffusers/sd/vae"), dtype="float32"),
         mode=Denoising(alignment=RepresentationAlignment(
             encoder=str(tmp_path / "rae/dinov2_plain"), layer="dit_block_0", width=8, resolution=112,
-            end_to_end=EndToEnd())))
+            end_to_end=EndToEnd(perceptual_weight=0.0, discriminator_width=8))))
     task = config.build()
     trainer = Trainer(task, optax.adam(1e-2), key=jax.random.PRNGKey(3))
     state = trainer.initial_state()
@@ -435,6 +518,7 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
     for weights in (tmp_path / "rae/dinov2_plain").glob("*.safetensors"):
         weights.unlink()
     restored = TextToImage.from_run(str(run))
+    assert DISCRIMINATOR not in restored.variables["params"]
     for got, want in zip(jax.tree.leaves(restored.variables["autoencoder"]),
                          jax.tree.leaves(state.variables["params"][AUTOENCODER]), strict=True):
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))

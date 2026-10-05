@@ -41,7 +41,7 @@ from dew.nn.autoencoders.kl import AutoencoderKL, posterior_latent
 from dew.nn.mp import Uncertainty
 from dew.objectives.base import Aux, EMASpec, Objective, Ratio, Step, Variables, thaw, under
 from dew.objectives.diffusion.alignment import ALIGNMENT, REPRESENTATION, Alignment, RepresentationAlignment
-from dew.objectives.diffusion.end_to_end import AUTOENCODER, LATENT_STATS, EndToEnd
+from dew.objectives.diffusion.end_to_end import AUTOENCODER, LATENT_STATS, PERCEPTUAL, EndToEnd
 from dew.registry import objectives, trainings
 from dew.sampling.guidance import CFG, Guidance
 from dew.sampling.pipelines import TextToImage
@@ -87,13 +87,13 @@ def _own_loss(name: str, kwargs: dict) -> None:
 
 def _without_loss_heads(variables: Variables) -> Variables:
     """`variables` without what the model never reads: the uncertainty head,
-    the alignment projector, the frozen representation encoder, and an
-    autoencoder trained end to end with its latent statistics, a fake score
-    and a teacher."""
+    the alignment projector, the frozen representation encoder, an
+    autoencoder trained end to end with its latent statistics, perceptual
+    network and discriminator, a fake score and a teacher."""
     return {name: ({key: value for key, value in tree.items() if key not in LOSS_HEADS}
                    if name in ("params", "constants") else tree)
             for name, tree in variables.items()
-            if name not in (REPRESENTATION, LATENT_STATS, TEACHER, SPECTRAL)}
+            if name not in (REPRESENTATION, LATENT_STATS, PERCEPTUAL, TEACHER, SPECTRAL)}
 
 
 def check_solver(process, solver, steps: int) -> None:
@@ -160,12 +160,14 @@ class FixedBlank:
 class TunedLatents(NamedTuple):
     """An end-to-end step's latents: the autoencoder's raw draw, the batch
     normalized samples the model trains on and the running statistics
-    after them, and the autoencoder's regularizer with its terms."""
+    after them, the autoencoder's regularizer, the discriminator's hinge
+    loss, and their terms."""
 
     raw: jax.Array
     samples: jax.Array
     statistics: Variables
     regularizer: jax.Array
+    hinge: jax.Array
     terms: dict[str, jax.Array]
 
 
@@ -417,6 +419,10 @@ class DiffusionObjective(Objective[Ratio]):
             held["autoencoder"] = self.autoencoder.params
         if self.alignment is not None:
             held[REPRESENTATION] = self.alignment.variables
+        if self.end_to_end is not None and self.end_to_end.perceptual_weight:
+            from dew.eval.lpips import LPIPSNetwork
+
+            held[PERCEPTUAL] = LPIPSNetwork.published()[1]
         return held
 
     def init(self, key, variables: Variables | None = None) -> Variables:
@@ -433,12 +439,12 @@ class DiffusionObjective(Objective[Ratio]):
             drawn = self.model.init(key, jnp.ones((1, *self.latent_shape)), jnp.ones((1,)),
                                     **conditions)
             state = {**drawn, "encoders": held["encoders"]}
-            own = self.held_variables()
-            for frozen in ("autoencoder", REPRESENTATION):
+            for frozen in ("autoencoder", REPRESENTATION, PERCEPTUAL, DISCRIMINATOR):
                 # The frozen weights are state, like the encoders'. They ride in
                 # as an argument to the compiled step for the layout to place.
-                # A caller holding only some towers takes the rest as built.
-                value = held.get(frozen, own.get(frozen))
+                # A caller holding only some towers takes the rest as built,
+                # and a pretrained discriminator rides in the same way.
+                value = held[frozen] if frozen in held else self.held_variables().get(frozen)
                 if value is not None:
                     state[frozen] = value
         if self.uncertainty is not None and UNCERTAINTY not in state["params"]:
@@ -454,6 +460,13 @@ class DiffusionObjective(Objective[Ratio]):
             state[LATENT_STATS] = self.end_to_end.initial_statistics(
                 self.autoencoder.latent_shift, self.autoencoder.latent_scale, self.autoencoder.latent_channels
             )
+            network = self.end_to_end.discriminator
+            if network is not None:
+                given = state.pop(DISCRIMINATOR, None)
+                drawn_discriminator = network.init(jax.random.fold_in(key, 3),
+                                                   jnp.zeros((2, *self.inputs.sample.shape)))
+                state["params"] = {**state["params"], DISCRIMINATOR: (
+                    drawn_discriminator if given is None else given)["params"]}
         if self.alignment is not None and ALIGNMENT not in state["params"]:
             state["params"] = {**state["params"], ALIGNMENT: self._projector_init(
                 jax.random.fold_in(key, 2), state)}
@@ -550,7 +563,7 @@ class DiffusionObjective(Objective[Ratio]):
         t = schedule.sample_t(time_key, count)
         end_to_end = None
         if self.end_to_end is not None:
-            end_to_end = self._end_to_end_latents(variables, images, encode_key)
+            end_to_end = self._end_to_end_latents(variables, images, encode_key, step.step)
             samples = end_to_end.samples
         elif self.autoencoder is not None:
             samples = self.autoencoder.encode(variables["autoencoder"], images, encode_key)
@@ -588,7 +601,8 @@ class DiffusionObjective(Objective[Ratio]):
                                     {**given, "train": False}, images)
         assert through is not None
         metrics.update(end_to_end.terms, autoencoder_alignment=through)
-        total = total + (end_to_end.regularizer + self.end_to_end.align_weight * through) * mass
+        autoencoder = end_to_end.regularizer + self.end_to_end.align_weight * through
+        total = total + (autoencoder + end_to_end.hinge) * mass
         return Ratio(total, mass), Aux(metrics=metrics, variables={LATENT_STATS: end_to_end.statistics})
 
     def _denoised(self, params, variables, samples, t, noise, call, images):
@@ -609,7 +623,7 @@ class DiffusionObjective(Objective[Ratio]):
         preds = self.process.prediction.pred_transform(noisy, preds, rates, t)
         return optax.l2_loss(preds, target), aligned
 
-    def _end_to_end_latents(self, params, images, key) -> TunedLatents:
+    def _end_to_end_latents(self, params, images, key, step) -> TunedLatents:
         """The trained autoencoder's posterior draw of `images` and what the
         step reads of it."""
         assert self.end_to_end is not None and isinstance(self.autoencoder, ModuleAutoEncoder)
@@ -617,10 +631,13 @@ class DiffusionObjective(Objective[Ratio]):
         moments = module.apply(weights, images, method=module.moments)
         raw = posterior_latent(moments, key)
         reconstruction = module.apply(weights, raw, method=module.decode)
-        regularizer, terms = self.end_to_end.regularizer(images, reconstruction, moments)
+        discriminator = params["params"].get(DISCRIMINATOR)
+        regularizer, hinge, terms = self.end_to_end.regularizer(
+            images, reconstruction, moments, perceptual=params.get(PERCEPTUAL),
+            discriminator=None if discriminator is None else {"params": discriminator}, step=step)
         samples, statistics = self.end_to_end.batch_normalized(jax.lax.stop_gradient(raw),
                                                                params[LATENT_STATS])
-        return TunedLatents(raw, samples, statistics, regularizer, terms)
+        return TunedLatents(raw, samples, statistics, regularizer, hinge, terms)
 
     def published_autoencoder(self, variables: Variables) -> tuple[AutoEncoder | None, Variables]:
         """The autoencoder a task over `variables` decodes with, and its
