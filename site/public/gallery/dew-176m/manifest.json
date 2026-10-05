@@ -573,12 +573,11 @@
         256,
         256
       ],
-      "call": "pipe.prepare(['a waterfall in a lush green forest, vivid colors, dramatic lighting, highly detailed'], key=61, steps=30, unconditional=negative); pipe(inputs, key=61, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
-      "clip_score": 31.92,
-      "aesthetic": 6.744,
+      "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=61, steps=30, unconditional=negative); pipe(inputs, key=61, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
+      "clip_score": 30.572383880615234,
+      "aesthetic": 6.274466037750244,
       "framing": "square",
-      "png_sha256": "9c706d6205d959292b4ee146d016960b8bed6bf6fb14af995b280b97d56f0fcc",
-      "seconds_on_rtx4080": 0.19,
+      "png_sha256": "9a5051c38ec11ebab2a8f3caacd580683dd25eaeb7b6b75e812e9f4e50e3afcf",
       "seed": 32,
       "grid_row": 2,
       "grid_column": 0
@@ -600,12 +599,11 @@
         256,
         256
       ],
-      "call": "pipe.prepare(['a waterfall in a lush green forest, vivid colors, dramatic lighting, highly detailed'], key=61, steps=30, unconditional=negative); pipe(inputs, key=61, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
-      "clip_score": 31.92,
-      "aesthetic": 6.744,
+      "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=3, steps=30, unconditional=negative); pipe(inputs, key=3, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
+      "clip_score": 28.530746459960938,
+      "aesthetic": 6.208670616149902,
       "framing": "square",
-      "png_sha256": "9c706d6205d959292b4ee146d016960b8bed6bf6fb14af995b280b97d56f0fcc",
-      "seconds_on_rtx4080": 0.19,
+      "png_sha256": "8b1ac18ee330f688c6355899c1ae7ddaa2276af4ef27b6b04716f2e098e5cdf5",
       "seed": 32,
       "grid_row": 2,
       "grid_column": 0

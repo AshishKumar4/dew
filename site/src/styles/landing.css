@@ -411,7 +411,8 @@ html[data-has-hero][data-past-hero] header.header {
 	scroll-snap-align: start;
 }
 
-.landing-image-grid img {
+.landing-image-grid img,
+.landing-image-grid video {
 	display: block;
 	width: 100%;
 	height: auto;
