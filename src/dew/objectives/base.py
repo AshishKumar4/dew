@@ -29,10 +29,13 @@ from dew.artifacts import Artifact, Artifacts
 from dew.records import JSON
 
 if TYPE_CHECKING:
+    from jax.typing import DTypeLike
+
     from dew.inference.tasks import BlockGeneration, MaskedGeneration, TextGeneration
     from dew.inputs import InputSpec
     from dew.nn.backbones.causal_transformer import DecoderBank
     from dew.sampling.pipelines import TextToImage
+    from dew.training.distributed import Layout, MeshSpec
     from dew.training.state import TrainState
 
     type Task = TextGeneration | BlockGeneration | MaskedGeneration | TextToImage
@@ -277,8 +280,26 @@ class EMASpec:
     select: PathFilter = everything
 
 
+class SavedTask(Protocol):
+    """What a saved run loads as, through `dew.pipeline(run_dir)`.
+
+    A class with this `from_run` classmethod qualifies: Dew's generation
+    tasks do, and so does a plugin's own task, named by its objective's
+    `saved_task`.
+    """
+
+    def from_run(self, directory: str, *, ema: bool | None = None, step: int | str | None = None,
+                 mesh: MeshSpec | None = None, layout: Layout | None = None,
+                 dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None) -> object: ...
+
+
 class Objective(ABC, Generic[Loss, Effects]):
     """Define what is being learned: the parameters, the loss, what evaluation produces."""
+
+    saved_task: ClassVar[SavedTask | None] = None
+    """The task a saved run of this objective loads as through `dew.pipeline`,
+    for objectives outside Dew; Dew's own kinds are listed in
+    `dew.inference.pipeline.SAVED_TASKS`. None: the run has no task."""
 
     _inputs: InputSpec | None = None
 
@@ -581,6 +602,7 @@ __all__ = [
     "PathFilter",
     "Prediction",
     "Ratio",
+    "SavedTask",
     "Shown",
     "Step",
     "TrainingScalar",

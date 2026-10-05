@@ -24,7 +24,7 @@ from jax.typing import DTypeLike
 from dew.checkpoints import RUN_FILE
 from dew.inference.tasks import BlockGeneration, MaskedGeneration, TextGeneration
 from dew.nn.inputs import Media, ModelInputs, pad_token_rows
-from dew.objectives.base import Variables
+from dew.objectives.base import SavedTask, Variables
 from dew.registry import dtype_name
 from dew.sampling.pipelines import TextToImage
 from dew.telemetry.instrumentation import default_compilation_cache_dir, enable_compilation_cache
@@ -43,7 +43,7 @@ def pipeline(
     ema: bool | None = None,
     step: int | str | None = None,
     revision: str | None = None,
-) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration:
+) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration | object:
     """Load the inference task for `source`, its weights placed once.
 
     `source` is a run directory, or a source checkpoint directory or Hub
@@ -107,15 +107,20 @@ about a run beyond the name its `run.json` records.
 
 def _from_run(root: epath.Path, *, mesh: MeshSpec | None, layout: Layout | None,
               dtype: str | None, param_dtype: str | None, ema: bool | None,
-              step: int | str | None) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration:
+              step: int | str | None
+              ) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration | object:
     from dew.inference.tasks import run_record
     record = run_record(str(root), step)
     from dew.records import text
     kind = text(record['objective'], 'objective')
-    task = SAVED_TASKS.get(kind)
+    task: SavedTask | None = SAVED_TASKS.get(kind)
+    if task is None:
+        from dew.registry import objectives
+        task = objectives[kind].saved_task if kind in objectives else None
     if task is None:
         supported = ", ".join(list(SAVED_TASKS)[:-1]) + f" and {list(SAVED_TASKS)[-1]}"
-        raise TypeError(f"{kind!r} has no saved generation task; supported kinds are {supported}")
+        raise TypeError(f"{kind!r} has no saved task; Dew's kinds with one are {supported}, and an "
+                        "objective outside Dew names its own as `saved_task`")
     return task.from_run(str(root), ema=ema, step=step, mesh=mesh, layout=layout,
                          dtype=dtype, param_dtype=param_dtype)
 

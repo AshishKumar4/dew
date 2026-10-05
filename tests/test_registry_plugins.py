@@ -129,3 +129,67 @@ def test_a_second_shared_table_of_one_kind_is_refused():
     assert share(models) is models
     with pytest.raises(ValueError, match="already shared"):
         share(Registry("model"))
+
+
+PLUGIN_OBJECTIVE = '''
+import jax
+import jax.numpy as jnp
+
+from dew.objectives.base import Objective
+from dew.registry import objectives
+
+
+class Scalar:
+    """The plugin's saved task: the one weight a run of Shift trained."""
+
+    def __init__(self, value):
+        self.value = value
+
+    @classmethod
+    def from_run(cls, directory, *, ema=None, step=None, mesh=None, layout=None, dtype=None,
+                 param_dtype=None):
+        from dew.checkpoints import Checkpoints
+        variables = Checkpoints(directory).variables(ema=ema, step=step, mesh=mesh, layout=layout)
+        return cls(float(variables["params"]["w"]))
+
+
+@objectives("shift")
+class Shift(Objective):
+    saved_task = Scalar
+
+    def init(self, key, variables=None):
+        return {"params": {"w": jnp.zeros(())}}
+
+    def loss(self, variables, batch, step):
+        return jnp.mean((variables["params"]["w"] - batch["x"]) ** 2)
+
+    def inference_record(self):
+        return {"objective": "shift"}
+'''
+
+
+def test_dew_pipeline_loads_a_plugin_objectives_saved_task(tmp_path):
+    _install(tmp_path, "toyplugin", PLUGIN_OBJECTIVE)
+    run = tmp_path / "run"
+    train = ("import jax, numpy as np, optax\n"
+             "from dew import Checkpoints, Trainer\n"
+             "from dew.data import Dataset, Loading\n"
+             "from toyplugin.models import Shift\n"
+             "data = Dataset.from_records({'x': np.full((8,), 3.0, np.float32)}, batch=8,\n"
+             "                            loading=Loading(workers=0, threads=1, read_buffer=1))\n"
+             "trainer = Trainer(Shift(), optax.sgd(0.5), key=jax.random.key(0),\n"
+             f"                  checkpoints=Checkpoints({str(run)!r}))\n"
+             "state = trainer.fit(data, steps=3, log_every=3, checkpoint_every=3)\n"
+             "trainer.checkpoints.wait()\n"
+             "print(float(state.variables['params']['w']))\n")
+    trained = _run(tmp_path, train)
+    assert trained.returncode == 0, trained.stderr[-2000:]
+    load = ("import sys\n"
+            "import dew\n"
+            f"task = dew.pipeline({str(run)!r})\n"
+            "print(type(task).__module__, type(task).__name__, task.value)\n")
+    loaded = _run(tmp_path, load)
+    assert loaded.returncode == 0, loaded.stderr[-2000:]
+    module, name, value = loaded.stdout.split()
+    assert (module, name) == ("toyplugin.models", "Scalar")
+    assert float(value) == float(trained.stdout.split()[-1])
