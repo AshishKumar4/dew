@@ -497,18 +497,12 @@ class TextGeneration:
         `param_dtype` the parameter storage dtype; None keeps what the
         checkpoint stored.
         """
-        from dew.checkpoints import Checkpoints
         from dew.registry import objectives
 
         record, model_config, processor = _saved_run(directory, dtype, step)
-        kind = named(record["objective"], "objective")
         budget = _saved_budget(record)
-        objective_type = objectives[kind]
-        variables = Checkpoints(directory).variables( ema=False if objective_type._ema_is_reference else ema,
-                                      step=step, mesh=mesh, layout=layout, param_dtype=param_dtype)
-        if kind == "ppo":
-            from dew.objectives.base import part
-            variables = part(variables, "policy")
+        variables = objectives[named(record["objective"], "objective")]._saved_variables(
+            directory, step=step, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
         model = model_config.build()
         return cls(model, variables, processor, sampling=_saved_sampling(record, budget),
                    max_new_tokens=budget if budget else None)
@@ -601,14 +595,14 @@ class BlockGeneration:
         the averaged weights, `mesh` and `layout` place them, and the two
         dtypes override computation and storage.
         """
-        from dew.checkpoints import Checkpoints
         from dew.diffusion.block import BlockProcess
+        from dew.registry import objectives
         record, model_config, processor = _saved_run(directory, dtype, step)
         model = model_config.build()
         if not isinstance(model, DiffusionGemma):
             raise TypeError("block checkpoint must declare DiffusionGemma")
-        variables = Checkpoints(directory).variables(ema=ema, step=step, mesh=mesh, layout=layout,
-                                                      param_dtype=param_dtype)
+        variables = objectives[named(record["objective"], "objective")]._saved_variables(
+            directory, step=step, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
         return cls(model, variables, BlockProcess.from_json(named_fields(record['process'], 'process')),
                    processor,
                    max_new_tokens=_saved_budget(record) or None)
@@ -695,9 +689,8 @@ class MaskedGeneration:
         The arguments work as in `TextGeneration.from_run`, and the run's
         preview budget becomes the response length a call omits.
         """
-        from dew.checkpoints import Checkpoints
         from dew.diffusion.discrete import DiscreteProcess
-        from dew.registry import solvers
+        from dew.registry import objectives, solvers
 
         record, model_config, processor = _saved_run(directory, dtype, step)
         budget = _saved_budget(record)
@@ -707,8 +700,8 @@ class MaskedGeneration:
                 "a saved masked run requires a CausalTransformer with causal=False and a mask_token_id"
             )
         mask_id = model.mask_token_id
-        variables = Checkpoints(directory).variables( ema=ema, step=step, mesh=mesh, layout=layout,
-                                      param_dtype=param_dtype)
+        variables = objectives[named(record["objective"], "objective")]._saved_variables(
+            directory, step=step, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
         process = DiscreteProcess.from_json(named_fields(record['process'], 'process'))
         if process.mask_id != mask_id:
             raise ValueError("model and process mask token disagree")
