@@ -27,7 +27,7 @@ export class GatewayLab extends DurableObject<Env> {
 		}
 		try {
 			await this.ctx.storage.setAlarm(Date.now() + 15 * 60_000);
-			if (this.env.BUILD_COMMIT) return await this.prepare(this.env.BUILD_COMMIT);
+			if (this.env.BUILD_COMMIT) return await this.prepareManaged(this.env.BUILD_COMMIT);
 			stage = 'restore';
 			container.start({ containerSnapshot: { id: this.env.SNAPSHOT_ID }, instance: 'standard-4',
 				enableInternet: false, entrypoint: ['sleep', 'infinity'] });
@@ -67,6 +67,13 @@ export class GatewayLab extends DurableObject<Env> {
 	}
 
 	async prepare(commit: string): Promise<unknown> {
+		if (commit !== this.env.BUILD_COMMIT) throw new Error('requested generation is not the pinned build');
+		const result = await this.run() as { exitCode?: number; error?: string };
+		if (result.exitCode !== 0 || result.error) throw new Error('snapshot preparation or offline smoke failed');
+		return result;
+	}
+
+	private async prepareManaged(commit: string): Promise<unknown> {
 		const container = this.ctx.container!;
 		const started = Date.now();
 		container.start({ image: 'cloudflare/debian-trixie', instance: 'standard-4',
