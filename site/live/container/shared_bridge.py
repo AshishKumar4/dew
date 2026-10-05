@@ -1,7 +1,6 @@
 """Relay authenticated sessions to private Kernel Gateway contexts."""
 
 import asyncio
-from contextlib import suppress
 import hmac
 import json
 import os
@@ -9,6 +8,7 @@ import re
 import time
 import urllib.request
 import uuid
+from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 

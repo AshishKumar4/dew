@@ -117,6 +117,14 @@ def main():
                     "except PermissionError:\n pass\n"
                     "else:\n raise AssertionError('guest connected to another context')\n"
                     "finally:\n sock.close()")
+        for _, client, _ in kernels:
+            execute(client,
+                "from model_client import from_pretrained, CFG, DPMSolverMultistep, text_model\n"
+                "pipe = from_pretrained('dewml/hybrid-dit-176m')\n"
+                "result = pipe(['a lake beneath the northern lights'], key=3, steps=15, "
+                "solver=DPMSolverMultistep(), guidance=CFG(6, interval=(0.15, 0.9)))\n"
+                "assert result.pil()[0].size == (256, 256)\n"
+                "import sys\nassert 'jax' not in sys.modules\n")
         submitted = time.perf_counter()
 
         def run(kernel, indices):
@@ -127,6 +135,8 @@ def main():
                 stdout = execute(client,
                     f"assert __measurement == {identifier!r}\n"
                     f"assert Path('/work/context').read_text() == {identifier!r}\n"
+                    "from model_client import text_model\n"
+                    "assert text_model('HuggingFaceTB/SmolLM2-135M-Instruct')('The capital of France is', 24, key=0).text[0]\n"
                     "import json, os\nfrom pathlib import Path\n"
                     "pss = next(line for line in Path('/proc/self/smaps_rollup').read_text().splitlines() "
                     "if line.startswith('Pss:'))\n"
@@ -146,8 +156,21 @@ def main():
             rows = [row for future in futures for row in future.result()]
         assert len({row["uid"] for row in rows}) == len(kernels)
         memory = {row["uid"]: row["pss_bytes"] for row in rows}
+        model_processes = []
+        for proc in pathlib.Path('/proc').glob('[0-9]*'):
+            try:
+                status = (proc / 'status').read_text()
+                if next(line for line in status.splitlines() if line.startswith('Uid:')).split()[1] != '5000':
+                    continue
+                command = (proc / 'cmdline').read_bytes()
+                if b'model_service.py' in command:
+                    model_processes.append(proc.name)
+            except (OSError, StopIteration):
+                pass
+        assert len(model_processes) == 1, model_processes
         print(json.dumps({"requests": args.count, "contexts": len(kernels),
                           "state_isolation": True, "sandbox_checks": True, "all_channels": True,
+                          "native_text_and_image": True, "model_processes": model_processes,
                           "startup_seconds": [kernel[2] for kernel in kernels], "kernel_pss_bytes": memory,
                           "kernel_fd_counts": {row["uid"]: row["fds"] for row in rows},
                           "median_execute_seconds": statistics.median(row["execute_seconds"] for row in rows),
