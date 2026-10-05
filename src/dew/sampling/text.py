@@ -148,21 +148,22 @@ WARPERS = ("temperature", "top_h", "top_k", "top_p", "min_p", "typical_p", "epsi
 
 @dataclass(frozen=True)
 class Sampling:
-    """Token selection and termination. Zero temperature is deterministic argmax.
+    """Common generation controls that decide how tokens are drawn and when a row stops.
 
-    ``top_k=None`` keeps the vocabulary. EOS counts as a sampled action;
-    subsequent output slots contain ``pad_id`` and have no likelihood.
+    Zero temperature is deterministic argmax, and ``top_k=None`` keeps the
+    whole vocabulary. EOS counts as a sampled action; the output slots after
+    it contain ``pad_id`` and have no likelihood.
 
-    The penalties, ``no_repeat_ngram_size``, ``min_new_tokens`` and
+    The repetition penalty, ``no_repeat_ngram_size``, ``min_new_tokens`` and
     ``typical_p`` are Transformers' controls of the same names, and
-    ``presence_penalty`` and ``frequency_penalty`` vLLM's; each one's
-    default changes nothing. ``stop`` ends a row whose text ends with one
-    of the strings, compiled against a task's processor.
+    ``presence_penalty`` and ``frequency_penalty`` are vLLM's. Each one's
+    default changes nothing. ``stop`` ends a row whose text ends with one of
+    the strings; a task compiles them against its processor.
 
-    ``eos_id`` and ``pad_id`` are facts of the model and its tokenizer, so a
-    task fills the ones a policy leaves None with its own, as Transformers'
-    `generate` does; plain `generate` has no task, stops on no EOS unless
-    one is named, and pads with 0.
+    ``eos_id`` and ``pad_id`` belong to the model and its tokenizer, so where
+    a policy leaves them None, a task fills in its own, as Transformers
+    does. Plain `generate` has no task, so it stops on EOS only when the
+    policy names one, and pads with 0 unless the policy names a ``pad_id``.
 
     A ``Sampling`` value compiles to its transforms in Transformers' order
     when a request has no explicit logits chain. An explicit chain replaces
@@ -219,36 +220,37 @@ class Sampling:
 
     @property
     def pad(self) -> int:
-        """The id output slots after EOS hold: `pad_id`, or 0 when nothing filled it."""
+        """The id in the output slots after EOS, which is `pad_id`, or 0 when `pad_id` is None."""
         return 0 if self.pad_id is None else self.pad_id
 
     def active(self, names: Sequence[str]) -> list[str]:
-        """Return the named controls this policy sets away from their defaults.
+        """Return the controls in `names` that this policy sets away from their defaults.
 
-        A remote engine that cannot apply a control the way Dew does refuses
-        the ones this names, rather than drawing without them.
+        A client for a remote engine that cannot apply some controls the way
+        Dew does passes their names here, and refuses a policy that sets any
+        of them so the engine never draws without them.
         """
         neutral = Sampling()
         return [name for name in names if getattr(self, name) != getattr(neutral, name)]
 
     @property
     def stops(self) -> tuple[int, ...]:
-        """The EOS ids that end a draw, none when the policy names no EOS."""
+        """The EOS ids that end a draw, or an empty tuple when the policy names no EOS."""
         eos = self.eos_id
         return () if eos is None else (eos,) if isinstance(eos, int) else tuple(eos)
 
     def transforms(self) -> tuple[LogitsTransform, ...]:
-        """The complete default chain for a request without explicit transforms.
+        """Return the full default chain that a request without explicit transforms runs.
 
-        Zero temperature is the argmax, and the sample-only filters are
-        inactive there, which is what `generate()` does with `do_sample=False`.
-        A caller that adds a transform of its own writes
+        At zero temperature the chain ends in the argmax and runs none of the
+        sampling-only filters, as Transformers does with `do_sample=False`.
+        To add a transform of your own, pass
         `logits=policy.transforms() + (mine,)`.
         """
         return ordered_transforms(self)
 
     def criteria(self) -> tuple[Stopping, ...]:
-        """The EOS criterion this policy adds after a caller's criteria."""
+        """Return the EOS criterion this policy adds after a caller's criteria, empty when it names no EOS."""
         if self.eos_id is None:
             return ()
         return (EndOfSequence(jnp.asarray(self.eos_id, jnp.int32)),)
@@ -311,23 +313,24 @@ def ordered_transforms(policy: Sampling, extra: Mapping[str, LogitsTransform] = 
 
 @struct.dataclass
 class Generation(Generic[ArrayT]):
-    """Prompt plus padded continuation, and response-aligned likelihoods.
+    """The prompt and padded continuation of each row, with response-aligned log-probabilities.
 
-    ``lengths`` counts response actions, including EOS. ``terminated`` marks a
-    stopping criterion, EOS by default; false marks a length limit. Both
-    log-probability arrays have shape [B, max_new_tokens]. Only positions
-    below ``lengths`` are valid. ``behavior_log_probs`` describes the
-    distribution that actually drew each action, after the whole transform
-    chain. ``raw_log_probs`` describes the unmodified model policy.
+    ``lengths`` counts each row's response actions, including EOS.
+    ``terminated`` is true where a stopping criterion (EOS by default) ended
+    the row and false where the length limit did. Both log-probability
+    arrays have shape [B, max_new_tokens], and only positions below
+    ``lengths`` are valid. ``behavior_log_probs`` describes the distribution
+    that actually drew each action, after the whole transform chain.
+    ``raw_log_probs`` describes the unmodified model policy.
 
     A request for ``n`` continuations per prompt gives every array
     ``[B * n, ...]`` rows: prompt zero's ``n`` continuations, then prompt
-    one's. Each row carries its own length, termination and likelihoods.
+    one's. Each row has its own length, termination and likelihoods.
 
-    Arrays keep the placement the task ran with: on a mesh they are global
-    arrays whose rows split over the batch axes, padded to the device count.
-    ``host()`` reads this process's ``rows`` real rows back as host arrays.
-    ``text`` decodes them through the processor the task was bound to.
+    The arrays keep the placement the task ran with. On a mesh they are
+    global arrays whose rows are split over the batch axes and padded to the
+    device count. ``host()`` reads this process's ``rows`` real rows back as
+    host arrays, and ``text`` decodes them through the task's processor.
     """
 
     tokens: ArrayT
@@ -344,13 +347,15 @@ class Generation(Generic[ArrayT]):
         return self.tokens.shape[1] - self.behavior_log_probs.shape[1]
 
     def host(self) -> Generation[np.ndarray]:
-        """This process's real rows as host arrays, without the padding a
-        row plan added to fill the devices."""
+        """Return this process's real rows as host arrays, without the padding rows that fill the devices."""
         return jax.tree.map(lambda leaf: local_rows(leaf)[:self.rows], self)
 
     @functools.cached_property
     def text(self) -> tuple[str, ...]:
-        """Each real row's valid continuation, decoded on first access."""
+        """Each real row's valid continuation, decoded on first access.
+
+        Raises `ValueError` when the generation has no processor to decode with.
+        """
         if self.decoder is None:
             raise ValueError("this generation carries no processor to decode with")
         rows = self.host()
@@ -819,31 +824,35 @@ def generate(model: nn.Module, params: Variables,
              *, key: int | jax.Array | None = None,
              sampling: Sampling = _DEFAULT_SAMPLING, n: int = 1, logits: Transforms | None = None,
              stopping: Criteria | None = None, strategy: Strategy | None = None) -> Generation:
-    """Generate from numeric model inputs, with an array shorthand for text.
+    """Generate continuations from model inputs, or from token ids for a text-only prompt.
 
-    ModelInputs.token_fields["attention_mask"] identifies real tokens. Missing masks mean all
-    tokens are real. Every row must contain a real token. Prefill evaluates
-    conditioning once; decode reuses the model-owned cache and logical-position
-    state. Each cache compacts real input tokens and leaves paused rows intact.
+    ``params`` is the full variables dict, ``{'params': ...}``.
+    ``ModelInputs.token_fields["attention_mask"]`` marks the real tokens;
+    without a mask, every token is real. Every row must contain at least one
+    real token. Prefill evaluates the conditioning once, and decoding reuses
+    the cache and logical-position state the model keeps. Each cache
+    compacts the real input tokens and leaves paused rows unchanged.
 
-    Parameters keep their placement. On a mesh, rows split over its batch
-    axes and the result keeps that sharding; ``Generation.host()`` reads a
-    process's own rows back. All cooperating processes use the same input
-    shapes, effective decoding components, padding id and continuation count.
-    Decode loops have fixed bounds; any skipped blocks are globally agreed.
-    Keys fold in the global row index and response position, so a pool draws
-    what one process draws for the same rows.
+    Parameters keep their placement. On a mesh, the rows are split over its
+    batch axes and the result keeps that sharding; ``Generation.host()``
+    reads a process's own rows back. All cooperating processes must use the
+    same input shapes, effective decoding components, padding id and
+    continuation count. The decode loops have fixed bounds, and the
+    processes agree on any block they skip. Keys fold in the global row
+    index and response position, so a pool draws what one process draws for
+    the same rows.
 
-    ``n`` continuations of each prompt share its prefill and leave as ``n``
-    consecutive rows of every array, in prompt order. Continuation zero of a
-    prompt draws with that prompt's own key, so ``n=1`` and continuation zero
-    of any larger request are the same draw.
+    The ``n`` continuations of each prompt share its prefill and come back
+    as ``n`` consecutive rows of every array, in prompt order. Continuation
+    zero of a prompt draws with that prompt's own key, so ``n=1`` and
+    continuation zero of any larger request are the same draw.
 
-    ``logits`` is the whole transform chain, in the order it runs. Left as
-    ``None`` it is what ``sampling`` compiles to, and ``()`` runs no
-    transform. ``stopping`` adds criteria beside the policy's EOS one rather
-    than replacing it. ``strategy`` replaces the per-row draw loop; ``None``
-    uses ``Sample``.
+    ``logits`` is the whole transform chain, in the order it runs. ``None``
+    means the chain ``sampling`` compiles to, and ``()`` runs no transform.
+    ``stopping`` adds criteria beside the policy's EOS criterion and never
+    replaces it. ``strategy`` replaces the per-row draw loop; ``None`` uses
+    ``Sample``. A policy with ``stop`` strings raises ``ValueError``,
+    because ``generate`` has no tokenizer to compile them against.
     """
     if sampling.stop:
         raise ValueError("stop strings compile against a tokenizer's vocabulary, which generate does not "
