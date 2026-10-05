@@ -2,10 +2,10 @@
 
 Meng et al. 2023 ("On Distillation of Guided Diffusion Models", stage one)
 train a student ε_s(z_t, w) to match the teacher's classifier-free guided
-prediction at scale w, drawn per example: one student evaluation then
-stands for the teacher's two. FLUX.1 [dev] ships such a student, its
-guidance embedded beside the time; no training code is published for it,
-so this follows the paper's equation.
+prediction at a scale w drawn per example. One student evaluation then
+replaces the teacher's two. FLUX.1 [dev] ships such a student, with its
+guidance embedded beside the time. No training code is published for it, so
+this module follows the paper's equation.
 """
 
 from __future__ import annotations
@@ -28,31 +28,33 @@ from .objective import TEACHER, DiffusionObjective, _own_loss
 
 
 def with_guidance(conditions: dict, scale: jax.Array) -> dict:
-    """`conditions` with every conditioning record's guidance set to `scale`,
-    one value per row."""
+    """Return `conditions` with every conditioning record's guidance set to `scale`, one value per row."""
     return {keyword: replace(value, guidance=scale) if isinstance(value, DenoisingCondition) else value
             for keyword, value in conditions.items()}
 
 
 def guided_target(conditional: jax.Array, unconditional: jax.Array, scale: jax.Array) -> jax.Array:
-    """The teacher's guided raw output at a per-row scale,
-    unconditional + w (conditional - unconditional)."""
+    """Return the teacher's guided raw output at a per-row scale w.
+
+    The output is unconditional + w (conditional - unconditional).
+    """
     return unconditional + expand(scale, conditional) * (conditional - unconditional)
 
 
 @objectives("guidance_distillation")
 class GuidanceDistillationObjective(DiffusionObjective):
-    """Distill `teacher`'s classifier-free guidance into this model.
+    """Distills `teacher`'s classifier-free guidance into this model.
 
-    `teacher` is the teacher's objective and `teacher_variables` its whole
-    variables tree, held frozen under `TEACHER`; the teacher reads its own
-    conditioning of the batch, as its run trained on it. Each row draws a scale
-    uniformly from `scales`; the student reads it as its conditioning
-    record's `guidance` and regresses its raw output onto the teacher's
-    guided raw output at that scale, both on the same noised sample, under
-    the process's weighting. The two share the process and the data's
-    latent geometry, and the student's conditioning must carry a guidance
-    input, as a guidance-embedded Flux's does.
+    `teacher` is the teacher's objective, and `teacher_variables` is its whole
+    variables tree, held frozen under `TEACHER`. The teacher reads its own
+    conditioning of the batch, the conditioning its run trained on. Each row
+    draws a scale uniformly from `scales`. The student reads that scale as its
+    conditioning record's `guidance`, and regresses its raw output onto the
+    teacher's guided raw output at that scale, both on the same noised
+    sample, under the process's weighting. The two must share the process's
+    schedule and prediction and the data's latent geometry, and the student's
+    conditioning must have a guidance input, as a guidance-embedded Flux's
+    does.
     """
 
     def __init__(self, model: nn.Module, process: Process, inputs: InputSpec, *,
