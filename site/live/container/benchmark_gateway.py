@@ -73,6 +73,31 @@ def main():
                     f"assert not Path('/work/context').exists()\n"
                     f"__measurement = {model['id']!r}\n"
                     f"Path('/work/context').write_text(__measurement)")
+        for position, (identifier, client, _) in enumerate(kernels):
+            foreign = kernels[(position + 1) % len(kernels)][0]
+            execute(client,
+                "import errno, os, resource, socket\n"
+                "status = Path('/proc/self/status').read_text().splitlines()\n"
+                "assert all(line.split(':')[1].strip() == '0000000000000000' "
+                "for line in status if line.startswith('Cap'))\n"
+                "assert next(line for line in status if line.startswith('NoNewPrivs:')).split()[1] == '1'\n"
+                "try:\n socket.create_connection(('127.0.0.1', 8890), timeout=1)\n"
+                "except OSError:\n pass\nelse:\n raise AssertionError('guest reached gateway TCP')\n"
+                "try:\n bytearray(1024 * 1024 * 1024)\n"
+                "except MemoryError:\n pass\nelse:\n raise AssertionError('guest exceeded memory allowance')\n"
+                "try:\n resource.setrlimit(resource.RLIMIT_AS, (resource.RLIM_INFINITY, resource.RLIM_INFINITY))\n"
+                "except (PermissionError, ValueError):\n pass\n"
+                "else:\n raise AssertionError('guest raised hard memory limit')\n"
+                "try:\n pid = os.fork()\n"
+                "except PermissionError:\n pass\nelse:\n"
+                " if pid == 0: os._exit(0)\n os.waitpid(pid, 0)\n raise AssertionError('guest forked')")
+            if foreign != identifier:
+                execute(client,
+                    f"for path in ['/sessions/connections/kernel-{foreign}.json', "
+                    f"'/sessions/ipc/kernel-{foreign}/kernel-1']:\n"
+                    " try:\n  Path(path).read_bytes()\n"
+                    " except PermissionError:\n  pass\n"
+                    " else:\n  raise AssertionError('guest read another context')")
         submitted = time.perf_counter()
 
         def run(kernel, indices):
@@ -102,7 +127,7 @@ def main():
             rows = [row for future in futures for row in future.result()]
         assert len({row["uid"] for row in rows}) == len(kernels)
         memory = {row["uid"]: row["pss_bytes"] for row in rows}
-        print(json.dumps({"requests": args.count, "contexts": len(kernels), "state_isolation": True,
+        print(json.dumps({"requests": args.count, "contexts": len(kernels), "state_isolation": True, "sandbox_checks": True,
                           "startup_seconds": [kernel[2] for kernel in kernels], "kernel_pss_bytes": memory,
                           "kernel_fd_counts": {row["uid"]: row["fds"] for row in rows},
                           "median_execute_seconds": statistics.median(row["execute_seconds"] for row in rows),
