@@ -727,6 +727,22 @@
     }
    ]
   },
+  "hf/deepseek-v4-dspark-tiny": {
+   "tool": "tools/deepseek_v4_dspark_reference.py",
+   "sources": [
+    {
+     "repo": "deepseek-ai/DeepSeek-V4-Flash-0731",
+     "version": "7872f01b1d1fe23eabc4c98b48bffcef5a386062",
+     "runs": "fetched"
+    },
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.16.1",
+     "runs": "transformers"
+    }
+   ],
+   "note": "The release's inference/model.py over the V4.1 tool's kernel stand-ins with the quantizers and the indexer's rotation off for DSpark's drafts, transformers for the trunk's logits; both in float64 for reference_f64.npz (tools/deepseek_v4_dspark_reference.py:1)."
+  },
   "hf/deepseek-v4-tiny/logits.npy": {
    "tool": "tools/hf_reference_b.py",
    "sources": [
