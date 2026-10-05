@@ -30,6 +30,7 @@ from typing import Any
 
 import jax
 import numpy as np
+from huggingface_hub.errors import OfflineModeIsEnabled
 from PIL import Image
 
 # Stable Diffusion's VAE latents (sd-vae-ft-mse, as the model is trained on)
@@ -135,7 +136,12 @@ class ReportingModels:
         key = (name, revision)
         if key not in self.loaded:
             _show({"stage": "load", "model": name})
-            loaded = self.load(name) if revision is None else self.load(name, revision=revision)
+            try:
+                loaded = self.load(name) if revision is None else self.load(name, revision=revision)
+            except OfflineModeIsEnabled:
+                if any(model == name and version != revision for model, version in self.loaded):
+                    raise ValueError("This page was updated. Reload it to use the current model.") from None
+                raise
             self.loaded[key] = self.wrap(loaded)
         return self.loaded[key]
 
