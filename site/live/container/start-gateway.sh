@@ -21,3 +21,26 @@ nohup env JUPYTER_RUNTIME_DIR=/run/dew/gateway PYTHONPATH=/opt/live /opt/venv/bi
   --KernelGatewayApp.ip=127.0.0.1 --KernelGatewayApp.port=8890 \
   --KernelGatewayApp.max_kernels=8 \
   > /run/dew/gateway.log 2>&1 </dev/null &
+/opt/venv/bin/python - <<'PY'
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+token = Path('/run/dew/gateway-token').read_text()
+request = urllib.request.Request('http://127.0.0.1:8890/api/kernels',
+                                 headers={'Authorization': 'token ' + token})
+deadline = time.monotonic() + 30
+while True:
+    try:
+        with urllib.request.urlopen(request, timeout=1) as response:
+            if response.status != 200:
+                raise RuntimeError('Kernel Gateway did not accept the administrative token')
+        break
+    except urllib.error.HTTPError:
+        raise
+    except (urllib.error.URLError, TimeoutError):
+        if time.monotonic() >= deadline:
+            raise TimeoutError('Kernel Gateway did not listen within 30 seconds') from None
+        time.sleep(0.1)
+PY
