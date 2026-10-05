@@ -57,10 +57,39 @@ def source_alias(tensors: Mapping[str, np.ndarray], owners: dict[tuple[str, ...]
         raise ValueError(f"Two different source tensors {previous!r} and {name!r} map to {path}")
 
 
+_TILE = 64
+"""The side of the squares `swapped` copies: a 64x64 block of float32 is
+16 KiB, so a block and its transpose stay in a core's cache."""
+
+
+def swapped(values: np.ndarray) -> np.ndarray:
+    """`values` with its last two axes swapped, C-ordered.
+
+    numpy copies a whole transposed matrix with one strided pass, which
+    misses the cache on every element: 0.39 GiB/s for a 10240x4096 float32
+    kernel, where a contiguous copy runs at 9.7. Square tiles small enough
+    for the cache copy at 3.5 GiB/s."""
+    *lead, rows, columns = values.shape
+    if values.size == 0:
+        return np.empty((*lead, columns, rows), values.dtype)
+    flat = np.ascontiguousarray(values).reshape(-1, rows, columns)
+    out = np.empty((flat.shape[0], columns, rows), values.dtype)
+    for row in range(0, rows, _TILE):
+        for column in range(0, columns, _TILE):
+            out[:, column:column + _TILE, row:row + _TILE] = (
+                flat[:, row:row + _TILE, column:column + _TILE].swapaxes(-1, -2))
+    return out.reshape(*lead, columns, rows)
+
+
 def _copy(stored: np.ndarray, dtype: np.dtype, order: tuple[int, ...] | None) -> np.ndarray:
-    """Cast in contiguous source order before copying the native layout."""
+    """Cast in contiguous source order before copying the native layout, a
+    swap of the last two axes (every linear kernel) in tiles (`swapped`)."""
     leaf = stored.astype(dtype, copy=False)
-    return leaf if order is None else np.ascontiguousarray(leaf.transpose(order))
+    if order is None:
+        return leaf
+    if order == (*range(leaf.ndim - 2), leaf.ndim - 1, leaf.ndim - 2):
+        return swapped(leaf)
+    return np.ascontiguousarray(leaf.transpose(order))
 
 
 def _leaves[LeafT](tensors: Mapping[str, np.ndarray], path_of: TensorPath, param_dtype: str,
