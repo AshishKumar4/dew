@@ -1,14 +1,14 @@
 """Train MDLM on real byte-tokenized text, then unmask a sample.
 
-Prepare WikiText or TinyStories with `dew tokenize`:
+Prepare WikiText or TinyStories with the existing tokenizer tool:
 
     dew tokenize --input data/wikitext.txt --out data/wikitext --tokenizer byte
     python examples/train_masked_lm.py --tokens data/wikitext --steps 2000
     python examples/train_masked_lm.py --tokens data/wikitext --smoke --out runs/mdlm-smoke
 
-The mask occupies an extra vocabulary entry outside the corpus's byte IDs.
-`--smoke` reduces the model size and step count but still reads your supplied
-corpus. The sample checks the workflow; it does not establish language quality.
+The mask is an extra vocabulary entry, not a byte the corpus can contain.
+`--smoke` makes the model and run small; it still reads the supplied real
+corpus. Its sample demonstrates the workflow, not language quality.
 """
 
 import json
