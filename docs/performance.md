@@ -1039,8 +1039,8 @@ HLO gives 40.5% of peak, as reported in `docs/benchmarks.md`.
 
 ## Muon against AdamW at equal tokens
 
-These are the only CPU rows in this file. They compare optimizers at equal
-token budgets. Accelerator speed is not measured. One workstation CPU
+These CPU runs compare optimizers at equal token budgets. Accelerator
+speed is not measured. One workstation CPU
 can finish nine of these small runs in under an hour.
 
 ```
@@ -1272,10 +1272,12 @@ remaining idle time comes from the traced client's own keys. Each trace
 covers one measured 64-slot run of the benchmark's prompts under
 `dew.Profiler`, summing idle time between kernels.
 
-Several decode iterations a device call (`decode_steps`), measured after
-that change, 2026-10-03: slower at every slot count, and with nothing left
-to gain. Tokens a second, RTX 4080, admission 8 rows, medians of five runs,
-vLLM from the table above:
+Several decode iterations per device call (`decode_steps`), measured after
+that change, 2026-10-03. More iterations slow the run at every slot count
+except 64 slots with two iterations, which reaches 7271 tokens a second
+against 7216 with one. The table gives tokens a second on the RTX 4080,
+with admission 8 rows and medians of five runs. vLLM rates come from
+the table above:
 
 | slots | vLLM | 1 | 2 | 4 | 8 |
 |---:|---:|---:|---:|---:|---:|
@@ -1451,14 +1453,16 @@ Served tokens and log-probabilities are bitwise equal at 32, 64 and
 
 ### Open loop, 2026-10-04
 
-The table above submits every request at once and keeps the slots full,
-which no user's traffic does. `tools/benchmark_lm_serving.py --rate` sends
-six times the slots in requests as a Poisson process at each rate (seeded
-per slot count) to a server that queues them; TTFT runs from a request's
-arrival and the token gaps are per token, each decoding row's time between
-consecutive tokens. Qwen3-0.6B, the same prompts and outputs, the RTX 4080
-on a quiet host, Dew at integration `420ea2c1`, then with bucketed admission
-in the same session as vLLM 0.30.0:
+The closed-loop table above submits every request at once and keeps slots
+full. In open loop, `tools/benchmark_lm_serving.py --rate` sends requests
+over time as a Poisson process at each rate, seeded per slot count.
+It sends six times as many requests as slots to a server that queues
+them. Time to first token (TTFT) starts at request arrival. Token gaps
+measure the time between consecutive tokens for each decoding row.
+
+This run uses Qwen3-0.6B, the same prompts and outputs, and the RTX 4080
+on a quiet host. Dew ran at integration `420ea2c1`, then with bucketed
+admission in the same session as vLLM 0.30.0:
 
 | slots | rate | Dew `420ea2c1` tok/s, TTFT p50 / p99, gap p99 (ms) | Dew bucketed | vLLM |
 |---:|---:|---|---|---|
@@ -1472,49 +1476,55 @@ in the same session as vLLM 0.30.0:
 | 128 | 44 | 5068, 1140 / 1989, 64.2 | 5701, 26.8 / 43.2, 18.6 | 5756, 20.2 / 32.4, 11.7 |
 | 128 | 56 | 5320, 2217 / 4449, 83.5 | 7064, 34.6 / 55.0, 23.4 | 7090, 35.8 / 57.2, 22.4 |
 
-The admitting program prefilled every row of its admission, so a request
-arriving alone was padded to eight prompts of prefill. Those admitting
-steps were the token gaps' p99, 28 to 94 ms, and they cut the server's
-capacity until its queue grew without bound at rates vLLM served with a
-TTFT p50 under 40 ms.
-Each admitting step is now padded only to the smallest power of two that
-holds its prompts (`dew.inference.serving.admission_share`), each width its
-own compiled program. The closed-loop runs are unchanged: an admission that
-fills its width is the same program, and the 32-, 64- and 128-slot
-generations are bitwise. With buckets Dew is level with vLLM at 32 slots,
-with shorter TTFT tails. At 64 and 128 slots its token gaps run 1.4 to 2
-times vLLM's at p99, and at 64 slots and 48 requests a second it sits at its
-capacity: a traced run had the device 97% busy, and that cell's TTFT swings
-between runs (p50 21 to 447 ms). The gap is in the admitting step. Dew
-prefills an arriving prompt in a forward of its own beside the decode
-forward, 9.9 ms against a 5.1 ms decode step for one 256-token prompt at 64
-slots, so the weights are read twice. vLLM's chunked prefill puts the
-prompt's tokens into the decode forward's batch.
+The admission program prefilled every row, padding a lone request to
+eight prompts. Admission steps set the token-gap p99 at 28 to 94 ms.
+They reduced server capacity until the queue grew without bound at
+rates where vLLM kept TTFT p50 under 40 ms.
 
-A narrower prefill runs its GEMMs at other shapes, so a request admitted in
-a narrower bucket than the padded eight can draw other bits: served one at
-a time at 32 slots, 6 of 16 Qwen3-0.6B rows and 8 of 16 Qwen3-1.7B rows
-part from the padded path, each at a bf16 near-tie (teacher-forced in fp32,
-a median 0.5 bf16 spacings apart, at most 1.81, the fp32 argmax the padded
-choice in 7 rows and the bucketed one in 7). Under tests/reference_error.py's
-rule the 1-, 2- and 4-row prefills' RMS distance from the same weights in
-fp32 is 0.96, 0.95 and 0.95 times the 8-row prefill's on Qwen3-0.6B's
-log-probabilities (1.00, 1.00 and 0.99 on the logits) and 1.02, 1.00
-(bitwise) and 1.08 on Qwen3-1.7B's (1.02, 1.00 and 1.07), against an
-allowed 2.
+Each admission step now pads to the smallest power of two that fits
+its prompts (`dew.inference.serving.admission_share`). Each width has its
+own compiled program. Closed-loop runs are unchanged because an admission
+that fills its width uses the same program. Generations at 32, 64 and
+128 slots are bitwise equal.
 
-The mixed admitting step, 2026-10-04. An admitting step now runs one
-forward over every token it holds: each slot's last draw, then the admitted
-prompts, laid out in one row (`dew.nn.inputs.Admitted`). Projections, norms,
-the MLP and the head work token by token, so they read their weights once for
-the decoding rows and the prompts together. Attention writes every token's
-keys into its row of the cache in one scatter. Each decoding row's query
-then reads its row as a decode step does, and a prompt that starts its row
-reads its own keys. The decode-only program is untouched: its optimized
-HLO is identical to integration's and its device time per run equal (2540.4
-against 2540.0 ms at 128 slots). Same session, quiet host, Dew at
-integration `ab5966b1` (bucketed admission) and with the mixed step, and
-vLLM 0.30.0:
+With buckets, Dew matches vLLM at 32 slots and has shorter TTFT tails.
+At 64 and 128 slots, Dew's token-gap p99 is 1.4 to 2 times vLLM's.
+At 64 slots and 48 requests a second, Dew reaches capacity: a traced
+run was 97% device busy, and TTFT p50 varies from 21 to 447 ms
+between runs. Admission accounts for the gap. Dew prefills an arriving
+prompt in a separate forward alongside decoding, reading the weights twice.
+With one 256-token prompt at 64 slots, admission takes 9.9 ms against
+5.1 ms for a decode step. vLLM's chunked prefill puts prompt tokens in
+the decode forward's batch.
+
+A narrower prefill changes GEMM shapes, so admitting fewer than the padded
+eight prompts can change the drawn bits. Serving one request at a time
+at 32 slots, 6 of 16 Qwen3-0.6B rows and 8 of 16 Qwen3-1.7B rows
+diverge from the padded path at bf16 near-ties. Teacher-forced in fp32,
+the chosen logits are a median 0.5 bf16 spacings apart, at most 1.81.
+FP32 argmax matches the padded choice in 7 rows and the bucketed choice
+in 7.
+
+Under tests/reference_error.py's rule, the 1-, 2- and 4-row prefills'
+RMS distances from the same weights in fp32 are 0.96, 0.95 and 0.95
+times the 8-row prefill's on Qwen3-0.6B log-probabilities. The logits'
+ratios are 1.00, 1.00 and 0.99. For Qwen3-1.7B, log-probability ratios
+are 1.02, 1.00 (bitwise) and 1.08, and logits ratios are 1.02, 1.00
+and 1.07. The allowed ratio is 2.
+
+The mixed admitting step, 2026-10-04. Admission now runs one forward over
+each slot's last draw and the admitted prompts, arranged in one row
+(`dew.nn.inputs.Admitted`). Projections, norms, MLP and head work token by
+token. They read weights once for decoding rows and prompts together.
+Attention scatters every token's keys into its cache row in one call.
+Decoding queries read their cache rows as in a decode step. Prompts that
+start a row read their own keys.
+
+The decode-only program is unchanged. Its optimized HLO is identical to
+integration's, and device time per run matches (2540.4 against 2540.0 ms
+at 128 slots). This session compared Dew at integration `ab5966b1`
+(bucketed admission), Dew with the mixed step, and vLLM 0.30.0 on a
+quiet host:
 
 | slots | rate | Dew `ab5966b1` TTFT p50 / p99, gap p99 (ms) | Dew mixed | vLLM |
 |---:|---:|---|---|---|
@@ -1528,39 +1538,45 @@ vLLM 0.30.0:
 | 128 | 44 | 26.3 / 42.3, 17.1 | 23.9 / 39.7, 15.9 | 24.6 / 79.2, 25.1 |
 | 128 | 56 | 34.7 / 55.4, 23.1 | 31.2 / 50.5, 22.5 | 38.4 / 64.6, 23.0 |
 
-The three serve the same tokens a second at every rate, within 0.8%. With
-the mixed step Dew's median TTFT is the shortest of the three in 8 of 9
-cells, and at 64 and 128 slots its p99 TTFT and token gap are at or below
-vLLM's from 36 requests a second up. At 32 slots vLLM keeps the shorter
-token-gap tails, by 0.4 to 2.8 ms at p99, and the shorter TTFT p99 at the
-two lower rates. (The 64-slot, 48-a-second cell that saturated in
-the earlier session did not here; that rate sits near the server's
-capacity.) Closed loop, three repeats in two alternating rounds: 32 slots
-5929 to 5994 tokens a second, 64 slots 7673 to 7766, 128 slots 9039 to
-9033-9072. Traced at 128 slots, the admitting program took 1068 against
-1078 ms a run: GEMMs 671 against 676, attention 253 against 252.
+All three serve the same tokens a second at every rate, within 0.8%.
+With the mixed step, Dew has the shortest median TTFT in 8 of 9 cells.
+At 64 and 128 slots, its p99 TTFT and token gap are at or below
+vLLM's from 36 requests a second up. At 32 slots, vLLM's token-gap p99
+is shorter by 0.4 to 2.8 ms. vLLM also has shorter TTFT p99 at the
+two lower rates. The 64-slot cell at 48 requests a second saturated
+in the earlier session but not here; this rate is near server capacity.
 
-The mixed step is not bitwise to the two forwards: its GEMMs run at other
-shapes. Against the same bf16 weights computed in fp32 at the highest
-precision, over 28 decoding rows and four admitted prompts of 64 to 256
-tokens, its RMS distance is 0.84 times the two forwards' on Qwen3-0.6B's
-decoding logits and 0.97 on its prompt logits (log-probabilities 0.83 and
-0.95), and 1.09 and 0.99 on Qwen3-1.7B's (1.14 and 0.98), against
-tests/reference_error.py's allowed 2. At 32 slots 27 of 64 greedy rows part
-from integration's, all at bf16 near-ties (a median 0.57 bf16 spacings in
-fp32, at most 1.44; fp32's argmax is the two-forward choice in 16 rows and
-the mixed one in 11).
+In closed loop, three repeats in two alternating rounds gave 5929 to
+5994 tokens a second at 32 slots, 7673 to 7766 at 64, and 9039 to
+9033-9072 at 128. Traced at 128 slots, the admission program took 1068
+against 1078 ms per run: GEMMs 671 against 676, attention 253 against
+252.
 
-Over a paged cache, 2026-10-04. The mixed step now runs over a page pool
-too: the admitted rows' tables go into the cache before the step writes, each
-token lands in its row's page, and the decoding rows read the pool through
-cuDNN's paged kernel as a decode step does. Pieces that continue a row (a
-chunked prompt, a shared prefix's pages) read the row's earlier keys from
-the pool; a server with neither has its pieces read only their own keys. A dense
-cache takes chunked prefill the same way (`chunk`), which only the mixed
-step serves. The paged decode-only programs are identical to integration's.
-Same session, two alternating rounds at integration `ab60614a`, the second
-round (the first ran under another lane's load):
+The mixed step changes GEMM shapes, so it is not bitwise equal to two
+separate forwards. Reference checks compute the same bf16 weights in fp32
+at the highest precision, over 28 decoding rows and four admitted prompts
+of 64 to 256 tokens. RMS distance is 0.84 times the two forwards' for
+Qwen3-0.6B decoding logits and 0.97 for prompt logits. Log-probability
+ratios are 0.83 and 0.95. On Qwen3-1.7B, the logits ratios are 1.09
+and 0.99, and log-probability ratios are 1.14 and 0.98. The allowed
+ratio in tests/reference_error.py is 2.
+
+At 32 slots, 27 of 64 greedy rows diverge from integration's, all at
+bf16 near-ties. In fp32, the chosen logits are a median 0.57 bf16
+spacings apart, at most 1.44. FP32 argmax matches the two-forward choice
+in 16 rows and the mixed choice in 11.
+
+Over a paged cache, 2026-10-04. The mixed step also runs over a page
+pool. It installs admitted rows' tables before writing each token to
+its row's page. Decoding rows read the pool through cuDNN's paged kernel,
+as in a decode step. A chunked prompt or shared prefix reads the row's
+earlier keys from the pool. Without either, each piece reads only its
+own keys. Dense caches support chunked prefill the same way (`chunk`);
+only the mixed step serves it.
+
+Paged decode-only programs are identical to integration's. Two alternating
+rounds ran in one session at integration `ab60614a`. The table gives the
+second round; the first ran under another lane's load:
 
 | slots | rate | paged, two forwards: TTFT p50 / p99, gap p99 (ms) | paged, mixed |
 |---:|---:|---|---|
@@ -1571,24 +1587,23 @@ round (the first ran under another lane's load):
 | 128 | 44 | 42.9 / 63.7, 26.3 | 41.0 / 61.0, 25.7 |
 | 128 | 56 | 50.6 / 231.3, 26.3 | 44.8 / 161.7, 25.8 |
 
-Closed loop the mixed step went from 5576-5577 to 5583-5656 tokens a
-second at 32 slots and from 8254-8274 to 8330-8334 at 128. A traced
-32-slot run at 24 requests a second put a one-row admitting step at 8.30
-against 9.22 ms. The paged decode step itself is slower than the dense one
-(at 128 slots and 32 requests a second a token gap's p50 is 11.7 ms paged
-against 5.4 dense), so a dense cache stays
-the faster way to serve where the memory fits. The served tokens part from
-the two forwards' as the dense cache's do: the same 27 of 64 rows at 32
-slots, all at bf16 near-ties.
+In closed loop, the mixed step increased throughput from 5576-5577 to
+5583-5656 tokens a second at 32 slots and from 8254-8274 to 8330-8334
+at 128. A traced 32-slot run at 24 requests a second measured one-row
+admission at 8.30 against 9.22 ms. Paged decoding is slower than dense:
+at 128 slots and 32 requests a second, token-gap p50 is 11.7 ms paged
+against 5.4 dense. Use a dense cache for speed when it fits in memory.
+Served tokens diverge from the two forwards in the same 27 of 64 rows
+at 32 slots as with a dense cache, all at bf16 near-ties.
 
-Under `--xla_gpu_deterministic_ops` (the CUDA test lane's flag) the paged
-write, a scatter into the pool's page and offset axes past an unindexed
-head axis, put a dropped token's keys at another head's kept slot (jax
-0.11.2, an RTX 4080): the expander's out-of-range rows were padded with 0
-on the unindexed axis, so a window offset along it collided with a kept
-index. openxla/xla#49498 fixes it (issue #49380), after the jax pin. Mapped
-over a group of one, as the paged cache's other write is, the scatter is
-right, so `KVStore.write_tokens` writes that way.
+Under `--xla_gpu_deterministic_ops`, the CUDA test lane's flag, a paged write
+put a dropped token's keys in another head's kept slot (jax 0.11.2,
+RTX 4080). The write scatters into page and offset axes past an unindexed
+head axis. The expander padded out-of-range rows with 0 on that unindexed
+axis, so a window offset collided with a kept index. openxla/xla#49498
+fixes this (issue #49380), after the jax pin. Mapping over a group of
+one makes the scatter correct, as in the paged cache's other write.
+`KVStore.write_tokens` uses that form.
 
 Open: latent attention (MLA, DSA), sliding windows, sinks, quantized or
 rotated caches, a pool split into groups, hybrids whose recurrent layers
@@ -1598,17 +1613,19 @@ forwards; a server names which (`Server.mixed_refusal`, logged at build).
 ## Quantized serving of the 176M text-to-image model, 2026-09-28
 
 `TextToImage.quantized` serves the denoiser with its kernels stored as int8
-or fp8 values and their scales, through Qwix's post-training quantization
+or fp8 values and scales, using Qwix's post-training quantization
 (`dew.training.quantization.quantize_for_serving`). `int8` and `fp8`
-quantize weights and activations, so a matmul of two quantized operands runs
-in the quantized dtype; `int8w` and `fp8w` quantize weights only and
-dequantize them into the compute dtype. The model is dewml/hybrid-dit-176m.
-Each row is one process of `tools/benchmark_quantized_serving.py`: forward
-is the warm guided denoiser call over 12 prompts (batch 24, median of 5),
-sample is the warm wall time of 12 images with 20 DPM-Solver++(2M) steps at
-guidance 5 including text encoding and decoding, CLIP is the mean ViT-L/14
-cosine over 12 prompts at seeds 0 and 1, and memory is the denoiser's weight
-bytes and the compiled forward's temporaries, in MiB.
+quantize weights and activations. A matmul of two quantized operands runs
+in the quantized dtype. `int8w` and `fp8w` quantize weights only, then
+dequantize to the compute dtype. The model is dewml/hybrid-dit-176m.
+
+Each row runs in one process of `tools/benchmark_quantized_serving.py`.
+Forward time measures a warm guided denoiser call over 12 prompts
+(batch 24, median of 5). Sample time is warm wall time for 12 images
+with 20 DPM-Solver++(2M) steps at guidance 5, including text encoding and
+decoding. CLIP is mean ViT-L/14 cosine over 12 prompts at seeds 0 and
+1. Memory reports denoiser weight bytes and compiled-forward temporaries
+in MiB.
 
 RTX 4080 16 GiB, jax 0.11.2, Qwix 0.1.8:
 
@@ -1625,12 +1642,12 @@ RTX 4080 16 GiB, jax 0.11.2, Qwix 0.1.8:
 | bf16 | int8, fusion in bf16 | 28.3 | 0.72 | 0.2490 | 183 | 108 |
 | bf16 | fp8, fusion in bf16 | 28.3 | 0.78 | 0.2464 | 183 | 106 |
 
-Weight-only quantization saves memory, not time: the kernels take 27% of
-their fp32 bytes and the forward runs as fast as the unquantized one in the
-same compute dtype. Weights and activations in int8 or fp8 take 21% off the
-bf16 forward's time (28.3 ms against 36.0) and 35% to 39% off the fp32
-one's (34.7 and 32.5 ms against 53.3). Every
-quantized row keeps CLIP within 0.002 of fp32.
+Weight-only quantization reduces kernel storage to 27% of fp32 bytes.
+Forward time matches the unquantized model in the same compute dtype.
+Quantizing weights and activations to int8 or fp8 reduces bf16 forward
+time by 21% (28.3 ms against 36.0). It reduces fp32 forward time by
+35% to 39% (34.7 and 32.5 ms against 53.3). Every quantized row keeps
+CLIP within 0.002 of fp32.
 
 The RTX 4080's bf16 rows with quantized activations were measured before
 serving scaled the product of two quantized operands in float32 (below). On
@@ -1654,10 +1671,11 @@ fp8 activations are from 2026-09-30, the rest from 2026-09-28:
 | bf16 | int8, fusion in bf16 | 28.4 | 1.90 | 0.2484 | 183 | 118 |
 | bf16 | fp8, fusion in bf16 | 31.7 | 2.05 | 0.2467 | 183 | 171 |
 
-On the A100 quantizing saves memory and no time. With weights and
-activations quantized the forward is slower than unquantized in the same
-compute dtype: 28.4 ms in bf16 int8 against 25.0, 30.3 ms in fp32 int8
-against 27.5, and slower again in fp8, which the A100 has no units for.
+On the A100, quantization saves memory without reducing time. Quantizing
+weights and activations makes forward slower than the unquantized model
+in the same compute dtype: 28.4 ms in bf16 int8 against 25.0, and
+30.3 ms in fp32 int8 against 27.5. FP8 is slower still because the
+A100 has no fp8 units.
 Every quantized row keeps CLIP within 0.0025 of fp32.
 
 TPU v6e, one chip on Colab, jax 0.11.2, libtpu 0.0.48, Qwix 0.1.8. The bf16
@@ -1681,25 +1699,28 @@ rows without a weight-only precision are from 2026-09-30, the rest from
 | bf16 | int8, fusion in bf16 | 6.3 | 28.40 | 0.2521 | 183 | 50 |
 | bf16 | fp8, fusion in bf16 | 9.3 | 28.56 | 0.2443 | 183 | 50 |
 
-On the v6e int8 weights and activations halve the fp32 forward (7.1 ms
-against 13.7) with the depthwise convolutions quantized too; with them in
-fp32 the forward takes 14.9 ms. In bf16 the weight-only rows run in the
-unquantized forward's time (5.2 and 5.6 ms against 5.7), and with activations
-quantized the forward is slower (6.3 to 9.8 ms). Sampling takes 28
-to 31 s in every row, whatever the forward's time, so on this machine
-something other than the denoiser's 20 steps sets it; this section does not
-break it down. Every quantized row keeps CLIP within 0.005 of fp32.
+On the v6e, int8 weights and activations halve fp32 forward time
+(7.1 ms against 13.7) when depthwise convolutions are also quantized.
+Keeping those convolutions in fp32 gives 14.9 ms. In bf16, weight-only
+times match the unquantized forward (5.2 and 5.6 ms against 5.7).
+Quantizing activations makes it slower (6.3 to 9.8 ms).
 
-Before serving scaled the product of two quantized operands in float32,
-every bf16 row with int8 or fp8 activations sampled NaN images on the v6e
-(CLIP 0.1481, with the depthwise convolutions quantized or not). Qwix 0.1.8
-scales that product in the scales' dtype, bf16 in a bf16 model. In plain
-JAX on the v6e, an int8 depthwise convolution whose int32 product is scaled
-in bf16 came out NaN in all but a few outputs, while the model's dense and
-attention forms scaled the same way stayed finite. In the served model the
-NaN began in the depthwise convolutions in int8 and in an attention block in
-fp8. Scaled in float32, the bf16 model's 8-bit operations have the result
-types of the fp32 model's, and it samples as above.
+Sampling takes 28 to 31 s in every row regardless of forward time.
+Something outside the denoiser's 20 steps limits this machine; these
+measurements do not break down that cost. Every quantized row keeps
+CLIP within 0.005 of fp32.
+
+Before serving scaled quantized products in float32, every bf16 row with
+int8 or fp8 activations sampled NaN images on the v6e. CLIP was 0.1481,
+whether depthwise convolutions were quantized or not. Qwix 0.1.8 scales
+the product of two quantized operands in the scales' dtype, which is
+bf16 for a bf16 model. In plain JAX on the v6e, scaling an int8
+depthwise convolution's int32 product in bf16 produced NaN in almost
+all outputs. The model's dense and attention forms stayed finite with
+the same scaling. In the served model, NaN first appeared in int8
+depthwise convolutions and in an fp8 attention block. Scaling in float32
+gives the bf16 model's 8-bit operations the fp32 model's result types,
+and it samples as shown above.
 
 XLA:CPU, 12 threads of a Colab L4 host, jax 0.11.2, Qwix 0.1.8, latents
 decoded two at a time (`--decode-batch 2`). The bf16 int8 row is from
@@ -1714,23 +1735,24 @@ decoded two at a time (`--decode-batch 2`). The bf16 int8 row is from
 | bf16 | int8w | 5550 | 123.50 | 0.2494 | 183 | 584 |
 | bf16 | int8 | 10550 | 224.61 | 0.2497 | 182 | 152 |
 
-On XLA:CPU int8 weights and activations double the forward's time (9.8 s
-against 4.9 in fp32) and weight-only int8 leaves it as it was. Every
+On XLA:CPU, int8 weights and activations double forward time (9.8 s
+against 4.9 in fp32). Weight-only int8 leaves it unchanged. Every
 quantized row keeps CLIP within 0.0025 of fp32.
 
-On a GPU, Dew refuses to quantize the activations of a grouped
-convolution, so the GPU rows with quantized activations keep the spatial
-fusion's depthwise convolutions in float (`--float spatial_fusion`), and
-`TextToImage.quantized` raises without it. XLA:GPU (jax 0.11.2) computes
-those convolutions wrongly or not at all. On the RTX 4080, an int8
-convolution with one or two input channels per group returns wrong values
-without an error: before the refusal, the whole-model int8 row ran in 42.3
-ms and scored CLIP 0.1391. In fp8 the same convolutions fail to compile
-there (`Failed to get configs for: 36 out of 126 instructions`, one per
-depthwise convolution). On the A100 the whole-model int8 row scored CLIP
-0.1373 in fp32 and failed to compile in bf16 (`UNIMPLEMENTED`). fp8
-computed on the A100 (CLIP 0.2443 in fp32), but Dew refuses it there too,
-with the rest of the GPUs.
+On GPU, Dew refuses to quantize grouped-convolution activations. These
+GPU rows therefore keep spatial-fusion depthwise convolutions in float
+with `--float spatial_fusion`; `TextToImage.quantized` raises without it.
+XLA:GPU at jax 0.11.2 computes these convolutions incorrectly or fails
+to compile them.
+
+On the RTX 4080, int8 convolutions with one or two input channels per
+group return wrong values without errors. Before Dew refused them,
+whole-model int8 took 42.3 ms and scored CLIP 0.1391. In fp8, the same
+convolutions fail to compile there (`Failed to get configs for: 36 out of 126 instructions`,
+one per depthwise convolution). On the A100, whole-model int8 scored
+CLIP 0.1373 in fp32 and failed to compile in bf16 (`UNIMPLEMENTED`).
+FP8 ran on the A100, scoring CLIP 0.2443 in fp32, but Dew refuses
+it there as on every other GPU.
 
 ## Kernel choices per generation, 2026-09-22
 
