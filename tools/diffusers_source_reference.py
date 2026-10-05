@@ -59,6 +59,7 @@ for _name, _value in (("FLAX_WEIGHTS_NAME", "flax_model.msgpack"),
 
 import jax
 import jax.numpy as jnp
+from diffusers_wan_reference import float64_scheduler
 from diffusers.schedulers import (
     scheduling_ddim, scheduling_ddpm, scheduling_deis_multistep,
     scheduling_dpmsolver_multistep, scheduling_dpmsolver_sde,
@@ -392,38 +393,6 @@ def grid_times(scheduler, case: Case) -> np.ndarray:
     if case.scheduler in TWO_STAGE:
         return np.concatenate([times[:1], times[2::2]])
     return times
-
-
-class Float64Library:
-    """A scheduler module's explicit float32 constructors and casts widened."""
-
-    def __init__(self, library):
-        self.library = library
-
-    def __getattr__(self, name):
-        return getattr(self.library, "float64" if name == "float32" else name)
-
-
-@contextlib.contextmanager
-def float64_scheduler(module: ModuleType):
-    """Evaluate the published formulas in float64, including table creation.
-
-    Casting already-built tables would retain their float32 cumprod and
-    interpolation errors. Some step methods also explicitly upcast a sample
-    to float32; that minimum precision must become float64 for this oracle.
-    Only this scheduler module sees the widened libraries, and the default
-    dtype is restored before the native float32 reference runs.
-    """
-    previous = torch.get_default_dtype()
-    try:
-        torch.set_default_dtype(torch.float64)
-        with contextlib.ExitStack() as scope:
-            for name, library in (("torch", torch), ("np", np)):
-                if hasattr(module, name):
-                    scope.enter_context(patch.object(module, name, Float64Library(library)))
-            yield
-    finally:
-        torch.set_default_dtype(previous)
 
 
 class ReplayBrownian:

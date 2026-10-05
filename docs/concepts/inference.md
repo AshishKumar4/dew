@@ -234,6 +234,33 @@ A pixel mask has shape `[B, H, W, 1]`. Its masked-image conditions go to both gu
 
 `initial=` is a latent state that is already noisy, and Dew never adds noise to it again. Prepared inputs keep their process and concrete time grid. `task(prepared, key=..., decode=False)` skips the VAE and the image checker and returns unclipped `result.latents`, with `result.images` set to `None`. For a base and refiner handoff, pass those latents as another task's `initial` with the matching partial grid. Normal calls return both the decoded images and the latents before decoding. Prepared inputs must belong to the task's mesh. A preparation on the source grid also records its step count; to change the count, prepare a new initial state.
 
+Diffusers' `strength`, `denoising_end` and `denoising_start` are such a choice of grid. `strength=s` over `steps` starts at the point Diffusers' `get_timesteps` starts. `denoising_end=f` on a base and `denoising_start=f` on its refiner split the grid where the model time falls below `round(T * (1 - f))`, `T` being the scheduler's `num_train_timesteps`. The base walks to that point and stops there, and the refiner starts from it (`tests/test_native_diffusion.py` holds both against Diffusers' own pipelines):
+
+<!-- not run: needs an SDXL base and refiner -->
+```python
+import dataclasses
+
+import jax.numpy as jnp
+import numpy as np
+
+process, times = task.prepared_process(steps)
+img2img = task.prepare(prompts, key=key, steps=steps, image=pixels,
+                       times=times[steps - int(steps * strength):])
+
+def split(task):
+    process, times = task.prepared_process(steps)
+    model_times = np.asarray(process.sampler_schedule.model_time(jnp.asarray(times[:-1])))
+    return times, int(np.flatnonzero(model_times < round(T * (1 - f)))[0])
+
+times, cut = split(base)
+first = dataclasses.replace(base, final_denoise=False)
+latents = first(first.prepare(prompts, key=key, steps=steps, times=times[:cut + 1]),
+                key=key, decode=False).latents
+times, cut = split(refiner)
+images = refiner(refiner.prepare(prompts, key=key, steps=steps, initial=latents, times=times[cut:]),
+                 key=key).images
+```
+
 ## Serving
 
 `Server.from_task(task, slots=, capacity=)` keeps `slots` rows of `capacity` cache positions resident and admits queued requests into free rows while the other rows keep decoding. Each step prefills the prompts admitted that step and draws one token for every occupied row, in one compiled program; a row leaves on EOS or at its budget, and the next request takes its slot. A served request draws with the key it was submitted with, folded as a one-row `TextGeneration` call folds it, so it draws the tokens it would draw alone.
