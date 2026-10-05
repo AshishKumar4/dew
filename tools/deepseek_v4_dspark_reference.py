@@ -47,11 +47,11 @@ rotate_activation, the indexer's Hadamard rotation of its queries and keys
 alike, leaves the scores it ranks unchanged in exact arithmetic, so it is
 the identity (model.py:253-257, :374-376, :420-422), and the head returns
 every position's logits (`_full_head`). Beyond the quantizers, the tie order
-is the one documented difference from the release: each indexer breaks
-equal scores toward the lower entry, as jax.lax.top_k does, where torch.topk
-leaves the order unspecified (`lower_index_ties` of
-tools/decoder_export_reference.py, on the release's Indexer and
-transformers' alike).
+is the one documented difference from the release: each indexer and router
+breaks equal scores toward the lower entry, as jax.lax.top_k does, where
+torch.topk leaves the order unspecified (`lower_index_ties` of
+tools/decoder_export_reference.py, on the release's Indexer and Gate and
+transformers' indexer and router alike).
 """
 
 from __future__ import annotations
@@ -67,7 +67,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch.overrides import TorchFunctionMode
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
@@ -237,48 +236,6 @@ def inputs(seed: int) -> torch.Tensor:
     return torch.randint(2, TINY["vocab_size"] - 1, (2, LENGTH), generator=generator)
 
 
-class _Selections(TorchFunctionMode):
-    """Every top-k inside a module's forward, appended to `found` as its
-    scored rows and sorted picks. Entered inside `lower_index_ties`'s mode,
-    it sees each call first and passes it on to be broken toward the lower
-    index."""
-
-    def __init__(self, found: list):
-        super().__init__()
-        self.found = found
-
-    def __torch_function__(self, func, types, args=(), kwargs=None):
-        out = func(*args, **(kwargs or {}))
-        if func in (torch.topk, torch.Tensor.topk):
-            rows, picks = args[0].detach(), out.indices
-            self.found.append((rows.reshape(-1, rows.size(-1)).double(),
-                               picks.reshape(-1, picks.size(-1)).sort(-1).values))
-        return out
-
-
-@contextlib.contextmanager
-def selections(model, classes: tuple[type, ...], indexer: type | None = None):
-    """Record every top-k the modules of `classes` make (`_Selections`), the
-    indexer's under the lower-index tie order."""
-    found: list = []
-    held = [(module, module.forward) for module in model.modules() if isinstance(module, classes)]
-
-    def recording(original):
-        def forward(*args, **kwargs):
-            with _Selections(found):
-                return original(*args, **kwargs)
-        return forward
-
-    try:
-        for module, original in held:
-            module.forward = recording(original)
-        with lower_index_ties(model, indexer=indexer):
-            yield found
-    finally:
-        for module, original in held:
-            module.forward = original
-
-
 def tied(found: list) -> int:
     """How many recorded selections the tie order decided: rows whose k-th
     and next finite scores are equal."""
@@ -301,10 +258,12 @@ def differ(found: list, wide: list) -> int:
 
 def released_outputs(module, seed: int, ids: torch.Tensor, widen: bool = False):
     """The release's full-forward logits and its cached run, the net, and
-    every top-k its indexers and routers made (`selections`)."""
+    every top-k its indexers and routers made, each breaking ties toward the
+    lower index (`lower_index_ties`)."""
+    found: list = []
     with torch.no_grad():
         net = build(module, seed, widen)
-        with selections(net, (module.Indexer, module.Gate), module.Indexer) as found:
+        with lower_index_ties(net, classes=(module.Indexer, module.Gate), found=found):
             reset(net)
             _, logits, _ = forward(net, ids)
             outputs = {"release_logits": logits.numpy(), **cached(net, ids)}
@@ -339,8 +298,8 @@ def widened_transformers(module):
 
 def transformers_logits(directory: Path, ids: torch.Tensor, dtype: torch.dtype):
     """transformers' logits over `ids` from the checkpoint in `directory`, and
-    every top-k its indexers and routers made (`selections`); refused if it
-    leaves a trunk tensor unread."""
+    every top-k its indexers and routers made under the lower-index tie order
+    (`lower_index_ties`); refused if it leaves a trunk tensor unread."""
     from transformers import DeepseekV4ForCausalLM
     from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4Indexer, DeepseekV4TopKRouter
 
@@ -357,7 +316,9 @@ def transformers_logits(directory: Path, ids: torch.Tensor, dtype: torch.dtype):
         raise SystemExit(f"{directory}: transformers does not read the checkpoint: {unread} {stray}")
     model.eval()
     model.set_attn_implementation("eager")
-    with torch.no_grad(), selections(model, (DeepseekV4Indexer, DeepseekV4TopKRouter)) as found:
+    found: list = []
+    selecting = (DeepseekV4Indexer, DeepseekV4TopKRouter)
+    with torch.no_grad(), lower_index_ties(model, classes=selecting, found=found):
         logits = model(input_ids=ids, use_cache=False).logits.numpy()
     return logits, found
 
