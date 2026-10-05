@@ -52,7 +52,12 @@ def _split(embeddings, labels):
 
 def linear_probe_accuracy(embeddings, labels, num_classes: int, steps: int = 100,
                           learning_rate: float = 1e-2, weight_decay: float = 1e-4):
-    """Fit a logistic regression on half the batch and score its accuracy on the rest."""
+    """Fit a logistic regression on half the batch and score its accuracy on the rest.
+
+    The features are standardized with the first half's statistics, and the
+    regression trains for `steps` AdamW steps. A batch of fewer than two
+    samples raises ValueError.
+    """
     fit_x, fit_y, test_x, test_y = _split(embeddings, labels)
     mean, std = jnp.mean(fit_x, axis=0), jnp.std(fit_x, axis=0) + 1e-6
     fit_x, test_x = (fit_x - mean) / std, (test_x - mean) / std
@@ -77,7 +82,11 @@ def linear_probe_accuracy(embeddings, labels, num_classes: int, steps: int = 100
 
 
 def knn_probe_accuracy(embeddings, labels, num_classes: int, k: int = 20):
-    """Score cosine k-NN accuracy, fitting on half the batch and scoring the rest."""
+    """Return cosine k-NN accuracy, with the first half of the batch as neighbours and the second half scored.
+
+    Each scored sample takes the majority label of its `k` most similar
+    neighbours by cosine similarity.
+    """
     fit_x, fit_y, test_x, test_y = _split(embeddings, labels)
     fit_x = fit_x / (jnp.linalg.norm(fit_x, axis=-1, keepdims=True) + 1e-8)
     test_x = test_x / (jnp.linalg.norm(test_x, axis=-1, keepdims=True) + 1e-8)
@@ -91,7 +100,10 @@ def knn_probe_accuracy(embeddings, labels, num_classes: int, k: int = 20):
 @metrics("linear_probe")
 @dataclass(frozen=True)
 class LinearProbe:
-    """Report linear probe accuracy over each validation batch's representations."""
+    """Reports linear-probe accuracy on each validation batch, averaged over the pass.
+
+    Each batch's representations are scored with `linear_probe_accuracy`.
+    """
     num_classes: int
     steps: int = 100
     learning_rate: float = 1e-2
@@ -119,7 +131,10 @@ class LinearProbe:
 @metrics("knn_probe")
 @dataclass(frozen=True)
 class KnnProbe:
-    """Report cosine k-NN accuracy over each validation batch's representations."""
+    """Reports cosine k-NN accuracy on each validation batch, averaged over the pass.
+
+    Each batch's representations are scored with `knn_probe_accuracy`.
+    """
     num_classes: int
     k: int = 20
 

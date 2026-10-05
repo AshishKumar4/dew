@@ -1,8 +1,10 @@
 """Assemble a DiffusionGemma for the shared pretrained-model loader.
 
-Checkpoint text aliases collapse into one Flax subtree; vision and projection
-weights keep their own. This module opens no checkpoint or processor and adds
-no family-specific public loading entry point.
+The checkpoint stores its text weights under two prefixes, the encoder's and
+the decoder's, and both map into one Flax subtree. The vision and projection
+weights keep subtrees of their own. This module opens no checkpoint or
+processor, and it adds no public loading function for this family; the
+shared loader calls it.
 """
 
 from __future__ import annotations
@@ -60,7 +62,12 @@ def text_config(config: Mapping[str, object]) -> Mapping[str, object]:
 
 def build(config: Mapping[str, object], *, dtype: str | None = "bfloat16",
           attention_impl: str = "auto", max_seq_len: int | None = None) -> DiffusionGemma:
-    """Build native model values without allocating parameters."""
+    """Build the native `DiffusionGemma` module from a checkpoint's config, without allocating parameters.
+
+    `config` is the `diffusion_gemma` wrapper config; any other config, or
+    one with an audio encoder, raises ValueError. `canvas_length` is 256
+    when the config omits it.
+    """
     fields = translate_config(text_config(config))
     fields["causal"] = True
     if max_seq_len is not None:
