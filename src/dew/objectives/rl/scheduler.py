@@ -1,80 +1,92 @@
 """Keep agent rollouts in flight and admit complete groups within a staleness bound.
 
-`RolloutScheduler` is the trainer's `Rollout` for any `SessionSource`: an
-in-process environment, a single-turn prompt set, or a harness behind a
-recording gateway. Wrap the task dataset with `scheduler.tasks(dataset)`:
-the wrapped stream registers each task batch as the trainer's prefetch reads
-it, so when the trainer hands over batch `i` the scheduler submits batches
-`i + 1 ... i + ahead` under the version the engines serve now. Batch `i`'s
-own rollouts were submitted `ahead` calls earlier and have been running,
-across weight pushes, since. Nothing is read ahead of the trainer's own
-prefetch, so the checkpointed data position stays the trainer's: a resumed
-run re-reads and resubmits whatever was in flight, and reopening the stream
-cancels what the old one left running.
+`RolloutScheduler` is the trainer's `Rollout` for any `SessionSource`, such
+as an in-process environment, a single-turn prompt set, or a harness behind
+a recording gateway. Wrap the task dataset with `scheduler.tasks(dataset)`.
+The wrapped stream registers each task batch when the trainer's prefetch
+reads it. When the trainer then passes batch `i` to the scheduler, the
+scheduler submits batches `i + 1 ... i + ahead` under the weight version
+the engines serve at that moment. Batch `i`'s own rollouts were submitted
+`ahead` calls earlier and have kept running since, through any weight
+pushes in between. The scheduler reads no data beyond the trainer's own
+prefetch, so the data position in a checkpoint is still the trainer's. A
+resumed run reads again and resubmits whatever was in flight, and reopening
+the stream cancels the rollouts the old stream left running.
 
-Each task becomes one group of `groups` rollouts, relabelled with the
-scheduler's own group id, sample index and attempt, so a resubmitted sample
-rejoins its group. Admission is per rollout, by status:
+Each task becomes one group of `groups` rollouts. The scheduler relabels
+each rollout with its own group id, sample index and attempt number, so a
+resubmitted sample rejoins its group. Each finished rollout is admitted or
+replaced according to its status:
 
-- COMPLETED and AGENT_ERROR are admitted; the verifier scored them.
-- TRUNCATED is admitted and trains as `truncation` says: `mask` (the
+- COMPLETED and AGENT_ERROR are admitted, because the verifier scored them.
+- TRUNCATED is admitted, and `truncation` sets how it trains: `mask` (the
   default, for agentic context, turn and wall-clock limits), `score` on its
   verifier reward (single-turn RLVR), or `zero` (a length penalty); see
-  `dew.objectives.rl.sessions`. Under `score`, a truncation without a reward
-  is resubmitted as a failed attempt (cause `unscored`), like an
-  INFRA_ERROR: its verifier never ran, so masking it would drop a sample
-  for a reason unrelated to the policy, and training it has no reward.
+  `dew.objectives.rl.sessions`. Under `score`, a truncated rollout without
+  a reward is resubmitted as a failed attempt (cause `unscored`), like an
+  INFRA_ERROR. Its verifier never ran, so masking it would drop a sample
+  for a reason unrelated to the policy, and there is no reward to train it
+  on.
 - INFRA_ERROR and CANCELLED are never scored. The sample is submitted again
-  under the served weights, up to `max_attempts` failures per sample, after
-  which the group is abandoned rather than trained incomplete.
+  under the weights being served. After `max_attempts` failures of one
+  sample, the scheduler abandons the whole group instead of training it
+  incomplete.
 - A rollout whose oldest call is more than `max_lag` updates behind is
-  discarded and resubmitted. One still running whose submission is already
-  past the bound is cancelled before anyone waits on it: its first call was
-  made under that version.
+  discarded and resubmitted. A rollout still running when its submission
+  falls past that bound is cancelled without waiting for it to finish,
+  because its first call was made under the submission's version.
 - A rollout still running `timeout` seconds after its submission is
   cancelled and resubmitted as a failed attempt, like an INFRA_ERROR.
-  Cancelling asks the source to stop; a thread stuck inside an environment
-  step cannot be reclaimed, so environments must bound their own step time.
+  Cancelling only asks the source to stop. The scheduler cannot reclaim a
+  thread stuck inside an environment step, so environments must bound
+  their own step time.
 
-A source that raises instead of returning a status is broken; the exception
-propagates after the batch's work is cancelled.
+A source that raises an exception instead of returning a status is broken.
+The scheduler cancels the batch's remaining rollouts and lets the exception
+propagate.
 
-The long tail is cut two ways, both keeping the batch shape fixed.
-`oversample` extra samples run per group and a group is admitted when its
-first `groups` rollouts finish; the rest are cancelled (APRIL's active
-partial rollouts, arXiv:2509.18521, without the carry-over). `admit` below
-the task batch size admits the first `admit` groups to complete and cancels
-the others (slime's over-sampling batch). Both select by completion time,
-which favors short rollouts; that bias is the price of not waiting on the
-tail. Rollouts running when a weight push lands keep running: their later
-calls carry the new version and the rollout's staleness is its oldest call's
-(Kimi K2's partial rollouts, arXiv:2507.20534 section 3.3.4).
+Two options cut the long tail of slow rollouts, and both keep the batch
+shape fixed. With `oversample`, each group runs that many extra samples and
+is admitted once its first `groups` rollouts finish; the scheduler cancels
+the rest. This is APRIL's active partial rollouts (arXiv:2509.18521)
+without the carry-over. With `admit` below the task batch size, the
+scheduler admits the first `admit` groups to complete and cancels the
+others, as slime's over-sampling batch does. Both select by completion
+time, which favors short rollouts; that bias is the price of not waiting on
+the tail. Rollouts that are running when new weights are pushed keep
+running. Their later calls carry the new version, and a rollout's
+staleness is that of its oldest call, as in Kimi K2's partial rollouts
+(arXiv:2507.20534 section 3.3.4).
 
-Weights are pushed through `weights` when the served version falls
-`sync_every` updates behind, so a first submission is at most
-`ahead + sync_every - 1` updates stale at consumption, and construction
-refuses a `max_lag` below that. Admitted groups are packed by `pack` into
-fixed `[rows, width]` rows; `pack` computes the per-rollout advantages and
-masks. A complete group whose chains do not fit `rows` beside the groups
-admitted before it is cut, never packed into a failing step. The proximal
-policy is the trainer's current weights, rescored over the packed rows with
-`GRPOObjective.packed_log_probs` (decoupled PPO, AReaL arXiv:2505.24298):
-sources report behavior likelihoods only, and the objective's
-`behavior_importance` weights each token by proximal over behavior.
+The scheduler pushes weights through `weights` when the served version
+falls `sync_every` updates behind the trainer, or is ahead of it, as after
+a resume from an earlier checkpoint. A first submission is therefore at
+most `ahead + sync_every - 1` updates stale when the trainer consumes it,
+and the constructor refuses a `max_lag` below that. `pack` packs the
+admitted groups into fixed `[rows, width]` arrays and computes the
+per-rollout advantages and masks. If a complete group's chains do not fit
+in `rows` beside the groups admitted before it, the scheduler cuts that
+group, so an overfull batch never reaches the step. The proximal policy is
+the trainer's current weights. The scheduler rescores the packed rows under
+them with `GRPOObjective.packed_log_probs` (decoupled PPO, AReaL
+arXiv:2505.24298). Sources report only behavior likelihoods, and the
+objective's `behavior_importance` weights each token by the ratio of its
+proximal to its behavior likelihood.
 
-Every process of a multi-process trainer runs its own scheduler, over the
-task rows its data stream reads and on its own source, and packs its own
-`rows`: the step's batch is every process's rows together, sharded as the
-trainer shards any batch, and no rollout crosses a process. The pool meets
-twice a call. The weight push is one call every process makes, so the
-publisher has to agree on it across the pool. The proximal rescoring runs
-once over the pool's batch, and each process reads its own rows back. A
-process whose admission fails raises on every process at the agreement
-point, rather than leave the others waiting in the rescoring. Where
-several processes read one share, as a tensor or sequence axis across
-processes makes them, the share's first reader alone samples, and the
-others train on the rows it packed (`first_reader_batch`): their devices
-hold the same rows, which independent draws would not give them.
+In a multi-process trainer, every process runs its own scheduler on its own
+source, over the task rows its data stream reads, and packs its own `rows`.
+The step's batch is all the processes' rows together, sharded as the
+trainer shards any batch, and no rollout moves between processes. The
+processes still act together at a few points in each call. The weight push
+is one call that every process makes, so the publisher has to agree on it
+across processes. If admission fails on one process, every process raises
+at the admission agreement point, so none is left waiting in the
+rescoring. The proximal rescoring runs once over the combined batch, and
+each process reads its own rows back. When a tensor or sequence axis spans
+processes, several processes read the same share of the data. Then only
+the share's first reader samples, and the others train on the rows it
+packed (`first_reader_batch`). That way their devices hold the same rows,
+which independent draws would not give them.
 """
 
 from __future__ import annotations
@@ -116,9 +128,12 @@ from .sessions import (
 
 
 class Publisher(Protocol):
-    """Where the trainer's weights go: `load` serves them under `version`.
+    """Serves the trainer's weights to the rollout engines.
 
-    A `RolloutServer` is one; so is an engine fleet's publish sequence.
+    `load(variables, version)` makes the engines serve `variables` under
+    `version`, and the `version` property is the version they serve now. A
+    `RolloutServer` is a publisher, and so is an engine fleet's publish
+    sequence.
     """
 
     @property
@@ -131,18 +146,24 @@ class Publisher(Protocol):
 class SchedulerRecord:
     """What one trainer call consumed and what it cost.
 
-    `version` and `lag` are the oldest admitted call's; `groups` counts
-    admitted groups; `resubmitted` counts resubmissions by cause
-    (`infra_error`, `cancelled`, `stale`, `timeout`, `unscored`);
-    `cancelled` counts in-flight rollouts cancelled as surplus, stale or
-    abandoned; `abandoned` counts groups given up after `max_attempts`;
-    `cut` counts complete groups left out because their chains did not fit
-    the batch's `rows` beside the groups admitted before them; `waited` is
-    the seconds the trainer waited. `metrics` is `session_metrics` over the
-    admitted rollouts and their packed batch: merge ratio, status shares
-    and masked shares, mean reward and reward components,
-    submission-to-finish latency tail and token lag. The loss reports the
-    trainer-engine mismatch.
+    - `updates` is the trainer's update count at the call.
+    - `version` is the version of the oldest admitted call, and `lag` is
+      how many updates it is behind `updates`.
+    - `groups` counts the admitted groups.
+    - `resubmitted` counts resubmissions by cause (`infra_error`,
+      `cancelled`, `stale`, `timeout`, `unscored`).
+    - `cancelled` counts in-flight rollouts cancelled because they were
+      surplus, stale, past their `timeout` or in an abandoned group.
+    - `abandoned` counts groups given up after `max_attempts` failures.
+    - `cut` counts complete groups left out because their chains did not
+      fit the batch's `rows` beside the groups admitted before them.
+    - `waited` is the number of seconds the trainer waited.
+    - `metrics` is `session_metrics` over the admitted rollouts and their
+      packed batch: merge ratio, status shares and masked shares, mean
+      reward and reward components, the submission-to-finish latency tail
+      and token lag.
+
+    The trainer-engine mismatch is not in this record; the loss reports it.
     """
 
     updates: int
@@ -158,7 +179,11 @@ class SchedulerRecord:
 
 
 def task_ids(batch: Batch) -> list[Task]:
-    """One task per integer `task_id` row, named by its decimal id."""
+    """Return one task per integer `task_id` row of `batch`, named by the id in decimal.
+
+    Raises ValueError unless this process's `task_id` rows are a nonempty
+    vector of integers.
+    """
     ids = local_rows(batch["task_id"])
     if ids.ndim != 1 or not ids.size or not np.issubdtype(ids.dtype, np.integer):
         raise ValueError("task_id must be a nonempty vector of integer task identities")
@@ -208,18 +233,28 @@ class _Tally:
 
 
 class RolloutScheduler:
-    """Train on complete rollout groups from `source`, `ahead` task batches early.
+    """Runs rollouts from `source` ahead of the trainer and packs complete groups into its batches.
 
-    `tasks` turns one registered batch into its tasks (`task_ids` for
-    integer `task_id` rows). `timeout` is each rollout's deadline in seconds
-    from its submission. `width` and `rows` fix the packed batch shape, `rows`
-    for this process's share of a multi-process trainer's batch;
-    `estimator` and `truncation` are `pack`'s advantage family and
-    truncation policy, and `support_capacity` its per-row support length,
-    which a filtered-sampling source requires. `log`, when given,
-    receives a `SchedulerRecord` per call, of this process's rollouts; a
-    share's later readers sample none and log nothing. `metrics` holds the
-    latest record's numbers, which the trainer logs as `rollout/<name>`.
+    The module docstring describes `groups`, `oversample`, `admit`,
+    `max_lag`, `ahead`, `sync_every` and `max_attempts`. The other
+    arguments:
+
+    - `tasks` turns one registered batch into its tasks (`task_ids` for
+      integer `task_id` rows).
+    - `timeout` is each rollout's deadline in seconds from its submission.
+    - `width` and `rows` fix the packed batch shape. `rows` is this
+      process's share of a multi-process trainer's batch.
+    - `estimator` and `truncation` are `pack`'s advantage family and
+      truncation policy, and `support_capacity` is its per-row support
+      length, which a filtered-sampling source requires.
+    - `log`, when given, receives a `SchedulerRecord` of this process's
+      rollouts after each call. A process that is not the first reader of
+      its share samples nothing and logs nothing.
+
+    A `max_lag` above 0 needs the objective's `behavior_importance` (a TIS
+    cap or an IcePop band), and the constructor raises ValueError without
+    it. `metrics` holds the latest call's numbers, which the trainer logs as
+    `rollout/<name>`.
     """
 
     shown: ClassVar[dict[str, Shown]] = {
@@ -281,7 +316,7 @@ class RolloutScheduler:
         self._rescore = jax.jit(objective.packed_log_probs)
 
     def tasks(self, dataset: Dataset) -> Dataset:
-        """`dataset` with a training stream that registers each task batch ahead of the step.
+        """Return `dataset` with a training stream that registers each task batch ahead of the step.
 
         Opening the stream again, as a resume does, cancels every rollout
         the previous stream left in flight.
@@ -296,7 +331,7 @@ class RolloutScheduler:
         return dataclasses.replace(dataset, train=train)
 
     def close(self) -> None:
-        """Cancel every rollout in flight; the source belongs to the caller."""
+        """Cancel every rollout in flight. The caller closes the source; this method does not."""
         self._drop_registered()
 
     def _drop_registered(self) -> None:
