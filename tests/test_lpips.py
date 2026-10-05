@@ -2,6 +2,7 @@
 its `LPIPS` on VGG16, run as published, on drawn weights and on the
 published ones."""
 
+import math
 from pathlib import Path
 
 import jax
@@ -51,8 +52,13 @@ def test_the_distance_and_its_gradient_are_repa_es():
     reference = dict(np.load(FIXTURES / "drawn.npz"))
     vgg, linear = drawn_weights()
     for key, value in {**vgg, **linear}.items():
-        np.testing.assert_allclose(value.astype(np.float64).sum(), reference[f"sum/{key}"], rtol=1e-12,
-                                   err_msg=key)
+        # The fixture's sum is numpy's, whose order follows the CPU's SIMD
+        # width, so it carries up to n·u·Σ|x| of float64 rounding (7.5e-9 on
+        # one conv's 1.2M entries, one CI runner against another); ours is
+        # math.fsum's, rounded once. A different draw moves a sum by ~30.
+        entries = value.astype(np.float64).ravel()
+        bound = entries.size * np.finfo(np.float64).eps * np.abs(entries).sum()
+        assert abs(math.fsum(entries) - reference[f"sum/{key}"]) <= bound, key
     network, variables = LPIPSNetwork(), variables_from_torch(vgg, linear)
     images, references = (jnp.asarray(reference[key], jnp.float32) for key in ("images", "references"))
 
