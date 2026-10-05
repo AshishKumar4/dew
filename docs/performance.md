@@ -2044,7 +2044,7 @@ separate dots at 128 tokens or fewer. The exception is 1 x 128,
 measured in two sessions.
 
 The rule therefore considers both token count and frozen weights. A
-step with an objective's `trainable` split, as in LoRA, keeps the merger
+step whose starting variables are split frozen, as in LoRA, keeps the merger
 at 128 tokens or fewer per device. Every other step uses separate dots.
 Only LM objectives specify the token count, so another objective's frozen
 step uses separate dots and has not been measured.

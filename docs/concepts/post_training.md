@@ -43,7 +43,7 @@ model = CausalTransformer(vocab_size=tokenizer.vocab_size,
 base = model.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32))
 ```
 
-`base` is a full Flax variables mapping, including its outer `params` collection, which is what every objective's `pretrained` argument takes.
+`base` is a full Flax variables mapping, including its outer `params` collection, which is what every objective's `variables` argument takes.
 
 ### Supervised fine-tuning
 
@@ -244,7 +244,7 @@ Completed 2 DPO updates; reference stayed fixed.
 
 The DPO reference is stored in `TrainState.ema` with decay fixed at 1, so it stays unchanged; `DPOObjective` refuses an `ema_decay` argument. `rewards/chosen` and `rewards/rejected` are beta times each side's sequence log-ratio of policy over reference. A policy that has not changed therefore reports zero rewards and no wins. The reference needs no second model object and receives no optimizer updates, but it is a separate parameter tree with its own forward passes. Budget memory for the policy parameters, reference parameters, optimizer state, gradients, activations and batches.
 
-SFT keeps no moving average unless `ema_decay` is set, as the language-model objective does. GRPO keeps a frozen reference only when `beta > 0`, and refuses `ema_decay` too. When a DPO or GRPO stage starts, its `pretrained` weights become the frozen reference.
+SFT keeps no moving average unless `ema_decay` is set, as the language-model objective does. GRPO keeps a frozen reference only when `beta > 0`, and refuses `ema_decay` too. When a DPO or GRPO stage starts, its starting `variables` become the frozen reference.
 
 ## GRPO
 

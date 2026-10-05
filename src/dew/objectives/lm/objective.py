@@ -673,8 +673,9 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
 
     def _starting_tree(self, given: Variables | None, key) -> Variables:
         """Return the tree training starts from: the given one as it is,
-        split or whole, or a fresh init. The indexer's warm-up decides its
-        own split, so it starts from the given tree whole."""
+        split or whole, or a fresh init. An indexer phase decides its own
+        split, the warm-up the indexer alone and the sparse phase the whole
+        tree, so it starts from the given tree whole."""
         def fresh() -> Variables:
             return self.model.init(key, jnp.zeros((1, self.seq_len), jnp.int32))
 
@@ -684,9 +685,11 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             raise ValueError(
                 "variables is the variables dict ({'params': ...}) that "
                 "Pretrained.load and model.init return")
-        if not self._warmup:
+        if self.indexer is None:
             return given
         whole = thaw(given)
+        if not self._warmup:
+            return whole
         # The warm-up may start from a dense checkpoint that has no indexer
         # yet; the fresh init supplies exactly those weights.
         variables = fresh()

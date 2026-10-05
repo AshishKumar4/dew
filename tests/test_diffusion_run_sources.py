@@ -97,7 +97,7 @@ def test_a_run_fine_tunes_a_published_pipeline_and_rebinds_it_without_weights(
 @pytest.mark.parametrize("family", ["sd3", "flux", "qwen_image"])
 def test_a_run_config_builds_the_objective_the_python_api_builds(family, pipelines):
     """The wiring half of a configured run: `DiffusionRunConfig` over a
-    published pipeline builds what `Pretrained.load(...).diffusion_objective`
+    published pipeline builds what `DiffusionObjective(Pretrained.load(...))`
     builds with the same settings at the data's resolution
     (`load_diffusion_source(size=)`): the same model, process (its
     resolution shift too), tokenized ids and autoencoder kind over the
