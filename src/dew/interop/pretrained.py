@@ -1995,6 +1995,41 @@ def _decoded(tensors: Mapping[str, np.ndarray], config: Mapping[str, object], pa
     return tensors, quantized_tensors, scale_dtype, grid
 
 
+def _input_quantization(model: nn.Module, layouts: tuple[WeightLayout, ...],
+                        config: Mapping[str, object], grid: Mapping[str, np.ndarray]) -> nn.Module:
+    """Bind each stored input scale to its Linear's native Qwix scope.
+
+    Expert stacks and concatenated projections need one quantizer per
+    member, which this per-Linear binding cannot compute, so they are refused
+    before returning a model with the wrong activation forward.
+    """
+    from dew.training.quantization import NVFP4Input, checkpoint_input_quantization
+
+    codec = source_quantization(config)
+    if codec is None or codec.input_scale_dtype is None:
+        return model
+    inputs = {}
+    for layout in layouts:
+        part = layout.name.removesuffix('.weight') + codec.input_suffix
+        if part not in grid:
+            continue
+        if (len(layout.paths) != 1 or layout.paths[0][-1] != 'kernel'
+                or layout.expert_index is not None or layout.concatenate is not None):
+            raise ValueError(f"{layout.name} needs NVFP4 input QDQ per expert or projection member, "
+                             "which this checkpoint provider does not compute")
+        scale = np.asarray(grid[part])
+        if scale.dtype != np.float32 or scale.size != 1:
+            raise ValueError(f"{part} must be one float32 stored global scale, "
+                             f"got {scale.dtype} {scale.shape}")
+        path = '/'.join(layout.paths[0][1:-1])
+        inputs[path] = NVFP4Input(float(scale.reshape(())), codec.input_scale_dtype == 'float8_e4m3fn',
+                                 format=codec.input_format)
+    if len(inputs) != sum(name.endswith(codec.input_suffix) for name in grid):
+        raise ValueError("NVFP4 input scales must each bind one Linear scope; "
+                         "an unbound scale would drop QDQ")
+    return checkpoint_input_quantization(model, inputs)
+
+
 def _decoder_layouts(tensors: Mapping[str, np.ndarray], record: decoders.DecoderFields, family: str,
                      variables: Variables) -> tuple[tuple[WeightLayout, ...], dict[str, np.ndarray]]:
     """Each source tensor's binding into the tree, and the tensors none binds."""
@@ -2150,6 +2185,7 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
         model, variables, record, built, layouts, retained = _decoder_source(
             config, tensors, directory, verified, dtype=dtype, attention_impl=attention_impl,
             max_seq_len=max_seq_len, param_dtype=param_dtype, lazy=streaming)
+    model = _input_quantization(model, layouts, config, grid)
     processor = _source_processor(directory, config, record, model, gguf_path)
     generation_config = _generation_config(directory)
 

@@ -16,11 +16,20 @@ output scale, which is the distance the cudnn parity in tests/test_kernels.py
 pins between two correct kernels.
 """
 
+from types import SimpleNamespace
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference, assert_computes_the_oracle
+from reference_error import (
+    ORDERS,
+    assert_as_exact_as_the_reference,
+    assert_as_exact_over_orders,
+    assert_computes_the_oracle,
+    distance,
+)
+from residual_orders import orders
 
 from dew.nn.attention import (
     SPLASH_BLOCK,
@@ -69,9 +78,9 @@ def qkv(shape, dtype, seed=0, kv_shape=None):
             *(jax.random.normal(key, kv_shape or shape, dtype) for key in keys[1:]))
 
 
-def value_and_grads(implementation, query, key, value, sinks=None, live=None, **kwargs):
-    """The output and the gradients of every input, sinks included, in fp32
-    or the inputs' wider dtype.
+def attention_and_grads(implementation, *, has_sinks=False, live=None, **kwargs):
+    """Compile the output and gradients once for repeated rounding draws,
+    sinks included, in fp32 or the inputs' wider dtype.
 
     `live` `[B, S]` keeps the rows the loss reads and the output compares,
     which a packed row's padding is not.
@@ -83,8 +92,12 @@ def value_and_grads(implementation, query, key, value, sinks=None, live=None, **
             out = jnp.where(live[:, :, None, None], out, 0)
         return jnp.sum(out.astype(jnp.promote_types(out.dtype, jnp.float32)) ** 2), out
 
-    argnums = (0, 1, 2) if sinks is None else (0, 1, 2, 3)
-    (_, out), grads = jax.jit(jax.value_and_grad(loss, argnums=argnums, has_aux=True))(
+    argnums = (0, 1, 2, 3) if has_sinks else (0, 1, 2)
+    return jax.jit(jax.value_and_grad(loss, argnums=argnums, has_aux=True))
+
+
+def value_and_grads(implementation, query, key, value, sinks=None, **kwargs):
+    (_, out), grads = attention_and_grads(implementation, has_sinks=sinks is not None, **kwargs)(
         query, key, value, sinks)
     return [np.asarray(x, np.promote_types(x.dtype, np.float32)) for x in (out, *grads)]
 
@@ -96,6 +109,38 @@ def reference(query, key, value, **kwargs):
     bf16 passes; XLA:CPU computes fp32 either way."""
     return value_and_grads('reference', *(x.astype(jnp.float32) for x in (query, key, value)),
                            precision=jax.lax.Precision.HIGHEST, **kwargs)
+
+
+def flash_query_gradient(query, key, value, *, softcap):
+    """Splash's published untiled flash-formula reference, over the same heads.
+
+    Its custom backward forms delta = rowsum(out * dout), as Splash and
+    FlashAttention 2/3 do. The vanilla softmax derivative uses rowsum(dp * p),
+    an exact identity whose different roundings omit the output's error.
+    """
+    from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel
+
+    heads, length, width = query.shape[2], query.shape[1], query.shape[-1]
+    keep = np.arange(key.shape[1])[None, :] <= np.arange(length)[:, None]
+    kernel = splash_attention_kernel.make_attention_reference(
+        np.broadcast_to(keep, (heads, *keep.shape)), is_mqa=False,
+        backward_impl="custom")
+
+    def loss(q, k, v):
+        out = jax.vmap(lambda q, k, v: kernel(q, k, v, attn_logits_soft_cap=softcap))(
+            jnp.moveaxis(q, -2, -3) / np.sqrt(width),
+            jnp.moveaxis(k, -2, -3), jnp.moveaxis(v, -2, -3))
+        return jnp.sum(out ** 2)
+
+    pinned = splash_attention_kernel.jnp
+    try:
+        if query.dtype == jnp.float64:
+            # The reference's fp32 pins must widen with its inputs to measure
+            # its exact flash identity, as the vanilla twin's inputs do.
+            splash_attention_kernel.jnp = SimpleNamespace(**{**vars(jnp), "float32": jnp.float64})
+        return np.asarray(jax.jit(jax.grad(loss))(query, key, value))
+    finally:
+        splash_attention_kernel.jnp = pinned
 
 
 def assert_agrees(splash, reference, dtype):
@@ -342,7 +387,19 @@ def test_splash_is_as_exact_as_the_reference_attention(case):
     (`exact_value_and_grads`), by tests/reference_error.py's rule: no
     further from it than twice the fp32 reference attention it replaces,
     whose own arithmetic in float64 is first held to that oracle. Each
-    argument the kernel takes, grouped key heads among them."""
+    argument the kernel takes, grouped key heads among them.
+
+    The sinks' gradients use 52 head-unit orders on both sides. Moving
+    q, k and v's units together leaves the masks and sinks intact and only
+    permutes the output and the three qkv gradients; the float64 oracle
+    checks that symmetry under every order. The softcapped query gradient
+    is held to Splash's published flash-formula reference. Its delta is
+    rowsum(out * dout), as in FlashAttention 2/3; vanilla AD takes
+    rowsum(dp * p), which omits the rounded output's error. Over 52 orders,
+    Splash and the untiled flash formula both sit at 1.79 times vanilla's
+    RMS error (default and AVX CPU), and within 1% of each other. Both
+    upstream backwards share the same tanh and recomputed probabilities.
+    """
     q_shape, kv_shape, structure = ORACLE_CASES[case]
     query, _, _ = qkv(q_shape, jnp.float32)
     _, key, value = qkv(kv_shape or q_shape, jnp.float32, seed=1)
@@ -361,13 +418,40 @@ def test_splash_is_as_exact_as_the_reference_attention(case):
         widened = (jnp.asarray(np.asarray(x, np.float64)) for x in (query, key, value))
         twin = value_and_grads('reference', *widened, force_fp32_for_softmax=False, **wide)
     names = ("output", "query", "key", "value", "sinks")[:len(splash)]
+    truth = exact_value_and_grads(query, key, value, **structure)
+    expected = reference(query, key, value, **structure)
+    if case == "softcap":
+        expected[1] = flash_query_gradient(query, key, value, softcap=structure["softcap"])
+        with jax.enable_x64(new_val=True):
+            widened = (jnp.asarray(np.asarray(x, np.float64)) for x in (query, key, value))
+            twin[1] = flash_query_gradient(*widened, softcap=structure["softcap"])
+    ordered = "sinks" if case in ("sinks", "sinks-window") else None
     for name, mine, theirs, wide_theirs, want in zip(
-            names, splash, reference(query, key, value, **structure), twin,
-            exact_value_and_grads(query, key, value, **structure), strict=True):
+            names, splash, expected, twin, truth, strict=True):
         # A key's logit sums the head width, its weight the keys.
         assert_computes_the_oracle(wide_theirs, want, f"{case} {name}",
                                    roundings=query.shape[-1] + key.shape[1])
-        assert_as_exact_as_the_reference(mine, theirs, want, f"{case} {name}")
+        if name != ordered:
+            assert_as_exact_as_the_reference(mine, theirs, want, f"{case} {name}")
+    if ordered is not None:
+        sinks = structure.get("sinks")
+        kwargs = {name: value for name, value in structure.items() if name != "sinks"}
+        runs = [attention_and_grads('tpu', has_sinks=True, **kwargs),
+                attention_and_grads('reference', has_sinks=True,
+                                     precision=jax.lax.Precision.HIGHEST, **kwargs)]
+        distances = [[], []]
+        for k, order in enumerate(orders(query.shape[-1], ORDERS, seed=0)):
+            inputs = [jnp.asarray(np.take(np.asarray(x), order, -1)) for x in (query, key, value)]
+            inverse = np.argsort(order)
+            exact = exact_value_and_grads(*inputs, **structure)
+            for index, (wide_value, want) in enumerate(zip(exact, truth, strict=True)):
+                unpermuted = wide_value if index == 4 else np.take(wide_value, inverse, -1)
+                assert_computes_the_oracle(unpermuted, want, f"{case} order {k}",
+                                           roundings=query.shape[-1] + key.shape[1])
+            for run, measured in zip(runs, distances, strict=True):
+                _, grads = run(*inputs, sinks)
+                measured.append(distance(grads[-1], truth[-1]))
+        assert_as_exact_over_orders(*distances, f"{case} {ordered}")
 
 
 def dense(descriptor, heads, q_len, kv_len):

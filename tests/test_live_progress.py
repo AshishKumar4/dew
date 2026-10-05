@@ -95,8 +95,9 @@ def test_unavailable_old_revision_requests_reload(progress, monkeypatch):
     load = Mock(side_effect=[object(), OfflineModeIsEnabled("offline")])
     models = progress.ReportingModels(load, lambda value: value)
     models("model", revision="new")
-    with pytest.raises(progress.StalePage, match=r"This page was updated.*Reload"):
+    with pytest.raises(progress.StalePage, match=r"This page was updated.*Reload") as caught:
         models("model", revision="old")
+    assert caught.value._render_traceback_() == [str(caught.value)]
     assert ("model", "old") not in models.loaded
 
 
