@@ -1,30 +1,30 @@
-"""Name the things a run is made of.
+"""Registries that name the things a run is made of.
 
-One Registry per kind, including model components such as mixers, towers and
-projectors. A registry is the record layer: config files, the CLI and run
-records name a member, and the registry maps that name to its class and back,
-so `models["simple_dit"]` is `SimpleDiT`. Code builds the class itself. A
-name or a field the table does not know raises.
+There is one `Registry` per kind, including model components such as mixers,
+towers and projectors. Config files, the CLI and run records refer to a member
+by name, and its registry maps that name to the class and back, so
+`models["simple_dit"]` is `SimpleDiT`. Python code builds the class directly. An
+unknown name or field raises an error.
 
 The registries are empty at import. Each member registers itself where it is
-defined, so importing a package fills its table and the registry module
-imports none of them. A lookup of a name its table does not hold yet imports
-the modules of Dew whose decorator registers that name, read off the
-sources (`_registering_modules`), so a record loads in a process that
-imported nothing beforehand, and nothing else is imported.
+defined, so importing a package fills its tables, and this module imports none
+of them. When a lookup asks for a name its table does not hold yet, the registry
+imports the Dew modules whose decorator registers that name, found by reading
+the sources. So a record loads in a process that imported nothing beforehand,
+and no other module is imported.
 
-A package outside Dew registers its members the same way and names a module
+A package outside Dew registers its members the same way, and lists a module
 whose import registers them under the `dew.plugins` entry-point group:
 
     [project.entry-points."dew.plugins"]
     sparx = "sparx"
 
-Only a name Dew's own sources do not register loads the plugins: every
-entry is imported once (`entry.load()`), and the lookup tries again. An
-entry that fails to import is named in the error of a lookup that then
-still misses, and in no other lookup. A plugin's own kind of member is a
-`Registry` it creates and `share`s, in the module that defines the kind's
-base class, so a record whose field declares that class rebuilds it.
+The plugins are loaded only for a name that Dew's own sources do not register.
+Every entry is then imported once (`entry.load()`), and the lookup tries again.
+An entry that fails to import is reported only in the error of a lookup that
+still misses after that. A plugin can also add a kind of its own. It creates a
+`Registry` and `share`s it in the module that defines the kind's base class, so
+a record whose field declares that class rebuilds the member.
 """
 
 from __future__ import annotations
@@ -116,7 +116,7 @@ def _registering_modules() -> Mapping[tuple[str, str], tuple[str, ...]]:
 
 
 PLUGINS = "dew.plugins"
-"""The entry-point group a package outside Dew names its registering module under."""
+"""The entry-point group under which a package outside Dew lists the module that registers its members."""
 
 
 @functools.cache
@@ -141,10 +141,14 @@ none: a reader asks each table for a member and tests what it got."""
 
 
 class Registry[T: Callable[..., Any], Built](Mapping[str, T]):
-    """Names one kind of thing: a decorator and a mapping from name to member.
+    """Holds the members of one kind by name, and registers them as a decorator.
 
-    A table records read is shared (`share`): Dew's eleven are, and a
-    plugin shares a kind of its own the same way.
+    `registry[name]` returns a member. If the table does not hold the name yet,
+    it first imports the Dew modules that register it, and then the plugins. An
+    unknown name raises KeyError listing the known ones.
+
+    Records can name members only of a shared table (`share`). Dew's twelve
+    tables are shared, and a plugin shares a kind of its own the same way.
     """
 
     def __init__(self, kind: str):
@@ -156,7 +160,12 @@ class Registry[T: Callable[..., Any], Built](Mapping[str, T]):
         self._members: dict[str, Any] = {}
 
     def __call__(self, name: str, /) -> Callable[[M], M]:
-        """Register the class it names, as `@models("simple_dit")`."""
+        """Return a decorator that registers a class or function under `name`, as in `@models("simple_dit")`.
+
+        The decorator returns the member unchanged. Raises TypeError for a name
+        that is not a non-empty string, and the decorator raises ValueError
+        when the name already maps to another member.
+        """
         if type(name) is not str or not name:
             raise TypeError(f"a {self.kind} name is a non-empty string, not {name!r}")
 
@@ -206,14 +215,15 @@ class Registry[T: Callable[..., Any], Built](Mapping[str, T]):
         return f"Registry({self.kind!r}, {sorted(self._members)})"
 
     def share(self) -> Registry[T, Built]:
-        """Make this table one a record names members of, and return it, as
-        `activations = Registry("activation").share()`.
+        """Share this table so records can name its members, and return it.
 
-        A record then rebuilds a member of it wherever a field declares the
-        member's base class, and writes it back by name. Share a plugin's
-        kind in the module that defines that base class, so any field typed
-        with it finds the table. A kind has one shared table; sharing the
-        same table again does nothing.
+        A typical use is `activations = Registry("activation").share()`. A
+        record then rebuilds a member wherever a field declares the member's
+        base class, and writes the member back by name. Share a plugin's kind
+        in the module that defines that base class, so every field typed with
+        it finds the table. A kind has one shared table; sharing the same table
+        again does nothing, and sharing a second table of that kind raises
+        ValueError.
         """
         for held in _SHARED:
             if held.kind == self.kind and held is not self:
@@ -224,12 +234,15 @@ class Registry[T: Callable[..., Any], Built](Mapping[str, T]):
 
     @staticmethod
     def shared() -> tuple[Registry, ...]:
-        """Every shared table: Dew's eleven, then any a plugin shared."""
+        """Return every shared table, Dew's twelve first, then any a plugin shared."""
         return tuple(_SHARED)
 
     def name_of(self, member: Named) -> str:
-        """Return the name a member was registered under. The table is scanned by
-        identity, so this takes a member of any registry, whatever it makes."""
+        """Return the name a member was registered under in this table.
+
+        The table is searched by identity, so `member` can be any class or
+        function, whatever the registry builds. A member this table does not
+        hold raises KeyError, with the decorator line that would register it."""
         for name, held in self._members.items():
             if held is member:
                 return name
@@ -240,16 +253,16 @@ class Registry[T: Callable[..., Any], Built](Mapping[str, T]):
               **fields: Configured) -> Built:
         """Construct the member called `name` from a record, keyword fields, or both.
 
-        A field the member does not declare is an error. Fields arrive from
-        JSON as often as from code, so a field whose declared type is a value
-        builds from a record here, where a logged config becomes an object:
+        A field the member does not declare is an error. Fields come from JSON
+        as often as from code, so a field whose declared type is a value class
+        is built here from its record. For example,
         `models.build("m", attention={"heads": 8})` and
-        `models.build("m", attention=Attention(heads=8))` agree.
+        `models.build("m", attention=Attention(heads=8))` build the same model.
 
-        A whole parsed config is the positional `record`: its values are
-        unnarrowed, and narrowing them against the member's declared types is
-        this method's job, so the splat happens here rather than at a caller
-        that would have to know the member's fields to write it.
+        Pass a whole parsed config as the positional `record`. Its values are
+        converted to the member's declared types here, so a caller does not
+        need to know the member's fields to unpack the config. Keyword fields
+        override the record's.
         """
         member = self[name]
         given: Mapping[str, object] = {**record, **fields}
@@ -261,16 +274,16 @@ class Registry[T: Callable[..., Any], Built](Mapping[str, T]):
     def from_record(self, record: Mapping[str, object]) -> Built:
         """Construct the member a `{"name": ..., "fields": {...}}` record names.
 
-        A config writes a mixer, a tower or a projector this way where code
-        passes the value `build` makes, so the two meet here. A record that
-        names no registered member raises, with the known ones.
+        A config writes a mixer, a tower or a projector as such a record, where
+        code passes the value `build` makes. A record that names no registered
+        member raises ValueError listing the known ones.
         """
         name, fields = _named(self, record)
         return self.build(name, fields)
 
     @property
     def union(self) -> type[Built] | types.UnionType:
-        """Return `Union[...]` of the members, for a tyro subcommand over the table."""
+        """The union of the members' types, for a tyro subcommand over the table."""
         return functools.reduce(operator.or_, self._members.values())
 
 
@@ -691,9 +704,9 @@ def with_precision(name: str, config: Mapping[str, object], *,
                    matmul_precision: str | None = None) -> Mapping[str, object]:
     """Return a model config with the run's compute dtype and attention kernel in it.
 
-    A composite that declares no `dtype` of its own, DiffusionGemma around its
-    text decoder, passes the run's compute dtype to the registered model parts
-    its record nests, which own it."""
+    A composite that declares no `dtype` of its own, such as DiffusionGemma
+    around its text decoder, passes the run's compute dtype on to the
+    registered model parts nested in its record that declare one."""
     fields = {**config, **precision_fields(
         name, config, dtype=dtype, attention_impl=attention_impl,
         param_dtype=param_dtype, matmul_precision=matmul_precision)}
