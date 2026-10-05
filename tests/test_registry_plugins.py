@@ -71,3 +71,61 @@ def test_a_plugin_entry_naming_a_missing_package_raises(tmp_path):
                           "models['plugin_mlp']\n")
     assert done.returncode != 0
     assert "not_installed_anywhere" in done.stderr and "dew.plugins" in done.stderr
+
+
+PLUGIN_KIND = '''
+from dataclasses import dataclass
+
+from dew.registry import Registry, share
+
+activations = share(Registry("activation", record="kind"))
+
+
+class Activation:
+    pass
+
+
+@activations("scaled_tanh")
+@dataclass(frozen=True)
+class ScaledTanh(Activation):
+    scale: float = 1.0
+'''
+
+PLUGIN_MODEL_WITH_KIND = '''
+import flax.linen as nn
+
+from dew.registry import models
+
+from toyplugin.kinds import Activation
+
+
+@models("plugin_act")
+class PluginAct(nn.Module):
+    activation: Activation
+
+    @nn.compact
+    def __call__(self, x):
+        return x
+'''
+
+
+def test_a_plugin_kind_rebuilds_from_a_record_and_writes_back_its_kind(tmp_path):
+    _install(tmp_path, "toyplugin", PLUGIN_MODEL_WITH_KIND)
+    (tmp_path / "toyplugin" / "kinds.py").write_text(PLUGIN_KIND)
+    done = _run(tmp_path, "from dew.registry import models\n"
+                          "from dew.config import _to_json\n"
+                          "record = {'activation': {'kind': 'scaled_tanh', 'scale': 2.0}}\n"
+                          "built = models.build('plugin_act', record)\n"
+                          "print(type(built.activation).__name__, built.activation.scale)\n"
+                          "print(_to_json(built.activation, type(built).__annotations__['activation']))\n")
+    assert done.returncode == 0, done.stderr[-2000:]
+    assert done.stdout.splitlines() == ["ScaledTanh 2.0", "{'kind': 'scaled_tanh', 'scale': 2.0}"]
+
+
+def test_a_second_shared_table_of_one_kind_is_refused():
+    import pytest
+
+    from dew.registry import Registry, models, share
+    assert share(models) is models
+    with pytest.raises(ValueError, match="already shared"):
+        share(Registry("model"))

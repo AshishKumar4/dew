@@ -133,10 +133,17 @@ def _registering_modules() -> Mapping[tuple[str, str], tuple[str, ...]]:
 
 
 class Registry[T: Callable[..., Any], Built](Mapping[str, T]):
-    """Names one kind of thing: a decorator and a mapping from name to member."""
+    """Names one kind of thing: a decorator and a mapping from name to member.
+
+    A table is held by a module attribute named for its kind plus "s", as
+    `models` holds the `model` table, and that name is how its decorators read
+    in sources. A plugin package makes a kind of its own the same way, in a
+    module of its own, and passes it to `share` so records rebuild its members.
+    """
 
     def __init__(self, kind: str, *, record: Literal["name", "kind"] = "name"):
         self.kind = kind
+        self.attribute = f"{kind}s"
         self.record = record
         # A decorator has no base class to test the member against, and it
         # hands back the class it decorated so a caller's checker keeps the
@@ -168,13 +175,13 @@ class Registry[T: Callable[..., Any], Built](Mapping[str, T]):
             return self._members[name]
         except KeyError:
             known = set(self._members) | {held for attribute, held in _registering_modules()
-                                          if getattr(sys.modules[__name__], attribute, None) is self}
+                                          if attribute == self.attribute}
             raise KeyError(f"no {self.kind} named {name!r}; known: {', '.join(sorted(known))}") from None
 
     def _registering(self, name: str) -> tuple[str, ...]:
         """The modules of Dew or a plugin whose decorator registers `name` in this table."""
         return tuple(module for (attribute, held), modules in _registering_modules().items()
-                     if held == name and getattr(sys.modules[__name__], attribute, None) is self
+                     if held == name and attribute == self.attribute
                      for module in modules)
 
     def __iter__(self) -> Iterator[str]:
@@ -627,12 +634,30 @@ schedules: Registry[type[ScheduleBase], ScheduleBase] = Registry("schedule", rec
 
 # Core records nest their fields under a name; model component records inline
 # their fields beside the kind discriminator `Registry.from_record` reads.
-REGISTRIES = (models, presets, solvers, datasets, encoders, metrics, objectives,
-              mixers, towers, projectors, schedules)
+REGISTRIES: list[Registry[Any, Any]] = [models, presets, solvers, datasets, encoders, metrics, objectives,
+                                        mixers, towers, projectors, schedules]
+"""The tables a record names members of: Dew's, then those its plugins `share`."""
+
+
+def share[T: Registry[Any, Any]](table: T) -> T:
+    """Add a plugin's table to `REGISTRIES` and return it, as
+    `activations = share(Registry("activation", record="kind"))`.
+
+    Records then rebuild its members wherever a field declares their base
+    class, and write them back as their kind. A kind has one shared table;
+    sharing the same table again is harmless.
+    """
+    for held in REGISTRIES:
+        if held.kind == table.kind and held is not table:
+            raise ValueError(f"a {table.kind} registry is already shared; a kind has one table")
+    if table not in REGISTRIES:
+        REGISTRIES.append(table)
+    return table
 
 __all__ = [
     "REGISTRIES",
     "Registry",
+    "share",
     "datasets",
     "encoders",
     "metrics",
