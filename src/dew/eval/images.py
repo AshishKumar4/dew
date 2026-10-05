@@ -84,8 +84,10 @@ def _artifact_cosine(artifact: ImageGrid, batch: Batch, field: str, modelname: s
 
 @metrics("clip")
 class CLIPDistance(ImageMetric):
-    """Score CLIP distance, mean(1 - cos(image, text)); lower is better. It logs as
-    val/clip_similarity; `CLIPScore` is the standard number for a new run.
+    """Measures the CLIP distance, `mean(1 - cos(image, text))`; lower is better.
+
+    It logs as `val/clip_similarity`. `CLIPScore` is the standard number to
+    report for a new run.
     """
 
     def __init__(self, modelname: str = DEFAULT_MODEL, field: str = "text"):
@@ -97,8 +99,12 @@ class CLIPDistance(ImageMetric):
 
 @metrics("clip_score")
 class CLIPScore(ImageMetric):
-    """CLIPScore, of an image set against its prompts (`score`) or as the mean
-    over the sampled images and the validation batch's prompts."""
+    """Measures CLIPScore for an image set against its prompts (`score`), or over a validation pass.
+
+    Over a validation pass it is the mean over the sampled images and the
+    batch's tokenized prompts in `field`. `modelname` names the CLIP
+    checkpoint.
+    """
 
     def __init__(self, modelname: str = DEFAULT_MODEL, field: str = 'text'):
         def measure(artifact, batch):
@@ -107,12 +113,13 @@ class CLIPScore(ImageMetric):
         self.modelname = modelname
 
     def score(self, images: ArrayLike, prompts: Sequence[str], *, batch_size: int = 64) -> float:
-        """Score CLIPScore of uint8 [N, H, W, 3] images against one prompt each.
+        """Return the CLIPScore of uint8 [N, H, W, 3] images, each against its own prompt.
 
-        100 * mean(max(cos(image, prompt), 0)), higher is better; typical T2I
-        models score around 25-35 on natural prompts. The images are scored
-        `batch_size` rows at a time, and the prompts are tokenized the way a run's
-        batch carries them.
+        The score is `100 * mean(max(cos(image, prompt), 0))`, and higher is
+        better. Typical T2I models score around 25-35 on natural prompts. The
+        images are scored `batch_size` rows at a time, and the prompts are
+        tokenized the way a run's batch holds them, truncated to CLIP's
+        context.
         """
         if batch_size < 1:
             raise ValueError(f"clip_score: a batch holds at least one image, got batch_size={batch_size}")

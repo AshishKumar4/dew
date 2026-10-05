@@ -88,7 +88,7 @@ def test_device_timeline_covers_nested_and_disjoint_kernels(
     events = [SimpleNamespace(name="kernel", start_ns=start * 1_000_000,
                               end_ns=end * 1_000_000) for start, end in intervals]
     profile = SimpleNamespace(planes=[SimpleNamespace(
-        name="/device:GPU:0", lines=[SimpleNamespace(events=events)])])
+        name="/device:GPU:0", lines=[SimpleNamespace(name="Stream #1(Compute)", events=events)])])
     monkeypatch.setattr(jax.profiler, "ProfileData", SimpleNamespace(
         from_file=lambda path: profile))
 

@@ -123,14 +123,15 @@ class JournalRun:
 
 @dataclass(frozen=True)
 class EpisodeJournal:
-    """Persist completed turns before the next tool call or trainer update.
+    """Saves each completed turn to disk before the next tool call or trainer update.
 
-    The directory is dedicated to one run. Each rank owns one SQLite file,
-    protected against concurrent writers by flock. WAL commits use FULL
-    synchronization. Recovery requires the same cohort layout, controls,
-    policy shards and key. Environment snapshots must include all state
-    needed to continue; external effects in a pending call need idempotency
-    from the environment. A completed, committed turn is never executed again.
+    `directory` belongs to one run. Each rank writes its own SQLite file, and
+    an flock keeps out a second writer. The database runs in WAL mode with
+    `synchronous=FULL`. Recovery needs the same cohort layout, controls,
+    policy shards and key. An environment snapshot must hold all the state
+    needed to continue, and the environment must make the external effects
+    of a pending call idempotent. A completed turn that was committed never
+    runs again.
     """
 
     directory: str
@@ -139,9 +140,10 @@ class EpisodeJournal:
     def open(self, cohort: str, signature: str, binding: str) -> Iterator[JournalRun]:
         """Open this rank's journal file and yield the run for one cohort.
 
-        The file is locked for the caller alone. A cohort that is already
-        recorded has to present the same signature, and its stored binding
-        wins over the caller's.
+        The file stays locked for the caller until the context exits, and
+        opening a file someone else holds fails at once. A cohort that is
+        already recorded must present the same signature, and its stored
+        binding replaces the caller's.
         """
         directory = Path(self.directory)
         directory.mkdir(parents=True, exist_ok=True)

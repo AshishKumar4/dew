@@ -1,6 +1,6 @@
 # Papers and attribution
 
-The papers explain methods used in Dew. The projects are dependencies, reference implementations used in tests, or sources of adapted code. These citations do not imply that Dew reproduces every result or supports every model. See the [API reference](reference/core-api.md) for Dew's interfaces and [Step benchmarks](benchmarks.md) for measurements with hardware and source revisions.
+The papers below explain methods that Dew uses. The projects below are Dew's dependencies, reference implementations it is checked against, or sources of code it adapts. Citing a paper or project does not mean Dew reproduces all of its results or supports every model it covers. Dew's own interfaces are in the [API reference](reference/core-api.md), and its measurements with hardware and revision in [Step benchmarks](benchmarks.md).
 
 ## Diffusion and flow models
 
@@ -24,7 +24,7 @@ DDPM introduces the denoising objective. EDM relates noise levels, the network's
 | Guidance over part of the sampling path | [Applying Guidance in a Limited Interval Improves Sample and Distribution Quality](https://arxiv.org/abs/2404.07724) |
 | Diffusion language modeling and a square-root schedule | [Diffusion-LM Improves Controllable Text Generation](https://arxiv.org/abs/2205.14217) |
 
-Dew's `simple_dit` is a DiT variant that embeds time steps with EDM-style random Fourier features. The original DiT uses sinusoidal embeddings. Time scaling depends on the model and training convention. The flow preset multiplies time by 1000; Fourier features do not require this factor in general. The [diffusion guide](guides/diffusion.md) shows how to pair a preset with a model.
+Dew's `simple_dit` embeds the time step with EDM-style random Fourier features, where the original DiT uses sinusoidal embeddings. So `simple_dit` is a variant of the DiT architecture. How the time value is scaled belongs to the model and training convention you pick. The flow preset multiplies time by 1000, but Fourier features do not require that factor in general. The [diffusion guide](guides/diffusion.md) shows how a preset and a model fit together.
 
 ## Representation learning and sequence models
 
@@ -32,7 +32,7 @@ Dew's `simple_dit` is a DiT variant that embeds time steps with EDM-style random
 - [Revisiting Feature Prediction for Learning Visual Representations from Video (V-JEPA)](https://arxiv.org/abs/2404.08471) applies the same feature prediction to video.
 - [Simplified State Space Layers for Sequence Modeling (S5)](https://arxiv.org/abs/2208.04933) describes the state-space layer that Dew's SSM components follow.
 
-The [representation-learning guide](guides/representation-learning.md) explains encoders, predictors, target encoders and masks, then covers recipe settings.
+The [representation-learning guide](guides/representation-learning.md) explains the encoder, the predictor, the target encoder, and the masks before it gets to recipe settings.
 
 ## Language-model post-training
 
@@ -40,13 +40,13 @@ The [representation-learning guide](guides/representation-learning.md) explains 
 - [DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models](https://arxiv.org/abs/2402.03300) introduces GRPO.
 - [TRL](https://github.com/huggingface/trl) and [verl](https://github.com/verl-project/verl) are the reference implementations for the small numerical comparisons recorded in [post-training](concepts/post_training.md).
 
-The comparisons check fixed losses, gradients and one chat-rendering case. They do not establish end-to-end learning parity with TRL or verl. They also do not test agentic RL or production deployment.
+Those comparisons check fixed losses, gradients, and one chat-rendering case. They do not show that Dew learns end to end like TRL or verl, and they say nothing about agentic RL or production deployment.
 
 ## Dependencies and adapted code
 
 Dew uses [JAX](https://github.com/jax-ml/jax) for arrays and transformations, [Flax Linen](https://github.com/google/flax) for neural-network modules, [Optax](https://github.com/google-deepmind/optax) for optimizers, [Orbax](https://github.com/google/orbax) for checkpoints, and [Grain](https://github.com/google/grain) for data loading. [tyro](https://github.com/brentyi/tyro) turns the recipe dataclasses into command-line interfaces. [Weights & Biases](https://github.com/wandb/wandb) is an optional run tracker.
 
-Depending on your loader, image and public-dataset workflows use [OpenCV](https://github.com/opencv/opencv-python) and [TensorFlow Datasets](https://github.com/tensorflow/datasets). [Transformers](https://github.com/huggingface/transformers) supplies tokenizers and encoders; [safetensors](https://github.com/huggingface/safetensors) supplies the tensor file format. Offline byte-token and in-memory examples need fewer dependencies. [Installation](installation.md) lists the extras for each workflow.
+Depending on the loader you choose, the image and public-dataset paths use [OpenCV](https://github.com/opencv/opencv-python) and [TensorFlow Datasets](https://github.com/tensorflow/datasets). [Transformers](https://github.com/huggingface/transformers) provides tokenizers and encoders, and [safetensors](https://github.com/huggingface/safetensors) provides the tensor file format. The offline byte-token and in-memory examples do not need all of these; [installation](installation.md) lists the extras each workflow needs.
 
 The Stable Diffusion Flax VAE is adapted from [Hugging Face Diffusers](https://github.com/huggingface/diffusers) v0.29.2, which is Apache-2.0. Parts of Dew's attention blocks are also adapted from Diffusers' Flax attention code. The InceptionV3 model used for FID is adapted mainly from [jax-fid](https://github.com/matthias-wright/jax-fid), which itself descends from the PyTorch/torchvision model. If you redistribute adapted code, keep the upstream attribution and license notices. The licenses of dependencies, checkpoints, and datasets are separate from Dew's license.
 
@@ -62,4 +62,4 @@ Dew's first diffusion experiments started from the Keras tutorials for [DDPM by 
 
 [MaxText](https://github.com/AI-Hypercomputer/maxtext) and [Levanter](https://github.com/stanford-crfm/levanter) are JAX projects for training language models. [verl](https://github.com/verl-project/verl) is for RL post-training and [vLLM](https://github.com/vllm-project/vllm) is for inference and serving. Each project documents its own supported models and deployment requirements.
 
-Dew's `save_hf_layout` writes `model.safetensors` and `config.json` in the Hugging Face layout. It leaves tensor names and the model configuration unchanged. `PretrainedDecoder.from_model(...).save` translates them for supported decoder families and rejects unsupported model features. It also writes your tokenizer's files beside the weights. Neither API guarantees compatibility with a particular serving engine. [Language models](concepts/language_models.md) lists family-specific limits. Test an export in the program that will load it.
+Dew's `save_hf_layout` writes `model.safetensors` and `config.json` into a directory in the Hugging Face layout. It does not translate tensor names or the model configuration. `PretrainedDecoder.from_model(...).save` does translate for the decoder families it accepts, refuses model features it does not support, and writes the files of the tokenizer you give it next to the weights. Neither API guarantees that a given serving engine can run the export. [Language models](concepts/language_models.md) lists the family-specific limits; test an export in the program that will load it.

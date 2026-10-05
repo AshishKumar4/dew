@@ -3,9 +3,8 @@
 Run from an installed Dew checkout, without downloads:
     JAX_PLATFORMS=cpu python examples/readme_demo.py --out runs/readme-demo
 
-Use a new output directory for each invocation. The synthetic data exercises
-the workflow; its results do not measure language ability, preference quality
-or useful image generation.
+Use a new output directory for each invocation. The generated data demonstrates
+mechanics, not language ability, preference quality, or useful image generation.
 """
 import itertools
 import json

@@ -51,13 +51,13 @@ def _hf_datasets():
 
 @dataclasses.dataclass(frozen=True)
 class HFOptions:
-    """Holds `datasets.load_dataset`'s arguments as one value of their own types.
+    """Holds the arguments of `datasets.load_dataset` as one value, each with
+    its own type.
 
-    Both hf routes call `load`, so the Arrow source and the streamed source
-    cannot drift apart in what they forward. The fields are the library's,
-    named as the library names them apart from `config`, which is
-    `load_dataset`'s `name`; dew already uses `name` for which dataset this
-    is.
+    The Arrow source and the streamed source both call `load`, so they always
+    pass the same arguments. The fields have the library's names, except
+    `config`, which is `load_dataset`'s `name`, because Dew already uses
+    `name` for the dataset's id.
     """
 
     config: str | None = None
@@ -74,15 +74,15 @@ class HFOptions:
     token: str | bool | None = None
     num_proc: int | None = None
     storage_options: Mapping[str, Any] | None = None
-    """`datasets` passes this to fsspec, whose backends declare their own
-    options; the mapping is theirs to read."""
+    """Options that `datasets` passes to fsspec. Each fsspec backend defines its own options, so
+    Dew passes the mapping on unread."""
 
     def load(self, path: str, split: str, *, streaming: bool):
-        """The split at `path`, through `datasets.load_dataset`.
+        """Load the split at `path` with `datasets.load_dataset`.
 
-        This is where the library downloads a hub dataset and writes an Arrow
-        cache, on its own terms. A streamed split reads as it goes instead.
-        Dew adds nothing to either.
+        This is where the library downloads a hub dataset and writes its
+        Arrow cache, as it normally does. With `streaming`, it reads the
+        split as it goes. Dew adds nothing to either.
         """
         datasets = _hf_datasets()
         return datasets.load_dataset(

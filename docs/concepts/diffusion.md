@@ -4,9 +4,7 @@ A diffusion model learns to undo noise. Training takes a clean sample $x_0$, dra
 
 $$x_t = \alpha_t x_0 + \sigma_t \epsilon.$$
 
-The network takes $x_t$ and $t$ as inputs. It predicts a quantity that you can convert to $x_0$ and $\epsilon$. To sample, a solver starts from noise at the highest time and steps through a time grid down to zero.
-
-In Dew, a `Process` defines the choices that training and sampling must share. A preset builds a `Process` from a published method, and `dew.sampling.sample` runs a solver with it.
+The network sees $x_t$ and $t$ and predicts a quantity from which $x_0$ and $\epsilon$ can be recovered. Sampling starts from noise at the highest time, and a solver steps through a grid of times down to zero. In Dew, a `Process` holds every part of this convention that training and sampling must agree on. A preset builds the `Process` of a published method, and `dew.sampling.sample` runs a solver over it.
 
 ![The same image noised at six times under the Cosine and Flow presets, with the alpha and sigma curves of both.](../assets/diffusion-forward-light.svg)
 ![The same image noised at six times under the Cosine and Flow presets, with the alpha and sigma curves of both.](../assets/diffusion-forward-dark.svg)
@@ -55,15 +53,13 @@ A `Process` is a frozen dataclass of four parts:
 | Weighting | How the loss weighs each time: the schedule's own weight, a P2-style weight, or Min-SNR |
 | Sampling schedule | The time grid inference walks, when it differs from training |
 
-For sampling, `process.noise(key, shape)` draws the starting noise at the highest level. `process.times(steps)` returns the descending time grid. `process.rates(t, like=x)` returns `(alpha, sigma)` at `t`, shaped to broadcast against `x`.
-
-`process.denoiser(model, params, conditions)` builds the function a solver calls. Given a noisy sample and its time, it uses the model and weights to estimate the clean sample and the noise.
+Sampling uses four methods of the process. `process.noise(key, shape)` draws the starting noise at the highest level. `process.times(steps)` returns the descending grid of times a solver steps through, and `process.rates(t, like=x)` returns `(alpha, sigma)` at `t`, shaped to broadcast against `x`. `process.denoiser(model, params, conditions)` wraps a model and its weights into the function a solver calls. That function takes a noisy sample and its time and returns the model's estimates of the clean sample and of the noise.
 
 ## Presets
 
-A preset is a frozen dataclass with the numbers that define a published method. Pass `EDM(regime="pixel")` or `Flow()` directly to `DiffusionObjective` or `DiffusionRunConfig(preset=...)`. They build the process, which the objective's image task also uses. Call a preset yourself to build a `Process` for inspecting schedules or sampling at the lower level.
+A preset is a frozen dataclass of the numbers that define a published convention. Pass `EDM(regime="pixel")` or `Flow()` directly to `DiffusionObjective` or `DiffusionRunConfig(preset=...)`. They build the process, and the objective's image task keeps that same process. Call a preset yourself when you want a `Process` to inspect its schedule or to sample with at a low level.
 
-EDM's regime selects the training noise levels: Karras et al. 2022's for pixels or EDM2's for latents. Explicit `P_mean` and `P_std` values override the regime. If you supply both, you can omit the regime; old run records therefore keep their training distribution. Otherwise the EDM preset needs a regime before it can build. A run config selects it based on whether the run has an autoencoder. `run.json` stores the preset's fields so sampling can rebuild the process used in training.
+EDM's regime chooses the training noise levels, those of Karras et al. (2022) for pixels or EDM2's for latents. Explicit `P_mean` and `P_std` values override the regime. Supplying both also works without a regime, so old run records keep their training distribution. Otherwise an EDM preset without a regime refuses to build, and a run config picks the regime from whether the run has an autoencoder. A run's `run.json` stores the preset's fields, so sampling rebuilds the convention the model was trained with.
 
 | Preset | Convention |
 |---|---|
@@ -76,67 +72,51 @@ EDM's regime selects the training noise levels: Karras et al. 2022's for pixels 
 | `Sqrt` | Diffusion-LM (Li et al., 2022): the square-root schedule with the plain $x_0$ loss |
 | `MDLM` | Masked diffusion over tokens (Sahoo et al., 2024) on the log-linear schedule, from `dew.diffusion.discrete`; it takes the vocabulary's `mask_id` |
 
-The presets are classes in `dew.diffusion.presets`. Training and inference can use different schedules. For example, EDM trains on log-normal noise levels and samples on the Karras grid.
+The presets are classes in `dew.diffusion.presets`. Training and inference can use different schedules; for example, EDM trains on log-normal noise levels and samples on the Karras grid.
 
-`MinSNR(gamma)` in `dew.diffusion` replaces a process's weighting with min-SNR-$\gamma$ (Hang et al., 2023). It weights the $x_0$ loss by $\min(\mathrm{SNR}, \gamma)$. For an $\epsilon$ prediction, it divides that weight by SNR; for a $v$ prediction, by SNR + 1. EDM preconditioning computes its loss on $x_0$, so it uses the cap without division.
+`MinSNR(gamma)` in `dew.diffusion` replaces a process's weighting with min-SNR-$\gamma$ (Hang et al., 2023). The weight is $\min(\mathrm{SNR}, \gamma)$ on the $x_0$ loss, and that value divided by SNR for an $\epsilon$ prediction or by SNR + 1 for a $v$ prediction. The EDM preconditioning computes its loss on $x_0$, so it takes the cap as it is.
 
-EDM2 (Karras et al., 2024) uses the `EDM` preset's latent regime. Its `edm2_unet` backbone uses the magnitude-preserving layers in `dew.nn.mp`. It matches NVlabs' `UNet` (`tools/edm2_reference.py`), with a text condition in place of the class label.
-
-`--optim.forced-weight-normalization` renormalizes those layers' weights after every update, as the paper specifies. Set `uncertainty=128` on the run config to learn the paper's loss weighting. This trains a head u(sigma) beside the model with the loss w / e^u ||D - y||^2 + u. The published task omits that head.
+EDM2 (Karras et al., 2024) trains under the `EDM` preset with its latent regime. Its network is the `edm2_unet` backbone, built from the magnitude-preserving layers in `dew.nn.mp`. The backbone matches NVlabs' `UNet` (`tools/edm2_reference.py`), with a text condition in place of the class label. `--optim.forced-weight-normalization` renormalizes those layers' weights after every update, as the paper's forced weight normalization does. `uncertainty=128` on the run config learns the paper's loss weighting, a head u(sigma) trained beside the model with the loss w / e^u ||D - y||^2 + u. A published task drops that head.
 
 ## Training aids
 
-To add representation alignment, set `alignment=RepresentationAlignment(...)` on `DiffusionRunConfig`. It builds `DiffusionObjective(alignment=Alignment(...))`.
+A run adds representation alignment with `alignment=RepresentationAlignment(...)` on `DiffusionRunConfig`, which builds `DiffusionObjective(alignment=Alignment(...))`. REPA (Yu et al., 2025) projects the model's hidden tokens after one layer with an MLP. It scores the projected tokens against a frozen DINOv2's patch features of the clean image by negative cosine similarity, weighted by `weight` (REPA's `proj_coeff`). Dew's L2 loss halves the denoising error, so the alignment term is halved with it. iREPA (Singh et al., 2026) sets `projector="conv"`, one 3x3 convolution over the token grid, and `spatial_norm=gamma`, which z-scores the encoder's features over space after subtracting gamma times their mean (0.6 in its training script).
 
-REPA (Yu et al., 2025) uses an MLP to project the model's hidden tokens after one layer. The loss compares them with a frozen DINOv2 encoder's patch features of the clean image. It uses negative cosine similarity, weighted by `weight` (REPA's `proj_coeff`). Dew halves the L2 denoising error and the alignment loss together.
+Both losses match the official code (`tools/repa_reference.py`). REPA's whole training loss, as its `train.py` composes `SILoss`, and its gradient in every weight are twice Dew's. The encoder's input goes through REPA's and iREPA's DINOv2 preprocessing: divide by 255, apply ImageNet's normalization, and resize bicubically to 224 for a 256-pixel image with `resolution=224`. The projector trains beside the model and the encoder's weights stay frozen, and a published task drops both.
 
-iREPA (Singh et al., 2026) uses `projector="conv"`, a single 3x3 convolution over the token grid. `spatial_norm=gamma` subtracts gamma times the encoder features' spatial mean, then z-scores them over space. The training script uses gamma 0.6.
+The aligned tokens must lie on the encoder's patch grid in raster order. For REPA's setup on a 256-pixel run, a latent DiT of patch 2 has 16x16 tokens, which the default `encoder="facebook/dinov2-base"` reads at `resolution=224` (16x16 patches of 14 pixels). `layer="dit_block_7"` aligns after the eighth block of `simple_dit`. In Python, the same encoder comes from `dew.nn.autoencoders.rae.load_dinov2`, as `module.clone(input_size=224)` over its parameters.
 
-`tools/repa_reference.py` compares both losses with the official code. REPA's complete training loss, as `train.py` composes `SILoss`, and its gradient in every weight are twice Dew's. Encoder preprocessing matches REPA and iREPA: divide by 255, apply ImageNet normalization, then resize bicubically to 224 for a 256-pixel image with `resolution=224`. The projector trains with the model, while the encoder's weights stay frozen. The published task omits the projector and encoder.
+`RepresentationAlignment(end_to_end=EndToEnd())` adds REPA-E (Leng et al., 2025), which tunes the run's KL autoencoder together with the model. The autoencoder trains on its L1 reconstruction and KL, plus 1.5 times the alignment loss of its latent as the frozen model reads it. The model trains on the detached latent, normalized by a batch norm without affine parameters. That norm's running statistics replace the autoencoder's fixed latent scale. A saved run's task decodes with the tuned autoencoder and these statistics, scaling by the reciprocal square root of the running variance without the norm's epsilon, as REPA-E's `extract_latents_stats` does.
 
-The aligned tokens must match the encoder's patch grid in raster order. In REPA's 256-pixel setup, a latent DiT with patch size 2 has 16x16 tokens. The default `encoder="facebook/dinov2-base"` uses `resolution=224` to produce 16x16 patches of 14 pixels. `layer="dit_block_7"` aligns after the eighth block of `simple_dit`. In Python, load this encoder with `dew.nn.autoencoders.rae.load_dinov2` and use `module.clone(input_size=224)` with its parameters.
+REPA-E's LPIPS and PatchGAN terms are left out. The regularizer and the batch norm match REPA-E's code, and so does a whole step. `tools/repae_reference.py` runs `train_repae.py`'s loop body as published, with those two terms at weight 0. Against it, Dew's step gives the same autoencoder gradient and running statistics, and half the model's gradient, because Dew halves its L2 loss.
 
-`RepresentationAlignment(end_to_end=EndToEnd())` adds REPA-E (Leng et al., 2025), which tunes the run's KL autoencoder with the model. The autoencoder loss includes L1 reconstruction, KL and 1.5 times the alignment loss on its latent through the frozen model. The model trains on the detached latent after affine-free batch normalization.
-
-The batch norm's running statistics replace the autoencoder's fixed latent scale. A saved run decodes with the tuned autoencoder and these statistics. As in REPA-E's `extract_latents_stats`, it scales by the running variance's reciprocal square root without the batch norm's epsilon.
-
-Dew omits REPA-E's LPIPS and PatchGAN terms. `tools/repae_reference.py` compares a complete step with the published `train_repae.py` loop, with those two terms at weight 0. The regularizer, batch norm, autoencoder gradient and running statistics match. The model's gradient is half the reference's because Dew halves its L2 loss.
-
-`simple_dit`'s `routes` implements TREAD's token routing (Krause et al., 2025) during training only. Each `(ratio, start, end)` makes a random `ratio` of the tokens skip blocks `start` to `end`. These tokens keep their values from before `start`, then rejoin the others after `end`. The skipped blocks therefore process fewer tokens. The gather and scatter match CompVis/tread's `Router` (`tools/tread_reference.py`). Sampling runs every token through every block.
+`simple_dit`'s `routes` is TREAD's token routing (Krause et al., 2025), which applies during training only. Each `(ratio, start, end)` makes a random `ratio` of the tokens skip blocks `start` to `end`. Those tokens rejoin afterwards with the values they had before `start`, so the skipped blocks compute on fewer tokens. The gather and scatter match CompVis/tread's `Router` (`tools/tread_reference.py`), and sampling runs every token through every block.
 
 ## Few-step generators
 
-`MeanFlowObjective` trains the average velocity u(z_t, r, t) using the MeanFlow identity u = v - (t - r) du/dt. One `jax.jvp` through the model computes the derivative along the flow. Training-time guidance mixes the sample's velocity with the model's unconditional and conditional velocities (`omega`, `kappa`). `norm_p` and `norm_eps` control adaptive weighting of each row's squared error.
+`MeanFlowObjective` trains the average velocity u(z_t, r, t) through the MeanFlow identity u = v - (t - r) du/dt. One `jax.jvp` through the model takes the derivative along the flow. The training-time guidance mixes the sample's velocity with the model's own unconditional and conditional velocities (`omega`, `kappa`), and each row's squared error is weighted adaptively (`norm_p`, `norm_eps`).
 
-As in the reference, a draw at `unconditional_prob` determines how many rows have their condition dropped. These are the first rows in the batch, the instantaneous rows. The loss and gradient match Gsunshine/meanflow's `forward` on the reference's draws (`tools/meanflow_reference.py`). For an interval process, `sample` passes the model the interval to the next grid point at each step. `steps=2` therefore makes one step from noise to data.
+As in the reference, the condition is dropped on the first rows of a batch, which are the instantaneous rows, and a draw at `unconditional_prob` decides how many. The loss and its gradient match Gsunshine/meanflow's `forward` on the reference's own draws (`tools/meanflow_reference.py`). On an interval process, `sample` gives the model the interval to the next grid point at every step, so `steps=2` is one step from noise to data.
 
-MeanFlow's and sCM's losses differentiate the model in time, so the model's time embedding has to change slowly with time. With `simple_dit`'s default Fourier scale of 16, applied to a flow's model time (sigma times 1000), it changes too fast. A run config sets `time_scale=0.002` for MeanFlow, and sCM distillation refuses a teacher trained at any other scale unless it distills with DMD alone (`consistency_weight=0`).
+MeanFlow's and sCM's losses differentiate the model in time, so the model's time embedding has to change slowly with time. With `simple_dit`'s default Fourier scale of 16, applied to a flow's model time (sigma times 1000), it changes too fast. A MeanFlow run config sets `time_scale=0.002` when the model config names no scale, and sCM distillation refuses a teacher trained at any other scale unless it distills with DMD alone (`consistency_weight=0`).
 
-A 2-D two-class toy compared the scales on an RTX 4080. It used a ring of eight Gaussians and a one-token `simple_dit` trained with these objectives. At scale 16, MeanFlow diverged after 8,000 steps, and the sCM student reached 11% class accuracy in one step. With `time_scale=0.002`, MeanFlow reached 99% in one step and 100% in two. The rCM student reached 98.6% in one step. Its teacher needs about 32 Euler steps for 99.9%.
+On a 2-D two-class toy, a ring of eight Gaussians trained with these objectives on a one-token `simple_dit` (RTX 4080), MeanFlow at scale 16 diverged after 8,000 steps, and the sCM student reached 11% class accuracy in one step. At `time_scale=0.002`, MeanFlow reached 99% in one step and 100% in two, and the rCM student reached 98.6% in one step, from a teacher that needs about 32 Euler steps for 99.9%.
 
-`ShortcutObjective` (Frans et al., 2025) trains a velocity conditioned on its step size. Select `shortcut` on the run config with the `Shortcut` preset. Most rows use flow matching at the finest step, 1 / `sections`. One row in `bootstrap_every` trains self-consistency at dyadic levels: one step of size 2d should match two steps of size d from the EMA weights.
+`ShortcutObjective` (Frans et al., 2025) trains a velocity conditioned on its step size; on the run config it is `shortcut`, under the `Shortcut` preset. Most rows are flow matching at the finest step, 1 / `sections`. One row in `bootstrap_every` trains self-consistency at dyadic levels, so that one step of 2d equals two steps of d from the EMA weights.
 
-The path is `(1 - (1 - 1e-5) t) * noise + t * data`, as in the reference. It keeps a noise factor of 1e-5 at the data end, and the loss is mean squared error. The loss and gradient match kvfrans/shortcut-models' `get_targets` and `update` loss (`tools/shortcut_reference.py`). The reference reuses the batch's first images for both flow and self-consistency rows. Dew gives each row its own image; each row's loss has the same distribution as the reference's.
+The path is the reference's, `(1 - (1 - 1e-5) t) * noise + t * data`, whose noise keeps a factor of 1e-5 at the data end, and the loss is its mean squared error. The loss and its gradient match kvfrans/shortcut-models' `get_targets` and the loss in its `update` (`tools/shortcut_reference.py`). The reference's flow rows reuse the batch's first images, as its self-consistency rows do. Dew gives every row its own image, and each row's loss still has the same distribution as the reference's.
 
-`ConsistencyDistillationObjective` implements rCM (Zheng et al., 2025). Set `distill=ConsistencyDistillation(teacher=<run directory>)` on the run config to distill a saved flow run into a few-step student on TrigFlow.
+`ConsistencyDistillationObjective` is rCM (Zheng et al., 2025), set as `distill=ConsistencyDistillation(teacher=<run directory>)` on the run config. It distills a saved flow run into a few-step student on TrigFlow. The sCM loss (Lu & Song, 2025) pulls the student toward the teacher ODE's tangent, which comes from one `jax.jvp` through the student. The DMD2 loss (Yin et al., 2024) moves the student's few-step samples along the difference between a fake score, trained on those samples, and the teacher. `consistency_weight=0` keeps only DMD2, and `dmd_weight=0` keeps only sCM. The losses match NVlabs/rcm's own methods on their draws (`tools/rcm_reference.py`).
 
-The sCM loss (Lu & Song, 2025) trains the student toward the teacher ODE's tangent using one `jax.jvp` through the student. The DMD2 loss (Yin et al., 2024) moves the student's samples along the difference between a fake score, trained on those samples, and the teacher's score. Set `consistency_weight=0` for DMD2 alone or `dmd_weight=0` for sCM alone. Both losses match NVlabs/rcm's methods on their draws (`tools/rcm_reference.py`).
+As in rCM, the student and the fake score each step with their own copy of the optimizer, on their own updates ([Several networks, several optimizers](objectives.md#several-networks-several-optimizers)). The EMA averages the student's updates at the student's own count, and `ema_decay=power_decay(0.1)` (`dew.training.posthoc`) is rCM's power EMA. After ten updates through `Trainer`, both networks, the EMA and both Adams' moments are where rCM's own training loop puts them. The phases alternate update by update, so `accumulation` must be 1. The student samples with `Consistency`.
 
-As in rCM, the student and fake score use separate copies of the optimizer, each stepped on its own updates ([Several networks, several optimizers](objectives.md#several-networks-several-optimizers)). The EMA averages student updates using the student's update count. `ema_decay=power_decay(0.1)` (`dew.training.posthoc`) selects rCM's power EMA. After ten `Trainer` updates, both networks, the EMA and both Adam optimizers' moments match rCM's training loop. The phases alternate on each update, so `accumulation` must be 1. The student samples with `Consistency`.
+cuDNN's and the TPU's fused attention define only reverse-mode derivatives. So inside `dew.nn.attention.forward_mode_attention()`, where the JVP runs, each attention call keeps the fused kernel's value and takes its tangent from the reference path. On an RTX 4080 the cuDNN tangent matches the XLA kernel's to bf16 rounding.
 
-cuDNN and TPU fused attention kernels provide only reverse-mode derivatives. Where the JVP runs, `dew.nn.attention.forward_mode_attention()` keeps the fused kernel's value but computes its tangent with the reference path. On an RTX 4080, the cuDNN tangent matches the XLA kernel's within bf16 rounding.
+`GuidanceDistillationObjective` distills a saved run's classifier-free guidance into a model that reads the guidance scale as an input of its conditioning, as FLUX.1 [dev] does. On the run config it is `guidance_distill=GuidanceDistillation(teacher=<run directory>)`. This is stage one of Meng et al. (2023). Each row draws a scale w, and the student regresses its raw output onto the teacher's u + w (c - u) on the same noised sample. FLUX.1 [dev] has no published training code for its guidance embedding, so the tests check the loss against the paper's equation. A saved student samples one branch at its conditioner's guidance value.
 
-`GuidanceDistillationObjective` distills a saved run's classifier-free guidance. Set `guidance_distill=GuidanceDistillation(teacher=<run directory>)` on the run config. The student takes the guidance scale as a conditioning input, as FLUX.1 [dev] does. This is stage one of Meng et al. (2023).
+`AdversarialDistillationObjective` trains a few-step student with LADD's projected discriminator (Sauer et al., 2024); on the run config it is `adversarial=AdversarialDistillation(teacher=<run directory>, feature_layers=...)`. Both the clean predictions and the reference samples are renoised, and the frozen teacher's token grids go into StyleGAN-T heads with spectral normalization, local batch normalization and projection conditioning. The hinge losses train each side with the other side's gradient stopped. ADD's R1 penalty regularizes the heads, and `distillation_weight` adds ADD's alpha-weighted, summed squared distance toward the teacher's denoising (Sauer et al., 2023). LADD drops that term for synthetic data. ADD's DINOv2 discriminator is not implemented.
 
-Each row draws a scale w. On the same noised sample, the student's raw output regresses onto the teacher's u + w (c - u). FLUX.1 [dev] has no published training code for its guidance embedding, so the tests compare the loss with the paper's equation. A saved student samples one branch at its conditioner's guidance value.
-
-`AdversarialDistillationObjective` trains a few-step student with LADD's projected discriminator (Sauer et al., 2024). Configure it with `adversarial=AdversarialDistillation(teacher=<run directory>, feature_layers=...)`.
-
-It renoises both clean predictions and reference samples. The frozen teacher's token grids are inputs to StyleGAN-T heads with spectral normalization, local batch normalization and projection conditioning. Hinge losses train each side while stopping gradients through the other. ADD's R1 penalty regularizes the heads. `distillation_weight` adds ADD's alpha-weighted, summed squared distance toward the teacher's denoising (Sauer et al., 2023). LADD omits that term for synthetic data. Dew does not implement ADD's DINOv2 discriminator.
-
-Neither paper publishes training code. `tools/ladd_reference.py` implements a torch oracle for one step using the papers' equations, StyleGAN-T's published `DiscHead` and DiT's timestep embedding. Dew's loss, every gradient and the heads' spectral state match the oracle on Dew's draws.
-
-The papers leave two choices unspecified. Dew trains the student and heads in the same step; StyleGAN-T alternates generator and discriminator steps. Dew also updates spectral norms once per step on the real pass. Other passes use that iteration without storing their own.
+Neither paper publishes training code, so `tools/ladd_reference.py` writes one step as an oracle in torch: the papers' equations around StyleGAN-T's `DiscHead` and DiT's timestep embedding, run as published. Dew's loss, every gradient and the heads' spectral state match it on Dew's own draws. Two choices are Dew's own, because the papers make neither. The student and the heads train in the same step, where StyleGAN-T alternates a generator step and a discriminator step. The spectral norms iterate once per step on the real pass, and the other passes read that iteration without storing their own.
 
 The CIFAR-10 runs below use 32-pixel images, a flow `simple_dit` teacher (width 256, six blocks, 3,000 training steps), and FID-5k. Teacher columns give one-/four-/25-step Euler FID with CFG 1.5. Student columns use `Consistency`, without sampling-time CFG.
 
@@ -151,7 +131,7 @@ The CIFAR-10 runs below use 32-pixel images, a flow `simple_dit` teacher (width 
 | Same | 20,000 | 1 | 216.91 | 160.52 | 310.34 / 102.85 / 85.54 |
 | Same | 20,000 | 2 | 254.73 | 143.26 | 310.34 / 102.85 / 85.54 |
 
-Every A100 seed improved one-step FID by 18 to 30% over that run's one-step teacher. None reached the teacher's four-step FID. These runs used the paper's high-noise renoising and resumed between 4,000-step segments. The ADD distance dominated the short real-data runs. Omitting it follows LADD's synthetic-data recipe and leaves ADD's equation unchanged.
+Every A100 seed improved one-step FID by 18 to 30% over that run's teacher at one step, and none reached the teacher's four-step FID. Those runs used the paper's high-noise renoising and resumed between 4,000-step segments. The ADD distance dominated the short real-data runs. Dropping it follows LADD's synthetic-data recipe and does not change ADD's equation.
 
 A separate two-class 2-D toy exposed the renoising sensitivity in the prototype heads (RTX 4080, one seed, 3,000 steps):
 
@@ -161,7 +141,7 @@ A separate two-class 2-D toy exposed the renoising sensitivity in the prototype 
 | Renoising mean -2, std 1, distillation weight 2.5, 256-wide prototype heads | 99.6% | 0.49 | All modes |
 | Same lower renoising, no distillation or 64-wide prototype heads | — | — | One mode per class |
 
-These runs test training at small scale. They do not reproduce the papers' image-quality results.
+These runs check that training works at small scale; they do not reproduce the papers' image-quality results.
 
 ## Solvers
 
@@ -189,9 +169,9 @@ Euler (2, 8, 8, 3) float32
 DDIM (2, 8, 8, 3) float32
 ```
 
-`sample` visits the `steps` points returned by `process.times(steps)`. It returns the model's clean prediction at the last point. The loop is one `jax.lax.scan`, so it compiles once. Each step draws noise from `key` folded with the step index. You can change the solver without changing the trained weights.
+`sample` steps through the `steps` points of `process.times(steps)` and returns the model's clean prediction at the last point. The whole loop is one `jax.lax.scan`, so it compiles once, and each step's noise comes from `key` folded with the step index. The solver only affects sampling, so you can change it without retraining.
 
-The classic integrators are `DDPM`, `DDIM`, `Euler`, `EulerAncestral`, `Heun`, `RK4`, and `MultiStepDPM`. `MultiStepDPM` is a third-order finite-difference integrator in sigma space that keeps the last three noise estimates. A second group follows the Diffusers schedulers and reproduces the Diffusers 0.34.0 trajectories recorded by `tools/diffusers_reference.py`:
+The classic integrators are `DDPM`, `DDIM`, `Euler`, `EulerAncestral`, `Heun`, `RK4`, and `MultiStepDPM`, a third-order finite-difference integrator in sigma space that keeps the last three noise estimates. A second group follows the Diffusers schedulers and reproduces the Diffusers 0.34.0 trajectories recorded by `tools/diffusers_reference.py`:
 
 - `DPMSolverMultistep` covers every algorithm, order and second-order form of `DPMSolverMultistepScheduler`, and the EDM scheduler's update over the EDM process.
 - `DPMSolverSinglestep`, `DPMSolverSDE`, `DEIS`, `UniPC`, `PNDM`, `LMS`, `KDPM2` (plain and ancestral) and `TCD`.
@@ -199,38 +179,32 @@ The classic integrators are `DDPM`, `DDIM`, `Euler`, `EulerAncestral`, `Heun`, `
 
 `FlowSDE` is Flow-GRPO's Euler-Maruyama solver on a rectified-flow process.
 
-`Heun` implements Algorithm 2 of Karras et al. (2022). `s_churn`, `s_tmin`, `s_tmax` and `s_noise` control that algorithm's stochasticity. Inside `[s_tmin, s_tmax]`, each step adds fresh noise to raise sigma by a factor of 1 + min(s_churn / N, sqrt(2) - 1). It then takes the Heun step from that sigma. This matches NVlabs' `edm_sampler` (`tools/edm_reference.py`). Churn changes sigma, so it needs a variance-exploding process. Dew rejects a step that would raise sigma above the schedule's highest value.
+`Heun` is Algorithm 2 of Karras et al. (2022), and its `s_churn`, `s_tmin`, `s_tmax` and `s_noise` set that algorithm's stochasticity. Inside `[s_tmin, s_tmax]`, each step first adds fresh noise to raise sigma by the factor 1 + min(s_churn / N, sqrt(2) - 1), then takes the Heun step from the raised sigma. It matches NVlabs' `edm_sampler` (`tools/edm_reference.py`). The churn changes sigma directly, so it needs a variance-exploding process, and a step that would raise sigma past the schedule's top is refused.
 
-`MultiStepDPM` and `DPMSolverMultistep` are different solvers. `DPMSolverSDE` implements `DPMSolverSDEScheduler`; it is separate from `DPMSolverMultistep`'s SDE algorithms. Each interval takes two ancestral steps. Both draw noise from one keyed Brownian bridge over the schedule's positive sigma range, so the draws are nested increments of a single path.
+`MultiStepDPM` and `DPMSolverMultistep` are different solvers, despite the similar names. `DPMSolverSDE` is the solver of `DPMSolverSDEScheduler`, and it is separate from the SDE algorithms of `DPMSolverMultistep`. Each of its intervals takes two ancestral steps, and both draw noise from one keyed Brownian bridge over the schedule's positive sigma range, so the two draws are nested increments of a single path.
 
-`DDPM(variance="large")` uses the wider published posterior variance: the beta of the variance-preserving forward step. Beta is zero wherever alpha is one, so DDPM rejects a variance-exploding grid. With either variance, the step at the schedule's zero time adds no noise.
+`DDPM(variance="large")` uses the wider published posterior variance, the beta of the variance-preserving forward step. That beta is zero wherever alpha is one, so on a variance-exploding grid DDPM would add no noise at all, and it refuses such a grid. Neither variance adds noise on the step whose own time is the schedule's zero.
 
-For DPM-Solver++ 2M without lowering the order at the end, use `DPMSolverMultistep(order=2, algorithm="dpmsolver++", solver_type="midpoint", lower_order_final=False, euler_at_final=False)`. The default `lower_order_final=True` follows Diffusers. With fewer than 15 steps, the last step is first order and the preceding step is at most second order. A solver's `init` takes `(x_T, times, process, key=key)` with a concrete time grid. Invalid endpoints therefore raise an error before the compiled loop starts.
+For DPM-Solver++ 2M without any lowering of order at the end, use `DPMSolverMultistep(order=2, algorithm="dpmsolver++", solver_type="midpoint", lower_order_final=False, euler_at_final=False)`. The default `lower_order_final=True` follows Diffusers. With fewer than 15 steps, the last step is first order and the one before it at most second order. A solver's `init` takes `(x_T, times, process, key=key)` with a concrete time grid, so an invalid pair of endpoints fails before the compiled loop starts.
 
-`SourceLimitedPrediction` applies source clipping and dynamic thresholding during the process's prediction conversion. A solver that reads the clean prediction twice therefore gets the limited value both times.
+Source clipping and dynamic thresholding are part of `SourceLimitedPrediction`, the process's prediction conversion, and no solver applies them. So a solver that reads the clean prediction twice sees the limited value both times.
 
 ## Guidance
 
-`CFG(scale, interval=(0.0, 1.0), rescale=0.0)` applies classifier-free guidance. At each step, the model predicts once with the condition and once without it. The guided prediction is `uncond + scale * (cond - uncond)`. Outside `interval`, the scale drops to 1 (Kynkäänniemi et al., 2024).
+`CFG(scale, interval=(0.0, 1.0), rescale=0.0)` is classifier-free guidance. At each step the model predicts once with the condition and once without it, and the guided prediction is `uncond + scale * (cond - uncond)`. Outside `interval` the scale drops to 1 (Kynkäänniemi et al., 2024). `rescale` is Diffusers' `guidance_rescale` (Lin et al., 2023), which pulls the guided output toward the conditional output's standard deviation; `rescale=0` leaves the output unchanged.
 
-The interval uses fractions of the sampling trajectory and includes both endpoints. Step `i` of `N` is guided when `start <= i / N <= stop`; the final denoise counts as step `N`. The guidance decision applies to every evaluation within that step, including Heun's corrector or a midpoint.
+The interval is given in fractions of the sampling steps and includes both ends. Step `i` of `N` is guided when `start <= i / N <= stop`, and the final denoise counts as step `N`. Each step decides once, and every evaluation within it, such as Heun's corrector or a midpoint, uses that decision. This matches the paper's own sampler, which `tests/test_guidance.py` runs against; its `guidance_interval=[a, b]` over `N` steps is `interval=(a / N, b / N)` here. A Diffusers guider's `start` and `stop` guide its steps `[int(start * N), int(stop * N))`, which is `interval=(int(start * N) / N, (int(stop * N) - 1) / N)` here. Every guidance rule below takes `interval` the same way.
 
-This matches the paper's sampler, checked in `tests/test_guidance.py`. Its `guidance_interval=[a, b]` over `N` steps is `interval=(a / N, b / N)` here. A Diffusers guider applies `start` and `stop` to steps `[int(start * N), int(stop * N))`. To match it, use `interval=(int(start * N) / N, (int(stop * N) - 1) / N)`. The guidance rules below use `interval` in the same way.
+Guidance is applied to the model's raw outputs, and the process then converts the guided output once, in the same order as published pipelines. So a nonlinear conversion never sees the two branches separately. For one model to make both the conditional and the unconditional prediction, train it with some conditions blanked. `DiffusionObjective(unconditional_prob=...)` replaces the condition with its empty value on that fraction of rows, 12% by default.
 
-`rescale` matches Diffusers' `guidance_rescale` (Lin et al., 2023). It adjusts the guided output toward the conditional output's standard deviation. `rescale=0` leaves the output unchanged.
-
-As in published pipelines, guidance applies to the model's raw outputs before the process converts the result. A nonlinear conversion therefore sees the combined output, without converting the branches separately. To train one model for conditional and unconditional predictions, set `DiffusionObjective(unconditional_prob=...)`. This replaces the condition with its empty value on that fraction of rows, 12% by default.
-
-You can also pass these guidance rules to `sample` and `TextToImage`:
+Three other guidance rules can take the place of `CFG` in `sample` and `TextToImage`:
 
 - `APG(scale, eta=1.0, norm_threshold=15.0, momentum=0.0)` is adaptive projected guidance (Sadat et al., 2025). It averages the direction `cond - uncond` over sampling steps with `momentum`, clips its norm at `norm_threshold`, and scales its component parallel to the conditional output by `eta`. With `eta=1`, no clipping and no momentum, it equals `CFG`. It matches Diffusers' `AdaptiveProjectedGuidance` over a complete trajectory, including the interval mapping above. When guidance is off, the momentum average stays unchanged, as in Diffusers.
-- `CFGPlusPlus(scale)` is CFG++ (Chung et al., 2025), with `scale` in [0, 1]. It guides the clean prediction and uses the unconditional noise prediction to renoise each step. It requires a solver that steps from the `(x_0, epsilon)` pair, such as `DDIM`.
-- `Autoguidance(scale, model)` uses a weaker model of the same task under the same condition (Karras et al., 2024). The guided output is `guide + scale * (model - guide)`. Store the guide's variables under `guide` in the denoiser's variables. This matches NVlabs/edm2's `edm_sampler(gnet=...)`.
+- `CFGPlusPlus(scale)` is CFG++ (Chung et al., 2025), with `scale` in [0, 1]. It guides the clean prediction, and each step renoises with the unconditional noise prediction. Only solvers that step from the `(x_0, epsilon)` pair, such as `DDIM`, follow its trajectory.
+- `Autoguidance(scale, model)` guides with a weaker model of the same task, run under the same condition (Karras et al., 2024). The guided output is `guide + scale * (model - guide)`. The guide's variables go under `guide` in the denoiser's variables. It matches NVlabs/edm2's `edm_sampler(gnet=...)`.
 
 ## Text to image
 
 `TextToImage` in `dew.inference` combines the text encoder, the denoising loop and, for latent models, the decoder. `objective.pipeline(state)` builds one from a trained objective, and `TextToImage.from_run(directory)` rebuilds one from a saved run.
 
-For Stable Diffusion and SDXL checkpoints, `dew.pipeline(source)` rebuilds the source scheduler. It supports the source's clipping, thresholding and timestep spacing. Where that scheduler supports them, it also handles Karras, exponential and beta grids.
-
-DPM-Solver multistep and UniPC scheduler files with `use_flow_sigmas` use the shifted rectified-flow path and velocity prediction. Flow pipelines such as SANA and Wan ship these files. Unsupported combinations raise an error; Dew does not substitute other defaults. Scheduler checks compare tiny synthetic trajectories with Diffusers. They do not measure image quality. [Supported models](../models.md) lists the pipelines that load.
+For Stable Diffusion and SDXL checkpoints, `dew.pipeline(source)` rebuilds the source's own scheduler, so you do not pick a solver by name. It supports the source's clipping, thresholding and timestep spacing, and the Karras, exponential and beta grids where the corresponding scheduler has them. DPM-Solver multistep and UniPC files with `use_flow_sigmas`, which flow pipelines such as SANA and Wan ship, follow the shifted rectified-flow path and read the model output as velocity. An unsupported combination raises an error, and Dew does not fall back to different defaults. The scheduler checks compare tiny synthetic trajectories against Diffusers and do not measure image quality. [Supported models](../models.md) lists the pipelines that load.

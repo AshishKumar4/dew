@@ -1,8 +1,8 @@
-"""LoRA SFT of DiffusionGemma on chat data, with the base weights in host memory.
+"""LoRA SFT of DiffusionGemma on chat data, with the base weights host-streamed.
 
-The optimizer updates only the adapter. `Layout(host=("variables",))` keeps
-the whole training state on the host between steps, and the scanned stack
-fetches one layer at a time. The 26B-A4B base has not been run through this workflow:
+The optimizer updates only the adapter, and `Layout(host=("variables",))`
+keeps the whole train state on the host between steps, with the scanned stack
+fetching one layer at a time. The 26B-A4B base has not been run through it:
 
     python examples/sft_diffusion_gemma.py \\
         --model google/diffusiongemma-26B-A4B-it \\
@@ -51,9 +51,9 @@ PROMPTS = ["<bos> t5 t7 t9 t11", "<bos> t6 t8 t10 t12"]
 @dataclass
 class Config:
     model: str = "google/diffusiongemma-26B-A4B-it"
-    """Hub repo or local directory containing the base weights and tokenizer."""
+    """Hub repo or local directory the base weights and tokenizer come from."""
     chat: str | None = None
-    """Hub dataset ID, .jsonl or parquet of conversations; --smoke writes its own."""
+    """Hub dataset id, .jsonl or parquet of conversations; --smoke writes its own."""
     out: Path = Path("runs/diffusion-gemma-lora")
     prompt_tokens: int = 256
     """Clean prompt prefix of a training row; the canvases follow it."""
@@ -65,14 +65,14 @@ class Config:
     rank: int = 16
     alpha: float = 32.0
     modules: tuple[str, ...] = ("q_proj", "k_proj", "v_proj", "o_proj")
-    """Projections to adapt, following PEFT's target_modules."""
+    """PEFT's target_modules: which projections carry a delta."""
     response_tokens: int = 32
     smoke: bool = False
     """Fine-tune the committed tiny checkpoint on three canned turns instead."""
 
 
 def smoke_conversations(out: Path) -> Path:
-    """Write the canned turns as JSONL for `ChatMessages`."""
+    """The canned turns as the JSONL `ChatMessages` reads line by line."""
     jsonl = out / "chat.jsonl"
     jsonl.write_text("".join(json.dumps({"messages": turns}) + "\n" for turns in CONVERSATIONS))
     return jsonl
@@ -103,8 +103,8 @@ def main(config: Config) -> Path:
         num_canvases=config.canvases, variables=source.variables,
         pad_token_id=int(source.config["text_config"]["pad_token_id"]))
 
-    # Packed windows have seq_len + 1 IDs, while the objective needs exactly
-    # prompt + canvases. The dataset spec therefore uses one fewer token.
+    # A packed window is seq_len + 1 ids wide, and the objective reads rows of
+    # exactly prompt + canvases: the spec is asked for one less.
     data = ChatMessages(tokenizer=tokenizer, path=config.chat,
                         seq_len=sequence_length - 1, val_batches=None,
                         loading=Loading(workers=0, threads=1, read_buffer=2,
@@ -122,8 +122,9 @@ def main(config: Config) -> Path:
     assert source.adapter is not None
     source.adapter.save(state.variables, adapter_dir)
 
-    # Loading from files needs the base weights through `dew.pipeline` and
-    # the adapter directory. Merging folds the factors into the base kernels.
+    # The other half of the workflow, from the files alone: the base weights
+    # back through `dew.pipeline`, the adapter directory read onto them, and
+    # the factors folded into the kernels so the task runs the base model.
     base = dew.pipeline(config.model, dtype=jnp.float32)
     trained = LoRA.load(base.model, base.variables, adapter_dir, layouts=source.layouts)
     task = base.bind(trained.merge(trained.variables))

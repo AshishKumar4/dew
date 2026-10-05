@@ -17,7 +17,6 @@ import json
 import math
 import os
 import platform
-import re
 import subprocess
 import sys
 import time
@@ -27,7 +26,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from trace_window import kernel_category, window_split
+from trace_window import device_events, kernel_category, window_split
 
 # Dense bf16 tensor throughput with fp32 accumulation, the figure MFU is
 # taken against. GA102 whitepaper, appendix table: RTX 3090 71 TFLOPS dense
@@ -170,34 +169,6 @@ def chrome_trace_kernels(path: str | Path) -> list[tuple[str, int, int, int]]:
     return kernels
 
 
-def xplane_kernels(directory: str | Path) -> tuple[list[tuple[str, int, int, int]], list[str]]:
-    """Device kernel records from the newest JAX trace under `directory`,
-    with the names of the device lines they came from.
-
-    A GPU plane holds one line per CUDA stream; the per-op and per-module
-    lines are derived from the same kernels, so only stream lines count. A
-    TPU plane runs its HLO ops on one "XLA Ops" line, named after the HLO
-    instruction (`fusion.12`, `convolution.3`)."""
-    from jax.profiler import ProfileData
-
-    traces = sorted(Path(directory).rglob("*.xplane.pb"), key=os.path.getmtime)
-    if not traces:
-        raise FileNotFoundError(f"no xplane.pb under {directory}")
-    kernels, lines = [], set()
-    for plane in ProfileData.from_file(str(traces[-1])).planes:
-        match = re.match(r"/device:(GPU|TPU):(\d+)", plane.name)
-        if match is None:
-            continue
-        for line in plane.lines:
-            lines.add(f"{plane.name}:{line.name}")
-            if not (line.name.lower().startswith("stream") if match.group(1) == "GPU"
-                    else line.name == "XLA Ops"):
-                continue
-            device = int(match.group(2))
-            kernels.extend((event.name, event.start_ns, event.end_ns, device) for event in line.events)
-    return kernels, sorted(lines)
-
-
 def sha256(path: str | Path) -> str:
     digest = hashlib.sha256()
     with open(path, "rb") as handle:
@@ -306,7 +277,9 @@ def attach_xplane_profile(record: dict, trace_dir: str | Path, steps: int,
     recorded as such: the run's curves stand without it."""
     trace_dir = Path(trace_dir)
     try:
-        kernels, lines = xplane_kernels(trace_dir)
+        planes, lines = device_events(trace_dir)
+        kernels = [(event.name, event.start_ns, event.end_ns, int(plane.rsplit(":", 1)[1]))
+                   for plane, events in planes.items() for event in events]
         record["profile"] = kernel_summary(kernels, steps)
         record["profile"]["kernels"] = str(trim_trace(kernels, rows or trace_dir / "kernels.json.gz"))
         record["profile"]["device_lines"] = lines
