@@ -1,9 +1,9 @@
-"""Process setup every recipe runs before it builds anything.
+"""Process setup that every recipe runs before it builds anything.
 
-rlimits, the XLA flags, the compilation cache, the JAX distributed pool and
-the env vars wandb and the tokenizers read are the same in every recipe.
-That makes them library wiring, and the recipes call this once at the top of
-main().
+Every recipe needs the same setup: the file descriptor limit, the XLA flags,
+the compilation cache, the JAX distributed pool, and the environment
+variables that wandb and the tokenizers read. So the library does it in
+`prepare_process`, and each recipe calls that once at the top of main().
 """
 
 from __future__ import annotations
@@ -64,24 +64,30 @@ def prepare_process(wandb: Wandb | None = None,
                     xla_flags: str | None = None,
                     compilation_cache_dir: str | None = None,
                     *, layout: Layout | None = None) -> None:
-    """Set the env vars and XLA flags, raise the soft descriptor limit, join
-    the JAX process pool.
+    """Set the environment variables and XLA flags, raise the soft file
+    descriptor limit, and join the JAX process pool.
 
     `wandb` is the run's `dew.config.Wandb`, or None for a run without a
     tracker. Only its offline switch is read, and it has to be read before
-    wandb opens a run. `multi_host` decides whether the process joins a pool
-    (`_join_process_pool`).
+    wandb opens a run. `multi_host=True` requires a pool, False never joins
+    one, and None joins the pool the environment describes, if any.
+    `compilation_cache_dir`, when set, turns on JAX's persistent compilation
+    cache in that directory.
 
-    xla_flags reaches XLA through the environment, which XLA reads when it
+    `xla_flags` reaches XLA through the environment, which XLA reads when it
     opens a backend. So this call has to come before the first JAX call in
-    the process, which makes it a recipe's first line. A library user, who
-    never runs a recipe, sets XLA_FLAGS in the environment.
+    the process, and it is the first line of every recipe. If you use the
+    library without a recipe, set XLA_FLAGS in the environment yourself.
 
-    The same Layout passed to Trainer selects CPU transaction ownership when
-    host includes variables. JAX_PLATFORMS must then permit CPU beside the
-    accelerator. JAX_NUM_CPU_DEVICES, or the existing XLA flags, must
-    establish one CPU device per local accelerator before this call.
-    Validation never changes backend configuration after initialization.
+    `layout` is the same `Layout` you pass to `Trainer`. When its `host`
+    includes "variables", the master copy of the whole train state is kept
+    on the CPU and the optimizer update runs there, so this call checks the
+    CPU devices that needs.
+    JAX_PLATFORMS must then allow CPU beside the accelerator, and
+    JAX_NUM_CPU_DEVICES or the existing XLA flags must give one CPU device
+    per local accelerator before this call. The check raises `ValueError`
+    when they do not, and it never changes the backend configuration after
+    JAX has initialized.
     """
     _set_environment(wandb, xla_flags, compilation_cache_dir)
     _raise_limits()
@@ -259,10 +265,14 @@ def cuda_plugin() -> bool:
 
 
 class Preempted(SystemExit):
-    """`Trainer.fit` stopped at a preemption notice, at `step`, and wrote that
-    step's checkpoint and data position. Uncaught, it ends the program with
-    `PREEMPTED_EXIT` and no traceback, the way SIGTERM itself would have; the
-    same program run again resumes from the checkpoint."""
+    """Raised by `Trainer.fit` when it stops at a preemption notice.
+
+    `step` is the step it stopped at, and `fit` has written that step's
+    checkpoint and data position before raising. Uncaught, it ends the
+    program with exit status `PREEMPTED_EXIT` and no traceback, as SIGTERM
+    itself would have. Run the same program again to resume from the
+    checkpoint.
+    """
 
     def __init__(self, step: int):
         super().__init__(PREEMPTED_EXIT)
@@ -270,19 +280,22 @@ class Preempted(SystemExit):
 
 
 class PreemptionNotice:
-    """Whether a preemption notice reached the run, asked once a step, from
-    its creation until `close`.
+    """Reports once a step whether a preemption notice has reached the run,
+    from its creation until `close`.
 
-    A scheduler stops a job with SIGTERM and SIGKILLs it a grace period later:
-    Slurm's KillWait, Kubernetes' termination grace period, a spot VM's
-    notice. In a pool, JAX's preemption service takes the SIGTERM (XLA's
-    notifier replaces the handler, so the process runs on), shares the notice
-    through the coordination service, and `reached_preemption_sync_point`
-    agrees one step on every process, where the checkpoint is whole. A process
-    outside any pool has no such service, and the notice is SIGTERM itself,
-    caught until `close`. A pool whose preemption service is off
-    (jax_enable_preemption_service) gets no notice, and SIGTERM ends it as it
-    always did.
+    A scheduler stops a job by sending SIGTERM and then SIGKILL after a grace
+    period, such as Slurm's KillWait, Kubernetes' termination grace period
+    or a spot VM's notice. In a process pool, JAX's preemption service
+    receives the SIGTERM; XLA's notifier replaces the signal handler, so the
+    process keeps running. The service shares the notice through the
+    coordination service, and `reached_preemption_sync_point` picks one step
+    that every process agrees on, so the checkpoint written there is
+    complete. A process outside any pool has no such service, so the notice
+    is SIGTERM itself, which this object catches until `close`. Only the main
+    thread can set a signal handler, so outside a pool, on another thread,
+    SIGTERM keeps its default effect. A pool with the preemption service
+    turned off (jax_enable_preemption_service) gets no notice, and SIGTERM
+    ends it as usual.
     """
 
     def __init__(self):
@@ -308,8 +321,12 @@ class PreemptionNotice:
         self._signalled = True
 
     def reached(self, step: int) -> bool:
-        """Whether to stop at `step`: in a pool, whether every process agreed
-        on it; alone, whether SIGTERM arrived."""
+        """Return whether to stop at `step`.
+
+        In a pool, that is whether every process agreed to stop there, and a
+        pool without the preemption service never stops. A process outside a
+        pool stops once SIGTERM has arrived.
+        """
         if not self._pool:
             return self._signalled
         if global_state.preemption_sync_manager is None:
@@ -320,9 +337,9 @@ class PreemptionNotice:
 def run_timestamp() -> str:
     """Return process 0's wall clock as `%Y-%m-%d_%H:%M:%S`, on every process.
 
-    A default run name carries it, and the name is the checkpoint directory
-    every process writes into, so a process that read its own clock a second
-    later would write into a different directory.
+    The default run name includes it, and that name is the checkpoint
+    directory every process writes into. So a process that read its own
+    clock a second later would write into a different directory.
     """
     return broadcast_from_process_zero(datetime.now().strftime("%Y-%m-%d_%H:%M:%S"))
 
