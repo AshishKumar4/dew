@@ -66,7 +66,7 @@ export class GatewayLab extends DurableObject<Env> {
 		}
 	}
 
-	private async prepare(commit: string): Promise<unknown> {
+	async prepare(commit: string): Promise<unknown> {
 		const container = this.ctx.container!;
 		const started = Date.now();
 		container.start({ image: 'cloudflare/debian-trixie', instance: 'standard-4',
@@ -92,7 +92,7 @@ export class GatewayLab extends DurableObject<Env> {
 			'HF_HUB_OFFLINE=1', 'JAX_PLATFORMS=cpu', 'JAX_COMPILATION_CACHE_DIR=/opt/xla',
 			'XLA_FLAGS=--xla_cpu_max_isa=AVX2', '/opt/venv/bin/python', '/opt/live/warm-managed.py']);
 		const result = await smoke.output();
-		return { stage: 'offline smoke', commit, snapshot, prepareSeconds, snapshotSeconds,
+		return { stage: 'offline smoke', commit, created: Date.now(), snapshot, prepareSeconds, snapshotSeconds,
 			smokeSeconds: (Date.now() - smokeStarted) / 1000, ...this.decode(result) };
 	}
 
