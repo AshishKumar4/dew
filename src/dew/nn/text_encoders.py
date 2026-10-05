@@ -41,6 +41,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew import records
 from dew.interop.config_records import NativeFields, native_fields
+from dew.interop.weights import ParamTree, translate_parameters
 from dew.nn.attention import LayerNorm, RMSNorm, scaled_dot_product_attention
 from dew.nn.conv import Conv
 from dew.nn.sharding import logical_axes
@@ -505,96 +506,19 @@ def _clip_path(hf_name: str) -> tuple[str, ...] | None:
     raise ValueError(f"unknown tensor name {hf_name!r}")
 
 
-def checkpoint_dtype(stored: np.dtype, param_dtype: str = "float32") -> np.dtype:
-    """The dtype one stored array is kept in: `param_dtype` for a floating
-    payload, its own for an integer or boolean one."""
-    dtype = resolve_dtype(param_dtype)
-    if dtype is None or not jnp.issubdtype(dtype, jnp.floating):
-        raise ValueError(
-            f"param_dtype {param_dtype!r} must name floating parameter storage"
-        )
-    return np.dtype(dtype) if jnp.issubdtype(stored, jnp.floating) else stored
-
-
-def checkpoint_array(tensor, param_dtype: str = "float32") -> np.ndarray:
-    """One stored floating array in the requested precision, without an FP32
-    array intermediate. Integer and boolean payloads retain their native dtype.
-    Callers choose FP32 for frozen state rather than applying parameter
-    precision to an entire variables tree.
-    """
-    leaf = np.asarray(tensor)
-    return leaf.astype(checkpoint_dtype(leaf.dtype, param_dtype), copy=False)
-
-
-def checkpoint_leaf(
-    path: tuple[str, ...], tensor, param_dtype: str = "float32"
-) -> np.ndarray:
-    """One checkpoint leaf in Linen layout and the requested storage precision.
-
-    Linear holds [out, in] and Dense keeps [in, out]; Conv2d holds
-    [out, in, kh, kw] and Conv keeps [kh, kw, in, out]. Norms and
-    embeddings keep their layout. Conversion precedes the layout copy,
-    avoiding an FP32 intermediate for a BF16 leaf.
-    """
-    leaf = checkpoint_array(tensor, param_dtype)
-    if path[-1] == "kernel":
-        leaf = np.ascontiguousarray(leaf.T if leaf.ndim == 2 else leaf.transpose(2, 3, 1, 0))
-    return leaf
-
-
-type Tree[LeafT] = dict[str, LeafT | Tree[LeafT]]
-"""A variables collection as a translator builds it: leaves under the
-module names that read them."""
-
-# One collection of a variables tree: the arrays `checkpoint_leaf` returns.
-# Shared by every translator that builds one, here and in `nn.vision` and
-# `interop.hf_decoders`.
-type ParamTree = Tree[np.ndarray]
-
-
-def insert[LeafT](tree: Tree[LeafT], path: tuple[str, ...], leaf: LeafT, name: str) -> None:
-    """Put the checkpoint tensor `name`, translated to `leaf`, at `path`.
-
-    A path through a leaf already placed is refused, and so is a second
-    tensor at a placed path unless both are equal arrays: a tied tensor a
-    checkpoint stores under two names is one parameter, while two different
-    ones are two parameters, and keeping the last would drop the other
-    unnoticed. A lazy leaf is not read to compare, so a second one is refused
-    whatever it holds.
-    """
-    node = tree
-    for key in path[:-1]:
-        child = node.setdefault(key, {})
-        if not isinstance(child, dict):
-            raise ValueError(f"{name} crosses the tensor already at {key!r}")
-        node = child
-    held = node.setdefault(path[-1], leaf)
-    if held is not leaf and not (isinstance(held, np.ndarray) and isinstance(leaf, np.ndarray)
-                                 and np.array_equal(held, leaf)):
-        raise ValueError(f"{name} lands on {'/'.join(path)}, which another tensor already fills")
-
-
-def _translate(hf_tensors: Mapping[str, np.ndarray], path_of, param_dtype: str) -> ParamTree:
-    params: ParamTree = {}
-    for name, tensor in hf_tensors.items():
-        path = path_of(name)
-        if path is not None:
-            insert(params, path, checkpoint_leaf(path, tensor, param_dtype), name)
-    return params
-
 
 def translate_weights(
     hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
 ) -> ParamTree:
     """Text-tower parameters; storage precision is independent of compute dtype."""
-    return _translate(hf_tensors, _text_path, param_dtype)
+    return translate_parameters(hf_tensors, _text_path, param_dtype)
 
 
 def translate_clip_weights(
     hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
 ) -> ParamTree:
     """Full CLIP parameters, with FP32 storage unless explicitly requested otherwise."""
-    return _translate(hf_tensors, _clip_path, param_dtype)
+    return translate_parameters(hf_tensors, _clip_path, param_dtype)
 
 
 def check_tree(variables: Mapping[str, object], module: nn.Module, *inputs) -> None:
@@ -1070,7 +994,7 @@ def translate_t5_weights(
     relative bias tables keep their layout.
     """
     t5_embedding(hf_tensors)
-    return _translate(hf_tensors, _t5_path, param_dtype)
+    return translate_parameters(hf_tensors, _t5_path, param_dtype)
 
 
 class T5EncoderModel:

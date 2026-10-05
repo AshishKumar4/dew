@@ -1,4 +1,4 @@
-"""Train text-to-image diffusion on Oxford Flowers, then sample and export weights.
+"""Train a text-to-image diffusion model on Oxford Flowers, sample from it, export the weights.
 
     python examples/train_diffusion.py --data-path /data/oxford_flowers102/2.1.1 --epochs 200
     python examples/train_diffusion.py --data-path /data/oxford_flowers102/2.1.1 --steps 20 --image-size 32
@@ -31,7 +31,7 @@ class Config:
     batch_size: int = 32
     epochs: int = 200
     steps: int | None = None
-    """Training steps. If unset, train for `epochs` passes over the data."""
+    """Run length in steps; unset trains for `epochs` passes over the data."""
     learning_rate: float = 2e-4
     fsdp: int = 1
     model: dict = field(default_factory=lambda: {
@@ -63,8 +63,8 @@ def main(config: Config, data=None, inputs=None):
                       checkpoints=Checkpoints(str(config.out / "checkpoints")))
     state = trainer.fit(data, steps=steps, log_every=50)
 
-    # Averaged weights stay on the trainer's mesh. Prompts split across it;
-    # host() reads the sampled rows back to the host.
+    # The averaged weights stay on
+    # the trainer's mesh, prompts split over it, and host() reads the rows back.
     pipe = objective.pipeline(state)
     images = pipe(list(config.prompts), steps=50, guidance=3.0, solver=Heun(), key=1).host().images
     pixels = uint8_pixels(images)

@@ -6,7 +6,7 @@ scheduler implementation is imported by this module.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -14,8 +14,10 @@ import numpy as np
 from jax.typing import DTypeLike
 
 from dew import records
+from dew.interop import weights
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.safetensors_io import read_weights
+from dew.interop.weights import ParamTree, checkpoint_dtype, insert, source_alias
 from dew.nn.backbones.flux import FluxTransformer
 from dew.nn.backbones.flux2 import Flux2Transformer
 from dew.nn.backbones.qwen_image import QwenImageTransformer
@@ -23,24 +25,10 @@ from dew.nn.backbones.sd3 import SD3Transformer
 from dew.nn.backbones.unet_condition import UNet2DCondition, UNetStage
 from dew.nn.backbones.wan import WanTransformer
 from dew.nn.backbones.z_image import ZImageTransformer
-from dew.nn.text_encoders import ParamTree, checkpoint_dtype, insert
 from dew.registry import resolve_dtype
 
 if TYPE_CHECKING:
     from dew.interop.streaming import LazyTree, WeightLayout
-
-
-def _source_alias(tensors: Mapping[str, np.ndarray], owners: dict[tuple[str, ...], str],
-                  path: tuple[str, ...], name: str) -> None:
-    """Record `name` as the owner of `path`, and raise if another name differs there.
-
-    The check runs on the source values, before the storage cast, because two
-    different values can round to the same BF16 leaf.
-    """
-    previous = owners.setdefault(path, name)
-    if previous != name and not np.array_equal(tensors[previous], tensors[name]):
-        raise ValueError(f"Two different source tensors {previous!r} and {name!r} map to {path}")
-
 
 
 def flag(config: Mapping[str, object], name: str, *, default: bool) -> bool:
@@ -250,7 +238,7 @@ def translate_unet_weights(tensors: Mapping[str, np.ndarray], model: UNet2DCondi
 
     Each leaf is cast to `param_dtype` before its transpose. Attention kernels
     are also reshaped to per-head axes, which is why this does not go through
-    `record_layouts`. Read eagerly, a transposed kernel is a view of the
+    `weights.record_layouts`. Read eagerly, a transposed kernel is a view of the
     stored tensor. With `lazy` every other linear kernel and every
     untransposed leaf is a `SourceLeaf`, read when it is placed; a reshaped
     attention kernel and a convolution are read whole either way.
@@ -261,7 +249,7 @@ def translate_unet_weights(tensors: Mapping[str, np.ndarray], model: UNet2DCondi
     owners: dict[tuple[str, ...], str] = {}
     for name, tensor in tensors.items():
         path = _unet_path(name, tensor.ndim)
-        _source_alias(tensors, owners, path, name)
+        source_alias(tensors, owners, path, name)
         stored = np.asarray(tensor)
         dtype = checkpoint_dtype(stored.dtype, param_dtype)
         kernel = path[-1] == "kernel"
@@ -270,7 +258,7 @@ def translate_unet_weights(tensors: Mapping[str, np.ndarray], model: UNet2DCondi
             layouts.append(WeightLayout("unet/" + name, (("params", *path),), stored.shape,
                                         (1, 0) if kernel else None))
             if owners[path] == name:
-                # A second name `_source_alias` proved equal adds no leaf.
+                # Equal source aliases add export names without another leaf.
                 insert(parameters, path, SourceLeaf((stored,), dtype, transposed=kernel), name)
             continue
         value = stored.astype(dtype, copy=False)
@@ -524,7 +512,7 @@ def translate_flux2_weights(tensors: Mapping[str, np.ndarray], *, param_dtype: s
                             ) -> tuple[LazyTree, tuple[WeightLayout, ...]]:
     """Map FLUX.2 tensors into a parameter tree and the layouts that invert
     it; its rotary tables are computed from ids, so it stores no buffer."""
-    return record_layouts("transformer", tensors, _flux2_path, ("params",), param_dtype=param_dtype,
+    return weights.record_layouts("transformer", tensors, _flux2_path, ("params",), param_dtype=param_dtype,
                           lazy=lazy)
 
 
@@ -611,8 +599,9 @@ def translate_z_image_weights(tensors: Mapping[str, np.ndarray], *, param_dtype:
                               ) -> tuple[LazyTree, tuple[WeightLayout, ...]]:
     """Map Z-Image tensors into a parameter tree and the layouts that invert
     it; its rotary table is computed, so it stores no buffer."""
-    return record_layouts("transformer", tensors, lambda name: _z_image_path(name, np.ndim(tensors[name])),
-                          ("params",), param_dtype=param_dtype, lazy=lazy)
+    return weights.record_layouts(
+        "transformer", tensors, lambda name: _z_image_path(name, np.ndim(tensors[name])),
+        ("params",), param_dtype=param_dtype, lazy=lazy)
 
 
 def wan_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float32",
@@ -689,7 +678,8 @@ def translate_wan_weights(tensors: Mapping[str, np.ndarray], *, param_dtype: str
                           ) -> tuple[LazyTree, tuple[WeightLayout, ...]]:
     """Map Wan transformer tensors into a parameter tree and the layouts that
     invert it; its rotary table is computed, so it stores no buffer."""
-    return record_layouts("transformer", tensors, _wan_path, ("params",), param_dtype=param_dtype, lazy=lazy)
+    return weights.record_layouts("transformer", tensors, _wan_path, ("params",),
+                                  param_dtype=param_dtype, lazy=lazy)
 
 _FLUX_EMBEDDERS = {
     "x_embedder": ("x_embedder",),
@@ -743,7 +733,8 @@ def translate_flux_weights(tensors: Mapping[str, np.ndarray], *, param_dtype: st
     Rotary tables are computed from input ids, so Flux stores no positional
     buffer and there is nothing to place outside `params`.
     """
-    return record_layouts("transformer", tensors, _flux_path, ("params",), param_dtype=param_dtype, lazy=lazy)
+    return weights.record_layouts("transformer", tensors, _flux_path, ("params",),
+                                  param_dtype=param_dtype, lazy=lazy)
 
 
 def translate_sd3_weights(tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32",
@@ -758,7 +749,7 @@ def translate_sd3_weights(tensors: Mapping[str, np.ndarray], *, param_dtype: str
     """
     from dew.interop.streaming import WeightLayout
 
-    parameters, layouts = record_layouts(
+    parameters, layouts = weights.record_layouts(
         "transformer", tensors, _sd3_path, ("params",), param_dtype=param_dtype, lazy=lazy)
     buffers: ParamTree = {}
     position = tensors.get("pos_embed.pos_embed")
@@ -855,7 +846,7 @@ def translate_qwen_image_weights(tensors: Mapping[str, np.ndarray], *, param_dty
     """Map Qwen-Image 2.1 transformer tensors into a parameter tree and the
     layouts that invert it. Its rotary table is computed from positions, so
     it stores no buffer."""
-    return record_layouts("transformer", tensors, _qwen_image_path, ("params",),
+    return weights.record_layouts("transformer", tensors, _qwen_image_path, ("params",),
                           param_dtype=param_dtype, lazy=lazy)
 
 
@@ -863,48 +854,6 @@ def component_tensors(directory: Path, component: str) -> dict[str, np.ndarray]:
     """Read one published component's weights: the shards its index names or
     its one weights file, never a precision variant beside them."""
     return read_weights(directory / component)
-
-
-def record_layouts(component: str, tensors: Mapping[str, np.ndarray],
-                   path_of: Callable[[str], tuple[str, ...] | None], prefix: tuple[str, ...], *,
-                   param_dtype: str = "float32", lazy: bool = False
-                   ) -> tuple[LazyTree, tuple[WeightLayout, ...]]:
-    """Map a component's tensors into a parameter tree and the layouts that invert it.
-
-    `path_of` gives each tensor's tree path, or None to skip it. Kernels are
-    transposed from torch's `[out, in, *window]` to Flax's `[*window, in, out]`
-    (a linear layer's, a 2-D or a 3-D convolution's) and the transpose is
-    recorded in the layout, so `WeightLayout.export`
-    writes the tensor back unchanged. Each leaf is cast to `param_dtype` before
-    the transpose; buffers and scoring state are the caller's to keep in FP32.
-
-    With `lazy` a linear kernel or an untransposed leaf is a `SourceLeaf`
-    over the stored tensor, read only when it is placed
-    (`dew.interop.streaming`). A convolution kernel's transpose is not the
-    trailing pair a `SourceLeaf` swaps, and convolutions are small, so it is
-    read whole either way.
-    """
-    from dew.interop.streaming import SourceLeaf, WeightLayout, materialize
-    parameters: LazyTree = {}
-    layouts = []
-    owners: dict[tuple[str, ...], str] = {}
-    for name, tensor in tensors.items():
-        path = path_of(name)
-        if path is None:
-            continue
-        _source_alias(tensors, owners, path, name)
-        stored = np.asarray(tensor)
-        order = (*range(2, stored.ndim), 1, 0) if path[-1] == "kernel" else None
-        transpose = None if order is None else tuple(int(axis) for axis in np.argsort(order))
-        layouts.append(WeightLayout(f"{component}/{name}", ((*prefix, *path),), tensor.shape, transpose))
-        if owners[path] != name:
-            # A second name for a tensor `_source_alias` proved equal: one leaf, two exports.
-            continue
-        dtype = checkpoint_dtype(stored.dtype, param_dtype)
-        insert(parameters, path, np.ascontiguousarray(stored.astype(dtype, copy=False).transpose(order))
-               if order is not None and stored.ndim != 2
-               else SourceLeaf((stored,), dtype, transposed=order is not None), name)
-    return (parameters if lazy else materialize(parameters)), tuple(layouts)
 
 
 def flax_component_parameters(component: str, tensors: Mapping[str, np.ndarray]) -> ParamTree:

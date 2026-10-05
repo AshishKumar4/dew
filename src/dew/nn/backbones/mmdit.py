@@ -1,5 +1,4 @@
-"""
-MM-DiT (SD3-style multi-modal DiT) and a hierarchical variant.
+"""MM-DiT, the SD3-style multimodal DiT, and a hierarchical variant.
 
 The block is a dual-stream MM-DiT: text and image tokens keep separate
 qkv/mlp/modulation weights and mix through a single joint attention over the
@@ -7,7 +6,6 @@ concatenated sequence.
 """
 
 from collections.abc import Sequence
-from typing import Literal
 
 import einops
 import jax.numpy as jnp
@@ -20,10 +18,9 @@ from ..attention import LayerNorm, RMSNorm, scaled_dot_product_attention
 from ..dit import (
     ROPE_THETA,
     AdaLNParams,
-    ConditioningEmbed,
-    PatchSequenceEmbed,
-    PatchSequenceOutput,
     RematChoice,
+    _AttentionStackOptions,
+    _DiTStackOptions,
     remat_block,
     rope_for_scan,
 )
@@ -155,39 +152,11 @@ class MMDiTBlock(nn.Module):
 
 
 @models("simple_mmdit")
-class SimpleMMDiT(nn.Module):
+class SimpleMMDiT(_DiTStackOptions):
     """SD3-style MM-DiT: a plain stack of dual-stream blocks."""
-    output_channels: int = 3
-    patch_size: int = 16
-    emb_features: int = 768
-    num_layers: int = 12
-    num_heads: int = 12
-    mlp_ratio: int = 4
-    dropout_rate: float = 0.0  # Typically 0 for diffusion
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-    force_fp32_for_softmax: bool = True
-    norm_epsilon: float = 1e-5
-    qk_norm: bool = False
-    attention_impl: str = "auto"  # an AttentionImpl
-    remat: RematChoice = False
-    scan_order: Literal["raster", "hilbert", "zigzag"] = "raster"
-
-
     def setup(self):
-        self.embed = PatchSequenceEmbed(
-            patch_size=self.patch_size,
-            emb_features=self.emb_features,
-            scan_order=self.scan_order,
-            dtype=self.dtype,
-            precision=self.precision,
-        )
-        self.conditioning = ConditioningEmbed(
-            emb_features=self.emb_features,
-            mlp_ratio=self.mlp_ratio,
-            dtype=self.dtype,
-            precision=self.precision,
-        )
+        self.embed = self._embedding(self.patch_size, self.emb_features, self.scan_order)
+        self.conditioning = self._conditioning(self.emb_features)
         # text tokens enter the sequence, so they need their own projection
         self.txt_embed = nn.Dense(
             features=self.emb_features, dtype=self.dtype,
@@ -196,25 +165,11 @@ class SimpleMMDiT(nn.Module):
             remat_block(MMDiTBlock, self.remat)(
                 features=self.emb_features,
                 num_heads=self.num_heads,
-                mlp_ratio=self.mlp_ratio,
-                dropout_rate=self.dropout_rate,
-                dtype=self.dtype,
-                precision=self.precision,
-                force_fp32_for_softmax=self.force_fp32_for_softmax,
-                norm_epsilon=self.norm_epsilon,
-                qk_norm=self.qk_norm,
-                attention_impl=self.attention_impl,
+                **self._block_options(),
                 name=f"mmdit_block_{i}"
             ) for i in range(self.num_layers)
         ]
-        self.output = PatchSequenceOutput(
-            patch_size=self.patch_size,
-            output_channels=self.output_channels,
-            modulated=True,
-            norm_epsilon=self.norm_epsilon,
-            dtype=self.dtype,
-            precision=self.precision,
-        )
+        self.output = self._output(self.patch_size, self.output_channels, modulated=True)
 
     def __call__(self, x, temb, textcontext, train: bool = False):  # textcontext is required
         _, H, W, _ = x.shape
@@ -300,7 +255,7 @@ class PatchExpanding(nn.Module):
 
 
 @models("hierarchical_mmdit")
-class HierarchicalMMDiT(nn.Module):
+class HierarchicalMMDiT(_AttentionStackOptions):
     """U-shaped MM-DiT: dual-stream blocks per stage with patch merging on the
     way down and expansion + skip fusion on the way up.
 
@@ -312,14 +267,6 @@ class HierarchicalMMDiT(nn.Module):
     emb_features: Sequence[int] = (512, 768, 1024)  # Feature dims for stages, fine to coarse
     num_layers: Sequence[int] = (4, 4, 14)  # Layers per stage, fine to coarse
     num_heads: Sequence[int] = (8, 12, 16)  # Heads per stage, fine to coarse
-    mlp_ratio: int = 4
-    dropout_rate: float = 0.0
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-    force_fp32_for_softmax: bool = True
-    norm_epsilon: float = 1e-5
-    qk_norm: bool = False
-    attention_impl: str = "auto"  # an AttentionImpl
     remat: RematChoice = False
 
     def stage_blocks(self, stage: int, prefix: str) -> list:
@@ -328,14 +275,7 @@ class HierarchicalMMDiT(nn.Module):
             remat_block(MMDiTBlock, self.remat)(
                 features=self.emb_features[stage],
                 num_heads=self.num_heads[stage],
-                mlp_ratio=self.mlp_ratio,
-                dropout_rate=self.dropout_rate,
-                dtype=self.dtype,
-                precision=self.precision,
-                force_fp32_for_softmax=self.force_fp32_for_softmax,
-                norm_epsilon=self.norm_epsilon,
-                qk_norm=self.qk_norm,
-                attention_impl=self.attention_impl,
+                **self._block_options(),
                 name=f"{prefix}_block_stage{stage}_{i}"
             ) for i in range(self.num_layers[stage])
         ]
@@ -394,20 +334,9 @@ class HierarchicalMMDiT(nn.Module):
             "Feature dimensions, layers, and heads must have the same number of stages"
         num_stages = len(self.emb_features)
 
-        self.embed = PatchSequenceEmbed(
-            patch_size=self.base_patch_size,
-            emb_features=self.emb_features[0],
-            scan_order='raster',
-            dtype=self.dtype,
-            precision=self.precision,
-        )
+        self.embed = self._embedding(self.base_patch_size, self.emb_features[0])
         # Base conditioning at the finest dim, projected per stage
-        self.conditioning = ConditioningEmbed(
-            emb_features=self.emb_features[0],
-            mlp_ratio=self.mlp_ratio,
-            dtype=self.dtype,
-            precision=self.precision,
-        )
+        self.conditioning = self._conditioning(self.emb_features[0])
         self.cond_projs = [
             nn.Dense(features=self.emb_features[i], dtype=self.dtype,
                      precision=self.precision, name=f"cond_proj_stage{i}")
@@ -423,14 +352,7 @@ class HierarchicalMMDiT(nn.Module):
         self.encoder_path(num_stages)
         self.decoder_path(num_stages)
 
-        self.output = PatchSequenceOutput(
-            patch_size=self.base_patch_size,
-            output_channels=self.output_channels,
-            modulated=True,
-            norm_epsilon=self.norm_epsilon,
-            dtype=self.dtype,
-            precision=self.precision,
-        )
+        self.output = self._output(self.base_patch_size, self.output_channels, modulated=True)
 
     def __call__(self, x, temb, textcontext, train: bool = False):
         _, H, W, _ = x.shape

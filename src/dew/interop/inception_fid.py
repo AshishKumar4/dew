@@ -18,7 +18,7 @@ import numpy as np
 from flax.traverse_util import flatten_dict
 
 from dew.interop.safetensors_io import SEPARATOR, _flatten, _unflatten, read_file, write_file
-from dew.nn.text_encoders import ParamTree
+from dew.interop.weights import ParamTree
 from dew.objectives.base import Variables
 
 # The FID feature extractor's weights, the jax-fid pickle mirrored on the Hub

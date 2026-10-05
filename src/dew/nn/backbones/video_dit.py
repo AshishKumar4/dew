@@ -8,89 +8,35 @@ position, the standard factorized design, so compute stays linear in T for
 the spatial half and linear in S for the temporal half.
 """
 
-from typing import Literal
-
 import jax.numpy as jnp
-from flax import linen as nn
-from flax.typing import Dtype, PrecisionLike
 
 from dew.registry import models
 
-from ..dit import (
-    ROPE_THETA,
-    ConditioningEmbed,
-    ModulatedBlock,
-    PatchSequenceEmbed,
-    PatchSequenceOutput,
-    RematChoice,
-    remat_block,
-    rope_for_scan,
-)
+from ..dit import ROPE_THETA, ModulatedBlock, _DiTStackOptions, remat_block, rope_for_scan
 from ..precision import at_least_fp32
 from ..rope import rotary_freqs
 
 
 @models("video_dit")
-class VideoDiT(nn.Module):
+class VideoDiT(_DiTStackOptions):
     """Factorized spatial-temporal DiT over (B, T, H, W, C) inputs."""
-    output_channels: int = 3
-    patch_size: int = 16
-    emb_features: int = 768
-    num_layers: int = 12  # Each layer is one spatial + one temporal block
-    num_heads: int = 12
-    mlp_ratio: int = 4
-    dropout_rate: float = 0.0
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-    force_fp32_for_softmax: bool = True
-    norm_epsilon: float = 1e-5
-    qk_norm: bool = False
-    attention_impl: str = "auto"  # an AttentionImpl
-    remat: RematChoice = False
-    scan_order: Literal["raster", "hilbert", "zigzag"] = "raster"
-
-
     def setup(self):
-        self.embed = PatchSequenceEmbed(
-            patch_size=self.patch_size,
-            emb_features=self.emb_features,
-            scan_order=self.scan_order,
-            dtype=self.dtype,
-            precision=self.precision,
-        )
-        self.conditioning = ConditioningEmbed(
-            emb_features=self.emb_features,
-            mlp_ratio=self.mlp_ratio,
-            dtype=self.dtype,
-            precision=self.precision,
-        )
+        self.embed = self._embedding(self.patch_size, self.emb_features, self.scan_order)
+        self.conditioning = self._conditioning(self.emb_features)
 
         def block(name):
             return remat_block(ModulatedBlock, self.remat)(
                 features=self.emb_features,
                 num_heads=self.num_heads,
                 mixer='attention',
-                mlp_ratio=self.mlp_ratio,
-                dropout_rate=self.dropout_rate,
-                dtype=self.dtype,
-                precision=self.precision,
-                force_fp32_for_softmax=self.force_fp32_for_softmax,
-                norm_epsilon=self.norm_epsilon,
-                qk_norm=self.qk_norm,
-                attention_impl=self.attention_impl,
+                **self._block_options(),
                 name=name,
             )
 
         self.spatial_blocks = [block(f"spatial_block_{i}") for i in range(self.num_layers)]
         self.temporal_blocks = [block(f"temporal_block_{i}") for i in range(self.num_layers)]
 
-        self.output = PatchSequenceOutput(
-            patch_size=self.patch_size,
-            output_channels=self.output_channels,
-            norm_epsilon=self.norm_epsilon,
-            dtype=self.dtype,
-            precision=self.precision,
-        )
+        self.output = self._output(self.patch_size, self.output_channels)
 
     def __call__(self, x, temb, textcontext=None, train: bool = False):
         B, T, H, W, C = x.shape

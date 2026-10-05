@@ -1,60 +1,49 @@
-"""JEPA encoders and predictors, arranged from the shared DiT machinery.
+"""JEPA encoders and predictors, built from the shared DiT blocks.
 
-A JEPA encoder is the DiT sandwich without the diffusion parts: patchify with
-the 2D sincos signal, run unmodulated ModulatedBlocks over the tokens, norm.
+A JEPA encoder is the DiT structure without the diffusion parts: patchify with
+the 2D sincos signal, run ModulatedBlocks over the tokens, then normalize.
 There is no timestep to condition on, so the blocks run in their unmodulated
-(plain pre-norm) mode, and the mixer is still pluggable; mixer patterns with
-'ssm' give a linear-time S5 encoder.
+(plain pre-norm) mode. The mixer is still configurable, and mixer patterns
+with 'ssm' give a linear-time S5 encoder.
 
 Position never comes from RoPE here. Both the encoder and the predictor work
 on a masked subset of the sequence, where a token's index in the sequence is
-not its position on the grid, so the spatial blocks run unrotated and
-position is carried entirely by the 2D sincos embedding that travels with
-each token.
+not its position on the grid, so the spatial blocks run unrotated and the 2D
+sincos embedding that stays with each token carries all the position
+information.
 
-The image encoder and predictor compute V-JEPA's (facebookresearch/jepa,
-image mode, mask-token predictor) with one difference: their MLPs run the
-tanh GELU where V-JEPA's run exact (erf) GELU. tests/test_jepa_source.py
-holds them to V-JEPA's own code with that swap. Exact GELU
+The image encoder and predictor compute what V-JEPA's do (facebookresearch/jepa,
+image mode, mask-token predictor) with one difference: their MLPs use the
+tanh GELU where V-JEPA's use exact (erf) GELU. Exact GELU
 (`ModulatedBlock.gelu_approximate=False`) made a training step 3.2% slower
-on the RTX 4080 (ViT-S/16 encoder at 224, 6-layer predictor, bf16, batch
-64: 36.35-36.51 ms against 35.24-35.30), and Dew loads no published
-I-JEPA or V-JEPA weights that would need it.
+on an RTX 4080, and Dew loads no published I-JEPA or V-JEPA weights that
+would need it.
 """
+
+# tests/test_jepa_source.py checks these modules against V-JEPA's own code with
+# the GELU swapped. The 3.2% was a ViT-S/16 encoder at 224 with a 6-layer
+# predictor, bf16, batch 64: 36.35-36.51 ms against 35.24-35.30.
 
 from typing import ClassVar, Literal
 
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
-from flax.typing import Dtype, PrecisionLike
 
 from dew.registry import models
 
 from ..attention import LayerNorm
-from ..dit import ROPE_THETA, ModulatedBlock, PatchSequenceEmbed, build_block_pattern, scan_ordered_pos_embed
+from ..dit import ROPE_THETA, ModulatedBlock, _JepaStackOptions, build_block_pattern, scan_ordered_pos_embed
 from ..precision import at_least_fp32
 from ..rope import rotary_freqs
 from ..sharding import constrain, down_projection
 from .dit import gather_tokens
 
 
-class TokenStack(nn.Module):
+class TokenStack(_JepaStackOptions):
     """A stack of unmodulated blocks over a token sequence."""
     features: int
     num_layers: int
-    num_heads: int
-    mlp_ratio: int = 4
-    ssm_attention_ratio: str = "all-attn"
-    ssm_state_dim: int = 64
-    bidirectional_ssm: bool = True
-    dropout_rate: float = 0.0
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-    force_fp32_for_softmax: bool = True
-    norm_epsilon: float = 1e-5
-    qk_norm: bool = False
-    attention_impl: str = "auto"  # an AttentionImpl
 
     def setup(self):
         pattern = build_block_pattern(self.num_layers, self.ssm_attention_ratio)
@@ -64,14 +53,7 @@ class TokenStack(nn.Module):
                 num_heads=self.num_heads,
                 mixer='ssm' if kind == 'ssm' else 'attention',
                 modulated=False,
-                mlp_ratio=self.mlp_ratio,
-                dropout_rate=self.dropout_rate,
-                dtype=self.dtype,
-                precision=self.precision,
-                force_fp32_for_softmax=self.force_fp32_for_softmax,
-                norm_epsilon=self.norm_epsilon,
-                qk_norm=self.qk_norm,
-                attention_impl=self.attention_impl,
+                **self._block_options(),
                 ssm_state_dim=self.ssm_state_dim,
                 bidirectional_ssm=self.bidirectional_ssm,
                 name=f"block_{i}",
@@ -84,7 +66,7 @@ class TokenStack(nn.Module):
         return tokens
 
 
-class FactorizedTokenStack(nn.Module):
+class FactorizedTokenStack(_JepaStackOptions):
     """Spatial then temporal blocks over [B, T, N, F], as in VideoDiT.
 
     Time is a real 1D axis that masking never touches, so the temporal half
@@ -92,29 +74,13 @@ class FactorizedTokenStack(nn.Module):
     """
     features: int
     num_layers: int
-    num_heads: int
-    mlp_ratio: int = 4
-    ssm_attention_ratio: str = "all-attn"
-    ssm_state_dim: int = 64
-    bidirectional_ssm: bool = True
-    dropout_rate: float = 0.0
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-    force_fp32_for_softmax: bool = True
-    norm_epsilon: float = 1e-5
-    qk_norm: bool = False
-    attention_impl: str = "auto"  # an AttentionImpl
 
     def setup(self):
         def stack(name, num_layers, ratio):
+            options = self._stack_options()
+            options['ssm_attention_ratio'] = ratio
             return TokenStack(
-                features=self.features, num_layers=num_layers, num_heads=self.num_heads,
-                mlp_ratio=self.mlp_ratio, ssm_attention_ratio=ratio,
-                ssm_state_dim=self.ssm_state_dim, bidirectional_ssm=self.bidirectional_ssm,
-                dropout_rate=self.dropout_rate, dtype=self.dtype, precision=self.precision,
-                force_fp32_for_softmax=self.force_fp32_for_softmax,
-                norm_epsilon=self.norm_epsilon, qk_norm=self.qk_norm,
-                attention_impl=self.attention_impl, name=name)
+                features=self.features, num_layers=num_layers, **options, name=name)
 
         # one spatial and one temporal block per layer, built as single-block
         # stacks so the two halves can be interleaved
@@ -138,46 +104,26 @@ class FactorizedTokenStack(nn.Module):
 
 
 @models("jepa_encoder")
-class JepaEncoder(nn.Module):
+class JepaEncoder(_JepaStackOptions):
     """ViT over an image, optionally restricted to a subset of its patches."""
     patch_size: int = 16
     emb_features: int = 384
     num_layers: int = 12
     num_heads: int = 6
-    mlp_ratio: int = 4
-    ssm_attention_ratio: str = "all-attn"
-    ssm_state_dim: int = 64
-    bidirectional_ssm: bool = True
-    dropout_rate: float = 0.0
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-    force_fp32_for_softmax: bool = True
-    norm_epsilon: float = 1e-5
-    qk_norm: bool = False
-    attention_impl: str = "auto"  # an AttentionImpl
     scan_order: Literal["raster", "hilbert", "zigzag"] = "raster"
 
     stack_type: ClassVar[type[TokenStack | FactorizedTokenStack]] = TokenStack
-    """The layers between the patches and the norm: `TokenStack` over one
-    image's tokens, `FactorizedTokenStack` over a clip's frames."""
+    """The layers between the patches and the norm.
+
+    `TokenStack` runs over one image's tokens and `FactorizedTokenStack` over a
+    clip's frames.
+    """
 
     def setup(self):
-        self.embed = PatchSequenceEmbed(
-            patch_size=self.patch_size,
-            emb_features=self.emb_features,
-            scan_order=self.scan_order,
-            dtype=self.dtype,
-            precision=self.precision,
-        )
+        self.embed = self._embedding(self.patch_size, self.emb_features, self.scan_order)
         self.stack = self.stack_type(
             features=self.emb_features, num_layers=self.num_layers,
-            num_heads=self.num_heads, mlp_ratio=self.mlp_ratio,
-            ssm_attention_ratio=self.ssm_attention_ratio,
-            ssm_state_dim=self.ssm_state_dim, bidirectional_ssm=self.bidirectional_ssm,
-            dropout_rate=self.dropout_rate, dtype=self.dtype, precision=self.precision,
-            force_fp32_for_softmax=self.force_fp32_for_softmax,
-            norm_epsilon=self.norm_epsilon, qk_norm=self.qk_norm,
-            attention_impl=self.attention_impl,
+            **self._stack_options(),
         )
         self.norm = LayerNorm(epsilon=self.norm_epsilon, dtype=self.dtype, name="norm")
 
@@ -208,35 +154,24 @@ class JepaVideoEncoder(JepaEncoder):
 
 
 @models("jepa_predictor")
-class JepaPredictor(nn.Module):
-    """Narrow transformer from context embeddings to target embeddings.
+class JepaPredictor(_JepaStackOptions):
+    """A narrow transformer that maps context embeddings to target embeddings.
 
     Context tokens are projected down, mask tokens stand in for the targets,
-    and both carry the sincos signal for the grid position they belong to.
+    and both get the sincos signal for the grid position they belong to.
 
     The projections in and out split no tensor width, so under a tensor axis
-    each runs where `down_projection` places it: on each tensor shard's own
-    tokens where the measured link pays for gathering them, as multi-head
-    latent attention's down-projections do. On every token of every shard,
-    the two made layout_parity's JEPA compute 1.11 times one device's FLOPs
-    on tensor4.
+    each runs where `down_projection` places it. When the measured link is
+    fast enough to gather the results, each tensor shard projects only its
+    own tokens, as multi-head latent attention's down-projections do.
     """
+    # Run on every token of every shard, the two projections made
+    # tools/layout_parity's JEPA compute 1.11 times one device's FLOPs on tensor4.
     grid: tuple[int, int] = (14, 14)
     emb_features: int = 384      # encoder width, in and out
     predictor_features: int = 192
     num_layers: int = 6
     num_heads: int = 6
-    mlp_ratio: int = 4
-    ssm_attention_ratio: str = "all-attn"
-    ssm_state_dim: int = 64
-    bidirectional_ssm: bool = True
-    dropout_rate: float = 0.0
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-    force_fp32_for_softmax: bool = True
-    norm_epsilon: float = 1e-5
-    qk_norm: bool = False
-    attention_impl: str = "auto"  # an AttentionImpl
     scan_order: str = 'raster'
     factorized: bool = False     # space-time blocks, for video
 
@@ -248,20 +183,14 @@ class JepaPredictor(nn.Module):
         stack = FactorizedTokenStack if self.factorized else TokenStack
         self.stack = stack(
             features=self.predictor_features, num_layers=self.num_layers,
-            num_heads=self.num_heads, mlp_ratio=self.mlp_ratio,
-            ssm_attention_ratio=self.ssm_attention_ratio,
-            ssm_state_dim=self.ssm_state_dim, bidirectional_ssm=self.bidirectional_ssm,
-            dropout_rate=self.dropout_rate, dtype=self.dtype, precision=self.precision,
-            force_fp32_for_softmax=self.force_fp32_for_softmax,
-            norm_epsilon=self.norm_epsilon, qk_norm=self.qk_norm,
-            attention_impl=self.attention_impl,
+            **self._stack_options(),
         )
         self.norm = LayerNorm(epsilon=self.norm_epsilon, dtype=self.dtype, name="norm")
         self.proj_out = nn.Dense(features=self.emb_features, dtype=self.dtype,
                                  precision=self.precision, name="proj_out")
 
     def __call__(self, context, context_idx, target_idx, train: bool = False):
-        """context: [B, (T,) N_ctx, F] -> predictions [B, (T,) N_tgt, F]."""
+        """Map context embeddings [B, (T,) N_ctx, F] to predictions [B, (T,) N_tgt, F]."""
         pos_embed = jnp.asarray(
             scan_ordered_pos_embed(self.predictor_features, *self.grid, self.scan_order),
             dtype=self.dtype or jnp.float32)

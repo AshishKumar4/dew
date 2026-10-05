@@ -123,19 +123,15 @@ def step(args):
 
 
 def convolution_profile(directory):
-    from jax.profiler import ProfileData
+    from trace_window import device_events
 
-    files = sorted(directory.glob('**/*.xplane.pb'), key=lambda path: path.stat().st_mtime)
     native = 0.0
-    for plane in ProfileData.from_file(str(files[-1])).planes:
-        if not plane.name.startswith('/device:'):
-            continue
-        for line in plane.lines:
-            for event in line.events:
-                stats = {name: str(value) for name, value in event.stats}
-                milliseconds = (event.end_ns - event.start_ns) / 1e6 / 5
-                if stats.get('hlo_op', '').startswith('cudnn-conv'):
-                    native += milliseconds
+    for events in device_events(directory)[0].values():
+        for event in events:
+            stats = {name: str(value) for name, value in event.stats}
+            milliseconds = (event.end_ns - event.start_ns) / 1e6 / 5
+            if stats.get('hlo_op', '').startswith('cudnn-conv'):
+                native += milliseconds
     # The grids' interleaving can fuse with surrounding ops, so this counts
     # only native convolutions and never calls their absence zero fusion work.
     return {'native_cudnn_conv_ms': native}

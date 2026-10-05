@@ -45,6 +45,7 @@ from dew.interop.safetensors_io import LazyTensors
 if TYPE_CHECKING:
     from dew.interop.families.deepseek_v41 import DSparkFields, EngramFields
 from dew.interop.streaming import LazyTree, SourceLeaf, WeightLayout, materialize
+from dew.interop.weights import checkpoint_dtype, insert
 from dew.nn import audio as audio_nn, vision as vision_nn
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture, RematPolicy
@@ -52,7 +53,7 @@ from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.kv_cache import KVCache
 from dew.nn.mixers import AttentionMixer, MixerBase
 from dew.nn.moe import GatedActivation, Situ
-from dew.nn.text_encoders import check_tree, checkpoint_dtype, insert
+from dew.nn.text_encoders import check_tree
 from dew.objectives.base import Variables
 from dew.registry import from_record, mixers, towers
 
@@ -147,8 +148,11 @@ def _any_value(key: str, hf_config: Mapping[str, object]) -> bool:
 # tests/test_pretrained_sources.py checks every entry against the installed
 # reference config classes.
 _INERT_FIELDS: Mapping[str | None, Mapping[str, Callable[[str, Mapping[str, object]], bool]]] = {
-    # transformers.js's loading hints (SmolLM2-*-Instruct).
-    None: {'transformers.js_config': _any_value},
+    # Tooling records no reference reads: transformers.js's loading hints
+    # (SmolLM2-*-Instruct), Unsloth's patch markers (unsloth/* re-uploads) and
+    # the source repo names exporters write.
+    None: {'transformers.js_config': _any_value, 'unsloth_fixed': _any_value, 'unsloth_version': _any_value,
+           'name_or_path': _any_value, 'model_name': _any_value},
     # nanotron's training flags, which SmolLM2 retains.
     'llama': {'is_llama_config': _any_value, 'rope_interleaved': _any_value},
     # Qwen2.5's text configs state the multimodal rotary off; on, it is a
@@ -171,6 +175,14 @@ _INERT_FIELDS: Mapping[str | None, Mapping[str, Callable[[str, Mapping[str, obje
         'time_step_scale': _any_value,
     },
 }
+
+
+def _unread(hf_config: Mapping[str, object], used: set[str]) -> set[str]:
+    """The config's fields that neither the translation read nor any rule
+    accepts as describing no computation."""
+    return (set(hf_config) - used - _IGNORED_FIELDS - _CODEC_FIELDS
+            - _inert(hf_config.get('model_type'), hf_config)
+            - {key for key in hf_config if str(key).startswith('_')})
 
 
 def _inert(model_type: object, hf_config: Mapping[str, object]) -> set[str]:
@@ -937,9 +949,7 @@ def _translated(hf_config: Mapping[str, object], family: "DecoderFamily") -> tup
     used = {'model_type', 'use_bidirectional_attention', 'mlp_bias', 'num_hidden_layers'}
     config = family.translate_config(hf_config, used)
 
-    unknown = (set(hf_config) - used - _IGNORED_FIELDS - _CODEC_FIELDS - _inert(model_type, hf_config)
-               - {key for key in hf_config if str(key).startswith('_')})
-    return config, unknown
+    return config, _unread(hf_config, used)
 
 
 def _wrapper_text(hf_config: Mapping[str, object], used: set, *,
@@ -1178,8 +1188,7 @@ def translate_wrapper_config(hf_config: Mapping[str, object]) -> WrapperFields:
                 "no supported multimodal wrapper is registered for this model")
     used = {"model_type"}
     record = read(hf_config, used)
-    unknown = (set(hf_config) - used - _IGNORED_FIELDS - _CODEC_FIELDS - _inert(model_type, hf_config)
-               - {key for key in hf_config if str(key).startswith("_")})
+    unknown = _unread(hf_config, used)
     if unknown:
         _refuse(f"config fields {sorted(unknown)}",
                 "the wrapper has no counterpart, so translating them would "
