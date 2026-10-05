@@ -51,12 +51,13 @@ value Tunix hardcodes. verl-omni and TRL use 1e-4, so it is an argument."""
 
 
 def masked_mean(x: jax.Array, mask: jax.Array, axis=None) -> jax.Array:
-    """Ratio of `x` over the positions `mask` keeps.
+    """Return the mean of `x` over the positions `mask` keeps, along `axis` (all axes by default).
 
-    Outside the mask the values are replaced through `jnp.where`, verl's
-    `masked_sum` form. A nan in a padded position survives a multiply by a
-    zero mask and reaches the loss, and a padded position is where an
-    uninitialised value sits.
+    Values outside the mask are replaced with zero through `jnp.where` before
+    the multiply, as verl's `masked_sum` does. A nan in a padded position
+    would survive a multiply by a zero mask and reach the loss, and padded
+    positions are where uninitialised values sit. The denominator adds
+    `MEAN_EPS`, so a fully masked input gives zero.
     """
     weights = mask.astype(x.dtype)
     kept = jnp.where(weights != 0, x, 0)
@@ -64,12 +65,13 @@ def masked_mean(x: jax.Array, mask: jax.Array, axis=None) -> jax.Array:
 
 
 def masked_whiten(x: jax.Array, mask: jax.Array) -> jax.Array:
-    """`x` centred and scaled by its masked mean and unbiased deviation.
+    """Return `x` centred on its masked mean and scaled by its unbiased masked deviation.
 
-    Both references whiten GAE advantages this way, Bessel correction
-    included, and both leave the positions outside the mask in the output for
-    the loss to mask again. With one unmasked position the correction divides
-    by zero. verl raises there; this runs under jit and cannot.
+    Tunix and verl both whiten GAE advantages this way, Bessel correction
+    included. Both also leave the positions outside the mask in the output,
+    for the loss to mask again. With only one unmasked position the
+    correction divides by zero. verl raises an error there; this function
+    runs under jit and cannot.
     """
     mean = masked_mean(x, mask)
     variance = masked_mean(jnp.square(x - mean), mask)
@@ -94,14 +96,17 @@ def _grouped(rewards: jax.Array, group: int) -> jax.Array:
 
 def group_advantage(rewards: jax.Array, group: int, normalise_by_std: bool = True,
                     eps: float = GROUP_EPS) -> jax.Array:
-    """Group-relative advantage of `[B]` rewards, `group` completions per prompt.
+    """Return the group-relative advantage of `[B]` rewards, with `group` completions per prompt.
 
-    The rollout expands each prompt into `group` rows next to each other, so a
-    group is a reshape. verl groups by a `uid` column, which allows ragged
-    groups. Dew's rollout cannot produce those.
+    Each reward has its group's mean subtracted and is divided by the
+    group's standard deviation (ddof 1) plus `eps`. The rollout puts each
+    prompt's `group` rows next to each other, so a reshape forms the groups.
+    verl groups by a `uid` column, which allows ragged groups, but Dew's
+    rollout cannot produce them. A `group` below 2 raises ValueError, because
+    a group of one has no baseline.
 
     `normalise_by_std=False` is Dr.GRPO (arXiv:2503.20783), which subtracts the
-    group mean without scaling by the deviation. verl spells the same switch
+    group mean without scaling by the deviation. verl calls the same switch
     `norm_adv_by_std_in_grpo`.
     """
     grouped = _grouped(rewards, group)
@@ -114,11 +119,11 @@ def group_advantage(rewards: jax.Array, group: int, normalise_by_std: bool = Tru
 
 
 def rloo_advantage(rewards: jax.Array, group: int) -> jax.Array:
-    """Each completion against the mean of the rest of its group.
+    """Return each completion's reward minus the mean reward of the rest of its group.
 
-    `r_i - mean(r_j, j != i)`, which is `group / (group - 1)` times the centred
-    reward. Tunix writes the first form and verl the second (arXiv:2402.14740).
-    This follows Tunix.
+    That is `r_i - mean(r_j, j != i)`, which equals `group / (group - 1)`
+    times the centred reward (arXiv:2402.14740). Tunix writes the first form
+    and verl the second; this function follows Tunix.
     """
     grouped = _grouped(rewards, group)
     others = (jnp.sum(grouped, axis=-1, keepdims=True) - grouped) / (group - 1)
@@ -127,18 +132,18 @@ def rloo_advantage(rewards: jax.Array, group: int) -> jax.Array:
 
 def gae(token_rewards: jax.Array, values: jax.Array, mask: jax.Array,
         gamma: float, lam: float) -> tuple[jax.Array, jax.Array]:
-    """Generalized advantage estimation over `[B, T]` rewards and values.
+    """Compute generalized advantage estimates for `[B, T]` rewards and values.
 
+    The recursion runs backwards from the last step, with
     `delta_t = r_t + gamma * V(s_{t+1}) - V(s_t)` and
-    `A_t = delta_t + gamma * lam * A_{t+1}`, backwards from the last step
-    (arXiv:1506.02438). A masked step contributes nothing and passes the
-    running advantage and the next value through unchanged, so a padded tail
-    leaves the real steps before it undiscounted. Positions outside the mask
-    hold the neighbouring step's carry, as in both references, for the loss
-    to mask again.
+    `A_t = delta_t + gamma * lam * A_{t+1}` (arXiv:1506.02438). A masked step
+    contributes nothing and passes the running advantage and the next value
+    through unchanged, so a padded tail does not discount the real steps
+    before it. Positions outside the mask hold the neighbouring step's
+    carry, as in both references, and the loss masks them again.
 
     Returns the whitened advantages and the unwhitened returns, in that order.
-    `returns = A + V` happens before the whitening in both references.
+    Both references compute `returns = A + V` before whitening.
 
     The recursion runs in float32 whatever the caller's dtype, the way Tunix's
     GRPO loss casts its log-probabilities. The whitening subtracts two nearby
