@@ -151,6 +151,20 @@ def test_a_keyword_overrides_what_a_bundle_supplies():
     assert not any(bool(jnp.any(leaf)) for leaf in jax.tree.leaves(objective.init(jax.random.key(0))))
 
 
+def test_an_explicit_none_clears_what_a_decoder_bundle_supplies():
+    """`variables=None` beside a bundle starts from a fresh init and
+    `processor=None` keeps no processor, as they do without one; only an
+    omitted keyword takes the bundle's."""
+    source = Pretrained.load(FIXTURES / "llama-tiny", dtype="float32", attention_impl="xla")
+    cleared = LMObjective(source, 4, variables=None, processor=None)
+    assert cleared.variables is None and cleared.processor is None
+    drawn = cleared.init(jax.random.key(0))
+    assert any(not np.array_equal(np.asarray(ours), np.asarray(theirs)) for ours, theirs in zip(
+        jax.tree.leaves(drawn["params"]), jax.tree.leaves(source.variables["params"]), strict=True))
+    kept = LMObjective(source, 4)
+    assert kept.variables is source.variables and kept.processor is source.text_processor
+
+
 def test_media_prompts_are_processed_once_and_keep_their_continuations():
     """Text and images reach the processor once per request, whatever the
     continuation count, and the continuations expand afterwards: each row

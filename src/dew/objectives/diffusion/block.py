@@ -29,7 +29,20 @@ from dew.inputs import Field, InputSpec
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.inputs import ModelInputs
 from dew.nn.sharding import LOGITS, constrain
-from dew.objectives.base import FROZEN, Aux, Batch, EMASpec, Objective, Ratio, Source, Step, Variables, thaw
+from dew.objectives.base import (
+    FROZEN,
+    OMITTED,
+    Aux,
+    Batch,
+    EMASpec,
+    Objective,
+    Omitted,
+    Ratio,
+    Source,
+    Step,
+    Variables,
+    thaw,
+)
 from dew.objectives.lm.chunked import chunked_cross_entropy, head_logits
 from dew.registry import objectives
 
@@ -147,19 +160,21 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
 
     def __init__(self, model: DiffusionGemma | Source, *, prompt_length: int,
                  num_canvases: int = 1, canvas_size: int | None = None,
-                 variables: Variables | None = None, pad_token_id: int = 0,
+                 variables: Variables | None | Omitted = OMITTED, pad_token_id: int = 0,
                  self_cond_prob: float = 0.5, safety_epsilon: float = 1e-4,
                  stop_gradient_from_denoiser_to_encoder: bool = False,
                  encoder_loss_weight: float = 1.0, decoder_loss_weight: float = 1.0,
                  ema_decay: float | None = None, head_chunks: int = 4,
-                 processor: Processor | None = None):
+                 processor: Processor | None | Omitted = OMITTED):
         if isinstance(model, Source):
-            variables = model.variables if variables is None else variables
-            processor = model.text_processor if processor is None else processor
+            variables = model.variables if variables is OMITTED else variables
+            processor = model.text_processor if processor is OMITTED else processor
             if not isinstance(model.model, DiffusionGemma):
                 raise TypeError(f"block diffusion trains a DiffusionGemma, and this source's model "
                                 f"is a {type(model.model).__name__}")
             model = model.model
+        variables = None if variables is OMITTED else variables
+        processor = None if processor is OMITTED else processor
         canvas_size = model.canvas_length if canvas_size is None else canvas_size
         for name, value in (("prompt_length", prompt_length), ("num_canvases", num_canvases),
                             ("canvas_size", canvas_size), ("head_chunks", head_chunks)):
