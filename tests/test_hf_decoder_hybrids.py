@@ -4,6 +4,7 @@ inputs and shared KV, Qwen3.5's and Qwen3-Next's gated delta nets, and Gemma
 """
 
 import json
+import os
 from pathlib import Path
 
 import jax
@@ -1160,3 +1161,49 @@ def test_diffusion_gemma_text_reuses_the_gemma4_map_in_decoder_mode():
                            'final_logit_softcap')} == {
         key: value for key, value in gemma4.items()
         if key not in ('attention_k_eq_v', 'final_logit_softcap')}
+
+
+QWEN35_0_8B = "Qwen/Qwen3.5-0.8B"
+QWEN35_0_8B_REVISION = "2fc06364715b967f1860aea9cf38778875588b17"
+
+
+@pytest.mark.network
+@pytest.mark.skipif(not os.environ.get("DEW_NETWORK_TESTS"),
+                    reason=f"DEW_NETWORK_TESTS=1 downloads {QWEN35_0_8B}")
+def test_the_real_qwen35_0_8b_delta_rule_chunks_as_it_recurs():
+    """Qwen3.5-0.8B's own keys on a 256-token prompt reach the chunk
+    inverse's hard case: in the fifth delta-rule layer the series form of
+    `strictly_lower_inverse` came out 1e24 off in fp32 and every later
+    layer, the logits and a served request NaN (transformers' forward was
+    finite, 3.3e-05 from Dew's once fixed). Each layer's chunked rule now
+    gives what the token-by-token rule gives on the same inputs, and the
+    logits are finite."""
+    import dew
+    from dew.nn import linear
+
+    task = dew.pipeline(QWEN35_0_8B, revision=QWEN35_0_8B_REVISION, dtype="float32",
+                        param_dtype="float32")
+    model = task.model.language_model
+    params = {"params": task.variables["params"]["language_model"]}
+    captured = []
+    chunked = linear.chunk_gated_delta_rule
+
+    def recording(query, key, value, g, beta, state=None, chunk_size=linear.CHUNK_SIZE):
+        jax.debug.callback(lambda *args: captured.append([np.asarray(x) for x in args]),
+                           query, key, value, g, beta)
+        return chunked(query, key, value, g, beta, state, chunk_size)
+
+    prompt = np.random.default_rng(0).integers(100, 150_000, (1, 256)).astype(np.int32)
+    with jax.default_matmul_precision("highest"):
+        linear.chunk_gated_delta_rule = recording
+        try:
+            logits = jax.jit(lambda p, t: model.apply(p, t))(params, prompt)
+            jax.effects_barrier()
+        finally:
+            linear.chunk_gated_delta_rule = chunked
+        assert bool(jnp.isfinite(logits).all())
+        assert len(captured) == model.layer_types.count("linear_attention")
+        for inputs in captured:
+            got = chunked(*inputs)[0]
+            want = linear.recurrent_gated_delta_rule(*inputs)[0]
+            assert float(jnp.max(jnp.abs(got - want))) <= 1e-4 * float(jnp.max(jnp.abs(want)))
