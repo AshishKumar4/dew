@@ -36,6 +36,7 @@ from dew import records
 
 if TYPE_CHECKING:
     from dew.diffusion.process import Process
+    from dew.registry import DtypeName
     from dew.sampling.pipelines import TextToImage
 
 # FlaxDiff 0.2's DiTs held these at their root; Dew nests them under the
@@ -209,6 +210,15 @@ def _condition(input_config: Mapping[str, object]) -> tuple[str, str, str]:
             records.text(condition.get("unconditional_input", ""), "unconditional_input"))
 
 
+def _towers(clip: str, unconditional: str, vae: str, dtype: DtypeName):
+    """A run's CLIP condition and SD VAE, computing in `dtype`; FlaxDiff read
+    the VAE's main branch."""
+    from dew.objectives.diffusion.config import PretrainedAutoencoder, TextCondition
+
+    return (TextCondition(checkpoint=clip, dtype=dtype, unconditional=unconditional).build(),
+            PretrainedAutoencoder(modelname=vae, revision="main", dtype=dtype).build())
+
+
 def text_to_image(directory: str | os.PathLike, config: Mapping[str, object], *, jax_version: str,
                   ema: bool = True, best: bool = False, dtype: DTypeLike | None = None) -> TextToImage:
     """A FlaxDiff text-to-image run as a Dew `TextToImage` (`TextToImage.from_flaxdiff`).
@@ -228,7 +238,6 @@ def text_to_image(directory: str | os.PathLike, config: Mapping[str, object], *,
     from dew.inputs import Field, InputSpec
     from dew.nn.dit import TextContext
     from dew.nn.text_encoders import check_tree
-    from dew.objectives.diffusion.config import PretrainedAutoencoder, TextCondition
     from dew.registry import models, resolve_dtype
     from dew.sampling import CFG, EulerAncestral, TextToImage
 
@@ -255,10 +264,8 @@ def text_to_image(directory: str | os.PathLike, config: Mapping[str, object], *,
     variables = convert(read_checkpoint(directory, ema=ema, best=best),
                          model_config, jax_version=jax_version)
 
-    # FlaxDiff's encoders ran in bfloat16, and it read the VAE's main branch.
-    condition = TextCondition(checkpoint=clip, dtype="bfloat16", unconditional=unconditional).build()
-    vae = PretrainedAutoencoder(modelname=records.text(options["modelname"], "modelname"),
-                                     revision="main").build()
+    # FlaxDiff's encoders ran in bfloat16.
+    condition, vae = _towers(clip, unconditional, records.text(options["modelname"], "modelname"), "bfloat16")
     encoder = condition.encoder
     context = encoder.encode(encoder.params, encoder.tokenize([unconditional]))
     if not isinstance(context, TextContext):
