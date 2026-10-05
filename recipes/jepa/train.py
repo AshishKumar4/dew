@@ -11,8 +11,6 @@ The encoder is --model, the predictor takes the encoder's width and heads plus
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
-import tyro
-
 from dew.config import JsonDict, ModelConfig, OptimConfig, RunConfig
 from dew.data import ImageDataset, VideoDataset
 from dew.inputs import Field
@@ -163,4 +161,4 @@ def main(config: JepaRunConfig) -> TrainState:
 
 
 if __name__ == '__main__':
-    main(tyro.cli(tyro.conf.CascadeSubcommandArgs[JepaRunConfig]))
+    main(JepaRunConfig.cli())

@@ -13,6 +13,7 @@ reports. These values are JAX pytrees.
 
 from __future__ import annotations
 
+import enum
 import functools
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
@@ -672,6 +673,20 @@ def merge_totals(accumulated: tuple[float, float],
 def mean_of_totals(accumulated: tuple[float, float]) -> float:
     """Divide a metric's summed total by its summed count."""
     return accumulated[0] / accumulated[1]
+
+
+class Omitted(enum.Enum):
+    """A keyword the caller left out, where None is a value of its own.
+
+    An objective built over a loaded bundle takes what the bundle supplies for
+    such a keyword (`variables`, `processor`, a pipeline's `autoencoder`) only
+    when it is omitted; an explicit None clears it.
+    """
+
+    OMITTED = "omitted"
+
+
+OMITTED = Omitted.OMITTED
 
 
 __all__ = [
