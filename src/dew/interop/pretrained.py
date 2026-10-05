@@ -47,6 +47,7 @@ from dew.inputs.diffusion import (
 )
 from dew.interop import gguf, hf_decoders as decoders, mamba2, sources, verify
 from dew.interop.codecs import SourceQuantization, source_quantization
+from dew.interop.config_records import NativeFields
 from dew.interop.generation_config import (
     audit_masked,
     eos_ids,
@@ -74,7 +75,6 @@ from dew.objectives.base import Variables
 from dew.registry import (
     dtype_name,
     from_record,
-    models,
     precision_fields,
     projectors,
     resolve_dtype,
@@ -1271,11 +1271,10 @@ def _unet_denoiser(directory: Path, *, dtype: str | None, attention_impl: str) -
     """Build the published UNet: cross attention over one or two CLIP towers, whose
     pooled text conditioning is the one its added time features ask for."""
     from dew.interop import diffusion
-    from dew.nn.backbones.unet_condition import UNet2DCondition
 
     config = _component_config(directory, "unet")
     fields = diffusion.unet_fields(config, dtype=dtype, attention_impl=attention_impl)
-    model = UNet2DCondition(**fields)
+    model = fields.value
 
     def weights(param_dtype: str, lazy: bool) -> tuple[Variables, tuple[WeightLayout, ...]]:
         params, layouts = diffusion.translate_unet_weights(
@@ -1316,7 +1315,7 @@ def _denoiser(directory: Path, *, dtype: str | None, attention_impl: str) -> _De
         return spec(config, directory, dtype=dtype, attention_impl=attention_impl)
     fields = spec.fields(config, dtype=dtype, attention_impl=attention_impl)
     return _Denoiser(
-        component="transformer", model=models[spec.name](**fields),
+        component="transformer", model=fields.value,
         weights=_transformer_weights(directory, spec.translate),
         built=_built(spec.name, fields, dtype), config=config, text=spec.text(fields),
         patch=spec.patch(fields) if callable(spec.patch) else spec.patch,
@@ -1351,9 +1350,9 @@ def _sd3_denoiser(config: dict, directory: Path, *, dtype: str | None, attention
     """Build SD3's MM-DiT: both CLIP towers and the T5 tower read jointly, with the
     stored position buffer in its own frozen collection."""
     from dew.interop import diffusion
-    from dew.nn.backbones.sd3 import SD3Transformer
 
     fields = diffusion.sd3_fields(config, dtype=dtype, attention_impl=attention_impl)
+    model = fields.value
 
     def weights(param_dtype: str, lazy: bool) -> tuple[Variables, tuple[WeightLayout, ...]]:
         params, buffers, layouts = diffusion.translate_sd3_weights(
@@ -1361,13 +1360,13 @@ def _sd3_denoiser(config: dict, directory: Path, *, dtype: str | None, attention
         return {"params": params, "buffers": buffers}, layouts
 
     return _Denoiser(
-        component="transformer", model=SD3Transformer(**fields), weights=weights,
+        component="transformer", model=model, weights=weights,
         built=_built("sd3_transformer", fields, dtype), config=config,
         text=_TextTowers("sd3", ("text_encoder", "text_encoder_2"), t5_tower="text_encoder_3"),
-        patch=fields["patch_size"],
-        latent_input=fields["in_channels"],
+        patch=model.patch_size,
+        latent_input=model.in_channels,
         sample_size=_square(config),
-        context_width=fields["joint_attention_dim"], pipeline="StableDiffusion3Pipeline")
+        context_width=model.joint_attention_dim, pipeline="StableDiffusion3Pipeline")
 
 
 @dataclass(frozen=True)
@@ -1375,7 +1374,7 @@ class _DenoiserSpec:
     """The transformer's native record and its pipeline's text, geometry and sigma origin."""
 
     name: str
-    fields: Callable[..., Mapping[str, object]]
+    fields: Callable[..., NativeFields[nn.Module]]
     translate: Callable[..., tuple[LazyTree, tuple[WeightLayout, ...]]]
     text: Callable[[Mapping[str, object]], _TextTowers | _QwenImageText | _HiddenStatesText | _WanText]
     patch: int | Callable[[Mapping[str, object]], int]
