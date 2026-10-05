@@ -71,7 +71,7 @@ class LayerBanks(Protocol):
         """Return the bank of one run of `layers`, on the shardings or Formats in `placement`.
 
         The layers are stacked in order on a new leading axis; a run of one
-        layer returns that layer's own subtree. A Format carries a physical
+        layer returns that layer's own subtree. A Format also sets a physical
         layout, which the source must preserve. The returned collections are
         local to `namespace`.
         """
@@ -414,8 +414,8 @@ class SafetensorsBanks(LayerBanks):
 
         Only the non-decoder leaves are loaded now. Each declared run gets a
         static `StreamedBank` handle in the runtime-only `streaming`
-        collection, and the stack's prefetch, which carries two rows, calls
-        it during execution.
+        collection, and the stack's prefetch, which holds two rows at a time,
+        calls it during execution.
 
         This works for single-device inference only. A mesh of more than one
         device, host placement in `layout`, or a stack without `scan_layers`

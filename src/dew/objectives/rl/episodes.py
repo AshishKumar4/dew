@@ -298,7 +298,7 @@ class EpisodeRollout:
     possible call, so it always fits and its shapes stay fixed. Every action
     in an episode gets the same group advantage, computed from the episode's
     final reward; Dew infers no per-turn credit, and truncated episodes are
-    masked. Host records and numeric rows carry the trainer's committed
+    masked. Host records and numeric rows record the trainer's committed
     update count. Raw and behavior likelihoods come from the actual draws.
 
     `policy.bind` fixes one immutable variables snapshot for the whole

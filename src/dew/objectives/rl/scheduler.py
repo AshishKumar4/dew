@@ -54,9 +54,9 @@ scheduler admits the first `admit` groups to complete and cancels the
 others, as slime's over-sampling batch does. Both select by completion
 time, which favors short rollouts; that bias is the price of not waiting on
 the tail. Rollouts that are running when new weights are pushed keep
-running. Their later calls carry the new version, and a rollout's
-staleness is that of its oldest call, as in Kimi K2's partial rollouts
-(arXiv:2507.20534 section 3.3.4).
+running. Their later calls are stamped with the new version, and a
+rollout's staleness is that of its oldest call, as in Kimi K2's partial
+rollouts (arXiv:2507.20534 section 3.3.4).
 
 The scheduler pushes weights through `weights` when the served version
 falls `sync_every` updates behind the trainer, or is ahead of it, as after

@@ -32,7 +32,7 @@ gateway keeps.
   and the verifier still scored the trial.
 - `TRUNCATED` when the agent ran out of time, context or output budget, the
   harness hit its own step limit, or the last call stopped at its length
-  limit. It carries the verifier's reward when the verifier ran, and the
+  limit. It has the verifier's reward when the verifier ran, and the
   scheduler's `truncation` policy decides whether it trains.
 - `INFRA_ERROR` for anything else: a sandbox, gateway, engine or verifier
   failure, a trace without ids or likelihoods, an aborted call, or a
