@@ -24,14 +24,32 @@ What it writes:
   packed additive masks) and the outputs (per-query KL and its mean for the
   dense and the sparse loss, the exact top-k mask).
 - meta.json: the reference release and lines, and the tensor shapes.
+- maxtext.npz: `MLA.calculate_indexer_loss` and `Indexer.generate_mask`
+  themselves, fetched at that commit and run as published under JAX (EPS
+  and DEFAULT_MASK_VALUE read from the same commit's globals.py and
+  common_types.py, the config at base.yml's defaults: exact top-k, no head
+  chunking, default matmul precision; the float64 run reads the loss's
+  float32 casts as float64), behind `Indexer.__call__`'s masking
+  and `jax.lax.top_k`, on larger tensors: the dense loss over a causal and
+  a packed mask and the sparse loss over the causal one, each with its
+  gradient in the indexer's scores, in float32 and in float64, and the
+  exact top-k masks.
 """
 
+import ast
 import json
+import types
+import urllib.request
 from pathlib import Path
 
 import numpy as np
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "indexer"
+COMMIT = "538fe7a3f3376d94cf3f04e77741aa6d7e8efa45"
+MAXTEXT = f"https://raw.githubusercontent.com/AI-Hypercomputer/maxtext/{COMMIT}/src/maxtext/"
+PUBLISHED = {"batch": 2, "length": 24, "heads": 4, "head_dim": 16, "top_k": 6, "seed": 29}
+"""maxtext.npz's sizes: 1152 scores per mask, which the float64 rule's RMS
+settles over."""
 
 BATCH, LENGTH, HEADS, HEAD_DIM = 2, 7, 3, 8
 TOP_K = 3
@@ -161,5 +179,122 @@ def main() -> None:
               + (f" = {float(value):.6f}" if value.ndim == 0 else ""))
 
 
+def fetched(path: str) -> str:
+    return urllib.request.urlopen(MAXTEXT + path).read().decode()
+
+
+def constant(text: str, name: str, scope: dict):
+    """A module-level constant of the fetched source, evaluated as published."""
+    node = next(node for node in ast.parse(text).body if isinstance(node, ast.Assign)
+                and any(isinstance(target, ast.Name) and target.id == name for target in node.targets))
+    return eval(compile(ast.Expression(node.value), name, "eval"), scope)
+
+
+class Numpy(types.ModuleType):
+    """jax.numpy with `float32`, which the loss casts its softmaxes to, as
+    the run's precision: the float64 run is the same code in float64."""
+
+    def __init__(self, dtype):
+        super().__init__("jax.numpy")
+        self.float32 = dtype
+
+    def __getattr__(self, name):
+        import jax.numpy as jnp
+
+        return getattr(jnp, name)
+
+
+def published_methods(dtype) -> tuple[dict, float]:
+    """`Indexer.generate_mask` and `MLA.calculate_indexer_loss` from
+    attention_mla.py, with the module scope they read, at `dtype`."""
+    import jax
+    from jax.ad_checkpoint import checkpoint_name
+
+    scope = {"jax": jax, "jnp": Numpy(dtype), "checkpoint_name": checkpoint_name, "np": np,
+             "Array": jax.Array, "Optional": __import__("typing").Optional}
+    scope["EPS"] = constant(fetched("utils/globals.py"), "EPS", scope)
+    mask_value = constant(fetched("common/common_types.py"), "DEFAULT_MASK_VALUE", scope)
+    scope["DEFAULT_MASK_VALUE"] = mask_value
+    text = fetched("layers/attention_mla.py")
+    methods = {}
+    for node in ast.parse(text).body:
+        if isinstance(node, ast.ClassDef) and node.name in ("Indexer", "MLA"):
+            for item in node.body:
+                if isinstance(item, ast.FunctionDef) and item.name in {"generate_mask",
+                                                                       "calculate_indexer_loss"}:
+                    exec(compile(ast.Module(body=[item], type_ignores=[]), "attention_mla.py", "exec"), scope)
+                    methods[item.name] = scope[item.name]
+    assert set(methods) == {"generate_mask", "calculate_indexer_loss"}
+    return methods, mask_value
+
+
+def published_loss(methods: dict, dtype, raw, attention_mask, query, key, sparse: bool):
+    """The published loss on the indexer's raw scores behind
+    `Indexer.__call__`'s tail (:428-452): the attention mask goes on before
+    `jax.lax.top_k` and again after `generate_mask`, and the masked score is
+    what the loss receives. Returns the loss and the indexer's mask."""
+    import jax
+
+    layer = types.SimpleNamespace(config=types.SimpleNamespace(
+        indexer_mask_exact_topk=True, mla_qk_head_chunk_size=0, matmul_precision="default"), dtype=dtype)
+    indexer_score = raw + attention_mask
+    topk_values, _ = jax.lax.top_k(indexer_score, k=PUBLISHED["top_k"])
+    indexer_mask = methods["generate_mask"](layer, indexer_score, topk_values) + attention_mask
+    value = methods["calculate_indexer_loss"](layer, indexer_score, query, key, attention_mask, indexer_mask,
+                                              sparse_loss=sparse, scaling_factor=1.0)
+    return value, indexer_mask
+
+
+def write_published() -> None:
+    """maxtext.npz: the published loss, gradient and mask in both precisions."""
+    import jax
+    import jax.numpy as jnp
+
+    batch, length, heads = PUBLISHED["batch"], PUBLISHED["length"], PUBLISHED["heads"]
+    rng = np.random.default_rng(PUBLISHED["seed"])
+    scale = PUBLISHED["head_dim"] ** -0.5
+    query = rng.normal(size=(batch, length, heads, PUBLISHED["head_dim"])).astype(np.float32)
+    key = rng.normal(size=(batch, length, heads, PUBLISHED["head_dim"])).astype(np.float32)
+    scores = np.maximum(rng.normal(scale=1.5, size=(batch, length, length)), 0).astype(np.float32)
+    segments = np.repeat(np.array([[1, 2, 3], [1, 2, 0]], np.int32), length // 3, axis=1)
+    arrays = {"query": query, "key": key, "scores": scores, "segments": segments,
+              "scale": np.float64(scale)}
+    keeps = {"causal": np.broadcast_to(np.tril(np.ones((length, length), bool)), (batch, length, length)),
+             "packed": ((segments[:, :, None] == segments[:, None, :]) & (segments[:, :, None] != 0)
+                        & np.tril(np.ones((length, length), bool))[None])}
+    cases = {"causal_dense": ("causal", False), "packed_dense": ("packed", False),
+             "causal_sparse": ("causal", True)}
+    for dtype, tail in ((jnp.float32, ""), (jnp.float64, "_f64")):
+        methods, mask_value = published_methods(dtype)
+        with jax.enable_x64(new_val=True):
+            arrays.update(published_case(methods, mask_value, dtype, tail, query, key, scores, scale,
+                                         keeps, cases))
+    np.savez(FIXTURES / "maxtext.npz", **arrays)
+    print(f"{FIXTURES / 'maxtext.npz'}: " + ", ".join(
+        f"{name} {float(arrays[f'{name}/loss_f64']):.6f}" for name in cases))
+
+
+def published_case(methods, mask_value, dtype, tail, query, key, scores, scale, keeps, cases) -> dict:
+    """Every case's published loss and gradient at `dtype`, and at float32
+    its mask."""
+    import jax
+    import jax.numpy as jnp
+
+    arrays = {}
+    for name, (mask, sparse) in cases.items():
+        attention_mask = jnp.where(keeps[mask], 0.0, mask_value).astype(dtype)
+        scaled = jnp.asarray(query, dtype) * dtype(scale)
+        (value, indexer_mask), gradient = jax.value_and_grad(
+            lambda raw, attention_mask=attention_mask, scaled=scaled, dtype=dtype, sparse=sparse:
+            published_loss(methods, dtype, raw, attention_mask, scaled, jnp.asarray(key, dtype), sparse),
+            has_aux=True)(jnp.asarray(scores, dtype))
+        arrays[f"{name}/loss{tail}"] = np.asarray(value)
+        arrays[f"{name}/grad{tail}"] = np.asarray(gradient)
+        if tail == "":
+            arrays[f"{mask}/selected"] = np.asarray(indexer_mask) == 0.0
+    return arrays
+
+
 if __name__ == "__main__":
     main()
+    write_published()

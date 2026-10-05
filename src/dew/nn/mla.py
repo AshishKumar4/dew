@@ -23,7 +23,6 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
-from jax.scipy.special import xlogy
 
 from dew.nn.attention import (
     LayerNorm,
@@ -92,6 +91,11 @@ INDEXER_COLLECTION = 'indexer'
 """The collection an attention layer sows its per-query indexer KL under
 when a caller opens it, as the LM objective does to train the indexer."""
 
+INDEXER_EPS = 1e-8
+"""MaxText's `EPS` (src/maxtext/utils/globals.py at 538fe7a3), which its
+`calculate_indexer_loss` adds to the target's normaliser and inside both
+logarithms of the KL."""
+
 
 def indexer_kl(scores, query, key, keep, scale: float):
     """Per query, KL of the indexer's softmax from the attention: `[B, S]`, fp32.
@@ -103,7 +107,10 @@ def indexer_kl(scores, query, key, keep, scale: float):
     the dense warm-up, the top-k selection in sparse training). `query` and
     `key` are the main heads, `scale` the kernel's logit scale. The target is
     detached as the reference detaches it, and heads are summed one at a time
-    to keep the footprint at `[B, S, T]`.
+    to keep the footprint at `[B, S, T]`. MaxText's `EPS` (1e-8) guards the
+    L1 normalisation and both logarithms, as the reference adds it: a key the
+    target gives no mass contributes zero, and the gradient is the
+    reference's, which the epsilon moves beyond float32 rounding.
     """
     masked = jnp.finfo(jnp.float32).min
     batch, length, total = scores.shape
@@ -119,11 +126,9 @@ def indexer_kl(scores, query, key, keep, scale: float):
     summed, _ = jax.lax.scan(
         head, jnp.zeros((batch, length, total), jnp.float32),
         (jnp.moveaxis(query, 2, 0), jnp.moveaxis(key, 2, 0)))
-    target = summed / jnp.sum(summed, axis=-1, keepdims=True)
-    log_indexer = jax.nn.log_softmax(
-        jnp.where(keep, scores.astype(jnp.float32), masked), axis=-1)
-    # xlogy keeps a key the target gives no mass at zero rather than nan.
-    return jnp.sum(xlogy(target, target) - target * log_indexer, axis=-1)
+    target = summed / (jnp.sum(summed, axis=-1, keepdims=True) + INDEXER_EPS)
+    indexer = jax.nn.softmax(jnp.where(keep, scores.astype(jnp.float32), masked), axis=-1)
+    return jnp.sum(target * (jnp.log(target + INDEXER_EPS) - jnp.log(indexer + INDEXER_EPS)), axis=-1)
 
 
 def _rotate(interleave: bool, part, freqs_cos, freqs_sin):

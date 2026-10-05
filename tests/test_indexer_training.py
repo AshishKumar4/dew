@@ -2,7 +2,8 @@
 
 The arithmetic is checked against MaxText 0.2.4's `calculate_indexer_loss`
 and exact top-k mask, transcribed in tools/indexer_reference.py and run on
-fixed-seed tensors into tests/fixtures/indexer. The phases are checked
+fixed-seed tensors into tests/fixtures/indexer, and against those two
+functions themselves, fetched and run as published (maxtext.npz). The phases are checked
 through the LM objective on a toy DeepSeek stack: the warm-up moves the
 indexer and nothing else, the sparse phase keeps the indexer's gradient
 and the main model's apart, and a packed batch scores its documents as it
@@ -17,6 +18,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from reference_error import assert_as_exact_as_the_reference
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import ModelInputs
@@ -28,6 +30,7 @@ from dew.training import Layout, MeshSpec, Trainer
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "indexer"
 META = json.loads((FIXTURES / "meta.json").read_text())
+PUBLISHED = np.load(FIXTURES / "maxtext.npz")
 MLA_FIXTURES = Path(__file__).resolve().parent / "fixtures" / "mla"
 MLA_CONFIG = json.loads((MLA_FIXTURES / "config.json").read_text())
 
@@ -91,6 +94,33 @@ def test_the_sparse_kl_matches_the_reference_sparse_loss():
     per_query = indexer_kl(data["scores"], data["query"], data["key"], selected, float(data["scale"]))
     np.testing.assert_allclose(per_query, data["causal_sparse_kl"], atol=1e-6)
     assert float(jnp.mean(per_query)) == pytest.approx(float(data["causal_sparse_loss"]), abs=1e-6)
+
+
+@pytest.mark.parametrize("name", ["causal_dense", "packed_dense", "causal_sparse"])
+def test_the_loss_its_gradient_and_the_selection_are_maxtexts(name):
+    """MaxText 0.2.4's own `calculate_indexer_loss` and `generate_mask`,
+    run as published by tools/indexer_reference.py behind the masking and
+    `jax.lax.top_k` of `Indexer.__call__`, on 2 x 24 x 24 scores with
+    exact-zero ties: the exact top-k selection is MaxText's mask; the dense
+    warm-up's loss over the causal or packed keys and the sparse loss over
+    the selection are its mean, within 1e-6 of its float64 run, and the
+    gradient in the indexer's scores, what trains the indexer, is held to
+    it by the float64 rule over 1152 entries."""
+    mask, phase = name.split("_")
+    data = {key: jnp.asarray(PUBLISHED[key]) for key in ("query", "key", "scores", "segments")}
+    length, scale = data["scores"].shape[-1], float(PUBLISHED["scale"])
+    keep = causal(length) if mask == "causal" else packed_keep(data["segments"])
+    selected = top_k_keys(data["scores"], keep, 6)
+    np.testing.assert_array_equal(np.asarray(selected), PUBLISHED[f"{mask}/selected"])
+    region = selected if phase == "sparse" else keep
+
+    def loss(scores):
+        return jnp.mean(indexer_kl(scores, data["query"], data["key"], region, scale))
+
+    value, gradient = jax.value_and_grad(loss)(data["scores"])
+    np.testing.assert_allclose(float(value), float(PUBLISHED[f"{name}/loss_f64"]), rtol=1e-6)
+    assert_as_exact_as_the_reference(gradient, PUBLISHED[f"{name}/grad"], PUBLISHED[f"{name}/grad_f64"],
+                                     f"{name}'s gradient")
 
 
 def test_a_packed_batch_keeps_its_documents_apart_and_its_padding_at_zero():
