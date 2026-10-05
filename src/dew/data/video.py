@@ -120,8 +120,8 @@ class VideoDataset(DatasetSpec):
 
     @property
     def audio_seconds(self) -> float:
-        """The length in seconds of the waveform under a clip, which covers its
-        frames and the padding on each side at the 25 fps clips are sampled at."""
+        """The length in seconds of the waveform under a clip: its frames plus the
+        padding on each side, at the 25 fps that clips are sampled at."""
         return (self.frames + 2 * self.audio_padding) / FPS
 
     def source(self) -> list[dict[str, str]]:

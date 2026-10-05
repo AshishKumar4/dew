@@ -337,7 +337,7 @@ class PackedTokens(DatasetSpec):
     not on which documents one process reads. The training stream shuffles
     and shards windows as it does any other record. Its saved position is a
     global window count, so a run can resume on any number of processes.
-    Every run over the same corpus puts the same documents in a window; the
+    Every run over the same corpus packs the same documents together; the
     seed decides only the order the windows come in.
 
     `path` names one tokenized directory, or maps several to the share of a

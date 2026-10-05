@@ -392,8 +392,8 @@ class ImageDataset(DatasetSpec):
         The source has `__getitem__`, and `__len__` unless `count` gives the
         number of records. `split` names a split other than the one this spec
         reads, which is how `val_split` opens a second source. A dataset with
-        no named splits, such as `ArrayRecordImages`, raises `ValueError` for
-        it.
+        no named splits, such as `ArrayRecordImages`, raises `ValueError`
+        when given one.
         """
         raise NotImplementedError
 
@@ -412,8 +412,8 @@ class ImageDataset(DatasetSpec):
 
         That is `count` when it is set and the source's length otherwise. A
         `count` larger than the source raises `ValueError`. A source without
-        `__len__` cannot count itself, so it needs `count`, and without one
-        it raises `ValueError`.
+        `__len__` cannot count itself, so it needs `count`; without `count`,
+        this raises `ValueError`.
         """
         name = type(self).__name__
         if self.count is None:
@@ -523,7 +523,7 @@ class HFImages(ImageDataset):
     unconditional or class-conditional run; passing `tokenize` to `load`
     then raises `TypeError`. If the dataset has a `label` column, it gives
     each record's class index. Loading raises `ValueError` when the split
-    lacks the image column or every caption column.
+    lacks the image column or has none of the caption columns.
 
     `datasets` decodes these images itself, so a JPEG's EXIF orientation is
     applied. `decode_image` keeps the stored orientation.

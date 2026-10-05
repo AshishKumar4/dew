@@ -89,8 +89,9 @@ class Evaluation:
         directly, pass `state.averaged` as `variables`. `step` keys the
         evaluation's RNG and labels the result. `schedule_step` is the step
         the objective's schedules read and defaults to `step`. When training
-        attempts were rejected, pass the count of accepted updates so the
-        schedule matches the work training accepted.
+        attempts were rejected, pass the count of accepted microbatches
+        (`TrainState.microstep`, as `fit` does) so the schedule follows only
+        the work training accepted.
 
         The scores are broadcast to every process. Previews stay on process 0,
         and there is at most one objective preview, however long the
