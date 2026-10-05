@@ -17,4 +17,11 @@ if os.environ.get("DEW_GUEST_TRACE") == "1":
 sys.argv[0] = "ipykernel_launcher"
 from ipykernel.kernelapp import launch_new_instance  # noqa: E402 - install policy first
 
-launch_new_instance()
+try:
+    launch_new_instance()
+except BaseException:
+    if os.environ.get('DEW_GUEST_TRACE') == '1':
+        import traceback
+        traceback.print_exc(file=trace)
+        trace.flush()
+    raise
