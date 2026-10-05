@@ -116,16 +116,16 @@ class Recipe:
         past the first stage, with its rollout beside it for GRPO."""
         if isinstance(stage.data, ChatMessages):
             return LMObjective(self.model, stage.data.seq_len, loss_role=Role.ASSISTANT,
-                               pretrained=variables), None
+                               variables=variables), None
         if isinstance(stage.data, PreferencePairs):
             beta = 0.1 if stage.beta is None else stage.beta
             return DPOObjective(self.model, stage.data.seq_len - 1, beta=beta,
-                                pretrained=variables), None
+                                variables=variables), None
         assert stage.reward is not None
         beta = 0.0 if stage.beta is None else stage.beta
         objective = GRPOObjective(
             self.model, stage.data.max_prompt_len + stage.max_new_tokens - 1,
-            beta=beta, pretrained=variables)
+            beta=beta, variables=variables)
         rollout = SampledRollout(objective, stage.reward, groups=stage.groups,
                                  max_new_tokens=stage.max_new_tokens, estimator=stage.estimator)
         return objective, rollout

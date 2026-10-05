@@ -110,7 +110,7 @@ def run(directory: Path, mode: str) -> None:
 
     source = Pretrained.load(directory / "source", dtype="float32", attention_impl="xla")
     objective = LMObjective(source.model.clone(dropout_rate=0.1), SEQUENCE,
-                            pretrained=source.variables, ema_decay=0.9)
+                            variables=source.variables, ema_decay=0.9)
     data = TokenWindows(path=str(directory / "tokens"), seq_len=SEQUENCE, seed=17, val_batches=1,
                         loading=Loading(workers=0, threads=1)).load(batch=BATCH)
     trainer = Trainer(objective, optax.chain(optax.clip_by_global_norm(0.5),

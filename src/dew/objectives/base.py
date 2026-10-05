@@ -29,9 +29,10 @@ from dew.artifacts import Artifact, Artifacts
 from dew.records import JSON
 
 if TYPE_CHECKING:
+    from flax import linen as nn
     from jax.typing import DTypeLike
 
-    from dew.inference.tasks import BlockGeneration, MaskedGeneration, TextGeneration
+    from dew.inference.tasks import BlockGeneration, MaskedGeneration, Processor, TextGeneration
     from dew.inputs import InputSpec
     from dew.nn.backbones.causal_transformer import DecoderBank
     from dew.sampling.pipelines import TextToImage
@@ -266,6 +267,22 @@ def thaw(variables: Variables) -> Variables:
         return variables
     rest = {name: value for name, value in variables.items() if name != FROZEN}
     return {**rest, "params": merge(variables[FROZEN], variables["params"])}
+
+
+def part(variables: Variables, name: str) -> Variables:
+    """Cut the `name` subtree out of every collection that holds one: one
+    module's own tree out of an objective's that nests several under each
+    collection, `params/policy` and `frozen/policy`, so an adapted module's
+    base comes with its factors."""
+    return {collection: subtree[name] for collection, subtree in variables.items() if name in subtree}
+
+
+def joined(parts: Mapping[str, Variables]) -> Variables:
+    """Nest each module's tree under its name in every collection it holds;
+    the inverse of `part`."""
+    collections = {collection for tree in parts.values() for collection in tree}
+    return {collection: {name: tree[collection] for name, tree in parts.items() if collection in tree}
+            for collection in sorted(collections)}
 
 
 @dataclass(frozen=True)
@@ -537,6 +554,28 @@ class Objective(ABC, Generic[Loss, Effects]):
 
 
 
+M = TypeVar("M", bound="nn.Module", covariant=True)
+
+
+@runtime_checkable
+class Source(Protocol[M]):
+    """A loaded model an objective can train in place of a bare model:
+    `LMObjective(qwen, seq_len=512)` reads its `model`, its `variables` as
+    the starting tree and its `text_processor`. `dew.interop.Pretrained` is
+    one; the protocol keeps `dew.objectives` from importing `dew.interop`.
+    `M` is the kind of model it carries, which an objective that trains one
+    kind checks when it reads it."""
+
+    @property
+    def model(self) -> M: ...
+
+    @property
+    def variables(self) -> Variables: ...
+
+    @property
+    def text_processor(self) -> Processor | None: ...
+
+
 S = TypeVar("S")
 
 
@@ -602,13 +641,16 @@ __all__ = [
     "Ratio",
     "SavedTask",
     "Shown",
+    "Source",
     "Step",
     "TrainingScalar",
     "TrainingScalars",
     "Variables",
     "everything",
     "freeze",
+    "joined",
     "merge",
+    "part",
     "select",
     "thaw",
     "under",

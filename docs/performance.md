@@ -1918,7 +1918,7 @@ On an A100 40 GB (Colab, `db1761fd`, benchmark_step with one batch on the device
 Small training steps, 2026-10-02 (RTX 4080, bf16, `Trainer.compile` with and without the option in one process, five alternating blocks of 20 steps, medians). A full step, with every weight training, is faster with separate dots from 32 tokens up. A LoRA step (rank 16 on Qwen3-0.6B's seven projections, with the base frozen) of 128 tokens or fewer is slower with separate dots, by up to 0.6 ms, except at 1 x 128 (measured in two sessions).
 
 The rule therefore considers both token count and frozen weights. A
-step with an objective's `trainable` split, as in LoRA, keeps the merger
+step whose starting variables are split frozen, as in LoRA, keeps the merger
 at 128 tokens or fewer per device. Every other step uses separate dots.
 Only LM objectives specify the token count, so another objective's frozen
 step uses separate dots and has not been measured.

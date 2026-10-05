@@ -17,7 +17,7 @@ uses; the preview hook limits itself to the display count.
 from __future__ import annotations
 
 from functools import cached_property
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -37,18 +37,7 @@ from dew.nn.autoencoders import AutoEncoder
 from dew.nn.autoencoders.api import ModuleAutoEncoder
 from dew.nn.autoencoders.kl import AutoencoderKL, posterior_latent
 from dew.nn.mp import Uncertainty
-from dew.objectives.base import (
-    Aux,
-    EMASpec,
-    Objective,
-    PathFilter,
-    Ratio,
-    Step,
-    Variables,
-    freeze,
-    thaw,
-    under,
-)
+from dew.objectives.base import Aux, EMASpec, Objective, Ratio, Step, Variables, thaw, under
 from dew.objectives.diffusion.alignment import ALIGNMENT, REPRESENTATION, Alignment
 from dew.objectives.diffusion.end_to_end import AUTOENCODER, LATENT_STATS, EndToEnd
 from dew.registry import objectives
@@ -178,6 +167,51 @@ class TunedLatents(NamedTuple):
 
 _DEFAULT_SOLVER = DDIM()
 _DEFAULT_GUIDANCE = CFG(3.0)
+_DEFAULT_STEPS = 200
+
+
+class _SourceSolver(Protocol):
+    @property
+    def solver(self) -> Solver: ...
+
+
+class _SourceCall(Protocol):
+    @property
+    def steps(self) -> int: ...
+
+    @property
+    def guidance(self) -> Guidance | None: ...
+
+
+@runtime_checkable
+class PipelineSource(Protocol):
+    """A loaded diffusion pipeline a `DiffusionObjective` can train in place
+    of a bare denoiser: its denoiser `model`, starting `variables`, `process`,
+    `inputs` and `autoencoder`, and how it samples, the solver of its
+    `schedule` and the steps and guidance of its `task`.
+    `dew.interop.PretrainedPipeline` is one; the protocol keeps
+    `dew.objectives` from importing `dew.interop`."""
+
+    @property
+    def model(self) -> nn.Module: ...
+
+    @property
+    def variables(self) -> Variables: ...
+
+    @property
+    def process(self) -> Process: ...
+
+    @property
+    def inputs(self) -> InputSpec: ...
+
+    @property
+    def autoencoder(self) -> AutoEncoder | None: ...
+
+    @property
+    def schedule(self) -> _SourceSolver: ...
+
+    @property
+    def task(self) -> _SourceCall: ...
 
 
 @objectives("diffusion")
@@ -198,27 +232,40 @@ class DiffusionObjective(Objective[Ratio]):
 
     def __init__(
         self,
-        model: nn.Module,
-        process: Process | Preset,
-        inputs: InputSpec,
+        model: nn.Module | PipelineSource,
+        process: Process | Preset | None = None,
+        inputs: InputSpec | None = None,
         *,
         autoencoder: AutoEncoder | None = None,
         unconditional_prob: float = 0.12,
         ema_decay: float | optax.Schedule | None = 0.999,
         solver: Solver = _DEFAULT_SOLVER,
         guidance: Guidance | None = _DEFAULT_GUIDANCE,
-        steps: int = 200,
-        pretrained: Variables | None = None,
+        steps: int | None = None,
+        variables: Variables | None = None,
         uncertainty: int | None = None,
         alignment: Alignment | None = None,
         end_to_end: EndToEnd | None = None,
-        trainable: PathFilter | None = None,
     ):
         """Build a denoising objective over `model` for the `inputs` field.
 
         `process` is a preset or a custom `Process`; presets build once here.
-        `solver`, `guidance` and `steps` are how evaluation samples;
-        `guidance` None is the plain conditional prediction. `ema_decay` is
+        `solver`, `guidance` and `steps` are how evaluation samples, DDIM,
+        `CFG(3.0)` and 200 unless given; `guidance` None is the plain
+        conditional prediction.
+
+        `variables` is the tree training starts from: the denoiser's
+        variables beside its frozen towers (`encoders`, `autoencoder`), as a
+        loaded pipeline holds them, or an adapter's split of them, kept as
+        given so the optimizer moves what it leaves in `params`. None draws
+        the denoiser and takes the towers as built. `model` may be a loaded
+        pipeline in place of the denoiser (`DiffusionObjective(flux)`), which
+        supplies the denoiser, `variables`, `process`, `inputs`,
+        `autoencoder` and its own sampling policy; any of them given here
+        overrides it. Its text encoder trains nothing but encodes every
+        caption, so a pipeline loaded without it is refused.
+
+        `ema_decay` is
         the EMA's decay, a number or a schedule of the updates before it,
         such as EDM2's power EMA (`dew.training.posthoc.power_decay`); None
         keeps no EMA.
@@ -244,25 +291,33 @@ class DiffusionObjective(Objective[Ratio]):
         latents a batch norm normalizes, its running statistics held in
         the `LATENT_STATS` collection. A published task carries the tuned
         autoencoder with those statistics as its latent normalization.
-
-        `trainable` selects the model leaves the optimizer moves, by their
-        full path; the rest of the model rides under `FROZEN`, as
-        `LMObjective` keeps it. An adapted pipeline's filter
-        (`dew.lora.LoRA.trainable`) goes here. It chooses among the model's
-        own leaves, so it takes the denoising loss alone, without the heads
-        `uncertainty`, `alignment` and `end_to_end` train beside the model.
-        None trains every leaf.
         """
+        if isinstance(model, PipelineSource):
+            source = model
+            model = source.model
+            process = source.process if process is None else process
+            inputs = source.inputs if inputs is None else inputs
+            autoencoder = source.autoencoder if autoencoder is None else autoencoder
+            variables = source.variables if variables is None else variables
+            solver = source.schedule.solver if solver is _DEFAULT_SOLVER else solver
+            guidance = source.task.guidance if guidance is _DEFAULT_GUIDANCE else guidance
+            steps = source.task.steps if steps is None else steps
+            held = variables.get("encoders", {})
+            if any(keyword not in held for keyword in inputs.conditions):
+                raise ValueError("this pipeline was loaded without its text encoder (text=False), and "
+                                 "training encodes its captions; load it with its text encoder")
+        if process is None or inputs is None:
+            raise ValueError("a denoiser needs its `process` and `inputs`; a loaded pipeline carries both")
+        steps = _DEFAULT_STEPS if steps is None else steps
         self.model = model
         self.process = build_process(process)
         self.inputs = inputs
         self.autoencoder = autoencoder
-        self.pretrained = pretrained
+        self.variables = variables
         self._condition_precision = jax.config.jax_default_matmul_precision
         self.uncertainty = None if uncertainty is None else Uncertainty(uncertainty)
         self.alignment = alignment
         self.end_to_end = end_to_end
-        self.trainable = trainable
         if end_to_end is not None and (
                 alignment is None or not isinstance(autoencoder, ModuleAutoEncoder)
                 or not isinstance(autoencoder.model, AutoencoderKL) or inputs.mask is not None):
@@ -312,8 +367,8 @@ class DiffusionObjective(Objective[Ratio]):
         return shape if self.autoencoder is None else self.autoencoder.latent_shape(shape)
 
     def encoder_params(self) -> dict:
-        if self.pretrained is not None:
-            return dict(self.pretrained["encoders"])
+        if self.variables is not None:
+            return dict(self.variables["encoders"])
         return {keyword: condition.encoder.params
                 for keyword, condition in self.inputs.conditions.items()}
 
@@ -343,7 +398,7 @@ class DiffusionObjective(Objective[Ratio]):
         return self._fixed_blank(like)
 
     def held_variables(self) -> Variables:
-        """Every array `init` starts from rather than draws: a whole pretrained
+        """Every array `init` starts from rather than draws: the starting
         tree, or the frozen towers.
 
         A text tower and a VAE are released weights: hundreds of megabytes
@@ -351,8 +406,8 @@ class DiffusionObjective(Objective[Ratio]):
         constants. One mapping, so an objective that starts from more than
         the towers extends this and `init` together.
         """
-        if self.pretrained is not None:
-            return self.pretrained
+        if self.variables is not None:
+            return self.variables
         held: dict[str, Any] = {"encoders": self.encoder_params()}
         if self.autoencoder is not None:
             held["autoencoder"] = self.autoencoder.params
@@ -364,7 +419,8 @@ class DiffusionObjective(Objective[Ratio]):
         held = self.held_variables() if variables is None else variables
         head_key = jax.random.fold_in(key, 1)
         if "params" in held:
-            state: dict[str, Any] = dict(thaw(held))
+            # A split is kept: the optimizer moves what it leaves in `params`.
+            state: dict[str, Any] = dict(held)
         else:
             conditions = self.encode(held["encoders"])
             if self.inputs.mask is not None:
@@ -397,14 +453,7 @@ class DiffusionObjective(Objective[Ratio]):
         if self.alignment is not None and ALIGNMENT not in state["params"]:
             state["params"] = {**state["params"], ALIGNMENT: self._projector_init(
                 jax.random.fold_in(key, 2), state)}
-        if self.trainable is None:
-            return state
-        if type(self).loss is not DiffusionObjective.loss or any(
-                head in state["params"] for head in LOSS_HEADS):
-            raise ValueError(
-                f"{type(self).__name__} trains a loss or heads of its own beside the model, and "
-                "`trainable` selects among the model's leaves alone; train a plain DiffusionObjective")
-        return freeze(state, self.trainable)
+        return state
 
     def _projector_init(self, key, state) -> Variables:
         """The projector's parameters, shaped by the model's hidden tokens at

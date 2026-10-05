@@ -43,7 +43,7 @@ model = CausalTransformer(vocab_size=tokenizer.vocab_size,
 base = model.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32))
 ```
 
-`base` is a full Flax variables mapping, including its outer `params` collection, which is what every objective's `pretrained` argument takes.
+`base` is a full Flax variables mapping, including its outer `params` collection, which is what every objective's `variables` argument takes.
 
 ### Supervised fine-tuning
 
@@ -57,7 +57,7 @@ roles = np.array([Role.USER] * len(prompt) + [Role.ASSISTANT] * len(response), d
 sft_batch = {"text": np.tile(row, (8, 1)), "text_roles": np.tile(roles, (8, 1))}
 sft_data = Dataset(train=lambda partition: itertools.repeat(sft_batch), val=None,
                    records=8, batch=8)
-sft_objective = LMObjective(model, seq_len=len(row) - 1, pretrained=base,
+sft_objective = LMObjective(model, seq_len=len(row) - 1, variables=base,
                             loss_role=Role.ASSISTANT)
 sft_state = Trainer(sft_objective, optax.adamw(1e-3), key=jax.random.key(1)).fit(
     sft_data, steps=20, log_every=10)
@@ -83,7 +83,7 @@ pair = {"chosen": prompt + response, "rejected": prompt + rejected,
 width = max(len(pair["chosen"]), len(pair["rejected"]))
 pairs = PreferencePairs(records=(json.dumps(pair),) * 8, seq_len=width,
                         loading=Loading(workers=0, threads=1, read_buffer=2)).load(batch=8)
-dpo = DPOObjective(model, seq_len=width - 1, beta=0.1, pretrained=sft_state.variables)
+dpo = DPOObjective(model, seq_len=width - 1, beta=0.1, variables=sft_state.variables)
 dpo_state = Trainer(dpo, optax.adam(1e-3), key=jax.random.key(2)).fit(
     pairs, steps=10, log_every=5)
 ```
@@ -120,7 +120,7 @@ def reward(data_source, completion, ground_truth, extra_info):
 rl_data = Dataset(train=lambda partition: itertools.repeat(prompt_batch), val=None,
                   records=8, batch=8)
 rl_objective = GRPOObjective(model, seq_len=len(story) + 7, beta=0.01,
-                             pretrained=dpo_state.variables)
+                             variables=dpo_state.variables)
 rollout = SampledRollout(rl_objective, reward=reward, groups=4, max_new_tokens=8,
                          sampling=Sampling(temperature=1.0, top_k=40),
                          decode=tokenizer.decode)
@@ -244,7 +244,7 @@ Completed 2 DPO updates; reference stayed fixed.
 
 The DPO reference is kept in `TrainState.ema` with its decay fixed at 1, so it never changes, and `DPOObjective` refuses an `ema_decay` argument. `rewards/chosen` and `rewards/rejected` are beta times each side's sequence log-ratio of policy over reference, so a policy that has not moved yet reports zero rewards and no wins. The reference is not a second model object and the optimizer never updates it, but it is still a separate parameter tree with its own forward passes. Budget memory for the policy parameters, reference parameters, optimizer state, gradients, activations and batches.
 
-SFT keeps no moving average unless `ema_decay` is set, as the language-model objective does. GRPO keeps a frozen reference only when `beta > 0`, and refuses `ema_decay` too. When a DPO or GRPO stage starts, its `pretrained` weights become the frozen reference.
+SFT keeps no moving average unless `ema_decay` is set, as the language-model objective does. GRPO keeps a frozen reference only when `beta > 0`, and refuses `ema_decay` too. When a DPO or GRPO stage starts, its starting `variables` become the frozen reference.
 
 ## GRPO
 

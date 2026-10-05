@@ -149,17 +149,16 @@ def test_a_model_no_record_can_describe_still_checkpoints_and_loading_says_why(t
 
 def test_an_adapted_run_records_its_base_and_adapter_and_loads_what_it_trained(tmp_path):
     """The record of a LoRA run is the base model's record with the adapter's
-    rank, alpha and native modules; the loaded task computes what the trained
-    adapted model computes, with factors the training moved off zero."""
+    rank, alpha, native modules and the name each binds under; the loaded
+    task computes what the trained adapted model computes, with factors the
+    training moved off zero."""
     from dew.inference import TextGeneration
     from dew.lora import LoRA
-    from dew.objectives.base import thaw
 
     base = model()
-    adapter, variables = LoRA.fresh(base, base.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32)), {},
-                                    rank=2, modules=("q_proj", "v_proj"), key=jax.random.key(1))
-    objective = LMObjective(adapter.adapt(base), seq_len=8, ema_decay=None, pretrained=variables,
-                            trainable=adapter.trainable)
+    adapter = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(
+        base, base.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32)), key=1)
+    objective = LMObjective(adapter.model, seq_len=8, ema_decay=None, variables=adapter.variables)
     rows = [{'text': np.arange(9, dtype=np.int32)} for _ in range(8)]
     data = Dataset.from_grain(grain.MapDataset.source(rows), batch=8, loading=Loading(workers=0))
     checkpoints = Checkpoints(str(tmp_path / 'run'))
@@ -169,13 +168,15 @@ def test_an_adapted_run_records_its_base_and_adapter_and_loads_what_it_trained(t
     record = checkpoints.artifact()['model']
     assert record['architecture'] == 'causal_transformer'
     assert record['adapter'] == {'rank': 2, 'alpha': 4.0, 'rslora': False, 'dropout': 0.0, 'modules': [
-        'params/layers_0/self_attn/q_proj', 'params/layers_0/self_attn/v_proj']}
+        'params/layers_0/self_attn/q_proj', 'params/layers_0/self_attn/v_proj'], 'layouts': {
+        f'params/layers_0/self_attn/{name}': {'name': f'layers_0.self_attn.{name}.weight', 'shape': [16, 16],
+                                               'transpose': [1, 0]} for name in ('q_proj', 'v_proj')}}
     assert any(np.abs(np.asarray(leaf)).max() > 0 for path, leaf in jax.tree_util.tree_leaves_with_path(
         state.variables['params']) if 'lora_B' in jax.tree_util.keystr(path))
     task = TextGeneration.from_run(str(tmp_path / 'run'), ema=False)
     tokens = jnp.arange(1, 9)[None, :]
     np.testing.assert_array_equal(np.asarray(task.model.apply(task.variables, tokens)),
-                                  np.asarray(objective.model.apply(thaw(state.variables), tokens)))
+                                  np.asarray(objective.model.apply(state.variables, tokens)))
 
 
 def test_an_adapted_denoiser_run_loads_what_it_trained(tmp_path, monkeypatch):
@@ -184,7 +185,6 @@ def test_an_adapted_denoiser_run_loads_what_it_trained(tmp_path, monkeypatch):
     from dew import Field, InputSpec
     from dew.diffusion.presets import Flow
     from dew.lora import LoRA
-    from dew.objectives.base import thaw
     from dew.objectives.diffusion import DiffusionObjective
     from dew.registry import models
     from dew.sampling import TextToImage
@@ -199,11 +199,11 @@ def test_an_adapted_denoiser_run_loads_what_it_trained(tmp_path, monkeypatch):
     monkeypatch.setitem(models._members, "tiny_denoiser", TinyDenoiser)
     base = TinyDenoiser()
     sample = jnp.zeros((1, 4, 4, 3))
-    adapter, variables = LoRA.fresh(base, base.init(jax.random.key(0), sample, jnp.zeros((1,))), {}, rank=2,
-                                    modules=("hidden", "out"), key=jax.random.key(1))
-    objective = DiffusionObjective(adapter.adapt(base), Flow(), InputSpec(Field("image", (4, 4, 3))),
+    adapter = LoRA(rank=2, modules=("hidden", "out")).apply(
+        base, base.init(jax.random.key(0), sample, jnp.zeros((1,))), key=1)
+    objective = DiffusionObjective(adapter.model, Flow(), InputSpec(Field("image", (4, 4, 3))),
                                    guidance=None, steps=2, ema_decay=None,
-                                   pretrained={**variables, "encoders": {}}, trainable=adapter.trainable)
+                                   variables={**adapter.variables, "encoders": {}})
     rows = [{"image": np.full((4, 4, 3), 200, np.uint8)} for _ in range(8)]
     data = Dataset.from_grain(grain.MapDataset.source(rows), batch=8, loading=Loading(workers=0))
     checkpoints = Checkpoints(str(tmp_path / 'run'))
@@ -213,8 +213,8 @@ def test_an_adapted_denoiser_run_loads_what_it_trained(tmp_path, monkeypatch):
     assert checkpoints.artifact()['model']['adapter']['modules'] == ['params/hidden', 'params/out']
     pipe = TextToImage.from_run(str(tmp_path / 'run'), ema=False)
     x, t = jax.random.normal(jax.random.key(2), (2, 4, 4, 3)), jnp.zeros((2,))
-    np.testing.assert_array_equal(np.asarray(pipe.model.apply(thaw(pipe.variables), x, t)),
-                                  np.asarray(objective.model.apply(thaw(state.variables), x, t)))
+    np.testing.assert_array_equal(np.asarray(pipe.model.apply(pipe.variables, x, t)),
+                                  np.asarray(objective.model.apply(state.variables, x, t)))
 
 
 def test_python_lm_run_saves_its_inference_record_without_run_json(tmp_path):

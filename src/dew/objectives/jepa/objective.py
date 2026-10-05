@@ -34,7 +34,19 @@ from flax import linen as nn
 from dew.artifacts import Representations
 from dew.inputs import Field, InputSpec, unit_range
 from dew.nn.backbones.jepa import JepaEncoder, JepaPredictor
-from dew.objectives.base import Aux, EMASpec, Objective, Ratio, Shown, Step, Variables, under
+from dew.objectives.base import (
+    Aux,
+    EMASpec,
+    Objective,
+    Ratio,
+    Shown,
+    Step,
+    Variables,
+    joined,
+    part,
+    thaw,
+    under,
+)
 from dew.registry import objectives
 
 from .masking import MultiBlockMask
@@ -84,6 +96,13 @@ class JepaObjective(Objective[Ratio]):
 
     Evaluation returns the pooled target-encoder embeddings of a batch with
     its labels, which the probe metrics score.
+
+    `encoder_variables` and `predictor_variables` are the trees each module
+    starts from, as `model.init`, `Pretrained.load` or `LoRA.apply` return
+    them; one left None is drawn. Every collection of each is kept, under
+    the module's name: an adapted encoder's factors train under `params`
+    and its base rides under `frozen`, and the target encoder is the
+    trainer's average of what trains over that same frozen base.
     """
     artifact = Representations
     # A collapsing encoder's spread falls to zero; a redundant one's
@@ -102,6 +121,8 @@ class JepaObjective(Objective[Ratio]):
         momentum: tuple[float, float] = (0.996, 1.0),
         momentum_steps: int = 100_000,
         label_key: str = LABEL_KEY,
+        encoder_variables: Variables | None = None,
+        predictor_variables: Variables | None = None,
     ):
         # Dew's encoder and predictor declare the order they sequence tokens
         # in; the mask's indices must refer to that sequence.
@@ -114,6 +135,8 @@ class JepaObjective(Objective[Ratio]):
         self.mask = mask
         self.sample = sample
         self.label_key = label_key
+        self.encoder_variables = encoder_variables
+        self.predictor_variables = predictor_variables
         self.is_video = len(sample.shape) == 4
         self.inputs = InputSpec(sample=sample)
         self.ema = EMASpec(
@@ -121,35 +144,46 @@ class JepaObjective(Objective[Ratio]):
             select=under("params", CONTEXT_ENCODER),
         )
 
+    def held_variables(self) -> Variables | None:
+        """The modules' given starting trees, by module, or None when both are drawn."""
+        given = {name: tree for name, tree in ((CONTEXT_ENCODER, self.encoder_variables),
+                                               (PREDICTOR, self.predictor_variables)) if tree is not None}
+        return given or None
+
     def init(self, key, variables: Variables | None = None):
+        given = dict(self.held_variables() or {}) if variables is None else dict(variables)
         encoder_key, predictor_key = jax.random.split(key)
         sample = jnp.ones((1, *self.sample.shape))
         context_idx = jnp.arange(self.mask.num_context, dtype=jnp.int32)[None]
         target_idx = jnp.arange(self.mask.block_area, dtype=jnp.int32)[None]
 
-        encoder = self.encoder.init(encoder_key, sample, context_idx)
-        context = self.encoder.apply(encoder, sample, context_idx)
-        predictor = self.predictor.init(predictor_key, context, context_idx, target_idx)
-        return {"params": {CONTEXT_ENCODER: encoder["params"],
-                           PREDICTOR: predictor["params"]}}
+        encoder = given.get(CONTEXT_ENCODER)
+        if encoder is None:
+            encoder = self.encoder.init(encoder_key, sample, context_idx)
+        predictor = given.get(PREDICTOR)
+        if predictor is None:
+            context = self.encoder.apply(thaw(encoder), sample, context_idx)
+            predictor = self.predictor.init(predictor_key, context, context_idx, target_idx)
+        return joined({CONTEXT_ENCODER: encoder, PREDICTOR: predictor})
 
-    def encode(self, encoder_params, samples, token_idx=None, train=False, rngs=None) -> jax.Array:
-        features = self.encoder.apply({"params": encoder_params}, samples, token_idx,
-                                      train=train, rngs=rngs)
+    def encode(self, encoder_variables, samples, token_idx=None, train=False, rngs=None) -> jax.Array:
+        """The encoder over `encoder_variables`, its own tree in every collection,
+        a frozen split merged back."""
+        features = self.encoder.apply(thaw(encoder_variables), samples, token_idx, train=train, rngs=rngs)
         # `mutable` is unset, so apply returns the output alone, not a pair.
         assert not isinstance(features, tuple)
         return features
 
-    def _target_params(self, step: Step):
-        """The target encoder's parameters, the EMA copy of the context
-        encoder.
+    def _target_variables(self, step: Step):
+        """The target encoder's variables: the EMA copy of the context
+        encoder's trained leaves over whatever the encoder keeps frozen.
 
         The objective declares an EMASpec, so the trainer always hands it an
         EMA tree. Without one there is no target branch to run.
         """
         if step.ema is None:
             raise ValueError("the JEPA target branch needs the trainer's EMA variables")
-        return step.ema["params"][CONTEXT_ENCODER]
+        return part(step.ema, CONTEXT_ENCODER)
 
     def loss(self, variables, batch, step: Step):
         samples = unit_range(batch[self.sample.key])
@@ -159,7 +193,7 @@ class JepaObjective(Objective[Ratio]):
         num_targets = self.mask.num_targets
 
         # The target branch reads the whole view through the EMA encoder, without gradients.
-        full = normalize_targets(self.encode(self._target_params(step), samples))
+        full = normalize_targets(self.encode(self._target_variables(step), samples))
         # [B, (T,) S, F] -> [B, M, (T,) n_tgt, F]
         frame_axis = (1,) if self.is_video else ()
         gather_idx = target_idx.reshape(batch_size, num_targets, *frame_axis, -1, 1)
@@ -167,14 +201,14 @@ class JepaObjective(Objective[Ratio]):
             jnp.take_along_axis(full[:, None], gather_idx, axis=-2))
 
         context = self.encode(
-            variables["params"][CONTEXT_ENCODER], samples, context_idx,
+            part(variables, CONTEXT_ENCODER), samples, context_idx,
             train=True, rngs={"dropout": dropout_key})
 
         # Each target block is predicted from the same context. Fold the block
         # axis into the batch so one predictor call covers all M of them
         repeated = jnp.repeat(context, num_targets, axis=0)
         predictions = self.predictor.apply(
-            {"params": variables["params"][PREDICTOR]},
+            thaw(part(variables, PREDICTOR)),
             repeated,
             jnp.repeat(context_idx, num_targets, axis=0),
             target_idx.reshape(batch_size * num_targets, -1),
@@ -191,13 +225,13 @@ class JepaObjective(Objective[Ratio]):
 
     def evaluate(self, params, batch, step: Step):
         """The frozen target encoder's pooled embeddings, with the batch labels."""
-        features = self._embed(self._target_params(step), batch[self.sample.key])
+        features = self._embed(self._target_variables(step), batch[self.sample.key])
         return Representations(features=features, labels=jnp.asarray(batch[self.label_key]))
 
     @functools.cached_property
     def _embed(self):
-        def embed(encoder_params, pixels):
-            features = self.encode(encoder_params, unit_range(pixels))
+        def embed(encoder_variables, pixels):
+            features = self.encode(encoder_variables, unit_range(pixels))
             return jnp.mean(features, axis=tuple(range(1, features.ndim - 1)))
 
         return jax.jit(embed)

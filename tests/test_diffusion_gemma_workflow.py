@@ -91,7 +91,7 @@ def test_public_pipeline_source_storage_and_saved_block_compute_are_independent(
     np.testing.assert_array_equal(actual.tokens, wanted.tokens)
     np.testing.assert_array_equal(actual.decoder_steps, wanted.decoder_steps)
 
-    objective = BlockDiffusionObjective(bundle.model, prompt_length=3, pretrained=bundle.variables)
+    objective = BlockDiffusionObjective(bundle.model, prompt_length=3, variables=bundle.variables)
     state = Trainer(objective, optax.sgd(0.01), key=jax.random.PRNGKey(2)).initial_state()
     checkpoints = Checkpoints(str(tmp_path))
     checkpoints.save(0, state, None, artifact=objective.inference_record())

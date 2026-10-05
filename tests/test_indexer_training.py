@@ -425,7 +425,7 @@ def test_the_warmup_starts_a_fresh_indexer_beside_a_dense_checkpoint():
                                         "v_head_dim": 8})
     checkpoint = dense.init(jax.random.key(5), jnp.zeros((1, SEQ), jnp.int32))
     objective = LMObjective(deepseek_stack(None), SEQ, indexer=IndexerTraining("warmup"),
-                            pretrained=checkpoint)
+                            variables=checkpoint)
     params = objective.init(jax.random.key(0))
     frozen = dict(jax.tree_util.tree_leaves_with_path(params[FROZEN]))
     given = dict(jax.tree_util.tree_leaves_with_path(checkpoint["params"]))
@@ -439,24 +439,28 @@ def test_the_warmup_starts_a_fresh_indexer_beside_a_dense_checkpoint():
                              if name != "embed_tokens"}}
     with pytest.raises(ValueError, match="embed_tokens"):
         LMObjective(deepseek_stack(None), SEQ, indexer=IndexerTraining("warmup"),
-                    pretrained=incomplete).init(jax.random.key(0))
+                    variables=incomplete).init(jax.random.key(0))
 
 
 def test_the_sparse_phase_reads_the_warmup_tree():
-    """The warm-up's split tree hands over as one params collection, leaf
-    for leaf, and the plain objective reads it the same way."""
+    """The warm-up's split tree hands over to the sparse phase, which trains
+    the whole tree, as one params collection, leaf for leaf. A plain
+    objective keeps the split it is given, so it trains the indexer alone."""
     warmup = LMObjective(deepseek_stack(None), SEQ, indexer=IndexerTraining("warmup"))
     split = warmup.init(jax.random.key(0))
-    for objective in (LMObjective(deepseek_stack(4), SEQ, indexer=IndexerTraining("sparse"),
-                                  pretrained=split),
-                      LMObjective(deepseek_stack(4), SEQ, pretrained=split)):
-        params = objective.init(jax.random.key(1))
-        assert sorted(params) == ["params"]
-        leaves = dict(jax.tree_util.tree_leaves_with_path(params["params"]))
-        expected = dict(jax.tree_util.tree_leaves_with_path(split["params"]))
-        expected.update(jax.tree_util.tree_leaves_with_path(split[FROZEN]))
-        assert leaves.keys() == expected.keys()
-        assert all(bool(jnp.all(leaves[path] == expected[path])) for path in leaves)
+    params = LMObjective(deepseek_stack(4), SEQ, indexer=IndexerTraining("sparse"),
+                         variables=split).init(jax.random.key(1))
+    assert sorted(params) == ["params"]
+    leaves = dict(jax.tree_util.tree_leaves_with_path(params["params"]))
+    expected = dict(jax.tree_util.tree_leaves_with_path(split["params"]))
+    expected.update(jax.tree_util.tree_leaves_with_path(split[FROZEN]))
+    assert leaves.keys() == expected.keys()
+    assert all(bool(jnp.all(leaves[path] == expected[path])) for path in leaves)
+
+    kept = LMObjective(deepseek_stack(4), SEQ, variables=split).init(jax.random.key(1))
+    assert jax.tree.structure(kept) == jax.tree.structure(split)
+    assert all(bool(jnp.all(ours == theirs))
+               for ours, theirs in zip(jax.tree.leaves(kept), jax.tree.leaves(split), strict=True))
 
 
 def test_evaluation_and_scoring_read_the_split_tree():
@@ -466,7 +470,7 @@ def test_evaluation_and_scoring_read_the_split_tree():
     params = objective.init(jax.random.key(0))
     batch = token_batch()
     scored = objective.evaluate(params, batch, step_at())
-    merged = LMObjective(deepseek_stack(None), SEQ, pretrained=params).init(jax.random.key(0))
+    merged = LMObjective(deepseek_stack(None), SEQ, variables=params).init(jax.random.key(0))
     expected = objective.token_scores(merged, batch["text"])
     np.testing.assert_allclose(scored.losses, expected.losses, rtol=1e-6, atol=1e-6)
     assert not objective.ema.select((FROZEN, "layers_0"))

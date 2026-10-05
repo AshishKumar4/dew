@@ -1151,7 +1151,9 @@ class Trainer(Generic[Loss, Effects]):
                     return bank
 
                 def release(namespace, index, keys, bank):
-                    node = held["params"] if held is not None else None
+                    # The rows sit under the held tree's own frozen split
+                    # when it came split, or under its params when init split it.
+                    node = None if held is None else held.get(FROZEN, held.get("params"))
                     for component in (*namespace, f"layers_{index}", *keys[:-1]):
                         node = node.get(component) if isinstance(node, dict) else None
                     if isinstance(node, dict) and keys[-1] in node:

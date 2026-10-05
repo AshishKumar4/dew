@@ -14,7 +14,7 @@ import dataclasses
 import functools
 import json
 import os
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 from pathlib import Path
@@ -88,9 +88,7 @@ from dew.sampling.text import Sampling
 
 if TYPE_CHECKING:
 
-    from dew.lora import LoRA
-    from dew.objectives.diffusion import DiffusionObjective
-    from dew.objectives.lm import LMObjective
+    from dew.lora import Adapter, LoRA
     from dew.training.distributed import Layout, MeshSpec
 
 
@@ -307,9 +305,10 @@ class Pretrained:
     revision: str | None = None
     """The Hub commit the source resolved to, whatever branch or tag was
     asked for; None for a local directory."""
-    adapter: LoRA | None = None
-    """The low-rank adapter `lora` put on the model, whose factors the
-    variables hold; None for the source as published."""
+    adapter: Adapter | None = None
+    """The low-rank adapter `adapt` bound to the model, whose factors the
+    variables hold under `params` beside the base under `frozen`; None for
+    the source as published."""
     tokenizer: str | decoders.ExportTokenizer | None = None
     """The vocabulary `save` writes beside the weights, by name or by object,
     for a bundle with no source processor to write (`from_model`)."""
@@ -318,7 +317,7 @@ class Pretrained:
     where the family's reader takes that file as a closed set of fields."""
 
     @property
-    def _text_processor(self) -> TaskProcessor | None:
+    def text_processor(self) -> TaskProcessor | None:
         """What the bundle's tasks encode and decode text with: the source's
         processor, or a run processor over the vocabulary `tokenizer` names
         (a run's export, Dew's byte vocabulary included)."""
@@ -370,7 +369,12 @@ class Pretrained:
         if not isinstance(bundle, cls):
             raise TypeError(f"{directory} is a {type(bundle).__name__} source, not a {cls.__name__}; "
                             f"load it with {type(bundle).__name__}.from_run or Pretrained.from_run")
-        return bundle
+        if model_config.adapter is None:
+            return bundle
+        # The run's adapter, as `Adapter.from_run` rebuilds it, so `save`
+        # merges its factors and `adapter.save` writes them alone.
+        from dew.lora import Adapter
+        return replace(bundle, adapter=Adapter.recorded(model, variables, model_config.adapter))
 
     @classmethod
     def load(cls, name_or_dir: str | Path, *, dtype: DTypeLike = jnp.bfloat16,
@@ -481,6 +485,27 @@ class Pretrained:
         """
         return {layout.name.removesuffix(".weight").replace("/", "."): layout
                 for layout in self.weight_layouts if layout.name.endswith(".weight")}
+
+    @property
+    def _adaptable(self) -> Mapping[str, WeightLayout]:
+        """The layouts an adapter binds: every one of a decoder's."""
+        return self.layouts
+
+    def adapt(self, lora: LoRA, *, key: int | jax.Array) -> Self:
+        """This source with `lora` bound to its model and its factors drawn
+        (`LoRA.apply`): the adapted model, the variables with the factors
+        under `params` and the base under `frozen`, and the bound `adapter`.
+        Any objective built over it trains the factors alone; B is zero, so
+        it computes what the source does. `adapter.save` writes the factors
+        under the source's own names (PEFT's directory for a decoder, the
+        Diffusers file for a pipeline) and `save` the source with them
+        merged in. A pipeline binds its denoiser's projections alone, so the
+        text towers and the VAE stay as published.
+        """
+        if self.adapter is not None:
+            raise ValueError("this bundle already carries an adapter; adapt the source it was made from")
+        adapter = lora.apply(self.model, self.variables, key=key, layouts=self._adaptable)
+        return replace(self, model=adapter.model, variables=adapter.variables, adapter=adapter)
 
     def export(self, variables: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
         """The tensors `save` writes, by their source names; `dew.inference.NCCLPush` sends these.
@@ -603,44 +628,6 @@ class PretrainedDecoder(Pretrained):
                    decoders.GENERATION_DEFAULTS if generation_config is None else generation_config,
                    export_adapter=decoders.export_decoder_weights, tokenizer=tokenizer)
 
-    def lora(self, *, rank: int, modules: Sequence[str], key: jax.Array, alpha: float | None = None,
-             rslora: bool = False, dropout: float = 0.0) -> PretrainedDecoder:
-        """Return this source with a fresh low-rank adapter on the projections `modules` name.
-
-        The bundle that comes back holds the adapted model, the variables
-        with the factors in them (B zero, so it computes what the source
-        does) and the adapter, and nothing of a run: `lm_objective` trains
-        the factors alone, `adapter.save` writes PEFT's directory and `save`
-        the source's layout with the factors merged in. `dew.lora.LoRA.fresh`
-        describes the arguments.
-        """
-        from dew.lora import LoRA
-
-        if self.adapter is not None:
-            raise ValueError("this bundle already carries an adapter; adapt the source it was made from")
-        adapter, variables = LoRA.fresh(self.model, self.variables, self.layouts, rank=rank, modules=modules,
-                                        key=key, alpha=alpha, rslora=rslora, dropout=dropout)
-        return replace(self, model=adapter.adapt(self.model), variables=variables, adapter=adapter)
-
-    def lm_objective(self, seq_len: int, **options) -> LMObjective:
-        """Build next-token training from this source's model and variables.
-
-        `options` are `LMObjective`'s training and evaluation controls. This
-        bundle supplies `pretrained` itself and its processor unless one is
-        passed, and an adapted bundle its adapter's filter as `trainable`,
-        so the run moves the factors alone.
-        """
-        from dew.objectives.lm import LMObjective
-
-        if "pretrained" in options:
-            raise ValueError("a Pretrained bundle already supplies the initial variables; omit pretrained=")
-        if self.adapter is not None:
-            if "trainable" in options:
-                raise ValueError("the adapter already selects what trains, its own factors; omit trainable=")
-            options["trainable"] = self.adapter.trainable
-        return LMObjective(self.model, seq_len, pretrained=self.variables,
-                           **{"processor": self._text_processor, **options})
-
     def text_generation(self, *, sampling: Sampling | None = None) -> TextGeneration:
         """Build the text generation task this source describes.
 
@@ -660,7 +647,7 @@ class PretrainedDecoder(Pretrained):
         return TextGeneration(
             self.model,
             self.variables,
-            self._text_processor,
+            self.text_processor,
             policy,
             max_new_tokens=generation_limit(self.config, self.generation_config, "max_new_tokens"),
             max_length=generation_limit(self.config, self.generation_config, "max_length"),
@@ -690,7 +677,7 @@ class PretrainedMaskedDecoder(Pretrained):
             raise TypeError("a masked decoder generates by unmasking, and this model names no mask token")
         audit_masked(config, generation)
         return MaskedGeneration(self.model, self.variables, MDLM(mask_id=mask_id)(),
-                                self._text_processor,
+                                self.text_processor,
                                 eos_token_ids=eos_ids(config, generation),
                                 pad_token_id=pad_id(config, generation),
                                 max_new_tokens=generation_limit(config, generation, "max_new_tokens"),
@@ -716,7 +703,7 @@ class PretrainedBlockDecoder(Pretrained):
             self.model,
             self.variables,
             diffusion_gemma.generation_process(self.config, self.generation_config),
-            self._text_processor,
+            self.text_processor,
             eos_ids(self.config, self.generation_config),
             pad_id(self.config, self.generation_config),
             max_new_tokens=generation_limit(self.config, self.generation_config, "max_new_tokens"),
@@ -749,52 +736,10 @@ class PretrainedPipeline(Pretrained):
                            grid=self.task.grid, final_denoise=False, solver=self.schedule.solver,
                            steps=self.task.steps, guidance=self.task.guidance, finish=self.finish)
 
-    def lora(self, *, rank: int, modules: Sequence[str], key: jax.Array, alpha: float | None = None,
-             rslora: bool = False, dropout: float = 0.0) -> PretrainedPipeline:
-        """Return this pipeline with a fresh low-rank adapter on the denoiser projections `modules` name.
-
-        `modules` match the denoiser's projections alone, by their names
-        relative to its component (`to_q`, `attn.to_out.0`), so the text
-        towers and the VAE stay as published. The bundle that comes back
-        holds the adapted denoiser, the variables with the factors in them
-        (B zero, so it samples what the source does) and the adapter:
-        `diffusion_objective` trains the factors alone, `adapter.save` writes
-        the Diffusers file the family's `load_lora_weights` reads, and `save`
-        writes the pipeline with the factors merged in. `dew.lora.LoRA.fresh`
-        describes the arguments.
-        """
-        from dew.lora import LoRA
-
-        if self.adapter is not None:
-            raise ValueError("this bundle already carries an adapter; adapt the source it was made from")
-        denoiser = {name: layout for name, layout in self.layouts.items() if layout.paths[0][0] == "params"}
-        adapter, variables = LoRA.fresh(self.model, self.variables, denoiser, rank=rank, modules=modules,
-                                        key=key, alpha=alpha, rslora=rslora, dropout=dropout)
-        return replace(self, model=adapter.adapt(self.model), variables=variables, adapter=adapter)
-
-    def diffusion_objective(self, **options) -> DiffusionObjective:
-        """Build denoising training from this pipeline's denoiser, process, conditions and autoencoder.
-
-        `options` are `DiffusionObjective`'s training and evaluation
-        controls. This bundle supplies `pretrained` itself, evaluation
-        samples the way the source does (its solver, step count and
-        guidance) unless they are passed, and an adapted bundle supplies its
-        adapter's filter as `trainable`, so the run moves the factors alone.
-        The text towers and the VAE never train. Batches carry the source's
-        input fields, an inpainting source's mask among them.
-        """
-        from dew.objectives.diffusion import DiffusionObjective
-
-        if "pretrained" in options:
-            raise ValueError("a Pretrained bundle already supplies the initial variables; omit pretrained=")
-        self._text_encoder("training encodes its captions")
-        if self.adapter is not None:
-            if "trainable" in options:
-                raise ValueError("the adapter already selects what trains, its own factors; omit trainable=")
-            options["trainable"] = self.adapter.trainable
-        policy = {"solver": self.schedule.solver, "steps": self.task.steps, "guidance": self.task.guidance}
-        return DiffusionObjective(self.model, self.process, self.inputs, autoencoder=self.autoencoder,
-                                  pretrained=self.variables, **{**policy, **options})
+    @property
+    def _adaptable(self) -> Mapping[str, WeightLayout]:
+        """The denoiser's layouts alone, the `params`-rooted ones."""
+        return {name: layout for name, layout in self.layouts.items() if layout.paths[0][0] == "params"}
 
     def export(self, variables: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
         raise ValueError("a diffusion source writes one tensor set per component; save it instead")
@@ -828,18 +773,8 @@ class PretrainedFallback(Pretrained):
     """transformers' PyTorch forward lowered to JAX by torchax (tier 3): it
     fine-tunes next-token, with no Dew kernels, sharding rules or cached
     generation; generate with transformers' own
-    `AutoModelForCausalLM.from_pretrained(source).generate`."""
-
-    def lm_objective(self, seq_len: int, **options) -> LMObjective:
-        """Build next-token training from this source's forward and variables;
-        `options` are `LMObjective`'s controls, and the processor is this
-        source's unless one is passed."""
-        from dew.objectives.lm import LMObjective
-
-        if "pretrained" in options:
-            raise ValueError("a Pretrained bundle already supplies the initial variables; omit pretrained=")
-        return LMObjective(self.model, seq_len, pretrained=self.variables,
-                           **{"processor": self._text_processor, **options})
+    `AutoModelForCausalLM.from_pretrained(source).generate`. Train it as
+    any source, `LMObjective(fallback, seq_len)`."""
 
 
 def _native_variables(parts: Mapping[str, Mapping[str, ParamTree]]) -> dict[str, dict[str, ParamTree]]:

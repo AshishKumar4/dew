@@ -14,6 +14,7 @@ import os
 from importlib import import_module
 from typing import TYPE_CHECKING, ClassVar, Literal
 
+import jax
 import numpy as np
 
 from dew.config import ModelConfig, RunConfig
@@ -30,12 +31,14 @@ from dew.sampling.solvers import EulerAncestral
 
 from .alignment import REPRESENTATION, Alignment
 from .end_to_end import AUTOENCODER, EndToEnd
-from .objective import DiffusionObjective
+from .objective import LOSS_HEADS, DiffusionObjective
 
 import_module("dew.eval")  # registers the image metrics
 import_module("dew.nn.backbones")  # registers the models before the config's unions are built
 
 if TYPE_CHECKING:
+    from flax import linen as nn
+
     from dew.diffusion.presets import Preset
     from dew.sampling.solvers import Solver
 
@@ -644,12 +647,41 @@ class DiffusionRunConfig(RunConfig):
         Supplied variables are the authoritative saved snapshot. Encoders and
         the VAE read only configuration/tokenizer metadata and bind their
         respective subtrees without a source weight load or storage cast.
+
+        A `lora` binds to the denoiser `pretrained` loads, or from scratch to
+        a fresh draw of it from the run's key, so the objective trains its
+        factors and any loss head of its own.
         """
+        if self.lora is not None and variables is not None:
+            raise ValueError("a --lora run's saved variables hold its factors, which "
+                             "TextToImage.from_run binds through the run's own adapter record")
+        objective = self._objective(variables, None)
+        if self.lora is None or self.pretrained is not None:
+            return objective
+        # The objective's own init draws the denoiser beside its heads and
+        # towers; the adapter freezes the denoiser's weights, and the heads
+        # stay under `params` to train.
+        key = jax.random.key(self.trainer.key)
+        drawn = objective.init(key)
+        adapter = self.lora.apply(objective.model, objective.model_variables(drawn),
+                                  key=jax.random.fold_in(key, 1))
+        heads = {name: tree for name, tree in drawn["params"].items() if name in LOSS_HEADS}
+        start = {**drawn, **adapter.variables, "params": {**heads, **adapter.variables["params"]}}
+        return self._objective(start, adapter.model)
+
+    def _objective(self, variables: Variables | None, adapted: nn.Module | None) -> DiffusionObjective:
+        """The configured objective over `variables`, with `adapted` in place
+        of the model a run from scratch builds."""
         if self.pretrained is None:
             model, conditions, autoencoder = self._scratch(variables)
+            model = model if adapted is None else adapted
             sample, convention = self.sample_field(), None
         else:
             source = self._source(variables)
+            if self.lora is not None:
+                # The adapter binds to the denoiser and the pipeline's
+                # weights, so the objective trains its factors alone.
+                source = source.adapt(self.lora, key=self.trainer.key)
             if source.inputs is None:
                 raise ValueError(f"{self.pretrained} loads no diffusion inputs to train on")
             if source.inputs.mask is not None:
@@ -670,13 +702,13 @@ class DiffusionRunConfig(RunConfig):
                 model, process, inputs, sde=FlowSDE(self.rl.noise_level), beta=self.rl.beta,
                 clip_range=self.rl.clip_range, adv_clip_max=self.rl.adv_clip_max,
                 autoencoder=autoencoder, guidance=self.guidance, solver=self.solver,
-                steps=self.sampling_steps, pretrained=variables)
+                steps=self.sampling_steps, variables=variables)
         if self.mean_flow is not None:
             from .few_step import MeanFlowObjective
 
             return MeanFlowObjective(
                 model, process, inputs, **dataclasses.asdict(self.mean_flow),
-                autoencoder=autoencoder, pretrained=variables, unconditional_prob=self.unconditional_prob,
+                autoencoder=autoencoder, variables=variables, unconditional_prob=self.unconditional_prob,
                 ema_decay=self.ema_decay, solver=self.solver, guidance=None, steps=self.sampling_steps)
         if self.adversarial is not None:
             from .adversarial import AdversarialDistillationObjective
@@ -685,7 +717,7 @@ class DiffusionRunConfig(RunConfig):
                       for field in dataclasses.fields(self.adversarial) if field.name != "teacher"}
             return AdversarialDistillationObjective(
                 model, process, inputs, teacher=teacher_model(self.adversarial.teacher, variables), **fields,
-                autoencoder=autoencoder, pretrained=variables, unconditional_prob=self.unconditional_prob,
+                autoencoder=autoencoder, variables=variables, unconditional_prob=self.unconditional_prob,
                 ema_decay=self.ema_decay, solver=self.solver, guidance=None, steps=self.sampling_steps)
         if self.guidance_distill is not None:
             from .guidance_distillation import GuidanceDistillationObjective
@@ -693,7 +725,7 @@ class DiffusionRunConfig(RunConfig):
             teacher, held = self.guidance_distill.teacher_objective(variables)
             return GuidanceDistillationObjective(
                 model, process, inputs, teacher=teacher, teacher_variables=held,
-                scales=self.guidance_distill.scales, autoencoder=autoencoder, pretrained=variables,
+                scales=self.guidance_distill.scales, autoencoder=autoencoder, variables=variables,
                 ema_decay=self.ema_decay, solver=self.solver, guidance=None, steps=self.sampling_steps)
         if self.distill is not None:
             from .consistency import ConsistencyDistillationObjective
@@ -707,18 +739,18 @@ class DiffusionRunConfig(RunConfig):
             }
             return ConsistencyDistillationObjective(
                 model, process, inputs, teacher=self.distill.teacher_variables(variables), **fields,
-                autoencoder=autoencoder, pretrained=variables, ema_decay=self.ema_decay, solver=self.solver,
+                autoencoder=autoencoder, variables=variables, ema_decay=self.ema_decay, solver=self.solver,
                 guidance=None, steps=self.sampling_steps)
         if self.shortcut is not None:
             from .few_step import ShortcutObjective
 
             return ShortcutObjective(
                 model, process, inputs, **dataclasses.asdict(self.shortcut),
-                autoencoder=autoencoder, pretrained=variables, unconditional_prob=self.unconditional_prob,
+                autoencoder=autoencoder, variables=variables, unconditional_prob=self.unconditional_prob,
                 ema_decay=self.ema_decay, solver=self.solver, guidance=None, steps=self.sampling_steps)
         return DiffusionObjective(
             model, process, inputs,
-            autoencoder=autoencoder, pretrained=variables,
+            autoencoder=autoencoder, variables=variables,
             unconditional_prob=self.unconditional_prob,
             ema_decay=self.ema_decay,
             solver=self.solver,
