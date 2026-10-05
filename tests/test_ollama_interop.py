@@ -355,10 +355,11 @@ def test_the_daemon_reports_dews_own_logprobs(imported, client):
     forward over the weights rounded to F16 measures that, from
     transformers' float64 forward of the export, and the daemon has to be
     within tests/reference_error.py's FACTOR of it, RMS over every drawn
-    token. Observed: the daemon 9.0e-4 from float64, the conversion alone
-    6.5e-4 (ratio 1.39; llama.cpp also rounds activations and the KV cache
-    to F16, which the conversion leaves out), Dew's float32 forward 8.6e-7.
-    A kernel or precision change that started to matter would widen this
+    token. FACTOR also has to hold what llama.cpp rounds beyond the
+    conversion, its F16 activations and KV cache: on Ollama 0.32.9 the
+    daemon is 9.0e-4 from float64 and the conversion alone 6.5e-4 (ratio
+    1.39), Dew's float32 forward 8.6e-7. A daemon that rounds more, or a
+    kernel or precision change that started to matter, would widen this
     before it flipped a token.
     """
     import torch
