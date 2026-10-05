@@ -10,7 +10,9 @@ class NativeFields[Value](dict[str, Configured]):
 
     The record keeps checkpoint serialization independent of constructor
     defaults. Its typed value is rebuilt from the current record, so edits
-    to a field are read against the same native declarations.
+    to a field are read against the same native declarations. A copy made
+    as a plain dict (`dict(record)`, `{**record}`) has no `.value`: edit the
+    record itself, or build its value first.
     """
 
     def __init__(self, owner: type[Value], fields: Mapping[str, Configured]):
