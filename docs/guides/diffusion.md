@@ -124,7 +124,7 @@ tuned.save("flux-merged", variables=state.variables)
 images = objective.pipeline(state)(["a red bird"], key=0).host().images
 ```
 
-`tuned.adapter.save` writes `pytorch_lora_weights.safetensors`, the denoiser's PEFT config in its header, which Diffusers' `load_lora_weights` reads for that family. `tuned.save` writes the whole pipeline in the diffusers layout with the factors merged into the kernels. Both take the trainer's `state.variables` as it comes back. `LoRA.load(pipe.model, pipe.variables, path, layouts=pipe.layouts)` reads such a file back, or one Diffusers or a PEFT trainer wrote. A run takes the same spec as `lora:lora --lora.rank 16 --lora.modules to_q to_k to_v to_out.0` beside `--pretrained`, and `Adapter.from_run(run)` rebuilds its adapter from the run alone, so `adapter.save(adapter.variables, path)` writes the same file.
+`tuned.adapter.save` writes `pytorch_lora_weights.safetensors`, the denoiser's PEFT config in its header, which Diffusers' `load_lora_weights` reads for that family. `tuned.save` writes the whole pipeline in the diffusers layout with the factors merged into the kernels. Both take the trainer's `state.variables` as it comes back. `LoRA.load(pipe.model, pipe.variables, path, layouts=pipe.layouts)` reads such a file back, or one Diffusers or a PEFT trainer wrote. A run takes the same spec as `lora:lora --lora.rank 16 --lora.modules to_q to_k to_v to_out.0` beside `--pretrained` (from scratch it binds to a fresh draw of the denoiser from the run's key), and `Adapter.from_run(run)` rebuilds its adapter from the run alone, so `adapter.save(adapter.variables, path)` writes the same file.
 
 <!-- not run: needs torch, diffusers and peft -->
 ```python
