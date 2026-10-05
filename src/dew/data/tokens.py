@@ -94,16 +94,18 @@ def bounded(stream: Reader, batches: int | None) -> Reader:
 @datasets("token_windows")
 @dataclasses.dataclass(frozen=True)
 class TokenWindows(DatasetSpec):
-    """Reads fixed windows of `seq_len + 1` ids off the token stream.
+    """Reads fixed windows of `seq_len + 1` ids from the token stream.
 
+    `path` is the directory that `dew tokenize` or `TokenCorpus.write` wrote.
     Training windows start `stride` ids apart, `seq_len` by default. A
     stride of one lets the shuffled training stream read every contiguous
     window. Validation always starts windows `seq_len` ids apart, so it
     counts each target once. A batch is `{"text": int32 [batch, seq_len + 1]}`.
-    `val_batches` bounds a validation pass; None scores the whole split.
+    `val_batches` caps the batches in a validation pass; None scores the
+    whole split.
 
     The training stream's saved position is a global window count, so a run
-    resumes on any process count the global batch divides over.
+    can resume with any number of processes that divides the global batch.
     """
 
     path: str | None = None
@@ -111,8 +113,8 @@ class TokenWindows(DatasetSpec):
     stride: int | None = dataclasses.field(default=None, kw_only=True)
     val_batches: int | None = 4
     field: str | None = None
-    """Which arrayrecord field the ids are in, for a corpus held in ArrayRecord
-    shards of dict records; a `.bin` corpus is the stream itself."""
+    """The arrayrecord field that holds the ids, for a corpus stored as ArrayRecord shards of dict
+    records; None reads each record's bytes as the ids. A `.bin` corpus ignores it."""
 
     def load(self, *, batch: int, tokenize: Tokenize | None = None) -> Dataset:
         from .sources.text import TokenWindowSource, token_corpus
@@ -320,47 +322,50 @@ class PackedWindows(_WrappingDataset):
 @datasets("packed_tokens")
 @dataclasses.dataclass(frozen=True)
 class PackedTokens(DatasetSpec):
-    """Packs whole documents into `seq_len + 1` windows.
+    """Packs whole documents into windows of `seq_len + 1` tokens.
 
     Documents come from `TokenDocumentSource`, which cuts the token stream at
-    the eos ids the tokenize tool writes between files (`--pack`). Each
-    document, in chunks when it outgrows the window, is one element the
-    packer adds to the first window with room. Every window carries
+    the eos ids the tokenize tool writes after each document (`--pack`). The
+    packer adds each document to the first window with room, split into
+    chunks when it is longer than a window. Every window has
     `text_segment_ids` (which document each token is from, 0 for padding) and
     `text_positions` (the token's position inside its document), so the model
     can stop attention and the loss at document boundaries.
 
     `PackedWindows` plans the packing over the whole corpus in file order,
-    ahead of the shard, so a window is a fact about the corpus rather than
-    about one process's documents. The training stream shuffles and shards
-    windows as it does any other record, and its saved position is a global
-    window count that resumes on any process count. Which documents share a
-    window is the same in every run over that corpus; the seed decides only
-    the order the windows come in.
+    before the data is sharded, so the windows depend on the corpus alone and
+    not on which documents one process reads. The training stream shuffles
+    and shards windows as it does any other record. Its saved position is a
+    global window count, so a run can resume on any number of processes.
+    Every run over the same corpus packs the same documents together; the
+    seed decides only the order the windows come in.
 
-    `path` names one tokenized directory, or several with the share of a
-    step each fills, MaxText's weighted `grain_train_files`. Each corpus is
-    packed by its own plan, so a window holds one corpus's documents, and
-    `mixture` interleaves the windows at their weights ahead of the shard:
-    the weights are shares of the windows, and so of the tokens, a step
-    reads, and a position is still one global window count. The corpora
-    have to come from one tokenizer, which their `meta.json` records.
+    `path` names one tokenized directory, or maps several to the share of a
+    step each fills, like MaxText's weighted `grain_train_files`. Each corpus
+    is packed by its own plan, so a window holds documents from one corpus.
+    `mixture` then interleaves the windows at their weights before the data
+    is sharded. The weights are shares of the windows a step reads, and so
+    of its tokens, and a position is still one global window count. The
+    corpora must come from one tokenizer, as their `meta.json` records.
 
-    `phases` switches what a run reads at step boundaries instead: each
-    `DataPhase` names a corpus or mixture and the step it ends before, the
-    last running on, and each phase's mixture continues every corpus's
-    shuffled order where the earlier phases left it, so no window repeats
-    before its corpus's epoch ends (`dew.data.providers.phased_dataset`). A resume checks the phases the
-    run has read and accepts phases appended or moved past its step, so a run
-    of one mixture continues into a phase list that begins with it. `path`
-    is then unset, and validation reads the first phase's held-out split.
+    `phases` replaces `path` for a run that switches its data at step
+    boundaries. Each `DataPhase` names a corpus or mixture and the step it
+    ends before, and the last phase runs to the end. A phase that reads a
+    corpus again continues that corpus's shuffled order where the earlier
+    phases left it, so no window repeats before its corpus's epoch ends
+    (`dew.data.providers.phased_dataset`). On resume, the run checks the
+    phases it has already read, and you may append phases or move a boundary
+    it has not reached. So a run of one mixture can continue into a phase
+    list that begins with that mixture. With `phases`, leave `path` unset;
+    validation reads the first phase's held-out split.
 
-    `records` counts the windows a pass over the split holds, exactly, so
-    `steps_per_epoch` is that pass; a mixture's pass is the windows in which
-    every corpus has been read at least once (`mixed_records`), and a phased
-    run's is its first phase's.
-    `val_batches` bounds a validation pass; None scores the whole split, a
-    mixture's split mixed at the same weights, each corpus in its own order.
+    `records` is exactly the number of windows in one pass over the split,
+    so `steps_per_epoch` is that pass. For a mixture, a pass is the windows in
+    which every corpus has been read at least once (`mixed_records`), and for
+    a phased run it is the first phase's pass. `val_batches` caps the batches
+    in a validation pass; None scores the whole split. For a mixture, that
+    split is the held-out splits mixed at the same weights, each corpus in
+    its own order.
     """
 
     path: str | Mapping[str, float] | None = None
@@ -368,15 +373,15 @@ class PackedTokens(DatasetSpec):
     seq_len: int = 256
     val_batches: int | None = 4
     field: str | None = None
-    """Which arrayrecord field the ids are in, for a corpus held in
-    ArrayRecord shards of dict records; a `.bin` corpus is the stream itself."""
+    """The arrayrecord field that holds the ids, for a corpus stored as ArrayRecord shards of dict
+    records; None reads each record's bytes as the ids. A `.bin` corpus ignores it."""
     packing_bins: int = 8
-    """Windows the plan keeps open at once. More of them leave less padding
-    in a window and let documents further apart in the file share one."""
+    """The number of windows the plan keeps open at once. More of them leave less padding in a
+    window and let documents further apart in the file share one."""
 
     @property
     def corpora(self) -> list[str]:
-        """Every tokenized directory the run reads, in name order."""
+        """Every tokenized directory the run reads, across `path` and `phases`, in name order."""
         from .providers import name_ordered
         named = {name for phase in self.phases for name in name_ordered(phase.path)}
         return sorted(named | set(name_ordered(self.path)))
