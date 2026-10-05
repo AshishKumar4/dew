@@ -2,8 +2,10 @@
 
 The crop is an integer (top, left, height, width) rectangle, resized with
 half-pixel bilinear interpolation and clamped edges. Both implementations
-apply flip and the same three colour factors in the supplied order, then
-their caller rounds and clips once. This is not OpenCV's area/cubic resize
+apply flip and then torchvision's float ColorJitter (brightness, contrast
+and saturation, `torchvision.transforms.v2.functional` at 0.29) in the
+supplied order, each clamped to the pixel range as torchvision's `_blend`
+clamps it, and their caller rounds once. This is not OpenCV's area/cubic resize
 used to make variable-size decoded records stackable before augmentation.
 """
 
@@ -27,7 +29,9 @@ class ImageParameters(NamedTuple):
     order: ArrayLike
 
 
-_LUMA = (0.299, 0.587, 0.114)
+_GREY = (0.2989, 0.587, 0.114)
+"""torchvision's `rgb_to_grayscale` weights, which its contrast and
+saturation blend against."""
 _LOW = (0.8, 0.95, 0.8)
 _HIGH = (1.2, 1.05, 1.2)
 
@@ -85,16 +89,43 @@ def apply_device(image: ArrayLike, parameters: ImageParameters, size: int) -> ja
         in_axes=2, out_axes=2)(pixels)
     pixels = jnp.where(jnp.asarray(parameters.flip), pixels[:, ::-1], pixels)
     brightness, contrast, saturation = jnp.asarray(parameters.factors, dtype=pixels.dtype)
-    luma = jnp.asarray(_LUMA, dtype=pixels.dtype)
+    grey = jnp.asarray(_GREY, dtype=pixels.dtype)
 
     def colour(index, current):
-        return jax.lax.switch(jnp.asarray(parameters.order)[index], (
+        return jnp.clip(jax.lax.switch(jnp.asarray(parameters.order)[index], (
             lambda x: x * brightness,
-            lambda x: x * contrast + jnp.mean(jnp.sum(x * luma, axis=-1)) * (1 - contrast),
-            lambda x: x * saturation + jnp.sum(x * luma, axis=-1, keepdims=True) * (1 - saturation),
-        ), current)
+            lambda x: x * contrast + jnp.mean(jnp.sum(x * grey, axis=-1)) * (1 - contrast),
+            lambda x: x * saturation + jnp.sum(x * grey, axis=-1, keepdims=True) * (1 - saturation),
+        ), current), 0, 255)
 
     return jax.lax.fori_loop(0, 3, colour, pixels)
+
+
+def jitter_host(pixels: np.ndarray, factors: ArrayLike, order: ArrayLike) -> np.ndarray:
+    """torchvision's float ColorJitter on `[..., 3]` pixels in [0, 255]: the
+    brightness, contrast and saturation `factors` applied in `order`, each a
+    blend with black, the mean grey or each pixel's grey, clamped to the
+    pixel range."""
+    import cv2
+
+    brightness, contrast, saturation = np.asarray(factors, dtype=pixels.dtype)
+    grey = np.asarray(_GREY, dtype=pixels.dtype)
+    pixels = np.array(pixels, copy=True)
+    for index in np.asarray(order):
+        if index == 0:
+            np.multiply(pixels, brightness, out=pixels)
+        elif index == 1:
+            # The mean grey of the image as it stands at its place in the order.
+            mean = cv2.transform(pixels, grey[None]).mean()
+            np.multiply(pixels, contrast, out=pixels)
+            np.add(pixels, mean * (1 - contrast), out=pixels)
+        else:
+            # Saturation as one matrix: out_c = s * x_c + (1 - s) * grey.
+            matrix = np.eye(3, dtype=pixels.dtype) * saturation + np.outer(
+                np.ones(3, pixels.dtype), (1 - saturation) * grey)
+            pixels = cv2.transform(pixels, matrix)
+        np.clip(pixels, 0, 255, out=pixels)
+    return pixels
 
 
 def apply_host(image: np.ndarray, parameters: ImageParameters, size: int) -> np.ndarray:
@@ -107,16 +138,7 @@ def apply_host(image: np.ndarray, parameters: ImageParameters, size: int) -> np.
                         (size, size), interpolation=cv2.INTER_LINEAR)
     if parameters.flip:
         pixels = pixels[:, ::-1]
-    brightness, contrast, saturation = np.asarray(parameters.factors, dtype=dtype)
-    luma = np.asarray(_LUMA, dtype=dtype)
-    for index in np.asarray(parameters.order):
-        if index == 0:
-            pixels = pixels * brightness
-        elif index == 1:
-            pixels = pixels * contrast + (pixels * luma).sum(axis=-1).mean() * (1 - contrast)
-        else:
-            pixels = pixels * saturation + (pixels * luma).sum(axis=-1, keepdims=True) * (1 - saturation)
-    return pixels
+    return jitter_host(pixels, parameters.factors, parameters.order)
 
 
 def augment_batch(images: ArrayLike, raw_keys: ArrayLike, *, size: int, flip: bool, jitter: bool,

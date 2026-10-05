@@ -1,7 +1,9 @@
-"""Batch augmentation agrees with OpenCV and follows the saved data position."""
+"""Batch augmentation agrees with OpenCV's resize and torchvision's
+ColorJitter, and follows the saved data position."""
 
 import dataclasses
 import itertools
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -11,6 +13,8 @@ from steady_state import guarded, steady_state
 
 from dew.data import DataPartition, Loading
 from dew.data.images import ImageDataset
+
+TORCHVISION = np.load(Path(__file__).resolve().parent / "fixtures" / "colour_jitter" / "torchvision.npz")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -78,6 +82,36 @@ def test_supplied_parameters_match_opencv_at_highest_precision(order, crop):
     rounded = np.clip(np.rint(actual), 0, 255).astype(np.int16)
     host_rounded = np.clip(np.rint(expected), 0, 255).astype(np.int16)
     assert np.max(np.abs(rounded - host_rounded)) <= 1
+
+
+@pytest.mark.parametrize("case", range(6))
+def test_the_jitter_is_torchvisions_colorjitter_in_every_order(case):
+    """torchvision 0.29's own `adjust_brightness`, `adjust_contrast` and
+    `adjust_saturation` (tools/colour_jitter_reference.py), in each of the
+    six orders, on images whose brightened pixels leave the range, so each
+    op's clamp and the grey weights decide them. The device path and the
+    host path in float64, over the whole image with no flip (the resize is
+    then the identity), are torchvision's float64 run to 1e-9; in float32
+    the device path and the host loader's `jitter_host` round to the code
+    torchvision's float32 run rounds to, or one next to it."""
+    from dew.data.image_augmentation import ImageParameters, apply_device, apply_host, jitter_host
+
+    image = TORCHVISION[f"{case}/image"]
+    factors, order = TORCHVISION[f"{case}/factors"], TORCHVISION[f"{case}/order"]
+    side = image.shape[0]
+    parameters = ImageParameters(np.asarray([0, 0, side, side]), np.zeros((), dtype=bool), factors, order)
+    device = jax.devices()[0]
+    if device.platform == "tpu":
+        device = jax.devices("cpu")[0]  # TPU has no float64 operations.
+    with jax.enable_x64(), jax.default_device(device):
+        exact = jax.jit(lambda x, p: apply_device(x, p, side))(image.astype(np.float64), parameters)
+    for label, got in (("device", exact), ("host", apply_host(image.astype(np.float64), parameters, side))):
+        np.testing.assert_allclose(np.asarray(got), TORCHVISION[f"{case}/jittered_f64"], rtol=0, atol=1e-9,
+                                   err_msg=label)
+    reference = np.rint(TORCHVISION[f"{case}/jittered"])
+    for got in (jax.jit(lambda x, p: apply_device(x, p, side))(image, parameters),
+                jitter_host(image.astype(np.float32), factors, order)):
+        assert np.abs(np.clip(np.rint(np.asarray(got)), 0, 255) - reference).max() <= 1
 
 
 def test_each_data_key_keeps_its_draw_across_batch_sizes_and_order():
