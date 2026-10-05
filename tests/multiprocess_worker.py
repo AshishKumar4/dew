@@ -568,7 +568,27 @@ class Batches:
         return accumulated
 
 
+def fail_local_save(step: int) -> None:
+    """Make this process's local checkpoint at `step` fail in its background
+    thread, where orbax creates the step's tmp directories."""
+    from orbax.checkpoint._src.path import atomicity
+
+    create = atomicity._create_tmp_directory
+
+    async def failing(async_makedir_func, tmp_dir, *args, **kwargs):
+        path = Path(tmp_dir)
+        # The item's directory under the step's, in this process's local directory.
+        if path.name.startswith("default.") and path.parent.name.startswith(f"{step}.orbax-checkpoint-tmp") \
+                and path.parent.parent.name.startswith("process"):
+            raise FileExistsError(17, "File exists", str(tmp_dir))
+        return await create(async_makedir_func, tmp_dir, *args, **kwargs)
+
+    atomicity._create_tmp_directory = failing
+
+
 def mode_fit(args) -> dict:
+    if args.fail_local_save is not None:
+        fail_local_save(args.fail_local_save)
     trainer = build_trainer(args.name, args.run_dir, args.fsdp_size,
                             local_dir=args.local_dir, local_every=args.local_every)
     checkpoints = trainer.checkpoints
@@ -2035,6 +2055,9 @@ def parse_args(argv=None):
     parser.add_argument("--block-after", type=int,
                         help="batches to hand out before waiting to be killed")
     parser.add_argument("--marker", help="file written once the source blocks")
+    parser.add_argument("--fail-local-save", type=int,
+                        help="this process's local save at this step fails in the background, as "
+                             "orbax's tmp directory creation once did (FileExistsError)")
     parser.add_argument("--tokens", help="directory holding train.bin and val.bin")
     parser.add_argument("--seq-len", type=int, default=8)
     parser.add_argument("--workers", type=int, default=0)
