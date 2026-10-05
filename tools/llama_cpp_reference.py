@@ -37,8 +37,8 @@ which transformers parses the tokenizer.
 `consume` fetches and builds llama.cpp under ~/.cache/dew/upstream (cmake,
 ninja and a C++ compiler) and writes tests/fixtures/llama_cpp/reference.npz:
 the ids, llama.cpp's float32 logits, transformers' float64 ones, the
-SHA-256 of the export's config, generation config and weights (the weights
-by contents, as tools/lora_export_reference.py's `digest` hashes them), and
+SHA-256 of the export's config and weights (the weights by contents, as
+tools/lora_export_reference.py's `digest` hashes them), and
 the vocabulary the GGUF carries (its pieces by id, and its unknown,
 beginning and end ids), read back with the pinned gguf-py.
 """
@@ -65,10 +65,13 @@ FIELDS = {"vocab_size": 384, "emb_features": 64, "num_layers": 2, "num_heads": 4
           "mlp_features": 128, "max_seq_len": 64, "qk_norm": False, "tie_embeddings": False}
 SEED = 61
 IDS = (np.arange(3, 3 + 24 * 7, 7) % FIELDS["vocab_size"]).astype(np.int32)
-DIGESTED = ("config.json", "generation_config.json", "model.safetensors")
-"""The files the forward reads. The tokenizer files are transformers' own
-serialization, which the tokenizers release decides; what the GGUF carries
-of them is recorded as a vocabulary instead (`gguf_vocabulary`)."""
+DIGESTED = ("config.json", "model.safetensors")
+"""The files the forward reads. generation_config.json names the tokenizer
+the export was made with, which for a local one is its path on the
+exporting machine, and nothing the converter or the forward reads; the
+tokenizer files are transformers' own serialization, which the tokenizers
+release decides, so what the GGUF carries of them is recorded as a
+vocabulary instead (`gguf_vocabulary`)."""
 SPECIAL_KEYS = ("tokenizer.ggml.unknown_token_id", "tokenizer.ggml.bos_token_id",
                 "tokenizer.ggml.eos_token_id")
 
