@@ -29,7 +29,7 @@ from .sessions import (
 )
 
 type Reward = Callable[[str, str, str, str], float]
-"""Score ``(data_source, completion, ground_truth, extra_info)``."""
+"""A function that scores `(data_source, completion, ground_truth, extra_info)` and returns the reward."""
 
 def _texts(rows: np.ndarray) -> list[str]:
     """Decode fixed-width UTF-8 byte rows stored as int32."""
@@ -86,17 +86,19 @@ def completion_rows(prompts: np.ndarray, prompt_lengths: np.ndarray, sampled: np
 
 @dataclasses.dataclass(frozen=True)
 class SampledRollout:
-    """Draw G completions per prompt and pack them as one-call sessions.
+    """Draws `groups` completions per prompt from the objective's policy and packs them as one-call sessions.
 
-    EOS is a valid action in the response mask but excluded from reward text.
-    The batch is `pack`'s layout, `prompts * groups` rows of the prompt
-    width plus the response budget. Every completion is scored; one that
-    ran out of `max_new_tokens` is TRUNCATED, and `truncation` (default
-    `score`, train it on its reward) decides whether it trains.
-    `old_log_probs` holds the raw likelihoods the cached model recorded at
-    each sampled action, and `behavior_log_probs` the sampling ones.
-    `metrics` holds the latest call's mean reward, mean completion length
-    and truncated share, which the trainer logs as `rollout/<name>`.
+    EOS counts as an action in the response mask, but the text passed to
+    `reward` leaves it out. The batch has `pack`'s layout, `prompts * groups`
+    rows of the prompt width plus `max_new_tokens`, so size the objective's
+    `seq_len` one below that width; any other size raises ValueError. Every
+    completion is scored. One that ran out of `max_new_tokens` is TRUNCATED,
+    and `truncation` decides whether it trains; the default, `score`, trains
+    it on its reward. `old_log_probs` holds the raw likelihoods the cached
+    model recorded at each sampled action, and `behavior_log_probs` holds
+    the sampling ones. `metrics` holds the latest call's mean reward, mean
+    completion length and truncated share, which the trainer logs as
+    `rollout/<name>`.
     """
 
     objective: LMObjective
@@ -143,9 +145,9 @@ class SampledRollout:
     def __call__(self, state, batch, key: jax.Array) -> dict[str, np.ndarray]:
         """Draw `groups` completions per prompt and pack them as GRPO rows.
 
-        Every group is drawn from one policy snapshot, scored by `reward`
-        and centred within its prompt's group. The returned columns are
-        the batch a GRPO loss reads.
+        Every group is drawn from one policy snapshot and scored by
+        `reward`, and the advantages are computed within each prompt's
+        group. The returned columns are the batch a GRPO loss reads.
         """
         # Validation completes on every rank before generation enters collectives.
         prepared = None
