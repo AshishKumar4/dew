@@ -108,7 +108,15 @@ class DecodeOps:
 
 
 class Strategy(Protocol):
-    """The device loop of one generation request."""
+    """The device loop that runs one generation request.
+
+    A strategy is called with the prefilled `DecoderState`, the initial
+    `StepState`, the `DecodeOps` that advance the model and gather its cache
+    rows, the composed transform chain, the stopping criterion, the token
+    budget and the number of continuations. It returns one `Draws` record
+    per output row. `Sample`, `Beam` and `Speculative` use nothing else, so
+    your own strategy is a callable with the same signature.
+    """
 
     def __call__(self, state: DecoderState, start: StepState, ops: DecodeOps,
                  transform: Callable[[StepState, jax.Array], jax.Array],
@@ -239,16 +247,16 @@ class _Emitted(NamedTuple):
 
 @struct.dataclass
 class Sample:
-    """Draw every row independently, one token per step.
+    """Draws every row independently, one token per step.
 
-    This is the loop `generate` runs when a request names no strategy, and
-    a prompt's continuations share its prefill (`continuations`).
+    This is the loop `generate` runs when a request names no strategy. A
+    prompt's continuations share its prefill (`continuations`).
 
-    `grammar` holds every draw to a regex or JSON schema
-    (`dew.sampling.guided`): each row carries its automaton state, and the
-    tokens it forbids score -inf ahead of the transform chain, so the chain
-    filters and samples inside the language and the raw likelihood stays
-    the model's own.
+    `grammar` restricts every draw to a regex or JSON schema
+    (`dew.sampling.guided`). Each row keeps its own automaton state, and the
+    tokens the automaton forbids get the score -inf before the transform
+    chain runs. So the chain filters and samples within the language, and
+    the raw likelihood is still the model's own.
     """
 
     grammar: Grammar | None = None
@@ -305,27 +313,33 @@ class Completed:
 
 @struct.dataclass
 class Beam:
-    """Deterministic beam search over one shared prefill.
+    """Runs deterministic beam search over one shared prefill.
 
-    The bookkeeping is `_beam_search` in Transformers 5.16.1. A step scores
-    every live beam's continuations, keeps the best `(1 + stop_ids) * width`
-    of them so `width` live beams always remain, moves the ones a criterion
-    ended into the completed set with their score divided by their generated
-    length raised to `length_penalty`, and continues with the rest.
-    `early_stopping` follows the reference's three settings: False estimates
-    the best score still reachable from the current length, True also stops
-    recording once every beam is completed, and "never" estimates from the
+    The bookkeeping follows `_beam_search` in Transformers 5.16.1. Each step
+    scores every live beam's continuations and keeps the best `keep` of
+    them, `max(2, 1 + stop_ids) * width`, so that `width` live beams always
+    remain. `stop_ids` is the number of tokens that can end a beam. The kept
+    continuations that a stopping criterion ended move into the completed
+    set, with their score divided by their generated length raised to
+    `length_penalty`, and the search continues with the rest.
+
+    `early_stopping` takes the reference's three settings, which decide when
+    a prompt is no longer worth extending from an estimate of the best score
+    its live beams can still reach. False estimates it from the current
+    length. True does the same and also stops recording completed beams once
+    every slot of the completed set is full. "never" estimates it from the
     whole budget when the penalty rewards length.
 
     The prompt is prefilled once and its cache row is copied into `width`
-    rows; every step reparents those rows through `DecodeOps.reindex`, so a
-    branched beam decodes exactly like a separately selected prefix.
-    Parameters are never mapped.
+    rows. Every step gathers each beam's parent row through
+    `DecodeOps.reindex`, so a branched beam decodes exactly like a
+    separately selected prefix. Parameters are never mapped.
 
-    `n` is how many completed beams to return, not the search width, and
-    `n > width` is an error. A selected path is a search result rather than a
-    draw, so its behaviour log probability is zero; the raw log probabilities
-    stay the model's own for the tokens on the path.
+    `n` is how many completed beams to return, which is separate from the
+    search width, and an `n` larger than `width` raises `ValueError`. A
+    selected path is a search result and not a draw, so its behaviour log
+    probability is zero. The raw log probabilities are still the model's own
+    for the tokens on the path.
     """
 
     width: int = struct.field(pytree_node=False, default=1)
@@ -343,7 +357,7 @@ class Beam:
 
     @property
     def keep(self) -> int:
-        """Continuations a step keeps, as `beams_to_keep` upstream."""
+        """The number of continuations a step keeps, as `beams_to_keep` upstream."""
         return max(2, 1 + self.stop_ids) * self.width
 
     def __call__(self, state: DecoderState, start: StepState, ops: DecodeOps,
@@ -525,40 +539,45 @@ def _beam_draws(done: Completed, start: StepState, prompts: int, n: int, budget:
 
 @struct.dataclass
 class Speculative:
-    """Draft with the model's prediction depths or its block drafter, verify
-    with the model itself.
+    """Drafts with the model's prediction depths or block drafter, and verifies with the model itself.
 
-    The law is algorithm 1 of arXiv 2211.17192, as `_speculative_sampling` in
-    Transformers 5.16.1 applies it. The first candidate is an ordinary target
-    draw, so it is always accepted, and the model's prediction depths chain
-    the rest from the target's last hidden state and each candidate's
-    embedding, which is what vLLM's `Qwen3_5MultiTokenPredictor` does; a
-    block drafter (DeepSeek-V4.1's DSpark) drafts them in one pass after the
-    first, each drawn from its position's logits as the pass reaches it. A
-    proposed `x` is accepted with probability `min(1, p(x) / q(x))` for the
-    target's post-transform `p` and the draft's actual `q`, compared as a log
-    ratio; the first rejection draws from the normalized positive part of
-    `p - q`, and a block with nothing rejected draws a bonus token from `p`.
-    The emitted tokens are therefore distributed exactly as `Sample` would
-    distribute them, token for token, though not draw for draw at one seed.
+    The acceptance rule is algorithm 1 of arXiv 2211.17192, as
+    `_speculative_sampling` in Transformers 5.16.1 applies it. The first
+    candidate of a block is an ordinary target draw, so it is always
+    accepted. The model's prediction depths chain the remaining candidates
+    from the target's last hidden state and each candidate's embedding, as
+    vLLM's `Qwen3_5MultiTokenPredictor` does. A block drafter (DeepSeek-V4.1's
+    DSpark) instead drafts all the candidates after the first in one pass,
+    drawing each from its position's logits as the pass reaches it.
 
-    Every emitted action, including a replacement or a bonus, records the
-    target's post-transform log probability as its behaviour and the model's
-    own log probability as its raw value. The draft's `q`, the acceptance
-    probability and the residual are never recorded: none of them is the
-    distribution the emitted action came from.
+    A proposed token `x` is accepted with probability `min(1, p(x) / q(x))`,
+    where `p` is the target's post-transform distribution and `q` is the
+    draft's actual one, compared as a log ratio. At the first rejection, the
+    replacement is drawn from the normalized positive part of `p - q`, and a
+    block with nothing rejected draws a bonus token from `p`. So the emitted
+    tokens have exactly the distribution `Sample` would give them, token for
+    token, though not the same draws at one seed.
 
-    `block` candidates per iteration keep every collective the same size. The
-    target cache is saved before the block and the accepted prefix is replayed
-    into it, because a recurrent mixer's state is a running summary that no
-    cursor can rewind, and the prediction cache is rebuilt the same way. A
-    continuing block emits two or more tokens unless the budget ends first,
-    so `ceil(budget / 2)` iterations bound the loop.
+    Every emitted token, including a replacement or a bonus, records the
+    target's post-transform log probability as its behaviour log probability
+    and the model's own log probability as its raw value. The draft's `q`,
+    the acceptance probability and the residual are never recorded, because
+    none of them is the distribution the emitted token came from.
 
-    `confidence` stops the draft after the first candidate the draft itself is
-    less sure of than that, as the reference's `ConfidenceCriteria` does. The
-    later candidates are still computed, at the same shapes, and simply
-    cannot be accepted.
+    Each iteration proposes `block` candidates (at least 2), so every
+    collective keeps the same size. The target cache is saved before the
+    block and the accepted prefix is replayed into it, because a recurrent
+    mixer's state is a running summary that no cursor can rewind. The
+    prediction cache is rebuilt the same way. A block that continues emits
+    two or more tokens unless the budget ends first, so `ceil(budget / 2)`
+    iterations bound the loop.
+
+    `confidence` stops the draft after the first candidate to which the
+    draft itself gives a probability below `confidence`, as the reference's
+    `ConfidenceCriteria` does. The later candidates are still computed, at
+    the same shapes, but cannot be accepted. Calling the strategy on a model
+    that has neither prediction depths nor a block drafter raises
+    `ValueError`.
     """
 
     block: int = struct.field(pytree_node=False, default=4)

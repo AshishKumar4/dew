@@ -11,11 +11,13 @@ class DiscreteNoiseScheduler(NoiseScheduler):
     """A variance preserving schedule tabulated from betas, DDPM style.
 
     signal_rate^2 + noise_rate^2 = 1 at every index, and t is the index into
-    the table, so T is the number of entries. The loss weight is the P2 weight
-    of Choi et al. 2022, (k + SNR)^-gamma. At the defaults k = 1, gamma = 1 it
-    is 1 / (1 + SNR), which on a v-prediction loss (whose error is 1 + SNR
-    times the x_0 error) is exactly an unweighted x_0 loss. All fixed tables,
-    including the weight, are prepared in host float64 and rounded once.
+    the table, so T is the number of entries. The loss weight is the P2
+    weight of Choi et al. 2022, (k + SNR)^-gamma, with
+    k = `p2_loss_weight_k` and gamma = `p2_loss_weight_gamma`. At the
+    defaults k = 1, gamma = 1 it is 1 / (1 + SNR). On a v-prediction loss,
+    whose error is 1 + SNR times the x_0 error, that is exactly an
+    unweighted x_0 loss. All fixed tables, including the weight, are
+    prepared in host float64 and rounded once.
     """
 
     def __init__(self, betas: np.ndarray,
@@ -37,8 +39,10 @@ class DiscreteNoiseScheduler(NoiseScheduler):
         self.p2_loss_weights = jnp.asarray(weights, jnp.float32)
 
     def index(self, t) -> jax.Array:
-        """`t` as a table index; a time grid may reach T itself, which is the
-        last entry."""
+        """Return `t` as a table index.
+
+        A time grid may reach T itself, which maps to the last entry.
+        """
         return jnp.clip(jnp.asarray(t).astype(jnp.int32), 0, self.T - 1)
 
     def rates(self, t):

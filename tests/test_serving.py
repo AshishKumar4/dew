@@ -651,6 +651,30 @@ def test_a_server_on_an_expert_mesh_draws_what_one_device_draws(dispatch):
             served("12", 3, key=0)
 
 
+def test_a_wrapped_decoder_holds_the_capacity_it_is_served_at():
+    """A multimodal wrapper declares its language model's max_seq_len, which
+    `_sized` read only as the wrapper's own field: Qwen3.5-0.8B served at 384
+    slots held a cache of 8192 (4.1 GiB at 32 rows, out of memory at 128,
+    and its decode step transposed every full-attention layer's 8192 slots).
+    The language model inside is sized, whatever the wrapper declares."""
+    from dew.nn.multimodal import MultimodalTransformer
+    from dew.nn.vision import GemmaProjector, SiglipVision
+
+    text = CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
+                             mlp_features=32, max_seq_len=1024, dtype="float32")
+    model = MultimodalTransformer(
+        text, SiglipVision(hidden_size=16, intermediate_size=32, num_layers=1, num_heads=2,
+                           image_size=8, patch_size=4),
+        GemmaProjector(text_width=16, patches_per_side=2, tokens_per_side=1),
+        family="gemma3", image_token_id=1)
+    bound = TextGeneration(model, model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)),
+                           RunProcessor(Digits()))
+    server = Server.from_task(bound, slots=2, capacity=128)
+    held = {leaf.shape[1] for path, leaf in jax.tree_util.tree_leaves_with_path(server.cache)
+            if jax.tree_util.keystr(path).endswith("['cached_key']")}
+    assert held == {128}
+
+
 def test_prefix_sharing_needs_a_paged_cache():
     with pytest.raises(ValueError, match="paged cache"):
         Server.from_task(task(), slots=2, capacity=128, prefix_cache=True)
