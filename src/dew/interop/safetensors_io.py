@@ -114,9 +114,37 @@ def _publish(
             temporary,
             metadata=None if metadata is None else dict(metadata),
         )
+        if metadata is not None and len(metadata) > 1:
+            _sort_metadata(temporary)
         os.replace(temporary, destination)
     finally:
         Path(temporary).unlink(missing_ok=True)
+
+
+def _sort_metadata(path: str) -> None:
+    """Write the header's metadata in key order, in place.
+
+    safetensors keeps the metadata in a Rust HashMap, whose order differs from
+    one write to the next, so the same table would be different bytes. The
+    keys and values are the same text in another order, so the header keeps
+    its length and the tensors their offsets. This works around
+    safetensors/safetensors#584, which its PR #790 fixes; once a release
+    includes that, safetensors writes the order itself and this goes.
+    """
+    with open(path, "r+b") as file:
+        length = int.from_bytes(file.read(8), "little")
+        raw = file.read(length)
+        header = json.loads(raw)
+
+        def serialized(table: dict) -> bytes:
+            return json.dumps(table, separators=(",", ":"), ensure_ascii=False).encode()
+
+        if serialized(header) != raw.rstrip(b" "):
+            raise ValueError(f"{path}'s header is not one this writer reproduces, so its metadata "
+                             "cannot be put in order")
+        header["__metadata__"] = dict(sorted(header["__metadata__"].items()))
+        file.seek(8)
+        file.write(serialized(header).ljust(length))
 
 
 def _leaf_name(path) -> str:

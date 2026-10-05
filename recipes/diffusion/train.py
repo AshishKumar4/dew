@@ -168,4 +168,4 @@ def main(config: DiffusionRunConfig) -> TrainState:
 
 
 if __name__ == '__main__':
-    main(tyro.cli(tyro.conf.CascadeSubcommandArgs[DiffusionRecipeConfig]))
+    main(DiffusionRecipeConfig.cli())
