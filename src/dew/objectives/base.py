@@ -513,7 +513,7 @@ class Objective(ABC, Generic[Loss, Effects]):
         raw state restore remains available for custom research methods.
         """
 
-    def pipeline(self, state: TrainState, *, ema: bool | None = None) -> Task:
+    def pipeline(self, state: TrainState, *, ema: bool | None = None) -> Task | SavedTask:
         """The trained model as its inference task over `state`'s weights.
 
         `ema` None takes `state.averaged` when the objective keeps an
