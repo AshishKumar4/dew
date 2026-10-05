@@ -57,15 +57,19 @@ def source_alias(tensors: Mapping[str, np.ndarray], owners: dict[tuple[str, ...]
         raise ValueError(f"Two different source tensors {previous!r} and {name!r} map to {path}")
 
 
-def _leaves(tensors: Mapping[str, np.ndarray], path_of: TensorPath, param_dtype: str
-            ) -> Iterator[tuple[str, tuple[str, ...], np.ndarray | SourceLeaf, tuple[int, ...] | None]]:
-    """Cast before the layout copy, keeping linear and untransposed leaves mapped.
+def _copy(stored: np.ndarray, dtype: np.dtype, order: tuple[int, ...] | None) -> np.ndarray:
+    """Cast in contiguous source order before copying the native layout."""
+    leaf = stored.astype(dtype, copy=False)
+    return leaf if order is None else np.ascontiguousarray(leaf.transpose(order))
 
-    Convolutions need arbitrary axis permutations, so they are read whole.
+
+def _leaves[LeafT](tensors: Mapping[str, np.ndarray], path_of: TensorPath, param_dtype: str,
+                   read: Callable[[np.ndarray, np.dtype, tuple[int, ...] | None], LeafT]
+                   ) -> Iterator[tuple[str, tuple[str, ...], LeafT, tuple[int, ...] | None]]:
+    """Choose native paths, layout and precision for an eager or mapped reader.
+
     Frozen constants stay FP32 independently of parameter precision.
     """
-    from dew.interop.streaming import SourceLeaf
-
     for name, tensor in tensors.items():
         path = path_of(name)
         if path is None:
@@ -74,20 +78,18 @@ def _leaves(tensors: Mapping[str, np.ndarray], path_of: TensorPath, param_dtype:
         order = (*range(2, stored.ndim), 1, 0) if path[-1] == "kernel" else None
         transpose = None if order is None else tuple(int(axis) for axis in np.argsort(order))
         dtype = checkpoint_dtype(stored.dtype, "float32" if path[0] == "constants" else param_dtype)
-        leaf = (np.ascontiguousarray(stored.astype(dtype, copy=False).transpose(order))
-                if order is not None and stored.ndim != 2
-                else SourceLeaf((stored,), dtype, transposed=order is not None))
-        yield name, path, leaf, transpose
+        yield name, path, read(stored, dtype, order), transpose
 
 
 def translate_parameters(tensors: Mapping[str, np.ndarray], path_of: TensorPath,
                          param_dtype: str = "float32") -> ParamTree:
-    """Read native parameters, comparing repeated paths at their storage precision."""
-    from dew.interop.streaming import SourceLeaf
+    """Read host-built parameters without creating deferred placement recipes.
 
+    Repeated paths compare at their storage precision.
+    """
     parameters: ParamTree = {}
-    for name, path, leaf, _ in _leaves(tensors, path_of, param_dtype):
-        insert(parameters, path, leaf.read() if isinstance(leaf, SourceLeaf) else leaf, name)
+    for name, path, leaf, _ in _leaves(tensors, path_of, param_dtype, _copy):
+        insert(parameters, path, leaf, name)
     return parameters
 
 
@@ -101,7 +103,7 @@ def record_layouts(component: str, tensors: Mapping[str, np.ndarray], path_of: T
     each placement reads and casts only its shard. Scoring state can request
     FP32 separately from parameters.
     """
-    from dew.interop.streaming import WeightLayout, materialize
+    from dew.interop.streaming import SourceLeaf, WeightLayout, materialize
 
     parameters: LazyTree = {}
     layouts = []
@@ -113,7 +115,11 @@ def record_layouts(component: str, tensors: Mapping[str, np.ndarray], path_of: T
             source_alias(tensors, owners, path, name)
         return path
 
-    for name, path, leaf, transpose in _leaves(tensors, locate, param_dtype):
+    def mapped(stored: np.ndarray, dtype: np.dtype, order: tuple[int, ...] | None) -> np.ndarray | SourceLeaf:
+        return (_copy(stored, dtype, order) if order is not None and stored.ndim != 2
+                else SourceLeaf((stored,), dtype, transposed=order is not None))
+
+    for name, path, leaf, transpose in _leaves(tensors, locate, param_dtype, mapped):
         layouts.append(WeightLayout(f"{component}/{name}", ((*prefix, *path),),
                                     tensors[name].shape, transpose))
         if owners[path] == name:
