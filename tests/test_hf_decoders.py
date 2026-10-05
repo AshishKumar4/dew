@@ -107,7 +107,7 @@ import pytest
 from reference_error import assert_as_exact_as_the_reference
 
 from dew.interop import Pretrained, PretrainedDecoder
-from dew.interop.hf_decoders import translate_config, translate_weights
+from dew.interop.hf_decoders import DrafterRefused, translate_config, translate_weights
 from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
@@ -257,6 +257,24 @@ def test_a_multimodal_gemma3_config_is_refused():
 
     with pytest.raises(ValueError, match="model_type 'gemma3'"):
         translate_config(wrapped)
+
+
+def test_a_speculative_drafter_is_refused_by_design_naming_what_it_reads():
+    """RadixArk/Kimi-K3-DSpark ships a SpecForge drafter under model_type
+    qwen3. It reads Kimi K3's states after five of its 93 layers and has no
+    embedding or head of its own, so the refusal names the drafter, its
+    target layers and SGLang, where its draft arithmetic lives. Without
+    `num_target_layers` the same fields are an ordinary qwen3 config that
+    fails on what it cannot express."""
+    config = fixture_config("kimi-k3-dspark")
+
+    with pytest.raises(DrafterRefused, match=r"\['DSparkDraftModel'\].* 93-layer target's hidden "
+                       r"states after its layers \[7, 23, 51, 67, 83\].*SGLang"):
+        translate_config(config)
+    del config["num_target_layers"]
+    with pytest.raises(ValueError, match="config fields") as refused:
+        translate_config(config)
+    assert not isinstance(refused.value, DrafterRefused)
 
 
 def test_released_mistral_v03_config_translates_every_computational_field():

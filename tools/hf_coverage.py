@@ -11,8 +11,9 @@ architectures, or why no config was read (gated, missing). `classify`
 sorts every model into the route that loads it: a registered family (tier
 1, `hf_decoders.translate_config` or the wrapper table), a registered
 family's verified convention (tier 2, `verify.verify_mapping` on the shrunk
-config, no weights; run once per model_type), a GGUF repo's stub config, or
-a refusal with its reason. Types
+config, no weights; run once per model_type), a GGUF repo's stub config, a
+refusal with its reason, or a refusal by design (`DrafterRefused`, a
+speculative drafter that is no model on its own). Types
 transformers does not know (remote code only) have no reference to verify
 against and are counted apart. The shares are of downloads, over all types
 and over the most downloaded 200 and 50. Writes coverage.json.
@@ -67,6 +68,8 @@ def _route(config: dict, *, probe: bool) -> tuple[str, str]:
     try:
         hf_decoders.translate_config(config)
         return "tier 1", "registered family"
+    except hf_decoders.DrafterRefused as error:
+        return "by design", str(error)[:300]
     except (KeyError, ValueError, TypeError) as error:
         registered_error = f"{type(error).__name__}: {error}"
     try:
@@ -139,7 +142,7 @@ def classify(out: Path) -> None:
         summary[scope] = {route: {"models": sum(model["route"] == route for model in scoped),
                                   "download_share": sum(model["downloads"] for model in scoped
                                                         if model["route"] == route) / downloads}
-                          for route in ("tier 1", "tier 2", "gguf", "refused", "remote code")}
+                          for route in ("tier 1", "tier 2", "gguf", "refused", "by design", "remote code")}
     report = [{"model_type": name, "downloads": entry["downloads"], "share": entry["downloads"] / total,
                "models": entry["models"], "routes": dict(entry["routes"]),
                "detail": next((model["detail"] for model in models
