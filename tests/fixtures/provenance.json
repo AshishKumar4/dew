@@ -2476,6 +2476,27 @@
    ],
    "note": "Executes Megatron Core core_v0.19.2's SelfAttention.clip_qk and _clip_linear_qkv as published on a stand-in layer whose fused linear_qkv holds Dew-layout query, key and value kernels, grouped-query and multi-head, in float32 and float64."
   },
+  "nanogpt": {
+   "tool": "tools/nanogpt_reference.py",
+   "sources": [
+    {
+     "repo": "karpathy/nanoGPT",
+     "version": "3adf61e154c3fe3fca428ad6bc3818b27a3b8291",
+     "runs": "fetched"
+    },
+    {
+     "repo": "karpathy/char-rnn",
+     "version": "6f9487a6fe5b420b7ca9afb0d7c078e37c1d1b4e",
+     "runs": "fetched"
+    },
+    {
+     "repo": "pytorch/pytorch",
+     "version": "2.14.0",
+     "runs": "torch"
+    }
+   ],
+   "note": "Executes data/shakespeare_char/prepare.py as published on the first 20,000 characters of char-rnn's tinyshakespeare (train.bin, val.bin), then train.py's get_batch as published for eight batches of each split, recording the offsets it draws and its x and y."
+  },
   "native_diffusion_edges.tar.xz": {
    "tool": "tools/native_diffusion_edges_reference.py",
    "sources": [
