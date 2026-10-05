@@ -2010,7 +2010,7 @@ def _input_quantization(model: nn.Module, layouts: tuple[WeightLayout, ...],
         return model
     inputs = {}
     for layout in layouts:
-        part = layout.name.removesuffix('.weight') + '.input_global_scale'
+        part = layout.name.removesuffix('.weight') + codec.input_suffix
         if part not in grid:
             continue
         if (len(layout.paths) != 1 or layout.paths[0][-1] != 'kernel'
@@ -2019,11 +2019,12 @@ def _input_quantization(model: nn.Module, layouts: tuple[WeightLayout, ...],
                              "which this checkpoint provider does not compute")
         scale = np.asarray(grid[part])
         if scale.dtype != np.float32 or scale.size != 1:
-            raise ValueError(f"{part} must be one float32 inverse global scale, "
+            raise ValueError(f"{part} must be one float32 stored global scale, "
                              f"got {scale.dtype} {scale.shape}")
         path = '/'.join(layout.paths[0][1:-1])
-        inputs[path] = NVFP4Input(float(scale.reshape(())), codec.input_scale_dtype == 'float8_e4m3fn')
-    if len(inputs) != sum(name.endswith('.input_global_scale') for name in grid):
+        inputs[path] = NVFP4Input(float(scale.reshape(())), codec.input_scale_dtype == 'float8_e4m3fn',
+                                 format=codec.input_format)
+    if len(inputs) != sum(name.endswith(codec.input_suffix) for name in grid):
         raise ValueError("NVFP4 input scales must each bind one Linear scope; "
                          "an unbound scale would drop QDQ")
     return checkpoint_input_quantization(model, inputs)

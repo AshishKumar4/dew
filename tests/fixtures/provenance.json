@@ -108,6 +108,21 @@
    ],
    "note": "Documented generation environment also uses Torch 2.8.0."
   },
+  "codecs/modelopt/tiny/reference.npz": {
+   "tool": "tools/modelopt_nvfp4_reference.py",
+   "sources": [
+    {"repo": "NVIDIA/Model-Optimizer", "version": "0.47.0", "runs": "modelopt"},
+    {"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}
+   ],
+   "note": "Torch 2.13.0+cu130, Triton 3.7.1 on RTX 4080. ModelOpt export_hf_checkpoint writes the files; NVFP4QTensor reads weights to bf16, then fp32. The author's exact fake-quant kernel body consumes each file's multiplier, with ONLY its FP8 conversion helper replaced by direct RN, as ModelOpt's torch cast and TensorRT-LLM dc6f88de69ce869dc0ce095c888a70705a8b663c quantization.cuh:499-503 specify. A million-value conversion check holds the correction to torch's cast bit for bit. Uncorrected sm89 fp16-truncation outputs are recorded and attributed separately (13 forward differences each at q/k/v, none at the other projections). Continuous operations widen for float64; the discrete quantizer remains fp32. Transformers 5.16.1 has no ModelOpt reader, so its native class runs the author's decoded weights."
+  },
+  "codecs/modelopt/real/reference.npz": {
+   "tool": "tools/modelopt_nvfp4_reference.py",
+   "sources": [
+    {"repo": "NVIDIA/Model-Optimizer", "version": "0.47.0", "runs": "modelopt"}
+   ],
+   "note": "32 q_proj rows of nvidia/Qwen3-14B-NVFP4 at bc39319a4dc265d9bbb9a9731bc52c4988d9ece7, read by byte range. Author weight reader and own fake-quant kernel with direct RN FP8 conversion (as the tiny fixture); original sm89 outputs are recorded separately. Inputs include the reciprocal-order .75 boundary and effective-scale-below-1e-5 guard."
+  },
   "codecs/nvfp4_qdq/unrounded/reference.npz": {
    "tool": "tools/nvfp4_qdq_reference.py",
    "sources": [
@@ -3225,6 +3240,11 @@
   }
  },
  "inputs": [
+  {
+   "tool": "tools/modelopt_nvfp4_reference.py",
+   "what": "author-exported tiny ModelOpt checkpoint and 32 real pinned q_proj rows",
+   "files": ["codecs/modelopt/tiny/model.safetensors", "codecs/modelopt/real/model.safetensors"]
+  },
   {
    "tool": "tools/nvfp4_storage_reference.py",
    "what": "tiny weight-only FP8 and NVFP4 checkpoints written by the reference compressors",

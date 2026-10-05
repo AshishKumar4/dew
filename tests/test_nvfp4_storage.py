@@ -68,16 +68,15 @@ def test_a_storage_load_refuses_input_quantization_even_without_stored_scales(ki
         Pretrained.load(tmp_path, dtype="float32")
 
 
-def test_modelopt_is_refused_with_the_missing_activation_and_reference_contract(tmp_path):
+def test_modelopt_mixed_precision_is_refused_with_its_missing_input_rules(tmp_path):
     config = {"model_type": "qwen3",
-              "quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4"}}
+              "quantization_config": {"quant_method": "modelopt", "quant_algo": "MIXED_PRECISION"}}
     (tmp_path / "config.json").write_text(json.dumps(config))
-    with pytest.raises(ValueError, match=r"'modelopt'.*input activations.*no ModelOpt checkpoint reader"):
+    with pytest.raises(ValueError, match=r"'modelopt'.*MIXED_PRECISION.*other input activations"):
         Pretrained.load(tmp_path, dtype="float32")
 
 
 RELEASES = [
-    ("nvidia/Qwen3-14B-NVFP4", "bc39319a4dc265d9bbb9a9731bc52c4988d9ece7", "'modelopt'"),
     ("RedHatAI/Llama-3.2-3B-Instruct-FP8", "377571d314b30f1d58448499e4100e2deafe7d7d", "dynamic=False"),
 ]
 
