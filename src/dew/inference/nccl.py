@@ -140,18 +140,29 @@ def _world(root: str, timeout: float) -> int:
 
 @dataclass
 class NCCLPush:
-    """Publish a policy version to vLLM replicas by NCCL broadcast; see the module docstring.
+    """Publishes a policy version to vLLM replicas by NCCL broadcast from a trainer GPU.
 
-    `source` is the `Pretrained` the replicas were launched from; its `export`
-    gives the tensors. `engines` are the replicas' roots, not their `/v1` APIs.
-    `library` is the engine's own libnccl.so.2. `chunk` bounds the bytes of
-    tensors placed on the sender device beside the trainer's state: the next
-    chunk is copied over while the current one broadcasts, so a push holds
-    at most two chunks there, or two of its largest tensor. Groups open on
-    the first push and stay open until `close`.
+    The replicas run vLLM (checked against v0.30.0) launched with
+    `--weight-transfer-config '{"backend": "nccl"}'` and
+    `VLLM_SERVER_DEV_MODE=1`. The module docstring of `dew.inference.nccl`
+    describes the handshake and the push in full.
+
+    - `source` is the `Pretrained` the replicas were launched from; its
+      `export` gives the tensors.
+    - `engines` are the replicas' root URLs, not their `/v1` API URLs.
+    - `library` is the engine's own libnccl.so.2, because NCCL refuses a
+      peer of another version when the group opens.
+    - `chunk` bounds the bytes of tensors placed on the sender device beside
+      the trainer's state. The next chunk is copied over while the current
+      one broadcasts, so a push holds at most two chunks there, or two of its
+      largest tensor.
+
+    Floating-point leaves are cast to `dtype` before the push, and `timeout`
+    bounds each HTTP call in seconds. Groups open on the first push and stay
+    open until `close`. Every process of a pool calls the push.
 
     `timings` holds the seconds each phase of the last push took: `gather`
-    (the cast and the gather to process 0's host, every process), and on
+    (the cast and the gather to process 0's host, on every process), and on
     process 0, which sends, `export`, `send` (copies and broadcasts until
     every replica has loaded the tensors) and `total`.
     """
@@ -187,12 +198,13 @@ class NCCLPush:
         self.timings["total"] = time.perf_counter() - began
 
     def close(self) -> None:
-        """Tear down the groups this side opened; a later push opens them again.
+        """Abort the NCCL groups this side opened. A later push opens them again.
 
-        Every group is aborted, not destroyed: NCCL's destroy finalizes the
-        group, which waits on the engine's side, and an engine keeps its side
-        open until it exits. A push that failed closes too: a group whose
-        broadcast failed, or whose replica did, cannot carry the next version.
+        Groups are aborted rather than destroyed, because NCCL's destroy
+        finalizes the group, which waits on the engine's side, and an engine
+        keeps its side open until it exits. A failed push also calls `close`,
+        because a group whose broadcast or replica failed cannot carry the
+        next version.
         """
         if self._library is not None:
             for comm in self._groups.values():
