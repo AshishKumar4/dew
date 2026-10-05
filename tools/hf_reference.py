@@ -130,6 +130,38 @@ NEMOTRON_H_CONFIGS = (
 )
 
 
+def write_granitemoe() -> None:
+    """Granite's four non-unit multipliers and the released packed expert layout."""
+    from diffusers_wan_reference import float64
+    from safetensors.torch import save_file
+    from transformers import GraniteMoeConfig, GraniteMoeForCausalLM
+
+    torch.manual_seed(0)
+    model = GraniteMoeForCausalLM(GraniteMoeConfig(
+        vocab_size=64, hidden_size=32, num_hidden_layers=2, num_attention_heads=4,
+        num_key_value_heads=2, intermediate_size=24, num_local_experts=4,
+        num_experts_per_tok=2, max_position_embeddings=64, rope_theta=10000.0,
+        embedding_multiplier=12.0, residual_multiplier=0.22, logits_scaling=6.0,
+        attention_multiplier=0.015625, tie_word_embeddings=True, bos_token_id=0, eos_token_id=0))
+    model.set_experts_implementation('eager')
+    write_tiny('granitemoe-tiny', model)
+    directory = FIXTURES / 'granitemoe-tiny'
+    ids = torch.from_numpy(np.load(directory / 'input_ids.npy')).long()
+    with float64(), torch.no_grad():
+        np.save(directory / 'logits_f64.npy', model.double()(input_ids=ids, use_cache=False).logits.numpy())
+    weights = {}
+    for name, value in model.float().state_dict().items():
+        name = name.replace('.block_sparse_moe.experts.gate_up_proj', '.block_sparse_moe.input_linear.weight')
+        name = name.replace('.block_sparse_moe.experts.down_proj', '.block_sparse_moe.output_linear.weight')
+        name = name.replace('.block_sparse_moe.router.weight', '.block_sparse_moe.router.layer.weight')
+        if name != 'lm_head.weight':
+            weights[name] = value.contiguous()
+    save_file(weights, str(directory / 'model.safetensors'))
+    (directory / 'model.safetensors').chmod(0o644)
+    write_released_config('powermoe-3b', 'ibm-research/PowerMoE-3b',
+                          '13fcb5a98001438bed01cf1ac4b423751dc4c2ea')
+
+
 def tiny_qwen3() -> Qwen3ForCausalLM:
     config = Qwen3Config.from_dict(dict(
         hidden_size=64, num_hidden_layers=2, num_attention_heads=4,
@@ -1131,9 +1163,14 @@ def main() -> None:
                         help="only the tiny fixtures, no 1.5 GB download")
     parser.add_argument("--nemotron-h-only", action="store_true",
                         help="only the Nemotron-H tiny fixture and two pinned released configs")
+    parser.add_argument('--granitemoe-only', action='store_true',
+                        help='only Granite MoE and its pinned PowerMoE config')
     args = parser.parse_args()
 
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    if args.granitemoe_only:
+        write_granitemoe()
+        return
     write_nemotron_h()
     for name, repo, revision in NEMOTRON_H_CONFIGS:
         write_released_config(name, repo, revision)
