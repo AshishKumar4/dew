@@ -173,7 +173,7 @@ class DiscreteProcess:
 
         Raises `ValueError` when the model is not a bidirectional
         transformer, when the prompt plus `max_new_tokens` exceeds its
-        `max_seq_len`, or when the inputs carry conditioning or token fields
+        `max_seq_len`, or when the inputs include conditioning or token fields
         that masked generation cannot extend.
         """
         solver = Unmask() if solver is None else solver

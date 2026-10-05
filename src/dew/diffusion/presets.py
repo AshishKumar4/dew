@@ -190,7 +190,7 @@ class ResolutionShift:
     is a reference and does not match every model's own token count. A model
     that tokenizes the image differently, such as a 32x autoencoder under
     1x1 patches, should set `tokens` to its own count. `DiffusionRunConfig`
-    fills an unset `tokens` from the data's resolution on the 16 x 16 grid.
+    sets an unset `tokens` from the data's resolution on the 16 x 16 grid.
     """
 
     base_shift: float = 0.5
