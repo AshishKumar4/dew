@@ -1,6 +1,6 @@
 # Coming from FlaxDiff
 
-FlaxDiff was Dew's earlier name when it focused on diffusion. Dew separates model construction, data loading, objectives and training. That separation lets the same trainer run language models and representation learning. Below is a map of FlaxDiff's modules to Dew's and the one FlaxDiff checkpoint format Dew can load. The new names are not import aliases. You need to review the calling code when migrating; search and replace is not enough.
+Dew started as a fork of FlaxDiff, my earlier diffusion-only framework. Dew separates model construction, data loading, objectives and training. That separation lets the same trainer run language models and representation learning. Below is a map of FlaxDiff's modules to Dew's and the one FlaxDiff checkpoint format Dew can load. The new names are not import aliases. You need to review the calling code when migrating; search and replace is not enough.
 
 ## Module map
 

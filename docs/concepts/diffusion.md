@@ -110,7 +110,7 @@ Dew omits REPA-E's LPIPS and PatchGAN terms. `tools/repae_reference.py` compares
 
 As in the reference, a draw at `unconditional_prob` determines how many rows have their condition dropped. These are the first rows in the batch, the instantaneous rows. The loss and gradient match Gsunshine/meanflow's `forward` on the reference's draws (`tools/meanflow_reference.py`). For an interval process, `sample` passes the model the interval to the next grid point at each step. `steps=2` therefore makes one step from noise to data.
 
-MeanFlow's and sCM's losses differentiate the model in time, so its time embedding must be smooth in time. `simple_dit`'s default Fourier scale of 16, applied to a flow's model time (sigma times 1000), is not.
+MeanFlow's and sCM's losses differentiate the model in time, so the model's time embedding has to change slowly with time. With `simple_dit`'s default Fourier scale of 16, applied to a flow's model time (sigma times 1000), it changes too fast. A run config sets `time_scale=0.002` for MeanFlow, and sCM distillation refuses a teacher trained at any other scale unless it distills with DMD alone (`consistency_weight=0`).
 
 A 2-D two-class toy compared the scales on an RTX 4080. It used a ring of eight Gaussians and a one-token `simple_dit` trained with these objectives. At scale 16, MeanFlow diverged after 8,000 steps, and the sCM student reached 11% class accuracy in one step. With `time_scale=0.002`, MeanFlow reached 99% in one step and 100% in two. The rCM student reached 98.6% in one step. Its teacher needs about 32 Euler steps for 99.9%.
 
