@@ -123,6 +123,10 @@ def _ready(result: Any) -> bool:
     return all(leaf.is_ready() for leaf in jax.tree.leaves(result))
 
 
+class StalePage(ValueError):
+    """A page requests a model revision absent from the offline runtime."""
+
+
 class ReportingModels:
     """`load`, one of the setup cell's loaders, reporting each model's load and
     handing back what it loads wrapped in `wrap`, once per model."""
@@ -140,7 +144,7 @@ class ReportingModels:
                 loaded = self.load(name) if revision is None else self.load(name, revision=revision)
             except OfflineModeIsEnabled:
                 if any(model == name and version != revision for model, version in self.loaded):
-                    raise ValueError("This page was updated. Reload it to use the current model.") from None
+                    raise StalePage("This page was updated. Reload it to use the current model.") from None
                 raise
             self.loaded[key] = self.wrap(loaded)
         return self.loaded[key]

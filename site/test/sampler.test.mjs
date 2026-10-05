@@ -195,7 +195,7 @@ test('a stale model revision asks for a reload instead of showing a traceback', 
 		socket.onMessage((raw) => {
 			const message = JSON.parse(String(raw));
 			if (message.op !== 'execute') return;
-			socket.send(JSON.stringify({ id: message.id, type: 'error', ename: 'ValueError',
+			socket.send(JSON.stringify({ id: message.id, type: 'error', ename: 'StalePage',
 				evalue: 'This page was updated. Reload it to use the current model.', traceback: ['private traceback'] }));
 			socket.send(JSON.stringify({ id: message.id, type: 'done', status: 'error', count: 1 }));
 		});
