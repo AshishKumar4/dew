@@ -38,7 +38,11 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_error import (
+    FACTOR,
+    FALSE_FAILURE,
+    ORDERS,
     assert_as_exact_as_the_reference,
+    assert_as_exact_over_orders,
     assert_computes_the_oracle,
     assert_rounds_where_the_reference_does,
 )
@@ -136,6 +140,29 @@ def test_logits_coarser_than_the_reference_fail_the_rule():
     coarse = jax.lax.reduce_precision(logits, exponent_bits=5, mantissa_bits=2)
     with np.load(directory / "numerics.npz") as exact, pytest.raises(AssertionError, match="ratio"):
         assert_as_exact_as_the_reference(coarse, exact["bf16"], exact["f64"], "coarse")
+
+
+def test_the_k_order_rule_holds_an_equally_exact_port_and_fails_a_coarser_one():
+    """ORDERS is the fewest K at which F(K, K), the ratio of two means of
+    one-degree chi-squares, the widest a squared RMS of Gaussian roundings
+    spreads, passes FACTOR^2 with probability at most FALSE_FAILURE. Over
+    20000 simulated fixtures of one-degree draws, an equally exact port
+    never fails, one twice as far fails half the time, as at the factor it
+    must, and one four times as far always fails."""
+    from scipy.stats import f
+
+    assert next(k for k in range(1, 1000) if f.sf(FACTOR ** 2, k, k) <= FALSE_FAILURE) == ORDERS
+    rng = np.random.default_rng(11)
+    dew, reference = np.sqrt(rng.chisquare(1, (2, 20000, ORDERS)))
+    ratio = np.sqrt(np.mean(np.square(dew), 1) / np.mean(np.square(reference), 1))
+    assert not np.any(ratio > FACTOR)
+    assert 0.45 < np.mean(2 * ratio > FACTOR) < 0.55
+    assert np.all(4 * ratio > FACTOR)
+    assert_as_exact_over_orders(dew[0], reference[0], "equally exact")
+    with pytest.raises(AssertionError, match="ratio"):
+        assert_as_exact_over_orders(2.5 * dew[1], reference[1], "coarser")
+    with pytest.raises(AssertionError, match="orders"):
+        assert_as_exact_over_orders(dew[0][:20], reference[0][:20], "too few orders")
 
 
 def bfloat16(bits: np.ndarray) -> jax.Array:

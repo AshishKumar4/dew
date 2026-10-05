@@ -20,7 +20,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax.traverse_util import flatten_dict
-from reference_error import FACTOR, assert_as_exact_as_the_reference
+from reference_error import FACTOR, assert_as_exact_as_the_reference, assert_as_exact_over_orders, distance
+from residual_orders import permuted
 from safetensors.numpy import load_file
 from scipy.special import log_softmax
 
@@ -148,10 +149,14 @@ def test_forward_matches_the_reference_over_left_padding(source):
 def test_update_exports_the_trained_model_back_in_the_source_layout(source, tmp_path):
     """One all-parameter SGD step at the reference's learning rate (1e-2,
     which moves the logits by up to 4.2). The loss is within 1e-5 of the
-    reference's (9.5e-7 apart), and the updated logits are held to the
-    reference's own distance from a float64 step as the forward is.
-    Observed RMS from float64: Dew 5.57e-6, the reference 8.15e-6 (ratio
-    0.68 on CPU, 0.91 on an RTX 4080, 1.26 on an RTX 3090).
+    reference's (9.5e-7 apart). One run's distance of the updated logits
+    from a float64 step is a draw of a few degrees of freedom (Dew's draws
+    here run from 0.54 to 1.98 times the reference's first), so they are
+    held over the fixture's 52 residual orders, each moving MXFP4's groups
+    of 32 whole (orders.npz, tests/residual_orders.py), by
+    `assert_as_exact_over_orders`. Dew's RMS over them is 0.75 of the
+    reference's on CPU, 0.71 on an AVX-512 CPU (Intel SDE's Ice Lake server)
+    and 0.69 on an RTX 4080.
 
     The export writes every source name back: towers byte-exact, A_log
     zero-padded to its stored length, trained experts as MXFP4 pairs,
@@ -165,20 +170,23 @@ def test_update_exports_the_trained_model_back_in_the_source_layout(source, tmp_
         statistics, _ = objective.loss({**loaded.variables, "params": variables}, {"text": inputs}, step)
         return objective.reduce_loss(statistics)[0]
 
-    value, gradient = jax.jit(jax.value_and_grad(loss))(loaded.variables["params"])
+    def stepped(params):
+        gradient = jax.grad(loss)(params)
+        return jax.tree.map(lambda weight, grad: weight - reference["learning_rate"] * grad, params, gradient)
+
+    value = jax.jit(loss)(loaded.variables["params"])
     np.testing.assert_allclose(value, reference["loss"], atol=1e-5, rtol=0)
-    variables = {
-        **loaded.variables,
-        "params": jax.tree.map(
-            lambda weight, grad: weight - reference["learning_rate"] * grad,
-            loaded.variables["params"],
-            gradient,
-        ),
-    }
     valid = reference["attention_mask"].astype(bool)
-    updated = loaded.model.apply(variables, inputs.tokens, **inputs.kwargs())
-    assert_as_exact_as_the_reference(np.asarray(updated)[valid], reference["updated_logits"][valid],
-                                     reference["updated_logits_f64"][valid], "updated logits")
+    updated = jax.jit(lambda params: loaded.model.apply(
+        {**loaded.variables, "params": stepped(params)}, inputs.tokens, **inputs.kwargs()))
+    with np.load(TINY / "orders.npz") as drawn:
+        orders, theirs = drawn["orders"], drawn["updated_logits"]
+    truth = reference["updated_logits_f64"][valid]
+    mine = [distance(np.asarray(updated(permuted(loaded.variables, order)["params"]))[valid], truth)
+            for order in orders]
+    assert_as_exact_over_orders(mine, theirs, "updated logits")
+
+    variables = {**loaded.variables, "params": jax.jit(stepped)(loaded.variables["params"])}
 
     loaded.save(tmp_path, variables=variables)
     written, shipped = (
