@@ -41,6 +41,69 @@ from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.hyper_connections import HyperConnections
 
 
+def _minimax_m2_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
+    """Read MiniMax-M2's projection norms, partial rotary and sigmoid MoE.
+
+    Transformers 5.16.1 predates the rotary_dim fix (issue 48241, PR 48486);
+    5.18.0 and the release rotate rotary_dim/head_dim of each head. The
+    selection-only bias and normalized sigmoid weights reuse DeepSeek's
+    router without groups, scaling or shared experts. MTP metadata is inert
+    because the released indexes ship no MTP weights; the weight path refuses
+    any MTP tensor instead of dropping a prediction block.
+    """
+    for name, expected in (
+        ('use_qk_norm', True), ('qk_norm_type', 'per_layer'),
+        ('use_routing_bias', True), ('scoring_func', 'sigmoid'),
+        ('shared_intermediate_size', 0), ('router_jitter_noise', 0.0),
+        ('layernorm_full_attention_beta', 1.0),
+        ('layernorm_linear_attention_beta', 1.0), ('layernorm_mlp_beta', 1.0),
+    ):
+        used.add(name)
+        if hf_config.get(name, expected) != expected:
+            _refuse(name, f'MiniMax-M2 requires {expected!r}; router jitter has no training counterpart')
+    used.add('attn_type_list')
+    layers = records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
+    if hf_config.get('attn_type_list', [1] * layers) != [1] * layers:
+        _refuse('attn_type_list', 'MiniMax-M2 uses full attention in every layer')
+    # These release fields are absent from the reference's config/modeling;
+    # none changes the forward pass or supplies weights in the released index.
+    used.update(('use_mtp', 'num_mtp_modules', 'mtp_transformer_layers',
+                 'mlp_intermediate_size', 'shared_moe_mode',
+                 'output_router_logits', 'router_aux_loss_coef'))
+    entry = records.record(hf_config.get('rope_scaling') or hf_config.get('rope_parameters') or {},
+                           'rope_parameters')
+    extra = set(entry) - {'rope_type', 'type', 'rope_theta', 'partial_rotary_factor'}
+    if extra or entry.get('rope_type', entry.get('type', 'default')) != 'default':
+        _refuse('rope_parameters', 'MiniMax-M2 currently reads plain partial rotary positions')
+    head_dim = records.integer(hf_config.get('head_dim', 128), 'head_dim')
+    rotary_dim = records.integer(hf_config.get('rotary_dim', head_dim), 'rotary_dim')
+    factor = records.number(entry.get('partial_rotary_factor', hf_config.get(
+        'partial_rotary_factor', rotary_dim / head_dim)), 'partial_rotary_factor')
+    if 'rotary_dim' in hf_config and factor * head_dim != rotary_dim:
+        _refuse('rotary_dim', 'it disagrees with partial_rotary_factor * head_dim')
+    if not 0 < factor <= 1 or int(head_dim * factor) % 2:
+        _refuse('rotary_dim', 'partial rotary must rotate a positive even head slice')
+    used.update(('rotary_dim', 'partial_rotary_factor', 'rope_parameters', 'rope_scaling', 'rope_theta'))
+    theta = records.number(entry.get('rope_theta', hf_config.get('rope_theta', 5000000.0)), 'rope_theta')
+    config = _base_config({**hf_config, 'head_dim': head_dim}, used, qk_norm=True,
+                          rope=_Ropes(theta), reads=frozenset())
+    config.update(qk_norm_scope='projection', partial_rotary_factor=factor,
+                  partial_rotary_type='default')
+    config['mixture'] = native_fields(Mixture)(
+        experts=records.integer(hf_config['num_local_experts'], 'num_local_experts'),
+        top_k=records.integer(hf_config['num_experts_per_tok'], 'num_experts_per_tok'),
+        score_function='sigmoid', bias=True)
+    used.update(('num_local_experts', 'num_experts_per_tok'))
+    return config
+
+
+_MINIMAX_M2_NAMES = (
+    ('block_sparse_moe.e_score_correction_bias', 'mlp.gate.e_score_correction_bias'),
+    ('mlp.e_score_correction_bias', 'mlp.gate.e_score_correction_bias'),
+    ('block_sparse_moe', 'mlp'), ('w1', 'gate_proj'), ('w2', 'down_proj'), ('w3', 'up_proj'),
+)
+
+
 def _deepseek_rope(hf_config: Mapping[str, object], used: set
                    ) -> tuple[float, Ramp | None]:
     """Return (rope_theta, yarn record) from either rope spelling.
