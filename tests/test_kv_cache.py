@@ -16,7 +16,17 @@ from flax import linen as nn
 
 from dew.nn.attention import cudnn_attention, cudnn_runs, scaled_dot_product_attention
 from dew.nn.kernels import bf16_dot_runs
-from dew.nn.kv_cache import KVCache, KVStore, _gather_pages, _gpu_paged, hadamard, quantize, rotated
+from dew.nn.kv_cache import (
+    KVCache,
+    KVStore,
+    _gather_pages,
+    _gpu_paged,
+    hadamard,
+    quantize,
+    rotated,
+    write_cache,
+)
+from dew.nn.scatter import DROPPED
 
 
 class Holder(nn.Module):
@@ -51,6 +61,57 @@ def outlier_keys(seed=0):
 
 def logits(queries, keys):
     return jnp.einsum("bqhd,bkhd->bhqk", queries, keys)
+
+
+@pytest.mark.parametrize("wide", [False, True])
+def test_a_cache_write_is_the_per_row_scatter_bit_for_bit(wide):
+    """A write as wide as its buffer gathers each slot's token rather than
+    scattering the tokens; either way the buffer comes back with exactly the
+    per-row scatter's bits: slots no token names keep theirs, a slot of -1
+    drops its token, and values change dtype once."""
+    rng = np.random.default_rng(int(wide))
+    for _ in range(25):
+        rows, tokens = int(rng.integers(1, 5)), int(rng.integers(2, 9))
+        slots = tokens if wide else int(rng.integers(tokens + 1, 2 * tokens + 2))
+        buffer = jnp.asarray(rng.normal(size=(rows, slots, 2, 3)), jnp.bfloat16)
+        values = jnp.asarray(rng.normal(size=(rows, tokens, 2, 3)), jnp.float32)
+        positions = np.full((rows, tokens), -1)
+        for row in range(rows):
+            taken = rng.permutation(slots)[:int(rng.integers(0, tokens + 1))]
+            positions[row, rng.choice(tokens, size=len(taken), replace=False)] = taken
+        def scatter(row, incoming, at):
+            return row.at[at].set(incoming.astype(row.dtype), mode="drop")
+
+        dropped = jnp.asarray(np.where(positions >= 0, positions, DROPPED))
+        scattered = jax.vmap(scatter)(buffer, values, dropped)
+        written = jax.jit(write_cache)(buffer, values, jnp.asarray(positions))
+        assert np.asarray(written).tobytes() == np.asarray(scattered).tobytes()
+        # The wide write scatters only the [rows, slots] token map, not the values.
+        scatters = [equation for equation in jax.make_jaxpr(write_cache)(buffer, values, positions).eqns
+                    if equation.primitive.name.startswith("scatter")]
+        widths = {equation.outvars[0].aval.ndim for equation in scatters}
+        assert widths == ({2} if wide else {4}), widths
+
+
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16, jnp.float8_e4m3fn, jnp.int8, jnp.float32,
+                                   jnp.bool_])
+def test_a_cache_write_moves_whole_words_with_the_same_bits(dtype):
+    """On a GPU a cache of one- or two-byte elements is written as uint32
+    words (`as_words`): XLA's scatter stores an element a thread, and
+    Qwen3-0.6B's admission write ran 2.3 times faster as words. The bits are
+    the per-row scatter's either way, and a word-wide or boolean cache is
+    written as it is."""
+    rng = np.random.default_rng(0)
+    buffer = jnp.asarray(rng.normal(size=(3, 6, 2, 8)) * 4).astype(dtype)
+    values = jnp.asarray(rng.normal(size=(3, 2, 2, 8)) * 4).astype(dtype)
+    positions = jnp.asarray([[2, -1], [-1, -1], [5, 0]], jnp.int32)
+    scattered = jax.vmap(lambda row, incoming, at: row.at[at].set(incoming, mode="drop"))(
+        buffer, values, jnp.where(positions >= 0, positions, DROPPED))
+    written = jax.jit(write_cache)(buffer, values, positions)
+    assert written.dtype == dtype and np.asarray(written).tobytes() == np.asarray(scattered).tobytes()
+    text = jax.jit(write_cache).lower(buffer, values, positions).compile().as_text() or ""
+    narrow = jnp.dtype(dtype).itemsize < 4 and dtype != jnp.bool_
+    assert ("u32[3,6,2," in text) == (narrow and jax.default_backend() == "gpu")
 
 
 def test_an_int8_cache_keeps_the_logits_outlier_key_channels_would_flatten():

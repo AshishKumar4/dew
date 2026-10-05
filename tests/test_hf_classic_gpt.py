@@ -163,7 +163,7 @@ def test_exact_nanogpt_architecture_trains_through_dew(bias):
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0))
     before = np.asarray(model.apply(variables, jnp.asarray(rows[:, :-1])))
     state = trainer.fit(data, steps=3)
-    after = np.asarray(model.apply(state.params, jnp.asarray(rows[:, :-1])))
+    after = np.asarray(model.apply(state.variables, jnp.asarray(rows[:, :-1])))
     def loss(logits):
         return float(optax.softmax_cross_entropy_with_integer_labels(logits, jnp.asarray(rows[:, 1:])).mean())
     assert np.isfinite(loss(after)) and loss(after) < loss(before)

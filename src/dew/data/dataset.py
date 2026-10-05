@@ -474,7 +474,9 @@ class Ramp:
     the ramp with nothing else saved. A stage lasts
     `ceil(samples / increments / batch)` steps, computed as one integer ratio
     rather than MaxText's two floating-point divisions, so the boundaries are
-    exact.
+    exact. Where the ramp ends, MaxText's loader drops what is left of its
+    buffered batch and Dew reads on, so from there a step reads later
+    records in MaxText than in Dew, though the batches match.
     """
 
     start: int

@@ -434,13 +434,27 @@ def test_pull_returns_the_snapshot_directory(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------------
 
 
+def assert_transformers_reads_the_run(export, task, ids):
+    """transformers' own class for the export's model_type loads its files
+    with a clean report (`decoder_export_reference.reference_model`) and,
+    over the same ids, holds the run's own logits to tests/reference_error.py's
+    rule: in fp32 the reference, in float64 the truth."""
+    from reference_error import assert_as_exact_as_the_reference
+
+    from tools.decoder_export_reference import Case, reference_logits
+
+    case = Case("run export", str(export))
+    ours = np.asarray(task.model.apply(task.variables, jnp.asarray(ids, jnp.int32)))
+    assert_as_exact_as_the_reference(ours, reference_logits(case, export, ids),
+                                     reference_logits(case, export, ids, wide=True), "run export logits")
+
+
 def test_a_trained_lm_run_exports_and_reloads_at_its_own_logits(tmp_path):
     """The whole way out of a run directory: run.json and the checkpoint in,
     a Hugging Face directory out, and `Pretrained.load` reads it back at the
-    logits the run's own task computes."""
+    logits the run's own task computes, as transformers does."""
     from test_inference import make_lm_run
 
-    import dew
     from dew.interop import Pretrained
 
     run = tmp_path / "run"
@@ -458,19 +472,143 @@ def test_a_trained_lm_run_exports_and_reloads_at_its_own_logits(tmp_path):
     ids = jnp.asarray([[3, 4, 5, 6]], jnp.int32)
     np.testing.assert_array_equal(np.asarray(reloaded.model.apply(reloaded.variables, ids)),
                                   np.asarray(task.model.apply(task.variables, ids)))
+    assert_transformers_reads_the_run(destination, task, np.asarray([[3, 4, 5, 6, 7, 8, 9, 10]]))
 
 
 def test_exporting_a_run_whose_model_has_no_published_layout_names_it(tmp_path):
     """A latent diffusion run: the denoiser is a native model with no file
-    to be written back into, so the refusal names the model and what does
-    export."""
+    to be written back into, so building its export bundle is refused,
+    naming the model and the task that loads the run."""
     from test_inference import make_run
 
     from dew.interop import Pretrained
 
     make_run(tmp_path)
-    with pytest.raises(ValueError, match="SimpleDiT has no published layout"):
-        Pretrained.from_run(str(tmp_path)).save(tmp_path / "export")
+    with pytest.raises(TypeError, match="SimpleDiT has no maintained exported bundle layout"):
+        Pretrained.from_run(str(tmp_path))
+
+
+FRESH_TRAINING = """
+import sys
+
+import grain.python as grain
+import jax.numpy as jnp
+import numpy as np
+import optax
+
+from dew.checkpoints import Checkpoints
+from dew.data import ByteTokenizer, Dataset, Loading
+from dew.inference import RunProcessor
+from dew.nn.backbones import CausalTransformer
+from dew.objectives.{module} import {objective}
+from dew.training import Trainer
+
+model = CausalTransformer(vocab_size=256, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
+                          max_seq_len=16, dtype=jnp.float32, attention_impl="xla")
+objective = {objective}(model, 8, ema_decay=None, processor=RunProcessor(ByteTokenizer()))
+rows = [{{"text": np.arange(9, dtype=np.int32)}} for _ in range(8)]
+data = Dataset.from_grain(grain.MapDataset.source(rows), batch=8, loading=Loading(workers=0))
+checkpoints = Checkpoints(sys.argv[1])
+Trainer(objective, optax.sgd(.01), key=0, checkpoints=checkpoints).fit(data, steps=1, checkpoint_every=1)
+checkpoints.wait()
+"""
+
+
+def test_a_run_trained_in_one_process_exports_from_a_fresh_one(tmp_path):
+    """`dew export` in a new process reads the run by its record alone: the
+    registry imports the module that registers each name the record holds,
+    so nothing the training process happened to import is needed. What it
+    writes, transformers reads at the run's own logits."""
+    import os
+    import subprocess
+
+
+    root = Path(__file__).resolve().parents[1]
+    env = {**{name: value for name, value in os.environ.items() if name != "XLA_FLAGS"},
+           "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(root / "src")}
+    program = FRESH_TRAINING.format(module="lm", objective="LMObjective")
+    trained = subprocess.run([sys.executable, "-c", program, str(tmp_path / "run")],
+                             capture_output=True, text=True, env=env, timeout=600)
+    assert trained.returncode == 0, trained.stderr[-2000:]
+    exported = subprocess.run([sys.executable, "-m", "dew.cli.main", "export", str(tmp_path / "run"),
+                               str(tmp_path / "export")],
+                              capture_output=True, text=True, env=env, timeout=600)
+    assert exported.returncode == 0, exported.stderr[-2000:]
+    assert (tmp_path / "export" / "model.safetensors").is_file()
+    assert_transformers_reads_the_run(tmp_path / "export", dew.pipeline(str(tmp_path / "run")),
+                                      np.arange(9).reshape(1, 9))
+
+
+def test_a_registry_imports_the_module_that_registers_a_name_and_no_other():
+    """A lookup of a name nothing has registered yet imports the module whose
+    decorator registers it, found in Dew's sources, with what that module
+    imports, and no other registering module (JEPA's objective, the eval
+    harness); a name no module registers still raises."""
+    import os
+    import subprocess
+
+    root = Path(__file__).resolve().parents[1]
+    env = {**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(root / "src")}
+    program = ("import sys\n"
+               "from dew.registry import objectives, solvers\n"
+               "assert 'dew.objectives.rl.ppo' not in sys.modules\n"
+               "print(objectives['ppo'].__module__, solvers['heun'].__name__)\n"
+               "print('dew.objectives.jepa' in sys.modules, 'dew.eval.harness' in sys.modules)\n"
+               "try:\n"
+               "    objectives['no_such_objective']\n"
+               "except KeyError as error:\n"
+               "    print('refused', 'no_such_objective' in str(error))\n")
+    done = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True, env=env,
+                          timeout=300)
+    assert done.returncode == 0, done.stderr[-2000:]
+    assert done.stdout.splitlines() == ["dew.objectives.rl.ppo Heun", "False False", "refused True"]
+
+
+REGISTRATIONS = """
+import importlib
+import json
+
+import dew.registry as registry
+
+index = registry._registering_modules()
+absent = set()
+for module in sorted({module for modules in index.values() for module in modules}):
+    try:
+        importlib.import_module(module)
+    except ModuleNotFoundError as missing:
+        if missing.name is None or missing.name.split(".")[0] == "dew":
+            raise
+        absent.add(module)  # an optional dependency this environment lacks
+drift = {}
+for attribute in dir(registry):
+    table = getattr(registry, attribute)
+    if not any(table is held for held in registry.REGISTRIES):
+        continue
+    indexed = {name for (named, name), modules in index.items()
+               if named == attribute and not set(modules) <= absent}
+    if indexed != set(table):
+        drift[attribute] = [sorted(indexed - set(table)), sorted(set(table) - indexed)]
+print(json.dumps({"tables": sum(1 for attribute in dir(registry)
+                                if any(getattr(registry, attribute) is held for held in registry.REGISTRIES)),
+                  "drift": drift}))
+"""
+
+
+def test_the_index_of_registrations_is_every_registration_dew_makes():
+    """The lookup's index reads the decorators off Dew's sources. Importing
+    every module it names fills each of the 11 registries with exactly the
+    names it attributes to them, so a registration it cannot see (a decorator
+    over several lines, an aliased registry) or a line it mistakes for one
+    fails here."""
+    import os
+    import subprocess
+
+    root = Path(__file__).resolve().parents[1]
+    env = {**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(root / "src")}
+    done = subprocess.run([sys.executable, "-c", REGISTRATIONS], capture_output=True, text=True, env=env,
+                          timeout=600)
+    assert done.returncode == 0, done.stderr[-2000:]
+    assert json.loads(done.stdout.splitlines()[-1]) == {"tables": 11, "drift": {}}
 
 
 def test_the_cli_exports_a_run_and_refuses_a_directory_that_is_not_one(tmp_path, capsys):
@@ -491,29 +629,31 @@ def test_the_cli_exports_a_run_and_refuses_a_directory_that_is_not_one(tmp_path,
         main(["export", str(tmp_path / "nothing"), str(tmp_path / "other")])
 
 
-def test_a_block_diffusion_run_exports_under_its_published_config(tmp_path):
-    """DiffusionGemma writes the reference's own encoder/decoder names, over
-    the published config the run recorded rather than a derived one."""
+def test_a_block_diffusion_run_writes_no_export_transformers_cannot_read(tmp_path):
+    """transformers' DiffusionGemmaForBlockDiffusion, the implementation the
+    checkpoint layout is for, builds experts and a vision tower, and takes
+    generation_config.json as a closed set of fields. Google's dense
+    text-only model has neither, and Dew's byte vocabulary has no files and
+    no field to be named in, so a run of either is refused before a file is
+    written (a run of the image-reading model on its own tokenizer exports:
+    test_diffusion_gemma_workflow.py)."""
     from test_inference import make_block_run
 
     from dew.interop import Pretrained
 
-    run = tmp_path / "run"
-    run.mkdir()
-    make_block_run(run)
-    destination = tmp_path / "export"
+    dense = tmp_path / "dense"
+    dense.mkdir()
+    make_block_run(dense, fixture="diffusion-gemma-sft")
+    with pytest.raises(ValueError, match="cannot read an export"):
+        Pretrained.from_run(str(dense), ema=False).save(tmp_path / "refused")
+    assert not (tmp_path / "refused").exists()
 
-    Pretrained.from_run(str(run), ema=False).save(destination)
-
-    reloaded = Pretrained.load(destination, dtype="float32", attention_impl="xla", max_seq_len=32)
-    task = dew.pipeline(str(run), ema=False)
-    # The export writes the layer scalars into the reference's buffers, so
-    # the reloaded tree is the source's shape, not the run's; what has to
-    # survive is the canvas the two decode.
-    wanted = task([[1, 5, 7]], 3, key=4).host()
-    actual = reloaded.block_generation()([[1, 5, 7]], 3, key=4).host()
-    np.testing.assert_array_equal(actual.tokens, wanted.tokens)
-    np.testing.assert_array_equal(actual.decoder_steps, wanted.decoder_steps)
+    byte = tmp_path / "byte"
+    byte.mkdir()
+    make_block_run(byte)
+    with pytest.raises(ValueError, match="no tokenizer files"):
+        Pretrained.from_run(str(byte), ema=False).save(tmp_path / "refused")
+    assert not (tmp_path / "refused").exists()
 
 
 def test_the_fid_converter_refuses_a_pickle_that_is_missing_a_key(tmp_path):

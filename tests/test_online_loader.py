@@ -507,9 +507,9 @@ class Ratio(Objective):
     def init(self, key, variables=None):
         return {"params": {"level": jnp.zeros(())}}
 
-    def loss(self, params, batch, step):
+    def loss(self, variables, batch, step):
         pixels = (jnp.asarray(batch["image"], jnp.float32) - 127.5) / 127.5
-        return jnp.mean((pixels - params["params"]["level"]) ** 2), Aux({})
+        return jnp.mean((pixels - variables["params"]["level"]) ** 2), Aux({})
 
 
 def _run(data, *, steps, checkpoints=None, checkpoint_every=None):
@@ -538,7 +538,7 @@ def test_a_streaming_run_trains_when_it_never_checkpoints(monkeypatch):
     assert int(state.step) == 6
     # The rows carry pixel values 1 to 24, so the level fits the mean of what
     # reached the objective; a batch of fabricated zeros fits -1.0.
-    assert -0.70 < float(state.params["params"]["level"]) < -0.60
+    assert -0.70 < float(state.variables["params"]["level"]) < -0.60
 
 
 def test_a_streaming_run_that_asks_for_checkpoints_is_refused(monkeypatch, tmp_path):

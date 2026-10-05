@@ -21,6 +21,7 @@ from jax.typing import DTypeLike
 
 from dew.nn.attention import (
     RMSNorm,
+    cached_validity,
     causal_attention_mask,
     chunk_mask,
     document_mask,
@@ -158,7 +159,7 @@ class Llama4Attention(nn.Module):
             key, value = append(key, value)
             key_positions = jnp.arange(key.shape[-3])
             mask = causal_attention_mask(
-                positions, key.shape[-3], key_valid=self.get_variable("cache", "cache_valid"))
+                positions, key.shape[-3], key_valid=cached_validity(self, key.shape[-3]))
             causal = False
         elif segment_ids is not None:
             inside = document_mask(segment_ids)[:, None]

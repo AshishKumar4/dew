@@ -20,7 +20,7 @@ from dew.diffusion.schedules import (
     KarrasVENoiseScheduler,
     SqrtContinuousNoiseScheduler,
 )
-from dew.diffusion.schedules.flow import Density
+from dew.diffusion.schedules.flow import Density, _token_mu
 from dew.diffusion.transforms import (
     DirectPredictionTransform,
     FlowMatchPredictionTransform,
@@ -145,13 +145,14 @@ class Karras:
 class Cosine:
     """The cosine beta table with v-prediction.
 
-    The table's P2 weight at its defaults (k = 1, gamma = 1) is 1 / (1 + SNR),
-    which makes the v loss an unweighted x_0 loss. `p2_loss_weight_gamma`
-    changes that.
+    The table is improved-diffusion's, its betas clipped at 0.999 so the last
+    step keeps some signal (`CosineNoiseScheduler`). Its P2 weight at its
+    defaults (k = 1, gamma = 1) is 1 / (1 + SNR), which makes the v loss an
+    unweighted x_0 loss. `p2_loss_weight_gamma` changes that.
     """
 
     timesteps: int = 1000
-    beta_end: float = 1.0
+    beta_end: float = 0.999
     p2_loss_weight_k: float = 1.0
     p2_loss_weight_gamma: float = 1.0
     min_snr_gamma: float | None = None
@@ -195,8 +196,8 @@ class ResolutionShift:
         if self.tokens is None:
             raise ValueError("a resolution shift needs the image's token count; set tokens "
                              "or build through DiffusionRunConfig, which fills it")
-        slope = (self.max_shift - self.base_shift) / (self.max_tokens - self.base_tokens)
-        return math.exp(self.base_shift + slope * (self.tokens - self.base_tokens))
+        return math.exp(_token_mu(self.tokens, self.base_tokens, self.max_tokens, self.base_shift,
+                                  self.max_shift))
 
 
 @presets("flow")

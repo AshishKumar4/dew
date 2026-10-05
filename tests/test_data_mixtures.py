@@ -567,27 +567,14 @@ def test_phases_are_a_list_of_ends_and_refuse_a_ramp(tmp_path):
 # The batch ramp: MaxText's schedule
 # --------------------------------------------------------------------------
 
-def maxtext_batches(start: int, increment: int, samples: int, final: int,
-                    steps: int) -> list[int]:
-    """The global batch MaxText's `RampupBatchManager` reads at each of
-    `steps` steps, as `utils/rampup_batch.py:53-101` computes it: the samples
-    since the last increment are accumulated, and the batch grows once they
-    reach `global_rampup_samples` over the number of increments."""
-    increments = (final - start) // increment
-    per_increment = samples / increments
-    batch, accumulated, reads = start, 0, []
-    for _ in range(steps):
-        reads.append(batch)
-        accumulated += batch
-        if accumulated >= per_increment:
-            batch = min(batch + increment, final)
-            accumulated = 0
-    return reads
+MAXTEXT_RAMP = json.loads(
+    (Path(__file__).resolve().parent / "fixtures" / "ramp" / "maxtext.json").read_text())
 
 
-def ramp_batches(ramp: Ramp, final: int, steps: int) -> list[int]:
-    """The global batch this ramp reads at each of `steps` steps."""
-    stages, records, reads = ramp.stages(final), 0, []
+def ramp_batches(ramp: Ramp, final: int, steps: int, records: int = 0) -> list[int]:
+    """The global batch this ramp reads at each of `steps` steps, from a
+    position of `records` records read."""
+    stages, reads = ramp.stages(final), []
     for _ in range(steps):
         stage = stages[max(index for index, stage in enumerate(stages)
                            if stage.records <= records)]
@@ -596,21 +583,26 @@ def ramp_batches(ramp: Ramp, final: int, steps: int) -> list[int]:
     return reads
 
 
-@pytest.mark.parametrize("start, increment, samples, final", [
-    (4, 2, 500, 8),
-    (8, 8, 64, 32),
-    (2, 1, 7, 5),
-    (16, 16, 1024, 64),
-])
-def test_the_ramp_reads_the_batch_maxtext_reads_at_every_step(start, increment,
-                                                              samples, final):
-    """Dew counts the global batch where MaxText counts a batch per device,
-    and computes a stage's length as one integer ratio where MaxText divides
+@pytest.mark.parametrize("case", MAXTEXT_RAMP["cases"], ids=lambda case: str(case["config"]))
+def test_the_ramp_reads_the_batch_maxtext_reads_at_every_step(case):
+    """MaxText's own `RampupBatchManager` at a pinned commit, as its
+    `RampUpDataLoader` drives it (tools/ramp_reference.py): the batch read
+    at each of 128 steps, through every stage and past the ramp's end, and
+    of a run resumed inside the second stage, which MaxText rebuilds by
+    replaying its updates and Dew reads off the records already read. Dew
+    counts the global batch where MaxText counts a batch per device, and
+    computes a stage's length as one integer ratio where MaxText divides
     twice in floating point; the schedule is the same schedule."""
-    ramp = Ramp(start=start, increment=increment, samples=samples)
+    config = case["config"]
+    devices = config["num_target_devices"]
+    ramp = Ramp(start=devices * config["per_device_batch_size_start"],
+                increment=devices * config["per_device_batch_size_increment"],
+                samples=config["global_rampup_samples"])
+    final = devices * config["per_device_batch_size"]
+    steps, resume = MAXTEXT_RAMP["steps"], case["resume_step"]
 
-    assert ramp_batches(ramp, final, 40) == maxtext_batches(
-        start, increment, samples, final, 40)
+    assert ramp_batches(ramp, final, steps) == case["batches"]
+    assert ramp_batches(ramp, final, steps - resume, sum(case["batches"][:resume])) == case["resumed"]
 
 
 def test_the_ramp_ends_on_the_runs_own_batch_and_stays_there():
@@ -834,13 +826,13 @@ class Regression(Objective):
     def init(self, key, variables=None):
         return self.model.init(key, np.zeros((1, FEATURES), np.float32))
 
-    def loss(self, params, batch, step):
+    def loss(self, variables, batch, step):
         import jax.numpy as jnp
 
         features = jnp.stack([jnp.sin(batch["id"].astype(jnp.float32) * (index + 1))
                               for index in range(FEATURES)], axis=-1)
         target = jnp.stack([features[:, 0] * 2, features[:, 1] - 1], axis=-1)
-        return jnp.mean((self.model.apply(params, features) - target) ** 2), Aux({})
+        return jnp.mean((self.model.apply(variables, features) - target) ** 2), Aux({})
 
 
 def regression_trainer(directory: Path) -> Trainer:
@@ -852,7 +844,7 @@ def regression_trainer(directory: Path) -> Trainer:
 
 def parameters(state) -> dict:
     return {"/".join(str(part) for part in path): np.asarray(leaf)
-            for path, leaf in jax.tree_util.tree_flatten_with_path(state.params)[0]}
+            for path, leaf in jax.tree_util.tree_flatten_with_path(state.variables)[0]}
 
 
 def assert_same(left: dict, right: dict, why: str) -> None:

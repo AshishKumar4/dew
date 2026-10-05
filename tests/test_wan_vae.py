@@ -26,10 +26,18 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from reference_error import assert_as_exact_as_the_reference
 from safetensors.numpy import save_file
 
 from dew.interop.diffusion import component_tensors
-from dew.nn.autoencoders.wan import WanRMSNorm, load_wan_vae, wan_vae_fields, wan_vae_path
+from dew.nn.autoencoders.wan import (
+    WanRMSNorm,
+    chunked_decode,
+    chunked_moments,
+    load_wan_vae,
+    wan_vae_fields,
+    wan_vae_path,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 FORWARD = 1e-5
@@ -122,6 +130,72 @@ def test_the_decode_matches_the_source(loaded, reference):
     print(f"decode gap {gap:.3g}")
     assert gap < FORWARD
     assert float(jnp.abs(pixels).max()) <= 1.0
+
+
+def widened(model, params):
+    """The model and its parameters in float64, for the truth the rule
+    measures from (call under x64)."""
+    return model.clone(dtype=jnp.float64), jax.tree.map(lambda leaf: np.asarray(leaf, np.float64), params)
+
+
+@pytest.mark.parametrize("frames", [3, 5])
+def test_a_chunked_walk_is_the_whole_clip_as_exactly_as_float32_allows(loaded, reference, frames):
+    """The decode one latent frame at a time and the encode the first frame
+    then four at a time, each convolution's last frames carried in the cache,
+    against the one-pass walk: no further from the float64 one-pass walk
+    than the float32 one-pass walk is. Observed RMS ratios at 3 and 5 latent
+    frames: decode 1.017 and 0.978, encode 0.976 and 0.825; the chunked and
+    one-pass walks lie at most 1.5e-6 (decode) and 4.9e-7 (encode) apart."""
+    autoencoder, params, _, _ = loaded
+    model = autoencoder.model
+    rng = np.random.default_rng(frames)
+    latents = (channels_last(reference["latent"]) if frames == 3
+               else rng.standard_normal((1, frames, 4, 6, model.latent)).astype(np.float32))
+    video = (channels_last(reference["video"]) if frames == 3
+             else rng.uniform(-1, 1, (1, 4 * frames - 3, 32, 48, 3)).astype(np.float32))
+    whole = {"decode": model.apply({"params": params}, latents, method=model.decode),
+             "moments": model.apply({"params": params}, video, method=model.moments)}
+    chunked = {"decode": chunked_decode(model, {"params": params}, latents),
+               "moments": chunked_moments(model, {"params": params}, video)}
+    with jax.enable_x64(new_val=True):
+        wide, wide_params = widened(model, params)
+        variables = {"params": wide_params}
+        truth = {"decode": wide.apply(variables, latents.astype(np.float64), method=wide.decode),
+                 "moments": wide.apply(variables, video.astype(np.float64), method=wide.moments)}
+        truth = {name: np.asarray(value) for name, value in truth.items()}
+    for name in whole:
+        assert chunked[name].shape == whole[name].shape
+        assert truth[name].dtype == np.float64
+        assert_as_exact_as_the_reference(np.asarray(chunked[name]), np.asarray(whole[name]), truth[name],
+                                         f"chunked {name}, {frames} latent frames")
+
+
+def test_the_autoencoder_walks_in_chunks_and_holds_one_chunk(loaded):
+    """`WanAutoencoder` decodes in chunks, and what a chunked decode holds
+    beyond the pixels it returns does not grow with the clip: from 3 latent
+    frames to 17, XLA's temporaries grow by less than twice the added
+    pixels (the scan's stacked frames and their join), where the one-pass
+    decode's grow by its activations, many times that."""
+    autoencoder, params, _, _ = loaded
+    model = autoencoder.model
+
+    def temporaries(decode, frames: int) -> int:
+        latents = jax.ShapeDtypeStruct((1, frames, 16, 24, model.latent), jnp.float32)
+        compiled = jax.jit(decode).lower(params, latents).compile()
+        return compiled.memory_analysis().temp_size_in_bytes
+
+    def whole(params, latents):
+        return model.apply({"params": params}, latents, method=model.decode)
+
+    chunked = {frames: temporaries(autoencoder._decode, frames) for frames in (3, 17)}
+    one_pass = {frames: temporaries(whole, frames) for frames in (3, 17)}
+    added_pixels = 4 * (17 - 3) * 128 * 192 * 3 * 4
+    assert chunked[17] - chunked[3] < 2 * added_pixels, (chunked, one_pass)
+    assert one_pass[17] - one_pass[3] > 10 * added_pixels, (chunked, one_pass)
+    latents = np.random.default_rng(0).standard_normal((1, 3, 4, 6, model.latent)).astype(np.float32)
+    np.testing.assert_array_equal(np.asarray(autoencoder.decode_video(params, latents)),
+                                  np.asarray(jax.jit(lambda p, z: chunked_decode(model, {"params": p}, z))(
+                                      params, latents)))
 
 
 @pytest.mark.network

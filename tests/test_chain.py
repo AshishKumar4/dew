@@ -95,10 +95,10 @@ def test_each_stage_continues_the_last(tmp_path):
     assert len(states) == 2
     assert (tmp_path / "chain" / "sft").is_dir()
     assert (tmp_path / "chain" / "dpo").is_dir()
-    first = [leaf.tobytes() for leaf in jax.tree.leaves(states[0].params)]
+    first = [leaf.tobytes() for leaf in jax.tree.leaves(states[0].variables)]
     frozen = [leaf.tobytes() for leaf in jax.tree.leaves(states[1].ema)]
     assert frozen == first
-    second = [leaf.tobytes() for leaf in jax.tree.leaves(states[1].params)]
+    second = [leaf.tobytes() for leaf in jax.tree.leaves(states[1].variables)]
     assert any(a != b for a, b in zip(first, second, strict=True))
 
 

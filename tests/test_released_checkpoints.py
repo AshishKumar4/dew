@@ -297,7 +297,7 @@ def test_one_trainer_step_moves_the_weights_by_the_objectives_gradient(scoring, 
     step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=None)
     gradient = jax.grad(lambda values: objective.scalar_loss(values, batch, step)[0])(variables)
 
-    held, updated, grads = flat(variables), flat(state.params), flat(gradient)
+    held, updated, grads = flat(variables), flat(state.variables), flat(gradient)
     assert int(state.updates) == 1 and held.keys() == updated.keys()
     difference = max(float(np.max(np.abs(np.asarray(updated[name])
                                          - (np.asarray(leaf) - RATE * np.asarray(grads[name])))))
@@ -320,14 +320,14 @@ def test_the_trained_export_reloads_and_transformers_reads_it(
     valid = np.asarray(inputs.token_fields["attention_mask"])
     export = tmp_path / "trained"
 
-    bundle.save(export, variables=state.params)
-    ours = np.asarray(bundle.model.apply(state.params, inputs.tokens, **inputs.kwargs()),
+    bundle.save(export, variables=state.variables)
+    ours = np.asarray(bundle.model.apply(state.variables, inputs.tokens, **inputs.kwargs()),
                       np.float32)
     again = Pretrained.load(export, dtype="float32", attention_impl="reference", max_seq_len=SEQ)
 
     assert again.model == bundle.model, "the exported config rebuilds a different model"
     assert again.processor is not None, "the export carries no tokenizer"
-    held = flat(state.params)
+    held = flat(state.variables)
     for name, leaf in flat(again.variables).items():
         assert np.array_equal(np.asarray(leaf), np.asarray(held[name])), name
     reloaded = np.asarray(again.model.apply(again.variables, inputs.tokens, **inputs.kwargs()),

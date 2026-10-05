@@ -49,14 +49,13 @@ def write_token_files(root, train_tokens, val_tokens, tokenizer="byte", eos_id=N
     return root
 
 
-def run_config(recipe, tokens, *args):
+def run_config(recipe, tokens, *args, model='{"emb_features": 16, "num_layers": 1, "num_heads": 2}'):
     # A dataset subcommand has to come before its flags, so `args` leads.
     return tyro.cli(tyro.conf.CascadeSubcommandArgs[recipe.LmRunConfig], args=[
         *args, "--data.path", str(tokens), "--data.seq-len", str(SEQ), "--data.loading.workers", "0",
         "--trainer.batch-size", "8", "--trainer.checkpoint-dir", str(tokens.parent / "runs"),
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
-        "--trainer.log-every", "1", "--model.dtype", "float32",
-        "--model.config", '{"emb_features": 16, "num_layers": 1, "num_heads": 2}'])
+        "--trainer.log-every", "1", "--model.dtype", "float32", "--model.config", model])
 
 
 def test_the_sampling_budget_decides_the_context_the_model_is_built_for():
@@ -120,7 +119,7 @@ def test_the_recipe_trains_on_tokenized_files(tmp_path, packed):
     assert drawn.host().tokens.shape == (1, len("the ") + 4) and len(drawn.text[0]) > 0
     np.testing.assert_array_equal(
         drawn.host().tokens,
-        TextGeneration(task.model, state.params)([list(b"the ")], 4, key=1,
+        TextGeneration(task.model, state.variables)([list(b"the ")], 4, key=1,
                                                  sampling=Sampling(temperature=0)).host().tokens)
     objective = LMObjective(task.model, SEQ, samples=recipe.build_samples(config))
     trained = objective.pipeline(state, processor=task.processor)
@@ -168,14 +167,15 @@ def test_weighted_corpora_from_different_vocabularies_are_refused(tmp_path):
 def test_the_recipe_trains_muonclip_with_the_clip_firing(tmp_path):
     """`--optim.optimizer muonclip` through `recipe.main`: the per-head maxima
     travel from the loss to the optimizer inside the compiled step, so the
-    query kernel lands away from a Muon run at the same seed. Observed on
-    CPU: 4 steps, kernels differ by 0.48."""
+    query kernel lands away from a Muon run at the same seed. The model has
+    no QK-norm, which the clip refuses, as docs/recipes.md says. Observed on
+    CPU: 4 steps, kernels differ by 0.32."""
     recipe = load_recipe()
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
 
     def run(name, *args):
-        config = run_config(recipe, tokens, "--trainer.name", name,
-                            "--trainer.epochs", "1", *args)
+        config = run_config(recipe, tokens, "--trainer.name", name, "--trainer.epochs", "1", *args,
+                            model='{"emb_features": 16, "num_layers": 1, "num_heads": 2, "qk_norm": false}')
         return recipe.main(config)
 
     muon = run("muon", "--optim.optimizer", "muon")
@@ -184,7 +184,7 @@ def test_the_recipe_trains_muonclip_with_the_clip_firing(tmp_path):
 
     def q_kernel(state):
         return np.asarray(
-            state.params["params"]["layers_0"]["self_attn"]["q_proj"]["kernel"])
+            state.variables["params"]["layers_0"]["self_attn"]["q_proj"]["kernel"])
 
     assert int(clipped.step) == int(muon.step) > 0
     assert bool(jnp.all(jnp.isfinite(q_kernel(clipped))))
@@ -207,7 +207,7 @@ def test_the_recipe_trains_a_quantized_trunk(tmp_path):
     state = recipe.main(config)
     assert int(state.step) > 0
     assert all(bool(jnp.all(jnp.isfinite(leaf)))
-               for leaf in jax.tree.leaves(state.params["params"]))
+               for leaf in jax.tree.leaves(state.variables["params"]))
     recorded = recipe.LmRunConfig.load(str(tmp_path / "runs" / "quant"))
     assert recorded.model.config["vocab_size"] == 256
     assert dataclasses.replace(recorded, model=config.model) == config
@@ -267,7 +267,7 @@ def test_the_recipe_continues_a_pretrained_decoder(tmp_path):
     recorded = recipe.LmRunConfig.load(str(tmp_path / "runs" / "continued"))
     assert recorded.model.config["vocab_size"] == 256
     assert dataclasses.replace(recorded, model=config.model) == config
-    kernel = state.params["params"]["layers_0"]["self_attn"]["q_proj"]["kernel"]
+    kernel = state.variables["params"]["layers_0"]["self_attn"]["q_proj"]["kernel"]
     assert kernel.shape == (16, 16)
     assert np.all(np.isfinite(np.asarray(kernel)))
 
@@ -288,7 +288,7 @@ def test_a_pretrained_run_starts_from_the_checkpoints_weights(tmp_path):
     expected = Pretrained.load(str(checkpoint), dtype="float32",
                                attention_impl="reference").variables
     for path, leaf in jax.tree_util.tree_flatten_with_path(expected["params"])[0]:
-        held = state.params["params"]
+        held = state.variables["params"]
         for entry in path:
             held = held[entry.key]
         np.testing.assert_array_equal(np.asarray(held), np.asarray(leaf))
@@ -385,7 +385,7 @@ def test_a_trained_export_round_trips_with_its_tokenizer(tmp_path):
 
     trained = tmp_path / "trained"
     Pretrained.load(str(checkpoint), dtype="float32", attention_impl="reference").save(
-        trained, variables=state.params)
+        trained, variables=state.variables)
     again = Pretrained.load(str(trained), dtype="float32", attention_impl="reference")
 
     assert again.processor is not None, "the saved export carries no tokenizer"
@@ -419,7 +419,7 @@ def test_the_recipe_balances_a_sparse_run(tmp_path):
                                            "--trainer.name", name, *extra,
                                            model_config=sparse))
         state = recipe.main(config)
-        return np.asarray(state.params["moe"]["layers_1"]["mlp"]["gate"]
+        return np.asarray(state.variables["moe"]["layers_1"]["mlp"]["gate"]
                           ["e_score_correction_bias"])
 
     balanced = run("balanced", "--balance-rate", "0.01")
@@ -446,7 +446,7 @@ def test_the_recipe_trains_the_prediction_depths_on_request(tmp_path):
                                            "--trainer.name", name, *extra,
                                            model_config=model_config))
         state = recipe.main(config)
-        return np.asarray(state.params["params"]["mtp_0"]["eh_proj"]["kernel"])
+        return np.asarray(state.variables["params"]["mtp_0"]["eh_proj"]["kernel"])
 
     assert np.any(run("mtp", "--mtp-weight", "0.3") != run("plain")), \
         "the term never reached the depth"
@@ -498,7 +498,7 @@ def test_masked_diffusion_trains_on_packed_documents(tmp_path):
     batch = next(iter(config.data.load(batch=8).val(DataPartition())))
     padding = np.asarray(batch["text_segment_ids"]) == 0
     assert padding.any() and not padding.all()
-    scored = objective.evaluate(state.params, batch, Step(jnp.asarray(0), jax.random.key(0), None))
+    scored = objective.evaluate(state.variables, batch, Step(jnp.asarray(0), jax.random.key(0), None))
     np.testing.assert_array_equal(np.asarray(scored.weights), ~padding)
 
 
@@ -578,7 +578,7 @@ def test_masked_diffusion_continues_a_pretrained_checkpoint(tmp_path):
     assert objective.seq_len == 12, "the objective has to take the window's whole width"
     held = jax.tree.leaves(original.variables)
     distance = max(float(jnp.max(jnp.abs(a - b)))
-                   for a, b in zip(jax.tree.leaves(state.params), held, strict=True))
+                   for a, b in zip(jax.tree.leaves(state.variables), held, strict=True))
     drawn = max(float(jnp.max(jnp.abs(a - b))) for a, b in zip(
         jax.tree.leaves(recipe.build_masked_objective(
             config, original.model, original.model_config, None).init(jax.random.key(0))), held, strict=True))
@@ -612,10 +612,10 @@ def test_official_block_diffusion_is_a_complete_pretrained_recipe(tmp_path):
     original = Pretrained.load(checkpoint, dtype="float32", attention_impl="xla")
     initial = recipe.build_block_objective(config, original.model, original.variables).init(jax.random.key(0))
     difference = max(float(jnp.max(jnp.abs(a - b)))
-                     for a, b in zip(jax.tree.leaves(state.params), jax.tree.leaves(initial), strict=True))
+                     for a, b in zip(jax.tree.leaves(state.variables), jax.tree.leaves(initial), strict=True))
     assert difference > 1e-5
     restored = recipe.main(config)
-    for wanted, actual in zip(jax.tree.leaves(state.params), jax.tree.leaves(restored.params),
+    for wanted, actual in zip(jax.tree.leaves(state.variables), jax.tree.leaves(restored.variables),
                               strict=True):
         np.testing.assert_array_equal(actual, wanted)
     task = dew.pipeline(str(tmp_path / "runs" / "block"), ema=False)
@@ -632,7 +632,10 @@ def test_a_trained_block_diffusion_tree_saves_back_over_its_source(tmp_path):
     constant and the objective moves into `params`, so a trained tree and the
     source it came from disagree about where that tensor lives. The tree is
     what is being written, so `source.save(destination)` takes the trained one
-    and the model read back out of that directory computes the trained loss."""
+    and the model read back out of that directory computes the trained loss.
+    The checkpoint is the published layout's own (experts and a vision
+    tower): Google's dense text-only model has no published reader, and its
+    export is refused (tests/test_block_sft.py)."""
     import optax
 
     from dew import Dataset, Trainer
@@ -640,29 +643,26 @@ def test_a_trained_block_diffusion_tree_saves_back_over_its_source(tmp_path):
     from dew.objectives.base import Step, thaw
     from dew.objectives.diffusion.block import BlockDiffusionObjective
 
-    checkpoint = REPO_ROOT / "tests/fixtures/hf/diffusion-gemma-sft"
+    checkpoint = REPO_ROOT / "tests/fixtures/hf/diffusion-gemma-workflow"
     source = Pretrained.load(checkpoint, dtype="float32", attention_impl="xla", max_seq_len=32)
     objective = BlockDiffusionObjective(source.model, prompt_length=4, num_canvases=2,
                                         pretrained=source.variables)
-    rows = jax.device_count()
-    with np.load(checkpoint / "reference.npz") as arrays:
-        batch = {name: np.concatenate([arrays[source_name]] * (rows // 2))
-                 for name, source_name in (("text", "tokens"), ("canvas_mask", "canvas_mask"),
-                                           ("encoder_target_mask", "encoder_target_mask"))}
+    rows = 2 * jax.device_count()
+    batch = {"text": np.random.default_rng(0).integers(3, 60, (rows, 12)).astype(np.int32)}
     data = Dataset(train=lambda partition: iter([batch, batch]), val=None, records=rows, batch=rows)
 
     state = Trainer(objective, optax.sgd(0.05), key=jax.random.key(0)).fit(data, steps=1, log_every=1)
-    source.save(tmp_path / "trained", variables=thaw(state.params))
+    source.save(tmp_path / "trained", variables=thaw(state.variables))
 
     read = Pretrained.load(tmp_path / "trained", dtype="float32", attention_impl="xla", max_seq_len=32)
     restored = BlockDiffusionObjective(read.model, prompt_length=4, num_canvases=2,
                                        pretrained=read.variables)
     rebuilt = restored.init(jax.random.key(0))
-    for wanted, actual in zip(jax.tree.leaves(state.params), jax.tree.leaves(rebuilt), strict=True):
+    for wanted, actual in zip(jax.tree.leaves(state.variables), jax.tree.leaves(rebuilt), strict=True):
         np.testing.assert_array_equal(actual, wanted)
     step = Step(step=jnp.asarray(0, jnp.int32), key=jax.random.key(1), ema=None)
     np.testing.assert_array_equal(restored.scalar_loss(rebuilt, batch, step)[0],
-                                  objective.scalar_loss(state.params, batch, step)[0])
+                                  objective.scalar_loss(state.variables, batch, step)[0])
 
 
 def test_the_shipped_lm_run_config_round_trips_through_its_record():

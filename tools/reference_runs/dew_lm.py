@@ -238,7 +238,7 @@ def train(args: argparse.Namespace, run: Run, probe: RouterProbe | None) -> tupl
     for step in range(run.total):
         window.before(step, loss)
         if probe is not None and step % args.probe_every == 0:
-            spent = probe(step, state.params)
+            spent = probe(step, state.variables)
             if window.times(step):
                 window.excluded += spent
         state, loss, metrics, _, _ = run.step(state, run.batch(step))
@@ -310,7 +310,7 @@ def main() -> None:
     probe = RouterProbe(run, args.probe_rows) if args.probe_every else None
     state, curves = train(args, run, probe)
     if probe is not None:
-        probe(run.total, state.params)
+        probe(run.total, state.variables)
     result = record(args, run, curves, probe, built_from)
     if args.profile_steps:
         write_record(args.out, result)

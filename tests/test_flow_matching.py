@@ -1,9 +1,13 @@
 """Flow matching on the linear (rectified flow) path.
 
 Covers the schedule invariants, the exact velocity round-trip, the claim that
-the DDIM and Euler solvers already integrate the flow ODE, and a toy
-end-to-end run proving the objective actually learns a distribution.
+the DDIM and Euler solvers already integrate the flow ODE, DiffusionObjective's
+loss and gradient against Diffusers' Flux training loss on the same draws
+(tools/flow_loss_reference.py), and a toy end-to-end run proving the
+objective actually learns a distribution.
 """
+
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -11,6 +15,7 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
+from reference_error import assert_as_exact_as_the_reference
 
 from dew.diffusion import FlowMatchPredictionTransform, Process, broadcast_rates, expand, presets
 from dew.diffusion.schedules import FlowMatchingScheduler
@@ -40,26 +45,30 @@ def test_endpoints_are_data_and_noise(rng):
     assert jnp.allclose(at_one, noise, atol=1e-6)
 
 
-def test_timesteps_are_logit_normal(rng):
-    schedule = FlowMatchingScheduler(logit_mean=-0.3, logit_std=1.4)
-    steps = schedule.sample_t(rng, 50000)
-    assert jnp.all((steps > 0) & (steps < 1))
-    logits = jnp.log(steps) - jnp.log1p(-steps)
-    assert abs(float(jnp.mean(logits)) - (-0.3)) < 0.05
-    assert abs(float(jnp.std(logits)) - 1.4) < 0.05
+DENSITIES = dict(np.load(Path(__file__).parent / "fixtures" / "flow" / "densities.npz"))
 
 
-def test_mode_times_are_the_sd3_training_scripts_draws(monkeypatch):
-    """SD3's mode density (Esser et al. 2024, Eq. 20) as diffusers' SD3
-    training scripts draw it, fed the same uniform draws."""
-    torch = pytest.importorskip("torch")
-    training = pytest.importorskip("diffusers.training_utils")
-    key, count = jax.random.PRNGKey(4), 4096
-    uniform = jax.random.uniform(key, (count,), jnp.float32)
-    monkeypatch.setattr(torch, "rand", lambda size, **_: torch.from_numpy(np.asarray(uniform)))
-    expected = training.compute_density_for_timestep_sampling("mode", count, mode_scale=1.29)
-    drawn = FlowMatchingScheduler(density="mode", mode_scale=1.29).sample_t(key, count)
-    np.testing.assert_allclose(np.asarray(drawn), expected.numpy(), rtol=1e-6, atol=1e-7)
+@pytest.mark.parametrize("case,fields", [
+    ("logit_normal", {"density": "logit_normal"}),
+    ("logit_normal_shifted", {"density": "logit_normal", "logit_mean": 0.5, "logit_std": 0.8}),
+    ("mode", {"density": "mode", "mode_scale": 1.29}),
+    ("mode_negative", {"density": "mode", "mode_scale": -0.5}),
+])
+def test_training_times_are_diffusers_sd3_densities(case, fields):
+    """SD3's training-time densities (Esser et al. 2024, section 3.1) as
+    Diffusers 0.34.0's `compute_density_for_timestep_sampling` computes them
+    (tools/flow_density_reference.py), on the draw `sample_t` makes from the
+    same key, held to the float64 rule: logit-normal at its default and
+    shifted, and the mode density on both sides of uniform."""
+    drawn = FlowMatchingScheduler(**fields).sample_t(jax.random.key(0), DENSITIES[case].shape[0])
+    assert_as_exact_as_the_reference(drawn, DENSITIES[case], DENSITIES[f"{case}_f64"], case)
+
+
+def test_uniform_training_times_are_the_draw_itself():
+    """Diffusers' fallback density is the uniform draw unchanged, as Dew's is."""
+    count = DENSITIES["uniform"].shape[0]
+    drawn = FlowMatchingScheduler(density="uniform").sample_t(jax.random.key(0), count)
+    np.testing.assert_array_equal(drawn, DENSITIES["uniform"])
 
 
 def test_cosmap_times_follow_the_papers_density(rng):
@@ -219,3 +228,58 @@ def test_flow_matching_learns_a_two_mode_mixture():
     # The third channel is a single zero-centred gaussian, not a mixture
     assert abs(float(jnp.mean(samples[:, 2]))) < 0.04
     assert abs(float(jnp.std(samples[:, 2])) - MODE_STD) < 0.04
+
+
+LOSS = np.load(Path(__file__).resolve().parent / "fixtures" / "flow" / "loss.npz")
+
+
+class Velocity(nn.Module):
+    """tools/flow_loss_reference.py's stand-in velocity network."""
+
+    @nn.compact
+    def __call__(self, x, timestep, train=False):
+        time = timestep.reshape(-1, 1, 1, 1) / 1000
+        weights = self.param("weights", nn.initializers.zeros, (4, *x.shape[1:]))
+        return (jnp.tanh(x) * weights[0] + jnp.sin(2 * time) * x * weights[1]
+                + jnp.cos(x) * time * weights[2] + time * weights[3])
+
+
+def test_the_static_shift_is_diffusers_schedulers():
+    """`FlowMatchEulerDiscreteScheduler(shift=3)`'s published sigma grid is
+    Dew's shifted noise rate at the scheduler's own unshifted grid."""
+    schedule = presets.Flow(shift=3.0)().schedule
+    np.testing.assert_allclose(np.asarray(schedule.rates(jnp.asarray(LOSS["grid"]))[1]),
+                               LOSS["grid_shifted_3"], rtol=2e-7, atol=0)
+
+
+@pytest.mark.parametrize("case", [0, 1], ids=["shift_1", "shift_3"])
+def test_the_flow_loss_and_its_gradient_are_diffusers_flux_trainings(case):
+    """DiffusionObjective's flow loss on its own draws against Diffusers'
+    Flux DreamBooth loss statements run as published on the same sigmas and
+    noise (its "logit_normal" weighting, ones): Dew's is half of it, as
+    Dew's L2 halves the squared error, within 1e-6 of the float64 run, and
+    twice its gradient in the network's 192 weights is held to the float64
+    run by the float64 rule. At shift 3 the drawn times move to the
+    shifted sigmas the static shift gives."""
+    from dew.inputs import Field, InputSpec
+    from dew.objectives.base import Step
+    from dew.objectives.diffusion import DiffusionObjective
+
+    shift = float(LOSS["shifts"][case])
+    pixels = LOSS["pixels"]
+    objective = DiffusionObjective(Velocity(), presets.Flow(shift=shift)(),
+                                   InputSpec(Field("image", pixels.shape[1:])), guidance=None, solver=Euler(),
+                                   steps=2, unconditional_prob=0.0, ema_decay=None)
+    variables = objective.init(jax.random.PRNGKey(0))
+    step = Step(step=jnp.asarray(0), key=jax.random.key(int(LOSS["key"])), ema=None)
+    times = objective.process.schedule.sample_t(jax.random.split(step.key, 5)[2], pixels.shape[0])
+    np.testing.assert_array_equal(np.asarray(objective.process.schedule.rates(times)[1]),
+                                  LOSS[f"sigmas_{case}"])
+
+    def loss(weights):
+        tree = {**variables, "params": {"weights": weights}}
+        return objective.scalar_loss(tree, {"image": pixels}, step)[0]
+
+    value, gradient = jax.value_and_grad(loss)(jnp.asarray(LOSS["weights"]))
+    np.testing.assert_allclose(2 * float(value), float(LOSS[f"loss_{case}_f64"]), rtol=1e-6)
+    assert_as_exact_as_the_reference(2 * gradient, LOSS[f"grad_{case}"], LOSS[f"grad_{case}_f64"], "gradient")

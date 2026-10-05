@@ -3,7 +3,8 @@
 A row of token ids is corrupted by masking each position with the process's
 probability at a drawn time. The model, a `CausalTransformer` with
 `causal=False`, reads the whole corrupted row and predicts the original
-tokens. The loss is the cross entropy at the masked positions, weighted by
+tokens. The loss is the cross entropy at the masked positions, under a distribution
+that gives the mask token no mass (MDLM's SUBS parameterization), weighted by
 the process's NELBO weight and averaged over every position of the batch.
 That average is the continuous-time negative ELBO the paper trains. The
 cross entropy is the LM objective's chunked one, which holds one vocabulary
@@ -75,6 +76,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         samples: int = 4,
         decode: Callable[[Sequence[int]], str] | None = None,
         pretrained: Variables | None = None,
+        processor: Processor | None = None,
     ):
         """Build an MDLM objective over `model` for `seq_len`-token rows.
 
@@ -84,7 +86,10 @@ class MaskedDiffusionObjective(Objective[Ratio]):
 
         `pretrained` is a released masked-diffusion checkpoint's variables as
         `Pretrained.load` returns them, so a run continues from LLaDA's or
-        Dream's weights instead of a fresh init; None draws the init."""
+        Dream's weights instead of a fresh init; None draws the init.
+
+        `processor` is what `pipeline` turns text into ids with and decodes
+        through, unless it is handed another; a run records its tokenizer."""
         if model.causal:
             raise ValueError(
                 "a masked diffusion model reads the whole corrupted row, so it needs "
@@ -98,16 +103,21 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         self.samples = samples
         self.decode = decode
         self.pretrained = pretrained
+        self.processor = processor
         self.inputs = InputSpec(sample=Field(TEXT_KEY, (seq_len,)))
         self.ema = None if ema_decay is None else EMASpec(decay=optax.constant_schedule(ema_decay))
         self._sample = jax.jit(self._sample_impl, static_argnames=("count",))
 
     def inference_record(self):
         from dew.config import ModelConfig, _to_json
+        from dew.inference.tasks import recorded_tokenizer
         from dew.registry import objectives
-        model = ModelConfig.from_model(self.model)
-        return {'objective': objectives.name_of(type(self)), 'model': _to_json(model, ModelConfig),
-                'seq_len': self.seq_len, 'sample_tokens': self.seq_len, 'tokenizer': None,
+        if not any(member is type(self) for member in objectives.values()):
+            return None
+        model = _to_json(ModelConfig.from_model(self.model), ModelConfig)
+        return {'objective': objectives.name_of(type(self)), 'model': model,
+                'seq_len': self.seq_len, 'sample_tokens': self.seq_len,
+                'tokenizer': recorded_tokenizer(self.processor),
                 'process': self.process.to_json(), 'solver': _to_json(self.solver, type(self.solver)),
                 'sampling_steps': self.steps}
 
@@ -117,7 +127,8 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         from dew.inference.tasks import MaskedGeneration
 
         return MaskedGeneration(self.model, self._pipeline_weights(state, ema), self.process,
-                                processor, solver=self.solver, steps=self.steps)
+                                self.processor if processor is None else processor,
+                                solver=self.solver, steps=self.steps)
 
     def held_variables(self) -> Variables | None:
         """Return the checkpoint this run continues from, or None for a fresh init."""
@@ -133,9 +144,9 @@ class MaskedDiffusionObjective(Objective[Ratio]):
                 "Pretrained.load and model.init return")
         return pretrained
 
-    def loss(self, params, batch, step: Step):
+    def loss(self, variables, batch, step: Step):
         tokens, losses, weights, counted, predicted, real = self._token_losses(
-            params, batch, step.key, train=True)
+            variables, batch, step.key, train=True)
         nelbo = Ratio(jnp.sum(losses * weights), jnp.sum(real, dtype=jnp.float32))
         correct = (predicted == tokens).astype(losses.dtype)
         return nelbo, Aux(metrics={
@@ -209,9 +220,12 @@ class MaskedDiffusionObjective(Objective[Ratio]):
             method=type(self.model).hidden_states,
         )
         head = self.model.apply(params, params["params"], method=type(self.model).head_weight)
+        # MDLM's SUBS parameterization gives the mask token no mass: it is
+        # never a target, so the partition and the prediction leave it out.
         losses, predicted, _ = chunked_cross_entropy(
             hidden, head, tokens, self.head_chunks,
-            softcap=self.model.final_logit_softcap, precision=self.model.precision)
+            softcap=self.model.final_logit_softcap, precision=self.model.precision,
+            excluded=self.process.mask_id)
         counted = is_masked.astype(losses.dtype)
         return tokens, losses, counted * self.process.weight(t)[:, None], counted, predicted, real
 

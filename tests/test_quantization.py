@@ -575,6 +575,69 @@ def test_a_quantized_text_task_matches_qwix_direct_logits_and_generation(dtype, 
           f"whole continuations={int(matches.all(axis=1).sum())}/{matches.shape[0]}")
 
 
+@pytest.fixture(scope="module")
+def flux_task(tmp_path_factory):
+    """The tiny FLUX source's text-to-image task: a matmul-only denoiser
+    beside CLIP and T5 towers and a VAE."""
+    import tarfile
+    from pathlib import Path
+
+    from dew.interop.pretrained import Pretrained
+
+    root = tmp_path_factory.mktemp("flux")
+    with tarfile.open(Path(__file__).parent / "fixtures/flux_source.tar.xz") as archive:
+        archive.extractall(root, filter="data")
+    return Pretrained.load(root / "pipeline", dtype="float32", attention_impl="xla").text_to_image()
+
+
+@pytest.mark.parametrize("dtype", ["int8", "fp8"])
+@pytest.mark.parametrize("weight_only", [False, True])
+def test_a_quantized_image_task_matches_qwix_direct_prediction_and_samples(flux_task, dtype, weight_only):
+    """Qwix 0.1.8 PTQ over the task's denoiser, built here from Qwix's own
+    rules, provider and `quantize_params`, is the reference for
+    `TextToImage.quantized`: the same quantized kernels, the denoiser's
+    prediction bitwise, and a decoded two-step sample bitwise. The towers
+    and the VAE keep their weights, leaf for leaf."""
+    import functools
+
+    from dew.training.quantization import METHODS
+
+    qwix = pytest.importorskip("qwix")
+    task = flux_task
+    served = task.quantized(Quantization(dtype=dtype, weight_only=weight_only))
+    qtype = jnp.int8 if dtype == "int8" else jnp.float8_e4m3fn
+    fields = {"op_names": ("dot_general", "einsum", "dot")} if weight_only else {}
+    rules = [qwix.QuantizationRule(module_path=".*", weight_qtype=qtype,
+                                  act_qtype=None if weight_only else qtype, **fields)]
+    reference = qwix.quantize_model(task.model, qwix.PtqProvider(rules),
+                                    methods=tuple(name for name in METHODS if hasattr(task.model, name)))
+    example = task.prepare("", key=0, steps=1)
+    own = {name: tree for name, tree in task.variables.items() if name not in ("encoders", "autoencoder")}
+    abstract = jax.eval_shape(functools.partial(reference.init, jax.random.key(0), example.noise,
+                                                jnp.zeros(example.noise.shape[:1]), **example.conditions))
+    expected = {**own, "params": qwix.quantize_params(jax.tree.map(jnp.asarray, own["params"]),
+                                                      abstract["params"])}
+    def assert_same_leaves(found, wanted):
+        for leaf, other in zip(jax.tree.leaves(found), jax.tree.leaves(wanted), strict=True):
+            np.testing.assert_array_equal(leaf, other)
+
+    assert_same_leaves(served.variables["params"], expected["params"])
+    for frozen in ("encoders", "autoencoder"):
+        assert_same_leaves(served.variables[frozen], task.variables[frozen])
+
+    latent = jax.random.normal(jax.random.key(3), example.noise.shape)
+    times = jnp.full(example.noise.shape[:1], 0.6)
+    served_denoiser = {name: tree for name, tree in served.variables.items() if name in own}
+    prediction = jax.jit(served.model.apply)(served_denoiser, latent, times, **example.conditions)
+    wanted = jax.jit(reference.apply)(expected, latent, times, **example.conditions)
+    np.testing.assert_array_equal(prediction, wanted)
+    unquantized = task.model.apply(own, latent, times, **example.conditions)
+    assert float(jnp.abs(prediction - unquantized).max()) > 1e-3
+    direct = dataclasses.replace(task, model=reference, variables={**task.variables, **expected})
+    np.testing.assert_array_equal(served(["a red bird"], steps=2, key=1).host().images,
+                                  direct(["a red bird"], steps=2, key=1).host().images)
+
+
 @pytest.mark.mesh
 def test_quantizing_resident_weights_keeps_their_parameter_shards():
     from dew.inference import TextGeneration
@@ -622,6 +685,36 @@ def test_quantizing_host_weights_keeps_numpy_storage_and_matches_qwix():
                                   jax.jit(expected.model.apply)(expected.variables, prompt))
     np.testing.assert_array_equal(served(prompt, 3, key=7).host().tokens,
                                   expected(prompt, 3, key=7).host().tokens)
+
+
+def test_quantizing_packed_pipeline_weights_matches_the_canonical_quantized_model():
+    from pathlib import Path
+
+    import dew
+    from dew.inference.serving import Server
+    from dew.interop import Pretrained
+    from dew.sampling import Sampling
+
+    pytest.importorskip("qwix")
+    directory = Path(__file__).parent / "fixtures/hf/llama-tiny"
+    spec = Quantization(weight_only=True, patterns=(".*_proj",))
+    canonical = Pretrained.load(directory, dtype="float32").text_generation(
+        sampling=Sampling(temperature=0, eos_id=None))
+    packed = dew.pipeline(str(directory), dtype="float32")
+    reference = canonical.quantized(spec)
+    served = packed.quantized(spec)
+    tokens = jnp.asarray([[1, 2, 3]], jnp.int32)
+    np.testing.assert_allclose(served.model.apply(served.variables, tokens),
+                               reference.model.apply(reference.variables, tokens), atol=2e-6, rtol=2e-6)
+    expected = reference(tokens, 4, key=5).host()
+    actual = served(tokens, 4, key=5).host()
+    np.testing.assert_array_equal(actual.tokens, expected.tokens)
+    np.testing.assert_allclose(actual.raw_log_probs, expected.raw_log_probs, atol=2e-6, rtol=2e-6)
+    np.testing.assert_allclose(actual.behavior_log_probs, expected.behavior_log_probs, atol=2e-6, rtol=2e-6)
+    server = Server.from_task(served, slots=max(2, jax.device_count()), capacity=64)
+    drawn = server([[1, 2, 3]], 4, key=5)[0].host()
+    np.testing.assert_array_equal(drawn.tokens, expected.tokens)
+    np.testing.assert_allclose(drawn.raw_log_probs, expected.raw_log_probs, atol=2e-6, rtol=2e-6)
 
 
 def test_a_quantized_text_task_without_qwix_names_the_install_extra(monkeypatch):
@@ -854,8 +947,8 @@ def test_stochastic_rounding_draws_from_its_own_stream():
     variables = model.init(jax.random.key(2), values)
     quantized = Quantization(bwd_qtype="int8", bwd_stochastic_rounding="uniform").apply(model)
 
-    def loss(params, key):
-        result = quantized.apply({"params": params}, values,
+    def loss(variables, key):
+        result = quantized.apply({"params": variables}, values,
                                  rngs={"stochastic_rounding": key})
         return jnp.mean(result ** 2)
 
@@ -928,8 +1021,8 @@ def test_the_trainer_knob_quantizes_the_objective_a_run_trains(tmp_path):
     noise_level = jnp.ones((1,), jnp.float32)
     # Compiled, as a run computes: XLA:GPU compiles an int8 convolution only
     # with its dequantization fused in, and eagerly the convolution runs alone.
-    quantized_out = jax.jit(objective.model.apply)(state.params, image, noise_level)
-    plain_out = jax.jit(plain.model.apply)(state.params, image, noise_level)
+    quantized_out = jax.jit(objective.model.apply)(state.variables, image, noise_level)
+    plain_out = jax.jit(plain.model.apply)(state.variables, image, noise_level)
     assert float(jnp.max(jnp.abs(quantized_out - plain_out))) > 0.0
 
 
@@ -943,7 +1036,7 @@ def test_an_objective_that_trains_no_single_model_is_refused(tmp_path):
         def init(self, key, variables=None):
             return {"params": {}}
 
-        def loss(self, params, batch, step):
+        def loss(self, variables, batch, step):
             return jnp.zeros(()), Aux({})
 
     config = diffusion_run(tmp_path, quantization=Quantization())

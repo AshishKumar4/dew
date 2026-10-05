@@ -100,8 +100,8 @@ def test_device_timeline_covers_nested_and_disjoint_kernels(
 
 def test_every_small_case_builds_its_trainer():
     """The small preset runs every registry architecture in one process, and
-    one case its model refuses ends the sweep: uvit has no mlp_ratio, and
-    the preset gave it one."""
+    one case its model refuses ends the sweep: a field a model does not
+    have, such as an mlp_ratio given to a model without one."""
     tool = _benchmark_step()
     for case in tool.small_cases('bfloat16'):
         tool.build_trainer(case)

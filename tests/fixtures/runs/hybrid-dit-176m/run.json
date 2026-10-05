@@ -1,4 +1,5 @@
 {
+  "adversarial": null,
   "alignment": null,
   "audio": null,
   "autoencoder": {
@@ -49,6 +50,7 @@
   "lora": null,
   "mean_flow": null,
   "model": {
+    "adapter": null,
     "architecture": "hybrid_dit",
     "attention_impl": "auto",
     "config": {
@@ -67,7 +69,8 @@
     },
     "dtype": "float32",
     "matmul_precision": null,
-    "param_dtype": null
+    "param_dtype": null,
+    "quantization": null
   },
   "objective": "diffusion",
   "optim": {

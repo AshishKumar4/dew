@@ -1558,7 +1558,8 @@ class CausalTransformer(nn.Module):
         return prediction, self._logits(x)
 
     def states_and_logits_at(self, tokens, slots, **kwargs):
-        """The prediction input states, and the logits of one slot per row.
+        """The prediction input states, and the logits of one slot per row,
+        or of `[rows, K]` slots.
 
         A prefill scores the position the first draw reads, `slots`, and no
         other: the head over every prompt position is the largest array the
@@ -1567,7 +1568,8 @@ class CausalTransformer(nn.Module):
         features] of work.
         """
         x, prediction = self.hidden_and_mtp_inputs(tokens, **kwargs)
-        return prediction, self._logits(x[jnp.arange(x.shape[0]), slots])
+        rows = jnp.arange(x.shape[0]).reshape(-1, *(1,) * (jnp.ndim(slots) - 1))
+        return prediction, self._logits(x[rows, slots])
 
     def _logits(self, x):
         """The shared fp32 head over `x`: what `__call__` and every MTP depth score with."""
@@ -1744,7 +1746,7 @@ class CausalTransformer(nn.Module):
                               input_embeddings=None,
                               attention_mask=None, image_groups=None, rotary_positions=None,
                               attention_pairwise_mask=None, attention_key_positions=None,
-                              routed_experts=None, routed=None, media_mask=None):
+                              routed_experts=None, routed=None, media_mask=None, admitted=None):
         """The final normalized states and the prediction depth's input.
 
         V4's depth reads the raw residual streams before the collapse head and final
@@ -1762,11 +1764,12 @@ class CausalTransformer(nn.Module):
         (vLLM's `routed_experts`, SGLang's `meta_info.routed_experts`) with `routed`
         `[B, S]` marking covered tokens (`dew.nn.moe.Routes`). `media_mask` [B, S]
         marks positions a media encoder fills, which engram keeps out of n-grams
-        and a media-biased router selects for.
+        and a media-biased router selects for. `admitted` makes a cached call a
+        serving step's mixed one (`dew.nn.inputs.Admitted`).
         """
         attention_metadata = self._attention_metadata(
             tokens, decode, positions, attention_mask, image_groups, rotary_positions,
-            attention_pairwise_mask, attention_key_positions, media_mask)
+            attention_pairwise_mask, attention_key_positions, media_mask, admitted)
         # The stack's entry and exit sit where the batch does, so neither the
         # lookup nor the head is computed whole on the shards of an axis that
         # splits the rows or the positions.
@@ -1817,7 +1820,7 @@ class CausalTransformer(nn.Module):
 
     def _attention_metadata(self, tokens, decode: bool, positions, attention_mask, image_groups,
                             rotary_positions, pairwise_mask, key_positions,
-                            media_mask) -> AttentionMetadata | None:
+                            media_mask, admitted=None) -> AttentionMetadata | None:
         """What the layers read beside the residual, None for a call that
         carries none of it: the masks and positions `hidden_and_mtp_inputs`
         takes, the token ids a hash router selects by, the engram layers'
@@ -1835,12 +1838,13 @@ class CausalTransformer(nn.Module):
                       else self.engram_hashes(tokens, attention_mask, positions, decode, media_mask))
         if (attention_mask is None and image_groups is None and rotary_positions is None
                 and pairwise_mask is None and key_positions is None and not self.hash_layers
-                and engram_ids is None and media_mask is None):
+                and engram_ids is None and media_mask is None and admitted is None):
             return None
         return AttentionMetadata(
             valid=attention_mask, image_groups=image_groups, rotary_positions=rotary_positions,
             pairwise_mask=pairwise_mask, key_positions=key_positions,
-            token_ids=tokens if self.hash_layers else None, engram_ids=engram_ids, media=media_mask)
+            token_ids=tokens if self.hash_layers else None, engram_ids=engram_ids, media=media_mask,
+            admitted=admitted)
 
     def stack(self, x, *, train: bool, decode: bool, positions, segment_ids,
               per_layer_input, attention_metadata=None):
@@ -1856,7 +1860,10 @@ class CausalTransformer(nn.Module):
         leaves alone.
         """
         stages = pipeline_stages()
-        if self.is_initializing() and stages == 1 and not decode:
+        # A seeded initialization (PTQ's abstract annotation pass) reads the
+        # supplied layout; the scan's init=True pass would draw over it first.
+        if (self.is_initializing() and stages == 1 and not decode
+                and not self.has_variable('params', 'layers_0')):
             groups = scan_groups(self.specs, self.bank_layers)
             if any(count > 1 for _, count in groups):
                 view = StackView(groups)

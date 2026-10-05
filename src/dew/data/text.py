@@ -80,6 +80,9 @@ class ByteTokenizer:
     input, so a generated sequence rounds back to text byte for byte.
     """
 
+    name = "byte"
+    """What `tokenizer_for` resolves back to this vocabulary, as a run records it."""
+
     def __init__(self):
         self.vocab_size = 256
         self.eos_id = 255

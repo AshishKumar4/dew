@@ -14,13 +14,18 @@ freezes it is both updates at once, on the same latent, times and noise.
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
 from jax.typing import ArrayLike
 
 from dew.objectives.base import Variables
+
+if TYPE_CHECKING:
+    from dew.nn.autoencoders import AutoEncoder
 
 AUTOENCODER = "autoencoder"
 """Where the trained autoencoder's parameters sit in `params`."""
@@ -56,6 +61,21 @@ class EndToEnd:
         scale = jnp.asarray(scale, jnp.float32)
         return {"mean": jnp.broadcast_to(jnp.asarray(shift, jnp.float32), (channels,)),
                 "var": jnp.broadcast_to(1.0 / scale ** 2, (channels,))}
+
+    def tuned(self, autoencoder: AutoEncoder, variables: Variables) -> tuple[AutoEncoder, Variables]:
+        """The autoencoder a task over a tuned run's `variables` decodes with,
+        and the variables with its weights under `autoencoder`: the trained
+        weights at `params/autoencoder`, its latents shifted by the running
+        mean and scaled by the running variance's reciprocal square root,
+        without the batch norm's epsilon, as REPA-E's
+        `SiT.extract_latents_stats` gives the scale its sampling
+        denormalizes with."""
+        tuned = copy.copy(autoencoder)
+        statistics = variables[LATENT_STATS]
+        tuned.latent_shift = statistics["mean"]
+        tuned.latent_scale = jax.lax.rsqrt(statistics["var"])
+        tuned.params = variables["params"][AUTOENCODER]
+        return tuned, {**variables, "autoencoder": tuned.params}
 
     def normalized(self, latents: jax.Array, statistics: Variables) -> jax.Array:
         """`latents` under the running statistics: the batch norm in eval mode."""

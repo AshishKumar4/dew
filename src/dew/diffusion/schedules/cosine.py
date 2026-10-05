@@ -1,5 +1,7 @@
 """The cosine beta table of Nichol and Dhariwal 2021."""
 
+import math
+
 import numpy as np
 
 from .discrete import DiscreteNoiseScheduler
@@ -7,13 +9,15 @@ from .discrete import DiscreteNoiseScheduler
 
 def cosine_beta_schedule(timesteps, start_angle=0.008, end_angle=0.999):
     """Nichol and Dhariwal 2021, Eq. 17: the cumulative alpha follows
-    cos^2((t / T + s) / (1 + s) * pi / 2), s = start_angle, and each beta is
-    clipped at end_angle."""
-    ts = np.linspace(0, 1, timesteps + 1, dtype=np.float64)
-    alphas_bar = np.cos((ts + start_angle) / (1 + start_angle) * np.pi / 2) ** 2
-    alphas_bar = alphas_bar / alphas_bar[0]
-    betas = 1 - (alphas_bar[1:] / alphas_bar[:-1])
-    return np.clip(betas, 0, end_angle)
+    f(t) = cos^2((t + s) / (1 + s) * pi / 2) at t = i / T, s = start_angle,
+    and beta_i = 1 - f((i + 1) / T) / f(i / T), clipped at end_angle. The
+    arithmetic is improved-diffusion's `betas_for_alpha_bar`, operation for
+    operation and in scalar `math.cos` (NumPy's vectorized cosine rounds a
+    few arguments differently), so the table is the authors' to the bit."""
+    def alpha_bar(t):
+        return math.cos((t + start_angle) / (1 + start_angle) * math.pi / 2) ** 2
+    return np.array([min(1 - alpha_bar((i + 1) / timesteps) / alpha_bar(i / timesteps), end_angle)
+                     for i in range(timesteps)], np.float64)
 
 
 class CosineNoiseScheduler(DiscreteNoiseScheduler):

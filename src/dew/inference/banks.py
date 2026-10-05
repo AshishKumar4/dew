@@ -218,7 +218,7 @@ class CheckpointBanks(LayerBanks):
     def shapes(self) -> Variables:
         if self.ema and self.stored.get("ema") is None:
             raise ValueError("the run keeps no EMA; read the live weights with ema=False")
-        return self.stored["params"]
+        return self.stored["variables"]
 
     def entry(self, placement: Placement) -> Variables:
         return self._restored(placement)
@@ -239,13 +239,13 @@ class CheckpointBanks(LayerBanks):
         from dew.checkpoints import Checkpoints
 
         shapes = narrowed(self.shapes(), placement)
-        template = {"params": _typed(shapes, narrowed(placement, shapes))}
+        template = {"variables": _typed(shapes, narrowed(placement, shapes))}
         if self.ema:
             averaged = narrowed(self.stored["ema"], placement)
             if averaged:
                 template["ema"] = _typed(averaged, narrowed(placement, averaged))
         values, _ = Checkpoints(self.directory).restore(template, step=self.step)
-        return merge(values["params"], values["ema"]) if "ema" in template else values["params"]
+        return merge(values["variables"], values["ema"]) if "ema" in template else values["variables"]
 
 
 @dataclasses.dataclass(frozen=True)

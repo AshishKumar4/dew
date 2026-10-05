@@ -59,8 +59,8 @@ def test_qwen35_moe_conditioning_has_finite_trainable_gradients():
     inputs = loaded.processor(json.loads((DIRECTORY / 'prompts.json').read_text()),
                               images=[[images[0]], [images[1], images[2]]])
     mask = inputs.token_fields['attention_mask'][:, 1:]
-    def loss(params):
-        logits = loaded.model.apply({'params': params}, inputs.tokens, **inputs.kwargs())[:, :-1]
+    def loss(variables):
+        logits = loaded.model.apply({'params': variables}, inputs.tokens, **inputs.kwargs())[:, :-1]
         values = optax.softmax_cross_entropy_with_integer_labels(logits, inputs.tokens[:, 1:])
         return jnp.sum(jnp.where(mask, values, 0)) / jnp.sum(mask)
     value, gradient = jax.jit(jax.value_and_grad(loss))(loaded.variables['params'])

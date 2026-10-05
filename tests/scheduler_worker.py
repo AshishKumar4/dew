@@ -104,7 +104,7 @@ def main() -> None:
     final = trainer.fit(data, steps=1, log_every=1, checkpoint_every=None)
     rows = multihost_utils.process_allgather({name: trained[0][name] for name in PACKED})
     leaves = {jax.tree_util.keystr(path): np.asarray(multihost_utils.process_allgather(leaf, tiled=True))
-              for path, leaf in jax.tree_util.tree_flatten_with_path(final.params["params"])[0]}
+              for path, leaf in jax.tree_util.tree_flatten_with_path(final.variables["params"])[0]}
     if process == 0:
         np.savez(args.out.with_suffix(".npz"), **leaves)
         args.out.write_text(json.dumps({

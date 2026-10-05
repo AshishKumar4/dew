@@ -133,7 +133,15 @@ def test_an_audio_conditioned_video_run_learns_and_samples_from_audio(towers, tm
     """A run config selects the audio condition over a video dataset's clips:
     the clips' audio reaches the model through the dataset's own `audio`
     field, training on it lowers the loss, and sampling follows the audio
-    it is handed."""
+    it is handed.
+
+    The loss is the denoising loss over drawn noise levels and noise, so it
+    is scored before and after training on the same 64 draws, and the drop
+    is held to a test rather than a share: training lowered the expected
+    loss when the paired drops' t statistic clears Student's t with 63
+    degrees of freedom at one in a billion, 7.0
+    (scipy.stats.t.isf(1e-9, 63)). A run that learns nothing scores near 0;
+    this one scored 15.9, on the pixel regime's sigmas a pixel run draws."""
     pytest.importorskip("moviepy.config", reason="needs the av extra")
     for hertz in range(220, 1100, 110):
         _clip(tmp_path / f"{hertz}.avi", hertz)
@@ -151,17 +159,19 @@ def test_an_audio_conditioned_video_run_learns_and_samples_from_audio(towers, tm
     batch = next(data.load(batch=8, tokenize=objective.inputs.tokenize).train(DataPartition()))
     assert set(batch) == {"video", "audio"}
 
-    keys = jax.random.split(jax.random.PRNGKey(1), 8)
+    keys = jax.random.split(jax.random.PRNGKey(7), 64)
+    scored = jax.jit(lambda variables, key: objective.loss(
+        variables, batch, Step(jnp.asarray(0), key, None))[0].total)
 
-    def loss(params):
-        return float(np.mean([objective.loss(params, batch, Step(jnp.asarray(0), key, None))[0].total
-                              for key in keys]))
+    def losses(variables):
+        return np.asarray([float(scored(variables, key)) for key in keys])
 
-    before = loss(objective.init(jax.random.PRNGKey(0)))
+    before = losses(objective.init(jax.random.PRNGKey(0)))
     state = Trainer(objective, optax.adam(3e-3), key=jax.random.PRNGKey(0)).fit(
         data.load(batch=8, tokenize=objective.inputs.tokenize), steps=40, log_every=100)
-    after = loss(state.params)
-    assert after < 0.7 * before
+    drop = before - losses(state.variables)
+    statistic = drop.mean() / (drop.std(ddof=1) / np.sqrt(drop.size))
+    assert statistic > 7.0, (statistic, drop.mean())
 
     pipe = objective.pipeline(state, ema=False)
     low, high = (pipe([{"audio": _tone(hertz, data.audio_seconds)}], key=0).host().images

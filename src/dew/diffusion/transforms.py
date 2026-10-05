@@ -142,7 +142,10 @@ class KarrasPredictionTransform(PredictionTransform):
 
     The model sees c_in x_t and its raw output F is read as
     x_0 = c_skip x_t + c_out F. Every denominator is at least sigma_data, so
-    none needs a guard.
+    none needs a guard. The loss compares that x_0 with the clean sample,
+    so the target is x_0 and a weight defined on the x_0 loss, min-SNR's,
+    applies unconverted; EDM's lambda = 1 / c_out^2 is the schedule's own
+    weight on it.
 
     `velocity` is Diffusers 0.34.0's EDM `prediction_type="v_prediction"`,
     whose `precondition_outputs` negates c_out, so the model's output is the
@@ -165,11 +168,6 @@ class KarrasPredictionTransform(PredictionTransform):
     def get_input_scale(self, rates):
         _, sigma = rates
         return 1 / jnp.sqrt(self.sigma_data ** 2 + sigma ** 2)
-
-    def target_error_scale(self, snr):
-        # x_0 error is c_out times the raw error, and alpha = 1 here so
-        # sigma^2 = 1 / SNR
-        return 1 / self.sigma_data ** 2 + snr
 
 
 class ConsistencyBoundary(PredictionTransform):
@@ -287,14 +285,18 @@ class MinSNR:
     """Weights the loss with min-SNR-gamma (Hang et al. 2023).
 
     min(SNR, gamma) on the x_0 loss, converted into the space the model
-    trains in. It replaces the schedule's own weight.
+    trains in. It replaces the schedule's own weight. At zero SNR (a table
+    whose last step keeps no signal) the weight is one, as the authors'
+    code sets it: the epsilon conversion is 0 / 0 there.
     """
 
     gamma: float
 
     def __call__(self, schedule, prediction, t):
         snr = schedule.snr(t)
-        return jnp.minimum(snr, self.gamma) / prediction.target_error_scale(snr)
+        scale = prediction.target_error_scale(snr)
+        weight = jnp.minimum(snr, self.gamma) / jnp.where(snr == 0, 1.0, scale)
+        return jnp.where(snr == 0, 1.0, weight)
 
 
 @dataclass(frozen=True)

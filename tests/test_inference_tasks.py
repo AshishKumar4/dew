@@ -133,11 +133,11 @@ def test_a_pretrained_bundle_fine_tunes_identically_to_explicit_wiring():
         data, steps=1, log_every=100, checkpoint_every=None) for objective in (explicit, bundled)]
     assert int(states[1].updates) == 1
     for actual, expected in zip(
-        jax.tree.leaves(states[1].params), jax.tree.leaves(states[0].params), strict=True
+        jax.tree.leaves(states[1].variables), jax.tree.leaves(states[0].variables), strict=True
     ):
         np.testing.assert_array_equal(actual, expected)
     assert any(not np.array_equal(actual, initial) for actual, initial in
-               zip(jax.tree.leaves(states[1].params), jax.tree.leaves(source.variables), strict=True))
+               zip(jax.tree.leaves(states[1].variables), jax.tree.leaves(source.variables), strict=True))
 
 
 def test_a_pretrained_bundle_refuses_a_second_initial_tree():
@@ -348,23 +348,24 @@ def test_a_placed_diffusion_gemma_task_keeps_its_rows_sharded_and_draws_the_same
 
 @pytest.mark.parametrize("kind", ["dpo", "grpo", "ppo"])
 def test_pipeline_publishes_the_updated_policy_not_the_frozen_reference(kind, tmp_path):
-    from dataclasses import asdict
-
     import dew
-    from dew.config import ModelConfig
     from dew.data import Dataset
     from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.lm import Samples
     from dew.objectives.rl import DPOObjective, GRPOObjective, PPOObjective, ValueHead
     from dew.training import Checkpoints, Trainer
 
     model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1, num_heads=2,
                               mlp_features=32, max_seq_len=8, dtype="float32", attention_impl="xla")
+    sampling = Sampling(temperature=0)
+    # One previewed token under greedy sampling: the budget and policy the run records.
+    samples = Samples([1], 1, sampling=sampling)
     if kind == "dpo":
-        objective = DPOObjective(model, seq_len=2)
+        objective = DPOObjective(model, seq_len=2, samples=samples)
     elif kind == "grpo":
-        objective = GRPOObjective(model, seq_len=2, beta=0.1)
+        objective = GRPOObjective(model, seq_len=2, beta=0.1, samples=samples)
     else:
-        objective = PPOObjective(model, seq_len=2, critic=ValueHead(model.clone()), beta=0.1)
+        objective = PPOObjective(model, seq_len=2, critic=ValueHead(model.clone()), beta=0.1, samples=samples)
     trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(0))
     count = max(2, jax.device_count())
     if kind == "dpo":
@@ -379,32 +380,27 @@ def test_pipeline_publishes_the_updated_policy_not_the_frozen_reference(kind, tm
                  "text_positions": np.tile(np.arange(3, dtype=np.int32), (count, 1)),
                  "response_mask": mask, "advantages": mask}
         actor = objective.actor if kind == "ppo" else objective
-        weights = ({collection: value["policy"] for collection, value in before.params.items()}
-                   if kind == "ppo" else before.params)
+        weights = ({collection: value["policy"] for collection, value in before.variables.items()}
+                   if kind == "ppo" else before.variables)
         batch["old_log_probs"] = np.asarray(actor.packed_log_probs(weights, batch))
         batch["behavior_log_probs"] = batch["old_log_probs"]
         if kind == "ppo":
-            values = np.asarray(objective.values(before.params, batch))
+            values = np.asarray(objective.values(before.variables, batch))
             batch.update(old_values=values, returns=values + mask)
     data = Dataset(train=lambda partition: iter([batch, batch]), val=None, records=2 * count, batch=count)
     state = trainer.fit(data, steps=2, log_every=100, checkpoint_every=None)
-    sampling = Sampling(temperature=0)
     def draw(weights):
         task = objective.policy(weights) if kind == "ppo" else objective.policy(weights, sampling)
         return task([[1, 2]], 1, key=jax.random.key(3), sampling=sampling).host()
-    expected = draw(state.params)
+    expected = draw(state.variables)
     actual = objective.pipeline(state)([[1, 2]], 1, key=3, sampling=sampling).host()
     reference = draw(state.averaged)
     np.testing.assert_array_equal(actual.tokens, expected.tokens)
     np.testing.assert_allclose(actual.raw_log_probs, expected.raw_log_probs, atol=1e-7, rtol=1e-7)
     assert not np.allclose(actual.raw_log_probs, reference.raw_log_probs, atol=1e-5, rtol=1e-5)
     checkpoints = Checkpoints(str(tmp_path))
-    checkpoints.save(int(state.step), state, None)
+    checkpoints.save(int(state.step), state, None, artifact=objective.inference_record())
     checkpoints.wait()
-    config = ModelConfig("causal_transformer", {"vocab_size": 8, "emb_features": 16, "num_layers": 1,
-        "num_heads": 2, "mlp_features": 32, "max_seq_len": 8}, dtype="float32", attention_impl="xla")
-    (tmp_path / "run.json").write_text(json.dumps({"objective": kind, "model": asdict(config),
-        "tokenizer": "byte", "sample_tokens": 1, "sampling": asdict(sampling)}))
     restored = dew.pipeline(str(tmp_path))([[1, 2]], key=3).host()
     np.testing.assert_array_equal(restored.tokens, expected.tokens)
     np.testing.assert_allclose(restored.raw_log_probs, expected.raw_log_probs, atol=1e-7, rtol=1e-7)

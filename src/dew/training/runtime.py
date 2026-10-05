@@ -64,8 +64,8 @@ def prepare_process(wandb: Wandb | None = None,
                     xla_flags: str | None = None,
                     compilation_cache_dir: str | None = None,
                     *, layout: Layout | None = None) -> None:
-    """Set the env vars and XLA flags, raise the fd/core limits, join the JAX
-    process pool.
+    """Set the env vars and XLA flags, raise the soft descriptor limit, join
+    the JAX process pool.
 
     `wandb` is the run's `dew.config.Wandb`, or None for a run without a
     tracker. Only its offline switch is read, and it has to be read before
@@ -78,7 +78,7 @@ def prepare_process(wandb: Wandb | None = None,
     never runs a recipe, sets XLA_FLAGS in the environment.
 
     The same Layout passed to Trainer selects CPU transaction ownership when
-    host includes params. JAX_PLATFORMS must then permit CPU beside the
+    host includes variables. JAX_PLATFORMS must then permit CPU beside the
     accelerator. JAX_NUM_CPU_DEVICES, or the existing XLA flags, must
     establish one CPU device per local accelerator before this call.
     Validation never changes backend configuration after initialization.
@@ -86,7 +86,7 @@ def prepare_process(wandb: Wandb | None = None,
     _set_environment(wandb, xla_flags, compilation_cache_dir)
     _raise_limits()
     _join_process_pool(multi_host)
-    if layout is not None and "params" in layout.host:
+    if layout is not None and "variables" in layout.host:
         from dew.training.distributed import MeshSpec
         from dew.training.host import companion_mesh
         companion_mesh(MeshSpec().build())
@@ -108,13 +108,19 @@ def _set_environment(wandb: Wandb | None, xla_flags: str | None,
         enable_compilation_cache(compilation_cache_dir)
 
 
+_DESCRIPTORS = 65535
+"""The open files a run asks room for: data loaders' and checkpoints' descriptors."""
+
+
 def _raise_limits() -> None:
-    """Unlimited core files, and room for the descriptors data loaders and
-    checkpoints open."""
-    resource.setrlimit(
-        resource.RLIMIT_CORE,
-        (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
-    resource.setrlimit(resource.RLIMIT_NOFILE, (65535, 65535))
+    """Raise the soft descriptor limit toward `_DESCRIPTORS`, as far as the
+    hard limit the process was started with allows. The hard limit, which
+    only a privileged process can raise, and a soft limit already higher are
+    left as they are."""
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    wanted = _DESCRIPTORS if hard == resource.RLIM_INFINITY else min(_DESCRIPTORS, hard)
+    if soft != resource.RLIM_INFINITY and soft < wanted:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (wanted, hard))
 
 
 def _join_process_pool(multi_host: bool | None) -> None:

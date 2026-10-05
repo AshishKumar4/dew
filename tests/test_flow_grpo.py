@@ -107,7 +107,7 @@ def test_recorded_trajectory_rescores_under_shifted_guided_process():
         sigma, following = 3 * t / (1 + 2 * t), 3 * s / (1 + 2 * s)
         latent = np.asarray(trajectory.states[:, index], np.float64)
         action = np.asarray(trajectory.states[:, index + 1], np.float64)
-        scale = 2 if 0.1 <= 1 - t <= 0.8 else 1
+        scale = 2 if 0.1 <= index / 4 <= 0.8 else 1
         velocity = 0.25 * latent + 0.1 * sigma + scale * np.asarray(offset)
         dt = following - sigma
         g_squared = 0.5**2 * sigma / (1 - (following if t == 1 else sigma))
@@ -129,6 +129,7 @@ def trajectory_batch(trajectory, advantages, mask=None):
         "next_latents": trajectory.states[:, 1:],
         "timesteps": jnp.broadcast_to(trajectory.times[:-1], (count, points - 1)),
         "next_timesteps": jnp.broadcast_to(trajectory.times[1:], (count, points - 1)),
+        "rollout_steps": jnp.full((count,), points, jnp.int32),
         "old_log_probs": trajectory.log_probs,
         "transition_mask": trajectory.stochastic if mask is None else jnp.asarray(mask),
         "advantages": jnp.asarray(advantages),
@@ -222,21 +223,32 @@ def test_deterministic_rollout_cannot_contribute_policy_gradient():
 
 
 def test_flow_rollout_groups_rewards_selects_steps_and_preserves_likelihoods():
+    """Rescoring reproduces the rollout's likelihoods, guidance included: the
+    rollout walks 4 points and guides its step 1 of 3, inside (0.3, 0.6),
+    while the objective's own walk of 7 points would not guide a step 1 of
+    6, so the rescoring reads the rollout's step count off the batch."""
     from dew.inputs import CharTable, Condition
     from dew.nn.backbones.dit import SimpleDiT
-
-
 
     process = Process(FlowMatchingScheduler(shift=2), FlowMatchPredictionTransform())
     inputs = InputSpec(Field("image", (4, 4, 1)), {
         "textcontext": Condition(CharTable.from_pretrained(tokens=3, features=4))})
     model = SimpleDiT(output_channels=1, patch_size=2, emb_features=8,
                       num_layers=1, num_heads=2, mlp_ratio=2)
-    objective = FlowGRPOObjective(model, process, inputs, guidance=CFG(1.5), steps=4)
+    guidance = CFG(1.5, interval=(0.3, 0.6))
+    initial = FlowGRPOObjective(model, process, inputs, guidance=guidance, steps=7).init(jax.random.key(20))
+    # The DiT starts with its output zeroed, which no condition moves; noise in
+    # every weight lets a guided transition part from an unguided one.
+    leaves, tree = jax.tree.flatten(initial["params"])
+    noise = jax.random.split(jax.random.key(22), len(leaves))
+    params = jax.tree.unflatten(tree, [leaf + 0.1 * jax.random.normal(key, leaf.shape, leaf.dtype)
+                                       for leaf, key in zip(leaves, noise, strict=True)])
+    objective = FlowGRPOObjective(model, process, inputs, guidance=guidance, steps=7,
+                                  pretrained={**initial, "params": params})
 
     optimizer = optax.sgd(1e-3)
     state = Trainer(objective, optimizer, key=jax.random.key(21)).initial_state()
-    variables = state.params
+    variables = state.variables
     prompts = {**inputs.tokenize(["red", "blue"]), "target": np.asarray([-0.3, 0.6], np.float32)}
 
     def reward(images, context):
@@ -280,7 +292,7 @@ def test_zero_reward_variance_has_no_training_support():
     batch = rollout(state, {"image": np.zeros((2, 2), np.float32)}, jax.random.key(42))
     assert batch["latents"].shape[:2] == (6, 3)
     assert np.isfinite(batch["old_log_probs"]).all()
-    params = {**state.params, "params": {"gain": jnp.asarray(0.9)}}
+    params = {**state.variables, "params": {"gain": jnp.asarray(0.9)}}
     stats, _ = objective.loss(params, batch, Step(state.microstep, jax.random.key(43), state.averaged))
     value, active = objective.reduce_loss(stats)
     assert float(stats.mass) == 0 and float(value) == 0 and not bool(active)
@@ -460,7 +472,7 @@ def test_float64_callback_distinctions_reach_a_real_policy_update():
     final = trainer.fit(data, steps=1, log_every=1)
     assert int(final.updates) == 1
     change = float(optax.tree.norm(jax.tree.map(
-        lambda a, b: a - b, final.params["params"], initial.params["params"])))
+        lambda a, b: a - b, final.variables["params"], initial.variables["params"])))
     assert np.isfinite(change) and change > 1e-6
     np.testing.assert_allclose(collected["advantages"], oracle, atol=2e-6)
     np.testing.assert_array_equal(collected["rewards"], raw)
@@ -522,12 +534,12 @@ def test_conditioned_prompt_only_evaluation_preview_and_trainer_consumers():
     trainer = Trainer(objective, optax.sgd(1e-3), key=jax.random.key(101), rollout=rollout, tracker=tracker)
     initial = trainer.place()[0]
     step = Step(initial.microstep, jax.random.key(102), initial.averaged)
-    evaluated = objective.evaluate(initial.params, prompts, step)
-    previewed = objective.preview(initial.params, prompts, step)
+    evaluated = objective.evaluate(initial.variables, prompts, step)
+    previewed = objective.preview(initial.variables, prompts, step)
     tokens = {keyword: prompts[condition.field] for keyword, condition in inputs.conditions.items()}
-    conditions = objective.encode(initial.params["encoders"], tokens)
-    denoiser = process.denoiser(model, objective.model_variables(initial.params), conditions,
-                               objective.encode(initial.params["encoders"]))
+    conditions = objective.encode(initial.variables["encoders"], tokens)
+    denoiser = process.denoiser(model, objective.model_variables(initial.variables), conditions,
+                               objective.encode(initial.variables["encoders"]))
     noise_key, sample_key = jax.random.split(step.key)
     expected = sample(denoiser, process.noise(noise_key, (count, *objective.latent_shape)),
                       objective.steps, solver=objective.solver, guidance=objective.guidance, key=sample_key)

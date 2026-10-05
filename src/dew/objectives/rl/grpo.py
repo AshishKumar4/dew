@@ -23,6 +23,7 @@ import jax.numpy as jnp
 
 from dew.artifacts import TokenScores
 from dew.data.prompts import LENGTH_KEY, PROMPT_KEY
+from dew.inputs import Field, InputSpec
 from dew.nn.precision import at_least_fp32
 from dew.objectives.base import Aux, Ratio, Shown, Variables
 from dew.objectives.lm.chunked import chunked_cross_entropy
@@ -165,6 +166,8 @@ class GRPOObjective(LMObjective):
             raise ValueError(f"aggregation must be one of {AGGREGATIONS}, got {aggregation!r}")
         kwargs["ema_decay"] = 1.0 if beta > 0 else None
         super().__init__(model, seq_len, **kwargs)
+        # The batch is packed `input_ids` rows, not the LM's text windows.
+        self.inputs = InputSpec(sample=Field(IDS_KEY, (seq_len + 1,)))
         self.beta = beta
         self.epsilon_low = epsilon_low
         self.epsilon_high = epsilon_high
@@ -233,13 +236,13 @@ class GRPOObjective(LMObjective):
                       jnp.asarray(batch[SEGMENT_IDS_KEY], jnp.int32),
                       None if weights is None else jnp.asarray(weights, jnp.float32), proximal)
 
-    def loss(self, params, batch, step):
+    def loss(self, variables, batch, step):
         """Score the policy surrogate over the trainable tokens, plus the KL to the reference.
 
         The policy is rescored from the rollout's own ids, so every term
         reads the tokens that were actually drawn.
         """
-        terms = self._terms(params, batch)
+        terms = self._terms(variables, batch)
         mask = terms.mask
         if self._cap is not None and not terms.proximal:
             raise ValueError(

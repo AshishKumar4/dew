@@ -95,6 +95,7 @@ from dew.training.distributed import (
     shard_batch,
 )
 from dew.training.evaluation import Evaluation
+from dew.training.narrow import NARROW_COPY_GENERATIONS, narrowed, narrowed_paths
 from dew.training.runtime import Preempted, PreemptionNotice
 from dew.training.selection import Best
 from dew.training.state import Accumulation, TrainState
@@ -280,31 +281,35 @@ def step_compiler_options(objective, tokens: float, frozen: bool) -> jax.stages.
     return options or None
 
 
-def compiled_if_it_fits(program: jax.stages.Lowered,
-                        options: jax.stages.CompilerOptions | None) -> jax.stages.Compiled | None:
+def compiled_if_it_fits(program: jax.stages.Lowered, options: jax.stages.CompilerOptions | None,
+                        refusals: list[RuntimeError]) -> jax.stages.Compiled | None:
     """`program` compiled under `options`, or None where XLA refuses it for
-    memory. XLA:TPU checks a program's temporaries against HBM as it compiles
-    and raises RESOURCE_EXHAUSTED instead of returning an executable whose
-    memory `step_fits` could read, so the refusal is the step not fitting:
-    on a v6e Qwen3-0.6B at 16 x 1024 tokens asked for 38.47G of temporaries
-    beside 31.24G of HBM. Any other compile error raises."""
+    memory, the refusal appended to `refusals`. XLA:TPU checks a program's
+    temporaries against HBM as it compiles and raises RESOURCE_EXHAUSTED
+    instead of returning an executable whose memory `step_fits` could read,
+    so the refusal is the step not fitting: on a v6e Qwen3-0.6B at 16 x 1024
+    tokens asked for 38.47G of temporaries beside 31.24G of HBM. Any other
+    compile error raises."""
     try:
         return program.compile(options)
     except jax.errors.JaxRuntimeError as error:
         if not str(error).startswith('RESOURCE_EXHAUSTED'):
             raise
         _log.info("XLA refused the step for memory: %s", error)
+        refusals.append(error)
         return None
 
 
 def fitting_default(program: jax.stages.Lowered, executable: jax.stages.Compiled | None,
-                    mesh: Mesh, held: int = 0) -> tuple[jax.stages.Compiled | None, bool]:
+                    mesh: Mesh, held: int, refusals: list[RuntimeError]
+                    ) -> tuple[jax.stages.Compiled | None, bool]:
     """Fall back to the step compiled under XLA's default options where it
     fits and the one compiled under `step_compiler_options` does not.
-    Returns the step to run and whether it fits; `held` is `step_fits`'s.
-    The Triton GEMM fusions can hold fewer temporaries, so XLA's defaults
-    come back before the ladder's first rung."""
-    default = compiled_if_it_fits(program, None)
+    Returns the step to run and whether it fits; `held` is `step_fits`'s and
+    `refusals` `compiled_if_it_fits`'s. The Triton GEMM fusions can hold
+    fewer temporaries, so XLA's defaults come back before the ladder's first
+    rung."""
+    default = compiled_if_it_fits(program, None, refusals)
     if not step_fits(default, mesh, held):
         return executable, False
     _log.warning("the step fits the devices only with XLA's default options (Triton GEMM fusions, "
@@ -541,7 +546,7 @@ def refuse_wide_floats(state: TrainState, mesh: Mesh) -> None:
     trains as it did."""
     if mesh.devices.flat[0].platform != "tpu":
         return
-    wide = [jax.tree_util.keystr(path) for path, leaf in jax.tree_util.tree_leaves_with_path(state.params)
+    wide = [jax.tree_util.keystr(path) for path, leaf in jax.tree_util.tree_leaves_with_path(state.variables)
             if leaf.dtype in (jnp.float64, jnp.complex128)]
     if wide:
         others = f" and {len(wide) - 1} more parameters" if len(wide) > 1 else ""
@@ -784,7 +789,9 @@ class Trainer(Generic[Loss, Effects]):
         being in `fit`, so constructing a Trainer allocates nothing.
 
         `accumulation` is how many microbatches pool into one optimizer
-        commit. `step` replaces the built-in transaction. A custom step then
+        commit. The optimizer the run steps is the objective's
+        (`Objective.optimizer`), made from `optimizer`. `step` replaces the
+        built-in transaction. A custom step then
         owns the clocks, the scaler, the EMA and the mutable writes, and the
         compiled wrapper owns only the attempted-step counter. `rollout` runs
         once per batch read, before the step and outside replay. `layout` and
@@ -792,13 +799,13 @@ class Trainer(Generic[Loss, Effects]):
         """
         if accumulation < 1:
             raise ValueError(f"accumulation must be at least 1, got {accumulation}")
-        if step is not None and "params" in layout.host:
+        if step is not None and "variables" in layout.host:
             raise ValueError(
                 "Parameter-streamed training requires the trainer objective transaction; "
                 "custom steps own their execution"
             )
         self.objective = objective
-        self.optimizer = optimizer
+        self.optimizer = objective.optimizer(optimizer, accumulation=accumulation)
         from dew.nn.inputs import request_key
         self.seed = int(key) if isinstance(key, (int, np.integer)) and not isinstance(key, bool) else None
         self.key = request_key(key)
@@ -830,6 +837,8 @@ class Trainer(Generic[Loss, Effects]):
         # compiles. A resumed run starts at its checkpoint's rung, and says so
         # if its first compile has to climb past it (`_climb_to`).
         self._xla_defaults = False
+        # Why this run's checkpoints describe no model to load, said once.
+        self._unrecorded: str | None = None
         self._resumed_rung: JSON = None
 
     # ------------------------------------------------------------------
@@ -868,7 +877,7 @@ class Trainer(Generic[Loss, Effects]):
             scale=(jax.tree.map(jnp.asarray, dynamic_scale_lib.DynamicScale())
                    if self.dynamic_scale else None),
             window_size=jnp.asarray(self.accumulation, jnp.int32),
-            params=params,
+            variables=params,
             opt_state=self.optimizer.init(params["params"]),
             # The average starts equal to the parameters but as its own
             # buffers: the step donates the state, and a buffer can be
@@ -885,7 +894,7 @@ class Trainer(Generic[Loss, Effects]):
 
     @property
     def host_master(self) -> bool:
-        return "params" in self.layout.host
+        return "variables" in self.layout.host
 
     @functools.cached_property
     def state_mesh(self) -> Mesh:
@@ -903,15 +912,15 @@ class Trainer(Generic[Loss, Effects]):
         sits where the realization reads it (`execution.resident`) for the
         whole run."""
         mesh = self.state_mesh
-        params = dict(state.params)
+        params = dict(state.variables)
         frozen = params.pop(FROZEN, None) if self.host_master else None
-        placed = self.layout.shardings(mesh, dataclasses.replace(state, params=params, accumulation=None))
+        placed = self.layout.shardings(mesh, dataclasses.replace(state, variables=params, accumulation=None))
         placed = dataclasses.replace(placed, **{
             field: jax.tree.map(lambda s: s.with_memory_kind("pinned_host"), getattr(placed, field))
             for field in (() if self.host_master else self.layout.host)})
         if frozen is not None:
             placed = dataclasses.replace(
-                placed, params={**placed.params, FROZEN: self._frozen_shardings(state, frozen)}
+                placed, variables={**placed.variables, FROZEN: self._frozen_shardings(state, frozen)}
             )
         accumulation = state.accumulation
         if accumulation is None:
@@ -925,7 +934,7 @@ class Trainer(Generic[Loss, Effects]):
             layout = batch_shardings(mesh, sample) if batches else self.layout.shardings(mesh, sample)
             return jax.tree.map(lambda s: NamedSharding(mesh, P(None, *s.spec)), layout)
         pending = dataclasses.replace(pending,
-            gradient=None if accumulation.gradient is None else placed.params["params"],
+            gradient=None if accumulation.gradient is None else placed.variables["params"],
             batches=buffered_shardings(accumulation.batches, batches=True),
             variables=buffered_shardings(accumulation.variables, batches=False))
         return dataclasses.replace(placed, accumulation=pending)
@@ -955,7 +964,7 @@ class Trainer(Generic[Loss, Effects]):
         abstract = jax.eval_shape(self.initial_state, initializer, key)
         refuse_wide_floats(abstract, self.device_mesh)
         shardings = self.shardings(abstract)
-        self.layout.check(abstract.params, shardings.params, self.device_mesh)
+        self.layout.check(abstract.variables, shardings.variables, self.device_mesh)
         checkpoints = self.checkpoints
         resume = None if checkpoints is None else checkpoints.latest
         if checkpoints is None or resume is None:
@@ -969,10 +978,11 @@ class Trainer(Generic[Loss, Effects]):
             return state, shardings, None
         abstract = dataclasses.replace(abstract, accumulation=checkpoints.accumulation_template(resume))
         shardings = self.shardings(abstract)
-        if self.host_master and FROZEN in abstract.params:
-            abstract = dataclasses.replace(abstract, params={**abstract.params, FROZEN: self._banked_frozen(
-                abstract.params[FROZEN],
-                lambda rows, path: jax.ShapeDtypeStruct((len(rows), *rows[0].shape), rows[0].dtype))})
+        if self.host_master and FROZEN in abstract.variables:
+            abstract = dataclasses.replace(abstract, variables={
+                **abstract.variables, FROZEN: self._banked_frozen(
+                    abstract.variables[FROZEN],
+                    lambda rows, path: jax.ShapeDtypeStruct((len(rows), *rows[0].shape), rows[0].dtype))})
         template = jax.tree.map(
             lambda leaf, sharding: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=sharding),
             abstract, shardings)
@@ -985,6 +995,32 @@ class Trainer(Generic[Loss, Effects]):
             raise ValueError("checkpoint accumulation window_size differs from this trainer")
         self._display.note(f"Resumed from step {resume} in {checkpoints.source(resume)}")
         return state, shardings, position
+
+    def _artifact(self) -> JSON:
+        """The objective's inference record, which a checkpoint carries for
+        loaders. Training and resuming never read it, so a model or component
+        no record can describe still checkpoints: the record says why, a
+        loader raises that, and the first checkpoint warns it, as it does a
+        model no registry names."""
+        from dew.registry import models
+
+        artifact: JSON
+        try:
+            artifact = self.objective.inference_record()
+        except (KeyError, TypeError, ValueError) as error:
+            reason = f"{type(self.objective).__name__}: {error}"
+            artifact = {'unrecorded': reason}
+        else:
+            model = None if artifact is None else record(artifact, 'inference record').get('model')
+            name = model.get('architecture') if isinstance(model, Mapping) else None
+            reason = (None if not isinstance(name, str) or name in models else
+                      f"its model is not registered; `@dew.registry.models({name!r})` above the "
+                      f"class registers it")
+        if reason is not None and reason != self._unrecorded:
+            self._unrecorded = reason
+            _log.warning("this run's checkpoints resume, but no loader can rebuild their model "
+                         "(TextGeneration.from_run, dew.pipeline) until it is fixed: %s", reason)
+        return artifact
 
     def _rung(self) -> JSON:
         """The fit ladder's rung this trainer's step compiles at: the
@@ -1028,7 +1064,7 @@ class Trainer(Generic[Loss, Effects]):
         become the state's buffers. The copy leaves the objective's own
         arrays alone."""
         variables = {path: (sharding, leaf.shape) for (path, leaf), sharding in zip(
-            jax.tree_util.tree_leaves_with_path(abstract.params), jax.tree.leaves(shardings.params),
+            jax.tree_util.tree_leaves_with_path(abstract.variables), jax.tree.leaves(shardings.variables),
             strict=True)}
         replicated = NamedSharding(self.device_mesh, P())
 
@@ -1060,8 +1096,8 @@ class Trainer(Generic[Loss, Effects]):
             return jax.tree.map(lambda leaf: leaf.sharding, frozen)
         from dew.training.execution import resident
         rows = self.layout.shardings(
-            self.state_mesh, dataclasses.replace(state, params={FROZEN: frozen}, accumulation=None))
-        return resident(rows.params[FROZEN], self.bank_sites, self.device_mesh)
+            self.state_mesh, dataclasses.replace(state, variables={FROZEN: frozen}, accumulation=None))
+        return resident(rows.variables[FROZEN], self.bank_sites, self.device_mesh)
 
     @functools.cached_property
     def bank_sites(self):
@@ -1094,8 +1130,8 @@ class Trainer(Generic[Loss, Effects]):
         held = self.objective.held_variables()
         with jax.default_device(self.state_mesh.local_devices[0]):
             state = self.initial_state(initializer, key)
-            if FROZEN in state.params:
-                check_bank_pool(bank_bytes(state.params[FROZEN], self.bank_sites), self.device_mesh)
+            if FROZEN in state.variables:
+                check_bank_pool(bank_bytes(state.variables[FROZEN], self.bank_sites), self.device_mesh)
                 # A scanned run's frozen rows become its bank here and the
                 # bank lands where it stays resident before the next is
                 # stacked, so the host holds one bank in transit, not the
@@ -1103,7 +1139,7 @@ class Trainer(Generic[Loss, Effects]):
                 # tree holds the placed bank where each row was. An
                 # objective placed this way holds banks at its rows afterwards
                 # and does not seed a second trainer.
-                targets = shardings.params[FROZEN]
+                targets = shardings.variables[FROZEN]
 
                 def stack(rows, path):
                     target = targets
@@ -1120,13 +1156,13 @@ class Trainer(Generic[Loss, Effects]):
                         node = node.get(component) if isinstance(node, dict) else None
                     if isinstance(node, dict) and keys[-1] in node:
                         node[keys[-1]] = bank
-                frozen = self._banked_frozen(state.params[FROZEN], stack, release)
-                state = dataclasses.replace(state, params={**state.params, FROZEN: frozen})
-        params = stream(state.params, shardings.params, held)
+                frozen = self._banked_frozen(state.variables[FROZEN], stack, release)
+                state = dataclasses.replace(state, variables={**state.variables, FROZEN: frozen})
+        params = stream(state.variables, shardings.variables, held)
         ema = None if state.ema is None else stream(state.ema, shardings.ema)
-        rest = dataclasses.replace(state, params=None, ema=None)
-        placed = transfer(rest, dataclasses.replace(shardings, params=None, ema=None))
-        return dataclasses.replace(placed, params=params, ema=ema)
+        rest = dataclasses.replace(state, variables=None, ema=None)
+        placed = transfer(rest, dataclasses.replace(shardings, variables=None, ema=None))
+        return dataclasses.replace(placed, variables=params, ema=ema)
 
     # ------------------------------------------------------------------
     # The step
@@ -1137,10 +1173,10 @@ class Trainer(Generic[Loss, Effects]):
         # memory space than the moving ones, and the loss the realization
         # runs reads a snapshot in one space. The step's key is drawn inside
         # the trace, so an abstract state compiles a step as a placed one does.
-        params = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), state.params)
+        params = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), state.variables)
 
         def loss(params, batch, microstep, key, step, ema):
-            return self.objective.loss(
+            return self.objective._loss(
                 params, batch, Step(microstep, jax.random.fold_in(key, step), with_ema(params, ema)))
 
         return jax.eval_shape(loss, params, batch, state.microstep, state.key, state.step, state.ema)
@@ -1155,10 +1191,10 @@ class Trainer(Generic[Loss, Effects]):
         def shape(leaf: jax.Array) -> jax.ShapeDtypeStruct:
             return jax.ShapeDtypeStruct(leaf.shape, leaf.dtype)
 
-        trainable = jax.tree.map(shape, state.params["params"])
+        trainable = jax.tree.map(shape, state.variables["params"])
         records = jax.tree.map(shape, batch)
         mutable = (None if shared or aux.variables is None else
-                   jax.tree.map(shape, {name: state.params[name] for name in aux.variables}))
+                   jax.tree.map(shape, {name: state.variables[name] for name in aux.variables}))
 
         def zeros(leaf):
             dtype = (
@@ -1259,15 +1295,21 @@ class Trainer(Generic[Loss, Effects]):
                     f"no pipeline, so every stage would compute the whole step; give those "
                     f"devices to the data or fsdp axis")
             prepared = self._initialize_accumulation(state, batch, shapes, shape_only=True)
+            copies = self._narrow_copies(state, batch)
+            if copies:
+                prepared = dataclasses.replace(prepared, compute=jax.eval_shape(
+                    lambda variables: narrowed(variables, copies), prepared.variables))
             shardings = self.shardings(prepared)
             replicated = NamedSharding(mesh, P())
             placement = batch_shardings(mesh, batch)
             held = prefetched_bytes(batch, placement)
             prepared = jax.tree.map(
                 lambda x, s: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=s), prepared, shardings)
+            refusals: list[RuntimeError] = []
             while True:
                 body = (self.step(self.objective, self.optimizer) if self.step is not None else
-                        Transaction(self.objective, self.optimizer, self.accumulation, shapes).step())
+                        Transaction(self.objective, self.optimizer, self.accumulation, shapes,
+                                    copies).step())
 
                 def step(current, batch, body=body):
                     # The body sees every field on the device; the out shardings
@@ -1284,11 +1326,12 @@ class Trainer(Generic[Loss, Effects]):
                 shards = math.prod(mesh.shape[axis] for axis in BATCH_AXES)
                 options = None if self._xla_defaults else step_compiler_options(
                     self.objective, _device_tokens(self.objective, batch, shards),
-                    FROZEN in prepared.params)
-                self.executable = compiled_if_it_fits(self.program, options)
+                    FROZEN in prepared.variables)
+                self.executable = compiled_if_it_fits(self.program, options, refusals)
                 fits = step_fits(self.executable, mesh, held)
                 if not fits and options is not None:
-                    self.executable, fits = fitting_default(self.program, self.executable, mesh, held)
+                    self.executable, fits = fitting_default(self.program, self.executable, mesh, held,
+                                                            refusals)
                     self._xla_defaults = fits
                 if not fits and resumed is not None:
                     _log.warning(
@@ -1300,8 +1343,8 @@ class Trainer(Generic[Loss, Effects]):
                 if fits or not recompute_more(self.objective):
                     break
             if self.executable is None:
-                # XLA refused the last rung too: compile it once more for its refusal.
-                self.executable = self.program.compile(options)
+                # XLA refused the last rung too, and its refusal is the run's error.
+                raise refusals[-1]
             self.flops_per_step = compiled_flops(self.executable)
             self.links = links
         # The program compiled above, not the jit: a call through the jit
@@ -1314,8 +1357,33 @@ class Trainer(Generic[Loss, Effects]):
                 if current.accumulation is None and self.accumulation > 1 and self.step is None:
                     current = self._initialize_accumulation(current, batch, shapes)
                     current = jax.device_put(current, shardings)
+                if copies and current.compute is None:
+                    current = dataclasses.replace(current, compute=jax.jit(
+                        lambda variables: narrowed(variables, copies), out_shardings=shardings.compute)(
+                            current.variables))
                 return executable(current, batch)
         return run
+
+    def _narrow_copies(self, state: TrainState, batch: Batch) -> dict:
+        """The parameters the step reads through narrow copies
+        (`dew.training.narrow`), by path under `params`: on the CUDA
+        generations measured to gain, for a step this trainer composes that
+        commits every microbatch without a loss scale."""
+        if (device_generation() not in NARROW_COPY_GENERATIONS or self.step is not None
+                or self.accumulation != 1 or self.dynamic_scale or FROZEN in state.variables):
+            return {}
+        variables = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), state.variables)
+
+        def loss(params, rest, batch, microstep, key, step, ema):
+            # As `_loss_shape` traces it, the averaged weights the step hands
+            # the objective included: a parameter read there is used twice.
+            variables = {**rest, "params": params}
+            return self.objective._loss(
+                variables, batch, Step(microstep, jax.random.fold_in(key, step), with_ema(variables, ema)))
+
+        rest = {name: tree for name, tree in variables.items() if name != "params"}
+        return narrowed_paths(loss, variables["params"], rest, batch, state.microstep, state.key, state.step,
+                              state.ema)
 
     def _compile_host(self, state: TrainState, batch: Batch) -> CompiledStep:
         from dew.training.execution import HostExecution
@@ -1362,9 +1430,12 @@ class Trainer(Generic[Loss, Effects]):
         stop: Plateau | None = None,
         validation: Mapping[str, Reader] | None = None,
         restore_best: bool = False,
+        state: TrainState | None = None,
     ) -> TrainState:
         """Train to `steps` total steps, resuming from the checkpoints' latest
-        step when the directory holds one.
+        step when the directory holds one. An explicit `state` takes precedence
+        over initialization and checkpoint restoration; its input reader starts
+        at the position supplied by `dataset`, not a checkpoint's data position.
 
         Every `log_every` steps the tracker receives the loss, the objective's
         metrics and the throughput.
@@ -1413,28 +1484,31 @@ class Trainer(Generic[Loss, Effects]):
                 validation=validation is not None
                 or (bool(eval_every or metrics) and dataset.val is not None),
             )
-            state, complete = self._training_loop(plan, run, profiler, tracer, profile, checkpoints)
+            trained, complete = self._training_loop(plan, run, profiler, tracer, profile, checkpoints, state)
+            # The state a checkpoint would hold: the step rebuilds its narrow copies.
+            trained = dataclasses.replace(trained, compute=None)
         finally:
             primary = sys.exception()
             error = self._closed(run, primary, profiler)
             if primary is None and error is not None:
                 raise error
         if complete:
-            return state
+            return trained
         if run.preempted is not None:
             raise Preempted(run.preempted)
         if restore_best and checkpoints is not None:
-            state, _ = checkpoints.restore(
+            trained, _ = checkpoints.restore(
                 jax.tree.map(
-                    lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding), state
+                    lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding), trained
                 ),
                 step="best",
             )
-        return state
+        return trained
 
     def _training_loop(self, plan: _FitPlan, run: _FitRun, profiler: Profiler | None,
                        tracer: Profiler | None, profile: ProfileWindow | None,
-                       checkpoints: Checkpoints | None) -> tuple[TrainState, bool]:
+                       checkpoints: Checkpoints | None,
+                       initial: TrainState | None = None) -> tuple[TrainState, bool]:
         """Place the state, dispatch the numerical steps and finish their loop
         before resource cleanup. Returns the final state and whether the run
         was already complete, its last checkpoint written, so nothing ran.
@@ -1442,7 +1516,13 @@ class Trainer(Generic[Loss, Effects]):
         The loop is the state's one holder: each step donates the state it is
         handed, and a reference kept past that, as fit's own once was, holds
         an array whose buffers the step consumed."""
-        state, shardings, position = self.place()
+        if initial is None:
+            state, shardings, position = self.place()
+        else:
+            shardings = self.shardings(initial)
+            self.layout.check(initial.variables, shardings.variables, self.device_mesh)
+            state = jax.device_put(initial, shardings)
+            position = None
         run.last_checkpoint = time.perf_counter()
         if checkpoints is not None and checkpoints.latest is not None:
             run.stop_control = checkpoints.control(checkpoints.latest)
@@ -1474,6 +1554,10 @@ class Trainer(Generic[Loss, Effects]):
                 if self.rollout is not None:
                     batch, sampled = self._rolled_out(state, batch)
                     interval.rollout_seconds += sampled
+                inputs = self.objective.inputs
+                if not compiled and self.rollout is None and inputs is not None:
+                    # A rollout writes the batch its loss reads, from prompts it reads itself.
+                    agreed("training input declaration", functools.partial(inputs.check, batch))
                 first_compile = not compiled
                 train_step, measured_flops = self._compiled_for(compiled, state, batch)
                 if first_compile:
@@ -1559,8 +1643,9 @@ class Trainer(Generic[Loss, Effects]):
         run.current = current = int(state.step)
         started = FitStarted(current, steps,
             checkpoints.source(current) if checkpoints is not None and position is not None else None,
-            sum(leaf.size for leaf in jax.tree.leaves(state.params["params"])), mesh.devices.size,
-            jax.devices()[0].device_kind, jax.process_count(), dict(mesh.shape), _split_share(state.params),
+            sum(leaf.size for leaf in jax.tree.leaves(state.variables["params"])), mesh.devices.size,
+            jax.devices()[0].device_kind, jax.process_count(), dict(mesh.shape),
+            _split_share(state.variables),
             seed=self.seed)
         self._report(started, current)
         # Read through the type that declares it: fit takes any object with a
@@ -1586,7 +1671,7 @@ class Trainer(Generic[Loss, Effects]):
             run.source = None  # Lifetime transferred to the prefetch worker.
 
         model = _model_of(self.objective)
-        stored = sorted({str(leaf.dtype) for leaf in jax.tree.leaves(state.params["params"])})
+        stored = sorted({str(leaf.dtype) for leaf in jax.tree.leaves(state.variables["params"])})
         compute = getattr(model, "dtype", None)
         precision = "/".join(stored)
         if compute is not None and [str(jnp.dtype(compute))] != stored:
@@ -1924,6 +2009,8 @@ class Trainer(Generic[Loss, Effects]):
         minutes or run out of memory before the error. Every other mesh's
         batch is checked with its stream (`_check_stream`), a ramp's at each
         of its stages."""
+        if metrics and eval_every is None:
+            raise ValueError("metrics need eval_every to schedule their validation pass")
         if stop is None or not isinstance(stop.metric, TrainingScalar):
             self._check_validation_is_read(eval_every, metrics, preview=preview)
         if self.mesh.stage > 1:
@@ -2130,7 +2217,7 @@ class Trainer(Generic[Loss, Effects]):
                 ranking = (Ranking('train/loss', metadata['train/loss']),)
         checkpoints.save(step, state, position, metadata, share=DataPartition.of(self.device_mesh),
                          ranking=ranking, control=control, weights_only=weights_only,
-                         rung=self._rung(), artifact=self.objective.inference_record())
+                         rung=self._rung(), artifact=self._artifact())
         self._report(CheckpointRequested(checkpoints.directory), step)
         interval.saved(step)
         self._display.status("")
@@ -2152,7 +2239,7 @@ class Trainer(Generic[Loss, Effects]):
         paused = time.perf_counter()
         self._display.status("writing a local checkpoint")
         checkpoints.save_local(step, state, position, share=DataPartition.of(self.device_mesh),
-                               control=control, rung=self._rung(), artifact=self.objective.inference_record())
+                               control=control, rung=self._rung(), artifact=self._artifact())
         self._report(CheckpointRequested(str(checkpoints.local_directory), local=True), step)
         self._display.status("")
         return time.perf_counter() - paused
@@ -2273,8 +2360,8 @@ class Trainer(Generic[Loss, Effects]):
         does."""
         paused = time.perf_counter()
         self._display.status("evaluating")
-        mesh, params = self.device_mesh, state.params
-        averaged = with_ema(state.params, self._fetched(state, shardings).ema)
+        mesh, params = self.device_mesh, state.variables
+        averaged = with_ema(state.variables, self._fetched(state, shardings).ema)
         key = state.key
         if self.host_master:
             from dew.training.execution import HostExecution

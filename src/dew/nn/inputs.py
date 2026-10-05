@@ -202,6 +202,7 @@ class AttentionMetadata:
     ids for the stack (`dew.nn.engram`), as it hands a hash router the ids.
     `media` `[B, S]` marks the positions a media encoder fills, which
     DeepSeek-V4.1 routes by its image bias and keeps out of every n-gram.
+    `admitted` makes a cached call a serving step's mixed one (`Admitted`).
     """
 
     valid: jax.Array | None = None
@@ -212,6 +213,29 @@ class AttentionMetadata:
     token_ids: jax.Array | None = None
     engram_ids: jax.Array | None = None
     media: jax.Array | None = None
+    admitted: Admitted | None = None
+
+
+@struct.dataclass
+class Admitted:
+    """A serving step's cached call over every token it runs, in one row.
+
+    The call's `[1, rows + A * W]` tokens are one per cache row, in row
+    order, then the prompt pieces of the `A` rows admitted this step, `W`
+    tokens each, row `slots[a]` continuing from slot `cursors[a]`. A slot
+    past the cache's rows is padding. Attention writes every valid token's
+    keys into its row and reads that row's cache (`CausalSelfAttention`);
+    every other layer works token by token, so the step's projections read
+    their weights once for the decoding rows and the prompts together.
+    Unless `continuing`, every piece starts its row (the cursors are 0), and
+    a piece's queries read its own keys rather than the row's whole cache.
+    Over a paged cache `tables` are the admitted rows' page tables.
+    """
+
+    slots: jax.Array
+    cursors: jax.Array
+    tables: jax.Array | None = None
+    continuing: bool = struct.field(pytree_node=False, default=True)
 
 
 @struct.dataclass

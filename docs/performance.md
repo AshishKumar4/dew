@@ -16,7 +16,7 @@ python tools/optimizer_curve.py --dataset <tokens> --optimizer <name> \
     --learning-rate <lr> --out <json>
 ```
 
-## Training scoreboard, 2026-10-02
+## Training scoreboard, 2026-10-03
 
 Dew against `torch.compile` on the same models: the same batch, bf16
 compute over fp32 master weights, the same optimizer constants, the same
@@ -29,7 +29,7 @@ rows from `tools/reference_runs/dew_lm.py` and `tools/benchmark_step.py`;
 `tools/reference_runs/scoreboard.py` builds the reference-run rows into one
 table.
 
-RTX 4080 16 GiB, Dew at `4d392f0a` (jax 0.11.2.post3), torch 2.13.0+cu130,
+RTX 4080 16 GiB, Dew at `f6047cf9` (jax 0.11.2.post3), torch 2.13.0+cu130,
 transformers 5.17.0, SDPA attention. Each Dew row is two processes, given
 as their range; each torch row is one process, or two where a range is
 given. Dew as installed, cuDNN attention; with tokamax installed
@@ -37,14 +37,14 @@ given. Dew as installed, cuDNN attention; with tokamax installed
 
 | model | step | Dew | best torch.compile | Dew / torch |
 |---|---|---:|---:|---:|
-| Qwen3-0.6B, pretrained | 1 x 1024 tokens, AdamW | 96.2 ms, MFU 46.7-46.8% | 112.1-112.4 ms, 40.0% | 1.17 |
-| Qwen3-0.6B, pretrained | 2 x 1024 tokens, AdamW | 148.1 ms, MFU 60.7% | 168.6-169.1 ms, 53.3% | 1.14 |
-| 99M Qwen3-MoE shape, 8 experts, top 2 | 8 x 1024 tokens, AdamW | 78.1 ms | 112.5 ms | 1.44 |
-| decoder, GPT-2 small widths, 3 layers | 16 x 512, Adam, EMA | 49.1 ms; tokamax 48.4-48.5 | 49.4 ms (flash), 50.0 (cuDNN) | 1.01; 1.02 |
-| SimpleDiT, width 384, 6 layers, 64 px | batch 16, Adam, EMA | 7.41-7.46 ms | 8.07 ms | 1.08-1.09 |
-| SimpleDiT, width 768, 12 layers, 64 px | batch 32, Adam, EMA | 72.6-72.7 ms, MFU 62.3-62.4%; tokamax 71.1 | 76.4 ms (flash) | 1.05; 1.07 |
-| 176M hybrid DiT (published config) | batch 16, Adam, EMA | 66.5-66.6 ms, MFU 39.2%; tokamax 66.3-66.4 | no torch port | |
-| 176M hybrid DiT (published config) | batch 32 | 110.2-110.3 ms, MFU 47.3%; tokamax 109.6 | no torch port | |
+| Qwen3-0.6B, pretrained | 1 x 1024 tokens, AdamW | 96.0-96.1 ms, MFU 46.8% | 112.1-112.4 ms, 40.0% | 1.17 |
+| Qwen3-0.6B, pretrained | 2 x 1024 tokens, AdamW | 148.0-148.3 ms, MFU 60.6-60.8% | 168.6-169.1 ms, 53.3% | 1.14 |
+| 99M Qwen3-MoE shape, 8 experts, top 2 | 8 x 1024 tokens, AdamW | 78.1-78.2 ms | 112.5 ms | 1.44 |
+| decoder, GPT-2 small widths, 3 layers | 16 x 512, Adam, EMA | 49.0-49.3 ms; tokamax 48.5 | 49.4 ms (flash), 50.0 (cuDNN) | 1.00-1.01; 1.02 |
+| SimpleDiT, width 384, 6 layers, 64 px | batch 16, Adam, EMA | 7.41-7.42 ms | 8.07 ms | 1.09 |
+| SimpleDiT, width 768, 12 layers, 64 px | batch 32, Adam, EMA | 72.6-72.7 ms, MFU 62.4%; tokamax 70.9-71.0 | 76.4 ms (flash) | 1.05; 1.08 |
+| 176M hybrid DiT (published config) | batch 16, Adam, EMA | 60.1 ms, MFU 44.4%; tokamax 60.0-60.2 | no torch port | |
+| 176M hybrid DiT (published config) | batch 32 | 100.6 ms, MFU 53.1%; tokamax 100.0-100.1 | no torch port | |
 
 The Dew decoder and SimpleDiT rows take a fresh host batch every step, and
 match the fixed-batch rows ("Comparison with PyTorch" below has both ways
@@ -52,6 +52,12 @@ for both frameworks, and the commands). Qwen3-0.6B at 1 x 1024 keeps both
 devices busy (torch 110.3 ms of its 112.1 ms step in the second process,
 Dew 96.0 of 96.2); on the MoE torch idles 20.9 ms a step on its host, and
 on device time alone Dew is 1.26x faster (78.1 against 98.3 ms busy).
+
+From `4d392f0a` to `f6047cf9` the hybrid DiT went from 66.5 to 60.1 ms at
+batch 16 and from 110.2 to 100.6 at 32, over the merges in between (among
+them the S5 recurrence in real arithmetic, "The hybrid DiT's SSM blocks"
+below, and the DiT MLP's GELU in fp32); the other rows stayed within
+their spread.
 
 Since `42ddfc14`: the hybrid DiT's dilated depthwise convolutions run as
 undilated ones over their interleaved grids (75.4 to 70.2 ms at batch 16);
@@ -102,27 +108,105 @@ backward (with its grouped-query head reduction) against FlashAttention-2's
 2.05 and 4.56 kernels; no alternative on this stack closes it ("At 128-wide heads"
 below).
 
-A100 40 GB (Colab), the latest records:
+A100 40 GB (Colab). The first rows are one session at integration
+`6a220e31` (c15: jax 0.11.2.post3, torch 2.13.0+cu130, transformers
+5.17.0), Dew and torch.compile alternating, two processes each where a
+range is given; the rest are the latest earlier records:
 
 | model | step | Dew | reference | Dew / reference | Dew commit |
 |---|---|---:|---:|---:|---|
-| Qwen3-0.6B, pretrained | 4 x 1024 tokens, AdamW | 141.0 ms | torch.compile 138.3 ms | 0.98 | `8c391009` |
+| Qwen3-0.6B, pretrained | 4 x 1024 tokens, AdamW | 128.4-129.0 ms, MFU 43.6-43.8% | torch.compile 138.7 ms, 40.5% | 1.08 | `6a220e31` |
+| 99M Qwen3-MoE shape, 8 experts, top 2 | 8 x 1024 tokens, AdamW | 45.5 ms | torch.compile 106.3-108.2 ms | 2.36 | `6a220e31` |
+| SimpleDiT, width 768, 12 layers, 64 px | batch 32, Adam, EMA | 39.1 ms (fresh batch or one on the device) | 38.2 ms (flash, one batch on the device), 38.4 (fresh) | 0.98 | `6a220e31` |
+| 176M hybrid DiT (published config) | batch 16 / 32 | 44.5 / 64.1 ms | no torch port | | `6a220e31` |
 | Qwen3-0.6B, pretrained | 4 x 1024 tokens | 161.9 ms | MaxText 0.2.4 GPU recipe 164.9 ms | 1.02 | `157bc21a` |
-| 99M Qwen3-MoE shape, 8 experts, top 2 | 8 x 1024 tokens | 74.4 ms | torch.compile 110.5 ms | 1.48 | `157bc21a` |
 | mamba2-130m | 4 x 1024 tokens | 127.9 ms | torch with mamba_ssm kernels, eager, 172.5 ms | 1.35 | `9490c9e6` |
 | SimpleDiT, width 384, 8 layers, 64 px | batch 64, EMA | 21.9 ms | flaxdiff 21.4 ms | 0.98 | `9490c9e6` |
 
-These rows predate every change listed above. On Qwen3-0.6B torch idles
-18.3 ms a step on the host, so its device does 120 ms of work against
-Dew's 138: Dew's attention is 21.4 against 16.6 ms (cuDNN's sm80 backward
-against FlashAttention-2), its converts 17.8 ms and its reductions 10.9
-against 4.2 (the norms and the fp32 head), while its GEMMs are 64.9 against
-70.9 and its update, inside 22.7 ms of copies, beats torch's 19.2 ms of
-copies plus 17.8 of optimizer. The MoE and Mamba-2 rows win only because
-torch idles on the host (77 to 177 ms a step); on device time Dew is 1.7
-and 2.0 times slower (its expert GEMMs and the XLA path of the SSD scan).
+From `8c391009` to `6a220e31` Qwen3-0.6B at 4 x 1024 went from 141.0 to
+128.7 ms and the MoE from 74.4 to 45.5. On device time too Dew now wins
+both: Qwen3-0.6B 128.4 against torch's 136.1 ms busy (GEMMs 64.2 against
+70.9; attention 21.6 against 16.7, cuDNN's sm80 kernels against
+FlashAttention-2; the update and casts 30.4 against torch's copies and
+optimizer at 37.0), the MoE 45.1 against 78.1 (torch also idles 86 ms a
+step on its host). The SimpleDiT is the A100's one loss, by 2%; the session
+traced neither side, and on the RTX 4080 the same model's gap to torch is
+attention (cuDNN's kernels 5.6 ms a step against FlashAttention-2's 4.4,
+below), which there the optimizer's lead covers. The older rows predate
+every change listed above. On Qwen3-0.6B (at `8c391009`) torch idled 18.3
+ms a step on the host, so its device did 120 ms of work against Dew's 138:
+Dew's attention was 21.4 against 16.6 ms (cuDNN's sm80 backward against
+FlashAttention-2), its converts 17.8 ms and its reductions 10.9 against 4.2
+(the norms and the fp32 head), while its GEMMs were 64.9 against 70.9 and
+its update, inside 22.7 ms of copies, beat torch's 19.2 ms of copies plus
+17.8 of optimizer. The Mamba-2 row (and the MoE at
+`157bc21a`) won only because torch idled on the host (77 to 177 ms a step);
+on device time Dew was 1.7 and 2.0 times slower (its expert GEMMs and the
+XLA path of the SSD scan).
 The MaxText row ran on another VM, before the whole-logits head took Dew's
 step from 161.9 to 141 ms.
+
+TPU v6e (Colab, one chip), Dew against MaxText 0.2.4 on the same VM:
+`tools/reference_runs/dew_lm.py` (pretrained weights, the reference
+corpus) and `tools/reference_runs/maxtext_run.py` (MaxText's synthetic
+tokens), bf16 compute over fp32 weights, AdamW with a 1.0 global-norm
+clip, 90 steps with steps 30-89 timed and nothing profiled, two processes
+each, integration `8895763d` (jax 0.11.2.post3, libtpu 0.0.48). ms a step,
+each window's mean (its wall time over its steps), and the ratio of the
+means:
+
+| model | tokens | Dew | MaxText, minimal remat | MaxText, default remat | Dew / best MaxText |
+|---|---|---:|---:|---:|---:|
+| Qwen3-0.6B | 8 x 1024 | 145.3, MFU 26.3% | 154.0-154.1, 24.8% | 167.9, 22.8% | 1.06 |
+| Qwen3-0.6B | 16 x 1024 | 288.9, 26.4% | 299.7-299.8, 25.5% | 343.7, 22.2% | 1.04 |
+| Qwen3-1.7B | 4 x 1024 | 153.3, 32.1% | 158.7-158.8, 31.0% | 179.7, 27.4% | 1.04 |
+
+Dew's 16 x 1024 window is steps 30-63, where its two epochs of data end,
+against MaxText's 30-89, and runs with the vocabulary head tiled, the fit
+ladder's first rung (the whole logits do not fit). MaxText's
+minimal-remat windows hold a few slow steps: its median step is 150.1 ms
+at 0.6B 8 x 1024 and 154.9 at 1.7B, against means of 154.0 and 158.7.
+Dew's runner times only the window, so it has no median to set beside
+them; were all of MaxText's steps its median ones, the ratios would be
+1.03 and 1.01. The global-norm
+clip costs Dew 8.1 ms a step here: Qwen3-0.6B's widths at 8 x 1024 through
+`tools/benchmark_step.py`, one batch on the device, take 137.2 ms with
+`optax.adam` and 145.3 with dew_lm's optimizer (the norm, the clip, AdamW
+and the schedule), the same as the reference runner's step; on the RTX
+4080 the same comparison at 1 x 1024 is 94.0 against 96.0. Compiled for
+the v6e, the clip's program writes 6.1 GiB more a step (80 to 86 GiB),
+copies of the gradients the norm holds until every one is in.
+
+## Rounding on the TPU, 2026-10-02
+
+`import dew` turns off XLA's excess precision (`--xla_allow_excess_precision=false`)
+so that every bf16 rounding a program states is kept. On one TPU v6e chip
+(Colab, jax 0.11.2.post3, libtpu 0.0.48, Dew at `f24b452a`) the policy is
+needed there too. With XLA's default, a bf16 round trip before a `tanh` or a
+sum is computed unrounded, and a bf16 decoder's outputs depend on the
+program's shape: Qwen3-0.6B's widths over 256 tokens give 10% of their
+elements equal between a batch of 4 and the same rows one at a time. With
+the policy, all of them are equal. Multi-chip layouts could not be tested
+on one chip and are unverified.
+
+The policy cost the 176M hybrid DiT's batch-16 step 8.1% on the v6e (16.95
+to 18.29 ms; on an A100 it was neutral, 45.31 to 45.42). The traces put
+0.93 ms of the 1.39 in the MLP's backward: the GELU ran as eight bf16
+elementwise steps, and each kept its rounding. A further 0.27 ms is the
+rounding of the residual sums the norms read, which is the policy's
+purpose. The MLP's GELU (`dew.nn.dit`, and an ungated decoder's `gelu`) now
+runs in fp32 and rounds once, as torch's bf16 GELU does, and as the gated
+MLPs already did (`dew.nn.moe.gated_product`). Over 2^20 bf16 values its
+RMS error against float64 drops from 2.19e-3 to 1.76e-3 (CPU and RTX 4080
+alike). The RTX 4080 steps are unchanged: the hybrid DiT at batch 16
+66.66/66.54 against 66.47/66.55 ms, SimpleDiT-B at 32 72.99/72.63 against
+72.77/72.71, a 3-layer GELU decoder at 16 x 512 44.40/44.30 against
+44.39/44.42. On the v6e (integration `8e92a4a6`, three rounds each) the
+hybrid DiT's batch-16 step runs 17.25-17.29 ms against 18.25, where XLA's
+excess precision would give 16.88-16.92: the policy now costs 2.2%, the
+residual roundings. Those roundings are real on the TPU too: an RMSNorm
+reading a fused bf16 residual sum matches the program that stores the sum
+on 98.8% of its outputs with excess precision, and on all of them without.
 
 ## Sampling the hybrid DiT on the CPU, 2026-10-02
 
@@ -179,10 +263,86 @@ pixel's dilation-d taps are its neighbours in the grid of pixels sharing
 its row and column residues mod d, so the convolution now runs as cuDNN's
 dilation-1 kernel over the d^2 interleaved grids: forward and VJP 0.097 ms
 (dilation 2) and 0.089 ms (dilation 3) against 0.31 and 0.33, and the step
-75.30 to 70.17 ms. In fp32, where cuDNN's depthwise kernels are slower,
-the step goes from 109.70 to 113.68 ms; the published config trains in
-bf16. At HIGHEST precision the fp32 output and input gradient equal lax's
-dilated convolution's exactly.
+75.30 to 70.17 ms. At HIGHEST precision the fp32 output and input
+gradient equal lax's dilated convolution's exactly.
+
+In fp32 that form made the step slower (109.70 to 113.68 ms), so CUDA now
+picks by dtype: polyphase in bf16, and in fp32 the nine shifted products
+with fp32 input, kernel and output held in memory, the form before it. In
+fp32 cuDNN runs the polyphase convolutions with its grouped direct kernels
+(forward, input and filter gradient): 3.8 ms of the 5.2 ms a batch-16 step
+spent in the dilated layers, with 1.3 ms more in the interleaving
+transposes. The step at integration `f6047cf9` against the change, RTX
+4080, fixed batch, two alternating rounds:
+
+| dtype | batch | polyphase (before) | by dtype (after) |
+|---|---:|---:|---:|
+| fp32 | 16 | 105.87 / 105.77 | 101.57 / 101.54 |
+| fp32 | 32 | 265.81 / 265.18 | 254.71 / 254.50 |
+| bf16 | 16 | 60.13 / 60.08 | 60.12 / 60.09 |
+| bf16 | 32 | 100.68 / 100.60 | 100.69 / 100.62 |
+
+fp32 is 4.0% faster at batch 16 and 4.1% at 32; bf16 is the same program,
+with the same losses to the bit. The fp32 losses move in the 8th digit
+(0.56920904 to 0.56920898 at batch 16), within the forms' fp32 bound
+(tests/test_depthwise_conv.py). In bf16 the shifted form would cost 65.4
+and 107.0 ms. The published model samples in fp32, and the live sampler's
+call (15 DPM-Solver++ steps under CFG, `0964f573`, median of five, two
+rounds each) is faster too: batch 1 101.0-102.0 to 97.5-98.1 ms, batch 4
+268.2-269.3 to 257.4-259.0, the denoising scan alone 93.0-93.2 to 90.1-90.5
+and 236.8-237.6 to 226.8-227.7, peak memory within the rounds' spread. Its
+latents and fp32 images move within twice what one rounding of the
+convolutions moves them (the published-sample test). On an A100 (c15,
+integration `6a220e31`, two alternating rounds) the fp32 step is faster
+the same way, 66.73/66.78 to 63.44/63.37 ms at batch 16 and 117.43/117.47
+to 111.03/110.97 at 32, and bf16, polyphase either way, is the same
+program (42.17/42.39 and 42.12/43.01 ms, 63.96/64.12 and 64.01/64.18).
+
+The S5 layer ran its recurrence as `associative_scan` over complex
+states, whose backward spent 4.5 ms of the 4080's step in complex
+arithmetic alone. On a GPU and the CPU it now runs in real arithmetic, in
+chunks: inside a chunk the states are one fp32 product of the pole's
+powers with the chunk's inputs, and `associative_scan` carries only the
+chunks' last states. The powers come by doubling, the powers so far times
+the next squared power, so each rounds at most 2 log2(t) times, and the
+`[L, L]` Toeplitz block is a one-hot product of them, exact at full
+precision, whose transpose is a product too. Both directions' complex
+input products run as one real product. A TPU runs the layer as it first
+did, unchanged (`dew.nn.ssm._directions`): compiled for a v6e its program
+has the same 5125 instructions and estimated cycles as before. The rows
+below are `tools/benchmark_step.py`, ms per step (the asynchronous
+throughput a run sees), and the live sampler's call
+(`dit_sample_time.py`: 15 DPM-Solver++ steps under CFG 5.0, the denoising
+scan alone), the scan against the chunks, 2026-10-03:
+
+| device | step, batch 16 | step, batch 32 | sampler, 1 image | sampler, 4 images |
+|---|---:|---:|---:|---:|
+| RTX 4080 (integration `17e2b226`, two rounds) | 66.63/66.41 to 60.15/60.14 | 110.26/110.21 to 100.80/100.65 | | |
+| A100 40 GB (Colab, `db1761fd`, a first form) | 42.38 to 40.89 | 65.67 to 62.39 | | |
+| CPU (i9-12900K, 4 threads, the live sampler's `0964f573`, ABAB) | | | 17.17 to 14.19 s | |
+
+On the CPU the row is the live sampler's call without its VAE decode, the
+median of nine calls in three alternating processes on a loaded host
+(14.55-20.52 s against 13.31-19.73), and a second session agreed (14.35
+and 14.50 against 13.07 and 13.57); with the decode, 25.47 against 22.06
+s. Peak RSS is within the processes' spread (medians 4370 and 4414 MiB,
+ranges 3937-4478 and 4221-4829). The image's bits change with the
+arithmetic (sha256 `923e1b09` to `10b80bfe` at key 0), as they do on any
+backend whose recurrence changes; both forms are held to the same bound.
+
+On a v6e (Colab, three rounds each) neither form won every shape. The
+doubled chunks at `527a32e9`: batch 16 17.25 to 18.03-18.05 ms, batch 32
+34.39 to 32.17-32.20, sampling 1 image 22.0 to 18.8 ms, 4 images 63.6 to
+65.2 with 0.11 GB more at peak. The scan behind the real input product at
+`1f8d5e72`: batch 16 17.26-17.29 to 17.43-17.46, batch 32 34.40-34.43 to
+32.35-32.38, 1 image 22.0 to 16.7, 4 images 63.4-63.5 to 63.0-63.6. So a TPU
+keeps the first form whole. A first chunked form built the powers as a
+running product (`cumprod`) and the Toeplitz block from shifted copies;
+`exp(t log(pole))` was cheaper but rounds the phase of a large-angle pole t
+times over (RMS 1.05e-5 against complex128 on poles all around the unit
+circle, against 1.57e-6 by doubling and 8.5e-7 by the running product).
+Over 4096 positions the doubled chunks' forward RMS error against the
+complex128 oracle is 1.144e-6, the old scan's 1.156e-6.
 
 Unless a section says otherwise, the sections below were measured on jax
 0.11.1 / jaxlib 0.11.1 / jax_cuda12_plugin 0.11.1, driver 595.84, RTX 4080
@@ -401,6 +561,46 @@ torch's elementwise and norm kernels 5.8 and copies 8.9.
 
 ## Attention kernels
 
+### Splash's tiles on the TPU, 2026-10-02
+
+Splash attention took 34 ms of Dew's 156 ms Qwen3-0.6B step at 8 x 1024
+tokens on a TPU v6e. MaxText's took 50 ms of its own, at about 13% of the
+chip's peak in both. The tiles: forward plus backward of Qwen3-0.6B's
+attention (8 x 1024 tokens, 16 query heads over 8, 128 wide, causal, bf16),
+median of 7 rounds of 10 calls, through `dew.nn.attention.splash_attention`
+at integration `8e92a4a6`:
+
+| forward tiles | backward tiles | backward kernels | ms |
+|---:|---:|---|---:|
+| 512 | 512 | dq and dkv apart (was the default) | 1.814 |
+| 512 | 512 | one fused kernel | 1.423 |
+| 1024 | 512 | one fused kernel | 1.397 |
+| 1024 | 1024 | dq and dkv apart | 1.549 |
+| 1024 | 1024 | one fused kernel | 1.282 |
+| 512 | 256 | one fused kernel | 2.194 |
+| 256 | 256 | dq and dkv apart | 3.647 |
+
+Every configuration's errors against fp32 XLA at HIGHEST are the same (out
+3.7e-3, dq 5.0e-3, dk 5.1e-3, dv 2.8e-3 of their maximum). The kernel now
+tiles by 1024 (narrowed to a divisor of each sequence) and runs its
+backward as one kernel. The training steps on the v6e (integration
+`527a32e9`, three rounds each, one batch on the device, ms):
+
+| step | 512 tiles, dq and dkv apart | 1024 tiles, fused backward |
+|---|---:|---:|
+| Qwen3-0.6B widths, 8 x 1024 | 150.34-150.43 | 136.77-136.92 |
+| Qwen3-0.6B widths, 16 x 1024 (head tiled by the fit ladder) | 320.48-320.54 | 278.63-278.66 |
+| 4-layer decoder, 256-wide heads, 8 x 2048 | 80.90-80.95 | 75.36-75.45 |
+| 176M hybrid DiT, batch 16 (4 attention blocks of 256 tokens) | 17.24-17.30 | 17.25 |
+
+These rows are `tools/benchmark_step.py`'s step, with `optax.adam`;
+against MaxText the matched step is the reference runner's, with AdamW and
+its clip ("Training scoreboard" above: 145.3 against MaxText's 154.0 at
+8 x 1024). Losses after the 45 steps differ in the third or fourth
+significant digit (0.003386 against 0.003389 at 8 x 1024), where
+reordering the backward's fp32 sums moves a training run's trajectory; each
+kernel call's errors against fp32 are the same.
+
 ### tokamax's attention, 2026-10-02
 
 tokamax's Pallas-Triton flash attention (openxla/tokamax main at `47d3d663`)
@@ -449,6 +649,19 @@ cuDNN with gradients as accurate:
   ms, attention 9.09 against 9.11; SimpleDiT-B and the decoder alike).
   `uv pip install` resolves the newest cuDNN under 10, so a fresh install
   gets 9.27.
+- JAX's own Pallas-Triton `mha` (`jax.experimental.pallas.ops.gpu.attention`,
+  the keys repeated over each group's query heads), 2026-10-04 at
+  `0527ab19`: one call's forward plus backward over 28 layered calls takes
+  0.33 against cuDNN's 0.38 ms at 1 x 1024 and 1.30 against 1.36 at 4 x 1024,
+  its gradients' RMS distance from float64 1.00 to 1.04 times cuDNN's; in
+  the training step the two tie (two rounds alternating: attention 8.49
+  against 8.52 ms a step and the step 90.6 against 90.8 at 1 x 1024, 15.5
+  against 15.3 and 142.4 against 142.9 at 2 x 1024). tokamax's main has no
+  GPU attention change since `47d3d663`, and JAX exposes no cuDNN algorithm,
+  workspace or determinism choice for its fused attention (non-deterministic
+  is already the default). A kernel of Dew's own to close FlashAttention-2's
+  1.3-1.9 ms a step would be a Pallas-Triton backward, on the backend JAX
+  0.11 deprecates, for under 2% of steps Dew already wins.
 
 tokamax trails JAX's `mha` by 10-18% at 64-wide heads in its backward
 (0.35 against 0.29 ms of the SimpleDiT-B call; the forwards are 0.093 and
@@ -849,6 +1062,451 @@ nothing raises an error. The losses go down (2.44 bf16 against 2.68 fp8 at
 width 256, 0.009 against 0.011 at width 1024, each after 14 steps from the
 same init). On this card, at these sizes, fp8 gives no speedup to adopt.
 
+## Serving against vLLM, 2026-10-03
+
+`tools/benchmark_lm_serving.py`, Qwen3-0.6B bf16 on the RTX 4080, 256-token
+prompts and 128 greedy output tokens, twice as many requests as slots,
+output tokens a second (three repeats; Dew two processes a side, vLLM
+0.30.0 on 2026-10-01):
+
+| slots | vLLM | Dew `1f8d5e72` | Dew, wide cache writes gathered |
+|---:|---:|---:|---:|
+| 32 | 6049-6053 | 5078-5323 | 5513-5532 |
+| 64 | 7614-7618 | 6869-6879 | 7171-7204 |
+| 128 | 9037-9050 | 7758-7773 | 8230-8289 |
+
+The same benchmark later the same day, Dew at `88620c1d` (the prefill's
+cuDNN attention, the head's bf16 logits held as bf16 and the cache writes
+as words, all below) and vLLM 0.30.0 in one session, alternating, two
+processes each, the range over every repeat, with another lane holding the
+host's load average near 50:
+
+| slots | vLLM | Dew `88620c1d` | Dew / vLLM, medians |
+|---:|---:|---:|---:|
+| 32 | 5903-6046 | 5490-5883 | 0.96 |
+| 64 | 7532-7563 | 7540-7619 | 1.01 |
+| 128 | 8949-9049 | 8957-8985 | 1.00 |
+
+Dew is level with vLLM at 64 and 128 slots and 4% behind at 32, where a
+step is shortest and the host's share largest. Each process is
+`tools/benchmark_lm_serving.py --backend dew` (or `vllm-engine`, with
+`VLLM_ENABLE_V1_MULTIPROCESSING=0`) `--slots 32,64,128 --repeats 3` over the
+Qwen3-0.6B checkpoint; its JSON holds each repeat's `output_tokens_per_second`.
+
+At 64 slots a Dew decode step takes 6.96 ms on the device: attention 4.0
+ms, at the bound of reading the dense cache's keys and values (2.8 GB a
+step at 716 GB/s), and the projections and head 2.1 ms, near the bound of
+reading the weights. Each of the 16 admission steps (8 prompts prefilled
+beside the other rows' decode) took 40 ms, and 8 of them were the prefill's
+key and value writes: XLA lays the prefill's fresh cache out with its slots
+minor, for the attention that reads it, and scattering whole tokens into
+that layout ran at 28 GB/s. A write as wide as its buffer now gathers each
+slot's token (`dew.nn.kv_cache.write_cache`), with the same bits: tokens
+and both log-probability streams are identical at every slot count.
+
+A decode step's attention reads each key head once for its group of query
+heads: the group goes in as that head's query positions. cuDNN otherwise
+padded the lone query to two positions and ran each query head on its own.
+The kernel is the evidence: at 64 rows over 384 slots it takes 0.146
+against 0.154 ms a layer, and 0.072 against 0.129 when every row has 257
+keys, with the same bits. Serving at integration `17e2b226` is consistent
+with that and no more, since the host was loaded and the differences sit
+inside its spread: medians of 15 runs, 32 slots 5489-5510 to 5521-5619
+tokens a second, 64 slots 7175 to 7215, 128 slots 8219 to 8343 (both sides
+had slow runs, the slowest 5196 and 4685 at 32 slots), the tokens and
+log-probabilities identical.
+
+### The remaining gap, 2026-10-03
+
+At 64 slots Dew serves 7146 and 7197 tokens a second (medians of five
+runs, two processes, integration `6a220e31`) against vLLM 0.30.0's
+7596-7609 in-process (three runs, one process). Both schedule alike: Dew
+runs 265 model steps a run, vLLM 267 (its scheduler's steps, counted in
+its engine process), each admitting up to 8 prompts a step beside the
+other rows' decode. So the gap is per step: 8.6 ms of Dew's wall against
+8.0 of vLLM's. Whole measured runs traced, Dew under XProf (`f6047cf9`)
+and vLLM under Nsight with its CUDA graphs' nodes:
+
+| | Dew | vLLM, 249 of 267 steps traced |
+|---|---:|---:|
+| GEMMs | 891 ms | 907 ms |
+| attention | 1016 ms, 138.7 us a decode call | 943 ms, 136.6 us a decode call |
+| everything else | 313 ms | 154 ms |
+| device busy | 2.22 s of 2.29 | 2.00 s of 2.18 |
+
+Nsight warned that not every CUDA event was collected, and its trace holds
+249 of the run's 267 steps, so vLLM's rows are low by about 7%: scaled to
+the whole run, its attention is Dew's and its GEMMs 80 ms slower. Dew's
+extra device time is many small kernels: the residual add with the split-K
+GEMM's sum and its cast (52.5 ms in 22859 launches), the norms (80.7 ms in
+32201), the cache writes (61.0 ms) and the transposes around attention
+(48.8 ms), each one to three microseconds, where vLLM fuses an add into
+its RMSNorm and writes K and V in one kernel. Dew's 2.29 s run also holds
+70 ms without a kernel running.
+
+Measured and not adopted, each under 1% of the run:
+
+- K and V written by one Pallas kernel a layer instead of XLA's two
+  scatters: 0.141 against 0.166 ms a decode step for all 28 layers,
+  bitwise the same.
+- XLA's command buffers: on by default, cuDNN's attention among the
+  commands the decode step replays; every command type with no minimum
+  graph size measured within the default's spread, off is slower, and the
+  tokens are the same three ways.
+- JAX's Pallas split-KV decode attention (`gqa`): 0.43 ms a layer on the
+  cache as Dew stores it, which it transposes, against cuDNN's 0.165; its
+  kernel on a head-major cache 0.155 ms at its best tiles, with other bits
+  than cuDNN's.
+- Triton multi-output fusion and a single split-K, one traced run each:
+  device time 2222.2 and 2216.2 ms against 2222.3-2224.6.
+- Freeing a slot in the step that finishes it, rather than when the host
+  reads that step's results: the schedule, counted step by step, would
+  take 263 steps instead of 265.
+
+What remains is the small kernels vLLM fuses, at most about 1.5% of the
+run by the launches a fused add and norm would save, and the idle between
+steps. The rates are `tools/benchmark_lm_serving.py`'s; the traces are one
+measured run each, Dew's under `dew.Profiler` and vLLM's under Nsight
+Systems with `--cuda-graph-trace=node`, kernel time summed by family.
+
+The idle between steps, 2026-10-03. Two host costs left the device waiting.
+A request's key took three small programs to make at submission (the seed
+moved to the device, made a key, folded), which ran between steps after
+the device had drained; and the admitting step's inputs are fresh buffers
+every call, so XLA updated its CUDA command buffer before it could replay,
+about 5 ms before 9 of a run's 16 admitting steps. Now an integer seed
+stays on the host until the admission's one key program makes and folds
+every row's key (`_row_keys`, the same bits as an eager key), and the
+admitting step compiles without command buffers (`ADMISSION_OPTIONS`); the
+decoding step keeps them. The benchmark submits integer seeds, as a client
+sends them. RTX 4080, the change against its parent, three alternating
+rounds, medians of five runs, tokens a second:
+
+| slots | before | after |
+|---:|---:|---:|
+| 32 | 5664 / 5657 / 5663 | 3960 / 5728 / 5728 |
+| 64 | 7131 / 7229 / 7222 | 7360 / 7359 / 7357 |
+| 128 | 8329 / 8355 / 8346 | 8527 / 8528 / 8524 |
+
+One process ran all five of its 32-slot runs slow (3846-4054) and its
+64- and 128-slot runs at the others' rate; four more alternating rounds at
+32 slots gave 5729-5730 after against 5564-5669 before. An earlier
+session on a loaded host gave the same order at every slot count. The
+tokens and both log-probability streams are the same in every run. The
+admitting step was its own compile before too (the step's jit traced it
+apart from the decoding one), so a cold server's start is unchanged:
+`Server.from_task` to the first token, no compilation cache, two
+alternating rounds, 34.9 and 35.5 s before, 38.7 and 35.2 after. A
+traced 64-slot run idles 74.7-83.2 ms before and 40.9-42.1 after (one of
+five traces 76.0, one 838 on a host load spike); what is left is mostly the
+traced client's own keys. Each trace is one measured 64-slot run of the
+benchmark's prompts under `dew.Profiler`, idle summed between kernels.
+
+Several decode iterations a device call (`decode_steps`), measured after
+that change, 2026-10-03: slower at every slot count, and with nothing left
+to gain. Tokens a second, RTX 4080, admission 8 rows, medians of five runs,
+vLLM from the table above:
+
+| slots | vLLM | 1 | 2 | 4 | 8 |
+|---:|---:|---:|---:|---:|---:|
+| 32 | 6049 | 5726 | 5696 | 5500 | 5106 |
+| 64 | 7614 | 7216 | 7271 | 6975 | 6573 |
+| 128 | 9047 | 8527 | 8357 | 7861 | 7231 |
+
+A call seats requests only before its first iteration, so filling 64 slots
+8 rows a call takes 8 calls of k iterations, and a run takes 265, 274,
+292 and 328 iterations. Seating at every iteration would at most win back
+the idle: a traced 64-slot run at one iteration a call keeps the device
+busy 2228 ms of 2242, idle 20 ms (0.9%), since the decoding step already
+replays as CUDA graphs and the host runs ahead. Seating 8k rows a call
+(the default) changes the prefill's shapes and so its GEMM kernels, and the
+tokens differ from one iteration a call; at 8 rows they are the same at 32
+and 64 slots (the log-probabilities within 9.5e-6), while at 128 the
+decoding GEMMs inside the longer program autotune to other kernels.
+Each cell is `tools/benchmark_lm_serving.py --decode-steps K --admission 8
+--generations`, its generations compared to K=1's.
+
+The decoding step's small kernels, 2026-10-03. Per 64-slot decode step on
+the RTX 4080 Dew's device spends 8.39 ms to vLLM's about 8.05: GEMMs 3.37
+against 3.64, attention 3.84 against 3.79, everything else 1.18 against
+0.62. The largest of the rest was one kernel, 136 us a step: the held
+logits merged with the step's over every slot's vocabulary in fp32, so
+that a row seated this step drew from its prompt's. A step that seats no
+row has every drawing row fed, so it now takes the model's logits whole;
+only a seating step merges. Tokens a second, three alternating rounds,
+medians of five runs, the tokens and both log-probability streams the same
+in every run:
+
+| slots | before | after |
+|---:|---:|---:|
+| 32 | 5710 / 5729 / 3389 | 5780 / 5779 / 5746 |
+| 64 | 7364 / 7363 / 7236 | 7410 / 6545 / 7407 |
+| 128 | 8543 / 8527 / 8461 | 8610 / 8559 / 8609 |
+
+(one process each side ran on a load spike, 3389 and 6545). The bf16
+rounding of the logits now runs as its own kernel, 57 us a step. Not
+storing the step's logits at all lets XLA fuse that rounding into the
+draw, 27 us more, but the draw's log-softmax then sums in another order:
+at 32 slots 430 log-probabilities move by up to 3.8e-6, so the step still
+stores them.
+The attribution traces a run under `dew.Profiler` with command buffers off
+(`--xla_gpu_enable_command_buffer=`) and the optimized HLO dumped, and
+names each kernel by its `hlo_op` there.
+
+The head's bf16 rounding, 2026-10-03. The logits are bf16 values held in
+fp32 (`dew.nn.precision.head_product`), and `rounded_to`'s reduce-precision
+did not join XLA's Triton head GEMM, so a serving step wrote the fp32 logits
+and read them back to round them before the draw's three readers (the
+well-formedness check, the argmax with the log-softmax maximum, and the sum
+of exponentials) read them again: a 157 to 178 us kernel of its own at 128
+rows. Under CUDA the logits are now cast to bf16 behind a barrier
+(`bf16_logits`), so the cast joins the GEMM's epilogue and each reader widens
+the bf16 copy itself. The values and cotangents are `rounded_to`'s, bitwise
+(tests/test_precision_policy.py), and so are the served tokens and
+log-probabilities at 32, 64 and 128 slots. The head and greedy draw alone
+went from 1.145 to 0.981 ms at 128 rows of Qwen3-0.6B's widths, and the
+serving run's device busy time from 2211.0 to 2198.5 ms at 64 slots and from
+3803.5 to 3768.7 ms at 128 (two traced runs each). Training's loss head
+rounds its tiles itself (`dew.objectives.lm.chunked`) and other platforms
+keep `rounded_to`. The bits are
+`tests/test_precision_policy.py::test_bf16_logits_round_as_rounded_to_and_are_held_as_bf16_under_cuda`
+and `tools/benchmark_lm_serving.py --generations` on each tree; busy time is
+one traced run under `dew.Profiler`.
+
+A fused decode prologue, measured and removed. XLA runs a layer's q and k
+norms, the rotated key's scatter into the cache, the value's, and the
+query's rotation and GQA fold as five kernels of one to three microseconds
+each. A Pallas Triton kernel doing all five in one program a row took 28
+layers at Qwen3-0.6B's widths from 0.191 to 0.097 ms and served Qwen3-0.6B
+2-3% faster with the tokens and log-probabilities bitwise in every run
+(5943 / 7587 / 8765 tokens a second at 32 / 64 / 128 slots against vLLM's
+6049 / 7614 / 9047). Serving Qwen3-1.7B, whose heads have the same widths,
+its tokens differed from the unfused step's (1349 of 8192 at 32 slots),
+each side repeatable. (A record here first read that as the unfused step
+being unrepeatable; the run had taken the kernel on both sides.) The
+difference was the norm: its sum over a head's 128 lanes, even given XLA's
+own statistics from a standalone reduction, put one or two elements a head
+on the other bf16 neighbour of the unfused step's. XLA's reduction order
+inside its norm fusion depends on the fusion, and its rsqrt is the
+hardware's approximation, so there was no fixed arithmetic to match. A
+kernel that left the norms to XLA's own fusions and took only the
+rotation, both cache writes and the fold was bitwise on both models, but
+saved 3 of the 5 kernels: the device's busy time per 64-slot run went from
+2211 to 2186 ms, and the Pallas call fell outside XLA's default CUDA
+command buffers, which then needed `CUSTOM_CALL` in the decoding step's
+options or the run idled 200 ms more. Under 1% for a kernel on a backend
+JAX 0.11 deprecates was not worth keeping, so it was removed; the
+rotation-only kernel stays on the `perf/prologue-bitwise` branch.
+
+Where the gap sits at 128 slots, and the prefill's attention, 2026-10-03. A
+traced 128-slot run (integration `66a1848c`, command buffers off so each
+kernel is attributed to its program and HLO scope) puts attention and GEMMs
+at parity: cuDNN's decode attention took 259 us a call against vLLM FA2's
+266, and the GEMMs 4.68 against 4.74 ms a step. The gap is the small
+kernels: 1.26 ms of them a decode step against vLLM's 0.50, and 8.1 ms an
+admission (32 admissions of 8 prompts). The largest admission item was the
+prefill's attention. Admission left-pads its prompts and writes their keys
+compactly, so the cache prefill builds the cursor mask, and
+`kernel_for_materialized_mask`, a rule for training (cuDNN's bias backward
+refuses odd lengths), sent it to xla: two dense dots, a softmax and four
+mask transposes, 3.7 ms an admission. A cache call over more than one
+query now gives that mask to cuDNN as its bias where cuDNN runs (training,
+single-token decode, CPU and the deterministic-ops CUDA lane are
+unchanged): 4.0 against 6.2 ms over 28 layers in isolation, and the
+device's busy time per run went from 2212.6 to 2179.2 ms at 64 slots and
+from 3807.4 to 3745.1 ms at 128 (two traced runs each, the same in both).
+
+It is not bitwise: cuDNN rounds at other points than xla's dots and
+softmax. Under tests/reference_error.py's rule, against the same bf16
+weights computed in fp32 at the highest precision over 8 of the benchmark's
+prompts cut to mixed lengths and left-padded, the cuDNN prefill's RMS
+distance is 1.036 times xla's on Qwen3-0.6B's logits (1.088 on the
+log-probabilities) and 0.999 (0.987) on Qwen3-1.7B's, against an allowed 2;
+the argmax agrees with fp32 at 96.4 against 96.8% of positions on 0.6B and
+96.9 against 97.2% on 1.7B. Greedy generations over the benchmark's
+random-token prompts part in 56 of 128 rows at 64 slots, each run
+repeatable, and every first divergence is a bf16 near-tie: teacher-forced
+through the fp32 model, the two chosen tokens' logits are a median 0.64
+bf16 spacings apart at their magnitude, the largest 2.78, 77% under one and
+98% under two, and the fp32 argmax is the xla prefill's choice in 31 rows
+and cuDNN's in 23.
+`tests/test_causal_transformer.py::test_a_padded_prefill_attends_through_cudnn_where_it_runs`
+holds the routing. The distances apply `tests/reference_error.py`'s
+`distance` to the cache prefill and to `dew.pipeline(..., dtype="float32")`
+under `jax.default_matmul_precision("highest")` over the same tokens.
+
+The cache writes as words, 2026-10-03. XLA's scatter stores one element a
+thread, so a bf16 cache moved two bytes a store: each decode layer's key and
+value writes took 3.7 us apiece at 128 rows, and an admission's prefill
+windows 28 us a cache. On a GPU `write_cache` and admission's placement now
+move a one- or two-byte cache's bits as uint32 words
+(`dew.nn.kv_cache.as_words`; a word-wide or boolean leaf, an axis that does
+not fill whole words, and a TPU, which tiles two-byte arrays on another axis,
+are written as they are). Over 16 caches in isolation the decode write went
+from 0.113 to 0.099 ms and admission's from 0.627 to 0.277; the served tokens
+and log-probabilities are bitwise at 32, 64 and 128 slots, and the run's
+device busy time went from 2165.6 to 2149.5 ms at 64 slots and from 3704.2
+to 3649.5 ms at 128 (two traced runs each, integration `456a4b64`).
+`tests/test_kv_cache.py::test_a_cache_write_moves_whole_words_with_the_same_bits`
+holds the bits.
+
+The cache's validity, derived, 2026-10-04. Each attention cache stored a
+`[rows, capacity]` mask of its filled slots beside the cursor, though slots
+fill in order and the mask was always the cursor's `filled_slots`. A decode
+step rewrote it in every layer, 28 one-microsecond kernels whose only reader
+was the carried state. It is now derived where read
+(`dew.nn.attention.cached_validity`), in the attention, Llama 4, MLA, the
+DSA pool and DeepSeek V4, and serving no longer places or zeroes it. The
+served tokens and log-probabilities are bitwise at 32, 64 and 128 slots, and
+the device's busy time a run went from 1393.7 to 1388.3 ms at 32 slots,
+2147.5 to 2139.2 at 64 and 3645.2 to 3626.2 at 128 (two traced runs each).
+
+### Open loop, 2026-10-04
+
+The table above submits every request at once and keeps the slots full,
+which no user's traffic does. `tools/benchmark_lm_serving.py --rate` sends
+six times the slots in requests as a Poisson process at each rate (seeded
+per slot count) to a server that queues them; TTFT runs from a request's
+arrival and the token gaps are per token, each decoding row's time between
+consecutive tokens. Qwen3-0.6B, the same prompts and outputs, the RTX 4080
+on a quiet host, Dew at integration `420ea2c1`, then with bucketed admission
+in the same session as vLLM 0.30.0:
+
+| slots | rate | Dew `420ea2c1` tok/s, TTFT p50 / p99, gap p99 (ms) | Dew bucketed | vLLM |
+|---:|---:|---|---|---|
+| 32 | 16 | 1985, 34.6 / 61.2, 28.5 | 1990, 12.8 / 19.5, 8.0 | 1990, 13.8 / 33.5, 8.4 |
+| 32 | 24 | 2892, 55.3 / 257, 29.9 | 2929, 13.6 / 19.9, 8.5 | 2928, 15.4 / 30.1, 15.5 |
+| 32 | 32 | 3216, 536 / 1216, 30.2 | 3832, 15.5 / 31.9, 11.2 | 3829, 16.3 / 33.7, 11.3 |
+| 64 | 24 | 2877, 42.6 / 85.3, 30.9 | 2886, 15.0 / 25.3, 10.1 | 2893, 14.6 / 22.2, 7.0 |
+| 64 | 36 | 4071, 589 / 1047, 32.4 | 4170, 18.0 / 55.2, 16.5 | 4279, 16.5 / 26.1, 8.8 |
+| 64 | 48 | 4469, 1454 / 2258, 32.8 | 5580, 68.1 / 458, 55.4 | 5620, 21.3 / 33.7, 14.0 |
+| 128 | 32 | 4093, 80.5 / 647, 93.8 | 4210, 21.0 / 32.3, 14.2 | 4240, 16.7 / 27.5, 9.1 |
+| 128 | 44 | 5068, 1140 / 1989, 64.2 | 5701, 26.8 / 43.2, 18.6 | 5756, 20.2 / 32.4, 11.7 |
+| 128 | 56 | 5320, 2217 / 4449, 83.5 | 7064, 34.6 / 55.0, 23.4 | 7090, 35.8 / 57.2, 22.4 |
+
+The admitting program prefilled every row of its admission, so a request
+arriving alone was padded to eight prompts of prefill. Those admitting
+steps were the token gaps' p99, 28 to 94 ms, and they cut the server's
+capacity until its queue grew without bound at rates vLLM served with a
+TTFT p50 under 40 ms.
+Each admitting step is now padded only to the smallest power of two that
+holds its prompts (`dew.inference.serving.admission_share`), each width its
+own compiled program. The closed-loop runs are unchanged: an admission that
+fills its width is the same program, and the 32-, 64- and 128-slot
+generations are bitwise. With buckets Dew is level with vLLM at 32 slots,
+with shorter TTFT tails. At 64 and 128 slots its token gaps run 1.4 to 2
+times vLLM's at p99, and at 64 slots and 48 requests a second it sits at its
+capacity: a traced run had the device 97% busy, and that cell's TTFT swings
+between runs (p50 21 to 447 ms). The gap is in the admitting step. Dew
+prefills an arriving prompt in a forward of its own beside the decode
+forward, 9.9 ms against a 5.1 ms decode step for one 256-token prompt at 64
+slots, so the weights are read twice. vLLM's chunked prefill puts the
+prompt's tokens into the decode forward's batch.
+
+A narrower prefill runs its GEMMs at other shapes, so a request admitted in
+a narrower bucket than the padded eight can draw other bits: served one at
+a time at 32 slots, 6 of 16 Qwen3-0.6B rows and 8 of 16 Qwen3-1.7B rows
+part from the padded path, each at a bf16 near-tie (teacher-forced in fp32,
+a median 0.5 bf16 spacings apart, at most 1.81, the fp32 argmax the padded
+choice in 7 rows and the bucketed one in 7). Under tests/reference_error.py's
+rule the 1-, 2- and 4-row prefills' RMS distance from the same weights in
+fp32 is 0.96, 0.95 and 0.95 times the 8-row prefill's on Qwen3-0.6B's
+log-probabilities (1.00, 1.00 and 0.99 on the logits) and 1.02, 1.00
+(bitwise) and 1.08 on Qwen3-1.7B's (1.02, 1.00 and 1.07), against an
+allowed 2.
+
+The mixed admitting step, 2026-10-04. An admitting step now runs one
+forward over every token it holds: each slot's last draw, then the admitted
+prompts, laid out in one row (`dew.nn.inputs.Admitted`). Projections, norms,
+the MLP and the head work token by token, so they read their weights once for
+the decoding rows and the prompts together. Attention writes every token's
+keys into its row of the cache in one scatter. Each decoding row's query
+then reads its row as a decode step does, and a prompt that starts its row
+reads its own keys. The decode-only program is untouched: its optimized
+HLO is identical to integration's and its device time per run equal (2540.4
+against 2540.0 ms at 128 slots). Same session, quiet host, Dew at
+integration `ab5966b1` (bucketed admission) and with the mixed step, and
+vLLM 0.30.0:
+
+| slots | rate | Dew `ab5966b1` TTFT p50 / p99, gap p99 (ms) | Dew mixed | vLLM |
+|---:|---:|---|---|---|
+| 32 | 16 | 17.3 / 36.5, 14.0 | 12.6 / 34.5, 9.4 | 13.2 / 17.7, 6.6 |
+| 32 | 24 | 14.6 / 37.8, 12.1 | 13.0 / 22.0, 7.8 | 14.6 / 19.9, 6.8 |
+| 32 | 32 | 14.9 / 27.9, 9.7 | 13.4 / 21.5, 8.2 | 15.3 / 21.7, 7.8 |
+| 64 | 24 | 14.8 / 25.3, 9.2 | 13.5 / 20.3, 8.0 | 14.7 / 22.9, 7.6 |
+| 64 | 36 | 17.0 / 27.8, 11.4 | 15.3 / 25.0, 10.3 | 17.0 / 26.6, 10.6 |
+| 64 | 48 | 20.8 / 37.4, 13.8 | 18.4 / 32.0, 12.1 | 21.1 / 33.7, 14.9 |
+| 128 | 32 | 20.6 / 33.9, 14.2 | 19.1 / 29.6, 13.1 | 17.1 / 34.8, 12.0 |
+| 128 | 44 | 26.3 / 42.3, 17.1 | 23.9 / 39.7, 15.9 | 24.6 / 79.2, 25.1 |
+| 128 | 56 | 34.7 / 55.4, 23.1 | 31.2 / 50.5, 22.5 | 38.4 / 64.6, 23.0 |
+
+The three serve the same tokens a second at every rate, within 0.8%. With
+the mixed step Dew's median TTFT is the shortest of the three in 8 of 9
+cells, and at 64 and 128 slots its p99 TTFT and token gap are at or below
+vLLM's from 36 requests a second up. At 32 slots vLLM keeps the shorter
+token-gap tails, by 0.4 to 2.8 ms at p99, and the shorter TTFT p99 at the
+two lower rates. (The 64-slot, 48-a-second cell that saturated in
+the earlier session did not here; that rate sits near the server's
+capacity.) Closed loop, three repeats in two alternating rounds: 32 slots
+5929 to 5994 tokens a second, 64 slots 7673 to 7766, 128 slots 9039 to
+9033-9072. Traced at 128 slots, the admitting program took 1068 against
+1078 ms a run: GEMMs 671 against 676, attention 253 against 252.
+
+The mixed step is not bitwise to the two forwards: its GEMMs run at other
+shapes. Against the same bf16 weights computed in fp32 at the highest
+precision, over 28 decoding rows and four admitted prompts of 64 to 256
+tokens, its RMS distance is 0.84 times the two forwards' on Qwen3-0.6B's
+decoding logits and 0.97 on its prompt logits (log-probabilities 0.83 and
+0.95), and 1.09 and 0.99 on Qwen3-1.7B's (1.14 and 0.98), against
+tests/reference_error.py's allowed 2. At 32 slots 27 of 64 greedy rows part
+from integration's, all at bf16 near-ties (a median 0.57 bf16 spacings in
+fp32, at most 1.44; fp32's argmax is the two-forward choice in 16 rows and
+the mixed one in 11).
+
+Over a paged cache, 2026-10-04. The mixed step now runs over a page pool
+too: the admitted rows' tables go into the cache before the step writes, each
+token lands in its row's page, and the decoding rows read the pool through
+cuDNN's paged kernel as a decode step does. Pieces that continue a row (a
+chunked prompt, a shared prefix's pages) read the row's earlier keys from
+the pool; a server with neither has its pieces read only their own keys. A dense
+cache takes chunked prefill the same way (`chunk`), which only the mixed
+step serves. The paged decode-only programs are identical to integration's.
+Same session, two alternating rounds at integration `ab60614a`, the second
+round (the first ran under another lane's load):
+
+| slots | rate | paged, two forwards: TTFT p50 / p99, gap p99 (ms) | paged, mixed |
+|---:|---:|---|---|
+| 32 | 16 | 17.8 / 23.7, 9.9 | 16.5 / 22.4, 8.8 |
+| 32 | 24 | 18.2 / 27.3, 10.0 | 16.6 / 22.0, 8.9 |
+| 32 | 32 | 18.1 / 26.5, 10.3 | 16.9 / 24.0, 11.0 |
+| 128 | 32 | 40.3 / 58.5, 26.0 | 38.1 / 55.6, 23.7 |
+| 128 | 44 | 42.9 / 63.7, 26.3 | 41.0 / 61.0, 25.7 |
+| 128 | 56 | 50.6 / 231.3, 26.3 | 44.8 / 161.7, 25.8 |
+
+Closed loop the mixed step went from 5576-5577 to 5583-5656 tokens a
+second at 32 slots and from 8254-8274 to 8330-8334 at 128. A traced
+32-slot run at 24 requests a second put a one-row admitting step at 8.30
+against 9.22 ms. The paged decode step itself is slower than the dense one
+(at 128 slots and 32 requests a second a token gap's p50 is 11.7 ms paged
+against 5.4 dense), so a dense cache stays
+the faster way to serve where the memory fits. The served tokens part from
+the two forwards' as the dense cache's do: the same 27 of 64 rows at 32
+slots, all at bf16 near-ties.
+
+Under `--xla_gpu_deterministic_ops` (the CUDA test lane's flag) the paged
+write, a scatter into the pool's page and offset axes past an unindexed
+head axis, put a dropped token's keys at another head's kept slot (jax
+0.11.2, an RTX 4080): the expander's out-of-range rows were padded with 0
+on the unindexed axis, so a window offset along it collided with a kept
+index. openxla/xla#49498 fixes it (issue #49380), after the jax pin. Mapped
+over a group of one, as the paged cache's other write is, the scatter is
+right, so `KVStore.write_tokens` writes that way.
+
+Open: latent attention (MLA, DSA), sliding windows, sinks, quantized or
+rotated caches, a pool split into groups, hybrids whose recurrent layers
+read their row's tokens in order, and prediction depths keep the two
+forwards; a server names which (`Server.mixed_refusal`, logged at build).
+
 ## Quantized serving of the 176M text-to-image model, 2026-09-28
 
 `TextToImage.quantized` serves the denoiser with its kernels stored as int8
@@ -1093,6 +1751,65 @@ With the rule, the same steps against XLA's default (the merger on), measured th
 | 3-layer decoder, full | 4 x 256 | 10.02 | 10.00 | -0.3% |
 
 At 128 tokens the shapes disagree, in two more sessions of merged against apart: 1 x 128 runs 20.65 and 20.65 ms merged against 18.98 and 19.11 apart, where 2 x 64 runs 18.72 and 18.63 against 18.96 and 19.03, and 4 x 32 18.56 and 18.50 against 18.91 and 18.81 (1 x 96: 18.22 and 18.22 against 18.41 and 18.43; 1 x 160: 22.33 and 21.95 against 20.57 and 20.37). A boundary below 128 would run 2 x 64 and 4 x 32 1.3-2.1% slower than XLA's default, so it includes 128, and 1 x 128 runs at XLA's default, 1.6 ms behind apart.
+
+### The forward's bf16 weights: `NARROW_COPY_GENERATIONS`, 2026-10-03
+
+A bf16 model over fp32 parameters cast each weight to bf16 in the forward,
+a CUDA kernel per weight every step (on Qwen3-0.6B at 1 x 1024 on the RTX
+4080, 5.7 ms of casts), and widened each weight's bf16 gradient back to
+fp32 in the backward (1.8 ms). On `sm80` and `sm89` the update now writes
+the bf16 copy of each such weight (`TrainState.compute`) from the new fp32 value,
+the forward reads the copy, and the gradient reaches the update in bf16,
+widened as the update reads it (`dew.training.narrow`). Only a weight whose
+one use in the loss is that cast is copied: a tied embedding's table (two
+uses, so its cotangents sum in fp32), the norms' scales (not read through
+a lone cast) and a weight a custom VJP reads keep their fp32 read. RTX 4080, the step against
+its parent, two alternating rounds, ms:
+
+| row | before | copies | peak GiB |
+|---|---:|---:|---:|
+| Qwen3-0.6B, 1 x 1024, AdamW (dew_lm) | 96.03 / 96.09 | 90.88 / 90.71 | 9.87 -> 9.86 |
+| Qwen3-0.6B, 2 x 1024 | 147.94 / 148.25 | 142.44 / 142.32 | 11.94 -> 11.94 |
+| 176M hybrid DiT, batch 16 | 60.11 / 60.13 | 57.86 / 57.74 | 5.02 -> 5.03 |
+| 176M hybrid DiT, batch 32 | 100.81 / 100.72 | 99.43 / 99.22 | 6.94 -> 6.96 |
+| SimpleDiT 768, batch 32 | 72.68 / 72.69 | 71.46 / 71.56 | 4.99 -> 5.01 |
+| SimpleDiT 384, batch 16 | 7.38 / 7.41 | 7.21 / 7.27 | 0.67 -> 0.67 |
+| decoder, 3 layers, 16 x 512 | 49.08 / 49.12 | 48.79 / 48.80 | 3.97 -> 3.98 |
+| 99M MoE, 8 x 1024 | 78.13 / 78.09 | 78.06 / 78.03 | 9.56 -> 9.56 |
+
+No row moved to another rung of the fit ladder. The MoE's experts run
+through the grouped matmul, which reads them otherwise, so it gains
+nothing. An A100 40 GB (Colab, integration `6a220e31`, copies off and on
+in one session, two alternating rounds, ms):
+
+| row | before | copies | peak GiB |
+|---|---:|---:|---:|
+| Qwen3-0.6B, 4 x 1024, AdamW (dew_lm) | 128.45 / 128.37 | 125.88 / 125.93 | 16.08 -> 16.08 |
+| 176M hybrid DiT, batch 16 | 45.71 / 45.01 | 40.79 / 41.07 | 5.77 -> 5.78 |
+| 176M hybrid DiT, batch 32 | 63.96 / 63.96 | 62.66 / 62.89 | 8.43 -> 8.45 |
+| SimpleDiT 768, batch 32 | 39.26 / 39.30 | 38.24 / 38.24 | 6.12 -> 6.13 |
+
+The forward and the gradients are the cast's to the bit: under plain SGD
+every parameter is bitwise the same after three steps
+(tests/test_narrow.py). The update's arithmetic rounds otherwise, its fp32
+multiply-adds contracted differently with the widening inside it (Adam's
+second moment within 1 ulp after two steps); every accumulation is still
+fp32. A deterministic Qwen3-0.6B run (dew_lm, AdamW and its clip) is
+bitwise for 13 steps and within 2.7e-3 of the loss at 40, where two default
+runs of the parent differ by 3.9e-3. `tools/lm_step_parity.py`'s decoder
+(100 steps) and the hybrid DiT on one batch (300 steps), twice each way:
+the DiT's four runs are bitwise equal at every step, and the decoder's two
+runs with copies equal one of the parent's two at every step, the parent's
+pair 6.9e-4 apart at most. On the A100, whose runs are not repeatable, the
+decoder's runs with and without copies are at most 1.13e-3 apart at any
+step, within the 8.3e-4 and 1.13e-3 each side's pair differs by, and the
+DiT's at most 2.26e-2, against 2.23e-2 and 1.53e-2 within its pairs; the
+final losses are 0.36587 and 0.36163 without copies, 0.36583 and 0.36631
+with.
+
+A TPU fuses the cast into the matmul, so there the copies would only add
+writes (Qwen3-0.6B's widths at 8 x 1024 compiled for a v6e: 85.8 GiB
+written a step against 79.8, and 2.1 GiB more temporaries).
 
 ### Generations below sm80
 

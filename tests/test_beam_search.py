@@ -1,24 +1,33 @@
-"""Beam search against searches written independently of the device loop.
+"""Beam search against transformers' own and against searches written apart
+from the device loop.
 
-Two oracles. Over a two-token budget with the width set to the vocabulary the
+transformers' `_beam_search` (tools/beam_reference.py, 5.16.1) on the
+llama-tiny and qwen3-tiny checkpoints: three prompts, width three, three
+returned beams, six new tokens, an EOS that ends some beams inside the
+budget, under four settings of the length penalty and early stopping. Its
+beams are the float64 search's too, so a rounding cannot choose them.
+
+One more oracle: over a two-token budget with the width set to the vocabulary the
 search is exhaustive, so the returned hypothesis has to be the best-scoring
 sequence out of every one that exists, under whatever length normalization is
-asked for. Over a longer budget with a narrow width the oracle is a plain host
-beam search written from `_beam_search`'s rules in Transformers 5.16.1, run on
-full forward passes with no cache, which also checks that branching the cache
-rows keeps each beam's own prefix.
+asked for.
 """
+
+import json
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from reference_error import assert_as_exact_as_the_reference
 from test_text_rollout_contract import decoder
 
+from dew.interop import Pretrained
+from dew.nn.inputs import ModelInputs
 from dew.sampling import Beam, Sampling, decoding, generate
 
 VOCAB = 13
-DEAD = -1.0e9
 
 
 @pytest.fixture(scope="module")
@@ -49,34 +58,6 @@ def every_sequence(model, params, prompt, budget, eos_ids=()):
     return done
 
 
-def host_beam(model, params, prompt, budget, width, eos_ids, penalty, early=False):
-    """`_beam_search`'s bookkeeping on the host, over uncached forward passes."""
-    keep = max(2, 1 + len(eos_ids)) * width
-    running, finished, open_ = [([], 0.0)], [], True
-    for position in range(budget):
-        scores = next_log_probs(model, params, [list(prompt) + seq for seq, _ in running])
-        candidates = sorted(
-            (([*seq, token], float(total + scores[index, token]), token)
-             for index, (seq, total) in enumerate(running) for token in range(VOCAB)),
-            key=lambda entry: -entry[1])[:keep]
-        hits = [entry[2] in eos_ids or position + 1 == budget for entry in candidates]
-        recording = open_ and not (early is True and len(finished) >= width)
-        for slot, (entry, hit) in enumerate(zip(candidates, hits, strict=True)):
-            if recording and slot < width and hit:
-                finished.append((entry[0], entry[1] / (position + 1) ** penalty,
-                                 entry[2] in eos_ids, position + 1))
-        finished = sorted(finished, key=lambda entry: -entry[1])[:width]
-        running = [(entry[0], entry[1]) for entry, hit in zip(candidates, hits, strict=True) if not hit][
-            :width
-        ]
-        if not running:
-            break
-        reach = budget if (early == "never" and penalty > 0) else position + 1
-        worst = min(entry[1] for entry in finished) if len(finished) >= width else DEAD
-        open_ = open_ and running[0][1] / reach ** penalty > worst
-    return finished
-
-
 def searched(model, params, prompt, budget, width, penalty=1.0, early=False, eos=None, n=1):
     return generate(model, params, jnp.asarray([prompt], jnp.int32), budget,
                     key=jax.random.key(0), sampling=Sampling(eos_id=eos, pad_id=0), n=n,
@@ -85,6 +66,39 @@ def searched(model, params, prompt, budget, width, penalty=1.0, early=False, eos
 
 
 PROMPT = [1, 2, 3]
+FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
+
+
+@pytest.mark.parametrize("name", ["llama-tiny", "qwen3-tiny"])
+def test_beams_are_transformers_beam_search(name):
+    """Every returned beam, its length and its EOS flag as transformers
+    returns them for each prompt, from Dew's batch of the three prompts left
+    padded together, and each beam's score (its summed log probability over
+    its generated length raised to the penalty) held to transformers'
+    float64 search by the float64 rule."""
+    directory = FIXTURES / name
+    pretrained = Pretrained.load(str(directory), dtype="float32", attention_impl="reference")
+    with np.load(directory / "generate.npz") as stored:
+        inputs = ModelInputs(jnp.asarray(stored["prompt"], jnp.int32),
+                             {"attention_mask": jnp.asarray(stored["mask"], bool)})
+        width = stored["prompt"].shape[1]
+    with np.load(directory / "beam.npz") as stored:
+        reference = {key: stored[key] for key in stored.files}
+    eos, pad = int(reference["eos"]), int(reference["pad"])
+    for case, (penalty, early) in enumerate(json.loads(str(reference["settings"]))):
+        found = generate(pretrained.model, pretrained.variables, inputs, 6, key=jax.random.key(0),
+                         sampling=Sampling(eos_id=eos, pad_id=pad), n=3,
+                         strategy=Beam(width=3, length_penalty=penalty, early_stopping=early, stop_ids=1))
+        want = reference[f"case_{case}_tokens"]
+        np.testing.assert_array_equal(np.asarray(found.tokens)[:, width:], want, err_msg=f"case {case}")
+        ended = want == eos
+        lengths = np.where(ended.any(-1), ended.argmax(-1) + 1, 6)
+        np.testing.assert_array_equal(np.asarray(found.lengths), lengths, err_msg=f"case {case}")
+        np.testing.assert_array_equal(np.asarray(found.terminated), ended.any(-1), err_msg=f"case {case}")
+        valid = np.arange(6)[None] < lengths[:, None]
+        summed = np.sum(np.where(valid, np.asarray(found.raw_log_probs, np.float64), 0.0), -1)
+        assert_as_exact_as_the_reference(summed / lengths ** penalty, reference[f"case_{case}_scores"],
+                                         reference[f"case_{case}_scores_f64"], f"case {case} scores")
 
 
 @pytest.mark.parametrize("penalty", [0.0, 1.0, 2.0])
@@ -113,24 +127,6 @@ def test_a_completed_hypothesis_competes_on_its_own_length(model, penalty):
     length = int(found.lengths[0])
     np.testing.assert_array_equal(np.asarray(found.tokens)[0, 3:3 + length], best[0])
     assert length == len(best[0]) and bool(found.terminated[0]) == best[2]
-
-
-@pytest.mark.parametrize("early", [False, True, "never"])
-@pytest.mark.parametrize("penalty", [0.0, 1.0])
-def test_a_narrow_search_matches_a_host_search_with_the_same_rules(model, early, penalty):
-    """Four steps at width three, with an EOS that fires: every returned token,
-    length and termination flag has to match a beam search written on the host
-    over uncached forwards, which only agrees if the cache rows follow the
-    beams they were selected from."""
-    module, params = model
-    eos = int(np.argsort(next_log_probs(module, params, [PROMPT])[0])[-3])
-    found = searched(module, params, PROMPT, 4, 3, penalty=penalty, early=early, eos=eos, n=3)
-    expected = host_beam(module, params, PROMPT, 4, 3, (eos,), penalty, early)
-    assert len(expected) == 3
-    for row, (tokens, _, terminated, length) in enumerate(expected):
-        assert int(found.lengths[row]) == length
-        np.testing.assert_array_equal(np.asarray(found.tokens)[row, 3:3 + length], tokens)
-        assert bool(found.terminated[row]) == terminated
 
 
 def test_the_returned_rows_are_prompt_major_and_carry_no_behaviour_probability(model):
@@ -164,69 +160,30 @@ def test_asking_for_more_hypotheses_than_the_width_is_refused(model):
                  strategy=Beam(width=2), n=3)
 
 
-def shaped(model, params, rows, entries, renormalize):
-    """The log probabilities a source chain of a sequence bias and a
-    renormalization produces, written out in numpy."""
-    scores = np.array(next_log_probs(model, params, rows), np.float32)
-    for tokens, bias in entries:
-        prefix, last = tokens[:-1], tokens[-1]
-        for index, row in enumerate(rows):
-            if len(tokens) <= len(row) and (not prefix or list(row[-len(prefix):]) == list(prefix)):
-                scores[index, last] += bias
-    if renormalize:
-        scores = scores - np.log(np.exp(scores - scores.max(-1, keepdims=True)).sum(
-            -1, keepdims=True)) - scores.max(-1, keepdims=True)
-    return scores
-
-
-def host_beam_shaped(model, params, prompt, budget, width, eos_ids, penalty, early, entries,
-                     renormalize):
-    """`host_beam` over a shaped distribution instead of the plain policy."""
-    keep = max(2, 1 + len(eos_ids)) * width
-    running, finished, open_ = [([], 0.0)], [], True
-    for position in range(budget):
-        rows = [list(prompt) + seq for seq, _ in running]
-        scores = shaped(model, params, rows, entries, renormalize)
-        candidates = sorted(
-            (([*seq, token], float(total + scores[index, token]), token)
-             for index, (seq, total) in enumerate(running) for token in range(VOCAB)),
-            key=lambda entry: -entry[1])[:keep]
-        hits = [entry[2] in eos_ids or position + 1 == budget for entry in candidates]
-        recording = open_ and not (early is True and len(finished) >= width)
-        for slot, (entry, hit) in enumerate(zip(candidates, hits, strict=True)):
-            if recording and slot < width and hit:
-                finished.append((entry[0], entry[1] / (position + 1) ** penalty,
-                                 entry[2] in eos_ids, position + 1))
-        finished = sorted(finished, key=lambda entry: -entry[1])[:width]
-        running = [(entry[0], entry[1]) for entry, hit in zip(candidates, hits, strict=True) if not hit][
-            :width
-        ]
-        if not running:
-            break
-        reach = budget if (early == "never" and penalty > 0) else position + 1
-        worst = min(entry[1] for entry in finished) if len(finished) >= width else DEAD
-        open_ = open_ and running[0][1] / reach ** penalty > worst
-    return finished
-
-
-def test_a_renormalized_biased_search_matches_the_host_search(model):
+@pytest.mark.parametrize("name", ["llama-tiny", "qwen3-tiny"])
+def test_a_renormalized_biased_search_is_transformers(name):
     """A sequence bias followed by a renormalization is what a source with
-    both controls compiles to, and the reference appends the renormalization
-    even for a search. Every returned path has to match a host beam search
-    over the same shaped distribution."""
-    module, params = model
-    entries = [([9], -0.1906398587), ([8, 4], 1.0661105421)]
-    penalty = 2.6265404784
-    chain = (decoding.sequence_bias(entries), decoding.Renormalize())
-    eos = int(np.argsort(next_log_probs(module, params, [PROMPT])[0])[-3])
-
-    found = generate(module, params, jnp.asarray([PROMPT], jnp.int32), 4, key=jax.random.key(0),
-                     sampling=Sampling(eos_id=eos, pad_id=0), logits=chain, n=2,
-                     strategy=Beam(width=3, length_penalty=penalty, early_stopping="never",
-                                   stop_ids=1))
-    expected = host_beam_shaped(module, params, PROMPT, 4, 3, (eos,), penalty, "never",
-                                entries, renormalize=True)
-    for row, (tokens, _, terminated, length) in enumerate(expected[:2]):
-        assert int(found.lengths[row]) == length, (row, np.asarray(found.tokens)[row])
-        np.testing.assert_array_equal(np.asarray(found.tokens)[row, 3:3 + length], tokens)
-        assert bool(found.terminated[row]) == terminated
+    both controls compiles to, and transformers appends the renormalization
+    even for a search: its search with `sequence_bias` and
+    `renormalize_logits` returns the beams, lengths and EOS flags Dew's
+    returns under the same chain. The fixture checks that the bias and the
+    renormalization each move a beam."""
+    directory = FIXTURES / name
+    pretrained = Pretrained.load(str(directory), dtype="float32", attention_impl="reference")
+    with np.load(directory / "generate.npz") as stored:
+        inputs = ModelInputs(jnp.asarray(stored["prompt"], jnp.int32),
+                             {"attention_mask": jnp.asarray(stored["mask"], bool)})
+        width = stored["prompt"].shape[1]
+    with np.load(directory / "beam.npz") as stored:
+        reference = {key: stored[key] for key in stored.files}
+    entries = [(list(tokens), bias) for tokens, bias in json.loads(str(reference["shaped_bias"]))]
+    penalty, early = json.loads(str(reference["shaped_setting"]))
+    found = generate(pretrained.model, pretrained.variables, inputs, 6, key=jax.random.key(0),
+                     sampling=Sampling(eos_id=int(reference["eos"]), pad_id=int(reference["pad"])),
+                     logits=(decoding.sequence_bias(entries), decoding.Renormalize()), n=3,
+                     strategy=Beam(width=3, length_penalty=penalty, early_stopping=early, stop_ids=1))
+    want = reference["shaped_tokens"]
+    np.testing.assert_array_equal(np.asarray(found.tokens)[:, width:], want)
+    ended = want == int(reference["eos"])
+    np.testing.assert_array_equal(np.asarray(found.lengths), np.where(ended.any(-1), ended.argmax(-1) + 1, 6))
+    np.testing.assert_array_equal(np.asarray(found.terminated), ended.any(-1))

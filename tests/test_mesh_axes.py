@@ -541,8 +541,8 @@ def step_text(spec, model):
         sharding=batch_shardings(mesh, {"text": np.zeros((BATCH, SEQ_LEN + 1))})["text"],
     )
 
-    def loss(params, rest, text):
-        return objective.scalar_loss({**rest, "params": params}, {"text": text},
+    def loss(variables, rest, text):
+        return objective.scalar_loss({**rest, "params": variables}, {"text": text},
                            Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(1), ema=None))[0]
 
     placed = jax.tree.map(
@@ -641,6 +641,39 @@ def test_a_vocabulary_split_head_keeps_its_table_where_it_is(dtype):
     assert moved < table // 2, (moved, table)
 
 
+@pytest.mark.mesh(devices=4)
+def test_a_vocabulary_split_head_leaves_the_excluded_column_out_on_every_shard():
+    """The masked objective leaves its mask column out of the partition. On
+    a vocabulary split the column sits in one device's rows (the last
+    shard's here), and each device shifts it into its own numbering as it
+    shifts the targets, so the loss and every gradient are the unsplit
+    head's."""
+    from dew.diffusion.discrete import MDLM
+    from dew.objectives.diffusion.masked import MaskedDiffusionObjective
+
+    model = models.build(
+        "causal_transformer", vocab_size=4096, emb_features=32, num_layers=1, num_heads=4,
+        num_kv_heads=2, mlp_features=64, max_seq_len=SEQ_LEN, causal=False)
+    objective = MaskedDiffusionObjective(model, MDLM(mask_id=4095)(), SEQ_LEN)
+    initial = objective.init(jax.random.key(0))
+    text = jax.random.randint(jax.random.key(2), (BATCH, SEQ_LEN), 0, 4095)
+    step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(1), ema=None)
+
+    def loss(params, text):
+        return objective.scalar_loss({**initial, "params": params}, {"text": text}, step)[0]
+
+    want, want_grads = jax.value_and_grad(loss)(initial["params"], text)
+    mesh = MeshSpec(fsdp=4).build(jax.devices()[:4])
+    shardings = Layout(min_shard=TINY_SHARD).shardings(mesh, initial)
+    with jax.set_mesh(mesh):
+        got, got_grads = jax.jit(jax.value_and_grad(loss))(
+            jax.device_put(initial["params"], shardings["params"]),
+            shard_batch(mesh, {"text": np.asarray(text)})["text"])
+    np.testing.assert_allclose(got, want, rtol=1e-5)
+    for expected, actual in zip(jax.tree.leaves(want_grads), jax.tree.leaves(got_grads), strict=True):
+        assert jnp.abs(actual - expected).max() <= 1e-4 * jnp.abs(expected).max()
+
+
 def test_tensor_parallelism_keeps_every_projection_weight_in_place():
     """Megatron's split computes each projection on the shard of the weight a
     device holds and sums the row-parallel outputs; it never gathers a
@@ -735,8 +768,8 @@ def test_a_convolutions_kernel_gradient_under_a_partly_replicated_layout(name):
     shape = jax.eval_shape(block.apply, {"params": params}, x).shape
     cotangent = rng.normal(size=shape).astype(np.float32)
 
-    def loss(params, x, cotangent, constrained):
-        out = block.apply({"params": params}, x)
+    def loss(variables, x, cotangent, constrained):
+        out = block.apply({"params": variables}, x)
         if constrained and outputs is not None:
             out = jax.lax.with_sharding_constraint(out, outputs)
         return jnp.sum(out * cotangent)

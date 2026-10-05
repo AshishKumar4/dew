@@ -48,6 +48,9 @@ from dew.registry import presets, solvers
 MDLM_STEPS = 64
 """Reverse steps `generate` takes by default, the count MDLM samples with."""
 
+SAMPLING_EPS = 1e-3
+"""The least training time, MDLM's `training.sampling_eps` (configs/config.yaml)."""
+
 
 class MaskingSchedule(ABC):
     """Says how fast tokens are masked along t.
@@ -100,13 +103,15 @@ class DiscreteProcess:
         return cls(LogLinear(eps=record['eps']), record['mask_id'])
 
     def sample_t(self, key, n: int) -> jax.Array:
-        """`n` times stratified over [0, 1), MDLM's antithetic draw.
+        """`n` times stratified over [SAMPLING_EPS, 1), MDLM's antithetic draw.
 
-        One uniform offset is shared by the batch, so the weights 1 / t of
-        one batch cover the trajectory.
+        Row i draws its own place in the i-th of n strata, so the weights
+        1 / t of one batch cover the trajectory, and the floor keeps every
+        weight at most 1 / SAMPLING_EPS (`_sample_t`, kuleshov-group/mdlm
+        @c112c52, diffusion.py:800-808).
         """
-        offset = jax.random.uniform(key, (), minval=0.0, maxval=1.0)
-        return (jnp.arange(n, dtype=jnp.float32) + offset) / n
+        stratified = (jax.random.uniform(key, (n,)) + jnp.arange(n, dtype=jnp.float32)) / n
+        return (1 - SAMPLING_EPS) * stratified + SAMPLING_EPS
 
     def corrupt(self, key, tokens, t) -> tuple[jax.Array, jax.Array]:
         """`(masked tokens, is_masked)` at `t`, one t per row."""

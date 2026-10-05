@@ -108,9 +108,12 @@ def test_prepacked_serving_keeps_the_source_and_reloads_its_original_tree():
     """Serving holds the same weight bytes; reloading casts and repacks the trained tree."""
     from flax.core import freeze
 
+    from dew.inference.serving import _inference_projections
+
     bound = task(Sampling(temperature=0, eos_id=None))
     source = jax.tree.map(np.asarray, bound.variables)
-    packed_task = TextGeneration(bound.model, source, bound.processor, sampling=bound.sampling)
+    packed_task = TextGeneration(bound.model, jax.device_put(_inference_projections(bound.model, source)),
+                                 bound.processor, sampling=bound.sampling)
     server = Server.from_task(packed_task, slots=2, capacity=128)
     before = server(["12", "34"], 5, key=3)
     assert sum(leaf.nbytes for leaf in jax.tree.leaves(server.variables)) == sum(
@@ -160,6 +163,33 @@ def test_inference_projection_layout_preserves_special_attention_logits(case):
         np.testing.assert_array_equal(jnp.argmax(actual, axis=-1), jnp.argmax(expected, axis=-1))
 
 
+def test_an_admitting_step_pads_to_the_fewest_rows_that_hold_its_prompts():
+    """The admitting program prefills every row it is given: a request
+    arriving alone is one row, three together are four, never the whole
+    admission of eight (`admission_share`), and each draws what it draws alone."""
+    from dew.inference.serving import admission_share
+
+    assert [admission_share(waiting, 8) for waiting in range(1, 9)] == [1, 2, 4, 4, 8, 8, 8, 8]
+    assert admission_share(5, 6) == 6
+    bound = task()
+    server = Server.from_task(bound, slots=8, capacity=128, admission=8)
+    widths, admit = [], server._admit
+
+    def recorded():
+        admission = admit()
+        widths.append(None if admission is None else admission.prompts.tokens.shape[0])
+        return admission
+
+    server._admit = recorded
+    first = server.submit(PROMPTS[0], 3, key=0)
+    server.step()
+    rest = [server.submit(prompt, 3, key=index) for index, prompt in enumerate(PROMPTS[1:4], start=1)]
+    server.run()
+    assert [width for width in widths if width] == [1, 4]
+    for index, ticket in enumerate([first, *rest]):
+        assert ticket.result().text == bound(PROMPTS[index], 3, key=index).text
+
+
 @pytest.mark.parametrize("decode_steps", [1, 4])
 def test_mixed_lengths_and_budgets_submitted_together_draw_what_each_draws_alone(decode_steps):
     """Five prompts of different widths and budgets, greedy, one seed per
@@ -203,9 +233,12 @@ def test_host_task_and_server_preserve_nonzero_lora_branches():
 
 def test_reload_normalizes_source_precision_before_concatenating_projections():
     """A float64 value just above an FP16 midpoint must not double-round through FP32."""
+    from dew.inference.serving import _inference_projections
+
     bound = task(Sampling(temperature=0, eos_id=None))
     source = jax.tree.map(lambda leaf: np.asarray(leaf, dtype=np.float16), bound.variables)
-    host = TextGeneration(bound.model, source, bound.processor, sampling=bound.sampling)
+    host = TextGeneration(bound.model, jax.device_put(_inference_projections(bound.model, source)),
+                          bound.processor, sampling=bound.sampling)
     server = Server.from_task(host, slots=2, capacity=128)
     incoming = jax.tree.map(lambda leaf: np.asarray(leaf, np.float64), source)
     kernel = incoming["params"]["layers_0"]["self_attn"]["q_proj"]["kernel"]
@@ -271,6 +304,57 @@ def test_submission_keeps_device_keys_on_device_until_admission():
         ticket = server.submit(prompt, 5, key=key)
     server.run()
     assert_same_generation(ticket.result(), bound(prompt[None], 5, key=key))
+
+
+@pytest.mark.parametrize("seed", [7, 2**31, -1, 2**40 + 3])
+def test_a_request_with_an_integer_seed_launches_nothing_until_admission(seed):
+    """Submitting with an integer seed moves nothing to the device, not even
+    the seed: the admission's program makes the key (`_row_keys`), whose bits
+    are an eager `jax.random.key(seed)`'s, wrapped where the seed overflows
+    32 bits as eager keys wrap it. The request draws the sampled tokens and
+    likelihoods the one-row task draws with that seed."""
+    bound = task(Sampling(temperature=1.0, top_k=5, eos_id=None))
+    prompt = np.asarray([1, 2, 3], np.int32)
+    server = Server.from_task(bound, slots=2, capacity=128, admission=2)
+    with guarded():
+        ticket = server.submit(prompt, 5, key=seed)
+    server.run()
+    assert_same_generation(ticket.result(), bound(prompt[None], 5, key=seed))
+
+
+def test_a_step_without_admission_draws_from_its_own_logits_without_merging_every_slot():
+    """With no admission every drawing row fed this step, so the logits it
+    draws from are the model's whole: no select over every slot's vocabulary
+    keeps a held row's (on an RTX 4080 at 64 slots, 136 us of an 8.4 ms
+    step). A step that seats rows still merges, since those draw from their
+    prompt's logits."""
+    from dew.inference.serving import _advanced, _joined
+
+    server = Server.from_task(task(Sampling(temperature=0, eos_id=None)), slots=2, capacity=64, admission=1)
+    server.submit(np.asarray([1, 2, 3], np.int32), 4, key=0)
+    admission = server._admit()
+    state = _joined(server._resident, server._carried)
+
+    def merges(admission):
+        jaxpr = jax.make_jaxpr(lambda state: _advanced(
+            server.model, server.variables, server.pad_id, server.rows.placement, state, admission,
+            server.transforms, server.stopping, server.grammar))(state)
+        return _selects(jaxpr.jaxpr, state.decoder.logits.shape)
+
+    assert admission is not None and merges(admission)
+    assert not merges(None)
+
+
+def _selects(jaxpr, shape) -> bool:
+    """Whether `jaxpr` or a jaxpr it calls selects an array of `shape`."""
+    for eqn in jaxpr.eqns:
+        if eqn.primitive.name == "select_n" and eqn.outvars[0].aval.shape == shape:
+            return True
+        for value in eqn.params.values():
+            inner = getattr(value, "jaxpr", value)
+            if hasattr(inner, "eqns") and _selects(inner, shape):
+                return True
+    return False
 
 
 def test_repeated_requests_reuse_their_programs_and_read_back_only_results():
@@ -417,13 +501,16 @@ def test_a_server_holds_its_capacity_in_whole_tiles_not_a_power_of_two():
 
     def slots(**options):
         server = Server.from_task(bound, slots=2, **options)
-        held = {leaf.shape for path, leaf in jax.tree_util.tree_flatten_with_path(server.cache)[0]
-                if jax.tree_util.keystr(path).endswith("['cache_valid']")}
+        page = options.get("kv_cache", KVCache()).page_size
+        # A row's slots: the dense keys' second axis, or its pages' tokens.
+        leaves = jax.tree_util.tree_flatten_with_path(server.cache)[0]
+        held = {leaf.shape[1] * (page or 1) for path, leaf in leaves
+                if jax.tree_util.keystr(path).endswith("['page_table']" if page else "['cached_key']")}
         return server.capacity, held
 
-    assert slots(capacity=384) == (384, {(2, 384)})
-    assert slots(capacity=300) == (320, {(2, 320)})
-    assert slots(capacity=300, kv_cache=KVCache(page_size=128)) == (384, {(2, 384)})
+    assert slots(capacity=384) == (384, {384})
+    assert slots(capacity=300) == (320, {320})
+    assert slots(capacity=300, kv_cache=KVCache(page_size=128)) == (384, {384})
 
 
 def test_a_prompt_past_the_bucket_under_the_capacity_is_served_as_the_task_serves_it():
@@ -456,17 +543,20 @@ def served_alongside(bound, slots=4, admission=2, **options):
     {"kv_cache": KVCache(page_size=16, pages=12), "chunk": 2},
     {"kv_cache": KVCache(page_size=4, pages=40), "chunk": 3, "prefix_cache": True},
     {"kv_cache": KVCache(page_size=4, pages=40), "chunk": 3, "prefix_cache": True, "decode_steps": 3},
-], ids=["paged", "chunked", "prefix", "prefix-three-steps"])
+    {"chunk": 2},
+], ids=["paged", "chunked", "prefix", "prefix-three-steps", "dense-chunked"])
 def test_a_paged_server_draws_what_each_request_draws_alone(options):
     """A pool of 12 pages holds fewer tokens than the 4 x 128 slots the dense
     server reserves, a prompt prefilled two or three tokens a step
-    attends to its earlier pieces through the page table, and a repeated
-    prompt starts from the page its first run published. None of it
-    changes a greedy draw: every row is the lone task call's."""
+    attends to its earlier pieces through the page table (or its dense
+    row), and a repeated prompt starts from the page its first run
+    published. None of it changes a greedy draw: every row is the lone task
+    call's. Each runs the mixed admitting step."""
     bound = task()
     alone = [bound(prompt, budget, key=index)
              for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
     server, tickets = served_alongside(bound, **options)
+    assert server.mixed_refusal is None
     for ticket, lone in zip(tickets, [*alone, alone[2]], strict=True):
         assert_same_generation(ticket.result(), lone)
     # "1234567" keeps its last token to prefill: one full page of four is shared.
@@ -561,8 +651,22 @@ def test_a_server_on_an_expert_mesh_draws_what_one_device_draws(dispatch):
             served("12", 3, key=0)
 
 
-def test_chunks_and_prefix_sharing_need_a_paged_cache():
+def test_prefix_sharing_needs_a_paged_cache():
     with pytest.raises(ValueError, match="paged cache"):
+        Server.from_task(task(), slots=2, capacity=128, prefix_cache=True)
+
+
+def test_a_model_the_mixed_step_cannot_take_keeps_two_forwards_and_says_why(monkeypatch):
+    """A layer that refuses the mixed admitting step names why; the server
+    keeps the prompts' prefill in a forward of its own and reports the
+    reason, and refuses a dense chunked prefill, which only the mixed step
+    serves."""
+    from dew.nn.mixers.attention import CausalSelfAttention
+
+    monkeypatch.setattr(CausalSelfAttention, "mixed_refusal", lambda self: f"{self.name}: a test refusal")
+    server = Server.from_task(task(), slots=2, capacity=128)
+    assert "a test refusal" in (server.mixed_refusal or "") and not server.rows.placement.mixed
+    with pytest.raises(ValueError, match="a test refusal"):
         Server.from_task(task(), slots=2, capacity=128, chunk=4)
 
 

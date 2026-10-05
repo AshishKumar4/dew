@@ -1,6 +1,6 @@
 """Save and restore a run's train state and data position through orbax.
 
-A checkpoint holds `step`, `params`, `opt_state`, `ema`, `key` and, when the
+A checkpoint holds `step`, `variables`, `opt_state`, `ema`, `key` and, when the
 data iterator can report one, `position`. Metrics, the loss scale and epoch
 counters are the loop's business and are rebuilt on resume. A position is
 either global, and readable by any partition of the data, or one share's
@@ -68,7 +68,7 @@ if TYPE_CHECKING:
 type StateLeaf = (jax.Array | np.ndarray | Variables | optax.OptState
                   | DynamicScale | Accumulation | None)
 
-STATE_LEAVES = ("step", "microstep", "updates", "params", "opt_state", "ema", "key",
+STATE_LEAVES = ("step", "microstep", "updates", "variables", "opt_state", "ema", "key",
                 "scale", "window_size", "accumulation")
 """The train-state fields a checkpoint persists; anything outside this tuple
 is rebuilt on resume."""
@@ -419,7 +419,7 @@ def _with_ema_deltas(state_tree: dict[str, StateLeaf]) -> tuple[dict[str, StateL
         return state_tree, []
     paths_leaves, structure = jax.tree_util.tree_flatten_with_path(ema)
     leaves = [leaf for _, leaf in paths_leaves]
-    held = _by_path(state_tree['params'])
+    held = _by_path(state_tree['variables'])
     lives = [held[path] for path, _ in paths_leaves]
     chosen = [index for index, (average, live) in enumerate(zip(leaves, lives, strict=True))
               if _stored_as_delta(average, live)]
@@ -444,7 +444,7 @@ def _ema_deltas(metadata: ocp.metadata.StepMetadata) -> dict[jax.tree_util.KeyPa
     recorded = set(custom.get('ema_deltas', ()))
     if not recorded:
         return {}
-    deltas, lives = {}, _by_path(stored['params'])
+    deltas, lives = {}, _by_path(stored['variables'])
     for path, _ in jax.tree_util.tree_flatten_with_path(dict(stored['ema']))[0]:
         if jax.tree_util.keystr(path) in recorded:
             live = lives[path]
@@ -541,7 +541,8 @@ def _filled(template, restored: dict, step: int):
     if (not isinstance(template.window_size, jax.ShapeDtypeStruct)
             and int(restored["window_size"]) != int(template.window_size)):
         raise ValueError("checkpoint accumulation window_size differs from this run")
-    return template.replace(**restored)
+    # A template's narrow copies are of its own parameters, not the restored ones.
+    return template.replace(**restored, compute=None)
 
 
 class _RankedSteps(preservation.PreservationPolicy):
@@ -918,7 +919,7 @@ class Checkpoints:
             'updates': int(profiles.updates), 'stds': [float(std) for std in np.asarray(profiles.stds)]}
         state_tree, deltas = _with_ema_deltas(self._item(state, saved, share))
         if weights_only:
-            state_tree = {name: state_tree[name] for name in ('params', 'ema')}
+            state_tree = {name: state_tree[name] for name in ('variables', 'ema')}
         persistent = self._open()
         self._metadata = None
         if profiles is not None:
@@ -997,7 +998,7 @@ class Checkpoints:
         Sums every snapshot up to `step`, of every tracked profile, with the
         weights `coefficients` solves for, one snapshot read at a time and
         accumulated in fp32 or wider. The result goes where the run's params
-        go: `merge(params, {"params": checkpoints.posthoc_ema(...)})`.
+        go: `merge(variables, {"params": checkpoints.posthoc_ema(...)})`.
         """
         from dew.training.posthoc import coefficients
 
@@ -1107,7 +1108,7 @@ class Checkpoints:
 
         target = resolve_dtype(param_dtype)
         stored = self.stored(step)
-        template = {"params": stored["params"]}
+        template = {"variables": stored["variables"]}
         if ema and stored.get("ema") is None:
             raise ValueError("the run keeps no EMA; request the live policy with ema=False")
         averaged = stored.get("ema") is not None if ema is None else ema
@@ -1116,11 +1117,11 @@ class Checkpoints:
         device_mesh = (DefaultMesh() if mesh is None else mesh).build()
         chosen_layout = DefaultLayout() if layout is None else layout
         placement = chosen_layout.shardings(device_mesh, template)
-        chosen_layout.check(template["params"], placement["params"], device_mesh)
+        chosen_layout.check(template["variables"], placement["variables"], device_mesh)
         selected = set()
         if target is not None:
             roots = tuple(tuple(jax.tree_util.DictKey(name) for name in root) for root in parameter_roots)
-            selected = {path for path, leaf in jax.tree_util.tree_flatten_with_path(stored["params"])[0]
+            selected = {path for path, leaf in jax.tree_util.tree_flatten_with_path(stored["variables"])[0]
                         if jnp.issubdtype(leaf.dtype, jnp.floating) and
                         any(path[:len(root)] == root for root in roots)}
         template = jax.tree_util.tree_map_with_path(
@@ -1128,7 +1129,7 @@ class Checkpoints:
                 leaf.shape, target if path[1:] in selected else leaf.dtype, sharding=sharding),
             template, placement)
         values, _ = self.restore(template, step=step)
-        params = values["params"]
+        params = values["variables"]
         if averaged:
             params = merge(params, values["ema"])
 
@@ -1233,7 +1234,7 @@ class Checkpoints:
             deltas = _ema_deltas(snapshot)
             if deltas:
                 restored = dict(restored)
-                weights = _by_path(restored['params'])
+                weights = _by_path(restored['variables'])
                 restored['ema'] = jax.tree_util.tree_map_with_path(
                     lambda path, leaf: _from_delta_planes(leaf, weights[path])
                     if path in deltas else leaf, restored['ema'])
@@ -1297,7 +1298,7 @@ class Checkpoints:
         rest are read here, placed as the leaves they undo.
         """
         lives, unread = {}, {}
-        held = _by_path(restored.get('params'))
+        held = _by_path(restored.get('variables'))
         for path, target in targets.items():
             weight = held.get(path)
             if (isinstance(weight, jax.Array) and weight.dtype == deltas[path].dtype
@@ -1311,13 +1312,13 @@ class Checkpoints:
         if unread:
             # The stored params tree, its containers kept, with every leaf
             # but the ones to read held back by orbax's placeholder.
-            weights = {'params': jax.tree_util.tree_map_with_path(
-                lambda path, _: unread.get(path, ocp.PLACEHOLDER), dict(metadata)['params'])}
+            weights = {'variables': jax.tree_util.tree_map_with_path(
+                lambda path, _: unread.get(path, ocp.PLACEHOLDER), dict(metadata)['variables'])}
             read = checkpointer.restore(step, args=ocp.args.PyTreeRestore(
                 item=weights, partial_restore=True, restore_args=jax.tree.map(
                     lambda leaf: ocp.ArrayRestoreArgs(sharding=getattr(leaf, "sharding", None)),
                     weights)))
-            lives.update({path: leaf for path, leaf in _by_path(read['params']).items() if path in unread})
+            lives.update({path: leaf for path, leaf in _by_path(read['variables']).items() if path in unread})
 
         def average(path, planes):
             if path not in targets:

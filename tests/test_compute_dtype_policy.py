@@ -97,9 +97,10 @@ _OP_NAME = re.compile(r'op_name="([^"]*)"')
 # multiplies, whatever the operands are stored as.
 _ALGORITHM = re.compile(r"algorithm=(\w+)")
 
-# An operand the machine multiplies at the fp32 rate. f64 is here for
-# completeness; nothing in dew asks for it.
-FP32 = ("f32", "f64")
+# An operand the machine multiplies at the fp32 rate. A complex operand is a
+# pair of them. f64 and c128 are here for completeness; nothing in dew asks
+# for them.
+FP32 = ("f32", "f64", "c64", "c128")
 
 # How much of a family's matmul work may still be fp32. The fp32 boundaries a
 # bf16 run keeps on purpose - the output head, the timestep embedding - are
@@ -124,6 +125,14 @@ LOGITS = ("causal_transformer", "diffusion_gemma", "multimodal_transformer")
 FIXTURES: dict[str, str] = {}
 
 FAMILIES = sorted(models)
+
+# A family whose bf16 compute keeps one module's matmuls in fp32 by that
+# module's own contract, and the op-name scope that holds them. The hybrid
+# DiT's mixer is the S5 layer (`ssm`), which runs its state-space products in
+# at least fp32 whatever dtype its input carries (`dew.nn.ssm.S5Layer`); its
+# complex products read as c64 here and so counted as bf16 until the layer
+# moved to real ones.
+FP32_BY_CONTRACT = {"hybrid_dit": "/ssm/"}
 
 
 @dataclass(frozen=True)
@@ -294,8 +303,8 @@ def family_loss(family: str, rng):
     variables = family_variables(family, model, args, kwargs, rng)
     held = {name: value for name, value in variables.items() if name != "params"}
 
-    def loss(params):
-        prediction = model.apply({**held, "params": params}, *args, **kwargs)
+    def loss(variables):
+        prediction = model.apply({**held, "params": variables}, *args, **kwargs)
         prediction = prediction.astype(jnp.float32)
         if family in LOGITS:
             targets = jnp.zeros(prediction.shape[:-1], jnp.int32)
@@ -323,12 +332,77 @@ def test_a_bf16_family_runs_its_matmuls_in_bf16(family, rng):
     loss, params = family_loss(family, rng)
     found = matmuls(matmul_text(jax.value_and_grad(loss), params))
     assert found, f"{family} compiled to no matmul at all"
+    scope = FP32_BY_CONTRACT.get(family)
+    if scope is not None:
+        kept = [matmul for matmul in found if scope not in matmul.module]
+        assert len(kept) < len(found), f"{family} has no matmul under {scope}"
+        found = kept
 
     fp32, total, share = fp32_share(found)
     assert share < BUDGET, (
         f"{family}: {fp32:,.0f} of {total:,.0f} matmul FLOPs ({100 * share:.2f}%) have an "
         f"fp32 operand, over the {100 * BUDGET:.0f}% budget. The dots and the modules "
         f"they came from:\n{listing(found)}")
+
+
+@pytest.mark.parametrize("family", ["simple_dit", "hybrid_dit"])
+def test_a_bf16_dit_runs_its_gelu_in_fp32(family, rng):
+    """The DiT blocks' MLP GELU runs in fp32 and rounds once, as torch's bf16
+    GELU does: forward and backward, every tanh under a block's `mlp` reads
+    fp32. Computed in bf16, each of its eight elementwise steps keeps a bf16
+    rounding, which a v6e paid 0.93 ms for in the hybrid DiT's batch-16 step
+    (docs/performance.md). The time embedding's GELU, one row per image,
+    stays as it was."""
+    loss, params = family_loss(family, rng)
+    jaxpr = jax.make_jaxpr(jax.value_and_grad(loss))(params)
+
+    def tanh_inputs(jaxpr):
+        for equation in jaxpr.eqns:
+            if equation.primitive.name == "tanh" and "/mlp" in str(equation.source_info.name_stack):
+                yield equation.invars[0].aval.dtype
+            for parameter in equation.params.values():
+                inner = getattr(parameter, "jaxpr", parameter)
+                if hasattr(inner, "eqns"):
+                    yield from tanh_inputs(inner)
+
+    dtypes = list(tanh_inputs(jaxpr.jaxpr))
+    assert dtypes and all(dtype == jnp.float32 for dtype in dtypes), dtypes
+
+
+def test_an_exact_gelu_reads_fp32_and_keeps_only_its_bf16_input_for_the_backward(rng):
+    """Exact GELU (`gelu_approximate=False`, U-ViT's) runs in fp32 and rounds
+    once like the tanh one, inside a remat whose only input is the bf16
+    activation: saved instead, XLA wrote the fp32 value out for the backward,
+    10.4% of a JEPA step on the RTX 4080 (dew.nn.dit._exact_gelu)."""
+    from dew.nn.dit import ModulatedBlock
+
+    block = ModulatedBlock(features=32, num_heads=2, modulated=False, gelu_approximate=False,
+                           dtype=jnp.bfloat16)
+    tokens = jax.random.normal(rng, (2, 8, 32), jnp.bfloat16)
+    params = block.init(rng, tokens, None, None)
+
+    def loss(params):
+        return jnp.sum(block.apply(params, tokens, None, None).astype(jnp.float32))
+
+    found = []
+
+    def walk(jaxpr, remat_inputs=None):
+        for equation in jaxpr.eqns:
+            if equation.primitive.name == "erfc":
+                found.append((equation.invars[0].aval.dtype, remat_inputs))
+            inputs = ([variable.aval.dtype for variable in equation.invars]
+                      if equation.primitive.name in ("checkpoint", "remat2") else remat_inputs)
+            for parameter in equation.params.values():
+                inner = getattr(parameter, "jaxpr", parameter)
+                if hasattr(inner, "eqns"):
+                    walk(inner, inputs)
+
+    walk(jax.make_jaxpr(jax.value_and_grad(loss))(params).jaxpr)
+    assert found and all(dtype == jnp.float32 for dtype, _ in found), found
+    # The backward recomputes erfc in a remat that reads the bf16 activation
+    # and its bf16 cotangent, nothing wider.
+    recomputed = [inputs for _, inputs in found if inputs is not None]
+    assert recomputed and all(dtype == jnp.bfloat16 for inputs in recomputed for dtype in inputs), found
 
 
 def test_the_split_counts_every_flop_dew_counts(rng):
@@ -354,8 +428,8 @@ def lm_loss_and_grad(rng):
     batch = {TEXT_KEY: jax.random.randint(rng, (2, 33), 0, 512)}
     step = Step(step=jnp.asarray(0), key=rng, ema=None)
 
-    def loss(params):
-        return objective.scalar_loss(params, batch, step)[0]
+    def loss(variables):
+        return objective.scalar_loss(variables, batch, step)[0]
 
     return jax.value_and_grad(loss), variables
 

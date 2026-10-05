@@ -84,7 +84,7 @@ import dew
 from dew.interop import PretrainedDecoder
 from dew.training import MeshSpec
 
-PretrainedDecoder.from_model(model, state.params, tokenizer="byte").save("lily-decoder")
+PretrainedDecoder.from_model(model, state.variables, tokenizer="byte").save("lily-decoder")
 loaded = dew.pipeline("lily-decoder", mesh=MeshSpec(), dtype=jnp.float32)
 loaded = dataclasses.replace(loaded, processor=RunProcessor(tokenizer),
                              sampling=Sampling(temperature=0.0))
@@ -101,7 +101,7 @@ A run assembled by hand needs its configuration saved next to the checkpoints be
 
 ## Weights
 
-For the plain LM, image-diffusion and block-diffusion objectives, `ema=True` asks for the moving-average weights and raises if the run or state has no EMA copy, and `ema=False` reads the live weights. `dew.pipeline`, the tasks' `from_run` and `from_pretrained`, `objective.pipeline` and `export_run` default to `ema=None`, which takes the EMA copy when the run or state has one and the live weights otherwise. DPO, GRPO and PPO use the EMA slot for a frozen reference, so their pipelines always publish the trained policy, never the reference. PPO also leaves out the critic.
+For the plain LM, image-diffusion and block-diffusion objectives, `ema=True` asks for the moving-average weights and raises if the run or state has no EMA copy, and `ema=False` reads the live weights. `dew.pipeline`, the tasks' `from_run` and `from_pretrained`, `objective.pipeline` and `Pretrained.from_run` default to `ema=None`, which takes the EMA copy when the run or state has one and the live weights otherwise. DPO, GRPO and PPO use the EMA slot for a frozen reference, so their pipelines always publish the trained policy, never the reference. PPO also leaves out the critic.
 
 `objective.pipeline(state)` picks weights by the same rule and keeps the arrays the trainer has already placed. `LMObjective.policy(params, sampling)` returns a `TextGeneration` bound to the given tree, the task a GRPO rollout samples with. `task.bind(variables)` makes a task over another set of variables; it copies the mapping structure and shares the array buffers, so do not change or donate those arrays while a task uses them.
 
@@ -130,7 +130,8 @@ import jax.numpy as jnp
 from dew.sampling import TextToImage
 from dew.training.quantization import Quantization
 
-pipe = TextToImage.from_pretrained("dewml/hybrid-dit-176m", dtype=jnp.bfloat16)
+pipe = TextToImage.from_pretrained("dewml/hybrid-dit-176m", dtype=jnp.bfloat16,
+                                   revision="32d59de89683d59824361144b87bdcaf3e742598")
 served = pipe.quantized(Quantization(dtype="int8", patterns=("^(?!.*spatial_fusion).*",)))
 images = served(["a red fox in a snowy forest"], steps=20, key=0).host().images
 ```
@@ -149,16 +150,17 @@ Results hold global arrays sharded by row, including any filler rows added so th
 
 ```python
 import jax
+import jax.numpy as jnp
 
-from dew.config import ModelConfig
 from dew.inference import SafetensorsBanks
 from dew.interop import translate_config
+from dew.nn.backbones import CausalTransformer
 from dew.sampling.text import Sampling, generate
 
 with SafetensorsBanks("path/to/gpt-oss-20b-BF16",
                        cache_bytes=0, param_dtype="auto") as source:
-    record = {**translate_config(source.config), "max_seq_len": 128, "scan_layers": True}
-    model = ModelConfig("causal_transformer", record, dtype="bfloat16", attention_impl="xla").build()
+    fields = {**translate_config(source.config), "max_seq_len": 128, "scan_layers": True}
+    model = CausalTransformer(**fields, dtype=jnp.bfloat16, attention_impl="xla")
     variables = source.stream(model)
     generated = jax.block_until_ready(generate(
         model, variables, [[1, 2, 3, 4]], max_new_tokens=8,
@@ -231,6 +233,33 @@ Repeated calls with the same shapes and controls reuse the compiled executables.
 A pixel mask has shape `[B, H, W, 1]`. Its masked-image conditions go to both guidance branches. `encode_key=None` uses the VAE posterior mean; an explicit key samples from the posterior. Condition encoders accept native prompt records as well as strings. `unconditional=` supplies one row, or one row per prompt, in place of the configured unconditional input.
 
 `initial=` is a latent state that is already noisy, and Dew never adds noise to it again. Prepared inputs keep their process and concrete time grid. `task(prepared, key=..., decode=False)` skips the VAE and the image checker and returns unclipped `result.latents`, with `result.images` set to `None`. For a base and refiner handoff, pass those latents as another task's `initial` with the matching partial grid. Normal calls return both the decoded images and the latents before decoding. Prepared inputs must belong to the task's mesh. A preparation on the source grid also records its step count; to change the count, prepare a new initial state.
+
+Diffusers' `strength`, `denoising_end` and `denoising_start` are such a choice of grid. `strength=s` over `steps` starts at the point Diffusers' `get_timesteps` starts. `denoising_end=f` on a base and `denoising_start=f` on its refiner split the grid where the model time falls below `round(T * (1 - f))`, `T` being the scheduler's `num_train_timesteps`. The base walks to that point and stops there, and the refiner starts from it (`tests/test_native_diffusion.py` holds both against Diffusers' own pipelines):
+
+<!-- not run: needs an SDXL base and refiner -->
+```python
+import dataclasses
+
+import jax.numpy as jnp
+import numpy as np
+
+process, times = task.prepared_process(steps)
+img2img = task.prepare(prompts, key=key, steps=steps, image=pixels,
+                       times=times[steps - int(steps * strength):])
+
+def split(task):
+    process, times = task.prepared_process(steps)
+    model_times = np.asarray(process.sampler_schedule.model_time(jnp.asarray(times[:-1])))
+    return times, int(np.flatnonzero(model_times < round(T * (1 - f)))[0])
+
+times, cut = split(base)
+first = dataclasses.replace(base, final_denoise=False)
+latents = first(first.prepare(prompts, key=key, steps=steps, times=times[:cut + 1]),
+                key=key, decode=False).latents
+times, cut = split(refiner)
+images = refiner(refiner.prepare(prompts, key=key, steps=steps, initial=latents, times=times[cut:]),
+                 key=key).images
+```
 
 ## Serving
 
@@ -347,3 +376,5 @@ Decode on a tensor axis is bound by the host on these cards. Each step runs 57 a
 ## Other runtimes
 
 To serve with vLLM or Ollama instead, export with `Pretrained.save` (a trained model through `PretrainedDecoder.from_model`) and point the runtime at the directory. `OllamaCompletion` and `OpenAICompletion` (`dew.inference`) call those projects' official clients. Their results keep the backend's metadata and do not make up native raw-policy or behavior-policy likelihoods.
+
+A GGUF file for llama.cpp depends on the tokenizer. llama.cpp's `convert_hf_to_gguf.py` (checked at v0.5.0) converts a decoder export whose tokenizer it recognizes. A Llama-style byte-fallback BPE (byte pieces `<0x00>` to `<0xFF>` in the vocabulary, `▁` marking word starts) is read directly. A byte-level BPE is recognized only by its pre-tokenizer's hash, and only published models' hashes are listed. Any byte-level BPE trained from scratch, such as a custom tokenizer for a Dew run, therefore stops the converter with `NotImplementedError: BPE pre-tokenizer was not recognized`. For that tokenizer, use Ollama: `ollama create` with `FROM <export directory>` in the Modelfile runs Ollama's own converter, which accepts it, and the result serves Dew's greedy continuation token for token. Ollama records the pre-tokenizer as `default`, which splits a run of digits into groups of three where a byte-level tokenizer keeps the run whole, so a prompt with long numbers can tokenize differently there. The converter's own pinned environment (transformers 4.57.6) also cannot read a `tokenizer_config.json` saved by transformers 5, which names its class `TokenizersBackend`. Run the converter with transformers 5 and `sentencepiece` installed.

@@ -33,6 +33,7 @@ from flax import linen as nn
 
 from dew.artifacts import Representations
 from dew.inputs import Field, InputSpec, unit_range
+from dew.nn.backbones.jepa import JepaEncoder, JepaPredictor
 from dew.objectives.base import Aux, EMASpec, Objective, Ratio, Shown, Step, Variables, under
 from dew.registry import objectives
 
@@ -102,6 +103,12 @@ class JepaObjective(Objective[Ratio]):
         momentum_steps: int = 100_000,
         label_key: str = LABEL_KEY,
     ):
+        # Dew's encoder and predictor declare the order they sequence tokens
+        # in; the mask's indices must refer to that sequence.
+        for role, module in (("encoder", encoder), ("predictor", predictor)):
+            if isinstance(module, JepaEncoder | JepaPredictor) and module.scan_order != mask.scan_order:
+                raise ValueError(f"the {role} scans in {module.scan_order!r} order and the mask in "
+                                 f"{mask.scan_order!r}; they must share one scan order")
         self.encoder = encoder
         self.predictor = predictor
         self.mask = mask
@@ -144,7 +151,7 @@ class JepaObjective(Objective[Ratio]):
             raise ValueError("the JEPA target branch needs the trainer's EMA variables")
         return step.ema["params"][CONTEXT_ENCODER]
 
-    def loss(self, params, batch, step: Step):
+    def loss(self, variables, batch, step: Step):
         samples = unit_range(batch[self.sample.key])
         batch_size = samples.shape[0]
         mask_key, dropout_key = jax.random.split(step.key)
@@ -160,14 +167,14 @@ class JepaObjective(Objective[Ratio]):
             jnp.take_along_axis(full[:, None], gather_idx, axis=-2))
 
         context = self.encode(
-            params["params"][CONTEXT_ENCODER], samples, context_idx,
+            variables["params"][CONTEXT_ENCODER], samples, context_idx,
             train=True, rngs={"dropout": dropout_key})
 
         # Each target block is predicted from the same context. Fold the block
         # axis into the batch so one predictor call covers all M of them
         repeated = jnp.repeat(context, num_targets, axis=0)
         predictions = self.predictor.apply(
-            {"params": params["params"][PREDICTOR]},
+            {"params": variables["params"][PREDICTOR]},
             repeated,
             jnp.repeat(context_idx, num_targets, axis=0),
             target_idx.reshape(batch_size * num_targets, -1),

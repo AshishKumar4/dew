@@ -388,7 +388,7 @@ def test_train_runs_the_trainer_its_config_describes(tmp_path):
     state = RunConfig(trainer=config).train(Regression(), Dataset(lambda partition: batches(), None, None, 8),
                                             name="built")
 
-    assert any(not leaf.sharding.is_fully_replicated for leaf in jax.tree.leaves(state.params))
+    assert any(not leaf.sharding.is_fully_replicated for leaf in jax.tree.leaves(state.variables))
     assert state.scale is not None
     assert state.accumulation is not None
     assert any(path.is_file() for path in trace.rglob("*"))

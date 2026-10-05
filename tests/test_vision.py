@@ -279,6 +279,24 @@ def test_qwen35_projector_matches_the_reference_implementation():
         - fixture["projector_ref"])) > 10.0
 
 
+@pytest.mark.parametrize("name", ["gemma4-vision-tiny", "gemma4-vision-wide-tiny",
+                                  "diffusion-gemma-workflow"])
+def test_a_gemma4_tower_writes_back_the_config_it_was_read_from(name):
+    """Every field the writer emits is the published value, and reading what
+    it writes gives the same tower; an unset head_dim is written as the width
+    it stands for, so it reads back as that width."""
+    published = json.loads((FIXTURES / name / "config.json").read_text())
+    vision = published.get("vision_config", published)
+    tower = towers.from_record(V.translate_gemma4_vision_config(published))
+    written = V.export_gemma4_vision_config(tower)
+    assert {key: (value, vision[key]) for key, value in written.items() if vision[key] != value} == {}
+    assert towers.from_record(V.translate_gemma4_vision_config(written)) == tower
+    unset = dataclasses.replace(tower, head_dim=None, rope_theta=50.0, standardize=False,
+                                use_clipped_linears=True, hidden_act="gelu")
+    assert towers.from_record(V.translate_gemma4_vision_config(V.export_gemma4_vision_config(unset))) == (
+        dataclasses.replace(unset, head_dim=unset.hidden_size // unset.num_heads))
+
+
 @pytest.mark.parametrize("field,value,message", [
     ("hidden_activation", "swiglu", "hidden_activation"),
     ("attention_bias", True, "attention_bias"),

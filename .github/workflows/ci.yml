@@ -22,7 +22,10 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  EXTRAS: test,av,tfds,metrics,plots,inference-clients,vision,quantization,profile
+  # Every optional dependency a test file imports, so no test skips for want of
+  # one: the test job fails a shard where one does (`Refuse a test skipped on
+  # a missing import`).
+  EXTRAS: test,av,tfds,metrics,plots,inference-clients,vision,quantization,profile,torchax,gguf
 
 jobs:
   lint:
@@ -41,7 +44,7 @@ jobs:
         pip install flake8 uv
         pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
         # pyright resolves every import in src/dew, the optional readers' included.
-        pip install -e ".[$EXTRAS,gguf,torchax]" -c constraints.txt
+        pip install -e ".[$EXTRAS]" -c constraints.txt
     - name: Lint with flake8
       run: |
         # stop the build if there are Python syntax errors or undefined names; the
@@ -169,7 +172,9 @@ jobs:
         pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
         # The jax constraints.txt names: the patched 0.11.2 the multi-process
         # cache tests need. The package job runs the release users install.
-        pip install -e ".[$EXTRAS]" -c constraints.txt
+        # tokamax is not a dependency (docs/installation.md); the commit
+        # constraints.txt names runs the MoE tests of its grouped matmul.
+        pip install -e ".[$EXTRAS]" tokamax -c constraints.txt
     # conftest.py persists XLA's compilations under ~/.cache/dew/xla; every
     # run restores the latest one main saved for this shard.
     - name: Restore the compilation cache
@@ -180,7 +185,9 @@ jobs:
         restore-keys: xla-${{ matrix.python-version }}-${{ matrix.shard }}-${{ hashFiles('pyproject.toml') }}-
     - name: Test with pytest
       run: |
+        # The lint job runs tests/test_gen_api.py, under the griffe it pins.
         /usr/bin/time -v env JAX_PLATFORMS=cpu PYTHONFAULTHANDLER=1 pytest -m "not network" -vv \
+          --ignore=tests/test_gen_api.py \
           --capture=tee-sys -ra --junitxml=pytest-report.xml \
           --splits 12 --group ${{ matrix.shard }} --splitting-algorithm duration_based_chunks \
           --durations-path tests/test_durations.json
@@ -211,6 +218,23 @@ jobs:
                     title = title.replace(":", "%3A").replace(",", "%2C")
                     detail = escape(node.text or node.get("message") or "Test failed")
                     print(f"::error title={title}::{detail}")
+        EOF
+    - name: Refuse a test skipped on a missing import
+      if: always() && hashFiles('pytest-report.xml') != ''
+      run: |
+        python - <<'EOF'
+        # pytest.importorskip skips a test, or a whole file, whose dependency did
+        # not install, and the shard still passes: a test CI never ran. Install
+        # the dependency (EXTRAS) or leave the file to the job that has it.
+        import xml.etree.ElementTree as ET
+        missing = sorted({
+            f"{case.get('classname') or case.get('name')}: {skipped.text or skipped.get('message')}"
+            for case in ET.parse("pytest-report.xml").getroot().iter("testcase")
+            for skipped in case.iter("skipped")
+            if "could not import" in f"{skipped.get('message')} {skipped.text}"})
+        for line in missing:
+            print(f"::error title=Skipped on a missing import::{line}")
+        raise SystemExit(1 if missing else 0)
         EOF
     - name: Upload the test report
       if: always() && hashFiles('pytest-report.xml') != ''

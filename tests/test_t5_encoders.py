@@ -15,6 +15,9 @@ Tolerances and the differences actually observed, fp32 on CPU:
   kernel's 1/sqrt(head_dim), and the gate is `jax.nn.gelu(approximate=True)`,
   transformers' tanh `gelu_new`, not the erf one (4.7e-4 apart at |x| = 11,
   measured against `ACT2FN["gelu_new"]`).
+- tiny UMT5 (three layers, a bias table each): max |hidden state difference|
+  1.61e-06 (mean 2.49e-07, median 2.38e-07), tolerance 1e-4, on hidden states
+  reaching 3.3.
 - t5-small (plain relu): max |hidden state difference| 4.8e-07 (mean 8.2e-08,
   median 6.7e-08), tolerance 1e-3, on hidden states reaching 3.3.
 """
@@ -32,6 +35,7 @@ from dew.inputs import T5Text
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "t5"
 TINY = FIXTURES / "tiny"
+TINY_UMT5 = FIXTURES / "tiny-umt5"
 TOLERANCE = 1e-4
 
 
@@ -60,6 +64,36 @@ def test_tiny_checkpoint_matches_the_reference():
     difference = largest_difference(context.hidden, expected["last_hidden_state"])
     assert difference < TOLERANCE, f"max |hidden state difference| {difference:.3e}"
     assert np.array_equal(np.asarray(context.mask), expected["attention_mask"])
+
+
+def test_a_umt5_checkpoint_matches_the_reference():
+    """UMT5, Wan 2.1's text encoder: the same tower with a relative bias
+    table in every layer, run on the reference's own ids and padding."""
+    expected = reference(TINY_UMT5)
+    encoder = T5Text.from_pretrained(str(TINY_UMT5))
+    tokens = {"input_ids": expected["input_ids"], "attention_mask": expected["attention_mask"]}
+
+    difference = largest_difference(encoder.encode(encoder.params, tokens).hidden,
+                                    expected["last_hidden_state"])
+    assert difference < TOLERANCE, f"max |hidden state difference| {difference:.3e}"
+
+
+def test_each_umt5_layer_reads_its_own_bias():
+    """T5's sharing, layer 0's table read by every layer, is not UMT5's: with
+    the later layers' tables replaced by layer 0's, the outputs leave the
+    reference."""
+    expected = reference(TINY_UMT5)
+    encoder = T5Text.from_pretrained(str(TINY_UMT5))
+    tokens = {"input_ids": expected["input_ids"], "attention_mask": expected["attention_mask"]}
+    layers = encoder.params["params"]
+    first = layers["layers_0"]["self_attn"]["rel_bias"]
+    shared = dict(layers)
+    for name in ("layers_1", "layers_2"):
+        shared[name] = {**layers[name], "self_attn": {**layers[name]["self_attn"], "rel_bias": first}}
+
+    difference = largest_difference(encoder.encode({"params": shared}, tokens).hidden,
+                                    expected["last_hidden_state"])
+    assert difference > TOLERANCE, f"layer 0's table in every layer still matches: {difference:.3e}"
 
 
 def test_the_encoder_tokenizes_and_captions():

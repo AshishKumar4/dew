@@ -22,13 +22,30 @@ Regenerate with a maxtext checkout on the path:
 ```
 PYTHONPATH=/path/to/maxtext-parent python tools/muonclip_reference.py
 ```
+
+For grouped-query and multi-head attention, which MaxText refuses, the
+applicable implementation is Megatron Core's (`SelfAttention.clip_qk` and
+`_clip_linear_qkv`, megatron/core/transformer/attention.py at core_v0.19.2):
+per query group, eta = min(1, tau / the group's largest logit), the group's
+query heads scaled by eta^alpha and its key head by eta^(1 - alpha), alpha
+0.5. `write_megatron_fixture` runs those two methods as published, fetched
+at that commit, on a stand-in layer whose fused `linear_qkv` holds Dew-layout
+query, key and value kernels, in float32 and in float64, and stores the
+clipped kernels in Dew's layout in `tests/fixtures/muonclip/megatron.npz`:
+
+```
+python tools/muonclip_reference.py megatron
+```
 """
 
 from __future__ import annotations
 
+import ast
 import importlib
 import json
 import sys
+import types
+import urllib.request
 from pathlib import Path
 
 import jax
@@ -37,6 +54,17 @@ import numpy as np
 
 FIXTURE = (Path(__file__).resolve().parent.parent / "tests" / "fixtures"
            / "muonclip" / "maxtext_mla.json")
+MEGATRON = ("https://raw.githubusercontent.com/NVIDIA/Megatron-LM/"
+            "4b4acac9a1d28ea6829c8d4f566d75698a21249d/megatron/core/transformer/attention.py")
+MEGATRON_CASES = {"gqa": (8, 2, [250.0, 10.0, 40.0, 120.0, 10.0, -5.0, 30.0, 99.0]),
+                  "mha": (4, 4, [250.0, 10.0, 30.0, 150.0])}
+"""Heads, key heads and per-head maxima at tau 100: under grouped queries
+one group fires on two heads and the other stays below, a negative maximum
+among its quiet ones; under multi-head attention two heads fire and two
+hold. A group whose largest maximum is not positive is left out: Megatron's
+tau over it goes negative and its square root NaN, where Dew holds the
+group (`_clip_scale`)."""
+HIDDEN, HEAD_DIM = 16, 4
 
 
 def clip_scale(s_max: jax.Array, tau: float) -> jax.Array:
@@ -106,5 +134,67 @@ def write_maxtext_fixture() -> None:
     print(f"wrote {FIXTURE} with {len(cases)} cases")
 
 
+def megatron_methods() -> dict:
+    """`SelfAttention.clip_qk` and `_clip_linear_qkv`, as published."""
+    text = urllib.request.urlopen(MEGATRON).read().decode()
+    attention = next(node for node in ast.parse(text).body
+                     if isinstance(node, ast.ClassDef) and node.name == "SelfAttention")
+    methods = [node for node in attention.body if isinstance(node, ast.FunctionDef)
+               and node.name in ("clip_qk", "_clip_linear_qkv")]
+    import torch
+
+    scope = {"torch": torch}
+    exec(compile(ast.Module(body=methods, type_ignores=[]), "attention.py", "exec"), scope)
+    return {name: scope[name] for name in ("clip_qk", "_clip_linear_qkv")}
+
+
+def megatron_clip(methods: dict, kernels: dict, heads: int, kv_heads: int, maxima, dtype) -> dict:
+    """The clipped query, key and value kernels, `[hidden, width]` each, of a
+    layer whose fused `linear_qkv` weight Megatron lays out group by group:
+    the group's query heads, then its key head, then its value head."""
+    import torch
+
+    group = heads // kv_heads
+    rows = {name: torch.as_tensor(kernel.T, dtype=dtype) for name, kernel in kernels.items()}
+    fused = torch.cat([torch.cat([rows["q"][g * group * HEAD_DIM:(g + 1) * group * HEAD_DIM],
+                                  rows["k"][g * HEAD_DIM:(g + 1) * HEAD_DIM],
+                                  rows["v"][g * HEAD_DIM:(g + 1) * HEAD_DIM]]) for g in range(kv_heads)])
+    layer = types.SimpleNamespace(
+        config=types.SimpleNamespace(qk_clip=True, qk_clip_threshold=100.0, qk_clip_alpha=0.5),
+        core_attention=types.SimpleNamespace(current_max_attn_logits=torch.tensor(maxima, dtype=dtype)),
+        num_attention_heads_per_partition=heads, num_query_groups_per_partition=kv_heads,
+        query_projection_size=heads * HEAD_DIM, kv_projection_size=kv_heads * HEAD_DIM,
+        linear_qkv=types.SimpleNamespace(weight=torch.nn.Parameter(fused, requires_grad=False)))
+    layer._clip_linear_qkv = types.MethodType(methods["_clip_linear_qkv"], layer)
+    methods["clip_qk"](layer)
+    clipped = layer.linear_qkv.weight.data.view(kv_heads, (group + 2) * HEAD_DIM, HIDDEN)
+    return {"q": clipped[:, :group * HEAD_DIM].reshape(-1, HIDDEN).T.numpy(),
+            "k": clipped[:, group * HEAD_DIM:(group + 1) * HEAD_DIM].reshape(-1, HIDDEN).T.numpy(),
+            "v": clipped[:, (group + 1) * HEAD_DIM:].reshape(-1, HIDDEN).T.numpy()}
+
+
+def write_megatron_fixture() -> None:
+    import torch
+
+    methods = megatron_methods()
+    rng = np.random.default_rng(7)
+    arrays = {}
+    for name, (heads, kv_heads, maxima) in MEGATRON_CASES.items():
+        kernels = {"q": rng.normal(0, 0.5, (HIDDEN, heads * HEAD_DIM)).astype(np.float32),
+                   "k": rng.normal(0, 0.5, (HIDDEN, kv_heads * HEAD_DIM)).astype(np.float32),
+                   "v": rng.normal(0, 0.5, (HIDDEN, kv_heads * HEAD_DIM)).astype(np.float32)}
+        arrays[f"{name}/max_logits"] = np.asarray(maxima, np.float32)
+        arrays.update({f"{name}/{part}": kernel for part, kernel in kernels.items()})
+        for dtype, tail in ((torch.float32, ""), (torch.float64, "_f64")):
+            clipped = megatron_clip(methods, kernels, heads, kv_heads, maxima, dtype)
+            arrays.update({f"{name}/clipped_{part}{tail}": kernel for part, kernel in clipped.items()})
+    path = FIXTURE.parent / "megatron.npz"
+    np.savez(path, **arrays)
+    print(f"wrote {path}: {', '.join(MEGATRON_CASES)}")
+
+
 if __name__ == "__main__":
-    write_maxtext_fixture()
+    if sys.argv[1:] == ["megatron"]:
+        write_megatron_fixture()
+    else:
+        write_maxtext_fixture()

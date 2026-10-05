@@ -88,6 +88,7 @@ import jax
 import ml_dtypes
 import numpy as np
 import pytest
+from reference_error import assert_as_exact_as_the_reference
 
 from dew.interop import Pretrained
 from dew.interop.safetensors_io import save_hf_layout
@@ -167,13 +168,15 @@ def indexed(request, trips):
 def test_every_source_tensor_is_bound_or_retained_and_written_back(trip):
     """No tensor of the checkpoint disappears on the way out: each one is
     either bound to a leaf or retained by name, and the export holds the
-    same table the source did."""
+    same table the source did. GPT-NeoX binds no layout: the decoder
+    export's encoder writes its whole table, which the last half holds."""
     bound = [layout.name for layout in trip.source.weight_layouts]
     retained = set(trip.source.retained_tensors)
 
-    assert len(bound) == len(set(bound)), "a source tensor is bound twice"
-    assert not retained & set(bound), "a tensor is both bound and retained"
-    assert set(bound) | retained == set(trip.source_tensors)
+    if trip.case.name != "gpt_neox":
+        assert len(bound) == len(set(bound)), "a source tensor is bound twice"
+        assert not retained & set(bound), "a tensor is both bound and retained"
+        assert set(bound) | retained == set(trip.source_tensors)
     assert set(trip.exported_tensors) == set(trip.source_tensors)
     for name, tensor in trip.source_tensors.items():
         assert trip.exported_tensors[name].shape == tensor.shape, name
@@ -188,10 +191,11 @@ def test_the_export_carries_the_trained_weights_not_the_loaded_ones(trip):
     embedding and attention projections; a routed one holds its experts and
     router besides."""
     distances = tool.moved(trip)
-    routed = trip.source.model.mixture is not None
+    routed = getattr(trip.source.model, "mixture", None) is not None
+    recurrent = trip.case.name == "mamba2"
 
-    assert set(distances) >= {"embedding", "attention"} | (
-        {"expert", "router"} if routed else {"feedforward"})
+    assert set(distances) >= {"embedding", "mixer" if recurrent else "attention"} | (
+        {"expert", "router"} if routed else set() if recurrent else {"feedforward"})
     for kind, distance in distances.items():
         assert distance > MOVEMENT, f"{kind} moved {distance:.3e}"
 
@@ -210,12 +214,11 @@ def test_the_trained_export_reloads_leaf_for_leaf_and_recomputes_the_logits(trip
 
 
 def test_transformers_reads_the_trained_export(trip):
-    """The export is a checkpoint the reference implementation loads: same
-    ids, same argmax, and the logits agree to `LOGITS` of their scale."""
-    assert np.array_equal(np.argmax(trip.theirs, -1), np.argmax(trip.ours, -1))
-    difference = float(np.max(np.abs(trip.theirs - trip.ours)))
-    scale = float(np.max(np.abs(trip.theirs)))
-    assert difference < LOGITS * scale, f"max |logit difference| {difference:.3e} at scale {scale:.2f}"
+    """The export is a checkpoint the reference implementation loads with a
+    clean report (`tool.reference_model`), and Dew's trained logits are as
+    exact as transformers' own over the exported files: tests/reference_error.py's
+    rule, against transformers in float64 over the same files."""
+    assert_as_exact_as_the_reference(trip.ours, trip.theirs, trip.truth, f"{trip.case.name} logits")
 
 
 def test_the_export_keeps_the_sources_config_and_generation_config(trip):
@@ -524,6 +527,80 @@ def test_an_interrupted_re_export_leaves_the_previous_export_whole(tmp_path, mon
         "model.fp16.safetensors", "model.safetensors"]
 
 
+@pytest.mark.parametrize("sampling", [
+    {"temperature": 0.0},
+    {"temperature": 0.5, "top_k": 7, "eos_id": 3, "pad_id": 0, "min_new_tokens": 2, "stop": ("\n\n",)},
+    {"temperature": 1.3, "top_p": 0.9, "min_p": 0.05, "typical_p": 0.8, "repetition_penalty": 1.2,
+     "no_repeat_ngram_size": 3, "eos_id": (3, 4), "pad_id": 1},
+], ids=["greedy", "top_k_with_stops", "nucleus_and_penalties"])
+def test_a_runs_policy_exports_as_the_generation_config_transformers_and_dew_read_back(sampling):
+    """The generation_config.json an export of a run writes is transformers'
+    format, which transformers parses to the run's policy (no top-k of 50
+    where the run had none), and Dew's reader returns the policy as it was."""
+    import transformers
+
+    from dew.interop.generation_config import generation_config_of, source_decoding
+    from dew.nn.backbones import CausalTransformer
+    from dew.sampling import Sampling
+
+    policy = Sampling(**sampling)
+    written = json.loads(json.dumps(generation_config_of(policy, 4)))
+    parsed = transformers.GenerationConfig.from_dict(written)
+    assert (parsed.do_sample, parsed.max_new_tokens) == (policy.temperature > 0, 4)
+    if parsed.do_sample:
+        assert (parsed.temperature, parsed.top_k or None, parsed.top_p) == (
+            policy.temperature, policy.top_k, policy.top_p)
+    assert parsed.eos_token_id == (list(policy.eos_id) if isinstance(policy.eos_id, tuple) else policy.eos_id)
+    model = CausalTransformer(vocab_size=8, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
+                              max_seq_len=16)
+    read, _, _ = source_decoding({}, written, model, 1, None)
+    assert read == dataclasses.replace(policy, pad_id=policy.pad_id or 0)
+
+
+def test_a_policy_transformers_cannot_hold_is_refused_not_dropped():
+    from dew.interop.generation_config import generation_config_of
+    from dew.sampling import Sampling
+
+    with pytest.raises(ValueError, match="no presence_penalty"):
+        generation_config_of(Sampling(presence_penalty=0.5))
+
+
+@pytest.mark.parametrize("sharded", [False, True])
+def test_a_re_export_deletes_only_its_own_files_whatever_the_old_index_names(tmp_path, sharded):
+    """The public export's deletion rule: a re-export removes only the
+    weight files this writer creates, `model.safetensors` and
+    `model-*-of-*.safetensors` shards it did not just write, read off the
+    folder's own listing. An old index is the folder's content, not the
+    writer's, so one naming a path outside the export, an absolute path or
+    another file deletes none of them, and no unrelated file in the folder
+    is touched."""
+    from dew.interop.safetensors_io import INDEX_FILE, read_weights
+
+    source = Pretrained.load(str(FIXTURES / "qwen3-tiny"), dtype="float32", attention_impl="reference")
+    export, outside = tmp_path / "export", tmp_path / "outside.txt"
+    export.mkdir()
+    outside.write_text("not the export's")
+    sentinels = {"notes.safetensors": "named by the old index", "model.fp16.safetensors": "a variant",
+                 "README.md": "a model card", "optimizer.pt": "someone's state", "notes.txt": "notes"}
+    for name, text in sentinels.items():
+        (export / name).write_text(text)
+    (export / "model-00001-of-00002.safetensors").write_bytes(b"a stale shard")
+    (export / INDEX_FILE).write_text(json.dumps({"metadata": {}, "weight_map": {
+        "a": "../outside.txt", "b": str(outside.resolve()), "c": "notes.safetensors",
+        "d": "model-00001-of-00002.safetensors"}}))
+
+    source.save(export, max_shard_size=64 * 1024 if sharded else "5GB")
+
+    assert outside.read_text() == "not the export's"
+    for name, text in sentinels.items():
+        assert (export / name).read_text() == text, name
+    assert not (export / "model-00001-of-00002.safetensors").exists()
+    assert (export / INDEX_FILE).exists() == sharded
+    written = read_weights(export)
+    again = Pretrained.load(str(export), dtype="float32", attention_impl="reference")
+    assert len(written) > 0 and jax.tree.structure(again.variables) == jax.tree.structure(source.variables)
+
+
 def test_a_quantized_source_exports_trained_weights_in_its_original_format(tmp_path):
     """The source config describes real FP8 bytes after a training update."""
     import torch
@@ -565,7 +642,7 @@ def test_a_quantized_source_exports_trained_weights_in_its_original_format(tmp_p
     )
     state = tool.train(CASES["deepseek_v3"], quantized, ids)
     destination = tmp_path / "exported"
-    quantized.save(destination, variables=state.params)
+    quantized.save(destination, variables=state.variables)
     packed_export = load_file(str(destination / "model.safetensors"))
     assert packed_export[scaled].dtype == torch.float8_e4m3fn
     assert json.loads((destination / "config.json").read_text()) == config
@@ -588,10 +665,10 @@ def test_a_quantized_source_exports_trained_weights_in_its_original_format(tmp_p
                                   tool.logits(decoded, decoded.variables, ids))
     for layout in quantized.weight_layouts:
         if layout.name != scaled:
-            np.testing.assert_array_equal(float_export[layout.name], layout.export(state.params))
+            np.testing.assert_array_equal(float_export[layout.name], layout.export(state.variables))
     without_provenance = dataclasses.replace(quantized, quantized_tensors=())
     with pytest.raises(ValueError, match="recorded no quantized tensors"):
-        without_provenance.save(tmp_path / "refused", variables=state.params)
+        without_provenance.save(tmp_path / "refused", variables=state.variables)
 
 
 def test_mxfp4_source_reexports_the_trained_experts_and_preserves_float_tensors(tmp_path):
@@ -616,7 +693,7 @@ def test_mxfp4_source_reexports_the_trained_experts_and_preserves_float_tensors(
     ids = np.load(source / "input_ids.npy")
     state = tool.train(tool.Case("gpt_oss", "gpt-oss-tiny"), loaded, ids)
     destination = tmp_path / "export"
-    loaded.save(destination, variables=state.params)
+    loaded.save(destination, variables=state.variables)
     emitted = load_file(str(destination / "model.safetensors"))
     assert set(emitted) == set(packed)
     assert json.loads((destination / "config.json").read_text()) == config
@@ -630,7 +707,7 @@ def test_mxfp4_source_reexports_the_trained_experts_and_preserves_float_tensors(
                for layout in loaded.weight_layouts if layout.name in stems)
     for layout in loaded.weight_layouts:
         if layout.name not in stems:
-            np.testing.assert_array_equal(decoded[layout.name], layout.export(state.params))
+            np.testing.assert_array_equal(decoded[layout.name], layout.export(state.variables))
     plain_directory = tmp_path / "decoded"
     plain_config = {name: value for name, value in config.items() if name != "quantization_config"}
     save_hf_layout(decoded, plain_config, plain_directory)
@@ -640,7 +717,7 @@ def test_mxfp4_source_reexports_the_trained_experts_and_preserves_float_tensors(
                                   tool.logits(reloaded, reloaded.variables, ids))
     missing = dataclasses.replace(loaded, quantized_tensors=())
     with pytest.raises(ValueError, match="recorded no quantized tensors"):
-        missing.save(tmp_path / "missing-provenance", variables=state.params)
+        missing.save(tmp_path / "missing-provenance", variables=state.variables)
 
 
 def test_an_mtp_copy_that_differs_from_the_trunk_names_the_tensor(tmp_path):

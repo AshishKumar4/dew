@@ -51,6 +51,13 @@ def test_native_bundle_trajectory_update_and_source_roundtrip(saved_pipelines, t
     run_check(saved_pipelines / task)
 
 
+@pytest.mark.parametrize("task", ["sd", "xl", "safety"])
+def test_a_streamed_bundle_matches_the_source(saved_pipelines, task):
+    """The same checks, on the pipeline streamed onto a mesh a leaf at a time
+    (tests/test_pipeline_streaming.py)."""
+    run_check(saved_pipelines / task, "--streamed")
+
+
 @pytest.mark.parametrize("solver", ["pndm-prk", "pndm-plms", "lms", "lms-v", "lms-karras", "euler", "dpm"])
 def test_native_solver_consumes_the_complete_source_grid(saved_pipelines, solver):
     run_check(
@@ -73,6 +80,24 @@ def test_source_roundtrip_preserves_generation_geometry(saved_pipelines):
 
 def test_checkpoint_policy_controls_omitted_negative_conditioning(saved_pipelines):
     run_check(saved_pipelines / "xl", "--case", "negative-policy")
+
+
+def test_the_sdxl_base_hands_its_partial_walk_to_the_refiner_as_diffusers_does(saved_pipelines):
+    """The base walks the steps at or above the cutoff and stops undecoded,
+    and the refiner continues from those latents (`prepare(initial=)`)
+    below it, held to tests/reference_error.py's rule against Diffusers'
+    own SDXL base with denoising_end and refiner with denoising_start
+    (tools/diffusers_handoff_reference.py): the base's latents, the
+    refiner's latents and their decoded images. docs/concepts/inference.md
+    shows the mapping from strength and denoising_end/start to the grid."""
+    run_check(saved_pipelines / "xl", "--case", "handoff")
+
+
+def test_a_prepared_mask_is_the_inpainting_pipelines_own_at_every_level(saved_pipelines):
+    """`prepare(mask=)` binarizes and shrinks a mask as Diffusers 0.34.0's
+    inpainting pipeline does (its mask processor, then nearest
+    interpolation), at each of the 256 byte levels."""
+    run_check(saved_pipelines / "inpaint", "--case", "mask-levels")
 
 
 def test_caption_dropout_keeps_mask_conditioned_gradients(saved_pipelines):

@@ -46,7 +46,7 @@ def main() -> None:
     # verl reads one left-padded [prompt | response] row per call; rebuild that
     # layout from the actions and read Dew's packed critic values into it.
     packed = rollout.episodes.project(episodes)
-    packed_values = np.asarray(rollout.objective.values(state.params, packed))
+    packed_values = np.asarray(rollout.objective.values(state.variables, packed))
     turns, width = native.TURNS, native.PROMPT + native.RESPONSE
     batch = {"input_ids": np.zeros((len(episodes) * turns, width), np.int32),
              "response_mask": np.zeros((len(episodes) * turns, native.RESPONSE), np.float32)}
@@ -72,9 +72,9 @@ def main() -> None:
     # The small native models have a bigram policy and a diagonal feature
     # scale followed by Dense(1). Evaluate those same weights with torch,
     # then let verl compute every loss term and its autograd pullback.
-    policy_table = torch.tensor(np.asarray(state.params["params"]["policy"]["table"]))
+    policy_table = torch.tensor(np.asarray(state.variables["params"]["policy"]["table"]))
     policy_table = (policy_table + .4 * torch.sin(torch.arange(policy_table.numel()).reshape(policy_table.shape))).requires_grad_()
-    weights = state.params["params"]["critic"]
+    weights = state.variables["params"]["critic"]
     kernel = torch.tensor(np.asarray(weights["value"]["kernel"]))
     kernel = (1.2 * kernel + torch.linspace(.5, -.4, kernel.shape[0])[:, None]).requires_grad_()
     scale = torch.tensor(np.asarray(weights["backbone"]["scale"]), requires_grad=True)
@@ -82,7 +82,7 @@ def main() -> None:
     previous = torch.tensor(batch["input_ids"][:, native.PROMPT - 1:native.PROMPT + native.RESPONSE - 1], dtype=torch.long)
     actions = torch.tensor(batch["input_ids"][:, native.PROMPT:], dtype=torch.long)
     policy_probs = torch.log_softmax(policy_table, dim=-1)[previous, actions]
-    ref_table = torch.tensor(np.asarray(state.params["params"]["policy"]["table"]))
+    ref_table = torch.tensor(np.asarray(state.variables["params"]["policy"]["table"]))
     ref_probs = torch.log_softmax(ref_table, dim=-1)[previous, actions]
     critic_values = (scale * kernel[:, 0])[previous] + bias[0]
     response_mask = torch.tensor(batch["response_mask"])

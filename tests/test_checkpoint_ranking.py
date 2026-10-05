@@ -21,8 +21,8 @@ class Overfit(Objective):
     def init(self, key, variables=None):
         return {'params': {'w': jnp.zeros(())}}
 
-    def loss(self, params, batch, step):
-        weight = params['params']['w']
+    def loss(self, variables, batch, step):
+        weight = variables['params']['w']
         # Train to 1; validation prefers the halfway weights.
         target = jnp.where(batch['validation'][0], 0.5, 1.0)
         return (weight - target) ** 2, Aux({})
@@ -79,8 +79,8 @@ def test_default_retains_the_weights_with_lowest_validation_loss(tmp_path):
     assert set(scores) == {3, 12}
     assert scores[3]['val/loss'] < scores[12]['val/loss']
     assert scores[3]['train/loss'] > scores[12]['train/loss']
-    restored, _ = run.checkpoints.restore({'params': result.params}, step='best')
-    assert float(restored['params']['params']['w']) == pytest.approx(0.488)
+    restored, _ = run.checkpoints.restore({'variables': result.variables}, step='best')
+    assert float(restored['variables']['params']['w']) == pytest.approx(0.488)
 
 
 def test_multiple_directions_and_threshold(tmp_path):
@@ -146,9 +146,9 @@ def test_weights_only_best_is_smaller_and_not_a_resume_state(tmp_path):
             metrics=[metric], best=Best(metric, weights_only=True))
     assert run.checkpoints.best == 1
     assert run.checkpoints.latest == 4
-    assert set(run.checkpoints.stored('best')) == {'params', 'ema'}
+    assert set(run.checkpoints.stored('best')) == {'variables', 'ema'}
     saved, _ = run.checkpoints.restore(None, 'best')
-    assert set(saved) == {'params', 'ema'}
+    assert set(saved) == {'variables', 'ema'}
     with pytest.raises(ValueError, match='inference-only'):
         run.checkpoints.restore(run.initial_state(), 'best')
     with pytest.raises(ValueError, match='requires full'):
@@ -161,7 +161,7 @@ def test_restore_best_returns_the_whole_earlier_state(tmp_path):
     state = run.fit(data(), steps=8, log_every=1, eval_every=1, checkpoint_every=4, restore_best=True)
     assert int(state.step) == 3
     assert int(state.updates) == 3
-    assert float(state.params['params']['w']) == pytest.approx(.488)
+    assert float(state.variables['params']['w']) == pytest.approx(.488)
 
 
 def test_training_values_are_selected_through_the_objective(tmp_path):
@@ -276,8 +276,8 @@ def test_validation_loss_reduces_additive_statistics_over_uneven_batches():
     from dew.training import Evaluation
 
     class Weighted(Overfit):
-        def loss(self, params, batch, step):
-            values = (params['params']['w'] - batch['target']) ** 2
+        def loss(self, variables, batch, step):
+            values = (variables['params']['w'] - batch['target']) ** 2
             return Ratio(jnp.sum(values), jnp.asarray(values.size, jnp.float32)), Aux({})
 
     objective = Weighted()
@@ -404,9 +404,9 @@ def test_validation_loss_reuses_compilation_without_retaining_dead_objectives():
 
     class Traced(Overfit):
         traces = 0
-        def loss(self, params, batch, step):
+        def loss(self, variables, batch, step):
             self.traces += 1
-            return super().loss(params, batch, step)
+            return super().loss(variables, batch, step)
     objective = Traced()
     variables = objective.init(jax.random.key(0))
     for step in (1, 2):

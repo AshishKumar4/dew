@@ -11,6 +11,8 @@ An `Objective` defines what a run learns: how to initialize the variables, how t
 | `evaluate(variables, batch, step)` | No | Scoring artifacts for a validation batch |
 | `preview(variables, batch, step, *, scored=None)` | No | Display artifacts, once per evaluation event |
 | `ema` | No | An `EMASpec`, or `None` for no moving average |
+| `optimizer(tx, *, accumulation)` | No | The optimizer the trainer steps `params` with; `tx` by default |
+| `averages(update)` | No | Whether an update moves the EMA; every update by default |
 
 An objective is passed to `Trainer` as an instance. Registering it (`dew.registry`) is only needed when a configuration file must find it by name.
 
@@ -47,6 +49,42 @@ class Continued(Objective):
 `variables=None` means the objective's own configured input, which is what a plain `init(key)` uses. The trainer always passes the tree through the initializer, so nothing is read off the objective inside the trace. Because the tree is an argument, it stays an argument however deeply `init` nests its own `jax.jit`. An objective that wraps another passes the held tree on to that objective's `init`. A subclass of an objective that holds weights must accept the `variables` parameter; if it does not, the call raises.
 
 `Trainer.initial_state(initializer=None, key=None)` is the one place the state is built; each `None` is filled in from the run. `Trainer.place` calls it once for the shapes and once for the values, so `trainer.initial_state()` returns the state a run starts from.
+
+## Several networks, several optimizers
+
+An objective that trains more than one network, such as a few-step student beside the fake score that criticizes it (rCM, DMD2) or a generator beside its discriminator, can give each network its own optimizer. `optimizer(tx, *, accumulation)` returns the optimizer the trainer steps `params` with, made from the one `Trainer` was handed. `optax.multi_transform` gives each network its own copy of `tx`, with its own moments, count and schedule, and `optax.conditionally_mask` steps a copy only on its network's updates, so Adam's momentum cannot move a network on another's update. The mask's count is the trainer's committed updates, which at `accumulation=1` is also the `step.step` the loss reads. An objective that alternates refuses a larger accumulation, since one window would mix phases. `averages(update)` says which updates move the EMA:
+
+```python
+import jax
+import optax
+
+from dew import Objective
+from dew.objectives.base import EMASpec, under
+
+
+class Players(Objective):
+    ema = EMASpec(decay=optax.constant_schedule(0.999), select=under("params", "gen"))
+
+    def generating(self, update):
+        return update % 2 == 0
+
+    def loss(self, variables, batch, step):
+        return jax.lax.cond(self.generating(step.step), self.generator_loss,
+                            self.discriminator_loss, variables["params"], batch)
+
+    def optimizer(self, tx, *, accumulation):
+        if accumulation > 1:
+            raise ValueError("the players alternate update by update; train with accumulation=1")
+        return optax.multi_transform(
+            {"gen": optax.conditionally_mask(tx, self.generating),
+             "disc": optax.conditionally_mask(tx, lambda update: ~self.generating(update))},
+            {"gen": "gen", "disc": "disc"})
+
+    def averages(self, update):
+        return self.generating(update)
+```
+
+`ConsistencyDistillationObjective` (rCM) is built this way: its student and fake score step on their own phases, each from its own copy of the optimizer, and its EMA follows the student's updates.
 
 ## loss
 
@@ -117,7 +155,7 @@ data = Dataset(train=lambda partition: itertools.repeat(batch), val=None, record
 objective = StatefulRegression()
 trainer = Trainer(objective, optax.sgd(0.001), key=jax.random.key(0))
 state = trainer.fit(data, steps=3, log_every=1)
-running_mean = np.asarray(state.params["batch_stats"]["norm"]["mean"])
+running_mean = np.asarray(state.variables["batch_stats"]["norm"]["mean"])
 assert np.all(running_mean > 0)
 print("Stored running mean:", running_mean)
 ```

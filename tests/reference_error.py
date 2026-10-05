@@ -37,6 +37,13 @@ rounding boundary: an entry flips with probability about sqrt(K) 2^-24 /
 rounding error, so the ratio is near 2 sqrt(sqrt(K) 2^-16), 0.04 at K 512.
 One rounding at a point the reference does not round is an independent
 error of the reference's own size and puts the ratio near one.
+
+Where the truth is an oracle written apart from the reference (a recurrence
+or an equation, not the reference run in float64), the rule only measures
+rounding if the reference computes the oracle's function: a reference that
+shares Dew's mistake would widen the bound to fit it. So the reference's own
+arithmetic in float64 is held to the oracle first, within the float64
+rounding of the computation itself (`assert_computes_the_oracle`).
 """
 
 import numpy as np
@@ -71,6 +78,22 @@ def assert_as_exact_as_the_reference(dew, reference, truth, label: str) -> None:
     assert mine <= FACTOR * theirs, (
         f"{label}: dew is {mine:.3e} from float64 (rms), the reference {theirs:.3e} "
         f"(ratio {mine / theirs:.2f}, allowed {FACTOR})")
+
+
+def assert_computes_the_oracle(reference_in_float64, truth, label: str, *, roundings: int) -> None:
+    """The reference run in float64 within the float64 rounding of the
+    computation itself of an independent float64 oracle: FACTOR times
+    `roundings` (the longest chain of roundings an output goes through, its
+    reductions' lengths summed along the way) float64 unit roundoffs of the
+    truth's RMS scale. Two float64 runs of one function part by that much at
+    most; any difference in the function moves the twin by many orders of
+    magnitude more. The fp32 error is no measure of it: a near-exact fp32 path
+    leaves the float64 runs a few ulps apart all the same."""
+    eps = float(np.finfo(np.float64).eps)
+    apart, scale = distance(reference_in_float64, truth), float(np.sqrt(np.mean(np.square(truth))))
+    assert apart <= FACTOR * roundings * eps * scale, (
+        f"{label}: the reference in float64 is {apart:.3e} from the oracle (rms), more than float64 "
+        f"rounding over {roundings} steps of its scale {scale:.3e}")
 
 
 def assert_rounds_where_the_reference_does(dew, reference, truth, label: str) -> None:

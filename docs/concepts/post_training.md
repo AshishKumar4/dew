@@ -83,7 +83,7 @@ pair = {"chosen": prompt + response, "rejected": prompt + rejected,
 width = max(len(pair["chosen"]), len(pair["rejected"]))
 pairs = PreferencePairs(records=(json.dumps(pair),) * 8, seq_len=width,
                         loading=Loading(workers=0, threads=1, read_buffer=2)).load(batch=8)
-dpo = DPOObjective(model, seq_len=width - 1, beta=0.1, pretrained=sft_state.params)
+dpo = DPOObjective(model, seq_len=width - 1, beta=0.1, pretrained=sft_state.variables)
 dpo_state = Trainer(dpo, optax.adam(1e-3), key=jax.random.key(2)).fit(
     pairs, steps=10, log_every=5)
 ```
@@ -120,7 +120,7 @@ def reward(data_source, completion, ground_truth, extra_info):
 rl_data = Dataset(train=lambda partition: itertools.repeat(prompt_batch), val=None,
                   records=8, batch=8)
 rl_objective = GRPOObjective(model, seq_len=len(story) + 7, beta=0.01,
-                             pretrained=dpo_state.params)
+                             pretrained=dpo_state.variables)
 rollout = SampledRollout(rl_objective, reward=reward, groups=4, max_new_tokens=8,
                          sampling=Sampling(temperature=1.0, top_k=40),
                          decode=tokenizer.decode)

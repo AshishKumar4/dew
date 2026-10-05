@@ -24,11 +24,13 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import tyro
 
 from dew.config import ModelConfig, OptimConfig, TrainerConfig
 from dew.data import ChatMessages, HFTokenizer, Loading
 from dew.data.chat import Role
+from dew.inference import RunProcessor
 from dew.interop import PretrainedDecoder
 from dew.objectives.lm import LMRunConfig, Perplexity, Samples
 from dew.training import MeshSpec, TrainState, prepare_process
@@ -75,13 +77,12 @@ def write_conversations(conversations: list, out: Path) -> Path:
 
 
 def run_config(config: Config, tokenizer: str, chat: str) -> LMRunConfig:
-    """Everything the run is, before the checkpoint decides the architecture."""
+    """Everything the run is but its model, which the checkpoint decides
+    (`main` records the loaded one)."""
     smoke = config.smoke
     # A row budget is the split slice `datasets` already understands.
     split = config.split if config.rows is None else f"{config.split}[:{config.rows}]"
     return LMRunConfig(
-        model=ModelConfig("causal_transformer", {}, dtype="float32" if smoke else "bfloat16",
-                          attention_impl="xla" if smoke else "auto"),
         data=ChatMessages(tokenizer=tokenizer, path=chat, val_path=chat, column=config.column,
                           split=split, seq_len=config.sequence_length, val_batches=1,
                           loading=Loading(workers=0, threads=1, read_buffer=2,
@@ -118,21 +119,21 @@ def main(config: Config) -> Path:
     # the pool forms, and a pool's count is every process's devices.
     run = replace(run, trainer=replace(run.trainer, mesh=MeshSpec(fsdp=jax.device_count())))
 
-    source = PretrainedDecoder.load(config.model, dtype=run.model.dtype,
-                             attention_impl=run.model.attention_impl,
-                             max_seq_len=config.sequence_length + run.sample_tokens)
+    source = PretrainedDecoder.load(config.model, dtype=jnp.float32 if config.smoke else jnp.bfloat16,
+                                    attention_impl="xla" if config.smoke else "auto",
+                                    max_seq_len=config.sequence_length + run.sample_tokens)
     words = HFTokenizer(tokenizer)
+    # The run decodes through this tokenizer, so its checkpoints record its name.
     objective = source.lm_objective(
         config.sequence_length,
         loss_role=Role.ASSISTANT,
+        processor=RunProcessor(words),
         samples=Samples(words.encode("user : hello "), run.sample_tokens,
                         sampling=run.sampling, decode=words.decode))
 
-    # run.json records the model as built, so `dew.pipeline` and the export
-    # rebuild the checkpoint's own architecture rather than these defaults.
-    resolved = {name: value for name, value in source.model_config.items()
-                if name not in run.model.precision_settings()}
-    run = replace(run, model=replace(run.model, config=resolved))
+    # run.json records the model as loaded, so `dew.pipeline` and the export
+    # rebuild the checkpoint's own architecture at the precision it trained in.
+    run = replace(run, model=ModelConfig.from_model(source.model))
 
     data = run.data.load(batch=run.trainer.batch_size)
     name = config.out.name

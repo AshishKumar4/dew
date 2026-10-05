@@ -52,6 +52,7 @@ from jax.typing import DTypeLike
 from dew.nn.attention import (
     RMSNorm,
     _cache_positions,
+    cached_validity,
     causal_attention_mask,
     document_mask,
     unweighted_rmsnorm,
@@ -724,7 +725,7 @@ class DeepseekV4Attention(nn.Module):
                 raise ValueError("decode accepts row validity, not packed segment_ids")
             if valid is None and length > self.max_seq_len:
                 raise ValueError(f"{length} tokens exceed max_seq_len={self.max_seq_len}")
-            slots, allocated = _cache_positions(self, batch, length, self.max_seq_len, valid)
+            slots, allocated = _cache_positions(self, batch, length, valid)
             cache = (slots, self.max_seq_len, allocated)
             cached_key = self.variable('cache', 'cached_key', jnp.zeros,
                                        (batch, self.max_seq_len, self.head_dim), x.dtype)
@@ -763,7 +764,7 @@ class DeepseekV4Attention(nn.Module):
             keys = cached_key.value
             allowed = causal_attention_mask(
                 slots, keys.shape[1], self.sliding_window,
-                key_valid=self.get_variable('cache', 'cache_valid'))[:, 0]
+                key_valid=cached_validity(self, keys.shape[1]))[:, 0]
         if segment_ids is not None:
             allowed = allowed & document_mask(segment_ids)
         if valid is not None and not decode:
@@ -838,8 +839,7 @@ class DSparkAttention(DeepseekV4Attention):
             cached_key = self.variable('cache', 'cached_key', jnp.zeros,
                                        (batch, self.max_seq_len, self.head_dim), x.dtype)
             if main is not None:
-                slots, allocated = _cache_positions(self, batch, main.shape[1], self.max_seq_len,
-                                                    store.get(DRAFT_VALID))
+                slots, allocated = _cache_positions(self, batch, main.shape[1], store.get(DRAFT_VALID))
                 if allocated:
                     cached_key.value = write_cache(cached_key.value, self._window_keys(
                         main, *rope_freqs(slots, self.rope_dim, self.rope_theta, self.yarn,

@@ -9,6 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
+from reference_error import assert_as_exact_as_the_reference
 
 from dew.diffusion import presets
 from dew.inputs import Field, InputSpec
@@ -100,8 +101,126 @@ def test_the_objective_adds_the_weighted_alignment_to_the_denoising_mean(kind):
     assert float(jnp.abs(jax.tree.leaves(grads[ALIGNMENT])[0]).sum()) > 0
     assert float(sum(jnp.abs(leaf).sum() for leaf in jax.tree.leaves(grads["dit_block_0"]))) > 0
     assert float(sum(jnp.abs(leaf).sum() for leaf in jax.tree.leaves(grads["dit_block_1"]))) == 0
-    published = TextToImage.from_objective(objective, params).params
+    published = TextToImage.from_objective(objective, params).variables
     assert REPRESENTATION not in published and ALIGNMENT not in published["params"]
+
+
+COMPOSED = np.load(Path(__file__).resolve().parent / "fixtures" / "repa" / "composed.npz")
+PREPROCESSED = np.load(Path(__file__).resolve().parent / "fixtures" / "repa" / "preprocessed.npz")
+
+
+def patches(images, patch: int):
+    """`[B, H, W, C]` as `[B, N, p * p * C]` tokens in raster order."""
+    b, h, w, c = images.shape
+    grid = images.reshape(b, h // patch, patch, w // patch, patch, c).transpose(0, 1, 3, 2, 4, 5)
+    return grid.reshape(b, (h // patch) * (w // patch), patch * patch * c)
+
+
+class Block(nn.Module):
+    @nn.compact
+    def __call__(self, hidden):
+        return jnp.tanh(hidden @ self.param("kernel", nn.initializers.zeros, (hidden.shape[-1],) * 2))
+
+
+class Network(nn.Module):
+    """`tools/repa_reference.py`'s stand-in model at Dew's model time (t times
+    1000): patch tokens plus the time, the aligned `block`, a head."""
+
+    patch: int
+    width: int
+
+    @nn.compact
+    def __call__(self, x, time, train=False):
+        b, side, _, c = x.shape
+        tokens = patches(x, self.patch)
+        hidden = (tokens @ self.param("embed", nn.initializers.zeros, (tokens.shape[-1], self.width))
+                  + (time / 1000).reshape(-1, 1, 1)
+                  * self.param("time", nn.initializers.zeros, (self.width,)))
+        block = Block(name="block")(hidden)
+        out = block @ self.param("head", nn.initializers.zeros, (self.width, tokens.shape[-1]))
+        grid = out.reshape(b, side // self.patch, side // self.patch, self.patch, self.patch, c)
+        return grid.transpose(0, 1, 3, 2, 4, 5).reshape(b, side, side, c)
+
+
+class Projected(nn.Module):
+    """The stand-in encoder: a projection of the preprocessed pixels' patches."""
+
+    patch: int
+
+    @nn.compact
+    def __call__(self, pixels):
+        tokens = patches(pixels, self.patch)
+        return tokens @ self.param("encoder", nn.initializers.zeros, (tokens.shape[-1], 6))
+
+
+def test_repa_trains_on_repas_composed_loss_and_its_gradient():
+    """REPA's whole loss as its train.py takes it, `loss_mean +
+    proj_loss_mean * proj_coeff` over `SILoss` (linear path, v prediction,
+    uniform times) with `build_mlp`'s projector and the encoder's input
+    from `preprocess_raw_image`, run as published on a stand-in network and
+    encoder (`tools/repa_reference.py`), on the times and noise
+    `DiffusionObjective.loss` draws: Dew's loss is half of it, as Dew's L2
+    halves the denoising error, and its gradient in every weight, the
+    model's up to and past the aligned block and the projector's, is half
+    of REPA's, held to its float64 run by the float64 rule."""
+    from dew.diffusion import FlowMatchingScheduler, FlowMatchPredictionTransform, Process
+
+    settings = json.loads(str(COMPOSED["settings"]))
+    patch, width = settings["patch"], settings["width"]
+    encoder = Projected(patch)
+    alignment = Alignment(encoder, {"params": {"encoder": jnp.asarray(COMPOSED["encoder"])}}, "block",
+                          weight=settings["proj_coeff"], width=settings["projector"])
+    process = Process(FlowMatchingScheduler(density="uniform"), FlowMatchPredictionTransform())
+    pixels = COMPOSED["pixels"]
+    objective = DiffusionObjective(Network(patch, width), process,
+                                   InputSpec(Field("image", pixels.shape[1:])), guidance=None, solver=Euler(),
+                                   steps=2, alignment=alignment, unconditional_prob=0.0, ema_decay=None)
+    variables = objective.init(jax.random.PRNGKey(0))
+    projector = {name: {leaf: jnp.asarray(COMPOSED[f"projector/{name}/{leaf}"], jnp.float32)
+                        for leaf in ("kernel", "bias")} for name in ("Dense_0", "Dense_1", "Dense_2")}
+    params = {"embed": COMPOSED["weights/embed"], "time": COMPOSED["weights/time"],
+              "head": COMPOSED["weights/head"], "block": {"kernel": COMPOSED["weights/block"]},
+              ALIGNMENT: projector}
+    params = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float32), params)
+    step = Step(step=jnp.asarray(0), key=jax.random.key(settings["key"]), ema=None)
+
+    def loss(params):
+        return objective.scalar_loss({**variables, "params": params}, {"image": pixels}, step)[0]
+
+    value, gradient = jax.value_and_grad(loss)(params)
+    np.testing.assert_allclose(2 * float(value), float(COMPOSED["loss_f64"]), rtol=2e-6)
+    for name, got in (("embed", gradient["embed"]), ("time", gradient["time"]), ("head", gradient["head"]),
+                      ("block", gradient["block"]["kernel"])):
+        assert_as_exact_as_the_reference(2 * got, COMPOSED[f"grad/{name}"], COMPOSED[f"grad/{name}_f64"],
+                                         name)
+    for name in ("Dense_0", "Dense_1", "Dense_2"):
+        for leaf in ("kernel", "bias"):
+            key = f"grad/projector/{name}/{leaf}"
+            assert_as_exact_as_the_reference(2 * gradient[ALIGNMENT][name][leaf], COMPOSED[key],
+                                             COMPOSED[f"{key}_f64"], key)
+
+
+class Unchanged(nn.Module):
+    """An encoder whose features are the pixels it is handed."""
+
+    @nn.compact
+    def __call__(self, pixels):
+        return pixels
+
+
+@pytest.mark.parametrize("spatial_norm", [None, 0.6], ids=["repa", "irepa"])
+def test_the_encoders_input_is_repas_and_irepas_dinov2_preprocessing(spatial_norm):
+    """256-pixel images to an encoder of 224: REPA's `preprocess_raw_image`
+    ("dinov2") and iREPA's `DINOv2Encoder.preprocess`, which agree (the
+    reference checks), /255, ImageNet's normalization and torch's bicubic
+    resize, and under iREPA its `spatial_zscore` (gamma 0.6) of the
+    features, held to the published float64 run by the float64 rule."""
+    from dew.inputs import unit_range
+
+    alignment = Alignment(Unchanged(), {}, "block", resolution=224, spatial_norm=spatial_norm)
+    targets = alignment.targets({}, unit_range(PREPROCESSED["pixels"]))
+    name = "dinov2" if spatial_norm is None else "zscore"
+    assert_as_exact_as_the_reference(targets, PREPROCESSED[name], PREPROCESSED[f"{name}_f64"], name)
 
 
 def test_a_layer_the_model_lacks_is_refused():
@@ -110,3 +229,31 @@ def test_a_layer_the_model_lacks_is_refused():
     with pytest.raises(ValueError, match="no submodule 'dit_block_9'"):
         DiffusionObjective(objective.model, objective.process, objective.inputs, guidance=None,
                            solver=Euler(), steps=2, alignment=alignment).init(jax.random.PRNGKey(0))
+
+
+def test_from_run_publishes_the_model_without_the_alignment_head(tmp_path):
+    """An inference record restores the denoiser, not the frozen encoder or
+    projector that only its training loss reads, as the objective's own
+    pipeline does."""
+    import optax
+
+    from dew.checkpoints import Checkpoints
+    from dew.training import Trainer
+
+    objective = aligned()
+    trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0))
+    state = trainer.initial_state()
+    checkpoints = Checkpoints(str(tmp_path))
+    checkpoints.save(0, state, None, artifact=objective.inference_record())
+    checkpoints.wait()
+
+    restored = TextToImage.from_run(str(tmp_path), ema=False)
+    published = objective.pipeline(state, ema=False)
+    assert REPRESENTATION not in restored.variables
+    assert ALIGNMENT not in restored.variables["params"]
+    assert jax.tree.structure(restored.variables) == jax.tree.structure(published.variables)
+    for actual, expected in zip(jax.tree.leaves(restored.variables), jax.tree.leaves(published.variables),
+                                strict=True):
+        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+    np.testing.assert_array_equal(restored([{}, {}], key=9).host().images,
+                                  published([{}, {}], key=9).host().images)

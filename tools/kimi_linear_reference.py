@@ -40,6 +40,8 @@ model_executor/layers/fused_moe/router/grouped_topk_router.py:123-124, 150).
 `unbiased_gate` keeps the released selection and weighs it by the
 unshifted scores, as Dew's router does, and checks on every call that the
 released weights differ from these by the gathered bias and nothing else.
+tests/test_router_source.py holds Dew's router to vLLM's own grouped_topk
+(tools/vllm_router_reference.py) on Kimi Linear's published router.
 
 The tiny config keeps the release's fields and layer pattern at small widths:
 7 layers, KDA on 1-3 and 5-6 and MLA on 4 and 7 (1-based, as the release

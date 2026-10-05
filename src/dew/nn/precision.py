@@ -150,6 +150,21 @@ def rounds_to_bf16(dtype: Dtype | None, precision: PrecisionLike = None) -> bool
     return bf16_operand_precision(dtype, precision) is jax.lax.DotAlgorithmPreset.BF16_BF16_F32
 
 
+def bf16_logits(logits: jax.Array) -> jax.Array:
+    """fp32 `logits` rounded to bf16 and held in fp32, as `rounded_to` rounds
+    them, written as bf16 under CUDA.
+
+    There the cast joins the product's epilogue and each reader widens in its
+    own fusion, behind a barrier `xla_allow_excess_precision` cannot see
+    through. `reduce_precision` instead stayed a kernel of its own after the
+    Triton head, writing and reading the fp32 logits in full when a serving
+    step's draw read them three times: 0.16 ms of a step at 128 rows of
+    Qwen3-0.6B on an RTX 4080, the same bits (docs/performance.md)."""
+    return jax.lax.platform_dependent(
+        logits, cuda=lambda x: jax.lax.optimization_barrier(x.astype(jnp.bfloat16)).astype(x.dtype),
+        default=lambda x: rounded_to(x, jnp.bfloat16))
+
+
 def _algorithm_operand(value: jax.Array) -> jax.Array:
     """`value` as a bf16-algorithm product reads it. GPU and TPU round inside
     the product, so the value passes as it is and no rounded copy is written;
@@ -180,7 +195,7 @@ def head_dot_general(dtype: Dtype | None, precision: PrecisionLike = None):
             rhs = _algorithm_operand(rhs)
         logits = jax.lax.dot_general(lhs, rhs, dimension_numbers, precision=resolved,
                                      preferred_element_type=at_least_fp32(lhs.dtype))
-        return rounded_to(logits, jnp.bfloat16) if rounds else logits
+        return bf16_logits(logits) if rounds else logits
 
     return dot_general
 
@@ -204,7 +219,7 @@ def head_product(subscripts: str, hidden: jax.Array, head: jax.Array,
         logits = jnp.einsum(subscripts, hidden.astype(jnp.float32), _algorithm_operand(head),
                             precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32,
                             preferred_element_type=jnp.float32)
-        return rounded_to(logits, jnp.bfloat16)
+        return bf16_logits(logits)
     wide = at_least_fp32(hidden.dtype)
     return jnp.einsum(subscripts, hidden.astype(wide), head,
                       precision=precision, preferred_element_type=wide)

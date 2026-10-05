@@ -21,7 +21,7 @@ FIXTURE = Path(__file__).parent / "fixtures/hf/diffusion-gemma-workflow"
 
 def test_trained_image_task_accepts_raw_and_prepared_inputs_and_immutable_rebinding(tmp_path):
     objective, state = make_run(tmp_path)
-    task = TextToImage.from_objective(objective, state.params)
+    task = TextToImage.from_objective(objective, state.variables)
     key = jax.random.key(23)
     raw = task(["flower", "tree"], steps=3, solver=Heun(), guidance=CFG(2.0), key=key).host().images
     prepared = task.prepare(["flower", "tree"], key=key)
@@ -35,7 +35,7 @@ def test_trained_image_task_accepts_raw_and_prepared_inputs_and_immutable_rebind
         atol=2e-6,
         rtol=2e-6,
     )
-    mutable = jax.tree.map(lambda leaf: leaf, task.params.unfreeze())
+    mutable = jax.tree.map(lambda leaf: leaf, task.variables.unfreeze())
     bound = task.bind(mutable)
     mutable["params"] = jax.tree.map(lambda leaf: leaf + 0.05, mutable["params"])
     np.testing.assert_array_equal(

@@ -134,6 +134,9 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
     Every response token is corrupted, but only a uniformly selected valid
     canvas contributes diffusion CE.
 
+    `processor` is what `pipeline` turns text into ids with and decodes
+    through, unless it is handed another; a run records its tokenizer.
+
     `trainable` selects the parameter leaves the optimizer moves, by their
     full path (`dew.objectives.base.PathFilter`), the way `LMObjective`
     takes it; the rest of the tree is kept under `frozen`, which `init`
@@ -155,7 +158,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
                  stop_gradient_from_denoiser_to_encoder: bool = False,
                  encoder_loss_weight: float = 1.0, decoder_loss_weight: float = 1.0,
                  ema_decay: float | None = None, trainable: PathFilter | None = None,
-                 head_chunks: int = 4):
+                 head_chunks: int = 4, processor: Processor | None = None):
         canvas_size = model.canvas_length if canvas_size is None else canvas_size
         for name, value in (("prompt_length", prompt_length), ("num_canvases", num_canvases),
                             ("canvas_size", canvas_size), ("head_chunks", head_chunks)):
@@ -194,21 +197,20 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         self.ema = None if ema_decay is None else EMASpec(optax.constant_schedule(ema_decay))
         self.trainable = trainable
         self.head_chunks = head_chunks
+        self.processor = processor
 
     def inference_record(self):
         from dew.config import ModelConfig, _to_json
         from dew.diffusion.block import BlockProcess
-        from dew.interop.hf_decoders import _export_config
+        from dew.inference.tasks import recorded_tokenizer
         from dew.registry import objectives
-        if self.model.conditioner is not None:
-            raise TypeError("multimodal block training needs an explicit inference record declaration")
-        model = ModelConfig.from_model(self.model)
-        config = {'model_type': 'diffusion_gemma', 'text_config': _export_config(self.model.text),
-                  'canvas_length': self.canvas_size}
-        return {'objective': objectives.name_of(type(self)), 'model': _to_json(model, ModelConfig),
-                'seq_len': self.sequence_length, 'sample_tokens': self.canvas_size, 'tokenizer': None,
-                'process': BlockProcess(self.canvas_size, self.model.vocab_size).to_json(),
-                'diffusion_gemma': {'config': config, 'generation_config': {}}}
+        if not any(member is type(self) for member in objectives.values()):
+            return None
+        model = _to_json(ModelConfig.from_model(self.model), ModelConfig)
+        return {'objective': objectives.name_of(type(self)), 'model': model,
+                'seq_len': self.sequence_length, 'sample_tokens': self.canvas_size,
+                'tokenizer': recorded_tokenizer(self.processor),
+                'process': BlockProcess(self.canvas_size, self.model.vocab_size).to_json()}
 
     def pipeline(self, state: TrainState, *, ema: bool | None = None,
                  processor: Processor | None = None) -> BlockGeneration:
@@ -221,7 +223,8 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         from dew.inference.tasks import BlockGeneration
 
         process = BlockProcess(canvas_length=self.model.canvas_length, vocab_size=self.model.vocab_size)
-        return BlockGeneration(self.model, thaw(self._pipeline_weights(state, ema)), process, processor,
+        return BlockGeneration(self.model, thaw(self._pipeline_weights(state, ema)), process,
+                               self.processor if processor is None else processor,
                                pad_token_id=self.pad_token_id)
 
     @property
@@ -283,9 +286,9 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
             return values
         return self.model.init(key, jnp.zeros((1, self.canvas_size), jnp.int32))
 
-    def loss(self, params: Variables, batch: Batch, step: Step):
+    def loss(self, variables: Variables, batch: Batch, step: Step):
         canvas_losses, target_mask, encoder_losses, encoder_target_mask, _ = self._token_losses(
-            params, batch, step.key, train=True)
+            variables, batch, step.key, train=True)
         canvas_stats, encoder_stats = (
             _row_mean(canvas_losses, target_mask),
             _row_mean(encoder_losses, encoder_target_mask),

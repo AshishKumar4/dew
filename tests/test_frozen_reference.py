@@ -43,8 +43,8 @@ class Regression(Objective):
     def init(self, key, variables=None):
         return self.model.init(key, jnp.zeros((1, FEATURES)))
 
-    def loss(self, params, batch, step):
-        prediction = self.model.apply(params, batch["x"])
+    def loss(self, variables, batch, step):
+        prediction = self.model.apply(variables, batch["x"])
         return jnp.mean((prediction - batch["y"]) ** 2), Aux({"probe": jnp.asarray(1.0)})
 
 
@@ -115,13 +115,13 @@ def test_unit_decay_returns_the_average_untouched():
 
 def poison(state):
     """Replace a live kernel without changing the aliased frozen reference."""
-    params = dict(state.params)
+    params = dict(state.variables)
     collection = dict(params["params"])
     layer = dict(collection["Dense_0"])
     layer["kernel"] = jnp.full_like(layer["kernel"], jnp.inf)
     collection["Dense_0"] = layer
     params["params"] = collection
-    return dataclasses.replace(state, params=params)
+    return dataclasses.replace(state, variables=params)
 
 
 @pytest.mark.parametrize("dynamic_scale", [False, True])

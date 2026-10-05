@@ -332,18 +332,59 @@ def _trainer(case, fields: dict[str, int], *, one_device: bool = False, accumula
     """The trainer of `case` on the layout `fields` names over the first
     `devices` devices (every device by default), or on this process's first
     device, stashing each gradient the optimizer is handed. Its initial
-    parameters have no all-zero leaf (`_drawn`)."""
+    parameters have no all-zero leaf (`_drawn`). In a one-process run, once
+    the case's one-device state is computed (`_initial`), a trainer whose
+    mesh shards the variables in a way the case has not yet drawn them
+    computes its own state and must find it bitwise equal to that one, and
+    every other trainer copies it: the same state, without a compile of the
+    model's initialization on every layout."""
     import benchmark_step as bench
     import jax
+    import numpy as np
     import optax
 
     from dew.training import Layout, MeshSpec, Trainer
+    from dew.training.trainer import refuse_wide_floats
 
     class Drawn(Trainer):
         def initial_state(self, initializer=None, key=None):
             state = super().initial_state(initializer, key)
-            params = {**state.params, "params": _drawn(state.params["params"], jax.random.key(7))}
-            return dataclasses.replace(state, params=params, opt_state=self.optimizer.init(params["params"]))
+            params = {**state.variables, "params": _drawn(state.variables["params"], jax.random.key(7))}
+            return dataclasses.replace(state, variables=params, opt_state=self.optimizer.init(params["params"]))
+
+        def place(self):
+            held = _initial.get((repr(case), accumulation)) if jax.process_count() == 1 else None
+            # Copies every time, in and out: the step donates the state it is handed.
+            if held is None:
+                state, shardings, position = super().place()
+                if one_device:
+                    _initial[(repr(case), accumulation)] = jax.tree.map(lambda leaf: leaf.copy(), state)
+                return state, shardings, position
+            abstract = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), held)
+            refuse_wide_floats(abstract, self.device_mesh)
+            shardings = self.shardings(abstract)
+            self.layout.check(abstract.variables, shardings.variables, self.device_mesh)
+            # The mesh axes the variables split over, with their sizes: an
+            # initializer drawn under a split the case has not drawn under
+            # yet could come out different, so that split draws its own.
+            split = tuple(sorted({(axis, self.device_mesh.shape[axis])
+                                  for sharding in jax.tree.leaves(shardings.variables)
+                                  for entry in sharding.spec if entry is not None
+                                  for axis in ((entry,) if isinstance(entry, str) else entry)
+                                  if self.device_mesh.shape[axis] > 1}))
+            if split and (repr(case), split) not in _drawn_splits:
+                state, shardings, position = super().place()
+                drawn, _ = jax.tree_util.tree_flatten_with_path(jax.device_get(state.variables))
+                wanted = jax.tree.leaves(jax.device_get(held.variables))
+                differing = [jax.tree_util.keystr(path)
+                             for (path, here), there in zip(drawn, wanted, strict=True)
+                             if np.asarray(here).tobytes() != np.asarray(there).tobytes()]
+                if differing:
+                    raise ValueError(f"the variables drawn split over {split} differ from one device's "
+                                     f"at {differing[:4]}")
+                _drawn_splits.add((repr(case), split))
+                return state, shardings, position
+            return jax.device_put(jax.tree.map(lambda leaf: leaf.copy(), held), shardings), shardings, None
 
     trainer = Drawn(bench.build_objective(case), optax.chain(stash(), optax.adam(1e-3)),
                       key=jax.random.key(0), mesh=bench.mesh_spec(fields),
@@ -354,6 +395,15 @@ def _trainer(case, fields: dict[str, int], *, one_device: bool = False, accumula
     elif devices is not None:
         trainer.device_mesh = trainer.mesh.build(jax.devices()[:devices])
     return trainer
+
+
+_initial: dict[tuple[str, int], Any] = {}
+"""Each case's initial state by its accumulation window, as the first
+one-device trainer placed it on this process's first device: every layout's
+trainer draws the same state from the same key, so later trainers copy it
+onto their mesh."""
+_drawn_splits: set[tuple[str, tuple[tuple[str, int], ...]]] = set()
+"""Each case's variable splits whose own draw was found equal to `_initial`'s."""
 
 
 def _gradient(state) -> dict[str, NDArray]:
@@ -488,13 +538,13 @@ def anchor_step(case, batch) -> tuple[float, dict[str, NDArray]]:
     from dew.objectives.base import Step
     from dew.training.transaction import with_ema
 
-    state = jax.jit(_trainer(case, {}, one_device=True).initial_state)()
+    state, _, _ = _trainer(case, {}, one_device=True).place()
 
     def widened(tree):
         return jax.tree.map(lambda leaf: leaf.astype(jnp.float64)
                             if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf, tree)
 
-    wide = widened(state.params)
+    wide = widened(state.variables)
     objective = bench.build_objective(case, widened=True)
     # The trainer's first step: its key folded with the step, which draws a
     # diffusion objective's noise and a masked one's masks, and the frozen
@@ -502,8 +552,8 @@ def anchor_step(case, batch) -> tuple[float, dict[str, NDArray]]:
     step = Step(state.microstep, jax.random.fold_in(state.key, state.step),
                 with_ema(wide, None if state.ema is None else widened(state.ema)))
 
-    def loss(params, batch):
-        return objective.scalar_loss({**wide, "params": params}, batch, step)[0]
+    def loss(variables, batch):
+        return objective.scalar_loss({**wide, "params": variables}, batch, step)[0]
 
     value, gradient = jax.jit(jax.value_and_grad(loss))(wide["params"], batch)
     return float(value), {jax.tree_util.keystr(path): np.asarray(leaf)
