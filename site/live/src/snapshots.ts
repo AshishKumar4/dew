@@ -25,6 +25,10 @@ export class SnapshotRegistry extends DurableObject<SnapshotEnv> {
 		return generation?.commit === commit && generation.created + LIFETIME_MS > now ? generation : null;
 	}
 
+	async previous(): Promise<SnapshotGeneration | null> {
+		return (await this.ctx.storage.get<SnapshotGeneration>('active')) ?? null;
+	}
+
 	async ensure(commit = this.env.SNAPSHOT_COMMIT): Promise<{
 		generation: SnapshotGeneration | null; rebuilding: boolean;
 	}> {
