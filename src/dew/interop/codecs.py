@@ -49,7 +49,7 @@ import numpy as np
 from numpy.typing import ArrayLike, DTypeLike
 
 from dew import records
-from dew.nn.text_encoders import checkpoint_array
+from dew.interop.weights import checkpoint_array
 
 # --------------------------------------------------------------------------
 # E2M1 codes under E8M0 exponents, shared by every FP4 format
