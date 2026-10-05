@@ -14,7 +14,7 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
-from reference_error import assert_as_exact_as_the_reference, assert_computes_the_oracle
+from reference_error import assert_as_exact_as_the_reference, assert_computes_the_oracle, chain_roundings
 from test_lpips import drawn_weights
 from test_mean_flow import CLASSES, labelled
 
@@ -327,68 +327,117 @@ def repae_step(tmp_path_factory) -> SimpleNamespace:
     discriminator, given to `init` under `discriminator`).
 
     The autoencoder's gradient is the VAE update's and the discriminator's
-    the discriminator update's, and the model's and the projector's are
-    half the SiT update's, as Dew's L2 halves the denoising error and REPA's
-    term with it; each network's is held to the reference by the float64
-    rule, the running statistics too, and the loss and its terms within
-    1e-6 of the reference's float64 run. The tuned
+    the discriminator update's, held in float64 (`repae_step_f64`), and the
+    model's and the projector's are half the SiT update's, as Dew's L2 halves
+    the denoising error and REPA's term with it, held to the reference by the
+    float64 rule, the running statistics too, and the loss and its terms
+    within 1e-6 of the reference's float64 run. The tuned
     autoencoder a run then decodes with takes the latent scale and bias of
     REPA-E's `extract_latents_stats`, by the float64 rule too."""
-    tmp_path = tmp_path_factory.mktemp("repae")
+    return _repae_step(tmp_path_factory.mktemp("repae"), jnp.float32)
+
+
+@pytest.fixture(scope="module")
+def repae_step_f64(tmp_path_factory) -> SimpleNamespace:
+    """The same step in float64 end to end, under `jax.enable_x64`: every
+    weight, the batch and the running statistics the reference's float64
+    run read, and the step's own draws, which are float32 at any precision
+    as the reference replays them."""
+    with jax.enable_x64(new_val=True):
+        return _repae_step(tmp_path_factory.mktemp("repae_f64"), jnp.float64)
+
+
+def _repae_step(tmp_path: Path, dtype) -> SimpleNamespace:
+    """`repae_step` at `dtype`, with the traced gradient's `chain_roundings`."""
+
+    def cast(tree):
+        def leaf_at(leaf):
+            return jnp.asarray(leaf, dtype) if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.floating) else leaf
+
+        return jax.tree.map(leaf_at, tree)
+
+    tail = "_f64" if dtype == jnp.float64 else ""
     with tarfile.open(FIXTURES / "tiny_diffusers.tar.xz") as archive:
         archive.extractall(tmp_path, filter="data")
-    alignment = Alignment(Representation(), {"params": {"Conv_0": module("representation")}}, "block_0",
+    alignment = Alignment(Representation(), cast({"params": {"Conv_0": module("representation")}}), "block_0",
                           width=PROJECTOR)
     inputs = InputSpec(Field("image", (SIDE, SIDE, 3)), {"textcontext": Condition(labelled())})
     task = DiffusionObjective(
         StandIn(), presets.Flow(density="uniform")(), inputs, guidance=None, solver=Euler(), steps=2,
-        autoencoder=StableDiffusionVAE(modelname=str(tmp_path / "sd" / "vae"), dtype=jnp.float32),
+        autoencoder=StableDiffusionVAE(modelname=str(tmp_path / "sd" / "vae"), dtype=dtype),
         alignment=alignment, end_to_end=EndToEnd(discriminator_width=DISCRIMINATOR_WIDTH), ema_decay=None,
         unconditional_prob=DROPOUT)
     assert task.autoencoder is not None
-    discriminator = PatchDiscriminator(DISCRIMINATOR_WIDTH).variables_from_torch(
+    discriminator = cast(PatchDiscriminator(DISCRIMINATOR_WIDTH).variables_from_torch(
         {key.removeprefix("weights/discriminator."): STEPPED[key] for key in STEPPED.files
-         if key.startswith("weights/discriminator.")})
-    variables = task.init(jax.random.PRNGKey(0), {
+         if key.startswith("weights/discriminator.")}))
+    variables = task.init(jax.random.PRNGKey(0), cast({
         "encoders": task.encoder_params(), "autoencoder": task.autoencoder.params,
         REPRESENTATION: alignment.variables, PERCEPTUAL: variables_from_torch(*drawn_weights()),
-        DISCRIMINATOR: discriminator})
-    params = {**nested((path, module(name)) for name, path in LAYOUT),
-              AUTOENCODER: variables["params"][AUTOENCODER], DISCRIMINATOR: discriminator["params"]}
+        DISCRIMINATOR: discriminator}))
+    params = cast({**nested((path, module(name)) for name, path in LAYOUT),
+                   AUTOENCODER: variables["params"][AUTOENCODER], DISCRIMINATOR: discriminator["params"]})
     assert jax.tree.structure(params) == jax.tree.structure(variables["params"])
-    variables = {**variables, LATENT_STATS: {"mean": STEPPED["bn/running_mean_before"],
-                                             "var": STEPPED["bn/running_var_before"]}}
-    batch = {"image": STEPPED["pixels"], **inputs.tokenize([str(label) for label in STEPPED["classes"]])}
+    variables = {**variables, LATENT_STATS: cast({"mean": STEPPED[f"bn/running_mean_before{tail}"],
+                                                  "var": STEPPED[f"bn/running_var_before{tail}"]})}
+    batch = {"image": jnp.asarray(STEPPED["pixels"], dtype),
+             **inputs.tokenize([str(label) for label in STEPPED["classes"]])}
     step = Step(step=jnp.asarray(0), key=jax.random.key(int(STEPPED["key"])), ema=None)
-    (value, aux), gradients = jax.value_and_grad(
-        lambda tree: task.scalar_loss({**variables, "params": tree}, batch, step), has_aux=True)(params)
 
+    def loss(tree):
+        return task.scalar_loss({**variables, "params": tree}, batch, step)
+
+    (value, aux), gradients = jax.value_and_grad(loss, has_aux=True)(params)
+    roundings = chain_roundings(jax.make_jaxpr(jax.grad(lambda tree: loss(tree)[0]))(params))
     return SimpleNamespace(task=task, variables=variables, params=params, batch=batch, step=step, value=value,
-                           aux=aux, gradients=gradients)
+                           aux=aux, gradients=gradients, roundings=roundings)
 
 
 def _flat(tree) -> np.ndarray:
     return np.concatenate([np.ravel(leaf) for leaf in jax.tree.leaves(tree)])
 
 
-def test_a_repae_step_moves_each_network_as_train_repae_does(repae_step):
-    """The autoencoder's gradient is the VAE update's and the
-    discriminator's the discriminator update's, and the model's and the
-    projector's are half the SiT update's, as Dew's L2 halves the denoising
-    error and REPA's term with it; each is held to the reference by the
-    float64 rule."""
-    gradients = repae_step.gradients
-    assert jax.tree.structure(gradients[AUTOENCODER]) == jax.tree.structure(autoencoder_gradients(""))
-    assert_as_exact_as_the_reference(_flat(gradients[AUTOENCODER]), _flat(autoencoder_gradients("")),
-                                     _flat(autoencoder_gradients("_f64")), "the autoencoder's gradient")
-    discriminator_gradients = [PatchDiscriminator(DISCRIMINATOR_WIDTH).variables_from_torch(
+def _discriminator_gradient(tail: str) -> dict:
+    """The reference's discriminator gradient, float32 or (`_f64`) float64, in Dew's tree."""
+    return PatchDiscriminator(DISCRIMINATOR_WIDTH).variables_from_torch(
         {key.removeprefix("grad/discriminator.").removesuffix(tail): STEPPED[key]
          for key in STEPPED.files if key.startswith("grad/discriminator.") and key.endswith(tail)
-         and (tail or not key.endswith("_f64"))}
-    )["params"] for tail in ("", "_f64")]
-    assert jax.tree.structure(gradients[DISCRIMINATOR]) == jax.tree.structure(discriminator_gradients[0])
-    assert_as_exact_as_the_reference(_flat(gradients[DISCRIMINATOR]), *map(_flat, discriminator_gradients),
-                                     "the discriminator's gradient")
+         and (tail or not key.endswith("_f64"))})["params"]
+
+
+def test_the_autoencoder_and_discriminator_gradients_are_train_repae_s_in_float64(repae_step_f64):
+    """The autoencoder's gradient is the VAE update's and the
+    discriminator's the discriminator update's, Dew's float64 run within the
+    float64 rounding of the step's own computation of the reference's
+    float64 run (`assert_computes_the_oracle` over the traced gradient's
+    `chain_roundings`).
+
+    Both pass through kinks, VGG's ReLUs and pools and the PatchGAN's leaky
+    ReLUs, where float32 can take the other branch. Under Intel SDE's Ice
+    Lake server (70.9, against 70.9 on CI's northcentralus runner) the
+    reconstruction's float32 rounding puts VGG's first ReLU at image 4,
+    pixel (2, 6), channel 46 on the other side of a float64 input of 8.5e-7,
+    and that one branch puts the autoencoder's float32 gradient at 71 times
+    the reference's error, 0.68 with that one ReLU taken as float64 takes
+    it. A flip moves a gradient by a discrete step the float32 rule does not
+    model, so these two are held in float64, where both runs take one
+    branch; the parts no kink reaches stay under the float32 rule."""
+    gradients = repae_step_f64.gradients
+    with jax.enable_x64(new_val=True):  # the reference's float64 gradients, kept float64
+        truths = {AUTOENCODER: autoencoder_gradients("_f64"), DISCRIMINATOR: _discriminator_gradient("_f64")}
+    for label, network in (("the autoencoder's gradient", AUTOENCODER),
+                           ("the discriminator's gradient", DISCRIMINATOR)):
+        assert jax.tree.structure(gradients[network]) == jax.tree.structure(truths[network])
+        assert_computes_the_oracle(_flat(gradients[network]), _flat(truths[network]), label,
+                                   roundings=repae_step_f64.roundings)
+
+
+def test_a_repae_step_moves_the_model_as_train_repae_does(repae_step):
+    """The model's and the projector's gradients are half the SiT update's,
+    as Dew's L2 halves the denoising error and REPA's term with it, each held
+    to the reference by the float64 rule: their path, the stand-in SiT's
+    tanh blocks, the latent's batch norm and REPA's cosine, has no kink."""
+    gradients = repae_step.gradients
     for label, entries in (("the model's gradient", LAYOUT[:-3]), ("the projector's gradient", LAYOUT[-3:])):
         dew, reference, truth = [], [], []
         for name, path in entries:

@@ -209,11 +209,13 @@ class EndToEnd:
         the discriminator frozen and the discriminator's hinge loss reads the
         images and the reconstruction frozen, so each loss trains only its
         own network, on what the step began with."""
-        mean, log_variance = jnp.split(moments.astype(jnp.float32), 2, axis=-1)
+        # At least float32, and a float64 run stays float64.
+        dtype = jnp.promote_types(jnp.result_type(moments, reconstruction), jnp.float32)
+        mean, log_variance = jnp.split(moments.astype(dtype), 2, axis=-1)
         log_variance = jnp.clip(log_variance, -30.0, 20.0)
         axes = tuple(range(1, mean.ndim))
         kl = jnp.mean(0.5 * jnp.sum(jnp.square(mean) + jnp.exp(log_variance) - 1.0 - log_variance, axis=axes))
-        reconstruction = reconstruction.astype(jnp.float32)
+        reconstruction = reconstruction.astype(dtype)
         reconstruction_error = jnp.mean(jnp.abs(images - reconstruction))
         total = self.reconstruction_weight * reconstruction_error + self.kl_weight * kl
         terms = {"reconstruction": reconstruction_error, "kl": kl}
@@ -222,10 +224,10 @@ class EndToEnd:
 
             terms["perceptual"] = jnp.mean(_applied(LPIPSNetwork(), perceptual, images, reconstruction))
             total = total + self.perceptual_weight * terms["perceptual"]
-        hinge = jnp.zeros((), jnp.float32)
+        hinge = jnp.zeros((), dtype)
         network = self.discriminator
         if network is not None and discriminator is not None:
-            started = (step >= self.discriminator_start).astype(jnp.float32)
+            started = (step >= self.discriminator_start).astype(dtype)
             frozen = jax.lax.stop_gradient(discriminator)
             terms["generator"] = -jnp.mean(_applied(network, frozen, reconstruction))
             total = total + self.discriminator_weight * started * terms["generator"]
