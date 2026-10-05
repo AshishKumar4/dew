@@ -294,6 +294,80 @@ def test_a_pretrained_run_starts_from_the_checkpoints_weights(tmp_path):
         np.testing.assert_array_equal(np.asarray(held), np.asarray(leaf))
 
 
+def test_a_pretrained_run_trains_a_lora_that_saves_from_the_run_alone(tmp_path):
+    """`--pretrained <decoder> lora:lora --lora.rank 4 --lora.modules q_proj`: the recipe
+    binds the adapter to the loaded weights, two steps move every factor and
+    leave the base bitwise, and `Pretrained.from_run` rebuilds the adapter
+    from the run's own record, so its `adapter.save` writes the files the
+    in-process adapter writes, byte for byte."""
+    from dew.interop import Pretrained
+    from dew.lora import LoRA
+    from dew.objectives.base import FROZEN
+
+    recipe = load_recipe()
+    tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
+    checkpoint = export_tiny_decoder(tmp_path / "checkpoint")
+    lora = ("lora:lora", "--lora.rank", "4", "--lora.modules", "q_proj")
+    config = pretrained_config(recipe, tokens, checkpoint, "--trainer.steps", "2", "--sample-tokens", "0",
+                               "--trainer.name", "lora", *lora)
+    assert config.lora == LoRA(rank=4, modules=("q_proj",))
+
+    state = recipe.main(config)
+
+    source = Pretrained.load(str(checkpoint), dtype="float32", attention_impl="reference")
+    moved = jax.tree_util.tree_leaves_with_path(state.variables["params"])
+    assert moved and all(path[-1].key in ("lora_A", "lora_B") for path, _ in moved)
+    assert all(bool(jnp.any(leaf)) for path, leaf in moved if path[-1].key == "lora_B")
+    for before, after in zip(jax.tree.leaves(source.variables["params"]),
+                             jax.tree.leaves(state.variables[FROZEN]), strict=True):
+        np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
+    tuned = source.adapt(config.lora, key=config.trainer.key)
+    assert tuned.adapter is not None
+    tuned.adapter.save(state.variables, tmp_path / "in-process")
+    run = Pretrained.from_run(str(tmp_path / "runs" / "lora"))
+    assert run.adapter is not None
+    run.adapter.save(run.variables, tmp_path / "from-run")
+    for name in ("adapter_config.json", "adapter_model.safetensors"):
+        assert (tmp_path / "from-run" / name).read_bytes() == (tmp_path / "in-process" / name).read_bytes()
+
+
+def test_a_scratch_run_trains_a_lora_that_saves_from_the_run_alone(tmp_path):
+    """From scratch, `lora:lora --lora.rank 2 --lora.modules q_proj v_proj`
+    binds the adapter to a fresh draw of the model from the run's key and
+    the factors from the key folded with 1: two steps move every B and
+    leave that draw bitwise under `frozen`, and `Adapter.from_run` writes
+    the files an adapter bound the same way in process writes, byte for
+    byte. (A model with no exported family, as this one, has no
+    `Pretrained` bundle; the adapter needs none.)"""
+    from dew.lora import Adapter
+    from dew.objectives.base import FROZEN
+
+    recipe = load_recipe()
+    tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
+    config = run_config(recipe, tokens, "--trainer.steps", "2", "--sample-tokens", "0", "--trainer.name",
+                        "scratch", "lora:lora", "--lora.rank", "2", "--lora.modules", "q_proj", "v_proj")
+
+    state = recipe.main(config)
+
+    recorded = recipe.LmRunConfig.load(str(tmp_path / "runs" / "scratch"))
+    assert recorded.lora == config.lora
+    model = recorded.model.build()
+    key = jax.random.key(recorded.trainer.key)
+    base = model.init(key, jnp.zeros((1, SEQ), jnp.int32))
+    for before, after in zip(jax.tree.leaves(base["params"]), jax.tree.leaves(state.variables[FROZEN]),
+                             strict=True):
+        np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
+    moved = jax.tree_util.tree_leaves_with_path(state.variables["params"])
+    assert moved and all(path[-1].key in ("lora_A", "lora_B") for path, _ in moved)
+    assert all(bool(jnp.any(leaf)) for path, leaf in moved if path[-1].key == "lora_B")
+    adapter = recorded.lora.apply(model, base, key=jax.random.fold_in(key, 1))
+    adapter.save(state.variables, tmp_path / "in-process")
+    rebuilt = Adapter.from_run(tmp_path / "runs" / "scratch")
+    rebuilt.save(rebuilt.variables, tmp_path / "from-run")
+    for name in ("adapter_config.json", "adapter_model.safetensors"):
+        assert (tmp_path / "from-run" / name).read_bytes() == (tmp_path / "in-process" / name).read_bytes()
+
+
 def test_a_hub_reference_at_a_revision_is_recorded_at_its_commit(tmp_path, monkeypatch):
     """`--pretrained repo@revision` loads that revision, and run.json names
     the commit it resolved to, so the record pins the weights the run
@@ -646,7 +720,7 @@ def test_a_trained_block_diffusion_tree_saves_back_over_its_source(tmp_path):
     checkpoint = REPO_ROOT / "tests/fixtures/hf/diffusion-gemma-workflow"
     source = Pretrained.load(checkpoint, dtype="float32", attention_impl="xla", max_seq_len=32)
     objective = BlockDiffusionObjective(source.model, prompt_length=4, num_canvases=2,
-                                        pretrained=source.variables)
+                                        variables=source.variables)
     rows = 2 * jax.device_count()
     batch = {"text": np.random.default_rng(0).integers(3, 60, (rows, 12)).astype(np.int32)}
     data = Dataset(train=lambda partition: iter([batch, batch]), val=None, records=rows, batch=rows)
@@ -656,7 +730,7 @@ def test_a_trained_block_diffusion_tree_saves_back_over_its_source(tmp_path):
 
     read = Pretrained.load(tmp_path / "trained", dtype="float32", attention_impl="xla", max_seq_len=32)
     restored = BlockDiffusionObjective(read.model, prompt_length=4, num_canvases=2,
-                                       pretrained=read.variables)
+                                       variables=read.variables)
     rebuilt = restored.init(jax.random.key(0))
     for wanted, actual in zip(jax.tree.leaves(state.variables), jax.tree.leaves(rebuilt), strict=True):
         np.testing.assert_array_equal(actual, wanted)

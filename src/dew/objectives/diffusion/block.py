@@ -29,18 +29,7 @@ from dew.inputs import Field, InputSpec
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.inputs import ModelInputs
 from dew.nn.sharding import LOGITS, constrain
-from dew.objectives.base import (
-    Aux,
-    Batch,
-    EMASpec,
-    Objective,
-    PathFilter,
-    Ratio,
-    Step,
-    Variables,
-    freeze,
-    thaw,
-)
+from dew.objectives.base import FROZEN, Aux, Batch, EMASpec, Objective, Ratio, Source, Step, Variables, thaw
 from dew.objectives.lm.chunked import chunked_cross_entropy, head_logits
 from dew.registry import objectives
 
@@ -138,11 +127,11 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
     `processor` is what `pipeline` turns text into ids with and decodes
     through, unless it is handed another; a run records its tokenizer.
 
-    `trainable` selects the parameter leaves the optimizer moves, by their
-    full path (`dew.objectives.base.PathFilter`), the way `LMObjective`
-    takes it; the rest of the tree is kept under `frozen`, which `init`
-    returns and a checkpoint stores. An adapter's own filter
-    (`dew.lora.LoRA.trainable`) goes here. None trains every leaf.
+    `variables` is the tree training starts from, the SFT source's or an
+    adapter's split of it; a split (`dew.objectives.base.freeze`) is kept,
+    so the optimizer moves what it leaves in `params`. `model` may be the
+    loaded source itself, which supplies its model, variables and
+    processor. None draws a fresh init.
 
     Both cross-entropies score the final states through the bounded head
     (`dew.objectives.lm.chunked.chunked_cross_entropy`), `head_chunks`
@@ -154,14 +143,21 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
 
     saved_task = BlockGeneration
 
-    def __init__(self, model: DiffusionGemma, *, prompt_length: int,
+    def __init__(self, model: DiffusionGemma | Source, *, prompt_length: int,
                  num_canvases: int = 1, canvas_size: int | None = None,
-                 pretrained: Variables | None = None, pad_token_id: int = 0,
+                 variables: Variables | None = None, pad_token_id: int = 0,
                  self_cond_prob: float = 0.5, safety_epsilon: float = 1e-4,
                  stop_gradient_from_denoiser_to_encoder: bool = False,
                  encoder_loss_weight: float = 1.0, decoder_loss_weight: float = 1.0,
-                 ema_decay: float | None = None, trainable: PathFilter | None = None,
-                 head_chunks: int = 4, processor: Processor | None = None):
+                 ema_decay: float | None = None, head_chunks: int = 4,
+                 processor: Processor | None = None):
+        if isinstance(model, Source):
+            variables = model.variables if variables is None else variables
+            processor = model.text_processor if processor is None else processor
+            if not isinstance(model.model, DiffusionGemma):
+                raise TypeError(f"block diffusion trains a DiffusionGemma, and this source's model "
+                                f"is a {type(model.model).__name__}")
+            model = model.model
         canvas_size = model.canvas_length if canvas_size is None else canvas_size
         for name, value in (("prompt_length", prompt_length), ("num_canvases", num_canvases),
                             ("canvas_size", canvas_size), ("head_chunks", head_chunks)):
@@ -189,7 +185,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         # The reference allocates one full-sequence cache for training, not the
         # model's potentially much larger serving capacity. Weights are unchanged.
         self.training_model = self.model.clone(text=self.model.text.clone(max_seq_len=self.sequence_length))
-        self.pretrained = pretrained
+        self.variables = variables
         self.pad_token_id = pad_token_id
         self.self_cond_prob = self_cond_prob
         self.safety_epsilon = safety_epsilon
@@ -197,8 +193,9 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         self.encoder_loss_weight = encoder_loss_weight
         self.decoder_loss_weight = decoder_loss_weight
         self.inputs = InputSpec(sample=Field("text", (self.sequence_length,)))
-        self.ema = None if ema_decay is None else EMASpec(optax.constant_schedule(ema_decay))
-        self.trainable = trainable
+        # The EMA follows what moves; the frozen collection never does.
+        self.ema = None if ema_decay is None else EMASpec(
+            optax.constant_schedule(ema_decay), select=lambda path: path[0] != FROZEN)
         self.head_chunks = head_chunks
         self.processor = processor
 
@@ -226,7 +223,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         from dew.inference.tasks import BlockGeneration
 
         process = BlockProcess(canvas_length=self.model.canvas_length, vocab_size=self.model.vocab_size)
-        return BlockGeneration(self.model, thaw(self._pipeline_weights(state, ema)), process,
+        return BlockGeneration(self.model, self._pipeline_weights(state, ema), process,
                                self.processor if processor is None else processor,
                                pad_token_id=self.pad_token_id)
 
@@ -237,30 +234,28 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
 
     def held_variables(self) -> Variables | None:
         """Return the SFT source this objective starts from."""
-        return self.pretrained
+        return self.variables
 
     def init(self, key: jax.Array, variables: Variables | None = None) -> Variables:
-        tree = self._whole_tree(key, variables)
-        return tree if self.trainable is None else freeze(tree, self.trainable)
+        """The starting tree, its split kept, with the source's layer scalars
+        moved where the model reads them; or a fresh init.
 
-    def _whole_tree(self, key: jax.Array, variables: Variables | None) -> Variables:
-        """Return the model's variables in one `params` collection.
-
-        Either the source with its frozen split undone and the layer
-        scalars moved, or a fresh init.
+        A split tree's scalars go under `frozen` beside the rest of the base,
+        so an adapter's run moves its factors alone, as the source's frozen
+        scalars did not move either.
         """
-        pretrained = self.pretrained if variables is None else variables
+        pretrained = self.variables if variables is None else variables
         if pretrained is not None:
             if "params" not in pretrained:
-                raise ValueError("pretrained must contain the params collection")
-            pretrained = thaw(pretrained)
+                raise ValueError("variables must contain the params collection")
             if self._initial_scalar_mode == "trainable":
                 return pretrained
+            held = FROZEN if FROZEN in pretrained else "params"
             # Google makes skip_scale a parameter; Transformers declares the
             # same tensor a buffer. Move references once, under an explicit
             # model policy, without copying any parameter arrays.
             values = dict(pretrained)
-            params = dict(values["params"])
+            params = dict(values[held])
             text = dict(params["text"])
             constants = dict(values["constants"])
             text_constants = dict(constants["text"])
@@ -277,7 +272,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
                 else:
                     del text_constants[layer]
             params["text"] = text
-            values["params"] = params
+            values[held] = params
             if text_constants:
                 constants["text"] = text_constants
             else:

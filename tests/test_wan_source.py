@@ -38,6 +38,7 @@ from reference_error import assert_as_exact_as_the_reference
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.diffusion import component_tensors, translate_wan_weights, wan_fields
 from dew.nn.backbones.wan import WanTransformer
+from dew.objectives.diffusion import DiffusionObjective
 
 ROOT = Path(__file__).resolve().parents[1]
 PUBLISHED = ROOT / "tests/fixtures/hf/wan-source"
@@ -324,7 +325,7 @@ def test_a_trained_wan_step_exports_and_reloads(pipeline, walk, tmp_path):
     from dew.objectives import Step
     from dew.training import Trainer
 
-    objective = pipeline.diffusion_objective(unconditional_prob=0.0, ema_decay=None, steps=2)
+    objective = DiffusionObjective(pipeline, unconditional_prob=0.0, ema_decay=None, steps=2)
     batch = clip_batch(objective, walk[1]["prompts"])
     trainer = Trainer(objective, optax.sgd(1e-2), key=jax.random.PRNGKey(3))
     initial = trainer.initial_state()
@@ -376,18 +377,19 @@ def test_a_trained_wan_step_exports_and_reloads(pipeline, walk, tmp_path):
 
 
 def test_a_wan_lora_starts_as_the_source_and_trains_its_factors_alone(pipeline, walk):
-    """`lora` binds the transformer's self- and cross-attention projections,
+    """An adapter binds the transformer's self- and cross-attention projections,
     never UMT5's; with B at zero it samples exactly what the source does, and
     a step moves every B while the base, the text encoder and the VAE stay
     bitwise where they were."""
     import optax
 
+    from dew.lora import LoRA
     from dew.objectives.base import FROZEN
     from dew.training import Trainer
 
     prompts = walk[1]["prompts"]
-    tuned = pipeline.lora(rank=2, modules=("attn1.to_q", "attn1.to_v", "attn2.to_k", "attn2.to_out.0"),
-                          key=jax.random.key(0))
+    tuned = pipeline.adapt(LoRA(rank=2, modules=("attn1.to_q", "attn1.to_v", "attn2.to_k", "attn2.to_out.0")),
+                           key=0)
     assert {path[1] for path in tuned.adapter.targets} == {f"blocks_{index}" for index in range(2)}
     assert all(path[0] == "params" for path in tuned.adapter.targets)
 
@@ -395,7 +397,7 @@ def test_a_wan_lora_starts_as_the_source_and_trains_its_factors_alone(pipeline, 
         return np.asarray(task(prompts, steps=2, key=1).host().images)
 
     np.testing.assert_array_equal(sampled(tuned.text_to_image()), sampled(pipeline.text_to_image()))
-    objective = tuned.diffusion_objective(ema_decay=None, unconditional_prob=0.0)
+    objective = DiffusionObjective(tuned, ema_decay=None, unconditional_prob=0.0)
     batch = clip_batch(objective, prompts)
     trainer = Trainer(objective, optax.sgd(1e-1), key=jax.random.key(3))
     initial = trainer.initial_state()

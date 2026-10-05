@@ -338,7 +338,7 @@ def test_x64_router_bias_storage_survives_updates_and_restart(tmp_path, bias_dty
                                   mixture={"experts": 2, "top_k": 1, "bias": True})
         initial = model.init(jax.random.PRNGKey(1), jnp.ones((1, 4), jnp.int32))
         initial["moe"] = jax.tree.map(lambda x: x.astype(bias_dtype), initial["moe"])
-        objective = LMObjective(model, 4, pretrained=initial, head_chunks=1,
+        objective = LMObjective(model, 4, variables=initial, head_chunks=1,
                                 balance_rate=.02, aux_loss_alpha=.1, seq_aux=False)
         checkpoints = Checkpoints(str(tmp_path / "router"))
         def build():

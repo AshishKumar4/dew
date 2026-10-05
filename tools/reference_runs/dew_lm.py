@@ -152,7 +152,7 @@ def build(args: argparse.Namespace) -> Run:
             raise SystemExit(f"--dispatch sets a mixture's dispatch, and {args.model} builds no mixture")
         model = model.clone(mixture=dataclasses.replace(model.mixture, dispatch=args.dispatch))
     objective = LMObjective(model, seq, ema_decay=None, head_chunks=args.head_chunks,
-                            pretrained=pretrained.variables, aux_loss_alpha=args.aux_loss_alpha,
+                            variables=pretrained.variables, aux_loss_alpha=args.aux_loss_alpha,
                             seq_aux=args.seq_aux)
     schedule = Cosine(peak=args.lr_peak, warmup_steps=args.warmup, end=args.lr_end, init=args.lr_init)
     solver = OptimConfig(

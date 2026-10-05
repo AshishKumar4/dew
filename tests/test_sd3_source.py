@@ -425,7 +425,7 @@ def test_a_trained_step_keeps_the_frozen_buffer_and_exports_for_the_source(sourc
     loaded = Pretrained.load(str(source / "pipeline"), dtype="float32", attention_impl="xla")
     height, width = loaded.inputs.sample.shape[:2]
     objective = DiffusionObjective(loaded.model, loaded.process, loaded.inputs,
-                                   autoencoder=loaded.autoencoder, pretrained=loaded.variables,
+                                   autoencoder=loaded.autoencoder, variables=loaded.variables,
                                    unconditional_prob=0.0, ema_decay=None, steps=2)
     # One row per simulated device, which is what the data mesh divides.
     rows = jax.device_count()

@@ -11,7 +11,7 @@ fetching one layer at a time. The 26B-A4B base has not been run through it:
 `--chat` is a Hub dataset id, a `.jsonl` file or a parquet file of
 conversations, which is what `dew.data.ChatMessages` reads and renders with
 the checkpoint's own chat template. The run writes the PEFT adapter directory
-`LoRA.save` produces, which transformers loads, then loads the base again
+`Adapter.save` produces, which transformers loads, then loads the base again
 through `dew.pipeline`, merges the adapter into it and writes the decoded
 canvases to `samples.txt`. Image-conditioned training on real Oxford Flowers
 is `examples/sft_diffusion_gemma_images.py`; it uses a fresh small model,
@@ -33,7 +33,6 @@ import dew
 from dew.data import ChatMessages, Loading
 from dew.interop import PretrainedBlockDecoder
 from dew.lora import LoRA
-from dew.objectives.base import thaw
 from dew.objectives.diffusion.block import BlockDiffusionObjective
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 
@@ -92,20 +91,17 @@ def main(config: Config) -> Path:
             raise ValueError("--chat names the conversations to fine-tune on: a hub "
                              "dataset id, a .jsonl file or a parquet file")
 
-    source = PretrainedBlockDecoder.load(config.model, dtype=jnp.bfloat16, param_dtype=jnp.float32)
+    source = PretrainedBlockDecoder.load(config.model, dtype=jnp.bfloat16, param_dtype=jnp.float32).adapt(
+        LoRA(rank=config.rank, modules=tuple(config.modules), alpha=config.alpha), key=0)
     sequence_length = config.prompt_tokens + config.canvases * source.model.canvas_length
-    adapter, variables = LoRA.fresh(source.model, source.variables, source.layouts,
-                                    rank=config.rank, alpha=config.alpha,
-                                    modules=list(config.modules), key=jax.random.key(0))
     # A host layout streams the stack one layer per scan iteration, so the
     # decoder runs as a scan; a plain loop's fetches would all be hoisted and
     # the whole base would land on the device this is keeping it off.
     scanned = source.model.clone(text=source.model.text.clone(scan_layers=True))
     objective = BlockDiffusionObjective(
-        adapter.adapt(scanned), prompt_length=config.prompt_tokens,
-        num_canvases=config.canvases, pretrained=variables,
-        pad_token_id=int(source.config["text_config"]["pad_token_id"]),
-        trainable=adapter.trainable)
+        scanned, prompt_length=config.prompt_tokens,
+        num_canvases=config.canvases, variables=source.variables,
+        pad_token_id=int(source.config["text_config"]["pad_token_id"]))
 
     # A packed window is seq_len + 1 ids wide, and the objective reads rows of
     # exactly prompt + canvases: the spec is asked for one less.
@@ -123,14 +119,15 @@ def main(config: Config) -> Path:
     checkpoints.wait()
 
     adapter_dir = config.out / "adapter"
-    adapter.save(thaw(state.variables), adapter_dir)
+    assert source.adapter is not None
+    source.adapter.save(state.variables, adapter_dir)
 
     # The other half of the workflow, from the files alone: the base weights
     # back through `dew.pipeline`, the adapter directory read onto them, and
     # the factors folded into the kernels so the task runs the base model.
     base = dew.pipeline(config.model, dtype=jnp.float32)
-    trained, weights = LoRA.load(base.model, base.variables, source.layouts, adapter_dir)
-    task = base.bind(trained.merge(weights))
+    trained = LoRA.load(base.model, base.variables, adapter_dir, layouts=source.layouts)
+    task = base.bind(trained.merge(trained.variables))
     generated = task(PROMPTS, config.response_tokens, key=3)
     (config.out / "samples.txt").write_text("\n".join(task.decode(generated)) + "\n")
     print(f"adapter {adapter_dir}  samples {config.out / 'samples.txt'}")

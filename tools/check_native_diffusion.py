@@ -164,7 +164,7 @@ def diffusers_reads(source, export, prediction, noise, given):
 
 def train_and_reload(source, reference, key, given, noise):
     objective = DiffusionObjective(source.model, source.process, source.inputs, autoencoder=source.autoencoder,
-                                   pretrained=source.variables, unconditional_prob=0.0, ema_decay=None, steps=2)
+                                   variables=source.variables, unconditional_prob=0.0, ema_decay=None, steps=2)
     pixels = reference["pixels"][None] if "pixels" in reference else np.rint(reference["images"] * 255).astype(np.uint8)
     batch = {"image": pixels, **source.inputs.tokenize(["cat"])}
     if source.inputs.mask is not None:
@@ -367,7 +367,7 @@ def regress(directory, case):
     elif case == "mask-dropout":
         reference = np.load(Path(directory) / "reference.npz")
         objective = DiffusionObjective(source.model, source.process, source.inputs, autoencoder=source.autoencoder,
-                                       pretrained=source.variables, unconditional_prob=1.0, ema_decay=None, steps=2)
+                                       variables=source.variables, unconditional_prob=1.0, ema_decay=None, steps=2)
         batch = {"image": reference["pixels"][None], **source.inputs.tokenize(["cat"]),
                  "mask": (reference["mask"][None, ..., None] >= 128).astype(np.float32)}
         other = {**batch, "mask": 1 - batch["mask"]}

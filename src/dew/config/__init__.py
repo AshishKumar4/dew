@@ -46,7 +46,7 @@ from dew.checkpoints import RUN_FILE, Checkpoints, Keep
 from dew.config.sweep import Search, Space, _read, _write, override, random_search
 from dew.data import Dataset, DatasetSpec, Ramp
 from dew.data.dataset import json_list_argument, ramped
-from dew.lora import LoRA, _Adapted, _attach
+from dew.lora import LoRA, _Adapted, adapted
 from dew.nn.attention import AttentionImpl
 from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.records import JSON, duration, recorded_duration
@@ -154,7 +154,7 @@ class ModelConfig:
         model_type = type(model)
         adapter, quantization = None, None
         if isinstance(model_type, _Adapted):
-            adapter = model_type._dew_lora_spec.to_json()
+            adapter = model_type._dew_lora_record()
             model_type = model_type._dew_lora_base
         if isinstance(model_type, _Quantized):
             quantization = model_type._dew_quantization
@@ -195,7 +195,7 @@ class ModelConfig:
         model = models.build(self.architecture, self.fields())
         if self.quantization is not None:
             model = self.quantization.apply(model)
-        return model if self.adapter is None else LoRA.from_json(self.adapter).adapt(model)
+        return model if self.adapter is None else adapted(model, self.adapter)
 
 
 def _architecture(model_type: type) -> str:
@@ -742,10 +742,13 @@ class RunConfig:
     optim: OptimConfig = dataclasses.field(default_factory=OptimConfig)
     trainer: TrainerConfig = dataclasses.field(default_factory=TrainerConfig)
     objective: str | None = None
-    lora: LoRA | None = None
-    """The low-rank adapter the run trains instead of the whole model. The
-    targets are the module paths under `params` a delta sits on; `train`
-    adapts the objective's module and freezes every other leaf."""
+    lora: Annotated[LoRA, tyro.conf.subcommand("lora")] | None = None
+    """The low-rank adapter the run trains instead of the whole model
+    (`lora:lora --lora.rank 16 --lora.modules q_proj v_proj`). A recipe binds it to the
+    source `--pretrained` loads (`Pretrained.adapt`), or from scratch to a
+    fresh draw of the model from the run's key, and the objective then
+    trains the factors alone; the run records the bound adapter on its
+    model."""
 
     def to_dict(self) -> dict[str, JSON]:
         """Return a JSON-safe record of the run.
@@ -812,8 +815,8 @@ class RunConfig:
 
         A `trainer.quantization` wraps the module `objective` trains before
         anything initialises it, so the quantized forward is what the run
-        learns through, and a `lora` adapts the same module the same way,
-        so the run traces the adapted forward and moves only its factors.
+        learns through. A `lora` is not applied here: the recipe binds it to
+        the model and variables it builds the objective from.
         `rollout` is the trainer's, which turns each prefetched batch into the
         one the step trains on, as an on-policy objective samples it.
         """
@@ -824,8 +827,6 @@ class RunConfig:
                 f"load(batch={self.trainer.batch_size})")
         if self.trainer.quantization is not None:
             _quantize(objective, self.trainer.quantization)
-        if self.lora is not None:
-            _attach(objective, self.lora)
         self = self._naming(objective)
         trainer = self.trainer
         # Before the run length, since a ramp reads fewer records a step early

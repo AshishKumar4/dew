@@ -69,11 +69,11 @@ def test_an_instance_of_a_dew_class_is_held_to_its_members_across_cells(gen_api,
             "objective.model_variables(params)\n",
             "objective.pipeline(state)\n",
             "objective.process.denoiser(model, params, {})\n",
-            "objective.trainable(params)\n",
+            "objective.variables(params)\n",
             "objective.sampler\n",
             "other.anything(params)\n"]},
     ]}))
     assert gen_api.unresolved_in("instance.ipynb", notebook, *documented) == [
         "`objective.sampler`: dew.objectives.diffusion.objective.DiffusionObjective has no sampler",
-        "`objective.trainable(...)`: trainable is a value "
+        "`objective.variables(...)`: variables is a value "
         "dew.objectives.diffusion.objective.DiffusionObjective holds, not a method"]
