@@ -226,13 +226,13 @@ class TextToImage:
         overrides parameter storage; None preserves checkpoint storage exactly.
         """
         from dew.checkpoints import Checkpoints
-        from dew.config import ModelConfig, _built
+        from dew.config import ModelConfig
         from dew.diffusion.process import Process
         from dew.inference.tasks import run_record
         from dew.nn.autoencoders import AutoEncoder
         from dew.objectives.diffusion.objective import FixedBlank, _without_loss_heads
         from dew.records import integer, record as fields, text
-        from dew.registry import objectives, solvers
+        from dew.registry import from_record, objectives, solvers
 
         record = run_record(directory, step)
         config = ModelConfig.from_dict(fields(record['model'], 'model'))
@@ -259,7 +259,7 @@ class TextToImage:
         autoencoder = None
         if autoencoder_record is not None and end_to_end is not None:
             from dew.objectives.diffusion.end_to_end import AUTOENCODER, EndToEnd
-            tuning = _built(EndToEnd, fields(end_to_end, 'end_to_end'))
+            tuning = from_record(EndToEnd, fields(end_to_end, 'end_to_end'), dtypes=False)
             frozen = AutoEncoder.from_json(autoencoder_record, params=params['params'][AUTOENCODER])
             autoencoder, params = tuning.tuned(frozen, params)
         elif autoencoder_record is not None:
@@ -267,7 +267,8 @@ class TextToImage:
         solver_record = fields(record['solver'], 'solver')
         solver = solvers.build(text(solver_record['name'], 'solver name'),
                                 fields(solver_record['fields'], 'solver fields'))
-        guidance = None if record['guidance'] is None else _built(CFG, fields(record['guidance'], 'guidance'))
+        guidance = (None if record['guidance'] is None
+                    else from_record(CFG, fields(record['guidance'], 'guidance'), dtypes=False))
         precision = record['condition_precision']
         precision = None if precision is None else text(precision, 'condition_precision')
         return cls(config.build(), Process.from_json(fields(record['process'], 'process')),

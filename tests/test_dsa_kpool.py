@@ -265,7 +265,7 @@ def test_a_padded_prefill_decodes_like_the_padded_parallel_block():
 
 
 def test_the_kind_builds_from_the_configs_fields_and_is_nope():
-    record = {"kind": "kpool_sparse_attention", **SETTINGS}
+    record = {"name": "kpool_sparse_attention", "fields": {**SETTINGS}}
     mixer = mixers.from_record(record)
     assert isinstance(mixer, KPoolSparseAttentionMixer)
     assert mixers["kpool_sparse_attention"] is KPoolSparseAttentionMixer
