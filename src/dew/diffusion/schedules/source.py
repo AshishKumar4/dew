@@ -1,17 +1,18 @@
 """Native grids and policies for published diffusion checkpoint scheduler files.
 
-One class of a published `scheduler_config.json` is interpreted once, here,
-into the native process, solver and time grid that reproduce its
-`set_timesteps` and `step`.
+This module reads the class of a published `scheduler_config.json` once and
+turns it into the native process, solver and time grid that reproduce the
+class's `set_timesteps` and `step`.
 
-Each pinned Diffusers 0.34.0 class declares its own constructor controls with
-its own defaults and builds its grid its own way. `_SOURCES` therefore names,
-per class, exactly the keys that class reads and the grid family it belongs
-to. A key another class declares is not read here, the way the source ignores
-it, and whatever a class does declare and this file does not reconstruct is
-refused rather than dropped.
+Each pinned Diffusers 0.34.0 class declares its own constructor controls
+with its own defaults and builds its grid in its own way. So `_SOURCES`
+lists, for each class, exactly the keys that class reads and the grid family
+it belongs to. A key that only another class declares is not read here,
+just as the source ignores it. A control the class declares but this file
+does not reconstruct raises `ValueError` when the file sets it to an active
+value, so it is never silently dropped.
 
-The five families are the shapes those `set_timesteps` take:
+The classes fall into six families by the shape of their `set_timesteps`:
 
 - `tabulated`: DDIM, PNDM, DDPM, LCM and TCD step between integer indices of
   the training beta table, so the schedule is that table and the grid is the
@@ -20,21 +21,26 @@ The five families are the shapes those `set_timesteps` take:
   point.
 - `lambda`: DPM-Solver multistep and singlestep, DEIS and UniPC integrate in
   log-SNR over paired sigma and model-time tables, normalized so that
-  alpha^2 + sigma^2 is 1, and truncate their model times to integers. Under
-  `use_flow_sigmas` DPM-Solver multistep and UniPC walk the shifted
-  rectified-flow path instead, alpha + sigma = 1, reading velocity.
+  alpha^2 + sigma^2 is 1, and truncate their model times to integers. With
+  `use_flow_sigmas`, DPM-Solver multistep and UniPC instead follow the
+  shifted rectified-flow path, where alpha + sigma = 1, and read the model's
+  output as velocity.
 - `sigma`: LMS, Euler, Euler ancestral and Heun integrate the
   variance-exploding sigma directly and scale the model input by
   1 / sqrt(sigma^2 + 1).
 - `stage`: KDPM2, KDPM2 ancestral and DPMSolverSDE evaluate the model twice
-  per interval. Their grids carry the interpolated stage rows the source
-  places between grid points. The solver's second evaluation reads the
-  source's sigma and model time there, while the outer walk still visits one
-  point per interval.
-- `edm`: EDMDPMSolverMultistep is EDM's own convention, sigma_min to sigma_max
-  at rho with c_noise = log(sigma) / 4 and a signed c_out. It has no beta
-  table and no VP training law, so its training process is EDM's log-normal
-  sigma draw over the same preconditioning.
+  per interval. Their grids include the interpolated stage rows that the
+  source places between grid points. The solver's second evaluation uses the
+  source's sigma and model time at those rows, while the outer loop still
+  visits one point per interval.
+- `edm`: EDMDPMSolverMultistep uses EDM's own convention, with sigmas from
+  sigma_min to sigma_max spaced by rho, c_noise = log(sigma) / 4 and a
+  signed c_out. It has no beta table and no VP training law, so its training
+  process is EDM's log-normal sigma draw with the same preconditioning.
+- `flow`: FlowMatchEulerDiscrete follows the shifted rectified-flow path and
+  reads the model's output as velocity. Its shift is static, or follows the
+  latent token count under `use_dynamic_shifting`, and `shift_terminal`
+  stretches its grid to end where the file says.
 """
 from __future__ import annotations
 
@@ -143,14 +149,15 @@ def _published_linspace(start: float, end: float, count: int) -> np.ndarray:
 def published_betas(*, count: JSON, start: JSON, end: JSON, schedule: JSON,
                     trained: JSON | np.ndarray, zero_snr: bool,
                     schedules: tuple[str, ...]) -> np.ndarray:
-    """The class's beta table, rescaled for zero terminal SNR when it asks.
+    """Return a scheduler class's beta table, rescaled for zero terminal SNR when `zero_snr` is set.
 
     Every control arrives already resolved against the class's own declared
-    default. A file that omits one gets that class's value, and a control the
-    class does not declare never reaches the table. `schedules` are the
-    `beta_schedule` tables the class implements: all of them accept the three
-    common ones, DDPM adds GeoDiff's sigmoid and Heun the exponential
-    alpha-bar.
+    default. So a file that omits one gets that class's value, and a control
+    the class does not declare never reaches the table. `trained`, when
+    given, is the table itself. `schedules` lists the `beta_schedule` tables
+    the class implements. Every class accepts the three common ones, DDPM
+    adds GeoDiff's sigmoid, and Heun adds the exponential alpha-bar. A table
+    that does not have `count` finite entries in [0, 1] raises `ValueError`.
     """
     length = records.integer(count, "num_train_timesteps")
     if length < 1:
@@ -482,7 +489,13 @@ def _distilled_times(train_steps: int, original_steps: int, steps: int) -> np.nd
 
 @dataclass(frozen=True, eq=False)
 class SourceSchedule:
-    """Source-file policy interpreted once into native solver and grid fields."""
+    """Reproduces a published scheduler file with Dew's native solver and time grids.
+
+    `from_config` reads the file's class and controls once and resolves them
+    into a prediction transform, a native `solver` and the policy that
+    builds grids. It raises `ValueError` for an unsupported class or for an
+    active control this module does not reconstruct.
+    """
 
     config: Mapping[str, object]
     betas: np.ndarray
@@ -550,13 +563,13 @@ class SourceSchedule:
         return self.policy.train_steps
 
     def training_process(self, tokens: int | None = None) -> Process:
-        """The process Dew fine-tunes the checkpoint on, at `tokens` latent
-        tokens.
+        """Return the process Dew fine-tunes the checkpoint on, at `tokens` latent tokens.
 
-        A scheduler file states how its checkpoint samples, so this is the
-        convention its sampler reads: the VP beta table, EDM's log-normal
-        sigma draw, or the flow path at the shift its sampler walks (a
-        dynamic file needs `tokens`; the terminal stretch is sampling's alone).
+        A scheduler file states how its checkpoint samples, so the training
+        process uses the convention its sampler reads. That is the VP beta
+        table, EDM's log-normal sigma draw, or the flow path at the shift
+        its sampler uses. A file with dynamic shifting needs `tokens`. The
+        terminal stretch applies to sampling only.
         """
         if self.policy.family == "flow":
             flow = self.policy.flow
@@ -768,11 +781,14 @@ class SourceSchedule:
 
     def sampling(self, steps: int, *, tokens: int | None = None,
                  origin: Origin = "scheduler") -> tuple[Process, jax.Array]:
-        """The process and the explicit descending grid a `steps` walk takes.
+        """Return the process and the explicit descending grid for sampling in `steps` steps.
 
-        `tokens` is the latent token count a resolution-dependent flow shift
-        reads, and `origin` is where a flow file's sigmas start. Both belong
-        to the calling pipeline, bound through the task's grid callable.
+        `tokens` is the latent token count that a resolution-dependent flow
+        shift reads, and `origin` is where a flow file's sigmas start. The
+        calling pipeline supplies both through the task's grid callable.
+        Raises `ValueError` when `steps` is not a positive integer, or when
+        it is larger than the training table of a `tabulated` or `lambda`
+        class.
         """
         held = self._grids.get((steps, tokens, origin))
         if held is None:

@@ -1,4 +1,4 @@
-"""Holds the one convention a model is trained and sampled with."""
+"""The diffusion process a model is trained and sampled with, and the denoiser that runs a model on it."""
 
 from __future__ import annotations
 
@@ -19,13 +19,16 @@ from dew.records import json_value
 
 @struct.dataclass
 class DenoisingCondition:
-    """Carries text conditioning as the published families read it.
+    """Text conditioning in the form the published model families read it.
 
-    The fields are the token states, a pooled vector, the size and crop ids
-    the XL towers add, the distilled guidance value a guidance-embedded
-    transformer takes as a model input rather than as two guided branches,
-    and the `[B, tokens]` mask of the real token states in a right-padded
-    `context`, which a family that excludes padded keys reads.
+    - `context` holds the token states.
+    - `pooled` is a pooled vector.
+    - `time_ids` are the size and crop ids that the XL towers add.
+    - `guidance` is the distilled guidance value, which a guidance-embedded
+      transformer takes as a model input instead of running two guided
+      branches.
+    - `mask` is the `[B, tokens]` mask of the real token states in a
+      right-padded `context`, read by a family that excludes padded keys.
     """
 
     context: jax.Array
@@ -35,9 +38,12 @@ class DenoisingCondition:
     mask: jax.Array | None = None
 
     def aligned(self, given: DenoisingCondition) -> DenoisingCondition:
-        """This conditioning with `given`'s distilled guidance value, which
-        belongs to the row rather than to its caption, so a dropped or
-        unconditional caption keeps the scale the checkpoint walks at."""
+        """Return this conditioning with `given`'s distilled guidance value.
+
+        The guidance value belongs to the row and not to its caption, so a
+        dropped or unconditional caption keeps the guidance scale the
+        checkpoint samples at.
+        """
         return replace(self, guidance=given.guidance)
 
 
@@ -48,12 +54,12 @@ type Conditioning = DenoisingCondition | jax.Array
 
 def aligned_conditions(conditions: Mapping[str, Conditioning],
                        unconditional: Mapping[str, Conditioning]) -> dict[str, Conditioning]:
-    """`unconditional` with each row's own model inputs taken from `conditions`.
+    """Return `unconditional` with each row's own model inputs taken from `conditions`.
 
-    A keyword names a conditioning record on both sides or on neither, so the
-    spatial keywords an inpainting source adds are arrays and pass through. A
-    keyword that is a record on one side only is a caller pairing two
-    different conditionings, and raises rather than aligning nothing.
+    A keyword must name a conditioning record on both sides or on neither.
+    Array keywords, such as the spatial ones an inpainting source adds, pass
+    through unchanged. A keyword that is a record on one side only means the
+    caller paired two different conditionings, so it raises `ValueError`.
     """
     aligned: dict[str, Conditioning] = {}
     for key, null in unconditional.items():
@@ -69,20 +75,20 @@ def aligned_conditions(conditions: Mapping[str, Conditioning],
 
 @dataclass(frozen=True)
 class Process:
-    """Pairs a schedule with what the model predicts on it and how the loss is
-    weighted.
+    """Pairs a noise schedule with what the model predicts on it and how the loss is weighted.
 
-    `sampling` is the schedule inference integrates when it is not the
-    training one, as EDM trains on log-normal sigmas and samples on the
-    Karras grid. None means the same schedule.
+    `sampling` is the schedule that inference integrates when it differs
+    from the training schedule. For example, EDM trains on log-normal sigmas
+    and samples on the Karras grid. None means sampling uses the training
+    schedule.
 
-    `interval` says the model predicts over an interval rather than at an
-    instant, as MeanFlow's average velocity and a shortcut model's step do:
-    it reads the interval's length in model time as `duration`, and a
-    solver's step hands it the interval to the next grid point
-    (`Denoiser.spanning`), so a single-evaluation solver such as `Euler`
-    takes the whole interval in one step. A zero duration is the
-    instantaneous prediction.
+    `interval` is whether the model predicts over an interval of time and
+    not at an instant, as MeanFlow's average velocity and a shortcut model's
+    step do. Such a model reads the interval's length in model time as the
+    `duration` condition. At each step, `sample` gives the denoiser the
+    interval to the next grid point (`Denoiser.spanning`), so a
+    single-evaluation solver such as `Euler` covers the whole interval in
+    one step. A zero duration gives the instantaneous prediction.
     """
 
     schedule: NoiseScheduler
@@ -92,7 +98,12 @@ class Process:
     interval: bool = False
 
     def to_json(self) -> dict:
-        """The built-in schedule, prediction and weighting constructor records."""
+        """Return the process as a record of its built-in components' constructor arguments.
+
+        The record covers the schedule, prediction, weighting and sampling
+        schedule, and the `interval` flag. A component that is not a
+        built-in class raises `TypeError`.
+        """
         def component(value, module):
             cls = type(value)
             if getattr(module, cls.__name__, None) is not cls:
@@ -116,7 +127,12 @@ class Process:
 
     @classmethod
     def from_json(cls, record: Mapping) -> Process:
-        """Rebuild only maintained built-in components; never import arbitrary record classes."""
+        """Rebuild a process from its `to_json` record.
+
+        Components are looked up by name in Dew's own schedule and transform
+        modules, so a record can never make it import an arbitrary class. An
+        unknown component or loss weighting raises `ValueError`.
+        """
         def component[Part](spec, module, expected: type[Part]) -> Part:
             name, fields = spec['name'], dict(spec['fields'])
             member = getattr(module, name, None)
@@ -146,12 +162,14 @@ class Process:
         return self.weighting(self.schedule, self.prediction, t)
 
     def rates(self, t, *, like: jax.Array) -> tuple[jax.Array, jax.Array]:
-        """`(alpha, sigma)` of the schedule a solver walks at `t`, shaped to
-        broadcast against `like`, a `[B, ...]` state."""
+        """Return the sampling schedule's `(alpha, sigma)` at `t`, shaped to broadcast against `like`.
+
+        `like` is a `[B, ...]` state.
+        """
         return broadcast_rates(self.sampler_schedule, t, like)
 
     def times(self, steps: int) -> jax.Array:
-        """The descending time grid of `steps` points a solver walks, from T to 0.
+        """Return the descending grid of `steps` times, from T to 0, that a solver steps through.
 
         A tabulated schedule cannot take more steps than it has entries, so
         `steps` is capped at T there.
@@ -162,20 +180,21 @@ class Process:
         return jnp.linspace(schedule.T, 0.0, steps, dtype=jnp.float32)
 
     def noise(self, key, shape) -> jax.Array:
-        """Draws the sampling schedule's Gaussian prior at `shape`.
+        """Draw an array of `shape` from the sampling schedule's Gaussian prior.
 
-        Its default scale is the unit-data marginal at T; a schedule may
-        declare a different prior normalization.
+        By default the prior's standard deviation is that of the marginal at
+        T for unit-variance data. A schedule may declare a different scale
+        through `prior_scale`.
         """
         return jax.random.normal(key, shape) * self.sampler_schedule.prior_scale()
 
     def denoiser(self, model, params, conditions: Mapping[str, Conditioning],
                  unconditional: Mapping[str, Conditioning] | None = None) -> Denoiser:
-        """`(x_t, t) -> (x_0, epsilon)` for `model` under `params` with the
-        given conditions, on the sampling schedule.
+        """Return the denoiser of `model` under `params` with the given conditions.
 
-        `unconditional` carries the same keys with the unconditional values
-        and is what classifier-free guidance interpolates against.
+        The denoiser maps `(x_t, t)` to `(x_0, epsilon)` on the sampling
+        schedule. `unconditional` has the same keys with the unconditional
+        values, and classifier-free guidance interpolates against it.
         """
         return Denoiser(self, model, params, dict(conditions),
                         None if unconditional is None else dict(unconditional))
@@ -185,13 +204,15 @@ class Process:
 class Denoiser:
     """Denoises with one model, its parameters and its conditions.
 
-    A call is the model's raw output at `(x_t, t)` followed by the process's
-    conversion of it into `(x_0, epsilon)`. The two are separate because a
-    conversion is not always linear in the output: dynamic thresholding and
-    sample clipping limit x_0, and a consistency boundary reads a function of
-    it, so combining two raw outputs after conversion is not combining them
-    before it. Guidance therefore reads `raw_both`, combines the raw outputs
-    and converts once, the order a source pipeline runs its scheduler in.
+    A call computes the model's raw output at `(x_t, t)` and then the
+    process's conversion of it into `(x_0, epsilon)`. The two steps are
+    separate methods because a conversion is not always linear in the
+    output. Dynamic thresholding and sample clipping limit x_0, and a
+    consistency boundary computes a function of it, so combining two raw
+    outputs after conversion gives a different result from combining them
+    before. Guidance therefore calls `raw_both`, combines the raw outputs
+    and converts once, in the same order a source pipeline runs its
+    scheduler.
     """
 
     process: Process
@@ -213,7 +234,7 @@ class Denoiser:
         return output
 
     def convert(self, x_t, t, output) -> tuple[jax.Array, jax.Array]:
-        """`(x_0, epsilon)` read out of a raw model output at `(x_t, t)`."""
+        """Return `(x_0, epsilon)` recovered from a raw model output at `(x_t, t)`."""
         process = self.process
         rates = process.rates(t, like=x_t)
         preds = process.prediction.pred_transform(x_t, output, rates, t)
@@ -223,8 +244,11 @@ class Denoiser:
         return self.convert(x_t, t, self.raw(x_t, t))
 
     def spanning(self, t, t_next) -> Denoiser:
-        """This denoiser over the interval from `t` to `t_next`: every call
-        reads its length in model time as the `duration` condition."""
+        """Return this denoiser over the interval from `t` to `t_next`.
+
+        Every call of the returned denoiser passes the interval's length in
+        model time to the model as the `duration` condition.
+        """
         schedule = self.process.sampler_schedule
         duration = {"duration": schedule.model_time(t) - schedule.model_time(t_next)}
         return replace(
@@ -234,12 +258,15 @@ class Denoiser:
         )
 
     def raw(self, x_t, t) -> jax.Array:
-        """The model's raw output at `(x_t, t)` under the conditions."""
+        """Return the model's raw output at `(x_t, t)` under the conditions."""
         return self._raw(x_t, t, self.conditions)
 
     def raw_both(self, x_t, t) -> tuple[jax.Array, jax.Array]:
-        """The conditional and the unconditional raw outputs, in one model
-        call over the doubled batch."""
+        """Return the conditional and the unconditional raw outputs.
+
+        Both come from one model call over the doubled batch. Raises
+        `ValueError` when the denoiser has no unconditional conditions.
+        """
         if self.unconditional is None:
             raise ValueError("guidance needs the unconditional conditions; pass "
                              "`unconditional` to Process.denoiser")

@@ -75,13 +75,15 @@ def _token_row(ids: ArrayLike | Sequence[int]) -> list[int]:
 class ByteTokenizer:
     """Encodes text as one id per utf-8 byte, over a vocabulary of 256.
 
-    It trains nothing and downloads nothing, which makes it the default for
-    small corpora and for tests. Its decode inverts its encode on any unicode
-    input, so a generated sequence rounds back to text byte for byte.
+    It needs no training and no download, so it is the default for small
+    corpora and for tests. Its eos id is 255, a byte that never occurs in
+    utf-8 text, and it has no bos id. Decoding inverts encoding for any
+    unicode text. Ids that are not valid utf-8, which a model can generate,
+    decode with replacement characters.
     """
 
     name = "byte"
-    """What `tokenizer_for` resolves back to this vocabulary, as a run records it."""
+    """The name a run records for this vocabulary, which `tokenizer_for` resolves back to it."""
 
     def __init__(self):
         self.vocab_size = 256
@@ -89,7 +91,11 @@ class ByteTokenizer:
         self.bos_id = None
 
     def encode(self, text: str, *, add_special_tokens: bool = True) -> list[int]:
-        """UTF-8 byte ids; this vocabulary has no special tokens to insert."""
+        """Return the text's utf-8 bytes as ids.
+
+        `add_special_tokens` has no effect, because this vocabulary has no
+        special tokens to insert.
+        """
         return list(text.encode("utf-8"))
 
     def decode(self, ids: ArrayLike | Sequence[int]) -> str:
@@ -100,10 +106,12 @@ class ByteTokenizer:
 
 
 class HFTokenizer:
-    """A huggingface tokenizer, loaded from its hub name on first use.
+    """A Hugging Face tokenizer, loaded from its hub name or local directory
+    on first use.
 
-    Lazy loading keeps `import dew.data.text` (and `import dew.data`) from
-    paying for `transformers` and any hub lookup a caller never asked for.
+    Because it loads lazily, `import dew.data.text` (and `import dew.data`)
+    does not import `transformers` or look anything up on the hub until a
+    caller uses the tokenizer.
     """
 
     def __init__(self, name: str, *, local_files_only: bool = False):
@@ -122,7 +130,11 @@ class HFTokenizer:
 
     @property
     def eos_id(self) -> int | None:
-        """The eos token's id, or None for a tokenizer that declares none."""
+        """The eos token's id, or None for a tokenizer that declares none.
+
+        Raises `TypeError` when the tokenizer reports something other than
+        one id.
+        """
         eos = self.tokenizer.eos_token_id
         if eos is None or isinstance(eos, int):
             return eos
@@ -130,7 +142,11 @@ class HFTokenizer:
 
     @property
     def bos_id(self) -> int | None:
-        """The id the tokenizer starts a sequence with, or None where it has none."""
+        """The id the tokenizer starts a sequence with, or None where it has none.
+
+        Raises `TypeError` when the tokenizer reports something other than
+        one id.
+        """
         bos = self.tokenizer.bos_token_id
         if bos is None or isinstance(bos, int):
             return bos
@@ -144,10 +160,10 @@ class HFTokenizer:
         return self.tokenizer.batch_decode([_token_row(ids)])[0]
 
     def save_pretrained(self, directory) -> None:
-        """Writes this tokenizer's own files into an export directory.
+        """Write this tokenizer's own files into an export directory.
 
         The tokenizer writes tokenizer.json, tokenizer_config.json and its
-        vocabulary itself, so the export copies no bytes by hand and the
+        vocabulary itself, so the export copies no files by hand and the
         result loads in anything that reads the HF layout.
         """
         self.tokenizer.save_pretrained(str(directory))

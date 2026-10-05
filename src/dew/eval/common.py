@@ -15,11 +15,14 @@ from dew.objectives.base import Batch, Shown, mean_of_totals, merge_totals
 
 @dataclass(frozen=True, eq=False)
 class Mean[Scored: Artifact]:
-    """Average per-example values or additive (total, count) contributions.
+    """Averages a metric over a validation pass, from per-example values or additive (total, count) pairs.
 
-    `better` is required so checkpoint ranking cannot infer the opposite
-    direction. `reads` explicitly names the scoring artifact the function
-    consumes. State belongs to the evaluation pass.
+    `fn` scores one artifact and batch, returning per-example values or a
+    `(total, count)` pair. `better` (`higher` or `lower`) is required, so
+    checkpoint ranking never assumes the wrong direction. `reads` names the
+    artifact type `fn` scores. `name` is unprefixed, such as `accuracy`,
+    because evaluation adds `val/` or the split name. The running totals
+    belong to the evaluation pass, not to this object.
     """
 
     fn: Callable[[Scored, Batch], ArrayLike | tuple[float, float]]
@@ -95,8 +98,10 @@ def paired(artifact: ImageGrid | VideoGrid, batch: Batch, field: str):
 
 
 class ImageMetric(Mean[ImageGrid | VideoGrid]):
-    """A `Mean` of one measurement per image, or per frame for video, taken on
-    one local device. Flow-GRPO reads `fn` as a per-sample reward."""
+    """Averages one measurement per image, or per frame for video, taken on one local device.
+
+    It is a `Mean`, and Flow-GRPO reads its `fn` as a per-sample reward.
+    """
 
     def __init__(self, name: str, measure: Callable[[ImageGrid | VideoGrid, Batch], ArrayLike], *,
                  better: Literal["higher", "lower"] = "higher",

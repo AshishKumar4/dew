@@ -822,7 +822,7 @@ The flag `--xla_gpu_deterministic_ops=true` turns them on, and
 `TrainerConfig.xla_flags` appends it to `XLA_FLAGS`. Check the flag with your
 attention backend: under JAX 0.11.1, repeated cuDNN backward calls fail with it
 set, while the XLA attention path passed the recorded bitwise checks.
-`tools/qualify_training.py` uses the XLA path (`--attention-impl xla`).
+`tests/test_training_qualification.py` resumes a killed fine-tune on the XLA path.
 
 ### Standalone evaluation and local reports
 

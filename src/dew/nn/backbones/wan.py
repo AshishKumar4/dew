@@ -1,20 +1,20 @@
-"""Wan 2.1's video transformer, as Diffusers 0.34.0's `WanTransformer3DModel`
-runs it for text-to-video.
+"""Wan 2.1's video transformer, as Diffusers 0.34.0's `WanTransformer3DModel` runs it for text-to-video.
 
 A strided 3-D convolution cuts the clip's latent into 1x2x2 patches, one
 token each, in frame, row, column order. Every block normalizes its residual
 stream and modulates it by the time, self-attends with a three-axis rotary
 table over (frame, row, column), cross-attends to the text, and runs the
 tanh-GELU feed-forward. A block's six modulation pieces are its own learned
-table plus one projection of the time embedding that every block shares.
-Queries and keys are RMS-normalized across all heads, before they split.
+table plus one projection of the time embedding that all blocks share.
+Queries and keys are RMS-normalized across all heads, before they are split
+into heads.
 
 The source keeps its norms, its modulation tables and its time embedder in
-fp32 (`_keep_in_fp32_modules`) and adds the gated residuals in fp32, so a
-bfloat16 model here does the same, at `at_least_fp32` of its dtype, and
+fp32 (`_keep_in_fp32_modules`) and adds the gated residuals in fp32. A
+bfloat16 model here does the same at `at_least_fp32` of its dtype, and
 rounds the stream back after each sum. The source rotates queries and keys
-in float64; this rotates them at that wider dtype, from `rotary_table`'s
-float32 cosines and sines.
+in float64; Dew rotates them at `at_least_fp32` of their dtype, from
+`rotary_table`'s float32 cosines and sines.
 """
 
 from __future__ import annotations
@@ -58,15 +58,16 @@ def wan_rotation(frames: int, rows: int, columns: int, head_dim: int, *,
                for name, axes in (*(((name), ("embed", None)) for name in ("to_q", "to_k", "to_v")),
                                   ("to_out_0", (None, "embed")))})
 class WanAttention(nn.Module):
-    """The source's `Attention` under `WanAttnProcessor2_0`, for text-to-video.
+    """Runs the source's `Attention` under `WanAttnProcessor2_0`, for text-to-video.
 
-    Queries come from the video tokens and keys and values from `context`
-    (the text, for the cross-attention) or the tokens themselves. It is
-    not `JointAttention`: Wan's `rms_norm_across_heads` normalizes each
-    token's whole projection before it splits into heads, where the MM-DiTs
-    normalize each head, and its cross-attention reads keys and values from
-    the text alone, where theirs join the two streams. `rotation` turns the
-    self-attention's queries and keys, `[1, S, 1, D]`.
+    Queries come from the video tokens. Keys and values come from `context`
+    (the text, for the cross-attention) or from the tokens themselves. It
+    differs from `JointAttention` in two ways. Wan's `rms_norm_across_heads`
+    normalizes each token's whole projection before it is split into heads,
+    where the MM-DiTs normalize each head. And its cross-attention reads keys
+    and values from the text alone, where theirs join the two streams.
+    `rotation`, `[1, S, 1, D]`, rotates the self-attention's queries and
+    keys.
     """
 
     heads: int
@@ -106,11 +107,14 @@ class WanAttention(nn.Module):
 
 
 class WanBlock(nn.Module):
-    """`WanTransformerBlock`: modulated self-attention, cross-attention to
-    the text through its own affine norm (`cross_attn_norm`), and the
-    modulated feed-forward. `modulation` is the model's shared projection
-    of the time, `[B, 6, features]`, which the block's `scale_shift_table`
-    offsets."""
+    """Runs `WanTransformerBlock`: modulated self-attention, cross-attention to the text, and a feed-forward.
+
+    The cross-attention reads the text through its own affine norm
+    (`cross_attn_norm`), and the feed-forward is modulated like the
+    self-attention. `modulation` is the model's shared projection of the
+    time, `[B, 6, features]`, and the block adds its `scale_shift_table` to
+    it.
+    """
 
     features: int
     heads: int
@@ -150,15 +154,16 @@ class WanBlock(nn.Module):
                ("time_embedder_linear_1",): (None, "embed"), ("time_embedder_linear_2",): (None, "embed"),
                ("patch_embedding_3d",): (None, None, None, None, "embed"), ("proj_out",): ("embed", None)})
 class WanTransformer(nn.Module):
-    """Diffusers 0.34.0's `WanTransformer3DModel`, text-to-video, over Dew's interface.
+    """Runs Diffusers 0.34.0's `WanTransformer3DModel` for text-to-video, behind Dew's model interface.
 
     `__call__` takes a clip's latent `[B, F, H, W, C]`, the model time the
-    schedule supplies (the sigma times the training count, which is the
-    timestep the source's pipeline hands it), and a `DenoisingCondition`
-    whose `context` is the UMT5 states `[B, L, text_dim]`, every one of
-    which the cross-attention reads, as the source's does, and returns the
-    flow, `[B, F, H, W, out_channels]`. The fields are the config's;
-    `qk_norm` is the one the source names, `rms_norm_across_heads` or None.
+    schedule supplies, and a `DenoisingCondition`, and returns the flow
+    `[B, F, H, W, out_channels]`. The model time is the sigma times the
+    training count, which is the timestep the source's pipeline passes. The
+    condition's `context` is the UMT5 states `[B, L, text_dim]`, and the
+    cross-attention reads every one of them, as the source's does. The
+    fields are the config's; `qk_norm` takes the value the source names,
+    `rms_norm_across_heads`, or None.
     """
 
     patch_size: Sequence[int] = (1, 2, 2)
@@ -184,8 +189,14 @@ class WanTransformer(nn.Module):
 
     @nn.compact
     def __call__(self, x, time, conditioning: DenoisingCondition, train: bool = False):
-        """`train` is the objective's standard call contract; the published
-        transformer holds no dropout, so it changes nothing here."""
+        """Return the flow for the latent `x` at `time` under `conditioning`.
+
+        `train` is part of the objective's standard call; the published
+        transformer has no dropout, so it changes nothing here. Raises
+        `ValueError` for latents that are not whole patches, for a patch grid
+        longer than `rope_max_seq_len` on any axis, and for an unknown
+        `qk_norm`.
+        """
         if self.qk_norm not in (None, "rms_norm_across_heads"):
             raise ValueError(f"Native Wan implements qk_norm 'rms_norm_across_heads', not "
                              f"{self.qk_norm!r}")

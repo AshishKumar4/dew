@@ -1,30 +1,29 @@
-"""RLVR with asynchronous GRPO rollouts of programs that must pass their tests.
+"""RLVR: GRPO on programs that must pass their tests, rolled out asynchronously.
 
     python examples/train_rlvr.py --backend native --steps 40 --out runs/rlvr-native
     python examples/train_rlvr.py --backend vllm --steps 40 --out runs/rlvr-vllm
     python examples/train_rlvr.py --backend sglang --steps 40 --out runs/rlvr-sglang
 
 Every prompt asks for a Python program that reads two integers from stdin
-and prints a stated function of them. A `SandboxFleet` runs each program on
-three hidden test cases, and its reward is the fraction it passes.
-`--runner container` runs each program in a `python:3.12-slim`
-container without network access.
-`--runner process` (the default, and the only choice where Docker is absent,
-as on Colab) runs it as a process with wall-clock, CPU-time and memory limits.
-That process has your user's filesystem and network access.
+and prints a stated function of them. A completion's reward is the fraction
+of three hidden test cases its program passes, run in a `SandboxFleet`.
+`--runner container` runs each program in a network-less `python:3.12-slim`
+container. `--runner process` (the default, and the only choice where Docker
+is absent, as on Colab) runs it as a process with a wall clock, CPU time and
+memory cap; that process has your user's filesystem and network.
 
-The rollout server samples while the trainer updates. `--backend native`
-uses Dew's continuous-batching `Server` in this process, with weights updated
-in place. `--backend vllm` and `--backend sglang` start the chosen engine's
-OpenAI-compatible server on an export of the same checkpoint. They sample
-by token IDs and push weights by writing safetensors and asking the engine
-to reload them (vLLM's development endpoints, `VLLM_SERVER_DEV_MODE=1`;
-SGLang's `/update_weights_from_disk`).
+Rollouts run on a rollout server while the trainer updates. `--backend
+native` serves them from Dew's own continuous-batching `Server` in this
+process, with weights pushed in place. `--backend vllm` and `--backend
+sglang` start that engine's OpenAI-compatible server on an export of the
+same checkpoint, sample from it by token ids, and push weights by writing
+safetensors and asking the engine to reload them (vLLM's development
+endpoints, `VLLM_SERVER_DEV_MODE=1`; SGLang's `/update_weights_from_disk`).
 `--vllm` and `--sglang` name the executables, which may live in their own
 environments. A `RolloutScheduler` over a `PromptSource` draws one batch
-ahead of the update, so each batch is at most one update stale. The GRPO
-objective's importance cap corrects for this lag. A completion that runs
-out of `--new-tokens` is still scored and trained on (`truncation="score"`): a
+ahead of the update, so each batch is at most one update stale; the GRPO
+objective's importance cap corrects for it. A completion that runs out of
+`--new-tokens` is still scored and trained on (`truncation="score"`): a
 closed code block followed by cut-off prose can pass every test.
 
 `--turns N` gives each task up to N attempts through an `EnvironmentSource`,
@@ -100,8 +99,8 @@ FEEDBACK_TOKENS = 32
 SMOKE_MODEL = Path(__file__).resolve().parents[1] / "tests/fixtures/hf/qwen2-tiny"
 
 
-# This recipe scores the completion's last fenced program. The reward
-# column holds `{"stdin", "stdout"}` test cases.
+# The reward is this recipe's: the program is the completion's last fenced
+# block, and the reward column holds `{"stdin", "stdout"}` test cases.
 _FENCE = re.compile(r"```([A-Za-z0-9_+-]*)[ \t]*\n(.*?)```", re.DOTALL)
 
 
@@ -137,10 +136,9 @@ class CodeReward:
     passes when the program completes and its stdout matches, line by line
     up to trailing whitespace. A completion without a code block scores
     zero, as do timeouts, crashes and oversized output. `all_or_nothing`
-    scores one only when every case passes. `interpreter` supplies the argv
-    to which the program file is appended. With None, the fleet runner's
-    `python` is used: the image's interpreter for a container, or this
-    process's interpreter for a process runner.
+    scores one only when every case passes. `interpreter` is the argv the
+    program file is appended to; None takes the fleet runner's `python`, so
+    a container runs the image's interpreter and a process runs this one.
     """
 
     fleet: SandboxFleet
@@ -171,13 +169,11 @@ def _uniform(low: int, high: int) -> Callable[[random.Random], tuple[int, int]]:
 
 
 def _digits(most: int) -> Callable[[random.Random], tuple[int, int]]:
-    """Draw a and b with 1..most decimal digits.
-
-    Each digit count is uniform, then the number is uniform among numbers
-    with that count. This gives products a wider range of digits and bits
-    than uniform a and b in 1..99, where print(18) passed 14.7% of digit-sum
-    cases and print(6) passed 23.6% of popcount cases.
-    """
+    """a and b each with 1..most decimal digits, the count uniform, then
+    uniform among the numbers of that many digits. A product's digits and bits
+    spread over a wider range than with a and b uniform in 1..99, where
+    print(18) passed 14.7% of the digit-sum cases and print(6) 23.6% of the
+    popcount ones."""
     def one(draw: random.Random) -> int:
         digits = draw.randint(1, most)
         return draw.randint(10 ** (digits - 1), 10 ** digits - 1)
@@ -185,15 +181,13 @@ def _digits(most: int) -> Callable[[random.Random], tuple[int, int]]:
 
 
 def _shared_factor(draw: random.Random) -> tuple[int, int]:
-    """Draw a and b with a common factor from 1..30.
-
-    Redraw while their gcd is min(a, b) or |a - b|. With uniform draws in
-    1..99, the pair was coprime 61% of the time, so print(1) passed that share
-    of cases. With a shared factor alone, print(min(a, b)) passed 28% because
-    one cofactor divides the other, and print(abs(a - b)) passed a quarter
-    because the cofactors are consecutive multiples of their gcd. A gcd is
-    at most min(a, b), so no other echo of a and b can print it.
-    """
+    """a and b with a common factor from 1..30, redrawn while their gcd is
+    min(a, b) or |a - b|. Uniform in 1..99 they were coprime 61% of the time,
+    so print(1) passed that share of the cases; with a shared factor alone,
+    print(min(a, b)) passed 28% (one cofactor divides the other) and
+    print(abs(a - b)) a quarter (the cofactors are consecutive multiples of
+    their gcd). A gcd is at most min(a, b), so no other echo of a and b
+    can print it."""
     while True:
         factor = draw.randint(1, 30)
         a, b = factor * draw.randint(2, 20), factor * draw.randint(2, 20)
@@ -216,7 +210,7 @@ def _index_and_modulus(draw: random.Random) -> tuple[int, int]:
 
 # (what to print, how to compute it from a and b, how to draw a and b).
 # Qwen3-0.6B solved the one-line arithmetic of an earlier set on 74% of its
-# first draws and on every draw by update 6, leaving no learning curve to measure.
+# first draws and on every draw by update 6, which leaves a curve no signal.
 # Each of these takes more than one step, and each draws a and b so that no
 # program that ignores the task, a constant or a, b, min(a, b), max(a, b),
 # a + b, a * b or |a - b|, passes a tenth of its cases.
@@ -299,10 +293,8 @@ class Config:
     """Prompts per step; each gets `groups` completions, all in the same step."""
     groups: int = 8
     accumulation: int = 1
-    """Steps per optimizer update. An update trains on
-    `accumulation * prompts * groups` rows; each step and the server's slots
-    hold `prompts * groups` rows.
-    """
+    """Steps pooled into one optimizer update. An update trains on `accumulation * prompts * groups`
+    rows while a step, and the server's slots with it, holds `prompts * groups` of them."""
     prompt_tokens: int = 128
     new_tokens: int = 128
     learning_rate: float = 2e-6
@@ -312,9 +304,7 @@ class Config:
     """Attempts per task; above one, a failed program's test count comes back and the model tries again."""
     thinking: bool = False
     """Whether a reasoning template opens a think block (Qwen3's `enable_thinking`); others ignore it.
-    Off by default because the task asks for one code block and thinking
-    uses part of the token budget.
-    """
+    Off by default: the task asks for one code block, and a think block eats the budget."""
     window: int = 10
     """Steps averaged at each end of the run for the reward comparison; an update is `accumulation` steps."""
     runner: str = "process"
@@ -333,7 +323,7 @@ class Config:
 
 
 def rollout_width(config: Config) -> int:
-    """Token IDs needed for one session's prompt, attempts and failed-attempt reports."""
+    """The ids one session's chain holds: the prompt, every attempt and the report after each failed one."""
     return config.prompt_tokens + config.turns * config.new_tokens + (config.turns - 1) * FEEDBACK_TOKENS
 
 
@@ -349,7 +339,7 @@ def attempt_scorer(
 
 
 class Attempts:
-    """Program attempts for one task, with test-count feedback after failures.
+    """One task's attempts at a program: a failing one hears how many tests passed and tries again.
 
     The report is appended as plain text after the model's own turn, so every
     attempt extends the ids before it and a session packs as one chain.
@@ -395,13 +385,12 @@ def attempts_source(server, reward: CodeReward, decode: Callable[[Sequence[int]]
 
 
 def engine_context(config: Config) -> int:
-    """Set the engine's context window to the rollout width plus SGLang's reserve.
+    """The context window the engine is started with: the rollout width, and SGLang's reserve on top.
 
     SGLang 0.5.20 caps a request's budget at `context - input - 2` and
-    refuses an input of `context - 6` IDs or more. With the context set to
-    the rollout width, a prompt near the window limit would get fewer than
-    `new_tokens` IDs and finish with a "length" reason the rollout refuses.
-    vLLM's `--max-model-len`
+    refuses an input of `context - 6` ids or more, so at a context equal to
+    the width a prompt at the window would draw fewer than `new_tokens` ids
+    and end with a "length" the rollout refuses. vLLM's `--max-model-len`
     admits the full width.
     """
     width = rollout_width(config)
@@ -488,8 +477,8 @@ def launch_engine(config: Config, directory: Path) -> subprocess.Popen:
 def native_server(source, sampling: Sampling, *, slots: int, capacity: int) -> NativeRolloutServer:
     """Dew's own server on a bfloat16 copy of the checkpoint.
 
-    Only the server holds that copy, and the first push replaces it. Keeping
-    another reference after this call would retain a model's worth of device
+    Nothing but the server holds that copy: the first push replaces it, and a
+    reference kept past this call would keep a model's worth of device
     memory for the whole run.
     """
     served = jax.tree.map(
@@ -555,12 +544,12 @@ def main(config: Config) -> dict:
     words = HFTokenizer(tokenizer)
     # An attempt ends on EOS; the committed tiny Qwen2 names none, its tokenizer does.
     eos = stock.eos_id if stock.eos_id is not None else words.eos_id
-    # Temperature one with no filters makes the engine's reported
-    # likelihoods those of the behavior policy, on either backend.
+    # Temperature one without filters: the engine's reported likelihoods are
+    # then the behavior policy's, on either backend.
     sampling = Sampling(temperature=1.0, eos_id=eos, pad_id=stock.pad_id)
 
-    # Recomputing each block during the backward pass reduces Qwen3-0.6B's
-    # saved activations at 64 rows of 320 IDs from 61.6 GiB to 3.4 GiB.
+    # Recompute each block's forward in the backward: without it the saved
+    # activations of Qwen3-0.6B at 64 rows of 320 ids are 61.6 GiB, with it 3.4 GiB.
     policy = source.model.clone(remat=remat_policy("full"))
     objective = GRPOObjective(policy, width - 1, variables=source.variables,
                               behavior_importance=2.0, epsilon_high=0.28)

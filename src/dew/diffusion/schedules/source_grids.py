@@ -1,14 +1,18 @@
-"""The schedule objects a published diffusion checkpoint's grid is walked on.
+"""The schedules that sampling on a published diffusion checkpoint's grid uses.
 
-`source.py` reads one scheduler file into a policy, and these are the
-schedules that policy hands to `Process`. Each is an ordinary Dew schedule,
-so a solver reads its rates, its model time and its prior the way it reads
-any other.
+`source.py` reads one scheduler file into a policy, and the policy builds
+its `Process` from one of these schedules. Each is an ordinary Dew schedule,
+so a solver reads its rates, model time and prior the same way as any
+other's.
 
-The four are the training beta table indexed by t, a paired
-sigma/model-time table in variance-exploding or normalized-VP coordinates,
-the same table refined with the stage row a two-evaluation solver reads, and
-a rectified-flow table whose signal and noise sum to one.
+There are four kinds: the training beta table indexed by t (`TabulatedVP`);
+a paired sigma and model-time table, in variance-exploding (`SigmaGrid`) or
+normalized-VP (`VPGrid`) coordinates; the variance-exploding table with the
+stage rows a two-evaluation solver reads (`StageSigmaGrid`); and a
+rectified-flow table whose signal and noise sum to one (`FlowGrid`). A
+paired table is read at a coordinate t that counts down from
+T = len(sigmas) - 1, so a non-integer t interpolates between two prepared
+rows.
 """
 from __future__ import annotations
 
@@ -21,12 +25,13 @@ from dew.diffusion.schedules.discrete import DiscreteNoiseScheduler
 
 
 class TabulatedVP(DiscreteNoiseScheduler):
-    """The training beta table as the sampling schedule, indexed by t.
+    """The training beta table used as the sampling schedule, indexed by t.
 
-    `stride` is the fixed training transfer DDIM and PNDM step over, whatever
-    their evaluation grid is. None leaves the grid's own interval, which is
-    what DDPM's previous-timestep policy and the distilled schedules take. A
-    t below zero is the source's "no previous alpha" end.
+    `stride` is the fixed training transfer that DDIM and PNDM step over,
+    whatever their evaluation grid is. None keeps the grid's own interval,
+    which DDPM's previous-timestep policy and the distilled schedules use. A
+    t below zero is the source's "no previous alpha" end, where the rates
+    come from `final_alpha_cumprod`.
     """
 
     def __init__(self, betas: np.ndarray, *, final_alpha_cumprod: float, stride: int | None):
@@ -45,13 +50,16 @@ class TabulatedVP(DiscreteNoiseScheduler):
         return jnp.maximum(jnp.asarray(t, jnp.float32), 0.0)
 
     def step_interval(self, t, t_next):
-        """Published DDIM/PNDM transfer stride, independent of evaluation spacing."""
+        """Return the published DDIM and PNDM transfer stride, independent of the evaluation spacing.
+
+        Without a `stride`, this is the grid's own interval.
+        """
         if self.stride is None:
             return super().step_interval(t, t_next)
         return jnp.full_like(jnp.asarray(t, jnp.float32), self.stride)
 
     def half_interval(self, t, t_next):
-        """Published PRK uses the integer transfer stride divided by two."""
+        """Return half the integer transfer stride, rounded down, as published PRK uses it."""
         return jnp.floor(self.step_interval(t, t_next) / 2)
 
 
@@ -105,10 +113,11 @@ class _PairedGrid:
 
 
 class SigmaGrid(_PairedGrid, GeneralizedNoiseScheduler):
-    """A VE process with paired continuous sigma and model-time coordinates.
+    """A variance-exploding schedule on a prepared grid of paired sigmas and model times.
 
-    `sigma_min` and `sigma_max` are the prepared grid's own positive
-    extremes, which is the domain a source noise sampler is built over.
+    `sigma_min` and `sigma_max` are the grid's smallest positive sigma and
+    its largest sigma, which is the domain a source's noise sampler is built
+    over.
     """
 
     def __init__(self, sigmas: np.ndarray, model_times: np.ndarray, prior: float):
@@ -119,14 +128,15 @@ class SigmaGrid(_PairedGrid, GeneralizedNoiseScheduler):
 
 
 class StageSigmaGrid(SigmaGrid):
-    """A source VE grid that carries the stage rows of a two-evaluation solver.
+    """A source's variance-exploding grid that includes the stage rows of a two-evaluation solver.
 
-    Even coordinates are the grid points the outer walk visits. The odd one
-    between each pair is the source's own interpolated evaluation, at the
-    sigma it places there and the model time it reads back for that sigma.
-    `t_of_sigma` resolves a sigma to a stage coordinate, the only inversion
-    these solvers ask of a schedule, since KDPM2's midpoint and
-    DPMSolverSDE's proposal both land on a stage row.
+    Even coordinates are the grid points the outer loop visits. The odd
+    coordinate between each pair is the source's own interpolated
+    evaluation, at the sigma the source places there and the model time it
+    computes for that sigma. `t_of_sigma` maps a sigma to a stage
+    coordinate. That is the only inversion these solvers need from a
+    schedule, because KDPM2's midpoint and DPMSolverSDE's proposal both land
+    on a stage row.
     """
 
     def __init__(self, sigmas: np.ndarray, model_times: np.ndarray, prior: float):
@@ -155,12 +165,13 @@ class _UniformGrid(_PairedGrid, NoiseScheduler):
 
 
 class FlowGrid(_UniformGrid):
-    """A rectified-flow grid: alpha is 1 - sigma, not a normalized VP pair.
+    """A rectified-flow grid, where alpha is 1 - sigma.
 
     The source's forward process is x_t = (1 - sigma) x_0 + sigma eps, so
-    signal and noise sum to one rather than their squares. Model times are
-    the sigmas times the training count, which is where the source's
-    `timesteps` come from. The prior at sigma 1 is the unit Gaussian.
+    signal and noise sum to one; in a normalized VP pair, their squares do.
+    Model times are the sigmas times the training step count, which is where
+    the source's `timesteps` come from. The prior at sigma 1 is the unit
+    Gaussian. Training draws times uniformly with a constant loss weight.
     """
 
     def rates(self, t):
@@ -169,7 +180,11 @@ class FlowGrid(_UniformGrid):
 
 
 class VPGrid(_UniformGrid):
-    """The same paired coordinates in normalized VP latent space."""
+    """A paired sigma and model-time grid in normalized VP coordinates.
+
+    A grid sigma gives alpha = 1 / sqrt(1 + sigma^2) and a noise rate of
+    sigma alpha. Training draws times uniformly with a constant loss weight.
+    """
 
     def rates(self, t):
         sigma = self.sigmas(t)

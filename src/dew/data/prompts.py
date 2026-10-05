@@ -240,18 +240,23 @@ class PromptSource:
 class Prompts(DatasetSpec):
     """Reads prompts with their reward context, in fixed-width batches.
 
-    `path` is a parquet file in the verl layout and `records` is JSON rows
-    for tests and small sweeps; exactly one of the two is set. Each batch
-    holds `prompt` left-padded to `max_prompt_len` with `pad_id`,
-    `prompt_length`, and the reward columns as UTF-8 bytes.
+    `path` is a parquet file in the verl layout, and `records` is JSON rows
+    for tests and small sweeps; set exactly one of the two. Each batch holds
+    `prompt` left-padded to `max_prompt_len` with `pad_id`, `prompt_length`,
+    and the reward columns (`data_source`, `ground_truth`, `extra_info`) as
+    UTF-8 bytes. A prompt longer than `max_prompt_len` keeps its last tokens.
 
-    String prompts use `tokenizer_for`, so `tokenizer="byte"` encodes UTF-8
-    locally and a Hub name loads its own vocabulary without special tokens.
-    An optional `tools` column holds schemas as a list or JSON string for
-    chat prompts. Schemas are rendered into prompt tokens and never copied
-    into the device batch. `val_path` is a second parquet file scored as one
-    pass; None trains without validation. `thinking` sets a reasoning
-    template's `enable_thinking` (Qwen3's switch); None keeps its default.
+    A row's prompt is chat messages, a string or token ids. Messages are
+    rendered with the tokenizer's chat template and generation prompt, and
+    token ids are used as they are. A string is encoded with `tokenizer_for`
+    and no special tokens, so `tokenizer="byte"` encodes UTF-8 locally and a
+    Hub name loads its own vocabulary. An optional `tools` column holds tool
+    schemas for chat prompts, as a list or a JSON string. The schemas are
+    rendered into the prompt tokens and are not copied into the device batch.
+
+    `val_path` is a second parquet file scored as one pass; None trains
+    without validation. `thinking` sets a reasoning template's
+    `enable_thinking` (Qwen3's switch); None keeps the template's default.
     """
 
     tokenizer: str

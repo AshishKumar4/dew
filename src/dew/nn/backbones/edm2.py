@@ -1,11 +1,13 @@
-"""EDM2's magnitude-preserving U-Net (Karras et al. 2024, Figure 21).
+"""EDM2's magnitude-preserving U-Net.
 
-NVlabs/edm2's `training/networks_edm2.py` `UNet`, channels last, from
-`dew.nn.mp`: every convolution and dense layer an `MPConv`, `MPFourier` time
-features, `mp_sum` branches and `mp_cat` skips, no biases or gains. Train it
-under the `edm` preset with `OptimConfig.forced_weight_normalization`. In
-place of the one-hot class label it embeds the mask-weighted mean of the
-`textcontext` states at unit magnitude through the same dense layer.
+The architecture is Figure 21 of Karras et al. 2024. The code follows
+NVlabs/edm2's `training/networks_edm2.py` `UNet`, channels last, built from
+`dew.nn.mp`: every convolution and dense layer is an `MPConv`, the time
+features are `MPFourier`, branches join with `mp_sum` and skips with
+`mp_cat`, and there are no biases or gains. Train it under the `edm` preset
+with `OptimConfig.forced_weight_normalization`. In place of the one-hot
+class label, it embeds the mask-weighted mean of the `textcontext` states at
+unit magnitude through the same dense layer.
 """
 
 from __future__ import annotations
@@ -35,7 +37,7 @@ def _resample(x: jax.Array, mode: str) -> jax.Array:
 
 
 class Block(nn.Module):
-    """An encoder or decoder block with optional self-attention."""
+    """Runs one encoder or decoder block, with optional self-attention."""
 
     features: int
     flavor: str = "enc"
@@ -83,9 +85,12 @@ class Block(nn.Module):
 
 @models("edm2_unet")
 class EDM2UNet(nn.Module):
-    """EDM2's U-Net; the fields are the reference's, `output_channels` its
+    """Runs EDM2's U-Net.
+
+    The fields are the reference's, and `output_channels` is its
     `img_channels`. `attn_resolutions` are feature-map sizes, compared with
-    the input's height halved once per level."""
+    the input's height halved once per level.
+    """
 
     output_channels: int = 3
     model_channels: int = 192

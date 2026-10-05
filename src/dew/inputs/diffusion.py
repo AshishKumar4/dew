@@ -136,14 +136,15 @@ class T5Segment:
 @encoders("diffusion_text")
 @dataclass(eq=False)
 class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
-    """The text conditioning of a published latent diffusion checkpoint.
+    """Encodes text into the conditioning a published latent diffusion checkpoint reads.
 
-    One encoder owns every family's composition: which towers run, which of
-    their states the model reads, and how the pooled vector is built. The
-    towers themselves are the native CLIP and T5 towers, called the way their
+    This one encoder handles every family's `composition` (`clip`,
+    `clip_pooled`, `sd3` or `flux`). The composition decides which towers
+    run, which of their states the model reads, and how the pooled vector is
+    built. The towers are the native CLIP and T5 towers, called the way their
     own source pipelines call them. The SD3 and Flux pipelines pass their T5
-    ids with no attention mask, which is what `T5EncoderTransformer` does with
-    none, and no generic T5 default changes for it.
+    ids with no attention mask. `T5EncoderTransformer` called without a mask
+    does the same, so no generic T5 default changes for these families.
     """
 
     towers: tuple[CLIPTextTransformer, ...]
@@ -156,8 +157,9 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
     context_width: int
     """The width of the token sequence the denoiser reads: the UNet's
     `cross_attention_dim`, the joint transformers' `joint_attention_dim`. The
-    SD3 composition pads its CLIP states out to it and writes the zero segment
-    its pipeline substitutes for an absent third encoder at it."""
+    SD3 composition pads its CLIP states out to this width, and the zero
+    segment its pipeline writes for an absent third encoder has this width
+    too."""
     composition: Composition = "clip"
     aesthetics: bool = False
     t5: T5Segment | None = None
@@ -178,11 +180,11 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
 
     @property
     def stacked(self) -> bool:
-        """Whether the CLIP ids ride one array with a tower axis.
+        """Whether the CLIP ids share one array with a tower axis.
 
-        Every family but plain Stable Diffusion does. The XL refiner carries
-        a single tower that way too, since its pipeline still writes a
-        tower's row rather than a bare batch.
+        Every family except plain Stable Diffusion stacks them. The XL
+        refiner stacks its single tower too, because its pipeline still
+        writes a tower's row and not a bare batch.
         """
         return self.composition != "clip"
 
@@ -207,10 +209,13 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
             raise ValueError("Flux conditioning needs its T5 encoder")
 
     def tokenize(self, texts: Sequence[str | Mapping[str, object]]):
-        """One row per item, with each text slot routed to the tower whose
-        source pipeline reads it: `text` to the first CLIP tower, `second` to
-        the second one, and the T5 tower's own slot, which is `third` where a
-        family has two CLIP towers beside it and `second` where it has one.
+        """Tokenize one row per item, sending each text slot to the tower whose source pipeline reads it.
+
+        An item is a prompt string or a mapping of slots, and a missing
+        `second` or `third` slot repeats `text`. `text` goes to the first CLIP
+        tower and `second` to the second one. The T5 tower reads its own
+        slot, which is `third` when the family has two CLIP towers beside it
+        and `second` when it has one.
         """
         rows, second, third, zero, negative, guidance = [], [], [], [], [], []
         for prompt in texts:
@@ -238,8 +243,11 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
         return tokens
 
     def time_ids(self, count, dtype):
-        """SDXL's micro-conditioning: the original size, no crop, then the
-        target size or the refiner's aesthetic score."""
+        """Return SDXL's micro-conditioning for `count` rows.
+
+        Each row is the original size, a zero crop offset, then the target
+        size or, for the refiner, its aesthetic score.
+        """
         size = (self.height, self.width)
         values = (*size, 0, 0, *((6.0,) if self.aesthetics else size))
         return jnp.broadcast_to(jnp.asarray(values, dtype), (count, len(values)))
@@ -321,7 +329,7 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
                 "param_dtype": self.param_dtype}
 
     def save_assets(self, destination: Path) -> None:
-        """Write the tokenizer files an exported directory carries beside the weights."""
+        """Write into `destination` the tokenizer files an exported directory keeps beside the weights."""
         for name, tokenizer in zip(self.names, self.tokenizers, strict=True):
             folder = destination / ("tokenizer" + name.removeprefix("text_encoder"))
             tokenizer.save_pretrained(folder)

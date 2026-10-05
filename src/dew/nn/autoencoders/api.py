@@ -11,21 +11,22 @@ from dew.objectives.base import Variables
 
 
 class AutoEncoder(ABC):
-    """An encoder and decoder pair a latent diffusion model trains behind.
+    """Encodes images or video to the latents a latent diffusion model trains on, and decodes them back.
 
     A subclass encodes and decodes one batch of frames, `[B, H, W, C]` to
-    `[B, h, w, c]` and back; `encode` and `decode` here take video
-    `[B, T, H, W, C]` frame by frame unless the subclass encodes time itself
-    (`encode_video`, `decode_video`, `latent_shape`), and apply the latent
-    normalization. Latents are normalized as (z - latent_shift) * latent_scale
-    on the way out and inverted on the way in, the SD3 convention; each is
+    `[B, h, w, c]` and back. `encode` and `decode` here take video
+    `[B, T, H, W, C]` frame by frame, unless the subclass encodes time itself
+    (`encode_video`, `decode_video`, `latent_shape`), and they apply the
+    latent normalization. On the way out, latents are normalized as
+    (z - latent_shift) * latent_scale, and on the way in the normalization is
+    inverted, the SD3 convention. `latent_shift` and `latent_scale` are each
     one number or one per latent channel. The defaults are the identity; set
     them to the dataset's own latent mean and 1/std so the diffusion model
     sees roughly unit-variance, zero-mean inputs.
 
-    The weights are an argument, as a `ConditionEncoder`'s are: `params` holds
+    The weights are an argument, as a `ConditionEncoder`'s are. `params` holds
     what a run loaded, and every call takes the tree to use, so the layout
-    places the weights and the checkpoint carries them.
+    places the weights and the checkpoint stores them.
     """
 
     latent_shift: float | np.ndarray | jax.Array = 0.0
@@ -33,12 +34,19 @@ class AutoEncoder(ABC):
     params: Variables
 
     def to_json(self) -> dict:
-        """Declare this built-in autoencoder's constructor, without its parameters."""
+        """Return the record of this built-in autoencoder's constructor, without its parameters.
+
+        The base class raises `TypeError`; a built-in subclass returns its own
+        record.
+        """
         raise TypeError(f"{type(self).__name__} needs an explicit autoencoder record declaration")
 
     @classmethod
     def from_json(cls, record, *, params: Variables) -> AutoEncoder:
-        """Rebuild maintained autoencoders around the checkpoint's own parameters."""
+        """Rebuild a built-in autoencoder from its `record`, around the checkpoint's own `params`.
+
+        The built-in record is 'sd_vae'; any other name raises `ValueError`.
+        """
         from .sd_vae import StableDiffusionVAE
         if record['name'] == 'sd_vae':
             from dew.registry import resolve_dtype
@@ -56,12 +64,14 @@ class AutoEncoder(ABC):
     @abstractmethod
     def encode_batch(self, params, x: jnp.ndarray,
                      key: jax.Array | None = None) -> jnp.ndarray:
-        """Frames `[B, H, W, C]` to raw latents `[B, h, w, c]`; `key` draws a
-        stochastic encoder's sample, and None takes its mean."""
+        """Encode frames `[B, H, W, C]` to raw latents `[B, h, w, c]`.
+
+        `key` draws a stochastic encoder's sample, and None takes its mean.
+        """
 
     @abstractmethod
     def decode_batch(self, params, z: jnp.ndarray) -> jnp.ndarray:
-        """Raw latents `[B, h, w, c]` to frames `[B, H, W, C]`."""
+        """Decode raw latents `[B, h, w, c]` to frames `[B, H, W, C]`."""
 
     @property
     @abstractmethod
@@ -71,45 +81,45 @@ class AutoEncoder(ABC):
     @property
     @abstractmethod
     def latent_channels(self) -> int:
-        """c, the channels of a latent."""
+        """c, the number of channels in a latent."""
 
     def latent_shape(self, shape: tuple[int, ...]) -> tuple[int, ...]:
-        """The latent shape of one example of `shape`: `(H, W, C)` or, for
-        video, `(T, H, W, C)`."""
+        """Return the latent shape for one example of `shape`.
+
+        `shape` is `(H, W, C)` or, for video, `(T, H, W, C)`.
+        """
         *lead, height, width, _ = shape
         factor = self.downscale_factor
         return (*lead, height // factor, width // factor, self.latent_channels)
 
     def encode_video(self, params, x: jnp.ndarray, key: jax.Array | None = None) -> jnp.ndarray:
-        """Video `[B, T, H, W, C]` to raw latents, frame by frame."""
+        """Encode video `[B, T, H, W, C]` to raw latents, frame by frame."""
         batch_size, seq_len, height, width, channels = x.shape
         latent = self.encode_batch(params, x.reshape(-1, height, width, channels), key=key)
         return latent.reshape(batch_size, seq_len, *latent.shape[1:])
 
     def decode_video(self, params, z: jnp.ndarray) -> jnp.ndarray:
-        """Raw latents `[B, t, h, w, c]` to video, frame by frame."""
+        """Decode raw latents `[B, t, h, w, c]` to video, frame by frame."""
         batch_size, seq_len, height, width, channels = z.shape
         decoded = self.decode_batch(params, z.reshape(-1, height, width, channels))
         return decoded.reshape(batch_size, seq_len, *decoded.shape[1:])
 
     def encode(self, params, x: jnp.ndarray,
                key: jax.Array | None = None) -> jnp.ndarray:
-        """Images `[B, H, W, C]` or video `[B, T, H, W, C]` to normalized
-        latents."""
+        """Encode images `[B, H, W, C]` or video `[B, T, H, W, C]` to normalized latents."""
         latent = self.encode_video(params, x, key) if x.ndim == 5 else self.encode_batch(params, x, key=key)
         shift, scale = (jnp.asarray(value, latent.dtype) for value in (self.latent_shift, self.latent_scale))
         return (latent - shift) * scale
 
     def decode(self, params, z: jnp.ndarray) -> jnp.ndarray:
-        """Normalized latents `[B, h, w, c]` or `[B, t, h, w, c]` back to
-        images or video."""
+        """Decode normalized latents `[B, h, w, c]` or `[B, t, h, w, c]` back to images or video."""
         shift, scale = (jnp.asarray(value, z.dtype) for value in (self.latent_shift, self.latent_scale))
         z = z / scale + shift
         return self.decode_video(params, z) if z.ndim == 5 else self.decode_batch(params, z)
 
     def __call__(self, params, x: jnp.ndarray,
                  key: jax.Array | None = None) -> jnp.ndarray:
-        """Encode then decode."""
+        """Encode `x`, then decode it."""
         return self.decode(params, self.encode(params, x, key=key))
 
 
