@@ -638,29 +638,44 @@ class DiffusionObjective(Objective[Ratio]):
             samples = autoencoder.decode(params["autoencoder"], samples)
         return jnp.clip(samples, -1.0, 1.0)
 
+    def _rows(self, batch) -> int:
+        """How many samples a batch draws, one per real row: its images' count."""
+        return batch[self.inputs.sample.key].shape[0]
+
+    def _draw(self, params, batch, step: Step, limit: int | None = None) -> tuple[jax.Array, dict]:
+        """Sample the batch's conditions on every rank, agreeing at each phase.
+
+        The weights are the EMA copy when the step carries one and it is not
+        the objective's reference (`_ema_is_reference`), else the live ones.
+        `limit` caps the rows drawn, which is what a preview takes. Returns
+        the samples and the condition tokens behind them.
+        """
+        weights = params if step.ema is None or self._ema_is_reference else step.ema
+
+        def setup() -> tuple[int, dict]:
+            count, selected = self._rows(batch), self._sampling_batch(batch)
+            if limit is not None:
+                count = min(limit, count)
+                selected = jax.tree.map(lambda value: value[:count], selected)
+            return count, selected
+
+        count, selected = agreed("diffusion sample setup", setup)
+        samples = agreed("diffusion sample generation",
+                         lambda: self._sample(weights, selected, step.key, count=count))
+        return samples, {keyword: selected[condition.field]
+                         for keyword, condition in self.inputs.conditions.items()}
+
     def evaluate(self, params, batch, step: Step):
         """One generated sample for every real row, without display decoding."""
-        params = params if step.ema is None else step.ema
-        count = batch[self.inputs.sample.key].shape[0]
-        samples = self._sample(params, self._sampling_batch(batch), step.key, count=count)
+        samples, _ = self._draw(params, batch, step)
         assert self.artifact is not None
         return self.artifact(samples)
 
     def preview(self, params, batch, step: Step, *, scored=None):
-        """A separate small draw for display, with root-only caption decoding."""
-        def setup():
-            weights = params if step.ema is None else step.ema
-            count = min(VALIDATION_SAMPLES, batch[self.inputs.sample.key].shape[0])
-            return weights, count, self._sampling_batch(batch)
-
-        def generate():
-            selected = jax.tree.map(lambda value: value[:count], raw_batch)
-            return (self._sample(weights, selected, step.key, count=count),
-                    {keyword: selected[condition.field]
-                     for keyword, condition in self.inputs.conditions.items()})
-
-        weights, count, raw_batch = agreed("diffusion preview setup", setup)
-        samples, tokens = agreed("diffusion preview generation", generate)
+        """A separate small draw for display: up to `VALIDATION_SAMPLES` rows on
+        every process, gathered to the host, with captions decoded on process
+        zero; the other processes return None."""
+        samples, tokens = self._draw(params, batch, step, VALIDATION_SAMPLES)
         samples, tokens = collective_host((samples, tokens), phase="diffusion preview")
         if jax.process_index() != 0:
             return None
