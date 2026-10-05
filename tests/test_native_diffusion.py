@@ -88,7 +88,8 @@ def test_the_sdxl_base_hands_its_partial_walk_to_the_refiner_as_diffusers_does(s
     below it, held to tests/reference_error.py's rule against Diffusers'
     own SDXL base with denoising_end and refiner with denoising_start
     (tools/diffusers_handoff_reference.py): the base's latents, the
-    refiner's latents and their decoded images."""
+    refiner's latents and their decoded images. docs/concepts/inference.md
+    shows the mapping from strength and denoising_end/start to the grid."""
     run_check(saved_pipelines / "xl", "--case", "handoff")
 
 
