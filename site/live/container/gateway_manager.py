@@ -59,8 +59,9 @@ class LimitedKernelManager(KernelGatewayIOLoopKernelManager):
         os.chmod(connection, 0o400)
         directory = Path(self.ip).parent
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chown(directory, uid, uid)
         subprocess.run(['mount', '-t', 'tmpfs', '-o',
-                        f'size=16m,uid={uid},gid={uid},mode=0700,nosuid,nodev',
+                        f'size=1m,uid={uid},gid={uid},mode=0700,nosuid,nodev',
                         'tmpfs', str(directory)], check=True)
         arguments = ["/kernel.json" if arg == self.connection_file else arg for arg in kernel_cmd[3:]]
         command = [
