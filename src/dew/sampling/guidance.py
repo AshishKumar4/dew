@@ -1,25 +1,28 @@
 """Guidance as a wrapper around a denoiser.
 
-Every guidance reads a second prediction beside the conditional one and
-combines the two. `CFG` and `APG` read the same model without its condition,
-`CFGPlusPlus` renoises with that unconditional prediction, and `Autoguidance`
-reads a weaker model under the same condition.
+Every guidance computes a second prediction next to the conditional one and
+combines the two. `CFG` and `APG` evaluate the same model without its
+condition, `CFGPlusPlus` also renoises with that unconditional prediction,
+and `Autoguidance` evaluates a weaker model under the same condition.
 
-A guidance applied to a denoiser over a walk of N steps,
-`guidance.walk(denoise, N)`, is a `Walk`: each step's guided
-`(x_t, t) -> (x_0, epsilon)`, and whatever the guidance keeps from one step
-to the next: nothing for all but `APG` with momentum, whose running average
-of the guidance direction rides in the walk's state.
+A walk is one pass of the sampler over its N steps.
+`guidance.walk(denoise, N)` applies a guidance to a denoiser over such a
+walk and returns a `Walk`. The `Walk` gives each step's guided prediction
+`(x_t, t) -> (x_0, epsilon)` and holds whatever the guidance keeps from one
+step to the next. Only `APG` with momentum keeps anything: the walk's state
+holds its running average of the guidance direction.
 
-Every guidance's `interval` is the part of the walk it guides, in fractions
-of the walk, closed at both ends: step i of N is guided when start <= i / N
-<= stop, and the closing denoise is step N. A step decides once and every
-evaluation within it (a corrector, a midpoint, a stage) takes that decision,
-as Kynkaanniemi et al.'s own sampler and Diffusers' guiders decide. The
-paper's `guidance_interval=[a, b]` over N steps is `interval=(a / N,
-b / N)`, and a Diffusers guider's `start` and `stop`, which guide its steps
-[int(start N), int(stop N)), are `interval=(int(start N) / N,
-(int(stop N) - 1) / N)`.
+Every guidance's `interval` is the part of the walk it guides, as fractions
+of the walk. The interval is closed at both ends, so step i of N is guided
+when start <= i / N <= stop, and the closing denoise counts as step N. Each
+step decides once whether it is guided, and every evaluation within the step
+(a corrector, a midpoint, a stage) uses that decision. Kynkaanniemi et al.'s
+own sampler and Diffusers' guiders decide the same way.
+
+The paper's `guidance_interval=[a, b]` over N steps converts to
+`interval=(a / N, b / N)`. A Diffusers guider's `start` and `stop` guide its
+steps [int(start N), int(stop N)), which converts to
+`interval=(int(start N) / N, (int(stop N) - 1) / N)`.
 """
 
 from __future__ import annotations
@@ -43,13 +46,14 @@ Index = jax.Array | int
 
 @dataclass(frozen=True)
 class Walk:
-    """A guided denoiser over one walk and the state it carries.
+    """A guided denoiser for one walk, with the state the guidance keeps between steps.
 
-    `init(x_T)` is the state before the first step. `step(x, t, index,
-    state)` is the guided prediction step `index` starts from and the state
-    after it. `at(state, index)` is step `index`'s guided prediction under a
-    state without advancing it, which a solver's own evaluations within the
-    step (a corrector, a midpoint) and the closing denoise read.
+    `init(x_T)` returns the state before the first step.
+    `step(x, t, index, state)` returns the guided prediction at the start of
+    step `index` and the state after that step. `at(state, index)` returns
+    step `index`'s guided prediction function under a given state, without
+    advancing the state. The solver calls it for its own evaluations within a
+    step (a corrector, a midpoint) and for the closing denoise.
     """
 
     init: Callable[[jax.Array], Any]
@@ -58,13 +62,21 @@ class Walk:
 
     @classmethod
     def stateless(cls, predict: Callable[[Index], Predict]) -> Walk:
-        """The walk of `predict`, which maps a step's index to its guided prediction."""
+        """Return a walk that keeps no state between steps.
+
+        `predict` maps a step's index to that step's guided prediction.
+        """
         return cls(lambda x: (), lambda x, t, index, state: (predict(index)(x, t), state),
                    lambda state, index: predict(index))
 
     @classmethod
     def over(cls, denoise: Predict, guidance: Guidance | None, steps: int | jax.Array) -> Walk:
-        """`guidance`'s walk of `denoise` over `steps` steps, or the unguided walk."""
+        """Return `guidance`'s walk of `denoise` over `steps` steps.
+
+        When `guidance` is None, the walk is unguided. Raises `TypeError` when
+        `guidance` is given and `denoise` is not a continuous `Denoiser`, as
+        with the masked diffusion LM.
+        """
         if guidance is None:
             return cls.stateless(lambda index: denoise)
         if not isinstance(denoise, Denoiser):
@@ -114,22 +126,24 @@ class CFG:
     """Interval-limited classifier-free guidance (Kynkaanniemi et al. 2024).
 
     The guided prediction is uncond + scale (cond - uncond). Guidance hurts at
-    high noise and buys nothing at low noise, so outside `interval` the scale
-    drops to 1, which is exactly the plain conditional prediction. The
-    interval is in trajectory progress, 0 at pure noise and 1 at the clean
-    sample; the default covers all of it.
+    high noise and does not help at low noise, so outside `interval` the scale
+    is 1, which gives exactly the plain conditional prediction. The interval
+    is measured in progress along the trajectory, from 0 at pure noise to 1
+    at the clean sample, and the default covers all of it.
 
-    `rescale` is the guidance rescaling of Lin et al. 2023 ("Common Diffusion
-    Noise Schedules and Sample Steps are Flawed", section 3.4), Diffusers'
-    `guidance_rescale`: the guided output is rescaled to the per-sample
-    standard deviation of the conditional one and mixed back at that weight,
-    so 0 leaves the guided output alone and 1 takes the rescaled one. The
-    standard deviation is over everything but the batch axis, with the
-    unbiased correction the reference's `Tensor.std` applies.
+    `rescale` applies the guidance rescaling of Lin et al. 2023 ("Common
+    Diffusion Noise Schedules and Sample Steps are Flawed", section 3.4),
+    which Diffusers calls `guidance_rescale`. The guided output is rescaled
+    to the per-sample standard deviation of the conditional output, then
+    mixed with the unrescaled guided output at weight `rescale`. So 0 leaves
+    the guided output alone and 1 uses the rescaled one. The standard
+    deviation is taken over every axis but the batch axis, with the unbiased
+    correction that the reference's `Tensor.std` applies.
 
-    Guidance combines the model's raw outputs and lets the denoiser convert
-    once, so a source's clipping, dynamic thresholding or consistency
-    boundary sees the guided output rather than each branch separately.
+    The guidance combines the model's raw outputs, and the denoiser then
+    converts the combined output once. So a source's clipping, dynamic
+    thresholding or consistency boundary is applied once, to the guided
+    output, and never to the conditional or unconditional output alone.
     """
 
     scale: float
@@ -161,14 +175,17 @@ class CFG:
 
 @dataclass(frozen=True)
 class CFGPlusPlus:
-    """CFG++ (Chung et al. 2025, "CFG++: Manifold-constrained Classifier Free
-    Guidance for Diffusion Models", Algorithm 1): the clean prediction is
-    guided, uncond + scale (cond - uncond) with `scale` in [0, 1], and the
-    noise a step renoises with is the unconditional prediction's.
+    """Guides the clean prediction and renoises with the unconditional noise (CFG++).
 
-    The pair it returns is what DDIM's update, alpha x_0 + sigma epsilon,
-    reads; a solver that integrates from x_t alone rather than from that
-    pair takes plain CFG's trajectory instead.
+    This is Algorithm 1 of Chung et al. 2025, "CFG++: Manifold-constrained
+    Classifier Free Guidance for Diffusion Models". The clean prediction is
+    uncond + scale (cond - uncond) with `scale` in [0, 1], and the noise a
+    step renoises with is the unconditional prediction's noise. A `scale`
+    outside [0, 1] raises `ValueError`.
+
+    The guided pair (x_0, epsilon) is what DDIM's update, alpha x_0 + sigma
+    epsilon, reads. A solver that integrates from x_t alone, without that
+    pair, follows plain CFG's trajectory.
     """
 
     scale: float
@@ -195,18 +212,24 @@ class CFGPlusPlus:
 
 @dataclass(frozen=True)
 class APG:
-    """Adaptive projected guidance (Sadat et al. 2025, "Eliminating
-    Oversaturation and Artifacts of High Guidance Scales in Diffusion
-    Models"), as Diffusers' `AdaptiveProjectedGuidance` combines raw outputs.
+    """Adaptive projected guidance, combining raw outputs as Diffusers' `AdaptiveProjectedGuidance` does.
 
-    The guidance direction cond - uncond is averaged with `momentum` over the
-    walk (the paper's beta, negative to push away from earlier steps' update;
-    0 keeps none), its norm over everything but the batch axis is clipped at
-    `norm_threshold` (0 clips nothing), and its component parallel to the
-    conditional output is scaled by `eta`: uncond + scale (orthogonal + eta
-    parallel). eta 1 without clipping or momentum is CFG. Where guidance is
-    off (outside `interval`, or at scale 1) the average rests, as Diffusers'
-    buffer does.
+    The method is from Sadat et al. 2025, "Eliminating Oversaturation and
+    Artifacts of High Guidance Scales in Diffusion Models". The guided output
+    is uncond + scale (orthogonal + eta parallel), where the guidance
+    direction cond - uncond goes through three changes:
+
+    - `momentum` (the paper's beta) keeps a running average of the direction
+      over the walk. A negative value pushes away from earlier steps'
+      updates, and 0 keeps no average.
+    - The direction's norm, taken over every axis but the batch axis, is
+      clipped at `norm_threshold`. 0 clips nothing.
+    - The direction's component parallel to the conditional output is scaled
+      by `eta`.
+
+    With eta 1, no clipping and no momentum, this is CFG. Where guidance is
+    off (outside `interval`, or at scale 1), the running average stays as it
+    is, like Diffusers' buffer.
     """
 
     scale: float
@@ -250,15 +273,20 @@ class APG:
 
 @dataclass(frozen=True)
 class Autoguidance:
-    """Autoguidance (Karras et al. 2024, "Guiding a diffusion model with a bad
-    version of itself"): guide + scale (model - guide), where the guide is a
-    weaker model of the same task, smaller or less trained, read under the
-    same condition. NVlabs/edm2's `edm_sampler(gnet=...)` is the reference.
+    """Guides a model with a weaker version of itself (autoguidance).
 
-    `model` is the guide's module; its variables ride in the denoiser's under
-    `guide`, so they reach a compiled walk as arguments beside the model's.
-    Both share the process, and their raw outputs combine before the one
-    conversion, as `CFG`'s do.
+    The method is from Karras et al. 2024, "Guiding a diffusion model with a
+    bad version of itself", and NVlabs/edm2's `edm_sampler(gnet=...)` is the
+    reference. The guided output is guide + scale (main - guide), where main
+    is the output of the denoiser's own model. The guide is a weaker model
+    for the same task, smaller or less trained, and it is evaluated under the
+    same condition as the main model.
+
+    `model` is the guide's module. Its variables go in the denoiser's
+    variables under `guide`, so a compiled walk receives them as arguments
+    together with the main model's; `walk` raises `ValueError` when they are
+    missing. Both models use the same process, and their raw outputs are
+    combined before the single conversion, as in `CFG`.
     """
 
     scale: float
@@ -289,7 +317,7 @@ class Autoguidance:
 
 
 Guidance = CFG | CFGPlusPlus | APG | Autoguidance
-"""Every guidance `sample` walks, a union `isinstance` reads."""
+"""The guidance types `sample` accepts, as a union that `isinstance` can check."""
 
 
 __all__ = ["APG", "CFG", "Autoguidance", "CFGPlusPlus", "Guidance", "Walk"]
