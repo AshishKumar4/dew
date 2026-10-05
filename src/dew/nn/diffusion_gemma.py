@@ -20,12 +20,12 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.interop.weights import ParamTree, translate_parameters
 from dew.nn.attention import RMSNorm
 from dew.nn.backbones.causal_transformer import CausalTransformer, DecoderBank
 from dew.nn.moe import gated_product
 from dew.nn.multimodal import VisionConditioner
 from dew.nn.precision import at_least_fp32
-from dew.nn.text_encoders import checkpoint_array
 from dew.registry import models
 
 
@@ -192,7 +192,7 @@ class DiffusionGemma(nn.Module):
 
 def translate_weights(
     hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
-) -> dict[str, dict[str, np.ndarray]]:
+) -> ParamTree:
     """Self-conditioning parameters, cast per weight before the layout copy."""
     paths = {
         "pre_norm.weight": ("pre_norm", "scale"),
@@ -200,17 +200,20 @@ def translate_weights(
         "up_proj.weight": ("up_proj", "kernel"),
         "down_proj.weight": ("down_proj", "kernel"),
     }
-    params: dict[str, dict[str, np.ndarray]] = {}
-    for name, tensor in hf_tensors.items():
+    seen = set()
+
+    def path_of(name: str) -> tuple[str, ...]:
         bare = name.removeprefix("self_conditioning.")
         if bare not in paths:
             raise ValueError(f"unknown tensor name {name!r}")
-        module, key = paths[bare]
-        if module in params:
+        path = paths[bare]
+        if path[0] in seen:
             raise ValueError(f"duplicate self-conditioning tensor {name!r}")
-        leaf = checkpoint_array(tensor, param_dtype)
-        params[module] = {key: np.ascontiguousarray(leaf.T) if key == "kernel" else leaf}
-    missing = {path[0] for path in paths.values()} - set(params)
+        seen.add(path[0])
+        return path
+
+    params = translate_parameters(hf_tensors, path_of, param_dtype)
+    missing = {path[0] for path in paths.values()} - seen
     if missing:
         raise ValueError(f"missing self-conditioning tensors for {sorted(missing)}")
     return params
