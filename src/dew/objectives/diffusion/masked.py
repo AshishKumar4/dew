@@ -33,6 +33,7 @@ import optax
 
 from dew.artifacts import TextSamples, TokenScores, agreed, collective_host
 from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask
+from dew.inference.tasks import MaskedGeneration
 from dew.inputs import Field, InputSpec
 from dew.objectives.base import Aux, EMASpec, Objective, Ratio, Shown, Step, Variables
 from dew.objectives.lm.chunked import chunked_cross_entropy
@@ -41,7 +42,7 @@ from dew.registry import objectives
 from dew.sampling.sample import sample
 
 if TYPE_CHECKING:
-    from dew.inference.tasks import MaskedGeneration, Processor
+    from dew.inference.tasks import Processor
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.training.state import TrainState
 
@@ -60,6 +61,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
     """
 
     artifact = TextSamples
+    saved_task = MaskedGeneration
     shown: Mapping[str, Shown] = {
         "masked_accuracy": Shown(better="higher", percent=True), "masked_fraction": Shown(percent=True)}
 

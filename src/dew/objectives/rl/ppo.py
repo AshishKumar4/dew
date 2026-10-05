@@ -113,6 +113,7 @@ class PPOObjective(Objective[Ratio, Variables]):
     # critic's own has a direction.
     shown: Mapping[str, Shown] = {"loss": Shown(), "critic/loss": Shown(better="lower")}
 
+    saved_task = TextGeneration
     _ema_is_reference = True
 
     def __init__(self, model, seq_len: int, *, critic: nn.Module,
