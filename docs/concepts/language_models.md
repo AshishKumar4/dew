@@ -137,7 +137,7 @@ The binary files use the smallest unsigned dtype that holds the vocabulary. Two 
 
 ## LMObjective
 
-`LMObjective(model, seq_len, **options)` reads `batch["text"]` of shape `[B, seq_len + 1]`. Every auxiliary term is off until its argument is set.
+`LMObjective(model, seq_len, **options)` reads `batch["text"]` of shape `[B, seq_len + 1]`. `model` may be a loaded decoder bundle in place of the model (see [Pretrained checkpoints](#pretrained-checkpoints)). Every auxiliary term is off until its argument is set.
 
 | Argument | Default | Meaning |
 |---|---|---|
@@ -146,7 +146,7 @@ The binary files use the smallest unsigned dtype that holds the vocabulary. Two 
 | `head_chunks` | `4` | Vocabulary slices the tiled head scores in. `1` is the full pass. |
 | `head_tile` | `None` | Backward tile of the head, or `'whole'` / `'tiled'`. `None` keeps the whole logits where they fit. |
 | `samples` | `None` | `Samples` configuration for generated previews at evaluation. |
-| `pretrained` | `None` | A variables mapping to start from instead of a fresh init. |
+| `variables` | `None` | The tree to start from instead of a fresh init, whole or split by `freeze` or an adapter; a split is kept, so its `params` train and its `frozen` stays put. |
 | `loss_role` | `None` | Count only targets whose `text_roles` entry equals this `Role` (SFT). |
 | `balance_rate` | `None` | Aux-loss-free routing-bias update rate for mixture layers. |
 | `aux_loss_alpha`, `seq_aux` | `None`, `True` | DeepSeek V2 expert balance loss and its per-sequence form. |
@@ -154,7 +154,6 @@ The binary files use the smallest unsigned dtype that holds the vocabulary. Two 
 | `mtp_weight` | `None` | Weight of DeepSeek V3's multi-token prediction loss. |
 | `z_loss` | `0.0` | PaLM's squared log-partition auxiliary. |
 | `qk_stats` | `False` | Report per-head attention logit maxima, the key-head count and the head width for `muonclip`, which clips per query group as Megatron Core does and leaves an output gate's weights alone. |
-| `trainable` | `None` | `PathFilter` selecting the leaves the optimizer moves; the rest go under `frozen`. |
 | `token_accuracy` | `True` | Report argmax accuracy. |
 
 The step reports `ce`, `perplexity` and `token_accuracy`. `LMObjective` refuses a model built with `causal=False`.

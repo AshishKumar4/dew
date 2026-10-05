@@ -443,20 +443,24 @@ def test_the_warmup_starts_a_fresh_indexer_beside_a_dense_checkpoint():
 
 
 def test_the_sparse_phase_reads_the_warmup_tree():
-    """The warm-up's split tree hands over as one params collection, leaf
-    for leaf, and the plain objective reads it the same way."""
+    """The warm-up's split tree hands over to the sparse phase, which trains
+    the whole tree, as one params collection, leaf for leaf. A plain
+    objective keeps the split it is given, so it trains the indexer alone."""
     warmup = LMObjective(deepseek_stack(None), SEQ, indexer=IndexerTraining("warmup"))
     split = warmup.init(jax.random.key(0))
-    for objective in (LMObjective(deepseek_stack(4), SEQ, indexer=IndexerTraining("sparse"),
-                                  variables=split),
-                      LMObjective(deepseek_stack(4), SEQ, variables=split)):
-        params = objective.init(jax.random.key(1))
-        assert sorted(params) == ["params"]
-        leaves = dict(jax.tree_util.tree_leaves_with_path(params["params"]))
-        expected = dict(jax.tree_util.tree_leaves_with_path(split["params"]))
-        expected.update(jax.tree_util.tree_leaves_with_path(split[FROZEN]))
-        assert leaves.keys() == expected.keys()
-        assert all(bool(jnp.all(leaves[path] == expected[path])) for path in leaves)
+    params = LMObjective(deepseek_stack(4), SEQ, indexer=IndexerTraining("sparse"),
+                         variables=split).init(jax.random.key(1))
+    assert sorted(params) == ["params"]
+    leaves = dict(jax.tree_util.tree_leaves_with_path(params["params"]))
+    expected = dict(jax.tree_util.tree_leaves_with_path(split["params"]))
+    expected.update(jax.tree_util.tree_leaves_with_path(split[FROZEN]))
+    assert leaves.keys() == expected.keys()
+    assert all(bool(jnp.all(leaves[path] == expected[path])) for path in leaves)
+
+    kept = LMObjective(deepseek_stack(4), SEQ, variables=split).init(jax.random.key(1))
+    assert jax.tree.structure(kept) == jax.tree.structure(split)
+    assert all(bool(jnp.all(ours == theirs))
+               for ours, theirs in zip(jax.tree.leaves(kept), jax.tree.leaves(split), strict=True))
 
 
 def test_evaluation_and_scoring_read_the_split_tree():
