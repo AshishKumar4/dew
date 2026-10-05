@@ -57,7 +57,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
     """Trains a masked diffusion model on the MDLM negative ELBO.
 
     A batch holds `[B, seq_len]` token ids under `batch["text"]`, and packed
-    windows also carry `text_segment_ids` and `text_positions`.
+    windows also include `text_segment_ids` and `text_positions`.
     """
 
     artifact = TextSamples
@@ -180,8 +180,8 @@ class MaskedDiffusionObjective(Objective[Ratio]):
 
         One noise level and one masking are drawn from the pass's key, as in
         training. Dropout is off, and the averaged weights are used when the
-        run keeps them. Every real token counts: a masked token carries its
-        weighted cross entropy, a visible one carries zero, and a packed
+        run keeps them. Every real token counts: a masked token scores its
+        weighted cross entropy, a visible one scores zero, and a packed
         window's padding has no weight. So `perplexity` over a validation
         pass is the exponential of the ELBO bound per token, the number MDLM
         reports."""

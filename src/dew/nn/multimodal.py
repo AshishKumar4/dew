@@ -161,7 +161,7 @@ class MultimodalTransformer(nn.Module):
     """Conditions the shared decoder on images and audio, using the ordinary decoder cache and head.
 
     ``image_indices`` and ``audio_indices`` give, for each token slot, the
-    index of the soft feature that fills it, or -1 for a text token. The
+    index of the soft feature that replaces it, or -1 for a text token. The
     towers run during conditioned forward and prefill calls; later decode
     steps read the cached language states and do not run the encoders again.
     The parameters keep the existing `language_model`, tower and projector

@@ -112,7 +112,7 @@ class GRPOObjective(LMObjective):
     Session-mean takes each session's token mean and averages those over
     sessions, so a long session, or one split over several rows, counts as
     one. That is Agent Lightning's `per_rollout_mean`, and verl's
-    `seq-mean-token-mean` when a session is one row. The batch carries the
+    `seq-mean-token-mean` when a session is one row. The batch holds the
     weights in `session_weights`.
 
     Behavior corrections compare `behavior_log_probs` with the proximal
@@ -131,7 +131,7 @@ class GRPOObjective(LMObjective):
     masks. A TIS cap is refused in that mode, because the ratio is already
     current over behavior.
 
-    When a packed batch carries engine records, the loss replays them.
+    When a packed batch holds engine records, the loss replays them.
     `routed_experts`/`routed` make every router use the experts the engine
     used (R3). `support_ids`/`support_columns` renormalize each sampled id
     over the ids its top-k/top-p sampler kept, at `sampling_temperature`
