@@ -1,23 +1,23 @@
-"""The autoregressive transformer decoder every language model here trains.
+"""The autoregressive transformer decoder that every language model in Dew trains.
 
-By default, token embedding, rotary positions, pre-norm blocks of grouped-query
-causal attention and a gated MLP, a final RMSNorm, and an fp32 head. Attention goes
-through the one shared kernel path in dew.nn.attention, so a run picks
-reference/xla/cudnn/tpu the same way a diffusion run does, and decoding reuses
-the same fixed-size KV cache helpers.
+By default the model has a token embedding, rotary positions, pre-norm blocks of
+grouped-query causal attention and a gated MLP, a final RMSNorm, and an fp32 head.
+Attention goes through the shared kernel path in dew.nn.attention, so a run picks
+reference/xla/cudnn/tpu the same way a diffusion run does, and decoding uses the
+same fixed-size KV cache helpers.
 
-Parameter names mirror the HF decoder layout - embed_tokens,
+Parameter names follow the HF decoder layout: embed_tokens,
 layers_N.{input_layernorm, self_attn.{q,k,v,o}_proj, post_attention_layernorm,
-mlp.{gate,up,down}_proj}, norm, lm_head. A model family is supported only
-after its translator and same-weight reference parity test land. Gemma's two
-extra norms are the exception: HF calls them post_attention_layernorm and
-post_feedforward_layernorm even though they normalize sublayer outputs, so
-here they are attention_output_norm and mlp_output_norm and the pre-norms keep
-their names. dew.interop.hf_decoders does that rename.
+mlp.{gate,up,down}_proj}, norm, lm_head. Gemma's two extra norms are the
+exception. HF calls them post_attention_layernorm and post_feedforward_layernorm
+even though they normalize sublayer outputs, so here they are
+attention_output_norm and mlp_output_norm, and the pre-norms keep their names.
+dew.interop.hf_decoders does that rename. A model family is supported only after
+its translator and a same-weight parity test against the reference have landed.
 
-The block holds its token mixer in a slot: any module with the
+The block holds its token mixer in a slot. Any module with the
 (x, decode=..., positions=..., segment_ids=...) -> x signature of
-CausalSelfAttention becomes self_attn without the block changing, which is
+CausalSelfAttention can be self_attn without changes to the block, and that is
 where a linear-attention mixer goes.
 """
 
@@ -331,14 +331,14 @@ def _prefetched_run(banks, primed, cache, x, inputs, layer, count: int, *, follo
 
 
 class PipelineStage(nn.Module):
-    """The layers one pipeline stage holds, over one microbatch.
+    """Runs the layers of one pipeline stage over one microbatch.
 
-    The pipeline vmaps this module over the stage axis, so every stage runs
-    it over its own slice of the stacked layer weights and its variables
-    carry a leading stage axis that the view outside stacks and unstacks.
-    Layer `j` of a stage is `layers_j` here and `layers_{stage * count + j}`
-    in the stored tree; `specs` and `groups` are stage 0's, which every
-    stage repeats.
+    The pipeline vmaps this module over the stage axis, so each stage runs it
+    on its own slice of the stacked layer weights. Its variables therefore have
+    a leading stage axis, which the `StackView` outside stacks and unstacks.
+    Layer `j` of a stage is `layers_j` here and `layers_{stage * count + j}` in
+    the stored tree, where `count` is the number of layers per stage. `specs`
+    and `groups` describe stage 0, and every stage repeats them.
     """
     block: Block
     specs: tuple[LayerSpec, ...]
@@ -362,21 +362,23 @@ def _stack_leaves(*trees):
 
 @dataclasses.dataclass(frozen=True)
 class StackView:
-    """The layer stack's variables as its loops read them.
+    """Converts the layer stack's variables between their stored layout and the one its loops read.
 
-    Outside, every collection holds one subtree per layer, `layers_N`, the tree
-    a checkpoint stores and a Hugging Face loader fills. Inside a scanned run
-    the leaves stack on a leading layer axis under the run's name
-    (`layers_3_7`), and inside a pipeline on a leading stage axis under
-    `stages`; `stack` and `unstack` convert, so what a run reads, sows and
-    caches lands where the plain loop puts it.
+    Outside a loop, every collection holds one subtree per layer, `layers_N`.
+    That is the tree a checkpoint stores and a Hugging Face loader writes.
+    Inside a scanned run, the leaves are stacked on a leading layer axis under
+    the run's name (`layers_3_7`). Inside a pipeline, they are stacked on a
+    leading stage axis under `stages`. `stack` converts to the inside layout and
+    `unstack` converts back, so whatever a run reads, sows and caches ends up
+    where the plain loop would put it.
 
-    `banked` collections are already held the inside way, one array per run,
-    and are left alone both ways; `bank_names` says which bank a run's layers
-    are in, and `unstack` outside a scope reads one layer's slice at a time for
-    a save or export. A collection that entered the pipeline keeps `[stage,
-    ...]` leaves; one the loop created keeps `[iteration, stage, microbatch,
-    ...]`, each stage's real iterations being its microbatches in order.
+    The `banked` collections are already stored the inside way, one array per
+    run, and both methods leave them alone. `bank_names` returns the name of the
+    bank that holds each run's layers. Outside a scope, `unstack` reads one
+    layer's slice at a time, for a save or an export. Inside a pipeline, a
+    collection that entered it has `[stage, ...]` leaves, and one the loop
+    created has `[iteration, stage, microbatch, ...]` leaves; a stage's real
+    iterations are its microbatches, in order.
     """
     groups: tuple[tuple[int, int], ...]
     stages: int = 1
@@ -400,7 +402,7 @@ class StackView:
                 for stage in range(self.stages)]
 
     def bank_names(self) -> list[str]:
-        """Every run's stored name, in order: what a banked store's keys are."""
+        """Return every run's stored name, in order. A banked store uses these names as keys."""
         return [self._inside_name(first, count) or f'layers_{first}'
                 for first, count in self.groups]
 
@@ -481,20 +483,22 @@ class StackView:
 
 @dataclasses.dataclass(frozen=True)
 class DecoderBank:
-    """One decoder's stored layer namespace below every variables collection.
+    """Where one decoder's layer stack is stored, below every variables collection.
 
-    A container prefixes the namespace and leaves the view untouched: layer
-    groups, module names and RNG streams remain the decoder's. Shared scopes
-    declare one site even when several methods read the same parameters.
+    `namespace` is the module path to the decoder. A container module adds its
+    own name in front of the namespace and leaves `view` unchanged, so the layer
+    groups, module names and RNG streams stay the decoder's. A shared scope is
+    one site, even when several methods read the same parameters.
     """
     namespace: tuple[str, ...]
     view: StackView
     scanned: bool = True
-    """Whether the stack runs its banks under `scan`, which is what sequences
-    a host-resident bank's fetches one row at a time. A plain loop declares
-    the same banks, but nothing orders their fetches, so the compiler hoists
-    every layer's copy to the front and the whole stack lands on the device
-    at once; a host layout refuses it (`dew.training.execution.resident`)."""
+    """Whether the stack runs its banks under `scan`. The scan is what makes a
+    host-resident bank's fetches happen one row at a time. A plain loop declares
+    the same banks, but nothing orders their fetches, so the compiler moves
+    every layer's copy to the front and the whole stack is on the device at
+    once. A host layout therefore refuses a plain loop
+    (`dew.training.execution.resident`)."""
 
 
 def _on_stage_axis(leaf):
@@ -545,40 +549,42 @@ class CausalTransformer(nn.Module):
     """Decoder-only transformer over token ids: [B, S] int32 -> [B, S, vocab] fp32.
 
     The defaults train a model from scratch: multi-head attention, swiglu,
-    tied embeddings, no softcap. Every field an open decoder varies is a
-    field here, so loading Qwen3 or Gemma3 is a field mapping and not a
-    subclass; the field comments name the family that sets each one. Classic
-    GPT blocks are `norm_type='layer'`, `norm_bias`, an ungated `mlp`,
-    `mlp_bias` and learned positions, which advance from each decode row's
-    cache cursor.
+    tied embeddings, no softcap. Every setting that differs between open
+    decoders is a field here, so loading Qwen3 or Gemma3 is a mapping of config
+    fields and needs no subclass. The field comments name the family that sets
+    each one. A classic GPT block is `norm_type='layer'`, `norm_bias`, an
+    ungated `mlp`, `mlp_bias` and learned positions; the learned positions
+    advance from each decode row's cache cursor.
 
     `layer_types` is the pattern, one kind per layer, and `kinds` says what
-    a kind does. `kv_shared_layers` names the layers that share by index (a
-    trailing run for Gemma 3n/4, one after every indexer layer for GLM's
-    IndexShare). A sharing layer reads what the last earlier non-sharing
-    layer of its kind stashed: keys and values for attention, the indexer's
-    selection for MLA.
+    each kind does. `kv_shared_layers` lists the layers that share by index: a
+    trailing run of layers for Gemma 3n/4, or the layer after every indexer
+    layer for GLM's IndexShare. A sharing layer reads what the last earlier
+    non-sharing layer of its kind stored: keys and values for attention, or the
+    indexer's selection for MLA.
 
-    Active attention dropout runs the reference kernel, and an explicit
-    fused kernel that cannot drop probabilities is refused.
+    When attention dropout is active the model runs the reference kernel, and
+    it refuses an explicitly chosen fused kernel that cannot drop
+    probabilities.
 
-    Interleaved mRoPE (Qwen3.5's mrope_section) is `partial_rotary_factor`
-    for text: with one position per token the three grids' angles are equal,
-    so text-only input reduces to the partial rope exactly; image-grid
-    positions are not modelled. A `mixer` kind other than attention reads its
-    own record; the GQA geometry fields stay validated, so a translation
-    fills them consistently.
+    Interleaved mRoPE (Qwen3.5's mrope_section) is `partial_rotary_factor` for
+    text. With one position per token the three grids' angles are equal, so
+    text-only input reduces exactly to the partial rope; image-grid positions
+    are not modelled. A `mixer` kind other than attention reads its own record,
+    but the GQA geometry fields are still validated, so a translation has to
+    fill them consistently.
 
     MTP depth d pairs the previous depth's state at position p with the
-    embedding of the token at p + d and scores what follows p + d (arXiv
-    2412.19437, section 2.2), so each depth is one position shorter.
+    embedding of the token at p + d, and scores the token that follows p + d
+    (arXiv 2412.19437, section 2.2). Each depth is therefore one position
+    shorter than the one before it.
 
-    `scan_layers` runs each run of like layers (same parameter shapes and
-    computation, read off the resolved layers) as one scanned body, so
-    compile time stops growing with depth; the variables tree stays the
-    unscanned one (`StackView`). `init` always draws like runs under the
-    scan, once per run. A stage axis above one on the mesh runs the stack as
-    a pipeline (`_pipeline`).
+    With `scan_layers`, each run of like layers (layers whose resolved specs
+    give the same parameter shapes and computation) runs as one scanned body,
+    so compile time stops growing with depth. The variables tree stays the
+    unscanned one (`StackView`). `init` always draws a run of like layers under
+    the scan, once per run. When the mesh has a stage axis larger than one, the
+    stack runs as a pipeline.
     """
     vocab_size: int
     emb_features: int = 512
@@ -588,16 +594,19 @@ class CausalTransformer(nn.Module):
     head_dim: int | None = None  # None: emb_features // num_heads
     mlp: GatedActivation = "swiglu"  # 'swiglu' | 'geglu' | 'geglu_exact' | 'swigluoai', or Kimi K3's Situ
     mlp_bias: bool = False
-    """Bias both feed-forward projections; gelu, gelu_exact and relu are ungated."""
+    """Whether both feed-forward projections have a bias. The `mlp` activations gelu,
+    gelu_exact and relu give an ungated feed-forward."""
     mlp_features: int | tuple[int, ...] | None = None
-    """None: four times emb_features; a tuple: one width per layer (Gemma 3n);
-    0: no feed-forward (Mamba-2)."""
+    """The dense feed-forward width. None means four times `emb_features`, a
+    tuple gives one width per layer (Gemma 3n), and 0 means no feed-forward
+    (Mamba-2)."""
     max_seq_len: int = 2048
     position_embedding: Literal['rotary', 'learned'] = 'rotary'
     position_embedding_size: int | None = None
-    """Learned table size, None for max_seq_len, independent of the decode capacity."""
+    """The number of rows in the learned position table; None means `max_seq_len`.
+    It does not depend on the decode cache's capacity."""
     position_embedding_offset: int = 0
-    """Reserved rows before learned position zero, two in OPT checkpoints."""
+    """The number of reserved rows before learned position zero; OPT checkpoints have two."""
     rope_theta: float = 10000.0              # the base a kind does not override
     rope_scaling: RopeScaling | None = None  # Llama 3.1's ramp, unless a kind states its own
     partial_rotary_factor: float | None = None  # None: every dim rotates
@@ -612,7 +621,7 @@ class CausalTransformer(nn.Module):
     sandwich_norms: bool = False     # add a norm after each sublayer, as Gemma does
     pre_norms: bool = True           # norm each sublayer's input; False + sandwich is OLMo 3
     parallel_residual: bool = False
-    """Attention and feed-forward read the same residual, as GPT-NeoX does."""
+    """Whether attention and the feed-forward both read the same residual, as in GPT-NeoX."""
     qk_norm: bool = True
     qk_norm_scope: str = 'head'              # 'head' per head (Qwen3); 'projection' whole (OLMo 3)
     v_norm: bool = False                     # Gemma 4's scale-free values norm
@@ -627,33 +636,39 @@ class CausalTransformer(nn.Module):
     output_gate: bool = False                 # Qwen3.5 gates the attention branch
     embedding_scale: bool = False            # Gemma scales embeddings by sqrt(d)
     embedding_multiplier: float = 1.0
-    """Token embeddings times this before the first layer: muP's m_emb in
-    lm-engine, GraniteMoeHybrid's `embedding_multiplier`."""
+    """The factor that multiplies the token embeddings before the first layer:
+    muP's m_emb in lm-engine, and GraniteMoeHybrid's `embedding_multiplier`."""
     residual_multiplier: float = 1.0
-    """Every sublayer output times this before it joins the residual stream:
-    lm-engine's m_residual, GraniteMoeHybrid's `residual_multiplier`."""
+    """The factor that multiplies every sublayer output before it is added to the
+    residual stream: lm-engine's m_residual, and GraniteMoeHybrid's
+    `residual_multiplier`."""
     logits_scaling: float = 1.0
-    """The logits divided by this: lm-engine's m_width (`lm_logits *
-    (1 / m_width)`), GraniteMoeHybrid's `logits_scaling`. The final states
-    carry the division, in fp32, so every head that contracts them with
-    `head_weight` scores the same logits `__call__` returns."""
+    """The divisor of the logits: lm-engine's m_width (`lm_logits *
+    (1 / m_width)`), and GraniteMoeHybrid's `logits_scaling`. The division is
+    applied to the final states, in fp32, so every head that contracts them
+    with `head_weight` gets the same logits that `__call__` returns."""
+    # lm-engine's init_utils.py at 45b6b57b.
     initializer_range: float | None = None
-    """lm-engine's initialisation: the embedding table (and an untied head)
-    drawn from N(0, initializer_range^2), every hidden matrix (attention and
-    Mamba-2 projections, conv taps, router, experts, dense MLPs) from
-    N(0, (initializer_range / sqrt(logits_scaling))^2), biases zero and norms
-    one. With `logits_scaling` as m_width that is lm-engine's
-    `init_method="mup"`, and with it 1 its `"normal"` (init_utils.py at
-    45b6b57b). None keeps each module's own initializer."""
+    """The std of lm-engine's initialisation; None keeps each module's own
+    initializer.
+
+    When it is set, the embedding table (and an untied head) is drawn from
+    N(0, initializer_range^2), and every hidden matrix (attention and Mamba-2
+    projections, conv taps, router, experts, dense MLPs) from
+    N(0, (initializer_range / sqrt(logits_scaling))^2). Biases start at zero
+    and norms at one. With `logits_scaling` set to m_width this is lm-engine's
+    `init_method="mup"`, and with `logits_scaling` at 1 it is lm-engine's
+    `"normal"`."""
     depth_scaled_init: bool = False
-    """With `initializer_range`, the projections back into the residual stream
-    (o_proj, out_proj, down_proj) divide their std by sqrt(2 * num_layers),
-    lm-engine's `use_depth_scaled_init`."""
+    """Whether, with `initializer_range` set, the projections back into the
+    residual stream (o_proj, out_proj, down_proj) divide their std by
+    sqrt(2 * num_layers). This is lm-engine's `use_depth_scaled_init`."""
     final_logit_softcap: float | None = None
     tie_embeddings: bool = True
+    # Kimi K2.5's text-only wrapper path, modeling_kimi_k25.py:686-690.
     embedding_zero_ids: tuple[int, ...] = ()
-    """Placeholder ids looked up as token zero, without changing labels
-    (modeling_kimi_k25.py:686-690, the text-only wrapper path)."""
+    """Placeholder ids that the embedding lookup reads as token zero. The labels
+    keep the original ids."""
     dropout_rate: float = 0.0
     embedding_dropout_rate: float = 0.0
     attention_dropout_rate: float = 0.0
@@ -667,60 +682,69 @@ class CausalTransformer(nn.Module):
     mixture: Mixture | None = None        # some layers' feed-forward as `moe.SparseMLP`; None: dense
     use_double_wide_mlp: bool = False        # Gemma 4 doubles sharing layers' MLP width; needs sharing
     causal: bool = True
-    """False is full attention, the encoder a masked diffusion language model
-    denoises with; the parameter tree is the same either way."""
+    """Whether attention is causal. False gives full attention, the encoder that
+    a masked diffusion language model denoises with. The parameter tree is the
+    same either way."""
     per_layer_input_dim: int | None = None
-    """Gemma 3n/4 per-layer inputs: an extra table read per layer and added
-    to its input through its own gate."""
+    """The width of Gemma 3n/4 per-layer inputs, or None for a model without
+    them. Each layer reads its own slice of an extra table and adds it to its
+    input through its own gate."""
     per_layer_input_vocab: int | None = None  # None: vocab_size
     kv_shared_layers: tuple[int, ...] | None = None  # layers reusing a provider's K/V; None disables
     mixer: MixerBase | None = None         # None: today's attention; a kind value or its record
     num_nextn_predict_layers: int = 0         # MTP depths; their input/residual policy is independent below
     index_share_for_mtp_iteration: bool = False
     mtp_layer_type: str | None = None
-    """An explicit prediction-layer kind, which need not occur in the trunk."""
+    """The layer kind the prediction depths build their mixer from. It need not
+    occur in the trunk. None uses the full-attention kind when the pattern has
+    one, and the first layer's kind otherwise."""
     mtp_hyper_connections: HyperConnections | None = None
-    """None gives prediction depths plain residuals and normalized trunk inputs.
-    A stream depth explicitly opts in, independently of the trunk's residuals."""
+    """The residual streams of the prediction depths. None gives the depths
+    plain residuals and normalized trunk inputs. Setting it opts the depth into
+    streams, separately from the trunk's `hyper_connections`."""
     altup: AltUp | None = None             # Gemma 3n's residual copies (`dew.nn.gemma3n`); None disables
     laurel_rank: int | None = None         # Gemma 3n's learned augmented residual; None disables
     hyper_connections: HyperConnections | None = None  # mHC's stack of residual streams; None disables
     attention_residuals: AttentionResiduals | None = None
-    """Kimi K3's softmax over finished blocks of layers in place of the
-    running residual (`dew.nn.attention_residuals`); None disables."""
+    """Kimi K3's attention residuals (`dew.nn.attention_residuals`): a softmax
+    over finished blocks of layers that replaces the running residual. None
+    disables them."""
     engram: Engram | None = None
-    """DeepSeek-V4.1's n-gram lookups (`dew.nn.engram`): the layers it names
-    gate their table rows into the residual streams before their attention.
-    The tokenizer's compressed vocabulary is the `constants` collection's
-    `engram_hashes/token_map`, which a loaded checkpoint derives from its
-    tokenizer and a fresh model fills with each id modulo the compressed
+    """DeepSeek-V4.1's n-gram lookups (`dew.nn.engram`). Each layer it names
+    gates its table rows into the residual streams before its attention. The
+    tokenizer's compressed vocabulary is stored as `engram_hashes/token_map` in
+    the `constants` collection. A loaded checkpoint derives it from its
+    tokenizer, and a fresh model fills it with each id modulo the compressed
     vocabulary's size."""
     dspark: DSpark | None = None
-    """DeepSeek-V4.1's block drafter (`dew.nn.dspark`): its stages are
-    decoder blocks attending with its `layer_type` kind's V4 attention as a
-    `DSparkAttention`, and its target layers sow the stream means it reads
-    (`draft_context`). None is a model without one."""
+    """DeepSeek-V4.1's block drafter (`dew.nn.dspark`), or None for a model
+    without one. Its stages are decoder blocks that attend through a
+    `DSparkAttention` built from the V4 attention of its `layer_type` kind. Its
+    target layers sow the stream means that the drafter reads
+    (`draft_context`)."""
     swiglu_limit: float | None = None  # GLM-5.3-Flash's clamp before every gated MLP's activation
     activation_sparsity_pattern: tuple[float, ...] | None = None
-    """Gemma 3n's gaussian top-k, one fraction per layer."""
+    """Gemma 3n's gaussian top-k activation sparsity, one fraction per layer."""
     mask_token_id: int | None = None
-    """The vocabulary id a masked-diffusion objective corrupts to;
-    None is plain training."""
+    """The vocabulary id that a masked-diffusion objective corrupts tokens to.
+    None means plain training."""
     scan_layers: bool = False                 # runs of like layers under flax's scan
     bank_layers: int | None = None
-    """The most layers one scanned run holds, which is how many its parameter
-    bank stacks. A longer run of like layers splits into consecutive runs of
-    at most this many, each its own bank under its own name; None puts a
-    whole run in one bank. `scan_layers` and `init` read it: init draws each
-    run under one scan, so it decides the draw at a seed. The split is what
-    bounds the memory that building a host-resident bank and reading it back
-    cost, so a deep stack offloaded to the host sets it."""
+    """The most layers one scanned run holds, which is also how many layers its
+    parameter bank stacks. A longer run of like layers is split into
+    consecutive runs of at most this many, each with its own bank under its own
+    name. None keeps a whole run in one bank. `scan_layers` and `init` read it,
+    and because init draws each run under one scan, it also changes what init
+    draws for a given seed. The split bounds the memory needed to build a
+    host-resident bank and read it back, so set it for a deep stack that is
+    offloaded to the host."""
     remat: RematPolicy | None = None
-    """Recompute each block in the backward pass, keeping its inputs, any K/V
-    supplied to later layers and the residuals the policy names. A name from
-    `REMAT_POLICIES` or a record of save/offload residual names arrives from
-    a config; None recomputes nothing. Init and cached decode follow the
-    direct block path; stored parameters have the same layout."""
+    """The rematerialization policy. Each block is recomputed in the backward
+    pass, keeping its inputs, any K/V passed to later layers, and the residuals
+    the policy names. A config gives a name from `REMAT_POLICIES` or a record of
+    residual names to save or offload. None recomputes nothing. Init and cached
+    decode call the blocks directly, and the stored parameters have the same
+    layout either way."""
 
     def __post_init__(self):
         if self.layer_scalar not in (None, "frozen", "trainable"):
@@ -772,8 +796,8 @@ class CausalTransformer(nn.Module):
     @property
     def init_stds(self) -> tuple[float | None, float | None]:
         """The normal std of the hidden matrices and of the projections back
-        into the residual stream, or (None, None) for the modules' own
-        initializers (`initializer_range`)."""
+        into the residual stream. Both are None when `initializer_range` is
+        None, and the modules then use their own initializers."""
         if self.initializer_range is None:
             return None, None
         hidden = self.initializer_range / math.sqrt(self.logits_scaling)
@@ -800,9 +824,9 @@ class CausalTransformer(nn.Module):
 
     @property
     def hidden_features(self) -> int:
-        """The model's one feed-forward width, which the routed experts fall
-        back to and the prediction depths take; a model whose layers differ
-        has none."""
+        """The model's single feed-forward width. The routed experts fall back
+        to it and the prediction depths use it. A model whose layers have
+        different widths has none and raises `ValueError`."""
         widths = set(self.mlp_widths)
         if len(widths) != 1:
             raise ValueError(
@@ -818,7 +842,7 @@ class CausalTransformer(nn.Module):
         return tuple(self.layer_types)
 
     def kind_of(self, layer_type: str) -> "ResolvedKind":
-        """What the layers of `layer_type` do, the model's defaults included."""
+        """Return the `ResolvedKind` of `layer_type`, with the model's defaults where the kind is unset."""
         kind = (self.kinds or {}).get(layer_type, LayerKind())
         return ResolvedKind(
             window=kind.window,
@@ -832,7 +856,7 @@ class CausalTransformer(nn.Module):
 
     @property
     def hash_layers(self) -> set:
-        """The sparse layers routing by the mixture's token table."""
+        """The sparse layers that route by the mixture's token table."""
         mixture = self.mixture
         return set() if mixture is None or mixture.hash_layers is None else set(mixture.hash_layers)
 
@@ -846,7 +870,7 @@ class CausalTransformer(nn.Module):
 
     @property
     def sharing_layers(self) -> tuple[int, ...]:
-        """The layers that read another layer's stash, in order."""
+        """The sorted indices of the layers that read what another layer stored."""
         if self.kv_shared_layers is None:
             return ()
         outside = sorted(index for index in self.kv_shared_layers
@@ -859,13 +883,16 @@ class CausalTransformer(nn.Module):
 
     @property
     def kv_sharing(self) -> dict:
-        """Sharing layer index to the provider it reads, both of one layer type.
+        """A map from each sharing layer's index to the provider layer it reads.
 
-        A sharing layer owns no K/V (no indexer, for MLA) and reads the last
-        earlier non-sharing layer of its own type (modeling_gemma4.py,
-        Gemma4TextAttention; modeling_glm_moe_dsa.py:739-748 carries the
-        last full layer's top-k forward). Empty unless sharing is on.
+        A sharing layer has no K/V of its own (and, for MLA, no indexer). It
+        reads the last earlier non-sharing layer of its own type. The map is
+        empty unless `kv_shared_layers` is set, and a sharing layer with no
+        earlier provider raises `ValueError`.
         """
+        # As Gemma4TextAttention does in modeling_gemma4.py. GLM's IndexShare
+        # carries the last full layer's top-k forward the same way
+        # (modeling_glm_moe_dsa.py:739-748).
         sharing = set(self.sharing_layers)
         types = self.per_layer_types
         providers = {}
@@ -885,14 +912,15 @@ class CausalTransformer(nn.Module):
 
     def mixer_context(self, kind: "ResolvedKind", layer_type: str,
                       kv_shared: bool) -> MixerContext:
-        """One layer's mixer geometry: the kind's resolved values as a context.
+        """Return one layer's mixer geometry as a `MixerContext` built from the resolved kind.
 
-        `head_dim`, `rope_theta`, `window` and the two rotary ramps carry the
-        layer kind's overrides; a windowed kind rotates every dimension, so the
-        partial rotary belongs to the kinds that attend the whole sequence,
-        where Gemma 4 puts it. Every other field is the model's own of the same
-        name. A kind builds its `DecoderBlock` factory from this and its own
-        record; `setup` chooses the mixer there and nowhere else.
+        `head_dim`, `rope_theta`, `window` and the two rotary ramps take the
+        layer kind's overrides. A windowed kind rotates every dimension, so the
+        partial rotary applies only to the kinds that attend the whole
+        sequence, which is where Gemma 4 puts it. Every other field is the
+        model's field of the same name. A kind builds its `DecoderBlock` factory
+        from this context and its own record, and `setup` chooses the mixer
+        there and nowhere else.
         """
         resolved = {
             "num_kv_heads": kind.num_kv_heads, "head_dim": kind.head_dim,
@@ -908,21 +936,22 @@ class CausalTransformer(nn.Module):
 
     @property
     def bank_sites(self) -> tuple[DecoderBank, ...]:
-        """This decoder's stored stack: scanned runs, or one layer per bank.
+        """Where this decoder's layer stack is stored: scanned runs, or one layer per bank.
 
-        `groups` already says which is which. A scanned stack declares its
-        runs and a plain loop declares singletons, and `run_stack` fetches a
-        run of one the same way it fetches a longer one; `scanned` says
-        whether those fetches are sequenced, which a host layout requires.
+        `groups` already records which of the two it is. A scanned stack
+        declares its runs and a plain loop declares one-layer runs, and
+        `run_stack` fetches a one-layer run the same way it fetches a longer
+        one. `scanned` records whether those fetches are sequenced, which a host
+        layout requires.
         """
         bound = self if self.scope is not None else self.bind({})
         return (DecoderBank((), StackView(bound.groups), scanned=self.scan_layers),)
 
     def layer_kinds(self, types: Sequence[str]) -> dict[str, "ResolvedKind"]:
-        """Resolve every kind the pattern names, and the prediction depths'.
+        """Resolve every kind the pattern names, plus the kinds of the prediction depths and the drafter.
 
-        Raises when the pattern is not one kind per layer, or when `kinds`
-        describes a kind no layer has.
+        Raises `ValueError` when the pattern does not have one kind per layer,
+        or when `kinds` describes a kind that no layer has.
         """
         if len(types) != self.num_layers:
             raise ValueError(
@@ -940,7 +969,8 @@ class CausalTransformer(nn.Module):
         return {layer_type: self.kind_of(layer_type) for layer_type in set(types) | prediction_kinds}
 
     def refuse_unbuildable_mup(self, kinds: Mapping[str, "ResolvedKind"]):
-        """Raise for lm-engine's multipliers or init on a model that cannot carry them."""
+        """Raise `ValueError` if lm-engine's multipliers or initialisation are set on a model that
+        cannot apply them."""
         mup = (self.embedding_multiplier != 1.0 or self.residual_multiplier != 1.0
                or self.logits_scaling != 1.0 or self.initializer_range is not None)
         if mup and (self.num_nextn_predict_layers or self.hyper_connections is not None
@@ -967,7 +997,8 @@ class CausalTransformer(nn.Module):
             raise ValueError("depth_scaled_init scales initializer_range's std; set it")
 
     def refuse_unbuildable_dropout(self, kinds: Mapping[str, "ResolvedKind"]) -> None:
-        """Refuse invalid rates and a mixer that cannot drop probabilities."""
+        """Raise `ValueError` for a dropout rate outside [0, 1), or for attention dropout with a mixer that
+        cannot drop probabilities."""
         for field in ("embedding_dropout_rate", "attention_dropout_rate"):
             rate = getattr(self, field)
             if not 0 <= rate < 1:
@@ -978,7 +1009,8 @@ class CausalTransformer(nn.Module):
                     raise ValueError("attention_dropout_rate requires ordinary attention mixers")
 
     def refuse_unbuildable_classic_fields(self):
-        """Refuse norm, position and feed-forward combinations with no counterpart."""
+        """Raise `ValueError` for norm, position and feed-forward combinations that no supported
+        model uses."""
         if self.norm_type not in ('rms', 'layer'):
             raise ValueError(f'norm_type must be rms or layer, got {self.norm_type!r}')
         if self.norm_type == 'rms' and self.norm_bias:
@@ -1008,7 +1040,7 @@ class CausalTransformer(nn.Module):
             raise ValueError('prediction depths require RMSNorm and rotary positions')
 
     def refuse_unbuildable_kinds(self, kinds: Mapping[str, "ResolvedKind"]):
-        """Validate each kind's rotary, local-mask and grouped-head geometry."""
+        """Raise `ValueError` for a kind with invalid rotary, local-mask or grouped-head geometry."""
         for layer_type, kind in sorted(kinds.items()):
             if self.position_embedding == 'rotary' and kind.head_dim % 2:
                 raise ValueError(
@@ -1034,10 +1066,10 @@ class CausalTransformer(nn.Module):
                     f"heads of {layer_type!r} ({kind.num_kv_heads})")
 
     def refuse_unbuildable_fields(self, kinds: Mapping[str, "ResolvedKind"]):
-        """Raise for a field, or a pair of fields, this model cannot build.
+        """Raise `ValueError` for a field, or a pair of fields, that this model cannot build.
 
-        Each check names the field the caller set and what a model without
-        it looks like, so a translated config says which entry to fix.
+        Each error names the field the caller set and what a model without it
+        looks like, so whoever translated the config can see which entry to fix.
         """
         self.refuse_unbuildable_mup(kinds)
         self.refuse_unbuildable_dropout(kinds)
@@ -1120,8 +1152,8 @@ class CausalTransformer(nn.Module):
                 "model trained on plain next-token prediction")
 
     def refuse_unbuildable_stream_fields(self):
-        """Raise for the fields riding mHC's streams that cannot be built:
-        engram's layers, DSpark's stages and the Single-Pass schedule."""
+        """Raise `ValueError` for settings on mHC's residual streams that cannot be
+        built: engram's layers, DSpark's stages and the Single-Pass schedule."""
         engram, hc = self.engram, self.hyper_connections
         if engram is not None:
             if hc is None:
@@ -1146,11 +1178,11 @@ class CausalTransformer(nn.Module):
                              "streams, which no stream prediction depth reads")
 
     def feedforward_factories(self):
-        """Build the three feed-forward factories a layer can be given.
+        """Build the three feed-forward factories a layer can use.
 
-        Returns the dense gated MLP, the routed experts, and Gemma 4's
-        parallel branch, each a partial the block calls with a name. A
-        model with no mixture has only the first.
+        Returns the dense gated MLP, the routed experts and Gemma 4's parallel
+        branch, each a partial that the block calls with a name. A model with
+        no mixture gets only the first, and None for the other two.
         """
         init_std, output_init_std = self.init_stds
         # Every gated MLP in the model shares the activation and the clamp:
@@ -1232,9 +1264,11 @@ class CausalTransformer(nn.Module):
         return gated_mlp, routed, parallel
 
     def setup(self):
-        """Build the embeddings, the layers (one `LayerSpec` each, built by
-        `block`, scanned in `groups`), the prediction depths `mtp`, the final
+        """Build the embeddings, the layers, the prediction depths `mtp`, the final
         `norm`, and `lm_head` when the embeddings are not tied.
+
+        Each layer has one `LayerSpec`, is built by `block`, and is scanned in
+        `groups`.
         """
         types = self.per_layer_types
         kinds = self.layer_kinds(types)
@@ -1548,24 +1582,24 @@ class CausalTransformer(nn.Module):
         return self._logits(x)
 
     def states_and_logits(self, tokens, **kwargs):
-        """The prediction input states and logits from one forward.
+        """Return the prediction-input states and the logits from one forward pass.
 
-        A speculative decoder verifies with both: the logits give the target
-        distribution and the states seed the next block's prediction depths:
-        normalized states normally, uncollapsed residual streams for V4.
+        A speculative decoder verifies with both. The logits give the target
+        distribution, and the states seed the next block's prediction depths.
+        The states are the normalized states, except for V4, where they are
+        the uncollapsed residual streams.
         """
         x, prediction = self.hidden_and_mtp_inputs(tokens, **kwargs)
         return prediction, self._logits(x)
 
     def states_and_logits_at(self, tokens, slots, **kwargs):
-        """The prediction input states, and the logits of one slot per row,
-        or of `[rows, K]` slots.
+        """Return the prediction-input states and the logits at one slot per row, or at `[rows, K]` slots.
 
-        A prefill scores the position the first draw reads, `slots`, and no
-        other: the head over every prompt position is the largest array the
-        forward allocates, [rows, width, vocab], and a decoder keeps one row
-        of it. Gathering the state before the head leaves the head [rows,
-        features] of work.
+        A prefill needs logits only at `slots`, the positions the first draw
+        reads. The head over every prompt position would be the largest array
+        the forward allocates, [rows, width, vocab], and a decoder keeps only
+        one row of it. Gathering the states before the head cuts the head's
+        work to [rows, features].
         """
         x, prediction = self.hidden_and_mtp_inputs(tokens, **kwargs)
         rows = jnp.arange(x.shape[0]).reshape(-1, *(1,) * (jnp.ndim(slots) - 1))
@@ -1590,12 +1624,14 @@ class CausalTransformer(nn.Module):
                           positions=None, segment_ids=None, input_embeddings=None,
                           attention_mask=None,
                           image_groups=None, rotary_positions=None):
-        """One final-normed state array per shifted prediction depth.
+        """Return one final-normed state array per shifted prediction depth.
 
-        A depth combines the preceding hidden state and the next token's
-        embedding, including any media replacement. Its positions are the
-        next token's positions. Both ends must be valid and belong to the
-        same packed document; padded intermediates cannot become keys.
+        Each depth combines the preceding hidden state with the next token's
+        embedding, including any media replacement, and uses the next token's
+        positions. A pair counts only when both of its positions are valid and
+        belong to the same packed document, so padded positions in between
+        never become keys. A sequence no longer than the number of depths
+        raises `ValueError`.
         """
         if self.mtp and tokens.shape[1] <= len(self.mtp):
             raise ValueError("prediction depths need a sequence longer than their depth count")
@@ -1629,7 +1665,7 @@ class CausalTransformer(nn.Module):
     def mtp_logits(self, hidden, tokens, train: bool = False, positions=None,
                    segment_ids=None, input_embeddings=None,
                    attention_mask=None, image_groups=None, rotary_positions=None):
-        """The shared language head over each prediction depth's hidden states."""
+        """Return the shared language head's logits for each prediction depth's hidden states."""
         return [self._logits(state) for state in self.mtp_hidden_states(
             hidden, tokens, train=train, positions=positions, segment_ids=segment_ids,
             input_embeddings=input_embeddings, attention_mask=attention_mask, image_groups=image_groups,
@@ -1638,14 +1674,16 @@ class CausalTransformer(nn.Module):
     def mtp_step(self, hidden, tokens, *, depth: int = 0, positions=None,
                  input_embeddings=None, attention_mask=None, rotary_positions=None,
                  decode: bool = False, prediction_phase: PredictionPhase = "ordinary"):
-        """One unshifted prediction step, optionally appending its own KV cache.
+        """Run one unshifted prediction step, optionally appending to the depth's own KV cache.
 
-        Call init_mtp_cache before cached steps. `hidden` is the target model's
-        preceding state and tokens or input_embeddings the candidate next token, as
-        in vLLM's Qwen3_5MultiTokenPredictor. Returns the step's logits and hidden
-        state, which a chained draft's next step reads in place of the target's.
-        With index_share_for_mtp_iteration, cached extend publishes index
-        selections and draft reuses them; ordinary always recomputes.
+        Call `init_mtp_cache` before cached steps. `hidden` is the target
+        model's preceding state, and `tokens` or `input_embeddings` give the
+        candidate next token, as in vLLM's Qwen3_5MultiTokenPredictor. Returns
+        the step's logits and hidden state; a chained draft's next step reads
+        that state in place of the target's. With
+        `index_share_for_mtp_iteration`, a cached "extend" step publishes its
+        index selections and a "draft" step reuses them, while "ordinary"
+        always recomputes them.
         """
         if prediction_phase not in ("ordinary", "extend", "draft"):
             raise ValueError("prediction_phase must be ordinary, extend or draft")
@@ -1660,10 +1698,11 @@ class CausalTransformer(nn.Module):
         return self._logits(state), prediction
 
     def token_embeddings(self, tokens):
-        """The embeddings a prediction depth pairs with `tokens`.
+        """Return the embeddings a prediction depth pairs with `tokens`.
 
-        `mtp_hidden_states` reads the unscaled table, so this is that lookup
-        and nothing else: a drawn token is text, and media never reaches it.
+        `mtp_hidden_states` reads the unscaled table, so this method does that
+        lookup, with `embedding_zero_ids` read as token zero, and nothing else.
+        A drawn token is always text, so no media embedding replaces it.
         """
         lookup = tokens
         for token_id in self.embedding_zero_ids:
@@ -1671,32 +1710,37 @@ class CausalTransformer(nn.Module):
         return self.embed_tokens(lookup)
 
     def scaled_embeddings(self, x):
-        """Token embeddings `x` as the first layer reads them: times
-        sqrt(emb_features) under `embedding_scale` (Gemma), then times
-        `embedding_multiplier` (lm-engine, GraniteMoeHybrid). The decoder, the
-        multimodal wrapper and the Qwen-Image conditioner all scale here.
+        """Return the token embeddings `x` scaled the way the first layer reads them.
 
-        Gemma casts embed_scale to the embedding weight dtype
-        (modeling_gemma3.py:117); the lookup holds that table in fp32, so the
-        factor stays fp32 and only the product rounds (a bf16 factor would be 34.0
-        at hidden 1152, not 33.941...). lm-engine multiplies in fp32 opmath
-        (mixins/dense/base.py at 45b6b57b), which `scaled` keeps.
+        `x` is multiplied by sqrt(emb_features) when `embedding_scale` is set
+        (Gemma), then by `embedding_multiplier` (lm-engine, GraniteMoeHybrid).
+        The decoder, the multimodal wrapper and the Qwen-Image conditioner all
+        scale here.
+
+        Gemma casts embed_scale to the embedding weight dtype. The lookup holds
+        that table in fp32, so the factor stays fp32 and only the product is
+        rounded (a bf16 factor would be 34.0 at hidden size 1152, not
+        33.941...). lm-engine multiplies in fp32, and `scaled` does the same.
         """
+        # Gemma's cast: modeling_gemma3.py:117. lm-engine's fp32 opmath:
+        # mixins/dense/base.py at 45b6b57b.
         if self.embedding_scale:
             x = (x * jnp.asarray(math.sqrt(self.emb_features),
                                  self.embed_tokens.embedding.dtype)).astype(x.dtype)
         return scaled(x, self.embedding_multiplier)
 
     def draft(self, context, tokens, *, decode: bool = True, valid=None, choose=None):
-        """DSpark's draft after each row's last context position.
+        """Draft a DSpark block after each row's last context position.
 
-        `context` `[B, M, targets * D]` comes from `draft_context` (the target
-        layers' sown stream means), `valid` `[B, M]` marks its real positions and
-        `tokens` `[B]` are drawn after it. Returns `(ids [B, block + 1], logits
-        [B, block, vocab], confidence [B, block])`, drafting by `choose(index,
-        logits)`, greedily when None (`dew.nn.dspark.draft`). Cached, call
-        `init_draft_cache` first; `tokens` None only appends context and `context`
-        None drafts after what the windows hold.
+        `context` `[B, M, targets * D]` comes from `draft_context` (the stream
+        means the target layers sow), `valid` `[B, M]` marks its real
+        positions, and `tokens` `[B]` are the tokens drawn after it. Returns
+        `(ids [B, block + 1], logits [B, block, vocab], confidence [B, block])`.
+        Tokens are chosen by `choose(index, logits)`, or greedily when `choose`
+        is None (`dew.nn.dspark.draft`). For a cached draft, call
+        `init_draft_cache` first. With `tokens` None the call only appends
+        context, and with `context` None it drafts after what the windows
+        already hold. A model without a drafter raises `ValueError`.
         """
         if self.dspark is None:
             raise ValueError("this model has no DSpark drafter")
@@ -1706,30 +1750,35 @@ class CausalTransformer(nn.Module):
                             hc.hc_mult, context, tokens, decode=decode, valid=valid, choose=choose)
 
     def reach_drafter(self, tokens, dtype):
-        """Create the DSpark drafter's parameters, which no forward reaches, by
-        drafting after `tokens` over a context of the width its first stage
-        projects."""
+        """Create the DSpark drafter's parameters, which no forward pass reaches.
+
+        It drafts after `tokens` over a zero context as wide as the drafter's
+        first stage projects.
+        """
         assert self.dspark is not None
         width = len(self.dspark.target_layers) * self.emb_features
         self.draft(jnp.zeros((tokens.shape[0], 1, width), dtype), tokens[:, -1], decode=False)
 
     def draft_context(self, prediction_inputs: Mapping) -> jax.Array:
-        """DSpark's context `[B, S, targets * D]` from the `prediction_inputs`
-        a forward sows when the caller makes them mutable: each target
-        layer's stream mean, concatenated in `target_layers` order."""
+        """Return DSpark's context `[B, S, targets * D]` from `prediction_inputs`.
+
+        A forward pass sows `prediction_inputs` when the caller makes that
+        collection mutable. The context is each target layer's stream mean,
+        concatenated in `target_layers` order.
+        """
         assert self.dspark is not None
         return jnp.concatenate([prediction_inputs[f'layers_{layer}']['draft_context']
                                 for layer in self.dspark.target_layers], axis=-1)
 
     def init_draft_cache(self, batch_size: int):
-        """Allocate the drafter's window caches, apart from the trunk's."""
+        """Allocate the drafter's window caches, separately from the trunk's cache."""
         assert self.dspark is not None
         width = len(self.dspark.target_layers) * self.emb_features
         self.draft(jnp.zeros((batch_size, 1, width), self.dtype or jnp.float32),
                    jnp.zeros((batch_size,), jnp.int32), decode=True)
 
     def init_mtp_cache(self, batch_size: int):
-        """Allocate prediction-layer caches independently of the trunk cache."""
+        """Allocate the prediction depths' caches, separately from the trunk's cache."""
         shape = ((batch_size, 1, self.emb_features) if self.mtp_hyper_connections is None else
                  (batch_size, 1, self.mtp_hyper_connections.hc_mult, self.emb_features))
         for block in self.mtp:
@@ -1738,7 +1787,7 @@ class CausalTransformer(nn.Module):
                   prediction_phase="extend" if self.index_share_for_mtp_iteration else "ordinary")
 
     def hidden_states(self, tokens, **kwargs):
-        """The final normalized states, excluding the vocabulary projection."""
+        """Return the final normalized states, without the vocabulary projection."""
         return self.hidden_and_mtp_inputs(tokens, **kwargs)[0]
 
     def hidden_and_mtp_inputs(self, tokens, train: bool = False, decode: bool = False,
@@ -1747,25 +1796,28 @@ class CausalTransformer(nn.Module):
                               attention_mask=None, image_groups=None, rotary_positions=None,
                               attention_pairwise_mask=None, attention_key_positions=None,
                               routed_experts=None, routed=None, media_mask=None, admitted=None):
-        """The final normalized states and the prediction depth's input.
+        """Return the final normalized states and the prediction depths' input.
 
-        V4's depth reads the raw residual streams before the collapse head and final
-        norm (inference/model.py MTPBlock.forward at b5968e9); other depths read the
-        final normalized states. Packed `positions` and `segment_ids` reach the
-        layers.
+        V4's depth reads the raw residual streams from before the collapse head
+        and the final norm; other depths read the final normalized states.
+        Packed `positions` and `segment_ids` are passed on to the layers.
 
-        `input_embeddings` `[B, S, D]` replace the scaled token embeddings, for
-        a caller fusing another encoder; the token ids still feed per-layer
-        inputs and routing.
-        `attention_pairwise_mask` is an explicit [B, queries, keys] visibility mask
-        for ordinary attention, with optional `attention_key_positions` [B, keys]
-        for local windows; both are call-local cached-read metadata.
-        `routed_experts` `[B, S, layers, top_k]` replays a rollout engine's routing
-        (vLLM's `routed_experts`, SGLang's `meta_info.routed_experts`) with `routed`
-        `[B, S]` marking covered tokens (`dew.nn.moe.Routes`). `media_mask` [B, S]
-        marks positions a media encoder fills, which engram keeps out of n-grams
-        and a media-biased router selects for. `admitted` makes a cached call a
-        serving step's mixed one (`dew.nn.inputs.Admitted`).
+        - `input_embeddings` `[B, S, D]` replace the scaled token embeddings,
+          for a caller that fuses in another encoder's output. The token ids
+          still feed the per-layer inputs and routing.
+        - `attention_pairwise_mask` is an explicit [B, queries, keys]
+          visibility mask for ordinary attention, and the optional
+          `attention_key_positions` [B, keys] give key positions for local
+          windows. Both describe the cached reads of this call only.
+        - `routed_experts` `[B, S, layers, top_k]` replays a rollout engine's
+          routing (vLLM's `routed_experts`, SGLang's
+          `meta_info.routed_experts`), and `routed` `[B, S]` marks the tokens
+          it covers (`dew.nn.moe.Routes`).
+        - `media_mask` [B, S] marks the positions a media encoder fills.
+          Engram keeps them out of its n-grams, and a media-biased router
+          selects for them.
+        - `admitted` makes a cached call a serving step's mixed call
+          (`dew.nn.inputs.Admitted`).
         """
         attention_metadata = self._attention_metadata(
             tokens, decode, positions, attention_mask, image_groups, rotary_positions,
@@ -1811,6 +1863,7 @@ class CausalTransformer(nn.Module):
             # head that contracts them, the chunked losses' included, as
             # lm-engine's logits * (1 / m_width) does.
             hidden = hidden.astype(jnp.float32) / jnp.float32(self.logits_scaling)
+        # V4's depth input: inference/model.py MTPBlock.forward at b5968e9.
         prediction = hidden if self.mtp_hyper_connections is None else streams
         if (self.mtp_hyper_connections is not None and not self.is_initializing()
                 and self.is_mutable_collection('prediction_inputs')):
@@ -1848,16 +1901,17 @@ class CausalTransformer(nn.Module):
 
     def stack(self, x, *, train: bool, decode: bool, positions, segment_ids,
               per_layer_input, attention_metadata=None):
-        """The layer stack over `x`: the plain loop, the scanned runs, or the
-        pipeline over the mesh's stages.
+        """Run the layer stack over `x` as the plain loop, as scanned runs, or as a pipeline over the stages.
 
-        `init` draws like runs under the scan and unstacks them, so the tree is the
-        plain loop's; a stage mesh or `decode` runs the plain loop. `scan_layers`
-        or a stage axis runs under `StackView`, stacking the leaves while the loops
-        run. The loops carry one residual dtype, so the stream enters in the dtype
-        it settles in (`residual_dtype`). A store built bank by bank
-        (`dew.inference.banks`) already holds one array per run, which the view
-        leaves alone.
+        `init` draws like runs under the scan and then unstacks them, so the
+        tree is the plain loop's; under a stage mesh or with `decode`, init
+        runs the plain loop. With `scan_layers` or a stage axis, the stack runs
+        under a `StackView`, which stacks the leaves while the loops run. The
+        loops carry one residual dtype, so the stream enters in the dtype it
+        settles in (`residual_dtype`). A store built bank by bank
+        (`dew.inference.banks`) already holds one array per run, and the view
+        leaves it alone. A pipeline raises `LayoutRefused` for `decode` and
+        for a banked store.
         """
         stages = pipeline_stages()
         # A seeded initialization (PTQ's abstract annotation pass) reads the
@@ -1936,14 +1990,16 @@ class CausalTransformer(nn.Module):
         return run(self, view, x, train, decode, positions, segment_ids, per_layer_input, attention_metadata)
 
     def banked_collections(self) -> tuple[str, ...]:
-        """The collections whose layer subtrees the store holds as banks.
+        """Return the collections whose layer subtrees the store holds as banks.
 
-        A store built per layer holds `layers_0`, one built bank by bank each
-        multi-layer run's name, `layers_0_15`; a run of one is the same either way.
-        A collection holding a run's bank beside its layers with different leaves
-        (a host layout's frozen leaves) is not banked, since its rows still stack
-        (`StackView.stack`). A bank and a row holding the same leaf, or some banks
-        and not others with no rows, is refused rather than guessed.
+        A store built per layer holds `layers_0`, and a store built bank by bank
+        holds each multi-layer run under the run's name, such as `layers_0_15`.
+        A run of one layer looks the same either way. A collection that holds a
+        run's bank beside its layers, with different leaves in each (a host
+        layout's frozen leaves), is not banked, because its rows still stack
+        (`StackView.stack`). A bank and a row that hold the same leaf raise
+        `ValueError`, and so do some banks without the others when there are
+        no rows.
         """
         runs = {group_name(first, count): [f'layers_{index}' for index in range(first, first + count)]
                 for first, count in self.groups if count > 1}
@@ -1981,14 +2037,14 @@ class CausalTransformer(nn.Module):
 
     def residual_dtype(self, x, *, train: bool, decode: bool, positions, segment_ids,
                        per_layer_input, attention_metadata=None) -> jnp.dtype:
-        """The dtype the residual stream settles in: `x`'s promoted with what
-        the first layer returns for it.
+        """Return the dtype the residual stream settles in: `x`'s promoted with the first layer's output.
 
-        A scan carries one dtype through, and each pipeline stage takes the one the
-        stage before returns; under a bf16 policy the dense feed-forward returns
-        fp32, so the loops take fp32 from the start. The layer runs abstractly in
-        its own scope (no cache, nothing sown, placeholder RNG keys), and a banked
-        store answers from its first bank's first row without fetching it.
+        A scan carries one dtype through, and each pipeline stage takes the
+        dtype the stage before returns. Under a bf16 policy the dense
+        feed-forward returns fp32, so the loops use fp32 from the start. The
+        first layer runs abstractly in its own scope (no cache, nothing sown,
+        placeholder RNG keys), and a banked store answers from its first
+        bank's first row without fetching it.
         """
         layer, scope = self.layers[0], self.layers[0].scope
         assert scope is not None
@@ -2004,9 +2060,11 @@ class CausalTransformer(nn.Module):
         return jnp.result_type(streams.dtype, output.dtype)
 
     def first_layer_shapes(self) -> dict:
-        """The stack's first layer's variables as shape/dtype structs: layer 0's,
-        a bank's first row with the layer axis dropped, or layer 0's completed by
-        the bank's (`banked_collections`). Nothing is read, fetched or sliced.
+        """Return the stack's first layer's variables as shape/dtype structs.
+
+        These are layer 0's variables, a bank's first row with the layer axis
+        dropped, or layer 0's variables completed by the bank's
+        (`banked_collections`). Nothing is read, fetched or sliced.
         """
         banked = self.banked_collections()
         first = StackView(self.groups).bank_names()[0]
@@ -2034,12 +2092,12 @@ class CausalTransformer(nn.Module):
         return variables
 
     def stage_layers(self, stages: int) -> int:
-        """Layers per stage when the stack splits into `stages`, or why it cannot.
+        """Return the number of layers per stage when the stack splits into `stages`.
 
-        Every stage runs one program, so layer `j` of every stage must match layer
-        `j` of the first (kind, feed-forward, width, KV role); a pattern that does
-        not repeat every `num_layers / stages` layers is refused with the first
-        differing pair.
+        Every stage runs one program, so layer `j` of every stage must match
+        layer `j` of the first stage in kind, feed-forward, width and KV role.
+        A pattern that does not repeat every `num_layers / stages` layers raises
+        `LayoutRefused`, and the error names the first pair that differs.
         """
         if self.num_layers % stages:
             raise LayoutRefused(
@@ -2185,14 +2243,15 @@ class CausalTransformer(nn.Module):
         return LayerInputs(embeddings=embeddings, experts=routed_experts, routed=coverage)
 
     def per_layer_inputs(self, tokens, inputs_embeds):
-        """Every layer's input signal `[B, S, L, P]` (Gemma 3n/4 PLE).
+        """Return every layer's input signal `[B, S, L, P]` (Gemma 3n/4 PLE).
 
-        The token-identity component is the packed table's row for each
-        token, scaled like the main embedding; the context component is the
-        input embeddings projected down, scaled and normed. Their sum over
-        sqrt(2) is what each layer's gate multiplies in
-        (modeling_gemma4.py, get_per_layer_inputs/project_per_layer_inputs).
+        The token-identity part is the packed table's row for each token,
+        scaled like the main embedding. The context part is the input
+        embeddings projected down, scaled and normed. Each layer's gate
+        multiplies in their sum divided by sqrt(2). A model without
+        `per_layer_input_dim` raises `ValueError`.
         """
+        # modeling_gemma4.py, get_per_layer_inputs and project_per_layer_inputs.
         ple = self.per_layer_input_dim
         if ple is None:
             raise ValueError(
@@ -2223,20 +2282,25 @@ class CausalTransformer(nn.Module):
         return prepared.astype(x.dtype)
 
     def head_weight(self, params):
-        """The `[D, vocab]` head matrix in its stored dtype, as the forward
-        contracts it (`_logits`): the tied embedding table transposed or
-        `lm_head`'s kernel, read from `params` without an fp32 copy. The Gemma
-        embedding scale applies to input embeddings only.
+        """Return the `[D, vocab]` head matrix in its stored dtype, as the forward pass contracts it.
+
+        For a tied head this is the embedding table transposed, and otherwise
+        `lm_head`'s kernel. It is read from `params` without an fp32 copy. The
+        Gemma embedding scale applies only to input embeddings, so it is not
+        part of this matrix.
         """
+        # The same matrix `_logits` contracts.
         table, vocab_major = self.head_table(params)
         return table.T if vocab_major else table
 
     def head_table(self, params):
-        """The head matrix as the tree stores it, and whether its rows are
-        the vocabulary: the `[vocab, D]` embedding table and True for a tied head,
-        `lm_head`'s `[D, vocab]` kernel and False otherwise. With no operation in
-        between, a loss keeping the head for its backward (`chunked_cross_entropy`
-        with `vocab_major`) keeps the parameter, not a transposed copy.
+        """Return the head matrix as the tree stores it, and whether its rows are the vocabulary.
+
+        For a tied head this is the `[vocab, D]` embedding table and True, and
+        otherwise `lm_head`'s `[D, vocab]` kernel and False. No operation sits
+        between the parameter and the result, so a loss that keeps the head for
+        its backward pass (`chunked_cross_entropy` with `vocab_major`) keeps the
+        parameter itself and no transposed copy.
         """
         if self.tie_embeddings:
             return params['embed_tokens']['embedding'], True
@@ -2245,12 +2309,12 @@ class CausalTransformer(nn.Module):
     def init_cache(self, batch_size: int):
         """Allocate a zeroed decode cache for `batch_size` sequences.
 
-        cache = model.apply(params, batch_size, method=CausalTransformer.init_cache,
-                            mutable=['cache'])[1]['cache']
+            cache = model.apply(params, batch_size, method=CausalTransformer.init_cache,
+                                mutable=['cache'])[1]['cache']
 
-        The forward pass this runs is a single dummy token whose keys are never
-        written: allocation happens on the first decode-mode call, the write on
-        the ones after it.
+        It runs the forward pass in decode mode on a single dummy token, and
+        that token's keys are never written: the first decode-mode call
+        allocates the cache, and the calls after it write to it.
         """
         self(jnp.zeros((batch_size, 1), jnp.int32), decode=True)
 

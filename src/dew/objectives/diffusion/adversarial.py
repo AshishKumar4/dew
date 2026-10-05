@@ -2,19 +2,20 @@
 
 LADD (Sauer et al. 2024, "Fast High-Resolution Image Synthesis with Latent
 Adversarial Diffusion Distillation") trains a few-step student against a
-projected discriminator built on the frozen teacher: the student's clean
-prediction and a real sample are both noised again, the teacher reads each,
-and independent heads on its token sequences after chosen blocks score them
-with the hinge loss. The heads are StyleGAN-T's (Sauer et al. 2023,
-autonomousvision/stylegan-t `networks/discriminator.py` `DiscHead`), with
-LADD's change from 1D to 2D convolutions over the token grid, conditioned by
-projection on the noise level and the pooled text. ADD (Sauer et al. 2023,
-"Adversarial Diffusion Distillation") adds the R1 penalty on each head's
-input, gamma 1e-5, and a distillation term that pulls the student's
-prediction toward the teacher's denoising of it, lambda 2.5 with the
-exponential weighting alpha_t on the squared L2 distance. Neither paper
-publishes its training code; the heads follow StyleGAN-T's, which
-`tools/stylegan_t_reference.py` runs, and the losses the papers' equations.
+projected discriminator built on the frozen teacher. The student's clean
+prediction and a real sample are both noised again, and the teacher reads
+each. Independent heads on the teacher's token sequences after chosen
+blocks score them with the hinge loss. The heads are StyleGAN-T's (Sauer et
+al. 2023, autonomousvision/stylegan-t `networks/discriminator.py`
+`DiscHead`), with LADD's change from 1D to 2D convolutions over the token
+grid, and they are conditioned by projection on the noise level and the
+pooled text. ADD (Sauer et al. 2023, "Adversarial Diffusion Distillation")
+adds the R1 penalty on each head's input, with gamma 1e-5, and a
+distillation term that pulls the student's prediction toward the teacher's
+denoising of it, with lambda 2.5 and the exponential weighting alpha_t on
+the squared L2 distance. Neither paper publishes its training code. The
+heads follow StyleGAN-T's, which `tools/stylegan_t_reference.py` runs, and
+the losses follow the papers' equations.
 """
 
 from __future__ import annotations
@@ -189,26 +190,29 @@ def r1_penalty(score, features: Sequence[jax.Array]) -> jax.Array:
 
 @objectives("ladd")
 class AdversarialDistillationObjective(DiffusionObjective):
-    """LADD, with ADD's R1 penalty and its distillation term.
+    """Trains LADD, with ADD's R1 penalty and its distillation term.
 
-    `teacher` is the teacher model's variables, frozen under `TEACHER`; the
+    `teacher` is the teacher model's variables, frozen under `TEACHER`. The
     student starts from them, and a `Head` reads the teacher's token grid
-    after each of `feature_layers`. The student's time is drawn from
-    `student_times` and the renoising level from LADD's logit-normal at
-    `renoise_times` (mean 1, std 1: high noise, the paper's for images).
+    after each layer in `feature_layers`. The student's time is drawn from
+    `student_times`, and the renoising level from LADD's logit-normal with
+    `renoise_times` (mean 1, std 1, the high-noise setting the paper uses for
+    images).
+
     The discriminator and the student train in the same step, each through
-    its own loss with the other stopped; StyleGAN-T, whose heads these are,
+    its own loss with the other stopped. StyleGAN-T, whose heads these are,
     alternates a generator step and a discriminator step, and neither LADD
-    nor ADD says which. The heads' spectral norms take one power iteration
-    a step: the real pass iterates and keeps its `u`, and the held, fake and
-    R1 passes iterate from that `u` and keep nothing, where StyleGAN-T's
-    keeps each training pass's. The discriminator adds `r1_weight`
-    (ADD's gamma, 1e-5) times R1 on its real inputs, and the student
-    `distillation_weight` (ADD's lambda, 2.5) times alpha_t ||x_0 -
-    sg(teacher's x_0 of the renoised x_0)||^2, summed over the sample;
-    LADD itself drops that term when it trains on synthetic data, and on
-    CIFAR-10 at 32 pixels the term at 2.5 dominated and the student did
-    better without it. Sampling walks `Consistency`.
+    nor ADD says which it does. The heads' spectral norms take one power
+    iteration per step. The real pass iterates and keeps its `u`; the held,
+    fake and R1 passes iterate from that `u` and keep nothing, while
+    StyleGAN-T keeps the `u` of each training pass.
+
+    The discriminator adds `r1_weight` (ADD's gamma, 1e-5) times R1 on its
+    real inputs. The student adds `distillation_weight` (ADD's lambda, 2.5)
+    times alpha_t ||x_0 - sg(teacher's x_0 of the renoised x_0)||^2, summed
+    over the sample. LADD itself drops that term when it trains on synthetic
+    data, and on CIFAR-10 at 32 pixels the term at 2.5 dominated and the
+    student did better without it. Sampling runs `Consistency`.
     """
 
     def __init__(self, model: nn.Module, process: Process, inputs: InputSpec, *, teacher: Variables,

@@ -6,22 +6,22 @@ template. Every token gets the role of the message that wrote it, so
 `LMObjective` with `loss_role=Role.ASSISTANT` trains on assistant tokens
 only.
 
-Packing is the token pipeline's plan over the whole corpus
-(`PackedWindows`) with `text_roles` as one more per-token field. A window
-carries `text`, `text_roles`, `text_segment_ids` and `text_positions`, all
-aligned. The
-training stream's position is a global window count that resumes on any
-process count.
+The rendered conversations are packed by the token pipeline's plan over
+the whole corpus (`PackedWindows`), with `text_roles` as one more per-token
+field. Each window holds `text`, `text_roles`, `text_segment_ids` and
+`text_positions`, all aligned. The training stream's position is a global
+window count, so a run can resume on any number of processes.
 
-Conversations are structured. A `Message` carries what the Hugging Face
-chat-template contract reads: a role; content that is a string, a list of
-typed parts, or nothing; an assistant's `tool_calls`; a tool response's
-`tool_call_id` and `name`; and any further keys the template wants
-(`reasoning_content`, `thinking`) untouched. A `Conversation` adds the
-`tools` schemas the template renders into its system block. The stored
-messages retain typed content. Text-tokenizer rendering joins all-text parts
-into strings and refuses other part types, which require a processor.
-Tool-call fields and message metadata reach the template unchanged.
+A `Message` holds the fields the Hugging Face chat-template contract reads:
+a role; content that is a string, a list of typed parts, or nothing; an
+assistant's `tool_calls`; a tool response's `tool_call_id` and `name`; and
+any further keys the template wants, such as `reasoning_content` or
+`thinking`, unchanged. A `Conversation` adds the `tools` schemas that the
+template renders into its system block. The stored messages keep their typed
+content. When a text tokenizer renders them, each message's text parts are
+joined into one string, and any other part type is refused because it needs
+a processor. Tool-call fields and message metadata reach the template
+unchanged.
 """
 
 from __future__ import annotations
@@ -56,11 +56,12 @@ ROLES_KEY = "text_roles"
 class Role(int, Enum):
     """Who wrote a token of a rendered conversation.
 
-    The values are the `text_roles` column: 0 pads, the rest name the message
-    whose span holds the token. An assistant turn's opening header belongs to
-    no span; it reads as padding, so only the completion counts. `DEVELOPER`
-    is the Harmony instruction role; templates without it render the message
-    to nothing, which the renderer refuses.
+    The values are what the `text_roles` column stores. 0 marks padding, and
+    every other value is the role of the message whose span contains the
+    token. An assistant turn's opening header is in no span, so it reads as
+    padding and only the completion counts as assistant tokens. `DEVELOPER`
+    is the Harmony instruction role. A template that does not know it renders
+    the message to no tokens, and the renderer refuses that.
     """
 
     PAD = 0
@@ -118,9 +119,10 @@ def _records(raw: object, name: str, where: str) -> list[Mapping[str, object]]:
 class ContentPart:
     """One typed block of a message's content.
 
-    `type` names the block; `fields` is the rest of it verbatim, `text` for
-    a text block, a url or a path for media. Text rendering accepts text
-    parts only; media stays available in the stored conversation.
+    `type` names the kind of block, and `fields` holds the block's other keys
+    as they were: `text` for a text block, or a url or a path for media.
+    Rendering with a text tokenizer accepts only text parts, but media parts
+    are kept in the stored conversation.
     """
 
     type: str
@@ -140,15 +142,16 @@ class ContentPart:
 
 @dataclasses.dataclass(frozen=True)
 class ToolCall:
-    """One function call an assistant message asks for.
+    """One function call that an assistant message requests.
 
-    `arguments` is the parsed object. A source may hold it as a JSON string,
-    since parquet cannot carry a struct whose fields differ per call, while
-    the Hugging Face contract hands templates a mapping. The string parses
-    here, and a string that is not a JSON object fails. `id` links the call
-    to the `tool_call_id` of its response where the template uses ids.
-    `type` is the contract's `"function"`. A source may write the call flat
-    (`{name, arguments}`) or nested under `function`; both read the same.
+    `arguments` is the parsed object. A source may store it as a JSON string,
+    because parquet cannot hold a struct whose fields differ from call to
+    call, while the Hugging Face contract gives templates a mapping. So a
+    string is parsed here, and one that is not a JSON object raises
+    `ValueError`. `id` matches the call to its response's `tool_call_id`, for
+    templates that use ids. `type` is `"function"`, as the contract defines
+    it. A source may write the call flat (`{name, arguments}`) or nested
+    under `function`; both parse to the same call.
     """
 
     name: str
@@ -211,16 +214,17 @@ RESERVED = ("role", "content", "tool_calls", "tool_call_id", "name")
 
 @dataclasses.dataclass(frozen=True)
 class Message:
-    """One turn, in the shape the chat template reads.
+    """One turn of a conversation, in the shape the chat template reads.
 
-    `content` is the text, the typed parts, or None when the turn is only its
-    tool calls. None reaches the template as None, the wire form tool loops
-    send. `tool_calls` belong to assistant turns and `tool_call_id` to tool
-    responses; `name` is the function a response answers, or a participant's
-    name on other roles. `extra` holds every further key verbatim, so
-    `reasoning_content` or `thinking` reach the template that reads them. A
-    value of None on an optional key reads as absent, which is how parquet
-    spells a field a row does not have.
+    `content` is the text, the typed parts, or None when the turn consists
+    only of tool calls. None is passed to the template as None, which is how
+    tool loops send such a turn. `tool_calls` belong to assistant turns and
+    `tool_call_id` to tool responses, and `parse` refuses either on any other
+    role. `name` is the function a tool response answers, or a participant's
+    name on other roles. `extra` holds every other key unchanged, so keys
+    such as `reasoning_content` or `thinking` reach the templates that read
+    them. An optional key whose value is None counts as absent, because that
+    is how parquet stores a field a row does not have.
     """
 
     role: Role
@@ -261,9 +265,10 @@ class Message:
             extra)
 
     def as_template(self) -> Mapping[str, object]:
-        """The structured HF message, retaining content parts and metadata.
+        """Return the message as the Hugging Face template dict, with its
+        content parts and metadata.
 
-        `Conversation.text_rows` adapts these fields for text tokenizers.
+        `Conversation.text_rows` converts these dicts for text tokenizers.
         """
         if isinstance(self.content, tuple):
             content: object = [part.as_template() for part in self.content]
@@ -295,9 +300,12 @@ class Conversation:
     @classmethod
     def parse(cls, messages: object, tools: object = None,
               where: str = "conversation") -> Conversation:
-        """One row's messages and tool schemas, as a parquet column holds them.
+        """Parse one row's messages and tool schemas as a parquet column
+        stores them.
 
-        Each is a list, or the JSON text a column of varying schema carries.
+        Each is a list or, when the column's schema varies across rows, the
+        JSON text of one. A malformed row or an empty conversation raises
+        `ValueError`.
         """
         if not isinstance(messages, (str, list)):
             raise ValueError(
@@ -318,11 +326,13 @@ class Conversation:
         return [message.as_template() for message in self.messages]
 
     def text_rows(self, where: str) -> list[Mapping[str, object]]:
-        """The text-tokenizer input, with all-text parts joined in order.
+        """Return the messages as text-tokenizer input, with each message's
+        text parts joined in order.
 
-        The stored messages and `rows` retain their structured content.
-        Media needs a processor to expand its payload into model inputs;
-        a text tokenizer cannot do that, even if its template emits a marker.
+        The stored messages and `rows` keep their structured content. A part
+        that is not text raises `ValueError`, because media needs a processor
+        to turn its payload into model inputs. A text tokenizer cannot do
+        that, even if its template emits a marker for the media.
         """
         rows = []
         for index, (message, row) in enumerate(zip(self.messages, self.rows(), strict=True)):
@@ -557,19 +567,19 @@ def _hub_conversations(path: str, split: str, options: HFOptions, column: str) -
 
 
 class ConversationSource:
-    """Reads the conversations at `path` by index, with their tool schemas
-    beside them where the rows carry any.
+    """Reads the conversations at `path` by index, with each row's tool
+    schemas where the rows have them.
 
-    Three things hold conversations and one reader takes all three: a parquet
-    file, a `.jsonl` file, and a Hub dataset id resolved through `HFOptions`.
-    The suffix decides which. `chat.jsonl` is lines, `chat.parquet` is a
-    table, an existing file without either suffix is a table too, and
-    anything else is a repo id at `split`.
+    `path` can be a parquet file, a `.jsonl` file, or a Hub dataset id loaded
+    through `HFOptions`, and its suffix decides which. `chat.jsonl` is read
+    as one JSON object per line and `chat.parquet` as a table. An existing
+    file without either suffix is read as a table too, and anything else is
+    loaded as a repo id at `split`.
 
-    One record is one conversation, a list of messages in the verl layout,
-    and its tool schemas, a list or a JSON string. The rows are read once and
-    come back as plain dicts, which pickle across to grain workers. Other
-    columns are not read.
+    A record is a dict with one conversation under `messages`, a list of
+    messages in the verl layout, and its tool schemas under `tools`, a list
+    or a JSON string. The constructor reads every row once, and records are
+    plain dicts, so they pickle to grain workers. Other columns are not read.
     """
 
     def __init__(self, path: str, *, column: str = "messages", split: str = "train",
@@ -619,11 +629,13 @@ def _rendered(tokenizer: PreTrainedTokenizerBase, record: Batch,
 
 
 class RenderConversation:
-    """Turns source rows into rendered ids and per-token roles, for
-    `map_with_index`.
+    """Renders source rows to token ids and per-token roles, as the function
+    for `map_with_index`.
 
-    Holds only the tokenizer path, so grain workers unpickle the name and
-    load their own copy. Failures name the tokenizer and the row.
+    A call returns the ids under `text` and the roles under `text_roles`.
+    The instance holds only the tokenizer's name or path, so each grain
+    worker unpickles the name and loads its own copy. Errors name the
+    tokenizer and the row.
     """
 
     def __init__(self, tokenizer: str):
@@ -650,38 +662,40 @@ def _lengths(source: ConversationSource, tokenizer: str) -> list[int]:
 @datasets("chat_messages")
 @dataclasses.dataclass(frozen=True)
 class ChatMessages(DatasetSpec):
-    """Renders conversations with the tokenizer's chat template and packs them.
+    """Renders conversations with the tokenizer's chat template and packs them
+    into windows.
 
-    `path` names the conversations: a parquet file, a `.jsonl` file, or a Hub
-    dataset id read at `split` through `options`, which is the same value the
-    `hf` provider forwards to `datasets.load_dataset`. Whichever it is, the
-    rows carry lists of messages under `column` (or `prompt`, which is what
-    the verl layout calls it) and their tool schemas under `tools` where they
-    have any. `tokenizer` is the hub name or local path whose chat template
-    renders them.
+    `path` names the conversations. It can be a parquet file, a `.jsonl`
+    file, or a Hub dataset id loaded at `split` with `options`, the same value
+    the `hf` provider passes to `datasets.load_dataset`. In each case the
+    rows hold lists of messages under `column` (or under `prompt`, the name
+    the verl layout uses) and, where they have any, their tool schemas under
+    `tools`. `tokenizer` is the hub name or local path of the tokenizer whose
+    chat template renders them.
 
-    Each conversation, in chunks when it outgrows the window, is one element
-    the packing plan adds to the first window with room. Every window carries
+    The packing plan adds each conversation to the first window with room,
+    split into chunks when it is longer than a window. Every window has
     `text_roles` beside the ids, so the loss can count one role's targets.
-    The plan runs over the whole corpus in row order, ahead of the shard, as
-    `PackedTokens` plans its documents, so `records` is the windows of a pass
-    exactly and a saved position is a global window count.
+    As with the documents of `PackedTokens`, the plan runs over the whole
+    corpus in row order before the data is sharded. So `records` is exactly
+    the number of windows in one pass, and a saved position is a global
+    window count.
 
-    `val_path` is a second source of the same three kinds, read at
-    `val_split` and scored as one pass; None trains without validation.
+    `val_path` is a second source of any of the same three kinds. It is read
+    at `val_split` and scored as one pass; None trains without validation.
     """
 
     tokenizer: str
     path: str | None = None
     val_path: str | None = None
     column: str = "messages"
-    """The column of conversations; `prompt` is read where a row has that."""
+    """The column that holds the conversations; a source without it is read from `prompt`."""
     split: str = "train"
-    """Which split `path` is read at, when it names a Hub dataset."""
+    """The split of `path` to read when it names a Hub dataset."""
     val_split: str | None = None
-    """Which split `val_path` is read at; None reads `split`."""
+    """The split of `val_path` to read; None uses `split`."""
     options: HubOptions = dataclasses.field(default_factory=HFOptions)
-    """What `datasets.load_dataset` takes beside the id and the split."""
+    """The arguments `datasets.load_dataset` takes besides the id and the split."""
     seq_len: int = 256
     val_batches: int | None = 4
     packing_bins: int = 8

@@ -1,7 +1,9 @@
-"""Explicit process-local JAX capture and unmodified native XProf reports.
+"""Process-local JAX profile captures, exported as XProf's own reports.
 
-Only start/stop drain the default backend's live arrays and effects. This is
-not a distributed barrier. Normal execution installs no instrumentation hooks.
+A capture runs only when you start a `Profiler`. Starting and stopping it
+wait for the default backend's live arrays and effects, but they do not
+synchronize with other processes. When no capture is running, Dew installs
+no instrumentation hooks.
 """
 
 from __future__ import annotations
@@ -63,6 +65,10 @@ def capture_options() -> jax.profiler.ProfileOptions:
     options = jax.profiler.ProfileOptions()
     options.host_tracer_level = 2
     options.python_tracer_level = 0
+    # Exporting every live executable's HLO cost 0.95 s and 3.4 MB for a
+    # 4-layer decoder's fit that had evaluated and sampled first (RTX 4080).
+    # 400 unrelated compiled programs made a CPU capture of small work take
+    # 15 s and 75 MB.
     options.enable_hlo_proto = True
     if jax.default_backend() == "tpu":
         options.advanced_configuration = {"tpu_trace_mode": "TRACE_COMPUTE_AND_SYNC"}
@@ -158,22 +164,24 @@ def _reports(directory: Path, converter: _Converter, metadata: dict[str, JSON]) 
 
 
 class Profiler:
-    """One reusable explicitly enabled profiler for context or manual use.
+    """Captures a JAX profile of this process, as a context manager or through
+    `start` and `stop`.
 
-    Each start creates a fresh capture child below directory. Without a supplied
-    directory, the first start allocates a persistent temporary root. Collection
-    covers this process and drains only JAX's default backend, without copying
-    array values to the host. Other processes must enter their own captures.
+    One profiler can capture more than once. Each `start` creates a new
+    capture directory under `directory`. Without a directory, the first start
+    creates a temporary one, which is kept after the run. A capture covers
+    only this process, so other processes must start their own. Starting and
+    stopping wait for the work on JAX's default backend to finish, without
+    copying array values to the host. Only one capture can run in a process
+    at a time, and `start` raises `RuntimeError` while another is running.
 
-    A capture carries the HLO of every executable alive in the process, not
-    only of the work it traced, and its stop exports all of it. A training
-    run's window pays little for that: 0.95 s and 3.4 MB for a 4-layer
-    decoder's fit that had evaluated and sampled first (RTX 4080), whose
-    op_profile, hlo_stats and roofline_model reports are built from it and
-    come out nearly empty without it. A long-lived process that has compiled
-    many other programs pays for each (400 unrelated ones made a CPU capture
-    of small work take 15 s and 75 MB); pass options with `enable_hlo_proto`
-    off there when the trace and kernel reports are enough.
+    A capture includes the HLO of every executable alive in the process, not
+    only of the work it traced, and `stop` exports all of it. The op_profile,
+    hlo_stats and roofline_model reports are built from that HLO and come out
+    nearly empty without it. In a training run's window this costs little.
+    A long-lived process that has compiled many other programs pays for each
+    of them, so there pass `options` with `enable_hlo_proto` off when the
+    trace and kernel reports are enough.
     """
 
     def __init__(self, directory: str | os.PathLike[str] | None = None, *,
@@ -191,11 +199,12 @@ class Profiler:
         return self._directory
 
     def region(self, name: str) -> AbstractContextManager[None]:
-        """A named span in the trace while this profiler is capturing.
+        """Return a context manager that marks a named span in the trace while
+        this profiler is capturing.
 
         Wrap the work whose device and host time should show under `name`.
-        Outside a capture the span is a no-op, so the same code runs
-        unprofiled without a branch at every site.
+        Outside a capture the span does nothing, so the same code runs
+        unprofiled without a branch at every call site.
         """
         if not self.running:
             return nullcontext()
@@ -319,10 +328,11 @@ class Profiler:
 
 
 def region(name: str) -> AbstractContextManager[None]:
-    """A named span in the active capture, or a no-op when nothing captures.
+    """Return a context manager that marks a named span in the running
+    capture, or does nothing when no capture is running.
 
-    The site does not need to know whether a profiler is running or which
-    one; `with region("input.wait"):` reads the same either way.
+    The call site does not need to know whether a profiler is running or
+    which one; `with region("input.wait"):` reads the same either way.
     """
     active = active_profile()
     return nullcontext() if active is None else active.region(name)

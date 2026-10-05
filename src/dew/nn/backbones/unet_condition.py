@@ -26,8 +26,9 @@ if TYPE_CHECKING:
 class UNetStage:
     """Describes one resolution level: its width, heads and transformer depth.
 
-    `cross_attention` gives the level a spatial attention block at all;
-    `cross_only` drops the self-attention inside it.
+    With `cross_attention`, the level has a spatial attention block, and
+    without it the level has none. `cross_only` drops the self-attention
+    inside that block.
     """
 
     features: int
@@ -260,12 +261,12 @@ class _Level(nn.Module):
 
 @models("unet_2d_condition")
 class UNet2DCondition(nn.Module):
-    """Denoise NHWC latents on text, pooled/size and optional inpaint conditions.
+    """Denoises NHWC latents conditioned on text, pooled and size features, and optional inpainting inputs.
 
-    Stages specify spatial width, attention heads and transformer depth. The
-    encoder saves each residual output and each downsample; the decoder
-    consumes those skips in reverse order with one extra residual block per
-    level.
+    The stages set each level's spatial width, attention heads and
+    transformer depth. The encoder saves each residual output and each
+    downsample, and the decoder uses those skips in reverse order, with one
+    extra residual block per level.
     """
     stages: tuple[UNetStage, ...]
     in_channels: int = 4

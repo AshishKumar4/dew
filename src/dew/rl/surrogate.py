@@ -61,11 +61,11 @@ when asked, so the two agree wherever the estimate stays under 10."""
 
 
 def token_log_ratio(log_probs: jax.Array, old_log_probs: jax.Array) -> jax.Array:
-    """Per-token `log pi(a) - log pi_old(a)`, clamped to +-20.
+    """Return the per-token log ratio `log pi(a) - log pi_old(a)`, clamped to +-20.
 
-    verl calls this `negative_approx_kl` and negates it for its `ppo_kl`
-    metric, the token mean of its negation under the mask. It is fp32,
-    or the log-probabilities' dtype where it is wider (`at_least_fp32`).
+    verl calls this `negative_approx_kl`, and its `ppo_kl` metric is the
+    masked token mean of its negation. The result is fp32, or the
+    log-probabilities' dtype when that is wider (`at_least_fp32`).
     """
     log_probs = jnp.asarray(log_probs)
     work = at_least_fp32(log_probs.dtype)
@@ -107,28 +107,30 @@ def segment_mean(values: jax.Array, mask: jax.Array, segments: jax.Array | None 
 
 def sequence_log_ratio(log_probs: jax.Array, old_log_probs: jax.Array,
                        mask: jax.Array, segments: jax.Array | None = None) -> jax.Array:
-    """GSPO's sequence-level log ratio, carrying a per-token gradient.
+    """Return GSPO's sequence-level log ratio, with a per-token gradient.
 
     The sequence ratio is the geometric mean of the token ratios, so its log is
     the masked mean of the token log ratios (arXiv:2507.18071, equation 6).
-    Written as `logp - sg(logp) + sg(mean)` the value of every token in a
-    sequence is that one mean, while the derivative with respect to each token's
-    log-probability is that token's own. Dropping either stop-gradient leaves
-    the value untouched and changes every gradient. The test pins the
-    gradients for that reason.
+    The function computes it as `logp - sg(logp) + sg(mean)`, where `sg`
+    stops the gradient. Every token in a sequence then has that one mean as
+    its value, while the derivative with respect to each token's
+    log-probability is that token's own. Dropping either stop-gradient
+    leaves the value unchanged and changes every gradient.
 
-    A sequence is a row, or with `segments` one packed chain of it
-    (`segment_mean`), which is what verl's per-row pooling sees when each
-    chain is its own row.
+    A sequence is a row or, with `segments`, one packed chain in a row (see
+    `segment_mean`). That matches verl's per-row pooling when each chain is
+    its own row.
 
-    Tunix clamps the token log ratios to +-20 before pooling them. This pools
-    the raw difference, as verl's `compute_policy_loss_gspo` does. The clamp
-    at 10 on the result bounds what is exponentiated either way.
+    Tunix clamps the token log ratios to +-20 before pooling them. This
+    function pools the raw difference, as verl's `compute_policy_loss_gspo`
+    does. Either way, the result is clamped above at 10, which bounds what
+    is exponentiated.
     """
     log_probs = jnp.asarray(log_probs)
     log_probs = log_probs.astype(at_least_fp32(log_probs.dtype))
     log_ratio = log_probs - jnp.asarray(old_log_probs, log_probs.dtype)
     pooled = segment_mean(log_ratio, mask, segments)
+    # A test pins these gradients, because dropping a stop_gradient would not change the value.
     sequence = (log_probs - jax.lax.stop_gradient(log_probs)
                 + jax.lax.stop_gradient(pooled))
     return jnp.clip(sequence, max=SEQUENCE_RATIO_CLAMP)
@@ -137,23 +139,25 @@ def sequence_log_ratio(log_probs: jax.Array, old_log_probs: jax.Array,
 def clipped_surrogate_terms(log_ratio: jax.Array, advantages: jax.Array, mask: jax.Array,
                             epsilon_low: float = 0.2, epsilon_high: float = 0.2,
                             dual_clip: float | None = 3.0) -> tuple[jax.Array, dict[str, jax.Array]]:
-    """PPO policy terms before normalization, with the dual clip.
+    """Return PPO's per-token policy terms with the dual clip, before normalization, and their metrics.
 
-    `max(-A r, -A clip(r, 1 - eps_low, 1 + eps_high))` per token, and for a
-    negative advantage the dual clip caps the term at `-A * dual_clip`
-    (arXiv:1912.09729). Without the cap one token's ratio can dominate a step.
-    `advantages` is `[B]`, one per completion, or `[B, T]` when a run
-    scores tokens, the shape branch Tunix's `grpo_loss_fn` carries; a `[B]`
-    column broadcasts over the sequence.
+    Each token's term is `max(-A r, -A clip(r, 1 - eps_low, 1 + eps_high))`,
+    where `r = exp(log_ratio)` and the epsilons are `epsilon_low` and
+    `epsilon_high`. For a negative advantage, the dual clip caps the term at
+    `-A * dual_clip` (arXiv:1912.09729), because without the cap one token's
+    ratio can dominate a step. `advantages` is `[B]`, one per completion, or
+    `[B, T]` when a run scores tokens, a shape Tunix's `grpo_loss_fn` also
+    handles. A `[B]` advantage broadcasts over the sequence.
 
-    Aux carries `pg_clipfrac`, `pg_clipfrac_lower` and `ppo_kl`, verl's three
-    metrics, each read over the unmasked positions. They describe the ratio
-    handed in, so with `sequence_log_ratio` the `ppo_kl` entry is the
-    sequence-pooled quantity, and a GSPO run reads its `ppo_kl` from
+    The metrics are verl's three, `pg_clipfrac`, `pg_clipfrac_lower` and
+    `ppo_kl`, each averaged over the unmasked positions. They describe the
+    ratio passed in, so with `sequence_log_ratio` the `ppo_kl` entry is the
+    sequence-pooled quantity. A GSPO run therefore takes its `ppo_kl` from
     `token_log_ratio`, as verl's GSPO loss does.
 
-    `dual_clip=None` leaves the negative side uncapped, verl's
-    `compute_policy_loss_gspo`, and reports `pg_clipfrac_lower` as zero.
+    `dual_clip=None` leaves the negative side uncapped, as verl's
+    `compute_policy_loss_gspo` does, and reports `pg_clipfrac_lower` as
+    zero. A `dual_clip` of 1 or less raises ValueError.
     """
     if dual_clip is not None and dual_clip <= 1.0:
         raise ValueError("the dual clip caps a negative advantage, so it needs "
@@ -216,17 +220,18 @@ def cispo_terms(log_probs: jax.Array, old_log_probs: jax.Array, advantages: jax.
 
 
 def k3_kl(log_probs: jax.Array, ref_log_probs: jax.Array) -> jax.Array:
-    """Schulman's k3 estimator of `KL(pi || pi_ref)`, per token.
+    """Return Schulman's k3 estimate of `KL(pi || pi_ref)` for each token.
 
-    `exp(d) - d - 1` for `d = log pi_ref - log pi`, which is non-negative,
-    unbiased and lower variance than `-d` (http://joschu.net/blog/kl-approx.html).
-    verl's `kl_penalty_forward("k3")` clamps `d` to +-20 before the exponential
-    and the estimate to +-10 after it, and this follows verl. Without the
-    second clamp one drifted token contributes `exp(20)` to the penalty and
-    dominates the step.
+    The estimate is `exp(d) - d - 1` for `d = log pi_ref - log pi`. It is
+    non-negative, unbiased, and has lower variance than `-d`
+    (http://joschu.net/blog/kl-approx.html). This follows verl's
+    `kl_penalty_forward("k3")`, which clamps `d` to +-20 before the
+    exponential and the estimate to +-10 after it. Without the second
+    clamp, one drifted token would contribute `exp(20)` to the penalty and
+    dominate the step.
 
-    Aggregate it the way the policy loss is aggregated, over the same token
-    mass, and add `beta` times that.
+    Aggregate it over the same tokens and in the same way as the policy
+    loss, and add `beta` times the result.
     """
     log_probs = jnp.asarray(log_probs)
     work = at_least_fp32(log_probs.dtype)
@@ -239,11 +244,14 @@ def preference_logsigmoid_terms(policy_chosen: jax.Array, policy_rejected: jax.A
                                 ref_chosen: jax.Array, ref_rejected: jax.Array,
                                 mask_chosen: jax.Array, mask_rejected: jax.Array,
                                 beta: float) -> tuple[jax.Array, tuple[jax.Array, jax.Array]]:
-    """Per-pair DPO sigmoid terms and chosen/rejected reference-relative rewards.
+    """Return the per-pair DPO sigmoid loss terms and the chosen and rejected rewards.
 
-    Equation 7 of arXiv:2305.18290 uses the difference of masked sequence
-    policy/reference log-ratios. Rewards use beta times each log-ratio.
-    Masks arrive shifted, one value per scored token.
+    Each completion's log-ratio is the masked sum of its policy
+    log-probabilities minus the masked sum of its reference
+    log-probabilities. The term is `-log_sigmoid(beta * (chosen - rejected))`
+    on those log-ratios (arXiv:2305.18290, equation 7), and each reward is
+    `beta` times its log-ratio. The masks come already shifted, with one
+    value per scored token.
     """
     chosen = (jnp.sum(policy_chosen * mask_chosen, axis=-1)
               - jnp.sum(ref_chosen * mask_chosen, axis=-1))
@@ -256,14 +264,17 @@ def preference_logsigmoid_terms(policy_chosen: jax.Array, policy_rejected: jax.A
 
 def behavior_importance_weights(old_log_probs: jax.Array, behavior_log_probs: jax.Array,
                                 mask: jax.Array, cap: float) -> jax.Array:
-    """Detached token TIS weights from recorded raw and behavior policies.
+    """Return detached per-token TIS weights from the recorded raw-policy and behavior log-probabilities.
 
-    Port of verl compute_rollout_correction_weights(token), revision
-    d040717b21af2e23e8e789a3e354cff2394ae2de: exponentiate the log ratio
-    clamped to +-20, mask padding, then cap the weight. No batch normalization
-    or rejection sampling is implied. Token TIS and filtered sampling do
-    not recover an unbiased full-trajectory raw-policy expectation.
+    This ports verl's `compute_rollout_correction_weights` for token-level
+    weights. Each weight is the exponential of the log ratio
+    `old_log_probs - behavior_log_probs`, clamped to +-20; padding gets
+    weight zero, and every weight is capped at `cap`. There is no batch
+    normalization and no rejection sampling. Token TIS and filtered sampling
+    do not recover an unbiased raw-policy expectation over the full
+    trajectory. A `cap` that is not positive raises ValueError.
     """
+    # Ported from verl compute_rollout_correction_weights(token) at d040717b21af2e23e8e789a3e354cff2394ae2de.
     if type(cap) is bool or not cap > 0:
         raise ValueError("behavior importance cap must be positive")
     ratio = token_log_ratio(old_log_probs, behavior_log_probs)
@@ -335,12 +346,15 @@ def mismatch_metrics(proximal_log_probs: jax.Array, behavior_log_probs: jax.Arra
 
 def clipped_value_loss_terms(predicted: jax.Array, returns: jax.Array, old_values: jax.Array,
                              clip: float = 0.2) -> jax.Array:
-    """verl d040717 compute_value_loss, before its token-mask reduction.
+    """Return PPO's clipped value-loss terms per token, before the token-mask reduction.
 
-    The larger squared error of the live prediction and the prediction
-    clipped around recorded values is multiplied by one half. Targets and
-    recorded values are detached rollout data.
+    This ports verl's `compute_value_loss`. Each term is half the larger of
+    two squared errors against `returns`: the live prediction's, and that of
+    the prediction clipped to within `clip` of the recorded `old_values`.
+    `returns` and `old_values` are rollout data, so no gradient flows into
+    them.
     """
+    # Ported from verl compute_value_loss at d040717.
     predicted = jnp.asarray(predicted)
     predicted = predicted.astype(at_least_fp32(predicted.dtype))
     returns = jax.lax.stop_gradient(jnp.asarray(returns, predicted.dtype))

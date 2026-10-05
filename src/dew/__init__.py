@@ -1,12 +1,16 @@
 """Dew: one objective, one trainer.
 
-Each name below is imported from its own module when it is first read, not at
-`import dew`, so `import dew.training` stays inside the training layer and
-pulls in no modality, no encoder and no tracker backend. Nothing here opens a
-JAX backend or loads an optional dependency; encoders, decoders and datasets
-fetch what they need when they are built. The declared narrow-dtype
-rounding policy is set here before backend initialization; an explicit
-XLA override remains the caller's choice.
+Each name exported here is imported from its own module when you first
+access it, not at `import dew`. So `import dew.training` loads only the
+training layer, with no modality, encoder or tracker backend. Importing
+`dew` opens no JAX backend and loads no optional dependency; encoders,
+decoders and datasets load what they need when they are built.
+
+`import dew` does set one XLA flag before the backend opens,
+`--xla_allow_excess_precision=false`, so that values declared in a narrow
+dtype such as bf16 are rounded where the program rounds them. If you set
+that flag yourself in XLA_FLAGS, your value is kept. If the JAX backend has
+already opened, the flag cannot take effect, and Dew logs a warning.
 """
 
 from collections.abc import Callable

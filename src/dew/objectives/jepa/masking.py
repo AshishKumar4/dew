@@ -48,8 +48,12 @@ def _factorizations(area: int, grid: tuple[int, int], aspect: tuple[float, float
 
 @dataclass(frozen=True)
 class MultiBlockMask:
-    """Hold one patch grid's static mask geometry, and sample masks over it.
-    `scan_order` is the encoder's, which orders its token sequence."""
+    """Holds one patch grid's static I-JEPA mask geometry and samples masks over it.
+
+    Build it with `for_grid`. `scan_order` is the encoder's, which sets the
+    order of its token sequence. Every target block has `block_area` tokens
+    in one of `block_shapes`, and the context has `num_context` tokens.
+    """
     grid: tuple[int, int]
     num_targets: int
     block_shapes: tuple[tuple[int, int], ...]
@@ -61,8 +65,15 @@ class MultiBlockMask:
                  scale: tuple[float, float] = (0.15, 0.2),
                  aspect: tuple[float, float] = (0.75, 1.5),
                  scan_order: Literal["raster", "hilbert", "zigzag"] = "raster") -> MultiBlockMask:
-        """Resolve the I-JEPA mask geometry for a patch grid whose tokens the
-        encoder sequences in `scan_order`."""
+        """Resolve the I-JEPA mask geometry for a patch grid whose tokens the encoder orders by `scan_order`.
+
+        The block area is the one in the `scale` range, a fraction of the
+        grid's tokens, that allows the most block shapes with an aspect ratio
+        in `aspect`; a tie goes to the area nearest the middle of the range.
+        The context gets the tokens left after `num_targets` blocks. A
+        configuration with no valid block, or with no tokens left for the
+        context, raises ValueError.
+        """
         S = grid[0] * grid[1]
         candidates = [
             (area, _factorizations(area, grid, aspect))
@@ -104,7 +115,8 @@ class MultiBlockMask:
         """Draw one batch of context and target token indices.
 
         Returns the context indices, `[B, num_context]`, and the target
-        indices, `[B, num_targets, block_area]`.
+        indices, `[B, num_targets, block_area]`, where `B` is `batch_size`.
+        Both are sorted positions in the encoder's token sequence.
         """
         H_P, W_P = self.grid
         S = self.num_patches

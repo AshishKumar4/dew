@@ -29,8 +29,11 @@ def _compute_capability() -> str | None:
 
 
 def device_generation() -> str:
-    """The default device's hardware generation: 'sm89' for a GPU of compute
-    capability 8.9, 'v6e' for a TPU v6e, and the platform's name otherwise."""
+    """Return the default device's hardware generation.
+
+    The generation is 'sm89' for a GPU of compute capability 8.9, 'v6e' for a
+    TPU v6e, and the platform's name otherwise.
+    """
     device = jax.devices()[0]
     capability = _compute_capability() if device.platform == 'gpu' else None
     if capability:
@@ -42,16 +45,22 @@ def device_generation() -> str:
 
 
 def bf16_dot_runs() -> bool:
-    """Whether the default device multiplies bf16 operands into an fp32 sum
-    as one dot algorithm, BF16_BF16_F32: every TPU and CPU, and a GPU from
-    `BF16_GPU` on."""
+    """Return whether the default device multiplies bf16 operands into an fp32 sum as one dot algorithm.
+
+    That algorithm is BF16_BF16_F32. Every TPU and CPU has it, and so does a
+    GPU from generation `BF16_GPU` on.
+    """
     generation = device_generation()
     return not generation.startswith('sm') or int(generation[2:]) >= BF16_GPU
 
 
 def triton_runs() -> bool:
-    """The one eligibility rule for Dew's Pallas GPU (Triton) kernels: a GPU
-    of compute capability 8.0 or later, the bound JAX's own Pallas lowerings
-    apply (`_backend_supports_triton`). A T4 fails to compile them ("Triton
-    support is only enabled for cc>=8.0")."""
+    """Return whether Dew's Pallas GPU (Triton) kernels can run here.
+
+    This is the one eligibility rule for those kernels: a GPU of compute
+    capability 8.0 or later, the same bound JAX's own Pallas lowerings apply.
+    A T4 fails to compile them ("Triton support is only enabled for
+    cc>=8.0").
+    """
+    # JAX's bound is `_backend_supports_triton`.
     return jax.default_backend() == 'gpu' and bf16_dot_runs()

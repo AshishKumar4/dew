@@ -1,40 +1,43 @@
 """Harbor trials as a session source, each model call recorded by rllm-model-gateway.
 
-`HarborSource` runs one Harbor trial per sample: Harbor starts the task's
+`HarborSource` runs one Harbor trial per sample. Harbor starts the task's
 sandbox, installs and runs the harness (mini-swe-agent by default), then
 runs the task's verifier. The harness reaches the model only through a
-recording gateway, `rllm-model-gateway`, at a base URL that carries the
+recording gateway, `rllm-model-gateway`, at a base URL that names the
 session in its path, `/sessions/{session}/v1`. The gateway forwards each
 call to a vLLM or SGLang replica, asks it for token ids and
-log-probabilities, and records them under that session. Attribution rides
-in the URL, not in a header a CLI harness may drop (memo section 5.7).
+log-probabilities, and records them under that session. The session is
+part of the URL because a CLI harness may drop a header.
 
-Harbor and the gateway are separate services in their own environments:
-Dew starts `harbor trials start` as a subprocess, reads the trial's
-`result.json`, and reads the session's traces over HTTP. Nothing of either
-is imported here. The gateway must persist traces before it answers
+Harbor and the gateway are separate services, each in its own environment.
+Dew runs `harbor trials start` as a subprocess, reads the trial's
+`result.json`, and reads the session's traces over HTTP; it imports
+neither. The gateway must persist traces before it answers
 (`sync_traces: true`), so a session's traces are complete once its harness
 has exited.
 
-`calls` maps gateway traces onto `Call` records: the engine's prompt ids,
-sampled ids and behavior log-probabilities as recorded, in submission order,
-with the version the gateway stamped when the request arrived (the
-publication stamps it, see `Publication`). The gateway extracts vLLM's
-ids and SGLang's prompt ids; SGLang's sampled ids
-(`choices[0].response_token_ids`) are read from the raw response it keeps.
+`calls` turns gateway traces into `Call` records, in submission order. Each
+holds the engine's prompt ids, sampled ids and behavior log-probabilities
+as recorded, and the version the gateway stamped when the request arrived
+(the publication sets that stamp; see `Publication`). The gateway extracts
+vLLM's ids and SGLang's prompt ids. SGLang's sampled ids
+(`choices[0].response_token_ids`) are read from the raw response the
+gateway keeps.
 
 `outcome` decides how a trial ended from Harbor's result and the calls:
 
-- the verifier scored a trial whose harness exited cleanly: `COMPLETED`;
-- the harness exited nonzero and the verifier still scored it:
-  `AGENT_ERROR` with that score;
-- the agent ran out of time, context or output budget, the harness hit its
-  own step limit, or the last call stopped at its length limit:
-  `TRUNCATED`, with the verifier's reward when it ran; the scheduler's
-  `truncation` policy decides whether it trains;
-- anything else: a sandbox, gateway, engine or verifier failure, a trace
-  without ids or likelihoods, an aborted call, or a session with no call:
-  `INFRA_ERROR`, which the scheduler retries and never trains on.
+- `COMPLETED` when the harness exited cleanly and the verifier scored the
+  trial.
+- `AGENT_ERROR`, with the verifier's score, when the harness exited nonzero
+  and the verifier still scored the trial.
+- `TRUNCATED` when the agent ran out of time, context or output budget, the
+  harness hit its own step limit, or the last call stopped at its length
+  limit. It has the verifier's reward when the verifier ran, and the
+  scheduler's `truncation` policy decides whether it trains.
+- `INFRA_ERROR` for anything else: a sandbox, gateway, engine or verifier
+  failure, a trace without ids or likelihoods, an aborted call, or a
+  session with no call. The scheduler retries these and never trains on
+  them.
 """
 
 from __future__ import annotations
@@ -72,7 +75,7 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 HARBOR_KEY = "harbor"
-"""`Task.data[HARBOR_KEY]` is the Harbor task directory the trial runs."""
+"""The `Task.data` key that holds the Harbor task directory a trial runs."""
 
 # Harbor's exception class names (harbor.trial.errors, harbor.agents.installed.base).
 _TRUNCATIONS = frozenset({"AgentTimeoutError", "ContextWindowExceededError", "OutputTokenExceededError"})
@@ -99,33 +102,37 @@ _SESSION = re.compile(r"[A-Za-z0-9._:-]+")
 
 
 class Gateway:
-    """The parts of an rllm-model-gateway a session source reads.
+    """Connects a session source to an rllm-model-gateway.
 
-    `url` is the gateway's root as Dew reaches it; `sandbox_url` is where the
-    sandboxes reach it, which is what a harness's base URL is built from.
+    It builds each session's base URL, waits for the gateway to be ready,
+    stamps the weight version and reads a session's traces. `url` is the
+    gateway's root as Dew reaches it. `sandbox_url` is the address the
+    sandboxes reach it at, and a harness's base URL is built from it.
 
-    rllm-model-gateway (3b40c37) has no authentication, and one port serves
-    the model proxy beside `GET /sessions`, every session's traces, `POST
+    rllm-model-gateway (3b40c37) has no authentication. One port serves the
+    model proxy and also `GET /sessions`, every session's traces, `POST
     /traces/query`, session deletes, `POST /admin/workers` and `POST
     /admin/weight_version`. A sandbox runs the policy's own commands, so a
     policy that reaches that port can read its group members' transcripts,
     reset the version stamp the staleness bound reads, or register a worker
-    that returns fabricated ids and likelihoods. Therefore:
+    that returns fabricated ids and likelihoods. To prevent that:
 
-    - `url` is on an interface only Dew reaches (bind the gateway to
-      loopback or a private trainer network);
-    - `sandbox_url` is a reverse proxy in front of it that forwards only
-      `POST /sessions/<session>/v1/chat/completions` (nginx `location ~
-      ^/sessions/[^/]+/v1/chat/completions$`) and answers 403 to everything
-      else, on its own address;
-    - the task's agent phase allows that address and nothing else: Harbor's
-      `[agent] network_mode = "allowlist"` with `allowed_hosts` naming the
-      proxy, or `--allow-agent-host`, on a provider that supports allowlists
-      (Harbor's `tasks/network-policy` page; Docker needs nftables `fib`
-      support), and `[verifier] network_mode = "no-network"`. Harbor's
-      allowlist filters by host, not path, which is why the proxy is needed.
+    - Put `url` on an interface only Dew reaches, by binding the gateway to
+      loopback or a private trainer network.
+    - Make `sandbox_url` a reverse proxy in front of the gateway, on its own
+      address, that forwards only `POST /sessions/<session>/v1/chat/completions`
+      (nginx `location ~ ^/sessions/[^/]+/v1/chat/completions$`) and answers
+      403 to everything else.
+    - Let the task's agent phase reach that address and nothing else, with
+      Harbor's `[agent] network_mode = "allowlist"` and `allowed_hosts`
+      naming the proxy, or with `--allow-agent-host`. This needs a provider
+      that supports allowlists (see Harbor's `tasks/network-policy` page;
+      Docker needs nftables `fib` support). Set
+      `[verifier] network_mode = "no-network"` as well. Harbor's allowlist
+      filters by host and not by path, which is why the proxy is needed.
 
-    `sandbox_url` defaults to `url` only for trusted harnesses and tests.
+    `sandbox_url` defaults to `url`. Leave it unset only for trusted
+    harnesses and tests.
     """
 
     def __init__(self, url: str, *, sandbox_url: str | None = None, client: httpx.Client | None = None):
@@ -136,9 +143,14 @@ class Gateway:
         self._client = client or httpx.Client(timeout=30.0)
 
     def session(self, session: str) -> str:
-        """The OpenAI base URL a harness uses so its calls are recorded under `session`."""
+        """Return the OpenAI base URL that makes the gateway record a harness's calls under `session`.
+
+        Raises ValueError unless `session` is URL-path safe: letters, digits
+        and `._:-`.
+        """
         if not _SESSION.fullmatch(session):
             raise ValueError(f"session ids are URL-path safe: letters, digits and ._:-; got {session!r}")
+        # The session goes in the path because a CLI harness may drop a header (memo section 5.7).
         return f"{self.sandbox_url}/sessions/{session}/v1"
 
     def traces(self, session: str) -> Sequence[object]:
@@ -153,12 +165,13 @@ class Gateway:
         """Wait until the gateway routes to a healthy worker that answers, or raise after `timeout` seconds.
 
         Ready means `/health/workers` counts a healthy worker and `GET /v1/models`, proxied through
-        the gateway to an engine, answers 200.
+        the gateway to an engine, answers 200. The check runs every `poll` seconds, and the error
+        after `timeout` is a RuntimeError.
 
-        rllm-model-gateway marks a worker dead after three failed health checks, as happens to an
-        engine still loading when the gateway starts, and until a later check revives it every
-        proxied call answers a plain-text 500 that leaves no trace. A session submitted then would
-        fail for the gateway's reasons, not the policy's.
+        rllm-model-gateway marks a worker dead after three failed health checks, which happens to an
+        engine that is still loading when the gateway starts. Until a later check revives the worker,
+        every proxied call gets a plain-text 500 that leaves no trace. A session submitted in that
+        window would fail because of the gateway, not the policy.
         """
         import httpx
 
@@ -219,7 +232,11 @@ def _ids(name: str, values: object) -> tuple[int, ...]:
 
 @dataclass(frozen=True)
 class Recorded:
-    """One session as the gateway recorded it: its model calls, and the engine errors it answered instead."""
+    """One session as the gateway recorded it.
+
+    `calls` are its model calls in submission order. `errors` are the
+    messages of the error replies the engine sent instead of a completion.
+    """
 
     calls: tuple[Call, ...]
     errors: tuple[str, ...]
@@ -375,37 +392,41 @@ def outcome(trial: JSON, records: tuple[Call, ...], *, errors: Sequence[str] = (
 
 
 class HarborSource:
-    """A `SessionSource` that runs each sample as one Harbor trial behind a recording gateway.
+    """Runs each sample as one Harbor trial behind a recording gateway.
 
-    `harbor` is the Harbor executable (in its own environment), `agent` and
-    `model` its `--agent` and `--model`, and `trials` the directory trials
-    are written under. `environment` is passed to the harness as agent
-    environment (`--ae`), beside the per-trial `OPENAI_BASE_URL` that
-    carries the session; `arguments` are further `harbor trials start`
-    options (environment provider, timeouts, agent kwargs). `workers` trials
-    run at once; Harbor's own sandbox limits apply inside each. The harness
-    must speak the OpenAI chat API through `OPENAI_BASE_URL`, as Harbor's
-    mini-swe-agent does.
+    - `harbor` is the Harbor executable, installed in its own environment.
+    - `agent` and `model` are its `--agent` and `--model`.
+    - `trials` is the directory trials are written under.
+    - `environment` is passed to the harness as agent environment (`--ae`),
+      beside the per-trial `OPENAI_BASE_URL` that names the session.
+    - `arguments` are further `harbor trials start` options, such as the
+      environment provider, timeouts and agent kwargs.
+    - `workers` is how many trials run at once. Harbor's own sandbox limits
+      apply inside each trial.
 
-    Gateway sessions are named `{task}:{group}:{sample}:{token}`, where
-    `group` is unique to one `submit` across runs and `token` is 128 secret
-    bits, so a sandbox can address only the session it was handed. Every
-    future resolves to a `Session`: a failure of Harbor, the sandbox, the
-    gateway or the engine is an `INFRA_ERROR` session, not an exception, and
-    a cancelled trial is a
-    `CANCELLED` one. `attempt` is always 0: a retry is a fresh `submit`,
-    relabelled by the scheduler that owns group identity.
+    The harness must speak the OpenAI chat API through `OPENAI_BASE_URL`, as
+    Harbor's mini-swe-agent does.
 
-    The first `submit` waits, up to `ready_timeout` seconds, until the gateway
-    reports a healthy worker (`Gateway.ready`), so a source started beside
-    engines that are still loading launches no trial the gateway would answer
-    with a traceless 500.
+    Gateway sessions are named `{task}:{group}:{sample}:{token}`. `group` is
+    unique to one `submit` across runs, and `token` is 128 secret bits, so a
+    sandbox can address only the session it was given. As a
+    `SessionSource`, every future it returns resolves to a `Session`. A
+    failure of Harbor, the sandbox, the gateway or the engine gives an
+    `INFRA_ERROR` session, not an exception, and a cancelled trial gives a
+    `CANCELLED` one. Each session's `attempt` is 0, because a retry is a
+    fresh `submit` and the scheduler, which assigns group identity, relabels
+    it.
 
-    Use it as a context manager, or call `close`, to cancel every trial on
-    the way out. A trainer that exits without either (an uncaught
-    KeyboardInterrupt) still stops its trials: trials run on daemon threads,
-    and an atexit hook cancels queued trials and interrupts, then kills after
-    `grace`, the running ones.
+    The first `submit` waits up to `ready_timeout` seconds for the gateway
+    to report a healthy worker (`Gateway.ready`). So a source started beside
+    engines that are still loading does not launch trials that the gateway
+    would answer with a 500 and no trace.
+
+    Use it as a context manager, or call `close`, to cancel every trial when
+    you are done. A trainer that exits without either, for example on an
+    uncaught KeyboardInterrupt, still stops its trials. Trials run on daemon
+    threads, and an atexit hook cancels the queued trials and interrupts the
+    running ones, then kills any still running after `grace` seconds.
     """
 
     def __init__(
@@ -483,7 +504,11 @@ class HarborSource:
             self._records.pop(future, None)
 
     def cancel(self, futures: Sequence[Future[Session]]) -> None:
-        """Interrupt the named trials; Harbor tears their sandboxes down, and each resolves `CANCELLED`."""
+        """Interrupt the given trials. Harbor tears down their sandboxes, and each resolves `CANCELLED`.
+
+        A trial still running `grace` seconds after the interrupt gets
+        SIGTERM, and SIGKILL after another `grace` seconds.
+        """
         with self._lock:
             for future in futures:
                 record = self._records.get(future)

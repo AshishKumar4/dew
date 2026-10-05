@@ -65,7 +65,10 @@ class _RawResponse[T](Protocol):
 
 @dataclass(frozen=True)
 class Usage:
-    """Holds the reported aggregate usage. None means the backend did not report it."""
+    """Token usage the backend reported for the whole request.
+
+    Each count is None when the backend did not report it.
+    """
 
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
@@ -74,15 +77,16 @@ class Usage:
 
 @dataclass(frozen=True)
 class Completion:
-    """Holds the choices in prompt-major order, with the SDK responses retained.
+    """The choices of one completion request in prompt-major order, with the SDK responses kept.
 
-    Per-choice counts stay None when only aggregate usage was reported.
-    finish_reasons retain the backend's values, including an absent reason.
-    `tokens` and `log_probs` hold each choice's sampled ids and their
-    log-probabilities where the backend reported them: a vLLM completion
-    asked for `logprobs` with `return_tokens_as_token_ids` in extra_body
-    reports both. The log-probabilities are whatever distribution the engine
-    was configured to report; this record does not relabel them.
+    `token_counts` holds per-choice counts, which stay None when only
+    aggregate usage was reported. `finish_reasons` keeps the backend's
+    values, including an absent reason. `tokens` and `log_probs` hold each
+    choice's sampled ids and their log-probabilities where the backend
+    reported them; a vLLM completion asked for `logprobs` with
+    `return_tokens_as_token_ids` in `extra_body` reports both. The
+    log-probabilities come from whatever distribution the engine was
+    configured to report, and this record does not relabel them.
     `routed_experts` holds each choice's `[forwarded ids, layers, top_k]`
     expert record when vLLM ran with `--enable-return-routed-experts`.
     """
@@ -218,13 +222,17 @@ def _ollama_result(responses: Sequence[OllamaResponse]) -> Completion:
 
 @dataclass(frozen=True)
 class OllamaCompletion:
-    """Bind a model to an injected ollama.Client or ollama.AsyncClient.
+    """Calls one Ollama model through an `ollama.Client` or `ollama.AsyncClient` that you pass in.
 
-    __call__/acall accept batches of text and a finite token budget. Additional
-    request fields use the SDK schema, including images, format, context,
-    raw/template/system, think and logprobs; options accepts the SDK Options
-    value or a mapping of backend options. chat/achat support tools and tool
-    results. stream/astream yield native GenerateResponse objects.
+    Calling it, or `acall` with the async client, takes a batch of text
+    prompts and a finite token budget and returns a `Completion`. Each
+    prompt is one generate request, seeded at the root seed `key` plus its
+    row index; pass the seed as `key=`, not `seed=`. Other request fields
+    follow the SDK schema, including `images`, `format`, `context`, `raw`,
+    `template`, `system`, `think` and `logprobs`. `options` takes the SDK's
+    `Options` value or a mapping of backend options. `chat` and `achat`
+    support tools and tool results, and `stream` and `astream` yield the
+    SDK's own `GenerateResponse` objects.
     """
 
     model: str
@@ -441,15 +449,19 @@ def _openai_fields(model: str, prompts: str | Sequence[str] | TokenRows, budget:
 
 @dataclass(frozen=True)
 class OpenAICompletion:
-    """Bind an OpenAI client, including one configured for a vLLM or SGLang base_url.
+    """Calls one model through an OpenAI client, including one pointed at a vLLM or SGLang `base_url`.
 
-    Native SDK request options pass through to completion/chat resources.
-    Engine-only controls such as top_k/min_p/stop_token_ids, which vLLM and
-    SGLang both accept, belong explicitly in extra_body. SDK responses and
-    streaming chunks retain backend logprobs, token IDs/extensions, tool calls
-    and structured output fields unchanged. Completion prompts are text or
-    token-id rows; a row of ids reaches the engine as ids, with no
-    detokenize/retokenize round trip.
+    `provider` (`openai`, `vllm` or `sglang`) names the engine behind the
+    client. The SDK's own request options pass through to the completions
+    and chat resources. Engine-only controls that vLLM and SGLang both
+    accept, such as `top_k`, `min_p` and `stop_token_ids`, go in
+    `extra_body`. A `Sampling` passed as `sampling=` becomes request fields,
+    and its top-k, min-p, repetition-penalty and EOS controls need
+    `provider="vllm"` or `"sglang"`. SDK responses and streaming chunks keep
+    the backend's logprobs, token ids and extensions, tool calls and
+    structured output fields unchanged. Completion prompts are text or rows
+    of token ids, and a row of ids reaches the engine as ids, without being
+    detokenized and tokenized again.
     """
 
     model: str

@@ -1,16 +1,17 @@
 """Gemma 3n's residual stream: AltUp, the LAuReL block and activation sparsity.
 
-`Gemma3nTextModel` (modeling_gemma3n.py) carries `altup_num_inputs` copies of
-the residual: the embeddings, and each other copy their own projection
-rescaled to the embeddings' RMS. Every layer predicts all copies from the
-active one (`Gemma3nTextAltUp.predict`), runs the block on that prediction,
-corrects every copy by the block's innovation (`correct`), and adds the
-per-layer input to the copies past the first. After the last layer the
-copies project back, rescale to the first's magnitude, and their mean meets
-the final norm. `Gemma3nTextLaurelBlock` is a rank-`laurel_rank` map of the
-block's normed input, normed and added back, averaged with the attention
-residual over sqrt(2). `Gemma3nTextMLP._gaussian_topk` keeps the gate
-activations above the mean by `norm.ppf(sparsity)` standard deviations.
+`Gemma3nTextModel` (modeling_gemma3n.py) keeps `altup_num_inputs` copies of
+the residual. The first copy is the embeddings, and each other copy is its
+own projection of them, rescaled to the embeddings' RMS. Every layer
+predicts all copies from the active one (`Gemma3nTextAltUp.predict`), runs
+the block on that prediction, corrects every copy by the block's innovation
+(`correct`), and adds the per-layer input to the copies past the first.
+After the last layer, the copies are projected back and rescaled to the
+first copy's magnitude, and their mean goes into the final norm.
+`Gemma3nTextLaurelBlock` is a rank-`laurel_rank` map of the block's normed
+input, normed and added back; its sum with the attention residual is divided
+by sqrt(2). `Gemma3nTextMLP._gaussian_topk` keeps the gate activations that
+are more than `norm.ppf(sparsity)` standard deviations above the mean.
 """
 
 import dataclasses
@@ -33,8 +34,11 @@ MAGNITUDE_EPSILON = 1e-5
 
 @dataclasses.dataclass(frozen=True)
 class AltUp:
-    """How many copies of the residual stream a model carries and which one
-    its blocks run on, under the reference's names (configuration_gemma3n.py)."""
+    """How many copies of the residual stream a model keeps, and which one its blocks run on.
+
+    The fields are the reference's `altup_*` config entries without the
+    prefix (configuration_gemma3n.py).
+    """
     num_inputs: int = 4
     active_idx: int = 0
     coef_clip: float | None = 120.0
@@ -56,16 +60,17 @@ class AltUp:
 
 
 def gaussian_topk(x, sparsity: float):
-    """Zero all but the top `1 - sparsity` fraction of each row, assuming the
-    row is Gaussian: the cutoff is the row's mean plus `norm.ppf(sparsity)`
-    of its population standard deviation, and what is above it is kept as
-    its distance above (modeling_gemma3n.py, Gemma3nTextMLP._gaussian_topk).
+    """Zero all but the top `1 - sparsity` fraction of each row, assuming the row is Gaussian.
 
-    The quantile is computed in fp32, as the reference's icdf of a float32
-    tensor is, or in the row's own dtype where it is wider (`at_least_fp32`).
-    Of a Python float it was computed in the default float width, which x64
-    widens, so a float32 model's cutoff moved with the process's x64 flag.
+    The cutoff is the row's mean plus `norm.ppf(sparsity)` times its
+    population standard deviation, and a value above the cutoff is kept as
+    its distance above it. The quantile is computed in fp32, as the
+    reference's icdf of a float32 tensor is, or in the row's own dtype where
+    that is wider (`at_least_fp32`). `sparsity` must be within (0, 1).
     """
+    # modeling_gemma3n.py, Gemma3nTextMLP._gaussian_topk. Computed as a Python
+    # float, the quantile took the default float width, which x64 widens, so a
+    # float32 model's cutoff moved with the process's x64 flag.
     if not 0 < sparsity < 1:
         raise ValueError(
             f"activation sparsity is the fraction of gate activations dropped, "
@@ -78,13 +83,13 @@ def gaussian_topk(x, sparsity: float):
 
 
 def rescale_to(x, target):
-    """`x` scaled to `target`'s RMS magnitude per token, the magnitude of `x`
-    floored at MAGNITUDE_EPSILON (the reference's `new_magnitude`).
+    """Return `x` scaled per token to `target`'s RMS magnitude.
 
-    A zero target (a zero pad embedding at a padded slot) has magnitude zero
-    with a zero gradient; sqrt's infinite derivative there would turn the
-    masked slot's zero upstream gradient into NaN for every parameter it
-    touches.
+    The mean square of `x` is floored at `MAGNITUDE_EPSILON` before its square
+    root (the reference's `new_magnitude`). A zero target (a zero pad
+    embedding at a padded slot) gets magnitude zero with a zero gradient,
+    because sqrt's infinite derivative at zero would turn the masked slot's
+    zero upstream gradient into NaN for every parameter it touches.
     """
     target_mean = jnp.mean(jnp.square(target), axis=-1, keepdims=True)
     positive = target_mean > 0
@@ -99,7 +104,10 @@ def rescale_to(x, target):
     ("linear_right",): ("mlp", "embed"),
 })
 class LaurelBlock(nn.Module):
-    """`x + post_laurel_norm(linear_right(linear_left(x)))`."""
+    """Computes Gemma 3n's learned augmented residual (LAuReL).
+
+    The output is `x + post_laurel_norm(linear_right(linear_left(x)))`.
+    """
     rank: int
     emb_features: int
     norm_eps: float = 1e-6
@@ -145,18 +153,20 @@ class _Coefficients(nn.Module):
     ("prediction_coefs",): (None, None),
 })
 class AltUpLayer(nn.Module):
-    """One layer's AltUp: `predict` before its block and `correct` after.
+    """Runs one layer's AltUp: `predict` before the block and `correct` after it.
 
-    The stream is `[num_inputs, B, S, D]`. Both steps read the modalities of
-    a token, the tanh of its normed, `1 / D`-scaled active copy through
-    `modality_router`. `predict` maps them to a `num_inputs` by `num_inputs`
-    matrix per token (`prediction_coefs`) that mixes the copies, added to
-    the copies; `correct` maps them to one coefficient per copy
-    (`correction_coefs`, plus one) that scales the block's innovation, the
-    activated output minus the active prediction, added to every
-    prediction. `coef_clip` bounds both coefficient weights while training,
-    as the reference clamps them (modeling_gemma3n.py, Gemma3nTextAltUp).
+    The stream is `[num_inputs, B, S, D]`. Both steps read a token's
+    modalities: the tanh of the `modality_router` output for the token's
+    normed, `1 / D`-scaled active copy. `predict` maps the modalities to a
+    `num_inputs` by `num_inputs` matrix per token (`prediction_coefs`) that
+    mixes the copies, and adds the mix to the copies. `correct` maps the
+    modalities to one coefficient per copy (`correction_coefs`, plus one).
+    Each coefficient scales the block's innovation, which is the activated
+    output minus the active prediction, and the scaled innovation is added to
+    every prediction. `coef_clip` bounds both coefficient weights during
+    training, as the reference clamps them.
     """
+    # modeling_gemma3n.py, Gemma3nTextAltUp.
     spec: AltUp
     emb_features: int
     norm_eps: float = 1e-6
