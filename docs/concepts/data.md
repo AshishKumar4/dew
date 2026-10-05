@@ -1,13 +1,15 @@
 # Training data
 
-A `Dataset` supplies the batches a run trains and validates on. A batch is a dictionary of arrays whose first dimension is this process's rows of the global batch (all of them with one process). Most readers yield NumPy arrays; device image augmentation yields resident JAX pixels. The trainer joins the processes' rows into global arrays, and the objective reads the fields it needs by name. This page covers the `Dataset` class, the fields each built-in objective expects, the built-in readers, reading data that TFDS or Hugging Face already holds, and resuming the data stream from a checkpoint.
+A `Dataset` supplies training and validation batches. Each batch is a dictionary of arrays. The first dimension holds this process's rows of the global batch, or all rows in a single-process run. Most readers return NumPy arrays. Device image augmentation returns pixels in JAX arrays already on the device. The trainer combines each process's rows into global arrays, and the objective reads fields by name.
+
+Use `Dataset` directly or choose a built-in reader, including readers for prepared TFDS and Hugging Face datasets. The sections below list the fields each objective expects and explain how to resume the data stream from a checkpoint.
 
 ![Dataset to global batch: train(partition) opens an iterator of host batches, and shard_batch assembles each into one jax.Array split over the mesh's batch axes.](../assets/data-pipeline-light.svg)
 ![Dataset to global batch: train(partition) opens an iterator of host batches, and shard_batch assembles each into one jax.Array split over the mesh's batch axes.](../assets/data-pipeline-dark.svg)
 
 ## Dataset
 
-Records you already hold in memory become a `Dataset` through `Dataset.from_records`:
+For records in memory, use `Dataset.from_records`:
 
 ```python
 import numpy as np
@@ -28,7 +30,9 @@ print(data.records, data.steps_per_epoch)
 16 2
 ```
 
-`from_records` takes a mapping of columns whose first axis is the record, as here, a list of per-record mappings, or any source with `__len__` and `__getitem__`. Training reshuffles the records from `seed` every epoch, reads each one once per epoch, and saves its position in a checkpoint, so a resumed run reads the records it had not reached. With several processes, each reads its own share of every batch. `validation` is read once in order, in whole batches. The example validates on training records only to show the argument; a validation result needs records the model does not train on.
+`from_records` accepts a mapping of columns with a record dimension first, as above, a list of per-record mappings, or a source with `__len__` and `__getitem__`. Training reshuffles records every epoch using `seed` and reads each record once per epoch. Checkpoints save the position, so a resumed run continues with the unread records. With several processes, each reads its share of every batch.
+
+Validation reads one ordered pass in whole batches. This example uses training records for `validation` to show the argument. To measure validation performance, use records the model does not train on.
 
 Every reader returns the same `Dataset` value:
 
@@ -39,11 +43,11 @@ Every reader returns the same `Dataset` value:
 | `records` | The number of training records, or `None` when unknown. |
 | `batch` | The global batch size. |
 
-`train` and `val` are functions rather than iterators so that every new or resumed run opens a fresh iterator. The iterator belongs to the caller that opened it: close it after use if it has a `close` method, and never close the dataset or its backing store. `Trainer.fit` closes the iterators it opens, whether the run finishes or fails, and a training step's exception kept after the run does not keep its closed prefetch iterator alive.
+`train` and `val` are functions so that each new or resumed run can open fresh iterators. If you open an iterator, close it after use when it has a `close` method. Do not close the dataset or its backing store. `Trainer.fit` closes its iterators whether the run finishes or fails. Keeping a training-step exception after the run does not keep the closed prefetch iterator alive.
 
-The argument is a `DataPartition`, the share of every global batch this process reads. `DataPartition()` reads every row, which is correct for a single process. With several processes the trainer asks the mesh for each process's share (`DataPartition.of(mesh)`), and the built-in readers read only that share.
+The `DataPartition` argument specifies this process's share of every global batch. Use `DataPartition()` to read all rows in a single process. With several processes, the trainer gets each share from the mesh through `DataPartition.of(mesh)`. Built-in readers read only that share.
 
-A `Dataset` can also be built from the two functions directly, for a stream no reader covers:
+For a stream without a built-in reader, pass the two functions directly to `Dataset`:
 
 ```python
 import itertools
@@ -56,7 +60,7 @@ batch = {"features": x, "target": x.sum(axis=1, keepdims=True)}
 data = Dataset(train=lambda partition: itertools.repeat(batch), val=None, records=8, batch=8)
 ```
 
-Such a function has to do what `from_records` does for you: read only the share its partition names, and give its iterator `get_state` and `set_state` if the run checkpoints (see [Resuming the data stream](#resuming-the-data-stream)). This one does neither, so it suits a single-process run with `checkpoint_every=None`. `Dataset.from_grain` takes a Grain pipeline you built yourself.
+Your function must read only the share specified by its partition. For checkpointing, its iterator also needs `get_state` and `set_state`; see [Resuming the data stream](#resuming-the-data-stream). The function above does neither, so use it only for a single-process run with `checkpoint_every=None`. If you have a Grain pipeline, pass it to `Dataset.from_grain`.
 
 `Dataset.steps_per_epoch` is `records // batch`, or `None` when `records` is `None`. A stream without a record count needs an explicit `steps` in `fit`.
 
@@ -75,7 +79,7 @@ For text-conditioned diffusion, the condition encoder tokenizes the caption fiel
 
 ## Dataset specifications
 
-The built-in readers are dataset specifications: frozen dataclasses that describe a dataset, whose `load(batch=...)` builds the reading pipeline and returns a `Dataset`. `TokenWindows` reads fixed windows of `seq_len + 1` token ids from a tokenized directory:
+Built-in readers use dataset specifications, which are frozen dataclasses describing the dataset. Calling `load(batch=...)` builds a reading pipeline and returns a `Dataset`. `TokenWindows` reads fixed windows of `seq_len + 1` token IDs from a tokenized directory:
 
 ```python
 import json
@@ -101,18 +105,18 @@ print(windows["text"][0])
 [392 393 394 395 396 397 398 399 400]
 ```
 
-The training stream is shuffled: the first window of the first batch is window 49 of the corpus. `records` is the number of windows, `(1000 - 1) // 8 = 124`.
+The training stream is shuffled, so this first batch starts with window 49 of the corpus. `records` counts windows: `(1000 - 1) // 8 = 124`.
 
-Each window starts `seq_len` ids after the previous one, so the last id of one window is the first of the next. `dew tokenize` (or `TokenCorpus.write` in Python) writes `train.bin`, `val.bin` and `meta.json` from raw text; see [Packing](#packing). Token ids already stored in parquet are read through `dew.data.load("hf/parquet", options=HFOptions(data_files=...))` or a Grain pipeline given to `Dataset.from_grain`.
+Each window starts `seq_len` IDs after the previous one. The last ID of one window is therefore the first of the next. To prepare raw text, use `dew tokenize` or `TokenCorpus.write` in Python. They write `train.bin`, `val.bin` and `meta.json`; see [Packing](#packing). For token IDs already in parquet, use `dew.data.load("hf/parquet", options=HFOptions(data_files=...))` or pass a Grain pipeline to `Dataset.from_grain`.
 
-Other specifications include `PackedTokens`, `TFDSImages` (a prepared TFDS image dataset, captioned from its class names), `HFImages`, `ChatMessages` and the video and preference readers; the [API reference](../reference/core-api.md) lists them. Each has its own fields for paths, tokenization, transforms and splits, and two fields every specification shares:
+Other specifications include `PackedTokens`, `TFDSImages`, `HFImages`, `ChatMessages` and the video and preference readers. `TFDSImages` reads prepared TFDS images with captions from their class names. The [API reference](../reference/core-api.md) lists all the readers. Each has fields for paths, tokenization, transforms and splits. Every specification also has these two fields:
 
 | Field | Meaning |
 |---|---|
 | `seed` | The record order and the key of each record's random draws (augmentation, captions, clip starts) |
 | `loading` | A `Loading` with Grain's throughput settings |
 
-`Loading` changes how fast records are read, never which records a run sees or what is in them:
+Use `Loading` to adjust reading throughput. It leaves record order and content unchanged:
 
 | `Loading` field | Default | Counts |
 |---|---|---|
@@ -121,13 +125,15 @@ Other specifications include `PackedTokens`, `TFDSImages` (a prepared TFDS image
 | `read_buffer` | 128 | Records one worker reads ahead |
 | `worker_buffer` | 2 | Batches one worker holds ready |
 
-The default reads in the training process, as Grain's own default does. Worker processes each import the program again, so they cost seconds and memory before the first batch, and pay off only when decoding or augmentation outruns the reading threads. Raise `workers` only after measuring the input pipeline on your data and hardware. A script that starts workers needs an `if __name__ == "__main__":` guard, because each worker imports the script.
+The default reads in the training process, matching Grain's default. Each worker process imports the program again, adding seconds and memory before the first batch. Workers help only when decoding or augmentation exceeds the reading threads' capacity. Before raising `workers`, measure the input pipeline on your data and hardware. If your script starts workers, use an `if __name__ == "__main__":` guard so that importing it does not start more workers.
 
-Image sources can need network access the first time. Token-window sources read files written by `dew tokenize`. Streaming sources can depend on remote servers and may have no position to restore. [Recipes](../recipes.md) lists the command-line entry points and [Installation](../installation.md#optional-extras) the extras each source needs. `OnlineImages` and `OnlineVideos` (`data:online-videos` in a recipe) stream Hugging Face tables of urls and captions. `OnlineVideos` decodes each url's video the way `LocalVideos` reads a file: `frames` consecutive frames at 25 fps, resized to `image_size` squares, without audio.
+Image sources may need network access on first use. Token-window sources read files written by `dew tokenize`. Streaming sources can depend on remote servers and may not support restoring a position. See [Recipes](../recipes.md) for command-line entry points and [Installation](../installation.md#optional-extras) for each source's extras.
+
+`OnlineImages` and `OnlineVideos` stream Hugging Face tables of URLs and captions. In a recipe, select `OnlineVideos` with `data:online-videos`. It reads each URL like a `LocalVideos` file: `frames` consecutive frames at 25 fps, resized to `image_size` squares, without audio.
 
 ## Image datasets on the Hugging Face Hub
 
-`HFImages` reads a Hub image dataset by index through the image pipeline: decode, resize to `image_size`, augmentation, and captions for text conditioning. Its column fields say where a record keeps its fields. `image_column` holds the image, the caption is the first of `caption_columns` a record has, and a `label` column, where the dataset has one, is the class index a record carries. CIFAR-10 keeps its image under `img`, a class under `label` and no caption:
+`HFImages` reads Hub images by index. The pipeline decodes each image, resizes it to `image_size`, applies augmentation and reads captions for text conditioning. Set `image_column` to the source's image field. The caption comes from the first available field in `caption_columns`. If the dataset has a `label` column, it supplies the class index. CIFAR-10, for example, stores images under `img` and classes under `label`, with no captions:
 
 <!-- not run: downloads CIFAR-10 on first use -->
 ```python
@@ -146,21 +152,24 @@ print(data.records, data.steps_per_epoch)
 50000 781
 ```
 
-`caption_columns=()` reads a dataset without captions, for an unconditional or class-conditional run, and refuses a caption reader. A column the split does not hold is refused when the spec loads, with the columns it does hold. Without `val_split`, `val_batches` batches are held out of the head of the training split; `val_batches=None` with a `val_split` scores the whole named split.
+For an unconditional or class-conditional run without captions, set `caption_columns=()`. That setting rejects a caption reader. If you request a column absent from the split, loading raises an error listing the available columns. Without `val_split`, the reader holds out the first `val_batches` batches of the training split. With `val_split` and `val_batches=None`, validation scores the whole named split.
 
-Validation reads each image through the deterministic resize, without the crop, flip and jitter training applies, so a metric scores the images a reference implementation would.
+Validation uses deterministic resizing without training's crop, flip or jitter. Metrics therefore score the same images as a reference implementation.
 
 ## Device image augmentation
 
-`TFDSImages`, `HFImages` and the prepared `ArrayRecordImages` readers share
-`ImageDataset`'s transforms. Set `augmentation_backend="device"` to apply
-random crop/resize, horizontal flip and colour jitter to each decoded batch
-with JAX. The default remains `"host"`, preserving existing runs' OpenCV/NumPy
-augmentation. `augmentation="flip_only"` disables colour jitter and `"none"`
-keeps the deterministic resize, without random cropping. The colour jitter on
-either backend is torchvision's float `ColorJitter(brightness=0.2,
-contrast=0.05, saturation=0.2)`: the three factors in a random order, each op
-clamped to the pixel range, rounded to uint8 once at the end.
+`TFDSImages`, `HFImages` and prepared `ArrayRecordImages` readers use
+`ImageDataset`'s transforms. To apply random crop/resize, horizontal flip
+and colour jitter to decoded batches with JAX, set
+`augmentation_backend="device"`. The default, `"host"`, keeps existing
+runs' OpenCV/NumPy augmentation. `augmentation="flip_only"` disables
+colour jitter. With `"none"`, images receive deterministic resizing
+without random cropping.
+
+Both backends use torchvision's float `ColorJitter(brightness=0.2,
+contrast=0.05, saturation=0.2)`. They apply the three factors in random
+order and clamp each operation to the pixel range. The result is rounded
+to uint8 once, at the end.
 
 <!-- not run: needs a prepared Oxford Flowers version directory -->
 ```python
@@ -177,46 +186,51 @@ data = TFDSImages(
 ).load(batch=32)
 ```
 
-`crop_scale` is the retained area fraction, drawn uniformly and applied as an
-integer crop of the staging square; both sides shrink by its square root.
-`(1.0, 1.0)` keeps the full image. `augmentation_size=None` stages at
-`image_size`; a larger size retains more pixels for crop/resize and increases
-transfer and device memory. Decode, the initial area/cubic resize into a dense
-square, and caption tokenization still run on the host. The variable-sized
-JPEGs cannot be stacked directly, and neither JAX nor this option decodes
-them. The subsequent crop's bilinear resize, flip and jitter run on device,
-with one final uint8 round/clip. The host path is also needed by CPU consumers
-and by `OnlineImages`/video decoding, which this option does not change.
+`crop_scale` sets the retained area fraction, drawn uniformly. The crop
+uses integer coordinates within the staging square, with each side
+scaled by the square root of that fraction. `(1.0, 1.0)` keeps the full
+image. With `augmentation_size=None`, staging uses `image_size`.
+A larger staging size retains more pixels for crop/resize but increases
+transfers and device memory.
 
-Grain's data seed and global record position produce each example's key.
-JAX derives every augmentation draw from that key, not its row in the batch.
-Changing the reader threads, batch size or process shares changes no draw;
-restoring the data position restores the augmentation without another RNG
-state. Switching backend changes the RNG algorithm and is a transform change,
-so do not switch it when resuming an existing run.
+Decoding, the initial area/cubic resize to a dense square and caption
+tokenization run on the host. Variable-sized JPEGs cannot be stacked
+directly. JAX does not decode them, and this option adds no JPEG decoder.
+The crop's bilinear resize, flip and jitter run on the device, with one
+final uint8 round/clip. CPU consumers, `OnlineImages` and video decoding
+still need the host path, which this option leaves unchanged.
+
+Grain uses the data seed and global record position for each example's key.
+JAX derives augmentation draws from that key. The batch row does not affect
+them. Changing reader threads, batch size or process shares leaves the
+draws unchanged. Restoring the data position also restores augmentation;
+you do not need another RNG state. Switching backend changes the RNG
+algorithm and therefore the transform. Do not switch it when resuming a run.
 
 Augmentation runs on the process's default JAX device, normally its first
 local device. With several local devices, that device augments the whole
 local batch before the trainer redistributes the rows onto its mesh. This
 option does not shard augmentation across the local devices.
 
-Validation reads through the host's deterministic resize, whatever the
-training augmentation and backend.
+Validation always uses the host's deterministic resize, regardless of
+the training augmentation or backend.
 
-Given identical crop/flip/colour parameters, the JAX op is tested against the
-OpenCV bilinear host op in float64. On the RTX 4080 the largest absolute error
-was 6.55e-6, with identical rounded uint8 codes across 18 cases. OpenCV's interpolation coefficients are
-float32. Four bilinear corner-weight errors and a combined jitter gain below
-two give the bound `255 * 8 * eps(float32)`, or at most one code value after
-rounding. The default host resize still uses area
-interpolation down and cubic up; it is not replaced by bilinear interpolation.
+Tests compare the JAX operation with the OpenCV bilinear host operation
+in float64, using identical crop/flip/colour parameters. On the RTX 4080,
+the largest absolute error was 6.55e-6. Rounded uint8 codes matched across
+18 cases. OpenCV's interpolation coefficients are float32. Four bilinear
+corner-weight errors and a combined jitter gain below two give the bound
+`255 * 8 * eps(float32)`, or at most one code value after rounding.
+The default host resize continues to use area interpolation down and
+cubic up. It does not use bilinear interpolation.
 
-`tools/benchmark_image_pipeline.py` compares OpenCV, PIL, TFDS's NumPy decoder
-and torchvision on identical Flowers JPEG bytes, with the same final resize.
-It also synchronizes input-pipeline throughput and real prefetched pixel
-diffusion updates on the selected device. The decoder microbenchmark excludes
-storage reads and startup. The training measurement includes decode, resize,
-augmentation, transfer and optimizer updates, excluding compilation/warmup.
+`tools/benchmark_image_pipeline.py` compares OpenCV, PIL, TFDS's NumPy
+decoder and torchvision on identical Flowers JPEG bytes with the same
+final resize. It also measures synchronized input throughput and real
+prefetched pixel-diffusion updates on the selected device. Decoder timings
+exclude storage reads and startup. Training timings include decode,
+resize, augmentation, transfer and optimizer updates. They exclude
+compilation and warmup.
 
 Measured on 2026-10-01 with an RTX 4080 (16 GB) and an i9-12900K, JAX
 0.11.2.post3, OpenCV 5.0.0, Pillow 11.3.0, TFDS 4.9.10 and torchvision
@@ -233,35 +247,39 @@ the GPU runner capped the host job at four CPU cores.
 | torchvision CPU decoder | 646 | 507–734 | 1 |
 | Existing OpenCV reduced JPEG decode | 761 | 745–810 | 1 |
 
-TFDS and torchvision did not beat Dew's existing reduced OpenCV path on this
-corpus and size, so the default stays OpenCV. The full-resolution decoders
-are run serially, one thread per image; OpenCV and Torch also have their
-thread pools limited to one. Pillow was not reduced: `Image.draft` was not
-measured. OpenCV is the fastest of the measured paths, not a claim about
-every possible reduced Pillow preprocessing path. The full-resolution decoders
-produced identical resized bytes on these 512 images. The existing reduced
-JPEG decode is a different decode, with a maximum pixel difference of 56
-against full decode here; this change does not introduce or alter it. These
-results compare TFDS's ArrayRecord NumPy decoder, not a TensorFlow `tf.data`
-graph or its scheduling.
+The reduced OpenCV path was fastest among the measured decoders, including
+TFDS and torchvision, on this corpus and size. OpenCV remains the default.
+Full-resolution decoders ran serially with one thread per image.
+OpenCV and Torch thread pools were
+also limited to one. I did not measure reduced Pillow decoding with
+`Image.draft`, so these results say nothing about that path.
 
-The full Flowers source was warmed before either pipeline. Each run used
-batch 32, four Grain reader threads, five warmup batches, and three intervals
-of 60 batches. CPU time sums the reader threads; it is not wall latency.
+The full-resolution decoders produced identical resized bytes on these
+512 images. Dew's existing reduced JPEG decode differs from full decode;
+the maximum pixel difference here was 56. Device augmentation leaves
+that decode unchanged. The TFDS result measures its ArrayRecord NumPy
+decoder. It does not measure a TensorFlow `tf.data` graph or its scheduling.
+
+Both pipelines used the warmed full Flowers source. Each run used batch 32,
+four Grain reader threads, five warmup batches and three intervals of
+60 batches. CPU time is the sum across reader threads. It measures CPU
+work, not elapsed latency.
 
 | Augmentation | Host images/s | Device images/s | Host CPU ms/batch, before → after |
 |---|---:|---:|---:|
 | Flip + colour jitter | 1,097 | 1,681 | 65.96 → 47.20 |
 | Crop (area 0.6–1.0) + flip + colour jitter | 998 | 2,002 | 83.95 → 47.98 |
 
-The real prefetched `Trainer` update on one RTX 4080 improved from 575 to 874 images/s
-(1.52×), for a small pixel-EDM SimpleDiT with patch 16, width 32, one layer,
-four heads and float32/HIGHEST computation, 185 updates per backend.
-This is an input-bound small model measurement, not a large-model speedup.
-Decode and the staging resize still account for host work after augmentation
-moves to the device. The CUDA autotuner emitted a delay-kernel timing warning
-during compilation; these numbers use synchronized wall-clock intervals after
-compilation and warmup, not its kernel timer.
+Real prefetched `Trainer` updates on one RTX 4080 increased from 575 to
+874 images/s (1.52×). The small pixel-EDM SimpleDiT used patch 16, width 32,
+one layer, four heads and float32/HIGHEST computation. Each backend ran
+185 updates. This small model was input-bound; the measurement does not
+establish a large-model speedup. Decoding and the staging resize still
+require host work with device augmentation.
+
+During compilation, the CUDA autotuner emitted a delay-kernel timing
+warning. The reported numbers come from synchronized wall-clock intervals
+after compilation and warmup. They do not use the autotuner's kernel timer.
 
 <!-- not run: needs prepared Flowers data and a GPU -->
 ```bash
@@ -287,21 +305,23 @@ remains the text-chat LoRA example.
 
 [`train_masked_lm.py`](https://github.com/AshishKumar4/dew/blob/main/examples/train_masked_lm.py)
 reads real text prepared by `dew tokenize --tokenizer byte`, trains
-the MDLM negative ELBO and unmasks a text sample. The mask is an extra id, 256,
-outside the corpus's byte vocabulary. Use WikiText or TinyStories as input.
-Both new scripts accept `--smoke` to shrink the model and run while still
-reading the supplied real corpus. A few steps establish the workflow, not
-caption or language quality.
+the MDLM negative ELBO and unmasks a text sample. The mask uses an extra
+ID, 256, outside the corpus's byte vocabulary. Use WikiText or TinyStories
+as input. Both scripts accept `--smoke` to reduce the model and run size
+while still reading the supplied real corpus. These short runs check the
+workflow. They do not demonstrate caption or language quality.
 
 Both ran for eight updates on the RTX 4080 in float32/HIGHEST. The Flowers
 image-SFT run used 1,020 real training images and a 977,362-parameter model.
-On the same fixed batch and noise key, SFT loss moved from 11.58235 to
-7.64003, the maximum vision-parameter change was 0.0076374, and negating the
-conditioning pixels changed the trained loss to 8.16366. The masked-LM run
-used 1,984,069 training bytes from a two-million-character WikiText-103
-subset and a 147,904-parameter model; fixed-batch NELBO moved from 5.50278 to
-4.17817. Both saved checkpoints and generated samples. The samples are
-untrained-looking byte text after eight updates, and carry no quality claim.
+With a fixed batch and noise key, SFT loss fell from 11.58235 to 7.64003.
+The maximum vision-parameter change was 0.0076374. Negating the
+conditioning pixels changed the trained loss to 8.16366.
+
+The masked-LM run used 1,984,069 training bytes from a
+two-million-character WikiText-103 subset and a 147,904-parameter model.
+Fixed-batch NELBO fell from 5.50278 to 4.17817. Both runs saved checkpoints
+and generated samples. After eight updates, those samples are
+untrained-looking byte text; I make no claim about their quality.
 
 <!-- not run: needs the real corpora and a GPU -->
 ```bash
@@ -315,7 +335,9 @@ python examples/train_masked_lm.py \
 
 ## TFDS and Hugging Face datasets
 
-`dew.data.load("<provider>/<name>", batch=...)` reads a dataset that TFDS or Hugging Face already holds and returns a `Dataset`. `preprocess(record, rng)` turns one provider record into batch fields. Without it, each field of a record reaches the batch as an array: a list column becomes one `[batch, n]` field, 64-bit numbers become 32-bit ones, and strings and bytes stay as they are. Nothing is decoded, renamed or dropped. An integer that does not fit in 32 bits is refused by name. `dataset=` takes a Hugging Face split that is already in memory:
+`dew.data.load("<provider>/<name>", batch=...)` reads a TFDS or Hugging Face dataset and returns a `Dataset`. To turn a provider record into batch fields, pass `preprocess(record, rng)`. Without preprocessing, every field becomes an array in the batch. A list column becomes a `[batch, n]` field, 64-bit numbers become 32-bit numbers, and strings and bytes remain unchanged. The reader does not decode, rename or drop fields. It rejects an integer that does not fit in 32 bits, naming its field.
+
+If a Hugging Face split is already in memory, pass it through `dataset=`:
 
 ```python
 import datasets
@@ -344,7 +366,7 @@ print(first["x"].shape, first["label"][:4], data.records)
 | `options` | `TFDSOptions` for `tfds/...`, `HFOptions` for `hf/...`; the other provider's options raise `TypeError` |
 | `loading` | Throughput only, as above |
 
-`tfds/<builder>` reads the ArrayRecord files a TFDS preparation run wrote under `TFDSOptions.path`, through TFDS's read-only builder, so the training process does not import TensorFlow. Dew never prepares the data itself ([Installation](../installation.md#preparing-tfds-data) shows how). `path` is either a prepared version directory or the `data_dir` above one; in the second case `config` and `version` select the directory inside it. Dew checks the prepared metadata against the builder, config and version requested. `decoders` is passed to the builder unchanged.
+`tfds/<builder>` reads prepared ArrayRecord files at `TFDSOptions.path` through TFDS's read-only builder. The training process therefore does not import TensorFlow. Dew never prepares the data itself; follow [Installation](../installation.md#preparing-tfds-data) to do that first. Set `path` to the prepared version directory or the `data_dir` above it. For `data_dir`, `config` and `version` select the version directory inside it. Dew checks the prepared metadata against the requested builder, config and version. It passes `decoders` to the builder unchanged.
 
 <!-- not run: needs a prepared TFDS directory -->
 ```python
@@ -356,25 +378,25 @@ data = dew.data.load("tfds/dew_images", batch=8, split="train", val_split="test"
                      preprocess=lambda record, rng: {"image": record["image"]})
 ```
 
-`hf/<name>` reads one Arrow-backed split through `datasets.load_dataset`, which downloads the dataset and writes its Arrow cache when the local cache does not have it. `HFOptions` carries `config`, `data_files`, `features`, `storage_options` and the other `load_dataset` arguments with that function's types.
+`hf/<name>` reads one Arrow-backed split through `datasets.load_dataset`. If the local cache lacks the dataset, that function downloads it and writes an Arrow cache. `HFOptions` supplies `config`, `data_files`, `features`, `storage_options` and other `load_dataset` arguments using that function's types.
 
-`streaming=True` reads an `IterableDataset` as it goes. A streamed split has no length, so `records` is `None` unless given and `Dataset.steps_per_epoch` is `None`. Processes split the rows with `datasets.distributed.split_dataset_by_node`; when there are more processes than rows, one process would get none, and Dew refuses the run.
+With `streaming=True`, the reader consumes an `IterableDataset` as records arrive. A streamed split has no length. Unless you supply `records`, it and `Dataset.steps_per_epoch` are `None`. Processes divide rows with `datasets.distributed.split_dataset_by_node`. If there are more processes than rows, Dew rejects the run because at least one process would get no rows.
 
-A streamed split loaded by name without shuffling resumes at the record where it stopped, with the same per-record random draws. Three kinds of streamed split have no position to resume from, and must train with `checkpoint_every=None` (`Trainer.fit` refuses otherwise):
+A streamed split loaded by name without shuffling resumes at the next unread record, with the same per-record random draws. These streamed splits cannot restore a position. They require `checkpoint_every=None`; otherwise, `Trainer.fit` rejects the run:
 
-- a split read with `shuffle_buffer` set, because `datasets` does not restore the shuffle buffer;
-- a split passed as `dataset=`, because it may carry transformations Dew did not apply;
-- a split whose source implements no state in `datasets`.
+- A split read with `shuffle_buffer` set, because `datasets` does not restore that buffer.
+- A split passed as `dataset=`, because it may include transformations Dew did not apply.
+- A split whose source implements no state in `datasets`.
 
 ## Packing
 
-Packing places tokens from several documents into rows of a fixed width. Segment ids (`text_segment_ids`) stop attention and target scoring from crossing document boundaries, and position ids (`text_positions`) restart at each document. Every per-token array must be sliced and packed the same way as the token ids.
+Packing combines tokens from several documents into fixed-width rows. Segment IDs (`text_segment_ids`) keep attention and target scoring within document boundaries. Position IDs (`text_positions`) restart at each document. Slice and pack every per-token array the same way as the token IDs.
 
-A batch stacks each field into one array, so token ids of varying length cannot reach it as they are: tokenizing in `preprocess` and batching the result raises an error that says so. There are two routes to fixed rows.
+A batch stacks each field into one array, which requires fixed-width token rows. Tokenizing variable-length text in `preprocess` and batching it directly raises an error. You can make fixed rows offline or online.
 
-Offline, `dew tokenize --pack` (or `TokenCorpus.write(..., pack=True)` in Python) writes a token directory with an eos id after every document, and `PackedTokens` packs it. Its position is a global record count that resumes on any process count. `TokenCorpus.write` takes a text file, a directory of `.txt` files, or any iterable of strings, one document each, such as a Hugging Face split's text column.
+Offline, use `dew tokenize --pack` or `TokenCorpus.write(..., pack=True)` in Python. It writes a token directory with an EOS ID after every document. `PackedTokens` packs that directory and tracks a global record count that can resume on any process count. `TokenCorpus.write` accepts a text file, a directory of `.txt` files, or an iterable of strings with one document per string. A Hugging Face split's text column is one such iterable.
 
-Online, Grain's packers build the rows as the documents are read, and `Dataset.from_grain` batches them. Each process builds the pipeline over its own share:
+Online, Grain packers build rows as they read documents. `Dataset.from_grain` batches those rows. Each process builds a pipeline for its own share:
 
 <!-- not run: downloads wikitext and the SmolLM2 tokenizer on first use -->
 ```python
@@ -412,29 +434,31 @@ print([len(set(row)) for row in batch["text_segment_ids"]])
 [1, 1, 2, 2, 3, 2, 1, 2]
 ```
 
-`ConcatThenSplitIterDataset` concatenates the documents and cuts the stream into rows of `seq_len + 1` ids, splitting a document that crosses a row's end, and writes `text_segment_ids` and `text_positions`, the field names `LMObjective` reads. The last line counts the documents in each row. `grain.experimental.FirstFitPackIterDataset` packs whole documents with padding instead, and refuses a document longer than the row, so cut long documents first. An online pipeline's position is Grain's own iterator state for one share, so it resumes only on the process count that wrote it (see [Resuming the data stream](#resuming-the-data-stream)).
+`ConcatThenSplitIterDataset` joins documents and splits the stream into rows of `seq_len + 1` IDs. A document can span rows. It also writes `text_segment_ids` and `text_positions`, the fields `LMObjective` reads. The last output line counts documents in each row.
 
-Padding and packing change the number of valid targets even when array shapes are equal. Gradient accumulation adds the loss totals and masses of its microbatches before dividing, so the accumulated gradient is that of one token mean over the whole window; check the normalization before calling two runs with different packing equivalent.
+To pack whole documents with padding, use `grain.experimental.FirstFitPackIterDataset`. It rejects documents longer than a row, so cut those first. An online pipeline stores Grain's iterator state for one process's share. It can resume only with the process count that wrote the checkpoint; see [Resuming the data stream](#resuming-the-data-stream).
+
+Padding and packing change the number of valid targets even when array shapes match. Gradient accumulation adds microbatch loss totals and masses, then divides once. The gradient is therefore for the token mean over the whole window. Before treating differently packed runs as equivalent, check their normalization.
 
 ## Resuming the data stream
 
-An iterator with `get_state()` and `set_state(state)` is restorable: Dew saves its position in every checkpoint and restores it on resume. The resumed run must use the same data order, tokenizer and transforms as the run that wrote the checkpoint. There are two kinds of position:
+If an iterator implements `get_state()` and `set_state(state)`, Dew can save its position in every checkpoint and restore it. Keep the same data order, tokenizer and transforms when resuming. There are two kinds of position:
 
 | Kind | Written by | Resumes on |
 |---|---|---|
 | Global record count | Every reader built on `train_stream`: token windows, packed documents and conversations, weighted mixtures, images, video, prompts, preference pairs | Any process count that divides the global batch |
 | Shard offset | Custom iterators that report their own state | Only the process count that wrote it |
 
-A global position is the number of records the whole run has consumed, and every process reports the same number. Step *k* reads records `[k * batch, (k + 1) * batch)` of one shuffled order, and process *p* of *n* reads every *n*-th record of that step. A checkpoint written by two processes therefore restores on one or on four, and the steps after the resume are the ones an uninterrupted run would have taken. Restoring sets where the stream starts reading; no record is read twice.
+A global position counts records consumed by the whole run. Every process reports the same number. Step *k* reads records `[k * batch, (k + 1) * batch)` from one shuffled order. Process *p* of *n* reads every *n*-th record in that step. A checkpoint written by two processes can therefore restore on one or four. The resumed steps read the same records as an uninterrupted run. Restoring starts the stream at that position without reading any record twice.
 
-The position also records what it counts through: the source's description, its record count and the shuffle seed. Dew refuses to resume with a different record count or seed. A source without its own `__repr__` is described by its type name, so two corpora of equal length and seed are only told apart if the source describes its data; give any source you resume across runs a `__repr__` that names its data.
+The saved position includes the source description, record count and shuffle seed. Dew rejects a resume with a different record count or seed. Without a custom `__repr__`, a source's description is its type name. Dew can distinguish two corpora of equal length and seed only if their source descriptions identify the data. For a source you resume across runs, provide a `__repr__` that names its data.
 
-Which process holds which row of a step depends on the process count, so randomness keyed by row, such as diffusion noise or sampled timesteps, falls on different records at a different process count. The resumed run then draws different noise for the same records: it optimizes the same objective, but its losses are not the same numbers an uninterrupted run would have logged. A record's own random draws are keyed by its place in the shuffled stream and do not depend on the process count.
+Changing the process count changes which process holds each row. Randomness keyed by row, such as diffusion noise or sampled timesteps, then applies to different records. The resumed run optimizes the same objective but draws different noise for each record, so its logged losses differ from an uninterrupted run. A record's own random draws use its position in the shuffled stream and remain independent of process count.
 
-`Checkpoints.restore` refuses a shard offset written by a different number of processes and names both counts; resume such a run on the process count that wrote it. [Checkpoints](../guides/checkpoints.md) shows the whole save and restore path.
+To resume a shard offset, use the process count that wrote it. `Checkpoints.restore` rejects a different count and reports both values. [Checkpoints](../guides/checkpoints.md) shows the full save and restore workflow.
 
 ## Multiple processes
 
-`Dataset.batch` is the global batch. With several JAX processes each process reads its share and Dew assembles the global arrays with `jax.make_array_from_process_local_data`. The built-in readers and `Dataset.from_records` split records between processes themselves. A custom `train` function must read only the share its `partition` names, `partition.index` of `partition.count`, or every process trains on the same records.
+`Dataset.batch` is the global batch size. Each JAX process reads its share, and Dew assembles global arrays with `jax.make_array_from_process_local_data`. Built-in readers and `Dataset.from_records` split the records between processes. In a custom `train` function, read only `partition.index` of `partition.count`, the share specified by `partition`. Otherwise, every process trains on the same records.
 
 Before a multi-process run, check on the target topology that process shares do not overlap, that sharding is as expected and that a resume continues the stream. [Distributed training](distributed.md) describes placement.
