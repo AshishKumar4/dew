@@ -758,7 +758,7 @@
      "runs": "model"
     }
    ],
-   "note": "Downloaded release code with local kernel stand-ins and documented patches (tools/deepseek_v41_reference.py:54)."
+   "note": "Downloaded release code with local kernel stand-ins and documented patches (tools/deepseek_v41_reference.py:60). orders.npz records 52 residual orders (rounding_orders.py, seed 0), the reference's plain-SGD distances, identity reproduction and float64 invariance under every order."
   },
   "hf/deepseek-v41-tiny/kernels.npz": {
    "tool": "tools/deepseek_v41_reference.py",

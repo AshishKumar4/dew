@@ -434,19 +434,49 @@ def test_pull_returns_the_snapshot_directory(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------------
 
 
-def assert_transformers_reads_the_run(export, task, ids):
+def assert_transformers_reads_the_run(export, task, ids, *, ordered_export=None):
     """transformers' own class for the export's model_type loads its files
     with a clean report (`decoder_export_reference.reference_model`) and,
     over the same ids, holds the run's own logits to tests/reference_error.py's
-    rule: in fp32 the reference, in float64 the truth."""
-    from reference_error import assert_as_exact_as_the_reference
+    rule: in fp32 the reference, in float64 the truth. An `ordered_export`
+    holds the trained run over 52 residual orders when one draw can flake;
+    every reference order in float64 must compute the identity's truth.
+    """
+    from reference_error import (
+        ORDERS,
+        assert_as_exact_as_the_reference,
+        assert_as_exact_over_orders,
+        assert_computes_the_oracle,
+        distance,
+    )
+    from residual_orders import orders, permuted, residual_width
 
+    from dew.interop import Pretrained
     from tools.decoder_export_reference import Case, reference_logits
 
     case = Case("run export", str(export))
-    ours = np.asarray(task.model.apply(task.variables, jnp.asarray(ids, jnp.int32)))
-    assert_as_exact_as_the_reference(ours, reference_logits(case, export, ids),
-                                     reference_logits(case, export, ids, wide=True), "run export logits")
+    truth = reference_logits(case, export, ids, wide=True)
+    if ordered_export is None:
+        ours = np.asarray(task.model.apply(task.variables, jnp.asarray(ids, jnp.int32)))
+        assert_as_exact_as_the_reference(ours, reference_logits(case, export, ids), truth,
+                                         "run export logits")
+        return
+    source = Pretrained.load(export, dtype="float32", attention_impl="reference")
+    forward = jax.jit(lambda variables: task.model.apply(variables, jnp.asarray(ids, jnp.int32)))
+    mine, theirs = [], []
+    # Two attention projections, a key reduction, two MLP projections and
+    # the norms/residuals per layer, then the output head, bound the chain.
+    model = source.model
+    roundings = model.num_layers * (4 * model.emb_features + model.mlp_features + ids.shape[1] + 16)
+    roundings += 2 * model.emb_features
+    for order in orders(residual_width(task.variables), ORDERS, seed=0):
+        variables = permuted(task.variables, order)
+        source.save(ordered_export, variables=variables)
+        assert_computes_the_oracle(reference_logits(case, ordered_export, ids, wide=True), truth,
+                                   "run export logits in order", roundings=roundings)
+        mine.append(distance(forward(variables), truth))
+        theirs.append(distance(reference_logits(case, ordered_export, ids), truth))
+    assert_as_exact_over_orders(mine, theirs, "run export logits")
 
 
 def test_a_trained_lm_run_exports_and_reloads_at_its_own_logits(tmp_path):
@@ -472,7 +502,8 @@ def test_a_trained_lm_run_exports_and_reloads_at_its_own_logits(tmp_path):
     ids = jnp.asarray([[3, 4, 5, 6]], jnp.int32)
     np.testing.assert_array_equal(np.asarray(reloaded.model.apply(reloaded.variables, ids)),
                                   np.asarray(task.model.apply(task.variables, ids)))
-    assert_transformers_reads_the_run(destination, task, np.asarray([[3, 4, 5, 6, 7, 8, 9, 10]]))
+    assert_transformers_reads_the_run(destination, task, np.asarray([[3, 4, 5, 6, 7, 8, 9, 10]]),
+                                      ordered_export=tmp_path / "orders")
 
 
 def test_exporting_a_run_whose_model_has_no_published_layout_names_it(tmp_path):
