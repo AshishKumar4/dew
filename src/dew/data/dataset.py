@@ -1523,8 +1523,8 @@ def train_stream(source: Records, operations: Sequence[pygrain.Transformation], 
 
     `operations` run after the order and before the slice. So they run inside
     the workers, a record's rng is keyed by its place in the endless stream,
-    and what a record turns into depends on neither the process count nor the
-    worker count.
+    and what a record turns into depends on neither the share count nor the worker
+    count.
 
     `offset` starts the order past the records earlier phases read.
     """
