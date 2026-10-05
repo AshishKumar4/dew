@@ -1,10 +1,10 @@
 # Performance measurements
 
-These experiments measure training steps, kernel choices, XLA flags, optimizer settings, expert parallelism and rematerialization. Each section gives the revision and settings. The hardware is an RTX 4080 unless stated otherwise; some experiments use an L4, an A100, 4x RTX 3090 or a TPU v6e. A result at one shape and revision is not enough to choose a default for other workloads. [Step benchmarks](benchmarks.md) compares architectures. [Distributed training](concepts/distributed.md) explains how to configure distributed training.
+This page records performance experiments: where a training step's time goes, which kernel each hardware generation runs and why, which XLA flags and optimizer settings I tried, and how expert parallelism and rematerialization behave. Each section states its revision and settings, and its hardware if that is not an RTX 4080; some sections use an L4, an A100, 4x RTX 3090 or a TPU v6e. A result at one shape and one revision does not settle a default for every case. [Step benchmarks](benchmarks.md) compares architectures, and [Distributed training](concepts/distributed.md) describes how to configure distributed training.
 
 The timeline busy percentages below were taken before `e5ee70d`, which fixed the measurement window for nested kernel intervals. Before you reuse those percentages, replay the original traces. The synchronized wall-clock step times are separate measurements, and that arithmetic bug does not affect them.
 
-Replace the angle-bracket fields in these commands with your experiment's architecture, kernel and data:
+The commands below are templates. Replace the angle-bracket fields with your experiment's architecture, kernel and data:
 
 ```
 python tools/benchmark_attention.py --json-out attention.json
@@ -18,23 +18,22 @@ python tools/optimizer_curve.py --dataset <tokens> --optimizer <name> \
 
 ## Training scoreboard, 2026-10-03
 
-Dew and `torch.compile` train the same models with the same batch and
-optimizer constants. Both use bf16 compute over fp32 master weights.
-Timing covers a warm step: forward, backward, update and EMA where both
-keep one. Each row runs in its own process. The ratio divides Dew's
-throughput by the best reference row's throughput; above 1, Dew is faster.
-The torch rows come from
-`tools/reference_runs/torch_lm.py` (transformers models) and
-`tools/benchmark_torch.py` (line-by-line ports of Dew's modules). The Dew
-rows come from `tools/reference_runs/dew_lm.py` and `tools/benchmark_step.py`.
-`tools/reference_runs/scoreboard.py` builds the reference-run rows into one
-table.
+I ran Dew and `torch.compile` on the same models with the same batch, bf16
+compute over fp32 master weights and the same optimizer constants. Both time
+the same warm step (forward, backward, update, and the EMA where both keep
+one), with one process per row. The ratio is Dew's throughput divided by the
+best reference row's, so a ratio above 1 means Dew is faster. The torch rows
+come from `tools/reference_runs/torch_lm.py` (transformers models) and
+`tools/benchmark_torch.py` (line-by-line ports of Dew's modules), and the
+Dew rows from `tools/reference_runs/dew_lm.py` and
+`tools/benchmark_step.py`. `tools/reference_runs/scoreboard.py` collects the
+reference-run rows into one table.
 
 RTX 4080 16 GiB, Dew at `f6047cf9` (jax 0.11.2.post3), torch 2.13.0+cu130,
-transformers 5.17.0, SDPA attention. Each Dew row reports the range from
-two processes. Each torch row reports one process, or two where a range
-is given. Dew uses cuDNN attention as installed. Rows that name tokamax
-also have it installed (docs/installation.md):
+transformers 5.17.0, SDPA attention. Each Dew row gives the range over two
+processes. Each torch row is one process, or two where it gives a range. Dew
+runs as installed, with cuDNN attention; where a row names tokamax, tokamax
+was installed as well (docs/installation.md):
 
 | model | step | Dew | best torch.compile | Dew / torch |
 |---|---|---:|---:|---:|
@@ -47,73 +46,74 @@ also have it installed (docs/installation.md):
 | 176M hybrid DiT (published config) | batch 16, Adam, EMA | 60.1 ms, MFU 44.4%; tokamax 60.0-60.2 | no torch port | |
 | 176M hybrid DiT (published config) | batch 32 | 100.6 ms, MFU 53.1%; tokamax 100.0-100.1 | no torch port | |
 
-The Dew decoder and SimpleDiT rows take a fresh host batch every step.
-Their times match the fixed-batch rows. "Comparison with PyTorch" below
-gives both batch methods for both frameworks, with commands.
-For Qwen3-0.6B at 1 x 1024, both frameworks keep the device busy:
-torch uses 110.3 ms of its 112.1 ms step in the second process, and Dew
-uses 96.0 of 96.2. For the MoE, torch idles on the host for 20.9 ms a step.
-Comparing device time alone, Dew is 1.26x faster (78.1 against 98.3 ms busy).
+The Dew decoder and SimpleDiT rows take a fresh batch from the host every
+step, and their times match the fixed-batch rows. "Comparison with PyTorch"
+below runs both frameworks both ways and gives the commands. With Qwen3-0.6B
+at 1 x 1024 both devices stay busy (torch for 110.3 ms of its 112.1 ms step
+in the second process, Dew for 96.0 of 96.2). On the MoE, torch idles
+20.9 ms a step on the host, and on device time alone Dew is 1.26x faster
+(78.1 against 98.3 ms busy).
 
-Between `4d392f0a` and `f6047cf9`, the hybrid DiT step fell from 66.5 to
-60.1 ms at batch 16 and from 110.2 to 100.6 at 32. The intervening merges
-include the S5 recurrence in real arithmetic ("The hybrid DiT's SSM blocks"
-below) and the DiT MLP's GELU in fp32. The other rows stayed within their
-measured spread.
+From `4d392f0a` to `f6047cf9` the hybrid DiT went from 66.5 to 60.1 ms at
+batch 16 and from 110.2 to 100.6 at batch 32. The merges in between include
+the S5 recurrence in real arithmetic ("The hybrid DiT's SSM blocks" below)
+and the DiT MLP's GELU in fp32. The other rows stayed within their spread.
 
-Several changes since `42ddfc14` reduced step time:
+These changes landed after `42ddfc14`:
 
-- The hybrid DiT's dilated depthwise convolutions use undilated kernels over
-  interleaved grids (75.4 to 70.2 ms at batch 16).
-- The vocabulary head computes logsumexp, maximum and argmax in one pass.
-  Its gradient products read one bf16 copy of the logits' gradient. This
-  lets the MoE keep its whole logits in memory (119.6 to 92.7 ms).
-- Pretrained weights no longer have the gap in placement that forced
-  Qwen3-0.6B at 2 x 1024 to recompute (185.7 to 161.2 ms).
-- At default precision, the head rounds its logits and their gradient to
-  bf16 once, as torch autocast and MaxText do. "The vocabulary head" below
-  compares quality. The 3-layer decoder fell from 59.9 to 52.2 ms, the
-  MoE from 92.7 to 79.2, and Qwen3-0.6B at 2 x 1024 from 161.2 to 154.0.
+- The hybrid DiT's dilated depthwise convolutions run as undilated ones over
+  their interleaved grids (75.4 to 70.2 ms at batch 16).
+- The vocabulary head computes its logsumexp, maximum and argmax in one
+  pass, and its gradient products read one bf16 copy of the logits'
+  gradient. That lets the MoE's whole logits fit in memory (119.6 to
+  92.7 ms).
+- Pretrained weights are placed without the hole that made Qwen3-0.6B at
+  2 x 1024 recompute (185.7 to 161.2 ms).
+- At the default precision, the head rounds its logits and their gradient to
+  bf16 once, as torch autocast and MaxText do ("The vocabulary head" below
+  has the quality comparison). The 3-layer decoder went from 59.9 to
+  52.2 ms, the MoE from 92.7 to 79.2, and Qwen3-0.6B at 2 x 1024 from 161.2
+  to 154.0.
 
-From `42292e99` to `4d392f0a` (92 merges from every lane), Qwen3-0.6B at
-1 x 1024 fell from 100.4-101.9 to 96.2 ms. At 2 x 1024 it fell from
-154.0 to 148.1, the decoder from 52.2 to 49.1, and the hybrid DiT at
-batch 32 from 116.6-122.3 to 110.2-110.3. Two changes affect the training
-step itself. It keeps every bf16 rounding specified by the program
-(`--xla_allow_excess_precision=false`) and compiles without XLA's dot merger.
-Disabling the dot merger took Qwen3-0.6B at 1 x 1024 from 97.7-98.0 to
-94.1-94.2 ms in its own A/B. "XLA flags" below covers both changes.
+From `42292e99` to `4d392f0a` (92 merges from every lane), Qwen3-0.6B went
+from 100.4-101.9 to 96.2 ms at 1 x 1024 and from 154.0 to 148.1 at 2 x 1024,
+the decoder from 52.2 to 49.1, and the hybrid DiT at batch 32 from
+116.6-122.3 to 110.2-110.3. Two of those changes are to the training step
+itself. The step keeps every bf16 rounding the program asks for
+(`--xla_allow_excess_precision=false`), and it compiles without XLA's dot
+merger. Dropping the dot merger took Qwen3-0.6B at 1 x 1024 from 97.7-98.0
+to 94.1-94.2 ms in its own A/B. "XLA flags" below covers both.
 
-For Qwen3-0.6B at 1 x 1024, XProf and the torch profiler measure device
-kernel time per step. GEMMs take 42.2 ms in Dew against 42.3 in torch;
-attention takes 8.7 against 7.2. The update, casts, norms and loss take
-45.0 ms in Dew (copies 28.0, including the fused update; converts 10.7;
-reductions 5.7; elementwise 0.6). They take 60.8 in torch (optimizer 39.5,
-copies 13.8, elementwise 6.0, loss 1.0, reductions 0.5). Both frameworks
-cast the fp32 master weights to bf16 every step and cast the gradients
-back. Torch uses its `_to_copy` kernels for these casts.
+I split Qwen3-0.6B's device kernel time per step at 1 x 1024 by kind, with
+XProf for Dew and the torch profiler for torch. GEMMs take 42.2 ms in Dew
+against 42.3 in torch, and attention 8.7 against 7.2. Everything else (the
+update, the casts, the norms and the loss) takes 45.0 ms in Dew against 60.8
+in torch. Dew's share is copies 28.0 (with the fused update), converts 10.7,
+reductions 5.7 and elementwise 0.6; torch's is optimizer 39.5, copies 13.8,
+elementwise 6.0, loss 1.0 and reductions 0.5. Both frameworks cast the fp32
+master weights to bf16 every step and cast the gradients back, and torch's
+casts are its `_to_copy` kernels.
 
-Dew's optimizer update is faster in these runs. XLA fuses Adam (or AdamW),
-EMA and the finiteness guard into one bandwidth-bound pass over the state.
-On the 768-wide SimpleDiT, this takes 6.9 ms against 16.2 for torch's
-fused Adam and foreach EMA. On Qwen3-0.6B, it takes 27.6 ms against 39.5
-for torch's fused AdamW and gradient clipping. GEMMs match or beat torch
-(44.5 against 47.2 ms on the 768-wide SimpleDiT). Dew's host cost is at
-most 2.6 ms a step on these rows, while torch.compile's reaches 25 ms.
-For Qwen3-0.6B at 2 x 1024, Dew's host work takes 13.0 ms and overlaps
-with device work.
+Dew is faster in the optimizer update. XLA fuses Adam (or AdamW), the EMA
+and the finiteness guard into one bandwidth-bound pass over the state. That
+pass takes 6.9 ms on the 768-wide SimpleDiT, against 16.2 for torch's fused
+Adam and foreach EMA, and 27.6 ms on Qwen3-0.6B, against 39.5 for torch's
+fused AdamW and gradient clipping. GEMMs run at par or better (44.5 against
+47.2 ms on the 768-wide SimpleDiT). Dew's host cost is at most 2.6 ms a step
+on these rows, where torch.compile's reaches 25 ms, except on Qwen3-0.6B at
+2 x 1024. There it is 13.0 ms, hidden behind the device.
 
-Dew's attention is slower in these runs. On the 768-wide SimpleDiT (head
-dimension 64, 256 tokens), cuDNN's fused forward and backward kernels take
-5.6 ms against 4.4 for FlashAttention-2 in torch. On Qwen3-0.6B (head
-dimension 128, causal, 1024 tokens), they take 8.7 against 7.2. With tokamax
-installed, 'auto' uses its Pallas-Triton kernel for heads up to 64 wide.
-It takes 4.3 ms on SimpleDiT ("tokamax's attention" below). At 128 wide,
-cuDNN stays faster: Qwen3-0.6B's widths at 2 x 1024 take 148.8-149.0
-against 151.1 ms a step. For Qwen3-0.6B at 1 x 1024, cuDNN takes 2.56 ms
-forward and 5.25 backward, including its grouped-query head reduction.
-FlashAttention-2 takes 2.05 and 4.56. No alternative on this stack closes
-that gap ("At 128-wide heads" below).
+Dew is slower in attention. cuDNN's fused kernels take 5.6 ms forward and
+backward on the 768-wide SimpleDiT (head dimension 64, 256 tokens), against
+4.4 for FlashAttention-2 in torch, and 8.7 against 7.2 on Qwen3-0.6B (head
+dimension 128, causal, 1024 tokens). With tokamax installed, 'auto' runs
+tokamax's Pallas-Triton kernel for heads up to 64 wide, which takes 4.3 ms
+on the SimpleDiT ("tokamax's attention" below). At 128 wide cuDNN stays
+faster; Qwen3-0.6B's widths at 2 x 1024 step in 148.8-149.0 ms with cuDNN
+and 151.1 with tokamax. Kernel by kernel on Qwen3-0.6B at 1 x 1024, cuDNN
+takes 2.56 ms forward and 5.25 backward (including its grouped-query head
+reduction), against 2.05 and 4.56 for FlashAttention-2's kernels. No
+alternative on this stack closes that gap ("At 128-wide heads" below).
 
 A100 40 GB (Colab). The first rows come from one session at integration
 `f08009d7` (c17: jax 0.11.2.post3, torch 2.13.0+cu130, transformers
@@ -150,27 +150,27 @@ against FlashAttention-2), and the update and casts 30.4 against 37.0 for
 torch's copies and optimizer. The MoE took 45.1 against 78.1; torch also
 idles on the host for 86 ms a step.
 
-The older rows predate every change listed above. For Qwen3-0.6B at
-`8c391009`, torch idled on the host for 18.3 ms a step. Its device did
-120 ms of work against Dew's 138. Dew's attention took 21.4 against
-16.6 ms (cuDNN's sm80 backward against FlashAttention-2), its converts
-17.8 ms, and its reductions 10.9 against 4.2 (the norms and the fp32
-head). Dew's GEMMs took 64.9 against 70.9. Its update was part of
-22.7 ms of copies, less than torch's 19.2 ms of copies plus 17.8 for
-the optimizer. The Mamba-2 row and the MoE at `157bc21a` beat torch only
-because torch idled on the host (77 to 177 ms a step). On device time,
-Dew was 1.7 and 2.0 times slower because of its expert GEMMs and the
-XLA path of the SSD scan. The MaxText row ran on another VM, before the
-whole-logits head reduced Dew's step from 161.9 to 141 ms.
+The older rows predate every change listed above. On Qwen3-0.6B at
+`8c391009`, torch idled 18.3 ms a step on the host, so its device did 120 ms
+of work against Dew's 138. Dew lost time in attention, 21.4 against 16.6 ms
+(cuDNN's sm80 backward against FlashAttention-2), in its converts (17.8 ms)
+and in its reductions, 10.9 against 4.2 (the norms and the fp32 head). Its
+GEMMs were faster, 64.9 against 70.9, and its update, counted inside 22.7 ms
+of copies, beat torch's 19.2 ms of copies plus 17.8 of optimizer. The
+Mamba-2 row, and the MoE at `157bc21a`, came out ahead only because torch
+idled on the host (77 to 177 ms a step). On device time Dew was 1.7 times
+slower on Mamba-2 (the XLA path of the SSD scan) and 2.0 times slower on the
+MoE (its expert GEMMs). The MaxText row ran on another VM, before the
+whole-logits head took Dew's step from 161.9 to 141 ms.
 
-On a TPU v6e (Colab, one chip), Dew and MaxText 0.2.4 ran on the same VM.
-`tools/reference_runs/dew_lm.py` uses pretrained weights and the reference
-corpus; `tools/reference_runs/maxtext_run.py` uses MaxText's synthetic tokens.
-Both use bf16 compute over fp32 weights and AdamW with a 1.0 global-norm
-clip. Each ran 90 steps, with steps 30-89 timed and no profiling, in two
-processes each at integration `8895763d` (jax 0.11.2.post3, libtpu 0.0.48).
-The table reports ms a step, computed as each window's wall time divided
-by its step count, and the ratio of those means:
+TPU v6e (Colab, one chip), Dew against MaxText 0.2.4 on the same VM, at
+integration `8895763d` (jax 0.11.2.post3, libtpu 0.0.48). Dew ran
+`tools/reference_runs/dew_lm.py` with pretrained weights and the reference
+corpus, and MaxText ran `tools/reference_runs/maxtext_run.py` on MaxText's
+synthetic tokens. Both used bf16 compute over fp32 weights and AdamW with a
+1.0 global-norm clip. Each ran 90 steps, two processes each, with steps
+30-89 timed and nothing profiled. The table gives ms a step as each window's
+mean (its wall time over its steps), and the ratio of the means:
 
 | model | tokens | Dew | MaxText, minimal remat | MaxText, default remat | Dew / best MaxText |
 |---|---|---:|---:|---:|---:|
@@ -178,23 +178,22 @@ by its step count, and the ratio of those means:
 | Qwen3-0.6B | 16 x 1024 | 288.9, 26.4% | 299.7-299.8, 25.5% | 343.7, 22.2% | 1.04 |
 | Qwen3-1.7B | 4 x 1024 | 153.3, 32.1% | 158.7-158.8, 31.0% | 179.7, 27.4% | 1.04 |
 
-Dew's 16 x 1024 window covers steps 30-63, where its two epochs of data
-end; MaxText's covers 30-89. Dew tiles the vocabulary head because the
-whole logits do not fit. This is the first memory fallback in `fit`.
-MaxText's minimal-remat windows include a few slow steps. Its median
-step is 150.1 ms at 0.6B 8 x 1024 and 154.9 at 1.7B, against means of
-154.0 and 158.7. Dew's runner times only the window, so it has no median
-for comparison. If all of MaxText's steps took its median time, the
-ratios would be 1.03 and 1.01.
+Dew's 16 x 1024 window is steps 30-63, because its two epochs of data end
+there; MaxText's is 30-89. That Dew run also tiles the vocabulary head, the
+first rung of the fit ladder, because the whole logits do not fit. MaxText's
+minimal-remat windows contain a few slow steps. Its median step is 150.1 ms
+at 0.6B 8 x 1024 and 154.9 at 1.7B, against means of 154.0 and 158.7. Dew's
+runner times only the whole window, so it has no median to compare. If every
+MaxText step took its median time, the ratios would be 1.03 and 1.01.
 
-The global-norm clip adds 8.1 ms to Dew's step here. With Qwen3-0.6B's
-widths at 8 x 1024, `tools/benchmark_step.py` reuses one device batch and
-takes 137.2 ms with `optax.adam`. It takes 145.3 with dew_lm's optimizer
-(the norm, clip, AdamW and schedule), matching the reference runner's step.
-On the RTX 4080, the same comparison at 1 x 1024 gives 94.0 against
-96.0. Compiled for the v6e, the clip writes 6.1 GiB more a step (80 to
-86 GiB). These are copies of the gradients retained until the norm has
-all of them.
+The global-norm clip costs Dew 8.1 ms a step here. Through
+`tools/benchmark_step.py`, with one batch kept on the device, Qwen3-0.6B's
+widths at 8 x 1024 take 137.2 ms with `optax.adam` and 145.3 with dew_lm's
+optimizer (the norm, the clip, AdamW and the schedule), the same as the
+reference runner's step. On the RTX 4080 the same comparison at 1 x 1024
+gives 94.0 against 96.0. Compiled for the v6e, the program with the clip
+writes 6.1 GiB more a step (80 to 86 GiB). The extra writes are copies of
+the gradients, which the norm holds until every one is in.
 
 ## Rounding on the TPU, 2026-10-02
 
