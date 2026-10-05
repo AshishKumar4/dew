@@ -240,12 +240,13 @@ class WandbTracker(_OwnedTracker):
 
 
 class LocalTracker(_OwnedTracker):
-    """Writes synchronous reports in a tracking directory.
+    """Writes each report to a tracking directory as it is logged.
 
-    Those are JSONL journals, preview files and optional plots. Nonfinite
-    metrics are journaled as the strings NaN, +Inf and -Inf. Plotting runs
-    only on plot() or close and reads the journal rather than retaining
-    history.
+    The reports are JSONL journals (`scalars.jsonl` and `records.jsonl`),
+    preview files and, with `plots`, plots. Nonfinite metrics are written to
+    the journal as the strings NaN, +Inf and -Inf. Plots are drawn only by
+    `plot()`, or by `close` when `plots` is set, and they read the journal,
+    so the tracker keeps no history in memory.
     """
 
     def __init__(self, directory: str | Path, *, plots: bool = False):
@@ -289,7 +290,8 @@ class LocalTracker(_OwnedTracker):
                                     'time': time.time(), 'files': [path.name for path in files]})
 
     def plot(self) -> list[Path]:
-        """Render journal metrics with matplotlib Agg; never changes the journal."""
+        """Plot each metric in the journal to `metric-<index>.png` with matplotlib's Agg backend, and
+        return the paths. The journal is not changed."""
         self._check()
         from matplotlib.backends.backend_agg import FigureCanvasAgg
         from matplotlib.figure import Figure
@@ -395,10 +397,10 @@ def _(value: TokenScores, prefix: Path) -> list[Path]:
 class MLflowTracker(_OwnedTracker):
     """An MLflow run in `experiment`, opened on the first value logged into it.
 
-    Scalars are the run's metrics and a preview is uploaded as the files the
-    local renderers write. A record becomes a JSON artifact rather than a
-    parameter: MLflow refuses a second value for a parameter, and a run
-    reports several records under one type.
+    Scalars are logged as the run's metrics, and a preview is uploaded as the
+    files `LocalTracker` writes for it. A record is uploaded as a JSON
+    artifact and not as a parameter, because MLflow refuses a second value
+    for a parameter and a run reports several records of the same type.
     """
 
     def __init__(self, experiment: str, name: str | None = None, *, uri: str | None = None):
@@ -411,7 +413,8 @@ class MLflowTracker(_OwnedTracker):
 
     @property
     def run(self) -> tuple[MlflowClient, str]:
-        """The client and the run id, creating the experiment and the run once."""
+        """The MLflow client and the run id; the first access creates the run, and the experiment if
+        it does not exist."""
         if self._closed:
             raise RuntimeError('MLflowTracker is closed')
         if self._run is None:
@@ -464,9 +467,12 @@ class TensorBoardTracker(_OwnedTracker):
     """A TensorBoard event file in `directory`, opened on the first value
     logged into it.
 
-    Scalars are scalar summaries and a record is the JSON its journal row
-    holds, as a text summary under `reporting/<type>`. Previews render with
-    `_summarize`.
+    Scalars are written as scalar summaries. A record is written as the JSON
+    `LocalTracker` journals for it, in a text summary under
+    `reporting/<type>`. Image and video grids are written as image summaries,
+    with a video as an animated GIF; text samples as text; and
+    representations as a histogram of their spread. Other previews raise
+    `TypeError`.
     """
 
     def __init__(self, directory: str | Path):
@@ -476,7 +482,7 @@ class TensorBoardTracker(_OwnedTracker):
 
     @property
     def writer(self) -> EventFileWriter:
-        """The event-file writer, opening `directory` once."""
+        """The event-file writer, which the first access opens in `directory`."""
         if self._closed:
             raise RuntimeError('TensorBoardTracker is closed')
         if self._writer is None:
@@ -593,7 +599,11 @@ def _(value: Representations):
 
 
 class Trackers(_OwnedTracker):
-    """Fan out without dropping reports; attempt every sink, raise the first failure."""
+    """Sends each report to several trackers.
+
+    Every tracker receives every report, even when an earlier tracker fails.
+    Then the first failure is raised, with the later ones attached as notes.
+    """
 
     def __init__(self, *trackers: Tracker):
         self.trackers = trackers

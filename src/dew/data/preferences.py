@@ -142,13 +142,17 @@ class PreferenceSource:
 @datasets("preference_pairs")
 @dataclasses.dataclass(frozen=True)
 class PreferencePairs(DatasetSpec):
-    """Reads chosen and rejected completions as fixed-width pairs.
+    """Reads chosen and rejected completions as fixed-width pairs, for DPO.
 
-    `path` is a parquet file and `records` is JSON rows for tests and small
-    sweeps; exactly one of the two is set. Each batch holds `input_ids` and
-    `completion_mask` as `[B, 2, seq_len]` pairs, chosen at index 0. A row
-    longer than `seq_len` fails. `val_path` is a second parquet file scored
-    as one pass; None trains without validation.
+    `path` is a parquet file, and `records` is JSON rows for tests and small
+    sweeps; set exactly one of the two. A row holds `chosen` and `rejected`
+    token-id lists, and optionally `chosen_mask` and `rejected_mask`, which
+    mark the completion tokens with 1 and default to all ones. Each batch
+    holds `input_ids` and `completion_mask` as `[B, 2, seq_len]` pairs, with
+    the chosen row at index 0, padded with `pad_id` and 0. A row longer than
+    `seq_len` raises `ValueError`, because cutting it could cut a completion
+    and train the wrong preference. `val_path` is a second parquet file
+    scored as one pass; None trains without validation.
     """
 
     path: str | None = None
