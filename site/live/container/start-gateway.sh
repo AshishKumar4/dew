@@ -2,8 +2,8 @@
 # Private administrative evaluation. Public routing waits for boundary and
 # memory/concurrency checks; no production configuration invokes this script.
 set -eu
-mkdir -p /run/dew/gateway /sessions/connections /work
-chmod 0711 /sessions /sessions/connections
+mkdir -p /run/dew/gateway /sessions/connections /sessions/ipc /work
+chmod 0711 /sessions /sessions/connections /sessions/ipc
 : > /kernel.json
 for index in $(seq 0 99); do
   id -u "ctx$index" >/dev/null 2>&1 || useradd --uid "$((6100+index))" --no-create-home --home-dir /work --shell /usr/sbin/nologin "ctx$index"
