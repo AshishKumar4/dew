@@ -33,9 +33,9 @@ for steps in (15, 30):
          guidance=CFG(6.0, interval=(0.15, 0.9))).host()
 bundle = PretrainedDecoder.load('/opt/models/HuggingFaceTB/SmolLM2-135M-Instruct',
                                 dtype=jnp.float32, max_seq_len=256)
-server = Server.from_task(bundle.text_generation(sampling=Sampling(temperature=0)), slots=4, capacity=128)
+server = Server.from_task(bundle.text_generation(sampling=Sampling(temperature=0)), slots=8, capacity=256)
 ids = bundle.processor('The capital of France is').tokens[0]
-tickets = [server.submit(ids, 24, key=0) for _ in range(4)]
+tickets = [server.submit(ids, 24, key=0) for _ in range(8)]
 server.run()
 for ticket in tickets:
     if not ticket.result().text[0]:

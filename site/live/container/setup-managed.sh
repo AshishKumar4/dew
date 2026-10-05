@@ -13,7 +13,7 @@ python3 -m venv /opt/venv
 /opt/venv/bin/pip install --no-cache-dir \
     "dewml @ https://github.com/AshishKumar4/dew/archive/$commit.tar.gz" \
     -c "https://raw.githubusercontent.com/AshishKumar4/dew/$commit/constraints.txt" \
-    ipykernel==7.3.0 jupyter-kernel-gateway==3.0.1 jupyter-client==8.10.0 pillow==12.3.0
+    ipykernel==7.3.0 jupyter-kernel-gateway==3.0.1 jupyter-client==8.10.0 pillow==12.3.0 websockets==17.1
 id -u model >/dev/null 2>&1 || useradd --uid 5000 --create-home --shell /usr/sbin/nologin model
 mkdir -p /opt/live /opt/models /opt/hf /opt/xla /run/dew /sessions
 chown model:model /opt/models /opt/hf /opt/xla
@@ -21,7 +21,8 @@ chmod 0755 /opt/models /opt/hf /opt/xla
 for file in text-to-image text-models; do
     curl -fsSL "https://raw.githubusercontent.com/AshishKumar4/dew/$commit/site/live/container/$file" -o "/opt/live/$file"
 done
-for file in guest_limits.py guest_entry.py gateway_manager.py start-gateway.sh benchmark_gateway.py warm-managed.py; do
+for file in guest_limits.py guest_entry.py gateway_manager.py start-gateway.sh benchmark_gateway.py warm-managed.py progress.py model_client.py model_service.py \
+            shared_bridge.py kernel_outputs.py start-shared.sh; do
     curl -fsSL "https://raw.githubusercontent.com/AshishKumar4/dew/$source/site/live/container/$file" -o "/opt/live/$file"
 done
 printf '%s\n' "$commit" > /opt/live/dew-commit
