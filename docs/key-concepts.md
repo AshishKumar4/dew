@@ -90,6 +90,8 @@ class ResidualMLP(nn.Module):
 
 Every checkpoint of this model records `"architecture": "residual_mlp"` and `"config": {"features": 64}`. `TextToImage.from_run` and `dew.pipeline` use that record to rebuild the model. For decoders, `TextGeneration.from_run` and `Pretrained.from_run` load runs the same way. A composite model's record includes each registered part. An adapted model records its base model and the adapter's rank, alpha and modules.
 
+A package outside Dew registers its members the same way. It names the module that registers them under the `dew.plugins` entry-point group in its `pyproject.toml` (`[project.entry-points."dew.plugins"]`, `mypackage = "mypackage"`). When Dew meets a name it has not registered, it imports every such entry once and looks again, so a run recorded with the package's model loads in a process that has not imported the package. A kind of the package's own is a `Registry("activation", record="kind").share()`, created in the module that defines its base class. An objective of its own uses `saved_task` to name the task its runs load as through `dew.pipeline`, as Dew's objectives do.
+
 You need registration to load a run from its record. An unregistered model still trains, checkpoints and resumes normally. Its record uses the class name in lower case. The first checkpoint prints a warning with the registration line to add. Loading the run also reports that line. Once you add it, the same run loads.
 
 Dew's modules name the logical axes of their parameters, such as `embed`, `heads` and `mlp`. The trainer maps those names onto the device mesh, so the model code does not change when the mesh does. [Distributed training](concepts/distributed.md) describes the mapping.

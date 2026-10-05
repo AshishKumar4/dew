@@ -15,6 +15,7 @@ from flax import linen as nn
 from reference_error import assert_as_exact_as_the_reference
 from test_diffusion_run_sources import batch_for
 
+import dew
 from dew.checkpoints import Checkpoints
 from dew.config import ModelConfig, TrainerConfig
 from dew.data import TFDSImages
@@ -235,3 +236,7 @@ def test_a_saved_student_samples_in_one_step(runs, tmp_path):
     assert TEACHER not in restored.variables and DISCRIMINATOR not in restored.variables["params"]
     expected = task.pipeline(state, ema=False)(["a red bird"], key=9).host().images
     np.testing.assert_array_equal(restored(["a red bird"], key=9).host().images, expected)
+    # The run records the "ladd" objective, whose saved task it inherits.
+    front = dew.pipeline(str(tmp_path / "student"))
+    assert isinstance(front, TextToImage)
+    np.testing.assert_array_equal(front(["a red bird"], key=9).host().images, expected)

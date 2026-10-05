@@ -24,7 +24,7 @@ from jax.typing import DTypeLike
 from dew.checkpoints import RUN_FILE
 from dew.inference.tasks import BlockGeneration, MaskedGeneration, TextGeneration
 from dew.nn.inputs import Media, ModelInputs, pad_token_rows
-from dew.objectives.base import Variables
+from dew.objectives.base import SavedTask, Variables
 from dew.registry import dtype_name
 from dew.sampling.pipelines import TextToImage
 from dew.telemetry.instrumentation import default_compilation_cache_dir, enable_compilation_cache
@@ -43,12 +43,14 @@ def pipeline(
     ema: bool | None = None,
     step: int | str | None = None,
     revision: str | None = None,
-) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration:
+) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration | SavedTask:
     """Load the inference task for `source`, its weights placed once.
 
     `source` is a run directory, or a source checkpoint directory or Hub
-    repository. `mesh` places the weights on that mesh under `layout` (the
-    trainer's default when None). Without `mesh`, data parallelism uses the
+    repository. A run loads as the task its recorded objective declares
+    (`Objective.saved_task`), a plugin objective's own included. `mesh`
+    places the weights on that mesh under `layout` (the trainer's default
+    when None). Without `mesh`, data parallelism uses the
     current pool's devices. dtype selects computation, a dtype (`jnp.bfloat16`)
     or its name. param_dtype selects parameter storage: None preserves a
     run's stored dtypes and uses FP32 masters for a source, and 'auto' stores
@@ -92,30 +94,19 @@ def _persist_compilations() -> None:
     enable_compilation_cache(default_compilation_cache_dir())
 
 
-SAVED_TASKS: Mapping[str, type[TextToImage] | type[TextGeneration] | type[BlockGeneration]
-                     | type[MaskedGeneration]] = {
-    "diffusion": TextToImage, "lm": TextGeneration, "dpo": TextGeneration,
-    "grpo": TextGeneration, "ppo": TextGeneration, "block_diffusion": BlockGeneration,
-    "masked_diffusion": MaskedGeneration}
-"""Which task each saved objective kind generates through.
-
-One entry per kind a run publishes weights for; each task's own `from_run`
-holds the construction, so this is the whole of what the front door knows
-about a run beyond the name its `run.json` records.
-"""
-
-
 def _from_run(root: epath.Path, *, mesh: MeshSpec | None, layout: Layout | None,
               dtype: str | None, param_dtype: str | None, ema: bool | None,
-              step: int | str | None) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration:
+              step: int | str | None) -> SavedTask:
+    """The task the run's recorded objective declares (`Objective.saved_task`)."""
     from dew.inference.tasks import run_record
-    record = run_record(str(root), step)
     from dew.records import text
-    kind = text(record['objective'], 'objective')
-    task = SAVED_TASKS.get(kind)
+    from dew.registry import objectives
+
+    kind = text(run_record(str(root), step)['objective'], 'objective')
+    task = objectives[kind].saved_task
     if task is None:
-        supported = ", ".join(list(SAVED_TASKS)[:-1]) + f" and {list(SAVED_TASKS)[-1]}"
-        raise TypeError(f"{kind!r} has no saved generation task; supported kinds are {supported}")
+        raise TypeError(f"a run of the {kind!r} objective ({objectives[kind].__name__}) loads as no task: "
+                        "its class declares no `saved_task`")
     return task.from_run(str(root), ema=ema, step=step, mesh=mesh, layout=layout,
                          dtype=dtype, param_dtype=param_dtype)
 
