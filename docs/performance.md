@@ -1566,15 +1566,15 @@ admitting program took 1068 against 1078 ms a run, with GEMMs at 671 against
 676 and attention at 253 against 252.
 
 The mixed step is not bitwise the same as the two forwards, because its
-GEMMs run at other shapes. Against the same bf16 weights computed in fp32 at
-the highest precision, over 28 decoding rows and four admitted prompts of 64
-to 256 tokens, its RMS distance is 0.84 times the two forwards' on
-Qwen3-0.6B's decoding logits and 0.97 on its prompt logits
-(log-probabilities 0.83 and 0.95), and 1.09 and 0.99 on Qwen3-1.7B's (1.14
-and 0.98), against tests/reference_error.py's allowed 2. At 32 slots 27 of
-64 greedy rows part from integration's, all at bf16 near-ties (a median 0.57
-bf16 spacings apart in fp32, at most 1.44). The fp32 argmax is the
-two-forward choice in 16 rows and the mixed one in 11.
+GEMMs run at other shapes. I compared both against the same bf16 weights
+computed in fp32 at the highest precision, over 28 decoding rows and four
+admitted prompts of 64 to 256 tokens. The mixed step's RMS distance is 0.84
+times the two forwards' on Qwen3-0.6B's decoding logits and 0.97 on its
+prompt logits (log-probabilities 0.83 and 0.95), and 1.09 and 0.99 on
+Qwen3-1.7B's (1.14 and 0.98), against tests/reference_error.py's allowed 2.
+At 32 slots 27 of 64 greedy rows part from integration's, all at bf16
+near-ties (a median 0.57 bf16 spacings apart in fp32, at most 1.44). The
+fp32 argmax is the two-forward choice in 16 rows and the mixed one in 11.
 
 Over a paged cache, 2026-10-04. The mixed step now runs over a page pool
 too. The admitted rows' tables go into the cache before the step writes,
@@ -1917,7 +1917,7 @@ With the rule, I measured the same steps against XLA's default (the merger on) t
 | 3-layer decoder, full | 1 x 128 | 5.33 | 5.23 | -1.8% |
 | 3-layer decoder, full | 4 x 256 | 10.02 | 10.00 | -0.3% |
 
-At 128 tokens the shapes disagree. In two more sessions of merged against separate dots, 1 x 128 ran 20.65 and 20.65 ms merged against 18.98 and 19.11 separate, while 2 x 64 ran 18.72 and 18.63 against 18.96 and 19.03, and 4 x 32 ran 18.56 and 18.50 against 18.91 and 18.81 (1 x 96: 18.22 and 18.22 against 18.41 and 18.43; 1 x 160: 22.33 and 21.95 against 20.57 and 20.37). A boundary below 128 would run 2 x 64 and 4 x 32 1.3-2.1% slower than XLA's default, so the boundary includes 128, and 1 x 128 runs at XLA's default, 1.6 ms behind separate dots.
+At 128 tokens the shapes disagree. In two more sessions, 1 x 128 ran in 20.65 and 20.65 ms merged against 18.98 and 19.11 with separate dots. 2 x 64 went the other way, 18.72 and 18.63 merged against 18.96 and 19.03, and so did 4 x 32, 18.56 and 18.50 against 18.91 and 18.81. 1 x 96 also ran faster merged (18.22 and 18.22 against 18.41 and 18.43), and 1 x 160 faster with separate dots (22.33 and 21.95 against 20.57 and 20.37). A boundary below 128 would run 2 x 64 and 4 x 32 1.3-2.1% slower than XLA's default, so the boundary includes 128, and 1 x 128 runs at XLA's default, 1.6 ms behind separate dots.
 
 ### The forward's bf16 weights: `NARROW_COPY_GENERATIONS`, 2026-10-03
 
