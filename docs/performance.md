@@ -1839,130 +1839,34 @@ The two L4 step rows are jax 0.11.2 from one Colab session (2026-09-22, 19:55 to
 
 ### The vocabulary head: the compute dtype's product
 
-The head product uses the compute dtype, matching torch autocast and
-MaxText (`logits_dot_in_fp32=False`). With bf16 compute, both operands
-multiply as bf16 with fp32 accumulation, in the model head and chunked
-loss alike. Softmax and loss stay fp32. An fp32 model keeps its fp32
-head. The table measures the chunked head's forward plus backward alone,
-with 8 x 1024 tokens, 1024 features and vocabulary 50304:
+The head's product follows the compute dtype, as torch autocast and MaxText (`logits_dot_in_fp32=False`) run it. Under bf16 compute both operands multiply as bf16 with fp32 accumulation, in the model's head and the chunked loss alike, while the softmax and the loss stay fp32; an fp32 model keeps its fp32 head. The table times forward plus backward of the chunked head alone, at 8 x 1024 tokens, 1024 features and vocabulary 50304:
 
 | device | fp32 operands (before) | bf16 operands, with argmax | bf16 operands, no argmax | fused linear cross entropy (Pallas port of Liger) |
 |---|---|---|---|---|
 | L4 | 206.16 ms | 134.02 ms | 133.91 ms | 142.63 ms |
 | v6e | 8.04 ms | 8.03 ms | 7.26 ms | not run |
 
-On the v6e, fp32 operands already multiplied in one bf16 pass. Only
-skipping argmax (`token_accuracy=False`) reduces head time. On the L4,
-argmax fuses into the head kernels. The bf16 product reduced the L4
-lm-dense step from 138.72 ms to 129.36 ms. On the RTX 4080 (jax
-0.11.2), the head at 4 x 1024 tokens fell from 45.25 ms to 28.00 ms.
+On the v6e the fp32 operands already multiplied in one bf16 pass, so only skipping the argmax (`token_accuracy=False`) changes the head's time. On the L4 the argmax fuses into the head's own kernels. With the bf16 product, the lm-dense step on the L4 went from 138.72 ms to 129.36 ms, and on the RTX 4080 (jax 0.11.2) the head at 4 x 1024 tokens went from 45.25 ms to 28.00 ms.
 
-The bf16 product changes loss by less than its own rerun spread.
-`tools/lm_step_parity.py` ran the 39M-parameter decoder for 100 steps on
-the RTX 4080, twice each way. Two fp32-head runs differ by at most
-2.3e-4 relative at any step; two bf16-head runs differ by 7.7e-4.
-Comparing bf16-head with fp32-head runs gives 3.4e-4 and 7.2e-4,
-within the bf16 head's rerun spread. Final losses are 0.0078378 and
-0.0078376 for fp32, and 0.0078368 and 0.0078387 for bf16.
+The bf16 product changes the loss by less than the loss changes between reruns. I ran `tools/lm_step_parity.py`, 100 steps of the 39M-parameter decoder on the RTX 4080, twice each way. Two fp32-head runs differ by at most 2.3e-4 relative at any step and two bf16-head runs by 7.7e-4, while a bf16-head run differs from an fp32-head run by 3.4e-4 and 7.2e-4, within the bf16 head's own rerun spread. The final losses are 0.0078378 and 0.0078376 with the fp32 head, and 0.0078368 and 0.0078387 with the bf16 head. I rejected the fused Pallas kernel, which is 6% slower than the chunked head on the L4, and tokamax's `mosaic_tpu` head, which is 2.24x slower on the v6e (kernel catalog, 2026-09-22).
 
-The fused Pallas kernel was rejected because it is 6% slower than the
-chunked head on the L4. Tokamax's `mosaic_tpu` head was also rejected:
-it is 2.24x slower on the v6e (kernel catalog, 2026-09-22).
+On an A100, the reference runs measured the fp32 head at 38 ms a step, 21% of a Qwen3-0.6B bf16 fine-tune's busy time, running as TF32 GEMMs where torch autocast runs bf16. That and the rows above made the bf16 product the default.
 
-On an A100, the fp32 head took 38 ms a step in reference runs, 21%
-of a Qwen3-0.6B bf16 fine-tune's busy time. It used TF32 GEMMs where
-torch autocast uses bf16. That result and the rows above made the bf16
-product the default.
+The logits' rounding, 2026-10-01. The bf16 product above still kept fp32 logits, and fed their fp32 gradient into the state product as two bf16 products, one of a high half and one of the rest (`347238c7`), where torch autocast and MaxText round both to bf16. At the default `matmul_precision` Dew now rounds as they do: the logits to bf16 values, and their gradient to bf16 once, which both backward products read. On the RTX 4080 (`tools/benchmark_step.py --fixed-batch`, one session, against `66784383`) the 3-layer decoder (GPT-2 small widths, vocabulary 50304, 16 x 512 tokens) runs in 52.17 ms against 59.95, with a planned peak of 4.53 GB against 5.36; torch.compile runs it in 49.4-50.0. Qwen3-0.6B's widths at 1 x 1024 run in 106.62 ms against 110.04.
 
-The logits' rounding, 2026-10-01. The bf16 product above kept fp32 logits
-and used their fp32 gradient in two bf16 state-gradient products: a high
-half and the remainder (`347238c7`). Torch autocast and MaxText round
-both logits and gradient to bf16. At default `matmul_precision`, Dew now
-does the same, rounding the gradient once for both backward products.
+To check training quality, I trained for 2000 steps on wikitext-103 Qwen3 tokens on the same card, with validation over 64 fixed windows scored with fp32 logits for both. The 3-layer decoder at vocabulary 151936, trained from scratch, ends at 5.0604 and 5.0491 with fp32 logits (seeds 0 and 1) against 5.0604 and 5.0493 with the bf16 rounding, and Qwen3-0.6B fine-tuned ends at 2.71965 and 2.71996 against 2.71983 and 2.71981. At the same seed the two roundings are at most 4.5e-4 and 1.6e-3 apart at any checkpoint, while the two seeds of either rounding are 1.3e-2 and 2.9e-3 apart on average.
 
-On the RTX 4080, `tools/benchmark_step.py --fixed-batch` compared the change
-with `66784383` in one session. The 3-layer decoder (GPT-2 small widths,
-vocabulary 50304, 16 x 512 tokens) takes 52.17 ms against 59.95, with
-a planned peak of 4.53 GB against 5.36. torch.compile takes 49.4-50.0.
-Qwen3-0.6B's widths at 1 x 1024 take 106.62 ms against 110.04.
+The high half existed for layout parity. With the gradient rounded once, a 4 x RTX 3090 bf16 run read 1.75 times its bound at a dense model's final norm and 5758 times it at an MoE's expert gate_proj, against 0.47 and 0.41 with the high half. Why the MoE's gap is that large is not yet established. A run that compares layouts in bf16 sets `matmul_precision="highest"`, which keeps the head fp32, and `tools/layout_parity.py` does so for bf16 decoders.
 
-Quality tests ran 2000 steps on wikitext-103 Qwen3 tokens on the same
-card. Validation uses 64 fixed windows, scored with fp32 logits for both
-roundings. The 3-layer decoder trained from scratch at vocabulary 151936
-ends at 5.0604 and 5.0491 with fp32 logits (seeds 0 and 1), against
-5.0604 and 5.0493. Fine-tuned Qwen3-0.6B ends at 2.71965 and 2.71996,
-against 2.71983 and 2.71981. At the same seed, roundings differ by at
-most 4.5e-4 and 1.6e-3 at any checkpoint. The two seeds of either
-rounding differ by 1.3e-2 and 2.9e-3 on average.
+On sm80 and sm89 the trainer compiles without XLA's Triton GEMM fusions, unless the run sets that flag explicitly or the model has an SSD mixer (`TRITON_GEMM_OFF_GENERATIONS`). On an A100 (jax 0.11.2, bf16), through the trainer, Qwen3-0.6B at 4 x 512 tokens compiled in 27.1 s against 47.5 s, because there is no Triton GEMM autotuning, and stepped in 161.4 ms against 161.5. Standalone, Qwen3-0.6B at 4 x 1024 tokens went from 162.1 to 153.1 ms, a 99M MoE from 74.6 to 69.4 ms, and a DiT ran 5.8% faster. A Mamba-2 step lost 7.7% (127.9 to 138.6 ms), because its SSD scan's small batched dots gain from the fusions.
 
-The high half was needed for layout parity. With the gradient rounded
-once, a 4 x RTX 3090 bf16 run reached 1.75 times its bound at a dense
-model's final norm, and 5758 times at an MoE's expert gate_proj. The
-earlier values were 0.47 and 0.41. The reason for the large MoE gap
-is still unknown. When comparing layouts in bf16, set
-`matmul_precision="highest"` to keep the head fp32. `tools/layout_parity.py`
-does this for bf16 decoders.
+On the RTX 4080, two-layer steps at 2048, 4080 and 16384 tokens go from 56.7 to 53.5, 103.8 to 94.0 and 420.5 to 406.3 ms, and tiled heads run 3-6% faster. At Qwen3-0.6B's widths with two layers, bf16, vocabulary 151936 and a 0.9 allocator fraction on an RTX 4080 (JAX 0.11.2), this removes a cliff at 4096 tokens, where a training step took 286.0 ms with the fusions and takes 93.4 ms without. At other shapes the unfused step can use more temporary memory, so before tiling the head or recomputing blocks, the trainer tries a step that does not fit with XLA's default options. At 8192 tokens only that whole-logits step fits (178.7 ms, against 211.2 ms after tiling). When tiling is needed, sm89 uses the measured 4096-by-8192 tile. These are two-layer measurements, not full-model times.
 
-On sm80 and sm89, the trainer compiles without XLA's Triton GEMM fusions
-unless the run explicitly sets the flag or the model has an SSD mixer
-(`TRITON_GEMM_OFF_GENERATIONS`). On an A100 (jax 0.11.2, bf16), the
-trainer compiled Qwen3-0.6B at 4 x 512 tokens in 27.1 s against 47.5 s,
-with no Triton GEMM autotuning. Step time was 161.4 ms against 161.5.
-Standalone Qwen3-0.6B at 4 x 1024 tokens fell from 162.1 to 153.1 ms,
-a 99M MoE from 74.6 to 69.4 ms, and a DiT ran 5.8% faster. Mamba-2
-was 7.7% slower (127.9 to 138.6 ms) because its SSD scan's small batched
-dots benefit from the fusions.
+On every GPU the trainer also compiles its step without XLA's dot merger (`--xla_gpu_dot_merger_threshold_mb=0` in the step's own compiler options, `step_compiler_options`). The exceptions are a run that sets that flag, and a step that trains next to frozen weights on 128 tokens or fewer a device (below). The merger runs dots that share an input (q, k and v; gate and up) as one GEMM over their weights, concatenated afresh every step, which cost 4.0 ms of Qwen3-0.6B's step at 1 x 1024. On the RTX 4080 (benchmark_step, two rounds, one session), Qwen3-0.6B's widths at 1 x 1024 run in 97.7-98.0 ms with the merger against 94.1-94.2 without it, the 3-layer decoder in 50.8-50.9 against 49.1-49.2, SimpleDiT-B in 73.1-73.2 against 72.8, and the 176M hybrid DiT in 66.7-67.6 against 66.4-66.7, with the peaks unchanged.
 
-On the RTX 4080, two-layer steps at 2048, 4080 and 16384 tokens fall
-from 56.7 to 53.5, 103.8 to 94.0, and 420.5 to 406.3 ms. Tiled heads
-run 3-6% faster. With Qwen3-0.6B's widths, two layers, bf16, vocabulary
-151936 and a 0.9 allocator fraction, the RTX 4080 run at JAX 0.11.2
-avoids a sharp slowdown at 4096 tokens. Each training step takes 286.0 ms
-with fusions and 93.4 ms without.
+On an A100 40 GB (Colab, `db1761fd`, benchmark_step with one batch on the device, two rounds), I set XLA's merger explicitly with `--xla_gpu_dot_merger_threshold_mb=64` against the step's 0. Qwen3-0.6B's widths at 4 x 1024 run in 128.40-128.41 against 123.85-124.01 ms, the 3-layer decoder at 16 x 512 in 22.96-23.01 against 22.12-22.51, and SimpleDiT-B at batch 32 in 38.47-38.51 against 38.39-38.48. Over 2000 steps of wikitext-103, two seeds each, validation loss at the same seed moved by at most 1.5e-3 on a 3-layer decoder from scratch (whose seeds are 1.2e-2 apart on average) and 2.2e-3 on Qwen3-0.6B fine-tuned (seeds 3.0e-3 apart). Serving keeps the merger, because decoding Qwen3-0.6B at 32 slots ran 4.6-14.8% slower without it; its 32-token GEMMs lose more to separate launches than the concatenations cost.
 
-At other shapes, the unfused step can need more temporary memory. If
-it does not fit, the trainer tries XLA's default options before tiling
-the head or recomputing blocks. At 8192 tokens, only that whole-logits
-step fits (178.7 ms, versus 211.2 ms after tiling). When tiling is needed,
-sm89 uses the measured 4096-by-8192 tile. These times measure two layers;
-they are not full-model times.
-
-On every GPU, the trainer also compiles its step without XLA's dot
-merger. It sets `--xla_gpu_dot_merger_threshold_mb=0` in the step's own
-compiler options, `step_compiler_options`. The exceptions are runs that
-set this flag, or steps training beside frozen weights on 128 tokens
-or fewer per device; see below.
-
-The merger combines dots sharing an input (q, k and v; gate and up)
-into one GEMM. It concatenates weights afresh every step, costing 4.0 ms
-of Qwen3-0.6B's step at 1 x 1024. On the RTX 4080 (benchmark_step, two
-rounds, one session), Qwen3-0.6B's widths at 1 x 1024 take 97.7-98.0 ms
-against 94.1-94.2 without the merger. The 3-layer decoder takes 50.8-50.9
-against 49.1-49.2, SimpleDiT-B 73.1-73.2 against 72.8, and the 176M
-hybrid DiT 66.7-67.6 against 66.4-66.7. Peaks are unchanged.
-
-On an A100 40 GB (Colab, `db1761fd`), benchmark_step reused one device
-batch for two rounds. It compared XLA's merger explicitly enabled with
-`--xla_gpu_dot_merger_threshold_mb=64` against the step's 0. Qwen3-0.6B's
-widths at 4 x 1024 take 128.40-128.41 ms against 123.85-124.01. The
-3-layer decoder at 16 x 512 takes 22.96-23.01 against 22.12-22.51, and
-SimpleDiT-B at batch 32 takes 38.47-38.51 against 38.39-38.48.
-
-Quality tests ran 2000 steps on wikitext-103 with two seeds each.
-At the same seed, validation loss changed by at most 1.5e-3 for a
-3-layer decoder trained from scratch, whose seeds differ by 1.2e-2 on
-average. For fine-tuned Qwen3-0.6B, it changed by at most 2.2e-3, with
-seeds 3.0e-3 apart. Serving keeps the merger. Qwen3-0.6B decoding at
-32 slots was 4.6-14.8% slower without it; separate launches for the
-32-token GEMMs cost more than concatenation.
-
-Small training steps, 2026-10-02. These medians compare `Trainer.compile`
-with and without the option on an RTX 4080, bf16, in one process.
-Each used five alternating blocks of 20 steps. Full-weight training
-favors separate dots from 32 tokens up. LoRA at rank 16 on Qwen3-0.6B's
-seven projections, with the base frozen, is up to 0.6 ms slower with
-separate dots at 128 tokens or fewer. The exception is 1 x 128,
-measured in two sessions.
+Small training steps, 2026-10-02 (RTX 4080, bf16, `Trainer.compile` with and without the option in one process, five alternating blocks of 20 steps, medians). A full step, with every weight training, is faster with separate dots from 32 tokens up. A LoRA step (rank 16 on Qwen3-0.6B's seven projections, with the base frozen) of 128 tokens or fewer is slower with separate dots, by up to 0.6 ms, except at 1 x 128 (measured in two sessions).
 
 The rule therefore considers both token count and frozen weights. A
 step with an objective's `trainable` split, as in LoRA, keeps the merger
@@ -1992,11 +1896,7 @@ step uses separate dots and has not been measured.
 | Qwen3-0.6B, LoRA | 1 x 512 | 36.30 | 34.99 | -3.6% |
 | Qwen3-0.6B, LoRA | 1 x 1024 | 60.61 | 59.19 | -2.3% |
 
-A second session at `perf/merger-frozen` used the same measurements to
-compare the rule with XLA's default, which keeps the merger on. Host
-load averaged 15-27 from other work. No row is slower. LoRA steps at
-128 tokens or fewer compile identical programs both ways; their -0.3%
-to +0.3% spread comes from measurement noise.
+With the rule, I measured the same steps against XLA's default (the merger on) the same way, in a second session at `perf/merger-frozen`, with a load average of 15-27 from other work on the host. No row is slower. The LoRA steps of 128 tokens or fewer compile the same program both ways, so their spread of -0.3% to +0.3% is the measurement's own.
 
 | model | tokens | XLA's default ms | as shipped ms | change |
 |---|---|---|---|---|
@@ -2017,15 +1917,7 @@ to +0.3% spread comes from measurement noise.
 | 3-layer decoder, full | 1 x 128 | 5.33 | 5.23 | -1.8% |
 | 3-layer decoder, full | 4 x 256 | 10.02 | 10.00 | -0.3% |
 
-At 128 tokens, shape changes which option is faster. Two more sessions
-gave 20.65 and 20.65 ms merged against 18.98 and 19.11 separate for
-1 x 128. With 2 x 64, times were 18.72 and 18.63 against 18.96 and
-19.03; with 4 x 32, they were 18.56 and 18.50 against 18.91 and 18.81.
-For 1 x 96, times were 18.22 and 18.22 against 18.41 and 18.43; for
-1 x 160, 22.33 and 21.95 against 20.57 and 20.37. Setting the boundary
-below 128 would make 2 x 64 and 4 x 32 slower than XLA's default by
-1.3-2.1%. The rule includes 128, leaving 1 x 128 at XLA's default,
-1.6 ms behind separate dots.
+At 128 tokens the shapes disagree. In two more sessions of merged against separate dots, 1 x 128 ran 20.65 and 20.65 ms merged against 18.98 and 19.11 separate, while 2 x 64 ran 18.72 and 18.63 against 18.96 and 19.03, and 4 x 32 ran 18.56 and 18.50 against 18.91 and 18.81 (1 x 96: 18.22 and 18.22 against 18.41 and 18.43; 1 x 160: 22.33 and 21.95 against 20.57 and 20.37). A boundary below 128 would run 2 x 64 and 4 x 32 1.3-2.1% slower than XLA's default, so the boundary includes 128, and 1 x 128 runs at XLA's default, 1.6 ms behind separate dots.
 
 ### The forward's bf16 weights: `NARROW_COPY_GENERATIONS`, 2026-10-03
 
