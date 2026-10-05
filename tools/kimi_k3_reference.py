@@ -302,7 +302,8 @@ def orders(drawn: Path) -> None:
         if k == 0:
             assert np.array_equal(updated, recorded), "order 0 must reproduce the fixture's run"
         distances.append(np.sqrt(np.mean(np.square(updated[valid].astype(np.float64) - truth))))
-    np.savez(DESTINATION / "orders.npz", orders=drawn_orders, updated_logits=np.asarray(distances))
+    np.savez(DESTINATION / "orders.npz", orders=drawn_orders.astype(np.min_scalar_type(drawn_orders.max())),
+             updated_logits=np.asarray(distances))
     print("orders", len(distances), "distances", np.round(np.asarray(distances) / distances[0], 2))
 
 
