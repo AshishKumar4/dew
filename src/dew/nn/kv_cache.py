@@ -1,30 +1,33 @@
-"""How a decode cache stores its keys and values: dense or paged, full or quantized.
+"""How a decode cache stores its keys and values: dense or paged, full precision or quantized.
 
-`dew.nn.attention.open_kv_cache` owns the cursor and the compact slot
-positions; a `KVCache` value names the storage layout behind them and
-`KVStore` reads and writes it inside one attention module.
+`dew.nn.attention.open_kv_cache` keeps the cursor and the compact slot
+positions. A `KVCache` value names the storage layout behind them, and
+`KVStore` reads and writes that storage inside one attention module.
 
 Dense storage is one `[rows, capacity, kv_heads, head_dim]` block per row.
 Paged storage is one pool `[kv_heads, pages, page_size, head_dim]` shared by
-every row, the layout the Pallas TPU paged attention kernel reads, with a
-`[rows, capacity // page_size]` page table mapping slot `s` to page
-`table[row, s // page_size]`, offset `s % page_size`. A server can then hand
-pages out on demand, share a common prefix's pages, and hold more rows than
-`pages * page_size / capacity` while they are short. A pool split into
-`groups` gives each equal group of rows its own part, indexed from the
-part's start, so a server whose mesh splits rows `n` ways reads and writes
-only the pages each device holds instead of gathering the whole pool.
+every row, which is the layout the Pallas TPU paged attention kernel reads.
+A `[rows, capacity // page_size]` page table maps slot `s` to page
+`table[row, s // page_size]` at offset `s % page_size`. With pages, a server
+can assign pages on demand, share the pages of a common prefix, and hold more
+than `pages * page_size / capacity` rows while they are short. A pool split
+into `groups` gives each equal group of rows its own part of the pool,
+indexed from the part's start. A server whose mesh splits rows `n` ways then
+reads and writes only the pages each device holds, and does not gather the
+whole pool.
 
-A quantized cache stores int8 or float8 (e4m3) values with one float32
-scale per token and head (absmax over the head's features over the
-format's largest value), dequantized on read. int8 keys are stored rotated
-by the orthonormal Hadamard matrix over head_dim, as QuaRot (arXiv:2404.00456)
-rotates its cache, so a few outlier channels (Qwen3's keys) do not take the
-whole per-token scale; the query takes the same rotation (`Append.query`),
-leaving every logit unchanged since `H Hᵀ = I`. Values and float8 keys are
-not rotated (e4m3 rounds each element relative to itself). On Qwen3-0.6B
-over wikitext-2 against bf16: int8 +0.66 perplexity unrotated, +0.008
-rotated; float8 -0.03 unrotated, +1.03 rotated (docs/concepts/inference.md).
+A quantized cache stores int8 or float8 (e4m3) values with one float32 scale
+per token and head, and dequantizes them on read. The scale is the absmax
+over the head's features divided by the format's largest value. int8 keys
+are stored rotated by the orthonormal Hadamard matrix over head_dim, the way
+QuaRot (arXiv:2404.00456) rotates its cache, so a few outlier channels
+(Qwen3's keys) do not set the whole per-token scale. The query gets the same
+rotation (`Append.query`), and every logit stays the same because
+`H Hᵀ = I`. Values and float8 keys are not rotated, because e4m3 rounds each
+element relative to itself. On Qwen3-0.6B over wikitext-2, compared with a
+bf16 cache, perplexity changed by +0.66 for unrotated int8 and +0.008 for
+rotated int8, and by -0.03 for unrotated float8 and +1.03 for rotated float8
+(docs/concepts/inference.md).
 """
 
 from __future__ import annotations
@@ -74,11 +77,12 @@ class KVCache:
     """The storage layout of a decode cache.
 
     `quantized` stores keys and values in that format with per-token, per-head
-    scales; int8 keys are Hadamard-rotated, which needs a power-of-two head_dim.
-    `page_size` pages the cache (`capacity` a multiple of it) and `pages` sizes
-    the pool, None giving one page per slot of every row; a smaller pool is a
-    server's to hand out (`dew.inference.serving.Server`). `groups` splits a
-    paged pool by equal groups of rows; the row count and `pages` divide by it.
+    scales. int8 keys are Hadamard-rotated, which needs a power-of-two
+    head_dim. `page_size` pages the cache, and `capacity` must be a multiple of
+    it. `pages` is the size of the pool. None gives every row enough pages for
+    its whole capacity, and a smaller pool is for a server to assign
+    (`dew.inference.serving.Server`). `groups` splits a paged pool among equal
+    groups of rows, so the row count and `pages` must both divide by it.
     """
 
     quantized: KVDtype | None = None
@@ -104,11 +108,11 @@ class KVCache:
             raise ValueError(f"a pool of {self.pages} pages does not split into {self.groups} equal groups")
 
     def storage(self, dtype: jnp.dtype) -> jnp.dtype:
-        """The dtype the cache holds values of `dtype` in."""
+        """Return the dtype that the cache stores values of `dtype` in."""
         return jnp.dtype(dtype) if self.quantized is None else jnp.dtype(self.quantized)
 
     def key_rotation(self, head_dim: int) -> jax.Array | None:
-        """The rotation stored keys carry, and a query has to take; None when unrotated."""
+        """Return the rotation that stored keys are in and a query must take, or None for unrotated keys."""
         return hadamard(head_dim) if self.quantized == "int8" else None
 
 
@@ -268,14 +272,14 @@ def grouped(array: jax.Array, axis: int, groups: int) -> jax.Array:
 
 @dataclasses.dataclass(frozen=True)
 class KVStore:
-    """One attention module's key and value storage, opened for `rows` rows.
+    """Reads and writes one attention module's key and value storage, opened for `rows` rows.
 
     `write` puts keys and values `[rows, tokens, kv_heads, head_dim]` at
-    compact slot positions `[rows, tokens]`, dropping the ones at -1.
-    `read` returns every slot of every row, `[rows, capacity, kv_heads,
-    head_dim]`, dequantized and with the keys in the stored rotation: a
-    slot no token has reached holds whatever its page last held, which the
-    caller's validity mask excludes.
+    compact slot positions `[rows, tokens]` and drops the ones at -1. `read`
+    returns every slot of every row, `[rows, capacity, kv_heads, head_dim]`,
+    dequantized and with the keys in the stored rotation. A slot that no token
+    has reached holds whatever its page last held, and the caller's validity
+    mask excludes it.
     """
 
     module: nn.Module
@@ -289,7 +293,11 @@ class KVStore:
     @classmethod
     def open(cls, module: nn.Module, layout: KVCache, rows: int, capacity: int, kv_heads: int,
              head_dim: int, dtype: jnp.dtype) -> KVStore:
-        """Declare the module's cache variables, allocating them on first use."""
+        """Declare the module's cache variables, allocating them on first use, and return the store.
+
+        A paged layout raises `ValueError` when `capacity` is not a multiple
+        of `page_size`, or when `rows` does not split into the pool's groups.
+        """
         store = cls(module, layout, rows, capacity, kv_heads, head_dim, jnp.dtype(dtype))
         layout.key_rotation(head_dim)
         storage = layout.storage(dtype)
@@ -357,10 +365,14 @@ class KVStore:
         return self._read("cached_key", "key_scale"), self._read("cached_value", "value_scale")
 
     def write_tokens(self, key: jax.Array, value: jax.Array, rows: jax.Array, positions: jax.Array) -> None:
-        """Keys and values `[tokens, kv_heads, head_dim]`, each at its own row
-        and slot (a serving step's mixed call, `dew.nn.inputs.Admitted`); a row
-        past the cache's or a slot of -1 drops. Full precision, unrotated, and
-        a paged pool in one group, which the mixed call requires."""
+        """Write keys and values `[tokens, kv_heads, head_dim]`, each at its own row and slot.
+
+        This is the write of a serving step's mixed call
+        (`dew.nn.inputs.Admitted`). A token whose row is past the cache's rows,
+        or whose slot is -1, is dropped. The cache must be full precision and
+        unrotated, and a paged pool must have one group, as the mixed call
+        requires.
+        """
         if self.layout.page_size is None:
             for name, incoming in (("cached_key", key), ("cached_value", value)):
                 self._put(name, write_tokens(self._get(name), incoming, rows, positions))
@@ -387,7 +399,11 @@ class KVStore:
             self._put(name, written[:, 0])
 
     def read_rows(self, rows: jax.Array) -> tuple[jax.Array, jax.Array]:
-        """`read` of only `rows`, `[len(rows), capacity, kv_heads, head_dim]`."""
+        """Return what `read` returns for only `rows`, `[len(rows), capacity, kv_heads, head_dim]`.
+
+        It does not dequantize, so it matches `read` only on a full-precision
+        cache, which the mixed call that uses it requires.
+        """
         def rows_of(name: str) -> jax.Array:
             stored = self._get(name)
             if self.layout.page_size is not None:
@@ -409,12 +425,13 @@ class KVStore:
         return _gather_pages(pool, self._get(TABLE), self.layout.groups)
 
     def kernel(self) -> bool:
-        """Whether decode can read a full-precision BF16 page pool natively.
+        """Return whether decode can read a full-precision BF16 page pool natively.
 
-        The TPU kernel reads bfloat16 and casts other page dtypes (its int8 path
-        broadcasts the scales to full width first), so a float32 or quantized pool
-        takes the gather; a GPU uses cuDNN's paged forward on supported heads and
-        whole 16-token pages. A grouped pool takes the gather, which keeps each
+        The TPU kernel reads bfloat16 and casts other page dtypes (its int8
+        path broadcasts the scales to full width first), so a float32 or
+        quantized pool uses the gather. On a GPU, decode uses cuDNN's paged
+        forward when cuDNN supports the heads and the page size is a multiple
+        of 16 tokens. A grouped pool also uses the gather, which keeps each
         group's pages where they are.
         """
         page_size = self.layout.page_size
@@ -432,11 +449,12 @@ class KVStore:
                 and not _FORWARD_MODE.get())
 
     def decode(self, query: jax.Array, lengths: jax.Array, softcap: float | None) -> jax.Array:
-        """One query per row `[rows, heads, head_dim]` against the first
-        `lengths` slots of each row, through its device's paged kernel.
+        """Attend one query per row `[rows, heads, head_dim]` to the first `lengths` slots of that row.
 
-        The TPU kernel does not scale the logits, so the query carries
-        1/sqrt(head_dim) as every other attention path applies it.
+        Decode runs the device's paged kernel. The TPU kernel does not scale
+        the logits, so the query is multiplied by 1/sqrt(head_dim) first, the
+        same scale every other attention path applies. On a GPU, a `softcap`
+        raises `ValueError`.
         """
         if jax.default_backend() == "gpu":
             if softcap is not None:
@@ -523,11 +541,11 @@ def _pages_per_block(pages: int) -> int:
 
 @dataclasses.dataclass(frozen=True)
 class Append:
-    """`open_kv_cache`'s writer: store a call's keys and values, then read the cache.
+    """Stores a call's keys and values, then reads the cache; `open_kv_cache` returns one.
 
-    The allocation-only call (the cache did not exist yet) stores nothing.
-    The keys it reads back carry the store's rotation, so the query that
-    attends to them goes through `query` first.
+    The allocation-only call (when the cache did not exist yet) stores
+    nothing. The keys it reads back are in the store's rotation, so the query
+    that attends to them must go through `query` first.
     """
 
     store: KVStore
@@ -540,7 +558,7 @@ class Append:
         return self.store.read()
 
     def query(self, query: jax.Array) -> jax.Array:
-        """`query` `[..., head_dim]` in the basis the stored keys are in."""
+        """Return `query` `[..., head_dim]` in the basis that the stored keys are in."""
         rotation = self.store.rotation
         return query if rotation is None else rotated(query, rotation)
 

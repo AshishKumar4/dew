@@ -1,10 +1,10 @@
-"""The layer plan of a `CausalTransformer`: each layer's kind, its spec, and
-which consecutive layers scan together.
+"""The layer plan of a `CausalTransformer`: each layer's kind, its spec, and which layers scan together.
 
-A `LayerKind` names what a layer type builds (its mixer, and the attention
-fields it overrides); `ResolvedKind` is one filled in from the model's
-fields; a `LayerSpec` is one layer's plan; `scan_groups` finds the runs of
-consecutive layers whose specs agree, which `nn.scan` stacks into one group.
+A `LayerKind` names what a layer type builds: its mixer, and the attention
+fields it overrides. A `ResolvedKind` is a kind with the model's fields
+filled in, and a `LayerSpec` is one layer's plan. `scan_groups` finds the
+runs of consecutive layers whose specs are equal, and `nn.scan` stacks each
+run into one group.
 """
 
 import dataclasses
@@ -21,39 +21,40 @@ from ..rope import RopeScaling, YarnScaling
 class LayerKind:
     """What the layers of one kind in the pattern do differently.
 
-    The pattern names each layer's kind, and this is what the kind means: a
-    windowed kind is the "sliding attention" of the reference configs, and
-    `rope_theta` and `head_dim` are the model's unless this kind states its
-    own. Rotary positions rotate every dimension of a windowed kind; Gemma 4
-    puts its partial rotary on the global layers and its sliding layers
-    rotate whole.
+    The pattern names each layer's kind, and this record says what the kind
+    means. A windowed kind is the "sliding attention" of the reference
+    configs. `rope_theta` and `head_dim` are the model's unless the kind sets
+    its own. Rotary positions rotate every dimension of a windowed kind;
+    Gemma 4 puts its partial rotary on the global layers, and its sliding
+    layers rotate every dimension.
 
-    `mixer` is this kind's token mixer, a value from the `mixers` registry;
-    None rides the model's mixer. A hybrid stack names its per-layer mixers
-    here, keyed by the names already in the pattern.
+    `mixer` is the kind's token mixer, a value from the `mixers` registry;
+    None uses the model's mixer. A hybrid stack names its per-layer mixers
+    here, keyed by the kind names already in the pattern.
     """
 
     window: int | None = None
-    """Keys a layer of this kind attends, its own included; None attends all."""
+    """The number of keys a layer of this kind attends to, its own included. None attends to all keys."""
     chunk: int | None = None
-    """Chunked local attention: a layer of this kind reads only the keys at
-    or before each query whose position shares the query's
-    `position // chunk`, MaxText's `chunk_attn_window_size` and Llama 4's
-    `attention_chunk_size`. None attends all; a kind sets a window or a
-    chunk, not both."""
+    """The chunk size of chunked local attention. A layer of this kind reads
+    only the keys at or before each query whose position has the same
+    `position // chunk` as the query. This is MaxText's
+    `chunk_attn_window_size` and Llama 4's `attention_chunk_size`. None
+    attends to all keys. A kind sets a window or a chunk, not both."""
     num_kv_heads: int | None = None
     """This kind's key/value head count; None takes the model's. Gemma 4's
-    global layers keep fewer than its sliding ones (num_global_key_value_heads)."""
+    global layers have fewer than its sliding ones (num_global_key_value_heads)."""
     rope_theta: float | None = None  # set: this kind takes this base over the model's
     rope_scaling: RopeScaling | None = None
-    """This kind's llama3 ramp or its record; None rides the model's."""
+    """This kind's llama3 ramp, or its record. None uses the model's."""
+    # OLMo 3's per-kind YaRN: configuration_olmo3.py:110-113.
     yarn: YarnScaling | None = None
-    """This kind's YaRN ramp or its record; None rides the model's. OLMo 3
-    scales its full-attention layers alone (configuration_olmo3.py:110-113),
-    so a YaRN ramp is a kind's as much as the model's."""
+    """This kind's YaRN ramp, or its record. None uses the model's. OLMo 3
+    scales only its full-attention layers, so a YaRN ramp can belong to a
+    kind as well as to the model."""
     head_dim: int | None = None
     mixer: MixerBase | None = None
-    """This kind's mixer value or its record; None is the model's mixer."""
+    """This kind's mixer value, or its record. None uses the model's mixer."""
 
     def __post_init__(self):
         # A kind's mixer and ramp arrive as values from code and as records
@@ -74,11 +75,12 @@ class LayerKind:
 class ResolvedKind:
     """One kind of layer with the model's defaults filled in.
 
-    `LayerKind` is what a config states, so a field it leaves to the model is
-    None there. This is what the model resolved it to, so `num_kv_heads`,
-    `rope_theta` and `head_dim` are numbers; the window, the chunk and the
-    rotary ramps stay optional, as a kind may have none. `mixer` passes
-    through, the model's default applying when unset.
+    `LayerKind` is what a config states, so a field the config leaves to the
+    model is None there. `ResolvedKind` is what the model resolved it to, so
+    `num_kv_heads`, `rope_theta` and `head_dim` are numbers. The window, the
+    chunk and the rotary ramps stay optional, since a kind may have none.
+    `mixer` is passed through unchanged, and the model's default applies when
+    it is unset.
     """
 
     window: int | None
@@ -93,34 +95,36 @@ class ResolvedKind:
 
 @dataclasses.dataclass(frozen=True)
 class LayerSpec:
-    """What one layer of the stack is, resolved: everything its block's
-    parameters and computation depend on that the layers do not share.
+    """One layer's resolved plan.
 
-    Two layers with equal specs have parameters of the same shapes and run
-    the same program, so a scan can run them as iterations of one body and a
-    pipeline can run them at the same position of different stages.
-    Everything the whole model sets (norms, the attention dials, per-layer
-    inputs, AltUp) is the same for every layer and so is not repeated here.
+    The spec holds everything that the block's parameters and computation
+    depend on and that differs between layers. Two layers with equal specs
+    have parameters of the same shapes and run the same program. A scan can
+    therefore run them as iterations of one body, and a pipeline can run them
+    at the same position of different stages. Settings of the whole model
+    (norms, the attention settings, per-layer inputs, AltUp) are the same for
+    every layer, so they are not repeated here.
     """
 
     layer_type: str
     kind: ResolvedKind
     routed: bool
-    """The feed-forward routes to the mixture's experts."""
+    """Whether the feed-forward routes to the mixture's experts."""
     hash_routed: bool
-    """The routed feed-forward selects its experts by the token table."""
+    """Whether the routed feed-forward selects its experts by the token table."""
     width: int
-    """The dense feed-forward width, doubled on a sharing layer when the model asks."""
+    """The dense feed-forward width, doubled on a sharing layer when the model asks for it."""
     sparsity: float
     """The gaussian top-k fraction on the feed-forward gate, 0 for none."""
     kv_shared: bool
-    """The layer reads its keys and values from an earlier layer's."""
+    """Whether the layer reads its keys and values from an earlier layer."""
     provider: int | None
-    """The layer's own index when a later layer reads what it leaves in the
-    kv_store, its keys and values or a CSA2 layer's publications; such a
-    layer runs unrolled, since what it stashes leaves the stack's loop."""
+    """The layer's own index when a later layer reads what this layer leaves
+    in the kv_store: its keys and values, or a CSA2 layer's publications.
+    Such a layer runs unrolled, because what it stores has to leave the
+    stack's loop. None for the other layers."""
     residual_site: ResidualSite | None
-    """The layer's place among Kimi K3's blocks of attention residuals, None
+    """The layer's place among Kimi K3's blocks of attention residuals, or None
     without them. It differs at every block boundary, so a scanned run never
     crosses one."""
     engram: int | None = None

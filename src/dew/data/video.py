@@ -101,9 +101,12 @@ class AudioVideoTransform(pygrain.RandomMapTransform):
 class VideoDataset(DatasetSpec):
     """Reads clips of `frames` frames at `frame_size`, with their audio.
 
-    `val_batches` batches of records are held out of the head of the source,
-    in canonical order, as the validation split; None or 0 holds nothing out.
-    `count` uses that many records from the head of the source.
+    Each record comes out as
+    `{"video": uint8 [frames, frame_size, frame_size, 3], "caption": str, "audio": {...}}`.
+    A subclass defines `source`. `val_batches` batches of records are held
+    out of the head of the source, in canonical order, as the validation
+    split; None or 0 holds nothing out. `count` uses only that many records
+    from the head of the source.
     """
 
     frame_size: int = 256
@@ -111,18 +114,18 @@ class VideoDataset(DatasetSpec):
     audio_padding: int = 3
     """Extra audio frames kept on either side of the sampled clip."""
     audio_model: str = "facebook/wav2vec2-base-960h"
-    """HF audio model whose feature extractor prepares the audio inputs."""
+    """The HF audio model whose feature extractor prepares the audio inputs."""
     val_batches: int | None = 4
     count: int | None = None
 
     @property
     def audio_seconds(self) -> float:
-        """How long the waveform under a clip is: its frames and the padding
-        on either side, at the rate clips are sampled at."""
+        """The length in seconds of the waveform under a clip: its frames plus the
+        padding on each side, at the 25 fps that clips are sampled at."""
         return (self.frames + 2 * self.audio_padding) / FPS
 
     def source(self) -> list[dict[str, str]]:
-        """One `{"video_path", "caption"}` record per clip, in a fixed order."""
+        """Return one `{"video_path", "caption"}` record per clip, in a fixed order."""
         raise NotImplementedError
 
     def load(self, *, batch: int, tokenize: Tokenize | None = None) -> Dataset:
@@ -156,7 +159,10 @@ class VideoDataset(DatasetSpec):
 @datasets("local_videos")
 @dataclasses.dataclass(frozen=True)
 class LocalVideos(VideoDataset):
-    """Reads every video file under `path`, captioned with `caption`."""
+    """Reads every video file under `path`, captioned with `caption`.
+
+    It reads the files whose suffix is in `extensions`, in sorted path order.
+    """
 
     path: str | None = None
     extensions: tuple[str, ...] = (".mp4", ".avi", ".mov", ".webm")

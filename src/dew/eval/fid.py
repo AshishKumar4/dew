@@ -72,8 +72,10 @@ def _sqrtm(product):
 def frechet_distance(mu_a, sigma_a, mu_b, sigma_b, eps=1e-6) -> float:
     """Return the Frechet distance between two multivariate gaussians.
 
-    Runs once per consumed validation pass on the host through scipy. The
-    matrix square root of the covariance product has no JAX equivalent.
+    It runs on the host through scipy, once per validation pass, because the
+    matrix square root of the covariance product has no JAX equivalent. When
+    the covariance product is singular, `eps` is added to both diagonals, as
+    the reference implementations do.
     """
 
     mu_a, mu_b = np.atleast_1d(mu_a), np.atleast_1d(mu_b)
@@ -217,12 +219,12 @@ def _pooled_distance(stats: FIDStats, weights: str | None = None) -> float:
 @metrics("fid")
 @dataclass(frozen=True)
 class FID:
-    """Fréchet Inception Distance, between two image sets (`score`) or over a
-    validation pass, pooling statistics and taking one final distance.
+    """Measures the Fréchet Inception Distance between two image sets (`score`) or over a validation pass.
 
-    As a metric the call gathers the sampled grid and the batch's reference
-    field; the features, the statistics and the distance are the ones `score`
-    computes.
+    As a validation metric, each call reads the sampled grid and the batch's
+    reference `field` and pools their feature statistics, and the pass ends
+    with one distance. The features, statistics and distance are the ones
+    `score` computes, and `weights` is described there.
     """
 
     field: str = "image"
@@ -252,21 +254,23 @@ class FID:
         """Measure FID between two sets of uint8 [N, H, W, 3] images.
 
         Each side is one array or an iterable of arrays, so a directory of
-        samples can stream past in blocks of `batch_size` rows instead of being
-        held at once. The value is the distance between the two populations
-        passed in, which is FID-50k only at 50,000 images a side. A pass over
+        samples can stream through in blocks of `batch_size` rows without
+        being held in memory at once. Each side needs at least two images.
+        The value is the distance between the two populations passed in, so it
+        is FID-50k only with 50,000 images a side. A validation pass over
         50,000 images a side reports the same number.
 
-        `weights` is the feature extractor's parameters as a file, the way
-        `CLIPScore(modelname)` names a local CLIP: the InceptionV3 variables
-        tree in safetensors, which `tools/convert_inception_weights.py` writes.
-        Unset downloads the published checkpoint and converts it. Two distances
-        are comparable only when both were measured with the same one, which is
-        why every distance logs which it was. With the published weights,
-        features and distance reproduce pytorch-fid 0.3.0's (bilinear resize
-        without antialiasing); tests/test_metrics.py holds the distance to 1e-5
-        relative.
+        `weights` is a file holding the feature extractor's parameters, as
+        `CLIPScore(modelname)` names a local CLIP. The file is the InceptionV3
+        variables tree in safetensors, which `tools/convert_inception_weights.py`
+        writes. When `weights` is unset, the published checkpoint is
+        downloaded and converted. Two distances are comparable only when both
+        used the same weights, so every distance logs which weights it used.
+        With the published weights, the features and distance reproduce
+        pytorch-fid 0.3.0's (bilinear resize without antialiasing) to within
+        1e-5 relative.
         """
+        # tests/test_metrics.py holds the distance to pytorch-fid 0.3.0's within 1e-5 relative.
         if batch_size < 1:
             raise ValueError(f"fid: a batch holds at least one image, got batch_size={batch_size}")
         with metric_device():

@@ -1,20 +1,21 @@
-"""Data for a run: dataset specs, the `Dataset` value they load, tokenizers.
+"""Data for a run: dataset specs, the `Dataset` value they load, and tokenizers.
 
-A dataset is a frozen dataclass behind `@datasets(name)`, and `load(batch=)`
-turns it into a `Dataset` of batch iterators:
+A dataset spec is a frozen dataclass registered with `@datasets(name)`, and
+its `load(batch=)` returns a `Dataset` of batch iterators:
 
     data = TFDSImages(path="data/oxford_flowers102/2.1.1", image_size=128).load(batch=32)
     steps = epochs * data.steps_per_epoch
 
-The specs here read a kind of store: prepared TFDS, Hugging Face, ArrayRecord
-shards, url tables, video trees. Which corpus they read, by name, bucket path
-and caption wording, is a recipe's choice; `recipes/diffusion/train.py`
-registers its own (`oxford_flowers102`, `cc12m`, the LAION sets and others).
+Each spec here reads one kind of store: prepared TFDS, Hugging Face,
+ArrayRecord shards, url tables or video trees. Which corpus to read, with its
+name, bucket path and caption wording, is up to the recipe. For example,
+`recipes/diffusion/train.py` defines its own in `CORPORA`
+(`oxford-flowers102`, `cc12m`, the LAION sets and others).
 
-Importing this package registers every dataset and costs none of the heavy
-dependencies. cv2, tensorflow_datasets, HF `datasets`, the AV readers and
-`transformers` are imported by a spec on use, so a host that only needs the
-token loaders never pays for the image stack, and vice versa.
+Importing this package registers every dataset without importing the heavy
+dependencies. A spec imports cv2, tensorflow_datasets, HF `datasets`, the AV
+readers or `transformers` only when it uses them, so a host that only needs
+the token loaders never loads the image stack, and the reverse.
 """
 
 from .chat import ChatMessages, Role

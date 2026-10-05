@@ -29,15 +29,15 @@ from ..precision import asks_default_precision
 
 def ragged_dot_runs(compute: Dtype, operands: tuple[Dtype, ...],
                     precision: PrecisionLike) -> bool:
-    """Whether the kernels compute the product a caller asked for.
+    """Return whether the kernels compute the product a caller asked for.
 
-    They multiply in `compute`, accumulate in fp32 and ignore `precision`.
-    With 16-bit compute that is exact products summed in fp32, which any
-    precision asks for; with fp32 it is TF32, which only the default
-    precision asks for (explicitly or through `jax_default_matmul_precision`).
-    An operand or master wider than fp32 needs its gradient summed wider than
-    the kernels do, and x64 widens their int32 group offsets, so both are
-    refused.
+    The kernels multiply in `compute`, accumulate in fp32 and ignore
+    `precision`. With 16-bit compute that gives exact products summed in
+    fp32, which any precision asks for. With fp32 compute it gives TF32,
+    which only the default precision asks for (explicitly or through
+    `jax_default_matmul_precision`). An operand or master wider than fp32
+    needs its gradient summed wider than the kernels sum, and x64 widens
+    their int32 group offsets, so both return False.
     """
     if jax.config.jax_enable_x64:
         return False
@@ -144,15 +144,15 @@ def _backward(inputs, matrix, sizes, cotangent, work, interpret_on_cpu):
 @functools.partial(jax.custom_vjp, nondiff_argnums=(3, 4))
 def grouped_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
                        compute: Dtype, interpret_on_cpu: bool) -> jax.Array:
-    """`dew.nn.moe.expert_projection` on the kernels, first-order reverse mode.
+    """Compute `dew.nn.moe.expert_projection` with the kernels, differentiable in first-order reverse mode.
 
-    The operands are cast to `compute`, the product accumulates in fp32 and
-    rounds once to `compute`. The input gradient takes `x`'s dtype and the
-    kernel gradient the kernel's, each summed in fp32 from the compute-dtype
-    cotangent and rounded operands: with 16-bit compute, exact products.
-    Only a CUDA lowering runs the kernels (`interpret_on_cpu` adds the CPU's
-    interpreter); every other lowering runs `jax.lax.ragged_dot` under the
-    same contract.
+    The operands are cast to `compute`, and the product accumulates in fp32
+    and is rounded once to `compute`. The input gradient takes `x`'s dtype
+    and the kernel gradient takes the kernel's. Each is summed in fp32 from
+    the compute-dtype cotangent and the rounded operands, which with 16-bit
+    compute means exact products. Only a CUDA lowering runs the kernels
+    (`interpret_on_cpu` adds the CPU's interpreter). Every other lowering
+    runs `jax.lax.ragged_dot` under the same contract.
     """
     return _projection_fwd(x, kernel, group_sizes, compute, interpret_on_cpu)[0]
 

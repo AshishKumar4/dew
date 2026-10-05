@@ -1,7 +1,8 @@
-"""SSIM in pure jax (Wang et al. 2004), batched over images and video.
+"""SSIM in pure jax, batched over images and video.
 
-Standard parameters, 11x11 gaussian window, sigma 1.5, means taken over
-channels after per-channel SSIM. No scipy/skimage dependency;
+This is the SSIM of Wang et al. (2004), with the standard parameters: an
+11x11 gaussian window, sigma 1.5, and the mean over channels taken after
+per-channel SSIM. No scipy/skimage dependency;
 `tests/test_metrics.py` states the tolerance against the filtered equations
 and the difference observed.
 """
@@ -93,12 +94,14 @@ def structural_similarity(
     data_range: float,
     per_example: bool = False,
 ) -> jnp.ndarray:
-    """SSIM (Wang et al. 2004) per frame, an 11x11 gaussian window of sigma
-    1.5 on each channel and the channels averaged.
+    """Return the SSIM per frame, averaged over channels.
 
+    Each channel is scored with an 11x11 gaussian window of sigma 1.5. This
+    is the SSIM of Wang et al. (2004). The inputs are (B, H, W, C) images or
+    (B, T, H, W, C) videos, and every video frame is scored on its own.
     `data_range` is the dynamic range of the signal, 2.0 for [-1, 1] inputs.
-    The mean over frames comes back unless `per_example` asks for the (N,)
-    per-frame scores. Identical inputs give 1.0.
+    The function returns the mean over frames, or the (N,) per-frame scores
+    when `per_example` is set. Identical inputs give 1.0.
     """
     pred, targ = frame_batch(predictions), frame_batch(targets)
     # vmap over frames then channels. Each (H, W) plane is scored independently,
@@ -113,9 +116,11 @@ def structural_similarity(
 
 @metrics("ssim")
 class SSIM(ImageMetric):
-    """Mean SSIM between the sampled frames and the batch's, higher is
-    better, on the same [-1, 1] scale as `PSNR`. `reads` names the artifact
-    type the trainer hands this metric; a video run passes `VideoGrid`."""
+    """Measures the mean SSIM between the sampled frames and the batch's; higher is better.
+
+    It uses the same [-1, 1] scale as `PSNR`. `reads` names the artifact type
+    the trainer passes this metric; a video run passes `VideoGrid`.
+    """
 
     def __init__(self, data_range: float = 2.0, field: str = "image", reads: type = ImageGrid):
         def measure(artifact, batch):

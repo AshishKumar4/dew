@@ -1,20 +1,20 @@
-"""Continuous-time consistency distillation (sCM) with distribution matching
-(DMD2), together rCM.
+"""Continuous-time consistency distillation (sCM) combined with distribution
+matching (DMD2), which together make rCM.
 
 sCM (Lu & Song 2025, "Simplifying, Stabilizing and Scaling Continuous-Time
 Consistency Models") trains a student F on TrigFlow, x_t = cos(t) x_0 +
-sin(t) z, toward the tangent of the teacher's probability-flow ODE: the
-student's time derivative along the ODE comes from one JVP, and the loss
-pulls F toward F plus the normalized tangent g. DMD2 (Yin et al. 2024,
-"Improved Distribution Matching Distillation for Fast Image Synthesis")
-moves the student's few-step samples along the difference of a fake score,
-trained on those samples, and the teacher's. rCM (Zheng et al. 2025,
+sin(t) z, toward the tangent of the teacher's probability-flow ODE. One JVP
+gives the student's time derivative along the ODE, and the loss pulls F
+toward F plus the normalized tangent g. DMD2 (Yin et al. 2024, "Improved
+Distribution Matching Distillation for Fast Image Synthesis") moves the
+student's few-step samples along the difference between a fake score,
+trained on those samples, and the teacher's score. rCM (Zheng et al. 2025,
 "Large Scale Diffusion Distillation via Score-Regularized Continuous-Time
 Consistency") combines the two. The official code is NVlabs/rcm's
 `T2VDistillModel_rCM`, which `tools/rcm_reference.py` runs.
 
 Every network here is a rectified-flow velocity model on Dew's `Flow`
-process; `trig_prediction` reads one on TrigFlow as rCM's
+process. `trig_prediction` reads one on TrigFlow the way rCM's
 `RectifiedFlow_TrigFlowWrapper` does, at rf time sin t / (cos t + sin t).
 """
 
@@ -47,13 +47,16 @@ Velocity = Callable[[jax.Array, jax.Array], jax.Array]
 
 
 def trig_time(rf: jax.Array) -> jax.Array:
-    """TrigFlow time of an rf time: arctan of sigma = rf / (1 - rf)."""
+    """Return the TrigFlow time of an rf time: the arctan of sigma = rf / (1 - rf)."""
     return jnp.arctan(rf / (1 - rf))
 
 
 def trig_prediction(velocity: Velocity, x: jax.Array, t: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """(x_0, F) of a velocity model at TrigFlow `(x, t)`: the input and time
-    scaled to rf, x_0 = x / (cos + sin) - rf v, and F = (cos x - x_0) / sin."""
+    """Return (x_0, F) of a velocity model at TrigFlow `(x, t)`.
+
+    The input and the time are first scaled to rf. Then
+    x_0 = x / (cos + sin) - rf v, and F = (cos x - x_0) / sin.
+    """
     cos, sin = expand(jnp.cos(t), x), expand(jnp.sin(t), x)
     rf = jnp.sin(t) / (jnp.cos(t) + jnp.sin(t))
     scaled = x / (cos + sin)
@@ -62,7 +65,7 @@ def trig_prediction(velocity: Velocity, x: jax.Array, t: jax.Array) -> tuple[jax
 
 
 def guided(unconditional: jax.Array, conditional: jax.Array, scale: float) -> jax.Array:
-    """The teacher's guided prediction, applied above a scale of one only."""
+    """Return the teacher's guided prediction. Guidance applies only at a scale above one."""
     return conditional if scale <= 1.0 else unconditional + scale * (conditional - unconditional)
 
 
@@ -79,12 +82,17 @@ def consistency_loss(
     warmup: float | jax.Array,
     scale: float,
 ) -> jax.Array:
-    """sCM's per-row loss (`_student_scm_step`), scaled: the student's
-    F-derivative along the teacher's ODE by one JVP, with tangents
-    (cos t sin t F_teacher, cos t sin t), the tangent
-    g = -cos t sqrt(1 - r^2 sin^2 t) (F_sg - F_teacher) - (r cos t sin t x + dF/dt)
-    at warmup ratio r, normalized by its norm plus 0.1, and the loss
-    ||F - F_sg - g||^2. `student(x, t)` is the student's F."""
+    """Return sCM's per-row loss times `scale` (rCM's `_student_scm_step`).
+
+    One JVP gives the student's F-derivative along the teacher's ODE, with
+    tangents (cos t sin t F_teacher, cos t sin t). At warmup ratio r the
+    tangent is
+
+        g = -cos t sqrt(1 - r^2 sin^2 t) (F_sg - F_teacher) - (r cos t sin t x + dF/dt)
+
+    normalized by its norm plus 0.1, and the loss is ||F - F_sg - g||^2.
+    `student(x, t)` returns the student's F.
+    """
     cos, sin = expand(jnp.cos(t), x), expand(jnp.sin(t), x)
     with forward_mode_attention():
         _, derivative = jax.jvp(student, (x, t), (cos * sin * teacher_F, jnp.cos(t) * jnp.sin(t)))
@@ -100,11 +108,13 @@ def consistency_loss(
 def discrete_consistency_loss(student: Callable[[jax.Array, jax.Array], jax.Array],
                               teacher: Callable[[jax.Array, jax.Array], jax.Array], x0, noise, u,
                               steps: int, skip: int, shift: float, scale: float) -> jax.Array:
-    """rCM's discrete consistency (dCM) per-row loss (`_student_dcm_step`):
-    on a grid of `steps` in shifted rf time, the student's x_0 at a point u
-    against its stopped x_0 `skip` teacher Euler steps of F later.
-    `student(x, t)` is the student's x_0 and `teacher(x, t)` the guided
-    teacher's F, both at TrigFlow time."""
+    """Return rCM's discrete consistency (dCM) per-row loss (rCM's `_student_dcm_step`).
+
+    On a grid of `steps` points in shifted rf time, the loss compares the
+    student's x_0 at a point u with its own stopped x_0 after `skip` teacher
+    Euler steps of F. `student(x, t)` returns the student's x_0 and
+    `teacher(x, t)` the guided teacher's F, both at TrigFlow time.
+    """
     def trig(k):
         s = 1.0 - (u + k / steps)
         rf = shift * s / (1 + (shift - 1) * s)
@@ -122,13 +132,15 @@ def discrete_consistency_loss(student: Callable[[jax.Array, jax.Array], jax.Arra
 
 def backward_simulation(student: Callable[[jax.Array, jax.Array], jax.Array], x_T, times, noises,
                         live: jax.Array | None = None) -> jax.Array:
-    """The student's few-step sample from `x_T` at t = pi/2
-    (`backward_simulation`): at each of `times`, a row's minimum with the
-    time before, the clean prediction is noised again with the next of
-    `noises`, and the last clean prediction, which alone keeps its
-    gradient, is the sample. `student(x, t)` is the student's x_0. `live`
-    marks the steps walked; the rest leave the state and the time as they
-    are, so a traced count of steps runs over a fixed number of draws."""
+    """Return the student's few-step sample from `x_T`, starting at t = pi/2 (rCM's `backward_simulation`).
+
+    At each time in `times`, capped per row at the time before it, the clean
+    prediction is noised again with the next entry of `noises`. The last
+    clean prediction is the sample, and only it keeps its gradient.
+    `student(x, t)` returns the student's x_0. `live` marks the steps that
+    run; the other steps leave the state and the time unchanged, so a traced
+    step count can run over a fixed number of draws.
+    """
     current = jnp.full(x_T.shape[:1], math.pi / 2, jnp.float32)
     x = x_T
     live = jnp.ones((len(times),), bool) if live is None else live
@@ -142,9 +154,12 @@ def backward_simulation(student: Callable[[jax.Array, jax.Array], jax.Array], x_
 
 
 def distribution_matching_loss(generated, fake, teacher, scale: float) -> jax.Array:
-    """DMD2's per-row generator loss (`_student_dmd_step`): the sample moved
-    along fake - teacher, normalized by the mean distance to the teacher's
-    prediction (at least 1e-5), as a regression onto the stopped target."""
+    """Return DMD2's per-row generator loss (rCM's `_student_dmd_step`).
+
+    The target is the sample moved along fake - teacher, normalized by the
+    mean distance to the teacher's prediction (at least 1e-5). The loss
+    regresses the sample onto that stopped target.
+    """
     weight = jnp.maximum(jnp.mean(jnp.abs(generated - teacher), axis=tuple(range(1, generated.ndim)),
                                   keepdims=True), 1e-5)
     target = jax.lax.stop_gradient(generated - (fake - teacher) / weight)
@@ -152,8 +167,8 @@ def distribution_matching_loss(generated, fake, teacher, scale: float) -> jax.Ar
 
 
 def critic_loss(generated, fake, t) -> jax.Array:
-    """The fake score's per-row denoising loss on the student's samples at
-    TrigFlow `t`, over sin^2 t (`training_step_critic`)."""
+    """Return the fake score's per-row denoising loss on the student's samples
+    at TrigFlow `t`, divided by sin^2 t (rCM's `training_step_critic`)."""
     return rows(jnp.square(generated - fake) / expand(jnp.sin(t) ** 2, generated))
 
 
@@ -176,41 +191,43 @@ class _Draws(NamedTuple):
 
 @objectives("rcm")
 class ConsistencyDistillationObjective(DiffusionObjective):
-    """rCM: sCM distillation of a flow teacher, regularized by DMD2.
+    """Trains rCM: sCM distillation of a flow teacher, regularized by DMD2.
 
-    `teacher` is the teacher model's variables; the student and the fake
-    score start from them. `consistency_weight` is sCM's loss scale (100,
-    rCM's; 0 leaves DMD2 alone), `dmd_weight` DMD2's (1; 0 leaves sCM
-    alone), and `teacher_guidance` the teacher's classifier-free scale in
-    both. For the first `tangent_warmup` steps the tangent's warmup ratio
-    rises from 0 to 1 and only the student trains; after them one step in
-    `student_update_freq` trains the student and the rest the fake score, as
-    rCM alternates its two optimizers. Each network has its own copy of the
-    optimizer the trainer is handed and steps only on its own updates
-    (`optimizer`), and the EMA averages the student's updates alone, its
-    decay reading the student's own update count (`averages`): with
-    `ema_decay=dew.training.posthoc.power_decay(0.1)`, rCM's power EMA at
+    `teacher` is the teacher model's variables, and the student and the fake
+    score start from them. `consistency_weight` is sCM's loss scale (100, as
+    in rCM; 0 trains DMD2 alone), `dmd_weight` is DMD2's (1; 0 trains sCM
+    alone), and `teacher_guidance` is the teacher's classifier-free guidance
+    scale in both losses.
+
+    For the first `tangent_warmup` steps, the tangent's warmup ratio rises
+    from 0 to 1 and only the student trains. After that, one step in
+    `student_update_freq` trains the student and the others train the fake
+    score, the way rCM alternates its two optimizers. Each network gets its
+    own copy of the optimizer given to the trainer and steps only on its own
+    updates (`optimizer`). The EMA averages only the student's updates, and
+    its decay reads the student's own update count (`averages`); with
+    `ema_decay=dew.training.posthoc.power_decay(0.1)` it is rCM's power EMA at
     rate 0.1. The student's DMD2 sample takes 1 to `max_simulation_steps`
-    steps, cycling with the step count. Training times are rCM's
-    log-normals in rf time, `student_times` for sCM and `critic_times` for
-    DMD2 and the critic.
+    steps, cycling with the step count. Training times are rCM's log-normals
+    in rf time: `student_times` for sCM, and `critic_times` for DMD2 and the
+    critic.
 
-    `consistency` "discrete" trains rCM's discrete consistency (dCM, Song
-    et al. 2023's consistency distillation) in place of sCM: the student's
-    x_0 at a point of a `discrete_steps` grid in rf time shifted by
-    `discrete_shift`, against its own stopped x_0 `discrete_skip` teacher
-    Euler steps later.
+    With `consistency="discrete"`, the objective trains rCM's discrete
+    consistency (dCM, the consistency distillation of Song et al. 2023) in
+    place of sCM. dCM compares the student's x_0 at a point of a
+    `discrete_steps` grid in rf time, shifted by `discrete_shift`, with its
+    own stopped x_0 `discrete_skip` teacher Euler steps later.
 
-    The loss is the mean over rows, where rCM's trainer backpropagates
-    their sum: under Adam the two take the same steps at an epsilon of
-    rCM's over the batch size. The phases alternate update by update, so a
-    trainer accumulating more than one microbatch per update is refused.
-    Sampling walks the student's multistep consistency solver,
+    The loss is the mean over rows, while rCM's trainer backpropagates their
+    sum. Under Adam the two take the same steps when the epsilon is rCM's
+    divided by the batch size. The phases alternate from one update to the
+    next, so a trainer that accumulates more than one microbatch per update
+    is refused. Sampling runs the student's multistep consistency solver,
     `Consistency`.
 
-    sCM's loss differentiates the student in time, so its time embedding
-    must be smooth in it: `simple_dit(time_scale=0.002)`, which a run config
-    sets for it, rather than the default 16.
+    sCM's loss differentiates the student with respect to time, so the
+    student's time embedding must be smooth in time. A run config sets
+    `simple_dit(time_scale=0.002)` for this, in place of the default 16.
     """
 
     def __init__(
@@ -280,8 +297,12 @@ class ConsistencyDistillationObjective(DiffusionObjective):
 
     def optimizer(self, tx: optax.GradientTransformation, *,
                   accumulation: int) -> optax.GradientTransformation:
-        """The student and the fake score, each with its own copy of `tx`,
-        each stepped on its own updates only, as rCM's two optimizers are."""
+        """Return an optimizer that gives the student and the fake score each their own copy of `tx`.
+
+        Each copy steps only on its own network's updates, as rCM's two
+        optimizers do. With DMD2 on, an `accumulation` above one raises
+        `ValueError`.
+        """
         if accumulation > 1 and self.dmd_weight > 0:
             raise ValueError(
                 "rCM alternates its student and fake-score updates update by update, so an update "

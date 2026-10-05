@@ -5,28 +5,29 @@ the caller's OS permissions with bounded CPU, memory, time and IO. It has no
 filesystem or network isolation, so hostile code needs an outer boundary.
 Dew never selects or executes it by default.
 
-A `Program` is files written into a fresh temporary directory, an argv run
-there without a shell, and the text fed to its stdin. A runner executes one
-program under `SandboxLimits` and reports an `Outcome`: how it ended, its
-exit code, its capped output and the seconds it took. `SandboxFleet` runs
-programs on `workers` threads at once, each program in its own process,
-which is what a verifiable reward scores completions with.
+A `Program` holds the files to write into a fresh temporary directory, an
+argv to run there without a shell, and the text to feed to its stdin. A
+runner executes one program under `SandboxLimits` and reports an
+`Outcome`: how it ended, its exit code, its capped output and the seconds
+it took. `SandboxFleet` runs programs on `workers` threads at once, each
+program in its own process, and a verifiable reward uses it to score
+completions.
 
-Two runners exist. `ProcessRunner` starts the program through the same
-launcher as `SubprocessEnvironment`: RLIMIT_CPU and RLIMIT_AS, no core
-dumps, its own session, SIGKILL on parent death, a minimal environment, and
-a process-group kill at the wall deadline. It keeps the caller's user,
-filesystem and network, so a program can read and reach whatever you can. `ContainerRunner` runs the
-program in a fresh Docker or Podman container with no network, a read-only
-root, the job directory mounted read-only, no capabilities, an unprivileged
-user and memory, CPU, process and CPU-time limits; that is the boundary for
-hostile code.
+Dew has two runners. `ProcessRunner` starts the program through the same
+launcher as `SubprocessEnvironment`. The program gets RLIMIT_CPU and
+RLIMIT_AS, no core dumps, its own session, SIGKILL on parent death and a
+minimal environment, and its process group is killed at the wall deadline.
+It keeps the caller's user, filesystem and network, so a program can read
+and reach whatever you can. `ContainerRunner` runs the program in a fresh
+Docker or Podman container with no network, a read-only root, the job
+directory mounted read-only, no capabilities, an unprivileged user, and
+limits on memory, CPU, process count and CPU time. Use it for hostile code.
 
 A program that fails returns an `Outcome`, and the reward decides what a
 timeout or a crash is worth. A runner raises only when it cannot start a
 program at all.
 
-`MathReward` is the verifiable reward that needs no program: it reads the
+`MathReward` is a verifiable reward that runs no program. It reads the
 completion's final answer and compares it with the reference as an exact
 rational number.
 """
@@ -62,10 +63,16 @@ from dew.records import JSON
 
 @dataclass(frozen=True)
 class SandboxLimits:
-    """Bound one worker by RLIMIT_CPU and RLIMIT_AS, plus parent-enforced session and IO limits.
+    """Limits for one worker: RLIMIT_CPU and RLIMIT_AS, plus session and IO limits the parent enforces.
 
-    Forked children inherit the resource limits. Process-group cleanup handles
-    descendants that stay in that group; this is not a cgroup aggregate limit.
+    `cpu_seconds` and `memory_bytes` set RLIMIT_CPU and RLIMIT_AS.
+    `wall_seconds` is the wall-clock deadline. `message_bytes` caps one JSON
+    message to or from a `SubprocessEnvironment` worker, and a program's
+    stdout and stderr together.
+
+    Forked children inherit the resource limits, which apply to each process
+    separately; they are not a cgroup limit on the group's total. Killing
+    the process group cleans up the descendants that stay in that group.
     """
 
     wall_seconds: float = 30.
@@ -230,17 +237,19 @@ class _ProcessEnvironment:
 
 @dataclass(frozen=True)
 class SubprocessEnvironment:
-    """A user-selected JSON-lines worker implementing reset and step.
+    """Runs an episode environment as a JSON-lines worker process that you choose.
 
-    command is an argv tuple, executed without a shell in a temporary working
-    directory. Each request has an operation and either an episode identity
-    or an action record. Replies contain context (integer ids), status
-    (running/completed/truncated/cancelled/error) and optional string detail.
+    The worker implements reset and step. `command` is its argv tuple, run
+    without a shell in a temporary working directory. Each request has an
+    operation and either an episode identity or an action record. Each
+    reply holds `context` (integer ids), `status` (running, completed,
+    truncated, cancelled or error) and an optional string `detail`. It runs
+    on Linux only.
 
-    Session exit kills the process group on success, error or cancellation.
-    The direct worker also receives SIGKILL if its parent dies. Neither
-    mechanism replaces filesystem/network isolation or controls descendants
-    that deliberately leave the group.
+    Leaving the session kills the process group, whether the episode
+    succeeded, failed or was cancelled. The worker itself also gets SIGKILL
+    if its parent dies. Neither replaces filesystem and network isolation,
+    and neither stops descendants that deliberately leave the group.
     """
 
     command: tuple[str, ...]
@@ -267,20 +276,25 @@ class Verdict(Enum):
     """How a program ended."""
 
     COMPLETED = "completed"
-    """Exited with status zero."""
+    """The program exited with status zero."""
     FAILED = "failed"
-    """Exited with a nonzero status, an uncaught exception or MemoryError included."""
+    """The program exited with a nonzero status, including after an uncaught exception or a MemoryError."""
     TIMEOUT = "timeout"
-    """Ran past the wall deadline or its CPU-time limit and was killed."""
+    """The program ran past the wall deadline or its CPU-time limit and was killed."""
     CRASHED = "crashed"
-    """Killed by a signal it did not ask for."""
+    """The program was killed by a signal it did not ask for."""
     OUTPUT_LIMIT = "output_limit"
-    """Wrote more than `message_bytes` to stdout and stderr together and was killed."""
+    """The program wrote more than `message_bytes` to stdout and stderr together and was killed."""
 
 
 @dataclass(frozen=True)
 class Program:
-    """Files to write, the argv to run beside them, and its stdin."""
+    """The files to write, the argv to run beside them, and the text for its stdin.
+
+    File names must be relative paths inside the job directory, and
+    `command` must be a nonempty argv tuple; anything else raises
+    ValueError.
+    """
 
     files: Mapping[str, str]
     command: tuple[str, ...]
@@ -306,9 +320,10 @@ class Outcome:
 
 
 class Runner(Protocol):
-    """Run one program to its end under `limits`; raise only when it cannot start.
+    """Runs one program to its end under `limits`, and raises only when it cannot start it.
 
-    `python` is the argv that runs a Python file where this runner runs programs.
+    `python` is the argv that runs a Python file in the place this runner
+    runs programs.
     """
 
     @property
@@ -409,12 +424,12 @@ def _closed(process: subprocess.Popen[bytes]) -> None:
 
 @dataclass(frozen=True)
 class ProcessRunner:
-    """Run each program as a resource-limited Linux process in a temporary directory.
+    """Runs each program as a resource-limited Linux process in a temporary directory.
 
-    The whole process group is killed at the wall deadline, on excess
-    output, and after a normal exit, so no child it forked outlives it
-    unless it left the group on purpose. `python` is this interpreter,
-    isolated from the environment, site-packages and user site.
+    The runner kills the whole process group at the wall deadline, on
+    excess output, and after a normal exit, so no child the program forked
+    outlives it unless the child left the group on purpose. `python` is this
+    interpreter, isolated from the environment, site-packages and user site.
     """
 
     python: tuple[str, ...] = (sys.executable, "-I", "-S")
@@ -438,16 +453,17 @@ class ProcessRunner:
 
 @dataclass(frozen=True)
 class ContainerRunner:
-    """Run each program in a fresh, network-less container of `image`.
+    """Runs each program in a fresh container of `image` with no network.
 
     `runtime` is the Docker-compatible CLI (`docker` or `podman`). The job
-    directory is mounted read-only at `/work`, the working directory; `/tmp`
-    is a small writable tmpfs. Memory is capped at `memory_bytes` with no
-    swap, CPU time at `cpu_seconds` (SIGXCPU, then SIGKILL a second later),
-    the processor share at `cpus` and the
-    process count at `pids`. At the wall deadline the client that runs
-    it is killed, then the container is force-removed by name. A runtime that exits without
-    creating the container (no daemon, no permission, no image) raises.
+    directory is mounted read-only at `/work`, which is the working
+    directory, and `/tmp` is a small writable tmpfs. The container caps
+    memory at `memory_bytes` with no swap, CPU time at `cpu_seconds`
+    (SIGXCPU, then SIGKILL a second later), the processor share at `cpus`
+    and the process count at `pids`, and it runs as `user`. At the wall
+    deadline the runner kills the client process, then force-removes the
+    container by name. A runtime that exits without creating the container
+    (no daemon, no permission, no image) raises RuntimeError.
     """
 
     image: str
@@ -456,12 +472,12 @@ class ContainerRunner:
     pids: int = 64
     user: str = "65534:65534"
     python: tuple[str, ...] = ("python", "-I", "-S")
-    """The image's own interpreter; the host's path does not exist inside it."""
+    """The image's own interpreter, since the host's path does not exist in the container."""
 
     def command(
         self, program: Program, limits: SandboxLimits, directory: str, name: str, cidfile: str
     ) -> list[str]:
-        """The runtime argv that runs `program` from `directory` in a container called `name`.
+        """Return the runtime argv that runs `program` from `directory` in a container called `name`.
 
         The runtime writes the container's id to `cidfile` once it creates one.
         """
@@ -529,10 +545,12 @@ _DEFAULT_LIMITS = SandboxLimits()
 
 
 class SandboxFleet:
-    """Run programs on `workers` concurrent sandboxed workers.
+    """Runs programs on `workers` sandboxed workers at once.
 
-    Use it as a context manager, or call `close`. Programs queue when every
-    worker is busy; `submit` returns at once.
+    `runner` defaults to a `ProcessRunner` and `workers` to the CPU count.
+    Use it as a context manager, or call `close`, which waits for the
+    running programs and cancels the queued ones. `submit` returns a future
+    at once, and programs wait in a queue while every worker is busy.
     """
 
     def __init__(self, runner: Runner = _DEFAULT_RUNNER, *, limits: SandboxLimits = _DEFAULT_LIMITS,
@@ -546,7 +564,7 @@ class SandboxFleet:
         return self._pool.submit(self.runner, program, self.limits)
 
     def run(self, programs: Iterable[Program]) -> list[Outcome]:
-        """Run every program, concurrently, and return their outcomes in order."""
+        """Run every program concurrently and return their outcomes in input order."""
         futures = [self.submit(program) for program in programs]
         return [future.result() for future in futures]
 
@@ -561,7 +579,11 @@ class SandboxFleet:
 
 
 def outputs_match(outcome: Outcome, expected: str) -> bool:
-    """A completed program whose stdout equals `expected`, up to surrounding whitespace per line."""
+    """Return whether the program completed and its stdout equals `expected`.
+
+    Whitespace around the whole output and at the end of each line is
+    ignored.
+    """
     def lines(text: str) -> list[str]:
         return [line.rstrip() for line in text.strip().splitlines()]
 
@@ -609,13 +631,13 @@ def _rational(text: str) -> Fraction | None:
 
 @dataclass(frozen=True)
 class MathReward:
-    """Score one when the final answer equals the reference as a rational number.
+    """Scores 1.0 when the final answer equals the reference as a rational number, and 0.0 otherwise.
 
-    The answer is the last `\\boxed{}` in the completion; with
-    `require_boxed=False` a completion without one falls back to its last
-    number. Integers, decimals, `a/b` and `\\frac{a}{b}` compare exactly, so
+    The answer is the last `\\boxed{}` in the completion. With
+    `require_boxed=False`, a completion without one uses its last number
+    instead. Integers, decimals, `a/b` and `\\frac{a}{b}` compare exactly, so
     `0.5`, `1/2` and `\\frac{1}{2}` agree. A reference that is not a number
-    compares as trimmed text.
+    is compared as trimmed text.
     """
 
     require_boxed: bool = True

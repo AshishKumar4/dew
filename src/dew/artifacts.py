@@ -1,8 +1,10 @@
-"""What an objective's evaluation produces, as typed values.
+"""Typed values that an objective's evaluation produces.
 
-Objectives return these values from scoring and preview hooks. A metric
-consumes scoring artifacts; a tracker renders previews by type. Array leaves
-cross jit, while optional captions and decoded text remain host metadata.
+An objective returns these from its scoring and preview hooks. A metric
+reads the scoring artifact of the type it expects, and a tracker renders
+each preview according to its type. The array fields are pytree leaves, so
+they can pass through jit, while the optional captions and decoded text stay
+on the host as static metadata.
 """
 
 from __future__ import annotations
@@ -38,7 +40,8 @@ class ImageGrid:
 
 @struct.dataclass
 class VideoGrid:
-    """Clips in [-1, 1], `[N, T, H, W, C]`."""
+    """Clips in [-1, 1], `[N, T, H, W, C]`, with the text each was conditioned on
+    where there was any."""
     videos: jax.Array
     captions: tuple[str, ...] = struct.field(pytree_node=False, default=())
 
@@ -61,10 +64,12 @@ class Representations:
 
 @struct.dataclass
 class TokenScores:
-    """Teacher-forced per-token losses `[N, L]` and the weight of each target,
-    1 where it counts and 0 where it is padding or a document's first token.
-    A perplexity is exp of the weighted mean over a whole pass, so a batch
-    with no counted target weighs nothing."""
+    """Teacher-forced per-token losses `[N, L]` and the weight of each target.
+
+    A weight is 1 where the target counts and 0 where it is padding or a
+    document's first token. A perplexity is exp of the weighted mean loss
+    over a whole pass, so a batch with no counted target adds nothing to it.
+    """
     losses: jax.Array
     weights: jax.Array
     correct: jax.Array
@@ -78,12 +83,12 @@ Artifacts = Artifact | tuple[Artifact, ...]
 
 
 def uint8_pixels(images: ArrayLike) -> NDArray[np.uint8]:
-    """[-1, 1] pixels, as `ImageGrid` and `VideoGrid` hold them, as uint8 in [0, 255].
+    """Convert [-1, 1] pixels, as `ImageGrid` and `VideoGrid` hold them, to uint8 in [0, 255].
 
-    Each value goes to its nearest level, `(x + 1) * 127.5` in float32
-    rounded half to even (`np.rint`), then clipped, because a sample can
-    leave the range. A metric scores and a tracker previews these bytes, so
-    the two see the same image.
+    Each value maps to its nearest level, computed as `(x + 1) * 127.5` in
+    float32 and rounded half to even (`np.rint`). The result is clipped,
+    because a sample can leave the range. Metrics score these bytes and
+    trackers preview them, so both see the same image.
     """
     levels = np.rint((np.asarray(images, np.float32) + 1.0) * 127.5)
     return np.clip(levels, 0, 255).astype(np.uint8)
@@ -250,7 +255,7 @@ def agreed[T](phase: str, operation: Callable[[], T]) -> T:
 
 
 class PeerFailure(RuntimeError):
-    """Another rank failed at a phase agreement this rank passed."""
+    """Raised when another process failed at a phase agreement that this process passed."""
 
 
 AGREEMENT_PATIENCE_SECONDS = 24 * 3600
