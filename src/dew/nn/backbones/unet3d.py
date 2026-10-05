@@ -65,9 +65,12 @@ class TemporalBlock(nn.Module):
 
 @models("unet_3d")
 class UNet3D(Unet):
-    """Video UNet over (B, T, H, W, C): the 2D Unet body per frame, with a
-    TemporalBlock at every resolution level. Spatial param paths are
-    identical to Unet, so 2D checkpoints inflate directly."""
+    """Denoises video (B, T, H, W, C) with the 2D `Unet` body per frame and a `TemporalBlock` per level.
+
+    There is a `TemporalBlock` at every resolution level. The spatial
+    parameter paths are identical to `Unet`'s, so 2D checkpoints inflate
+    directly.
+    """
     temporal_heads: int = 8
 
     @nn.compact
