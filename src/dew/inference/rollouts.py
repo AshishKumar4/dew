@@ -51,14 +51,16 @@ if TYPE_CHECKING:
 class Draw:
     """One sampled continuation of one prompt.
 
-    `tokens` are the sampled actions, EOS included when the draw terminated
-    on it. `behavior_log_probs` is the likelihood of each action under the
-    distribution that drew it; `raw_log_probs` is the unmodified model's,
-    or None when the backend cannot report it. `version` is the policy
-    version the request was submitted under. `routed_experts` is the
-    engine's mixture routing for every id it forwarded and `support` the ids
-    its sampler kept for each drawn token, when asked for
-    (`sessions.Call.routed_experts`, `sessions.Call.support`).
+    `tokens` are the sampled actions, with EOS included when the draw
+    terminated on it. `behavior_log_probs` is the likelihood of each action
+    under the distribution that drew it. `raw_log_probs` is the unmodified
+    model's likelihood, or None when the backend cannot report it. `version`
+    is the policy version the request was submitted under. When requested,
+    `routed_experts` is the engine's mixture routing for every id it
+    forwarded, and `support` is the ids its sampler kept for each drawn
+    token (see `sessions.Call.routed_experts` and `sessions.Call.support`).
+    Likelihoods that do not match the tokens one to one, or are not finite,
+    raise ValueError.
     """
 
     prompt: tuple[int, ...]
@@ -85,7 +87,11 @@ class Draw:
             raise ValueError("a draw's support holds one set of kept ids per drawn token")
 
     def check_stops(self, stops: tuple[int, ...]) -> Draw:
-        """This draw, refused unless it ends on EOS exactly when it terminated and holds no earlier EOS."""
+        """Return this draw after checking its EOS tokens against the stop ids `stops`.
+
+        Raises ValueError unless the draw ends on a stop id exactly when it
+        terminated, with no stop id before its last token.
+        """
         if self.terminated != bool(self.tokens and self.tokens[-1] in stops) or any(
                 token in stops for token in self.tokens[:-1]):
             raise ValueError("the draw's termination disagrees with its EOS tokens")
@@ -93,10 +99,11 @@ class Draw:
 
 
 class RolloutServer(Protocol):
-    """Sample continuations of token prompts under a versioned, reloadable policy.
+    """Samples continuations of token prompts under a versioned policy whose weights can be reloaded.
 
-    `submit` never blocks on generation. `load` replaces the served weights
-    and sets `version`; submissions after it return draws stamped with it.
+    `submit` returns a future without waiting for generation. `load`
+    replaces the served weights and sets `version`, and draws submitted
+    after it report that version.
     """
 
     @property
@@ -135,13 +142,13 @@ def _native_draw(prompt: tuple[int, ...], generation: Generation[np.ndarray], ve
 
 
 class NativeRolloutServer:
-    """Serve rollouts from Dew's `Server` on a background stepping thread.
+    """Serves rollouts from Dew's `Server`, stepping it on a background thread.
 
-    Submissions and weight loads are serialized with the server's steps by
-    one lock; a load lands between two steps. The server's own sampling
-    policy and transforms decide the draws, and a draw keeps both the raw
-    and the behavior likelihood the server records. A program that ends
-    without `close` stops the stepping at exit, after the step under way.
+    One lock orders submissions and weight loads with the server's steps,
+    so a load happens between two steps. The server's own sampling policy
+    and transforms decide the draws, and a draw keeps both the raw and the
+    behavior likelihoods the server records. If the program ends without
+    `close`, an exit hook stops the stepping after the step in progress.
     """
 
     def __init__(self, server: Server, *, version: int = 0):
@@ -165,7 +172,11 @@ class NativeRolloutServer:
         return self._version
 
     def submit(self, prompt: Sequence[int], max_new_tokens: int, *, key: int | jax.Array) -> Future[Draw]:
-        """Queue one draw; a request the server refuses raises here and leaves the rest running."""
+        """Queue one draw and return its future.
+
+        A request the server refuses raises here, and the other requests keep
+        running.
+        """
         request = request_key(key)
         ids, budget = _prompt(prompt), _budget(max_new_tokens)
         future: Future[Draw] = Future()
@@ -237,30 +248,34 @@ def _served(variables: Variables, dtype: jnp.dtype) -> Variables:
 
 @dataclass(frozen=True)
 class SafetensorsReload:
-    """Publish a policy version to engine replicas through safetensors on disk.
+    """Publishes a policy version to engine replicas through safetensors on disk.
 
-    `source.save` writes the weights, derived config and tokenizer files into
-    `directory`, the one every replica was launched on (shared when replicas
-    span hosts). Files are staged beside it and moved in with `os.replace`, so
-    no engine reads a half-written file. `engines` are the replicas' roots, not
-    their `/v1` APIs. A call fails the push on any answer but 200, or, where it
-    reports its outcome, on a `success` that is not true: both engines report
-    some failures as a 200 with `{"success": false}`.
+    `source.save` writes the weights, the derived config and the tokenizer
+    files into `directory`, the directory every replica was launched on (a
+    shared one when replicas span hosts). Floating-point leaves are cast to
+    `dtype` first. The files are staged beside `directory` and moved in with
+    `os.replace`, so no engine reads a half-written file. `engines` are the
+    replicas' root URLs, not their `/v1` API URLs, and `timeout` bounds each
+    HTTP call in seconds. The push fails if a call answers with any status
+    but 200, or, for a call that reports its outcome, with a `success` that
+    is not true. Both engines report some failures as a 200 with
+    `{"success": false}`.
 
-    vLLM (`engine="vllm"`, v0.30.0, `VLLM_SERVER_DEV_MODE=1`) pauses with
-    `mode=wait`, reloads, resets the prefix cache, sets the weight version and
-    resumes, so in-flight draws finish wholly on the old weights and no cached
-    prefix outlives them. A replica that fails after the pause stays paused
-    until a later push succeeds. SGLang (`engine="sglang"`, v0.5.20) runs one
-    `/update_weights_from_disk`, which waits out in-flight requests, holds new
-    ones and flushes the radix cache; a failed load rolls back by re-reading
-    the same directory.
+    For vLLM (`engine="vllm"`, v0.30.0, `VLLM_SERVER_DEV_MODE=1`), the push
+    pauses with `mode=wait`, reloads, resets the prefix cache, sets the
+    weight version and resumes. In-flight draws therefore finish entirely on
+    the old weights, and no cached prefix outlives them. A replica that fails
+    after the pause stays paused until a later push succeeds. For SGLang
+    (`engine="sglang"`, v0.5.20), the push is one `/update_weights_from_disk`
+    call, which waits for in-flight requests, holds new ones and flushes the
+    radix cache. A failed SGLang load rolls back by re-reading the same
+    directory.
 
-    A push raises naming every replica that did not take the version. Every
-    process of a pool calls it: `collective_host(held_by="first")` gathers the
-    served tree to process 0, which writes and publishes, and an agreement
-    point raises a failure on every process instead of leaving the rest to
-    hang at the next collective.
+    A failed push raises an error that names every replica that did not take
+    the version. Every process of a pool calls the push.
+    `collective_host(held_by="first")` gathers the served tree to process 0,
+    which writes and publishes it, and an agreement point raises a failure on
+    every process, so the others do not hang at the next collective.
     """
 
     source: Pretrained
@@ -275,7 +290,10 @@ class SafetensorsReload:
             raise ValueError("engine must be vllm or sglang")
 
     def write(self, variables: Variables) -> None:
-        """Write `variables` into `directory`, file by file atomically; every process of a pool calls it."""
+        """Write `variables` into `directory`, replacing each file atomically.
+
+        Every process of a pool calls it.
+        """
         served = collective_host(_served(variables, jnp.dtype(self.dtype)), phase="weight export gather",
                                  held_by="first")
         agreed("weight export", lambda: None if served is None else self._save(served))
@@ -348,17 +366,19 @@ class WeightSync(Protocol):
 
 
 class Publication:
-    """An engine fleet's publication as a versioned publisher: `load` pushes, stamps, then moves `version`.
+    """Publishes weights to an engine fleet under a version, for use as a scheduler's `Publisher`.
 
-    `weights` is the push (`SafetensorsReload`, or any `WeightSync`) and
-    `stamp`, when set, labels later calls with a version, as a recording
-    gateway does (`dew.interop.harbor.Gateway.stamp`). It runs only once
-    every replica serves the new version: a gateway stamps a call when it
-    arrives, so a stamp ahead of a replica would claim weights the call was
-    not sampled from. A failed push or stamp raises and leaves `version` where
-    it was. Construction stamps the launch `version`, so a gateway left higher
-    by an earlier run cannot mislabel this run's first calls. Every process
-    calls `load`; process 0 stamps.
+    `load(variables, version)` pushes the weights, stamps the version, then
+    updates `version`. `weights` does the push (`SafetensorsReload`, or any
+    `WeightSync`). `stamp`, when set, labels later calls with a version, as
+    a recording gateway does (`dew.interop.harbor.Gateway.stamp`). The stamp
+    runs only after every replica serves the new version, because a gateway
+    stamps a call when it arrives, and a stamp ahead of a replica would claim
+    weights the call was not sampled from. A failed push or stamp raises and
+    leaves `version` unchanged. The constructor stamps the launch `version`,
+    so a gateway left at a higher version by an earlier run cannot mislabel
+    this run's first calls. Every process calls `load`, and process 0
+    stamps.
     """
 
     def __init__(self, weights: WeightSync, *, version: int = 0, stamp: Callable[[int], None] | None = None):
@@ -425,24 +445,29 @@ class _RequestServer:
 
 
 class OpenAIRolloutServer(_RequestServer):
-    """Serve rollouts from a vLLM or SGLang OpenAI-compatible completions endpoint.
+    """Serves rollouts from the OpenAI-compatible completions endpoint of a vLLM or SGLang engine.
 
-    Each submission is one completion request of token ids carrying the
-    `Sampling` policy, a seed, one log-probability per sampled token and the
-    ids themselves; `workers` requests are in flight at once. The engine is
-    `completion.provider`.
+    Each submission is one completion request with token ids as the prompt.
+    It includes the `Sampling` policy and a seed, and asks for one
+    log-probability per sampled token and for the sampled ids themselves.
+    Up to `workers` requests are in flight at once. The engine is
+    `completion.provider`, which must be `vllm` or `sglang`.
 
     The reported log-probabilities are behavior likelihoods only for some
-    policies. vLLM reports raw ones unless started with `--logprobs-mode
-    processed_logprobs` (say so with `processed_logprobs=True`), and returns a
-    filtering policy's kept ids only on its token route (`VLLMGenerateServer`).
-    SGLang's `/v1/completions` reports the temperature-scaled distribution
-    before its filters, so it takes any temperature but no filter, and
-    `SGLANG_RETURN_ORIGINAL_LOGPROB` must stay unset. SGLang honors a seed only
-    under `--enable-deterministic-inference`.
+    policies. vLLM reports raw ones unless started with
+    `--logprobs-mode processed_logprobs`; pass `processed_logprobs=True`
+    when it is. vLLM returns a filtering policy's kept ids only on its token
+    route, so use `VLLMGenerateServer` for a filtering policy. SGLang's
+    `/v1/completions` reports the temperature-scaled distribution before its
+    filters, so with SGLang any temperature works but no filter does, and
+    `SGLANG_RETURN_ORIGINAL_LOGPROB` must stay unset. The constructor raises
+    ValueError for the combinations these rules exclude, and for a
+    temperature of zero. SGLang honors a seed only under
+    `--enable-deterministic-inference`.
 
-    `routing=True` records vLLM's routed experts on every draw for routing
-    replay (`dew.nn.moe.Routes`), under `--enable-return-routed-experts`.
+    With `routing=True`, every draw records vLLM's routed experts for
+    routing replay (`dew.nn.moe.Routes`); the engine must run with
+    `--enable-return-routed-experts`.
     """
 
     def __init__(self, completion: OpenAICompletion, sampling: Sampling, weights: WeightSync, *,
@@ -506,18 +531,26 @@ class OpenAIRolloutServer(_RequestServer):
 
 
 class VLLMGenerateServer(_RequestServer):
-    """Serve rollouts from vLLM's token route, `POST /inference/v1/generate`.
+    """Serves rollouts from vLLM's token route, `POST /inference/v1/generate`.
 
-    The one vLLM route that returns, beside the sampled ids and their
-    likelihoods, the ids the sampler kept for each of them
-    (`GenerateResponseChoice.sampling_mask`,
-    `entrypoints/scale_out/token_in_token_out` at 1c0eee9), so a top-k or
-    top-p policy trains on its recorded support (`support_log_probs`). The
-    engine runs with `--enable-scale-out` (or `--tokens-only`),
-    `--return-sampling-mask` (Model Runner V2, no speculative decoding),
-    `--logprobs-mode processed_logprobs`, so the reported likelihoods are the
-    filtered ones, and `--enable-return-routed-experts` when `routing`.
-    vLLM builds the mask only under a finite top-k.
+    This is the one vLLM route that returns, beside the sampled ids and
+    their likelihoods, the ids the sampler kept for each of them
+    (`GenerateResponseChoice.sampling_mask`). So a top-k or top-p policy
+    trains on its recorded support (`support_log_probs`). Start the engine
+    with:
+
+    - `--enable-scale-out` (or `--tokens-only`);
+    - `--return-sampling-mask`, which needs Model Runner V2 and no
+      speculative decoding;
+    - `--logprobs-mode processed_logprobs`, so the reported likelihoods are
+      the filtered ones;
+    - `--enable-return-routed-experts` when `routing` is set.
+
+    vLLM builds the mask only under a finite top-k, so a `Sampling` without
+    `top_k` raises ValueError. The route draws under temperature, top-k,
+    top-p and min-p alone, so a `Sampling` that sets a repetition, presence
+    or frequency penalty, `no_repeat_ngram_size`, `min_new_tokens`,
+    `typical_p` or `stop` raises ValueError too.
     """
 
     def __init__(self, base_url: str, sampling: Sampling, weights: WeightSync, *, version: int = 0,
@@ -546,6 +579,7 @@ class VLLMGenerateServer(_RequestServer):
         (choice,) = response.json()["choices"]
         tokens = tuple(choice["token_ids"])
         probabilities = tuple(float(entry["logprob"]) for entry in choice["logprobs"]["content"])
+        # vLLM defines sampling_mask in entrypoints/scale_out/token_in_token_out (at 1c0eee9).
         mask = choice.get("sampling_mask")
         if mask is None:
             raise ValueError("vLLM returned no sampling_mask; start it with --return-sampling-mask")
