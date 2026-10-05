@@ -1,4 +1,4 @@
-"""Masked diffusion language modelling (MDLM, Sahoo et al. 2024).
+"""Masked diffusion language modelling (MDLM, by Sahoo and coauthors, 2024).
 
 A row of token ids is corrupted by masking each position with the process's
 probability at a drawn time. The model, a `CausalTransformer` with
