@@ -103,7 +103,7 @@ class RolloutServer(Protocol):
 
     `submit` returns a future without waiting for generation. `load`
     replaces the served weights and sets `version`, and draws submitted
-    after it carry that version.
+    after it report that version.
     """
 
     @property
@@ -448,7 +448,7 @@ class OpenAIRolloutServer(_RequestServer):
     """Serves rollouts from the OpenAI-compatible completions endpoint of a vLLM or SGLang engine.
 
     Each submission is one completion request with token ids as the prompt.
-    It carries the `Sampling` policy and a seed, and asks for one
+    It includes the `Sampling` policy and a seed, and asks for one
     log-probability per sampled token and for the sampled ids themselves.
     Up to `workers` requests are in flight at once. The engine is
     `completion.provider`, which must be `vllm` or `sglang`.

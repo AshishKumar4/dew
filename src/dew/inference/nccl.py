@@ -203,7 +203,7 @@ class NCCLPush:
         Groups are aborted rather than destroyed, because NCCL's destroy
         finalizes the group, which waits on the engine's side, and an engine
         keeps its side open until it exits. A failed push also calls `close`,
-        because a group whose broadcast or replica failed cannot carry the
+        because a group whose broadcast or replica failed cannot deliver the
         next version.
         """
         if self._library is not None:

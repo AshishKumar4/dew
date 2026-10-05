@@ -229,7 +229,7 @@ class T5Text(_TextTower):
     The tower is the one vendored in `dew.nn.text_encoders`. It is the text
     half of an SD3.5/Flux-class run, whose MMDiT conditions on T5-XXL's last
     hidden states. Prompts are padded to `max_length` (256 by default), which
-    the run's record carries. `encode` returns the tower's last hidden state
+    the run's record stores. `encode` returns the tower's last hidden state
     and the attention mask as a `TextContext`.
     """
 

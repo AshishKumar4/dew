@@ -16,7 +16,7 @@ imports the episode types from `dew.objectives.rl`, so you import it as
 `dew.rl.sandbox`; this package does not re-export it.
 
 `advantage` and `surrogate` port Apache-2.0 code from Tunix and verl and
-carry their notice. The rest of Dew is MIT.
+include their notice. The rest of Dew is MIT.
 """
 
 from .advantage import gae, group_advantage, masked_mean, masked_whiten, rloo_advantage
