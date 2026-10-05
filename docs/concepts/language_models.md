@@ -137,7 +137,7 @@ The binary files use the smallest unsigned dtype that holds the vocabulary. Two 
 
 ## LMObjective
 
-`LMObjective(model, seq_len, **options)` reads `batch["text"]` of shape `[B, seq_len + 1]`. Every auxiliary term is off until its argument is set.
+`LMObjective(model, seq_len, **options)` reads `batch["text"]` of shape `[B, seq_len + 1]`. `model` may be a loaded decoder bundle in place of the model (see [Pretrained checkpoints](#pretrained-checkpoints)). Every auxiliary term is off until its argument is set.
 
 | Argument | Default | Meaning |
 |---|---|---|
@@ -146,7 +146,7 @@ The binary files use the smallest unsigned dtype that holds the vocabulary. Two 
 | `head_chunks` | `4` | Vocabulary slices the tiled head scores in. `1` is the full pass. |
 | `head_tile` | `None` | Backward tile of the head, or `'whole'` / `'tiled'`. `None` keeps the whole logits where they fit. |
 | `samples` | `None` | `Samples` configuration for generated previews at evaluation. |
-| `pretrained` | `None` | A variables mapping to start from instead of a fresh init. |
+| `variables` | `None` | The tree to start from instead of a fresh init, whole or split by `freeze` or an adapter. A split tree stays split, so its `params` train and its `frozen` part does not change. |
 | `loss_role` | `None` | Count only targets whose `text_roles` entry equals this `Role` (SFT). |
 | `balance_rate` | `None` | Aux-loss-free routing-bias update rate for mixture layers. |
 | `aux_loss_alpha`, `seq_aux` | `None`, `True` | DeepSeek V2 expert balance loss and its per-sequence form. |
@@ -154,7 +154,6 @@ The binary files use the smallest unsigned dtype that holds the vocabulary. Two 
 | `mtp_weight` | `None` | Weight of DeepSeek V3's multi-token prediction loss. |
 | `z_loss` | `0.0` | PaLM's squared log-partition auxiliary. |
 | `qk_stats` | `False` | Report per-head attention logit maxima, the key-head count and the head width for `muonclip`, which clips per query group as Megatron Core does and leaves an output gate's weights alone. |
-| `trainable` | `None` | `PathFilter` selecting the leaves the optimizer moves; the rest go under `frozen`. |
 | `token_accuracy` | `True` | Report argmax accuracy. |
 
 The step reports `ce`, `perplexity` and `token_accuracy`. `LMObjective` refuses a model built with `causal=False`.
@@ -193,34 +192,37 @@ With gradient accumulation, the cross-entropy and multi-token-prediction (MTP) l
 
 ## Pretrained checkpoints
 
-`Pretrained.load(name_or_dir)` reads a local Hugging Face directory or a Hub identifier into a `Pretrained` bundle: the native Flax model, its variables, the checkpoint's processor or tokenizer, the source config and the generation defaults. The bundle is the kind of source it read, each with the methods that work for it: `PretrainedDecoder` (text generation, `lm_objective`, `lora`), `PretrainedMaskedDecoder` (LLaDA, Dream), `PretrainedBlockDecoder` (DiffusionGemma), `PretrainedPipeline` (latent diffusion, `text_to_image`, `diffusion_objective`, `lora`) and `PretrainedFallback` (`fallback="torchax"`, `lm_objective`). Calling `load` on a kind, as `PretrainedDecoder.load(...)`, refuses a source of another kind by name. `dew.pipeline(source)` wraps the same loader and returns a `TextGeneration` (a `BlockGeneration` for DiffusionGemma, a `MaskedGeneration` for LLaDA and Dream) with the weights placed on the current devices and the sampling policy and budget taken from the checkpoint.
+`Pretrained.load(name_or_dir)` reads a local Hugging Face directory or a Hub identifier into a `Pretrained` bundle that holds the native Flax model, its variables, the checkpoint's processor or tokenizer, the source config and the generation defaults. The bundle's class depends on the kind of source it read, and each class has the methods that work for that kind: `PretrainedDecoder` (text generation), `PretrainedMaskedDecoder` (LLaDA, Dream), `PretrainedBlockDecoder` (DiffusionGemma), `PretrainedPipeline` (latent diffusion, `text_to_image`) and `PretrainedFallback` (`fallback="torchax"`, training only). Every kind can take an adapter (`adapt`), and you can pass any of them in place of the model to the objective that trains it. Calling `load` on a specific kind, as in `PretrainedDecoder.load(...)`, refuses a source of another kind and names it. `dew.pipeline(source)` wraps the same loader and returns a `TextGeneration` (a `BlockGeneration` for DiffusionGemma, a `MaskedGeneration` for LLaDA and Dream) with the weights placed on the current devices and the sampling policy and budget taken from the checkpoint.
 
-A decoder's `bundle.lm_objective(seq_len, **options)` builds an `LMObjective` starting from its loaded weights. With token files prepared using the checkpoint's tokenizer (`dew tokenize --tokenizer Qwen/Qwen3-0.6B`), fine-tuning uses the same trainer as training from scratch:
+`LMObjective(bundle, seq_len, **options)` trains a decoder bundle from its loaded weights. With token files prepared using the checkpoint's tokenizer (`dew tokenize --tokenizer Qwen/Qwen3-0.6B`), fine-tuning uses the same trainer as training from scratch:
 
 ```python
 from dew.interop import PretrainedDecoder
 
 data = TokenWindows(path="data/qwen3-tokens", seq_len=512).load(batch=4)
 bundle = PretrainedDecoder.load("Qwen/Qwen3-0.6B", max_seq_len=512)
-objective = bundle.lm_objective(seq_len=512)
+objective = LMObjective(bundle, seq_len=512)
 state = Trainer(objective, optax.adamw(1e-5), key=jax.random.key(0)).fit(data, steps=100)
 ```
 
-This downloads the Hub weights and needs memory for the model, gradients and optimizer. A bundle already supplies the initial variables, so passing `pretrained=` as well is refused. It also hands the objective its processor, so `objective.pipeline(state)` takes text prompts; `processor=` overrides it.
+This downloads the Hub weights and needs memory for the model, gradients and optimizer. The bundle supplies the model, the initial variables and its processor, so `objective.pipeline(state)` takes text prompts. Passing `variables=` or `processor=` as well overrides that part of the bundle.
 
-`bundle.lora(rank=, modules=, key=)` returns the same kind of bundle with a fresh low-rank adapter (LoRA) on the projections `modules` names, PEFT's `target_modules`. Its `lm_objective` trains the adapter's factors and leaves every other weight frozen. `tuned.adapter.save` writes PEFT's adapter directory, and `tuned.save` writes the source's layout with the factors merged into the kernels. Both read the trainer's `state.variables` as it comes back:
+`dew.lora.LoRA` describes a low-rank adapter with PEFT's own fields (`rank`, `modules` as PEFT's `target_modules`, `alpha`, `rslora`, `dropout`). `bundle.adapt(lora, key=)` returns the same kind of bundle with the adapter attached: the adapted model, the variables with the factors under `params` and every base weight under `frozen`, and the bound `adapter`. Any objective over that bundle trains the factors and leaves every other weight as loaded. `tuned.adapter.save` writes PEFT's adapter directory, and `tuned.save` writes the source's layout with the factors merged into the kernels. Both take the trainer's `state.variables` as they come back from `fit`:
 
 ```python
-key = jax.random.key(0)
-tuned = bundle.lora(rank=8, modules=("q_proj", "v_proj"), key=key)
-objective = tuned.lm_objective(seq_len=512)
-state = Trainer(objective, optax.adamw(1e-4), key=key).fit(data, steps=100)
+from dew.lora import LoRA
+
+tuned = bundle.adapt(LoRA(rank=8, modules=("q_proj", "v_proj")), key=0)
+objective = LMObjective(tuned, seq_len=512)
+state = Trainer(objective, optax.adamw(1e-4), key=0).fit(data, steps=100)
 tuned.adapter.save(state.variables, "qwen3-adapter")
 tuned.save("qwen3-merged", variables=state.variables)
-print(objective.pipeline(state)("The capital of France is", 8, key=key).text[0])
+print(objective.pipeline(state)("The capital of France is", 8, key=0).text[0])
 ```
 
-`bundle` itself is unchanged; `lora` returns a new value. Calling `lora` on an adapted bundle is refused, as is `trainable=` beside an adapter. `dew.lora.LoRA.fresh` and `LoRA.load` build the same adapter over any model and variables, for a model built from the registry or a pipeline component.
+`adapt` leaves `bundle` itself unchanged and returns a new value; adapting an already adapted bundle is refused. `LoRA(...).apply(model, variables, key=)` attaches the same adapter to any model and variables, including a model built from its class, and `LoRA.load(model, variables, path, layouts=)` reads an adapter that PEFT or Diffusers wrote. Both return the bound `Adapter`, whose `model` and `variables` you pass to an objective.
+
+On the command line, a run takes the same spec as `lora:lora --lora.rank 8 --lora.modules q_proj v_proj`. With `--pretrained`, the adapter goes on the loaded weights; without it, on a fresh draw of the model from the run's key. `Pretrained.from_run(run).adapter.save(...)` writes the run's factors under the source's names from the run alone. To train part of a model without an adapter, split its starting variables with `dew.objectives.base.freeze(variables, filter)`. The leaves the filter keeps are trained and the rest stay frozen.
 
 `PretrainedDecoder.from_model` wraps a trained `CausalTransformer` as a source bundle so you can export it, and the bundle's `save` writes the Hugging Face layout. This exports the decoder from the example and loads it back:
 
@@ -328,7 +330,7 @@ import optax
 from dew.data.dataset import Dataset
 from dew.training import Layout, MeshSpec
 
-mm_objective = bundle.lm_objective(inputs.tokens.shape[1] - 1, pad_id=0)
+mm_objective = LMObjective(bundle, inputs.tokens.shape[1] - 1, pad_id=0)
 rows = 2 * jax.device_count()
 batch = inputs.take_rows(jax.numpy.arange(rows) % 2)
 mm_data = Dataset(train=lambda partition: iter([{"text": batch}]), val=None,
@@ -469,7 +471,7 @@ with np.load(sft_source / "reference.npz") as reference:
 block_data = Dataset(train=lambda partition: iter([{"text": train_tokens}]), val=None,
                      records=len(train_tokens), batch=len(train_tokens))
 block_objective = BlockDiffusionObjective(sft_bundle.model, prompt_length=4,
-                                          num_canvases=2, pretrained=sft_bundle.variables)
+                                          num_canvases=2, variables=sft_bundle.variables)
 block_state = Trainer(block_objective, optax.sgd(0.001), key=jax.random.key(2)).fit(
     block_data, steps=1, log_every=1)
 print("Optimizer updates:", int(block_state.updates))

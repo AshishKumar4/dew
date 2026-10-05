@@ -16,7 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import distance
+from reference_error import assert_as_exact_as_the_reference, assert_fp32_reduction_bound, distance
 
 from dew.nn import kernels
 from dew.nn.attention import (
@@ -25,6 +25,8 @@ from dew.nn.attention import (
     VALUE_BLOCK,
     attention_kernel,
     cudnn_runs,
+    folded_attention,
+    folds,
     resolve_implementation,
     scaled_dot_product_attention,
     tpu_runs,
@@ -559,4 +561,58 @@ def test_cpu_fp32_attention_rounds_closer_to_float64_in_blocks():
             jnp.einsum('...hqk,...qhd->...khd', weights, cotangent))
     for got, expected in zip(blocked(weights, value), want, strict=True):
         np.testing.assert_array_equal(got, expected)
+
+
+@pytest.mark.parametrize("call, taken", [
+    ({}, True), ({"positions": 8, "heads": 2}, True), ({"positions": 9, "heads": 2}, False),
+    ({"kv_heads": 1}, False), ({"causal": True}, False), ({"mask": True}, False),
+    ({"backend": "cpu"}, False)])
+def test_a_decode_shaped_xla_call_on_a_gpu_folds_its_heads(monkeypatch, call, taken):
+    """An xla call of at most FOLDED_PAIRS query positions times heads, over
+    keys of its own heads and masked by key lengths at most, reads the cache
+    in its layout on a GPU (`folded_attention`); anything else is jax.nn's."""
+    monkeypatch.setattr(jax, 'default_backend', lambda: call.get("backend", "gpu"))
+    heads = call.get("heads", 2)
+    query = jnp.zeros((3, call.get("positions", 4), heads, 256), jnp.bfloat16)
+    key = jnp.zeros((3, 40, call.get("kv_heads", heads), 256), jnp.bfloat16)
+    mask = jnp.ones((3, 1, query.shape[1], 40), bool) if call.get("mask") else None
+    assert folds(query, key, None, mask, call.get("causal", False), None) == taken
+
+
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize("heads", [1, 2])
+def test_folded_attention_is_jax_nn_attention(dtype, heads):
+    """Every query head against every (key, head) pair, the other heads'
+    products thrown away, computes jax.nn's xla attention. In fp32 it only
+    reorders three sums, the logits' over the width, the softmax's over the
+    keys and the value product's over keys times heads (exact zeros between),
+    so it sits within their summed chains of jax.nn's
+    (`assert_fp32_reduction_bound`), the logits' rounding carried through the
+    softmax at twice the largest logit magnitude. In bf16 it is within
+    tests/reference_error.py's rule of jax.nn against float64. Rows read 1,
+    17 and all 40 keys."""
+    rng = np.random.default_rng(0)
+    query = rng.normal(size=(3, 4, heads, 256))
+    key, value = rng.normal(size=(2, 3, 40, heads, 256)) * np.array([0.3, 1.0])[:, None, None, None, None]
+    lengths = jnp.asarray([1, 17, 40], jnp.int32)
+    q, k, v = (jnp.asarray(x, dtype) for x in (query, key, value))
+    folded = folded_attention(q, k, v, lengths)
+    plain = jax.nn.dot_product_attention(q, k, v, key_value_seq_lengths=lengths,
+                                         implementation='xla')
+    assert folded.shape == plain.shape and folded.dtype == plain.dtype
+
+    q, k, v = (np.asarray(x, np.float64) for x in (q, k, v))
+    read = np.arange(40)[None, None, None, :] < np.asarray(lengths)[:, None, None, None]
+    logits = np.where(read, np.einsum('btnd,bsnd->bnts', q, k) / 16.0, -np.inf)
+    probs = np.exp(logits - logits.max(-1, keepdims=True))
+    probs /= probs.sum(-1, keepdims=True)
+    truth = np.einsum('bnts,bsnd->btnd', probs, v)
+    if dtype == jnp.float32:
+        spread = np.where(read, np.einsum('btnd,bsnd->bnts', np.abs(q), np.abs(k)) / 16.0, 0).max(-1)
+        carried = 1 + 2 * spread.transpose(0, 2, 1)[..., None]
+        magnitudes = np.einsum('bnts,bsnd->btnd', probs, np.abs(v)) * carried
+        assert_fp32_reduction_bound(folded, plain, magnitudes, terms=256 + 40 + 40 * heads)
+        return
+    assert_as_exact_as_the_reference(np.asarray(folded, np.float32), np.asarray(plain, np.float32), truth,
+                                     "folded")
 

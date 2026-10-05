@@ -35,18 +35,20 @@ from dew import Objective
 
 
 class Continued(Objective):
-    def __init__(self, model, pretrained=None):
-        self.model, self.pretrained = model, pretrained
+    def __init__(self, model, variables=None):
+        self.model, self.variables = model, variables
 
     def held_variables(self):
-        return self.pretrained
+        return self.variables
 
     def init(self, key, variables=None):
-        pretrained = self.pretrained if variables is None else variables
-        if pretrained is not None:
-            return pretrained
+        start = self.variables if variables is None else variables
+        if start is not None:
+            return start
         return self.model.init(key, jnp.zeros((1, 4), jnp.float32))
 ```
+
+The same objective trains a low-rank adapter without any change. Given `adapter.model` and `adapter.variables` from `dew.lora.LoRA(...).apply(model, variables, key=)`, it starts from the factors under `params` and the base weights under `frozen`. The adapted model adds the base back in itself, so the optimizer updates only the factors.
 
 `variables=None` means the objective's own configured input, which is what a plain `init(key)` uses. The trainer always passes the tree through the initializer, so nothing is read off the objective inside the trace. Because the tree is an argument, it stays an argument however deeply `init` nests its own `jax.jit`. An objective that wraps another passes the held tree on to that objective's `init`. A subclass of an objective that holds weights must accept the `variables` parameter; if it does not, the call raises.
 

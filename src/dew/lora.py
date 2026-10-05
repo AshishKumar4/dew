@@ -1,32 +1,35 @@
-"""Adapt a variables tree with low-rank deltas (LoRA, arXiv 2106.09685).
+"""Low-rank adapters (LoRA) for Dew models.
 
-Beside a target kernel `W`, `[in..., out...]`, the tree holds `lora_A`,
-`[in..., r]`, and `lora_B`, `[r, out...]`, and the module computes
-`x W + scale * (x A) B` with `scale = alpha / r` (`alpha / sqrt(r)` for
-rsLoRA, arXiv 2312.03732). Merged, `scale * A B` is added into the kernel and
-the factors are gone. A target is its module's path in the tree,
-`("params", "layers_0", "self_attn", "q_proj")`, so one description serves
-every model and every collection.
+LoRA is from arXiv 2106.09685. Next to a target kernel `W` of shape
+`[in..., out...]`, the tree holds `lora_A` of shape `[in..., r]` and `lora_B` of
+shape `[r, out...]`, and the module computes `x W + scale * (x A) B` with
+`scale = alpha / r` (`alpha / sqrt(r)` for rsLoRA, arXiv 2312.03732). Merging
+adds `scale * A B` into the kernel and removes the factors. A target is its
+module's path in the tree, such as `("params", "layers_0", "self_attn", "q_proj")`,
+so one description works for every model.
 
-`LoRA.fresh` draws an adapter on the projections a model binds and `LoRA.load`
-reads one off disk; the adapter adapts the model (`adapt`), names what trains
-(`trainable`), folds itself in (`merge`) and writes itself out (`save`).
-`adapt` wraps `apply` and `init` in a Flax method interceptor rather than
-swapping modules, and owns what PEFT's wrapper layers do: the factor shapes
-of a `DenseGeneral` with several contracted axes, the kernel path's compute
-dtype, dropout on the branch input, and the parameter names the merge, the
-export and the trainable filter agree on.
+`LoRA` is the adapter spec a user writes and a run records, with PEFT's own
+fields. `LoRA.apply` attaches it to a model and its variables, and `LoRA.load`
+reads one from disk. Both return an `Adapter`, which holds the adapted model;
+the variables, with the factors under `params` and every base weight under
+`FROZEN`, so any objective trains only the factors; and the bindings that
+`merge` and `save` use. The adapted model wraps `apply` and `init` in a Flax
+method interceptor instead of swapping modules, and adds `FROZEN` back into
+`params` itself. It also handles what PEFT's wrapper layers do: the factor
+shapes of a `DenseGeneral` with several contracted axes, the kernel path's
+compute dtype, dropout on the branch input, and the parameter names that the
+merge and the export agree on.
 
-The files are the references' own: PEFT's directory (`adapter_config.json`,
-`adapter_model.safetensors`, keys `base_model.model.<module>.lora_A.weight`),
-which Transformers loads, and the Diffusers file
-(`pytorch_lora_weights.safetensors`, keys `<component>.<module>.lora_A.weight`,
-each component's PEFT config in the header's `lora_adapter_metadata`), which a
-pipeline's `load_lora_weights` reads. Kohya/sgm keys are not accepted. Names
-resolve to tree paths through a loaded source's `Pretrained.layouts`; a model
-built from the registry passes none, and `bound_layouts` reads the names and
-shapes off its own kernels. `RunConfig.lora` adapts the module a run's
-objective trains and freezes everything but the factors.
+The file formats are the references' own. PEFT's directory
+(`adapter_config.json`, `adapter_model.safetensors`, keys
+`base_model.model.<module>.lora_A.weight`) is what Transformers loads. The
+Diffusers file (`pytorch_lora_weights.safetensors`, keys
+`<component>.<module>.lora_A.weight`, with each component's PEFT config in the
+header's `lora_adapter_metadata`) is what a pipeline's `load_lora_weights`
+reads. Kohya/sgm keys are not accepted. Module names resolve to tree paths
+through a loaded source's `Pretrained.layouts`; a model built from the registry
+passes none, and `bound_layouts` reads the names and shapes from its own
+kernels.
 """
 from __future__ import annotations
 
@@ -49,7 +52,7 @@ from flax.linen.module import Interceptor
 from dew.interop.safetensors_io import read_file, write_file
 from dew.interop.streaming import WeightLayout
 from dew.nn.backbones.layer_plan import group_layers
-from dew.objectives.base import Path, PathFilter, Variables, merge as overlay, select, thaw
+from dew.objectives.base import Path, Variables, freeze, merge as overlay, select, thaw
 
 PEFT_CONFIG = "adapter_config.json"
 PEFT_WEIGHTS = "adapter_model.safetensors"
@@ -67,7 +70,7 @@ INIT_B = nn.initializers.zeros
 
 @dataclass(frozen=True)
 class Target:
-    """Holds one adapted kernel's rank and alpha."""
+    """One adapted kernel's rank and alpha."""
 
     rank: int
     alpha: float
@@ -75,174 +78,191 @@ class Target:
 
 @dataclass(frozen=True)
 class LoRA:
-    """Says which kernels carry a low-rank delta, and how the delta scales."""
+    """A low-rank adapter spec with PEFT's own fields.
 
+    This is what a user writes and a run records (`RunConfig.lora`,
+    `lora:lora --lora.rank 16 --lora.modules q_proj v_proj`).
+
+    `modules` are PEFT's `target_modules`: a projection matches when its name
+    relative to the model (`model.layers.0.self_attn.q_proj`, or `to_q` under a
+    pipeline component) equals an entry or ends in `.` followed by the entry.
+    `alpha` None uses PEFT's own default, twice the rank. `rslora` scales by
+    `alpha / sqrt(rank)`, and `dropout` drops the branch's input in a training
+    forward pass.
+    """
+
+    rank: int
+    modules: tuple[str, ...]
+    alpha: float | None = None
+    rslora: bool = False
+    dropout: float = 0.0
+
+    def __post_init__(self) -> None:
+        if isinstance(self.modules, str):
+            raise ValueError("modules is a sequence of module names, not one string")
+        object.__setattr__(self, "modules", tuple(self.modules))
+        if type(self.rank) is not int or self.rank < 1:
+            raise ValueError(f"rank must be a positive integer, not {self.rank!r}")
+        if not self.modules or any(not isinstance(module, str) or not module for module in self.modules):
+            raise ValueError("modules names at least one projection")
+        if self.alpha is not None and (isinstance(self.alpha, bool) or not math.isfinite(self.alpha)):
+            raise ValueError(f"alpha must be a finite number, not {self.alpha!r}")
+        if not 0 <= self.dropout < 1:
+            raise ValueError(f"dropout must be in [0, 1), not {self.dropout!r}")
+
+    def apply(self, model: nn.Module, variables: Variables, *, key: int | jax.Array,
+              layouts: Mapping[str, WeightLayout] | None = None) -> Adapter:
+        """Attach this adapter to `model` over `variables` and draw its factors.
+
+        `layouts` maps module names to tree paths: `Pretrained.layouts` for a loaded
+        source, or None for a model built from its class, whose own module paths are
+        its names. An entry of `modules` that matches no projection is refused. A is
+        drawn per module from `key` in sorted name order, the way PEFT draws it, and B
+        is zero, so the adapted model computes exactly what the source does.
+        """
+        from dew.nn.inputs import request_key
+
+        if isinstance(type(model), _Adapted):
+            raise ValueError("The model is already adapted")
+        variables = thaw(variables)
+        bound = _named(bound_layouts(model, variables, layouts or {}), self.modules)
+        scaling = 2.0 * self.rank if self.alpha is None else float(self.alpha)
+        targets: dict[Path, Target] = {}
+        leaves: dict = {}
+        keys = jax.random.split(request_key(key), len(bound))
+        for name, factor_key in zip(sorted(bound), keys, strict=True):
+            factors = _factors(name, bound[name], variables, self.rank)
+            shape_a, shape_b = factors.shapes(self.rank)
+            targets[factors.module] = Target(self.rank, scaling)
+            _insert_factors(leaves, factors.module, INIT_A(factor_key, shape_a, jnp.float32),
+                            INIT_B(factor_key, shape_b, jnp.float32))
+        return Adapter.bound(model, overlay(variables, leaves), targets, self.rslora, self.dropout, bound)
+
+    @staticmethod
+    def load(model: nn.Module, variables: Variables, path: str | FilePath, *,
+             layouts: Mapping[str, WeightLayout] | None = None) -> Adapter:
+        """Return the adapter a PEFT directory or Diffusers file holds, attached to `model`.
+
+        The adapter goes over `variables` with its factors in place. `path` is a PEFT
+        adapter directory or a Diffusers file (or the directory that holds one), and
+        `layouts` is read as in `apply`. Targets the model does not have, tensors
+        whose shapes do not fit the bound weight, ranks that disagree with the config,
+        and PEFT features this loader does not support are refused by name.
+        """
+        if isinstance(type(model), _Adapted):
+            raise ValueError("The model is already adapted")
+        variables = thaw(variables)
+        bound = bound_layouts(model, variables, layouts or {})
+        path = FilePath(path)
+        if (path / PEFT_WEIGHTS).is_file():
+            where = str(path / PEFT_CONFIG)
+            config = _Config.read(json.loads(FilePath(where).read_text()), where)
+            tensors, _ = read_file(path / PEFT_WEIGHTS)
+            return _place(model, bound, variables, _entries(_components(bound), tensors, {"": config},
+                                                            PEFT_PREFIX))
+        file = path if path.is_file() else path / DIFFUSERS_WEIGHTS
+        if not file.is_file():
+            raise FileNotFoundError(f"{path} holds neither {PEFT_WEIGHTS} nor {DIFFUSERS_WEIGHTS}")
+        tensors, metadata = read_file(file)
+        configs = _diffusers_configs(tensors, metadata.get(DIFFUSERS_METADATA), str(file))
+        return _place(model, bound, variables, _entries(_components(bound), tensors, configs, ""))
+
+
+@dataclass(frozen=True, eq=False)
+class Adapter:
+    """A low-rank adapter bound to one model, as `LoRA.apply` and `LoRA.load` return it.
+
+    Two adapters compare equal only if they are the same object; compare their
+    `targets` and `layouts` to compare what they bind.
+
+    `model` computes the adapter branch in every target module and adds `FROZEN`
+    back into `params` itself, so any objective can apply it to the split tree.
+    `variables` holds the factors under `params` and every base weight under
+    `FROZEN`, so the optimizer updates only the factors. `targets` lists the
+    adapted modules' paths with their rank and alpha. `layouts` holds the
+    bindings, keyed by the name a file stores each module under, that `save`
+    writes the factors back through.
+    """
+
+    model: nn.Module
+    variables: Variables
     targets: Mapping[Path, Target]
     rslora: bool = False
     dropout: float = 0.0
-    layouts: Mapping[str, WeightLayout] = dataclasses.field(
-        default_factory=dict, compare=False, metadata={"record": False})
-    """The bindings the targets were bound over, by the name a file writes
-    them under, which is what `save` writes the factors back through.
-    `fresh` and `load` fill it with the source's own projections; an adapter
-    a run config declares carries its targets alone, so it compares by them
-    and cannot save itself. A run record leaves it out: the source the
-    record names is where the bindings come from."""
-
-    def to_json(self) -> dict:
-        """The bound adapter on native module paths, independent of source tensor names."""
-        ranks = {target.rank for target in self.targets.values()}
-        alphas = {target.alpha for target in self.targets.values()}
-        if len(ranks) != 1 or len(alphas) != 1:
-            raise ValueError("a recorded LoRA requires one rank and alpha across its modules")
-        return {'rank': next(iter(ranks)), 'alpha': next(iter(alphas)),
-                'rslora': self.rslora, 'dropout': self.dropout,
-                'modules': ['/'.join(path) for path in sorted(self.targets)]}
+    layouts: Mapping[str, WeightLayout] = dataclasses.field(default_factory=dict)
 
     @classmethod
-    def from_json(cls, record: Mapping) -> LoRA:
-        """Rebuild the interceptor; the checkpoint, not this record, supplies its factors."""
-        from dew.records import integer, text
-        if set(record) != {'rank', 'alpha', 'rslora', 'dropout', 'modules'}:
-            raise ValueError("a LoRA record needs rank, alpha, rslora, dropout and modules")
-        rank = integer(record['rank'], 'adapter rank')
-        alpha = record['alpha']
-        if alpha is None:
-            alpha = 2 * rank
-        if (rank < 1 or isinstance(alpha, bool) or not isinstance(alpha, (int, float))
-                or not math.isfinite(alpha)):
-            raise ValueError("adapter rank must be positive and alpha must be a finite number")
-        if type(record['rslora']) is not bool:
-            raise ValueError("adapter rslora must be boolean")
-        dropout = record['dropout']
-        if isinstance(dropout, bool) or not isinstance(dropout, (int, float)) or not 0 <= dropout < 1:
-            raise ValueError("adapter dropout must be in [0, 1)")
-        modules = record['modules']
-        if not isinstance(modules, list) or not modules:
-            raise ValueError("adapter modules must be a nonempty list of native module names")
-        targets = {}
-        for module in modules:
-            path = tuple(text(module, 'adapter module').split('/'))
-            if any(not name or name in ('.', '..') for name in path) or path in targets:
-                raise ValueError("adapter modules must be distinct native module names")
-            targets[path] = Target(rank, float(alpha))
-        return cls(targets, record['rslora'], float(dropout))
+    def bound(cls, model: nn.Module, variables: Variables, targets: Mapping[Path, Target], rslora: bool,
+              dropout: float, layouts: Mapping[str, WeightLayout]) -> Adapter:
+        """Adapt `model` to `targets` and split `variables` into factors and frozen weights.
+
+        The factors go under `params` and everything else under `FROZEN`.
+        """
+        adapted = _adapted(model, _Branch(targets, rslora, dropout), layouts)
+        factors = {(*path, factor) for path in targets for factor in FACTORS}
+        return cls(adapted, freeze(thaw(variables), lambda path: path in factors), targets, rslora, dropout,
+                   layouts)
+
+    @classmethod
+    def from_run(cls, directory: str | FilePath, *, step: int | str | None = None,
+                 ema: bool | None = None) -> Adapter:
+        """Return the adapter a run trained, rebuilt from the run's own record and checkpoint.
+
+        It holds the adapted model, the checkpoint's variables and the bindings the
+        run recorded, so `save` writes the factors under the source's names without
+        the source at hand. A recorded binding whose shapes do not fit the restored
+        factors is refused by name.
+        """
+        from dew.checkpoints import Checkpoints
+        from dew.config import ModelConfig
+        from dew.inference.tasks import run_record
+        from dew.records import record, text
+        from dew.registry import objectives
+
+        declaration = run_record(str(directory), step)
+        config = ModelConfig.from_dict(record(declaration['model'], 'model'))
+        if config.adapter is None:
+            raise ValueError(f"{directory} trained no adapter")
+        model = config.build()
+        kind = text(declaration['objective'], 'objective')
+        averaged = False if objectives[kind]._ema_is_reference else ema
+        variables = Checkpoints(str(directory)).variables(step=step, ema=averaged)
+        return cls.recorded(model, variables, config.adapter)
+
+    @classmethod
+    def recorded(cls, model: nn.Module, variables: Variables, adapter: Mapping) -> Adapter:
+        """Return the adapter a model record's `adapter` describes.
+
+        It goes over the adapted `model` and a checkpoint's `variables`.
+        """
+        if not isinstance(type(model), _Adapted):
+            raise ValueError(f"{type(model).__name__} is not adapted, so it carries no adapter")
+        targets, rslora, dropout, layouts = _read_record(adapter)
+        whole = thaw(variables)
+        for name, layout in layouts.items():
+            module = layout.paths[0][:-1]
+            rank = targets[module].rank
+            try:
+                expected = _factors(name, layout, whole, rank).shapes(rank)
+            except (KeyError, ValueError) as error:
+                raise ValueError(f"the recorded binding {name} does not fit the checkpoint: "
+                                 f"{error}") from None
+            node = _node(whole, module)
+            found = tuple(tuple(np.shape(node[factor])) for factor in FACTORS)
+            if found != expected:
+                raise ValueError(f"the recorded binding {name} expects factors {expected}, and the "
+                                 f"checkpoint holds {found}")
+        return cls(model, variables, targets, rslora, dropout, layouts)
 
     def scale(self, target: Target) -> float:
-        return target.alpha / (math.sqrt(target.rank) if self.rslora else target.rank)
-
-    def trainable(self, path: Path) -> bool:
-        """Return the adapter's own leaves: the `PathFilter` a partial run trains."""
-        return path[-1] in FACTORS and path[:-1] in self.targets
-
-    def target_at(self, path: Path) -> Target | None:
-        """Return the target a module path names, seen through the stack that runs
-        it: a scanned run's module `layers_3_7` stands for layers 3 through
-        7, whose targets must agree, since the run's kernels share one
-        stacked factor pair."""
-        if path in self.targets:
-            return self.targets[path]
-        for depth, name in enumerate(path):
-            layers = group_layers(name)
-            if layers is None or len(layers) == 1:
-                continue
-            found = {self.targets.get((*path[:depth], f"layers_{index}", *path[depth + 1:]))
-                     for index in layers}
-            if found == {None}:
-                return None
-            if len(found) != 1:
-                raise ValueError(f"{'/'.join(path)} runs layers whose adapter targets differ: "
-                                 f"a scanned run stacks one factor pair over all of them")
-            return found.pop()
-        return None
-
-    def adapt(self, model: nn.Module, root: Path = ("params",)) -> nn.Module:
-        """Return `model` computing the adapter branch in every target module.
-
-        The result is an instance of a subclass of `model`'s class with the
-        same fields and methods, so it builds, checks and generates as the
-        model does; only `apply` and `init` change, running under the
-        interceptor (Flax's `init` dispatches through `init_with_output`).
-        Adapt the module that is applied: a target inside a submodule is
-        reached through its parent's `apply`. `root` is where the model's
-        own `params` sit in the tree the targets are named in: the whole
-        tree's `params` for a model applied on it, deeper for a tower
-        applied on a subtree.
-        """
-        base = type(model)
-        if isinstance(base, _Adapted):
-            raise ValueError("The model is already adapted")
-        branch = self._branch(root)
-
-        class Adapted(base):
-            _dew_lora_interceptor: ClassVar[Interceptor] = staticmethod(branch)
-            _dew_lora_base: ClassVar[type[nn.Module]] = base
-            _dew_lora_spec: ClassVar[LoRA] = self
-
-            def apply(self, *args, **kwargs):
-                with nn.intercept_methods(self._dew_lora_interceptor):
-                    return super().apply(*args, **kwargs)
-
-            def init_with_output(self, *args, **kwargs):
-                with nn.intercept_methods(self._dew_lora_interceptor):
-                    return super().init_with_output(*args, **kwargs)
-
-        Adapted.__name__ = Adapted.__qualname__ = base.__name__
-        return Adapted(**{field.name: getattr(model, field.name)
-                          for field in dataclasses.fields(model)
-                          if field.init and field.name not in ("parent", "name")})
-
-    def _branch(self, root: Path):
-        def branch(next_fun, args, kwargs, context):
-            module = context.module
-            if context.method_name == "stochastic_input":
-                # A layer asks whether its submodule's input is drawn on this
-                # call (`MultiHeadLatentAttention.stochastic_input`): the
-                # branch's dropout is, on a target under a dropout stream.
-                name = args[0] if args else kwargs["name"]
-                return next_fun(*args, **kwargs) or bool(
-                    self.dropout and module.has_rng("dropout")
-                    and self.target_at(root + module.path + (name,)) is not None)
-            target = self.target_at(root + module.path) if context.method_name == "__call__" else None
-            if target is None:
-                return next_fun(*args, **kwargs)
-            if type(module) not in (nn.Dense, nn.DenseGeneral):
-                raise TypeError(
-                    f"{'/'.join(root + module.path)} is a {type(module).__name__}; an adapter "
-                    "targets nn.Dense and nn.DenseGeneral kernels")
-            x = args[0] if args else kwargs["inputs"]
-            output = next_fun(*args, **kwargs)
-            if isinstance(module, nn.DenseGeneral):
-                if module.batch_dims:
-                    raise TypeError(f"{'/'.join(root + module.path)} contracts with batch dims")
-                axes = (module.axis,) if isinstance(module.axis, int) else tuple(module.axis)
-            else:
-                axes = (-1,)
-            axes = tuple(sorted(axis % x.ndim for axis in axes))
-            kernel = module.get_variable("params", "kernel")
-            a = module.param("lora_A", INIT_A, (*kernel.shape[:len(axes)], target.rank), module.param_dtype)
-            b = module.param("lora_B", INIT_B, (target.rank, *kernel.shape[len(axes):]), module.param_dtype)
-            # The branch drops out its input when the forward carries the
-            # dropout stream, which is how a training forward is marked; an
-            # evaluation forward carries none.
-            if self.dropout and module.has_rng("dropout"):
-                x = nn.Dropout(self.dropout, deterministic=False)(x)
-            x, a, b = promote_dtype(x, a, b, dtype=module.dtype)
-            hidden = jax.lax.dot_general(x, a, ((axes, tuple(range(len(axes)))), ((), ())),
-                                         precision=module.precision)
-            delta = jax.lax.dot_general(hidden, b, (((hidden.ndim - 1,), (0,)), ((), ())),
-                                        precision=module.precision)
-            return output + jnp.asarray(self.scale(target), delta.dtype) * delta
-
-        return branch
+        return _scale(target, self.rslora)
 
     def merge(self, variables: Variables) -> Variables:
         """Return `variables` with every delta added into its kernel and the factors removed.
 
-        `variables` is the adapted tree, or a trainer's split of it, the
-        factors under `params` and the base under `frozen`. The sum runs in
-        at least fp32 at full precision and lands in the kernel's dtype,
-        PEFT's `merge_and_unload`.
+        `variables` is the adapted tree, whole or split as a trainer keeps it. The sum
+        runs in at least fp32 at full precision and is stored in the kernel's dtype,
+        as PEFT's `merge_and_unload` does. The result is one `params` collection.
         """
         variables = thaw(variables)
         merged: dict = {}
@@ -257,76 +277,18 @@ class LoRA:
                 (*path, "kernel"),
                 (kernel.astype(dtype) + self.scale(target) * delta).astype(kernel.dtype),
             )
-        return select(overlay(variables, merged), lambda path: not self.trainable(path))
-
-    @classmethod
-    def fresh(cls, model: nn.Module, variables: Variables, layouts: Mapping[str, WeightLayout], *,
-              rank: int, modules: Sequence[str], key: jax.Array, alpha: float | None = None,
-              rslora: bool = False, dropout: float = 0.0) -> tuple[LoRA, Variables]:
-        """Build a new adapter on the projections `modules` name, and add its factors.
-
-        `modules` are PEFT's `target_modules`: a projection matches when its
-        name relative to the model (`model.layers.0.self_attn.q_proj`, or `to_q`
-        under a pipeline component) is the entry or ends in `.` and the entry.
-        An entry that matches no projection is refused. `alpha` unset is
-        PEFT's own default for a rank, twice it. A is drawn from `key` the
-        way PEFT draws it and B is zero, so the fresh adapter is the identity.
-        """
-        bound = _named(bound_layouts(model, variables, layouts), modules)
-        scaling = 2.0 * rank if alpha is None else alpha
-        targets: dict[Path, Target] = {}
-        leaves: dict = {}
-        for name, factor_key in zip(sorted(bound), jax.random.split(key, len(bound)), strict=True):
-            factors = _factors(name, bound[name], variables, rank)
-            shape_a, shape_b = factors.shapes(rank)
-            targets[factors.module] = Target(rank, scaling)
-            _insert_factors(leaves, factors.module, INIT_A(factor_key, shape_a, jnp.float32),
-                            INIT_B(factor_key, shape_b, jnp.float32))
-        return cls(targets, rslora, dropout, bound), overlay(variables, leaves)
-
-    @classmethod
-    def load(cls, model: nn.Module, variables: Variables, layouts: Mapping[str, WeightLayout],
-             path: str | FilePath) -> tuple[LoRA, Variables]:
-        """Load an adapter for `model` and `variables` with the factors in place.
-
-        `layouts` are the bindings a file's module names resolve through:
-        `Pretrained.layouts` for a loaded source, an empty mapping for a model
-        built from the registry, whose own module paths are its names.
-
-        `path` is a PEFT adapter directory or a Diffusers file (or the directory
-        holding one). Targets the model does not bind, tensors whose shapes do
-        not fit the bound weight, ranks that disagree with the config, and PEFT
-        features this loader does not carry are refused by name.
-        """
-        bound = bound_layouts(model, variables, layouts)
-        path = FilePath(path)
-        if (path / PEFT_WEIGHTS).is_file():
-            where = str(path / PEFT_CONFIG)
-            config = _Config.read(json.loads(FilePath(where).read_text()), where)
-            tensors, _ = read_file(path / PEFT_WEIGHTS)
-            return _place(bound, variables, _entries(_components(bound), tensors, {"": config}, PEFT_PREFIX))
-        file = path if path.is_file() else path / DIFFUSERS_WEIGHTS
-        if not file.is_file():
-            raise FileNotFoundError(f"{path} holds neither {PEFT_WEIGHTS} nor {DIFFUSERS_WEIGHTS}")
-        tensors, metadata = read_file(file)
-        configs = _diffusers_configs(tensors, metadata.get(DIFFUSERS_METADATA), str(file))
-        return _place(bound, variables, _entries(_components(bound), tensors, configs, ""))
+        factors = {(*path, factor) for path in self.targets for factor in FACTORS}
+        return select(overlay(variables, merged), lambda path: path not in factors)
 
     def save(self, variables: Variables, path: str | FilePath) -> None:
         """Write the adapter's factors from `variables` under its own module names.
 
-        The names are the ones this adapter bound at construction, so a run
-        saves what it trained with the tree it trained it in, split or
-        whole (`merge` reads both). One unnamed
-        component writes PEFT's directory, which is a decoder source and a
-        registry-built model; a pipeline source, whose weights are named
-        under several components, writes the Diffusers file with each
-        component's PEFT config in its header.
+        The names are the ones this adapter bound, so a run saves what it trained from
+        the tree it trained, split or whole. With a single unnamed component (a
+        decoder source, or a model built from its class), it writes PEFT's directory.
+        A pipeline source, whose weights are named under several components, gets the
+        Diffusers file with each component's PEFT config in its header.
         """
-        if not self.layouts:
-            raise ValueError(
-                "this adapter binds no source names to write its factors under; "
-                "LoRA.fresh and LoRA.load bind them, a declared target set does not")
         variables = thaw(variables)
         components = _components(self.layouts)
         names = {layout.paths[0][:-1]: name for name, layout in self.layouts.items()
@@ -354,6 +316,198 @@ class LoRA:
                     for field, value in _config(self, targets).items()}
         write_file(tensors, path / DIFFUSERS_WEIGHTS,
                    {"format": "pt", DIFFUSERS_METADATA: json.dumps(metadata, indent=2, sort_keys=True)})
+
+
+def _scale(target: Target, rslora: bool) -> float:
+    return target.alpha / (math.sqrt(target.rank) if rslora else target.rank)
+
+
+def _target_at(targets: Mapping[Path, Target], path: Path) -> Target | None:
+    """Return the target a module path names, seen through the stack that runs
+    it: a scanned run's module `layers_3_7` stands for layers 3 through 7,
+    whose targets must agree, since the run's kernels share one stacked
+    factor pair."""
+    if path in targets:
+        return targets[path]
+    for depth, name in enumerate(path):
+        layers = group_layers(name)
+        if layers is None or len(layers) == 1:
+            continue
+        found = {targets.get((*path[:depth], f"layers_{index}", *path[depth + 1:])) for index in layers}
+        if found == {None}:
+            return None
+        if len(found) != 1:
+            raise ValueError(f"{'/'.join(path)} runs layers whose adapter targets differ: "
+                             f"a scanned run stacks one factor pair over all of them")
+        return found.pop()
+    return None
+
+
+@dataclass(frozen=True)
+class _Branch:
+    """The interceptor an adapted model runs under: the adapter branch on
+    every target module's `__call__`."""
+
+    targets: Mapping[Path, Target]
+    rslora: bool
+    dropout: float
+    root: Path = ("params",)
+
+    def __call__(self, next_fun, args, kwargs, context):
+        module = context.module
+        root = self.root
+        if context.method_name == "stochastic_input":
+            # A layer asks whether its submodule's input is drawn on this
+            # call (`MultiHeadLatentAttention.stochastic_input`): the
+            # branch's dropout is, on a target under a dropout stream.
+            name = args[0] if args else kwargs["name"]
+            return next_fun(*args, **kwargs) or bool(
+                self.dropout and module.has_rng("dropout")
+                and _target_at(self.targets, root + module.path + (name,)) is not None)
+        target = _target_at(self.targets, root + module.path) if context.method_name == "__call__" else None
+        if target is None:
+            return next_fun(*args, **kwargs)
+        if type(module) not in (nn.Dense, nn.DenseGeneral):
+            raise TypeError(
+                f"{'/'.join(root + module.path)} is a {type(module).__name__}; an adapter "
+                "targets nn.Dense and nn.DenseGeneral kernels")
+        x = args[0] if args else kwargs["inputs"]
+        output = next_fun(*args, **kwargs)
+        if isinstance(module, nn.DenseGeneral):
+            if module.batch_dims:
+                raise TypeError(f"{'/'.join(root + module.path)} contracts with batch dims")
+            axes = (module.axis,) if isinstance(module.axis, int) else tuple(module.axis)
+        else:
+            axes = (-1,)
+        axes = tuple(sorted(axis % x.ndim for axis in axes))
+        kernel = module.get_variable("params", "kernel")
+        a = module.param("lora_A", INIT_A, (*kernel.shape[:len(axes)], target.rank), module.param_dtype)
+        b = module.param("lora_B", INIT_B, (target.rank, *kernel.shape[len(axes):]), module.param_dtype)
+        # The branch drops out its input when the forward carries the
+        # dropout stream, which is how a training forward is marked; an
+        # evaluation forward carries none.
+        if self.dropout and module.has_rng("dropout"):
+            x = nn.Dropout(self.dropout, deterministic=False)(x)
+        x, a, b = promote_dtype(x, a, b, dtype=module.dtype)
+        hidden = jax.lax.dot_general(x, a, ((axes, tuple(range(len(axes)))), ((), ())),
+                                     precision=module.precision)
+        delta = jax.lax.dot_general(hidden, b, (((hidden.ndim - 1,), (0,)), ((), ())),
+                                    precision=module.precision)
+        return output + jnp.asarray(_scale(target, self.rslora), delta.dtype) * delta
+
+
+def _adapted(model: nn.Module, branch: _Branch, layouts: Mapping[str, WeightLayout]) -> nn.Module:
+    """Return `model` computing `branch` in every target module.
+
+    The result is an instance of a subclass of `model`'s class with the
+    same fields and methods, so it builds, checks and generates as the model
+    does; only `apply` and `init` change. `apply` folds `FROZEN` back into
+    `params` and runs under the interceptor; `init` (Flax's dispatches
+    through `init_with_output`) runs under it and splits what it draws, the
+    factors under `params` and the rest under `FROZEN`. `layouts` are the
+    bindings the class's record (`ModelConfig.adapter`) writes beside the
+    targets; the record is written when a run asks for it, so an adapter a
+    run cannot record (a file's mixed ranks) still loads and computes.
+    """
+    base = type(model)
+    if isinstance(base, _Adapted):
+        raise ValueError("The model is already adapted")
+    factors = {(*path, factor) for path in branch.targets for factor in FACTORS}
+
+    class Adapted(base):
+        # A staticmethod, or Flax would wrap the callable as a module method.
+        _dew_lora_interceptor: ClassVar[Interceptor] = staticmethod(branch)
+        _dew_lora_base: ClassVar[type[nn.Module]] = base
+
+        @classmethod
+        def _dew_lora_record(cls) -> dict:
+            return _record(branch.targets, branch.rslora, branch.dropout, layouts)
+
+        def apply(self, variables, *args, **kwargs):
+            with nn.intercept_methods(self._dew_lora_interceptor):
+                return super().apply(thaw(variables), *args, **kwargs)
+
+        def init_with_output(self, *args, **kwargs):
+            with nn.intercept_methods(self._dew_lora_interceptor):
+                output, variables = super().init_with_output(*args, **kwargs)
+            return output, dict(freeze(variables, lambda path: path in factors))
+
+    Adapted.__name__ = Adapted.__qualname__ = base.__name__
+    return Adapted(**{field.name: getattr(model, field.name)
+                      for field in dataclasses.fields(model)
+                      if field.init and field.name not in ("parent", "name")})
+
+
+def _record(targets: Mapping[Path, Target], rslora: bool, dropout: float,
+            layouts: Mapping[str, WeightLayout]) -> dict:
+    """The bound adapter as a model record writes it: one rank and alpha, the
+    targets' module paths, and each target's binding (the name a file writes
+    it under, the weight's stored shape and transpose), so the run's adapter
+    saves with no source at hand. A mixed-rank adapter is refused."""
+    ranks = {target.rank for target in targets.values()}
+    alphas = {target.alpha for target in targets.values()}
+    if len(ranks) != 1 or len(alphas) != 1:
+        raise ValueError("a recorded LoRA requires one rank and alpha across its modules")
+    bindings = {layout.paths[0][:-1]: layout for layout in layouts.values()}
+
+    def binding(layout: WeightLayout) -> dict:
+        transpose = layout.transpose
+        return {'name': layout.name, 'shape': list(layout.shape),
+                'transpose': None if transpose is None else list(transpose)}
+
+    return {'rank': next(iter(ranks)), 'alpha': next(iter(alphas)), 'rslora': rslora, 'dropout': dropout,
+            'modules': ['/'.join(path) for path in sorted(targets)],
+            'layouts': {'/'.join(path): binding(bindings[path])
+                        for path in sorted(targets) if path in bindings}}
+
+
+def _read_record(record: Mapping) -> tuple[dict[Path, Target], bool, float, dict[str, WeightLayout]]:
+    """Read back what `_record` wrote."""
+    from dew.records import integer, text
+
+    if set(record) != {'rank', 'alpha', 'rslora', 'dropout', 'modules', 'layouts'}:
+        raise ValueError("a LoRA record needs rank, alpha, rslora, dropout, modules and layouts")
+    rank = integer(record['rank'], 'adapter rank')
+    alpha = record['alpha']
+    if rank < 1 or isinstance(alpha, bool) or not isinstance(alpha, (int, float)) or not math.isfinite(alpha):
+        raise ValueError("adapter rank must be positive and alpha must be a finite number")
+    if type(record['rslora']) is not bool:
+        raise ValueError("adapter rslora must be boolean")
+    dropout = record['dropout']
+    if isinstance(dropout, bool) or not isinstance(dropout, (int, float)) or not 0 <= dropout < 1:
+        raise ValueError("adapter dropout must be in [0, 1)")
+    modules = record['modules']
+    if not isinstance(modules, list) or not modules:
+        raise ValueError("adapter modules must be a nonempty list of native module names")
+    targets: dict[Path, Target] = {}
+    for module in modules:
+        path = tuple(text(module, 'adapter module').split('/'))
+        if any(not name or name in ('.', '..') for name in path) or path in targets:
+            raise ValueError("adapter modules must be distinct native module names")
+        targets[path] = Target(rank, float(alpha))
+    bindings = record['layouts']
+    if not isinstance(bindings, dict) or not set(bindings) <= set(modules):
+        raise ValueError("adapter layouts must be keyed by the adapter's own modules")
+    layouts: dict[str, WeightLayout] = {}
+    for module, binding in bindings.items():
+        if not isinstance(binding, dict) or set(binding) != {'name', 'shape', 'transpose'}:
+            raise ValueError(f"the adapter's binding of {module} needs name, shape and transpose")
+        name = text(binding['name'], f'binding of {module}')
+        shape = tuple(integer(size, f'binding of {module}') for size in binding['shape'])
+        transpose = binding['transpose']
+        layout = WeightLayout(name, ((*module.split('/'), 'kernel'),), shape,
+                              None if transpose is None else tuple(integer(axis, f'binding of {module}')
+                                                                   for axis in transpose))
+        layouts[name.removesuffix('.weight').replace('/', '.')] = layout
+    return targets, record['rslora'], float(dropout), layouts
+
+
+def adapted(model: nn.Module, record: Mapping) -> nn.Module:
+    """`model` adapted as the model record `record` says, which is how a
+    recorded run's model is rebuilt (`ModelConfig.build`); the checkpoint
+    supplies the factors."""
+    targets, rslora, dropout, layouts = _read_record(record)
+    return _adapted(model, _Branch(targets, rslora, dropout), layouts)
 
 
 def _node(tree: Mapping, path: Path) -> Mapping:
@@ -552,12 +706,12 @@ def _pattern(patterns: Mapping[str, object], relative: str) -> str:
 
 
 class PeftConfig(TypedDict):
-    """Describes `adapter_config.json` as PEFT writes and reads it.
+    """The contents of `adapter_config.json`, as PEFT writes and reads it.
 
-    It carries the defaults every target takes and the per-module exceptions.
-    `fan_in_fan_out`, `bias`, `init_lora_weights` and `inference_mode` are
-    fixed because dew builds its adapters one way. Nothing here reads those
-    four back; they are written so a PEFT reader finds the keys it expects.
+    It holds the defaults every target uses and the per-module exceptions.
+    `fan_in_fan_out`, `bias`, `init_lora_weights` and `inference_mode` are fixed
+    because Dew builds its adapters one way. Nothing here reads those four back;
+    they are written so that a PEFT reader finds the keys it expects.
     """
 
     peft_type: str
@@ -574,7 +728,7 @@ class PeftConfig(TypedDict):
     inference_mode: bool
 
 
-def _config(lora: LoRA, named: Mapping[str, Target]) -> PeftConfig:
+def _config(lora: Adapter, named: Mapping[str, Target]) -> PeftConfig:
     """Build the PEFT config of `named` targets, keyed by the relative module name.
 
     The commonest rank and alpha become the defaults and the rest the patterns.
@@ -600,7 +754,7 @@ def _config(lora: LoRA, named: Mapping[str, Target]) -> PeftConfig:
 
 
 # --------------------------------------------------------------------------
-# What LoRA.fresh, LoRA.load and LoRA.save read and write the files with
+# What LoRA.apply, LoRA.load and Adapter.save read and write the files with
 # --------------------------------------------------------------------------
 
 
@@ -636,8 +790,8 @@ def _entries(components: frozenset[str], tensors: Mapping[str, np.ndarray],
     return entries
 
 
-def _place(layouts: Mapping[str, WeightLayout], variables: Variables,
-           entries: Sequence[_Entry]) -> tuple[LoRA, Variables]:
+def _place(model: nn.Module, layouts: Mapping[str, WeightLayout], variables: Variables,
+           entries: Sequence[_Entry]) -> Adapter:
     """Build the adapter the entries describe, its factors restored into the model's tree."""
     components = _components(layouts)
     settings = {(entry.config.rslora, entry.config.dropout) for entry in entries}
@@ -672,7 +826,7 @@ def _place(layouts: Mapping[str, WeightLayout], variables: Variables,
         bound[entry.module] = layout
         _insert_factors(leaves, factors.module, factors.a.restore(entry.a, shape_a),
                         factors.b.restore(entry.b, shape_b))
-    return LoRA(targets, rslora, dropout, bound), overlay(variables, leaves)
+    return Adapter.bound(model, overlay(thaw(variables), leaves), targets, rslora, dropout, bound)
 
 
 def _diffusers_configs(tensors: Mapping[str, np.ndarray], metadata: str | None,
@@ -720,7 +874,7 @@ def _named(layouts: Mapping[str, WeightLayout], wanted: Sequence[str]) -> dict[s
 
 @runtime_checkable
 class _Adapted(Protocol):
-    """Marks a module class `adapt` already wrapped.
+    """Marks a module class an adapter already wrapped.
 
     The wrapper subclass declares the interceptor its `apply` and `init` run
     under, which is the whole record that a class was adapted: a second
@@ -729,48 +883,9 @@ class _Adapted(Protocol):
 
     _dew_lora_interceptor: ClassVar[Interceptor]
     _dew_lora_base: ClassVar[type[nn.Module]]
-    _dew_lora_spec: ClassVar[LoRA]
+
+    @classmethod
+    def _dew_lora_record(cls) -> dict: ...
 
 
-@runtime_checkable
-class Adaptable(Protocol):
-    """Declares an objective an adapter attaches to.
-
-    It trains one module, which is its `model`, and it takes the filter that
-    says which of that module's leaves the optimizer moves. `LMObjective`,
-    `BlockDiffusionObjective` and the denoising `DiffusionObjective` are
-    the three; an objective that keeps no model or selects what trains some
-    other way is refused by name.
-    """
-
-    model: nn.Module
-    trainable: PathFilter | None
-
-
-def _attach(objective: object, adapter: LoRA) -> None:
-    """Adapt the module `objective` trains, in place, and freeze all but the factors.
-
-    This is `RunConfig.train`'s step, not a user's: the recipe hands the run
-    its objective, and the run adapts it once, before anything initialises
-    it, so the adapted module is what the run traces and the adapter's own
-    leaves are the only ones the optimizer moves. Code that builds its own
-    run adapts a source with `PretrainedDecoder.lora` or
-    `PretrainedPipeline.lora` instead, which returns a new bundle. The
-    adapted module is a subclass of the same class with the same fields, so
-    what the objective read off the model at construction still holds.
-    """
-    if not isinstance(objective, Adaptable):
-        raise ValueError(
-            f"--lora adapts the module an objective trains and freezes the rest, and "
-            f"{type(objective).__name__} keeps no `model` it can select leaves of; train "
-            f"an LMObjective, a BlockDiffusionObjective or a DiffusionObjective, or leave "
-            f"the adapter unset")
-    if objective.trainable is not None:
-        raise ValueError(
-            f"{type(objective).__name__} already selects what trains, and an adapter "
-            f"freezes everything but its own factors; pass one filter, not both")
-    objective.model = adapter.adapt(objective.model)
-    objective.trainable = adapter.trainable
-
-
-__all__ = ["Adaptable", "LoRA", "PeftConfig", "Target"]
+__all__ = ["Adapter", "LoRA", "PeftConfig", "Target"]

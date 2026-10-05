@@ -112,17 +112,14 @@ def moved(variables, seed: int):
 def export_case(case: Case, source, directory: Path):
     """Adapt the loaded `source` as `case` says, move the factors and write
     the adapter into `directory`; returns the adapter and its variables."""
-    import jax
-
     from dew.lora import LoRA
 
     if case.patterned:
-        adapter, variables = LoRA.load(source.model, source.variables, source.layouts, PATTERNED)
+        adapter = LoRA.load(source.model, source.variables, PATTERNED, layouts=source.layouts)
     else:
-        tuned = source.lora(rank=case.rank, modules=case.modules, key=jax.random.key(case.seed),
-                            alpha=case.alpha, rslora=case.rslora, dropout=case.dropout)
-        adapter, variables = tuned.adapter, tuned.variables
-    variables = moved(variables, 100 + case.seed)
+        adapter = source.adapt(LoRA(rank=case.rank, modules=case.modules, alpha=case.alpha,
+                                    rslora=case.rslora, dropout=case.dropout), key=case.seed).adapter
+    variables = moved(adapter.variables, 100 + case.seed)
     adapter.save(variables, directory)
     return adapter, variables
 

@@ -25,7 +25,7 @@ from dew.artifacts import TokenScores
 from dew.data.prompts import LENGTH_KEY, PROMPT_KEY
 from dew.inputs import Field, InputSpec
 from dew.nn.precision import at_least_fp32
-from dew.objectives.base import Aux, Ratio, Shown, Variables
+from dew.objectives.base import Aux, Ratio, Shown, Variables, thaw
 from dew.objectives.lm.chunked import chunked_cross_entropy
 from dew.registry import objectives
 from dew.rl import behavior_importance_weights, k3_kl, masked_mean, sequence_log_ratio, token_log_ratio
@@ -54,6 +54,7 @@ from .sessions import (
     SUPPORT_KEY,
 )
 
+# Each surrogate was checked against verl at 12ebe0c.
 POLICY_LOSSES = ("ppo", "gspo", "cispo")
 AGGREGATIONS = ("token-mean", "session-mean")
 
@@ -85,55 +86,59 @@ def _band(name: str, band) -> tuple[float, float] | None:
 
 @objectives("grpo")
 class GRPOObjective(LMObjective):
-    """Train a policy on sampled rollouts with the GRPO loss (arXiv:2402.03300, eq. 4).
+    """Trains a policy on sampled rollouts with the GRPO loss (arXiv:2402.03300, equation 4).
 
-    The default composition is verl's: the dual-clipped surrogate, token-meaned
-    over the response mask, plus `beta` times the token-mean k3 KL to the
-    frozen reference (`verl/trainer/ppo/core_algos.py`,
-    `compute_policy_loss_vanilla` with `token-mean` and
-    `kl_penalty_forward` with `k3`).
+    By default the loss is verl's: the dual-clipped surrogate, averaged over
+    the tokens of the response mask, plus `beta` times the token-mean k3 KL
+    to the frozen reference (`verl/trainer/ppo/core_algos.py`,
+    `compute_policy_loss_vanilla` with `token-mean` and `kl_penalty_forward`
+    with `k3`).
 
-    `beta` is the KL strength; 0.0 allocates no frozen reference.
-    `epsilon_low`, `epsilon_high` and `dual_clip` are the clip points;
-    `model` and `seq_len` are the LMObjective's, with `seq_len` one below the
-    row width. An `ema_decay` argument is refused, and `loss_role` is refused
-    with it: the response mask already says which targets count.
+    `beta` is the KL strength, and at 0.0 no frozen reference is allocated.
+    `epsilon_low`, `epsilon_high` and `dual_clip` are the clip points.
+    `model` and `seq_len` are as in `LMObjective`, with `seq_len` one less
+    than the row width. An `ema_decay` argument is refused, and so is
+    `loss_role`, because the response mask already says which targets count.
 
-    `policy_loss` picks the surrogate, each checked against verl 12ebe0c:
-    `"ppo"` (`compute_policy_loss_vanilla`), `"gspo"`
-    (`compute_policy_loss_gspo`: the sequence ratio of `sequence_log_ratio`,
-    clipped, no dual clip) and `"cispo"` (`compute_policy_loss_cispo`). A
-    sequence is a packed chain.
+    `policy_loss` picks the surrogate:
 
-    `aggregation` is `"token-mean"` (verl's default) or `"session-mean"`:
-    each session's token mean, averaged over sessions, so a long session or
-    one split over several rows weighs as one (Agent Lightning's
-    `per_rollout_mean`, verl's `seq-mean-token-mean` when a session is one
-    row). The batch carries the weights in `session_weights`.
+    - `"ppo"`, verl's `compute_policy_loss_vanilla`.
+    - `"gspo"`, verl's `compute_policy_loss_gspo`. It clips the sequence ratio
+      from `sequence_log_ratio` and has no dual clip. A sequence here is a
+      packed chain.
+    - `"cispo"`, verl's `compute_policy_loss_cispo`.
 
-    Behavior corrections read `behavior_log_probs` against the proximal
-    policy (`old_log_probs`), all detached, from verl's
-    `rollout_corr_helper`. `behavior_importance` is one threshold, as verl's
-    `rollout_is_threshold` is: a number caps the token ratio (TIS), a
-    `(low, high)` pair zeroes it outside the band instead (IcePop);
+    `aggregation` is `"token-mean"` (verl's default) or `"session-mean"`.
+    Session-mean takes each session's token mean and averages those over
+    sessions, so a long session, or one split over several rows, counts as
+    one. That is Agent Lightning's `per_rollout_mean`, and verl's
+    `seq-mean-token-mean` when a session is one row. The batch holds the
+    weights in `session_weights`.
+
+    Behavior corrections compare `behavior_log_probs` with the proximal
+    policy (`old_log_probs`), all detached, as verl's `rollout_corr_helper`
+    does. `behavior_importance` is a single threshold, like verl's
+    `rollout_is_threshold`: a number caps the token ratio (TIS), and a
+    `(low, high)` pair zeroes the ratio outside the band (IcePop).
     `sequence_mask` and `geometric_mask` reject every token of a sequence
     whose summed (`seq_sum_k1`) or mean (`seq_mean_k1`) k1 statistic lies
-    outside `(log low, log high)`. Metrics add `mismatch/kl`,
-    `mismatch/k3_kl` and `mismatch/ess` whenever behavior likelihoods are
-    present, and the fraction of trainable tokens each correction masked.
-    Without `old_log_probs` the corrections follow verl's bypass mode: they
-    compare the detached current policy with behavior, the band only masks,
-    and a TIS cap is refused, since the ratio already is current over
-    behavior.
+    outside `(log low, log high)`. Whenever behavior likelihoods are present,
+    the metrics include `mismatch/kl`, `mismatch/k3_kl` and `mismatch/ess`,
+    and the fraction of trainable tokens each correction masked.
 
-    Engine records on a packed batch are replayed when present:
+    Without `old_log_probs`, the corrections follow verl's bypass mode. They
+    compare the detached current policy with behavior, and the band only
+    masks. A TIS cap is refused in that mode, because the ratio is already
+    current over behavior.
+
+    When a packed batch holds engine records, the loss replays them.
     `routed_experts`/`routed` make every router use the experts the engine
-    used (R3), and `support_ids`/`support_columns` renormalize each sampled
-    id over the ids its top-k/top-p sampler kept, at `sampling_temperature`
-    (applied after any final softcap), so the policy
-    likelihood compares with a filtered behavior likelihood (DeepSeek-V3.2
-    section 3.1). `sampling_temperature` is the engine's when its reported
-    likelihoods are processed ones; raw ones need 1.0.
+    used (R3). `support_ids`/`support_columns` renormalize each sampled id
+    over the ids its top-k/top-p sampler kept, at `sampling_temperature`
+    (applied after any final softcap), so the policy likelihood is compared
+    with a filtered behavior likelihood (DeepSeek-V3.2 section 3.1). Set
+    `sampling_temperature` to the engine's when the engine reports processed
+    likelihoods; raw ones need 1.0.
     """
 
     # The loss is a policy-gradient surrogate: its value is no measure of
@@ -191,12 +196,13 @@ class GRPOObjective(LMObjective):
         self.sampling_temperature = sampling_temperature
 
     def packed_log_probs(self, params: Variables, batch) -> jax.Array:
-        """Score each packed id given its own chain's prefix, `[rows, width]`.
+        """Return each packed id's log-probability given its own chain's prefix, as `[rows, width]`.
 
         Entry t is `log pi(input_ids[t] | chain prefix)`, aligned with
-        `input_ids`; it is zero where `response_mask` is zero, which covers
+        `input_ids`. It is zero where `response_mask` is zero, which covers
         every chain start and all padding. The loss and a proximal rescoring
-        read this one function.
+        both use this one function. A packed column whose shape differs from
+        `input_ids` raises `ValueError`.
         """
         ids = jnp.asarray(batch[IDS_KEY], jnp.int32)
         segments = jnp.asarray(batch[SEGMENT_IDS_KEY], jnp.int32)
@@ -237,10 +243,10 @@ class GRPOObjective(LMObjective):
                       None if weights is None else jnp.asarray(weights, jnp.float32), proximal)
 
     def loss(self, variables, batch, step):
-        """Score the policy surrogate over the trainable tokens, plus the KL to the reference.
+        """Compute the policy surrogate over the trainable tokens, plus the KL to the reference.
 
-        The policy is rescored from the rollout's own ids, so every term
-        reads the tokens that were actually drawn.
+        The policy's log-probabilities are recomputed from the rollout's own
+        ids, so every term uses the tokens that were actually sampled.
         """
         terms = self._terms(variables, batch)
         mask = terms.mask
@@ -328,12 +334,14 @@ class GRPOObjective(LMObjective):
         return terms.session_weights * keep * (effective != 0)
 
     def evaluate(self, params, batch, step):
-        """Score the prompts' perplexity under the policy.
+        """Return the per-token scores of the prompts under the policy, for their perplexity.
 
-        Each row is its shifted cross entropy with the real suffix as
-        weights, taken off the row's `prompt_length`. Pads predict nothing
-        and count nothing.
+        Prompts are left-padded, so a row's real tokens are its last
+        `prompt_length` columns. Each row's score is its shifted cross entropy
+        with those real tokens as the weights; padding neither predicts nor
+        counts.
         """
+        params = thaw(params)
         prompts = jnp.asarray(batch[PROMPT_KEY])
         lengths = jnp.asarray(batch[LENGTH_KEY]).reshape(-1)
         if prompts.shape[1] < 2:

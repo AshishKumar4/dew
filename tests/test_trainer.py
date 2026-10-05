@@ -36,7 +36,7 @@ from dew import position
 from dew.artifacts import Representations
 from dew.checkpoints import STATE_LEAVES, Ranking
 from dew.data import DataPartition
-from dew.objectives.base import Aux, EMASpec, Objective, merge, select, under
+from dew.objectives.base import Aux, EMASpec, Objective, freeze, merge, select, under
 from dew.training import (
     Checkpoints,
     Layout,
@@ -493,7 +493,7 @@ def held_lm_trainer(**settings):
     model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=1,
                               mlp_features=16, max_seq_len=8)
     weights = jax.jit(LMObjective(model, seq_len=4).init)(jax.random.key(0))
-    objective = LMObjective(model, seq_len=4, pretrained=weights, ema_decay=0.999)
+    objective = LMObjective(model, seq_len=4, variables=weights, ema_decay=0.999)
     return Trainer(objective, optax.adam(1e-3), key=jax.random.key(0),
                    layout=Layout(min_shard=1, tolerance=1.0), **settings), objective, weights
 
@@ -2241,8 +2241,10 @@ def test_a_frozen_step_tells_the_options_its_tokens_and_split(monkeypatch):
                         lambda objective, tokens, frozen: seen.append((tokens, frozen)))
     model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=1,
                               mlp_features=16, max_seq_len=8)
-    for trainable, frozen in ((None, False), (lambda path: path[-2:] == ("q_proj", "kernel"), True)):
-        trainer = Trainer(LMObjective(model, seq_len=4, trainable=trainable), optax.sgd(1e-3),
+    fresh = LMObjective(model, seq_len=4).init(jax.random.key(0))
+    queries = freeze(fresh, lambda path: path[-2:] == ("q_proj", "kernel"))
+    for variables, frozen in ((fresh, False), (queries, True)):
+        trainer = Trainer(LMObjective(model, seq_len=4, variables=variables), optax.sgd(1e-3),
                           key=jax.random.key(0), checkpoints=None, tracker=None)
         state, _, _ = trainer.place()
         trainer.compile(state, {"text": jax.ShapeDtypeStruct((8, 5), jnp.int32)})

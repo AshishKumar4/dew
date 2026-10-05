@@ -1,14 +1,16 @@
 """Flow-GRPO over recorded rectified-flow transitions.
 
-The policy ratio follows the released implementation's mean coordinate log
-likelihood, not the product of all coordinate likelihood ratios. The KL term
-is the conditional Gaussian KL from arXiv:2505.05470v5 section 4, also averaged
-across coordinates. Its variance includes elapsed time. The released
-scripts/train_sd3.py at 879042cf5707f8b90daa98d147d7deac2317c5da instead divides
-squared mean displacement by the diffusion coefficient squared, a term equal
-to elapsed time times this conditional KL. These regularizers have different
-step weighting. Callback scores are retained in float64 through host grouping,
-unlike the released trainer's earlier float32 score conversion.
+The policy ratio uses the mean log likelihood over coordinates, as the
+released implementation does, and not the product of every coordinate's
+likelihood ratio. The KL term is the conditional Gaussian KL from
+arXiv:2505.05470v5 section 4, also averaged over coordinates, and its
+variance includes the elapsed time. The released scripts/train_sd3.py
+computes a different term: it divides the squared mean displacement by the
+squared diffusion coefficient, which equals the elapsed time times this
+conditional KL. The two regularizers therefore weight the steps differently.
+
+Callback scores stay in float64 through the host grouping, where the
+released trainer converted them to float32 earlier.
 """
 
 from __future__ import annotations
@@ -38,7 +40,7 @@ from dew.sampling.solvers import Euler, Solver
 from .sessions import ADVANTAGES_KEY, OLD_LOG_PROBS_KEY
 
 REWARDS_KEY = "rewards"
-"""Per image, the reward its trajectory scored."""
+"""The batch field that holds each image's reward, the score its trajectory got."""
 
 if TYPE_CHECKING:
     from dew.training.state import TrainState
@@ -65,26 +67,29 @@ _DEFAULT_SOLVER = Euler()
 
 @objectives("flow_grpo")
 class FlowGRPOObjective(DiffusionObjective):
-    """Train a rectified-flow policy on clipped, coordinate-normalized gradients.
+    """Trains a rectified-flow policy with a clipped policy gradient, normalized per coordinate.
 
     A conditional transition KL regularizes it.
 
-    Batches carry latents/next_latents [N, K, ...], timesteps/next_timesteps,
-    joint old_log_probs and transition_mask [N, K], and advantages [N] or
-    [N, K]. K is the selected transition count. The denominator counts kept
-    stochastic transitions. Deterministic intervals contribute no policy loss.
+    A batch holds `latents` and `next_latents` as `[N, K, ...]`; `timesteps`,
+    `next_timesteps`, the joint `old_log_probs` and `transition_mask` as
+    `[N, K]`; and `advantages` as `[N]` or `[N, K]`. K is the number of
+    selected transitions. The loss's denominator counts the kept stochastic
+    transitions, and deterministic intervals contribute no policy loss.
 
-    beta > 0 freezes the initial denoiser in the existing EMA slot, which is
-    then a reference rather than an average (`_ema_is_reference`): the
-    task a run publishes and restores, its evaluation and its previews are
-    the live policy. solver and steps configure evaluation; sde specifies
-    both rollout and rescoring. pretrained is the whole variables tree the
-    policy starts from, as `DiffusionObjective` takes it: the model's
-    collections, `encoders` and any `autoencoder`.
+    With `beta` > 0, the objective freezes the initial denoiser in the
+    existing EMA slot, which then holds a reference instead of an average.
+    The task a run publishes and restores, its evaluation and its previews
+    all use the live policy. `solver` and `steps` configure evaluation, and
+    `sde` configures both the rollout and the rescoring. `variables` is the
+    whole variables tree the policy starts from, as `DiffusionObjective`
+    takes it: the model's collections, `encoders` and any `autoencoder`.
     """
 
     # The loss is a policy-gradient surrogate, shown without a direction.
     shown: Mapping[str, Shown] = {"loss": Shown(), "reward": Shown(better="higher")}
+    # With beta > 0 the EMA slot holds the frozen reference, so pipelines,
+    # evaluation and previews read the live weights.
     _ema_is_reference = True
 
     def __init__(self, model: nn.Module, process: Process | Preset, inputs: InputSpec, *,
@@ -92,7 +97,7 @@ class FlowGRPOObjective(DiffusionObjective):
                  clip_range: float = 1e-4, adv_clip_max: float = 5.0,
                  autoencoder: AutoEncoder | None = None,
                  guidance: CFG | None = _DEFAULT_GUIDANCE, solver: Solver = _DEFAULT_SOLVER,
-                 steps: int = 41, pretrained: Variables | None = None):
+                 steps: int = 41, variables: Variables | None = None):
         if not math.isfinite(beta) or beta < 0:
             raise ValueError("beta must be finite and non-negative")
         if not math.isfinite(clip_range) or not 0 <= clip_range < 1:
@@ -101,11 +106,11 @@ class FlowGRPOObjective(DiffusionObjective):
             raise ValueError("adv_clip_max must be finite and positive")
         if steps < 2:
             raise ValueError("evaluation needs at least two time points")
-        if pretrained is not None and "params" not in pretrained:
-            raise ValueError("pretrained must be a variables tree with a params collection")
+        if variables is not None and "params" not in variables:
+            raise ValueError("variables must be a variables tree with a params collection")
         super().__init__(model, process, inputs, autoencoder=autoencoder,
                          unconditional_prob=0, ema_decay=1.0, solver=solver,
-                         guidance=guidance, steps=steps, pretrained=pretrained)
+                         guidance=guidance, steps=steps, variables=variables)
         sde.validate(self.process)
         if beta == 0:
             self.ema = None
@@ -152,7 +157,7 @@ class FlowGRPOObjective(DiffusionObjective):
         return jax.tree.map(jax.lax.stop_gradient, (latents, following, times, next_times))
 
     def log_probs(self, params: Variables, batch: Batch) -> jax.Array:
-        """Rescore joint transition log densities with the rollout's guidance."""
+        """Return each recorded transition's joint log density under `params`, guided as the rollout was."""
         latents, following, times, next_times = self._window(batch)
         walk = self._walk(params, batch)
 
@@ -166,11 +171,11 @@ class FlowGRPOObjective(DiffusionObjective):
         return values.T
 
     def loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
-        """Score the clipped policy gradient over the recorded transitions.
+        """Compute the clipped policy-gradient loss over the recorded transitions.
 
-        The scan carries nothing between transitions; each one contributes
-        its surrogate, its KL to the frozen reference, whether it counted,
-        and whether the ratio was clipped.
+        The scan carries no state from one transition to the next. Each
+        transition contributes its surrogate, its KL to the frozen reference,
+        whether it counted and whether its ratio was clipped.
         """
         latents, following, times, next_times = self._window(batch)
         old = jax.lax.stop_gradient(jnp.asarray(batch[OLD_LOG_PROBS_KEY], jnp.float32))
@@ -205,6 +210,8 @@ class FlowGRPOObjective(DiffusionObjective):
             pg = jnp.where(keep, jnp.maximum(unclipped, clipped), 0).sum()
             kl = jnp.asarray(0.0)
             if reference is not None:
+                # The released scripts/train_sd3.py that the module docstring
+                # compares this KL with is at 879042cf5707f8b90daa98d147d7deac2317c5da.
                 reference_mean = self._transition(reference.at((), index), x, t, s).mean
                 kl = jnp.where(keep, transition.kl(reference_mean) / dimensions, 0).sum()
             clipped_count = (keep & (jnp.abs(ratio - 1) > self.clip_range)).sum()
@@ -243,13 +250,18 @@ class FlowGRPOObjective(DiffusionObjective):
                          for keyword, condition in self.inputs.conditions.items()}
 
     def evaluate(self, params: Variables, batch: Batch, step: Step):
-        """Generate one live-policy sample per source row, including prompt-only batches."""
+        """Return one sample from the live policy for each source row, including for prompt-only batches."""
         samples, _ = self._draw(params, batch, step.key)
         assert self.artifact is not None
         return self.artifact(samples)
 
     def preview(self, params: Variables, batch: Batch, step: Step, *, scored=None):
-        """Draw on all ranks; materialize before root-only caption decoding."""
+        """Return preview samples and their captions, drawn on every process and decoded on process zero.
+
+        Every process draws up to `VALIDATION_SAMPLES` samples, and they are
+        gathered to the host before process zero decodes the captions. The
+        other processes return None.
+        """
         samples, tokens = self._draw(params, batch, step.key, VALIDATION_SAMPLES)
         samples, tokens = collective_host((samples, tokens), phase="flow preview")
         if jax.process_index() != 0:
@@ -266,28 +278,34 @@ class FlowGRPOObjective(DiffusionObjective):
 
 
 type FlowReward = Callable[[np.ndarray, Batch], np.ndarray | jax.Array | Sequence[float]]
-"""Score decoded [-1, 1] samples and repeated source rows, one scalar per sample."""
+"""A function that scores decoded [-1, 1] samples, given their repeated source rows, one scalar per sample."""
 
 
 @dataclass(frozen=True)
 class FlowRollout:
-    """Collect complete prompt groups and the first train_steps transitions.
+    """Collects complete prompt groups and the first `train_steps` transitions of each trajectory.
 
-    steps counts time points, so steps=11 draws ten transitions. None selects
-    all transitions. Rewards use population group standard deviation and
-    epsilon 1e-4, as Flow-GRPO's PerPromptStatTracker does. Each prompt row
-    defines a group; equal prompt text in other rows does not merge groups.
-    Zero-advantage rows are masked, as the reference training loop filters them.
-    Callback collection, JSON/byte transport, and population statistics retain
-    float64 values. Host rewards remain float64; training advantages are
-    float32 after normalization. The reward metric is a float32 diagnostic,
-    and JAX device transfer also narrows the reward column when x64 is off.
+    Each source row is sampled `groups` times. `steps` counts time points, so
+    `steps=11` draws ten transitions, and `train_steps` None trains on all of
+    them.
 
-    The trainer supplies global arrays on every process. Generation remains
-    collective, rewards run once on rank zero, and the result contains only
-    this process's owned rows for the trainer's shard_batch boundary. Host
-    materialization currently uses collective_host and replicates the complete
-    trajectory on every process before selecting local rows.
+    A sample's advantage is its reward minus its group's mean, divided by
+    the group's population standard deviation plus 1e-4, as Flow-GRPO's
+    PerPromptStatTracker computes it. Each prompt row is its own group, so
+    equal prompt text in other rows does not merge groups. Rows with zero
+    advantage are masked, as the reference training loop filters them out.
+
+    Rewards stay in float64 from the callback, through the JSON and byte
+    transport, to the population statistics, and they stay float64 on the
+    host. The training advantages are float32 after normalization. The `reward` metric
+    is a float32 diagnostic, and JAX's device transfer also narrows the
+    reward column when x64 is off.
+
+    The trainer passes global arrays on every process. Generation runs on
+    every process, rewards are computed once on process zero, and the result
+    holds only the rows this process owns, for the trainer's `shard_batch`.
+    Gathering to the host currently uses `collective_host`, which copies the
+    whole trajectory to every process before each selects its local rows.
     """
 
     objective: FlowGRPOObjective
@@ -404,13 +422,13 @@ class FlowRollout:
         return prepared
 
     def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> Batch:
-        """Collect one batch of trajectories and return this rank's training rows.
+        """Collect one batch of trajectories and return this process's training rows.
 
-        The phases are: expand each prompt into its group, generate on
-        every rank, score on rank zero and broadcast, then centre the
-        rewards within each group and cut the trajectory into the first
-        `train_steps` transitions. Every phase agrees across ranks before
-        the next collective.
+        It expands each prompt into its group, generates on every process,
+        scores on process zero and broadcasts the rewards. Then it centres
+        the rewards within each group and cuts each trajectory to its first
+        `train_steps` transitions. The processes agree that each phase
+        succeeded before the next collective runs.
         """
         expanded, owned, count = agreed("flow rollout setup", lambda: self._expanded(batch))
         generated = agreed("flow rollout generation", lambda: self._generate(state.variables, expanded, key))

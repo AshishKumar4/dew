@@ -1,15 +1,15 @@
 """What a generative objective is fed: the sample field and its conditions.
 
-`InputSpec` names the batch field the model learns to generate and, keyed by
-the model's own keyword arguments, the conditions it is given. A `Condition`
-is an encoder, the batch field it reads, and the raw datum that stands for
-"no condition", which classifier-free guidance and conditioning dropout
-substitute. Nothing here runs a model: the spec is a description, and the
-objective does the encoding.
+`InputSpec` names the batch field the model learns to generate, and the
+conditions it is given, keyed by the model's own keyword arguments. A
+`Condition` holds an encoder, the batch field it reads and the raw datum that
+stands for "no condition", which classifier-free guidance and conditioning
+dropout substitute. Nothing here runs a model. The spec only describes the
+inputs, and the objective does the encoding.
 
-Image and video batches arrive as uint8 pixels in [0, 255], the way the data
-workers write them. `unit_range` is the one conversion to the [-1, 1] range
-every diffusion loss, sample, artifact and image metric lives in;
+Image and video batches arrive as uint8 pixels in [0, 255], as the data
+workers write them. `unit_range` is the one conversion to [-1, 1], the range
+every diffusion loss, sample, artifact and image metric uses, and
 `dew.artifacts.uint8_pixels` is the one conversion back.
 """
 
@@ -31,13 +31,13 @@ from .encoders import CharTable, CLIPText, ConditionEncoder, HFAudio, T5Text, re
 
 
 def unit_range(pixels: jax.typing.ArrayLike) -> jax.Array:
-    """uint8 pixels in [0, 255] as float32 in [-1, 1]."""
+    """Convert uint8 pixels in [0, 255] to float32 in [-1, 1]."""
     return (jnp.asarray(pixels, jnp.float32) - 127.5) / 127.5
 
 
 @dataclass(frozen=True)
 class Field:
-    """A batch field and its per-example shape: `Field("image", (128, 128, 3))`."""
+    """A batch field and its per-example shape, such as `Field("image", (128, 128, 3))`."""
 
     key: str
     shape: tuple[int, ...]
@@ -70,15 +70,16 @@ class Condition:
 
 @dataclass(frozen=True)
 class InputSpec:
-    """Names the sample field and the conditions, keyed by the model keyword
-    each is passed under: `{"textcontext": Condition(...)}`.
+    """Names the sample field and the conditions, keyed by the model keyword each is passed under.
 
-    `tokenize` is what a captioning dataset hands its text to. Every
-    condition that reads captions tokenizes them under its own field, so the
-    encoder a run names decides the ids and the context length while the
-    dataset carries the words alone. A condition on another modality reads
-    the field its dataset writes, as audio conditioning reads a clip's
-    `audio`.
+    For example, `conditions={"textcontext": Condition(...)}`. Two conditions
+    cannot share a batch field.
+
+    A captioning dataset passes its text to `tokenize`. Every condition that
+    reads captions tokenizes them under its own field, so the encoder a run
+    names decides the ids and the context length, and the dataset only
+    carries the words. A condition on another modality reads the field its
+    dataset writes; audio conditioning, for example, reads a clip's `audio`.
     """
 
     sample: Field
@@ -96,18 +97,19 @@ class InputSpec:
                 "Name a field per condition")
 
     def tokenize(self, captions: Sequence[str]) -> dict[str, Mapping[str, np.ndarray]]:
-        """The batch fields this run's caption conditions read out of `captions`.
+        """Return the batch fields this run's caption conditions read, tokenized from `captions`.
 
-        Empty for a run with none, so the captions stop at the loader and no
-        string array reaches a device.
+        The result is empty for a run with no caption conditions, so the
+        captions stop at the loader and no string array reaches a device.
         """
         return {condition.field: condition.encoder.tokenize(captions)
                 for condition in self.conditions.values() if condition.encoder.reads_captions}
 
     def check(self, batch: Batch) -> None:
-        """Refuse a batch that lacks a field this spec names, or holds the
-        sample or mask at another per-example shape. A `ModelInputs` field
-        is measured by its token rows."""
+        """Raise `ValueError` if `batch` is missing a field this spec names or has a wrong shape.
+
+        The sample and the mask must have their declared per-example shapes.
+        A `ModelInputs` field's shape is taken from its token rows."""
         for condition in self.conditions.values():
             if condition.field not in batch:
                 raise ValueError(f"objective.inputs needs condition field {condition.field!r} "
@@ -136,8 +138,10 @@ class InputSpec:
 
     @classmethod
     def from_json(cls, record: Mapping, *, params: Mapping[str, Variables] | None = None) -> InputSpec:
-        """Rebuilds the spec around supplied condition parameters, or loads
-        each encoder's own weights when none are given."""
+        """Rebuild the spec from its JSON record, around the given condition parameters.
+
+        `params` maps each condition's keyword to its encoder's parameters.
+        When it is None, each encoder loads its own weights."""
         sample = record["sample"]
         return cls(
             sample=Field(sample["key"], tuple(sample["shape"])),

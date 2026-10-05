@@ -1,4 +1,4 @@
-"""Masked diffusion language modelling (MDLM, Sahoo et al. 2024).
+"""Masked diffusion language modelling (MDLM, by Sahoo and coauthors, 2024).
 
 A row of token ids is corrupted by masking each position with the process's
 probability at a drawn time. The model, a `CausalTransformer` with
@@ -35,7 +35,7 @@ from dew.artifacts import TextSamples, TokenScores, agreed, collective_host
 from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask
 from dew.inference.tasks import MaskedGeneration
 from dew.inputs import Field, InputSpec
-from dew.objectives.base import Aux, EMASpec, Objective, Ratio, Shown, Step, Variables
+from dew.objectives.base import FROZEN, Aux, EMASpec, Objective, Ratio, Shown, Source, Step, Variables, thaw
 from dew.objectives.lm.chunked import chunked_cross_entropy
 from dew.objectives.lm.objective import _batch_text
 from dew.registry import objectives
@@ -54,10 +54,10 @@ _DEFAULT_SOLVER = Unmask()
 
 @objectives("masked_diffusion")
 class MaskedDiffusionObjective(Objective[Ratio]):
-    """Train a masked diffusion model on the MDLM negative ELBO.
+    """Trains a masked diffusion model on the MDLM negative ELBO.
 
-    The rows are `[B, seq_len]` token ids under `batch["text"]`; packed
-    windows carry `text_segment_ids` and `text_positions` beside them.
+    A batch holds `[B, seq_len]` token ids under `batch["text"]`, and packed
+    windows also include `text_segment_ids` and `text_positions`.
     """
 
     artifact = TextSamples
@@ -67,7 +67,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
 
     def __init__(
         self,
-        model: CausalTransformer,
+        model: CausalTransformer | Source,
         process: DiscreteProcess,
         seq_len: int,
         *,
@@ -77,21 +77,35 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         steps: int = MDLM_STEPS,
         samples: int = 4,
         decode: Callable[[Sequence[int]], str] | None = None,
-        pretrained: Variables | None = None,
+        variables: Variables | None = None,
         processor: Processor | None = None,
     ):
         """Build an MDLM objective over `model` for `seq_len`-token rows.
 
-        `solver`, `steps` and `samples` are how evaluation unmasks.
-        `decode` turns a row of ids into the text the artifact shows, and
-        None shows the ids alone.
+        `model` must be a `CausalTransformer` with `causal=False`. `solver`
+        and `steps` set how generation unmasks, in the preview and in the
+        task `pipeline` returns, and `samples` is how many rows the preview
+        draws. `decode` turns a row of ids into the text the artifact shows;
+        with None, the artifact shows the ids alone.
 
-        `pretrained` is a released masked-diffusion checkpoint's variables as
-        `Pretrained.load` returns them, so a run continues from LLaDA's or
-        Dream's weights instead of a fresh init; None draws the init.
+        `variables` is the tree training starts from: a released
+        masked-diffusion checkpoint as `Pretrained.load` returns it, so a run
+        continues from LLaDA's or Dream's weights, or an adapter's split of
+        one, kept as given. None starts from a fresh init. `model` may be the
+        loaded source itself, which supplies its model, variables and
+        processor.
 
-        `processor` is what `pipeline` turns text into ids with and decodes
-        through, unless it is handed another; a run records its tokenizer."""
+        `processor` is what `pipeline` uses to turn text into ids and decode
+        them, unless it is given another one. A run records its tokenizer."""
+        if isinstance(model, Source):
+            from dew.nn.backbones.causal_transformer import CausalTransformer
+
+            variables = model.variables if variables is None else variables
+            processor = model.text_processor if processor is None else processor
+            if not isinstance(model.model, CausalTransformer):
+                raise TypeError(f"masked diffusion trains a CausalTransformer, and this source's model "
+                                f"is a {type(model.model).__name__}")
+            model = model.model
         if model.causal:
             raise ValueError(
                 "a masked diffusion model reads the whole corrupted row, so it needs "
@@ -104,10 +118,12 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         self.steps = steps
         self.samples = samples
         self.decode = decode
-        self.pretrained = pretrained
+        self.variables = variables
         self.processor = processor
         self.inputs = InputSpec(sample=Field(TEXT_KEY, (seq_len,)))
-        self.ema = None if ema_decay is None else EMASpec(decay=optax.constant_schedule(ema_decay))
+        # The EMA follows what moves; the frozen collection never does.
+        self.ema = None if ema_decay is None else EMASpec(
+            decay=optax.constant_schedule(ema_decay), select=lambda path: path[0] != FROZEN)
         self._sample = jax.jit(self._sample_impl, static_argnames=("count",))
 
     def inference_record(self):
@@ -125,7 +141,10 @@ class MaskedDiffusionObjective(Objective[Ratio]):
 
     def pipeline(self, state: TrainState, *, ema: bool | None = None,
                  processor: Processor | None = None) -> MaskedGeneration:
-        """Publish the state's weights as a native full-response MDLM task."""
+        """Return the trained model as a full-response MDLM task over the state's weights.
+
+        The task is a `MaskedGeneration` with this objective's solver and steps.
+        """
         from dew.inference.tasks import MaskedGeneration
 
         return MaskedGeneration(self.model, self._pipeline_weights(state, ema), self.process,
@@ -133,18 +152,18 @@ class MaskedDiffusionObjective(Objective[Ratio]):
                                 solver=self.solver, steps=self.steps)
 
     def held_variables(self) -> Variables | None:
-        """Return the checkpoint this run continues from, or None for a fresh init."""
-        return self.pretrained
+        """Return the tree this run starts from, or None for a fresh init."""
+        return self.variables
 
     def init(self, key, variables: Variables | None = None):
-        pretrained = self.pretrained if variables is None else variables
-        if pretrained is None:
+        given = self.variables if variables is None else variables
+        if given is None:
             return self.model.init(key, jnp.zeros((1, self.seq_len), jnp.int32))
-        if "params" not in pretrained:
+        if "params" not in given:
             raise ValueError(
-                "pretrained is the variables dict ({'params': ...}) that "
+                "variables is the variables dict ({'params': ...}) that "
                 "Pretrained.load and model.init return")
-        return pretrained
+        return given
 
     def loss(self, variables, batch, step: Step):
         tokens, losses, weights, counted, predicted, real = self._token_losses(
@@ -157,14 +176,15 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         })
 
     def evaluate(self, params, batch, step: Step) -> TokenScores:
-        """Score the negative ELBO of every token in the batch.
+        """Return the negative ELBO of every token in the batch.
 
-        One noise level and one masking are drawn from the pass's key, as
-        training draws them, with dropout off and the averaged weights when
-        the run keeps them. Every real token counts and carries its weighted
-        masked cross entropy, zero where it was left visible, and a packed
-        window's padding weighs nothing, so `perplexity` over a validation
-        pass is exp of the ELBO bound per token, the number MDLM reports."""
+        One noise level and one masking are drawn from the pass's key, as in
+        training. Dropout is off, and the averaged weights are used when the
+        run keeps them. Every real token counts: a masked token scores its
+        weighted cross entropy, a visible one scores zero, and a packed
+        window's padding has no weight. So `perplexity` over a validation
+        pass is the exponential of the ELBO bound per token, the number MDLM
+        reports."""
         params = params if step.ema is None else step.ema
         losses, weights, correct = self._scored(params, batch, step.key)
         return TokenScores(losses=losses, weights=weights, correct=correct)
@@ -194,6 +214,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         directions, with its own positions, and the tail is neither masked
         nor scored: a packed window scores as its documents would one by one.
         """
+        params = thaw(params)
         prepared = _batch_text(batch)
         unread = sorted(set(prepared.token_fields) - {"positions", "segment_ids"})
         if unread or prepared.conditioning:
@@ -232,12 +253,16 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         return tokens, losses, counted * self.process.weight(t)[:, None], counted, predicted, real
 
     def _sample_impl(self, params, key, *, count: int):
-        denoise = self.process.denoiser(self.model, params)
+        denoise = self.process.denoiser(self.model, thaw(params))
         x_T = self.process.noise(key, (count, self.seq_len))
         return sample(denoise, x_T, self.steps, solver=self.solver, key=key)
 
     def preview(self, params, batch, step: Step, *, scored=None):
-        """Generate the configured display count, then decode on process zero."""
+        """Generate `samples` rows on every process, then decode them on process zero.
+
+        The other processes return None. Without `decode`, the artifact holds
+        the ids alone.
+        """
         def setup():
             return params if step.ema is None else step.ema, self.samples
 

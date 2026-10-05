@@ -285,7 +285,7 @@ def test_a_trained_flux_step_exports_and_reloads(source, pipeline_record, tmp_pa
     loaded = Pretrained.load(str(source / "pipeline"), dtype="float32", attention_impl="xla")
     height, width = loaded.inputs.sample.shape[:2]
     objective = DiffusionObjective(loaded.model, loaded.process, loaded.inputs,
-                                   autoencoder=loaded.autoencoder, pretrained=loaded.variables,
+                                   autoencoder=loaded.autoencoder, variables=loaded.variables,
                                    unconditional_prob=0.0, ema_decay=None, steps=2)
     rows = jax.device_count()
     pixels = np.tile(np.arange(height * width * 3, dtype=np.uint8).reshape(1, height, width, 3),
@@ -428,7 +428,7 @@ def test_each_records_guidance_reaches_the_model_and_survives_the_shared_seams(
     # Dropping every caption leaves the guidance in place, so the loss still
     # depends on it.
     objective = DiffusionObjective(loaded.model, loaded.process, loaded.inputs,
-                                   autoencoder=loaded.autoencoder, pretrained=loaded.variables,
+                                   autoencoder=loaded.autoencoder, variables=loaded.variables,
                                    unconditional_prob=1.0, ema_decay=None, steps=2)
     height, width = loaded.inputs.sample.shape[:2]
     pixels = np.tile(np.arange(height * width * 3, dtype=np.uint8).reshape(1, height, width, 3),
@@ -450,7 +450,8 @@ def test_the_tied_t5_embedding_maps_under_either_name(source):
     for export; a file carrying two copies that differ is refused, and one
     carrying neither is refused rather than initialized.
     """
-    from dew.interop.diffusion import component_tensors, record_layouts
+    from dew.interop.diffusion import component_tensors
+    from dew.interop.weights import record_layouts
     from dew.nn.text_encoders import _t5_path, translate_t5_weights
 
     tensors = dict(component_tensors(source / "pipeline", "text_encoder_2"))

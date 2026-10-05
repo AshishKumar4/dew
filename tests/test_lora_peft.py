@@ -15,7 +15,7 @@ from safetensors.numpy import load_file
 
 from dew import lora
 from dew.interop.pretrained import Pretrained
-from dew.lora import LoRA, Target
+from dew.lora import Adapter, LoRA, Target
 from dew.objectives.base import Step, merge
 from dew.objectives.lm import LMObjective
 
@@ -64,21 +64,21 @@ def test_an_adapter_trains_as_peft_trains_it(case, decoder, monkeypatch, tmp_pat
     float64 rule."""
     with np.load(FIXTURES / case / "reference.npz") as data:
         reference = {key: data[key] for key in data}
-    adapter, variables = LoRA.load(decoder.model, decoder.variables, decoder.layouts,
-                                   FIXTURES / case / "adapter")
+    adapter = LoRA.load(decoder.model, decoder.variables, FIXTURES / case / "adapter",
+                        layouts=decoder.layouts)
+    variables = adapter.variables
     assert (adapter.rslora, adapter.dropout) == ((True, 0.0) if case == "rslora" else (False, 0.25))
     masks = {key.removeprefix("mask/"): value for key, value in reference.items() if key.startswith("mask/")}
     assert len(masks) == (6 if case == "dropout" else 0)
     monkeypatch.setattr(nn.Dropout, "__call__", recorded_dropout(masks))
     tokens = jnp.asarray(reference["input_ids"])
     rngs = {"dropout": jax.random.key(0)} if case == "dropout" else {}
-    logits = adapter.adapt(decoder.model).apply(variables, tokens, rngs=rngs)
+    logits = adapter.model.apply(variables, tokens, rngs=rngs)
     assert_as_exact_as_the_reference(logits, reference["adapted_logits"], reference["adapted_logits_f64"],
                                      "the adapted logits")
     assert np.abs(reference["adapted_logits_f64"] - reference["base_logits"]).max() > 1
 
-    objective = LMObjective(adapter.adapt(decoder.model), tokens.shape[1] - 1, pretrained=variables,
-                            ema_decay=None, trainable=adapter.trainable)
+    objective = LMObjective(adapter.model, tokens.shape[1] - 1, variables=variables, ema_decay=None)
     params = objective.init(jax.random.key(0))
 
     def loss(moving):
@@ -123,16 +123,16 @@ def test_a_multi_axis_target_steps_as_its_flattened_matrix_does():
     model = Host()
     params = jax.tree.map(np.asarray, model.init(jax.random.key(0), jnp.asarray(x)))["params"]
     target = Target(rank=4, alpha=3.0)
-    adapter = LoRA({("params", "proj"): target})
     a = rng.normal(size=(6, 8, 4)).astype(np.float32)
     b = rng.normal(size=(4, 5, 6)).astype(np.float32)
     cotangent = rng.normal(size=(16, 5, 6)).astype(np.float32)
-    scale = adapter.scale(target)
     tree = {"params": {"proj": {**params["proj"], "lora_A": a, "lora_B": b}}}
+    adapter = Adapter.bound(model, tree, {("params", "proj"): target}, rslora=False, dropout=0.0, layouts={})
+    scale = adapter.scale(target)
 
     def output(factors):
         node = {**params["proj"], **factors}
-        return adapter.adapt(model).apply({"params": {"proj": node}}, jnp.asarray(x))
+        return adapter.model.apply({"params": {"proj": node}}, jnp.asarray(x))
 
     def functional(factors):
         return jnp.sum(output(factors) * cotangent)

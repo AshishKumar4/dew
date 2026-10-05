@@ -346,15 +346,16 @@ def recurrent_delta_rule(query, key, value, g, beta, state=None):
     return jnp.moveaxis(out, 0, 1).astype(dtype), state.astype(dtype)
 
 
-def decode_gated_delta_rule(query, key, value, g, beta, state):
+def decode_gated_delta_rule(query, key, value, g, beta, state, active=None):
     """`recurrent_gated_delta_rule` for one decode token `[B, 1, H, D]`
     through `dew.nn.kernels.delta_rule.step`, which reads and writes the
-    state once (CUDA, where `delta_rule.fits` the state)."""
+    state once (CUDA, where `delta_rule.fits` the state). A row `active`
+    `[B]` marks False keeps its state untouched and outputs zeros."""
     work = state.dtype
     query, key, value = (x[:, 0].astype(work) for x in (query, key, value))
     decay = jnp.broadcast_to(jnp.exp(g[:, 0].astype(work))[..., None], key.shape)
     final, out = delta_rule.step(state, query * key.shape[-1] ** -0.5, key, value, decay,
-                                 beta[:, 0].astype(work))
+                                 beta[:, 0].astype(work), active)
     return out[:, None], final
 
 
@@ -556,7 +557,8 @@ class GatedDeltaNet(nn.Module):
 
         state = None if recurrent is None else recurrent.value
         if S == 1 and state is not None and delta_rule.fits(state):
-            out, final = decode_gated_delta_rule(query, key, value, g, beta, state)
+            out, final = decode_gated_delta_rule(query, key, value, g, beta, state,
+                                                 None if valid is None else valid[:, 0])
         elif S == 1:
             out, final = recurrent_gated_delta_rule(query, key, value, g, beta, state)
         else:
