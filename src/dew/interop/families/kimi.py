@@ -197,22 +197,22 @@ def _decoder(text: Mapping[str, object], tied: bool, max_seq_len: int) -> Decode
     if 'linear_attention' in types:
         bound = linear.get('gate_lower_bound')
         kinds['linear_attention'] = {'mixer': {
-            'kind': 'kimi_delta_attention',
+            'name': 'kimi_delta_attention', 'fields': {
             'linear_num_heads': _record_int(linear, 'num_heads'),
             'linear_head_dim': _record_int(linear, 'head_dim'),
             'linear_conv_kernel_dim': _record_int(linear, 'short_conv_kernel_size'),
             'linear_lower_bound': None if bound is None else float(records.number(bound, 'gate_lower_bound')),
-            'use_full_rank_gate': bool(linear.get('use_full_rank_gate', False))}}
+            'use_full_rank_gate': bool(linear.get('use_full_rank_gate', False))}}}
     if 'full_attention' in types:
         kinds['full_attention'] = {'mixer': {
-            'kind': 'mla',
+            'name': 'mla', 'fields': {
             'q_lora_rank': None if text.get('q_lora_rank') is None else _record_int(text, 'q_lora_rank'),
             'kv_lora_rank': _record_int(text, 'kv_lora_rank'),
             'qk_nope_head_dim': _record_int(text, 'qk_nope_head_dim'),
             'qk_rope_head_dim': _record_int(text, 'qk_rope_head_dim'),
             'v_head_dim': _record_int(text, 'v_head_dim'),
             'mla_use_nope': True,
-            'mla_use_output_gate': bool(text.get('mla_use_output_gate', False))}}
+            'mla_use_output_gate': bool(text.get('mla_use_output_gate', False))}}}
     block = text.get('attn_res_block_size')
     config: DecoderFields = {
         "vocab_size": _record_int(text, "vocab_size"),
