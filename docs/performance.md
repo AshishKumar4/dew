@@ -400,40 +400,38 @@ JAX_PLATFORMS=cuda XLA_PYTHON_CLIENT_PREALLOCATE=false XLA_PYTHON_CLIENT_MEM_FRA
     --warmup 3 --steps 30 --profile-dir /tmp/dew-trace --profile-steps 5
 ```
 
-`tools/benchmark_step.py` reads back the traced window. Busy time is the
-union of kernel intervals across the device's streams. The tool counts
-kernels per step and sums their time by category, using kernel names to
-assign categories. Dew was at `9886c20`, before the cudnn padding described
-below.
+`tools/benchmark_step.py` reads the traced window back itself. Busy time is
+the union of every kernel interval on the device's streams. The tool counts
+kernels per step and sums kernel time per category, taking the category from
+the kernel name. Dew was at `9886c20`, the tree before the cudnn padding
+described below.
 
 | architecture | ms/step | device busy | kernels/step | gemm | elementwise | reduce | convert | attention | copy |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | simple_dit | 7.0 | 100% in steady state | 532 | 3.29 | 0.69 | 1.19 | 0.79 | 0.69 | 0.16 |
 | causal_transformer | 88.8 | 100% | 282 | 63.3 | 13.3 | 7.6 | 0.8 | 1.8 | 0.7 |
 
-The trace reports 81.6% busy for the DiT over five steps. Starting the
-profiler adds a 3 ms gap to each of the first two steps. After that,
-the interval between steps settles at 6.9 ms, equal to the kernel time.
-The device stays busy between steps once the loop is running.
+The trace reports 81.6% busy for the DiT over its five steps, because
+starting the profiler puts a 3 ms gap into each of the first two steps.
+After that, the interval from one step to the next settles at 6.9 ms, which
+equals the kernel time, so once the loop is running the device does not sit
+idle between steps.
 
-The DiT's reductions compute the Dense layers' bias gradients and norm
-statistics. The 6-by-64 biases of the q, k and v projections require
-three full passes over each layer's activation gradient, costing 0.25 ms
-a step. The convert kernels compute XLA's split-K partial sums in fp32
-and cast fp32 parameters to bf16 at each use. Parameter casts account for
-0.15 ms of the 0.79.
-
-The decoder's gemm time comes from the fp32 (TF32) vocabulary head. It
-uses two cutlass `s1688gemm` kernels at 12.9 and 12.5 ms, plus four Triton
-tiles of 3.2 ms for the third product. At the measured TF32 ceiling of
-49.5 TFLOP/s, each product needs at least 12.8 ms
-(`docs/research/benchmark-parity.md`).
+The DiT's reductions are the bias gradients of every Dense layer and the
+norm statistics. The 6-by-64 biases of the q, k and v projections cost three
+full passes over the activation gradient per layer, 0.25 ms a step. Its
+converts are XLA's own split-K partial sums in fp32 and the casts of the
+fp32 parameters to bf16 at each use (0.15 ms of the 0.79). Most of the
+decoder's gemm time is the fp32 (TF32) vocabulary head. It runs as two
+cutlass `s1688gemm` kernels at 12.9 and 12.5 ms, and the third product as
+four Triton tiles of 3.2 ms each. At the 49.5 TFLOP/s TF32 ceiling measured
+in `docs/research/benchmark-parity.md`, each product needs at least 12.8 ms.
 
 ### Host time per step
 
-Host times for simple_dit come from the trace's host plane and from a
-dispatch loop timed while the device was deliberately allowed to lag.
-The device step takes 6.9 ms.
+The table below shows what the host spends per step on simple_dit, from the
+trace's host plane and from timing the dispatch loop while the device was
+deliberately left behind. The device step is 6.9 ms.
 
 | host work per step | ms | how measured |
 |---|---:|---|
@@ -447,37 +445,39 @@ The device step takes 6.9 ms.
 On the smallest step, the host takes 94% of the device's time with a fresh
 batch every step, and 106% without command buffers.
 
-The Python in `Compiled.__call__` costs at most 4.5 us per leaf. This state
-has 396 leaves, and more on a mesh. To avoid that cost, `Trainer.compile`
-returns the jitted step starting with `de6b22c`. Since the sequence axis
-was added, a mesh context wraps the jitted step. Dispatch costs 32 us on
-the i9-12900K with or without that wrapper. On this card, wall time stays
-the same and host time drops by 1.8 ms a step.
+The Python in `Compiled.__call__` costs up to 4.5 us per leaf, and this
+state has 396 leaves (more on a mesh). So since `de6b22c`, `Trainer.compile`
+returns the jitted step. On this card that leaves the wall time the same and
+cuts host time by 1.8 ms a step. Since the sequence axis was added, the
+jitted step is wrapped in the mesh context, and a dispatch costs 32 us on
+the i9-12900K with or without that wrapper.
 
-A fresh batch costs 1.5 ms more than a fixed one because the command buffer
-must update its buffer addresses. This limits the loop to 7 steps ahead
-of the device, against 27 with a fixed batch. On a faster card or smaller
-model, it would limit wall-clock throughput. Placement itself takes only
-0.25 ms. Keeping every consumed batch alive also changes nothing under
-default preallocation. Prefetch depths 2, 8 and 32 measure the same. No
-fix was adopted because the runtime controls the addresses.
+A fresh batch costs 1.5 ms more than a fixed one, because the command buffer
+has to be updated for the new buffer addresses. That cost limits how far the
+loop runs ahead (7 steps against 27), and on a faster card or a smaller
+model it would set the wall clock. The placement itself (0.25 ms) is not the
+cause. Neither is freeing the consumed batch, because keeping every batch
+alive changes nothing under the default preallocation. Prefetch depths 2, 8
+and 32 measure the same. I adopted no fix, because the runtime controls the
+addresses.
 
-Waiting on the device after every step costs 45%. The same simple_dit loop
-with `block_until_ready` after each step takes 10.3 ms against 7.1.
-The trainer waits only at logging ticks. Running ahead does not increase
-peak allocation: 0.823 GiB at 27 steps ahead against 0.819 in lockstep,
-and 3.499 against 3.495 GiB for hierarchical_mmdit.
+The alternative, waiting on the device every step, costs 45%. The same
+simple_dit loop with `block_until_ready` after each step runs at 10.3 ms
+against 7.1, so the trainer's loop does not wait between logging ticks.
+Running ahead does not raise the peak allocation (0.823 GiB at 27 steps
+ahead against 0.819 in lockstep, and 3.499 against 3.495 GiB for
+hierarchical_mmdit).
 
-Correction, 2026-10-01, at `42ddfc14` (jax 0.11.2.post3, same card).
-The three "loop" rows above hit the runtime's limit on executions in
-flight. Once the device falls a few dozen steps behind, each dispatch
-waits for a step to finish. These rows therefore measure device time.
-Timing eight dispatches immediately after synchronization stays under
-that limit. Each costs 0.95 ms on simple_dit with a fixed device batch,
-or 1.38 ms when the main thread also places a fresh batch. The small
-decoder costs 0.40 and 0.63 ms. `DevicePrefetchIterator` places fresh
-batches on a worker thread, as used by `Trainer.fit`. With it, every
-loop runs at the device's pace:
+Correction, 2026-10-01, at `42ddfc14` (jax 0.11.2.post3, same card). The
+three "loop" rows above time a dispatch loop that runs into the runtime's
+limit on executions in flight. Once the device is a few dozen steps behind,
+each dispatch waits for a step to finish, so those rows measure the device's
+pace. Eight dispatches timed right after a synchronization stay under that
+limit. They cost 0.95 ms each on simple_dit with a fixed device batch and
+1.38 ms when the main thread also places a fresh batch, and 0.40 and 0.63 ms
+on the small decoder. When the fresh batch comes from
+`DevicePrefetchIterator`, as it does in `Trainer.fit`, the placement runs on
+the iterator's worker thread, and every loop runs at the device's pace:
 
 | loop, 3 repeats of 100 steps (40 on the decoder) | simple_dit ms/step | decoder ms/step |
 |---|---:|---:|
@@ -485,20 +485,20 @@ loop runs at the device's pace:
 | a fresh placement each step, `DevicePrefetchIterator` | 7.43-7.50 | 63.55-63.64 |
 | `Trainer.fit` over the same host batch, logging every 100 (40) steps | 7.456-7.460 | 63.69-63.73 |
 
-The fit row includes logging, which waits on the device once per interval.
-Host time limits the cpu-smoke decoder, whose device work takes 0.3 ms.
-There, `Trainer.fit` costs 0.51-0.62 ms a step, against 0.31-0.37 for the
-bare loop and 0.32-0.44 with the prefetch iterator. Timing each part
-separately gives 234 us for compiled-step dispatch, 85 us for the
-prefetch iterator's `next`, and 22 us for jitted `bookkeep`. Checking batch
-shapes and row counts, and the profiler regions, cost under 1 us each.
-`fit` adds about 0.2 ms of host work a step. Device work longer than
-about 0.6 ms hides this cost.
+The fit row includes its logging, which waits on the device once an
+interval. On the cpu-smoke decoder, with 0.3 ms of device work, the host
+sets the step time. There `Trainer.fit` costs 0.51-0.62 ms a step, against
+0.31-0.37 for the bare loop and 0.32-0.44 with the prefetch iterator. Timed
+one by one, its pieces are the compiled step's dispatch (234 us), the
+prefetch iterator's `next` (85 us), the jitted `bookkeep` (22 us), and the
+batch's shapes, its row count and the profiler regions (under 1 us each). So
+`fit` adds about 0.2 ms of host work a step, and any step that keeps the
+device busy for longer than about 0.6 ms hides it.
 
 ### Antipattern audit
 
-This audit checked `src/dew` for nine classes of performance antipattern
-using the small preset. Each row gives the measured cost and any fix.
+I audited `src/dew` for nine classes of performance antipattern, measuring
+on the small preset. Each row names the cost found and what I did about it.
 
 | class | site | what was measured | verdict |
 |---|---|---|---|
@@ -515,18 +515,17 @@ using the small preset. Each row gives the measured cost and any fix.
 | 8 compile time | `Trainer.compile` | one compile per fit (class 2 row); the FLOP count reads the same executable | none found; the persistent cache was not timed this pass |
 | 9 memory | peak against the state, run-ahead against lockstep | simple_dit 0.82 GiB peak on a 303 MiB state, unchanged by run-ahead; hierarchical_mmdit 3.50 GiB on 847 MiB, 1.65 GiB of it the xla attention's fp32 logits | fixed by the class-5 row |
 
-The audit did not measure `jax_default_matmul_precision` settings, remat on
-a step that fits in memory, XLA flags other than command buffers, or the
-cost of the class-1 eager scalars. It gives no conclusions about them.
-`bfloat16` matmul precision would change the fp32 head's numerics; the
-precision rule refuses it.
+The audit did not measure the `jax_default_matmul_precision` settings, remat
+on a step that fits in memory, XLA flags other than command buffers, or the
+cost of the class-1 eager scalars. (`bfloat16` matmul precision would change
+the numerics of the fp32 head, and the precision rule refuses it anyway.)
 
 Correction, 2026-09-22, checked against current main. The jitted `bookkeep`
 from the first class-1 row is on main (`src/dew/training/trainer.py`, called
-from `Trainer.fit`). The class-5 row about `objective.py:141` describes old
-code. The diffusion objective now encodes the unconditional prompt once
-at construction. Each step casts the stored encoding to the batch's
-dtypes (`DiffusionObjective.blank_conditions` in
+from `Trainer.fit`). The class-5 row about `objective.py:141` no longer
+matches the code. The diffusion objective encodes the unconditional prompt
+once, when it is built, and each step only casts that stored encoding to the
+batch's dtypes (`DiffusionObjective.blank_conditions` in
 `src/dew/objectives/diffusion/objective.py`).
 
 ### Comparison with PyTorch
@@ -534,7 +533,7 @@ dtypes (`DiffusionObjective.blank_conditions` in
 `tools/benchmark_torch.py` ran in a fresh venv with torch 2.14.0+cu130 and
 cuDNN 9.24. The run the week before used 2.11.0+cu128 with cuDNN 9.19. The
 flags were `--mode compile --warmup 20 --steps 100`, with the small presets
-and one process per row. The dew columns reproduce rows from
+and one process per row. The dew columns are the rows of
 `docs/benchmarks.md` and the table above:
 
 | case | dew ms/step | torch compile, reference attention | torch compile, SDPA cudnn | dew against the best torch row |
@@ -542,25 +541,25 @@ and one process per row. The dew columns reproduce rows from
 | simple_dit | 7.02 | 9.28 | 8.39 | 1.19x faster |
 | causal_transformer | 88.78 | 81.50 | 72.46 | 0.82x, torch faster by 18% |
 
-The previous week's decoder ratio was 0.95x, comparing the parity
-benchmark's fixed-batch decoder (75.70) with torch's 72.18. The dew row
-here uses the benchmark's prefetching loop and takes 88.78. The two dew
-times differ by 13 ms. The chunked head accounts for 1.9 ms, and decoder
-changes since `6b0f119` account for 3.8 ms. The remaining 7.6 ms separates
-the fixed-batch row from this tool's loop at the same commit: `6b0f119`
-reran at 83.26 here on the same day. The DiT ratio rose from 1.16x the
-week before to 1.19x. With the newer torch, its SDPA row is 0.4 ms slower
-than the week before.
+The week before, the decoder read 0.95x, but that figure compared the parity
+benchmark's fixed-batch decoder row (75.70) with torch's 72.18. The dew row
+here is the benchmark's own prefetching loop, at 88.78, so the two dew
+numbers are 13 ms apart. Of that, 1.9 ms is the chunked head and 3.8 ms is
+the decoder's own changes since `6b0f119`. The remaining 7.6 ms is the gap
+between the fixed-batch row and this tool's loop at the same commit
+(`6b0f119` reruns at 83.26 here on the same day). The DiT went from 1.16x
+the week before to 1.19x. On the newer torch, torch's SDPA row is 0.4 ms
+slower than the week before.
 
-Correction, 2026-10-01. The 0.82x row compared different batch methods.
-Dew placed a fresh batch every step, while torch without `--h2d` kept one
-batch on the device. The 7.6 ms was never shown to be loop overhead.
-At `42ddfc14`, both tools use matching batch methods.
-`tools/benchmark_step.py --fixed-batch` is compared with
-`tools/benchmark_torch.py` without `--h2d`. The default fresh-batch loop
-is compared with `--h2d`, which copies pinned host memory every step.
-Versions and flags: torch 2.13.0+cu130, transformers 5.17.0, `--mode compile --attention
-sdpa`, `--warmup 20 --steps 100`, one process per row:
+Correction, 2026-10-01. The 0.82x row set Dew's loop, which places a fresh
+batch every step, against torch's run without `--h2d`, which keeps one batch
+on the device, and nothing showed that the 7.6 ms was loop overhead. At
+`42ddfc14` I compared the two tools like with like: `tools/benchmark_step.py
+--fixed-batch` against `tools/benchmark_torch.py` without `--h2d`, and Dew's
+default fresh-batch loop against `--h2d` (pinned host memory, copied every
+step). The runs used torch 2.13.0+cu130, transformers 5.17.0, `--mode
+compile --attention sdpa` and `--warmup 20 --steps 100`, with one process
+per row:
 
 | case | Dew, fixed | Dew, fresh | torch.compile, fixed | torch.compile, `--h2d` | Dew against torch, fixed / fresh |
 |---|---:|---:|---:|---:|---:|
@@ -568,40 +567,39 @@ sdpa`, `--warmup 20 --steps 100`, one process per row:
 | simple_dit, small preset | 7.46 | 7.43 | 8.53 (cudnn) | 8.07 (cudnn) | 1.14x / 1.09x |
 | simple_dit, width 768, 12 layers, batch 32 (`--size large`) | 76.09 | 76.11 | 76.40 (flash), 78.18 (cudnn) | 76.51 (flash), 78.38 (cudnn) | 1.00x / 1.01x |
 
-The torch decoder computes its head's product in bf16
-(`--head-dtype bfloat16`, now the twin's default), as Dew's LM objective
-does. With the twin's earlier fp32 head, torch took 72.38 ms. Neither a
-fresh batch nor `Trainer.fit` adds measurable cost to Dew's steps in
-these rows (the host-time correction above).
+The torch decoder computes its head's product in bf16 (`--head-dtype
+bfloat16`, now the twin's default), as Dew's LM objective does; with the
+fp32 head the twin used before, torch ran at 72.38 ms. On these rows a fresh
+batch costs Dew nothing measurable, and `Trainer.fit` adds nothing on top
+(the host-time correction above).
 
-At `42ddfc14`, the vocabulary head accounted for the decoder's 14 ms gap.
-With 8192 tokens, vocabulary 50304 and three layers, the head is most of
-the step. Dew kept fp32 logits and computed the state gradient from their
-fp32 cotangent as two products: a bf16 high half and the remainder. Torch
-rounds both logits and cotangent to bf16.
+At `42ddfc14` the decoder's 14 ms gap was its vocabulary head. With 8192
+tokens, vocabulary 50304 and three layers, the head is most of the step. Dew
+kept the logits in fp32 and fed their fp32 cotangent into the state product
+as two products, one of a bf16 high half and one of the rest; torch rounds
+both the logits and the cotangent to bf16. Three changes since then took the
+decoder to 52.2 ms against torch's 49.4 (the scoreboard above): the
+log-sum-exp and argmax in one pass, one bf16 copy of the cotangent for both
+products, and torch's rounding of the logits and their cotangent at the
+default precision.
 
-Three later changes reduced the decoder to 52.2 ms against torch's 49.4
-(the scoreboard above). The head computes log-sum-exp and argmax in one
-pass, makes one bf16 cotangent copy for both gradient products, and uses
-torch's rounding of logits and cotangent at default precision.
+I traced both at `42ddfc14`, XProf with command buffers off against
+torch.profiler. In ms per step, the forward's log-sum-exp and argmax read
+the fp32 logits in two passes, 5.1 against 1.3 for torch's fused
+log-softmax. The backward wrote the logits' cotangent three times in bf16
+(the high half, the rest, and the plain rounding for the head's own
+gradient), 6.7 against 2.7. Dew's GEMMs took 39.4 against torch's 33.9,
+about 3 of it from running the state product twice. Attention is 1.7 against
+1.3.
 
-XProf with command buffers off and torch.profiler measured these costs
-per step. The forward's two passes over fp32 logits for log-sum-exp and
-argmax took 5.1 ms, against 1.3 for torch's fused log-softmax. The
-backward wrote the logits' cotangent three times in bf16: the high half,
-the remainder and the plain rounding for the head's own gradient. This
-took 6.7 against 2.7. Computing the state product twice accounted for
-about 3 of Dew's 39.4 ms of GEMMs, against torch's 33.9. Attention takes
-1.7 against 1.3.
-
-For the large DiT, XProf with command buffers off and torch.profiler
-measured a different balance of work. GEMMs take 44.5 ms a step against
-47.2. The optimizer update takes 6.9 against 16.2 because XLA fuses Adam
-and EMA into one state pass. Attention takes 5.3 against 4.4 for
-FlashAttention-2. CuDNN's attention time includes forward at 0.9, backward
-at 2.9 and two pre-Hopper backward helpers at 1.5. Dew's reductions and
-converts take 16.5 (bias gradients with GELU backward 5.4, norm statistics
-1.9). Torch's elementwise and norm kernels take 5.8, and copies take 8.9.
+On the large DiT the two frameworks spend the step differently (same
+profilers, ms per step). GEMMs take 44.5 against 47.2. The optimizer update
+takes 6.9 against 16.2, because XLA fuses Adam and the EMA into one pass
+over the state. Attention takes 5.3 against 4.4 for FlashAttention-2;
+cuDNN's 5.3 is its forward at 0.9, its backward at 2.9 and its two
+pre-Hopper backward helpers at 1.5. Dew's reductions and converts take 16.5
+(the bias gradients with the GELU backward 5.4, the norm statistics 1.9),
+against 5.8 for torch's elementwise and norm kernels and 8.9 for its copies.
 
 ## Attention kernels
 
