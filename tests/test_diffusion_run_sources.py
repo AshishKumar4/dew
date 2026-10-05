@@ -157,6 +157,49 @@ def test_sd3_trains_at_its_static_shift_at_any_size(size, pipelines):
     assert flow_run("sd3", size, pipelines).build().process.schedule.shift == 3.0
 
 
+@pytest.mark.parametrize("family", ["sd3", "flux"])
+def test_a_published_flow_pipeline_trains_on_the_sd3_papers_convention(family, pipelines):
+    """`training_process` follows Esser et al. 2024 rather than the Diffusers
+    scripts' command-line defaults: logit-normal times (mean 0, std 1) at
+    the shift the pipeline's sampler walks, scored on the velocity at unit
+    weight (docs/guides/diffusion.md says where the scripts differ)."""
+    process = flow_run(family, 16, pipelines).build().process
+    schedule = process.schedule
+    assert (schedule.density, schedule.logit_mean, schedule.logit_std) == ("logit_normal", 0.0, 1.0)
+    assert process.to_json()["weighting"] == {"name": "ScheduleWeighting", "fields": {}}
+    assert process.to_json()["prediction"]["name"] == "FlowMatchPredictionTransform"
+
+
+DRAWS = dict(np.load(FIXTURES / "flow" / "draws.npz"))
+
+
+@pytest.mark.parametrize("family,preset", [
+    ("sd3", Flow(shift=3.0)),
+    ("flux", Flow(shift=1.0, density="uniform")),
+], ids=["sd3", "flux"])
+def test_a_flow_preset_reproduces_a_diffusers_scripts_default_draw_and_weighting(family, preset):
+    """tools/flow_draw_reference.py runs Diffusers 0.34.0's SD3 and Flux
+    DreamBooth scripts' own draw-to-weighting statements, at their own
+    defaults and over the published scheduler files, on this preset's
+    draws (reflected, as the scripts' tables descend). The scripts index a
+    1000-entry table where Dew draws a continuous time, so each noise level
+    is the preset's or above it by at most the table's step there; the
+    weights are equal, all one."""
+    schedule = preset().schedule
+    times = np.asarray(schedule.sample_t(jax.random.key(int(DRAWS["key"])), DRAWS[f"{family}/times"].size))
+    np.testing.assert_array_equal(times, DRAWS[f"{family}/times"])
+    wide = times.astype(np.float64)
+
+    def shifted(t):
+        return schedule.shift * t / (1 + (schedule.shift - 1) * t)
+
+    above = DRAWS[f"{family}/sigmas"].astype(np.float64) - np.asarray(schedule.rates(times)[1], np.float64)
+    step = shifted(np.minimum(wide + 1 / 1000, 1)) - shifted(wide)
+    slack = 4 * np.finfo(np.float32).eps
+    assert above.min() >= -slack and np.all(above <= step + slack), (above.min(), float((above - step).max()))
+    np.testing.assert_array_equal(np.asarray(schedule.weight(times)), DRAWS[f"{family}/weighting"])
+
+
 SHIFTS = dict(np.load(FIXTURES / "flow" / "resolution_shift.npz"))
 
 
