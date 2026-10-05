@@ -9,7 +9,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import assert_computes_the_oracle, chain_roundings
 
 from dew.artifacts import ImageGrid
 from dew.eval import LPIPS
@@ -42,8 +42,12 @@ def test_the_distance_and_its_gradient_are_repa_es():
     converted by the same `variables_from_torch` the published weights go
     through: each pair's distance is within 1e-6 of REPA-E's float64 run,
     and the gradient of their mean in the first image, what the perceptual
-    loss trains an autoencoder by, is held to it by the float64 rule over
-    24,576 entries.
+    loss trains an autoencoder by, is Dew's float64 run within the float64
+    rounding of the computation of REPA-E's (24,576 entries). The gradient
+    passes VGG's ReLUs and pools, whose nearest input sits 3.45 times Dew's
+    own float32 error from its kink, so another codegen's float32 could take
+    the other branch, a step the float32 rule does not model; in float64
+    both runs take one.
 
     Two distances are too few for the rule's RMS, so they take a bound:
     Dew's are 5.7e-8 and 4.4e-8 relative from float64, the reference's own
@@ -53,23 +57,28 @@ def test_the_distance_and_its_gradient_are_repa_es():
     vgg, linear = drawn_weights()
     for key, value in {**vgg, **linear}.items():
         # The fixture's sum is numpy's, whose order follows the CPU's SIMD
-        # width, so it carries up to n·u·Σ|x| of float64 rounding (7.5e-9 on
-        # one conv's 1.2M entries, one CI runner against another); ours is
-        # math.fsum's, rounded once. A different draw moves a sum by ~30.
+        # width, so it carries up to n·ε·Σ|x| of float64 rounding, ε numpy's
+        # eps (7.5e-9 on one conv's 1.2M entries, one CI runner against
+        # another); ours is math.fsum's, rounded once. A different draw moves
+        # a sum by ~30.
         entries = value.astype(np.float64).ravel()
         bound = entries.size * np.finfo(np.float64).eps * np.abs(entries).sum()
         assert abs(math.fsum(entries) - reference[f"sum/{key}"]) <= bound, key
     network, variables = LPIPSNetwork(), variables_from_torch(vgg, linear)
     images, references = (jnp.asarray(reference[key], jnp.float32) for key in ("images", "references"))
-
-    def mean(first):
-        return jnp.mean(network.apply(variables, first, references))
-
     distance = network.apply(variables, images, references)
-    gradient = jax.grad(mean)(images)
     np.testing.assert_allclose(np.asarray(distance), reference["distance_f64"], rtol=1e-6)
-    assert_as_exact_as_the_reference(gradient, reference["gradient"], reference["gradient_f64"],
-                                     "the gradient")
+
+    with jax.enable_x64(new_val=True):
+        wide = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), variables)
+        first, second = (jnp.asarray(reference[key], jnp.float64) for key in ("images", "references"))
+
+        def mean(images):
+            return jnp.mean(network.apply(wide, images, second))
+
+        gradient = np.asarray(jax.grad(mean)(first))
+        roundings = chain_roundings(jax.make_jaxpr(jax.grad(mean))(first))
+    assert_computes_the_oracle(gradient, reference["gradient_f64"], "the gradient", roundings=roundings)
 
 
 @pytest.mark.network

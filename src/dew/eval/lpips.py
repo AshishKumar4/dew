@@ -42,9 +42,10 @@ from dew.registry import metrics
 from .common import ImageMetric, paired
 from .psnr import frame_batch
 
-SHIFT = (-0.030, -0.088, -0.188)
-SCALE = (0.458, 0.448, 0.450)
-"""LPIPS's `ScalingLayer`: the per-channel shift and scale of [-1, 1] pixels."""
+SHIFT = tuple(np.asarray((-0.030, -0.088, -0.188), np.float32).tolist())
+SCALE = tuple(np.asarray((0.458, 0.448, 0.450), np.float32).tolist())
+"""LPIPS's `ScalingLayer`: the per-channel shift and scale of [-1, 1] pixels,
+as the float32 numbers its `torch.Tensor` buffers hold, at any precision."""
 
 STAGES = ((64, 64), (128, 128), (256, 256, 256), (512, 512, 512), (512, 512, 512))
 """VGG16's convolution widths, stage by stage; a 2x2 max pool opens every

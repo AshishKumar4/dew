@@ -528,7 +528,8 @@ class DiffusionObjective(Objective[Ratio]):
         unconditional = self.blank_conditions(given)
         if dropout:
             count = batch[self.inputs.sample.key].shape[0]
-            dropped = jax.random.bernoulli(key, self.unconditional_prob, (count,))
+            # A float32 draw, as the step's others are, at any precision.
+            dropped = jax.random.bernoulli(key, jnp.float32(self.unconditional_prob), (count,))
             given = jax.tree.map(
                 lambda value, blank: jnp.where(
                     expand(dropped, value), jnp.broadcast_to(blank, value.shape), value),
@@ -570,6 +571,9 @@ class DiffusionObjective(Objective[Ratio]):
         else:
             samples = images
         noise = jax.random.normal(noise_key, samples.shape, dtype=jnp.float32)
+        # The times are drawn in float32 and read at the samples' precision,
+        # so a float64 run interpolates in float64.
+        t = t.astype(jnp.promote_types(samples.dtype, t.dtype))
 
         call = {**conditions, "train": True, "rngs": {"dropout": dropout_key}}
         losses, aligned = self._denoised(variables, self.model_variables(variables), samples, t, noise, call,
