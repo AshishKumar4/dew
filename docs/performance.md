@@ -666,7 +666,7 @@ At 64-wide shapes, tokamax matches cuDNN's errors (dq and dk 4.8e-3 to
 8.5e-3 because its backward computes `rowsum(o * do)` as a bf16 product.
 An fp32 product matches cuDNN's errors at the same speed.
 
-Tokamax reduces training time at 64-wide heads. On SimpleDiT-B at batch
+Tokamax reduces training time at 64-wide heads but not at 128. On SimpleDiT-B at batch
 32, attention falls from 5.62 to 4.33 ms and the step from 73.1 to 71.5.
 For the 3-layer decoder, attention falls from 1.82 to 1.24 ms and the
 step from 50.8 to 50.2. At Qwen3-0.6B's widths with 1 x 1024, attention
