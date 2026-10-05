@@ -154,10 +154,11 @@ def _qwen3_moe_config(hf_config: Mapping[str, object], used: set[str]) -> Decode
         _refuse("mlp_only_layers with decoder_sparse_step",
                 "together they leave no routed layer, which is a dense qwen3 model")
     expert_count = records.integer(experts, 'num_experts/num_local_experts')
+    norm_topk = bool(hf_config.get('norm_topk_prob', False))
     expert_width = records.integer(hf_config['moe_intermediate_size'], 'moe_intermediate_size')
     config['mixture'] = native_fields(Mixture)(
         top_k=_softmax_top_k(hf_config, used), experts=expert_count, layers=sparse,
-        norm_topk_prob=bool(hf_config.get('norm_topk_prob', False)),
+        norm_topk_prob=norm_topk,
         expert_features=expert_width)
     return config
 
@@ -266,11 +267,12 @@ def _qwen3_next_config(hf_config: Mapping[str, object], used: set[str]) -> Decod
     )
     # `num_experts > 0` gates the routed block too (modeling_qwen3_next.py:814).
     if sparse and experts > 0:
+        norm_topk = bool(hf_config.get('norm_topk_prob', True))
         expert_width = _record_int(hf_config, 'moe_intermediate_size')
         shared_width = _record_int(hf_config, 'shared_expert_intermediate_size')
         config['mixture'] = native_fields(Mixture)(
             top_k=_softmax_top_k(hf_config, used), experts=experts, layers=sparse,
-            norm_topk_prob=bool(hf_config.get('norm_topk_prob', True)),
+            norm_topk_prob=norm_topk,
             expert_features=expert_width, shared_features=shared_width,
             shared_gate=True)
     config['num_nextn_predict_layers'] = _single_prediction_depth(hf_config, used, 'num_nextn_predict_layers')
