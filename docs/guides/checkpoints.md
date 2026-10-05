@@ -108,8 +108,10 @@ final step: 10 latest: 10
 | `path(step)` | The directory of one step. |
 | `restore(template, step=None)` | Read the latest full state, a numbered step, `"best"`, or `"best:<metric key>"` into the structure of `template`. |
 | `stored(step=None)` | The shapes and dtypes each saved state field holds, without reading values. |
+| `save_tree(step, tree, metrics=None, *, ranking=None, control=None)` | Write a plain pytree, such as a simulation's state, in place of a `TrainState`. Writes are asynchronous and sharded, and `keep`, `ranking`, `latest` and `best` apply as they do to training checkpoints. |
+| `restore_tree(template=None, step=None)` | Read a `save_tree` checkpoint into the structure and shardings of `template`, or as host arrays without one. A training checkpoint is refused. |
 | `wait()` | Block until asynchronous saves have finished. |
-| `kept()` | Committed steps with their metrics, ranking rules and state/weights kind. |
+| `kept()` | Committed steps with their metrics, ranking rules and kind (`state`, `weights` or `tree`). |
 | `profile_steps()`, `profile_metadata(step)`, `restore_profiles(step)` | The post-hoc EMA snapshots (below). |
 
 Saves are asynchronous, and `wait()` returns once they are durable. Constructing `Checkpoints` opens nothing, because the Orbax managers are created on first use.

@@ -5,7 +5,10 @@ data iterator can report one, `position`. Metrics, the loss scale and epoch
 counters belong to the training loop, which rebuilds them on resume. A position
 is either global, which any partition of the data can read, or one share's own
 offset, which only a reader of that same share can read; `dew.position` marks
-the difference and `read_position` acts on it.
+the difference and `read_position` acts on it. A state that is not a training
+run's, such as a simulation's, is written as one plain pytree by `save_tree`
+and read by `restore_tree`, with the same asynchronous writes, retention and
+step index.
 
 The EMA copy is stored as its difference from the weights. Each EMA leaf with
 its weight's floating dtype and shape is stored as the XOR of the two, split
@@ -67,6 +70,14 @@ if TYPE_CHECKING:
 # gathered data position rides along under its own name as uint8 rows.
 type StateLeaf = (jax.Array | np.ndarray | Variables | optax.OptState
                   | DynamicScale | Accumulation | None)
+
+# A plain pytree `save_tree` writes: arrays, or shapes and dtypes standing
+# for them in a template, in mappings and sequences.
+type StateTree = (jax.Array | jax.ShapeDtypeStruct | np.ndarray | Mapping[str, StateTree]
+                  | Sequence[StateTree] | None)
+
+TREE = "tree"
+"""The one item a `save_tree` checkpoint holds, the tree it was given."""
 
 STATE_LEAVES = ("step", "microstep", "updates", "variables", "opt_state", "ema", "key",
                 "scale", "window_size", "accumulation")
@@ -333,7 +344,7 @@ def read_position(table: dict, where: str, share: DataPartition) -> bytes:
     return mine[0]
 
 
-def _written_in_place(tree: Mapping[str, StateLeaf]) -> bool:
+def _written_in_place(tree: Mapping[str, StateLeaf | StateTree]) -> bool:
     """Whether orbax writes an array of `tree` from the array's own buffer.
 
     Orbax copies each array to host memory before its async write and holds
@@ -700,7 +711,7 @@ class Checkpoints:
             metrics=Metrics(metadata.metrics or {}),
             ranked_by=custom.get('primary') or next(iter(rules), None),
             mode=selection.get('mode'),
-            kind='weights' if custom.get('weights_only') else 'state',
+            kind='weights' if custom.get('weights_only') else 'tree' if custom.get('tree') else 'state',
             rankings=copy.deepcopy(rules))
         self._step_cache[step] = checkpoint
         self._custom_cache[step] = copy.deepcopy(custom)
@@ -954,13 +965,49 @@ class Checkpoints:
         state_tree, deltas = _with_ema_deltas(self._item(state, saved, share))
         if weights_only:
             state_tree = {name: state_tree[name] for name in ('variables', 'ema')}
-        persistent = self._open()
-        self._metadata = None
         if profiles is not None:
             self._profile_snapshots.add(step)
         scores = dict(metrics or {})
         if weights_only:
             scores['checkpoint/weights_only'] = 1.0
+        self._commit(step, state_tree, scores, ranking, primary, {
+            "ema_deltas": deltas,
+            "profiles": profile_metadata,
+            "control": copy.deepcopy(control or {}),
+            "weights_only": weights_only,
+            "rung": rung,
+            "artifact": artifact,
+        })
+
+    def save_tree(
+        self,
+        step: int,
+        tree: StateTree,
+        metrics: Mapping[str, float] | None = None,
+        *,
+        ranking: Ranking | Sequence[Ranking] | None = None,
+        control: dict | None = None,
+    ) -> None:
+        """Write a plain pytree of arrays under `step`, asynchronously.
+
+        This is the checkpoint for a state that is not a `TrainState`, such
+        as a simulation's, which has no optimizer, average or loss scale.
+        It is written as `save` writes a train state: sharded arrays go
+        straight to Orbax from every process, `keep` and `ranking` retain
+        steps as they do for training checkpoints, `latest` and `best` index
+        them, and `control` is returned by `control(step)`. `restore_tree`
+        reads it back. A train state's own checkpoint resumes only through
+        `restore`, so the step records which of the two it holds.
+        """
+        self._commit(step, {TREE: tree}, dict(metrics or {}), ranking, None,
+                     {"tree": True, "control": copy.deepcopy(control or {})})
+
+    def _commit(self, step: int, written: Mapping[str, StateLeaf | StateTree], scores: dict[str, float],
+                ranking: Ranking | Sequence[Ranking] | None, primary: str | None, custom: dict) -> None:
+        """Submit `written` to the persistent manager under `step`, with `scores`,
+        the rankings' scores and `custom` as the step's metadata."""
+        persistent = self._open()
+        self._metadata = None
         rankings = () if ranking is None else (ranking,) if isinstance(ranking, Ranking) else ranking
         rules = {}
         for rank in rankings:
@@ -975,23 +1022,18 @@ class Checkpoints:
         with region("checkpoint.submit"):
             persistent.save(
                 step,
-                args=ocp.args.PyTreeSave(state_tree),
+                args=ocp.args.PyTreeSave(written),
                 metrics=scores,
                 force=True,
                 custom_metadata={
-                    "ema_deltas": deltas,
-                    "profiles": profile_metadata,
+                    **custom,
                     "rankings": rules,
                     "primary": primary or (rankings[0].metric if rankings else None),
-                    "control": copy.deepcopy(control or {}),
-                    "weights_only": weights_only,
-                    "rung": rung,
-                    "artifact": artifact,
                 },
             )
         self._pending = (step, scores)
-        # Pinned-host state is written before returning; the docstring says why.
-        if _written_in_place(state_tree):
+        # Pinned-host state is written before returning; `save`'s docstring says why.
+        if _written_in_place(written):
             with region("checkpoint.write_in_place"):
                 persistent.wait_until_finished()
 
@@ -1300,6 +1342,11 @@ class Checkpoints:
                 restored = checkpointer.restore(step, args=ocp.args.PyTreeRestore(
                     item=state_tree, restore_args=restore_args, partial_restore=True))
             except (TypeError, ValueError) as mismatch:
+                if (snapshot.custom_metadata or {}).get("tree"):
+                    raise ValueError(
+                        f"The checkpoint at {where} holds a tree that does not fit this "
+                        f"template ({mismatch}); restore it with the structure, shapes "
+                        f"and dtypes it was written with.") from mismatch
                 # Model, optimizer and retained record shapes are a resume contract.
                 raise ValueError(
                     f"The checkpoint at {where} does not fit this run's "
@@ -1369,6 +1416,36 @@ class Checkpoints:
             sharding = getattr(target, "sharding", None)
             return value if sharding is None else jax.device_put(value, sharding)
         return jax.tree_util.tree_map_with_path(average, restored['ema'])
+
+    @overload
+    def restore_tree[TreeT: StateTree](self, template: TreeT, step: int | str | None = None) -> TreeT: ...
+
+    @overload
+    def restore_tree(self, template: None = None, step: int | str | None = None) -> StateTree: ...
+
+    def restore_tree(self, template: StateTree = None, step: int | str | None = None) -> StateTree:
+        """Read the tree `save_tree` wrote at `step`, the latest by default.
+
+        `template` is the tree's structure with `jax.ShapeDtypeStruct`
+        leaves, and each array is placed on its leaf's sharding, so a tree
+        written on one mesh restores onto another. `None` reads every leaf
+        as a host array. A train state's checkpoint is refused, since its
+        fields are not one tree.
+        """
+        step = self.resolve(step)
+        if step is None:
+            step = self.latest
+            if step is None:
+                raise FileNotFoundError(f"{self.directory} holds no checkpoint")
+        snapshot = self._step_metadata(step, local=step == self._local_latest())
+        if not (snapshot.custom_metadata or {}).get("tree"):
+            raise ValueError(f"the checkpoint at {self.path(step)} holds a train state, not a tree; "
+                             f"read it with restore")
+        if template is None:
+            restored, _ = self.restore(step=step)
+        else:
+            restored, _ = self.restore({TREE: template}, step)
+        return restored[TREE]
 
     def _check_placement(self, step: int, state_tree: Mapping[str, StateLeaf]) -> None:
         """Refuse a local step written for another placement of the state."""
