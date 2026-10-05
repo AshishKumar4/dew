@@ -40,9 +40,12 @@ server.run()
 for ticket in tickets:
     if not ticket.result().text[0]:
         raise RuntimeError('the pinned text task returned no text')
-report = {'apt_packages': subprocess.check_output(
+report = {'os_release': Path('/etc/os-release').read_text(),
+          'base_image': 'cloudflare/debian-trixie',
+          'apt_packages': subprocess.check_output(
               ['dpkg-query', '-W', '-f=${binary:Package}=${Version}\n'], text=True).splitlines(),
-          'pip_freeze': subprocess.check_output([sys.executable, '-m', 'pip', 'freeze'], text=True).splitlines(),
+          'pip_freeze': subprocess.check_output(
+              [sys.executable, '-m', 'pip', 'freeze'], text=True).splitlines(),
           'dew': (root / 'dew-commit').read_text().strip(), 'jax': jax.__version__,
           'warm_seconds': time.perf_counter() - started, 'xla_flags': os.environ.get('XLA_FLAGS'),
           'cache_bytes': sum(p.stat().st_size for p in Path('/opt/xla').rglob('*') if p.is_file())}
