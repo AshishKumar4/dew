@@ -116,33 +116,39 @@ FlashAttention-2 takes 2.05 and 4.56. No alternative on this stack closes
 that gap ("At 128-wide heads" below).
 
 A100 40 GB (Colab). The first rows come from one session at integration
-`6a220e31` (c15: jax 0.11.2.post3, torch 2.13.0+cu130, transformers
-5.17.0). Dew and torch.compile alternated, with two processes each where
-a range is given. The remaining rows are the latest earlier records:
+`f08009d7` (c17: jax 0.11.2.post3, torch 2.13.0+cu130, transformers
+5.17.0). Dew and torch.compile alternated, with two processes each where a
+range is given. Each pair's losses agree to within 0.007 over 40 steps. The
+remaining rows are the latest earlier records:
 
 | model | step | Dew | reference | Dew / reference | Dew commit |
 |---|---|---:|---:|---:|---|
-| Qwen3-0.6B, pretrained | 4 x 1024 tokens, AdamW | 128.4-129.0 ms, MFU 43.6-43.8% | torch.compile 138.7 ms, 40.5% | 1.08 | `6a220e31` |
-| 99M Qwen3-MoE shape, 8 experts, top 2 | 8 x 1024 tokens, AdamW | 45.5 ms | torch.compile 106.3-108.2 ms | 2.36 | `6a220e31` |
-| SimpleDiT, width 768, 12 layers, 64 px | batch 32, Adam, EMA | 39.1 ms (fresh batch or one on the device) | 38.2 ms (flash, one batch on the device), 38.4 (fresh) | 0.98 | `6a220e31` |
-| 176M hybrid DiT (published config) | batch 16 / 32 | 44.5 / 64.1 ms | no torch port | | `6a220e31` |
+| Qwen3-0.6B, pretrained | 4 x 1024 tokens, AdamW | 125.2-125.3 ms, MFU 44.8-44.9% | torch.compile 139.3-139.7 ms, 40.2-40.3% | 1.11 | `f08009d7` |
+| Qwen3-1.7B, pretrained | 1 x 1024 tokens, AdamW | 109.2 ms, MFU 33.1% | torch.compile 140.2 ms, 25.8% | 1.28 | `f08009d7` |
+| Qwen3-1.7B, pretrained | 2 x 1024 tokens, AdamW | 179.3 ms, MFU 40.4% | torch.compile 202.3 ms, 35.8% | 1.13 | `f08009d7` |
+| 99M Qwen3-MoE shape, 8 experts, top 2 | 8 x 1024 tokens, AdamW | 45.4 ms | torch.compile 118.2-118.7 ms | 2.61 | `f08009d7` |
+| SimpleDiT, width 768, 12 layers, 64 px | batch 32, Adam, EMA | 38.25-38.26 ms fresh, 38.22-38.29 on the device; with tokamax 37.87-37.88 | flash: 38.15-38.23 ms on the device, 38.48-38.53 fresh | 1.00 (1.01 with tokamax) | `f08009d7` |
+| 176M hybrid DiT (published config) | batch 16 / 32 | 41.0 / 62.8-62.9 ms (the same with tokamax) | no torch port | | `f08009d7` |
 | Qwen3-0.6B, pretrained | 4 x 1024 tokens | 161.9 ms | MaxText 0.2.4 GPU recipe 164.9 ms | 1.02 | `157bc21a` |
 | mamba2-130m | 4 x 1024 tokens | 127.9 ms | torch with mamba_ssm kernels, eager, 172.5 ms | 1.35 | `9490c9e6` |
 | SimpleDiT, width 384, 8 layers, 64 px | batch 64, EMA | 21.9 ms | flaxdiff 21.4 ms | 0.98 | `9490c9e6` |
 
-From `8c391009` to `6a220e31`, Qwen3-0.6B at 4 x 1024 fell from 141.0
-to 128.7 ms, and the MoE from 74.4 to 45.5. Dew also uses less device
-time on both models. Qwen3-0.6B takes 128.4 ms against torch's 136.1 ms
-busy: GEMMs 64.2 against 70.9, attention 21.6 against 16.7 (cuDNN's sm80
-kernels against FlashAttention-2), and the update and casts 30.4 against
-37.0 for torch's copies and optimizer. The MoE takes 45.1 against 78.1;
-torch also idles on the host for 86 ms a step.
+From `6a220e31` to `f08009d7`, Qwen3-0.6B at 4 x 1024 went from 128.7 to
+125.3 ms and the hybrid DiT from 44.5 / 64.1 to 41.0 / 62.9 ms. SimpleDiT,
+2% slower in the earlier session, now ties torch.compile with a fresh batch
+on both sides and on the device on both sides. With tokamax installed, whose
+Pallas kernel `auto` takes at its 64-wide heads, it is 0.8% faster.
+JAX's own Pallas-Triton `mha` was no faster here either. In the step at
+Qwen3-0.6B's 128-wide heads it took 131.3-131.9 against cuDNN's 125.3-126.1
+ms at 4 x 1024, and 78.0-78.2 against 77.0-77.1 at 2 x 1024. One call
+forward and backward took 0.37 against cuDNN's 0.39 ms at 1 x 1024, and
+1.10 against 1.06 at 4 x 1024.
 
-SimpleDiT is 2% slower in Dew, the only loss on the A100. Neither
-framework was traced in that session. On the RTX 4080, the same model's
-attention is slower (cuDNN's kernels take 5.6 ms a step against
-FlashAttention-2's 4.4, below), but its faster optimizer makes up the
-difference there.
+At `6a220e31` Qwen3-0.6B took 128.4 ms against torch's 136.1 ms busy:
+GEMMs 64.2 against 70.9, attention 21.6 against 16.7 (cuDNN's sm80 kernels
+against FlashAttention-2), and the update and casts 30.4 against 37.0 for
+torch's copies and optimizer. The MoE took 45.1 against 78.1; torch also
+idles on the host for 86 ms a step.
 
 The older rows predate every change listed above. For Qwen3-0.6B at
 `8c391009`, torch idled on the host for 18.3 ms a step. Its device did
