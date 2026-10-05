@@ -41,6 +41,7 @@ from dew.nn.linear import (
     _masked_conv1d,
     _stream_order,
     causal_conv1d,
+    chunk_decay,
     chunk_gated_delta_rule,
     l2norm,
     recurrent_gated_delta_rule,
@@ -437,6 +438,33 @@ def test_the_chunk_inverse_is_exact_where_its_series_cancels(chunk):
     np.testing.assert_allclose(strictly_lower_inverse(a), np.broadcast_to(want, a.shape), atol=1e-6)
 
 
+def test_a_decay_deep_in_a_chunk_keeps_its_own_precision():
+    """Each pairwise decay's exponent is a difference of two compensated
+    cumulative sums, rounded twice: within 2u of its own range's magnitude,
+    plus the compensated sums' own error (u^2 per term of the chunk's
+    magnitude) and exp's rounding, however far into the chunk the pair
+    sits. A difference of plain cumulative sums carries the rounding of the
+    whole accumulated magnitude instead: at g near -2 over 64 positions,
+    ~128 u on a decay between neighbours, which the KDA gradient amplified
+    to twice the reference's distance from float64 (tests/test_kimi_linear.py)."""
+    g = np.random.default_rng(7).uniform(-3, -1, (2, 64, 4)).astype(np.float32)
+    _, decay = chunk_decay(jnp.asarray(g))
+    wide = np.asarray(g, np.float64)
+    rows, cols = np.tril_indices(64)
+    ranges = [wide[:, c + 1:r + 1] for r, c in zip(rows, cols, strict=True)]
+    exponent = np.array([part.sum(1) for part in ranges])
+    magnitude = np.array([np.abs(part).sum(1) for part in ranges])
+    u = np.finfo(np.float32).eps / 2
+    got = np.asarray(decay, np.float64)[:, rows, cols].transpose(1, 0, 2)
+    kept = got > np.finfo(np.float32).tiny
+    error = np.abs(np.log(got[kept]) - exponent[kept])
+    chunk = np.broadcast_to(np.abs(wide).sum(1), magnitude.shape)[kept]
+    bound = 2 * u * magnitude[kept] + 64 * u * u * chunk + 2 * u
+    assert np.all(error <= bound), float(np.max(error / bound))
+    above = ~np.tril(np.ones((64, 64), bool))
+    assert not np.asarray(decay)[:, above].any()
+
+
 def test_the_chunked_rule_holds_with_aligned_keys():
     """Keys nearly aligned within a chunk, beta near one and slow decay, the
     case real checkpoints reach: the chunked rule still gives the
@@ -478,3 +506,28 @@ def test_the_decode_kernel_steps_as_the_recurrence_does(rows):
     got, got_state = jax.jit(decode_gated_delta_rule)(query, key, value, g, beta, state)
     np.testing.assert_allclose(got, want, atol=2e-6)
     np.testing.assert_allclose(got_state, want_state, atol=2e-6)
+
+
+@pytest.mark.skipif(jax.default_backend() != "gpu", reason="the kernel runs on CUDA")
+def test_the_decode_kernel_leaves_an_idle_row_alone():
+    """A serving step holds every slot, drawing or not. A row the step marks
+    idle keeps its state bit for bit, unread and unwritten, and outputs
+    zeros; the drawing rows step exactly as they do with every row active."""
+    from dew.nn.linear import decode_gated_delta_rule
+
+    rng = np.random.default_rng(1)
+    rows, H, D = 8, 16, 128
+    unit = [rng.normal(size=(rows, 1, H, D)) for _ in range(2)]
+    query, key = (jnp.asarray(x / np.linalg.norm(x, axis=-1, keepdims=True), jnp.float32) for x in unit)
+    value = jnp.asarray(rng.normal(size=(rows, 1, H, D)), jnp.float32)
+    g = jnp.asarray(-rng.random((rows, 1, H)) * 3, jnp.float32)
+    beta = jnp.asarray(rng.random((rows, 1, H)), jnp.float32)
+    state = jnp.asarray(rng.normal(size=(rows, H, D, D)) * 0.1, jnp.float32)
+    active = jnp.asarray([True, False, True, True, False, False, True, False])
+    every, every_state = jax.jit(decode_gated_delta_rule)(query, key, value, g, beta, state)
+    got, got_state = jax.jit(decode_gated_delta_rule)(query, key, value, g, beta, state, active)
+    drawing = np.asarray(active)
+    np.testing.assert_array_equal(np.asarray(got)[drawing], np.asarray(every)[drawing])
+    np.testing.assert_array_equal(np.asarray(got_state)[drawing], np.asarray(every_state)[drawing])
+    np.testing.assert_array_equal(np.asarray(got)[~drawing], 0)
+    np.testing.assert_array_equal(np.asarray(got_state)[~drawing], np.asarray(state)[~drawing])

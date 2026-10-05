@@ -88,7 +88,14 @@ import jax
 import ml_dtypes
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import (
+    ORDERS,
+    assert_as_exact_as_the_reference,
+    assert_as_exact_over_orders,
+    assert_computes_the_oracle,
+    distance,
+)
+from residual_orders import orders, permuted, residual_width
 
 from dew.interop import Pretrained
 from dew.interop.safetensors_io import save_hf_layout
@@ -196,8 +203,8 @@ def test_the_export_carries_the_trained_weights_not_the_loaded_ones(trip):
 
     assert set(distances) >= {"embedding", "mixer" if recurrent else "attention"} | (
         {"expert", "router"} if routed else set() if recurrent else {"feedforward"})
-    for kind, distance in distances.items():
-        assert distance > MOVEMENT, f"{kind} moved {distance:.3e}"
+    for kind, moved in distances.items():
+        assert moved > MOVEMENT, f"{kind} moved {moved:.3e}"
 
 
 def test_the_trained_export_reloads_leaf_for_leaf_and_recomputes_the_logits(trip):
@@ -213,12 +220,33 @@ def test_the_trained_export_reloads_leaf_for_leaf_and_recomputes_the_logits(trip
         tool.logits(trip.reloaded, trip.reloaded.variables, trip.ids), trip.ours)
 
 
-def test_transformers_reads_the_trained_export(trip):
+def test_transformers_reads_the_trained_export(trip, tmp_path):
     """The export is a checkpoint the reference implementation loads with a
     clean report (`tool.reference_model`), and Dew's trained logits are as
     exact as transformers' own over the exported files: tests/reference_error.py's
-    rule, against transformers in float64 over the same files."""
-    assert_as_exact_as_the_reference(trip.ours, trip.theirs, trip.truth, f"{trip.case.name} logits")
+    rule, against transformers in float64 over the same files. A case with
+    `orders` is held over ORDERS residual orders of the trained weights, each
+    exported and read by transformers, after checking in float64 that an
+    order computes the same logits."""
+    label = f"{trip.case.name} logits"
+    if not trip.case.orders:
+        assert_as_exact_as_the_reference(trip.ours, trip.theirs, trip.truth, label)
+        return
+    forward = jax.jit(trip.source.model.apply)  # one compile for every order
+    mine, theirs = [], [distance(trip.theirs, trip.truth)]
+    for k, order in enumerate(orders(residual_width(trip.trained), ORDERS, tool.SEED)):
+        variables, export = permuted(trip.trained, order), tmp_path / str(k)
+        mine.append(distance(np.asarray(forward(variables, trip.ids)), trip.truth))
+        if k == 0:
+            continue
+        trip.source.save(export, variables=variables)
+        theirs.append(distance(tool.reference_logits(trip.case, export, trip.ids), trip.truth))
+        if k == 1:
+            model = trip.source.model
+            roundings = model.num_layers * (model.emb_features + trip.ids.shape[1]) + model.emb_features
+            assert_computes_the_oracle(tool.reference_logits(trip.case, export, trip.ids, wide=True),
+                                       trip.truth, f"{label} in order 1", roundings=roundings)
+    assert_as_exact_over_orders(mine, theirs, label)
 
 
 def test_the_export_keeps_the_sources_config_and_generation_config(trip):

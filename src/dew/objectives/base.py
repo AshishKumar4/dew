@@ -13,6 +13,7 @@ reports. These values are JAX pytrees.
 
 from __future__ import annotations
 
+import enum
 import functools
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
@@ -569,7 +570,7 @@ class Objective(ABC, Generic[Loss, Effects]):
         custom research method can still restore its raw state.
         """
 
-    def pipeline(self, state: TrainState, *, ema: bool | None = None) -> Task:
+    def pipeline(self, state: TrainState, *, ema: bool | None = None) -> Task | SavedTask:
         """Return the trained model as its inference task, over `state`'s weights.
 
         With `ema` None, the task uses `state.averaged` when the objective
@@ -578,7 +579,9 @@ class Objective(ABC, Generic[Loss, Effects]):
         selects the live parameters. An objective with a reference policy
         returns the trained policy, never the frozen reference its loss
         compares against. The arrays keep their placement. Objectives
-        without a generation task raise `TypeError`.
+        without a generation task raise `TypeError`. A plugin objective
+        returns its own `saved_task` class, which is why the type is open to
+        `SavedTask` beside dew's tasks.
         """
         raise TypeError(f"{type(self).__name__} has no inference task")
 
@@ -672,6 +675,20 @@ def merge_totals(accumulated: tuple[float, float],
 def mean_of_totals(accumulated: tuple[float, float]) -> float:
     """Divide a metric's summed total by its summed count."""
     return accumulated[0] / accumulated[1]
+
+
+class Omitted(enum.Enum):
+    """A keyword the caller left out, where None is a value of its own.
+
+    An objective built over a loaded bundle takes what the bundle supplies for
+    such a keyword (`variables`, `processor`, a pipeline's `autoencoder`) only
+    when it is omitted; an explicit None clears it.
+    """
+
+    OMITTED = "omitted"
+
+
+OMITTED = Omitted.OMITTED
 
 
 __all__ = [

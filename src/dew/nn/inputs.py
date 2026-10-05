@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import itertools
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Literal, overload
 
@@ -15,6 +15,7 @@ import numpy as np
 from flax import struct
 from jax.core import Tracer
 
+from dew.artifacts import agreed
 from dew.nn.sharding import DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS
 
 if TYPE_CHECKING:
@@ -102,12 +103,13 @@ def host_token_rows(array: np.ndarray) -> np.ndarray:
 class ModelInputs:
     """Token rows with sequence-aligned fields and row-aligned conditioning.
 
-    Every leaf has batch axis zero, and ``token_fields`` sequence axis one at
-    ``tokens``' length. ``conditioning`` holds media payloads and their valid
-    lengths; a token field such as ``image_indices`` names the media feature
-    read at each text slot (-1 for text), so slicing a prompt keeps feature
-    identity. The processor validates fields on the host; these shape-preserving
-    operations also work inside JIT.
+    Every leaf has the batch on axis 0, and each of ``token_fields`` also has
+    the sequence on axis 1, at the length of ``tokens``. ``conditioning`` holds
+    media payloads and their valid lengths. A token field such as
+    ``image_indices`` gives the index of the media feature read at each text
+    slot (-1 for a text token), so a sliced prompt still points at the same
+    features. The processor validates the fields on the host. `take_rows`,
+    `slice_tokens` and `align_left` also work inside JIT.
     """
 
     tokens: jax.Array
@@ -116,10 +118,14 @@ class ModelInputs:
 
     @classmethod
     def from_value(cls, value: ModelInputs | jax.typing.ArrayLike | Sequence[Sequence[int]]) -> ModelInputs:
-        """Normalize host input without lossy ID coercion or moving resident arrays.
+        """Return `value` as validated `ModelInputs`, without lossy id conversion or moving resident arrays.
 
-        Distributed algorithms call this inside their agreed validation phase;
-        this method itself performs no collectives or model execution.
+        A `ModelInputs` is validated as it is, and a JAX array is wrapped where
+        it sits. Anything else is read on the host as an integer `[B, S]`
+        array, and ids that int32 cannot represent raise ValueError.
+
+        Distributed algorithms call this inside their agreed validation phase.
+        It runs no collectives and no model.
         """
         if isinstance(value, cls):
             prepared = value
@@ -132,7 +138,12 @@ class ModelInputs:
 
 
     def validate(self) -> None:
-        """Check the numeric layout on the host before dispatching a model."""
+        """Check the numeric layout on the host before dispatching a model.
+
+        Raises ValueError when `tokens` is not an integer `[B, S]` array, when
+        a token field has a reserved name or does not start with the tokens'
+        shape, or when a conditioning entry has another batch size.
+        """
         if self.tokens.ndim != 2 or not jnp.issubdtype(self.tokens.dtype, jnp.integer):
             raise ValueError("tokens must be an integer [B, S] array")
         reserved = {"tokens", "conditioning", "train", "decode", "rngs", "method",
@@ -159,17 +170,18 @@ class ModelInputs:
             conditioning={name: value[indices] for name, value in self.conditioning.items()})
 
     def slice_tokens(self, start: int | None = None, stop: int | None = None) -> ModelInputs:
-        """Slice token slots; media features retain their original indices."""
+        """Slice the tokens and token fields to slots `start:stop`; media features keep their indices."""
         selection = slice(start, stop)
         return replace(self,
             tokens=self.tokens[:, selection],
             token_fields={name: value[:, selection] for name, value in self.token_fields.items()})
 
     def align_left(self, left_padding: jax.Array) -> ModelInputs:
-        """Move each row's real token prefix left and its padding to the end.
+        """Rotate each row so its real tokens start at slot 0 and its `left_padding` slots move to the end.
 
-        Logical positions are sequence fields, so their values travel with the
-        tokens. Their values are not recomputed from the padded slot number.
+        Positions are token fields, so they move with the tokens and keep their
+        values; they are not recomputed from the new slot numbers. Raises
+        ValueError unless `left_padding` has one count per row.
         """
         if left_padding.shape != (self.tokens.shape[0],):
             raise ValueError("left_padding must have one count per token row")
@@ -183,7 +195,11 @@ class ModelInputs:
                             token_fields={name: shift(value) for name, value in self.token_fields.items()})
 
     def kwargs(self) -> dict[str, jax.Array | Mapping[str, jax.Array]]:
-        """Keywords for a native model call, excluding the token argument."""
+        """Return the keyword arguments for a native model call, without the tokens.
+
+        Each token field is its own keyword, and ``conditioning`` is included
+        only when it is not empty.
+        """
         prepared: dict[str, jax.Array | Mapping[str, jax.Array]] = dict(self.token_fields)
         if self.conditioning:
             prepared["conditioning"] = self.conditioning
@@ -192,17 +208,17 @@ class ModelInputs:
 
 @struct.dataclass
 class AttentionMetadata:
-    """Per-token data the layers read beside their inputs, independent of
-    physical cache-slot addresses.
+    """Per-token data the layers read alongside their inputs, independent of physical cache-slot addresses.
 
-    `token_ids` are the vocabulary ids of the rows, for a layer that routes
-    by them (DeepSeek V4's hash router); the model sets them when it has
-    such a layer. `engram_ids` are every engram layer's n-gram bucket ids,
-    `[B, S, layers, columns]`, which the model hashes once from the token
-    ids for the stack (`dew.nn.engram`), as it hands a hash router the ids.
-    `media` `[B, S]` marks the positions a media encoder fills, which
-    DeepSeek-V4.1 routes by its image bias and keeps out of every n-gram.
-    `admitted` makes a cached call a serving step's mixed one (`Admitted`).
+    `token_ids` are the rows' vocabulary ids, for a layer that routes by them
+    (DeepSeek V4's hash router); the model sets them when it has such a layer.
+    `engram_ids` are every engram layer's n-gram bucket ids,
+    `[B, S, layers, columns]`. The model hashes them from the token ids once
+    for the whole stack (`dew.nn.engram`), the same way it gives a hash router
+    the ids. `media` `[B, S]` marks the positions a media encoder fills;
+    DeepSeek-V4.1 routes those by its image bias and keeps them out of every
+    n-gram. `admitted` turns a cached call into a serving step's mixed call
+    (`Admitted`).
     """
 
     valid: jax.Array | None = None
@@ -240,14 +256,14 @@ class Admitted:
 
 @struct.dataclass
 class LayerInputs:
-    """What each decoder layer reads of its own, `[B, S, layers, ...]` leaves.
+    """Inputs each decoder layer reads for itself, as `[B, S, layers, ...]` leaves.
 
-    The stack slices every leaf on axis 2 the same way, so a scanned run, a
-    run read from a bank one layer at a time and a pipeline stage each hand a
-    layer its own `[B, S, ...]` slice. `embeddings` is Gemma 3n/4's per-layer
-    input signal; `experts` and `routed` are a routing replay's `[..., top_k]`
-    expert ids and coverage (`dew.nn.moe.Routes`), `routed` broadcast over the
-    layer axis.
+    The stack slices every leaf on axis 2 the same way. So each layer gets its
+    own `[B, S, ...]` slice whether the stack runs as a scan, reads its weights
+    from a bank one layer at a time, or runs as a pipeline stage. `embeddings`
+    is Gemma 3n/4's per-layer input signal. `experts` and `routed` are a
+    routing replay's `[..., top_k]` expert ids and coverage
+    (`dew.nn.moe.Routes`), with `routed` broadcast over the layer axis.
     """
 
     embeddings: jax.Array | None = None
@@ -255,11 +271,11 @@ class LayerInputs:
     routed: jax.Array | None = None
 
     def span(self, first: int, count: int) -> LayerInputs:
-        """Layers `first` through `first + count - 1`, the axis kept."""
+        """Return layers `first` through `first + count - 1`, keeping the layer axis."""
         return jax.tree.map(lambda leaf: leaf[:, :, first:first + count], self)
 
     def layer(self, index) -> LayerInputs:
-        """One layer's slice, the axis dropped; `index` may be traced."""
+        """Return one layer's slice without the layer axis; `index` may be traced."""
         return jax.tree.map(
             lambda leaf: jax.lax.dynamic_index_in_dim(leaf, index, 2, keepdims=False), self)
 
@@ -464,10 +480,11 @@ class RowPlan:
     """Where one request's rows sit while a task runs.
 
     Without a mesh every array stays on the default device. On a mesh, rows
-    split over its batch axes; each process contributes ``count`` rows, its
-    ``rows`` real ones followed by repeats that pad to the device count, so
-    every device holds the same shape and every collective lines up. Results
-    keep that sharding; ``host`` reads a process's real rows back.
+    split over its batch axes. Each process contributes ``count`` rows, its
+    ``rows`` real ones followed by repeats that pad them to a multiple of its
+    devices on those axes, so every device holds the same shape and every
+    collective lines up. Results keep that sharding, and ``host`` reads a
+    process's real rows back.
     """
 
     mesh: jax.sharding.Mesh | None
@@ -495,16 +512,16 @@ class RowPlan:
 
     @property
     def global_rows(self) -> int:
-        """Rows of a placed array across every process."""
+        """The number of rows of a placed array, over all processes."""
         return self.count * self.processes
 
     @property
     def padding(self) -> np.ndarray:
-        """Which of the ``count`` placed rows are repeats, not real rows."""
+        """A mask over the ``count`` placed rows, True for the repeats and False for real rows."""
         return np.arange(self.count) >= self.rows
 
     def pad(self, tree):
-        """Repeat rows up to ``count`` without moving resident arrays to the host."""
+        """Repeat rows up to ``count``, cycling through the real ones; device arrays stay on device."""
         if self.count == self.rows:
             return tree
         indices = np.arange(self.count) % self.rows
@@ -512,7 +529,11 @@ class RowPlan:
                             else np.asarray(leaf)[indices], tree)
 
     def place(self, tree):
-        """Place padded host or device rows, row-sharded on a mesh."""
+        """Place padded host or device rows, sharded by row on a mesh.
+
+        Without a mesh this is `jax.device_put`. Raises ValueError for a leaf
+        without ``count`` rows on axis 0.
+        """
         sharding = self.sharding
         if sharding is None:
             return jax.device_put(tree)
@@ -526,19 +547,21 @@ class RowPlan:
         return jax.tree.map(put, tree)
 
     def keys(self, key: jax.Array) -> jax.Array:
-        """One key per placed row, folded by global row index, so a pool draws
-        what a single process draws for the same rows.
+        """Return one key per placed row, folded from `key` by global row index.
 
-        A request key replicated over a multi-process mesh is not
-        addressable, and folding it would hand
-        `make_array_from_process_local_data` rows this process cannot place.
-        Every replica holds the same key data, so on a mesh the rows fold
-        from this process's first replica, on its one device, and are sliced
-        from there to their devices. Folded on every device of a replicated
-        key, they went through the host to be split: jax reshards a
-        multi-device array whose shards hold no target slice by reading it.
+        A pool of processes therefore draws the same values as one process does
+        for the same rows. On a mesh, `key` may be replicated over several
+        processes; the keys are folded from this process's copy on one device
+        and then sharded to their devices.
         """
         sharding = self.sharding
+        # A request key replicated over a multi-process mesh is not addressable,
+        # and folding it would hand `make_array_from_process_local_data` rows this
+        # process cannot place. Every replica holds the same key data, so the rows
+        # fold from this process's first replica, on its one device, and are sliced
+        # from there to their devices. Folded on every device of a replicated key,
+        # they went through the host to be split, because jax reshards a
+        # multi-device array whose shards hold no target slice by reading it.
         local = key if sharding is None else key.addressable_data(0)
         start = self.process * self.rows
         indices = jax.device_put(np.arange(start, start + self.count, dtype=np.uint32), local.sharding)
@@ -549,8 +572,65 @@ class RowPlan:
         return jax.random.wrap_key_data(sharded, impl=jax.random.key_impl(key))
 
     def host(self, leaf) -> np.ndarray:
-        """This process's real rows of a result leaf as a host array."""
+        """Return this process's real rows of a result leaf as a host array."""
         return local_rows(leaf)[:self.rows]
+
+
+@dataclass(frozen=True)
+class Request:
+    """One sampler request as this process holds it, ready to place.
+
+    `inputs` are this process's rows as the sampler checked them, `plan`
+    places them and `key` is the request's one PRNG key. When the weights sit
+    on a mesh across processes the pool has agreed, before anything is
+    placed, on the check's outcome, one validity schema and the signature of
+    `inputs` with the sampler's controls, so every process enters the program
+    with the same shapes; otherwise each process serves its own request.
+    """
+
+    inputs: ModelInputs
+    plan: RowPlan
+    key: jax.Array
+
+    @classmethod
+    def prepare[CheckedT](
+            cls, inputs: ModelInputs | jax.typing.ArrayLike | Sequence[Sequence[int]],
+            key: int | jax.Array | None, mesh: jax.sharding.Mesh | None,
+            check: Callable[[ModelInputs, bool], tuple[ModelInputs, tuple, CheckedT]],
+            *, phase: str) -> tuple[Request, CheckedT]:
+        """The request, with whatever else `check` resolved.
+
+        `check` takes the request as `ModelInputs` and whether a pool shares
+        it, and returns the inputs the sampler runs, the controls a pool
+        compares (each with a deterministic repr) and anything else it
+        resolved. What it raises, a pool raises together, before any rank
+        enters a collective.
+        """
+        pooled = mesh is not None and jax.process_count() > 1
+
+        def setup() -> tuple[jax.Array, tuple[ModelInputs, tuple, CheckedT]]:
+            return request_key(key), check(ModelInputs.from_value(inputs), pooled)
+
+        random_key, (prepared, controls, checked) = (agreed(f"{phase} setup", setup) if pooled
+                                                     else setup())
+        if pooled:
+            from jax.experimental import multihost_utils
+
+            prepared = agreed_validity(prepared, jax.process_count(), controls=controls,
+                                       phase=f"{phase} input")
+            multihost_utils.assert_equal(generation_signature(prepared, controls),
+                                         f"{phase} input shapes and controls must agree across processes")
+        return cls(prepared, RowPlan.over(mesh, prepared.tokens.shape[0]), random_key), checked
+
+    def padded(self) -> ModelInputs:
+        """`inputs` filled out to the rows the devices take, the repeats
+        marked invalid, so they hold no real token and finish at once."""
+        plan, padded = self.plan, self.plan.pad(self.inputs)
+        if plan.count == plan.rows:
+            return padded
+        valid = padded.token_fields.get(VALIDITY_FIELD, jnp.ones(padded.tokens.shape, bool))
+        valid = jnp.asarray(valid, bool) & ~plan.padding[:, None]
+        return replace(padded, token_fields={**padded.token_fields, VALIDITY_FIELD: valid})
 
 
 __all__ = ["AttentionMetadata", "LayerInputs", "ModelInputs", "RowPlan"]

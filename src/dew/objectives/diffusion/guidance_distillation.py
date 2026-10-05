@@ -10,7 +10,9 @@ this module follows the paper's equation.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import replace
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -21,10 +23,14 @@ from dew.diffusion.process import DenoisingCondition, Process
 from dew.diffusion.schedules import expand
 from dew.diffusion.transforms import broadcast_rates
 from dew.inputs import InputSpec, unit_range
+from dew.nn.autoencoders import AutoEncoder
 from dew.objectives.base import Aux, Ratio, Step, Variables
-from dew.registry import objectives
+from dew.registry import objectives, trainings
 
-from .objective import TEACHER, DiffusionObjective, _own_loss
+from .objective import TEACHER, DiffusionObjective, Training, _own_loss
+
+if TYPE_CHECKING:
+    from .config import DiffusionRunConfig
 
 
 def with_guidance(conditions: dict, scale: jax.Array) -> dict:
@@ -39,6 +45,52 @@ def guided_target(conditional: jax.Array, unconditional: jax.Array, scale: jax.A
     The output is unconditional + w (conditional - unconditional).
     """
     return unconditional + expand(scale, conditional) * (conditional - unconditional)
+
+
+@trainings("guidance_distillation")
+@dataclasses.dataclass(frozen=True)
+class GuidanceDistillation(Training):
+    """Distillation of a saved run's classifier-free guidance into this run's model.
+
+    The student reads the guidance scale through its conditioning's guidance input
+    (`GuidanceDistillationObjective`), so sampling runs one branch. `teacher` is the
+    teacher run's directory, which a run must name, and `scales` is the range each
+    row's scale is drawn from.
+    """
+
+    guided = False
+
+    teacher: str = ""
+    scales: tuple[float, float] = (1.0, 8.0)
+
+    def __post_init__(self) -> None:
+        low, high = (float(value) for value in self.scales)
+        object.__setattr__(self, "scales", (low, high))
+
+    def check(self, run: DiffusionRunConfig) -> None:
+        super().check(run)
+        if not self.teacher:
+            raise ValueError("guidance distillation distills a teacher; name its run directory")
+
+    def objective(self, run: DiffusionRunConfig, model: nn.Module, process: Process, inputs: InputSpec, *,
+                  autoencoder: AutoEncoder | None,
+                  variables: Variables | None) -> GuidanceDistillationObjective:
+        """Return the student objective over the teacher run's objective and its variables.
+
+        The teacher's variables are the copy a saved student tree holds when `variables` is
+        given, and otherwise the weights the teacher run published.
+        """
+        from dew.checkpoints import Checkpoints
+
+        from .config import DiffusionRunConfig
+
+        held = (variables[TEACHER] if variables is not None else Checkpoints(self.teacher).variables(
+            ema=None, step=None, mesh=None, layout=None, param_dtype=None))
+        teacher = DiffusionRunConfig.load(self.teacher).build(variables=held)
+        return GuidanceDistillationObjective(
+            model, process, inputs, teacher=teacher, teacher_variables=held, scales=self.scales,
+            autoencoder=autoencoder, variables=variables, ema_decay=run.ema_decay, solver=run.solver,
+            guidance=None, steps=run.sampling_steps)
 
 
 @objectives("guidance_distillation")

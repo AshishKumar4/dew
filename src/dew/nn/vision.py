@@ -52,7 +52,7 @@ from dew.nn.precision import at_least_fp32
 from dew.nn.rope import inverse_frequencies
 from dew.nn.text_encoders import MLP, CLIPEncoderLayer
 from dew.objectives.base import Variables
-from dew.registry import from_record, projectors, towers
+from dew.registry import Record, from_record, projectors, towers
 
 from .mobilenet import _ARCHITECTURE, MobileNetV5Encoder
 
@@ -65,8 +65,7 @@ class ProjectorBase:
 
     Each kind is a frozen dataclass of the reference's field names, registered
     under its name (`@projectors("gemma")`). `build` turns the value into the
-    Flax module. A record without a kind, or one naming nothing registered,
-    raises ValueError.
+    Flax module. A record that names nothing registered raises.
     """
 
     def build(self) -> nn.Module:
@@ -1469,7 +1468,7 @@ def _image_size(value: object, field: str) -> int:
     return records.integer(value, field)
 
 
-def translate_siglip_vision_config(hf_config: Mapping[str, object]) -> Mapping[str, object]:
+def translate_siglip_vision_config(hf_config: Mapping[str, object]) -> Record:
     """A SiglipVisionConfig into a SiglipVision value's fields.
 
     Reads the vision_config of a multimodal wrapper or a bare vision config.
@@ -1490,7 +1489,7 @@ def translate_siglip_vision_config(hf_config: Mapping[str, object]) -> Mapping[s
     if records.number(vision.get("attention_dropout", 0.0), "attention_dropout"):
         raise ValueError("attention_dropout is training-time; this trunk runs eval")
     return {
-        "kind": "siglip",
+        "name": "siglip", "fields": {
         "hidden_size": hidden,
         "intermediate_size": records.integer(vision["intermediate_size"], "intermediate_size"),
         "num_layers": records.integer(vision["num_hidden_layers"], "num_hidden_layers"),
@@ -1500,10 +1499,10 @@ def translate_siglip_vision_config(hf_config: Mapping[str, object]) -> Mapping[s
         "num_channels": records.integer(vision.get("num_channels", 3), "num_channels"),
         "hidden_act": activation,
         "layer_norm_eps": records.number(vision.get("layer_norm_eps", 1e-6), "layer_norm_eps"),
-    }
+    }}
 
 
-def translate_llama4_vision_config(hf_config: Mapping[str, object]) -> Mapping[str, object]:
+def translate_llama4_vision_config(hf_config: Mapping[str, object]) -> Record:
     """A Llama4VisionConfig into a Llama4Vision value's fields.
 
     Reads the vision_config of a wrapper or a bare vision config. The feature
@@ -1537,7 +1536,7 @@ def translate_llama4_vision_config(hf_config: Mapping[str, object]) -> Mapping[s
             f"vision_output_dim ({output_dim}) disagrees with projector_output_dim "
             f"({vision.get('projector_output_dim')}), the adapter's width")
     return {
-        "kind": "llama4",
+        "name": "llama4", "fields": {
         "hidden_size": records.integer(vision["hidden_size"], "hidden_size"),
         "intermediate_size": records.integer(vision["intermediate_size"], "intermediate_size"),
         "num_layers": records.integer(vision["num_hidden_layers"], "num_hidden_layers"),
@@ -1552,11 +1551,11 @@ def translate_llama4_vision_config(hf_config: Mapping[str, object]) -> Mapping[s
         "pixel_shuffle_ratio": records.number(vision.get("pixel_shuffle_ratio", 0.5), "pixel_shuffle_ratio"),
         "projector_input_dim": records.integer(vision["projector_input_dim"], "projector_input_dim"),
         "projector_output_dim": records.integer(vision["projector_output_dim"], "projector_output_dim"),
-    }
+    }}
 
 
 def translate_gemma_projector_config(vision: Mapping[str, object], text_width: int,
-                                     mm_tokens_per_image: object) -> Mapping[str, object]:
+                                     mm_tokens_per_image: object) -> Record:
     """A Gemma wrapper's projector fields: decoder width, grids."""
     if isinstance(mm_tokens_per_image, bool) or not isinstance(mm_tokens_per_image, int):
         raise ValueError(
@@ -1574,17 +1573,17 @@ def translate_gemma_projector_config(vision: Mapping[str, object], text_width: i
         raise ValueError(
             f"{patches} patches per side do not split over {side} soft tokens per side")
     return {
-        "kind": "gemma",
+        "name": "gemma", "fields": {
         "text_width": int(text_width),
         "patches_per_side": patches,
         "tokens_per_side": side,
         "norm_eps": records.number(vision.get("layer_norm_eps", 1e-6), "layer_norm_eps"),
-    }
+    }}
 
 
-def translate_llama4_projector_config(text_width: int) -> Mapping[str, object]:
+def translate_llama4_projector_config(text_width: int) -> Record:
     """A Llama 4 wrapper's projector fields: the text width."""
-    return {"kind": "llama4", "text_width": int(text_width)}
+    return {"name": "llama4", "fields": {"text_width": int(text_width)}}
 
 
 _GEMMA4_VISION_TENSORS = {
@@ -1661,7 +1660,7 @@ def translate_gemma4_projector_weights(
     return translate_parameters(hf_tensors, lambda name: projector_weight_path("gemma4", name), param_dtype)
 
 
-def translate_gemma4_vision_config(hf_config: Mapping[str, object]) -> Mapping[str, object]:
+def translate_gemma4_vision_config(hf_config: Mapping[str, object]) -> Record:
     """A Gemma4VisionConfig into a Gemma4Vision value's fields.
 
     Reads the vision_config of a wrapper or a bare vision config. The head
@@ -1696,7 +1695,7 @@ def translate_gemma4_vision_config(hf_config: Mapping[str, object]) -> Mapping[s
             f"rope_type {rope.get('rope_type')!r} is not expressible: this trunk "
             "runs the default 2D rotary")
     return {
-        "kind": "gemma4",
+        "name": "gemma4", "fields": {
         "hidden_size": hidden,
         "intermediate_size": records.integer(vision["intermediate_size"], "intermediate_size"),
         "num_layers": records.integer(vision["num_hidden_layers"], "num_hidden_layers"),
@@ -1715,7 +1714,7 @@ def translate_gemma4_vision_config(hf_config: Mapping[str, object]) -> Mapping[s
         "rope_theta": records.number(rope.get("rope_theta", vision.get("rope_theta", 100.0)), "rope_theta"),
         "standardize": bool(vision.get("standardize", False)),
         "use_clipped_linears": bool(vision.get("use_clipped_linears", False)),
-    }
+    }}
 
 
 def export_gemma4_vision_config(tower: Gemma4Vision) -> Mapping[str, object]:
@@ -1742,13 +1741,13 @@ def export_gemma4_vision_config(tower: Gemma4Vision) -> Mapping[str, object]:
 
 
 def translate_gemma4_projector_config(vision: Mapping[str, object],
-                                      text_width: int) -> Mapping[str, object]:
+                                      text_width: int) -> Record:
     """A Gemma 4 wrapper's projector fields: decoder width, norm epsilon."""
     return {
-        "kind": "gemma4",
+        "name": "gemma4", "fields": {
         "text_width": int(text_width),
         "norm_eps": records.number(vision.get("rms_norm_eps", 1e-6), "rms_norm_eps"),
-    }
+    }}
 
 
 _QWEN35_VISION_TENSORS = {
@@ -1817,7 +1816,7 @@ def translate_qwen35_projector_weights(
     return translate_parameters(hf_tensors, lambda name: projector_weight_path("qwen3_5", name), param_dtype)
 
 
-def translate_qwen35_vision_config(hf_config: Mapping[str, object]) -> Mapping[str, object]:
+def translate_qwen35_vision_config(hf_config: Mapping[str, object]) -> Record:
     """A Qwen3_5VisionConfig into a Qwen35Vision value's fields.
 
     Reads the vision_config of a wrapper or a bare vision config. The
@@ -1840,7 +1839,7 @@ def translate_qwen35_vision_config(hf_config: Mapping[str, object]) -> Mapping[s
             f"hidden_act {activation!r} is not expressible: this trunk runs the "
             "shared MLP's activations")
     return {
-        "kind": "qwen3_5",
+        "name": "qwen3_5", "fields": {
         "depth": records.integer(vision["depth"], "depth"),
         "hidden_size": records.integer(vision["hidden_size"], "hidden_size"),
         "hidden_act": activation,
@@ -1851,11 +1850,11 @@ def translate_qwen35_vision_config(hf_config: Mapping[str, object]) -> Mapping[s
         "spatial_merge_size": records.integer(vision.get("spatial_merge_size", 2), "spatial_merge_size"),
         "temporal_patch_size": records.integer(vision["temporal_patch_size"], "temporal_patch_size"),
         "num_position_embeddings": table,
-    }
+    }}
 
 
 def translate_qwen35_projector_config(hf_config: Mapping[str, object],
-                                      text_width: int) -> Mapping[str, object]:
+                                      text_width: int) -> Record:
     """A Qwen 3.5 wrapper's projector fields: trunk width, merge, output.
 
     The merged features enter the text embeddings directly, so a merger width
@@ -1868,11 +1867,11 @@ def translate_qwen35_projector_config(hf_config: Mapping[str, object],
             f"out_hidden_size ({merged}) is not the decoder width ({text_width}), "
             "the merger output enters the text embeddings as it is")
     return {
-        "kind": "qwen3_5",
+        "name": "qwen3_5", "fields": {
         "vision_width": records.integer(vision["hidden_size"], "hidden_size"),
         "merge_size": records.integer(vision.get("spatial_merge_size", 2), "spatial_merge_size"),
         "out_width": merged,
-    }
+    }}
 
 
 _DEEPSEEK_V41_VISION_TENSORS = {
@@ -1914,7 +1913,7 @@ def translate_deepseek_v41_projector_weights(
                                  param_dtype)
 
 
-def translate_deepseek_v41_vision_config(hf_config: Mapping[str, object]) -> Mapping[str, object]:
+def translate_deepseek_v41_vision_config(hf_config: Mapping[str, object]) -> Record:
     """A DeepSeek-V4.1 vision_config into a DeepseekV41Vision value's fields.
 
     The image-size fields (max_image_tokens, min_pixels, max_wh_ratio) plan
@@ -1930,27 +1929,27 @@ def translate_deepseek_v41_vision_config(hf_config: Mapping[str, object]) -> Map
         raise ValueError(f"hidden_size {width} over {heads} heads leaves no head width the 2D rotary "
                          "splits into height and width pairs")
     return {
-        "kind": "deepseek_v41",
+        "name": "deepseek_v41", "fields": {
         "num_hidden_layers": records.integer(vision["num_hidden_layers"], "num_hidden_layers"),
         "hidden_size": width,
         "num_attention_heads": heads,
         "intermediate_size": records.integer(vision["intermediate_size"], "intermediate_size"),
         "patch_size": records.integer(vision["patch_size"], "patch_size"),
         "rope_theta": records.number(vision.get("rope_theta", 10000.0), "rope_theta"),
-    }
+    }}
 
 
 def translate_deepseek_v41_projector_config(hf_config: Mapping[str, object],
-                                            text_width: int) -> Mapping[str, object]:
+                                            text_width: int) -> Record:
     """DeepSeek-V4.1's aligner fields: the ViT width, its downsample ratio and
     the decoder width its rows and span vectors enter."""
     vision = _vision_section(hf_config)
     return {
-        "kind": "deepseek_v41",
+        "name": "deepseek_v41", "fields": {
         "vision_width": records.integer(vision["hidden_size"], "hidden_size"),
         "downsample_ratio": records.integer(vision.get("downsample_ratio", 3), "downsample_ratio"),
         "out_width": int(text_width),
-    }
+    }}
 
 
 @towers("gemma3n")
@@ -2163,17 +2162,17 @@ def _gemma3n_vision_record(
     return embedder, options
 
 
-def translate_gemma3n_vision_config(hf_config: Mapping[str, object]) -> Mapping[str, object]:
+def translate_gemma3n_vision_config(hf_config: Mapping[str, object]) -> Record:
     _, options = _gemma3n_vision_record(hf_config)
     value: Gemma3nVision = from_record(Gemma3nVision, options)
-    return {"kind": "gemma3n", **dataclasses.asdict(value)}
+    return {"name": "gemma3n", "fields": {**dataclasses.asdict(value)}}
 
 
 def translate_gemma3n_projector_config(hf_config: Mapping[str, object],
-                                       text_width: int) -> Mapping[str, object]:
+                                       text_width: int) -> Record:
     embedder, _ = _gemma3n_vision_record(hf_config)
     value: Gemma3nProjector = from_record(Gemma3nProjector, {**embedder, "text_width": text_width})
-    return {"kind": "gemma3n", **dataclasses.asdict(value)}
+    return {"name": "gemma3n", "fields": {**dataclasses.asdict(value)}}
 
 
 # Where each tower and projector kind's tensors sit in a media checkpoint, and

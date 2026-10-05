@@ -40,6 +40,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew import records
+from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.weights import ParamTree, translate_parameters
 from dew.nn.attention import LayerNorm, RMSNorm, scaled_dot_product_attention
 from dew.nn.conv import Conv
@@ -330,45 +331,11 @@ class CLIP(nn.Module):
                 self.get_text_features(input_ids, attention_mask))
 
 
-class TextFields(TypedDict):
-    """Every field of `CLIPTextTransformer` a config states, all of them read.
-
-    The keys are the module's own init fields, which
-    `tests/test_text_encoders.py` pins, so a field renamed there is a failing
-    test here rather than a key the tower never reads. `dtype` and `precision`
-    are the caller's execution choices, not the checkpoint's, so a translated
-    config carries neither and the loader passes them itself.
-    """
-
-    vocab_size: int
-    hidden_size: int
-    intermediate_size: int
-    num_layers: int
-    num_heads: int
-    max_position_embeddings: int
-    layer_norm_eps: float
-    eos_token_id: int
-    activation: str
-
-
-class VisionFields(TypedDict):
-    """Every field of `CLIPVisionTransformer` a config states, minus dtype."""
-
-    hidden_size: int
-    intermediate_size: int
-    num_layers: int
-    num_heads: int
-    image_size: int
-    patch_size: int
-    num_channels: int
-    layer_norm_eps: float
-
-
 class CLIPFields(TypedDict):
     """A full CLIP config: one record per tower, and the shared head width."""
 
-    text: TextFields
-    vision: VisionFields
+    text: NativeFields[CLIPTextTransformer]
+    vision: NativeFields[CLIPVisionTransformer]
     projection_dim: int
 
 
@@ -380,7 +347,7 @@ def _quick_gelu_only(config: Mapping[str, object]) -> None:
             "quick-GELU")
 
 
-def translate_config(hf_config: Mapping[str, object]) -> TextFields:
+def translate_config(hf_config: Mapping[str, object]) -> NativeFields[CLIPTextTransformer]:
     """A CLIP config into `CLIPTextTransformer` fields.
 
     Reads a full CLIP config, which nests the tower's fields under
@@ -399,38 +366,38 @@ def translate_config(hf_config: Mapping[str, object]) -> TextFields:
             f"eos_token_id {eos_token_id!r} names no single token, so the "
             "pooled row has no position")
 
-    return {
-        "vocab_size": records.integer(text["vocab_size"], "vocab_size"),
-        "hidden_size": records.integer(text["hidden_size"], "hidden_size"),
-        "intermediate_size": records.integer(text["intermediate_size"], "intermediate_size"),
-        "num_layers": records.integer(text["num_hidden_layers"], "num_hidden_layers"),
-        "num_heads": records.integer(text["num_attention_heads"], "num_attention_heads"),
-        "max_position_embeddings": records.integer(
+    return native_fields(CLIPTextTransformer)(
+        vocab_size=records.integer(text["vocab_size"], "vocab_size"),
+        hidden_size=records.integer(text["hidden_size"], "hidden_size"),
+        intermediate_size=records.integer(text["intermediate_size"], "intermediate_size"),
+        num_layers=records.integer(text["num_hidden_layers"], "num_hidden_layers"),
+        num_heads=records.integer(text["num_attention_heads"], "num_attention_heads"),
+        max_position_embeddings=records.integer(
             text["max_position_embeddings"], "max_position_embeddings"
         ),
-        "layer_norm_eps": records.number(text.get("layer_norm_eps", 1e-5), "layer_norm_eps"),
-        "eos_token_id": eos_token_id,
-        "activation": activation,
-    }
+        layer_norm_eps=records.number(text.get("layer_norm_eps", 1e-5), "layer_norm_eps"),
+        eos_token_id=eos_token_id,
+        activation=activation,
+    )
 
 
-def translate_vision_config(hf_config: Mapping[str, object]) -> VisionFields:
+def translate_vision_config(hf_config: Mapping[str, object]) -> NativeFields[CLIPVisionTransformer]:
     """A CLIP config into `CLIPVisionTransformer` fields, read the way
     `translate_config` reads the text ones: from `vision_config` of a full
     config or from a `CLIPVisionConfig` on its own."""
     vision = records.record(hf_config.get("vision_config", hf_config), "vision_config")
 
     _quick_gelu_only(vision)
-    return {
-        "hidden_size": records.integer(vision["hidden_size"], "hidden_size"),
-        "intermediate_size": records.integer(vision["intermediate_size"], "intermediate_size"),
-        "num_layers": records.integer(vision["num_hidden_layers"], "num_hidden_layers"),
-        "num_heads": records.integer(vision["num_attention_heads"], "num_attention_heads"),
-        "image_size": records.integer(vision["image_size"], "image_size"),
-        "patch_size": records.integer(vision["patch_size"], "patch_size"),
-        "num_channels": records.integer(vision.get("num_channels", 3), "num_channels"),
-        "layer_norm_eps": records.number(vision.get("layer_norm_eps", 1e-5), "layer_norm_eps"),
-    }
+    return native_fields(CLIPVisionTransformer)(
+        hidden_size=records.integer(vision["hidden_size"], "hidden_size"),
+        intermediate_size=records.integer(vision["intermediate_size"], "intermediate_size"),
+        num_layers=records.integer(vision["num_hidden_layers"], "num_hidden_layers"),
+        num_heads=records.integer(vision["num_attention_heads"], "num_attention_heads"),
+        image_size=records.integer(vision["image_size"], "image_size"),
+        patch_size=records.integer(vision["patch_size"], "patch_size"),
+        num_channels=records.integer(vision.get("num_channels", 3), "num_channels"),
+        layer_norm_eps=records.number(vision.get("layer_norm_eps", 1e-5), "layer_norm_eps"),
+    )
 
 
 def translate_clip_config(hf_config: Mapping[str, object]) -> CLIPFields:
@@ -637,7 +604,7 @@ class CLIPTextModel:
         directory = _checkpoint_dir(name_or_dir, revision, weights=variables is None)
         config = translate_config(_read_config(directory))
 
-        transformer = CLIPTextTransformer(dtype=resolve_dtype(dtype), **config)
+        transformer = config.value.clone(dtype=resolve_dtype(dtype))
         if variables is None:
             params = translate_weights(_read_tensors(directory), param_dtype=param_dtype)
             variables = {"params": jax.tree.map(jnp.asarray, params)}
@@ -681,14 +648,14 @@ class CLIPModel:
         config = translate_clip_config(_read_config(directory))
 
         module = CLIP(
-            text_model=CLIPTextTransformer(dtype=dtype, **config["text"]),
-            vision_model=CLIPVisionTransformer(dtype=dtype, **config["vision"]),
+            text_model=config["text"].value.clone(dtype=dtype),
+            vision_model=config["vision"].value.clone(dtype=dtype),
             projection_dim=config["projection_dim"], dtype=dtype)
         params = translate_clip_weights(_read_tensors(directory), param_dtype=param_dtype)
-        vision = config["vision"]
+        vision = config["vision"].value
         check_tree(
             {"params": params}, module,
-            jnp.zeros((1, vision["num_channels"], vision["image_size"], vision["image_size"]),
+            jnp.zeros((1, vision.num_channels, vision.image_size, vision.image_size),
                       jnp.float32),
             jnp.zeros((1, 2), jnp.int32))
         return cls(module, {"params": jax.tree.map(jnp.asarray, params)}, config)
@@ -937,42 +904,25 @@ class T5EncoderTransformer(nn.Module):
         return self.dropout(hidden_states, deterministic=not train)
 
 
-class T5Fields(TypedDict):
-    """Every field of `T5EncoderTransformer` a config states, minus dtype."""
-
-    vocab_size: int
-    d_model: int
-    d_ff: int
-    num_layers: int
-    num_heads: int
-    head_dim: int
-    num_buckets: int
-    max_distance: int
-    feed_forward_proj: str
-    dropout_rate: float
-    layer_norm_epsilon: float
-    per_layer_bias: bool
-
-
-def translate_t5_config(hf_config: Mapping[str, object]) -> T5Fields:
+def translate_t5_config(hf_config: Mapping[str, object]) -> NativeFields[T5EncoderTransformer]:
     """A T5 or UMT5 config into `T5EncoderTransformer` fields; a `umt5`
     model gives every layer its own relative bias."""
-    return {
-        "vocab_size": records.integer(hf_config["vocab_size"], "vocab_size"),
-        "d_model": records.integer(hf_config["d_model"], "d_model"),
-        "d_ff": records.integer(hf_config["d_ff"], "d_ff"),
-        "num_layers": records.integer(hf_config["num_layers"], "num_layers"),
-        "num_heads": records.integer(hf_config["num_heads"], "num_heads"),
-        "head_dim": records.integer(hf_config["d_kv"], "d_kv"),
-        "num_buckets": records.integer(hf_config.get("relative_attention_num_buckets", 32),
+    return native_fields(T5EncoderTransformer)(
+        vocab_size=records.integer(hf_config["vocab_size"], "vocab_size"),
+        d_model=records.integer(hf_config["d_model"], "d_model"),
+        d_ff=records.integer(hf_config["d_ff"], "d_ff"),
+        num_layers=records.integer(hf_config["num_layers"], "num_layers"),
+        num_heads=records.integer(hf_config["num_heads"], "num_heads"),
+        head_dim=records.integer(hf_config["d_kv"], "d_kv"),
+        num_buckets=records.integer(hf_config.get("relative_attention_num_buckets", 32),
                             "relative_attention_num_buckets"),
-        "max_distance": records.integer(hf_config.get("relative_attention_max_distance", 128),
+        max_distance=records.integer(hf_config.get("relative_attention_max_distance", 128),
                              "relative_attention_max_distance"),
-        "feed_forward_proj": records.text(hf_config.get("feed_forward_proj", "relu"), "feed_forward_proj"),
-        "dropout_rate": records.number(hf_config.get("dropout_rate", 0.0), "dropout_rate"),
-        "layer_norm_epsilon": records.number(hf_config.get("layer_norm_epsilon", 1e-6), "layer_norm_epsilon"),
-        "per_layer_bias": hf_config.get("model_type") == "umt5",
-    }
+        feed_forward_proj=records.text(hf_config.get("feed_forward_proj", "relu"), "feed_forward_proj"),
+        dropout_rate=records.number(hf_config.get("dropout_rate", 0.0), "dropout_rate"),
+        layer_norm_epsilon=records.number(hf_config.get("layer_norm_epsilon", 1e-6), "layer_norm_epsilon"),
+        per_layer_bias=hf_config.get("model_type") == "umt5",
+    )
 
 
 # The names a published T5 stores its one tied token embedding under.
@@ -1075,7 +1025,7 @@ class T5EncoderModel:
         """
         directory = _checkpoint_dir(name_or_dir, revision, weights=variables is None)
         config = translate_t5_config(_read_config(directory))
-        transformer = T5EncoderTransformer(dtype=resolve_dtype(dtype), **config)
+        transformer = config.value.clone(dtype=resolve_dtype(dtype))
         if variables is None:
             params = translate_t5_weights(_read_tensors(directory), param_dtype=param_dtype)
             variables = {"params": jax.tree.map(jnp.asarray, params)}

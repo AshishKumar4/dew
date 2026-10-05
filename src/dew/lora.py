@@ -80,15 +80,16 @@ class Target:
 class LoRA:
     """A low-rank adapter spec with PEFT's own fields.
 
-    This is what a user writes and a run records (`RunConfig.lora`,
-    `lora:lora --lora.rank 16 --lora.modules q_proj v_proj`).
+    A user writes it and a run records it (`RunConfig.lora`,
+    `--lora.rank 16 --lora.modules q_proj v_proj`).
 
-    `modules` are PEFT's `target_modules`: a projection matches when its name
+    `modules` are PEFT's `target_modules`. A projection matches when its name
     relative to the model (`model.layers.0.self_attn.q_proj`, or `to_q` under a
     pipeline component) equals an entry or ends in `.` followed by the entry.
-    `alpha` None uses PEFT's own default, twice the rank. `rslora` scales by
-    `alpha / sqrt(rank)`, and `dropout` drops the branch's input in a training
-    forward pass.
+    `alpha` None means twice the rank. `rslora` scales by `alpha / sqrt(rank)`, and
+    `dropout` drops the branch's input in a training forward pass. `rank` must be a
+    positive int, `modules` must name at least one projection, and `dropout` must be
+    in [0, 1).
     """
 
     rank: int

@@ -69,11 +69,11 @@ def model_config(width: int = 1024) -> dict:
         "qk_norm": False, "attention_bias": False, "tie_embeddings": True, "mlp": "swiglu",
         "layer_types": ["mamba", "mamba", "mamba", "attention"] * (LAYERS // 4),
         "kinds": {
-            "mamba": {"mixer": {"kind": "mamba2", "num_heads": 2 * width // 64, "head_dim": 64,
+            "mamba": {"mixer": {"name": "mamba2", "fields": {"num_heads": 2 * width // 64, "head_dim": 64,
                                 "state_size": 128, "n_groups": 1, "conv_kernel": 4,
-                                "chunk_size": 256, "use_conv_bias": True}},
-            "attention": {"window": 4096, "mixer": {"kind": "attention", "nope": True,
-                                                     "exclusive_self_attention": True}},
+                                "chunk_size": 256, "use_conv_bias": True}}},
+            "attention": {"window": 4096, "mixer": {"name": "attention", "fields": {"nope": True,
+                                                     "exclusive_self_attention": True}}},
         },
         "mixture": {"experts": 128, "top_k": 2, "expert_features": width // 8},
         "embedding_multiplier": 12.0, "residual_multiplier": 0.22,
@@ -147,4 +147,4 @@ def run_config(args: RigelArgs):
 if __name__ == "__main__":
     from train import LmRunConfig, main
     args, rest = tyro.cli(RigelArgs, return_unknown_args=True)
-    main(tyro.cli(tyro.conf.CascadeSubcommandArgs[LmRunConfig], default=run_config(args), args=rest))
+    main(LmRunConfig.cli(rest, default=run_config(args)))

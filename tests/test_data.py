@@ -57,7 +57,7 @@ def test_an_unknown_dataset_is_refused():
 
 def test_a_spec_field_the_dataset_has_no_declaration_for_is_refused():
     """A misspelled knob built a dataset other than the one asked for."""
-    with pytest.raises(ValueError, match=r"no field for \['image_scale'\]"):
+    with pytest.raises(ValueError, match=r"unknown fields \['image_scale'\]"):
         datasets.build("tfds_images", image_scale=64)
     assert datasets.build("tfds_images", image_size=64).image_size == 64
 

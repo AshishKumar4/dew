@@ -29,9 +29,11 @@ dependencies = [
     # (dew.training.runtime._pool_keys_alike), and CI and development installs
     # take the build through constraints.txt. A bump runs
     # tests/test_linear_attention.py::test_the_decode_kernel_steps_as_the_recurrence_does
+    # and tests/test_kernels.py::test_the_decode_kernel_reads_each_row_to_its_length
     # on a GPU first: CI is CPU-only, and the gated delta net's decode kernel
-    # (dew.nn.kernels.delta_rule) is on the Pallas Triton backend JAX 0.11
-    # deprecates; its `fits` is the off switch.
+    # (dew.nn.kernels.delta_rule) and the decode attention kernel
+    # (dew.nn.kernels.decode_attention) are on the Pallas Triton backend JAX
+    # 0.11 deprecates; each one's `fits` is its off switch.
     "jax>=0.11.2,<0.11.3",
     "optax>=0.2.2",
     "orbax-checkpoint>=0.12.4",

@@ -53,12 +53,12 @@ from dew.rl import group_advantage, rloo_advantage
 
 IDS_KEY = "input_ids"
 RESPONSE_MASK_KEY = "response_mask"
-"""1 on every sampled id of a trainable session, the tokens that carry loss mass."""
+"""1 on every sampled id of a session that trains, the tokens that carry loss mass."""
 OLD_LOG_PROBS_KEY = "old_log_probs"
 """The proximal policy's log-probabilities, recorded or rescored before the update.
 
 GRPO's PPO ratio compares the current raw policy with this one. When a batch
-carries none, the behavior log-probabilities stand in.
+has none, the behavior log-probabilities stand in.
 """
 BEHAVIOR_LOG_PROBS_KEY = "behavior_log_probs"
 """Actual sampling log-probabilities, including temperature/top-k and greedy selection."""
@@ -99,7 +99,14 @@ of the other members."""
 
 
 class Status(Enum):
-    """How a session ended, which decides whether it trains."""
+    """How a session ended, which decides whether it trains.
+
+    `COMPLETED` and `AGENT_ERROR` sessions always train on their reward; an
+    agent error means the agent broke, and the verifier's reward says how
+    badly. `INFRA_ERROR` and `CANCELLED` sessions never train, and the
+    scheduler retries them. A `TRUNCATED` session follows `pack`'s
+    `truncation` policy.
+    """
 
     COMPLETED = "completed"
     TRUNCATED = "truncated"
@@ -109,7 +116,11 @@ class Status(Enum):
 
     @property
     def trainable(self) -> bool:
-        """Whether a session with this status is scored and carries loss mass."""
+        """Whether a session with this status is scored and always carries loss mass.
+
+        It is False for `TRUNCATED`, because whether a truncated session
+        trains depends on `pack`'s `truncation` policy.
+        """
         return self in (Status.COMPLETED, Status.AGENT_ERROR)
 
 
@@ -134,20 +145,24 @@ def _token_ids(name: str, ids: object) -> None:
 class Call:
     """One model call as the engine served it.
 
-    `sampled_ids` includes EOS when `finish_reason` is a natural stop, and
+    `prompt_ids` are the ids the engine read and `sampled_ids` the ids it
+    sampled, including EOS when `finish_reason` is a natural stop.
     `behavior_log_probs` holds the engine-reported log-probability of each
-    sampled id. `version` is the served policy version when the request was
-    submitted, the oldest policy that may have produced any of its ids.
+    sampled id. `finish_reason` is `stop`, `tool_calls`, `length` or `abort`.
+    `version` is the policy version being served when the request was
+    submitted, which is the oldest policy that may have produced any of its
+    ids.
 
     Two engine records are optional. `routed_experts` is the mixture's
-    routing for every id the engine forwarded, `[len(prompt_ids) +
-    len(sampled_ids) - 1, layers, top_k]` expert ids (vLLM's
-    `routed_experts`, SGLang's `meta_info.routed_experts`; the last sampled id
-    is never forwarded), kept in the dtype the engine shipped, which the
-    trainer replays (`dew.nn.moe.Routes`). `support` is, per sampled id, the token ids the
-    sampler's top-k/top-p filters kept (vLLM's `sampling_mask`); the
-    behavior log-probability is then the filtered one, and the trainer
-    renormalizes over the same support. None means no filter.
+    routing for every id the engine forwarded, as
+    `[len(prompt_ids) + len(sampled_ids) - 1, layers, top_k]` expert ids in
+    the dtype the engine sent; the last sampled id is never forwarded. vLLM
+    calls this record `routed_experts` and SGLang
+    `meta_info.routed_experts`, and the trainer replays it
+    (`dew.nn.moe.Routes`). `support` holds, for each sampled id, the token
+    ids the sampler's top-k/top-p filters kept (vLLM's `sampling_mask`).
+    With a support, the behavior log-probability is the filtered one, and
+    the trainer renormalizes over the same support. None means no filter.
     """
 
     prompt_ids: tuple[int, ...]
@@ -197,7 +212,7 @@ class Call:
 
 @dataclass(frozen=True)
 class Task:
-    """One unit of work a session source runs: an identity and its source-specific payload."""
+    """One unit of work a session source runs, with its id and a source-specific payload in `data`."""
 
     id: str
     data: Mapping[str, object] = field(default_factory=lambda: MappingProxyType({}))
@@ -205,12 +220,13 @@ class Task:
 
 @dataclass(frozen=True)
 class Session:
-    """One harness session: its calls in submission order and how it ended.
+    """One harness session, with its calls in submission order and how it ended.
 
-    `(task, group)` names the advantage group; `sample` and `attempt` tell
-    members and retries apart. `reward` is the verifier's score, required
-    when the status is trainable. `components` holds verifier sub-scores for
-    logging and `detail` the verifier or failure provenance.
+    `(task, group)` names the advantage group, and `sample` and `attempt`
+    tell its members and their retries apart. `reward` is the verifier's
+    score, required when the status is trainable (`Status.trainable`).
+    `components` holds the verifier's sub-scores for logging, and `detail`
+    says where the verdict or the failure came from.
     """
 
     task: str
@@ -243,8 +259,8 @@ class SessionSource(Protocol):
     """Anything that turns tasks into sessions.
 
     `submit` starts `samples` sessions of one task under the served policy
-    `version` and returns one future per session; `cancel` stops sessions
-    whose results are no longer wanted.
+    `version` and returns one future per session. `cancel` stops the
+    sessions whose results are no longer wanted.
     """
 
     def submit(self, task: Task, samples: int, *, version: int) -> Sequence[Future[Session]]: ...
@@ -430,20 +446,39 @@ def pack(sessions: Sequence[Session], width: int, *, rows: int | None = None,
          support_capacity: int | None = None) -> dict[str, np.ndarray]:
     """Strictly merge each trained session's calls, then pack the chains into `[rows, width]`.
 
-    Every array is `[rows, width]` and aligned with `input_ids`: entry t
-    describes id t. `response_mask` is 1 on sampled ids alone;
-    `behavior_log_probs`, `versions` and `call_index` are set on them;
-    `advantages` repeats the session's advantage over its chain tokens;
-    `session_weights` is described at `SESSION_WEIGHTS_KEY`. Chains are
-    placed first-fit in decreasing length, a stable order, and `rows` pads
-    the batch to a fixed count, refusing chains that need more
-    (`rows_needed` over `chain_lengths` counts them). `truncation` decides whether TRUNCATED
-    sessions train, as the module docstring describes.
+    A call joins the chain of the call before it only when its prompt ids
+    start with every id of that chain so far, sampled ids included;
+    otherwise it starts a new chain. Nothing is re-tokenized, and a single
+    call wider than `width` raises `ValueError`.
 
-    Calls that recorded `routed_experts` or `support` add the arrays
-    `_engine_records` describes; `support_capacity`, required when any call
-    recorded a support, fixes the per-row length of the support arrays so
-    every batch has one shape and the step compiles once.
+    Every array but the engine records below is `[rows, width]` and aligned
+    with `input_ids`, so entry t describes id t. `text_segment_ids` numbers
+    the chains of a row from 1, with 0 on padding, and `text_positions`
+    counts each chain's positions from 0. `response_mask` is 1 on sampled
+    ids alone, and `behavior_log_probs`, `versions` and `call_index` are set
+    on those ids. `advantages` repeats the session's advantage, which
+    `estimator` computes within its `(task, group)`, over its chain tokens.
+    `session_weights` is one over the session's number of sampled ids on
+    each of them and 0 elsewhere. It sums to the number of sessions, so
+    `sum(weights * terms) / sum(weights)` is the mean over sessions of each
+    session's token mean. Chains are placed first-fit in decreasing length,
+    a stable order. `rows` pads the batch to a fixed count and raises
+    `ValueError` when the chains need more (`rows_needed` over
+    `chain_lengths` counts them).
+
+    `truncation` decides what a `TRUNCATED` session trains on: `mask` (the
+    default) drops it, `score` trains it on its verifier reward, and `zero`
+    trains it on reward 0. `COMPLETED` and `AGENT_ERROR` sessions always
+    train, and `INFRA_ERROR` and `CANCELLED` sessions never do.
+
+    Calls that recorded `routed_experts` add that array,
+    `[rows, width, layers, top_k]`, and `routed`, which is true where a
+    call's record covers the id. Calls that recorded a `support` add
+    `support_ids` and `support_columns`: each row's kept ids back to back,
+    and for each one the column of the sampled id it belongs to, both
+    padded with -1. `support_capacity`, required when any call recorded a
+    support, fixes the per-row length of these two arrays, so every batch
+    has one shape and the step compiles once.
     """
     if type(width) is not int or width < 2:
         raise ValueError("a packed row holds at least two ids")

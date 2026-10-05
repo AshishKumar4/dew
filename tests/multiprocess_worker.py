@@ -1548,11 +1548,15 @@ def mode_continuations(args) -> dict:
     from dew.interop import Pretrained
     source = Pretrained.load(Path(__file__).parent / "fixtures/hf/diffusion-gemma-workflow",
                              dtype="float32", attention_impl="xla", max_seq_len=32)
-    canvas = source.block_generation().bind(place(source.variables, MeshSpec(fsdp=args.fsdp_size),
-                                                  Layout(min_shard=TINY)))
     canvas_prompts = ["<bos> t5 t7 t9 t11", "<bos> t6 t8 t10 t12"] * 2
     canvas_rows = len(canvas_prompts) // processes
     canvas_prompts = canvas_prompts[rank * canvas_rows:(rank + 1) * canvas_rows]
+    # Weights on no mesh serve each process's own request: ranks asking for
+    # different row counts are not a pool and agree on nothing. (`place`
+    # below moves the source's own leaves onto the mesh, so this runs first.)
+    canvas_alone = source.block_generation()(canvas_prompts[:rank + 1], 7, key=11).rows
+    canvas = source.block_generation().bind(place(source.variables, MeshSpec(fsdp=args.fsdp_size),
+                                                  Layout(min_shard=TINY)))
     canvases = canvas(canvas_prompts, 7, n=2, key=11)
     canvas_host = canvases.host()
     canvas_rejected = False
@@ -1578,6 +1582,7 @@ def mode_continuations(args) -> dict:
         "raw": np.asarray(host.raw_log_probs).tolist(),
         "canvas_rejected": canvas_rejected,
         "canvas_rows": canvases.rows,
+        "canvas_alone": canvas_alone,
         "canvas_tokens": np.asarray(canvas_host.tokens).tolist(),
         "canvas_lengths": np.asarray(canvas_host.lengths).tolist(),
         "canvas_steps": np.asarray(canvas_host.decoder_steps).tolist(),
@@ -1863,13 +1868,17 @@ def mode_masked_generation(args) -> dict:
     rank, processes = jax.process_index(), jax.process_count()
     source = Pretrained.load(Path(__file__).parent / "fixtures/hf/llada-tiny",
                              dtype="float32", attention_impl="xla")
-    task = source.text_generation().bind(place(source.variables, MeshSpec(fsdp=args.fsdp_size),
-                                              Layout(min_shard=TINY)))
     prompts = np.asarray([[120, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12],
                           [0, 0, 120, 5], [0, 6, 7, 8], [0, 0, 0, 9]], np.int32)
     valid = np.asarray([[1, 1, 1, 1]] * 3 + [[0, 0, 1, 1], [0, 1, 1, 1], [0, 0, 0, 1]], bool)
     rows = len(prompts) // processes
     mine = slice(rank * rows, (rank + 1) * rows)
+    # Weights on no mesh serve each process's own request: ranks asking with
+    # different prompt widths are not a pool and agree on nothing. (`place`
+    # below moves the source's own leaves onto the mesh, so this runs first.)
+    alone = source.text_generation()(jnp.asarray(prompts[mine][:, -(3 + rank):]), 4, steps=2, key=7)
+    task = source.text_generation().bind(place(source.variables, MeshSpec(fsdp=args.fsdp_size),
+                                              Layout(min_shard=TINY)))
     fields = {} if valid[mine].all() else {"attention_mask": jnp.asarray(valid[mine])}
     request = ModelInputs(jnp.asarray(prompts[mine]), fields)
     result = task(request, 8, steps=5, key=7, n=2).host()
@@ -1899,7 +1908,8 @@ def mode_masked_generation(args) -> dict:
         np.testing.assert_array_equal(recovered.tokens, result.tokens)
     return {"rows": result.rows, "tokens": result.tokens.tolist(), "lengths": result.lengths.tolist(),
             "terminated": result.terminated.tolist(), "decoder_steps": result.decoder_steps.tolist(),
-            "valid_lengths": valid[mine].sum(axis=1).tolist(), "refused": refused}
+            "valid_lengths": valid[mine].sum(axis=1).tolist(), "refused": refused,
+            "alone_width": int(alone.host().tokens.shape[1])}
 
 
 def mode_host_training(args) -> dict:

@@ -1,13 +1,14 @@
-"""Bind a model, its weights and its host processing into a reusable task.
+"""Tasks that hold a model, its weights and its host processing for repeated generation.
 
-A task binds what a generation needs beyond the request itself: the native
-model, a captured variables mapping and, when the source ships one, the host
-processor that turns text and media into `ModelInputs`. Controls stay the
-typed values training already uses (`Sampling`, `BlockProcess`); results
-stay the typed records the kernels produce. `bind` gives the same task over
-other weights, which is how a training loop draws from a policy snapshot
-without holding the trainer's mutable mapping. Array buffers are shared; do
-not mutate, donate or delete those buffers while the task is using them.
+A task holds what a generation needs besides the request itself: the native
+model, a frozen variables mapping and, when the source ships one, the host
+processor that turns text and media into `ModelInputs`. A call takes the same
+typed controls training uses (`Sampling`, `BlockProcess`) and returns the
+typed records the sampling kernels produce. `bind` returns the same task over
+other weights, so a training loop can draw from a policy snapshot without
+holding the trainer's mutable mapping. The task uses the array buffers of the
+variables it is given without copying them, so do not mutate, donate or
+delete those buffers while the task is using them.
 """
 
 from __future__ import annotations
@@ -50,18 +51,26 @@ Request = str | Sequence[str] | Rows
 SHAPE_BUCKETS = tuple(1 << exponent for exponent in range(21))
 """The shapes a text request is rounded up to: powers of two.
 
-Every distinct prompt width, budget and continuation count is its own
-several-second XLA compile. So a prompt pads left to the smallest bucket of 64
-or more, behind the attention mask; a budget rounds up to the next power of
-two and the extra trips come off the result; and the call's cache is the two
-together, rounded up again, in place of the model's whole `max_seq_len`. Rows
-are not bucketed, and a request whose buckets would exceed `max_seq_len`
-keeps its own shapes, so the ceiling refuses what it would refuse anyway.
+Every distinct prompt width, budget and continuation count costs its own XLA
+compile of several seconds. To share compiles, a call pads the prompt on the
+left, behind the attention mask, to the smallest bucket that holds it and is
+at least 64. It rounds the budget up to the next power of two and trims the
+extra decode steps off the result. The call's cache is the padded prompt plus
+the rounded budget, rounded up again, and the call uses it in place of the
+model's whole `max_seq_len`. The number of rows is not bucketed. A request
+whose buckets would exceed `max_seq_len` keeps its own shapes, so the model
+refuses exactly the requests it would refuse without buckets. A request with
+media or multi-axis positions also keeps its own shapes.
 """
 
 
 class Processor(Protocol):
-    """Declares the host preprocessing and decoding a loaded source's processor does."""
+    """Interface for a loaded source's host processor, which prepares requests and decodes tokens.
+
+    Calling it turns text, with optional images, into `ModelInputs`.
+    `decode` turns token rows into one string per row, and `bos_id` is the
+    id a sequence starts with, or None.
+    """
 
     def __call__(self, text: str | Sequence[str], *, images: Media | None = None) -> ModelInputs: ...
 
@@ -380,31 +389,34 @@ def _saved_sampling(record: Mapping[str, object], budget: int | None) -> Samplin
 class TextGeneration:
     """Generates next tokens from a decoder, its weights and its processor.
 
-    A call runs the shared cached prefill and decode; the result is the
-    `Generation` a training rollout consumes, with the actual and raw-policy
-    likelihood of every drawn action. `sampling` is the policy a call uses
-    when it passes none, `max_new_tokens` the budget and `n` the number of
-    continuations per prompt; a loaded source fills all three from its
-    generation config. `n` continuations of a prompt leave as `n` consecutive
-    rows, in prompt order. Weights keep their placement: on a mesh, rows
-    split over its batch axes and results keep that sharding.
+    A call runs the shared cached prefill and decode, and returns the
+    `Generation` a training rollout consumes, with the log-probability of
+    every drawn action under the policy that drew it and under the raw model.
+    When a call passes none, it uses the task's `sampling` policy, its
+    `max_new_tokens` budget and its `n` continuations per prompt; a loaded
+    source sets all three from its generation config. The `n` continuations
+    of a prompt come back as `n` consecutive rows, in prompt order. The
+    weights stay where they were placed. On a mesh, the rows are split over
+    its batch axes and the results keep that sharding.
 
-    `logits` is the whole transform chain, `stopping` the criteria that run
-    beside the policy's EOS and stop-string ones, and `strategy` the device
-    loop. `logits=None` means the chain `sampling` compiles to. A call
-    replaces each of them whole, so a caller that wants to add to a chain
-    writes `logits=task.sampling.transforms() + (mine,)`, and an explicit
-    `sampling=` on a call replaces a bound chain with its own, because the
-    policy it overrides is what that chain was built from. A call's policy
-    takes the task's EOS and pad ids where it leaves them None, so changing
-    one control is `sampling=replace(task.sampling, repetition_penalty=1.1)`
-    or a fresh `Sampling(...)`, and either still stops where the task does.
-    `sampling.stop` strings compile against `processor` once per policy.
+    `logits` is the whole logits transform chain, and None means the chain
+    `sampling` compiles to. `stopping` holds the criteria that run beside
+    the policy's EOS and stop-string criteria, and `strategy` is the device
+    loop. A call that passes any of the three replaces the task's value
+    whole, so to add a transform you pass
+    `logits=task.sampling.transforms() + (mine,)`. A call that passes
+    `sampling=` also drops the task's own `logits` chain, because that chain
+    was built from the policy the call replaces. Where a call's policy
+    leaves the EOS and pad ids None, it takes the task's. So to change one
+    control, pass `sampling=replace(task.sampling, repetition_penalty=1.1)`
+    or a fresh `Sampling(...)`, and either one still stops where the task
+    does. `sampling.stop` strings compile against `processor` once for the
+    task's policy, and again on each call whose policy has other stop strings.
 
-    A call runs at `SHAPE_BUCKETS` shapes over a cache the bucket sizes,
-    and hands back the shapes the request asked for, so two requests of
-    nearby lengths share one compiled executable and neither pays for the
-    model's whole context.
+    A call pads the request to `SHAPE_BUCKETS` shapes, with a cache sized to
+    the buckets, and returns results at the shapes the request asked for. So
+    two requests of nearby lengths share one compiled executable, and neither
+    pays for the model's whole context.
     """
 
     model: nn.Module
@@ -448,14 +460,15 @@ class TextGeneration:
         return replace(self, variables=variables)
 
     def quantized(self, spec: Quantization, example: Rows = ((0,),)) -> TextGeneration:
-        """Store the weights matched by `spec` as int8 or fp8 through Qwix.
+        """Return the task with the weights matched by `spec` stored as int8 or fp8 through Qwix.
 
         Requires `dewml[quantization]`. `example` is one prepared model
-        input for the abstract trace; a multimodal model needs its media
-        fields too. The processor and decoding controls stay unchanged.
-        Host NumPy weights quantize one kernel at a time on the default
-        device and return to host storage. If one kernel will not fit,
-        load weights onto the task's mesh before quantizing them.
+        input, token rows or `ModelInputs`, for Qwix's abstract trace; for a
+        multimodal model it must include the media fields too. The processor
+        and decoding controls stay unchanged. Weights held as host NumPy
+        arrays are quantized one kernel at a time on the default device and
+        then return to host storage. If one kernel will not fit on that
+        device, load the weights onto the task's mesh before quantizing them.
         """
         from dew.training.quantization import quantize_for_serving
 
@@ -468,17 +481,21 @@ class TextGeneration:
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
                  mesh: MeshSpec | None = None, layout: Layout | None = None,
                  dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None) -> TextGeneration:
-        """Load the causal run in `directory`: the model its `run.json` records,
-        rebuilt the way the recipe built it, over the weights of its latest
-        checkpoint (or `step`), decoding through the run's own tokenizer.
+        """Load the causal language-model run in `directory` as a task.
 
-        `ema` reads the averaged weights (None: when the run kept them), except
-        under an objective whose average is a reference policy rather than the
-        trained one. With `mesh` the weights restore straight onto that mesh
-        under `layout`, the way the trainer places them. dtype overrides computation;
-        param_dtype overrides parameter storage, and None preserves what the
-        checkpoint stored. The run's preview budget and sampling policy
-        become the task's defaults.
+        The task rebuilds the model that the run's `run.json` records, the
+        way the recipe built it, over the weights of the latest checkpoint
+        (or of `step`), and decodes text through the run's own tokenizer.
+        The run's preview budget and sampling policy become the task's
+        defaults, and a PPO run loads only its policy weights.
+
+        `ema` selects the averaged weights; None reads them when the run
+        kept them. When the run's objective keeps its average as a reference
+        policy, the task always loads the trained weights. With `mesh`, the
+        weights are restored directly onto that mesh under `layout`, the way
+        the trainer places them. `dtype` overrides the computation dtype and
+        `param_dtype` the parameter storage dtype; None keeps what the
+        checkpoint stored.
         """
         from dew.checkpoints import Checkpoints
         from dew.registry import objectives
@@ -504,7 +521,9 @@ class TextGeneration:
                         param_dtype: DTypeLike | None = None) -> TextGeneration:
         """Load a run directory published to the Hugging Face Hub.
 
-        `HfApi().upload_folder` of the run directory itself is what writes it.
+        You publish one by uploading the run directory itself with
+        `HfApi().upload_folder`. `revision` pins a Hub revision, and the
+        other arguments work as in `from_run`.
         """
         return cls.from_run(_pulled(repo_id, revision), ema=ema, step=step, mesh=mesh, layout=layout,
                             dtype=dtype, param_dtype=param_dtype)
@@ -540,12 +559,12 @@ class TextGeneration:
 class BlockGeneration:
     """Generates block-diffusion canvases from a DiffusionGemma and its weights.
 
-    A call runs prefill, refinement and clean-token commits as one device
-    computation; the `CanvasGeneration` result carries no autoregressive
-    likelihoods. `process` is the published sampler configuration used when
-    a call passes none, `max_new_tokens` the budget a call omits and `n` the
-    number of continuations per prompt, which leave as `n` consecutive rows
-    in prompt order.
+    A call runs prefill, refinement and the commits of clean tokens as one
+    device computation. It returns a `CanvasGeneration`, which has no
+    autoregressive likelihoods. When a call passes none, it uses the task's
+    `process` (the published sampler configuration), its `max_new_tokens`
+    budget and its `n` continuations per prompt. The `n` continuations of a
+    prompt come back as `n` consecutive rows, in prompt order.
     """
 
     model: DiffusionGemma
@@ -569,13 +588,18 @@ class BlockGeneration:
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
                  mesh: MeshSpec | None = None, layout: Layout | None = None,
                  dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None) -> BlockGeneration:
-        """Load the block-diffusion run in `directory`: the DiffusionGemma its
-        `run.json` records over the weights of its latest checkpoint (or
-        `step`), sampling over the canvas the model declares.
+        """Load the block-diffusion run in `directory` as a task.
 
-        The arguments carry what `TextGeneration.from_run` carries: `ema`
-        selects the averaged weights, `mesh` and `layout` place them, and
-        the two dtypes override computation and storage.
+        The task rebuilds the DiffusionGemma that the run's `run.json`
+        records, over the weights of the latest checkpoint (or of `step`),
+        and samples with the run's saved `BlockProcess` over the canvas the
+        model declares. The run's preview budget becomes the task's
+        `max_new_tokens`. A run whose model is not a DiffusionGemma raises
+        `TypeError`.
+
+        The arguments work as in `TextGeneration.from_run`: `ema` selects
+        the averaged weights, `mesh` and `layout` place them, and the two
+        dtypes override computation and storage.
         """
         from dew.checkpoints import Checkpoints
         from dew.diffusion.block import BlockProcess
@@ -597,7 +621,9 @@ class BlockGeneration:
                         param_dtype: DTypeLike | None = None) -> BlockGeneration:
         """Load a run directory published to the Hugging Face Hub.
 
-        `HfApi().upload_folder` of the run directory itself is what writes it.
+        You publish one by uploading the run directory itself with
+        `HfApi().upload_folder`. `revision` pins a Hub revision, and the
+        other arguments work as in `from_run`.
         """
         return cls.from_run(_pulled(repo_id, revision), ema=ema, step=step, mesh=mesh, layout=layout,
                             dtype=dtype, param_dtype=param_dtype)
@@ -626,9 +652,12 @@ class BlockGeneration:
 class MaskedGeneration:
     """Samples a whole response with native MDLM, holding the prompt fixed.
 
-    This is not LLaDA's or Dream's source-specific remasking recipe. EOS trims
-    the finished response, not the bidirectional denoising trajectory. Results
-    carry refinement counts, never autoregressive action likelihoods.
+    It does not reproduce the source-specific remasking recipes of LLaDA or
+    Dream. EOS trims the finished response after the bidirectional
+    denoising, and does not end that denoising early. Results hold
+    refinement counts and no autoregressive action likelihoods. When a call
+    passes none, it uses the task's `steps`, its `max_new_tokens` response
+    length and its `n` continuations per prompt.
     """
 
     model: nn.Module
@@ -654,12 +683,17 @@ class MaskedGeneration:
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
                  mesh: MeshSpec | None = None, layout: Layout | None = None,
                  dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None) -> MaskedGeneration:
-        """Load the masked-diffusion run in `directory`: the bidirectional model
-        its `run.json` records over the weights of its latest checkpoint (or
-        `step`), refined with MDLM over the run's own mask token.
+        """Load the masked-diffusion run in `directory` as a task.
 
-        The arguments carry what `TextGeneration.from_run` carries, and the
-        run's preview budget becomes the response length a call omits.
+        The task rebuilds the bidirectional model that the run's `run.json`
+        records, over the weights of the latest checkpoint (or of `step`),
+        and refines responses with MDLM over the run's own mask token, using
+        the solver and step count the run saved. The model must be a
+        `CausalTransformer` with `causal=False` and a `mask_token_id` that
+        matches the saved process, or loading raises `ValueError`.
+
+        The arguments work as in `TextGeneration.from_run`, and the run's
+        preview budget becomes the response length a call omits.
         """
         from dew.checkpoints import Checkpoints
         from dew.diffusion.discrete import DiscreteProcess
@@ -695,7 +729,9 @@ class MaskedGeneration:
                         param_dtype: DTypeLike | None = None) -> MaskedGeneration:
         """Load a run directory published to the Hugging Face Hub.
 
-        `HfApi().upload_folder` of the run directory itself is what writes it.
+        You publish one by uploading the run directory itself with
+        `HfApi().upload_folder`. `revision` pins a Hub revision, and the
+        other arguments work as in `from_run`.
         """
         return cls.from_run(_pulled(repo_id, revision), ema=ema, step=step, mesh=mesh, layout=layout,
                             dtype=dtype, param_dtype=param_dtype)

@@ -138,7 +138,7 @@ from dataclasses import dataclass
 
 from dew.registry import Registry
 
-activations = Registry("activation", record="kind").share()
+activations = Registry("activation").share()
 
 
 class Activation:
@@ -176,13 +176,13 @@ def test_a_plugin_kind_rebuilds_from_a_record_and_writes_back_its_kind(tmp_path)
     (tmp_path / "toyplugin" / "kinds.py").write_text(PLUGIN_KIND)
     done = _run(tmp_path, "from dew.registry import Registry, models\n"
                           "from dew.config import _to_json\n"
-                          "record = {'activation': {'kind': 'scaled_tanh', 'scale': 2.0}}\n"
+                          "record = {'activation': {'name': 'scaled_tanh', 'fields': {'scale': 2.0}}}\n"
                           "built = models.build('plugin_act', record)\n"
                           "print(type(built.activation).__name__, built.activation.scale)\n"
                           "print(_to_json(built.activation, type(built).__annotations__['activation']))\n"
                           "print([table.kind for table in Registry.shared()][-1])\n")
     assert done.returncode == 0, done.stderr[-2000:]
-    assert done.stdout.splitlines() == ["ScaledTanh 2.0", "{'kind': 'scaled_tanh', 'scale': 2.0}",
+    assert done.stdout.splitlines() == ["ScaledTanh 2.0", "{'name': 'scaled_tanh', 'fields': {'scale': 2.0}}",
                                         "activation"]
 
 
@@ -230,13 +230,16 @@ class Shift(Objective):
 
     def inference_record(self):
         return {"objective": "shift"}
+
+    def pipeline(self, state, *, ema=None) -> Scalar:
+        return Scalar(float(self._pipeline_weights(state, ema)["params"]["w"]))
 '''
 
 
 def test_dew_pipeline_loads_a_plugin_objectives_saved_task(tmp_path):
     """A plugin objective declares its task the way Dew's do, and a run of
     it trained in one process loads as that task in another that has not
-    imported the plugin."""
+    imported the plugin, equal to the task `pipeline` returns in place."""
     _install(tmp_path, "toyplugin", PLUGIN_OBJECTIVE)
     run = tmp_path / "run"
     train = ("import jax, numpy as np, optax\n"
@@ -249,7 +252,7 @@ def test_dew_pipeline_loads_a_plugin_objectives_saved_task(tmp_path):
              f"                  checkpoints=Checkpoints({str(run)!r}))\n"
              "state = trainer.fit(data, steps=3, log_every=3, checkpoint_every=3)\n"
              "trainer.checkpoints.wait()\n"
-             "print(float(state.variables['params']['w']))\n")
+             "print(trainer.objective.pipeline(state).value)\n")
     trained = _run(tmp_path, train)
     assert trained.returncode == 0, trained.stderr[-2000:]
     load = ("import sys\n"

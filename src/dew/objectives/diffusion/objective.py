@@ -16,8 +16,10 @@ uses; the preview hook limits itself to the display count.
 
 from __future__ import annotations
 
+import dataclasses
+from abc import ABC, abstractmethod
 from functools import cached_property
-from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -37,16 +39,18 @@ from dew.nn.autoencoders import AutoEncoder
 from dew.nn.autoencoders.api import ModuleAutoEncoder
 from dew.nn.autoencoders.kl import AutoencoderKL, posterior_latent
 from dew.nn.mp import Uncertainty
-from dew.objectives.base import Aux, EMASpec, Objective, Ratio, Step, Variables, thaw, under
-from dew.objectives.diffusion.alignment import ALIGNMENT, REPRESENTATION, Alignment
+from dew.objectives.base import OMITTED, Aux, EMASpec, Objective, Omitted, Ratio, Step, Variables, thaw, under
+from dew.objectives.diffusion.alignment import ALIGNMENT, REPRESENTATION, Alignment, RepresentationAlignment
 from dew.objectives.diffusion.end_to_end import AUTOENCODER, LATENT_STATS, EndToEnd
-from dew.registry import objectives
+from dew.registry import objectives, trainings
 from dew.sampling.guidance import CFG, Guidance
 from dew.sampling.pipelines import TextToImage
 from dew.sampling.sample import sample
 from dew.sampling.solvers import DDIM, Solver
 
 if TYPE_CHECKING:
+    from dew.objectives.diffusion.config import DiffusionRunConfig
+    from dew.objectives.rl.flow import FlowRollout
     from dew.training.state import TrainState
 
 # Samples a validation batch draws, conditioned or not.
@@ -236,13 +240,13 @@ class DiffusionObjective(Objective[Ratio]):
         process: Process | Preset | None = None,
         inputs: InputSpec | None = None,
         *,
-        autoencoder: AutoEncoder | None = None,
+        autoencoder: AutoEncoder | None | Omitted = OMITTED,
         unconditional_prob: float = 0.12,
         ema_decay: float | optax.Schedule | None = 0.999,
         solver: Solver = _DEFAULT_SOLVER,
         guidance: Guidance | None = _DEFAULT_GUIDANCE,
         steps: int | None = None,
-        variables: Variables | None = None,
+        variables: Variables | None | Omitted = OMITTED,
         uncertainty: int | None = None,
         alignment: Alignment | None = None,
         end_to_end: EndToEnd | None = None,
@@ -262,8 +266,10 @@ class DiffusionObjective(Objective[Ratio]):
         pipeline in place of the denoiser (`DiffusionObjective(flux)`), which
         supplies the denoiser, `variables`, `process`, `inputs`,
         `autoencoder` and its own sampling policy; any of them given here
-        overrides it. Its text encoder trains nothing but encodes every
-        caption, so a pipeline loaded without it is refused.
+        overrides it, an explicit None included (`autoencoder=None` trains
+        in pixel space, `variables=None` draws the denoiser). Its text
+        encoder trains nothing but encodes every caption, so a pipeline
+        loaded without it is refused.
 
         `ema_decay` is
         the EMA's decay, a number or a schedule of the updates before it,
@@ -297,17 +303,19 @@ class DiffusionObjective(Objective[Ratio]):
             model = source.model
             process = source.process if process is None else process
             inputs = source.inputs if inputs is None else inputs
-            autoencoder = source.autoencoder if autoencoder is None else autoencoder
-            variables = source.variables if variables is None else variables
+            autoencoder = source.autoencoder if autoencoder is OMITTED else autoencoder
+            variables = source.variables if variables is OMITTED else variables
             solver = source.schedule.solver if solver is _DEFAULT_SOLVER else solver
             guidance = source.task.guidance if guidance is _DEFAULT_GUIDANCE else guidance
             steps = source.task.steps if steps is None else steps
-            held = variables.get("encoders", {})
+            held = source.variables.get("encoders", {})
             if any(keyword not in held for keyword in inputs.conditions):
                 raise ValueError("this pipeline was loaded without its text encoder (text=False), and "
                                  "training encodes its captions; load it with its text encoder")
         if process is None or inputs is None:
             raise ValueError("a denoiser needs its `process` and `inputs`; a loaded pipeline carries both")
+        autoencoder = None if autoencoder is OMITTED else autoencoder
+        variables = None if variables is OMITTED else variables
         steps = _DEFAULT_STEPS if steps is None else steps
         self.model = model
         self.process = build_process(process)
@@ -638,29 +646,44 @@ class DiffusionObjective(Objective[Ratio]):
             samples = autoencoder.decode(params["autoencoder"], samples)
         return jnp.clip(samples, -1.0, 1.0)
 
+    def _rows(self, batch) -> int:
+        """How many samples a batch draws, one per real row: its images' count."""
+        return batch[self.inputs.sample.key].shape[0]
+
+    def _draw(self, params, batch, step: Step, limit: int | None = None) -> tuple[jax.Array, dict]:
+        """Sample the batch's conditions on every rank, agreeing at each phase.
+
+        The weights are the EMA copy when the step carries one and it is not
+        the objective's reference (`_ema_is_reference`), else the live ones.
+        `limit` caps the rows drawn, which is what a preview takes. Returns
+        the samples and the condition tokens behind them.
+        """
+        weights = params if step.ema is None or self._ema_is_reference else step.ema
+
+        def setup() -> tuple[int, dict]:
+            count, selected = self._rows(batch), self._sampling_batch(batch)
+            if limit is not None:
+                count = min(limit, count)
+                selected = jax.tree.map(lambda value: value[:count], selected)
+            return count, selected
+
+        count, selected = agreed("diffusion sample setup", setup)
+        samples = agreed("diffusion sample generation",
+                         lambda: self._sample(weights, selected, step.key, count=count))
+        return samples, {keyword: selected[condition.field]
+                         for keyword, condition in self.inputs.conditions.items()}
+
     def evaluate(self, params, batch, step: Step):
         """One generated sample for every real row, without display decoding."""
-        params = params if step.ema is None else step.ema
-        count = batch[self.inputs.sample.key].shape[0]
-        samples = self._sample(params, self._sampling_batch(batch), step.key, count=count)
+        samples, _ = self._draw(params, batch, step)
         assert self.artifact is not None
         return self.artifact(samples)
 
     def preview(self, params, batch, step: Step, *, scored=None):
-        """A separate small draw for display, with root-only caption decoding."""
-        def setup():
-            weights = params if step.ema is None else step.ema
-            count = min(VALIDATION_SAMPLES, batch[self.inputs.sample.key].shape[0])
-            return weights, count, self._sampling_batch(batch)
-
-        def generate():
-            selected = jax.tree.map(lambda value: value[:count], raw_batch)
-            return (self._sample(weights, selected, step.key, count=count),
-                    {keyword: selected[condition.field]
-                     for keyword, condition in self.inputs.conditions.items()})
-
-        weights, count, raw_batch = agreed("diffusion preview setup", setup)
-        samples, tokens = agreed("diffusion preview generation", generate)
+        """A separate small draw for display: up to `VALIDATION_SAMPLES` rows on
+        every process, gathered to the host, with captions decoded on process
+        zero; the other processes return None."""
+        samples, tokens = self._draw(params, batch, step, VALIDATION_SAMPLES)
         samples, tokens = collective_host((samples, tokens), phase="diffusion preview")
         if jax.process_index() != 0:
             return None
@@ -671,3 +694,93 @@ class DiffusionObjective(Objective[Ratio]):
                 break
         assert self.artifact is not None
         return self.artifact(samples, captions)
+
+
+class Training(ABC):
+    """How a diffusion run trains: the denoising loss, or a loss of its own in its place.
+
+    A run holds one (`DiffusionRunConfig.mode`), registered in
+    `dew.registry.trainings` under the name of the objective it builds, which is
+    the name the run's record gives that objective. `preset_class` is the preset
+    the objective's loss trains under, None for any, and `guided` is whether
+    validation samples with the run's guidance, which a few-step student or a
+    model with its guidance trained in does not.
+    """
+
+    preset_class: ClassVar[type[Preset] | None] = None
+    guided: ClassVar[bool] = True
+
+    @abstractmethod
+    def objective(self, run: DiffusionRunConfig, model: nn.Module, process: Process, inputs: InputSpec, *,
+                  autoencoder: AutoEncoder | None, variables: Variables | None) -> DiffusionObjective:
+        """Return this mode's objective over the run's model, process, inputs, autoencoder and variables.
+
+        It samples as the run says.
+        """
+
+    def check(self, run: DiffusionRunConfig) -> None:
+        """Refuse a run this mode cannot train.
+
+        That is a run under another preset than `preset_class`, or a guided one when
+        this mode samples unguided.
+        """
+        name = trainings.name_of(type(self))
+        if self.preset_class is not None and not isinstance(run.preset, self.preset_class):
+            raise ValueError(f"{name} trains on its own loss under the {self.preset_class.__name__} preset; "
+                             f"the run names {type(run.preset).__name__ if run.preset else None}")
+        if not self.guided and run.guidance is not None:
+            raise ValueError(f"{name} samples unguided; set guidance None")
+
+    def rollout(self, objective: DiffusionObjective) -> FlowRollout | None:
+        """Return the trainer's rollout over `objective`.
+
+        Without one, as here, the trainer trains on each batch as it comes.
+        """
+        return
+
+
+@trainings("diffusion")
+@dataclasses.dataclass(frozen=True)
+class Denoising(Training):
+    """The denoising loss, `DiffusionObjective`'s.
+
+    `uncertainty` is the number of Fourier channels of a head that learns EDM2's
+    loss weighting; EDM2 uses 128, and None keeps the preset's fixed weighting.
+    `alignment` aligns the model's hidden tokens with a frozen DINOv2's (REPA or
+    iREPA), and with its `end_to_end` also tunes the autoencoder through the
+    alignment (REPA-E).
+    """
+
+    uncertainty: int | None = None
+    alignment: RepresentationAlignment | None = None
+
+    def objective(self, run: DiffusionRunConfig, model: nn.Module, process: Process, inputs: InputSpec, *,
+                  autoencoder: AutoEncoder | None, variables: Variables | None) -> DiffusionObjective:
+        return DiffusionObjective(
+            model, process, inputs, autoencoder=autoencoder, variables=variables,
+            unconditional_prob=run.unconditional_prob, ema_decay=run.ema_decay, solver=run.solver,
+            guidance=run.guidance, steps=run.sampling_steps, uncertainty=self.uncertainty,
+            alignment=None if self.alignment is None else self.alignment.build(variables),
+            end_to_end=None if self.alignment is None else self.alignment.end_to_end)
+
+    def check(self, run: DiffusionRunConfig) -> None:
+        super().check(run)
+        if self.alignment is not None and run.pretrained is not None:
+            raise ValueError("representation alignment trains a scratch model on the denoising loss; "
+                             "it takes no `pretrained`")
+        if self.alignment is not None and self.alignment.end_to_end is not None and run.autoencoder is None:
+            raise ValueError("end-to-end tuning trains the run's autoencoder; set `autoencoder`")
+
+
+def teacher_variables(directory: str, variables: Variables | None) -> Variables:
+    """Return a distilled run's teacher model variables.
+
+    They are a saved distilled tree's own copy, else the teacher run's published ones.
+    """
+    from dew.checkpoints import Checkpoints
+
+    if variables is not None:
+        return variables[TEACHER]
+    restored = Checkpoints(directory).variables(ema=None, step=None, mesh=None, layout=None, param_dtype=None)
+    return _without_loss_heads({name: tree for name, tree in restored.items()
+                                if name not in ("encoders", "autoencoder")})

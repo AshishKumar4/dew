@@ -79,10 +79,13 @@ class _Resolved:
 
 @struct.dataclass
 class DenoisingInputs:
-    """Encoded conditioning and initial noise, placed the way a call runs them.
+    """Encoded conditioning and initial noise, placed on the devices the way a call uses them.
 
-    ``rows`` counts this process's real prompts; on a mesh the arrays carry
-    the padded, row-sharded batch a call consumes directly.
+    `TextToImage.prepare` builds them, and a `TextToImage` call takes them in
+    place of prompts. ``rows`` is the number of this process's real prompts. On
+    a mesh the arrays hold the padded batch, sharded by row, which a call uses
+    as it is. A call refuses inputs prepared for another step count, another
+    geometry or another mesh.
     """
 
     noise: jax.Array
@@ -96,11 +99,12 @@ class DenoisingInputs:
 
 @struct.dataclass
 class Images(Generic[ArrayT]):
-    """Decoded samples in [-1, 1], NHWC (NTHWC for a video field), keeping the
-    placement the task ran with.
+    """Decoded samples in [-1, 1], NHWC (NTHWC for a video field), placed as the task ran them.
 
-    ``host()`` reads this process's ``rows`` real rows back as a host array;
-    ``pil()`` reads an image batch's back as 8-bit images.
+    ``latents`` holds the denoised latents, and ``images`` is None when the
+    call ran with ``decode=False``. ``host()`` copies this process's ``rows``
+    real rows back to host arrays, and ``pil()`` returns an image batch's real
+    rows as 8-bit images.
     """
 
     images: ArrayT | None
@@ -108,14 +112,16 @@ class Images(Generic[ArrayT]):
     latents: ArrayT | None = None
 
     def host(self) -> Images[np.ndarray]:
-        """This process's real rows as host arrays, without the padding a
-        row plan added to fill the devices."""
+        """Return this process's real rows as host arrays, without the padding added to fill the devices."""
         return jax.tree.map(lambda leaf: local_rows(leaf)[:self.rows], self)
 
     def pil(self) -> list[PILImage]:
-        """This process's real rows of an NHWC image batch as RGB images (or
-        grayscale, for one channel), their pixels quantized by
-        `dew.artifacts.uint8_pixels`."""
+        """Return this process's real rows of an NHWC image batch as PIL images.
+
+        Three channels give RGB images and one channel gives grayscale. The
+        pixels are quantized by `dew.artifacts.uint8_pixels`. Raises ValueError
+        when the samples kept only their latents, or when they are not
+        `[N, H, W, 3]` or `[N, H, W, 1]` images."""
         from PIL import Image
 
         if self.images is None:
@@ -129,22 +135,26 @@ class Images(Generic[ArrayT]):
 
 @dataclass(frozen=True, eq=False)
 class TextToImage:
-    """`pipe(prompts, key=0)` or `pipe(prompts, steps=40, guidance=4.0, solver=Heun(), key=key)`.
+    """Generates images from text prompts with a trained diffusion model and its encoders.
 
-    `variables` is the objective's whole tree, the EMA copy merged over the live
-    weights when the run kept one, so a sample comes from the weights a run
-    publishes. `steps`, `guidance` and `solver` are the defaults a call
-    omits; an objective or a loaded source sets them. `grid` prepares the
-    process and its explicit time grid for a step count, for a source whose
-    solver pairs its own sigma and model-time tables; `final_denoise`
-    False ends a trajectory the way those solvers do. `finish` runs on the
-    decoded images under the same placement, for a source that ships a
-    checker or an output transform.
+    Call it as `pipe(prompts, key=0)` or
+    `pipe(prompts, steps=40, guidance=4.0, solver=Heun(), key=key)`.
 
-    Weights keep their placement. On a mesh, prompts split into per-process
-    rows over its batch axes and the result keeps that sharding; each row's
-    initial noise comes from its global row index, so a pool draws what one
-    process draws for the same prompts.
+    `variables` is the objective's whole tree, with the EMA copy merged over
+    the live weights when the run kept one, so a sample comes from the weights
+    the run publishes. `steps`, `guidance` and `solver` are the defaults for a
+    call that omits them; an objective or a loaded source sets them. `grid` is
+    for a source whose solver pairs its own sigma and model-time tables, and
+    returns the process and its explicit time grid for a step count. With
+    `final_denoise` False a trajectory ends the way those solvers end it.
+    `finish` runs on the decoded images under the same placement, for a source
+    that ships a checker or an output transform.
+
+    The weights stay where they are placed. On a mesh, the prompts are split
+    into per-process rows over its batch axes, and the result keeps that
+    sharding. Each row's initial noise comes from its global row index, so a
+    pool of processes draws the same noise as one process does for the same
+    prompts.
     """
 
     model: nn.Module
@@ -159,17 +169,22 @@ class TextToImage:
     final_denoise: bool = True
     finish: Callable[[Variables, jax.Array], jax.Array] | None = None
     blank: Callable[[dict], dict] | None = None
-    """The task's own unconditional branch in the dtypes of a conditional one,
-    encoded once by whoever built this task (`DiffusionObjective.blank_conditions`);
-    None encodes it on every call, for a source that has none."""
+    """A function that returns the task's own unconditional branch in the
+    dtypes of the conditional branch it is given. Whoever built this task
+    encoded the branch once (`DiffusionObjective.blank_conditions`). None
+    means each call encodes the unconditional prompt itself, for a source
+    that has no encoded branch."""
 
     def __post_init__(self) -> None:
         # A tree split for training, an adapter's, is read whole.
         object.__setattr__(self, "variables", freeze(dict(thaw(self.variables))))
 
     def bind(self, variables: Variables) -> TextToImage:
-        """Bind another snapshot. Changed encoder leaves get a new lazy blank;
-        a denoiser-only change keeps the already encoded branch."""
+        """Return this task with `variables` as its weights.
+
+        When encoder leaves change, the unconditional branch is encoded again,
+        lazily on first use. When only the denoiser's weights change, the
+        branch already encoded is kept."""
         from dew.objectives.diffusion.objective import FixedBlank
 
         blank = self.blank
@@ -178,8 +193,9 @@ class TextToImage:
         return replace(self, variables=variables, blank=blank)
 
     def quantized(self, spec: Quantization) -> TextToImage:
-        """This task with its denoiser's weights stored quantized as `spec`
-        says and its matmuls computing with them
+        """Return this task with its denoiser's weights quantized as `spec` says.
+
+        The denoiser's matmuls then compute with the quantized weights
         (`dew.training.quantization.quantize_for_serving`). The encoders and
         the autoencoder keep their weights."""
         from dew.training.quantization import quantize_for_serving
@@ -194,8 +210,9 @@ class TextToImage:
 
     @classmethod
     def from_objective(cls, objective: DiffusionObjective, variables: Variables) -> TextToImage:
-        """The objective's model over `variables`, sampling the way its
-        evaluation does; a loss-only head the objective trains is dropped."""
+        """Build a task over the objective's model and `variables` that samples the way its evaluation does.
+
+        A loss-only head the objective trains is dropped."""
         from dew.objectives.diffusion.objective import _without_loss_heads
 
         autoencoder, variables = objective.published_autoencoder(variables)
@@ -208,31 +225,36 @@ class TextToImage:
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
                  mesh: MeshSpec | None = None, layout: Layout | None = None,
                  dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None) -> TextToImage:
-        """The run in `directory`: its `run.json` built the way the recipe
-        built it, and the weights of its latest checkpoint (or `step`).
+        """Load the run in `directory`, built from its `run.json` the way the recipe built it.
+
+        The weights come from the run's latest checkpoint, or from `step`.
 
         `ema` None reads the averaged weights when the run kept them and the
-        live ones when it kept none; True requires the averaged ones and False
-        reads the live ones. A run whose average is a reference policy rather
-        than the trained one (Flow-GRPO's frozen KL reference) reads its live
-        policy. With `mesh` the weights restore straight onto that mesh under
-        `layout`, the way the trainer places them; without one the default
-        mesh uses the current pool.
-        The configured unconditional prompt uses the same eager encoding as
-        an objective's pipeline, at its recorded construction-time matmul
-        precision. The required `condition_precision` field is None when
-        the objective used JAX's default, independent of the caller's context.
-        dtype overrides computation in the model, encoders and VAE. param_dtype
-        overrides parameter storage; None preserves checkpoint storage exactly.
+        live ones when it kept none; True requires the averaged weights, and
+        False reads the live ones. A run whose averaged weights are a reference
+        policy, such as Flow-GRPO's frozen KL reference, always reads its live
+        policy. With `mesh`, the weights are restored directly onto that mesh
+        under `layout`, the way the trainer places them. Without it, they go
+        onto a default `MeshSpec()` over the current pool's devices.
+
+        The configured unconditional prompt is encoded the way an objective's
+        pipeline encodes it: eagerly, at the matmul precision recorded when the
+        objective was built. The record must have a `condition_precision`
+        field, which is None when the objective used JAX's default, whatever
+        precision the caller's context sets.
+
+        `dtype` sets the compute dtype of the model, the encoders and the VAE.
+        `param_dtype` sets the dtype the parameters are stored in; None keeps
+        the checkpoint's dtypes exactly.
         """
         from dew.checkpoints import Checkpoints
-        from dew.config import ModelConfig, _built
+        from dew.config import ModelConfig
         from dew.diffusion.process import Process
         from dew.inference.tasks import run_record
         from dew.nn.autoencoders import AutoEncoder
         from dew.objectives.diffusion.objective import FixedBlank, _without_loss_heads
         from dew.records import integer, record as fields, text
-        from dew.registry import objectives, solvers
+        from dew.registry import from_record, objectives, solvers
 
         record = run_record(directory, step)
         config = ModelConfig.from_dict(fields(record['model'], 'model'))
@@ -259,7 +281,7 @@ class TextToImage:
         autoencoder = None
         if autoencoder_record is not None and end_to_end is not None:
             from dew.objectives.diffusion.end_to_end import AUTOENCODER, EndToEnd
-            tuning = _built(EndToEnd, fields(end_to_end, 'end_to_end'))
+            tuning = from_record(EndToEnd, fields(end_to_end, 'end_to_end'), dtypes=False)
             frozen = AutoEncoder.from_json(autoencoder_record, params=params['params'][AUTOENCODER])
             autoencoder, params = tuning.tuned(frozen, params)
         elif autoencoder_record is not None:
@@ -267,7 +289,8 @@ class TextToImage:
         solver_record = fields(record['solver'], 'solver')
         solver = solvers.build(text(solver_record['name'], 'solver name'),
                                 fields(solver_record['fields'], 'solver fields'))
-        guidance = None if record['guidance'] is None else _built(CFG, fields(record['guidance'], 'guidance'))
+        guidance = (None if record['guidance'] is None
+                    else from_record(CFG, fields(record['guidance'], 'guidance'), dtypes=False))
         precision = record['condition_precision']
         precision = None if precision is None else text(precision, 'condition_precision')
         return cls(config.build(), Process.from_json(fields(record['process'], 'process')),
@@ -281,8 +304,11 @@ class TextToImage:
                         ema: bool | None = None, mesh: MeshSpec | None = None,
                         layout: Layout | None = None, dtype: DTypeLike | None = None,
                         param_dtype: DTypeLike | None = None) -> TextToImage:
-        """A run directory published to the Hugging Face Hub, as
-        `HfApi().upload_folder` of the run directory writes it."""
+        """Download a run directory from the Hugging Face Hub and load it with `from_run`.
+
+        The repository holds the run directory as `HfApi().upload_folder`
+        writes it. `revision` is the Hub revision to download; the other
+        arguments are `from_run`'s."""
         from dew.interop.hub import pull_from_hub
 
         return cls.from_run(os.fspath(pull_from_hub(repo_id, revision=revision)),
@@ -292,13 +318,13 @@ class TextToImage:
     @classmethod
     def from_flaxdiff(cls, directory: str | os.PathLike, config: Mapping[str, object], *, jax_version: str,
                       ema: bool = True, best: bool = False, dtype: DTypeLike | None = None) -> TextToImage:
-        """A FlaxDiff text-to-image run (`simple_udit` or `hybrid_dit` on the
-        SD VAE) over Dew's own model.
+        """Load a FlaxDiff text-to-image run (`simple_udit` or `hybrid_dit` on the SD VAE) into Dew's model.
 
         `directory` is one checkpoint step, `config` the run config FlaxDiff's
-        trainer logged, and `jax_version` the jax the run trained under, from
-        its `requirements.txt`. `ema` and `best` pick the weights; `dtype` is
-        the model's compute dtype. `dew.interop.flaxdiff` reads the format.
+        trainer logged, and `jax_version` the jax version the run trained
+        under, from its `requirements.txt`. `ema` and `best` pick the weights;
+        `dtype` is the model's compute dtype. `dew.interop.flaxdiff` reads the
+        format.
         """
         from dew.interop import flaxdiff
 
@@ -306,8 +332,11 @@ class TextToImage:
                                       dtype=dtype)
 
     def prepared_process(self, steps: int) -> tuple[Process, tuple[float, ...] | None]:
-        """The process and explicit time grid a `steps` call walks; the grid
-        is concrete, so the compiled trajectory has its length and values."""
+        """Return the process and explicit time grid that a call with `steps` steps runs.
+
+        The grid is a tuple of concrete times, so the compiled trajectory has a
+        fixed length and fixed values. It is None when the task has no `grid`.
+        Raises ValueError unless `steps` is a positive int."""
         if type(steps) is not int or steps < 1:
             raise ValueError("steps must be a positive integer")
         if self.grid is None:
@@ -317,8 +346,10 @@ class TextToImage:
 
     @property
     def latent_shape(self) -> tuple[int, ...]:
-        """The per-example shape the model denoises: the sample field's, or
-        its latent when an autoencoder sits in front of the model."""
+        """The per-example shape the model denoises.
+
+        It is the sample field's shape, or that field's latent shape when the
+        task has an autoencoder in front of the model."""
         shape = self.inputs.sample.shape
         return shape if self.autoencoder is None else self.autoencoder.latent_shape(shape)
 
@@ -353,24 +384,39 @@ class TextToImage:
         times: ArrayLike | Sequence[float] | None = None,
         encode_key: int | jax.Array | None = None,
     ) -> DenoisingInputs:
-        """Encode conditions and construct the initial state on a concrete grid.
+        """Encode the conditions and build the initial state for a call, on a concrete grid.
 
-        Images are uint8 or normalized floating NHWC pixels at the task's
-        geometry. image_latents skips VAE encoding. A mask adds spatial
-        conditioning to both guidance branches. noise is unit Gaussian noise
-        for noising a clean image; initial is an already-noisy latent state
-        for a continuation or refiner handoff and is never noised again.
-        Explicit times select a partial trajectory in the prepared process.
-        encode_key samples a VAE posterior; None uses its mean.
+        Pass either `prompts` or `conditions`. The result is `DenoisingInputs`,
+        which a call takes in place of prompts. Each array argument has one row
+        or one row per sample. The optional inputs:
+
+        - `image`: uint8 or normalized floating NHWC pixels at the task's
+          geometry.
+        - `image_latents`: the image already encoded, which skips VAE encoding.
+        - `mask`: spatial conditioning added to both guidance branches; it
+          needs `image` and an autoencoder.
+        - `noise`: unit Gaussian noise for noising a clean image.
+        - `initial`: an already-noisy latent state for a continuation or
+          refiner handoff, which is never noised again.
+        - `times`: an explicit grid that selects a partial trajectory in the
+          prepared process.
+        - `encode_key`: the key that samples a VAE posterior; None uses its
+          mean.
 
         `conditions` are prompts already encoded, `{keyword: condition}` with
-        one row per sample, in place of `prompts`: a pipeline's conditioner
-        loaded alone encodes them, so its text encoder need not share the
-        device with the denoiser (`load_diffusion_source(text=False)`).
-        `unconditional` encoded the same way, one row or one per sample, is
-        the branch guidance reads; without it the task's own blank prompt is
-        encoded where the text encoder is loaded, and otherwise the call
-        takes no guidance. Each row's noise is the one a prompted call draws.
+        one row per sample. A pipeline's conditioner loaded on its own can
+        encode them, so the text encoder does not have to share the device with
+        the denoiser (`load_diffusion_source(text=False)`). `unconditional`
+        encoded the same way, one row or one per sample, is the branch guidance
+        reads. It can also be negative prompts as text, which the text encoder
+        encodes. Without it, the task's own blank prompt is encoded if the text
+        encoder is loaded. If it is not loaded, the result has no unconditional
+        branch, and a call with it must pass `guidance=None`. Each row's noise
+        is the noise a call with prompts draws.
+
+        Raises ValueError for a combination the task cannot run, such as
+        `image` together with `image_latents`, or `noise` without a clean
+        image.
         """
         mesh = mesh_of(self.variables)
 
@@ -635,9 +681,13 @@ class TextToImage:
         key: int | jax.Array | None = None,
         decode: bool = True,
     ) -> Images:
-        """Images in [-1, 1], `[rows, H, W, C]`. `guidance` is a classifier-free
-        guidance scale, or a `CFG` with its interval, or None for the plain
-        conditional prediction; omitted, it is the task's default."""
+        """Generate images for `prompts`, as `Images` in [-1, 1] of shape `[rows, H, W, C]`.
+
+        `prompts` can also be `DenoisingInputs` from `prepare`. `guidance` is a
+        classifier-free guidance scale, a `CFG` with its interval, or None for
+        the plain conditional prediction; when it is omitted, the task's
+        default applies, and so do the task's `steps` and `solver`. With
+        `decode=False` the result holds only the latents."""
         mesh = mesh_of(self.variables)
 
         def resolve():
