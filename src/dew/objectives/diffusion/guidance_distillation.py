@@ -52,10 +52,10 @@ def guided_target(conditional: jax.Array, unconditional: jax.Array, scale: jax.A
 class GuidanceDistillation(Training):
     """Distillation of a saved run's classifier-free guidance into this run's model.
 
-    The student reads the guidance scale as its conditioning's guidance input
-    (`GuidanceDistillationObjective`) and samples one branch. `teacher` is the
-    teacher run's directory, and `scales` is the range each row's scale is drawn
-    from.
+    The student reads the guidance scale through its conditioning's guidance input
+    (`GuidanceDistillationObjective`), so sampling runs one branch. `teacher` is the
+    teacher run's directory, which a run must name, and `scales` is the range each
+    row's scale is drawn from.
     """
 
     guided = False
@@ -75,10 +75,10 @@ class GuidanceDistillation(Training):
     def objective(self, run: DiffusionRunConfig, model: nn.Module, process: Process, inputs: InputSpec, *,
                   autoencoder: AutoEncoder | None,
                   variables: Variables | None) -> GuidanceDistillationObjective:
-        """Return the student over the teacher run's objective and its variables.
+        """Return the student objective over the teacher run's objective and its variables.
 
-        The variables are a saved student tree's copy of them if there is one, and the
-        teacher run's published ones otherwise.
+        The teacher's variables are the copy a saved student tree holds when `variables` is
+        given, and otherwise the weights the teacher run published.
         """
         from dew.checkpoints import Checkpoints
 

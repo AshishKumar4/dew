@@ -201,12 +201,14 @@ class _Draws(NamedTuple):
 class ConsistencyDistillation(Training):
     """rCM distillation of a saved flow run into a few-step student.
 
-    rCM is sCM's consistency loss regularized by DMD2's, or either one alone when
-    the other's weight is 0 (`ConsistencyDistillationObjective` documents the other
-    fields), under the `Flow` preset, sampling unguided. `teacher` is the teacher
-    run's directory a run loads it from. Its model is this run's `model`, and the
-    student and the fake score start from its weights; an objective built in code
-    takes the teacher's weights instead.
+    rCM is sCM's consistency loss regularized by DMD2's, or either loss alone when
+    the other's weight is 0. It trains under the `Flow` preset and samples unguided.
+    `ConsistencyDistillationObjective` documents the other fields.
+
+    `teacher` is the teacher run's directory, which a run loads; a run without one
+    is refused. The teacher's model is this run's `model`, and the student and the
+    fake score start from the teacher's weights. An objective built in code is given
+    the teacher's weights directly.
     """
 
     preset_class = Flow
@@ -250,11 +252,13 @@ class ConsistencyDistillation(Training):
             guidance=None, steps=run.sampling_steps)
 
     def check_teacher(self, architecture: str) -> None:
-        """Refuse sCM over a teacher whose time embedding changes too fast in time.
+        """Refuse sCM from a teacher whose time embedding changes too fast with time.
 
-        The student starts from the teacher's variables, including its Fourier table,
-        so it trains with the teacher's time scale whatever this run's model config
-        says.
+        The student starts from the teacher's variables, including its Fourier table, so
+        it trains with the teacher's time scale whatever this run's model config says.
+        For continuous consistency with a positive `consistency_weight`, on an
+        architecture that has a `time_scale` field, this raises ValueError unless the
+        teacher trained at `SMOOTH_TIME_SCALE`.
         """
         from .config import DiffusionRunConfig
 
