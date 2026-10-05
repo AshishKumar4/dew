@@ -80,7 +80,7 @@ const tutorialNames: Record<string, string> = {
 		</section>
 		<section class="band landing-videos" data-reveal>
 			<h2 class="band-title">Video</h2>
-			<p class="framework-note">Wan 2.1 1.3B, running natively in Dew · <a href="/gallery/wan-2.1/manifest.json">Prompts and settings</a></p>
+			<p class="framework-note">Wan 2.1 1.3B's released weights, sampled with Dew's JAX implementation · <a href="/gallery/wan-2.1/manifest.json">Prompts and settings</a></p>
 			<div class="landing-image-grid">{videos.map((clip) => <figure>
 				<video data-lazy-video data-src={`/gallery/wan-2.1/${clip.video}`} poster={`/gallery/wan-2.1/${clip.poster}`} width="832" height="480" preload="none" muted loop playsinline controls aria-label={clip.prompt} />
 				<figcaption>{clip.prompt}</figcaption>
@@ -89,7 +89,7 @@ const tutorialNames: Record<string, string> = {
 
 		<section class="band run" data-reveal>
 			<h2 class="band-title">Training</h2>
-			<p class="band-lede">A decoder learns Tiny Shakespeare on {capture.meta.where}, then generates ROMEO and JULIET samples.</p>
+			<p class="band-lede">A small decoder trains on Tiny Shakespeare on {capture.meta.where}, then writes one sample from each of the prompts <code>ROMEO:</code> and <code>JULIET:</code>.</p>
 			<div class="run-grid">
 				<Code code={shortHero.trimEnd()} lang="python" title="train.py" />
 				<HeroOutput screen={hero.screen} meta={capture.meta} seconds={hero.seconds} replay={hero.replay} rows={hero.rows} columns={hero.columns} source_rows={hero.source_rows} playbackSeconds={terminalReplay.duration} />
@@ -99,22 +99,22 @@ const tutorialNames: Record<string, string> = {
 
 		<section class="band" data-reveal>
 			<h2 class="band-title">Language modeling</h2>
-			<p class="band-lede">The objective defines the loss, initialization and evaluation. The same <code>Trainer.fit</code> owns optimization, reporting and checkpoints.</p>
+			<p class="band-lede">The objective creates the model's variables, computes the loss and runs evaluation. <code>Trainer.fit</code> steps the optimizer, logs progress and saves checkpoints, and every model on this page trains through that one call.</p>
 			<Code code={snippet('lm')} lang="python" title="framework.py" />
 			<p class="framework-note"><a href={fullScript}>Full script</a></p>
 		</section>
 
 		<section class="band" data-reveal>
 			<h2 class="band-title">Representation learning</h2>
-			<p class="band-lede">A JEPA encoder learns by predicting masked patch representations from the visible context.</p>
+			<p class="band-lede">A JEPA encoder sees part of an image and learns to predict the representations of the patches it cannot see.</p>
 			<Code code={snippet('jepa')} lang="python" title="framework.py" />
 		</section>
 
 		<section class="band" data-reveal>
 			<h2 class="band-title">Fine-tuning</h2>
-			<p class="band-lede">Load a Hub checkpoint into a native Flax model, generate, fine-tune with the same trainer, and export under its source tensor names.</p>
+			<p class="band-lede">Load a Hugging Face checkpoint as a Flax model, generate from it, fine-tune it with the same trainer, and save it back in the Hugging Face layout with its original tensor names.</p>
 			{live.endpoint && live.turnstileSitekey && <LiveText cell={textCell} recorded={textRecording.text} models={[{ id: 'HuggingFaceTB/SmolLM2-135M-Instruct', label: 'SmolLM2 135M Instruct' }]} />}
-			<Code code={snippet('pretrained-source', 'finetune-load', 'finetune')} lang="python" title="framework.py — Qwen3-0.6B" />
+			<Code code={snippet('pretrained-source', 'finetune-load', 'finetune')} lang="python" title="framework.py (Qwen3-0.6B)" />
 			<HeroOutput screen={records.pretrained.capture.hero.screen} meta={records.pretrained.capture.meta}
 				seconds={records.pretrained.capture.hero.seconds} columns={records.pretrained.capture.hero.columns}
 				source_rows={records.pretrained.capture.hero.screen.length} playbackSeconds={0} />
@@ -124,7 +124,7 @@ const tutorialNames: Record<string, string> = {
 
 		<section class="band replay" data-replays data-reveal>
 			<h2 class="band-title">Diffusion</h2>
-			<p class="band-lede">A process defines the noise, times and training target. A solver walks that process at generation time; it can change without retraining.</p>
+			<p class="band-lede">The process sets how training adds noise and what the model learns to predict. At generation time a solver runs the process in reverse, and you can switch solvers without retraining.</p>
 			<LiveSampler setup={samplerSetup} cell={samplerCell} colab={tries.find((entry) => entry.name === 'Colab notebook')!.href} />
 			<Code code={snippet('diffusion')} lang="python" title="Define and train a DiT" />
 			<p class="framework-note">A {modelSize}M-parameter text-to-image model at {resolution}, trained with Dew. Weights: <a href="https://huggingface.co/dewml/hybrid-dit-176m">dewml/hybrid-dit-176m</a>.</p>
@@ -138,18 +138,18 @@ const tutorialNames: Record<string, string> = {
 
 		<section class="band" data-reveal>
 			<h2 class="band-title">Serving</h2>
-			<p class="band-lede">A <code>TextGeneration</code> task binds the model, weights and decoding policy. The server batches requests over the same task, keeping each request's seed and cache.</p>
-			<Code code={snippet('serving')} lang="python" title="framework.py — batched decoding" />
+			<p class="band-lede">A <code>TextGeneration</code> task holds the model, its weights and the sampling settings. <code>Server</code> runs many requests through one task in shared batches, and each request keeps its own seed and KV cache.</p>
+			<Code code={snippet('serving')} lang="python" title="framework.py (batched decoding)" />
 			<pre class="shown-output">{records.serving.result.text.join('\n')}</pre>
 			<p class="framework-note">Store weights in int8 or fp8:</p>
-			<Code code={snippet('int8', 'fp8')} lang="python" title="framework.py — weight-only int8 and fp8" />
-			<p class="framework-note"><a href="/guides/inference/">Serving</a> covers paging, prefix sharing, constrained decoding and the measured quantization errors.</p>
+			<Code code={snippet('int8', 'fp8')} lang="python" title="framework.py (weight-only int8 and fp8)" />
+			<p class="framework-note">The <a href="/guides/inference/">serving guide</a> covers the paged KV cache, prefix sharing, constrained decoding, and the error each quantized format adds.</p>
 		</section>
 
 		<section class="band" data-reveal>
 			<h2 class="band-title">Distributed</h2>
-			<p class="band-lede">Change the mesh, not the training loop. FSDP shards parameter storage, tensor parallelism splits model widths, and an expert axis shards an MoE's experts; the data axis fills the remaining devices.</p>
-			<Code code={snippet('mesh')} lang="python" title="framework.py — the same objective and data" />
+			<p class="band-lede">To use more devices, give <code>Trainer</code> a mesh; the objective and data stay as they are. FSDP shards parameters and optimizer state, tensor parallelism splits each layer's weight matrices, and an expert axis puts an MoE's experts on different devices. The devices left over form the data-parallel axis.</p>
+			<Code code={snippet('mesh')} lang="python" title="framework.py (same objective and data)" />
 			<figure class="mesh-overview">
 				<div class="mesh-devices">{mesh.devices.map((id: number, index: number) => <div class="mesh-device"><strong>cpu:{id}</strong><span>fsdp {Math.floor(index / mesh.axes.tensor)} · tensor {index % mesh.axes.tensor}</span></div>)}</div>
 				<figcaption>{mesh.devices.length} simulated CPU devices: {mesh.axes.fsdp} FSDP shards × {mesh.axes.tensor} tensor slices.</figcaption>
@@ -159,8 +159,8 @@ const tutorialNames: Record<string, string> = {
 
 		<section class="band" data-reveal>
 			<h2 class="band-title">Post-training</h2>
-			<p class="band-lede">GRPO scores groups of completions with a reward function. Here the reward is the fraction of adjacent tokens counting up by one, modulo 13.</p>
-			<Code code={snippet('grpo')} lang="python" title="framework.py — rollout and reward" />
+			<p class="band-lede">GRPO samples a group of completions for each prompt and scores them with a reward function. The reward here is the fraction of adjacent tokens that count up by one, modulo 13.</p>
+			<Code code={snippet('grpo')} lang="python" title="framework.py (rollout and reward)" />
 			<figure class="reward-figure">
 				<svg viewBox="0 0 380 180" role="img" aria-label={`Mean completion reward at each of ${reward.length} GRPO updates; fraction of adjacent tokens counting up modulo 13.`}>
 					<line x1="40" y1="40" x2="40" y2="140" /><line x1="40" y1="140" x2="340" y2="140" />
@@ -169,21 +169,21 @@ const tutorialNames: Record<string, string> = {
 					<polyline points={rewardPoints} />
 					{reward.map((row) => <circle cx={40 + (row.step - 1) / Math.max(1, reward.at(-1)!.step - 1) * 300} cy={140 - row.reward * 100} r="2.5" />)}
 				</svg>
-				<figcaption>Mean reward per sampled completion, recorded over {records.grpo.result.steps} updates. <a href="/examples/framework/grpo/tracking/scalars.jsonl">Raw reports</a>. <a href="/guides/post-training/">SFT, DPO, PPO and Flow-GRPO</a> use the same trainer.</figcaption>
+				<figcaption>Mean reward of the sampled completions at each of {records.grpo.result.steps} updates (<a href="/examples/framework/grpo/tracking/scalars.jsonl">raw log</a>). <a href="/guides/post-training/">SFT, DPO, PPO and Flow-GRPO</a> train with the same <code>Trainer</code>.</figcaption>
 			</figure>
 		</section>
 
 		<section class="band" data-reveal>
 			<h2 class="band-title">Reliability</h2>
-			<p class="band-lede">A checkpoint saves the numerical state and data position. On SIGTERM, <code>fit</code> stops at a synchronized step, writes that checkpoint and exits with status 143; the same command resumes it.</p>
-			<Code code={snippet('determinism', 'reliability')} lang="python" title="framework.py — save and resume" />
-			<pre class="shown-output">{`Saved step ${records.reliability.result.saved_step}; resumed to step ${records.reliability.result.resumed_step}.\nAll numerical TrainState leaves equal the uninterrupted run bit for bit: ${records.reliability.result.bit_exact}.`}</pre>
-			<Code code={snippet('profile')} lang="python" title="framework.py — JAX/XProf capture" />
+			<p class="band-lede">A checkpoint stores the training state and the position in the data stream. When the job receives SIGTERM, <code>fit</code> stops at the next step every process agrees on, writes a checkpoint and exits with status 143. Run the same command again to resume.</p>
+			<Code code={snippet('determinism', 'reliability')} lang="python" title="framework.py (save and resume)" />
+			<pre class="shown-output">{`Saved step ${records.reliability.result.saved_step}, then resumed and trained to step ${records.reliability.result.resumed_step}.\nEvery TrainState leaf matches an uninterrupted run bit for bit: ${records.reliability.result.bit_exact}.`}</pre>
+			<Code code={snippet('profile')} lang="python" title="framework.py (JAX/XProf capture)" />
 			<p class="framework-note"><a href="/guides/checkpoints/">Checkpoint guarantees</a> · <a href="/reference/performance/">Profiling</a></p>
 		</section>
 
 		<section class="band try" data-reveal>
-			<h2 class="band-title">Try it and released weights</h2>
+			<h2 class="band-title">Try the 176M model</h2>
 			<ul class="try-list">{tries.map((entry) => <li><a class="try-link" href={entry.href}><span class="try-name">{entry.name}</span><span class="try-what">{entry.what}</span></a></li>)}</ul>
 		</section>
 
@@ -192,14 +192,14 @@ const tutorialNames: Record<string, string> = {
 			<ol class="tutorial-list">{tutorials.map((entry) => <li><a class="tutorial-link" href={`/${entry.slug}/`}><span class="tutorial-number">{entry.number}</span><span class="tutorial-name">{tutorialNames[entry.number]}</span><span class="tutorial-device">{entry.accelerator}</span></a></li>)}</ol>
 		</section>
 		<details class="band framework-note">
-			<summary>Example recording provenance</summary>
+			<summary>How each example above was recorded</summary>
 			<ul>{names.map((name) => {
 				const entry = records[name].capture;
 				return <li><a href={`/examples/framework/${name}/capture.json`}>{name}</a>: {entry.meta.where}, JAX {entry.meta.jax}, Dew{' '}
-					<a href={`https://github.com/AshishKumar4/dew/commit/${entry.meta.dew}`}><code>{entry.meta.dew.slice(0, 7)}</code></a>, {entry.meta.date}, {entry.hero.seconds} s from start to end.</li>;
+					<a href={`https://github.com/AshishKumar4/dew/commit/${entry.meta.dew}`}><code>{entry.meta.dew.slice(0, 7)}</code></a>, {entry.meta.date}, {entry.hero.seconds} s.</li>;
 			})}</ul>
 		</details>
-		<footer class="landing-footer"><span>MIT license. Research software before 1.0.</span><a href={fullScript}>Runnable page examples</a><a href="https://github.com/AshishKumar4/dew">GitHub</a></footer>
+		<footer class="landing-footer"><span>MIT license. Research software before 1.0.</span><a href={fullScript}>All examples as one script</a><a href="https://github.com/AshishKumar4/dew">GitHub</a></footer>
 	</div>
 </StarlightPage>
 
