@@ -275,7 +275,10 @@ class Unmask:
 @presets("mdlm")
 @dataclass(frozen=True)
 class MDLM:
-    """Builds the process of Sahoo et al. 2024, on the log-linear schedule."""
+    """Builds MDLM's masked diffusion process on the log-linear schedule.
+
+    MDLM is Sahoo et al. 2024.
+    """
 
     mask_id: int
     eps: float = 1e-3

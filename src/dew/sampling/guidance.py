@@ -123,13 +123,14 @@ def _interval(interval) -> tuple[float, float]:
 
 @dataclass(frozen=True)
 class CFG:
-    """Interval-limited classifier-free guidance (Kynkaanniemi et al. 2024).
+    """Interval-limited classifier-free guidance.
 
-    The guided prediction is uncond + scale (cond - uncond). Guidance hurts at
-    high noise and does not help at low noise, so outside `interval` the scale
-    is 1, which gives exactly the plain conditional prediction. The interval
-    is measured in progress along the trajectory, from 0 at pure noise to 1
-    at the clean sample, and the default covers all of it.
+    The guided prediction is uncond + scale (cond - uncond). Kynkaanniemi et
+    al. 2024 found that guidance hurts at high noise and does not help at
+    low noise, so outside `interval` the scale is 1, which gives exactly the
+    plain conditional prediction. The interval is measured in progress along
+    the trajectory, from 0 at pure noise to 1 at the clean sample, and the
+    default covers all of it.
 
     `rescale` applies the guidance rescaling of Lin et al. 2023 ("Common
     Diffusion Noise Schedules and Sample Steps are Flawed", section 3.4),

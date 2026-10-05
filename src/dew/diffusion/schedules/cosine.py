@@ -8,10 +8,11 @@ from .discrete import DiscreteNoiseScheduler
 
 
 def cosine_beta_schedule(timesteps, start_angle=0.008, end_angle=0.999):
-    """Return the cosine beta table of Nichol and Dhariwal 2021, Eq. 17.
+    """Return the cosine beta table of Nichol and Dhariwal 2021.
 
-    The cumulative alpha follows f(t) = cos^2((t + s) / (1 + s) * pi / 2) at
-    t = i / T, with T = `timesteps` and s = `start_angle`, and
+    The table is their Eq. 17. The cumulative alpha follows
+    f(t) = cos^2((t + s) / (1 + s) * pi / 2) at t = i / T, with
+    T = `timesteps` and s = `start_angle`, and
     beta_i = 1 - f((i + 1) / T) / f(i / T), clipped at `end_angle`. The
     arithmetic is improved-diffusion's `betas_for_alpha_bar`, operation for
     operation and in scalar `math.cos` (NumPy's vectorized cosine rounds a

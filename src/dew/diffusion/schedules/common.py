@@ -74,12 +74,12 @@ class NoiseScheduler(ABC):
 
 
 class GeneralizedNoiseScheduler(NoiseScheduler):
-    """The variance-exploding schedule family of Karras et al. 2022.
+    """The variance-exploding schedule family of the EDM paper.
 
-    The paper is "Elucidating the Design Space of Diffusion-Based Generative
-    Models". alpha is 1, and the paired preconditioning scales the model
-    input. Every member conditions the model on c_noise = log(sigma) / 4
-    and weights the loss with
+    The paper is Karras et al. 2022, "Elucidating the Design Space of
+    Diffusion-Based Generative Models". alpha is 1, and the paired
+    preconditioning scales the model input. Every member conditions the
+    model on c_noise = log(sigma) / 4 and weights the loss with
     lambda(sigma) = (sigma^2 + sigma_data^2) / (sigma sigma_data)^2 (Eq. 8
     of the paper). A subclass places the sigmas along t (`sigmas`) and
     inverts that placement (`t_of_sigma`) for the solvers that step in
