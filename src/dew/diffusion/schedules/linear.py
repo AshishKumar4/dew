@@ -6,8 +6,11 @@ from .discrete import DiscreteNoiseScheduler
 
 
 def linear_beta_schedule(timesteps, beta_start=0.0001, beta_end=0.02):
-    """Ho et al. 2020's betas, linear from beta_start to beta_end over 1000
-    steps and scaled so another step count keeps the same cumulative alpha."""
+    """Return Ho et al. 2020's betas, linear from `beta_start` to `beta_end` over 1000 steps.
+
+    For another step count, the betas are scaled by 1000 / `timesteps` so
+    the cumulative alpha stays roughly the same.
+    """
     scale = 1000 / timesteps
     return np.linspace(scale * beta_start, scale * beta_end, timesteps, dtype=np.float64)
 

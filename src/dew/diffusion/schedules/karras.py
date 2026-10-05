@@ -7,9 +7,12 @@ from .common import GeneralizedNoiseScheduler
 
 
 class KarrasVENoiseScheduler(GeneralizedNoiseScheduler):
-    """Sigmas placed along t with the rho spacing of Karras et al. 2022 (Eq. 5):
+    """Places sigmas along t with the rho spacing of Karras et al. 2022 (Eq. 5).
+
+    The sigmas are
     sigma(t) = (sigma_max^(1/rho) + (1 - t) (sigma_min^(1/rho) - sigma_max^(1/rho)))^rho,
-    so a uniform grid in t is the paper's sampling grid in sigma."""
+    so a uniform grid in t is the paper's sampling grid in sigma.
+    """
 
     def __init__(self, sigma_min: float = 0.002, sigma_max: float = 80.0, rho: float = 7.0,
                  sigma_data: float = 0.5):
@@ -30,12 +33,12 @@ class KarrasVENoiseScheduler(GeneralizedNoiseScheduler):
 
 
 class EDMNoiseScheduler(GeneralizedNoiseScheduler):
-    """Training sigmas drawn from exp(N(P_mean, P_std^2)): t is the standard
-    normal draw and sigma(t) = exp(P_mean + P_std t).
+    """Draws training sigmas from exp(N(P_mean, P_std^2)).
 
-    Defaults are EDM2's (Karras et al. 2024); EDM1's -1.2/1.2 concentrated too
-    much mass on low noise levels for larger models. Pass them explicitly to
-    reproduce an EDM1 run.
+    t is the standard normal draw, and sigma(t) = exp(P_mean + P_std t). The
+    defaults are EDM2's (Karras et al. 2024), because EDM1's -1.2/1.2
+    concentrated too much mass on low noise levels for larger models. Pass
+    P_mean=-1.2 and P_std=1.2 explicitly to reproduce an EDM1 run.
     """
 
     def __init__(self, sigma_min: float = 0.002, sigma_max: float = 80.0, sigma_data: float = 0.5,
