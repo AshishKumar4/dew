@@ -1,12 +1,12 @@
 # Evaluation and tracking
 
-During `Trainer.fit`, evaluation scores a separate validation split. The objective's `evaluate` method returns artifacts that metrics read to calculate scores. A tracker receives training scalars, validation metrics, previews and run records.
+While `Trainer.fit` runs, evaluation scores a separate validation split. The objective's `evaluate` returns artifacts, such as token scores or generated images, and metrics read those artifacts to compute the scores. A tracker receives the training scalars, the validation metrics, previews and run records.
 
-To run evaluation, the dataset needs a validation split and `fit` needs `eval_every`. You must also supply `metrics` that read the objective's artifact, or `preview=True` with a tracker. Otherwise, `fit` rejects the unused evaluation pass. Passing `metrics` alone does not enable evaluation.
+Evaluation runs only when the dataset has a validation split and `fit` has `eval_every` set. Something also has to read the pass, so `fit` refuses `eval_every` unless you also pass `metrics` that read the objective's artifact, or `preview=True` with a tracker. Passing `metrics` alone does not turn evaluation on.
 
 ## Example
 
-Train a tiny next-token decoder on synthetic token rows and measure perplexity on a different row. This example needs no tokenizer, downloaded weights or accelerator.
+The example trains a tiny next-token decoder on synthetic token rows and measures perplexity on a different row. It needs no tokenizer, downloaded weights or accelerator.
 
 ```python
 import itertools
@@ -45,9 +45,7 @@ Trained 10 steps in 0:00:03: first step after 2.75 s, then 483.1 step/s
 0.6% of the wall time in steps, final loss 0.2373
 ```
 
-Each row has nine IDs. The model reads the first eight and predicts the last eight, so `seq_len=8`. With `vocab_size=4`, valid IDs are zero to three. The run logs training loss and validation perplexity at steps five and ten.
-
-Perplexity exponentiates cross entropy weighted by the number of valid targets. Lower is better when using the same validation data and tokenizer. Validation scores the trained weights. If the objective keeps an EMA, as in `LMObjective(..., ema_decay=0.999)`, it scores the average and prints `eval val (ema)`. This cyclic task does not measure general language ability.
+Each row has nine IDs. The model reads the first eight and predicts the last eight, so `seq_len=8`, and `vocab_size=4` makes the valid IDs zero to three. The run logs the training loss and the validation perplexity at steps five and ten. Perplexity is the exponential of the mean cross entropy per valid target over the whole pass. Lower is better, as long as you compare runs on the same validation data and tokenizer. Validation scores the weights the run trained. If the objective keeps an EMA (`LMObjective(..., ema_decay=0.999)`), validation scores the average instead and the line reads `eval val (ema)`. This cyclic task does not measure general language ability.
 
 ## Artifacts and metrics
 
@@ -60,32 +58,32 @@ Perplexity exponentiates cross entropy weighted by the number of valid targets. 
 | JEPA | Representations. |
 | Masked diffusion | Generated token rows, one batch's worth, undecoded, for custom text metrics. These are not teacher-forced perplexity and not held-out NELBO. |
 
-A `Metric[S]` declares the artifact type it `reads`. Its `__call__` computes sufficient statistics for one batch. `merge(accumulated, contribution)` combines those statistics across batches, and `finalize(accumulated)` returns the scalar score. The first contribution starts the pass.
-
-The trainer stores only the accumulator and current contribution. Metric instances keep no state between calls. Each accumulator belongs to one pass, and a metric can merge its own NumPy buffers in place.
+A `Metric[S]` declares which artifact type it `reads`. It computes one batch's sufficient statistics with `__call__`, adds them to the running total with `merge(accumulated, contribution)`, and reports its scalar with `finalize(accumulated)`. The first contribution starts the pass, so a metric has no separate initial value. The trainer keeps only the accumulator and the current contribution, and metric instances keep no state between calls. An accumulator belongs to one pass, so a metric may merge into its own NumPy buffers in place.
 
 The built-in metrics reduce their batches as follows:
 
 - Perplexity sums weighted losses and target weights, then exponentiates.
 - Image means weight each image once. Video PSNR and SSIM weight each frame once.
 - Paired image metrics and CLIP need as many generated rows as reference or prompt rows.
-- FID pools float64 counts, means and centered second moments for the generated and real populations. It then computes one distance using unbiased covariances. Each population needs at least two rows. State uses O(D²) memory regardless of batch count, plus bounded workspace for batch features and the matrix square root. A small-population FID result is not FID-50k.
+- FID pools float64 counts, means and centered second moments for the generated and the real population, then computes one distance with unbiased covariances. It needs at least two rows in each population. Its state takes O(D²) memory however many batches it is fed, plus bounded workspace for batch features and the matrix square root. FID over a small population is not FID-50k.
 
-  With default weights, features and distance match pytorch-fid 0.3.0 using its published weights. Resizing is bilinear to 299x299 without antialiasing, matching `F.interpolate(align_corners=False)`. `tests/test_metrics.py` checks 1e-4 absolute error on features and 1e-5 relative error on distance. Compare these values with pytorch-fid. They are not comparable with clean-fid's antialiased bicubic resize or the TF1 TTUR code.
+  With the default weights, the features and the distance reproduce pytorch-fid 0.3.0 on the weights it publishes. That includes its resize, which is bilinear to 299x299 without antialiasing, as its `F.interpolate(align_corners=False)` does. `tests/test_metrics.py` checks the features to within 1e-4 absolute and the distance to within 1e-5 relative. So the values are comparable with pytorch-fid's. They are not comparable with clean-fid's, which resizes with antialiased bicubic, or with the TF1 TTUR code's.
 
-  On TPU, the feature extractor inserts an optimization barrier before each strided 2D convolution. This prevents XLA's space-to-batch rewrite from miscompiling small per-device batches. It adds no images to the batch. CPU and GPU compilation removes the barrier.
+  On TPU the feature extractor puts an optimization barrier before each strided 2D convolution, because XLA's space-to-batch rewrite miscompiles that convolution at small per-device batches. The barrier adds no images to the batch, and CPU and GPU compile it away.
 
 - JEPA's `linear_probe` and `knn_probe` fit on the first half of each batch and test on the second half. They log the mean of the batch accuracies as `val/batch_linear_probe_accuracy` and `val/batch_knn_probe_accuracy`. These numbers depend on how the batch is split and are not a probe over the full dataset.
 
-Training metrics use the `train/` prefix. Reduced validation metrics use `val/`. Metric names must be unique within a pass.
+Training metrics are named under `train/`, and reduced validation metrics under `val/`. Metric names must be unique within a pass.
 
 `key=0` is the same root key as `key=jax.random.key(0)`. The fit record
 also keeps the supplied integer seed.
 
 `Mean` turns per-example values or a `(total, count)` pair into a metric.
-It sums counts across uneven batches, giving a small last batch its own
-weight. Set `better` and `reads` explicitly, because evaluation selects
-the exact artifact type. This LM metric ranks top-1 accuracy from the logits:
+It sums counts across uneven batches, so a small last batch weighs only as
+much as its count. `better` and `reads` have no defaults. Checkpoint ranking
+takes its direction from `better`, and evaluation passes the metric the one
+artifact whose type `reads` names. This LM metric measures top-1 accuracy
+from the logits, and the run ranks its checkpoints by it:
 
 ```python
 from dew import Checkpoints, Mean
@@ -107,31 +105,29 @@ run.checkpoints.wait()
 assert run.checkpoints.best is not None
 ```
 
-`Mean` starts a pass with its first contribution and finalizes on the
-host without collectives. A vector counts each example once. A pair can
-specify token counts or fractional weights. A scalar batch mean is rejected.
-`TokenScores.correct` comes from the same chunked head as its losses,
-without retaining a full logits tensor. The name `accuracy` becomes
-`val/accuracy`. Passing `name="val/accuracy"` raises an error because
-the prefix is already present.
+`Mean` starts a pass from its first contribution and finalizes on the
+host without collectives. A vector counts each example once, and a pair can
+hold token counts or fractional weights. A scalar batch mean is refused.
+`TokenScores.correct` comes from the same chunked head as the losses, so no
+full logits tensor is kept. The unprefixed name `accuracy` is reported as
+`val/accuracy`. Evaluation adds that prefix itself, so passing
+`name="val/accuracy"` raises an error.
 
 ## Previews
 
-To run `Objective.preview`, pass `fit(preview=True)`. Process zero must have a tracker, and evaluation must have a coordinated batch. The trainer calls it once per evaluation event. A tracker that accepts only scalars does not enable previews.
-
-LM previews use the objective's `Samples` configuration. Diffusion draws at most four display samples. Masked diffusion uses its configured preview count. DPO and GRPO preview the live policy because their EMA stores a frozen reference. The base `preview` reuses the first scoring artifacts, so JEPA's representation histogram needs no second encoder pass. Preview samples never enter scoring metrics. Without metrics, evaluation skips scoring. Without a tracker, it skips previews.
+The trainer calls `Objective.preview` once per evaluation event, and only if you passed `fit(preview=True)`, process zero has a tracker, and there is a coordinated batch. A tracker that only takes scalars does not turn previews on. LM previews use the objective's `Samples` configuration. Diffusion draws at most four display samples. Masked diffusion uses its configured preview count. DPO and GRPO preview the live policy, because their EMA holds a frozen reference. The base `preview` reuses the first scoring artifacts, so JEPA's representation histogram needs no second encoder pass. Preview samples never enter the scoring metrics. Evaluation skips the scoring work when there are no metrics, and skips the preview work when there is no tracker.
 
 ## Trackers
 
-Diagnostic messages are separate from scalar and record trackers. Dew uses Python's
-`"dew"` logger, at `WARNING` level by default. Rich formats logs on stderr;
-redirected stderr is plain. The live training panel shares its console with the
-log handler. Change verbosity with
+Diagnostic messages go to a logger, separately from the scalar and record trackers. Dew logs
+through Python's `"dew"` logger at `WARNING` level by default, formatted by Rich on stderr.
+Redirected stderr gets plain text, and a live training panel shares its console with the log
+handler. Change verbosity with
 `logging.getLogger("dew").setLevel(logging.INFO)`. A handler configured on `"dew"` before importing
 Dew is left untouched. To use your application's root handlers instead, remove Dew's handlers
 and set `logging.getLogger("dew").propagate = True`.
 
-`Tracker` has three methods: `log(scalars, step)`, `artifact(value, step)` and `close()`. `Trainer.fit` uses the tracker without closing it. Whoever constructs it must close it. If closing a tracker context manager fails during another exception, the original exception still propagates. Import trackers from `dew.training`:
+`Tracker` has three methods: `log(scalars, step)`, `artifact(value, step)` and `close()`. `Trainer.fit` uses the tracker without closing it, so whoever created the tracker closes it. If a tracker used as a context manager fails to close while another exception is already being raised, you still see the original exception. The trackers are importable from `dew.training`:
 
 | Tracker | Writes | Install |
 |---|---|---|
@@ -141,17 +137,17 @@ and set `logging.getLogger("dew").propagate = True`.
 | `TensorBoardTracker(path)` | One event file through TensorBoard's own `EventFileWriter`, without TensorFlow. | `dewml[tensorboard]` |
 | `Trackers(*trackers)` | Every tracker receives each report even if another fails; the first failure is raised. | |
 
-`LocalTracker` never overwrites a recipe's `run.json`. Recipes create it under the checkpoint directory. If checkpoints use a URI, the run prints its local tracking path. Recipes preserve a configured W&B preview request. Local-only reporting does not enable previews.
+`LocalTracker` never overwrites a recipe's `run.json`. Recipes create a local tracker under their checkpoint directory, and a run whose checkpoints are at a URI prints its local tracking path. Recipes keep a W&B preview request you configured, but they do not turn previews on when the only reporting is local.
 
-Local JSON stores non-finite metric values as `"NaN"`, `"+Inf"` and `"-Inf"`. A perfect PSNR remains positive infinity. Read these fields with `float(value)`.
+The local JSON writes non-finite metric values as the strings `"NaN"`, `"+Inf"` and `"-Inf"`, and a perfect PSNR stays positive infinity. Read these fields with `float(value)`.
 
-For plots, install `dewml[plots]` and call `tracker.plot()`. To render them when the tracker closes, use `LocalTracker(path, plots=True)`. Matplotlib uses the Agg backend without opening a display. Nothing is plotted during training. Plots mark non-finite points and omit them from curve segments, while the journal keeps their exact values.
+Plots are opt-in. Install `dewml[plots]`, then call `tracker.plot()`, or construct `LocalTracker(path, plots=True)` to render the plots when the tracker closes. Matplotlib uses the Agg backend and never opens a display, and nothing is plotted during training. Non-finite points are marked and left out of the curve segments, and the journal keeps their exact values.
 
-`MLflowTracker` leaves MLflow's global active run untouched. Scalars become metrics. Records become JSON artifacts at `records/<type>-<step>.json`. MLflow rejects a second value for a param, so artifacts allow a run to report several records of the same type. Previews upload the files produced by the local renderers. If a `FitEnded` record has a status other than "completed", the run ends as `FAILED`. Set `uri` to any store MLflow can read. From MLflow 3.16 on, a local file store also needs `MLFLOW_ALLOW_FILE_STORE=true`.
+`MLflowTracker` never touches MLflow's global active run. Scalars become the run's metrics. Each record becomes a JSON artifact at `records/<type>-<step>.json`. Records are not stored as params because MLflow refuses a second value for a param, and a run reports several records of the same type. A preview is uploaded as the files the local renderers write. A `FitEnded` record whose status is not "completed" ends the run as `FAILED`. `uri` can be any store MLflow reads. From MLflow 3.16 on, a local file store also needs `MLFLOW_ALLOW_FILE_STORE=true`.
 
-`TensorBoardTracker` writes scalars as scalar summaries and records as text summaries under `reporting/<type>`. Images use image summaries under `val/samples/<index>`. The image plugin shows clips as animated GIFs. Representations use a histogram of their per-dimension spread. `TokenScores` has no summary form and raises an error, as with W&B.
+`TensorBoardTracker` writes scalars as scalar summaries and records as text summaries under `reporting/<type>`. Images become image summaries under `val/samples/<index>`, and a video clip becomes an animated GIF, which the image plugin shows. Representations become a histogram of their per-dimension spread. `TokenScores` has no summary form, so the tracker raises an error on it, as the W&B tracker does.
 
-Reporting writes every report synchronously, with no background queue or dropped reports. This I/O takes time at each log step. On an i9-12900K, a report of six scalars took 0.005 ms for a local journal, 0.033 ms for an event file and 0.26 ms for an MLflow file store. A thousand reports therefore cost 5 ms, 33 ms and 0.26 s respectively. Across 10,000 steps of a small regression with `log_every=10`, local and TensorBoard tracking stayed within the run-to-run variation of an untracked run. MLflow run creation, batch logging and termination added 0.5 s to 6.2 s.
+Reporting has no background queue and never drops a report, so its I/O adds time to every log step. On an i9-12900K I measured one report of six scalars at 0.005 ms into a local journal, 0.033 ms into an event file and 0.26 ms into an MLflow file store, so a thousand reports cost 5 ms, 33 ms and 0.26 s. Over 10,000 steps of a small regression at `log_every=10`, the local and TensorBoard trackers stayed within the run-to-run spread of an untracked run. MLflow's run creation, batch logging and termination added 0.5 s to 6.2 s.
 
 ## Run records
 
@@ -171,9 +167,9 @@ Dew does not hash data contents or source revisions. Put their identities in the
 
 ## Hyperparameter sweeps
 
-Use `config.sweep(space, *, train, trials, ledger, tracker, search=random_search, seed=0)` on a `RunConfig` to train one trial per point in a search space. The `train` entry point trains a configuration and returns its score. Each trial uses the normal training loop, with no scheduler, and gets its own record, checkpoints and tracking directory under `<trainer.name>/trial-<index>`.
+`config.sweep(space, *, train, trials, ledger, tracker, search=random_search, seed=0)` on a `RunConfig` trains `trials` trials, each at a point the search picks from `space`. For each trial it calls the entry point `train`, which trains the config it is given and returns a score. Each trial is an ordinary run with its own record, checkpoints and tracking directory under `<trainer.name>/trial-<index>`. The sweep runs the trials one after another through the normal training loop and has no scheduler.
 
-The space maps dotted paths in the run record to candidate values. `to_dict` and `from_dict` apply each point to the configuration. If the class does not declare a path, the call raises an error rather than training with the unchanged configuration.
+A space maps dotted paths in the run record to the values a trial can take. The sweep applies a point through `to_dict` and `from_dict`, so a path the config class does not declare raises an error. A typo in the space therefore cannot leave a trial silently training the unchanged config.
 
 | Search | Behavior |
 |---|---|
@@ -181,7 +177,7 @@ The space maps dotted paths in the run record to candidate values. `to_dict` and
 | `grid_search` | Walks the cartesian product in order. |
 | `optuna_search` | Asks Optuna's sampler for the next point and tells it the trials in the ledger. Install `dewml[hpo]`. |
 
-Each finished trial goes into the ledger before the tracker receives it. Rerunning an interrupted sweep resumes the interrupted trial and skips finished trials. A ledger for a different space is rejected. The tracker receives `sweep/value` at the trial's number and a `TrialFinished` record. Set `trainer.name` so that trials get separate names and cannot resume from each other's checkpoints.
+A finished trial is written to the ledger before it is reported. So if a sweep is interrupted, running it again continues at the trial it stopped on and does not retrain the finished ones. A ledger written for a different space is refused. The tracker receives each trial's score as `sweep/value` at the trial's number, along with its `TrialFinished` record. A sweep needs `trainer.name`, because trials sharing one name would resume from each other's checkpoints.
 
 The example continues the previous one and reuses `objective`, `data`, `Perplexity` and `jax`:
 
@@ -229,20 +225,16 @@ Trained 10 steps in 0:00:01: first step after 0.68 s, then 2683.2 step/s
 {'optim.learning_rate': 0.01}
 ```
 
-The trials train under `runs/sweep/lm-rate/trial-0` and `runs/sweep/lm-rate/trial-1`. Each saves its learning rate in its own `run.json`. `sweep` returns the trials from the ledger. `trial.value` is the score returned by the entry point; `trial.overrides` is the point used for training. A second run of the script reads the ledger without training again.
+The two trials train under `runs/sweep/lm-rate/trial-0` and `runs/sweep/lm-rate/trial-1`, and each one's `run.json` records the learning rate it used. `sweep` returns the trials from the ledger. `trial.value` is the score the entry point returned, and `trial.overrides` is the point the trial trained. A second run of the script reads the ledger and trains nothing.
 
 ## Reproducibility and limits
 
-Each evaluation event derives its random key from the run key and training step. Scoring batch indices and preview sampling use separate fixed RNG domains. Repeating an event with the same state and batches therefore reproduces its samples. Adding a tracker leaves scoring draws unchanged.
+Each evaluation event derives its random key from the run key and the training step. Scoring batch indices and preview sampling use separate fixed RNG domains. So repeating an event with the same state and batches reproduces its samples, and adding a tracker does not change the scoring draws.
 
-All processes run the objective's numerical work and gather global arrays. Only process zero computes host metrics, decodes previews and writes tracking output. Host metric kernels use one process-local device.
+All processes take part in the objective's numerical work and in gathering global arrays. Only process zero computes host metrics, decodes previews and writes tracking output, and the host metric kernels use one process-local device.
 
-Evaluation uses `dew.artifacts.collective_host` to check local conversions and addressable shards before transfer. Processes agree on the global gather plan and share each transfer's outcome before starting the next gather. Built-in previews agree on local setup and generation outcomes before transfer. If a custom hook has its own collectives, call `agree_process_phase` at those same points. The trainer's final agreement after the hook cannot replace these calls.
+Before any transfer, evaluation uses `dew.artifacts.collective_host` to check the local conversions and addressable shards on every process. The processes then agree on the global gather plan and share each transfer's outcome before the next gather starts. Built-in previews agree on their local setup and generation outcomes before they start that transfer. A custom hook with its own collectives must also call `agree_process_phase` at those points. The trainer's own agreement on the hook comes at the end and cannot replace those calls. Finish all gathers before decoding on process zero alone. For local arrays, plain `host` still works on process zero alone. A dead process, a blocked loader, or a failure inside a device collective that is already running still needs the distributed runtime's timeout and the launcher's failure handling.
 
-Finish all gathers before decoding on process zero alone. For local arrays, plain `host` still works on process zero alone. A dead process, blocked loader or failure inside a running device collective still requires the distributed runtime's timeout and launcher failure handling.
+All processes read their validation shards in step, and validation stops when the shortest shard ends. If one shard ends before another, the remaining local rows do not enter the metrics. The `evaluation/coordinated_batches`, `evaluation/records` and `evaluation/uneven_shards` fields describe the part that was read, which may not be the whole split. The record count comes from the placed global batch, so sequence and pipeline-stage replicas count once and scalar metadata adds no rows. The trainer's printed evaluation line shows the scores, the record count and the elapsed time, and it says when the shards were uneven. An empty coordinated validation pass generates no preview and returns no metric values. A non-empty pass with no counted language target raises an error.
 
-Validation stops when the shortest shard ends. Remaining rows in longer shards do not enter the metrics. `evaluation/coordinated_batches`, `evaluation/records` and `evaluation/uneven_shards` describe the consumed prefix, which may be smaller than the full split.
-
-The record count comes from the placed global batch. Sequence and pipeline-stage replicas count once; scalar metadata adds no rows. The printed evaluation line reports scores, record count, elapsed time and whether shards were uneven. An empty coordinated pass returns no metric values or preview. A non-empty pass with no counted language target raises an error.
-
-To compare generative scores, record the seed, generated and real sample counts, conditioning data, solver, sampling steps and guidance. Include the feature and preprocessing definition, and keep the run configuration with the results.
+When you compare generative scores, record the seed, the numbers of generated and real samples consumed, the conditioning data, the solver, the number of sampling steps, the guidance, and the feature and preprocessing definition. Keep the run configuration with the results.

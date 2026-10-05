@@ -330,9 +330,9 @@ trainable, so export has to use the objective's model:
 LLaDA (`llada`) and Dream (`dream`, `Dream`) train with the MDLM loss,
 starting from their released weights.
 
-`MaskedDiffusionObjective(model, MDLM(mask_id=...)(), seq_len,
-pretrained=loaded.variables)` trains on the MDLM negative ELBO starting from
-a loaded checkpoint. `loaded.save(directory, variables=state.variables)` writes
+`MaskedDiffusionObjective(loaded, MDLM(mask_id=...)(), seq_len)` trains on the
+MDLM negative ELBO starting from a loaded checkpoint.
+`loaded.save(directory, variables=state.variables)` writes
 the trained weights back with the source's own tensor names (OLMo-style names
 for LLaDA, the Qwen 2 layout for Dream), next to the config they came with.
 The transformers library has no class for either release, so the export tests compare
@@ -470,7 +470,7 @@ sft_data = Dataset(
 sft_objective = LMObjective(
     model,
     seq_len=len(row) - 1,
-    pretrained=lm_state.variables,
+    variables=lm_state.variables,
     loss_role=Role.ASSISTANT,
 )
 sft_state = Trainer(
@@ -498,7 +498,7 @@ pair = {"chosen": prompt + response, "rejected": prompt + rejected,
         "rejected_mask": [0] * len(prompt) + [1] * len(rejected)}
 pairs = PreferencePairs(records=(json.dumps(pair),) * 8, seq_len=16,
                         loading=Loading(workers=0, threads=1, read_buffer=2)).load(batch=8)
-dpo = DPOObjective(model, seq_len=15, beta=0.1, pretrained=lm_state.variables)
+dpo = DPOObjective(model, seq_len=15, beta=0.1, variables=lm_state.variables)
 dpo_state = Trainer(dpo, optax.adam(0.001), key=jax.random.key(2)).fit(
     pairs, steps=10, log_every=5)
 ```
@@ -546,7 +546,7 @@ rl_objective = GRPOObjective(
     model,
     seq_len=len(prompt) + 7,
     beta=0.01,
-    pretrained=lm_state.variables,
+    variables=lm_state.variables,
 )
 rollout = SampledRollout(
     rl_objective,
@@ -703,7 +703,7 @@ result = generate(
 print(tokenizer.decode(result.tokens[0], skip_special_tokens=True))
 ```
 
-To train from those weights, pass `pretrained=pretrained.variables` to `LMObjective` or a post-training objective, and tokenize the training data with the checkpoint's own tokenizer. [Generating and serving](#generating-and-serving) shows how to sample from and export the result.
+To train from those weights, pass the bundle in place of the model (`LMObjective(pretrained, seq_len=512)`, or a post-training objective), and tokenize the training data with the checkpoint's own tokenizer. `pretrained.adapt(LoRA(rank=8, modules=("q_proj", "v_proj")), key=0)` adds a low-rank adapter first, so the objective trains only the adapter's factors ([language models](docs/concepts/language_models.md#pretrained-checkpoints)). [Generating and serving](#generating-and-serving) shows how to sample from and export the result.
 
 ### Composing a native decoder
 
@@ -822,7 +822,7 @@ The flag `--xla_gpu_deterministic_ops=true` turns them on, and
 `TrainerConfig.xla_flags` appends it to `XLA_FLAGS`. Check the flag with your
 attention backend: under JAX 0.11.1, repeated cuDNN backward calls fail with it
 set, while the XLA attention path passed the recorded bitwise checks.
-`tools/qualify_training.py` uses the XLA path (`--attention-impl xla`).
+`tests/test_training_qualification.py` resumes a killed fine-tune on the XLA path.
 
 ### Standalone evaluation and local reports
 

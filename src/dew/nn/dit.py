@@ -12,7 +12,7 @@ sandwich; the model files arrange blocks.
 import inspect
 import math
 from collections.abc import Sequence
-from typing import Literal
+from typing import Literal, TypedDict, Unpack
 
 import jax
 import jax.numpy as jnp
@@ -364,6 +364,91 @@ def remat_block(block_cls, enabled: RematChoice, policy: str | None = 'dots'):
         static_argnums=tuple(i for i, name in enumerate(names) if name == 'train'),
         policy=(saved_through_remat if policy == 'dots' else None),
     )
+
+
+class _BlockOptions(TypedDict):
+    mlp_ratio: int
+    dtype: Dtype | None
+    precision: PrecisionLike
+    force_fp32_for_softmax: bool
+    norm_epsilon: float
+    attention_impl: str
+
+
+class _AttentionBlockOptions(_BlockOptions):
+    dropout_rate: float
+    qk_norm: bool
+
+
+class _ConditioningOptions(TypedDict, total=False):
+    text_pooling: Literal['real', 'all']
+    interval: bool
+    time_scale: float
+
+
+class _TransformerOptions(nn.Module, kw_only=True):
+    """Shared controls stay keyword-only so token stacks can require their widths."""
+    mlp_ratio: int = 4
+    dtype: Dtype | None = None
+    precision: PrecisionLike = None
+    force_fp32_for_softmax: bool = True
+    norm_epsilon: float = 1e-5
+    attention_impl: str = 'auto'
+
+    def _block_options(self) -> _BlockOptions:
+        return {'mlp_ratio': self.mlp_ratio, 'dtype': self.dtype, 'precision': self.precision,
+                'force_fp32_for_softmax': self.force_fp32_for_softmax,
+                'norm_epsilon': self.norm_epsilon, 'attention_impl': self.attention_impl}
+
+    def _embedding(self, patch_size: int, features: int, scan_order: str = 'raster',
+                   *, bottleneck: int | None = None) -> PatchSequenceEmbed:
+        return PatchSequenceEmbed(patch_size=patch_size, emb_features=features, scan_order=scan_order,
+                                  dtype=self.dtype, precision=self.precision, bottleneck=bottleneck)
+
+    def _conditioning(self, features: int, **options: Unpack[_ConditioningOptions]) -> ConditioningEmbed:
+        return ConditioningEmbed(emb_features=features, mlp_ratio=self.mlp_ratio,
+                                 dtype=self.dtype, precision=self.precision, **options)
+
+    def _output(self, patch_size: int, channels: int, *, modulated: bool = False) -> PatchSequenceOutput:
+        return PatchSequenceOutput(patch_size=patch_size, output_channels=channels, modulated=modulated,
+                                   norm_epsilon=self.norm_epsilon, dtype=self.dtype, precision=self.precision)
+
+
+class _AttentionStackOptions(_TransformerOptions, kw_only=True):
+    dropout_rate: float = 0.0
+    qk_norm: bool = False
+
+    def _block_options(self) -> _AttentionBlockOptions:
+        return {**super()._block_options(), 'dropout_rate': self.dropout_rate, 'qk_norm': self.qk_norm}
+
+
+class _DiTStackOptions(_AttentionStackOptions):
+    output_channels: int = 3
+    patch_size: int = 16
+    emb_features: int = 768
+    num_layers: int = 12
+    num_heads: int = 12
+    remat: RematChoice = False
+    scan_order: Literal['raster', 'hilbert', 'zigzag'] = 'raster'
+
+
+class _TokenStackOptions(_AttentionBlockOptions):
+    num_heads: int
+    ssm_attention_ratio: str
+    ssm_state_dim: int
+    bidirectional_ssm: bool
+
+
+class _JepaStackOptions(_AttentionStackOptions, kw_only=True):
+    num_heads: int
+    ssm_attention_ratio: str = 'all-attn'
+    ssm_state_dim: int = 64
+    bidirectional_ssm: bool = True
+
+    def _stack_options(self) -> _TokenStackOptions:
+        return {**self._block_options(), 'num_heads': self.num_heads,
+                'ssm_attention_ratio': self.ssm_attention_ratio, 'ssm_state_dim': self.ssm_state_dim,
+                'bidirectional_ssm': self.bidirectional_ssm}
 
 
 def _gelu(hidden: jax.Array, approximate: bool) -> jax.Array:

@@ -10,7 +10,7 @@ import pytest
 from dew.artifacts import Representations
 from dew.inputs import Field
 from dew.nn.backbones.jepa import JepaPredictor
-from dew.objectives.base import Step, merge
+from dew.objectives.base import Step, merge, part
 from dew.objectives.jepa import (
     JepaEncoder,
     JepaObjective,
@@ -278,14 +278,14 @@ def context_ablation(objective, params, ema, data, mask, rng):
     """Prediction error from the true context vs. from another image's context."""
     n, blocks = data.shape[0], mask.num_targets
     context_idx, target_idx = mask.sample(rng, n)
-    full = normalize_targets(objective.encode(ema["params"]["context_encoder"], data))
+    full = normalize_targets(objective.encode(part(ema, "context_encoder"), data))
     targets = jnp.take_along_axis(
         full[:, None], target_idx.reshape(n, blocks, -1, 1), axis=-2)
-    context = objective.encode(params["params"]["context_encoder"], data, context_idx)
+    context = objective.encode(part(params, "context_encoder"), data, context_idx)
 
     def error(ctx):
         predictions = objective.predictor.apply(
-            {"params": params["params"]["predictor"]},
+            part(params, "predictor"),
             jnp.repeat(ctx, blocks, axis=0),
             jnp.repeat(context_idx, blocks, axis=0),
             target_idx.reshape(n * blocks, -1),
@@ -489,6 +489,49 @@ def test_evaluation_reads_the_ema_encoder(mask):
     live = objective.evaluate(params, batch, step_with(params))
     averaged = objective.evaluate(params, batch, step_with(merge(params, ema)))
     assert not np.allclose(live.features, averaged.features)
+
+
+def test_an_adapted_pretrained_encoder_trains_its_factors_over_one_frozen_base(mask):
+    """A pretrained encoder adapted by `LoRA.apply` starts JEPA from its own
+    weights: its factors and the predictor train, its base comes back
+    bitwise, and the target encoder is the average of the factors over that
+    same frozen base, which evaluation reads."""
+    from dew.inputs import unit_range
+    from dew.lora import LoRA
+    from dew.objectives.base import FROZEN
+
+    encoder = make_encoder()
+    pretrained = encoder.init(jax.random.key(5), jnp.ones((1, RES, RES, 3)),
+                              jnp.arange(mask.num_context, dtype=jnp.int32)[None])
+    adapter = LoRA(rank=2, modules=("layers_0",)).apply(encoder, pretrained, key=0)
+    objective = JepaObjective(adapter.model, make_predictor(), mask, sample=Field("image", (RES, RES, 3)),
+                              encoder_variables=adapter.variables, momentum=(0.5, 0.5), momentum_steps=1)
+    trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.key(0))
+    initial = jax.tree.map(np.asarray, trainer.initial_state().variables)
+
+    state = trainer.fit(Data(image_batches, batch=8), steps=3, log_every=3)
+
+    factors = state.variables["params"]["context_encoder"]
+    assert factors and all(path[-1].key in ("lora_A", "lora_B")
+                           for path, _ in jax.tree_util.tree_leaves_with_path(factors))
+    for before, after in zip(jax.tree.leaves(pretrained["params"]),
+                             jax.tree.leaves(state.variables[FROZEN]["context_encoder"]), strict=True):
+        np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
+    assert any(not np.array_equal(before, after) for before, after in zip(
+        jax.tree.leaves(initial["params"]["predictor"]),
+        jax.tree.leaves(state.variables["params"]["predictor"]), strict=True))
+    assert set(state.ema["params"]) == {"context_encoder"}
+    lagging = state.ema["params"]["context_encoder"]
+    assert any(not np.allclose(a, b) for a, b in zip(jax.tree.leaves(lagging), jax.tree.leaves(factors),
+                                                       strict=True))
+
+    pixels = images()
+    step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=state.averaged)
+    features = objective.evaluate(state.variables, {"image": pixels, "label": jnp.zeros((4,), jnp.int32)},
+                                  step).features
+    target = {"params": lagging, FROZEN: state.variables[FROZEN]["context_encoder"]}
+    expected = jnp.mean(objective.encode(target, unit_range(pixels)), axis=1)
+    np.testing.assert_allclose(np.asarray(features), np.asarray(expected), atol=1e-6, rtol=0)
 
 
 # --- probes ----------------------------------------------------------------

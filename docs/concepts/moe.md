@@ -1,6 +1,6 @@
 # Mixture of experts
 
-A mixture-of-experts (MoE) layer replaces one feed-forward network with several networks, called experts. For each token, a router selects the `top_k` highest-scoring experts, and the layer sums their outputs weighted by the router scores. To use MoE in a `CausalTransformer`, set `mixture` to a `Mixture` from `dew.nn.backbones`.
+A mixture-of-experts (MoE) layer holds several feed-forward networks, called experts, in place of one. For each token, a router scores the experts and selects the `top_k` with the highest scores, and the layer sums those experts' outputs weighted by the scores. To make a `CausalTransformer` sparse, set its `mixture` field to a `Mixture` from `dew.nn.backbones`.
 
 ## Example
 
@@ -29,7 +29,7 @@ logits: (1, 4, 32)
 experts per token, layer 0: [[1, 3], [3, 1], [1, 0], [3, 2]]
 ```
 
-Every layer here routes to two of four experts. The logits keep the usual `(batch, sequence, vocabulary)` shape. `mutable=["router"]` records each router's choices (`indices`, `[batch, sequence, top_k]`), scores and log partition. Without it, nothing is recorded. Flax stores sown values in a tuple, which is why the example uses the first `[0]`. The figure reads this model's router collection over 64 random tokens:
+Every layer here routes to two of four experts, and the logits keep the usual `(batch, sequence, vocabulary)` shape. Passing `mutable=["router"]` makes each router record its choices (`indices`, `[batch, sequence, top_k]`), its scores and its log partition; without it nothing is recorded. Flax stores sown values in a tuple, which the first `[0]` unpacks. The figure reads the same collection from this model over 64 random tokens.
 
 ![Router choices of a four-expert, top-2 mixture at layer 0 for 32 tokens, with each chosen expert's normalized weight, and the number of tokens each expert received in both layers.](../assets/moe-routing-light.svg)
 ![Router choices of a four-expert, top-2 mixture at layer 0 for 32 tokens, with each chosen expert's normalized weight, and the number of tokens each expert received in both layers.](../assets/moe-routing-dark.svg)
@@ -54,17 +54,15 @@ Every layer here routes to two of four experts. The logits keep the usual `(batc
 | `capacity_factor` | `None` | Per-expert slot capacity; `None` keeps every selected slot. |
 | `hash_layers`, `latent_features`, `latent_norm`, `media_bias` | | DeepSeek V4 hash routing, Kimi K3 latent experts, DeepSeek-V4.1's media bias. |
 
-A published checkpoint's configuration sets these values. Changing them changes the architecture and can make the weights unusable.
+When you load a published checkpoint, its configuration sets these values. Changing them changes the architecture and can make the weights unusable.
 
 ## Routing
 
-Model families differ in how they score and select experts. Their choices include softmax or sigmoid scores, normalized or raw selected weights, output scaling, group-limited routing, shared experts and a selection bias. Two routers with matching tensor shapes can still behave differently. The router's gate projection always runs in float32, regardless of the activation dtype.
+Model families route in different ways: softmax or sigmoid scores, normalized or raw selected weights, output scaling, group-limited routing, shared experts and a selection bias. So two routers whose tensors have the same shapes are not necessarily interchangeable. The router's gate projection runs in float32 whatever the activation dtype.
 
-To balance routing without an auxiliary loss, `bias=True` adds a per-expert selection bias. This changes the chosen experts while leaving their weights unchanged. Each step, `LMObjective(balance_rate=...)` adjusts this non-parameter state against each expert's load. An auxiliary balancing loss (`aux_loss_alpha`, `router_z_loss`) is a separate term of the objective ([Language models](language_models.md)). Check your model family's algorithm and configuration before enabling either.
+To balance the load without an auxiliary loss, set `bias=True`. Each expert then gets a bias that is added to its score when the router selects experts, but not when it weights them. The bias is non-parameter state, and every step `LMObjective(balance_rate=...)` moves it against each expert's load. An auxiliary balancing loss (`aux_loss_alpha`, `router_z_loss`) is a separate term of the objective ([Language models](language_models.md)). Check the algorithm and configuration of your model family before you turn on either.
 
-Routing replay trains on the experts used by a rollout engine (R3, arXiv 2510.11370). Pass `routes=(routed_experts, routed)` to `LMObjective.token_scores`. For GRPO, pack sessions whose calls recorded `routed_experts` ([Post-training](post_training.md)). The record has shape `[batch, tokens, layers, top_k]`, indexed by decoder layer as vLLM and SGLang return it.
-
-Each router selects the recorded experts, then gets their weights from the current forward pass's scores. This preserves the router's gradient. If a token has no record (`routed` false, such as the last sampled ID), the router makes its own choice. A balancing bias counts the replayed experts.
+Routing replay trains on the experts that a rollout engine used (R3, arXiv 2510.11370). Pass `routes=(routed_experts, routed)` to `LMObjective.token_scores`, or, for GRPO, pack sessions whose calls recorded `routed_experts` ([Post-training](post_training.md)). The record has shape `[batch, tokens, layers, top_k]` and is indexed by decoder layer, the way vLLM and SGLang return it. Each router uses the recorded experts in place of its own top-k but still computes their weights from the scores of the current forward pass, so the router still gets a gradient. Where the record does not cover a token (`routed` is false, as for the last sampled ID), the router makes its own choice. A balancing bias counts the replayed experts.
 
 ## Expert kernels
 
@@ -77,48 +75,44 @@ Dew sorts tokens into expert order and runs the experts as one grouped matrix mu
 | `'pallas'` | JAX's own Pallas/Triton grouped-matmul kernels, `gmm` and `tgmm`, vendored in `dew.nn.kernels.ragged_dot` from the jax 0.11.2 source tree because no wheel ships them. |
 | `'tokamax'` | `tokamax.ragged_dot` with the kernel named per generation (`TOKAMAX_KERNEL_BY_GENERATION`): Triton on sm80 and sm89, `mosaic_tpu_v2` on v5e and v6e, tokamax's XLA path elsewhere. Only the forward runs on tokamax; the backward differentiates on XLA. |
 
-On an L4, the Pallas kernels reduce the lm-moe training step from 601.6 ms to 213.1 ms ([Performance measurements](../performance.md)). jax 0.11.2 deprecates their Pallas Triton backend. Dew still uses them on compute capability 8.0 to 8.9 because JAX's Mosaic GPU grouped matmul does not compile there. On sm89, it fails for lack of wgmma. Dew leaves the deprecation warning to the user's warning filters.
+On an L4 the Pallas kernels cut the lm-moe training step from 601.6 ms to 213.1 ms ([Performance measurements](../performance.md)). jax 0.11.2 deprecates the Pallas Triton backend they run on. Dew still uses them on compute capability 8.0 to 8.9, because JAX's Mosaic GPU grouped matmul does not compile there (on sm89 it fails for lack of wgmma), and it leaves the deprecation warning to your warning filters.
 
-The Pallas kernels support first-order reverse mode, as used by an ordinary `Trainer` step. For forward mode or higher-order derivatives, such as meta-learning, use `'xla'`. Dew also falls back to `'xla'` when Pallas would change the product: float64, fp32 operands at a precision above the default, or an x64 run.
+The Pallas kernels support only first-order reverse mode, which is what an ordinary `Trainer` step uses. Forward mode and higher-order derivatives, as in meta-learning, need `'xla'`. Dew also falls back to `'xla'` in the cases where the Pallas kernels would compute a different product than you asked for: float64, fp32 operands at a precision above the default, and any x64 run.
 
-On a mesh, the same kernel choice applies. The experts run inside the dispatch's `shard_map` on each device's rows, with the required weights gathered there. On 2x RTX 3090, one fsdp-sharded expert layer took 26.2 ms with Pallas and 271.9 ms with `'xla'`. Every routed expert module follows `implementation`, including GPT OSS's.
+The choice is the same on a mesh. The experts run inside the dispatch's `shard_map` on each device's rows, and the weights they need are gathered onto that device. On 2x RTX 3090, one fsdp-sharded expert layer took 26.2 ms with the Pallas kernels and 271.9 ms with `'xla'`. Every routed expert module the decoder builds follows `implementation`, including GPT OSS's.
 
-tokamax defaults to its v1 TPU kernel, which is 13 times slower than XLA on a v6e. Dew therefore selects a kernel explicitly. If you choose `'tokamax'` and the package cannot be imported, initialization fails. It does not fall back to XLA.
+Left to its default, tokamax picks its v1 TPU kernel, which is 13 times slower than XLA on a v6e, so Dew names the kernel it wants. If a model asks for `'tokamax'` and the package cannot be imported, initialization fails; Dew does not fall back to XLA under that name.
 
-tokamax 0.0.13 and 0.0.14 pin `typeguard==2.13.3`. tyro 1.0.16, which parses every recipe's command line, needs `typeguard>=4.0.0`. Installing either tokamax release downgrades typeguard. `uv pip check` reports the conflict, and every recipe fails to parse its arguments with `AttributeError: module 'typeguard' has no attribute 'TypeCheckError'`. Install tokamax with `-c constraints.txt` to use a commit from its main branch that dropped typeguard ([Installation](../installation.md)). The grouped-matmul numbers here were measured on 0.0.14.
+tokamax's releases do not install cleanly beside Dew. tokamax 0.0.13 and 0.0.14 pin `typeguard==2.13.3`, but tyro 1.0.16, which parses every recipe's command line, needs `typeguard>=4.0.0`. So installing either release downgrades typeguard, `uv pip check` reports the conflict, and every recipe then fails while parsing its arguments with `AttributeError: module 'typeguard' has no attribute 'TypeCheckError'`. If you install tokamax with `-c constraints.txt`, you get a commit from its main branch that dropped typeguard ([Installation](../installation.md)). The grouped-matmul numbers on this page were measured on 0.0.14.
 
 ## Dispatch and expert parallelism
 
 The `expert` mesh axis splits the expert dimension across devices. Dense parameter dimensions can use FSDP or tensor placement on their own; [Distributed training](distributed.md) covers the global batch and layout requirements.
 
-`dispatch='global'`, the default, sorts and gathers tokens on their current devices. Each device routes its own tokens through every expert, so every layout computes each token once.
+`dispatch='global'`, the default, sorts and gathers tokens on the device that already holds them. On a mesh, each device routes its own tokens through every expert, so every layout computes each token once.
 
-`dispatch='exchange'` uses expert parallelism. JAX `all_to_all` collectives send selected tokens to the devices holding their experts and return the results. The `expert` axis must be larger than one and divide the number of experts. The data, fsdp and sequence axes may split the tokens further.
+`dispatch='exchange'` is expert parallelism. Each device sends its selected tokens to the devices that hold their experts, using JAX `all_to_all` collectives, and receives the results back. It needs an `expert` mesh axis larger than one that divides the number of experts; the data, fsdp and sequence axes may split the tokens further. The exchange keeps every selected token, even when all of the traffic goes to one shard. In the first round each device sends every shard a bucket the size of an even split of its tokens, and whatever a skewed routing leaves over follows in later rounds of the same size. The backward pass recomputes those rounds rather than keeping their intermediates.
 
-The exchange keeps every selected token, even when all traffic goes to one shard. The first round sends each shard a device's balanced share of tokens. Skewed routing sends the remaining tokens in later rounds of the same size. The backward pass recomputes these rounds instead of storing them.
+You can initialize the model outside a mesh, but applying the exchange needs the mesh. `TextGeneration` refuses `dispatch='exchange'` ([Inference](inference.md)), so generate with `dispatch='global'`, which computes the same layer. Gated experts and GPT OSS's interleaved biased experts are exchanged the same way, and each keeps its own activation and output-weight arithmetic.
 
-You can initialize the model outside a mesh, but applying the exchange needs the mesh. `TextGeneration` rejects exchange dispatch ([Inference](inference.md)); use `dispatch='global'` to compute the same layer. Gated experts and GPT OSS's interleaved biased experts use the same transport. Each keeps its own activation and output-weight arithmetic.
-
-To limit capacity by dropping tokens, as GShard and MaxText do, set `capacity_factor`. Each sequence keeps `max(ceil(length * top_k / experts) * capacity_factor, capacity_factor)` slots per expert in token order. Dropped slots add nothing to a token's output. Both dispatch modes drop the same slots on every placement because the count uses whole sequences. With a capacity limit, the exchange runs one round.
+To drop tokens over a fixed capacity, as GShard and MaxText do, set `capacity_factor`. Each sequence keeps `max(ceil(length * top_k / experts) * capacity_factor, capacity_factor)` slots per expert, filled in token order, and a dropped slot adds nothing to its token's output. Because the count runs over whole sequences, both dispatch modes drop the same slots on every placement. With a capacity set, the exchange runs one round.
 
 ## Precision
 
-Both dispatch modes use `moe.expert_projection` to keep the routed layer's training arithmetic consistent across activation dtypes and placements:
+Both dispatch modes run their expert projections through `moe.expert_projection`. It gives a routed layer the same rounding in training whatever the activation dtype and placement:
 
 - each contraction accumulates in at least fp32 and rounds once to the compute dtype;
-- a kernel gradient sums each device's and each exchange round's share in at least fp32, then rounds once to the master dtype. The summation order depends on the mesh, so gradients on different meshes agree within fp32 rounding but can differ bit for bit;
+- a kernel gradient sums the shares from every device and every exchange round in at least fp32 and rounds once to the master dtype; the summation order still depends on the mesh, so gradients on different meshes agree to fp32 rounding but not bit for bit;
 - kernel gradients keep the master dtype, and input gradients their input's dtype;
 - the exact GELU rounds once.
 
-If a model has no `dtype`, it computes experts in their stored dtype when that is narrower than the stream (`moe.expert_compute_dtype`). For an fp32 residual stream with bf16 expert kernels, it rounds expert inputs to bf16. It multiplies bf16 by bf16 with fp32 accumulation and returns bf16. The dense layers still promote to fp32.
+A model that names no `dtype` computes its experts in their stored dtype when that dtype is narrower than the residual stream (`moe.expert_compute_dtype`). For example, with an fp32 stream and bf16 expert kernels, each expert's input is rounded to bf16, the experts multiply bf16 by bf16 with fp32 accumulation, and they return bf16. The dense layers of such a model still promote to fp32. Promoting the experts to fp32 as well would copy each layer's kernels; serving gpt-oss-20b on four RTX 3090s, those copies took 14.35 GiB of live temporaries. So the forward pass reads the kernels as stored, and only a gradient widens them, because its cross-device sums need fp32.
 
-Widening the experts to fp32 copied each layer's kernels. When serving gpt-oss-20b on four RTX 3090s, those copies needed 14.35 GiB of live temporaries. The forward pass reads kernels in their stored dtype. Only gradients widen them for fp32 cross-device sums.
+JAX's x64 mode also widens default integer counts to int64. The TPU ragged-dot kernel cannot lower int64 indices, so the XLA grouped-matmul path narrows signed int64 group sizes to int32 when the number of rows fits. The expert values and their gradients keep the dtypes above.
 
-JAX's x64 mode widens default integer counts. The TPU ragged-dot kernel cannot lower int64 indices, so the XLA grouped-matmul path converts signed int64 group sizes to int32 when the row domain fits. Expert values and gradients keep the dtypes described above.
+Forward-mode and reverse-mode differentiation follow the same rules. `tests/test_moe_precision.py` checks them against float64 arithmetic on the rounded operands, and over three Adam steps of both dispatch modes in bf16. `tools/moe_exchange_probe.py` compares the exchange's working memory with the global path's on CPU; it does not measure throughput on several accelerators.
 
-Forward-mode and reverse-mode differentiation follow the same rules. `tests/test_moe_precision.py` compares them with float64 arithmetic on the rounded operands. It also checks three Adam steps in bf16 with both dispatch modes. `tools/moe_exchange_probe.py` compares working memory for exchange and global dispatch on CPU. It does not measure throughput on several accelerators.
-
-GPT OSS's per-expert biases use `moe.gather_expert_bias`. It accumulates bias gradients at master or compute precision, then converts them to the parameter dtype. Padding and idle experts add no bias gradient. The stored fused kernel and bias leaves, router choices, clipping limits and SwiGLU scaling are unchanged. `tests/test_moe_biased_exchange.py` checks the router and experts against pinned transformers fixtures. It also compares forward passes, backward passes and optimizer updates between dispatch modes.
+GPT OSS's per-expert biases go through `moe.gather_expert_bias`, which accumulates their gradients at master or compute precision and converts them back to the parameter dtype. Padding and idle experts add no bias gradient. The stored fused kernel and bias leaves, router choices, clipping limits and SwiGLU scaling are unchanged. `tests/test_moe_biased_exchange.py` checks the full router and experts against pinned transformers fixtures, and compares the forward pass, backward pass and optimizer updates of both dispatch modes.
 
 ## Cost and validation
 

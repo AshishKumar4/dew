@@ -1,8 +1,9 @@
 """Model backbones.
 
-Code builds a model by its class: `SimpleDiT(patch_size=4, ...)`. Each class
-also registers itself with `dew.registry.models` where it is defined, so a
-run record that names `simple_dit` and its fields rebuilds the same model.
+You build a model by calling its class, as in `SimpleDiT(patch_size=4, ...)`.
+Each class also registers itself with `dew.registry.models` where it is
+defined, so a run record that names `simple_dit` and its fields rebuilds the
+same model.
 """
 
 from .causal_transformer import CausalTransformer

@@ -1,0 +1,75 @@
+"""One decode token of the delta rule, reading the recurrent state once and
+writing it once, as a Pallas kernel for CUDA.
+
+The token's update is `S' = S diag(decay) + k delta^T` with
+`delta = beta (v - (k decay)^T S)`, and its output `q^T S'`, which is
+`(q decay)^T S + (q . k) delta`: both readouts are products with the old
+state, so one pass over it serves them and the write. XLA ran the
+reference's four passes (decay, read, write, read) as three fusions over
+the fp32 state; at Qwen3.5-0.8B's widths and 128 rows on an RTX 4080 they
+were two thirds of a decode step (docs/performance.md).
+
+The program is one row-head and one block of value columns, over a state
+laid out `[rows * heads, Dk, Dv]`; its body is whole-block array arithmetic
+with nothing Triton-specific but the warp count, so a Mosaic GPU kernel (JAX
+0.11 deprecates the Triton backend, and Mosaic GPU targets sm90 on) takes
+the same body and block specs. On a TPU the step stays XLA's: tokamax's
+Mosaic TPU `causal_conv1d_gated_delta_rule` covers the conv, the gating and
+the rule over a step's tokens in one ragged call, which is the layout of a
+serving step's mixed call (`dew.nn.inputs.Admitted`) rather than this one.
+"""
+
+from __future__ import annotations
+
+import jax
+import jax.numpy as jnp
+from jax.experimental import pallas as pl
+
+BLOCK = 32
+"""Value columns a program: 16 to 64 measured within 3% on an RTX 4080."""
+WARPS = 8
+
+
+def fits(state: jax.Array) -> bool:
+    """Whether the kernel takes this `[rows, heads, Dk, Dv]` state: CUDA, fp32,
+    and power-of-two widths with Dv a multiple of `BLOCK` (Triton's blocks)."""
+    dk, dv = state.shape[-2:]
+    power = dk > 0 and dk & (dk - 1) == 0
+    return (jax.default_backend() == "gpu" and state.dtype == jnp.float32 and power
+            and dv % BLOCK == 0 and (dv // BLOCK) & (dv // BLOCK - 1) == 0)
+
+
+def _kernel(state_ref, query_ref, key_ref, value_ref, decay_ref, beta_ref, state_out, out_ref):
+    state = state_ref[...]                                   # [Dk, BLOCK]
+    query, key, decay = query_ref[...], key_ref[...], decay_ref[...]   # [Dk]
+    read_key = jnp.sum((key * decay)[:, None] * state, axis=0)          # [BLOCK]
+    read_query = jnp.sum((query * decay)[:, None] * state, axis=0)
+    delta = (value_ref[...] - read_key) * beta_ref[...]
+    out_ref[...] = read_query + jnp.sum(query * key) * delta
+    state_out[...] = state * decay[:, None] + key[:, None] * delta[None, :]
+
+
+def step(state, query, key, value, decay, beta):
+    """`(state', out)` for one token: `state` `[rows, heads, Dk, Dv]` fp32,
+    `query` (already scaled), `key` and `decay` (`exp(g)`, per key dimension)
+    `[rows, heads, Dk]`, `value` `[rows, heads, Dv]`, `beta` `[rows, heads]`,
+    all fp32. The state is updated in place where the caller lets it go."""
+    from jax.experimental.pallas import triton as plgpu
+
+    rows, heads, dk, dv = state.shape
+    flat = rows * heads
+    keyed = pl.BlockSpec((None, dk), lambda i, j: (i, 0))
+    valued = pl.BlockSpec((None, BLOCK), lambda i, j: (i, j))
+    held = pl.BlockSpec((None, dk, BLOCK), lambda i, j: (i, 0, j))
+    updated, out = pl.pallas_call(
+        _kernel, grid=(flat, dv // BLOCK),
+        in_specs=[held, keyed, keyed, valued, keyed, valued],
+        out_specs=[held, valued],
+        out_shape=[jax.ShapeDtypeStruct((flat, dk, dv), state.dtype),
+                   jax.ShapeDtypeStruct((flat, dv), state.dtype)],
+        input_output_aliases={0: 0},
+        compiler_params=plgpu.CompilerParams(num_warps=WARPS),
+    )(state.reshape(flat, dk, dv), query.reshape(flat, dk), key.reshape(flat, dk),
+      value.reshape(flat, dv), decay.reshape(flat, dk),
+      jnp.broadcast_to(beta.reshape(flat, 1), (flat, dv)))
+    return updated.reshape(state.shape), out.reshape(rows, heads, dv)
