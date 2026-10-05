@@ -108,6 +108,54 @@
    ],
    "note": "Documented generation environment also uses Torch 2.8.0."
   },
+  "codecs/modelopt/tiny/reference.npz": {
+   "tool": "tools/modelopt_nvfp4_reference.py",
+   "sources": [
+    {"repo": "NVIDIA/Model-Optimizer", "version": "0.47.0", "runs": "modelopt"},
+    {"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}
+   ],
+   "note": "Torch 2.13.0+cu130, Triton 3.7.1 on RTX 4080. ModelOpt export_hf_checkpoint writes the files; NVFP4QTensor reads weights to bf16, then fp32. The author's exact fake-quant kernel body consumes each file's multiplier, with ONLY its FP8 conversion helper replaced by direct RN, as ModelOpt's torch cast and TensorRT-LLM dc6f88de69ce869dc0ce095c888a70705a8b663c quantization.cuh:499-503 specify. A million-value conversion check holds the correction to torch's cast bit for bit. Uncorrected sm89 fp16-truncation outputs are recorded and attributed separately (13 forward differences each at q/k/v, none at the other projections). Continuous operations widen for float64; the discrete quantizer remains fp32. Transformers 5.16.1 has no ModelOpt reader, so its native class runs the author's decoded weights."
+  },
+  "codecs/modelopt/real/reference.npz": {
+   "tool": "tools/modelopt_nvfp4_reference.py",
+   "sources": [
+    {"repo": "NVIDIA/Model-Optimizer", "version": "0.47.0", "runs": "modelopt"}
+   ],
+   "note": "32 q_proj rows of nvidia/Qwen3-14B-NVFP4 at bc39319a4dc265d9bbb9a9731bc52c4988d9ece7, read by byte range. Author weight reader and own fake-quant kernel with direct RN FP8 conversion (as the tiny fixture); original sm89 outputs are recorded separately. Inputs include the reciprocal-order .75 boundary and effective-scale-below-1e-5 guard."
+  },
+  "codecs/nvfp4_qdq/unrounded/reference.npz": {
+   "tool": "tools/nvfp4_qdq_reference.py",
+   "sources": [
+    {"repo": "vllm-project/compressed-tensors", "version": "0.17.1", "runs": "compressed_tensors"},
+    {"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}
+   ],
+   "note": "Torch 2.14.0+cpu. Local NVFP4 input scales have scale_dtype=null, as pinned RedHatAI/Qwen3-32B-NVFP4 declares; each Linear carries a different non-power-of-two input_global_scale. CPU from_pretrained reads the same files, decoded bf16 Linear weights are promoted to fp32 while dense tensors remain fp32, and redundant weight QDQ removal is checked bit for bit. Continuous operations widen for float64; input QDQ keeps its published fp32 discrete function. Per-Linear fp32/bf16 QDQ outputs include zero, tiny-group and boundary probes."
+  },
+  "codecs/nvfp4_qdq/e4m3/reference.npz": {
+   "tool": "tools/nvfp4_qdq_reference.py",
+   "sources": [
+    {"repo": "vllm-project/compressed-tensors", "version": "0.17.1", "runs": "compressed_tensors"},
+    {"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}
+   ],
+   "note": "The same same-file reference as the unrounded variant, with scale_dtype=torch.float8_e4m3fn as CT's NVFP4 preset declares. The input scale is rounded to E4M3 before dividing by its stored inverse global scale."
+  },
+  "codecs/storage/fp8/reference.npz": {
+   "tool": "tools/nvfp4_storage_reference.py",
+   "sources": [
+    {"repo": "vllm-project/compressed-tensors", "version": "0.17.1", "runs": "compressed_tensors"},
+    {"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}
+   ],
+   "note": "Torch 2.14.0+cpu; same-file from_pretrained fp32 logits and float64 forward over the reader's decoded weights. Weight QDQ removal is checked bit for bit before widening."
+  },
+  "codecs/storage/nvfp4/reference.npz": {
+   "tool": "tools/nvfp4_storage_reference.py",
+   "sources": [
+    {"repo": "vllm-project/compressed-tensors", "version": "0.17.1", "runs": "compressed_tensors"},
+    {"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}
+   ],
+   "note": "Torch 2.14.0+cpu. CT's NVFP4 decompress always returns bf16 weights; from_pretrained(dtype=float32) cannot run its mixed-dtype first forward. A bf16 reader checks redundant weight QDQ removal bit for bit. The fp32 reader keeps dense checkpoint tensors in fp32 and promotes only its decoded bf16 Linear weights before fp32/float64 forwards. Each weight's direct fp32 dequantize is recorded under /unrounded and must round to the published bf16 decode bit for bit. Dew uses that published bf16 decode."
+  },
+
   "codecs/compressed_tensors_mxfp4.npz": {
    "tool": "tools/compressed_tensors_mxfp4_reference.py",
    "sources": [
@@ -769,7 +817,7 @@
      "runs": "model"
     }
    ],
-   "note": "Downloaded release code with local kernel stand-ins and documented patches (tools/deepseek_v41_reference.py:54)."
+   "note": "Downloaded release code with local kernel stand-ins and documented patches (tools/deepseek_v41_reference.py:60). orders.npz records 52 residual orders (rounding_orders.py, seed 0), the reference's plain-SGD distances, identity reproduction and float64 invariance under every order."
   },
   "hf/deepseek-v41-tiny/kernels.npz": {
    "tool": "tools/deepseek_v41_reference.py",
@@ -1830,6 +1878,28 @@
     }
    ],
    "note": "Dew's reference_logits helper calls the actual Transformers model; no Dew model forward."
+  },
+  "hf/nemotron-h-tiny/logits.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.16.1",
+     "runs": "transformers"
+    }
+   ],
+   "note": "--nemotron-h-only; grouped SSD, positionless GQA and ReLU² MLP. source.json pins commit 93c8b7b485963a10800c91f55304db6be211c2bd and seed 2024."
+  },
+  "hf/nemotron-h-tiny/logits_f64.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.16.1",
+     "runs": "transformers"
+    }
+   ],
+   "note": "--nemotron-h-only; the same fp32 checkpoint widened through the reference's SSD, norm, softmax and head casts."
   },
   "hf/mixtral-tiny/generate.npz": {
    "tool": "tools/numerics_reference.py",
@@ -3204,6 +3274,21 @@
  },
  "inputs": [
   {
+   "tool": "tools/modelopt_nvfp4_reference.py",
+   "what": "author-exported tiny ModelOpt checkpoint and 32 real pinned q_proj rows",
+   "files": ["codecs/modelopt/tiny/model.safetensors", "codecs/modelopt/real/model.safetensors"]
+  },
+  {
+   "tool": "tools/nvfp4_storage_reference.py",
+   "what": "tiny weight-only FP8 and NVFP4 checkpoints written by the reference compressors",
+   "files": ["codecs/storage/fp8/model.safetensors", "codecs/storage/nvfp4/model.safetensors"]
+  },
+  {
+   "tool": "tools/nvfp4_qdq_reference.py",
+   "what": "tiny NVFP4 checkpoints with calibrated local input quantizers",
+   "files": ["codecs/nvfp4_qdq/unrounded/model.safetensors", "codecs/nvfp4_qdq/e4m3/model.safetensors"]
+  },
+  {
    "tool": "tools/audio_reference.py",
    "what": "audio encoder weights and synthetic waveforms",
    "files": [
@@ -3475,6 +3560,14 @@
     "hf/qwen38-dense-tiny/video_0.npy",
     "hf/qwen38-dense-tiny/video_1.npy",
     "hf/qwen38-moe-tiny/model.safetensors"
+   ]
+  },
+  {
+   "tool": "tools/hf_reference.py",
+   "what": "the random weights and probe ids its Nemotron-H references are computed on",
+   "files": [
+    "hf/nemotron-h-tiny/input_ids.npy",
+    "hf/nemotron-h-tiny/model.safetensors"
    ]
   },
   {

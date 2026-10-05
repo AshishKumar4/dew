@@ -138,11 +138,11 @@ def _any_value(key: str, hf_config: Mapping[str, object]) -> bool:
     return True
 
 
-def _repeats_text(name: str) -> Callable[[str, Mapping[str, object]], bool]:
-    """A wrapper field inert when it repeats its text config's value."""
+def _repeats(name: str, section: str | None = None) -> Callable[[str, Mapping[str, object]], bool]:
+    """A legacy field is inert only when it repeats the reference's field."""
     def repeats(key: str, hf_config: Mapping[str, object]) -> bool:
-        text = hf_config.get('text_config')
-        return isinstance(text, Mapping) and text.get(name) == hf_config[key]
+        record = hf_config if section is None else hf_config.get(section)
+        return isinstance(record, Mapping) and record.get(name) == hf_config[key]
     return repeats
 
 
@@ -166,6 +166,17 @@ _INERT_FIELDS: Mapping[str | None, Mapping[str, Callable[[str, Mapping[str, obje
     # Qwen2.5's text configs state the multimodal rotary off; on, it is a
     # Qwen2-VL rotary the qwen2 reference never applies.
     'qwen2': {'use_mrope': lambda key, hf_config: hf_config[key] is False},
+    # Released Nemotron-H configs retain these older names. The native
+    # reference reads layer_norm_epsilon, has no rotary positions, and
+    # derives dt directly from the Mamba projection.
+    'nemotron_h': {
+        'mamba_num_groups': _repeats('n_groups'),
+        'mamba_state_dim': _repeats('ssm_state_size'),
+        'num_query_groups': _repeats('num_key_value_heads'),
+        'rms_norm_eps': _repeats('layer_norm_epsilon'),
+        'norm_eps': _repeats('layer_norm_epsilon'),
+        **dict.fromkeys(('time_step_rank', 'rope_theta', 'partial_rotary_factor'), _any_value),
+    },
     # The published HF ports carry mamba_ssm's own fields. The reference
     # normalizes with MambaRMSNormGated alone and gates before it
     # normalizes (modeling_mamba2.py:417, :477 passes norm_before_gate=False,
@@ -186,8 +197,8 @@ _INERT_FIELDS: Mapping[str | None, Mapping[str, Callable[[str, Mapping[str, obje
     # Qwen3_5(Moe)Config declares no such field, and the wrapper's model sizes
     # its head from text_config.hidden_size (modeling_qwen3_5.py:1683,
     # modeling_qwen3_5_moe.py:1868).
-    'qwen3_5': {'hidden_size': _repeats_text('hidden_size')},
-    'qwen3_5_moe': {'hidden_size': _repeats_text('hidden_size')},
+    'qwen3_5': {'hidden_size': _repeats('hidden_size', section='text_config')},
+    'qwen3_5_moe': {'hidden_size': _repeats('hidden_size', section='text_config')},
 }
 
 
@@ -724,7 +735,7 @@ def _softmax_top_k(hf_config: Mapping[str, object], used: set[str]) -> int:
 
 
 def translate_config(hf_config: Mapping[str, object]) -> DecoderFields:
-    """Translate one registered family, refusing computation with no counterpart."""
+    """Translate one registered family's config, refusing any setting Dew does not compute."""
 
     model_type = hf_config.get('model_type')
     # A multimodal repo's config.json is a wrapper whose model_type names the
@@ -1536,29 +1547,30 @@ def translate_weights(
     param_dtype: str = "float32",
     lazy: bool = False,
 ) -> Variables:
-    """Map HF tensors into a CausalTransformer tree. Parameters default to FP32.
+    """Map HF tensors into a CausalTransformer tree, with parameters in FP32 by default.
 
-    Each tensor goes through its family's `prepare_weights` and `weight_path`;
-    a 2-D kernel is transposed from torch's [out, in] to Dense's [in, out],
-    and per-expert tensors stack onto an expert axis.
+    Each tensor goes through its family's `prepare_weights` and `weight_path`. A
+    2-D kernel is transposed from torch's [out, in] to Dense's [in, out], and
+    per-expert tensors are stacked on an expert axis.
 
-    A tied checkpoint carries lm_head.weight as well, as a copy of the
-    embedding (Qwen3-0.6B does). The copy is checked and dropped. The tree has
-    one leaf for the two, and a checkpoint whose "tied" head is a different
-    matrix would otherwise load as a model that computes something else.
-    param_dtype changes floating parameter storage, independently of compute
-    dtype. Router and frozen state remain FP32; integer indices retain their
-    native dtype. Conversion happens per leaf before its layout copy.
+    A tied checkpoint also stores lm_head.weight as a copy of the embedding
+    (Qwen3-0.6B does). The copy is checked and dropped, because the tree has one
+    leaf for both, and a checkpoint whose "tied" head were a different matrix
+    would otherwise load as a model that computes something else.
 
-    With `lazy` every leaf is a `SourceLeaf` over the stored tensors, read
-    only when it is placed (`dew.interop.streaming`); otherwise each is read
+    `param_dtype` sets the storage dtype of floating parameters, separately from
+    the compute dtype. Router and frozen state stay in FP32, and integer indices
+    keep their own dtype. Each leaf is converted before its layout copy.
+
+    With `lazy`, every leaf is a `SourceLeaf` over the stored tensors that is read
+    only when it is placed (`dew.interop.streaming`); otherwise each leaf is read
     whole here.
 
-    `model_type` names the source's own family where the caller read it off
-    a config.json. Without it the family comes from the record, which is
-    what the backbone would be built from and so cannot tell two families
-    apart that compute the same thing under different tensor names: Kimi
-    K2.5's decoder is DeepSeek V3's computation nested under
+    `model_type` names the source's own family when the caller read it from a
+    config.json. Without it, the family comes from the record, which describes
+    what the backbone would be built from, so it cannot tell apart two families
+    that compute the same thing under different tensor names. Kimi K2.5's
+    decoder, for example, is DeepSeek V3's computation nested under
     `language_model.`.
     """
     family = (_family_for_config(config) if model_type is None
