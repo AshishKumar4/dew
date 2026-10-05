@@ -7,6 +7,7 @@ from pathlib import Path
 
 import jax
 import numpy as np
+import pytest
 
 from dew.diffusion.block import BlockProcess
 from dew.interop import Pretrained
@@ -151,6 +152,46 @@ def test_a_text_decoder_takes_its_tokenizer_whatever_processor_files_ship(tmp_pa
     assert type(bundle.processor.reference) is type(reference.processor.reference)
 
 
+def assert_transformers_reads(export, model, variables, reference):
+    """transformers' DiffusionGemmaForBlockDiffusion loads `export` with a
+    clean report, and its bare and self-conditioned logits on the fixture's
+    prompt and canvas, in fp32 and float64, hold Dew's (`model` on
+    `variables`) to tests/reference_error.py's rule. Returns its fp32 model."""
+    import torch
+    from reference_error import assert_as_exact_as_the_reference
+    from test_block_diffusion import prefill
+    from transformers.models.diffusion_gemma.modeling_diffusion_gemma import DiffusionGemmaForBlockDiffusion
+
+    from tools.diffusers_wan_reference import float64
+
+    def theirs(dtype):
+        loaded, report = DiffusionGemmaForBlockDiffusion.from_pretrained(
+            str(export), dtype=dtype, local_files_only=True, output_loading_info=True,
+            experts_implementation="eager")
+        assert not any(report.values()), report
+        loaded = loaded.eval()
+        loaded.set_attn_implementation("eager")
+        prompt, canvas = (torch.from_numpy(reference[key]) for key in ("prompt", "canvas"))
+        previous = torch.from_numpy(reference["previous"]).to(dtype)
+        with torch.no_grad():
+            bare = loaded(input_ids=prompt, decoder_input_ids=canvas).logits
+            conditioned = loaded(input_ids=prompt, decoder_input_ids=canvas,
+                                 self_conditioning_logits=previous).logits
+        return loaded, bare.numpy(), conditioned.numpy()
+
+    loaded, bare, conditioned = theirs(torch.float32)
+    with float64():
+        _, bare_f64, conditioned_f64 = theirs(torch.float64)
+    cache = prefill(model, variables, reference["prompt"])
+    ours_bare = model.apply({**variables, "cache": cache}, reference["canvas"])
+    ours_conditioned = model.apply({**variables, "cache": cache}, reference["canvas"],
+                                   self_conditioning_logits=reference["previous"])
+    assert_as_exact_as_the_reference(np.asarray(ours_bare), bare, bare_f64, "bare")
+    assert_as_exact_as_the_reference(np.asarray(ours_conditioned), conditioned, conditioned_f64,
+                                     "conditioned")
+    return loaded
+
+
 def test_transformers_reads_a_trained_export_at_dews_logits_and_tokens(tmp_path):
     """The export of a changed DiffusionGemma is a checkpoint transformers'
     DiffusionGemmaForBlockDiffusion loads with a clean report. On the
@@ -159,12 +200,8 @@ def test_transformers_reads_a_trained_export_at_dews_logits_and_tokens(tmp_path)
     rule, and its generation from matched draws
     (tools/diffusion_gemma_reference.py) writes Dew's tokens."""
     import torch
-    from reference_error import assert_as_exact_as_the_reference
-    from test_block_diffusion import prefill
-    from transformers.models.diffusion_gemma.modeling_diffusion_gemma import DiffusionGemmaForBlockDiffusion
 
     from dew.nn.inputs import ModelInputs
-    from tools.diffusers_wan_reference import float64
     from tools.diffusion_gemma_reference import reference_generation
 
     bundle = Pretrained.load(str(FIXTURE), dtype="float32", attention_impl="xla", max_seq_len=32)
@@ -176,34 +213,71 @@ def test_transformers_reads_a_trained_export_at_dews_logits_and_tokens(tmp_path)
     with np.load(FIXTURE / "reference.npz") as stored:
         reference = {name: stored[name] for name in stored.files}
 
-    def theirs(dtype):
-        model, report = DiffusionGemmaForBlockDiffusion.from_pretrained(
-            str(tmp_path), dtype=dtype, local_files_only=True, output_loading_info=True,
-            experts_implementation="eager")
-        assert not any(report.values()), report
-        model = model.eval()
-        model.set_attn_implementation("eager")
-        prompt, canvas = (torch.from_numpy(reference[key]) for key in ("prompt", "canvas"))
-        previous = torch.from_numpy(reference["previous"]).to(dtype)
-        with torch.no_grad():
-            bare = model(input_ids=prompt, decoder_input_ids=canvas).logits
-            conditioned = model(input_ids=prompt, decoder_input_ids=canvas,
-                                self_conditioning_logits=previous).logits
-        return model, bare.numpy(), conditioned.numpy()
-
-    model, bare, conditioned = theirs(torch.float32)
-    with float64():
-        _, bare_f64, conditioned_f64 = theirs(torch.float64)
-    cache = prefill(bundle.model, changed, reference["prompt"])
-    ours_bare = bundle.model.apply({**changed, "cache": cache}, reference["canvas"])
-    ours_conditioned = bundle.model.apply({**changed, "cache": cache}, reference["canvas"],
-                                          self_conditioning_logits=reference["previous"])
-    assert_as_exact_as_the_reference(np.asarray(ours_bare), bare, bare_f64, "bare")
-    assert_as_exact_as_the_reference(np.asarray(ours_conditioned), conditioned, conditioned_f64,
-                                     "conditioned")
+    model = assert_transformers_reads(tmp_path, bundle.model, changed, reference)
 
     generated, _, _ = reference_generation(model, torch.from_numpy(reference["prompt"]))
     process = bundle.block_generation().process
     prompt = ModelInputs(jax.numpy.asarray(reference["prompt"]))
     ours = process.generate(bundle.model, changed, prompt, 7, key=jax.random.key(11))
     np.testing.assert_array_equal(ours.tokens, generated.sequences.numpy()[:, :12])
+
+
+def test_transformers_reads_a_trained_image_reading_runs_export(tmp_path):
+    """A block-diffusion run records its native model and no published config;
+    `Pretrained.from_run` writes one from the model
+    (`diffusion_gemma.published_config`: the text stack in
+    diffusion_gemma_text's fields, the Gemma 4 tower's vision_config, the
+    canvas). The export of a run of the image-reading model, its parameters
+    moved, is read by transformers' DiffusionGemmaForBlockDiffusion at Dew's
+    logits (`assert_transformers_reads`), and by Dew's own loader back to the
+    run's model and logits."""
+    from test_block_diffusion import prefill
+    from test_inference import make_block_run
+    from transformers import AutoConfig
+
+    run = tmp_path / "run"
+    run.mkdir()
+    make_block_run(run, moved=0.02, tokenizer=str(FIXTURE))
+    exported = Pretrained.from_run(str(run), ema=False)
+    exported.save(tmp_path / "export")
+    assert (tmp_path / "export" / "tokenizer.json").read_bytes() == (FIXTURE / "tokenizer.json").read_bytes()
+    # transformers reads the same text and vision configs out of the export as
+    # out of the checkpoint the run started from, but for the run's own
+    # max_seq_len, and the fixture's default_output_length, which no class
+    # of transformers 5.16.1 declares. The image token ids are transformers'
+    # defaults: Dew places images by position and keeps none.
+    ours, published = (AutoConfig.from_pretrained(str(path)) for path in (tmp_path / "export", FIXTURE))
+    assert ours.text_config.to_dict() == {**published.text_config.to_dict(),
+                                          "max_position_embeddings": exported.model.max_seq_len}
+    vision = published.vision_config.to_dict()
+    del vision["default_output_length"]
+    assert ours.vision_config.to_dict() == vision
+    with np.load(FIXTURE / "reference.npz") as stored:
+        reference = {name: stored[name] for name in stored.files}
+    assert_transformers_reads(tmp_path / "export", exported.model, exported.variables, reference)
+
+    again = Pretrained.load(str(tmp_path / "export"), dtype="float32", attention_impl="xla")
+    assert again.model.conditioner == exported.model.conditioner
+    assert again.model.canvas_length == exported.model.canvas_length
+
+    def logits(bundle):
+        cache = prefill(bundle.model, bundle.variables, reference["prompt"])
+        return np.asarray(bundle.model.apply({**bundle.variables, "cache": cache}, reference["canvas"]))
+
+    np.testing.assert_array_equal(logits(again), logits(exported))
+
+
+def test_a_model_the_published_config_cannot_carry_is_refused_by_field():
+    """DiffusionGemma's text config fixes the 30 softcap, and transformers
+    builds the projector from the tower's epsilon; a model that differs in
+    either is refused naming it rather than written as one it is not."""
+    from dew.interop.diffusion_gemma import published_config
+
+    model = Pretrained.load(str(FIXTURE), dtype="float32", attention_impl="xla").model
+    assert published_config(model)["vision_config"]["model_type"] == "gemma4_vision"
+    with pytest.raises(ValueError, match="final_logit_softcap"):
+        published_config(model.clone(text=model.text.clone(final_logit_softcap=50.0)))
+    projection = replace(model.conditioner.projection, norm_eps=1e-5)
+    with pytest.raises(ValueError, match="Gemma 4 tower and its projector"):
+        published_config(model.clone(conditioner=model.conditioner.clone(projection=projection)))
+

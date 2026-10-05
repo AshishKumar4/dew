@@ -7,6 +7,7 @@ no family-specific public loading entry point.
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Mapping
 
 import numpy as np
@@ -15,11 +16,19 @@ from flax.traverse_util import flatten_dict
 
 from dew import records
 from dew.diffusion.block import BlockProcess
-from dew.interop.hf_decoders import DecoderFields, translate_config, translate_denoiser_weights
+from dew.interop.hf_decoders import (
+    DecoderFields,
+    _export_config,
+    translate_config,
+    translate_denoiser_weights,
+)
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.multimodal import VisionConditioner
 from dew.nn.vision import (
+    Gemma4Projector,
+    Gemma4Vision,
+    export_gemma4_vision_config,
     translate_gemma4_projector_config,
     translate_gemma4_projector_weights,
     translate_gemma4_vision_config,
@@ -160,6 +169,60 @@ def scalar_placement(text: CausalTransformer, variables: Variables) -> CausalTra
         if any(isinstance(node, Mapping) and "layer_scalar" in node for node in held.values()):
             return text if text.layer_scalar == mode else text.clone(layer_scalar=mode)
     return text
+
+
+# Gemma 4 text fields DiffusionGemma's text config has none of: its modules
+# fix them (keys read as values on full layers, a routed mixture beside every
+# dense MLP, the 30 softcap) or never build them (per-layer inputs, shared KV
+# layers, the double-wide MLP).
+_GEMMA4_ONLY = ("architectures", "use_cache", "attention_k_eq_v", "enable_moe_block",
+                "final_logit_softcapping", "hidden_size_per_layer_input", "vocab_size_per_layer_input",
+                "num_kv_shared_layers", "use_double_wide_mlp")
+# The run's own settings, which no config carries: precision and kernels,
+# training-time dropout and initialization, layout, and where the layer
+# scalar is stored (`scalar_placement`). `causal` is no setting but is fixed
+# by the classes on both sides: Dew's text stack is the causal encoder view
+# DiffusionGemma requires, and transformers' encoder attends causally unless
+# use_bidirectional_attention is "all", which this config never writes,
+# while its decoder never does (modeling_diffusion_gemma.py:281, :383, 5.16.1).
+_RUN_SETTINGS = ("dtype", "precision", "force_fp32_for_softmax", "attention_impl", "kv_cache", "causal",
+                 "scan_layers", "bank_layers", "remat", "dropout_rate", "embedding_dropout_rate",
+                 "attention_dropout_rate", "initializer_range", "depth_scaled_init", "layer_scalar")
+
+
+def published_config(model: DiffusionGemma) -> Mapping[str, object]:
+    """The config transformers' DiffusionGemmaForBlockDiffusion reads for
+    `model`: its text stack in diffusion_gemma_text's fields, its Gemma 4
+    tower's vision_config and its canvas length.
+
+    Dew places images by position and keeps no image token ids, so the config
+    names none and transformers' defaults stand. A model the written fields
+    would rebuild differently is refused, naming the fields that differ.
+    """
+    text = {name: value for name, value in _export_config(model.text).items() if name not in _GEMMA4_ONLY}
+    text.update(model_type="diffusion_gemma_text",
+                use_bidirectional_attention=None if model.conditioner is None else "vision")
+    rebuilt = from_record(CausalTransformer, {
+        **translate_config(text), **{name: getattr(model.text, name) for name in _RUN_SETTINGS}})
+    lost = [field.name for field in dataclasses.fields(CausalTransformer)
+            if field.name not in ("parent", "name")
+            and getattr(rebuilt, field.name) != getattr(model.text, field.name)]
+    if lost:
+        raise ValueError(f"DiffusionGemma's text config cannot carry this model's {', '.join(lost)}")
+    config: dict[str, object] = {"model_type": "diffusion_gemma",
+                                 "architectures": ["DiffusionGemmaForBlockDiffusion"],
+                                 "text_config": text, "canvas_length": model.canvas_length,
+                                 "tie_word_embeddings": model.text.tie_embeddings}
+    if model.conditioner is not None:
+        tower, projection = model.conditioner.vision, model.conditioner.projection
+        # transformers builds the tower from vision_config and the projector
+        # from the tower's epsilon and the text width.
+        if not (isinstance(tower, Gemma4Vision) and projection == Gemma4Projector(
+                text_width=model.text.emb_features, norm_eps=tower.rms_norm_eps)):
+            raise ValueError("DiffusionGemma's vision_config describes a Gemma 4 tower and its projector, "
+                             f"not {tower!r} with {projection!r}")
+        config["vision_config"] = export_gemma4_vision_config(tower)
+    return config
 
 
 def _refuse_unreadable(config: Mapping[str, object]) -> None:
