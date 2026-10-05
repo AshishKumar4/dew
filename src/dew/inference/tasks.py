@@ -59,8 +59,8 @@ extra decode steps off the result. The call's cache is the padded prompt plus
 the rounded budget, rounded up again, and the call uses it in place of the
 model's whole `max_seq_len`. The number of rows is not bucketed. A request
 whose buckets would exceed `max_seq_len` keeps its own shapes, so the model
-refuses exactly the requests it would refuse without buckets. A request that
-carries media or multi-axis positions also keeps its own shapes.
+refuses exactly the requests it would refuse without buckets. A request with
+media or multi-axis positions also keeps its own shapes.
 """
 
 
@@ -654,7 +654,7 @@ class MaskedGeneration:
 
     It does not reproduce the source-specific remasking recipes of LLaDA or
     Dream. EOS trims the finished response after the bidirectional
-    denoising, and does not end that denoising early. Results carry
+    denoising, and does not end that denoising early. Results hold
     refinement counts and no autoregressive action likelihoods. When a call
     passes none, it uses the task's `steps`, its `max_new_tokens` response
     length and its `n` continuations per prompt.
