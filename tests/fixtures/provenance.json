@@ -2281,17 +2281,6 @@
     }
    ]
   },
-  "lora/flux-tiny": {
-   "tool": "tools/lora_reference.py",
-   "sources": [
-    {
-     "repo": "huggingface/diffusers",
-     "version": "0.34.0",
-     "runs": "diffusers"
-    }
-   ],
-   "note": "Expected adapted/base outputs are Diffusers; same tool also stores Dew's prediction, and meta pins PEFT 0.20.0/transformers 4.49.0."
-  },
   "lora/llama-tiny": {
    "tool": "tools/lora_reference.py",
    "sources": [
@@ -2329,16 +2318,26 @@
    ],
    "note": "Expected context is CLIP; UNet and text adapters use PEFT."
   },
-  "lora/sd3-tiny": {
-   "tool": "tools/lora_reference.py",
+  "lora_exports": {
+   "tool": "tools/lora_export_reference.py",
    "sources": [
+    {
+     "repo": "huggingface/peft",
+     "version": "0.20.0",
+     "runs": "peft"
+    },
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.16.1",
+     "runs": "transformers"
+    },
     {
      "repo": "huggingface/diffusers",
      "version": "0.34.0",
      "runs": "diffusers"
     }
    ],
-   "note": "Expected adapted/base outputs are Diffusers; same tool also stores Dew's prediction, and meta pins PEFT 0.20.0/transformers 4.49.0."
+   "note": "Adapters Dew writes (llama-tiny fresh, rsLoRA and patterned; tiny SD, FLUX and SD3 denoisers), factors moved by seeded draws, read by PEFT's PeftModel and Diffusers' load_lora_weights with every file tensor landing; adapted and merge_and_unload/fuse_lora outputs in float32 and float64 (diffusers_wan_reference.float64); content SHA-256 of each adapter file. Torch 2.14.0+cpu."
   },
   "mamba2": {
    "tool": "tools/mamba2_reference.py",
