@@ -1670,6 +1670,36 @@ tokamax's Mosaic TPU `causal_conv1d_gated_delta_rule` covers the conv, the
 gating and the rule over a step's tokens in one ragged call. That call is
 the layout of the mixed admitting step, where it would plug in.
 
+Dew keeps the recurrent state in fp32, as transformers does. vLLM 0.30.0
+keeps it in the model's dtype: for a gated delta net,
+`mamba_ssm_cache_dtype="auto"` means the conv state's dtype, bf16 here
+(`MambaStateDtypeCalculator._mamba_state_dtype`). At 32 slots Dew's state is
+604 MB, read and written each decode step, so 1.2 GB moves against vLLM's
+0.6. At the RTX 4080's bandwidth that is about 0.85 ms of the step, a large
+part of the median token gap: Dew 5.6 ms against vLLM's 3.5. Dew keeps fp32
+anyway. A bf16 state rounds every row's memory at every token, and the
+reference does not.
+
+Not adopted: the mixed admitting step for a gated delta net, 2026-10-05.
+A hybrid server keeps two forwards for an admitting step: a prefill
+forward for the admitted prompts and a decode forward for the running
+rows. A branch gave `GatedDeltaNet` the mixed call (`Admitted`): the
+projections over every token at once, then the conv and the rule apart
+for the decoding rows (the kernel above) and for each admitted piece.
+Its numerics passed the rule. At 32 slots, 3 of 64 greedy rows parted
+from the two-forward path, all at ties within 1.00 bf16 spacing, and all
+three took fp32's argmax. It gained nothing measurable:
+
+- Traced closed loop: device busy 5613 against 5621 ms at 128 slots and
+  1812 against 1804 at 32. Every admission in a closed loop comes as a
+  wave with no row decoding, so the merge has nothing to fold in, and the
+  decode program ran 241 and 253 times on both sides.
+- Open loop at 32 slots, two rounds alternating: TTFT p50 3.5 ms shorter
+  at 8 requests a second, level at 16 and 24, and a median token gap of
+  5.6 ms on both sides.
+
+171 added lines were not worth that.
+
 ## Quantized serving of the 176M text-to-image model, 2026-09-28
 
 `TextToImage.quantized` serves the denoiser with its kernels stored as int8
