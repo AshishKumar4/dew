@@ -1,4 +1,4 @@
-"""Native vision conditioning around the shared causal decoder."""
+"""Image and audio conditioning around the shared causal decoder."""
 
 from __future__ import annotations
 
@@ -158,16 +158,17 @@ def _place(embeddings: jax.Array, table: jax.Array, indices: jax.Array) -> jax.A
 
 @models("multimodal_transformer")
 class MultimodalTransformer(nn.Module):
-    """A media-conditioned decoder using the ordinary decoder cache and head.
+    """Conditions the shared decoder on images and audio, using the ordinary decoder cache and head.
 
-    ``image_indices`` and ``audio_indices`` identify the soft feature for each
-    text slot, or -1 for text. Media are evaluated during conditioned
-    forward/prefill calls; subsequent decoding reads the cached language
-    states without rerunning the encoders. Parameters retain the existing
-    language_model, tower and projector names; audio adds audio_tower and
-    audio_projector. Gemma 3n also embeds its hard vision and audio vocabulary
-    ranges through the embedders and keeps placeholder ids for its per-layer
-    inputs, as modeling_gemma3n.py does.
+    ``image_indices`` and ``audio_indices`` give, for each token slot, the
+    index of the soft feature that fills it, or -1 for a text token. The
+    towers run during conditioned forward and prefill calls; later decode
+    steps read the cached language states and do not run the encoders again.
+    The parameters keep the existing `language_model`, tower and projector
+    names, and audio adds `audio_tower` and `audio_projector`. Gemma 3n also
+    embeds its hard vision and audio vocabulary ranges through the embedders,
+    and keeps placeholder ids for its per-layer inputs, as modeling_gemma3n.py
+    does.
     """
 
     language_model: CausalTransformer
@@ -273,7 +274,7 @@ class MultimodalTransformer(nn.Module):
     def mtp_hidden_states(self, hidden, tokens, train: bool = False, positions=None,
                           segment_ids=None, image_indices=None, conditioning=None,
                           attention_mask=None, image_groups=None, rotary_positions=None):
-        """Prediction layers over the same media embeddings as the main decoder."""
+        """Run the multi-token prediction layers over the same media embeddings as the main decoder."""
         embeddings = None
         if conditioning is not None:
             fused = self._conditioned_embeddings(tokens, image_indices, conditioning, train=train)
@@ -286,15 +287,17 @@ class MultimodalTransformer(nn.Module):
             image_groups=image_groups, rotary_positions=rotary_positions)
 
     def mtp_logits(self, hidden, tokens, **kwargs):
-        """The shared language head over each media-aware prediction depth."""
+        """Return the shared language head's logits for each media-aware prediction depth."""
         return [
             self.language_model._logits(state) for state in self.mtp_hidden_states(hidden, tokens, **kwargs)
         ]
 
     def mtp_step(self, hidden, tokens, *, image_indices=None, conditioning=None,
                  input_embeddings=None, **kwargs):
-        """One candidate prediction step using the decoder's independent MTP
-        cache, returning its logits and its hidden state."""
+        """Run one candidate prediction step with the decoder's separate MTP cache.
+
+        It returns the step's logits and hidden state. Pass either prepared
+        `input_embeddings` or media `conditioning`, not both."""
         if conditioning is not None:
             if input_embeddings is not None:
                 raise ValueError("MTP receives either prepared embeddings or media conditioning")
@@ -305,7 +308,7 @@ class MultimodalTransformer(nn.Module):
         return self.language_model.mtp_step(hidden, tokens, input_embeddings=input_embeddings, **kwargs)
 
     def token_embeddings(self, tokens):
-        """The decoder's own table; a drawn token is text, never media."""
+        """Return the decoder's own embeddings of `tokens`; a sampled token is always text, never media."""
         return self.language_model.token_embeddings(tokens)
 
     def init_mtp_cache(self, batch_size: int):
@@ -320,13 +323,13 @@ class MultimodalTransformer(nn.Module):
                       audio_indices=None, routed_experts=None, routed=None):
         """Run the decoder over text with the media embeddings spliced in.
 
-        `conditioning` holds the towers' payloads and `image_indices` and
+        `conditioning` holds the towers' payloads, and `image_indices` and
         `audio_indices` say which token positions each one replaces. A
         decode step tracks the next position in the `cache` collection,
         because a media span advances a row by more than one token.
-        `routed_experts` and `routed` replay a routing record and pass to the
-        language model unchanged: engines record a row for every placeholder
-        position too, so the `[B, S, layers, top_k]` layout is the text's.
+        `routed_experts` and `routed` replay a routing record and go to the
+        language model unchanged. Engines record a row for every placeholder
+        position too, so the `[B, S, layers, top_k]` layout matches the text.
         """
         if self.family == "gemma4":
             placeholder = tokens == self.image_token_id
@@ -384,27 +387,27 @@ class MultimodalTransformer(nn.Module):
         return self.language_model._logits(hidden)
 
     def states_and_logits(self, tokens, **kwargs):
-        """The final hidden states and their logits from one media-aware forward."""
+        """Return the final hidden states and their logits from one media-aware forward pass."""
         hidden = self.hidden_states(tokens, **kwargs)
         return hidden, self.language_model._logits(hidden)
 
     def states_and_logits_at(self, tokens, slots, **kwargs):
-        """The final hidden states, and the logits of one slot per row.
+        """Return the final hidden states, and the logits of one slot per row.
 
-        A prefill scores the position the first draw reads and no other; the
-        head over every prompt position is what a long request allocates
-        most of its transient memory for.
+        A prefill needs logits only at the position the first sample reads.
+        Running the head over every prompt position would take most of a
+        long request's transient memory, so this scores only `slots`.
         """
         hidden = self.hidden_states(tokens, **kwargs)
         return hidden, self.language_model._logits(hidden[jnp.arange(hidden.shape[0]), slots])
 
     def head_weight(self, params):
-        """The decoder's shared fp32 head matrix for chunked objective scoring."""
+        """Return the decoder's shared fp32 head matrix, for an objective's chunked scoring."""
         return self.language_model.head_weight(params["language_model"])
 
     @nn.compact
     def init_cache(self, batch_size: int):
-        """Allocate the nested language cache without evaluating media."""
+        """Allocate the language model's cache and the next-position counter, without running the towers."""
         self.variable("cache", "next_position", jnp.zeros, (batch_size,), jnp.int32)
         self.language_model.init_cache(batch_size)
 
