@@ -1670,6 +1670,24 @@ tokamax's Mosaic TPU `causal_conv1d_gated_delta_rule` covers the conv, the
 gating and the rule over a step's tokens in one ragged call. That call is
 the layout of the mixed admitting step, where it would plug in.
 
+The six full-attention layers have 256-wide heads, and cudnn does not run
+them, so their decode attention takes jax.nn's xla path. XLA's GPU
+products take each head's keys apart, so every step transposed the whole
+cache, keys and values, into `[rows, heads, width, slots]`: 394 of the
+128-slot decode program's 3673 ms. A decode-shaped xla call on a GPU now
+puts every query head against every (slot, head) pair (`folded_attention`,
+at most 16 query positions times heads). Both products then read the cache
+as `[rows, slots * heads, width]`, its own layout, and the cross-head
+products are discarded. That is twice the multiplications here, in a step
+bound by reading the cache. Six layers took 1.21 against 2.48 ms at 128
+rows and 0.33 against 0.47 at 32 in isolation. Serving, two rounds
+alternating, 128 slots went from 5814-5816 to 6152-6157 tokens a second
+(median token gap 15.25 to 14.1 ms at 16 requests a second), and 32 slots
+from 4245-4501 to 4637-4641. Divergent greedy rows are near-ties: 3 of 64
+at 32 slots (at most 0.93 bf16 spacings apart in fp32, all three to fp32's
+argmax) and 20 of 256 at 128 (at most 1.74, fp32's argmax split 10 and
+10).
+
 Dew keeps the recurrent state in fp32, as transformers does. vLLM 0.30.0
 keeps it in the model's dtype: for a gated delta net,
 `mamba_ssm_cache_dtype="auto"` means the conv state's dtype, bf16 here
