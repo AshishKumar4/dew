@@ -63,6 +63,14 @@
 		// `pnpm live:deploy <sha> -- --env preview`.
 		"preview": {
 			"name": "dewml-live-preview",
+			// The retired private snapshot lab existed only on preview.
+			"migrations": [
+				{ "tag": "v1", "new_sqlite_classes": ["Kernel", "Coordinator"] },
+				{ "tag": "v2", "new_sqlite_classes": ["LiveKernel"] },
+				{ "tag": "v3", "deleted_classes": ["Kernel"] },
+				{ "tag": "v4", "new_sqlite_classes": ["SnapshotLab"] },
+				{ "tag": "v5", "deleted_classes": ["SnapshotLab"] }
+			],
 			"routes": [{ "pattern": "live-preview.dewml.dev", "custom_domain": true }],
 			"containers": [
 				{
