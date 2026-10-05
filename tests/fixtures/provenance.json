@@ -2386,7 +2386,7 @@
      "runs": "transformers"
     }
    ],
-   "note": "A tiny registry Llama Dew exports (parameters moved by a seeded draw) with the committed Llama-style tokenizer, converted by llama.cpp's own convert_hf_to_gguf.py to F32 GGUF (in the Dew environment plus sentencepiece 0.2.2: its declared transformers 4.57.6 cannot read the TokenizersBackend class transformers 5 writes) and run by libllama built from the archive (SHA-256 pinned) for the CPU, F32 KV cache, one thread; transformers float64 logits on the same export as the truth; SHA-256 of the export's config, generation config and weights; the GGUF's vocabulary (pieces by id, unknown/beginning/end ids) read back with the pinned gguf-py."
+   "note": "A tiny registry Llama Dew exports (weights on a 2^-8 grid drawn from numpy's PCG64 integers, the same on every CPU) with the committed Llama-style tokenizer, converted by llama.cpp's own convert_hf_to_gguf.py to F32 GGUF (in the Dew environment plus sentencepiece 0.2.2: its declared transformers 4.57.6 cannot read the TokenizersBackend class transformers 5 writes) and run by libllama built from the archive (SHA-256 pinned) for the CPU, F32 KV cache, one thread; transformers float64 logits on the same export as the truth; SHA-256 of the export's config, generation config and weights; the GGUF's vocabulary (pieces by id, unknown/beginning/end ids) read back with the pinned gguf-py."
   },
   "lm_engine": {
    "tool": "tools/lm_engine_reference.py",
