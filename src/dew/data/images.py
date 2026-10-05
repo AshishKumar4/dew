@@ -191,13 +191,6 @@ def image_augmentations(mode: Augmentation) -> Augment | None:
 # ColorJitter(brightness=0.2, contrast=0.05, saturation=0.2, hue=0): the three
 # factors' uniform ranges, applied in a random order per record.
 _JITTER_RANGES = ((0.8, 1.2), (0.95, 1.05), (0.8, 1.2))
-_LUMA = np.array([0.299, 0.587, 0.114], np.float32)
-
-
-def _gray(pixels: np.ndarray) -> np.ndarray:
-    """0.299 R + 0.587 G + 0.114 B as float32; cvtColor is the fast path here."""
-    import cv2
-    return cv2.cvtColor(pixels, cv2.COLOR_RGB2GRAY)
 
 
 def augment_image(augment: Augment | None, image: np.ndarray,
@@ -206,8 +199,9 @@ def augment_image(augment: Augment | None, image: np.ndarray,
 
     Every draw comes from grain's per-record rng, a Philox keyed by the
     record index, so a record's augmentation is the same however many
-    workers, threads or processes produced its batch. uint8 pixels go through
-    float32 and are rounded and clipped once at the end.
+    workers, threads or processes produced its batch. The jitter is
+    torchvision's float ColorJitter (`jitter_host`); uint8 pixels go through
+    float32 and are rounded once at the end.
     """
     if augment is None:
         return image
@@ -216,24 +210,11 @@ def augment_image(augment: Augment | None, image: np.ndarray,
     if not augment.jitter:
         return np.ascontiguousarray(image)
 
-    import cv2
-    brightness, contrast, saturation = (rng.uniform(low, high) for low, high in _JITTER_RANGES)
-    pixels = image.astype(np.float32)
-    for index in rng.permutation(3):
-        if index == 0:
-            pixels = pixels * brightness
-        elif index == 1:
-            # Contrast is measured against the image as it stands at its
-            # place in the order, not the incoming one.
-            mean = _gray(pixels).mean()
-            pixels = pixels * contrast + mean * (1 - contrast)
-        else:
-            # Saturation as one matrix: out_c = s * x_c + (1 - s) * gray.
-            matrix = np.eye(3, dtype=np.float32) * saturation + np.outer(
-                np.ones(3, np.float32), (1 - saturation) * _LUMA)
-            pixels = cv2.transform(pixels, matrix)
-    np.rint(pixels, out=pixels)
-    return np.clip(pixels, 0, 255, out=pixels).astype(np.uint8)
+    from .image_augmentation import jitter_host
+
+    factors = np.asarray([rng.uniform(low, high) for low, high in _JITTER_RANGES])
+    pixels = jitter_host(image.astype(np.float32), factors, rng.permutation(3))
+    return np.rint(pixels).astype(np.uint8)
 
 
 @functools.cache
