@@ -439,14 +439,14 @@ def test_the_chunk_inverse_is_exact_where_its_series_cancels(chunk):
 
 
 def test_a_decay_deep_in_a_chunk_keeps_its_own_precision():
-    """Each pairwise decay's exponent is summed over its own range, so its
-    fp32 error is that of a sum of the range's k terms, in any order
-    gamma_k sum|g| (the zeros outside it add exactly), plus exp's own
-    rounding, however far into the chunk the pair sits. A difference of
-    cumulative sums carries the error of the whole accumulated magnitude
-    instead: at g near -2 over 64 positions, ~128 eps on a decay between
-    neighbours, which the KDA gradient amplified to twice the reference's
-    distance from float64 (tests/test_kimi_linear.py)."""
+    """Each pairwise decay's exponent is a difference of two compensated
+    cumulative sums, rounded twice: within 2u of its own range's magnitude,
+    plus the compensated sums' own error (u^2 per term of the chunk's
+    magnitude) and exp's rounding, however far into the chunk the pair
+    sits. A difference of plain cumulative sums carries the rounding of the
+    whole accumulated magnitude instead: at g near -2 over 64 positions,
+    ~128 u on a decay between neighbours, which the KDA gradient amplified
+    to twice the reference's distance from float64 (tests/test_kimi_linear.py)."""
     g = np.random.default_rng(7).uniform(-3, -1, (2, 64, 4)).astype(np.float32)
     _, decay = chunk_decay(jnp.asarray(g))
     wide = np.asarray(g, np.float64)
@@ -454,13 +454,12 @@ def test_a_decay_deep_in_a_chunk_keeps_its_own_precision():
     ranges = [wide[:, c + 1:r + 1] for r, c in zip(rows, cols, strict=True)]
     exponent = np.array([part.sum(1) for part in ranges])
     magnitude = np.array([np.abs(part).sum(1) for part in ranges])
-    eps = np.finfo(np.float32).eps / 2
-    terms = (rows - cols)[:, None, None]
-    gamma = np.broadcast_to(terms * eps / (1 - terms * eps), magnitude.shape)
+    u = np.finfo(np.float32).eps / 2
     got = np.asarray(decay, np.float64)[:, rows, cols].transpose(1, 0, 2)
     kept = got > np.finfo(np.float32).tiny
     error = np.abs(np.log(got[kept]) - exponent[kept])
-    bound = gamma[kept] * magnitude[kept] + 2 * eps
+    chunk = np.broadcast_to(np.abs(wide).sum(1), magnitude.shape)[kept]
+    bound = 2 * u * magnitude[kept] + 64 * u * u * chunk + 2 * u
     assert np.all(error <= bound), float(np.max(error / bound))
     above = ~np.tril(np.ones((64, 64), bool))
     assert not np.asarray(decay)[:, above].any()

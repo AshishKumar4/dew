@@ -34,8 +34,7 @@ import pytest
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import AttentionMetadata, ModelInputs
-from dew.nn.linear import segment_sum
-from dew.nn.mixers.mamba2 import Mamba2, Mamba2Mixer, chunk_ssd, recurrent_ssd
+from dew.nn.mixers.mamba2 import Mamba2, Mamba2Mixer, chunk_ssd, recurrent_ssd, segment_sum
 from dew.objectives.lm import LMObjective
 from dew.registry import mixers
 
