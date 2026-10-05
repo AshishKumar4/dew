@@ -6,14 +6,14 @@ model calls, and Dew trains on them.
     JAX_PLATFORMS=cpu python examples/train_harbor.py --smoke --out /tmp/harbor-smoke
 
 Each update draws `--prompts` Harbor tasks and runs `--groups` trials of
-each through `HarborSource`: Harbor starts the task's sandbox and the
-harness (mini-swe-agent by default), the harness's model calls go through
-rllm-model-gateway to the engines, and the gateway's traces become the
-session's calls. `RolloutScheduler` admits complete groups at most
-`--max-lag` updates stale and packs them; the GRPO objective trains on the
-sampled ids only. `Publication` pushes each version to every engine with
-`SafetensorsReload` and then stamps the gateway, so every call carries the
-version it was sampled under.
+each through `HarborSource`. Harbor starts the task's sandbox and harness
+(mini-swe-agent by default). The harness sends model calls through
+rllm-model-gateway to the engines, and the gateway records them as session
+calls. `RolloutScheduler` admits and packs complete groups at most
+`--max-lag` updates stale; the GRPO objective trains only on the sampled
+IDs. `Publication` pushes each version to every engine with
+`SafetensorsReload` and then stamps the gateway, so each call records the
+version used to sample it.
 
 The example writes the policy to `--served` and then waits, up to
 `--ready-timeout` seconds, for the gateway to route to an engine:
@@ -25,8 +25,8 @@ gateway's health interval, keep its admin routes away from the sandboxes).
 `--smoke` needs neither Harbor nor an engine. A stand-in `harbor` script
 runs a two-turn harness against an in-process gateway whose engine is
 Dew's own server on the committed tiny Qwen2, so the ids and likelihoods
-it records are the policy's own draws. The reward is the share of vowels
-in the replies. Two updates on CPU.
+it records are the policy's own draws. It trains for two updates on CPU,
+with the share of vowels in the replies as the reward.
 """
 
 from __future__ import annotations
@@ -65,9 +65,9 @@ class Config:
     tasks: tuple[Path, ...] = ()
     """Harbor task directories; each update samples `prompts` of them."""
     gateway: str = "http://127.0.0.1:9090"
-    """The gateway's root as this process reaches it."""
+    """The gateway's root URL reachable from this process."""
     sandbox_gateway: str | None = None
-    """Where sandboxes reach the gateway: a proxy that forwards only session chat calls."""
+    """Proxy URL reachable from sandboxes, forwarding only session chat calls."""
     engines: tuple[str, ...] = ("http://127.0.0.1:8011",)
     engine: str = "vllm"
     served: Path = Path("runs/harbor/served")
@@ -179,7 +179,7 @@ with open(os.path.join(trial, "result.json"), "w") as out:
 
 
 class SmokeGateway(ThreadingHTTPServer):
-    """rllm-model-gateway's routes a HarborSource reads, over Dew's own server as the engine."""
+    """rllm-model-gateway routes for HarborSource, backed by Dew's own server."""
 
     def __init__(self, policy: NativeRolloutServer, words):
         super().__init__(("127.0.0.1", 0), _SmokeRoutes)
@@ -189,7 +189,7 @@ class SmokeGateway(ThreadingHTTPServer):
         self.lock = threading.Lock()
 
     def handle_error(self, request, client_address) -> None:
-        """Quiet: a trial cancelled mid-call leaves its request's socket and draw behind."""
+        """Suppress errors from trials cancelled mid-call, which leave a socket and draw behind."""
 
 
 class _SmokeRoutes(BaseHTTPRequestHandler):
@@ -258,7 +258,7 @@ class _SmokeRoutes(BaseHTTPRequestHandler):
 
 
 def smoke_setup(config: Config, source) -> tuple[SmokeGateway, Path, tuple[Path, ...]]:
-    """The stand-in harbor, two task directories and a gateway over Dew's server on the tiny policy."""
+    """Prepare the stand-in harbor, two task directories and a gateway serving the tiny policy."""
     harbor = config.out / "harbor"
     harbor.write_text(f"#!{sys.executable}\n" + HARNESS)
     harbor.chmod(0o755)

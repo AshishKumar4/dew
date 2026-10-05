@@ -3,18 +3,18 @@
     python examples/sft_gemma4.py --model google/gemma-4-E2B \\
         --dataset allenai/tulu-3-sft-mixture --steps 4000 --out runs/gemma4-sft
 
-The run packs whole conversations into windows, counts the loss on assistant
-targets alone, shards the weights over the visible devices and accumulates
-micro-batches into one update. It ends by exporting the trained weights to
-the Hugging Face layout, so transformers and `Pretrained.load` both read
-them, and the run directory itself scores through the harness:
+The run packs whole conversations into windows and counts the loss only on
+assistant targets. It shards the weights over the visible devices and
+accumulates micro-batches into one update, then exports the trained weights
+in the Hugging Face layout. Both transformers and `Pretrained.load` can read
+the export, and the harness can score the run directory itself:
 
     python -m dew.eval --model dew --model_args run=runs/gemma4-sft/checkpoints/gemma4-sft \\
         --tasks hellaswag --limit 64
 
-`dew.data.ChatMessages` reads the Hub dataset itself, so the id on the
-command line is what the run trains on: it renders every conversation with
-the checkpoint's own chat template and packs them into windows.
+`dew.data.ChatMessages` reads the Hub dataset named on the command line,
+renders every conversation with the checkpoint's own chat template and
+packs them into windows.
 
     JAX_PLATFORMS=cpu python examples/sft_gemma4.py --smoke --out /tmp/gemma4-smoke
 """
@@ -37,10 +37,10 @@ from dew.training import MeshSpec, TrainState, prepare_process
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests/fixtures"
 SMOKE_MODEL = FIXTURES / "hf/gemma4-ple"
-# The decoder fixtures ship weights and no tokenizer. This one holds the same
-# 64 ids they were written against, one per `t<n>` word, so a canned turn
-# tokenizes to distinct targets instead of a row of unknowns, and it carries
-# the prefix-preserving chat template an instruct checkpoint always does.
+# The decoder fixtures have weights but no tokenizer. This vocabulary has
+# the same 64 IDs, one per `t<n>` word, so canned turns yield distinct targets
+# rather than unknowns. It includes the prefix-preserving chat template
+# expected from an instruct checkpoint.
 SMOKE_VOCAB = FIXTURES / "hf/diffusion-gemma-workflow"
 SMOKE_CONVERSATIONS = [
     [{"role": "user", "content": f"t{first} t{first + 2}"},
@@ -52,7 +52,7 @@ SMOKE_CONVERSATIONS = [
 class Config:
     model: str = "google/gemma-4-E2B"
     dataset: str = "allenai/tulu-3-sft-mixture"
-    """Hub chat dataset id, a parquet file or a .jsonl file of conversations."""
+    """Hub chat dataset ID, a parquet file or a .jsonl file of conversations."""
     split: str = "train"
     column: str = "messages"
     out: Path = Path("runs/gemma4-sft")
@@ -63,13 +63,13 @@ class Config:
     steps: int = 4000
     learning_rate: float = 1e-5
     rows: int | None = None
-    """Conversations taken from the head of the split; unset takes them all."""
+    """Conversations to take from the start of the split; unset uses them all."""
     smoke: bool = False
     """Fine-tune the committed tiny Gemma 4 on canned turns instead."""
 
 
 def write_conversations(conversations: list, out: Path) -> Path:
-    """The canned turns as the JSONL `ChatMessages` reads line by line."""
+    """Write the canned turns as JSONL for `ChatMessages`."""
     out.mkdir(parents=True, exist_ok=True)
     jsonl = out / "chat.jsonl"
     jsonl.write_text("".join(json.dumps({"messages": turns}) + "\n" for turns in conversations))
@@ -77,8 +77,10 @@ def write_conversations(conversations: list, out: Path) -> Path:
 
 
 def run_config(config: Config, tokenizer: str, chat: str) -> LMRunConfig:
-    """Everything the run is but its model, which the checkpoint decides
-    (`main` records the loaded one)."""
+    """Configure the run apart from its model, which comes from the checkpoint.
+
+    `main` records that loaded model.
+    """
     smoke = config.smoke
     # A row budget is the split slice `datasets` already understands.
     split = config.split if config.rows is None else f"{config.split}[:{config.rows}]"
@@ -91,8 +93,8 @@ def run_config(config: Config, tokenizer: str, chat: str) -> LMRunConfig:
         sample_tokens=4 if smoke else 64,
         optim=OptimConfig(learning_rate=config.learning_rate, weight_decay=0.0,
                           clip_grads=1.0),
-        # A smoke run stays out of any process pool; a real run joins one
-        # when a cluster started it and runs alone otherwise.
+        # Smoke runs stay out of process pools. A real run joins the pool
+        # supplied by its cluster, or runs alone when there is none.
         trainer=TrainerConfig(checkpoint_dir=str(config.out / "checkpoints"),
                               batch_size=config.batch_size, steps=config.steps,
                               accumulation=config.accumulation, log_every=1 if smoke else 20,
@@ -115,8 +117,8 @@ def main(config: Config) -> Path:
     run = run_config(config, tokenizer, chat)
     prepare_process(run.trainer.wandb, run.trainer.multi_host, run.trainer.xla_flags,
                     run.trainer.compilation_cache_dir, layout=run.trainer.layout)
-    # Only now: counting devices opens the backend, which has to come after
-    # the pool forms, and a pool's count is every process's devices.
+    # Counting devices opens the backend, so the pool must form first.
+    # In a pool, the count includes devices from every process.
     run = replace(run, trainer=replace(run.trainer, mesh=MeshSpec(fsdp=jax.device_count())))
 
     source = PretrainedDecoder.load(config.model, dtype=jnp.float32 if config.smoke else jnp.bfloat16,
