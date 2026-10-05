@@ -164,7 +164,7 @@ const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey);
 				}
 			}
 			if (stopping) return;
-			if (message.type === 'error' && message.ename === 'ValueError' && message.evalue.startsWith('This page was updated.')) {
+			if (message.type === 'error' && message.ename === 'StalePage') {
 				failure = message.evalue;
 				return;
 			}
