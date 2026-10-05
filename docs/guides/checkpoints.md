@@ -1,10 +1,12 @@
 # Checkpoints
 
-`dew.Checkpoints(directory)` holds the checkpoints of one run. Given to a `Trainer`, it saves the training state and the data iterator's position every `checkpoint_every` steps and at the end of `fit`, and a later `fit` with the same directory resumes from the newest step. A training checkpoint holds the model variables, the optimizer state, three step counters (attempted batches, accepted microbatches and optimizer updates), the root key, the EMA copy when the objective keeps one, the loss scaler's history, and any half-filled gradient accumulation window.
+Use `dew.Checkpoints(directory)` to manage one run's checkpoints. Pass it to `Trainer` to save training state and the data iterator's position every `checkpoint_every` steps and at the end of `fit`. A later `fit` with the same directory resumes from the newest step.
+
+A training checkpoint stores model variables, optimizer state and three counters: attempted batches, accepted microbatches and optimizer updates. It also stores the root key, the EMA copy when the objective keeps one, loss-scaler history and any partly filled gradient-accumulation window.
 
 ## Example
 
-The example trains for five steps, restores the state in a new `Trainer`, and continues to step ten. Its iterator reports its batch index as bytes through `get_state` and `set_state`, so the checkpoint can store the data position.
+Train for five steps, restore into a new `Trainer`, then continue to step ten. The iterator exposes its batch index as bytes through `get_state` and `set_state`, so the checkpoint can save its position.
 
 ```python
 import tempfile
@@ -87,7 +89,7 @@ Trained 5 steps in 0:00:00: first step after 0.10 s, then 1501.2 step/s
 final step: 10 latest: 10
 ```
 
-`steps` is the step count to finish at, not a number of steps to add: the second `fit(..., steps=10)` starts at step five and runs five more. `place()` returns the restored `TrainState`, its placement and the saved iterator position. Prefetching may read batches ahead of the loop, but the saved position is the last batch the loop consumed. The example writes into a temporary directory; a run that should persist needs a directory of its own, passed again on later calls.
+`steps` is the target step count. The second `fit(..., steps=10)` starts at step five and runs five more steps. `place()` returns the restored `TrainState`, its placement and the saved iterator position. Prefetching may read ahead, but checkpoints record the last batch consumed by the loop. This example uses a temporary directory. For a persistent run, choose a directory and pass it again on later calls.
 
 ## Checkpoints
 
@@ -110,11 +112,11 @@ final step: 10 latest: 10
 | `kept()` | Committed steps with their metrics, ranking rules and state/weights kind. |
 | `profile_steps()`, `profile_metadata(step)`, `restore_profiles(step)` | The post-hoc EMA snapshots (below). |
 
-Saves are asynchronous; `wait()` returns once they are durable. Constructing `Checkpoints` opens nothing; the Orbax managers are created on first use.
+Saves run asynchronously. Call `wait()` to wait until they are durable. Constructing `Checkpoints` opens nothing; it creates Orbax managers on first use.
 
 ## Best weights and early stopping
 
-Evaluation decides what “best” means; the checkpointer decides where those weights stay. `fit` takes the metric objects it evaluates, so a selector names a producer, not an unrelated log string. The metric's `Shown(better="lower" | "higher")` supplies its direction. A missing direction is refused unless `Best(..., mode="min" | "max")` supplies one.
+Select the best checkpoint using a metric object passed to `fit`. The selector must refer to a metric that evaluation produces. Its `Shown(better="lower" | "higher")` specifies which direction is better. If that direction is missing, supply `Best(..., mode="min" | "max")`; otherwise, the selector is rejected. The checkpointer retains the selected weights.
 
 ```python
 from dew import Best, Checkpoints, Plateau, Trainer
@@ -129,11 +131,15 @@ state = trainer.fit(data, steps=100_000, metrics=[fid, clip],
                     best=fid, stop=Plateau(fid, evals=5, min_delta=0.01))
 ```
 
-With no selector, a run with validation ranks by the objective's validation loss; a run without validation ranks by its training loss. A validation pass always refers to the checkpoint's own state, including its EMA overlay when evaluation uses averaged weights. Evaluation runs at the checkpoint cadence too, so a save never inherits a score from earlier weights. The default objective loss adds a forward pass when validation metrics do not already report loss. Its statistics-only program is compiled once per objective and reused by mesh and batch shape; it does not compile or run an optimizer gradient. An explicit metric selector uses the existing metric pass and avoids that additional forward pass. An evaluation between checkpoint steps writes a state only if its score enters a best-K set. With `checkpoint_every=None` and no explicit `best`, only the final state is saved, as before; an explicit best policy can instead save only its winners. A regular checkpoint that also enters best is written once.
+Without a selector, a run with validation ranks checkpoints by the objective's validation loss. Without validation, it uses training loss. Validation always scores the checkpoint's state, including its EMA overlay when evaluation uses averaged weights. Evaluation also runs at checkpoint intervals, so a save cannot inherit a score from earlier weights.
 
-Each save records all metrics from that evaluation and the training loss under their names, such as `val/fid` and `train/loss`. Ranking values, directions and top-K limits have separate metadata. A save without a selected score is unranked, not ranked by a different loss. In particular, an emergency preemption save does not invent a validation score. Old checkpoints' `loss` key keeps its historical training-loss meaning.
+If validation metrics do not already report loss, default ranking adds an objective forward pass. This statistics-only program compiles once per objective and is reused by mesh and batch shape. It does not compile or run an optimizer gradient. An explicit metric selector uses the existing metric pass and avoids the extra forward pass.
 
-Several trackers retain the union of their winners. A callable reads metrics by object, handles unhashable metric objects, and minimizes its result unless `mode="max"` is supplied. `threshold` admits only scores strictly better than that value in the selected direction.
+Between checkpoint steps, evaluation saves state only when its score enters a best-K set. With `checkpoint_every=None` and no explicit `best`, the run saves only its final state. An explicit best policy can save only its winners. A regular checkpoint that also enters a best set is written once.
+
+Each save records all metrics from that evaluation and the training loss under names such as `val/fid` and `train/loss`. Ranking values, directions and top-K limits have separate metadata. A save without a selected score stays unranked. It does not substitute another loss. Emergency preemption saves, for example, have no invented validation score. In old checkpoints, `loss` still means training loss.
+
+With several trackers, the run retains all their winners. A callable reads metrics by object and handles unhashable metric objects. Its result is minimized unless you set `mode="max"`. With `threshold`, only scores strictly better than that value in the selected direction qualify.
 
 ```python
 # Three best FID steps and two best CLIP-score steps, plus the latest two states.
@@ -146,11 +152,13 @@ trainer.fit(data, steps=100_000, metrics=[fid, clip], eval_every=1_000,
             best=Best(lambda m: m[fid] - 0.1 * m[clip], threshold=20.0))
 ```
 
-The supplied metrics run together. If a callable needs a score absent from that evaluation, its tracker leaves the step unranked: it never fills a missing value from a previous evaluation. For training reports, `best=objective.loss` selects the objective's training loss; `objective.scalars.ce` selects a value the objective declares in `shown`. Aggregates can index those objects too. Strings are for recorded configurations, reader selectors and log keys, not for selecting a declared evaluation metric in code.
+The supplied metrics run together. If a callable needs a score missing from that evaluation, its tracker leaves the step unranked. It never substitutes a value from an earlier evaluation. For training reports, `best=objective.loss` selects the objective's training loss. `objective.scalars.ce` selects a value declared in `shown`. Aggregates can index those objects too. Use metric objects to select declared evaluation metrics in code. Strings are for recorded configurations, reader selectors and log keys.
 
-`Plateau` counts eligible evaluations, not training steps. An improvement must exceed `min_delta`, an absolute amount in the selected direction. Missing scores do not advance patience; nonfinite objective validation losses are errors. Patience and its policy are checkpoint metadata, so resuming with the same policy continues the same count. A changed policy is refused. Stopping writes a final full checkpoint and reports “Stopped: validation plateau”; its control metadata includes the reason. Nothing is added to `TrainState`.
+`Plateau` counts eligible evaluations. An improvement must exceed `min_delta`, an absolute amount in the selected direction. Missing scores do not advance patience. Non-finite objective validation losses are errors.
 
-The existing readers accept best selectors; `"best"` chooses the first tracker and `"best:val/clip_score"` chooses the named tracker. An aggregate is named by its position, such as `"best:aggregate:0"`.
+Checkpoints store patience and its policy as metadata, so resuming with the same policy continues the count. A changed policy is rejected. Stopping writes a final full checkpoint and reports "Stopped: validation plateau". The control metadata records the reason, with nothing added to `TrainState`.
+
+Readers accept best selectors. `"best"` chooses the first tracker; `"best:val/clip_score"` chooses the named tracker. An aggregate uses its position as its name, such as `"best:aggregate:0"`.
 
 ```python
 restored, position = trainer.checkpoints.restore(template, step="best")
@@ -159,9 +167,11 @@ for checkpoint in trainer.checkpoints.kept():
     print(checkpoint.step, checkpoint.kind, checkpoint.metrics, checkpoint.rankings)
 ```
 
-`restore_best=True` on `fit` returns the best *whole* training state, including its earlier optimizer, counters and RNG, not earlier weights paired with the final optimizer. It does not change the default return value, which is the final state. `Best(fid, weights_only=True)` writes only parameters and EMA for an off-cadence winner. Such a snapshot is inference-only: full-state restore and `restore_best=True` refuse it. When a winner falls on a full-checkpoint step, the one full save also serves the best tracker; there is no duplicate write. Latest-N retention counts full states so a small inference snapshot cannot replace the state a run resumes from.
+With `restore_best=True`, `fit` returns the complete training state from the best step, including that step's optimizer, counters and RNG. By default, it returns the final state.
 
-Several validation splits use explicit reader names; a metric selector needs its split when more than one is present. A callable uses `(split, metric)` keys.
+`Best(fid, weights_only=True)` saves only parameters and EMA when a winner falls between regular checkpoint steps. These snapshots are inference-only. Full-state restore and `restore_best=True` reject them. On a regular checkpoint step, a winning full save also serves the best tracker without a second write. Latest-N retention counts full states, so an inference snapshot cannot replace the state needed to resume.
+
+Give each validation split an explicit reader name. With several splits, a metric selector must name its split. A callable uses `(split, metric)` keys.
 
 ```python
 trainer.fit(data, steps=100_000, metrics=[fid, clip], eval_every=1_000,
@@ -170,11 +180,11 @@ trainer.fit(data, steps=100_000, metrics=[fid, clip], eval_every=1_000,
 # A cross-split aggregate: Best(lambda m: m["flowers", fid] + m["faces", fid])
 ```
 
-Recorded runs use `TrainerConfig.best`, a metric name or `Best("fid", top=3, mode="min")`; several selectors can be a tuple of named `Best` policies. A callable cannot be a recorded selector and raises a clear error.
+For recorded runs, set `TrainerConfig.best` to a metric name or a policy such as `Best("fid", top=3, mode="min")`. For several selectors, use a tuple of named `Best` policies. Recording a callable selector raises an error.
 
 ## Time cadence and retention
 
-A checkpoint cadence is steps or a `timedelta`, through the same parameter. A duration saves at the next safe training step after it elapses; processes agree on that step. Recorded configurations use a duration such as `checkpoint_every="30m"` (`s`, `m` and `h` are supported).
+Set the checkpoint interval in steps or as a `timedelta`, using the same parameter. With a duration, saving occurs at the next safe training step after the interval elapses. Processes agree on that step. In recorded configurations, use a duration such as `checkpoint_every="30m"`; `s`, `m` and `h` are supported.
 
 ```python
 from datetime import timedelta
@@ -187,35 +197,51 @@ trainer = Trainer(objective, optimizer, key=key, checkpoints=checkpoints)
 trainer.fit(data, steps=100_000, checkpoint_every=timedelta(minutes=15))
 ```
 
-`Keep.every` retains steps divisible by that period. `Keep.interval` retains checkpoints at least that much wall time apart, starting with the oldest saved step; it does **not** mean “keep every checkpoint older than this age.” `Keep.where` is a code-only predicate over a checkpoint's step and metrics. Records accept metric objects as keys as well as stored names; with several splits, use `c.metrics["flowers", fid]`. A missing score leaves that predicate unselected. These policies, latest full states, all best-K sets and post-hoc snapshots are unioned. Filenames remain step numbers; scores live in metadata and `kept()`, not in names that readers must parse.
+`Keep.every` retains steps divisible by its period. `Keep.interval` retains checkpoints spaced by at least that much wall time, starting with the oldest saved step. It specifies spacing, not a cutoff age. `Keep.where` is a code-only predicate over a checkpoint's step and metrics. Metric records accept object keys or stored names. With several splits, use `c.metrics["flowers", fid]`. A missing score leaves the predicate unselected.
 
-Ranking reads completed evaluation scalars on the host and adds no parameter transfer. The same evaluation is shared by all trackers, and entering several best-K sets still requests one save. Weights-only winners omit the optimizer, clocks and data position rather than compressing a full training checkpoint and calling it small.
+Retention combines these policies, latest full states, all best-K sets and post-hoc snapshots. Filenames stay as step numbers. Scores are in metadata and `kept()`, so readers do not need to parse them from filenames.
+
+Ranking reads completed evaluation scalars on the host without transferring parameters. All trackers use the same evaluation. A step that enters several best-K sets still requests one save. Weights-only winners save parameters and EMA without the optimizer, clocks or data position; they do not compress a full training checkpoint.
 
 ## The EMA copy on disk
 
-Orbax compresses every array of a checkpoint with zstd, which in the two runs below saves 6 to 9% on weights and Adam moments: past the sign and exponent, their bits look random. An EMA copy is different, because it agrees with the weights it follows in its sign, exponent and leading mantissa bits. `Checkpoints` stores each EMA leaf that has its weight's floating dtype and shape as the XOR of the two, split into byte planes: a leading `uint8` axis with one plane per byte, least significant first. The XOR is zero wherever the two agree, and the planes gather those zeros into long runs, which zstd compresses well. The step's metadata lists the leaves stored this way. `restore` and `stored` return them bit for bit, as the run trained them, in the dtype and placement the template asks for and on any mesh. Checkpoints written before this change list no such leaves and restore as they were written.
+Orbax compresses every checkpoint array with zstd. In the two runs below, that saves 6 to 9% on weights and Adam moments. Their bits beyond the sign and exponent look random and compress poorly.
+
+An EMA often shares its weights' sign, exponent and leading mantissa bits. For an EMA leaf with the same floating dtype and shape as its weight, `Checkpoints` stores their XOR. It splits the XOR into one plane per byte on a leading `uint8` axis, least significant byte first. Matching bits become zeros. Byte planes group those zeros into long runs that zstd compresses well.
+
+Step metadata lists leaves stored this way. `restore` and `stored` return them bit for bit in the requested template dtype and placement, on any mesh. Older checkpoints list no such leaves and restore as originally written.
 
 | Run | EMA, zstd alone | XOR, then zstd | XOR and byte planes, then zstd |
 |---|---|---|---|
 | 176M-parameter DiT, fp32, step 1.35M | 652.7 MB | 560.3 MB | 488.6 MB (−25%) |
 | 8.7M-parameter DiT, fp32, step 750, decay 0.999 | 32.2 MB | 30.8 MB | 28.2 MB (−12%) |
 
-How much the XOR saves depends on how close a run's EMA sits to its weights, which follows its updates and its decay; the table measures two runs. Written through `Checkpoints` with JAX's CPU backend, the 176M model's weights and EMA take 1139.4 MB instead of 1306.0 MB. In three processes of three saves and restores each, alternating with processes running the code before this change, a compiled save blocked the step for 0.19 to 0.46 s instead of 0.04 to 0.14 s, the time to compute the planes, and landed on disk in 1.9 to 3.7 s instead of 1.8 to 2.3 s, apart from saves that took 17 to 74 s either way while the shared disk was busy. Restores took 1.45 to 1.59 s instead of 1.31 to 1.71 s. The first save and the first restore of a process each compile one small program per distinct EMA leaf shape (19 for this model): there, a save blocked for 1.0 to 2.7 s and a restore took 2.0 to 3.0 s.
+XOR savings depend on how closely EMA values follow the weights, which depends on the updates and decay. The table measures two runs. Through `Checkpoints` on JAX's CPU backend, the 176M model's weights and EMA occupy 1139.4 MB, down from 1306.0 MB.
 
-On an NVIDIA A100 at integration commit `845b75bc`, with JAX 0.11.2, the same checkpoint's weights and EMA (175.6M fp32 parameters, step 1.35M) gave the following timings. The variants were interleaved in one process for five saves and restores each; the table gives medians of attempts 1–4, excluding the first calls.
+I measured three processes with three saves and restores each, alternating with processes using the earlier zstd-only storage. Once compiled, a save blocked the step for 0.19 to 0.46 s with XOR byte planes, compared with 0.04 to 0.14 s with zstd alone. That extra time computes the planes. Saves reached disk in 1.9 to 3.7 s, compared with 1.8 to 2.3 s. When the shared disk was busy, either variant took 17 to 74 s. Restores took 1.45 to 1.59 s with planes and 1.31 to 1.71 s with zstd alone.
+
+The first save and restore each compile a small program for every distinct EMA leaf shape, 19 for this model. Those first saves blocked for 1.0 to 2.7 s; first restores took 2.0 to 3.0 s.
+
+On an NVIDIA A100 at integration commit `845b75bc` with JAX 0.11.2, I timed the same checkpoint's weights and EMA: 175.6M fp32 parameters at step 1.35M. The variants were interleaved in one process for five saves and restores each. The table gives medians of attempts 1 to 4, excluding the first calls.
 
 | EMA storage | Weights and EMA | Save blocks the step | Save becomes durable | Restore |
 |---|---|---|---|---|
 | EMA as itself, zstd | 1306.0 MB | 0.49 s | 5.78 s | 2.35 s |
 | XOR byte planes, zstd | 1139.4 MB | 0.59 s | 5.28 s | 2.53 s |
 
-Both variants restored the EMA bit for bit. These are checkpoint timings, not training-step timings.
+Both variants restored the EMA bit for bit. The timings measure checkpoint operations only; they do not measure training steps.
 
-Planes are computed on the devices that hold the EMA. So a save holds one more EMA-sized buffer there until Orbax has copied it to the host, which fits in memory that the step's gradient frees between steps. EMA leaves in pinned host memory, as a host layout keeps them, are written as themselves: Orbax writes them from their own buffers, and differencing them would keep a second copy in the memory the layout exists to spare. EMA leaves whose dtype differs from their weight's are also stored as themselves.
+The devices holding the EMA compute its planes. Saving needs one extra EMA-sized buffer there until Orbax copies it to the host. That buffer fits in the memory freed by the step's gradients between steps.
+
+With a host layout, EMA leaves in pinned host memory are stored directly. Orbax writes from their buffers, avoiding a second copy in the host memory the layout is meant to save. EMA leaves with a different dtype from their weights are also stored directly.
 
 ## Post-hoc EMA
 
-An EMA's length is usually picked before training and judged after it. Post-hoc EMA (Karras et al. 2024, [arXiv:2312.02696](https://arxiv.org/abs/2312.02696)) picks it afterwards. `OptimConfig.ema_profiles`, such as `(0.05, 0.10)`, wraps the optimizer in `dew.training.optim.power_profiles`, which keeps one power-function EMA of the weights per relative standard deviation (the paper's σ_rel) in the optimizer state. They are sharded, placed and saved with that state. A snapshot is the ordinary checkpoint itself, retained by Orbax's public preservation policy even after `keep` would prune it. There is one atomic save, not a separate write of the averages: an interrupted save cannot publish a state without its profiles.
+You usually choose an EMA length before training and assess it afterwards. Post-hoc EMA (Karras et al. 2024, [arXiv:2312.02696](https://arxiv.org/abs/2312.02696)) lets you choose it after training.
+
+Set `OptimConfig.ema_profiles`, for example to `(0.05, 0.10)`, to wrap the optimizer in `dew.training.optim.power_profiles`. It keeps one power-function EMA per relative standard deviation, the paper's σ_rel, in optimizer state. These profiles are sharded, placed and saved with that state.
+
+A snapshot is an ordinary checkpoint retained through Orbax's public preservation policy, even when `keep` would prune it. State and profiles share one atomic save. An interrupted save cannot publish state without its profiles.
 
 ```python
 from dew import Checkpoints
@@ -225,28 +251,42 @@ averaged = checkpoints.posthoc_ema(0.07)               # at the latest snapshot
 averaged = checkpoints.posthoc_ema(0.07, step=40000)
 ```
 
-`posthoc_ema` returns the `params` collection as host arrays, in the weights' structure and dtypes. It weights every snapshot up to the step by the least-squares solve of the paper's Algorithm 3 (`dew.training.posthoc.coefficients`), which gives the same weights as NVlabs' `phema.py` to the last bit on the paper's setting, and reads one snapshot at a time. Its accuracy depends on how many snapshots there are: in a 96-step CPU run tracking 0.05 and 0.10, an average of 0.07 rebuilt from snapshots every 4 steps differed from one tracked directly by at most 1.2e-7 (weights of scale 2), every 8 steps by 4.8e-7, every 16 steps by 5.7e-6; the tracked 0.05 average was 1.3e-4 from it.
+`posthoc_ema` returns the `params` collection as host arrays with the weights' structure and dtypes. It reads one snapshot at a time and weights every snapshot up to the selected step. The weights come from the least-squares solve in the paper's Algorithm 3, implemented by `dew.training.posthoc.coefficients`. On the paper's setting, they match NVlabs' `phema.py` bit for bit.
 
-Each profile holds one more copy of the weights in memory. Retaining the whole checkpoint costs disk. With fp32 weights, an ordinary EMA, fp32 Adam moments, two power profiles and no accumulation buffers, a 176M model holds six weight-sized trees per snapshot: about 4.2 GB before compression. A 1.35M-update run saving every 10k updates keeps 135 snapshots, about 570 GB raw. Keeping only the two averages would take about 190 GB, but the separate-manager design added blocking setup and a gap between commits; the one-checkpoint design keeps the state and profiles atomic. Empty `ema_profiles` retains the ordinary `keep` policy.
+Accuracy depends on snapshot count. In a 96-step CPU run tracking 0.05 and 0.10, I rebuilt an average of 0.07 and compared it with one tracked directly. With snapshots every 4 steps, the largest difference was 1.2e-7 for weights of scale 2. Every 8 steps gave 4.8e-7; every 16 gave 5.7e-6. The tracked 0.05 average differed from the directly tracked 0.07 by 1.3e-4.
 
-In paired, interleaved CPU saves of an 8.4M-parameter fp32 tree, the same state saved with and without snapshot retention blocked for median 14.9 and 15.2 ms respectively (six warmed pairs). No extra parameter bytes are transferred or serialized for a snapshot. On an NVIDIA A100 at integration commit `845b75bc`, with JAX 0.11.2 and 175.6M fp32 parameters, snapshot retention likewise added no measured blocking cost. The full state included weights, EMA, Adam moments and two power profiles. The variants were interleaved for five saves each; these are medians of attempts 1–4. Restore was not timed for this comparison.
+Each profile adds a copy of the weights in memory. Retaining full checkpoints also costs disk. A 176M model with fp32 weights, an ordinary EMA, fp32 Adam moments and two power profiles uses six weight-sized trees per snapshot, excluding accumulation buffers. That is about 4.2 GB before compression. A 1.35M-update run saving every 10k updates keeps 135 snapshots, about 570 GB raw.
+
+Keeping only the two averages would use about 190 GB. However, a separate manager added blocking setup and a gap between commits. Saving one checkpoint keeps state and profiles atomic. With empty `ema_profiles`, the ordinary `keep` policy applies.
+
+For an 8.4M-parameter fp32 tree on CPU, I interleaved six warmed pairs of saves of the same state. Median blocking time was 14.9 ms with snapshot retention and 15.2 ms without it. A snapshot transfers and serializes no extra parameter bytes.
+
+On an NVIDIA A100 at integration commit `845b75bc`, with JAX 0.11.2 and 175.6M fp32 parameters, snapshot retention also added no measured blocking cost. Full state included weights, EMA, Adam moments and two power profiles. The variants were interleaved for five saves each. These are medians of attempts 1 to 4. I did not time restore for this comparison.
 
 | Retention | Full checkpoint | Save blocks the step | Save becomes durable |
 |---|---|---|---|
 | Inline profiles, no snapshot retention | 3762.1 MB | 1.41 s | 14.80 s |
 | Checkpoint retained as a snapshot | 3762.1 MB | 1.38 s | 14.71 s |
 
-Both variants wrote the same bytes. Snapshot retention changes which steps stay on disk, not what each save transfers.
+Both variants wrote the same bytes. Snapshot retention determines which steps stay on disk. Each save transfers the same data.
 
 ## Preemption
 
-A scheduler stops a job with SIGTERM and kills it a grace period later: Slurm's `KillWait`, Kubernetes' termination grace period, a spot VM's notice. `Trainer.fit` stops at the next step every process agrees on (JAX's `reached_preemption_sync_point` in a pool, the signal itself in a lone process), writes that step's state and data position, skips the final validation, and raises `dew.training.Preempted`. Uncaught, it ends the program with exit status 143, SIGTERM's, so the scheduler sees a stopped job rather than a finished one; a Kubernetes pod failure policy can ignore that code. The same command run again resumes from the checkpoint. On a GPU, `--xla_gpu_deterministic_ops=true` orders the reductions, so a resumed run can match the uninterrupted one to the bit. XLA still picks GEMM and convolution kernels at compile time by live timing, and a resumed process compiles again, so it can pick kernels that round differently ([XLA's determinism notes](https://openxla.org/xla/determinism)). `--xla_gpu_autotune_level=0` removes that choice, at a cost. On an RTX 4080 the 176M hybrid DiT's step went from 139 to 151 ms (8%), and a 67M decoder's from 79.8 to 81.5 ms (2%). Whether the choice actually differs in practice is unconfirmed. Two runs of a CIFAR-10 LADD distillation under deterministic ops alone ended a step apart from an uninterrupted run, by 3.5e-14 in the patch convolution's gradient, which Adam carried to 8e-6. But 20 fresh processes training a DiT under deterministic ops alone all agreed to the bit, as did 20 with autotuning off. Dew's CUDA test lane sets both flags as a precaution. On a CPU with performance and efficiency cores (Intel's hybrid parts), XLA's float32 convolution rounds one of two ways for the life of a process, chosen by the core type that ran its first convolution ([openxla/xla#50022](https://github.com/openxla/xla/issues/50022)), so a resumed process can land on the other; pinning the run to one core type (`taskset`) removes the choice.
+Schedulers send SIGTERM, then kill the job after a grace period. Examples include Slurm's `KillWait`, Kubernetes' termination grace period and a spot VM's notice. `Trainer.fit` stops at the next step every process agrees on. In a process pool, it uses JAX's `reached_preemption_sync_point`; in a single process, it uses the signal itself. It saves that step's state and data position, skips final validation and raises `dew.training.Preempted`.
 
-The save has to fit in the scheduler's grace: a step and one checkpoint write. `dew launch` gives a pool it was told to stop 300 seconds before it kills the ranks, and a second signal kills them at once ([Training on several nodes](multi-node.md)).
+Uncaught, `Preempted` exits with status 143, the code for SIGTERM. The scheduler then records a stopped job instead of a completed one. A Kubernetes pod failure policy can ignore that code. Run the same command again to resume from the checkpoint.
+
+On GPU, `--xla_gpu_deterministic_ops=true` orders reductions so a resumed run can match an uninterrupted run bit for bit. XLA still chooses GEMM and convolution kernels by timing them during compilation. A resumed process compiles again and may choose kernels that round differently; see [XLA's determinism notes](https://openxla.org/xla/determinism). Setting `--xla_gpu_autotune_level=0` removes that choice but slows steps. On an RTX 4080, the 176M hybrid DiT's step rose from 139 to 151 ms (8%). A 67M decoder's step rose from 79.8 to 81.5 ms (2%).
+
+I have not confirmed whether different autotuner choices cause different rounding in practice. Two CIFAR-10 LADD distillation runs with deterministic ops alone differed at a step from an uninterrupted run. The patch convolution's gradient differed by 3.5e-14, which Adam amplified to 8e-6. However, 20 fresh processes training a DiT with deterministic ops alone matched bit for bit, as did 20 with autotuning off. Dew's CUDA test lane sets both flags as a precaution.
+
+On CPUs with performance and efficiency cores, such as Intel's hybrid parts, XLA's float32 convolution has two rounding behaviors. The core type that runs the first convolution chooses the behavior for that process; see [openxla/xla#50022](https://github.com/openxla/xla/issues/50022). A resumed process may use the other behavior. Pin the run to one core type with `taskset` to remove that choice.
+
+The scheduler's grace period must cover one step and one checkpoint write. After a stop request, `dew launch` gives the pool 300 seconds before killing its ranks. A second signal kills them immediately; see [Training on several nodes](multi-node.md).
 
 ## Data position
 
-A plain Python generator usually cannot report its position. To continue the data sequence, use a built-in source that supports checkpointing, or give the iterator both `get_state` and `set_state` as the example does. An iterator rebuilt from the start may replay records even though the model weights restore correctly. A stream that cannot save its position cannot produce a resumable checkpoint, so its `checkpoint_every` must be `None`; the final state is still written.
+A plain Python generator usually cannot report its position. To resume the data sequence, use a built-in source with checkpoint support or implement `get_state` and `set_state`, as above. Rebuilding an iterator from the start may replay records even when weights restore correctly. For a stream that cannot save its position, set `checkpoint_every=None`. Such a stream cannot produce a resumable checkpoint, but the final state is still written.
 
 A persistent checkpoint can restore into a different, compatible placement through the trainer's restore template. Whether the process count can change depends on the saved position:
 
@@ -258,16 +298,20 @@ Local checkpoints hold only the shards each process had, so they restore onto th
 
 ## Several hosts
 
-Every process of a pool writes its own shards of a persistent checkpoint, process 0 writes the metadata and commits the step, and a restore reads shards other processes wrote. So every process must read and write the same directory, on a shared filesystem or in a bucket. On disks of their own, process 0 would commit steps without the other processes' shards, and those processes would see no step at all. The first time a pool uses `Checkpoints`, process 0 writes a file into the directory and every process checks that it can see it; if any cannot, every process raises an error that names the processes that cannot. Buckets skip this check. Each host's own disk can still hold the local checkpoints next to the shared directory.
+Each process writes its shards of a persistent checkpoint. Process 0 writes metadata and commits the step. Restoring reads shards written by other processes, so every process needs read and write access to the same directory. Use a shared filesystem or bucket. With separate disks, process 0 would commit without the other shards, and other processes would see no step.
+
+On a pool's first use of `Checkpoints`, process 0 writes a file and every process checks that it can see it. If any process cannot, all processes raise an error listing those that failed. Buckets skip this check. You can also keep local checkpoints on each host's disk alongside the shared checkpoints.
 
 [Distributed training](../concepts/distributed.md) covers topology requirements and [Cloud TPUs](../tpu.md) remote setup. A local save and restore does not show that cross-host recovery or remote storage work.
 
 ## What a checkpoint does not save
 
-`Checkpoints` does not write `run.json`; recipes that use `RunConfig.save` or `RunConfig.train` write the run configuration separately. `RunConfig.load` reads a record an older Dew wrote: a field the record lacks takes its default, which is what runs recorded before the field existed did. It refuses a field it does not know, such as one a newer Dew wrote. A checkpoint also does not save source code, package versions, tokenizer files, the dataset revision, or the state of any external service. Record those in the experiment metadata.
+`Checkpoints` does not write `run.json`. Recipes save configuration separately through `RunConfig.save` or `RunConfig.train`. `RunConfig.load` can read records from older Dew versions. A missing field takes its default, matching runs recorded before that field existed. Unknown fields, such as those written by a newer version, are rejected.
+
+Checkpoints do not save source code, package versions, tokenizer files, dataset revisions or external-service state. Record these in the experiment metadata.
 
 ## Limits
 
-Resume with the same model, optimizer, accumulation length and scaler configuration the run trained with; the trainer refuses a different accumulation length. When the loss scaler rejects a step's gradients, the attempt still counts, and the accumulation records, optimizer state, EMA and mutable contributions accepted before it stay as they were. Restoring keeps the scaler's streak of finite steps and its scale, including a partially filled window. If the checkpoint already reached the target step, resuming reads no data and does no evaluation, compilation or saving.
+Resume with the same model, optimizer, accumulation length and scaler configuration. The trainer rejects a different accumulation length. If the loss scaler rejects a step's gradients, the attempt still counts. Previously accepted accumulation records, optimizer state, EMA and mutable contributions remain unchanged. Restoring preserves the scaler's finite-step streak and scale, including a partly filled window. If the checkpoint has already reached the target step, resuming reads no data and runs no evaluation, compilation or save.
 
 Deterministic CPU tests cover checkpoints taken in the middle of a window and after rejected attempts, including composite replay. They do not cover cross-host recovery on GPU or TPU, or replaying the side effects of external rollouts. The per-fit counter that stops a run after repeated non-finite losses is not checkpointed. A training checkpoint without the step counters and accumulation fields cannot resume through this interface, but its parameters can still be loaded alone.
