@@ -161,7 +161,8 @@ class NativeModels:
                 tickets.append(error)
         for server in self.text_servers.values():
             server.run()
-        return [ticket if isinstance(ticket, Exception) else {"text": ticket.result().text} for ticket in tickets]
+        return [ticket if isinstance(ticket, Exception) else {"text": ticket.result().text}
+                for ticket in tickets]
 
 
 class ModelService(socketserver.ThreadingUnixStreamServer):
@@ -170,7 +171,7 @@ class ModelService(socketserver.ThreadingUnixStreamServer):
     def __init__(self, path, models, uids=KERNEL_UIDS):
         self.path, self.models, self.uids = Path(path), models, frozenset(uids)
         self.jobs = queue.Queue(maxsize=8)
-        self.pending = set()
+        self.pending = {}
         self.lock = threading.Lock()
         self.path.unlink(missing_ok=True)
         super().__init__(str(path), ModelRequest)
@@ -179,6 +180,43 @@ class ModelService(socketserver.ThreadingUnixStreamServer):
         self.worker.start()
         self.listener = threading.Thread(target=self.serve_forever, daemon=True)
         self.listener.start()
+
+    def process_request(self, request, address):
+        uid = struct.unpack("3i", request.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))[1]
+        token = object()
+        with self.lock:
+            if uid not in self.uids:
+                error = {"name": "PermissionError",
+                         "message": "model requests require an isolated kernel uid"}
+            elif uid in self.pending or len(self.pending) >= 8:
+                error = {"name": "ValueError", "message": "the shared model request queue is full; try again"}
+            else:
+                self.pending[uid] = token
+                error = None
+        if error is not None:
+            try:
+                request.sendall(json.dumps({"error": error}).encode() + b"\n")
+            finally:
+                self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, address)
+        except Exception:
+            self.release(uid, token)
+            raise
+
+    def process_request_thread(self, request, address):
+        uid = struct.unpack("3i", request.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))[1]
+        token = self.pending[uid]
+        try:
+            super().process_request_thread(request, address)
+        finally:
+            self.release(uid, token)
+
+    def release(self, uid, token):
+        with self.lock:
+            if self.pending.get(uid) is token:
+                del self.pending[uid]
 
     def compute(self):
         missing = object()
@@ -225,9 +263,12 @@ class ModelService(socketserver.ThreadingUnixStreamServer):
 class ModelRequest(socketserver.StreamRequestHandler):
     def handle(self):
         uid = struct.unpack("3i", self.request.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))[1]
+        token = self.server.pending[uid]
         completed = threading.Event()
 
         def emit(value):
+            if "result" in value or "error" in value:
+                self.server.release(uid, token)
             try:
                 self.wfile.write(json.dumps(value, allow_nan=False).encode() + b"\n")
                 self.wfile.flush()
@@ -237,32 +278,21 @@ class ModelRequest(socketserver.StreamRequestHandler):
                 if "result" in value or "error" in value:
                     completed.set()
 
-        admitted = False
         try:
-            if uid not in self.server.uids:
-                raise PermissionError("model requests require an isolated kernel uid")
-            self.request.settimeout(90)
+            self.request.settimeout(10)
             raw = self.rfile.readline(MAX_REQUEST + 1)
             if not raw.endswith(b"\n") or len(raw) > MAX_REQUEST:
                 raise ValueError("the model request is too large")
             request = validate(json.loads(raw))
-            with self.server.lock:
-                if uid in self.server.pending:
-                    raise ValueError("this kernel already has a model request running")
-                self.server.pending.add(uid)
-                admitted = True
             self.server.jobs.put_nowait((request, emit))
             if not completed.wait(90):
                 raise TimeoutError("the shared model did not finish within 90 seconds")
         except Exception as error:
             emit({"error": {"name": type(error).__name__, "message": str(error)}})
-        finally:
-            if admitted:
-                with self.server.lock:
-                    self.server.pending.discard(uid)
 
 
 if __name__ == "__main__":
     models = NativeModels()
-    with ModelService("/run/dew/model.sock", models):
+    with ModelService("/run/dew/model/model.sock", models):
+        Path("/run/dew/model/ready").write_text("ready\n")
         threading.Event().wait()

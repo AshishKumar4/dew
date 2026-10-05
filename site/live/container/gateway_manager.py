@@ -5,7 +5,7 @@ small private tmpfs scratch mounts. Models and compiled programs belong to the
 separate serving uid and are never loaded into these kernel processes.
 """
 
-import itertools
+import queue
 import json
 import os
 import shlex
@@ -19,7 +19,9 @@ from kernel_gateway.services.kernels.manager import (
 )
 from traitlets import default
 
-_uids = itertools.count(6100)
+_uids = queue.SimpleQueue()
+for _uid in range(6100, 6200):
+    _uids.put(_uid)
 
 
 class LimitedKernelManager(KernelGatewayIOLoopKernelManager):
@@ -46,11 +48,17 @@ class LimitedKernelManager(KernelGatewayIOLoopKernelManager):
         if self.connection_file:
             connection = Path('/sessions/connections') / Path(self.connection_file).name
             connection.unlink(missing_ok=True)
+        uid = getattr(self, "guest_uid", None)
+        if uid is not None:
+            _uids.put(uid)
+            self.guest_uid = None
 
     async def _async_launch_kernel(self, kernel_cmd, **kwargs):
-        uid = next(_uids)
-        if uid >= 6200:
-            raise RuntimeError("the container's kernel uid allotment is exhausted; retire this container")
+        try:
+            uid = _uids.get_nowait()
+        except queue.Empty:
+            raise RuntimeError("the shared container has no free isolated kernel uid") from None
+        self.guest_uid = uid
         if len(kernel_cmd) < 3 or kernel_cmd[1:3] != ["-m", "ipykernel_launcher"]:
             raise ValueError("only the Python demo kernel may be started")
         connection = Path('/sessions/connections') / Path(self.connection_file).name
@@ -79,14 +87,16 @@ class LimitedKernelManager(KernelGatewayIOLoopKernelManager):
             "--size", str(64 * 1024 * 1024), "--tmpfs", "/work",
             "--size", str(16 * 1024 * 1024), "--tmpfs", "/tmp",
             "--ro-bind", str(connection), "/kernel.json",
-            "--bind", str(directory), "/work/ipc", "--chdir", "/work", "--cap-drop", "ALL",
+            "--bind", str(directory), "/work/ipc",
+            "--ro-bind", "/run/dew/model/model.sock", "/work/model.sock",
+            "--chdir", "/work", "--cap-drop", "ALL",
             "/opt/venv/bin/python", "/opt/live/guest_entry.py", *arguments,
         ]
         limited = ["/usr/sbin/capsh", "--drop=all", "--no-new-privs", f"--user=ctx{uid - 6100}",
                    "--", "-c", "exec " + shlex.join(command)]
         env = {
             "PATH": "/opt/venv/bin:/usr/bin:/bin", "HOME": "/work", "TMPDIR": "/tmp",
-            "LANG": "C.UTF-8", "IPYTHONDIR": "/work/ipython", "JUPYTER_RUNTIME_DIR": "/work/jupyter",
+            "LANG": "C.UTF-8", "PYTHONPATH": "/opt/live", "IPYTHONDIR": "/work/ipython", "JUPYTER_RUNTIME_DIR": "/work/jupyter",
             "HF_HOME": "/opt/hf", "HF_HUB_OFFLINE": "1", "JAX_PLATFORMS": "cpu",
             "JAX_COMPILATION_CACHE_DIR": "/work/xla", "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1",
             "MALLOC_ARENA_MAX": "2",
