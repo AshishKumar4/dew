@@ -10,10 +10,9 @@ layer the MTP checkpoints carry past `num_hidden_layers`.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import asdict
 
 from dew import records
-from dew.interop.config_records import NativeFields, native_fields
+from dew.interop.config_records import native_fields
 from dew.interop.hf_decoders import (
     _LINEAR_FIELDS,
     _MOE_SHARED,
@@ -289,12 +288,12 @@ def _qwen35_moe_config(hf_config: Mapping[str, object], used: set[str]) -> Decod
     """
     width = _record_int(hf_config, "moe_intermediate_size")
     config = _qwen35_config({**hf_config, "intermediate_size": width}, used)
-    config["mixture"] = NativeFields(Mixture, asdict(Mixture(
+    config["mixture"] = native_fields(Mixture)(
         experts=_record_int(hf_config, "num_experts"),
         top_k=_record_int(hf_config, "num_experts_per_tok"),
         expert_features=width,
         shared_features=_record_int(hf_config, "shared_expert_intermediate_size"),
-        shared_gate=True)))
+        shared_gate=True)
     used.update(("moe_intermediate_size", "num_experts", "num_experts_per_tok",
                  "shared_expert_intermediate_size", "output_router_logits", "router_aux_loss_coef"))
     return config
