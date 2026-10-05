@@ -87,7 +87,7 @@ def main() -> None:
         trained.append(packed)
         return packed
 
-    objective = GRPOObjective(model, seq_len=7, pretrained=params, behavior_importance=2.0)
+    objective = GRPOObjective(model, seq_len=7, variables=params, behavior_importance=2.0)
     trainer = Trainer(
         objective,
         optax.sgd(0.1),

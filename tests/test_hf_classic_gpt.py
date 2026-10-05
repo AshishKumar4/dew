@@ -157,7 +157,7 @@ def test_exact_nanogpt_architecture_trains_through_dew(bias):
     rows = np.asarray([[2, 4, 8, 3, 2, 4, 8, 3, 2], [7, 3, 9, 5, 7, 3, 9, 5, 7]], np.int32)
     rows = np.tile(rows, (jax.device_count(), 1))
     variables = model.init(jax.random.key(0), jnp.asarray(rows[:, :-1]))
-    objective = LMObjective(model, seq_len=8, ema_decay=None, pretrained=variables)
+    objective = LMObjective(model, seq_len=8, ema_decay=None, variables=variables)
     data = Dataset(train=lambda partition: iter({'text': rows} for _ in range(3)),
                    val=None, records=3 * len(rows), batch=len(rows))
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0))

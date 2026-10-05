@@ -107,7 +107,7 @@ def device_weights(directory) -> dict:
     import jax
 
     from dew.interop.diffusion import component_tensors, translate_wan_weights
-    from dew.nn.text_encoders import insert
+    from dew.interop.weights import insert
 
     tree: dict = {}
     for name, tensor in component_tensors(directory, "transformer").items():

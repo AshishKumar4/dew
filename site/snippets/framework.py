@@ -193,7 +193,7 @@ def pretrained(out, smoke):
                    val=None, records=1, batch=1)
     text = task(prompt, 12, key=0).text
     # Begin snippet: finetune
-    objective = bundle.lm_objective(seq_len=training_tokens.shape[1] - 1, ema_decay=None)
+    objective = LMObjective(bundle, seq_len=training_tokens.shape[1] - 1, ema_decay=None)
     trainer = Trainer(objective, optax.sgd(1e-5), key=jax.random.key(0))
     state = trainer.fit(data, steps=1)
     bundle.save(out / "export", variables=state.variables, max_shard_size="128MB")

@@ -35,6 +35,7 @@ from torch.overrides import TorchFunctionMode
 
 from dew.interop.pretrained import Pretrained
 from dew.objectives.base import Variables
+from dew.objectives.lm import LMObjective
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
 RATE = 5e-2
@@ -144,7 +145,7 @@ def train(case: Case, source: Pretrained, ids: np.ndarray):
     from dew.data.dataset import Dataset
     from dew.training import Trainer
 
-    objective = source.lm_objective(seq_len=int(ids.shape[1]) - 1, ema_decay=None,
+    objective = LMObjective(source, seq_len=int(ids.shape[1]) - 1, ema_decay=None,
                             balance_rate=case.balance_rate,
                             mtp_weight=case.mtp_weight)
     count = math.lcm(int(ids.shape[0]), jax.device_count())
@@ -616,7 +617,7 @@ def v4_training_gradient_parity(trip: RoundTrip) -> dict[str, float]:
     weight = case.mtp_weight
     if weight is None:
         raise ValueError('V4 training gradient comparison requires mtp_weight')
-    objective = source.lm_objective(seq_len=trip.ids.shape[1] - 1, ema_decay=None,
+    objective = LMObjective(source, seq_len=trip.ids.shape[1] - 1, ema_decay=None,
                             mtp_weight=case.mtp_weight)
     step = Step(step=jnp.asarray(0), key=jax.random.key(SEED), ema=None)
     batch = {'text': jnp.asarray(trip.ids, jnp.int32)}

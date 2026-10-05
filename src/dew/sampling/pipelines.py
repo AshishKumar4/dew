@@ -23,7 +23,7 @@ from dew.diffusion.process import Conditioning, Process
 from dew.inputs import InputSpec, unit_range
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.inputs import RowPlan, generation_signature, local_rows, mesh_of, request_key
-from dew.objectives.base import Variables
+from dew.objectives.base import Variables, thaw
 from dew.registry import dtype_name, resolve_dtype
 from dew.sampling.guidance import CFG, Guidance
 from dew.sampling.sample import sample
@@ -164,7 +164,8 @@ class TextToImage:
     None encodes it on every call, for a source that has none."""
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "variables", freeze(dict(self.variables)))
+        # A tree split for training, an adapter's, is read whole.
+        object.__setattr__(self, "variables", freeze(dict(thaw(self.variables))))
 
     def bind(self, variables: Variables) -> TextToImage:
         """Bind another snapshot. Changed encoder leaves get a new lazy blank;

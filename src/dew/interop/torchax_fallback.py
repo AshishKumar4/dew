@@ -237,7 +237,7 @@ class TorchCausalLM(nn.Module):
         if self.is_initializing():
             raise ValueError(
                 "a torchax model has no initializer; apply it to the variables "
-                "Pretrained.load returned, or pass them to LMObjective as pretrained=")
+                "Pretrained.load returned, or pass them to LMObjective as variables=")
         held = self.variables
         params = {name: self._compute(leaf) for name, leaf in held["params"].items()}
         buffers = {name: jnp.asarray(leaf) for name, leaf in held.get("buffers", {}).items()}

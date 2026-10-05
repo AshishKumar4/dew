@@ -14,7 +14,7 @@ import dataclasses
 import functools
 import json
 import os
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 from pathlib import Path
@@ -45,8 +45,9 @@ from dew.inputs.diffusion import (
     T5Segment,
     WanConditioner,
 )
-from dew.interop import gguf, hf_decoders as decoders, mamba2, sources, verify
+from dew.interop import gguf, hf_decoders as decoders, mamba2, sources, verify, weights as checkpoint_weights
 from dew.interop.codecs import SourceQuantization, source_quantization
+from dew.interop.components import bind_component
 from dew.interop.generation_config import (
     audit_masked,
     eos_ids,
@@ -64,12 +65,12 @@ from dew.interop.processors import (
 )
 from dew.interop.safetensors_io import MAX_SHARD_SIZE
 from dew.interop.streaming import LazyTree, SourceLeaf, WeightLayout
+from dew.interop.weights import ParamTree
 from dew.nn import audio as audio_nn
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.multimodal import MultimodalTransformer
-from dew.nn.text_encoders import ParamTree
 from dew.objectives.base import Variables
 from dew.registry import (
     dtype_name,
@@ -86,9 +87,7 @@ from dew.sampling.text import Sampling
 
 if TYPE_CHECKING:
 
-    from dew.lora import LoRA
-    from dew.objectives.diffusion import DiffusionObjective
-    from dew.objectives.lm import LMObjective
+    from dew.lora import Adapter, LoRA
     from dew.training.distributed import Layout, MeshSpec
 
 
@@ -305,9 +304,10 @@ class Pretrained:
     revision: str | None = None
     """The Hub commit the source resolved to, whatever branch or tag was
     asked for; None for a local directory."""
-    adapter: LoRA | None = None
-    """The low-rank adapter `lora` put on the model, whose factors the
-    variables hold; None for the source as published."""
+    adapter: Adapter | None = None
+    """The low-rank adapter `adapt` bound to the model, whose factors the
+    variables hold under `params` beside the base under `frozen`; None for
+    the source as published."""
     tokenizer: str | decoders.ExportTokenizer | None = None
     """The vocabulary `save` writes beside the weights, by name or by object,
     for a bundle with no source processor to write (`from_model`)."""
@@ -316,7 +316,7 @@ class Pretrained:
     where the family's reader takes that file as a closed set of fields."""
 
     @property
-    def _text_processor(self) -> TaskProcessor | None:
+    def text_processor(self) -> TaskProcessor | None:
         """What the bundle's tasks encode and decode text with: the source's
         processor, or a run processor over the vocabulary `tokenizer` names
         (a run's export, Dew's byte vocabulary included)."""
@@ -368,7 +368,12 @@ class Pretrained:
         if not isinstance(bundle, cls):
             raise TypeError(f"{directory} is a {type(bundle).__name__} source, not a {cls.__name__}; "
                             f"load it with {type(bundle).__name__}.from_run or Pretrained.from_run")
-        return bundle
+        if model_config.adapter is None:
+            return bundle
+        # The run's adapter, as `Adapter.from_run` rebuilds it, so `save`
+        # merges its factors and `adapter.save` writes them alone.
+        from dew.lora import Adapter
+        return replace(bundle, adapter=Adapter.recorded(model, variables, model_config.adapter))
 
     @classmethod
     def load(cls, name_or_dir: str | Path, *, dtype: DTypeLike = jnp.bfloat16,
@@ -479,6 +484,27 @@ class Pretrained:
         """
         return {layout.name.removesuffix(".weight").replace("/", "."): layout
                 for layout in self.weight_layouts if layout.name.endswith(".weight")}
+
+    @property
+    def _adaptable(self) -> Mapping[str, WeightLayout]:
+        """The layouts an adapter binds: every one of a decoder's."""
+        return self.layouts
+
+    def adapt(self, lora: LoRA, *, key: int | jax.Array) -> Self:
+        """This source with `lora` bound to its model and its factors drawn
+        (`LoRA.apply`): the adapted model, the variables with the factors
+        under `params` and the base under `frozen`, and the bound `adapter`.
+        Any objective built over it trains the factors alone; B is zero, so
+        it computes what the source does. `adapter.save` writes the factors
+        under the source's own names (PEFT's directory for a decoder, the
+        Diffusers file for a pipeline) and `save` the source with them
+        merged in. A pipeline binds its denoiser's projections alone, so the
+        text towers and the VAE stay as published.
+        """
+        if self.adapter is not None:
+            raise ValueError("this bundle already carries an adapter; adapt the source it was made from")
+        adapter = lora.apply(self.model, self.variables, key=key, layouts=self._adaptable)
+        return replace(self, model=adapter.model, variables=adapter.variables, adapter=adapter)
 
     def export(self, variables: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
         """The tensors `save` writes, by their source names; `dew.inference.NCCLPush` sends these.
@@ -601,44 +627,6 @@ class PretrainedDecoder(Pretrained):
                    decoders.GENERATION_DEFAULTS if generation_config is None else generation_config,
                    export_adapter=decoders.export_decoder_weights, tokenizer=tokenizer)
 
-    def lora(self, *, rank: int, modules: Sequence[str], key: jax.Array, alpha: float | None = None,
-             rslora: bool = False, dropout: float = 0.0) -> PretrainedDecoder:
-        """Return this source with a fresh low-rank adapter on the projections `modules` name.
-
-        The bundle that comes back holds the adapted model, the variables
-        with the factors in them (B zero, so it computes what the source
-        does) and the adapter, and nothing of a run: `lm_objective` trains
-        the factors alone, `adapter.save` writes PEFT's directory and `save`
-        the source's layout with the factors merged in. `dew.lora.LoRA.fresh`
-        describes the arguments.
-        """
-        from dew.lora import LoRA
-
-        if self.adapter is not None:
-            raise ValueError("this bundle already carries an adapter; adapt the source it was made from")
-        adapter, variables = LoRA.fresh(self.model, self.variables, self.layouts, rank=rank, modules=modules,
-                                        key=key, alpha=alpha, rslora=rslora, dropout=dropout)
-        return replace(self, model=adapter.adapt(self.model), variables=variables, adapter=adapter)
-
-    def lm_objective(self, seq_len: int, **options) -> LMObjective:
-        """Build next-token training from this source's model and variables.
-
-        `options` are `LMObjective`'s training and evaluation controls. This
-        bundle supplies `pretrained` itself and its processor unless one is
-        passed, and an adapted bundle its adapter's filter as `trainable`,
-        so the run moves the factors alone.
-        """
-        from dew.objectives.lm import LMObjective
-
-        if "pretrained" in options:
-            raise ValueError("a Pretrained bundle already supplies the initial variables; omit pretrained=")
-        if self.adapter is not None:
-            if "trainable" in options:
-                raise ValueError("the adapter already selects what trains, its own factors; omit trainable=")
-            options["trainable"] = self.adapter.trainable
-        return LMObjective(self.model, seq_len, pretrained=self.variables,
-                           **{"processor": self._text_processor, **options})
-
     def text_generation(self, *, sampling: Sampling | None = None) -> TextGeneration:
         """Build the text generation task this source describes.
 
@@ -658,7 +646,7 @@ class PretrainedDecoder(Pretrained):
         return TextGeneration(
             self.model,
             self.variables,
-            self._text_processor,
+            self.text_processor,
             policy,
             max_new_tokens=generation_limit(self.config, self.generation_config, "max_new_tokens"),
             max_length=generation_limit(self.config, self.generation_config, "max_length"),
@@ -688,7 +676,7 @@ class PretrainedMaskedDecoder(Pretrained):
             raise TypeError("a masked decoder generates by unmasking, and this model names no mask token")
         audit_masked(config, generation)
         return MaskedGeneration(self.model, self.variables, MDLM(mask_id=mask_id)(),
-                                self._text_processor,
+                                self.text_processor,
                                 eos_token_ids=eos_ids(config, generation),
                                 pad_token_id=pad_id(config, generation),
                                 max_new_tokens=generation_limit(config, generation, "max_new_tokens"),
@@ -714,7 +702,7 @@ class PretrainedBlockDecoder(Pretrained):
             self.model,
             self.variables,
             diffusion_gemma.generation_process(self.config, self.generation_config),
-            self._text_processor,
+            self.text_processor,
             eos_ids(self.config, self.generation_config),
             pad_id(self.config, self.generation_config),
             max_new_tokens=generation_limit(self.config, self.generation_config, "max_new_tokens"),
@@ -747,52 +735,10 @@ class PretrainedPipeline(Pretrained):
                            grid=self.task.grid, final_denoise=False, solver=self.schedule.solver,
                            steps=self.task.steps, guidance=self.task.guidance, finish=self.finish)
 
-    def lora(self, *, rank: int, modules: Sequence[str], key: jax.Array, alpha: float | None = None,
-             rslora: bool = False, dropout: float = 0.0) -> PretrainedPipeline:
-        """Return this pipeline with a fresh low-rank adapter on the denoiser projections `modules` name.
-
-        `modules` match the denoiser's projections alone, by their names
-        relative to its component (`to_q`, `attn.to_out.0`), so the text
-        towers and the VAE stay as published. The bundle that comes back
-        holds the adapted denoiser, the variables with the factors in them
-        (B zero, so it samples what the source does) and the adapter:
-        `diffusion_objective` trains the factors alone, `adapter.save` writes
-        the Diffusers file the family's `load_lora_weights` reads, and `save`
-        writes the pipeline with the factors merged in. `dew.lora.LoRA.fresh`
-        describes the arguments.
-        """
-        from dew.lora import LoRA
-
-        if self.adapter is not None:
-            raise ValueError("this bundle already carries an adapter; adapt the source it was made from")
-        denoiser = {name: layout for name, layout in self.layouts.items() if layout.paths[0][0] == "params"}
-        adapter, variables = LoRA.fresh(self.model, self.variables, denoiser, rank=rank, modules=modules,
-                                        key=key, alpha=alpha, rslora=rslora, dropout=dropout)
-        return replace(self, model=adapter.adapt(self.model), variables=variables, adapter=adapter)
-
-    def diffusion_objective(self, **options) -> DiffusionObjective:
-        """Build denoising training from this pipeline's denoiser, process, conditions and autoencoder.
-
-        `options` are `DiffusionObjective`'s training and evaluation
-        controls. This bundle supplies `pretrained` itself, evaluation
-        samples the way the source does (its solver, step count and
-        guidance) unless they are passed, and an adapted bundle supplies its
-        adapter's filter as `trainable`, so the run moves the factors alone.
-        The text towers and the VAE never train. Batches carry the source's
-        input fields, an inpainting source's mask among them.
-        """
-        from dew.objectives.diffusion import DiffusionObjective
-
-        if "pretrained" in options:
-            raise ValueError("a Pretrained bundle already supplies the initial variables; omit pretrained=")
-        self._text_encoder("training encodes its captions")
-        if self.adapter is not None:
-            if "trainable" in options:
-                raise ValueError("the adapter already selects what trains, its own factors; omit trainable=")
-            options["trainable"] = self.adapter.trainable
-        policy = {"solver": self.schedule.solver, "steps": self.task.steps, "guidance": self.task.guidance}
-        return DiffusionObjective(self.model, self.process, self.inputs, autoencoder=self.autoencoder,
-                                  pretrained=self.variables, **{**policy, **options})
+    @property
+    def _adaptable(self) -> Mapping[str, WeightLayout]:
+        """The denoiser's layouts alone, the `params`-rooted ones."""
+        return {name: layout for name, layout in self.layouts.items() if layout.paths[0][0] == "params"}
 
     def export(self, variables: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
         raise ValueError("a diffusion source writes one tensor set per component; save it instead")
@@ -826,18 +772,8 @@ class PretrainedFallback(Pretrained):
     """transformers' PyTorch forward lowered to JAX by torchax (tier 3): it
     fine-tunes next-token, with no Dew kernels, sharding rules or cached
     generation; generate with transformers' own
-    `AutoModelForCausalLM.from_pretrained(source).generate`."""
-
-    def lm_objective(self, seq_len: int, **options) -> LMObjective:
-        """Build next-token training from this source's forward and variables;
-        `options` are `LMObjective`'s controls, and the processor is this
-        source's unless one is passed."""
-        from dew.objectives.lm import LMObjective
-
-        if "pretrained" in options:
-            raise ValueError("a Pretrained bundle already supplies the initial variables; omit pretrained=")
-        return LMObjective(self.model, seq_len, pretrained=self.variables,
-                           **{"processor": self._text_processor, **options})
+    `AutoModelForCausalLM.from_pretrained(source).generate`. Train it as
+    any source, `LMObjective(fallback, seq_len)`."""
 
 
 def _native_variables(parts: Mapping[str, Mapping[str, ParamTree]]) -> dict[str, dict[str, ParamTree]]:
@@ -1104,7 +1040,7 @@ def _load_diffusion_source(directory: Path, index: Mapping[str, object], *, dtyp
     mapped files, for a placement to read one device shard at a time
     (`dew.inference.pipeline.place`), but for the convolution kernels and a
     UNet's per-head attention kernels, which are read whole
-    (`dew.interop.diffusion.record_layouts`). `text=False` binds the text
+    (`dew.interop.weights.record_layouts`). `text=False` binds the text
     encoder to no weights and leaves it out of the variables.
     """
     compute = resolve_dtype(dtype)
@@ -1269,11 +1205,10 @@ def _unet_denoiser(directory: Path, *, dtype: str | None, attention_impl: str) -
     """Build the published UNet: cross attention over one or two CLIP towers, whose
     pooled text conditioning is the one its added time features ask for."""
     from dew.interop import diffusion
-    from dew.nn.backbones.unet_condition import UNet2DCondition
 
     config = _component_config(directory, "unet")
     fields = diffusion.unet_fields(config, dtype=dtype, attention_impl=attention_impl)
-    model = UNet2DCondition(**fields)
+    model = fields.value
 
     def weights(param_dtype: str, lazy: bool) -> tuple[Variables, tuple[WeightLayout, ...]]:
         params, layouts = diffusion.translate_unet_weights(
@@ -1306,20 +1241,11 @@ def _denoiser(directory: Path, *, dtype: str | None, attention_impl: str) -> _De
         return _unet_denoiser(directory, dtype=dtype, attention_impl=attention_impl)
     config = _component_config(directory, "transformer")
     published = config.get("_class_name")
-    if published == "SD3Transformer2DModel":
-        return _sd3_denoiser(config, directory, dtype=dtype, attention_impl=attention_impl)
-    if published == "FluxTransformer2DModel":
-        return _flux_denoiser(config, directory, dtype=dtype, attention_impl=attention_impl)
-    if published == "QwenImage21Transformer2DModel":
-        return _qwen_image_denoiser(config, directory, dtype=dtype, attention_impl=attention_impl)
-    if published == "Flux2Transformer2DModel":
-        return _flux2_denoiser(config, directory, dtype=dtype, attention_impl=attention_impl)
-    if published == "ZImageTransformer2DModel":
-        return _z_image_denoiser(config, directory, dtype=dtype, attention_impl=attention_impl)
-    if published == "WanTransformer3DModel":
-        return _wan_denoiser(config, directory, dtype=dtype, attention_impl=attention_impl)
-    raise ValueError(f"Native diffusion does not implement the published transformer "
-                     f"{published!r}")
+    builder = _DENOISERS.get(published) if isinstance(published, str) else None
+    if builder is None:
+        raise ValueError(f"Native diffusion does not implement the published transformer "
+                         f"{published!r}")
+    return builder(config, directory, dtype=dtype, attention_impl=attention_impl)
 
 
 def _transformer_weights(directory: Path, translate: Callable[..., tuple[LazyTree, tuple[WeightLayout, ...]]]
@@ -1335,143 +1261,141 @@ def _transformer_weights(directory: Path, translate: Callable[..., tuple[LazyTre
     return weights
 
 
-def _built(name: str, fields: Mapping[str, object], dtype: str | None) -> dict:
-    """The registry record a denoiser was built from, its tuples as JSON lists."""
-    return {"name": name, "fields": {**{key: list(value) if isinstance(value, tuple) else value
-                                        for key, value in fields.items()}, "dtype": dtype}}
+def _transformer_denoiser(name: str, model: nn.Module, fields: Mapping[str, object], config: dict,
+                         dtype: str | None,
+                         weights: Callable[[str, bool], tuple[Variables, tuple[WeightLayout, ...]]],
+                         text: _TextTowers | _QwenImageText | _HiddenStatesText | _WanText, *,
+                         patch: int, latent_input: int, sample_size: tuple[int, int], context_width: int,
+                         pipeline: str, origin: Origin = "scheduler", frames: int | None = None) -> _Denoiser:
+    """Build the native record with the pipeline's already resolved conditioning and geometry."""
+    built = {"name": name, "fields": {**{key: list(value) if isinstance(value, tuple) else value
+                                         for key, value in fields.items()}, "dtype": dtype}}
+    return _Denoiser(
+        component="transformer", model=model, weights=weights, built=built, config=config,
+        text=text, patch=patch, latent_input=latent_input, sample_size=sample_size,
+        context_width=context_width, pipeline=pipeline, origin=origin, frames=frames)
 
 
 def _sd3_denoiser(config: dict, directory: Path, *, dtype: str | None, attention_impl: str) -> _Denoiser:
     """Build SD3's MM-DiT: both CLIP towers and the T5 tower read jointly, with the
     stored position buffer in its own frozen collection."""
     from dew.interop import diffusion
-    from dew.nn.backbones.sd3 import SD3Transformer
 
     fields = diffusion.sd3_fields(config, dtype=dtype, attention_impl=attention_impl)
+    model = fields.value
 
     def weights(param_dtype: str, lazy: bool) -> tuple[Variables, tuple[WeightLayout, ...]]:
         params, buffers, layouts = diffusion.translate_sd3_weights(
             diffusion.component_tensors(directory, "transformer"), param_dtype=param_dtype, lazy=lazy)
         return {"params": params, "buffers": buffers}, layouts
 
-    return _Denoiser(
-        component="transformer", model=SD3Transformer(**fields), weights=weights,
-        built=_built("sd3_transformer", fields, dtype), config=config,
-        text=_TextTowers("sd3", ("text_encoder", "text_encoder_2"), t5_tower="text_encoder_3"),
-        patch=fields["patch_size"],
-        latent_input=fields["in_channels"],
-        sample_size=_square(config),
-        context_width=fields["joint_attention_dim"], pipeline="StableDiffusion3Pipeline")
+    return _transformer_denoiser(
+        "sd3_transformer", model, fields, config, dtype, weights,
+        _TextTowers("sd3", ("text_encoder", "text_encoder_2"), t5_tower="text_encoder_3"),
+        patch=model.patch_size, latent_input=model.in_channels, sample_size=_square(config),
+        context_width=model.joint_attention_dim, pipeline="StableDiffusion3Pipeline")
 
 
 def _flux_denoiser(config: dict, directory: Path, *, dtype: str | None, attention_impl: str) -> _Denoiser:
-    """Build Flux's transformer: one CLIP tower for the pooled vector, the T5 tower
-    for the sequence, and a latent its pipeline packs in 2x2 patches.
+    """Build Flux's 2x2-packed latent with pooled CLIP and sequence T5 text.
 
-    The class declares no sample size; its pipeline's `default_sample_size`
-    is 128 latent positions, which a directory overrides with its own
-    geometry. It starts from the sigmas its pipeline hands the scheduler.
+    The class declares no sample size. A directory overrides its pipeline's
+    default of 128 latent positions with its geometry; the pipeline supplies
+    the scheduler's starting sigmas.
     """
     from dew.interop import diffusion
-    from dew.nn.backbones.flux import FluxTransformer
 
     fields = diffusion.flux_fields(config, dtype=dtype, attention_impl=attention_impl)
-    return _Denoiser(
-        component="transformer", model=FluxTransformer(**fields),
-        weights=_transformer_weights(directory, diffusion.translate_flux_weights),
-        built=_built("flux_transformer", fields, dtype), config=config,
-        text=_TextTowers("flux", ("text_encoder",), t5_tower="text_encoder_2",
-                         embeds_guidance=fields["guidance_embeds"]), patch=2,
-        latent_input=fields["in_channels"] // 4,
-        sample_size=_square(config, 128),
-        context_width=fields["joint_attention_dim"], pipeline="FluxPipeline",
-        origin="linspace")
+    model = fields.value
+    weights = _transformer_weights(directory, diffusion.translate_flux_weights)
+    return _transformer_denoiser(
+        "flux_transformer", model, fields, config, dtype, weights,
+        _TextTowers("flux", ("text_encoder",), t5_tower="text_encoder_2",
+                    embeds_guidance=model.guidance_embeds),
+        patch=2, latent_input=model.in_channels // 4, sample_size=_square(config, 128),
+        context_width=model.joint_attention_dim, pipeline="FluxPipeline", origin="linspace")
 
 
 def _qwen_image_denoiser(config: dict, directory: Path, *, dtype: str | None,
                          attention_impl: str) -> _Denoiser:
-    """Build Qwen-Image 2.1's transformer: one stream over the Qwen3-VL
-    encoder's prompt states and the latent, one token per position.
+    """Build Qwen-Image 2.1's stream over Qwen3-VL text and latent positions.
 
-    The class declares no sample size, and neither does the published
-    config; its pipeline renders at `output_resolution` 1024 pixels, 64
-    latent positions through the VAE's 16x. It starts from the sigmas its
-    pipeline hands the scheduler.
+    Its config declares no sample size. The pipeline's 1024-pixel resolution
+    is 64 positions through its VAE's 16x, with pipeline-supplied sigmas.
     """
     from dew.interop import diffusion
-    from dew.nn.backbones.qwen_image import QwenImageTransformer
 
     fields = diffusion.qwen_image_fields(config, dtype=dtype, attention_impl=attention_impl)
-    return _Denoiser(
-        component="transformer", model=QwenImageTransformer(**fields),
-        weights=_transformer_weights(directory, diffusion.translate_qwen_image_weights),
-        built=_built("qwen_image_transformer", fields, dtype), config=config,
-        text=_QwenImageText(), patch=1,
-        latent_input=fields["in_channels"], sample_size=(64, 64),
-        context_width=fields["context_in_dim"], pipeline="QwenImage21Pipeline", origin="linspace")
+    model = fields.value
+    return _transformer_denoiser(
+        "qwen_image_transformer", model, fields, config, dtype,
+        _transformer_weights(directory, diffusion.translate_qwen_image_weights), _QwenImageText(),
+        patch=1, latent_input=model.in_channels, sample_size=(64, 64),
+        context_width=model.context_in_dim, pipeline="QwenImage21Pipeline", origin="linspace")
 
 
 def _flux2_denoiser(config: dict, directory: Path, *, dtype: str | None, attention_impl: str) -> _Denoiser:
-    """Build FLUX.2's transformer over its VAE's folded latent, one token per
-    position, conditioned by stacked text-encoder states.
+    """Build FLUX.2's folded latent on stacked text-encoder states.
 
-    Its pipelines render at `default_sample_size` 128 through the VAE's 8x,
-    which is 64 folded positions, and hand the scheduler `linspace(1, 1/N,
-    N)` with their own empirical mu.
+    Its pipelines' default 128 positions through the VAE's 8x are 64 folded
+    positions. They hand the scheduler `linspace(1, 1/N, N)` with their own
+    empirical mu.
     """
     from dew.interop import diffusion
-    from dew.nn.backbones.flux2 import Flux2Transformer
 
     fields = diffusion.flux2_fields(config, dtype=dtype, attention_impl=attention_impl)
-    guided = fields["guidance_embeds"]
-    return _Denoiser(
-        component="transformer", model=Flux2Transformer(**fields),
-        weights=_transformer_weights(directory, diffusion.translate_flux2_weights),
-        built=_built("flux2_transformer", fields, dtype), config=config,
-        text=_HiddenStatesText("flux2", embeds_guidance=guided), patch=1,
-        latent_input=fields["in_channels"], sample_size=(64, 64), context_width=fields["joint_attention_dim"],
+    model = fields.value
+    guided = model.guidance_embeds
+    weights = _transformer_weights(directory, diffusion.translate_flux2_weights)
+    return _transformer_denoiser(
+        "flux2_transformer", model, fields, config, dtype, weights,
+        _HiddenStatesText("flux2", embeds_guidance=guided), patch=1, latent_input=model.in_channels,
+        sample_size=(64, 64), context_width=model.joint_attention_dim,
         pipeline="Flux2Pipeline" if guided else "Flux2KleinPipeline", origin="empirical")
 
 
 def _z_image_denoiser(config: dict, directory: Path, *, dtype: str | None, attention_impl: str) -> _Denoiser:
-    """Build Z-Image's single-stream transformer over the Flux VAE's latent,
-    cut into 2x2 patches, conditioned by its Qwen3 encoder's second-to-last
-    layer.
+    """Build Z-Image's 2x2-patched latent on its encoder's second-to-last layer.
 
-    Its pipeline renders at 1024 pixels by default, 128 latent positions
-    through the VAE's 8x, and hands its statically shifting scheduler
-    `linspace(1, 1/N, N)`.
+    The default 1024 pixels are 128 positions through the Flux VAE's 8x.
+    The pipeline supplies `linspace(1, 1/N, N)` to its static-shift scheduler.
     """
     from dew.interop import diffusion
-    from dew.nn.backbones.z_image import ZImageTransformer
 
     fields = diffusion.z_image_fields(config, dtype=dtype, attention_impl=attention_impl)
-    return _Denoiser(
-        component="transformer", model=ZImageTransformer(**fields),
-        weights=_transformer_weights(directory, diffusion.translate_z_image_weights),
-        built=_built("z_image_transformer", fields, dtype), config=config,
-        text=_HiddenStatesText("z_image"), patch=2, latent_input=fields["in_channels"],
-        sample_size=(128, 128), context_width=fields["cap_feat_dim"], pipeline="ZImagePipeline",
-        origin="linspace")
+    model = fields.value
+    weights = _transformer_weights(directory, diffusion.translate_z_image_weights)
+    return _transformer_denoiser(
+        "z_image_transformer", model, fields, config, dtype, weights,
+        _HiddenStatesText("z_image"), patch=2, latent_input=model.in_channels, sample_size=(128, 128),
+        context_width=model.cap_feat_dim, pipeline="ZImagePipeline", origin="linspace")
 
 
 def _wan_denoiser(config: dict, directory: Path, *, dtype: str | None, attention_impl: str) -> _Denoiser:
-    """Build Wan 2.1's video transformer over its VAE's latent, cut into
-    1x2x2 patches, conditioned by its UMT5 encoder.
+    """Build Wan 2.1's video latent on UMT5 text, with 1x2x2 patches.
 
-    `WanPipeline` renders 81 frames at 480x832 by default, 60x104 latent
-    positions through the VAE's 8x, and walks its scheduler's own sigmas.
+    Its default 81 frames at 480x832 are 60x104 latent positions through the
+    VAE's 8x, with the scheduler's own starting sigmas.
     """
     from dew.interop import diffusion
-    from dew.nn.backbones.wan import WanTransformer
 
     fields = diffusion.wan_fields(config, dtype=dtype, attention_impl=attention_impl)
-    return _Denoiser(
-        component="transformer", model=WanTransformer(**fields),
-        weights=_transformer_weights(directory, diffusion.translate_wan_weights),
-        built=_built("wan_transformer", fields, dtype), config=config, text=_WanText(),
-        patch=fields["patch_size"][-1], latent_input=fields["in_channels"], sample_size=(60, 104),
-        context_width=fields["text_dim"], pipeline="WanPipeline", frames=81)
+    model = fields.value
+    weights = _transformer_weights(directory, diffusion.translate_wan_weights)
+    return _transformer_denoiser(
+        "wan_transformer", model, fields, config, dtype, weights,
+        _WanText(), patch=model.patch_size[-1], latent_input=model.in_channels, sample_size=(60, 104),
+        context_width=model.text_dim, pipeline="WanPipeline", frames=81)
+
+
+_DENOISERS: Mapping[str, Callable[..., _Denoiser]] = MappingProxyType({
+    "SD3Transformer2DModel": _sd3_denoiser,
+    "FluxTransformer2DModel": _flux_denoiser,
+    "QwenImage21Transformer2DModel": _qwen_image_denoiser,
+    "Flux2Transformer2DModel": _flux2_denoiser,
+    "ZImageTransformer2DModel": _z_image_denoiser,
+    "WanTransformer3DModel": _wan_denoiser,
+})
 
 
 def _text_components(text: _TextTowers | _QwenImageText | _HiddenStatesText | _WanText,
@@ -1538,16 +1462,12 @@ def _diffusion_vae(directory: Path, compute, *, param_dtype: str = "float32",
         post_quantize=diffusion.flag(config, "use_post_quant_conv", default=True),
         dtype=compute,
     )
-    layouts: tuple[WeightLayout, ...] = ()
-    if params is None:
-        tensors = diffusion.component_tensors(directory, "vae")
-        params, layouts = diffusion.record_layouts(
-            "vae", tensors, lambda name: _vae_path(name, np.ndim(tensors[name])), ("autoencoder",),
-            param_dtype=param_dtype, lazy=lazy)
-    autoencoder = StableDiffusionVAE(str(directory), dtype=compute, params=params, model=model,
-                                     latent_shift=config.get("shift_factor") or 0.0,
-                                     latent_scale=config.get("scaling_factor", 0.18215))
-    return autoencoder, params, layouts, config
+    return bind_component(
+        directory / "vae", "vae", config, model, _vae_path,
+        lambda bound: StableDiffusionVAE(str(directory), dtype=compute, params=bound, model=model,
+                                         latent_shift=config.get("shift_factor") or 0.0,
+                                         latent_scale=config.get("scaling_factor", 0.18215)),
+        prefix=("autoencoder",), params=params, param_dtype=param_dtype, lazy=lazy)
 
 
 def _clip_towers(directory: Path, names: tuple[str, ...], compute, *, param_dtype: str = "float32",
@@ -1556,19 +1476,20 @@ def _clip_towers(directory: Path, names: tuple[str, ...], compute, *, param_dtyp
     the layouts those parameters came from."""
     from transformers import CLIPTokenizer
 
-    from dew.interop import diffusion
-    from dew.nn.text_encoders import CLIPTextTransformer, translate_config
+    from dew.nn.text_encoders import translate_config
 
     towers, tokenizers, layouts = [], [], ()
     bound = {} if params is None else params
     for name in names:
         config = _component_config(directory, name)
-        towers.append(CLIPTextTransformer(**translate_config(config), dtype=compute))
+        model = translate_config(config).value.clone(dtype=compute)
+        tower, tree, recorded, _ = bind_component(
+            directory / name, name, config, model, lambda name, rank: _text_head_path(name),
+            lambda bound, model=model: model, prefix=("encoders", "conditioning", name),
+            params=params, param_dtype=param_dtype, lazy=lazy)
+        towers.append(tower)
         if params is None:
-            tower, recorded = diffusion.record_layouts(
-                name, diffusion.component_tensors(directory, name), _text_head_path,
-                ("encoders", "conditioning", name), param_dtype=param_dtype, lazy=lazy)
-            bound = {**bound, name: tower}
+            bound = {**bound, name: tree}
             layouts += recorded
         tokenizers.append(CLIPTokenizer.from_pretrained(
             directory / ("tokenizer" + name.removeprefix("text_encoder"))))
@@ -1585,20 +1506,16 @@ def _t5_tower(directory: Path, compute, component: str, tokens: int, *, param_dt
     the pipeline pads to.
     """
     from dew.data.text import load_tokenizer
-    from dew.interop import diffusion
-    from dew.nn.text_encoders import T5EncoderTransformer, _t5_path, t5_embedding, translate_t5_config
+    from dew.nn.text_encoders import _t5_path, t5_embedding, translate_t5_config
 
     config = _component_config(directory, component)
-    tower = T5EncoderTransformer(**translate_t5_config(config), dtype=compute)
-    layouts = ()
-    if params is None:
-        tensors = diffusion.component_tensors(directory, component)
-        t5_embedding(tensors)
-        params, layouts = diffusion.record_layouts(
-            component, tensors, _t5_path, ("encoders", "conditioning", component), param_dtype=param_dtype,
-            lazy=lazy)
-    tokenizer = load_tokenizer(str(directory / ("tokenizer" + component.removeprefix("text_encoder"))))
-    return T5Segment(tower, tokenizer, component, tokens), params, layouts, config
+    tower = translate_t5_config(config).value.clone(dtype=compute)
+    return bind_component(
+        directory / component, component, config, tower, lambda name, rank: _t5_path(name),
+        lambda bound: T5Segment(tower, load_tokenizer(str(directory / (
+            "tokenizer" + component.removeprefix("text_encoder")))), component, tokens),
+        prefix=("encoders", "conditioning", component), params=params,
+        param_dtype=param_dtype, lazy=lazy, validate=t5_embedding)
 
 
 def _wan_conditioning(directory: Path, compute, *, tokens: int, param_dtype: str,
@@ -1607,23 +1524,19 @@ def _wan_conditioning(directory: Path, compute, *, tokens: int, param_dtype: str
     """Build Wan's conditioner: the UMT5 encoder, its tokenizer, the
     parameters and their layouts."""
     from dew.data.text import load_tokenizer
-    from dew.interop import diffusion
-    from dew.nn.text_encoders import T5EncoderTransformer, _t5_path, t5_embedding, translate_t5_config
+    from dew.nn.text_encoders import _t5_path, t5_embedding, translate_t5_config
 
     config = _component_config(directory, "text_encoder")
     if config.get("model_type") != "umt5":
         raise ValueError(f"Wan's text encoder is a umt5 model, not {config.get('model_type')!r}")
-    tower = T5EncoderTransformer(**translate_t5_config(config), dtype=compute)
-    layouts: tuple[WeightLayout, ...] = ()
-    if params is None:
-        tensors = diffusion.component_tensors(directory, "text_encoder")
-        t5_embedding(tensors)
-        tree, layouts = diffusion.record_layouts(
-            "text_encoder", tensors, _t5_path, ("encoders", "conditioning", "text_encoder"),
-            param_dtype=param_dtype, lazy=lazy)
-        params = {"text_encoder": tree}
-    encoder = WanConditioner(tower, load_tokenizer(str(directory / "tokenizer")), params, str(directory),
-                             tokens=tokens, param_dtype=param_dtype)
+    tower = translate_t5_config(config).value.clone(dtype=compute)
+    encoder, _, layouts, _ = bind_component(
+        directory / "text_encoder", "text_encoder", config, tower, lambda name, rank: _t5_path(name),
+        lambda bound: WanConditioner(tower, load_tokenizer(str(directory / "tokenizer")),
+                                     bound if params is not None else {"text_encoder": bound},
+                                     str(directory), tokens=tokens, param_dtype=param_dtype),
+        prefix=("encoders", "conditioning", "text_encoder"), params=params,
+        param_dtype=param_dtype, lazy=lazy, validate=t5_embedding)
     return encoder, layouts, {"text_encoder": config}
 
 
@@ -1695,7 +1608,7 @@ def _qwen_image_conditioning(directory: Path, index: Mapping[str, object], compu
     decoder = from_record(CausalTransformer, built)
     layouts: tuple[WeightLayout, ...] = ()
     if params is None:
-        tower, layouts = diffusion.record_layouts(
+        tower, layouts = checkpoint_weights.record_layouts(
             "text_encoder", diffusion.component_tensors(directory, "text_encoder"),
             _qwen_text_path(record), ("encoders", "conditioning", "text_encoder"),
             param_dtype=param_dtype, lazy=lazy)
@@ -1777,7 +1690,7 @@ def _hidden_states_conditioning(directory: Path, index: Mapping[str, object], co
                          "encoder does not have before its final norm")
     layouts: tuple[WeightLayout, ...] = ()
     if params is None:
-        tower, layouts = diffusion.record_layouts(
+        tower, layouts = checkpoint_weights.record_layouts(
             "text_encoder", diffusion.component_tensors(directory, "text_encoder"),
             _hidden_states_path(record, records.text(text["model_type"], "model_type"), multimodal),
             ("encoders", "conditioning", "text_encoder"), param_dtype=param_dtype, lazy=lazy)
@@ -1797,7 +1710,7 @@ def _image_safety(directory: Path, compute, *, param_dtype: str = "float32",
     a weight read."""
     from dew.inputs.diffusion import CLIPImageTransform, CLIPSafetyHead, ImageSafety
     from dew.interop import diffusion
-    from dew.nn.text_encoders import CLIPVisionTransformer, translate_vision_config
+    from dew.nn.text_encoders import translate_vision_config
 
     config = _component_config(directory, "safety_checker")
     with open(directory / "feature_extractor" / "preprocessor_config.json") as handle:
@@ -1810,14 +1723,14 @@ def _image_safety(directory: Path, compute, *, param_dtype: str = "float32",
         state = {name: value for name, value in tensors.items()
                  if (path := _safety_path(name)) is not None and len(path) == 1}
         weights = {name: value for name, value in tensors.items() if name not in state}
-        params, layouts = diffusion.record_layouts(
+        params, layouts = checkpoint_weights.record_layouts(
             "safety_checker", weights, _safety_path, ("encoders", "safety"), param_dtype=param_dtype,
             lazy=lazy)
-        scoring, state_layouts = diffusion.record_layouts(
+        scoring, state_layouts = checkpoint_weights.record_layouts(
             "safety_checker", state, _safety_path, ("encoders", "safety"), param_dtype="float32", lazy=lazy)
         params.update(scoring)
         layouts += state_layouts
-    head = CLIPSafetyHead(CLIPVisionTransformer(**translate_vision_config(config), dtype=compute),
+    head = CLIPSafetyHead(translate_vision_config(config).value.clone(dtype=compute),
                           int(config["projection_dim"]), dtype=compute)
     return (ImageSafety(head, CLIPImageTransform.from_config(transform)), params, layouts,
             {"safety_checker": config, "feature_extractor": transform})
