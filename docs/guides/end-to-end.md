@@ -1,10 +1,10 @@
 # End-to-end runs
 
-Five scripts under [`examples/`](https://github.com/AshishKumar4/dew/tree/main/examples) each run a whole job: they read data, train or load weights, and score or export the result. By default a script uses settings for real hardware. `--smoke` replaces them with the repository's tiny fixtures, a few steps and one CPU device, and needs no network and no accelerator. `tests/test_examples.py` runs every smoke command below as a subprocess and checks the files it leaves.
+Five scripts under [`examples/`](https://github.com/AshishKumar4/dew/tree/main/examples) each run a complete job, reading data, training or loading weights, and scoring or exporting the result. By default they use settings for real hardware. `--smoke` swaps these for the repository's tiny fixtures, a few steps and one CPU device, with no network or accelerator needed. `tests/test_examples.py` runs every smoke command below as a subprocess and checks the files it writes.
 
 ## Text-to-image diffusion on a TPU slice
 
-[`examples/train_flowers_tpu.py`](https://github.com/AshishKumar4/dew/blob/main/examples/train_flowers_tpu.py) trains a `simple_dit` denoiser from scratch on Oxford Flowers. One `DiffusionRunConfig` holds the model, the prepared ArrayRecords, CLIP text conditioning, CFG with a Heun solver, EMA and the validation metrics. `config.train` runs it over the whole slice under `MeshSpec(fsdp=jax.device_count())`, with a profiler window. At the end the script loads the run back with `dew.pipeline`, samples a grid of images and scores it with `dew.eval.fid` and `dew.eval.clip_score`.
+[`examples/train_flowers_tpu.py`](https://github.com/AshishKumar4/dew/blob/main/examples/train_flowers_tpu.py) trains a `simple_dit` denoiser from scratch on Oxford Flowers. One `DiffusionRunConfig` holds the model, prepared ArrayRecords, CLIP text conditioning, CFG with a Heun solver, EMA and validation metrics. `config.train` trains over the whole slice under `MeshSpec(fsdp=jax.device_count())`, with a profiler window. The script then reloads the run with `dew.pipeline`, samples a grid of images and scores it with `dew.eval.fid` and `dew.eval.clip_score`.
 
 First prepare the records at the training resolution, then launch the same file on every worker:
 
@@ -19,7 +19,7 @@ python examples/train_flowers_tpu.py --data prepared/flowers-256 --steps 200000
 JAX_PLATFORMS=cpu python examples/train_flowers_tpu.py --smoke --out /tmp/flowers-smoke
 ```
 
-The smoke run writes synthetic captioned records, conditions on the tiny CLIP fixture and trains for three steps. Both metrics read committed fixtures instead of downloading anything: the tiny CLIP tower, and the FID feature extractor named by `--inception-weights`, which is an InceptionV3 with every channel width cut to a sixteenth and randomly drawn parameters. For a real run, leave that flag unset and the script downloads the published checkpoint.
+The smoke run writes synthetic captioned records, conditions on the tiny CLIP fixture and trains for three steps. Both metrics use committed fixtures without downloading anything. These are the tiny CLIP tower and the FID feature extractor named by `--inception-weights`, an InceptionV3 with every channel width cut to a sixteenth and randomly drawn parameters. For a real run, leave that flag unset so the script downloads the published checkpoint.
 
 ## LoRA SFT of DiffusionGemma
 
@@ -42,11 +42,13 @@ python examples/sft_diffusion_gemma.py \
 JAX_PLATFORMS=cpu python examples/sft_diffusion_gemma.py --smoke --out /tmp/dg-smoke
 ```
 
-`--chat` is a Hub dataset id, a `.jsonl` file or a parquet file of conversations. [`ChatMessages`](../concepts/data.md) reads it and renders each conversation with the checkpoint's chat template. The conversations are in the `messages` column, or in the `prompt` column for rows in the verl layout. The smoke run writes three canned conversations as JSONL and renders them with the fixture tokenizer's own template.
+`--chat` is a Hub dataset ID, a `.jsonl` file or a parquet file of conversations. [`ChatMessages`](../concepts/data.md) reads it and renders each conversation with the checkpoint's chat template. The conversations are in the `messages` column, or in the `prompt` column for rows in the verl layout. The smoke run writes three canned conversations as JSONL and renders them with the fixture tokenizer's own template.
 
 ## Full-weight SFT of a Gemma 4 decoder
 
-[`examples/sft_gemma4.py`](https://github.com/AshishKumar4/dew/blob/main/examples/sft_gemma4.py) trains every weight of a Gemma 4 text decoder on a Hub chat dataset. It packs conversations into windows, and `LMObjective(loss_role=Role.ASSISTANT)` counts the loss only on assistant targets. The trainer shards over the visible devices and accumulates micro-batches into one update. The run writes `run.json` next to its checkpoints, so `PretrainedDecoder.from_run(run).save(directory)` can write a Hugging Face directory that both transformers and `Pretrained.load` read. The run directory is `<--out>/checkpoints/<name of --out>`, which is the path the `dew.eval` command below reads.
+[`examples/sft_gemma4.py`](https://github.com/AshishKumar4/dew/blob/main/examples/sft_gemma4.py) trains every weight of a Gemma 4 text decoder on a Hub chat dataset. It packs conversations into windows, and `LMObjective(loss_role=Role.ASSISTANT)` counts the loss only on assistant targets. The trainer shards over the visible devices and accumulates micro-batches into one update.
+
+The run writes `run.json` next to its checkpoints, so `PretrainedDecoder.from_run(run).save(directory)` can export a Hugging Face directory that both transformers and `Pretrained.load` read. The run directory is `<--out>/checkpoints/<name of --out>`, the path used by the `dew.eval` command below.
 
 ```bash
 python examples/sft_gemma4.py --model google/gemma-4-E2B \
@@ -59,11 +61,11 @@ python -m dew.eval --model dew --model_args run=runs/gemma4-sft/checkpoints/gemm
 JAX_PLATFORMS=cpu python examples/sft_gemma4.py --smoke --out /tmp/gemma4-smoke
 ```
 
-The script passes `--dataset` to `ChatMessages` unchanged. `ChatMessages` resolves a Hub id through `HFOptions`, the same value the `hf` provider forwards, and renders each conversation with the checkpoint's chat template. `--rows N` takes the first N conversations, as the split slice `train[:N]` that `datasets` understands. The smoke run writes its canned conversations as JSONL and fine-tunes the committed tiny Gemma 4 for two steps.
+The script passes `--dataset` to `ChatMessages` unchanged. `ChatMessages` resolves a Hub ID through `HFOptions`, the same value the `hf` provider forwards, and renders each conversation with the checkpoint's chat template. `--rows N` takes the first N conversations through the split slice `train[:N]` that `datasets` understands. The smoke run writes its canned conversations as JSONL and fine-tunes the committed tiny Gemma 4 for two steps.
 
 ## GRPO with verifiable rewards
 
-[`examples/train_rlvr.py`](https://github.com/AshishKumar4/dew/blob/main/examples/train_rlvr.py) trains Qwen2.5-0.5B-Instruct with GRPO on generated programming tasks. Each prompt asks for a Python program that reads two integers from stdin and prints a stated function of them. A completion's reward is the fraction of three hidden test cases its program passes. The programs run in a `SandboxFleet` of processes with a wall clock, a CPU-time limit and a memory cap. Rollouts come from a rollout server one update ahead of the trainer, and the GRPO objective's importance cap corrects for that one update of staleness. [Post-training](../concepts/post_training.md#asynchronous-rlvr) describes the pieces.
+[`examples/train_rlvr.py`](https://github.com/AshishKumar4/dew/blob/main/examples/train_rlvr.py) trains Qwen2.5-0.5B-Instruct with GRPO on generated programming tasks. Each prompt asks for a Python program that reads two integers from stdin and prints a stated function of them. A completion's reward is the fraction of three hidden test cases its program passes. The programs run in a `SandboxFleet` of processes with wall-clock, CPU-time and memory limits. A rollout server samples one update ahead of the trainer; the GRPO objective's importance cap corrects for that one update of staleness. [Post-training](../concepts/post_training.md#asynchronous-rlvr) describes the pieces.
 
 ```bash
 python examples/train_rlvr.py --backend native --steps 40 --out runs/rlvr-native
@@ -76,7 +78,15 @@ JAX_PLATFORMS=cpu python examples/train_rlvr.py --smoke --out /tmp/rlvr-smoke
 JAX_PLATFORMS=cpu python examples/train_rlvr.py --smoke --turns 2 --out /tmp/rlvr-smoke-turns
 ```
 
-`--backend native` samples from Dew's own `Server` in the training process and pushes weights to it in place. `--backend vllm` exports the checkpoint, starts a vLLM server on it with `VLLM_SERVER_DEV_MODE=1`, samples from it by token ids, and pushes weights by writing safetensors and asking vLLM to reload them. vLLM can live in its own environment; `--vllm` names its executable. `--vllm-memory` is vLLM's share of the GPU, and `XLA_PYTHON_CLIENT_MEM_FRACTION` should leave it that much; on a 40 GB A100 the run fits at 0.12 for vLLM and 0.82 for JAX. `--backend sglang` does the same with an SGLang server (`sglang serve`), pushing weights through its `/update_weights_from_disk`; `--sglang` names its executable. `--sglang-memory` is SGLang's `--mem-fraction-static`, which SGLang takes as a fraction of the memory free when it starts, after JAX has taken its share; on a 40 GB A100 the run fits at 0.75 for JAX and 0.8 for SGLang. The run prints one line per update and writes `rewards.json` with each update's reward, policy version and lag, and, on vLLM and SGLang, the seconds each weight push took. `--turns N` gives each task up to N attempts through an in-process `EnvironmentSource`: an attempt that fails a test hears how many of the three passed and tries again, and the reward is the last attempt's. The smoke run trains the committed tiny Qwen2 for two updates on the native backend; the second trains on draws submitted one update earlier. Its eight-token budget cuts off every completion, and the example still scores and trains on those (`truncation="score"` on the `RolloutScheduler`), as a single-turn RLVR run should; an agentic run keeps the default `"mask"`. It checks that the pieces connect; learning needs the full run.
+Choose a rollout backend with `--backend`:
+
+- `--backend native` samples from Dew's own `Server` in the training process and pushes weights to it in place.
+- `--backend vllm` exports the checkpoint, starts a vLLM server on it with `VLLM_SERVER_DEV_MODE=1`, samples by token IDs, and updates weights by writing safetensors and asking vLLM to reload them. vLLM can run in its own environment; `--vllm` names its executable. `--vllm-memory` is vLLM's share of the GPU, and `XLA_PYTHON_CLIENT_MEM_FRACTION` should leave that much available. On a 40 GB A100 the run fits at 0.12 for vLLM and 0.82 for JAX.
+- `--backend sglang` does the same with an SGLang server (`sglang serve`), updating weights through `/update_weights_from_disk`. `--sglang` names its executable, and `--sglang-memory` sets its `--mem-fraction-static`. SGLang interprets this as a fraction of the memory still free when it starts, after JAX has taken its share. On a 40 GB A100 the run fits at 0.75 for JAX and 0.8 for SGLang.
+
+The run prints one line per update and writes `rewards.json` with each update's reward, policy version and lag. On vLLM and SGLang it also records the seconds each weight push took. `--turns N` gives each task up to N attempts through an in-process `EnvironmentSource`. When an attempt fails a test, the model hears how many of the three passed and tries again; the reward is the last attempt's.
+
+The smoke run trains the committed tiny Qwen2 for two updates on the native backend. The second update trains on draws submitted one update earlier. Its eight-token budget cuts off every completion, and the example still scores and trains on them (`truncation="score"` on the `RolloutScheduler`), as a single-turn RLVR run should; an agentic run keeps the default `"mask"`. This checks that the pieces work together. Learning needs the full run.
 
 ## Scoring and serving a finished run
 
@@ -87,7 +97,7 @@ JAX_PLATFORMS=cpu python examples/train_rlvr.py --smoke --turns 2 --out /tmp/rlv
 - FID and CLIPScore of a diffusion run's samples against a directory of reference images;
 - a greedy continuation.
 
-`--openai-base-url` and `--ollama-host` also send the same prompt to a served model, through the adapters in `dew.inference.clients`. Both SDKs are optional extras. If one is not installed, the report says so and the script carries on.
+`--openai-base-url` and `--ollama-host` also send the same prompt to a served model through the adapters in `dew.inference.clients`. Both SDKs are optional extras. If one is not installed, the report says so and the script carries on.
 
 `data/shakespeare` is the token directory that the commands in [`train_lm.py`](../examples.md#train_lmpy) download and write.
 
@@ -102,4 +112,4 @@ python examples/evaluate_and_serve.py --run runs/shakespeare/lm-shakespeare \
 JAX_PLATFORMS=cpu python examples/evaluate_and_serve.py --smoke --out /tmp/eval-smoke
 ```
 
-The smoke run first trains a byte-level model for two steps and then scores it. Given a diffusion run with `--image-run`, the smoke run also scores CLIPScore and FID offline. A smoke run has no held-out set, so the reference images are a second draw from the same run; that checks the metric code, not the model.
+The smoke run first trains a byte-level model for two steps and then scores it. Given a diffusion run with `--image-run`, it also scores CLIPScore and FID offline. A smoke run has no held-out set, so the reference images are a second draw from the same run. Those scores check the metric code without measuring the model's quality.
