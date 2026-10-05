@@ -35,7 +35,20 @@ from dew.artifacts import TextSamples, TokenScores, agreed, collective_host
 from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask
 from dew.inference.tasks import MaskedGeneration
 from dew.inputs import Field, InputSpec
-from dew.objectives.base import FROZEN, Aux, EMASpec, Objective, Ratio, Shown, Source, Step, Variables, thaw
+from dew.objectives.base import (
+    FROZEN,
+    OMITTED,
+    Aux,
+    EMASpec,
+    Objective,
+    Omitted,
+    Ratio,
+    Shown,
+    Source,
+    Step,
+    Variables,
+    thaw,
+)
 from dew.objectives.lm.chunked import chunked_cross_entropy
 from dew.objectives.lm.objective import _batch_text
 from dew.registry import objectives
@@ -77,8 +90,8 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         steps: int = MDLM_STEPS,
         samples: int = 4,
         decode: Callable[[Sequence[int]], str] | None = None,
-        variables: Variables | None = None,
-        processor: Processor | None = None,
+        variables: Variables | None | Omitted = OMITTED,
+        processor: Processor | None | Omitted = OMITTED,
     ):
         """Build an MDLM objective over `model` for `seq_len`-token rows.
 
@@ -100,12 +113,14 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         if isinstance(model, Source):
             from dew.nn.backbones.causal_transformer import CausalTransformer
 
-            variables = model.variables if variables is None else variables
-            processor = model.text_processor if processor is None else processor
+            variables = model.variables if variables is OMITTED else variables
+            processor = model.text_processor if processor is OMITTED else processor
             if not isinstance(model.model, CausalTransformer):
                 raise TypeError(f"masked diffusion trains a CausalTransformer, and this source's model "
                                 f"is a {type(model.model).__name__}")
             model = model.model
+        variables = None if variables is OMITTED else variables
+        processor = None if processor is OMITTED else processor
         if model.causal:
             raise ValueError(
                 "a masked diffusion model reads the whole corrupted row, so it needs "
