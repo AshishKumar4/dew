@@ -40,9 +40,9 @@ from .sharding import logical_axes
 
 @dataclasses.dataclass(frozen=True)
 class DSpark:
-    """The drafter, by the release's config names: `stages`
-    (num_nextn_predict_layers) blocks drafting `block_size` tokens past the
-    one drawn, `noise_token_id` filling the block, `target_layers` the trunk
+    """The drafter, by the release's config names: `stages` (n_mtp_layers,
+    one trailing compress ratio each) blocks drafting `block_size` tokens
+    past the one drawn, `noise_token_id` filling the block, `target_layers` the trunk
     layers whose streams form the context, a Markov head of `markov_rank`,
     and `experts` routed experts with `top_k` per token. `layer_type` is the
     layer kind whose V4 attention every stage attends with, a sliding one
