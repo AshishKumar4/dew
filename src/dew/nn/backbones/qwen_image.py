@@ -1,18 +1,20 @@
 """Qwen-Image 2.1's transformer, as Diffusers' `QwenImage21Transformer2DModel`
 runs it at commit 6256aa76.
 
-One residual stream carries the image then the text: the text is the
-vision-language encoder's states through a zero-centred RMS norm and a GELU
-MLP, the image one linear per latent position. Every block modulates both by
-scales and tanh gates from one shared projection of the time embedding,
-attends, and runs a SwiGLU. Attention is block-causal (text causal, image
-over all text and itself), and under `causal_condition` the text is
-modulated from time zero, so its activations do not change across a walk.
-The rotary table's three axes advance a text token on all three and place
-the image at the frame after the text on a zero-centred height and width
-grid. The source starts the frame after the call's longest prompt; here
-each row starts after its own text, which matches a prompt alone or a batch
-of one length and keeps rows independent of their batch.
+One residual stream holds the image and then the text. The text is the
+vision-language encoder's states passed through a zero-centred RMS norm and
+a GELU MLP, and the image is one linear map per latent position. Every block
+modulates both with scales and tanh gates from one shared projection of the
+time embedding, attends, and runs a SwiGLU. Attention is block-causal: the
+text is causal, and the image attends to all the text and to itself. Under
+`causal_condition` the text is modulated from time zero, so its activations
+do not change from one sampling step to the next. The rotary table's three
+axes advance a text token on all three, and place the image at the frame
+after the text, on a zero-centred height and width grid. The source starts
+the image's frame after the call's longest prompt. Here each row starts
+after its own text, which matches the source for a prompt alone or for a
+batch of prompts of one length, and keeps each row independent of the rest
+of its batch.
 """
 
 from __future__ import annotations
@@ -154,16 +156,17 @@ class _Block(nn.Module):
                ("timestep_embedder_linear_1",): (None, "embed"),
                ("timestep_embedder_linear_2",): (None, "embed")})
 class QwenImageTransformer(nn.Module):
-    """`QwenImage21Transformer2DModel` over Dew's interface.
+    """Runs `QwenImage21Transformer2DModel` behind Dew's model interface.
 
-    `__call__` takes NHWC latents, one token per position, the model time
-    the schedule supplies - the sigma times the training count, which is the
-    product the source reaches by dividing its timestep by a thousand and
-    multiplying it back - and a `DenoisingCondition` whose `context` is the
-    encoder's text states after the system prompt, right-padded, with `mask`
-    marking the real ones. Each row's real tokens lead its text, the layout
-    the rotary positions and the attention's key lengths both read. It
-    returns the prediction at the image's tokens.
+    `__call__` takes NHWC latents with one token per position, the model time
+    the schedule supplies, and a `DenoisingCondition`, and returns the
+    prediction at the image's tokens. The model time is the sigma times the
+    training count; the source reaches the same product by dividing its
+    timestep by a thousand and multiplying it back. The condition's `context`
+    is the encoder's text states after the system prompt, right-padded, and
+    its `mask` marks the real tokens. Each row's real tokens come first in
+    its text, which is the layout that both the rotary positions and the
+    attention's key lengths assume.
     """
 
     in_channels: int = 64
@@ -193,8 +196,12 @@ class QwenImageTransformer(nn.Module):
 
     @nn.compact
     def __call__(self, x, time, conditioning: DenoisingCondition, train: bool = False):
-        """`train` is the objective's standard call contract; the published
-        transformer holds no dropout, so it changes nothing here."""
+        """Return the prediction for the latents `x` at `time` under `conditioning`.
+
+        `train` is part of the objective's standard call; the published
+        transformer has no dropout, so it changes nothing here. Raises
+        `ValueError` for latents that are not NHWC.
+        """
         if x.ndim != 4:
             raise ValueError(f"Qwen-Image takes NHWC latents, got shape {x.shape}")
         batch, rows, columns, _ = x.shape

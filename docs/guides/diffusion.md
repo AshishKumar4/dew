@@ -66,7 +66,14 @@ For text conditioning, `InputSpec.conditions` maps a model keyword argument to a
 
 With an autoencoder configured, training runs on latents instead of pixels. The denoising model's channel count and spatial shape must match the encoder's output, and the encoder's scaling convention must be kept.
 
-`DiffusionRunConfig.autoencoder` is a `PretrainedAutoencoder`, which builds the autoencoder its checkpoint's config names: a Stable Diffusion `AutoencoderKL`, SANA's deep compression autoencoder (`AutoencoderDC`; the f32c32 checkpoints downsample 32 times into 32 channels), Wan 2.1's causal video VAE (`AutoencoderKLWan`, read from a pipeline's `vae/`), or a representation autoencoder (`AutoencoderRAE`). A DC-AE, Wan or RAE repository takes `revision="main"` or a commit; `bf16` and `flax` name the SD1-era Flax layouts:
+`DiffusionRunConfig.autoencoder` is a `PretrainedAutoencoder`, which builds the autoencoder its checkpoint's config names:
+
+- a Stable Diffusion `AutoencoderKL`;
+- SANA's deep compression autoencoder, `AutoencoderDC` (the f32c32 checkpoints downsample 32 times into 32 channels);
+- Wan 2.1's causal video VAE, `AutoencoderKLWan`, read from a pipeline's `vae/`;
+- a representation autoencoder, `AutoencoderRAE`.
+
+A DC-AE, Wan or RAE repository takes `revision="main"` or a commit; `bf16` and `flax` name the SD1-era Flax layouts:
 
 ```python
 from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder
@@ -79,15 +86,17 @@ On the published SANA 1.1 weights and a 256x384 batch, the DC-AE port matches di
 
 The Wan VAE compresses time as well as space: a clip of 1 + 4k frames encodes to 1 + k latent frames, each 8 times smaller on a side with 16 channels, and a `VideoDataset` run's clips need that length. Each frame reads only the frames before it, so the first frame encodes alone and an image is a one-frame clip. On `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` and a 9-frame 128x192 clip, the port matches diffusers 0.34.0's `AutoencoderKLWan`: the largest difference, divided by the larger of 1 and the largest reference value, is 1.5e-6 for the latent and 8.8e-6 for the decoded pixels (`tests/test_wan_vae.py`, a `network` test).
 
-A representation autoencoder (RAE) encodes with a frozen pretrained vision encoder, DINOv2 with registers, SigLIP or ViT-MAE, and decodes with a ViT trained to paint the image back. Its latent is the encoder's patch tokens: the `nyu-visionx` RAEs turn any image, resized to the encoder's input, into a 16x16 grid of 768 channels, normalized per position, and decode it to 256x256 pixels. Their encoders stay frozen in a run like any autoencoder here. The dataset's image size only sets what the encoder resizes from; train at the size the decoder paints. On the three published checkpoints (`RAE-dinov2-wReg-base-ViTXL-n08`, `RAE-siglip2-base-p16-i256-ViTXL-n08`, `RAE-mae-base-p16-ViTXL-n08`), a 256x256 image and a standard normal latent, compared over the first 32 of the latent's 768 channels and a 64x64 corner of the decode, the port is held to diffusers 0.40.0's `AutoencoderRAE` (with transformers 4.57.1) run in float64. The largest difference, divided by the larger of 1 and the largest reference value, is 9.8e-6, 1.8e-5 and 1.1e-6 for the DINOv2, SigLIP and MAE latents, where the source's own float32 runs land 7.9e-6, 2.8e-5 and 1.9e-6 away, and at most 4e-6 for the decoded pixels (`tests/test_rae.py`, a `network` test). SigLIP's residual stream reaches several hundred, so float32 rounding alone moves its latent that far.
+A representation autoencoder (RAE) encodes with a frozen pretrained vision encoder, DINOv2 with registers, SigLIP or ViT-MAE, and decodes with a ViT trained to reconstruct the image. Its latent is the encoder's patch tokens. The `nyu-visionx` RAEs resize any image to the encoder's input, encode it into a 16x16 grid of 768 channels normalized per position, and decode that back to 256x256 pixels. Their encoders stay frozen in a run, like every autoencoder here. The dataset's image size only sets what the encoder resizes from, so train at the decoder's output size.
 
-To condition on sound, `HFAudio` (`hf_audio`) runs a transformers audio model, such as wav2vec2 or Whisper's encoder, through torchax (the `torchax` extra) and hands the model its last hidden states under the same `textcontext` keyword. A run selects it with `DiffusionRunConfig(data=LocalVideos(...), text=None, audio=AudioCondition())`, or `text:None audio:audio-condition` on the command line. The video dataset's `audio_model` names the tower, its clips' `audio` field carries the extractor's input, and the clip length sets the waveform length every clip and the silent unconditional input are encoded at. Sampling takes one `{"audio": waveform}` record per sample, mono at the extractor's rate.
+`tests/test_rae.py` (a `network` test) compares the port with diffusers 0.40.0's `AutoencoderRAE` (with transformers 4.57.1) run in float64, on the three published checkpoints (`RAE-dinov2-wReg-base-ViTXL-n08`, `RAE-siglip2-base-p16-i256-ViTXL-n08`, `RAE-mae-base-p16-ViTXL-n08`), a 256x256 image and a standard normal latent, over the first 32 of the latent's 768 channels and a 64x64 corner of the decode. The largest difference, divided by the larger of 1 and the largest reference value, is 9.8e-6, 1.8e-5 and 1.1e-6 for the DINOv2, SigLIP and MAE latents, against 7.9e-6, 2.8e-5 and 1.9e-6 for the source's own float32 runs, and at most 4e-6 for the decoded pixels. SigLIP's residual stream reaches several hundred, so float32 rounding alone moves its latent that far.
+
+To condition on sound, `HFAudio` (`hf_audio`) runs a transformers audio model, such as wav2vec2 or Whisper's encoder, through torchax (the `torchax` extra) and passes the model's last hidden states to the denoiser under the same `textcontext` keyword. A run selects it with `DiffusionRunConfig(data=LocalVideos(...), text=None, audio=AudioCondition())`, or `text:None audio:audio-condition` on the command line. The video dataset's `audio_model` names the tower, its clips' `audio` field carries the extractor's input, and the clip length sets the waveform length every clip and the silent unconditional input are encoded at. Sampling takes one `{"audio": waveform}` record per sample, mono at the extractor's rate.
 
 ## Fine-tuning a published pipeline
 
-`PretrainedPipeline.load(name_or_dir)` reads a published pipeline in the diffusers layout (SD 1.x/2.x/XL, SD3, Flux, FLUX.2, Qwen-Image, Z-Image, or Wan 2.1 for text to video) into a bundle: the denoiser as `model`, its process, its text conditioning and its autoencoder. `pipe.diffusion_objective(**options)` builds a `DiffusionObjective` that starts from the pipeline's weights and trains the whole denoiser. The text encoders and the autoencoder stay frozen. Evaluation samples the way the pipeline does, with its own solver, step count and guidance, unless you pass `solver=`, `steps=` or `guidance=`. Training batches carry uint8 NHWC images at the pipeline's resolution, or a video pipeline's uint8 `[N, frames, H, W, 3]` clips under `video`, and `objective.inputs.tokenize(captions)`. The recipe's `--pretrained` flag runs the same full fine-tuning from the command line.
+`PretrainedPipeline.load(name_or_dir)` reads a published pipeline in the diffusers layout (SD 1.x/2.x/XL, SD3, Flux, FLUX.2, Qwen-Image, Z-Image, or Wan 2.1 for text to video) into a bundle that holds the denoiser as `model`, its process, its text conditioning and its autoencoder. `DiffusionObjective(pipe, **options)` trains the pipeline from its weights. It reads the denoiser, the process, the conditions, the autoencoder and the sampling policy from the bundle, and any keyword you pass overrides the bundle's value. It trains the whole denoiser, while the text encoders and the autoencoder stay frozen. Evaluation samples the way the pipeline does, with its own solver, step count and guidance, unless you pass `solver=`, `steps=` or `guidance=`. Training batches hold uint8 NHWC images at the pipeline's resolution, or a video pipeline's uint8 `[N, frames, H, W, 3]` clips under `video`, and `objective.inputs.tokenize(captions)`. The recipe's `--pretrained` flag runs the same full fine-tuning from the command line.
 
-A flow pipeline (SD3, Flux, FLUX.2, Qwen-Image, Z-Image, Wan) trains on the convention of the SD3 paper (Esser et al., 2024), not on the defaults of Diffusers' training scripts. Training times are drawn from a logit-normal distribution (mean 0, std 1), continuous on [0, 1]. The shift the pipeline's sampler walks maps each time to a noise level: SD3's static 3.0, or Flux's exp(mu) at the data's token count. The loss is the velocity error at unit weight. Diffusers 0.34's DreamBooth scripts differ in three ways:
+A flow pipeline (SD3, Flux, FLUX.2, Qwen-Image, Z-Image, Wan) trains on the convention of the SD3 paper (Esser et al., 2024), not on the defaults of Diffusers' training scripts. Training times are drawn from a logit-normal distribution (mean 0, std 1), continuous on [0, 1]. The shift in the pipeline's sampler maps each time to a noise level: SD3's static 3.0, or Flux's exp(mu) at the data's token count. The loss is the velocity error at unit weight. Diffusers 0.34's DreamBooth scripts differ in three ways:
 
 - They index a 1000-entry table of noise levels instead of drawing a continuous time.
 - `train_dreambooth_flux.py` defaults to `--weighting_scheme none`. That draws uniformly over Flux's training table, which stays unshifted because its scheduler shifts only at sampling time.
@@ -95,7 +104,7 @@ A flow pipeline (SD3, Flux, FLUX.2, Qwen-Image, Z-Image, Wan) trains on the conv
 
 To train on a script's default draw instead, pass the preset that reproduces it: `Flow(shift=1.0, density="uniform")` for the Flux script, or `Flow(shift=3.0)` (Dew's default for SD3) for the SD3 script. Either one reaches every table index the script draws, so the script's noise levels are the table at the preset's times, within one table step of the preset's own, and its loss weights are equal (`tests/test_diffusion_run_sources.py`).
 
-`pipe.lora(rank=, modules=, key=)` returns the same kind of bundle with a fresh low-rank adapter (LoRA) on the denoiser projections that `modules` names, the way Diffusers' `target_modules` does. `to_q`, `to_k`, `to_v` and `to_out.0` are the attention projections of each family's transformer and of the SD UNet. Names match the denoiser alone, so a text encoder is never adapted. B starts at zero, so the adapted pipeline samples exactly what the source does until it trains. Its `diffusion_objective` trains the adapter's factors and keeps every other weight frozen:
+To fine-tune with a low-rank adapter (LoRA) instead, `pipe.adapt(LoRA(rank=, modules=), key=)` returns the same kind of bundle with a fresh adapter on the denoiser projections that `modules` names, the way Diffusers' `target_modules` does. `to_q`, `to_k`, `to_v` and `to_out.0` are the attention projections of each family's transformer and of the SD UNet. The names are matched against the denoiser only, so a text encoder is never adapted. B starts at zero, so the adapted pipeline samples exactly what the source does until it trains. An objective over the adapted bundle trains the adapter's factors and keeps every other weight frozen:
 
 <!-- not run: downloads FLUX.1-schnell and needs an image dataset -->
 ```python
@@ -103,19 +112,21 @@ import jax
 import optax
 
 from dew.interop import PretrainedPipeline
+from dew.lora import LoRA
 from dew.training import Trainer
 
 pipe = PretrainedPipeline.load("black-forest-labs/FLUX.1-schnell", dtype="bfloat16")
-key = jax.random.key(0)
-tuned = pipe.lora(rank=16, modules=("to_q", "to_k", "to_v", "to_out.0"), key=key)
-objective = tuned.diffusion_objective()
-state = Trainer(objective, optax.adamw(1e-4), key=key).fit(data, steps=1000)
+tuned = pipe.adapt(LoRA(rank=16, modules=("to_q", "to_k", "to_v", "to_out.0")), key=0)
+objective = DiffusionObjective(tuned)
+state = Trainer(objective, optax.adamw(1e-4), key=0).fit(data, steps=1000)
 tuned.adapter.save(state.variables, "flux-adapter")
 tuned.save("flux-merged", variables=state.variables)
 images = objective.pipeline(state)(["a red bird"], key=0).host().images
 ```
 
-`tuned.adapter.save` writes `pytorch_lora_weights.safetensors`, the denoiser's PEFT config in its header, which Diffusers' `load_lora_weights` reads for that family. `tuned.save` writes the whole pipeline in the diffusers layout with the factors merged into the kernels. Both take the trainer's `state.variables` as it comes back. `LoRA.load(pipe.model, pipe.variables, pipe.layouts, path)` reads such a file back, or one Diffusers or a PEFT trainer wrote.
+`tuned.adapter.save` writes `pytorch_lora_weights.safetensors`, with the denoiser's PEFT config in its header, which Diffusers' `load_lora_weights` reads for that family. `tuned.save` writes the whole pipeline in the diffusers layout with the factors merged into the kernels. Both take the trainer's `state.variables` as they come back from `fit`. `LoRA.load(pipe.model, pipe.variables, path, layouts=pipe.layouts)` reads such a file back, as well as one that Diffusers or a PEFT trainer wrote.
+
+A recipe run takes the same spec as `lora:lora --lora.rank 16 --lora.modules to_q to_k to_v to_out.0` next to `--pretrained`. Without `--pretrained`, a run from scratch puts the adapter on a fresh draw of the denoiser from the run's key. `Adapter.from_run(run)` rebuilds a run's adapter from the run alone, so `adapter.save(adapter.variables, path)` writes the same file.
 
 <!-- not run: needs torch, diffusers and peft -->
 ```python
@@ -125,6 +136,6 @@ pipe = FluxPipeline.from_pretrained("black-forest-labs/FLUX.1-schnell")
 pipe.load_lora_weights("flux-adapter")
 ```
 
-`DiffusionObjective(..., trainable=)` takes the same filter for code that builds the objective itself. It chooses among the denoiser's own leaves, so it trains the plain denoising loss: a loss head (`uncertainty`, `alignment`, `end_to_end`) or an objective with a loss of its own (MeanFlow, shortcut, distillation, Flow-GRPO) refuses one.
+A loss head that the objective adds (`uncertainty`, `alignment`, `end_to_end`) trains alongside the factors. To train part of a denoiser without an adapter, split its starting variables with `dew.objectives.base.freeze(variables, filter)` and pass them as `variables=`. The leaves the filter keeps are trained and the rest stay frozen.
 
 [Recipes](../recipes.md) runs diffusion training on real datasets from the command line. [Supported models](../models.md) lists the published diffusion checkpoints that load.

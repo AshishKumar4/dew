@@ -1,9 +1,11 @@
-"""Named conventions, as the dataclasses a run's `run.json` stores.
+"""Named diffusion conventions, stored as dataclasses in a run's `run.json`.
 
-A preset is a frozen dataclass of the numbers that define a convention.
-Objectives build its `Process` on construction. Calling it
-also builds a process for direct schedule inspection or low-level sampling.
-A record that holds the preset's fields rebuilds it exactly.
+A convention is a choice of noise schedule, prediction target, loss
+weighting and sampling grid. A preset is a frozen dataclass of the numbers
+that define one convention. An objective builds the preset's `Process` when
+it is constructed. You can also call a preset to build its process yourself,
+to inspect the schedule or to sample at a low level. A record that holds a
+preset's fields rebuilds the preset exactly.
 """
 
 from __future__ import annotations
@@ -39,8 +41,11 @@ if TYPE_CHECKING:
 
 @runtime_checkable
 class Preset(Protocol):
-    """Every member of the `presets` registry is a frozen dataclass of a
-    convention's numbers, callable to the `Process` it describes."""
+    """The interface every member of the `presets` registry follows.
+
+    Each member is a frozen dataclass of a convention's numbers, and calling
+    it returns the process it describes.
+    """
 
     def __call__(self) -> Process | DiscreteProcess: ...
 
@@ -65,16 +70,17 @@ def _weighting(min_snr_gamma: float | None) -> Weighting:
 @presets("edm")
 @dataclass(frozen=True)
 class EDM:
-    """Log-normal training sigmas, the EDM preconditioning and lambda
-    weighting, sampled on the rho-spaced Karras grid.
+    """Trains on log-normal sigmas with the EDM preconditioning and lambda weighting.
 
-    The sigma distribution depends on the space the model denoises:
-    `regime="pixel"` draws Karras et al. 2022's exp(N(-1.2, 1.2^2)) for
-    pixels in [-1, 1], and `regime="latent"` EDM2's exp(N(-0.4, 1.0^2))
-    (Karras et al. 2024) for an autoencoder's latents. `P_mean` and `P_std`
-    set explicitly override the regime's, and a record that stores them
-    rebuilds without one. A preset with neither builds no process, and
-    `DiffusionRunConfig` fills the regime from whether it has an autoencoder.
+    It samples on the rho-spaced Karras grid. The sigma distribution depends
+    on the space the model denoises. `regime="pixel"` draws Karras et al.
+    2022's exp(N(-1.2, 1.2^2)) for pixels in [-1, 1], and `regime="latent"`
+    draws EDM2's exp(N(-0.4, 1.0^2)) (Karras et al. 2024) for an
+    autoencoder's latents. `P_mean` and `P_std`, when set, override the
+    regime's values, and a record that stores both rebuilds without a
+    regime. A preset with neither a regime nor both values builds no
+    process. `DiffusionRunConfig` sets the regime from whether the run has
+    an autoencoder.
     """
 
     sigma_min: float = 0.002
@@ -91,7 +97,11 @@ class EDM:
             raise ValueError(f"EDM's regime is 'pixel' or 'latent', got {self.regime!r}")
 
     def lognormal(self) -> tuple[float, float]:
-        """The training sigmas' log mean and log standard deviation."""
+        """Return the training sigmas' log mean and log standard deviation.
+
+        Raises `ValueError` when neither `regime` nor both `P_mean` and
+        `P_std` are set.
+        """
         if self.P_mean is not None and self.P_std is not None:
             return self.P_mean, self.P_std
         if self.regime is None:
@@ -122,8 +132,7 @@ _LOGNORMAL = {"pixel": (-1.2, 1.2), "latent": (-0.4, 1.0)}
 @presets("karras")
 @dataclass(frozen=True)
 class Karras:
-    """The EDM preconditioning trained on sigmas drawn uniformly along the
-    rho-spaced grid it samples on."""
+    """Trains the EDM preconditioning on sigmas drawn uniformly along the rho-spaced grid it samples on."""
 
     sigma_min: float = 0.002
     sigma_max: float = 80.0
@@ -145,10 +154,11 @@ class Karras:
 class Cosine:
     """The cosine beta table with v-prediction.
 
-    The table is improved-diffusion's, its betas clipped at 0.999 so the last
-    step keeps some signal (`CosineNoiseScheduler`). Its P2 weight at its
-    defaults (k = 1, gamma = 1) is 1 / (1 + SNR), which makes the v loss an
-    unweighted x_0 loss. `p2_loss_weight_gamma` changes that.
+    The table is improved-diffusion's (`CosineNoiseScheduler`), with its
+    betas clipped at 0.999 so the last step keeps some signal. At its
+    defaults (k = 1, gamma = 1), the P2 weight is 1 / (1 + SNR), which makes
+    the v loss an unweighted x_0 loss. Another `p2_loss_weight_gamma`
+    changes that.
     """
 
     timesteps: int = 1000
@@ -169,16 +179,18 @@ class Cosine:
 
 @dataclass(frozen=True)
 class ResolutionShift:
-    """Flux's shift by resolution (the pipelines' `calculate_shift`): mu is
-    linear in a token count, `base_shift` at `base_tokens` and `max_shift`
-    at `max_tokens`, and the shift is exp(mu).
+    """Flux's time shift by resolution, as the Flux pipelines' `calculate_shift` computes it.
 
-    `at` counts the image's 16 x 16-pixel cells, the grid Flux's constants
-    are stated on (an 8x autoencoder under 2x2 patches). That is a reference
-    grid, not every model's own token count: a model that tokenizes the
-    image otherwise, a 32x autoencoder under 1x1 patches for one, takes
-    `tokens` set to its own count. `DiffusionRunConfig` fills an unset
-    `tokens` from the data's resolution on that grid.
+    mu is linear in a token count, equal to `base_shift` at `base_tokens`
+    and `max_shift` at `max_tokens`, and the shift is exp(mu). `shift()`
+    returns it and raises `ValueError` while `tokens` is unset.
+
+    `at` counts the image's 16 x 16-pixel cells, which is the grid Flux's
+    constants are stated on (an 8x autoencoder under 2x2 patches). That grid
+    is a reference and does not match every model's own token count. A model
+    that tokenizes the image differently, such as a 32x autoencoder under
+    1x1 patches, should set `tokens` to its own count. `DiffusionRunConfig`
+    sets an unset `tokens` from the data's resolution on the 16 x 16 grid.
     """
 
     base_shift: float = 0.5
@@ -188,8 +200,7 @@ class ResolutionShift:
     tokens: int | None = None
 
     def at(self, height: int, width: int) -> ResolutionShift:
-        """This shift at an image of `height` x `width` pixels, counted in
-        16 x 16-pixel cells."""
+        """Return this shift for an image of `height` x `width` pixels, counted in 16 x 16-pixel cells."""
         return replace(self, tokens=(height // 16) * (width // 16))
 
     def shift(self) -> float:
@@ -205,11 +216,12 @@ class ResolutionShift:
 class Flow:
     """Rectified flow on the linear path with velocity prediction.
 
-    `density` is SD3's training time density (`FlowMatchingScheduler`):
-    logit-normal at `logit_mean` and `logit_std`, the heavy-tailed mode
-    density at `mode_scale`, cosmap or uniform. `shift` is SD3's static
-    resolution shift; `resolution_shift` sets it from the image size instead,
-    for training and sampling alike.
+    `density` is SD3's density of training times (see
+    `FlowMatchingScheduler`): logit-normal at `logit_mean` and `logit_std`,
+    the heavy-tailed mode density at `mode_scale`, cosmap, or uniform.
+    `shift` is SD3's static resolution shift. `resolution_shift` sets the
+    shift from the image size instead, for both training and sampling, so
+    giving it together with a `shift` other than 1.0 raises `ValueError`.
     """
 
     shift: float = 1.0
@@ -238,12 +250,14 @@ class Flow:
 @presets("mean_flow")
 @dataclass(frozen=True)
 class MeanFlow:
-    """Rectified flow on the linear path whose model predicts the average
-    velocity over an interval (`Process.interval`), MeanFlow's convention
-    (Geng et al. 2025, "Ratio Flows for One-step Generative Modeling"). Its
+    """Rectified flow on the linear path, with a model that predicts the average velocity over an interval.
+
+    This is MeanFlow's convention (Geng et al. 2025, "Mean Flows for One-step
+    Generative Modeling"), and its process sets `Process.interval`. The
     training times are Gsunshine/meanflow's logit-normal at P_mean -0.4 and
-    P_std 1.0, in the same noise-at-one time as Dew's. It trains under
-    `MeanFlowObjective`, and one Euler step over the whole grid samples it.
+    P_std 1.0, which measures time the same way Dew does, with noise at 1.
+    It trains under `MeanFlowObjective`, and one Euler step over the whole
+    grid samples it.
     """
 
     logit_mean: float = -0.4
@@ -258,11 +272,13 @@ class MeanFlow:
 @presets("shortcut")
 @dataclass(frozen=True)
 class Shortcut:
-    """Rectified flow on the linear path whose model predicts the velocity
-    of one step of a given size (`Process.interval`), a shortcut model's
-    convention (Frans et al. 2025, "One Step Diffusion via Shortcut
-    Models"). It trains under `ShortcutObjective`, which draws its own
-    times on dyadic grids."""
+    """Rectified flow on the linear path, with a model that predicts the velocity of one step of a given size.
+
+    This is a shortcut model's convention (Frans et al. 2025, "One Step
+    Diffusion via Shortcut Models"), and its process sets
+    `Process.interval`. It trains under `ShortcutObjective`, which draws its
+    own times on dyadic grids.
+    """
 
     def __call__(self) -> Process:
         return Process(schedule=FlowMatchingScheduler(density="uniform"),
@@ -272,13 +288,14 @@ class Shortcut:
 @presets("jit")
 @dataclass(frozen=True)
 class JiT:
-    """JiT (Li & He 2025, "Back to Basics: Let Denoising Generative Models
-    Denoise"): rectified flow on the linear path in which the model
-    predicts the clean sample and is scored in velocity space
-    (`VelocityLoss`). Its training times are LTH14/JiT's logit-normal at
-    P_mean -0.8 and P_std 0.8 in its clean-at-one time, which is Dew's
-    noise-at-one time at `logit_mean` 0.8. The reference's `noise_scale` is
-    1, its value at 256 pixels.
+    """Rectified flow where the model predicts the clean sample and is scored in velocity space (JiT).
+
+    JiT is Li & He 2025, "Back to Basics: Let Denoising Generative Models
+    Denoise", and the loss is `VelocityLoss` with `t_eps`. The training
+    times are LTH14/JiT's logit-normal at P_mean -0.8 and P_std 0.8. The
+    reference puts the clean sample at time 1, so in Dew's time, with noise
+    at 1, that is `logit_mean` 0.8. The reference's `noise_scale` is 1, its
+    value at 256 pixels.
     """
 
     logit_mean: float = 0.8
@@ -295,8 +312,10 @@ class JiT:
 @presets("sqrt")
 @dataclass(frozen=True)
 class Sqrt:
-    """Diffusion-LM (Li et al. 2022): the square-root schedule with the plain
-    x_0 loss."""
+    """The square-root schedule with the plain x_0 loss, from Diffusion-LM.
+
+    Diffusion-LM is Li et al. 2022.
+    """
 
     min_snr_gamma: float | None = None
 

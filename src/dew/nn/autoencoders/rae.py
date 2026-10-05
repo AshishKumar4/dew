@@ -31,6 +31,7 @@ import numpy as np
 from flax.typing import Dtype
 
 from dew import records
+from dew.interop.components import bind_component, component_source
 from dew.nn.attention import LayerNorm, scaled_dot_product_attention
 from dew.nn.backbones.sd3 import sincos_position
 from dew.nn.blocks import torch_bicubic_resize
@@ -454,29 +455,19 @@ def load_rae(
 
     Supplied `params` are bound unchanged: only the config is read, and no
     source layouts are returned."""
-    from dew.interop import diffusion, sources
-
-    directory = sources.snapshot(
-        str(name_or_dir), revision, weights=(subfolder,) if params is None else False
-    )
-    config = json.loads((directory / subfolder / "config.json").read_text())
+    directory, config = component_source(name_or_dir, revision, subfolder, weights=params is None)
     if config.get("_class_name") != "AutoencoderRAE":
         raise ValueError(
-            f"{directory / subfolder} holds a {config.get('_class_name')}, not an AutoencoderRAE"
+            f"{directory} holds a {config.get('_class_name')}, not an AutoencoderRAE"
         )
     model = RAE(**rae_fields(config), dtype=compute)
-    layouts: tuple[WeightLayout, ...] = ()
-    if params is None:
-        tensors = diffusion.component_tensors(directory, subfolder)
-        params, layouts = diffusion.record_layouts(
-            "vae", tensors, lambda name: rae_path(name, np.ndim(tensors[name])), ("autoencoder",),
-            param_dtype=param_dtype)
     image = jax.ShapeDtypeStruct((1, model.input_size, model.input_size, 3), jnp.float32)
-    check_tree({"params": params}, model, image)
-    autoencoder = RAEAutoencoder(model=model, params=params, latents_mean=config.get("latents_mean"),
-                                 latents_std=config.get("latents_std"),
-                                 scaling_factor=config.get("scaling_factor", 1.0))
-    return autoencoder, params, layouts, config
+    return bind_component(
+        directory, "vae", config, model, rae_path,
+        lambda bound: RAEAutoencoder(model=model, params=bound, latents_mean=config.get("latents_mean"),
+                                     latents_std=config.get("latents_std"),
+                                     scaling_factor=config.get("scaling_factor", 1.0)),
+        prefix=("autoencoder",), params=params, param_dtype=param_dtype, inputs=(image,))
 
 
 def load_dinov2(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | None = None,
@@ -489,7 +480,7 @@ def load_dinov2(name_or_dir: str | Path, compute=jnp.float32, *, revision: str |
     `module.clone(input_size=224)` resizes the table to the 16x16 grid as
     `Dinov2Model` does. Supplied `params` are bound unchanged, only the config
     is read, and no layouts are returned."""
-    from dew.interop import diffusion, sources
+    from dew.interop import diffusion, sources, weights
 
     directory = sources.snapshot(str(name_or_dir), revision, weights=params is None)
     config = json.loads((directory / "config.json").read_text())
@@ -517,7 +508,7 @@ def load_dinov2(name_or_dir: str | Path, compute=jnp.float32, *, revision: str |
             path = rae_path(f"encoder.{name}", np.ndim(tensors[name]))
             return None if path is None else path[1:]
 
-        params, layouts = diffusion.record_layouts("dinov2", tensors, path_of, ("representation",),
+        params, layouts = weights.record_layouts("dinov2", tensors, path_of, ("representation",),
                                                    param_dtype=param_dtype)
     check_tree({"params": params}, module,
                jax.ShapeDtypeStruct((1, module.input_size, module.input_size, 3), jnp.float32))

@@ -41,11 +41,11 @@ const attributes = (run: Run) => {
 		screen.map((row) => [...row.map((run) => (run.fg || run.bold || run.dim ? <span {...attributes(run)}>{run.text}</span> : run.text)), '\n'])
 	}</pre>
 	<p class="hero-output-meta">
-		Recorded on {meta.where}, JAX {meta.jax}, Dew{' '}
-		<a href={`https://github.com/AshishKumar4/dew/commit/${meta.dew}`}><code>{meta.dew.slice(0, 7)}</code></a>, {meta.date},{' '}
-		{Math.round(seconds)} s from start to end.{replay && <> Replayed in about {Math.round(playbackSeconds)} s.</>}
-		{replay && <> Recorded at {columns}×{source_rows}, shown with scrollback.</>}
-		{replay && <> <span data-terminal-note>Replay available with JavaScript; reduced motion shows the final frame.</span>{' '}
+		Recorded on {meta.where} with JAX {meta.jax} and Dew{' '}
+		<a href={`https://github.com/AshishKumar4/dew/commit/${meta.dew}`}><code>{meta.dew.slice(0, 7)}</code></a> on {meta.date}.{' '}
+		The run took {Math.round(seconds)} s.{replay && <> The replay lasts about {Math.round(playbackSeconds)} s.</>}
+		{replay && <> The terminal was {columns}×{source_rows}; scroll the panel for earlier lines.</>}
+		{replay && <> <span data-terminal-note>The replay needs JavaScript; with reduced motion you see the last frame.</span>{' '}
 			<a href="/hero/train.cast" download>Original recording</a>.</>}
 	</p>
 </div>

@@ -24,27 +24,17 @@ import optax
 from flax import struct
 
 from dew.artifacts import TokenScores
+from dew.inference.tasks import BlockGeneration
 from dew.inputs import Field, InputSpec
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.inputs import ModelInputs
 from dew.nn.sharding import LOGITS, constrain
-from dew.objectives.base import (
-    Aux,
-    Batch,
-    EMASpec,
-    Objective,
-    PathFilter,
-    Ratio,
-    Step,
-    Variables,
-    freeze,
-    thaw,
-)
+from dew.objectives.base import FROZEN, Aux, Batch, EMASpec, Objective, Ratio, Source, Step, Variables, thaw
 from dew.objectives.lm.chunked import chunked_cross_entropy, head_logits
 from dew.registry import objectives
 
 if TYPE_CHECKING:
-    from dew.inference.tasks import BlockGeneration, Processor
+    from dew.inference.tasks import Processor
     from dew.nn.backbones.causal_transformer import DecoderBank
     from dew.training.state import TrainState
 
@@ -123,42 +113,53 @@ def _row_mean(losses: jax.Array, mask: jax.Array) -> Ratio:
 
 @objectives("block_diffusion")
 class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
-    """Fine-tune DiffusionGemma on clean ``text`` rows split into prompt and canvases.
+    """Fine-tunes DiffusionGemma on clean ``text`` rows split into a prompt and canvases.
 
     A row has ``prompt_length + canvas_size * num_canvases`` tokens. ``text``
-    accepts token arrays or ModelInputs; media conditions only the clean encoder.
-    Supplied attention validity controls cache occupancy, otherwise the pad ID
-    and canvas mask do. Optional ``canvas_mask`` and ``encoder_target_mask``
-    select text targets; media placeholders are never labels. Default encoder
-    targets require adjacent valid slots, matching Google's SequenceTargetShift.
-    Every response token is corrupted, but only a uniformly selected valid
-    canvas contributes diffusion CE.
+    holds token arrays or `ModelInputs`, and any media in it conditions only
+    the clean encoder. When the batch supplies attention validity, that
+    decides which cache slots are occupied; otherwise the pad ID and the
+    canvas mask decide. The optional ``canvas_mask`` and
+    ``encoder_target_mask`` select the text targets, and media placeholders
+    are never labels. By default an encoder target requires adjacent valid
+    slots, as Google's SequenceTargetShift does. Every response token is
+    corrupted, but only one valid canvas, chosen uniformly, contributes the
+    diffusion cross entropy.
 
-    `processor` is what `pipeline` turns text into ids with and decodes
-    through, unless it is handed another; a run records its tokenizer.
+    `processor` is what `pipeline` uses to turn text into ids and decode
+    them, unless it is given another one. A run records its tokenizer.
 
-    `trainable` selects the parameter leaves the optimizer moves, by their
-    full path (`dew.objectives.base.PathFilter`), the way `LMObjective`
-    takes it; the rest of the tree is kept under `frozen`, which `init`
-    returns and a checkpoint stores. An adapter's own filter
-    (`dew.lora.LoRA.trainable`) goes here. None trains every leaf.
+    `variables` is the tree training starts from: the SFT source's, or an
+    adapter's split of it. A split (`dew.objectives.base.freeze`) is kept,
+    so the optimizer updates only what the split leaves in `params`. `model`
+    may be the loaded source itself, which supplies its model, variables and
+    processor. With no variables, training starts from a fresh init.
 
-    Both cross-entropies score the final states through the bounded head
+    Both cross entropies score the final states through the bounded head
     (`dew.objectives.lm.chunked.chunked_cross_entropy`), `head_chunks`
-    vocabulary tiles at a time, so no vocabulary-sized fp32 logits or
-    softmax of a whole row is held for the backward pass. The first
-    denoising pass, whose logits condition the second and carry no
-    gradient, is the one place a full row of logits exists.
+    vocabulary tiles at a time. The backward pass therefore never holds
+    vocabulary-sized fp32 logits or the softmax of a whole row. The one
+    place a full row of logits exists is the first denoising pass, whose
+    logits condition the second pass and receive no gradient.
     """
 
-    def __init__(self, model: DiffusionGemma, *, prompt_length: int,
+    saved_task = BlockGeneration
+
+    def __init__(self, model: DiffusionGemma | Source, *, prompt_length: int,
                  num_canvases: int = 1, canvas_size: int | None = None,
-                 pretrained: Variables | None = None, pad_token_id: int = 0,
+                 variables: Variables | None = None, pad_token_id: int = 0,
                  self_cond_prob: float = 0.5, safety_epsilon: float = 1e-4,
                  stop_gradient_from_denoiser_to_encoder: bool = False,
                  encoder_loss_weight: float = 1.0, decoder_loss_weight: float = 1.0,
-                 ema_decay: float | None = None, trainable: PathFilter | None = None,
-                 head_chunks: int = 4, processor: Processor | None = None):
+                 ema_decay: float | None = None, head_chunks: int = 4,
+                 processor: Processor | None = None):
+        if isinstance(model, Source):
+            variables = model.variables if variables is None else variables
+            processor = model.text_processor if processor is None else processor
+            if not isinstance(model.model, DiffusionGemma):
+                raise TypeError(f"block diffusion trains a DiffusionGemma, and this source's model "
+                                f"is a {type(model.model).__name__}")
+            model = model.model
         canvas_size = model.canvas_length if canvas_size is None else canvas_size
         for name, value in (("prompt_length", prompt_length), ("num_canvases", num_canvases),
                             ("canvas_size", canvas_size), ("head_chunks", head_chunks)):
@@ -186,7 +187,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         # The reference allocates one full-sequence cache for training, not the
         # model's potentially much larger serving capacity. Weights are unchanged.
         self.training_model = self.model.clone(text=self.model.text.clone(max_seq_len=self.sequence_length))
-        self.pretrained = pretrained
+        self.variables = variables
         self.pad_token_id = pad_token_id
         self.self_cond_prob = self_cond_prob
         self.safety_epsilon = safety_epsilon
@@ -194,8 +195,9 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         self.encoder_loss_weight = encoder_loss_weight
         self.decoder_loss_weight = decoder_loss_weight
         self.inputs = InputSpec(sample=Field("text", (self.sequence_length,)))
-        self.ema = None if ema_decay is None else EMASpec(optax.constant_schedule(ema_decay))
-        self.trainable = trainable
+        # The EMA follows what moves; the frozen collection never does.
+        self.ema = None if ema_decay is None else EMASpec(
+            optax.constant_schedule(ema_decay), select=lambda path: path[0] != FROZEN)
         self.head_chunks = head_chunks
         self.processor = processor
 
@@ -214,50 +216,48 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
 
     def pipeline(self, state: TrainState, *, ema: bool | None = None,
                  processor: Processor | None = None) -> BlockGeneration:
-        """Publish the state's weights as a `BlockGeneration` task.
+        """Return the trained model as a `BlockGeneration` task over the state's weights.
 
-        The sampler keeps the published defaults, and the tokenizer's EOS
-        ids are the caller's to set.
+        The sampler keeps the published defaults, and the caller sets the
+        tokenizer's EOS ids.
         """
         from dew.diffusion.block import BlockProcess
         from dew.inference.tasks import BlockGeneration
 
         process = BlockProcess(canvas_length=self.model.canvas_length, vocab_size=self.model.vocab_size)
-        return BlockGeneration(self.model, thaw(self._pipeline_weights(state, ema)), process,
+        return BlockGeneration(self.model, self._pipeline_weights(state, ema), process,
                                self.processor if processor is None else processor,
                                pad_token_id=self.pad_token_id)
 
     @property
     def bank_sites(self) -> tuple[DecoderBank, ...]:
-        """Name the shared text stack, as the training model declares it."""
+        """The shared text stack, as the training model declares it."""
         return self.training_model.bank_sites
 
     def held_variables(self) -> Variables | None:
-        """Return the SFT source this objective starts from."""
-        return self.pretrained
+        """Return the SFT source this objective starts from, or None for a fresh init."""
+        return self.variables
 
     def init(self, key: jax.Array, variables: Variables | None = None) -> Variables:
-        tree = self._whole_tree(key, variables)
-        return tree if self.trainable is None else freeze(tree, self.trainable)
+        """The starting tree, its split kept, with the source's layer scalars
+        moved where the model reads them; or a fresh init.
 
-    def _whole_tree(self, key: jax.Array, variables: Variables | None) -> Variables:
-        """Return the model's variables in one `params` collection.
-
-        Either the source with its frozen split undone and the layer
-        scalars moved, or a fresh init.
+        A split tree's scalars go under `frozen` beside the rest of the base,
+        so an adapter's run moves its factors alone, as the source's frozen
+        scalars did not move either.
         """
-        pretrained = self.pretrained if variables is None else variables
+        pretrained = self.variables if variables is None else variables
         if pretrained is not None:
             if "params" not in pretrained:
-                raise ValueError("pretrained must contain the params collection")
-            pretrained = thaw(pretrained)
+                raise ValueError("variables must contain the params collection")
             if self._initial_scalar_mode == "trainable":
                 return pretrained
+            held = FROZEN if FROZEN in pretrained else "params"
             # Google makes skip_scale a parameter; Transformers declares the
             # same tensor a buffer. Move references once, under an explicit
             # model policy, without copying any parameter arrays.
             values = dict(pretrained)
-            params = dict(values["params"])
+            params = dict(values[held])
             text = dict(params["text"])
             constants = dict(values["constants"])
             text_constants = dict(constants["text"])
@@ -274,7 +274,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
                 else:
                     del text_constants[layer]
             params["text"] = text
-            values["params"] = params
+            values[held] = params
             if text_constants:
                 constants["text"] = text_constants
             else:
@@ -302,12 +302,12 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
                                   "encoder_ce": encoder_stats.mean()[0]})
 
     def evaluate(self, params: Variables, batch: Batch, step: Step) -> TokenScores:
-        """Score the denoiser's cross entropy on every canvas target of the batch.
+        """Return the denoiser's cross entropy on every canvas target of the batch.
 
         One noise level and one canvas per row are drawn from the pass's key,
-        as training draws them, with dropout off and the averaged weights
-        when the run keeps them, so `perplexity` over a validation pass is
-        exp of the denoising loss per target."""
+        as in training. Dropout is off, and the averaged weights are used when
+        the run keeps them. So `perplexity` over a validation pass is the
+        exponential of the denoising loss per target."""
         params = params if step.ema is None else step.ema
         losses, weights, correct = self._scored(params, batch, step.key)
         return TokenScores(losses=losses, weights=weights, correct=correct)

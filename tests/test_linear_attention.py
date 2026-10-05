@@ -44,6 +44,7 @@ from dew.nn.linear import (
     chunk_gated_delta_rule,
     l2norm,
     recurrent_gated_delta_rule,
+    strictly_lower_inverse,
 )
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "linear_attention"
@@ -422,3 +423,58 @@ def test_the_layer_reads_a_holed_row_as_the_row_without_its_holes(reference, geo
     assert largest(holed[:, kept], alone) < 1e-5
     assert jnp.array_equal(holed[:, jnp.asarray([2, 3, 6])],
                            jnp.zeros_like(holed[:, jnp.asarray([2, 3, 6])]))
+
+
+@pytest.mark.parametrize("chunk", [4, 16, 64])
+def test_the_chunk_inverse_is_exact_where_its_series_cancels(chunk):
+    """Every key the same and beta one make A every -1 below the diagonal:
+    (I - A)^-1 is I minus the subdiagonal, entries of at most 1, while the
+    series' powers of A grow as binomials (to 1.8e17 at 64), which summed
+    in fp32 left Qwen3.5-0.8B's fifth delta-rule layer 1e24 off on a
+    256-token prompt and its logits NaN."""
+    a = -jnp.tril(jnp.ones((2, chunk, chunk), jnp.float32), -1)
+    want = np.eye(chunk) - np.eye(chunk, k=-1)
+    np.testing.assert_allclose(strictly_lower_inverse(a), np.broadcast_to(want, a.shape), atol=1e-6)
+
+
+def test_the_chunked_rule_holds_with_aligned_keys():
+    """Keys nearly aligned within a chunk, beta near one and slow decay, the
+    case real checkpoints reach: the chunked rule still gives the
+    token-by-token recurrence's output."""
+    rng = np.random.default_rng(0)
+    B, S, H, D = 1, 128, 2, 16
+    base = rng.normal(size=(1, 1, H, D))
+    key = base + 0.05 * rng.normal(size=(B, S, H, D))
+    key = key / np.linalg.norm(key, axis=-1, keepdims=True)
+    query = rng.normal(size=(B, S, H, D))
+    query = query / np.linalg.norm(query, axis=-1, keepdims=True)
+    value = rng.normal(size=(B, S, H, D))
+    g = -0.01 * rng.random((B, S, H))
+    beta = 0.99 + 0.01 * rng.random((B, S, H))
+    query, key, value, g, beta = (jnp.asarray(x, jnp.float32) for x in (query, key, value, g, beta))
+    want, want_state = recurrent_gated_delta_rule(query, key, value, g, beta)
+    got, state = chunk_gated_delta_rule(query, key, value, g, beta)
+    np.testing.assert_allclose(got, want, atol=2e-4)
+    np.testing.assert_allclose(state, want_state, atol=2e-4)
+
+
+@pytest.mark.skipif(jax.default_backend() != "gpu", reason="the kernel runs on CUDA")
+@pytest.mark.parametrize("rows", [3, 32])
+def test_the_decode_kernel_steps_as_the_recurrence_does(rows):
+    """One decode token through `dew.nn.kernels.delta_rule` (one read and one
+    write of the state) gives the reference recurrence's output and state,
+    at Qwen3.5-0.8B's widths (16 heads, 128 wide)."""
+    from dew.nn.linear import decode_gated_delta_rule
+
+    rng = np.random.default_rng(0)
+    H, D = 16, 128
+    unit = [rng.normal(size=(rows, 1, H, D)) for _ in range(2)]
+    query, key = (jnp.asarray(x / np.linalg.norm(x, axis=-1, keepdims=True), jnp.float32) for x in unit)
+    value = jnp.asarray(rng.normal(size=(rows, 1, H, D)), jnp.float32)
+    g = jnp.asarray(-rng.random((rows, 1, H)) * 3, jnp.float32)
+    beta = jnp.asarray(rng.random((rows, 1, H)), jnp.float32)
+    state = jnp.asarray(rng.normal(size=(rows, H, D, D)) * 0.1, jnp.float32)
+    want, want_state = recurrent_gated_delta_rule(query, key, value, g, beta, state)
+    got, got_state = jax.jit(decode_gated_delta_rule)(query, key, value, g, beta, state)
+    np.testing.assert_allclose(got, want, atol=2e-6)
+    np.testing.assert_allclose(got_state, want_state, atol=2e-6)

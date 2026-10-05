@@ -1,45 +1,46 @@
 """Quantized training through Qwix, applied to the model before it trains.
 
-Qwix (google/qwix, Apache 2.0) expresses quantization as rules over module
+Qwix (google/qwix, Apache 2.0) describes quantization as rules over module
 paths and applies them without editing the model. One call wraps the module,
-and the matmuls in the wrapped methods' extent run quantized.
+and the matmuls that run inside the wrapped methods run quantized.
 
-Dew's version of that call is `Quantization.apply`. A caller builds its model
-as always, then wraps it before the objective ever sees it.
-A run that names `--trainer.quantization` instead hands `RunConfig.train` the
-objective, and `_quantize` wraps the model it holds before anything
+In Dew that call is `Quantization.apply`. A caller builds its model as
+usual, then wraps it before the objective ever sees it. A run that sets
+`--trainer.quantization` passes the objective to `RunConfig.train` instead,
+and the model the objective holds is wrapped there, before anything
 initialises it.
 
-What trains is fake-quantized. The parameter tree keeps fp32 master weights
+Training is fake-quantized. The parameter tree keeps fp32 master weights
 with the same structure, so the checkpoint layout, the sharding derivation,
-the Muon parameter split and Hugging Face loading are unchanged. The
-quantization lives in the forward and backward matmuls, with a
-straight-through estimator on the backward pass.
+the Muon parameter split and Hugging Face loading are unchanged. Only the
+forward and backward matmuls are quantized, with a straight-through
+estimator on the backward pass.
 
-Serving is not fake-quantized. `quantize_for_serving` runs Qwix's
+Serving stores the weights quantized. `quantize_for_serving` runs Qwix's
 post-training quantization: the returned variables hold each matched kernel
 as int8 or fp8 values with their scales, and the returned module's matmuls
 read them. `TextGeneration.quantized` applies it to a language model and
 `TextToImage.quantized` to an image task's denoiser.
 
-The vocabulary head stays fp32 with the rest of Dew's fp32 zones. Its einsum
-lives in the objective's chunked cross entropy, outside any model method
-Qwix wraps.
+The vocabulary head stays fp32, like the rest of Dew's fp32 zones. Its
+einsum runs in the objective's chunked cross entropy, outside any model
+method Qwix wraps.
 
-The value mirrors MaxText's knob set (configs/base.yml:128-167) where Qwix
-has an equivalent. `dtype` is its `quantization` for the dynamic-range forms
-and `patterns` its `quant_cfg_path`, written inline as the regexes Qwix
-matches; the backward fields are Qwix's finer-grained version of the same
-idea.
+The `Quantization` fields follow MaxText's quantization settings where Qwix
+has an equivalent. `dtype` is MaxText's `quantization` for the dynamic-range
+forms, and `patterns` is its `quant_cfg_path`, written inline as the regexes
+Qwix matches. The backward fields are Qwix's finer-grained version of the
+same idea.
 
-Three of its knobs have no equivalent, and `dtype` takes neither of the
-first two. Static activation scaling (`fp8_full`) needs a calibration pass
-Dew has no seam for, `nanoo_fp8` is AMD-only kernels, and KV-cache
-quantization has no reader here since the cache holds the compute dtype.
+Three MaxText settings have no equivalent, and `dtype` accepts neither of
+the first two. Static activation scaling (`fp8_full`) needs a calibration
+pass that Dew has no hook for, `nanoo_fp8` uses AMD-only kernels, and
+KV-cache quantization has nothing to read it here because the cache holds
+the compute dtype.
 
 Qwix comes with the `quantization` extra (`pip install "dewml[quantization]"`).
-The import sits inside the calls that need it, and without the package they
-raise naming the extra.
+It is imported inside the calls that need it, and without the package those
+calls raise an error that names the extra.
 """
 from __future__ import annotations
 
@@ -83,6 +84,8 @@ METHODS = ("__call__", "hidden_states", "mtp_hidden_states", "states_and_logits"
            "draft_context")
 
 
+# MaxText's quantization settings, which these fields follow, are in its
+# configs/base.yml:128-167.
 @dataclasses.dataclass(frozen=True)
 class Quantization:
     """Says how a run quantizes its trunk matmuls, for Qwix's provider."""
@@ -90,27 +93,34 @@ class Quantization:
     dtype: QuantizedDtype = "int8"
     """The dtype weights and activations quantize to, in the forward pass."""
     weight_only: bool = False
-    """Quantize the weights alone and keep activations in the compute dtype.
-    Convolutions stay unquantized under it, since Qwix's serving provider
-    refuses a convolution whose activations stay in float."""
+    """Whether to quantize only the weights and keep activations in the compute dtype.
+
+    Convolutions stay unquantized when this is set, because Qwix's serving
+    provider refuses a convolution whose activations stay in float."""
     patterns: tuple[str, ...] = (".*",)
-    """Module-path regexes the rules apply to, in Qwix precedence order: the
-    first rule whose regex full-matches a module's `/`-joined scope path wins.
-    `'.*mlp.*'` quantizes the feed-forward blocks and leaves attention in
-    fp32; the default quantizes every matmul of the wrapped methods."""
+    """Regexes over module paths that select what is quantized, in Qwix's precedence order.
+
+    The first rule whose regex fully matches a module's `/`-joined scope path
+    wins. `'.*mlp.*'` quantizes the feed-forward blocks and leaves attention
+    in fp32; the default quantizes every matmul of the wrapped methods."""
     calibration: str = "absmax"
-    """How weights calibrate, as Qwix parses it: a method with an optional
-    `,args` suffix, for example `absmax,0.8`."""
+    """The weight calibration method, in the form Qwix parses.
+
+    It is a method name, one of `absmax`, `minmax`, `rms` or `fixed`, with an
+    optional `,args` suffix, for example `absmax,0.8`."""
     tile_size: int | None = None
-    """Sub-channel tiling of the contraction axis; unset keeps per-channel
-    scales, the coarser and cheaper form."""
+    """The number of elements per tile for sub-channel scales along the contraction axis.
+
+    Unset keeps per-channel scales, which are coarser and cheaper."""
     bwd_qtype: QuantizedDtype | None = None
     """The dtype gradients quantize to in the backward pass; unset keeps
     them in the compute dtype."""
+    # Qwix draws the stream in qwix/_src/providers/qt.py:361.
     bwd_stochastic_rounding: Rounding | None = None
-    """Stochastic rounding on the quantized gradients. A run that sets this
-    passes a `stochastic_rounding` RNG stream at apply time, which Qwix draws
-    (`qwix/_src/providers/qt.py:361`); unset rounds deterministically."""
+    """The stochastic rounding mode for the quantized gradients; unset rounds deterministically.
+
+    A run that sets it passes a `stochastic_rounding` RNG stream at apply
+    time, and Qwix draws from that stream."""
 
     def __post_init__(self) -> None:
         if self.dtype not in ("int8", "fp8"):
@@ -145,13 +155,14 @@ class Quantization:
                 f"unset, got {self.bwd_stochastic_rounding!r}")
 
     def apply(self, model: nn.Module) -> nn.Module:
-        """Wrap `model` so its trunk matmuls train in this spec's dtype.
+        """Return a copy of `model` whose trunk matmuls train in this spec's dtype.
 
-        The returned module is a copy of the same class with the entry methods
-        it defines of `METHODS` wrapped, so everything the registry, the
-        objective and the checkpoint code read off the model still answers.
-        Construction already refused what the value cannot ask for; without the
-        package the call raises naming it.
+        The copy is an instance of Qwix's subclass of the model's class, with
+        each method of `METHODS` that the model defines wrapped. Everything
+        the registry, the objective and the checkpoint code read from the
+        model therefore still works. Invalid settings were already refused
+        when the spec was constructed. Without Qwix installed, the call raises
+        an error that names the extra.
         """
         rules = _rules(self, training=True)
         methods = tuple(method for method in METHODS if hasattr(model, method))
@@ -582,10 +593,10 @@ def quantize_for_serving(model: nn.Module, variables: Variables, spec: Quantizat
 
 @runtime_checkable
 class ModelObjective(Protocol):
-    """Trains one module, which is the shape `quantize` can wrap.
+    """An objective that trains one module, which is what `--trainer.quantization` can wrap.
 
-    The module is the objective's `model`, and every trace it runs reads it
-    there."""
+    The module is the objective's `model` attribute, and every trace the
+    objective runs reads it from there."""
 
     model: nn.Module
 

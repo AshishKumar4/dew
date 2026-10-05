@@ -168,7 +168,7 @@ def test_prompt_perplexity_uses_unpadded_context_and_real_transitions(kind):
 def test_real_trainer_update_matches_raw_policy_ratio_with_behavior_recorded():
     model = decoder()
     params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
-    objective = GRPOObjective(model, seq_len=7, pretrained=params)
+    objective = GRPOObjective(model, seq_len=7, variables=params)
     rollout = SampledRollout(
         objective, lambda source, text, truth, info: float(sum(map(int, text.split()))),
         groups=2, max_new_tokens=4, sampling=Sampling(temperature=1.2, top_k=7))

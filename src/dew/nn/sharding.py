@@ -1,4 +1,4 @@
-"""Where a parameter splits, declared on the module that owns it.
+"""Where a parameter is split across devices, declared on the module that creates it.
 
 A module names the logical axes of the parameters its submodules create,
 keyed by the trailing module path, outermost dimension first:
@@ -6,29 +6,29 @@ keyed by the trailing module path, outermost dimension first:
     @logical_axes({("q_proj",): ("embed", "heads"), ("o_proj",): ("attention", "embed")})
     class CausalSelfAttention(nn.Module): ...
 
-A parameter takes the trailing names its rank can hold, so a kernel takes all
-of them and its bias the output ones. The declarations of every decorated
-module merge into one table the `Layout` reads when it places a train state
-and Muon reads when it picks a parameter's matrix axes. The models stay
-plain Flax modules whose init returns arrays. The optimizer's
-moments and the EMA copy have paths ending in their parameter's, so one
-declaration reaches them as well.
+A parameter takes as many of the trailing names as its rank holds, so a
+kernel takes all of them and its bias takes the output ones. The
+declarations of every decorated module merge into one table. The `Layout`
+reads that table when it places a train state, and Muon reads it when it
+picks a parameter's matrix axes. The models stay plain Flax modules whose
+init returns arrays. The optimizer's moments and the EMA copy have paths
+that end in their parameter's path, so one declaration covers them as well.
 
-A parameter no declaration names (a convolution, a state matrix, a
-projection with no side worth naming) takes the shape heuristic, which
+A parameter that no declaration names (a convolution, a state matrix, a
+projection with no side worth naming) gets the shape heuristic, which
 places it on its largest divisible axis.
 
-The mesh axis names live here too, with the readers of the mesh in context:
-`pipeline_stages` for the decoder's stage count, `microbatches` for the
-schedule the trainer puts in context around its compiled step,
-`sequence_shards` for how many ways attention and the Mamba-2 mixer split a
-sequence, `row_axes` for the axes their `shard_map`s split rows over, and
-`manual_map` for those maps.
+This module also defines the mesh axis names and the functions that read
+the mesh in context: `pipeline_stages` for the decoder's stage count,
+`microbatches` for the schedule the trainer sets in context around its
+compiled step, `sequence_shards` for how many ways attention and the Mamba-2
+mixer split a sequence, `row_axes` for the axes their `shard_map`s split
+rows over, and `manual_map` for those maps.
 
-`DEFAULT_RULES` maps the logical names onto the mesh, parameters and
-activations alike: `logical_spec` reads it (or the rules a layout puts in
-context) for a parameter's placement and for an activation's, which
-`constrain` pins.
+`DEFAULT_RULES` maps the logical names onto the mesh, for parameters and
+activations alike. `logical_spec` reads it (or the rules a layout sets in
+context) to place a parameter or an activation, and `constrain` applies that
+placement to an activation.
 """
 
 from __future__ import annotations
@@ -71,10 +71,12 @@ tensor shard computes its share of the width for every row."""
 
 
 class LayoutRefused(ValueError):
-    """A mesh layout that a model, an objective or a device set does not run,
-    by design. The message names the axis, why it cannot hold what it would
-    split, and a layout that runs. Any other error on a layout is a defect.
-    It is a ValueError, so a caller that catches the one catches the other."""
+    """Raised for a mesh layout that a model, an objective or a device set does not run, by design.
+
+    The message names the axis, says why it cannot hold what it would split,
+    and gives a layout that runs. Any other error on a layout is a defect.
+    It is a ValueError, so a caller that catches ValueError catches it too.
+    """
 
 type MeshAxes = str | tuple[str, ...] | None
 type LogicalAxisRules = tuple[tuple[str, MeshAxes], ...]
@@ -155,9 +157,10 @@ DEFAULT_RULES: LogicalAxisRules = (
 )
 
 RESIDUAL: LogicalAxes = ("activation_batch", "activation_length", "activation_embed")
-"""A `[batch, length, width]` activation between sublayers, and a sublayer's
-input: under a tensor axis every tensor shard reads every row it computes
-its share of the width for."""
+"""The logical axes of a `[batch, length, width]` activation between sublayers,
+which is also each sublayer's input. Under a tensor axis the width stays
+whole, so every tensor shard reads every row it computes its share of the
+width for."""
 HEADS: LogicalAxes = ("activation_batch", "activation_length", "activation_heads", None)
 """A `[batch, length, heads, head_dim]` query, or the attention's output."""
 KV_HEADS: LogicalAxes = ("activation_batch", "activation_length", "activation_kv", None)
@@ -181,9 +184,10 @@ DECLARED: dict[Suffix, LogicalAxes] = {}
 
 @dataclasses.dataclass
 class Schedule:
-    """The microbatch count a step feeds the stage axis, and whether a model
-    in the step ran a pipeline over it, which `microbatches` notes as the
-    pipeline reads the count."""
+    """The microbatch count a step feeds the stage axis, and whether a model in the step ran a pipeline.
+
+    `microbatches` sets `pipelined` when the pipeline reads the count.
+    """
 
     count: int | None
     pipelined: bool = False
@@ -231,18 +235,22 @@ def microbatches() -> int:
 
 @dataclasses.dataclass
 class Link:
-    """A mesh axis's interconnect as the trainer measured it when it placed a
-    step (`dew.training.distributed.link_bandwidth`), one device's dense bf16
-    peak, and whether a projection in the step ran split over the axis, which
-    `down_projection` and `split_positions` note as they decide."""
+    """A mesh axis's interconnect, one device's dense bf16 peak, and whether a projection split over the axis.
+
+    The trainer measures the interconnect when it places a step
+    (`dew.training.distributed.link_bandwidth`). `down_projection` and
+    `split_positions` set `spread` when they decide to split a projection in
+    the step over the axis.
+    """
 
     bytes_per_second: float | None
-    """What one device receives a second in an all-gather over the axis:
-    (N - 1) / N of the result, over the time it took. None where nothing was
-    measured: a CPU mesh, or a device the peak table does not name."""
+    """The bytes one device receives per second in an all-gather over the axis:
+    (N - 1) / N of the result, divided by the time the gather took. None where
+    nothing was measured: on a CPU mesh, or on a device the peak table does not
+    name."""
     flops_per_second: float | None
-    """One device's dense bf16 peak, None for hardware the peak table does
-    not name (`dew.telemetry.instrumentation.peak_flops`)."""
+    """One device's dense bf16 peak in FLOPs per second, or None for hardware
+    the peak table does not name (`dew.telemetry.instrumentation.peak_flops`)."""
     platform: str
     spread: bool = False
 
@@ -425,18 +433,18 @@ def logical_spec(axes: LogicalAxes, shape: tuple[int, ...], *,
                  rules: LogicalAxisRules | None = None,
                  mesh: jax.sharding.Mesh | jax.sharding.AbstractMesh | None = None
                  ) -> jax.sharding.PartitionSpec:
-    """The spec `rules` give an array of `shape` whose dimensions `axes`
-    names, on `mesh`: the rules and the mesh in context by default.
+    """Return the spec that `rules` give, on `mesh`, an array of `shape` whose dimensions `axes` names.
 
-    A mesh axis of size 1 shards nothing, and a manual one belongs to the
-    `shard_map` in context, so both are dropped from the rules before they
-    are read: such an axis claims no dimension, and a name whose rule named
-    only such axes takes its next rule. With no tensor axis, 'mlp' passes
-    its tensor rule to fsdp. A rule whose axes do not divide its dimension
-    evenly cannot split it, so that rule is set aside for this array and the
-    name takes its next rule, or none, and the axis goes to the next
-    dimension that names it. An odd vocabulary shards the embedding on its
-    width and keeps the table in the layout.
+    `rules` and `mesh` default to the ones in context. A mesh axis of size 1
+    shards nothing, and a manual axis belongs to the `shard_map` in context,
+    so both are dropped from the rules before they are read. Such an axis
+    claims no dimension, and a name whose rule named only such axes takes
+    its next rule. With no tensor axis, 'mlp' passes its tensor rule to
+    fsdp. A rule whose axes do not divide its dimension evenly cannot split
+    it, so that rule is set aside for this array: the name takes its next
+    rule, or none, and the mesh axis goes to the next dimension that names
+    it. For example, an odd vocabulary shards the embedding on its width and
+    keeps the table in the layout.
     """
     rules = axis_rules() if rules is None else rules
     mesh = jax.sharding.get_abstract_mesh() if mesh is None else mesh

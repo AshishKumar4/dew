@@ -551,7 +551,7 @@ def main(config: Config) -> dict:
     # Recompute each block's forward in the backward: without it the saved
     # activations of Qwen3-0.6B at 64 rows of 320 ids are 61.6 GiB, with it 3.4 GiB.
     policy = source.model.clone(remat=remat_policy("full"))
-    objective = GRPOObjective(policy, width - 1, pretrained=source.variables,
+    objective = GRPOObjective(policy, width - 1, variables=source.variables,
                               behavior_importance=2.0, epsilon_high=0.28)
     pushes: list[float] = []
     server, remote = rollout_server(config, source, sampling, width=width, pushes=pushes)

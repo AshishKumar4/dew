@@ -45,11 +45,12 @@ from jax.typing import DTypeLike
 
 from dew import records
 from dew._model_types import _QWEN35_VISION_TYPES
+from dew.interop.weights import checkpoint_array, translate_parameters
 from dew.nn.attention import LayerNorm, RMSNorm, scaled_dot_product_attention
 from dew.nn.conv import Conv
 from dew.nn.precision import at_least_fp32
 from dew.nn.rope import inverse_frequencies
-from dew.nn.text_encoders import MLP, CLIPEncoderLayer, ParamTree, checkpoint_array, checkpoint_leaf, insert
+from dew.nn.text_encoders import MLP, CLIPEncoderLayer
 from dew.objectives.base import Variables
 from dew.registry import from_record, projectors, towers
 
@@ -1312,16 +1313,6 @@ class DeepseekV41Projector(ProjectorBase):
                                           out_width=self.out_width)
 
 
-def _translate(hf_tensors: Mapping[str, np.ndarray], path_of, param_dtype: str) -> ParamTree:
-    params: ParamTree = {}
-    for name, tensor in hf_tensors.items():
-        path = path_of(name)
-        if path is not None:
-            storage = "float32" if path[0] == "constants" else param_dtype
-            insert(params, path, checkpoint_leaf(path, tensor, storage), name)
-    return params
-
-
 _SIGLIP_TENSORS = {
     "embeddings.patch_embedding.weight": ("patch_embedding", "kernel"),
     "embeddings.patch_embedding.bias": ("patch_embedding", "bias"),
@@ -1368,7 +1359,7 @@ def translate_siglip_vision_weights(
     hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
 ) -> Variables:
     """SigLIP vision parameters at the requested storage precision."""
-    return _translate(hf_tensors, siglip_vision_path, param_dtype)
+    return translate_parameters(hf_tensors, siglip_vision_path, param_dtype)
 
 
 _LLAMA4_VISION_TENSORS = {
@@ -1398,7 +1389,7 @@ def translate_llama4_vision_weights(
     hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
 ) -> Variables:
     """Llama 4 vision parameters at the requested storage precision."""
-    return _translate(hf_tensors, llama4_vision_path, param_dtype)
+    return translate_parameters(hf_tensors, llama4_vision_path, param_dtype)
 
 
 _PROJECTOR_PATHS: dict[str, dict[str, tuple[str, ...]]] = {
@@ -1460,7 +1451,7 @@ def translate_llama4_projector_weights(
     hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
 ) -> Variables:
     """Llama 4's outer projector map at the requested storage precision."""
-    return _translate(hf_tensors, lambda name: projector_weight_path("llama4", name), param_dtype)
+    return translate_parameters(hf_tensors, lambda name: projector_weight_path("llama4", name), param_dtype)
 
 
 def _vision_section(hf_config: Mapping[str, object]) -> Mapping[str, object]:
@@ -1654,7 +1645,7 @@ def translate_gemma4_vision_weights(
     hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
 ) -> Variables:
     """Gemma 4 parameters plus native FP32 frozen and clipping buffers."""
-    return _translate(hf_tensors, gemma4_vision_path, param_dtype)
+    return translate_parameters(hf_tensors, gemma4_vision_path, param_dtype)
 
 
 def translate_gemma4_projector_weights(
@@ -1667,7 +1658,7 @@ def translate_gemma4_projector_weights(
     """
     if set(hf_tensors) != set(_PROJECTOR_PATHS["gemma4"]):
         raise ValueError(f"unknown tensor names {sorted(hf_tensors)}")
-    return _translate(hf_tensors, lambda name: projector_weight_path("gemma4", name), param_dtype)
+    return translate_parameters(hf_tensors, lambda name: projector_weight_path("gemma4", name), param_dtype)
 
 
 def translate_gemma4_vision_config(hf_config: Mapping[str, object]) -> Mapping[str, object]:
@@ -1812,7 +1803,7 @@ def translate_qwen35_vision_weights(
     """
     rest = {name: tensor for name, tensor in hf_tensors.items()
             if name != "patch_embed.proj.weight"}
-    params = _translate(rest, qwen35_vision_path, param_dtype)
+    params = translate_parameters(rest, qwen35_vision_path, param_dtype)
     conv = checkpoint_array(hf_tensors["patch_embed.proj.weight"], param_dtype)
     params.setdefault("patch_embed", {})["kernel"] = np.ascontiguousarray(
         conv.transpose(1, 2, 3, 4, 0).reshape(-1, conv.shape[0]))
@@ -1823,7 +1814,7 @@ def translate_qwen35_projector_weights(
     hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
 ) -> Variables:
     """A Qwen 3.5 merger's tensors at the requested storage precision."""
-    return _translate(hf_tensors, lambda name: projector_weight_path("qwen3_5", name), param_dtype)
+    return translate_parameters(hf_tensors, lambda name: projector_weight_path("qwen3_5", name), param_dtype)
 
 
 def translate_qwen35_vision_config(hf_config: Mapping[str, object]) -> Mapping[str, object]:
@@ -1912,14 +1903,15 @@ def translate_deepseek_v41_vision_weights(
     hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
 ) -> Variables:
     """DeepSeek-V4.1 ViT parameters at the requested storage precision."""
-    return _translate(hf_tensors, deepseek_v41_vision_path, param_dtype)
+    return translate_parameters(hf_tensors, deepseek_v41_vision_path, param_dtype)
 
 
 def translate_deepseek_v41_projector_weights(
     hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
 ) -> Variables:
     """DeepSeek-V4.1's aligner and span vectors at the requested storage precision."""
-    return _translate(hf_tensors, lambda name: projector_weight_path("deepseek_v41", name), param_dtype)
+    return translate_parameters(hf_tensors, lambda name: projector_weight_path("deepseek_v41", name),
+                                 param_dtype)
 
 
 def translate_deepseek_v41_vision_config(hf_config: Mapping[str, object]) -> Mapping[str, object]:
@@ -2118,7 +2110,7 @@ def gemma3n_vision_path(hf_name: str) -> tuple[str, ...]:
 def translate_gemma3n_vision_weights(
     hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
 ) -> Mapping[str, object]:
-    return _translate(hf_tensors, gemma3n_vision_path, param_dtype)
+    return translate_parameters(hf_tensors, gemma3n_vision_path, param_dtype)
 
 
 def translate_gemma3n_projector_weights(
@@ -2128,7 +2120,7 @@ def translate_gemma3n_projector_weights(
     if set(hf_tensors) != set(paths):
         raise ValueError(f"vision embedder tensors differ: missing {sorted(set(paths) - set(hf_tensors))}, "
                          f"unknown {sorted(set(hf_tensors) - set(paths))}")
-    return _translate(hf_tensors, paths.__getitem__, param_dtype)
+    return translate_parameters(hf_tensors, paths.__getitem__, param_dtype)
 
 
 def _gemma3n_vision_record(

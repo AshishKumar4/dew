@@ -679,7 +679,7 @@ def make_block_run(directory, fixture="diffusion-gemma-workflow", moved=0.0, tok
 
     fixture = Path(__file__).resolve().parent / "fixtures/hf" / fixture
     bundle = Pretrained.load(str(fixture), dtype="float32", attention_impl="xla", max_seq_len=32)
-    objective = BlockDiffusionObjective(bundle.model, prompt_length=3, pretrained=bundle.variables,
+    objective = BlockDiffusionObjective(bundle.model, prompt_length=3, variables=bundle.variables,
                                         processor=RunProcessor(tokenizer_for(tokenizer)))
     state = Trainer(objective, optax.sgd(0.01), key=jax.random.PRNGKey(2)).initial_state()
     if moved:
@@ -705,7 +705,7 @@ def make_masked_run(directory):
     fixture = Path(__file__).resolve().parent / "fixtures/hf/llada-tiny"
     source = Pretrained.load(fixture, dtype="float32", attention_impl="xla")
     objective = MaskedDiffusionObjective(source.model, MDLM(mask_id=120)(), 8,
-                                         pretrained=source.variables, ema_decay=None,
+                                         variables=source.variables, ema_decay=None,
                                          processor=RunProcessor(ByteTokenizer()))
     state = Trainer(objective, optax.sgd(0.05), key=jax.random.PRNGKey(19)).initial_state()
     checkpoints = Checkpoints(str(directory))
@@ -737,6 +737,8 @@ def test_every_saved_text_kind_constructs_through_its_own_task_class(
 
 @pytest.mark.parametrize("kind", ["jepa", "unregistered"])
 def test_saved_non_generation_objectives_fail_at_the_front_door(tmp_path, kind):
+    """A run loads as the task its objective declares (`saved_task`): JEPA
+    declares none, and a kind no objective registers is unknown."""
     from dew.nn.backbones import CausalTransformer
     from dew.objectives.lm import LMObjective
 
@@ -746,13 +748,31 @@ def test_saved_non_generation_objectives_fail_at_the_front_door(tmp_path, kind):
     checkpoints = Checkpoints(str(tmp_path))
     checkpoints.save(0, state, None, artifact={"objective": kind})
     checkpoints.wait()
-    with pytest.raises(TypeError, match="no saved generation task") as refusal:
+    refused = (TypeError, r"'jepa' objective \(JepaObjective\) loads as no task") if kind == "jepa" else (
+        KeyError, "no objective named 'unregistered'; known: .*diffusion")
+    with pytest.raises(refused[0], match=refused[1]):
         dew.pipeline(str(tmp_path))
-    named = str(refusal.value)
-    assert kind in named
-    for supported in ("diffusion", "lm", "dpo", "grpo", "ppo", "block_diffusion",
-                      "masked_diffusion"):
-        assert supported in named
+
+
+def test_every_objective_that_publishes_a_task_declares_it():
+    """Each registered objective's `saved_task` is the task its own
+    `pipeline` returns: subclasses inherit their parent's, and an objective
+    with no saved task declares None."""
+    from dew.inference import tasks
+    from dew.objectives.diffusion import objective as diffusion
+    from dew.registry import objectives
+    from dew.sampling.pipelines import TextToImage
+
+    declared = {kind: objectives[kind].saved_task for kind in (
+        "diffusion", "ladd", "rcm", "mean_flow", "shortcut", "guidance_distillation", "flow_grpo", "lm",
+        "dpo", "grpo", "ppo", "block_diffusion", "masked_diffusion", "jepa", "distillation")}
+    assert declared == {
+        "diffusion": TextToImage, "ladd": TextToImage, "rcm": TextToImage, "mean_flow": TextToImage,
+        "shortcut": TextToImage, "guidance_distillation": TextToImage, "flow_grpo": TextToImage,
+        "lm": tasks.TextGeneration, "dpo": tasks.TextGeneration, "grpo": tasks.TextGeneration,
+        "ppo": tasks.TextGeneration, "block_diffusion": tasks.BlockGeneration,
+        "masked_diffusion": tasks.MaskedGeneration, "jepa": None, "distillation": None}
+    assert diffusion.DiffusionObjective.saved_task is TextToImage
 
 
 def test_saved_sampling_policy_survives_a_disabled_preview_budget(tmp_path):

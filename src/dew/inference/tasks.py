@@ -31,7 +31,7 @@ from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.inputs import Media, ModelInputs, mesh_of, request_key
-from dew.objectives.base import Variables
+from dew.objectives.base import Variables, thaw
 from dew.records import integer, record as named_fields, text as named
 from dew.sampling import decoding
 from dew.sampling.decoding import LogitsTransform, Stopping
@@ -223,12 +223,19 @@ def _sized(model: nn.Module, capacity: int | None) -> nn.Module:
     from (`dew.nn.attention.open_kv_cache`), so a per-request capacity is a
     model per capacity. The clones are kept because the model is a static
     argument of the compiled generation: one object per capacity is one
-    compile per capacity rather than one per call.
+    compile per capacity rather than one per call. A wrapper that declares
+    its language model's size (`MultimodalTransformer`) has that model
+    sized: read only as the wrapper's own field, Qwen3.5-0.8B served at 384
+    slots held caches of 8192.
     """
-    if capacity is None or not any(field.name == "max_seq_len"
-                                   for field in dataclasses.fields(model)):
+    if capacity is None:
         return model
-    return model.clone(max_seq_len=capacity)
+    fields = {field.name for field in dataclasses.fields(model)}
+    if "max_seq_len" in fields:
+        return model.clone(max_seq_len=capacity)
+    if "language_model" in fields:
+        return model.clone(language_model=_sized(model.language_model, capacity))
+    return model
 
 
 def _requested(generated: Generation, budget: int, padding: int) -> Generation:
@@ -336,10 +343,11 @@ def _freeze_variables(task: TextGeneration | BlockGeneration | MaskedGeneration,
                       variables: Variables) -> None:
     """Freeze `variables` onto `task`, whose own `__post_init__` cannot assign.
 
-    A frozen dataclass refuses attribute assignment, so the field is written
-    through `object.__setattr__`.
+    A tree split for training, an adapter's or `dew.objectives.base.freeze`'s,
+    is read whole. A frozen dataclass refuses attribute assignment, so the
+    field is written through `object.__setattr__`.
     """
-    object.__setattr__(task, "variables", freeze(dict(variables)))
+    object.__setattr__(task, "variables", freeze(dict(thaw(variables))))
 
 
 def _canvas_text(processor: Processor | None, generation: CanvasGeneration,
@@ -473,7 +481,6 @@ class TextGeneration:
         become the task's defaults.
         """
         from dew.checkpoints import Checkpoints
-        from dew.objectives.base import thaw
         from dew.registry import objectives
 
         record, model_config, processor = _saved_run(directory, dtype, step)
@@ -483,10 +490,10 @@ class TextGeneration:
         variables = Checkpoints(directory).variables( ema=False if objective_type._ema_is_reference else ema,
                                       step=step, mesh=mesh, layout=layout, param_dtype=param_dtype)
         if kind == "ppo":
-            from dew.objectives.rl.ppo import _part
-            variables = _part(variables, "policy")
+            from dew.objectives.base import part
+            variables = part(variables, "policy")
         model = model_config.build()
-        return cls(model, thaw(variables), processor, sampling=_saved_sampling(record, budget),
+        return cls(model, variables, processor, sampling=_saved_sampling(record, budget),
                    max_new_tokens=budget if budget else None)
 
     @classmethod

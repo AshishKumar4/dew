@@ -1,4 +1,4 @@
-"""Tier 2 of loading: an unregistered model_type through the verified Llama convention.
+"""Tier 2 of loading: an unregistered model_type through a registered family's verified convention.
 
 The offline cases write a tiny random checkpoint of a transformers class Dew
 registers no family for and load it with `Pretrained.load`. CWM is the
@@ -14,7 +14,10 @@ the top-200 census computes the Llama convention, so each census repo below
 is refused, for its own reason, before its weights download. The one real
 repo that loads is a random-weight CWM (Meta's Code World Model is the Llama
 block with per-layer sliding windows); its released 32B checkpoint passes the
-same probe from its config, at 65 GB beyond what this suite downloads.
+same probe from its config, at 65 GB beyond what this suite downloads. Over
+every registered family, `tools/hf_coverage.py` on the 400 most downloaded
+text-generation repos (2026-10-05) finds one more type that loads:
+GLM-4.7-Flash, as kimi_k2, which the offline GLM_FLASH case checks.
 Measured on CPU against transformers 5.16.1 in fp32, over two rows of 64
 random ids:
 
@@ -34,10 +37,17 @@ import jax
 import numpy as np
 import pytest
 import torch
+from safetensors.numpy import load_file
 from transformers import AutoConfig, AutoModelForCausalLM
 
 from dew.interop import Pretrained
-from dew.interop.verify import VerifiedMappingWarning, probe_ids, reference_logits, scatter_weights
+from dew.interop.verify import (
+    VerifiedMappingWarning,
+    probe_ids,
+    reference_logits,
+    scatter_weights,
+    verify_mapping,
+)
 
 TIER2 = "tier 2: verified mapping"
 TORCHAX = 'fallback="torchax"'
@@ -53,25 +63,27 @@ REFUSED = {
     "smollm3": (
         "HuggingFaceTB/SmolLM3-3B",
         "a07cc9a04f16550a088caea529712d1d335b0ac1",
-        r"SmolLM3ForCausalLM and the convention disagree .* \['no_rope_layer_interval', 'no_rope_layers'\]",
+        r"SmolLM3ForCausalLM and llama disagree .* \['no_rope_layer_interval', 'no_rope_layers'\]",
     ),
     # Embedding, residual, attention and logit multipliers.
     "granite": (
         "ibm-granite/granite-4.1-3b",
         "c0650403e44e78ec0262dab1c90914c65b196c4e",
-        r"GraniteForCausalLM and the convention disagree .* 'residual_multiplier'",
+        r"GraniteForCausalLM and llama disagree .* 'residual_multiplier'",
     ),
     # Llama's names and fields, a different rotary: the modeling alone differs.
     "ernie4_5": (
         "baidu/ERNIE-4.5-0.3B-PT",
         "b565cf6caebdb7a1eadf00100857b1ed5e044f12",
-        r"Ernie4_5ForCausalLM and the convention disagree",
+        r"Ernie4_5ForCausalLM and llama disagree",
     ),
-    # Phi-3's longrope and fused projections.
+    # Phi-3's longrope and fused projections. Only OPT's reader, which reads
+    # no rotary field, takes the config, and the probe cannot shrink
+    # longrope's per-frequency factors to its head width.
     "phi3": (
         "microsoft/Phi-4-mini-instruct",
         "cfbefacb99257ffa30c83adab238a50856ac3083",
-        r"rope_type 'longrope'",
+        r"(?s)builds no causal LM from its shrunken config .*short_factor",
     ),
     # OLMo 2's q/k norms over the whole projection and its post-norms.
     "olmo2": (
@@ -83,8 +95,12 @@ REFUSED = {
 
 
 def write_tiny(directory, model_type, **fields):
-    """Save a random tiny checkpoint of transformers' class for `model_type`; return its logits."""
-    config = AutoConfig.for_model(model_type, **{**TINY, **fields})
+    """Save a random tiny checkpoint of transformers' class for `model_type`; return its logits.
+
+    A field given as None is left out of the config, as a released config
+    that does not state it."""
+    stated = {key: value for key, value in {**TINY, **fields}.items() if value is not None}
+    config = AutoConfig.for_model(model_type, **stated)
     model = AutoModelForCausalLM.from_config(config, dtype=torch.float32)
     scatter_weights(model)
     model.save_pretrained(directory)
@@ -101,6 +117,51 @@ def test_a_llama_convention_type_loads_with_one_tier2_warning(tmp_path):
     assert "transformers 5.16.1's CwmForCausalLM" in str(caught[0].message)
     actual = np.asarray(loaded.model.apply(loaded.variables, ids))
     np.testing.assert_allclose(actual, expected, atol=1e-4, rtol=0)
+
+
+# GLM-4.7-Flash is DeepSeek V3's MLA and routed experts under its own name;
+# its released config states as many key/value heads as query heads, and no
+# head_dim: the rope is qk_rope_head_dim wide.
+GLM_FLASH = {"num_key_value_heads": 4, "n_routed_experts": 4, "num_experts_per_tok": 2, "n_shared_experts": 1,
+             "moe_intermediate_size": 64, "kv_lora_rank": 16, "q_lora_rank": 32, "qk_nope_head_dim": 16,
+             "qk_rope_head_dim": 8, "v_head_dim": 16, "first_k_dense_replace": 1, "n_group": 1,
+             "topk_group": 1, "head_dim": None}
+
+
+@pytest.mark.parametrize("model_type, family, fields", [
+    # Seed-OSS is Qwen2's block, biases on q/k/v and none on o_proj.
+    ("seed_oss", "qwen2", {"attention_bias": True, "attention_out_bias": False}),
+    ("glm4_moe_lite", "kimi_k2", GLM_FLASH),
+])
+def test_a_type_that_follows_another_registered_family_loads_as_that_family(tmp_path, model_type, family,
+                                                                            fields):
+    """Tier 2 tries every registered causal family, not the Llama convention
+    alone: the first whose reading takes the config and whose model computes
+    transformers' logits is the mapping, and the warning names it."""
+    ids, expected = write_tiny(tmp_path, model_type, **fields)
+    with pytest.warns(VerifiedMappingWarning) as caught:
+        loaded = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
+    assert [str(entry.message).startswith(TIER2) for entry in caught] == [True]
+    assert f"loads as the registered {family!r} family" in str(caught[0].message)
+    actual = np.asarray(loaded.model.apply(loaded.variables, ids))
+    np.testing.assert_allclose(actual, expected, atol=1e-4, rtol=0)
+
+
+def test_a_refusal_names_every_family_it_was_tried_as(tmp_path):
+    write_tiny(tmp_path, "granite", embedding_multiplier=12.0, residual_multiplier=0.22,
+               attention_multiplier=0.015625, logits_scaling=8.0)
+    with pytest.raises(ValueError, match="llama: ") as refused:
+        Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
+    assert "qwen2: " in str(refused.value) and "mistral: " in str(refused.value)
+
+
+def test_a_config_without_the_shared_size_names_is_refused_by_name():
+    """OPT's reader defaults every size, so it takes BLOOM's config, which
+    names its sizes n_embed and n_head; the probe cannot shrink it."""
+    bloom = {"model_type": "bloom", "n_embed": 64, "n_head": 4, "n_layer": 2, "vocab_size": 256}
+    with pytest.raises(ValueError, match=r"reads as opt's but states no 'num_attention_heads'") as refused:
+        verify_mapping(bloom)
+    assert TORCHAX in str(refused.value)
 
 
 @pytest.mark.skipif(jax.default_backend() != "gpu", reason="TF32 matmuls exist on a GPU alone")
@@ -125,13 +186,17 @@ def test_the_probe_holds_its_bound_at_a_gpus_default_tf32_precision(tmp_path):
     assert TIER2 in run.stderr
 
 
-def test_a_verified_load_saves_the_source_config_and_reloads(tmp_path):
+@pytest.mark.parametrize("model_type, fields", [("cwm", {"sliding_window": 4}), ("glm4_moe_lite", GLM_FLASH)])
+def test_a_verified_load_saves_the_source_config_and_reloads(tmp_path, model_type, fields):
+    """A verified type is not its family: it saves under its own config and
+    tensor names, which load as the same type again."""
     source, destination = tmp_path / "source", tmp_path / "export"
-    ids, _ = write_tiny(source, "cwm", sliding_window=4)
+    ids, _ = write_tiny(source, model_type, **fields)
     with pytest.warns(VerifiedMappingWarning):
         loaded = Pretrained.load(source, dtype="float32", attention_impl="reference")
     loaded.save(destination)
     assert json.loads((destination / "config.json").read_text()) == loaded.config
+    assert set(load_file(destination / "model.safetensors")) == set(load_file(source / "model.safetensors"))
     with pytest.warns(VerifiedMappingWarning):
         restored = Pretrained.load(destination, dtype="float32", attention_impl="reference")
     np.testing.assert_array_equal(np.asarray(restored.model.apply(restored.variables, ids)),

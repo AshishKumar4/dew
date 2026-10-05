@@ -86,7 +86,7 @@ def test_the_objective_reports_the_loaded_tree_and_returns_it_from_init():
     holding nothing binds nothing and draws the model's tree from the key."""
     model, variables = loaded("llada-tiny")
     holding = MaskedDiffusionObjective(model, MDLM(mask_id=120)(), seq_len=12,
-                                       ema_decay=None, pretrained=variables)
+                                       ema_decay=None, variables=variables)
     fresh = MaskedDiffusionObjective(model, MDLM(mask_id=120)(), seq_len=12, ema_decay=None)
     tree_bytes = sum(int(np.asarray(leaf).nbytes) for leaf in jax.tree.leaves(variables))
 
@@ -113,7 +113,7 @@ def test_a_tree_that_is_not_the_variables_dict_is_refused():
     leaves sit one level too high."""
     model, variables = loaded("llada-tiny")
     objective = MaskedDiffusionObjective(model, MDLM(mask_id=120)(), seq_len=12,
-                                         ema_decay=None, pretrained=variables["params"])
+                                         ema_decay=None, variables=variables["params"])
 
     with pytest.raises(ValueError, match="params"):
         objective.init(jax.random.key(0))
@@ -125,7 +125,7 @@ def test_the_trainer_builds_its_state_from_the_held_checkpoint():
     Dream's weights instead of a fresh draw."""
     model, variables = loaded("dream-tiny")
     objective = MaskedDiffusionObjective(model, MDLM(mask_id=120)(), seq_len=12,
-                                         ema_decay=None, pretrained=variables)
+                                         ema_decay=None, variables=variables)
 
     state = Trainer(objective, optax.sgd(1e-2), key=jax.random.key(0)).initial_state()
 
@@ -222,7 +222,7 @@ def test_masked_training_resume_publish_and_run_pipeline(masked_source, tmp_path
     source, prompt = masked_source
     model = source.model.clone(dtype=jnp.bfloat16)
     objective = MaskedDiffusionObjective(model, MDLM(mask_id=120)(), 8,
-        pretrained=source.variables, ema_decay=0.5, processor=RunProcessor(ByteTokenizer()))
+        variables=source.variables, ema_decay=0.5, processor=RunProcessor(ByteTokenizer()))
     rows = jax.device_count()
     batch = {"text": np.full((rows, 8), 7, np.int32)}
     stream = grain.MapDataset.source([batch]).repeat().to_iter_dataset()
@@ -338,7 +338,7 @@ def test_masked_task_refuses_media_and_non_scalar_logical_positions(masked_sourc
 def test_saved_masked_run_refuses_invalid_sample_budget(masked_source, tmp_path):
     source, _ = masked_source
     objective = MaskedDiffusionObjective(source.model, MDLM(mask_id=120)(), 8,
-                                         pretrained=source.variables, ema_decay=None)
+                                         variables=source.variables, ema_decay=None)
     state = Trainer(objective, optax.sgd(0.05), key=jax.random.key(19)).initial_state()
     for index, budget in enumerate((-1, True, "8")):
         checkpoints = Checkpoints(str(tmp_path / str(index)))

@@ -10,21 +10,12 @@ from typing import Literal
 
 import jax.numpy as jnp
 from flax import linen as nn
-from flax.typing import Dtype, PrecisionLike
 
 from dew.registry import models
 
 from ..attention import LayerNorm
 from ..conv import Conv
-from ..dit import (
-    ROPE_THETA,
-    ConditioningEmbed,
-    ModulatedBlock,
-    PatchEmbedding,
-    PatchSequenceOutput,
-    RematChoice,
-    remat_block,
-)
+from ..dit import ROPE_THETA, ModulatedBlock, PatchEmbedding, RematChoice, _TransformerOptions, remat_block
 from ..precision import at_least_fp32
 from ..rope import rotary_freqs
 from ..scan_orders import hilbert_patchify, hilbert_unpatchify, unpatchify
@@ -32,45 +23,43 @@ from .unet_condition import sinusoidal_time
 
 
 @models("uvit")
-class UViT(nn.Module):
-    """Denoise patches as U-ViT does (Bao et al. 2023), baofff/U-ViT's
-    libs/uvit_t2i.py.
+class UViT(_TransformerOptions):
+    """Denoises patches as U-ViT does, following baofff/U-ViT's libs/uvit_t2i.py.
 
-    A time token and, given text, one token per text state lead the patches:
-    [time, text..., patches]. The time token is the sinusoidal embedding
-    [cos, sin] of the time times `time_scale` (U-ViT reads its timesteps on a
-    0 to 999 scale, Dew's processes hand a time in [0, 1]), through a
-    d -> 4d -> d SiLU MLP when `mlp_time_embed`; the text states are projected
-    by a dense layer; the patches are a `patch_size` convolution. A learned
-    position table covers every token: one row for the time, `text_tokens`
-    for the text and the patches of an `image_size` image, used from the
-    first row of each part. Every block is a plain pre-norm transformer
-    block, x + attention(LN(x)) and then x + MLP(LN(x)): q, k and v without
-    bias, the output projection with one, the MLP `mlp_ratio` wide on exact
-    GELU. num_layers / 2 blocks go down, one sits in the middle and
-    num_layers / 2 go up, each up block first projecting [x, skip] back to
-    the width. A final LN and dense layer read the patches, which are
-    unpatchified and, with `conv`, refined by a 3x3 convolution. The text
-    attends unmasked, padding included, as U-ViT's CLIP states do. A Hilbert
-    `scan_order` sequences the patches along the curve, each projected by a
-    dense layer, and its position rows follow the sequence.
+    U-ViT is from Bao et al. (2023). A time token and, when there is text, one
+    token per text state come before the patches: [time, text..., patches].
+
+    - The time token is the sinusoidal embedding [cos, sin] of the time
+      multiplied by `time_scale`, passed through a d -> 4d -> d SiLU MLP when
+      `mlp_time_embed` is set. U-ViT reads timesteps on a 0 to 999 scale,
+      while Dew's processes give a time in [0, 1].
+    - A dense layer projects the text states, and a `patch_size` convolution
+      embeds the patches.
+    - A learned position table covers every token: one row for the time,
+      `text_tokens` rows for the text, and rows for the patches of an
+      `image_size` image, each part using its rows from the first.
+
+    Every block is a plain pre-norm transformer block, x + attention(LN(x))
+    then x + MLP(LN(x)), with q, k and v projections without bias, an output
+    projection with bias, and an MLP `mlp_ratio` wide on exact GELU.
+    num_layers / 2 blocks go down, one sits in the middle and num_layers / 2
+    go up; each up block first projects [x, skip] back to the width. A final
+    LN and dense layer read the patches, which are unpatchified and, with
+    `conv`, refined by a 3x3 convolution. The text attends unmasked, padding
+    included, as U-ViT's CLIP states do. A Hilbert `scan_order` orders the
+    patches along the curve, each projected by a dense layer, and the
+    position rows follow that order.
     """
     output_channels: int = 3
     patch_size: int = 16
     emb_features: int = 768
     num_layers: int = 12
     num_heads: int = 12
-    mlp_ratio: int = 4
     mlp_time_embed: bool = False
     conv: bool = True
     time_scale: float = 999.0
     text_tokens: int = 77
     image_size: int = 512
-    force_fp32_for_softmax: bool = True
-    attention_impl: str = "auto"  # an AttentionImpl
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-    norm_epsilon: float = 1e-5
     scan_order: Literal["raster", "hilbert"] = "raster"
 
     def setup(self):
@@ -91,9 +80,7 @@ class UViT(nn.Module):
                              dense(self.emb_features, name="time_embed_2")]
         self.context_embed = dense(self.emb_features, name="context_embed")
         block = partial(ModulatedBlock, features=self.emb_features, num_heads=self.num_heads, modulated=False,
-                        mlp_ratio=self.mlp_ratio, qkv_bias=False, gelu_approximate=False, dtype=self.dtype,
-                        precision=self.precision, force_fp32_for_softmax=self.force_fp32_for_softmax,
-                        norm_epsilon=self.norm_epsilon, attention_impl=self.attention_impl)
+                        qkv_bias=False, gelu_approximate=False, **self._block_options())
         half = self.num_layers // 2
         self.in_blocks = [block(name=f"in_blocks_{i}") for i in range(half)]
         self.mid_block = block(name="mid_block")
@@ -156,7 +143,7 @@ class UViT(nn.Module):
 
 
 @models("simple_udit")
-class SimpleUDiT(nn.Module):
+class SimpleUDiT(_TransformerOptions):
     """A U-shaped DiT: `SimpleDiT`'s adaLN-Zero blocks with the first half's
     outputs skipping into the second half through a dense layer over the
     concatenation. Position comes from RoPE over the sequence index, so a
@@ -172,14 +159,8 @@ class SimpleUDiT(nn.Module):
     emb_features: int = 768
     num_layers: int = 12
     num_heads: int = 12
-    mlp_ratio: int = 4
     dropout_rate: float = 0.0
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-    force_fp32_for_softmax: bool = True
-    attention_impl: str = "auto"  # an AttentionImpl
     remat: RematChoice = False
-    norm_epsilon: float = 1e-5
     scan_order: Literal["raster", "hilbert"] = "raster"
     adaln_silu: bool = True
     text_pooling: Literal["real", "all"] = "real"
@@ -202,26 +183,15 @@ class SimpleUDiT(nn.Module):
                 precision=self.precision,
                 name="hilbert_projection"
             )
-        self.conditioning = ConditioningEmbed(
-            emb_features=self.emb_features,
-            mlp_ratio=self.mlp_ratio,
-            dtype=self.dtype,
-            precision=self.precision,
-            text_pooling=self.text_pooling,
-        )
+        self.conditioning = self._conditioning(self.emb_features, text_pooling=self.text_pooling)
 
         block = partial(
             remat_block(ModulatedBlock, self.remat),
             features=self.emb_features,
             num_heads=self.num_heads,
-            mlp_ratio=self.mlp_ratio,
             dropout_rate=self.dropout_rate,
-            dtype=self.dtype,
-            precision=self.precision,
-            force_fp32_for_softmax=self.force_fp32_for_softmax,
-            attention_impl=self.attention_impl,
-            norm_epsilon=self.norm_epsilon,
             adaln_silu=self.adaln_silu,
+            **self._block_options(),
         )
         self.down_blocks = [block(name=f"down_block_{i}") for i in range(half_layers)]
         self.mid_block = block(name="mid_block")
@@ -235,13 +205,7 @@ class SimpleUDiT(nn.Module):
         ]
         self.up_blocks = [block(name=f"up_block_{i}") for i in range(half_layers)]
 
-        self.output = PatchSequenceOutput(
-            patch_size=self.patch_size,
-            output_channels=self.output_channels,
-            norm_epsilon=self.norm_epsilon,
-            dtype=self.dtype,
-            precision=self.precision,
-        )
+        self.output = self._output(self.patch_size, self.output_channels)
 
     def __call__(self, x, temb, textcontext=None, train: bool = False):
         _, H, W, _ = x.shape

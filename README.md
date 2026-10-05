@@ -14,13 +14,13 @@ Model training with JAX and Flax
 [Documentation](docs/index.md) · [Installation](#installation) · [Examples](examples/) · [API reference](docs/reference/core-api.md)
 </div>
 
-Dew is a framework for training language models, image and video diffusion models, and JEPA encoders in JAX. It provides builtin definitions for common models and training objectives, with a shared trainer for optimization, device sharding, evaluation, and checkpoints.
+Dew is a JAX framework for training language models, image and video diffusion models, and JEPA encoders. It comes with common model architectures and training objectives, and one trainer handles optimization, sharding across devices, evaluation and checkpoints for all of them.
 
-This framework was built as a fork of my previous pure diffusion focused framework I have been building and refining throughout the years, with which I was able to train stable diffusion like text-to-image models from scratch on 400M+ text-image pairs on 128 TPU v4 chips [Flaxdiff](https://github.com/AshishKumar4/FlaxDiff)
+Dew started as a fork of [FlaxDiff](https://github.com/AshishKumar4/FlaxDiff), the diffusion-only framework I have been building and refining for years. With FlaxDiff I trained Stable Diffusion-style text-to-image models from scratch on more than 400M text-image pairs, on 128 TPU v4 chips.
 
-Use the supplied architectures, load a supported Hugging Face checkpoint, or train your own Flax model. Model variables and training state remain JAX PyTrees; optimizers are Optax transformations, data loading uses Grain, and checkpoints use Orbax.
+You can use the built-in architectures, load a supported Hugging Face checkpoint, or train your own Flax model. Variables and training state are ordinary JAX PyTrees, optimizers are Optax transformations, data loading uses Grain, and checkpoints use Orbax.
 
-APIs and checkpoint formats can change before 1.0. [Models](#models) lists supported configurations and workflow limits.
+Dew is not at 1.0 yet, so APIs and checkpoint formats can still change. [Models](#models) lists what is supported and the known limits.
 
 ## Contents
 
@@ -38,7 +38,7 @@ APIs and checkpoint formats can change before 1.0. [Models](#models) lists suppo
 
 ## Getting started
 
-Train a diffusion transformer on Oxford Flowers at 64×64, then generate a sample grid on an NVIDIA GPU.
+This section trains a diffusion transformer on Oxford Flowers at 64×64 on an NVIDIA GPU, then samples a grid of images.
 
 Install Dew and CUDA JAX in a virtual environment:
 
@@ -50,7 +50,7 @@ source .venv/bin/activate
 uv pip install -e ".[tfds,cuda12]"
 ```
 
-Prepare the dataset once in a separate environment. TensorFlow is needed for this TFDS builder, but not for reading the prepared data during training. TFDS 4.9.10 imports `importlib_resources` while it prepares a dataset but declares it only for Python before 3.9, so the install names it.
+Prepare the dataset once, in a separate environment. The TFDS builder needs TensorFlow, but training reads the prepared files without it. TFDS 4.9.10 imports `importlib_resources` while it prepares a dataset but only declares that dependency for Python before 3.9, so the command installs it explicitly.
 
 ```bash
 uv venv --python 3.13 .venv-data
@@ -69,7 +69,7 @@ print(builder.data_dir)
 PY
 ```
 
-An abridged [`examples/train_flowers.py`](examples/train_flowers.py); the file adds a command-line configuration and the sampling step:
+Here is an abridged [`examples/train_flowers.py`](examples/train_flowers.py). The full file adds command-line options and the sampling step:
 
 ```python
 from pathlib import Path
@@ -121,7 +121,7 @@ if __name__ == "__main__":
     state = train()
 ```
 
-The `__main__` guard allows Grain to start its data-loading workers. `Field` describes one image; the dataset supplies batches of 16. The objective adds noise and constructs the denoising targets. The trainer runs optimization and checkpoints; `state.averaged` contains the EMA weights used for sampling.
+The `__main__` guard lets Grain start its data-loading worker processes. `Field` describes one image, and the dataset yields batches of 16. The objective adds noise and builds the denoising targets. The trainer runs the optimizer and writes checkpoints, and `state.averaged` holds the EMA weights you sample from.
 
 Run the full script. It also saves a sample grid to `runs/flowers64/samples.png`:
 
@@ -133,7 +133,7 @@ CUDA_VISIBLE_DEVICES=0 JAX_PLATFORMS=cuda python examples/train_flowers.py \
 
 Use `--steps 20` for a short run, or increase `--steps` to train longer.
 
-[`examples/train_diffusion.py`](examples/train_diffusion.py) adds pretrained CLIP text conditioning, and [`examples/train_flowers_tpu.py`](examples/train_flowers_tpu.py) runs the same job across a TPU slice and scores what it trained. For an offline run without a dataset download, [`examples/readme_demo.py`](examples/readme_demo.py) demonstrates language modeling, checkpoint continuation, DPO, and flow matching.
+[`examples/train_diffusion.py`](examples/train_diffusion.py) adds pretrained CLIP text conditioning, and [`examples/train_flowers_tpu.py`](examples/train_flowers_tpu.py) runs the same job across a TPU slice and scores the result. For an offline run with no dataset download, [`examples/readme_demo.py`](examples/readme_demo.py) covers language modeling, resuming from a checkpoint, DPO and flow matching.
 
 ### Change the training setup
 
@@ -179,12 +179,12 @@ images = sample(
 
 Set `ema_decay=None` to train without an averaged copy, then sample with `state.variables`.
 
-`SimpleDiT(dtype=jnp.bfloat16)` sets the computation dtype; master weights and
-optimizer state stay fp32, so the optimizer still accumulates in full
-precision.
+`SimpleDiT(dtype=jnp.bfloat16)` sets the dtype the model computes in. The
+master weights and optimizer state stay in fp32, so updates still accumulate in
+full precision.
 
 For int8 quantization-aware training, install the `quantization` extra
-(`pip install "dewml[quantization]"`, which brings Qwix) and wrap the model before you construct the objective:
+(`pip install "dewml[quantization]"`, which installs Qwix) and wrap the model before you construct the objective:
 
 ```python
 from dew.training import Quantization
@@ -192,11 +192,11 @@ from dew.training import Quantization
 model = Quantization(dtype="int8", patterns=(".*dit_block_.*",)).apply(model)
 ```
 
-This selects the DiT transformer blocks for int8 quantization and leaves the
-patch-embedding convolution in its configured floating-point dtype. Master
-weights remain fp32. Change `patterns` to select other module paths.
+The pattern selects the DiT's transformer blocks for int8 and leaves the
+patch-embedding convolution in its floating-point dtype. Master weights stay in
+fp32. Change `patterns` to quantize other modules.
 
-Build a model from its class, `from dew.nn.backbones import SimpleDiT, CausalTransformer`. A run record names the class by its registered name instead (`simple_dit`), and `dew.registry.models` maps that name back to the class when a recipe rebuilds the run.
+In code, you build a model from its class (`from dew.nn.backbones import SimpleDiT, CausalTransformer`). A saved run records the class by its registered name, such as `simple_dit`, and `dew.registry.models` maps that name back to the class when a recipe rebuilds the run.
 
 ## Features
 
@@ -209,17 +209,24 @@ Build a model from its class, `from dew.nn.backbones import SimpleDiT, CausalTra
 | Interoperability | Hugging Face configuration and weight translation for the supported families, safetensors export, CLIP and T5 conditioning, and VAE components |
 | Evaluation | Perplexity, FID, CLIP score, PSNR, SSIM, representation diagnostics, generated previews, and Weights & Biases tracking |
 
-The DPO and GRPO objectives run on the same trainer as pretraining. `dew.rl` holds PPO's advantage estimators and loss terms as separate functions, so you can build your own policy loop from them.
+DPO and GRPO train with the same `Trainer` as pretraining. `dew.rl` has PPO's advantage estimators and loss terms as separate functions, so you can build your own policy loop from them.
 
-`attention_impl` selects the attention kernel: `"reference"`, `"xla"`, `"cudnn"`, `"tpu"` (Pallas splash attention), or `"auto"`. With `"auto"`, each trace takes the reference path when the call asks for arithmetic no fused kernel performs (a matmul precision above default, a softmax outside fp32, or a compute dtype other than the inputs'), has float64 inputs, or runs bf16 on a GPU older than sm80, then picks cuDNN on a supported GPU when the call has no attention sinks, splash attention on a TPU for a call it qualifies (lengths it can tile of at least 512 tokens, a mask it can describe, no additive bias and whole sequences at the kernel), and XLA everywhere else. The choice never changes the parameter tree, so a checkpoint trained with one kernel loads with any other.
+`attention_impl` selects the attention kernel: `"reference"`, `"xla"`, `"cudnn"`, `"tpu"` (Pallas splash attention) or `"auto"`. With `"auto"`, Dew picks a kernel each time it traces an attention call, in this order:
+
+1. The reference path, if the call asks for arithmetic that no fused kernel does (a matmul precision above default, a softmax outside fp32, or a compute dtype different from the inputs'), has float64 inputs, or runs bf16 on a GPU older than sm80.
+2. cuDNN, on a supported GPU, if the call has no attention sinks.
+3. Splash attention, on a TPU, if the call qualifies: lengths of at least 512 tokens that it can tile, a mask it can describe, no additive bias, and whole sequences at the kernel.
+4. XLA otherwise.
+
+The kernel never changes the parameter tree, so a checkpoint trained with one kernel loads with any other.
 
 ## Models
 
 [Supported models](https://dewml.dev/reference/models/) lists every checkpoint
-family `Pretrained.load` reads, by the `model_type` in its `config.json`, and
-every architecture Dew trains from scratch. The site generates the
-page from Dew's registries when it builds. The notes below cover their
-training, inference and export workflows.
+family `Pretrained.load` can read, by the `model_type` in its `config.json`,
+and every architecture Dew can train from scratch. The site builds that page
+from Dew's registries. The notes below cover training, inference and export
+for each group.
 
 ### Text decoders
 
@@ -229,109 +236,114 @@ training, inference and export workflows.
 `Pretrained.save` writes `config.json`, `model.safetensors` and
 `generation_config.json` back in the Hugging Face layout.
 
-`dtype` selects computation; `param_dtype` independently selects parameter
-storage. `Pretrained.load` keeps FP32 parameters by default. Pass
-`param_dtype="bfloat16"` to reduce weight storage without changing the
-compute dtype. Non-parameter state retains its declared precision.
+`dtype` sets the compute dtype and `param_dtype` sets the dtype parameters
+are stored in. By default `Pretrained.load` keeps parameters in FP32. Pass
+`param_dtype="bfloat16"` to halve weight memory without changing the compute
+dtype. State that is not a parameter keeps its declared precision.
 
-Kimi K2 keeps its own model type, vocabulary, RoPE settings, and routing widths
-when exported. Small fixtures cover loading, a `Trainer` update, export, and
-reference reload. Their [source record](tests/fixtures/hf/kimi-k2-tiny/source.json)
-pins the released configuration. Kimi K2.5 nests the same decoder in a vision
-wrapper: Dew loads and trains the text half, and keeps the tower and projector
-tensors to write them back byte for byte. It runs no vision computation.
+When exported, Kimi K2 keeps its own model type, vocabulary, RoPE settings and
+routing widths. Small fixtures test loading, a `Trainer` update, export, and
+reloading in the reference implementation; their
+[source record](tests/fixtures/hf/kimi-k2-tiny/source.json) pins the released
+configuration. Kimi K2.5 wraps the same decoder in a vision model. Dew loads and
+trains the text decoder and writes the vision tower and projector tensors back
+byte for byte, but it does not run the vision part.
 
-Qwen3-Next, GLM-5.3 and GLM-5.3-Flash load from tiny fixtures of the released
-configurations with parity against their transformers classes, including the
-prediction layer, and a `Trainer` update exports back in the source layout.
-Mamba 2 reads the Hugging Face port (`Mamba2ForCausalLM`) and the original
+For Qwen3-Next, GLM-5.3 and GLM-5.3-Flash, tiny fixtures built from the released
+configurations match their transformers classes, including the prediction
+layer, and export back in the source layout after a `Trainer` update. Dew reads
+Mamba 2 from both the Hugging Face port (`Mamba2ForCausalLM`) and the original
 `mamba_ssm` checkpoints such as `state-spaces/mamba2-130m`, and saves in the
-port's layout. Exporting a decoder whose layers mix sliding and full attention
-on Llama's block writes `ministral`, which transformers reads.
+port's layout. A decoder built on Llama's block that mixes sliding-window and
+full attention layers exports as `ministral`, which transformers can load.
 
-Kimi K3 loads its text decoder from the vision wrapper: KDA and NoPE MLA
-layers, Attention Residuals over blocks of layers, latent routed experts with
-SiTU, and the routed experts' compressed-tensors MXFP4, which export writes
-back as the same packed pairs, re-encoding trained experts by the library's
-own rule (`dew.interop.codecs.quantize_packed_mxfp4`). The tower tensors are
-kept and written back unchanged.
-A tiny fixture from the released remote code covers parity, an update, export
-and greedy decoding; the [source record](tests/fixtures/hf/kimi-k3-source/source.json)
-lists every released tensor's shape.
+For Kimi K3, Dew loads the text decoder out of the vision wrapper. That covers
+the KDA and NoPE MLA layers, Attention Residuals over blocks of layers, latent
+routed experts with SiTU, and the routed experts' compressed-tensors MXFP4
+weights. Export writes the experts back as the same packed pairs, re-encoding
+trained experts with the library's own rule
+(`dew.interop.codecs.quantize_packed_mxfp4`). The vision tower tensors are
+written back unchanged. A tiny fixture built from the released remote code
+tests parity, an update, export and greedy decoding, and the
+[source record](tests/fixtures/hf/kimi-k3-source/source.json) lists the shape
+of every released tensor.
 
-Kimi Linear loads as its released remote code computes it, KDA and NoPE MLA
-layers with DeepSeek's routed experts, with one exception. The released gate
-adds the balancing bias to its scores in place, so its routing weights carry
-the bias; Dew weighs the chosen experts by the unbiased scores, as K3's
-revision of the same file and vLLM do. A tiny fixture from the released code,
-with that line patched, covers parity, an update, export and greedy decoding;
-the [source record](tests/fixtures/hf/kimi-linear-source/source.json) lists
-every released tensor's shape.
+Kimi Linear (KDA and NoPE MLA layers with DeepSeek's routed experts) computes
+what its released remote code computes, with one exception. The released gate
+adds the balancing bias to its scores in place, so the routing weights include
+the bias. Dew weights the chosen experts by the unbiased scores, as vLLM and
+K3's revision of the same file do. A tiny fixture from the released code, with
+that line patched, tests parity, an update, export and greedy decoding; the
+[source record](tests/fixtures/hf/kimi-linear-source/source.json) lists the
+shape of every released tensor.
 
 ### Native multimodal models
 
-`Pretrained.load` returns the model, the checkpoint's own processor, and the
-weights. The processor turns text and raw media into `ModelInputs`, which
-`LMObjective`, `Trainer` and cached generation take unchanged. The export
-carries the processor and tokenizer files beside the weights.
+For a multimodal checkpoint, `Pretrained.load` returns the model, the
+checkpoint's own processor and the weights. The processor turns text and raw
+media into `ModelInputs`, which `LMObjective`, `Trainer` and cached generation
+accept as they are. Export writes the processor and tokenizer files next to
+the weights.
 
-The image, video and audio inputs a model accepts follow the checkpoint's
-modality configuration. `Processor.__call__` takes `text`, `images`, `audio`,
-`videos` and `video_metadata`. `Processor.chat` runs the checkpoint's own chat
-template, so the checkpoint interprets template controls such as
-`reasoning_effort` and `preserve_thinking`. The checkpoint's own processor also
-does the raw image, video and waveform preprocessing, and Dew arranges its
-outputs row by row. DeepSeek-V4.1 ships no processor, so its caller builds
-the pixel values and image positions
+The checkpoint's modality configuration decides which image, video and audio
+inputs a model accepts. `Processor.__call__` takes `text`, `images`, `audio`,
+`videos` and `video_metadata`. `Processor.chat` applies the checkpoint's own
+chat template, so template controls such as `reasoning_effort` and
+`preserve_thinking` behave as the checkpoint defines them. The checkpoint's
+processor also does the image, video and waveform preprocessing, and Dew
+arranges its outputs row by row. DeepSeek-V4.1 ships without a processor, so
+you build its pixel values and image positions yourself
 ([language models](docs/concepts/language_models.md#multimodal-checkpoints)).
 
-Qwen 3.8 ships under the Qwen 3.5 model types. `Qwen/Qwen3.8-27B` loads as a
-`qwen3_5` conditional model with a dense hybrid decoder, images and videos.
-The text-only `Qwen/Qwen3.8-2.4T-A95B` loads as `qwen3_5_moe_text`, with
-normalized top-k routing and a sigmoid-gated shared expert.
+Qwen 3.8 uses the Qwen 3.5 model types. `Qwen/Qwen3.8-27B` loads as a
+`qwen3_5` conditional model with a dense hybrid decoder and image and video
+inputs. The text-only `Qwen/Qwen3.8-2.4T-A95B` loads as `qwen3_5_moe_text`,
+with normalized top-k routing and a sigmoid-gated shared expert.
 `tests/fixtures/hf/qwen38-source/source.json` pins both revisions, and every
-tensor name in their indexes maps to a Dew parameter. That includes the shipped
-multi-token prediction (MTP) layer. The MTP layer shares the target embedding
-and head, trains as an auxiliary loss, and decodes candidate steps from its own
-cache. I did not download the released weights: the qualification runs tiny
-source-shaped fixtures on CPU in float32. I make no claim about full-size memory
-use, bf16 parity, accelerator throughput, multi-host placement or a speculative
-accept/reject scheduler, and Dew refuses a checkpoint with more than one
-prediction layer.
+tensor name in their indexes maps to a Dew parameter, including the
+multi-token prediction (MTP) layer they ship. The MTP layer shares the target
+embedding and head, trains as an auxiliary loss, and decodes candidate steps
+from its own cache. Dew refuses a checkpoint with more than one prediction
+layer.
+
+I did not download the released Qwen 3.8 weights. The tests run tiny fixtures
+with the released shapes, on CPU in float32, so I have not checked full-size
+memory use, bf16 parity, accelerator throughput, multi-host placement or a
+speculative accept/reject scheduler.
 
 ### Block-diffusion decoders
 
 Diffusion Gemma (`diffusion_gemma`) generates canvases and trains with text
 and image-conditioned SFT.
 
-`BlockDiffusionObjective` trains the canvas loss from the loaded weights and
-`PretrainedBlockDecoder.block_generation()` decodes canvases. Text SFT follows Google's
-published recipe. Image-conditioned SFT uses the same `ModelInputs`, `Dataset`
-and `Trainer` path. Images condition the clean encoder; their placeholder slots
-are not text targets. `BlockGeneration` takes the matching `images=` when it
-decodes. The objective makes `layer_scalar` trainable, so the export goes
-through the objective's model:
+`BlockDiffusionObjective` trains the canvas loss starting from the loaded
+weights, and `PretrainedBlockDecoder.block_generation()` decodes canvases. Text
+SFT follows Google's published recipe. Image-conditioned SFT goes through the
+same `ModelInputs`, `Dataset` and `Trainer`. The images condition the clean
+encoder, and their placeholder slots are not text targets. To decode, pass the
+matching `images=` to `BlockGeneration`. The objective makes `layer_scalar`
+trainable, so export has to use the objective's model:
 `replace(loaded, model=objective.model).save(directory, variables=state.variables)`.
 
 ### Masked-diffusion decoders
 
-LLaDA (`llada`) and Dream (`dream`, `Dream`) train on the MDLM loss from their
-released weights.
+LLaDA (`llada`) and Dream (`dream`, `Dream`) train with the MDLM loss,
+starting from their released weights.
 
-`MaskedDiffusionObjective(model, MDLM(mask_id=...)(), seq_len,
-pretrained=loaded.variables)` trains the MDLM negative ELBO from a loaded
-checkpoint. `loaded.save(directory, variables=state.variables)` writes the trained
-weights back under the source's own tensor names, beside the config they came
-with: LLaDA's OLMo-style names and Dream's Qwen 2 layout.
-Transformers has no class for either release, so the export tests compare
-against the transformers block each model is built from, run with an
-all-visible attention mask: `LlamaForCausalLM` for LLaDA and
-`Qwen2ForCausalLM` for Dream.
+`MaskedDiffusionObjective(loaded, MDLM(mask_id=...)(), seq_len)` trains on the
+MDLM negative ELBO starting from a loaded checkpoint.
+`loaded.save(directory, variables=state.variables)` writes
+the trained weights back with the source's own tensor names (OLMo-style names
+for LLaDA, the Qwen 2 layout for Dream), next to the config they came with.
+The transformers library has no class for either release, so the export tests compare
+against the transformers model each one is built from, run with an all-visible
+attention mask: `LlamaForCausalLM` for LLaDA and `Qwen2ForCausalLM` for Dream.
 
 ### Pretrained diffusion and quantized checkpoints
 
-`Pretrained.load` reads SD, SDXL, SD3, Flux, and Qwen-Image 2.1 pipeline directories.
-SD and SDXL include img2img, inpainting, and the SDXL refiner.
+`Pretrained.load` reads SD, SDXL, SD3, Flux and Qwen-Image 2.1 pipeline
+directories. For SD and SDXL that includes img2img, inpainting and the SDXL
+refiner.
 
 The loader reads these quantized storage formats:
 
@@ -345,22 +357,24 @@ The loader reads these quantized storage formats:
 - AutoAWQ's 4-bit gemm packing;
 - GPTQ at 2, 4 and 8 bits, act-order included.
 
-An AWQ or GPTQ weight is saved back against the scales and zeros the source
-shipped, so a change smaller than half a grid step is lost and a lightly
-trained model saves back mostly as its source. A trained value outside that
-grid is refused: AutoAWQ's packing would spill it into the neighbouring
-codes and gptqmodel's would clamp it. A substantially trained model saves
-dense instead (the error names the call). A compressed-tensors weight is saved as the library's own compressor
-writes it, for the weight in the dtype Dew holds, against the source's scales, clamping a value past the code range
-as the library does. Activations that a checkpoint quantizes dynamically run
-in the model's dtype; static activation scales are refused.
+It decodes each format to the same values as the release's own
+dequantization. `Pretrained.save` writes trained weights back in the source's
+format and scale dtype, with the encoding rule of the tool that wrote the
+source.
 
-It decodes them to the same values each release's own dequantization gives.
-`Pretrained.save` writes trained weights back in the source's format and scale
-dtype, using the encoding rule of the tool that wrote the source.
+AWQ and GPTQ weights are saved against the scales and zeros the source
+shipped. A change smaller than half a grid step is lost, so a lightly trained
+model mostly saves back as its source. Dew refuses to save a trained value
+outside the grid, because AutoAWQ's packing would spill it into the
+neighbouring codes and gptqmodel's would clamp it. Save a substantially trained
+model dense instead; the error message names the call. A compressed-tensors
+weight is saved the way the library's own compressor writes it: from the weight
+in the dtype Dew holds, against the source's scales, clamping a value past the
+code range as the library does. Activations that a checkpoint quantizes
+dynamically run in the model's dtype, and Dew refuses static activation scales.
 
-Model-family tests use small source-shaped fixtures. I have not validated
-full-size checkpoint execution, accelerator performance, or physical multi-host
+The model-family tests use small fixtures with the source's shapes. I have not
+validated full-size checkpoints, accelerator performance or physical multi-host
 runs. Video inputs are tested on Gemma 4 and Qwen 3.5.
 
 ### Diffusion and representation models
@@ -370,7 +384,7 @@ encoders from scratch, for diffusion, flow matching and masked representation
 prediction; [Supported models](https://dewml.dev/reference/models/#architectures-you-can-train-from-scratch)
 lists them by registry name.
 
-CLIP and T5 text encoders and VAE interfaces provide conditioning and latent-space training.
+CLIP and T5 text encoders supply conditioning, and the VAE interfaces let you train in latent space.
 
 ## Training
 
@@ -386,7 +400,7 @@ A training run combines a model, an objective, a dataset, and an optimizer:
 
 ### Language modeling
 
-This decoder trains on TinyStories, a corpus of short stories in simple English, with the GPT-2 tokenizer. Download the 22 MB validation file of TinyStories V2 and tokenize it into the `train.bin`, `val.bin` and `meta.json` that `TokenWindows` reads. The tool holds out the first 1% of the tokens for validation.
+This decoder trains on TinyStories, a corpus of short stories in simple English, with the GPT-2 tokenizer. Download the 22 MB validation file of TinyStories V2 and tokenize it into the `train.bin`, `val.bin` and `meta.json` files that `TokenWindows` reads. `dew tokenize` holds out the first 1% of the tokens for validation.
 
 ```bash
 hf download roneneldan/TinyStories TinyStoriesV2-GPT4-valid.txt \
@@ -428,11 +442,11 @@ On one Colab L4 GPU the run takes about three minutes. The training loss falls f
 
 `temperature=0` selects the highest-probability token. GPU reductions are not bitwise repeatable by default, so a second run can continue differently after the first sentence. Validation uses EMA weights, which lag the live parameters during a short run: at step 1,000 their perplexity is 29.3.
 
-`PackedTokens` packs whole documents into the windows instead, with segment IDs and positions; it splits the stream at the EOS ID that `dew tokenize --pack` records. `ChatMessages` reads conversations from a parquet file, a JSONL file or a Hub dataset id, renders them with the tokenizer's chat template and tracks token roles. Set `LMObjective(loss_role=Role.ASSISTANT)` to train only on assistant targets. See [language models](docs/concepts/language_models.md) for checkpoint loading and text tokenization.
+To pack whole documents into the windows instead, use `PackedTokens`. It adds segment IDs and positions, and splits the stream at the EOS ID that `dew tokenize --pack` records. `ChatMessages` reads conversations from a parquet file, a JSONL file or a Hub dataset ID, renders them with the tokenizer's chat template, and records each token's role. Set `LMObjective(loss_role=Role.ASSISTANT)` to train only on assistant targets. See [language models](docs/concepts/language_models.md) for checkpoint loading and text tokenization.
 
 ### Supervised fine-tuning
 
-Fine-tune the decoder above on a response to a prompt. Each token carries a role: the prompt's tokens are `Role.USER` and the response's are `Role.ASSISTANT`. `ChatMessages` produces this role column from chat templates when reading conversation data.
+Next, fine-tune the decoder above on one response to a prompt. Each token has a role: the prompt's tokens are `Role.USER` and the response's are `Role.ASSISTANT`. When you read conversation data, `ChatMessages` builds this role column from the chat template.
 
 ```python
 import itertools
@@ -456,7 +470,7 @@ sft_data = Dataset(
 sft_objective = LMObjective(
     model,
     seq_len=len(row) - 1,
-    pretrained=lm_state.variables,
+    variables=lm_state.variables,
     loss_role=Role.ASSISTANT,
 )
 sft_state = Trainer(
@@ -466,11 +480,11 @@ sft_state = Trainer(
 ).fit(sft_data, steps=20, log_every=10)
 ```
 
-The loss counts assistant targets after the next-token shift. Prompt tokens still provide context. For conversation files, `ChatMessages` also preserves tool calls, tool responses, and tool schemas.
+The loss counts only the assistant targets, after the next-token shift; the prompt tokens are still there as context. For conversation files, `ChatMessages` also keeps tool calls, tool responses and tool schemas.
 
 ### Preference optimization
 
-Continue from `model` and `lm_state` above with a chosen and a rejected response to the same prompt. The masks restrict the loss to the response tokens.
+This continues from `model` and `lm_state` above, with a chosen and a rejected response to the same prompt. The masks limit the loss to the response tokens.
 
 ```python
 import json
@@ -484,20 +498,20 @@ pair = {"chosen": prompt + response, "rejected": prompt + rejected,
         "rejected_mask": [0] * len(prompt) + [1] * len(rejected)}
 pairs = PreferencePairs(records=(json.dumps(pair),) * 8, seq_len=16,
                         loading=Loading(workers=0, threads=1, read_buffer=2)).load(batch=8)
-dpo = DPOObjective(model, seq_len=15, beta=0.1, pretrained=lm_state.variables)
+dpo = DPOObjective(model, seq_len=15, beta=0.1, variables=lm_state.variables)
 dpo_state = Trainer(dpo, optax.adam(0.001), key=jax.random.key(2)).fit(
     pairs, steps=10, log_every=5)
 ```
 
-`DPOObjective` keeps the starting policy as a frozen reference and optimizes the relative likelihood of the chosen response. `PreferencePairs.seq_len` is the full ID-row width, and shorter pairs are padded to it; the objective scores one fewer position because of the next-token shift.
+`DPOObjective` keeps the starting policy as a frozen reference and raises the likelihood of the chosen response relative to the rejected one. `PreferencePairs.seq_len` is the width of the whole ID row, and shorter pairs are padded to it. The objective scores one position fewer because of the next-token shift.
 
-`FlowGRPOObjective` applies group-relative rewards to stochastic flow trajectories. `FlowRollout` samples image groups, evaluates rewards, and records the transition densities used by the clipped policy objective. See [FlowGRPO](docs/concepts/post_training.md) for a complete image-reward example.
+`FlowGRPOObjective` applies group-relative rewards to stochastic flow trajectories. `FlowRollout` samples groups of images, computes their rewards, and records the transition densities that the clipped policy objective uses. [FlowGRPO](docs/concepts/post_training.md) has a complete example with an image reward.
 
-For online reinforcement learning, `SampledRollout` generates groups of responses and calls a reward function. `GRPOObjective` trains on their advantages, old log probabilities, and response masks. [`recipes/chain.py`](recipes/chain.py) connects SFT, DPO, and GRPO stages. The [post-training guide](docs/concepts/post_training.md) covers reward callbacks and rollout settings.
+For online reinforcement learning, `SampledRollout` generates groups of responses and calls a reward function on them. `GRPOObjective` then trains on their advantages, old log probabilities and response masks. [`recipes/chain.py`](recipes/chain.py) connects SFT, DPO, and GRPO stages. The [post-training guide](docs/concepts/post_training.md) covers reward callbacks and rollout settings.
 
 ### Reinforcement learning with a reward function
 
-This example continues the same decoder with a reward for stories about a dog. A task verifier can replace the reward function. The prompt batch uses the same numeric layout as `Prompts`, including UTF-8 reward metadata.
+This example keeps training the same decoder and rewards stories that mention a dog. A task verifier could replace the reward function. The prompt batch has the same numeric layout that `Prompts` produces, including the UTF-8 reward metadata.
 
 ```python
 from dew.objectives.rl import GRPOObjective, SampledRollout
@@ -532,7 +546,7 @@ rl_objective = GRPOObjective(
     model,
     seq_len=len(prompt) + 7,
     beta=0.01,
-    pretrained=lm_state.variables,
+    variables=lm_state.variables,
 )
 rollout = SampledRollout(
     rl_objective,
@@ -550,13 +564,13 @@ rl_state = Trainer(
 ).fit(rl_data, steps=20, log_every=10)
 ```
 
-Each prompt produces four responses, and `SampledRollout.decode` turns each one into the text the reward reads. Their relative rewards determine the advantages. GRPO uses a clipped policy objective and an optional reference KL term; `beta` sets its coefficient. `seq_len` covers the prompt and the 8 response tokens, less one for the next-token shift.
+Each prompt gets four responses, and `SampledRollout.decode` turns each one into the text the reward reads. The advantages come from how each response's reward compares with the others in its group. GRPO uses a clipped policy objective and an optional KL term against the reference; `beta` sets the KL coefficient. `seq_len` covers the prompt and the 8 response tokens, minus one for the next-token shift.
 
 In the Colab run, 3 of 128 responses sampled from the policy before these 20 steps mention a dog, and all 128 sampled after them do.
 
 ### Diffusion language models
 
-Masked diffusion trains a bidirectional decoder to recover corrupted tokens. Unlike autoregressive training, each input row contains exactly `seq_len` tokens; there is no next-token shift, so windows of `seq_len=127`, which hold 128 IDs each, feed a 128-token objective. The mask takes the ID after the last GPT-2 token.
+Masked diffusion trains a bidirectional decoder to recover masked tokens. There is no next-token shift, so each input row holds exactly `seq_len` tokens. Windows of `seq_len=127` hold 128 IDs each, which is what the 128-token objective needs. The mask token takes the first ID after GPT-2's vocabulary.
 
 ```python
 from dew.diffusion.discrete import MDLM
@@ -587,15 +601,15 @@ drawn = process.generate(masked_model, masked_state.averaged,
 print(tokenizer.decode(drawn.tokens[0]))
 ```
 
-On the same L4 the 4,000 steps take about five minutes. The loss, MDLM's negative ELBO per token, falls from 3.48 at step 1,000 to 2.78 at step 4,000, and validation perplexity reaches 15.0. That perplexity is exp of the ELBO, an upper bound on the model's own, so it does not compare directly with the 8.7 above. `process.generate` unmasks the 48 tokens after the prompt in 64 reverse steps; one run's draw reads:
+On the same L4 the 4,000 steps take about five minutes. The loss, MDLM's negative ELBO per token, falls from 3.48 at step 1,000 to 2.78 at step 4,000, and validation perplexity reaches 15.0. That perplexity is exp of the ELBO, an upper bound on the model's own, so it does not compare directly with the 8.7 above. `process.generate` unmasks the 48 tokens after the prompt in 64 reverse steps. One run's sample reads:
 
 > Once upon a time, in a small town, there lived a little girl named Lily. Mia loved whistle. She had an key telling to try to sleep. One day, she always to see her favorite mom, dad unate to have lots of.
 
-LLaDA and Dream use this masked-token path. Diffusion Gemma uses a different canvas/self-conditioning process.
+LLaDA and Dream train the same way. Diffusion Gemma uses a different process, with canvases and self-conditioning.
 
 ### JEPA representation learning
 
-Train an image encoder by predicting masked patch representations. This uses the Flowers data prepared in the quickstart, with 8×8 patches and a smaller predictor.
+A JEPA encoder learns by predicting the representations of masked image patches. This example uses the Flowers data prepared in [Getting started](#getting-started), with 8×8 patches and a smaller predictor.
 
 ```python
 from pathlib import Path
@@ -653,11 +667,11 @@ if __name__ == "__main__":
     jepa_state = train_jepa()
 ```
 
-The target encoder follows an EMA of the context encoder. The loss compares predicted and target representations; it does not reconstruct pixels. The kNN metric is a half-batch diagnostic, so use a larger labeled evaluation to judge representation quality. `jepa_video_encoder` extends the same objective to video clips.
+The target encoder is an EMA of the context encoder. The loss compares predicted and target representations and never reconstructs pixels. The kNN metric is a quick check on half a batch; judge representation quality with a larger labeled evaluation. `jepa_video_encoder` applies the same objective to video clips.
 
 ### Loading pretrained weights
 
-Load a supported checkpoint from a Hub repository or local directory. This example downloads Qwen3-0.6B and its tokenizer (about 1.5 GB).
+You can load a supported checkpoint from a Hub repository or a local directory. This example downloads Qwen3-0.6B and its tokenizer (about 1.5 GB).
 
 ```python
 import jax
@@ -689,13 +703,13 @@ result = generate(
 print(tokenizer.decode(result.tokens[0], skip_special_tokens=True))
 ```
 
-Pass `pretrained=pretrained.variables` to `LMObjective` or a post-training objective to continue from those weights, and tokenize the training data with the checkpoint's own tokenizer. [Generating and serving](#generating-and-serving) draws from the result and exports it.
+To train from those weights, pass the bundle in place of the model (`LMObjective(pretrained, seq_len=512)`, or a post-training objective), and tokenize the training data with the checkpoint's own tokenizer. `pretrained.adapt(LoRA(rank=8, modules=("q_proj", "v_proj")), key=0)` adds a low-rank adapter first, so the objective trains only the adapter's factors ([language models](docs/concepts/language_models.md#pretrained-checkpoints)). [Generating and serving](#generating-and-serving) shows how to sample from and export the result.
 
 ### Composing a native decoder
 
 `CausalTransformer` takes its layer pattern as configuration. This decoder
-uses a local/global attention pattern of three windowed layers to one global
-layer, trains on a Grain stream, then generates from the trained state:
+has three sliding-window attention layers followed by one global layer. It
+trains on a Grain stream, then generates from the trained state:
 
 ```python
 import grain.python as grain
@@ -737,13 +751,13 @@ print(np.asarray(result.tokens))
 `sliding_attention` attends to 8 keys including its own, and `full_attention`
 attends to all of them. A Grain `to_iter_dataset()` iterator has
 `get_state` and `set_state`, which `checkpoint_every` needs to record the data
-position. A plain generator has neither, and `Trainer` raises an error if you
-combine one with `checkpoint_every`. `objective.pipeline` returns the
-`TextGeneration` task over the state's weights.
+position. A plain generator has neither, so `Trainer` raises an error if you
+use one with `checkpoint_every`. `objective.pipeline` returns a
+`TextGeneration` task that uses the state's weights.
 
 ### Custom Flax models
 
-An objective can train an ordinary Linen module. This example learns `y = 2x + 1` with a single dense layer.
+An objective can train any Linen module. This example fits `y = 2x + 1` with a single dense layer.
 
 ```python
 import flax.linen as nn
@@ -774,15 +788,15 @@ state = Trainer(objective, optax.sgd(0.1), key=jax.random.key(0)).fit(
 print(objective.model.apply(state.variables, jnp.array([[0.0], [1.0]])))
 ```
 
-The predictions approach `1` and `3`. `init` creates the variables, `loss` computes a differentiable scalar, and `Aux` supplies metrics and optional mutable-variable updates. You can pass a custom objective directly to `Trainer`; registration is only needed to construct it by name from a configuration.
+The predictions approach `1` and `3`. `init` creates the variables, `loss` returns a differentiable scalar, and `Aux` holds metrics and any updates to mutable variables. You can pass a custom objective straight to `Trainer`. You only need to register it if you want to build it by name from a configuration.
 
 The [objective guide](docs/concepts/objectives.md) also covers BatchNorm state and EMA selection.
 
 ### Evaluation and checkpoints
 
-Pass `eval_every` and metrics to `fit` to score validation data. Set `preview=True` when you also want generated previews. Perplexity reduces token losses over the validation pass; FID accumulates population statistics before computing the final distance.
+Pass `eval_every` and metrics to `fit` to score the validation data, and set `preview=True` if you also want generated previews. Perplexity is computed from the token losses of the whole validation pass, and FID accumulates statistics over the pass before it computes the distance.
 
-`Checkpoints` saves numerical state and data position through Orbax. Rebuild the run with the same checkpoint directory to continue it. `fit(steps=1200)` sets a total target: restoring step 1000 runs toward 1200, not 2200. Recipe configuration is separate; `RunConfig.save` writes `run.json`.
+`Checkpoints` saves the training state and the data position with Orbax. To continue a run, rebuild it with the same checkpoint directory. `fit(steps=1200)` is a total: a run restored at step 1000 trains to step 1200, not 2200. The recipe configuration is saved separately; `RunConfig.save` writes it to `run.json`.
 
 See [checkpointing and resume](docs/guides/checkpoints.md) for restore requirements, local checkpoints, and current recovery limitations.
 
@@ -803,16 +817,16 @@ position, so keep the native checkpoint if you want to resume training.
 [`examples/sft_gemma4.py`](examples/sft_gemma4.py) trains a run and exports
 it with `PretrainedDecoder.from_run(...).save(...)`, the last row of the table.
 
-Reproducing a run bitwise on CUDA needs deterministic GPU reductions. The flag
-`--xla_gpu_deterministic_ops=true` requests them, and `TrainerConfig.xla_flags`
-appends it to `XLA_FLAGS`. Check the flag against your attention backend. Under
-JAX 0.11.1, repeated cuDNN backward calls fail with the flag set, while the XLA
-attention path passed the recorded bitwise checks. `tools/qualify_training.py`
-uses that path with `--attention-impl xla`.
+To reproduce a run bit for bit on CUDA you need deterministic GPU reductions.
+The flag `--xla_gpu_deterministic_ops=true` turns them on, and
+`TrainerConfig.xla_flags` appends it to `XLA_FLAGS`. Check the flag with your
+attention backend: under JAX 0.11.1, repeated cuDNN backward calls fail with it
+set, while the XLA attention path passed the recorded bitwise checks.
+`tests/test_training_qualification.py` resumes a killed fine-tune on the XLA path.
 
 ### Standalone evaluation and local reports
 
-`Evaluation.run` scores trained variables without an optimizer. It returns metric values and optional previews. `LocalTracker` writes scalar history, artifacts, and plots; it needs no W&B account or installation. Install `dewml[plots]` for Matplotlib output.
+`Evaluation.run` scores trained variables without an optimizer and returns metric values and optional previews. `LocalTracker` writes the scalar history, artifacts and plots to disk, with no W&B account or install. Install `dewml[plots]` for Matplotlib output.
 
 ```python
 import itertools
@@ -869,9 +883,9 @@ with LocalTracker("runs/lm-report", plots=True) as tracker:
     print(result.scores)
 ```
 
-This run reports perplexity around 1.002 and saves the training-loss curve, scalar journal, and generated text under `runs/lm-report`. The tracker renders plots once, when it closes. Use `plots=False` to record only scalars and artifacts, or call `tracker.plot()` yourself. [`examples/evaluate_and_serve.py`](examples/evaluate_and_serve.py) scores a finished run the same way and adds an lm-eval-harness suite, image metrics, and a served-model comparison.
+This run reports a perplexity of about 1.002 and saves the training-loss curve, the scalar journal and the generated text under `runs/lm-report`. The tracker draws the plots once, when it closes. Use `plots=False` to record only scalars and artifacts, or call `tracker.plot()` yourself. [`examples/evaluate_and_serve.py`](examples/evaluate_and_serve.py) scores a finished run the same way and adds an lm-eval-harness suite, image metrics, and a served-model comparison.
 
-`Trackers` sends the same reports to several backends, and you switch a backend by changing its constructor. Install `dewml[wandb]`, `dewml[mlflow]` or `dewml[tensorboard]` for the backend you want:
+`Trackers` sends the same reports to several backends. To switch backends, change the constructor. Install `dewml[wandb]`, `dewml[mlflow]` or `dewml[tensorboard]` for the backend you want:
 
 ```python
 from dew import LocalTracker, TensorBoardTracker, Trackers
@@ -882,11 +896,11 @@ tracker = Trackers(
 )
 ```
 
-Use this tracker in the same `with` block and `Trainer` call above. `WandbTracker(project="dew-experiments", offline=True)` and `MLflowTracker("dew-experiments", uri="sqlite:///runs/mlflow.db")` take the same place. A custom backend implements `log`, `artifact`, and `close`. Run configuration, progress, checkpoint requests, profiler windows, sweep trials, and failures use typed reporting records.
+Use it in the same `with` block and `Trainer` call as above. `WandbTracker(project="dew-experiments", offline=True)` and `MLflowTracker("dew-experiments", uri="sqlite:///runs/mlflow.db")` go in the same place. A custom backend implements `log`, `artifact` and `close`. Run configuration, progress, checkpoint requests, profiler windows, sweep trials and failures reach the tracker as typed records.
 
 ### Profiling training and inference
 
-Install `dewml[profile]`, or use `uv pip install -e '.[profile]'` from this checkout. Both forms run the same JAX/XProf capture:
+Install `dewml[profile]`, or run `uv pip install -e '.[profile]'` in this checkout. Then wrap the work you want to profile in `dew.Profiler`, either as a context manager or with `start` and `stop`. Both forms record the same JAX/XProf capture:
 
 ```python
 import dew
@@ -904,15 +918,15 @@ finally:
     prof.stop()
 ```
 
-Each capture gets a new directory, so restarting a profiler keeps earlier results. Without a path, the first start creates a persistent temporary directory, available as `prof.directory`. A capture keeps the native XPlane traces, the available HLO files, and XProf's overview, input, kernel, memory and other supported reports. Its manifest records the backend, package versions, capture options and which reports are available. A counter the backend does not provide is recorded as missing, not as zero. The `profile` extra installs XProf's own viewer, and each manifest stores the command that opens its capture under `view_command`, for example `xprof --logdir=profiles/run/capture-<id>`.
+Each capture goes in a new directory, so restarting a profiler keeps the earlier results. Without a path, the first start creates a temporary directory that is not deleted, available as `prof.directory`. A capture keeps the native XPlane traces, the HLO files that exist, and XProf's overview, input, kernel, memory and other supported reports. Its manifest records the backend, package versions, capture options and which reports are available. A counter the backend does not provide is recorded as missing, not as zero. The `profile` extra installs XProf's viewer, and each manifest stores the command that opens its capture under `view_command`, for example `xprof --logdir=profiles/run/capture-<id>`.
 
-A capture leaves JAX's Python tracer off. The tracer records every Python and C call and slows Python-heavy host work several times over, so the host time in its traces is time the run doesn't spend. To trace differently, pass `Profiler` an `options=` value. To start a trace yourself the way a capture does, use `jax.profiler.start_trace(directory, profiler_options=capture_options())`, with `capture_options` from `dew.telemetry.profile`.
+A capture leaves JAX's Python tracer off. That tracer records every Python and C call and slows Python-heavy host work several times over, so the host time in its traces is not time the run would spend without it. To trace differently, pass `Profiler` an `options=` value. To start a trace yourself with the same settings, use `jax.profiler.start_trace(directory, profiler_options=capture_options())`, with `capture_options` from `dew.telemetry.profile`.
 
-To trace a chosen window of training, pass `Trainer` a `ProfileWindow` with the trace `directory`, the number of `steps` to trace, and the `warmup` steps to run first. The loop starts tracing after the warm-up, stops after the requested steps, and reports the window to the tracker as a `ProfileWindow` record. Use either this schedule or an outer `dew.Profiler`, not both.
+To trace a window of training, pass `Trainer` a `ProfileWindow` with the trace `directory`, the number of `steps` to trace and the `warmup` steps to run first. The loop starts tracing after the warm-up, stops after the requested steps, and reports the window to the tracker as a `ProfileWindow` record. Use this schedule or an outer `dew.Profiler`, but not both.
 
 ### Sweeping a hyperparameter
 
-`RunConfig.sweep` trains one trial per point of a search space through the ordinary `RunConfig.train`, keeps a resumable JSON ledger, and reports each trial through the tracker you pass it:
+`RunConfig.sweep` trains one trial for each point of a search space with the ordinary `RunConfig.train`. It keeps a JSON ledger so the sweep can resume, and reports each trial to the tracker you pass it:
 
 ```python
 from dew import Evaluation, LocalTracker
@@ -945,11 +959,11 @@ best = min(trials, key=lambda trial: trial.value)
 print(best.overrides, round(best.value, 4))
 ```
 
-This prints `{'optim.learning_rate': 0.01} 1.0024` against 1.015 for the slower rate. Each trial is a real run under `runs/sweep/lm-rate/trial-<index>` with its own `run.json`, checkpoints and tracking journal, and every finished trial is written to the ledger before it is reported, so rerunning the call continues an interrupted sweep instead of retraining. `random_search` and `grid_search` are built in; `optuna_search` needs `dewml[hpo]`.
+This prints `{'optim.learning_rate': 0.01} 1.0024`; the slower rate reaches 1.015. Each trial is a real run under `runs/sweep/lm-rate/trial-<index>`, with its own `run.json`, checkpoints and tracking journal. A finished trial is written to the ledger before it is reported, so calling `sweep` again continues an interrupted sweep without retraining the finished trials. `random_search` and `grid_search` are built in; `optuna_search` needs `dewml[hpo]`.
 
 ## Diffusion and sampling
 
-A `Process` combines a noise schedule, a prediction transform, and loss weighting. Presets build common combinations:
+A `Process` combines a noise schedule, a prediction transform and a loss weighting. Presets build the common combinations:
 
 | Component | Options |
 |---|---|
@@ -960,37 +974,39 @@ A `Process` combines a noise schedule, a prediction transform, and loss weightin
 | Guidance | Classifier-free guidance with an optional interval and rescaling |
 | Conditions | `InputSpec`/`Condition`, CLIP, T5, labels or custom encoders |
 
-Training and inference can use different schedules, as in EDM's log-normal training distribution and Karras sampling grid. `sample` runs the solver under `jax.lax.scan`, so changing the solver reuses the same trained weights. `MultiStepDPM` integrates in sigma space and keeps the previous denoiser outputs to raise the order of each step.
+Training and sampling can use different schedules; EDM, for example, trains on a log-normal distribution of noise levels and samples on a Karras grid. `sample` runs the solver under `jax.lax.scan`, and you can change the solver without retraining. `MultiStepDPM` integrates in sigma space and keeps the previous denoiser outputs to raise the order of each step.
 
-`TextToImage` combines text encoding, denoising, and optional latent decoding. See [diffusion](docs/guides/diffusion.md) for text conditioning, latent models, and sampling.
+`TextToImage` runs text encoding, denoising and, for latent models, decoding. See [diffusion](docs/guides/diffusion.md) for text conditioning, latent models, and sampling.
 
 For SD and SDXL checkpoints, `dew.pipeline(source)` rebuilds the source's own
-scheduler instead of picking a solver by name. It supports the source's
-clipping, thresholding and timestep spacing, and Karras, exponential and beta
-grids where the corresponding scheduler has them. An unsupported combination
-raises an error instead of falling back to different defaults.
+scheduler rather than choosing a solver by name. It supports the source's
+clipping, thresholding and timestep spacing, and the Karras, exponential and
+beta grids where the matching scheduler has them. An unsupported combination
+raises an error; Dew does not fall back to different defaults.
 
 For a text-conditioned image task, pass
 `guidance=CFG(scale=7.5, interval=(0.0, 1.0), rescale=0.7)`
 after importing `CFG` from `dew.sampling`. Rescaling mixes the guided output
 with a version matched to the conditional output's standard deviation.
-`rescale=0.0` leaves it unchanged; `guidance=None` disables classifier-free guidance.
-The source-scheduler oracles use tiny synthetic trajectories, not released-model quality benchmarks.
+`rescale=0.0` leaves it unchanged, and `guidance=None` turns classifier-free guidance off.
+The tests that compare these schedulers with the source use tiny synthetic
+trajectories; they are not quality benchmarks of the released models.
 
 ## Generating and serving
 
-`dew.inference` binds weights to a generation task. `TextGeneration` decodes
-tokens, `BlockGeneration` decodes Diffusion Gemma canvases, `MaskedGeneration`
-samples a whole response from a masked-diffusion decoder with native MDLM, and
-`TextToImage` denoises images. `MaskedGeneration` does not implement LLaDA's or
-Dream's own remasking recipes. Each task is frozen around the weights it was
-built with, and `bind` returns a new task over another set of weights.
+A task in `dew.inference` pairs a model with its weights for generation.
+`TextGeneration` decodes tokens, `BlockGeneration` decodes Diffusion Gemma
+canvases, `MaskedGeneration` samples a whole response from a masked-diffusion
+decoder with Dew's MDLM sampler, and `TextToImage` denoises images.
+`MaskedGeneration` does not implement LLaDA's or Dream's own remasking recipes.
+A task is immutable and keeps the weights it was built with; `bind` returns a
+new task with other weights.
 
 ### Drawing from a trained language model
 
-`LMObjective.policy` hands back the `TextGeneration` bound to the parameters
-you pass it, which is the same task the GRPO rollout samples with. This
-continues the decoder trained in [language modeling](#language-modeling):
+`LMObjective.policy` returns a `TextGeneration` over the parameters you pass
+it. The GRPO rollout samples with the same task. This continues the decoder
+trained in [language modeling](#language-modeling):
 
 ```python
 from dew.inference import TextGeneration
@@ -1005,20 +1021,21 @@ print(np.array_equal(np.asarray(same([prompt], 8, key=jax.random.key(1)).tokens)
                      np.asarray(drawn.tokens)))
 ```
 
-This prints `Once upon a time, there was a little girl named Lily [8]` and `True`: the constructor and
-`policy` build the same task. `lengths` counts the 8 response actions, not the
-4 prompt tokens the row also carries. `Generation` also returns `terminated`,
-and the `behavior_log_probs` and `raw_log_probs` a policy ratio needs.
+This prints `Once upon a time, there was a little girl named Lily [8]` and
+`True`, because the constructor and `policy` build the same task. `lengths`
+counts the 8 generated tokens and leaves out the 4 prompt tokens in the same
+row. `Generation` also returns `terminated`, plus the `behavior_log_probs` and
+`raw_log_probs` that a policy ratio needs.
 
-A task built by `PretrainedDecoder.text_generation()` carries the checkpoint's
+A task built by `PretrainedDecoder.text_generation()` includes the checkpoint's
 processor, so it accepts strings and `decode` returns text. Without a
 processor the task takes token rows or `ModelInputs`.
 
 ### Drawing from a trained diffusion run
 
-`TextToImage.from_run` reads a run directory: the `run.json` that a
-`DiffusionRunConfig` wrote, and the weights of its latest checkpoint with the
-EMA copy merged over the live parameters. You do not restate the model
+`TextToImage.from_run` loads a run directory. It reads the `run.json` that a
+`DiffusionRunConfig` wrote and the weights of the latest checkpoint, with the
+EMA copy merged over the live parameters, so you don't repeat the model
 configuration at generation time.
 
 ```python
@@ -1075,26 +1092,24 @@ if __name__ == "__main__":
 ```
 
 The run directory then holds `['20', 'run.json']` and the task draws
-`(2, 64, 64, 3)` images clipped to `[-1, 1]`. `text=None` trains
-unconditionally, so the prompt list only decides how many images to draw; a
-`TextCondition` run encodes the prompts through the encoder it names.
+`(2, 64, 64, 3)` images clipped to `[-1, 1]`. `text=None` trains an
+unconditional model, so the prompt list only sets how many images to draw; a
+run with a `TextCondition` encodes the prompts with the encoder it names.
 `config.data.load` takes `tokenize=objective.inputs.tokenize` because the
-objective's conditions are what read the dataset's captions, and
-`Loading(workers=0)` keeps that caption reader in the training process, where
-its shutdown is part of the run.
+objective's conditions read the dataset's captions. `Loading(workers=0)` keeps
+that caption reader in the training process, so it shuts down with the run.
 
 ### Exporting a decoder and serving it
 
-`PretrainedDecoder.from_model(model, variables, tokenizer=...)` is a model
-trained in Dew as a source bundle, and its `save(directory)` writes the
-Hugging Face layout and asks the tokenizer the run trained with to save its
-own files into the same directory. Another runtime can read that directory as
-it is.
+`PretrainedDecoder.from_model(model, variables, tokenizer=...)` wraps a model
+you trained in Dew so you can export it. `save(directory)` writes the weights
+and config in the Hugging Face layout and saves the run's tokenizer files next
+to them. Another runtime can load that directory directly.
 
-Tokenize a corpus with the tokenizer the export will carry, so the token ids
-and the exported vocabulary are the same one. `tiny-tools` is the small
-byte-level BPE tokenizer committed for the tests, and the corpus is the
-TinyStories file that [Language modeling](#language-modeling) downloads:
+Tokenize the corpus with the tokenizer you will export, so the token IDs match
+the exported vocabulary. Here that is `tiny-tools`, a small byte-level BPE
+tokenizer committed for the tests, and the corpus is the TinyStories file from
+[Language modeling](#language-modeling):
 
 ```bash
 dew tokenize \
@@ -1143,8 +1158,8 @@ drawn = task("The trainer", 12, key=jax.random.key(1),
 print(task.decode(drawn))
 ```
 
-The export directory holds the weights, the config both runtimes read, and the
-tokenizer's own files:
+The export directory holds the weights, the config that both runtimes read,
+and the tokenizer's files:
 
 ```
 runs/dew-decoder/
@@ -1156,9 +1171,9 @@ runs/dew-decoder/
 └── tokenizer_config.json
 ```
 
-`qk_norm=False` and `tie_embeddings=False` make the exporter write a `llama`
-config, which is the architecture llama.cpp converts; the default decoder
-exports as `qwen3`, and Ollama 0.32.9 answers `unsupported architecture
+With `qk_norm=False` and `tie_embeddings=False` the exporter writes a `llama`
+config, an architecture llama.cpp can convert. The default decoder exports as
+`qwen3`, which Ollama 0.32.9 rejects with `unsupported architecture
 "Qwen3ForCausalLM"`. `ollama create` reads the export through the running
 daemon, so start `ollama serve` first, then convert the directory with a
 Modelfile:
@@ -1174,14 +1189,16 @@ ollama create dew-decoder -f Modelfile
 ```
 
 `num_gpu 0` keeps the runner on the CPU. `TEMPLATE "{{ .Prompt }}"` passes
-the prompt through unchanged, so the served draw is comparable to the local one.
+the prompt through unchanged, so you can compare the served output with the
+local one.
 These steps ran on Ollama 0.32.9 on Linux x86-64. On the same machine, Ollama
 0.34.3's `ollama create` stops at `MLX runtime is not available`.
 
-`OllamaCompletion` and `OpenAICompletion` wrap the vendors' own SDK clients,
-which you construct and own. Pass a `Sampling` to request the same sampling
-policy that local generation uses. The client turns it into backend options
-and switches off the daemon's own repetition penalties and other truncations.
+`OllamaCompletion` and `OpenAICompletion` wrap the vendors' SDK clients,
+which you create yourself. Pass a `Sampling` to ask for the same sampling
+settings that local generation uses. The client translates it into backend
+options and turns off the daemon's own repetition penalties and other
+truncations.
 
 ```python
 import ollama
@@ -1194,12 +1211,12 @@ served = client("The trainer", 12, sampling=Sampling(temperature=0.0), key=0, ra
 print(served.texts, served.finish_reasons)
 ```
 
-With `temperature=0.0`, the daemon reproduces Dew's greedy draw token for
-token, so `served.texts[0] == task.decode(drawn)[0]`. `Completion` also carries
-`token_counts`, a `usage` record, and the SDK's own responses under
+With `temperature=0.0`, the daemon reproduces Dew's greedy output token for
+token, so `served.texts[0] == task.decode(drawn)[0]`. `Completion` also has
+`token_counts`, a `usage` record, and the raw SDK responses under
 `responses`. For vLLM, serve the same directory and pass `provider="vllm"`,
-which enables the sampling controls vLLM accepts beyond the OpenAI schema;
-SGLang accepts the same controls with `provider="sglang"`:
+which enables the sampling controls vLLM accepts beyond the OpenAI schema.
+`provider="sglang"` does the same for SGLang:
 
 ```bash
 vllm serve runs/dew-decoder --served-model-name dew-decoder
@@ -1223,19 +1240,19 @@ accept them.
 
 ## Distributed training
 
-`MeshSpec` describes the device topology; `Layout` maps model dimensions onto it. For example, `MeshSpec(fsdp=4)` splits eligible parameters and optimizer state over four devices. The remaining devices form the data-parallel axis. Use the same `Trainer` interface on one device or a mesh.
+`MeshSpec` describes how the devices are arranged, and `Layout` maps model dimensions onto that mesh. For example, `MeshSpec(fsdp=4)` splits eligible parameters and optimizer state over four devices, and the remaining devices form the data-parallel axis. `Trainer` works the same way on one device or a mesh.
 
-The mesh also supports expert, tensor, sequence, and stage axes. Sequence-parallel attention picks its exchange per call: Ulysses all-to-alls, which trade sequence rows for heads so no device holds a whole key or value, where the heads and lengths divide and they move fewer bytes, as causal attention does; a key/value gather everywhere else. The GPipe stage axis partitions the execution view; parameters and optimizer state stay replicated across stages, so a stage split saves activation memory rather than parameter memory. `MeshSpec(fsdp=8, replicas=2)` is hybrid sharding over two nodes: fsdp inside each node, replicas across them.
+The mesh also has expert, tensor, sequence and stage axes. Sequence-parallel attention chooses how to exchange data on each call. It uses Ulysses all-to-alls, which trade sequence rows for heads so that no device holds a whole key or value, when the heads and lengths divide evenly and the all-to-all moves fewer bytes, as it does for causal attention. Otherwise it gathers keys and values. The GPipe stage axis splits execution into stages, but parameters and optimizer state stay replicated across stages, so stages save activation memory and not parameter memory. `MeshSpec(fsdp=8, replicas=2)` is hybrid sharding over two nodes: FSDP inside each node and replicas across them.
 
-Models use configurable compute dtypes and hardware-dependent attention kernels: cuDNN on compatible NVIDIA GPU shapes, a Pallas TPU path, and XLA implementations for other configurations. Qwix supplies optional int8/fp8 computation, and MuonClip adds per-head QK clipping to Muon. Quantized weight loading is separate from quantized training.
+Compute dtypes are configurable, and the attention kernel depends on the hardware: cuDNN for supported shapes on NVIDIA GPUs, a Pallas kernel on TPU, and XLA otherwise. Qwix provides optional int8 and fp8 compute, and MuonClip adds per-head QK clipping to Muon. Loading quantized weights is separate from quantized training.
 
-Set `remat` on a decoder to a policy name such as `"full"`, `"minimal"`, or `"save_qkv_proj"` to recompute block activations during the backward pass while keeping the named projections. Offloaded policies such as `"minimal_offloaded"` keep those residuals in pinned host memory, and `Layout(host=("opt_state", "ema"))` keeps the optimizer state and the EMA copy there between steps. Both reduce device memory at the cost of extra computation or transfers, and both work with layer scanning.
+Set `remat` on a decoder to a policy name such as `"full"`, `"minimal"` or `"save_qkv_proj"` to recompute block activations in the backward pass. A policy such as `"save_qkv_proj"` keeps the projections it names. Offloaded policies such as `"minimal_offloaded"` keep those residuals in pinned host memory, and `Layout(host=("opt_state", "ema"))` keeps the optimizer state and the EMA copy there between steps. Both save device memory at the cost of extra compute or transfers, and both work with layer scanning.
 
 Start with [distributed training](docs/concepts/distributed.md) and the [TPU guide](docs/tpu.md). [Benchmarks](docs/benchmarks.md) and [performance notes](docs/performance.md) record workload sizes, hardware, memory, and timing.
 
 ### Multiple hosts
 
-Use the same script on each host. The example below uses two hosts with two visible GPUs each and shards model state over all four devices. Both hosts must read the same token files and checkpoint directory. [Training on several nodes](docs/guides/multi-node.md) covers Slurm, hybrid sharding and long sequences.
+Every host runs the same script. The example below uses two hosts with two GPUs each and shards the model state over all four devices. Both hosts must see the same token files and checkpoint directory. [Training on several nodes](docs/guides/multi-node.md) covers Slurm, hybrid sharding and long sequences.
 
 Prepare byte-token data from your corpus and place it on shared storage:
 
@@ -1247,7 +1264,7 @@ dew tokenize \
     --val-fraction 0.01
 ```
 
-Save as `train_multihost.py`. `prepare_process` joins the process pool, so it comes before any device array.
+Save this as `train_multihost.py`. `prepare_process` joins the process pool, so call it before you create any device array.
 
 ```python
 import os
@@ -1304,7 +1321,7 @@ if __name__ == "__main__":
     main()
 ```
 
-Launch it from the first host. `dew launch` starts one process per GPU on each host over ssh, four here, and gives each its GPU, the coordinator, the process count and its rank. The remote shell reads no login profile, so name the interpreter by its absolute path:
+Launch it from the first host. `dew launch` uses ssh to start one process per GPU on each host (four in all) and gives each process its GPU, the coordinator address, the process count and its rank. The remote shell does not read a login profile, so give the interpreter's absolute path:
 
 ```bash
 dew launch --hosts 10.0.0.1,10.0.0.2 \
@@ -1312,13 +1329,15 @@ dew launch --hosts 10.0.0.1,10.0.0.2 \
     -- /opt/dew/.venv/bin/python train_multihost.py
 ```
 
-`batch=16` is global, so each process reads four rows. The same command without `--hosts` runs on the GPUs of this machine; inside a Slurm allocation it starts `srun`, and `--tpu NAME` runs on every worker of a Cloud TPU. [Training on several nodes](docs/guides/multi-node.md) covers each. To rehearse the launch on a machine without GPUs, run `dew launch --processes-per-host 2 --env JAX_PLATFORMS=cpu --env XLA_FLAGS=--xla_force_host_platform_device_count=2 --env DEW_STEPS=20 ...` with local directories: two processes of two simulated devices fill the same `MeshSpec(fsdp=4)`, and each prints `20 updates`.
+`batch=16` is the global batch, so each process reads four rows. Without `--hosts`, the same command runs on this machine's GPUs. Inside a Slurm allocation it starts `srun`, and with `--tpu NAME` it runs on every worker of a Cloud TPU. [Training on several nodes](docs/guides/multi-node.md) covers each case. To rehearse the launch on a machine without GPUs, run `dew launch --processes-per-host 2 --env JAX_PLATFORMS=cpu --env XLA_FLAGS=--xla_force_host_platform_device_count=2 --env DEW_STEPS=20 ...` with local directories. Two processes with two simulated devices each make up the same `MeshSpec(fsdp=4)`, and each process prints `20 updates`.
 
 ### Generating text with Gemma 4 on one GPU
 
-`dew.pipeline` loads a published checkpoint and returns a callable task. Set `JAX_PLATFORMS=cuda` before starting Python. I have not run this released Gemma 4 checkpoint on the 4080; check loading memory before attempting it.
+`dew.pipeline` loads a published checkpoint and returns a task you can call. Set `JAX_PLATFORMS=cuda` before starting Python. I have not run this released Gemma 4 checkpoint on the 4080, so check that it fits in memory before you try it.
 
 ```python
+import jax.numpy as jnp
+
 import dew
 
 chat = dew.pipeline("google/gemma-4-E2B-it", dtype=jnp.bfloat16)
@@ -1332,20 +1351,21 @@ for text in result.text:
     print(text)
 ```
 
-The task carries the checkpoint's processor, so it accepts strings and `result.text` returns decoded continuations. The second positional argument is the token budget; a checkpoint's `generation_config.json` supplies a default when it declares one. `n=4` draws four continuations per prompt. The prompts above go through the tokenizer directly; use `task.processor.chat(messages)` to apply the checkpoint's chat template and pass the returned `ModelInputs` to the same call.
+The task includes the checkpoint's processor, so it accepts strings and `result.text` holds the decoded continuations. The second positional argument is the token budget; if the checkpoint's `generation_config.json` declares one, that is the default. `n=4` draws four continuations per prompt. The prompts above go straight to the tokenizer. To apply the checkpoint's chat template, call `task.processor.chat(messages)` and pass the `ModelInputs` it returns to the same call.
 
-E2B is a multimodal wrapper; the task also accepts `images=` when the checkpoint declares a vision tower. Here, `dtype="bfloat16"` selects computation, not weight storage. The Gemma 4 loader retains FP32 parameters, and loading also needs host buffers, device temporaries, and the KV cache. This example does not establish that E2B fits a 16 GB GPU.
+E2B wraps a multimodal model, and the task also accepts `images=` when the checkpoint declares a vision tower. The `dtype` here sets the compute dtype, not how weights are stored: the Gemma 4 loader keeps FP32 parameters. Loading also needs host buffers, device temporaries and the KV cache, so this example does not show that E2B fits on a 16 GB GPU.
 
 ### Generating text with a large decoder on a TPU slice
 
-Every process runs the same script and supplies its own prompts. `result.host()` returns only that process's real rows. I have not verified this deployment on a real TPU slice. The current pipeline loads the checkpoint before sharding it, so aggregate device memory alone does not establish that loading succeeds.
+Every process runs the same script with its own prompts, and `result.host()` returns only that process's real rows. I have not run this on a real TPU slice. The pipeline loads the checkpoint before it shards it, so having enough device memory in total does not mean loading will succeed.
 
-Save as `generate_tpu.py`:
+Save this as `generate_tpu.py`:
 
 ```python
 import os
 
 import jax
+import jax.numpy as jnp
 
 
 def main():
@@ -1372,22 +1392,22 @@ if __name__ == "__main__":
     main()
 ```
 
-`MeshSpec(fsdp=jax.device_count())` distributes eligible weights over the slice; small or indivisible leaves may remain replicated. Cloud TPU environments can supply coordinator discovery for `jax.distributed.initialize()`. For manual clusters, pass the coordinator address, process count, and process ID as in the training example. Authenticate on each worker through its environment or credential store; do not put tokens in launch arguments. Save the script on every worker and preview the launch on every worker (see [Cloud TPUs](docs/tpu.md)):
+`MeshSpec(fsdp=jax.device_count())` shards eligible weights over the slice; small leaves, and leaves that don't divide evenly, may stay replicated. On Cloud TPU, `jax.distributed.initialize()` can find the coordinator by itself. On a cluster you manage yourself, pass the coordinator address, process count and process ID, as in the training example. Authenticate each worker through its environment or credential store, and keep tokens out of launch arguments. Save the script on every worker, then preview the launch on every worker (see [Cloud TPUs](docs/tpu.md)):
 
 ```bash
 dew launch --tpu dew-16 --zone us-central2-b --dry-run \
     --env DEW_MODEL=google/gemma-4-31B-it -- python generate_tpu.py
 ```
 
-Each worker needs access to the checkpoint and tokenizer files. A shared download cache does not eliminate per-process loading buffers. Budget for the stored weight dtype, replicated leaves, loading peaks, and KV cache; dividing checkpoint bytes by device count is insufficient. Row counts, tokenized shapes, and execution controls must agree across processes. Use the same seed on every rank; Dew derives global row keys. Rehearse on a small checkpoint and CPU process pool before an authorized TPU run.
+Each worker needs access to the checkpoint and tokenizer files. A shared download cache still leaves every process with its own loading buffers. When you estimate memory, count the stored weight dtype, replicated leaves, loading peaks and the KV cache; checkpoint bytes divided by the device count is too low. Row counts, tokenized shapes and execution settings must match across processes. Use the same seed on every rank, because Dew derives each global row's key from it. Rehearse with a small checkpoint on a CPU process pool before a real TPU run.
 
 ## Data and configuration
 
-Dew's data specifications prepare batches through Grain. Token loaders support fixed windows and packed documents; chat, preference, and prompt loaders provide post-training data. Image/video sources include local files, Hugging Face datasets, TFDS, ArrayRecord shards, and URL streams.
+Dew's dataset specifications build batches with Grain. The token loaders read fixed windows or packed documents, and the chat, preference and prompt loaders read post-training data. Image and video data can come from local files, Hugging Face datasets, TFDS, ArrayRecord shards or URL streams.
 
-`Loading` controls workers, read threads, and buffering. `Dataset` also accepts your own iterator factories, as in the opening example. See [data loading](docs/concepts/data.md) for transforms, deterministic randomness, batching, and iterator ownership.
+`Loading` sets the number of workers, read threads and buffers. `Dataset` also accepts your own iterator factories, as in the fine-tuning examples above. [Data loading](docs/concepts/data.md) covers transforms, deterministic randomness, batching and who owns the iterators.
 
-The recipes expose dataclass configurations through tyro. `ModelConfig`, `OptimConfig`, and `TrainerConfig` collect model, optimizer, and run settings; task-specific configurations add diffusion or language-model options. `--help` shows the available command-line arguments:
+The recipes turn dataclass configurations into command-line options with tyro. `ModelConfig`, `OptimConfig` and `TrainerConfig` hold the model, optimizer and run settings, and task-specific configurations add diffusion or language-model options. `--help` lists the options:
 
 ```bash
 python recipes/lm/train.py --help
@@ -1395,7 +1415,7 @@ python recipes/diffusion/train.py --help
 python recipes/jepa/train.py --help
 ```
 
-The [recipe guide](docs/recipes.md) includes a complete text-corpus preparation and training workflow.
+The [recipe guide](docs/recipes.md) walks through preparing a text corpus and training on it.
 
 ## Installation
 
@@ -1409,7 +1429,7 @@ source .venv/bin/activate
 uv pip install -e .
 ```
 
-Add the extra for your hardware; its accelerator build of JAX matches the JAX Dew requires:
+Then add the extra for your hardware. Each one installs the accelerator build of the JAX version Dew requires:
 
 | Hardware | Install |
 |---|---|
@@ -1417,9 +1437,9 @@ Add the extra for your hardware; its accelerator build of JAX matches the JAX De
 | NVIDIA GPU | `uv pip install -e ".[cuda12]"` (or `cuda13` for CUDA 13 drivers) |
 | Google TPU | `uv pip install -e ".[tpu]"` |
 
-Installing from the repository without a checkout works the same way: `uv pip install "dewml[cuda13] @ git+https://github.com/AshishKumar4/dew"`. The extras install the accelerator build of jax 0.11.2, the version Dew requires; a later `-U "jax[...]"` would replace it with a release Dew isn't tested on. A process pool across GPUs keeps its compilation cache only with a patched jax 0.11.2 ([jax-ml/jax#40940](https://github.com/jax-ml/jax/issues/40940)); the [installation guide](docs/installation.md#process-pools-across-gpus) says how to install it. See the [JAX installation guide](https://docs.jax.dev/en/latest/installation.html) for driver requirements.
+To install from the repository without cloning it, run `uv pip install "dewml[cuda13] @ git+https://github.com/AshishKumar4/dew"`. The extras install the accelerator build of jax 0.11.2, the version Dew requires. A later `-U "jax[...]"` would replace it with a release Dew isn't tested on. A process pool across GPUs keeps its compilation cache only with a patched jax 0.11.2 ([jax-ml/jax#40940](https://github.com/jax-ml/jax/issues/40940)); the [installation guide](docs/installation.md#process-pools-across-gpus) explains how to install it. See the [JAX installation guide](https://docs.jax.dev/en/latest/installation.html) for driver requirements.
 
-The optional extras are `av`, `cuda12`, `cuda13`, `diffusers`, `eval-harness`, `gguf`, `guided`, `hpo`, `inference-clients`, `interop`, `metrics`, `mlflow`, `plots`, `profile`, `streaming`, `tensorboard`, `test`, `tfds`, `torch`, `torchax`, `tpu`, `vision` and `wandb`. `interop` reads and writes safetensors, `vision` supplies the host image processors that the multimodal checkpoints call, and `inference-clients` installs the Ollama and OpenAI SDKs that the serving section uses. The sections above name the extra each feature needs. The [installation guide](docs/installation.md) covers development dependencies and dataset preparation.
+The optional extras are `av`, `cuda12`, `cuda13`, `diffusers`, `eval-harness`, `gguf`, `guided`, `hpo`, `inference-clients`, `interop`, `metrics`, `mlflow`, `plots`, `profile`, `streaming`, `tensorboard`, `test`, `tfds`, `torch`, `torchax`, `tpu`, `vision` and `wandb`. `interop` reads and writes safetensors, `vision` provides the host image processors that the multimodal checkpoints call, and `inference-clients` installs the Ollama and OpenAI SDKs used in the serving section. The sections above name the extra each feature needs. The [installation guide](docs/installation.md) covers development dependencies and dataset preparation.
 
 ## Documentation and examples
 
@@ -1432,7 +1452,7 @@ The optional extras are `av`, `cuda12`, `cuda13`, `diffusers`, `eval-harness`, `
 - [API reference](docs/reference/core-api.md): constructors, arguments, and state contracts.
 - [Examples](examples/) and [recipes](docs/recipes.md): complete programs to adapt.
 
-The five scripts below run a whole job, from data to scored weights. Each takes real-hardware settings by default and a `--smoke` flag that trades them for the repository's tiny fixtures, a few steps, and one CPU device. [End-to-end examples](docs/guides/end-to-end.md) gives both command lines for each.
+Each of the five scripts below runs a whole job, from data to scored weights. By default they use settings for real hardware; `--smoke` swaps those for the repository's tiny fixtures, a few steps and one CPU device. [End-to-end examples](docs/guides/end-to-end.md) gives both command lines for each.
 
 - [`examples/train_flowers_tpu.py`](examples/train_flowers_tpu.py): a text-to-image DiT trained on Oxford Flowers across a TPU slice, then sampled and scored with FID and CLIPScore.
 - [`examples/sft_diffusion_gemma.py`](examples/sft_diffusion_gemma.py): LoRA SFT of DiffusionGemma with the base weights held in host memory, publishing a PEFT adapter directory.

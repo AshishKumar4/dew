@@ -52,10 +52,14 @@ def ema_update(ema: optax.Params, params: optax.Params, decay: jax.typing.ArrayL
 
 
 def ema_update(ema, params, decay):
-    """Update selected EMA leaves in their initialized storage dtypes.
+    """Update the EMA leaves toward `params`, keeping each leaf's storage dtype.
 
-    Arithmetic uses at least fp32 and preserves explicit fp64. Unit decay
-    selects the original leaf, including nonfinite frozen-reference values.
+    Each leaf of `ema` becomes `decay * average + (1 - decay) * live`, where
+    the live value is the leaf of `params` at the same path; leaves that
+    `ema` does not hold are not averaged. The arithmetic runs in fp32 or
+    wider, so fp64 leaves keep fp64 precision. A decay of 1 or more returns
+    the average leaf as it was, even when it holds nonfinite values, as a
+    frozen reference can.
     """
     def step(average, live):
         dtype = jnp.result_type(average.dtype, live.dtype, decay, jnp.float32)
