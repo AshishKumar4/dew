@@ -1,12 +1,10 @@
 # Training recipes
 
-A recipe is a command-line script in `recipes/`. It builds a model, loads data, selects an objective and calls `Trainer.fit`. Every setting comes from a typed configuration saved beside the checkpoints as `run.json`.
-
-Use `recipes/lm/train.py` for language models, `recipes/diffusion/train.py` for diffusion and `recipes/jepa/train.py` for JEPA. The `recipes/` and `tools/` scripts are in the repository checkout, outside the installed `dew` package. The [first training run](getting-started.md) uses the same objects directly in Python.
+A recipe is a command-line script in `recipes/` that builds a model, loads data, picks an objective and calls `Trainer.fit`. Every setting comes from a typed configuration, and the recipe saves that configuration next to the checkpoints as `run.json`. The repository has recipes for language models (`recipes/lm/train.py`), diffusion (`recipes/diffusion/train.py`) and JEPA (`recipes/jepa/train.py`). The `recipes/` and `tools/` scripts are in the repository checkout and are not part of the installed `dew` package. The [first training run](getting-started.md) puts the same pieces together in Python.
 
 ## Example
 
-Train a small language model from random initialization on a corpus you create below, without downloading data or weights. After [installation](installation.md), open a shell in the Dew checkout. Save its path and move to an empty working directory:
+The example trains a small language model from random initialization on a corpus it writes itself, so it downloads no data and no weights. After [installation](installation.md), open a shell in the Dew checkout, save its path and move to an empty working directory:
 
 ```bash
 export DEW_REPO="$PWD"
@@ -41,7 +39,7 @@ wrote 48276 tokens to tokens/train.bin and 5364 to tokens/val.bin
 tokens/meta.json: {"tokenizer": "byte", "vocab_size": 256, "dtype": "uint8", "train_tokens": 48276, "val_tokens": 5364, "eos_id": null}
 ```
 
-Keep the three token files together. `tokens/meta.json` records the tokenizer, vocabulary size, storage dtype and token counts. Validation uses the first 10% of the token stream without random sampling. This repeating corpus checks the workflow only; it does not measure generalization.
+`tokens/meta.json` records the tokenizer, the vocabulary size, the storage dtype and the token counts, so keep the three files together. The validation split is the first 10% of the token stream, not a random sample. This corpus repeats itself, so it tests the workflow and tells you nothing about generalization.
 
 `--help` prints the flags and trains nothing:
 
@@ -77,9 +75,9 @@ Trained 2 steps in 0:00:01: first step after 0.49 s, then 137.6 step/s
 1.1% of the wall time in steps, final loss 5.713
 ```
 
-The first update includes compilation. The run logs loss at steps 1 and 2 and validation perplexity at step 2. It saves a checkpoint at `runs/byte-demo/2`, with configuration in `runs/byte-demo/run.json`. The checkpoint stores training state and data position; see [Checkpoints](guides/checkpoints.md).
+The first update includes compilation. The run logs a loss at steps 1 and 2 and a validation perplexity at step 2. It writes a checkpoint to `runs/byte-demo/2` and the configuration to `runs/byte-demo/run.json`. The checkpoint holds the training state and the position in the data stream ([Checkpoints](guides/checkpoints.md)).
 
-With `--sample-tokens 0`, validation scores tokens without generating text. For sample continuations in a longer run, use `--sample-prompt "The number after" --sample-tokens 32`. Sampling uses EMA weights. The recipe sets enough decoder context for the prompt and new tokens. Early in training, random bytes may decode to replacement characters.
+`--sample-tokens 0` turns off text sampling, so validation only scores tokens. In a longer run you can ask for sample continuations with `--sample-prompt "The number after" --sample-tokens 32`. Sampling uses the EMA weights, and the recipe makes the decoder's context long enough for the prompt plus the new tokens. Early in training, random bytes may decode to replacement characters.
 
 ## Configuration
 
@@ -92,7 +90,7 @@ Every recipe's configuration extends `RunConfig` with four parts:
 | `optim` (`OptimConfig`) | Optimizer, learning rate, schedule, weight decay, clipping, optimizer-state dtype. | `--optim.learning-rate 0.0001` |
 | `trainer` (`TrainerConfig`) | Run length, batch size, checkpoint and logging intervals, mesh and layout, tracking. | `--trainer.steps 1000` |
 
-A dotted flag sets a field in a configuration object. A subcommand such as `data:token-windows` selects a registered dataset type and exposes its flags. Pass architecture fields in one JSON object through `--model.config`, using their Python spelling, such as `num_layers`. Only include fields the chosen architecture accepts. Meshes and layouts belong to the trainer configuration; see [Distributed training](concepts/distributed.md).
+A dotted flag sets a field inside a configuration object. A subcommand such as `data:token-windows` picks a registered dataset type and makes its flags available. Put all architecture fields in one JSON object passed to `--model.config`, spelled as in Python (`num_layers`), and use only fields the chosen architecture accepts. Meshes and layouts are trainer fields ([Distributed training](concepts/distributed.md)), so they do not go in `--model.config`.
 
 | Setting | Default | Notes |
 |---|---|---|
@@ -108,33 +106,25 @@ A dotted flag sets a field in a configuration object. A subcommand such as `data
 | `--trainer.multi-host` | `None` | Join the JAX process pool: `None` asks and continues alone when no cluster is configured, `True` requires the pool, `False` never asks. |
 | `--trainer.xla-flags` | `None` | Extra `XLA_FLAGS`, applied before JAX opens a backend. |
 
-Loader workers and threads control host data reading. Device batch size is unchanged. With zero workers, the loader starts no worker processes. See [Training data](concepts/data.md) for loading settings.
+Loader workers and threads control how the host reads data; they do not change the batch size on the device. With zero workers the loader starts no worker processes. [Training data](concepts/data.md) covers the loading settings.
 
-An `epoch` interval requires a dataset with a known size. If a stream cannot save and restore its read position, set its checkpoint interval to `None`. It cannot produce a resumable checkpoint, but a configured checkpointer still saves the final state.
+An `epoch` interval needs a dataset with a known size. A stream that cannot save and restore its read position cannot produce a resumable checkpoint, so `fit` refuses a checkpoint interval for it and you have to set `--trainer.checkpoint-every None`. A configured checkpointer still writes the final state.
 
-Muon treats matrix parameters separately from embedding, head and normalization parameters. MuonClip also needs attention QK statistics for clipping. The LM recipe enables `qk_stats` when the optimizer is `muonclip`. A new objective must emit those statistics itself.
+Muon treats matrix parameters separately from embedding, head and normalization parameters. MuonClip also needs attention QK statistics for its clipping step. The LM recipe turns them on (`qk_stats`) when the optimizer is `muonclip`, and a new objective has to emit them itself. MuonClip clips by rescaling the query and key kernels. A layer that normalizes its queries and keys divides that scale back out of the logits, so MuonClip refuses such a layer. The causal transformer normalizes them by default, so to train it with MuonClip, pass `--optim.optimizer muonclip --model.config '{..., "qk_norm": false}'`.
 
-MuonClip rescales query and key kernels. Query/key normalization would cancel that scaling in the logits, so MuonClip rejects layers with it enabled. The causal transformer normalizes queries and keys by default. To train it with MuonClip, use `--optim.optimizer muonclip --model.config '{..., "qk_norm": false}'`.
+`--optim.state-dtype bfloat16` halves the memory the optimizer state takes. Its effect on step time depends on the device ([Performance measurements](performance.md)).
 
-`--optim.state-dtype bfloat16` halves optimizer-state storage. Its effect on step time depends on the device; see [Performance measurements](performance.md).
-
-With `trainer.wandb` unset, the recipe prints to the terminal and writes a local journal in `<checkpoint-dir>/<name>/tracking`. For Weights & Biases, select `trainer.wandb:wandb` and set `--trainer.wandb.project NAME`. `--trainer.wandb.offline` prevents an online tracking session. It does not prevent dataset or model downloads.
-
-Profiling is off unless you set `trainer.profile`. `run.json` records configuration only. To reproduce a run, separately archive dataset contents, package versions and the source checkout.
+With `trainer.wandb` unset, the recipe prints to the terminal and keeps a local tracking journal in `<checkpoint-dir>/<name>/tracking`. To use Weights & Biases, select it with `trainer.wandb:wandb` and set `--trainer.wandb.project NAME`. `--trainer.wandb.offline` stops the tracker from opening an online session, but the recipe can still download datasets and models. Profiling is off unless `trainer.profile` is set. `run.json` records the configuration only, so to reproduce a run, archive the dataset contents, the package versions and the source checkout separately.
 
 ## Token data and pretrained models
 
-To use your own corpus, replace `corpus.txt` with a UTF-8 file or a directory of `.txt` files. Tokenize into a new output directory with the tokenizer used for training. The recipe reads vocabulary size from `meta.json`; there is no vocabulary-size flag. `data:token-windows` reads fixed-width windows from the stream.
+To train on your own text, replace `corpus.txt` with a UTF-8 file or a directory of `.txt` files. Tokenize it into a new output directory with the tokenizer the run will train with. The recipe reads the vocabulary size from `meta.json`, so there is no flag for it. `data:token-windows` cuts fixed-width windows from the token stream.
 
-For whole documents, tokenize with `--pack` and select `data:packed-tokens`. The packed loader resets attention boundaries and positions between documents. `--pack` treats each input file as one document and appends the tokenizer's EOS ID. The byte tokenizer uses ID 255 for EOS, a byte that never occurs in UTF-8 text.
+For whole documents, tokenize with `--pack` and select `data:packed-tokens`. `--pack` treats each input file as one document and writes the tokenizer's EOS ID after it. The byte tokenizer's EOS is ID 255, a byte that never occurs in UTF-8 text. The packed loader then resets attention boundaries and positions between documents.
 
-`--pretrained` accepts a supported Hugging Face model directory, a Hub ID, or `repo@revision` for a branch, tag or commit. A Hub ID may trigger a download requiring authentication and a license agreement. `run.json` records the resolved source as `repo@commit`.
+`--pretrained` takes a supported Hugging Face model directory, a Hub ID, or `repo@revision` for a branch, tag or commit. A Hub ID can start a download, which may need authentication and a license agreement. `run.json` records a Hub source as `repo@commit`, with the commit it resolved to. To run offline, prepare a local checkpoint and its tokenizer, tokenize the data with that tokenizer, and pass matching `--tokenizer` and `--pretrained` values. The checkpoint decides the architecture, so `--model.config` may hold `max_seq_len` and nothing else. With any other field, the recipe refuses to load the checkpoint. [Language models](concepts/language_models.md) covers loading and export.
 
-For offline use, prepare a local checkpoint and its tokenizer. Tokenize the data with that tokenizer, then pass matching `--tokenizer` and `--pretrained` values. The checkpoint determines the architecture. In this mode, `--model.config` accepts only `max_seq_len`; any other field makes the recipe reject loading. See [Language models](concepts/language_models.md) for loading and export.
-
-The LM recipe's `--objective` accepts `lm`, `masked_diffusion` or `block_diffusion`. Use `masked_diffusion` for bidirectional masked denoising. With `--pretrained`, it continues from a LLaDA or Dream checkpoint. Without it, training starts from fresh initialization and requires `mask_token_id` and `causal=False` in `--model.config`.
-
-Use `block_diffusion` to fine-tune a DiffusionGemma checkpoint. It requires both `--pretrained` and `data:token-windows`. SFT, DPO and GRPO run in Python, outside these three recipe modes; see [Post-training](concepts/post_training.md).
+The LM recipe's `--objective` takes `lm`, `masked_diffusion` or `block_diffusion`. `masked_diffusion` trains a bidirectional masked-denoising model. With `--pretrained` it continues from a LLaDA or Dream checkpoint. Without it, the model starts from a fresh initialization, and `--model.config` needs `mask_token_id` as well as `causal=False`. `block_diffusion` fine-tunes a DiffusionGemma checkpoint and needs both `--pretrained` and `data:token-windows`. The recipe does not run SFT, DPO or GRPO; those run in Python ([Post-training](concepts/post_training.md)).
 
 ## Diffusion and JEPA recipes
 
@@ -143,26 +133,24 @@ python "$DEW_REPO/recipes/diffusion/train.py" --help
 python "$DEW_REPO/recipes/jepa/train.py" --help
 ```
 
-A diffusion configuration adds a training `preset`, validation `solver`, guidance, sampling steps, text condition and optional autoencoder. Select registered choices with subcommands such as `preset:edm` and `sampler:heun`. Set guidance through its configuration object with `--guidance.scale`. There is no bare numeric `--guidance` flag.
+A diffusion configuration adds a training `preset`, a validation `solver`, guidance, the number of sampling steps, a text condition and an optional autoencoder. You pick registered choices with subcommands such as `preset:edm` and `solver:heun`. Guidance is a configuration object, so you set its scale with `--guidance.scale`; there is no bare numeric `--guidance` flag.
 
-By default, the recipe trains on Oxford Flowers with a CLIP text encoder and scores validation with a CLIP metric. First prepare Oxford Flowers and pass its path as `--data.path`; see [Installation](installation.md). The encoder and metric download `openai/clip-vit-large-patch14` from Hugging Face if it is not cached. An offline tracker does not prepare the dataset or models.
+By default the recipe trains on Oxford Flowers with a CLIP text encoder and scores validation with a CLIP metric. Prepare Oxford Flowers first and pass it as `--data.path` ([Installation](installation.md)). The CLIP text encoder and the CLIP metric download `openai/clip-vit-large-patch14` from Hugging Face unless it is cached. An offline tracker does not prepare any of these.
 
-To fine-tune a published diffusion pipeline, pass `--pretrained` a Hub ID, `repo@revision` or local directory in the diffusers layout. Supported pipelines include SD 1.x/2.x/XL, SD3, Flux, FLUX.2, Qwen-Image and Z-Image.
+`--pretrained` fine-tunes a published diffusion pipeline in the diffusers layout. It takes a Hub ID, `repo@revision` or a local directory holding SD 1.x/2.x/XL, SD3, Flux, FLUX.2, Qwen-Image or Z-Image. The pipeline decides the model, its autoencoder and its text conditioning, which comes from all of its text encoders and reaches the model as `conditioning`. So `--model` then sets only `dtype`, `param_dtype` and `attention_impl`, and `text` and `autoencoder` stay unset. The pipeline runs at the data's resolution, and its images use the autoencoder's own channels; Qwen-Image 2.1's, for example, are RGBA.
 
-The pipeline supplies the model, text encoders and autoencoder. It passes all text-encoder outputs to the model as `conditioning`. In this mode, `--model` holds only `dtype`, `param_dtype` and `attention_impl`. Leave `text` and `autoencoder` unset. Training uses the data's resolution and the autoencoder's image channels; Qwen-Image 2.1, for example, uses RGBA.
+`preset:none` trains with the convention the pipeline's scheduler reads, using the flow shift its sampler applies at that resolution. That shift is 3.0 for SD3, and for Flux it is exp(mu), with mu linear in the packed latent's token count. A scheduler file says how its checkpoint samples and says nothing about how it was trained, so this is a choice Dew makes for fine-tuning. A preset of the same kind replaces it, for example `preset:flow --preset.shift 1.0`. `run.json` records a Hub source as `repo@commit`.
 
-With `preset:none`, training uses the convention read by the pipeline's scheduler and the flow shift its sampler uses at that resolution. The shift is 3.0 for SD3. For Flux, it is exp(mu) of the packed latent's token count. A scheduler file describes sampling, not the original training procedure, so this is Dew's fine-tuning choice. To replace it, use a preset of the same kind, such as `preset:flow --preset.shift 1.0`. `run.json` records Hub sources as `repo@commit`.
+To train one of these published architectures from scratch, name it in `--model.architecture` and put its fields in `--model.config`. To condition it on a pipeline's text encoders, pass `--text.encoder diffusion_text --text.checkpoint REPO`.
 
-You can train these architectures from scratch by setting `--model.architecture` and their fields in `--model.config`. For conditioning from a pipeline's text towers, use `--text.encoder diffusion_text --text.checkpoint REPO`.
-
-For Flow-GRPO, select `rl:flow-grpo` with a flow preset. It trains with a reward objective in place of denoising loss. The rollout samples `--rl.groups` images per prompt through the flow SDE, then scores them with the image metric named by `--rl.reward`. The metric must reward higher values, as `clip_score` does.
+`rl:flow-grpo` trains the model with Flow-GRPO in place of the denoising loss, and it needs a flow preset. For each prompt it samples `--rl.groups` images through the flow SDE and scores them with the image metric named by `--rl.reward`. That metric has to give better images higher scores, as `clip_score` does.
 
 A JEPA configuration adds predictor fields, target-mask settings, an EMA momentum schedule for the target encoder, and optional representation probes. The predictor estimates the encoded features of hidden image or video regions. The dataset and the model must both be image or both be video. Set the run length explicitly and prepare the dataset before starting.
 
-To use either recipe from Python, call `main(config)`. Their configurations are frozen dataclasses extending `RunConfig`. Import `DiffusionRunConfig` from `dew.objectives.diffusion.config`. `JepaRunConfig` and `LmRunConfig` are defined in the recipe files. `main` sets up the process and builds the objective and data. See the [diffusion](guides/diffusion.md) and [representation learning](guides/representation-learning.md) guides for task-specific settings.
+To run a recipe from Python, call its `main(config)`. The configurations are frozen dataclasses that extend `RunConfig`. You can import `DiffusionRunConfig` from `dew.objectives.diffusion.config`, while `JepaRunConfig` and `LmRunConfig` are defined in the recipe files. A recipe's `main` sets up the process and builds the matching objective and data. The [diffusion](guides/diffusion.md) and [representation learning](guides/representation-learning.md) guides cover task-specific settings.
 
 ## Scaling up
 
-Before a longer run, check that a small run reaches the requested updates, reports finite losses, reads the intended split and writes to the intended directory. Increasing batch size, sequence length or model width needs more memory. A two-step run on one machine does not test multi-host collectives, sustained input throughput, preemption recovery or final model quality.
+Before a longer run, check that a small run reaches the number of updates you asked for, reports finite losses, reads the intended split and writes to the intended directory. A larger batch, sequence length or model width needs more memory. A two-step run on one machine does not test multi-host collectives, sustained input throughput, recovery after preemption or final model quality.
 
-See [Checkpoints](guides/checkpoints.md), [Evaluation and tracking](guides/evaluation.md) and [Training data](concepts/data.md) for resume and validation behavior. For example, if validation shards have different lengths, scoring stops at the shortest shard's end.
+[Checkpoints](guides/checkpoints.md) describes what a resume restores. [Evaluation and tracking](guides/evaluation.md) and [Training data](concepts/data.md) describe what validation scores. For example, when validation shards have different lengths, the rows past the end of the shortest shard are not scored.

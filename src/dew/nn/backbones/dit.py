@@ -25,19 +25,22 @@ def scatter_tokens(held: jax.Array, kept: jax.Array, tokens: jax.Array) -> jax.A
 
 @models("simple_dit")
 class SimpleDiT(_DiTStackOptions):
-    """Standard DiT: a plain stack of adaLN-Zero attention blocks.
+    """The standard DiT: a plain stack of adaLN-Zero attention blocks.
 
-    `adaln_silu=False` and `text_pooling="all"` are FlaxDiff 0.2's conditioning,
-    as in `SimpleUDiT`. `routes` is TREAD's token routing (Krause et al. 2025)
-    in training: each `(ratio, start, end)` draws `int(tokens * ratio)` tokens
-    per example, from the `dropout` stream, that skip blocks `start` to `end`
-    and rejoin after `end` with the values they entered with, as CompVis/tread's
-    `Router` does; kept tokens stay in order at their own positions. Sampling
-    runs every token through every block. `patch_bottleneck` is JiT's bottleneck
-    patch embedding (Li & He 2025), 128 in its models. `interval` reads the
-    `duration` of the predicted interval beside the time (MeanFlow, shortcut
-    models; `Process.interval`), and `time_scale` scales the Fourier
-    frequencies, small for a model trained through a JVP in time.
+    - `adaln_silu=False` and `text_pooling="all"` give FlaxDiff 0.2's
+      conditioning, as in `SimpleUDiT`.
+    - `routes` is TREAD's token routing (Krause et al. 2025) during training.
+      Each `(ratio, start, end)` draws `int(tokens * ratio)` tokens per
+      example, from the `dropout` stream, that skip blocks `start` to `end`
+      and rejoin after `end` with the values they had on entry, as
+      CompVis/tread's `Router` does; the kept tokens stay in order at their
+      own positions. Sampling runs every token through every block.
+    - `patch_bottleneck` is JiT's bottleneck patch embedding (Li and He 2025),
+      128 in its models.
+    - `interval` adds the `duration` of the predicted interval next to the
+      time, for MeanFlow and shortcut models (`Process.interval`).
+    - `time_scale` scales the Fourier frequencies; keep it small for a model
+      trained through a JVP in time.
     """
     adaln_silu: bool = True
     text_pooling: Literal["real", "all"] = "real"
@@ -94,8 +97,10 @@ class SimpleDiT(_DiTStackOptions):
         return self.output(x_seq, inv_idx, H, W)
 
     def checked_routes(self) -> list[tuple[float, int, int]]:
-        """`routes` as `(ratio, start, end)`, refused unless each ratio is in
-        (0, 1) and the spans are ordered, disjoint and inside the stack."""
+        """Return `routes` as `(ratio, start, end)` tuples, after checking them.
+
+        Each ratio must be in (0, 1), and the spans must be ordered, disjoint
+        and inside the stack."""
         routes = [(float(ratio), int(start), int(end)) for ratio, start, end in self.routes]
         following = 0
         for ratio, start, end in routes:
@@ -106,8 +111,10 @@ class SimpleDiT(_DiTStackOptions):
         return routes
 
     def kept_tokens(self, tokens: jax.Array, ratio: float, start: int) -> jax.Array:
-        """The `[B, keep]` indices of the tokens a route at `start` computes on:
-        the reference's first `keep` of a uniform shuffle, in sequence order."""
+        """Return the `[B, keep]` indices of the tokens a route at `start` computes on.
+
+        As in the reference, these are the first `keep` of a uniform shuffle,
+        in sequence order."""
         batch, count, _ = tokens.shape
         noise = jax.random.uniform(self.make_rng("dropout"), (batch, count))
         kept = jnp.sort(jnp.argsort(noise, axis=1)[:, :count - int(count * ratio)], axis=1)

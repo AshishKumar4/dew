@@ -24,27 +24,31 @@ from .unet_condition import sinusoidal_time
 
 @models("uvit")
 class UViT(_TransformerOptions):
-    """Denoise patches as U-ViT does (Bao et al. 2023), baofff/U-ViT's
-    libs/uvit_t2i.py.
+    """Denoises patches as U-ViT does, following baofff/U-ViT's libs/uvit_t2i.py.
 
-    A time token and, given text, one token per text state lead the patches:
-    [time, text..., patches]. The time token is the sinusoidal embedding
-    [cos, sin] of the time times `time_scale` (U-ViT reads its timesteps on a
-    0 to 999 scale, Dew's processes hand a time in [0, 1]), through a
-    d -> 4d -> d SiLU MLP when `mlp_time_embed`; the text states are projected
-    by a dense layer; the patches are a `patch_size` convolution. A learned
-    position table covers every token: one row for the time, `text_tokens`
-    for the text and the patches of an `image_size` image, used from the
-    first row of each part. Every block is a plain pre-norm transformer
-    block, x + attention(LN(x)) and then x + MLP(LN(x)): q, k and v without
-    bias, the output projection with one, the MLP `mlp_ratio` wide on exact
-    GELU. num_layers / 2 blocks go down, one sits in the middle and
-    num_layers / 2 go up, each up block first projecting [x, skip] back to
-    the width. A final LN and dense layer read the patches, which are
-    unpatchified and, with `conv`, refined by a 3x3 convolution. The text
-    attends unmasked, padding included, as U-ViT's CLIP states do. A Hilbert
-    `scan_order` sequences the patches along the curve, each projected by a
-    dense layer, and its position rows follow the sequence.
+    U-ViT is from Bao et al. (2023). A time token and, when there is text, one
+    token per text state come before the patches: [time, text..., patches].
+
+    - The time token is the sinusoidal embedding [cos, sin] of the time
+      multiplied by `time_scale`, passed through a d -> 4d -> d SiLU MLP when
+      `mlp_time_embed` is set. U-ViT reads timesteps on a 0 to 999 scale,
+      while Dew's processes give a time in [0, 1].
+    - A dense layer projects the text states, and a `patch_size` convolution
+      embeds the patches.
+    - A learned position table covers every token: one row for the time,
+      `text_tokens` rows for the text, and rows for the patches of an
+      `image_size` image, each part using its rows from the first.
+
+    Every block is a plain pre-norm transformer block, x + attention(LN(x))
+    then x + MLP(LN(x)), with q, k and v projections without bias, an output
+    projection with bias, and an MLP `mlp_ratio` wide on exact GELU.
+    num_layers / 2 blocks go down, one sits in the middle and num_layers / 2
+    go up; each up block first projects [x, skip] back to the width. A final
+    LN and dense layer read the patches, which are unpatchified and, with
+    `conv`, refined by a 3x3 convolution. The text attends unmasked, padding
+    included, as U-ViT's CLIP states do. A Hilbert `scan_order` orders the
+    patches along the curve, each projected by a dense layer, and the
+    position rows follow that order.
     """
     output_channels: int = 3
     patch_size: int = 16
