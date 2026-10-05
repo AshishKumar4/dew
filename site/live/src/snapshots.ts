@@ -1,0 +1,57 @@
+import { DurableObject } from 'cloudflare:workers';
+
+export interface SnapshotGeneration {
+	snapshot: ContainerSnapshot;
+	commit: string;
+	created: number;
+	prepareSeconds: number;
+	snapshotSeconds: number;
+	smokeSeconds: number;
+}
+
+interface SnapshotEnv {
+	PREPARER: DurableObjectNamespace<DurableObject & {
+		prepare(commit: string): Promise<SnapshotGeneration>;
+	}>;
+}
+
+const LIFETIME_MS = 30 * 24 * 60 * 60_000;
+const REBUILD_MS = 15 * 60_000;
+
+export class SnapshotRegistry extends DurableObject<SnapshotEnv> {
+	async current(commit: string, now = Date.now()): Promise<SnapshotGeneration | null> {
+		const generation = await this.ctx.storage.get<SnapshotGeneration>('active');
+		return generation?.commit === commit && generation.created + LIFETIME_MS > now ? generation : null;
+	}
+
+	async refresh(commit: string, now = Date.now()): Promise<{ rebuilding: boolean; generation: SnapshotGeneration | null }> {
+		if (!/^[0-9a-f]{40}$/.test(commit)) throw new Error('snapshot commit must be pinned');
+		const token = crypto.randomUUID();
+		const acquired = await this.ctx.storage.transaction(async (storage) => {
+			const lease = await storage.get<{ token: string; until: number }>('rebuild');
+			if (lease && lease.until > now) return false;
+			await storage.put('rebuild', { token, until: now + REBUILD_MS });
+			return true;
+		});
+		if (!acquired) return { rebuilding: true, generation: await this.current(commit, now) };
+		try {
+			const preparer = this.env.PREPARER.get(this.env.PREPARER.idFromName('trusted'));
+			const candidate = await preparer.prepare(commit);
+			if (candidate.commit !== commit || !candidate.snapshot.id || candidate.created < now) {
+				throw new Error('prepared snapshot does not match the requested generation');
+			}
+			await this.ctx.storage.transaction(async (storage) => {
+				const lease = await storage.get<{ token: string }>('rebuild');
+				if (lease?.token !== token) throw new Error('snapshot preparation lost its lease');
+				await storage.put('active', candidate);
+				await storage.delete('rebuild');
+			});
+			return { rebuilding: false, generation: candidate };
+		} catch (error) {
+			await this.ctx.storage.transaction(async (storage) => {
+				if ((await storage.get<{ token: string }>('rebuild'))?.token === token) await storage.delete('rebuild');
+			});
+			throw error;
+		}
+	}
+}
