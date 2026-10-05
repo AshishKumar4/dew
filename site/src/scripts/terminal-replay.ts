@@ -88,12 +88,12 @@ for (const panel of document.querySelectorAll<HTMLElement>('[data-terminal-repla
 			if (!response.ok) throw new Error(`Recording: HTTP ${response.status}`);
 			replay = await response.json();
 			if (!replay || !replay.frames.length) throw new Error('Recording has no frames');
-			note.textContent = 'Waits shortened; updates held for readability. The clock shows recording time.';
+			note.textContent = 'Long waits are cut short and each update stays up long enough to read. The clock shows the time in the original run.';
 			controls.hidden = reduced.matches;
 			resume();
 		} catch {
 			replay = undefined;
-			note.textContent = 'Replay unavailable; the final recorded frame is shown.';
+			note.textContent = 'Replay unavailable, so this is the last recorded frame.';
 		}
 	})();
 
@@ -122,16 +122,16 @@ for (const panel of document.querySelectorAll<HTMLElement>('[data-terminal-repla
 			stop();
 			controls.hidden = true;
 			screen.replaceChildren(...Array.from(final.cloneNode(true).childNodes));
-			note.textContent = 'Reduced motion: the final recorded frame is shown.';
+			note.textContent = 'Reduced motion is on, so this is the last recorded frame.';
 		} else {
 			frame = -1;
 			void load();
 			controls.hidden = !replay;
-			if (replay) note.textContent = 'Waits shortened; updates held for readability. The clock shows recording time.';
+			if (replay) note.textContent = 'Long waits are cut short and each update stays up long enough to read. The clock shows the time in the original run.';
 			resume();
 		}
 	});
-	if (reduced.matches) note.textContent = 'Reduced motion: the final recorded frame is shown.';
+	if (reduced.matches) note.textContent = 'Reduced motion is on, so this is the last recorded frame.';
 	new IntersectionObserver(([entry]) => {
 		visible = entry.isIntersecting;
 		if (visible && !reduced.matches) {
