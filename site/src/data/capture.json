@@ -6,20 +6,18 @@
 		"jax": "0.11.2.post3",
 		"flax": "0.12.9",
 		"optax": "0.2.8",
-		"dew": "0d0b18c7f9ea3c93ac969237f2f0d913b171a560",
-		"date": "2026-10-01",
-		"device": "NVIDIA GeForce RTX 4080",
+		"dew": "0128621c2fbe85b591153d944b350499738a564c",
+		"date": "2026-10-04",
+		"wall_seconds": 101.8,
+		"script_sha256": "c97ff9aaa09801fd7f8b8cfa2de13f136370dad3b334d302ecb7a75890203fc6",
 		"steps": 1000,
-		"parameters": 10720128,
-		"validation_loss": 1.543849648083172,
-		"validation_perplexity": 4.682581910504552,
-		"script_sha256": "f682b1ef273ced413f1718515f09210b368a061c087f70b4b9f5c736d711d6d0",
+		"device": "NVIDIA GeForce RTX 4080",
 		"description": "Tiny Shakespeare, final 50,000 bytes held out, freshly initialized weights, real recorded training",
-		"wall_seconds": 91.32519468199462
+		"validation_perplexity_display": 4.682
 	},
 	"hero": {
 		"returncode": 0,
-		"seconds": 91.32519468199462,
+		"seconds": 101.8,
 		"columns": 110,
 		"screen": [
 			[
@@ -382,14 +380,14 @@
 					"dim": true
 				},
 				{
-					"text": "  100%  14.6"
+					"text": "  100%  16.6"
 				},
 				{
 					"text": " step/s",
 					"dim": true
 				},
 				{
-					"text": "  0:01:11 "
+					"text": "  0:01:24 "
 				},
 				{
 					"text": "\u2502",
@@ -446,7 +444,7 @@
 					"text": "  "
 				},
 				{
-					"text": "     1.201",
+					"text": "     1.195",
 					"bold": true
 				},
 				{
@@ -523,7 +521,7 @@
 					"text": "  "
 				},
 				{
-					"text": "     1.201",
+					"text": "     1.195",
 					"bold": true
 				},
 				{
@@ -600,7 +598,7 @@
 					"text": "  "
 				},
 				{
-					"text": "     3.324",
+					"text": "     3.304",
 					"bold": true
 				},
 				{
@@ -650,7 +648,7 @@
 					"text": "  "
 				},
 				{
-					"text": "    \u2193 53%",
+					"text": "    \u2193 54%",
 					"fg": "3fae6a"
 				},
 				{
@@ -677,7 +675,7 @@
 					"text": "  "
 				},
 				{
-					"text": "     61.6%",
+					"text": "     61.4%",
 					"bold": true
 				},
 				{
@@ -708,7 +706,7 @@
 					"fg": "5f86d1"
 				},
 				{
-					"text": "\u2588",
+					"text": "\u2587",
 					"fg": "6a7fd3"
 				},
 				{
@@ -727,7 +725,7 @@
 					"text": "  "
 				},
 				{
-					"text": "\u2191 19.2 pt",
+					"text": "\u2191 19.0 pt",
 					"fg": "3fae6a"
 				},
 				{
@@ -775,14 +773,14 @@
 					"text": "  "
 				},
 				{
-					"text": "     69.36",
+					"text": "     60.02",
 					"bold": true
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": "\u2583",
+					"text": "\u2581",
 					"fg": "2aa7c9"
 				},
 				{
@@ -814,18 +812,18 @@
 					"fg": "7579d5"
 				},
 				{
-					"text": "\u2582",
+					"text": "\u2581",
 					"fg": "8072d7"
 				},
 				{
-					"text": "\u2582",
+					"text": "\u2581",
 					"fg": "8b6cd9"
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": "   \u2193 1.2%",
+					"text": "   \u2193 0.3%",
 					"fg": "3fae6a"
 				},
 				{
@@ -852,14 +850,14 @@
 					"text": "  "
 				},
 				{
-					"text": "     922.7",
+					"text": "     1,066",
 					"bold": true
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": "\u2586",
+					"text": "\u2588",
 					"fg": "2aa7c9"
 				},
 				{
@@ -891,18 +889,18 @@
 					"fg": "7579d5"
 				},
 				{
-					"text": "\u2587",
+					"text": "\u2588",
 					"fg": "8072d7"
 				},
 				{
-					"text": "\u2587",
+					"text": "\u2588",
 					"fg": "8b6cd9"
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": "   \u2191 1.2%",
+					"text": "   \u2191 0.3%",
 					"fg": "3fae6a"
 				},
 				{
@@ -929,14 +927,14 @@
 					"text": "  "
 				},
 				{
-					"text": "     17.3%",
+					"text": "     20.0%",
 					"bold": true
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": "\u2586",
+					"text": "\u2588",
 					"fg": "2aa7c9"
 				},
 				{
@@ -968,18 +966,18 @@
 					"fg": "7579d5"
 				},
 				{
-					"text": "\u2587",
+					"text": "\u2588",
 					"fg": "8072d7"
 				},
 				{
-					"text": "\u2587",
+					"text": "\u2588",
 					"fg": "8b6cd9"
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": " \u2191 0.2 pt",
+					"text": " \u2191 0.1 pt",
 					"fg": "3fae6a"
 				},
 				{
@@ -1085,7 +1083,7 @@
 					"text": "  "
 				},
 				{
-					"text": "     4.683",
+					"text": "     4.682",
 					"bold": true
 				},
 				{
@@ -1103,7 +1101,7 @@
 					"text": "  "
 				},
 				{
-					"text": "   \u2193 5.0%",
+					"text": "   \u2193 2.5%",
 					"fg": "3fae6a"
 				},
 				{
@@ -1165,7 +1163,7 @@
 					"dim": true
 				},
 				{
-					"text": "1000 steps in 0:01:12           "
+					"text": "1000 steps in 0:01:26           "
 				},
 				{
 					"text": "\u2502",
@@ -1185,7 +1183,7 @@
 					"dim": true
 				},
 				{
-					"text": "after 2.05 s                    "
+					"text": "after 11.58 s                   "
 				},
 				{
 					"text": "\u2502",
@@ -1205,7 +1203,7 @@
 					"dim": true
 				},
 				{
-					"text": "14.5 step/s                     "
+					"text": "16.7 step/s                     "
 				},
 				{
 					"text": "\u2502",
@@ -1225,7 +1223,7 @@
 					"dim": true
 				},
 				{
-					"text": "96.4% of the wall time in steps "
+					"text": "69.8% of the wall time in steps "
 				},
 				{
 					"text": "\u2502",
@@ -1245,7 +1243,7 @@
 					"dim": true
 				},
 				{
-					"text": "1.201                          ",
+					"text": "1.195                          ",
 					"bold": true
 				},
 				{
@@ -1269,14 +1267,14 @@
 					"dim": true
 				},
 				{
-					"text": "4.683",
+					"text": "4.682",
 					"bold": true
 				},
 				{
 					"text": " "
 				},
 				{
-					"text": "\u2193 5.0%",
+					"text": "\u2193 2.5%",
 					"fg": "3fae6a"
 				},
 				{
@@ -1311,12 +1309,12 @@
 			],
 			[
 				{
-					"text": "The mercy of the matter that the world hath sent"
+					"text": "The mercy of the duke of the treason"
 				}
 			],
 			[
 				{
-					"text": "Of the duke's death."
+					"text": "The grace of my heart."
 				}
 			],
 			[],
@@ -1328,22 +1326,32 @@
 			],
 			[
 				{
-					"text": "They shall be so; therefore that has no man"
+					"text": "Then shall I see thee so in the common men"
 				}
 			],
 			[
 				{
-					"text": "That seems the queen that is come to such a death,"
+					"text": "Of the world have been that swift to see"
 				}
 			],
 			[
 				{
-					"text": "And here I see thee by the company."
+					"text": "The death of many things of the confess"
+				}
+			],
+			[
+				{
+					"text": "Of the ground confession of the ground;"
+				}
+			],
+			[
+				{
+					"text": "And then the kind of the sun and lo"
 				}
 			]
 		],
-		"rows": 37,
-		"source_rows": 30,
+		"rows": 39,
+		"source_rows": 200,
 		"viewer_rows": 200,
 		"replay": "/hero/train.json"
 	}
