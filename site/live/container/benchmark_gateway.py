@@ -22,7 +22,10 @@ def dump_processes():
             pass
 
 def execute(client, code):
-    message = client.execute(code, allow_stdin=False)
+    return collect(client, client.execute(code, allow_stdin=False))
+
+
+def collect(client, message):
     stdout = ""
     while True:
         result = client.get_iopub_msg(timeout=30)
@@ -75,6 +78,15 @@ def main():
                     f"Path('/work/context').write_text(__measurement)")
         for position, (identifier, client, _) in enumerate(kernels):
             foreign = kernels[(position + 1) % len(kernels)][0]
+            control = client.session.msg('kernel_info_request', {})
+            client.control_channel.send(control)
+            reply = client.get_control_msg(timeout=30)
+            assert reply['msg_type'] == 'kernel_info_reply'
+            assert reply['parent_header']['msg_id'] == control['header']['msg_id']
+            message = client.execute("print(input('probe input:'))", allow_stdin=True)
+            assert client.get_stdin_msg(timeout=30)['msg_type'] == 'input_request'
+            client.input('private stdin probe')
+            assert collect(client, message).strip() == 'private stdin probe'
             execute(client,
                 "import errno, os, resource, socket\n"
                 "status = Path('/proc/self/status').read_text().splitlines()\n"
@@ -99,7 +111,12 @@ def main():
                     f"'/sessions/ipc/kernel-{foreign}/kernel-1']:\n"
                     " try:\n  Path(path).read_bytes()\n"
                     " except PermissionError:\n  pass\n"
-                    " else:\n  raise AssertionError('guest read another context')")
+                    " else:\n  raise AssertionError('guest read another context')\n"
+                    "sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+                    f"try:\n sock.connect('/sessions/ipc/kernel-{foreign}/kernel-1')\n"
+                    "except PermissionError:\n pass\n"
+                    "else:\n raise AssertionError('guest connected to another context')\n"
+                    "finally:\n sock.close()")
         submitted = time.perf_counter()
 
         def run(kernel, indices):
@@ -130,7 +147,7 @@ def main():
         assert len({row["uid"] for row in rows}) == len(kernels)
         memory = {row["uid"]: row["pss_bytes"] for row in rows}
         print(json.dumps({"requests": args.count, "contexts": len(kernels),
-                          "state_isolation": True, "sandbox_checks": True,
+                          "state_isolation": True, "sandbox_checks": True, "all_channels": True,
                           "startup_seconds": [kernel[2] for kernel in kernels], "kernel_pss_bytes": memory,
                           "kernel_fd_counts": {row["uid"]: row["fds"] for row in rows},
                           "median_execute_seconds": statistics.median(row["execute_seconds"] for row in rows),
