@@ -65,6 +65,14 @@ class Case:
     export runs on input_ids alone, which is its text half.
     `AutoModelForCausalLM` reads every other family here off its model_type.
 
+    `orders` holds the trained logits over ORDERS residual orders
+    (tests/reference_error.py's K-order rule) where one run is a coin flip:
+    two tokens of qwen3_next's trained export carry most of either
+    implementation's distance from float64, so each one's single runs
+    spread from 0.4 to 2.7 times its RMS over the orders, and one run
+    against one reached 3.84 with XLA capped to AVX, where the RMS ratio is
+    0.98 (1.18 by default).
+
     `rate` is the step this case trains with, `RATE` unless it says
     otherwise. Torch and JAX can choose different valid indexer sets at
     equal scores. The V4 MTP-enabled step preserves the observed tied-score
@@ -79,6 +87,7 @@ class Case:
     reference_module: str = 'transformers'
     conversion_type: str | None = None
     rate: float = RATE
+    orders: bool = False
 
 
 CASES = (
@@ -96,7 +105,7 @@ CASES = (
          reference_class="Kimi_K25ForConditionalGeneration"),
     Case("llama4_text", "llama4-tiny"),
     Case("olmo3", "olmo3-yarn-tiny"),
-    Case("qwen3_next", "qwen3-next-tiny", mtp_weight=0.3),
+    Case("qwen3_next", "qwen3-next-tiny", mtp_weight=0.3, orders=True),
     Case("opt", "opt-tiny"),
     Case("gpt_neox", "gpt-neox-tiny"),
     Case("mamba2", "mamba2-tiny"),
