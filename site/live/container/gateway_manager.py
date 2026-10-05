@@ -64,7 +64,8 @@ class LimitedKernelManager(KernelGatewayIOLoopKernelManager):
                         'tmpfs', str(directory)], check=True)
         arguments = ["/kernel.json" if arg == self.connection_file else arg for arg in kernel_cmd[3:]]
         command = [
-            "bwrap", "--unshare-user", "--unshare-net", "--die-with-parent", "--new-session", "--ro-bind", "/", "/",
+            "bwrap", "--unshare-user", "--unshare-net", "--die-with-parent", "--new-session",
+            "--ro-bind", "/", "/",
             "--size", str(64 * 1024 * 1024), "--tmpfs", "/work",
             "--size", str(16 * 1024 * 1024), "--tmpfs", "/tmp",
             "--ro-bind", str(connection), "/kernel.json",
