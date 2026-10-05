@@ -451,9 +451,9 @@ def fp8_format(quantization: Mapping[str, object]) -> tuple[int, bool]:
     quantized-kernel forward is outside this weight-only loader's contract.
     DeepSeek-V3's own inference/model.py at 9b4e9788e4a3a731f7567338ed15d3ec549ce03b
     sets gemm_impl='bf16' (line 16); linear dequantizes weights and runs
-    F.linear there (lines 147-153). act_quant runs only in its fp8 branch
-    (lines 154-158).
-    compressed-tensors keeps input QDQ even after decompressing weights,
+    F.linear there (lines 155-157). act_quant runs only in its fp8 branch
+    (lines 158-160).
+    Compressed-tensors keeps input QDQ even after decompressing weights,
     so its activation schemes cannot take the same weight-only path.
     """
     fmt, block, scale_fmt = (quantization.get(key)
