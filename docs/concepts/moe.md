@@ -1,6 +1,6 @@
 # Mixture of experts
 
-A mixture-of-experts (MoE) layer replaces one feed-forward network with several networks, called experts. For each token, a router selects the `top_k` highest-scoring experts. It sums their outputs, weighted by their router scores. To use MoE in a `CausalTransformer`, set `mixture` to a `Mixture` from `dew.nn.backbones`.
+A mixture-of-experts (MoE) layer replaces one feed-forward network with several networks, called experts. For each token, a router selects the `top_k` highest-scoring experts, and the layer sums their outputs weighted by the router scores. To use MoE in a `CausalTransformer`, set `mixture` to a `Mixture` from `dew.nn.backbones`.
 
 ## Example
 
