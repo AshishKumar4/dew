@@ -9,9 +9,19 @@ name or a field the table does not know raises.
 The registries are empty at import. Each member registers itself where it is
 defined, so importing a package fills its table and the registry module
 imports none of them. A lookup of a name its table does not hold yet imports
-the modules of Dew whose decorator registers that name, read off the
-sources (`_registering_modules`), so a record loads in a process that
-imported nothing beforehand, and nothing else is imported.
+the modules whose decorator registers that name, read off the sources
+(`_registering_modules`), so a record loads in a process that imported
+nothing beforehand, and nothing else is imported.
+
+The sources read are Dew's own and those of every installed plugin: a
+package that registers members into these tables names itself under the
+`dew.plugins` entry-point group,
+
+    [project.entry-points."dew.plugins"]
+    sparx = "sparx"
+
+and its modules are read the same way, without importing it, so a run
+recorded with a plugin's model loads as a run of Dew's own does.
 """
 
 from __future__ import annotations
@@ -19,6 +29,8 @@ from __future__ import annotations
 import dataclasses
 import functools
 import importlib
+import importlib.metadata
+import importlib.util
 import operator
 import re
 import sys
@@ -83,20 +95,40 @@ _DECORATOR = re.compile(r"""^[ \t]*@(?:dew\.)?(?:registry\.)?(\w+)\(\s*["']([^"'
 member's."""
 
 
+PLUGINS = "dew.plugins"
+"""The entry-point group a package names itself under to register into Dew's tables."""
+
+
+def _plugin_roots() -> list[Path]:
+    """The package directory of each installed `dew.plugins` entry, found without importing it.
+
+    An entry names a top-level package. One that is declared but cannot be
+    found is a broken install, and raises with the entry that declared it.
+    """
+    roots = []
+    for entry in sorted(importlib.metadata.entry_points(group=PLUGINS), key=lambda entry: entry.name):
+        spec = importlib.util.find_spec(entry.value)
+        if spec is None or not spec.submodule_search_locations:
+            raise ImportError(f"the {PLUGINS} entry {entry.name!r} names {entry.value!r}, "
+                              "which is not an importable package")
+        roots.extend(Path(location) for location in spec.submodule_search_locations)
+    return roots
+
+
 @functools.cache
 def _registering_modules() -> Mapping[tuple[str, str], tuple[str, ...]]:
-    """Each `(registry, name)` Dew's sources register, and the modules that do.
+    """Each `(registry, name)` Dew's and its plugins' sources register, and the modules that do.
 
     The decorators are the one statement of what registers where, so this
-    reads them rather than keeping a second table: about 270 files in 20 ms,
-    once a process, and only when a lookup misses."""
-    root = Path(__file__).parent
+    reads them rather than keeping a second table: about 270 of Dew's files
+    in 20 ms, once a process, and only when a lookup misses."""
     found: dict[tuple[str, str], list[str]] = {}
-    for path in sorted(root.rglob("*.py")):
-        parts = path.relative_to(root.parent).with_suffix("").parts
-        module = ".".join(parts[:-1] if parts[-1] == "__init__" else parts)
-        for attribute, name in _DECORATOR.findall(path.read_text()):
-            found.setdefault((attribute, name), []).append(module)
+    for root in [Path(__file__).parent, *_plugin_roots()]:
+        for path in sorted(root.rglob("*.py")):
+            parts = path.relative_to(root.parent).with_suffix("").parts
+            module = ".".join(parts[:-1] if parts[-1] == "__init__" else parts)
+            for attribute, name in _DECORATOR.findall(path.read_text()):
+                found.setdefault((attribute, name), []).append(module)
     return {key: tuple(modules) for key, modules in found.items()}
 
 
@@ -140,7 +172,7 @@ class Registry[T: Callable[..., Any], Built](Mapping[str, T]):
             raise KeyError(f"no {self.kind} named {name!r}; known: {', '.join(sorted(known))}") from None
 
     def _registering(self, name: str) -> tuple[str, ...]:
-        """The modules of Dew whose decorator registers `name` in this table."""
+        """The modules of Dew or a plugin whose decorator registers `name` in this table."""
         return tuple(module for (attribute, held), modules in _registering_modules().items()
                      if held == name and getattr(sys.modules[__name__], attribute, None) is self
                      for module in modules)
