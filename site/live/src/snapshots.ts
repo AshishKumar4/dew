@@ -10,6 +10,7 @@ export interface SnapshotGeneration {
 }
 
 interface SnapshotEnv {
+	SNAPSHOT_COMMIT: string;
 	PREPARER: DurableObjectNamespace<DurableObject & {
 		prepare(commit: string): Promise<SnapshotGeneration>;
 	}>;
@@ -22,6 +23,19 @@ export class SnapshotRegistry extends DurableObject<SnapshotEnv> {
 	async current(commit: string, now = Date.now()): Promise<SnapshotGeneration | null> {
 		const generation = await this.ctx.storage.get<SnapshotGeneration>('active');
 		return generation?.commit === commit && generation.created + LIFETIME_MS > now ? generation : null;
+	}
+
+	async ensure(commit = this.env.SNAPSHOT_COMMIT): Promise<{
+		generation: SnapshotGeneration | null; rebuilding: boolean;
+	}> {
+		const generation = await this.current(commit);
+		if (generation) return { generation, rebuilding: false };
+		this.ctx.waitUntil(this.refresh(commit));
+		return { generation: null, rebuilding: true };
+	}
+
+	override async alarm(): Promise<void> {
+		await this.refresh(this.env.SNAPSHOT_COMMIT);
 	}
 
 	async refresh(commit: string, now = Date.now()): Promise<{ rebuilding: boolean; generation: SnapshotGeneration | null }> {
@@ -45,6 +59,7 @@ export class SnapshotRegistry extends DurableObject<SnapshotEnv> {
 				if (lease?.token !== token) throw new Error('snapshot preparation lost its lease');
 				await storage.put('active', candidate);
 				await storage.delete('rebuild');
+				await storage.setAlarm(candidate.created + 7 * 24 * 60 * 60_000);
 			});
 			return { rebuilding: false, generation: candidate };
 		} catch (error) {
