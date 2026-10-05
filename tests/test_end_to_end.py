@@ -512,6 +512,33 @@ def test_a_repae_step_s_loss_and_terms_are_train_repae_s(repae_step):
                                          STEPPED[f"loss/{term}_f64"], term)
 
 
+def test_each_network_steps_on_its_own_optimizer_as_repa_e_s_three_do(repae_step):
+    """`train_repae.py` steps the SiT (with its projector), the VAE and the
+    discriminator with three AdamWs, each clipping its own gradient
+    (`clip_grad_norm_` at `max_grad_norm` 1.0, lines 396, 405 and 430). So
+    the objective's optimizer gives each network its own copy of the run's
+    `tx`: under a clip to norm 1, a discriminator gradient a thousand times
+    larger leaves the model's and the autoencoder's updates as they were,
+    where one clip over the whole tree would shrink them."""
+    task, params, gradients = repae_step.task, repae_step.params, repae_step.gradients
+    tx = task.optimizer(optax.chain(optax.clip_by_global_norm(1.0), optax.sgd(1.0)), accumulation=1)
+    louder = {**gradients, DISCRIMINATOR: jax.tree.map(lambda leaf: 1000 * leaf, gradients[DISCRIMINATOR])}
+    updates = [tx.update(grads, tx.init(params), params)[0] for grads in (gradients, louder)]
+
+    def network(tree, name):
+        return {key: value for key, value in tree.items() if key not in (AUTOENCODER, DISCRIMINATOR)} \
+            if name == "model" else tree[name]
+
+    for name in ("model", AUTOENCODER):
+        quiet_updates, loud_updates = (jax.tree.leaves(network(update, name)) for update in updates)
+        for quiet, loud in zip(quiet_updates, loud_updates, strict=True):
+            np.testing.assert_array_equal(np.asarray(quiet), np.asarray(loud), err_msg=name)
+    for name in ("model", AUTOENCODER, DISCRIMINATOR):
+        clipped = optax.tree.norm(network(updates[1], name))
+        alone = min(1.0, float(optax.tree.norm(network(louder, name))))
+        np.testing.assert_allclose(float(clipped), alone, rtol=1e-5, err_msg=name)
+
+
 def test_end_to_end_needs_alignment_and_a_kl_autoencoder():
     task = objective(EndToEnd(**L1_KL))
     with pytest.raises(ValueError, match="needs `alignment`"):

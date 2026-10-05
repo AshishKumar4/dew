@@ -425,6 +425,23 @@ class DiffusionObjective(Objective[Ratio]):
             held[PERCEPTUAL] = LPIPSNetwork.published()[1]
         return held
 
+    def optimizer(self, tx: optax.GradientTransformation, *,
+                  accumulation: int) -> optax.GradientTransformation:
+        """Return `tx`, or under `end_to_end` one copy of it per network.
+
+        REPA-E steps the model (with its alignment projector), the
+        autoencoder and the discriminator with three optimizers, each
+        clipping its own gradient, so each takes its own copy of `tx`, with
+        its own clip, moments and update count.
+        """
+        if self.end_to_end is None:
+            return tx
+
+        def network(params):
+            return {name: name if name in (AUTOENCODER, DISCRIMINATOR) else "model" for name in params}
+
+        return optax.multi_transform({"model": tx, AUTOENCODER: tx, DISCRIMINATOR: tx}, network)
+
     def init(self, key, variables: Variables | None = None) -> Variables:
         held = self.held_variables() if variables is None else variables
         head_key = jax.random.fold_in(key, 1)
