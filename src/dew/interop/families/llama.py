@@ -34,9 +34,9 @@ def _mixtral_config(hf_config, used):
     used.update(('num_local_experts', 'router_jitter_noise'))
     if hf_config.get('router_jitter_noise', 0.0):
         _refuse('router_jitter_noise', 'training-time input jitter has no counterpart')
+    experts = records.integer(hf_config['num_local_experts'], 'num_local_experts')
     config['mixture'] = native_fields(Mixture)(
-        top_k=_softmax_top_k(hf_config, used),
-        experts=records.integer(hf_config['num_local_experts'], 'num_local_experts'))
+        top_k=_softmax_top_k(hf_config, used), experts=experts)
     return config
 
 
