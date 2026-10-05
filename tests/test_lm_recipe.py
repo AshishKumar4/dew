@@ -10,7 +10,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-import tyro
 
 import dew
 from dew.data import PackedTokens, TokenWindows
@@ -51,7 +50,7 @@ def write_token_files(root, train_tokens, val_tokens, tokenizer="byte", eos_id=N
 
 def run_config(recipe, tokens, *args, model='{"emb_features": 16, "num_layers": 1, "num_heads": 2}'):
     # A dataset subcommand has to come before its flags, so `args` leads.
-    return tyro.cli(tyro.conf.CascadeSubcommandArgs[recipe.LmRunConfig], args=[
+    return recipe.LmRunConfig.cli([
         *args, "--data.path", str(tokens), "--data.seq-len", str(SEQ), "--data.loading.workers", "0",
         "--trainer.batch-size", "8", "--trainer.checkpoint-dir", str(tokens.parent / "runs"),
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
@@ -136,7 +135,7 @@ def test_the_recipe_trains_on_weighted_corpora(tmp_path):
     recipe = load_recipe()
     first = write_token_files(tmp_path / "first", 40 * SEQ, 8 * SEQ, eos_id=0)
     second = write_token_files(tmp_path / "second", 24 * SEQ, 8 * SEQ, eos_id=0)
-    config = tyro.cli(tyro.conf.CascadeSubcommandArgs[recipe.LmRunConfig], args=[
+    config = recipe.LmRunConfig.cli( [
         "data:packed-tokens", "--data.path", str(first), "0.7", str(second), "0.3",
         "--data.seq-len", str(SEQ), "--data.packing-bins", "2", "--data.loading.workers", "0",
         "--trainer.batch-size", "8", "--trainer.checkpoint-dir", str(tmp_path / "runs"),
@@ -242,8 +241,8 @@ def recipe_args(tokens, *args, model_config="{}"):
 
 
 def pretrained_config(recipe, tokens, pretrained, *args, model_config="{}"):
-    return tyro.cli(tyro.conf.CascadeSubcommandArgs[recipe.LmRunConfig], args=recipe_args(
-        tokens, "--pretrained", str(pretrained), *args, model_config=model_config))
+    return recipe.LmRunConfig.cli(recipe_args(tokens, "--pretrained", str(pretrained), *args,
+                                              model_config=model_config))
 
 
 def test_the_recipe_continues_a_pretrained_decoder(tmp_path):
@@ -295,7 +294,7 @@ def test_a_pretrained_run_starts_from_the_checkpoints_weights(tmp_path):
 
 
 def test_a_pretrained_run_trains_a_lora_that_saves_from_the_run_alone(tmp_path):
-    """`--pretrained <decoder> lora:lora --lora.rank 4 --lora.modules q_proj`: the recipe
+    """`--pretrained <decoder> --lora.rank 4 --lora.modules q_proj`: the recipe
     binds the adapter to the loaded weights, two steps move every factor and
     leave the base bitwise, and `Pretrained.from_run` rebuilds the adapter
     from the run's own record, so its `adapter.save` writes the files the
@@ -307,7 +306,7 @@ def test_a_pretrained_run_trains_a_lora_that_saves_from_the_run_alone(tmp_path):
     recipe = load_recipe()
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
     checkpoint = export_tiny_decoder(tmp_path / "checkpoint")
-    lora = ("lora:lora", "--lora.rank", "4", "--lora.modules", "q_proj")
+    lora = ("--lora.rank", "4", "--lora.modules", "q_proj")
     config = pretrained_config(recipe, tokens, checkpoint, "--trainer.steps", "2", "--sample-tokens", "0",
                                "--trainer.name", "lora", *lora)
     assert config.lora == LoRA(rank=4, modules=("q_proj",))
@@ -332,7 +331,7 @@ def test_a_pretrained_run_trains_a_lora_that_saves_from_the_run_alone(tmp_path):
 
 
 def test_a_scratch_run_trains_a_lora_that_saves_from_the_run_alone(tmp_path):
-    """From scratch, `lora:lora --lora.rank 2 --lora.modules q_proj v_proj`
+    """From scratch, `--lora.rank 2 --lora.modules q_proj v_proj`
     binds the adapter to a fresh draw of the model from the run's key and
     the factors from the key folded with 1: two steps move every B and
     leave that draw bitwise under `frozen`, and `Adapter.from_run` writes
@@ -345,7 +344,7 @@ def test_a_scratch_run_trains_a_lora_that_saves_from_the_run_alone(tmp_path):
     recipe = load_recipe()
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
     config = run_config(recipe, tokens, "--trainer.steps", "2", "--sample-tokens", "0", "--trainer.name",
-                        "scratch", "lora:lora", "--lora.rank", "2", "--lora.modules", "q_proj", "v_proj")
+                        "scratch", "--lora.rank", "2", "--lora.modules", "q_proj", "v_proj")
 
     state = recipe.main(config)
 
@@ -487,8 +486,8 @@ def test_the_recipe_balances_a_sparse_run(tmp_path):
               '"mixture": {"experts": 8, "top_k": 2, "layers": [1], "bias": true}}')
 
     def run(name, *extra):
-        config = tyro.cli(tyro.conf.CascadeSubcommandArgs[recipe.LmRunConfig],
-                          args=recipe_args(tokens, "--trainer.steps", "2",
+        config = recipe.LmRunConfig.cli(
+                          recipe_args(tokens, "--trainer.steps", "2",
                                            "--sample-tokens", "0",
                                            "--trainer.name", name, *extra,
                                            model_config=sparse))
@@ -514,8 +513,8 @@ def test_the_recipe_trains_the_prediction_depths_on_request(tmp_path):
             '"num_nextn_predict_layers": 1}')
 
     def run(name, *extra, model_config=deep):
-        config = tyro.cli(tyro.conf.CascadeSubcommandArgs[recipe.LmRunConfig],
-                          args=recipe_args(tokens, "--trainer.steps", "2",
+        config = recipe.LmRunConfig.cli(
+                          recipe_args(tokens, "--trainer.steps", "2",
                                            "--sample-tokens", "0",
                                            "--trainer.name", name, *extra,
                                            model_config=model_config))
@@ -554,7 +553,7 @@ def test_masked_diffusion_trains_on_packed_documents(tmp_path):
         (directory / f"{split}.bin").write_bytes(ids.tobytes())
     (directory / "meta.json").write_text(json.dumps(
         {"tokenizer": str(checkpoint), "vocab_size": 100, "dtype": "uint8", "eos_id": 1}))
-    config = tyro.cli(tyro.conf.CascadeSubcommandArgs[recipe.LmRunConfig], args=[
+    config = recipe.LmRunConfig.cli( [
         "data:packed-tokens", "--pretrained", str(checkpoint), "--objective", "masked_diffusion",
         "--tokenizer", str(checkpoint), "--data.path", str(directory),
         "--data.seq-len", "11", "--data.loading.workers", "0",
@@ -633,7 +632,7 @@ def test_masked_diffusion_continues_a_pretrained_checkpoint(tmp_path):
         (directory / f"{split}.bin").write_bytes(ids.tobytes())
     (directory / "meta.json").write_text(json.dumps(
         {"tokenizer": str(checkpoint), "vocab_size": 100, "dtype": "uint8", "eos_id": 1}))
-    config = tyro.cli(tyro.conf.CascadeSubcommandArgs[recipe.LmRunConfig], args=[
+    config = recipe.LmRunConfig.cli( [
         "--pretrained", str(checkpoint), "--objective", "masked_diffusion",
         "--tokenizer", str(checkpoint), "--data.path", str(directory),
         "--data.seq-len", "11", "--data.loading.workers", "0",
@@ -672,7 +671,7 @@ def test_official_block_diffusion_is_a_complete_pretrained_recipe(tmp_path):
         (directory / f"{split}.bin").write_bytes(ids.tobytes())
     (directory / "meta.json").write_text(json.dumps(
         {"tokenizer": str(checkpoint), "vocab_size": 32, "dtype": "uint8", "eos_id": 1}))
-    config = tyro.cli(tyro.conf.CascadeSubcommandArgs[recipe.LmRunConfig], args=[
+    config = recipe.LmRunConfig.cli( [
         "--pretrained", str(checkpoint), "--objective", "block_diffusion",
         "--tokenizer", str(checkpoint), "--data.path", str(directory), "--data.seq-len", "11",
         "--block-prompt-tokens", "4", "--data.loading.workers", "0",

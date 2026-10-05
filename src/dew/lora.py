@@ -81,7 +81,7 @@ class LoRA:
     """A low-rank adapter spec with PEFT's own fields.
 
     This is what a user writes and a run records (`RunConfig.lora`,
-    `lora:lora --lora.rank 16 --lora.modules q_proj v_proj`).
+    `--lora.rank 16 --lora.modules q_proj v_proj`).
 
     `modules` are PEFT's `target_modules`: a projection matches when its name
     relative to the model (`model.layers.0.self_attn.q_proj`, or `to_q` under a

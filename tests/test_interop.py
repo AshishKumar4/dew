@@ -229,6 +229,26 @@ _PUBLISHERS = [
 ]
 
 
+def test_the_same_tensors_and_metadata_write_the_same_bytes(tmp_path):
+    """safetensors 0.8.0 keeps a header's metadata in a Rust HashMap, whose
+    order is drawn per map, so the same table and metadata wrote different
+    bytes from one write to the next (6 distinct files in 20 writes of three
+    keys). A written file is a function of what it holds: an adapter saved
+    twice, or a file and its digest, agree byte for byte."""
+    path = tmp_path / "model.safetensors"
+    tensors = {"a": np.ones((2, 2), np.float32), "b": np.zeros(3, np.int32)}
+    metadata = {"format": "pt", "lora_adapter_metadata": '{"r": 2}', "z": "1"}
+    written = set()
+    for _ in range(20):
+        write_file(tensors, path, metadata)
+        written.add(path.read_bytes())
+    assert len(written) == 1
+    header = json.loads(next(iter(written))[8:8 + int.from_bytes(next(iter(written))[:8], "little")])
+    assert list(header["__metadata__"]) == sorted(metadata)
+    loaded, read = read_file(path)
+    assert read == metadata and all(np.array_equal(loaded[name], tensors[name]) for name in tensors)
+
+
 @pytest.mark.parametrize("publish", _PUBLISHERS)
 def test_overwrite_retains_the_previously_loaded_tree(tmp_path, publish):
     path = tmp_path / "model.safetensors"

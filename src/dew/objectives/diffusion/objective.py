@@ -37,7 +37,7 @@ from dew.nn.autoencoders import AutoEncoder
 from dew.nn.autoencoders.api import ModuleAutoEncoder
 from dew.nn.autoencoders.kl import AutoencoderKL, posterior_latent
 from dew.nn.mp import Uncertainty
-from dew.objectives.base import Aux, EMASpec, Objective, Ratio, Step, Variables, thaw, under
+from dew.objectives.base import OMITTED, Aux, EMASpec, Objective, Omitted, Ratio, Step, Variables, thaw, under
 from dew.objectives.diffusion.alignment import ALIGNMENT, REPRESENTATION, Alignment
 from dew.objectives.diffusion.end_to_end import AUTOENCODER, LATENT_STATS, EndToEnd
 from dew.registry import objectives
@@ -236,13 +236,13 @@ class DiffusionObjective(Objective[Ratio]):
         process: Process | Preset | None = None,
         inputs: InputSpec | None = None,
         *,
-        autoencoder: AutoEncoder | None = None,
+        autoencoder: AutoEncoder | None | Omitted = OMITTED,
         unconditional_prob: float = 0.12,
         ema_decay: float | optax.Schedule | None = 0.999,
         solver: Solver = _DEFAULT_SOLVER,
         guidance: Guidance | None = _DEFAULT_GUIDANCE,
         steps: int | None = None,
-        variables: Variables | None = None,
+        variables: Variables | None | Omitted = OMITTED,
         uncertainty: int | None = None,
         alignment: Alignment | None = None,
         end_to_end: EndToEnd | None = None,
@@ -262,8 +262,10 @@ class DiffusionObjective(Objective[Ratio]):
         pipeline in place of the denoiser (`DiffusionObjective(flux)`), which
         supplies the denoiser, `variables`, `process`, `inputs`,
         `autoencoder` and its own sampling policy; any of them given here
-        overrides it. Its text encoder trains nothing but encodes every
-        caption, so a pipeline loaded without it is refused.
+        overrides it, an explicit None included (`autoencoder=None` trains
+        in pixel space, `variables=None` draws the denoiser). Its text
+        encoder trains nothing but encodes every caption, so a pipeline
+        loaded without it is refused.
 
         `ema_decay` is
         the EMA's decay, a number or a schedule of the updates before it,
@@ -297,17 +299,19 @@ class DiffusionObjective(Objective[Ratio]):
             model = source.model
             process = source.process if process is None else process
             inputs = source.inputs if inputs is None else inputs
-            autoencoder = source.autoencoder if autoencoder is None else autoencoder
-            variables = source.variables if variables is None else variables
+            autoencoder = source.autoencoder if autoencoder is OMITTED else autoencoder
+            variables = source.variables if variables is OMITTED else variables
             solver = source.schedule.solver if solver is _DEFAULT_SOLVER else solver
             guidance = source.task.guidance if guidance is _DEFAULT_GUIDANCE else guidance
             steps = source.task.steps if steps is None else steps
-            held = variables.get("encoders", {})
+            held = source.variables.get("encoders", {})
             if any(keyword not in held for keyword in inputs.conditions):
                 raise ValueError("this pipeline was loaded without its text encoder (text=False), and "
                                  "training encodes its captions; load it with its text encoder")
         if process is None or inputs is None:
             raise ValueError("a denoiser needs its `process` and `inputs`; a loaded pipeline carries both")
+        autoencoder = None if autoencoder is OMITTED else autoencoder
+        variables = None if variables is OMITTED else variables
         steps = _DEFAULT_STEPS if steps is None else steps
         self.model = model
         self.process = build_process(process)
