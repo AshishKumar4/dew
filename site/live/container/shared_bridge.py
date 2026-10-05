@@ -122,14 +122,17 @@ class Gateway:
             return Response(200 if ready else 503, "OK" if ready else "Warming up", Headers(), b"")
         if not hmac.compare_digest(request.headers.get("Authorization", ""), "Bearer " + self.secret):
             return Response(403, "Forbidden", Headers(), b"")
-        match = re.fullmatch(r"/contexts/([0-9a-f-]{36})(/ws)?", request.path)
+        match = re.fullmatch(r"/contexts/([0-9a-f-]{36})(?:/(ws|status|close))?", request.path)
         if not match:
             return Response(404, "Not found", Headers(), b"")
-        if match[2]:
+        if match[2] == "ws":
             return None
+        if match[2] == "status":
+            known = match[1] in self.contexts
+            return Response(200 if known else 404, "OK" if known else "Not found", Headers(), b"")
         # Container RPCs use a small GET endpoint; WebSocket connections use /ws.
         try:
-            if request.headers.get("X-Dew-Close") == "1":
+            if match[2] == "close":
                 await self.close(match[1])
             else:
                 await self.create(match[1])
