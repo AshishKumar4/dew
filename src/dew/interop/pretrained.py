@@ -74,6 +74,7 @@ from dew.objectives.base import Variables
 from dew.registry import (
     dtype_name,
     from_record,
+    models,
     precision_fields,
     projectors,
     resolve_dtype,
@@ -1307,20 +1308,24 @@ def _denoiser(directory: Path, *, dtype: str | None, attention_impl: str) -> _De
         return _unet_denoiser(directory, dtype=dtype, attention_impl=attention_impl)
     config = _component_config(directory, "transformer")
     published = config.get("_class_name")
-    if published == "SD3Transformer2DModel":
-        return _sd3_denoiser(config, directory, dtype=dtype, attention_impl=attention_impl)
-    if published == "FluxTransformer2DModel":
-        return _flux_denoiser(config, directory, dtype=dtype, attention_impl=attention_impl)
-    if published == "QwenImage21Transformer2DModel":
-        return _qwen_image_denoiser(config, directory, dtype=dtype, attention_impl=attention_impl)
-    if published == "Flux2Transformer2DModel":
-        return _flux2_denoiser(config, directory, dtype=dtype, attention_impl=attention_impl)
-    if published == "ZImageTransformer2DModel":
-        return _z_image_denoiser(config, directory, dtype=dtype, attention_impl=attention_impl)
-    if published == "WanTransformer3DModel":
-        return _wan_denoiser(config, directory, dtype=dtype, attention_impl=attention_impl)
-    raise ValueError(f"Native diffusion does not implement the published transformer "
-                     f"{published!r}")
+    spec = _denoiser_specs().get(published) if isinstance(published, str) else None
+    if spec is None:
+        raise ValueError(f"Native diffusion does not implement the published transformer "
+                         f"{published!r}")
+    if not isinstance(spec, _DenoiserSpec):
+        return spec(config, directory, dtype=dtype, attention_impl=attention_impl)
+    fields = spec.fields(config, dtype=dtype, attention_impl=attention_impl)
+    return _Denoiser(
+        component="transformer", model=models[spec.name](**fields),
+        weights=_transformer_weights(directory, spec.translate),
+        built=_built(spec.name, fields, dtype), config=config, text=spec.text(fields),
+        patch=spec.patch(fields) if callable(spec.patch) else spec.patch,
+        latent_input=records.integer(fields["in_channels"], "in_channels") // spec.latent_divisor,
+        sample_size=(_square(config, spec.sample_size) if isinstance(spec.sample_size, int)
+                     else spec.sample_size),
+        context_width=records.integer(fields[spec.context], spec.context),
+        pipeline=spec.pipeline(fields) if callable(spec.pipeline) else spec.pipeline,
+        origin=spec.origin, frames=spec.frames)
 
 
 def _transformer_weights(directory: Path, translate: Callable[..., tuple[LazyTree, tuple[WeightLayout, ...]]]
@@ -1365,114 +1370,62 @@ def _sd3_denoiser(config: dict, directory: Path, *, dtype: str | None, attention
         context_width=fields["joint_attention_dim"], pipeline="StableDiffusion3Pipeline")
 
 
-def _flux_denoiser(config: dict, directory: Path, *, dtype: str | None, attention_impl: str) -> _Denoiser:
-    """Build Flux's transformer: one CLIP tower for the pooled vector, the T5 tower
-    for the sequence, and a latent its pipeline packs in 2x2 patches.
+@dataclass(frozen=True)
+class _DenoiserSpec:
+    """The transformer's native record and its pipeline's text, geometry and sigma origin."""
 
-    The class declares no sample size; its pipeline's `default_sample_size`
-    is 128 latent positions, which a directory overrides with its own
-    geometry. It starts from the sigmas its pipeline hands the scheduler.
-    """
+    name: str
+    fields: Callable[..., Mapping[str, object]]
+    translate: Callable[..., tuple[LazyTree, tuple[WeightLayout, ...]]]
+    text: Callable[[Mapping[str, object]], _TextTowers | _QwenImageText | _HiddenStatesText | _WanText]
+    patch: int | Callable[[Mapping[str, object]], int]
+    sample_size: tuple[int, int] | int
+    context: str
+    pipeline: str | Callable[[Mapping[str, object]], str]
+    origin: Origin = "scheduler"
+    latent_divisor: int = 1
+    frames: int | None = None
+
+
+@functools.cache
+def _denoiser_specs() -> Mapping[str, _DenoiserSpec | Callable[..., _Denoiser]]:
+    """Keep model imports lazy, as the loader also reads language-only sources."""
     from dew.interop import diffusion
-    from dew.nn.backbones.flux import FluxTransformer
 
-    fields = diffusion.flux_fields(config, dtype=dtype, attention_impl=attention_impl)
-    return _Denoiser(
-        component="transformer", model=FluxTransformer(**fields),
-        weights=_transformer_weights(directory, diffusion.translate_flux_weights),
-        built=_built("flux_transformer", fields, dtype), config=config,
-        text=_TextTowers("flux", ("text_encoder",), t5_tower="text_encoder_2",
-                         embeds_guidance=fields["guidance_embeds"]), patch=2,
-        latent_input=fields["in_channels"] // 4,
-        sample_size=_square(config, 128),
-        context_width=fields["joint_attention_dim"], pipeline="FluxPipeline",
-        origin="linspace")
-
-
-def _qwen_image_denoiser(config: dict, directory: Path, *, dtype: str | None,
-                         attention_impl: str) -> _Denoiser:
-    """Build Qwen-Image 2.1's transformer: one stream over the Qwen3-VL
-    encoder's prompt states and the latent, one token per position.
-
-    The class declares no sample size, and neither does the published
-    config; its pipeline renders at `output_resolution` 1024 pixels, 64
-    latent positions through the VAE's 16x. It starts from the sigmas its
-    pipeline hands the scheduler.
-    """
-    from dew.interop import diffusion
-    from dew.nn.backbones.qwen_image import QwenImageTransformer
-
-    fields = diffusion.qwen_image_fields(config, dtype=dtype, attention_impl=attention_impl)
-    return _Denoiser(
-        component="transformer", model=QwenImageTransformer(**fields),
-        weights=_transformer_weights(directory, diffusion.translate_qwen_image_weights),
-        built=_built("qwen_image_transformer", fields, dtype), config=config,
-        text=_QwenImageText(), patch=1,
-        latent_input=fields["in_channels"], sample_size=(64, 64),
-        context_width=fields["context_in_dim"], pipeline="QwenImage21Pipeline", origin="linspace")
-
-
-def _flux2_denoiser(config: dict, directory: Path, *, dtype: str | None, attention_impl: str) -> _Denoiser:
-    """Build FLUX.2's transformer over its VAE's folded latent, one token per
-    position, conditioned by stacked text-encoder states.
-
-    Its pipelines render at `default_sample_size` 128 through the VAE's 8x,
-    which is 64 folded positions, and hand the scheduler `linspace(1, 1/N,
-    N)` with their own empirical mu.
-    """
-    from dew.interop import diffusion
-    from dew.nn.backbones.flux2 import Flux2Transformer
-
-    fields = diffusion.flux2_fields(config, dtype=dtype, attention_impl=attention_impl)
-    guided = fields["guidance_embeds"]
-    return _Denoiser(
-        component="transformer", model=Flux2Transformer(**fields),
-        weights=_transformer_weights(directory, diffusion.translate_flux2_weights),
-        built=_built("flux2_transformer", fields, dtype), config=config,
-        text=_HiddenStatesText("flux2", embeds_guidance=guided), patch=1,
-        latent_input=fields["in_channels"], sample_size=(64, 64), context_width=fields["joint_attention_dim"],
-        pipeline="Flux2Pipeline" if guided else "Flux2KleinPipeline", origin="empirical")
-
-
-def _z_image_denoiser(config: dict, directory: Path, *, dtype: str | None, attention_impl: str) -> _Denoiser:
-    """Build Z-Image's single-stream transformer over the Flux VAE's latent,
-    cut into 2x2 patches, conditioned by its Qwen3 encoder's second-to-last
-    layer.
-
-    Its pipeline renders at 1024 pixels by default, 128 latent positions
-    through the VAE's 8x, and hands its statically shifting scheduler
-    `linspace(1, 1/N, N)`.
-    """
-    from dew.interop import diffusion
-    from dew.nn.backbones.z_image import ZImageTransformer
-
-    fields = diffusion.z_image_fields(config, dtype=dtype, attention_impl=attention_impl)
-    return _Denoiser(
-        component="transformer", model=ZImageTransformer(**fields),
-        weights=_transformer_weights(directory, diffusion.translate_z_image_weights),
-        built=_built("z_image_transformer", fields, dtype), config=config,
-        text=_HiddenStatesText("z_image"), patch=2, latent_input=fields["in_channels"],
-        sample_size=(128, 128), context_width=fields["cap_feat_dim"], pipeline="ZImagePipeline",
-        origin="linspace")
-
-
-def _wan_denoiser(config: dict, directory: Path, *, dtype: str | None, attention_impl: str) -> _Denoiser:
-    """Build Wan 2.1's video transformer over its VAE's latent, cut into
-    1x2x2 patches, conditioned by its UMT5 encoder.
-
-    `WanPipeline` renders 81 frames at 480x832 by default, 60x104 latent
-    positions through the VAE's 8x, and walks its scheduler's own sigmas.
-    """
-    from dew.interop import diffusion
-    from dew.nn.backbones.wan import WanTransformer
-
-    fields = diffusion.wan_fields(config, dtype=dtype, attention_impl=attention_impl)
-    return _Denoiser(
-        component="transformer", model=WanTransformer(**fields),
-        weights=_transformer_weights(directory, diffusion.translate_wan_weights),
-        built=_built("wan_transformer", fields, dtype), config=config, text=_WanText(),
-        patch=fields["patch_size"][-1], latent_input=fields["in_channels"], sample_size=(60, 104),
-        context_width=fields["text_dim"], pipeline="WanPipeline", frames=81)
+    return MappingProxyType({
+        "SD3Transformer2DModel": _sd3_denoiser,
+        # Flux packs four latent positions per token; its pipeline's default is 128 positions.
+        "FluxTransformer2DModel": _DenoiserSpec(
+            "flux_transformer", diffusion.flux_fields, diffusion.translate_flux_weights,
+            lambda fields: _TextTowers("flux", ("text_encoder",), t5_tower="text_encoder_2",
+                                      embeds_guidance=records.boolean(fields["guidance_embeds"],
+                                                                      "guidance_embeds")),
+            patch=2, latent_divisor=4, sample_size=128, context="joint_attention_dim",
+            pipeline="FluxPipeline", origin="linspace"),
+        # Qwen-Image renders 1024 pixels through its VAE's 16x downscale.
+        "QwenImage21Transformer2DModel": _DenoiserSpec(
+            "qwen_image_transformer", diffusion.qwen_image_fields, diffusion.translate_qwen_image_weights,
+            lambda _: _QwenImageText(), patch=1, sample_size=(64, 64), context="context_in_dim",
+            pipeline="QwenImage21Pipeline", origin="linspace"),
+        # FLUX.2 folds 128 latent positions into 64 and binds its own empirical sigma shift.
+        "Flux2Transformer2DModel": _DenoiserSpec(
+            "flux2_transformer", diffusion.flux2_fields, diffusion.translate_flux2_weights,
+            lambda fields: _HiddenStatesText("flux2", embeds_guidance=records.boolean(
+                fields["guidance_embeds"], "guidance_embeds")),
+            patch=1, sample_size=(64, 64), context="joint_attention_dim",
+            pipeline=lambda fields: "Flux2Pipeline" if fields["guidance_embeds"] else "Flux2KleinPipeline",
+            origin="empirical"),
+        # Z-Image renders 1024 pixels through its VAE's 8x downscale.
+        "ZImageTransformer2DModel": _DenoiserSpec(
+            "z_image_transformer", diffusion.z_image_fields, diffusion.translate_z_image_weights,
+            lambda _: _HiddenStatesText("z_image"), patch=2, sample_size=(128, 128), context="cap_feat_dim",
+            pipeline="ZImagePipeline", origin="linspace"),
+        # Wan's 81 frames at 480x832 use the scheduler's own sigmas.
+        "WanTransformer3DModel": _DenoiserSpec(
+            "wan_transformer", diffusion.wan_fields, diffusion.translate_wan_weights, lambda _: _WanText(),
+            patch=lambda fields: records.integers(fields["patch_size"], "patch_size")[-1],
+            sample_size=(60, 104), context="text_dim", pipeline="WanPipeline", frames=81),
+    })
 
 
 def _text_components(text: _TextTowers | _QwenImageText | _HiddenStatesText | _WanText,
