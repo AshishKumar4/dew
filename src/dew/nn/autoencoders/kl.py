@@ -22,10 +22,11 @@ def posterior_latent(moments: jnp.ndarray, key: jax.Array | None) -> jnp.ndarray
 
 
 class AutoencoderKL(nn.Module):
-    """NHWC image/latent arrays; scaling and shifts belong to AutoEncoder.
+    """Encodes NHWC images to latents with a convolutional VAE, and decodes latents back to images.
 
-    encode(image, key=None) returns the posterior mean. Passing a key samples
-    its diagonal Gaussian; decode(latents) returns unnormalized image pixels.
+    `encode(image, key=None)` returns the posterior mean, and passing a key
+    samples its diagonal Gaussian. `decode(latents)` returns unnormalized
+    image pixels. The latent scale and shift belong to `AutoEncoder`.
     """
     channels: tuple[int, ...] = (128, 256, 512, 512)
     latent_channels: int = 4
@@ -36,12 +37,16 @@ class AutoencoderKL(nn.Module):
     post_quantize: bool = True
     decoder_channels: tuple[int, ...] | None = None
     """The decoder's widths where they differ from the encoder's, as a
-    distilled decoder's do; None reads `channels`."""
+    distilled decoder's do; None uses `channels`."""
     dtype: Dtype = jnp.float32
 
     @property
     def downscale_factor(self) -> int:
-        """Every encoder level except the last halves each spatial axis."""
+        """The spatial factor between an image and its latent.
+
+        Every encoder level except the last halves each spatial axis, so the
+        factor is 2 ** (len(channels) - 1).
+        """
         return 2 ** (len(self.channels) - 1)
 
     def setup(self):
@@ -65,7 +70,7 @@ class AutoencoderKL(nn.Module):
             self.post_quant_conv = Conv(self.latent_channels, (1, 1), padding="VALID", dtype=self.dtype)
 
     def moments(self, image):
-        """The posterior's mean and log-variance, stacked on the channel axis."""
+        """Return the posterior's mean and log-variance, stacked on the channel axis."""
         moments = self.encoder(image)
         return self.quant_conv(moments) if self.quantize else moments
 

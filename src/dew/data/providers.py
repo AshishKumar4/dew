@@ -345,7 +345,12 @@ class ProviderDataset(DatasetSpec):
 @datasets("tfds")
 @dataclasses.dataclass(frozen=True)
 class PreparedTFDS(ProviderDataset):
-    """Reads splits of a prepared TFDS builder where preparation left them."""
+    """Reads the splits of a prepared TFDS builder from where its preparation
+    run wrote them.
+
+    `options` is a `TFDSOptions`, whose `path` names that directory. Nothing
+    is prepared, downloaded or generated here.
+    """
 
     options: PreparedOptions = dataclasses.field(default_factory=TFDSOptions)
 
@@ -360,12 +365,15 @@ class PreparedTFDS(ProviderDataset):
 @datasets("hf")
 @dataclasses.dataclass(frozen=True)
 class HubDataset(ProviderDataset):
-    """Reads one Hugging Face split, Arrow-backed or streamed.
+    """Reads a Hugging Face split, either Arrow-backed and read by index or
+    streamed.
 
-    `streaming` reads the split as it comes instead of by index.
-    `shuffle_buffer` is then how many rows the shuffle holds, zero being file
-    order, and a pass has no length, so `records` is whatever a caller knows.
-    A validation pass is never shuffled either way.
+    With `streaming`, the split is read in order as it arrives.
+    `shuffle_buffer` is then the number of rows the shuffle holds, and 0
+    keeps file order. A stream has no length, so `records` is whatever count
+    the caller knows. A validation pass is never shuffled. An Arrow split is
+    shuffled whole from `seed`, so a nonzero `shuffle_buffer` without
+    `streaming` raises `TypeError`, and so does streaming a mixture.
     """
 
     streaming: bool = False
@@ -383,12 +391,12 @@ class HubDataset(ProviderDataset):
 
     def rows(self, *, batch: int,
              dataset: ArrowDataset | IterableDataset | None) -> Dataset:
-        """This spec's batches, over `dataset` when a caller already holds
-        the split.
+        """Return this spec's batches, read from `dataset` when the caller
+        already holds the split.
 
-        A table in memory has no JSON form, so it is an argument here rather
-        than a spec field. `dew.data.load(dataset=)` is the one caller that
-        passes one.
+        A table in memory has no JSON form, so `dataset` is an argument here
+        and not a spec field. `dew.data.load(dataset=)` is the only caller
+        that passes one.
         """
         if self.streaming:
             return self._streamed(batch=batch, dataset=dataset)
@@ -458,21 +466,24 @@ def load(source: Named, *, batch: int,
          seed: int = 0, shuffle_buffer: int = 0, streaming: bool = False,
          loading: Loading = _DEFAULT_LOADING,
          dataset: ArrowDataset | IterableDataset | None = None) -> Dataset:
-    """The `Dataset` behind `source`, read where the provider already holds it.
+    """Return the `Dataset` for `source`, read from where its provider
+    already stores it.
 
     This builds the registered spec, so `load("hf/wiki", batch=32,
     options=HFOptions(config="20231101.en"))` and
     `datasets["hf"](name="wiki", options=HFOptions(config="20231101.en"))
-    .load(batch=32)` are the same dataset. A run that wants the second in its
-    config writes it there.
+    .load(batch=32)` are the same dataset. To put the dataset in a run's
+    config, write the second form there.
 
-    `source` is `"tfds/<builder>"` or `"hf/<name>"`, or several of them with
-    the share of a step each one fills. `options` is the provider's own
-    value, `TFDSOptions` for tfds and `HFOptions` for hf, so an option of the
-    other provider is a type error rather than a name. Everything else is
-    what both providers take. `dataset=` is a split the caller already holds,
-    an argument rather than a spec field because a table in memory has no
-    record in a config.
+    `source` is `"tfds/<builder>"` or `"hf/<name>"`, or a mapping of several
+    such names to the share of a step each one fills; they must all name one
+    provider. `options` is the provider's own type, `TFDSOptions` for tfds
+    and `HFOptions` for hf, so the other provider's options raise
+    `TypeError`. The other arguments are the ones both providers take,
+    except `streaming`, `shuffle_buffer` and `dataset=`, which only hf
+    accepts. `dataset=` is a split the caller already holds. It is an
+    argument and not a spec field, because a table in memory has no record
+    in a config.
     """
     provider, names = _sources(source)
     if provider == "tfds":

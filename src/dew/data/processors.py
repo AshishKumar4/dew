@@ -21,10 +21,16 @@ class Sampled(Protocol):
 
 
 class AutoAudioProcessor:
-    """Runs a Hugging Face audio feature extractor.
+    """Runs a Hugging Face audio feature extractor and returns its arrays
+    unchanged, such as `input_values` for wav2vec2 or `input_features` for
+    Whisper.
 
-    Returns its arrays unchanged: `input_values` for wav2vec2,
-    `input_features` for Whisper.
+    `modelname` names the model whose extractor is loaded. The audio is read
+    at `sampling_rate`, which defaults to the rate the extractor states, or
+    16 kHz when it states none. An extractor that pads to a fixed window by
+    default, as Whisper's pads to 30 seconds, keeps that padding. One that
+    does not pad by default, such as wav2vec2's, pads a batch to its longest
+    waveform.
     """
 
     def __init__(self, tensor_type="np", modelname="facebook/wav2vec2-base-960h",
@@ -43,7 +49,7 @@ class AutoAudioProcessor:
         self.padding = {} if padding is None else {"padding": padding.default or True}
 
     def __call__(self, audio):
-        """The extractor's arrays for one waveform or a batch of them."""
+        """Return the extractor's arrays for one waveform or a batch of them, as a dict."""
         features = self.processor(audio, sampling_rate=self.sampling_rate,
                                   return_tensors=self.tensor_type, **self.padding)
         return dict(features)

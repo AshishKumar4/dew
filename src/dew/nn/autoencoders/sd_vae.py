@@ -8,15 +8,20 @@ from .vae import load_pretrained_vae
 
 
 class StableDiffusionVAE(ModuleAutoEncoder[AutoencoderKL]):
-    """Frozen native AutoencoderKL variables and their latent normalization."""
+    """Encodes and decodes images with a frozen native `AutoencoderKL` and its latent normalization."""
 
     def __init__(self, modelname="CompVis/stable-diffusion-v1-4", revision="bf16",
                  dtype=jnp.bfloat16, latent_shift=None, latent_scale=None, params=None,
                  model: AutoencoderKL | None = None):
-        """Bind supplied params unchanged, reading only missing model metadata.
+        """Build the autoencoder around `params` as given, loading only the model metadata that is missing.
 
-        Without params, load source weights. Supplying model as well avoids
-        metadata I/O; dtype controls computation and never casts supplied params.
+        Without `params`, it loads the source weights of `modelname` at
+        `revision`. Passing `model` as well avoids reading any metadata, and
+        passing `model` without `params` raises `ValueError`. `dtype` sets the
+        computation dtype and never casts supplied params. When the config is
+        read from the checkpoint, `latent_shift` and `latent_scale` default to
+        its `shift_factor` and `scaling_factor`; otherwise they default to 0.0
+        and 0.18215.
         """
         self.modelname = modelname
         self.revision = revision
