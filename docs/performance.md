@@ -1522,6 +1522,36 @@ rotated caches, a pool split into groups, hybrids whose recurrent layers
 read their row's tokens in order, and prediction depths keep the two
 forwards; a server names which (`Server.mixed_refusal`, logged at build).
 
+### A hybrid: Qwen3.5-0.8B, 2026-10-05
+
+Qwen3.5-0.8B is a multimodal wrapper around 18 gated delta net layers and
+6 full-attention layers. Before 2026-10-05 Dew served it NaN (the chunked
+rule's inverse, above). Then, served at 384 slots, it held caches of 8192:
+`_sized` sized a model only through its own `max_seq_len` field, which the
+wrapper only reads through to its language model. 4.1 GiB of cache at 32
+rows ran out of memory at 128, and each decode step transposed every
+full-attention layer's 8192 slots, half its time. `_sized` now sizes the
+wrapper's language model, for serving and for a lone generation alike.
+The same session against vLLM 0.30.0, one process each:
+
+| slots | rate | Dew TTFT p50 / p99, gap p50 / p99 (ms) | vLLM |
+|---:|---:|---|---|
+| 32 | closed | 4166-4271 tokens a second | 4938-4945 |
+| 32 | 8 | 25.4 / 37.1, 5.94 / 13.65 | 28.7 / 74.0, 3.50 / 22.87 |
+| 32 | 16 | 26.4 / 40.8, 5.95 / 15.97 | 33.0 / 114.9, 4.11 / 31.88 |
+| 32 | 24 | 28.1 / 49.2, 5.96 / 15.98 | 38.2 / 69.5, 4.52 / 26.29 |
+| 128 | closed | 4203-4207 | 5410-5577 |
+| 128 | 16 | 81.1 / 113.3, 22.96 / 43.98 | 41.8 / 215.7, 4.29 / 72.11 |
+| 128 | 24 | 88.8 / 125.8, 25.48 / 46.88 | 42.7 / 112.3, 4.87 / 26.70 |
+| 128 | 32 | 929 / 2052, 34.58 / 55.13 | 46.4 / 84.4, 6.60 / 27.22 |
+
+At 32 slots Dew has the shorter tails and vLLM the shorter median token
+gap. At 128 Dew's decode step is the gap: it runs every slot's delta-rule
+state each step, 2.4 GB of fp32 at 128 rows, and reads it in separate
+passes (decay, the memory read, the write, the query read), where vLLM's
+fused recurrent kernel passes once over the rows it holds. Tracing 32
+slots, those passes were a quarter of the decode program's device time.
+
 ## Quantized serving of the 176M text-to-image model, 2026-09-28
 
 `TextToImage.quantized` serves the denoiser with its kernels stored as int8

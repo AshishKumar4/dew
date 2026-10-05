@@ -223,12 +223,19 @@ def _sized(model: nn.Module, capacity: int | None) -> nn.Module:
     from (`dew.nn.attention.open_kv_cache`), so a per-request capacity is a
     model per capacity. The clones are kept because the model is a static
     argument of the compiled generation: one object per capacity is one
-    compile per capacity rather than one per call.
+    compile per capacity rather than one per call. A wrapper that declares
+    its language model's size (`MultimodalTransformer`) has that model
+    sized: read only as the wrapper's own field, Qwen3.5-0.8B served at 384
+    slots held caches of 8192.
     """
-    if capacity is None or not any(field.name == "max_seq_len"
-                                   for field in dataclasses.fields(model)):
+    if capacity is None:
         return model
-    return model.clone(max_seq_len=capacity)
+    fields = {field.name for field in dataclasses.fields(model)}
+    if "max_seq_len" in fields:
+        return model.clone(max_seq_len=capacity)
+    if "language_model" in fields:
+        return model.clone(language_model=_sized(model.language_model, capacity))
+    return model
 
 
 def _requested(generated: Generation, budget: int, padding: int) -> Generation:
