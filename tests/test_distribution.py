@@ -286,18 +286,21 @@ ONE_SLURM_TASK = {"SLURM_JOB_ID": "4242", "SLURM_NTASKS": "1", "SLURM_PROCID": "
 @pytest.mark.parametrize(
     "flags, kept", [("", "false"), ("--xla_gpu_enable_allocator_spatial_partitioning=true", "true")]
 )
-def test_a_gpu_process_keeps_its_temporaries_one_free_block(flags, kept):
+def test_a_gpu_process_keeps_its_temporaries_one_free_block(tmp_path, flags, kept):
     """A preallocated BFC pool is spatially partitioned by default: a free
     block below a buffer goes on serving the small allocations around a step,
     while the open space past it waits for collective buffers. The step's
     temporaries then lose their block on the 4080 once a prefetched batch
-    lands past them. The process turns the partitioning off, unless the run
+    lands past them, and the fit check holds room for them twice. `import
+    dew` turns the partitioning off where JAX's CUDA plugin is installed
+    (here a stand-in for one), with no `prepare_process`, unless the run
     named it."""
-    env = {**os.environ, "PYTHONPATH": str(REPO_ROOT / "src"), "JAX_PLATFORMS": "cpu", "XLA_FLAGS": flags}
-    program = ("import os\n"
-               "import dew.training.runtime as runtime\n"
-               "runtime.cuda_plugin = lambda: True\n"
-               "runtime.prepare_process(multi_host=False)\n"
+    plugin = tmp_path / "jax_plugins" / "xla_cuda12"
+    plugin.mkdir(parents=True)
+    (plugin / "__init__.py").write_text("")
+    env = {**os.environ, "PYTHONPATH": f"{REPO_ROOT / 'src'}{os.pathsep}{tmp_path}", "JAX_PLATFORMS": "cpu",
+           "XLA_FLAGS": flags}
+    program = ("import dew\n"
                "from dew.telemetry.devices import xla_flag\n"
                "print('partitioning', xla_flag('xla_gpu_enable_allocator_spatial_partitioning'))\n")
     done = subprocess.run([sys.executable, "-c", program], cwd=REPO_ROOT, env=env,

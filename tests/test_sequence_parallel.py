@@ -711,8 +711,8 @@ def hybrid():
         "causal_transformer", vocab_size=VOCAB, emb_features=32, num_layers=4,
         num_heads=4, num_kv_heads=2, mlp_features=64, max_seq_len=SEQ_LEN,
         layer_types=("mamba",) * 3 + ("attention",),
-        kinds={"mamba": {"mixer": {"kind": "mamba2", "num_heads": 4, "head_dim": 8,
-                                   "state_size": 8, "n_groups": 1, "chunk_size": 4}}})
+        kinds={"mamba": {"mixer": {"name": "mamba2", "fields": {"num_heads": 4, "head_dim": 8,
+                                   "state_size": 8, "n_groups": 1, "chunk_size": 4}}}})
 
 
 # tensor=2 by sequence=4 leaves fsdp at 1, so the layout's tolerance has to

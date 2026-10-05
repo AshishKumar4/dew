@@ -57,7 +57,7 @@ def chunk_kimi_delta_rule(query, key, value, g, beta, state=None, chunk_size: in
     `chunk_kimi_delta_attention` (modeling_glm5_next.py:482-578) line for
     line in fp32. The reference's row correction loop inverts `I - A` for a
     strictly lower triangular `A`, which `dew.nn.linear.strictly_lower_inverse`
-    sums as a series.
+    builds from its diagonal blocks.
     """
     dtype, work = query.dtype, at_least_fp32(query.dtype)
     query, key, value, g, beta = (x.astype(work) for x in (query, key, value, g, beta))

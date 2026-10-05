@@ -8,7 +8,6 @@ variables that wandb and the tokenizers read. So the library does it in
 
 from __future__ import annotations
 
-import importlib.util
 import logging
 import os
 import resource
@@ -34,7 +33,7 @@ from dew.pool import (
     runs_on_gpu,
     slurm_tasks_here,
 )
-from dew.telemetry.devices import apply_xla_flags, xla_flag
+from dew.telemetry.devices import apply_xla_flags, cuda_plugin, unpartition_gpu_pool, xla_flag
 from dew.telemetry.instrumentation import enable_compilation_cache
 
 _log = logging.getLogger(__name__)
@@ -220,24 +219,6 @@ def _joined() -> None:
     multihost_utils.sync_global_devices("dew process pool joined")
 
 
-def unpartition_gpu_pool() -> None:
-    """Turn off XLA's spatial partitioning of a preallocated GPU pool,
-    unless the run named it.
-
-    There a step's temporaries can lose their block between steps
-    (`dew.training.trainer.strands_temporaries`). The partitioning lets the
-    pool's upper end hold XLA's collective memory space
-    (xla/pjrt/gpu/se_gpu_pjrt_client.cc, `GetStreamExecutorGpuDeviceAllocator`
-    at openxla/xla 91888df, the commit jax 0.11.2 builds), which a buffer
-    takes only for NCCL user or symmetric buffers, a one-shot ragged
-    all-to-all or a Mosaic kernel's symmetric operand
-    (xla/service/gpu/gpu_memory_space_assignment.cc); Dew asks for none of
-    them. With it off XLA serves that space from an allocator of its own, and
-    steps ran as fast on an A100 (a DiT and a decoder within 0.5%)."""
-    if cuda_plugin() and xla_flag("xla_gpu_enable_allocator_spatial_partitioning") is None:
-        apply_xla_flags("--xla_gpu_enable_allocator_spatial_partitioning=false")
-
-
 def _pool_keys_alike() -> bool:
     """Whether this jax keys a computation that spans processes alike on
     every one of them (jax-ml/jax#40940).
@@ -254,14 +235,6 @@ def _pool_keys_alike() -> bool:
     from jax._src import cache_key
 
     return hasattr(cache_key, "_shared_fingerprints")
-
-
-def cuda_plugin() -> bool:
-    """Whether JAX's CUDA plugin is installed, the one reader of XLA's GPU
-    flags; asked before the backend opens, which no other question can be."""
-    return (importlib.util.find_spec("jax_plugins") is not None
-            and any(importlib.util.find_spec(f"jax_plugins.xla_cuda{major}") is not None
-                    for major in (12, 13)))
 
 
 class Preempted(SystemExit):

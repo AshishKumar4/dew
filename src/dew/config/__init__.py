@@ -18,16 +18,12 @@ raises an error.
 
 import dataclasses
 import datetime
-import functools
 import hashlib
 import json
-import operator
 import os
 import re
 import sys
-import types
-import typing
-from collections.abc import Callable, Mapping, Mapping as MappingABC, MutableMapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Literal, Self
 
@@ -50,7 +46,16 @@ from dew.lora import LoRA, _Adapted, adapted
 from dew.nn.attention import AttentionImpl
 from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.records import JSON, duration, recorded_duration
-from dew.registry import Registry, _declared_type, datasets, models, schedules, with_precision
+from dew.registry import (
+    _declared_type,
+    _recorded,
+    _table_of,
+    datasets,
+    from_record,
+    models,
+    schedules,
+    with_precision,
+)
 from dew.telemetry.instrumentation import default_compilation_cache_dir, dew_cache_dir
 from dew.telemetry.records import RunRecord, TrialFinished, json_value, packages_installed
 from dew.training.display import TrainingDisplay
@@ -149,7 +154,7 @@ class ModelConfig:
     @classmethod
     def from_dict(cls, values: Mapping[str, object]) -> Self:
         """Read back the record `RunConfig.to_dict` writes for this field."""
-        return _built(cls, values)
+        return from_record(cls, values, dtypes=False)
 
     @classmethod
     def from_model(cls, model) -> Self:
@@ -487,7 +492,7 @@ class TrainerConfig:
         if isinstance(self.checkpoint_every, str) and self.checkpoint_every != 'epoch':
             object.__setattr__(self, 'checkpoint_every', duration(self.checkpoint_every))
         if isinstance(self.keep, Mapping):
-            object.__setattr__(self, 'keep', _built(Keep, self.keep))
+            object.__setattr__(self, 'keep', from_record(Keep, self.keep, dtypes=False))
         if isinstance(self.keep, Keep) and self.keep.where is not None:
             raise TypeError("Keep.where is code-only; a recorded retention policy contains no callable")
         if self.best is not None:
@@ -497,7 +502,7 @@ class TrainerConfig:
                 if isinstance(choice, str):
                     choice = Best(choice)
                 elif isinstance(choice, Mapping):
-                    choice = _built(Best, choice)
+                    choice = from_record(Best, choice, dtypes=False)
                 if not isinstance(choice, Best) or choice._source is not None:
                     raise TypeError("a recorded best selector names metrics; callable scores are code-only")
                 rebuilt.append(choice)
@@ -593,15 +598,6 @@ def _artifact_name(name: str) -> str:
     return re.sub(r"[^\w.-]", "-", name)
 
 
-def _registry_for(annotation):
-    """Return the registry whose members the annotation names, or None."""
-    members = typing.get_args(annotation) or (annotation,)
-    for held in Registry.shared():
-        if all(any(member is m for m in held.values()) for member in members):
-            return held
-    return None
-
-
 def _to_json(value, annotation) -> JSON:
     """Return `value` as JSON: a dict, a list, or a scalar json.dump can write.
     `annotation` is the declared field type, so the write side names the same
@@ -611,7 +607,7 @@ def _to_json(value, annotation) -> JSON:
     if isinstance(value, type) and value.__module__ in ('jax.numpy', 'numpy', 'ml_dtypes'):
         return registry.dtype_name(value)
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        held = _registry_for(annotation)
+        held = _table_of(annotation)
         if held is not None and not any(type(value) is member
                                       for member in held.values()):
             raise ValueError(
@@ -619,15 +615,13 @@ def _to_json(value, annotation) -> JSON:
                 f"run config can only record members that load back, so register "
                 f"it once with `@dew.registry.{held.kind}s(\"{type(value).__name__.lower()}\")`")
         if held is None:
-            held = _registry_for(type(value))
+            held = _table_of(type(value))
         fields = {f.name: _to_json(getattr(value, f.name), _declared_type(type(value), f.name))
                   for f in dataclasses.fields(value) if _recorded(f)
                   and not (isinstance(value, nn.Module) and f.name in ('parent', 'name'))}
         if held is None:
             return fields
-        name = held.name_of(type(value))
-        return ({"kind": name, **fields} if held.record == "kind"
-                else {"name": name, "fields": fields})
+        return {"name": held.name_of(type(value)), "fields": fields}
     if isinstance(value, (list, tuple)):
         entries = registry.entry_types(annotation, len(value))
         return [_to_json(entry_value, entry)
@@ -662,118 +656,6 @@ def _key(key: object) -> str:
     return str(key)
 
 
-def _rebuild_key(annotation: registry.Annotation, key: str) -> str | tuple[str, ...]:
-    """Return one record key as the field declares it: a name, or the joined path."""
-    return tuple(key.split("/")) if registry.wants_tuple(annotation) else key
-
-
-def _instantiate(member: Callable, fields: Mapping[str, registry.Configured]) -> registry.Configured:
-    """Call the member with the record's fields, as a value a config carries.
-
-    The call is written here, behind `Callable[...]`, because a record names
-    its fields at runtime and the class it builds cannot check them at type
-    time; `_fields` has already refused any the class does not declare.
-    """
-    return registry.configured(member(**fields))
-
-
-def _recorded(field: dataclasses.Field) -> bool:
-    """Return whether a field is part of the run record.
-
-    A field marked `metadata={"record": False}` is a binding the value picked
-    up at runtime, not something the record describes: an adapter's source
-    names, say, which follow from the source the record already names. It is
-    neither written nor required, and a rebuilt value takes its default.
-    """
-    return field.init and field.metadata.get("record", True)
-
-
-def _has_default(field: dataclasses.Field) -> bool:
-    return field.default is not dataclasses.MISSING or field.default_factory is not dataclasses.MISSING
-
-
-def _fields(cls: type, values: registry.Configured) -> dict[str, registry.Configured]:
-    """The record's fields as `cls` declares them. A field the record lacks
-    takes its declared default; a field `cls` does not declare, or a
-    required one the record lacks, raises."""
-    if not isinstance(values, Mapping):
-        raise ValueError(f"{cls.__name__} is built from a record of its fields, not {values!r}")
-    declared = [f for f in dataclasses.fields(cls) if _recorded(f)]
-    unknown = sorted(set(values) - {f.name for f in declared})
-    missing = [f.name for f in declared if f.name not in values and not _has_default(f)]
-    if unknown or missing:
-        raise ValueError(
-            f"{cls.__name__} does not match the record: unknown fields {unknown}, "
-            f"missing fields {missing}")
-    return {f.name: _rebuild(_declared_type(cls, f.name), registry.configured(values[f.name]))
-            for f in declared if f.name in values}
-
-
-def _built[ValueT](cls: type[ValueT], values: Mapping[str, object]) -> ValueT:
-    """Build one record into the class it describes, or raise naming what it built."""
-    rebuilt = _rebuild(cls, values)
-    if not isinstance(rebuilt, cls):
-        raise ValueError(f"{values!r} builds a {type(rebuilt).__name__}, not a {cls.__name__}")
-    return rebuilt
-
-
-_MAPPINGS = (dict, MappingABC, MutableMapping)
-
-
-def _rebuild(annotation: registry.Annotation, value: registry.Configured) -> registry.Configured:
-    """Build the value `annotation` asks for, out of a record.
-
-    It hands back what the field declares, which only the annotation knows,
-    so the width here is what a config field can carry. `_built` is the same
-    walk for a caller that holds the class and reads a value of it back.
-
-    `dew.registry._rebuilt` is the sibling walk over a module field. That one
-    resolves a `dtype` entry and walks a record with no value class behind it;
-    this one reads registered members and honours `record: False`.
-    """
-    annotation = registry.resolve_alias(annotation)
-    held = _registry_for(annotation)
-    if held is not None:
-        if not isinstance(value, Mapping):
-            raise ValueError(f"a {held.kind} is the record that names it, not {value!r}")
-        named = value["kind" if held.record == "kind" else "name"]
-        if not isinstance(named, str):
-            raise ValueError(f"a {held.kind} names a registered member, not {named!r}")
-        member = held[named]
-        if not isinstance(member, type):
-            raise ValueError(f"the {held.kind} {named!r} is a function, and a record "
-                             f"names the fields of a class")
-        fields = ({name: entry for name, entry in value.items() if name != "kind"}
-                  if held.record == "kind" else value["fields"])
-        return _instantiate(member, _fields(member, registry.configured(fields)))
-    if isinstance(annotation, type) and dataclasses.is_dataclass(annotation):
-        return _instantiate(annotation, _fields(annotation, value))
-    if typing.get_origin(annotation) in (typing.Union, types.UnionType):
-        inner = [m for m in typing.get_args(annotation) if m is not type(None)]
-        if value is None:
-            return value
-        if len(inner) == 1:
-            return _rebuild(inner[0], value)
-        # An optional registry union (a schedule or None) rebuilds through
-        # its registry; any other union holds a JSON value as it is.
-        members = functools.reduce(operator.or_, inner)
-        return _rebuild(members, value) if _registry_for(members) is not None else value
-    if typing.get_origin(annotation) in _MAPPINGS and isinstance(value, Mapping):
-        # A mapping's own annotation names its keys and its values, and the
-        # record carries neither: JSON keys are strings and JSON values are
-        # the scalars and lists below. Both go back through this walk.
-        keys, values = typing.get_args(annotation)
-        return {_rebuild_key(keys, str(name)): _rebuild(values, registry.configured(entry))
-                for name, entry in value.items()}
-    if isinstance(value, list):
-        # JSON writes every sequence as a list; the field says which are tuples.
-        entries = registry.entry_types(annotation, len(value))
-        rebuilt = [_rebuild(entry, record)
-                   for entry, record in zip(entries, value, strict=True)]
-        return tuple(rebuilt) if registry.wants_tuple(annotation) else rebuilt
-    return value
-
-
 @dataclasses.dataclass(frozen=True)
 class RunConfig:
     """A whole run's configuration; recipes subclass it to add their objective's settings."""
@@ -806,7 +688,7 @@ class RunConfig:
     def from_dict(cls, values: Mapping[str, object]) -> Self:
         """Read back what `to_dict` wrote, for subclasses too. A field the
         record lacks takes its default; an unknown field raises."""
-        return _built(cls, values)
+        return from_record(cls, values, dtypes=False)
 
     def save(self, directory: str) -> str:
         """Write this config as `run.json` in `directory` and return the path.

@@ -80,6 +80,40 @@ def assert_as_exact_as_the_reference(dew, reference, truth, label: str) -> None:
         f"(ratio {mine / theirs:.2f}, allowed {FACTOR})")
 
 
+FALSE_FAILURE = 1e-6
+"""The chance a port exactly as exact as its reference fails the K-order
+rule. The suite holds about 150 rules and CI runs it some tens of times a
+day, so this is one false failure in a few hundred days."""
+
+ORDERS = 52
+"""The rounding orders the K-order rule takes on each side: the fewest K
+for which a mean of K squared distances over another such mean exceeds
+FACTOR^2 with probability at most FALSE_FAILURE when both are equally exact.
+A squared RMS of Gaussian roundings is a weighted sum of one-degree
+chi-squares, whose spread is widest when one direction carries all of it,
+as a training step's can (Kimi Linear's updated logits spread like 3 to 5
+degrees, where one draw against one exceeds the factor about 10% of the
+time). At one degree the ratio is F(K, K), and F(52, 52) passes 4 with
+probability 8e-7; any larger spread in degrees is more concentrated still,
+so K holds for any computation (tests/test_bf16_reference.py derives it)."""
+
+
+def assert_as_exact_over_orders(dew, reference, label: str) -> None:
+    """Dew's RMS over ORDERS rounding orders within FACTOR times the
+    reference's RMS over the same orders.
+
+    `dew` and `reference` hold one distance from float64 per order (each a
+    `distance`), where an order is an exact symmetry of the computation, a
+    permutation of the residual stream (tests/residual_orders.py), so only
+    the rounding moves."""
+    dew, reference = np.asarray(dew, np.float64), np.asarray(reference, np.float64)
+    assert dew.shape == reference.shape == (ORDERS,), f"{label}: {dew.shape} and {reference.shape} orders"
+    mine, theirs = float(np.sqrt(np.mean(dew ** 2))), float(np.sqrt(np.mean(reference ** 2)))
+    assert mine <= FACTOR * theirs, (
+        f"{label}: dew is {mine:.3e} from float64 (rms over {ORDERS} orders), the reference "
+        f"{theirs:.3e} (ratio {mine / theirs:.2f}, allowed {FACTOR})")
+
+
 def assert_computes_the_oracle(reference_in_float64, truth, label: str, *, roundings: int) -> None:
     """The reference run in float64 within the float64 rounding of the
     computation itself of an independent float64 oracle: FACTOR times

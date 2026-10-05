@@ -32,6 +32,9 @@ What lands in numerics.npz beside each fixture's reference.npz, in float64:
 Run from the checkout, in Dew's own environment:
 
     JAX_PLATFORMS=cpu python tools/kimi_float64_reference.py
+
+`orders <fixture> <drawn>` checks that the residual orders
+tools/rounding_orders.py drew are a symmetry of this computation too.
 """
 
 import json
@@ -276,5 +279,36 @@ def main() -> None:
         np.savez(directory / "numerics.npz", **arrays)
 
 
+def symmetric(fixture: Path, drawn: Path) -> None:
+    """Hold the float64 truth under the second and the last residual order
+    tools/rounding_orders.py wrote under `drawn` to the fixture's own, within
+    float64 rounding over the computation's longest chain of reductions
+    (each layer's hidden and token sums, then the head's): the orders are a
+    symmetry of the reference's computation, not only of Dew's."""
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
+    from reference_error import assert_computes_the_oracle
+
+    text = json.loads((fixture / "config.json").read_text())
+    text = text.get("text_config", text)
+    with np.load(fixture / "numerics.npz") as exact, np.load(fixture / "reference.npz") as stored:
+        valid = stored["attention_mask"].astype(bool)
+        tokens = valid.shape[1]
+        roundings = text["num_hidden_layers"] * (text["hidden_size"] + tokens) + text["hidden_size"]
+        count = len(np.load(drawn / "orders.npy"))
+        for k in (1, count - 1):
+            arrays = truth(drawn / str(k))
+            for key in ("logits_f64", "updated_logits_f64"):
+                assert_computes_the_oracle(arrays[key][valid], exact[key][valid],
+                                           f"{fixture.name} order {k} {key}", roundings=roundings)
+    print(fixture.name, "orders 1 and", count - 1, "hold the float64 truth")
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+
+    if sys.argv[1:2] == ["orders"]:
+        symmetric(Path(sys.argv[2]), Path(sys.argv[3]))
+    else:
+        main()

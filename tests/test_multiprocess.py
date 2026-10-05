@@ -1209,6 +1209,7 @@ def test_a_pool_draws_every_prompts_continuations_on_the_process_that_asked(tmp_
     np.testing.assert_allclose(reports[0]["raw"] + reports[1]["raw"], single["raw"], rtol=1e-5, atol=1e-6)
     for report in reports:
         assert report["canvas_rejected"] and report["canvas_rows"] == 4
+    assert [report["canvas_alone"] for report in reports] == [1, 2]
     for name in ("canvas_tokens", "canvas_lengths", "canvas_steps"):
         assert reports[0][name] + reports[1][name] == single[name]
 
@@ -1366,6 +1367,7 @@ def test_masked_task_preserves_pool_rows_and_coordinates_invalid_requests(tmp_pa
     for report in reports:
         assert report["rows"] == 6
         assert report["refused"] == ["conditioning", "steps"]
+    assert [report["alone_width"] for report in reports] == [3 + 4, 4 + 4]
     for name in ("tokens", "lengths", "terminated", "decoder_steps"):
         assert reports[0][name] + reports[1][name] == single[name], name
 

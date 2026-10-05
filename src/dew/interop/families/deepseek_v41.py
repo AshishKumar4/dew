@@ -172,15 +172,16 @@ def _v41_decoder(hf_config: Mapping[str, object], used: set[str], *, media_bias:
              'index_n_heads': _record_int(text, 'index_n_heads'),
              'index_head_dim': _record_int(text, 'index_head_dim')}
     seen.update(index)
-    mixer: dict[str, object] = {
-        'kind': 'deepseek_v4', 'q_lora_rank': _record_int(text, 'q_lora_rank'),
+    fields: dict[str, object] = {
+        'q_lora_rank': _record_int(text, 'q_lora_rank'),
         'o_groups': _record_int(text, 'o_groups'), 'o_lora_rank': _record_int(text, 'o_lora_rank'),
         'rope_head_dim': rope_width, 'compressor': None, 'compress_rate': None,
         'query_norm': False, 'kv_qat': True}
+    mixer = {'name': 'deepseek_v4', 'fields': fields}
     seen.update(('q_lora_rank', 'o_groups', 'o_lora_rank'))
     compressed = native_fields(LayerKind)(window=window, rope_theta=compress_theta, yarn=None)
     compressed['yarn'] = ramp
-    kinds, layer_types, shared = _v41_kinds(text, layers, ratios[:layers], modes, mixer,
+    kinds, layer_types, shared = _v41_kinds(text, layers, ratios[:layers], modes, fields,
                                           compressed, index, seen)
     moe = _record_int(text, 'moe_intermediate_size')
     base_used: set[str] = set()
@@ -244,7 +245,7 @@ def _v41_kinds(text: Mapping[str, object], layers: int, ratios, modes, mixer: Ma
         pool = {'candidate_blocks': _record_int(text, 'candidate_topk_blocks'),
                 'candidate_block_size': _record_int(text, 'candidate_block_size')}
     sliding = native_fields(LayerKind)(window=compressed.value.window, mixer=None)
-    sliding['mixer'] = mixer
+    sliding['mixer'] = {'name': 'deepseek_v4', 'fields': mixer}
     kinds: dict[str, KindFields] = {'sliding_attention': sliding}
     layer_types, shared = [], []
     for layer, (rate, mode) in enumerate(zip(ratios, modes, strict=True)):
@@ -261,9 +262,10 @@ def _v41_kinds(text: Mapping[str, object], layers: int, ratios, modes, mixer: Ma
         elif mode == 'reindex' and 0 <= candidate < layer:
             role = 'restrict'
         record: KindFields = NativeFields(LayerKind, {**compressed,
-                              'mixer': {**mixer, 'compressor': 'csa2', 'compress_rate': rate, **index,
+                              'mixer': {'name': 'deepseek_v4', 'fields': {
+                                        **mixer, 'compressor': 'csa2', 'compress_rate': rate, **index,
                                         'reindex': mode == 'reindex', 'candidates': role,
-                                        **(pool if role else {})}})
+                                        **(pool if role else {})}}})
         held = kinds.setdefault(name, record)
         if mode != 'reuse' and held != record:
             _refuse(f"layer {layer}", f"the {name} layers would need different candidate "

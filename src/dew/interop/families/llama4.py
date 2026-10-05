@@ -64,7 +64,6 @@ def _llama4_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
                  'moe_layers', 'interleave_moe_layer_step', 'attention_chunk_size',
                  'use_qk_norm', 'attn_temperature_tuning', 'floor_scale', 'attn_scale'))
     rule = {
-        'kind': 'llama4',
         'use_qk_norm': bool(hf_config.get('use_qk_norm', True)),
         'attn_temperature_tuning': bool(hf_config.get('attn_temperature_tuning', True)),
         'floor_scale': records.number(hf_config.get('floor_scale', 8192), 'floor_scale'),
@@ -72,11 +71,11 @@ def _llama4_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     }
     chunk = hf_config.get('attention_chunk_size')
     full = native_fields(LayerKind)(mixer=None)
-    full['mixer'] = {**rule, 'use_rope': False}
+    full['mixer'] = {'name': 'llama4', 'fields': {**rule, 'use_rope': False}}
     chunked = native_fields(LayerKind)(chunk=None if chunk is None else records.integer(chunk,
                                                                                     'attention_chunk_size'),
                                       mixer=None)
-    chunked['mixer'] = {**rule, 'use_rope': True}
+    chunked['mixer'] = {'name': 'llama4', 'fields': {**rule, 'use_rope': True}}
     kinds: dict[str, KindFields] = {'full_attention': full, 'chunked_attention': chunked}
     moe_layers = hf_config.get('moe_layers')
     step = records.integer(hf_config.get('interleave_moe_layer_step', 1), 'interleave_moe_layer_step')

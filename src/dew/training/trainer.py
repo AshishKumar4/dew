@@ -96,6 +96,7 @@ from dew.training.distributed import (
 )
 from dew.training.evaluation import Evaluation
 from dew.training.narrow import NARROW_COPY_GENERATIONS, narrowed, narrowed_paths
+from dew.training.rungs import keep_rung, recorded_rung
 from dew.training.runtime import Preempted, PreemptionNotice
 from dew.training.selection import Best
 from dew.training.state import Accumulation, TrainState
@@ -1339,6 +1340,7 @@ class Trainer(Generic[Loss, Effects]):
             prepared = jax.tree.map(
                 lambda x, s: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=s), prepared, shardings)
             refusals: list[RuntimeError] = []
+            consulted, record_path, key = False, None, {}
             while True:
                 body = (self.step(self.objective, self.optimizer) if self.step is not None else
                         Transaction(self.objective, self.optimizer, self.accumulation, shapes,
@@ -1356,6 +1358,14 @@ class Trainer(Generic[Loss, Effects]):
                                                 replicated),
                                  donate_argnums=0)
                 self.program = jitted.lower(prepared, batch)
+                if not consulted:
+                    consulted, before = True, self._rung()
+                    record_path, key, recorded = recorded_rung(self.program, mesh)
+                    self._climb_to(recorded)
+                    self._resumed_rung = None
+                    if self._rung() != before:
+                        _log.warning("taking an earlier run's rung; delete %s to decide again", record_path)
+                        continue
                 shards = math.prod(mesh.shape[axis] for axis in BATCH_AXES)
                 options = None if self._xla_defaults else step_compiler_options(
                     self.objective, _device_tokens(self.objective, batch, shards),
@@ -1378,6 +1388,8 @@ class Trainer(Generic[Loss, Effects]):
             if self.executable is None:
                 # XLA refused the last rung too, and its refusal is the run's error.
                 raise refusals[-1]
+            if record_path is not None:
+                keep_rung(record_path, key, self._rung())
             self.flops_per_step = compiled_flops(self.executable)
             self.links = links
         # The program compiled above, not the jit: a call through the jit
