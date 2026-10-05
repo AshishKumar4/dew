@@ -3,21 +3,10 @@ from typing import Literal
 
 import jax
 import jax.numpy as jnp
-from flax import linen as nn
-from flax.typing import Dtype, PrecisionLike
 
 from dew.registry import models
 
-from ..dit import (
-    ROPE_THETA,
-    ConditioningEmbed,
-    ModulatedBlock,
-    PatchSequenceEmbed,
-    PatchSequenceOutput,
-    RematChoice,
-    remat_block,
-    rope_for_scan,
-)
+from ..dit import ROPE_THETA, ModulatedBlock, _DiTStackOptions, remat_block, rope_for_scan
 from ..precision import at_least_fp32
 from ..rope import rotary_freqs
 
@@ -35,7 +24,7 @@ def scatter_tokens(held: jax.Array, kept: jax.Array, tokens: jax.Array) -> jax.A
 
 
 @models("simple_dit")
-class SimpleDiT(nn.Module):
+class SimpleDiT(_DiTStackOptions):
     """Standard DiT: a plain stack of adaLN-Zero attention blocks.
 
     `adaln_silu=False` and `text_pooling="all"` are FlaxDiff 0.2's conditioning,
@@ -50,21 +39,6 @@ class SimpleDiT(nn.Module):
     models; `Process.interval`), and `time_scale` scales the Fourier
     frequencies, small for a model trained through a JVP in time.
     """
-    output_channels: int = 3
-    patch_size: int = 16
-    emb_features: int = 768
-    num_layers: int = 12
-    num_heads: int = 12
-    mlp_ratio: int = 4
-    dropout_rate: float = 0.0  # Typically 0 for diffusion
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-    force_fp32_for_softmax: bool = True
-    norm_epsilon: float = 1e-5
-    qk_norm: bool = False
-    attention_impl: str = "auto"  # an AttentionImpl
-    remat: RematChoice = False
-    scan_order: Literal["raster", "hilbert", "zigzag"] = "raster"
     adaln_silu: bool = True
     text_pooling: Literal["real", "all"] = "real"
     routes: Sequence[Sequence[float]] = ()
@@ -74,31 +48,12 @@ class SimpleDiT(nn.Module):
 
 
     def setup(self):
-        self.embed = PatchSequenceEmbed(
-            patch_size=self.patch_size,
-            emb_features=self.emb_features,
-            scan_order=self.scan_order,
-            dtype=self.dtype,
-            precision=self.precision,
-            bottleneck=self.patch_bottleneck,
-        )
-        self.conditioning = ConditioningEmbed(
-            emb_features=self.emb_features,
-            mlp_ratio=self.mlp_ratio,
-            dtype=self.dtype,
-            precision=self.precision,
-            text_pooling=self.text_pooling,
-            interval=self.interval,
-            time_scale=self.time_scale,
-        )
+        self.embed = self._embedding(self.patch_size, self.emb_features, self.scan_order,
+                                     bottleneck=self.patch_bottleneck)
+        self.conditioning = self._conditioning(self.emb_features, text_pooling=self.text_pooling,
+                                              interval=self.interval, time_scale=self.time_scale)
         self.blocks = self.stack()
-        self.output = PatchSequenceOutput(
-            patch_size=self.patch_size,
-            output_channels=self.output_channels,
-            norm_epsilon=self.norm_epsilon,
-            dtype=self.dtype,
-            precision=self.precision,
-        )
+        self.output = self._output(self.patch_size, self.output_channels)
 
     def stack(self) -> list[ModulatedBlock]:
         """The layers between the patch embedding and the output, all attention."""
@@ -107,15 +62,8 @@ class SimpleDiT(nn.Module):
                 features=self.emb_features,
                 num_heads=self.num_heads,
                 mixer='attention',
-                mlp_ratio=self.mlp_ratio,
-                dropout_rate=self.dropout_rate,
-                dtype=self.dtype,
-                precision=self.precision,
-                force_fp32_for_softmax=self.force_fp32_for_softmax,
-                norm_epsilon=self.norm_epsilon,
                 adaln_silu=self.adaln_silu,
-                qk_norm=self.qk_norm,
-                attention_impl=self.attention_impl,
+                **self._block_options(),
                 name=f"dit_block_{i}"
             ) for i in range(self.num_layers)
         ]

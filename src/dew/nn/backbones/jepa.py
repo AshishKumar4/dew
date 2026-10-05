@@ -27,34 +27,21 @@ from typing import ClassVar, Literal
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
-from flax.typing import Dtype, PrecisionLike
 
 from dew.registry import models
 
 from ..attention import LayerNorm
-from ..dit import ROPE_THETA, ModulatedBlock, PatchSequenceEmbed, build_block_pattern, scan_ordered_pos_embed
+from ..dit import ROPE_THETA, ModulatedBlock, _JepaStackOptions, build_block_pattern, scan_ordered_pos_embed
 from ..precision import at_least_fp32
 from ..rope import rotary_freqs
 from ..sharding import constrain, down_projection
 from .dit import gather_tokens
 
 
-class TokenStack(nn.Module):
+class TokenStack(_JepaStackOptions):
     """A stack of unmodulated blocks over a token sequence."""
     features: int
     num_layers: int
-    num_heads: int
-    mlp_ratio: int = 4
-    ssm_attention_ratio: str = "all-attn"
-    ssm_state_dim: int = 64
-    bidirectional_ssm: bool = True
-    dropout_rate: float = 0.0
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-    force_fp32_for_softmax: bool = True
-    norm_epsilon: float = 1e-5
-    qk_norm: bool = False
-    attention_impl: str = "auto"  # an AttentionImpl
 
     def setup(self):
         pattern = build_block_pattern(self.num_layers, self.ssm_attention_ratio)
@@ -64,14 +51,7 @@ class TokenStack(nn.Module):
                 num_heads=self.num_heads,
                 mixer='ssm' if kind == 'ssm' else 'attention',
                 modulated=False,
-                mlp_ratio=self.mlp_ratio,
-                dropout_rate=self.dropout_rate,
-                dtype=self.dtype,
-                precision=self.precision,
-                force_fp32_for_softmax=self.force_fp32_for_softmax,
-                norm_epsilon=self.norm_epsilon,
-                qk_norm=self.qk_norm,
-                attention_impl=self.attention_impl,
+                **self._block_options(),
                 ssm_state_dim=self.ssm_state_dim,
                 bidirectional_ssm=self.bidirectional_ssm,
                 name=f"block_{i}",
@@ -84,7 +64,7 @@ class TokenStack(nn.Module):
         return tokens
 
 
-class FactorizedTokenStack(nn.Module):
+class FactorizedTokenStack(_JepaStackOptions):
     """Spatial then temporal blocks over [B, T, N, F], as in VideoDiT.
 
     Time is a real 1D axis that masking never touches, so the temporal half
@@ -92,29 +72,13 @@ class FactorizedTokenStack(nn.Module):
     """
     features: int
     num_layers: int
-    num_heads: int
-    mlp_ratio: int = 4
-    ssm_attention_ratio: str = "all-attn"
-    ssm_state_dim: int = 64
-    bidirectional_ssm: bool = True
-    dropout_rate: float = 0.0
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-    force_fp32_for_softmax: bool = True
-    norm_epsilon: float = 1e-5
-    qk_norm: bool = False
-    attention_impl: str = "auto"  # an AttentionImpl
 
     def setup(self):
         def stack(name, num_layers, ratio):
+            options = self._stack_options()
+            options['ssm_attention_ratio'] = ratio
             return TokenStack(
-                features=self.features, num_layers=num_layers, num_heads=self.num_heads,
-                mlp_ratio=self.mlp_ratio, ssm_attention_ratio=ratio,
-                ssm_state_dim=self.ssm_state_dim, bidirectional_ssm=self.bidirectional_ssm,
-                dropout_rate=self.dropout_rate, dtype=self.dtype, precision=self.precision,
-                force_fp32_for_softmax=self.force_fp32_for_softmax,
-                norm_epsilon=self.norm_epsilon, qk_norm=self.qk_norm,
-                attention_impl=self.attention_impl, name=name)
+                features=self.features, num_layers=num_layers, **options, name=name)
 
         # one spatial and one temporal block per layer, built as single-block
         # stacks so the two halves can be interleaved
@@ -138,23 +102,12 @@ class FactorizedTokenStack(nn.Module):
 
 
 @models("jepa_encoder")
-class JepaEncoder(nn.Module):
+class JepaEncoder(_JepaStackOptions):
     """ViT over an image, optionally restricted to a subset of its patches."""
     patch_size: int = 16
     emb_features: int = 384
     num_layers: int = 12
     num_heads: int = 6
-    mlp_ratio: int = 4
-    ssm_attention_ratio: str = "all-attn"
-    ssm_state_dim: int = 64
-    bidirectional_ssm: bool = True
-    dropout_rate: float = 0.0
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-    force_fp32_for_softmax: bool = True
-    norm_epsilon: float = 1e-5
-    qk_norm: bool = False
-    attention_impl: str = "auto"  # an AttentionImpl
     scan_order: Literal["raster", "hilbert", "zigzag"] = "raster"
 
     stack_type: ClassVar[type[TokenStack | FactorizedTokenStack]] = TokenStack
@@ -162,22 +115,10 @@ class JepaEncoder(nn.Module):
     image's tokens, `FactorizedTokenStack` over a clip's frames."""
 
     def setup(self):
-        self.embed = PatchSequenceEmbed(
-            patch_size=self.patch_size,
-            emb_features=self.emb_features,
-            scan_order=self.scan_order,
-            dtype=self.dtype,
-            precision=self.precision,
-        )
+        self.embed = self._embedding(self.patch_size, self.emb_features, self.scan_order)
         self.stack = self.stack_type(
             features=self.emb_features, num_layers=self.num_layers,
-            num_heads=self.num_heads, mlp_ratio=self.mlp_ratio,
-            ssm_attention_ratio=self.ssm_attention_ratio,
-            ssm_state_dim=self.ssm_state_dim, bidirectional_ssm=self.bidirectional_ssm,
-            dropout_rate=self.dropout_rate, dtype=self.dtype, precision=self.precision,
-            force_fp32_for_softmax=self.force_fp32_for_softmax,
-            norm_epsilon=self.norm_epsilon, qk_norm=self.qk_norm,
-            attention_impl=self.attention_impl,
+            **self._stack_options(),
         )
         self.norm = LayerNorm(epsilon=self.norm_epsilon, dtype=self.dtype, name="norm")
 
@@ -208,7 +149,7 @@ class JepaVideoEncoder(JepaEncoder):
 
 
 @models("jepa_predictor")
-class JepaPredictor(nn.Module):
+class JepaPredictor(_JepaStackOptions):
     """Narrow transformer from context embeddings to target embeddings.
 
     Context tokens are projected down, mask tokens stand in for the targets,
@@ -226,17 +167,6 @@ class JepaPredictor(nn.Module):
     predictor_features: int = 192
     num_layers: int = 6
     num_heads: int = 6
-    mlp_ratio: int = 4
-    ssm_attention_ratio: str = "all-attn"
-    ssm_state_dim: int = 64
-    bidirectional_ssm: bool = True
-    dropout_rate: float = 0.0
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-    force_fp32_for_softmax: bool = True
-    norm_epsilon: float = 1e-5
-    qk_norm: bool = False
-    attention_impl: str = "auto"  # an AttentionImpl
     scan_order: str = 'raster'
     factorized: bool = False     # space-time blocks, for video
 
@@ -248,13 +178,7 @@ class JepaPredictor(nn.Module):
         stack = FactorizedTokenStack if self.factorized else TokenStack
         self.stack = stack(
             features=self.predictor_features, num_layers=self.num_layers,
-            num_heads=self.num_heads, mlp_ratio=self.mlp_ratio,
-            ssm_attention_ratio=self.ssm_attention_ratio,
-            ssm_state_dim=self.ssm_state_dim, bidirectional_ssm=self.bidirectional_ssm,
-            dropout_rate=self.dropout_rate, dtype=self.dtype, precision=self.precision,
-            force_fp32_for_softmax=self.force_fp32_for_softmax,
-            norm_epsilon=self.norm_epsilon, qk_norm=self.qk_norm,
-            attention_impl=self.attention_impl,
+            **self._stack_options(),
         )
         self.norm = LayerNorm(epsilon=self.norm_epsilon, dtype=self.dtype, name="norm")
         self.proj_out = nn.Dense(features=self.emb_features, dtype=self.dtype,

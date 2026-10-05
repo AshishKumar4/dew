@@ -128,7 +128,7 @@ def dew_run(server, prompts: np.ndarray, output: int):
 def profile_decode(server, prompts: np.ndarray, output: int, steps: int, directory: Path):
     """Untraced Python costs and a warmed decode-only Dew/XProf capture."""
     import jax
-    from jax.profiler import ProfileData
+    from trace_window import device_events, length, union
 
     import dew
 
@@ -161,24 +161,15 @@ def profile_decode(server, prompts: np.ndarray, output: int, steps: int, directo
     assert all(ticket.done() for ticket in tickets)
     devices = {}
     trace, = set(directory.rglob("*.xplane.pb")) - previous
-    for plane in ProfileData.from_file(str(trace)).planes:
-        if not plane.name.startswith("/device:GPU"):
+    for plane, events in device_events(trace.parent)[0].items():
+        if not plane.startswith("/device:GPU") or not events:
             continue
-        spans, durations, counts = [], {}, {}
-        for line in plane.lines:
-            if not line.name.startswith("Stream"):
-                continue
-            for event in line.events:
-                spans.append((event.start_ns, event.start_ns + event.duration_ns))
-                durations[event.name] = durations.get(event.name, 0) + event.duration_ns
-                counts[event.name] = counts.get(event.name, 0) + 1
-        if not spans:
-            continue
-        end, busy = None, 0
-        for start, stop in sorted(spans):
-            busy += max(0, stop - max(start, start if end is None else end))
-            end = stop if end is None else max(end, stop)
-        window = max(stop for _, stop in spans) - min(start for start, _ in spans)
+        durations, counts = {}, {}
+        for event in events:
+            durations[event.name] = durations.get(event.name, 0) + event.duration_ns
+            counts[event.name] = counts.get(event.name, 0) + 1
+        spans = union([(event.start_ns, event.start_ns + event.duration_ns) for event in events])
+        busy, window = length(spans), spans[-1][1] - spans[0][0]
         patterns = {"attention": r"fmha|flash|cudnn|attention", "gemm": r"gemm|cutlass|cublas|xmma|matmul|_dot",
                     "movement": r"memcpy|copy|scatter|gather|transpose|concatenate",
                     "reduction": r"reduce|argmax|topk|sort", "random": r"random|threefry|philox"}
@@ -186,11 +177,11 @@ def profile_decode(server, prompts: np.ndarray, output: int, steps: int, directo
         for name, duration in durations.items():
             kind = next((kind for kind, pattern in patterns.items() if re.search(pattern, name, re.I)), "other")
             classes[kind] += duration
-        devices[plane.name] = {"window_ms": window / 1e6, "busy_ms": busy / 1e6,
-                               "busy_fraction": busy / window, "kernel_count": sum(counts.values()),
-                               "kernel_ms": {kind: duration / 1e6 for kind, duration in classes.items()},
-                               "top": [{"name": name, "ms": duration / 1e6, "count": counts[name]}
-                                       for name, duration in sorted(durations.items(), key=lambda item: -item[1])[:30]]}
+        devices[plane] = {"window_ms": window / 1e6, "busy_ms": busy / 1e6,
+                          "busy_fraction": busy / window, "kernel_count": sum(counts.values()),
+                          "kernel_ms": {kind: duration / 1e6 for kind, duration in classes.items()},
+                          "top": [{"name": name, "ms": duration / 1e6, "count": counts[name]}
+                                  for name, duration in sorted(durations.items(), key=lambda item: -item[1])[:30]]}
     return {"directory": str(directory), "steps": steps,
             "host_wall_seconds": host_wall, "host_profile": stream.getvalue(), "devices": devices}
 
