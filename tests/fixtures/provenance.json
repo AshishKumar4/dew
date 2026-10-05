@@ -279,6 +279,17 @@
    ],
    "note": "Brownian records call the upstream scheduler's torchsde-backed sampler (torchsde 0.2.6 documented at tool:28)."
   },
+  "diffusers/source_rounding.npz": {
+   "tool": "tools/diffusers_source_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/diffusers",
+     "version": "0.34.0",
+     "runs": "diffusers"
+    }
+   ],
+   "note": "The rounding mode with copies=32. Five pointwise source_schedulers cases use independent initial states and replayed per-step JAX noise on (2, 3, 128), both precisions over the same float32 inputs. CFG epsilon uses 52 pixel orders of the original (2, 3, 4) input and cotangent; each float64 VJP commutes with its order within 1e-12 relative RMS, and order zero reproduces the original float32 gradient bit for bit. Original source_schedulers arrays are unchanged. Torch 2.14.0+cpu, JAX 0.11.2.post3."
+  },
   "diffusers_handoff.npz": {
    "tool": "tools/diffusers_handoff_reference.py",
    "sources": [
@@ -428,7 +439,7 @@
      "runs": "jax"
     }
    ],
-   "note": "RK4Sampler.sample_step and MultiStepDPM.take_next_step through DiffusionSampler.sample_step, on KarrasVENoiseScheduler, walked as generate_samples walks its grid, around a stand-in denoiser; x_T and the cotangent are inputs. Also generate_samples as published from x_T (its priors): the closing clean prediction."
+   "note": "RK4Sampler.sample_step and MultiStepDPM.take_next_step through DiffusionSampler.sample_step, on KarrasVENoiseScheduler, walked as generate_samples walks its grid, around a stand-in denoiser; x_T and the cotangent are inputs. Also generate_samples as published from x_T (its priors): the closing clean prediction. rounding.npz adds RK4's clipped output over four copies of the independent initial states (128, 64); its float64 namespace widens every explicit jnp.float32 timestep cast so sigma arithmetic also runs in float64. The original solvers.npz arrays are unchanged."
   },
   "flow/densities.npz": {
    "tool": "tools/flow_density_reference.py",

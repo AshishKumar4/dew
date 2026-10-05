@@ -28,6 +28,8 @@ Run on CPU in an isolated reference environment with Dew, diffusers==0.34.0
 and torchsde==0.2.6:
 
     PYTHONPATH=src python tools/diffusers_source_reference.py
+    PYTHONPATH=src python tools/diffusers_source_reference.py rounding \
+        tests/fixtures/diffusers/source_rounding.npz 32
 """
 
 from __future__ import annotations
@@ -35,6 +37,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import sys
 import tempfile
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
@@ -409,7 +412,8 @@ class ReplayBrownian:
 
 
 def trajectory_gradient(module: ModuleType, case: Case, initial: torch.Tensor,
-                        cotangent: torch.Tensor, dtype: torch.dtype) -> np.ndarray:
+                        cotangent: torch.Tensor, dtype: torch.dtype,
+                        noises: list[np.ndarray] | None = None) -> np.ndarray:
     """One walk's VJP on identical inputs, cotangent and random draws."""
     scheduler = getattr(module, case.scheduler)(**case.config)
     scheduler.set_timesteps(case.steps)
@@ -425,11 +429,75 @@ def trajectory_gradient(module: ModuleType, case: Case, initial: torch.Tensor,
         with patch.object(module, "BrownianTreeNoiseSampler", ReplayBrownian):
             latents, _ = walk(scheduler, module, case, x, [])
     else:
-        noises = step_noise(len(scheduler.timesteps))
+        noises = step_noise(len(scheduler.timesteps)) if noises is None else noises
         runner = guided_walk if case.guidance is not None else walk
         latents, _ = runner(scheduler, module, case, x, noises)
     (gradient,) = torch.autograd.grad((latents[-1] * cotangent.to(dtype)).sum(), x)
     return gradient.numpy()
+
+
+STATE_CASES = ("edm.exponential_v_threshold", "dpm_multi.eps_threshold", "edm.default",
+               "dpm_multi.flow", "cfg.zero_rescale")
+
+
+def rounding(destination: Path, copies: int) -> None:
+    """Independent states for pointwise VJPs, pixel orders for CFG's reduction.
+
+    The five pointwise cases have no reduction over latent positions: their
+    pixel permutations reproduce one rounding draw. Independent initial
+    states and per-step noise draws enlarge their RMS comparison instead.
+    CFG with rescaling reduces over pixels, so its 52 permutations do move
+    rounding. Both its input and cotangent move, and its float64 VJP must
+    commute with each permutation before a reference distance is recorded.
+    The original source_schedulers arrays are read, never replaced.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
+    from reference_error import ORDERS, distance
+    from residual_orders import orders
+
+    torch.set_num_threads(2)
+    arrays: dict[str, np.ndarray] = {"copies": np.asarray(copies)}
+    shape = (SHAPE[0], SHAPE[1], SHAPE[2] * copies)
+    key = jax.random.PRNGKey(0)
+    noises = [np.asarray(jax.random.normal(jax.random.fold_in(key, index), shape, jnp.float32),
+                         np.float64) for index in range(STEPS)]
+    for name in STATE_CASES:
+        case, module = CASES[name], MODULES[CASES[name].scheduler]
+        generator = torch.Generator().manual_seed(SEED)
+        scheduler = getattr(module, case.scheduler)(**case.config)
+        scheduler.set_timesteps(case.steps)
+        initial = (torch.randn(shape, generator=generator, dtype=torch.float64)
+                   * float(scheduler.init_noise_sigma)).float()
+        cotangent = torch.randn(shape, generator=generator, dtype=torch.float64).float()
+        single = trajectory_gradient(module, case, initial, cotangent, torch.float32, noises)
+        with float64_scheduler(module):
+            truth = trajectory_gradient(module, case, initial, cotangent, torch.float64, noises)
+        arrays.update({f"{name}.x_T": initial.numpy(), f"{name}.cotangent": cotangent.numpy(),
+                       f"{name}.grad_float32": single, f"{name}.grad": truth})
+    name = "cfg.epsilon"
+    case, module = CASES[name], MODULES[CASES[name].scheduler]
+    drawn = orders(int(np.prod(SHAPE[1:])), ORDERS, SEED)
+    distances = []
+    with np.load(FIXTURES / "source_schedulers.npz") as stored:
+        truth = stored[f"{name}.grad"]
+        for index, order in enumerate(drawn):
+            def moved(value, order=order):
+                return value.reshape(SHAPE[0], -1)[:, order].reshape(SHAPE)
+            initial, cotangent = (torch.tensor(moved(stored[f"{name}.{field}"]))
+                                  for field in ("x_T", "cotangent"))
+            single = trajectory_gradient(module, case, initial, cotangent, torch.float32)
+            with float64_scheduler(module):
+                wide = trajectory_gradient(module, case, initial, cotangent, torch.float64)
+            scale = float(np.sqrt(np.mean(np.square(truth))))
+            assert distance(wide, moved(truth)) <= 1e-12 * scale, (
+                "the float64 VJP must commute with the order")
+            if index == 0:
+                np.testing.assert_array_equal(single, stored[f"{name}.grad_float32"])
+            distances.append(distance(single, moved(truth)))
+    arrays["orders"] = drawn.astype(np.uint8)
+    arrays[f"{name}.distances"] = np.asarray(distances)
+    np.savez_compressed(destination, **arrays)
+    print(f"{destination}: {copies} independent states per original entry, {ORDERS} pixel orders")
 
 
 def run(name: str, case: Case) -> dict[str, np.ndarray]:
@@ -610,4 +678,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:2] == ["rounding"]:
+        rounding(Path(sys.argv[2]), int(sys.argv[3]))
+    else:
+        main()
