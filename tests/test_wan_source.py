@@ -248,6 +248,8 @@ def test_a_text_free_walk_from_the_sources_own_encodings_matches_the_source(walk
                             initial=channels_last(arrays["x_T"]), key=0, steps=record["steps"])
     walked = task(prepared, key=jax.random.PRNGKey(0)).host()
     frames = np.clip(np.asarray(walked.images) / 2 + 0.5, 0.0, 1.0)
+    # Measured: 2.2e-6 to 2.5e-6 relative on the latents and the frames,
+    # under FORWARD's 1e-5.
     for row in range(rows):
         expected = channels_last(arrays[f"latents.{row}"][None])[0]
         assert relative_gap(np.asarray(walked.latents)[row], expected) < FORWARD, row
