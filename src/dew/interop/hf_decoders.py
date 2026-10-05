@@ -162,7 +162,8 @@ _INERT_FIELDS: Mapping[str | None, Mapping[str, Callable[[str, Mapping[str, obje
     # reference reads layer_norm_epsilon, has no rotary positions, and
     # derives dt directly from the Mamba projection.
     'nemotron_h': dict.fromkeys(
-        ('rms_norm_eps', 'norm_eps', 'time_step_rank', 'rope_theta', 'partial_rotary_factor'), _any_value),
+        ('rms_norm_eps', 'norm_eps', 'time_step_rank', 'rope_theta', 'partial_rotary_factor',
+         'mamba_num_groups', 'mamba_state_dim', 'num_query_groups'), _any_value),
     # The published HF ports carry mamba_ssm's own fields. The reference
     # normalizes with MambaRMSNormGated alone and gates before it
     # normalizes (modeling_mamba2.py:417, :477 passes norm_before_gate=False,
