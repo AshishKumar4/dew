@@ -1645,6 +1645,13 @@ At 32 slots 27 of 64 greedy rows part from integration's, all at bf16
 near-ties (a median 0.57 bf16 spacings apart in fp32, at most 1.44). The
 fp32 argmax is the two-forward choice in 16 rows and the mixed one in 11.
 
+The 32-slot tails above did not repeat on 2026-10-05 (integration
+`dfd31d58`). In two alternating rounds against vLLM in one session, the
+second round put Dew at or below vLLM on TTFT p50 and p99 and on token gap
+p50 and p99 at 16, 24 and 32 requests a second. Gap p99 was 8.16, 7.42 and
+8.32 ms against 8.65, 16.4 and 9.56. The first round had a TTFT p99 outlier
+at 16 requests a second on both sides: 46.4 ms for Dew and 51.6 for vLLM.
+
 Over a paged cache, 2026-10-04. The mixed step now runs over a page pool
 too. The admitted rows' tables go into the cache before the step writes,
 each token is written to its row's page, and the decoding rows read the pool
@@ -1809,6 +1816,36 @@ the same at 32 and 128 slots:
 
 Closed loop is unchanged at 32 slots (4503-4506 against 4408-4533 tokens
 a second). At 128 it rose from 5801-5818 to 5966.
+
+The same session against vLLM 0.30.0 at integration `be10d331` (the decode
+kernel, the folded attention and idle rows skipped), on a quiet host, Dew
+and vLLM alternating, two rounds:
+
+| slots | rate | Dew TTFT p50 / p99, gap p50 / p99 (ms) | vLLM |
+|---:|---:|---|---|
+| 32 | closed | 4657-4664 tokens a second | 4693-4938 |
+| 32 | 8 | 19.3-19.5 / 27.1-28.3, 3.88-3.89 / 10.1-11.5 | 25.6-27.1 / 56.3-56.5, 3.48-3.49 / 20.7-21.9 |
+| 32 | 16 | 20.6-20.9 / 33.5-40.8, 4.18-4.19 / 13.4-13.6 | 26.4-29.4 / 58.0-67.3, 4.05-4.08 / 21.3-23.0 |
+| 32 | 24 | 22.6-23.0 / 38.5-39.7, 4.66-4.70 / 14.2-15.5 | 30.9-36.6 / 63.9-95.0, 4.45-4.48 / 21.8-26.6 |
+| 128 | closed | 6309-6316 | 7393-7406 |
+| 128 | 16 | 32.9-33.3 / 55.6-57.6, 7.62 / 19.1-20.1 | 29.0-32.7 / 70.3-71.7, 4.17-4.20 / 23.9-25.2 |
+| 128 | 24 | 39.3 / 64.1-66.7, 8.83-8.88 / 22.8-23.0 | 39.4-41.5 / 81.6-86.4, 4.76-4.86 / 26.0-29.3 |
+| 128 | 32 | 47.8-48.3 / 77.7-78.4, 11.7 / 28.7-28.8 | 48.1-52.4 / 81.1-176, 6.76-7.21 / 31.9-77.1 |
+
+At 32 slots Dew is level with vLLM: 0.94-0.99 of its throughput, shorter
+TTFTs and token-gap tails, and a median gap 0.1-0.4 ms longer. At 128
+slots Dew serves 0.85 of vLLM's closed-loop throughput, its TTFTs and
+tails are level or shorter, and its median gap is 3.4-4.9 ms longer. Two
+causes remain. The first, counted by its bytes, is the fp32 recurrent
+state, above, twice vLLM's bytes per drawing row. The second, which the
+trace's per-program costs suggest but no A/B has isolated, is that a step
+still runs all 128 slots' rows through the projections, the MLP, the
+vocabulary head and the full-attention layers' cache reads, where vLLM
+batches only the rows that are running. To reproduce the Dew side:
+`tools/benchmark_lm_serving.py` asks `Server.from_task` for a dense cache,
+which a `MultimodalTransformer` refuses because it declares no `kv_cache`
+layout. These runs dropped that request, and the dense cache is the
+default anyway.
 
 ## Quantized serving of the 176M text-to-image model, 2026-09-28
 
