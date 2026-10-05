@@ -219,21 +219,25 @@ _INDEXERS = {
 
 
 @contextmanager
-def lower_index_ties(model, block: torch.nn.Module | None = None) -> Iterator[None]:
+def lower_index_ties(model, block: torch.nn.Module | None = None,
+                     indexer: type[torch.nn.Module] | None = None) -> Iterator[None]:
     """Run `model` (or `block`, a bare layer of its family) with its sparse
     indexer breaking equal scores toward the lower token index, which is what
     jax.lax.top_k does and torch leaves unspecified. Families without an
-    indexer run unchanged."""
-    named = _INDEXERS.get(model.config.model_type)
-    if named is None:
-        yield
-        return
-    from importlib import import_module
-    indexer = getattr(import_module(named[0]), named[1])
+    indexer run unchanged. `indexer` names the class for a reference outside
+    transformers, which has no config to look it up by (DeepSeek-V4-Flash-0731's
+    inference/model.py `Indexer`)."""
+    if indexer is None:
+        named = _INDEXERS.get(model.config.model_type)
+        if named is None:
+            yield
+            return
+        from importlib import import_module
+        indexer = getattr(import_module(named[0]), named[1])
     target = model if block is None else block
     held = [(m, m.forward) for m in target.modules() if isinstance(m, indexer)]
     if not held:
-        raise ValueError(f'{model.config.model_type} reference has no {named[1]}')
+        raise ValueError(f'the reference has no {indexer.__name__}')
 
     def stable(original):
         def forward(*args, **kwargs):
