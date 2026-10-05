@@ -130,6 +130,30 @@ NEMOTRON_H_CONFIGS = (
 )
 
 
+def write_qwen2_moe() -> None:
+    """Three mixed-window layers, two routed layers and a gated shared expert."""
+    from diffusers_wan_reference import float64
+    from transformers import Qwen2MoeConfig, Qwen2MoeForCausalLM
+
+    torch.manual_seed(0)
+    model = Qwen2MoeForCausalLM(Qwen2MoeConfig(
+        vocab_size=64, hidden_size=32, num_hidden_layers=3, num_attention_heads=4,
+        num_key_value_heads=2, intermediate_size=48, moe_intermediate_size=16,
+        shared_expert_intermediate_size=24, num_experts=4, num_experts_per_tok=2,
+        norm_topk_prob=False, decoder_sparse_step=1, mlp_only_layers=[1],
+        qkv_bias=True, use_sliding_window=True, sliding_window=4, max_window_layers=3,
+        max_position_embeddings=64, rope_theta=1000000.0, tie_word_embeddings=False))
+    model.set_experts_implementation('eager')
+    write_tiny('qwen2-moe-tiny', model)
+    directory = FIXTURES / 'qwen2-moe-tiny'
+    ids = torch.from_numpy(np.load(directory / 'input_ids.npy')).long()
+    with float64(), torch.no_grad():
+        np.save(directory / 'logits_f64.npy', model.double()(input_ids=ids, use_cache=False).logits.numpy())
+    (directory / 'model.safetensors').chmod(0o644)
+    write_released_config('qwen1.5-moe-a2.7b', 'Qwen/Qwen1.5-MoE-A2.7B',
+                          '1a758c50ecb6350748b9ce0a99d2352fd9fc11c9')
+
+
 def tiny_qwen3() -> Qwen3ForCausalLM:
     config = Qwen3Config.from_dict(dict(
         hidden_size=64, num_hidden_layers=2, num_attention_heads=4,
@@ -1131,9 +1155,14 @@ def main() -> None:
                         help="only the tiny fixtures, no 1.5 GB download")
     parser.add_argument("--nemotron-h-only", action="store_true",
                         help="only the Nemotron-H tiny fixture and two pinned released configs")
+    parser.add_argument('--qwen2-moe-only', action='store_true',
+                        help='only Qwen2-MoE and its pinned released config')
     args = parser.parse_args()
 
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    if args.qwen2_moe_only:
+        write_qwen2_moe()
+        return
     write_nemotron_h()
     for name, repo, revision in NEMOTRON_H_CONFIGS:
         write_released_config(name, repo, revision)
