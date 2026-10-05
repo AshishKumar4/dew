@@ -1,5 +1,4 @@
-"""
-MM-DiT (SD3-style multi-modal DiT) and a hierarchical variant.
+"""MM-DiT, the SD3-style multimodal DiT, and a hierarchical variant.
 
 The block is a dual-stream MM-DiT: text and image tokens keep separate
 qkv/mlp/modulation weights and mix through a single joint attention over the
