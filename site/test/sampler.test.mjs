@@ -158,3 +158,26 @@ test('Try it cards stay readable and the local sampler link opens at both widths
 		await page.close();
 	}
 });
+
+
+test('editable Python highlighting follows edits, scrolling and theme', async () => {
+	const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
+	const errors = [];
+	page.on('pageerror', (error) => errors.push(error.message));
+	await page.goto(`http://127.0.0.1:${server.address().port}/sample/`);
+	const editor = page.locator('[data-python-editor]').first();
+	const input = editor.locator('textarea');
+	const source = 'prompt = "a lake"\n# updated\n' + 'value = 1234567890'.repeat(30);
+	await input.fill(source);
+	await page.waitForFunction(() => document.querySelector('[data-highlight]')?.textContent.includes('# updated'));
+	assert.equal((await editor.locator('[data-highlight]').textContent()).trimEnd(), source);
+	for (const theme of ['dark', 'light']) {
+		await page.evaluate((theme) => document.documentElement.dataset.theme = theme, theme);
+		const colors = await editor.locator('[data-highlight] span').evaluateAll((spans) => spans.map((span) => getComputedStyle(span).color));
+		assert.ok(new Set(colors).size > 1, `${theme} has syntax colors`);
+	}
+	await input.evaluate((element) => { element.scrollLeft = 100; element.dispatchEvent(new Event('scroll')); });
+	assert.equal(await editor.locator('[data-highlight]').evaluate((element) => element.scrollLeft), await input.evaluate((element) => element.scrollLeft));
+	assert.deepEqual(errors, []);
+	await page.close();
+});

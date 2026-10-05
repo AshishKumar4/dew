@@ -8,9 +8,10 @@ interface Props {
 	rows?: number;
 	columns: number;
 	source_rows: number;
+	playbackSeconds: number;
 	meta: { where: string; jax: string; dew: string; date: string };
 }
-const { screen, seconds, meta, replay, rows = screen.length, columns, source_rows } = Astro.props;
+const { screen, seconds, meta, replay, rows = screen.length, columns, source_rows, playbackSeconds } = Astro.props;
 
 // pyte names the eight ANSI colours (yellow as "brown") and gives any other
 // colour as hex. The named ones take the site's palette, so they read in either
@@ -42,8 +43,8 @@ const attributes = (run: Run) => {
 	<p class="hero-output-meta">
 		Recorded on {meta.where}, JAX {meta.jax}, Dew{' '}
 		<a href={`https://github.com/AshishKumar4/dew/commit/${meta.dew}`}><code>{meta.dew.slice(0, 7)}</code></a>, {meta.date},{' '}
-		{Math.round(seconds)} s from start to end.
-		Recorded at {columns}×{source_rows}, shown with scrollback.
+		{Math.round(seconds)} s from start to end.{replay && <> Replayed in about {Math.round(playbackSeconds)} s.</>}
+		{replay && <> Recorded at {columns}×{source_rows}, shown with scrollback.</>}
 		{replay && <> <span data-terminal-note>Replay available with JavaScript; reduced motion shows the final frame.</span>{' '}
 			<a href="/hero/train.cast" download>Original recording</a>.</>}
 	</p>

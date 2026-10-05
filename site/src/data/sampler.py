@@ -1,10 +1,13 @@
 pipe = from_pretrained("dewml/hybrid-dit-176m", revision="32d59de89683d59824361144b87bdcaf3e742598")
-prompt = "a turquoise alpine lake surrounded by pine trees and rugged mountains"
+prompt = "the northern lights over a frozen lake at night, vivid colors, dramatic lighting, highly detailed"
+negative = ("letterbox, white border, black border, frame, text, watermark, collage, blurry, lowres, "
+            "low quality, dull colors, washed out, low contrast, grainy")
+inputs = pipe.prepare([prompt], key=3, steps=15, unconditional=negative)
 result = pipe(
-    [prompt],
-    key=0,
+    inputs,
+    key=3,
     steps=15,
     solver=DPMSolverMultistep(),
-    guidance=CFG(5.0),
+    guidance=CFG(6.0, interval=(0.15, 0.9)),
 )
 result.pil()[0]
