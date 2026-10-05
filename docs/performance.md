@@ -606,11 +606,12 @@ converts take 16.5 (bias gradients with GELU backward 5.4, norm statistics
 ### Splash's tiles on the TPU, 2026-10-02
 
 Splash attention took 34 ms of Dew's 156 ms Qwen3-0.6B step at 8 x 1024
-tokens on a TPU v6e. MaxText's took 50 ms of its own, at about 13% of the
-chip's peak in both. The tiles: forward plus backward of Qwen3-0.6B's
-attention (8 x 1024 tokens, 16 query heads over 8, 128 wide, causal, bf16),
-median of 7 rounds of 10 calls, through `dew.nn.attention.splash_attention`
-at integration `8e92a4a6`:
+tokens on a TPU v6e. MaxText's attention took 50 ms of its step. Both ran
+at about 13% of the chip's peak. This tile comparison measures forward
+plus backward for Qwen3-0.6B's attention: 8 x 1024 tokens, 16 query heads
+over 8, 128 wide, causal, bf16. Each time is the median of 7 rounds of
+10 calls through `dew.nn.attention.splash_attention` at integration
+`8e92a4a6`:
 
 | forward tiles | backward tiles | backward kernels | ms |
 |---:|---:|---|---:|
@@ -622,11 +623,11 @@ at integration `8e92a4a6`:
 | 512 | 256 | one fused kernel | 2.194 |
 | 256 | 256 | dq and dkv apart | 3.647 |
 
-Every configuration's errors against fp32 XLA at HIGHEST are the same (out
+Every configuration has the same errors against fp32 XLA at HIGHEST (out
 3.7e-3, dq 5.0e-3, dk 5.1e-3, dv 2.8e-3 of their maximum). The kernel now
-tiles by 1024 (narrowed to a divisor of each sequence) and runs its
-backward as one kernel. The training steps on the v6e (integration
-`527a32e9`, three rounds each, one batch on the device, ms):
+tiles by 1024, reduced to a divisor of each sequence, and runs backward
+in one kernel. Training times in ms on the v6e (integration `527a32e9`,
+three rounds each, one batch reused on the device):
 
 | step | 512 tiles, dq and dkv apart | 1024 tiles, fused backward |
 |---|---:|---:|
@@ -635,19 +636,20 @@ backward as one kernel. The training steps on the v6e (integration
 | 4-layer decoder, 256-wide heads, 8 x 2048 | 80.90-80.95 | 75.36-75.45 |
 | 176M hybrid DiT, batch 16 (4 attention blocks of 256 tokens) | 17.24-17.30 | 17.25 |
 
-These rows are `tools/benchmark_step.py`'s step, with `optax.adam`;
-against MaxText the matched step is the reference runner's, with AdamW and
-its clip ("Training scoreboard" above: 145.3 against MaxText's 154.0 at
-8 x 1024). Losses after the 45 steps differ in the third or fourth
-significant digit (0.003386 against 0.003389 at 8 x 1024), where
-reordering the backward's fp32 sums moves a training run's trajectory; each
-kernel call's errors against fp32 are the same.
+These rows use `tools/benchmark_step.py` with `optax.adam`. The matched
+comparison against MaxText uses the reference runner's AdamW and clip
+("Training scoreboard" above: 145.3 against MaxText's 154.0 at 8 x 1024).
+After 45 steps, losses differ in the third or fourth significant digit
+(0.003386 against 0.003389 at 8 x 1024). Reordering fp32 sums in the
+backward pass changes the training trajectory, although each kernel
+call has the same errors against fp32.
 
 ### tokamax's attention, 2026-10-02
 
-tokamax's Pallas-Triton flash attention (openxla/tokamax main at `47d3d663`)
-against cuDNN on an RTX 4080, bf16, forward plus backward, medians of 7
-rounds of 10 calls, each checked against fp32 XLA at HIGHEST
+This compares tokamax's Pallas-Triton flash attention (openxla/tokamax
+main at `47d3d663`) with cuDNN on an RTX 4080. Inputs are bf16. Times
+cover forward plus backward, as medians of 7 rounds of 10 calls.
+Each call is checked against fp32 XLA at HIGHEST
 (`max|err| / max|ref|` for dq and dk):
 
 | shape | cuDNN | tokamax, its heuristic config | tokamax, best of a config grid | JAX's Pallas `mha`, best blocks |
@@ -659,62 +661,69 @@ rounds of 10 calls, each checked against fp32 XLA at HIGHEST
 | 4 x 1024 causal, 16 over 8, of 128 (Qwen3-0.6B) | 1.541 | 1.288 | 1.242 | 1.260 |
 | 4 x 1024 causal, window of 256 | 0.579 | 0.587 | 0.535 | no window |
 
-tokamax's errors are cuDNN's at the 64-wide shapes (dq and dk 4.8e-3 to
-6.6e-3), and not at 128 (below);
-JAX's `mha` reaches 8.5e-3 because its backward forms `rowsum(o * do)` as a
-bf16 product, and an fp32 one gives cuDNN's errors at the same speed. In the
-training step the gain holds at 64-wide heads and not at 128: SimpleDiT-B
-at batch 32, attention 5.62 to 4.33 ms and the step 73.1 to 71.5; the
-3-layer decoder, 1.82 to 1.24 ms and 50.8 to 50.2; Qwen3-0.6B's widths at
-1 x 1024, 9.13 to 9.24 ms and 97.6 to 98.4. So with tokamax installed
-'auto' takes it for heads up to 64 wide and calls with no window, mask or
-bias (`dew.nn.attention.triton_runs`), at tokamax's heuristic config.
+At 64-wide shapes, tokamax matches cuDNN's errors (dq and dk 4.8e-3 to
+6.6e-3). At 128, its errors differ; see below. JAX's `mha` reaches
+8.5e-3 because its backward computes `rowsum(o * do)` as a bf16 product.
+An fp32 product matches cuDNN's errors at the same speed.
+
+Tokamax reduces training time at 64-wide heads. On SimpleDiT-B at batch
+32, attention falls from 5.62 to 4.33 ms and the step from 73.1 to 71.5.
+For the 3-layer decoder, attention falls from 1.82 to 1.24 ms and the
+step from 50.8 to 50.2. At Qwen3-0.6B's widths with 1 x 1024, attention
+increases from 9.13 to 9.24 ms and the step from 97.6 to 98.4. With
+tokamax installed, 'auto' therefore selects its heuristic config for
+heads up to 64 wide and calls without a window, mask or bias
+(`dew.nn.attention.triton_runs`).
 
 At 128-wide heads, 2026-10-02 (Qwen3-0.6B's: 16 query heads over 8, causal,
-1024 tokens; RTX 4080, bf16; Dew at `14087252`), nothing on this stack beats
-cuDNN with gradients as accurate:
+1024 tokens; RTX 4080, bf16; Dew at `14087252`). No kernel on this stack
+beats cuDNN while matching its gradient accuracy:
 
-- In the training step at 1 x 1024 (XProf, command buffers on, kernels per
-  step), tokamax's forward is faster and its backward slower: 2.16 ms
-  forward against cuDNN's 2.56, and 7.14 backward plus 0.27 for
-  `rowsum(o * do)` against cuDNN's 5.07 plus 0.18 for its head reduction;
-  the step 95.96 against 94.07 ms. torch's FlashAttention-2 kernels take 2.05 and
-  4.56.
-- tokamax's gradients are less accurate there: dk and dv reach 5.2e-3 and
-  4.6e-3 of their maximum at batch 1 against cuDNN's 4.9e-3 and 2.8e-3, and
-  6.7e-3 and 4.8e-3 at batch 2 against 4.7e-3 and 3.5e-3. Its best grid
-  config (blocks of 32, keeping openxla/tokamax#1494's constraint) has the
-  same errors.
-- cuDNN with BNTH inputs runs as BTNH does (0.385 against 0.381 ms a call
-  at batch 1, 0.721 against 0.716 at batch 2), and cuDNN 9.27.0 as 9.25.1
-  (Qwen3-0.6B's widths at 1 x 1024 94.20 and 94.08 against 94.23 and 94.19
-  ms, attention 9.09 against 9.11; SimpleDiT-B and the decoder alike).
+- At 1 x 1024, tokamax's forward is faster and its backward slower
+  (XProf, command buffers on, kernels per step). Forward takes 2.16 ms
+  against cuDNN's 2.56. Backward takes 7.14 plus 0.27 for
+  `rowsum(o * do)`, against cuDNN's 5.07 plus 0.18 for its head reduction.
+  The step takes 95.96 against 94.07 ms. Torch's FlashAttention-2 kernels
+  take 2.05 and 4.56.
+- Tokamax's gradients are less accurate at these shapes. At batch 1, dk
+  and dv errors reach 5.2e-3 and 4.6e-3 of their maximum, against
+  cuDNN's 4.9e-3 and 2.8e-3. At batch 2, they reach 6.7e-3 and 4.8e-3
+  against 4.7e-3 and 3.5e-3. Its best grid config has the same errors
+  (blocks of 32, keeping openxla/tokamax#1494's constraint).
+- BNTH and BTNH inputs give similar cuDNN times: 0.385 against 0.381 ms
+  a call at batch 1, and 0.721 against 0.716 at batch 2. Upgrading from
+  cuDNN 9.25.1 to 9.27.0 also makes no difference. Qwen3-0.6B's widths at
+  1 x 1024 take 94.20 and 94.08 against 94.23 and 94.19 ms, with attention
+  at 9.09 against 9.11; SimpleDiT-B and the decoder behave similarly.
   `uv pip install` resolves the newest cuDNN under 10, so a fresh install
   gets 9.27.
-- JAX's own Pallas-Triton `mha` (`jax.experimental.pallas.ops.gpu.attention`,
-  the keys repeated over each group's query heads), 2026-10-04 at
-  `0527ab19`: one call's forward plus backward over 28 layered calls takes
-  0.33 against cuDNN's 0.38 ms at 1 x 1024 and 1.30 against 1.36 at 4 x 1024,
-  its gradients' RMS distance from float64 1.00 to 1.04 times cuDNN's; in
-  the training step the two tie (two rounds alternating: attention 8.49
-  against 8.52 ms a step and the step 90.6 against 90.8 at 1 x 1024, 15.5
-  against 15.3 and 142.4 against 142.9 at 2 x 1024). tokamax's main has no
-  GPU attention change since `47d3d663`, and JAX exposes no cuDNN algorithm,
-  workspace or determinism choice for its fused attention (non-deterministic
-  is already the default). A kernel of Dew's own to close FlashAttention-2's
-  1.3-1.9 ms a step would be a Pallas-Triton backward, on the backend JAX
-  0.11 deprecates, for under 2% of steps Dew already wins.
+- JAX's Pallas-Triton `mha` repeats keys over each group's query heads
+  (`jax.experimental.pallas.ops.gpu.attention`). At `0527ab19` on
+  2026-10-04, forward plus backward per call, measured over 28 layered
+  calls, takes 0.33 against cuDNN's 0.38 ms at 1 x 1024 and 1.30 against
+  1.36 at 4 x 1024. Its gradients' RMS distance from float64 is 1.00 to
+  1.04 times cuDNN's. In training, the two tie over two alternating rounds.
+  At 1 x 1024, attention takes 8.49 against 8.52 ms and the step 90.6
+  against 90.8. At 2 x 1024, attention takes 15.5 against 15.3 and the
+  step 142.4 against 142.9. Tokamax's main has no GPU attention change
+  since `47d3d663`. JAX exposes no cuDNN algorithm, workspace or determinism
+  choice for fused attention; non-deterministic is already the default.
+  Closing FlashAttention-2's 1.3-1.9 ms gap would require a Dew
+  Pallas-Triton backward kernel on a backend JAX 0.11 deprecates. That
+  would save under 2% on steps where Dew already beats torch.
 
-tokamax trails JAX's `mha` by 10-18% at 64-wide heads in its backward
-(0.35 against 0.29 ms of the SimpleDiT-B call; the forwards are 0.093 and
-0.087), and no block size, warp count or stage count of its own grid closes
-that. Its VJP computes wrong gradients for a causal call when
-`block_m1 > block_n1` (dk and dv off by 10^2) or `block_n2 > block_m2` (dq
-off by 0.7), configs its autotuning grid includes; its heuristic config is
-not one of them, which is why Dew runs that and checks each shape it routes
-(`tests/test_kernels.py`). tokamax's heuristic at 256-wide heads asks for
-more shared memory than sm89 has (102784 of 101376 bytes) and fails; cuDNN
-takes no 256-wide head either, so those calls run on XLA.
+At 64-wide heads, tokamax's backward is 10-18% slower than JAX's `mha`:
+0.35 against 0.29 ms for the SimpleDiT-B call. The forwards take 0.093
+and 0.087. None of the block sizes, warp counts or stage counts in
+tokamax's grid closes the gap.
+
+Its VJP computes wrong causal gradients when `block_m1 > block_n1` (dk
+and dv off by 10^2) or `block_n2 > block_m2` (dq off by 0.7). These
+configs are in its autotuning grid, but its heuristic config avoids them.
+Dew therefore uses the heuristic and checks each routed shape
+(`tests/test_kernels.py`). At 256-wide heads, tokamax's heuristic fails
+because it requests more shared memory than sm89 has (102784 of 101376
+bytes). CuDNN also refuses 256-wide heads, so those calls use XLA.
 
 `tools/benchmark_attention.py`, bf16. The batch is chosen so that query tokens
 times heads is 524288 in every row. The table shows the forward pass alone,
@@ -736,20 +745,20 @@ milliseconds.
 | 4096 | 128 | no | oom | oom | 12.12 | oom | oom | 46.89 |
 | 4096 | 128 | yes | oom | oom | 6.96 | oom | oom | 26.38 |
 
-The reference and xla paths materialize the S x S logits. They run out of 16
-GiB at S=4096, and wherever they fit they are 3 to 12 times slower than the
-fused kernel. cudnn is the kernel to use for a GPU run, forward and backward,
-and `'auto'` picks it wherever it can.
+The reference and xla paths store the S x S logits and run out of 16 GiB
+at S=4096. Where they fit, they are 3 to 12 times slower than the fused
+kernel. These measurements favor cudnn for GPU forward and backward;
+`'auto'` selects it wherever it can.
 
 ### Head dimension 256 through tokamax's Triton flash attention
 
-Before Hopper, cudnn refuses head dimensions above 128. So a Gemma 3 4B or 12B
-shape (heads of 256) trains through the xla path on every Ampere and Ada card,
-and that path materializes the S x S logits. tokamax 0.0.13 ships a
-Pallas-Triton flash attention for compute capability 8.0 and up. It has a
-forward and a backward, and it takes grouped query heads, causal masks,
-windows and any power-of-two head dimension. JAX 0.11.1 deprecates its own
-`jax.experimental.pallas.ops.gpu.attention` in favour of it.
+On pre-Hopper GPUs, cudnn refuses head dimensions above 128. A Gemma 3
+4B or 12B shape, with heads of 256, therefore trains through xla on
+Ampere and Ada. That path stores the S x S logits. Tokamax 0.0.13
+provides Pallas-Triton flash attention for compute capability 8.0 and up,
+with forward and backward passes. It supports grouped query heads, causal
+masks, windows and power-of-two head dimensions. JAX 0.11.1 deprecates its
+own `jax.experimental.pallas.ops.gpu.attention` in favor of tokamax.
 
 Measured on the RTX 4080 (compute capability 8.9, 99 KiB of shared memory per
 block), driver 595.84, jax/jaxlib 0.11.1, tokamax 0.0.13. Inputs were bf16,
@@ -768,68 +777,67 @@ but not the 4080.
 | 4096 (B=1) | none | 3.97 | 1.03 | 768 MiB | 0 | 10.5 | fails, shared memory |
 | 4096 (B=1) | 1024 | 4.10 | 0.540 | 768 MiB | 0 | 10.7 | fails, shared memory |
 
-The Triton forward is 2.2 to 7.6 times faster than xla, uses no temporary
-memory, and has a smaller error (0.0081 against xla's 0.0112, on outputs of
-size 3.4). The backward does not run. tokamax's Triton VJP uses one fixed
-tiling for every card (`pallas_triton_vjp.py` carries a `TODO: Implement
-heuristics`). At head dimension 256 that tiling asks for 102784 bytes of
-shared memory, and the card has 101376, so it fails with `RESOURCE_EXHAUSTED:
+The Triton forward is 2.2 to 7.6 times faster than xla and uses no
+temporary memory. Its error is also smaller: 0.0081 against xla's 0.0112,
+on outputs of size 3.4. The backward does not run. Tokamax's Triton VJP
+uses one fixed tiling for every card (`pallas_triton_vjp.py` contains
+`TODO: Implement heuristics`). At head dimension 256, that tiling requests
+102784 bytes of shared memory from a card with 101376. It fails with `RESOURCE_EXHAUSTED:
 Shared memory size limit exceeded`.
 
-Other tilings, probed through tokamax's private classes: a 32x32 tiling with
-one stage fits and is correct (gradient error 0.031, the same as xla). It
-runs forward and backward in 1.80 ms against xla's 2.66 at S=2048. Two
-16-row tilings compile and run at the same speed, but they return wrong
-gradients (error 6.6 on gradients of size 6.3). tokamax's autotuner picks a
-tiling by its time on random inputs and never compares numerics, so
-autotuning cannot be trusted to find the correct one. At head dimension 128 the Triton
-kernel ties cudnn (0.235 against 0.236 ms forward, 0.75 against 0.78 forward
-and backward at S=2048), so it gains nothing where cudnn already runs.
+Probing tokamax's private classes found a 32x32 tiling with one stage
+that fits and is correct (gradient error 0.031, the same as xla). It
+takes 1.80 ms forward and backward against xla's 2.66 at S=2048. Two
+16-row tilings compile and run at the same speed, but return wrong
+gradients (error 6.6 on gradients of size 6.3). Tokamax's autotuner chooses
+by timing random inputs without comparing numerics. It cannot be trusted
+to choose a correct tiling. At head dimension 128, Triton ties cudnn
+(0.235 against 0.236 ms forward, 0.75 against 0.78 forward and backward
+at S=2048), giving no gain where cudnn already runs.
 
-Two other features are still missing. The first is Gemma 2's logit softcap.
-The Triton forward takes it (0.35 against xla's 1.01 ms at S=2048, head
-dimension 256), but the VJP raises `NotImplementedError: logits_soft_cap
-unsupported`. tokamax also applies the cap after adding the bias, while Gemma
-applies it before (1.4e-2 apart on CPU with a bias, identical without one).
-The second is attention sinks, which no tokamax implementation takes.
+The Triton forward supports Gemma 2's logit softcap (0.35 against xla's
+1.01 ms at S=2048, head dimension 256), but the VJP raises
+`NotImplementedError: logits_soft_cap unsupported`. Tokamax also applies
+the cap after adding bias, while Gemma applies it before. On CPU, the
+outputs differ by 1.4e-2 with bias and are identical without it. No
+tokamax implementation supports attention sinks.
 
-Dew has no route for this kernel. A forward-only kernel cannot serve
-training, and the only backward tiling that works is reachable through
-private tokamax classes. The route needs an upstream tokamax release whose
-VJP picks a tiling that fits the card, or a public tiling setting, with a
-correctness check next to it. Installing tokamax 0.0.13 next to Dew also
-pins `typeguard==2.13.3`, while tyro 1.0.16 requires `typeguard>=4.0.0`. That
-breaks the command line of every recipe, so these measurements ran the tool
-through its `main` function in a separate environment.
+Dew does not route calls to this kernel. Training needs a backward pass,
+and the only working tiling is available through private tokamax classes.
+Routing needs an upstream release that selects a fitting VJP tiling, or
+a public tiling setting, together with a correctness check. Installing
+tokamax 0.0.13 beside Dew also pins `typeguard==2.13.3`, while tyro 1.0.16
+requires `typeguard>=4.0.0`. This breaks every recipe's command line, so
+these measurements called the tool's `main` function in a separate
+environment.
 
 ## Odd sequence lengths on cudnn
 
-cudnn's fused kernel has no backward pass for an odd query or key length. The
-forward pass takes any length, so the problem only appeared at the first
-training step, as `NotImplementedError: Unsupported sequence length Q 333, KV
-333` from jax. 77 CLIP text tokens are an odd length, and so is 256+77
-concatenated.
+CuDNN's fused kernel has no backward pass for odd query or key lengths.
+The forward accepts any length, so the failure appeared only at the
+first training step: `NotImplementedError: Unsupported sequence length Q 333, KV
+333` from jax. CLIP's 77 text tokens have an odd length, as does a
+concatenation of 256+77.
 
 Until 2026-09-05, `'auto'` sent those shapes to the xla kernel. That kernel
-materializes the [B, H, Q, K] logits and their probabilities in fp32 and
-keeps them for the backward pass. `cudnn_attention` pads an odd length to an
-even one instead. It adds one zero row to the query and slices it off the
-output. It adds one zero key and hides it with the kernel's own padding mask
-(`key_value_seq_lengths`), so every real query attends to exactly the keys it
-had. On a GPU, `'auto'` picks cudnn at any sequence length, and an explicit
-`'cudnn'` also takes any length.
+stores the [B, H, Q, K] logits and probabilities in fp32 for backward.
+`cudnn_attention` now pads odd lengths to even ones. It adds one zero query
+row and slices it off the output. It also adds one zero key and hides it
+with the kernel's padding mask (`key_value_seq_lengths`). Each real query
+therefore attends to its original keys. On GPU, `'auto'` selects cudnn at
+any sequence length, and an explicit `'cudnn'` also accepts any length.
 
 `tests/test_kernels.py::test_cudnn_trains_odd_lengths_and_agrees_with_xla`
 checks this at q1024/kv77, q9/kv7 and q333/kv333 causal. The outputs and the
 three input gradients agree with the xla kernel to within two bf16 ulps of
-their scale. The two kernels sit the same distance apart at an even length
+their scale. The kernels differ by the same amount at an even length
 (q256: 1.6e-2 at scale 2.9 on the output, 7.8e-2 at scale 15.6 on the
 gradients, both one ulp). If the pad key is left unmasked, the q9/kv7 output
 moves by 0.26 at scale 2.4 and the test fails. If the pad query row is left
 in, the shape changes and the test fails.
 
-The padding's value, from `--warmup 3 --steps 50` on the small preset with
-`'xla'` (the kernel these shapes ran on before the padding) against `'auto'`:
+Padding results from `--warmup 3 --steps 50` on the small preset, comparing
+`'xla'` (used before padding) with `'auto'`:
 
 | architecture | shapes | xla ms/step | cudnn ms/step | xla peak GiB | cudnn peak GiB | loss at the end, xla / cudnn |
 |---|---|---:|---:|---:|---:|---|
@@ -837,33 +845,33 @@ The padding's value, from `--warmup 3 --steps 50` on the small preset with
 | simple_mmdit | q333/kv333 | 12.86 | 11.01 | 1.43 | 1.08 | 0.584398 / 0.584407 |
 | unet | q256/kv77, q1024/kv77 | 16.30 | 16.13 | 0.78 | 0.71 | 0.597518 / 0.597516 |
 
-The xla attention on the 1101-token stage kept its fp32 logits and
-probabilities for the backward pass. That is where the 1.65 GiB and the 13 ms
-went. Attention is a small part of the unet's step, so the unet gains little.
-The losses are after 103 steps on one fixed batch and differ in the sixth
-digit. That difference is the two kernels' bf16 rounding, compounded by Adam.
-Decoding asks for one query position at a time, which is an odd length. It
-runs on cudnn with the cache mask as an additive bias; its speed was not
-measured.
+The xla attention on the 1101-token stage kept fp32 logits and probabilities
+for backward, accounting for 1.65 GiB and 13 ms. Attention is a small
+part of the unet's step, so padding saves little there. Losses after
+103 steps on one fixed batch differ in the sixth digit because of the
+kernels' bf16 rounding, compounded by Adam. Decoding uses one query
+position at a time, an odd length. It runs on cudnn with the cache mask
+as additive bias; decoding speed was not measured.
 
 ## Attention metadata and the masked conv, 2026-09-07
 
-Before `14622ba`, any `AttentionMetadata` cost the fused kernel, whatever the
-metadata said. The mixer built its `[B, 1, S, S]` mask and forced the xla
-path as soon as any metadata arrived. A batch that only spelled out rotary
-positions, or one whose validity marked every slot as real, paid for a mask
-that excluded nothing. At `14622ba` the mixer checks what the metadata
-restricts: key validity, or image groups on a bidirectional-image layer. A
-validity array is opaque at trace time, so an all-true array still builds the
-mask. The host producers that used to emit one leave it out when they know
-the rows are whole: `pad_token_rows`, the processor's `from_hf`, generation's
-input validation, the rollout collector and episode cohorts, the PPO critic
+Before `14622ba`, supplying any `AttentionMetadata` disabled the fused kernel.
+The mixer built a `[B, 1, S, S]` mask and selected xla even when the metadata
+only specified rotary positions or marked every slot as valid. Those
+batches computed a mask that excluded nothing.
+
+At `14622ba`, the mixer checks whether metadata restricts key validity
+or image groups on a bidirectional-image layer. It cannot read a validity
+array at trace time, so even an all-true array still requires a mask.
+Host code now omits the array when it knows the rows are whole. This
+includes `pad_token_rows`, the processor's `from_hf`, generation input
+validation, the rollout collector and episode cohorts, the PPO critic
 without lengths, and every MTP depth.
 
-The Gated DeltaNet short conv had the same kind of problem inside it.
-`_masked_conv1d` convolved one token per scan step to keep a paused row's
-history still. At `14622ba` it compacts each row's real tokens by
-`cumsum(valid) - 1` and calls the same fp32 `causal_conv1d` once.
+Gated DeltaNet's short conv had a similar cost. `_masked_conv1d` convolved
+one token per scan step to preserve a paused row's history. At
+`14622ba`, it compacts each row's real tokens with `cumsum(valid) - 1`,
+then calls the same fp32 `causal_conv1d` once.
 
 Conditions: one RTX 4080, bf16 compute with fp32 master parameters, one fresh
 process per case, `XLA_PYTHON_CLIENT_PREALLOCATE=false`, no XLA flags, 5
@@ -884,67 +892,75 @@ The attention cases use batch 1, 2048 tokens, and 8 query and 4 key heads of
 128. The GDN cases use batch 2, 2048 tokens, 8 key and 16 value heads, and
 conv kernel 4. Peaks and kernel counts are the forward+backward figures.
 
-The canonical row is the same batch as the opaque row with the redundant
-validity left out, so it has the shape of a real unpadded request. Its before
-column is that same call measured at `83f08e5`. The compiled HLO holds a
-`__cudnn$fmhaSoftmax` custom call after the change and none before, which
-shows that the route changed and the gain is not clock noise. The opaque and
-packed rows are unchanged by design, and their spread across windows covers
-the difference. The peaks the process allocator reports move by up to 20 MiB
-between identical runs. The packed forward gave 496.02 and 476.02 MiB on two
-repeats of the same executable, whose own `memory_analysis` is
-byte-identical. Read the peak column at that resolution.
+The canonical row uses the opaque row's batch with redundant validity
+omitted, matching a real unpadded request. Its before column measures the
+same call at `83f08e5`. The compiled HLO contains a `__cudnn$fmhaSoftmax`
+custom call after the change, and none before. This confirms that routing
+changed; the speedup is not clock noise. The opaque and packed rows
+are unchanged by design, with differences within their spread across windows.
 
-Case by case: canonical metadata runs the plain call exactly. Its outputs are
-bitwise equal to the no-metadata forward, and its parameter gradients are
-within 2.4e-06 of it. The opaque all-true mask stays on the xla kernel at its
-old cost, because the shape of a validity array does not say that its
-contents are all true. The GDN rows time the whole mixer (projections, gates,
-rule and norm), and the masked conv is the only part that changed. With a
-mask, the mixer is 3.3 times faster forward and 3.0 times faster with the
-gradient. Its kernel launches drop 22.8 times forward (10707 to 470 a call)
-and 19.5 times with the gradient (36700 to 1884). The scan's `while` loop is
-gone from the HLO, and the `__cudnn$convForward` of the unmasked path takes
-its place. The result is exact where it has to be. On lengths 2048 and 1537
-the outputs agree with row-by-row evaluation to 2.4e-04 (the layer's bound is
-5e-4). The padded row's input gradients and outputs are exactly zero. Against
-the token scan on CPU at fp32, the largest difference over left, right,
-interior and paused padding at kernels 2, 4 and 8 is 4.8e-07.
+The process allocator's reported peaks vary by up to 20 MiB between
+identical runs. Two repeats of the same packed forward gave 496.02 and
+476.02 MiB, although the executable's `memory_analysis` was byte-identical.
+Read the peak column at that resolution.
 
-Leaving the field out changes the batch's pytree, so every process in a pool
-has to agree on it. Whether a process's own rows needed padding is known only
-to that process. If one process leaves the field out while another carries
-it, the same step gets two different pytrees. A generation request first
-agrees on the signature that ignores validity, then on one fixed-size
-presence vector. Every process runs the same collectives in the same order,
-whatever it holds, and materializes the field wherever any process carries
-it. Where no process carries it, the field stays out and the call keeps the
-fused kernel. `shard_batch` cannot run that agreement. Placement runs on the
-worker thread of `DevicePrefetchIterator`, while the step's collectives run
-on the caller's thread. So in a pool, every `ModelInputs` of a training batch
-that lacks the field gets it materialized. Single-process runs, which is what
-the table measures, are untouched. So are batches of plain token arrays,
-which carry no validity anywhere.
+Canonical metadata uses the plain call. Its outputs are bitwise equal
+to the no-metadata forward, and parameter gradients agree within 2.4e-06.
+The opaque all-true mask stays on xla at its old cost because the
+array's shape cannot establish that every entry is true.
 
-The head-chunk and head-dimension-256 cases were not rerun, because nothing
-in this change reaches them.
+The GDN rows time the whole mixer: projections, gates, rule and norm.
+Only the masked conv changed. With a mask, the mixer is 3.3 times
+faster forward and 3.0 times faster with the gradient. Kernel launches
+fall 22.8 times forward (10707 to 470 a call) and 19.5 times with the
+gradient (36700 to 1884). The HLO replaces the scan's `while` loop with
+the unmasked path's `__cudnn$convForward`. At lengths 2048 and 1537,
+outputs agree with row-by-row evaluation to 2.4e-04 (the layer's bound
+is 5e-4). The padded row's input gradients and outputs are exactly zero.
+Against the fp32 token scan on CPU, the largest difference is 4.8e-07
+over left, right, interior and paused padding at kernels 2, 4 and 8.
+
+Omitting the field changes the batch's pytree, so every process in a pool
+must agree on its presence. Each process knows only whether its own
+rows need padding. If some omit the field and others include it, they
+give the same step different pytrees.
+
+For generation, processes first agree on the signature without validity,
+then on a fixed-size presence vector. They run the same collectives in
+the same order regardless of their local inputs. If any process includes
+the field, every process adds it. If none includes it, they omit it and
+keep the fused kernel.
+
+`shard_batch` cannot perform that agreement: `DevicePrefetchIterator` places
+batches on a worker thread, while step collectives run on the caller's
+thread. In a pool, it therefore adds the field to every training batch's
+`ModelInputs` that lacks it. Single-process runs, as measured in the
+table, are unchanged. Batches of plain token arrays are also unchanged;
+they have no validity field.
+
+The head-chunk and head-dimension-256 cases were not rerun because this
+change does not affect them.
 
 ## XLA flags
 
 `TrainerConfig.xla_flags` appends to `XLA_FLAGS`. `prepare_process` applies
-it before JAX opens a backend, and also sets `--xla_allow_excess_precision=false`
-unless the run named that flag (`dew.training.runtime.keep_roundings`): with
-XLA's default a fusion may skip a bf16 rounding the program states, and which
-it skips depends on the layout, so one device and four computed different
-bf16 forwards of one model. The recipes and the CLI call `prepare_process`;
-a script or notebook that builds a `Trainer` itself calls it first, or sets
+it before JAX opens a backend. It also sets
+`--xla_allow_excess_precision=false` unless the run explicitly sets that flag
+(`dew.training.runtime.keep_roundings`). With XLA's default, a fusion may
+skip bf16 rounding specified by the program. The skipped rounding depends
+on layout, so one device and four produced different bf16 forwards for
+the same model.
+
+The recipes and CLI call `prepare_process`. If your script or notebook
+builds a `Trainer` directly, call it first or set
 `XLA_FLAGS=--xla_allow_excess_precision=false` before importing jax. On the
-RTX 4080 the flag was faster: the 176M hybrid DiT at batch 16 69.60 to 66.62
-ms, SimpleDiT-B at batch 32 76.00 to 73.03, Qwen3-0.6B's widths at 1 x 1024
-110.52 to 109.62. The default `xla_flags` is None, and this sweep is the
-reason. It covers three architectures, with one fresh process per
-configuration. Each cell is the median of the runs, with the range and count
-where a configuration was repeated.
+RTX 4080, the flag reduced step time: the 176M hybrid DiT at batch 16
+fell from 69.60 to 66.62 ms, SimpleDiT-B at batch 32 from 76.00 to 73.03,
+and Qwen3-0.6B's widths at 1 x 1024 from 110.52 to 109.62.
+
+The following sweep is why `xla_flags` defaults to None. It covers three
+architectures, with a fresh process per configuration. Each cell gives
+the median, with a range and count for repeated configurations.
 
 | configuration | simple_dit | causal_transformer | unet |
 |---|---|---|---|
@@ -957,21 +973,21 @@ where a configuration was repeated.
 | `--xla_gpu_enable_while_loop_double_buffering=true` | 6.95 [6.93-7.09] n=5 | 75.73 | 17.30 |
 | the two above with any signal, together | 7.00 [6.99-7.02] n=2 | 75.75 [75.67-75.84] n=2 | 17.09 [16.93-17.26] n=2 |
 
-No flag was adopted, and the noise band is the reason. Four repeats of the same
-configuration on simple_dit spread from 6.97 to 7.53 ms, or 8%, because each
-fresh process autotunes again. Against that spread, every simple_dit number
-in the table comes from one distribution. The causal_transformer is the quiet
-measurement, with a spread of 0.7%, and no flag moves it by more than 0.2%.
-The unet is the only architecture where a flag shows an effect:
+No flag was adopted from this sweep because the differences fell within
+measurement noise. Four repeats of the same simple_dit configuration ranged
+from 6.97 to 7.53 ms, or 8%, because each fresh process autotunes again.
+Every simple_dit result in the table fits that distribution. The
+causal_transformer varies by 0.7%, and no flag changes it by more than
+0.2%. Only unet shows a measurable effect:
 `--xla_gpu_triton_gemm_any=true` takes the median from 17.38 to 17.05 ms, or
 1.9%, over four runs each.
 
-So the unet gains 2%, the decoder is unchanged, and simple_dit cannot tell
-the difference. The adoption rule asks for a flag to be faster on all three
-architectures and outside the noise on each, so the default stays None. A
-run that wants the unet flag can pass `--trainer.xla-flags`.
+The unet gains 2%, the decoder is unchanged, and simple_dit's noise
+obscures any difference. A default flag must be faster on all three
+architectures by more than each one's noise, so the default stays None.
+To use the unet flag for a run, pass `--trainer.xla-flags`.
 
-Two flags stand out for other reasons:
+Two flags affect autotuning or dispatch:
 
 - `--xla_gpu_autotune_level=4` changes nothing on any architecture, because
   it is already the default in this build. Level 0 turns autotuning off,
@@ -986,9 +1002,9 @@ Two flags stand out for other reasons:
   list than the default adds nothing to that.
 
 None of the candidate flags changes numerics. The sweep covered only kernel
-selection and scheduling. No flag that relaxes precision was tested, and none
-would be adopted, because an adopted change has to keep a fixed-seed 20-step
-loss trajectory within 1e-5.
+selection and scheduling; it did not test flags that relax precision.
+Such flags would not be adopted because a change must keep a fixed-seed
+20-step loss trajectory within 1e-5.
 
 ## UNet batch scaling
 
