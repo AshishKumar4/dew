@@ -2766,7 +2766,7 @@
      "runs": "torchvision"
     }
    ],
-   "note": "Fetches and executes upstream projection loss code, REPA's SILoss with train.py's loss composition and preprocess_raw_image, and iREPA's DINOv2Encoder.preprocess and spatial_zscore, with a stand-in network and encoder; SILoss's draws are DiffusionObjective's from jax.random.key(3)."
+   "note": "Fetches and executes upstream projection loss code, REPA's SILoss with train.py's loss composition and preprocess_raw_image, and iREPA's DINOv2Encoder.preprocess and spatial_zscore, with a stand-in network and encoder; SILoss's draws are DiffusionObjective's from jax.random.key(3). composed.npz also holds the fp32 gradient's RMS distance from float64 over 52 orders of the stand-in's hidden units (order 1 checked in float64 against the identity's gradient)."
   },
   "repae": {
    "tool": "tools/repae_reference.py",
