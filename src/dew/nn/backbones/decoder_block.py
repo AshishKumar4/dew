@@ -152,7 +152,7 @@ class GatedMLP(nn.Module):
     `activation` picks act: swiglu is silu, geglu is the tanh approximation of
     gelu (HF's gelu_pytorch_tanh), and geglu_exact is the erf form (HF's gelu).
     A `Situ` is Kimi K3's SiTU, which transforms both halves
-    (`dew.nn.moe.gated_product`). `gelu`, `gelu_exact` and `relu` build the
+    (`dew.nn.moe.gated_product`). `gelu`, `gelu_exact`, `relu` and `relu2` build the
     ungated MLP with two projections. The ungated `gelu_exact` uses Torch's
     `1 + erf` arithmetic, which the converted checkpoints were trained with;
     `jax.nn.gelu(approximate=False)` goes through erfc and rounds the negative
@@ -179,7 +179,7 @@ class GatedMLP(nn.Module):
         dense = functools.partial(
             nn.Dense, use_bias=self.use_bias, dtype=self.dtype, precision=self.precision,
             **normal_kernel(self.init_std))
-        if self.activation not in ('gelu', 'gelu_exact', 'relu'):
+        if self.activation not in ('gelu', 'gelu_exact', 'relu', 'relu2'):
             if self.has_variable('params', 'gate_up_proj'):
                 self.gate_up_proj = dense(2 * self.hidden_features, name='gate_up_proj')
             else:
@@ -191,13 +191,18 @@ class GatedMLP(nn.Module):
         self.down_proj = dense(self.out_features, name='down_proj', **normal_kernel(
             self.init_std if self.output_init_std is None else self.output_init_std))
 
-    def __call__(self, x):
+    def __call__(self, x, decode: bool = False, positions=None, segment_ids=None, kv_store=None,
+                 attention_metadata=None):
+        # Nemotron-H's MLP-only blocks use this module in the mixer slot.
+        del decode, positions, segment_ids, kv_store, attention_metadata
         # Column-parallel under a tensor axis: the hidden width splits and
         # down_proj's sum returns to the residual placement in the block.
-        if self.activation in ('gelu', 'gelu_exact', 'relu'):
+        if self.activation in ('gelu', 'gelu_exact', 'relu', 'relu2'):
             up = checkpoint_name(constrain(self.up_proj(x), MLP_HIDDEN), 'up_proj')
             if self.activation == 'relu':
                 hidden = nn.relu(up)
+            elif self.activation == 'relu2':
+                hidden = jnp.square(nn.relu(up))
             elif self.activation == 'gelu_exact':
                 # Torch's GELU uses 1 + erf. Flax's erfc(-x) rounds its
                 # negative tail differently before this trained projection.

@@ -158,6 +158,11 @@ _INERT_FIELDS: Mapping[str | None, Mapping[str, Callable[[str, Mapping[str, obje
     # Qwen2.5's text configs state the multimodal rotary off; on, it is a
     # Qwen2-VL rotary the qwen2 reference never applies.
     'qwen2': {'use_mrope': lambda key, hf_config: hf_config[key] is False},
+    # Released Nemotron-H configs retain these older names. The native
+    # reference reads layer_norm_epsilon, has no rotary positions, and
+    # derives dt directly from the Mamba projection.
+    'nemotron_h': dict.fromkeys(
+        ('rms_norm_eps', 'norm_eps', 'time_step_rank', 'rope_theta', 'partial_rotary_factor'), _any_value),
     # The published HF ports carry mamba_ssm's own fields. The reference
     # normalizes with MambaRMSNormGated alone and gates before it
     # normalizes (modeling_mamba2.py:417, :477 passes norm_before_gate=False,
