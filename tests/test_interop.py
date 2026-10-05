@@ -631,10 +631,12 @@ def test_the_cli_exports_a_run_and_refuses_a_directory_that_is_not_one(tmp_path,
 
 def test_a_block_diffusion_run_writes_no_export_transformers_cannot_read(tmp_path):
     """transformers' DiffusionGemmaForBlockDiffusion, the implementation the
-    checkpoint layout is for, builds experts and a vision tower. A run of
-    Google's dense text-only model records a text-only config it cannot
-    build, so its export is refused before a file is written; a run with a
-    vision conditioner records none, and is refused by `from_run`."""
+    checkpoint layout is for, builds experts and a vision tower, and takes
+    generation_config.json as a closed set of fields. Google's dense
+    text-only model has neither, and Dew's byte vocabulary has no files and
+    no field to be named in, so a run of either is refused before a file is
+    written (a run of the image-reading model on its own tokenizer exports:
+    test_diffusion_gemma_workflow.py)."""
     from test_inference import make_block_run
 
     from dew.interop import Pretrained
@@ -646,11 +648,12 @@ def test_a_block_diffusion_run_writes_no_export_transformers_cannot_read(tmp_pat
         Pretrained.from_run(str(dense), ema=False).save(tmp_path / "refused")
     assert not (tmp_path / "refused").exists()
 
-    vision = tmp_path / "vision"
-    vision.mkdir()
-    make_block_run(vision)
-    with pytest.raises(TypeError, match="vision conditioner"):
-        Pretrained.from_run(str(vision), ema=False)
+    byte = tmp_path / "byte"
+    byte.mkdir()
+    make_block_run(byte)
+    with pytest.raises(ValueError, match="no tokenizer files"):
+        Pretrained.from_run(str(byte), ema=False).save(tmp_path / "refused")
+    assert not (tmp_path / "refused").exists()
 
 
 def test_the_fid_converter_refuses_a_pickle_that_is_missing_a_key(tmp_path):
