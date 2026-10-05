@@ -2219,9 +2219,14 @@
      "repo": "google/maxtext",
      "version": "0.2.4 (538fe7a3f3376d94cf3f04e77741aa6d7e8efa45)",
      "transcribed": true
+    },
+    {
+     "repo": "AI-Hypercomputer/maxtext",
+     "version": "538fe7a3f3376d94cf3f04e77741aa6d7e8efa45",
+     "runs": "fetched"
     }
    ],
-   "note": "NumPy transcription explicitly documented at tools/indexer_reference.py:12; meta.json present."
+   "note": "indexer_loss.npz: NumPy transcription documented at tools/indexer_reference.py:12; meta.json present. maxtext.npz: executes MLA.calculate_indexer_loss and Indexer.generate_mask fetched at 538fe7a3 (EPS and DEFAULT_MASK_VALUE from the same commit) under JAX behind Indexer.__call__'s masking and jax.lax.top_k, in float32 and float64."
   },
   "jepa/vjepa.npz": {
    "tool": "tools/vjepa_reference.py",
