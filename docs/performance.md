@@ -1921,20 +1921,18 @@ At 128 tokens the shapes disagree. In two more sessions of merged against separa
 
 ### The forward's bf16 weights: `NARROW_COPY_GENERATIONS`, 2026-10-03
 
-With bf16 compute over fp32 parameters, forward used a separate CUDA
-kernel to cast each weight at every step. On Qwen3-0.6B at 1 x 1024
-on the RTX 4080, those casts took 5.7 ms per step. Backward widened each weight's
-bf16 gradient to fp32, taking 1.8 ms.
-
-On `sm80` and `sm89`, the update now writes a bf16 copy of each such
-weight from its new fp32 value (`TrainState.compute`). Forward reads
-the copy; gradients reach the update in bf16 and widen when it reads
-them (`dew.training.narrow`). A weight is copied only if its sole use
-in the loss is that cast. A tied embedding table keeps fp32 reads
-because its two cotangents must sum in fp32. Norm scales that do not
-use a lone cast, and weights read by custom VJPs, also keep fp32 reads.
-The table compares the step with its parent on an RTX 4080, in ms,
-over two alternating rounds:
+A bf16 model over fp32 parameters cast each weight to bf16 in the forward,
+one CUDA kernel per weight every step (5.7 ms of casts on Qwen3-0.6B at
+1 x 1024 on the RTX 4080), and widened each weight's bf16 gradient back to
+fp32 in the backward (1.8 ms). On `sm80` and `sm89` the update now writes
+the bf16 copy of each such weight (`TrainState.compute`) from the new fp32
+value. The forward reads that copy, and the gradient reaches the update in
+bf16 and is widened as the update reads it (`dew.training.narrow`). Only a
+weight whose one use in the loss is that cast gets a copy. A tied
+embedding's table has two uses, so its cotangents sum in fp32, and it keeps
+its fp32 read; so do the norms' scales, which are not read through a lone
+cast, and any weight a custom VJP reads. The step against its parent on the
+RTX 4080, two alternating rounds, in ms:
 
 | row | before | copies | peak GiB |
 |---|---:|---:|---:|
@@ -1947,10 +1945,10 @@ over two alternating rounds:
 | decoder, 3 layers, 16 x 512 | 49.08 / 49.12 | 48.79 / 48.80 | 3.97 -> 3.98 |
 | 99M MoE, 8 x 1024 | 78.13 / 78.09 | 78.06 / 78.03 | 9.56 -> 9.56 |
 
-No row changed memory fallback in `fit`. The MoE's grouped matmul reads
-expert weights differently and gains nothing. On an A100 40 GB, copies
-were off and on in one session (Colab, integration `6a220e31`, two
-alternating rounds, ms):
+No row moved to another rung of the fit ladder. The MoE gains nothing,
+because its experts run through the grouped matmul, which reads them another
+way. On an A100 40 GB (Colab, integration `6a220e31`, copies off and on in
+one session, two alternating rounds, ms):
 
 | row | before | copies | peak GiB |
 |---|---:|---:|---:|
@@ -1959,46 +1957,37 @@ alternating rounds, ms):
 | 176M hybrid DiT, batch 32 | 63.96 / 63.96 | 62.66 / 62.89 | 8.43 -> 8.45 |
 | SimpleDiT 768, batch 32 | 39.26 / 39.30 | 38.24 / 38.24 | 6.12 -> 6.13 |
 
-Forward and gradients are bitwise equal to the casts. Under plain SGD,
-every parameter stays bitwise equal after three steps (tests/test_narrow.py).
-Update arithmetic rounds differently because moving the widening into
-the update changes contraction of fp32 multiply-adds. Adam's second
-moment agrees within 1 ulp after two steps; all accumulation stays fp32.
+The forward and the gradients are bitwise those of the cast. Under plain SGD
+every parameter is bitwise the same after three steps
+(tests/test_narrow.py). The update's arithmetic rounds differently, because
+with the widening inside it XLA contracts its fp32 multiply-adds another way
+(Adam's second moment is within 1 ulp after two steps); every accumulation
+is still fp32. A deterministic Qwen3-0.6B run (dew_lm, AdamW and its clip)
+is bitwise the same for 13 steps and within 2.7e-3 of the loss at step 40,
+where two default runs of the parent differ by 3.9e-3.
 
-A deterministic Qwen3-0.6B run (dew_lm, AdamW and its clip) is bitwise
-equal for 13 steps. At step 40, loss differs by at most 2.7e-3, while
-two default runs of the parent differ by 3.9e-3. Tests ran
-`tools/lm_step_parity.py`'s decoder for 100 steps and the hybrid DiT on
-one batch for 300 steps, twice each way. All four DiT runs are bitwise
-equal at every step. Both decoder runs with copies equal one parent
-run at every step; the parent's two runs differ by at most 6.9e-4.
+I also ran `tools/lm_step_parity.py`'s decoder (100 steps) and the hybrid
+DiT on one batch (300 steps), twice each way. The DiT's four runs are
+bitwise equal at every step, and the decoder's two runs with copies equal
+one of the parent's two at every step, where the parent's pair is at most
+6.9e-4 apart. On the A100, whose runs are not repeatable, the decoder's runs
+with and without copies are at most 1.13e-3 apart at any step, within the
+8.3e-4 and 1.13e-3 by which each side's pair differs. The DiT's are at most
+2.26e-2 apart, against 2.23e-2 and 1.53e-2 within its pairs, and the final
+losses are 0.36587 and 0.36163 without copies and 0.36583 and 0.36631 with
+them.
 
-The A100 runs are not repeatable. Decoder runs with and without copies
-differ by at most 1.13e-3 at any step, within the pairs' differences
-of 8.3e-4 and 1.13e-3. DiT runs differ by at most 2.26e-2 across
-versions, against 2.23e-2 and 1.53e-2 within the pairs. Final losses
-are 0.36587 and 0.36163 without copies, and 0.36583 and 0.36631 with
-copies.
-
-The TPU already fuses the cast into matmul, so copies would add writes.
-At Qwen3-0.6B's widths, 8 x 1024 compiled for a v6e, they write
-85.8 GiB per step against 79.8 and need 2.1 GiB more temporaries.
+A TPU fuses the cast into the matmul, so there the copies would only add
+writes. Compiled for a v6e, Qwen3-0.6B's widths at 8 x 1024 write 85.8 GiB a
+step with the copies against 79.8 without, with 2.1 GiB more temporaries.
 
 ### Generations below sm80
 
-A T4 (sm75) rejects the `BF16_BF16_F32` dot algorithm at run time:
-"UNIMPLEMENTED: Unsupported algorithm on the current device(s): ALG_DOT_BF16_BF16_F32".
-CuDNN fused attention also refuses bf16 there ("SDPA FP16/BF16 requires SM80"),
-and Triton does not compile for it. `dew.nn.kernels.generation.bf16_dot_runs`
-checks support. Below sm80, bf16 attention uses the reference path for
-`auto` and `xla`. Bf16 operand precision preserves the caller's precision,
-and grouped matmul uses XLA.
+A T4 (sm75) rejects the `BF16_BF16_F32` dot algorithm at run time ("UNIMPLEMENTED: Unsupported algorithm on the current device(s): ALG_DOT_BF16_BF16_F32"), cuDNN's fused attention refuses bf16 there ("SDPA FP16/BF16 requires SM80"), and Triton does not compile for it. `dew.nn.kernels.generation.bf16_dot_runs` is the single check for all three. Below sm80, bf16 attention takes the reference path for `auto` and `xla`, the bf16 operand precision keeps the caller's precision, and the grouped matmul runs XLA.
 
 ### Faster kernels not adopted
 
-This kernel matrix reports forward plus backward medians on 2026-09-22,
-with jax 0.11.2. Every cell is checked against float64. Each option
-needs a kernel or dependency not yet included in Dew:
+Kernel matrix, 2026-09-22, jax 0.11.2, forward plus backward medians, every cell checked against float64. Each of these needs a kernel or a dependency that Dew does not have yet:
 
 | op | where it wins | numbers | why not yet |
 |---|---|---|---|
@@ -2021,25 +2010,11 @@ needs a kernel or dependency not yet included in Dew:
 | TPU v6e | 128 | 4096 | 0.632 ms | 0.705 ms |
 | RTX 4080 | 256 | 4096 to 65536 | 2.28 to 33.63 ms | does not compile: 590 KB of shared memory asked, 101 KB available |
 
-On the RTX 4080, the Triton kernel was 6x to 12x slower than XLA where
-it compiled. At chunk 64, width 32, it took 1.39 against 0.22 ms;
-at batch 8 and 16 heads, 22.7 against 2.2 ms. Every chunk of 128 or
-256 requested 131 to 590 KB of shared memory. The scan uses the
-kernel only on TPU.
+On the RTX 4080 the Triton kernel ran 6x to 12x slower than XLA wherever it compiled (chunk 64, width 32: 1.39 against 0.22 ms; at batch 8 and 16 heads, 22.7 against 2.2 ms), and every chunk of 128 or 256 asked for 131 to 590 KB of shared memory. So the scan takes the kernel on TPU only.
 
 ### Packed sliding-window attention on GPU: `local_attention`
 
-No fused-kernel flag supports packed sliding-window attention on pre-Hopper
-GPUs. `jax.nn.dot_product_attention` accepts no segment ids alongside
-`local_window_size`. CuDNN's packed layout (`q_offsets`) raises "Packed layout requires a GPU with at least Hopper architecture"
-on sm89. JAX's Pallas GPU `mha` accepts segment ids but no window;
-its gradient was also 4-9% off at this shape.
-
-`local_attention` therefore builds a `[W, 2W]` band mask and passes it
-to cuDNN as additive bias where supported, or to xla elsewhere. The
-table measures forward plus backward on a Colab L4, jax 0.11.2, bf16,
-with 16 query heads of 64 over 4 key heads, window 4096 and
-5 packed documents:
+A packed batch with a sliding window has no fused-kernel option on a GPU before Hopper. `jax.nn.dot_product_attention` takes no segment ids next to `local_window_size`; cuDNN's packed layout (`q_offsets`) raises "Packed layout requires a GPU with at least Hopper architecture" on sm89; and JAX's Pallas GPU `mha` takes segment ids but no window (and its gradient was 4-9% off at this shape). So `local_attention` builds its `[W, 2W]` band mask and, where cuDNN runs, passes it to cuDNN as the additive bias; elsewhere xla takes it. Colab L4, jax 0.11.2, bf16, 16 query heads of 64 over 4 key heads, window 4096, 5 packed documents, forward plus backward:
 
 | tokens | before (band on xla) | after (band on cuDNN) |
 |---|---|---|
@@ -2049,11 +2024,7 @@ with 16 query heads of 64 over 4 key heads, window 4096 and
 | 32768 | out of memory | 156.5 ms, 1.19 GiB |
 | 65536 | out of memory | 316.7 ms, 2.38 GiB |
 
-Against a float64 oracle at 2048 tokens, output error is 2.7e-3 relative
-and gradient errors are 3.3e-3 to 6.6e-3, matching xla. A dense
-`[S, S]` document mask on cuDNN is faster at 32768 tokens on the
-RTX 4080 (63.7 against 78.1 ms). However, its memory grows with the
-square of length and it ran out at 65536. Dew uses the band mask.
+Against a float64 oracle at 2048 tokens the output error is 2.7e-3 relative and the gradients' 3.3e-3 to 6.6e-3, the same as the xla path's. A dense `[S, S]` document mask on cuDNN is faster at 32768 tokens on an RTX 4080 (63.7 against 78.1 ms), but it grows with the square of the length and ran out of memory at 65536, so Dew uses the band.
 
 ## Expert parallelism on 4x RTX 3090, 2026-09-23
 
