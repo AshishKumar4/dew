@@ -1831,6 +1831,26 @@
    ],
    "note": "Dew's reference_logits helper calls the actual Transformers model; no Dew model forward."
   },
+  "hf/nemotron-h-moe-tiny/logits.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}],
+   "note": "--nemotron-h-only; ungated ReLU² experts, grouped sigmoid top-k with nonzero selection bias, and an ungated shared expert. Seed 2024."
+  },
+  "hf/nemotron-h-moe-tiny/logits_f64.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}],
+   "note": "The same fp32 weights widened through SSD, norms, attention, router type casts and head."
+  },
+  "hf/nemotron-h-moe-latent-tiny/logits.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}],
+   "note": "--nemotron-h-only; latent routed experts with unnormalized sigmoid weights and a full-width shared branch. Seed 2024."
+  },
+  "hf/nemotron-h-moe-latent-tiny/logits_f64.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}],
+   "note": "The same fp32 weights widened through SSD, norms, attention, router type casts and head."
+  },
   "hf/nemotron-h-tiny/logits.npy": {
    "tool": "tools/hf_reference.py",
    "sources": [
@@ -3504,7 +3524,11 @@
    "what": "the random weights and probe ids its Nemotron-H references are computed on",
    "files": [
     "hf/nemotron-h-tiny/input_ids.npy",
-    "hf/nemotron-h-tiny/model.safetensors"
+    "hf/nemotron-h-tiny/model.safetensors",
+    "hf/nemotron-h-moe-tiny/input_ids.npy",
+    "hf/nemotron-h-moe-tiny/model.safetensors",
+    "hf/nemotron-h-moe-latent-tiny/input_ids.npy",
+    "hf/nemotron-h-moe-latent-tiny/model.safetensors"
    ]
   },
   {
