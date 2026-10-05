@@ -140,7 +140,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
     vocabulary tiles at a time. The backward pass therefore never holds
     vocabulary-sized fp32 logits or the softmax of a whole row. The one
     place a full row of logits exists is the first denoising pass, whose
-    logits condition the second pass and carry no gradient.
+    logits condition the second pass and receive no gradient.
     """
 
     saved_task = BlockGeneration

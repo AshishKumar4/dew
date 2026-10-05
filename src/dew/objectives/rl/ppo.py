@@ -137,7 +137,7 @@ class PPOObjective(Objective[Ratio, Variables]):
         return joined({"policy": self.actor.init(key, variables), "critic": critic})
 
     def policy(self, variables: Variables) -> EpisodeInference:
-        """Return the actor's episode inference task, which binds only the `policy` subtree of a full tree."""
+        """Return the actor's episode inference task, whose `bind` uses only the `policy` subtree of a tree."""
         return _Policy(self.actor.policy(part(variables, "policy")))
 
     def inference_record(self) -> JSON:
@@ -181,7 +181,7 @@ class PPOObjective(Objective[Ratio, Variables]):
     def loss(self, variables: Variables, batch, step: Step) -> tuple[Ratio, Aux[Variables]]:
         """Return the actor's policy loss plus the weighted, clipped value error, over the same mass.
 
-        The batch must carry `old_values` and `returns` from the rollout,
+        The batch must hold `old_values` and `returns` from the rollout,
         aligned with `response_mask`, or the loss raises `ValueError`.
         """
         for field in (OLD_VALUES_KEY, RETURNS_KEY):
