@@ -115,6 +115,9 @@ const tutorialNames: Record<string, string> = {
 			<p class="band-lede">Load a Hub checkpoint into a native Flax model, generate, fine-tune with the same trainer, and export under its source tensor names.</p>
 			{live.endpoint && live.turnstileSitekey && <LiveText cell={textCell} recorded={textRecording.text} models={[{ id: 'HuggingFaceTB/SmolLM2-135M-Instruct', label: 'SmolLM2 135M Instruct' }]} />}
 			<Code code={snippet('pretrained-source', 'finetune-load', 'finetune')} lang="python" title="framework.py — Qwen3-0.6B" />
+			<HeroOutput screen={records.pretrained.capture.hero.screen} meta={records.pretrained.capture.meta}
+				seconds={records.pretrained.capture.hero.seconds} columns={records.pretrained.capture.hero.columns}
+				source_rows={records.pretrained.capture.hero.screen.length} playbackSeconds={0} />
 			<pre class="shown-output">export/config.json{'\n'}export/model.safetensors.index.json</pre>
 			<p class="framework-note"><a href="/reference/models/">Supported families</a>: Qwen, Llama, Gemma, Mistral, DeepSeek, Mamba and multimodal decoders.</p>
 		</section>
