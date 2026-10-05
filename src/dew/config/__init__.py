@@ -50,7 +50,7 @@ from dew.lora import LoRA, _Adapted, _attach
 from dew.nn.attention import AttentionImpl
 from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.records import JSON, duration, recorded_duration
-from dew.registry import REGISTRIES, _declared_type, datasets, models, schedules, with_precision
+from dew.registry import Registry, _declared_type, datasets, models, schedules, with_precision
 from dew.telemetry.instrumentation import default_compilation_cache_dir, dew_cache_dir
 from dew.telemetry.records import RunRecord, TrialFinished, json_value, packages_installed
 from dew.training.display import TrainingDisplay
@@ -555,7 +555,7 @@ def _artifact_name(name: str) -> str:
 def _registry_for(annotation):
     """Return the registry whose members the annotation names, or None."""
     members = typing.get_args(annotation) or (annotation,)
-    for held in REGISTRIES:
+    for held in Registry.shared():
         if all(any(member is m for m in held.values()) for member in members):
             return held
     return None
