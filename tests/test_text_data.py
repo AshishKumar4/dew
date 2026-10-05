@@ -606,6 +606,66 @@ def test_the_tokenize_command_writes_what_the_library_writes(tmp_path, capsys):
     assert f"wrote {library.train_tokens} tokens to" in capsys.readouterr().out
 
 
+def _tokenize(input_path, out, *flags):
+    """The real CLI of this checkout in a fresh process, run in `out`'s parent."""
+    import subprocess
+
+    source = Path(__file__).resolve().parents[1] / "src"
+    return subprocess.run([sys.executable, "-m", "dew.cli.main", "tokenize", "--input", str(input_path),
+                           "--out", str(out), *flags], cwd=Path(out).parent, capture_output=True, text=True,
+                          env={**os.environ, "PYTHONPATH": str(source), "JAX_PLATFORMS": "cpu"}, check=False)
+
+
+def _listing(directory):
+    return sorted(path.name for path in Path(directory).iterdir())
+
+
+@pytest.mark.parametrize("case", ["success", "missing input", "empty corpus"])
+def test_tokenize_leaves_every_file_it_did_not_create(tmp_path, case):
+    """Issue #24: the scratch stream is a file the run creates for itself.
+    An unrelated `<out>/all.bin` (once the fixed scratch name) is
+    byte-identical after a successful run, a missing input and a corpus too
+    short to window, and the directory then holds that file plus, on
+    success, the three outputs, no scratch left behind."""
+    out = tmp_path / "out"
+    out.mkdir()
+    sentinel = out / "all.bin"
+    sentinel.write_bytes(b"unrelated bytes \x00\xff" * 64)
+    before = sentinel.read_bytes()
+    raw = tmp_path / "corpus.txt"
+    texts = {"success": "one line\nanother line\n" * 20, "empty corpus": "", "missing input": ""}
+    raw.write_text(texts[case], encoding="utf-8")
+    source = tmp_path / "missing.txt" if case == "missing input" else raw
+
+    result = _tokenize(source, out, "--val-fraction", "0.2")
+
+    assert (result.returncode == 0) == (case == "success"), result.stderr[-2000:]
+    assert sentinel.read_bytes() == before
+    expected = ["all.bin", "meta.json", "train.bin", "val.bin"] if case == "success" else ["all.bin"]
+    assert _listing(out) == expected
+
+
+def test_an_input_at_the_old_scratch_name_is_read_and_left_alone(tmp_path):
+    """A corpus at `<out>/all.bin` tokenizes to what the same text gives from
+    anywhere else, and is byte-identical afterwards."""
+    text = "a corpus whose file name happens to be all.bin\n" * 30
+    out = tmp_path / "out"
+    out.mkdir()
+    inside = out / "all.bin"
+    inside.write_text(text, encoding="utf-8")
+    elsewhere = tmp_path / "corpus.txt"
+    elsewhere.write_text(text, encoding="utf-8")
+
+    result = _tokenize(inside, out, "--val-fraction", "0.2")
+
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert inside.read_text(encoding="utf-8") == text
+    library = TokenCorpus.write(elsewhere, tmp_path / "lib", val_fraction=0.2)
+    for name in ("train.bin", "val.bin"):
+        assert (out / name).read_bytes() == (tmp_path / "lib" / name).read_bytes()
+    assert json.loads((out / "meta.json").read_text())["train_tokens"] == library.train_tokens
+
+
 def _bos_tokenizer(directory):
     """A word-level tokenizer that starts every encode with its bos id, as
     Llama's does, saved where `HFTokenizer` loads it without the hub."""
