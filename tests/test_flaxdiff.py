@@ -141,3 +141,50 @@ def test_config_the_port_does_not_reproduce_is_refused(reference):
             simple_udit_fields({**model_config, name: True})
     with pytest.raises(ValueError, match="unknown"):
         simple_udit_fields({**model_config, "attention_bias": True})
+
+
+def test_a_run_imported_by_from_flaxdiff_samples_what_flaxdiffs_preview_did(tmp_path):
+    """tools/flaxdiff_pipeline_reference.py ran FlaxDiff's own preview
+    sampling (3e3497e) of a tiny SimpleUDiT run over the tiny SD pipeline's
+    CLIP and VAE: `EulerAncestralSampler` on `KarrasVENoiseScheduler` with
+    `KarrasPredictionTransform`, guidance 3, 200 steps of its own grid, then
+    the decode and the clip, on Dew's random draws. `TextToImage.from_flaxdiff`
+    reads the same checkpoint and the run config FlaxDiff logs, and its call
+    holds tests/reference_error.py's rule against FlaxDiff's images: as the
+    run sampled, its towers in bfloat16, and with the towers in float32 on
+    both sides, where their rounding (5.2e-3 rms from float64 in FlaxDiff's
+    own run, against 2.3e-6 without it) no longer hides a sampler
+    difference. A failure with a large ratio after a change to how Dew
+    draws its noise needs the tool rerun."""
+    from dataclasses import replace
+
+    from reference_error import assert_as_exact_as_the_reference
+
+    from dew.interop.flaxdiff import _towers
+    from dew.sampling import TextToImage
+    from tools.flaxdiff_pipeline_reference import KEY, PROMPTS, checkpoint, run_config, towers
+
+    with np.load(Path(__file__).parent / "fixtures" / "flaxdiff_pipeline" / "reference.npz") as stored:
+        recorded = {name: stored[name] for name in stored.files}
+    meta = json.loads(recorded.pop("meta").tobytes())
+    weights = unflatten_dict({name.removeprefix("params/"): value for name, value in recorded.items()
+                              if name.startswith("params/")}, sep="/")
+    clip, vae = towers(tmp_path)
+    checkpoint(tmp_path / "1", weights)
+    task = TextToImage.from_flaxdiff(tmp_path / "1", run_config(meta["input_config"], clip, vae),
+                                     jax_version=meta["jax_version"])
+    np.testing.assert_allclose(task.prepare(list(PROMPTS), key=KEY).noise, recorded["start"], rtol=1e-6)
+
+    def sampled(task):
+        return np.clip(np.asarray(task(list(PROMPTS), key=KEY).images), -1, 1)
+
+    truth = recorded["fp64.images"]
+    assert_as_exact_as_the_reference(sampled(task), recorded["as_run.images"], truth, "as run")
+    (keyword,) = task.inputs.conditions
+    condition, autoencoder = _towers(str(clip), "", str(vae), "float32")
+    wide = replace(task, inputs=replace(task.inputs, conditions={keyword: condition}),
+                   autoencoder=autoencoder,
+                   variables={**task.variables, "encoders": {keyword: condition.encoder.params},
+                              "autoencoder": autoencoder.params})
+    assert_as_exact_as_the_reference(sampled(wide), recorded["fp32_towers.images"], truth, "float32 towers")
+
