@@ -49,14 +49,13 @@ def write_token_files(root, train_tokens, val_tokens, tokenizer="byte", eos_id=N
     return root
 
 
-def run_config(recipe, tokens, *args):
+def run_config(recipe, tokens, *args, model='{"emb_features": 16, "num_layers": 1, "num_heads": 2}'):
     # A dataset subcommand has to come before its flags, so `args` leads.
     return tyro.cli(tyro.conf.CascadeSubcommandArgs[recipe.LmRunConfig], args=[
         *args, "--data.path", str(tokens), "--data.seq-len", str(SEQ), "--data.loading.workers", "0",
         "--trainer.batch-size", "8", "--trainer.checkpoint-dir", str(tokens.parent / "runs"),
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
-        "--trainer.log-every", "1", "--model.dtype", "float32",
-        "--model.config", '{"emb_features": 16, "num_layers": 1, "num_heads": 2}'])
+        "--trainer.log-every", "1", "--model.dtype", "float32", "--model.config", model])
 
 
 def test_the_sampling_budget_decides_the_context_the_model_is_built_for():
@@ -168,14 +167,15 @@ def test_weighted_corpora_from_different_vocabularies_are_refused(tmp_path):
 def test_the_recipe_trains_muonclip_with_the_clip_firing(tmp_path):
     """`--optim.optimizer muonclip` through `recipe.main`: the per-head maxima
     travel from the loss to the optimizer inside the compiled step, so the
-    query kernel lands away from a Muon run at the same seed. Observed on
-    CPU: 4 steps, kernels differ by 0.48."""
+    query kernel lands away from a Muon run at the same seed. The model has
+    no QK-norm, which the clip refuses, as docs/recipes.md says. Observed on
+    CPU: 4 steps, kernels differ by 0.32."""
     recipe = load_recipe()
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
 
     def run(name, *args):
-        config = run_config(recipe, tokens, "--trainer.name", name,
-                            "--trainer.epochs", "1", *args)
+        config = run_config(recipe, tokens, "--trainer.name", name, "--trainer.epochs", "1", *args,
+                            model='{"emb_features": 16, "num_layers": 1, "num_heads": 2, "qk_norm": false}')
         return recipe.main(config)
 
     muon = run("muon", "--optim.optimizer", "muon")

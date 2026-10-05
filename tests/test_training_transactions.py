@@ -201,9 +201,11 @@ def test_real_lm_mtp_router_and_qk_update_matches_combined_batch(auxiliary):
     from dew.objectives.lm import LMObjective
     from dew.training.optim import scale_by_qk_clip
 
+    # QK-Clip bounds logits only where no QK-norm divides the kernels' scale
+    # back out, and refuses a normed layer.
     model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=1,
                               num_heads=2, mlp_features=16, max_seq_len=16,
-                              num_nextn_predict_layers=2,
+                              num_nextn_predict_layers=2, qk_norm=False,
                               mixture={"experts": 4, "top_k": 2, "bias": True,
                                        "score_function": "softmax"})
     objective = LMObjective(model, 10, head_chunks=1, mtp_weight=.3,

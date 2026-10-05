@@ -633,6 +633,7 @@ class CausalSelfAttention(nn.Module):
                 query, key, causal=causal, sliding_window=window,
                 mask=mask if documents is None else with_documents(mask, documents)))
             self.sow("qk", "kv_heads", jnp.asarray(key.shape[-2]))
+            self.sow("qk", "head_dim", jnp.asarray(query.shape[-1]))
         if self.attention_dropout_rate and train:
             return checkpoint_name(scaled_dot_product_attention(
                 query, key, value, dtype=self.dtype, precision=self.precision,
