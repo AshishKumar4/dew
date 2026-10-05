@@ -160,7 +160,7 @@ def test_a_run_imported_by_from_flaxdiff_samples_what_flaxdiffs_preview_did(tmp_
 
     from reference_error import assert_as_exact_as_the_reference
 
-    from dew.objectives.diffusion.config import PretrainedAutoencoder, TextCondition
+    from dew.interop.flaxdiff import _towers
     from dew.sampling import TextToImage
     from tools.flaxdiff_pipeline_reference import KEY, PROMPTS, checkpoint, run_config, towers
 
@@ -181,8 +181,7 @@ def test_a_run_imported_by_from_flaxdiff_samples_what_flaxdiffs_preview_did(tmp_
     truth = recorded["fp64.images"]
     assert_as_exact_as_the_reference(sampled(task), recorded["as_run.images"], truth, "as run")
     (keyword,) = task.inputs.conditions
-    condition = TextCondition(checkpoint=str(clip), dtype="float32", unconditional="").build()
-    autoencoder = PretrainedAutoencoder(modelname=str(vae), revision="main", dtype="float32").build()
+    condition, autoencoder = _towers(str(clip), "", str(vae), "float32")
     wide = replace(task, inputs=replace(task.inputs, conditions={keyword: condition}),
                    autoencoder=autoencoder,
                    variables={**task.variables, "encoders": {keyword: condition.encoder.params},
