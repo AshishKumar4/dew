@@ -14,6 +14,7 @@ sihyun-yu/REPA's `loss.py` and `models/sit.py`, and End2End-Diffusion/iREPA's
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from dataclasses import dataclass
 from typing import Literal
@@ -24,6 +25,7 @@ from flax import linen as nn
 
 from dew.nn.blocks import torch_bicubic_resize
 from dew.objectives.base import Variables
+from dew.objectives.diffusion.end_to_end import EndToEnd
 
 ALIGNMENT = "alignment_projector"
 """The projector's key in `params`, beside the model's own modules."""
@@ -163,3 +165,46 @@ class Alignment:
 
 
 __all__ = ["ALIGNMENT", "REPRESENTATION", "Alignment", "Projector", "spatial_zscore"]
+
+
+@dataclasses.dataclass(frozen=True)
+class RepresentationAlignment:
+    """Alignment of the model's hidden tokens with a frozen DINOv2's patch features.
+
+    This is REPA (Yu et al. 2025) or iREPA (Singh et al. 2026), optionally with the
+    autoencoder tuned end to end through it, as in REPA-E (Leng et al. 2025).
+
+    `encoder` is a transformers `Dinov2Model` checkpoint given as `repo`,
+    `repo@revision` or a directory, by default REPA's DINOv2-B/14, read at
+    `resolution` pixels; a run's record pins it to a commit. `layer` names the
+    model's submodule whose output is aligned: REPA aligns after the eighth block,
+    which is `dit_block_7` on `simple_dit`. The other fields are `Alignment`'s, and
+    `end_to_end` is REPA-E's `EndToEnd`, which needs a KL `autoencoder`.
+    """
+
+    encoder: str = "facebook/dinov2-base"
+    layer: str = "dit_block_7"
+    weight: float = 0.5
+    projector: Literal["mlp", "conv"] = "mlp"
+    width: int = 2048
+    kernel_size: int = 3
+    spatial_norm: float | None = None
+    resolution: int = 224
+    end_to_end: EndToEnd | None = None
+
+    def build(self, variables: Variables | None = None) -> Alignment:
+        """Return the alignment over the encoder's weights.
+
+        It uses the `representation` subtree of `variables` when a saved tree supplies
+        it, and the checkpoint's weights otherwise.
+        """
+        from dew.interop.pretrained import split_revision
+        from dew.nn.autoencoders.rae import load_dinov2
+
+        name, revision = split_revision(self.encoder)
+        supplied = None if variables is None else variables[REPRESENTATION]["params"]
+        module, params, _ = load_dinov2(name, revision=revision, params=supplied)
+        return Alignment(module.clone(input_size=self.resolution), {"params": params}, self.layer,
+                         weight=self.weight, projector=self.projector, width=self.width,
+                         kernel_size=self.kernel_size, spatial_norm=self.spatial_norm,
+                         resolution=self.resolution)
