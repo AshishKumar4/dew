@@ -6,9 +6,9 @@ separate serving uid and are never loaded into these kernel processes.
 """
 
 import itertools
+import json
 import os
 import shlex
-import shutil
 import subprocess
 from pathlib import Path
 
@@ -54,7 +54,9 @@ class LimitedKernelManager(KernelGatewayIOLoopKernelManager):
             raise ValueError("only the Python demo kernel may be started")
         connection = Path('/sessions/connections') / Path(self.connection_file).name
         connection.parent.mkdir(mode=0o711, exist_ok=True)
-        shutil.copyfile(self.connection_file, connection)
+        data = json.loads(Path(self.connection_file).read_text())
+        data['ip'] = '/work/ipc/kernel'
+        connection.write_text(json.dumps(data))
         os.chown(connection, uid, uid)
         os.chmod(connection, 0o400)
         directory = Path(self.ip).parent
@@ -70,7 +72,7 @@ class LimitedKernelManager(KernelGatewayIOLoopKernelManager):
             "--size", str(64 * 1024 * 1024), "--tmpfs", "/work",
             "--size", str(16 * 1024 * 1024), "--tmpfs", "/tmp",
             "--ro-bind", str(connection), "/kernel.json",
-            "--bind", str(directory), str(directory), "--chdir", "/work", "--cap-drop", "ALL",
+            "--bind", str(directory), "/work/ipc", "--chdir", "/work", "--cap-drop", "ALL",
             "/opt/venv/bin/python", "/opt/live/guest_entry.py", *arguments,
         ]
         limited = ["/usr/sbin/capsh", "--drop=all", "--no-new-privs", f"--user=ctx{uid - 6100}",
