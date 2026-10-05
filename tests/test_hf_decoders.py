@@ -846,6 +846,13 @@ def test_nemotron_h_legacy_patterns_and_mamba_aliases_read_as_the_modern_config(
     assert translate_config(legacy) == translate_config(modern)
 
 
+def test_nemotron_h_stale_nano9b_geometry_fields_change_no_computation():
+    """Transformers 5.16.1 reads n_groups, ssm_state_size and num_key_value_heads instead."""
+    modern = fixture_config("nemotron-h-tiny")
+    stale = {**modern, "mamba_num_groups": 8, "mamba_state_dim": 128, "num_query_groups": 8}
+    assert translate_config(stale) == translate_config(modern)
+
+
 @pytest.mark.parametrize("changes, message", [
     ({"layers_block_type": ["moe"]}, "ungated ReLU² routed experts"),
     ({"num_nextn_predict_layers": 1}, "multi-token prediction"),
