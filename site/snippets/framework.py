@@ -1,12 +1,13 @@
 """Small runnable examples behind the landing page, using the public API.
 
 python site/snippets/framework.py --section lm --out /tmp/dew-landing
-Every displayed block is between its show/end markers; the surrounding code
-prepares the small synthetic fixtures. --smoke uses an offline tiny checkpoint
-in place of the Hub model and shortens training for CI, not for the recording.
+The page shows the code between each "Begin snippet" and "End snippet" marker.
+The code around the markers builds small synthetic fixtures. For CI, --smoke
+swaps the Hub model for an offline tiny checkpoint and trains for fewer steps;
+the recordings on the page do not use it.
 """
 
-# Command-line examples print results for capture_snippets.py.
+# Each section prints its result for capture_snippets.py.
 
 import argparse
 import itertools
