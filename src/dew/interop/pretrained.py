@@ -75,7 +75,6 @@ from dew.objectives.base import Variables
 from dew.registry import (
     dtype_name,
     from_record,
-    models,
     precision_fields,
     projectors,
     resolve_dtype,
@@ -1206,11 +1205,10 @@ def _unet_denoiser(directory: Path, *, dtype: str | None, attention_impl: str) -
     """Build the published UNet: cross attention over one or two CLIP towers, whose
     pooled text conditioning is the one its added time features ask for."""
     from dew.interop import diffusion
-    from dew.nn.backbones.unet_condition import UNet2DCondition
 
     config = _component_config(directory, "unet")
     fields = diffusion.unet_fields(config, dtype=dtype, attention_impl=attention_impl)
-    model = UNet2DCondition(**fields)
+    model = fields.value
 
     def weights(param_dtype: str, lazy: bool) -> tuple[Variables, tuple[WeightLayout, ...]]:
         params, layouts = diffusion.translate_unet_weights(
@@ -1263,7 +1261,8 @@ def _transformer_weights(directory: Path, translate: Callable[..., tuple[LazyTre
     return weights
 
 
-def _transformer_denoiser(name: str, fields: Mapping[str, object], config: dict, dtype: str | None,
+def _transformer_denoiser(name: str, model: nn.Module, fields: Mapping[str, object], config: dict,
+                         dtype: str | None,
                          weights: Callable[[str, bool], tuple[Variables, tuple[WeightLayout, ...]]],
                          text: _TextTowers | _QwenImageText | _HiddenStatesText | _WanText, *,
                          patch: int, latent_input: int, sample_size: tuple[int, int], context_width: int,
@@ -1272,7 +1271,7 @@ def _transformer_denoiser(name: str, fields: Mapping[str, object], config: dict,
     built = {"name": name, "fields": {**{key: list(value) if isinstance(value, tuple) else value
                                          for key, value in fields.items()}, "dtype": dtype}}
     return _Denoiser(
-        component="transformer", model=models[name](**fields), weights=weights, built=built, config=config,
+        component="transformer", model=model, weights=weights, built=built, config=config,
         text=text, patch=patch, latent_input=latent_input, sample_size=sample_size,
         context_width=context_width, pipeline=pipeline, origin=origin, frames=frames)
 
@@ -1283,6 +1282,7 @@ def _sd3_denoiser(config: dict, directory: Path, *, dtype: str | None, attention
     from dew.interop import diffusion
 
     fields = diffusion.sd3_fields(config, dtype=dtype, attention_impl=attention_impl)
+    model = fields.value
 
     def weights(param_dtype: str, lazy: bool) -> tuple[Variables, tuple[WeightLayout, ...]]:
         params, buffers, layouts = diffusion.translate_sd3_weights(
@@ -1290,10 +1290,10 @@ def _sd3_denoiser(config: dict, directory: Path, *, dtype: str | None, attention
         return {"params": params, "buffers": buffers}, layouts
 
     return _transformer_denoiser(
-        "sd3_transformer", fields, config, dtype, weights,
+        "sd3_transformer", model, fields, config, dtype, weights,
         _TextTowers("sd3", ("text_encoder", "text_encoder_2"), t5_tower="text_encoder_3"),
-        patch=fields["patch_size"], latent_input=fields["in_channels"], sample_size=_square(config),
-        context_width=fields["joint_attention_dim"], pipeline="StableDiffusion3Pipeline")
+        patch=model.patch_size, latent_input=model.in_channels, sample_size=_square(config),
+        context_width=model.joint_attention_dim, pipeline="StableDiffusion3Pipeline")
 
 
 def _flux_denoiser(config: dict, directory: Path, *, dtype: str | None, attention_impl: str) -> _Denoiser:
@@ -1306,13 +1306,14 @@ def _flux_denoiser(config: dict, directory: Path, *, dtype: str | None, attentio
     from dew.interop import diffusion
 
     fields = diffusion.flux_fields(config, dtype=dtype, attention_impl=attention_impl)
+    model = fields.value
     weights = _transformer_weights(directory, diffusion.translate_flux_weights)
     return _transformer_denoiser(
-        "flux_transformer", fields, config, dtype, weights,
+        "flux_transformer", model, fields, config, dtype, weights,
         _TextTowers("flux", ("text_encoder",), t5_tower="text_encoder_2",
-                    embeds_guidance=fields["guidance_embeds"]),
-        patch=2, latent_input=fields["in_channels"] // 4, sample_size=_square(config, 128),
-        context_width=fields["joint_attention_dim"], pipeline="FluxPipeline", origin="linspace")
+                    embeds_guidance=model.guidance_embeds),
+        patch=2, latent_input=model.in_channels // 4, sample_size=_square(config, 128),
+        context_width=model.joint_attention_dim, pipeline="FluxPipeline", origin="linspace")
 
 
 def _qwen_image_denoiser(config: dict, directory: Path, *, dtype: str | None,
@@ -1325,11 +1326,12 @@ def _qwen_image_denoiser(config: dict, directory: Path, *, dtype: str | None,
     from dew.interop import diffusion
 
     fields = diffusion.qwen_image_fields(config, dtype=dtype, attention_impl=attention_impl)
+    model = fields.value
     return _transformer_denoiser(
-        "qwen_image_transformer", fields, config, dtype,
+        "qwen_image_transformer", model, fields, config, dtype,
         _transformer_weights(directory, diffusion.translate_qwen_image_weights), _QwenImageText(),
-        patch=1, latent_input=fields["in_channels"], sample_size=(64, 64),
-        context_width=fields["context_in_dim"], pipeline="QwenImage21Pipeline", origin="linspace")
+        patch=1, latent_input=model.in_channels, sample_size=(64, 64),
+        context_width=model.context_in_dim, pipeline="QwenImage21Pipeline", origin="linspace")
 
 
 def _flux2_denoiser(config: dict, directory: Path, *, dtype: str | None, attention_impl: str) -> _Denoiser:
@@ -1342,12 +1344,13 @@ def _flux2_denoiser(config: dict, directory: Path, *, dtype: str | None, attenti
     from dew.interop import diffusion
 
     fields = diffusion.flux2_fields(config, dtype=dtype, attention_impl=attention_impl)
-    guided = fields["guidance_embeds"]
+    model = fields.value
+    guided = model.guidance_embeds
     weights = _transformer_weights(directory, diffusion.translate_flux2_weights)
     return _transformer_denoiser(
-        "flux2_transformer", fields, config, dtype, weights,
-        _HiddenStatesText("flux2", embeds_guidance=guided), patch=1, latent_input=fields["in_channels"],
-        sample_size=(64, 64), context_width=fields["joint_attention_dim"],
+        "flux2_transformer", model, fields, config, dtype, weights,
+        _HiddenStatesText("flux2", embeds_guidance=guided), patch=1, latent_input=model.in_channels,
+        sample_size=(64, 64), context_width=model.joint_attention_dim,
         pipeline="Flux2Pipeline" if guided else "Flux2KleinPipeline", origin="empirical")
 
 
@@ -1360,11 +1363,12 @@ def _z_image_denoiser(config: dict, directory: Path, *, dtype: str | None, atten
     from dew.interop import diffusion
 
     fields = diffusion.z_image_fields(config, dtype=dtype, attention_impl=attention_impl)
+    model = fields.value
     weights = _transformer_weights(directory, diffusion.translate_z_image_weights)
     return _transformer_denoiser(
-        "z_image_transformer", fields, config, dtype, weights,
-        _HiddenStatesText("z_image"), patch=2, latent_input=fields["in_channels"], sample_size=(128, 128),
-        context_width=fields["cap_feat_dim"], pipeline="ZImagePipeline", origin="linspace")
+        "z_image_transformer", model, fields, config, dtype, weights,
+        _HiddenStatesText("z_image"), patch=2, latent_input=model.in_channels, sample_size=(128, 128),
+        context_width=model.cap_feat_dim, pipeline="ZImagePipeline", origin="linspace")
 
 
 def _wan_denoiser(config: dict, directory: Path, *, dtype: str | None, attention_impl: str) -> _Denoiser:
@@ -1376,11 +1380,12 @@ def _wan_denoiser(config: dict, directory: Path, *, dtype: str | None, attention
     from dew.interop import diffusion
 
     fields = diffusion.wan_fields(config, dtype=dtype, attention_impl=attention_impl)
+    model = fields.value
     weights = _transformer_weights(directory, diffusion.translate_wan_weights)
     return _transformer_denoiser(
-        "wan_transformer", fields, config, dtype, weights,
-        _WanText(), patch=fields["patch_size"][-1], latent_input=fields["in_channels"], sample_size=(60, 104),
-        context_width=fields["text_dim"], pipeline="WanPipeline", frames=81)
+        "wan_transformer", model, fields, config, dtype, weights,
+        _WanText(), patch=model.patch_size[-1], latent_input=model.in_channels, sample_size=(60, 104),
+        context_width=model.text_dim, pipeline="WanPipeline", frames=81)
 
 
 _DENOISERS: Mapping[str, Callable[..., _Denoiser]] = MappingProxyType({
@@ -1471,13 +1476,13 @@ def _clip_towers(directory: Path, names: tuple[str, ...], compute, *, param_dtyp
     the layouts those parameters came from."""
     from transformers import CLIPTokenizer
 
-    from dew.nn.text_encoders import CLIPTextTransformer, translate_config
+    from dew.nn.text_encoders import translate_config
 
     towers, tokenizers, layouts = [], [], ()
     bound = {} if params is None else params
     for name in names:
         config = _component_config(directory, name)
-        model = CLIPTextTransformer(**translate_config(config), dtype=compute)
+        model = translate_config(config).value.clone(dtype=compute)
         tower, tree, recorded, _ = bind_component(
             directory / name, name, config, model, lambda name, rank: _text_head_path(name),
             lambda bound, model=model: model, prefix=("encoders", "conditioning", name),
@@ -1501,10 +1506,10 @@ def _t5_tower(directory: Path, compute, component: str, tokens: int, *, param_dt
     the pipeline pads to.
     """
     from dew.data.text import load_tokenizer
-    from dew.nn.text_encoders import T5EncoderTransformer, _t5_path, t5_embedding, translate_t5_config
+    from dew.nn.text_encoders import _t5_path, t5_embedding, translate_t5_config
 
     config = _component_config(directory, component)
-    tower = T5EncoderTransformer(**translate_t5_config(config), dtype=compute)
+    tower = translate_t5_config(config).value.clone(dtype=compute)
     return bind_component(
         directory / component, component, config, tower, lambda name, rank: _t5_path(name),
         lambda bound: T5Segment(tower, load_tokenizer(str(directory / (
@@ -1519,12 +1524,12 @@ def _wan_conditioning(directory: Path, compute, *, tokens: int, param_dtype: str
     """Build Wan's conditioner: the UMT5 encoder, its tokenizer, the
     parameters and their layouts."""
     from dew.data.text import load_tokenizer
-    from dew.nn.text_encoders import T5EncoderTransformer, _t5_path, t5_embedding, translate_t5_config
+    from dew.nn.text_encoders import _t5_path, t5_embedding, translate_t5_config
 
     config = _component_config(directory, "text_encoder")
     if config.get("model_type") != "umt5":
         raise ValueError(f"Wan's text encoder is a umt5 model, not {config.get('model_type')!r}")
-    tower = T5EncoderTransformer(**translate_t5_config(config), dtype=compute)
+    tower = translate_t5_config(config).value.clone(dtype=compute)
     encoder, _, layouts, _ = bind_component(
         directory / "text_encoder", "text_encoder", config, tower, lambda name, rank: _t5_path(name),
         lambda bound: WanConditioner(tower, load_tokenizer(str(directory / "tokenizer")),
@@ -1705,7 +1710,7 @@ def _image_safety(directory: Path, compute, *, param_dtype: str = "float32",
     a weight read."""
     from dew.inputs.diffusion import CLIPImageTransform, CLIPSafetyHead, ImageSafety
     from dew.interop import diffusion
-    from dew.nn.text_encoders import CLIPVisionTransformer, translate_vision_config
+    from dew.nn.text_encoders import translate_vision_config
 
     config = _component_config(directory, "safety_checker")
     with open(directory / "feature_extractor" / "preprocessor_config.json") as handle:
@@ -1725,7 +1730,7 @@ def _image_safety(directory: Path, compute, *, param_dtype: str = "float32",
             "safety_checker", state, _safety_path, ("encoders", "safety"), param_dtype="float32", lazy=lazy)
         params.update(scoring)
         layouts += state_layouts
-    head = CLIPSafetyHead(CLIPVisionTransformer(**translate_vision_config(config), dtype=compute),
+    head = CLIPSafetyHead(translate_vision_config(config).value.clone(dtype=compute),
                           int(config["projection_dim"]), dtype=compute)
     return (ImageSafety(head, CLIPImageTransform.from_config(transform)), params, layouts,
             {"safety_checker": config, "feature_extractor": transform})
