@@ -176,7 +176,9 @@ def _masked_conv1d(x, kernel, valid, state=None, bias=None, segments=None):
 def _compensated_add(left, right):
     """Add two double-float values, `(hi, lo)` pairs whose sum is the value:
     `hi` is the rounded sum and `lo` carries what its rounding dropped
-    (Knuth's TwoSum), so a running sum keeps fp32's precision squared."""
+    (Knuth's TwoSum), so a running sum keeps fp32's precision squared.
+    XLA reassociates no float arithmetic unless fast math is on; with it,
+    `lo` cancels to zero and the sum is the plain one."""
     (left_hi, left_lo), (right_hi, right_lo) = left, right
     total = left_hi + right_hi
     part = total - left_hi
