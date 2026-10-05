@@ -704,4 +704,13 @@ def learning_rate_schedule(config: OptimConfig, steps: int):
     return config.learning_rate if config.schedule is None else config.schedule.schedule(steps)
 
 
-__all__ = ["Cosine", "Linear", "ParamGroup", "Power", "PowerProfilesState", "PowerTail", "ScheduleBase"]
+__all__ = [
+    "Cosine",
+    "Linear",
+    "ParamGroup",
+    "Power",
+    "PowerProfilesState",
+    "PowerTail",
+    "ScheduleBase",
+    "param_labels",
+]

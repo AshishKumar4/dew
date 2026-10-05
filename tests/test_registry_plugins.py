@@ -232,7 +232,7 @@ class Shift(Objective):
         return {"objective": "shift"}
 
     def pipeline(self, state, *, ema=None) -> Scalar:
-        return Scalar(float(self._pipeline_weights(state, ema)["params"]["w"]))
+        return Scalar(float(self.pipeline_variables(state, ema=ema)["params"]["w"]))
 '''
 
 

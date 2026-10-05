@@ -365,7 +365,7 @@ class DiffusionObjective(Objective[Ratio]):
         task, sampling the way this objective's evaluation does."""
         from dew.sampling.pipelines import TextToImage
 
-        return TextToImage.from_objective(self, thaw(self._pipeline_weights(state, ema)))
+        return TextToImage.from_objective(self, thaw(self.pipeline_variables(state, ema=ema)))
 
     @property
     def latent_shape(self) -> tuple[int, ...]:

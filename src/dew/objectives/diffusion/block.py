@@ -240,7 +240,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         from dew.inference.tasks import BlockGeneration
 
         process = BlockProcess(canvas_length=self.model.canvas_length, vocab_size=self.model.vocab_size)
-        return BlockGeneration(self.model, self._pipeline_weights(state, ema), process,
+        return BlockGeneration(self.model, self.pipeline_variables(state, ema=ema), process,
                                self.processor if processor is None else processor,
                                pad_token_id=self.pad_token_id)
 

@@ -447,6 +447,7 @@ Import `pipeline`, `TextGeneration`, `BlockGeneration`, `MaskedGeneration`, `Tex
 pipeline(source, *, mesh=None, layout=None, dtype=None, param_dtype=None, ema=None, step=None,
          revision=None) -> TextGeneration | BlockGeneration | MaskedGeneration | TextToImage
 Objective.pipeline(state, *, ema=None) -> the objective's task over state.averaged or state.variables
+Objective.pipeline_variables(state, *, ema=None) -> the variables pipeline builds its task over
 LMObjective.pipeline(state, *, ema=None, processor=None) -> TextGeneration
 TextGeneration(model, variables, processor=None, sampling=Sampling(), max_new_tokens=None,
                max_length=None, n=1, logits=None, stopping=(), strategy=None)

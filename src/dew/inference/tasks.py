@@ -756,4 +756,11 @@ class MaskedGeneration:
         return _canvas_text(self.processor, generation, "inference.masked.decode")
 
 
-__all__ = ["SHAPE_BUCKETS", "BlockGeneration", "MaskedGeneration", "Processor", "TextGeneration"]
+__all__ = [
+    "SHAPE_BUCKETS",
+    "BlockGeneration",
+    "MaskedGeneration",
+    "Processor",
+    "TextGeneration",
+    "run_record",
+]

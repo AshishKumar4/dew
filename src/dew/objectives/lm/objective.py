@@ -745,7 +745,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         `processor`, or the objective's own when it is None, encodes and decodes.
         """
         samples = self.samples
-        return TextGeneration(self.model, self._pipeline_weights(state, ema),
+        return TextGeneration(self.model, self.pipeline_variables(state, ema=ema),
                               self.processor if processor is None else processor,
                               sampling=Sampling() if samples is None else samples.sampling,
                               max_new_tokens=None if samples is None or samples.max_new_tokens <= 0

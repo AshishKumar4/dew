@@ -558,7 +558,14 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         return None
 
-    def _pipeline_weights(self, state: TrainState, ema: bool | None) -> Variables:
+    def pipeline_variables(self, state: TrainState, *, ema: bool | None = None) -> Variables:
+        """Return the variables `pipeline` builds its task over, chosen by `ema` as `pipeline` documents.
+
+        An objective whose average is the frozen reference returns the live
+        variables whatever `ema` says, since those are the trained policy.
+        A plugin's `pipeline` reads its weights here, so it serves the
+        weights dew's own objectives would.
+        """
         if self._ema_is_reference or ema is False or (ema is None and state.ema is None):
             return state.variables
         return state.averaged

@@ -749,9 +749,11 @@ trainings: Registry[type[Training], Training] = Registry("training").share()
 
 __all__ = [
     "PLUGINS",
+    "Record",
     "Registry",
     "datasets",
     "encoders",
+    "from_record",
     "metrics",
     "mixers",
     "models",

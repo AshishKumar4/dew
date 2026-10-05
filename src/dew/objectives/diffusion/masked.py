@@ -162,7 +162,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         """
         from dew.inference.tasks import MaskedGeneration
 
-        return MaskedGeneration(self.model, self._pipeline_weights(state, ema), self.process,
+        return MaskedGeneration(self.model, self.pipeline_variables(state, ema=ema), self.process,
                                 self.processor if processor is None else processor,
                                 solver=self.solver, steps=self.steps)
 
