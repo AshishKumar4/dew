@@ -35,6 +35,7 @@ from jax.typing import DTypeLike
 from dew import records
 
 if TYPE_CHECKING:
+    from dew.diffusion.process import Process
     from dew.sampling.pipelines import TextToImage
 
 # FlaxDiff 0.2's DiTs held these at their root; Dew nests them under the
@@ -219,8 +220,9 @@ def text_to_image(directory: str | os.PathLike, config: Mapping[str, object], *,
 
     The text tower and the VAE load from the Hub under the names the config
     records, both computing in bfloat16 as FlaxDiff's did. A call samples the
-    way FlaxDiff's trainer previewed the run: Euler ancestral over 200 steps
-    of the Karras grid, classifier-free guidance 3.
+    way FlaxDiff's trainer previewed the run: Euler ancestral with
+    classifier-free guidance 3 over FlaxDiff's own grid of the Karras
+    schedule, 200 steps unless the call names another count.
     """
     from dew.diffusion.presets import EDM
     from dew.inputs import Field, InputSpec
@@ -268,5 +270,14 @@ def text_to_image(directory: str | os.PathLike, config: Mapping[str, object], *,
 
     inputs = InputSpec(sample=Field("image", (height, width, channels)), conditions={keyword: condition})
     params = {**variables, "encoders": {keyword: encoder.params}, "autoencoder": vae.params}
-    return TextToImage(model, EDM(regime="latent")(), inputs, params, vae, steps=200, guidance=CFG(3.0),
-                       solver=EulerAncestral())
+    process = EDM(regime="latent")()
+
+    def grid(steps: int) -> tuple[Process, jax.Array]:
+        # FlaxDiff's `get_steps(1000, 0, steps)` truncates an evenly spaced
+        # per-mille grid to int16 and `scale_steps` maps it back onto the
+        # schedule's [0, 1], so its times sit up to a thousandth below an
+        # even ramp's.
+        return process, jnp.linspace(0, 1000, steps, dtype=jnp.int16)[::-1] * (1 / 1000)
+
+    return TextToImage(model, process, inputs, params, vae, steps=200, guidance=CFG(3.0),
+                       solver=EulerAncestral(), grid=grid)
