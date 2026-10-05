@@ -851,7 +851,8 @@ def test_an_export_carries_the_tokenizer_it_names(tmp_path):
     tokenizer_config.json beside the weights, and a `tokenizer_name` string
     is not a tokenizer. The name is resolved through the loader a training
     run uses, from local files only, so an export copies what the host
-    already has and reaches nothing.
+    already has and reaches nothing; the files are the whole record, and
+    the name, a path on this machine, is written nowhere.
     """
     from transformers import AutoTokenizer
 
@@ -865,8 +866,69 @@ def test_an_export_carries_the_tokenizer_it_names(tmp_path):
     expected = AutoTokenizer.from_pretrained(str(TOKENIZER), local_files_only=True)
     assert written.get_vocab() == expected.get_vocab()
     assert written.encode("The trainer") == expected.encode("The trainer")
-    assert json.loads((export / "generation_config.json").read_text()
-                      )['tokenizer_name'] == str(TOKENIZER)
+    assert "tokenizer_name" not in json.loads((export / "generation_config.json").read_text())
+
+
+def test_an_export_with_a_local_tokenizer_is_the_directory_alone(tmp_path):
+    """The tokenizer is named by a path that is gone once the export is
+    written, as it is on any other machine. No file of the export holds
+    that path, and no JSON string is an absolute path of two or more parts
+    (a vocabulary's "/" is a token, not a path); a re-export of a source whose
+    generation config carried a `tokenizer_name` path drops it, and a
+    fresh process loads the export's tokenizer from the directory alone,
+    as transformers' AutoTokenizer does and as `Pretrained.load` does."""
+    import shutil
+
+    from transformers import AutoTokenizer
+
+    model, variables = fp32_decoder(FIXTURES / "llama-tiny")
+    source = tmp_path / "elsewhere" / "tokenizer"
+    shutil.copytree(TOKENIZER, source)
+    export = tmp_path / "export"
+    PretrainedDecoder.from_model(model, variables, tokenizer=str(source)).save(export)
+    shutil.rmtree(tmp_path / "elsewhere")
+
+    def strings(value):
+        if isinstance(value, str):
+            yield value
+        elif isinstance(value, dict):
+            for key, item in value.items():
+                yield key
+                yield from strings(item)
+        elif isinstance(value, list):
+            for item in value:
+                yield from strings(item)
+
+    def assert_portable(directory):
+        for path in directory.iterdir():
+            assert str(tmp_path).encode() not in path.read_bytes(), path.name
+            if path.suffix == ".json":
+                absolute = [text for text in strings(json.loads(path.read_text()))
+                            if os.path.isabs(text) and len(Path(text).parts) > 2]
+                assert absolute == [], (path.name, absolute)
+
+    assert_portable(export)
+    generation = json.loads((export / "generation_config.json").read_text())
+    (export / "generation_config.json").write_text(json.dumps({**generation, "tokenizer_name": str(source)}))
+    again = tmp_path / "again"
+    Pretrained.load(export, dtype="float32", attention_impl="reference").save(again)
+    assert_portable(again)
+
+    expected = AutoTokenizer.from_pretrained(str(TOKENIZER), local_files_only=True).encode("The trainer")
+    probe = (
+        "import sys, json, numpy as np\n"
+        "from transformers import AutoTokenizer\n"
+        "from dew.interop import Pretrained\n"
+        "export = sys.argv[1]\n"
+        "ids = AutoTokenizer.from_pretrained(export, local_files_only=True).encode('The trainer')\n"
+        "bundle = Pretrained.load(export, dtype='float32', attention_impl='reference')\n"
+        "print(json.dumps({'ids': ids, 'processor': bundle.processor is not None,\n"
+        "                  'decoded': bundle.processor.decode(np.asarray([ids]))[0]}))\n")
+    result = subprocess.run([sys.executable, "-c", probe, str(again)], capture_output=True, text=True,
+                            env={**os.environ, "HF_HUB_OFFLINE": "1"}, check=True)
+    loaded = json.loads(result.stdout.strip().splitlines()[-1])
+    assert loaded["ids"] == expected and loaded["processor"]
+    assert "The trainer" in loaded["decoded"]
 
 
 def test_a_tokenizer_object_is_exported_without_being_named(tmp_path):
