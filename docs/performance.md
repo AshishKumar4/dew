@@ -963,6 +963,75 @@ arrays, which have no validity field.
 I did not rerun the head-chunk and head-dimension-256 cases, because this
 change does not touch them.
 
+## fp32 attention on the CPU, 2026-10-05
+
+On XLA:CPU, `jax.nn.dot_product_attention`'s xla path rounded fp32
+attention further from float64 than torch's SDPA does. Wan's walk measured
+2.07 times torch's distance at its 512 text keys. The probability-value
+product causes it. YNNPACK, XLA:CPU's dot library in the pinned jax, sums
+a contraction of up to about 1024 terms in one chain. Torch's CPU GEMM and
+Eigen sum it in shorter blocks. Replacing each stage in turn with its
+float64 value isolated the product: an exact product removed four fifths
+of the error, while exact logits or probabilities changed nothing.
+
+Over 512 to 8192 keys, an fp32 call on the CPU now takes the reference
+path whenever it has more than `VALUE_BLOCK` (256) keys
+(`_xla_kernel_chains`). That path's `weighted_values` sums the product over
+each block of 256 keys separately and then sums the blocks. Its gradients
+are the plain product's, and neither of them sums over keys. Calls with 256
+keys or fewer, bf16 calls and GPU and TPU calls compute exactly as before.
+The inputs were cross-attention-like: 128 queries, 2 heads of width 128,
+and logits with standard deviation 0.36. Torch's math and flash backends
+measured the same distance.
+
+| keys | torch SDPA, RMS from float64 | jax.nn xla (before) | blocks of 256 | blocks of 128 | Eigen dots |
+|---:|---:|---:|---:|---:|---:|
+| 512 | 1.46e-8 | 1.34x | 0.98x | 0.76x | 0.69x |
+| 2048 | 7.62e-9 | 1.75x | 0.96x | 0.74x | 0.74x |
+| 8192 | 4.26e-9 | 1.63x | 0.87x | 0.66x | 0.73x |
+
+Times are from one process on two pinned threads of an i9-12900K, with
+the paths interleaved. The table gives the minimum of seven runs on a
+loaded shared host:
+
+| call (fp32, heads 128 wide) | forward before / after, ms | forward + backward before / after, ms |
+|---|---:|---:|
+| cross, 2048 queries x 512 keys, 12 heads | 78.1 / 83.1 | 225.7 / 236.6 |
+| cross, 4096 queries x 512 keys, 12 heads | 146.9 / 151.8 | 442.2 / 433.7 |
+| causal GQA 16/8 heads, 1024 | 105.9 / 115.9 | 372.8 / 383.9 |
+| causal GQA 16/8 heads, 2048 | 446.1 / 419.1 | 2075.8 / 1735.6 |
+
+Writing each block's partial product before the sum leaves a small cost
+in the forward. This run measured +3% to +9% at 512 to 1024 keys. A second
+sweep, on two other pinned threads, measured -5% to +12% on the minimum and
+-9% to +5% on the median. Run to run noise here is about 10%, so the cost
+is near that noise but not shown to be zero. It was kept for the
+accuracy. A training step's attention runs within 5% of its old time, and
+the 2048-token causal step is 16% faster because the reference path's
+backward is.
+
+The landing page's live sampler attends over at most 256 keys, so it is
+unchanged. Its 17 compiled programs are the same apart from source
+locations, so its time is the same too, and its image's sha256 is the
+same before and after (`d9ce11b0`).
+
+The sweep covered three block sizes and three ways to sum the blocks. It
+kept the cheapest one that brings 512 keys, Wan's case, within the rule:
+
+- Blocks of 512 or 1024 keys leave a 512-key call as it was (1.34x torch).
+  At 1024, every length rounds as before, because YNNPACK's chain is about
+  that long.
+- The blocks' sum as the last axis of one product (kept) was faster than
+  the same sum over a leading axis and than a loop of per-block products,
+  which cost 10-30% more.
+- Blocks of 128 keys round closer to float64 (0.66-0.76x torch), but they
+  double the partial products, and their forward cost up to 18% more.
+- Turning YNNPACK's dots off with
+  `--xla_cpu_experimental_ynn_fusion_type=-individual_dot` gives every CPU
+  dot Eigen's blocks. On two threads, Eigen ran the 176M hybrid DiT's MLP
+  shapes (512 x 768 x 3072) 12% slower. It would also change every CPU
+  result, including the live sampler's image.
+
 ## XLA flags
 
 `TrainerConfig.xla_flags` appends to `XLA_FLAGS`, and `prepare_process`
