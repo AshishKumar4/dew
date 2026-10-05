@@ -22,7 +22,8 @@ class Comparison(ctypes.Structure):
 def install(cpu_seconds=10):
     resource.setrlimit(resource.RLIMIT_AS, (MEMORY_BYTES, MEMORY_BYTES))
     resource.setrlimit(resource.RLIMIT_FSIZE, (32 * 1024 * 1024, 32 * 1024 * 1024))
-    resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
+    # Stock ipykernel creates more than 64 descriptors while starting its shell channels.
+    resource.setrlimit(resource.RLIMIT_NOFILE, (128, 128))
     resource.setrlimit(resource.RLIMIT_NPROC, (32, 32))
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds + 1))

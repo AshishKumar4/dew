@@ -71,7 +71,14 @@ def main():
             rows = []
             for index in indices:
                 started = time.perf_counter()
-                msg = client.execute("import os\nprint(os.getuid())", allow_stdin=False)
+                msg = client.execute(
+                    "import json, os\nfrom pathlib import Path\n"
+                    "pss = next(line for line in Path('/proc/self/smaps_rollup').read_text().splitlines() "
+                    "if line.startswith('Pss:'))\n"
+                    "print(json.dumps({'uid': os.getuid(), 'fds': len(os.listdir('/proc/self/fd')), "
+                    "'pss_bytes': int(pss.split()[1]) * 1024}))",
+                    allow_stdin=False,
+                )
                 stdout = ""
                 while True:
                     result = client.get_iopub_msg(timeout=30)
@@ -83,29 +90,22 @@ def main():
                         raise RuntimeError(str(result["content"]))
                     if result["msg_type"] == "status" and result["content"]["execution_state"] == "idle":
                         break
-                assert int(stdout.strip()) >= 6100
+                usage = json.loads(stdout)
+                assert usage['uid'] >= 6100
                 rows.append({"visitor": index, "execute_seconds": time.perf_counter() - started,
                              "arrival_to_result_seconds": time.perf_counter() - submitted,
-                             "uid": int(stdout)})
+                             "uid": usage["uid"], "fds": usage["fds"],
+                             "pss_bytes": usage["pss_bytes"]})
             return rows
 
         with concurrent.futures.ThreadPoolExecutor(len(kernels)) as pool:
             futures = [pool.submit(run, kernel, range(index, args.count, len(kernels)))
                        for index, kernel in enumerate(kernels)]
             rows = [row for future in futures for row in future.result()]
-        memory = {}
-        for proc in pathlib.Path("/proc").glob("[0-9]*"):
-            try:
-                status = (proc / "status").read_text().splitlines()
-                uid = int(next(line for line in status if line.startswith("Uid:")).split()[1])
-                if 6100 <= uid < 6200:
-                    rollup = (proc / "smaps_rollup").read_text().splitlines()
-                    pss = int(next(line for line in rollup if line.startswith("Pss:")).split()[1]) * 1024
-                    memory[uid] = memory.get(uid, 0) + pss
-            except (OSError, StopIteration):
-                pass
+        memory = {row["uid"]: row["pss_bytes"] for row in rows}
         print(json.dumps({"visitors": args.count, "contexts": len(kernels),
                           "startup_seconds": [kernel[2] for kernel in kernels], "kernel_pss_bytes": memory,
+                          "kernel_fd_counts": {row["uid"]: row["fds"] for row in rows},
                           "median_execute_seconds": statistics.median(row["execute_seconds"] for row in rows),
                           "arrival_to_result_seconds": [row["arrival_to_result_seconds"] for row in rows]}),
               flush=True)
