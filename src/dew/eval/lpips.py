@@ -26,6 +26,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import os
+import secrets
 import urllib.request
 from pathlib import Path
 
@@ -111,11 +112,18 @@ def _fetched(url: str, digest: str) -> Path:
     path = Path(dew_cache_dir()) / "lpips" / url.rsplit("/", 1)[-1]
     if not path.is_file():
         path.parent.mkdir(parents=True, exist_ok=True)
-        partial = path.with_suffix(".partial")
-        with urllib.request.urlopen(url) as response, open(partial, "wb") as handle:
-            while chunk := response.read(1 << 20):
-                handle.write(chunk)
-        os.replace(partial, path)
+        # A name of this download's own, created exclusively with the
+        # umask's mode as the cached file keeps, so processes sharing the
+        # cache each write their own file and the last rename leaves a whole one.
+        partial = path.parent / f".{path.name}.{secrets.token_hex(8)}.partial"
+        descriptor = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        try:
+            with urllib.request.urlopen(url) as response, os.fdopen(descriptor, "wb") as output:
+                while chunk := response.read(1 << 20):
+                    output.write(chunk)
+            os.replace(partial, path)
+        finally:
+            partial.unlink(missing_ok=True)
     with open(path, "rb") as handle:
         found = hashlib.file_digest(handle, "sha256").hexdigest()
     if found != digest:

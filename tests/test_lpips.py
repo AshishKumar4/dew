@@ -39,10 +39,15 @@ def drawn_weights(seed: int = 0) -> tuple[dict[str, np.ndarray], dict[str, np.nd
 def test_the_distance_and_its_gradient_are_repa_es():
     """On weights both sides draw (their per-tensor sums are the fixture's),
     converted by the same `variables_from_torch` the published weights go
-    through: each pair's distance is within 1e-5 of REPA-E's float64 run,
+    through: each pair's distance is within 1e-6 of REPA-E's float64 run,
     and the gradient of their mean in the first image, what the perceptual
     loss trains an autoencoder by, is held to it by the float64 rule over
-    24,576 entries."""
+    24,576 entries.
+
+    Two distances are too few for the rule's RMS, so they take a bound:
+    Dew's are 5.7e-8 and 4.4e-8 relative from float64, the reference's own
+    float32 1.3e-7 and 3.0e-8, and a wrong shift or scale digit or a dropped
+    stage moves a distance by 1e-3 or more."""
     reference = dict(np.load(FIXTURES / "drawn.npz"))
     vgg, linear = drawn_weights()
     for key, value in {**vgg, **linear}.items():
@@ -56,7 +61,7 @@ def test_the_distance_and_its_gradient_are_repa_es():
 
     distance = network.apply(variables, images, references)
     gradient = jax.grad(mean)(images)
-    np.testing.assert_allclose(np.asarray(distance), reference["distance_f64"], rtol=1e-5)
+    np.testing.assert_allclose(np.asarray(distance), reference["distance_f64"], rtol=1e-6)
     assert_as_exact_as_the_reference(gradient, reference["gradient"], reference["gradient_f64"],
                                      "the gradient")
 
@@ -64,13 +69,15 @@ def test_the_distance_and_its_gradient_are_repa_es():
 @pytest.mark.network
 def test_the_published_network_measures_as_repa_es():
     """The published weights, downloaded, checked and converted on first use:
-    four pairs' distances within 1e-5 of REPA-E's float64 run on the same
+    four pairs' distances within 1e-6 of REPA-E's float64 run on the same
     files, and the `LPIPS` metric over an image grid is their mean, the
-    batch holding the references as pixels in [0, 255] as a loader does."""
+    batch holding the references as pixels in [0, 255] as a loader does.
+    Dew's distances are at most 2.5e-7 relative from float64, the
+    reference's own float32 at most 1.9e-7."""
     reference = dict(np.load(FIXTURES / "published.npz"))
     network, variables = LPIPSNetwork.published()
     images, references = (jnp.asarray(reference[key], jnp.float32) for key in ("images", "references"))
     distance = network.apply(variables, images, references)
-    np.testing.assert_allclose(np.asarray(distance), reference["distance_f64"], rtol=1e-5)
+    np.testing.assert_allclose(np.asarray(distance), reference["distance_f64"], rtol=1e-6)
     total, count = LPIPS()(ImageGrid(images=images), {"image": reference["references"] * 127.5 + 127.5})
-    np.testing.assert_allclose(total / count, reference["distance_f64"].mean(), rtol=1e-5)
+    np.testing.assert_allclose(total / count, reference["distance_f64"].mean(), rtol=1e-6)
