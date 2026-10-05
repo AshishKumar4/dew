@@ -14,6 +14,11 @@ Run it in its own environment, never the project's:
     PYTHONPATH=. ~/.cache/dew/reference-venvs/deepseek-v41/bin/python \
         tools/deepseek_v41_reference.py [--search N | --kernels | --vision | --fp64]
 
+    PYTHONPATH=src python tools/rounding_orders.py \
+        tests/fixtures/hf/deepseek-v41-tiny <drawn> 52 0
+    PYTHONPATH=. ~/.cache/dew/reference-venvs/deepseek-v41/bin/python \
+        tools/deepseek_v41_reference.py orders <drawn>
+
 `--kernels` runs the release's tilelang kernels on a CUDA GPU and writes
 kernels.npz beside the fixture (`write_kernels`), which the suite holds Dew's
 quantizers and the stand-ins to. `--search N` ranks N seeds from `--seed` by
@@ -600,7 +605,8 @@ def widened(model_module):
         return torch.float64 if dtype == torch.float32 else dtype
 
     torch.Tensor.float = lambda self, *args, **kwargs: self.double()
-    torch.zeros_like = lambda x, *args, dtype=None, **kwargs: zeros_like(x, *args, dtype=wide(dtype), **kwargs)
+    torch.zeros_like = lambda x, *args, dtype=None, **kwargs: zeros_like(
+        x, *args, dtype=wide(dtype), **kwargs)
     torch.Tensor.new_zeros = lambda self, *size, dtype=None, **kwargs: new_zeros(
         self, *size, dtype=wide(dtype), **kwargs)
     torch.arange = lambda *args, dtype=None, **kwargs: arange(*args, dtype=wide(dtype), **kwargs)
@@ -627,7 +633,8 @@ def widened_outputs(seed: int) -> dict[str, np.ndarray]:
     model_module, engram_module = import_reference()
     install_selection_probe()
     args = model_args(model_module, engram_module)
-    ids = torch.randint(3, args.vocab_size - 1, (2, LENGTH), generator=torch.Generator().manual_seed(seed + 1))
+    ids = torch.randint(3, args.vocab_size - 1, (2, LENGTH),
+                        generator=torch.Generator().manual_seed(seed + 1))
     outputs: dict[str, np.ndarray] = {}
     with widened(model_module):
         net = build(model_module, engram_module, args, seed, widen=True)
@@ -664,6 +671,57 @@ def write_truth(seed: int):
         raise SystemExit(f"the float64 run decides otherwise than seed {seed}'s fixture")
     np.savez(FIXTURE / "reference_f64.npz", **{name: value for name, value in truth.items()
                                                if not name.endswith(("_out", "_picks", "draft_ids"))})
+
+
+def orders(drawn: Path, seed: int):
+    """The plain SGD step under every residual order from rounding_orders.py.
+
+    Order zero reproduces the shipped updated logits bit for bit. Every
+    float64 step must compute the identity's truth within 1e-12 of its RMS
+    scale before its fp32 distance counts. The release's discrete selections
+    must also agree with their float64 twins, as the fixture's own do.
+    """
+    from safetensors.torch import load_file
+
+    model_module, engram_module = import_reference()
+    install_selection_probe()
+    set_quantizers(model_module, enabled=False)
+    args = model_args(model_module, engram_module)
+    net = build(model_module, engram_module, args, seed)
+    with widened(model_module):
+        twin = build(model_module, engram_module, args, seed, widen=True)
+    stored = np.load(FIXTURE / "reference.npz")
+    truth = np.load(FIXTURE / "reference_f64.npz")["updated_logits"]
+    ids = torch.from_numpy(stored["input_ids"].astype(np.int64))
+    drawn_orders = np.load(drawn / "orders.npy")
+    distances = []
+
+    def step(model, weights):
+        with torch.no_grad():
+            for name, parameter in model.named_parameters():
+                if not name.endswith("engram.embed.scale"):
+                    parameter.copy_(weights[name].to(parameter))
+        captured = Record()
+        RECORDS[:] = [captured]
+        _, _, gradient = trained(model, ids)
+        logits = stepped(model, gradient, ids)
+        RECORDS.clear()
+        return logits, captured.arrays("")["selection_picks"]
+
+    for k in range(len(drawn_orders)):
+        weights = load_file(str(drawn / str(k) / "model.safetensors"))
+        logits, picks = step(net, weights)
+        with widened(model_module):
+            exact, exact_picks = step(twin, weights)
+        assert np.array_equal(picks, exact_picks), f"order {k} selects otherwise than float64"
+        error = np.sqrt(np.mean(np.square(exact - truth)))
+        assert error <= 1e-12 * np.sqrt(np.mean(np.square(truth))), f"order {k} changes float64"
+        if k == 0:
+            assert np.array_equal(logits, stored["updated_logits"]), "order 0 must reproduce the fixture"
+        distances.append(np.sqrt(np.mean(np.square(logits.astype(np.float64) - truth))))
+    np.savez(FIXTURE / "orders.npz", orders=drawn_orders.astype(np.min_scalar_type(drawn_orders.max())),
+             updated_logits=np.asarray(distances))
+    print("orders", len(distances), "distances", np.round(np.asarray(distances) / distances[0], 2))
 
 
 def official_kernels():
@@ -836,7 +894,8 @@ def vision_outputs(model_module, engram_module, seed: int, widen: bool = False):
     generator = torch.Generator().manual_seed(seed + 3)
     patch = args.vision_patch_size
     pixels = torch.randn(3, GRID[0] * patch, GRID[1] * patch, generator=generator, dtype=torch.float32)
-    patches = pixels.reshape(3, GRID[0], patch, GRID[1], patch).permute(1, 3, 0, 2, 4).reshape(-1, 3, patch, patch)
+    patches = (pixels.reshape(3, GRID[0], patch, GRID[1], patch).permute(1, 3, 0, 2, 4)
+               .reshape(-1, 3, patch, patch))
     ratio = args.vision_downsample_ratio
     types = processor.image_token_types(-(-GRID[0] // ratio), -(-GRID[1] // ratio))
     text = torch.randint(3, IMAGE_TOKEN_ID, (1, LENGTH - types.numel()), generator=generator)
@@ -910,6 +969,8 @@ def write(seed: int):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("mode", nargs="?", choices=("orders",))
+    parser.add_argument("drawn", nargs="?", type=Path)
     parser.add_argument("--search", type=int, default=0, help="rank this many seeds")
     parser.add_argument("--seed", type=int, default=SEED, help="the fixture's seed, or the first searched")
     parser.add_argument("--kernels", action="store_true",
@@ -921,7 +982,11 @@ def main():
     # One thread keeps every reduction in one order, so a rerun writes the
     # same bits.
     torch.set_num_threads(1)
-    if options.kernels:
+    if options.mode == "orders":
+        if options.drawn is None:
+            parser.error("orders needs the directory written by tools/rounding_orders.py")
+        orders(options.drawn, options.seed)
+    elif options.kernels:
         write_kernels()
     elif options.fp64:
         write_truth(options.seed)
