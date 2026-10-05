@@ -569,7 +569,7 @@ class Objective(ABC, Generic[Loss, Effects]):
         custom research method can still restore its raw state.
         """
 
-    def pipeline(self, state: TrainState, *, ema: bool | None = None) -> Task:
+    def pipeline(self, state: TrainState, *, ema: bool | None = None) -> Task | SavedTask:
         """Return the trained model as its inference task, over `state`'s weights.
 
         With `ema` None, the task uses `state.averaged` when the objective
@@ -578,7 +578,9 @@ class Objective(ABC, Generic[Loss, Effects]):
         selects the live parameters. An objective with a reference policy
         returns the trained policy, never the frozen reference its loss
         compares against. The arrays keep their placement. Objectives
-        without a generation task raise `TypeError`.
+        without a generation task raise `TypeError`. A plugin objective
+        returns its own `saved_task` class, which is why the type is open to
+        `SavedTask` beside dew's tasks.
         """
         raise TypeError(f"{type(self).__name__} has no inference task")
 
