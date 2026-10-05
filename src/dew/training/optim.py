@@ -652,9 +652,9 @@ class PowerTail:
 @schedules("power")
 @dataclasses.dataclass(frozen=True)
 class Power(ScheduleBase):
-    """lm-engine's power schedule (`power_schedule`).
+    """lm-engine's power schedule (`power_schedule`), a power law of the step after a linear warmup.
 
-    After a warmup, the rate is min(peak, a * (step * c) ** b). With a
+    After the warmup, the rate is min(peak, a * (step * c) ** b). With a
     `tail`, a linear decay follows the power law, as in the last 29% of
     Rigel's run. lm-engine's examples set `a` to 4 * batch size and `c` to
     the tokens per step.
@@ -679,7 +679,7 @@ class Power(ScheduleBase):
 @schedules("linear")
 @dataclasses.dataclass(frozen=True)
 class Linear(ScheduleBase):
-    """lm-engine's linear schedule (`linear_schedule`).
+    """lm-engine's linear schedule (`linear_schedule`), with a warmup, a constant rate and a linear decay.
 
     The rate warms up from zero to `peak`, stays constant until
     `decay_start` (the end of the warmup when None), then falls linearly to

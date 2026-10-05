@@ -82,7 +82,7 @@ def prepare_process(wandb: Wandb | None = None,
     `layout` is the same `Layout` you pass to `Trainer`. When its `host`
     includes "variables", the master copy of the whole train state is kept
     on the CPU and the optimizer update runs there, so this call checks the
-    CPU devices that needs.
+    CPU devices that this requires.
     JAX_PLATFORMS must then allow CPU beside the accelerator, and
     JAX_NUM_CPU_DEVICES or the existing XLA flags must give one CPU device
     per local accelerator before this call. The check raises `ValueError`
@@ -292,10 +292,10 @@ class PreemptionNotice:
     that every process agrees on, so the checkpoint written there is
     complete. A process outside any pool has no such service, so the notice
     is SIGTERM itself, which this object catches until `close`. Only the main
-    thread can set a signal handler, so outside a pool, on another thread,
-    SIGTERM keeps its default effect. A pool with the preemption service
-    turned off (jax_enable_preemption_service) gets no notice, and SIGTERM
-    ends it as usual.
+    thread can set a signal handler, so a notice created on another thread
+    outside a pool leaves SIGTERM's default effect. A pool with the
+    preemption service turned off (jax_enable_preemption_service) gets no
+    notice, and SIGTERM ends it as usual.
     """
 
     def __init__(self):
