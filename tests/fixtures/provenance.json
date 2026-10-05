@@ -263,6 +263,22 @@
    ],
    "note": "Brownian records call the upstream scheduler's torchsde-backed sampler (torchsde 0.2.6 documented at tool:28)."
   },
+  "diffusers_handoff.npz": {
+   "tool": "tools/diffusers_handoff_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/diffusers",
+     "version": "0.34.0",
+     "runs": "diffusers"
+    },
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.16.1",
+     "runs": "transformers"
+    }
+   ],
+   "note": "Over tiny_diffusers.tar.xz's xl (PyTorch twins: UNet, VAE, both CLIP towers, DDIM) and refiner: StableDiffusionXLPipeline with denoising_end=0.5 to latents, then StableDiffusionXLImg2ImgPipeline with denoising_start=0.5 from them, 'cat' against 'dog' at guidance 3, four steps, from xl's reference noise; float32 and float64 (models via diffusers_wan_reference.float64, DDIM tables via float64_scheduler). Torch 2.14.0+cpu."
+  },
   "diffusers_pipeline_schedulers.npz": {
    "tool": "tools/diffusers_scheduler_pipeline_reference.py",
    "sources": [
