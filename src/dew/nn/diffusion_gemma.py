@@ -139,6 +139,10 @@ class DiffusionGemma(nn.Module):
         which `setup` holds causal."""
         return self.text.causal
 
+    @property
+    def mask_token_id(self) -> int | None:
+        return self.text.mask_token_id
+
     def with_trainable_layer_scalars(self) -> DiffusionGemma:
         """Return this model with its layer scalars as parameters, the model the published SFT trains.
 

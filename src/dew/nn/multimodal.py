@@ -225,6 +225,10 @@ class MultimodalTransformer(nn.Module):
         return self.language_model.causal
 
     @property
+    def mask_token_id(self) -> int | None:
+        return self.language_model.mask_token_id
+
+    @property
     def num_nextn_predict_layers(self) -> int:
         return self.language_model.num_nextn_predict_layers
 
