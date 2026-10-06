@@ -15,6 +15,7 @@ from flax.typing import Dtype, PrecisionLike
 from dew import records
 from dew._model_types import _QWEN35_VISION_TYPES
 from dew.interop.weights import checkpoint_array, translate_parameters
+from dew.nn.activations import gelu_exact
 from dew.nn.attention import LayerNorm, scaled_dot_product_attention
 from dew.nn.precision import at_least_fp32
 from dew.nn.text_encoders import MLP
@@ -257,7 +258,7 @@ class Qwen35ProjectorModule(nn.Module):
                 f"{count} patch features do not group into "
                 f"{self.spatial_merge_size}x{self.spatial_merge_size} merge blocks")
         grouped = self.norm(image_features).reshape(batch, count // block, grown)
-        return self.fc2(jax.nn.gelu(self.fc1(grouped), approximate=False))
+        return self.fc2(gelu_exact(self.fc1(grouped)))
 
 
 @projectors("qwen3_5")

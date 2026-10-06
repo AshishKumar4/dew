@@ -104,7 +104,7 @@ import jax
 import numpy as np
 from jax.sharding import Mesh
 
-from dew.artifacts import agreed
+from dew.coordination import agreed
 from dew.data.dataset import Batch, DataPartition, Dataset, tapped
 from dew.nn.inputs import local_rows, mesh_of
 from dew.objectives.base import Shown, Variables

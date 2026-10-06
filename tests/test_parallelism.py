@@ -15,6 +15,7 @@ import optax
 import pytest
 from flax import linen as nn
 from jax.sharding import PartitionSpec as P
+from recording import RecordingTracker
 from sharded import assert_sharded
 
 from dew.artifacts import Representations
@@ -107,21 +108,6 @@ def batches():
         yield batch
 
 
-class RecordingTracker:
-    def __init__(self):
-        self.scalars = []
-        self.artifacts = []
-
-    def log(self, scalars, step):
-        self.scalars.append((step, dict(scalars)))
-
-    def artifact(self, value, step):
-        self.artifacts.append((step, value))
-
-    def losses(self):
-        return [s["train/loss"] for _, s in self.scalars if "train/loss" in s]
-
-
 def make_trainer(tmp_path=None, fsdp=1, optimizer=None, objective=None, tracker=None,
                  **kwargs):
     checkpoints = None if tmp_path is None else Checkpoints(str(tmp_path), keep=4)
@@ -144,7 +130,7 @@ def run_losses(steps, **kwargs):
     trainer = make_trainer(tracker=tracker, **kwargs)
     state = trainer.fit(Data(batches), steps=steps, log_every=1)
     assert_sharded(state.variables["params"], trainer.device_mesh)
-    return tracker.losses()
+    return [scalars["train/loss"] for _, scalars in tracker.scalars if "train/loss" in scalars]
 
 
 def reference_losses(trainer, steps):

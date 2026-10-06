@@ -25,7 +25,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
-from dew.artifacts import agreed, broadcast_from_process_zero, collective_host
+from dew.coordination import agreed, broadcast_from_process_zero, collective_host
 from dew.diffusion.presets import Preset
 from dew.diffusion.process import Process
 from dew.inputs import InputSpec

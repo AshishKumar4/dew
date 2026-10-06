@@ -21,7 +21,8 @@ def main() -> None:
                                    process_id=rank, local_device_ids=[0], initialization_timeout=30)
     import optax
 
-    from dew.artifacts import ImageGrid, collective_host
+    from dew.artifacts import ImageGrid
+    from dew.coordination import collective_host
     from dew.data import Dataset
     from dew.diffusion import FlowMatchingScheduler, FlowMatchPredictionTransform, Process
     from dew.inputs import CharTable, Condition, Field, InputSpec

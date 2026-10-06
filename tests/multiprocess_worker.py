@@ -654,7 +654,7 @@ def mode_profile_failure(args) -> dict:
     import optax
 
     import dew.telemetry.profile as telemetry_profile
-    from dew.artifacts import agree_process_phase
+    from dew.coordination import agree_process_phase
     from dew.training import ProfileWindow, Trainer
 
     # The optional XProf package is absent in the test environment; stubbing

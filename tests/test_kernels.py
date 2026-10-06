@@ -233,26 +233,22 @@ def test_single_query_cudnn_decode_matches_float64_attention_and_gradients(witho
             assert np.abs(got - want).max() <= 2 ** -6 * np.abs(want).max()
 
 
-def test_flags_are_appended_to_what_the_environment_already_carries(monkeypatch):
+@pytest.mark.parametrize("carried, flags, expected", [
+    ("--xla_force_host_platform_device_count=8", "--xla_gpu_autotune_level=4",
+     "--xla_force_host_platform_device_count=8 --xla_gpu_autotune_level=4"),
+    ("--xla_force_host_platform_device_count=8", None, "--xla_force_host_platform_device_count=8"),
+    ("--xla_force_host_platform_device_count=8", "", "--xla_force_host_platform_device_count=8"),
+    (None, "--xla_gpu_triton_gemm_any=true", "--xla_gpu_triton_gemm_any=true"),
+], ids=["appended", "none", "empty", "unset"])
+def test_flags_are_appended_to_what_the_environment_already_carries(monkeypatch, carried, flags, expected):
     """The test suite itself sets a flag, and a run's own flags have to add to
-    it, not replace it."""
-    monkeypatch.setenv("XLA_FLAGS", "--xla_force_host_platform_device_count=8")
-    apply_xla_flags("--xla_gpu_autotune_level=4")
-    assert os.environ["XLA_FLAGS"] == (
-        "--xla_force_host_platform_device_count=8 --xla_gpu_autotune_level=4")
-
-
-@pytest.mark.parametrize("flags", [None, ""])
-def test_no_flags_leaves_the_environment_alone(monkeypatch, flags):
-    monkeypatch.setenv("XLA_FLAGS", "--xla_force_host_platform_device_count=8")
-    apply_xla_flags(flags)
-    assert os.environ["XLA_FLAGS"] == "--xla_force_host_platform_device_count=8"
-
-
-def test_flags_reach_an_environment_that_had_none(monkeypatch):
+    it, not replace it. No flags leave it alone, and an environment that had
+    none takes them as given."""
     monkeypatch.delenv("XLA_FLAGS", raising=False)
-    apply_xla_flags("--xla_gpu_triton_gemm_any=true")
-    assert os.environ["XLA_FLAGS"] == "--xla_gpu_triton_gemm_any=true"
+    if carried is not None:
+        monkeypatch.setenv("XLA_FLAGS", carried)
+    apply_xla_flags(flags)
+    assert os.environ["XLA_FLAGS"] == expected
 
 
 @pytest.mark.parametrize("flags, value", [
