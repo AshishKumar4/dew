@@ -38,6 +38,7 @@ from .blocks import normal_kernel
 from .kernels.generation import device_generation, triton_runs
 from .kernels.grouped_matmul import grouped_projection, ragged_dot_runs, xla_ragged_dot
 from .precision import at_least_fp32, rounded_operand, rounded_to
+from .protocols import ProjectionGroup, declared_groups
 from .sharding import (
     EXPERT_AXIS,
     STAGE_AXIS,
@@ -1146,6 +1147,11 @@ class SparseMLP(nn.Module):
                 self.shared_expert_gate = nn.Dense(
                     1, use_bias=False, dtype=self.dtype, precision=self.precision,
                     name='shared_expert_gate', **normal_kernel(self.init_std))
+
+    def projection_groups(self) -> tuple[ProjectionGroup, ...]:
+        """The packed groups its shared branch declares (`ProjectionSites`);
+        the routed experts keep their stacked kernels."""
+        return () if self.shared is None else declared_groups(self.shared_experts)
 
     def __call__(self, x, tokens=None, media=None, routes: Routes | None = None):
         weights, indices = self.gate(x, tokens, media, routes)

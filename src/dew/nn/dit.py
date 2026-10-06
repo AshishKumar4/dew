@@ -12,12 +12,14 @@ sandwich; the model files arrange blocks.
 import inspect
 import math
 from collections.abc import Sequence
-from typing import Literal, TypedDict, Unpack
+from typing import Literal, Self, TypedDict, Unpack
 
 import jax
 import jax.numpy as jnp
 from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
+
+from dew.records import JSON
 
 from .activations import gelu_exact_torch, gelu_tanh
 from .attention import LayerNorm, NormalAttention
@@ -346,6 +348,35 @@ RematChoice = bool | Literal['dots', 'full']
 'dots' recomputes a block but keeps its matmul outputs and attention
 forward, 'full' recomputes the whole block from its inputs."""
 
+DIFFUSION_REMAT: tuple[RematChoice, ...] = (False, 'dots', 'full')
+"""What a diffusion stack recomputes in its backward pass when its step does
+not fit, weakest first; each rung is slower and holds less
+(docs/performance.md). A stack's own remat is where it starts, and it moves
+up one rung at a time (`recompute_more`)."""
+
+
+def _remat_rung(remat: JSON) -> int | None:
+    """`remat`'s rung on `DIFFUSION_REMAT`, True being 'dots', or None for a value off it."""
+    if remat is False:
+        return 0
+    if remat is True:
+        return 1
+    return DIFFUSION_REMAT.index(remat) if remat in ('dots', 'full') else None
+
+
+def stronger_remat(remat: RematChoice) -> RematChoice | None:
+    """The rung above `remat` on `DIFFUSION_REMAT`, or None at its top."""
+    rung = _remat_rung(remat)
+    return None if rung is None or rung + 1 == len(DIFFUSION_REMAT) else DIFFUSION_REMAT[rung + 1]
+
+
+def restored_remat(remat: RematChoice, record: JSON) -> RematChoice | None:
+    """`record`'s rung where it is above `remat`'s, or None to keep `remat`:
+    a resumed run compiles the rung its checkpoint trained on, never a
+    lighter one, and a record off the ladder moves nothing."""
+    here, there = _remat_rung(remat), _remat_rung(record)
+    return None if here is None or there is None or there <= here else DIFFUSION_REMAT[there]
+
 
 def remat_block(block_cls, enabled: RematChoice, policy: str | None = 'dots'):
     """Optionally rematerialize a block class under `saved_through_remat`.
@@ -431,6 +462,23 @@ class _DiTStackOptions(_AttentionStackOptions):
     num_heads: int = 12
     remat: RematChoice = False
     scan_order: Literal['raster', 'hilbert', 'zigzag'] = 'raster'
+
+    @nn.nowrap
+    def recompute_record(self) -> JSON:
+        """Its `remat` as a checkpoint's rung records it (`Recomputing`)."""
+        return self.remat
+
+    @nn.nowrap
+    def recompute_more(self) -> Self | None:
+        """This stack one rung up `DIFFUSION_REMAT`, or None at its top (`Recomputing`)."""
+        stronger = stronger_remat(self.remat)
+        return None if stronger is None else self.clone(remat=stronger)
+
+    @nn.nowrap
+    def restore_recompute(self, record: JSON) -> Self:
+        """This stack at `record`'s rung where that is above its own (`Recomputing`)."""
+        restored = restored_remat(self.remat, record)
+        return self if restored is None else self.clone(remat=restored)
 
 
 class _TokenStackOptions(_AttentionBlockOptions):

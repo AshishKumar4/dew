@@ -41,6 +41,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from dew.interop import sources
 from dew.interop.pickles import host_view
 from dew.interop.pretrained import AUTO, PretrainedFallback, _source_processor
+from dew.nn.protocols import OutputTable
 from dew.nn.sharding import LogicalAxes, logical_spec, parameter_path
 from dew.registry import resolve_dtype
 from dew.training.distributed import PARAMETER_AXES, Layout, Placement
@@ -198,7 +199,10 @@ class TorchCausalLM(nn.Module):
 
     `hidden_states` and `head_weight` are the pair `LMObjective` scores
     through, so the vocabulary-sized logits are never built whole. Only a
-    model whose logits are the plain head product has them (`TorchGraph`).
+    model whose logits are the plain head product has them (`TorchGraph`),
+    and only it has an `output_table`. The reads take plain token rows:
+    transformers' forward runs with no packing columns and no cache, so a
+    packing field is refused by name and there is no cached decode.
     """
 
     graph: TorchGraph
@@ -211,18 +215,26 @@ class TorchCausalLM(nn.Module):
     def bank_sites(self) -> tuple[DecoderBank, ...]:
         return ()
 
+    @property
+    def causal(self) -> bool:
+        """True: `load` builds the model with `AutoModelForCausalLM`, whose
+        architectures all predict each token from the ones before it."""
+        return True
+
     def __call__(self, tokens, train: bool = False) -> jax.Array:
         logits, _ = self._run(tokens)
         return logits.astype(jnp.float32)
 
     def hidden_states(self, tokens, train: bool = False, **packing) -> jax.Array:
         """The states the output head reads, `[B, S, features]`."""
-        if packing:
-            raise ValueError(
-                f"a torchax model runs transformers' forward over plain token rows, which "
-                f"takes no {sorted(packing)}; train it on unpacked rows without packing columns")
+        _refuse_packing(packing)
         _, hidden = self._run(tokens)
         return hidden
+
+    def logits(self, tokens, *, train: bool = False, **packing) -> jax.Array:
+        """The fp32 logits of the whole rows, as `__call__` returns them."""
+        _refuse_packing(packing)
+        return self(tokens, train=train)
 
     def head_weight(self, params) -> jax.Array:
         """The `[features, vocab]` output head, the transposed torch weight."""
@@ -232,6 +244,14 @@ class TorchCausalLM(nn.Module):
                 "bias, a scale or a cap), so LMObjective cannot score it in vocabulary chunks; "
                 "train it with a loss over model.apply's logits instead")
         return jnp.asarray(params[self.graph.head]).T
+
+    def output_table(self) -> OutputTable | None:
+        """The output head's `[vocab, features]` torch weight as the bound
+        params hold it, or None when the logits are not its plain product."""
+        if self.graph.head is None:
+            return None
+        return OutputTable(self.variables["params"][self.graph.head], vocab_major=True,
+                           precision=self.precision)
 
     def _run(self, tokens) -> tuple[jax.Array, jax.Array]:
         if self.is_initializing():
@@ -248,6 +268,15 @@ class TorchCausalLM(nn.Module):
         if self.dtype is None or not jnp.issubdtype(value.dtype, jnp.floating):
             return value
         return value.astype(self.dtype)
+
+
+def _refuse_packing(packing: Mapping[str, object]) -> None:
+    """Refuse every field past the tokens: transformers' forward takes whole
+    plain rows, with no packing columns and no cache."""
+    if packing:
+        raise ValueError(
+            f"a torchax model runs transformers' forward over whole plain token rows, with no cache, "
+            f"which takes no {sorted(packing)}; train it on unpacked rows without packing columns")
 
 
 def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtype: str,

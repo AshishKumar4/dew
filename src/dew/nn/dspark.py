@@ -35,6 +35,7 @@ from .attention import RMSNorm
 from .deepseek_v4 import DRAFT_CONTEXT, DRAFT_VALID
 from .hyper_connections import Carried, HyperConnections, HyperHead, collapse_by, expand_streams, first_stream
 from .precision import at_least_fp32
+from .protocols import ProjectionGroup
 from .sharding import logical_axes
 
 
@@ -114,6 +115,10 @@ class DSparkStage(nn.Module):
             if self.weighted_head is not None:
                 self.hc_head = HyperHead(spec=self.weighted_head, emb_features=self.emb_features,
                                          norm_eps=self.norm_eps, name='hc_head')
+
+    def projection_groups(self) -> tuple[ProjectionGroup, ...]:
+        """The packed groups its block declares (`ProjectionSites`)."""
+        return self.layer.projection_groups()
 
     def context(self, hidden):
         """The drafter's context off the concatenated target states (v41:1130)."""

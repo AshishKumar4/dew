@@ -6,16 +6,26 @@ block's output into its mirror in the second half.
 """
 
 from functools import partial
-from typing import Literal
+from typing import Literal, Self
 
 import jax.numpy as jnp
 from flax import linen as nn
 
+from dew.records import JSON
 from dew.registry import models
 
 from ..attention import LayerNorm
 from ..conv import Conv
-from ..dit import ROPE_THETA, ModulatedBlock, PatchEmbedding, RematChoice, _TransformerOptions, remat_block
+from ..dit import (
+    ROPE_THETA,
+    ModulatedBlock,
+    PatchEmbedding,
+    RematChoice,
+    _TransformerOptions,
+    remat_block,
+    restored_remat,
+    stronger_remat,
+)
 from ..precision import at_least_fp32
 from ..rope import rotary_freqs
 from ..scan_orders import hilbert_patchify, hilbert_unpatchify, unpatchify
@@ -164,6 +174,23 @@ class SimpleUDiT(_TransformerOptions):
     scan_order: Literal["raster", "hilbert"] = "raster"
     adaln_silu: bool = True
     text_pooling: Literal["real", "all"] = "real"
+
+    @nn.nowrap
+    def recompute_record(self) -> JSON:
+        """Its `remat` as a checkpoint's rung records it (`Recomputing`)."""
+        return self.remat
+
+    @nn.nowrap
+    def recompute_more(self) -> Self | None:
+        """This stack one rung up `DIFFUSION_REMAT`, or None at its top (`Recomputing`)."""
+        stronger = stronger_remat(self.remat)
+        return None if stronger is None else self.clone(remat=stronger)
+
+    @nn.nowrap
+    def restore_recompute(self, record: JSON) -> Self:
+        """This stack at `record`'s rung where that is above its own (`Recomputing`)."""
+        restored = restored_remat(self.remat, record)
+        return self if restored is None else self.clone(remat=restored)
 
     def setup(self):
         assert self.num_layers % 2 == 0, "num_layers must be even for U-Net structure"
