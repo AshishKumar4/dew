@@ -1412,6 +1412,8 @@ def _param_path(parts: list[str], config: Mapping[str, object]) -> tuple[str, ..
         return ('hc_head', parts[2])
     if parts == ['lm_head', 'weight']:
         return None if config['tie_embeddings'] else ('lm_head', 'kernel')
+    if parts == ['lm_head', 'bias']:
+        return ('lm_head', 'bias')
 
     if len(parts) >= 4 and parts[:2] == ['model', 'layers'] and parts[2].isdigit():
         path = _layer_param_path(parts, config)
@@ -2019,6 +2021,8 @@ def _hf_name(dew_name: str, config: Mapping[str, object]) -> str | None:
         return _TRUNK_NAMES[tuple(parts)]
     if parts == ['lm_head', 'kernel']:
         return None if config['tie_word_embeddings'] else 'lm_head.weight'
+    if parts == ['lm_head', 'bias']:
+        return 'lm_head.bias'
 
     if parts[0].startswith('layers_'):
         index = parts[0].removeprefix('layers_')
