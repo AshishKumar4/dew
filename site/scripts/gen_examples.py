@@ -19,10 +19,10 @@ SOURCE = "https://github.com/AshishKumar4/dew/blob/main/"
 
 GROUPS = [
     ("Train one model", ["readme_demo", "train_lm", "train_masked_lm", "train_flowers",
-                         "train_diffusion", "train_jepa"]),
+                         "train_diffusion", "train_jepa", "banking77_decisions"]),
     ("Run a whole job", ["train_flowers_tpu", "sft_gemma4", "sft_diffusion_gemma", "sft_diffusion_gemma_images",
                          "train_rlvr", "train_harbor", "evaluate_and_serve"]),
-    ("Sample and inspect", ["sample_text_to_image", "moe_mesh"]),
+    ("Sample and inspect", ["sample_text_to_image", "moe_mesh", "route_decisions"]),
 ]
 
 COMMAND = re.compile(r"^(python|JAX_PLATFORMS=|CUDA_VISIBLE_DEVICES=|uv |dew |XLA_FLAGS=)")

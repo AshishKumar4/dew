@@ -19,6 +19,8 @@ import pytest
 
 from dew.config import ModelConfig
 from dew.data import DataPartition, PreferencePairs, TFDSImages, TokenCorpus, TokenWindows
+from dew.data.text import ByteTokenizer
+from dew.decision import Choice, DecisionObjective, Example, Specials, StateFirstLayout
 from dew.diffusion.discrete import MDLM
 from dew.diffusion.presets import Flow, MeanFlow, Shortcut
 from dew.nn.backbones import CausalTransformer, SimpleDiT
@@ -132,6 +134,18 @@ def jepa():
     return objective, first(config.data)
 
 
+def decision():
+    """A decision head over a byte decoder, on a two-option question, and the
+    first batch its dataset lays out."""
+    team = Choice("Which team?", ["billing", "technical"])
+    examples = [Example(text, {"team": team}, {"team": label})
+                for text, label in (("charged twice", 0), ("site down", 1))] * 2
+    objective = DecisionObjective(decoder(), tokenizer=ByteTokenizer(),
+                                  specials=Specials(None, 10, 0, "\x00", 255),
+                                  layout=StateFirstLayout(max_len=32, head_max_len=24, option_tokens=6))
+    return objective, next(objective.dataset(examples, batch=2).train(DataPartition()))
+
+
 def cases(windows):
     """Per registered name, its objective and the first batch of the data its
     recipe trains on."""
@@ -171,6 +185,7 @@ def cases(windows):
         "rcm": lambda: with_teacher("rcm"),
         "guidance_distillation": lambda: with_teacher("guidance_distillation"),
         "jepa": jepa,
+        "decision": decision,
     }
 
 

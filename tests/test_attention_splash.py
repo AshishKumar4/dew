@@ -324,9 +324,9 @@ def exact_value_and_grads(query, key, value, sinks=None, live=None, causal=False
     """`value_and_grads`' output and gradients in float64, from attention
     written out here apart from every Dew path: the logits of query head h
     against key head h // (Hq // Hkv) over sqrt(D), capped `c tanh(l / c)`,
-    then the kept keys (k <= q, the window's w most recent, the explicit
-    mask, equal segment ids), a softmax whose denominator a sink joins, and
-    the values."""
+    then the kept keys (k <= q; a causal window's w most recent, or without
+    causality the keys within w - 1 of the query; the explicit mask; equal
+    segment ids), a softmax whose denominator a sink joins, and the values."""
     def attention(q, k, v, s):
         _, q_len, heads, width = q.shape
         k_len, kv_heads = k.shape[1], k.shape[2]
@@ -336,10 +336,10 @@ def exact_value_and_grads(query, key, value, sinks=None, live=None, causal=False
             logits = softcap * jnp.tanh(logits / softcap)
         rows, cols = np.arange(q_len)[:, None], np.arange(k_len)[None, :]
         keep = np.ones((1, 1, q_len, k_len), bool)
-        if causal or sliding_window is not None:
+        if causal:
             keep = keep & (cols <= rows)
         if sliding_window is not None:
-            keep = keep & (cols > rows - sliding_window)
+            keep = keep & (np.abs(cols - rows) < sliding_window)
         if mask is not None:
             keep = keep & np.asarray(mask, bool)
         if segment_ids is not None:
@@ -369,12 +369,14 @@ def exact_value_and_grads(query, key, value, sinks=None, live=None, causal=False
 ORACLE_CASES = {
     "full": ((2, 256, 4, 64), None, {}),
     "causal": ((2, 256, 4, 64), None, {"causal": True}),
-    "window": ((2, 256, 4, 64), None, {"sliding_window": 64}),
+    "window": ((2, 256, 4, 64), None, {"causal": True, "sliding_window": 64}),
+    "bidirectional-window": ((2, 256, 4, 64), None, {"sliding_window": 64}),
     "grouped": ((2, 256, 8, 64), (2, 256, 2, 64), {"causal": True}),
     "cross": ((2, 256, 4, 64), (2, 512, 4, 64), {}),
     "softcap": ((2, 256, 8, 64), (2, 256, 2, 64), {"causal": True, "softcap": 1.0}),
     "sinks": ((2, 256, 8, 64), (2, 256, 2, 64), {"causal": True, "sinks": True}),
-    "sinks-window": ((2, 256, 8, 64), (2, 256, 2, 64), {"sliding_window": 128, "sinks": True}),
+    "sinks-window": ((2, 256, 8, 64), (2, 256, 2, 64),
+                     {"causal": True, "sliding_window": 128, "sinks": True}),
     "mask": ((2, 256, 4, 64), None, {"causal": True, "mask": True}),
     "packed-window": ((2, 256, 4, 64), None, {"causal": True, "sliding_window": 64, "segment_ids": True}),
 }
@@ -467,8 +469,9 @@ def test_the_descriptor_stands_for_the_mask_the_other_paths_build(causal, slidin
     """`combined_attention_mask` is the array the reference and xla paths
     mask with. The descriptor never builds it, so this is the one place the
     two spellings meet: CausalMask against `k <= q`, LocalMask against the w
-    most recent keys, and a window that already implies causality rather than
-    sitting beside it."""
+    most recent keys, or without causality the keys within w - 1 either side,
+    and a causal window that already implies causality rather than sitting
+    beside it."""
     descriptor = splash_mask_descriptor(256, 256, 4, causal, sliding_window, None)
     expected = combined_attention_mask(256, 256, causal, sliding_window, None)
     if expected is None:

@@ -61,6 +61,10 @@ class MixerContext:
     kv_shared: bool = False
     kv_store_key: str | None = None
     sliding_window: int | None = None
+    bidirectional_window: bool = False
+    """Whether a non-causal layer keeps `sliding_window` on both sides of a
+    query (`LayerKind.bidirectional_window`); without it the window bounds
+    only a cached prefix and the layer otherwise reads its whole row."""
     attention_chunk: int | None = None
     """The kind's chunk: a query reads only the keys whose position shares
     its `position // attention_chunk` (`LayerKind.chunk`)."""

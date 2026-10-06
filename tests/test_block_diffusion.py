@@ -266,6 +266,25 @@ def test_the_released_layout_denoiser_matches_the_reference():
             np.testing.assert_array_equal(np.argmax(logits, -1), reference.argmax(-1))
 
 
+def test_a_sliding_denoiser_reads_its_whole_canvas_past_its_window():
+    """tools/hf_reference.py's diffusion-gemma-window-tiny: a sliding layer
+    of window 4 under a prompt of 6 and a canvas of 6. The decoder's sliding
+    layer reads the last 3 cached prompt keys and every canvas key
+    (modeling_diffusion_gemma.py:1399-1401), held to twice the fp32
+    reference's distance from float64."""
+    directory = FIXTURES / "diffusion-gemma-window-tiny"
+    config = {"model_type": "diffusion_gemma", "canvas_length": 6,
+              "text_config": json.loads((directory / "config.json").read_text())}
+    model = adapter.build(config, dtype="float32", attention_impl="xla")
+    variables = adapter.translate_weights(load_file(str(directory / "model.safetensors")), config)
+    cache = prefill(model, variables, np.load(directory / "prompt.npy"))
+    logits = model.apply({**variables, "cache": cache}, np.load(directory / "canvas.npy"))
+    reference = np.load(directory / "logits.npy")
+    assert_as_exact_as_the_reference(logits, reference, np.load(directory / "logits_f64.npy"),
+                                     "windowed canvas")
+    np.testing.assert_array_equal(np.argmax(logits, -1), reference.argmax(-1))
+
+
 def test_self_conditioning_matches_the_reference_implementation():
     """Independent self-conditioning fixture: observed fp32 error 1.1e-6."""
     directory = FIXTURES / "diffusion-gemma-sc-tiny"
