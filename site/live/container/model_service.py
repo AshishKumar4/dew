@@ -150,10 +150,11 @@ class NativeModels:
             image.save(buffer, format="PNG")
             encoded.append(base64.b64encode(buffer.getvalue()).decode())
         pixels = self.np.asarray(result.images)
-        if pixels.dtype.name not in ("float16", "float32", "float64"):
+        if pixels.dtype.name not in ("float16", "float32", "float64", "bfloat16"):
             raise ValueError("the live sampler cannot transport this pixel dtype exactly")
         return {"pngs": encoded, "pixels": base64.b64encode(pixels.tobytes()).decode(),
-                "shape": list(pixels.shape), "dtype": pixels.dtype.str}
+                "shape": list(pixels.shape),
+                "dtype": pixels.dtype.name if pixels.dtype.name == "bfloat16" else pixels.dtype.str}
 
     def text(self, requests):
         tickets = []
