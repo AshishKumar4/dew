@@ -27,13 +27,11 @@ denoises a canvas; its reads stand for its causal encoder's forward, which
 the DiffusionGemma tests below hold them to. Every other checkpoint is a
 decoder or a wrapper around one, and its call is its logits.
 
-Checkpoints that exercise the same code path prove nothing twice, so each
-check runs on the smallest checkpoint of each kind it can tell apart: the
-reads on each wrapper, token mixer and layer kind, expert routing, head
-(tied, transformed, biased) and attention direction a checkpoint declares;
-the gradients, cache capacity and packed projections on each wrapper and
-mixer set; the remat rungs, which every decoder climbs alike, on each
-wrapper. Every comparison is bitwise, the logits at both checkpoint dtypes,
+Checkpoints that take the same code path prove nothing twice, so each check
+runs on the smallest checkpoint of each path: each wrapper, set of token
+mixers and layer kinds, expert routing, head (tied, transformed, biased) and
+attention direction a checkpoint declares. Every comparison is bitwise, the
+logits at both checkpoint dtypes,
 because the read and the forward run the same operations on the same operands: the reads run
 eagerly, operation by operation, as the forward they are compared with does.
 Two programs compiled whole need not agree to the bit even then, since XLA
@@ -135,20 +133,16 @@ def _paths(name: str) -> tuple:
              bool(record.get("causal", True))))
 
 
-def _smallest_of_each(names, kind) -> list[str]:
-    """The smallest checkpoint of each `kind(_paths(name))`, in name order."""
+def _smallest_of_each(names) -> list[str]:
+    """The smallest checkpoint of each code path (`_paths`), in name order."""
     chosen: dict[object, str] = {}
     for name in sorted(names, key=lambda name: (FIXTURES / name / "model.safetensors").stat().st_size):
-        chosen.setdefault(kind(_paths(name)), name)
+        chosen.setdefault(_paths(name), name)
     return sorted(chosen.values())
 
 
-READ = _smallest_of_each(CHECKPOINTS, lambda paths: paths)
+PATHS = _smallest_of_each(CHECKPOINTS)
 """One checkpoint per wrapper, mixer and layer set, routing, head and direction."""
-MIXED = _smallest_of_each(CHECKPOINTS, lambda paths: paths[:2])
-"""One per wrapper and mixer set."""
-WRAPPED = _smallest_of_each(CHECKPOINTS, lambda paths: paths[0])
-"""One per wrapper."""
 
 
 @functools.cache
@@ -210,19 +204,19 @@ dtypes = pytest.mark.parametrize("dtype", DTYPES)
 
 
 @dtypes
-@pytest.mark.parametrize("name", [name for name in READ if name in DECODERS])
+@pytest.mark.parametrize("name", [name for name in PATHS if name in DECODERS])
 def test_logits_are_the_forwards(name, dtype):
     source, read = loaded(name, dtype), reads(name, dtype)
     same(read.logits, source.model.apply(source.variables, read.tokens))
 
 
-@pytest.mark.parametrize("name", READ)
+@pytest.mark.parametrize("name", PATHS)
 def test_the_head_over_the_hidden_states_is_the_logits(name, dtype="float32"):
     source, read = loaded(name, dtype), reads(name, dtype)
     same(source.model.apply(source.variables, read.hidden, method="logits_from_hidden"), read.logits)
 
 
-@pytest.mark.parametrize("name", READ)
+@pytest.mark.parametrize("name", PATHS)
 def test_the_head_a_loss_contracts_is_the_logits(name, dtype="float32"):
     """The table's product, bias and softcap included, at the table's
     precision; or, where the model gives no table, the exact head."""
@@ -231,7 +225,7 @@ def test_the_head_a_loss_contracts_is_the_logits(name, dtype="float32"):
          if read.table is None else contracted(read.hidden, read.table, source.variables), read.logits)
 
 
-@pytest.mark.parametrize("name", READ)
+@pytest.mark.parametrize("name", PATHS)
 def test_the_reads_write_no_cache_and_leave_an_allocated_one_alone(name, dtype="float32"):
     """With every collection mutable, neither read writes a `cache`. With a
     causal model's decode cache allocated beside the parameters (a
@@ -253,7 +247,7 @@ def test_the_reads_write_no_cache_and_leave_an_allocated_one_alone(name, dtype="
             same(beside, without)
 
 
-@pytest.mark.parametrize("name", [name for name in MIXED if name in DECODERS])
+@pytest.mark.parametrize("name", [name for name in PATHS if name in DECODERS])
 def test_gradients_through_the_logits_are_the_forwards(name, dtype="float32"):
     source, read = loaded(name, dtype), reads(name, dtype)
     model, variables = source.model, source.variables
@@ -502,7 +496,7 @@ def _decoding(name: str) -> dict:
     return {"method": "encode"} if name in OWN else {"decode": True}
 
 
-@pytest.mark.parametrize("name", MIXED)
+@pytest.mark.parametrize("name", PATHS)
 def test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it(name):
     """The resized model reads the same variables to the model's logits, and
     a causal one decodes into a cache of `CAPACITY` slots and draws the same
@@ -607,7 +601,7 @@ def _climbs_and_restores(model, variables, inputs, **apply) -> None:
         assert rung.apply(variables, *inputs, mutable=True, **apply)[1].keys() == written.keys()
 
 
-@pytest.mark.parametrize("name", WRAPPED)
+@pytest.mark.parametrize("name", PATHS)
 def test_a_checkpoints_remat_rungs_step_as_it_does(name):
     source, read = loaded(name), reads(name, "float32")
     _climbs_and_restores(source.model, source.variables, (read.tokens,), method="logits")
@@ -648,7 +642,7 @@ def _packed(variables, groups) -> dict:
     return {**variables, "params": unflatten_dict(params)}
 
 
-@pytest.mark.parametrize("name", [name for name in MIXED if name in DECODERS])
+@pytest.mark.parametrize("name", [name for name in PATHS if name in DECODERS])
 def test_packed_projections_serve_the_models_numbers(name):
     """Every group a decoder declares packs: the packed variables still
     declare the same groups, and give the same logits and the same cached
