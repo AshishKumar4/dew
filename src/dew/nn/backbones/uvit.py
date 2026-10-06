@@ -177,18 +177,15 @@ class SimpleUDiT(_TransformerOptions):
 
     @nn.nowrap
     def recompute_record(self) -> JSON:
-        """Its `remat` as a checkpoint's rung records it (`Recomputing`)."""
         return self.remat
 
     @nn.nowrap
     def recompute_more(self) -> Self | None:
-        """This stack one rung up `DIFFUSION_REMAT`, or None at its top (`Recomputing`)."""
         stronger = stronger_remat(self.remat)
         return None if stronger is None else self.clone(remat=stronger)
 
     @nn.nowrap
     def restore_recompute(self, record: JSON) -> Self:
-        """This stack at `record`'s rung where that is above its own (`Recomputing`)."""
         restored = restored_remat(self.remat, record)
         return self if restored is None else self.clone(remat=restored)
 
