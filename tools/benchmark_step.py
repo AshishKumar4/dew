@@ -61,7 +61,7 @@ from dew.telemetry.instrumentation import model_flops_utilization
 from dew.telemetry.profile import capture_options
 from dew.training.distributed import DevicePrefetchIterator
 from dew.training.runtime import prepare_process
-from dew.training.trainer import remat_record
+from dew.training.trainer import recompute_record
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from benchmark_cases import (
@@ -451,7 +451,7 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
             "compile_seconds": round(compile_seconds, 2),
             # The rung the trainer compiled the step under, the model's own
             # or a stronger one where the step did not fit.
-            "remat": remat_record(getattr(getattr(trainer.objective, "model", None), "remat", None)),
+            "remat": recompute_record(trainer.objective),
             "ms_per_step": round(step_time * 1e3, 3),
             "p10_ms": round(float(p10), 3),
             "p50_ms": round(float(p50), 3),
