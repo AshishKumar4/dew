@@ -514,34 +514,21 @@ def load(source: Named, *, batch: int,
             f"the hf provider reads HFOptions; {type(options).__name__} is the "
             f"other provider's")
     if tokenizer is not None or seq_len is not None:
-        shaping = {"val_split": val_split, "records": records, "preprocess": preprocess,
-                   "dataset": dataset, "streaming": streaming or None,
-                   "shuffle_buffer": shuffle_buffer or None}
-        hub, length = _hub_text(names, tokenizer=tokenizer, seq_len=seq_len, split=split,
-                                options=options or HFOptions(),
-                                given=[name for name, value in shaping.items() if value is not None])
-        return TokenWindows(hub=hub, seq_len=length, val_batches=val_batches, seed=seed,
+        if (not isinstance(names, str) or tokenizer is None or seq_len is None
+                or any((val_split, records, preprocess, dataset, streaming, shuffle_buffer))):
+            raise TypeError(
+                "tokenizer= and seq_len= read one split as token windows, which hold out the "
+                "head of the tokenized split for validation and count their own windows; name "
+                "one hf split and both, and none of val_split, records, preprocess, dataset, "
+                "streaming or shuffle_buffer")
+        hub = HubText(name=names, split=split, tokenizer=tokenizer, options=options or HFOptions())
+        return TokenWindows(hub=hub, seq_len=seq_len, val_batches=val_batches, seed=seed,
                             loading=loading).load(batch=batch)
     return HubDataset(
         name=names, split=split, val_split=val_split, val_batches=val_batches,
         records=records, preprocess=preprocess, streaming=streaming,
         shuffle_buffer=shuffle_buffer, options=options or HFOptions(),
         seed=seed, loading=loading).rows(batch=batch, dataset=dataset)
-
-
-def _hub_text(names: Named, *, tokenizer: str | None, seq_len: int | None, split: str,
-              options: HFOptions, given: list[str]) -> tuple[HubText, int]:
-    """The split `load` tokenizes and its window length, or the refusal of
-    what does not name one split, a tokenizer and a length."""
-    if not isinstance(names, str):
-        raise TypeError("tokenizer= tokenizes one split; mix tokenized corpora with PackedTokens")
-    if tokenizer is None or seq_len is None:
-        raise TypeError("tokenizer= and seq_len= go together: what a window holds and how long it is")
-    if given:
-        raise TypeError(
-            f"token windows hold out the head of the tokenized split for validation "
-            f"and count their own windows, so they take no {', '.join(given)}")
-    return HubText(name=names, split=split, tokenizer=tokenizer, options=options), seq_len
 
 
 def _sources(source: Named) -> tuple[str, Named]:

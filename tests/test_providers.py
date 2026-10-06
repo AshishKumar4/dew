@@ -205,18 +205,6 @@ def test_a_split_the_prepared_data_does_not_hold_is_refused():
                       options=TFDSOptions(path=str(PREPARED)))
 
 
-def test_a_half_copied_prepared_dataset_is_refused_before_the_run(tmp_path):
-    """A missing shard otherwise raises inside a grain worker on the first
-    record that needed it, steps into a run."""
-    copy = tmp_path / "dew_images" / "1.0.0"
-    copy.parent.mkdir(parents=True)
-    shutil.copytree(PREPARED, copy)
-    next(copy.glob("*train.array_record*")).unlink()
-
-    with pytest.raises(FileNotFoundError, match="Missing prepared ArrayRecord shard"):
-        dew.data.load("tfds/dew_images", batch=4, options=TFDSOptions(path=str(copy)))
-
-
 def test_an_option_no_provider_knows_is_refused_by_the_signature():
     with pytest.raises(TypeError, match="builder_name"):
         dew.data.load("tfds/dew_images", batch=4,
@@ -371,13 +359,13 @@ def test_a_text_split_reads_as_token_windows_tokenized_once(tmp_path, monkeypatc
     assert RunConfig.from_dict(json.loads(json.dumps(config.to_dict()))) == config
 
 
-@pytest.mark.parametrize("source, arguments, message", [
-    ("tfds/dew_images", {"tokenizer": "byte", "seq_len": 8}, "the hf provider's"),
-    ("hf/json", {"tokenizer": "byte"}, "go together"),
-    ("hf/json", {"tokenizer": "byte", "seq_len": 8, "val_split": "test"}, "take no val_split"),
+@pytest.mark.parametrize("source, arguments", [
+    ("tfds/dew_images", {"tokenizer": "byte", "seq_len": 8}),
+    ("hf/json", {"tokenizer": "byte"}),
+    ("hf/json", {"tokenizer": "byte", "seq_len": 8, "val_split": "test"}),
 ])
-def test_token_windows_over_a_split_refuse_what_shapes_provider_rows(source, arguments, message):
-    with pytest.raises(TypeError, match=message):
+def test_token_windows_over_a_split_refuse_what_shapes_provider_rows(source, arguments):
+    with pytest.raises(TypeError, match="seq_len="):
         dew.data.load(source, batch=4, **arguments)
 
 

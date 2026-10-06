@@ -19,7 +19,7 @@ import importlib
 import os
 import struct
 from collections.abc import Mapping, Sized
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 
 import grain.python as pygrain
 import jax
@@ -42,11 +42,8 @@ from .dataset import (
     train_stream,
     validation_pass,
 )
-from .sources.hf import ArrayInterface, HFDatasetSource, HFOptions, HubOptions
+from .sources.hf import HFDatasetSource, HFOptions, HubOptions
 from .tokens import bounded
-
-if TYPE_CHECKING:
-    from PIL.Image import Image as PILImage
 
 Augmentation = Literal["none", "flip_only", "flip_jitter"]
 
@@ -103,13 +100,9 @@ def pack_dict_of_byte_arrays(unpacked: dict) -> bytes:
 
 
 def decode_image(encoded: bytes, *, at_least: int | None = None) -> np.ndarray:
-    """An encoded image as RGB uint8, in the orientation its pixels are stored.
-
-    Grey is replicated and a 16-bit sample kept to its high byte. An image
-    with transparency is composited onto white, as img2dataset does for the
-    url shards the online loader streams. EXIF orientation is ignored, as
-    PIL's `Image.open` ignores it, on the reduced decodes too, which would
-    otherwise apply it.
+    """An encoded image as RGB uint8 (`as_rgb`), in the orientation its
+    pixels are stored. EXIF orientation is ignored, as PIL's `Image.open`
+    ignores it, on the reduced decodes too, which would otherwise apply it.
 
     With `at_least`, an opaque image is decoded at the largest 1/2, 1/4 or
     1/8 reduction that keeps both sides >= `at_least` (the DCT scale of a
@@ -138,34 +131,27 @@ def decode_image(encoded: bytes, *, at_least: int | None = None) -> np.ndarray:
         raise ValueError(f"cv2 refused {len(encoded)} bytes of image") from error
     if image is None:
         raise ValueError(f"cv2 could not decode {len(encoded)} bytes of image")
-    if image.dtype == np.uint16:
-        image = np.right_shift(image, 8).astype(np.uint8)
-    if image.ndim == 2:
-        image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
-    elif image.shape[-1] == 4:
-        image = _on_white(image)
-    return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    if image.ndim == 3:
+        image = cv2.cvtColor(image, cv2.COLOR_BGRA2RGBA if image.shape[-1] == 4 else cv2.COLOR_BGR2RGB)
+    return as_rgb(image)
 
 
-def _on_white(pixels: np.ndarray) -> np.ndarray:
-    """uint8 colour and alpha, `[..., 4]`, composited onto white as `[..., 3]`."""
-    # c * a / 255 + 255 - a, rounded to nearest in integers; the exact
-    # quotient is k / 255, which is never a tie.
-    alpha = pixels[..., 3:].astype(np.uint32)
-    return ((pixels[..., :3] * alpha + 255 * (255 - alpha) + 127) // 255).astype(np.uint8)
+def as_rgb(pixels: np.ndarray) -> np.ndarray:
+    """Grey, grey and alpha, RGB or RGBA pixels, 8 or 16 bits, as RGB uint8.
 
-
-def rgb_pixels(image: PILImage) -> np.ndarray:
-    """A decoded PIL image as RGB uint8, by `decode_image`'s rules: a 16-bit
-    sample kept to its high byte, which PIL's own conversion would clip,
-    transparency composited onto white, and any other mode (grey, a palette,
-    CMYK) converted by PIL, since such a mode's array is not RGB."""
-    if image.mode.startswith("I"):
-        grey = np.right_shift(np.clip(np.asarray(image), 0, 0xFFFF), 8).astype(np.uint8)
-        return np.repeat(grey[..., None], 3, axis=-1)
-    if "A" in image.getbands() or "transparency" in image.info:
-        return _on_white(np.asarray(image.convert("RGBA")))
-    return np.asarray(image.convert("RGB"))
+    Grey is replicated and a 16-bit sample kept to its high byte. An image
+    with transparency is composited onto white, as img2dataset does for the
+    url shards the online loader streams.
+    """
+    if pixels.dtype == np.uint16:
+        pixels = np.right_shift(pixels, 8).astype(np.uint8)
+    pixels = pixels.reshape(*pixels.shape[:2], -1)
+    if pixels.shape[-1] in (2, 4):
+        # c * a / 255 + 255 - a, rounded to nearest in integers; the exact
+        # quotient is k / 255, which is never a tie.
+        alpha = pixels[..., -1:].astype(np.uint32)
+        pixels = ((pixels[..., :-1] * alpha + 255 * (255 - alpha) + 127) // 255).astype(np.uint8)
+    return np.ascontiguousarray(np.broadcast_to(pixels, (*pixels.shape[:2], 3)))
 
 
 def _header(encoded: bytes) -> tuple[int, int, bool]:
@@ -548,23 +534,6 @@ class TFDSImages(ImageDataset):
         return element["image"], template.format(class_names(labels)[label]), label
 
 
-class HFImageSource(HFDatasetSource):
-    """Reads a hub split by index, its `image_column` as RGB uint8
-    (`rgb_pixels`), which needs the decoded PIL image's mode. The records
-    and their order are the plain source's, and so is the description."""
-
-    def __init__(self, *, name: str, split: str, options: HFOptions, image_column: str):
-        super().__init__(name=name, split=split, options=options)
-        self.image_column = image_column
-
-    def array(self, name: str, value: ArrayInterface) -> np.ndarray:
-        from PIL import Image
-
-        if name == self.image_column and isinstance(value, Image.Image):
-            return rgb_pixels(value)
-        return super().array(name, value)
-
-
 @datasets("hf_images")
 @dataclasses.dataclass(frozen=True)
 class HFImages(ImageDataset):
@@ -576,7 +545,7 @@ class HFImages(ImageDataset):
     a revision, its own `data_files` or a token.
 
     `image_column` is the column that holds the image, read as RGB uint8
-    whatever mode it is stored in (`rgb_pixels`). If the dataset has a
+    whatever mode it is stored in (`as_rgb`). If the dataset has a
     `label` column, it gives each record's class index. The caption comes
     from the first of `caption_columns` that a record has, and is read only
     when `load` is given `tokenize`. Without it, a split with no caption
@@ -609,8 +578,8 @@ class HFImages(ImageDataset):
     def source(self, split: str | None = None):
         if not self.name:
             raise ValueError("HFImages needs name= set to a hub dataset repo id")
-        source = HFImageSource(name=self.name, split=split or self.split,
-                               options=self.options, image_column=self.image_column)
+        source = HFDatasetSource(name=self.name, split=split or self.split,
+                                 options=self.options)
         self._check_columns(source.columns, split or self.split)
         return source
 
@@ -628,7 +597,7 @@ class HFImages(ImageDataset):
         element = _fields(element, "HFImages")
         caption = record_caption(element, self.caption_columns) if self.caption_columns else ""
         label = element.get("label")
-        return element[self.image_column], caption, None if label is None else int(label)
+        return as_rgb(element[self.image_column]), caption, None if label is None else int(label)
 
 
 @datasets("array_record_images")

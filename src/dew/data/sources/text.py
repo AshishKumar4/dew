@@ -33,11 +33,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import numpy as np
-from filelock import FileLock
 
 from dew.cache import dew_cache_dir
 
-from .hf import HFOptions, HubOptions, _hf_datasets
+from .hf import HFOptions, HubOptions
 
 if TYPE_CHECKING:
     from dew.data.text import ByteTokenizer, HFTokenizer
@@ -329,38 +328,18 @@ class HubText:
         return Path(dew_cache_dir()) / "tokens" / self.name.replace("/", "--") / key[:16]
 
     def tokenized(self) -> str:
-        """`directory`, written on first use. `TokenCorpus.write` puts
-        `meta.json` in place last, so a directory holding it is complete, and
-        processes on one host write it one at a time under a file lock."""
+        """`directory`, written on first use. `TokenCorpus.write` puts each
+        file in place whole and `meta.json` last, so a directory holding it
+        is complete, and two writers write the same files."""
         directory = self.directory
         if not (directory / "meta.json").is_file():
-            directory.parent.mkdir(parents=True, exist_ok=True)
-            with FileLock(f"{directory}.lock"):
-                if not (directory / "meta.json").is_file():
-                    TokenCorpus.write(self._documents(), directory, tokenizer=self.tokenizer,
-                                      pack=True)
+            # `datasets` refuses a column the split lacks, naming those it has.
+            table = self.options.table(self.name, self.split).select_columns([self.column])
+            # Rows a chunk at a time: one Python row at a time is 100x slower.
+            chunks = table.data.column(self.column).chunks
+            TokenCorpus.write((text for chunk in chunks for text in chunk.to_pylist() if text is not None),
+                              directory, tokenizer=self.tokenizer, pack=True)
         return str(directory)
-
-    def _documents(self) -> Iterator[str]:
-        """The split's `column`, one document per row and none for a missing
-        value; the split is loaded and checked before anything is written."""
-        table = self.options.load(self.name, self.split, streaming=False)
-        where = f"{self.name!r} split {self.split!r}"
-        if not isinstance(table, _hf_datasets().Dataset):
-            raise TypeError(f"{where} loaded as {type(table).__name__}; name one split")
-        if self.column not in table.column_names:
-            raise ValueError(f"column={self.column!r}, and {where} has the columns "
-                             f"{sorted(table.column_names)}; name its text column")
-        column = table.select_columns([self.column])
-
-        def documents() -> Iterator[str]:
-            # A thousand rows at a time: one Python row at a time is 100x slower.
-            for rows in column.iter(batch_size=1024):
-                if not isinstance(rows, Mapping):
-                    raise TypeError(f"{where} reads as {type(rows).__name__}, not as columns")
-                yield from (text for text in rows[self.column] if text is not None)
-
-        return documents()
 
 
 class TokenBytes(_Reopened):

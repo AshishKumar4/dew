@@ -101,24 +101,15 @@ def _hub_images(**fields):
 # The source itself
 # ---------------------------------------------------------------------------------
 
-def test_a_wrapped_dataset_indexes_like_the_table():
-    table = _table(records=4)
-    source = HFDatasetSource(dataset=table)
-
-    assert len(source) == len(table) == 4
-    record = source[2]
-    assert sorted(record) == ["caption", "image", "index"]
-    assert record["caption"] == "caption number 2" and record["index"] == 2
-
-
-def test_image_columns_come_back_as_arrays_not_pil_objects():
+def test_a_wrapped_dataset_indexes_like_the_table_with_images_as_arrays():
     """The transforms are numpy and cv2; a PIL image would reach cv2.resize."""
-    record = HFDatasetSource(dataset=_table(records=2))[0]
-    expected = np.random.RandomState(0).randint(0, 256, (IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.uint8)
+    source = HFDatasetSource(dataset=_table(records=4))
+    record = source[2]
+    expected = np.random.RandomState(2).randint(0, 256, (IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.uint8)
 
-    assert isinstance(record["image"], np.ndarray)
-    assert record["image"].dtype == np.uint8
-    assert np.array_equal(record["image"], expected)
+    assert len(source) == 4 and sorted(record) == ["caption", "image", "index"]
+    assert record["caption"] == "caption number 2" and record["index"] == 2
+    assert isinstance(record["image"], np.ndarray) and np.array_equal(record["image"], expected)
 
 
 def test_a_source_needs_a_name_or_a_dataset():
@@ -228,12 +219,6 @@ def test_a_hub_dataset_spec_builds_the_image_pipeline(hub):
     assert "label" not in batch
 
 
-def test_the_split_is_a_field(hub):
-    _hub_images(split="validation", val_batches=None).load(batch=4)
-
-    assert hub == [{"name": "acme/pets", "split": "validation"}]
-
-
 def test_the_hub_options_reach_load_dataset(forwarded):
     """A hub image dataset behind a config name, a revision or its own
     `data_files` was unreadable from the image spec: only the provider route
@@ -241,10 +226,10 @@ def test_the_hub_options_reach_load_dataset(forwarded):
     options = HFOptions(config="full", data_files={"train": "shard-*.parquet"},
                         revision="refs/convert/parquet", token="hf_x", num_proc=2)
 
-    _hub_images(options=options, val_batches=None).load(batch=4)
+    _hub_images(split="validation", options=options, val_batches=None).load(batch=4)
 
     assert forwarded == [{
-        "path": "acme/pets", "name": "full", "split": "train", "streaming": False,
+        "path": "acme/pets", "name": "full", "split": "validation", "streaming": False,
         "data_dir": None, "data_files": {"train": "shard-*.parquet"},
         "cache_dir": None, "features": None, "download_config": None,
         "download_mode": None, "verification_mode": None, "keep_in_memory": None,
