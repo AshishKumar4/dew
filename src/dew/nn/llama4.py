@@ -34,7 +34,7 @@ from dew.nn.inputs import AttentionMetadata
 from dew.nn.kv_cache import KVCache
 from dew.nn.mixer_base import MixerBase, MixerContext, mixers
 from dew.nn.precision import at_least_fp32
-from dew.nn.rope import RopeScaling, apply_rotary_interleave, rotary_freqs
+from dew.nn.rope import LongRopeScaling, RopeScaling, apply_rotary_interleave, rotary_freqs
 from dew.nn.sharding import logical_axes
 
 
@@ -72,7 +72,7 @@ class Llama4Attention(nn.Module):
     max_seq_len: int
     causal: bool = True
     rope_theta: float = 500000.0
-    rope_scaling: RopeScaling | None = None
+    rope_scaling: RopeScaling | LongRopeScaling | None = None
     use_rope: bool = True
     use_qk_norm: bool = True
     attention_chunk_size: int | None = None

@@ -13,10 +13,13 @@ transformers' float32 `pow`.
 
 import dataclasses
 import math
+from collections.abc import Mapping
 
 import jax.numpy as jnp
 import numpy as np
 from jax.typing import DTypeLike
+
+from dew.registry import from_record
 
 from .precision import at_least_fp32
 
@@ -85,9 +88,53 @@ class RopeScaling:
         return np.where(medium, smoothed, divided).astype(inv_freq.dtype)
 
 
+@dataclasses.dataclass(frozen=True)
+class LongRopeScaling:
+    """Phi-3's short/long inverse-frequency factors and cos/sin amplitude.
+
+    Each row selects its table at its own largest position. This matches
+    transformers at batch one and on uniform batches, while independent
+    served requests cannot change one another's frequencies. Cached keys
+    retain their table until the shared decode operation rebuilds the row.
+    """
+
+    short_factor: tuple[float, ...]
+    long_factor: tuple[float, ...]
+    original_max_position_embeddings: int
+    factor: float = 1.0
+    attention_factor: float | None = None
+    rope_type: str = 'longrope'
+
+    def __post_init__(self):
+        for name in ('short_factor', 'long_factor'):
+            object.__setattr__(self, name, tuple(getattr(self, name)))
+        if self.rope_type != 'longrope' or self.original_max_position_embeddings < 2:
+            raise ValueError('longrope requires an original context of at least two positions')
+        if not self.short_factor or len(self.short_factor) != len(self.long_factor):
+            raise ValueError('longrope short_factor and long_factor must have the same positive length')
+        if any(value <= 0 for value in (*self.short_factor, *self.long_factor)) or self.factor <= 0:
+            raise ValueError('longrope frequency factors must be positive')
+        if self.attention_factor is not None and self.attention_factor <= 0:
+            raise ValueError('longrope attention_factor must be positive')
+
+    @property
+    def amplitude(self) -> float:
+        """The reference's explicit amplitude, or its context-ratio formula."""
+        if self.attention_factor is not None:
+            return self.attention_factor
+        return (1.0 if self.factor <= 1 else
+                math.sqrt(1 + math.log(self.factor) / math.log(self.original_max_position_embeddings)))
+
+
+def rope_scaling_from_record(record: Mapping[str, object]) -> RopeScaling | LongRopeScaling:
+    """Build the ramp the record's rope_type names."""
+    return (from_record(LongRopeScaling, record) if record.get('rope_type') == 'longrope'
+            else from_record(RopeScaling, record))
+
+
 def rotary_freqs(positions, head_dim: int, theta: float, rot_dim: int | None = None,
                  partial_rotary_type: str = 'proportional',
-                 rope_scaling: RopeScaling | None = None, *, dtype: DTypeLike):
+                 rope_scaling: RopeScaling | LongRopeScaling | None = None, *, dtype: DTypeLike):
     """Return cos and sin of the rotary angles at absolute `positions`: [P, pairs].
 
     `positions` is [P], or [B, P] for a packed batch whose documents restart at
@@ -115,13 +162,30 @@ def rotary_freqs(positions, head_dim: int, theta: float, rot_dim: int | None = N
     pairs = head_dim // 2 if rot_dim is None else rot_dim // 2
     divisor = head_dim if rot_dim is None or partial_rotary_type == 'proportional' else rot_dim
     inv_freq = inverse_frequencies(theta, divisor, pairs, dtype=dtype)
-    if rope_scaling is not None:
+    if isinstance(rope_scaling, LongRopeScaling):
+        if len(rope_scaling.short_factor) != pairs:
+            raise ValueError(f'longrope factors must have {pairs} entries for the rotated width')
+        powers = _base_powers(theta, np.arange(0, 2 * pairs, 2, dtype=dtype) / divisor)
+        short = 1.0 / (np.asarray(rope_scaling.short_factor, dtype=dtype) * powers)
+        long = 1.0 / (np.asarray(rope_scaling.long_factor, dtype=dtype) * powers)
+        rows = jnp.asarray(positions)
+        expanded = jnp.max(rows, axis=-1) + 1 > rope_scaling.original_max_position_embeddings
+        inv_freq = jnp.where(expanded[..., None], long, short)
+        if rows.ndim > 1:
+            inv_freq = inv_freq[..., None, :]
+    elif rope_scaling is not None:
         inv_freq = rope_scaling.apply(inv_freq)
     if rot_dim is not None and partial_rotary_type == 'proportional':
         padding = head_dim // 2 - pairs
-        inv_freq = np.concatenate([inv_freq, np.zeros((padding,), inv_freq.dtype)])
+        if isinstance(rope_scaling, LongRopeScaling):
+            inv_freq = jnp.pad(inv_freq, (*((0, 0),) * (inv_freq.ndim - 1), (0, padding)))
+        else:
+            inv_freq = np.concatenate([inv_freq, np.zeros((padding,), inv_freq.dtype)])
     angles = jnp.asarray(positions, inv_freq.dtype)[..., None] * inv_freq
-    return jnp.cos(angles), jnp.sin(angles)
+    cos, sin = jnp.cos(angles), jnp.sin(angles)
+    if isinstance(rope_scaling, LongRopeScaling):
+        cos, sin = cos * rope_scaling.amplitude, sin * rope_scaling.amplitude
+    return cos, sin
 
 
 def apply_rotary(x, freqs_cos, freqs_sin, scale: float | None = None):
