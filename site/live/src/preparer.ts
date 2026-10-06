@@ -19,8 +19,9 @@ export async function prepareSnapshot(container: Container, commit: string, sour
 	const snapshotSeconds = (Date.now() - snapshotStart) / 1000;
 	await container.destroy();
 	const smokeStart = Date.now();
+	const relaySecret = crypto.randomUUID();
 	container.start({ containerSnapshot: snapshot, instance: 'standard-4', enableInternet: false,
-		entrypoint: ['sh', '/opt/live/start-shared.sh'], env: { DEW_SHARED_SECRET: crypto.randomUUID() } });
+		entrypoint: ['sh', '/opt/live/start-shared.sh'], env: { DEW_SHARED_SECRET: relaySecret } });
 	await container.setInactivityTimeout(15 * 60_000);
 	const port = container.getTcpPort(8888);
 	const deadline = Date.now() + 180_000;
@@ -29,6 +30,11 @@ export async function prepareSnapshot(container: Container, commit: string, sour
 		if (Date.now() > deadline || !container.running) throw new Error('offline shared models did not become ready');
 		await scheduler.wait(500);
 	}
+	const credential = new ReadableStream<Uint8Array>({ start(controller) {
+		controller.enqueue(new TextEncoder().encode(relaySecret)); controller.close();
+	} });
+	const browser = await (await container.exec(['/opt/venv/bin/python', '/opt/live/smoke-shared.py'], { stdin: credential })).output();
+	if (browser.exitCode !== 0) throw new Error(`offline relay smoke failed: ${new TextDecoder().decode(browser.stderr).slice(-4000)}`);
 	const smoke = await (await container.exec(['/opt/venv/bin/python', '/opt/live/benchmark_gateway.py', '1'])).output();
 	if (smoke.exitCode !== 0) throw new Error(`offline context smoke failed: ${new TextDecoder().decode(smoke.stderr).slice(-4000)}`);
 	return { commit: sourceCommit, snapshot, created: Date.now(), prepareSeconds, snapshotSeconds,
