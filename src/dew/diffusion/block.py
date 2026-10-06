@@ -274,6 +274,20 @@ class CanvasDecodeState:
     index: jax.Array
 
 
+def through_eos(tokens: jax.Array, available: jax.typing.ArrayLike, eos_ids: tuple[int, ...],
+                pad_id: int) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """`tokens` `[..., width]` kept through its first EOS among the first
+    `available`, the rest padded: `(kept, lengths, ended)`, where `ended`
+    marks rows that met an EOS there."""
+    width = tokens.shape[-1]
+    read = jnp.arange(width) < jnp.expand_dims(available, -1)
+    is_eos = jnp.isin(tokens, jnp.asarray(eos_ids, jnp.int32)) & read
+    first = jnp.min(jnp.where(is_eos, jnp.arange(width), width), axis=-1)
+    lengths = jnp.minimum(first + 1, available)
+    kept = jnp.where(jnp.arange(width) < jnp.expand_dims(lengths, -1), tokens, pad_id)
+    return kept, lengths, jnp.any(is_eos, axis=-1)
+
+
 def _validated(model: DiffusionGemma, process: BlockProcess, inputs: ModelInputs, max_new_tokens: int,
                eos_token_ids: tuple[int, ...], pad_token_id: int, n: int) -> None:
     """Raises for whatever a rank can get wrong before the compiled loop."""
@@ -325,17 +339,13 @@ def _advance(model: DiffusionGemma, variables: Variables, state: CanvasDecodeSta
     canvas_key = jax.random.fold_in(key, index)
     refined = process.refine(model, variables, cache, canvas_key, batch, generation.terminated)
     available = jnp.minimum(length, plan.max_new_tokens - index * length)
-    is_eos = jnp.isin(refined.argmax, jnp.asarray(plan.eos_token_ids, jnp.int32))
-    valid = jnp.arange(length)[None, :] < available
-    is_eos = is_eos & valid
-    first_eos = jnp.min(jnp.where(is_eos, jnp.arange(length)[None, :], length), axis=-1)
-    emitted = jnp.where(generation.terminated, 0, jnp.minimum(first_eos + 1, available))
-    keep = jnp.arange(length)[None, :] < emitted[:, None]
-    clean = jnp.where(keep, refined.argmax, plan.pad_token_id)
+    # A row that ended earlier emits nothing more: none of its canvas is available.
+    available = jnp.where(generation.terminated, 0, available)
+    clean, emitted, ended = through_eos(refined.argmax, available, plan.eos_token_ids, plan.pad_token_id)
     tokens = jax.lax.dynamic_update_slice(generation.tokens, clean, (0, prompt_length + index * length))
     generation = CanvasGeneration(
         tokens=tokens, lengths=generation.lengths + emitted,
-        terminated=generation.terminated | jnp.any(is_eos, axis=-1),
+        terminated=generation.terminated | ended,
         decoder_steps=generation.decoder_steps + refined.decoder_steps)
     # This branch depends only on the request's canvas counter, never on a
     # rank-local sampled token or termination outcome.
