@@ -1,18 +1,23 @@
-"""REPA-E: the autoencoder trained with the diffusion model through REPA.
+"""REPA-E: the autoencoder trained together with the diffusion model through REPA.
 
-Leng et al. 2025, "REPA-E: Unlocking VAE for End-to-End Tuning with Latent
-Diffusion Transformers"; the official code is End2End-Diffusion/REPA-E's
-`train_repae.py`, `models/sit.py` and `loss/losses.py`. One step there
-updates the VAE on its own loss (L1 reconstruction, LPIPS, KL and the
-PatchGAN's generator term) plus `vae_align_proj_coeff` times the REPA loss
-of its latent, with the diffusion model frozen and its batch norm reading
-running statistics; then the discriminator on its hinge loss against the
-same reconstruction; then the diffusion model on the denoising and REPA
-losses of the detached latent, its batch norm normalizing with the batch's
-statistics and updating the running ones. The parameter sets are disjoint
-and each update reads the others as they were before the step, so one loss
-that stops each gradient where the reference freezes it is all three
-updates at once, on the same latent, times and noise.
+REPA-E is from Leng et al. 2025, "REPA-E: Unlocking VAE for End-to-End Tuning
+with Latent Diffusion Transformers"; the official code is
+End2End-Diffusion/REPA-E's `train_repae.py`, `models/sit.py` and
+`loss/losses.py`. One step there makes three updates:
+
+1. The VAE, on its own loss (L1 reconstruction, LPIPS, KL and the PatchGAN's
+   generator term) plus `vae_align_proj_coeff` times the REPA loss of its
+   latent. The diffusion model is frozen, and its batch norm reads the
+   running statistics.
+2. The discriminator, on its hinge loss against the same reconstruction.
+3. The diffusion model, on the denoising and REPA losses of the detached
+   latent. Its batch norm normalizes with the batch's statistics and updates
+   the running ones.
+
+The three parameter sets are disjoint, and each update reads the others as
+they were before the step. So one loss that stops each gradient where the
+reference freezes it makes all three updates at once, on the same latent,
+times and noise.
 """
 
 from __future__ import annotations
@@ -40,7 +45,7 @@ LATENT_STATS = "latent_statistics"
 """The collection of the latent batch norm's running mean and variance."""
 
 PERCEPTUAL = "perceptual"
-"""The collection the frozen LPIPS network's weights ride under."""
+"""The collection that holds the frozen LPIPS network's weights."""
 
 
 class _BatchNorm(nn.Module):
@@ -125,20 +130,23 @@ class EndToEnd:
 
     `align_weight` is `vae_align_proj_coeff`, the REPA loss's weight in the
     autoencoder's update. The autoencoder's own loss is REPA-E's
-    `ReconstructionLoss_Single_Stage` at configs/l1_lpips_kl_gan.yaml: the
-    L1 reconstruction at `reconstruction_weight`, LPIPS between the images
-    and the reconstruction at `perceptual_weight` (`dew.eval.LPIPSNetwork`,
-    its published weights held frozen under `PERCEPTUAL`), the posterior's
-    KL at `kl_weight`, summed over each latent and averaged over the batch,
-    and the PatchGAN's generator term, minus the mean logit of the
-    reconstruction, at `discriminator_weight` from step
-    `discriminator_start`. The PatchGAN (`PatchDiscriminator` at
-    `discriminator_width` and `discriminator_layers`) trains on the hinge
-    loss of the images against the reconstruction from the same step, in
-    `params` as `DISCRIMINATOR`. A weight at 0 leaves its network out. The
-    latents are normalized per channel by an affine-free batch norm
-    (`momentum`, `epsilon`), which replaces the autoencoder's fixed latent
-    scale and starts from it.
+    `ReconstructionLoss_Single_Stage` with configs/l1_lpips_kl_gan.yaml:
+
+    - the L1 reconstruction, at `reconstruction_weight`;
+    - LPIPS between the images and the reconstruction, at `perceptual_weight`
+      (`dew.eval.LPIPSNetwork`, its published weights held frozen under
+      `PERCEPTUAL`);
+    - the posterior's KL, at `kl_weight`, summed over each latent and averaged
+      over the batch;
+    - the PatchGAN's generator term, minus the mean logit of the reconstruction,
+      at `discriminator_weight` from step `discriminator_start`.
+
+    The PatchGAN (`PatchDiscriminator` at `discriminator_width` and
+    `discriminator_layers`) trains on the hinge loss of the images against the
+    same step's reconstruction, in `params` as `DISCRIMINATOR`. A weight of 0
+    leaves its network out. An affine-free batch norm (`momentum`, `epsilon`)
+    normalizes the latents per channel; it replaces the autoencoder's fixed
+    latent scale and starts from it.
     """
 
     align_weight: float = 1.5
@@ -160,21 +168,24 @@ class EndToEnd:
         return PatchDiscriminator(self.discriminator_width, self.discriminator_layers)
 
     def initial_statistics(self, shift: ArrayLike, scale: ArrayLike, channels: int) -> Variables:
-        """The running statistics REPA-E's `init_bn` starts from: the
-        autoencoder's latent shift as the mean and 1 / scale^2 as the
-        variance, per channel."""
+        """Return the running statistics REPA-E's `init_bn` starts from.
+
+        Per channel, the mean is the autoencoder's latent shift and the variance is
+        1 / scale^2.
+        """
         scale = jnp.asarray(scale, jnp.float32)
         return {"mean": jnp.broadcast_to(jnp.asarray(shift, jnp.float32), (channels,)),
                 "var": jnp.broadcast_to(1.0 / scale ** 2, (channels,))}
 
     def tuned(self, autoencoder: AutoEncoder, variables: Variables) -> tuple[AutoEncoder, Variables]:
-        """The autoencoder a task over a tuned run's `variables` decodes with,
-        and the variables with its weights under `autoencoder`: the trained
-        weights at `params/autoencoder`, its latents shifted by the running
-        mean and scaled by the running variance's reciprocal square root,
-        without the batch norm's epsilon, as REPA-E's
-        `SiT.extract_latents_stats` gives the scale its sampling
-        denormalizes with."""
+        """Return the autoencoder a task over a tuned run's `variables` decodes with, and its variables.
+
+        The trained weights come from `params/autoencoder` and go under
+        `autoencoder`. The latents are shifted by the running mean and scaled by the
+        reciprocal square root of the running variance, without the batch norm's
+        epsilon, which is the scale REPA-E's `SiT.extract_latents_stats` gives its
+        sampling to denormalize with.
+        """
         tuned = copy.copy(autoencoder)
         statistics = variables[LATENT_STATS]
         tuned.latent_shift = statistics["mean"]
