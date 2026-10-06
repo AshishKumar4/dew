@@ -13,6 +13,7 @@ refusal of a vocabulary mismatch, and a real trainer run on CPU where the
 teacher never moves and a resumed run lands where the straight one does.
 """
 
+import itertools
 import json
 from pathlib import Path
 
@@ -21,6 +22,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from affine_run import Data
 from flax.traverse_util import unflatten_dict
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -288,19 +290,9 @@ def test_a_student_with_the_router_balance_loss_is_refused():
 # --------------------------------------------------------------------------
 
 
-class Data:
+def fixed(batch):
     """The one fixed batch, endlessly, as the trainer's dataset contract."""
-
-    def __init__(self, batch):
-        self.batch = batch["text"].shape[0]
-        self._batch = batch
-
-    def train(self, partition):
-        while True:
-            yield self._batch
-
-    val = None
-    steps_per_epoch = None
+    return Data(lambda: itertools.repeat(batch), batch=batch[TEXT_KEY].shape[0])
 
 
 def make_trainer(arrays, tmp_path=None):
@@ -323,7 +315,7 @@ def test_the_teacher_never_moves_and_the_student_learns(tmp_path):
     initial = trainer.initial_state()
     before = float(trainer.objective.scalar_loss(initial.variables, batch, step_at())[0])
 
-    state = trainer.fit(Data(batch), steps=5, log_every=1)
+    state = trainer.fit(fixed(batch), steps=5, log_every=1)
 
     for path, leaf in jax.tree_util.tree_leaves_with_path(state.variables[TEACHER]):
         assert np.array_equal(np.asarray(leaf), np.asarray(dict(
@@ -335,8 +327,8 @@ def test_the_teacher_never_moves_and_the_student_learns(tmp_path):
     after = float(trainer.objective.scalar_loss(state.variables, batch, step_at())[0])
     assert after < before, (before, after)
 
-    make_trainer(arrays, tmp_path).fit(Data(batch), steps=3, log_every=1)
-    resumed = make_trainer(arrays, tmp_path).fit(Data(batch), steps=5, log_every=1)
+    make_trainer(arrays, tmp_path).fit(fixed(batch), steps=3, log_every=1)
+    resumed = make_trainer(arrays, tmp_path).fit(fixed(batch), steps=5, log_every=1)
     for straight, again in zip(jax.tree.leaves(state.variables),
                                jax.tree.leaves(resumed.variables), strict=True):
         np.testing.assert_array_equal(np.asarray(straight), np.asarray(again))

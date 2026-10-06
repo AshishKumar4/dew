@@ -17,6 +17,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from affine_run import Data
 from flax import linen as nn
 from recording import RecordingTracker
 
@@ -124,17 +125,6 @@ def cycle_batches(batch=BATCH, seq=SEQ, seed=0):
     while True:
         offsets = rs.randint(0, VOCAB, (batch, 1))
         yield {TEXT_KEY: ((offsets + positions) % VOCAB).astype(np.int32)}
-
-
-class Data:
-    def __init__(self, train, val=None, batch=BATCH):
-        self._train, self.batch, self.records = train, batch, None
-        self.val = None if val is None else lambda partition: val()
-
-    def train(self, partition):
-        return self._train()
-
-    steps_per_epoch = None
 
 
 def reference_cross_entropy(logits, targets, pad_id=None, weights=None):
