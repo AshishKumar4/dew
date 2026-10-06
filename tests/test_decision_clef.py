@@ -1,16 +1,40 @@
 """Clef's layout and head against Clef's own code (Cloudflare/clef 2f3de3dd), under the float64 rule."""
 
+import base64
+import io
 import json
+from dataclasses import replace
 from pathlib import Path
 
+import jax
 import numpy as np
+import optax
 import pytest
+from PIL import Image
 from reference_error import assert_as_exact_as_the_reference
 from safetensors.numpy import load_file
 
+from dew.checkpoints import Checkpoints
 from dew.data.text import HFTokenizer
-from dew.decision import DecisionInputs, Encoded, JointLayout, JointSchemaHead, Question, Specials
+from dew.decision import (
+    Choice,
+    ChoiceAnswer,
+    Decide,
+    DecisionInputs,
+    DecisionObjective,
+    Encoded,
+    Example,
+    JointLayout,
+    JointSchemaHead,
+    Noul,
+    Question,
+    Specials,
+    TopProbability,
+)
+from dew.decision.calibration import softmax
 from dew.decision.clef import ClefHead
+from dew.decision.images import Images
+from dew.training.trainer import Trainer
 
 FIXTURES = Path(__file__).parent / "fixtures"
 TINY = FIXTURES / "clef" / "tiny"
@@ -108,3 +132,113 @@ def test_a_head_record_rebuilds_the_head():
     assert record == {"name": "JointSchemaHead", "fields": {"width": 24, "routing_layers": 2, "layers": 2,
                                                               "heads": 2, "feedforward": 40}}
     assert JointSchemaHead.from_record(record, 32) == head
+
+
+def test_a_clef_release_answers_as_clefs_own_model(tmp_path):
+    """`Decide.from_pretrained` reads a Clef release, the Qwen 3.5 backbone
+    with the head beside it. Dew's backbone and head together are held to
+    twice Clef's own fp32 model's distance from its float64 run, and
+    `systemone`, with Clef's confidence, gives each option the probability
+    Clef's fp32 logits give it, within the fourth decimal both round to."""
+    for source in [*BACKBONE.iterdir(), TINY / "joint_head_config.json", TINY / "joint_head.safetensors"]:
+        (tmp_path / source.name).symlink_to(source.resolve())
+    decide = replace(Decide.from_pretrained(tmp_path, attention_impl="xla"), confidence=TopProbability())
+    layouts = json.loads((TINY / "layouts.json").read_text())
+    found, reference, truth = [], [], []
+    with np.load(TINY / "logits.npz") as logits:
+        for case, request in CASES.items():
+            questions = {name: Question.from_wire(wire) for name, wire in request["questions"].items()}
+            [row] = decide.layout.rows(decide.tokenizer, decide.specials, request["state"], questions)
+            scores = np.asarray(decide.model.logits(decide.variables, DecisionInputs.collate([row], 0)))
+            answers = decide.systemone(request)["answers"]
+            for slot, (laid, clef) in enumerate(zip(row.questions, layouts[case]["questions"], strict=True)):
+                key = f"{case}/{laid.name}"
+                found.append(scores[0, slot, :len(laid.options)])
+                reference.append(logits[key])
+                truth.append(logits[f"{key}/f64"])
+                probabilities = softmax(logits[key].astype(np.float64), 1.0)
+                expected = dict(zip(clef["option_ids"], probabilities, strict=True))
+                answer = answers[laid.name]
+                given = ({"true": answer["noul"]} if answer["type"] == "noul" else answer["probabilities"])
+                for option, value in given.items():
+                    assert abs(value - expected[option]) <= 1e-4, (case, laid.name, option)
+                if answer["type"] != "noul":
+                    assert answer["confidence"] == max(given.values())
+    assert_as_exact_as_the_reference(np.concatenate(found), np.concatenate(reference), np.concatenate(truth),
+                                     "Clef over Dew's Qwen 3.5")
+
+
+def test_a_clef_release_fine_tunes_and_reloads_from_the_run(tmp_path):
+    """A Clef release is a whole task to fine-tune: its Qwen 3.5 backbone,
+    joint head and layout train together on rows of several questions, and
+    the saved run loads back as a task with identical probabilities."""
+    release = tmp_path / "release"
+    release.mkdir()
+    for source in [*BACKBONE.iterdir(), TINY / "joint_head_config.json", TINY / "joint_head.safetensors"]:
+        (release / source.name).symlink_to(source.resolve())
+    team = Choice("Which team?", {"billing": "payments", "technical": "outages", "sales": "pricing"})
+    urgent = Noul("Is it urgent?")
+    answered = (("charged twice", "billing", "true"), ("site is down", "technical", "true"),
+                ("how much is pro", "sales", "false"), ("refund please", "billing", "false"))
+    examples = [Example(state, {"team": team, "urgent": urgent}, {"team": label, "urgent": hurry})
+                for state, label, hurry in answered * 2]
+    # Training pads every row to the layout's max_len; Clef serves up to 16384.
+    objective = DecisionObjective(Decide.from_pretrained(release, attention_impl="xla"),
+                                  layout=JointLayout(max_len=1024))
+    data = objective.dataset(examples, batch=8, validation=examples)
+    run = tmp_path / "run"
+    checkpoints = Checkpoints(str(run), keep=1)
+    start = objective.init(jax.random.key(0))
+    state = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=checkpoints).fit(
+        data, steps=2, log_every=100, checkpoint_every=2)
+    checkpoints.wait()
+    before = jax.tree.leaves(start["params"]["head"])
+    after = jax.tree.leaves(state.variables["params"]["head"])
+    assert any(not np.array_equal(np.asarray(a), np.asarray(b)) for a, b in zip(before, after, strict=True))
+
+    live, reloaded = objective.pipeline(state), Decide.from_run(str(run))
+    assert live.processor is not None  # the release's, which reads images
+    asked = {"team": team, "urgent": urgent}
+    first, second = live("charged twice!", asked), reloaded("charged twice!", asked)
+    for answer, again in zip(first.values(), second.values(), strict=True):
+        np.testing.assert_array_equal(answer.probabilities, again.probabilities)
+
+
+def test_a_clef_release_reads_images_as_clefs_own_model_does(tmp_path):
+    """A request's images, laid out before the state by the backbone's own
+    processor as Clef's `systemone` lays them out: the same token ids, and
+    logits held to twice Clef's fp32 model's distance from its float64 run,
+    the vision tower included. `systemone` reads them as data URLs."""
+    for source in [*BACKBONE.iterdir(), TINY / "joint_head_config.json", TINY / "joint_head.safetensors"]:
+        (tmp_path / source.name).symlink_to(source.resolve())
+    decide = Decide.from_pretrained(tmp_path, attention_impl="xla")
+    pictures = [Image.fromarray(array) for array in np.load(BACKBONE / "images.npy")]
+    request = CASES["quickstart"]
+    questions = {name: Question.from_wire(wire) for name, wire in request["questions"].items()}
+    media = Images.of(decide.processor, pictures, JointLayout.image)
+    [row] = decide.layout.rows(decide.tokenizer, decide.specials, request["state"], questions,
+                               media=media.tokens)
+    assert list(row.tokens) == json.loads((TINY / "images.json").read_text())["ids"]
+    scores = np.asarray(decide.model.logits(decide.variables, DecisionInputs.collate([row], 0),
+                                            media=media.inputs(decide.processor, row)))
+    with np.load(TINY / "images.npz") as logits:
+        names = [laid.name for laid in row.questions]
+        found = [scores[0, slot, :len(laid.options)] for slot, laid in enumerate(row.questions)]
+        reference = [logits[name] for name in names]
+        truth = [logits[f"{name}/f64"] for name in names]
+        assert_as_exact_as_the_reference(np.concatenate(found), np.concatenate(reference),
+                                         np.concatenate(truth), "Clef over Dew's Qwen 3.5, with images")
+
+    def url(picture: Image.Image) -> str:
+        encoded = io.BytesIO()
+        picture.save(encoded, format="PNG")
+        return "data:image/png;base64," + base64.b64encode(encoded.getvalue()).decode()
+
+    served = decide.systemone({**request, "images": [url(picture) for picture in pictures]})
+    assert served == decide.systemone({**request, "images": pictures})
+    assert served["usage"]["input_tokens"] == len(row.tokens)
+    seen = decide(request["state"], questions, images=pictures)["department"]
+    assert isinstance(seen, ChoiceAnswer)
+    shown = {option: round(float(p), 4) for option, p in zip(seen.options, seen.probabilities, strict=True)}
+    assert served["answers"]["department"]["probabilities"] == shown
+    assert decide.systemone(request)["answers"] != served["answers"]

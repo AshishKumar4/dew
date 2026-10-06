@@ -17,7 +17,7 @@ from dew.data.text import HFTokenizer, Tokenizer
 from dew.decision.data import DecisionTable, Example
 from dew.decision.head import DecisionHead, Head
 from dew.decision.layout import DecisionInputs, Layout, MarkerLayout, Specials, StateFirstLayout
-from dew.decision.model import DecisionModel, Ordered
+from dew.decision.model import DecisionModel
 from dew.decision.questions import KINDS, Choice, Question, Score
 from dew.decision.scoring import LogLoss, ScoringRule
 from dew.decision.task import Decide, Weights, laid_out
@@ -26,6 +26,7 @@ from dew.inference.tasks import Processor as TaskProcessor
 from dew.inputs import Field, InputSpec
 from dew.interop.processors import Processor
 from dew.lora import Adapter
+from dew.nn.protocols import TokenModel
 from dew.objectives.base import (
     OMITTED,
     Aux,
@@ -229,9 +230,11 @@ class DecisionObjective(Objective[Ratio]):
                  label_smoothing: float = 0.0, shuffle_options: bool = True,
                  none_of_the_above: float = 0.0):
         held: Variables | None = None
+        self.image_processor = None
         match backbone:
             case Decide():
                 model, held = backbone.model, backbone.variables
+                self.image_processor = backbone.processor
                 head = head or model.head
                 layout = layout or backbone.layout
                 tokenizer = tokenizer or backbone.tokenizer
@@ -257,7 +260,7 @@ class DecisionObjective(Objective[Ratio]):
             head = DecisionHead(width, dtype=dtype)
         self.model = DecisionModel(module, head)
         if layout is None:
-            if not isinstance(module, Ordered):
+            if not isinstance(module, TokenModel):
                 raise ValueError(f"a {type(module).__name__} does not say whether it reads its tokens in "
                                  "order; pass layout= (StateFirstLayout if it does, MarkerLayout if not)")
             layout = StateFirstLayout() if module.causal else MarkerLayout()
@@ -387,11 +390,13 @@ class DecisionObjective(Objective[Ratio]):
         """Return the trained model as a `Decide` task over the state's weights.
 
         A `Decide` encodes with the objective's own tokenizer and layout, so it
-        takes no processor.
+        takes no processor; it reads images with the backbone's own processor,
+        which a task the objective fine-tunes brings.
         """
         if processor is not OMITTED:
             raise TypeError("a Decide task encodes with the objective's tokenizer and takes no processor")
         averaged = not (ema is False or (ema is None and state.ema is None))
         return Decide(self.model, self._pipeline_weights(state, ema), self.layout, self.tokenizer,
-                      self.specials, weights=Weights(int(state.step), averaged))
+                      self.specials, weights=Weights(int(state.step), averaged),
+                      processor=self.image_processor)
 

@@ -23,8 +23,10 @@ from dew.checkpoints import Checkpoints
 from dew.data.dataset import DataPartition, Reader
 from dew.data.text import HFTokenizer, Tokenizer
 from dew.decision.calibration import Abstention, Binning, Calibration, Scored, Temperatures, softmax
+from dew.decision.clef import ClefCheckpoint
 from dew.decision.data import Example
 from dew.decision.head import Head
+from dew.decision.images import Images
 from dew.decision.laya import LayaCheckpoint
 from dew.decision.layout import (
     DecisionInputs,
@@ -52,6 +54,7 @@ from dew.decision.questions import (
     ScoreAnswer,
 )
 from dew.inference.tasks import SHAPE_BUCKETS
+from dew.interop.processors import Processor
 from dew.nn.inputs import RowPlan, mesh_of
 from dew.objectives.base import Metric, Variables
 from dew.records import JSON, json_value, record
@@ -131,22 +134,31 @@ class Decide:
     """The model name a Jev response reports."""
     weights: Weights | None = None
     """The run checkpoint the weights came from, when they came from a run."""
+    processor: Processor | None = None
+    """The backbone's own processor, which prepares a request's images for it."""
 
     @classmethod
     def from_pretrained(cls, name: str | Path = "convaiinnovations/laya", *, subfolder: str | None = None,
                         revision: str | None = None, dtype: str = "float32", param_dtype: str = "float32",
                         attention_impl: str = "auto") -> Self:
-        """Load a released Laya checkpoint (`LayaCheckpoint`) as a task.
+        """Load a released Laya (`LayaCheckpoint`) or Clef (`ClefCheckpoint`) checkpoint as a task.
 
-        The task uses the temperatures that Laya's agent reads from
-        `rl_agent_config.json`.
+        A Laya task uses the temperatures that Laya's agent reads from
+        `rl_agent_config.json`; Clef ships none. Either answers with Jev's
+        confidence; `replace(task, confidence=...)` selects Laya's
+        (`EntropyConfidence`) or Clef's (`TopProbability`).
         """
+        label = str(name) if subfolder is None else f"{name}/{subfolder}"
+        if subfolder is None and ClefCheckpoint.exists(name, revision=revision):
+            clef = ClefCheckpoint.load(name, revision=revision, dtype=dtype, param_dtype=param_dtype,
+                                       attention_impl=attention_impl)
+            return cls(clef.model, clef.variables, JointLayout(), clef.tokenizer, clef.specials, name=label,
+                       processor=clef.processor)
         checkpoint = LayaCheckpoint.load(name, subfolder=subfolder, revision=revision, dtype=dtype,
                                          param_dtype=param_dtype, attention_impl=attention_impl)
         choice, score, noul = checkpoint.temperatures
         temperatures = Temperatures({"choice": choice, "score": score, "noul": noul},
                                     checkpoint.bucket_temperatures)
-        label = str(name) if subfolder is None else f"{name}/{subfolder}"
         return cls(checkpoint.model, checkpoint.variables, checkpoint.layout, checkpoint.tokenizer,
                    checkpoint.specials, Calibration(temperatures), name=label)
 
@@ -245,9 +257,14 @@ class Decide:
             "budget": to_record(self.budget, Budget), "name": self.name}, indent=1) + "\n")
         written.replace(target)
 
-    def __call__(self, state: JSON, questions: Mapping[str, Question]) -> dict[str, Answer]:
-        """Return one answer per question in `questions`, about `state`."""
-        return self.batch([(state, questions)])[0][0]
+    def __call__(self, state: JSON, questions: Mapping[str, Question], *,
+                 images: Sequence[Image.Image] = ()) -> dict[str, Answer]:
+        """Return one answer per question in `questions`, about `state` and any `images`.
+
+        Images need a layout with a place for them (`Layout.image`) and the
+        backbone's processor, as a Clef release brings.
+        """
+        return self._seen(state, questions, images)[0] if images else self.batch([(state, questions)])[0][0]
 
     def batch(self, requests: Sequence[tuple[JSON, Mapping[str, Question]]]
               ) -> list[tuple[dict[str, Answer], Usage]]:
@@ -270,8 +287,26 @@ class Decide:
             answered.append(({name: answers[name] for name in questions}, usage))
         return answered
 
-    def _encoded(self, state: JSON, questions: Mapping[str, Question]) -> list[Encoded]:
-        rows = self.layout.rows(self.tokenizer, self.specials, state, questions)
+    def _seen(self, state: JSON, questions: Mapping[str, Question],
+              images: Sequence[Image.Image]) -> tuple[dict[str, Answer], Usage]:
+        """One request's answers and usage, its images laid out in its one row."""
+        if self.processor is None or self.layout.image is None:
+            raise ValueError("images need a backbone with a vision encoder, which this task does not have")
+        media = Images.of(self.processor, images, self.layout.image)
+        rows = self._encoded(state, questions, media.tokens)
+        if len(rows) != 1:
+            raise ValueError("a request's images go in a layout of one row")
+        [row] = rows
+        scores = np.asarray(self._forward(self.variables, DecisionInputs.collate(rows, self.specials.pad),
+                                          media=media.inputs(self.processor, row)))[0]
+        answers = {laid.name: self._answer(questions[laid.name], _ordered(laid, scores[slot]))
+                   for slot, laid in enumerate(row.questions)}
+        return ({name: answers[name] for name in questions},
+                Usage(len(row.tokens), row.state_tokens, row.state_kept))
+
+    def _encoded(self, state: JSON, questions: Mapping[str, Question],
+                 media: Sequence[int] = ()) -> list[Encoded]:
+        rows = self.layout.rows(self.tokenizer, self.specials, state, questions, media=media)
         for laid in (laid for row in rows for laid in row.questions):
             count = len(questions[laid.name].options)
             if len(laid.options) != count:
@@ -473,9 +508,10 @@ class Decide:
                      for name, wire in record(request.get("questions"), "questions").items()}
         if not questions:
             raise ValueError("a request needs at least one question")
-        if not strict and decoded_images(request.get("images")):
-            raise ValueError("images need a backbone with a vision encoder, which this task does not have")
-        answers, usage = self.batch([(json_value(request["state"], "state"), questions)])[0]
+        state = json_value(request["state"], "state")
+        images = [] if strict else decoded_images(request.get("images"))
+        answers, usage = (self._seen(state, questions, images) if images
+                          else self.batch([(state, questions)])[0])
         gated = self.calibration.abstention is not None
         reported: dict[str, JSON] = {"input_tokens": usage.input_tokens, "output_tokens": 0}
         if details:
