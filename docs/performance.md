@@ -208,6 +208,36 @@ gives 94.0 against 96.0. Compiled for the v6e, the program with the clip
 writes 6.1 GiB more a step (80 to 86 GiB). The extra writes are copies of
 the gradients, which the norm holds until every one is in.
 
+Where the rest of the v6e step goes, profiled at integration `0773af76`
+(Colab v6e, five steps traced after ten warm ones, both frameworks on the same
+VM): Dew's Qwen3-0.6B step at 8 x 1024 took 144.9 ms against MaxText's 157.3
+(median 149.7), and Qwen3-1.7B's at 4 x 1024 153.0 against 161.6 (median
+154.2). Dew's kernels, attributed to the model through the optimized HLO's
+source lines:
+
+- The AdamW update reads and writes the fp32 weights and both moments, and
+  it is bound by memory: 12.1 ms of the 0.6B step (8%), and 37.6 ms of the
+  1.7B step (25%), whose batch of 4 does little else. MaxText's update fusions
+  take the same.
+- The 151936-word head and its loss take about 27 ms in both frameworks.
+- The rotary embedding ran as separate passes: `rotate_half`'s slice and
+  negate, the fp32 converts around it, and the split, about 18 ms a step
+  against MaxText's 1.5. `dew.nn.rope.apply_rotary` now rotates the halves
+  as `x1 cos - x2 sin` and `x2 cos + x1 sin` without the rotated copy.
+  Two rounds alternating at integration `a906f011` put Qwen3-0.6B at 140.5-140.7
+  ms against 145.5-145.6 (MFU 27.2% against 26.3%), and Qwen3-1.7B at
+  150.0 against 153.6-153.9 (32.8% against 32.0%). The 1.7B losses and
+  gradient norms were bitwise the same over 40 steps. The 0.6B losses parted
+  by up to 1.7e-3, from rounding, which bf16 training then carries forward;
+  each run repeated its own losses bitwise. Against float64 the two forms
+  are within tests/reference_error.py's rule of each other, forward and
+  backward (`test_the_rotary_rotates_the_halves_as_rotate_half_does`). On an
+  RTX 4080 the two forms take the same time.
+- The splash attention wrapper scales the query and transposes the
+  operands to head-major and back, about 5.6 ms. Compiled for a v6e without
+  the separate scale, the wrapper kept the same four kernels, which are
+  splash's layout transposes, so that was left as is.
+
 ## Rounding on the TPU, 2026-10-02
 
 `import dew` turns off XLA's excess precision
