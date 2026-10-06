@@ -939,6 +939,18 @@ class PagedRows:
 Rows = DenseRows | PagedRows
 
 
+def _refuse_longrope_modes(model: nn.Module, *, paged: bool = False, chunked: bool = False,
+                           prefix: bool = False, mixed: bool = False) -> None:
+    """Refuse serving modes whose cache cannot rebuild a crossing request."""
+    if isinstance(model, CausalTransformer) and isinstance(model.rope_scaling, LongRopeScaling):
+        modes = [name for name, active in (('paged', paged), ('chunked', chunked),
+                                          ('prefix', prefix), ('mixed admission', mixed)) if active]
+        if modes:
+            raise ValueError(
+                f'LongRoPE crossing position {model.rope_scaling.original_max_position_embeddings} '
+                f'cannot rebuild {", ".join(modes)} serving; use whole-prompt dense admission')
+
+
 class Server:
     """Serves text requests with continuous batching over one resident KV cache.
 
@@ -965,18 +977,8 @@ class Server:
             raise ValueError("slots must be a positive number of resident rows")
         if type(admission) is not int or not 1 <= admission <= slots:
             raise ValueError("admission must be between one and the slot count")
-        if isinstance(model, CausalTransformer) and isinstance(model.rope_scaling, LongRopeScaling):
-            unsupported = []
-            if isinstance(rows, PagedRows):
-                unsupported.append('paged')
-            if rows.chunk is not None:
-                unsupported.append('chunked')
-            if rows.placement.mixed:
-                unsupported.append('mixed admission')
-            if unsupported:
-                raise ValueError(
-                    f'LongRoPE crossing position {model.rope_scaling.original_max_position_embeddings} '
-                    f'cannot rebuild {", ".join(unsupported)} serving; use whole-prompt dense admission')
+        _refuse_longrope_modes(model, paged=isinstance(rows, PagedRows),
+                               chunked=rows.chunk is not None, mixed=rows.placement.mixed)
         if type(decode_steps) is not int or decode_steps < 1:
             raise ValueError("decode_steps must be a positive number of iterations per device call")
         self.mesh = mesh_of(variables)
@@ -1134,16 +1136,8 @@ class Server:
                 raise ValueError(f"{type(model).__name__} declares no kv_cache layout to replace")
             model = model.clone(kv_cache=kv_cache)
         layout = model.kv_cache if isinstance(model, Layered) else KVCache()
-        if isinstance(model, CausalTransformer) and isinstance(model.rope_scaling, LongRopeScaling):
-            unsupported = (["paged"] if layout.page_size is not None else [])
-            if chunk is not None:
-                unsupported.append('chunked')
-            if prefix_cache:
-                unsupported.append('prefix')
-            if unsupported:
-                raise ValueError(
-                    f'LongRoPE crossing position {model.rope_scaling.original_max_position_embeddings} '
-                    f'cannot rebuild {", ".join(unsupported)} serving; use whole-prompt dense admission')
+        _refuse_longrope_modes(model, paged=layout.page_size is not None,
+                               chunked=chunk is not None, prefix=prefix_cache)
         # One program serves one capacity, so the cache holds whole tiles of it
         # rather than a power-of-two bucket: every decode step's attention reads
         # each slot, and a capacity of 384 bucketed to 512 read a third more.
