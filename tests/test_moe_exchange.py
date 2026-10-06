@@ -8,8 +8,6 @@ and the layer to a float64 expert loop over the slots it keeps.
 import functools
 import json
 import math
-import subprocess
-import sys
 from pathlib import Path
 
 import jax
@@ -18,6 +16,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from jax.sharding import NamedSharding, PartitionSpec as P
+from moe_support import exchange_worker
 from reference_error import assert_as_exact_as_the_reference, assert_computes_the_oracle
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -306,22 +305,10 @@ def test_capacity_drops_compute_maxtexts_experts(maxtext, case, dispatch, spec):
 
 
 def test_exchange_collectives_work_across_two_real_processes(tmp_path):
-    from test_multiprocess import free_port, report_of, terminate, worker_env
+    from test_multiprocess import run_pool
 
-    coordinator = f"127.0.0.1:{free_port()}"
-    worker = Path(__file__).with_name('moe_exchange_worker.py')
-    outputs = [tmp_path / f'rank{rank}.json' for rank in range(2)]
-    running = [subprocess.Popen(
-        [sys.executable, str(worker), str(rank), coordinator, str(output)],
-        env=worker_env(1), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, start_new_session=True) for rank, output in enumerate(outputs)]
-    try:
-        reports = [report_of(process, output, timeout=120)
-                   for process, output in zip(running, outputs, strict=True)]
-    finally:
-        for process in running:
-            if process.poll() is None:
-                terminate(process)
+    reports = run_pool(Path(__file__).with_name('moe_exchange_worker.py'), tmp_path, 2,
+                       timeout=120, start=exchange_worker)
     for report in reports:
         assert report['processes'] == 2
         for errors in report['errors'].values():

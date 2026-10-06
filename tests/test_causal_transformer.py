@@ -16,6 +16,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
+from model_support import TINY_DECODER
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -28,9 +29,7 @@ SEQ = 12
 
 
 def tiny(**overrides):
-    config = {"vocab_size": VOCAB, "emb_features": 32, "num_layers": 2, "num_heads": 4,
-                  "mlp_features": 64, "max_seq_len": 16}
-    return CausalTransformer(**{**config, **overrides})
+    return CausalTransformer(**{"vocab_size": VOCAB, **TINY_DECODER, **overrides})
 
 
 def tokens(rng, batch=2, length=SEQ):

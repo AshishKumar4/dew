@@ -113,6 +113,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import flat_tree
 from reference_error import assert_as_exact_as_the_reference
 
 from dew.interop import Pretrained, PretrainedDecoder
@@ -210,10 +211,6 @@ def fp32_decoder(directory, **kwargs):
                                  attention_impl='reference', **kwargs)
     return pretrained.model, pretrained.variables
 
-
-def flat_tree(tree):
-    leaves, _ = jax.tree_util.tree_flatten_with_path(tree)
-    return {'.'.join(str(entry.key) for entry in path): leaf for path, leaf in leaves}
 
 def test_llama_checkpoint_with_training_metadata_keeps_reference_logits(tmp_path):
     from shutil import copytree
