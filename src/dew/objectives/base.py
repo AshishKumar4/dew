@@ -597,15 +597,14 @@ class Objective(ABC, Generic[Loss, Effects]):
     def pipeline(self, state: TrainState, *, ema: bool | None = None) -> Task | SavedTask:
         """Return the trained model as its inference task, over `state`'s weights.
 
-        With `ema` None, the task uses `state.averaged` when the objective
-        keeps an average and the live parameters otherwise, which is how
-        `dew.pipeline` reads a run. True requires the average, and False
-        selects the live parameters. An objective with a reference policy
-        returns the trained policy, never the frozen reference its loss
-        compares against. The arrays keep their placement. Objectives
-        without a generation task raise `TypeError`. A plugin objective
-        returns its own `saved_task` class, which is why the type is open to
-        `SavedTask` beside dew's tasks.
+        With `ema` None, the task uses `state.averaged` when the objective keeps an
+        average and the live parameters otherwise, which is how `dew.pipeline` reads a
+        run. True requires the average, and False selects the live parameters. An
+        objective with a reference policy returns the trained policy, never the frozen
+        reference its loss compares against. The arrays keep their placement.
+        Objectives without a generation task raise `TypeError`. A plugin objective
+        returns its own `saved_task` class, so the return type also allows a
+        `SavedTask` besides Dew's own tasks.
         """
         raise TypeError(f"{type(self).__name__} has no inference task")
 

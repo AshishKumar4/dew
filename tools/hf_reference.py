@@ -61,7 +61,8 @@ What lands in tests/fixtures/hf:
   weights in fp32, which the network test compares against.
 - One directory per released config the translation is tested on
   (gemma3-1b, gemma-2b, gemma-2-2b, mistral-7b-v0.3, mixtral-8x7b,
-  qwen2-0.5b, qwen3-30b-a3b, olmo-3-7b, llama-3.1-8b, llada-8b, dream-7b):
+  qwen2-0.5b, qwen3-30b-a3b, olmo-3-7b, llama-3.1-8b, llada-8b, dream-7b,
+  and kimi-k3-dspark, the speculative drafter the qwen3 family refuses):
   config.json and the repo it came from in source.json, no weights. Google's
   and Meta's gated repos come from unsloth's mirrors, minus the mirror's marker keys.
 """
@@ -1154,6 +1155,7 @@ def main() -> None:
     write_tiny("olmo3-yarn-tiny", tiny_olmo3_yarn())
     write_released_config("olmo-3-7b", "allenai/Olmo-3-1025-7B")
     write_released_config("qwen3-30b-a3b", "Qwen/Qwen3-30B-A3B")
+    write_released_config("kimi-k3-dspark", "RadixArk/Kimi-K3-DSpark")
     write_released_config("qwen2-0.5b", "Qwen/Qwen2-0.5B")
     write_released_config("mixtral-8x7b", "mistralai/Mixtral-8x7B-v0.1")
     write_released_config("mistral-7b-v0.3", "mistralai/Mistral-7B-v0.3")
