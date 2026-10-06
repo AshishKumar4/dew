@@ -24,8 +24,14 @@ const { code, title, filename = 'dew-example.py' } = Astro.props;
 		const text = editor.querySelector<HTMLTextAreaElement>('textarea')!;
 		const copy = editor.querySelector<HTMLButtonElement>('[data-example-copy]')!;
 		copy.addEventListener('click', async () => {
-			await navigator.clipboard.writeText(text.value);
-			copy.textContent = 'Copied';
+			try {
+				await navigator.clipboard.writeText(text.value);
+				copy.textContent = 'Copied';
+			} catch {
+				text.focus();
+				text.select();
+				copy.textContent = 'Select and copy';
+			}
 			setTimeout(() => { copy.textContent = 'Copy'; }, 1500);
 		});
 		editor.querySelector('[data-example-reset]')!.addEventListener('click', () => {
