@@ -26,7 +26,7 @@ from dew.inference.tasks import Processor as TaskProcessor
 from dew.inputs import Field, InputSpec
 from dew.interop.processors import Processor
 from dew.lora import Adapter
-from dew.nn.protocols import Ordered
+from dew.nn.protocols import TokenModel
 from dew.objectives.base import (
     OMITTED,
     Aux,
@@ -260,7 +260,7 @@ class DecisionObjective(Objective[Ratio]):
             head = DecisionHead(width, dtype=dtype)
         self.model = DecisionModel(module, head)
         if layout is None:
-            if not isinstance(module, Ordered):
+            if not isinstance(module, TokenModel):
                 raise ValueError(f"a {type(module).__name__} does not say whether it reads its tokens in "
                                  "order; pass layout= (StateFirstLayout if it does, MarkerLayout if not)")
             layout = StateFirstLayout() if module.causal else MarkerLayout()
