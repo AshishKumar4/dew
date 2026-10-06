@@ -23,6 +23,104 @@ from dew.registry import models, with_precision
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 
+QWEN2_MOE = FIXTURES / 'qwen2-moe-tiny'
+
+
+def test_qwen2_moe_released_config_keeps_unnormalized_routing_and_shared_gate():
+    config = translate_config(fixture_config('qwen1.5-moe-a2.7b'))
+    assert config['mixture'] == {'experts': 60, 'top_k': 4, 'layers': tuple(range(24)),
+                                'norm_topk_prob': False, 'expert_features': 1408,
+                                'shared_features': 5632, 'shared_gate': True}
+    assert config['attention_bias'] and config['o_proj_bias'] is False and not config['qk_norm']
+    assert config['layer_types'] == ('full_attention',) * 24
+
+
+@pytest.mark.network
+def test_qwen2_moe_pinned_config_reads_as_the_committed_release():
+    from huggingface_hub import hf_hub_download
+
+    source = json.loads((FIXTURES / 'qwen1.5-moe-a2.7b/source.json').read_text())
+    config = json.loads(Path(hf_hub_download(source['repo'], 'config.json',
+                                           revision=source['revision'])).read_text())
+    assert config == fixture_config('qwen1.5-moe-a2.7b')
+    assert translate_config(config)['mixture']['shared_gate']
+
+
+def test_qwen2_moe_windows_and_dense_exclusions_follow_the_reference():
+    config = translate_config(fixture_config('qwen2-moe-tiny'))
+    assert config['layer_types'] == ('sliding_attention', 'full_attention', 'sliding_attention')
+    assert config['mixture']['layers'] == (0, 2)
+    assert config['kinds']['sliding_attention']['window'] == 4
+    model, variables = fp32_decoder(QWEN2_MOE)
+    assert 'experts' not in variables['params']['layers_1']['mlp']
+    assert 'shared_experts' in variables['params']['layers_2']['mlp']
+    assert model.mixture.shared_features == 24
+
+
+def test_qwen2_moe_logits_match_the_reference():
+    model, variables = fp32_decoder(QWEN2_MOE)
+    ids = np.load(QWEN2_MOE / 'input_ids.npy')
+    reference = np.load(QWEN2_MOE / 'logits.npy')
+    truth = np.load(QWEN2_MOE / 'logits_f64.npy')
+    logits = np.asarray(model.apply(variables, ids))
+    assert_as_exact_as_the_reference(logits, reference, truth, 'Qwen2-MoE logits')
+    np.testing.assert_array_equal(logits.argmax(-1), reference.argmax(-1))
+    print('Qwen2-MoE RMS ratio', distance(logits, truth) / distance(reference, truth))
+
+
+def test_qwen2_moe_decode_matches_the_reference():
+    model, variables = fp32_decoder(QWEN2_MOE)
+    ids = np.load(QWEN2_MOE / 'input_ids.npy')
+    state = model.apply(variables, ids.shape[0], method='init_cache', mutable=['cache'])[1]
+    out, state = model.apply({**variables, **state}, ids[:, :4], decode=True, mutable=['cache'])
+    pieces = [np.asarray(out)]
+    for index in range(4, ids.shape[1]):
+        out, state = model.apply({**variables, **state}, ids[:, index:index + 1],
+                                 decode=True, mutable=['cache'])
+        pieces.append(np.asarray(out))
+    assert_as_exact_as_the_reference(np.concatenate(pieces, axis=1),
+        np.load(QWEN2_MOE / 'logits.npy'), np.load(QWEN2_MOE / 'logits_f64.npy'), 'Qwen2-MoE cache')
+
+
+def test_qwen2_moe_padded_routing_matches_the_reference():
+    model, variables = fp32_decoder(QWEN2_MOE)
+    arrays = np.load(QWEN2_MOE / 'padded.npz')
+    logits = np.asarray(model.apply(
+        variables, arrays['input_ids'], positions=arrays['position_ids'],
+        attention_mask=arrays['attention_mask']))
+    valid = arrays['attention_mask']
+    assert_as_exact_as_the_reference(logits[valid], arrays['logits'][valid],
+                                     arrays['logits_f64'][valid], 'Qwen2-MoE padded')
+    print('Qwen2-MoE padded RMS ratio', distance(logits[valid], arrays['logits_f64'][valid])
+          / distance(arrays['logits'][valid], arrays['logits_f64'][valid]))
+
+
+def test_qwen2_moe_export_keeps_fused_experts_and_shared_gate(tmp_path):
+    loaded = Pretrained.load(str(QWEN2_MOE), dtype='float32', attention_impl='reference')
+    loaded.save(tmp_path / 'export')
+    again = Pretrained.load(str(tmp_path / 'export'), dtype='float32', attention_impl='reference')
+    for path, leaf in flat_tree(loaded.variables).items():
+        np.testing.assert_array_equal(leaf, flat_tree(again.variables)[path])
+    assert json.loads((tmp_path / 'export/config.json').read_text()) == fixture_config('qwen2-moe-tiny')
+
+
+def test_qwen2_moe_runs_a_backward_update():
+    model, variables = fp32_decoder(QWEN2_MOE)
+    ids = jnp.asarray(np.load(QWEN2_MOE / 'input_ids.npy'))
+
+    def loss(params):
+        return jnp.mean(jnp.square(model.apply({'params': params}, ids)))
+
+    before, gradients = jax.value_and_grad(loss)(variables['params'])
+    updated = jax.tree_util.tree_map(lambda p, g: p - 1e-3 * g, variables['params'], gradients)
+    assert np.isfinite(float(before)) and float(loss(updated)) < float(before)
+
+
+def test_qwen2_moe_reads_qkv_bias_without_biasing_the_output():
+    config = translate_config({**fixture_config('qwen2-moe-tiny'), 'qkv_bias': False})
+    assert config['attention_bias'] is False and config['o_proj_bias'] is False
+
+
 MINIMAX_M2 = FIXTURES / 'minimax-m2-tiny'
 
 

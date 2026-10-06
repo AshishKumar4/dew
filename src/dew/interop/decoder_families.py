@@ -91,6 +91,7 @@ from dew.interop.families.olmo import _olmo3_config
 from dew.interop.families.opt import _OPT_NAMES, _opt_config, _opt_export
 from dew.interop.families.qwen import (
     _qwen2_config,
+    _qwen2_moe_config,
     _qwen3_config,
     _qwen3_export,
     _qwen3_moe_config,
@@ -526,6 +527,18 @@ ENTRIES = (
         "Qwen3ForCausalLM",
         _qwen3_export,
         preserve_source_layout=False,
+    ),
+    DecoderFamily(
+        ('qwen2_moe',),
+        _qwen2_moe_config,
+        lambda fields: bool(not fields.qk_norm and fields.mixture is not None
+                            and fields.mixture.shared_gate),
+        'qwen2_moe',
+        'Qwen2MoeForCausalLM',
+        lambda model: {},
+        weight_path=_qwen35_moe_path,
+        packed=_FUSED_EXPERTS,
+        preserve_source_layout=True,
     ),
     DecoderFamily(
         ("qwen2",),
