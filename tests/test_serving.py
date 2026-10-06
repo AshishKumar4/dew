@@ -841,4 +841,5 @@ def test_a_padding_positions_value_is_not_part_of_a_served_row():
                           "positions": jnp.array([[1, 0, 1]], jnp.int32)})
     ticket = server.submit(inputs, 4, key=0)
     server.run()
-    np.testing.assert_array_equal(ticket.result().tokens, bound(jnp.array([[1, 2]], jnp.int32), 4, key=0).tokens)
+    expected = bound(jnp.array([[1, 2]], jnp.int32), 4, key=0)
+    np.testing.assert_array_equal(ticket.result().tokens, expected.tokens)
