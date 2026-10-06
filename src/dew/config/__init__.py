@@ -41,7 +41,7 @@ from dew.checkpoints import RUN_FILE, Checkpoints, Keep
 from dew.config.sweep import Search, Space, _read, _write, override, random_search
 from dew.coordination import agree_process_phase, agreed
 from dew.data import Dataset, DatasetSpec, Ramp
-from dew.data.dataset import json_list_argument, ramped
+from dew.data.dataset import ramped, record_argument
 from dew.lora import LoRA, _Adapted, adapted
 from dew.nn.attention import AttentionImpl
 from dew.objectives.base import Effects, Loss, Metric, Objective
@@ -242,7 +242,7 @@ class OptimConfig:
     """The weight decay passed to the optimizer; for 'adam' it is torch's coupled L2
     penalty, added to the gradient before the moments read it, for 'adamw' the
     decoupled decay."""
-    param_groups: Annotated[tuple[ParamGroup, ...], json_list_argument(ParamGroup)] = ()
+    param_groups: Annotated[tuple[ParamGroup, ...], record_argument(tuple[ParamGroup, ...])] = ()
     """Per-group learning rates, momentum schedules, weight decay and bounds; the first
     matching group wins.
 
@@ -804,4 +804,4 @@ class RunConfig:
         return finished
 
 
-__all__ = ["JsonDict", "ModelConfig", "OptimConfig", "RunConfig", "TrainerConfig", "Wandb"]
+__all__ = ["JsonDict", "ModelConfig", "OptimConfig", "RunConfig", "ScheduleSpec", "TrainerConfig", "Wandb"]

@@ -218,7 +218,8 @@ def test_a_composite_takes_the_dtype_through_its_parts_and_refuses_what_none_dec
                                                      "num_layers": 1, "num_heads": 2}}
     fields = {"text": text, "canvas_length": 4}
 
-    assert ModelConfig("diffusion_gemma", fields, dtype="float32").fields()["text"]["fields"]["dtype"] == "float32"
+    written = ModelConfig("diffusion_gemma", fields, dtype="float32").fields()
+    assert written["text"]["fields"]["dtype"] == "float32"
     with pytest.raises(ValueError, match="'diffusion_gemma' declares no param_dtype field"):
         ModelConfig("diffusion_gemma", fields, dtype="float32", param_dtype="bfloat16").fields()
     with pytest.raises(ValueError, match="'diffusion_gemma' declares no dtype field"):

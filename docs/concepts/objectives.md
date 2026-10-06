@@ -98,6 +98,8 @@ class Players(Objective):
 
 For a composite loss, return a pytree whose leaves are additive sufficient statistics and implement `reduce_loss(statistics) -> (value, has_data)`, keeping independent denominators separate. `objective.scalar_loss(variables, batch, step)` computes `(value, aux)` from the same statistics for direct differentiation. A loss that is not additive over the batch needs its own decomposition into additive statistics; a per-microbatch mean is not a substitute.
 
+The trainer differentiates the loss with `jax.grad`, so an objective whose gradient comes from another rule (e-prop's eligibility traces, a forward-gradient or evolution-strategies estimate, synthetic gradients) states that rule as JAX's own custom derivative: a `jax.custom_vjp` function whose forward computes the loss and whose backward returns the rule's gradient. The trainer then microbatches, accumulates, shards and logs it as it does any loss, through the one gradient path.
+
 `Aux(metrics=...)` holds scalar arrays to report next to the loss. With a tracker configured, the trainer records them as `train/<name>` at the logging interval. They are measured on the training batch, not on the validation set.
 
 `Aux.variables` holds new values for non-parameter state, such as BatchNorm statistics, and the trainer applies them in order after each accepted microbatch. `Aux.effects` holds additive observations. Once per supported optimizer commit, the trainer passes them to `apply_effects(variables, effects)`, which returns the new non-parameter values. Router balancing uses these deferred counts so that its bias stays fixed within an accumulation window. `Aux.qk_stats` holds attention observations, and the trainer keeps the per-head maximum across accepted microbatches.
