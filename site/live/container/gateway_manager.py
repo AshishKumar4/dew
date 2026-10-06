@@ -103,7 +103,7 @@ class LimitedKernelManager(KernelGatewayIOLoopKernelManager):
             "MALLOC_ARENA_MAX": "2",
             **({"DEW_GUEST_TRACE": "1"} if os.environ.get("DEW_GUEST_TRACE") == "1" else {}),
         }
-        isolated = ["unshare", "--mount", "--pid", "--fork", "--mount-proc",
+        isolated = ["unshare", "--mount", "--pid", "--fork", "--kill-child", "--mount-proc",
                     "--ipc", "--uts", "--net", *limited]
         await super()._async_launch_kernel(isolated, **{**kwargs, "env": env, "cwd": "/"})
 
