@@ -79,7 +79,7 @@ import torch
 from transformers import (
     AutoModelForCausalLM, AutoTokenizer, BloomConfig, BloomForCausalLM, DeepseekV3Config, DeepseekV3ForCausalLM,
     Gemma2Config, Gemma2ForCausalLM, Gemma3Config, Gemma3ForCausalLM, Gemma3TextConfig,
-    GemmaConfig, GemmaForCausalLM, LlamaConfig, LlamaForCausalLM,
+    GemmaConfig, GemmaForCausalLM, GPTNeoConfig, GPTNeoForCausalLM, LlamaConfig, LlamaForCausalLM,
     Qwen3Config, Qwen3ForCausalLM, MistralConfig, MistralForCausalLM, PreTrainedModel,
     MixtralConfig, MixtralForCausalLM, Qwen2Config, Qwen2ForCausalLM,
     Qwen3MoeConfig, Qwen3MoeForCausalLM, Olmo3Config, Olmo3ForCausalLM,
@@ -139,6 +139,19 @@ def tiny_bloom() -> BloomForCausalLM:
     return BloomForCausalLM(BloomConfig(
         vocab_size=64, hidden_size=24, n_layer=2, n_head=3,
         layer_norm_epsilon=3e-5, hidden_dropout=0., attention_dropout=0.,
+        bos_token_id=1, eos_token_id=None, pad_token_id=0))
+
+
+GPT_NEO_CONFIG = ('gpt-neo-125m', 'EleutherAI/gpt-neo-125m', '21def0189f5705e2521767faed922f1f15e7d7db')
+
+
+def tiny_gpt_neo() -> GPTNeoForCausalLM:
+    """Local/global attention without a logit scale, learned positions and an output bias."""
+    torch.manual_seed(0)
+    return GPTNeoForCausalLM(GPTNeoConfig(
+        vocab_size=64, hidden_size=32, intermediate_size=48, num_layers=2, num_heads=4,
+        attention_types=[[['global', 'local'], 1]], window_size=4, max_position_embeddings=48,
+        layer_norm_epsilon=3e-5, resid_dropout=0., embed_dropout=0., attention_dropout=0.,
         bos_token_id=1, eos_token_id=None, pad_token_id=0))
 
 
@@ -1227,7 +1240,7 @@ def main() -> None:
                         help="only the tiny fixtures, no 1.5 GB download")
     parser.add_argument("--nemotron-h-only", action="store_true",
                         help="only the Nemotron-H tiny fixture and two pinned released configs")
-    parser.add_argument('--classic-family', choices=('bloom',),
+    parser.add_argument('--classic-family', choices=('bloom', 'gpt_neo'),
                         help='only this classic decoder fixture and its pinned released config')
     args = parser.parse_args()
 
@@ -1236,6 +1249,10 @@ def main() -> None:
         write_classic_tiny('bloom-tiny', tiny_bloom())
         write_released_config(*BLOOM_CONFIG)
         write_released_config(*BLOOMZ_CONFIG)
+        return
+    if args.classic_family == 'gpt_neo':
+        write_classic_tiny('gpt-neo-tiny', tiny_gpt_neo())
+        write_released_config(*GPT_NEO_CONFIG)
         return
     write_nemotron_h()
     for name, repo, revision in NEMOTRON_H_CONFIGS:
