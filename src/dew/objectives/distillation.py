@@ -39,7 +39,17 @@ from flax import linen as nn
 from typing_extensions import TypeVar
 
 from dew.artifacts import Artifacts
-from dew.objectives.base import Aux, Batch, EMASpec, Objective, Prediction, Ratio, Step, Variables
+from dew.objectives.base import (
+    Aux,
+    Batch,
+    EMASpec,
+    Objective,
+    Prediction,
+    ProgramModule,
+    Ratio,
+    Step,
+    Variables,
+)
 from dew.registry import objectives
 
 Loss = TypeVar("Loss", default=Ratio | jax.Array | float)
@@ -118,6 +128,16 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
         self.ema = None if averaged is None else EMASpec(
             decay=averaged.decay,
             select=lambda path: path[0] != TEACHER and averaged.select(path))
+
+    def program_key(self) -> tuple[ProgramModule, ...]:
+        """The student's modules, then the teacher's, which the step does not train."""
+        return (*self.student.program_key(),
+                *(program._replace(trained=False) for program in self.teacher.program_key()))
+
+    def substitute(self, modules: Sequence[nn.Module]) -> None:
+        count = len(self.student.program_key())
+        self.student.substitute(modules[:count])
+        self.teacher.substitute(modules[count:])
 
     def held_variables(self) -> Variables | None:
         """Return the student's held tree, if any, with the teacher's under `teacher`."""

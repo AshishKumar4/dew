@@ -476,28 +476,35 @@ class DiffusionObjective(Objective[Ratio]):
 
         return optax.multi_transform({"model": tx, AUTOENCODER: tx, DISCRIMINATOR: tx}, network)
 
-    def init(self, key, variables: Variables | None = None) -> Variables:
-        held = self.held_variables() if variables is None else variables
+    # The held tree is the starting tree or the frozen towers a draw goes beside.
+    _held_parts = True
+
+    def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
+        """Draw the denoiser beside the held frozen towers."""
+        held = self.held_variables() if held is None else held
+        conditions = self.encode(held["encoders"])
+        if self.inputs.mask is not None:
+            conditions = {**conditions, "mask": jnp.zeros((1, *self.latent_shape[:-1], 1)),
+                          "masked_image": jnp.zeros((1, *self.latent_shape))}
+        drawn = self.model.init(key, jnp.ones((1, *self.latent_shape)), jnp.ones((1,)),
+                                **conditions)
+        state = {**drawn, "encoders": held["encoders"]}
+        for frozen in ("autoencoder", REPRESENTATION, PERCEPTUAL, DISCRIMINATOR):
+            # The frozen weights are state, like the encoders'. They ride in
+            # as an argument to the compiled step for the layout to place.
+            # A caller holding only some towers takes the rest as built,
+            # and a pretrained discriminator rides in the same way.
+            value = held[frozen] if frozen in held else self.held_variables().get(frozen)
+            if value is not None:
+                state[frozen] = value
+        return state
+
+    def complete_variables(self, key: jax.Array, tree: Variables) -> Variables:
+        """Add the loss's own heads the tree lacks: EDM2's uncertainty head,
+        REPA-E's tuned autoencoder, statistics and discriminator, and REPA's
+        projector. A split is kept: the optimizer moves what it leaves in `params`."""
+        state: dict[str, Any] = dict(tree)
         head_key = jax.random.fold_in(key, 1)
-        if "params" in held:
-            # A split is kept: the optimizer moves what it leaves in `params`.
-            state: dict[str, Any] = dict(held)
-        else:
-            conditions = self.encode(held["encoders"])
-            if self.inputs.mask is not None:
-                conditions = {**conditions, "mask": jnp.zeros((1, *self.latent_shape[:-1], 1)),
-                              "masked_image": jnp.zeros((1, *self.latent_shape))}
-            drawn = self.model.init(key, jnp.ones((1, *self.latent_shape)), jnp.ones((1,)),
-                                    **conditions)
-            state = {**drawn, "encoders": held["encoders"]}
-            for frozen in ("autoencoder", REPRESENTATION, PERCEPTUAL, DISCRIMINATOR):
-                # The frozen weights are state, like the encoders'. They ride in
-                # as an argument to the compiled step for the layout to place.
-                # A caller holding only some towers takes the rest as built,
-                # and a pretrained discriminator rides in the same way.
-                value = held[frozen] if frozen in held else self.held_variables().get(frozen)
-                if value is not None:
-                    state[frozen] = value
         if self.uncertainty is not None and UNCERTAINTY not in state["params"]:
             head = self.uncertainty.init(head_key, jnp.ones((1,)))
             for collection, value in head.items():
@@ -731,7 +738,7 @@ class DiffusionObjective(Objective[Ratio]):
         `limit` caps the rows drawn, which is what a preview takes. Returns
         the samples and the condition tokens behind them.
         """
-        weights = params if step.ema is None or self._ema_is_reference else step.ema
+        weights = self.evaluation_variables(params, step)
 
         def setup() -> tuple[int, dict]:
             count, selected = self._rows(batch), self._sampling_batch(batch)

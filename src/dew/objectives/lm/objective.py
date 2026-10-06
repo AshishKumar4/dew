@@ -60,9 +60,9 @@ from dew.objectives.base import (
     Omitted,
     PathFilter,
     Prediction,
+    ProgramModule,
     Ratio,
     Shown,
-    Source,
     Step,
     Variables,
     freeze,
@@ -631,12 +631,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         processor: Processor | None | Omitted = OMITTED,
     ):
         """Build the objective; the class docstring describes each argument."""
-        if isinstance(model, Source):
-            variables = model.variables if variables is OMITTED else variables
-            processor = model.text_processor if processor is OMITTED else processor
-            model = model.model
-        variables = None if variables is OMITTED else variables
-        processor = None if processor is OMITTED else processor
+        model = self.bind_model(model, variables=variables, processor=processor)
         decoder = _decoder(model)
         if decoder is not None and decoder.causal is False:
             raise ValueError("LMObjective requires a causal model for next-token likelihoods")
@@ -646,8 +641,6 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         self.head_chunks = head_chunks
         self.head_tile = _head_tile(head_tile, self.keeps_whole_logits)
         self.samples = samples
-        self.variables = variables
-        self.processor = processor
         self.balance_rate = balance_rate
         _check_terms(decoder, aux_loss_alpha=aux_loss_alpha, mtp_weight=mtp_weight, z_loss=z_loss,
                      router_z_loss=router_z_loss)
@@ -676,52 +669,36 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     def _warmup(self) -> bool:
         return self.indexer is not None and self.indexer.phase == "warmup"
 
-    def held_variables(self) -> Variables | None:
-        """Return the checkpoint a continued-pretraining run starts from.
-
-        Passed as the initializer's argument, the tree reaches the trainer's state JIT
-        as data; read from `self` inside a trace with no arguments, it would be
-        compiled into the executable as a constant.
-        """
-        return self.variables
-
     @property
     def bank_sites(self) -> tuple[DecoderBank, ...]:
         return self.model.bank_sites
 
-    def init(self, key, variables: Variables | None = None) -> Variables:
-        tree = self._starting_tree(self.variables if variables is None else variables, key)
+    def program_key(self) -> tuple[ProgramModule, ...]:
+        return (ProgramModule(self.model, self.head_tile, trained=True),)
+
+    def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
+        return self.model.init(key, jnp.zeros((1, self.seq_len), jnp.int32))
+
+    def complete_variables(self, key: jax.Array, tree: Variables) -> Variables:
+        """Split the tree as the indexer phase trains it.
+
+        An indexer phase decides its own split, the warm-up the indexer alone
+        and the sparse phase the whole tree, so it starts from the tree
+        whole. The warm-up may start from a dense checkpoint that has no
+        indexer yet, and a fresh init supplies exactly those weights.
+        """
+        if self.indexer is not None:
+            tree = thaw(tree)
+            drawn = jax.eval_shape(self.fresh_variables, key, None)
+            missing = _leaf_paths(drawn["params"]) - _leaf_paths(tree["params"])
+            if self._warmup and missing:
+                outside = sorted("/".join(path) for path in missing if not _is_indexer(path))
+                if outside:
+                    raise ValueError(
+                        "the warm-up initialises the indexer and nothing else, but the "
+                        f"starting tree lacks {outside[:3]}{'...' if len(outside) > 3 else ''}")
+                tree = merge(self.fresh_variables(key, None), tree)
         return tree if self.phase is None else freeze(tree, self.phase)
-
-    def _starting_tree(self, given: Variables | None, key) -> Variables:
-        """Return the tree training starts from: the given one as it is,
-        split or whole, or a fresh init. An indexer phase decides its own
-        split, the warm-up the indexer alone and the sparse phase the whole
-        tree, so it starts from the given tree whole."""
-        def fresh() -> Variables:
-            return self.model.init(key, jnp.zeros((1, self.seq_len), jnp.int32))
-
-        if given is None:
-            return fresh()
-        if "params" not in given:
-            raise ValueError(
-                "variables is the variables dict ({'params': ...}) that "
-                "Pretrained.load and model.init return")
-        if self.indexer is None:
-            return given
-        whole = thaw(given)
-        if not self._warmup:
-            return whole
-        # The warm-up may start from a dense checkpoint that has no indexer
-        # yet; the fresh init supplies exactly those weights.
-        variables = fresh()
-        missing = _leaf_paths(variables["params"]) - _leaf_paths(whole["params"])
-        outside = sorted("/".join(path) for path in missing if not _is_indexer(path))
-        if outside:
-            raise ValueError(
-                "the warm-up initialises the indexer and nothing else, but the "
-                f"starting tree lacks {outside[:3]}{'...' if len(outside) > 3 else ''}")
-        return merge(variables, whole)
 
 
     def policy(self, params: Variables, sampling: Sampling = _DEFAULT_SAMPLING) -> TextGeneration:
@@ -1240,7 +1217,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
 
     def evaluate(self, params, batch, step: Step):
         """Score the complete batch teacher-forced, using EMA when present."""
-        params = params if step.ema is None else step.ema
+        params = self.evaluation_variables(params, step)
         losses, weights, correct = self._scored(params, _batch_text(batch), self._batch_roles(batch))
         return TokenScores(losses=losses, weights=weights, correct=correct)
 
@@ -1255,7 +1232,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         def setup():
             if settings is None or settings.max_new_tokens <= 0:
                 return None
-            weights = params if step.ema is None or self._ema_is_reference else step.ema
+            weights = self.evaluation_variables(params, step)
             return (self.policy(weights, settings.sampling), self._prompt, settings.max_new_tokens)
 
         def generate():

@@ -166,15 +166,10 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
                  encoder_loss_weight: float = 1.0, decoder_loss_weight: float = 1.0,
                  ema_decay: float | None = None, head_chunks: int = 4,
                  processor: Processor | None | Omitted = OMITTED):
-        if isinstance(model, Source):
-            variables = model.variables if variables is OMITTED else variables
-            processor = model.text_processor if processor is OMITTED else processor
-            if not isinstance(model.model, DiffusionGemma):
-                raise TypeError(f"block diffusion trains a DiffusionGemma, and this source's model "
-                                f"is a {type(model.model).__name__}")
-            model = model.model
-        variables = None if variables is OMITTED else variables
-        processor = None if processor is OMITTED else processor
+        model = self.bind_model(model, variables=variables, processor=processor)
+        if not isinstance(model, DiffusionGemma):
+            raise TypeError(f"block diffusion trains a DiffusionGemma, and this source's model "
+                            f"is a {type(model).__name__}")
         canvas_size = model.canvas_length if canvas_size is None else canvas_size
         for name, value in (("prompt_length", prompt_length), ("num_canvases", num_canvases),
                             ("canvas_size", canvas_size), ("head_chunks", head_chunks)):
@@ -202,7 +197,6 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         # The reference allocates one full-sequence cache for training, not the
         # model's potentially much larger serving capacity. Weights are unchanged.
         self.training_model = self.model.clone(text=self.model.text.clone(max_seq_len=self.sequence_length))
-        self.variables = variables
         self.pad_token_id = pad_token_id
         self.self_cond_prob = self_cond_prob
         self.safety_epsilon = safety_epsilon
@@ -214,7 +208,6 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         self.ema = None if ema_decay is None else EMASpec(
             optax.constant_schedule(ema_decay), select=lambda path: path[0] != FROZEN)
         self.head_chunks = head_chunks
-        self.processor = processor
 
     def inference_record(self):
         from dew.config import ModelConfig
@@ -250,18 +243,16 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         return self.training_model.bank_sites
 
     def held_variables(self) -> Variables | None:
-        """Return the SFT source this objective starts from, or None for a fresh init."""
-        return self.variables
-
-    def init(self, key: jax.Array, variables: Variables | None = None) -> Variables:
-        """The starting tree, its split kept, with the source's layer scalars
-        moved where the model reads them; or a fresh init.
+        """The SFT source this objective starts from, its split kept, with the
+        source's layer scalars moved where the model reads them; or None for
+        a fresh init.
 
         A split tree's scalars go under `frozen` beside the rest of the base,
         so an adapter's run moves its factors alone, as the source's frozen
-        scalars did not move either.
+        scalars did not move either. The move rearranges the tree and copies
+        no array.
         """
-        pretrained = self.variables if variables is None else variables
+        pretrained = self.variables
         if pretrained is not None:
             if "params" not in pretrained:
                 raise ValueError("variables must contain the params collection")
@@ -299,6 +290,9 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
             else:
                 del values["constants"]
             return values
+        return None
+
+    def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
         return self.model.init(key, jnp.zeros((1, self.canvas_size), jnp.int32))
 
     def loss(self, variables: Variables, batch: Batch, step: Step):
@@ -323,7 +317,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         as in training. Dropout is off, and the averaged weights are used when
         the run keeps them. So `perplexity` over a validation pass is the
         exponential of the denoising loss per target."""
-        params = params if step.ema is None else step.ema
+        params = self.evaluation_variables(params, step)
         losses, weights, correct = self._scored(params, batch, step.key)
         return TokenScores(losses=losses, weights=weights, correct=correct)
 
