@@ -147,6 +147,28 @@ def _fixture(name: str) -> dict[str, Any]:
     return dict(translate_config(config.get("text_config", config)))
 
 
+def _nemotron_h_moe() -> dict[str, Any]:
+    """The fp32 MoE row, checked in the explicit K-order mode.
+
+    At f7f85cef1b8c83a85c74ed93be22928c3d400801 its sequence4 gradient was
+    0.720 of the K-order bound over 52 exact residual orders, and expert4
+    was 0.596. Float64 invariance drift was at most 1.121e-14; no expert
+    gate_proj exists. The two-layout Colab CPU job took 172 seconds, so
+    this multi-draw check stays explicit rather than adding it to CI.
+    Reproduce with `--models nemotron_h_moe --layouts sequence4 expert4
+    --dtype float32 --steps 1 --devices 4 --rounding-orders --out DIR`,
+    JAX_PLATFORMS=cpu, JAX_ENABLE_X64=1 and four virtual CPU devices.
+    Raw distances live under
+    ~/.cache/dew/integration/a906f0111d586f67996850929c23b80343345891/ExcitedRook/
+    dew-aux-nemotron-orders-retry-job-1/outputs/out/nemotron_h_orders/;
+    the sibling nemotron_h_orders.log records the run.
+    """
+    config = _fixture('nemotron-h-moe-tiny')
+    config.update(vocab_size=512, num_layers=20, max_seq_len=33,
+                  layer_types=tuple(config['layer_types']) * 4)
+    return config
+
+
 class TokenRows(TypedDict):
     """The batch every decoder of the zoo trains on."""
     batch_size: int
@@ -211,9 +233,6 @@ def zoo() -> dict[str, Any]:
     nemotron_h = _fixture("nemotron-h-tiny")
     nemotron_h.update(vocab_size=512, num_layers=20, max_seq_len=33,
                      layer_types=tuple(nemotron_h["layer_types"]) * 4)
-    nemotron_h_moe = _fixture("nemotron-h-moe-tiny")
-    nemotron_h_moe.update(vocab_size=512, num_layers=20, max_seq_len=33,
-                         layer_types=tuple(nemotron_h_moe["layer_types"]) * 4)
     window = {**dense, "layer_types": ("sliding",) * 4, "kinds": {"sliding": {"window": 12}}}
     mla = {**dense, "mixer": {"name": "mla", "fields": {"q_lora_rank": 48, "kv_lora_rank": 32, "qk_nope_head_dim": 16,
                               "qk_rope_head_dim": 8, "v_head_dim": 8}}}
@@ -245,7 +264,7 @@ def zoo() -> dict[str, Any]:
         "moe128": Case("causal_transformer", moe128, **lm),
         "hybrid": Case("causal_transformer", hybrid, **lm),
         "nemotron_h": Case("causal_transformer", nemotron_h, **lm),
-        "nemotron_h_moe": Case("causal_transformer", nemotron_h_moe, **lm),
+        "nemotron_h_moe": Case("causal_transformer", _nemotron_h_moe(), **lm),
         "window": Case("causal_transformer", window, **lm),
         "mla": Case("causal_transformer", mla, **lm),
         "mamba2": Case("causal_transformer", mamba2, **lm),
