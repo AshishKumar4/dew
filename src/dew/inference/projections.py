@@ -19,6 +19,7 @@ from flax import linen as nn
 from flax.core import unfreeze
 
 from dew.interop.streaming import SourceLeaf
+from dew.nn.activations import UNGATED
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import GatedMLP
 from dew.nn.backbones.layer_plan import group_layers
@@ -42,7 +43,7 @@ def _projection_groups(model: nn.Module, variables: Variables
                 width = module.num_heads * module.head_dim * (2 if module.output_gate else 1)
                 kv_width = module.num_kv_heads * module.head_dim
                 group = ("qkv_proj", ("q_proj", "k_proj", "v_proj"), (width, kv_width, kv_width))
-            elif isinstance(module, GatedMLP) and module.activation not in ('gelu', 'gelu_exact', 'relu'):
+            elif isinstance(module, GatedMLP) and module.activation not in UNGATED:
                 group = ("gate_up_proj", ("gate_proj", "up_proj"), (module.hidden_features,) * 2)
         if group is not None:
             paths = [module.path]
