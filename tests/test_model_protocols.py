@@ -49,13 +49,16 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
-from test_architectures import CASES as ARCHITECTURES, MASK
+from test_architectures import CASES as ARCHITECTURES, MASK, TEXT_FEATURES, TEXT_TOKENS, VOCAB
 
 from dew.interop import Pretrained, hf_decoders
 from dew.lora import LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.protocols import OutputTable
+from dew.nn.dit import TextContext
+from dew.nn.inputs import ModelInputs
+from dew.nn.protocols import OutputTable, ProjectionSites, Recomputing
 from dew.objectives.lm.chunked import head_logits
 from dew.registry import models
 
@@ -404,3 +407,270 @@ def test_a_torchax_models_reads_are_its_forward(tmp_path):
         with pytest.raises(ValueError, match=r"takes no \['positions'\]"):
             model.apply(variables, tokens, method=method, positions=tokens)
     assert model.causal
+
+
+# The hooks a task, a server and the trainer read off a model: the same
+# model at another cache capacity or remat rung, the projections its decode
+# step reads packed, and a request continued into its response.
+
+
+STEPS = 3
+CAPACITY = LENGTH + STEPS
+"""Room for the prompt and the greedy steps, below every checkpoint's own capacity."""
+
+
+def _greedy(model, variables, tokens, **call):
+    """The cache `init_cache` allocates, the `STEPS` greedy draws after
+    `tokens` and the logits of every call, through `call` (the decode mode,
+    or DiffusionGemma's `encode`, the clean commits a canvas reads)."""
+    cache = model.apply(variables, ROWS, method="init_cache", mutable=["cache"])[1]["cache"]
+    logits, held = model.apply({**variables, "cache": cache}, tokens, mutable=["cache"], **call)
+    drawn, scores = [], [logits]
+    for _ in range(STEPS):
+        drawn.append(jnp.argmax(logits[:, -1], axis=-1).astype(jnp.int32))
+        logits, held = model.apply({**variables, "cache": held["cache"]}, drawn[-1][:, None],
+                                   mutable=["cache"], **call)
+        scores.append(logits)
+    return cache, jnp.stack(drawn, axis=1), scores
+
+
+def _decoding(name: str) -> dict:
+    return {"method": "encode"} if name in OWN else {"decode": True}
+
+
+@pytest.mark.parametrize("name", CHECKPOINTS)
+def test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it(name):
+    """The resized model reads the same variables: its whole-sequence
+    logits are the model's, and a causal one decodes into a cache with
+    `CAPACITY` slots where the model's had `max_seq_len` (an axis a cache
+    derives from it shrinks with it) and draws the same tokens. Its
+    attention reduces over the shorter cache, so the cached logits agree to
+    rounding."""
+    source, read = loaded(name), reads(name, "float32")
+    model, variables = source.model, source.variables
+    sized = model.with_cache_capacity(CAPACITY)
+    same(sized.apply(variables, read.tokens, method="logits"), read.logits)
+    if not model.causal:
+        return
+    cache, drawn, scores = _greedy(model, variables, read.tokens, **_decoding(name))
+    sized_cache, sized_drawn, sized_scores = _greedy(sized, variables, read.tokens, **_decoding(name))
+    assert jax.tree.structure(sized_cache) == jax.tree.structure(cache)
+    for before, after in zip(jax.tree.leaves(cache), jax.tree.leaves(sized_cache), strict=True):
+        assert all(old == new or (old, new) == (model.max_seq_len, CAPACITY) or new < old
+                   for old, new in zip(before.shape, after.shape, strict=True)), (before.shape, after.shape)
+    assert any(CAPACITY in after.shape for after in jax.tree.leaves(sized_cache)) or not any(
+        model.max_seq_len in before.shape for before in jax.tree.leaves(cache))
+    np.testing.assert_array_equal(np.asarray(sized_drawn), np.asarray(drawn))
+    for got, want in zip(sized_scores, scores, strict=True):
+        np.testing.assert_allclose(np.asarray(got), np.asarray(want), rtol=1e-5, atol=1e-5)
+
+
+def _call(model, variables, inputs, **apply) -> jax.Array:
+    """A training forward: a token model's logits, a denoiser's output."""
+    return model.apply(variables, *inputs, train=True, rngs={"dropout": jax.random.key(2)}, **apply)
+
+
+def _stepped(model, variables, inputs, **apply) -> tuple[jax.Array, dict]:
+    """A training step's forward and its gradient in every floating parameter."""
+    output = _call(model, variables, inputs, **apply)
+    cotangent = jax.random.normal(jax.random.key(1), output.shape, output.dtype)
+    flat = flatten_dict(variables["params"])
+    floats = {path: leaf for path, leaf in flat.items() if jnp.issubdtype(leaf.dtype, jnp.inexact)}
+    held = {path: leaf for path, leaf in flat.items() if path not in floats}
+
+    def loss(trained):
+        params = unflatten_dict({**held, **trained})
+        return jnp.sum(_call(model, {**variables, "params": params}, inputs, **apply) * cotangent)
+
+    return output, jax.grad(loss)(floats)
+
+
+def _rungs(model) -> list:
+    """The model, then every rung `recompute_more` climbs to."""
+    rungs = [model]
+    while (stronger := rungs[-1].recompute_more()) is not None:
+        rungs.append(stronger)
+        assert len(rungs) <= 16, "the ladder does not end"
+    return rungs
+
+
+def _climbs_and_restores(model, variables, inputs, **apply) -> None:
+    """Each rung holds less than the one below it, and steps the same
+    forward and backward bitwise: the step runs eagerly, so each recomputed
+    block replays the operations its forward ran. A rung's record restores
+    it from any rung below it and moves no rung above it, and the rung
+    runs over the model's variables, every collection where it was."""
+    rungs = _rungs(model)
+    records = [rung.recompute_record() for rung in rungs]
+    assert len(rungs) > 1
+    assert all(records[index] not in records[:index] for index in range(len(records)))
+    for low, rung in enumerate(rungs):
+        for high in range(len(rungs)):
+            restored = rung.restore_recompute(records[high]).recompute_record()
+            assert restored == records[max(low, high)], (records[low], records[high], restored)
+    assert all(rung.restore_recompute("no rung").recompute_record() == record
+               for rung, record in zip(rungs, records, strict=True))
+    output, gradient_tree = _stepped(model, variables, inputs, **apply)
+    written = model.apply(variables, *inputs, mutable=True, **apply)[1]
+    for rung in rungs[1:]:
+        stepped = _stepped(rung, variables, inputs, **apply)
+        same(stepped[0], output)
+        same(stepped[1], gradient_tree)
+        assert rung.apply(variables, *inputs, mutable=True, **apply)[1].keys() == written.keys()
+
+
+@pytest.mark.parametrize("name", CHECKPOINTS)
+def test_a_checkpoints_remat_rungs_step_as_it_does(name):
+    source, read = loaded(name), reads(name, "float32")
+    _climbs_and_restores(source.model, source.variables, (read.tokens,), method="logits")
+
+
+RECOMPUTED = [case for case in ARCHITECTURES
+              if not case.is_jepa and isinstance(models.build(case.architecture, **case.config), Recomputing)]
+
+
+def _inputs(case) -> tuple:
+    """A batch of what the case's model takes, at test_architectures.py's sizes."""
+    if case.is_lm:
+        return (jnp.asarray(np.random.RandomState(0).randint(0, VOCAB, (ROWS, case.seq_len)), jnp.int32),)
+    sample = jax.random.normal(jax.random.key(0), (ROWS, *case.sample_shape))
+    text = jax.random.normal(jax.random.key(3), (ROWS, TEXT_TOKENS, TEXT_FEATURES))
+    return sample, jnp.asarray([0.3, 0.7]), TextContext(text, jnp.ones((ROWS, TEXT_TOKENS), bool))
+
+
+@pytest.mark.parametrize("case", RECOMPUTED, ids=[case.name for case in RECOMPUTED])
+def test_an_architectures_remat_rungs_step_as_it_does(case):
+    """Every architecture test_architectures.py trains that climbs a remat
+    ladder, decoders and DiT stacks, at its size there."""
+    model = models.build(case.architecture, **case.config)
+    inputs = _inputs(case)
+    _climbs_and_restores(model, model.init(jax.random.key(0), *inputs), inputs)
+
+
+def _packed(variables, groups) -> dict:
+    """`variables` with each group's members concatenated, in order, on
+    their output axis into its packed projection, as `ProjectionGroup`
+    describes the layout its module reads."""
+    params = flatten_dict(variables["params"])
+    for group in groups:
+        fields = {path[-1] for path in params if path[:-1] == (*group.path, group.members[0])}
+        for field in fields:
+            params[(*group.path, group.packed, field)] = jnp.concatenate(
+                [params.pop((*group.path, member, field)) for member in group.members], axis=-1)
+    return {**variables, "params": unflatten_dict(params)}
+
+
+@pytest.mark.parametrize("name", DECODERS)
+def test_packed_projections_serve_the_models_numbers(name):
+    """Every group a decoder declares packs: the packed variables still
+    declare the same groups, and give the same logits and the same cached
+    decode. One wider product can round apart from three (falcon-tiny's
+    logits moved by 1.2e-7, Kimi K2's by 7.2e-7), so the logits agree to
+    rounding and the drawn tokens exactly. Each module the forward runs
+    declares no group the model leaves out, and a bidirectional decoder,
+    which serves no decode step, declares none."""
+    source, read = loaded(name), reads(name, "float32")
+    model, variables = source.model, source.variables
+    groups = model.inference_projection_groups(variables)
+    if not model.causal:
+        assert groups == ()
+        return
+    widths = flatten_dict(variables["params"])
+    for group in groups:
+        assert all(widths[(*group.path, member, "kernel")].shape[-1] == width
+                   for member, width in zip(group.members, group.widths, strict=True))
+    packed = _packed(variables, groups)
+    assert model.inference_projection_groups(packed) == groups
+    _, drawn, scores = _greedy(model, variables, read.tokens, decode=True)
+    _, packed_drawn, packed_scores = _greedy(model, packed, read.tokens, decode=True)
+    same(packed_drawn, drawn)
+    for got, want in zip([model.apply(packed, read.tokens), *packed_scores], [read.logits, *scores],
+                         strict=True):
+        np.testing.assert_allclose(np.asarray(got), np.asarray(want), rtol=1e-5, atol=1e-5)
+
+    declared, busy = set(), []
+
+    def declaring(next_fun, args, kwargs, context):
+        if not busy and context.method_name == "__call__" and isinstance(context.module, ProjectionSites):
+            busy.append(context.module)
+            try:
+                declared.update(context.module.projection_groups())
+            finally:
+                busy.pop()
+        return next_fun(*args, **kwargs)
+
+    with nn.intercept_methods(declaring):
+        model.apply(variables, read.tokens)
+    assert declared <= set(groups) and bool(declared) == bool(groups)
+
+
+def _request() -> ModelInputs:
+    """Two left-padded prompts, the second a document reset at slot 3 with
+    an image read at slots 3 and 4, and three-axis rotary coordinates."""
+    valid = jnp.asarray([[False, False, True, True, True], [False, True, True, True, True]])
+    rotary = jnp.asarray([[[0, 0, 0], [0, 0, 0], [0, 0, 0], [1, 1, 1], [2, 2, 2]],
+                          [[0, 0, 0], [0, 0, 0], [1, 1, 1], [2, 3, 4], [3, 4, 4]]], jnp.int32)
+    return ModelInputs(
+        jnp.asarray([[0, 0, 5, 6, 7], [0, 8, 9, 10, 11]], jnp.int32),
+        {"attention_mask": valid,
+         "positions": jnp.asarray([[0, 0, 0, 1, 2], [0, 0, 1, 0, 1]], jnp.int32),
+         "segment_ids": jnp.asarray([[0, 0, 1, 1, 1], [0, 1, 1, 2, 2]], jnp.int32),
+         "rotary_positions": rotary,
+         "image_indices": jnp.asarray([[-1, -1, -1, -1, -1], [-1, -1, -1, 0, 1]], jnp.int32),
+         "image_groups": jnp.asarray([[-1, -1, -1, -1, -1], [-1, -1, -1, 0, 0]], jnp.int32)},
+        {"pixel_values": jnp.ones((2, 1, 4, 4, 3))})
+
+
+def test_a_request_continues_into_its_response_by_each_fields_meaning():
+    """The response's slots read no media and sit in no image group (-1),
+    are real in rows with a real prompt token, count logical positions on
+    from the last real token and rotary ones past the largest coordinate,
+    stay in the last document, and keep each field's dtype; the prompt's
+    slots and the media are as they were."""
+    request = _request()
+    response = jnp.full((2, 2), 3, jnp.int32)
+    extended = request.extended(response)
+    fields = extended.token_fields
+    same(extended.tokens, jnp.concatenate([request.tokens, response], axis=1))
+    for name, value in request.token_fields.items():
+        same(fields[name][:, :5], value)
+    same(fields["image_indices"][:, 5:], jnp.full((2, 2), -1, jnp.int32))
+    same(fields["image_groups"][:, 5:], jnp.full((2, 2), -1, jnp.int32))
+    same(fields["attention_mask"][:, 5:], jnp.ones((2, 2), bool))
+    same(fields["positions"][:, 5:], jnp.asarray([[3, 4], [2, 3]], jnp.int32))
+    same(fields["segment_ids"][:, 5:], jnp.asarray([[1, 1], [2, 2]], jnp.int32))
+    same(fields["rotary_positions"][:, 5:],
+         jnp.asarray([[[3, 3, 3], [4, 4, 4]], [[5, 5, 5], [6, 6, 6]]], jnp.int32))
+    same(extended.conditioning, request.conditioning)
+    extended.validate()
+    same(jax.jit(lambda inputs: inputs.extended(response))(request), extended)
+
+
+def test_a_row_without_a_real_token_gets_no_real_response_slot():
+    request = ModelInputs(jnp.zeros((2, 3), jnp.int32),
+                          {"attention_mask": jnp.asarray([[False] * 3, [True] * 3])})
+    same(request.extended(jnp.ones((2, 2), jnp.int32)).token_fields["attention_mask"][:, 3:],
+         jnp.asarray([[False, False], [True, True]]))
+
+
+def test_a_field_with_no_extension_rule_is_refused_and_a_named_rule_extends_it():
+    """A routing replay has no value for slots the model has not routed, so
+    extending it is refused until the caller names a rule, which also
+    replaces a built-in one."""
+    tokens = jnp.zeros((2, 3), jnp.int32)
+    request = ModelInputs(tokens, {"routed": jnp.ones((2, 3), bool),
+                                   "positions": jnp.zeros((2, 3), jnp.int32)})
+    with pytest.raises(ValueError, match=r"\['routed'\] have no rule"):
+        request.extended(jnp.ones((2, 2), jnp.int32))
+
+    def unrouted(value, valid, width):
+        return jnp.zeros((value.shape[0], width), bool)
+
+    def zeros(value, valid, width):
+        return jnp.zeros((value.shape[0], width), value.dtype)
+
+    extended = request.extended(jnp.ones((2, 2), jnp.int32), rules={"routed": unrouted, "positions": zeros})
+    same(extended.token_fields["routed"][:, 3:], jnp.zeros((2, 2), bool))
+    same(extended.token_fields["positions"][:, 3:], jnp.zeros((2, 2), jnp.int32))
+    with pytest.raises(ValueError, match="a response is"):
+        request.extended(jnp.ones((3, 2), jnp.int32), rules={"routed": unrouted})
