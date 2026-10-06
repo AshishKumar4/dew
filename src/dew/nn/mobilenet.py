@@ -19,6 +19,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from .activations import gelu_tanh
 from .attention import RMSNorm, scaled_dot_product_attention
 from .blocks import torch_nearest_resize
 from .conv import Conv
@@ -71,14 +72,6 @@ def _timm_rms_norm(dtype: Dtype | None, name: str) -> RMSNorm:
     return RMSNorm(epsilon=1e-6, fp32_statistics=False, scale_after_cast=True, dtype=dtype, name=name)
 
 
-def _gelu(x):
-    """Apply the tanh-approximate GELU, evaluated in at least fp32."""
-    # Torch's fused GELU evaluates the polynomial in fp32 for bf16/fp16
-    # inputs. A bf16 polynomial changes its negative tail before rounding.
-    compute = jnp.promote_types(x.dtype, jnp.float32)
-    return jax.nn.gelu(x.astype(compute), approximate=True).astype(x.dtype)
-
-
 class MobileConvNormAct(nn.Module):
     features: int
     kernel: int = 1
@@ -96,7 +89,7 @@ class MobileConvNormAct(nn.Module):
                   padding=self.padding, bias=self.bias, dtype=self.dtype,
                   precision=self.precision, name="conv")(x)
         x = _timm_rms_norm(self.dtype, "bn")(x)
-        return _gelu(x) if self.activate else x
+        return gelu_tanh(x) if self.activate else x
 
 
 class MobileLayerScale(nn.Module):
@@ -196,7 +189,7 @@ class MobileResidual(nn.Module):
                       groups=groups(middle), padding=self.padding, dtype=self.dtype,
                       precision=self.precision, name="conv_exp")(x)
             x = _timm_rms_norm(self.dtype, "bn1")(x)
-            x = _gelu(x)
+            x = gelu_tanh(x)
             x = _conv(self.features, 1, padding=self.padding, dtype=self.dtype,
                       precision=self.precision, name="conv_pwl")(x)
             x = _timm_rms_norm(self.dtype, "bn2")(x)

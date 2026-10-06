@@ -14,6 +14,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew import records
 from dew.interop.weights import translate_parameters
+from dew.nn.activations import gelu_exact
 from dew.nn.attention import RMSNorm, scaled_dot_product_attention
 from dew.nn.precision import at_least_fp32
 from dew.objectives.base import Variables
@@ -147,8 +148,7 @@ class DeepseekV41ProjectorModule(nn.Module):
             0, 1, 3, 5, 2, 4
         )
         dense = functools.partial(nn.Dense, self.out_width, dtype=self.dtype, precision=self.precision)
-        aligned = dense(name="w2")(jax.nn.gelu(dense(name="w1")(
-            squares.reshape(images, high, wide, -1)), approximate=False))
+        aligned = dense(name="w2")(gelu_exact(dense(name="w1")(squares.reshape(images, high, wide, -1))))
         start, newline, end = (
             self.param(name, nn.initializers.normal(1.0), (self.out_width,), jnp.float32).astype(
                 aligned.dtype

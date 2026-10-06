@@ -19,6 +19,7 @@ import jax.numpy as jnp
 from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
+from .activations import gelu_exact, gelu_tanh
 from .attention import LayerNorm, NormalAttention
 from .blocks import FourierEmbedding, TimeProjection
 from .conv import Conv
@@ -451,23 +452,14 @@ class _JepaStackOptions(_AttentionStackOptions, kw_only=True):
                 'bidirectional_ssm': self.bidirectional_ssm}
 
 
-def _gelu(hidden: jax.Array, approximate: bool) -> jax.Array:
-    """GELU in at least fp32, rounded once to `hidden`'s dtype, as torch's bf16
-    GELU does (docs/performance.md): tanh-approximate, or exact."""
-    if approximate:
-        return nn.gelu(hidden.astype(at_least_fp32(hidden.dtype)), approximate=True).astype(hidden.dtype)
-    return _exact_gelu(hidden)
-
-
 @jax.checkpoint
 def _exact_gelu(hidden: jax.Array) -> jax.Array:
-    """Exact GELU, recomputed in the backward from `hidden` in its own dtype,
+    """`gelu_exact`, recomputed in the backward from `hidden` in its own dtype,
     which the next matmul keeps anyway. Saved instead, XLA writes the fp32
     value out for the backward, which made a JEPA training step (ViT-S/16 at
     224, batch 64, bf16, RTX 4080) 10.4% slower than with tanh GELU;
-    recomputed, 3.2% slower. The rest is erfc's own arithmetic: torch's erf
-    form measured slower still."""
-    return nn.gelu(hidden.astype(at_least_fp32(hidden.dtype)), approximate=False).astype(hidden.dtype)
+    recomputed, 3.2% slower."""
+    return gelu_exact(hidden)
 
 
 @logical_axes({("mlp", "layers_0"): ("embed", "mlp"), ("mlp", "layers_2"): ("mlp", "embed")})
@@ -550,12 +542,13 @@ class ModulatedBlock(nn.Module):
                     name="spatial_fusion",
                 )
 
+        activate = gelu_tanh if self.gelu_approximate else _exact_gelu
         self.mlp = nn.Sequential([
             nn.Dense(features=hidden_features, dtype=self.dtype, precision=self.precision),
             # Column-parallel under a tensor axis; the activation holds the
             # place so the layers keep their names. GELU runs in fp32 and
             # rounds once, as torch's bf16 GELU does (docs/performance.md).
-            lambda hidden: _gelu(constrain(hidden, MLP_HIDDEN), self.gelu_approximate),
+            lambda hidden: activate(constrain(hidden, MLP_HIDDEN)),
             nn.Dense(features=self.features, dtype=self.dtype, precision=self.precision),
         ])
         self.dropout = nn.Dropout(rate=self.dropout_rate)
