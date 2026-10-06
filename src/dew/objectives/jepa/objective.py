@@ -223,7 +223,7 @@ class JepaObjective(Objective[Ratio]):
         predictions = predictions.reshape(targets.shape)
 
         squared = (predictions.astype(jnp.float32) - targets.astype(jnp.float32)) ** 2
-        loss = Ratio(jnp.sum(squared), jnp.asarray(squared.size, squared.dtype))
+        loss = self.row_mean(squared, batch)
         pooled = jnp.mean(full, axis=tuple(range(1, full.ndim - 1)))
         return loss, Aux(representation_health(pooled))
 

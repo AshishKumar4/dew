@@ -116,16 +116,6 @@ class RouterMoments:
     top_k: int = struct.field(pytree_node=False)
 
 
-def router_moments(scores: jax.Array, indices: jax.Array) -> RouterMoments:
-    experts = scores.shape[-1]
-    dtype = jnp.promote_types(scores.dtype, jnp.float32)
-    # These counts enter a floating loss, unlike the exact integer bias effects.
-    return RouterMoments(
-        jnp.sum(scores.astype(dtype), axis=(0, 1)),
-        jnp.bincount(indices.ravel(), length=experts).astype(dtype),
-        jnp.asarray(scores.shape[0] * scores.shape[1], dtype), indices.shape[-1])
-
-
 def global_router_loss(stats: RouterMoments, alpha: float) -> jax.Array:
     """DeepSeek V2 auxiliary loss after all routed positions have pooled."""
     scores = stats.scores.astype(jnp.promote_types(stats.scores.dtype, jnp.float32))

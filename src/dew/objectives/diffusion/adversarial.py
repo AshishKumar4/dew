@@ -36,7 +36,7 @@ from dew.diffusion.transforms import FlowMatchPredictionTransform, broadcast_rat
 from dew.inputs import InputSpec, unit_range
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.dit import TextContext, masked_mean
-from dew.objectives.base import Aux, Ratio, Step, Variables
+from dew.objectives.base import Aux, Batch, Objective, Step, Variables
 from dew.registry import objectives, trainings
 from dew.sampling.solvers import Consistency
 
@@ -107,18 +107,24 @@ def _normalized(x: jax.Array, eps: float = 1e-12) -> jax.Array:
 class BatchNormLocal(nn.Module):
     """StyleGAN-T's `BatchNormLocal`: each channel normalized over the
     positions and the samples of groups of `virtual_batch`, with an affine
-    map and no running statistics."""
+    map and no running statistics. A group's samples are `batch`'s rows
+    (`Objective.row_mean`)."""
 
     virtual_batch: int = 8
     eps: float = 1e-5
 
     @nn.compact
-    def __call__(self, x: jax.Array) -> jax.Array:
-        batch, height, width, channels = x.shape
-        groups = math.ceil(batch / self.virtual_batch)
+    def __call__(self, x: jax.Array, batch: Batch) -> jax.Array:
+        rows, height, width, channels = x.shape
+        groups = math.ceil(rows / self.virtual_batch)
         grouped = x.reshape(groups, -1, height * width, channels)
-        mean = jnp.mean(grouped, axis=(1, 2), keepdims=True)
-        var = jnp.var(grouped, axis=(1, 2), keepdims=True)
+
+        def group_mean(values: jax.Array) -> jax.Array:
+            mean, _ = Objective.row_mean(values, batch, (1, 2), rows=(0, 1)).mean()
+            return jnp.expand_dims(mean, (1, 2))
+
+        mean = group_mean(grouped)
+        var = group_mean(jnp.square(grouped - mean))
         normalized = ((grouped - mean) / jnp.sqrt(var + self.eps)).reshape(x.shape)
         weight = self.param("weight", nn.initializers.ones, (channels,))
         bias = self.param("bias", nn.initializers.zeros, (channels,))
@@ -133,9 +139,9 @@ class Block(nn.Module):
     kernel_size: tuple[int, int]
 
     @nn.compact
-    def __call__(self, x: jax.Array, update: bool) -> jax.Array:
+    def __call__(self, x: jax.Array, update: bool, batch: Batch) -> jax.Array:
         y = SpectralConv(self.features, self.kernel_size, name="conv")(x, update)
-        return nn.leaky_relu(BatchNormLocal(name="norm")(y), 0.2)
+        return nn.leaky_relu(BatchNormLocal(name="norm")(y, batch), 0.2)
 
 
 class Head(nn.Module):
@@ -150,10 +156,10 @@ class Head(nn.Module):
     kernel_size: tuple[int, int] = (9, 9)
 
     @nn.compact
-    def __call__(self, x: jax.Array, condition: jax.Array, update: bool) -> jax.Array:
+    def __call__(self, x: jax.Array, condition: jax.Array, update: bool, batch: Batch) -> jax.Array:
         channels = x.shape[-1]
-        h = Block(channels, (1, 1), name="block_0")(x, update)
-        h = (Block(channels, self.kernel_size, name="block_1")(h, update) + h) / math.sqrt(2)
+        h = Block(channels, (1, 1), name="block_0")(x, update, batch)
+        h = (Block(channels, self.kernel_size, name="block_1")(h, update, batch) + h) / math.sqrt(2)
         out = SpectralConv(self.cmap_dim, (1, 1), circular=False, name="cls")(
             h, update)
         weight = self.param("cmapper_weight", nn.initializers.normal(1.0),
@@ -172,8 +178,9 @@ class Heads(nn.Module):
     kernel_size: tuple[int, int] = (9, 9)
 
     @nn.compact
-    def __call__(self, features: Sequence[jax.Array], condition: jax.Array, update: bool) -> list[jax.Array]:
-        return [Head(self.cmap_dim, self.kernel_size, name=f"head_{index}")(grid, condition, update)
+    def __call__(self, features: Sequence[jax.Array], condition: jax.Array, update: bool,
+                 batch: Batch) -> list[jax.Array]:
+        return [Head(self.cmap_dim, self.kernel_size, name=f"head_{index}")(grid, condition, update, batch)
                 for index, grid in enumerate(features)]
 
 
@@ -192,12 +199,14 @@ def _logits(scores: Sequence[jax.Array]) -> jax.Array:
     return jnp.concatenate([score.reshape(score.shape[0], -1) for score in scores], axis=-1)
 
 
-def r1_penalty(score, features: Sequence[jax.Array]) -> jax.Array:
+def r1_penalty(score, features: Sequence[jax.Array], batch: Batch) -> jax.Array:
     """ADD's R1, computed on each head's input: per row, the summed squared
     gradient of that head's mean logit with respect to its input features.
-    `score(features)` is the list of each head's logits."""
+    `score(features)` is the list of each head's logits, summed over
+    `batch`'s rows (`Objective.row_mean`)."""
     def total(features):
-        return sum(jnp.sum(jnp.mean(head.reshape(head.shape[0], -1), axis=-1)) for head in score(features))
+        return sum(Objective.row_mean(jnp.mean(head.reshape(head.shape[0], -1), axis=-1), batch).total
+                   for head in score(features))
     gradients = jax.grad(total)(list(features))
     return jnp.sum(jnp.stack([
         jnp.sum(jnp.square(g).reshape(g.shape[0], -1), axis=-1) for g in gradients]), axis=0)
@@ -322,7 +331,7 @@ class AdversarialDistillationObjective(DiffusionObjective):
         features = jax.eval_shape(lambda: self._features(self.teacher, x, jnp.ones((1,)), given))
         condition = self._condition(jnp.ones((1,)), given)
         heads = self.heads.init(jax.random.fold_in(key, 3), [jnp.zeros(f.shape, f.dtype) for f in features],
-                                condition, update=False)
+                                condition, update=False, batch={})
         state["params"] = {**state["params"], DISCRIMINATOR: heads["params"]}
         state[SPECTRAL] = heads[SPECTRAL]
         return state
@@ -392,7 +401,7 @@ class AdversarialDistillationObjective(DiffusionObjective):
         def score(head_params, spectral, features, *, update=False):
             scores, updated = self.heads.apply(
                 {"params": head_params, SPECTRAL: spectral}, features, condition,
-                                               update=update, mutable=[SPECTRAL])
+                update=update, batch=batch, mutable=[SPECTRAL])
             return scores, updated[SPECTRAL]
 
         real_scores, spectral = score(heads, variables[SPECTRAL], real, update=True)
@@ -404,7 +413,7 @@ class AdversarialDistillationObjective(DiffusionObjective):
         metrics = {"discriminator": jnp.mean(discriminator), "generator": jnp.mean(generator)}
         if self.distillation.r1_weight > 0:
             r1 = r1_penalty(lambda features: score(heads, spectral, features)[0],
-                            [jax.lax.stop_gradient(f) for f in real])
+                            [jax.lax.stop_gradient(f) for f in real], batch)
             metrics["r1"] = jnp.mean(r1)
             total = total + self.distillation.r1_weight * r1
         if self.distillation.distillation_weight > 0:
@@ -415,7 +424,7 @@ class AdversarialDistillationObjective(DiffusionObjective):
             distillation = self.distillation.distillation_weight * schedule.rates(level)[0] * distance
             metrics["distillation"] = jnp.mean(distillation)
             total = total + distillation
-        return (Ratio(jnp.sum(total), jnp.asarray(count, jnp.float32)),
+        return (self.row_mean(total, batch),
                 Aux(metrics=metrics, variables={SPECTRAL: jax.lax.stop_gradient(spectral)}))
 
 

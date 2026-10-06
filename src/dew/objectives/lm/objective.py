@@ -46,19 +46,14 @@ from dew.inputs import Field, InputSpec
 from dew.nn.backbones.causal_transformer import INTERMEDIATES, CausalTransformer, layer_output, layer_outputs
 from dew.nn.inputs import ModelInputs
 from dew.nn.mla import INDEXER, INDEXER_COLLECTION, MLAMixer
-from dew.nn.moe import (
-    RouterMoments,
-    global_router_loss,
-    load_balance_update,
-    router_moments,
-    sequence_router_losses,
-)
+from dew.nn.moe import RouterMoments, global_router_loss, load_balance_update, sequence_router_losses
 from dew.nn.multimodal import MultimodalTransformer
 from dew.nn.sharding import LOGITS, constrain
 from dew.objectives.base import (
     FROZEN,
     OMITTED,
     Aux,
+    Batch,
     EMASpec,
     Objective,
     Omitted,
@@ -390,22 +385,39 @@ def _updated_bias(bias: jax.Array, counts: jax.Array, rate: float) -> jax.Array:
     return (bias.astype(dtype) + correction).astype(bias.dtype)
 
 
-def router_z_terms(routing: Variables, weight: float) -> tuple[Ratio, ...]:
+def router_z_terms(routing: Variables, weight: float, batch: Batch) -> tuple[Ratio, ...]:
     """Return ST-MoE's router z-loss, one `Ratio` per router.
 
     This is eq. 5 of ST-MoE (arXiv 2202.08906): `weight` times the squared log
     partition of the gate logits, summed over the positions the router saw and
     divided by their count. The count adds across micro-batches, so a step's term
     is the mean over its routed positions, and the routers' terms add up, as
-    lm-engine's per-layer `(logsumexp(logits) ** 2).mean()` does.
+    lm-engine's per-layer `(logsumexp(logits) ** 2).mean()` does. The positions
+    are `batch`'s rows' (`Objective.row_mean`).
     """
     terms = []
     # lm-engine: moe/module.py at 45b6b57b, before its 0.1 and router_aux_loss_coef.
     for node in _sown_nodes(routing, "log_z"):
         (log_z,) = node["log_z"]
-        work = log_z.astype(jnp.promote_types(log_z.dtype, jnp.float32))
-        terms.append(Ratio(weight * jnp.sum(jnp.square(work)), jnp.asarray(work.size, work.dtype)))
+        work = Objective.row_mean(jnp.square(log_z.astype(jnp.promote_types(log_z.dtype, jnp.float32))),
+                                  batch)
+        terms.append(Ratio(weight * work.total, work.mass))
     return tuple(terms)
+
+
+def router_moments(scores: jax.Array, indices: jax.Array, batch: Batch) -> RouterMoments:
+    """Return one router's routed-position statistics over `batch`'s rows (`Objective.row_mean`).
+
+    `scores` is `[rows, positions, experts]` and `indices` the experts each
+    position chose, `[rows, positions, top_k]`.
+    """
+    experts = scores.shape[-1]
+    dtype = jnp.promote_types(scores.dtype, jnp.float32)
+    # These counts enter a floating loss, unlike the exact integer bias effects.
+    summed = Objective.row_mean(scores.astype(dtype), batch, axis=(0, 1))
+    chosen = jax.vmap(lambda row: jnp.bincount(row.ravel(), length=experts))(indices)
+    counts = Objective.row_mean(chosen, batch, axis=0).total.astype(dtype)
+    return RouterMoments(summed.total, counts, summed.mass, indices.shape[-1])
 
 
 def _router_scores(routing: Variables) -> list[tuple[jax.Array, jax.Array]]:
@@ -1010,7 +1022,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             weights = weights * valid[:, :-1].astype(dtype)
         return weights
 
-    def _indexer_term(self, sown, prepared: ModelInputs) -> tuple[jax.Array, jax.Array]:
+    def _indexer_term(self, sown, prepared: ModelInputs, batch: Batch) -> tuple[jax.Array, jax.Array]:
         """Sum the batch's indexer KL over the layers that sowed one, with
         the number of queries it counted.
 
@@ -1024,8 +1036,8 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
                 "mixer carries the indexer")
         weights = self._query_weights(prepared, jnp.float32)
         total = jnp.sum(jnp.stack([
-            jnp.sum(kl.astype(jnp.float32) * weights[:, :kl.shape[1]]) for kl in kls]))
-        mass = jax.lax.stop_gradient(jnp.sum(weights))
+            self.row_mean(kl.astype(jnp.float32) * weights[:, :kl.shape[1]], batch).total for kl in kls]))
+        mass = jax.lax.stop_gradient(self.row_mean(weights, batch).total)
         return total / len(kls), mass
 
     def _warmup_loss(self, params, batch, step: Step) -> tuple[Ratio, Aux[Variables]]:
@@ -1040,7 +1052,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         _, gathered = self._hidden_states(
             thaw(params), inputs, train=True, rngs={"dropout": step.key},
             collections=collections, packing=prepared.slice_tokens(stop=-1).kwargs())
-        total, mass = self._indexer_term(gathered[INDEXER_COLLECTION], prepared)
+        total, mass = self._indexer_term(gathered[INDEXER_COLLECTION], prepared, batch)
         reported = {"indexer_kl": total / jnp.where(mass > 0, mass, 1)}
         qk = gathered.get("qk") if self.qk_stats else None
         if self.qk_stats:
@@ -1101,8 +1113,8 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             depths=self.mtp_weight is not None, roles=self._batch_roles(batch),
             qk_stats=self.qk_stats, indexer=self.indexer is not None, layers=layers)
         losses, weights, log_z, correct, _, _, routing, depths, qk, kls = scores
-        mass = jax.lax.stop_gradient(jnp.sum(weights))
-        prediction = Ratio(jnp.sum(losses * weights), mass)
+        mass = jax.lax.stop_gradient(self.row_mean(weights, batch).total)
+        prediction = Ratio(self.row_mean(losses * weights, batch).total, mass)
         ce, _ = prediction.mean()
         reported = {"ce": ce, "perplexity": jnp.exp(ce)}
         if correct is not None:
@@ -1110,13 +1122,13 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         if self.z_loss:
             # PaLM's auxiliary over the same counted targets as the cross
             # entropy, so one Ratio carries both.
-            z_total = self.z_loss * jnp.sum(jnp.square(log_z) * weights)
+            z_total = self.z_loss * self.row_mean(jnp.square(log_z) * weights, batch).total
             reported["z_loss"] = z_total / jnp.where(mass > 0, mass, 1)
             prediction = Ratio(prediction.total + z_total, mass)
         if self.mtp_weight is not None:
             # Depths retain the main target denominator and configured depth average.
             mtp_total = jnp.mean(jnp.stack([
-                jnp.sum(depth_losses * depth_weights)
+                self.row_mean(depth_losses * depth_weights, batch).total
                 for depth_losses, depth_weights in depths]))
             reported["mtp_ce"], _ = Ratio(mtp_total, mass).mean()
             prediction = Ratio(prediction.total + self.mtp_weight * mtp_total, mass)
@@ -1125,14 +1137,14 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             # do, so one Ratio carries the step: the queries counted differ
             # from the targets only by the documents' last tokens. The
             # report is the KL per counted query, the paper's quantity.
-            total, queries = self._indexer_term(kls, prepared)
+            total, queries = self._indexer_term(kls, prepared, batch)
             reported["indexer_kl"] = total / jnp.where(queries > 0, queries, 1)
             prediction = Ratio(prediction.total + self.indexer.weight * total, mass)
         statistics: Ratio | LMStatistics = prediction
         if alpha is not None:
-            statistics, reported["aux_loss"] = self._router_statistics(prediction, routing, alpha)
+            statistics, reported["aux_loss"] = self._router_statistics(prediction, routing, alpha, batch)
         if self.router_z_loss:
-            router_z = router_z_terms(routing or {}, self.router_z_loss)
+            router_z = router_z_terms(routing or {}, self.router_z_loss, batch)
             if not router_z:
                 raise ValueError(
                     "router_z_loss needs routers that sow their gate's log partition "
@@ -1150,7 +1162,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
                 reported["qk/max_logit"] = peak
         return statistics, Aux(reported, qk_stats=qk, effects=effects), scores
 
-    def _router_statistics(self, prediction: Ratio, routing, alpha: float
+    def _router_statistics(self, prediction: Ratio, routing, alpha: float, batch: Batch
                            ) -> tuple[LMStatistics, jax.Array]:
         """Add the balance loss's own statistics beside the prediction's.
 
@@ -1161,10 +1173,9 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         if not routing:
             raise ValueError("aux_loss_alpha requires a model with a mixture")
         routers = _router_scores(routing)
-        sequence = tuple(Ratio(jnp.sum(sequence_router_losses(s, i, alpha)),
-                              jnp.asarray(s.shape[0], jnp.promote_types(s.dtype, jnp.float32)))
+        sequence = tuple(self.row_mean(sequence_router_losses(s, i, alpha), batch)
                          for s, i in routers) if self.seq_aux else ()
-        global_routers = () if self.seq_aux else tuple(router_moments(s, i) for s, i in routers)
+        global_routers = () if self.seq_aux else tuple(router_moments(s, i, batch) for s, i in routers)
         statistics = LMStatistics(prediction, sequence, global_routers)
         combined, _ = self.reduce_loss(statistics)
         prediction_loss, _ = prediction.mean()
