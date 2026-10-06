@@ -10,6 +10,11 @@
    "sources": [{"repo": "huggingface/transformers", "version": "5.18.0", "runs": "transformers"}],
    "note": "Reference is transformers 5.18.0, differing from the suite's 5.16.1 pin because of #48241/#48486 (rotary_dim). --minimax-m2-only; per-expert weights, nonzero routing bias, full and padded fp32/float64 logits."
   },
+  "hf/qwen2-moe-tiny": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}],
+   "note": "--qwen2-moe-only; mixed full/sliding GQA, two softmax MoE layers around a dense layer, unnormalized top-k and sigmoid-gated shared expert."
+  },
   "attention_bf16.npz": {
    "tool": "tools/numerics_reference.py",
    "sources": [
