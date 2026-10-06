@@ -260,12 +260,13 @@ class MaskedDiffusionObjective(Objective[Ratio]):
             method=type(self.model).hidden_states,
         )
         head = self.model.apply(params, params["params"], method=type(self.model).head_weight)
+        bias = self.model.apply(params, params['params'], method=type(self.model).vocabulary_bias)
         # MDLM's SUBS parameterization gives the mask token no mass: it is
         # never a target, so the partition and the prediction leave it out.
         losses, predicted, _ = chunked_cross_entropy(
             hidden, head, tokens, self.head_chunks,
             softcap=self.model.final_logit_softcap, precision=self.model.precision,
-            excluded=self.process.mask_id)
+            excluded=self.process.mask_id, bias=bias)
         counted = is_masked.astype(losses.dtype)
         return tokens, losses, counted * self.process.weight(t)[:, None], counted, predicted, real
 
