@@ -27,7 +27,6 @@ prompt once per event.
 from __future__ import annotations
 
 import dataclasses
-import functools
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple
@@ -1175,10 +1174,15 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         return {"moe": merge(moe, balanced)}
 
     def evaluate(self, params, batch, step: Step):
-        """Score the complete batch teacher-forced, using EMA when present."""
-        params = self.evaluation_variables(params, step)
-        losses, weights, correct = self._scored(params, _batch_text(batch), self._batch_roles(batch))
-        return TokenScores(losses=losses, weights=weights, correct=correct)
+        """Score the complete batch teacher-forced, using EMA when present; the
+        rows and roles are read outside the compiled scoring."""
+        prepared = {TEXT_KEY: _batch_text(batch), ROLES_KEY: self._batch_roles(batch)}
+        return super().evaluate(params, prepared, step)
+
+    def _evaluation_scores(self, params, batch, key) -> TokenScores:
+        scores = self.token_scores(params, batch[TEXT_KEY], roles=batch[ROLES_KEY], predict=True)
+        assert scores.correct is not None
+        return TokenScores(scores.losses, scores.weights, scores.correct)
 
     def preview(self, params, batch, step: Step, *, scored=None):
         """Sample the configured prompt once, then decode only on process zero.
@@ -1211,16 +1215,6 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             tokens=generated,
             prompt=decode(np.asarray(prompt)[0].tolist()),
             texts=tuple(decode(row.tolist()) for row in np.asarray(generated)))
-
-    @functools.cached_property
-    def _scored(self):
-        """Compile the teacher-forced scores once per objective."""
-        def scored(params, prepared, roles):
-            scores = self.token_scores(params, prepared, roles=roles, predict=True)
-            assert scores.correct is not None
-            return scores.losses, scores.weights, scores.correct
-
-        return jax.jit(scored)
 
 
 @metrics("perplexity")
