@@ -5,7 +5,10 @@ data iterator can report one, `position`. Metrics, the loss scale and epoch
 counters belong to the training loop, which rebuilds them on resume. A position
 is either global, which any partition of the data can read, or one share's own
 offset, which only a reader of that same share can read; `dew.position` marks
-the difference and `read_position` acts on it.
+the difference and `read_position` acts on it. A state that is not a training
+run's, such as a simulation's, is saved as a mapping of arrays and restored
+through a mapping template, with the same asynchronous writes, retention and
+step index.
 
 The EMA copy is stored as its difference from the weights. Each EMA leaf with
 its weight's floating dtype and shape is stored as the XOR of the two, split
@@ -239,6 +242,8 @@ class Kept:
     ranked_by: str | None
     mode: str | None
     kind: str = 'state'
+    """'state' for a train state, 'weights' for a weights-only snapshot, 'tree'
+    for a mapping saved in place of a train state."""
     rankings: Mapping[str, dict] = dataclasses.field(default_factory=dict)
 
 
@@ -440,7 +445,7 @@ def read_position(table: dict, where: str, share: DataPartition) -> bytes:
     return mine[0]
 
 
-def _written_in_place(tree: Mapping[str, StateLeaf]) -> bool:
+def _written_in_place(tree: Mapping[str, object]) -> bool:
     """Whether orbax writes an array of `tree` from the array's own buffer.
 
     Orbax copies each array to host memory before its async write and holds
@@ -611,16 +616,20 @@ def _plane_template(ema, deltas):
     return jax.tree_util.tree_map_with_path(planes, ema), targets
 
 
-def _check_template(template, metadata, stored) -> None:
+def _check_template(template, metadata, stored, *, mapping: bool) -> None:
     """Refuse a train-state template the checkpoint at hand cannot fill.
 
     A mapping template names the leaves it wants and is checked by the
     restore itself. A whole train state has to find every required field, and
     its scaler and EMA have to be present or absent together with the
-    checkpoint's.
+    checkpoint's. A `mapping` step, a mapping saved in place of a train
+    state, has none of them.
     """
     if template is None or isinstance(template, Mapping):
         return
+    if mapping:
+        raise ValueError("the checkpoint holds a mapping saved in place of a train state; restore it "
+                         "through a mapping template, or with none")
     missing = set(STATE_LEAVES).difference(stored)
     if missing:
         raise ValueError(f"training checkpoint lacks required state fields {sorted(missing)}")
@@ -628,6 +637,20 @@ def _check_template(template, metadata, stored) -> None:
         raise ValueError("checkpoint dynamic-scaler configuration differs from this run")
     if (metadata["ema"] is None) != (template.ema is None):
         raise ValueError("checkpoint EMA configuration differs from this run")
+
+
+def _held_apart(state_tree: dict, frozen: Mapping[str, Mapping[str, str]]) -> dict[str, dict]:
+    """Take the collections a step holds in the store (`frozen`, by tree) out
+    of the restore template `state_tree`, in place, and return them by tree:
+    the restore reads them from the store onto these templates."""
+    held = {}
+    for tree, names in frozen.items():
+        collections = state_tree.get(tree)
+        if isinstance(collections, Mapping):
+            collections = dict(collections)
+            held[tree] = {name: collections.pop(name) for name in names if name in collections}
+            state_tree[tree] = collections
+    return held
 
 
 def _position_leaves(state_tree: dict, restore_args: dict, metadata, *,
@@ -809,7 +832,7 @@ class Checkpoints:
             metrics=Metrics(metadata.metrics or {}),
             ranked_by=custom.get('primary') or next(iter(rules), None),
             mode=selection.get('mode'),
-            kind='weights' if custom.get('weights_only') else 'state',
+            kind='weights' if custom.get('weights_only') else 'tree' if custom.get('tree') else 'state',
             rankings=copy.deepcopy(rules))
         self._step_cache[step] = checkpoint
         self._custom_cache[step] = copy.deepcopy(custom)
@@ -1024,8 +1047,8 @@ class Checkpoints:
     def save(
         self,
         step: int,
-        state: TrainState,
-        saved: bytes | None,
+        state: TrainState | Mapping[str, object],
+        saved: bytes | None = None,
         metrics: Mapping[str, float] | None = None,
         *,
         share: DataPartition | None = None,
@@ -1037,6 +1060,16 @@ class Checkpoints:
         artifact: JSON = None,
     ) -> None:
         """Write `state` under `step`, asynchronously.
+
+        `state` is a run's `TrainState`, or a mapping of arrays in its place
+        for a state that is not a training run's, such as a simulation's,
+        which has no optimizer, average or loss scale. A mapping is written as
+        it is, with `metrics`, `ranking` and `control` as a train state's are,
+        and `restore` reads it back through a mapping template; it takes no
+        data position, share, weights-only split, rung or artifact. It is
+        written whole at every step, without the store a train state's
+        static collections go to (`FROZEN_STORE`), so large arrays no step
+        changes are better kept out of it.
 
         Sharded arrays go straight to Orbax. Gathering them onto the host
         first would serialise the whole state through one process and defeat
@@ -1057,14 +1090,22 @@ class Checkpoints:
         parameter for fp32 Adam moments and EMA, 84 GB at 7B parameters, on
         hosts that keep the state there because device memory is short.
         """
-        profiles = None if weights_only else _power_profiles(state.opt_state)
+        persistent = self._open()
+        mapping = isinstance(state, Mapping)
+        if mapping:
+            if (saved is not None or share is not None or weights_only or rung is not None
+                    or artifact is not None):
+                raise ValueError("a mapping is saved as it is: it takes no data position, share, "
+                                 "weights-only split, rung or artifact, which a train state's save records")
+            profiles, state_tree, frozen, deltas = None, dict(state), {}, []
+        else:
+            profiles = None if weights_only else _power_profiles(state.opt_state)
+            state_tree, frozen = self._frozen(self._item(state, saved, share))
+            state_tree, deltas = _with_ema_deltas(state_tree)
+            if weights_only:
+                state_tree = {name: state_tree[name] for name in ('variables', 'ema')}
         profile_metadata = None if profiles is None else {
             'updates': int(profiles.updates), 'stds': [float(std) for std in np.asarray(profiles.stds)]}
-        persistent = self._open()
-        state_tree, frozen = self._frozen(self._item(state, saved, share))
-        state_tree, deltas = _with_ema_deltas(state_tree)
-        if weights_only:
-            state_tree = {name: state_tree[name] for name in ('variables', 'ema')}
         self._metadata = None
         if profiles is not None:
             self._profile_snapshots.add(step)
@@ -1098,6 +1139,7 @@ class Checkpoints:
                     "rung": rung,
                     "artifact": artifact,
                     "frozen": frozen,
+                    "tree": mapping,
                 },
             )
         self._pending = (step, scores)
@@ -1155,6 +1197,19 @@ class Checkpoints:
             assert isinstance(collections, Mapping)
             kept_tree[tree] = {name: value for name, value in collections.items() if name not in values}
         return kept_tree, digests
+
+    def _with_frozen(self, restored: dict, frozen: Mapping[str, Mapping[str, str]],
+                     held: Mapping[str, Mapping] | None) -> dict:
+        """`restored` with each collection the step records in the store read
+        back into its tree, onto `held`'s templates (`_held_apart`) or, with
+        none, as host arrays."""
+        for tree, names in frozen.items():
+            collections = restored.get(tree)
+            if isinstance(collections, Mapping):
+                templates = None if held is None else held.get(tree, {})
+                wanted = names if templates is None else {name: names[name] for name in templates}
+                restored[tree] = {**collections, **self._frozen_values(wanted, templates)}
+        return restored
 
     def _frozen_values(self, digests: Mapping[str, str], templates: Mapping | None) -> dict[str, Variables]:
         """Read each collection a step records from the store, onto its
@@ -1465,12 +1520,13 @@ class Checkpoints:
                 f"the template of a run placed as it was written, or read the "
                 f"persistent checkpoint at {self.path(step)}")
         snapshot = self._step_metadata(step, local=from_local)
+        mapping = bool((snapshot.custom_metadata or {}).get('tree'))
         if template is not None and not isinstance(template, Mapping) and (
                 snapshot.custom_metadata or {}).get('weights_only', False):
             raise ValueError("inference-only weights snapshot; resume a full checkpoint")
         metadata = _item_metadata(snapshot)
         stored = metadata.keys()
-        _check_template(template, metadata, stored)
+        _check_template(template, metadata, stored, mapping=mapping)
         frozen = (snapshot.custom_metadata or {}).get('frozen') or {}
         held: dict[str, dict] | None = None
         if template is None:
@@ -1494,13 +1550,7 @@ class Checkpoints:
         else:
             state_tree = {name: getattr(template, name) for name in STATE_LEAVES} \
                 if not isinstance(template, Mapping) else dict(template)
-            held = {}
-            for tree, names in frozen.items():
-                collections = state_tree.get(tree)
-                if isinstance(collections, Mapping):
-                    collections = dict(collections)
-                    held[tree] = {name: collections.pop(name) for name in names if name in collections}
-                    state_tree[tree] = collections
+            held = _held_apart(state_tree, frozen)
             if from_local:
                 self._check_placement(step, state_tree)
             targets, deltas = {}, {}
@@ -1519,6 +1569,11 @@ class Checkpoints:
                 restored = checkpointer.restore(step, args=ocp.args.PyTreeRestore(
                     item=state_tree, restore_args=restore_args, partial_restore=True))
             except (TypeError, ValueError) as mismatch:
+                if mapping:
+                    raise ValueError(
+                        f"The checkpoint at {where} holds a mapping that does not fit this "
+                        f"template ({mismatch}); restore it with the structure, shapes and "
+                        f"dtypes it was saved with.") from mismatch
                 # Model, optimizer and retained record shapes are a resume contract.
                 raise ValueError(
                     f"The checkpoint at {where} does not fit this run's "
@@ -1540,14 +1595,8 @@ class Checkpoints:
             if targets:
                 restored = {**restored, 'ema': self._averages(checkpointer, step, metadata, restored,
                                                               targets, deltas)}
-        restored = dict(restored)
-        for tree, names in frozen.items():
-            collections = restored.get(tree)
-            if isinstance(collections, Mapping):
-                templates = None if held is None else held.get(tree, {})
-                wanted = names if templates is None else {name: names[name] for name in templates}
-                restored[tree] = {**collections, **self._frozen_values(wanted, templates)}
-        table = restored.pop('position', None)
+        restored = self._with_frozen(dict(restored), frozen, held)
+        table = None if mapping else restored.pop('position', None)
         saved = None if table is None or share is None else read_position(table, where, share)
         restored = _filled(template, restored, step)
         return restored, saved
