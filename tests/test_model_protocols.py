@@ -113,6 +113,14 @@ def reads(name: str, dtype: str) -> Reads:
                  model.apply(variables, method="output_table"))
 
 
+def contracted(hidden: jax.Array, table: OutputTable, variables) -> jax.Array:
+    """`head_logits` over `table`, whose matrix is one of `variables`' own
+    arrays: the stored parameter, which a loss keeps, and no copy of it."""
+    assert any(table.matrix is leaf for leaf in jax.tree.leaves(variables))
+    return head_logits(hidden, table.matrix, softcap=table.softcap, precision=table.precision,
+                       vocab_major=table.vocab_major, bias=table.bias)
+
+
 def _cotangent(logits: jax.Array) -> jax.Array:
     return jax.random.normal(jax.random.key(1), logits.shape, logits.dtype)
 
@@ -154,13 +162,8 @@ def test_the_head_a_loss_contracts_is_the_logits(name, dtype):
     """The table's product, bias and softcap included, at the table's
     precision; or, where the model gives no table, the exact head."""
     source, read = loaded(name, dtype), reads(name, dtype)
-    table = read.table
-    if table is None:
-        scored = source.model.apply(source.variables, read.hidden, method="logits_from_hidden")
-    else:
-        scored = head_logits(read.hidden, table.matrix, softcap=table.softcap, precision=table.precision,
-                             vocab_major=table.vocab_major, bias=table.bias)
-    same(scored, read.logits)
+    same(source.model.apply(source.variables, read.hidden, method="logits_from_hidden")
+         if read.table is None else contracted(read.hidden, read.table, source.variables), read.logits)
 
 
 @dtypes
@@ -210,7 +213,8 @@ def test_the_clean_read_is_the_causal_encoders_forward_over_the_shared_tree(name
     """The encoder the canvas shares its tree with, run over the whole
     sequence: the same logits and states as the text model's own forward
     over the text tree, and the gradient its forward gives that tree, with
-    none for the parameters only the canvas reads."""
+    none for the parameters only the canvas reads. `encode`, the cached
+    commit, still moves the cache the clean read leaves alone."""
     source, read = loaded(name, dtype), reads(name, dtype)
     model, variables = source.model, source.variables
     text = _text(variables)
@@ -223,19 +227,10 @@ def test_the_clean_read_is_the_causal_encoders_forward_over_the_shared_tree(name
     others = [value for path, value in clean.items() if path[0] != "text"]
     assert others
     assert not any(np.any(np.asarray(value)) for value in others)
-
-
-@pytest.mark.parametrize("name", OWN)
-def test_encode_writes_the_cache_the_clean_read_leaves_alone(name):
-    """`encode` is still the cached commit: over the same tokens it moves
-    the cache the clean read left as it was."""
-    source, read = loaded(name), reads(name, "float32")
-    model, variables = source.model, source.variables
     cache = model.apply(variables, ROWS, method="init_cache", mutable=["cache"])[1]["cache"]
     _, written = model.apply({**variables, "cache": cache}, read.tokens, method="encode", mutable=["cache"])
-    moved = [not np.array_equal(np.asarray(after), np.asarray(before))
-             for after, before in zip(jax.tree.leaves(written["cache"]), jax.tree.leaves(cache), strict=True)]
-    assert any(moved)
+    pairs = zip(jax.tree.leaves(written["cache"]), jax.tree.leaves(cache), strict=True)
+    assert not all(np.array_equal(np.asarray(after), np.asarray(before)) for after, before in pairs)
 
 
 @pytest.mark.parametrize("name", OWN)
@@ -315,8 +310,7 @@ def test_an_adapter_off_the_head_keeps_the_table():
     assert table is not None
     logits = adapted.apply(adapted_variables, tokens, method="logits")
     hidden = adapted.apply(adapted_variables, tokens, method="hidden_states")
-    same(head_logits(hidden, table.matrix, softcap=table.softcap, precision=table.precision,
-                     vocab_major=table.vocab_major, bias=table.bias), logits)
+    same(contracted(hidden, table, adapted_variables), logits)
     assert not np.array_equal(np.asarray(logits), np.asarray(model.apply(variables, tokens)))
 
 
@@ -398,8 +392,7 @@ def test_a_torchax_models_reads_are_its_forward(tmp_path):
     table = model.apply(variables, method="output_table")
     assert table is not None
     hidden = model.apply(variables, tokens, method="hidden_states")
-    same(head_logits(hidden, table.matrix, softcap=table.softcap, precision=table.precision,
-                     vocab_major=table.vocab_major, bias=table.bias), logits)
+    same(contracted(hidden, table, variables), logits)
     for method in ("logits", "hidden_states"):
         with pytest.raises(ValueError, match=r"takes no \['positions'\]"):
             model.apply(variables, tokens, method=method, positions=tokens)

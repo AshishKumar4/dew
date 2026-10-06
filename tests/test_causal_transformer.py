@@ -21,7 +21,6 @@ from model_support import TINY_DECODER
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.mixers import AttentionMixer
-from dew.objectives.lm.chunked import head_logits
 from dew.registry import models, with_precision
 
 VOCAB = 37
@@ -362,36 +361,6 @@ def test_param_tree_mirrors_the_hf_decoder_layout(rng):
         + [f'layers_{index}.{leaf}' for index in (0, 1) for leaf in layer])
     # tie_embeddings=True is the reason there is no lm_head to rename
     assert 'lm_head' not in params
-
-
-SEAM_CONFIGS = [
-    {},
-    {'tie_embeddings': False},
-    {'dtype': jnp.bfloat16},
-    {'dtype': jnp.bfloat16, 'tie_embeddings': False},
-    {'embedding_scale': True, 'final_logit_softcap': 5.0},
-    {'embedding_scale': True, 'final_logit_softcap': 5.0, 'tie_embeddings': False},
-]
-
-
-@pytest.mark.parametrize("config", SEAM_CONFIGS)
-def test_hidden_states_times_head_weight_are_the_logits(rng, config):
-    """The seam the chunked loss multiplies: states, head matrix, softcap."""
-    model = tiny(**config)
-    ids = tokens(rng)
-    params = model.init(rng, ids)
-
-    hidden = model.apply(params, ids, method=CausalTransformer.hidden_states)
-    head = model.apply(params, params['params'], method=CausalTransformer.head_weight)
-    logits = head_logits(hidden, head, softcap=model.final_logit_softcap,
-                         precision=model.precision)
-
-    assert hidden.shape == (ids.shape[0], SEQ, model.emb_features)
-    stored = params['params']['embed_tokens']['embedding'].dtype
-    assert head.shape == (model.emb_features, VOCAB) and head.dtype == stored
-    reference = model.apply(params, ids)
-    largest = jnp.abs(reference).max()
-    assert jnp.abs(logits - reference).max() <= 1e-5 * largest
 
 
 def test_untied_head_adds_lm_head_and_nothing_else(rng):
