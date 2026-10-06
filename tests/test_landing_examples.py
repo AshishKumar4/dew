@@ -1,5 +1,6 @@
 """Every editable native landing example defines its inputs in a fresh scope."""
 
+import ast
 import builtins
 import json
 import subprocess
@@ -24,6 +25,8 @@ def test_each_native_landing_cell_defines_its_imports_and_data():
     assert len(cells) == 11
     for name, code in cells.items():
         compile(code, f"{name}.py", "exec")
+        imports = [node for node in ast.parse(code).body if isinstance(node, (ast.Import, ast.ImportFrom))]
+        exec(compile(ast.Module(imports, []), f"{name}.py", "exec"), {})
         table = symtable.symtable(code, f"{name}.py", "exec")
         defined = set(vars(builtins)) | {symbol.get_name() for symbol in table.get_symbols()
                                        if symbol.is_assigned() or symbol.is_imported()}
