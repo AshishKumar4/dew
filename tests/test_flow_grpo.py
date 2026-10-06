@@ -15,6 +15,7 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
+from recording import RecordingTracker
 
 from dew.diffusion import FlowMatchingScheduler, FlowMatchPredictionTransform, Process
 from dew.inputs import Field, InputSpec
@@ -508,19 +509,6 @@ def test_conditioned_prompt_only_evaluation_preview_and_trainer_consumers():
         def finalize(self, values):
             return values[0] / values[1]
 
-    class PreviewLog:
-        def __init__(self):
-            self.scalars = {}
-            self.images = []
-
-        def log(self, scalars, step):
-            self.scalars.update(scalars)
-
-        def artifact(self, artifact, step):
-            if isinstance(artifact, RECORD_TYPES):
-                return
-            self.images.append(np.asarray(artifact.images).copy())
-
     count = jax.device_count()
     inputs = InputSpec(Field("image", (4, 4, 1)), {
         "textcontext": Condition(CharTable.from_pretrained(tokens=3, features=4))})
@@ -530,7 +518,7 @@ def test_conditioned_prompt_only_evaluation_preview_and_trainer_consumers():
     process = Process(FlowMatchingScheduler(shift=2), FlowMatchPredictionTransform())
     objective = FlowGRPOObjective(model, process, inputs, guidance=CFG(1.5), beta=0.1, steps=3)
     rollout = FlowRollout(objective, lambda images, batch: images.mean((1, 2, 3)), groups=2, steps=3)
-    tracker, metric = PreviewLog(), PixelMean()
+    tracker, metric = RecordingTracker(), PixelMean()
     trainer = Trainer(objective, optax.sgd(1e-3), key=jax.random.key(101), rollout=rollout, tracker=tracker)
     initial = trainer.place()[0]
     step = Step(initial.microstep, jax.random.key(102), initial.averaged)
@@ -556,17 +544,8 @@ def test_conditioned_prompt_only_evaluation_preview_and_trainer_consumers():
     assert int(final.updates) == 1
     observed = np.concatenate(metric.images)
     assert observed.shape == (count * 2, 4, 4, 1)
-    assert tracker.scalars["val/pixel_mean"] == pytest.approx(observed.mean(dtype=np.float64), abs=1e-8)
-    assert tracker.scalars["evaluation/records"] == count * 2
-    assert tracker.images[0].shape == (min(4, count), 4, 4, 1)
-
-
-
-
-
-
-
-
-
-
-
+    logged = {name: value for _, scalars in tracker.scalars for name, value in scalars.items()}
+    assert logged["val/pixel_mean"] == pytest.approx(observed.mean(dtype=np.float64), abs=1e-8)
+    assert logged["evaluation/records"] == count * 2
+    previews = [value for _, value in tracker.artifacts if not isinstance(value, RECORD_TYPES)]
+    assert previews[0].images.shape == (min(4, count), 4, 4, 1)

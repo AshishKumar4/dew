@@ -9,13 +9,12 @@ group or RLOO family from `dew.rl`, with old log-probabilities rescored
 through the objective's own head.
 """
 
-import json
-
 import jax
 import numpy as np
 import optax
 import pytest
-from affine_run import FEATURES, Regression
+from affine_run import Data, Regression
+from recording import RecordingTracker
 from rl_support import TinyHead
 
 from dew.objectives.lm import LMObjective
@@ -28,48 +27,6 @@ VOCAB = 8
 PROMPT_WIDTH = 8
 NEW_TOKENS = 4
 GROUPS = 2
-
-
-class Counting:
-    """A deterministic, checkpointable stream of regression batches."""
-
-    def __init__(self, batch=8):
-        self.index = 0
-        self.batch = batch
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        rng = np.random.default_rng(self.index)
-        self.index += 1
-        x = rng.normal(size=(self.batch, FEATURES)).astype(np.float32)
-        return {"x": x, "y": 2 * x[:, :2]}
-
-    def get_state(self):
-        return json.dumps({"index": self.index}).encode()
-
-    def set_state(self, state):
-        self.index = json.loads(state)["index"]
-
-
-class Data:
-    """The `Dataset` contract the trainer reads: train, val, batch, records."""
-
-    def __init__(self, train=Counting, val=None, batch=8, records=None):
-        self._train, self._val = train, val
-        self.batch, self.records = batch, records
-
-    def train(self, partition):
-        return self._train()
-
-    @property
-    def val(self):
-        return None if self._val is None else lambda partition: self._val()
-
-    @property
-    def steps_per_epoch(self):
-        return None if self.records is None else self.records // self.batch
 
 
 def leaves(state):
@@ -101,19 +58,6 @@ class Recorder:
         return batch
 
 
-class Logging:
-    """A tracker that keeps every logged scalars mapping."""
-
-    def __init__(self):
-        self.scalars = []
-
-    def log(self, scalars, step):
-        self.scalars.append(dict(scalars))
-
-    def artifact(self, value, step):
-        pass
-
-
 # --- the loop with and without a rollout -------------------------------------
 
 def test_an_identity_rollout_leaves_the_loop_byte_identical():
@@ -123,13 +67,13 @@ def test_an_identity_rollout_leaves_the_loop_byte_identical():
     loop; the compiled step is unreachable for a direct jaxpr comparison
     because it runs under `set_mesh`, which refuses to trace."""
     assert make_trainer().rollout is None
-    plain, ident = Logging(), Logging()
+    plain, ident = RecordingTracker(), RecordingTracker()
     make_trainer(tracker=plain).fit(Data(), steps=2, log_every=1)
     make_trainer(rollout=lambda state, batch, key: batch,
                  tracker=ident).fit(Data(), steps=2, log_every=1)
 
-    assert [logged["train/loss"] for logged in plain.scalars if "train/loss" in logged] == [
-        logged["train/loss"] for logged in ident.scalars if "train/loss" in logged] != []
+    assert [logged["train/loss"] for _, logged in plain.scalars if "train/loss" in logged] == [
+        logged["train/loss"] for _, logged in ident.scalars if "train/loss" in logged] != []
 
 
 def test_changing_batches_compile_once():
@@ -175,15 +119,15 @@ def test_rollout_seconds_logs_only_with_a_rollout():
     """The log tick carries `train/rollout_seconds` when a rollout is set,
     and no such key without one. The run's final goodput line is not a step
     tick, so only ticks with a loss count."""
-    tracking = Logging()
+    tracking = RecordingTracker()
     make_trainer(rollout=Recorder(), tracker=tracking).fit(Data(), steps=2, log_every=1)
-    ticks = [logged for logged in tracking.scalars if "train/loss" in logged]
+    ticks = [logged for _, logged in tracking.scalars if "train/loss" in logged]
     assert len(ticks) == 2
     assert all(tick["train/rollout_seconds"] >= 0.0 for tick in ticks)
 
-    tracking = Logging()
+    tracking = RecordingTracker()
     make_trainer(tracker=tracking).fit(Data(), steps=2, log_every=1)
-    ticks = [logged for logged in tracking.scalars if "train/loss" in logged]
+    ticks = [logged for _, logged in tracking.scalars if "train/loss" in logged]
     assert len(ticks) == 2
     assert all("train/rollout_seconds" not in tick for tick in ticks)
 
@@ -198,9 +142,9 @@ def test_a_rollouts_metrics_log_as_of_its_latest_call():
             self.metrics = {"reward/mean": float(state.step) + 0.5}
             return super().__call__(state, batch, key)
 
-    tracking = Logging()
+    tracking = RecordingTracker()
     make_trainer(rollout=Counting(), tracker=tracking).fit(Data(), steps=4, log_every=2)
-    ticks = [logged for logged in tracking.scalars if "train/loss" in logged]
+    ticks = [logged for _, logged in tracking.scalars if "train/loss" in logged]
     assert [tick["rollout/reward/mean"] for tick in ticks] == [1.5, 3.5]
 
 
