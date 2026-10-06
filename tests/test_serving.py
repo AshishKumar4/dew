@@ -6,6 +6,8 @@ and budgets, a row admitted while others run, a slot reused after its row
 left, a queue longer than the slots, and a request too large for the cache.
 """
 
+import itertools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -474,6 +476,29 @@ def test_more_requests_than_slots_queue_and_all_complete():
     for index, (prompt, budget) in enumerate(zip(prompts, budgets, strict=True)):
         assert tickets[index].result().text == bound(prompt, budget, key=index).text
     assert all(ticket.admitted is not None and ticket.admitted >= ticket.submitted for ticket in tickets)
+
+
+def test_a_ticket_shows_its_tokens_as_each_step_reads_them_back():
+    """A caller streams a request from its ticket: each read of the draws
+    replaces `tokens` with a longer prefix and calls back, the first before
+    the request finishes, and the last is the generation's own tokens."""
+    bound = task()
+    server = Server.from_task(bound, slots=2, capacity=128, admission=2, decode_steps=2)
+    ticket = server.submit(PROMPTS[2], 7, key=0)
+    other = server.submit(PROMPTS[0], 3, key=1)
+    seen = []
+    ticket.add_tokens_callback(lambda done: seen.append((done.tokens, done.done())))
+    ticket.add_tokens_callback(lambda done: 1 / 0)
+    server.run()
+    generation = ticket.result()
+    drawn = tuple(int(token) for token in generation.tokens[0, -7:][:int(generation.lengths[0])])
+    snapshots = [tokens for tokens, _ in seen]
+    assert len(snapshots) > 1 and snapshots[-1] == drawn == ticket.tokens
+    assert all(len(shorter) < len(longer) and longer[:len(shorter)] == shorter
+               for shorter, longer in itertools.pairwise(snapshots))
+    assert not seen[0][1] and not seen[-1][1]
+    assert generation.text == bound(PROMPTS[2], 7, key=0).text
+    assert other.tokens and other.result().text == bound(PROMPTS[0], 3, key=1).text
 
 
 def test_a_request_over_the_capacity_is_refused_as_the_task_refuses_it():
