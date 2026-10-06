@@ -1939,6 +1939,30 @@ reproduce the Dew side, note that `tools/benchmark_lm_serving.py` asks
 refuses because it declares no `kv_cache` layout. These runs dropped that
 request; the dense cache is the default anyway.
 
+On an A100 40 GB (Colab) at integration `0aee4c9d`, with the decode kernels
+and idle rows skipped, Dew and vLLM 0.30.0 ran in one session, alternating,
+two rounds, except that the session ended before vLLM's second 128-slot
+round:
+
+| slots | load | Dew: TTFT p50 / p99, gap p50 / p99 (ms) | vLLM |
+|---:|---:|---|---|
+| 32 | closed | 6482-6489 tokens a second | 4876-5068 |
+| 32 | 8 a second | 20.3-24.4 / 35.6-43.8, 2.85-3.21 / 15.9-19.1 | 88.3-88.5 / 171-173, 2.97-2.99 / 61.0-62.2 |
+| 32 | 16 | 21.1-25.4 / 41.2-52.1, 2.99-3.31 / 16.2-20.2 | 180-355 / 642-955, 3.83-3.99 / 62.7-64.6 |
+| 32 | 24 | 23.7-29.4 / 41.9-50.3, 3.17-3.33 / 16.2-20.5 | 924-1032 / 1971-2088, 3.86-3.93 / 62.5-65.3 |
+| 128 | closed | 9816-9851 | 7879-7951 |
+| 128 | 16 | 26.0-26.3 / 52.2-54.7, 4.48-4.52 / 17.1-19.6 | 130.7 / 190.6, 3.91 / 64.3 |
+| 128 | 24 | 32.3-33.1 / 55.1-55.2, 4.77-4.86 / 19.2-19.5 | 174.4 / 468.0, 7.35 / 68.4 |
+| 128 | 32 | 36.7-38.3 / 60.4-64.6, 5.30-5.48 / 21.0-22.6 | 1281 / 2700, 7.81 / 70.0 |
+
+On the A100, Dew serves 1.28-1.33 times vLLM's closed-loop throughput at 32
+slots and 1.24 at 128. Under open-loop arrivals its time to first token
+stays at 20-38 ms, while vLLM's grows into seconds once the arrival rate
+nears its throughput. vLLM's median token gap is shorter only at 128 slots
+and 16 requests a second (3.91 against 4.5 ms). Its gap p99 is 61-70 ms
+against Dew's 16-23. vLLM ran its defaults through
+`tools/benchmark_lm_serving.py --backend vllm-engine`.
+
 ## Quantized serving of the 176M text-to-image model, 2026-09-28
 
 `TextToImage.quantized` serves the denoiser with its kernels stored as int8
