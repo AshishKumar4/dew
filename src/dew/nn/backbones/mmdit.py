@@ -175,7 +175,12 @@ class SimpleMMDiT(_DiTStackOptions):
         ]
         self.output = self._output(self.patch_size, self.output_channels, modulated=True)
 
-    def __call__(self, x, temb, textcontext, train: bool = False):  # textcontext is required
+    @property
+    def text_keyword(self) -> str:
+        """Every call takes the text as `textcontext`, which runs as a second stream through every block."""
+        return "textcontext"
+
+    def __call__(self, x, temb, textcontext, train: bool = False):
         _, H, W, _ = x.shape
 
         img, inv_idx = self.embed(x)
@@ -371,6 +376,11 @@ class HierarchicalMMDiT(_AttentionStackOptions):
         self.decoder_path(num_stages)
 
         self.output = self._output(self.base_patch_size, self.output_channels, modulated=True)
+
+    @property
+    def text_keyword(self) -> str:
+        """Every call takes the text as `textcontext`, which runs as a second stream through every block."""
+        return "textcontext"
 
     def __call__(self, x, temb, textcontext, train: bool = False):
         _, H, W, _ = x.shape

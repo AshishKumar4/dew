@@ -147,6 +147,11 @@ class Flux2Transformer(nn.Module):
     def features(self) -> int:
         return self.heads * self.head_dim
 
+    @property
+    def text_keyword(self) -> str:
+        """Every call takes the text as `conditioning`, run beside the image in the double-stream blocks."""
+        return "conditioning"
+
     @nn.compact
     def __call__(self, x, time, conditioning: DenoisingCondition, train: bool = False):
         """Return the flow for the latents `x` at `time` under `conditioning`.
