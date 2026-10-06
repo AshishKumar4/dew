@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import enum
 import functools
+import math
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -259,6 +260,16 @@ leaves stay in this collection as part of the state, and `thaw` merges the
 two before the model reads them."""
 
 
+VALID_ROWS = "valid_rows"
+"""The field every evaluation batch carries: one bool a row, True for a real
+record and False for a repeat. A split's last batch is filled out to the
+batch's rows with repeats of its own rows, and a process whose share ran out
+before its peers' scores a copy of its last batch with every row a repeat, so
+a pass is whole batches on every process and counts each record once. A
+loss weights its rows by it, and its batch-wide terms are taken over the
+real rows; training batches never carry it."""
+
+
 def freeze(variables: Variables, trainable: PathFilter) -> Variables:
     """Move the `params` leaves that `trainable` rejects into the `FROZEN` collection.
 
@@ -490,6 +501,31 @@ class Objective(ABC, Generic[Loss, Effects]):
         `reduce_loss` runs on the sum.
         """
 
+    @staticmethod
+    def row_mean(values: jax.Array, batch: Batch, axis: int | tuple[int, ...] | None = None, *,
+                 rows: int | tuple[int, ...] = 0) -> Ratio:
+        """Return the mean of `values` over `axis`, as the `Ratio` of their sum and count.
+
+        `rows` is the axis of `values`, or the consecutive axes, that index
+        `batch`'s rows. The sum runs over `axis` (every axis by default) and
+        the count is the entries summed. Under an evaluation batch's
+        `VALID_ROWS` a repeat row weighs zero in both, so a loss and every
+        batch-wide term taken through this count each real record once;
+        without it this is `jnp.sum` and the size, as training reads it.
+        """
+        dtype = jnp.promote_types(values.dtype, jnp.float32)
+        axes = (tuple(range(values.ndim)) if axis is None
+                else (axis,) if isinstance(axis, int) else tuple(axis))
+        valid = batch.get(VALID_ROWS)
+        if valid is None:
+            return Ratio(jnp.sum(values, axes), jnp.asarray(math.prod(values.shape[a] for a in axes), dtype))
+        held = (rows,) if isinstance(rows, int) else rows
+        shape = [values.shape[a] if a in held else 1 for a in range(values.ndim)]
+        real = jnp.asarray(valid, bool).reshape(shape)
+        # Selected rather than multiplied, so a repeat holding a NaN still adds nothing.
+        return Ratio(jnp.sum(jnp.where(real, values, jnp.zeros((), values.dtype)), axes),
+                     jnp.sum(jnp.broadcast_to(real, values.shape).astype(dtype), axes))
+
     def _loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Loss, Aux[Effects]]:
         loss = self.loss(variables, batch, step)
         if _has_aux(loss):
@@ -716,6 +752,7 @@ OMITTED = Omitted.OMITTED
 
 __all__ = [
     "FROZEN",
+    "VALID_ROWS",
     "Aux",
     "Batch",
     "EMASpec",
