@@ -187,6 +187,11 @@ class QwenImageTransformer(nn.Module):
     def features(self) -> int:
         return self.heads * self.head_dim
 
+    @property
+    def text_keyword(self) -> str:
+        """Every call takes the text as `conditioning`, which shares the image's residual stream."""
+        return "conditioning"
+
     def _time(self, time):
         """`QwenImage21TimestepProjEmbeddings`: cosines first, then two
         bias-free linears with a SiLU between."""

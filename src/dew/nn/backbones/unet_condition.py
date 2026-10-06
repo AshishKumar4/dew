@@ -286,6 +286,11 @@ class UNet2DCondition(nn.Module):
     attention_norm_epsilon: float = 1e-5
     approximate_gelu: bool = True
 
+    @property
+    def text_keyword(self) -> str:
+        """Every call takes the text as `conditioning`, which every attention stage cross-attends to."""
+        return "conditioning"
+
     @nn.compact
     def __call__(
         self, x, time, *, conditioning: DenoisingCondition, mask=None, masked_image=None, train=False

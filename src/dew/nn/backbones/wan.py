@@ -187,6 +187,11 @@ class WanTransformer(nn.Module):
     def features(self) -> int:
         return self.num_attention_heads * self.attention_head_dim
 
+    @property
+    def text_keyword(self) -> str:
+        """Every call takes the text as `conditioning`, which every block cross-attends to."""
+        return "conditioning"
+
     @nn.compact
     def __call__(self, x, time, conditioning: DenoisingCondition, train: bool = False):
         """Return the flow for the latent `x` at `time` under `conditioning`.

@@ -12,15 +12,22 @@ through Flax's own `apply`, with `rngs` and `mutable` passed to `apply`:
     table = model.apply(variables, method='output_table')
 
 `Logits` and `HiddenStates` are token models' full-sequence reads, with no
-cache: a call writes no `cache` collection. `DenoisingModel` is the call every
-image and video denoiser already has, the raw network that
-`dew.diffusion.process.Denoiser` wraps into a prediction a solver steps
-with. `AffineHead` and `LogitsFromHidden` let a loss score the vocabulary
-without a second trunk pass: `output_table` gives the matrix a tiled loss
-contracts in place of the logits, and `logits_from_hidden` is the exact head
-for a head no matrix alone gives.
+cache: a call writes no `cache` collection, and `TokenModel` says whether
+those states attend causally and names the id masked diffusion corrupts
+tokens to. `DenoisingModel` is the call every image and video
+denoiser already has, the raw network that `dew.diffusion.process.Denoiser`
+wraps into a prediction a solver steps with. `AffineHead` and
+`LogitsFromHidden` let a loss score the vocabulary without a second trunk
+pass: `output_table` gives the matrix a tiled loss contracts in place of the
+logits, and `logits_from_hidden` is the exact head for a head no matrix alone
+gives.
 `DenoisingModel` is an annotation only: every Flax module has a `__call__`, so
-an `isinstance` check on it would hold for any model.
+an `isinstance` check on it would hold for any model. `RequiresText`,
+`IntervalModel` and `TimeScaled` are what a denoiser declares about the
+text and time it reads.
+
+The serving and training hooks are read off the model itself, not through
+`apply`, from the layers it declares; a wrapper answers for its decoder.
 
 The keywords a model takes past its tokens are `ModelKwarg` values:
 `ModelInputs.kwargs()` gives a request's token fields and conditioning, and
@@ -29,10 +36,12 @@ callers add flags and absent values.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+import dataclasses
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Protocol, Self, runtime_checkable
 
 import jax
-from flax import struct
+from flax import linen as nn, struct
 from flax.typing import PrecisionLike
 
 from dew.nn.inputs import ModelKwarg
@@ -40,9 +49,13 @@ from dew.nn.inputs import ModelKwarg
 if TYPE_CHECKING:
     from dew.diffusion.process import DenoisingCondition
     from dew.nn.dit import TextContext
+    from dew.nn.hyper_connections import HyperConnections
+    from dew.nn.mla import MLAMixer
+    from dew.records import JSON
 
-__all__ = ["AffineHead", "DenoisingModel", "HiddenStates", "Logits", "LogitsFromHidden", "ModelKwarg",
-           "OutputTable"]
+__all__ = ["AffineHead", "CacheCapacity", "DecoderTraining", "DenoisingModel", "HiddenStates",
+           "IntervalModel", "Logits", "LogitsFromHidden", "ModelKwarg", "OutputTable", "ProjectionGroup",
+           "Recomputing", "RequiresText", "Serving", "TimeScaled", "TokenModel", "TritonGemm"]
 
 
 @struct.dataclass
@@ -80,6 +93,19 @@ class HiddenStates(Protocol):
                       **fields: ModelKwarg) -> jax.Array: ...
 
 
+@runtime_checkable
+class TokenModel(Protocol):
+    """Whether a token model's `hidden_states` attend causally (each position
+    to itself and the ones before it) or to the whole sequence, and the
+    vocabulary id masked diffusion corrupts tokens to, None without one."""
+
+    @property
+    def causal(self) -> bool: ...
+
+    @property
+    def mask_token_id(self) -> int | None: ...
+
+
 class DenoisingModel(Protocol):
     """A diffusion network's output for `sample` at `time`, given its conditions:
     arrays, encoded text (`TextContext`) or a process's `DenoisingCondition`."""
@@ -105,3 +131,131 @@ class LogitsFromHidden(Protocol):
     """The exact head from final states, for scoring states a loss already holds."""
 
     def logits_from_hidden(self, hidden: jax.Array) -> jax.Array: ...
+
+
+@runtime_checkable
+class CacheCapacity(Protocol):
+    """A decoder at another decode-cache capacity: the same variables, and
+    the same draws for a request that fits."""
+
+    def with_cache_capacity(self, capacity: int) -> Self: ...
+
+
+@runtime_checkable
+class Recomputing(Protocol):
+    """A model one remat rung up (None at the top), its rung as a checkpoint
+    records it, and the model at a record's rung where that is above its
+    own: a resumed run never compiles a lighter rung than it trained on."""
+
+    def recompute_record(self) -> JSON: ...
+
+    def recompute_more(self) -> Self | None: ...
+
+    def restore_recompute(self, record: JSON) -> Self: ...
+
+
+@dataclasses.dataclass(frozen=True)
+class ProjectionGroup:
+    """Projections under `path` in `params` that read one input: `members`,
+    `widths` wide, concatenate on the output axis into `packed`, which their
+    module reads in their place, one product for a decode step."""
+
+    path: tuple[str, ...]
+    packed: str
+    members: tuple[str, ...]
+    widths: tuple[int, ...]
+
+    def held(self, params: Mapping) -> bool:
+        """Whether `params`, the parameters at `path`, hold the group packed or every member."""
+        return self.packed in params or all(member in params for member in self.members)
+
+
+@runtime_checkable
+class ProjectionSites(Protocol):
+    """A bound module's packed groups, its own and its children's."""
+
+    def projection_groups(self) -> tuple[ProjectionGroup, ...]: ...
+
+
+def declared_groups(*modules: nn.Module) -> tuple[ProjectionGroup, ...]:
+    """The groups the bound `modules` declare, in order; a module declaring none adds none."""
+    return tuple(group for module in modules if isinstance(module, ProjectionSites)
+                 for group in module.projection_groups())
+
+
+@runtime_checkable
+class Serving(Protocol):
+    """What a server reads off a decoder. `inference_projection_groups` names
+    the packed groups `variables` hold, packed or as every member (the packer
+    checks the members concatenate; a model that does not decode
+    autoregressively names none). `cache_rebuild_position` is where cached
+    keys go stale and the prefix is recomputed (LongRoPE's long factors,
+    Phi-3), or None. `mixed_admission_refusal` says why its layers would not
+    run a mixed call (`dew.nn.inputs.Admitted`) as separate decode and
+    prefill calls would, or None."""
+
+    def inference_projection_groups(self, variables: Mapping[str, Mapping]
+                                    ) -> tuple[ProjectionGroup, ...]: ...
+
+    @property
+    def cache_rebuild_position(self) -> int | None: ...
+
+    def mixed_admission_refusal(self) -> str | None: ...
+
+
+@runtime_checkable
+class DecoderTraining(Protocol):
+    """What a decoder trains beside its next token: its multi-token prediction
+    depths (arXiv 2412.19437, section 2.2; `apply`'s `method='mtp_hidden_states'`
+    and `'mtp_logits'`), which with `mtp_hyper_connections` set read the
+    residual streams a forward sows under `prediction_inputs/states`, and the
+    MLA mixers it declares with DeepSeek's lightning indexer."""
+
+    @property
+    def num_nextn_predict_layers(self) -> int: ...
+
+    @property
+    def mtp_hyper_connections(self) -> HyperConnections | None: ...
+
+    @property
+    def indexed_mixers(self) -> tuple[MLAMixer, ...]: ...
+
+
+@runtime_checkable
+class TritonGemm(Protocol):
+    """Whether a mixer of a model keeps XLA's Triton GEMM fusions (`MixerBase.keeps_triton_gemm`)."""
+
+    @property
+    def keeps_triton_gemm(self) -> bool: ...
+
+
+@runtime_checkable
+class RequiresText(Protocol):
+    """A denoising model that cannot run without text, which reaches it under
+    the keyword `text_keyword` on every call. Any other runs unconditionally."""
+
+    @property
+    def text_keyword(self) -> str: ...
+
+
+@runtime_checkable
+class IntervalModel(Protocol):
+    """A denoising model that, with its `interval` field set
+    (`model.clone(interval=True)`), embeds the `duration` an interval process
+    hands it beside its time, a missing one as zero; unset, it refuses one."""
+
+    @property
+    def interval(self) -> bool: ...
+
+
+@runtime_checkable
+class TimeScaled(Protocol):
+    """A denoising model whose `time_scale` field is its time's unit: at scale
+    s on time t (and duration d) it computes what it does at s / k on k t (and
+    k d). A loss that differentiates it in time needs the scale small
+    (`dew.objectives.diffusion.few_step.SMOOTH_TIME_SCALE`). A table of time
+    features in the variables, as `FourierEmbedding`'s, is drawn at `init`'s
+    scale and loaded variables keep theirs."""
+
+    @property
+    def time_scale(self) -> float: ...

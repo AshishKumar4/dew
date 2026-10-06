@@ -162,6 +162,11 @@ class ZImageTransformer(nn.Module):
     precision: PrecisionLike = None
     attention_impl: str = "auto"  # an AttentionImpl
 
+    @property
+    def text_keyword(self) -> str:
+        """Every call takes the caption as `conditioning`, which joins the image's single stream."""
+        return "conditioning"
+
     def _embedded_time(self, time, dtype):
         """`TimestepEmbedder` of the source's time, (1000 - time) / 1000 times
         `t_scale`: 256 sinusoids, cosines first, 1024 wide inside, and

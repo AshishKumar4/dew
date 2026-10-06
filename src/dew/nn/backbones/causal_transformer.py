@@ -25,7 +25,7 @@ import dataclasses
 import functools
 import math
 from collections.abc import Mapping, Sequence
-from typing import Literal
+from typing import Literal, Self
 
 import flax.core
 import jax
@@ -33,6 +33,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.records import JSON
 from dew.registry import from_record, mixers, models
 
 from ..activations import ungated_activation
@@ -59,8 +60,10 @@ from ..inputs import AttentionMetadata, LayerInputs, PredictionPhase
 from ..kv_cache import KVCache
 from ..mixers import AttentionMixer, MixerBase, MixerContext
 from ..mixers.mamba2 import Mamba2Mixer
+from ..mla import MLAMixer
 from ..moe import GatedActivation, Situ
 from ..precision import at_least_fp32, head_dot_general, head_product, scaled
+from ..protocols import OutputTable, ProjectionGroup, declared_groups
 from ..rope import LongRopeScaling, RopeScaling, YarnScaling, rope_scaling_from_record
 from ..sharding import (
     RESIDUAL,
@@ -72,6 +75,7 @@ from ..sharding import (
     row_axes,
 )
 from .decoder_block import (
+    DECODER_REMAT,
     BlockWiring,
     DecoderBlock,
     GatedMLP,
@@ -80,6 +84,7 @@ from .decoder_block import (
     RematPolicy,
     decoder_norm,
     remat_policy,
+    remat_record,
 )
 from .decoder_stack import DecoderBank, PipelineStage, StackView, _merged, run_pipeline, run_stack
 from .layer_plan import LayerKind, LayerSpec, ResolvedKind, group_name, scan_groups
@@ -1404,6 +1409,15 @@ class CausalTransformer(nn.Module):
         """Return the final normalized states, without the vocabulary projection."""
         return self.hidden_and_mtp_inputs(tokens, **kwargs)[0]
 
+    def logits(self, tokens, *, train: bool = False, **fields):
+        """Return `__call__`'s fp32 logits over `hidden_states(tokens, **fields)`, which
+        write no cache unless `fields` ask to `decode`."""
+        return self._logits(self.hidden_states(tokens, train=train, **fields))
+
+    def logits_from_hidden(self, hidden):
+        """Return the logits of final states `hidden`: the head `__call__` and every MTP depth score with."""
+        return self._logits(hidden)
+
     def hidden_and_mtp_inputs(self, tokens, train: bool = False, decode: bool = False,
                               positions=None, segment_ids=None,
                               input_embeddings=None,
@@ -1846,6 +1860,18 @@ class CausalTransformer(nn.Module):
             return params['embed_tokens']['embedding'], True
         return params['lm_head']['kernel'], False
 
+    def output_table(self) -> OutputTable | None:
+        """Return the head as the matrix `logits_from_hidden` contracts, read from the bound variables:
+        the parameter itself, as `head_table` gives it, with `_logits`'s bias, softcap and precision.
+        None where no matrix alone is the head: past a `head_transform`, or when `lm_head`'s scope
+        holds more than its kernel, as `dew.lora`'s factors, which its interceptor adds."""
+        head = {} if self.tie_embeddings else self.lm_head.variables["params"]
+        if self.head_transform is not None or set(head) - {"kernel"}:
+            return None
+        matrix = self.embed_tokens.embedding if self.tie_embeddings else head["kernel"]
+        return OutputTable(matrix, self.tie_embeddings, self.head_bias_value if self.head_bias else None,
+                           self.final_logit_softcap, self.precision)
+
     def init_cache(self, batch_size: int):
         """Allocate a zeroed decode cache for `batch_size` sequences.
 
@@ -1857,6 +1883,85 @@ class CausalTransformer(nn.Module):
         allocates the cache, and the calls after it write to it.
         """
         self(jnp.zeros((batch_size, 1), jnp.int32), decode=True)
+
+    # The serving and training hooks (`dew.nn.protocols`).
+
+    @nn.nowrap
+    def with_cache_capacity(self, capacity: int) -> Self:
+        """`max_seq_len` is the cache size its layers read (`open_kv_cache`);
+        a learned position table it sized keeps its rows."""
+        if self.position_embedding == 'learned' and self.position_embedding_size is None:
+            return self.clone(max_seq_len=capacity, position_embedding_size=self.max_seq_len)
+        return self.clone(max_seq_len=capacity)
+
+    @nn.nowrap
+    def recompute_record(self) -> JSON:
+        return remat_record(self.remat)
+
+    @nn.nowrap
+    def recompute_more(self) -> Self | None:
+        """One rung up `DECODER_REMAT`; None at its top or off it."""
+        if self.remat not in DECODER_REMAT[:-1]:
+            return None
+        return self.clone(remat=DECODER_REMAT[DECODER_REMAT.index(self.remat) + 1])
+
+    @nn.nowrap
+    def restore_recompute(self, record: JSON) -> Self:
+        records = [remat_record(remat) for remat in DECODER_REMAT]
+        here = remat_record(self.remat)
+        if here in records and record in records and records.index(record) > records.index(here):
+            return self.clone(remat=DECODER_REMAT[records.index(record)])
+        return self
+
+    @nn.nowrap
+    def inference_projection_groups(self, variables: Mapping[str, Mapping]) -> tuple[ProjectionGroup, ...]:
+        """Its layers', depths' and drafter's groups, bound without tracing a
+        forward; an encoder serves no decode step and names none."""
+        if not self.causal:
+            return ()
+        bound = self.bind(variables)
+        return declared_groups(*bound.layers, *bound.mtp,
+                               *(bound.dspark_stages if self.dspark is not None else ()))
+
+    @property
+    def cache_rebuild_position(self) -> int | None:
+        scaling = self.rope_scaling
+        return scaling.original_max_position_embeddings if isinstance(scaling, LongRopeScaling) else None
+
+    @nn.nowrap
+    def mixed_admission_refusal(self) -> str | None:
+        """A cache rebuilt per request, a reader beyond the token, or a layer
+        whose mixer kind declares no `mixed_step`."""
+        position = self.cache_rebuild_position
+        if position is not None:
+            return (f'LongRoPE crossing position {position} requires separate admission so each '
+                    'request keeps its own table and rebuild history')
+        if self.num_nextn_predict_layers:
+            return "it runs prediction depths"
+        if self.dspark is not None:
+            return "its block drafter keeps a cache of its own, which a mixed step does not run"
+        if self.position_embedding == "learned" or self.engram is not None or self.hash_layers:
+            return "a learned position embedding, n-gram or hash routing reads beyond the token"
+        default = self.mixer if self.mixer is not None else AttentionMixer()
+        for index, layer_type in enumerate(self.per_layer_types):
+            mixer = self.kind_of(layer_type).mixer or default
+            if not mixer.mixed_step:
+                return f"layer {index}'s cache is {type(mixer).__name__}'s, which a mixed step does not run"
+        return None
+
+    @property
+    def declared_mixers(self) -> tuple[MixerBase, ...]:
+        """The mixer values it names: its own, then each layer kind's."""
+        return tuple(mixer for mixer in (self.mixer, *(kind.mixer for kind in (self.kinds or {}).values()))
+                     if mixer is not None)
+
+    @property
+    def indexed_mixers(self) -> tuple[MLAMixer, ...]:
+        return tuple(mixer for mixer in self.declared_mixers if isinstance(mixer, MLAMixer) and mixer.indexed)
+
+    @property
+    def keeps_triton_gemm(self) -> bool:
+        return any(mixer.keeps_triton_gemm for mixer in self.declared_mixers)
 
 
 __all__ = ["CausalTransformer", "DecoderBank", "PipelineStage", "StackView"]
