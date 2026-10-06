@@ -314,7 +314,7 @@ def tiny_inputs(architecture, rng):
         latents = jax.random.normal(rng, (1, 4, 4, 16))
         return (latents, jnp.ones((1,))), {"conditioning": DenoisingCondition(
             text.hidden[:, :, :16], guidance=jnp.full((1,), 3.5))}
-    if architecture == "z_image_transformer":
+    if architecture in ("z_image_transformer", "qwen_image_transformer"):
         latents = jax.random.normal(rng, (1, 4, 4, 4))
         return (latents, jnp.ones((1,))), {"conditioning": DenoisingCondition(
             text.hidden[:, :, :16], mask=text.mask)}
@@ -323,10 +323,6 @@ def tiny_inputs(architecture, rng):
         # fewer tokens would leave it a toy-sized share of the matmuls.
         latents = jax.random.normal(rng, (1, FRAMES, 8, 8, 4))
         return (latents, jnp.ones((1,))), {"conditioning": DenoisingCondition(text.hidden[:, :, :16])}
-    if architecture == "qwen_image_transformer":
-        latents = jax.random.normal(rng, (1, 4, 4, 4))
-        return (latents, jnp.ones((1,))), {"conditioning": DenoisingCondition(
-            text.hidden[:, :, :16], mask=text.mask)}
     if architecture == "jepa_encoder":
         return (image,)
     if architecture == "causal_transformer" or architecture in DECODERS:
