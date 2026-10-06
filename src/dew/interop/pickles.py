@@ -29,8 +29,8 @@ from typing import TYPE_CHECKING
 import ml_dtypes
 import numpy as np
 
+from dew.cache import dew_cache_dir
 from dew.interop.safetensors_io import WEIGHTS_FILE, weight_files, write_file, write_index
-from dew.telemetry.instrumentation import dew_cache_dir
 
 if TYPE_CHECKING:
     import torch

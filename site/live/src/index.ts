@@ -13,6 +13,9 @@ import { visitorKey } from './visitor';
 
 export { Coordinator } from './coordinator';
 export { LiveKernel } from './kernel';
+export { SharedHost } from './shared-host';
+export { SnapshotRegistry } from './snapshots';
+export { SnapshotPreparer } from './preparer';
 
 const REFUSALS: Record<Refusal, string> = {
 	busy: 'Every live kernel is in use right now. Try again in a minute, or open the notebook in Colab.',
@@ -58,6 +61,8 @@ async function createSession(request: Request, env: Env, ctx: ExecutionContext, 
 	const now = Date.now();
 	// Any Kernel object answers with the image of the deploy it runs in.
 	const image = await env.KERNEL.get(env.KERNEL.idFromName('image')).image();
+	if (!image) return reply({ error: 'warming', message: 'The shared model is warming up. Try again in a minute.' },
+		503, cors, { 'Retry-After': '30' });
 	const opened: Opened = await coordinatorOf(env).open(await digestIp(env.SESSION_SECRET, visitorKey(ip)), now, image);
 	if (!opened.ok) {
 		return reply({ error: opened.reason, message: REFUSALS[opened.reason], retryAfter: opened.retryAfter }, 429, cors, {

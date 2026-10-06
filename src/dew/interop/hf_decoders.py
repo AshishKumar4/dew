@@ -1358,6 +1358,8 @@ _TRUNK: Mapping[str, tuple[str, ...]] = {
     'model.norm.weight': ('norm', 'scale'), 'model.norm.bias': ('norm', 'bias'),
     'model.embed_tokens.weight': ('embed_tokens', 'embedding'),
     'model.embed_positions.weight': ('embed_positions', 'embedding'),
+    'model.embedding_layernorm.weight': ('embedding_layernorm', 'scale'),
+    'model.embedding_layernorm.bias': ('embedding_layernorm', 'bias'),
     'model.embed_tokens_per_layer.weight': ('embed_tokens_per_layer', 'embedding'),
     'model.per_layer_model_projection.weight': ('per_layer_model_projection', 'kernel'),
     'model.per_layer_projection_norm.weight': ('per_layer_projection_norm', 'scale'),

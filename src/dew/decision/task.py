@@ -1,0 +1,506 @@
+"""`Decide`: a decision model answering requests, in Dew's types and in Jev's wire form."""
+
+import functools
+import json
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+from typing import TYPE_CHECKING, Self
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+from etils import epath
+from jax.typing import DTypeLike
+
+from dew import records
+from dew.artifacts import Decisions
+from dew.checkpoints import Checkpoints
+from dew.data.dataset import DataPartition, Reader
+from dew.data.text import Tokenizer
+from dew.decision.calibration import Abstention, Binning, Calibration, Scored, Temperatures, softmax
+from dew.decision.data import Example
+from dew.decision.head import KINDS, DecisionHead, kind_of
+from dew.decision.laya import LayaCheckpoint
+from dew.decision.layout import (
+    DecisionInputs,
+    Encoded,
+    Layout,
+    MarkerLayout,
+    Specials,
+    StateFirstLayout,
+    render,
+)
+from dew.decision.model import DecisionModel
+from dew.decision.questions import (
+    Answer,
+    Choice,
+    ChoiceAnswer,
+    Confidence,
+    JevConfidence,
+    Noul,
+    NoulAnswer,
+    Question,
+    Score,
+    ScoreAnswer,
+)
+from dew.inference.tasks import SHAPE_BUCKETS
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.inputs import RowPlan, mesh_of
+from dew.objectives.base import Metric, Variables
+from dew.records import JSON, json_value, record
+
+if TYPE_CHECKING:
+    from dew.training.distributed import Layout as Placement, MeshSpec
+
+TASK_FILE = "decide.json"
+"""The file `Decide.save` writes into a run: its calibration, budget and name."""
+_LAYOUTS: Mapping[str, type[Layout]] = {
+    layout.__name__: layout for layout in (MarkerLayout, StateFirstLayout)}
+
+
+@dataclass(frozen=True)
+class Budget:
+    """How much one forward pass may hold: at most `tokens` padded tokens and `rows` question rows.
+
+    Laya's `predict_items` uses 16384 and 256. A pass's row count is padded to a
+    power of two and its row length to one of at least 64, so passes share
+    compiled programs.
+    """
+
+    tokens: int = 16384
+    rows: int = 256
+
+
+@dataclass(frozen=True)
+class Weights:
+    """The checkpoint a task's weights came from: its step, and whether they are the run's average.
+
+    A calibration is fitted to one set of weights, so `save` records them and
+    `from_run` loads a saved calibration only for them.
+    """
+
+    step: int
+    ema: bool
+
+
+@dataclass(frozen=True)
+class Usage:
+    """What a request cost: the tokens every question row read, and how much of the state the rows kept.
+
+    The kept share is the smallest any question kept.
+    """
+
+    input_tokens: int
+    state_tokens: int
+    state_kept: int
+
+    @property
+    def truncated(self) -> bool:
+        return self.state_kept < self.state_tokens
+
+
+@dataclass(frozen=True)
+class Decide:
+    """Answers typed questions about a state, with one forward pass per batch.
+
+    `decide(state, questions)` returns one answer per question, with its
+    probabilities over exactly the question's options. `batch` answers many
+    requests together within the `budget`, `tournament` splits a choice too large
+    for one pass into rounds, `calibrated` fits the calibration to held-out
+    examples, and `systemone` takes and returns TypeSafe Jev's wire format. The
+    logits are divided by `calibration`'s temperatures, and each answer reports
+    `confidence`'s statistic of its distribution.
+    """
+
+    model: DecisionModel
+    variables: Variables
+    layout: Layout
+    tokenizer: Tokenizer
+    specials: Specials
+    calibration: Calibration = field(default_factory=Calibration)
+    confidence: Confidence = field(default_factory=JevConfidence)
+    budget: Budget = field(default_factory=Budget)
+    name: str = "dew"
+    """The model name a Jev response reports."""
+    weights: Weights | None = None
+    """The run checkpoint the weights came from, when they came from a run."""
+
+    @classmethod
+    def from_pretrained(cls, name: str | Path = "convaiinnovations/laya", *, subfolder: str | None = None,
+                        revision: str | None = None, dtype: str = "float32", param_dtype: str = "float32",
+                        attention_impl: str = "auto") -> Self:
+        """Load a released Laya checkpoint (`LayaCheckpoint`) as a task.
+
+        The task uses the temperatures that Laya's agent reads from
+        `rl_agent_config.json`.
+        """
+        checkpoint = LayaCheckpoint.load(name, subfolder=subfolder, revision=revision, dtype=dtype,
+                                         param_dtype=param_dtype, attention_impl=attention_impl)
+        choice, score, noul = checkpoint.temperatures
+        temperatures = Temperatures({"choice": choice, "score": score, "noul": noul},
+                                    checkpoint.bucket_temperatures)
+        label = str(name) if subfolder is None else f"{name}/{subfolder}"
+        return cls(checkpoint.model, checkpoint.variables, checkpoint.layout, checkpoint.tokenizer,
+                   checkpoint.specials, Calibration(temperatures), name=label)
+
+    @classmethod
+    def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
+                 mesh: "MeshSpec | None" = None, layout: "Placement | None" = None,
+                 dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None) -> Self:
+        """Load the `DecisionObjective` run in `directory` as a task.
+
+        The task is rebuilt from the run's record over the latest checkpoint's
+        weights (or `step`'s), and includes any calibration `save` wrote into the
+        run. `ema` selects the averaged weights, and None uses them when the run kept
+        them. `mesh` and `layout` place the weights as the trainer does, `dtype`
+        overrides the compute dtype and `param_dtype` the storage dtype.
+        """
+        from dew.data.text import tokenizer_for
+        from dew.inference.tasks import _saved_model, run_record
+        from dew.registry import from_record, objectives
+
+        record = run_record(directory, step)
+        backbone = _saved_model(record, dtype).build()
+        if not isinstance(backbone, CausalTransformer):
+            raise TypeError(f"the run's backbone is a {type(backbone).__name__}, not a CausalTransformer")
+        head = records.record(record["head"], "head")
+        model = DecisionModel(backbone, DecisionHead(
+            backbone.emb_features, layers=records.integer(head["layers"], "head.layers"),
+            dropout_rate=records.number(head["dropout_rate"], "head.dropout_rate"), dtype=backbone.dtype))
+        laid = records.record(record["layout"], "layout")
+        rows = from_record(_LAYOUTS[records.text(laid["name"], "layout.name")],
+                           records.json_value(laid["fields"], "layout.fields"))
+        tokenizer = record.get("tokenizer")
+        if tokenizer is None:
+            raise ValueError("the run records no tokenizer to lay its rows out with")
+        variables = objectives[records.text(record["objective"], "objective")]._saved_variables(
+            directory, step=step, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
+        checkpoints = Checkpoints(directory)
+        chosen = checkpoints.resolve(step)
+        chosen = checkpoints.latest if chosen is None else chosen
+        if chosen is None:
+            raise FileNotFoundError(f"{directory} holds no checkpoint")
+        averaged = checkpoints.stored(chosen).get("ema") is not None if ema is None else ema
+        task = cls(model, variables, rows, tokenizer_for(records.text(tokenizer, "tokenizer")),
+                   from_record(Specials, records.json_value(record["specials"], "specials")),
+                   name=str(epath.Path(directory).name), weights=Weights(chosen, averaged))
+        saved = epath.Path(directory) / TASK_FILE
+        if not saved.exists():
+            return task
+        settings = records.record(json.loads(saved.read_text()), TASK_FILE)
+        fitted = from_record(Weights, records.json_value(settings["weights"], "weights"))
+        if fitted != task.weights:
+            raise ValueError(
+                f"{TASK_FILE} was fitted on step {fitted.step}'s {'averaged' if fitted.ema else 'live'} "
+                f"weights, and this loads step {chosen}'s {'averaged' if averaged else 'live'} ones; "
+                "fit them again with `calibrated` and `save`, or load the step it was fitted on")
+        return replace(task, calibration=from_record(Calibration, records.json_value(settings["calibration"],
+                                                                                    "calibration")),
+                       budget=from_record(Budget, records.json_value(settings["budget"], "budget")),
+                       name=records.text(settings["name"], "name"))
+
+    def save(self, directory: str) -> None:
+        """Write this task's calibration, budget and name into the run `directory`.
+
+        It also records the checkpoint the weights came from, so `from_run` and
+        `dew.pipeline` read the calibration back for that checkpoint. The file is
+        written whole or not at all.
+        """
+        from dew.registry import to_record
+
+        if self.weights is None:
+            raise ValueError("this task's weights came from no run checkpoint, so a run has no "
+                             "calibration of them to hold; save a task from `pipeline` or `from_run`")
+        target = epath.Path(directory) / TASK_FILE
+        written = target.parent / f"{TASK_FILE}.tmp"
+        written.write_text(json.dumps({
+            "weights": to_record(self.weights, Weights),
+            "calibration": to_record(self.calibration, Calibration),
+            "budget": to_record(self.budget, Budget), "name": self.name}, indent=1) + "\n")
+        written.replace(target)
+
+    def __call__(self, state: JSON, questions: Mapping[str, Question]) -> dict[str, Answer]:
+        """Return one answer per question in `questions`, about `state`."""
+        return self.batch([(state, questions)])[0][0]
+
+    def batch(self, requests: Sequence[tuple[JSON, Mapping[str, Question]]]
+              ) -> list[tuple[dict[str, Answer], Usage]]:
+        """Return each request's answers and usage.
+
+        The question rows of every request are scored together within the budget.
+        """
+        rows = [(index, name, question, encoded)
+                for index, (state, questions) in enumerate(requests)
+                for name, question, encoded in self._encoded(state, questions)]
+        logits = self.logits([encoded for *_, encoded in rows], [question for _, _, question, _ in rows])
+        answered: list[tuple[dict[str, Answer], Usage]] = []
+        for index in range(len(requests)):
+            own = [(name, question, encoded, scores) for (row, name, question, encoded), scores
+                   in zip(rows, logits, strict=True) if row == index]
+            answers = {name: self._answer(question, scores) for name, question, _, scores in own}
+            usage = Usage(sum(len(encoded.tokens) for _, _, encoded, _ in own),
+                          max((encoded.state_tokens for _, _, encoded, _ in own), default=0),
+                          min((encoded.state_kept for _, _, encoded, _ in own), default=0))
+            answered.append((answers, usage))
+        return answered
+
+    def _encoded(self, state: JSON, questions: Mapping[str, Question]) -> list[tuple[str, Question, Encoded]]:
+        tokens = self.layout.state(self.tokenizer, self.specials, state)
+        # A conversation, a list of turns, keeps its newest turns (Laya's agent).
+        match state:
+            case list():
+                conversation = True
+            case _:
+                conversation = False
+        laid = []
+        for name, question in questions.items():
+            encoded = self.layout.encode(self.tokenizer, self.specials, question, tokens,
+                                         conversation=conversation)
+            if len(encoded.markers) != len(question.options):
+                raise ValueError(
+                    f"question {name!r}: {len(encoded.markers)} of its {len(question.options)} options fit "
+                    f"in max_len={self.layout.max_len} with head_max_len={self.layout.head_max_len}; "
+                    "raise max_len, lower head_max_len, or ask fewer options (`tournament`)")
+            laid.append((name, question, encoded))
+        return laid
+
+    def _answer(self, question: Question, logits: np.ndarray) -> Answer:
+        probabilities = self.calibration.probabilities(question, logits)
+        answer = question.answer(probabilities, self.confidence)
+        return replace(answer, abstained=self.calibration.abstains(question, probabilities))
+
+    def logits(self, rows: Sequence[Encoded], questions: Sequence[Question]) -> list[np.ndarray]:
+        """Return each row's raw option logits.
+
+        The rows are scored shortest first, in passes that fit the budget.
+        """
+        order = sorted(range(len(rows)), key=lambda index: len(rows[index].tokens))
+        found: dict[int, np.ndarray] = {}
+        start = 0
+        while start < len(order):
+            stop = start + 1
+            while (stop < len(order) and stop - start < self.budget.rows
+                   and (_bucket(len(rows[order[stop]].tokens)) * _bucket(stop - start + 1, smallest=1)
+                        <= self.budget.tokens)):
+                stop += 1
+            chosen = order[start:stop]
+            scores = self._pass([rows[index] for index in chosen], [questions[index] for index in chosen])
+            found.update({index: scores[row, :len(rows[index].markers)] for row, index in enumerate(chosen)})
+            start = stop
+        return [found[index] for index in range(len(rows))]
+
+    def _pass(self, rows: Sequence[Encoded], questions: Sequence[Question]) -> np.ndarray:
+        """One forward pass at bucketed shapes, its rows placed on the
+        weights' mesh (`RowPlan`)."""
+        kinds = [kind_of(question) for question in questions]
+        inputs = DecisionInputs.collate(rows, kinds, self.specials.pad)
+        length = _bucket(inputs.tokens.shape[1])
+        inputs = replace(
+            inputs, tokens=_widened(inputs.tokens, length, self.specials.pad),
+            valid=_widened(inputs.valid, length),
+            positions=None if inputs.positions is None else _widened(inputs.positions, length),
+            slots=None if inputs.slots is None else _widened(inputs.slots, length))
+        count = _bucket(len(rows), smallest=1)
+        padded = RowPlan(None, len(rows), count, 0, 1).pad(inputs)
+        plan = RowPlan.over(mesh_of(self.variables), count)
+        return plan.host(self._forward(self.variables, plan.place(plan.pad(padded))))[:len(rows)]
+
+    @functools.cached_property
+    def _forward(self):
+        return jax.jit(self.model.logits)
+
+    def tournament(self, state: JSON, questions: Mapping[str, Question], *,
+                   group: int = 16) -> dict[str, Answer]:
+        """Return answers in which every choice of more than `group` options is decided in rounds.
+
+        The options are cut into near-equal groups of at most `group`, and each
+        group's winner goes on, until one group is left to answer the question
+        (Laya's `predict_tournament`). A finalist's probabilities cover only the last
+        round's options.
+        """
+        if group < 2:
+            raise ValueError("a tournament groups at least two options")
+        remaining = {name: list(question.options) for name, question in questions.items()
+                     if isinstance(question, Choice) and len(question.options) > group}
+        while any(len(options) > group for options in remaining.values()):
+            rounds = {}
+            for name, options in remaining.items():
+                parts = -(-len(options) // group)
+                for part in range(parts):
+                    chosen = options[part * len(options) // parts:(part + 1) * len(options) // parts]
+                    rounds[f"{name}/{part}"] = _restricted(questions[name], chosen)
+            answers = self(state, rounds)
+            remaining = {name: [_choice(answers[key]) for key in rounds if key.rsplit("/", 1)[0] == name]
+                         for name in remaining}
+        final = {name: _restricted(question, remaining[name]) if name in remaining else question
+                 for name, question in questions.items()}
+        return self(state, final)
+
+    def calibrated(self, held_out: Iterable[Example | Mapping[str, object]] | Reader, *,
+                   binning: bool = False, target_error: float | None = None, type_minimum: int = 10,
+                   bucket_minimum: int = 2000) -> Self:
+        """Return this task with temperatures fitted to held-out answers.
+
+        If asked, it also fits a binning map and abstention thresholds that keep the
+        error of the accepted answers at `target_error`, as `Calibration`'s parts fit
+        them. `held_out` is labelled examples, or a dataset's validation reader
+        (`DecisionObjective.dataset(...).val`), whose rows are already laid out. The
+        minimum counts are Laya's: a type's temperature needs `type_minimum` answers
+        and a bucket's `bucket_minimum`.
+        """
+        scored = self._scored_reader(held_out) if callable(held_out) else self._scored(held_out)
+        if not scored:
+            raise ValueError("calibration needs examples with answers")
+        temperatures = Temperatures.fit(scored, type_minimum=type_minimum, bucket_minimum=bucket_minimum)
+        binned = Binning.fit(scored, temperatures) if binning else None
+        abstention = (None if target_error is None
+                      else Abstention.fit(scored, temperatures, binned, target_error=target_error))
+        return replace(self, calibration=Calibration(temperatures, binned, abstention))
+
+    def score(self, examples: Iterable[Example | Mapping[str, object]],
+              metrics: Sequence[Metric] = ()) -> dict[str, float]:
+        """Return `metrics` over the questions answered for `examples`, through this task's calibration.
+
+        The default metrics are Accuracy, ECE, AURC and the log loss, computed the
+        way a validation pass computes them for a run.
+        """
+        from dew.decision.metrics import AURC, ECE, Accuracy
+        from dew.decision.scoring import LogLoss
+
+        defaults: list[Metric] = [Accuracy(), ECE(), AURC(), LogLoss()]
+        chosen = list(metrics) or defaults
+        scored = self._scored(examples)
+        if not scored:
+            raise ValueError("scoring needs examples with answers")
+        width = max(len(held.logits) for held in scored)
+        probabilities = np.zeros((len(scored), width))
+        options = np.zeros((len(scored), width), bool)
+        for row, held in enumerate(scored):
+            probabilities[row, :len(held.logits)] = softmax(
+                held.logits, self.calibration.temperatures.of(held.kind, len(held.logits)))
+            options[row, :len(held.logits)] = True
+        decisions = Decisions(probabilities=jnp.asarray(probabilities), options=jnp.asarray(options),
+                              labels=jnp.asarray([held.label for held in scored]),
+                              ordinal=jnp.asarray([held.kind == Score.kind for held in scored]))
+        return {metric.name: measured(metric, decisions) for metric in chosen}
+
+    def _scored(self, examples: Iterable[Example | Mapping[str, object]]) -> list[Scored]:
+        scored = []
+        for example in map(Example.of, examples):
+            labels = example.labels()
+            rows = self._encoded(example.state, {name: example.questions[name] for name in labels})
+            logits = self.logits([row for *_, row in rows], [question for _, question, _ in rows])
+            scored.extend(Scored(question.kind, scores, labels[name])
+                          for (name, question, _), scores in zip(rows, logits, strict=True))
+        return scored
+
+    def _scored_reader(self, reader: Reader) -> list[Scored]:
+        scored = []
+        for batch in reader(DataPartition()):
+            inputs = DecisionInputs(
+                tokens=jnp.asarray(batch["tokens"]), valid=jnp.asarray(batch["valid"]),
+                markers=jnp.asarray(batch["markers"]), options=jnp.asarray(batch["options"]),
+                kinds=jnp.asarray(batch["kinds"]),
+                positions=None if "positions" not in batch else jnp.asarray(batch["positions"]),
+                slots=None if "slots" not in batch else jnp.asarray(batch["slots"]))
+            logits = np.asarray(self._forward(self.variables, inputs))
+            for row, kind in enumerate(np.asarray(batch["kinds"])):
+                count = int(np.sum(batch["options"][row]))
+                scored.append(Scored(KINDS[int(kind)].kind, logits[row, :count], int(batch["labels"][row])))
+        return scored
+
+    def gated(self, min_confidence: float | Mapping[str, float]) -> Self:
+        """Return this task abstaining below `min_confidence`.
+
+        `min_confidence` is one threshold for every answer, or one per calibration
+        bucket (`bucket`), with the other buckets ungated. An answer abstains when
+        its calibrated (and binned) top probability is below its threshold, as with
+        Laya's `min_confidence`.
+        """
+        abstention = (Abstention(dict(min_confidence)) if isinstance(min_confidence, Mapping)
+                      else Abstention(default=float(min_confidence)))
+        return replace(self, calibration=replace(self.calibration, abstention=abstention))
+
+    def systemone(self, request: Mapping[str, object], *, details: bool = False) -> dict[str, JSON]:
+        """Answer a Jev request body with a Jev response body.
+
+        The request holds `state` and `questions` in Jev's wire format, and
+        optionally `model`, which this task ignores. The response holds `model` (this
+        task's name), one answer per question, and `usage`. A Noul's answer is
+        `noul`; a Choice's is `choice`, `probabilities` and `confidence`; a Score's is
+        `score`, `legend`, `probabilities` and `confidence`. Numbers are rounded to
+        four places. With `details`, a Noul also reports its confidence, an answer
+        reports whether it abstained when the calibration gates, and `usage` reports
+        how much of the state it kept.
+        """
+        unknown = set(request) - {"state", "questions", "model"}
+        if unknown:
+            raise ValueError(f"a request holds state, questions and model, not {sorted(unknown)}")
+        if "state" not in request:
+            raise ValueError("a request needs a state")
+        questions = {name: Question.from_wire(record(wire, f"questions.{name}"))
+                     for name, wire in record(request.get("questions"), "questions").items()}
+        if not questions:
+            raise ValueError("a request needs at least one question")
+        answers, usage = self.batch([(json_value(request["state"], "state"), questions)])[0]
+        gated = self.calibration.abstention is not None
+        reported: dict[str, JSON] = {"input_tokens": usage.input_tokens, "output_tokens": 0}
+        if details:
+            reported.update(state_tokens=usage.state_tokens, state_kept=usage.state_kept,
+                            truncated=usage.truncated)
+        return {"model": self.name,
+                "answers": {name: _wire(questions[name], answer, details=details, gated=gated)
+                            for name, answer in answers.items()},
+                "usage": reported}
+
+
+def measured[Totals](metric: Metric[Totals], decisions: Decisions) -> float:
+    """Return `metric` over one whole pass of `decisions`, reduced as a validation pass reduces it."""
+    return metric.finalize(metric(decisions, {}))
+
+
+def _bucket(value: int, smallest: int = 64) -> int:
+    return next((size for size in SHAPE_BUCKETS if size >= value and size >= smallest), value)
+
+
+def _widened(leaf: jax.Array, length: int, fill: int = 0) -> jax.Array:
+    """A `[B, L]` leaf padded on the right to `length` with `fill`: the
+    padding token, or an invalid slot at position and option slot zero."""
+    return jnp.pad(leaf, ((0, 0), (0, length - leaf.shape[1])), constant_values=fill)
+
+
+def _restricted(question: Question, options: Sequence[str]) -> Choice:
+    """`question` asked over `options` alone, each with its description."""
+    described = dict(zip(question.options, question.descriptions, strict=True))
+    return Choice(question.instructions, {option: described[option] for option in options})
+
+
+def _choice(answer: Answer) -> str:
+    assert isinstance(answer, ChoiceAnswer)
+    return answer.choice
+
+
+def _wire(question: Question, answer: Answer, *, details: bool, gated: bool) -> dict[str, JSON]:
+    probabilities = [round(float(value), 4) for value in answer.probabilities]
+    if isinstance(answer, NoulAnswer):
+        wire: dict[str, JSON] = {"type": "noul", "noul": round(answer.noul, 4)}
+        if details:
+            wire["confidence"] = round(answer.confidence, 4)
+    elif isinstance(answer, ChoiceAnswer):
+        wire = {"type": "choice", "choice": answer.choice,
+                "probabilities": dict(zip(answer.options, probabilities, strict=True)),
+                "confidence": round(answer.confidence, 4)}
+    else:
+        assert isinstance(answer, ScoreAnswer)
+        wire = {"type": "score", "score": round(answer.score, 4),
+                "legend": {str(level): render(text) for level, text in enumerate(answer.legend)},
+                "probabilities": {str(level): value for level, value in enumerate(probabilities)},
+                "confidence": round(answer.confidence, 4)}
+    if details and gated:
+        wire["abstained"] = answer.abstained
+    assert isinstance(question, Noul) == isinstance(answer, NoulAnswer)
+    return wire
+
+
+

@@ -65,6 +65,19 @@ class TokenArray(Protocol):
     def tolist(self) -> list[int]: ...
 
 
+class Tokenizer(Protocol):
+    """What a text vocabulary offers, as `ByteTokenizer` and `HFTokenizer` do:
+    text to ids, with or without the vocabulary's special tokens, ids back
+    to text, and the id a sequence starts with, or None."""
+
+    @property
+    def bos_id(self) -> int | None: ...
+
+    def encode(self, text: str, *, add_special_tokens: bool = True) -> list[int]: ...
+
+    def decode(self, ids: ArrayLike | Sequence[int]) -> str: ...
+
+
 def _token_row(ids: ArrayLike | Sequence[int]) -> list[int]:
     values = ids.tolist() if isinstance(ids, TokenArray) else ids
     if not isinstance(values, Sequence):

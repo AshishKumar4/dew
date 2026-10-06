@@ -1,7 +1,6 @@
 """Progress reports for the landing page's sampler, while a sampling cell runs.
 
-preload.py wraps the pipelines the setup cell's `from_pretrained` returns in
-`Reporting`, which samples exactly as the pipeline does, with the solver it is handed
+The shared model service wraps its pinned pipeline in `Reporting`, which samples exactly as the pipeline does, with the solver it is handed
 wrapped so each step also sends its clean prediction to the host. While the
 compiled program runs, the kernel's main thread displays one output per solver
 step, whose text is {"dew-progress": {"step": k, "steps": n}} with n the

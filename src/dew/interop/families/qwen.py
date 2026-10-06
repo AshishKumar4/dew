@@ -18,6 +18,7 @@ from dew.interop.hf_decoders import (
     _MOE_SHARED,
     DEFAULT_MAX_SEQ_LEN,
     DecoderFields,
+    MixtureFields,
     _base_config,
     _dew_path,
     _kinds_of,
@@ -144,7 +145,7 @@ def _qwen3_moe_config(hf_config: Mapping[str, object], used: set[str]) -> Decode
     layer_types = _specified_layer_types(hf_config, used, (
         'sliding_attention' if windowed else 'full_attention',) * layers)
     config = _base_config(hf_config, used, qk_norm=True, layer_types=layer_types)
-    used.update(('num_experts', 'num_local_experts', 'norm_topk_prob', 'moe_intermediate_size'))
+    used.update(('num_experts', 'num_local_experts'))
     experts = hf_config.get('num_experts', hf_config.get('num_local_experts'))
     if experts is None:
         _refuse("num_experts", "a qwen3_moe layer needs its expert count")
@@ -153,12 +154,50 @@ def _qwen3_moe_config(hf_config: Mapping[str, object], used: set[str]) -> Decode
         _refuse("mlp_only_layers with decoder_sparse_step",
                 "together they leave no routed layer, which is a dense qwen3 model")
     expert_count = records.integer(experts, 'num_experts/num_local_experts')
+    config['mixture'] = _qwen_moe_mixture(hf_config, used, sparse, expert_count)
+    return config
+
+
+def _qwen_moe_mixture(hf_config: Mapping[str, object], used: set[str],
+                      sparse: tuple[int, ...], experts: int) -> MixtureFields:
+    """The expert width and softmax normalization Qwen2-MoE and Qwen3-MoE share."""
+    used.update(('norm_topk_prob', 'moe_intermediate_size'))
     norm_topk = bool(hf_config.get('norm_topk_prob', False))
     expert_width = records.integer(hf_config['moe_intermediate_size'], 'moe_intermediate_size')
-    config['mixture'] = native_fields(Mixture)(
-        top_k=_softmax_top_k(hf_config, used), experts=expert_count, layers=sparse,
+    return native_fields(Mixture)(
+        top_k=_softmax_top_k(hf_config, used), experts=experts, layers=sparse,
         norm_topk_prob=norm_topk,
         expert_features=expert_width)
+
+
+def _qwen2_moe_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
+    """Read Qwen2-MoE's softmax experts beside a sigmoid-gated shared MLP.
+
+    The Qwen2 projections read qkv_bias (default true), with an unbiased
+    output projection and no head norms. Its window covers even-indexed
+    layers below max_window_layers, unlike Qwen2 and Qwen3-MoE. Routing
+    reuses their sparse-step schedule and Qwen3-Next's shared expert path.
+    """
+    layers = records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
+    enabled = bool(hf_config.get('use_sliding_window', False))
+    first = records.integer(hf_config.get('max_window_layers', 28), 'max_window_layers')
+    types = _specified_layer_types(hf_config, used, tuple(
+        'sliding_attention' if enabled and index % 2 == 0 and index < first else 'full_attention'
+        for index in range(layers)))
+    if not enabled and 'sliding_attention' in types:
+        _refuse('layer_types', 'use_sliding_window=False disables the reference window')
+    config = _base_config({**hf_config, 'sliding_window': hf_config.get('sliding_window', 4096)},
+                          used, layer_types=types, reads=_QWEN_READS)
+    config.update(attention_bias=bool(hf_config.get('qkv_bias', True)), o_proj_bias=False)
+    used.update(('qkv_bias', 'use_sliding_window', 'max_window_layers', 'num_experts',
+                 'shared_expert_intermediate_size'))
+    experts = records.integer(hf_config.get('num_experts', 60), 'num_experts')
+    sparse = _sparse_step_layers(hf_config, layers, used)
+    if experts > 0 and sparse:
+        mixture = _qwen_moe_mixture(hf_config, used, sparse, experts)
+        mixture.update(shared_features=_record_int(hf_config, 'shared_expert_intermediate_size'),
+                       shared_gate=True)
+        config['mixture'] = mixture
     return config
 
 

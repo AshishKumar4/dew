@@ -54,6 +54,10 @@ export const groups = [
 		],
 	},
 	{
+		label: 'Decision models',
+		items: [{ source: 'docs/guides/decision-models.md', slug: 'guides/decision-models', label: 'Decision models' }],
+	},
+	{
 		label: 'Representation learning',
 		items: [{ source: 'docs/guides/representation-learning.md', slug: 'guides/jepa', label: 'JEPA' }],
 	},
