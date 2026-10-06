@@ -74,3 +74,30 @@ def test_image_transport_keeps_native_pixels_and_preparation_keys(service, tmp_p
     assert len(result.pil()) == 1
     assert [report["progress"] for report in reports] == [
         {"step": 1, "steps": 4}, {"step": 2, "steps": 4}, {"step": 3, "steps": 4}, {"stage": "decode"}]
+
+
+def test_sequential_calls_release_the_same_kernel_uid(service, tmp_path, monkeypatch):
+    import os
+
+    class Models:
+        def describe(self, request):
+            return {"repo": request["repo"], "revision": request["revision"]}
+
+    client = module("model_client")
+    with service.ModelService(tmp_path / "model.sock", Models(), uids=[os.getuid()]) as server:
+        monkeypatch.setattr(client, "SOCKET", str(server.path))
+        for _ in range(3):
+            result = client.request({"op": "describe", "repo": "model", "revision": "pinned"})
+            assert result == {"repo": "model", "revision": "pinned"}
+
+
+def test_pixel_transport_does_not_reconstruct_floats_from_a_png():
+    import base64
+
+    import numpy as np
+
+    client = module("model_client")
+    pixels = np.array([[[[0.00001, -0.234567, 0.99999]]]], np.float32)
+    result = client.ImageResult({"pngs": [], "pixels": base64.b64encode(pixels.tobytes()).decode(),
+                                 "shape": list(pixels.shape), "dtype": pixels.dtype.str})
+    np.testing.assert_array_equal(result.images, pixels)
