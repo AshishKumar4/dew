@@ -19,10 +19,10 @@ async function scenario(name) {
 	} finally { await worker.dispose(); }
 }
 
-test('simultaneous remote requests reserve at most three containers', async () => {
+test('simultaneous remote requests respect the published standard-4 account ceiling', async () => {
 	const result = JSON.parse((await scenario('cap')).body);
-	assert.equal(result.jobs.length, 3);
-	assert.equal(new Set(result.jobs).size, 3);
+	assert.equal(result.jobs.length, 375);
+	assert.equal(new Set(result.jobs).size, 375);
 });
 test('expired leases destroy their containers before capacity is reclaimed', async () => {
 	const result = JSON.parse((await scenario('expiry')).body);
