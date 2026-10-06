@@ -109,6 +109,7 @@ export class RemoteJob extends DurableObject<Env> {
 					cwd: '/workspace', stdout: 'pipe', stderr: 'pipe',
 					env: { PATH: '/workspace/.venv/bin:/opt/bootstrap/bin:/usr/local/bin:/usr/bin:/bin',
 						PYTHONUNBUFFERED: '1', JAX_PLATFORMS: 'cpu', CUDA_VISIBLE_DEVICES: '',
+						GLOO_SOCKET_IFNAME: 'lo',
 						JAX_COMPILATION_CACHE_DIR: '/root/.cache/dew/xla' },
 				});
 				const pump = async (source: ReadableStream | null, type: string) => {
