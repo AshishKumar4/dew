@@ -39,6 +39,7 @@ from dew.nn.inputs import Admitted, AttentionMetadata
 from dew.nn.kv_cache import TABLE, Append, KVCache, KVStore, filled_slots, rotated, write_cache
 from dew.nn.mixer_base import MixerBase, MixerContext, mixers
 from dew.nn.precision import at_least_fp32, scaled
+from dew.nn.protocols import ProjectionGroup
 from dew.nn.rope import (
     LongRopeScaling,
     RopeScaling,
@@ -210,6 +211,23 @@ class CausalSelfAttention(nn.Module):
             # parameters either way.
             self.values_norm = RMSNorm(epsilon=self.norm_eps, with_scale=False,
                                        dtype=self.dtype, name='v_norm')
+
+    @property
+    def reads_train(self) -> bool:
+        """Whether its call takes `train` (`ReadsTrain`): it drops attention
+        probabilities while training."""
+        return bool(self.attention_dropout_rate)
+
+    def projection_groups(self) -> tuple[ProjectionGroup, ...]:
+        """Its query, key and value projections packed as `qkv_proj`
+        (`ProjectionSites`), which `setup` reads in their place, where it
+        projects keys and values of its own and its variables hold them."""
+        if self.kv_shared or self.k_eq_v:
+            return ()
+        query = self.num_heads * self.head_dim * (2 if self.output_gate else 1)
+        group = ProjectionGroup(tuple(self.path), 'qkv_proj', ('q_proj', 'k_proj', 'v_proj'),
+                                (query, self.num_kv_heads * self.head_dim, self.num_kv_heads * self.head_dim))
+        return (group,) if group.held(self.variables.get('params', {})) else ()
 
     def _rot_dim(self) -> int | None:
         """Head dims the rotary rotates, or None for all of them.
@@ -880,6 +898,9 @@ class AttentionMixer(MixerBase):
     """XSA (arXiv 2603.09078, lm-engine's `exclusive_self_attention`): each
     head's output loses its component along the token's own value
     (`exclusive_self_attention`)."""
+
+    # `CausalSelfAttention` reads the mixed call's `Admitted` layout.
+    mixed_step = True
 
     def __post_init__(self):
         if self.alibi and not self.nope:

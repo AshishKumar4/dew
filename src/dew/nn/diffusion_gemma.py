@@ -14,6 +14,7 @@ from __future__ import annotations
 import functools
 import math
 from collections.abc import Mapping
+from typing import TYPE_CHECKING, Self
 
 import jax
 import jax.numpy as jnp
@@ -29,6 +30,9 @@ from dew.nn.multimodal import VisionConditioner
 from dew.nn.precision import at_least_fp32
 from dew.nn.protocols import OutputTable
 from dew.registry import models
+
+if TYPE_CHECKING:
+    from dew.records import JSON
 
 
 # The layers follow Transformers' modeling_diffusion_gemma.py:790-823.
@@ -200,6 +204,36 @@ class DiffusionGemma(nn.Module):
 
     def init_cache(self, batch_size: int):
         self.text.init_cache(batch_size)
+
+    # What a task and the trainer read off the model, answered by its text
+    # model (`dew.nn.protocols`); the decoder is a clone of it and follows.
+
+    @nn.nowrap
+    def with_cache_capacity(self, capacity: int) -> Self:
+        """This model with `capacity` cache slots per row for the clean
+        prefix the canvases read (`CacheCapacity`)."""
+        return self.clone(text=self.text.with_cache_capacity(capacity))
+
+    @nn.nowrap
+    def recompute_record(self) -> JSON:
+        """Its text model's rung (`Recomputing`)."""
+        return self.text.recompute_record()
+
+    @nn.nowrap
+    def recompute_more(self) -> Self | None:
+        """This model with its text model one rung up (`Recomputing`), or None at its top."""
+        text = self.text.recompute_more()
+        return None if text is None else self.clone(text=text)
+
+    @nn.nowrap
+    def restore_recompute(self, record: JSON) -> Self:
+        """This model with its text model at `record`'s rung where that is above its own (`Recomputing`)."""
+        return self.clone(text=self.text.restore_recompute(record))
+
+    @property
+    def keeps_triton_gemm(self) -> bool:
+        """Its text model's (`TritonGemm`)."""
+        return self.text.keeps_triton_gemm
 
     def encode(self, tokens, *, positions=None, segment_ids=None, image_indices=None,
                attention_mask=None, image_groups=None, rotary_positions=None,
