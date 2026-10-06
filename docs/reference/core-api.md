@@ -105,6 +105,8 @@ Checkpointable data must supply the consumed iterator position. A failed scaled 
 
 `initial_state()` constructs an unplaced initial `TrainState`. `place()` returns `(state, shardings, position)`, restoring from the configured checkpointer when available. Eager and placed initialization can differ in low floating-point bits across backends; compare the actual path used by your run.
 
+An `OptimConfig` is built by `fit` over the run's optimizer updates. If you need `initial_state`, `place` or `compile` before `fit`, pass `OptimConfig(...).build(steps)` to `Trainer` instead, where `steps` is the run's length in optimizer updates.
+
 `compile(state, batch)` returns `compiled(state, batch) -> (state, loss, metrics, loss_finite, accepted)`. The scaler is part of `TrainState`. `loss_finite` and `accepted` are separate, because a finite scalar loss can come with a nonfinite gradient that is rejected. The callable consumes the state it is given (`donate_argnums=0`), and the returned state takes over its buffers, so write `new = compiled(old, batch)` and keep no reference to the old state. The batch is not donated, because the loader still owns it.
 
 ## TrainState
