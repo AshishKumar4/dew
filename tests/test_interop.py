@@ -539,6 +539,18 @@ def test_exporting_a_run_whose_model_has_no_published_layout_names_it(tmp_path):
         Pretrained.from_run(str(tmp_path))
 
 
+def test_writing_a_model_no_decoder_family_describes_as_a_decoder_names_it():
+    """A decoder family's config is derived from a decoder's fields, so a
+    denoiser handed to the decoder writer is refused by name rather than
+    read as fields it does not have."""
+    from dew.interop import PretrainedDecoder
+    from dew.registry import models
+
+    denoiser = models.build("simple_dit")
+    with pytest.raises(TypeError, match="SimpleDiT has no Hugging Face decoder layout"):
+        PretrainedDecoder.from_model(denoiser, {})
+
+
 FRESH_TRAINING = """
 import sys
 
