@@ -45,7 +45,7 @@ from dew.objectives.base import (
     Variables,
     thaw,
 )
-from dew.objectives.lm.chunked import affine_head, chunked_cross_entropy, head_logits
+from dew.objectives.lm.chunked import head_cross_entropy, model_logits
 from dew.records import JSON
 from dew.registry import objectives
 
@@ -167,11 +167,12 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
     processor. With no variables, training starts from a fresh init.
 
     Both cross entropies score the final states through the bounded head
-    (`dew.objectives.lm.chunked.chunked_cross_entropy`), `head_chunks`
+    (`dew.objectives.lm.chunked.head_cross_entropy`), `head_chunks`
     vocabulary tiles at a time. The backward pass therefore never holds
-    vocabulary-sized fp32 logits or the softmax of a whole row. The one
-    place a full row of logits exists is the first denoising pass, whose
-    logits condition the second pass and receive no gradient.
+    vocabulary-sized fp32 logits or the softmax of a whole row, unless an
+    adapter on the head leaves no matrix to tile. The one place a full row
+    of logits always exists is the first denoising pass, whose logits
+    condition the second pass and receive no gradient.
     """
 
     saved_task = BlockGeneration
@@ -425,9 +426,6 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
             full_valid, selected, self.prompt_length, self.canvas_size,
             fields.get("positions"), fields.get("image_groups"))
         model = self.training_model
-        # The head as stored, so what the losses keep for their backward is
-        # the table itself and not a transposed copy of it.
-        head = affine_head(model, params)
         cache = model.apply(params, tokens.shape[0], method=model.init_cache, mutable=["cache"])[1]["cache"]
         encoder_kwargs = prepared.kwargs()
         encoder_kwargs.update(positions=positions, attention_mask=full_valid)
@@ -449,9 +447,8 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         zero_logits = jnp.zeros((*response.shape, self.model.vocab_size), jnp.float32)
         # The conditioning pass carries no gradient, so its states stop it
         # before the head and nothing of that pass is kept for the backward.
-        first = jax.lax.stop_gradient(constrain(head_logits(
-            jax.lax.stop_gradient(denoise(zero_logits)), head.matrix, softcap=head.softcap,
-            precision=head.precision, vocab_major=head.vocab_major, bias=head.bias), LOGITS))
+        first = jax.lax.stop_gradient(constrain(model_logits(
+            model, params, jax.lax.stop_gradient(denoise(zero_logits))), LOGITS))
         use_sc = jax.random.uniform(sc_key, (tokens.shape[0],)) < self.self_cond_prob
         sc_logits = jnp.where(use_sc[:, None, None], first, zero_logits)
         states = denoise(sc_logits)
@@ -459,13 +456,11 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         target_mask = canvas_mask & chosen
         if text_slots is not None:
             target_mask &= text_slots[:, self.prompt_length:]
-        canvas_losses, predicted, _ = chunked_cross_entropy(
-            states, head.matrix, response, self.head_chunks, softcap=head.softcap,
-            precision=head.precision, vocab_major=head.vocab_major, predict=not train, bias=head.bias)
+        canvas_losses, predicted, _ = head_cross_entropy(model, params, states, response, self.head_chunks,
+                                                         predict=not train)
         shifted, encoder_target_mask = self._encoder_targets(batch, tokens, validity, full_valid, text_slots)
-        encoder_losses, _, _ = chunked_cross_entropy(
-            encoder_states, head.matrix, shifted, self.head_chunks, softcap=head.softcap,
-            precision=head.precision, vocab_major=head.vocab_major, predict=False, bias=head.bias)
+        encoder_losses, _, _ = head_cross_entropy(model, params, encoder_states, shifted, self.head_chunks,
+                                                  predict=False)
         correct = None if predicted is None else predicted == response
         return canvas_losses, target_mask, encoder_losses, encoder_target_mask, correct
 
