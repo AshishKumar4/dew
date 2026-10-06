@@ -1530,17 +1530,47 @@ def test_records_in_memory_follow_their_seed():
     assert order(0) != order(1)
 
 
-def test_a_mapping_of_columns_and_a_list_of_records_are_the_same_records():
+def test_columns_rows_and_a_torch_dataset_are_the_same_records():
+    import torch
+
     columns = _columns()
     rows = [{"index": columns["index"][i], "x": columns["x"][i]} for i in range(12)]
+    tensors = torch.utils.data.TensorDataset(torch.arange(12), torch.from_numpy(columns["x"]))
 
-    by_columns = Dataset.from_records(columns, batch=4, seed=0).train(DataPartition())
-    by_rows = Dataset.from_records(rows, batch=4, seed=0).train(DataPartition())
-    first, second = next(by_columns), next(by_rows)
+    first, *others = (next(data.train(DataPartition())) for data in (
+        Dataset.from_records(columns, batch=4, seed=0), Dataset.from_records(rows, batch=4, seed=0),
+        Dataset.from_torch(tensors, batch=4, fields=("index", "x"), seed=0)))
 
     assert first["x"].shape == (4, 2) and first["x"].dtype == np.float32
-    for name in ("index", "x"):
-        np.testing.assert_array_equal(first[name], second[name])
+    for other in others:
+        for name in ("index", "x"):
+            assert other[name].dtype == first[name].dtype
+            np.testing.assert_array_equal(first[name], other[name])
+
+
+def test_a_torchvision_style_dataset_reads_its_tuples_as_named_fields():
+    """`(PIL image, label)` is torchvision's sample; a DataLoader's own
+    sampler and collate_fn would be dropped by reading its dataset, so it is
+    refused rather than unwrapped."""
+    import torch
+    from PIL import Image
+
+    class Pictures(torch.utils.data.Dataset):
+        def __len__(self):
+            return 8
+
+        def __getitem__(self, index):
+            return Image.fromarray(np.full((5, 5, 3), index, np.uint8)), index
+
+    batch = next(Dataset.from_torch(Pictures(), batch=4, fields=("image", "label"),
+                                    validation=Pictures()).val(DataPartition()))
+
+    assert batch["image"].shape == (4, 5, 5, 3) and batch["image"].dtype == np.uint8
+    np.testing.assert_array_equal(batch["image"][:, 0, 0, 0], batch["label"])
+    with pytest.raises(TypeError, match="fields="):
+        Dataset.from_torch(Pictures(), batch=4)
+    with pytest.raises(TypeError, match=r"loader\.dataset"):
+        Dataset.from_torch(torch.utils.data.DataLoader(Pictures()), batch=4)
 
 
 def test_columns_of_different_lengths_are_refused_by_name():
