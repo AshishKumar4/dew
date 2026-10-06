@@ -1474,3 +1474,50 @@ def test_a_padded_prefill_attends_through_cudnn_where_it_runs(rng, without_deter
         assert not chosen
         return
     assert chosen and all("Bias" in line for line in chosen), chosen[:1]
+
+
+def _rotate_half_reference(x, freqs_cos, freqs_sin, scale=None):
+    """`dew.nn.rope.apply_rotary` as it was through 2026-10-06, and as the HF
+    decoders write it, `x cos + rotate_half(x) sin`, at least fp32."""
+    cos = jnp.concatenate([freqs_cos, freqs_cos], axis=-1)
+    sin = jnp.concatenate([freqs_sin, freqs_sin], axis=-1)
+    cos, sin = (part[:, :, None, :] if part.ndim == 3 else part[None, :, None, :] for part in (cos, sin))
+    wide = x.astype(jnp.promote_types(x.dtype, jnp.float32))
+    wide, passed = wide[..., :cos.shape[-1]], wide[..., cos.shape[-1]:]
+    x1, x2 = jnp.split(wide, 2, axis=-1)
+    out = jnp.concatenate([wide * cos + jnp.concatenate([-x2, x1], axis=-1) * sin, passed], axis=-1)
+    return (out if scale is None else out * scale).astype(x.dtype)
+
+
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
+@pytest.mark.parametrize("pairs, scale, packed", [(64, None, False), (64, 0.0884, False), (24, None, True)],
+                         ids=["full", "scaled", "partial-packed"])
+def test_the_rotary_rotates_the_halves_as_rotate_half_does(dtype, pairs, scale, packed):
+    """The halves rotate as `x1 cos - x2 sin` and `x2 cos + x1 sin`, without
+    rotate_half's rotated copy. The arithmetic is the same, its rounding
+    order not quite, so the forward and the input gradient are each within
+    tests/reference_error.py's rule of rotate_half's against float64: full
+    and partial rotary, a folded scale, and a packed batch's own angles."""
+    from reference_error import assert_as_exact_as_the_reference
+
+    from dew.nn.rope import apply_rotary
+
+    rng = np.random.default_rng(0)
+    x = jnp.asarray(rng.normal(size=(2, 96, 4, 128)), dtype)
+    angles = rng.normal(size=(2, 96, pairs) if packed else (96, pairs)) * 3
+    cos, sin = (jnp.asarray(f(angles), jnp.float32) for f in (np.cos, np.sin))
+    cotangent = jnp.asarray(rng.normal(size=x.shape), dtype)
+
+    def forward_and_gradient(rotary, x, cos, sin):
+        out, pullback = jax.vjp(lambda x: rotary(x, cos, sin, scale), x)
+        return out, pullback(cotangent.astype(x.dtype))[0]
+
+    with jax.enable_x64():
+        wide = (np.asarray(part, np.float64) for part in (x, cos, sin))
+        truth = forward_and_gradient(_rotate_half_reference, *wide)
+    new = forward_and_gradient(apply_rotary, x, cos, sin)
+    old = forward_and_gradient(_rotate_half_reference, x, cos, sin)
+    for label, mine, theirs, want in zip(("forward", "gradient"), new, old, truth, strict=True):
+        assert mine.dtype == theirs.dtype == dtype
+        assert_as_exact_as_the_reference(np.asarray(mine, np.float64), np.asarray(theirs, np.float64),
+                                         np.asarray(want), label)
