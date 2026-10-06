@@ -12,13 +12,15 @@ through Flax's own `apply`, with `rngs` and `mutable` passed to `apply`:
     table = model.apply(variables, method='output_table')
 
 `Logits` and `HiddenStates` are token models' full-sequence reads, with no
-cache: a call writes no `cache` collection. `DenoisingModel` is the call every
-image and video denoiser already has, the raw network that
-`dew.diffusion.process.Denoiser` wraps into a prediction a solver steps
-with. `AffineHead` and `LogitsFromHidden` let a loss score the vocabulary
-without a second trunk pass: `output_table` gives the matrix a tiled loss
-contracts in place of the logits, and `logits_from_hidden` is the exact head
-for a head no matrix alone gives.
+cache: a call writes no `cache` collection, and `Ordered` says whether those
+states attend causally. `DenoisingModel` is the call every image and video
+denoiser already has, the raw network that `dew.diffusion.process.Denoiser`
+wraps into a prediction a solver steps with. `AffineHead` and
+`LogitsFromHidden` let a loss score the vocabulary without a second trunk
+pass: `output_table` gives the matrix a tiled loss contracts in place of the
+logits, and `logits_from_hidden` is the exact head for a head no matrix alone
+gives. `HardVocabularyEmbedder` is a media embedder's: the range of the text
+vocabulary it embeds itself.
 `DenoisingModel` is an annotation only: every Flax module has a `__call__`, so
 an `isinstance` check on it would hold for any model.
 
@@ -41,8 +43,8 @@ if TYPE_CHECKING:
     from dew.diffusion.process import DenoisingCondition
     from dew.nn.dit import TextContext
 
-__all__ = ["AffineHead", "DenoisingModel", "HiddenStates", "Logits", "LogitsFromHidden", "ModelKwarg",
-           "OutputTable"]
+__all__ = ["AffineHead", "DenoisingModel", "HardVocabularyEmbedder", "HiddenStates", "Logits",
+           "LogitsFromHidden", "ModelKwarg", "Ordered", "OutputTable"]
 
 
 @struct.dataclass
@@ -80,6 +82,15 @@ class HiddenStates(Protocol):
                       **fields: ModelKwarg) -> jax.Array: ...
 
 
+@runtime_checkable
+class Ordered(Protocol):
+    """A token model that says whether its `hidden_states` attend causally,
+    each position to itself and the ones before it, or to the whole sequence."""
+
+    @property
+    def causal(self) -> bool: ...
+
+
 class DenoisingModel(Protocol):
     """A diffusion network's output for `sample` at `time`, given its conditions:
     arrays, encoded text (`TextContext`) or a process's `DenoisingCondition`."""
@@ -98,6 +109,17 @@ class AffineHead(Protocol):
     """
 
     def output_table(self) -> OutputTable | None: ...
+
+
+@runtime_checkable
+class HardVocabularyEmbedder(Protocol):
+    """A media embedder that also embeds a range of the text vocabulary, the
+    hard tokens the decoder's own table does not hold, as Gemma 3n's vision
+    and audio embedders do (modeling_gemma3n.py, Gemma3nMultimodalEmbedder)."""
+
+    def embed_hard(self, ids: jax.Array) -> jax.Array: ...
+
+    def merge_hard_embeddings(self, token_embeddings: jax.Array, ids: jax.Array) -> jax.Array: ...
 
 
 @runtime_checkable
