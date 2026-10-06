@@ -762,14 +762,46 @@ class Objective(ABC, Generic[Loss, Effects]):
             param_dtype=param_dtype, parameter_roots=parameter_roots)
         return variables if cls._model_part is None else part(variables, cls._model_part)
 
+    def task_record(self) -> Mapping[str, JSON] | None:
+        """Return the task settings a saved step records beside its model, or
+        None when the objective declares no inference contract.
+
+        They are what the objective's task is built with and a loader cannot
+        read off the model: a sampling policy, a token budget, a tokenizer, a
+        process. `inference_record` puts them beside the model's record.
+        """
+        return None
+
     def inference_record(self) -> JSON:
         """Return the registered model and task settings that let a saved step be rebuilt.
 
-        An objective without a declared inference contract returns None. A
-        custom research method can still restore its raw state.
+        It records the objective's registered name, its `model`'s record, and
+        `task_record`'s settings. An objective that is not registered, or
+        declares no task settings, returns None; a custom research method can
+        still restore its raw state.
         """
+        from dew.config import ModelConfig
+        from dew.registry import objectives, to_record
 
-    def pipeline(self, state: TrainState, *, ema: bool | None = None) -> Task | SavedTask:
+        settings = self.task_record()
+        if settings is None or not any(member is type(self) for member in objectives.values()):
+            return None
+        return {'objective': objectives.name_of(type(self)),
+                'model': to_record(ModelConfig.from_model(self.model), ModelConfig), **settings}
+
+    def build_task(self, variables: Variables, *,
+                   processor: Processor | None | Omitted = OMITTED) -> Task | SavedTask:
+        """Return the task over `variables`, the trained tree as the run keeps it.
+
+        `processor` encodes and decodes in place of the objective's own, an
+        explicit None included. Objectives without a generation task raise
+        `TypeError`. A plugin objective returns its own `saved_task` class, so
+        the return type also allows a `SavedTask` besides Dew's own tasks.
+        """
+        raise TypeError(f"{type(self).__name__} has no inference task")
+
+    def pipeline(self, state: TrainState, *, ema: bool | None = None,
+                 processor: Processor | None | Omitted = OMITTED) -> Task | SavedTask:
         """Return the trained model as its inference task, over `state`'s weights.
 
         With `ema` None, the task uses `state.averaged` when the objective keeps an
@@ -777,11 +809,9 @@ class Objective(ABC, Generic[Loss, Effects]):
         run. True requires the average, and False selects the live parameters. An
         objective with a reference policy returns the trained policy, never the frozen
         reference its loss compares against. The arrays keep their placement.
-        Objectives without a generation task raise `TypeError`. A plugin objective
-        returns its own `saved_task` class, so the return type also allows a
-        `SavedTask` besides Dew's own tasks.
+        `build_task` builds the task, with `processor` in place of the objective's own.
         """
-        raise TypeError(f"{type(self).__name__} has no inference task")
+        return self.build_task(self._pipeline_weights(state, ema), processor=processor)
 
     def preview(self, params: Variables, batch: Batch, step: Step, *,
                 scored: Artifacts | None = None) -> Artifacts | None:
