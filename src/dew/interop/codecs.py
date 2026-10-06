@@ -41,6 +41,7 @@ import re
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from functools import partial
+from types import MappingProxyType
 from typing import Literal
 
 import jax.numpy as jnp
@@ -1288,6 +1289,9 @@ MODELOPT_PARTS = ('.weight_scale', '.weight_scale_2', '.input_scale')
 MODELOPT_ALGOS = ('NVFP4', 'W4A16_NVFP4', 'FP8')
 """The per-layer algorithms ModelOpt's published mixed table dispatches."""
 
+_MODELOPT_EMPTY_LAYERS: Mapping[str, str] = MappingProxyType({})
+"""The immutable layer table for a uniform ModelOpt checkpoint."""
+
 _MODELOPT_FP8_WEIGHTS = {
     'format': 'float-quantized', 'config_groups': {'fp8': {'weights': {
         'num_bits': 8, 'type': 'float', 'strategy': 'tensor', 'symmetric': True, 'dynamic': False}}}}
@@ -1324,7 +1328,7 @@ def _modelopt_layer_parts(name: str, algo: str) -> tuple[str, ...]:
 
 
 def _modelopt_names(tensors: Mapping[str, np.ndarray], *, method: str = 'NVFP4',
-                    layers: Mapping[str, str] = {}) -> tuple[str, ...]:
+                    layers: Mapping[str, str] = _MODELOPT_EMPTY_LAYERS) -> tuple[str, ...]:
     stems = sorted({name.removesuffix(suffix) for name in tensors
                     for suffix in MODELOPT_PARTS if name.endswith(suffix)})
     for stem in stems:
@@ -1347,7 +1351,7 @@ def _modelopt_parts(name: str) -> tuple[str, ...]:
 
 
 def _modelopt_decode(tensors: Mapping[str, np.ndarray], name: str, *, method: str = 'NVFP4',
-                     layers: Mapping[str, str] = {}) -> np.ndarray:
+                     layers: Mapping[str, str] = _MODELOPT_EMPTY_LAYERS) -> np.ndarray:
     """ModelOpt 0.47.0's NVFP4QTensor.dequantize: block scale times global, then codes, then bf16."""
     packed = np.asarray(tensors[name])
     algo = _modelopt_algo(name, method, layers)
@@ -1380,7 +1384,7 @@ def _modelopt_decode(tensors: Mapping[str, np.ndarray], name: str, *, method: st
 
 
 def _modelopt_encode(name: str, weight: np.ndarray, *, grid: Mapping[str, np.ndarray] | None,
-                     method: str = 'NVFP4', layers: Mapping[str, str] = {}
+                     method: str = 'NVFP4', layers: Mapping[str, str] = _MODELOPT_EMPTY_LAYERS
                      ) -> dict[str, np.ndarray]:
     algo = _modelopt_algo(name, method, layers)
     parts = _modelopt_layer_parts(name, algo)
