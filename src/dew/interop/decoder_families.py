@@ -48,12 +48,18 @@ from dew.interop.families.gpt2 import (
     _GPT2_NAMES,
     _GPT2_PACKED,
     _GPT_NEO_NAMES,
+    _GPTJ_NAMES,
     _gpt2_config,
     _gpt2_export,
     _gpt2_path,
     _gpt2_prepare,
     _gpt_neo_config,
     _gpt_neo_export,
+    _gptj_config,
+    _gptj_export,
+    _gptj_export_weights,
+    _gptj_path,
+    _gptj_prepare,
 )
 from dew.interop.families.gpt_neox import (
     _GPT_NEOX_NAMES,
@@ -155,6 +161,14 @@ ENTRIES = (
         'phi', 'PhiForCausalLM', _phi_export,
         weight_path=partial(_renamed_path, _PHI_NAMES), export_path=partial(_renamed_name, _PHI_NAMES),
         export_weights=_decoder_tensors, preserve_source_layout=False,
+    ),
+    DecoderFamily(
+        ('gptj',), _gptj_config,
+        lambda fields: fields.shared_parallel_norm and fields.head_bias and not fields.attention_bias,
+        'gptj', 'GPTJForCausalLM', _gptj_export,
+        weight_path=_gptj_path, export_path=partial(_renamed_name, _GPTJ_NAMES),
+        prepare=_gptj_prepare, export_weights=_gptj_export_weights, preserve_source_layout=False,
+        tied_head_names=('lm_head.weight', 'transformer.wte.weight'),
     ),
     DecoderFamily(
         ('falcon',), _falcon_config,

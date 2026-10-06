@@ -82,6 +82,7 @@ from transformers import (
     GemmaConfig, GemmaForCausalLM, GPTNeoConfig, GPTNeoForCausalLM, LlamaConfig, LlamaForCausalLM,
     PhiConfig, PhiForCausalLM,
     FalconConfig, FalconForCausalLM,
+    GPTJConfig, GPTJForCausalLM,
     Qwen3Config, Qwen3ForCausalLM, MistralConfig, MistralForCausalLM, PreTrainedModel,
     MixtralConfig, MixtralForCausalLM, Qwen2Config, Qwen2ForCausalLM,
     Qwen3MoeConfig, Qwen3MoeForCausalLM, Olmo3Config, Olmo3ForCausalLM,
@@ -182,6 +183,18 @@ def tiny_falcon(multi_query: bool = True) -> FalconForCausalLM:
         num_attention_heads=3, multi_query=multi_query, bias=True, parallel_attn=True,
         max_position_embeddings=48, layer_norm_epsilon=3e-5,
         hidden_dropout=0., attention_dropout=0.,
+        bos_token_id=1, eos_token_id=None, pad_token_id=0))
+
+
+GPTJ_CONFIG = ('gpt-j-6b', 'EleutherAI/gpt-j-6b', '47e169305d2e8376be1d31e765533382721b2cc1')
+
+
+def tiny_gptj() -> GPTJForCausalLM:
+    """Interleaved partial rotary, one-norm parallel residual and an affine head."""
+    torch.manual_seed(0)
+    return GPTJForCausalLM(GPTJConfig(
+        vocab_size=64, n_embd=32, n_inner=48, n_layer=2, n_head=4, rotary_dim=4, n_positions=48,
+        layer_norm_epsilon=3e-5, resid_pdrop=0., embd_pdrop=0., attn_pdrop=0.,
         bos_token_id=1, eos_token_id=None, pad_token_id=0))
 
 
@@ -1270,7 +1283,7 @@ def main() -> None:
                         help="only the tiny fixtures, no 1.5 GB download")
     parser.add_argument("--nemotron-h-only", action="store_true",
                         help="only the Nemotron-H tiny fixture and two pinned released configs")
-    parser.add_argument('--classic-family', choices=('bloom', 'gpt_neo', 'phi', 'falcon'),
+    parser.add_argument('--classic-family', choices=('bloom', 'gpt_neo', 'phi', 'falcon', 'gptj'),
                         help='only this classic decoder fixture and its pinned released config')
     args = parser.parse_args()
 
@@ -1292,6 +1305,10 @@ def main() -> None:
         write_classic_tiny('falcon-tiny', tiny_falcon())
         write_classic_tiny('falcon-mha-tiny', tiny_falcon(multi_query=False))
         write_released_config(*FALCON_CONFIG)
+        return
+    if args.classic_family == 'gptj':
+        write_classic_tiny('gptj-tiny', tiny_gptj())
+        write_released_config(*GPTJ_CONFIG)
         return
     write_nemotron_h()
     for name, repo, revision in NEMOTRON_H_CONFIGS:

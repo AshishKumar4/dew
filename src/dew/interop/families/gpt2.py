@@ -6,7 +6,8 @@ import numpy as np
 
 from dew import records
 from dew.interop.config_records import native_fields
-from dew.interop.hf_decoders import DecoderFields, Packed, Renames, _refuse, _renamed_path
+from dew.interop.hf_decoders import DecoderFields, Packed, Renames, _decoder_tensors, _refuse, _renamed_path
+from dew.interop.safetensors_io import LazyTensors
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import LayerKind
 
@@ -77,6 +78,98 @@ def _gpt_neo_export(model: CausalTransformer) -> Mapping[str, object]:
                                  'scale_attn_weights', 'attn_pdrop', 'embd_pdrop', 'resid_pdrop',
                                  'layer_types', 'sliding_window')))
     return fields
+
+
+def _gptj_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
+    config = _gpt2_config(hf, used)
+    head_dim = records.integer(config['head_dim'], 'head_dim')
+    rotated = records.integer(hf.get('rotary_dim', 64), 'rotary_dim')
+    if rotated < 2 or rotated > head_dim or rotated % 2:
+        _refuse('rotary_dim', 'GPT-J rotates an even positive prefix of each attention head')
+    used.update(('rotary_dim', 'rotary', 'gradient_checkpointing', 'tokenizer_class'))
+    if hf.get('rotary', True) is not True or hf.get('scale_attn_weights', True) is not True:
+        _refuse('rotary/scale_attn_weights', 'GPT-J rotates its heads and scales by their dimension')
+    config.update({
+        'position_embedding': 'rotary', 'position_embedding_size': None,
+        'partial_rotary_factor': rotated / head_dim, 'partial_rotary_type': 'default',
+        'attention_bias': False, 'parallel_residual': True, 'shared_parallel_norm': True,
+        'head_bias': True, 'tie_embeddings': bool(hf.get('tie_word_embeddings', False)),
+    })
+    return config
+
+
+_GPTJ_NAMES: Renames = (
+    ('transformer.wte', 'model.embed_tokens'), ('transformer.ln_f', 'model.norm'),
+    ('transformer.h', 'model.layers'), ('ln_1', 'input_layernorm'),
+    ('attn.out_proj', 'self_attn.o_proj'), ('attn', 'self_attn'),
+    ('mlp.fc_in', 'mlp.up_proj'), ('mlp.fc_out', 'mlp.down_proj'))
+
+
+def _gptj_order(head_dim: int, rotated: int) -> np.ndarray:
+    """Interleaved rotary pairs as the shared rotate-half arithmetic reads them.
+
+    Applying the same permutation to q and k leaves their dot product
+    unchanged. Values keep their original order, so the output projection
+    and the residual stream require no permutation or runtime option.
+    """
+    return np.concatenate((np.arange(0, rotated, 2), np.arange(1, rotated, 2),
+                           np.arange(rotated, head_dim)))
+
+
+def _gptj_prepare(tensors: Mapping[str, np.ndarray],
+                  config: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
+    if config is None:
+        raise ValueError('GPT-J rotary storage requires translated head geometry')
+    head_dim = records.integer(config['head_dim'], 'head_dim')
+    heads = records.integer(config['num_heads'], 'num_heads')
+    rotated = int(head_dim * records.number(config['partial_rotary_factor'], 'partial_rotary_factor'))
+    prepared = dict(tensors)
+    for name, tensor in tensors.items():
+        if name.endswith(('.attn.q_proj.weight', '.attn.k_proj.weight')):
+            grouped = tensor.reshape(heads, head_dim, *tensor.shape[1:])
+            prepared[name] = grouped[:, _gptj_order(head_dim, rotated)].reshape(tensor.shape)
+        elif name.endswith('.attn.bias'):
+            if (tensor.ndim != 4 or tensor.shape[:2] != (1, 1)
+                    or tensor.shape[-2] != tensor.shape[-1]
+                    or not np.array_equal(tensor, np.tril(np.ones_like(tensor)))):
+                raise ValueError(f'{name} must hold the fixed triangular causal mask')
+            del prepared[name]
+        elif name.endswith('.attn.masked_bias'):
+            if tensor.shape != () or float(tensor) != -1e9:
+                raise ValueError(f'{name} must hold the historical negative mask sentinel')
+            del prepared[name]
+    return prepared
+
+
+def _gptj_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
+    if name.endswith(('.attn.bias', '.attn.masked_bias')):
+        return None
+    return _renamed_path(_GPTJ_NAMES, name, config)
+
+
+def _gptj_export(model: CausalTransformer) -> Mapping[str, object]:
+    fields = dict(_gpt2_export(model))
+    fields.update({
+        'rotary_dim': int(model.features_per_head * (model.partial_rotary_factor or 1.)),
+        'pad_token_id': None,
+    })
+    return fields
+
+
+def _gptj_export_weights(model: CausalTransformer, variables: Mapping[str, object],
+                         config: Mapping[str, object]) -> LazyTensors:
+    tensors = _decoder_tensors(model, variables, config)
+    rotated = int(model.features_per_head * (model.partial_rotary_factor or 1.))
+    order = np.argsort(_gptj_order(model.features_per_head, rotated))
+
+    def build(name: str) -> np.ndarray:
+        tensor = tensors[name]
+        if name.endswith(('.attn.q_proj.weight', '.attn.k_proj.weight')):
+            grouped = tensor.reshape(model.num_heads, model.features_per_head, *tensor.shape[1:])
+            return grouped[:, order].reshape(tensor.shape)
+        return tensor
+
+    return LazyTensors(tensors.specs, build)
 
 
 def _gpt2_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
