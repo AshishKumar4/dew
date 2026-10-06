@@ -34,7 +34,14 @@ class LayerKind:
     """
 
     window: int | None = None
-    """The number of keys a layer of this kind attends to, its own included. None attends to all keys."""
+    """The number of keys a causal layer of this kind attends to, its own
+    included. None attends to all keys. A bidirectional layer reads its whole
+    row, as DiffusionGemma's decoder does, unless `bidirectional_window`."""
+    bidirectional_window: bool = False
+    """Whether a bidirectional layer of this kind keeps `window` on both sides
+    of a query, reading the keys within window - 1 positions of it, as
+    ModernBERT's local layers do (modeling_modernbert.py, |q - k| <=
+    local_attention // 2). A causal layer ignores it."""
     chunk: int | None = None
     """The chunk size of chunked local attention. A layer of this kind reads
     only the keys at or before each query whose position has the same
@@ -84,6 +91,7 @@ class ResolvedKind:
     """
 
     window: int | None
+    bidirectional_window: bool
     chunk: int | None
     num_kv_heads: int
     rope_theta: float
@@ -133,6 +141,8 @@ class LayerSpec:
     prediction_slot: int | None = None
     """The layer's place among the DSpark drafter's target layers, whose
     input streams' mean it records; None for the rest."""
+    attention_norm: bool = True
+    """Whether the block norms its attention input; ModernBERT's first block does not."""
 
 
 def scan_groups(specs: Sequence[LayerSpec],
