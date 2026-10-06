@@ -25,6 +25,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 from lane_environment import outside_any_cluster
+from sharded import PARAMETER_AXES
 
 from dew.nn.sharding import MESH_AXES
 from dew.training import MeshSpec
@@ -76,13 +77,18 @@ def launch(*arguments: str, devices: int, timeout: float = 600) -> subprocess.Co
 
 
 def train(tmp_path: Path, mesh: dict, processes: int, devices: int = 8) -> dict:
-    """The worker's record of a pool of `processes` over `devices` CPU devices."""
+    """The worker's record of a pool of `processes` over `devices` CPU devices,
+    whose trained parameters are split over every parameter axis the mesh
+    has (`sharded.assert_sharded`)."""
     out = tmp_path / f"{len(list(tmp_path.iterdir()))}.json"
     done = launch("--processes-per-host", str(processes), "--",
                   sys.executable, str(WORKER), "--out", str(out), "--mesh", json.dumps(mesh),
                   devices=devices // processes)
     assert done.returncode == 0, done.stdout + done.stderr
-    return json.loads(out.read_text())
+    record = json.loads(out.read_text())
+    wanted = {axis for axis in PARAMETER_AXES if record["mesh"].get(axis, 1) > 1}
+    assert wanted <= set(record["split_axes"]), (wanted, record["split_axes"])
+    return record
 
 
 @pytest.fixture(scope="module")
