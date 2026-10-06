@@ -20,6 +20,7 @@ from jax.ad_checkpoint import checkpoint_name
 
 from dew.nn.attention import (
     RMSNorm,
+    alibi_bias,
     cached_validity,
     causal_attention_mask,
     chunk_mask,
@@ -152,6 +153,8 @@ class CausalSelfAttention(nn.Module):
     nope: bool = False
     """No positional encoding: q and k enter the kernel unrotated, and the
     logits keep their scale (lm-engine's `position_embedding_type="nope"`)."""
+    alibi: bool = False
+    """Linear key-position bias on unrotated queries and keys, as in BLOOM."""
     exclusive_self_attention: bool = False
     """XSA (arXiv 2603.09078): each head's output loses its component along
     the token's own value vector before the output projection."""
@@ -161,6 +164,8 @@ class CausalSelfAttention(nn.Module):
     """Normal std of o_proj; None follows init_std."""
 
     def setup(self):
+        if self.alibi and not self.nope:
+            raise ValueError('ALiBi requires unrotated attention (nope=True)')
         if self.exclusive_self_attention and self.kv_shared:
             raise ValueError(
                 "exclusive self attention subtracts the token's own value, and a "
@@ -447,7 +452,19 @@ class CausalSelfAttention(nn.Module):
             return self._output(attention, gate, B, S, own_value)
         masking = self._masking(query, key, value, positions, rotary_positions, append, prefix, kv_len,
                                 kv_store, segment_ids, attention_metadata, decode)
-        attention = self._attended(masking, positions, append, sinks, train)
+        bias = None
+        if self.alibi:
+            if decode:
+                key_positions = jnp.arange(masking.key.shape[1])
+            elif attention_metadata is not None and attention_metadata.key_positions is not None:
+                key_positions = attention_metadata.key_positions
+            elif attention_metadata is not None and attention_metadata.valid is not None:
+                valid = attention_metadata.valid
+                key_positions = (jnp.cumsum(valid, axis=-1) - 1) * valid
+            else:
+                key_positions = positions
+            bias = alibi_bias(key_positions, self.num_heads, dtype=query.dtype)
+        attention = self._attended(masking, positions, append, sinks, train, bias=bias)
         return self._output(attention, gate, B, S, own_value)
 
     def _step_positions(self, key, positions, segment_ids, attention_metadata: AttentionMetadata | None,
@@ -627,7 +644,7 @@ class CausalSelfAttention(nn.Module):
             implementation = masked
         return _Masking(query, key, value, causal, window, mask, documents, implementation, cursor)
 
-    def _attended(self, masking: _Masking, positions, append, sinks, train: bool):
+    def _attended(self, masking: _Masking, positions, append, sinks, train: bool, *, bias=None):
         """The attention output through the kernel the masking chose: the
         paged kernel or a per-row key count for a plain decode step, the
         general kernel otherwise, with the per-head logit maxima sown for
@@ -641,7 +658,7 @@ class CausalSelfAttention(nn.Module):
         if sowing:
             self.sow("qk", "max_logits", max_attention_logits(
                 query, key, causal=causal, sliding_window=window,
-                mask=mask if documents is None else with_documents(mask, documents)))
+                mask=mask if documents is None else with_documents(mask, documents), bias=bias))
             self.sow("qk", "kv_heads", jnp.asarray(key.shape[-2]))
             self.sow("qk", "head_dim", jnp.asarray(query.shape[-1]))
         if self.attention_dropout_rate and train:
@@ -649,11 +666,12 @@ class CausalSelfAttention(nn.Module):
                 query, key, value, dtype=self.dtype, precision=self.precision,
                 force_fp32_for_softmax=self.force_fp32_for_softmax,
                 implementation=self.attention_impl, causal=causal, sliding_window=window,
-                mask=mask, sinks=sinks, softcap=self.attn_logit_softcap, segment_ids=documents,
+                mask=mask, bias=bias, sinks=sinks, softcap=self.attn_logit_softcap, segment_ids=documents,
                 dropout_rate=self.attention_dropout_rate, dropout_rng=self.make_rng("dropout"),
                 deterministic=False), 'context')
         # A chunk, window or metadata mask replaces `cursor` and keeps the gather.
-        plain_step = append is not None and mask is cursor and S == 1 and sinks is None and not sowing
+        plain_step = (append is not None and mask is cursor and S == 1 and sinks is None
+                      and bias is None and not sowing)
         if append is not None and plain_step and self._page_kernel_runs(query) and append.store.kernel():
             attention = self._paged(append, query)
         elif plain_step:
@@ -663,7 +681,7 @@ class CausalSelfAttention(nn.Module):
                 query, key, value, dtype=self.dtype, precision=self.precision,
                 force_fp32_for_softmax=self.force_fp32_for_softmax,
                 implementation=implementation, causal=causal,
-                sliding_window=window, mask=mask, sinks=sinks,
+                sliding_window=window, mask=mask, bias=bias, sinks=sinks,
                 softcap=self.attn_logit_softcap, segment_ids=documents), 'context')
         return attention
 
@@ -679,6 +697,7 @@ class CausalSelfAttention(nn.Module):
             "a page pool split into groups": layout.page_size is not None and layout.groups != 1,
             "a sliding window or chunk": self.sliding_window is not None or self.attention_chunk is not None,
             "attention sinks": self.attention_sinks,
+            "ALiBi": self.alibi,
             "keys shared from another layer": self.kv_shared,
             "bidirectional attention or image groups": not self.causal or self.bidirectional_images,
         }
@@ -818,7 +837,7 @@ class CausalSelfAttention(nn.Module):
         """
         if (self.sliding_window is None and self.attention_chunk is None) or not self.causal:
             return False
-        if decode or (not self.is_initializing() and self.is_mutable_collection("qk")):
+        if self.alibi or decode or (not self.is_initializing() and self.is_mutable_collection("qk")):
             return False
         return metadata is None or (
             metadata.pairwise_mask is None
@@ -855,12 +874,16 @@ class AttentionMixer(MixerBase):
     """No positional encoding: q and k enter the kernel unrotated and the
     logits keep their scale (lm-engine's `position_embedding_type="nope"`,
     Granite 4.0-H)."""
+    alibi: bool = False
+    """Per-head linear key-position bias; requires unrotated attention."""
     exclusive_self_attention: bool = False
     """XSA (arXiv 2603.09078, lm-engine's `exclusive_self_attention`): each
     head's output loses its component along the token's own value
     (`exclusive_self_attention`)."""
 
     def __post_init__(self):
+        if self.alibi and not self.nope:
+            raise ValueError("ALiBi requires unrotated attention (nope=True)")
         if self.mrope_section is not None:
             object.__setattr__(self, "mrope_section", tuple(self.mrope_section))
             if len(self.mrope_section) != 3 or any(value < 0 for value in self.mrope_section):

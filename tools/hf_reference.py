@@ -77,9 +77,12 @@ from huggingface_hub import get_safetensors_metadata, hf_hub_download
 import numpy as np
 import torch
 from transformers import (
-    AutoModelForCausalLM, AutoTokenizer, DeepseekV3Config, DeepseekV3ForCausalLM,
+    AutoModelForCausalLM, AutoTokenizer, BloomConfig, BloomForCausalLM, DeepseekV3Config, DeepseekV3ForCausalLM,
     Gemma2Config, Gemma2ForCausalLM, Gemma3Config, Gemma3ForCausalLM, Gemma3TextConfig,
-    GemmaConfig, GemmaForCausalLM, LlamaConfig, LlamaForCausalLM, Phi3Config, Phi3ForCausalLM,
+    GemmaConfig, GemmaForCausalLM, GPTNeoConfig, GPTNeoForCausalLM, LlamaConfig, LlamaForCausalLM,
+    PhiConfig, PhiForCausalLM, Phi3Config, Phi3ForCausalLM,
+    FalconConfig, FalconForCausalLM,
+    GPTJConfig, GPTJForCausalLM,
     Qwen3Config, Qwen3ForCausalLM, MistralConfig, MistralForCausalLM, PreTrainedModel,
     MixtralConfig, MixtralForCausalLM, Qwen2Config, Qwen2ForCausalLM,
     Qwen3MoeConfig, Qwen3MoeForCausalLM, Olmo3Config, Olmo3ForCausalLM,
@@ -129,6 +132,72 @@ NEMOTRON_H_CONFIGS = (
     ("nemotron-h-4b", "nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16", "dfaf35de3e30f1867dd8dbc38a7fc9fb52d3914f"),
     ("nemotron-h-30b-a3b", "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", "bf77c3174f68ad409e1c2aa60daeb46e32d1c606"),
 )
+BLOOM_CONFIG = ('bloom-560m', 'bigscience/bloom-560m', 'ac2ae5fab2ce3f9f40dc79b5ca9f637430d24971')
+BLOOMZ_CONFIG = ('bloomz-560m', 'bigscience/bloomz-560m', 'a2845d7e13dd12efae154a9f1c63fcc2e0cc4b05')
+
+
+def tiny_bloom() -> BloomForCausalLM:
+    """Three heads exercise the non-power-of-two ALiBi slopes and fused qkv."""
+    torch.manual_seed(0)
+    return BloomForCausalLM(BloomConfig(
+        vocab_size=64, hidden_size=24, n_layer=2, n_head=3,
+        layer_norm_epsilon=3e-5, hidden_dropout=0., attention_dropout=0.,
+        bos_token_id=1, eos_token_id=None, pad_token_id=0))
+
+
+GPT_NEO_CONFIG = ('gpt-neo-125m', 'EleutherAI/gpt-neo-125m', '21def0189f5705e2521767faed922f1f15e7d7db')
+
+
+def tiny_gpt_neo() -> GPTNeoForCausalLM:
+    """Local/global attention without a logit scale, learned positions and an output bias."""
+    torch.manual_seed(0)
+    return GPTNeoForCausalLM(GPTNeoConfig(
+        vocab_size=64, hidden_size=32, intermediate_size=48, num_layers=2, num_heads=4,
+        attention_types=[[['global', 'local'], 1]], window_size=4, max_position_embeddings=48,
+        layer_norm_epsilon=3e-5, resid_dropout=0., embed_dropout=0., attention_dropout=0.,
+        bos_token_id=1, eos_token_id=None, pad_token_id=0))
+
+
+PHI_CONFIG = ('phi-2', 'microsoft/phi-2', '810d367871c1d460086d9f82db8696f2e0a0fcd0')
+
+
+def tiny_phi() -> PhiForCausalLM:
+    """Biased one-norm parallel branches, partial rotary, GQA and an affine head."""
+    torch.manual_seed(0)
+    return PhiForCausalLM(PhiConfig(
+        vocab_size=64, hidden_size=32, intermediate_size=48, num_hidden_layers=2,
+        num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=48,
+        layer_norm_eps=3e-5, resid_pdrop=0., embd_pdrop=0., attention_dropout=0.,
+        rope_parameters={'rope_type': 'default', 'rope_theta': 10000., 'partial_rotary_factor': .5},
+        bos_token_id=1, eos_token_id=None, pad_token_id=0))
+
+
+FALCON_CONFIG = ('falcon-7b', 'tiiuae/falcon-7b', 'ec89142b67d748a1865ea4451372db8313ada0d8')
+
+
+def tiny_falcon(multi_query: bool = True) -> FalconForCausalLM:
+    """A biased one-norm parallel block, with contiguous MQA or head-interleaved MHA."""
+    torch.manual_seed(0)
+    return FalconForCausalLM(FalconConfig(
+        vocab_size=64, hidden_size=24, ffn_hidden_size=48, num_hidden_layers=2,
+        num_attention_heads=3, multi_query=multi_query, bias=True, parallel_attn=True,
+        max_position_embeddings=48, layer_norm_epsilon=3e-5,
+        hidden_dropout=0., attention_dropout=0.,
+        bos_token_id=1, eos_token_id=None, pad_token_id=0))
+
+
+GPTJ_CONFIG = ('gpt-j-6b', 'EleutherAI/gpt-j-6b', '47e169305d2e8376be1d31e765533382721b2cc1')
+
+
+def tiny_gptj() -> GPTJForCausalLM:
+    """Interleaved partial rotary, one-norm parallel residual and an affine head."""
+    torch.manual_seed(0)
+    return GPTJForCausalLM(GPTJConfig(
+        vocab_size=64, n_embd=32, n_inner=48, n_layer=2, n_head=4, rotary_dim=4, n_positions=48,
+        layer_norm_epsilon=3e-5, resid_pdrop=0., embd_pdrop=0., attn_pdrop=0.,
+        bos_token_id=1, eos_token_id=None, pad_token_id=0))
+
+
 PHI3_CONFIGS = (
     ('phi3-mini-4k', 'microsoft/Phi-3-mini-4k-instruct', 'f39ac1d28e925b323eae81227eaba4464caced4e'),
     ('phi4-mini', 'microsoft/Phi-4-mini-instruct', 'cfbefacb99257ffa30c83adab238a50856ac3083'),
@@ -1548,7 +1617,7 @@ def main() -> None:
                         help="only the tiny fixtures, no 1.5 GB download")
     parser.add_argument("--nemotron-h-only", action="store_true",
                         help="only the Nemotron-H tiny fixture and two pinned released configs")
-    parser.add_argument('--classic-family', choices=('phi3',),
+    parser.add_argument('--classic-family', choices=('bloom', 'gpt_neo', 'phi', 'phi3', 'falcon', 'gptj'),
                         help='only this classic decoder fixture and its pinned released configs')
     parser.add_argument('--minimax-m2-only', action='store_true',
                         help='only MiniMax-M2 with transformers 5.18.0 and its pinned configs')
@@ -1561,6 +1630,28 @@ def main() -> None:
     args = parser.parse_args()
 
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    if args.classic_family == 'bloom':
+        write_classic_tiny('bloom-tiny', tiny_bloom())
+        write_released_config(*BLOOM_CONFIG)
+        write_released_config(*BLOOMZ_CONFIG)
+        return
+    if args.classic_family == 'gpt_neo':
+        write_classic_tiny('gpt-neo-tiny', tiny_gpt_neo())
+        write_released_config(*GPT_NEO_CONFIG)
+        return
+    if args.classic_family == 'phi':
+        write_classic_tiny('phi-tiny', tiny_phi())
+        write_released_config(*PHI_CONFIG)
+        return
+    if args.classic_family == 'falcon':
+        write_classic_tiny('falcon-tiny', tiny_falcon())
+        write_classic_tiny('falcon-mha-tiny', tiny_falcon(multi_query=False))
+        write_released_config(*FALCON_CONFIG)
+        return
+    if args.classic_family == 'gptj':
+        write_classic_tiny('gptj-tiny', tiny_gptj())
+        write_released_config(*GPTJ_CONFIG)
+        return
     if args.classic_family == 'phi3':
         write_classic_tiny('phi3-tiny', tiny_phi3())
         for config in PHI3_CONFIGS:
