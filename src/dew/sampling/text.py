@@ -543,6 +543,7 @@ def _operations(model: nn.Module, params: Variables, pad_id: int, depths: int) -
                 at the tiny fixture's position 8 its hook sees [[32], [59]],
                 no cache, and predicts 2 where its full-prefix forward predicts
                 32. Rebuilding the prefix retains the prompt's information.
+                https://github.com/huggingface/transformers/issues/49334
                 """
                 empty = model.apply(params, tokens.shape[0],
                                      method='init_cache', mutable=['cache'])[1]['cache']
