@@ -38,10 +38,11 @@ from dew.diffusion.schedules import expand
 from dew.diffusion.transforms import broadcast_rates
 from dew.inputs import InputSpec, unit_range
 from dew.nn.autoencoders import AutoEncoder
-from dew.nn.autoencoders.api import ModuleAutoEncoder
-from dew.nn.autoencoders.kl import AutoencoderKL, posterior_latent
+from dew.nn.autoencoders.kl import posterior_latent
 from dew.nn.mp import Uncertainty
+from dew.nn.protocols import RequiresText
 from dew.objectives.base import (
+    FROZEN,
     OMITTED,
     Aux,
     Batch,
@@ -51,6 +52,7 @@ from dew.objectives.base import (
     Ratio,
     Step,
     Variables,
+    merge,
     thaw,
     under,
 )
@@ -92,22 +94,22 @@ LOSS_HEADS = (UNCERTAINTY, ALIGNMENT, AUTOENCODER, FAKE_SCORE, DISCRIMINATOR)
 """What trains beside the model under `params` and the model never reads."""
 
 
-def _unadapted(name: str, model: nn.Module, held: str) -> None:
-    """Refuse an adapted `model` for an objective that applies `held`, whole
-    trees with no factors for the adapter's branch, through it."""
-    from dew.lora import _Adapted
-
-    if isinstance(type(model), _Adapted):
-        raise ValueError(f"{name} applies its {held} through the student's model, and a held tree holds no "
-                         f"factors for an adapter's branch: train {name} without a LoRA")
-
-
 def _own_loss(name: str, kwargs: dict) -> None:
     """Refuse the denoising loss's extras, which an objective with its own
-    loss would leave unused."""
+    loss would leave unused, and sample unguided unless `kwargs` guide."""
     unused = sorted(key for key in ("uncertainty", "alignment", "end_to_end") if kwargs.get(key) is not None)
     if unused:
         raise ValueError(f"{name} trains on its own loss, which reads none of {unused}")
+    kwargs.setdefault("guidance", None)
+
+
+def _from_teacher(variables: Variables, teacher: Variables) -> Variables:
+    """`variables` with the model's leaves copied from `teacher`'s, in buffers the step may donate, the
+    weights under `FROZEN` in an adapter's split, which freezes all but its factors."""
+    copied = dict(jax.tree.map(jnp.copy, dict(teacher)))
+    if FROZEN in variables:
+        copied[FROZEN] = copied.pop("params")
+    return merge(variables, copied)
 
 
 def _without_loss_heads(variables: Variables) -> Variables:
@@ -341,6 +343,9 @@ class DiffusionObjective(Objective[Ratio]):
                                  "training encodes its captions; load it with its text encoder")
         if process is None or inputs is None:
             raise ValueError("a denoiser needs its `process` and `inputs`; a loaded pipeline carries both")
+        if isinstance(model, RequiresText) and model.text_keyword not in inputs.conditions:
+            raise ValueError(f"{type(model).__name__} reads text as {model.text_keyword!r} on every call and "
+                             f"cannot run unconditionally; its inputs give {sorted(inputs.conditions)}")
         autoencoder = None if autoencoder is OMITTED else autoencoder
         variables = None if variables is OMITTED else variables
         steps = _DEFAULT_STEPS if steps is None else steps
@@ -353,11 +358,12 @@ class DiffusionObjective(Objective[Ratio]):
         self.uncertainty = None if uncertainty is None else Uncertainty(uncertainty)
         self.alignment = alignment
         self.end_to_end = end_to_end
-        if end_to_end is not None and (
-                alignment is None or not isinstance(autoencoder, ModuleAutoEncoder)
-                or not isinstance(autoencoder.model, AutoencoderKL) or inputs.mask is not None):
-            raise ValueError("end-to-end tuning trains a KL autoencoder through REPA's loss; it "
-                             "needs `alignment`, a KL autoencoder and no masked-image input")
+        if end_to_end is not None:
+            if alignment is None or autoencoder is None or inputs.mask is not None:
+                raise ValueError("end-to-end tuning trains a KL autoencoder through REPA's loss; it "
+                                 "needs `alignment`, a KL autoencoder and no masked-image input")
+            # An autoencoder without the posterior the step trains through refuses it by name.
+            jax.eval_shape(autoencoder.moments, autoencoder.params, jnp.zeros((1, *inputs.sample.shape)))
         if inputs.mask is not None and autoencoder is None:
             raise ValueError("Masked-image conditioning requires an autoencoder")
         self.unconditional_prob = unconditional_prob
@@ -446,17 +452,16 @@ class DiffusionObjective(Objective[Ratio]):
 
         A text tower and a VAE are released weights of hundreds of megabytes, which a
         trace without arguments would compile into the state executable as
-        constants. This is one mapping, so an objective that starts from more than
-        the towers extends both this and `init`.
+        constants. The loss's frozen networks ride beside a starting tree without them.
+        This is one mapping, so an objective that starts from more than the towers
+        extends both this and `init`.
         """
-        if self.variables is not None:
-            return self.variables
-        held: dict[str, Any] = {"encoders": self.encoder_params()}
-        if self.autoencoder is not None:
+        held: dict[str, Any] = dict(self.variables or {"encoders": self.encoder_params()})
+        if self.variables is None and self.autoencoder is not None:
             held["autoencoder"] = self.autoencoder.params
-        if self.alignment is not None:
+        if self.alignment is not None and REPRESENTATION not in held:
             held[REPRESENTATION] = self.alignment.variables
-        if self.end_to_end is not None and self.end_to_end.perceptual_weight:
+        if self.end_to_end is not None and self.end_to_end.perceptual_weight and PERCEPTUAL not in held:
             from dew.eval.lpips import LPIPSNetwork
 
             held[PERCEPTUAL] = LPIPSNetwork.published()[1]
@@ -491,11 +496,11 @@ class DiffusionObjective(Objective[Ratio]):
         drawn = self.model.init(key, jnp.ones((1, *self.latent_shape)), jnp.ones((1,)),
                                 **conditions)
         state = {**drawn, "encoders": held["encoders"]}
-        for frozen in ("autoencoder", REPRESENTATION, PERCEPTUAL, DISCRIMINATOR):
+        for frozen in ("autoencoder", REPRESENTATION, PERCEPTUAL, DISCRIMINATOR, TEACHER):
             # The frozen weights are state, like the encoders'. They ride in
             # as an argument to the compiled step for the layout to place.
-            # A caller holding only some towers takes the rest as built,
-            # and a pretrained discriminator rides in the same way.
+            # A caller holding only some towers takes the rest as built, and
+            # a pretrained discriminator and a teacher ride in the same way.
             value = held[frozen] if frozen in held else self.held_variables().get(frozen)
             if value is not None:
                 state[frozen] = value
@@ -571,6 +576,13 @@ class DiffusionObjective(Objective[Ratio]):
                   for keyword, condition in self.inputs.conditions.items()}
         return self.encode(params["encoders"], tokens)
 
+    def clean_samples(self, variables, batch, key) -> jax.Array:
+        """Return the batch's samples in [-1, 1], or under an autoencoder their latents drawn with `key`."""
+        samples = unit_range(batch[self.inputs.sample.key])
+        if self.autoencoder is None:
+            return samples
+        return self.autoencoder.encode(variables["autoencoder"], samples, key)
+
     def denoiser(self, params, given, unconditional):
         """Build the process's denoiser over the model's own collections.
 
@@ -628,10 +640,8 @@ class DiffusionObjective(Objective[Ratio]):
         if self.end_to_end is not None:
             end_to_end = self._end_to_end_latents(variables, images, encode_key, step.step, batch)
             samples = end_to_end.samples
-        elif self.autoencoder is not None:
-            samples = self.autoencoder.encode(variables["autoencoder"], images, encode_key)
         else:
-            samples = images
+            samples = self.clean_samples(variables, batch, encode_key)
         noise = jax.random.normal(noise_key, samples.shape, dtype=jnp.float32)
         # The times are drawn in float32 and read at the samples' precision,
         # so a float64 run interpolates in float64.
@@ -692,11 +702,11 @@ class DiffusionObjective(Objective[Ratio]):
     def _end_to_end_latents(self, params, images, key, step, batch: Batch) -> TunedLatents:
         """The trained autoencoder's posterior draw of `images` and what the
         step reads of it."""
-        assert self.end_to_end is not None and isinstance(self.autoencoder, ModuleAutoEncoder)
-        module, weights = self.autoencoder.model, {"params": params["params"][AUTOENCODER]}
-        moments = module.apply(weights, images, method=module.moments)
+        assert self.end_to_end is not None and self.autoencoder is not None
+        weights = params["params"][AUTOENCODER]
+        moments = self.autoencoder.moments(weights, images)
         raw = posterior_latent(moments, key)
-        reconstruction = module.apply(weights, raw, method=module.decode)
+        reconstruction = self.autoencoder.decode_raw(weights, raw)
         discriminator = params["params"].get(DISCRIMINATOR)
         regularizer, hinge, terms = self.end_to_end.regularizer(
             images, reconstruction, moments, perceptual=params.get(PERCEPTUAL),
@@ -797,10 +807,11 @@ class Training(ABC):
 
     @abstractmethod
     def objective(self, run: DiffusionRunConfig, model: nn.Module, process: Process, inputs: InputSpec, *,
-                  autoencoder: AutoEncoder | None, variables: Variables | None) -> DiffusionObjective:
+                  base: nn.Module, autoencoder: AutoEncoder | None,
+                  variables: Variables | None) -> DiffusionObjective:
         """Return this mode's objective over the run's model, process, inputs, autoencoder and variables.
 
-        It samples as the run says.
+        `base` is `model` without the run's adapter, for a teacher. It samples as the run says.
         """
 
     def check(self, run: DiffusionRunConfig) -> None:
@@ -840,7 +851,8 @@ class Denoising(Training):
     alignment: RepresentationAlignment | None = None
 
     def objective(self, run: DiffusionRunConfig, model: nn.Module, process: Process, inputs: InputSpec, *,
-                  autoencoder: AutoEncoder | None, variables: Variables | None) -> DiffusionObjective:
+                  base: nn.Module, autoencoder: AutoEncoder | None,
+                  variables: Variables | None) -> DiffusionObjective:
         return DiffusionObjective(
             model, process, inputs, autoencoder=autoencoder, variables=variables,
             unconditional_prob=run.unconditional_prob, ema_decay=run.ema_decay, solver=run.solver,
@@ -850,11 +862,8 @@ class Denoising(Training):
 
     def check(self, run: DiffusionRunConfig) -> None:
         super().check(run)
-        if self.alignment is not None and run.pretrained is not None:
-            raise ValueError("representation alignment trains a scratch model on the denoising loss; "
-                             "it takes no `pretrained`")
         if self.alignment is not None and self.alignment.end_to_end is not None and run.autoencoder is None:
-            raise ValueError("end-to-end tuning trains the run's autoencoder; set `autoencoder`")
+            raise ValueError("end-to-end tuning trains a run's own `autoencoder`; a pipeline sets none")
 
 
 def teacher_variables(directory: str, variables: Variables | None) -> Variables:

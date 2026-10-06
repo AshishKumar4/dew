@@ -4,7 +4,6 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from functools import cached_property
-from typing import Protocol
 
 import jax
 import jax.numpy as jnp
@@ -15,6 +14,7 @@ from jax.experimental import multihost_utils
 from dew.coordination import agreed
 from dew.inference.tasks import Processor, TextGeneration
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of
+from dew.nn.protocols import HiddenStates
 from dew.objectives.base import (
     OMITTED,
     Aux,
@@ -54,12 +54,6 @@ OLD_VALUES_KEY = "old_values"
 RETURNS_KEY = "returns"
 
 
-class ValueBackbone(Protocol):
-    def hidden_states(self, tokens: jax.Array, train: bool = False, *,
-                      segment_ids: jax.Array | None = None,
-                      positions: jax.Array | None = None) -> jax.Array: ...
-
-
 class ValueHead(nn.Module):
     """Projects a decoder's hidden states to one float32 value per position.
 
@@ -67,7 +61,7 @@ class ValueHead(nn.Module):
     hidden state sees another chain.
     """
 
-    backbone: ValueBackbone
+    backbone: HiddenStates
 
     @nn.compact
     def __call__(self, tokens: jax.Array, *, segment_ids: jax.Array | None = None,

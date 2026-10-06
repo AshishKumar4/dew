@@ -3,7 +3,7 @@ and the objective through the general trainer.
 
 The model here is a small causal stack that honors the backbone's contract
 (int32 ids in, float32 logits out, a `train` flag for dropout, the head split
-off behind `hidden_states` and `head_weight`) and `dew.sampling.text.generate`
+off behind `hidden_states` and `output_table`) and `dew.sampling.text.generate`
 is recorded, not run, so what is under test is the objective: that the
 loss is the cross entropy of the shifted sequence, that padding is excluded
 only when a pad id is named, that a pass is scored per token, and that the
@@ -22,14 +22,11 @@ from recording import RecordingTracker
 
 from dew.artifacts import TokenScores
 from dew.data.chat import ROLES_KEY, Role
+from dew.nn.protocols import OutputTable
 from dew.objectives.base import Step
 from dew.objectives.lm import TEXT_KEY, LMObjective, Perplexity, Samples
 from dew.sampling import Sampling
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
-
-# Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
-pytestmark = pytest.mark.mesh
-
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
 pytestmark = pytest.mark.mesh
@@ -51,8 +48,8 @@ class TinyCausalLM(nn.Module):
     Same contract as the real backbone: int32 ids `[B, S]` in, float32 logits
     `[B, S, vocab]` out, `train` gating dropout, no path from a position to a
     later one, and the head split off behind `hidden_states` and
-    `head_weight` so the loss can score a vocabulary slice at a time. The
-    head carries no bias, so `hidden @ head_weight` is the whole projection.
+    `output_table` so the loss can score a vocabulary slice at a time. The
+    head carries no bias, so the table's product is the whole projection.
     """
 
     vocab_size: int
@@ -61,7 +58,6 @@ class TinyCausalLM(nn.Module):
     max_seq_len: int = 64
     dropout_rate: float = 0.0
     final_logit_softcap: float | None = None
-    precision = None
 
     def setup(self):
         self.lm_head = nn.Dense(self.vocab_size, use_bias=False, dtype=jnp.float32,
@@ -97,8 +93,9 @@ class TinyCausalLM(nn.Module):
 
         return nn.LayerNorm()(x)
 
-    def head_weight(self, params):
-        return params["lm_head"]["kernel"].astype(jnp.float32)
+    def output_table(self):
+        return OutputTable(self.lm_head.variables["params"]["kernel"], vocab_major=False,
+                           softcap=self.final_logit_softcap)
 
 
 def make_objective(seq=SEQ, model=None, **kwargs):

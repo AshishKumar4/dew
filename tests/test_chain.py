@@ -18,6 +18,7 @@ import pytest
 from flax import linen as nn
 
 from dew.data import ChatMessages, Loading, PreferencePairs, Prompts
+from dew.nn.protocols import OutputTable
 from dew.training import Layout
 from recipes.chain import Recipe, Stage
 
@@ -27,11 +28,9 @@ TOKENIZER = Path(__file__).resolve().parent / "fixtures" / "tokenizers" / "tiny-
 class TinyHead(nn.Module):
     """A position-wise map with the backbone's scoring contract: int32 ids
     in, float32 logits out, the head split off behind `hidden_states` and
-    `head_weight`."""
+    `output_table`."""
 
     vocab_size: int
-    final_logit_softcap = None
-    precision = None
 
     def setup(self):
         self.lm_head = nn.Dense(self.vocab_size, use_bias=False)
@@ -46,8 +45,8 @@ class TinyHead(nn.Module):
         return self.lm_head(
             self.hidden_states(tokens, train=train)).astype(jnp.float32)
 
-    def head_weight(self, params):
-        return params["lm_head"]["kernel"].astype(jnp.float32)
+    def output_table(self):
+        return OutputTable(self.lm_head.variables["params"]["kernel"], vocab_major=False)
 
 
 def chat_parquet(tmp_path):

@@ -20,6 +20,7 @@ from dew.checkpoints import Checkpoints
 from dew.config import ModelConfig, TrainerConfig
 from dew.data import TFDSImages
 from dew.diffusion.presets import Flow
+from dew.nn.backbones import SimpleDiT
 from dew.objectives.base import Step
 from dew.objectives.diffusion import (
     AdversarialDistillation,
@@ -128,14 +129,15 @@ def test_one_step_is_the_papers_equations_on_stylegan_ts_heads():
     layers = {name: {"kernel": jnp.asarray(STEP[f"teacher/{name}"], jnp.float32)}
               for name in ("layer_a", "layer_b")}
     teacher = {"params": unflattened("teacher") | layers}
+    model = Tokens(settings["width"])
     task = AdversarialDistillationObjective(
-        Tokens(settings["width"]), Flow()(), InputSpec(Field("image", pixels.shape[1:])),
+        model, Flow()(), InputSpec(Field("image", pixels.shape[1:])),
         AdversarialDistillation(feature_layers=settings["layers"], student_times=settings["student_times"],
                                 renoise_times=tuple(settings["renoise_times"]),
                                 distillation_weight=settings["distillation_weight"],
                                 r1_weight=settings["r1_weight"], cmap_dim=settings["cmap_dim"],
                                 kernel_size=(1, 1)),
-        teacher=teacher, time_features=settings["time_features"], ema_decay=None)
+        teacher=model, teacher_variables=teacher, time_features=settings["time_features"], ema_decay=None)
     variables = task.init(jax.random.PRNGKey(0))
     student = unflattened("student")
     for name in ("layer_a", "layer_b"):
@@ -242,3 +244,31 @@ def test_a_saved_student_samples_in_one_step(runs, tmp_path):
     front = dew.pipeline(str(tmp_path / "student"))
     assert isinstance(front, TextToImage)
     np.testing.assert_array_equal(front(["a red bird"], key=9).host().images, expected)
+
+
+def test_a_lora_student_distills_beside_its_whole_teacher():
+    """The teacher runs through its own model, so a LoRA student over its
+    weights distills: a step trains its factors and the heads, and the
+    weights it froze stay the teacher's."""
+    from dew.inputs import Field, InputSpec
+    from dew.lora import LoRA
+    from dew.objectives.base import FROZEN
+
+    model = SimpleDiT(patch_size=2, emb_features=16, num_layers=1, num_heads=2)
+    teacher = model.init(jax.random.PRNGKey(0), jnp.zeros((1, 4, 4, 3)), jnp.ones((1,)))
+    held = jax.tree.map(np.asarray, teacher["params"])  # the step donates these buffers
+    adapter = LoRA(rank=2, modules=("ada_proj", "final_proj")).apply(model, teacher, key=1)
+    task = AdversarialDistillationObjective(
+        adapter.model, Flow()(), InputSpec(Field("image", (4, 4, 3))),
+        AdversarialDistillation(feature_layers=("dit_block_0",), cmap_dim=4), teacher=model,
+        teacher_variables=teacher, ema_decay=None, variables={**adapter.variables, "encoders": {}})
+    assert [program.trained for program in task.program_key()] == [True, False]
+    batch = {"image": np.asarray(jax.random.randint(jax.random.PRNGKey(1), (8, 4, 4, 3), 0, 256), np.uint8)}
+    trainer = Trainer(task, optax.adam(1e-2), key=jax.random.PRNGKey(4))
+    state = trainer.initial_state()
+    state, *_ = trainer.compile(state, batch)(state, batch)
+    assert {path[-1].key for path, _ in jax.tree_util.tree_flatten_with_path(state.variables["params"])[0]
+            if path[0].key != DISCRIMINATOR} == {"lora_A", "lora_B"}
+    for got, want in zip(jax.tree.leaves(state.variables[FROZEN]), jax.tree.leaves(held), strict=True):
+        np.testing.assert_array_equal(np.asarray(got), want)
+    assert np.any(np.asarray(state.variables["params"]["output"]["final_proj"]["lora_B"]) != 0)

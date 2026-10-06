@@ -26,7 +26,7 @@ from dew.data.prompts import LENGTH_KEY, PROMPT_KEY
 from dew.inputs import Field, InputSpec
 from dew.nn.precision import at_least_fp32
 from dew.objectives.base import Aux, Ratio, Shown, Variables, thaw
-from dew.objectives.lm.chunked import chunked_cross_entropy
+from dew.objectives.lm.chunked import head_cross_entropy
 from dew.registry import objectives
 from dew.rl import behavior_importance_weights, k3_kl, masked_mean, sequence_log_ratio, token_log_ratio
 from dew.rl.surrogate import (
@@ -350,14 +350,9 @@ class GRPOObjective(LMObjective):
         padding = prompts.shape[1] - lengths
         aligned = _shift_rows(prompts, padding)
         hidden = self.model.apply(params, aligned[:, :-1], train=False,
-                                  method=type(self.model).hidden_states)
-        head = self.model.apply(params, params["params"],
-                                method=type(self.model).head_weight)
-        losses, predicted, _ = chunked_cross_entropy(
-            hidden, head, aligned[:, 1:], self.head_chunks,
-            bias=self._head_bias(params),
-            softcap=self.model.final_logit_softcap,
-            precision=self.model.precision, predict=True)
+                                  method="hidden_states")
+        losses, predicted, _ = head_cross_entropy(self.model, params, hidden, aligned[:, 1:],
+                                                  self.head_chunks, predict=True)
         assert predicted is not None
         correct, _ = _unpadded(predicted == aligned[:, 1:], padding)
         losses, valid = _unpadded(losses, padding)
