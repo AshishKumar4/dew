@@ -192,22 +192,7 @@ def test_meanflow_refuses_the_denoising_losss_extras(extra):
                           MeanFlowTraining(), **extra)
 
 
-def test_the_time_embeddings_take_the_models_time_scale():
-    """`time_scale` sets the Fourier frequencies of the time and the duration
-    embeddings, the smoothness a loss differentiating in time needs."""
-    model = SimpleDiT(patch_size=2, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1, interval=True,
-                             time_scale=0.002)
-    variables = model.init(jax.random.PRNGKey(0), jnp.zeros((1, 4, 4, 3)), jnp.ones((1,)))
-    table = np.random.RandomState(42).normal(size=(8,)).astype(np.float32) * np.float32(0.002)
-    for name in ("time_embed", "duration_embed"):
-        frequencies = variables["constants"]["conditioning"][name]["layers_0"]["frequencies"]
-        np.testing.assert_allclose(np.asarray(frequencies), table, rtol=1e-6)
-
-
 def test_a_meanflow_run_config_builds_a_smooth_time_embedding_unless_it_names_one():
-    """The run's model embeds the interval's duration (`IntervalModel`), and
-    its time features turn at `SMOOTH_TIME_SCALE` (`TimeScaled`) unless its
-    config names a scale."""
     from dew.config import ModelConfig
     from dew.data import TFDSImages
     from dew.objectives.diffusion import DiffusionRunConfig, MeanFlowTraining

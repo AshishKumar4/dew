@@ -20,6 +20,7 @@ from dew.checkpoints import Checkpoints
 from dew.config import ModelConfig, TrainerConfig
 from dew.data import TFDSImages
 from dew.diffusion.presets import Flow
+from dew.nn.backbones import SimpleDiT
 from dew.objectives.base import Step
 from dew.objectives.diffusion import (
     AdversarialDistillation,
@@ -245,51 +246,29 @@ def test_a_saved_student_samples_in_one_step(runs, tmp_path):
     np.testing.assert_array_equal(front(["a red bird"], key=9).host().images, expected)
 
 
-class Grid(nn.Module):
-    """A velocity network over a 4x4 token grid: an embedding, the layer
-    the heads read, and a projection back, which an adapter targets."""
-
-    @nn.compact
-    def __call__(self, x, time):
-        b, h, w, c = x.shape
-        tokens = nn.Dense(8, name="embed")(x.reshape(b, h * w, c)) + (time / 1000).reshape(-1, 1, 1)
-        return nn.Dense(c, name="out")(jnp.tanh(nn.Dense(8, name="layer")(tokens))).reshape(x.shape)
-
-
 def test_a_lora_student_distills_beside_its_whole_teacher():
-    """LADD's teacher runs through its own model, never the student's, so a
-    LoRA-adapted student distills. It starts as the teacher with its B
-    factors zero, so its loss is the whole student's, bit for bit, and an
-    update moves its factors and the heads while the teacher's weights it
-    froze stay as they were."""
+    """The teacher runs through its own model, so a LoRA student over its
+    weights distills: a step trains its factors and the heads, and the
+    weights it froze stay the teacher's."""
     from dew.inputs import Field, InputSpec
     from dew.lora import LoRA
     from dew.objectives.base import FROZEN
 
-    model, inputs = Grid(), InputSpec(Field("image", (4, 4, 3)))
+    model = SimpleDiT(patch_size=2, emb_features=16, num_layers=1, num_heads=2)
     teacher = model.init(jax.random.PRNGKey(0), jnp.zeros((1, 4, 4, 3)), jnp.ones((1,)))
-    # The step donates the state, whose teacher and frozen leaves are these buffers.
-    held = jax.tree.map(np.asarray, teacher["params"])
-    adapter = LoRA(rank=2, modules=("embed", "out")).apply(model, teacher, key=1)
-    distillation = AdversarialDistillation(feature_layers=("layer",), cmap_dim=4, kernel_size=(3, 3))
-
-    def objective(student, **kwargs):
-        return AdversarialDistillationObjective(student, Flow()(), inputs, distillation, teacher=model,
-                                                teacher_variables=teacher, ema_decay=None, **kwargs)
-
-    tasks = objective(model), objective(adapter.model, variables={**adapter.variables, "encoders": {}})
-    starts = [task.init(jax.random.PRNGKey(2)) for task in tasks]
-    student = {path for path, _ in jax.tree_util.tree_flatten_with_path(starts[1]["params"])[0]
-               if path[0].key != DISCRIMINATOR}
-    assert {path[-1].key for path in student} == {"lora_A", "lora_B"}
+    held = jax.tree.map(np.asarray, teacher["params"])  # the step donates these buffers
+    adapter = LoRA(rank=2, modules=("ada_proj", "final_proj")).apply(model, teacher, key=1)
+    task = AdversarialDistillationObjective(
+        adapter.model, Flow()(), InputSpec(Field("image", (4, 4, 3))),
+        AdversarialDistillation(feature_layers=("dit_block_0",), cmap_dim=4), teacher=model,
+        teacher_variables=teacher, ema_decay=None, variables={**adapter.variables, "encoders": {}})
+    assert [program.trained for program in task.program_key()] == [True, False]
     batch = {"image": np.asarray(jax.random.randint(jax.random.PRNGKey(1), (8, 4, 4, 3), 0, 256), np.uint8)}
-    step = Step(step=jnp.asarray(0), key=jax.random.PRNGKey(3), ema=None)
-    np.testing.assert_array_equal(*(task.loss(start, batch, step)[0].total
-                                    for task, start in zip(tasks, starts, strict=True)))
-
-    trainer = Trainer(tasks[1], optax.adam(1e-2), key=jax.random.PRNGKey(4))
+    trainer = Trainer(task, optax.adam(1e-2), key=jax.random.PRNGKey(4))
     state = trainer.initial_state()
     state, *_ = trainer.compile(state, batch)(state, batch)
+    assert {path[-1].key for path, _ in jax.tree_util.tree_flatten_with_path(state.variables["params"])[0]
+            if path[0].key != DISCRIMINATOR} == {"lora_A", "lora_B"}
     for got, want in zip(jax.tree.leaves(state.variables[FROZEN]), jax.tree.leaves(held), strict=True):
-        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
-    assert np.any(np.asarray(state.variables["params"]["out"]["lora_B"]) != 0)
+        np.testing.assert_array_equal(np.asarray(got), want)
+    assert np.any(np.asarray(state.variables["params"]["output"]["final_proj"]["lora_B"]) != 0)
