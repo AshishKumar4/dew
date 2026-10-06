@@ -1261,8 +1261,8 @@ class Server:
         if budget is None:
             raise ValueError("max_new_tokens is required; the source declares no default budget")
         valid = _check_inputs(self.model, ids, fields, budget, self.sampling, 1).astype(bool)
-        if positions is not None and not np.array_equal(
-                positions, np.maximum(np.cumsum(valid, axis=1) - 1, 0)):
+        if positions is not None and (positions.shape != valid.shape or not np.array_equal(
+                positions[valid], (np.cumsum(valid, axis=1) - 1)[valid])):
             raise ValueError("a served prompt cannot carry noncanonical positions")
         self.rows.refuse(int(valid[0].sum()), budget)
         return _Row(ids[0][valid[0]].astype(np.int32), budget, seed, fold, Ticket())
