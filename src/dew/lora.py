@@ -214,7 +214,6 @@ class Adapter:
         the source at hand. A recorded binding whose shapes do not fit the restored
         factors is refused by name.
         """
-        from dew.checkpoints import Checkpoints
         from dew.config import ModelConfig
         from dew.inference.tasks import run_record
         from dew.records import record, text
@@ -224,11 +223,9 @@ class Adapter:
         config = ModelConfig.from_dict(record(declaration['model'], 'model'))
         if config.adapter is None:
             raise ValueError(f"{directory} trained no adapter")
-        model = config.build()
-        kind = text(declaration['objective'], 'objective')
-        averaged = False if objectives[kind]._ema_is_reference else ema
-        variables = Checkpoints(str(directory)).variables(step=step, ema=averaged)
-        return cls.recorded(model, variables, config.adapter)
+        variables = objectives[text(declaration['objective'], 'objective')]._saved_variables(
+            str(directory), step=step, ema=ema)
+        return cls.recorded(config.build(), variables, config.adapter)
 
     @classmethod
     def recorded(cls, model: nn.Module, variables: Variables, adapter: Mapping) -> Adapter:
