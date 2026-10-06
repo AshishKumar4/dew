@@ -382,8 +382,15 @@ class DecisionObjective(Objective[Ratio]):
             "tokenizer": recorded_tokenizer(RunProcessor(self.tokenizer)),
         }
 
-    def pipeline(self, state: "TrainState", *, ema: bool | None = None) -> Decide:
-        """Return the trained model as a `Decide` task over the state's weights."""
+    def pipeline(self, state: "TrainState", *, ema: bool | None = None,
+                 processor: TaskProcessor | None | Omitted = OMITTED) -> Decide:
+        """Return the trained model as a `Decide` task over the state's weights.
+
+        A `Decide` encodes with the objective's own tokenizer and layout, so it
+        takes no processor.
+        """
+        if processor is not OMITTED:
+            raise TypeError("a Decide task encodes with the objective's tokenizer and takes no processor")
         averaged = not (ema is False or (ema is None and state.ema is None))
         return Decide(self.model, self._pipeline_weights(state, ema), self.layout, self.tokenizer,
                       self.specials, weights=Weights(int(state.step), averaged))

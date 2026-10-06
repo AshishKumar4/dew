@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Self
 
+import jax
 import numpy as np
 
 from dew import records
@@ -25,10 +26,11 @@ from dew.decision.layout import MarkerLayout, Specials
 from dew.decision.model import DecisionModel
 from dew.interop import sources
 from dew.interop.hf_decoders import translate_config, translate_weights
-from dew.interop.safetensors_io import read_weights
+from dew.interop.safetensors_io import read_weights, write_file
 from dew.interop.weights import translate_parameters
+from dew.lora import FACTORS
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.objectives.base import Variables, joined
+from dew.objectives.base import Variables, joined, part, thaw
 from dew.registry import from_record, with_precision
 
 # Laya's head, as nn.TransformerEncoderLayer and its nn.Sequential scorer name it.
@@ -75,9 +77,27 @@ def unpacked_attention(tensors: Mapping[str, np.ndarray]) -> dict[str, np.ndarra
         if match is None:
             split[name] = tensor
             continue
-        for part, piece in zip(("q_proj", "k_proj", "v_proj"), np.split(tensor, 3, axis=0), strict=True):
-            split[f"{match[1]}.{part}.{match[2]}"] = piece
+        thirds = np.split(tensor, 3, axis=0)
+        for projection, piece in zip(("q_proj", "k_proj", "v_proj"), thirds, strict=True):
+            split[f"{match[1]}.{projection}.{match[2]}"] = piece
     return split
+
+
+def packed_attention(tensors: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """Return `tensors` with each attention's q, k and v packed into one in_proj.
+
+    That is how `nn.MultiheadAttention` holds them: `unpacked_attention`'s inverse.
+    """
+    packed, thirds = {}, {}
+    for name, tensor in tensors.items():
+        match = re.fullmatch(r"(.+)\.([qkv])_proj\.(weight|bias)", name)
+        if match is None:
+            packed[name] = tensor
+        else:
+            thirds.setdefault(f"{match[1]}.in_proj_{match[3]}", {})[match[2]] = tensor
+    for name, parts in thirds.items():
+        packed[name] = np.concatenate([parts["q"], parts["k"], parts["v"]], axis=0)
+    return packed
 
 
 @dataclass(frozen=True)
@@ -157,6 +177,60 @@ class LayaCheckpoint:
         return cls(DecisionModel(backbone, head), variables, layout, tokenizer, specials,
                    (temperatures[0], temperatures[1], temperatures[2]),
                    {name: records.number(value, name) for name, value in buckets.items()})
+
+    def save(self, directory: str | Path) -> None:
+        """Write this checkpoint in Laya's layout, which `load` and llama.cpp's converter read.
+
+        That is `model.safetensors` (the encoder's ModernBertModel tensors under
+        `encoder.` and the head's under Laya's names), `encoder/config.json`, the
+        tokenizer under `tokenizer/`, and `rl_agent_config.json` with the head's
+        depth, the layout's budgets and the temperatures. The backbone must be a
+        ModernBERT encoder and the head Laya's.
+        """
+        from dew.interop.pretrained import PretrainedDecoder
+
+        head = from_record(DecisionHead, self.model.head)
+        backbone = thaw(part(self.variables, "backbone"))
+        if any(isinstance(key, jax.tree_util.DictKey) and key.key in FACTORS
+               for path, _ in jax.tree_util.tree_leaves_with_path(backbone) for key in path):
+            raise ValueError("the backbone carries LoRA factors; merge them into its kernels before saving")
+        bundle = PretrainedDecoder.from_model(from_record(CausalTransformer, self.model.backbone), backbone)
+        if bundle.config.get("model_type") != "modernbert":
+            raise ValueError("Laya's layout holds a ModernBERT encoder, "
+                             f"not a {bundle.config.get('model_type')}")
+        root = Path(directory)
+        (root / "encoder").mkdir(parents=True, exist_ok=True)
+        tensors = {f"encoder.{name.removeprefix('model.')}": np.asarray(tensor)
+                   for name, tensor in bundle.export().items()}
+        tensors.update(_head_tensors(thaw(part(self.variables, "head"))["params"]))
+        write_file(tensors, root / "model.safetensors", {"format": "pt"})
+        config = {**bundle.config, "architectures": ["ModernBertModel"]}
+        (root / "encoder" / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+        self.tokenizer.save_pretrained(root / "tokenizer")
+        (root / CONFIG_FILE).write_text(json.dumps({
+            "head_layers": head.layers, "max_len": self.layout.max_len,
+            "head_max_len": self.layout.head_max_len,
+            "option_layout": "parallel" if self.layout.parallel else "sequential",
+            "temperature": list(self.temperatures), "temperature_by_options": self.bucket_temperatures,
+        }, indent=2) + "\n")
+
+
+def _head_tensors(params: Mapping[str, object]) -> dict[str, np.ndarray]:
+    """`DecisionHead`'s parameters under Laya's tensor names, `_head_path`'s inverse."""
+    modules = {path: name for name, path in (*_LAYER.items(), *_SCORER.items())}
+    tensors = {}
+    for path, leaf in jax.tree_util.tree_leaves_with_path(params):
+        keys = tuple(str(key.key) for key in path if isinstance(key, jax.tree_util.DictKey))
+        if keys[0] == "type_embedding":
+            module = "type_emb"
+        elif keys[0].startswith("layers_"):
+            module = f"head.layers.{keys[0].removeprefix('layers_')}.{modules[keys[1:-1]]}"
+        else:
+            module = modules[keys[:-1]]
+        value = np.asarray(leaf)
+        torch_leaf = "bias" if keys[-1] == "bias" else "weight"
+        tensors[f"{module}.{torch_leaf}"] = value.T if keys[-1] == "kernel" else value
+    return packed_attention(tensors)
 
 
 def _token(value: object, name: str) -> int:

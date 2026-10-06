@@ -232,6 +232,8 @@ def test_a_calibration_comes_back_with_the_weights_it_was_fitted_on(tmp_path):
     checkpoints.wait()
     calibrated = objective.pipeline(state).calibrated(data.val, type_minimum=1, bucket_minimum=1)
     assert calibrated.weights == Weights(1, ema=False)
+    with pytest.raises(TypeError, match="takes no processor"):
+        objective.pipeline(state, processor=None)
     calibrated.save(str(tmp_path))
     reloaded = Decide.from_run(str(tmp_path))
     assert reloaded.calibration == calibrated.calibration
