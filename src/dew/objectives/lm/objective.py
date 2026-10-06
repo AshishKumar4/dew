@@ -1118,7 +1118,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         ce, _ = prediction.mean()
         reported = {"ce": ce, "perplexity": jnp.exp(ce)}
         if correct is not None:
-            reported["token_accuracy"] = jnp.sum(correct * weights) / jnp.where(mass > 0, mass, 1)
+            reported["token_accuracy"], _ = self.accuracy(correct, batch, weights).mean()
         if self.z_loss:
             # PaLM's auxiliary over the same counted targets as the cross
             # entropy, so one Ratio carries both.
