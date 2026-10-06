@@ -413,15 +413,14 @@ def test_the_autoencoder_and_discriminator_gradients_are_train_repae_s_in_float6
     `chain_roundings`).
 
     Both pass through kinks, VGG's ReLUs and pools and the PatchGAN's leaky
-    ReLUs, where float32 can take the other branch. Under Intel SDE's Ice
-    Lake server (70.9, against 70.9 on CI's northcentralus runner) the
-    reconstruction's float32 rounding puts VGG's first ReLU at image 4,
-    pixel (2, 6), channel 46 on the other side of a float64 input of 8.5e-7,
-    and that one branch puts the autoencoder's float32 gradient at 71 times
-    the reference's error, 0.68 with that one ReLU taken as float64 takes
-    it. A flip moves a gradient by a discrete step the float32 rule does not
-    model, so these two are held in float64, where both runs take one
-    branch; the parts no kink reaches stay under the float32 rule."""
+    ReLUs, where another machine's float32 can take the other branch: on an
+    Ice Lake server (CI's northcentralus runner, and Intel SDE emulating
+    one) a reconstruction's float32 rounding put one of VGG's ReLU inputs on
+    the other side of its kink, and that one branch put the autoencoder's
+    float32 gradient at 71 times the reference's error. A flip moves a
+    gradient by a discrete step the float32 rule does not model, so these
+    two are held in float64, where both runs take one branch; the parts no
+    kink reaches stay under the float32 rule."""
     gradients = repae_step_f64.gradients
     with jax.enable_x64(new_val=True):  # the reference's float64 gradients, kept float64
         truths = {AUTOENCODER: autoencoder_gradients("_f64"), DISCRIMINATOR: _discriminator_gradient("_f64")}

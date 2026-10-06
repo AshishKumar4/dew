@@ -2,7 +2,7 @@
 its `LPIPS` on VGG16, run as published, on drawn weights and on the
 published ones."""
 
-import math
+import hashlib
 from pathlib import Path
 
 import jax
@@ -23,47 +23,44 @@ CHANNELS = (64, 128, 256, 512, 512)
 
 def drawn_weights(seed: int = 0) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
     """The tool's `drawn_weights`: torchvision's order from
-    `np.random.default_rng(seed)`, kernels He normal, biases normal at 0.01,
-    heads the absolute value of a normal at 0.1, in float32."""
+    `np.random.default_rng(seed)`'s float32 uniforms, kernels He uniform,
+    biases in [-0.01, 0.01), heads in [0, 0.2): integer bits and float32
+    arithmetic, the same bits on every machine."""
     rng = np.random.default_rng(seed)
+
+    def uniform(shape, bound: float) -> np.ndarray:
+        return (rng.random(shape, dtype=np.float32) * np.float32(2) - np.float32(1)) * np.float32(bound)
+
     vgg, inputs = {}, 3
     for index, width in zip(CONVOLUTIONS, WIDTHS, strict=True):
-        vgg[f"features.{index}.weight"] = (rng.standard_normal((width, inputs, 3, 3), dtype=np.float32)
-                                           * np.float32(np.sqrt(2 / (9 * inputs))))
-        vgg[f"features.{index}.bias"] = rng.standard_normal(width, dtype=np.float32) * np.float32(0.01)
+        vgg[f"features.{index}.weight"] = uniform((width, inputs, 3, 3), np.sqrt(6 / (9 * inputs)))
+        vgg[f"features.{index}.bias"] = uniform(width, 0.01)
         inputs = width
-    linear = {f"lin{stage}.model.1.weight": np.abs(rng.standard_normal((1, width, 1, 1), dtype=np.float32))
-              * np.float32(0.1) for stage, width in enumerate(CHANNELS)}
+    linear = {f"lin{stage}.model.1.weight": rng.random((1, width, 1, 1), dtype=np.float32) * np.float32(0.2)
+              for stage, width in enumerate(CHANNELS)}
     return vgg, linear
 
 
 def test_the_distance_and_its_gradient_are_repa_es():
-    """On weights both sides draw (their per-tensor sums are the fixture's),
+    """On weights both sides draw (bitwise the fixture's, by SHA-256),
     converted by the same `variables_from_torch` the published weights go
     through: each pair's distance is within 1e-6 of REPA-E's float64 run,
     and the gradient of their mean in the first image, what the perceptual
     loss trains an autoencoder by, is Dew's float64 run within the float64
     rounding of the computation of REPA-E's (24,576 entries). The gradient
-    passes VGG's ReLUs and pools, whose nearest input sits 3.45 times Dew's
-    own float32 error from its kink, so another codegen's float32 could take
-    the other branch, a step the float32 rule does not model; in float64
-    both runs take one.
+    passes VGG's ReLUs and pools, and one ReLU input (conv_6's) sits 0.64 of
+    Dew's own float32 error from its kink, so Dew's float32 takes the other
+    branch there, a step the float32 rule does not model; in float64, whose
+    margin there is 2.4 float32 spacings, both runs take one.
 
     Two distances are too few for the rule's RMS, so they take a bound:
-    Dew's are 5.7e-8 and 4.4e-8 relative from float64, the reference's own
-    float32 1.3e-7 and 3.0e-8, and a wrong shift or scale digit or a dropped
+    Dew's are 2.1e-8 and 5.8e-8 relative from float64, the reference's own
+    float32 7.1e-8 and 1.2e-7, and a wrong shift or scale digit or a dropped
     stage moves a distance by 1e-3 or more."""
     reference = dict(np.load(FIXTURES / "drawn.npz"))
     vgg, linear = drawn_weights()
     for key, value in {**vgg, **linear}.items():
-        # The fixture's sum is numpy's, whose order follows the CPU's SIMD
-        # width, so it carries up to n·ε·Σ|x| of float64 rounding, ε numpy's
-        # eps (7.5e-9 on one conv's 1.2M entries, one CI runner against
-        # another); ours is math.fsum's, rounded once. A different draw moves
-        # a sum by ~30.
-        entries = value.astype(np.float64).ravel()
-        bound = entries.size * np.finfo(np.float64).eps * np.abs(entries).sum()
-        assert abs(math.fsum(entries) - reference[f"sum/{key}"]) <= bound, key
+        assert hashlib.sha256(value.tobytes()).hexdigest() == str(reference[f"sha256/{key}"]), key
     network, variables = LPIPSNetwork(), variables_from_torch(vgg, linear)
     images, references = (jnp.asarray(reference[key], jnp.float32) for key in ("images", "references"))
     distance = network.apply(variables, images, references)
