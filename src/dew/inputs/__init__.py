@@ -31,8 +31,11 @@ from .encoders import CharTable, CLIPText, ConditionEncoder, HFAudio, T5Text, re
 
 
 def unit_range(pixels: jax.typing.ArrayLike) -> jax.Array:
-    """Convert pixels in [0, 255] to [-1, 1]: float32 from uint8 or float32,
-    and a float64 run's float64 pixels stay float64."""
+    """Convert pixels in [0, 255] to [-1, 1].
+
+    uint8 and float32 pixels give float32, and a float64 run's float64 pixels
+    stay float64.
+    """
     pixels = jnp.asarray(pixels)
     return (pixels.astype(jnp.promote_types(pixels.dtype, jnp.float32)) - 127.5) / 127.5
 

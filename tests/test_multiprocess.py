@@ -370,16 +370,31 @@ def test_processes_read_disjoint_windows_of_one_packing(tmp_path):
 
 
 @pytest.mark.distributed
-def test_a_validation_split_packed_unevenly_ends_on_every_process(tmp_path):
-    """Every process scores the batch count all of them have.
+def test_every_objective_scores_every_record_of_a_split_once_on_two_processes(tmp_path):
+    """`tests/test_whole_validation.py`'s passes on a pool of two: each
+    process reads its share of a split of a batch and one record, the share
+    that runs out first scoring its last batch's copy with every row a
+    repeat, and every objective's loss and `Perplexity` count each record once.
+    A split of one record leaves process 1's share empty, and it is scored once."""
+    from test_whole_validation import assert_every_record_once, assert_the_metric_over_every_record
+
+    reports = run_pool("whole_validation", tmp_path / "out", 2, run_dir=tmp_path / "run", timeout=1800)
+    assert reports[0]["passes"] == reports[1]["passes"]
+    for name, report in reports[0]["passes"].items():
+        assert_every_record_once(name, report)
+    assert_the_metric_over_every_record(reports[0]["perplexity"])
+    assert_the_metric_over_every_record(reports[0]["one"], 1)
+
+
+@pytest.mark.distributed
+def test_a_validation_split_packed_unevenly_is_scored_whole_on_every_process(tmp_path):
+    """Every process scores every window of the split.
 
     Of these 60 documents, 36 fill a nine-id window and 24 are one eos each,
     which the plan packs into 39 windows; process 0 reads 20 of them and
-    process 1 the other 19, so their passes are 5 and 4 batches of 4. Each
-    batch is agreed before it is scored, so both score 4; a process that
-    bounded its own pass with an islice would issue a fifth validation
-    collective after the other had left the pass, and the pool would sit in
-    it until the heartbeat killed both.
+    process 1 the other 19, so their passes are 5 batches of 4 each, process
+    1's last filled out with a repeat (`VALID_ROWS`). Each batch is agreed
+    before it is scored, so both score 5.
     """
     seq_len, val_steps = 8, 5
     lengths = [seq_len if index // 2 < (16, 20)[index % 2] else 0 for index in range(60)]
@@ -388,9 +403,9 @@ def test_a_validation_split_packed_unevenly_ends_on_every_process(tmp_path):
                        fsdp_size=2, steps=2, records=RECORDS, tokens=corpus,
                        seq_len=seq_len, val_steps=val_steps)
 
-    assert [report["val_available"] for report in reports] == [5, 4]
+    assert [report["val_available"] for report in reports] == [5, 5]
     for report in reports:
-        assert report["val_batches"] == 4
+        assert report["val_batches"] == 5
         assert report["step"] == 2
 
 
@@ -1280,8 +1295,9 @@ def test_evaluation_coordinates_root_consumers_keys_and_host_failures(tmp_path):
         assert len(report["results"]["preview_only"]["events"]) == 1
         assert report["results"]["preview_only"]["scores"]["evaluation/coordinated_batches"] == 1
         assert report["results"]["preview_only"]["scores"]["evaluation/records"] == 8
-        assert report["results"]["uneven"]["scores"]["evaluation/coordinated_batches"] == 1
-        assert report["results"]["uneven"]["scores"]["evaluation/uneven_shards"] == 1
+        # Process 0 holds one batch and process 1 two: process 0 covers the
+        # second with its first's rows marked repeats, so the pass reads all 12.
+        assert report["results"]["uneven"]["scores"]["evaluation/coordinated_batches"] == 2
         for phase in ("metric", "preview", "finalize", "log", "render", "construct", "next"):
             assert "error" in report["results"][phase], (phase, report)
             if phase != "construct":
@@ -1291,7 +1307,7 @@ def test_evaluation_coordinates_root_consumers_keys_and_host_failures(tmp_path):
         assert report["results"]["no_consumer"] == {"scores": {}, "events": []}
         assert "no_consumer" not in report["closed"]
         assert report["results"]["normal"]["scores"]["evaluation/records"] == 16
-        assert report["results"]["uneven"]["scores"]["evaluation/records"] == 8
+        assert report["results"]["uneven"]["scores"]["evaluation/records"] == 12
         for invalid in ("mismatch", "duplicates"):
             assert "error" in report["results"][invalid]
             assert report["results"][invalid]["events"] == []

@@ -13,7 +13,17 @@ from collections.abc import Mapping
 
 from dew import records
 from dew.interop.config_records import native_fields
-from dew.interop.hf_decoders import _base_config, _dew_path, _refuse, _softmax_top_k
+from dew.interop.families.qwen import _qwen35_moe_path
+from dew.interop.hf_decoders import (
+    _FUSED_EXPERTS,
+    DecoderFields,
+    Packed,
+    _base_config,
+    _dew_path,
+    _refuse,
+    _renamed,
+    _softmax_top_k,
+)
 from dew.nn.backbones.decoder_block import Mixture
 
 
@@ -55,3 +65,48 @@ def _mixtral_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | 
     for theirs, ours in (('w1', 'gate_proj'), ('w2', 'down_proj'), ('w3', 'up_proj')):
         name = name.replace(f'.{theirs}.weight', f'.{ours}.weight')
     return _dew_path(name, config)
+
+
+def _granitemoe_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
+    """Read Granite's embedding, attention, residual and head multipliers.
+
+    Every layer uses ordinary GQA and a normalized softmax MoE, without
+    shared experts or a balancing bias. The released activation_function
+    repeats hidden_act (default SiLU). Its router_jitter_noise is absent
+    from the pinned reference; only the released zero is accepted.
+    """
+    if hf_config.get('activation_function', hf_config.get('hidden_act', 'silu')) != hf_config.get(
+        'hidden_act', 'silu'):
+        _refuse('activation_function', 'it disagrees with hidden_act, which the reference reads')
+    if hf_config.get('router_jitter_noise', 0.0) != 0.0:
+        _refuse('router_jitter_noise', 'the Granite reference applies no router jitter')
+    used.update(('activation_function', 'router_jitter_noise'))
+    config = _llama_config(hf_config, used)
+    for source, target in (('embedding_multiplier', 'embedding_multiplier'),
+                           ('residual_multiplier', 'residual_multiplier'),
+                           ('logits_scaling', 'logits_scaling'), ('attention_multiplier', 'attention_scale')):
+        used.add(source)
+        config[target] = records.number(hf_config.get(source, 1.0), source)
+
+    config['mixture'] = native_fields(Mixture)(
+        experts=records.integer(hf_config.get('num_local_experts', 8), 'num_local_experts'),
+        top_k=_softmax_top_k(hf_config, used))
+    used.add('num_local_experts')
+    return config
+
+
+_GRANITEMOE_NAMES = (
+    ('block_sparse_moe.router.layer', 'mlp.gate'), ('block_sparse_moe.router', 'mlp.gate'),
+    ('block_sparse_moe', 'mlp'),
+)
+_GRANITEMOE_PACKED = (
+    Packed('.block_sparse_moe.input_linear.weight',
+           ('.block_sparse_moe.experts.gate_proj', '.block_sparse_moe.experts.up_proj'), -1, (0, 2, 1)),
+    Packed('.block_sparse_moe.output_linear.weight',
+           ('.block_sparse_moe.experts.down_proj',), -1, (0, 2, 1)),
+    *_FUSED_EXPERTS,
+)
+
+
+def _granitemoe_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
+    return _qwen35_moe_path(_renamed(name, _GRANITEMOE_NAMES), config)

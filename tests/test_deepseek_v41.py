@@ -372,7 +372,8 @@ def test_every_released_tensor_lands_on_one_leaf_of_the_released_tree(released):
     together they cover it: the decoder with its DSpark stages and every
     router's image bias, the ViT, and the aligner with the image span's
     vectors."""
-    from dew.nn.vision import deepseek_v41_vision_path, projector_weight_path
+    from dew.nn.vision.common import projector_weight_path
+    from dew.nn.vision.deepseek_v41 import deepseek_v41_vision_path
 
     config, record, model, shapes = released
     family = families()["deepseek_v41"]
