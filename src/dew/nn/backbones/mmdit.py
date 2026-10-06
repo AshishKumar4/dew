@@ -6,12 +6,14 @@ concatenated sequence.
 """
 
 from collections.abc import Sequence
+from typing import Self
 
 import einops
 import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.records import JSON
 from dew.registry import models
 
 from ..attention import LayerNorm, RMSNorm, scaled_dot_product_attention
@@ -22,7 +24,9 @@ from ..dit import (
     _AttentionStackOptions,
     _DiTStackOptions,
     remat_block,
+    restored_remat,
     rope_for_scan,
+    stronger_remat,
 )
 from ..precision import at_least_fp32
 from ..rope import apply_rotary, rotary_freqs
@@ -268,6 +272,20 @@ class HierarchicalMMDiT(_AttentionStackOptions):
     num_layers: Sequence[int] = (4, 4, 14)  # Layers per stage, fine to coarse
     num_heads: Sequence[int] = (8, 12, 16)  # Heads per stage, fine to coarse
     remat: RematChoice = False
+
+    @nn.nowrap
+    def recompute_record(self) -> JSON:
+        return self.remat
+
+    @nn.nowrap
+    def recompute_more(self) -> Self | None:
+        stronger = stronger_remat(self.remat)
+        return None if stronger is None else self.clone(remat=stronger)
+
+    @nn.nowrap
+    def restore_recompute(self, record: JSON) -> Self:
+        restored = restored_remat(self.remat, record)
+        return self if restored is None else self.clone(remat=restored)
 
     def stage_blocks(self, stage: int, prefix: str) -> list:
         """Build one stage's MMDiT blocks, at that stage's width and heads."""

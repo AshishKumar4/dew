@@ -133,6 +133,11 @@ class JepaEncoder(_JepaStackOptions):
             tokens = gather_tokens(tokens, token_idx)
         return self.norm(self.stack(tokens, train=train))
 
+    def hidden_states(self, x, *, train: bool = False, token_idx=None):
+        """Return the encoder's representation of `x`, the normed tokens its
+        call gives, of the patches `token_idx` selects when given."""
+        return self(x, token_idx, train=train)
+
 
 @models("jepa_video_encoder")
 class JepaVideoEncoder(JepaEncoder):
