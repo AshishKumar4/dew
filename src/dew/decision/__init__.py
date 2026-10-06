@@ -9,11 +9,11 @@ the rows with a backbone, scores every option with a head (Laya's
 distribution over exactly the options each question names. `Decide` is the
 task that answers requests, and `DecisionObjective` trains one on proper
 scoring rules. `LayaCheckpoint` reads convaiinnovations/laya's released
-checkpoints, and `ClefHead` Cloudflare/clef's released head.
+checkpoints, and `ClefCheckpoint` Cloudflare/clef's, whose head `ClefHead` reads.
 """
 
 from dew.decision.calibration import Abstention, Binning, Calibration, Scored, Temperatures, bucket
-from dew.decision.clef import ClefHead
+from dew.decision.clef import ClefCheckpoint, ClefHead
 from dew.decision.data import DecisionTable, Example
 from dew.decision.head import HEADS, DecisionHead, Head, JointSchemaHead
 from dew.decision.laya import LayaCheckpoint
@@ -68,6 +68,7 @@ __all__ = [
     "Calibration",
     "Choice",
     "ChoiceAnswer",
+    "ClefCheckpoint",
     "ClefHead",
     "Combined",
     "Confidence",
