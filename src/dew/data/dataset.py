@@ -49,7 +49,7 @@ from dew.nn.sharding import BATCH_AXES, LayoutRefused
 
 # `Batch` lives in dew.objectives.base. The data layer imports it from here
 # so a dataset module needs one import for the value and its shape.
-from dew.objectives.base import Batch
+from dew.objectives.base import VALID_ROWS, Batch
 
 _log = logging.getLogger(__name__)
 
@@ -589,8 +589,9 @@ class Dataset:
 
         The caller decides the order, the shuffle and what each record turns
         into. This adds what every spec's `load` adds, with the same helpers:
-        the reader's share of the batch, whole batches only, and the state pair
-        a checkpoint saves.
+        the reader's share of the batch, whole training batches, a validation
+        pass over every record with its last batch filled out (`VALID_ROWS`),
+        and the state pair a checkpoint saves.
 
         A `MapDataset` is read by index, so it gets the same training stream as
         every spec: repeated endlessly, cut into the reader's share, and saved
@@ -630,7 +631,7 @@ class Dataset:
         def validating(partition: DataPartition) -> Iterator[Batch]:
             assert validation is not None
             return _shared(validation, rows=partition.rows(batch), partition=partition,
-                           loading=loading)
+                           loading=loading, remainder=True)
 
         return cls(
             train=training,
@@ -650,14 +651,10 @@ class Dataset:
         read by index. Training reshuffles the records from `seed` every epoch,
         with the same stream every spec reads (`train_stream`), so the position
         a checkpoint saves is a global record count and each process reads its
-        own share of every batch. `validation` is read once, in order, in whole
-        batches.
+        own share of every batch. `validation` is read once, in order, every
+        record of it, the last batch filled out (`VALID_ROWS`).
         """
         held = None if validation is None else in_memory(validation)
-        if held is not None and len(held) < batch:
-            raise ValueError(
-                f"{len(held)} validation records, fewer than one batch of {batch}: a "
-                f"pass is whole batches, so it would score nothing")
         source = in_memory(records)
         if len(source) < batch:
             raise ValueError(
@@ -1081,16 +1078,17 @@ class _WorkerBatches[Record](pygrain.MapDataset[Record]):
     round-robin, which restores batch order 0, 1, 2, ...
 
     The length is padded to whole rounds of one batch per worker. An index
-    past the parent's last whole batch answers None, which grain's reader
-    skips.
+    past the parent's last whole batch, or with `remainder` past its last
+    record, answers None, which grain's reader skips.
     """
 
     _MUTATES_ELEMENT_SPEC = False
 
-    def __init__(self, parent: pygrain.MapDataset[Record], batch: int, workers: int):
+    def __init__(self, parent: pygrain.MapDataset[Record], batch: int, workers: int, *,
+                 remainder: bool = False):
         super().__init__(parent)
         self._batch, self._workers = batch, workers
-        self._whole = len(parent) // batch
+        self._whole = -(-len(parent) // batch) if remainder else len(parent) // batch
         self._length = min(math.ceil(self._whole / workers) * workers * batch, sys.maxsize)
 
     def __len__(self) -> int:
@@ -1107,13 +1105,35 @@ class _WorkerBatches[Record](pygrain.MapDataset[Record]):
         worker, within = index % self._workers, index // self._workers
         round_, row = divmod(within, self._batch)
         which = round_ * self._workers + worker
-        return None if which >= self._whole else self._parent[which * self._batch + row]
+        record = which * self._batch + row
+        return None if which >= self._whole or record >= len(self._parent) else self._parent[record]
+
+
+class _Filled(pygrain.MapTransform):
+    """A batch of fewer than `rows` records filled out with repeats of its
+    own rows (`RowPlan.pad`), and `VALID_ROWS` marking the real ones."""
+
+    def __init__(self, rows: int):
+        self._rows = rows
+
+    def map(self, element: Batch) -> Batch:
+        from dew.nn.inputs import RowPlan
+
+        held = rows_of(element)
+        if held == self._rows:
+            return element
+        plan = RowPlan(None, held, self._rows, 0, 1)
+        return {**plan.pad(element), VALID_ROWS: ~plan.padding}
 
 
 def _batches[Record](records: pygrain.MapDataset[Record], *, rows: int,
-                     partition: DataPartition, loading: Loading, offset: int = 0
-                     ) -> pygrain.DatasetIterator[Batch]:
+                     partition: DataPartition, loading: Loading, offset: int = 0,
+                     remainder: bool = False) -> pygrain.DatasetIterator[Batch]:
     """The partition's share of `records`, in batches of `rows` records.
+
+    A training stream is endless and takes whole batches. An evaluation pass
+    (`remainder`) takes every record: its last batch is filled out to `rows`
+    (`_Filled`).
 
     The slice is `offset + index :: count`. Global batch k is then the same
     records at every count, and an offset is a slice bound rather than a
@@ -1129,9 +1149,11 @@ def _batches[Record](records: pygrain.MapDataset[Record], *, rows: int,
     """
     mine = records[offset + partition.index::partition.count]
     if loading.workers:
-        mine = _WorkerBatches(mine, rows, loading.workers)
+        mine = _WorkerBatches(mine, rows, loading.workers, remainder=remainder)
     stream = mine.to_iter_dataset(pygrain.ReadOptions(loading.threads, loading.read_buffer))
-    stream = stream.batch(rows, drop_remainder=True)
+    stream = stream.batch(rows, drop_remainder=not remainder)
+    if remainder:
+        stream = stream.map(_Filled(rows))
     if loading.workers:
         stream = stream.mp_prefetch(pygrain.MultiprocessingOptions(
             num_workers=loading.workers,
@@ -1140,7 +1162,7 @@ def _batches[Record](records: pygrain.MapDataset[Record], *, rows: int,
 
 
 def _shared(source: GrainPipeline, *, rows: int, partition: DataPartition, loading: Loading,
-            offset: int = 0) -> pygrain.DatasetIterator[Batch]:
+            offset: int = 0, remainder: bool = False) -> pygrain.DatasetIterator[Batch]:
     """The partition's share of `source`, in batches of `rows` records.
 
     A `MapDataset` is read by index, which is what `_batches` needs to cut a
@@ -1150,8 +1172,10 @@ def _shared(source: GrainPipeline, *, rows: int, partition: DataPartition, loadi
     since only it has a position to resume.
     """
     if isinstance(source, pygrain.MapDataset):
-        return _batches(source, rows=rows, partition=partition, loading=loading, offset=offset)
-    return iter(source(partition).batch(rows, drop_remainder=True))
+        return _batches(source, rows=rows, partition=partition, loading=loading, offset=offset,
+                        remainder=remainder)
+    batches = source(partition).batch(rows, drop_remainder=not remainder)
+    return iter(batches.map(_Filled(rows)) if remainder else batches)
 
 
 def rows_of(batch: Mapping[str, object]) -> int:
@@ -1593,12 +1617,14 @@ def validation_pass(source: Records, transformations: Sequence[pygrain.Transform
     because grain keys a record's rng by its index in the dataset the random
     map sits on. Applied after the slice, record k would take its key from
     its place in the slice, and one seed would augment it differently on one
-    host than on a pod. A pass is whole batches only, because a part-full
-    batch cannot be sharded over a device mesh.
+    host than on a pod. A part-full batch cannot be sharded over a device
+    mesh, so the last one is filled out to the batch's rows with repeats
+    that `VALID_ROWS` marks, and the pass still counts every record once.
     """
     def stream(partition: DataPartition) -> Iterator[Batch]:
         records = pygrain.MapDataset.source(source).seed(seed).apply(list(transformations))
-        return _batches(records, rows=partition.rows(batch), partition=partition, loading=loading)
+        return _batches(records, rows=partition.rows(batch), partition=partition, loading=loading,
+                        remainder=True)
 
     return stream
 

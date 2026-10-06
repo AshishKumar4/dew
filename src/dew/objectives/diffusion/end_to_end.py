@@ -33,7 +33,7 @@ import numpy as np
 from flax import linen as nn
 from jax.typing import ArrayLike
 
-from dew.objectives.base import Variables
+from dew.objectives.base import Batch, Objective, Variables
 
 if TYPE_CHECKING:
     from dew.nn.autoencoders import AutoEncoder
@@ -53,16 +53,25 @@ class _BatchNorm(nn.Module):
     batch's mean and biased variance (`epsilon` 1e-5), then scaled by
     `weight` (taming's `weights_init` draws it normal at 1, 0.02) and
     shifted by `bias`. REPA-E never puts its discriminator in evaluation
-    mode, so no running statistics are kept."""
+    mode, so no running statistics are kept. The statistics are `batch`'s
+    rows' (`Objective.row_mean`)."""
 
     @nn.compact
-    def __call__(self, hidden: jax.Array) -> jax.Array:
+    def __call__(self, hidden: jax.Array, batch: Batch) -> jax.Array:
         width = hidden.shape[-1]
         weight = self.param("weight", lambda key, shape: 1 + 0.02 * jax.random.normal(key, shape), (width,))
         bias = self.param("bias", nn.initializers.zeros, (width,))
-        axes = tuple(range(hidden.ndim - 1))
-        mean, var = jnp.mean(hidden, axis=axes), jnp.var(hidden, axis=axes)
+        mean, var = _moments(hidden, batch)
         return (hidden - mean) / jnp.sqrt(var + 1e-5) * weight + bias
+
+
+def _moments(values: jax.Array, batch: Batch) -> tuple[jax.Array, jax.Array]:
+    """`values`' mean and biased variance over every axis but the channels,
+    over `batch`'s rows (`Objective.row_mean`), as `jnp.mean` and `jnp.var` take them."""
+    axes = tuple(range(values.ndim - 1))
+    mean, _ = Objective.row_mean(values, batch, axes).mean()
+    var, _ = Objective.row_mean(jnp.square(values - mean), batch, axes).mean()
+    return mean, var
 
 
 class PatchDiscriminator(nn.Module):
@@ -74,14 +83,14 @@ class PatchDiscriminator(nn.Module):
     logit per patch; every convolution pads by one. A fresh one draws its
     kernels normal at 0.02 as taming's `weights_init` does; REPA-E's recipe
     starts from a pretrained one (`variables_from_torch`). Returns the
-    logits, `[B, h, w, 1]`.
+    logits, `[B, h, w, 1]`. Its batch norms read `batch`'s rows.
     """
 
     width: int = 64
     layers: int = 3
 
     @nn.compact
-    def __call__(self, images: jax.Array) -> jax.Array:
+    def __call__(self, images: jax.Array, batch: Batch) -> jax.Array:
         def conv(features: int, stride: int, name: str, *, bias: bool = True) -> nn.Conv:
             return nn.Conv(features, (4, 4), strides=stride, padding=1, use_bias=bias, name=name,
                            kernel_init=nn.initializers.normal(0.02))
@@ -90,7 +99,7 @@ class PatchDiscriminator(nn.Module):
         for index in range(1, self.layers + 1):
             features = self.width * min(2 ** index, 8)
             hidden = conv(features, 2 if index < self.layers else 1, f"conv_{index}", bias=False)(hidden)
-            hidden = nn.leaky_relu(_BatchNorm(name=f"norm_{index}")(hidden), 0.2)
+            hidden = nn.leaky_relu(_BatchNorm(name=f"norm_{index}")(hidden, batch), 0.2)
         return conv(1, 1, f"conv_{self.layers + 1}")(hidden)
 
     def variables_from_torch(self, state: Mapping[str, np.ndarray]) -> Variables:
@@ -117,7 +126,7 @@ class PatchDiscriminator(nn.Module):
         return {"params": params}
 
 
-def _applied(module: nn.Module, variables: Variables, *inputs: jax.Array) -> jax.Array:
+def _applied(module: nn.Module, variables: Variables, *inputs: jax.Array | Batch) -> jax.Array:
     """`module` over `inputs`, which returns one array."""
     output = module.apply(variables, *inputs)
     assert isinstance(output, jax.Array)
@@ -197,14 +206,14 @@ class EndToEnd:
         """`latents` under the running statistics: the batch norm in eval mode."""
         return (latents - statistics["mean"]) / jnp.sqrt(statistics["var"] + self.epsilon)
 
-    def batch_normalized(self, latents: jax.Array, statistics: Variables) -> tuple[jax.Array, Variables]:
+    def batch_normalized(self, latents: jax.Array, statistics: Variables, batch: Batch
+                         ) -> tuple[jax.Array, Variables]:
         """`latents` under their own statistics over every axis but the
         channels, and the running statistics after them: torch's
-        `BatchNorm2d` in training mode, whose running variance is unbiased."""
-        axes = tuple(range(latents.ndim - 1))
-        mean = jnp.mean(latents, axis=axes)
-        var = jnp.var(latents, axis=axes)
-        count = latents.size // latents.shape[-1]
+        `BatchNorm2d` in training mode, whose running variance is unbiased.
+        The statistics are `batch`'s rows' (`Objective.row_mean`)."""
+        mean, var = _moments(latents, batch)
+        count = Objective.row_mean(latents[..., 0], batch).mass
         following = {"mean": (1 - self.momentum) * statistics["mean"] + self.momentum * mean,
                      "var": (1 - self.momentum) * statistics["var"]
                      + self.momentum * var * count / (count - 1)}
@@ -212,39 +221,43 @@ class EndToEnd:
 
     def regularizer(self, images: jax.Array, reconstruction: jax.Array, moments: jax.Array, *,
                     perceptual: Variables | None, discriminator: Variables | None,
-                    step: jax.Array) -> tuple[jax.Array, jax.Array, dict[str, jax.Array]]:
+                    step: jax.Array, batch: Batch) -> tuple[jax.Array, jax.Array, dict[str, jax.Array]]:
         """The autoencoder's own loss, the discriminator's, and their terms.
 
         `perceptual` is the LPIPS network's variables and `discriminator` the
         PatchGAN's, each None where its weight is 0. The generator term reads
         the discriminator frozen and the discriminator's hinge loss reads the
         images and the reconstruction frozen, so each loss trains only its
-        own network, on what the step began with."""
+        own network, on what the step began with. Every mean is over
+        `batch`'s rows (`Objective.row_mean`)."""
+        def mean_of(values: jax.Array) -> jax.Array:
+            return Objective.row_mean(values, batch).mean()[0]
+
         # At least float32, and a float64 run stays float64.
         dtype = jnp.promote_types(jnp.result_type(moments, reconstruction), jnp.float32)
         mean, log_variance = jnp.split(moments.astype(dtype), 2, axis=-1)
         log_variance = jnp.clip(log_variance, -30.0, 20.0)
         axes = tuple(range(1, mean.ndim))
-        kl = jnp.mean(0.5 * jnp.sum(jnp.square(mean) + jnp.exp(log_variance) - 1.0 - log_variance, axis=axes))
+        kl = mean_of(0.5 * jnp.sum(jnp.square(mean) + jnp.exp(log_variance) - 1.0 - log_variance, axis=axes))
         reconstruction = reconstruction.astype(dtype)
-        reconstruction_error = jnp.mean(jnp.abs(images - reconstruction))
+        reconstruction_error = mean_of(jnp.abs(images - reconstruction))
         total = self.reconstruction_weight * reconstruction_error + self.kl_weight * kl
         terms = {"reconstruction": reconstruction_error, "kl": kl}
         if perceptual is not None:
             from dew.eval.lpips import LPIPSNetwork
 
-            terms["perceptual"] = jnp.mean(_applied(LPIPSNetwork(), perceptual, images, reconstruction))
+            terms["perceptual"] = mean_of(_applied(LPIPSNetwork(), perceptual, images, reconstruction))
             total = total + self.perceptual_weight * terms["perceptual"]
         hinge = jnp.zeros((), dtype)
         network = self.discriminator
         if network is not None and discriminator is not None:
             started = (step >= self.discriminator_start).astype(dtype)
             frozen = jax.lax.stop_gradient(discriminator)
-            terms["generator"] = -jnp.mean(_applied(network, frozen, reconstruction))
+            terms["generator"] = -mean_of(_applied(network, frozen, reconstruction, batch))
             total = total + self.discriminator_weight * started * terms["generator"]
-            real, fake = (_applied(network, discriminator, jax.lax.stop_gradient(pixels))
+            real, fake = (_applied(network, discriminator, jax.lax.stop_gradient(pixels), batch)
                           for pixels in (images, reconstruction))
-            hinge = started * 0.5 * (jnp.mean(nn.relu(1.0 - real)) + jnp.mean(nn.relu(1.0 + fake)))
+            hinge = started * 0.5 * (mean_of(nn.relu(1.0 - real)) + mean_of(nn.relu(1.0 + fake)))
             terms["discriminator"] = hinge
         return total, hinge, terms
 

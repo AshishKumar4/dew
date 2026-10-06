@@ -24,7 +24,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from dew.nn.blocks import torch_bicubic_resize
-from dew.objectives.base import Variables
+from dew.objectives.base import Batch, Objective, Variables
 from dew.objectives.diffusion.end_to_end import EndToEnd
 
 ALIGNMENT = "alignment_projector"
@@ -143,8 +143,10 @@ class Alignment:
         """Return the projector's variables for `count` hidden tokens of `width`."""
         return self.module(features).init(key, jnp.zeros((1, count, width)))
 
-    def loss(self, projector: Variables, hidden: jax.Array, targets: jax.Array) -> jax.Array:
+    def loss(self, projector: Variables, hidden: jax.Array, targets: jax.Array, batch: Batch) -> jax.Array:
         """Return REPA's projection loss, the mean of -cos(target, projection) over tokens and examples.
+
+        The examples are `batch`'s rows (`Objective.row_mean`).
 
         Raises `ValueError` when the model's token count differs from the
         encoder's patch count.
@@ -159,7 +161,7 @@ class Alignment:
         def unit(value):
             return value / jnp.maximum(jnp.linalg.norm(value, axis=-1, keepdims=True), 1e-12)
 
-        return -jnp.mean(jnp.sum(unit(projected) * unit(targets), axis=-1))
+        return -Objective.row_mean(jnp.sum(unit(projected) * unit(targets), axis=-1), batch).mean()[0]
 
     def captures(self, module: nn.Module, method: str) -> bool:
         """Return whether `capture_intermediates` should keep this call: True for `layer`'s output."""
