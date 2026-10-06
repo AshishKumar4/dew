@@ -12,10 +12,10 @@ REPA-E copy for their perceptual losses.
 
 The published weights are torchvision's ImageNet VGG16 (`IMAGENET1K_V1`,
 vgg16-397923af.pth) and v0.1's linear heads (lpips/weights/v0.1/vgg.pth,
-whose MD5 is the d507d734... taming-transformers and REPA-E check). Both
-are PyTorch pickles: `LPIPSNetwork.published()` downloads each once,
-checks its SHA-256, and converts it through `dew.interop.pickles`, which
-needs torch for that first conversion only.
+whose MD5 is the d507d734... taming-transformers and REPA-E check).
+`LPIPSNetwork.published()` reads them from safetensors copies on the Hub,
+whose tensors are bitwise those files', each pinned by revision and
+SHA-256 through `dew.interop.inception_fid.fetch`.
 
 `LPIPS` is the same distance as an image metric: the mean over the sampled
 frames of their distance to the batch's, lower being better.
@@ -24,11 +24,6 @@ frames of their distance to the batch's, lower being better.
 from __future__ import annotations
 
 import functools
-import hashlib
-import os
-import secrets
-import urllib.request
-from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -54,12 +49,13 @@ stage after the first."""
 TORCHVISION_LAYERS = (0, 2, 5, 7, 10, 12, 14, 17, 19, 21, 24, 26, 28)
 """Where each convolution sits in torchvision's `vgg16().features`."""
 
-VGG16_WEIGHTS = ("https://download.pytorch.org/models/vgg16-397923af.pth",
-                 "397923af8e79cdbb6a7127f12361acd7a2f83e06b05044ddf496e83de57a5bf0")
-LINEAR_WEIGHTS = ("https://raw.githubusercontent.com/richzhang/PerceptualSimilarity/"
-                  "082bb24f84c091ea94de2867d34c4544f68e0963/lpips/weights/v0.1/vgg.pth",
-                  "a78928a0af1e5f0fcb1f3b9e8f8c3a2a5a3de244d830ad5c1feddc79b8432868")
-"""The published files and their SHA-256."""
+VGG16_WEIGHTS = ("timm/vgg16.tv_in1k", "model.safetensors", "b8d8aa2dd860af9233c8c67385a8097fd6c35d3f",
+                 "57b026918159a6bf9faf8405c3a551903768e7138989d9c6224a14227203fad8")
+LINEAR_WEIGHTS = ("vivym/lpips", "vgg_lpips_linear.safetensors", "270571f1fb2a2c4c5f920cec96cd87838c345982",
+                  "0c6387bf2e51e434dedbc0ca4c5894f605c415b8d128bfe720e13456eb4333ac")
+"""The Hub copies' repo, file, revision and SHA-256. timm's `features.*` are
+bitwise vgg16-397923af.pth's, and vivym's `{stage}.weight` v0.1's
+`lin{stage}.model.1.weight`."""
 
 
 def _unit(features: jax.Array) -> jax.Array:
@@ -101,35 +97,8 @@ class LPIPSNetwork(nn.Module):
 
     @staticmethod
     def published() -> tuple[LPIPSNetwork, Variables]:
-        """The network and the published weights, downloaded and converted
-        on first use."""
+        """The network and the published weights, downloaded on first use."""
         return LPIPSNetwork(), _published_variables()
-
-
-def _fetched(url: str, digest: str) -> Path:
-    """`url` in Dew's cache, downloaded once and checked against `digest`."""
-    from dew.telemetry.instrumentation import dew_cache_dir
-
-    path = Path(dew_cache_dir()) / "lpips" / url.rsplit("/", 1)[-1]
-    if not path.is_file():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        # A name of this download's own, created exclusively with the
-        # umask's mode as the cached file keeps, so processes sharing the
-        # cache each write their own file and the last rename leaves a whole one.
-        partial = path.parent / f".{path.name}.{secrets.token_hex(8)}.partial"
-        descriptor = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
-        try:
-            with urllib.request.urlopen(url) as response, os.fdopen(descriptor, "wb") as output:
-                while chunk := response.read(1 << 20):
-                    output.write(chunk)
-            os.replace(partial, path)
-        finally:
-            partial.unlink(missing_ok=True)
-    with open(path, "rb") as handle:
-        found = hashlib.file_digest(handle, "sha256").hexdigest()
-    if found != digest:
-        raise ValueError(f"{url} hashes to {found}, not the {digest} LPIPS was written against")
-    return path
 
 
 def variables_from_torch(vgg: dict[str, np.ndarray], linear: dict[str, np.ndarray]) -> Variables:
@@ -147,14 +116,12 @@ def variables_from_torch(vgg: dict[str, np.ndarray], linear: dict[str, np.ndarra
 
 @functools.cache
 def _published_variables() -> Variables:
-    from dew.interop.pickles import converted
-    from dew.interop.safetensors_io import WEIGHTS_FILE, read_file
+    from dew.interop.inception_fid import fetch
+    from dew.interop.safetensors_io import read_file
 
-    tables = []
-    for url, digest in (VGG16_WEIGHTS, LINEAR_WEIGHTS):
-        path = _fetched(url, digest)
-        tables.append(dict(read_file(converted(path.parent, [path.name]) / WEIGHTS_FILE)[0]))
-    return variables_from_torch(*tables)
+    vgg, linear = (read_file(fetch(*source))[0] for source in (VGG16_WEIGHTS, LINEAR_WEIGHTS))
+    return variables_from_torch(vgg, {f"lin{stage}.model.1.weight": linear[f"{stage}.weight"]
+                                      for stage in range(len(STAGES))})
 
 
 @functools.cache

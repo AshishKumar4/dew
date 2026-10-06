@@ -83,9 +83,9 @@ def test_the_distance_and_its_gradient_are_repa_es():
 
 @pytest.mark.network
 def test_the_published_network_measures_as_repa_es():
-    """The published weights, downloaded, checked and converted on first use:
-    four pairs' distances within 1e-6 of REPA-E's float64 run on the same
-    files, and the `LPIPS` metric over an image grid is their mean, the
+    """The published weights, the Hub copies downloaded and checked on first
+    use: four pairs' distances within 1e-6 of REPA-E's float64 run on the
+    original files, and the `LPIPS` metric over an image grid is their mean, the
     batch holding the references as pixels in [0, 255] as a loader does.
     Dew's distances are at most 2.5e-7 relative from float64, the
     reference's own float32 at most 1.9e-7."""
