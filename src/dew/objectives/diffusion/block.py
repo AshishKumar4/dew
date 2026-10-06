@@ -16,18 +16,18 @@ from __future__ import annotations
 
 import functools
 import math
-from collections.abc import Mapping
-from typing import TYPE_CHECKING
+from collections.abc import Mapping, Sequence
+from typing import TYPE_CHECKING, Protocol, Self, runtime_checkable
 
 import jax
 import jax.numpy as jnp
 import optax
-from flax import struct
+from flax import linen as nn, struct
+from flax.typing import VariableDict
 
 from dew.artifacts import TokenScores
 from dew.inference.tasks import BlockGeneration
 from dew.inputs import Field, InputSpec
-from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.inputs import ModelInputs
 from dew.nn.sharding import LOGITS, constrain
 from dew.objectives.base import (
@@ -38,19 +38,36 @@ from dew.objectives.base import (
     EMASpec,
     Objective,
     Omitted,
+    ProgramModule,
     Ratio,
     Source,
     Step,
     Variables,
     thaw,
 )
-from dew.objectives.lm.chunked import chunked_cross_entropy, head_logits
+from dew.objectives.lm.chunked import affine_head, chunked_cross_entropy, head_logits
 from dew.records import JSON
 from dew.registry import objectives
 
 if TYPE_CHECKING:
     from dew.inference.tasks import Processor
     from dew.nn.backbones.causal_transformer import DecoderBank
+    from dew.nn.diffusion_gemma import DiffusionGemma
+
+
+@runtime_checkable
+class _Canvases(Protocol):
+    """What the SFT reads off a model besides its head: a clean prefix
+    `encode`d into its cache, `canvas_length`-token canvases its call denoises
+    against that cache, and the layer scalars the published SFT trains, with
+    the source's tree as that model reads it (`DiffusionGemma`'s hooks)."""
+
+    @property
+    def canvas_length(self) -> int: ...
+
+    def with_trainable_layer_scalars(self) -> Self: ...
+
+    def trainable_variables(self, variables: VariableDict) -> VariableDict: ...
 
 
 @struct.dataclass
@@ -168,9 +185,11 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
                  ema_decay: float | None = None, head_chunks: int = 4,
                  processor: Processor | None | Omitted = OMITTED):
         model = self.bind_model(model, variables=variables, processor=processor)
-        if not isinstance(model, DiffusionGemma):
-            raise TypeError(f"block diffusion trains a DiffusionGemma, and this source's model "
-                            f"is a {type(model).__name__}")
+        if not isinstance(model, _Canvases):
+            raise TypeError(
+                f"block diffusion encodes a clean prefix into a model's cache and denoises canvases "
+                f"against it, with the layer scalars the published SFT trains, as DiffusionGemma "
+                f"does, and a {type(model).__name__} does none of that")
         canvas_size = model.canvas_length if canvas_size is None else canvas_size
         for name, value in (("prompt_length", prompt_length), ("num_canvases", num_canvases),
                             ("canvas_size", canvas_size), ("head_chunks", head_chunks)):
@@ -185,10 +204,10 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
             raise ValueError("encoder_loss_weight and decoder_loss_weight must be nonnegative")
         if not encoder_loss_weight + decoder_loss_weight:
             raise ValueError("at least one SFT loss must be active")
-        if model.text.layer_scalar not in ("frozen", "trainable"):
-            raise ValueError("official SFT requires the model layer_scalar value")
-        self._initial_scalar_mode = model.text.layer_scalar
-        self.model = model.clone(text=model.text.clone(layer_scalar="trainable"))
+        # The source reads its own tree; the model trained reads it with the
+        # scalars moved (`held_variables`).
+        self._source_model = model
+        self.model = model.with_trainable_layer_scalars()
         self.prompt_length = prompt_length
         self.canvas_size = canvas_size
         self.num_canvases = num_canvases
@@ -197,7 +216,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
             raise ValueError("the SFT sequence exceeds model.max_seq_len")
         # The reference allocates one full-sequence cache for training, not the
         # model's potentially much larger serving capacity. Weights are unchanged.
-        self.training_model = self.model.clone(text=self.model.text.clone(max_seq_len=self.sequence_length))
+        self.training_model = self.model.with_cache_capacity(self.sequence_length)
         self.pad_token_id = pad_token_id
         self.self_cond_prob = self_cond_prob
         self.safety_epsilon = safety_epsilon
@@ -239,9 +258,9 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         return self.training_model.bank_sites
 
     def held_variables(self) -> Variables | None:
-        """The SFT source this objective starts from, its split kept, with the
-        source's layer scalars moved where the model reads them; or None for
-        a fresh init.
+        """The SFT source this objective starts from, its split kept, read as
+        the trained model reads it (`trainable_variables`); or None for a
+        fresh init.
 
         A split tree's scalars go under `frozen` beside the rest of the base,
         so an adapter's run moves its factors alone, as the source's frozen
@@ -249,44 +268,21 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         no array.
         """
         pretrained = self.variables
-        if pretrained is not None:
-            if "params" not in pretrained:
-                raise ValueError("variables must contain the params collection")
-            if self._initial_scalar_mode == "trainable":
-                return pretrained
-            held = FROZEN if FROZEN in pretrained else "params"
-            # Google makes skip_scale a parameter; Transformers declares the
-            # same tensor a buffer. Move references once, under an explicit
-            # model policy, without copying any parameter arrays.
-            values = dict(pretrained)
-            params = dict(values[held])
-            text = dict(params["text"])
-            constants = dict(values["constants"])
-            text_constants = dict(constants["text"])
-            for index in range(self.model.text.num_layers):
-                layer = f"layers_{index}"
-                fixed = dict(text_constants[layer])
-                learned = dict(text[layer])
-                if "layer_scalar" in learned:
-                    raise ValueError("frozen source unexpectedly contains a trainable layer_scalar")
-                learned["layer_scalar"] = fixed.pop("layer_scalar")
-                text[layer] = learned
-                if fixed:
-                    text_constants[layer] = fixed
-                else:
-                    del text_constants[layer]
-            params["text"] = text
-            values[held] = params
-            if text_constants:
-                constants["text"] = text_constants
-            else:
-                del constants["text"]
-            if constants:
-                values["constants"] = constants
-            else:
-                del values["constants"]
-            return values
-        return None
+        if pretrained is None:
+            return None
+        if "params" not in pretrained:
+            raise ValueError("variables must contain the params collection")
+        if FROZEN not in pretrained:
+            return self._source_model.trainable_variables(pretrained)
+        moved = self._source_model.trainable_variables({**pretrained, "params": pretrained[FROZEN]})
+        return {**moved, "params": pretrained["params"], FROZEN: moved["params"]}
+
+    def program_key(self) -> tuple[ProgramModule, ...]:
+        """The model the losses run, sized to the SFT sequence, trained."""
+        return (ProgramModule(self.training_model, None, trained=True),)
+
+    def substitute(self, modules: Sequence[nn.Module]) -> None:
+        (self.training_model,) = modules
 
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
         return self.model.init(key, jnp.zeros((1, self.canvas_size), jnp.int32))
@@ -429,12 +425,9 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
             full_valid, selected, self.prompt_length, self.canvas_size,
             fields.get("positions"), fields.get("image_groups"))
         model = self.training_model
-        softcap, precision = model.text.final_logit_softcap, model.text.precision
         # The head as stored, so what the losses keep for their backward is
         # the table itself and not a transposed copy of it.
-        head, stored = model.apply(params, params["params"], method=type(model).head_table)
-        bias = model.apply(params, params['params'], method=type(model).vocabulary_bias)
-        vocab_major = bool(stored)
+        head = affine_head(model, params)
         cache = model.apply(params, tokens.shape[0], method=model.init_cache, mutable=["cache"])[1]["cache"]
         encoder_kwargs = prepared.kwargs()
         encoder_kwargs.update(positions=positions, attention_mask=full_valid)
@@ -457,8 +450,8 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         # The conditioning pass carries no gradient, so its states stop it
         # before the head and nothing of that pass is kept for the backward.
         first = jax.lax.stop_gradient(constrain(head_logits(
-            jax.lax.stop_gradient(denoise(zero_logits)), head, softcap=softcap,
-            precision=precision, vocab_major=vocab_major, bias=bias), LOGITS))
+            jax.lax.stop_gradient(denoise(zero_logits)), head.matrix, softcap=head.softcap,
+            precision=head.precision, vocab_major=head.vocab_major, bias=head.bias), LOGITS))
         use_sc = jax.random.uniform(sc_key, (tokens.shape[0],)) < self.self_cond_prob
         sc_logits = jnp.where(use_sc[:, None, None], first, zero_logits)
         states = denoise(sc_logits)
@@ -467,12 +460,12 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         if text_slots is not None:
             target_mask &= text_slots[:, self.prompt_length:]
         canvas_losses, predicted, _ = chunked_cross_entropy(
-            states, head, response, self.head_chunks, softcap=softcap, precision=precision,
-            vocab_major=vocab_major, predict=not train, bias=bias)
+            states, head.matrix, response, self.head_chunks, softcap=head.softcap,
+            precision=head.precision, vocab_major=head.vocab_major, predict=not train, bias=head.bias)
         shifted, encoder_target_mask = self._encoder_targets(batch, tokens, validity, full_valid, text_slots)
         encoder_losses, _, _ = chunked_cross_entropy(
-            encoder_states, head, shifted, self.head_chunks, softcap=softcap, precision=precision,
-            vocab_major=vocab_major, predict=False, bias=bias)
+            encoder_states, head.matrix, shifted, self.head_chunks, softcap=head.softcap,
+            precision=head.precision, vocab_major=head.vocab_major, predict=False, bias=head.bias)
         correct = None if predicted is None else predicted == response
         return canvas_losses, target_mask, encoder_losses, encoder_target_mask, correct
 

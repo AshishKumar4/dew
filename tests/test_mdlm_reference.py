@@ -17,6 +17,7 @@ import numpy as np
 from reference_error import assert_as_exact_as_the_reference
 
 from dew.diffusion.discrete import MDLM, DiscreteDenoiser, Unmask
+from dew.nn.protocols import OutputTable
 from dew.objectives.base import Step
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 
@@ -28,8 +29,6 @@ class Fixed(nn.Module):
     """A backbone whose hidden states and head are its two weights."""
 
     causal: bool = False
-    final_logit_softcap: float | None = None
-    precision: None = None
 
     def setup(self):
         self.hidden = self.param("hidden", lambda _: jnp.asarray(REFERENCE["hidden"]))
@@ -41,11 +40,8 @@ class Fixed(nn.Module):
     def hidden_states(self, tokens, train=False, positions=None, segment_ids=None):
         return self.hidden
 
-    def head_weight(self, params):
-        return params["head"]
-
-    def vocabulary_bias(self, params):
-        return None
+    def output_table(self):
+        return OutputTable(self.head, vocab_major=False)
 
 
 def objective() -> MaskedDiffusionObjective:

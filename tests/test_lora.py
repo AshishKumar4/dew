@@ -196,6 +196,17 @@ def test_adapter_gradients_of_the_token_loss_match_peft(decoder, loaded, referen
             np.testing.assert_allclose(exported[key.removeprefix("grad/")], reference[key], atol=1e-4, rtol=0)
 
 
+def test_an_adapted_head_is_refused_rather_than_scored_without_its_factors(decoder, reference):
+    """The LM objective scores tiles of the head's matrix, which an adapted head's branch is not in."""
+    adapter = LoRA(rank=2, modules=("lm_head",)).apply(decoder.model, decoder.variables, key=0,
+                                                         layouts=decoder.layouts)
+    tokens = jnp.asarray(reference["input_ids"])
+    objective = LMObjective(adapter.model, tokens.shape[1] - 1, variables=adapter.variables)
+    with pytest.raises(ValueError, match="no matrix alone gives its logits"):
+        objective.loss(objective.init(jax.random.key(0)), {"text": tokens},
+                       Step(jnp.int32(0), jax.random.key(1), None))
+
+
 def test_one_trainer_step_moves_the_adapter_and_nothing_else(decoder, loaded, reference, tmp_path):
     """A real SGD step through the Trainer: the frozen collection comes back
     bitwise, every factor moves, and the logits and factors agree with the

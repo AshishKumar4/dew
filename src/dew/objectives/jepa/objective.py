@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Mapping, Sequence
+from typing import Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -33,7 +34,6 @@ from flax import linen as nn
 
 from dew.artifacts import Representations
 from dew.inputs import Field, InputSpec, unit_range
-from dew.nn.backbones.jepa import JepaEncoder, JepaPredictor
 from dew.objectives.base import (
     Aux,
     EMASpec,
@@ -92,6 +92,15 @@ def normalize_targets(x, epsilon: float = 1e-6):
     return (x - mean) * jax.lax.rsqrt(variance + epsilon)
 
 
+@runtime_checkable
+class _Scanned(Protocol):
+    """A module that declares the order it sequences an image's or a clip's
+    tokens in, as Dew's JEPA encoder and predictor do."""
+
+    @property
+    def scan_order(self) -> str: ...
+
+
 @objectives("jepa")
 class JepaObjective(Objective[Ratio]):
     """Trains a JEPA encoder and predictor over images (B,H,W,C) or video (B,T,H,W,C).
@@ -129,10 +138,10 @@ class JepaObjective(Objective[Ratio]):
         encoder_variables: Variables | None = None,
         predictor_variables: Variables | None = None,
     ):
-        # Dew's encoder and predictor declare the order they sequence tokens
-        # in; the mask's indices must refer to that sequence.
+        # A module that declares the order it sequences tokens in reads the
+        # mask's indices in that sequence.
         for role, module in (("encoder", encoder), ("predictor", predictor)):
-            if isinstance(module, JepaEncoder | JepaPredictor) and module.scan_order != mask.scan_order:
+            if isinstance(module, _Scanned) and module.scan_order != mask.scan_order:
                 raise ValueError(f"the {role} scans in {module.scan_order!r} order and the mask in "
                                  f"{mask.scan_order!r}; they must share one scan order")
         self.encoder = encoder

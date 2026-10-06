@@ -44,11 +44,11 @@ from dew.data.chat import ROLES_KEY, Role
 from dew.inference import TextGeneration
 from dew.inference.tasks import Processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
-from dew.nn.backbones.causal_transformer import INTERMEDIATES, CausalTransformer, layer_output, layer_outputs
+from dew.nn.backbones.causal_transformer import INTERMEDIATES, layer_output, layer_outputs
 from dew.nn.inputs import ModelInputs
-from dew.nn.mla import INDEXER, INDEXER_COLLECTION, MLAMixer
+from dew.nn.mla import INDEXER, INDEXER_COLLECTION
 from dew.nn.moe import RouterMoments, global_router_loss, load_balance_update, sequence_router_losses
-from dew.nn.multimodal import MultimodalTransformer
+from dew.nn.protocols import AffineHead, HiddenStates, Indexed, Ordered, Predicting, StreamedPrediction
 from dew.nn.sharding import LOGITS, constrain
 from dew.objectives.base import (
     FROZEN,
@@ -70,7 +70,13 @@ from dew.objectives.base import (
     merge_totals,
     thaw,
 )
-from dew.objectives.lm.chunked import chunked_cross_entropy, chunked_tile, head_logits, support_log_probs
+from dew.objectives.lm.chunked import (
+    affine_head,
+    chunked_cross_entropy,
+    chunked_tile,
+    head_logits,
+    support_log_probs,
+)
 from dew.records import JSON
 from dew.registry import metrics, objectives
 from dew.sampling.text import Sampling
@@ -117,19 +123,30 @@ class IndexerTraining:
                 f"{self.weight}")
 
 
-def _decoder(model: nn.Module) -> CausalTransformer | MultimodalTransformer | None:
-    """Return the decoder an objective trains, or None for a model that is not one.
+def _check_reads(model: nn.Module) -> None:
+    """Refuse a model next-token scoring cannot read.
 
-    `CausalTransformer` declares the two fields read here before anything is
-    traced, and `MultimodalTransformer` forwards both to the decoder it
-    holds, so either answers for them.
+    The loss reads the final states and contracts them with the head
+    (`HiddenStates`, `AffineHead`), and a state may see only the tokens up
+    to its own, so a model that says its states attend both ways (`Ordered`)
+    is refused.
     """
-    return model if isinstance(model, CausalTransformer | MultimodalTransformer) else None
+    lacking = [read.__name__ for read in (HiddenStates, AffineHead) if not isinstance(model, read)]
+    if lacking:
+        raise TypeError(
+            f"LMObjective scores a model's final states through its head, and a "
+            f"{type(model).__name__} gives no {' or '.join(lacking)}")
+    if isinstance(model, Ordered) and not model.causal:
+        raise ValueError("LMObjective requires a causal model for next-token likelihoods")
 
 
-def _check_terms(decoder: CausalTransformer | MultimodalTransformer | None, *,
-                 aux_loss_alpha: float | None, mtp_weight: float | None, z_loss: float,
-                 router_z_loss: float = 0.0) -> None:
+def _streamed_depths(model: nn.Module) -> bool:
+    """Say whether the prediction depths carry their own residual streams (`StreamedPrediction`)."""
+    return isinstance(model, StreamedPrediction) and model.mtp_hyper_connections is not None
+
+
+def _check_terms(model: nn.Module, *, aux_loss_alpha: float | None, mtp_weight: float | None,
+                 z_loss: float, router_z_loss: float = 0.0) -> None:
     """Refuse a weight the term it scales cannot carry.
 
     The checks run in the order the constructor takes the arguments. The
@@ -142,7 +159,7 @@ def _check_terms(decoder: CausalTransformer | MultimodalTransformer | None, *,
             f"aux_loss_alpha scales the balance loss, so it is positive, "
             f"got {aux_loss_alpha}; None adds no balance loss")
     if mtp_weight is not None:
-        depths = 0 if decoder is None else decoder.num_nextn_predict_layers
+        depths = model.num_nextn_predict_layers if isinstance(model, Predicting) else 0
         if depths < 1:
             raise ValueError(
                 "mtp_weight scales the prediction depths' cross entropy, so "
@@ -171,7 +188,7 @@ def _check_indexer(model: nn.Module, indexer: IndexerTraining,
     The warm-up moves the indexer alone, so any term of the main loss asked
     for beside it would weight leaves the optimizer does not touch.
     """
-    mixers = indexed_mixers(model)
+    mixers = model.indexed_mixers if isinstance(model, Indexed) else ()
     if not mixers:
         raise ValueError(
             "indexer training needs an mla mixer with the indexer's "
@@ -191,29 +208,6 @@ def _check_indexer(model: nn.Module, indexer: IndexerTraining,
             raise ValueError(
                 f"the warm-up trains the indexer alone, so {', '.join(asked)} "
                 "would move nothing")
-
-
-def _streamed_depths(model: nn.Module) -> bool:
-    """Say whether the prediction depths carry their own residual streams.
-
-    The field is the decoder's own: the multimodal wrapper forwards the
-    depth count and no hyper-connections of its own.
-    """
-    return isinstance(model, CausalTransformer) and model.mtp_hyper_connections is not None
-
-
-def indexed_mixers(model: nn.Module) -> list[MLAMixer]:
-    """Collect the model's mla mixers that have the indexer: the model's own, then each layer kind's.
-
-    A mixer is a field of a decoder. The multimodal wrapper forwards the geometry
-    its callers read but no mixer, so a model that is not a `CausalTransformer`
-    has no indexer to train.
-    """
-    if not isinstance(model, CausalTransformer):
-        return []
-    candidates = [model.mixer, *(kind.mixer for kind in (model.kinds or {}).values())]
-    return [mixer for mixer in candidates
-            if isinstance(mixer, MLAMixer) and mixer.indexed]
 
 
 def _is_indexer(path: tuple[str, ...]) -> bool:
@@ -632,9 +626,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     ):
         """Build the objective; the class docstring describes each argument."""
         model = self.bind_model(model, variables=variables, processor=processor)
-        decoder = _decoder(model)
-        if decoder is not None and decoder.causal is False:
-            raise ValueError("LMObjective requires a causal model for next-token likelihoods")
+        _check_reads(model)
         self.model = model
         self.seq_len = seq_len
         self.pad_id = pad_id
@@ -642,7 +634,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         self.head_tile = _head_tile(head_tile, self.keeps_whole_logits)
         self.samples = samples
         self.balance_rate = balance_rate
-        _check_terms(decoder, aux_loss_alpha=aux_loss_alpha, mtp_weight=mtp_weight, z_loss=z_loss,
+        _check_terms(model, aux_loss_alpha=aux_loss_alpha, mtp_weight=mtp_weight, z_loss=z_loss,
                      router_z_loss=router_z_loss)
         self.aux_loss_alpha = aux_loss_alpha
         self.seq_aux = seq_aux
@@ -782,13 +774,11 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         qk = gathered.get("qk") if qk_stats else None
         kls = gathered.get(INDEXER_COLLECTION) if indexer else None
         kept = tuple(layer_output(gathered[INTERMEDIATES], index) for index in layers)
-        head = self.model.apply(params, params["params"],
-                                method=type(self.model).head_weight)
+        head = affine_head(self.model, params)
         losses, predicted, log_z = chunked_cross_entropy(
-            hidden, head, targets, self.head_chunks, tile=self.head_tile,
-            bias=self._head_bias(params),
-            softcap=self.model.final_logit_softcap,
-            precision=self.model.precision, predict=self.token_accuracy if predict is None else predict)
+            hidden, head.matrix, targets, self.head_chunks, tile=self.head_tile,
+            vocab_major=head.vocab_major, bias=head.bias, softcap=head.softcap,
+            precision=head.precision, predict=self.token_accuracy if predict is None else predict)
         weights = self._row_weights(prepared, targets, roles, losses.dtype)
         correct = None if predicted is None else (predicted == targets).astype(losses.dtype)
         depth_scores = []
@@ -798,7 +788,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             states = self.model.apply(
                 params, gathered['prediction_inputs']['states'] if stream_depth else hidden,
                 inputs, train=train, rngs=rngs,
-                method=type(self.model).mtp_hidden_states,
+                method="mtp_hidden_states",
                 mutable=collections or False, **packing)
             if collections:
                 # A routed depth balances, counts and indexes like a trunk layer.
@@ -811,18 +801,12 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
                     kls = {**(kls or {}), **depth_sown.get(INDEXER_COLLECTION, {})}
             for depth, state in enumerate(states, start=1):
                 depth_losses, _, _ = chunked_cross_entropy(
-                    state, head, targets[:, depth:], self.head_chunks, tile=self.head_tile,
-                    bias=self._head_bias(params),
-                    softcap=self.model.final_logit_softcap,
-                    precision=self.model.precision, predict=False)
+                    state, head.matrix, targets[:, depth:], self.head_chunks, tile=self.head_tile,
+                    vocab_major=head.vocab_major, bias=head.bias, softcap=head.softcap,
+                    precision=head.precision, predict=False)
                 depth_scores.append((depth_losses, self._depth_weights(
                     prepared, targets, roles, losses.dtype, depth)))
         return Scores(losses, weights, log_z, correct, hidden, kept, sown, depth_scores, qk, kls)
-
-    def _head_bias(self, params):
-        """The model's affine-head term, absent for every bias-free decoder."""
-        return (self.model.apply(params, params['params'], method='vocabulary_bias')
-                if _decoder(self.model) is not None else None)
 
     def _row_weights(self, prepared, targets, roles, dtype):
         """Weight the targets the row itself scores.
@@ -885,7 +869,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         """
         opened = [*collections, INTERMEDIATES] if layers else collections
         hidden = self.model.apply(params, inputs, train=train, rngs=rngs,
-                                  method=type(self.model).hidden_states,
+                                  method="hidden_states",
                                   mutable=opened or False,
                                   capture_intermediates=layer_outputs if layers else False,
                                   **packing)
@@ -925,24 +909,21 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         log_probs = -scores.losses
         if temperature == 1.0 and support is None:
             return log_probs
-        softcap = self.model.final_logit_softcap
-        params = thaw(params)
-        head = self.model.apply(params, params["params"], method=type(self.model).head_weight)
+        head = affine_head(self.model, thaw(params))
         targets = tokens[:, 1:]
         if temperature != 1.0:
             losses, _, _ = chunked_cross_entropy(
-                scores.hidden, head, targets, self.head_chunks, tile=self.head_tile,
-                bias=self._head_bias(params),
-                softcap=softcap,
-                precision=self.model.precision, predict=False, temperature=temperature)
+                scores.hidden, head.matrix, targets, self.head_chunks, tile=self.head_tile,
+                vocab_major=head.vocab_major, bias=head.bias, softcap=head.softcap,
+                precision=head.precision, predict=False, temperature=temperature)
             log_probs = -losses
         if support is not None:
             ids, columns = (jnp.asarray(value, jnp.int32) for value in support)
             # The id at column c is the target the state at c - 1 predicts.
             filtered, present = support_log_probs(
-                scores.hidden, head, targets, ids, jnp.where(columns > 0, columns - 1, -1),
-                temperature=temperature,
-                softcap=softcap, precision=self.model.precision, bias=self._head_bias(params))
+                scores.hidden, head.matrix, targets, ids, jnp.where(columns > 0, columns - 1, -1),
+                temperature=temperature, vocab_major=head.vocab_major, softcap=head.softcap,
+                precision=head.precision, bias=head.bias)
             log_probs = jnp.where(present, filtered, log_probs)
         return log_probs
 
@@ -1073,11 +1054,10 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
                 "student's routers with balance_rate instead")
         statistics, aux, scores = self._scored_loss(params, batch, step, train=train, layers=layers)
         assert isinstance(statistics, Ratio)
-        variables = thaw(params)
-        head = self.model.apply(variables, variables["params"], method=type(self.model).head_weight)
+        head = affine_head(self.model, thaw(params))
         logits = constrain(head_logits(
-            scores.hidden, head, softcap=self.model.final_logit_softcap,
-            precision=self.model.precision, bias=self._head_bias(variables)), LOGITS)
+            scores.hidden, head.matrix, softcap=head.softcap, precision=head.precision,
+            vocab_major=head.vocab_major, bias=head.bias), LOGITS)
         return statistics, aux, Prediction(logits, scores.losses, scores.weights, scores.layers)
 
     def _scored_loss(self, params, batch, step: Step, *, train: bool, layers: Sequence[int] = ()
