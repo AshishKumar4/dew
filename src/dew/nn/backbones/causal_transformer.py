@@ -622,6 +622,8 @@ class CausalTransformer(nn.Module):
     pre_norms: bool = True           # norm each sublayer's input; False + sandwich is OLMo 3
     parallel_residual: bool = False
     """Whether attention and the feed-forward both read the same residual, as in GPT-NeoX."""
+    shared_parallel_norm: bool = False
+    """Both parallel branches read one LayerNorm, as in Phi, Falcon-7B and GPT-J."""
     qk_norm: bool = True
     qk_norm_scope: str = 'head'              # 'head' per head (Qwen3); 'projection' whole (OLMo 3)
     v_norm: bool = False                     # Gemma 4's scale-free values norm
@@ -1311,7 +1313,8 @@ class CausalTransformer(nn.Module):
             nope=self.position_embedding != 'rotary')
         specs = self._layer_specs(types, kinds, mixer_spec)
         wiring = BlockWiring(pre_norms=self.pre_norms, output_norms=self.sandwich_norms,
-                             layer_scalar=self.layer_scalar, parallel_residual=self.parallel_residual)
+                             layer_scalar=self.layer_scalar, parallel_residual=self.parallel_residual,
+                             shared_parallel_norm=self.shared_parallel_norm)
 
         block = functools.partial(self._block, specs, mixer_spec, (gated_mlp, routed, parallel), wiring)
 
