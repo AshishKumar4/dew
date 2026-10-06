@@ -21,7 +21,7 @@ import numpy as np
 from etils import epath
 from jax.typing import DTypeLike
 
-from dew.cache import default_compilation_cache_dir, enable_compilation_cache
+from dew.cache import persist_compilations
 from dew.checkpoints import RUN_FILE
 from dew.data.text import Tokenizer
 from dew.inference.tasks import BlockGeneration, MaskedGeneration, TextGeneration
@@ -69,7 +69,7 @@ def pipeline(
     cache directory is already set, so a restarted process reuses what it
     already compiled.
     """
-    _persist_compilations()
+    persist_compilations()
     dtype = dtype_name(dtype)
     param_dtype = "auto" if param_dtype == "auto" else dtype_name(param_dtype)
     root = epath.Path(source)
@@ -83,21 +83,6 @@ def pipeline(
         raise ValueError("step selects a run's checkpoint; a source checkpoint has one set of weights")
     return _from_source(source, mesh=mesh, layout=layout, dtype=dtype, param_dtype=param_dtype,
                         revision=revision)
-
-
-def _persist_compilations() -> None:
-    """Point XLA at the on-disk executable cache, unless a directory is set.
-
-    A served request compiles for several seconds the first time its shapes
-    are seen, and a serving process restarts. Training turns the same cache
-    on in `prepare_process`; inference has no such entry point, and
-    `pipeline` is the one place every task is built, so it goes here.
-    Reading the setting is what makes it idempotent and what leaves a
-    trainer's own directory, or a caller's, alone.
-    """
-    if jax.config.jax_compilation_cache_dir:
-        return
-    enable_compilation_cache(default_compilation_cache_dir())
 
 
 def _from_run(root: epath.Path, *, mesh: MeshSpec | None, layout: Layout | None,
