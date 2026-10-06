@@ -126,7 +126,8 @@ from dew.nn.mla import MLAMixer
 ENTRIES = (
     DecoderFamily(
         ('falcon',), _falcon_config,
-        lambda fields: fields.shared_parallel_norm and fields.mlp == 'gelu_exact',
+        lambda fields: fields.shared_parallel_norm and fields.mlp == 'gelu_exact'
+                       and fields.partial_rotary_factor is None,
         'falcon', 'FalconForCausalLM', _falcon_export,
         weight_path=_falcon_path, export_path=partial(_renamed_name, _FALCON_NAMES),
         prepare=_falcon_prepare, export_weights=_falcon_export_weights, preserve_source_layout=False,
