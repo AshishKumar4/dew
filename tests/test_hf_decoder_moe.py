@@ -82,6 +82,19 @@ def test_qwen2_moe_decode_matches_the_reference():
         np.load(QWEN2_MOE / 'logits.npy'), np.load(QWEN2_MOE / 'logits_f64.npy'), 'Qwen2-MoE cache')
 
 
+def test_qwen2_moe_padded_routing_matches_the_reference():
+    model, variables = fp32_decoder(QWEN2_MOE)
+    arrays = np.load(QWEN2_MOE / 'padded.npz')
+    logits = np.asarray(model.apply(
+        variables, arrays['input_ids'], positions=arrays['position_ids'],
+        attention_mask=arrays['attention_mask']))
+    valid = arrays['attention_mask']
+    assert_as_exact_as_the_reference(logits[valid], arrays['logits'][valid],
+                                     arrays['logits_f64'][valid], 'Qwen2-MoE padded')
+    print('Qwen2-MoE padded RMS ratio', distance(logits[valid], arrays['logits_f64'][valid])
+          / distance(arrays['logits'][valid], arrays['logits_f64'][valid]))
+
+
 def test_qwen2_moe_export_keeps_fused_experts_and_shared_gate(tmp_path):
     loaded = Pretrained.load(str(QWEN2_MOE), dtype='float32', attention_impl='reference')
     loaded.save(tmp_path / 'export')
