@@ -204,11 +204,11 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
         counted = jnp.where(mass > 0, mass, 1)
         divergence = optax.kl_divergence(jax.nn.log_softmax(student.logits / temperature),
                                          jax.nn.softmax(teacher.logits / temperature))
-        soft = jnp.sum(divergence * weights)
+        soft = self.row_mean(divergence * weights, batch).total
         total = (1 - alpha) * statistics.total + alpha * temperature ** 2 * soft
         reported = {**aux.metrics, "distill/alpha": alpha, "distill/temperature": temperature,
                     "distill/kl": soft / counted, "distill/soft_loss": temperature ** 2 * soft / counted,
-                    "distill/teacher_loss": jnp.sum(teacher.losses * weights) / counted}
+                    "distill/teacher_loss": self.row_mean(teacher.losses * weights, batch).total / counted}
         if self.features:
             projections = variables["params"].get(PROJECTIONS, {})
             distances = []
@@ -216,7 +216,7 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
                 if own.shape[-1] != other.shape[-1]:
                     own = own.astype(jnp.float32) @ projections[f"projection_{index}"]
                 distances.append(self._distance(own, other))
-            feature = jnp.sum(jnp.stack(distances) * weights) / len(self.features)
+            feature = self.row_mean(jnp.stack(distances) * weights, batch, rows=1).total / len(self.features)
             total = total + beta * feature
             reported.update({"distill/beta": beta, "distill/feature": feature / counted})
         return Ratio(total, mass), replace(aux, metrics=reported)
