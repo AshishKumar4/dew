@@ -109,10 +109,17 @@ final step: 10 latest: 10
 | `restore(template, step=None)` | Read the latest full state, a numbered step, `"best"`, or `"best:<metric key>"` into the structure of `template`. |
 | `stored(step=None)` | The shapes and dtypes each saved state field holds, without reading values. |
 | `wait()` | Block until asynchronous saves have finished. |
-| `kept()` | Committed steps with their metrics, ranking rules and state/weights kind. |
+| `kept()` | Committed steps with their metrics, ranking rules and kind: state, weights or tree. |
 | `profile_steps()`, `profile_metadata(step)`, `restore_profiles(step)` | The post-hoc EMA snapshots (below). |
 
 Saves are asynchronous, and `wait()` returns once they are durable. Constructing `Checkpoints` opens nothing, because the Orbax managers are created on first use.
+
+A state that is not a training run's, such as a simulation's, has no optimizer, average or loss scale. `save(step, state)` takes it as a mapping of arrays in place of a `TrainState` and writes it as it is, with `metrics`, `ranking` and `control` as a train state's are. `restore(template)` reads it back through a mapping template of `jax.ShapeDtypeStruct` leaves, placed on their shardings, or as host arrays with no template. `kept()` reports its kind as `tree`, and a train-state template is refused for it.
+
+```python
+checkpoints.save(step, {"state": state, "key": key}, metrics={"rate": rate})
+state_tree, _ = checkpoints.restore({"state": state_shapes, "key": key_shape})
+```
 
 ## Weights no step moves
 
