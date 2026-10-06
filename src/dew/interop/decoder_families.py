@@ -3,6 +3,7 @@
 from functools import partial
 
 from dew.interop import mamba2
+from dew.interop.families.bloom import _BLOOM_NAMES, _bloom_config, _bloom_export, _bloom_path
 from dew.interop.families.deepseek import (
     _MINIMAX_M2_NAMES,
     _deepseek_config,
@@ -15,6 +16,14 @@ from dew.interop.families.deepseek import (
     _minimax_m2_config,
 )
 from dew.interop.families.deepseek_v41 import DEEPSEEK_V41
+from dew.interop.families.falcon import (
+    _FALCON_NAMES,
+    _falcon_config,
+    _falcon_export,
+    _falcon_export_weights,
+    _falcon_path,
+    _falcon_prepare,
+)
 from dew.interop.families.gemma import (
     _gemma2_config,
     _gemma2_export,
@@ -40,10 +49,19 @@ from dew.interop.families.glm import (
 from dew.interop.families.gpt2 import (
     _GPT2_NAMES,
     _GPT2_PACKED,
+    _GPT_NEO_NAMES,
+    _GPTJ_NAMES,
     _gpt2_config,
     _gpt2_export,
     _gpt2_path,
     _gpt2_prepare,
+    _gpt_neo_config,
+    _gpt_neo_export,
+    _gptj_config,
+    _gptj_export,
+    _gptj_export_weights,
+    _gptj_path,
+    _gptj_prepare,
 )
 from dew.interop.families.gpt_neox import (
     _GPT_NEOX_NAMES,
@@ -101,6 +119,7 @@ from dew.interop.families.nemotron_h import (
 )
 from dew.interop.families.olmo import _olmo3_config
 from dew.interop.families.opt import _OPT_NAMES, _opt_config, _opt_export
+from dew.interop.families.phi import _PHI_NAMES, _phi_config, _phi_export
 from dew.interop.families.qwen import (
     _qwen2_config,
     _qwen2_moe_config,
@@ -118,6 +137,7 @@ from dew.interop.hf_decoders import (
     _GEMMA,
     _QWEN35,
     DecoderFamily,
+    _decoder_tensors,
     _every_layer_windowed,
     _kind_mixers,
     _renamed_name,
@@ -132,6 +152,49 @@ from dew.nn.mixers.mamba2 import Mamba2Mixer
 from dew.nn.mla import MLAMixer
 
 ENTRIES = (
+    DecoderFamily(
+        ('bloom',), _bloom_config,
+        lambda fields: fields.position_embedding == 'alibi' and fields.embedding_norm,
+        'bloom', 'BloomForCausalLM', _bloom_export,
+        weight_path=_bloom_path, export_path=partial(_renamed_name, _BLOOM_NAMES),
+        prepare=partial(_gpt_neox_prepare, attention_name='self_attention'),
+        export_weights=partial(_gpt_neox_export_weights, attention_name='self_attention'),
+        preserve_source_layout=False,
+        tied_head_names=('lm_head.weight', 'transformer.word_embeddings.weight'),
+    ),
+    DecoderFamily(
+        ('gpt_neo',), _gpt_neo_config,
+        lambda fields: fields.position_embedding == 'learned' and fields.attention_scale == 1.0
+                       and fields.attention_bias is False and fields.o_proj_bias is True,
+        'gpt_neo', 'GPTNeoForCausalLM', _gpt_neo_export,
+        weight_path=partial(_renamed_path, _GPT_NEO_NAMES),
+        export_path=partial(_renamed_name, _GPT_NEO_NAMES), preserve_source_layout=False,
+        tied_head_names=('lm_head.weight', 'transformer.wte.weight'),
+    ),
+    DecoderFamily(
+        ('phi',), _phi_config,
+        lambda fields: fields.shared_parallel_norm and fields.head_bias and fields.attention_bias,
+        'phi', 'PhiForCausalLM', _phi_export,
+        weight_path=partial(_renamed_path, _PHI_NAMES), export_path=partial(_renamed_name, _PHI_NAMES),
+        export_weights=_decoder_tensors, preserve_source_layout=False,
+    ),
+    DecoderFamily(
+        ('gptj',), _gptj_config,
+        lambda fields: fields.shared_parallel_norm and fields.head_bias and not fields.attention_bias,
+        'gptj', 'GPTJForCausalLM', _gptj_export,
+        weight_path=_gptj_path, export_path=partial(_renamed_name, _GPTJ_NAMES),
+        prepare=_gptj_prepare, export_weights=_gptj_export_weights, preserve_source_layout=False,
+        tied_head_names=('lm_head.weight', 'transformer.wte.weight'),
+    ),
+    DecoderFamily(
+        ('falcon',), _falcon_config,
+        lambda fields: fields.shared_parallel_norm and fields.mlp == 'gelu_exact'
+                       and fields.partial_rotary_factor is None,
+        'falcon', 'FalconForCausalLM', _falcon_export,
+        weight_path=_falcon_path, export_path=partial(_renamed_name, _FALCON_NAMES),
+        prepare=_falcon_prepare, export_weights=_falcon_export_weights, preserve_source_layout=False,
+        tied_head_names=('lm_head.weight', 'transformer.word_embeddings.weight'),
+    ),
     DecoderFamily(
         ('minimax_m2',),
         _minimax_m2_config,
