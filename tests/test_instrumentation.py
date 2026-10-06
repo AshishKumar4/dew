@@ -16,16 +16,11 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 
 import dew
 import dew.nn.backbones  # registers the decoder the FLOP formula test builds
+from dew.cache import default_compilation_cache_dir, enable_compilation_cache
 from dew.objectives.base import Aux, EMASpec, Objective
 from dew.objectives.lm import LMObjective
 from dew.registry import models
-from dew.telemetry.instrumentation import (
-    compiled_flops,
-    default_compilation_cache_dir,
-    enable_compilation_cache,
-    hlo_flops,
-    model_flops_utilization,
-)
+from dew.telemetry.instrumentation import compiled_flops, hlo_flops, model_flops_utilization
 from dew.training import ProfileWindow, Trainer
 from dew.training.distributed import shard_batch
 
