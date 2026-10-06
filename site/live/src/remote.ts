@@ -94,6 +94,12 @@ export class RemoteJob extends DurableObject<Env> {
 		const stream = new TransformStream<Uint8Array, Uint8Array>();
 		const writer = stream.writable.getWriter();
 		const send = (event: unknown) => writer.write(encoder.encode(JSON.stringify(event) + '\n'));
+		let pulsePending = false;
+		const pulse = setInterval(() => {
+			if (pulsePending) return;
+			pulsePending = true;
+			void send({ type: 'heartbeat' }).catch(() => this.stop()).finally(() => { pulsePending = false; });
+		}, 5000);
 		void writer.closed.catch(() => this.stop());
 		this.ctx.waitUntil((async () => {
 			try {
@@ -128,6 +134,7 @@ export class RemoteJob extends DurableObject<Env> {
 					await send({ type: 'exit', code: 1 });
 				} catch { /* A disconnected client no longer consumes output. */ }
 			} finally {
+				clearInterval(pulse);
 				await this.stop();
 				await writer.close().catch(() => {});
 			}
