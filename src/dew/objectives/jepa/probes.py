@@ -122,12 +122,8 @@ class LinearProbe:
                 steps=self.steps, learning_rate=self.learning_rate,
                 weight_decay=self.weight_decay)), 1
 
-    def merge(self, accumulated: tuple[float, float],
-              contribution: tuple[float, float]) -> tuple[float, float]:
-        return merge_totals(accumulated, contribution)
-
-    def finalize(self, accumulated: tuple[float, float]) -> float:
-        return mean_of_totals(accumulated)
+    merge = staticmethod(merge_totals)
+    finalize = staticmethod(mean_of_totals)
 
 
 @metrics("knn_probe")
@@ -149,10 +145,6 @@ class KnnProbe:
             return float(knn_probe_accuracy(representations.features, representations.labels,
                                            self.num_classes, k=self.k)), 1
 
-    def merge(self, accumulated: tuple[float, float],
-              contribution: tuple[float, float]) -> tuple[float, float]:
-        return merge_totals(accumulated, contribution)
-
-    def finalize(self, accumulated: tuple[float, float]) -> float:
-        return mean_of_totals(accumulated)
+    merge = staticmethod(merge_totals)
+    finalize = staticmethod(mean_of_totals)
 

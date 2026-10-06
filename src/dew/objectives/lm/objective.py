@@ -1235,9 +1235,7 @@ class Perplexity:
         losses = np.asarray(scores.losses, dtype=np.float64)
         return float(np.sum(losses * weights)), float(np.sum(weights))
 
-    def merge(self, accumulated: tuple[float, float],
-              contribution: tuple[float, float]) -> tuple[float, float]:
-        return merge_totals(accumulated, contribution)
+    merge = staticmethod(merge_totals)
 
     def finalize(self, accumulated: tuple[float, float]) -> float:
         total, count = accumulated
