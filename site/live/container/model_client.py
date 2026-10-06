@@ -4,6 +4,7 @@ import base64
 import io
 import json
 import socket
+from contextlib import suppress
 from dataclasses import asdict, dataclass
 from functools import cache
 from pathlib import Path
@@ -21,11 +22,9 @@ def request(payload):
     with socket.socket(socket.AF_UNIX) as connection:
         connection.settimeout(95)
         connection.connect(SOCKET)
-        try:
+        # An admission refusal can already be queued before the payload is sent.
+        with suppress(BrokenPipeError, ConnectionResetError):
             connection.sendall(json.dumps(payload, allow_nan=False).encode() + b"\n")
-        except (BrokenPipeError, ConnectionResetError):
-            # An admission refusal can already be queued before the payload is sent.
-            pass
         with connection.makefile("rb") as stream:
             while True:
                 line = stream.readline(MAX_RESPONSE + 1)
