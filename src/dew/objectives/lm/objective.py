@@ -35,7 +35,6 @@ from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple
 import jax
 import jax.numpy as jnp
 import numpy as np
-import optax
 from flax import linen as nn, struct
 
 from dew.artifacts import TextSamples, TokenScores
@@ -51,7 +50,6 @@ from dew.nn.moe import RouterMoments, global_router_loss, load_balance_update, s
 from dew.nn.protocols import AffineHead, DecoderTraining, HiddenStates, TokenModel
 from dew.nn.sharding import LOGITS, constrain
 from dew.objectives.base import (
-    FROZEN,
     OMITTED,
     Aux,
     Batch,
@@ -644,10 +642,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             "mtp_weight": mtp_weight, "loss_role": loss_role, "z_loss": z_loss or None,
             "router_z_loss": router_z_loss or None})
         self.inputs = InputSpec(sample=Field(TEXT_KEY, (seq_len + 1,)))
-        # The EMA follows what moves; the frozen collection never does.
-        self.ema = None if ema_decay is None else EMASpec(
-            decay=optax.constant_schedule(ema_decay),
-            select=lambda path: path[0] != FROZEN)
+        self.ema = EMASpec.constant(ema_decay)
         if samples is not None and samples.max_new_tokens > 0:
             self._prompt = prompt_batch(samples.prompt)
 

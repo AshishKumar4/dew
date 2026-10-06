@@ -21,7 +21,6 @@ from typing import TYPE_CHECKING, Protocol, Self, runtime_checkable
 
 import jax
 import jax.numpy as jnp
-import optax
 from flax import linen as nn, struct
 from flax.typing import VariableDict
 
@@ -225,9 +224,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         self.encoder_loss_weight = encoder_loss_weight
         self.decoder_loss_weight = decoder_loss_weight
         self.inputs = InputSpec(sample=Field("text", (self.sequence_length,)))
-        # The EMA follows what moves; the frozen collection never does.
-        self.ema = None if ema_decay is None else EMASpec(
-            optax.constant_schedule(ema_decay), select=lambda path: path[0] != FROZEN)
+        self.ema = EMASpec.constant(ema_decay)
         self.head_chunks = head_chunks
 
     def task_record(self) -> Mapping[str, JSON]:
