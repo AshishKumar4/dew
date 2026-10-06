@@ -4,6 +4,8 @@ import { commandOf, runnerPlan, type RunnerPlan } from './remote-plan';
 import { ManagedPreparer } from './preparer';
 
 const JOB_MS = 40 * 60_000;
+// Cloudflare's published account ceiling is 1,500 concurrent vCPUs; standard-4 uses four.
+const JOB_LIMIT = 375;
 
 export class RunnerFleet extends DurableObject<Env> {
 	async active(): Promise<number> {
@@ -27,7 +29,7 @@ export class RunnerFleet extends DurableObject<Env> {
 		}
 		return this.ctx.storage.transaction(async (storage) => {
 			const jobs = (await storage.get<Record<string, number>>('jobs')) ?? {};
-			if (Object.keys(jobs).length >= 3) return null;
+			if (Object.keys(jobs).length >= JOB_LIMIT) return null;
 			const id = crypto.randomUUID();
 			jobs[id] = now + JOB_MS;
 			await storage.put('jobs', jobs);
@@ -189,7 +191,7 @@ export async function remoteRun(request: Request, env: Env): Promise<Response> {
 	if (!prepared.generation) return Response.json({ message: 'Preparing the cached CI environment. Retry shortly.' },
 		{ status: 503, headers: { 'Retry-After': '15' } });
 	const id = await fleet.acquire();
-	if (!id) return Response.json({ message: 'All three CPU runners are in use.' },
+	if (!id) return Response.json({ message: `All ${JOB_LIMIT} CPU runners are in use.` },
 		{ status: 429, headers: { 'Retry-After': '15' } });
 	try {
 		return await env.REMOTE_JOB.get(env.REMOTE_JOB.idFromName(id)).run(id, plan, command, prepared.generation);
