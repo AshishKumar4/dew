@@ -1241,14 +1241,17 @@ class Server:
         return row.ticket
 
     def _prepared(self, prompt: Prompt, max_new_tokens: int | None, seed: int | jax.Array, fold: int) -> _Row:
+        positions = None
         if isinstance(prompt, (str, ModelInputs)):
             inputs = _prepared(self.processor, prompt, images=None)
-            if set(inputs.token_fields) - {"attention_mask"} or inputs.conditioning:
+            if set(inputs.token_fields) - {"attention_mask", "positions"} or inputs.conditioning:
                 raise ValueError(
-                    "a served prompt carries tokens and validity only; media and positions do not slot"
+                    "a served prompt carries tokens and validity only; "
+                    "media and custom token fields do not slot"
                 )
             ids = np.asarray(inputs.tokens)
             fields = {name: np.asarray(value) for name, value in inputs.token_fields.items()}
+            positions = fields.pop("positions", None)
         else:
             ids = host_token_rows(np.atleast_2d(np.asarray(prompt)))
             fields = {}
@@ -1258,6 +1261,9 @@ class Server:
         if budget is None:
             raise ValueError("max_new_tokens is required; the source declares no default budget")
         valid = _check_inputs(self.model, ids, fields, budget, self.sampling, 1).astype(bool)
+        if positions is not None and not np.array_equal(
+                positions, np.maximum(np.cumsum(valid, axis=1) - 1, 0)):
+            raise ValueError("a served prompt cannot carry noncanonical positions")
         self.rows.refuse(int(valid[0].sum()), budget)
         return _Row(ids[0][valid[0]].astype(np.int32), budget, seed, fold, Ticket())
 
