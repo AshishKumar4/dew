@@ -38,8 +38,7 @@ from dew.diffusion.schedules import expand
 from dew.diffusion.transforms import broadcast_rates
 from dew.inputs import InputSpec, unit_range
 from dew.nn.autoencoders import AutoEncoder
-from dew.nn.autoencoders.api import ModuleAutoEncoder
-from dew.nn.autoencoders.kl import AutoencoderKL, posterior_latent
+from dew.nn.autoencoders.kl import posterior_latent
 from dew.nn.mp import Uncertainty
 from dew.objectives.base import (
     OMITTED,
@@ -319,7 +318,8 @@ class DiffusionObjective(Objective[Ratio]):
         published task drops both.
 
         `end_to_end` trains the autoencoder together with the model, as REPA-E does
-        (`EndToEnd`). It needs `alignment` and a KL autoencoder. The autoencoder's
+        (`EndToEnd`). It needs `alignment` and a KL autoencoder, whose latent is a draw
+        from the posterior `AutoEncoder.moments` gives. The autoencoder's
         weights then train under `params` as `AUTOENCODER`, and a batch norm
         normalizes its latents, with the running statistics in the `LATENT_STATS`
         collection. A published task includes the tuned autoencoder, with those
@@ -353,11 +353,12 @@ class DiffusionObjective(Objective[Ratio]):
         self.uncertainty = None if uncertainty is None else Uncertainty(uncertainty)
         self.alignment = alignment
         self.end_to_end = end_to_end
-        if end_to_end is not None and (
-                alignment is None or not isinstance(autoencoder, ModuleAutoEncoder)
-                or not isinstance(autoencoder.model, AutoencoderKL) or inputs.mask is not None):
-            raise ValueError("end-to-end tuning trains a KL autoencoder through REPA's loss; it "
-                             "needs `alignment`, a KL autoencoder and no masked-image input")
+        if end_to_end is not None:
+            if alignment is None or autoencoder is None or inputs.mask is not None:
+                raise ValueError("end-to-end tuning trains a KL autoencoder through REPA's loss; it "
+                                 "needs `alignment`, a KL autoencoder and no masked-image input")
+            # The step trains through the posterior; an autoencoder without one refuses it by name.
+            jax.eval_shape(autoencoder.moments, autoencoder.params, jnp.zeros((1, *inputs.sample.shape)))
         if inputs.mask is not None and autoencoder is None:
             raise ValueError("Masked-image conditioning requires an autoencoder")
         self.unconditional_prob = unconditional_prob
@@ -700,11 +701,11 @@ class DiffusionObjective(Objective[Ratio]):
     def _end_to_end_latents(self, params, images, key, step, batch: Batch) -> TunedLatents:
         """The trained autoencoder's posterior draw of `images` and what the
         step reads of it."""
-        assert self.end_to_end is not None and isinstance(self.autoencoder, ModuleAutoEncoder)
-        module, weights = self.autoencoder.model, {"params": params["params"][AUTOENCODER]}
-        moments = module.apply(weights, images, method=module.moments)
+        assert self.end_to_end is not None and self.autoencoder is not None
+        weights = params["params"][AUTOENCODER]
+        moments = self.autoencoder.moments(weights, images)
         raw = posterior_latent(moments, key)
-        reconstruction = module.apply(weights, raw, method=module.decode)
+        reconstruction = self.autoencoder.decode_raw(weights, raw)
         discriminator = params["params"].get(DISCRIMINATOR)
         regularizer, hinge, terms = self.end_to_end.regularizer(
             images, reconstruction, moments, perceptual=params.get(PERCEPTUAL),
