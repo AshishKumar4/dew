@@ -208,6 +208,36 @@ gives 94.0 against 96.0. Compiled for the v6e, the program with the clip
 writes 6.1 GiB more a step (80 to 86 GiB). The extra writes are copies of
 the gradients, which the norm holds until every one is in.
 
+Where the rest of the v6e step goes, profiled at integration `0773af76`
+(Colab v6e, five steps traced after ten warm ones, both frameworks on the same
+VM): Dew's Qwen3-0.6B step at 8 x 1024 took 144.9 ms against MaxText's 157.3
+(median 149.7), and Qwen3-1.7B's at 4 x 1024 153.0 against 161.6 (median
+154.2). Dew's kernels, attributed to the model through the optimized HLO's
+source lines:
+
+- The AdamW update reads and writes the fp32 weights and both moments, and
+  it is bound by memory: 12.1 ms of the 0.6B step (8%), and 37.6 ms of the
+  1.7B step (25%), whose batch of 4 does little else. MaxText's update fusions
+  take the same.
+- The 151936-word head and its loss take about 27 ms in both frameworks.
+- The rotary embedding ran as separate passes: `rotate_half`'s slice and
+  negate, the fp32 converts around it, and the split, about 18 ms a step
+  against MaxText's 1.5. `dew.nn.rope.apply_rotary` now rotates the halves
+  as `x1 cos - x2 sin` and `x2 cos + x1 sin` without the rotated copy.
+  Two rounds alternating at integration `a906f011` put Qwen3-0.6B at 140.5-140.7
+  ms against 145.5-145.6 (MFU 27.2% against 26.3%), and Qwen3-1.7B at
+  150.0 against 153.6-153.9 (32.8% against 32.0%). The 1.7B losses and
+  gradient norms were bitwise the same over 40 steps. The 0.6B losses parted
+  by up to 1.7e-3, from rounding, which bf16 training then carries forward;
+  each run repeated its own losses bitwise. Against float64 the two forms
+  are within tests/reference_error.py's rule of each other, forward and
+  backward (`test_the_rotary_rotates_the_halves_as_rotate_half_does`). On an
+  RTX 4080 the two forms take the same time.
+- The splash attention wrapper scales the query and transposes the
+  operands to head-major and back, about 5.6 ms. Compiled for a v6e without
+  the separate scale, the wrapper kept the same four kernels, which are
+  splash's layout transposes, so that was left as is.
+
 ## Rounding on the TPU, 2026-10-02
 
 `import dew` turns off XLA's excess precision
@@ -1724,6 +1754,23 @@ slots and 32 requests a second, a token gap's p50 is 11.7 ms paged against
 fits. The served tokens part from the two forwards' in the same 27 of 64
 rows at 32 slots as with the dense cache, all at bf16 near-ties.
 
+Where the paged step's time goes, measured on an A100 40 GB at integration
+`a906f011`. Qwen3-0.6B, two rounds alternating, 20 traced decode steps a
+case. At 128 slots the paged cache served 11407-11417 tokens a second
+closed loop against the dense cache's 14607-14628 (0.78), and at 32 slots
+7269-7278 against 7974-7983 (0.91). At 128 slots the decode step is on the
+device for 8.21 ms paged against 6.41 dense. cuDNN's paged attention kernel
+accounts for 1.67 ms of the 1.80 ms difference (5.12 against 3.45 ms
+dense). The paged write's scatter and a pad fusion add 0.41 ms more (0.31 +
+0.23 against the dense scatter's 0.13), and the dense step's cache copies
+and a concatenate (0.23 + 0.08 ms), which the paged step has none of, take
+back 0.31. The GEMMs are the same (1.65 ms). The
+page pools' layout costs nothing: cuDNN reads `[pages, page_size, heads,
+dim]`, and XLA already assigns the donated pools that layout. Holding them
+in it from the start (`perf/paged-layout`, not adopted) left the step at
+8.207 ms and the generations bitwise equal. A one-layer program compiled
+alone does transpose the pools, so a probe of one layer misleads here.
+
 Under `--xla_gpu_deterministic_ops` (the CUDA test lane's flag), the paged
 write put a dropped token's keys at another head's kept slot (jax 0.11.2, an
 RTX 4080). The write is a scatter into the pool's page and offset axes past
@@ -1921,6 +1968,31 @@ reproduce the Dew side, note that `tools/benchmark_lm_serving.py` asks
 `Server.from_task` for a dense cache, which a `MultimodalTransformer`
 refuses because it declares no `kv_cache` layout. These runs dropped that
 request; the dense cache is the default anyway.
+
+On an A100 40 GB (Colab) at integration `0aee4c9d`, with the decode kernels
+and idle rows skipped, Dew and vLLM 0.30.0 ran in one session, alternating,
+two rounds, except that the session ended before vLLM's second 128-slot
+round:
+
+| slots | load | Dew: TTFT p50 / p99, gap p50 / p99 (ms) | vLLM |
+|---:|---:|---|---|
+| 32 | closed | 6482-6489 tokens a second | 4876-5068 |
+| 32 | 8 a second | 20.3-24.4 / 35.6-43.8, 2.85-3.21 / 15.9-19.1 | 88.3-88.5 / 171-173, 2.97-2.99 / 61.0-62.2 |
+| 32 | 16 | 21.1-25.4 / 41.2-52.1, 2.99-3.31 / 16.2-20.2 | 180-355 / 642-955, 3.83-3.99 / 62.7-64.6 |
+| 32 | 24 | 23.7-29.4 / 41.9-50.3, 3.17-3.33 / 16.2-20.5 | 924-1032 / 1971-2088, 3.86-3.93 / 62.5-65.3 |
+| 128 | closed | 9816-9851 | 7879-7951 |
+| 128 | 16 | 26.0-26.3 / 52.2-54.7, 4.48-4.52 / 17.1-19.6 | 130.7 / 190.6, 3.91 / 64.3 |
+| 128 | 24 | 32.3-33.1 / 55.1-55.2, 4.77-4.86 / 19.2-19.5 | 174.4 / 468.0, 7.35 / 68.4 |
+| 128 | 32 | 36.7-38.3 / 60.4-64.6, 5.30-5.48 / 21.0-22.6 | 1281 / 2700, 7.81 / 70.0 |
+
+On the A100, Dew serves 1.28-1.33 times vLLM's closed-loop throughput at 32
+slots and 1.23-1.25 at 128. Under open-loop arrivals its time to first token
+stays at 20-38 ms, while vLLM's grows into seconds once the arrival rate
+nears its throughput. vLLM's median token gap is shorter at 128 slots and
+16 requests a second (3.91 against 4.48-4.52 ms), and the two overlap at
+32 slots and 8 a second (2.97-2.99 against 2.85-3.21). Its gap p99 is 61-70 ms
+against Dew's 16-23. vLLM ran its defaults through
+`tools/benchmark_lm_serving.py --backend vllm-engine`.
 
 ## Quantized serving of the 176M text-to-image model, 2026-09-28
 

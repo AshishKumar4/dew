@@ -29,7 +29,8 @@ from flax import linen as nn
 from flax.core import unfreeze
 from jax.core import eval_context
 
-from dew.artifacts import ImageGrid, VideoGrid, agreed, collective_host
+from dew.artifacts import ImageGrid, VideoGrid
+from dew.coordination import agreed, collective_host
 from dew.diffusion.presets import Preset, build_process
 from dew.diffusion.process import Process, aligned_conditions
 from dew.diffusion.schedules import expand

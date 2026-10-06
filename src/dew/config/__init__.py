@@ -36,10 +36,10 @@ import dew.data  # registers the datasets a config names
 import dew.io
 import dew.nn.backbones  # registers the models a config names
 from dew import registry
-from dew.artifacts import agree_process_phase, agreed
 from dew.cache import default_compilation_cache_dir, dew_cache_dir
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep
 from dew.config.sweep import Search, Space, _read, _write, override, random_search
+from dew.coordination import agree_process_phase, agreed
 from dew.data import Dataset, DatasetSpec, Ramp
 from dew.data.dataset import json_list_argument, ramped
 from dew.lora import LoRA, _Adapted, adapted
@@ -228,11 +228,17 @@ class OptimConfig:
     """The learning-rate schedule, as one typed record per kind (`dew.training.optim`).
 
     The kinds are cosine, power (lm-engine's power law with an optional linear
-    tail) and linear; each record holds only its own fields.
+    tail), linear, one_cycle (torch's `OneCycleLR`) and exponential; each record
+    holds only its own fields, and `every` steps any of them once per that many
+    updates.
     """
     weight_decay: float | None = None
+    """The weight decay passed to the optimizer; for 'adam' it is torch's coupled L2
+    penalty, added to the gradient before the moments read it, for 'adamw' the
+    decoupled decay."""
     param_groups: Annotated[tuple[ParamGroup, ...], json_list_argument(ParamGroup)] = ()
-    """Per-group learning-rate multipliers and weight decay; the first matching group wins.
+    """Per-group learning rates, momentum schedules, weight decay and bounds; the first
+    matching group wins.
 
     Empty treats every parameter alike. `ParamGroup.mup` is lm-engine's muP split.
     """
@@ -264,9 +270,10 @@ class OptimConfig:
 
         `steps` is the run's length, which the schedule decays over unless the config
         names its own end. With `param_groups`, one optimizer runs per group under
-        `optax.multi_transform`, each on the schedule times its multiplier and with its
-        own weight decay; the global-norm clip still reads every gradient together,
-        before the groups split them.
+        `optax.multi_transform`, each on its own schedule (the config's when it names
+        none) times its multiplier, with its own weight decay, `b1` schedule and bounds
+        (`ParamGroup.solver`); the global-norm clip still reads every gradient
+        together, before the groups split them.
         """
         learning_rate = learning_rate_schedule(self, steps)
         opts = dict(self.optimizer_opts)
@@ -293,8 +300,9 @@ class OptimConfig:
                     group_opts['weight_decay'] = group.weight_decay
                     if self.optimizer in ('muon', 'muonclip'):
                         group_opts['adam_weight_decay'] = group.weight_decay
-                solvers[group.name] = make(
-                    _scaled(learning_rate, group.learning_rate_multiplier), **group_opts)
+                rate = learning_rate if group.schedule is None else group.schedule.schedule(steps)
+                solvers[group.name] = group.solver(
+                    make, _scaled(rate, group.learning_rate_multiplier), steps, group_opts)
             solver = optax.multi_transform(solvers, param_labels(self.param_groups))
         else:
             solver = make(learning_rate, **opts)

@@ -16,6 +16,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from interop_support import gemma_features
 from safetensors.numpy import load_file
 
 from dew.nn.audio import Gemma3nAudio, audio_config, audio_weight_path, audio_weights
@@ -25,23 +26,6 @@ from dew.nn.vision.gemma4 import translate_gemma4_projector_weights
 from dew.registry import towers
 
 FIXTURES = Path(__file__).parent / "fixtures" / "audio"
-
-def gemma_features(model_type, config, waveforms):
-    """The float32 `input_features` and boolean `input_features_mask` the
-    checkpoint's own Transformers extractor makes of 16 kHz `waveforms`,
-    with the arguments `Processor` passes it: padded to the longest, 30 s
-    at most, frames a multiple of the encoder's 128."""
-    from transformers import Gemma3nAudioFeatureExtractor, Gemma4AudioFeatureExtractor
-
-    extractor = {"gemma3n_audio": Gemma3nAudioFeatureExtractor,
-                 "gemma4_audio": Gemma4AudioFeatureExtractor}[model_type].from_dict(dict(config))
-    features = extractor([np.asarray(waveform, np.float32) for waveform in waveforms],
-                         padding="longest", max_length=480000, truncation=True,
-                         pad_to_multiple_of=128, return_tensors="np", return_attention_mask=True)
-    return {"input_features": np.asarray(features["input_features"], np.float32),
-            "input_features_mask": np.asarray(features["input_features_mask"], np.bool_)}
-
-
 
 on_gpu = pytest.mark.skipif(jax.default_backend() != 'gpu',
                             reason="needs a cuda device")

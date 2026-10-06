@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from test_layer_stack import widened
+from reference_error import widened
 from test_tools import load
 
 from dew.nn.backbones.causal_transformer import CausalTransformer

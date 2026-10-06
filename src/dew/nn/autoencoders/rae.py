@@ -32,6 +32,7 @@ from flax.typing import Dtype
 
 from dew import records
 from dew.interop.components import bind_component, component_source
+from dew.nn.activations import activation
 from dew.nn.attention import LayerNorm, scaled_dot_product_attention
 from dew.nn.backbones.sd3 import sincos_position
 from dew.nn.blocks import torch_bicubic_resize
@@ -118,7 +119,7 @@ class _Block(nn.Module):
         )
         hidden = nn.Dense(self.intermediate, dtype=self.dtype, name="fc1")(
             LayerNorm(epsilon=self.epsilon, dtype=self.dtype, name="norm2")(x))
-        hidden = jax.nn.gelu(hidden, approximate=self.activation == "gelu_pytorch_tanh")
+        hidden = activation(self.activation)(hidden)
         return x + scaled(nn.Dense(self.width, dtype=self.dtype, name="fc2")(hidden), "layer_scale2")
 
 

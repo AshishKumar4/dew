@@ -1,5 +1,5 @@
 import { DurableObject } from 'cloudflare:workers';
-import { prepareSnapshot } from '../src/preparer';
+import { livePreparation, prepareSnapshot } from '../src/preparer';
 
 interface Env {
 	LAB: DurableObjectNamespace<GatewayLab>;
@@ -93,7 +93,7 @@ export class GatewayLab extends DurableObject<Env> {
 	}
 
 	private async prepareManaged(commit: string): Promise<unknown> {
-		const generation = await prepareSnapshot(this.ctx.container!, commit, this.env.SOURCE_COMMIT);
+		const generation = await prepareSnapshot(this.ctx.container!, livePreparation(commit, this.env.SOURCE_COMMIT));
 		const result = await (await this.ctx.container!.exec([
 			'/opt/venv/bin/python', '/opt/live/benchmark_gateway.py', this.env.REQUESTS ?? '1',
 		])).output();

@@ -13,6 +13,7 @@ import optax
 import pytest
 from flax import linen as nn
 from jax.sharding import NamedSharding, PartitionSpec as P
+from recording import RecordingTracker
 
 import dew
 import dew.nn.backbones  # registers the decoder the FLOP formula test builds
@@ -485,23 +486,13 @@ def test_gpu_matmul_custom_calls_are_counted_from_their_shapes():
     assert hlo_flops(CUDNN_ATTENTION_CROSS) == pytest.approx(
         4 * batch * heads * seq * (seq // 2) * head_dim)
 
-class RecordingTracker:
-    def __init__(self):
-        self.scalars = []
-
-    def log(self, scalars, step):
-        self.scalars.append(dict(scalars))
-
-    def artifact(self, value, step):
-        pass
-
 
 def test_fit_reports_throughput_to_the_tracker():
     """The logging tick carries the throughput numbers along with the loss."""
     tracker = RecordingTracker()
     make_trainer(tracker=tracker).fit(Data(batches), steps=3, log_every=1)
 
-    ticks = [p for p in tracker.scalars if "train/samples_per_sec" in p]
+    ticks = [p for _, p in tracker.scalars if "train/samples_per_sec" in p]
     assert len(ticks) == 3, "no throughput was logged"
     assert all(p["train/step_time_ms"] > 0 for p in ticks)
     assert all(p["train/samples_per_sec"] > 0 for p in ticks)
@@ -696,18 +687,18 @@ def test_a_peer_start_failure_keeps_the_cleanup_note(tmp_path, monkeypatch):
     stop that itself fails must land on the error being raised, not on the
     cleanup failure."""
     _capture_env(monkeypatch)
-    import dew.artifacts as artifacts_module
+    import dew.coordination as coordination
     import dew.telemetry.profile as telemetry_profile
     from dew.telemetry.profile import Profiler
 
-    # The window's phases are agreed through `dew.artifacts.agreed`, so the
+    # The window's phases are agreed through `dew.coordination.agreed`, so the
     # peer's failure is injected at the agreement that helper calls.
     def refused(error, phase):
         if phase == "profiling window start":
             raise RuntimeError("peer reported a broken window")
         return 1
 
-    monkeypatch.setattr(artifacts_module, "agree_process_phase", refused)
+    monkeypatch.setattr(coordination, "agree_process_phase", refused)
 
     real_stop = Profiler.stop
 

@@ -14,7 +14,7 @@ from dew.registry import mixers
 
 from ..attention_residuals import ResidualSite
 from ..mixers import MixerBase
-from ..rope import RopeScaling, YarnScaling
+from ..rope import LongRopeScaling, RopeScaling, YarnScaling, rope_scaling_from_record
 
 
 @dataclasses.dataclass(frozen=True)
@@ -52,7 +52,7 @@ class LayerKind:
     """This kind's key/value head count; None takes the model's. Gemma 4's
     global layers have fewer than its sliding ones (num_global_key_value_heads)."""
     rope_theta: float | None = None  # set: this kind takes this base over the model's
-    rope_scaling: RopeScaling | None = None
+    rope_scaling: RopeScaling | LongRopeScaling | None = None
     """This kind's llama3 ramp, or its record. None uses the model's."""
     # OLMo 3's per-kind YaRN: configuration_olmo3.py:110-113.
     yarn: YarnScaling | None = None
@@ -73,7 +73,7 @@ class LayerKind:
                 f"a kind's mixer is a mixer value, its record, or None, "
                 f"not {self.mixer!r}")
         if isinstance(self.rope_scaling, Mapping):
-            object.__setattr__(self, "rope_scaling", RopeScaling(**self.rope_scaling))
+            object.__setattr__(self, "rope_scaling", rope_scaling_from_record(self.rope_scaling))
         if isinstance(self.yarn, Mapping):
             object.__setattr__(self, "yarn", YarnScaling(**self.yarn))
 
@@ -95,7 +95,7 @@ class ResolvedKind:
     chunk: int | None
     num_kv_heads: int
     rope_theta: float
-    rope_scaling: RopeScaling | None
+    rope_scaling: RopeScaling | LongRopeScaling | None
     yarn: YarnScaling | None
     head_dim: int
     mixer: MixerBase | None

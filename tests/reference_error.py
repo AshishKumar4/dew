@@ -46,9 +46,18 @@ arithmetic in float64 is held to the oracle first, within the float64
 rounding of the computation itself (`assert_computes_the_oracle`).
 """
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 
 FACTOR = 2.0
+
+
+def widened(tree):
+    """`tree` as float64 host arrays, its integer leaves as they are: the
+    inputs of a float64 truth."""
+    return jax.tree.map(lambda leaf: np.asarray(
+        leaf, np.float64 if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf.dtype), tree)
 
 
 def assert_fp32_reduction_bound(dew, reference, magnitudes, terms: int) -> None:

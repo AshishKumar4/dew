@@ -10,12 +10,14 @@ import { SESSION_HEADER } from './kernel';
 import { limitsOf } from './limits';
 import { digestIp, sign, verify } from './token';
 import { visitorKey } from './visitor';
+import { remoteRun } from './remote';
 
 export { Coordinator } from './coordinator';
 export { LiveKernel } from './kernel';
 export { SharedHost } from './shared-host';
 export { SnapshotRegistry } from './snapshots';
 export { SnapshotPreparer } from './preparer';
+export { RunnerFleet, RunnerCache, RunnerPreparer, RemoteJob } from './remote';
 
 const REFUSALS: Record<Refusal, string> = {
 	busy: 'Every live kernel is in use right now. Try again in a minute, or open the notebook in Colab.',
@@ -94,6 +96,10 @@ async function connect(request: Request, env: Env, id: string): Promise<Response
 export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		const url = new URL(request.url);
+		if (request.method === 'POST' && url.pathname === '/v1/remote/run') {
+			try { return await remoteRun(request, env); }
+			catch (error) { return Response.json({ message: String(error) }, { status: 400 }); }
+		}
 		const origin = request.headers.get('Origin');
 		const allowed = listed(env.ALLOWED_ORIGINS);
 		const cors: HeadersInit = {

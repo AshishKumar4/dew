@@ -62,14 +62,14 @@ def _home(array: jax.Array | np.ndarray) -> np.ndarray:
 
     A tracker draws on process zero alone, and completing a global array needs
     every process, so an artifact arrives here already brought home by
-    `dew.artifacts.collective_host`. The refusal names the missing call
+    `dew.coordination.collective_host`. The refusal names the missing call
     instead of hanging in a collective one process entered by itself.
     """
     if isinstance(array, jax.Array) and not array.is_fully_addressable:
         raise ValueError(
             "a tracker was handed a shard of a global array, which it cannot "
             "complete from one process: bring the artifact home with "
-            "dew.artifacts.collective_host on every process before drawing it")
+            "dew.coordination.collective_host on every process before drawing it")
     return np.asarray(array)
 
 def _uint8(images: jax.Array | np.ndarray) -> np.ndarray:

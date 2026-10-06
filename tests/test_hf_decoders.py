@@ -113,6 +113,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import flat_tree
 from reference_error import assert_as_exact_as_the_reference
 
 from dew.interop import Pretrained, PretrainedDecoder
@@ -135,8 +136,9 @@ TOKENIZER = Path(__file__).resolve().parent / "fixtures" / "tokenizers" / "tiny-
 TINY = ("qwen3-tiny", "gemma3-tiny", "llama-tiny", "mistral-tiny", "qwen2-tiny",
         "gemma-tiny", "gemma2-tiny", "olmo3-tiny", "olmo3-yarn-tiny",
         "llama31-tiny", "gpt2-tiny", "opt-tiny", "gpt-neox-tiny",
-        "bloom-tiny", "gpt-neo-tiny", "phi-tiny", "falcon-tiny", "falcon-mha-tiny", "gptj-tiny")
-CLASSIC = ('bloom-tiny', 'gpt-neo-tiny', 'phi-tiny', 'falcon-tiny', 'falcon-mha-tiny', 'gptj-tiny')
+        "bloom-tiny", "gpt-neo-tiny", "phi-tiny", "falcon-tiny", "falcon-mha-tiny", "gptj-tiny", "phi3-tiny")
+CLASSIC = ('bloom-tiny', 'gpt-neo-tiny', 'phi-tiny', 'falcon-tiny', 'falcon-mha-tiny', 'gptj-tiny',
+           'phi3-tiny')
 DEEPSEEK = ("deepseek-v3-tiny", "deepseek-v32-tiny")
 ROUTED = (*DEEPSEEK, "kimi-k2-tiny", "mixtral-tiny", "qwen3-moe-tiny")
 HYBRID = ("nemotron-h-tiny", "nemotron-h-moe-tiny", "nemotron-h-moe-latent-tiny")
@@ -209,10 +211,6 @@ def fp32_decoder(directory, **kwargs):
                                  attention_impl='reference', **kwargs)
     return pretrained.model, pretrained.variables
 
-
-def flat_tree(tree):
-    leaves, _ = jax.tree_util.tree_flatten_with_path(tree)
-    return {'.'.join(str(entry.key) for entry in path): leaf for path, leaf in leaves}
 
 def test_llama_checkpoint_with_training_metadata_keeps_reference_logits(tmp_path):
     from shutil import copytree

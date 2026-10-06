@@ -35,8 +35,8 @@ from jax.experimental import multihost_utils
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from typing_extensions import TypeVar as DefaultTypeVar
 
-from dew.artifacts import agree_process_phase, agreed
 from dew.checkpoints import Checkpoints, Ranking
+from dew.coordination import agree_process_phase, agreed
 from dew.data.dataset import Checkpointable, Closeable, DataPartition, Dataset, RampedStream, Reader, rows_of
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES, RematPolicy
