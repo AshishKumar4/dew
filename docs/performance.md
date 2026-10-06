@@ -1130,7 +1130,7 @@ repeated its own result exactly. No XLA flag pins the blocking:
 `--xla_cpu_use_thunk_runtime=false` and
 `--xla_cpu_multi_thread_eigen=false` each still give both results.
 `ONEDNN_MAX_CPU_ISA=SSE41`, set before JAX starts, does: both orders gave the
-same bytes. I timed it on one thread of a P-core, two processes per setting:
+same bytes. Timed on one thread of a P-core, two processes per setting:
 
 | dot | default | `ONEDNN_MAX_CPU_ISA=SSE41` |
 |---|---|---|
