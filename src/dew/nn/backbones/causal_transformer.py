@@ -65,7 +65,7 @@ from ..mixers.mamba2 import Mamba2Mixer
 from ..mla import INDEXER_COLLECTION, MLAMixer
 from ..moe import GatedActivation, Situ
 from ..precision import at_least_fp32, head_dot_general, head_product, scaled
-from ..protocols import ProjectionGroup, declared_groups
+from ..protocols import OutputTable, ProjectionGroup, declared_groups
 from ..rope import LongRopeScaling, RopeScaling, YarnScaling, rope_scaling_from_record
 from ..sharding import (
     RESIDUAL,
@@ -1833,6 +1833,15 @@ class CausalTransformer(nn.Module):
         """Return the final normalized states, without the vocabulary projection."""
         return self.hidden_and_mtp_inputs(tokens, **kwargs)[0]
 
+    def logits(self, tokens, *, train: bool = False, **fields):
+        """Return `__call__`'s fp32 logits over `hidden_states(tokens, **fields)`, which
+        write no cache unless `fields` ask to `decode`."""
+        return self._logits(self.hidden_states(tokens, train=train, **fields))
+
+    def logits_from_hidden(self, hidden):
+        """Return the logits of final states `hidden`: the head `__call__` and every MTP depth score with."""
+        return self._logits(hidden)
+
     def hidden_and_mtp_inputs(self, tokens, train: bool = False, decode: bool = False,
                               positions=None, segment_ids=None,
                               input_embeddings=None,
@@ -2360,6 +2369,18 @@ class CausalTransformer(nn.Module):
         if self.tie_embeddings:
             return params['embed_tokens']['embedding'], True
         return params['lm_head']['kernel'], False
+
+    def output_table(self) -> OutputTable | None:
+        """Return the head as the matrix `logits_from_hidden` contracts, read from the bound variables:
+        the parameter itself, as `head_table` gives it, with `_logits`'s bias, softcap and precision.
+        None where no matrix alone is the head: past a `head_transform`, or when `lm_head`'s scope
+        holds more than its kernel, as `dew.lora`'s factors, which its interceptor adds."""
+        head = {} if self.tie_embeddings else self.lm_head.variables["params"]
+        if self.head_transform is not None or set(head) - {"kernel"}:
+            return None
+        matrix = self.embed_tokens.embedding if self.tie_embeddings else head["kernel"]
+        return OutputTable(matrix, self.tie_embeddings, self.head_bias_value if self.head_bias else None,
+                           self.final_logit_softcap, self.precision)
 
     def init_cache(self, batch_size: int):
         """Allocate a zeroed decode cache for `batch_size` sequences.

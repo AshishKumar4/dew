@@ -12,8 +12,8 @@ from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.backbones.causal_transformer import CausalTransformer, DecoderBank
-from dew.nn.protocols import ProjectionGroup
-from dew.nn.vision import Gemma3nProjectorModule, Gemma3nVision, ProjectorBase, TowerBase
+from dew.nn.protocols import HardVocabularyEmbedder, OutputTable, ProjectionGroup
+from dew.nn.vision import Gemma3nVision, ProjectorBase, TowerBase
 from dew.registry import models
 
 if TYPE_CHECKING:
@@ -131,7 +131,7 @@ class AudioConditioner(nn.Module):
                               mask.reshape(batch * clips, features.shape[2]))
         projected = self.audio_projector(encoding.features)
         if self.soft_tokens is not None:
-            if not isinstance(self.audio_projector, Gemma3nProjectorModule) or self.padding_id is None:
+            if not isinstance(self.audio_projector, HardVocabularyEmbedder) or self.padding_id is None:
                 raise ValueError("fixed audio slots require the Gemma 3n embedder and its padding token")
             padding = self.audio_projector.embed_hard(jnp.full((1, 1), self.padding_id, jnp.int32)).astype(
                 projected.dtype
@@ -231,6 +231,10 @@ class MultimodalTransformer(nn.Module):
         return self.language_model.causal
 
     @property
+    def mask_token_id(self) -> int | None:
+        return self.language_model.mask_token_id
+
+    @property
     def num_nextn_predict_layers(self) -> int:
         return self.language_model.num_nextn_predict_layers
 
@@ -266,7 +270,7 @@ class MultimodalTransformer(nn.Module):
             if self.audio is not None:
                 embedders.append(self.audio_conditioner.audio_projector)
             for embedder in embedders:
-                if not isinstance(embedder, Gemma3nProjectorModule):
+                if not isinstance(embedder, HardVocabularyEmbedder):
                     raise TypeError("Gemma 3n media embedders carry the hard vocabulary")
                 embeddings = embedder.merge_hard_embeddings(embeddings, tokens)
         if conditioning is not None and image_indices is not None:
@@ -295,9 +299,8 @@ class MultimodalTransformer(nn.Module):
 
     def mtp_logits(self, hidden, tokens, **kwargs):
         """Return the shared language head's logits for each media-aware prediction depth."""
-        return [
-            self.language_model._logits(state) for state in self.mtp_hidden_states(hidden, tokens, **kwargs)
-        ]
+        return [self.language_model.logits_from_hidden(state)
+                for state in self.mtp_hidden_states(hidden, tokens, **kwargs)]
 
     def mtp_step(self, hidden, tokens, *, image_indices=None, conditioning=None,
                  input_embeddings=None, **kwargs):
@@ -391,12 +394,22 @@ class MultimodalTransformer(nn.Module):
                                    segment_ids=segment_ids, image_indices=image_indices,
                                    conditioning=conditioning, attention_mask=attention_mask,
                                    image_groups=image_groups, rotary_positions=rotary_positions)
-        return self.language_model._logits(hidden)
+        return self.language_model.logits_from_hidden(hidden)
+
+    def logits(self, tokens, *, train: bool = False, **fields):
+        """Return the `[B, S, vocab]` fp32 logits of the whole sequence, media
+        fused as `hidden_states` fuses them from `fields`. Without `decode`
+        the call writes no cache."""
+        return self.language_model.logits_from_hidden(self.hidden_states(tokens, train=train, **fields))
+
+    def logits_from_hidden(self, hidden):
+        """Return the decoder's logits of final states `hidden`."""
+        return self.language_model.logits_from_hidden(hidden)
 
     def states_and_logits(self, tokens, **kwargs):
         """Return the final hidden states and their logits from one media-aware forward pass."""
         hidden = self.hidden_states(tokens, **kwargs)
-        return hidden, self.language_model._logits(hidden)
+        return hidden, self.language_model.logits_from_hidden(hidden)
 
     def states_and_logits_at(self, tokens, slots, **kwargs):
         """Return the final hidden states, and the logits of one slot per row.
@@ -406,7 +419,7 @@ class MultimodalTransformer(nn.Module):
         long request's transient memory, so this scores only `slots`.
         """
         hidden = self.hidden_states(tokens, **kwargs)
-        return hidden, self.language_model._logits(hidden[jnp.arange(hidden.shape[0]), slots])
+        return hidden, self.language_model.logits_from_hidden(hidden[jnp.arange(hidden.shape[0]), slots])
 
     def head_weight(self, params):
         """Return the decoder's shared fp32 head matrix, for an objective's chunked scoring."""
@@ -415,6 +428,15 @@ class MultimodalTransformer(nn.Module):
     def vocabulary_bias(self, params):
         """The decoder's vocabulary bias, for the same affine head its forward scores."""
         return self.language_model.vocabulary_bias(params['language_model'])
+
+    def head_table(self, params):
+        """Return the decoder's head as its tree stores it, and whether its rows are the vocabulary."""
+        return self.language_model.head_table(params["language_model"])
+
+    def output_table(self) -> OutputTable | None:
+        """Return the decoder's head as the matrix its final states contract,
+        or None where none does (`CausalTransformer.output_table`)."""
+        return self.language_model.output_table()
 
     @nn.compact
     def init_cache(self, batch_size: int):
