@@ -90,20 +90,24 @@ def moved(tree, seed: int):
         for leaf, key in zip(leaves, keys, strict=True)])
 
 
-def test_the_last_batch_is_filled_out_and_marked_on_every_process_count():
-    """Main's repro: eight training records in batches of four and seven to
-    validate. The pass reads rows 0-6 once each, on one process or two, and
-    the repeats that fill the last batch out are marked."""
-    data = Dataset.from_records({"id": np.arange(8)}, batch=4, validation={"id": np.arange(7)},
+@pytest.mark.parametrize("held", [7, 1])
+def test_the_last_batch_is_filled_out_and_marked_on_every_process_count(held):
+    """Main's repro: eight training records in batches of four, and seven or
+    one to validate. The pass reads each record once, on one process or two,
+    and the repeats that fill the last batch out are marked; with one record,
+    process 1's share is empty and reads one batch of repeats alone."""
+    data = Dataset.from_records({"id": np.arange(8)}, batch=4, validation={"id": np.arange(held)},
                                 loading=Loading(workers=0, threads=1, read_buffer=1))
     for count in (1, 2):
         seen = []
         for index in range(count):
-            for batch in data.val(DataPartition(index, count)):
+            batches = list(data.val(DataPartition(index, count)))
+            assert batches, (count, index)
+            for batch in batches:
                 assert rows_of(batch) == 4 // count
                 valid = np.asarray(batch.get(VALID_ROWS, np.ones(4 // count, bool)))
                 seen.extend(np.asarray(batch["id"])[valid].tolist())
-        assert sorted(seen) == list(range(7)), count
+        assert sorted(seen) == list(range(held)), count
 
 
 EVALUATED = sorted(set(objectives) - ROLLOUT)
@@ -180,15 +184,15 @@ def test_a_pass_scores_every_record_once_and_a_deterministic_loss_is_the_unbatch
     assert_every_record_once(name, evaluated(name, windows, tmp_path))
 
 
-def perplexity(windows) -> dict:
-    """`Perplexity` over the LM case's split of `RECORDS` in batches of
+def perplexity(windows, count: int = RECORDS) -> dict:
+    """`Perplexity` over the LM case's split of `count` records in batches of
     `ROWS`, run on every process of the pool, with the cross entropy of every
     record's tokens scored in one batch and the roundings of that computation."""
     objective, batch = cases(windows)["lm"]()
-    records = records_of(batch, RECORDS)
+    records = records_of(batch, count)
     with jax.enable_x64(new_val=True):
         variables = moved(objective.init(jax.random.key(0)), 1)
-        data = Dataset.from_records(records, batch=ROWS, validation=records,
+        data = Dataset.from_records(records_of(batch, ROWS), batch=ROWS, validation=records,
                                     loading=Loading(workers=0, threads=1, read_buffer=1))
         result = Evaluation.run(objective, variables, data.val, key=3, metrics=(Perplexity(),))
         whole = stacked(records)
@@ -201,14 +205,16 @@ def perplexity(windows) -> dict:
             "unbatched": total / mass, "roundings": roundings}
 
 
-def assert_the_metric_over_every_record(report: dict) -> None:
-    """The pass's perplexity is every record's, within float64 rounding: the
-    repeats filling the last batch reach no metric."""
-    assert report["records"] == RECORDS
+def assert_the_metric_over_every_record(report: dict, count: int = RECORDS) -> None:
+    """The pass's perplexity is every one of `count` records', within float64
+    rounding: the repeats filling the last batch reach no metric."""
+    assert report["records"] == count
     assert_computes_the_oracle(np.log([report["perplexity"]]), np.asarray([report["unbatched"]]),
                                "the cross entropy", roundings=report["roundings"])
 
 
-def test_a_metric_over_a_pass_is_the_metric_over_every_record(windows):
-    """On one process (`tests/test_multiprocess.py` runs the same on two)."""
-    assert_the_metric_over_every_record(perplexity(windows))
+@pytest.mark.parametrize("count", [RECORDS, 1])
+def test_a_metric_over_a_pass_is_the_metric_over_every_record(windows, count):
+    """On one process (`tests/test_multiprocess.py` runs the same on two,
+    where one record leaves process 1's share empty)."""
+    assert_the_metric_over_every_record(perplexity(windows, count), count)
