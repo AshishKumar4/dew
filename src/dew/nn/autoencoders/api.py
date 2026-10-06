@@ -84,25 +84,18 @@ class AutoEncoder(ABC):
         """c, the number of channels in a latent."""
 
     def moments(self, params, images: jnp.ndarray) -> jnp.ndarray:
-        """Return the KL posterior of frames `[B, H, W, C]`: its mean and log-variance, stacked on channels.
+        """Return the KL posterior of frames `[B, H, W, C]`, its mean and log-variance stacked on channels.
 
-        A KL autoencoder's latent is one draw from it, normalized by
-        `latent_shift` and `latent_scale` and nothing else: `encode(params,
-        images, key)` is `(posterior_latent(moments, key) - latent_shift) *
-        latent_scale`. A loss that trains the autoencoder reads the posterior
-        here (REPA-E's KL term) and may renormalize the draw itself. The base
-        class raises TypeError naming the autoencoder: one whose latent is no
-        such draw, a deterministic encoder's or a draw folded or normalized
-        past `latent_shift` and `latent_scale`, has no posterior to give.
+        A KL autoencoder's latent is one draw from it normalized by
+        `latent_shift` and `latent_scale` alone, `encode` being
+        `(posterior_latent(moments, key) - latent_shift) * latent_scale`, so a
+        loss may train it through the posterior and renormalize the draw
+        (REPA-E). Any other autoencoder raises TypeError, naming itself.
         """
-        raise TypeError(f"{type(self).__name__} has no KL posterior whose draw, normalized by "
-                        "latent_shift and latent_scale alone, is its latent")
+        raise TypeError(f"{type(self).__name__} has no KL posterior its latent is a draw of")
 
     def decode_raw(self, params, latents: jnp.ndarray) -> jnp.ndarray:
-        """Decode a draw from `moments`' posterior, `[B, h, w, c]`, to frames `[B, H, W, C]`.
-
-        The base class raises TypeError naming the autoencoder, as `moments` does.
-        """
+        """Decode a draw from `moments`' posterior to frames; raises as `moments` does."""
         raise TypeError(f"{type(self).__name__} has no KL posterior whose draws it decodes")
 
     def latent_shape(self, shape: tuple[int, ...]) -> tuple[int, ...]:
