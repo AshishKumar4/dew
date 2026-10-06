@@ -65,6 +65,7 @@ class _MediaReader(nn.Module):
     """A bidirectional model whose every state reads how many media slots its row holds."""
 
     causal = False
+    mask_token_id = None
 
     @nn.compact
     def hidden_states(self, tokens, train=False, image_indices=None):
