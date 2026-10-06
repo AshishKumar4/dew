@@ -33,6 +33,7 @@ from dew.objectives.base import (
     Batch,
     Objective,
     Omitted,
+    ProgramModule,
     Ratio,
     Source,
     Step,
@@ -222,6 +223,7 @@ class DecisionObjective(Objective[Ratio]):
 
     artifact = Decisions
     saved_task = Decide
+    _held_parts = True
 
     def __init__(self, backbone: nn.Module | Source | Adapter | Decide, *,
                  loss: ScoringRule | None = None, tokenizer: Tokenizer | None = None,
@@ -240,11 +242,10 @@ class DecisionObjective(Objective[Ratio]):
                 tokenizer = tokenizer or backbone.tokenizer
                 specials = specials or backbone.specials
                 module = model.backbone
-            case Adapter():
+            case Adapter() | Source():
                 module, held = backbone.model, joined({"backbone": backbone.variables})
-            case Source():
-                module, held = backbone.model, joined({"backbone": backbone.variables})
-                tokenizer = tokenizer or _tokenizer_of(backbone.text_processor)
+                if isinstance(backbone, Source):
+                    tokenizer = tokenizer or _tokenizer_of(backbone.text_processor)
             case _:
                 module = backbone
         if variables is not OMITTED:
@@ -274,15 +275,27 @@ class DecisionObjective(Objective[Ratio]):
         self.none_of_the_above = none_of_the_above
         self.inputs = InputSpec(sample=Field("tokens", (self.layout.max_len,)))
 
-    def held_variables(self) -> Variables | None:
-        return self.variables
+    def program_key(self) -> tuple[ProgramModule, ...]:
+        """The backbone, then the head, both trained."""
+        return (ProgramModule(self.model.backbone, None, trained=True),
+                ProgramModule(self.model.head, None, trained=True))
 
-    def init(self, key: jax.Array, variables: Variables | None = None) -> Variables:
-        given = self.held_variables() if variables is None else variables
+    def substitute(self, modules: Sequence[nn.Module]) -> None:
+        backbone, head = modules
+        if not isinstance(head, Head):
+            raise TypeError(f"a decision model's second module is its head, not a {type(head).__name__}")
+        self.model = DecisionModel(backbone, head)
+
+    def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
+        """Nothing beyond the held parts: `complete_variables` draws the part the tree lacks."""
+        return held or {}
+
+    def complete_variables(self, key: jax.Array, tree: Variables) -> Variables:
+        """Draw whichever of the backbone and the head `tree` does not hold."""
         backbone_key, head_key = jax.random.split(key)
         tokens = jnp.zeros((1, self.layout.max_len), jnp.int32)
-        parts = {name: part(given, name) for name in ("backbone", "head")
-                 if given is not None and any(name in tree for tree in given.values())}
+        parts = {name: part(tree, name) for name in ("backbone", "head")
+                 if any(name in collection for collection in tree.values())}
         if "backbone" not in parts:
             parts["backbone"] = self.model.backbone.init(backbone_key, tokens)
         if "head" not in parts:
@@ -317,7 +330,7 @@ class DecisionObjective(Objective[Ratio]):
 
     def evaluate(self, params: Variables, batch: Batch, step: Step) -> Decisions:
         inputs = laid_out(batch)
-        weights = params if step.ema is None else step.ema
+        weights = self.evaluation_variables(params, step)
         logits = self._logits(weights, inputs)
         empty = ~jnp.any(inputs.options, axis=-1, keepdims=True)
         probabilities = jax.nn.softmax(jnp.where(empty, 0.0, logits), axis=-1)

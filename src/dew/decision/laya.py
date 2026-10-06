@@ -194,7 +194,7 @@ class LayaCheckpoint:
         if any(isinstance(key, jax.tree_util.DictKey) and key.key in FACTORS
                for path, _ in jax.tree_util.tree_leaves_with_path(backbone) for key in path):
             raise ValueError("the backbone carries LoRA factors; merge them into its kernels before saving")
-        bundle = PretrainedDecoder.from_model(from_record(CausalTransformer, self.model.backbone), backbone)
+        bundle = PretrainedDecoder.from_model(self.model.backbone, backbone)
         if bundle.config.get("model_type") != "modernbert":
             raise ValueError("Laya's layout holds a ModernBERT encoder, "
                              f"not a {bundle.config.get('model_type')}")
