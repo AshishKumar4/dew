@@ -15,7 +15,7 @@ import numpy as np
 from dew.objectives.base import Variables
 
 from .episodes import Action, Episode, EpisodeId
-from .records import action_record, episode_from_record, episode_record
+from .records import action_record, episode_from_record
 
 
 def policy_digest(variables: Variables) -> str:
@@ -114,7 +114,7 @@ class JournalRun:
         """Commit one sample's episode, its pending action and the environment snapshot."""
         if episode._binding_id != self.binding:
             raise ValueError("journal cannot mix collection bindings")
-        encoded = json.dumps(episode_record(episode), allow_nan=False)
+        encoded = json.dumps(asdict(episode), allow_nan=False)
         action = None if pending is None else json.dumps(asdict(pending), allow_nan=False)
         with self.connection:
             self.connection.execute("INSERT OR REPLACE INTO turns VALUES (?, ?, ?, ?, ?)",
