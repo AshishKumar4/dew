@@ -2,7 +2,7 @@
 
 A `Dataset` supplies the batches a run trains and validates on. A batch is a dictionary of arrays whose first dimension holds this process's rows of the global batch (all of them with one process). Most readers yield NumPy arrays, but device image augmentation yields pixels that are already JAX arrays on the device. The trainer joins the processes' rows into global arrays, and the objective reads the fields it needs by name.
 
-This page covers the `Dataset` class, the fields each built-in objective expects, the built-in readers, reading data that TFDS or Hugging Face already holds, and resuming the data stream from a checkpoint.
+This page covers the `Dataset` class, one-line datasets from Hugging Face, TFDS, Grain and PyTorch, the fields each built-in objective expects, the built-in readers, reading data that TFDS or Hugging Face already holds, and resuming the data stream from a checkpoint.
 
 ![Dataset to global batch: train(partition) opens an iterator of host batches, and shard_batch assembles each into one jax.Array split over the mesh's batch axes.](../assets/data-pipeline-light.svg)
 ![Dataset to global batch: train(partition) opens an iterator of host batches, and shard_batch assembles each into one jax.Array split over the mesh's batch axes.](../assets/data-pipeline-dark.svg)
@@ -61,6 +61,42 @@ data = Dataset(train=lambda partition: itertools.repeat(batch), val=None, record
 Such a function has to do two things that `from_records` does for you. It must read only the share its partition names, and if the run checkpoints, its iterator needs `get_state` and `set_state` (see [Resuming the data stream](#resuming-the-data-stream)). This one does neither, so it only suits a single-process run with `checkpoint_every=None`. If you built a Grain pipeline yourself, pass it to `Dataset.from_grain`.
 
 `Dataset.steps_per_epoch` is `records // batch`, or `None` when `records` is `None`. A stream without a record count needs an explicit `steps` in `fit`.
+
+## Datasets from other libraries
+
+A Hugging Face, TFDS, Grain or PyTorch dataset is one call, with nothing to download or convert first:
+
+<!-- not run: downloads the datasets on first use -->
+```python
+import grain
+import torchvision
+import dew.data
+from dew.data import Dataset, HFImages, TFDSImages
+
+text = dew.data.load("hf/winglian/tiny-shakespeare", batch=64, tokenizer="byte", seq_len=256)
+cifar = HFImages(name="uoft-cs/cifar10", image_column="img", image_size=32).load(batch=64)
+digits = dew.data.load("tfds/mnist", batch=64)
+mnist = TFDSImages(name="mnist", image_size=32).load(batch=64)
+records = Dataset.from_grain(grain.MapDataset.source([{"x": i} for i in range(1024)]), batch=64)
+digits_torch = Dataset.from_torch(torchvision.datasets.MNIST("data", download=True), batch=64,
+                                  fields=("image", "label"))
+```
+
+| Call | A batch holds |
+|---|---|
+| `load("hf/<name>", tokenizer=, seq_len=)` | `text`: int32 `[B, seq_len + 1]` token windows |
+| `HFImages(name=...)`, `TFDSImages(name=...)` | `image`: uint8 `[B, image_size, image_size, 3]`, `label`: int32 `[B]` |
+| `load("tfds/<builder>")`, `load("hf/<name>")` | The provider's own fields as arrays, as [TFDS and Hugging Face datasets](#tfds-and-hugging-face-datasets) describes |
+| `Dataset.from_grain(map_dataset)` | The pipeline's own fields |
+| `Dataset.from_torch(dataset, fields=)` | A dict sample's keys, or one field per `fields` name of a tuple sample |
+
+`tokenizer` is `"byte"` or a Hugging Face tokenizer name such as `"gpt2"`. The split's `text` column is tokenized once, each row ended with the tokenizer's eos id, into `~/.cache/dew/tokens/<name>/<key>` (`$XDG_CACHE_HOME/dew/tokens` when that is set), and the first 1% of the stream is the validation split. The key covers the dataset name, `split`, the tokenizer and the `HFOptions` that choose the rows (`config`, `data_dir`, `data_files`, `revision`), so the same call made again opens the cached ids without calling `datasets`, the Hub or the tokenizer, and runs offline. A setup step that makes the call once, with network access, fills the cache for a sandbox without it. A model that encodes or decodes with the same Hugging Face tokenizer still needs it in the Hugging Face cache, which `HF_HUB_OFFLINE=1` then reads. Rows that change under the same request are not read again until you delete the directory, so pass `options=HFOptions(revision=...)` to pin a version. In a run's config, the call is `TokenWindows(hub=HubText("winglian/tiny-shakespeare", tokenizer="byte"), seq_len=256)`.
+
+`HFImages` reads each image in whatever mode it is stored, grey, 16-bit, a palette or with transparency, as RGB, with transparency composited onto white. A dataset without a caption column, such as CIFAR-10, loads without `caption_columns=()` as long as no caption reader is passed. Images and Arrow tables stay in the `datasets` cache, so after one load with network access, `HF_DATASETS_OFFLINE=1` reads them offline.
+
+`tfds/<builder>` and `TFDSImages(name=)` without a path read `~/.cache/dew/tfds` (`$XDG_CACHE_HOME/dew/tfds`). A builder that is not there yet is prepared there as ArrayRecords, in a separate Python process so that the training process never imports TensorFlow. That process needs `tensorflow` and the dataset's own packages, and TFDS 4.9.10 also imports `importlib_resources` without declaring it. Without TensorFlow, as on Python 3.14, the call raises an error that names how to prepare the builder elsewhere: prepare it into that directory from another environment, or pass the prepared directory as `path`. A prepared builder reads offline.
+
+`Dataset.from_grain` takes a `MapDataset` without batching: it repeats it, reads each process's share and saves a global record position. `Dataset.from_torch` reads a map-style `torch.utils.data.Dataset` by index, as `from_records` reads records: shuffled from `seed` every epoch, a share per process, and a global record position. Tensors arrive as NumPy, PIL images as their own arrays and 64-bit numbers as 32-bit ones. It refuses a `DataLoader`, whose sampler and `collate_fn` the run's stream would replace, so pass `loader.dataset` if you want the samples without them. It also refuses an `IterableDataset`, which has no index to shuffle or resume from; build a Grain `IterDataset` over it instead.
 
 ## Fields per objective
 
@@ -131,15 +167,14 @@ Image sources can need network access the first time. Token-window sources read 
 
 ## Image datasets on the Hugging Face Hub
 
-`HFImages` reads a Hub image dataset by index through the image pipeline, which decodes each image, resizes it to `image_size`, applies augmentation and reads captions for text conditioning. Its column fields tell it where each record keeps its data. `image_column` names the image column, and the caption is the first of `caption_columns` that a record has. Where the dataset has a `label` column, it holds the record's class index. CIFAR-10, for example, keeps its image under `img`, a class under `label` and no caption:
+`HFImages` reads a Hub image dataset by index through the image pipeline, which decodes each image to RGB, resizes it to `image_size`, applies augmentation and reads captions for text conditioning. Its column fields tell it where each record keeps its data. `image_column` names the image column, and the caption is the first of `caption_columns` that a record has. Where the dataset has a `label` column, it holds the record's class index. CIFAR-10, for example, keeps its image under `img`, a class under `label` and no caption:
 
 <!-- not run: downloads CIFAR-10 on first use -->
 ```python
 from dew.data import DataPartition, HFImages
 
-data = HFImages(name="uoft-cs/cifar10", image_column="img", caption_columns=(),
-                image_size=32, augmentation="flip_only", val_split="test",
-                val_batches=None).load(batch=64)
+data = HFImages(name="uoft-cs/cifar10", image_column="img", image_size=32,
+                augmentation="flip_only", val_split="test", val_batches=None).load(batch=64)
 batch = next(data.train(DataPartition()))
 print({name: (value.shape, value.dtype) for name, value in batch.items()})
 print(data.records, data.steps_per_epoch)
@@ -150,7 +185,7 @@ print(data.records, data.steps_per_epoch)
 50000 781
 ```
 
-`caption_columns=()` reads a dataset without captions, for an unconditional or class-conditional run, and refuses a caption reader. If you name a column the split does not hold, loading the spec raises an error that lists the columns it does hold. Without `val_split`, the first `val_batches` batches of the training split are held out for validation. With a `val_split`, `val_batches=None` scores the whole named split.
+Captions are read only when `load` is given a caption reader (`tokenize`), so a dataset without a caption column loads for an unconditional or class-conditional run, and a caption reader over it is refused. If you name an image column the split does not hold, loading the spec raises an error that lists the columns it does hold. Without `val_split`, the first `val_batches` batches of the training split are held out for validation. With a `val_split`, `val_batches=None` scores the whole named split.
 
 Validation reads each image through the deterministic resize and skips the crop, flip and jitter that training applies, so a metric scores the same images a reference implementation would.
 
@@ -361,8 +396,9 @@ print(first["x"].shape, first["label"][:4], data.records)
 | `shuffle_buffer` | Rows a streamed Hugging Face split shuffles through |
 | `options` | `TFDSOptions` for `tfds/...`, `HFOptions` for `hf/...`; the other provider's options raise `TypeError` |
 | `loading` | Throughput only, as above |
+| `tokenizer`, `seq_len` | Read an `hf/...` split's `text` column as token windows (see [Datasets from other libraries](#datasets-from-other-libraries)) |
 
-`tfds/<builder>` reads the ArrayRecord files that a TFDS preparation run wrote under `TFDSOptions.path`. It reads them through TFDS's read-only builder, so the training process does not import TensorFlow. Dew never prepares the data itself; [Installation](../installation.md#preparing-tfds-data) shows how to do that. `path` is either a prepared version directory or the `data_dir` above one, and in the second case `config` and `version` select the directory inside it. Dew checks the prepared metadata against the builder, config and version you asked for, and passes `decoders` to the builder unchanged.
+`tfds/<builder>` reads the ArrayRecord files that a TFDS preparation run wrote under `TFDSOptions.path`. It reads them through TFDS's read-only builder, so the training process does not import TensorFlow. Without a `path`, it reads Dew's own TFDS directory and prepares a missing builder there first, as [Datasets from other libraries](#datasets-from-other-libraries) describes; [Installation](../installation.md#preparing-tfds-data) shows how to prepare data yourself. `path` is either a prepared version directory or the `data_dir` above one, and in the second case `config` and `version` select the directory inside it. Dew checks the prepared metadata against the builder, config and version you asked for, and passes `decoders` to the builder unchanged.
 
 <!-- not run: needs a prepared TFDS directory -->
 ```python

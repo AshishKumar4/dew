@@ -45,6 +45,7 @@ from .dataset import (
     train_stream,
     validation_pass,
 )
+from .sources.text import HubText, TokenWindowSource, token_corpus
 
 
 class _BoundedIterator(Forwarding):
@@ -97,9 +98,11 @@ class TokenWindows(DatasetSpec):
     """Reads fixed windows of `seq_len + 1` ids from the token stream.
 
     `path` is the directory that `dew tokenize` or `TokenCorpus.write` wrote.
-    Training windows start `stride` ids apart, `seq_len` by default. A
-    stride of one lets the shuffled training stream read every contiguous
-    window. Validation always starts windows `seq_len` ids apart, so it
+    `hub` reads a Hugging Face text split instead, tokenized once into dew's
+    cache (`HubText`), which is what `load("hf/<name>", tokenizer=,
+    seq_len=)` builds. Training windows start `stride` ids apart, `seq_len`
+    by default. A stride of one lets the shuffled training stream read every
+    contiguous window. Validation always starts windows `seq_len` ids apart, so it
     counts each target once. A batch is `{"text": int32 [batch, seq_len + 1]}`.
     `val_batches` caps the batches in a validation pass; None scores the
     whole split.
@@ -115,12 +118,14 @@ class TokenWindows(DatasetSpec):
     field: str | None = None
     """The arrayrecord field that holds the ids, for a corpus stored as ArrayRecord shards of dict
     records; None reads each record's bytes as the ids. A `.bin` corpus ignores it."""
+    hub: HubText | None = dataclasses.field(default=None, kw_only=True)
 
     def load(self, *, batch: int, tokenize: Tokenize | None = None) -> Dataset:
-        from .sources.text import TokenWindowSource, token_corpus
-
         self.uncaptioned(tokenize)
-        corpus, held_out = token_corpus(self.path, "TokenWindows", field=self.field)
+        if self.hub is not None and self.path:
+            raise ValueError("TokenWindows reads path= or hub=, not both")
+        path = self.path if self.hub is None else self.hub.tokenized()
+        corpus, held_out = token_corpus(path, "TokenWindows", field=self.field)
         train = TokenWindowSource(corpus, self.seq_len, stride=self.stride)
         validation = TokenWindowSource(held_out, self.seq_len)
         return Dataset(
@@ -388,7 +393,7 @@ class PackedTokens(DatasetSpec):
 
     def load(self, *, batch: int, tokenize: Tokenize | None = None) -> Dataset:
         from .providers import corpora_dataset, name_ordered, phased_dataset
-        from .sources.text import TokenDocumentSource, same_tokenizer, token_corpus
+        from .sources.text import TokenDocumentSource, same_tokenizer
 
         self.uncaptioned(tokenize)
         if self.phases and self.path:
