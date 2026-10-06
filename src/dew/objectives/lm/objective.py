@@ -804,6 +804,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
                                 method=type(self.model).head_weight)
         losses, predicted, log_z = chunked_cross_entropy(
             hidden, head, targets, self.head_chunks, tile=self.head_tile,
+            bias=self._head_bias(params),
             softcap=self.model.final_logit_softcap,
             precision=self.model.precision, predict=self.token_accuracy if predict is None else predict)
         weights = self._row_weights(prepared, targets, roles, losses.dtype)
@@ -829,11 +830,17 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             for depth, state in enumerate(states, start=1):
                 depth_losses, _, _ = chunked_cross_entropy(
                     state, head, targets[:, depth:], self.head_chunks, tile=self.head_tile,
+                    bias=self._head_bias(params),
                     softcap=self.model.final_logit_softcap,
                     precision=self.model.precision, predict=False)
                 depth_scores.append((depth_losses, self._depth_weights(
                     prepared, targets, roles, losses.dtype, depth)))
         return Scores(losses, weights, log_z, correct, hidden, kept, sown, depth_scores, qk, kls)
+
+    def _head_bias(self, params):
+        """The model's affine-head term, absent for every bias-free decoder."""
+        return (self.model.apply(params, params['params'], method='vocabulary_bias')
+                if _decoder(self.model) is not None else None)
 
     def _row_weights(self, prepared, targets, roles, dtype):
         """Weight the targets the row itself scores.
@@ -943,6 +950,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         if temperature != 1.0:
             losses, _, _ = chunked_cross_entropy(
                 scores.hidden, head, targets, self.head_chunks, tile=self.head_tile,
+                bias=self._head_bias(params),
                 softcap=softcap,
                 precision=self.model.precision, predict=False, temperature=temperature)
             log_probs = -losses
@@ -952,7 +960,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             filtered, present = support_log_probs(
                 scores.hidden, head, targets, ids, jnp.where(columns > 0, columns - 1, -1),
                 temperature=temperature,
-                softcap=softcap, precision=self.model.precision)
+                softcap=softcap, precision=self.model.precision, bias=self._head_bias(params))
             log_probs = jnp.where(present, filtered, log_probs)
         return log_probs
 
@@ -1085,8 +1093,9 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         assert isinstance(statistics, Ratio)
         variables = thaw(params)
         head = self.model.apply(variables, variables["params"], method=type(self.model).head_weight)
-        logits = constrain(head_logits(scores.hidden, head, softcap=self.model.final_logit_softcap,
-                                       precision=self.model.precision), LOGITS)
+        logits = constrain(head_logits(
+            scores.hidden, head, softcap=self.model.final_logit_softcap,
+            precision=self.model.precision, bias=self._head_bias(variables)), LOGITS)
         return statistics, aux, Prediction(logits, scores.losses, scores.weights, scores.layers)
 
     def _scored_loss(self, params, batch, step: Step, *, train: bool, layers: Sequence[int] = ()
