@@ -34,6 +34,7 @@ import datetime
 import functools
 import importlib
 import importlib.metadata
+import inspect
 import operator
 import re
 import sys
@@ -263,13 +264,18 @@ class Registry[T: Callable[..., Any], Built](Mapping[str, T]):
         Pass a whole parsed config as the positional `record`. Its values are
         converted to the member's declared types here, so a caller does not
         need to know the member's fields to unpack the config. Keyword fields
-        override the record's.
+        override the record's. A function member's fields are its parameters,
+        converted to their annotations the same way, so a parameter typed
+        with what another table's functions return takes a record naming one
+        of them.
         """
         member = self[name]
         given: Mapping[str, object] = {**record, **fields}
         held = _record_class(member)
         if held is not None:
             given = _declared(held, given, dtypes=True)
+        elif not isinstance(member, type):
+            given = _arguments(member, given, dtypes=True)
         return member(**given)
 
     def from_record(self, record: Mapping[str, object]) -> Built:
@@ -465,7 +471,8 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
     run record alike. A registered member is the record that names it,
     `{"name": ..., "fields": {...}}` (`to_record` writes it), where
     the field declares the table's members or a class the member derives
-    from; a dataclass is the record of its fields. Containers are walked, so
+    from, or a function of a shared table declared to return such a class;
+    a dataclass is the record of its fields. Containers are walked, so
     a mapping of records and a tuple of records build their values too, a
     JSON list becomes the tuple a field declares, and a mapping's key
     becomes the tuple path its key type declares. `dtypes` is as
@@ -500,12 +507,14 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
     if isinstance(value, Mapping):
         if isinstance(annotation, type) and annotation is not object:
             # A field typed with a base class takes a record of any shared
-            # member derived from it, or of the class itself; `object`
-            # declares nothing, and its record stays the record it is.
+            # member derived from it or returning it, or of the class itself;
+            # `object` declares nothing, and its record stays the record it is.
             member, fields = _nested(annotation, value)
             held = _record_class(member)
             if held is not None:
                 return _construct(held, fields, dtypes=dtypes)
+            if not isinstance(member, type):
+                return configured(member(**_arguments(member, fields, dtypes=dtypes)))
         if typing.get_origin(annotation) in _MAPPINGS:
             keys, entries = typing.get_args(annotation)
             return {_key(keys, str(name)): _rebuilt(entries, entry, dtypes=dtypes, name=str(name))
@@ -557,6 +566,57 @@ def _declared(member: type, fields: Mapping[str, object], *, dtypes: bool) -> di
             for name, value in fields.items()}
 
 
+def _arguments(function: Callable[..., Configured], fields: Mapping[str, object], *,
+               dtypes: bool) -> dict[str, Configured]:
+    """The record's fields as the parameters of the registered `function`,
+    each walked against its own annotation, as `_declared` walks a
+    dataclass's. A field the function does not take, or a parameter without
+    a default that the record lacks, raises; a function taking `**kwargs`
+    takes any field."""
+    parameters = inspect.signature(function).parameters.values()
+    named = [parameter for parameter in parameters
+             if parameter.kind in (parameter.POSITIONAL_OR_KEYWORD, parameter.KEYWORD_ONLY)]
+    names = sorted(parameter.name for parameter in named)
+    open_ended = any(parameter.kind is parameter.VAR_KEYWORD for parameter in parameters)
+    unknown = [] if open_ended else sorted(set(fields) - set(names))
+    missing = [parameter.name for parameter in named
+               if parameter.name not in fields and parameter.default is parameter.empty]
+    if unknown or missing:
+        raise ValueError(f"{function.__name__} does not match the record: unknown fields {unknown}, "
+                         f"missing fields {missing}; its parameters are {names}")
+    return {name: _rebuilt(_parameter_type(function, name), configured(value), dtypes=dtypes, name=name)
+            for name, value in fields.items()}
+
+
+def _parameter_type(function: Callable[..., Configured], name: str) -> Annotation:
+    """Resolve the annotation of one parameter of `function`, or its return
+    for `name="return"`, without evaluating the others. None where it has no
+    annotation. An annotation naming what the function's module does not
+    import at runtime raises, since a record cannot be read against it."""
+    # A classmethod registered as `table("name")(Class.reader)` is a bound
+    # method; its annotations and module are its function's.
+    underlying = function.__func__ if isinstance(function, types.MethodType) else function
+    if not isinstance(underlying, types.FunctionType):
+        return None
+    annotations = get_annotations(underlying, format=Format.FORWARDREF)
+    if name not in annotations:
+        return None
+    selected = types.SimpleNamespace(__annotations__={name: annotations[name]})
+    try:
+        return typing.get_type_hints(selected, globalns=dict(underlying.__globals__))[name]
+    except NameError as error:
+        raise ValueError(f"{function.__name__}'s annotation of {name} names what {underlying.__module__} "
+                         f"does not import at runtime ({error}); a record is read against it, so "
+                         f"import it there") from error
+
+
+def _returns(member: Callable[..., Configured], held: type) -> bool:
+    """Whether the function `member` is declared to return `held` or a class
+    derived from it."""
+    returned = _parameter_type(member, "return")
+    return isinstance(returned, type) and issubclass(returned, held)
+
+
 def _recorded(field: dataclasses.Field) -> bool:
     """Return whether a field is part of a record: one the constructor takes,
     not marked `metadata={"record": False}`."""
@@ -586,15 +646,19 @@ def _named(table: Registry, record: object) -> tuple[str, Mapping[str, object]]:
     return record["name"], record["fields"]
 
 
-def _nested(held: type, record: Mapping[str, object]) -> tuple[type, Mapping[str, object]]:
-    """The class and fields a record builds for a field typed `held`: the
-    shared member a name/fields record names, where that member is `held`
-    or derives from it, or else `held` and the record as its own fields."""
+def _nested(held: type,
+            record: Mapping[str, object]) -> tuple[Callable[..., Configured], Mapping[str, object]]:
+    """The member and fields a record builds for a field typed `held`: the
+    shared member a name/fields record names, where that member is `held`,
+    derives from it, or is a function declared to return it, or else `held`
+    and the record as its own fields."""
     if set(record) == {"name", "fields"} and isinstance(record["name"], str) and isinstance(
             record["fields"], Mapping):
         for table in Registry.shared():
             member = table.get(record["name"])
-            if isinstance(member, type) and issubclass(member, held):
+            if member is None:
+                continue
+            if issubclass(member, held) if isinstance(member, type) else _returns(member, held):
                 return member, record["fields"]
     return held, record
 
