@@ -47,7 +47,9 @@ def _gpt_neox_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
 
 
 def _gpt_neox_prepare(tensors: Mapping[str, np.ndarray],
-                       config: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
+                       config: Mapping[str, object] | None = None, *,
+                       attention_name: str = 'attention', interleaved: bool = True
+                       ) -> Mapping[str, np.ndarray]:
     if config is None:
         raise ValueError('GPT-NeoX fused qkv preparation requires translated num_heads and head_dim')
     heads = records.integer(config['num_heads'], 'num_heads')
@@ -76,14 +78,19 @@ def _gpt_neox_prepare(tensors: Mapping[str, np.ndarray],
                     f"{name} disagrees with the configured rotary frequencies in its stored dtype"
                 )
             continue
-        if '.attention.query_key_value.' not in name:
+        fused = f'{attention_name}.query_key_value'
+        if f'.{fused}.' not in name:
             prepared[name] = tensor
             continue
-        shape = (heads, 3, dimension, *tensor.shape[1:])
-        grouped = tensor.reshape(shape)
+        if interleaved:
+            grouped = tensor.reshape(heads, 3, dimension, *tensor.shape[1:])
+            pieces = [grouped[:, index].reshape(heads * dimension, *tensor.shape[1:])
+                      for index in range(3)]
+        else:
+            kv = records.integer(config['num_kv_heads'], 'num_kv_heads') * dimension
+            pieces = np.split(tensor, (heads * dimension, heads * dimension + kv), axis=0)
         for index, part in enumerate(('q_proj', 'k_proj', 'v_proj')):
-            prepared[name.replace('attention.query_key_value', f'self_attn.{part}')] = (
-                grouped[:, index].reshape(heads * dimension, *tensor.shape[1:]))
+            prepared[name.replace(fused, f'self_attn.{part}')] = pieces[index]
     return prepared
 
 
@@ -117,7 +124,8 @@ def _gpt_neox_export(model: CausalTransformer) -> Mapping[str, object]:
 
 
 def _gpt_neox_export_weights(model: CausalTransformer, variables: Mapping[str, object],
-                             config: Mapping[str, object]) -> LazyTensors:
+                             config: Mapping[str, object], *,
+                             attention_name: str = 'attention', interleaved: bool = True) -> LazyTensors:
     """The shared writer's tensors with each layer's q, k and v interleaved by
     head into `query_key_value`, the inverse of `_gpt_neox_prepare`."""
     tensors = _decoder_tensors(model, variables, config)
@@ -125,18 +133,21 @@ def _gpt_neox_export_weights(model: CausalTransformer, variables: Mapping[str, o
     for name in tensors:
         stem, found, leaf = name.partition('.self_attn.q_proj.')
         if found:
-            fused[f'{stem}.attention.query_key_value.{leaf}'] = tuple(
+            fused[f'{stem}.{attention_name}.query_key_value.{leaf}'] = tuple(
                 f'{stem}.self_attn.{part}.{leaf}' for part in ('q_proj', 'k_proj', 'v_proj'))
     parts = {part for names in fused.values() for part in names}
     specs = {name: spec for name, spec in tensors.specs.items() if name not in parts}
     for name, (query, *_) in fused.items():
         spec = tensors.specs[query]
-        specs[name] = jax.ShapeDtypeStruct((3 * spec.shape[0], *spec.shape[1:]), spec.dtype)
+        specs[name] = jax.ShapeDtypeStruct((sum(tensors.specs[part].shape[0] for part in fused[name]),
+                                           *spec.shape[1:]), spec.dtype)
 
     def build(name: str) -> np.ndarray:
         if name not in fused:
             return tensors[name]
         values = [tensors[part] for part in fused[name]]
+        if not interleaved:
+            return np.concatenate(values, axis=0)
         grouped = np.stack([value.reshape(model.num_heads, model.features_per_head, *value.shape[1:])
                             for value in values], axis=1)
         return grouped.reshape(3 * values[0].shape[0], *values[0].shape[1:])

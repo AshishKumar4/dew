@@ -40,6 +40,142 @@
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
+  "hf/bloom-tiny/logits.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/bloom-tiny/logits_f64.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/bloom-tiny/padded_logits.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/bloom-tiny/padded_logits_f64.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/bloom-tiny/generated.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/gpt-neo-tiny/logits.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/gpt-neo-tiny/logits_f64.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/gpt-neo-tiny/padded_logits.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/gpt-neo-tiny/padded_logits_f64.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/gpt-neo-tiny/generated.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/phi-tiny/losses.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/phi-tiny/losses_f64.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/phi-tiny/logits.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/phi-tiny/logits_f64.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/phi-tiny/padded_logits.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/phi-tiny/padded_logits_f64.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/phi-tiny/generated.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/falcon-tiny/logits.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/falcon-tiny/logits_f64.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/falcon-tiny/padded_logits.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/falcon-tiny/padded_logits_f64.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/falcon-tiny/generated.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/falcon-mha-tiny/logits.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/falcon-mha-tiny/logits_f64.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/falcon-mha-tiny/padded_logits.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/falcon-mha-tiny/padded_logits_f64.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/falcon-mha-tiny/generated.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/gptj-tiny/losses.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/gptj-tiny/losses_f64.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/gptj-tiny/logits.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/gptj-tiny/logits_f64.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/gptj-tiny/padded_logits.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/gptj-tiny/padded_logits_f64.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/gptj-tiny/generated.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
   "hf/minimax-m2-fp8-tiny": {
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.18.0", "runs": "transformers"}],
@@ -3483,6 +3619,26 @@
    "files": ["hf/phi3-tiny/model.safetensors", "hf/phi3-tiny/input_ids.npy", "hf/phi3-tiny/padded_ids.npy", "hf/phi3-tiny/attention_mask.npy"]
   },
   {
+   "tool": "tools/hf_reference.py",
+   "what": "GPT-Neo weights, probe token ids and padded validity masks",
+   "files": ["hf/gpt-neo-tiny/model.safetensors", "hf/gpt-neo-tiny/input_ids.npy", "hf/gpt-neo-tiny/padded_ids.npy", "hf/gpt-neo-tiny/attention_mask.npy"]
+  },
+  {
+   "tool": "tools/hf_reference.py",
+   "what": "Phi weights, probe token ids and padded validity masks",
+   "files": ["hf/phi-tiny/model.safetensors", "hf/phi-tiny/input_ids.npy", "hf/phi-tiny/padded_ids.npy", "hf/phi-tiny/attention_mask.npy"]
+  },
+  {
+   "tool": "tools/hf_reference.py",
+   "what": "Falcon MQA/MHA weights, probe token ids and padded validity masks",
+   "files": ["hf/falcon-tiny/model.safetensors", "hf/falcon-tiny/input_ids.npy", "hf/falcon-tiny/padded_ids.npy", "hf/falcon-tiny/attention_mask.npy", "hf/falcon-mha-tiny/model.safetensors", "hf/falcon-mha-tiny/input_ids.npy", "hf/falcon-mha-tiny/padded_ids.npy", "hf/falcon-mha-tiny/attention_mask.npy"]
+  },
+  {
+   "tool": "tools/hf_reference.py",
+   "what": "GPT-J weights, probe token ids and padded validity masks",
+   "files": ["hf/gptj-tiny/model.safetensors", "hf/gptj-tiny/input_ids.npy", "hf/gptj-tiny/padded_ids.npy", "hf/gptj-tiny/attention_mask.npy"]
+  },
+  {
    "tool": "tools/laya_reference.py",
    "what": "a toy Laya checkpoint in Laya's own layout, its encoder, head and tokenizer",
    "files": ["laya/tiny/model.safetensors"]
@@ -3512,6 +3668,11 @@
    "tool": "tools/nvfp4_qdq_reference.py",
    "what": "tiny NVFP4 checkpoints with calibrated local input quantizers",
    "files": ["codecs/nvfp4_qdq/unrounded/model.safetensors", "codecs/nvfp4_qdq/e4m3/model.safetensors"]
+  },
+  {
+   "tool": "tools/hf_reference.py",
+   "what": "the BLOOM weights, token ids and validity masks its references read",
+   "files": ["hf/bloom-tiny/model.safetensors", "hf/bloom-tiny/input_ids.npy", "hf/bloom-tiny/padded_ids.npy", "hf/bloom-tiny/attention_mask.npy"]
   },
   {
    "tool": "tools/audio_reference.py",

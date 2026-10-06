@@ -148,11 +148,12 @@ def test_a_refusal_names_every_family_it_was_tried_as(tmp_path):
 
 
 def test_a_config_without_the_shared_size_names_is_refused_by_name():
-    """OPT's reader defaults every size, so it takes BLOOM's config, which
-    names its sizes n_embed and n_head; the probe cannot shrink it."""
-    bloom = {"model_type": "bloom", "n_embed": 64, "n_head": 4, "n_layer": 2, "vocab_size": 256}
-    with pytest.raises(ValueError, match=r"reads as opt's but states no 'num_attention_heads'") as refused:
-        verify_mapping(bloom)
+    """Defaulted readers cannot probe a config lacking the shared size names."""
+    legacy = {"model_type": "openai-gpt", "n_embd": 64, "n_head": 4, "n_layer": 2, "vocab_size": 256}
+    reason = r"states no 'num_attention_heads', by which the probe shrinks it"
+    with pytest.raises(ValueError, match=reason) as refused:
+        verify_mapping(legacy)
+    assert 'model_type \'openai-gpt\'' in str(refused.value)
     assert TORCHAX in str(refused.value)
 
 
