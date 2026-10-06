@@ -10,17 +10,15 @@ const START_MS = 180_000;
 export class LiveKernel extends DurableObject<Env> {
 	async image(): Promise<string | null> {
 		const registry = this.env.SNAPSHOTS.get(this.env.SNAPSHOTS.idFromName('global'));
+		const pool = this.env.POOL.get(this.env.POOL.idFromName('global'));
 		const current = await registry.ensure(this.env.SNAPSHOT_COMMIT);
 		if (current.generation) {
-			const id = current.generation.snapshot.id;
-			await this.env.SHARED.get(this.env.SHARED.idFromName(id)).configure(current.generation);
-			return id;
+			await pool.configure(current.generation);
+		} else if (!(await pool.status()).generation) {
+			const previous = await registry.previous();
+			if (previous) await pool.configure(previous);
 		}
-		const previous = await registry.previous();
-		if (previous && await this.env.SHARED.get(this.env.SHARED.idFromName(previous.snapshot.id)).available()) {
-			return previous.snapshot.id;
-		}
-		return null;
+		return pool.image();
 	}
 
 	async warm(session: string): Promise<void> {
@@ -45,27 +43,31 @@ export class LiveKernel extends DurableObject<Env> {
 
 	private async ensureRunning(session: string): Promise<string> {
 		let image = await this.ctx.storage.get<string>('image');
+		let host = await this.ctx.storage.get<string>('host');
 		if (!image) {
 			image = (await this.image()) ?? undefined;
 			if (!image) throw new Error('the shared model is warming up; try again in a minute');
+			host = await this.env.POOL.get(this.env.POOL.idFromName('global')).allocate(session, image);
 			const started = Date.now();
-			await this.ctx.storage.put({ image, started });
+			await this.ctx.storage.put({ image, host, started });
 			await this.ctx.storage.setAlarm(started + WATCH_MS);
 			if (!(await coordinatorOf(this.env).started(session, started, image))) {
 				await this.expire();
 				throw new Error('this session is over');
 			}
 		}
-		await this.env.SHARED.get(this.env.SHARED.idFromName(image)).allocate(session);
-		return image;
+		host ??= image;
+		await this.env.SHARED.get(this.env.SHARED.idFromName(host)).allocate(session);
+		return host;
 	}
 
 	override async alarm(): Promise<void> {
 		const started = (await this.ctx.storage.get<number>('started')) ?? 0;
 		const { wallSeconds, warmSeconds } = limitsOf(this.env);
 		const image = await this.ctx.storage.get<string>('image');
+		const hostId = (await this.ctx.storage.get<string>('host')) ?? image;
 		const session = await this.ctx.storage.get<string>('session');
-		const host = image ? this.env.SHARED.get(this.env.SHARED.idFromName(image)) : undefined;
+		const host = hostId ? this.env.SHARED.get(this.env.SHARED.idFromName(hostId)) : undefined;
 		const overdue = Date.now() > started + (wallSeconds + warmSeconds + 15) * 1000;
 		const booting = Date.now() < started + START_MS;
 		if (!overdue && (booting || session && await host?.has(session))) {
@@ -79,7 +81,12 @@ export class LiveKernel extends DurableObject<Env> {
 	async expire(): Promise<void> {
 		await this.ctx.storage.put('ended', true);
 		const image = await this.ctx.storage.get<string>('image');
+		const host = (await this.ctx.storage.get<string>('host')) ?? image;
 		const session = await this.ctx.storage.get<string>('session');
-		if (image && session) await this.env.SHARED.get(this.env.SHARED.idFromName(image)).close(session);
+		try {
+			if (host && session) await this.env.SHARED.get(this.env.SHARED.idFromName(host)).close(session);
+		} finally {
+			if (session) await this.env.POOL.get(this.env.POOL.idFromName('global')).release(session);
+		}
 	}
 }
