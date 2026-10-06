@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Self
+from typing import TYPE_CHECKING, Protocol, Self, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -12,13 +12,25 @@ from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.backbones.causal_transformer import CausalTransformer, DecoderBank
-from dew.nn.protocols import HardVocabularyEmbedder, OutputTable, ProjectionGroup
+from dew.nn.protocols import OutputTable, ProjectionGroup
 from dew.nn.vision import Gemma3nVision, ProjectorBase, TowerBase
 from dew.registry import models
 
 if TYPE_CHECKING:
+    from dew.nn.hyper_connections import HyperConnections
     from dew.nn.mla import MLAMixer
     from dew.records import JSON
+
+
+@runtime_checkable
+class HardVocabularyEmbedder(Protocol):
+    """A media embedder that also embeds a range of the text vocabulary, the
+    hard tokens the decoder's own table does not hold, as Gemma 3n's vision
+    and audio embedders do (modeling_gemma3n.py, Gemma3nMultimodalEmbedder)."""
+
+    def embed_hard(self, ids: jax.Array) -> jax.Array: ...
+
+    def merge_hard_embeddings(self, token_embeddings: jax.Array, ids: jax.Array) -> jax.Array: ...
 
 
 @struct.dataclass
@@ -429,10 +441,6 @@ class MultimodalTransformer(nn.Module):
         """The decoder's vocabulary bias, for the same affine head its forward scores."""
         return self.language_model.vocabulary_bias(params['language_model'])
 
-    def head_table(self, params):
-        """Return the decoder's head as its tree stores it, and whether its rows are the vocabulary."""
-        return self.language_model.head_table(params["language_model"])
-
     def output_table(self) -> OutputTable | None:
         """Return the decoder's head as the matrix its final states contract,
         or None where none does (`CausalTransformer.output_table`)."""
@@ -444,40 +452,29 @@ class MultimodalTransformer(nn.Module):
         self.variable("cache", "next_position", jnp.zeros, (batch_size,), jnp.int32)
         self.language_model.init_cache(batch_size)
 
-    # What a task, a server and the trainer read off the model, answered by
-    # its language model (`dew.nn.protocols`). A clone keeps the towers, and
-    # every variable keeps its path.
+    # The serving and training hooks (`dew.nn.protocols`), its language
+    # model's; a clone keeps the towers and every variable's path.
 
     @nn.nowrap
     def with_cache_capacity(self, capacity: int) -> Self:
-        """This model with its language model's cache at `capacity` slots
-        (`CacheCapacity`): the wrapper's own `max_seq_len` is the language
-        model's, and Qwen3.5-0.8B served at 384 slots held caches of 8192 when
-        only the wrapper was asked."""
         return self.clone(language_model=self.language_model.with_cache_capacity(capacity))
 
     @nn.nowrap
     def recompute_record(self) -> JSON:
-        """Its language model's rung (`Recomputing`); the towers keep their own remat."""
         return self.language_model.recompute_record()
 
     @nn.nowrap
     def recompute_more(self) -> Self | None:
-        """This model with its language model one rung up (`Recomputing`), or None at its top."""
         language_model = self.language_model.recompute_more()
         return None if language_model is None else self.clone(language_model=language_model)
 
     @nn.nowrap
     def restore_recompute(self, record: JSON) -> Self:
-        """This model with its language model at `record`'s rung where that is
-        above its own (`Recomputing`)."""
         return self.clone(language_model=self.language_model.restore_recompute(record))
 
     @nn.nowrap
     def inference_projection_groups(self, variables: Mapping[str, Mapping]) -> tuple[ProjectionGroup, ...]:
-        """Its language model's packed groups at their paths in this model's
-        variables (`PackedProjections`); the towers run once per prefill and
-        keep their layout."""
+        """The towers run once per prefill and keep their layout."""
         text = {collection: tree["language_model"] for collection, tree in variables.items()
                 if "language_model" in tree}
         return tuple(dataclasses.replace(group, path=("language_model", *group.path))
@@ -485,17 +482,21 @@ class MultimodalTransformer(nn.Module):
 
     @property
     def cache_rebuild_position(self) -> int | None:
-        """Its language model's (`CacheRebuilding`)."""
         return self.language_model.cache_rebuild_position
+
+    def mixed_admission_refusal(self) -> str | None:
+        return "media fuse into a prefill's embeddings, which a mixed call does not carry"
+
+    @property
+    def mtp_hyper_connections(self) -> HyperConnections | None:
+        return self.language_model.mtp_hyper_connections
 
     @property
     def indexed_mixers(self) -> tuple[MLAMixer, ...]:
-        """Its language model's (`Indexed`)."""
         return self.language_model.indexed_mixers
 
     @property
     def keeps_triton_gemm(self) -> bool:
-        """Its language model's (`TritonGemm`)."""
         return self.language_model.keeps_triton_gemm
 
 

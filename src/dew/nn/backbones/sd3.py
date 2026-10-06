@@ -93,6 +93,11 @@ class SD3Transformer(nn.Module):
     def features(self) -> int:
         return self.heads * self.head_dim
 
+    @property
+    def text_keyword(self) -> str:
+        """Every call takes the text as `conditioning`, a stream beside the image in the joint blocks."""
+        return "conditioning"
+
     def position(self, height: int, width: int):
         """Return the stored position buffer, cropped centred on a `height` by `width` patch grid.
 
