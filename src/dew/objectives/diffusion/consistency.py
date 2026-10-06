@@ -40,7 +40,7 @@ from dew.nn.attention import forward_mode_attention
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.protocols import TimeScaled
 from dew.objectives.base import Aux, EMASpec, ProgramModule, Step, Variables
-from dew.registry import objectives, trainings
+from dew.registry import models, objectives, trainings
 from dew.sampling.solvers import Consistency
 
 from .few_step import SMOOTH_TIME_SCALE
@@ -254,14 +254,14 @@ class ConsistencyDistillation(Training):
     def objective(self, run: DiffusionRunConfig, model: nn.Module, process: Process, inputs: InputSpec, *,
                   base: nn.Module, autoencoder: AutoEncoder | None,
                   variables: Variables | None) -> ConsistencyDistillationObjective:
-        self.check_teacher(autoencoder)
+        self.check_teacher()
         return ConsistencyDistillationObjective(
             model, process, inputs, self, teacher=base,
             teacher_variables=teacher_variables(self.teacher, variables), autoencoder=autoencoder,
             variables=variables, ema_decay=run.ema_decay, solver=run.solver, guidance=None,
             steps=run.sampling_steps)
 
-    def check_teacher(self, autoencoder: AutoEncoder | None) -> None:
+    def check_teacher(self) -> None:
         """Refuse sCM from a teacher whose time features turn too fast to differentiate in time.
 
         The student starts from the teacher's variables, its Fourier table included, and
@@ -276,8 +276,8 @@ class ConsistencyDistillation(Training):
         teacher = DiffusionRunConfig.load(self.teacher)
         if teacher.pretrained is not None:  # a pipeline's denoiser is its source's, not `model`'s
             return
-        model = teacher.scratch_model(autoencoder)
-        if isinstance(model, TimeScaled) and not abs(model.time_scale) <= SMOOTH_TIME_SCALE:
+        model = models.build(teacher.model.architecture, teacher.model_fields(None))
+        if isinstance(model, TimeScaled) and abs(model.time_scale) > SMOOTH_TIME_SCALE:
             raise ValueError(f"sCM differentiates the student in time, and its teacher's time features turn "
                              f"at time_scale={model.time_scale}, faster than {SMOOTH_TIME_SCALE}; train the "
                              f"teacher at time_scale={SMOOTH_TIME_SCALE}, or distill with dmd only "
