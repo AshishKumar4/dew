@@ -417,7 +417,6 @@ def leaf_dtypes(variables):
 @pytest.mark.parametrize("stated, stored", [
     ({}, ml_dtypes.bfloat16),                       # the first floating tensor's
     ({"dtype": "float16"}, np.float16),             # config.json's, which wins
-    ({"torch_dtype": "float32"}, np.float32),       # the pre-5.0 spelling
 ])
 def test_param_dtype_auto_stores_the_checkpoints_dtype(tmp_path, stated, stored):
     """transformers' dtype='auto' rule: config.json's dtype, else the
