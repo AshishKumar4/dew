@@ -571,7 +571,7 @@ def test_a_record_rebuilds_each_field_as_its_annotation_asks():
 def test_a_val_metric_no_registry_knows_is_refused():
     """`val_metrics` names the metrics registry, so an unknown name is
     refused where it is written, with the registered names in the message."""
-    with pytest.raises(ValueError, match=r"\['fid_score'\].*'clip', 'clip_score', 'fid'"):
+    with pytest.raises(ValueError, match=r"\['fid_score'\].*'clip', 'clip_score',.* 'fid'"):
         replace(unet_run(JSON_UNET), val_metrics=("fid_score",))
 
     for name in sorted(metrics):
