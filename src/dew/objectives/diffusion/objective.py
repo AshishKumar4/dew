@@ -103,13 +103,13 @@ def _own_loss(name: str, kwargs: dict) -> None:
     kwargs.setdefault("guidance", None)
 
 
-def _from_teacher(variables: Variables, teacher: Variables) -> dict[str, Any]:
+def _from_teacher(variables: Variables, teacher: Variables) -> Variables:
     """`variables` with the model's leaves copied from `teacher`'s, in buffers the step may donate, the
     weights under `FROZEN` in an adapter's split, which freezes all but its factors."""
     copied = dict(jax.tree.map(jnp.copy, dict(teacher)))
     if FROZEN in variables:
         copied[FROZEN] = copied.pop("params")
-    return dict(merge(variables, copied))
+    return merge(variables, copied)
 
 
 def _without_loss_heads(variables: Variables) -> Variables:

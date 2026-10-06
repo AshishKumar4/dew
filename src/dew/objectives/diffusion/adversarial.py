@@ -328,7 +328,7 @@ class AdversarialDistillationObjective(DiffusionObjective):
         if DISCRIMINATOR in state["params"]:
             return state
         teacher = state[TEACHER]
-        state = _from_teacher(state, teacher)
+        state = dict(_from_teacher(state, teacher))
         given = jax.tree.map(lambda value: value[:1], self.unconditional_conditions)
         x = jnp.zeros((1, *self.latent_shape))
         features = jax.eval_shape(lambda: self._features(teacher, x, jnp.ones((1,)), given))
