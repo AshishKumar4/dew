@@ -36,6 +36,102 @@ from dew.objectives.lm.chunked import chunked_cross_entropy, vocabulary_chunks
 CHUNKS = [1, 2, 4, 8]
 
 
+@pytest.mark.parametrize('dtype', [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize('tied', [False, True])
+def test_vocabulary_bias_is_fp32_after_tied_or_untied_head_products(dtype, tied):
+    """FP32 params keep their vocabulary bias outside the bf16 product."""
+    model = CausalTransformer(vocab_size=97, emb_features=24, num_layers=1, num_heads=3,
+                              mlp_features=32, max_seq_len=8, head_bias=True,
+                              tie_embeddings=tied, dtype=dtype, qk_norm=False,
+                              attention_impl='reference')
+    ids = jnp.asarray([[2, 7, 3], [11, 4, 9]], jnp.int32)
+    variables = model.init(jax.random.key(0), ids)
+    bias = jax.random.normal(jax.random.key(3), (97,), jnp.float32) / 17
+    variables['params']['head_bias'] = bias
+    with jax.default_matmul_precision('default'):
+        logits = model.apply(variables, ids)
+        states = model.apply(variables, ids, method='hidden_states')
+        matrix = model.apply(variables, variables['params'], method='head_weight')
+        stored, vocab_major = model.apply(variables, variables['params'], method='head_table')
+        actual = chunked.head_logits(states, stored, softcap=None, precision=None,
+                                     vocab_major=vocab_major, bias=bias)
+        np.testing.assert_array_equal(actual, logits)
+        for tile in (None, (2, 11)):
+            losses, predicted, _ = chunked_cross_entropy(states, matrix, ids, 4, tile=tile, bias=bias)
+            expected = optax.softmax_cross_entropy_with_integer_labels(logits, ids)
+            assert jnp.abs(losses - expected).max() <= 1e-5 * jnp.abs(expected).max()
+            np.testing.assert_array_equal(predicted, logits.argmax(-1))
+    assert variables['params']['head_bias'].dtype == jnp.float32
+    assert not np.array_equal(np.asarray(bias), np.asarray(bias.astype(jnp.bfloat16), np.float32))
+
+
+@pytest.mark.parametrize('dtype', [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize('tile', [None, (3, 11)], ids=['whole', 'tiled'])
+def test_vocabulary_bias_gradient_matches_full_logits_under_the_float64_rule(dtype, tile):
+    from reference_error import assert_as_exact_as_the_reference
+
+    from dew.nn.precision import head_product
+
+    states, matrix, targets = inputs(vocab=37, features=16, tokens=(2, 5), dtype=dtype)
+    bias = jax.random.normal(jax.random.key(3), (37,), jnp.float32) / 17
+    with jax.default_matmul_precision('default'):
+        def full(offset):
+            logits = chunked.head_logits(states, matrix, softcap=None, precision=None, bias=offset)
+            return optax.softmax_cross_entropy_with_integer_labels(logits, targets).mean()
+
+        def bounded(offset):
+            return chunked_cross_entropy(states, matrix, targets, 4, tile=tile, bias=offset)[0].mean()
+
+        reference = jax.grad(full)(bias)
+        actual = jax.grad(bounded)(bias)
+        product = head_product('...d,dv->...v', states, matrix, None)
+        with jax.enable_x64(new_val=True):
+            # For bf16 the rounded product is exact input to the affine
+            # head: this oracle isolates its fp32 bias and softmax gradient.
+            if dtype == jnp.float32:
+                product = jnp.einsum('...d,dv->...v', states.astype(jnp.float64),
+                                     matrix.astype(jnp.float64), precision=jax.lax.Precision.HIGHEST)
+            wide = product.astype(jnp.float64)
+
+            def truth(offset):
+                return optax.softmax_cross_entropy_with_integer_labels(wide + offset, targets).mean()
+
+            exact = jax.grad(truth)(bias.astype(jnp.float64))
+    assert_as_exact_as_the_reference(actual, reference, exact, f'{dtype} vocabulary bias gradient')
+
+
+def test_vocabulary_bias_reference_catches_rounding_the_offset_into_the_product(monkeypatch):
+    real = chunked._biased_logits
+    monkeypatch.setattr(chunked, '_biased_logits', lambda logits, bias: real(
+        logits, None if bias is None else bias.astype(jnp.bfloat16).astype(jnp.float32)))
+    with pytest.raises(AssertionError):
+        test_vocabulary_bias_is_fp32_after_tied_or_untied_head_products(jnp.bfloat16, tied=True)
+
+
+@pytest.mark.mesh(devices=2)
+def test_vocabulary_split_slices_the_bias_with_its_table_columns():
+    from dew.objectives.lm import LMObjective
+    from dew.training import Layout, MeshSpec
+    from dew.training.distributed import shard_batch
+
+    model = CausalTransformer(vocab_size=128, emb_features=8, num_layers=1, num_heads=2,
+                              mlp_features=16, max_seq_len=4, head_bias=True,
+                              qk_norm=False, attention_impl='reference')
+    tokens = jnp.arange(20, dtype=jnp.int32).reshape(4, 5)
+    variables = model.init(jax.random.key(0), tokens[:, :-1])
+    variables['params']['head_bias'] = variables['params']['head_bias'].at[117].set(13.027)
+    objective = LMObjective(model, seq_len=4, variables=variables, head_chunks=4,
+                            head_tile=(2, 11), ema_decay=None)
+    expected = objective.token_scores(variables, tokens)
+    mesh = MeshSpec(fsdp=2).build(jax.devices()[:2])
+    shardings = Layout(min_shard=1).shardings(mesh, variables)
+    with jax.set_mesh(mesh):
+        actual = jax.jit(objective.token_scores)(
+            jax.device_put(variables, shardings), shard_batch(mesh, {'text': np.asarray(tokens)})['text'])
+    assert jnp.abs(actual.losses - expected.losses).max() <= 1e-5 * jnp.abs(expected.losses).max()
+    np.testing.assert_array_equal(actual.correct, expected.correct)
+
+
 def reference(hidden, head, targets, softcap=None):
     """The full-vocabulary path: one big logits tensor, optax's cross entropy.
     bf16 states are bf16 compute, which multiplies the head rounded to bf16
@@ -198,9 +294,9 @@ def mutating_chunk_terms(monkeypatch, mutate):
     original = chunked._chunk_terms
 
     def mutated(hidden, head_chunk, targets, start, stop, softcap, precision, predict, temperature,
-                excluded):
+                excluded, bias=None):
         terms = original(hidden, head_chunk, targets, start, stop, softcap,
-                         precision, predict, temperature, excluded)
+                         precision, predict, temperature, excluded, bias)
         return mutate(terms, start, stop)
 
     monkeypatch.setattr(chunked, "_chunk_terms", mutated)

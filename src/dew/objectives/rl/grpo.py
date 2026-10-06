@@ -355,6 +355,7 @@ class GRPOObjective(LMObjective):
                                 method=type(self.model).head_weight)
         losses, predicted, _ = chunked_cross_entropy(
             hidden, head, aligned[:, 1:], self.head_chunks,
+            bias=self._head_bias(params),
             softcap=self.model.final_logit_softcap,
             precision=self.model.precision, predict=True)
         assert predicted is not None

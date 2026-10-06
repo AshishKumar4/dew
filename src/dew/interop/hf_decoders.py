@@ -1419,6 +1419,8 @@ def _param_path(parts: list[str], config: Mapping[str, object]) -> tuple[str, ..
         return ('hc_head', parts[2])
     if parts == ['lm_head', 'weight']:
         return None if config['tie_embeddings'] else ('lm_head', 'kernel')
+    if parts == ['lm_head', 'bias']:
+        return ('head_bias',)
 
     if len(parts) >= 4 and parts[:2] == ['model', 'layers'] and parts[2].isdigit():
         path = _layer_param_path(parts, config)
@@ -1629,7 +1631,7 @@ def translate_weights(
         if path is None or name in copies:
             continue
         stored = np.asarray(tensor)
-        dtype = checkpoint_dtype(stored.dtype, param_dtype if path[0] == "params" else "float32")
+        dtype = checkpoint_dtype(stored.dtype, param_dtype if path[0] == "params" else "float32", path=path)
         # torch Linear holds [out, in]; a stacked expert kernel arrives
         # [E, in, out], which is the layout dew keeps.
         insert(
@@ -1881,7 +1883,7 @@ def _export_config(model) -> Mapping[str, object]:
     # reads the field without passing it on). A checkpoint written under a
     # family that would drop the dial is refused naming it.
     if (model.o_proj_bias is not None and model.o_proj_bias != model.attention_bias
-            and family.export_model_type not in ('qwen2', 'dream')):
+            and family.export_model_type not in ('qwen2', 'dream', 'gpt_neo')):
         raise ValueError(
                 "o_proj_bias differs from attention_bias, which only the qwen2 "
                 "and dream references build, so the model cannot be written as "
@@ -2025,6 +2027,8 @@ def _hf_name(dew_name: str, config: Mapping[str, object]) -> str | None:
         return _TRUNK_NAMES[tuple(parts)]
     if parts == ['lm_head', 'kernel']:
         return None if config['tie_word_embeddings'] else 'lm_head.weight'
+    if parts == ['head_bias']:
+        return 'lm_head.bias'
 
     if parts[0].startswith('layers_'):
         index = parts[0].removeprefix('layers_')

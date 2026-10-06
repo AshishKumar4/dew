@@ -207,7 +207,7 @@ class Decide:
         `dew.pipeline` read the calibration back for that checkpoint. The file is
         written whole or not at all.
         """
-        from dew.config import _to_json
+        from dew.registry import to_record
 
         if self.weights is None:
             raise ValueError("this task's weights came from no run checkpoint, so a run has no "
@@ -215,9 +215,9 @@ class Decide:
         target = epath.Path(directory) / TASK_FILE
         written = target.parent / f"{TASK_FILE}.tmp"
         written.write_text(json.dumps({
-            "weights": _to_json(self.weights, Weights),
-            "calibration": _to_json(self.calibration, Calibration),
-            "budget": _to_json(self.budget, Budget), "name": self.name}, indent=1) + "\n")
+            "weights": to_record(self.weights, Weights),
+            "calibration": to_record(self.calibration, Calibration),
+            "budget": to_record(self.budget, Budget), "name": self.name}, indent=1) + "\n")
         written.replace(target)
 
     def __call__(self, state: JSON, questions: Mapping[str, Question]) -> dict[str, Answer]:
