@@ -47,7 +47,7 @@ export class SnapshotRegistry extends DurableObject<SnapshotEnv> {
 	}
 
 	async refresh(commit: string, now = Date.now()): Promise<{ rebuilding: boolean; generation: SnapshotGeneration | null }> {
-		if (!/^[0-9a-f]{40}$/.test(commit)) throw new Error('snapshot commit must be pinned');
+		if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(commit)) throw new Error('snapshot generation must be pinned');
 		const token = crypto.randomUUID();
 		const acquired = await this.ctx.storage.transaction(async (storage) => {
 			const lease = await storage.get<{ token: string; until: number }>('rebuild');
