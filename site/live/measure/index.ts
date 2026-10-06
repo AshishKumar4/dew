@@ -39,25 +39,40 @@ export class GatewayLab extends DurableObject<Env> {
 				'if mount -t tmpfs -o size=1m,nosuid,nodev tmpfs /sessions/ipc-probe; then ' +
 				'echo parent_tmpfs_supported; umount /sessions/ipc-probe; else echo parent_tmpfs_refused; fi']);
 			const capabilities = await capability.output();
-			for (const name of ['guest_limits.py', 'guest_entry.py', 'gateway_manager.py', 'start-gateway.sh', 'benchmark_gateway.py']) {
+			for (const name of ['guest_limits.py', 'guest_entry.py', 'gateway_manager.py', 'start-gateway.sh', 'benchmark_gateway.py',
+				'model_service.py', 'model_client.py', 'progress.py', 'shared_bridge.py', 'kernel_outputs.py', 'start-shared.sh', 'smoke-shared.py']) {
 				stage = `copy ${name}`;
 				const source = await fetch(`https://raw.githubusercontent.com/AshishKumar4/dew/${this.env.SOURCE_COMMIT}/site/live/container/${name}`);
 				if (!source.ok || !source.body) throw new Error(`cannot read pinned ${name}`);
 				const copy = await container.exec(['sh', '-c', 'cat > "$1"', 'copy', `/opt/live/${name}`], { stdin: source.body });
 				if (await copy.exitCode !== 0) throw new Error(`cannot install ${name}`);
 			}
-			stage = 'gateway startup';
-			const launch = await container.exec(['sh', '-c', 'DEW_GUEST_TRACE=1 sh /opt/live/start-gateway.sh']);
-			const launched = await launch.output();
-			stage = 'kernel readiness';
-			const result = launched.exitCode !== 0 ? launched : await (await container.exec([
-				'/opt/venv/bin/python', '/opt/live/benchmark_gateway.py', count,
-			])).output();
-			const logs = await container.exec(['sh', '-c', 'tail -c 16000 /run/dew/gateway.log']);
-			const log = await logs.output();
-			return { stage: launched.exitCode === 0 ? 'kernel' : 'launch',
-				seconds: (Date.now() - started) / 1000, commit: this.env.SOURCE_COMMIT,
-				...this.decode(result), parentCapability: this.decode(capabilities), gatewayLog: this.decode(log).stdout };
+			stage = 'shared startup';
+			const secret = crypto.randomUUID();
+			const launch = await container.exec(['sh', '-c',
+				'nohup sh /opt/live/start-shared.sh > /run/dew/shared.log 2>&1 </dev/null &'],
+				{ env: { DEW_SHARED_SECRET: secret } });
+			if (await launch.exitCode !== 0) throw new Error('shared startup failed');
+			const deadline = Date.now() + 180_000;
+			for (;;) {
+				try { if ((await container.getTcpPort(8888).fetch('http://container/health')).ok) break; } catch {}
+				if (Date.now() > deadline) {
+					const logs = await (await container.exec(['sh', '-c', 'tail -c 8000 /run/dew/shared.log /run/dew/model.log /run/dew/gateway.log 2>/dev/null'])).output();
+					return { stage, ...this.decode(logs) };
+				}
+				await scheduler.wait(500);
+			}
+			stage = 'browser protocol';
+			const credential = new ReadableStream<Uint8Array>({ start(controller) {
+				controller.enqueue(new TextEncoder().encode(secret)); controller.close();
+			} });
+			const browser = await (await container.exec(['/opt/venv/bin/python', '/opt/live/smoke-shared.py'], { stdin: credential })).output();
+			if (browser.exitCode !== 0) return { stage, ...this.decode(browser) };
+			stage = 'native shared inference';
+			const result = await (await container.exec(['/opt/venv/bin/python', '/opt/live/benchmark_gateway.py', count])).output();
+			return { stage, seconds: (Date.now() - started) / 1000, commit: this.env.SOURCE_COMMIT,
+				...this.decode(result), parentCapability: this.decode(capabilities) };
+
 		} catch (error) {
 			return { stage, error: String(error), seconds: (Date.now() - started) / 1000 };
 		} finally {

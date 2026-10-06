@@ -102,7 +102,8 @@ def test_pixel_transport_does_not_reconstruct_floats_from_a_png(dtype):
     kind = ml_dtypes.bfloat16 if dtype == "bfloat16" else np.float32
     pixels = np.array([[[[0.00001, -0.234567, 0.99999]]]], kind)
     result = client.ImageResult({"pngs": [], "pixels": base64.b64encode(pixels.tobytes()).decode(),
-                                 "shape": list(pixels.shape), "dtype": dtype if dtype == "bfloat16" else pixels.dtype.str})
+                                 "shape": list(pixels.shape),
+                                 "dtype": dtype if dtype == "bfloat16" else pixels.dtype.str})
     np.testing.assert_array_equal(result.images, pixels)
 
 
