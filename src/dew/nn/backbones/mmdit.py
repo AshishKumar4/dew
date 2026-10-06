@@ -176,7 +176,7 @@ class SimpleMMDiT(_DiTStackOptions):
         """Every call takes the text as `textcontext`, which runs as a second stream through every block."""
         return "textcontext"
 
-    def __call__(self, x, temb, textcontext, train: bool = False):  # textcontext is required
+    def __call__(self, x, temb, textcontext, train: bool = False):
         _, H, W, _ = x.shape
 
         img, inv_idx = self.embed(x)
