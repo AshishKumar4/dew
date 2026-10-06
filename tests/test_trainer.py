@@ -191,7 +191,7 @@ def test_fit_trains_to_the_step_it_was_asked_for():
 def test_an_optim_config_is_built_over_the_updates_fit_makes():
     """Four steps of two microbatches are two updates: the run is the config built over two, bit
     for bit, not over four. Before fit there is no length to build it over."""
-    config = OptimConfig(schedule=Cosine(peak=0.1, warmup_steps=0), weight_decay=0.1)
+    config = OptimConfig(schedule=Cosine(peak=0.1, warmup_steps=0), weight_decay=0.1, b2=0.99)
     with pytest.raises(ValueError, match="fit"):
         make_trainer(optimizer=config).initial_state()
     built, over_two, over_four = (make_trainer(optimizer=given, accumulation=2).fit(Data(), steps=4).variables

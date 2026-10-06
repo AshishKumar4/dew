@@ -158,7 +158,7 @@ def build(args: argparse.Namespace) -> Run:
     # One group over every parameter, as torch_lm.py's AdamW decays the norms
     # and biases too.
     solver = OptimConfig(
-        optimizer="adamw", optimizer_opts={"b1": args.b1, "b2": args.b2, "eps": args.eps},
+        optimizer="adamw", b1=args.b1, b2=args.b2, optimizer_opts={"eps": args.eps},
         schedule=schedule, weight_decay=args.weight_decay, clip_grads=args.clip,
         param_groups=(ParamGroup("all", ("*",)),)).build(schedule_steps)
     devices = jax.device_count()

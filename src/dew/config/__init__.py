@@ -239,11 +239,17 @@ class OptimConfig:
     updates.
     """
     weight_decay: float | None = None
-    """The weight decay passed to the optimizer; for 'adam' it is torch's coupled L2
-    penalty, added to the gradient before the moments read it, for 'adamw' the
-    decoupled decay. It spares biases and vectors such as a norm's scale, timm's split for every
-    optimizer (`dew.training.optim.weight_decay_mask`); Muon decays them as Moonlight does, and
-    `param_groups` replace the split."""
+    """The weight decay passed to the optimizer, None keeping its own (adamw's 1e-4, the others'
+    0); for 'adam' it is torch's coupled L2 penalty, added to the gradient before the moments
+    read it, for 'adamw' the decoupled decay. Either decay, the default included, spares biases
+    and vectors such as a norm's scale, timm's split for every optimizer
+    (`dew.training.optim.weight_decay_mask`); Muon decays them as Moonlight does, and
+    `param_groups` replace the split. Records written before this change decayed every
+    parameter; ParamGroup('all', ('*',)) restores that."""
+    b1: float | None = None
+    """Adam's first-moment decay, for adam, adamw and lamb; None keeps the optimizer's."""
+    b2: float | None = None
+    """Adam's second-moment decay, for adam, adamw and lamb; None keeps the optimizer's."""
     param_groups: Annotated[tuple[ParamGroup, ...], record_argument(tuple[ParamGroup, ...])] = ()
     """Per-group learning rates, momentum schedules, weight decay and bounds; the first
     matching group wins.
@@ -285,8 +291,10 @@ class OptimConfig:
         """
         learning_rate = self.learning_rate if self.schedule is None else self.schedule.schedule(steps)
         opts = dict(self.optimizer_opts)
-        if self.weight_decay is not None:
-            opts['weight_decay'] = self.weight_decay
+        if {'b1', 'b2'} & opts.keys():
+            raise ValueError("b1 and b2 are fields of OptimConfig, not optimizer_opts")
+        given = {'b1': self.b1, 'b2': self.b2, 'weight_decay': self.weight_decay}
+        opts.update({name: value for name, value in given.items() if value is not None})
         make: Callable[..., optax.GradientTransformation] = OPTIMIZER_MAP[self.optimizer]
         if self.state_dtype == 'bfloat16':
             if self.optimizer not in BF16_STATE_OPTIMIZERS:

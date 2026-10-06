@@ -701,9 +701,9 @@ def test_bf16_state_takes_optax_adamw_steps_from_the_fp32_moments():
     to fp32 rounding; the second is optax's to the rounding of the bf16 state."""
     params = decoder_params()
     grads = jax.tree.map(lambda p: jax.random.normal(jax.random.key(1), p.shape) * 1e-2, params)
-    opts = {'nesterov': True, 'eps_root': 1e-8, 'b2': 0.99}
-    reference = optax.adamw(LR, weight_decay=0.0, **opts)
-    solver = bf16_state_adamw(optimizer_opts=opts)
+    opts = {'nesterov': True, 'eps_root': 1e-8}
+    reference = optax.adamw(LR, b2=0.99, weight_decay=0.0, **opts)
+    solver = bf16_state_adamw(b2=0.99, optimizer_opts=opts)
     expected_state, state = reference.init(params), solver.init(params)
     for rtol, atol in ((1e-6, 0.0), (1e-2, 1e-7)):
         expected, expected_state = reference.update(grads, expected_state, params)
@@ -737,15 +737,16 @@ def test_bf16_state_keeps_the_second_moments_small_increments():
 
 def test_lamb_is_optax_lamb_on_the_configs_schedule_options_and_clip():
     """`optimizer='lamb'` runs optax.lamb itself (`OPTIMIZER_MAP`), so what
-    Dew adds is the wiring: the config's schedule and
+    Dew adds is the wiring: the config's schedule, betas and
     `optimizer_opts` reach it, behind the global-norm clip. Three steps on
     changing gradients are bitwise the transform built from optax
     directly."""
     params = decoder_params()["params"]
     cosine = Cosine(peak=1e-2, warmup_steps=2, end=1e-3, init=1e-4)
-    opts = {"b1": 0.8, "b2": 0.95, "eps": 1e-5, "eps_root": 1e-9}
-    solver = OptimConfig(optimizer="lamb", optimizer_opts=opts, schedule=cosine, clip_grads=0.5).build(10)
-    reference = optax.chain(optax.clip_by_global_norm(0.5), optax.lamb(cosine.schedule(10), **opts))
+    betas, opts = {"b1": 0.8, "b2": 0.95}, {"eps": 1e-5, "eps_root": 1e-9}
+    solver = OptimConfig(optimizer="lamb", **betas, optimizer_opts=opts, schedule=cosine,
+                         clip_grads=0.5).build(10)
+    reference = optax.chain(optax.clip_by_global_norm(0.5), optax.lamb(cosine.schedule(10), **betas, **opts))
     state, expected_state = solver.init(params), reference.init(params)
     for step in range(3):
         grads = jax.tree.map(lambda grad, step=step: grad * (step + 1) * 0.3, fixed_gradients(params))
@@ -756,6 +757,10 @@ def test_lamb_is_optax_lamb_on_the_configs_schedule_options_and_clip():
         params = optax.apply_updates(params, updates)
 
 
-def test_bf16_state_is_refused_where_there_is_no_adam_moment():
+def test_an_option_the_optimizer_lacks_or_that_has_a_field_is_refused():
     with pytest.raises(ValueError, match="state_dtype"):
         OptimConfig(optimizer='lamb', state_dtype='bfloat16').build(10)
+    with pytest.raises(TypeError, match="b2"):
+        OptimConfig(optimizer='muon', b2=0.99).build(10)
+    with pytest.raises(ValueError, match="optimizer_opts"):
+        OptimConfig(optimizer_opts={'b2': 0.99}).build(10)
