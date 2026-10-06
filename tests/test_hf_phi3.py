@@ -67,6 +67,99 @@ def test_phi3_cache_rebuild_logits_match_uncached_transformers_on_both_sides_of_
     np.testing.assert_array_equal(actual.argmax(-1), generated[:, 4:])
 
 
+def test_phi3_long_request_does_not_change_a_short_rows_logits():
+    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference', max_seq_len=64)
+    ids = jnp.asarray(np.load(DIRECTORY / 'input_ids.npy')[:, :4], jnp.int32)
+    positions = jnp.stack((jnp.arange(12, 16), jnp.arange(4)))
+    together = loaded.model.apply(loaded.variables, ids, positions=positions)
+    uniform = loaded.model.apply(loaded.variables, ids, positions=jnp.stack((jnp.arange(4), jnp.arange(4))))
+    np.testing.assert_array_equal(together[1], uniform[1])
+
+
+def test_phi3_mixed_tables_match_each_rows_batch_one_reference_under_the_float64_rule():
+    from unittest.mock import patch
+
+    import torch
+    from transformers import AutoModelForCausalLM
+
+    from tools.diffusers_wan_reference import float64
+
+    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference', max_seq_len=64)
+    ids = np.load(DIRECTORY / 'input_ids.npy')[:, :4]
+    positions = np.stack((np.arange(12, 16), np.arange(4)))
+    actual = np.asarray(loaded.model.apply(loaded.variables, ids, positions=positions))
+    reference = AutoModelForCausalLM.from_pretrained(DIRECTORY, attn_implementation='eager').float().eval()
+
+    def rows(model):
+        return np.concatenate([
+            model(torch.from_numpy(ids[row:row + 1]).long(),
+                  position_ids=torch.from_numpy(positions[row:row + 1]).long(),
+                  use_cache=False).logits.detach().numpy() for row in range(2)], axis=0)
+
+    with torch.no_grad():
+        expected = rows(reference)
+    tensor = torch.tensor
+    with float64(), patch.object(torch, 'tensor', lambda *args, dtype=None, **kwargs: tensor(
+            *args, dtype=torch.float64 if dtype == torch.float32 else dtype, **kwargs)), torch.no_grad():
+        truth_model = AutoModelForCausalLM.from_config(
+            reference.config, dtype=torch.float64, attn_implementation='eager').eval()
+        truth_model.load_state_dict(reference.state_dict())
+        truth = rows(truth_model)
+    for row in range(2):
+        assert_as_exact_as_the_reference(actual[row], expected[row], truth[row], f'Phi-3 mixed row {row}')
+    np.testing.assert_array_equal(actual.argmax(-1), expected.argmax(-1))
+
+
+def test_phi3_dense_server_and_generate_share_the_per_row_crossing_rebuild():
+    from dew.inference import TextGeneration
+    from dew.inference.serving import Server
+    from dew.sampling import Sampling
+
+    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference', max_seq_len=64)
+    task = TextGeneration(loaded.model, loaded.variables, sampling=Sampling(temperature=0, eos_id=None))
+    ids = np.load(DIRECTORY / 'input_ids.npy').astype(np.int32)
+    prompts = (ids[0, :4], ids[1, :2])
+    server = Server.from_task(task, slots=2, capacity=64, admission=2)
+    assert server.mixed_refusal is not None and 'LongRoPE crossing position 8' in server.mixed_refusal
+    tickets = [server.submit(prompt, 8, key=index) for index, prompt in enumerate(prompts)]
+    server.run()
+    for index, (ticket, prompt) in enumerate(zip(tickets, prompts, strict=True)):
+        served = ticket.result().host()
+        alone = task(prompt[None], 8, key=index).host()
+        np.testing.assert_array_equal(served.tokens, alone.tokens)
+        np.testing.assert_array_equal(served.lengths, alone.lengths)
+
+
+@pytest.mark.parametrize('mode', ['paged', 'chunked', 'prefix'])
+def test_phi3_server_refuses_modes_that_cannot_rebuild_at_the_crossing(mode):
+    from dew.inference import TextGeneration
+    from dew.inference.serving import Server
+    from dew.nn.kv_cache import KVCache
+    from dew.sampling import Sampling
+
+    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference', max_seq_len=64)
+    task = TextGeneration(loaded.model, loaded.variables, sampling=Sampling(temperature=0))
+    options = ({'kv_cache': KVCache(page_size=16)} if mode == 'paged' else
+               {'chunk': 2} if mode == 'chunked' else {'prefix_cache': True})
+    with pytest.raises(ValueError, match=rf'LongRoPE crossing position 8.*{mode}'):
+        Server.from_task(task, slots=2, capacity=64, **options)
+
+
+def test_phi3_server_refuses_an_explicit_mixed_admission_mode():
+    from dataclasses import replace
+
+    from dew.inference.serving import DenseRows, Server
+    from dew.sampling import Sampling
+
+    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference', max_seq_len=64)
+    rows = DenseRows(1, None)
+    rows.placement = replace(rows.placement, mixed=True)
+    with pytest.raises(ValueError, match=r'LongRoPE crossing position 8.*mixed admission'):
+        Server(loaded.model, loaded.variables, None, sampling=Sampling(temperature=0),
+               transforms=(), stopping=(), grammar=None, rows=rows, slots=2, capacity=64,
+               admission=2, default_budget=8, decode_steps=1)
+
+
 def test_phi3_export_preserves_both_fusions_and_reads_in_transformers(tmp_path):
     import torch
     from transformers import AutoModelForCausalLM

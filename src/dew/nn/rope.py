@@ -92,9 +92,10 @@ class RopeScaling:
 class LongRopeScaling:
     """Phi-3's short/long inverse-frequency factors and cos/sin amplitude.
 
-    Transformers' `dynamic_rope_update` selects the long table when the
-    largest position of the call exceeds the original context. Cached keys
-    retain the table they were written with, including a crossing step.
+    Each row selects its table at its own largest position. This matches
+    transformers at batch one and on uniform batches, while independent
+    served requests cannot change one another's frequencies. Cached keys
+    retain their table until the shared decode operation rebuilds the row.
     """
 
     short_factor: tuple[float, ...]
@@ -167,14 +168,17 @@ def rotary_freqs(positions, head_dim: int, theta: float, rot_dim: int | None = N
         powers = _base_powers(theta, np.arange(0, 2 * pairs, 2, dtype=dtype) / divisor)
         short = 1.0 / (np.asarray(rope_scaling.short_factor, dtype=dtype) * powers)
         long = 1.0 / (np.asarray(rope_scaling.long_factor, dtype=dtype) * powers)
-        inv_freq = jnp.where(jnp.max(jnp.asarray(positions)) + 1
-                             > rope_scaling.original_max_position_embeddings, long, short)
+        rows = jnp.asarray(positions)
+        expanded = jnp.max(rows, axis=-1) + 1 > rope_scaling.original_max_position_embeddings
+        inv_freq = jnp.where(expanded[..., None], long, short)
+        if rows.ndim > 1:
+            inv_freq = inv_freq[..., None, :]
     elif rope_scaling is not None:
         inv_freq = rope_scaling.apply(inv_freq)
     if rot_dim is not None and partial_rotary_type == 'proportional':
         padding = head_dim // 2 - pairs
         if isinstance(rope_scaling, LongRopeScaling):
-            inv_freq = jnp.concatenate([inv_freq, jnp.zeros((padding,), inv_freq.dtype)])
+            inv_freq = jnp.pad(inv_freq, (*((0, 0),) * (inv_freq.ndim - 1), (0, padding)))
         else:
             inv_freq = np.concatenate([inv_freq, np.zeros((padding,), inv_freq.dtype)])
     angles = jnp.asarray(positions, inv_freq.dtype)[..., None] * inv_freq
