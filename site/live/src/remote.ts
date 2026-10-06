@@ -156,10 +156,14 @@ export class RemoteJob extends DurableObject<Env> {
 	override async alarm(): Promise<void> { await this.expire(); }
 }
 
-export async function remoteRun(request: Request, env: Env): Promise<Response> {
+export function operatorAuthorized(request: Request, env: Env): boolean {
 	const expected = new TextEncoder().encode(`Bearer ${env.RUNNER_SECRET}`);
 	const supplied = new TextEncoder().encode(request.headers.get('Authorization') ?? '');
-	if (!env.RUNNER_SECRET || expected.length !== supplied.length || !crypto.subtle.timingSafeEqual(expected, supplied)) {
+	return Boolean(env.RUNNER_SECRET) && expected.length === supplied.length && crypto.subtle.timingSafeEqual(expected, supplied);
+}
+
+export async function remoteRun(request: Request, env: Env): Promise<Response> {
+	if (!operatorAuthorized(request, env)) {
 		return new Response('Forbidden', { status: 403 });
 	}
 	const reader = request.body?.getReader();

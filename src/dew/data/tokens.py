@@ -41,7 +41,7 @@ from .dataset import (
     Reader,
     Tokenize,
     describe,
-    json_list_argument,
+    record_argument,
     train_stream,
     validation_pass,
 )
@@ -369,7 +369,7 @@ class PackedTokens(DatasetSpec):
     """
 
     path: str | Mapping[str, float] | None = None
-    phases: Annotated[tuple[DataPhase, ...], json_list_argument(DataPhase)] = ()
+    phases: Annotated[tuple[DataPhase, ...], record_argument(tuple[DataPhase, ...])] = ()
     seq_len: int = 256
     val_batches: int | None = 4
     field: str | None = None
