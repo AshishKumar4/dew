@@ -38,6 +38,27 @@ import_module("dew.nn.backbones.causal_transformer")  # registers the backbone
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 
 
+def test_biased_masked_objective_scores_the_same_affine_logits_as_its_forward():
+    model = models.build('causal_transformer', vocab_size=32, emb_features=8, num_layers=1,
+                         num_heads=2, mlp_features=16, max_seq_len=4, causal=False,
+                         head_bias=True, qk_norm=False, attention_impl='reference', dtype=jnp.float32)
+    tokens = jnp.asarray([[2, 5, 7, 8], [3, 1, 4, 9]], jnp.int32)
+    variables = model.init(jax.random.key(0), tokens)
+    variables['params']['head_bias'] = jnp.linspace(-.123, .389, 32)
+    process = MDLM(mask_id=31)()
+    objective = MaskedDiffusionObjective(model, process, seq_len=4, head_chunks=4,
+                                         variables=variables, ema_decay=None)
+    key = jax.random.key(1)
+    _, losses, _, _, predicted, _ = objective._token_losses(variables, {'text': tokens}, key, train=False)
+    time_key, mask_key, _ = jax.random.split(key, 3)
+    corrupted, _ = process.corrupt(mask_key, tokens, process.sample_t(time_key, tokens.shape[0]))
+    logits = model.apply(variables, corrupted).at[..., 31].set(-jnp.inf)
+    expected = optax.softmax_cross_entropy_with_integer_labels(logits, tokens)
+    # The same 1e-5 relative loss contract as the bias-free chunked head.
+    assert jnp.abs(losses - expected).max() <= 1e-5 * jnp.abs(expected).max()
+    np.testing.assert_array_equal(predicted, logits.argmax(-1))
+
+
 def loaded(name: str):
     """A committed tiny masked-diffusion checkpoint as its model and variables."""
     from safetensors.numpy import load_file

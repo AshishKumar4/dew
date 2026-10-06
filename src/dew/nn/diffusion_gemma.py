@@ -159,6 +159,10 @@ class DiffusionGemma(nn.Module):
         It is read from the text tree of `params` by `CausalTransformer.head_weight`."""
         return self.text.head_weight(params["text"])
 
+    def vocabulary_bias(self, params):
+        """The decoder's vocabulary bias, for the same affine head its forward scores."""
+        return self.text.vocabulary_bias(params['text'])
+
     def head_table(self, params):
         """Return the head as the text tree stores it, and whether its rows are the vocabulary.
 
