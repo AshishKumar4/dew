@@ -372,14 +372,15 @@ class DiffusionRunConfig(RunConfig):
             f"the diffusion recipe trains on image or video datasets, not "
             f"{datasets.name_of(type(spec))}")
 
-    def scratch_model(self, autoencoder: AutoEncoder | None) -> nn.Module:
-        """Return the registry's model over the run's precision settings and `model.config`.
+    def model_fields(self, autoencoder: AutoEncoder | None) -> dict:
+        """Return the fields the registry builds the model from.
 
-        An architecture that takes `output_channels` gets the channels it denoises (the
-        published families name theirs as their sources do, in `model.config`). An
-        `IntervalModel` embeds the duration under an interval process, and MeanFlow,
-        whose loss differentiates in time, turns a `TimeScaled` model's time features at
-        `SMOOTH_TIME_SCALE` unless `model.config` names a scale.
+        These are the run's precision settings over `model.config`, plus the channels
+        the model denoises when the architecture takes them as `output_channels`. The
+        published families name theirs as their sources do, in `model.config`. On the
+        model those build, an `IntervalModel` embeds the duration under an interval
+        process, and MeanFlow, whose loss differentiates in time, turns a `TimeScaled`
+        model's time features at `SMOOTH_TIME_SCALE` unless `model.config` names a scale.
         """
         fields = dict(self.model.fields())
         if "output_channels" in {field.name for field in dataclasses.fields(models[self.model.architecture])}:
@@ -388,11 +389,11 @@ class DiffusionRunConfig(RunConfig):
         model = models.build(self.model.architecture, fields)
         if isinstance(model, IntervalModel) and self.preset is not None:
             built = self.preset()
-            model = model.clone(interval=isinstance(built, Process) and built.interval)
+            fields["interval"] = isinstance(built, Process) and built.interval
         if isinstance(self.mode, MeanFlowTraining) and isinstance(model, TimeScaled) \
                 and "time_scale" not in self.model.config:
-            model = model.clone(time_scale=SMOOTH_TIME_SCALE)
-        return model
+            fields["time_scale"] = SMOOTH_TIME_SCALE
+        return fields
 
     @property
     def context(self) -> TextCondition | AudioCondition | None:
@@ -520,7 +521,8 @@ class DiffusionRunConfig(RunConfig):
                 # __post_init__ holds audio to a VideoDataset.
                 assert self.audio is not None and isinstance(self.data, VideoDataset)
                 conditions[keyword] = self.audio.build(self.data, params=params, dtype=self.model.dtype)
-        return self.scratch_model(autoencoder), conditions, autoencoder
+        model = models.build(self.model.architecture, self.model_fields(autoencoder))
+        return model, conditions, autoencoder
 
     def _autoencoder_params(self, variables: Variables) -> Variables:
         """The autoencoder's weights in a saved tree: frozen beside the

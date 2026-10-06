@@ -205,7 +205,7 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     # A teacher whose time features turn slower still is as smooth to differentiate.
     dataclasses.replace(teacher_run, model=dataclasses.replace(
         teacher_run.model, config={**teacher_run.model.config, "time_scale": 0.001})).save(str(fast))
-    ConsistencyDistillation(teacher=str(fast)).check_teacher(None)
+    ConsistencyDistillation(teacher=str(fast)).check_teacher()
 
     config = dataclasses.replace(teacher_run, mode=ConsistencyDistillation(
         teacher=str(tmp_path / "teacher"), teacher_guidance=2.0, tangent_warmup=1, student_update_freq=2,

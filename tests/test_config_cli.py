@@ -179,7 +179,7 @@ def test_the_diffusion_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(
     assert config.to_dict()["preset"] == {"name": "edm", "fields": {
         "sigma_min": 0.002, "sigma_max": 80.0, "rho": 7.0, "sigma_data": 0.5,
         "regime": "pixel", "P_mean": None, "P_std": None, "min_snr_gamma": None}}
-    assert config.scratch_model(None).output_channels == 3
+    assert config.model_fields(None)["output_channels"] == 3
     assert (tmp_path / "run" / "2").is_dir()
 
 def test_the_jepa_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(tmp_path, monkeypatch):
