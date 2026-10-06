@@ -47,6 +47,7 @@ from .objective import (
     DiffusionObjective,
     Training,
     _from_teacher,
+    _own_loss,
     teacher_variables,
 )
 
@@ -301,11 +302,7 @@ class AdversarialDistillationObjective(DiffusionObjective):
                 and isinstance(process.prediction, FlowMatchPredictionTransform)):
             raise ValueError("LADD distills a velocity model on the linear path; build the process with "
                              "presets.Flow()")
-        unused = sorted(key for key in ("uncertainty", "alignment", "end_to_end")
-                        if kwargs.get(key) is not None)
-        if unused:
-            raise ValueError(f"LADD trains on its own losses, which read none of {unused}")
-        kwargs.setdefault("guidance", None)
+        _own_loss("LADD", kwargs)
         kwargs.setdefault("solver", Consistency())
         kwargs.setdefault("steps", 2)
         super().__init__(model, process, inputs, **kwargs)
@@ -326,13 +323,12 @@ class AdversarialDistillationObjective(DiffusionObjective):
         return {**super().held_variables(), TEACHER: self.teacher_variables}
 
     def complete_variables(self, key: jax.Array, tree: Variables) -> Variables:
-        """Start the student as the teacher the tree holds and draw the
-        discriminator's heads, unless it holds them already."""
+        """Start the student as the tree's teacher and draw the heads, unless it holds them."""
         state = super().complete_variables(key, tree)
         if DISCRIMINATOR in state["params"]:
             return state
         teacher = state[TEACHER]
-        state = dict(_from_teacher(state, teacher))
+        state = _from_teacher(state, teacher)
         given = jax.tree.map(lambda value: value[:1], self.unconditional_conditions)
         x = jnp.zeros((1, *self.latent_shape))
         features = jax.eval_shape(lambda: self._features(teacher, x, jnp.ones((1,)), given))

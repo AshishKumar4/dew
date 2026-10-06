@@ -97,7 +97,6 @@ def test_the_run_builds_an_mmdit_over_sixteen_channel_latents(tmp_path):
     assert objective.autoencoder.latent_channels == 16
     assert objective.latent_shape == (RES // 2, RES // 2, 16)
     assert objective.model.output_channels == 16
-    assert config.model_fields(objective.autoencoder)["output_channels"] == 16
 
 
 def test_one_trainer_step_and_a_sample(tmp_path):

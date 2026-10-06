@@ -372,31 +372,20 @@ class DiffusionRunConfig(RunConfig):
             f"the diffusion recipe trains on image or video datasets, not "
             f"{datasets.name_of(type(spec))}")
 
-    def model_fields(self, autoencoder: AutoEncoder | None) -> dict:
-        """Return the fields the registry builds the model from.
+    def scratch_model(self, autoencoder: AutoEncoder | None) -> nn.Module:
+        """Return the registry's model over the run's precision settings and `model.config`.
 
-        These are the run's precision settings over `model.config`, plus the channels
-        the model denoises when the architecture takes them as `output_channels`. The
-        published families name theirs as their sources do, in `model.config`.
+        An architecture that takes `output_channels` gets the channels it denoises (the
+        published families name theirs as their sources do, in `model.config`). An
+        `IntervalModel` embeds the duration under an interval process, and MeanFlow,
+        whose loss differentiates in time, turns a `TimeScaled` model's time features at
+        `SMOOTH_TIME_SCALE` unless `model.config` names a scale.
         """
         fields = dict(self.model.fields())
-        declared = {field.name for field in dataclasses.fields(models[self.model.architecture])}
-        if "output_channels" in declared:
-            sample = self.sample_field()
-            fields["output_channels"] = (sample.shape[-1] if autoencoder is None
+        if "output_channels" in {field.name for field in dataclasses.fields(models[self.model.architecture])}:
+            fields["output_channels"] = (self.sample_field().shape[-1] if autoencoder is None
                                          else autoencoder.latent_channels)
-        return fields
-
-    def scratch_model(self, autoencoder: AutoEncoder | None) -> nn.Module:
-        """Return the registry's model over `model_fields`, as this run's process and loss read it.
-
-        An `IntervalModel` embeds the interval's duration exactly when the preset's
-        process is an interval one. MeanFlow's loss differentiates the model in time, and
-        a `TimeScaled` model's default time features are far too fast in it to learn
-        from, so under MeanFlow one turns them at `SMOOTH_TIME_SCALE` unless
-        `model.config` names a scale.
-        """
-        model = models.build(self.model.architecture, self.model_fields(autoencoder))
+        model = models.build(self.model.architecture, fields)
         if isinstance(model, IntervalModel) and self.preset is not None:
             built = self.preset()
             model = model.clone(interval=isinstance(built, Process) and built.interval)

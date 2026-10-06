@@ -118,7 +118,6 @@ class GuidanceDistillationObjective(DiffusionObjective):
             raise ValueError("guidance distillation regresses onto the teacher's raw output, so the "
                              "two share the process's schedule and prediction")
         _own_loss("guidance distillation", kwargs)
-        kwargs.setdefault("guidance", None)
         super().__init__(model, process, inputs, **kwargs)
         if teacher.latent_shape != self.latent_shape:
             raise ValueError(f"the teacher denoises {teacher.latent_shape} and the student "

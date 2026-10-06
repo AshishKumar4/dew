@@ -119,10 +119,10 @@ def shortcut_target(velocity: Velocity, x, sigma, step) -> jax.Array:
 
 SMOOTH_TIME_SCALE = 0.002
 """The Fourier time scale a model trained through a derivative in time takes
-when its config names none, and the fastest an sCM teacher's may turn
-(`ConsistencyDistillation.check_teacher`). On a 2-D two-class toy (RTX
-4080), one-step class accuracy at simple_dit's default 16 against 0.002 was
-MeanFlow 23% against 99%, an sCM student 11% against 98.6%."""
+when its config names none, and the fastest an sCM teacher's may turn. On a
+2-D two-class toy (RTX 4080), one-step class accuracy at simple_dit's
+default 16 against 0.002 was MeanFlow 23% against 99%, an sCM student 11%
+against 98.6%."""
 
 
 @trainings("mean_flow")
@@ -216,7 +216,6 @@ class MeanFlowObjective(DiffusionObjective):
             raise ValueError("MeanFlow trains an interval model of velocity on the unshifted linear "
                              "path; build the process with presets.MeanFlow")
         _own_loss("MeanFlow", kwargs)
-        kwargs.setdefault("guidance", None)
         kwargs.setdefault("solver", Euler())
         kwargs.setdefault("steps", 2)
         super().__init__(model, process, inputs, **kwargs)
@@ -309,7 +308,6 @@ class ShortcutObjective(DiffusionObjective):
             raise ValueError("a shortcut model is an interval model of velocity on the unshifted "
                              "linear path; build the process with presets.Shortcut")
         _own_loss("a shortcut model", kwargs)
-        kwargs.setdefault("guidance", None)
         kwargs.setdefault("solver", Euler())
         kwargs.setdefault("steps", 2)
         super().__init__(model, process, inputs, **kwargs)
