@@ -101,6 +101,7 @@ def kernels(args):
 
 def step(args):
     import benchmark_step
+    from benchmark_cases import Case
 
     if args.implementation == 'lax':
         conv._polyphase_depthwise_3x3 = conv._materialized_depthwise_3x3 = partial(reference, precision=None)
@@ -110,7 +111,7 @@ def step(args):
               'use_2d_fusion': True, 'adaln_silu': False, 'output_channels': 4}
     if args.remat:
         config['remat'] = True
-    cases = [benchmark_step.Case('hybrid_dit', config, batch_size=batch, image_size=32, channels=4)
+    cases = [Case('hybrid_dit', config, batch_size=batch, image_size=32, channels=4)
              for batch in ((16, 32) if args.batch_size is None else (args.batch_size,))]
     rows = benchmark_step.main(benchmark_step.BenchmarkConfig(
         cases=cases, steps=args.repeats, warmup=5, profile_dir=str(args.output.parent / args.implementation),

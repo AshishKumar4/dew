@@ -50,287 +50,46 @@ import os
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import Annotated, Any, Iterator, Literal, Mapping, Sequence
+from typing import Annotated, Any, Literal
 
 import jax
-import jax.numpy as jnp
 import numpy as np
-import optax
 import tyro
-from jax.sharding import Mesh
 
-import dew.nn.backbones  # noqa: F401  (registers the kind)
-import dew.nn.backbones.jepa  # noqa: F401  (registers the kind)
-from dew.data import DataPartition, preferences
-from dew.data.chat import ROLES_KEY, Role
-from dew.diffusion import presets
-from dew.diffusion.discrete import MDLM
-from dew.diffusion.process import DenoisingCondition
-from dew.inputs import CharTable, Condition, Field, InputSpec
-from dew.inputs.encoders import ConditionEncoder
-from dew.nn.backbones.flux import FluxTransformer
-from dew.nn.backbones.flux2 import Flux2Transformer
-from dew.nn.backbones.qwen_image import QwenImageTransformer
-from dew.nn.backbones.sd3 import SD3Transformer
-from dew.nn.backbones.unet_condition import UNet2DCondition
-from dew.nn.backbones.wan import WanTransformer
-from dew.nn.backbones.z_image import ZImageTransformer
-from dew.nn.diffusion_gemma import DiffusionGemma
-from dew.nn.inputs import ModelInputs
-from dew.nn.multimodal import MultimodalTransformer, VisionConditioner
-from dew.nn.vision import ProjectorBase, TowerBase
-from dew.objectives.base import Objective, Variables
-from dew.objectives.diffusion import BlockDiffusionObjective, DiffusionObjective
-from dew.objectives.diffusion.masked import MaskedDiffusionObjective
-from dew.objectives.jepa import JepaObjective, MultiBlockMask
-from dew.objectives.lm import LMObjective
-from dew.objectives.rl import DPOObjective, GRPOObjective, sessions
-from dew.registry import float64_twin, models, projectors, resolve_dtype, towers, with_precision
+from dew.registry import models
 from dew.telemetry.instrumentation import model_flops_utilization
 from dew.telemetry.profile import capture_options
-from dew.training import Layout, MeshSpec, Trainer
 from dew.training.distributed import DevicePrefetchIterator
 from dew.training.runtime import prepare_process
 from dew.training.trainer import remat_record
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from benchmark_cases import (
+    TEXT_FEATURES as TEXT_FEATURES,
+    TEXT_TOKENS as TEXT_TOKENS,
+    Case,
+    canvas_split,
+    cpu_smoke_cases,
+    images_per_row,
+    media_pixels,
+    mesh_label,
+    small_cases,
+)
+from benchmark_models import (
+    Batch as Batch,
+    batches,
+    build_objective as build_objective,
+    build_trainer,
+    decoder_objective as decoder_objective,
+    global_batch as global_batch,
+    image_tokens as image_tokens,
+    media_row as media_row,
+    media_values as media_values,
+    mesh_spec,
+)
 from trace_window import device_events, kernel_category, length, overlap, union, window_split
 
-# The CLIP-L/14 context's shape, from the library's table encoder: a benchmark
-# of the model should not spend its first minute downloading a text tower, and
-# the step cost depends only on the context's shape.
-TEXT_TOKENS = 77
-TEXT_FEATURES = 768
-
-Batch = dict[str, np.ndarray | Mapping[str, np.ndarray] | ModelInputs]
 Row = dict[str, object]
-
-
-class _DenoisingTextTable(ConditionEncoder[str]):
-    """Synthetic token and pooled features for native diffusion models."""
-
-    def __init__(self, table: CharTable, features: int, pooled_features: int | None,
-                 guidance: float | None, masked: bool = False):
-        self.table = table
-        self.params = table.params
-        self.features = features
-        self.pooled_features = pooled_features
-        self.guidance = guidance
-        self.masked = masked
-        """Whether the condition marks the real tokens, as Z-Image reads them."""
-
-    @classmethod
-    def from_pretrained(cls, checkpoint: str = "char_table", *, tokens: int = TEXT_TOKENS,
-                        features: int = TEXT_FEATURES, pooled_features: int | None = None,
-                        guidance: float | None = None, masked: bool = False, vocab: int = 130, seed: int = 0,
-                        dtype=None):
-        return cls(CharTable.from_pretrained(checkpoint, tokens=tokens,
-                                            features=max(features, pooled_features or 0),
-                                            vocab=vocab, seed=seed, dtype=dtype),
-                   features, pooled_features, guidance, masked)
-
-    def tokenize(self, data: Sequence[str]) -> Mapping[str, np.ndarray]:
-        return self.table.tokenize(data)
-
-    def encode(self, params: Variables, tokens) -> DenoisingCondition:
-        text = self.table.encode(params, tokens)
-        hidden = text.hidden
-        pooled = None if self.pooled_features is None else hidden[:, 0, :self.pooled_features]
-        guidance = None if self.guidance is None else jnp.full((hidden.shape[0],), self.guidance)
-        return DenoisingCondition(hidden[..., :self.features], pooled, guidance=guidance,
-                                  mask=jnp.asarray(text.mask, bool) if self.masked else None)
-
-    def to_json(self) -> dict:
-        return {**self.table.to_json(), "features": self.features, "pooled_features": self.pooled_features,
-                "guidance": self.guidance, "masked": self.masked}
-
-
-@dataclass(frozen=True)
-class Case:
-    """One measurement: what to build, how much to feed it, how to shard it."""
-
-    architecture: str
-    config: dict[str, object] = field(default_factory=dict)
-    dtype: str | None = None
-    """Compute dtype, written into the model config by the precision policy;
-    None takes the run's --dtype."""
-    matmul_precision: str | None = None
-    """What every matmul asks XLA for (`ModelConfig.matmul_precision`), written
-    into a model that declares `precision`; None keeps the model's own."""
-    orders: bool = False
-    """Layout comparisons use 52 exact residual orders against fp64 when True.
-    Other measurements and rows retain their ordinary single-draw path."""
-    batch_size: int = 8
-    accumulation: int = 1
-    """Microbatches of `batch_size` rows the trainer pools into one optimizer
-    step; a timed step is one microbatch."""
-    mesh: dict[str, int] = field(default_factory=dict)
-    """`MeshSpec` fields, `{"fsdp": 2, "tensor": 2}`; the empty record is
-    data parallelism over every device."""
-    device_order: list[int] | None = None
-    """The global device ids, in the order the mesh lays them out; None is
-    `jax.devices()`'s. The innermost axis takes consecutive entries, so
-    `[0, 2, 1, 3]` puts a size-2 inner axis across the pairs `[0, 1]` would
-    keep together."""
-    image_size: int = 32
-    channels: int = 3
-    """Input channels, including four-channel latent diffusion inputs."""
-    frames: int = 0
-    """Video models take (frames, H, W, C) samples; 0 means images."""
-    predictor: dict[str, object] | None = None
-    """Set for JEPA: the architecture is an encoder and this builds its predictor."""
-    canvas: dict[str, object] | None = None
-    """Set for a block-diffusion decoder: `prompt_length` and `canvas_size`.
-    The architecture is the shared encoder/decoder trunk `config` builds, and
-    the row of `seq_len + 1` tokens splits into a clean prompt and whole
-    canvases the way recipes/lm/train.py's block objective splits it."""
-    media: dict[str, object] | None = None
-    """Set for a vision-conditioned decoder: the `tower` and `projector`
-    records, the `family` and `image_token_id` the wrapper carries, `images`
-    per row and the `pixels` shape the checkpoint's processor emits. The
-    architecture is the decoder `config` builds and the images ride the batch
-    beside the tokens, as they do on the loaded multimodal path."""
-    seq_len: int = 0
-    """Set for language models: batches are token windows of this length, not images."""
-    packed_documents: int = 0
-    """Set for language models: documents packed into every row, with the
-    segment ids and positions the packed loader emits; 0 feeds a fixed
-    window, the form a stream of tokens gives."""
-    head_chunks: int | None = None
-    """For language models, the vocabulary slices the loss scores a batch in;
-    None is the objective's own default."""
-    objective: dict[str, object] = field(default_factory=dict)
-    """For language models, further keywords of the decoder's objective, such
-    as LMObjective's balance terms `aux_loss_alpha` and `balance_rate`."""
-    decoder_objective: Literal["lm", "sft", "dpo", "grpo", "mdlm"] = "lm"
-    """For language models, what the decoder trains: next-token cross entropy
-    ("lm"), the same over the assistant's turns only ("sft"), DPO over
-    preference pairs ("dpo"), GRPO's clipped surrogate over rollouts
-    ("grpo"), or masked diffusion's negative ELBO over a bidirectional
-    decoder ("mdlm", MDLM's process)."""
-    fsdp_min_param_size: int = 2 ** 16
-
-    @property
-    def is_jepa(self) -> bool:
-        return self.predictor is not None
-
-    @property
-    def is_lm(self) -> bool:
-        return self.seq_len > 0
-
-    @property
-    def packs_documents(self) -> bool:
-        """Whether --packed-documents means anything for this case: a plain
-        token window packs, a canvas row is the objective's own fixed
-        geometry, a media row is what a processor emitted, and pairs,
-        rollouts and a masked-diffusion row have their own columns."""
-        return (self.is_lm and self.canvas is None and self.media is None
-                and self.decoder_objective in ("lm", "sft"))
-
-    @property
-    def sample_shape(self) -> tuple[int, ...]:
-        square = (self.image_size, self.image_size, self.channels)
-        return square if self.frames == 0 else (self.frames, *square)
-
-    @property
-    def label(self) -> str:
-        mixture = self.config.get("mixture")
-        experts = f" x{mixture['experts']}experts" if isinstance(mixture, dict) else ""
-        canvases = f" x{canvas_split(self)[2]}canvas" if self.canvas else ""
-        images = f" x{images_per_row(self)}img" if self.media else ""
-        order = "" if self.device_order is None else " order" + "".join(map(str, self.device_order))
-        pooled = "" if self.accumulation == 1 else f" x{self.accumulation}acc"
-        return (f"{self.architecture}{experts}{canvases}{images} b{self.batch_size}{pooled} "
-                f"{mesh_label(self.mesh)}{order}")
-
-
-def mesh_spec(mesh: Mapping[str, int]) -> MeshSpec:
-    """The `MeshSpec` a case's mesh record names, refusing a field it lacks."""
-    fields = {f.name for f in dataclasses.fields(MeshSpec)}
-    unknown = sorted(set(mesh) - fields)
-    if unknown:
-        raise ValueError(f"mesh has no field {unknown}; MeshSpec's fields are {sorted(fields)}")
-    return MeshSpec(**mesh)
-
-
-def mesh_label(mesh: Mapping[str, int]) -> str:
-    """`fsdp2-tensor2`, the mesh's sharded axes in MeshSpec order; `data` for none."""
-    named = [f"{name}{mesh[name]}" for name in (f.name for f in dataclasses.fields(MeshSpec))
-             if mesh.get(name) not in (None, 1)]
-    return "-".join(named) or "data"
-
-
-def _count(record: Mapping[str, object], key: str, owner: str) -> int:
-    value = record.get(key)
-    if type(value) is not int or value < 1:
-        raise ValueError(f"{owner} needs a positive integer {key}, got {value!r}")
-    return value
-
-
-def canvas_split(case: Case) -> tuple[int, int, int]:
-    """A block-diffusion row as (prompt_length, canvas_size, num_canvases).
-
-    The row holds `seq_len + 1` tokens, the width the token-windows loader
-    emits, and splits the way recipes/lm/train.py splits it for the official
-    fine-tuning objective: a clean prompt, then whole canvases.
-    """
-    canvas = case.canvas or {}
-    prompt = _count(canvas, "prompt_length", "a canvas case")
-    width = _count(canvas, "canvas_size", "a canvas case")
-    response = case.seq_len + 1 - prompt
-    if response < width or response % width:
-        raise ValueError(
-            f"{case.architecture}'s row of {case.seq_len + 1} tokens is not "
-            f"{prompt} prompt tokens followed by whole canvases of {width}")
-    return prompt, width, response // width
-
-
-def images_per_row(case: Case) -> int:
-    return _count(case.media or {}, "images", "a media case")
-
-
-def media_pixels(case: Case) -> tuple[int, ...]:
-    """One processed image's (channels, height, width), as a processor emits it."""
-    shape = (case.media or {}).get("pixels")
-    if (not isinstance(shape, (list, tuple)) or len(shape) != 3
-            or any(type(size) is not int or size < 1 for size in shape)):
-        raise ValueError(
-            f"a media case's pixels is [channels, height, width], got {shape!r}")
-    return tuple(shape)
-
-
-def media_values(case: Case) -> tuple[str, TowerBase, ProjectorBase, int]:
-    """The wrapper's media fields as built values: the checkpoint family, the
-    tower and projector its records name, and the placeholder token id."""
-    media = case.media or {}
-    family = media.get("family")
-    if not isinstance(family, str) or not family:
-        raise ValueError(f"a media case names its checkpoint family, got {family!r}")
-    for name in ("tower", "projector"):
-        if not isinstance(media.get(name), Mapping):
-            raise ValueError(f"a media case's {name} is a record, got {media.get(name)!r}")
-    token = media.get("image_token_id")
-    if type(token) is not int or token < 0:
-        raise ValueError(f"a media case's image_token_id is an id, got {token!r}")
-    return (family, towers.from_record(media["tower"]),
-            projectors.from_record(media["projector"]), token)
-
-
-def image_tokens(case: Case) -> int:
-    """Text slots one image fills: the soft tokens this case's own projector
-    emits for it.
-
-    Read off the tower and projector instead of declared beside them, so a
-    row cannot mark a width the modules do not produce. The trace is
-    abstract: no parameter is allocated and no kernel compiles.
-    """
-    _, tower, projector, _ = media_values(case)
-    conditioner = VisionConditioner(tower, projector)
-    features = jax.eval_shape(
-        lambda pixels: conditioner.init_with_output(
-            jax.random.key(0), {"pixel_values": pixels})[0],
-        jax.ShapeDtypeStruct((1, 1, *media_pixels(case)), np.float32))
-    return features.shape[1]
 
 
 def cases_from_json(text: str) -> list[Case]:
@@ -384,178 +143,6 @@ JsonMesh = Annotated[
     ),
 ]
 """A mesh, written as one JSON object on the command line."""
-
-
-def cpu_smoke_cases() -> list[Case]:
-    """Tiny enough to run anywhere, real enough to compile the same step.
-
-    The last two are the composites at a size a CPU compiles in seconds: the
-    same wrappers, the same objectives and the same media and canvas work as
-    --preset small, on a two-layer decoder.
-    """
-    tiny_decoder: dict[str, object] = {"vocab_size": 256, "emb_features": 32,
-                                       "num_layers": 2, "num_heads": 2,
-                                       "mlp_features": 64, "max_seq_len": 16}
-    return [
-        Case("simple_dit", {"patch_size": 4, "emb_features": 64, "num_layers": 2,
-                            "num_heads": 2, "mlp_ratio": 2},
-             batch_size=8, image_size=16, fsdp_min_param_size=256),
-        Case("unet_2d_condition", {"stages": [{"features": 32, "heads": 2}, {"features": 64, "heads": 4}],
-                                    "blocks_per_level": 1, "in_channels": 4, "out_channels": 4},
-             batch_size=8, image_size=16, channels=4, fsdp_min_param_size=256),
-        Case("sd3_transformer", {"in_channels": 4, "out_channels": 4, "num_layers": 2,
-                                  "heads": 2, "head_dim": 8, "joint_attention_dim": 16,
-                                  "caption_projection_dim": 16, "pooled_projection_dim": 32,
-                                  "sample_size": 8, "pos_embed_max_size": 4},
-             batch_size=8, image_size=8, channels=4, fsdp_min_param_size=256),
-        Case("flux_transformer", {"in_channels": 16, "out_channels": 16,
-                                   "num_layers": 1, "num_single_layers": 1, "heads": 2,
-                                   "head_dim": 12, "joint_attention_dim": 16,
-                                   "pooled_projection_dim": 8, "axes_dims_rope": (4, 4, 4),
-                                   "guidance_embeds": True},
-             batch_size=8, image_size=8, channels=4, fsdp_min_param_size=256),
-        Case("jepa_encoder", {"patch_size": 4, "emb_features": 32, "num_layers": 2,
-                              "num_heads": 2, "mlp_ratio": 2},
-             predictor={"grid": (4, 4), "emb_features": 32, "predictor_features": 16,
-                        "num_layers": 1, "num_heads": 2, "mlp_ratio": 2},
-             batch_size=8, image_size=16, fsdp_min_param_size=256),
-        Case("causal_transformer", tiny_decoder,
-             batch_size=8, seq_len=16, fsdp_min_param_size=256),
-        Case("multimodal_transformer", tiny_decoder,
-             media={"family": "gemma3", "image_token_id": 255, "images": 1,
-                    "pixels": [3, 16, 16],
-                    "tower": {"name": "siglip", "fields": {"hidden_size": 32, "intermediate_size": 64,
-                              "num_layers": 1, "num_heads": 2, "image_size": 16,
-                              "patch_size": 8}},
-                    "projector": {"name": "gemma", "fields": {"text_width": 32,
-                                  "patches_per_side": 2, "tokens_per_side": 2}}},
-             batch_size=8, seq_len=15, fsdp_min_param_size=256),
-        Case("diffusion_gemma", {**tiny_decoder, "layer_scalar": "frozen"},
-             canvas={"prompt_length": 8, "canvas_size": 4},
-             batch_size=8, seq_len=15, fsdp_min_param_size=256),
-    ]
-
-
-def small_cases(dtype: str) -> list[Case]:
-    """Every registry architecture at a size that fits one 16 GB card in bf16.
-
-    Sized so the whole sweep takes minutes: real token counts (256 image
-    tokens at 64px/patch 4) and real widths, but few layers.
-    """
-    dit: dict[str, object] = {"patch_size": 4, "emb_features": 384, "num_layers": 6,
-                              "num_heads": 6, "mlp_ratio": 4}
-    unet: dict[str, object] = {"emb_features": 256, "feature_depths": [64, 128, 256],
-                               "attention_configs": [None, {"heads": 4}, {"heads": 4}],
-                               "num_res_blocks": 2, "num_middle_res_blocks": 1}
-    encoder: dict[str, object] = {"patch_size": 4, "emb_features": 384, "num_layers": 6,
-                                  "num_heads": 6, "mlp_ratio": 4}
-    predictor: dict[str, object] = {"grid": (16, 16), "emb_features": 384,
-                                    "predictor_features": 192, "num_layers": 3,
-                                    "num_heads": 6, "mlp_ratio": 4}
-    # GPT-2 small's width and heads at a quarter of its depth, on 512-token
-    # rows. The two composites wrap this same decoder, so their rows are the
-    # plain decoder's rows plus the work their wrapper adds.
-    decoder: dict[str, object] = {"vocab_size": 50304, "emb_features": 768, "num_layers": 3,
-                                  "num_heads": 12, "mlp_features": 3072, "max_seq_len": 512}
-
-    cases = [
-        Case("unet", unet, batch_size=16, image_size=64),
-        # EDM2's magnitude-preserving U-Net at the plain U-Net's widths.
-        Case("edm2_unet", {"model_channels": 64, "channel_mult": [1, 2, 4], "num_blocks": 2,
-                           "attn_resolutions": [16], "channels_per_head": 64},
-             batch_size=16, image_size=64),
-        Case("unet_2d_condition", {"stages": [{"features": 64, "heads": 4}, {"features": 128, "heads": 4},
-                                              {"features": 256, "heads": 8, "cross_attention": False}],
-                                    "blocks_per_level": 1, "in_channels": 4, "out_channels": 4},
-             batch_size=4, image_size=32, channels=4),
-        Case("sd3_transformer", {"num_layers": 6, "heads": 6, "head_dim": 64,
-                                  "caption_projection_dim": 384, "sample_size": 32,
-                                  "pos_embed_max_size": 16},
-             batch_size=4, image_size=32, channels=16),
-        Case("flux_transformer", {"num_layers": 3, "num_single_layers": 3, "heads": 6,
-                                   "head_dim": 64, "axes_dims_rope": (16, 24, 24),
-                                   "guidance_embeds": True},
-             batch_size=4, image_size=32, channels=16),
-        Case("qwen_image_transformer", {"in_channels": 16, "out_channels": 16, "num_layers": 3,
-                                         "heads": 6, "head_dim": 64, "axes_dims_rope": (16, 24, 24)},
-             batch_size=4, image_size=32, channels=16),
-        # FLUX.2 reads three stacked encoder layers, so its context is three
-        # text widths wide. Each rotary splits the 64 head channels.
-        Case("flux2_transformer", {"num_layers": 3, "num_single_layers": 3, "heads": 6, "head_dim": 64,
-                                    "joint_attention_dim": 3 * TEXT_FEATURES,
-                                    "axes_dims_rope": (16, 16, 16, 16)},
-             batch_size=4, image_size=32, channels=128),
-        Case("z_image_transformer", {"dim": 384, "n_layers": 3, "n_refiner_layers": 1, "n_heads": 6,
-                                      "cap_feat_dim": TEXT_FEATURES, "axes_dims": (16, 24, 24)},
-             batch_size=4, image_size=32, channels=16),
-        # Wan 2.1's text-to-video transformer at the 1.3B's head width and a
-        # tenth of its depth, over 1 + 4k latent frames of its VAE's 16 channels.
-        Case("wan_transformer", {"num_attention_heads": 6, "attention_head_dim": 64,
-                                  "text_dim": TEXT_FEATURES, "ffn_dim": 1536, "num_layers": 3},
-             batch_size=4, image_size=32, channels=16, frames=5),
-        Case("uvit", dit,
-             batch_size=16, image_size=64),
-        Case("simple_udit", {**dit, "num_layers": 6}, batch_size=16, image_size=64),
-        Case("simple_dit", dit, batch_size=16, image_size=64),
-        Case("simple_mmdit", dit, batch_size=16, image_size=64),
-        Case("hierarchical_mmdit",
-             {"base_patch_size": 2, "emb_features": (192, 384, 576),
-              "num_layers": (2, 2, 2), "num_heads": (3, 6, 9), "mlp_ratio": 4},
-             batch_size=16, image_size=64),
-        Case("hybrid_dit", {**dit, "ssm_state_dim": 64, "ssm_attention_ratio": "3:1"},
-             batch_size=16, image_size=64),
-        Case("video_dit", {**dit, "num_layers": 4}, batch_size=4, image_size=64, frames=8),
-        Case("unet_3d", {**unet, "temporal_heads": 4},
-             batch_size=4, image_size=64, frames=8),
-        Case("jepa_encoder", encoder, predictor=predictor, batch_size=16, image_size=64),
-        Case("jepa_video_encoder", {**encoder, "num_layers": 4},
-             predictor={**predictor, "num_layers": 2, "factorized": True},
-             batch_size=4, image_size=64, frames=8),
-        Case("causal_transformer", decoder, batch_size=16, seq_len=512),
-        # The same decoder with an 8-expert, top-2 feed-forward on every second
-        # layer, which is the sparse shape the 4.7 acceptance run trains
-        Case("causal_transformer",
-             {**decoder, "mixture": {"experts": 8, "top_k": 2, "layers": (1,)}},
-             batch_size=16, seq_len=512),
-        # The same decoder as a vision-conditioned one: SigLIP-so400m's widths
-        # at four layers over a 448px crop, pooled to the 256 soft tokens
-        # Gemma 3 gives an image, so half of every 512-token row is media. One
-        # image a row keeps the tower's cost the per-row cost a caption batch
-        # pays, and the batch is halved because each row carries one. The trunk
-        # is the plain decoder, so the row is the tower, the projector, the
-        # fusion and a causal decoder; Gemma 3's bidirectional-over-image mask
-        # is a per-family attention setting this case does not turn on.
-        Case("multimodal_transformer", decoder,
-             media={"family": "gemma3", "image_token_id": 50303, "images": 1,
-                    "pixels": [3, 448, 448],
-                    "tower": {"name": "siglip", "fields": {"hidden_size": 1152,
-                              "intermediate_size": 4304, "num_layers": 4,
-                              "num_heads": 16, "image_size": 448, "patch_size": 14}},
-                    "projector": {"name": "gemma", "fields": {"text_width": 768,
-                                  "patches_per_side": 32, "tokens_per_side": 16}}},
-             batch_size=8, seq_len=512),
-        # The same decoder read both ways by the official DiffusionGemma
-        # fine-tuning loss: one encoder pass over the whole row into the
-        # cache, then two decoder passes over the response for the
-        # self-conditioning branch. `frozen` is the published scalar policy
-        # the objective migrates to a trained one. The published vocabulary is
-        # 262144 and this loss holds whole `[B, S, vocab]` logit tensors, so
-        # the case keeps the other rows' vocabulary and a quarter of their
-        # batch.
-        Case("diffusion_gemma", {**decoder, "layer_scalar": "frozen"},
-             canvas={"prompt_length": 256, "canvas_size": 128},
-             batch_size=4, seq_len=511),
-    ]
-    cases = [dataclasses.replace(case, dtype=dtype) for case in cases]
-    # jepa_predictor has no step of its own: it is built through the registry
-    # inside the two JEPA cases above.
-    covered = {case.architecture for case in cases} | {"jepa_predictor"}
-    missing = set(models) - covered
-    if missing:
-        raise ValueError(
-            f"--preset small does not cover {sorted(missing)}; add a case for every "
-            "architecture in dew.registry.models")
-    return cases
 
 
 @dataclass(frozen=True)
@@ -614,6 +201,14 @@ def build_cases(config: BenchmarkConfig) -> list[Case]:
         cases = cpu_smoke_cases()
     else:
         cases = small_cases(config.dtype)
+        # jepa_predictor has no step of its own: it is built through the registry
+        # inside the two JEPA cases above.
+        covered = {case.architecture for case in cases} | {"jepa_predictor"}
+        missing = set(models) - covered
+        if missing:
+            raise ValueError(
+                f"--preset small does not cover {sorted(missing)}; add a case for every "
+                "architecture in dew.registry.models")
 
     if config.architectures:
         wanted = set(config.architectures)
@@ -639,247 +234,6 @@ def build_cases(config: BenchmarkConfig) -> list[Case]:
         return dataclasses.replace(case, **overrides, **frames, **packed, **dtype)
 
     return [apply(case) for case in cases]
-
-
-def decoder_objective(case: Case, model) -> LMObjective | DPOObjective | GRPOObjective | MaskedDiffusionObjective:
-    """What the case's decoder trains over its rows (`Case.decoder_objective`),
-    with its own head chunking where it names one and its further objective
-    keywords. Masked diffusion corrupts to the vocabulary's last id, which
-    `global_batch` never draws."""
-    chunks: dict[str, Any] = {} if case.head_chunks is None else {"head_chunks": case.head_chunks}
-    keywords = {**chunks, **case.objective}
-    match case.decoder_objective:
-        case "lm":
-            return LMObjective(model, case.seq_len, **keywords)
-        case "sft":
-            return LMObjective(model, case.seq_len, loss_role=Role.ASSISTANT, **keywords)
-        case "dpo":
-            return DPOObjective(model, case.seq_len, **keywords)
-        case "grpo":
-            return GRPOObjective(model, case.seq_len, **keywords)
-        case "mdlm":
-            vocab = _count(case.config, "vocab_size", case.architecture)
-            return MaskedDiffusionObjective(model, MDLM(mask_id=vocab - 1)(), case.seq_len, **keywords)
-
-
-def build_objective(case: Case, attention_impl: str = 'auto', *, widened: bool = False) -> Objective:
-    """The objective a recipe would train for this case.
-
-    The model goes through the same precision function the recipes use, so the
-    dtype and the attention kernel land in the nested unet attention configs
-    too, and a row of this table is a row a real run would produce. With
-    `widened` every model is the float32 configuration's float64 twin
-    (`dew.registry.float64_twin`), nested stages included, which computes in
-    float64 throughout under x64: layout_parity's fp64 step.
-
-    A composite takes built values rather than a flat record, so its trunk
-    goes through the policy and the wrapper takes it, the way the pretrained
-    loader assembles the same two models (dew.interop.pretrained and
-    dew.interop.diffusion_gemma.build).
-    """
-    if widened:
-        dtype = "float32"
-    elif case.dtype is None:
-        raise ValueError(f"{case.label} names no dtype; build_cases gives it the run's --dtype")
-    else:
-        dtype = case.dtype
-
-    def built(architecture: str, config: Mapping[str, object]):
-        fields = with_precision(architecture, config, dtype=dtype, attention_impl=attention_impl,
-                                matmul_precision=case.matmul_precision)
-        return models.build(architecture, **(float64_twin(fields) if widened else fields))
-
-    sample_key = "video" if case.frames else "image"
-
-    if case.canvas is not None:
-        prompt, width, count = canvas_split(case)
-        model = DiffusionGemma(text=built("causal_transformer", case.config),
-                               canvas_length=width)
-        objective = BlockDiffusionObjective(
-            model, prompt_length=prompt, canvas_size=width, num_canvases=count)
-    elif case.media is not None:
-        family, tower, projector, token = media_values(case)
-        # The decoder carries the attention kernel; the wrapper reads none.
-        model = MultimodalTransformer(
-            built("causal_transformer", case.config), tower, projector, family, token,
-            dtype=jnp.float64 if widened else resolve_dtype(dtype))
-        objective = decoder_objective(case, model)
-    elif case.is_lm:
-        objective = decoder_objective(case, built(case.architecture, case.config))
-    elif case.predictor is not None:
-        model = built(case.architecture, case.config)
-        patch = case.config.get("patch_size", 16)
-        if not isinstance(patch, int):
-            raise ValueError(f"{case.architecture}'s patch_size is {patch!r}, not an int")
-        grid = (case.image_size // patch, case.image_size // patch)
-        objective = JepaObjective(
-            model, built("jepa_predictor", {**case.predictor, "grid": grid}),
-            MultiBlockMask.for_grid(grid, num_targets=2, scale=(0.2, 0.3)),
-            sample=Field(sample_key, case.sample_shape))
-    else:
-        model = built(case.architecture, case.config)
-        preset = presets.EDM(regime="pixel")
-        if isinstance(model, QwenImageTransformer):
-            keyword = "conditioning"
-            encoder = _DenoisingTextTable.from_pretrained()
-            preset = presets.Flow()
-        elif isinstance(model, WanTransformer):
-            keyword = "conditioning"
-            encoder = _DenoisingTextTable.from_pretrained(features=model.text_dim)
-            preset = presets.Flow()
-        elif isinstance(model, ZImageTransformer):
-            keyword = "conditioning"
-            encoder = _DenoisingTextTable.from_pretrained(features=model.cap_feat_dim, masked=True)
-            preset = presets.Flow()
-        elif isinstance(model, Flux2Transformer):
-            keyword = "conditioning"
-            encoder = _DenoisingTextTable.from_pretrained(
-                features=model.joint_attention_dim, guidance=3.5 if model.guidance_embeds else None)
-            preset = presets.Flow()
-        elif isinstance(model, (SD3Transformer, FluxTransformer)):
-            keyword = "conditioning"
-            encoder = _DenoisingTextTable.from_pretrained(
-                features=model.joint_attention_dim, pooled_features=model.pooled_projection_dim,
-                guidance=3.5 if isinstance(model, FluxTransformer) and model.guidance_embeds else None)
-            preset = presets.Flow()
-        elif isinstance(model, UNet2DCondition):
-            keyword = "conditioning"
-            encoder = _DenoisingTextTable.from_pretrained()
-        else:
-            keyword = "textcontext"
-            encoder = CharTable.from_pretrained(tokens=TEXT_TOKENS, features=TEXT_FEATURES)
-        inputs = InputSpec(Field(sample_key, case.sample_shape),
-                           {keyword: Condition(encoder)})
-        objective = DiffusionObjective(model, preset, inputs)
-    return objective
-
-
-def build_trainer(case: Case, attention_impl: str = 'auto',
-                  optimizer: optax.GradientTransformation | None = None) -> Trainer:
-    """The trainer a recipe would build for this case, minus the tracker and the
-    checkpoints, on the case's device order."""
-    trainer = Trainer(
-        build_objective(case, attention_impl), optimizer or optax.adam(1e-4), key=jax.random.key(0),
-        mesh=mesh_spec(case.mesh), layout=Layout(min_shard=case.fsdp_min_param_size),
-        accumulation=case.accumulation, checkpoints=None, tracker=None)
-    if case.device_order is not None:
-        by_id = {device.id: device for device in jax.devices()}
-        trainer.device_mesh = trainer.mesh.build([by_id[index] for index in case.device_order])
-    return trainer
-
-
-def media_row(case: Case, tokens: np.ndarray, rng: np.random.Generator) -> ModelInputs:
-    """One media batch in the numeric form a processor hands the model: the
-    placeholder run the images fill, the feature each of those slots reads,
-    and the pixels themselves.
-
-    Every row marks `image_tokens` slots for each of its images, so every
-    feature the tower computes is read by a slot. A shorter run would pay for
-    features the decoder never sees, and a longer one would read a feature
-    twice.
-    """
-    _, _, _, token = media_values(case)
-    images = images_per_row(case)
-    vocab = case.config.get("vocab_size")
-    if not isinstance(vocab, int) or token >= vocab:
-        raise ValueError(
-            f"a media row marks its slots with token {token}, which is not in "
-            f"{case.architecture}'s vocabulary of {vocab!r}")
-    slots = images * image_tokens(case)
-    if slots > tokens.shape[1]:
-        raise ValueError(
-            f"{images} images fill {slots} slots of {case.architecture}'s "
-            f"{tokens.shape[1]}-token row, which has no room for them")
-    tokens = tokens.copy()
-    tokens[:, :slots] = token
-    indices = np.full(tokens.shape, -1, np.int32)
-    indices[:, :slots] = np.arange(slots)
-    pixels = rng.normal(size=(case.batch_size, images, *media_pixels(case)))
-    return ModelInputs(tokens, {"image_indices": indices},
-                       {"pixel_values": pixels.astype(np.float32)})
-
-
-def global_batch(case: Case) -> Batch:
-    """The case's whole batch, drawn the same on every process."""
-    rng = np.random.default_rng(0)
-    batch: Batch = {}
-    if case.is_lm:
-        vocab = case.config["vocab_size"]
-        if not isinstance(vocab, int):
-            raise ValueError(f"{case.architecture}'s vocab_size is {vocab!r}, not an int")
-        width = case.seq_len + 1
-        prompt = width // 2
-        match case.decoder_objective:
-            case "mdlm":
-                # Rows of seq_len tokens, none of them the mask id, the
-                # vocabulary's last.
-                return {"text": rng.integers(0, vocab - 1, size=(case.batch_size, case.seq_len))
-                        .astype(np.int32)}
-            case "dpo":
-                # Pairs that share their prompt; the completions after it count.
-                pairs = rng.integers(0, vocab, size=(case.batch_size, 2, width)).astype(np.int32)
-                pairs[:, 1, :prompt] = pairs[:, 0, :prompt]
-                completion = np.zeros(pairs.shape, np.int32)
-                completion[:, :, prompt:] = 1
-                return {preferences.IDS_KEY: pairs, preferences.MASK_KEY: completion}
-            case "grpo":
-                # One rollout a row, a prompt and the response the mask counts:
-                # each row's advantage on its response tokens, and the
-                # sampler's likelihood near a fresh model's, so the ratios stay
-                # inside the clip and every token moves the gradient.
-                response = np.zeros((case.batch_size, width), np.float32)
-                response[:, prompt:] = 1
-                behavior = (rng.normal(-np.log(vocab), 0.05, size=response.shape) * response).astype(np.float32)
-                return {
-                    sessions.IDS_KEY: rng.integers(0, vocab, size=response.shape).astype(np.int32),
-                    sessions.SEGMENT_IDS_KEY: np.ones(response.shape, np.int32),
-                    sessions.POSITIONS_KEY: np.tile(np.arange(width, dtype=np.int32), (case.batch_size, 1)),
-                    sessions.RESPONSE_MASK_KEY: response,
-                    sessions.ADVANTAGES_KEY: (rng.normal(size=(case.batch_size, 1)) * response).astype(np.float32),
-                    sessions.BEHAVIOR_LOG_PROBS_KEY: behavior,
-                }
-        # A canvas row's target masks are read off the pad id, so a drawn zero
-        # would move the objective's own target support with the seed. Every
-        # other row takes it as an ordinary token.
-        lowest = 1 if case.canvas is not None else 0
-        tokens = rng.integers(lowest, vocab, size=(case.batch_size, width)).astype(np.int32)
-        batch["text"] = tokens if case.media is None else media_row(case, tokens, rng)
-        if case.decoder_objective == "sft":
-            # A user's turn, then the assistant's, which alone the loss counts.
-            roles = np.full((case.batch_size, width), Role.USER, np.int8)
-            roles[:, prompt:] = Role.ASSISTANT
-            batch[ROLES_KEY] = roles
-        if case.packed_documents:
-            # Equal documents tiling the row. A packed row from the loader is
-            # ragged and can end in padding; what the mask and the kernel cost
-            # see is how many segments the row carries, and equal ones make
-            # the case reproducible.
-            per_document = -(-width // case.packed_documents)
-            document = np.repeat(np.arange(case.packed_documents), per_document)[:width]
-            rows = (case.batch_size, 1)
-            batch["text_segment_ids"] = np.tile(document + 1, rows).astype(np.int32)
-            batch["text_positions"] = np.tile(
-                np.arange(width) - document * per_document, rows).astype(np.int32)
-    else:
-        sample_key = "video" if case.frames else "image"
-        batch[sample_key] = rng.integers(
-            0, 256, size=(case.batch_size, *case.sample_shape)).astype(np.float32)
-        if not case.is_jepa:
-            batch["text"] = CharTable.from_pretrained(tokens=TEXT_TOKENS).tokenize(["a flower"] * case.batch_size)
-    return batch
-
-
-def batches(case: Case, mesh: Mesh) -> Iterator[Batch]:
-    """This process's share of one host batch, reused: the loader is
-    benchmarked by benchmark_data.py. Every process draws the same global
-    batch and keeps the rows of the share `DataPartition.of` names, as many
-    as a loader would read."""
-    partition = DataPartition.of(mesh)
-    rows = partition.rows(case.batch_size)
-    start = partition.index * rows
-    mine = jax.tree.map(lambda leaf: leaf[start:start + rows], global_batch(case))
-    while True:
-        yield mine
 
 
 def step_bytes(executable: jax.stages.Compiled | None) -> int | None:
