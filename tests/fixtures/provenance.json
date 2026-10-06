@@ -108,6 +108,34 @@
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
+  "hf/gptj-tiny/losses.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/gptj-tiny/losses_f64.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/gptj-tiny/logits.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/gptj-tiny/logits_f64.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/gptj-tiny/padded_logits.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/gptj-tiny/padded_logits_f64.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/gptj-tiny/generated.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
   "attention_bf16.npz": {
    "tool": "tools/numerics_reference.py",
    "sources": [
@@ -3433,6 +3461,11 @@
    "tool": "tools/hf_reference.py",
    "what": "Falcon MQA/MHA weights, probe token ids and padded validity masks",
    "files": ["hf/falcon-tiny/model.safetensors", "hf/falcon-tiny/input_ids.npy", "hf/falcon-tiny/padded_ids.npy", "hf/falcon-tiny/attention_mask.npy", "hf/falcon-mha-tiny/model.safetensors", "hf/falcon-mha-tiny/input_ids.npy", "hf/falcon-mha-tiny/padded_ids.npy", "hf/falcon-mha-tiny/attention_mask.npy"]
+  },
+  {
+   "tool": "tools/hf_reference.py",
+   "what": "GPT-J weights, probe token ids and padded validity masks",
+   "files": ["hf/gptj-tiny/model.safetensors", "hf/gptj-tiny/input_ids.npy", "hf/gptj-tiny/padded_ids.npy", "hf/gptj-tiny/attention_mask.npy"]
   },
   {
    "tool": "tools/modelopt_nvfp4_reference.py",
