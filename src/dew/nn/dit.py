@@ -463,8 +463,7 @@ def _exact_gelu(hidden: jax.Array) -> jax.Array:
     Torch's erf form, not `gelu_exact`'s erfc, for speed: that step with exact
     GELU in every MLP, on an A100 (ABAB, 50 steps after 5 of warmup, equal
     peak memory), took 26.68/26.72 ms against erfc's 29.57/29.59 and tanh's
-    27.86 (Colab job dew-gpu-c20-gelu-a100-job-1, results under
-    ~/.cache/dew/integration/94e4c0093a44a944eabeee14ae1fbf693b40026b/).
+    27.86.
     The RTX 4080 measured erf slower than erfc, unverified since. In fp32 the
     erf form lies further from float64: U-ViT's output went from 1.090 to
     1.099 times the reference's error (tests/test_uvit_source.py)."""
