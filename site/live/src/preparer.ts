@@ -27,7 +27,10 @@ export async function prepareSnapshot(container: Container, commit: string, sour
 	const deadline = Date.now() + 180_000;
 	for (;;) {
 		try { if ((await port.fetch('http://container/health')).ok) break; } catch { /* Still starting. */ }
-		if (Date.now() > deadline || !container.running) throw new Error('offline shared models did not become ready');
+		if (Date.now() > deadline || !container.running) {
+			const logs = await (await container.exec(['sh', '-c', 'tail -c 6000 /run/dew/model.log /run/dew/gateway.log 2>/dev/null'])).output();
+			throw new Error(`offline shared models did not become ready (snapshot ${snapshot.id}): ${new TextDecoder().decode(logs.stdout)}`);
+		}
 		await scheduler.wait(500);
 	}
 	const credential = new ReadableStream<Uint8Array>({ start(controller) {
