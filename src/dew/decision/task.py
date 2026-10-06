@@ -52,7 +52,6 @@ from dew.decision.questions import (
     ScoreAnswer,
 )
 from dew.inference.tasks import SHAPE_BUCKETS
-from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import RowPlan, mesh_of
 from dew.objectives.base import Metric, Variables
 from dew.records import JSON, json_value, record
@@ -169,10 +168,9 @@ class Decide:
 
         record = run_record(directory, step)
         backbone = _saved_model(record, dtype).build()
-        if not isinstance(backbone, CausalTransformer):
-            raise TypeError(f"the run's backbone is a {type(backbone).__name__}, not a CausalTransformer")
+        width, head_dtype = DecisionModel.head_size(backbone)
         model = DecisionModel(backbone, Head.from_record(records.json_value(record["head"], "head"),
-                                                         backbone.emb_features, dtype=backbone.dtype))
+                                                         width, dtype=head_dtype))
         laid = records.record(record["layout"], "layout")
         rows = from_record(_LAYOUTS[records.text(laid["name"], "layout.name")],
                            records.json_value(laid["fields"], "layout.fields"))
