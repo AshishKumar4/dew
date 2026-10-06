@@ -133,7 +133,7 @@ def wrappers() -> list[str]:
 
 
 def pipelines() -> list[str]:
-    from dew.interop.pretrained import _PIPELINE_POLICY
+    from dew.interop.diffusion_pipelines import _PIPELINE_POLICY
 
     return list(_PIPELINE_POLICY)
 

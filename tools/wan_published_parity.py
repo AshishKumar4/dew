@@ -189,7 +189,8 @@ def native(directory, args, stages, expected) -> tuple[dict[str, dict[str, float
     import jax.numpy as jnp
 
     from dew.diffusion.process import DenoisingCondition
-    from dew.interop.pretrained import _denoiser, load_diffusion_source
+    from dew.interop.diffusion_components import _denoiser
+    from dew.interop.pretrained import load_diffusion_source
     from dew.nn.autoencoders.wan import load_wan_vae
     from dew.sampling.pipelines import DenoisingInputs
 

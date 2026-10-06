@@ -199,7 +199,7 @@ def test_the_released_configs_and_weight_maps_translate():
     parameter path of its own."""
     from dew.interop import hf_decoders
     from dew.interop.diffusion import _qwen_image_path
-    from dew.interop.pretrained import _qwen_text_path, _qwen_vl_text_config
+    from dew.interop.diffusion_components import _qwen_text_path, _qwen_vl_text_config
     from dew.nn.autoencoders.qwen_image import QwenImageVAE, qwen_image_vae_fields
 
     def read(name):

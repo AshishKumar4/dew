@@ -61,7 +61,7 @@ def main(repo: str, revision: str) -> dict[str, float]:
     from dew.diffusion.process import DenoisingCondition
     from dew.inputs.diffusion import HiddenStatesConditioner
     from dew.interop import sources
-    from dew.interop.pretrained import _denoiser, _diffusion_vae
+    from dew.interop.diffusion_components import _denoiser, _diffusion_vae
 
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
