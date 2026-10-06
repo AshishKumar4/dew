@@ -535,6 +535,47 @@ def test_a_rank_that_raises_between_collectives_stops_the_pool():
     assert time.monotonic() - started < 120, done.stdout + done.stderr
 
 
+@pytest.mark.mesh(devices=2)
+def test_a_pool_forms_and_fails_together_after_orbaxs_public_multihost_loads():
+    """Importing orbax.checkpoint.multihost replaces the private module that
+    `from orbax.checkpoint import multihost` had named, and the public one
+    has no accessor for jax.distributed's client: every rank of such a pool
+    failed to start. It forms, and rank 1's failure still ends it."""
+    done = launch("--processes-per-host", "2", "--", sys.executable, "-c",
+                  "import orbax.checkpoint.multihost\n"
+                  + stepping_pool("raise RuntimeError('injected failure')"), devices=1, timeout=600)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "RuntimeError: injected failure" in done.stdout
+    assert "AttributeError" not in done.stdout + done.stderr
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_failure_no_agreement_hears_ends_the_peer_after_the_grace():
+    """Rank 1 publishes a failure and ends its program; rank 0 waits on its
+    host and never fails. Only the coordination service carries the failure
+    to rank 0, whose watch ends it once the grace has passed unheard."""
+    program = ("import orbax.checkpoint.multihost\n"
+               "import os, threading\n"
+               "import dew.coordination as coordination\n"
+               "coordination.FAILURE_GRACE_SECONDS = 3.0\n"
+               "coordination.FAILURE_POLL_SECONDS = 0.5\n"
+               "from dew.training.runtime import prepare_process\n"
+               "prepare_process()\n"
+               "import jax\n"
+               "if jax.process_index() == 1:\n"
+               "    coordination.publish_failure(RuntimeError('injected failure'), 'a step')\n"
+               "else:\n"
+               "    threading.Event().wait()\n")
+    started = time.monotonic()
+    done = launch("--processes-per-host", "2", "--", sys.executable, "-c", program, devices=1, timeout=300)
+    output = done.stdout + done.stderr
+    assert done.returncode != 0, output
+    heard = [line for line in output.splitlines() if line.startswith("[0]") and "injected failure" in line]
+    assert heard and "failed in a step: RuntimeError: injected failure" in heard[0], output
+    assert "No agreement heard that failure in 3 s" in output, output
+    assert time.monotonic() - started < 120, output
+
+
 @pytest.mark.mesh(devices=4)
 def test_a_stopped_pool_ends_its_ranks_without_aborts():
     """Rank 3 fails and the launch stops ranks 0 to 2, which wait. A JAX
