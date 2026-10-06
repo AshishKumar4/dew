@@ -60,7 +60,7 @@ const native = `${setup.trimEnd()}\n\n${cell.replace('from model_client import C
 		<div class="sampler-bar" data-bar aria-hidden="true"><span></span></div>
 		<figcaption>
 			<p class="sampler-status" data-status aria-live="polite">
-				{liveEnabled && 'Run starts a kernel on a 4-vCPU Cloudflare container, with JAX on the CPU.'}
+				{liveEnabled && 'Run opens an isolated Python context backed by the shared Dew model on a 4-vCPU CPU host.'}
 			</p>
 			<p class="sampler-detail" data-detail></p>
 		</figcaption>
