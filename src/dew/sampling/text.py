@@ -33,10 +33,12 @@ from jax.experimental import checkify
 from jax.typing import ArrayLike
 from typing_extensions import TypeVar
 
+from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.dspark import DSpark
 from dew.nn.inputs import ModelInputs, PredictionPhase, Request, local_rows, mesh_of
-from dew.nn.kv_cache import Layered, gather_cache_rows, refuse_unassigned
+from dew.nn.kv_cache import Layered, gather_cache_rows, refuse_unassigned, write_cache
+from dew.nn.rope import LongRopeScaling
 from dew.objectives.base import Variables
 from dew.sampling import decoding, strategies
 from dew.sampling.decoding import (
@@ -410,6 +412,15 @@ def _prefill(model: nn.Module, params: Variables, inputs: ModelInputs, ops: Deco
         axis=tuple(range(1, logical.ndim))) + 1
     state = DecoderState(updated["cache"], drawn, positions,
                          None if states is None else states[rows, slot])
+    if isinstance(model, CausalTransformer) and isinstance(model.rope_scaling, LongRopeScaling):
+        if cache is not None or logical is not None or inputs.conditioning:
+            raise ValueError('LongRoPE cache rebuilding requires a fresh text prompt '
+                             'without custom coordinates')
+        lengths = jnp.sum(real, axis=1, dtype=jnp.int32)
+        slots = jnp.where(real, jnp.cumsum(real, axis=1, dtype=jnp.int32) - 1, -1)
+        history = write_cache(jnp.zeros((batch, model.max_seq_len), inputs.tokens.dtype),
+                              inputs.tokens, slots)
+        state = dataclasses.replace(state, tokens=history, lengths=lengths)
     prepared = jax.tree.leaves(updated.get("embeddings", {}))
     if ops.depths > 1 and states is not None:
         # Every later depth needs a predecessor slot in the carry from the
@@ -501,6 +512,8 @@ def _operations(model: nn.Module, params: Variables, pad_id: int, depths: int) -
     Parameters stay unmapped: every operation reads the same tree, and only
     the cache moves with the rows. A model with a block drafter hands its
     drafter's context back as the states `verify` returns.
+    A LongRoPE crossing costs one full-prefix forward over the whole batch
+    to keep static shapes; it happens once per request.
     """
     exposed = isinstance(model, Exposing)
     blocks = _block_drafting(model, params) if isinstance(model, BlockDrafting) and model.dspark else None
@@ -511,11 +524,53 @@ def _operations(model: nn.Module, params: Variables, pad_id: int, depths: int) -
         width = tokens.shape[1]
         positions = ({} if state.positions is None else
                      {"positions": state.positions[:, None] + jnp.arange(width)[None, :]})
-        answer, updated = model.apply(
-            {**params, "cache": state.cache}, jnp.where(valid, tokens, pad_id),
-            decode=True, attention_mask=valid, mutable=["cache", *recorded], rngs=None,
-            method="states_and_logits" if exposed else None,
-            capture_intermediates=False, **positions)
+        def append():
+            return model.apply(
+                {**params, "cache": state.cache}, jnp.where(valid, tokens, pad_id),
+                decode=True, attention_mask=valid, mutable=["cache", *recorded], rngs=None,
+                method="states_and_logits" if exposed else None,
+                capture_intermediates=False, **positions)
+
+        history, lengths = state.tokens, state.lengths
+        if (isinstance(model, CausalTransformer) and isinstance(model.rope_scaling, LongRopeScaling)
+                and history is not None and lengths is not None):
+            slots = lengths[:, None] + jnp.cumsum(valid, axis=1, dtype=jnp.int32) - 1
+            history = write_cache(history, tokens, jnp.where(valid, slots, -1))
+            following = lengths + jnp.sum(valid, axis=1, dtype=jnp.int32)
+            original = model.rope_scaling.original_max_position_embeddings
+            crossing = (lengths <= original) & (following > original)
+            ordinary = append()
+
+            def rebuild():
+                """Recompute the prefix at its new table, Phi-3's intended policy.
+
+                Transformers 5.16.1 slices to one token before clearing KV:
+                at the tiny fixture's position 8 its hook sees [[32], [59]],
+                no cache, and predicts 2 where its full-prefix forward predicts
+                32. Rebuilding the prefix retains the prompt's information.
+                https://github.com/huggingface/transformers/issues/49334
+                """
+                empty = model.apply(params, tokens.shape[0],
+                                     method='init_cache', mutable=['cache'])[1]['cache']
+                answer, updated = model.apply(
+                    {**params, 'cache': empty}, history,
+                    attention_mask=jnp.arange(history.shape[1])[None, :] < following[:, None],
+                    decode=True, mutable=['cache'], method='states_and_logits')
+                states, logits = answer
+                rows = jnp.arange(tokens.shape[0])[:, None]
+                rebuilt = (states[rows, slots], logits[rows, slots]), updated
+
+                def replaced(fresh, held):
+                    selected = crossing.reshape(-1, *(1,) * (fresh.ndim - 1))
+                    return jnp.where(selected, fresh, held)
+
+                return jax.tree.map(replaced, rebuilt, ordinary)
+
+            answer, updated = jax.lax.cond(
+                jnp.any(crossing), rebuild, lambda: ordinary)
+            lengths = following
+        else:
+            answer, updated = append()
         states, logits = answer if exposed else (None, answer)
         if blocks is not None:
             states = _context(model, params, updated)
@@ -523,6 +578,7 @@ def _operations(model: nn.Module, params: Variables, pad_id: int, depths: int) -
                  state.positions + jnp.sum(valid, axis=1, dtype=state.positions.dtype))
         return (dataclasses.replace(state, cache=updated["cache"], logits=logits[:, -1],
                                     positions=moved,
+                                    tokens=history, lengths=lengths,
                                     hidden=None if states is None else states[:, -1]),
                 logits, states)
 

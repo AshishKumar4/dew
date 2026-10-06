@@ -19,7 +19,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.kv_cache import KVCache
-from dew.nn.rope import RopeScaling, YarnScaling
+from dew.nn.rope import LongRopeScaling, RopeScaling, YarnScaling
 from dew.registry import mixers as mixers  # the registry every kind module imports from here
 
 
@@ -45,7 +45,7 @@ class MixerContext:
     causal: bool = True
     rope_theta: float = 10000.0
     """The kind-resolved rotary base; a kind's yarn record transforms it."""
-    rope_scaling: RopeScaling | None = None
+    rope_scaling: RopeScaling | LongRopeScaling | None = None
     """The kind-resolved llama3 ramp over the base frequencies, or None for plain rope."""
     qk_norm: bool = True
     qk_norm_scope: str = 'head'

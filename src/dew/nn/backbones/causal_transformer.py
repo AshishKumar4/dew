@@ -63,7 +63,7 @@ from ..mixers.mamba2 import Mamba2Mixer
 from ..mla import INDEXER_COLLECTION
 from ..moe import GatedActivation, Situ
 from ..precision import at_least_fp32, head_dot_general, head_product, scaled
-from ..rope import RopeScaling, YarnScaling
+from ..rope import LongRopeScaling, RopeScaling, YarnScaling, rope_scaling_from_record
 from ..sharding import (
     RESIDUAL,
     STAGE_AXIS,
@@ -610,7 +610,7 @@ class CausalTransformer(nn.Module):
     position_embedding_offset: int = 0
     """The number of reserved rows before learned position zero; OPT checkpoints have two."""
     rope_theta: float = 10000.0              # the base a kind does not override
-    rope_scaling: RopeScaling | None = None  # Llama 3.1's ramp, unless a kind states its own
+    rope_scaling: RopeScaling | LongRopeScaling | None = None
     partial_rotary_factor: float | None = None  # None: every dim rotates
     partial_rotary_type: str = 'proportional'  # 'proportional' (Gemma 4) | 'default' (Qwen3.5)
     layer_types: tuple[str, ...] | None = None  # the pattern, one kind per layer
@@ -787,11 +787,12 @@ class CausalTransformer(nn.Module):
         for name, record in (("altup", AltUp), ("hyper_connections", HyperConnections),
                              ("mtp_hyper_connections", HyperConnections),
                              ("attention_residuals", AttentionResiduals), ("engram", Engram),
-                             ("dspark", DSpark), ("yarn", YarnScaling), ("mixture", Mixture),
-                             ("rope_scaling", RopeScaling)):
+                             ("dspark", DSpark), ("yarn", YarnScaling), ("mixture", Mixture)):
             value = getattr(self, name)
             if isinstance(value, Mapping):
                 object.__setattr__(self, name, record(**value))
+        if isinstance(self.rope_scaling, Mapping):
+            object.__setattr__(self, 'rope_scaling', rope_scaling_from_record(self.rope_scaling))
         if isinstance(self.mlp, Mapping):
             # A config states SiTU's betas as a record in the activation's place.
             object.__setattr__(self, "mlp", from_record(Situ, self.mlp))
@@ -950,7 +951,10 @@ class CausalTransformer(nn.Module):
             "attention_chunk": kind.chunk,
             "k_eq_v": self.attention_k_eq_v and kind.window is None,
             "kv_shared": kv_shared, "kv_store_key": layer_type,
-            "partial_rotary_factor": None if kind.window is not None else self.partial_rotary_factor,
+            # LongRoPE's factors fix the rotated width on every layer;
+            # Gemma's windowed layers otherwise rotate whole heads.
+            "partial_rotary_factor": (self.partial_rotary_factor if kind.window is None
+                                      or isinstance(kind.rope_scaling, LongRopeScaling) else None),
             "init_std": self.init_stds[0], "output_init_std": self.init_stds[1]}
         return MixerContext(**resolved, **{field.name: getattr(self, field.name)
                                            for field in dataclasses.fields(MixerContext)
