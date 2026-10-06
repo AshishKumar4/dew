@@ -2003,12 +2003,12 @@ def _input_quantization(model: nn.Module, layouts: tuple[WeightLayout, ...],
     member, which this per-Linear binding cannot compute, so they are refused
     before returning a model with the wrong activation forward.
     """
-    from dew.training.quantization import NVFP4Input, checkpoint_input_quantization
+    from dew.training.quantization import FP8Input, NVFP4Input, checkpoint_input_quantization
 
     codec = source_quantization(config)
     if codec is None or codec.input_scale_dtype is None:
         return model
-    inputs = {}
+    inputs: dict[str, FP8Input | NVFP4Input] = {}
     for layout in layouts:
         part = layout.name.removesuffix('.weight') + codec.input_suffix
         if part not in grid:
@@ -2022,8 +2022,11 @@ def _input_quantization(model: nn.Module, layouts: tuple[WeightLayout, ...],
             raise ValueError(f"{part} must be one float32 stored global scale, "
                              f"got {scale.dtype} {scale.shape}")
         path = '/'.join(layout.paths[0][1:-1])
-        inputs[path] = NVFP4Input(float(scale.reshape(())), codec.input_scale_dtype == 'float8_e4m3fn',
-                                 format=codec.input_format)
+        if codec.input_kind(layout.name) == 'fp8':
+            inputs[path] = FP8Input(float(scale.reshape(())))
+        else:
+            inputs[path] = NVFP4Input(float(scale.reshape(())), codec.input_scale_dtype == 'float8_e4m3fn',
+                                     format=codec.input_format)
     if len(inputs) != sum(name.endswith(codec.input_suffix) for name in grid):
         raise ValueError("NVFP4 input scales must each bind one Linear scope; "
                          "an unbound scale would drop QDQ")

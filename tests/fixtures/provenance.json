@@ -108,6 +108,14 @@
    ],
    "note": "Documented generation environment also uses Torch 2.8.0."
   },
+  "codecs/modelopt/mixed/reference.npz": {
+   "tool": "tools/modelopt_nvfp4_reference.py",
+   "sources": [
+    {"repo": "NVIDIA/Model-Optimizer", "version": "0.47.0", "runs": "modelopt"},
+    {"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}
+   ],
+   "note": "Mixed tiny Qwen3 exported by ModelOpt: tensor-scaled FP8 attention weights/static input quantizers and W4A16_NVFP4 feed-forward weights. The exported quantized_layers table is authoritative over generic config_groups. FP8QTensor/NVFP4QTensor read the same files; static FP8 inputs use the author's fp8_eager arithmetic and recorded input scales. Continuous operations widen for float64, discrete QDQ stays fp32."
+  },
   "codecs/modelopt/tiny/reference.npz": {
    "tool": "tools/modelopt_nvfp4_reference.py",
    "sources": [
@@ -3243,7 +3251,8 @@
   {
    "tool": "tools/modelopt_nvfp4_reference.py",
    "what": "author-exported tiny ModelOpt checkpoint and 32 real pinned q_proj rows",
-   "files": ["codecs/modelopt/tiny/model.safetensors", "codecs/modelopt/real/model.safetensors"]
+   "files": ["codecs/modelopt/tiny/model.safetensors", "codecs/modelopt/real/model.safetensors",
+             "codecs/modelopt/mixed/model.safetensors"]
   },
   {
    "tool": "tools/nvfp4_storage_reference.py",
