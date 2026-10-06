@@ -114,6 +114,12 @@ final step: 10 latest: 10
 
 Saves are asynchronous, and `wait()` returns once they are durable. Constructing `Checkpoints` opens nothing, because the Orbax managers are created on first use.
 
+## Weights no step moves
+
+Every variables collection except `params` goes to `frozen/<digest>` beside the step directories, once per distinct content. That includes a LoRA run's `frozen` base, a pipeline's text towers and autoencoder, `constants` and batch statistics, and the same collections of the EMA copy. Each step records the digest of each collection. A LoRA fine-tune of Stable Diffusion 1.5 writes its 2.1 GB base once instead of in every checkpoint, and each step holds the 13 MB of factors plus their optimizer state (sizes from a LoRA rank-16 run). A collection that changes, such as batch statistics, gets a new entry each time it changes. The next save deletes any entry that no kept step records, so pruning a step never removes weights a kept step still needs.
+
+The digest covers the bytes as stored. A restore checks each entry against the step and refuses one whose content changed, whatever dtypes JAX allows at the time. Each step names its entries relative to the run directory, so a run directory copied elsewhere restores as it is. `dew.io.publish` uploads or references a step together with its `run.json` and the entries the step records, in the same layout.
+
 ## Best weights and early stopping
 
 Evaluation produces the scores that decide which step is best, and the checkpointer keeps those steps on disk. To choose the score, pass `best` the object that produces it, usually one of the metric objects `fit` evaluates. The metric's `Shown(better="lower" | "higher")` gives the direction. A metric without a direction is refused unless `Best(..., mode="min" | "max")` gives one.

@@ -16,6 +16,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 
+from ..activations import UNGATED, ungated_activation
 from ..attention import RMSNorm
 from ..attention_residuals import DepthAttention, ResidualSite, sources
 from ..blocks import normal_kernel
@@ -31,7 +32,7 @@ from ..hyper_connections import (
 from ..inputs import LayerInputs, PredictionPhase
 from ..mixers.attention import CausalSelfAttention
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, GatedActivation, SparseMLP, gated_product
-from ..precision import at_least_fp32, scaled
+from ..precision import scaled
 from ..sharding import MLP_HIDDEN, RESIDUAL, constrain, logical_axes
 
 STREAMS = ("activation_batch", "activation_length", None, "activation_embed")
@@ -165,31 +166,6 @@ class Mixture:
             dtype=dtype, precision=precision)
 
 
-UNGATED = ('gelu', 'gelu_exact', 'relu', 'relu2')
-"""The activations an ungated feed-forward takes, by `ungated_activation`'s names."""
-
-
-def ungated_activation(activation: str, x: jax.Array) -> jax.Array:
-    """`x` through one of the `UNGATED` activations, in `x`'s dtype.
-
-    `gelu` is the tanh form and `gelu_exact` the erf form, both computed in at
-    least fp32. The erf form uses Torch's `1 + erf` arithmetic, which the
-    converted checkpoints were trained with; `jax.nn.gelu(approximate=False)`
-    goes through erfc and rounds the negative tail differently. `relu2` is the
-    squared relu.
-    """
-    if activation == 'relu':
-        return nn.relu(x)
-    if activation == 'relu2':
-        return jnp.square(nn.relu(x))
-    work = x.astype(at_least_fp32(x.dtype))
-    if activation == 'gelu_exact':
-        return (.5 * work * (1 + jax.lax.erf(work * math.sqrt(.5)))).astype(x.dtype)
-    if activation == 'gelu':
-        return nn.gelu(work).astype(x.dtype)
-    raise ValueError(f"the ungated activations are {UNGATED}, got {activation!r}")
-
-
 @logical_axes({
     ("gate_proj",): ("embed", "mlp"),
     ("up_proj",): ("embed", "mlp"),
@@ -202,7 +178,7 @@ class GatedMLP(nn.Module):
     gelu (HF's gelu_pytorch_tanh), and geglu_exact is the erf form (HF's gelu).
     A `Situ` is Kimi K3's SiTU, which transforms both halves
     (`dew.nn.moe.gated_product`). The `UNGATED` activations build the ungated
-    MLP with two projections (`ungated_activation`).
+    MLP with two projections (`dew.nn.activations.ungated_activation`).
 
     `activation_sparsity` is Gemma 3n's gaussian top-k on the gate
     (`dew.nn.gemma3n.gaussian_topk`). `swiglu_limit` is the clamp that

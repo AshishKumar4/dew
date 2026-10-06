@@ -566,3 +566,25 @@ def test_a_learning_rate_schedule_is_a_typed_record_that_round_trips():
                           param_groups=ParamGroup.mup(4.0)))
     loaded = RunConfig.from_dict(json.loads(json.dumps(config.to_dict())))
     assert loaded == config
+
+
+def test_param_groups_with_schedules_momentum_and_bounds_round_trip():
+    """A run's record reads back each group's schedules, `every` included,
+    its bounds, and the config's own one-cycle schedule."""
+    from dew.training.optim import Cosine, Exponential, OneCycle, ParamGroup
+    momentum = OneCycle(peak=0.85, init=0.95, end=0.95, every=40)
+    config = RunConfig(
+        data=datasets["array_record_images"](image_size=64, shards=("cc12m",)),
+        trainer=TrainerConfig(steps=1),
+        optim=OptimConfig(
+            optimizer="adam", schedule=Exponential(init=1e-3, end=1e-5, decay_steps=8, offset=1e-6),
+            param_groups=(
+                ParamGroup("delays", ("*/delay",), schedule=Cosine(peak=0.1, warmup_steps=0, every=40),
+                           bounds=(0.0, 24.0)),
+                ParamGroup("weights", ("*/kernel",), weight_decay=1e-5,
+                           schedule=OneCycle(peak=5e-3, every=40), b1=momentum),
+                ParamGroup("rest", ("*",), schedule=OneCycle(peak=5e-3, warmup_fraction=0.25), b1=momentum),
+            )))
+    loaded = RunConfig.from_dict(json.loads(json.dumps(config.to_dict())))
+    assert loaded == config
+    assert loaded.optim.param_groups[0].bounds == (0.0, 24.0)

@@ -17,6 +17,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 from flax import linen as nn
+from model_support import TINY_DECODER
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import LayerKind
@@ -24,8 +25,7 @@ from dew.nn.mixers import AttentionMixer, MixerBase, MixerContext, mixers
 from dew.registry import models
 
 VOCAB = 37
-TINY = {"vocab_size": VOCAB, "emb_features": 32, "num_layers": 2, "num_heads": 4,
-            "mlp_features": 64, "max_seq_len": 16}
+TINY = {"vocab_size": VOCAB, **TINY_DECODER}
 
 
 def tiny(**overrides):

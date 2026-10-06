@@ -31,15 +31,17 @@ Run in the isolated reference environment (diffusers 0.40.0, transformers
 
 from __future__ import annotations
 
-import contextlib
 import json
-import math
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 import torch
+from diffusers_reference_helpers import (
+    rounded_frequency_table as rounded_frequency_table,
+    rounded_timestep_embedding as rounded_timestep_embedding,
+)
 
 DIFFUSERS = "0.40.0"
 BASE = {"patch_size": 1, "in_channels": 8, "num_layers": 2, "num_single_layers": 2, "attention_head_dim": 16,
@@ -66,32 +68,6 @@ CASES: dict[str, Case] = {
     "unguided": Case({"guidance_embeds": False, "num_layers": 1, "num_single_layers": 3}),
     "narrow": Case({"mlp_ratio": 2.0, "eps": 1e-3, "out_channels": 4, "rope_theta": 10000}, grid=(2, 6)),
 }
-
-
-def rounded_timestep_embedding(timesteps, embedding_dim, flip_sin_to_cos=False,
-                               downscale_freq_shift=1, scale=1, max_period=10000):
-    """The source's `get_timestep_embedding` with its exponential taken in
-    float64 and rounded once to float32, the table Dew builds on the host."""
-    half = embedding_dim // 2
-    exponent = -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32)
-    table = torch.exp((exponent / (half - downscale_freq_shift)).double()).float()
-    angle = scale * (timesteps[:, None].float() * table[None, :])
-    embedded = torch.cat([torch.sin(angle), torch.cos(angle)], dim=-1)
-    if flip_sin_to_cos:
-        embedded = torch.cat([embedded[:, half:], embedded[:, :half]], dim=-1)
-    return embedded
-
-
-@contextlib.contextmanager
-def rounded_frequency_table():
-    from diffusers.models import embeddings
-
-    original = embeddings.get_timestep_embedding
-    embeddings.get_timestep_embedding = rounded_timestep_embedding
-    try:
-        yield
-    finally:
-        embeddings.get_timestep_embedding = original
 
 
 def ids(rows: int, columns: int) -> tuple[torch.Tensor, torch.Tensor]:

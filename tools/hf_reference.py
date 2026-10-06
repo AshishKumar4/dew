@@ -80,7 +80,7 @@ from transformers import (
     AutoModelForCausalLM, AutoTokenizer, BloomConfig, BloomForCausalLM, DeepseekV3Config, DeepseekV3ForCausalLM,
     Gemma2Config, Gemma2ForCausalLM, Gemma3Config, Gemma3ForCausalLM, Gemma3TextConfig,
     GemmaConfig, GemmaForCausalLM, GPTNeoConfig, GPTNeoForCausalLM, LlamaConfig, LlamaForCausalLM,
-    PhiConfig, PhiForCausalLM,
+    PhiConfig, PhiForCausalLM, Phi3Config, Phi3ForCausalLM,
     FalconConfig, FalconForCausalLM,
     GPTJConfig, GPTJForCausalLM,
     Qwen3Config, Qwen3ForCausalLM, MistralConfig, MistralForCausalLM, PreTrainedModel,
@@ -195,6 +195,26 @@ def tiny_gptj() -> GPTJForCausalLM:
     return GPTJForCausalLM(GPTJConfig(
         vocab_size=64, n_embd=32, n_inner=48, n_layer=2, n_head=4, rotary_dim=4, n_positions=48,
         layer_norm_epsilon=3e-5, resid_pdrop=0., embd_pdrop=0., attn_pdrop=0.,
+        bos_token_id=1, eos_token_id=None, pad_token_id=0))
+
+
+PHI3_CONFIGS = (
+    ('phi3-mini-4k', 'microsoft/Phi-3-mini-4k-instruct', 'f39ac1d28e925b323eae81227eaba4464caced4e'),
+    ('phi4-mini', 'microsoft/Phi-4-mini-instruct', 'cfbefacb99257ffa30c83adab238a50856ac3083'),
+)
+
+
+def tiny_phi3() -> Phi3ForCausalLM:
+    """Unequal fused qkv widths, a window and two nontrivial LongRoPE tables."""
+    torch.manual_seed(0)
+    return Phi3ForCausalLM(Phi3Config(
+        vocab_size=64, hidden_size=32, intermediate_size=48, num_hidden_layers=2,
+        num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=48,
+        original_max_position_embeddings=8, sliding_window=5, rms_norm_eps=3e-5,
+        rope_parameters={'rope_type': 'longrope', 'rope_theta': 10000.,
+                         'short_factor': [1.1, 1.3, 1.5, 1.7], 'long_factor': [2., 3., 4., 5.],
+                         'original_max_position_embeddings': 8, 'factor': 6.},
+        resid_pdrop=0., embd_pdrop=0., attention_dropout=0.,
         bos_token_id=1, eos_token_id=None, pad_token_id=0))
 
 
@@ -1597,8 +1617,8 @@ def main() -> None:
                         help="only the tiny fixtures, no 1.5 GB download")
     parser.add_argument("--nemotron-h-only", action="store_true",
                         help="only the Nemotron-H tiny fixture and two pinned released configs")
-    parser.add_argument('--classic-family', choices=('bloom', 'gpt_neo', 'phi', 'falcon', 'gptj'),
-                        help='only this classic decoder fixture and its pinned released config')
+    parser.add_argument('--classic-family', choices=('bloom', 'gpt_neo', 'phi', 'phi3', 'falcon', 'gptj'),
+                        help='only this classic decoder fixture and its pinned released configs')
     parser.add_argument('--minimax-m2-only', action='store_true',
                         help='only MiniMax-M2 with transformers 5.18.0 and its pinned configs')
     parser.add_argument('--qwen2-moe-only', action='store_true',
@@ -1631,6 +1651,11 @@ def main() -> None:
     if args.classic_family == 'gptj':
         write_classic_tiny('gptj-tiny', tiny_gptj())
         write_released_config(*GPTJ_CONFIG)
+        return
+    if args.classic_family == 'phi3':
+        write_classic_tiny('phi3-tiny', tiny_phi3())
+        for config in PHI3_CONFIGS:
+            write_released_config(*config)
         return
     if args.minimax_m2_only:
         write_minimax_m2()

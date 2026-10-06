@@ -77,14 +77,6 @@ REFUSED = {
         "b565cf6caebdb7a1eadf00100857b1ed5e044f12",
         r"Ernie4_5ForCausalLM and llama disagree",
     ),
-    # Phi-3's longrope and fused projections. Only OPT's reader, which reads
-    # no rotary field, takes the config, and the probe cannot shrink
-    # longrope's per-frequency factors to its head width.
-    "phi3": (
-        "microsoft/Phi-4-mini-instruct",
-        "cfbefacb99257ffa30c83adab238a50856ac3083",
-        r"(?s)builds no causal LM from its shrunken config .*short_factor",
-    ),
     # OLMo 2's q/k norms over the whole projection and its post-norms.
     "olmo2": (
         "allenai/OLMo-2-0425-1B",
@@ -250,3 +242,15 @@ def test_a_census_repo_that_deviates_is_refused_before_its_weights(model_type):
     with pytest.raises(ValueError, match=reason) as refused:
         Pretrained.load(repo, revision=revision, dtype="float32")
     assert TORCHAX in str(refused.value)
+
+
+@pytest.mark.network
+def test_phi3_longrope_census_config_loads_natively():
+    from dew.interop.hf_decoders import translate_config
+    from dew.nn.rope import LongRopeScaling
+
+    config = AutoConfig.from_pretrained('microsoft/Phi-4-mini-instruct',
+                                        revision='cfbefacb99257ffa30c83adab238a50856ac3083')
+    model = translate_config(config.to_dict()).value
+    assert isinstance(model.rope_scaling, LongRopeScaling)
+    assert len(model.rope_scaling.short_factor) == model.features_per_head // 2

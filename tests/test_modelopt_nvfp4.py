@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from interop_support import assert_same_stored_tensors
 from reference_error import assert_as_exact_as_the_reference
 
 from dew.interop import Pretrained, codecs
@@ -81,11 +82,7 @@ def test_modelopt_save_keeps_the_original_packed_bytes_and_input_multipliers(che
     directory, reference, loaded = checkpoint
     loaded.save(tmp_path)
     original, written = read_weights(directory), read_weights(tmp_path)
-    assert set(original) == set(written)
-    for name, value in original.items():
-        assert value.dtype == written[name].dtype, name
-        np.testing.assert_array_equal(value.reshape(-1).view(np.uint8),
-                                      written[name].reshape(-1).view(np.uint8), err_msg=name)
+    assert_same_stored_tensors(written, original)
     reloaded = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
     actual = reloaded.model.apply(reloaded.variables, reference["ids"].astype(np.int32))
     assert_as_exact_as_the_reference(actual, reference["logits"], reference["logits_f64"], "ModelOpt export")

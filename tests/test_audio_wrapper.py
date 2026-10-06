@@ -13,9 +13,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from interop_support import gemma_features
 from jax.experimental import checkify
 from safetensors.numpy import load_file
-from test_audio import gemma_features
 
 from dew.interop.hf_decoders import translate_config, translate_weights
 from dew.nn import vision as V

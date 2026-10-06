@@ -114,6 +114,13 @@ def integers(value: object, key: str) -> tuple[int, ...]:
     return tuple(integer(entry, key) for entry in value)
 
 
+def numbers(value: object, key: str) -> tuple[float, ...]:
+    """One list of finite numbers: per-frequency rotary factors."""
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"{key}={value!r}: this field is a list of numbers")
+    return tuple(number(entry, key) for entry in value)
+
+
 def json_value(value: object, key: str) -> JSON:
     """One field narrowed to the JSON its file carries, section and all.
 

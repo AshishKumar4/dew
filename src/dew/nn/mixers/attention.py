@@ -40,6 +40,7 @@ from dew.nn.kv_cache import TABLE, Append, KVCache, KVStore, filled_slots, rotat
 from dew.nn.mixer_base import MixerBase, MixerContext, mixers
 from dew.nn.precision import at_least_fp32, scaled
 from dew.nn.rope import (
+    LongRopeScaling,
     RopeScaling,
     YarnScaling,
     apply_rotary,
@@ -119,7 +120,7 @@ class CausalSelfAttention(nn.Module):
     max_seq_len: int
     causal: bool = True
     rope_theta: float = 10000.0
-    rope_scaling: RopeScaling | None = None  # Llama 3.1's ramp over the base frequencies
+    rope_scaling: RopeScaling | LongRopeScaling | None = None
     qk_norm: bool = True
     qk_norm_scope: str = 'head'  # 'head': one RMSNorm per head; 'projection': over the whole q/k
     v_norm: bool = False

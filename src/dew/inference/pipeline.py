@@ -120,7 +120,7 @@ def _from_run(root: epath.Path, *, mesh: MeshSpec | None, layout: Layout | None,
 def _from_source(source: str, *, mesh: MeshSpec | None, layout: Layout | None,
                  dtype: str | None, param_dtype: str | None,
                  revision: str | None) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration:
-    from dew.inference.serving import _inference_projections
+    from dew.inference.projections import _inference_projections
     from dew.interop import (
         Pretrained,
         PretrainedBlockDecoder,

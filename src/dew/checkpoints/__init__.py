@@ -36,6 +36,8 @@ from __future__ import annotations
 import copy
 import dataclasses
 import datetime
+import hashlib
+import json
 import math
 import os
 from collections.abc import Callable, Mapping, Sequence
@@ -72,6 +74,16 @@ STATE_LEAVES = ("step", "microstep", "updates", "variables", "opt_state", "ema",
                 "scale", "window_size", "accumulation")
 """The train-state fields a checkpoint persists; anything outside this tuple
 is rebuilt on resume."""
+
+FROZEN_STORE = "frozen"
+"""The directory beside the steps that holds every variables collection but
+`params` once, under the digest of its content (`_digest`). A step records
+each collection's digest and holds `params` and the optimizer state itself,
+so weights no step moves (a LoRA run's frozen base, a pipeline's towers) are
+written once a run, and a collection a step does move (batch statistics) is
+written again only when it changes. A digest no kept step records is
+deleted. The step names it relative to the run directory, so a copied run
+still restores."""
 
 RUN_FILE = "run.json"
 """The run record `RunConfig.save` writes into the run directory, beside the
@@ -228,6 +240,101 @@ class Kept:
     mode: str | None
     kind: str = 'state'
     rankings: Mapping[str, dict] = dataclasses.field(default_factory=dict)
+
+
+def _frozen_entries(step_directory: str) -> list[str]:
+    """The `FROZEN_STORE` entries the step at `step_directory` records,
+    relative to its run directory, which `dew.io.publish` carries beside it."""
+    metadata = epath.Path(step_directory) / "_CHECKPOINT_METADATA"
+    custom = (json.loads(metadata.read_text()).get("custom_metadata") or {}) if metadata.exists() else {}
+    digests = {digest for names in (custom.get("frozen") or {}).values() for digest in names.values()}
+    return [f"{FROZEN_STORE}/{digest}" for digest in sorted(digests)]
+
+
+_SEEDS = (0x9E3779B9, 0x7F4A7C15)
+"""The two multipliers `_marks` mixes a word's flat index by."""
+
+
+@jax.jit
+def _marks(leaves: list[jax.Array]) -> jax.Array:
+    """Two 32-bit marks of each leaf's stored bits at their positions, `[leaves, 2]`.
+
+    Each 32-bit word of a leaf's storage, in memory order (an 8-byte element
+    is two, a narrower one is widened), is mixed with its flat index
+    (murmur3's finalizer) and the words summed, so the marks are a function
+    of the stored bytes alone, the same on every sharding and computed where
+    the shards are. One call marks a whole collection, so a collection
+    compiles once however many shapes it holds. `_host_marks` computes the
+    same marks of a host array.
+    """
+    return jnp.stack([_leaf_marks(leaf) for leaf in leaves]) if leaves else jnp.zeros((0, 2), jnp.uint32)
+
+
+def _leaf_marks(leaf: jax.Array) -> jax.Array:
+    bits = leaf.astype(jnp.uint8) if leaf.dtype == jnp.bool_ else leaf
+    width = np.dtype(bits.dtype).itemsize
+    # An 8-byte element becomes a trailing pair of 32-bit words.
+    unsigned = {1: jnp.uint8, 2: jnp.uint16}.get(width, jnp.uint32)
+    bits = jax.lax.bitcast_convert_type(bits, unsigned).astype(jnp.uint32)
+    index = jnp.zeros(bits.shape, jnp.uint32)
+    stride = 1
+    for axis in reversed(range(bits.ndim)):
+        index = index + jax.lax.broadcasted_iota(jnp.uint32, bits.shape, axis) * jnp.uint32(stride)
+        stride = stride * bits.shape[axis] % 2 ** 32
+    marks = []
+    for seed in _SEEDS:
+        mixed = bits ^ (index * jnp.uint32(seed))
+        mixed = (mixed ^ (mixed >> 16)) * jnp.uint32(0x85EBCA6B)
+        mixed = (mixed ^ (mixed >> 13)) * jnp.uint32(0xC2B2AE35)
+        marks.append(jnp.sum(mixed ^ (mixed >> 16), dtype=jnp.uint32))
+    return jnp.stack(marks)
+
+
+def _host_marks(leaf: np.ndarray, chunk: int = 1 << 24) -> np.ndarray:
+    """`_marks` of a host array, from its stored bytes, `chunk` words at a time."""
+    array = np.ascontiguousarray(leaf)
+    if array.dtype == np.bool_:
+        array = array.astype(np.uint8)
+    width = array.dtype.itemsize
+    words = array.reshape(-1).view({1: np.uint8, 2: np.uint16}.get(width, np.uint32))
+    marks = np.zeros(2, np.uint32)
+    with np.errstate(over="ignore"):
+        for start in range(0, words.size, chunk):
+            bits = words[start:start + chunk].astype(np.uint32)
+            index = (np.arange(start, start + bits.size, dtype=np.uint64) & 0xFFFFFFFF).astype(np.uint32)
+            for slot, seed in enumerate(_SEEDS):
+                mixed = bits ^ (index * np.uint32(seed))
+                mixed = (mixed ^ (mixed >> np.uint32(16))) * np.uint32(0x85EBCA6B)
+                mixed = (mixed ^ (mixed >> np.uint32(13))) * np.uint32(0xC2B2AE35)
+                marks[slot] += np.sum(mixed ^ (mixed >> np.uint32(16)), dtype=np.uint32)
+    return marks
+
+
+def _digest(tree) -> str:
+    """The SHA-256 of `tree`'s paths, shapes, dtypes and each leaf's marks
+    (`_marks`), taken of the bytes as stored, whatever dtypes JAX allows now.
+
+    The device leaves are marked in one call. A host array is marked on the
+    host, so a float64 leaf restored with x64 off has the digest it was saved
+    with. A device leaf in host memory is marked on the devices one leaf at a
+    time, so no more than one is copied off the host at once.
+    """
+    flat = jax.tree_util.tree_flatten_with_path(tree)[0]
+    on_device = [index for index, (_, leaf) in enumerate(flat) if isinstance(leaf, jax.Array)
+                 and leaf.sharding.memory_kind in (None, "device")]
+    marks = dict(zip(on_device, np.asarray(jax.device_get(_marks([flat[index][1] for index in on_device]))),
+                     strict=True))
+    digest = hashlib.sha256()
+    for index, (path, leaf) in enumerate(flat):
+        if index not in marks:
+            if isinstance(leaf, jax.Array):
+                array = jax.device_put(leaf, leaf.sharding.with_memory_kind("device"))
+                marks[index] = np.asarray(jax.device_get(_marks([array])))[0]
+            else:
+                marks[index] = _host_marks(np.asarray(leaf))
+        digest.update(f"{jax.tree_util.keystr(path)}|{np.shape(leaf)}|{np.dtype(leaf.dtype)}|".encode())
+        digest.update(marks[index].astype("<u4").tobytes())
+    return digest.hexdigest()
 
 
 def _check_shared(directory: str) -> None:
@@ -666,6 +773,8 @@ class Checkpoints:
         self._local_manager = None
         self._profile_snapshots: set[int] = set()
         self._metadata: tuple[bool, int, ocp.metadata.StepMetadata] | None = None
+        # The digests the save still in flight records, which no kept step lists yet.
+        self._frozen_pending: set[str] = set()
 
     def _candidates(self, rankings: Sequence[Ranking]) -> tuple[Ranking, ...]:
         eligible = [rank for rank in rankings if math.isfinite(rank.value)]
@@ -951,10 +1060,11 @@ class Checkpoints:
         profiles = None if weights_only else _power_profiles(state.opt_state)
         profile_metadata = None if profiles is None else {
             'updates': int(profiles.updates), 'stds': [float(std) for std in np.asarray(profiles.stds)]}
-        state_tree, deltas = _with_ema_deltas(self._item(state, saved, share))
+        persistent = self._open()
+        state_tree, frozen = self._frozen(self._item(state, saved, share))
+        state_tree, deltas = _with_ema_deltas(state_tree)
         if weights_only:
             state_tree = {name: state_tree[name] for name in ('variables', 'ema')}
-        persistent = self._open()
         self._metadata = None
         if profiles is not None:
             self._profile_snapshots.add(step)
@@ -987,13 +1097,105 @@ class Checkpoints:
                     "weights_only": weights_only,
                     "rung": rung,
                     "artifact": artifact,
+                    "frozen": frozen,
                 },
             )
         self._pending = (step, scores)
+        self._frozen_pending = {digest for held in frozen.values() for digest in held.values()}
         # Pinned-host state is written before returning; the docstring says why.
         if _written_in_place(state_tree):
             with region("checkpoint.write_in_place"):
                 persistent.wait_until_finished()
+
+    def _frozen(self, state_tree: dict[str, StateLeaf]
+                ) -> tuple[dict[str, StateLeaf], dict[str, dict[str, str]]]:
+        """Return `state_tree` with its variables' and its EMA's collections
+        but `params` held in the store (`FROZEN_STORE`), and each one's digest
+        under its tree, which the step records.
+
+        An EMA collection no average moves has its weights' content, so it is
+        the same entry. A collection the store lacks is written now, before
+        the step, by every process, as process 0 finds the store. A stored
+        collection that no kept step, this step nor the one still in flight
+        records is deleted first, by process 0.
+        """
+        held: dict[str, dict[str, object]] = {}
+        for tree in ('variables', 'ema'):
+            collections = state_tree.get(tree)
+            if isinstance(collections, Mapping):
+                held[tree] = {str(name): value for name, value in collections.items()
+                              if name != 'params' and jax.tree.leaves(value)}
+        digests = {tree: {name: _digest(value) for name, value in values.items()}
+                   for tree, values in held.items()}
+        root = epath.Path(self.directory) / FROZEN_STORE
+        recorded = {digest for values in digests.values() for digest in values.values()}
+        if jax.process_index() == 0 and root.exists():
+            referenced = {*recorded, *self._frozen_pending}
+            for kept in self.kept():
+                for values in ((self._custom_cache.get(kept.step) or {}).get('frozen') or {}).values():
+                    referenced.update(values.values())
+            for path in root.iterdir():
+                if path.name not in referenced and ocp.utils.is_checkpoint_finalized(path):
+                    path.rmtree()
+        stored = ({path.name for path in root.iterdir()}
+                  if jax.process_index() == 0 and root.exists() else set())
+        written: set[str] = set()
+        for tree, values in held.items():
+            for name, value in values.items():
+                digest = digests[tree][name]
+                there = digest in written or bool(multihost_utils.broadcast_one_to_all(
+                    np.asarray(digest in stored)))
+                if not there:
+                    with region("checkpoint.frozen"):
+                        ocp.PyTreeCheckpointer().save(root / digest, args=ocp.args.PyTreeSave(value))
+                    written.add(digest)
+        kept_tree = dict(state_tree)
+        for tree, values in held.items():
+            collections = state_tree[tree]
+            assert isinstance(collections, Mapping)
+            kept_tree[tree] = {name: value for name, value in collections.items() if name not in values}
+        return kept_tree, digests
+
+    def _frozen_values(self, digests: Mapping[str, str], templates: Mapping | None) -> dict[str, Variables]:
+        """Read each collection a step records from the store, onto its
+        template's placement and dtype or as host arrays, refusing one whose
+        content no longer has the digest the step recorded."""
+        values = {}
+        wide = jax.config.jax_enable_x64
+
+        def read(meta, want=None):
+            """A leaf in its stored dtype: on the host where no template places
+            it or JAX cannot hold that dtype now (a float64 saved with x64 on,
+            read with it off), else where the template places it."""
+            if want is None or (np.dtype(meta.dtype).itemsize == 8 and not wide):
+                return ocp.ArrayRestoreArgs(restore_type=np.ndarray)
+            return ocp.ArrayRestoreArgs(sharding=getattr(want, 'sharding', None), dtype=meta.dtype)
+
+        def placed(leaf, want):
+            value = jnp.asarray(leaf).astype(want.dtype)
+            sharding = getattr(want, 'sharding', None)
+            return value if sharding is None else jax.device_put(value, sharding)
+
+        for name, digest in digests.items():
+            path = epath.Path(self.directory) / FROZEN_STORE / digest
+            if not path.exists():
+                raise FileNotFoundError(
+                    f"{path} is gone: the step records its {name} collection there, so the run "
+                    f"directory was copied or published without its {FROZEN_STORE}/ directory")
+            checkpointer = ocp.PyTreeCheckpointer()
+            stored = dict(_item_metadata(checkpointer.metadata(path)))
+            template = None if templates is None else templates.get(name)
+            restore_args = (jax.tree.map(read, stored) if template is None
+                            else jax.tree.map(read, stored, template))
+            tree = checkpointer.restore(path, args=ocp.args.PyTreeRestore(restore_args=restore_args))
+            found = _digest(tree)
+            if found != digest:
+                raise ValueError(f"{path} holds content with digest {found}, not the {digest} the step "
+                                 f"recorded for its {name} collection")
+            if template is not None:
+                tree = jax.tree.map(placed, tree, template)
+            values[name] = tree
+        return values
 
     def profile_steps(self) -> list[int]:
         """Return the complete checkpoints that hold post-hoc EMA snapshots, oldest first."""
@@ -1196,6 +1398,14 @@ class Checkpoints:
         if deltas:
             stored['ema'] = jax.tree_util.tree_map_with_path(
                 lambda path, leaf: deltas.get(path, leaf), stored['ema'])
+        for tree, names in ((snapshot.custom_metadata or {}).get('frozen') or {}).items():
+            collections = stored.get(tree)
+            if isinstance(collections, Mapping):
+                stored[tree] = {**collections, **{
+                    name: jax.tree.map(lambda meta: jax.ShapeDtypeStruct(meta.shape, meta.dtype), dict(
+                        _item_metadata(ocp.PyTreeCheckpointer().metadata(
+                            epath.Path(self.directory) / FROZEN_STORE / digest))))
+                    for name, digest in names.items()}}
         return stored
 
     def accumulation_template(self, step: int):
@@ -1261,6 +1471,8 @@ class Checkpoints:
         metadata = _item_metadata(snapshot)
         stored = metadata.keys()
         _check_template(template, metadata, stored)
+        frozen = (snapshot.custom_metadata or {}).get('frozen') or {}
+        held: dict[str, dict] | None = None
         if template is None:
             # Typed as host arrays, so orbax reads no sharding file and warns
             # about none. A local checkpoint knows device arrays only, so its
@@ -1282,6 +1494,13 @@ class Checkpoints:
         else:
             state_tree = {name: getattr(template, name) for name in STATE_LEAVES} \
                 if not isinstance(template, Mapping) else dict(template)
+            held = {}
+            for tree, names in frozen.items():
+                collections = state_tree.get(tree)
+                if isinstance(collections, Mapping):
+                    collections = dict(collections)
+                    held[tree] = {name: collections.pop(name) for name in names if name in collections}
+                    state_tree[tree] = collections
             if from_local:
                 self._check_placement(step, state_tree)
             targets, deltas = {}, {}
@@ -1322,6 +1541,12 @@ class Checkpoints:
                 restored = {**restored, 'ema': self._averages(checkpointer, step, metadata, restored,
                                                               targets, deltas)}
         restored = dict(restored)
+        for tree, names in frozen.items():
+            collections = restored.get(tree)
+            if isinstance(collections, Mapping):
+                templates = None if held is None else held.get(tree, {})
+                wanted = names if templates is None else {name: names[name] for name in templates}
+                restored[tree] = {**collections, **self._frozen_values(wanted, templates)}
         table = restored.pop('position', None)
         saved = None if table is None or share is None else read_position(table, where, share)
         restored = _filled(template, restored, step)
