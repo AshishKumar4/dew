@@ -48,11 +48,6 @@ export class RunnerCache extends SnapshotRegistry {
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, { SNAPSHOT_COMMIT: '', PREPARER: env.RUNNER_PREPARER });
 	}
-
-	override async alarm(): Promise<void> {
-		const active = await this.previous();
-		if (active) await this.refresh(active.commit);
-	}
 }
 
 export class RunnerPreparer extends ManagedPreparer {
