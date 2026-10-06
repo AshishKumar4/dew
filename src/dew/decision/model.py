@@ -1,7 +1,6 @@
 """A backbone and a decision head, applied as two modules over one variables tree."""
 
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -12,15 +11,6 @@ from dew.decision.head import Head
 from dew.decision.layout import DecisionInputs
 from dew.nn.protocols import AffineHead, HiddenStates, OutputTable
 from dew.objectives.base import Variables, part, thaw
-
-
-@runtime_checkable
-class Ordered(Protocol):
-    """A model that says whether it reads its tokens in order, each after the
-    ones before it, which decides where a layout puts its markers."""
-
-    @property
-    def causal(self) -> bool: ...
 
 
 @dataclass(frozen=True)

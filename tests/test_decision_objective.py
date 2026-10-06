@@ -246,3 +246,26 @@ def test_a_calibration_comes_back_with_the_weights_it_was_fitted_on(tmp_path):
     assert Decide.from_run(str(tmp_path), step=1).calibration == calibrated.calibration
     with pytest.raises(ValueError, match="no run checkpoint"):
         Decide.from_pretrained(FIXTURES / "tiny").save(str(tmp_path))
+
+
+def test_diffusion_gemma_reads_each_row_once_whole_and_reloads_from_the_run(tmp_path):
+    """DiffusionGemma is a backbone like any other: its causal encoder reads
+    each clean row once (`hidden_states`), so a StateFirstLayout is chosen
+    for it, and the saved run rebuilds it with identical probabilities."""
+    from dew.interop import diffusion_gemma
+
+    directory = Path(__file__).parent / "fixtures" / "hf" / "diffusion-gemma-denoise-tiny"
+    text = {**json.loads((directory / "config.json").read_text()), "vocab_size": 256}
+    model = diffusion_gemma.build({"model_type": "diffusion_gemma", "canvas_length": 4, "text_config": text},
+                                  dtype="float32", attention_impl="xla")
+    chosen = DecisionObjective(model, tokenizer=TOKENIZER, specials=SPECIALS).layout
+    assert isinstance(chosen, StateFirstLayout)
+    objective = DecisionObjective(model, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT)
+    data = objective.dataset(EXAMPLES, batch=8, validation=EXAMPLES)
+    checkpoints = Checkpoints(str(tmp_path), keep=1)
+    state = Trainer(objective, optax.adam(1e-2), key=0, checkpoints=checkpoints).fit(
+        data, steps=2, log_every=100, checkpoint_every=2)
+    checkpoints.wait()
+    live, reloaded = objective.pipeline(state), Decide.from_run(str(tmp_path))
+    np.testing.assert_array_equal(live("charged twice!", {"team": INTENT})["team"].probabilities,
+                                  reloaded("charged twice!", {"team": INTENT})["team"].probabilities)

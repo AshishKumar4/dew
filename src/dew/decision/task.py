@@ -23,6 +23,7 @@ from dew.checkpoints import Checkpoints
 from dew.data.dataset import DataPartition, Reader
 from dew.data.text import HFTokenizer, Tokenizer
 from dew.decision.calibration import Abstention, Binning, Calibration, Scored, Temperatures, softmax
+from dew.decision.clef import ClefCheckpoint
 from dew.decision.data import Example
 from dew.decision.head import Head
 from dew.decision.laya import LayaCheckpoint
@@ -136,17 +137,23 @@ class Decide:
     def from_pretrained(cls, name: str | Path = "convaiinnovations/laya", *, subfolder: str | None = None,
                         revision: str | None = None, dtype: str = "float32", param_dtype: str = "float32",
                         attention_impl: str = "auto") -> Self:
-        """Load a released Laya checkpoint (`LayaCheckpoint`) as a task.
+        """Load a released Laya (`LayaCheckpoint`) or Clef (`ClefCheckpoint`) checkpoint as a task.
 
-        The task uses the temperatures that Laya's agent reads from
-        `rl_agent_config.json`.
+        A Laya task uses the temperatures that Laya's agent reads from
+        `rl_agent_config.json`; Clef ships none. Either answers with Jev's
+        confidence; `replace(task, confidence=...)` selects Laya's
+        (`EntropyConfidence`) or Clef's (`TopProbability`).
         """
+        label = str(name) if subfolder is None else f"{name}/{subfolder}"
+        if subfolder is None and ClefCheckpoint.exists(name, revision=revision):
+            clef = ClefCheckpoint.load(name, revision=revision, dtype=dtype, param_dtype=param_dtype,
+                                       attention_impl=attention_impl)
+            return cls(clef.model, clef.variables, JointLayout(), clef.tokenizer, clef.specials, name=label)
         checkpoint = LayaCheckpoint.load(name, subfolder=subfolder, revision=revision, dtype=dtype,
                                          param_dtype=param_dtype, attention_impl=attention_impl)
         choice, score, noul = checkpoint.temperatures
         temperatures = Temperatures({"choice": choice, "score": score, "noul": noul},
                                     checkpoint.bucket_temperatures)
-        label = str(name) if subfolder is None else f"{name}/{subfolder}"
         return cls(checkpoint.model, checkpoint.variables, checkpoint.layout, checkpoint.tokenizer,
                    checkpoint.specials, Calibration(temperatures), name=label)
 

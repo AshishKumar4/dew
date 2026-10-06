@@ -17,7 +17,7 @@ from dew.data.text import HFTokenizer, Tokenizer
 from dew.decision.data import DecisionTable, Example
 from dew.decision.head import DecisionHead, Head
 from dew.decision.layout import DecisionInputs, Layout, MarkerLayout, Specials, StateFirstLayout
-from dew.decision.model import DecisionModel, Ordered
+from dew.decision.model import DecisionModel
 from dew.decision.questions import KINDS, Choice, Question, Score
 from dew.decision.scoring import LogLoss, ScoringRule
 from dew.decision.task import Decide, Weights, laid_out
@@ -26,6 +26,7 @@ from dew.inference.tasks import Processor as TaskProcessor
 from dew.inputs import Field, InputSpec
 from dew.interop.processors import Processor
 from dew.lora import Adapter
+from dew.nn.protocols import Ordered
 from dew.objectives.base import (
     OMITTED,
     Aux,
