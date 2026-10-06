@@ -1,9 +1,9 @@
 """Metrics of a decision model's answers over a validation pass.
 
 Each reads the `Decisions` artifact `DecisionObjective.evaluate` returns: the
-model's probabilities over every row's options and the right option. The
-proper scoring rules (`LogLoss`, `Brier`, `Spherical`, `RankedProbability`)
-are metrics too.
+model's probabilities over every question's options and the right option,
+counting the questions with a known answer. The proper scoring rules
+(`LogLoss`, `Brier`, `Spherical`, `RankedProbability`) are metrics too.
 """
 
 from dataclasses import dataclass
@@ -27,12 +27,31 @@ def decisions_of(artifact: Artifact) -> Decisions:
     return artifact
 
 
+@dataclass(frozen=True)
+class Answered:
+    """The questions of a `Decisions` with a known answer, one row each: their
+    probabilities `[M, K]`, real options `[M, K]`, right options `[M]` and
+    whether `[M]` they ask a score."""
+
+    probabilities: np.ndarray
+    options: np.ndarray
+    labels: np.ndarray
+    ordinal: np.ndarray
+
+    @classmethod
+    def of(cls, artifact: Artifact) -> "Answered":
+        decisions = decisions_of(artifact)
+        scored = np.asarray(decisions.scored, bool)
+        return cls(np.asarray(decisions.probabilities, np.float64)[scored],
+                   np.asarray(decisions.options, bool)[scored], np.asarray(decisions.labels)[scored],
+                   np.asarray(decisions.ordinal, bool)[scored])
+
+
 def _tops(artifact: Artifact) -> tuple[np.ndarray, np.ndarray]:
-    """Each row's top probability, and whether its top option is the right one."""
-    artifact = decisions_of(artifact)
-    probabilities = np.where(np.asarray(artifact.options, bool),
-                             np.asarray(artifact.probabilities, np.float64), -1.0)
-    return probabilities.max(axis=-1), probabilities.argmax(axis=-1) == np.asarray(artifact.labels)
+    """Each answered question's top probability, and whether its top option is the right one."""
+    answered = Answered.of(artifact)
+    probabilities = np.where(answered.options, answered.probabilities, -1.0)
+    return probabilities.max(axis=-1), probabilities.argmax(axis=-1) == answered.labels
 
 
 @metrics("accuracy")
