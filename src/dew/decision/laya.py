@@ -11,6 +11,7 @@ onto `DecisionHead`.
 
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Self
@@ -66,11 +67,11 @@ def _head_path(name: str) -> tuple[str, ...] | None:
     return (f"layers_{match[1]}", *_LAYER[match[2]], "scale" if norm and leaf == "weight" else _leaf(leaf))
 
 
-def _split_attention(tensors: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-    """nn.MultiheadAttention's packed in_proj as its q, k and v thirds."""
+def unpacked_attention(tensors: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """Return `tensors` with each `nn.MultiheadAttention`'s packed in_proj as its q, k and v thirds."""
     split = {}
     for name, tensor in tensors.items():
-        match = re.fullmatch(r"(head\.layers\.\d+\.self_attn)\.in_proj_(weight|bias)", name)
+        match = re.fullmatch(r"(.+)\.in_proj_(weight|bias)", name)
         if match is None:
             split[name] = tensor
             continue
@@ -133,7 +134,7 @@ class LayaCheckpoint:
         head = DecisionHead(features=backbone.emb_features,
                             layers=records.integer(config.get("head_layers", 2), "head_layers"),
                             dtype=backbone.dtype, attention_impl=attention_impl)
-        head_tensors = _split_attention({name: tensor for name, tensor in tensors.items()
+        head_tensors = unpacked_attention({name: tensor for name, tensor in tensors.items()
                                          if not name.startswith("encoder.")})
         variables = joined({
             "backbone": translate_weights(encoder, record, "modernbert", param_dtype=param_dtype),

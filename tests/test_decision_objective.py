@@ -89,11 +89,14 @@ def test_a_rule_ignores_slots_past_a_rows_options():
 
 
 def decisions(tops, correct):
-    """Two-option rows whose top probability is `tops` and whose label is right where `correct`."""
+    """Two-option questions, one per row and a second unanswered one beside it,
+    whose top probability is `tops` and whose label is right where `correct`."""
     tops = np.asarray(tops)
-    probabilities = np.stack([tops, 1 - tops], axis=1)
-    return Decisions(probabilities=probabilities, options=np.ones((len(tops), 2), bool),
-                     labels=np.where(correct, 0, 1), ordinal=np.zeros(len(tops), bool))
+    probabilities = np.stack([np.stack([tops, 1 - tops], axis=1), np.full((len(tops), 2), 0.5)], axis=1)
+    labels = np.stack([np.where(correct, 0, 1), np.ones(len(tops), int)], axis=1)
+    scored = np.stack([np.ones(len(tops), bool), np.zeros(len(tops), bool)], axis=1)
+    return Decisions(probabilities=probabilities, options=np.ones((len(tops), 2, 2), bool),
+                     labels=labels, ordinal=np.zeros((len(tops), 2), bool), scored=scored)
 
 
 def test_aurc_counts_a_group_of_equal_confidences_whole():
@@ -141,28 +144,29 @@ EXAMPLES = [Example(state, {"team": INTENT}, {"team": label})
 def test_an_encoding_shuffles_a_choice_and_moves_its_label_with_it():
     encoding = Encoding(LAYOUT, TOKENIZER, SPECIALS, width=4)
     rng = np.random.default_rng(0)
-    rows = [encoding(EXAMPLES[0], "team", rng) for _ in range(30)]
-    labels = {int(row["labels"]) for row in rows}
+    rows = [encoding(EXAMPLES[0], ("team",), rng) for _ in range(30)]
+    labels = {int(row["labels"][0]) for row in rows}
     assert labels == {0, 1, 2}  # the right option lands in every slot
     for row in rows:
-        marker = int(row["markers"][int(row["labels"])])
+        marker = int(row["option_spans"][0, int(row["labels"][0]), 0])
         option = bytes(int(token) for token in row["tokens"][marker - 18:marker]).decode()
         assert "billing" in option
-    plain = encoding(EXAMPLES[0], "team", None)
-    assert int(plain["labels"]) == 0 and plain["options"].tolist() == [True, True, True, False]
+    plain = encoding(EXAMPLES[0], ("team",), None)
+    assert int(plain["labels"][0]) == 0 and plain["options"][0].tolist() == [True, True, True, False]
+    assert plain["scored"].tolist() == [True]
 
 
 def test_an_encoding_keeps_levels_in_order_and_adds_none_of_the_above():
     rating = Example("fine", {"q": Score("How bad?", ["calm", "upset", "furious"])}, {"q": 2})
     encoding = Encoding(LAYOUT, TOKENIZER, SPECIALS, width=4, none_of_the_above=1.0)
     rng = np.random.default_rng(3)
-    assert all(int(encoding(rating, "q", rng)["labels"]) == 2 for _ in range(10))
+    assert all(int(encoding(rating, ("q",), rng)["labels"][0]) == 2 for _ in range(10))
     unshuffled = replace(encoding, shuffle=False)
     seen = set()
     for _ in range(40):
-        row = unshuffled(EXAMPLES[0], "team", rng)
+        row = unshuffled(EXAMPLES[0], ("team",), rng)
         assert int(row["options"].sum()) in (3, 4)
-        seen.add((int(row["options"].sum()), int(row["labels"])))
+        seen.add((int(row["options"].sum()), int(row["labels"][0])))
     # Without its right option the row's answer is the added one, last; with
     # it, still billing, first.
     assert seen == {(3, 2), (4, 0)}

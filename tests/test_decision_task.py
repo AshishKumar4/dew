@@ -122,15 +122,14 @@ def test_a_small_budget_splits_passes_without_moving_a_logit(decide):
     """Every question of every case at a budget of two rows a pass, held to
     Laya's one-row logits under the float64 rule."""
     small = replace(decide, budget=Budget(tokens=256, rows=2))
-    rows, questions, keys = [], [], []
+    rows, keys = [], []
     for case, request in CASES.items():
         laid = small._encoded(request["state"], {name: Question.from_wire(wire)
                                                  for name, wire in request["questions"].items()})
-        for name, question, encoded in laid:
-            rows.append(encoded)
-            questions.append(question)
-            keys.append(f"sequential/{case}/{name}")
-    found = small.logits(rows, questions)
+        rows.extend(laid)
+        keys.extend(f"sequential/{case}/{encoded.questions[0].name}" for encoded in laid)
+    found = [logits[0, :len(encoded.questions[0].options)]
+             for encoded, logits in zip(rows, small.logits(rows), strict=True)]
     with np.load(TINY / "logits.npz") as reference:
         assert_as_exact_as_the_reference(np.concatenate(found),
                                          np.concatenate([reference[key] for key in keys]),
