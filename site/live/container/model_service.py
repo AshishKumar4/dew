@@ -206,6 +206,8 @@ class ModelService(socketserver.ThreadingUnixStreamServer):
         if error is not None:
             try:
                 request.sendall(json.dumps({"error": error}).encode() + b"\n")
+            except (BrokenPipeError, ConnectionResetError):
+                pass
             finally:
                 self.shutdown_request(request)
             return

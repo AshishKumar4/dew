@@ -192,6 +192,14 @@ def _modernbert_export(model: CausalTransformer) -> Mapping[str, object]:
     if model.head_transform is not None:
         fields['classifier_activation'] = {'gelu_exact': 'gelu', 'gelu': 'gelu_pytorch_tanh'}[
             model.head_transform]
+    # ModernBERT's original keys, which transformers 5 no longer writes and older
+    # readers still take: llama.cpp's converter reads its norm epsilon from these.
+    fields['layer_norm_eps'] = model.norm_eps
+    every = next((n for n in range(1, len(types) + 1)
+                  if all((kind == 'full_attention') == (index % n == 0) for index, kind in enumerate(types))),
+                 None)
+    if every is not None:
+        fields['global_attn_every_n_layers'] = every
     fields.update(dict.fromkeys(('num_key_value_heads', 'head_dim', 'rms_norm_eps', 'hidden_act',
                                  'rope_theta', 'rope_local_base_freq', 'sliding_window', 'use_cache')))
     return fields
