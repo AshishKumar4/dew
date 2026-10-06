@@ -29,6 +29,7 @@ class Fixed(nn.Module):
     """A backbone whose hidden states and head are its two weights."""
 
     causal: bool = False
+    mask_token_id: None = None
 
     def setup(self):
         self.hidden = self.param("hidden", lambda _: jnp.asarray(REFERENCE["hidden"]))
