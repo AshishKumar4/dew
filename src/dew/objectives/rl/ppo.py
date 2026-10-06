@@ -39,7 +39,7 @@ from dew.training.distributed import shard_batch
 from dew.training.state import TrainState
 
 from .episodes import EpisodeInference, EpisodeRollout
-from .grpo import GRPOObjective
+from .grpo import GRPOObjective, onto_ids
 from .sessions import (
     ADVANTAGES_KEY,
     CALL_INDEX_KEY,
@@ -173,13 +173,9 @@ class PPOObjective(Objective[Ratio, Variables]):
         return self.actor.build_task(part(variables, "policy"), processor=processor)
 
     def values(self, variables: Variables, batch: Mapping[str, object]) -> jax.Array:
-        """Return the critic's value of the state before each packed id, as `[rows, width]`.
+        """Return the critic's float32 value of each packed id's prefix, placed by `onto_ids`.
 
-        The result is aligned with `input_ids`. Entry t is the value of the
-        chain prefix that predicts id t, which is the state that action was
-        taken from. Entries are zero where `response_mask` is zero, which
-        includes chain starts and padding, since no action follows them. A
-        critic that does not return one value per input position raises
+        A critic that does not return one value per input position raises
         `ValueError`.
         """
         ids = jnp.asarray(batch[IDS_KEY], jnp.int32)
@@ -188,10 +184,7 @@ class PPOObjective(Objective[Ratio, Variables]):
                                    positions=jnp.asarray(batch[POSITIONS_KEY], jnp.int32)[:, :-1])
         if not isinstance(values, jax.Array) or values.shape != ids[:, :-1].shape:
             raise ValueError("PPO critic must return one scalar value per input position")
-        aligned = jnp.concatenate(
-            [jnp.zeros((ids.shape[0], 1), jnp.float32), values.astype(jnp.float32)], axis=1
-        )
-        return jnp.where(jnp.asarray(batch[RESPONSE_MASK_KEY]) != 0, aligned, 0.0)
+        return onto_ids(batch, values.astype(jnp.float32))
 
     def loss(self, variables: Variables, batch, step: Step) -> tuple[Ratio, Aux[Variables]]:
         """Return the actor's policy loss plus the weighted, clipped value error, over the same mass.
