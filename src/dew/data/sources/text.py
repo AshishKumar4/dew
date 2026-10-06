@@ -308,7 +308,9 @@ class HubText:
     choose the rows (`config`, `data_dir`, `data_files`, `revision`). The
     same request then reads that directory without `datasets`, the Hub or
     the tokenizer, so it runs offline once anything has made it. Rows that
-    change under one request are not read again; pin `revision`.
+    change under one request are not read again; pin `revision`. The
+    tokenizer is keyed by its name alone, so after its vocabulary changes
+    upstream, delete the directory to tokenize again.
     """
 
     name: str
