@@ -48,7 +48,7 @@ FLOWER_CAPTIONS = ("a photo of a {}", "a photo of a {} flower", "This is a photo
 # fuse mount handed over as `path`; the regional url tables are fetched as read.
 REGIONAL = "gs://dew-datasets-regional/datasets/"
 CORPORA: dict[str, DatasetSpec] = {
-    "oxford-flowers102": TFDSImages(caption_templates=FLOWER_CAPTIONS),
+    "oxford-flowers102": TFDSImages(name="oxford_flowers102", caption_templates=FLOWER_CAPTIONS),
     # laion-aesthetics-12M (score >= 6) plus MS-COCO 2017: 228 shards, 236 GiB, about 15M samples.
     "laion12m-coco": ArrayRecordImages(shards=("arrayrecord2/laion12m_coco",)),
     # laion-2B-en aesthetic >= 4.2 subset: 569 shards, 550 GiB, larger but noisier.

@@ -17,9 +17,9 @@ from pathlib import Path
 
 import jax
 import jax.numpy as jnp
-import optax
 import tyro
 
+from dew.config import OptimConfig
 from dew.data import ByteTokenizer, DataPartition, Loading, TokenCorpus, TokenWindows
 from dew.diffusion.discrete import DiscreteProcess, LogLinear
 from dew.inference import RunProcessor
@@ -69,7 +69,8 @@ def main(config: Config):
                                         ema_decay=None, steps=config.sample_steps, decode=tokenizer.decode)
     config.out.mkdir(parents=True, exist_ok=True)
     checkpoints = Checkpoints(str(config.out / "checkpoints"), keep=1)
-    trainer = Trainer(objective, optax.adamw(config.learning_rate), key=jax.random.key(0),
+    trainer = Trainer(objective, OptimConfig(learning_rate=config.learning_rate).build(config.steps),
+                      key=jax.random.key(0),
                       checkpoints=checkpoints)
     stream = data.train(DataPartition())
     try:

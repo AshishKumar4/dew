@@ -26,10 +26,10 @@ from pathlib import Path
 
 import jax
 import jax.numpy as jnp
-import optax
 import tyro
 
 import dew
+from dew.config import OptimConfig
 from dew.data import ChatMessages, Loading
 from dew.interop import PretrainedBlockDecoder
 from dew.lora import LoRA
@@ -111,7 +111,7 @@ def main(config: Config) -> Path:
                                         worker_buffer=1)).load(batch=config.batch_size)
 
     checkpoints = Checkpoints(str(config.out / "checkpoints"), keep=1)
-    trainer = Trainer(objective, optax.adamw(config.learning_rate), key=jax.random.key(1),
+    trainer = Trainer(objective, OptimConfig(learning_rate=config.learning_rate), key=jax.random.key(1),
                       mesh=MeshSpec(fsdp=jax.device_count()),
                       layout=Layout(host=("variables",)), checkpoints=checkpoints)
     state = trainer.fit(data, steps=config.steps, log_every=1,

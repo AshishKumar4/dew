@@ -79,9 +79,8 @@ A confidence is a statistic of the answer's distribution, and the task decides w
 `DecisionObjective` trains a decision head over any backbone that has hidden states. The backbone can be Laya's own checkpoint (head and layout included), a pretrained language model, adapted with LoRA or partly frozen, or a model built from scratch:
 
 ```python
-import optax
-
 from dew import Trainer
+from dew.config import OptimConfig
 from dew.decision import ECE, Accuracy, Brier, Choice, DecisionObjective, DecisionTable, LogLoss
 from dew.interop import Pretrained
 from dew.lora import LoRA
@@ -92,7 +91,7 @@ banking77 = DecisionTable(path="mteb/banking77", label="label_text", question="i
 
 objective = DecisionObjective(qwen, loss=LogLoss() + 0.5 * Brier())
 data = objective.dataset(banking77, batch=32)  # a tenth held out, for validation and calibration
-state = Trainer(objective, optax.adamw(1e-4), key=0).fit(
+state = Trainer(objective, OptimConfig(learning_rate=1e-4), key=0).fit(
     data, steps=2_000, eval_every=500, metrics=[Accuracy(), ECE()])
 
 decide = objective.pipeline(state).calibrated(data.val)
