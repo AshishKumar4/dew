@@ -232,7 +232,7 @@ class PipelineSource(Protocol):
 
 @objectives("diffusion")
 class DiffusionObjective(Objective[Ratio]):
-    """Denoising diffusion: sample a noise level, corrupt, predict, weight."""
+    """Trains a denoising diffusion model: draw a noise level, corrupt, predict, and weight the loss."""
 
     saved_task = TextToImage
 
@@ -265,50 +265,50 @@ class DiffusionObjective(Objective[Ratio]):
     ):
         """Build a denoising objective over `model` for the `inputs` field.
 
-        `process` is a preset or a custom `Process`; presets build once here.
-        `solver`, `guidance` and `steps` are how evaluation samples, DDIM,
-        `CFG(3.0)` and 200 unless given; `guidance` None is the plain
-        conditional prediction.
+        `process` is a preset or a custom `Process`; a preset is built once here.
+        `solver`, `guidance` and `steps` set how evaluation samples, by default DDIM,
+        `CFG(3.0)` and 200 steps. `guidance` None samples the plain conditional
+        prediction.
 
-        `variables` is the tree training starts from: the denoiser's
-        variables beside its frozen towers (`encoders`, `autoencoder`), as a
-        loaded pipeline holds them, or an adapter's split of them, kept as
-        given so the optimizer moves what it leaves in `params`. None draws
-        the denoiser and takes the towers as built. `model` may be a loaded
-        pipeline in place of the denoiser (`DiffusionObjective(flux)`), which
-        supplies the denoiser, `variables`, `process`, `inputs`,
-        `autoencoder` and its own sampling policy; any of them given here
-        overrides it, an explicit None included (`autoencoder=None` trains
-        in pixel space, `variables=None` draws the denoiser). Its text
-        encoder trains nothing but encodes every caption, so a pipeline
-        loaded without it is refused.
+        `variables` is the tree training starts from. It is the denoiser's variables
+        next to its frozen towers (`encoders`, `autoencoder`), as a loaded pipeline
+        holds them, or an adapter's split of them. A split tree is kept as given, so
+        the optimizer updates only what is in `params`. None draws the denoiser and
+        uses the towers as built.
 
-        `ema_decay` is
-        the EMA's decay, a number or a schedule of the updates before it,
-        such as EDM2's power EMA (`dew.training.posthoc.power_decay`); None
-        keeps no EMA.
+        `model` may be a loaded pipeline instead of the denoiser
+        (`DiffusionObjective(flux)`). The pipeline then supplies the denoiser,
+        `variables`, `process`, `inputs`, `autoencoder` and its own sampling policy,
+        and any of them passed here overrides the pipeline's, an explicit None
+        included (`autoencoder=None` trains in pixel space, `variables=None` draws
+        the denoiser). The pipeline's text encoder trains nothing but encodes every
+        caption, so a pipeline loaded without it is refused.
 
-        `uncertainty` learns EDM2's loss weighting (Karras et al. 2024,
-        Eq. 21): a head u of the model time, `dew.nn.mp.Uncertainty` with
-        this many Fourier channels, and the loss w / e^u ||D - y||^2 + u in
-        place of w ||D - y||^2, halved as Dew's L2 loss is. Its minimum over
-        u is at the log of the weighted error each noise level leaves, so
-        every level contributes about equally. The head trains beside the
-        model under `params`, as `UNCERTAINTY`, and a published task drops it.
-        None keeps the preset's fixed weighting.
+        `ema_decay` is the EMA's decay, either a number or a schedule over the number
+        of updates so far, such as EDM2's power EMA
+        (`dew.training.posthoc.power_decay`). None keeps no EMA.
 
-        `alignment` adds REPA's or iREPA's representation alignment
-        (`Alignment`) of the model's hidden tokens at one layer with a
-        frozen encoder's features of the clean sample: its projector trains
-        under `params` as `ALIGNMENT`, the encoder's weights ride frozen
-        under `REPRESENTATION`, and a published task drops both.
+        `uncertainty` learns EDM2's loss weighting (equation 21 of Karras et al.
+        2024). It adds a head u of the model time, `dew.nn.mp.Uncertainty` with this
+        many Fourier channels, and replaces the loss w ||D - y||^2 with
+        w / e^u ||D - y||^2 + u, halved as Dew's L2 loss is. The loss is smallest
+        when u is the log of the weighted error each noise level leaves, so every
+        level contributes about equally. The head trains next to the model under
+        `params`, as `UNCERTAINTY`, and a published task drops it. None keeps the
+        preset's fixed weighting.
 
-        `end_to_end` trains the autoencoder with the model, REPA-E's tuning
-        (`EndToEnd`): it needs `alignment` and a KL autoencoder, whose
-        weights then train under `params` as `AUTOENCODER` and whose
-        latents a batch norm normalizes, its running statistics held in
-        the `LATENT_STATS` collection. A published task carries the tuned
-        autoencoder with those statistics as its latent normalization.
+        `alignment` adds REPA's or iREPA's representation alignment (`Alignment`)
+        between the model's hidden tokens at one layer and a frozen encoder's
+        features of the clean sample. Its projector trains under `params` as
+        `ALIGNMENT`, the encoder's weights stay frozen under `REPRESENTATION`, and a
+        published task drops both.
+
+        `end_to_end` trains the autoencoder together with the model, as REPA-E does
+        (`EndToEnd`). It needs `alignment` and a KL autoencoder. The autoencoder's
+        weights then train under `params` as `AUTOENCODER`, and a batch norm
+        normalizes its latents, with the running statistics in the `LATENT_STATS`
+        collection. A published task includes the tuned autoencoder, with those
+        statistics as its latent normalization.
         """
         if isinstance(model, PipelineSource):
             source = model
@@ -373,16 +373,21 @@ class DiffusionObjective(Objective[Ratio]):
                 'end_to_end': None if self.end_to_end is None else _to_json(self.end_to_end, EndToEnd)}
 
     def pipeline(self, state: TrainState, *, ema: bool | None = None) -> TextToImage:
-        """The model over the state's published weights as a `TextToImage`
-        task, sampling the way this objective's evaluation does."""
+        """Return the model over the state's published weights as a `TextToImage` task.
+
+        The task samples the same way this objective's evaluation does.
+        """
         from dew.sampling.pipelines import TextToImage
 
         return TextToImage.from_objective(self, thaw(self._pipeline_weights(state, ema)))
 
     @property
     def latent_shape(self) -> tuple[int, ...]:
-        """The per-example shape the model denoises: the sample field's, or
-        its latent when an autoencoder sits in front of the model."""
+        """The per-example shape the model denoises.
+
+        That is the sample field's shape, or its latent's shape when an autoencoder
+        sits in front of the model.
+        """
         shape = self.inputs.sample.shape
         return shape if self.autoencoder is None else self.autoencoder.latent_shape(shape)
 
@@ -393,8 +398,10 @@ class DiffusionObjective(Objective[Ratio]):
                 for keyword, condition in self.inputs.conditions.items()}
 
     def encode(self, encoders, tokens: dict | None = None) -> dict:
-        """Encode conditions under the supplied parameters; omitted tokens
-        select each condition's configured unconditional datum."""
+        """Encode the conditions with the given parameters.
+
+        A condition whose tokens are omitted uses its configured unconditional input.
+        """
         if tokens is None:
             tokens = {keyword: condition.encoder.tokenize([condition.unconditional])
                       for keyword, condition in self.inputs.conditions.items()}
@@ -407,24 +414,25 @@ class DiffusionObjective(Objective[Ratio]):
 
     @property
     def unconditional_conditions(self) -> dict:
-        """The configured unconditional branch, lazily encoded over the bound
-        towers with the original eager operations and construction precision.
-        Building or shape-checking a restored model does not run its towers.
+        """The configured unconditional conditions, encoded on first use by the bound towers.
+
+        They are encoded with the original eager operations at the precision the
+        towers were built with. Building or shape-checking a restored model does not
+        run the towers.
         """
         return self._fixed_blank.values
 
     def blank_conditions(self, like: dict) -> dict:
-        """Cast the cached unconditional branch to the conditional dtypes."""
+        """Return the cached unconditional conditions cast to the conditional dtypes."""
         return self._fixed_blank(like)
 
     def held_variables(self) -> Variables:
-        """Every array `init` starts from rather than draws: the starting
-        tree, or the frozen towers.
+        """Return every array `init` starts from instead of drawing: the starting tree, or the frozen towers.
 
-        A text tower and a VAE are released weights: hundreds of megabytes
-        that a nullary trace would compile into the state executable as
-        constants. One mapping, so an objective that starts from more than
-        the towers extends this and `init` together.
+        A text tower and a VAE are released weights of hundreds of megabytes, which a
+        trace without arguments would compile into the state executable as
+        constants. This is one mapping, so an objective that starts from more than
+        the towers extends both this and `init`.
         """
         if self.variables is not None:
             return self.variables
@@ -443,10 +451,9 @@ class DiffusionObjective(Objective[Ratio]):
                   accumulation: int) -> optax.GradientTransformation:
         """Return `tx`, or under `end_to_end` one copy of it per network.
 
-        REPA-E steps the model (with its alignment projector), the
-        autoencoder and the discriminator with three optimizers, each
-        clipping its own gradient, so each takes its own copy of `tx`, with
-        its own clip, moments and update count.
+        REPA-E updates the model (with its alignment projector), the autoencoder and
+        the discriminator with three optimizers, each clipping its own gradient, so
+        each gets its own copy of `tx` with its own clip, moments and update count.
         """
         if self.end_to_end is None:
             return tx
@@ -529,13 +536,15 @@ class DiffusionObjective(Objective[Ratio]):
         return kept["__call__"][0]
 
     def model_variables(self, params) -> Variables:
-        """Return the model's own collections, a frozen split merged back,
-        without the frozen towers or the loss's own heads."""
+        """Return the model's own collections, with a frozen split merged back.
+
+        The frozen towers and the loss's own heads are left out.
+        """
         return _without_loss_heads({name: value for name, value in thaw(params).items()
                                     if name not in ("encoders", "autoencoder")})
 
     def encoded_conditions(self, params, batch) -> dict:
-        """Encode each condition's own batch field under the tree's frozen towers."""
+        """Encode each condition's own batch field with the tree's frozen towers."""
         tokens = {keyword: batch[condition.field]
                   for keyword, condition in self.inputs.conditions.items()}
         return self.encode(params["encoders"], tokens)
@@ -675,9 +684,11 @@ class DiffusionObjective(Objective[Ratio]):
         return TunedLatents(raw, samples, statistics, regularizer, hinge, terms)
 
     def published_autoencoder(self, variables: Variables) -> tuple[AutoEncoder | None, Variables]:
-        """The autoencoder a task over `variables` decodes with, and its
-        weights under `autoencoder`: the frozen one, or under `end_to_end`
-        the tuned one, its latents normalized by the running statistics."""
+        """Return the autoencoder a task over `variables` decodes with, and its weights under `autoencoder`.
+
+        That is the frozen autoencoder, or under `end_to_end` the tuned one, with its
+        latents normalized by the running statistics.
+        """
         if self.end_to_end is None or self.autoencoder is None:
             return self.autoencoder, variables
         return self.end_to_end.tuned(self.autoencoder, variables)
@@ -722,15 +733,18 @@ class DiffusionObjective(Objective[Ratio]):
                          for keyword, condition in self.inputs.conditions.items()}
 
     def evaluate(self, params, batch, step: Step):
-        """One generated sample for every real row, without display decoding."""
+        """Generate one sample for every real row, without decoding for display."""
         samples, _ = self._draw(params, batch, step)
         assert self.artifact is not None
         return self.artifact(samples)
 
     def preview(self, params, batch, step: Step, *, scored=None):
-        """A separate small draw for display: up to `VALIDATION_SAMPLES` rows on
-        every process, gathered to the host, with captions decoded on process
-        zero; the other processes return None."""
+        """Draw a separate small batch for display.
+
+        It draws up to `VALIDATION_SAMPLES` rows on every process and gathers them to
+        the host, and process zero decodes the captions; the other processes return
+        None.
+        """
         samples, tokens = self._draw(params, batch, step, VALIDATION_SAMPLES)
         samples, tokens = collective_host((samples, tokens), phase="diffusion preview")
         if jax.process_index() != 0:
@@ -790,13 +804,13 @@ class Training(ABC):
 @trainings("diffusion")
 @dataclasses.dataclass(frozen=True)
 class Denoising(Training):
-    """The denoising loss, `DiffusionObjective`'s.
+    """The denoising loss, `DiffusionObjective`'s training mode.
 
     `uncertainty` is the number of Fourier channels of a head that learns EDM2's
     loss weighting; EDM2 uses 128, and None keeps the preset's fixed weighting.
     `alignment` aligns the model's hidden tokens with a frozen DINOv2's (REPA or
-    iREPA), and with its `end_to_end` also tunes the autoencoder through the
-    alignment (REPA-E).
+    iREPA), and its `end_to_end` also tunes the autoencoder through the alignment
+    (REPA-E).
     """
 
     uncertainty: int | None = None
