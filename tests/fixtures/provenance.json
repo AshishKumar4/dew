@@ -1,5 +1,25 @@
 {
  "references": {
+  "hf/bloom-tiny/logits.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/bloom-tiny/logits_f64.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/bloom-tiny/padded_logits.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/bloom-tiny/padded_logits_f64.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/bloom-tiny/generated.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
   "attention_bf16.npz": {
    "tool": "tools/numerics_reference.py",
    "sources": [
@@ -3325,6 +3345,11 @@
    "tool": "tools/nvfp4_qdq_reference.py",
    "what": "tiny NVFP4 checkpoints with calibrated local input quantizers",
    "files": ["codecs/nvfp4_qdq/unrounded/model.safetensors", "codecs/nvfp4_qdq/e4m3/model.safetensors"]
+  },
+  {
+   "tool": "tools/hf_reference.py",
+   "what": "the BLOOM weights, token ids and validity masks its references read",
+   "files": ["hf/bloom-tiny/model.safetensors", "hf/bloom-tiny/input_ids.npy", "hf/bloom-tiny/padded_ids.npy", "hf/bloom-tiny/attention_mask.npy"]
   },
   {
    "tool": "tools/audio_reference.py",
