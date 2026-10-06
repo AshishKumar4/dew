@@ -1,0 +1,48 @@
+---
+import PythonEditor from './PythonEditor.astro';
+
+interface Props {
+	code: string;
+	title: string;
+	filename?: string;
+}
+const { code, title, filename = 'dew-example.py' } = Astro.props;
+---
+<div class="sampler-editor example-editor" data-example-editor data-filename={filename}>
+	<div class="sampler-editor-bar">
+		<span>{title}, editable</span>
+		<span class="sampler-editor-actions">
+			<button type="button" data-example-copy>Copy</button>
+			<button type="button" data-example-download>Save</button>
+			<button type="button" data-example-reset>Reset</button>
+		</span>
+	</div>
+	<PythonEditor code={code.trimEnd()} kind="example" rows={Math.min(20, code.split('\n').length + 1)} label={title} />
+</div>
+<script>
+	for (const editor of document.querySelectorAll<HTMLElement>('[data-example-editor]')) {
+		const text = editor.querySelector<HTMLTextAreaElement>('textarea')!;
+		const copy = editor.querySelector<HTMLButtonElement>('[data-example-copy]')!;
+		copy.addEventListener('click', async () => {
+			await navigator.clipboard.writeText(text.value);
+			copy.textContent = 'Copied';
+			setTimeout(() => { copy.textContent = 'Copy'; }, 1500);
+		});
+		editor.querySelector('[data-example-reset]')!.addEventListener('click', () => {
+			text.value = text.defaultValue;
+			text.dispatchEvent(new Event('input'));
+		});
+		editor.querySelector('[data-example-download]')!.addEventListener('click', () => {
+			const url = URL.createObjectURL(new Blob([text.value], { type: 'text/x-python' }));
+			const link = document.createElement('a');
+			link.href = url;
+			link.download = editor.dataset.filename!;
+			link.click();
+			setTimeout(() => URL.revokeObjectURL(url), 1000);
+		});
+	}
+</script>
+<style>
+	.example-editor { min-width: 0; }
+	.example-editor .sampler-editor-bar { flex-wrap: wrap; }
+</style>
