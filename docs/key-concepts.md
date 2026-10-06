@@ -116,7 +116,7 @@ The built-in readers, such as `TokenWindows` for tokenized text and `HFImages` f
 
 ## Trainer
 
-`Trainer(objective, optimizer, key=...)` takes an Optax optimizer and a JAX random key. `fit(dataset, steps=...)` places the variables on the devices, compiles one training step and runs it until the step counter reaches `steps`. Between steps it logs every `log_every` steps, evaluates every `eval_every` steps, and writes a checkpoint every `checkpoint_every` steps when the trainer was given `checkpoints=Checkpoints(directory)`.
+`Trainer(objective, optimizer, key=...)` takes an `OptimConfig` or an Optax optimizer, and a JAX random key or integer seed. `fit(dataset, steps=...)` builds a configured optimizer over the run's length, places the variables on the devices, compiles one training step and runs it until the step counter reaches `steps`. Between steps it logs every `log_every` steps, evaluates every `eval_every` steps, and writes a checkpoint every `checkpoint_every` steps when the trainer was given `checkpoints=Checkpoints(directory)`.
 
 ![Trainer.fit: the state is placed on the mesh, the dataset's iterator feeds a prefetcher, and each compiled step runs the loss, the gradient, the optimizer update and the EMA update; logging, evaluation and checkpoints run on the host between steps.](assets/training-loop-light.svg)
 ![Trainer.fit: the state is placed on the mesh, the dataset's iterator feeds a prefetcher, and each compiled step runs the loss, the gradient, the optimizer update and the EMA update; logging, evaluation and checkpoints run on the host between steps.](assets/training-loop-dark.svg)
