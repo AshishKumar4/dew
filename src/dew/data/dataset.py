@@ -269,14 +269,24 @@ def json_list_argument[Entry: DataclassInstance](
         entry: type[Entry]) -> tyro.constructors.PrimitiveConstructorSpec[tuple[Entry, ...]]:
     """A tuple of `entry` records written as one JSON list on the command
     line, `[{"field": ...}, ...]`, since a flag per field cannot spell a list
-    of records whose length the command line decides."""
+    of records whose length the command line decides.
+
+    Each entry is read and written as a run record holds it, so a field that
+    holds a registered value, such as a `ParamGroup`'s schedule, is the record
+    that names it, `{"name": ..., "fields": {...}}`."""
+    from dew.registry import from_record, to_record
+
+    def written(given: tuple[Entry, ...]) -> list[str]:
+        return [json.dumps([to_record(value, entry) for value in given])]
+
     return tyro.constructors.PrimitiveConstructorSpec(
         nargs=1,
         metavar="JSON",
-        instance_from_str=lambda given: tuple(entry(**record) for record in json.loads(given[0])),
+        instance_from_str=lambda given: tuple(
+            from_record(entry, record, dtypes=False) for record in json.loads(given[0])),
         is_instance=lambda given: isinstance(given, tuple) and all(
             isinstance(value, entry) for value in given),
-        str_from_instance=lambda given: [json.dumps([dataclasses.asdict(value) for value in given])],
+        str_from_instance=written,
     )
 
 
