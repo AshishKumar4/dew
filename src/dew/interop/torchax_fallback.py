@@ -215,6 +215,12 @@ class TorchCausalLM(nn.Module):
     def bank_sites(self) -> tuple[DecoderBank, ...]:
         return ()
 
+    @property
+    def causal(self) -> bool:
+        """True: `load` builds the model with `AutoModelForCausalLM`, whose
+        architectures all predict each token from the ones before it."""
+        return True
+
     def __call__(self, tokens, train: bool = False) -> jax.Array:
         logits, _ = self._run(tokens)
         return logits.astype(jnp.float32)
