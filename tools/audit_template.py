@@ -131,7 +131,7 @@ def audit_sessions(lines: Sequence[str]) -> dict:
         if not calls:
             continue
         width = max(len(call.prompt_ids) + len(call.sampled_ids) for call in calls)
-        built = chains(Session("audit", "audit", 0, 0, calls, Status.COMPLETED, 0.0), width)
+        built = chains(Session("audit", "audit", 0, 0, calls, Status.COMPLETED, 0.0), 0, width)
         calls_total += len(calls)
         chains_total += len(built)
         history: list[int] = []
