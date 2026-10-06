@@ -8,6 +8,13 @@ export class Registry extends DurableObject {
 export class Coordinator extends DurableObject {
 	async started() { return true; }
 }
+export class Pool extends DurableObject {
+	async configure() {}
+	async image() { return 'warm-snapshot'; }
+	async status() { return { generation: 'warm-snapshot' }; }
+	async allocate() { return 'warm-host'; }
+	async release() {}
+}
 export class Host extends DurableObject {
 	async configure() {}
 	async allocate() {}

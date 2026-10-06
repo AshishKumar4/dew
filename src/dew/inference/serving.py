@@ -66,7 +66,7 @@ import logging
 import math
 import time
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 
@@ -142,7 +142,12 @@ class Ticket(Future):
     submitted, admitted to a slot, when its first token reached the host
     and when it finished, in `time.perf_counter` seconds; `admitted`,
     `first` and `finished` are None until they happen. `first` less
-    `submitted` is the time to first token."""
+    `submitted` is the time to first token.
+
+    `tokens` are the ids the request has drawn so far, replaced whole each
+    time the server reads a step's draws back, so a caller streams the
+    request from them; the last value is the generation's own, and it is
+    set before the result."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -150,6 +155,22 @@ class Ticket(Future):
         self.admitted: float | None = None
         self.first: float | None = None
         self.finished: float | None = None
+        self.tokens: tuple[int, ...] = ()
+        self._token_callbacks: list[Callable[[Ticket], None]] = []
+
+    def add_tokens_callback(self, callback: Callable[[Ticket], None]) -> None:
+        """Call `callback(ticket)` on the serving thread after each read that
+        adds to `tokens`. As with `add_done_callback`, an exception it raises
+        is logged and the server goes on."""
+        self._token_callbacks.append(callback)
+
+    def _drew(self, tokens: Sequence[int]) -> None:
+        self.tokens = tuple(tokens)
+        for callback in self._token_callbacks:
+            try:
+                callback(self)
+            except Exception as error:
+                _log.error("exception calling a tokens callback for %r", self, exc_info=error)
 
 
 _KEY_DATA = jax.eval_shape(lambda: jax.random.key_data(jax.random.key(0)))
@@ -823,6 +844,7 @@ class Server:
             self._fail(failure)
             raise
         now = time.perf_counter()
+        drew: dict[int, _Row] = {}
         for step in range(draws.drawn.shape[0]):
             for slot, row in list(self._rows.items()):
                 if not draws.drawn[step, slot]:
@@ -832,10 +854,15 @@ class Server:
                 row.tokens.append(int(draws.token[step, slot]))
                 row.behavior.append(float(draws.behavior[step, slot]))
                 row.raw.append(float(draws.raw[step, slot]))
+                drew[slot] = row
                 if draws.stopped[step, slot] or len(row.tokens) == row.budget:
                     del self._rows[slot]
                     self.rows.release(row)
+                    del drew[slot]
+                    row.ticket._drew(row.tokens)
                     self._finish(row, terminated=bool(draws.stopped[step, slot]))
+        for row in drew.values():
+            row.ticket._drew(row.tokens)
 
     def _fail(self, failure: BaseException) -> None:
         self._failed = failure

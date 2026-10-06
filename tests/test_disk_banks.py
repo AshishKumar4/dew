@@ -225,7 +225,7 @@ def test_disk_bank_memory_plan_has_no_decoder_weight_arguments():
 
 def test_runtime_scan_fetches_exactly_the_stored_expert_weights():
     from dew.inference.banks import SafetensorsBanks
-    from dew.nn.backbones.causal_transformer import _fetched_layer
+    from dew.nn.backbones.decoder_stack import _fetched_layer
 
     with SafetensorsBanks(FIXTURE, cache_bytes=0) as source:
         model = decoder(source.config, None)

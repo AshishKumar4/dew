@@ -12,6 +12,7 @@ test('a session forwards the shared host WebSocket through fetch, not RPC serial
 		compatibilityDate: '2026-09-29', bindings: { SNAPSHOT_COMMIT: 'a'.repeat(40) }, durableObjects: {
 			KERNEL: { className: 'LiveKernel', useSQLite: true }, SNAPSHOTS: { className: 'Registry', useSQLite: true },
 			COORDINATOR: { className: 'Coordinator', useSQLite: true }, SHARED: { className: 'Host', useSQLite: true },
+			POOL: { className: 'Pool', useSQLite: true },
 		},
 	}));
 	try {
