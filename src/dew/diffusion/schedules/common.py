@@ -17,6 +17,12 @@ def expand(coefficient, x):
     return jnp.reshape(coefficient, (-1,) + (1,) * (x.ndim - 1))
 
 
+
+def times(t) -> jax.Array:
+    """`t` as an array of at least float32: a float64 run's times stay float64."""
+    t = jnp.asarray(t)
+    return t.astype(jnp.promote_types(t.dtype, jnp.float32))
+
 class NoiseScheduler(ABC):
     """Defines a forward process x_t = alpha(t) x_0 + sigma(t) eps on the time domain [0, T].
 
@@ -46,7 +52,7 @@ class NoiseScheduler(ABC):
 
         By default this is `t` itself, and a schedule can override it.
         """
-        return jnp.asarray(t, jnp.float32)
+        return times(t)
 
     def prior_scale(self) -> jax.Array:
         """Return the standard deviation of the initial Gaussian draw.
@@ -62,11 +68,11 @@ class NoiseScheduler(ABC):
         An ordinary grid advances to its next point, so the interval is
         `t - t_next`.
         """
-        return jnp.asarray(t, jnp.float32) - jnp.asarray(t_next, jnp.float32)
+        return times(t) - times(t_next)
 
     def half_interval(self, t, t_next) -> jax.Array:
         """Return half a grid interval, where a Runge-Kutta stage places its intermediate points."""
-        return (jnp.asarray(t, jnp.float32) - jnp.asarray(t_next, jnp.float32)) / 2
+        return (times(t) - times(t_next)) / 2
 
     def snr(self, t) -> jax.Array:
         alpha, sigma = self.rates(t)
@@ -103,16 +109,16 @@ class GeneralizedNoiseScheduler(NoiseScheduler):
         """Return the time at which `sigmas` gives `sigma`, the inverse of `sigmas`."""
 
     def rates(self, t):
-        sigma = self.sigmas(jnp.asarray(t, jnp.float32))
+        sigma = self.sigmas(times(t))
         return jnp.ones_like(sigma), sigma
 
     def sample_t(self, key, n):
         return jax.random.uniform(key, (n,), minval=0.0, maxval=self.T)
 
     def weight(self, t):
-        sigma = self.sigmas(jnp.asarray(t, jnp.float32))
+        sigma = self.sigmas(times(t))
         # Eq. 8's lambda, written as a sum that needs no epsilon guard.
         return 1 / self.sigma_data ** 2 + 1 / sigma ** 2
 
     def model_time(self, t):
-        return jnp.log(self.sigmas(jnp.asarray(t, jnp.float32))) / 4
+        return jnp.log(self.sigmas(times(t))) / 4

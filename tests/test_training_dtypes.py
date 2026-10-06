@@ -235,12 +235,13 @@ def test_scaled_native_gradients_preserve_update_and_restart(tmp_path, parameter
 
 @pytest.mark.parametrize("seq_aux", [False, True])
 def test_router_reductions_preserve_float64_scores(seq_aux):
-    from dew.nn.moe import global_router_loss, router_moments, sequence_router_losses
+    from dew.nn.moe import global_router_loss, sequence_router_losses
+    from dew.objectives.lm.objective import router_moments
 
     def balance_loss(scores, indices):
         if seq_aux:
             return jnp.mean(sequence_router_losses(scores, indices, .2))
-        return global_router_loss(router_moments(scores, indices), .2)
+        return global_router_loss(router_moments(scores, indices, {}), .2)
 
     with jax.enable_x64():
         values = np.array([[[.8 + 2.**-35, .2 - 2.**-35], [.65, .35], [.6, .4]],

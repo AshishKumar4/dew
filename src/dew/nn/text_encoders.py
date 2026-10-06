@@ -29,7 +29,7 @@ its PIL image processor.
 import functools
 import json
 import math
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import NamedTuple, TypedDict
 
@@ -576,6 +576,26 @@ def _read_tensors(directory: Path) -> dict[str, np.ndarray]:
     return read_weights(directory)
 
 
+def _bind_text_tower[Tower: nn.Module](
+    name: str, translate: Callable[[Mapping[str, object]], NativeFields[Tower]],
+    translate_tensors: Callable[..., ParamTree], name_or_dir: str, revision: str | None,
+    variables: Mapping[str, object] | None, dtype: Dtype | None, param_dtype: str,
+) -> tuple[Tower, Mapping[str, object], NativeFields[Tower]]:
+    """A text tower at `dtype` with its config and the variables it accepts:
+    those supplied, bound unchanged, or the checkpoint's at `param_dtype`."""
+    directory = _checkpoint_dir(name_or_dir, revision, weights=variables is None)
+    config = translate(_read_config(directory))
+    transformer = config.value.clone(dtype=resolve_dtype(dtype))
+    if variables is None:
+        params = translate_tensors(_read_tensors(directory), param_dtype=param_dtype)
+        variables = {"params": jax.tree.map(jnp.asarray, params)}
+    params = variables["params"]
+    if not isinstance(params, Mapping):
+        raise ValueError(f"{name} variables require a params collection")
+    check_tree({"params": params}, transformer, jnp.zeros((1, 2), jnp.int32))
+    return transformer, variables, config
+
+
 class CLIPTextModel:
     """A CLIP text tower with its weights, callable the way the encoder calls it.
 
@@ -601,18 +621,8 @@ class CLIPTextModel:
         defaults to FP32 masters independently of the checkpoint dtype.
         Supplied variables are bound unchanged; only configuration is read.
         """
-        directory = _checkpoint_dir(name_or_dir, revision, weights=variables is None)
-        config = translate_config(_read_config(directory))
-
-        transformer = config.value.clone(dtype=resolve_dtype(dtype))
-        if variables is None:
-            params = translate_weights(_read_tensors(directory), param_dtype=param_dtype)
-            variables = {"params": jax.tree.map(jnp.asarray, params)}
-        params = variables["params"]
-        if not isinstance(params, Mapping):
-            raise ValueError("CLIP text variables require a params collection")
-        check_tree({"params": params}, transformer, jnp.zeros((1, 2), jnp.int32))
-        return cls(transformer, variables, config)
+        return cls(*_bind_text_tower("CLIP text", translate_config, translate_weights, name_or_dir,
+                                     revision, variables, dtype, param_dtype))
 
     def __call__(self, input_ids, attention_mask=None) -> CLIPTowerOutput:
         if attention_mask is not None:
@@ -1023,17 +1033,8 @@ class T5EncoderModel:
         defaults to FP32 masters. Sharded checkpoints load as one tower.
         Supplied variables are bound unchanged; only configuration is read.
         """
-        directory = _checkpoint_dir(name_or_dir, revision, weights=variables is None)
-        config = translate_t5_config(_read_config(directory))
-        transformer = config.value.clone(dtype=resolve_dtype(dtype))
-        if variables is None:
-            params = translate_t5_weights(_read_tensors(directory), param_dtype=param_dtype)
-            variables = {"params": jax.tree.map(jnp.asarray, params)}
-        params = variables["params"]
-        if not isinstance(params, Mapping):
-            raise ValueError("T5 variables require a params collection")
-        check_tree({"params": params}, transformer, jnp.zeros((1, 2), jnp.int32))
-        return cls(transformer, variables, config)
+        return cls(*_bind_text_tower("T5", translate_t5_config, translate_t5_weights, name_or_dir,
+                                     revision, variables, dtype, param_dtype))
 
     def __call__(self, input_ids, attention_mask=None) -> jax.Array:
         if attention_mask is not None:

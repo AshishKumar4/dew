@@ -21,9 +21,9 @@ from pathlib import Path
 import numpy as np
 
 from dew import records
+from dew.cache import dew_cache_dir
 from dew.interop import pickles
 from dew.interop.safetensors_io import read_weights, weight_files
-from dew.telemetry.instrumentation import dew_cache_dir
 
 
 def load_shards(directory: Path) -> dict[str, np.ndarray]:

@@ -77,9 +77,12 @@ from huggingface_hub import get_safetensors_metadata, hf_hub_download
 import numpy as np
 import torch
 from transformers import (
-    AutoModelForCausalLM, AutoTokenizer, DeepseekV3Config, DeepseekV3ForCausalLM,
+    AutoModelForCausalLM, AutoTokenizer, BloomConfig, BloomForCausalLM, DeepseekV3Config, DeepseekV3ForCausalLM,
     Gemma2Config, Gemma2ForCausalLM, Gemma3Config, Gemma3ForCausalLM, Gemma3TextConfig,
-    GemmaConfig, GemmaForCausalLM, LlamaConfig, LlamaForCausalLM,
+    GemmaConfig, GemmaForCausalLM, GPTNeoConfig, GPTNeoForCausalLM, LlamaConfig, LlamaForCausalLM,
+    PhiConfig, PhiForCausalLM,
+    FalconConfig, FalconForCausalLM,
+    GPTJConfig, GPTJForCausalLM,
     Qwen3Config, Qwen3ForCausalLM, MistralConfig, MistralForCausalLM, PreTrainedModel,
     MixtralConfig, MixtralForCausalLM, Qwen2Config, Qwen2ForCausalLM,
     Qwen3MoeConfig, Qwen3MoeForCausalLM, Olmo3Config, Olmo3ForCausalLM,
@@ -129,6 +132,370 @@ NEMOTRON_H_CONFIGS = (
     ("nemotron-h-4b", "nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16", "dfaf35de3e30f1867dd8dbc38a7fc9fb52d3914f"),
     ("nemotron-h-30b-a3b", "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", "bf77c3174f68ad409e1c2aa60daeb46e32d1c606"),
 )
+BLOOM_CONFIG = ('bloom-560m', 'bigscience/bloom-560m', 'ac2ae5fab2ce3f9f40dc79b5ca9f637430d24971')
+BLOOMZ_CONFIG = ('bloomz-560m', 'bigscience/bloomz-560m', 'a2845d7e13dd12efae154a9f1c63fcc2e0cc4b05')
+
+
+def tiny_bloom() -> BloomForCausalLM:
+    """Three heads exercise the non-power-of-two ALiBi slopes and fused qkv."""
+    torch.manual_seed(0)
+    return BloomForCausalLM(BloomConfig(
+        vocab_size=64, hidden_size=24, n_layer=2, n_head=3,
+        layer_norm_epsilon=3e-5, hidden_dropout=0., attention_dropout=0.,
+        bos_token_id=1, eos_token_id=None, pad_token_id=0))
+
+
+GPT_NEO_CONFIG = ('gpt-neo-125m', 'EleutherAI/gpt-neo-125m', '21def0189f5705e2521767faed922f1f15e7d7db')
+
+
+def tiny_gpt_neo() -> GPTNeoForCausalLM:
+    """Local/global attention without a logit scale, learned positions and an output bias."""
+    torch.manual_seed(0)
+    return GPTNeoForCausalLM(GPTNeoConfig(
+        vocab_size=64, hidden_size=32, intermediate_size=48, num_layers=2, num_heads=4,
+        attention_types=[[['global', 'local'], 1]], window_size=4, max_position_embeddings=48,
+        layer_norm_epsilon=3e-5, resid_dropout=0., embed_dropout=0., attention_dropout=0.,
+        bos_token_id=1, eos_token_id=None, pad_token_id=0))
+
+
+PHI_CONFIG = ('phi-2', 'microsoft/phi-2', '810d367871c1d460086d9f82db8696f2e0a0fcd0')
+
+
+def tiny_phi() -> PhiForCausalLM:
+    """Biased one-norm parallel branches, partial rotary, GQA and an affine head."""
+    torch.manual_seed(0)
+    return PhiForCausalLM(PhiConfig(
+        vocab_size=64, hidden_size=32, intermediate_size=48, num_hidden_layers=2,
+        num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=48,
+        layer_norm_eps=3e-5, resid_pdrop=0., embd_pdrop=0., attention_dropout=0.,
+        rope_parameters={'rope_type': 'default', 'rope_theta': 10000., 'partial_rotary_factor': .5},
+        bos_token_id=1, eos_token_id=None, pad_token_id=0))
+
+
+FALCON_CONFIG = ('falcon-7b', 'tiiuae/falcon-7b', 'ec89142b67d748a1865ea4451372db8313ada0d8')
+
+
+def tiny_falcon(multi_query: bool = True) -> FalconForCausalLM:
+    """A biased one-norm parallel block, with contiguous MQA or head-interleaved MHA."""
+    torch.manual_seed(0)
+    return FalconForCausalLM(FalconConfig(
+        vocab_size=64, hidden_size=24, ffn_hidden_size=48, num_hidden_layers=2,
+        num_attention_heads=3, multi_query=multi_query, bias=True, parallel_attn=True,
+        max_position_embeddings=48, layer_norm_epsilon=3e-5,
+        hidden_dropout=0., attention_dropout=0.,
+        bos_token_id=1, eos_token_id=None, pad_token_id=0))
+
+
+GPTJ_CONFIG = ('gpt-j-6b', 'EleutherAI/gpt-j-6b', '47e169305d2e8376be1d31e765533382721b2cc1')
+
+
+def tiny_gptj() -> GPTJForCausalLM:
+    """Interleaved partial rotary, one-norm parallel residual and an affine head."""
+    torch.manual_seed(0)
+    return GPTJForCausalLM(GPTJConfig(
+        vocab_size=64, n_embd=32, n_inner=48, n_layer=2, n_head=4, rotary_dim=4, n_positions=48,
+        layer_norm_epsilon=3e-5, resid_pdrop=0., embd_pdrop=0., attn_pdrop=0.,
+        bos_token_id=1, eos_token_id=None, pad_token_id=0))
+
+
+def write_classic_tiny(name: str, model: PreTrainedModel) -> None:
+    """Same-weight fp32/float64 logits, left-padding and greedy continuation.
+
+    Phi-3's crossing oracle is its uncached full-prefix forward. Its pinned
+    generate drops the prefix at that crossing (transformers issue #49334),
+    so that output is recorded separately from the intended continuation.
+    """
+    from unittest.mock import patch
+
+    from diffusers_wan_reference import float64
+
+    model.config._attn_implementation = 'eager'
+    write_tiny(name, model)
+    directory = FIXTURES / name
+    ids = np.load(directory / 'input_ids.npy')
+    mask = np.ones_like(ids, bool)
+    mask[1, :3] = False
+    padded = np.where(mask, ids, 0)
+    positions = np.maximum(np.cumsum(mask, axis=-1) - 1, 0)
+    positioned = ({} if model.config.model_type == 'bloom' else
+                  {'position_ids': torch.from_numpy(positions).long()})
+    np.save(directory / 'padded_ids.npy', padded)
+    np.save(directory / 'attention_mask.npy', mask)
+    phi3 = model.config.model_type == 'phi3'
+    model.eval()
+    with torch.no_grad():
+        generated = model.generate(torch.from_numpy(ids[:, :4]).long(), do_sample=False,
+                                   max_new_tokens=6, eos_token_id=None, pad_token_id=0).numpy()
+        logits = model(torch.from_numpy(padded).long(), attention_mask=torch.from_numpy(mask),
+                       use_cache=False, **positioned).logits.numpy()
+        if phi3:
+            np.save(directory / 'transformers_generated.npy', generated)
+            generated = ids[:, :4].copy()
+            scores = []
+            for _ in range(6):
+                score = model(torch.from_numpy(generated).long(), use_cache=False).logits[:, -1].numpy()
+                scores.append(score)
+                generated = np.concatenate((generated, score.argmax(-1)[:, None]), axis=1)
+            np.save(directory / 'generation_logits.npy', np.stack(scores, axis=1))
+            np.save(directory / 'short_logits.npy',
+                    model(torch.from_numpy(ids[:, :4]).long(), use_cache=False).logits.numpy())
+    np.save(directory / 'generated.npy', generated)
+    np.save(directory / 'padded_logits.npy', logits)
+    affine = model.config.model_type in ('phi', 'gptj')
+    if affine:
+        full = torch.from_numpy(np.load(directory / 'logits.npy'))
+        losses = torch.nn.functional.cross_entropy(
+            full[:, :-1].transpose(1, 2), torch.from_numpy(ids[:, 1:]).long(), reduction='none')
+        np.save(directory / 'losses.npy', losses.numpy())
+    tensor, full = torch.tensor, torch.full
+
+    def wide_tensor(*args, dtype=None, **kwargs):
+        return tensor(*args, dtype=torch.float64 if dtype == torch.float32 else dtype, **kwargs)
+
+    def wide_full(*args, dtype=None, **kwargs):
+        return full(*args, dtype=torch.float64 if dtype == torch.float32 else dtype, **kwargs)
+
+    with (float64(), patch.object(torch, 'tensor', wide_tensor),
+          patch.object(torch, 'full', wide_full), torch.no_grad()):
+        # Rebuild frequency/sinusoidal buffers in float64 rather than
+        # widening an already-rounded fp32 table. Parameters remain the
+        # same checkpoint values, loaded into the wider reference model.
+        truth_model = AutoModelForCausalLM.from_config(
+            model.config, dtype=torch.float64, attn_implementation='eager').eval()
+        truth_model.load_state_dict(model.state_dict())
+        truth = truth_model(torch.from_numpy(ids).long(), use_cache=False).logits.double().numpy()
+        if affine:
+            losses = torch.nn.functional.cross_entropy(
+                torch.from_numpy(truth[:, :-1]).transpose(1, 2),
+                torch.from_numpy(ids[:, 1:]).long(), reduction='none')
+            np.save(directory / 'losses_f64.npy', losses.numpy())
+        padded_truth = truth_model(
+            torch.from_numpy(padded).long(), attention_mask=torch.from_numpy(mask),
+            use_cache=False, **positioned).logits.double().numpy()
+        if phi3:
+            np.save(directory / 'short_logits_f64.npy',
+                    truth_model(torch.from_numpy(ids[:, :4]).long(), use_cache=False).logits.double().numpy())
+            scores = [truth_model(torch.from_numpy(generated[:, :4 + step]).long(),
+                                  use_cache=False).logits[:, -1].double().numpy() for step in range(6)]
+            np.save(directory / 'generation_logits_f64.npy', np.stack(scores, axis=1))
+    np.save(directory / 'logits_f64.npy', truth)
+    np.save(directory / 'padded_logits_f64.npy', padded_truth)
+
+
+MINIMAX_M2_CONFIGS = (
+    ('minimax-m2', 'MiniMaxAI/MiniMax-M2', '757303d492a50514c312788b5247a4f696a4c6a3'),
+    ('minimax-m2.5', 'MiniMaxAI/MiniMax-M2.5', 'f710177d938eff80b684d42c5aa84b382612f21f'),
+    ('minimax-m2.7', 'MiniMaxAI/MiniMax-M2.7', 'd494266a4affc0d2995ba1fa35c8481cbd84294b'),
+)
+
+
+def write_minimax_m2() -> None:
+    """The fixed MiniMax rotary port, saved under the released per-expert names."""
+    from diffusers_wan_reference import float64
+    from safetensors.torch import save_file
+    import transformers
+    from transformers import MiniMaxM2Config, MiniMaxM2ForCausalLM
+
+    if transformers.__version__ != '5.18.0':
+        raise ValueError('MiniMax-M2 requires transformers 5.18.0 (rotary fix PR 48486)')
+    torch.manual_seed(0)
+    model = MiniMaxM2ForCausalLM(MiniMaxM2Config(
+        vocab_size=64, hidden_size=32, num_hidden_layers=2, num_attention_heads=4,
+        num_key_value_heads=2, head_dim=16, intermediate_size=24, num_local_experts=4,
+        num_experts_per_tok=2, rotary_dim=8, max_position_embeddings=64,
+        rope_theta=5000000.0, rms_norm_eps=1e-6, tie_word_embeddings=False,
+        bos_token_id=1, eos_token_id=2))
+    model.set_experts_implementation('eager')
+    write_tiny('minimax-m2-tiny', model, padded=True)
+    directory = FIXTURES / 'minimax-m2-tiny'
+    ids = torch.from_numpy(np.load(directory / 'input_ids.npy')).long()
+    with float64(), torch.no_grad():
+        truth = model.double()(input_ids=ids, use_cache=False).logits.numpy()
+    np.save(directory / 'logits_f64.npy', truth)
+    weights = {}
+    for name, value in model.float().state_dict().items():
+        if '.mlp.experts.' in name:
+            stem, projection = name.split('.mlp.experts.')
+            parts = value.chunk(2, dim=1) if projection == 'gate_up_proj' else (value,)
+            names = ('w1', 'w3') if projection == 'gate_up_proj' else ('w2',)
+            for part, target in zip(parts, names, strict=True):
+                for index, expert in enumerate(part):
+                    weights[f'{stem}.block_sparse_moe.experts.{index}.{target}.weight'] = expert.contiguous()
+        else:
+            weights[name.replace('.mlp.', '.block_sparse_moe.')] = value.contiguous()
+    save_file(weights, str(directory / 'model.safetensors'))
+    (directory / 'model.safetensors').chmod(0o644)
+    write_minimax_m2_fp8(model.config.to_dict(), weights, ids)
+    for name, repo, revision in MINIMAX_M2_CONFIGS:
+        write_released_config(name, repo, revision)
+
+
+def write_minimax_m2_fp8(config: dict, weights: dict, ids: torch.Tensor) -> None:
+    """Run Transformers' CPU dequantization on the released FP8 storage layout."""
+    from diffusers_wan_reference import float64
+    from safetensors.torch import save_file
+    from transformers import MiniMaxM2ForCausalLM, FineGrainedFP8Config
+
+    directory = FIXTURES / 'minimax-m2-fp8-tiny'
+    directory.mkdir(parents=True, exist_ok=True)
+    quantization = {'quant_method': 'fp8', 'fmt': 'float8_e4m3fn',
+                    'activation_scheme': 'dynamic', 'weight_block_size': [128, 128],
+                    'modules_to_not_convert': ['gate', 'e_score_correction_bias', 'lm_head']}
+    packed = {}
+    for name, value in weights.items():
+        if value.ndim != 2 or name in ('model.embed_tokens.weight', 'lm_head.weight') or '.gate.' in name:
+            packed[name] = value
+            continue
+        # Toy matrices occupy one partial 128x128 tile. Scales differ across
+        # projections and experts, and the reference dequantizes the same codes.
+        scale = value.abs().max() / torch.finfo(torch.float8_e4m3fn).max
+        packed[name] = (value / scale).to(torch.float8_e4m3fn)
+        packed[name.removesuffix('.weight') + '.weight_scale_inv'] = scale.reshape(1, 1)
+    save_file(packed, str(directory / 'model.safetensors'))
+    (directory / 'config.json').write_text(json.dumps({**config, 'quantization_config': quantization}, indent=1))
+    model = MiniMaxM2ForCausalLM.from_pretrained(
+        str(directory), dtype=torch.float32, quantization_config=FineGrainedFP8Config(dequantize=True))
+    model.set_experts_implementation('eager')
+    model.set_attn_implementation('eager')
+    model.eval()
+    np.save(directory / 'input_ids.npy', ids.numpy().astype(np.int32))
+    with torch.no_grad():
+        np.save(directory / 'logits.npy', model(input_ids=ids, use_cache=False).logits.numpy())
+    with float64(), torch.no_grad():
+        np.save(directory / 'logits_f64.npy', model.double()(input_ids=ids, use_cache=False).logits.numpy())
+    (directory / 'model.safetensors').chmod(0o644)
+
+
+def write_qwen2_moe() -> None:
+    """Three mixed-window layers, two routed layers and a gated shared expert."""
+    from diffusers_wan_reference import float64
+    from transformers import Qwen2MoeConfig, Qwen2MoeForCausalLM
+
+    torch.manual_seed(0)
+    model = Qwen2MoeForCausalLM(Qwen2MoeConfig(
+        vocab_size=64, hidden_size=32, num_hidden_layers=3, num_attention_heads=4,
+        num_key_value_heads=2, intermediate_size=48, moe_intermediate_size=16,
+        shared_expert_intermediate_size=24, num_experts=4, num_experts_per_tok=2,
+        norm_topk_prob=False, decoder_sparse_step=1, mlp_only_layers=[1],
+        qkv_bias=True, use_sliding_window=True, sliding_window=4, max_window_layers=3,
+        max_position_embeddings=64, rope_theta=1000000.0, tie_word_embeddings=False))
+    model.set_experts_implementation('eager')
+    write_tiny('qwen2-moe-tiny', model, padded=True)
+    directory = FIXTURES / 'qwen2-moe-tiny'
+    ids = torch.from_numpy(np.load(directory / 'input_ids.npy')).long()
+    with float64(), torch.no_grad():
+        np.save(directory / 'logits_f64.npy', model.double()(input_ids=ids, use_cache=False).logits.numpy())
+    (directory / 'model.safetensors').chmod(0o644)
+    write_released_config('qwen1.5-moe-a2.7b', 'Qwen/Qwen1.5-MoE-A2.7B',
+                          '1a758c50ecb6350748b9ce0a99d2352fd9fc11c9')
+
+
+def write_granitemoe() -> None:
+    """Granite's four non-unit multipliers and the released packed expert layout."""
+    from diffusers_wan_reference import float64
+    from safetensors.torch import save_file
+    from transformers import GraniteMoeConfig, GraniteMoeForCausalLM
+
+    torch.manual_seed(0)
+    model = GraniteMoeForCausalLM(GraniteMoeConfig(
+        vocab_size=64, hidden_size=32, num_hidden_layers=2, num_attention_heads=4,
+        num_key_value_heads=2, intermediate_size=24, num_local_experts=4,
+        num_experts_per_tok=2, max_position_embeddings=64, rope_theta=10000.0,
+        embedding_multiplier=12.0, residual_multiplier=0.22, logits_scaling=6.0,
+        attention_multiplier=0.015625, tie_word_embeddings=True, bos_token_id=0, eos_token_id=0))
+    model.set_experts_implementation('eager')
+    write_tiny('granitemoe-tiny', model, padded=True)
+    directory = FIXTURES / 'granitemoe-tiny'
+    ids = torch.from_numpy(np.load(directory / 'input_ids.npy')).long()
+    with float64(), torch.no_grad():
+        np.save(directory / 'logits_f64.npy', model.double()(input_ids=ids, use_cache=False).logits.numpy())
+    weights = {}
+    for name, value in model.float().state_dict().items():
+        name = name.replace('.block_sparse_moe.experts.gate_up_proj', '.block_sparse_moe.input_linear.weight')
+        name = name.replace('.block_sparse_moe.experts.down_proj', '.block_sparse_moe.output_linear.weight')
+        name = name.replace('.block_sparse_moe.router.weight', '.block_sparse_moe.router.layer.weight')
+        if name != 'lm_head.weight':
+            weights[name] = value.contiguous()
+    save_file(weights, str(directory / 'model.safetensors'))
+    (directory / 'model.safetensors').chmod(0o644)
+    write_released_config('powermoe-3b', 'ibm-research/PowerMoE-3b',
+                          '13fcb5a98001438bed01cf1ac4b423751dc4c2ea')
+
+
+MODERNBERT_CONFIGS = (
+    ('modernbert-base', 'answerdotai/ModernBERT-base', '8949b909ec900327062f0ebf497f51aef5e6f0c8',
+     'config.json'),
+    ('laya-encoder', 'convaiinnovations/laya', '7b928d828b7b0e022f929d9bd2e44165aa270148',
+     'encoder/config.json'),
+)
+
+
+def write_modernbert_tiny(name: str = 'modernbert-tiny') -> None:
+    """ModernBertForMaskedLM's logits and ModernBertModel's states, fp32 and float64.
+
+    Four layers give the global, local, local, global pattern, and a local
+    span of 6 (three keys either side) is shorter than the 12-token probe, so
+    a window applied on one side only, or not at all, shows in the states.
+    Beside the plain rows: right-padded rows with their validity mask, and
+    rows packing two documents, whose reference is each document run alone
+    at positions from zero.
+    """
+    from diffusers_wan_reference import float64
+    from transformers import ModernBertConfig, ModernBertForMaskedLM
+
+    torch.manual_seed(0)
+    model = ModernBertForMaskedLM(ModernBertConfig(
+        vocab_size=64, hidden_size=32, intermediate_size=24, num_hidden_layers=4,
+        num_attention_heads=2, global_attn_every_n_layers=3, local_attention=6,
+        global_rope_theta=160000.0, local_rope_theta=10000.0, norm_eps=3e-5,
+        max_position_embeddings=64, pad_token_id=0, bos_token_id=1, eos_token_id=2,
+        cls_token_id=1, sep_token_id=2))
+    model.config._attn_implementation = 'eager'
+    write_tiny(name, model)
+    directory = FIXTURES / name
+    ids = np.load(directory / 'input_ids.npy')
+    mask = np.ones_like(ids, bool)
+    mask[1, -3:] = False
+    padded = np.where(mask, ids, 0)
+    documents = np.where(np.arange(ids.shape[1]) < 5, 1, 2)[None].repeat(ids.shape[0], 0)
+    np.save(directory / 'padded_ids.npy', padded)
+    np.save(directory / 'attention_mask.npy', mask)
+    np.save(directory / 'segment_ids.npy', documents.astype(np.int32))
+
+    def states(dtype_scope):
+        with dtype_scope, torch.no_grad():
+            encoder = model.model
+            plain = encoder(torch.from_numpy(ids).long()).last_hidden_state
+            masked = encoder(torch.from_numpy(padded).long(),
+                             attention_mask=torch.from_numpy(mask)).last_hidden_state
+            packed = torch.cat([encoder(torch.from_numpy(ids[:, :5]).long()).last_hidden_state,
+                                encoder(torch.from_numpy(ids[:, 5:]).long()).last_hidden_state], dim=1)
+            logits = model(torch.from_numpy(ids).long()).logits
+        return {'hidden': plain, 'padded_hidden': masked, 'packed_hidden': packed, 'logits': logits}
+
+    import contextlib
+
+    model.eval()
+    for key, value in states(contextlib.nullcontext()).items():
+        np.save(directory / f'{key}.npy', value.float().numpy())
+    # The reference's own bf16 run, which a bf16 forward is held to, on a
+    # copy: a round trip through bf16 would round the float64 run's weights.
+    import copy
+
+    with torch.no_grad():
+        narrow = copy.deepcopy(model).to(torch.bfloat16)
+        np.save(directory / 'hidden_bf16.npy',
+                narrow.model(torch.from_numpy(ids).long()).last_hidden_state.float().numpy())
+    with float64():
+        model.double()
+        # The inverse frequencies are buffers built at construction, in float32.
+        rotary = model.model.rotary_emb
+        for layer_type in rotary.layer_types:
+            inverse, _ = rotary.compute_default_rope_parameters(model.config, layer_type=layer_type)
+            setattr(rotary, f'{layer_type}_inv_freq', inverse.double())
+        truths = states(contextlib.nullcontext())
+    for key, value in truths.items():
+        np.save(directory / f'{key}_f64.npy', value.double().numpy())
 
 
 def tiny_qwen3() -> Qwen3ForCausalLM:
@@ -1066,7 +1433,67 @@ def write_diffusion_denoiser_tiny() -> None:
     print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
 
 
-def write_tiny(name: str, model: PreTrainedModel, seed: int = 1234) -> None:
+def write_diffusion_window_tiny() -> None:
+    """One DiffusionGemma denoise step past its sliding window: a sliding then
+    a full layer at a window of 4, a prompt of 6 and a canvas of 6, so the
+    decoder's sliding layer reads only the last 3 cached prompt keys while
+    every canvas key reads every other (modeling_diffusion_gemma.py:1399-1401).
+    The fp32 and float64 reference logits, the latter for the float64 rule.
+    """
+    from diffusers_wan_reference import float64
+    from safetensors.torch import save_file
+    from transformers.models.diffusion_gemma.configuration_diffusion_gemma import (
+        DiffusionGemmaConfig, DiffusionGemmaTextConfig,
+    )
+    from transformers.models.diffusion_gemma.modeling_diffusion_gemma import (
+        DiffusionGemmaForBlockDiffusion,
+    )
+    from transformers.models.gemma4.configuration_gemma4 import Gemma4VisionConfig
+
+    fields = {**DIFFUSION_DENOISER_TEXT, "sliding_window": 4,
+              "layer_types": ["sliding_attention", "full_attention"]}
+    text = DiffusionGemmaTextConfig(**{key: value for key, value in fields.items() if key != "model_type"})
+    vision = Gemma4VisionConfig(
+        hidden_size=32, intermediate_size=64, num_hidden_layers=1,
+        num_attention_heads=2, num_key_value_heads=2, head_dim=16, patch_size=8,
+        pooling_kernel_size=2, position_embedding_size=64)
+    torch.manual_seed(0)
+    model = DiffusionGemmaForBlockDiffusion(DiffusionGemmaConfig(
+        text_config=text, vision_config=vision, canvas_length=6, tie_word_embeddings=False))
+    state = model.state_dict()
+    for name in list(state):
+        if name.startswith("model.decoder.layers.") or name in (
+                "model.decoder.embed_tokens.weight", "model.decoder.norm.weight"):
+            state[name].copy_(state[name.replace("model.decoder.", "model.encoder.language_model.", 1)])
+    model.load_state_dict(state)
+    model = model.float().eval()
+    # The experts' loop, since the grouped matmul has no float64 kernel.
+    for module in model.modules():
+        if hasattr(module, "experts") and hasattr(module.experts, "config"):
+            module.experts.config._experts_implementation = "eager"
+    directory = FIXTURES / "diffusion-gemma-window-tiny"
+    directory.mkdir(parents=True, exist_ok=True)
+    save_file({name: tensor for name, tensor in model.state_dict().items()
+               if name.startswith(("model.encoder.language_model.", "model.decoder.")) or name == "lm_head.weight"},
+              directory / "model.safetensors")
+    (directory / "config.json").write_text(json.dumps(fields, indent=1) + "\n")
+    prompt = np.array([[2, 5, 7, 9, 11, 13]], np.int32)
+    canvas = np.array([[3, 4, 5, 6, 8, 10]], np.int32)
+
+    def logits():
+        with torch.no_grad():
+            return model(input_ids=torch.from_numpy(prompt).long(),
+                         decoder_input_ids=torch.from_numpy(canvas).long()).logits
+
+    np.save(directory / "prompt.npy", prompt)
+    np.save(directory / "canvas.npy", canvas)
+    np.save(directory / "logits.npy", logits().to(torch.float32).numpy())
+    with float64():
+        model.double()
+        np.save(directory / "logits_f64.npy", logits().double().numpy())
+
+
+def write_tiny(name: str, model: PreTrainedModel, seed: int = 1234, *, padded: bool = False) -> None:
     directory = FIXTURES / name
     directory.mkdir(parents=True, exist_ok=True)
     scatter_weights(model, seed)
@@ -1076,6 +1503,23 @@ def write_tiny(name: str, model: PreTrainedModel, seed: int = 1234) -> None:
     ids = probe_ids(model.config.vocab_size)
     np.save(directory / "input_ids.npy", ids)
     np.save(directory / "logits.npy", reference_logits(model, ids))
+    if padded:
+        from copy import deepcopy
+        from diffusers_wan_reference import float64
+
+        tokens = torch.from_numpy(ids.astype(np.int64))
+        valid = torch.ones_like(tokens)
+        tokens[1, :4] = 0
+        valid[1, :4] = 0
+        positions = (valid.cumsum(-1) - 1).clamp(min=0)
+        inputs = {'input_ids': tokens, 'attention_mask': valid, 'position_ids': positions, 'use_cache': False}
+        with torch.no_grad():
+            reference = model(**inputs).logits.numpy()
+        with float64(), torch.no_grad():
+            truth = deepcopy(model).double()(**inputs).logits.numpy()
+        np.savez(directory / 'padded.npz', input_ids=tokens.numpy().astype(np.int32),
+                 attention_mask=valid.numpy().astype(bool), position_ids=positions.numpy().astype(np.int32),
+                 logits=reference, logits_f64=truth)
     size = sum(path.stat().st_size for path in directory.iterdir())
     print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
 
@@ -1123,7 +1567,8 @@ def write_real_reference(directory: Path) -> None:
           f"top {TOP_K}, argmax[:8]={np.argmax(logits, axis=-1)[:8].tolist()}")
 
 
-def write_released_config(name: str, repo: str, revision: str | None = None) -> None:
+def write_released_config(name: str, repo: str, revision: str | None = None,
+                          filename: str = "config.json") -> None:
     """The real config.json of a released checkpoint, and the repo it came
     from in source.json. Only the config is downloaded, never the weights.
 
@@ -1134,11 +1579,12 @@ def write_released_config(name: str, repo: str, revision: str | None = None) -> 
     """
     directory = FIXTURES / name
     directory.mkdir(parents=True, exist_ok=True)
-    config = json.loads(Path(hf_hub_download(repo, "config.json", revision=revision)).read_text())
+    config = json.loads(Path(hf_hub_download(repo, filename, revision=revision)).read_text())
     for key in [key for key in config if key.startswith("unsloth")]:
         del config[key]
     (directory / "config.json").write_text(json.dumps(config, indent=1) + "\n")
-    source = {"repo": repo, **({"revision": revision} if revision is not None else {})}
+    source = {"repo": repo, **({"revision": revision} if revision is not None else {}),
+              **({"filename": filename} if filename != "config.json" else {})}
     (directory / "source.json").write_text(json.dumps(source) + "\n")
     layers = config.get('num_hidden_layers', config.get('n_layers', config.get('num_layers')))
     print(f"{directory / 'config.json'}: {repo}, "
@@ -1151,9 +1597,55 @@ def main() -> None:
                         help="only the tiny fixtures, no 1.5 GB download")
     parser.add_argument("--nemotron-h-only", action="store_true",
                         help="only the Nemotron-H tiny fixture and two pinned released configs")
+    parser.add_argument('--classic-family', choices=('bloom', 'gpt_neo', 'phi', 'falcon', 'gptj'),
+                        help='only this classic decoder fixture and its pinned released config')
+    parser.add_argument('--minimax-m2-only', action='store_true',
+                        help='only MiniMax-M2 with transformers 5.18.0 and its pinned configs')
+    parser.add_argument('--qwen2-moe-only', action='store_true',
+                        help='only Qwen2-MoE and its pinned released config')
+    parser.add_argument('--granitemoe-only', action='store_true',
+                        help='only Granite MoE and its pinned PowerMoE config')
+    parser.add_argument('--encoder-family', choices=('modernbert',),
+                        help='only this encoder fixture and its pinned released configs')
     args = parser.parse_args()
 
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    if args.classic_family == 'bloom':
+        write_classic_tiny('bloom-tiny', tiny_bloom())
+        write_released_config(*BLOOM_CONFIG)
+        write_released_config(*BLOOMZ_CONFIG)
+        return
+    if args.classic_family == 'gpt_neo':
+        write_classic_tiny('gpt-neo-tiny', tiny_gpt_neo())
+        write_released_config(*GPT_NEO_CONFIG)
+        return
+    if args.classic_family == 'phi':
+        write_classic_tiny('phi-tiny', tiny_phi())
+        write_released_config(*PHI_CONFIG)
+        return
+    if args.classic_family == 'falcon':
+        write_classic_tiny('falcon-tiny', tiny_falcon())
+        write_classic_tiny('falcon-mha-tiny', tiny_falcon(multi_query=False))
+        write_released_config(*FALCON_CONFIG)
+        return
+    if args.classic_family == 'gptj':
+        write_classic_tiny('gptj-tiny', tiny_gptj())
+        write_released_config(*GPTJ_CONFIG)
+        return
+    if args.minimax_m2_only:
+        write_minimax_m2()
+        return
+    if args.qwen2_moe_only:
+        write_qwen2_moe()
+        return
+    if args.granitemoe_only:
+        write_granitemoe()
+        return
+    if args.encoder_family == 'modernbert':
+        write_modernbert_tiny()
+        for config in MODERNBERT_CONFIGS:
+            write_released_config(*config)
+        return
     write_nemotron_h()
     write_nemotron_h(moe=True)
     write_nemotron_h(moe=True, latent=True)

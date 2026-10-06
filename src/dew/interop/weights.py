@@ -17,8 +17,11 @@ type ParamTree = Tree[np.ndarray]
 type TensorPath = Callable[[str], tuple[str, ...] | None]
 
 
-def checkpoint_dtype(stored: np.dtype, param_dtype: str = "float32") -> np.dtype:
+def checkpoint_dtype(stored: np.dtype, param_dtype: str = "float32", *,
+                     path: tuple[str, ...] = ()) -> np.dtype:
     """Floating payloads use parameter storage; integer and boolean state keeps its dtype."""
+    if path and (path[0] == 'constants' or (path[0] == 'params' and path[-1] == 'head_bias')):
+        param_dtype = 'float32'
     dtype = resolve_dtype(param_dtype)
     if dtype is None or not jnp.issubdtype(dtype, jnp.floating):
         raise ValueError(f"param_dtype {param_dtype!r} must name floating parameter storage")
@@ -106,7 +109,7 @@ def _leaves[LeafT](tensors: Mapping[str, np.ndarray], path_of: TensorPath, param
         stored = np.asarray(tensor)
         order = (*range(2, stored.ndim), 1, 0) if path[-1] == "kernel" else None
         transpose = None if order is None else tuple(int(axis) for axis in np.argsort(order))
-        dtype = checkpoint_dtype(stored.dtype, "float32" if path[0] == "constants" else param_dtype)
+        dtype = checkpoint_dtype(stored.dtype, param_dtype, path=path)
         yield name, path, read(stored, dtype, order), transpose
 
 

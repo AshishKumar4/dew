@@ -83,6 +83,7 @@ from .decoder_block import (
     RematPolicy,
     decoder_norm,
     remat_policy,
+    ungated_activation,
 )
 from .layer_plan import LayerKind, LayerSpec, ResolvedKind, group_name, scan_groups
 
@@ -538,6 +539,7 @@ def _whole(value, axis: int):
     ("embed_tokens",): ("vocab", "embed"),
     ("embed_positions",): (None, "embed"),
     ("lm_head",): ("embed", "vocab"),
+    ("head_bias",): ("vocab",),
     ("embed_tokens_per_layer",): ("vocab", None),
     ("per_layer_model_projection",): ("embed", "mlp"),
     # AltUp's copies enter and leave through embed-by-embed projections, one
@@ -601,7 +603,7 @@ class CausalTransformer(nn.Module):
     tuple gives one width per layer (Gemma 3n), and 0 means no feed-forward
     (Mamba-2)."""
     max_seq_len: int = 2048
-    position_embedding: Literal['rotary', 'learned'] = 'rotary'
+    position_embedding: Literal['rotary', 'learned', 'alibi'] = 'rotary'
     position_embedding_size: int | None = None
     """The number of rows in the learned position table; None means `max_seq_len`.
     It does not depend on the decode cache's capacity."""
@@ -616,12 +618,20 @@ class CausalTransformer(nn.Module):
     norm_eps: float = 1e-5
     norm_type: Literal['rms', 'layer'] = 'rms'
     norm_bias: bool = False
+    embedding_norm: bool = False
+    """Normalize token embeddings before the first block, as BLOOM and ModernBERT do."""
+    first_attention_norm: bool = True
+    """Whether the first block norms its attention input. ModernBERT's first
+    block reads the embedding norm's output as it is (modeling_modernbert.py,
+    ModernBertEncoderLayer: attn_norm is Identity at layer 0)."""
     scale_offset: bool = False       # RMSNorm weight is (1 + w), as Gemma stores it
     scale_after_cast: bool = False   # apply the weight after casting, as Llama and Qwen3 do
     sandwich_norms: bool = False     # add a norm after each sublayer, as Gemma does
     pre_norms: bool = True           # norm each sublayer's input; False + sandwich is OLMo 3
     parallel_residual: bool = False
     """Whether attention and the feed-forward both read the same residual, as in GPT-NeoX."""
+    shared_parallel_norm: bool = False
+    """Both parallel branches read one LayerNorm, as in Phi, Falcon-7B and GPT-J."""
     qk_norm: bool = True
     qk_norm_scope: str = 'head'              # 'head' per head (Qwen3); 'projection' whole (OLMo 3)
     v_norm: bool = False                     # Gemma 4's scale-free values norm
@@ -664,6 +674,16 @@ class CausalTransformer(nn.Module):
     residual stream (o_proj, out_proj, down_proj) divide their std by
     sqrt(2 * num_layers). This is lm-engine's `use_depth_scaled_init`."""
     final_logit_softcap: float | None = None
+    head_transform: Literal['gelu', 'gelu_exact'] | None = None
+    """The activation of a BERT-style prediction head between the final norm
+    and the vocabulary projection: a bias-free dense layer, this activation and
+    a norm of the model's kind (ModernBertPredictionHead,
+    modeling_modernbert.py). None projects the final states directly. As in the
+    feed-forward, 'gelu' is the tanh form and 'gelu_exact' the erf form.
+    `hidden_states` stays the final norm's output, the encoder's."""
+    head_bias: bool = False
+    """A vocabulary bias added in fp32 after a tied or untied head's product, as
+    Phi's, GPT-J's and ModernBERT's decoders add one (`vocabulary_bias`)."""
     tie_embeddings: bool = True
     # Kimi K2.5's text-only wrapper path, modeling_kimi_k25.py:686-690.
     embedding_zero_ids: tuple[int, ...] = ()
@@ -846,6 +866,7 @@ class CausalTransformer(nn.Module):
         kind = (self.kinds or {}).get(layer_type, LayerKind())
         return ResolvedKind(
             window=kind.window,
+            bidirectional_window=kind.bidirectional_window,
             chunk=kind.chunk,
             num_kv_heads=self.kv_heads if kind.num_kv_heads is None else kind.num_kv_heads,
             rope_theta=self.rope_theta if kind.rope_theta is None else kind.rope_theta,
@@ -925,7 +946,8 @@ class CausalTransformer(nn.Module):
         resolved = {
             "num_kv_heads": kind.num_kv_heads, "head_dim": kind.head_dim,
             "rope_theta": kind.rope_theta, "rope_scaling": kind.rope_scaling, "yarn": kind.yarn,
-            "sliding_window": kind.window, "attention_chunk": kind.chunk,
+            "sliding_window": kind.window, "bidirectional_window": kind.bidirectional_window,
+            "attention_chunk": kind.chunk,
             "k_eq_v": self.attention_k_eq_v and kind.window is None,
             "kv_shared": kv_shared, "kv_store_key": layer_type,
             "partial_rotary_factor": None if kind.window is not None else self.partial_rotary_factor,
@@ -1015,14 +1037,18 @@ class CausalTransformer(nn.Module):
             raise ValueError(f'norm_type must be rms or layer, got {self.norm_type!r}')
         if self.norm_type == 'rms' and self.norm_bias:
             raise ValueError('norm_bias requires LayerNorm')
+        if not self.first_attention_norm and not self.pre_norms:
+            raise ValueError('first_attention_norm=False drops a pre-norm, so it requires pre_norms')
+        if self.head_transform not in (None, 'gelu', 'gelu_exact'):
+            raise ValueError("head_transform must be None, 'gelu' or 'gelu_exact'")
         if self.norm_type == 'layer' and self.scale_offset:
             raise ValueError('scale_offset describes RMSNorm weights')
-        if self.position_embedding not in ('rotary', 'learned'):
-            raise ValueError('position_embedding must be rotary or learned')
-        if self.position_embedding == "learned" and (
+        if self.position_embedding not in ('rotary', 'learned', 'alibi'):
+            raise ValueError('position_embedding must be rotary, learned or alibi')
+        if self.position_embedding != "rotary" and (
             self.mixer is not None or any(kind.mixer is not None for kind in (self.kinds or {}).values())
         ):
-            raise ValueError('learned positions require the default unrotated attention mixer')
+            raise ValueError('learned positions and ALiBi require the default unrotated attention mixer')
         if self.position_embedding_size is not None and (
                 self.position_embedding != 'learned' or self.position_embedding_size < self.max_seq_len):
             raise ValueError('position_embedding_size requires learned positions and covers max_seq_len')
@@ -1060,6 +1086,10 @@ class CausalTransformer(nn.Module):
                 raise ValueError(
                     f"{layer_type!r} chunks a causal layer's keys, and this model "
                     f"is not causal")
+            if kind.bidirectional_window and (self.causal or kind.window is None):
+                raise ValueError(
+                    f"{layer_type!r} keeps a window on both sides of a query, which "
+                    f"needs a window and a model that is not causal")
             if kind.num_kv_heads < 1 or self.num_heads % kind.num_kv_heads:
                 raise ValueError(
                     f"num_heads ({self.num_heads}) must be a multiple of the key/value "
@@ -1261,6 +1291,11 @@ class CausalTransformer(nn.Module):
                             else nn.initializers.normal(self.initializer_range)))
         if self.embedding_dropout_rate:
             self.embedding_dropout = nn.Dropout(self.embedding_dropout_rate, name="embedding_dropout")
+        if self.embedding_norm:
+            self.embedding_layernorm = decoder_norm(
+                self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
+                scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
+                dtype=self.dtype)(name='embedding_layernorm')
         if self.position_embedding == 'learned':
             self.embed_positions = TokenEmbedding(
                 num_embeddings=self.position_embedding_size or self.max_seq_len,
@@ -1287,10 +1322,11 @@ class CausalTransformer(nn.Module):
         # and otherwise rides the model's. Both build over the layer's
         # context.
         mixer_spec = self.mixer if self.mixer is not None else AttentionMixer(
-            nope=self.position_embedding != 'rotary')
+            nope=self.position_embedding != 'rotary', alibi=self.position_embedding == 'alibi')
         specs = self._layer_specs(types, kinds, mixer_spec)
         wiring = BlockWiring(pre_norms=self.pre_norms, output_norms=self.sandwich_norms,
-                             layer_scalar=self.layer_scalar, parallel_residual=self.parallel_residual)
+                             layer_scalar=self.layer_scalar, parallel_residual=self.parallel_residual,
+                             shared_parallel_norm=self.shared_parallel_norm)
 
         block = functools.partial(self._block, specs, mixer_spec, (gated_mlp, routed, parallel), wiring)
 
@@ -1335,6 +1371,17 @@ class CausalTransformer(nn.Module):
                 precision=self.precision,
                 dot_general=head_dot_general(self.dtype, self.precision),
                 name='lm_head', **normal_kernel(self.initializer_range))
+        if self.head_transform is not None:
+            self.head_dense = nn.Dense(
+                self.emb_features, use_bias=False, dtype=self.dtype, precision=self.precision,
+                name='head_dense', **normal_kernel(self.initializer_range))
+            self.head_norm = decoder_norm(
+                self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
+                scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
+                dtype=self.dtype)(name='head_norm')
+        if self.head_bias:
+            self.head_bias_value = self.param(
+                'head_bias', nn.initializers.zeros_init(), (self.vocab_size,), jnp.float32)
 
     @nn.nowrap
     def _layer_specs(self, types: Sequence[str], kinds: dict[str, ResolvedKind], mixer_spec
@@ -1367,7 +1414,8 @@ class CausalTransformer(nn.Module):
                 engram=(None if self.engram is None or index not in self.engram.layer_ids
                         else self.engram.layer_ids.index(index)),
                 prediction_slot=(None if self.dspark is None or index not in self.dspark.target_layers
-                                 else self.dspark.target_layers.index(index)))
+                                 else self.dspark.target_layers.index(index)),
+                attention_norm=index > 0 or self.first_attention_norm)
             for index, layer_type in enumerate(types))
 
     @nn.nowrap
@@ -1404,6 +1452,7 @@ class CausalTransformer(nn.Module):
             engram_index=spec.engram,
             prediction_slot=spec.prediction_slot,
             prediction_site='input' if self.dspark is None else self.dspark.reads,
+            attention_norm=spec.attention_norm,
             emb_features=self.emb_features,
             norm_eps=self.norm_eps,
             norm_type=self.norm_type,
@@ -1589,6 +1638,8 @@ class CausalTransformer(nn.Module):
 
     def _logits(self, x):
         """The shared fp32 head over `x`: what `__call__` and every MTP depth score with."""
+        if self.head_transform is not None:
+            x = self.head_norm(ungated_activation(self.head_transform, self.head_dense(x)))
         # fp32 logits whose product follows the compute dtype
         # (`dew.nn.precision.head_product`, the chunked loss's arithmetic).
         if self.tie_embeddings:
@@ -1597,6 +1648,8 @@ class CausalTransformer(nn.Module):
         else:
             logits = self.lm_head(x)
         logits = logits.astype(at_least_fp32(logits.dtype))
+        if self.head_bias:
+            logits = logits + self.head_bias_value.astype(logits.dtype)
         if self.final_logit_softcap is not None:
             cap = jnp.asarray(self.final_logit_softcap, logits.dtype)
             logits = cap * jnp.tanh(logits / cap)
@@ -1819,6 +1872,8 @@ class CausalTransformer(nn.Module):
                 if start is not None:
                     places = places + start[:, None]
             x = x + self.embed_positions(jnp.maximum(places + self.position_embedding_offset, 0))
+        if self.embedding_norm:
+            x = self.embedding_layernorm(x)
         if self.embedding_dropout_rate:
             x = self.embedding_dropout(x, deterministic=not train)
         # A prediction depth reads these unscaled embeddings, media
@@ -2275,6 +2330,10 @@ class CausalTransformer(nn.Module):
         table, vocab_major = self.head_table(params)
         return table.T if vocab_major else table
 
+    def vocabulary_bias(self, params):
+        """The vocabulary bias, or None for a bias-free head."""
+        return params['head_bias'] if self.head_bias else None
+
     def head_table(self, params):
         """Return the head matrix as the tree stores it, and whether its rows are the vocabulary.
 
@@ -2284,6 +2343,12 @@ class CausalTransformer(nn.Module):
         its backward pass (`chunked_cross_entropy` with `vocab_major`) keeps the
         parameter itself and no transposed copy.
         """
+        if self.head_transform is not None:
+            raise ValueError(
+                "a prediction head sits between the final states and the "
+                "vocabulary, so no matrix alone gives this model's logits, and the "
+                "objectives that score through the chunked head cannot train it yet; "
+                "the model's own call scores it")
         if self.tie_embeddings:
             return params['embed_tokens']['embedding'], True
         return params['lm_head']['kernel'], False

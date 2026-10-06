@@ -44,6 +44,9 @@ class Fixed(nn.Module):
     def head_weight(self, params):
         return params["head"]
 
+    def vocabulary_bias(self, params):
+        return None
+
 
 def objective() -> MaskedDiffusionObjective:
     return MaskedDiffusionObjective(Fixed(), MDLM(mask_id=MASK)(), REFERENCE["tokens"].shape[1])

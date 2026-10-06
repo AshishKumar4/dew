@@ -11,9 +11,7 @@ matmul (docs/research/benchmark-parity.md:5-9,93-102).
 """
 
 import math
-import os
 import re
-import sys
 from dataclasses import dataclass, field
 
 import jax
@@ -497,42 +495,3 @@ def model_flops_utilization(
     if peak is None:
         return None
     return flops_per_step / step_time / peak
-
-
-def dew_cache_dir() -> str:
-    """Dew's cache directory: `$XDG_CACHE_HOME/dew`, else ~/.cache/dew."""
-    return os.path.expanduser(
-        os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join("~", ".cache"), "dew")
-    )
-
-
-def default_compilation_cache_dir() -> str:
-    """Where compiled executables go unless a run names somewhere else.
-
-    The directory JAX is configured with (`jax_compilation_cache_dir`, which
-    JAX_COMPILATION_CACHE_DIR sets) when there is one, so a machine keeps one
-    cache for every entry point. Otherwise Python minors have separate
-    defaults: jax 0.11.2 compresses with Python 3.14's stdlib zstd but names
-    the codec "zlib" in the key, which says "zstandard" only for the
-    zstandard package (`jax._src.compilation_cache.get_cache_key`), so an
-    older interpreter sharing the directory would read those bytes with the
-    wrong codec. Explicit paths passed to enable_compilation_cache remain
-    unchanged.
-    """
-    if jax.config.jax_compilation_cache_dir:
-        return jax.config.jax_compilation_cache_dir
-    return os.path.join(dew_cache_dir(), 'xla', f"python{sys.version_info.major}.{sys.version_info.minor}")
-
-
-def enable_compilation_cache(path: str):
-    """Persist compiled executables so restarts skip XLA compilation.
-
-    The dominant cost of a restart-heavy TPU workflow, where every run otherwise
-    recompiles the same step function from scratch.
-    """
-    os.makedirs(path, exist_ok=True)
-    jax.config.update('jax_compilation_cache_dir', path)
-    # Defaults skip small/fast compilations; a training step is neither, and
-    # caching everything keeps startup predictable.
-    jax.config.update('jax_persistent_cache_min_entry_size_bytes', -1)
-    jax.config.update('jax_persistent_cache_min_compile_time_secs', 0.0)

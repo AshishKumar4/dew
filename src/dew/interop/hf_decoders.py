@@ -54,6 +54,11 @@ from dew.nn.mixers import AttentionMixer, MixerBase
 from dew.nn.moe import GatedActivation, Situ
 from dew.nn.rope import RopeScaling, YarnScaling
 from dew.nn.text_encoders import check_tree
+from dew.nn.vision.gemma3n import translate_gemma3n_projector_config, translate_gemma3n_vision_config
+from dew.nn.vision.gemma4 import translate_gemma4_projector_config, translate_gemma4_vision_config
+from dew.nn.vision.llama4 import translate_llama4_projector_config, translate_llama4_vision_config
+from dew.nn.vision.qwen35 import translate_qwen35_projector_config, translate_qwen35_vision_config
+from dew.nn.vision.siglip import translate_gemma_projector_config, translate_siglip_vision_config
 from dew.objectives.base import Variables
 from dew.registry import from_record, towers
 
@@ -881,11 +886,11 @@ def _record_float(record: Mapping[str, object], field: str, default: float | Non
 def _gemma3_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields:
     """Read a Gemma 3 wrapper: SigLIP tower, avg-pool projector, decoder."""
     text = _wrapper_text(hf_config, used)
-    tower = vision_nn.translate_siglip_vision_config(hf_config)
+    tower = translate_siglip_vision_config(hf_config)
     used.add("vision_config")
     mm = records.integer(hf_config.get("mm_tokens_per_image"), "mm_tokens_per_image")
     used.add("mm_tokens_per_image")
-    projector = vision_nn.translate_gemma_projector_config(
+    projector = translate_gemma_projector_config(
         tower["fields"], records.integer(text.get("emb_features"), "emb_features"), mm)
     image = _wrapper_token_id(hf_config, used, "image_token_index", "image_token_id")
     _wrapper_tokens(used)
@@ -904,9 +909,9 @@ def _gemma3_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
 def _llama4_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields:
     """Read a Llama 4 wrapper: MetaCLIP-style tower, shuffle adapter, outer map."""
     text = _wrapper_text(hf_config, used)
-    tower = vision_nn.translate_llama4_vision_config(hf_config)
+    tower = translate_llama4_vision_config(hf_config)
     used.add("vision_config")
-    projector = vision_nn.translate_llama4_projector_config(
+    projector = translate_llama4_projector_config(
         records.integer(text.get("emb_features"), "emb_features"))
     image = _wrapper_token_id(hf_config, used, "image_token_index", "image_token_id")
     _wrapper_tokens(used)
@@ -947,7 +952,7 @@ def _wrapper_audio(hf_config: Mapping[str, object], used: set, text_width: int) 
     slots = None
     projector: Mapping[str, object]
     if isinstance(encoder, audio_nn.Gemma4Audio):
-        projector = vision_nn.translate_gemma4_projector_config(
+        projector = translate_gemma4_projector_config(
             {"rms_norm_eps": encoder.rms_norm_eps}, text_width)
     else:
         slots = records.integer(hf_config.get("audio_soft_tokens_per_image"), "audio_soft_tokens_per_image")
@@ -966,9 +971,9 @@ def _wrapper_audio(hf_config: Mapping[str, object], used: set, text_width: int) 
 def _gemma4_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields:
     """Read a Gemma 4 wrapper: 2D-table tower, position pooler, embedder, decoder."""
     text = _wrapper_text(hf_config, used, declared_type='gemma4_text')
-    tower = vision_nn.translate_gemma4_vision_config(hf_config)
+    tower = translate_gemma4_vision_config(hf_config)
     used.add("vision_config")
-    projector = vision_nn.translate_gemma4_projector_config(
+    projector = translate_gemma4_projector_config(
         tower["fields"], records.integer(text.get("emb_features"), "emb_features"))
     image = _wrapper_token_id(hf_config, used, "image_token_id", "image_token_index")
     _wrapper_tokens(used)
@@ -995,9 +1000,9 @@ def _qwen35_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
         _refuse('language_model_only', 'the multimodal wrapper requires its vision component')
     used.add('language_model_only')
     text = _wrapper_text(hf_config, used)
-    tower = vision_nn.translate_qwen35_vision_config(hf_config)
+    tower = translate_qwen35_vision_config(hf_config)
     used.add("vision_config")
-    projector = vision_nn.translate_qwen35_projector_config(
+    projector = translate_qwen35_projector_config(
         hf_config, records.integer(text.get("emb_features"), "emb_features"))
     image = _wrapper_token_id(hf_config, used, "image_token_id")
     _wrapper_tokens(used)
@@ -1019,8 +1024,8 @@ def _qwen35_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
 def _gemma3n_wrapper(hf_config: Mapping[str, object], used: set[str]) -> WrapperFields:
     """Read a Gemma 3n wrapper: MobileNet tower, vocabulary embedders and its audio."""
     text = _wrapper_text(hf_config, used)
-    tower = vision_nn.translate_gemma3n_vision_config(hf_config)
-    projector = vision_nn.translate_gemma3n_projector_config(hf_config, _record_int(text, "emb_features"))
+    tower = translate_gemma3n_vision_config(hf_config)
+    projector = translate_gemma3n_projector_config(hf_config, _record_int(text, "emb_features"))
     used.add("vision_config")
     count = _record_int(tower["fields"], "msfa_output_resolution") ** 2
     if hf_config.get("vision_soft_tokens_per_image", count) != count:
@@ -1353,6 +1358,8 @@ _TRUNK: Mapping[str, tuple[str, ...]] = {
     'model.norm.weight': ('norm', 'scale'), 'model.norm.bias': ('norm', 'bias'),
     'model.embed_tokens.weight': ('embed_tokens', 'embedding'),
     'model.embed_positions.weight': ('embed_positions', 'embedding'),
+    'model.embedding_layernorm.weight': ('embedding_layernorm', 'scale'),
+    'model.embedding_layernorm.bias': ('embedding_layernorm', 'bias'),
     'model.embed_tokens_per_layer.weight': ('embed_tokens_per_layer', 'embedding'),
     'model.per_layer_model_projection.weight': ('per_layer_model_projection', 'kernel'),
     'model.per_layer_projection_norm.weight': ('per_layer_projection_norm', 'scale'),
@@ -1412,6 +1419,8 @@ def _param_path(parts: list[str], config: Mapping[str, object]) -> tuple[str, ..
         return ('hc_head', parts[2])
     if parts == ['lm_head', 'weight']:
         return None if config['tie_embeddings'] else ('lm_head', 'kernel')
+    if parts == ['lm_head', 'bias']:
+        return ('head_bias',)
 
     if len(parts) >= 4 and parts[:2] == ['model', 'layers'] and parts[2].isdigit():
         path = _layer_param_path(parts, config)
@@ -1622,7 +1631,7 @@ def translate_weights(
         if path is None or name in copies:
             continue
         stored = np.asarray(tensor)
-        dtype = checkpoint_dtype(stored.dtype, param_dtype if path[0] == "params" else "float32")
+        dtype = checkpoint_dtype(stored.dtype, param_dtype if path[0] == "params" else "float32", path=path)
         # torch Linear holds [out, in]; a stacked expert kernel arrives
         # [E, in, out], which is the layout dew keeps.
         insert(
@@ -1874,7 +1883,7 @@ def _export_config(model) -> Mapping[str, object]:
     # reads the field without passing it on). A checkpoint written under a
     # family that would drop the dial is refused naming it.
     if (model.o_proj_bias is not None and model.o_proj_bias != model.attention_bias
-            and family.export_model_type not in ('qwen2', 'dream')):
+            and family.export_model_type not in ('qwen2', 'dream', 'gpt_neo')):
         raise ValueError(
                 "o_proj_bias differs from attention_bias, which only the qwen2 "
                 "and dream references build, so the model cannot be written as "
@@ -2018,6 +2027,8 @@ def _hf_name(dew_name: str, config: Mapping[str, object]) -> str | None:
         return _TRUNK_NAMES[tuple(parts)]
     if parts == ['lm_head', 'kernel']:
         return None if config['tie_word_embeddings'] else 'lm_head.weight'
+    if parts == ['head_bias']:
+        return 'lm_head.bias'
 
     if parts[0].startswith('layers_'):
         index = parts[0].removeprefix('layers_')
