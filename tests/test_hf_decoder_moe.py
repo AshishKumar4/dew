@@ -51,15 +51,17 @@ def test_minimax_m2_pinned_configs_and_indexes_have_no_prediction_weights(name):
     assert not any('mtp' in key for key in index['weight_map'])
 
 
-@pytest.mark.parametrize('changes, field', (
-    ({'use_qk_norm': False}, 'use_qk_norm'),
-    ({'use_routing_bias': False}, 'use_routing_bias'),
-    ({'router_jitter_noise': 0.1}, 'router_jitter_noise'),
+@pytest.mark.parametrize('changes, reason', (
+    ({'use_qk_norm': False}, 'query and key projections'),
+    ({'qk_norm_type': 'per_head'}, 'whole projections before splitting heads'),
+    ({'use_routing_bias': False}, 'balancing bias'),
+    ({'scoring_func': 'softmax'}, 'selected sigmoid probabilities'),
+    ({'router_jitter_noise': 0.1}, 'training-time input jitter'),
     ({'partial_rotary_factor': 1.0}, 'rotary_dim'),
-    ({'shared_intermediate_size': 4}, 'shared_intermediate_size'),
+    ({'shared_intermediate_size': 4}, 'no shared expert branch'),
 ))
-def test_minimax_m2_refuses_settings_that_change_the_released_block(changes, field):
-    with pytest.raises(ValueError, match=field):
+def test_minimax_m2_refuses_settings_that_change_the_released_block(changes, reason):
+    with pytest.raises(ValueError, match=reason):
         translate_config({**fixture_config('minimax-m2'), **changes})
 
 
