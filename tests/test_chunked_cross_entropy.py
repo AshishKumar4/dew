@@ -294,9 +294,9 @@ def mutating_chunk_terms(monkeypatch, mutate):
     original = chunked._chunk_terms
 
     def mutated(hidden, head_chunk, targets, start, stop, softcap, precision, predict, temperature,
-                excluded):
+                excluded, bias=None):
         terms = original(hidden, head_chunk, targets, start, stop, softcap,
-                         precision, predict, temperature, excluded)
+                         precision, predict, temperature, excluded, bias)
         return mutate(terms, start, stop)
 
     monkeypatch.setattr(chunked, "_chunk_terms", mutated)
