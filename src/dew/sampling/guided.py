@@ -33,10 +33,9 @@ from flax import struct
 from jax.experimental import checkify
 
 from dew.records import JSON
-from dew.sampling.decoding import (
-    FILTER,
+from dew.sampling.decoding import FILTER, StepState
+from dew.sampling.vocabulary import (
     Referencing,
-    StepState,
     Tokenizing,
     Vocabulary,
     matching_mode,

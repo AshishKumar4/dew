@@ -34,7 +34,7 @@ from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.inputs import Media, ModelInputs, mesh_of, request_key
 from dew.objectives.base import Variables, thaw
 from dew.records import integer, record as named_fields, text as named
-from dew.sampling import decoding
+from dew.sampling import decoding, vocabulary
 from dew.sampling.decoding import LogitsTransform, Stopping
 from dew.sampling.strategies import Strategy
 from dew.sampling.text import Bounded, Criteria, Generation, Sampling, Transforms, generate, with_ids_of
@@ -439,7 +439,8 @@ class TextGeneration:
         """Compile stop strings against the processor's vocabulary, sized for the model's head."""
         if not strings:
             return ()
-        if not isinstance(self.processor, (decoding.Referencing, decoding.Tokenizing, decoding.Vocabulary)):
+        if not isinstance(
+                self.processor, (vocabulary.Referencing, vocabulary.Tokenizing, vocabulary.Vocabulary)):
             raise ValueError("stop strings compile against the task's processor, and this task has none "
                              "that lists its vocabulary; pass processor=")
         return (decoding.stop_strings(self.processor, strings,

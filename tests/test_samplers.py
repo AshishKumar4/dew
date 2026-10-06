@@ -1112,7 +1112,7 @@ def test_one_row_walks_each_source_grid_as_it_walks_in_a_batch(config):
 
 
 def source_bridge(depth=None):
-    from dew.sampling.solvers import MAX_BROWNIAN_DEPTH, _Brownian, _brownian_noise
+    from dew.sampling.solvers.brownian import MAX_BROWNIAN_DEPTH, _Brownian, _brownian_noise
 
     bounds = SOURCE_ARRAYS["brownian.bounds"]
     state = _Brownian(jax.random.PRNGKey(4), jnp.asarray(bounds[0], jnp.float32),
@@ -1192,7 +1192,7 @@ def test_the_native_brownian_noise_has_brownian_motions_law():
     covariance (mean zero, known) is chi-square with 171 degrees of freedom;
     306.2 is its one-in-a-billion level (scipy.stats.chi2.isf(1e-9, 171))."""
     from dew.diffusion.schedules.source import SourceSchedule
-    from dew.sampling.solvers import MAX_BROWNIAN_DEPTH, _Brownian, _brownian_noise
+    from dew.sampling.solvers.brownian import MAX_BROWNIAN_DEPTH, _Brownian, _brownian_noise
 
     schedule = SourceSchedule.from_config(json.loads(str(SOURCE_ARRAYS["dpm_sde.default.config"])))
     process, times = schedule.sampling(10)
@@ -1325,3 +1325,30 @@ def test_heun_churns_only_a_variance_exploding_walk():
         Heun(s_churn=1.0).init(jnp.zeros((1, 2)), jnp.linspace(1.0, 0.0, 5),
                                Process(FlowMatchingScheduler(), FlowMatchPredictionTransform()),
                                key=jax.random.PRNGKey(0))
+
+
+def test_public_solver_imports_and_registry_records_resolve_the_same_classes():
+    """Every solver keeps its public name, registry name and JSON configuration round trip."""
+    import dew.sampling
+    from dew.diffusion.discrete import Unmask
+    from dew.registry import solvers, to_record
+    from dew.sampling import FlowSDE, Solver, solvers as exported
+
+    names = {
+        "ddpm": DDPM, "ddim": DDIM, "euler": Euler, "euler_ancestral": EulerAncestral,
+        "heun": Heun, "rk4": RK4, "kdpm2": KDPM2, "dpmsolver_sde": DPMSolverSDE,
+        "multistep_dpm": MultiStepDPM, "dpmsolver_multistep": DPMSolverMultistep,
+        "dpmsolver_singlestep": DPMSolverSinglestep, "deis": DEIS, "unipc": UniPC,
+        "pndm": PNDM, "lms": LMS, "consistency": Consistency, "tcd": TCD,
+        "flow_sde": FlowSDE, "unmask": Unmask,
+    }
+    for name, member in names.items():
+        assert solvers[name] is member
+        assert solvers.name_of(member) == name
+        if name not in ("flow_sde", "unmask"):
+            assert getattr(exported, member.__name__) is member
+            assert getattr(dew.sampling, member.__name__) is member
+        value = solvers.build(name)
+        record = json.loads(json.dumps(to_record(value, Solver)))
+        assert record["name"] == name
+        assert solvers.from_record(record) == value
