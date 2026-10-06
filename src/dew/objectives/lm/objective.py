@@ -562,19 +562,11 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     loss before `router_aux_loss_coef`, which corresponds to
     `router_z_loss = 0.1 * aux_loss_alpha` here. Zero adds nothing.
 
-    `variables` is the tree training starts from, as `model.init`,
-    `Pretrained.load` or `LoRA.apply` return it; None draws a fresh one. A
-    split tree (`dew.objectives.base.freeze`, or an adapter's) is kept as
-    given: the optimizer updates what is in `params`, and the rest stays
-    under `frozen`. `model` may be a loaded source in place of the model
-    (`LMObjective(qwen, seq_len=512)`), which supplies its model, variables
-    and processor; `variables` and `processor` override them.
+    `model` may be a loaded source (`LMObjective(qwen, seq_len=512)`), and
+    `variables` and `processor` override its own (`Objective.bind_model`).
 
     `token_accuracy` reports the argmax accuracy; False skips the pass
     over every logit it costs (0.77 ms of the head's 8.0 on a TPU v6e).
-
-    `processor` is what `pipeline` uses to turn text into ids and decode
-    them, unless it is given another one.
     """
 
     artifact = TokenScores
