@@ -1625,7 +1625,7 @@ def translate_weights(
         if path is None or name in copies:
             continue
         stored = np.asarray(tensor)
-        dtype = checkpoint_dtype(stored.dtype, param_dtype if path[0] == "params" else "float32")
+        dtype = checkpoint_dtype(stored.dtype, param_dtype if path[0] == "params" else "float32", path=path)
         # torch Linear holds [out, in]; a stacked expert kernel arrives
         # [E, in, out], which is the layout dew keeps.
         insert(
