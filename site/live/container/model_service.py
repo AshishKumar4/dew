@@ -163,7 +163,16 @@ class NativeModels:
                 if request["model"] not in self.text_servers:
                     raise ValueError("the live kernel serves only its pinned text models")
                 server = self.text_servers[request["model"]]
-                tickets.append(server.submit(request["prompt"], request["tokens"], key=request["key"]))
+                inputs = server.processor(request["prompt"])
+                if inputs.conditioning or set(inputs.token_fields) - {"positions", "attention_mask"}:
+                    raise ValueError("the live text server does not accept media or custom token layouts")
+                ids = self.np.asarray(inputs.tokens)[0]
+                valid = self.np.asarray(inputs.token_fields.get("attention_mask", self.np.ones_like(inputs.tokens)))
+                positions = inputs.token_fields.get("positions")
+                if not valid.all() or positions is not None and not self.np.array_equal(
+                        self.np.asarray(positions)[0], self.np.arange(len(ids))):
+                    raise ValueError("the live text server requires one unpadded, sequential-position prompt")
+                tickets.append(server.submit(ids, request["tokens"], key=request["key"]))
             except Exception as error:
                 tickets.append(error)
         for server in self.text_servers.values():
