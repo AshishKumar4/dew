@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Callable
-from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -31,15 +30,11 @@ from dew.diffusion.process import Process
 from dew.diffusion.schedules import FlowMatchingScheduler, expand
 from dew.diffusion.transforms import FlowMatchPredictionTransform, broadcast_rates
 from dew.inputs import InputSpec
-from dew.nn.autoencoders import AutoEncoder
 from dew.objectives.base import Aux, Step, Variables
 from dew.registry import objectives, trainings
 from dew.sampling.solvers import Euler
 
 from .objective import DiffusionObjective, Training, _own_loss
-
-if TYPE_CHECKING:
-    from .config import DiffusionRunConfig
 
 Velocity = Callable[[jax.Array, jax.Array, jax.Array], jax.Array]
 """An average velocity u(z, t, r) over [r, t]."""
@@ -149,12 +144,8 @@ class MeanFlowTraining(Training):
         start, stop = (float(edge) for edge in self.guidance_interval)
         object.__setattr__(self, "guidance_interval", (start, stop))
 
-    def objective(self, run: DiffusionRunConfig, model: nn.Module, process: Process, inputs: InputSpec, *,
-                  base: nn.Module, autoencoder: AutoEncoder | None,
-                  variables: Variables | None) -> MeanFlowObjective:
-        return MeanFlowObjective(model, process, inputs, self, autoencoder=autoencoder, variables=variables,
-                                 unconditional_prob=run.unconditional_prob, ema_decay=run.ema_decay,
-                                 solver=run.solver, guidance=None, steps=run.sampling_steps)
+    def objective(self, base: nn.Module, variables: Variables | None, **run) -> DiffusionObjective:
+        return MeanFlowObjective(mean_flow=self, variables=variables, **run)
 
 
 @trainings("shortcut")
@@ -176,12 +167,8 @@ class ShortcutTraining(Training):
         if self.sections < 2 or self.sections & (self.sections - 1):
             raise ValueError(f"sections is a power of two, not {self.sections}")
 
-    def objective(self, run: DiffusionRunConfig, model: nn.Module, process: Process, inputs: InputSpec, *,
-                  base: nn.Module, autoencoder: AutoEncoder | None,
-                  variables: Variables | None) -> ShortcutObjective:
-        return ShortcutObjective(model, process, inputs, self, autoencoder=autoencoder, variables=variables,
-                                 unconditional_prob=run.unconditional_prob, ema_decay=run.ema_decay,
-                                 solver=run.solver, guidance=None, steps=run.sampling_steps)
+    def objective(self, base: nn.Module, variables: Variables | None, **run) -> DiffusionObjective:
+        return ShortcutObjective(shortcut=self, variables=variables, **run)
 
 
 @objectives("mean_flow")

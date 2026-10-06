@@ -205,16 +205,13 @@ class FlowGRPO(Training):
             raise ValueError(f"reward names {self.reward!r}, which no metric is registered "
                              f"under; the registered metrics are {sorted(metrics)}")
 
-    def objective(self, run: DiffusionRunConfig, model: nn.Module, process: Process, inputs: InputSpec, *,
-                  base: nn.Module, autoencoder: AutoEncoder | None,
-                  variables: Variables | None) -> FlowGRPOObjective:
+    def objective(self, base: nn.Module, variables: Variables | None, *, unconditional_prob: float,
+                  ema_decay: float | None, **run) -> FlowGRPOObjective:
         from dew.objectives.rl.flow import FlowGRPOObjective
         from dew.sampling.flow import FlowSDE
 
-        return FlowGRPOObjective(
-            model, process, inputs, sde=FlowSDE(self.noise_level), beta=self.beta, clip_range=self.clip_range,
-            adv_clip_max=self.adv_clip_max, autoencoder=autoencoder, guidance=run.guidance, solver=run.solver,
-            steps=run.sampling_steps, variables=variables)
+        return FlowGRPOObjective(sde=FlowSDE(self.noise_level), beta=self.beta, clip_range=self.clip_range,
+                                 adv_clip_max=self.adv_clip_max, variables=variables, **run)
 
     def rollout(self, objective: DiffusionObjective) -> FlowRollout:
         """Return the trainer's rollout over `objective`, scored by the named metric."""
@@ -473,8 +470,10 @@ class DiffusionRunConfig(RunConfig):
             sample = source.inputs.sample
         inputs = InputSpec(sample=sample, conditions=conditions)
         process = self._process(convention)
-        return self.mode.objective(self, model, process, inputs, base=base, autoencoder=autoencoder,
-                                   variables=variables)
+        return self.mode.objective(base, variables, model=model, process=process, inputs=inputs,
+                                   autoencoder=autoencoder, unconditional_prob=self.unconditional_prob,
+                                   ema_decay=self.ema_decay, solver=self.solver, guidance=self.guidance,
+                                   steps=self.sampling_steps)
 
     def rollout(self, objective: DiffusionObjective):
         """Return the mode's rollout for `objective`, which the trainer runs.

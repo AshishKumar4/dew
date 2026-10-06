@@ -23,7 +23,6 @@ from __future__ import annotations
 import dataclasses
 import math
 from collections.abc import Sequence
-from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -31,28 +30,20 @@ from flax import linen as nn
 
 from dew.diffusion.presets import Flow
 from dew.diffusion.process import Process
-from dew.diffusion.schedules import FlowMatchingScheduler
-from dew.diffusion.transforms import FlowMatchPredictionTransform, broadcast_rates
+from dew.diffusion.transforms import broadcast_rates
 from dew.inputs import InputSpec
-from dew.nn.autoencoders import AutoEncoder
 from dew.nn.dit import TextContext, masked_mean
-from dew.objectives.base import Aux, Batch, Objective, ProgramModule, Step, Variables
+from dew.objectives.base import Aux, Batch, Objective, Step, Variables
 from dew.registry import objectives, trainings
-from dew.sampling.solvers import Consistency
 
 from .objective import (
     DISCRIMINATOR,
     SPECTRAL,
     TEACHER,
     DiffusionObjective,
-    Training,
-    _from_teacher,
-    _own_loss,
-    teacher_variables,
+    Distillation,
+    FlowDistillationObjective,
 )
-
-if TYPE_CHECKING:
-    from .config import DiffusionRunConfig
 
 
 def timestep_embedding(time: jax.Array, features: int) -> jax.Array:
@@ -215,22 +206,17 @@ def r1_penalty(score, features: Sequence[jax.Array], batch: Batch) -> jax.Array:
 
 @trainings("ladd")
 @dataclasses.dataclass(frozen=True)
-class AdversarialDistillation(Training):
+class AdversarialDistillation(Distillation):
     """Adversarial distillation of a saved flow run into a few-step student.
 
     This is LADD with ADD's R1 penalty and distillation term. It trains under the
     `Flow` preset and samples unguided. `AdversarialDistillationObjective` documents
     the fields, and `feature_layers` must name at least one layer.
-
-    `teacher` is the teacher run's directory, which a run loads; a run without one
-    is refused. The teacher's model is this run's `model` without the run's adapter.
-    An objective built in code is given the teacher's model and weights directly.
     """
 
     preset_class = Flow
     guided = False
 
-    teacher: str = ""
     feature_layers: tuple[str, ...] = ()
     student_times: tuple[float, ...] = (1.0, 0.75, 0.5, 0.25)
     renoise_times: tuple[float, float] = (1.0, 1.0)
@@ -249,23 +235,13 @@ class AdversarialDistillation(Training):
         height, width = (int(size) for size in self.kernel_size)
         object.__setattr__(self, "kernel_size", (height, width))
 
-    def check(self, run: DiffusionRunConfig) -> None:
-        super().check(run)
-        if not self.teacher:
-            raise ValueError("adversarial distillation distills a teacher; name its run directory")
-
-    def objective(self, run: DiffusionRunConfig, model: nn.Module, process: Process, inputs: InputSpec, *,
-                  base: nn.Module, autoencoder: AutoEncoder | None,
-                  variables: Variables | None) -> AdversarialDistillationObjective:
-        return AdversarialDistillationObjective(
-            model, process, inputs, self, teacher=base,
-            teacher_variables=teacher_variables(self.teacher, variables), autoencoder=autoencoder,
-            variables=variables, unconditional_prob=run.unconditional_prob, ema_decay=run.ema_decay,
-            solver=run.solver, guidance=None, steps=run.sampling_steps)
+    def objective(self, base: nn.Module, variables: Variables | None, **run) -> DiffusionObjective:
+        return AdversarialDistillationObjective(distillation=self, teacher=base, variables=variables,
+                                                teacher_variables=self.teacher_variables(variables), **run)
 
 
 @objectives("ladd")
-class AdversarialDistillationObjective(DiffusionObjective):
+class AdversarialDistillationObjective(FlowDistillationObjective):
     """Trains LADD, with ADD's R1 penalty and its distillation term.
 
     `teacher` is the teacher's model and `teacher_variables` its variables,
@@ -291,50 +267,25 @@ class AdversarialDistillationObjective(DiffusionObjective):
     student did better without it. Sampling runs `Consistency`.
     """
 
+    network = DISCRIMINATOR
+
     def __init__(self, model: nn.Module, process: Process, inputs: InputSpec,
-                 distillation: AdversarialDistillation, *, teacher: nn.Module, teacher_variables: Variables,
-                 time_features: int = 256, **kwargs):
-        schedule = process.schedule
-        if not (isinstance(schedule, FlowMatchingScheduler) and not process.interval
-                and isinstance(process.prediction, FlowMatchPredictionTransform)):
-            raise ValueError("LADD distills a velocity model on the linear path; build the process with "
-                             "presets.Flow()")
-        _own_loss("LADD", kwargs)
-        kwargs.setdefault("solver", Consistency())
+                 distillation: AdversarialDistillation, *, time_features: int = 256, **kwargs):
         kwargs.setdefault("steps", 2)
         super().__init__(model, process, inputs, **kwargs)
-        self.teacher = teacher
-        self.teacher_variables = teacher_variables
         self.distillation = distillation
         self.time_features = time_features
         self.heads = Heads(len(distillation.feature_layers), distillation.cmap_dim, distillation.kernel_size)
 
-    def program_key(self) -> tuple[ProgramModule, ...]:
-        """The student, then the frozen teacher the discriminator reads."""
-        return (*super().program_key(), ProgramModule(self.teacher, None, trained=False))
-
-    def substitute(self, modules: Sequence[nn.Module]) -> None:
-        self.model, self.teacher = modules
-
-    def held_variables(self) -> Variables:
-        return {**super().held_variables(), TEACHER: self.teacher_variables}
-
-    def complete_variables(self, key: jax.Array, tree: Variables) -> Variables:
-        """Start the student as the tree's teacher and draw the heads, unless it holds them."""
-        state = super().complete_variables(key, tree)
-        if DISCRIMINATOR in state["params"]:
-            return state
-        teacher = state[TEACHER]
-        state = dict(_from_teacher(state, teacher))
+    def network_variables(self, key: jax.Array, state: Variables) -> Variables:
+        """The heads, drawn on the teacher's token grids."""
         given = jax.tree.map(lambda value: value[:1], self.unconditional_conditions)
         x = jnp.zeros((1, *self.latent_shape))
-        features = jax.eval_shape(lambda: self._features(teacher, x, jnp.ones((1,)), given))
+        features = jax.eval_shape(lambda: self._features(state[TEACHER], x, jnp.ones((1,)), given))
         condition = self._condition(jnp.ones((1,)), given)
         heads = self.heads.init(jax.random.fold_in(key, 3), [jnp.zeros(f.shape, f.dtype) for f in features],
                                 condition, update=False, batch={})
-        state["params"] = {**state["params"], DISCRIMINATOR: heads["params"]}
-        state[SPECTRAL] = heads[SPECTRAL]
-        return state
+        return {"params": {DISCRIMINATOR: heads["params"]}, SPECTRAL: heads[SPECTRAL]}
 
     def _condition(self, time: jax.Array, conditions) -> jax.Array:
         """The heads' condition: the noise level's sinusoidal embedding and,
