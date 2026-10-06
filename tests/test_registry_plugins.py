@@ -175,11 +175,11 @@ def test_a_plugin_kind_rebuilds_from_a_record_and_writes_back_its_kind(tmp_path)
     _install(tmp_path, "toyplugin", PLUGIN_MODEL_WITH_KIND)
     (tmp_path / "toyplugin" / "kinds.py").write_text(PLUGIN_KIND)
     done = _run(tmp_path, "from dew.registry import Registry, models\n"
-                          "from dew.config import _to_json\n"
+                          "from dew.registry import to_record\n"
                           "record = {'activation': {'name': 'scaled_tanh', 'fields': {'scale': 2.0}}}\n"
                           "built = models.build('plugin_act', record)\n"
                           "print(type(built.activation).__name__, built.activation.scale)\n"
-                          "print(_to_json(built.activation, type(built).__annotations__['activation']))\n"
+                          "print(to_record(built.activation, type(built).__annotations__['activation']))\n"
                           "print([table.kind for table in Registry.shared()][-1])\n")
     assert done.returncode == 0, done.stderr[-2000:]
     assert done.stdout.splitlines() == ["ScaledTanh 2.0", "{'name': 'scaled_tanh', 'fields': {'scale': 2.0}}",
