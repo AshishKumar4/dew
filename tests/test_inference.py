@@ -479,7 +479,7 @@ def test_pipeline_points_xla_at_the_persistent_compilation_cache(tmp_path, monke
     next load: a serving process compiles a shape once, ever."""
     from pathlib import Path
 
-    from dew.telemetry.instrumentation import default_compilation_cache_dir
+    from dew.cache import default_compilation_cache_dir
 
     make_lm_run(tmp_path)
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))

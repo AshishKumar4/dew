@@ -21,13 +21,13 @@ import numpy as np
 from etils import epath
 from jax.typing import DTypeLike
 
+from dew.cache import default_compilation_cache_dir, enable_compilation_cache
 from dew.checkpoints import RUN_FILE
 from dew.inference.tasks import BlockGeneration, MaskedGeneration, TextGeneration
 from dew.nn.inputs import Media, ModelInputs, pad_token_rows
 from dew.objectives.base import SavedTask, Variables
 from dew.registry import dtype_name
 from dew.sampling.pipelines import TextToImage
-from dew.telemetry.instrumentation import default_compilation_cache_dir, enable_compilation_cache
 
 if TYPE_CHECKING:
     from dew.training.distributed import Layout, MeshSpec

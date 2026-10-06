@@ -23,6 +23,7 @@ from jax._src.distributed import global_state
 from jax.experimental import multihost_utils
 
 from dew.artifacts import broadcast_from_process_zero, end_pool_on_failure
+from dew.cache import enable_compilation_cache
 from dew.pool import (
     PREEMPTED_EXIT,
     PROCESS_COUNT,
@@ -34,7 +35,6 @@ from dew.pool import (
     slurm_tasks_here,
 )
 from dew.telemetry.devices import apply_xla_flags, cuda_plugin, unpartition_gpu_pool, xla_flag
-from dew.telemetry.instrumentation import enable_compilation_cache
 
 _log = logging.getLogger(__name__)
 
