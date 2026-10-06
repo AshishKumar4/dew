@@ -101,3 +101,28 @@ def test_pixel_transport_does_not_reconstruct_floats_from_a_png():
     result = client.ImageResult({"pngs": [], "pixels": base64.b64encode(pixels.tobytes()).decode(),
                                  "shape": list(pixels.shape), "dtype": pixels.dtype.str})
     np.testing.assert_array_equal(result.images, pixels)
+
+
+def test_a_timed_out_handler_does_not_release_ongoing_compute(service, tmp_path, monkeypatch):
+    import os
+    import threading
+
+    finished = threading.Event()
+
+    class Models:
+        def describe(self, request):
+            finished.wait(1)
+            return {"repo": request["repo"], "revision": request["revision"]}
+
+    client = module("model_client")
+    monkeypatch.setattr(service, "REQUEST_SECONDS", 0.05)
+    with service.ModelService(tmp_path / "model.sock", Models(), uids=[os.getuid()]) as server:
+        monkeypatch.setattr(client, "SOCKET", str(server.path))
+        payload = {"op": "describe", "repo": "model", "revision": "pinned"}
+        try:
+            with pytest.raises(ValueError, match="did not finish"):
+                client.request(payload)
+            with pytest.raises(ValueError, match="queue is full"):
+                client.request(payload)
+        finally:
+            finished.set()

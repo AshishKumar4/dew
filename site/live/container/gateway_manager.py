@@ -5,9 +5,9 @@ small private tmpfs scratch mounts. Models and compiled programs belong to the
 separate serving uid and are never loaded into these kernel processes.
 """
 
-import queue
 import json
 import os
+import queue
 import shlex
 import subprocess
 import tempfile
@@ -97,7 +97,8 @@ class LimitedKernelManager(KernelGatewayIOLoopKernelManager):
                    "--", "-c", "exec " + shlex.join(command)]
         env = {
             "PATH": "/opt/venv/bin:/usr/bin:/bin", "HOME": "/work", "TMPDIR": "/tmp",
-            "LANG": "C.UTF-8", "PYTHONPATH": "/opt/live", "IPYTHONDIR": "/work/ipython", "JUPYTER_RUNTIME_DIR": "/work/jupyter",
+            "LANG": "C.UTF-8", "PYTHONPATH": "/opt/live", "IPYTHONDIR": "/work/ipython",
+            "JUPYTER_RUNTIME_DIR": "/work/jupyter",
             "HF_HOME": "/work/hf", "HF_HUB_OFFLINE": "1", "JAX_PLATFORMS": "cpu",
             "JAX_COMPILATION_CACHE_DIR": "/work/xla", "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1",
             "MALLOC_ARENA_MAX": "2",

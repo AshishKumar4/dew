@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 
 MAX_REQUEST = 32_768
+REQUEST_SECONDS = 90
 KERNEL_UIDS = range(6100, 6200)
 
 
@@ -296,7 +297,7 @@ class ModelRequest(socketserver.StreamRequestHandler):
             except queue.Full:
                 token["queued"] = False
                 raise
-            if not completed.wait(90):
+            if not completed.wait(REQUEST_SECONDS):
                 raise TimeoutError("the shared model did not finish within 90 seconds")
         except Exception as error:
             emit({"error": {"name": type(error).__name__, "message": str(error)}}, release=False)
