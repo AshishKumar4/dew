@@ -83,7 +83,10 @@ export class LiveKernel extends DurableObject<Env> {
 		const image = await this.ctx.storage.get<string>('image');
 		const host = (await this.ctx.storage.get<string>('host')) ?? image;
 		const session = await this.ctx.storage.get<string>('session');
-		if (host && session) await this.env.SHARED.get(this.env.SHARED.idFromName(host)).close(session);
-		if (session) await this.env.POOL.get(this.env.POOL.idFromName('global')).release(session);
+		try {
+			if (host && session) await this.env.SHARED.get(this.env.SHARED.idFromName(host)).close(session);
+		} finally {
+			if (session) await this.env.POOL.get(this.env.POOL.idFromName('global')).release(session);
+		}
 	}
 }
