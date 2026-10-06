@@ -24,11 +24,13 @@ from dew.data.dataset import DataPartition, Reader
 from dew.data.text import Tokenizer
 from dew.decision.calibration import Abstention, Binning, Calibration, Scored, Temperatures, softmax
 from dew.decision.data import Example
-from dew.decision.head import KINDS, DecisionHead, kind_of
+from dew.decision.head import Head
 from dew.decision.laya import LayaCheckpoint
 from dew.decision.layout import (
     DecisionInputs,
     Encoded,
+    JointLayout,
+    Laid,
     Layout,
     MarkerLayout,
     Specials,
@@ -37,6 +39,7 @@ from dew.decision.layout import (
 )
 from dew.decision.model import DecisionModel
 from dew.decision.questions import (
+    KINDS,
     Answer,
     Choice,
     ChoiceAnswer,
@@ -60,7 +63,7 @@ if TYPE_CHECKING:
 TASK_FILE = "decide.json"
 """The file `Decide.save` writes into a run: its calibration, budget and name."""
 _LAYOUTS: Mapping[str, type[Layout]] = {
-    layout.__name__: layout for layout in (MarkerLayout, StateFirstLayout)}
+    layout.__name__: layout for layout in (MarkerLayout, StateFirstLayout, JointLayout)}
 
 
 @dataclass(frozen=True)
@@ -168,10 +171,8 @@ class Decide:
         backbone = _saved_model(record, dtype).build()
         if not isinstance(backbone, CausalTransformer):
             raise TypeError(f"the run's backbone is a {type(backbone).__name__}, not a CausalTransformer")
-        head = records.record(record["head"], "head")
-        model = DecisionModel(backbone, DecisionHead(
-            backbone.emb_features, layers=records.integer(head["layers"], "head.layers"),
-            dropout_rate=records.number(head["dropout_rate"], "head.dropout_rate"), dtype=backbone.dtype))
+        model = DecisionModel(backbone, Head.from_record(records.json_value(record["head"], "head"),
+                                                         backbone.emb_features, dtype=backbone.dtype))
         laid = records.record(record["layout"], "layout")
         rows = from_record(_LAYOUTS[records.text(laid["name"], "layout.name")],
                            records.json_value(laid["fields"], "layout.fields"))
@@ -232,50 +233,41 @@ class Decide:
               ) -> list[tuple[dict[str, Answer], Usage]]:
         """Return each request's answers and usage.
 
-        The question rows of every request are scored together within the budget.
+        The rows of every request are scored together within the budget.
         """
-        rows = [(index, name, question, encoded)
-                for index, (state, questions) in enumerate(requests)
-                for name, question, encoded in self._encoded(state, questions)]
-        logits = self.logits([encoded for *_, encoded in rows], [question for _, _, question, _ in rows])
+        rows = [(index, encoded) for index, (state, questions) in enumerate(requests)
+                for encoded in self._encoded(state, questions)]
+        logits = self.logits([encoded for _, encoded in rows])
         answered: list[tuple[dict[str, Answer], Usage]] = []
-        for index in range(len(requests)):
-            own = [(name, question, encoded, scores) for (row, name, question, encoded), scores
-                   in zip(rows, logits, strict=True) if row == index]
-            answers = {name: self._answer(question, scores) for name, question, _, scores in own}
-            usage = Usage(sum(len(encoded.tokens) for _, _, encoded, _ in own),
-                          max((encoded.state_tokens for _, _, encoded, _ in own), default=0),
-                          min((encoded.state_kept for _, _, encoded, _ in own), default=0))
-            answered.append((answers, usage))
+        for index, (_, questions) in enumerate(requests):
+            own = [(encoded, scores) for (row, encoded), scores in zip(rows, logits, strict=True)
+                   if row == index]
+            answers = {laid.name: self._answer(questions[laid.name], _ordered(laid, scores[slot]))
+                       for encoded, scores in own for slot, laid in enumerate(encoded.questions)}
+            usage = Usage(sum(len(encoded.tokens) for encoded, _ in own),
+                          max((encoded.state_tokens for encoded, _ in own), default=0),
+                          min((encoded.state_kept for encoded, _ in own), default=0))
+            answered.append(({name: answers[name] for name in questions}, usage))
         return answered
 
-    def _encoded(self, state: JSON, questions: Mapping[str, Question]) -> list[tuple[str, Question, Encoded]]:
-        tokens = self.layout.state(self.tokenizer, self.specials, state)
-        # A conversation, a list of turns, keeps its newest turns (Laya's agent).
-        match state:
-            case list():
-                conversation = True
-            case _:
-                conversation = False
-        laid = []
-        for name, question in questions.items():
-            encoded = self.layout.encode(self.tokenizer, self.specials, question, tokens,
-                                         conversation=conversation)
-            if len(encoded.markers) != len(question.options):
+    def _encoded(self, state: JSON, questions: Mapping[str, Question]) -> list[Encoded]:
+        rows = self.layout.rows(self.tokenizer, self.specials, state, questions)
+        for laid in (laid for row in rows for laid in row.questions):
+            count = len(questions[laid.name].options)
+            if len(laid.options) != count:
                 raise ValueError(
-                    f"question {name!r}: {len(encoded.markers)} of its {len(question.options)} options fit "
-                    f"in max_len={self.layout.max_len} with head_max_len={self.layout.head_max_len}; "
-                    "raise max_len, lower head_max_len, or ask fewer options (`tournament`)")
-            laid.append((name, question, encoded))
-        return laid
+                    f"question {laid.name!r}: {len(laid.options)} of its {count} options fit in "
+                    f"max_len={self.layout.max_len}; raise max_len, shorten the question, or ask "
+                    "fewer options (`tournament`)")
+        return rows
 
     def _answer(self, question: Question, logits: np.ndarray) -> Answer:
         probabilities = self.calibration.probabilities(question, logits)
         answer = question.answer(probabilities, self.confidence)
         return replace(answer, abstained=self.calibration.abstains(question, probabilities))
 
-    def logits(self, rows: Sequence[Encoded], questions: Sequence[Question]) -> list[np.ndarray]:
-        """Return each row's raw option logits.
+    def logits(self, rows: Sequence[Encoded]) -> list[np.ndarray]:
+        """Return each row's raw `[Q, K]` logits, one row per question laid out in it, in slot order.
 
         The rows are scored shortest first, in passes that fit the budget.
         """
@@ -289,16 +281,19 @@ class Decide:
                         <= self.budget.tokens)):
                 stop += 1
             chosen = order[start:stop]
-            scores = self._pass([rows[index] for index in chosen], [questions[index] for index in chosen])
-            found.update({index: scores[row, :len(rows[index].markers)] for row, index in enumerate(chosen)})
+            scores = self._pass([rows[index] for index in chosen])
+            found.update({index: scores[row, :len(rows[index].questions)]
+                          for row, index in enumerate(chosen)})
             start = stop
         return [found[index] for index in range(len(rows))]
 
-    def _pass(self, rows: Sequence[Encoded], questions: Sequence[Question]) -> np.ndarray:
+    def _pass(self, rows: Sequence[Encoded]) -> np.ndarray:
         """One forward pass at bucketed shapes, its rows placed on the
         weights' mesh (`RowPlan`)."""
-        kinds = [kind_of(question) for question in questions]
-        inputs = DecisionInputs.collate(rows, kinds, self.specials.pad)
+        questions = max(len(row.questions) for row in rows)
+        options = max(len(laid.options) for row in rows for laid in row.questions)
+        inputs = DecisionInputs.collate(rows, self.specials.pad, questions=_bucket(questions, smallest=1),
+                                        options=_bucket(options, smallest=1))
         length = _bucket(inputs.tokens.shape[1])
         inputs = replace(
             inputs, tokens=_widened(inputs.tokens, length, self.specials.pad),
@@ -384,34 +379,37 @@ class Decide:
             probabilities[row, :len(held.logits)] = softmax(
                 held.logits, self.calibration.temperatures.of(held.kind, len(held.logits)))
             options[row, :len(held.logits)] = True
-        decisions = Decisions(probabilities=jnp.asarray(probabilities), options=jnp.asarray(options),
-                              labels=jnp.asarray([held.label for held in scored]),
-                              ordinal=jnp.asarray([held.kind == Score.kind for held in scored]))
+        decisions = Decisions(probabilities=jnp.asarray(probabilities)[:, None],
+                              options=jnp.asarray(options)[:, None],
+                              labels=jnp.asarray([[held.label] for held in scored]),
+                              ordinal=jnp.asarray([[held.kind == Score.kind] for held in scored]),
+                              scored=jnp.ones((len(scored), 1), bool))
         return {metric.name: measured(metric, decisions) for metric in chosen}
 
     def _scored(self, examples: Iterable[Example | Mapping[str, object]]) -> list[Scored]:
         scored = []
         for example in map(Example.of, examples):
             labels = example.labels()
-            rows = self._encoded(example.state, {name: example.questions[name] for name in labels})
-            logits = self.logits([row for *_, row in rows], [question for _, question, _ in rows])
-            scored.extend(Scored(question.kind, scores, labels[name])
-                          for (name, question, _), scores in zip(rows, logits, strict=True))
+            # A joint row reads every question, answered or not; a row per
+            # question needs the answered ones alone.
+            asked = (example.questions if self.layout.joint
+                     else {name: example.questions[name] for name in labels})
+            rows = self._encoded(example.state, asked)
+            for encoded, logits in zip(rows, self.logits(rows), strict=True):
+                scored.extend(Scored(asked[laid.name].kind, _ordered(laid, logits[slot]), labels[laid.name])
+                              for slot, laid in enumerate(encoded.questions) if laid.name in labels)
         return scored
 
     def _scored_reader(self, reader: Reader) -> list[Scored]:
         scored = []
         for batch in reader(DataPartition()):
-            inputs = DecisionInputs(
-                tokens=jnp.asarray(batch["tokens"]), valid=jnp.asarray(batch["valid"]),
-                markers=jnp.asarray(batch["markers"]), options=jnp.asarray(batch["options"]),
-                kinds=jnp.asarray(batch["kinds"]),
-                positions=None if "positions" not in batch else jnp.asarray(batch["positions"]),
-                slots=None if "slots" not in batch else jnp.asarray(batch["slots"]))
+            inputs = laid_out(batch)
             logits = np.asarray(self._forward(self.variables, inputs))
-            for row, kind in enumerate(np.asarray(batch["kinds"])):
-                count = int(np.sum(batch["options"][row]))
-                scored.append(Scored(KINDS[int(kind)].kind, logits[row, :count], int(batch["labels"][row])))
+            answered = np.asarray(batch["scored"])
+            for row, slot in zip(*np.nonzero(answered), strict=True):
+                count = int(np.sum(batch["options"][row, slot]))
+                scored.append(Scored(KINDS[int(batch["kinds"][row, slot])].kind, logits[row, slot, :count],
+                                     int(batch["labels"][row, slot])))
         return scored
 
     def gated(self, min_confidence: float | Mapping[str, float]) -> Self:
@@ -512,6 +510,25 @@ def _opened(raw: bytes, index: int) -> Image.Image:
 def measured[Totals](metric: Metric[Totals], decisions: Decisions) -> float:
     """Return `metric` over one whole pass of `decisions`, reduced as a validation pass reduces it."""
     return metric.finalize(metric(decisions, {}))
+
+
+def _ordered(laid: Laid, logits: np.ndarray) -> np.ndarray:
+    """A question's logits in its own option order, from the slot order its row shows them in."""
+    ordered = np.empty(len(laid.order), np.float32)
+    ordered[list(laid.order)] = logits[:len(laid.order)]
+    return ordered
+
+
+def laid_out(batch: Mapping[str, object]) -> DecisionInputs:
+    """The `DecisionInputs` of a batch the decision dataset laid out (`Encoding`)."""
+    def array(name: str) -> jax.Array:
+        return jnp.asarray(batch[name])
+
+    return DecisionInputs(tokens=array("tokens"), valid=array("valid"), kinds=array("kinds"),
+                          questions=array("questions"), spans=array("spans"),
+                          option_spans=array("option_spans"), options=array("options"),
+                          positions=array("positions") if "positions" in batch else None,
+                          slots=array("slots") if "slots" in batch else None)
 
 
 def _bucket(value: int, smallest: int = 64) -> int:
