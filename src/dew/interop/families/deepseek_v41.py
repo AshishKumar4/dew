@@ -15,7 +15,14 @@ import numpy as np
 
 from dew import records
 from dew.interop.config_records import NativeFields, native_fields
-from dew.interop.families.deepseek import _V4_LAYER_NAMES, _V4_SCORES, _deepseek_v4_prepare
+from dew.interop.families.deepseek import (
+    _DSPARK_LEAVES,
+    _V4_LAYER_NAMES,
+    _V4_SCORES,
+    _deepseek_v4_prepare,
+    _dspark,
+    _dspark_path,
+)
 from dew.interop.hf_decoders import (
     _NO_AUDIO,
     DEFAULT_MAX_SEQ_LEN,
@@ -32,13 +39,15 @@ from dew.interop.hf_decoders import (
     _Ropes,
     _yarn_record,
 )
-from dew.nn import vision as vision_nn
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.deepseek_v4 import DeepseekV4Mixer
-from dew.nn.dspark import DSpark
 from dew.nn.engram import Engram
 from dew.nn.hyper_connections import HyperConnections
+from dew.nn.vision.deepseek_v41 import (
+    translate_deepseek_v41_projector_config,
+    translate_deepseek_v41_vision_config,
+)
 
 # The release's config.json nests the text model's fields under text_config
 # beside a vision tower.
@@ -51,9 +60,6 @@ _V41_TEXT_INERT = frozenset((
 
 
 type EngramFields = NativeFields[Engram]
-
-
-type DSparkFields = NativeFields[DSpark]
 
 
 def _v41_modes(text: Mapping[str, object], layers: int) -> tuple[tuple[int, ...], tuple[str, ...]]:
@@ -117,8 +123,8 @@ def _deepseek_v41_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wr
     text = _v41_decoder(hf_config, used, media_bias=True)
     return {
         'model_type': 'deepseek_v41', 'text_model_type': 'deepseek_v41', 'text': text,
-        'tower': vision_nn.translate_deepseek_v41_vision_config(hf_config),
-        'projector': vision_nn.translate_deepseek_v41_projector_config(
+        'tower': translate_deepseek_v41_vision_config(hf_config),
+        'projector': translate_deepseek_v41_projector_config(
             hf_config, _record_int(text, 'emb_features')),
         'image_token_id': _record_int(hf_config, 'image_token_id'),
         'tokens_per_image': None, **_NO_AUDIO}
@@ -217,7 +223,7 @@ def _v41_decoder(hf_config: Mapping[str, object], used: set[str], *, media_bias:
     engram = _v41_engram(text, seen)
     if engram is not None:
         config['engram'] = engram
-    dspark = _v41_dspark(text, layers, ratios, seen)
+    dspark = _dspark(text, layers, ratios, seen, reads='input')
     if dspark is not None:
         config['dspark'] = dspark
     unknown = sorted(set(text) - seen - {'vocab_size', 'rms_norm_eps', 'tie_word_embeddings'})
@@ -276,31 +282,6 @@ def _v41_kinds(text: Mapping[str, object], layers: int, ratios, modes, mixer: Ma
     return kinds, layer_types, shared
 
 
-def _v41_dspark(text: Mapping[str, object], layers: int, ratios, seen: set[str]) -> DSparkFields | None:
-    """The DSpark drafter record (section 2.4.3, v41:129-136), or None when the
-    config names no stages. Its stages attend a sliding window (v41:1034)."""
-    fields = ('num_nextn_predict_layers', 'dspark_block_size', 'dspark_noise_token_id',
-              'dspark_target_layer_ids', 'dspark_markov_rank', 'dspark_n_routed_experts',
-              'dspark_num_experts_per_tok')
-    seen.update(fields)
-    stages = _record_int(text, 'num_nextn_predict_layers', 0)
-    block = _record_int(text, 'dspark_block_size', 0)
-    if not stages or not block:
-        return None
-    if ratios[layers:layers + stages] != (0,) * stages:
-        _refuse('compress_ratios', "the DSpark stages are sliding layers, one trailing 0 each")
-    return native_fields(DSpark)(stages=stages, block_size=block,
-            noise_token_id=_record_int(text, 'dspark_noise_token_id'),
-            target_layers=records.integers(text.get('dspark_target_layer_ids', ()),
-                                              'dspark_target_layer_ids'),
-            markov_rank=_record_int(text, 'dspark_markov_rank'),
-            experts=_record_int(text, 'dspark_n_routed_experts',
-                                   _record_int(text, 'n_routed_experts')),
-            top_k=_record_int(text, 'dspark_num_experts_per_tok',
-                                 _record_int(text, 'num_experts_per_tok')),
-            layer_type='sliding_attention')
-
-
 def _v41_engram(text: Mapping[str, object], seen: set[str]) -> EngramFields | None:
     """The engram record (section 2.4.2, v41:106-115), or None without layers."""
     fields = ('engram_layer_ids', 'engram_num_embeddings', 'engram_max_ngram_size',
@@ -333,11 +314,10 @@ _DEEPSEEK_V41_NAMES = (
 )
 _V41_TRUNK = {'embed.weight': 'model.embed_tokens.weight', 'norm.weight': 'model.norm.weight',
               'head.weight': 'lm_head.weight'}
-# A DSpark stage's own leaves beside its block, under `mtp.{stage}.`.
-_DSPARK_LEAVES: dict[str, tuple[str, ...]] = {
-    'main_proj.weight': ('main_proj', 'kernel'), 'main_norm.weight': ('main_norm', 'scale'),
-    'norm.weight': ('norm', 'scale'), 'markov_head.embed.weight': ('markov_embed',),
-    'markov_head.head.weight': ('markov_head',), 'confidence_head.proj.weight': ('confidence', 'kernel')}
+# V4.1's Markov tables (v41:1077-1081), beside the leaves both releases name.
+_V41_DSPARK_LEAVES: dict[str, tuple[str, ...]] = {
+    **_DSPARK_LEAVES,
+    'markov_head.embed.weight': ('markov_embed',), 'markov_head.head.weight': ('markov_head',)}
 _ENGRAM_LEAVES: dict[str, tuple[str, ...]] = {
     'embed.weight': ('embed', 'embedding'), 'wkv.weight': ('wkv', 'kernel'),
     'q_weight': ('q_weight',), 'k_weight': ('k_weight',)}
@@ -347,16 +327,7 @@ def _deepseek_v41_path(name: str, config: Mapping[str, object]) -> tuple[str, ..
     """Return the decoder's path for one DeepSeek-V4.1 tensor name, the
     DSpark drafter's `mtp.*` included; the tied head's copy is None."""
     if name.startswith('mtp.'):
-        parts = name.split('.')
-        dspark = config.get('dspark')
-        stages = dspark['stages'] if isinstance(dspark, Mapping) else 0
-        if len(parts) < 3 or not parts[1].isdigit() or int(parts[1]) >= stages:
-            raise ValueError(f"{name} names an undeclared DSpark stage")
-        stage, tail = f'dspark_{parts[1]}', '.'.join(parts[2:])
-        if tail in _DSPARK_LEAVES:
-            return ('params', stage, *_DSPARK_LEAVES[tail])
-        path = _deepseek_v41_path('layers.0.' + tail, config)
-        return None if path is None else (path[0], stage, 'block', *path[2:])
+        return _dspark_path(name, config, _V41_DSPARK_LEAVES, _deepseek_v41_path)
     name = _V41_TRUNK.get(name, name)
     parts = name.split('.')
     if len(parts) >= 4 and parts[0] == 'layers' and parts[1].isdigit() and parts[2] == 'engram':

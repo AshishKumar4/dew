@@ -38,12 +38,20 @@ from dew.diffusion.transforms import FlowMatchPredictionTransform
 from dew.inputs import InputSpec, unit_range
 from dew.nn.attention import forward_mode_attention
 from dew.nn.autoencoders import AutoEncoder
-from dew.objectives.base import Aux, EMASpec, Ratio, Step, Variables
+from dew.objectives.base import Aux, EMASpec, Step, Variables
 from dew.registry import models, objectives, trainings
 from dew.sampling.solvers import Consistency
 
 from .few_step import SMOOTH_TIME_SCALE
-from .objective import FAKE_SCORE, TEACHER, DiffusionObjective, Training, _own_loss, teacher_variables
+from .objective import (
+    FAKE_SCORE,
+    TEACHER,
+    DiffusionObjective,
+    Training,
+    _own_loss,
+    _unadapted,
+    teacher_variables,
+)
 
 if TYPE_CHECKING:
     from .config import DiffusionRunConfig
@@ -318,6 +326,10 @@ class ConsistencyDistillationObjective(DiffusionObjective):
     sCM's loss differentiates the student with respect to time, so the
     student's time embedding must be smooth in time. A run config sets
     `simple_dit(time_scale=0.002)` for this, in place of the default 16.
+
+    The teacher and the fake score run through the student's model, so a
+    LoRA-adapted student, whose model asks every tree for its factors, is
+    refused.
     """
 
     def __init__(
@@ -336,6 +348,7 @@ class ConsistencyDistillationObjective(DiffusionObjective):
             raise ValueError("rCM distills a velocity model on the unshifted linear path; build the "
                              "process with presets.Flow()")
         _own_loss("rCM", kwargs)
+        _unadapted("rCM", model, "teacher and fake score")
         kwargs.setdefault("guidance", None)
         kwargs.setdefault("solver", Consistency())
         kwargs.setdefault("steps", 3)
@@ -511,7 +524,7 @@ class ConsistencyDistillationObjective(DiffusionObjective):
             return critic_loss(generated, fake, t)
 
         losses = jax.lax.cond(student_phase, student_losses, critic_losses, variables)
-        return Ratio(jnp.sum(losses), jnp.asarray(count, jnp.float32)), Aux(metrics={})
+        return self.row_mean(losses, batch), Aux(metrics={})
 
     def _distribution_matching(self, params, student_params, given, blank, draws: _Draws, iteration):
         options = self.distillation

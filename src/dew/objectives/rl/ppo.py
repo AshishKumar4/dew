@@ -104,6 +104,7 @@ class PPOObjective(Objective[Ratio, Variables]):
 
     saved_task = TextGeneration
     _ema_is_reference = True
+    _model_part = "policy"
 
     def __init__(self, model, seq_len: int, *, critic: nn.Module,
                  value_coefficient: float = .5, value_clip: float = .2, **policy_options):

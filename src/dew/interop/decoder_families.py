@@ -79,6 +79,7 @@ from dew.interop.families.masked_diffusion import (
     _mask_token_export,
 )
 from dew.interop.families.nemotron_h import (
+    PACKED as _NEMOTRON_H_PACKED,
     config_from_hf as _nemotron_h_config,
     export_path as _nemotron_h_export_path,
     matches as _nemotron_h_matches,
@@ -125,6 +126,7 @@ ENTRIES = (
         lambda model: {},
         weight_path=_nemotron_h_path,
         export_path=_nemotron_h_export_path,
+        packed=_NEMOTRON_H_PACKED,
         preserve_source_layout=True,
         tied_head_names=("lm_head.weight", "backbone.embeddings.weight"),
     ),

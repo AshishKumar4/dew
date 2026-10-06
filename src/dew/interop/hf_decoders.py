@@ -54,6 +54,11 @@ from dew.nn.mixers import AttentionMixer, MixerBase
 from dew.nn.moe import GatedActivation, Situ
 from dew.nn.rope import RopeScaling, YarnScaling
 from dew.nn.text_encoders import check_tree
+from dew.nn.vision.gemma3n import translate_gemma3n_projector_config, translate_gemma3n_vision_config
+from dew.nn.vision.gemma4 import translate_gemma4_projector_config, translate_gemma4_vision_config
+from dew.nn.vision.llama4 import translate_llama4_projector_config, translate_llama4_vision_config
+from dew.nn.vision.qwen35 import translate_qwen35_projector_config, translate_qwen35_vision_config
+from dew.nn.vision.siglip import translate_gemma_projector_config, translate_siglip_vision_config
 from dew.objectives.base import Variables
 from dew.registry import from_record, towers
 
@@ -227,6 +232,38 @@ def _inert(model_type: object, hf_config: Mapping[str, object]) -> set[str]:
 
 def _refuse(field: str, detail: str) -> NoReturn:
     raise ValueError(f"{field} is not expressible: {detail}")
+
+
+class DrafterRefused(ValueError):
+    """Raised, by design, for a config.json that describes a speculative drafter.
+
+    A drafter reads a target model's hidden states and drafts through the
+    target's embedding and head, which its checkpoint does not carry, so it is
+    no language model on its own. The message names its architecture, the
+    target layers it reads and where its draft arithmetic lives. It is a
+    ValueError, so a caller that catches ValueError catches it too.
+    """
+
+
+def _refuse_drafter(hf_config: Mapping[str, object]) -> None:
+    """Refuse a SpecForge DFlash drafter, DSpark's among them, by the
+    `num_target_layers` it places its target layers by (dflash.py:256-298 in
+    RadixArk/Kimi-K3-DSpark at 3c5bac3). DFlashDraftModel, DFlash2DraftModel,
+    DSparkDraftModel and Qwen3DSparkModel all carry it under model_type qwen3,
+    beside the layers they read in dflash_config or at the top level."""
+    if 'num_target_layers' not in hf_config:
+        return
+    nested = hf_config.get('dflash_config')
+    taps = (nested.get('target_layer_ids') if isinstance(nested, Mapping) else None) or hf_config.get(
+        'target_layer_ids')
+    read = f"after its layers {taps}" if taps else "after the layers dflash.py spaces over them"
+    raise DrafterRefused(
+        f"architectures {hf_config.get('architectures')} is not expressible: it is a speculative "
+        f"drafter that reads a {hf_config['num_target_layers']}-layer target's hidden states {read} "
+        "and drafts through that target's embedding and head, which its checkpoint does not "
+        "carry. The draft arithmetic it is served with lives in SGLang's speculative decoding "
+        "(DSPARK, DFLASH), not in a model Dew builds; Dew drafts with a drafter its target's "
+        "own checkpoint carries (CausalTransformer.draft)")
 
 
 def _refuse_encoder_fields(text: Mapping[str, object]) -> None:
@@ -737,6 +774,7 @@ def _softmax_top_k(hf_config: Mapping[str, object], used: set[str]) -> int:
 def translate_config(hf_config: Mapping[str, object]) -> DecoderFields:
     """Translate one registered family's config, refusing any setting Dew does not compute."""
 
+    _refuse_drafter(hf_config)
     model_type = hf_config.get('model_type')
     # A multimodal repo's config.json is a wrapper whose model_type names the
     # whole model and whose text_config holds the decoder;
@@ -848,11 +886,11 @@ def _record_float(record: Mapping[str, object], field: str, default: float | Non
 def _gemma3_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields:
     """Read a Gemma 3 wrapper: SigLIP tower, avg-pool projector, decoder."""
     text = _wrapper_text(hf_config, used)
-    tower = vision_nn.translate_siglip_vision_config(hf_config)
+    tower = translate_siglip_vision_config(hf_config)
     used.add("vision_config")
     mm = records.integer(hf_config.get("mm_tokens_per_image"), "mm_tokens_per_image")
     used.add("mm_tokens_per_image")
-    projector = vision_nn.translate_gemma_projector_config(
+    projector = translate_gemma_projector_config(
         tower["fields"], records.integer(text.get("emb_features"), "emb_features"), mm)
     image = _wrapper_token_id(hf_config, used, "image_token_index", "image_token_id")
     _wrapper_tokens(used)
@@ -871,9 +909,9 @@ def _gemma3_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
 def _llama4_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields:
     """Read a Llama 4 wrapper: MetaCLIP-style tower, shuffle adapter, outer map."""
     text = _wrapper_text(hf_config, used)
-    tower = vision_nn.translate_llama4_vision_config(hf_config)
+    tower = translate_llama4_vision_config(hf_config)
     used.add("vision_config")
-    projector = vision_nn.translate_llama4_projector_config(
+    projector = translate_llama4_projector_config(
         records.integer(text.get("emb_features"), "emb_features"))
     image = _wrapper_token_id(hf_config, used, "image_token_index", "image_token_id")
     _wrapper_tokens(used)
@@ -914,7 +952,7 @@ def _wrapper_audio(hf_config: Mapping[str, object], used: set, text_width: int) 
     slots = None
     projector: Mapping[str, object]
     if isinstance(encoder, audio_nn.Gemma4Audio):
-        projector = vision_nn.translate_gemma4_projector_config(
+        projector = translate_gemma4_projector_config(
             {"rms_norm_eps": encoder.rms_norm_eps}, text_width)
     else:
         slots = records.integer(hf_config.get("audio_soft_tokens_per_image"), "audio_soft_tokens_per_image")
@@ -933,9 +971,9 @@ def _wrapper_audio(hf_config: Mapping[str, object], used: set, text_width: int) 
 def _gemma4_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields:
     """Read a Gemma 4 wrapper: 2D-table tower, position pooler, embedder, decoder."""
     text = _wrapper_text(hf_config, used, declared_type='gemma4_text')
-    tower = vision_nn.translate_gemma4_vision_config(hf_config)
+    tower = translate_gemma4_vision_config(hf_config)
     used.add("vision_config")
-    projector = vision_nn.translate_gemma4_projector_config(
+    projector = translate_gemma4_projector_config(
         tower["fields"], records.integer(text.get("emb_features"), "emb_features"))
     image = _wrapper_token_id(hf_config, used, "image_token_id", "image_token_index")
     _wrapper_tokens(used)
@@ -962,9 +1000,9 @@ def _qwen35_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
         _refuse('language_model_only', 'the multimodal wrapper requires its vision component')
     used.add('language_model_only')
     text = _wrapper_text(hf_config, used)
-    tower = vision_nn.translate_qwen35_vision_config(hf_config)
+    tower = translate_qwen35_vision_config(hf_config)
     used.add("vision_config")
-    projector = vision_nn.translate_qwen35_projector_config(
+    projector = translate_qwen35_projector_config(
         hf_config, records.integer(text.get("emb_features"), "emb_features"))
     image = _wrapper_token_id(hf_config, used, "image_token_id")
     _wrapper_tokens(used)
@@ -986,8 +1024,8 @@ def _qwen35_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
 def _gemma3n_wrapper(hf_config: Mapping[str, object], used: set[str]) -> WrapperFields:
     """Read a Gemma 3n wrapper: MobileNet tower, vocabulary embedders and its audio."""
     text = _wrapper_text(hf_config, used)
-    tower = vision_nn.translate_gemma3n_vision_config(hf_config)
-    projector = vision_nn.translate_gemma3n_projector_config(hf_config, _record_int(text, "emb_features"))
+    tower = translate_gemma3n_vision_config(hf_config)
+    projector = translate_gemma3n_projector_config(hf_config, _record_int(text, "emb_features"))
     used.add("vision_config")
     count = _record_int(tower["fields"], "msfa_output_resolution") ** 2
     if hf_config.get("vision_soft_tokens_per_image", count) != count:
@@ -1508,10 +1546,9 @@ def _stack_experts(params: LazyTree) -> None:
         nested = block.get('block') if isinstance(block, dict) else None
         if depth.startswith(('mtp_', 'dspark_')) and isinstance(nested, dict):
             blocks.append((depth, nested))
-    for layer, block in blocks:
-        mlp = block.get('mlp')
-        if not isinstance(mlp, dict):
-            continue
+    slots = [(f'{layer}.{name}', slot) for layer, block in blocks for name, slot in block.items()
+             if name in ('mlp', 'self_attn') and isinstance(slot, dict)]
+    for layer, mlp in slots:
         experts = mlp.get('experts')
         if not isinstance(experts, dict):
             continue

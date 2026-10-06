@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import enum
 import functools
+import math
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -259,6 +260,18 @@ leaves stay in this collection as part of the state, and `thaw` merges the
 two before the model reads them."""
 
 
+VALID_ROWS = "valid_rows"
+"""The field every evaluation batch holds: one bool per row, True for a real record and False for a repeat.
+
+A split's last batch is padded to full size with repeats of its own rows, and
+a process whose share runs out before the others' scores a copy of its last
+batch in which every row is a repeat. That way a pass is whole batches on
+every process and counts each record once. A loss weights its rows by this
+field, and its batch-wide terms are taken over the real rows only. Training
+batches never have it.
+"""
+
+
 def freeze(variables: Variables, trainable: PathFilter) -> Variables:
     """Move the `params` leaves that `trainable` rejects into the `FROZEN` collection.
 
@@ -357,6 +370,10 @@ class Objective(ABC, Generic[Loss, Effects]):
     A subclass inherits its parent's. None means a saved run of this
     objective loads as no task."""
     _ema_is_reference: ClassVar[bool] = False
+    # The name an objective that trains other networks beside its model nests
+    # the model under in every collection, as PPO nests its policy beside the
+    # critic; None when the saved tree is the model's.
+    _model_part: ClassVar[str | None] = None
     artifact: type | None = None
     """The artifact type `evaluate` returns, or None when it returns nothing."""
     shown: Mapping[str, Shown] = {}
@@ -486,6 +503,31 @@ class Objective(ABC, Generic[Loss, Effects]):
         `reduce_loss` runs on the sum.
         """
 
+    @staticmethod
+    def row_mean(values: jax.Array, batch: Batch, axis: int | tuple[int, ...] | None = None, *,
+                 rows: int | tuple[int, ...] = 0) -> Ratio:
+        """Return the mean of `values` over `axis`, as the `Ratio` of their sum and count.
+
+        `rows` is the axis of `values`, or the consecutive axes, that index `batch`'s
+        rows. The sum runs over `axis` (every axis by default), and the count is the
+        number of entries summed. When the batch is an evaluation batch with
+        `VALID_ROWS`, a repeat row has zero weight in both, so a loss and every
+        batch-wide term computed through this count each real record once. Without
+        `VALID_ROWS`, as in training, this is `jnp.sum` and the size.
+        """
+        dtype = jnp.promote_types(values.dtype, jnp.float32)
+        axes = (tuple(range(values.ndim)) if axis is None
+                else (axis,) if isinstance(axis, int) else tuple(axis))
+        valid = batch.get(VALID_ROWS)
+        if valid is None:
+            return Ratio(jnp.sum(values, axes), jnp.asarray(math.prod(values.shape[a] for a in axes), dtype))
+        held = (rows,) if isinstance(rows, int) else rows
+        shape = [values.shape[a] if a in held else 1 for a in range(values.ndim)]
+        real = jnp.asarray(valid, bool).reshape(shape)
+        # Selected rather than multiplied, so a repeat holding a NaN still adds nothing.
+        return Ratio(jnp.sum(jnp.where(real, values, jnp.zeros((), values.dtype)), axes),
+                     jnp.sum(jnp.broadcast_to(real, values.shape).astype(dtype), axes))
+
     def _loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Loss, Aux[Effects]]:
         loss = self.loss(variables, batch, step)
         if _has_aux(loss):
@@ -563,6 +605,26 @@ class Objective(ABC, Generic[Loss, Effects]):
             return state.variables
         return state.averaged
 
+    @classmethod
+    def _saved_variables(cls, directory: str, *, step: int | str | None, ema: bool | None,
+                         mesh: MeshSpec | None = None, layout: Layout | None = None,
+                         param_dtype: DTypeLike | None = None,
+                         parameter_roots: tuple[tuple[str, ...], ...] = (("params",), (FROZEN,))
+                         ) -> Variables:
+        """Return the model's variables from a run of this objective, as every run loader reads them.
+
+        The arguments are `Checkpoints.variables`'. An objective whose average
+        is its frozen reference gives the trained weights whatever `ema` asks,
+        and one that nests the model beside other networks gives the model's
+        own part, its trained and frozen collections together.
+        """
+        from dew.checkpoints import Checkpoints
+
+        variables = Checkpoints(directory).variables(
+            step=step, ema=False if cls._ema_is_reference else ema, mesh=mesh, layout=layout,
+            param_dtype=param_dtype, parameter_roots=parameter_roots)
+        return variables if cls._model_part is None else part(variables, cls._model_part)
+
     def inference_record(self) -> JSON:
         """Return the registered model and task settings that let a saved step be rebuilt.
 
@@ -573,15 +635,14 @@ class Objective(ABC, Generic[Loss, Effects]):
     def pipeline(self, state: TrainState, *, ema: bool | None = None) -> Task | SavedTask:
         """Return the trained model as its inference task, over `state`'s weights.
 
-        With `ema` None, the task uses `state.averaged` when the objective
-        keeps an average and the live parameters otherwise, which is how
-        `dew.pipeline` reads a run. True requires the average, and False
-        selects the live parameters. An objective with a reference policy
-        returns the trained policy, never the frozen reference its loss
-        compares against. The arrays keep their placement. Objectives
-        without a generation task raise `TypeError`. A plugin objective
-        returns its own `saved_task` class, which is why the type is open to
-        `SavedTask` beside dew's tasks.
+        With `ema` None, the task uses `state.averaged` when the objective keeps an
+        average and the live parameters otherwise, which is how `dew.pipeline` reads a
+        run. True requires the average, and False selects the live parameters. An
+        objective with a reference policy returns the trained policy, never the frozen
+        reference its loss compares against. The arrays keep their placement.
+        Objectives without a generation task raise `TypeError`. A plugin objective
+        returns its own `saved_task` class, so the return type also allows a
+        `SavedTask` besides Dew's own tasks.
         """
         raise TypeError(f"{type(self).__name__} has no inference task")
 
@@ -693,6 +754,7 @@ OMITTED = Omitted.OMITTED
 
 __all__ = [
     "FROZEN",
+    "VALID_ROWS",
     "Aux",
     "Batch",
     "EMASpec",
