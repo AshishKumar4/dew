@@ -42,9 +42,9 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
-import optax
 import tyro
 
+from dew.config import OptimConfig
 from dew.data import HFTokenizer
 from dew.data.dataset import Dataset
 from dew.inference import NativeRolloutServer, Publication, SafetensorsReload, Server, TextGeneration
@@ -135,7 +135,7 @@ def main(config: Config) -> dict:
     data = Dataset(train=lambda partition: iter(
                        lambda: {"task_id": draw.integers(0, len(tasks), config.prompts, np.int32)}, None),
                    val=None, records=len(tasks), batch=config.prompts)
-    trainer = Trainer(objective, optax.adamw(config.learning_rate, b2=0.99, weight_decay=0.0),
+    trainer = Trainer(objective, OptimConfig(learning_rate=config.learning_rate, b2=0.99, weight_decay=0.0),
                       key=jax.random.key(config.seed), rollout=rollout)
     try:
         with trials:

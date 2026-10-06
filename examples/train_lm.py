@@ -11,9 +11,9 @@ from pathlib import Path
 
 import jax
 import jax.numpy as jnp
-import optax
 import tyro
 
+from dew.config import OptimConfig
 from dew.data import ByteTokenizer, Loading, TokenCorpus, TokenWindows
 from dew.inference import RunProcessor
 from dew.nn.backbones import CausalTransformer
@@ -60,7 +60,7 @@ def main(config: Config):
         ),
     )
 
-    trainer = Trainer(objective, optax.adamw(config.learning_rate), key=jax.random.key(0),
+    trainer = Trainer(objective, OptimConfig(learning_rate=config.learning_rate), key=jax.random.key(0),
                       checkpoints=Checkpoints(str(config.out / "checkpoints")))
     state = trainer.fit(data, steps=steps, log_every=50)
 

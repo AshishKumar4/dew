@@ -19,9 +19,9 @@ import itertools
 
 import jax
 import numpy as np
-import optax
 
 from dew import Dataset, Trainer
+from dew.config import OptimConfig
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective
 from dew.training import MeshSpec
@@ -31,7 +31,7 @@ model = CausalTransformer(vocab_size=512, emb_features=256, num_layers=2,
 rows = np.random.default_rng(0).integers(0, 512, (16, 65), dtype=np.int32)
 data = Dataset(train=lambda partition: itertools.repeat({"text": rows}), val=None,
                records=16, batch=16)
-trainer = Trainer(LMObjective(model, seq_len=64), optax.adamw(1e-3), key=jax.random.key(0),
+trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(learning_rate=1e-3), key=jax.random.key(0),
                   mesh=MeshSpec(fsdp=2, tensor=2))
 state = trainer.fit(data, steps=4, log_every=2)
 

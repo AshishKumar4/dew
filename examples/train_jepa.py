@@ -9,9 +9,9 @@ from pathlib import Path
 
 import jax
 import jax.numpy as jnp
-import optax
 import tyro
 
+from dew.config import OptimConfig
 from dew.data import TFDSImages
 from dew.inputs import Field
 from dew.interop import save_params
@@ -45,6 +45,7 @@ class Config:
 def main(config: Config, data=None):
     data = data or TFDSImages(
         path=None if config.data_path is None else str(config.data_path.expanduser()),
+        name="oxford_flowers102",
         image_size=config.image_size,
     ).load(batch=config.batch_size)
     steps = config.steps or data.epoch_steps(config.epochs)
@@ -59,7 +60,7 @@ def main(config: Config, data=None):
                               sample=Field("image", (config.image_size, config.image_size, 3)),
                               momentum_steps=steps)
 
-    trainer = Trainer(objective, optax.adamw(config.learning_rate), key=jax.random.key(0),
+    trainer = Trainer(objective, OptimConfig(learning_rate=config.learning_rate), key=jax.random.key(0),
                       checkpoints=Checkpoints(str(config.out / "checkpoints")))
     state = trainer.fit(data, steps=steps, log_every=50, eval_every=steps,
                         metrics=(LinearProbe(config.classes), KnnProbe(config.classes)))

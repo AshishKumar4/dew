@@ -18,9 +18,9 @@ This trains a small decoder on one repeated sentence and generates from it. It d
 ```python
 import jax
 import numpy as np
-import optax
 
 from dew import Dataset, Trainer
+from dew.config import OptimConfig
 from dew.data import ByteTokenizer
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective
@@ -36,7 +36,7 @@ model = CausalTransformer(
     emb_features=64, num_layers=2, num_heads=4,
     mlp_features=256, max_seq_len=128)
 objective = LMObjective(model, seq_len=64)
-trainer = Trainer(objective, optax.adamw(3e-3),
+trainer = Trainer(objective, OptimConfig(learning_rate=3e-3),
                   key=jax.random.key(0))
 state = trainer.fit(data, steps=100, log_every=25)
 
@@ -116,7 +116,7 @@ The built-in readers, such as `TokenWindows` for tokenized text and `HFImages` f
 
 ## Trainer
 
-`Trainer(objective, optimizer, key=...)` takes an Optax optimizer and a JAX random key. `fit(dataset, steps=...)` places the variables on the devices, compiles one training step and runs it until the step counter reaches `steps`. Between steps it logs every `log_every` steps, evaluates every `eval_every` steps, and writes a checkpoint every `checkpoint_every` steps when the trainer was given `checkpoints=Checkpoints(directory)`.
+`Trainer(objective, optimizer, key=...)` takes an `OptimConfig` or an Optax optimizer, and a JAX random key or integer seed. `fit(dataset, steps=...)` builds a configured optimizer over the run's length, places the variables on the devices, compiles one training step and runs it until the step counter reaches `steps`. Between steps it logs every `log_every` steps, evaluates every `eval_every` steps, and writes a checkpoint every `checkpoint_every` steps when the trainer was given `checkpoints=Checkpoints(directory)`.
 
 ![Trainer.fit: the state is placed on the mesh, the dataset's iterator feeds a prefetcher, and each compiled step runs the loss, the gradient, the optimizer update and the EMA update; logging, evaluation and checkpoints run on the host between steps.](assets/training-loop-light.svg)
 ![Trainer.fit: the state is placed on the mesh, the dataset's iterator feeds a prefetcher, and each compiled step runs the loss, the gradient, the optimizer update and the EMA update; logging, evaluation and checkpoints run on the host between steps.](assets/training-loop-dark.svg)

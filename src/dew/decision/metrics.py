@@ -17,16 +17,6 @@ from dew.objectives.base import Batch, Objective, Shown, mean_of_totals, merge_t
 from dew.registry import metrics
 
 
-def decisions_of(artifact: Artifact) -> Decisions:
-    """Return `artifact` as the `Decisions` every decision metric reads.
-
-    Any other artifact raises a TypeError naming its type.
-    """
-    if not isinstance(artifact, Decisions):
-        raise TypeError(f"a decision metric reads Decisions, not {type(artifact).__name__}")
-    return artifact
-
-
 @dataclass(frozen=True)
 class Answered:
     """The questions of a `Decisions` with a known answer, one row each: their
@@ -40,7 +30,9 @@ class Answered:
 
     @classmethod
     def of(cls, artifact: Artifact) -> "Answered":
-        decisions = decisions_of(artifact)
+        if not isinstance(artifact, Decisions):
+            raise TypeError(f"a decision metric reads Decisions, not {type(artifact).__name__}")
+        decisions = artifact
         scored = np.asarray(decisions.scored, bool)
         return cls(np.asarray(decisions.probabilities, np.float64)[scored],
                    np.asarray(decisions.options, bool)[scored], np.asarray(decisions.labels)[scored],
