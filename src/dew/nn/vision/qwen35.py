@@ -18,7 +18,7 @@ from dew.interop.weights import checkpoint_array, translate_parameters
 from dew.nn.activations import gelu_exact
 from dew.nn.attention import LayerNorm, scaled_dot_product_attention
 from dew.nn.precision import at_least_fp32
-from dew.nn.text_encoders import MLP, MLP_ACTIVATIONS
+from dew.nn.text_encoders import MLP
 from dew.objectives.base import Variables
 from dew.registry import Record, projectors, towers
 
@@ -361,7 +361,7 @@ def translate_qwen35_vision_config(hf_config: Mapping[str, object]) -> Record:
             f"num_position_embeddings ({table}) is not a square, this trunk "
             "resamples a square table")
     activation = str(vision.get("hidden_act", "gelu_pytorch_tanh"))
-    if activation not in MLP_ACTIVATIONS:
+    if activation not in ("quick_gelu", "gelu_pytorch_tanh", "gelu"):
         raise ValueError(
             f"hidden_act {activation!r} is not expressible: this trunk runs the "
             "shared MLP's activations")

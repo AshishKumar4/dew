@@ -8,7 +8,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.decision.questions import Choice, Noul, Question, Score
-from dew.nn.activations import gelu_exact
+from dew.nn.activations import gelu_exact_torch
 from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock, GatedMLP, decoder_norm
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.mixer_base import MixerContext
@@ -83,5 +83,5 @@ class DecisionHead(nn.Module):
             if not isinstance(x, jax.Array):
                 raise TypeError("the head's blocks carry one plain residual stream")
         marked = jnp.take_along_axis(x, markers[..., None], axis=1)
-        hidden = gelu_exact(self.scorer_hidden(self.scorer_norm(marked)))
+        hidden = gelu_exact_torch(self.scorer_hidden(self.scorer_norm(marked)))
         return self.scorer_out(hidden)[..., 0].astype(jnp.float32)

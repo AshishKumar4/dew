@@ -117,8 +117,6 @@ def _inputs(features, mask, width: int) -> tuple[jax.Array, jax.Array]:
 
 
 def _activation(x, name: str = "silu"):
-    # Torch evaluates these elementwise activations in its fp32 opmath dtype,
-    # as `dew.nn.activations` does.
     if name not in ("silu", "gelu", "gelu_pytorch_tanh", "relu"):
         raise ValueError(f"audio hidden_act {name!r} has no implementation")
     return activation(name)(x)

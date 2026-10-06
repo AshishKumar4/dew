@@ -103,17 +103,13 @@ class CLIPAttention(nn.Module):
         return self.out_proj(attended.reshape(batch, length, self.hidden_size))
 
 
-MLP_ACTIVATIONS = ("quick_gelu", "gelu_pytorch_tanh", "gelu")
-"""The `hidden_act` names `MLP` runs."""
-
-
 @logical_axes({("fc1",): ("embed", "mlp"), ("fc2",): ("mlp", "embed")})
 class MLP(nn.Module):
     """Two biased maps with an activation between: the feed-forward of a CLIP,
     SigLIP or Llama 4 vision layer, which differ only in the activation.
-    `activation` is the reference's `hidden_act`, one of `MLP_ACTIVATIONS`:
-    'quick_gelu' (CLIP), 'gelu_pytorch_tanh' (SigLIP) or 'gelu' (Llama 4's
-    erf form), computed as `dew.nn.activations.activation` computes it."""
+    `activation` is the reference's `hidden_act`: 'quick_gelu' (CLIP),
+    'gelu_pytorch_tanh' (SigLIP) or 'gelu' (Llama 4's exact form), computed
+    as `dew.nn.activations.activation` computes it."""
     hidden_size: int
     intermediate_size: int
     activation: str = "quick_gelu"
@@ -127,7 +123,7 @@ class MLP(nn.Module):
         self.fc2 = dense(self.hidden_size, name="fc2")
 
     def __call__(self, hidden_states):
-        if self.activation not in MLP_ACTIVATIONS:
+        if self.activation not in ("quick_gelu", "gelu_pytorch_tanh", "gelu"):
             raise ValueError(
                 f"activation {self.activation!r} is not expressible: this MLP "
                 "runs quick_gelu, gelu_pytorch_tanh or gelu")
