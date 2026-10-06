@@ -226,16 +226,17 @@ def fp8_input_qdq(x: jax.Array, spec: FP8Input) -> jax.Array:
 
     qarray = _qwix("qwix._src.core.qarray")
     values = jax.lax.stop_gradient(x).astype(jnp.float32)
-    amax = jnp.full(values.shape, spec.scale, jnp.float32) * jnp.float32(448)
+    amax = jnp.float32(spec.scale) * jnp.float32(448)
     safe = jnp.where(amax <= jnp.float32(2 ** -24), 1, amax)
     # torch's scalar/tensor reverse divide is reciprocal then multiply.
-    multiplier = _nvfp4_divide(jnp.ones_like(values), safe) * jnp.float32(448)
-    scale = _nvfp4_divide(jnp.ones_like(values), multiplier)
+    multiplier = _nvfp4_divide(jnp.float32(1), safe) * jnp.float32(448)
+    scale = _nvfp4_divide(jnp.float32(1), multiplier)
     # The composed GPU forward must round this product before the FP8 cast.
     quotients = jax.lax.optimization_barrier(values * multiplier)
+    broadcast_shape = (1,) * values.ndim
     quantized = qarray.quantize_with_scale_zero_point(
-        quotients, jnp.float8_e4m3fn, jnp.ones_like(scale), None)
-    quantized = quantized.replace(scale=scale)
+        quotients, jnp.float8_e4m3fn, jnp.ones(broadcast_shape, jnp.float32), None)
+    quantized = quantized.replace(scale=scale.reshape(broadcast_shape))
     rounded = qarray.dequantize(quantized)
     return straight_through(x, rounded)
 
