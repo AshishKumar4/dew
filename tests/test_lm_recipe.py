@@ -682,7 +682,8 @@ def test_official_block_diffusion_is_a_complete_pretrained_recipe(tmp_path):
         "--ema-decay", "None", "--sample-tokens", "0", "--optim.learning-rate", "0.001"])
     state = recipe.main(config)
     assert int(state.updates) == 1
-    original = Pretrained.load(checkpoint, dtype="float32", attention_impl="xla")
+    original = Pretrained.load(checkpoint, dtype="float32", attention_impl="xla",
+                               max_seq_len=recipe.context_length(config, None))
     initial = recipe.build_block_objective(config, original.model, original.variables).init(jax.random.key(0))
     difference = max(float(jnp.max(jnp.abs(a - b)))
                      for a, b in zip(jax.tree.leaves(state.variables), jax.tree.leaves(initial), strict=True))

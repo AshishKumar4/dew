@@ -55,9 +55,9 @@ from dew.training.optim import (
     OPTIMIZER_MAP,
     ParamGroup,
     ScheduleBase,
-    learning_rate_schedule,
     param_labels,
     power_profiles,
+    weight_decay_mask,
 )
 from dew.training.quantization import Quantization, _quantize, _Quantized
 from dew.training.selection import Best
@@ -241,12 +241,14 @@ class OptimConfig:
     weight_decay: float | None = None
     """The weight decay passed to the optimizer; for 'adam' it is torch's coupled L2
     penalty, added to the gradient before the moments read it, for 'adamw' the
-    decoupled decay."""
+    decoupled decay. It spares biases and vectors such as a norm's scale, timm's split for every
+    optimizer (`dew.training.optim.weight_decay_mask`); Muon decays them as Moonlight does, and
+    `param_groups` replace the split."""
     param_groups: Annotated[tuple[ParamGroup, ...], record_argument(tuple[ParamGroup, ...])] = ()
     """Per-group learning rates, momentum schedules, weight decay and bounds; the first
     matching group wins.
 
-    Empty treats every parameter alike. `ParamGroup.mup` is lm-engine's muP split.
+    Empty runs one optimizer over every parameter. `ParamGroup.mup` is lm-engine's muP split.
     """
     clip_grads: float = 0.0
     state_dtype: Literal["float32", "bfloat16"] = "float32"
@@ -274,21 +276,18 @@ class OptimConfig:
     def build(self, steps: int) -> optax.GradientTransformation:
         """Build the optimizer this config describes, with its schedule, parameter groups and clipping.
 
-        `steps` is the run's length, which the schedule decays over unless the config
-        names its own end. With `param_groups`, one optimizer runs per group under
+        `steps` is the run's length in updates, which the schedule decays over unless the
+        config names its own end. With `param_groups`, one optimizer runs per group under
         `optax.multi_transform`, each on its own schedule (the config's when it names
         none) times its multiplier, with its own weight decay, `b1` schedule and bounds
         (`ParamGroup.solver`); the global-norm clip still reads every gradient
         together, before the groups split them.
         """
-        learning_rate = learning_rate_schedule(self, steps)
+        learning_rate = self.learning_rate if self.schedule is None else self.schedule.schedule(steps)
         opts = dict(self.optimizer_opts)
         if self.weight_decay is not None:
             opts['weight_decay'] = self.weight_decay
-            if self.optimizer in ('muon', 'muonclip'):
-                # Muon's weight_decay does not cover the AdamW group's norm scales.
-                opts.setdefault('adam_weight_decay', self.weight_decay)
-        make = OPTIMIZER_MAP[self.optimizer]
+        make: Callable[..., optax.GradientTransformation] = OPTIMIZER_MAP[self.optimizer]
         if self.state_dtype == 'bfloat16':
             if self.optimizer not in BF16_STATE_OPTIMIZERS:
                 raise ValueError(
@@ -301,16 +300,14 @@ class OptimConfig:
                 raise ValueError(f"param group names repeat: {names}")
             solvers = {}
             for group in self.param_groups:
-                group_opts = dict(opts)
-                if group.weight_decay is not None:
-                    group_opts['weight_decay'] = group.weight_decay
-                    if self.optimizer in ('muon', 'muonclip'):
-                        group_opts['adam_weight_decay'] = group.weight_decay
+                decay = {} if group.weight_decay is None else {'weight_decay': group.weight_decay}
                 rate = learning_rate if group.schedule is None else group.schedule.schedule(steps)
                 solvers[group.name] = group.solver(
-                    make, _scaled(rate, group.learning_rate_multiplier), steps, group_opts)
+                    make, _scaled(rate, group.learning_rate_multiplier), steps, {**opts, **decay})
             solver = optax.multi_transform(solvers, param_labels(self.param_groups))
         else:
+            if self.optimizer not in ('muon', 'muonclip'):
+                opts['mask'] = weight_decay_mask
             solver = make(learning_rate, **opts)
 
         if self.clip_grads > 0:
@@ -755,7 +752,7 @@ class RunConfig:
             # profile; prepare_process read the process fields, and the rest
             # are fit's arguments or built the checkpoints and the tracker.
             state = Trainer(
-                objective, self.optim.build(steps), key=trainer.key,
+                objective, self.optim, key=trainer.key,
                 mesh=trainer.mesh, layout=trainer.layout, accumulation=trainer.accumulation,
                 dynamic_scale=trainer.dynamic_scale, checkpoints=checkpoints, tracker=tracker,
                 rollout=rollout, profile=trainer.profile,

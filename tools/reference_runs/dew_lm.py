@@ -135,7 +135,7 @@ def build(args: argparse.Namespace) -> Run:
     from dew.objectives.lm import TEXT_KEY, LMObjective
     from dew.training import Layout, MeshSpec, Trainer
     from dew.training.distributed import batch_shardings
-    from dew.training.optim import Cosine
+    from dew.training.optim import Cosine, ParamGroup
 
     data = np.load(args.data)
     windows, order = data["windows"], data["order"]
@@ -155,9 +155,12 @@ def build(args: argparse.Namespace) -> Run:
                             variables=pretrained.variables, aux_loss_alpha=args.aux_loss_alpha,
                             seq_aux=args.seq_aux)
     schedule = Cosine(peak=args.lr_peak, warmup_steps=args.warmup, end=args.lr_end, init=args.lr_init)
+    # One group over every parameter, as torch_lm.py's AdamW decays the norms
+    # and biases too.
     solver = OptimConfig(
         optimizer="adamw", optimizer_opts={"b1": args.b1, "b2": args.b2, "eps": args.eps},
-        schedule=schedule, weight_decay=args.weight_decay, clip_grads=args.clip).build(schedule_steps)
+        schedule=schedule, weight_decay=args.weight_decay, clip_grads=args.clip,
+        param_groups=(ParamGroup("all", ("*",)),)).build(schedule_steps)
     devices = jax.device_count()
     mesh = {"data": MeshSpec(), "fsdp": MeshSpec(fsdp=devices), "expert": MeshSpec(expert=devices)}[args.mesh]
     layout = Layout() if args.tolerance is None else Layout(tolerance=args.tolerance)
