@@ -26,6 +26,14 @@ any reassociation of fp32 sums is held to fp32's own rounding of the step,
 while a defect lands orders of magnitude past it; the loss's floor likewise
 takes the reference loss's distance from the fp64 one.
 
+For a decoder whose individual gradient error is a coin flip, use
+`--rounding-orders --steps 1 --out DIR` with JAX_ENABLE_X64=1. It evaluates
+52 exact residual-unit permutations against fp64 and uses
+tests/reference_error.py's K-order rule per gradient leaf and for the loss.
+Each order's fp64 function invariance is checked; all raw distances and the
+expert gate_proj inventory are kept in DIR. Initialization stays at the
+default fp32 draw. This multi-draw mode belongs in the Colab queue.
+
 A layout also has to split one device's work rather than repeat it: its
 devices' FLOPs together, over the reference's, are at most `flops_bound`, an
 even split and a pipeline's bubble, else the layout is REDUNDANT.
@@ -139,6 +147,28 @@ def _fixture(name: str) -> dict[str, Any]:
     return dict(translate_config(config.get("text_config", config)))
 
 
+def _nemotron_h_moe() -> dict[str, Any]:
+    """The fp32 MoE row declares K-order judgment in its zoo entry.
+
+    At f7f85cef1b8c83a85c74ed93be22928c3d400801 its sequence4 gradient was
+    0.720 of the K-order bound over 52 exact residual orders, and expert4
+    was 0.596. Float64 invariance drift was at most 1.121e-14; no expert
+    gate_proj exists. The two-layout Colab CPU job took 172 seconds. This
+    multi-draw comparison belongs in Colab, not on the shared workstation.
+    Reproduce with `--models nemotron_h_moe --layouts sequence4 expert4
+    --dtype float32 --steps 1 --devices 4 --rounding-orders --out DIR`,
+    JAX_PLATFORMS=cpu, JAX_ENABLE_X64=1 and four virtual CPU devices.
+    Raw distances live under
+    ~/.cache/dew/integration/a906f0111d586f67996850929c23b80343345891/ExcitedRook/
+    dew-aux-nemotron-orders-retry-job-1/outputs/out/nemotron_h_orders/;
+    the sibling nemotron_h_orders.log records the run.
+    """
+    config = _fixture('nemotron-h-moe-tiny')
+    config.update(vocab_size=512, num_layers=20, max_seq_len=33,
+                  layer_types=tuple(config['layer_types']) * 4)
+    return config
+
+
 class TokenRows(TypedDict):
     """The batch every decoder of the zoo trains on."""
     batch_size: int
@@ -234,6 +264,7 @@ def zoo() -> dict[str, Any]:
         "moe128": Case("causal_transformer", moe128, **lm),
         "hybrid": Case("causal_transformer", hybrid, **lm),
         "nemotron_h": Case("causal_transformer", nemotron_h, **lm),
+        "nemotron_h_moe": Case("causal_transformer", _nemotron_h_moe(), orders=True, **lm),
         "window": Case("causal_transformer", window, **lm),
         "mla": Case("causal_transformer", mla, **lm),
         "mamba2": Case("causal_transformer", mamba2, **lm),
@@ -423,22 +454,29 @@ def _gradient(state) -> dict[str, NDArray]:
         for path, leaf in jax.tree_util.tree_flatten_with_path(state.opt_state[0]["gradient"])[0]}
 
 
+def compiled_step(case, fields: dict[str, int], batch, *, one_device: bool = False,
+                  devices: int | None = None):
+    """The trainer's step and its inputs, reusable across exact parameter orders."""
+    trainer = _trainer(case, fields, one_device=one_device, devices=devices)
+    state, _, _ = trainer.place()
+    data = placed(batch, trainer.device_mesh)
+    step = trainer.compile(state, data)
+    compiled = {"flops_per_device": trainer.flops_per_step,
+                "mesh": {axis: int(size) for axis, size in trainer.device_mesh.shape.items()}}
+    return state, data, step, compiled
+
+
 def trained(case, fields: dict[str, int], batch, *, steps: int, one_device: bool = False,
             devices: int | None = None) -> tuple[list[float], dict[str, NDArray], dict[str, Any]]:
     """The losses of `steps` steps on the layout `fields` names (over the
     first `devices` devices, every device by default), step one's gradient
     gathered whole, and what the compiler says of the step."""
-    trainer = _trainer(case, fields, one_device=one_device, devices=devices)
-    state, _, _ = trainer.place()
-    data = placed(batch, trainer.device_mesh)
-    step = trainer.compile(state, data)
+    state, data, step, compiled = compiled_step(case, fields, batch, one_device=one_device, devices=devices)
     losses, gradient = [], {}
     for _ in range(steps):
         state, loss, _, _, _ = step(state, data)
         losses.append(float(loss))
         gradient = gradient or _gradient(state)
-    compiled = {"flops_per_device": trainer.flops_per_step,
-                "mesh": {axis: int(size) for axis, size in trainer.device_mesh.shape.items()}}
     return losses, gradient, compiled
 
 
@@ -528,21 +566,14 @@ def permutation_floor(case, batch, reference: Mapping[str, NDArray],
     return leaves, loss
 
 
-def anchor_step(case, batch) -> tuple[float, dict[str, NDArray]]:
-    """Step one's loss and its gradient by leaf name in fp64: the model's
-    float64 twin (`dew.registry.float64_twin`), which computes in float64
-    throughout, on the reference's own initial variables widened to fp64.
-    The trainer draws those from its key's first split, so they come from
-    the trainer, not from the objective's `init` on the key itself."""
+def anchor_program(case, batch, state):
+    """The same fp64 loss/gradient executable reused for each residual order."""
     import benchmark_step as bench
     import jax
     import jax.numpy as jnp
-    import numpy as np
 
     from dew.objectives.base import Step
     from dew.training.transaction import with_ema
-
-    state, _, _ = _trainer(case, {}, one_device=True).place()
 
     def widened(tree):
         return jax.tree.map(lambda leaf: leaf.astype(jnp.float64)
@@ -559,7 +590,23 @@ def anchor_step(case, batch) -> tuple[float, dict[str, NDArray]]:
     def loss(variables, batch):
         return objective.scalar_loss({**wide, "params": variables}, batch, step)[0]
 
-    value, gradient = jax.jit(jax.value_and_grad(loss))(wide["params"], batch)
+    return jax.jit(jax.value_and_grad(loss)).lower(wide["params"], batch).compile()
+
+
+def anchor_step(case, batch) -> tuple[float, dict[str, NDArray]]:
+    """Step one's loss and its gradient by leaf name in fp64: the model's
+    float64 twin (`dew.registry.float64_twin`), which computes in float64
+    throughout, on the reference's own initial variables widened to fp64.
+    The trainer draws those from its key's first split, so they come from
+    the trainer, not from the objective's `init` on the key itself."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+
+    state, _, _ = _trainer(case, {}, one_device=True).place()
+    wide = jax.tree.map(lambda leaf: leaf.astype(jnp.float64)
+                        if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf, state.variables["params"])
+    value, gradient = anchor_program(case, batch, state)(wide, batch)
     return float(value), {jax.tree_util.keystr(path): np.asarray(leaf)
                           for path, leaf in jax.tree_util.tree_flatten_with_path(gradient)[0]}
 
@@ -777,6 +824,162 @@ def judged(errors: dict[str, float], floors: dict[str, float], loss: float,
             "status": "works" if ratios[worst] <= 1.0 and loss <= loss_bound else "MISMATCH"}
 
 
+def judged_orders(reference: Mapping[str, Sequence[float]], layout: Mapping[str, Sequence[float]]) -> dict:
+    """K-order RMS distances to fp64, held to the shared reference rule per leaf.
+
+    ORDERS=52 is the smallest K for which F(K,K) exceeds FACTOR² with
+    probability at most FALSE_FAILURE=1e-6, even when a squared error has
+    only one degree of freedom. tests/reference_error.py owns that derivation
+    and assertion; row-permutation floors and picked leaf tolerances play no
+    part in this comparison. Zero-error leaves pass only at zero layout error.
+    """
+    import numpy as np
+
+    sys.path.insert(0, str(REPO / "tests"))
+    from reference_error import FACTOR, assert_as_exact_over_orders
+
+    if reference.keys() != layout.keys():
+        raise ValueError('ordered gradients hold different leaves')
+    failed, ratios = {}, {}
+    for leaf in reference:
+        mine, theirs = (float(np.sqrt(np.mean(np.square(values))))
+                        for values in (layout[leaf], reference[leaf]))
+        ratios[leaf] = mine / (FACTOR * theirs) if theirs else 0.0 if mine == 0 else float('inf')
+        try:
+            assert_as_exact_over_orders(layout[leaf], reference[leaf], leaf)
+        except AssertionError as error:
+            failed[leaf] = str(error)
+    worst = max(ratios, key=ratios.__getitem__)
+    return {"worst_leaf": worst, "worst_ratio": ratios[worst], "ratios": ratios,
+            "failed_leaves": failed, "status": "MISMATCH" if failed else "works"}
+
+
+def order_invariance(actual: Mapping[str, NDArray], truth: Mapping[str, NDArray],
+                     loss: float, truth_loss: float) -> float:
+    """A residual permutation preserves the entire fp64 gradient and loss to 1e-12 relative.
+
+    The gradient is one vector over all parameters, so cancelled leaves are
+    measured on its scale instead of being divided by their own near-zero norm.
+    This is the exact-symmetry check required before an order counts as a
+    rounding draw; it is independent of the fp32 K-order acceptance bound.
+    """
+    import numpy as np
+
+    if actual.keys() != truth.keys():
+        raise ValueError('float64 orders hold different leaves')
+    apart = math.sqrt(sum(float(np.sum(np.square(actual[name] - truth[name]))) for name in truth))
+    scale = math.sqrt(sum(float(np.sum(np.square(values))) for values in truth.values()))
+    relative = apart / scale if scale else 0.0 if apart == 0 else float('inf')
+    if relative > 1e-12 or abs(loss - truth_loss) > 1e-12 * abs(truth_loss):
+        raise ValueError(
+            f'float64 residual order changes the function: gradient relative error {relative:.3e}')
+    return relative
+
+
+def run_orders(models: Sequence[str], layouts: Sequence[str], *, dtype: str, devices: int | None,
+               mixture: dict[str, Any], objective: dict[str, Any], out: Path,
+               speak: Callable[[str], None]) -> list[dict[str, Any]]:
+    """One compiled step per exact residual order, with a shared fp64 oracle.
+
+    Initialization and native executables are built with x64 disabled, so
+    enabling the oracle cannot change the original fp32 draw. Every native
+    executable is reused for all ORDERS, and every input state is copied
+    because the trainer donates it. This is a multi-draw validation job for
+    the Colab queue; it must not be run on the shared workstation.
+    """
+    import benchmark_step as bench
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+
+    sys.path.insert(0, str(REPO / "tests"))
+    from reference_error import ORDERS, distance
+    from residual_orders import orders, permuted, residual_width
+
+    if jax.process_count() != 1:
+        raise ValueError('residual-order comparisons run in one process')
+    if not jax.config.jax_enable_x64:
+        raise ValueError('residual-order comparisons need JAX_ENABLE_X64=1')
+    out.mkdir(parents=True, exist_ok=True)
+    rows = []
+    for model in models:
+        case, reference = model_case(model, dtype, mixture, objective)
+        if not case.is_lm or case.architecture != 'causal_transformer':
+            raise ValueError('residual orders require a CausalTransformer decoder')
+        batch = bench.global_batch(case)
+        with jax.enable_x64(new_val=False):
+            base, ref_data, ref_step, ref_compiled = compiled_step(reference, {}, batch, one_device=True)
+            programs = {name: compiled_step(case, LAYOUTS[name], batch, devices=devices) for name in layouts}
+        truth_step = anchor_program(reference, batch, base)
+        drawn = orders(residual_width(base.variables), ORDERS, seed=2024)
+        ref_shardings = jax.tree.map(lambda leaf: leaf.sharding, base)
+        model_out = out / model
+        model_out.mkdir(exist_ok=True)
+        (model_out / 'metadata.json').write_text(json.dumps({
+            'model': model, 'dtype': dtype, 'orders': ORDERS, 'seed': 2024,
+            'layouts': list(layouts), 'device_kind': jax.devices()[0].device_kind,
+            'source': source_digest(), 'x64_initialization': False,
+        }, indent=1))
+        np.save(model_out / 'orders.npy', drawn)
+        ref_distances, layout_distances = {}, {name: {} for name in layouts}
+        invariance, identity, identity_loss = [], None, None
+
+        def flat(tree, order):
+            canonical = permuted({'params': jax.device_get(tree)}, np.argsort(order))['params']
+            return {jax.tree_util.keystr(path): np.asarray(leaf)
+                    for path, leaf in jax.tree_util.tree_flatten_with_path(canonical)[0]}
+
+        def ordered_state(template, order, shardings):
+            copied = jax.tree.map(lambda leaf: leaf.copy(), template)
+            copied = dataclasses.replace(copied, variables=permuted(copied.variables, order))
+            return jax.device_put(copied, shardings)
+
+        for index, order in enumerate(drawn):
+            variables = permuted(base.variables, order)
+            params = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), variables['params'])
+            truth_loss, truth_tree = truth_step(params, batch)
+            truth_loss, truth = float(truth_loss), flat(truth_tree, order)
+            if identity is None:
+                identity, identity_loss = truth, truth_loss
+            invariance.append(order_invariance(truth, identity, truth_loss, identity_loss))
+            ref_state, ref_loss, _, _, _ = ref_step(ordered_state(base, order, ref_shardings), ref_data)
+            ref_gradient = flat(ref_state.opt_state[0]['gradient'], order)
+            keys = (*truth, '@loss')
+            for path in truth:
+                ref_distances.setdefault(path, []).append(distance(ref_gradient[path], truth[path]))
+            ref_distances.setdefault('@loss', []).append(abs(float(ref_loss) - truth_loss))
+            saved = {'reference': np.asarray([ref_distances[path][-1] for path in keys]),
+                     'truth_loss': np.asarray(truth_loss), 'leaves': np.asarray(keys),
+                     'invariance': np.asarray(invariance[-1])}
+            for name, (template, data, step, _compiled) in programs.items():
+                shardings = jax.tree.map(lambda leaf: leaf.sharding, template)
+                state, loss, _, _, _ = step(ordered_state(template, order, shardings), data)
+                gradient = flat(state.opt_state[0]['gradient'], order)
+                for path in truth:
+                    layout_distances[name].setdefault(path, []).append(distance(gradient[path], truth[path]))
+                layout_distances[name].setdefault('@loss', []).append(abs(float(loss) - truth_loss))
+                saved[name] = np.asarray([layout_distances[name][path][-1] for path in keys])
+            np.savez(model_out / f'order-{index:02}.npz', **saved)
+            speak(f'[{model}] residual order {index + 1}/{ORDERS}, fp64 invariance {invariance[-1]:.3e}')
+        for name, (_, _, _, compiled) in programs.items():
+            row = {"model": model, "layout": name, "dtype": dtype, "orders": ORDERS,
+                   "gate_proj_inventory": [path for path in ref_distances if 'gate_proj' in path],
+                   "invariance_max": max(invariance),
+                   "reference_distances": ref_distances, "layout_distances": layout_distances[name],
+                   **compiled, **judged_orders(ref_distances, layout_distances[name])}
+            if compiled['flops_per_device'] and ref_compiled['flops_per_device']:
+                row['flops_ratio'] = (compiled['flops_per_device'] * math.prod(compiled['mesh'].values())
+                                      / ref_compiled['flops_per_device'])
+                row['flops_bound'] = flops_bound(LAYOUTS[name])
+                if row['status'] == 'works' and row['flops_ratio'] > row['flops_bound']:
+                    row['status'] = 'REDUNDANT'
+            rows.append(row)
+            speak(f'[{model}/{name}] {row["status"]} K-order ratio {row["worst_ratio"]:.3f} '
+                  f'at {row["worst_leaf"]}')
+        (out / 'summary.json').write_text(json.dumps(rows, indent=1))
+    return rows
+
+
 def model_case(model: str, dtype: str, mixture: dict[str, Any], objective: dict[str, Any]):
     """`model`'s zoo case in `dtype`, with the flags' mixture and objective
     keywords merged in, and the case its one-device reference runs: the
@@ -830,7 +1033,7 @@ def prepared(models: Sequence[str], *, dtype: str, steps: int, anchor: bool, mix
 def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int, anchor: bool,
         mixture: dict[str, Any], objective: dict[str, Any], references: References,
         speak: Callable[[str], None], keep: Callable[[list[dict[str, Any]]], None],
-        devices: int | None = None) -> list[dict[str, Any]]:
+        devices: int | None = None, orders_out: Path | None = None) -> list[dict[str, Any]]:
     """Every layout of every model, one row each, `keep` handed the rows so
     far after each, each layout over the process's first `devices` devices
     (every device by default). A reference and a layout run as agreed
@@ -846,6 +1049,13 @@ def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int
     rows = []
     for model in models:
         case, reference = model_case(model, dtype, mixture, objective)
+        if case.orders:
+            with jax.enable_x64(new_val=True):
+                rows.extend(run_orders(
+                    [model], layouts, dtype=dtype, devices=devices, mixture=mixture, objective=objective,
+                    out=Path('out/layout-parity-orders') if orders_out is None else orders_out, speak=speak))
+            keep(rows)
+            continue
         batch = bench.global_batch(case)
         try:
             judge = agreed(f"reference of {model}", lambda: references.reference(reference, batch, steps))
@@ -934,6 +1144,8 @@ def summary(rows: Sequence[Mapping[str, Any]]) -> list[str]:
 def main(models: Annotated[tuple[str, ...], tyro.conf.arg(help="zoo() names")] = ("dense",),
          layouts: Annotated[tuple[str, ...], tyro.conf.arg(help="LAYOUTS names")] = tuple(LAYOUTS),
          dtype: str = "float32", steps: int = 3, anchor: bool = False,
+         rounding_orders: Annotated[bool, tyro.conf.arg(
+             help="52 exact residual orders against fp64; one step, --out is a directory; Colab")] = False,
          out: Path | None = None,
          mixture: Annotated[str, tyro.conf.arg(
              help="JSON merged into each model's mixture, e.g. '{\"dispatch\": \"exchange\"}'")] = "{}",
@@ -962,6 +1174,15 @@ def main(models: Annotated[tuple[str, ...], tyro.conf.arg(help="zoo() names")] =
                          "a pool runs every layout on all of its devices")
     jax.config.update("jax_default_matmul_precision", "highest")
     speaker = jax.process_index() == 0
+    if rounding_orders:
+        if steps != 1 or out is None or prepare or references is not None or anchor:
+            raise SystemExit('--rounding-orders needs --steps 1 and --out DIR; '
+                             '--prepare/--references/--anchor use the single-draw path')
+        rows = run_orders(models, layouts, dtype=dtype, devices=devices, mixture=json.loads(mixture),
+                          objective=json.loads(objective), out=out,
+                          speak=lambda line: print(line, flush=True))
+        print('\n'.join(summary(rows)), flush=True)
+        raise SystemExit(verdict(rows))
     store = References(references, prepare)
     if prepare:
         if not prepared(models, dtype=dtype, steps=steps, anchor=anchor, mixture=json.loads(mixture),
@@ -977,7 +1198,8 @@ def main(models: Annotated[tuple[str, ...], tyro.conf.arg(help="zoo() names")] =
     rows = run(models, layouts, dtype=dtype, steps=steps, anchor=anchor, mixture=json.loads(mixture),
                objective=json.loads(objective), references=store,
                speak=lambda line: print(line, flush=True) if speaker else None, keep=keep,
-               devices=devices)
+               devices=devices,
+               orders_out=None if out is None else out.parent / f'{out.stem}-orders')
     if speaker:
         print("\n".join(summary(rows)), flush=True)
     raise SystemExit(verdict(rows))
