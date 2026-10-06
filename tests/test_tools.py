@@ -1095,6 +1095,35 @@ def test_the_slop_gate_reports_a_broad_suppress_as_it_reports_an_empty_handler()
     assert sorted(finding.line for finding in lint.swallowed(module)) == [2, 8]
 
 
+def test_numpys_object_dtype_in_a_call_is_not_an_alias_of_object():
+    """#46: `np.asarray(rows, object)[keep]` is NumPy's object dtype under an
+    index, not a type alias resolving to `object`; `Rows = dict[str, object]`
+    still is one."""
+    lint = load("lint_slop")
+    source = ("import numpy as np\n"
+              "held = np.asarray(rows, object)[keep]\n"
+              "Rows = dict[str, object]\n")
+    module = lint.Module(Path("snippet.py"), "src/dew/snippet.py", source, ast.parse(source))
+    assert [(finding.line, finding.code) for finding in lint.contracts(module)] == [(3, "SLOP002")]
+
+
+def test_a_plugin_package_checks_its_own_source_with_dews_rules(tmp_path):
+    """#46: `--root` and `--package` point the gate at another checkout, whose
+    `src/<package>` gets the contract rules and whose own modules SLOP008
+    will not see patched."""
+    lint = load("lint_slop")
+    (tmp_path / "src" / "sparx").mkdir(parents=True)
+    (tmp_path / "src" / "sparx" / "graph.py").write_text(
+        "def edges(table: dict[str, object]):\n    return table\n")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_graph.py").write_text(
+        "def test_edges(monkeypatch):\n    monkeypatch.setattr('sparx.graph.edges', len)\n")
+    modules = list(lint.collect(["src/sparx", "tests"], tmp_path, "sparx"))
+    found = sorted((module.relative, finding.code) for module in modules for finding in lint.check(module))
+    assert found == [("src/sparx/graph.py", "SLOP002"), ("tests/test_graph.py", "SLOP008")]
+    assert lint.main(["--root", str(tmp_path), "--package", "sparx"]) == 1
+
+
 # ---------------------------------------------------------------------------
 # tools/hf_coverage.py
 # ---------------------------------------------------------------------------

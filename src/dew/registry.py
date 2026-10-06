@@ -380,15 +380,18 @@ def from_record[ValueT](annotation: type[ValueT], value: Configured, *, dtypes: 
 
     The class is the witness: what comes back is an instance of it or a
     `ValueError` naming what the record built instead, so a caller reads a
-    value of the type it asked for rather than one it has to narrow again.
+    value of the type it asked for rather than one it has to narrow again. A
+    container annotation, `tuple[ParamGroup, ...]` or `Mapping[str, ...]`,
+    builds every entry and witnesses the container.
     `dtypes` is the one policy the two readers differ in: a module field
     takes a `dtype` as the dtype its name says (True), and a run record
     keeps the name it wrote (`RunConfig.from_dict`, False).
     """
     built = _rebuilt(annotation, value, dtypes=dtypes)
-    if not isinstance(built, annotation):
+    witness: type[ValueT] = typing.get_origin(annotation) or annotation
+    if not isinstance(built, witness):
         raise ValueError(f"{value!r} builds {type(built).__name__}, "
-                         f"not the {annotation.__name__} the field declares")
+                         f"not the {witness.__name__} the field declares")
     return built
 
 
@@ -905,8 +908,10 @@ trainings: Registry[type[Training], Training] = Registry("training").share()
 
 __all__ = [
     "PLUGINS",
+    "Record",
     "Registry",
     "datasets",
+    "dtype_name",
     "encoders",
     "from_record",
     "metrics",
